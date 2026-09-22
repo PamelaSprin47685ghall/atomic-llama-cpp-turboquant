@@ -997,12 +997,20 @@ std::string server_rerot_format_plan_prefix(
 }
 
 std::string_view server_rerot_routing_probe_prompt() {
-    // Fixed one-line template injected after C0 capture. A single example is
-    // enough: JSON is native to the model and needs no syntax lecture. The
-    // trailing newline keeps the first sampled token inside the object (no
-    // glued preamble).
+    // Fixed instruction injected after C0 capture. Used verbatim as specified.
+    // The trailing template line is the wire-format anchor the routing grammar
+    // and the first sampled token depend on.
     static constexpr std::string_view prompt =
-        "Plan in JSON: {\"tasks\":{\"<id>\":\"<intent>\",...},\"deps\":{\"<id>\":[\"<dep_id>\"],...}}\n";
+        "Let's decompose into a maximally concurrent epistemic DAG. Maximize DAG width; minimize critical path depth. Enforce parallel analytical execution:\n"
+        "\n"
+        "1. Orthogonal Faceting (MECE): Split problem into disjoint structural layers, independent subsystems, or distinct analytical dimensions. Fork concurrently.\n"
+        "2. Regime Partitioning: Fork isolated lanes for orthogonal parameter regimes, edge-cases, and nominal vs pathological scenarios.\n"
+        "3. Adversarial Falsification: Run constructive derivations in parallel with active counterexample hunting, edge-case attacks, and failure-mode stress-tests.\n"
+        "4. Disjoint Cross-Audit: Verify high-risk core invariants by assigning redundant, independent derivation pathways in parallel.\n"
+        "5. Strict Causal Gating: Declare dependency B <- A IF AND ONLY IF task B is physically unstartable without an explicit, uncomputed output artifact of A. ABSOLUTELY FORBID narrative, rhetorical, or pedagogical sequencing. Output serialization belongs exclusively to final synthesis.\n"
+        "\n"
+        "Every task MUST be an atomic, falsifiable operation or derivation\u2014NEVER a vague topic outline.\n"
+        "Plan in JSON: {\"tasks\":{\"<id>\":\"<full English intent>\",...},\"deps\":{\"<id>\":[\"<dep_id>\"],...}}\n";
     return prompt;
 }
 
@@ -1070,12 +1078,39 @@ server_rerot_routing_decision server_rerot_parse_routing_decision(
         bool force_single_node_dag) {
     server_rerot_routing_decision result;
 
+    // The routing grammar is lazy: the model may reason in free text for as long
+    // as it needs and the GBNF only takes over at the plan object. Everything
+    // before that object is thinking, not protocol, so parse from the plan's
+    // opening brace instead of byte zero. Without this the leading prose would
+    // make every parse fail as `incomplete` and the probe could only ever end by
+    // exhausting its token budget.
+    //
+    // The start marker is the same one the grammar trigger uses, so the parser
+    // and the sampler agree on exactly where the plan begins; text after the
+    // object is left alone (a trailing note cannot invalidate the plan).
+    static constexpr std::string_view k_plan_open = "{\"tasks\"";
+    const size_t plan_at = text.find(k_plan_open);
+    if (plan_at == std::string::npos) {
+        if (text.find('{') == std::string::npos) {
+            // No object opened yet: still thinking. Keep sampling.
+            result.incomplete = true;
+            result.error = "no routing plan object sampled yet";
+            return result;
+        }
+        // An object is open but "tasks" has not been written: either mid-object
+        // or a plan that omits the key. Either way it is not yet decidable.
+        result.incomplete = true;
+        result.error = "routing plan object is missing \"tasks\"";
+        return result;
+    }
+
     json root_json;
     try {
-        root_json = json::parse(text);
+        // Parse the plan and whatever follows it; nlohmann stops at the first
+        // complete value, so trailing prose is harmless.
+        root_json = json::parse(text.begin() + (std::ptrdiff_t) plan_at, text.end());
     } catch (const std::exception & e) {
-        // In practice only truncation reaches here (the grammar admits no
-        // malformed object): keep sampling until the probe terminator decides.
+        // Truncated mid-object: keep sampling until the probe terminator decides.
         result.incomplete = true;
         result.error = "incomplete JSON: " + std::string(e.what());
         return result;
@@ -1084,8 +1119,9 @@ server_rerot_routing_decision server_rerot_parse_routing_decision(
     // Duplicate-member scan runs AFTER the parse: the scanner reports malformed
     // input as a duplicate, and truncation must stay classified as `incomplete`.
     // nlohmann keeps the last duplicate member, so an ambiguous object would be
-    // silently repaired - reject it outright instead.
-    if (json_text_has_duplicate_keys(text)) {
+    // silently repaired - reject it outright instead. Scope it to the plan
+    // substring so thinking text before the object cannot affect the verdict.
+    if (json_text_has_duplicate_keys(std::string_view(text).substr(plan_at))) {
         result.error = "duplicate JSON object members are not allowed";
         return result;
     }
