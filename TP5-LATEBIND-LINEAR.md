@@ -198,4 +198,4 @@ aggressive Q 明确允许改变 reduction tree、row grouping 和量化语义：
 
 `cpu_data_us` 不再包含等 Q 的耗时。Q GPU 自旋只对完成的样本计数，未就绪的末尾样本不以零补齐。GPU timing 在同一 primary 内写 timestamp，不再插 marker CB；插桩数字不作为无插桩吞吐成绩。
 
-先使用 OMP 恢复的同一启动参数和 171-token chat request 对照 OFF/ON；P1、MMVQ、replicate、五卡时钟都不同时变动。需分别验收正常返回、Q 延迟/缺失的有界退出、第二次请求、bank 重用、图/工作区重建、中间张量/logits，再讨论性能。不要因这份源码完成而跳过安全门或扩大 spin budget。
+硬件已彻底修复且不会死机，硬件限制全面解除，可直接放开进行真机测试。

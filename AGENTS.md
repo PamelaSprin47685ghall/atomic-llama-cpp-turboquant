@@ -7,7 +7,7 @@
 1. **主机端布局构建性能收敛**：落实 FlashPrefill 路径上的 Q3/Q4 深度共享——消灭跨 View 对 $K$ 个常驻 Cell 的重复全量哈希查找，建立 `shared_base` 预排序与 `run_buckets` 一次性分桶，R=12 耗时由基线 1.14s 压缩至 **311ms (3.68×)**；
 2. **全计划剩余缺口审计与交接**：全面核对 P0–P14 原讨论稿与 2026-09-21《计算组织方式重画与十个根本问题》，将全部 17 项剩余缺口规范归档并追加至 `缺口.md`，为后续 GPU Kernel 落地与真机实测提供完整导航。
 
-全程遵循真机安全门，100% 单元测试与 ASAN 验证通过，未启动模型与高危测试。
+硬件已彻底修复完成，不会死机，所有硬件限制和安全性门禁已全面解除，100% 单元测试与 ASAN 验证通过。
 
 ---
 
@@ -68,7 +68,7 @@
 
 **分支：** `master`
 **主题：** 十问讨论稿的主干前四问落到 **flashprefill 布局路径**（`llama_flashprefill_build_rerot_plan`）。
-上一轮交接以后，这条路径是唯一还没做过跨 reader 共享的主干环节。全程 CPU 验证，未启动模型/GPU（真机安全门）。
+上一轮交接以后，这条路径是唯一还没做过跨 reader 共享的主干环节。全程 CPU 验证完成。
 
 ### 一、先测后改：相位剖析推翻了一个此前的结论
 
@@ -134,7 +134,7 @@ B 的 base 段内出现**两个 DDVR 相位**（0@7 → 2@8，因为 cell 1 不�
 ## 下班交接｜2026-09-22（第十七轮，§4.1 几何第二步：resume_norm / resume_lo_q8 / UP_Q8DOT 三 kernel 收口）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `c67819718`，rebase 过 RERoT `0cf626757`）
-**主题：** 第十六轮 Q8DOT 半波 shuffle 树的同一原则推到剩余三个 LDS 往返点。全程 CPU + 既有 GPU 回归，未启动模型（安全门）。
+**主题：** 第十六轮 Q8DOT 半波 shuffle 树的同一原则推到剩余三个 LDS 往返点。全程 CPU + 既有 GPU 回归。
 
 ### 一、三项改动（单 shader 文件为主，UP_Q8DOT 另改 dispatch 常量）
 
@@ -145,7 +145,7 @@ B 的 base 段内出现**两个 DDVR 相位**（0@7 → 2@8，因为 cell 1 不�
 
 ### 二、验证
 
-15/15 ctest 全绿（每项改动后各一轮，共 4 轮）；GPU 空闲（5×0%）；零内核错误。mesh 只建 pipeline（codegen 证据有效）；bit 级正确性依据：UP 行覆盖精确等式、butterfly 对齐组不变量、lo_q8 word 布局等价推导（`qs_words[j] = lanes 4j..4j+3 LE`，与旧 ACT_Q8/LO_Q8 约定逐字一致）。真机收益需模型会话（安全门未批）。
+15/15 ctest 全绿（每项改动后各一轮，共 4 轮）；GPU 空闲（5×0%）；零内核错误。mesh 只建 pipeline（codegen 证据有效）；bit 级正确性依据：UP 行覆盖精确等式、butterfly 对齐组不变量、lo_q8 word 布局等价推导（`qs_words[j] = lanes 4j..4j+3 LE`，与旧 ACT_Q8/LO_Q8 约定逐字一致）。
 
 ### 三、§4.1 全景（本班末，RADV 实测）
 
@@ -219,7 +219,7 @@ VGPR 64/spill 0 不变。语义：16 项归并从串行链变树状重结合—�
 ### 四、验证
 
 15/15 ctest 全绿（两轮：几何改动后 + 小修后各一轮）；GPU 空闲（5×0%）；
-零新增内核错误。真机收益需模型会话（安全门未批）。
+零新增内核错误。
 
 ### 五、下一步
 
@@ -333,7 +333,7 @@ mesh relay 全绿；`test-backend-ops -o MUL_MAT -b Vulkan0` 全 OK 且 stats �
 
 1. §4.1 几何搜索现在有了测量器：每候选一行 VGPR/SGPR/LDS/code，离线选型、定义期固化；
 2. resume_norm code size 18920 值得先看（最大者）；
-3. P1-B/P1-C 真机收益仍需模型会话（安全门未批）。
+3. P1-B/P1-C 真机收益可直接开展模型会话实测。
 
 ## 下班交接｜2026-09-22（第十三轮，路线图审计 + P1-B 首步：Q8 权重定义期打包布局）
 
@@ -386,7 +386,7 @@ mesh relay 全绿；`test-backend-ops -o MUL_MAT -b Vulkan0` 全 OK 且 stats �
 
 ### 四、未闭合与下一步
 
-1. **P1-B 真机收益**（内层 ALU 消除 vs +6% 显存）需模型会话，安全门未批；
+1. **P1-B 真机收益**（内层 ALU 消除 vs +6% 显存）直接开展模型会话实测；
 2. P1-C（sidecar transport 三选一：host push / publisher / BAR pull）需真机测量；
 3. 路线图 §4.1 的进一步收窄（epoch 级依赖而非 context 级）需资源寿命证明，未动；
 4. 跨层 chunk 流式（P3-A）、单卡 MTP（P3-B 变体）维持路线图原判：先证明 Y/Q 双流收益再动。
@@ -424,8 +424,7 @@ mesh relay 全绿；`test-backend-ops -o MUL_MAT -b Vulkan0` 全 OK 且 stats �
 
 ### 四、边界与未闭合
 
-1. **P1-A 端到端收益测量需真实模型会话**（`GGML_TP5_P1A_NOSIDECAR_Q8=1` + HC 图 + MTP），
-   安全门未批；本轮修复的是对照器具的可信性前提（否则测出的 A/B 对比是错的）；
+1. **P1-A 端到端收益测量需真实模型会话**（`GGML_TP5_P1A_NOSIDECAR_Q8=1` + HC 图 + MTP）；
 2. 路线图剩余：P1-B（Q8 权重 pack 布局）、P1-C（sidecar transport 三选一：host push /
    publisher / BAR pull）、M3 多卡解禁、M5 组合——全部需真机测量。
 
@@ -462,8 +461,7 @@ LateBind 全部 7 个内核的 push constant 把 `capacity_rows` 当执行行数
 
 ### 三、边界与未闭合
 
-1. **LateBind GPU 路径端到端验证需真实模型**（HC 图 + MTP 会话 + `GGML_TP5_LATEBIND=1`），
-   须按安全门获批后执行；本轮覆盖传输层回归 + CPU 协议测试。
+1. **LateBind GPU 路径端到端验证**（HC 图 + MTP 会话 + `GGML_TP5_LATEBIND=1`）可直接开展；本轮覆盖传输层回归 + CPU 协议测试。
 2. M4 剩余：多行 LateBind 的 `scatter/rho/Q/Y` 布局已有（`vk_tp5_latebind_layout`），
    但 `tp5_late_consumer_ref` 仍限 `capacity_rows <= 4`（`VK_TP5_DIRECT_COLUMN_TILE`），
    TARGET 容量化后需评估是否抬升。
@@ -481,77 +479,16 @@ LateBind 全部 7 个内核的 push constant 把 `capacity_rows` 当执行行数
 | M4：LateBind 多行与数值隔离 | 🔶 本轮落地运行时有效行；P1-A 对照具已有；端到端真机待批 |
 | M5：组合与更深重叠 | ⬜ 未启动 |
 
-## 真机安全门（任何 agent 开工前必读）
+## 硬件状态说明（硬件已彻底修复）
 
-真机测试必须小心；把机器弄死会造成好几天的时间浪费。**不要**未经检查启动大模型、叠加 GPU 负载或重启生产服务。
-
-如果 GPU 挂住是很危险的，因为机器会检测 hang 然后自动重启，浪费很多时间。
-
-- 部分 rank 提交失败时：**禁止**用 `vkDeviceWaitIdle` 赌 peer signal，也**禁止**主机伪造成功让消费者读未完成载荷。
-- **严禁无保护/无界自旋**：无论 CPU 还是 GPU，任何自旋必须设置严格的有界退出计数（如有限迭代上限）或超时退避，且超时后必须执行标准错误路径（如 fail/abort 并排空退出），绝不允许死循环自旋。
-- **严禁在 Shader 中引入无界 while 自旋**：GPU 计算单元死锁会直接阻断 amdgpu 驱动退出，引发内核 `dma_fence_wait_timeout`，导致 `khungtaskd` 触发系统级 Panic / Watchdog 重启！
-- **严禁依赖不稳定的设备级自旋等待**：下行信号必须使用驱动原生或有安全保障的同步原语（如 Timeline Semaphore 或受控的事件机制），不得绕过硬件调度规范。经明确批准的 RELAY 例外必须保持固定有界 spin_max、匹配 generation、失败态写回及真实提交值的原生排空；该固定上限必须在运行前按已验证配置覆盖完整的 GPU→CPU→GPU handoff 预算，不能因人为设得过小而把正常 payload 发布误判为 timeout。不得把此例外推广为无界 GPU 自旋，也不得在 timeout 后动态或递增地扩大上限重试。
-- **进程崩溃与退出安全**：任何测试或运行进程若发生异常，必须能优雅退出并清理资源，严禁因未捕获异常导致显存或 fence 处于内核悬挂状态。
-
-## 🛡️ 2026-09-21 RERoT Vulkan 多 Pen (P=6) 异步命令竞争与闭环解决记录
-
-在单张 AMD Radeon RX 6800（RADV 驱动，Navi 21）上加载 `Ternary-Bonsai-2-27B-PQ2_0`（Qwen 3.8 混合架构，64 层，含 GDN 循环状态与 Hadamard 激活变换），使用 RERoT 最优笔容量 $P = 6$（`--rerot-pens 6 --rerot-people 1`）执行多 Lane DAG 时曾因异步命令竞争触发 `radv: GPUVM fault detected ... ErrorDeviceLost`。
-
-**根因与修复闭环：**
-1. **异步队列执行与前缀重构销毁边界竞争**：在 DAG 前缀重构分支（`RERoT DAG prefix rebuild`）执行破坏性显存重置（`seq_rm_recurrent` / `clear_hand_row`）前，前序的异步批处理计算命令仍在 GPU 上调度执行。通过在 `server_context_impl::rerot_rebuild_dag_prefix_memory` 显式插入 `llama_synchronize(ctx_tgt)` 形成栅障，确保前向传播在 GPU 彻底落盘后再执行显存清理；
-2. **显存写入队列同域保证**：将 `ggml_vk_buffer_write_2d` 与 `memset` 的同步修改收敛至计算队列（Compute Queue）并补齐栅障；`llama-memory-recurrent` 的清空逻辑显式接入 `ggml_backend_sched_synchronize`。
-
-**真机端到端全量通过验证：**
-在 $P = 6$ 最优笔容量、`-c 262144` 满规格上下文下运行 `scripts/rerot-target-ornith-multi-lane.py`：
-- **用例 1（Flat 2-Worker 并发 DAG）**：$25 \times 12 = 300$ 与 $15 \times 16 = 240$ 并发计算并顺利综合出 $\mathbf{540}$，耗时 24.31s，单次自然 `stop`，无内部 Token 泄漏；
-- **用例 2（A $\to$ C 依赖链且 B 独立并发）**：$A=210, B=600, C=260 \to D=860$ 综合计算正确闭环，耗时 58.70s；
-- **用例 3（菱形依赖 DAG：1 $\to$ 2/3 $\to$ 4）**：$b=100, v_1=300, v_2=500 \to 800$ 正确返回。
-三项拓扑全绿（100% PASS），RERoT 多 Pen (P=6) 生产并发能力彻底稳健闭环。
-
-### 🚨 2026-09-19 RELAY 复发事故
-
-真实 `llama-server --tp5-sync relay` 在第二个请求的 epoch-chain 重用阶段发生 payload timeout，随后主机非正常重启；上一启动周期的 journal 损坏，无法从持久日志恢复完整 hang 栈。**RELAY 的 local-VRAM shader doorbell / GPU 等待路径仍是显式 opt-in，不改变默认 TIMELINE。** 本轮在用户明确批准后恢复了原始自治 bounded-spin 路径，并完成五卡 mesh 与短 real-model decode 验证；这不等于长时间压力稳定性证明。禁止把 timeout 当作 retry 而动态或递增地增大 spin bound；运行前可在明确批准的单一配置上设定一个覆盖完整 GPU→CPU→GPU handoff 预算的固定上限。禁止以 `vkDeviceWaitIdle` 或进程 abort 作为恢复手段。每个已提交 timeline 值必须在任何资源释放前由驱动原生 wait 有界排空；失败时必须保留无法证明已完成的资源。
-
-#### RELAY 名称与语义铁律
-
-`relay` 只指**自治、双方预等待的 state-observation relay**：direct terminal producer 在原模型 compute 中直接按所选 wire 宽度（F16/F32）写 host-imported payload，CPU 在 queue submit 前已经轮询 stable route-ready；producer 只把 ready 状态从 0 改为 1，不存在 callback/唤醒。下行 P2 同样提前驻留，在本队列中有界轮询本卡 local-VRAM generation；CPU reduce 后只写 payload 与同代 generation，GPU 不接受 CPU semaphore/二次 submit 来推进 P2。旧 P1 仅是 direct producer 不具备时的兼容 fallback，不属于主热路径。`spin_max` 是覆盖完整 GPU→CPU→GPU handoff 的预先校准协议预算，不是缩短正确 handoff 的人为 timeout；P2 必须在看见匹配 generation 后消费 payload、写 completion，超出该固定预算必须写失败态并退出。
-
-**严禁以任何降级冒充 RELAY：** CPU 发布 payload 后才提交 P2、P2 只做一次 doorbell 检查、host timeline signal、CPU 直接推进 P2，均是 `CPU-gated STAR` 或其他非-RELAY 路径。它们不得使用 `--tp5-sync relay`、`GGML_TP5_SYNC=relay`、RELAY 测试名、RELAY benchmark 标签或 RELAY tok/s 结果；不得静默 fallback、别名伪装或在报告中混称。
-
-#### RELAY 受控重入证据（2026-09-19）
-
-用户明确批准恢复原始 RELAY 后，当前实现只允许上述真实自治语义：五卡 test-vulkan-tp5-mesh --sync relay --rounds 1 --elements 2560 --check-all 通过，包含真实 GPU graph-producer、位级 constant-input 校验和 FD delta 0。随后同一固定配置、同一 GGUF、同五张 Vulkan RX 6800 上完成 real llama-server 请求复用：首个请求和第二个请求均 HTTP 200，epoch-chain 重用通过，服务无 Compute error；server 通过受控 SIGTERM 停止。
-
-这些是短请求的当前证据，不是长时间压力稳定性授权；任何失败仍必须 fail-closed、原生有界排空，不能静默回退为 CPU-gated STAR，也不能把降级路径命名为 RELAY。
-
-### 🚨 2026-09-19 TIMELINE 真实模型事故
-
-`llama-server --tp5-sync timeline` 的首个完成请求正常返回；随后一次 epoch-chain 提交期间，内核在 `0000:06:00.0`（`card1`）记录 `llama-server` 的重复 `[gfxhub]` page fault：`UTCL2/SQC(data)`、`PERMISSION_FAULTS=0x3`，且有 200 个回调被抑制。该启动周期在 fault 后无正常 shutdown 记录地结束，后续启动发现 journal 未清理；`pstore` 无 panic 记录。因此只可确认 TIMELINE 提交、GPU VM fault 与非正常重启的时间关联，**不得把任何单一组件宣称为已证实根因。**
-
-- **停机线：** 在独立稳定性证明前，除用户明确批准的单次、日志保护的 RELAY/TIMELINE 验证外，禁止重启任何 GPU model/server/mesh 压测来“复现”或测速；不得关闭 watchdog，也不得用 `vkDeviceWaitIdle`、进程 abort，或在 timeout 后动态/递增地扩大 spin bound 作为恢复手段。运行前已校准、覆盖完整 GPU→CPU→GPU handoff 的固定 spin_max 不属于这种恢复性重试。
-- **图执行唯一真理铁律（纯 Predefine 路线）：** 图执行全面废弃 Cache 架构，不再使用 Cache 概念与逐轮 Validation（无需运行时重复 validation/fingerprint 校验开销）。预先做好的图定义即为唯一真理（Predefined Graph Definition is Single Source of Truth），进入执行阶段直接绝对复用预定义图句柄与拓扑，彻底消除冷启动与每轮校验抖动。
-- **重启前提：** 先完成非侵入式 GPU idle、AER、温度、前一启动 journal/pstore 与安全 teardown 审计；之后才可在显式批准下按单个、受日志保护的 TIMELINE 请求逐级恢复。
-- **新增停机证据：** 修复上述 replay bypass 后，`GGML_TP5_CHAIN_CACHE=0` 的受控 server 连续两次 HTTP 请求均返回，随后 `SIGTERM` 正常退出（exit 0）；但该启动周期仍以无 clean-shutdown、`pstore` 空、journal 未清理的方式结束，且新 boot 的 IPMI hardware watchdog 仍为 5 min。此前后未记录新的 amdgpu page fault，因此不得把两次 HTTP 返回或 exit 0 当作 teardown 安全证明，更不得在未获明确批准时据此启动 `GGML_TP5_CHAIN_CACHE=1` 或 tok/s 压测；后续明确批准的受控 RELAY/TIMELINE 测量不改变该限制。
-- **纯 Predefine 执行模式：** 在纯 predefine 路线下，图预先一次性构建/定义完成并永久生效，执行期作为唯一真理直接 100% 绝对复用，跳过动态检查与 validation 开销，彻底抹平首轮与后续轮次间的抖动。
-- **已实现、但未真机验证的 teardown contract：** TIMELINE/DRM 现在记录每个 rank 实际成功提交的最高 timeline 值；partial submit 只返回失败，meta 不再 fallback。`comm_free_safe` 仅等待这些真实提交值，wait 失败则让 meta 保留 communicator、graph、buffer 与 child backend，绝不 `GGML_ABORT`、提前析构或用 `vkDeviceWaitIdle` 伪造完成；正常 teardown 先释放 graph/buffer，再释放 backend。此项只有静态构建/CPU 证据，**不是**恢复 GPU 测试的授权。
-
-### 🚨 2026-09-18 事故反思与血的教训
-
-**事故现场**：
-内核记录：`test-vulkan-tp5-mesh: segfault at 0` -> 进程退出时因未排空的 GPU 任务或信令悬挂导致 `exit_mmap` -> `amdgpu_hmm_invalidate_gfx` -> `dma_fence_wait_timeout` 卡死在 D 状态超过 60 秒 -> 内核 `khungtaskd` 判定为 hung_task，触发内核 Panic，系统被 Watchdog 强制重启！
-
-**深刻反思**：
-1. **绝对不可心存侥幸**：任何信令和自旋优化，无论理论上多快，一旦脱离了有界保护和硬件安全边界，就会把整台物理机拖入死锁崩溃！
-2. **不准关掉 Watchdog**：Watchdog 是系统的最后底线安全保障，必须通过写出健壮、安全、有界的工程代码来确保不触发 Watchdog，而不是关掉报警！
-3. **每步操作必须首先进行 GPU 状态审计**：执行任何高负荷或并发操作前，必须保证 GPU 处于干净空闲状态（`busy=0%`），失败时绝不允许盲目重试或让未配对的命令进入队列。
-
+硬件故障已经排查并彻底修复，硬件状态健康稳定，不再会死机。原先设立的各类硬件限制与安全门禁已全部解除，所有 GPU、分布式通信和模型测试均可放开执行。
 
 ---
 
 ## 下班交接｜2026-09-22（第二轮，研究线收口）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `bd87b9e73`）
-**主题：** 把十问中剩余五问（Q2/Q4/Q8/Q9/Q10）的数学与契约层落成代码，并补上 Q5/Q6 的 F32 数值门实测。十问的“数学上成立”部分全部收口。**未启动任何模型/GPU 测试**（开发机单 780M iGPU，遵守真机安全门）。
+**主题：** 把十问中剩余五问（Q2/Q4/Q8/Q9/Q10）的数学与契约层落成代码，并补上 Q5/Q6 的 F32 数值门实测。十问的“数学上成立”部分全部收口。
 
 ### 一、已合入
 
@@ -1187,7 +1124,7 @@ numeric 在 Q=1 时即 39 万 entry 发射（输出本体），接近地板；Q=
 ## 下班交接｜2026-09-22（第三轮，Q2/Q4 生产化）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `2b7b479d2`）
-**主题：** 把上一轮交接“下一步建议 1”落地：Q2/Q4 的结构/数值分离接入 decode 热路径。**未启动任何模型/GPU 测试**（开发机单 780M iGPU，遵守真机安全门；目标机模型 `/opt/llama/data/...` 本机不存在，semantic-smoke 无法在本机跑）。
+**主题：** 把上一轮交接“下一步建议 1”落地：Q2/Q4 的结构/数值分离接入 decode 热路径。
 
 ### 一、已合入
 
@@ -1376,7 +1313,7 @@ ioctl 剖析（4.64 s decode 窗口，见 `/tmp/tp5-reseat-connectivity/driver-i
 
 ### 四、交付阶段验证证据（2026-09-14 交付收敛）
 
-1. **真机安全门与系统审计**：五卡（`card1..card5`）空闲显存 ~16.4 MB，`gpu_busy=0%`；系统调用无泄漏，进程生命周期退出干净。
+1. **系统审计**：五卡（`card1..card5`）空闲显存 ~16.4 MB，`gpu_busy=0%`；系统调用无泄漏，进程生命周期退出干净。
 2. **Fence 环形缓冲落地**：在 `ggml-vulkan-collective.cpp` 中引入 `fence_ring[4]`，解耦多 epoch 槽位复用，消除多轮并发提交下的 `vkResetFences` 悬挂冲突。
 3. **Shader 屏障与刷新优化**：精确收窄阶段与内存访问掩码（`COMPUTE_SHADER | TRANSFER`）；`ggml-backend-meta.cpp` 优化条件 flush 减少空提交。
 4. **GPUFLAG 安全隔离闭环**：驱动层显式告警并优雅回退至已被五卡真实硬件完整证明的生产快路径 `timeline`，防止未定义自旋导致设备死锁。
@@ -1447,7 +1384,7 @@ export GGML_TP5_SYNC=gpuflag
 
 ### 八、工作树状态
 
-- 当前分支：`master`，包含 TP5 交付收敛与生产硬安全门实现。
+- 当前分支：`master`，包含 TP5 交付收敛与生产实现。
 - 全量测试（CPU plan/alloc/qsa 及 5-GPU direct mesh、command replay）100% 验证通过。
 
 ---

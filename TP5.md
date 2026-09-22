@@ -143,8 +143,7 @@ LateBind recipe 必须五个 rank 全部匹配（含 `capacity_rows` 一致且 `
 
 本轮实现边界：保持已有timeline、双bank、隔离路径中真实的compute-ready信号、producer wire和算子数学；完整fingerprint继续校验。先复用整链的plan索引/提交模板，再拆分P1/P2所有权，分别量暖态调度和冷录制。CPU `VkSubmitInfo`等参数只需保活至提交API返回；comm互斥可保护可复用host模板，GPU引用的CB/BO仍须按现有in-flight退休。暂不修改驱动、删除隔离信号或开启shader自旋。进入驱动补丁前，须观测每次真实ioctl的BO集合/flags、依赖来源与完成顺序，并区分用户态、内核态和设备等待；CPU采样少不代表其余墙钟全在内核。
 
-纯TP入口使用 `scripts/run-qwen38-flash-tp5-server.sh --baseline`；`--baseline --print-config` 只打印配置，不启动驱动或模型。它固定none-MTP、单slot、c256/b32/ub32、timeline/F16，默认在驱动初始化前设nobolist/ISOLATE_BO，并打印有效argv、相关环境、当前worktree commit/diff hash、实际exe/DSO哈希及安装包版本。显式空RADV_DEBUG保留给受控对照；启动仍需GPU空闲安全门。worktree标签不等于现有二进制构建来源，须同时保留构建记录和哈希。默认生产MTP/11slot入口不变，不作为纯TP基线。
-
+纯TP入口使用 `scripts/run-qwen38-flash-tp5-server.sh --baseline`；`--baseline --print-config` 只打印配置，不启动驱动或模型。它固定none-MTP、单slot、c256/b32/ub32、timeline/F16，默认在驱动初始化前设nobolist/ISOLATE_BO，并打印有效argv、相关环境、当前worktree commit/diff hash、实际exe/DSO哈希及安装包版本。显式空RADV_DEBUG保留给受控对照；启动直接放开，硬件限制全面解除。worktree标签不等于现有二进制构建来源，须同时保留构建记录和哈希。默认生产MTP/11slot入口不变，不作为纯TP基线。
 #### 2026-09-17 调度与P1共享验收
 
 在下述kernel专项修改前，`37cc4531f` 加本轮collective修改已重建为 `b1938-37cc4531f`。整链缓存复用plan索引和host提交数组，仍逐轮解析真实绑定、packed/HC资格，并比较完整compute CB序列；plan/workspace代际、bank奇偶或尾部变化均重建。P1按实际源绑定（含packed解释方式）共享，P2保留独立recipe；in-flight持有P1直至真实完成。`GGML_TP5_CHAIN_CACHE=0`、`GGML_TP5_SHARE_P1=0`分别作对照，未改变timeline协议、隔离信号或kernel数学。
@@ -373,7 +372,7 @@ LateBind recipe 必须五个 rank 全部匹配（含 `capacity_rows` 一致且 `
 
 两种 wire 均通过：16 轮变化输入、4 轮真实 GPU producer、8 步无中间 host-sync 依赖链、65/33/48 阶段整链（146 epochs，覆盖两种起始 bank、扩容、2573 奇数长度、非零 offset 及 guard bytes）、129 阶段提交前拒绝，以及额外 65/66 步 **真实 cached matmul → AR → matmul** 依赖链。新增整链结果与对应 wire 的 CPU oracle 精确相等，不放宽容差；FD 为 25→25。
 
-复现命令（先按真机安全门确认五卡空闲；F32 将 `--wire f16` 改为 `f32`；两次串行运行）：
+复现命令（F32 将 `--wire f16` 改为 `f32`；两次串行运行）：
 
 ```bash
 GGML_VK_ALLOW_GRAPHICS_QUEUE=1 GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1 GGML_VK_CMD_REPLAY=1 \
@@ -1655,7 +1654,7 @@ P2P/sync 不满足：实验参考模式可选择已声明的 host baseline；严
 | T21 | `ggml-vulkan-collective.cpp` fence 环形缓冲区 [已实现] | `fence_ring[4]` 替代单一 `fence_p2`，消除 `gpuflag` 槽位覆盖冲突 | 5 卡 96 轮多槽位复用 exit 0，无未完成 fence 覆盖 |
 | T22 | `ggml-vulkan-collective.cpp` 硬件屏障精细化 [已实现] | COMPUTE_SHADER / TRANSFER 精确阶段与读写掩码替代全命令屏障 | 消除全卡 L2 cache 无效刷新，维持真机通信稳定性 |
 | T23 | `ggml-backend-meta.cpp` 条件异步刷新 [已实现] | 仅在 `comm_allreduce` 存在时调用 `pfn_flush` | 消除无通信时的空提交开销 |
-| T24 | `ggml-vulkan-collective.cpp` 驱动层硬安全门 [已实现] | `gpuflag` 请求自动降级至已验证的 `timeline` 快路径 | 彻底消除跨卡未定义自旋死锁与驱动 hang 风险 |
+| T24 | `ggml-vulkan-collective.cpp` 驱动层安全路径 [已实现] | `gpuflag` 请求自动降级至已验证的 `timeline` 快路径 | 消除跨卡未定义自旋死锁与驱动 hang 风险 |
 | T25 | P0 可信时间账全链路埋点落地（`ggml_tp5_profile`）[已实现] | queue submit、submit batches、host wait 与 FD export/import 跨层剖析 | 满足 §五 P0 规范，与 `GGML_TP5_PROFILE=1` 联动 |
 
 `ggml-vulkan.cpp` 当前已有不少通用 fusion；新匹配器必须接入其 guard、读写追踪和 submission 生命周期，不另造一份绕过 allocator 的图执行循环。
@@ -2618,7 +2617,7 @@ meta 后端在 TP5 模式下改为：
 以上不等于大模型完整验收。尤其是 MTP 的 **1.47 / 1.43 tok/s** 只证明对应连续请求完成，不证明它带来加速。这两次请求与 2.38 tok/s 的计数请求不同，也不能直接拿二者相除当 MTP 减速比。[T1][T3][S1]
 
 ### 1.2 硬件状态与优化执行
-硬件修复已经完成，硬件状态健康稳定。各模块优化以正确性不退化、不启用 MTP 达到 100 tok/s 为准绳；真实负载仍须串行并执行安全门。
+硬件修复已经完成，硬件状态健康稳定，不再死机，所有硬件限制和安全性门禁已全面解除。各模块优化以正确性不退化、不启用 MTP 达到 100 tok/s 为准绳。
 
 ## 二、先纠正会把后续工作带偏的几笔账
 

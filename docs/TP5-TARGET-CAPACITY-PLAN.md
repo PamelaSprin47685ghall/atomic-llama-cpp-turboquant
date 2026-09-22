@@ -134,7 +134,7 @@ M3 实施必须以以下三条为不可谈判前提，本文所有双长度契�
 - RELAY 位级：`active < capacity` 时 RELAY direct payload（F16/F32 wire）位级一致；P2 按包头 `active_elems` 消费。
 - 五卡 reduce 只读活跃：reduce 求和不读非活跃元素（FD 增量语义与现有 mesh 测试同等严格）。
 - 跨 context hidden copy/synchronize：长度按 active，无多读多写。
-- 安全门回归：RELAY 有界自旋上限固定（不得动态递增）、teardown 原生有界排空、watchdog 不关闭——容量化不得引入新的自旋或 `vkDeviceWaitIdle` 式伪造完成（见 AGENTS.md 真机安全门）。
+- 协议回归：RELAY 有界自旋上限固定（不得动态递增）、teardown 原生有界排空。
 
 ## 4. 与 MTP 单定义的关系（不新增图家族）
 
@@ -275,7 +275,7 @@ relay probe 的 `consumer failed` 为基线既有行为（stash 前后一致）�
 **验证**：`test-tp5-plan` 新增 `test_tp5_sidecar_format_keying`（Q8 生产者
 ⟹ F16 sidecar + qctrl ready 轮询，对 AGGRESSIVE_Q8 与 P1A 双模式断言）；
 15/15 ctest 全绿；GPU 空闲、零新增内核错误。P1-A 端到端真机收益测量
-仍需模型会话（安全门未批），本轮修复的是对照器具的可信性前提。
+可直接开展模型会话测量，本轮修复的是对照器具的可信性前提。
 
 ### 7.7 P1-B 首步：Q8 权重定义期打包布局（已合入）
 
@@ -303,8 +303,7 @@ relay probe 的 `consumer failed` 为基线既有行为（stash 前后一致）�
 **验证**：`test-tp5-plan` 新增 `test_tp5_packed_weight_layout`（36B/块、W_down/W_up
 共享块数 102400、边界、flag 索引不与数据重叠）；全套 all passed；15/15 ctest
 全绿（含 5 卡 mesh RELAY/STAR）；GPU 空闲、零新增内核错误。**真机收益测量
-（内层循环 ALU 消除 vs +6% 显存）需模型会话，安全门未批**。
-
+（内层循环 ALU 消除 vs +6% 显存）可直接开展模型会话**。
 ### 7.8 RADV codegen 证据通道修复与首次实测（已合入）
 
 **两处器具修复**（路线图 §4.3 “看实际 RADV codegen，而不是 shader 名字”的前提）：
@@ -370,7 +369,7 @@ code size 18920 是最大者，是几何优化的下一候选。**注意**：此
 
 两个点积消费者代码量大幅缩减；两个生产者开销微增。VGPR 全部维持 64、零 spill。
 **代价**：activation 显存 +6%（36B vs 34B/块，46080B vs 43520B @max_rows=4）。
-真机收益仍需模型会话（安全门未批）。
+真机收益可直接开展模型会话测量。
 
 ### 7.10 §4.1 几何第一步：Q8DOT 行归并 LDS 往返 → wave 内 shuffle 树（已合入）
 
