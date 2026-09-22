@@ -276,3 +276,31 @@ relay probe 的 `consumer failed` 为基线既有行为（stash 前后一致）�
 ⟹ F16 sidecar + qctrl ready 轮询，对 AGGRESSIVE_Q8 与 P1A 双模式断言）；
 15/15 ctest 全绿；GPU 空闲、零新增内核错误。P1-A 端到端真机收益测量
 仍需模型会话（安全门未批），本轮修复的是对照器具的可信性前提。
+
+### 7.7 P1-B 首步：Q8 权重定义期打包布局（已合入）
+
+**问题**：Q8DOT/UP_Q8DOT 的内层点积循环每 k 迭代对权重块执行两次
+`pack_q8_pair`（i16→i32 位拼接，约 6–8 条 ALU），而 `dotPacked4x8EXT` 本体仅
+1–2 条 VALU。权重流量（W_down 3.5MB + W_up 3.5MB/rank/token，是 activation 的
+320 倍）使该打包开销在每 token 重复支付。
+
+**改动**（路线图 P1-B 首步，位级等价重排，无需精度校准）：
+
+1. **新布局 `late_q8_packed`**：`float d; uint qs_words[8]` = 36B/块（vs
+   `late_q8_0` 34B）。块数与索引不变（仅元素尺寸变）；索引 0 保留为持久
+   done 标志，数据块 i 位于索引 i+1。
+2. **一次性转换 shader `TP5_LATE_PACK_WEIGHTS`**：读 `late_q8_0` 写 packed；
+   首次执行后由 done 标志自禁用（权重为不可变模型数据，plan 持有目标缓冲
+   全生命周期）。
+3. **发射位置**：pack dispatch 记录在 `cmd_late_pre` 头部（`mb_in` 后、
+   inject 前），经 pre tape 进入线性链——每 stage 重放均为单次 guard 读空转。
+4. **标志初始化**：plan 创建期（冷路径）以专用 fill CB + fence wait 将两块
+   packed 缓冲的前 4 字节清零——防未初始化设备内存或先前 plan 释放的缓冲
+   别名导致 flag==1 而跳过本次 pack（读到旧权重）。
+5. **描述符**：Q8DOT 绑定 0 与 UP_Q8DOT 绑定 0 改接 packed 缓冲；
+   activation 侧维持 `late_q8_0`（ACT_Q8 每块写一次，打包成本被全部输出行摊销）。
+
+**验证**：`test-tp5-plan` 新增 `test_tp5_packed_weight_layout`（36B/块、W_down/W_up
+共享块数 102400、边界、flag 索引不与数据重叠）；全套 all passed；15/15 ctest
+全绿（含 5 卡 mesh RELAY/STAR）；GPU 空闲、零新增内核错误。**真机收益测量
+（内层循环 ALU 消除 vs +6% 显存）需模型会话，安全门未批**。

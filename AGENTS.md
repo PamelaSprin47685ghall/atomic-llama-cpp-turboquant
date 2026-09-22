@@ -1,5 +1,61 @@
 # AGENTS.md
 
+## 下班交接｜2026-09-22（第十三轮，路线图审计 + P1-B 首步：Q8 权重定义期打包布局）
+
+**分支：** `master`（本轮 commit 见 git log；基于 `3e3e11bb3`）
+**主题：** 新路线图讨论稿到达后先做全量审计——发现讨论稿所列 P0/M1/M2 代码项**已全部由前几轮落地**
+（讨论稿基点 `fe46587f8` 落后当前 57 个提交）；随后攻下路线图 P1-B 首步（Q8 打包布局）。
+全程 CPU + 既有 GPU 回归，未启动模型。
+
+### 一、路线图审计结论（讨论稿 vs 当前源码）
+
+| 讨论稿条目 | 当前源码状态 | 证据 |
+|---|---|---|
+| P0-1 Q mailbox ABI 统一 | **已落地**：`tp5_late_q_control_offset/payload_word_offset` 单一来源；定义期对齐/范围断言；上轮补齐格式跟随 Q8 生产者 | collective.cpp:172–199, 2163–2171 |
+| P0-2 F32-Q 输入生命周期 | **已落地**：exact 路径 `q_norm_barrier`（WAR，SHADER_READ→WRITE on trefs）先于 norm；aggressive 同构 | collective.cpp:5090–5115 |
+| §2.2 MTP phase 切换打断图复用 | **已落地**：`ubatch_execution_phase` 对 predefined MTP 恒返 0；测试 `predefined_mtp_phase_invalidation_exemption` 覆盖 1→4→1→2 | llama-context.h:629–649, test-mtp-workspace:172 |
+| M2 cycle 闭环账本 | **已落地**：draft/target/catchup/handoff 微秒 + tokens + eff 比率 + device_hidden 标志，单 cycle 与 summary 双格式化 | speculative.cpp:15–60 |
+| §三 语义覆盖记录 | **已落地**：五类别（fixed_compute/dynamic_compute/data_movement/state_writes/dependency_boundaries）定义期评估 + fail-closed | ggml-vulkan-tp5-coverage.h 全文件 |
+| §4.1 完成依赖收窄 | **已落地**：`synchronized_generation` epoch 检查避免冗余跨 context sync | llama-predefined-hidden.cpp:145–244 |
+| M1 无效行不写 KV | **已落地**：`set_rows_indirect` EXTENT_TOKENS 间接派发 + 行边界可除性检查 | ggml-vulkan.cpp:10304+ |
+
+**结论**：讨论稿的正确部分已全部在库；剩余项（P1-B/C、P2、P3、真机收益）全部需要真机测量。
+本轮选择 P1-B 作为唯一可纯代码落地的下一项。
+
+### 二、P1-B 首步：Q8 权重打包布局（本轮主交付）
+
+**动机**：Q8DOT/UP_Q8DOT 内层每 k 迭代对权重执行 2 次 `pack_q8_pair`（i16→i32，
+约 6–8 ALU），而 `dotPacked4x8EXT` 本体仅 1–2 VALU。权重流量 7MB/rank/token
+（activation 的 320 倍），打包开销每 token 重复支付。
+
+**实现**（位级等价，无需精度校准）：
+
+1. `late_q8_packed { float d; uint qs_words[8]; }` 36B/块；索引 0 = 持久 done 标志，
+   数据块 i 位于 i+1；块数与索引数学与 `late_q8_0` 完全一致；
+2. `TP5_LATE_PACK_WEIGHTS` 一次性转换 shader（自禁用：done 标志后每次重放为单次 guard 读）；
+3. pack dispatch 记录在 `cmd_late_pre` 头部（`mb_in` 后、inject 前），经 pre tape
+   进入线性链——每 stage 重放均自禁用空转；
+4. **标志初始化**（本轮关键安全设计）：plan 创建期以专用 fill CB + fence wait
+   清零 packed 缓冲前 4 字节——防未初始化设备内存或先前 plan 释放缓冲的别名
+   （flag==1）跳过本次 pack 而读到旧权重；
+5. Q8DOT/UP_Q8DOT 绑定 0 改接 packed 缓冲；activation 维持 `late_q8_0`（ACT_Q8 每块写一次，
+   打包成本被全部输出行摊销，不值得动）。
+
+**代价**：+6% 权重显存（36B vs 34B/块）；每 plan 两个 packed 缓冲（W_down/W_up 同块数 102400，共 7.37MB）。
+
+### 三、验证
+
+- `test-tp5-plan` 新增 `test_tp5_packed_weight_layout`（36B/块、W_down/W_up 共享块数、
+  边界、flag 索引不与数据重叠）；全套 all passed；
+- 15/15 ctest 全绿（含 5 卡 mesh RELAY/STAR 96 轮）；GPU 全程空闲、零新增内核错误。
+
+### 四、未闭合与下一步
+
+1. **P1-B 真机收益**（内层 ALU 消除 vs +6% 显存）需模型会话，安全门未批；
+2. P1-C（sidecar transport 三选一：host push / publisher / BAR pull）需真机测量；
+3. 路线图 §4.1 的进一步收窄（epoch 级依赖而非 context 级）需资源寿命证明，未动；
+4. 跨层 chunk 流式（P3-A）、单卡 MTP（P3-B 变体）维持路线图原判：先证明 Y/Q 双流收益再动。
+
 ## 下班交接｜2026-09-22（第十二轮，P1-A 对照器具三处修复：sidecar 格式键位 / barrier 容量覆盖 / norm_ready 发射）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `fe41c4363`）

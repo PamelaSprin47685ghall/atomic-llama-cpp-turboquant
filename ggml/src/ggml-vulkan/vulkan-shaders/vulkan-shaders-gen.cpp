@@ -969,6 +969,10 @@ void process_shaders() {
                   {
                       { "TP5_LATE_ACT_Q8", "1" }
     });
+    string_to_spv("tp5_hc_late_pack", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_PACK_WEIGHTS", "1" }
+    });
     string_to_spv("tp5_hc_late_q_q8dot", "tp5_hc_latebind.comp",
                   {
                       { "TP5_LATE_Q_Q8DOT", "1" }

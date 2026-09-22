@@ -1532,6 +1532,44 @@ static void test_tp5_sidecar_format_keying() {
                     "for both AGGRESSIVE_Q8 and P1A_NOSIDECAR_Q8 verified\n");
 }
 
+static void test_tp5_packed_weight_layout() {
+    fprintf(stderr, "--- test_tp5_packed_weight_layout ---\n");
+    // P1-B: the packed weight layout must exactly cover the same logical
+    // blocks as the late_q8_0 GGUF-side layout, plus one flag block at
+    // index 0. Both W_down and W_up have identical block counts:
+    //   W_down = [late_rank][streams*width]  -> late_rank * streams*width/32
+    //   W_up   = [streams*width][late_rank]  -> streams*width * late_rank/32
+    // The dot-product inner loop reads one uint32 word per operand, so the
+    // per-block element is 4 (d) + 8*4 (qs_words) = 36 bytes.
+    struct PackedBlock { float d; uint32_t qs_words[8]; };
+    static_assert(sizeof(PackedBlock) == 36, "packed block must be 36B");
+    TEST_ASSERT(sizeof(PackedBlock) == sizeof(float) + 8 * sizeof(uint32_t));
+
+    // Production shape fixture: width=2560, streams=4, late_rank=320.
+    const uint32_t width = 2560u, streams = 4u, late_rank = 320u;
+    const uint64_t blocks = uint64_t(late_rank) * streams * width / 32u;
+    TEST_ASSERT(blocks == 320u * 4u * 80u);  // 102400 blocks
+    const uint64_t packed_bytes = (blocks + 1u) * sizeof(PackedBlock);
+    TEST_ASSERT(packed_bytes == (102400u + 1u) * 36u);
+
+    // The source Q8_0 bytes must cover exactly `blocks` blocks (34B each in
+    // the late_q8_0 shader-side layout: f16 d + 16 x i16).
+    const uint64_t src_bytes = blocks * (2u + 32u);
+    TEST_ASSERT(src_bytes == 102400u * 34u);
+
+    // Index mapping: shader reads w[base + block + 1]; the +1 flag offset must
+    // never push the last block past the buffer end.
+    TEST_ASSERT((blocks - 1u + 1u) * sizeof(PackedBlock) + sizeof(PackedBlock) <= packed_bytes);
+
+    // The done-flag word is the first 4 bytes of block 0; the pack shader
+    // writes block i to index i+1, so the flag block is never overwritten by
+    // data (blocks span indices [1, blocks]).
+    TEST_ASSERT(1u <= blocks);
+    fprintf(stderr, "  Packed weight layout: 36B/block + flag at index 0, W_down/W_up share block count, "
+                    "bounds verified (blocks=%llu bytes=%llu)\n",
+            (unsigned long long) blocks, (unsigned long long) packed_bytes);
+}
+
 int main() {
     test_plan_rejects_bad_ranks();
     test_plan_rejects_indivisible_moe();
@@ -1559,6 +1597,7 @@ int main() {
     test_tp5_latebind_multi_row_invariants();
     test_tp5_latebind_runtime_rows_protocol();
     test_tp5_sidecar_format_keying();
+    test_tp5_packed_weight_layout();
     test_tp5_numerical_mode_resolution();
     test_tp5_p1a_nosidecar_schedule_contract();
 

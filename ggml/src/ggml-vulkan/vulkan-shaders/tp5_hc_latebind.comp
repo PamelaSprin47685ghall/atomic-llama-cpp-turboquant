@@ -11,7 +11,7 @@
     defined(TP5_LATE_Q_Q8DOT) || defined(TP5_LATE_UP_Q8DOT)
 #include "tp5_hc_subgroup.glsl"
 #endif
-#if defined(TP5_LATE_Q_Q8DOT) || defined(TP5_LATE_UP_Q8DOT)
+#if defined(TP5_LATE_Q_Q8DOT) || defined(TP5_LATE_UP_Q8DOT) || defined(TP5_LATE_PACK_WEIGHTS)
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
@@ -29,6 +29,51 @@ struct late_q8_0 {
     float16_t d;
     int16_t   qs[16];
 };
+
+// Definition-time packed weight layout (P1-B). The dot-product inner loop
+// consumes uint32 words directly, so no per-iteration i16->i32 packing ALU
+// remains in the hot path. Same block count and indexing as late_q8_0; only
+// the element size differs (36B vs 34B). Conversion is bit-exact.
+struct late_q8_packed {
+    float   d;
+    uint    qs_words[8];
+};
+
+#ifdef TP5_LATE_PACK_WEIGHTS
+// One-shot weight repack: late_q8_0 -> late_q8_packed, recorded once at plan
+// definition into cmd_late_pre. The first uint of the destination is a
+// persistent done flag: after the first execution every later replay of this
+// command buffer exits immediately (weights are immutable model data; the
+// plan owns the destination buffer for its whole lifetime).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer SrcWeights { late_q8_0 src[]; };
+layout(std430, binding = 1) coherent buffer DstPacked { late_q8_packed dst[]; };
+
+layout(push_constant) uniform PackParams {
+    uint blocks;
+} p;
+
+void main() {
+    if (floatBitsToUint(dst[0].d) == 1u) return;
+    const uint block = gl_GlobalInvocationID.x;
+    if (block >= p.blocks) return;
+    const late_q8_0 s = src[block];
+    late_q8_packed out_block;
+    out_block.d = float(s.d);
+    [[unroll]] for (uint w = 0u; w < 8u; ++w) {
+        const uint lo = uint(uint16_t(s.qs[2u * w]));
+        const uint hi = uint(uint16_t(s.qs[2u * w + 1u]));
+        out_block.qs_words[w] = (lo & 0xffffu) | ((hi & 0xffffu) << 16u);
+    }
+    dst[block + 1u] = out_block;
+    memoryBarrierBuffer();
+    barrier();
+    if (gl_GlobalInvocationID.x == 0u) {
+        if (floatBitsToUint(dst[0].d) != 1u) dst[0].d = uintBitsToFloat(1u);
+    }
+}
+#endif
 
 #ifdef TP5_LATE_INJECT
 // Aggressive long-K inject: four stream workgroups remain independent, but
@@ -114,7 +159,7 @@ void main() {
 // Reduction is deliberately reassociated through shared memory.
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer UpWeightsQ8 { late_q8_0 up_w[]; };
+layout(std430, binding = 0) readonly buffer UpWeightsQ8 { late_q8_packed up_w[]; };
 layout(std430, binding = 1) readonly buffer LoQ8Input { late_q8_0 lo_q8_in[]; };
 layout(std430, binding = 2) readonly buffer NormalizedInput { float norm_in[]; };
 layout(std430, binding = 3) writeonly buffer MixedOutput { float mixed_out[]; };
@@ -156,14 +201,16 @@ void main() {
             if (row < p.width) {
             [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
                 const uint weight_row = stream * p.width + row;
-                const late_q8_0 w = up_w[weight_row * blocks + block];
+                // Packed weights (P1-B): block i lives at index i + 1;
+                // index 0 is the persistent pack done flag.
+                const late_q8_packed w = up_w[weight_row * blocks + block + 1u];
                 int32_t isum = 0;
                 [[unroll]] for (uint k = 0u; k < 8u; ++k) {
-                    const int32_t wp = pack_up_q8_pair(w.qs[2u*k], w.qs[2u*k + 1u]);
+                    const int32_t wp = int32_t(w.qs_words[k]);
                     const int32_t ap = pack_up_q8_pair(a.qs[2u*k], a.qs[2u*k + 1u]);
                     isum += dotPacked4x8EXT(wp, ap);
                 }
-                    partial[stream] = float(isum) * (float(w.d) * float(a.d));
+                    partial[stream] = float(isum) * (w.d * float(a.d));
                 }
             }
             up_partial[row_slot * 10u + block] = partial;
@@ -266,7 +313,7 @@ void main() {
 // produces 16 rows with half the waves of one-row-per-wave scheduling.
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer DownWeightsQ8 { late_q8_0 w_q8[]; };
+layout(std430, binding = 0) readonly buffer DownWeightsQ8 { late_q8_packed w_q8[]; };
 layout(std430, binding = 1) readonly buffer ActivationQ8 { late_q8_0 act_q8[]; };
 // Cached HOST_VISIBLE|HOST_COHERENT|DEVICE_COHERENT_AMD local VRAM. The
 // The compact F16 sidecar starts at p.late_word_offset. The immediately
@@ -309,15 +356,17 @@ void main() {
         const uint token_act_offset = token * (p.streams * blocks);
         for (uint block = lane16; block < blocks; block += 16u) {
             [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
-                const uint wi = (row * 4u + stream) * blocks + block;
+                // Packed weights (P1-B): block i lives at index i + 1;
+                // index 0 is the persistent pack done flag.
+                const uint wi = (row * 4u + stream) * blocks + block + 1u;
                 const uint ai = token_act_offset + stream * blocks + block;
                 int32_t isum = 0;
                 [[unroll]] for (uint k = 0u; k < 8u; ++k) {
-                    const int32_t wp = pack_q8_pair(w_q8[wi].qs[2u*k], w_q8[wi].qs[2u*k + 1u]);
+                    const int32_t wp = int32_t(w_q8[wi].qs_words[k]);
                     const int32_t ap = pack_q8_pair(act_q8[ai].qs[2u*k], act_q8[ai].qs[2u*k + 1u]);
                     isum += dotPacked4x8EXT(wp, ap);
                 }
-                acc[stream] = fma(float(isum), float(w_q8[wi].d) * float(act_q8[ai].d), acc[stream]);
+                acc[stream] = fma(float(isum), w_q8[wi].d * float(act_q8[ai].d), acc[stream]);
             }
         }
         row_partial[lid] = acc;

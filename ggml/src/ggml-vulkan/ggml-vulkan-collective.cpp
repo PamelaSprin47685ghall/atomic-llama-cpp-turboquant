@@ -429,6 +429,9 @@ struct tp5_rank {
     VkPipeline late_lo_q8_pipe = VK_NULL_HANDLE;
     VkPipelineLayout late_lo_q8_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout late_lo_q8_dsl = VK_NULL_HANDLE;
+    VkPipeline late_pack_pipe = VK_NULL_HANDLE;
+    VkPipelineLayout late_pack_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout late_pack_dsl = VK_NULL_HANDLE;
     VkPipeline late_up_q8dot_pipe = VK_NULL_HANDLE;
     VkPipelineLayout late_up_q8dot_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout late_up_q8dot_dsl = VK_NULL_HANDLE;
@@ -824,6 +827,14 @@ struct tp5_cached_plan {
     std::vector<VkDeviceMemory>  late_act_q8_mem;
     std::vector<VkBuffer>        late_lo_q8_buf;
     std::vector<VkDeviceMemory>  late_lo_q8_mem;
+    // P1-B packed weights: definition-time repack of W_down/W_up into
+    // uint32-word layout; the pack dispatch is recorded at the head of
+    // cmd_late_pre and self-disables via a persistent done flag.
+    std::vector<VkBuffer>        late_down_packed_buf;
+    std::vector<VkDeviceMemory>  late_down_packed_mem;
+    std::vector<VkBuffer>        late_up_packed_buf;
+    std::vector<VkDeviceMemory>  late_up_packed_mem;
+    std::vector<VkDescriptorSet> late_pack_ds;
     tp5_numerical_mode           numerical_mode = tp5_numerical_mode::REFERENCE;
     tp5_numerical_reason         numerical_reason = tp5_numerical_reason::NONE;
     bool                         late_q8_fast = false;
@@ -1076,6 +1087,26 @@ struct tp5_comm {
                 r.vkdev != VK_NULL_HANDLE) {
                 vkFreeMemory(r.vkdev, plan.late_lo_q8_mem[i], nullptr);
                 plan.late_lo_q8_mem[i] = VK_NULL_HANDLE;
+            }
+            if (i < plan.late_down_packed_buf.size() && plan.late_down_packed_buf[i] != VK_NULL_HANDLE &&
+                r.vkdev != VK_NULL_HANDLE) {
+                vkDestroyBuffer(r.vkdev, plan.late_down_packed_buf[i], nullptr);
+                plan.late_down_packed_buf[i] = VK_NULL_HANDLE;
+            }
+            if (i < plan.late_down_packed_mem.size() && plan.late_down_packed_mem[i] != VK_NULL_HANDLE &&
+                r.vkdev != VK_NULL_HANDLE) {
+                vkFreeMemory(r.vkdev, plan.late_down_packed_mem[i], nullptr);
+                plan.late_down_packed_mem[i] = VK_NULL_HANDLE;
+            }
+            if (i < plan.late_up_packed_buf.size() && plan.late_up_packed_buf[i] != VK_NULL_HANDLE &&
+                r.vkdev != VK_NULL_HANDLE) {
+                vkDestroyBuffer(r.vkdev, plan.late_up_packed_buf[i], nullptr);
+                plan.late_up_packed_buf[i] = VK_NULL_HANDLE;
+            }
+            if (i < plan.late_up_packed_mem.size() && plan.late_up_packed_mem[i] != VK_NULL_HANDLE &&
+                r.vkdev != VK_NULL_HANDLE) {
+                vkFreeMemory(r.vkdev, plan.late_up_packed_mem[i], nullptr);
+                plan.late_up_packed_mem[i] = VK_NULL_HANDLE;
             }
         }
         plan.owners.clear();
@@ -1510,6 +1541,8 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
                 r.caps.subgroup_max_size >= 32u;
             if (q8_wave32) {
                 const bool q8_ok =
+                    make_late(2, 4, tp5_hc_late_pack_data, tp5_hc_late_pack_len,
+                              r.late_pack_dsl, r.late_pack_layout, r.late_pack_pipe) &&
                     make_late(6, 16, tp5_hc_late_act_q8_data, tp5_hc_late_act_q8_len,
                               r.late_act_q8_dsl, r.late_act_q8_layout, r.late_act_q8_pipe, 32u) &&
                     make_late(3, 28, tp5_hc_late_q_q8dot_data, tp5_hc_late_q_q8dot_len,
@@ -1519,6 +1552,12 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
                     make_late(5, 20, tp5_hc_late_up_q8dot_data, tp5_hc_late_up_q8dot_len,
                               r.late_up_q8dot_dsl, r.late_up_q8dot_layout, r.late_up_q8dot_pipe, 32u);
                 if (!q8_ok) {
+                    if (r.late_pack_pipe) { vkDestroyPipeline(r.vkdev, r.late_pack_pipe, nullptr);
+                                           vkDestroyPipelineLayout(r.vkdev, r.late_pack_layout, nullptr);
+                                           vkDestroyDescriptorSetLayout(r.vkdev, r.late_pack_dsl, nullptr);
+                                           r.late_pack_pipe = VK_NULL_HANDLE;
+                                           r.late_pack_layout = VK_NULL_HANDLE;
+                                           r.late_pack_dsl = VK_NULL_HANDLE; }
                     if (r.late_act_q8_pipe) vkDestroyPipeline(r.vkdev, r.late_act_q8_pipe, nullptr);
                     if (r.late_q8dot_pipe) vkDestroyPipeline(r.vkdev, r.late_q8dot_pipe, nullptr);
                     if (r.late_lo_q8_pipe) vkDestroyPipeline(r.vkdev, r.late_lo_q8_pipe, nullptr);
@@ -2060,6 +2099,9 @@ void tp5_destroy_rank(tp5_rank & r) {
     if (r.late_inject_pipe) { vkDestroyPipeline(r.vkdev, r.late_inject_pipe, nullptr); r.late_inject_pipe = VK_NULL_HANDLE; }
     if (r.late_q_pipe) { vkDestroyPipeline(r.vkdev, r.late_q_pipe, nullptr); r.late_q_pipe = VK_NULL_HANDLE; }
     if (r.late_act_q8_pipe) { vkDestroyPipeline(r.vkdev, r.late_act_q8_pipe, nullptr); r.late_act_q8_pipe = VK_NULL_HANDLE; }
+    if (r.late_pack_pipe) { vkDestroyPipeline(r.vkdev, r.late_pack_pipe, nullptr); r.late_pack_pipe = VK_NULL_HANDLE; }
+    if (r.late_pack_layout) { vkDestroyPipelineLayout(r.vkdev, r.late_pack_layout, nullptr); r.late_pack_layout = VK_NULL_HANDLE; }
+    if (r.late_pack_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.late_pack_dsl, nullptr); r.late_pack_dsl = VK_NULL_HANDLE; }
     if (r.late_q8dot_pipe) { vkDestroyPipeline(r.vkdev, r.late_q8dot_pipe, nullptr); r.late_q8dot_pipe = VK_NULL_HANDLE; }
     if (r.late_publish_pipe) { vkDestroyPipeline(r.vkdev, r.late_publish_pipe, nullptr); r.late_publish_pipe = VK_NULL_HANDLE; }
     if (r.late_norm_pipe) { vkDestroyPipeline(r.vkdev, r.late_norm_pipe, nullptr); r.late_norm_pipe = VK_NULL_HANDLE; }
@@ -3297,6 +3339,11 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
             plan.late_q8dot_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
             plan.late_lo_q8_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
             plan.late_up_q8dot_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+            plan.late_down_packed_buf.resize(c.n_ranks, VK_NULL_HANDLE);
+            plan.late_down_packed_mem.resize(c.n_ranks, VK_NULL_HANDLE);
+            plan.late_up_packed_buf.resize(c.n_ranks, VK_NULL_HANDLE);
+            plan.late_up_packed_mem.resize(c.n_ranks, VK_NULL_HANDLE);
+            plan.late_pack_ds.resize(2 * c.n_ranks, VK_NULL_HANDLE);
         } else {
             plan.late_q_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
             plan.late_publish_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
@@ -3364,6 +3411,63 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     c.fail("allocation of LateBind Q8 LO buffer failed on rank " + std::to_string(i));
                     return false;
                 }
+                // P1-B packed weight buffers: one extra flag block at index 0.
+                const uint64_t weight_blocks =
+                    uint64_t(late.late_rank) * late.streams * late.width / 32u;
+                const VkDeviceSize packed_bytes =
+                    VkDeviceSize(weight_blocks + 1u) * (sizeof(float) + 8u * sizeof(uint32_t));
+                if (packed_bytes == 0 || packed_bytes > 2u * r.caps.max_storage_buffer_range ||
+                    !tp5_alloc_device_buffer(r, packed_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
+                                             plan.late_down_packed_buf[i], plan.late_down_packed_mem[i],
+                                             nullptr) ||
+                    !tp5_alloc_device_buffer(r, packed_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
+                                             plan.late_up_packed_buf[i], plan.late_up_packed_mem[i],
+                                             nullptr)) {
+                    c.fail("allocation of LateBind packed weight buffers failed on rank " + std::to_string(i));
+                    return false;
+                }
+                // The pack done flag must start at zero: device-local memory
+                // is uninitialized, and a freed earlier plan's buffer could
+                // otherwise alias with flag==1 and silently skip this plan's
+                // pack (stale weights). A dedicated one-shot fill CB with a
+                // fence wait runs only here, at plan creation (cold path).
+                if (r.late_pack_pipe != VK_NULL_HANDLE) {
+                    VkCommandBuffer clear_cmd = VK_NULL_HANDLE;
+                    VkCommandBufferAllocateInfo clear_ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                                         nullptr, r.cmd_pool,
+                                                         VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+                    if (vkAllocateCommandBuffers(r.vkdev, &clear_ai, &clear_cmd) != VK_SUCCESS) {
+                        c.fail("allocation of LateBind pack clear CB failed on rank " + std::to_string(i));
+                    return false;
+                }
+                    VkFence clear_fence = VK_NULL_HANDLE;
+                    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+                    if (vkCreateFence(r.vkdev, &fci, nullptr, &clear_fence) != VK_SUCCESS) {
+                        vkFreeCommandBuffers(r.vkdev, r.cmd_pool, 1, &clear_cmd);
+                        c.fail("creation of LateBind pack clear fence failed on rank " + std::to_string(i));
+                    return false;
+                }
+                    VkCommandBufferBeginInfo clear_bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                    if (vkBeginCommandBuffer(clear_cmd, &clear_bi) == VK_SUCCESS &&
+                        vkEndCommandBuffer(clear_cmd) == VK_SUCCESS) {
+                        vkCmdFillBuffer(clear_cmd, plan.late_down_packed_buf[i], 0, 4u, 0u);
+                        vkCmdFillBuffer(clear_cmd, plan.late_up_packed_buf[i], 0, 4u, 0u);
+                        VkSubmitInfo clear_si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                        clear_si.commandBufferCount = 1;
+                        clear_si.pCommandBuffers = &clear_cmd;
+                        if (vkQueueSubmit(r.queue, 1, &clear_si, clear_fence) == VK_SUCCESS &&
+                            vkWaitForFences(r.vkdev, 1, &clear_fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS) {
+                            // Flag words are zero before any pack replay.
+                        } else {
+                            c.fail("submission of LateBind pack clear failed on rank " + std::to_string(i));
+                        }
+                    } else {
+                        c.fail("recording of LateBind pack clear failed on rank " + std::to_string(i));
+                    }
+                    vkDestroyFence(r.vkdev, clear_fence, nullptr);
+                    vkFreeCommandBuffers(r.vkdev, r.cmd_pool, 1, &clear_cmd);
+                    if (c.failed) return false;
+                }
             } else {
                 const VkDeviceSize late_bytes = (VkDeviceSize) max_late_count * sizeof(float);
                 if (!tp5_alloc_device_buffer(r, late_bytes,
@@ -3379,6 +3483,18 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 if (vkAllocateDescriptorSets(r.vkdev, &inj_ai,
                                              &plan.late_inject_ds[tp5_plan_slot(i, b)]) != VK_SUCCESS) {
                     c.fail("allocation of LateBind inject descriptor failed on rank " + std::to_string(i));
+                    return false;
+                }
+            }
+            if (plan.late_q8_fast && r.late_pack_dsl != VK_NULL_HANDLE) {
+                // P1-B pack descriptors are per-rank: both bank replays of
+                // cmd_late_pre bind the same read-only weight/packed pair.
+                // The pack dispatch self-disables via the persistent done
+                // flag, so the second replay is a no-op guard read.
+                VkDescriptorSetAllocateInfo pk_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr,
+                                                   r.desc_pool, 1, &r.late_pack_dsl};
+                if (vkAllocateDescriptorSets(r.vkdev, &pk_ai, &plan.late_pack_ds[i]) != VK_SUCCESS) {
+                    c.fail("allocation of LateBind pack descriptor failed on rank " + std::to_string(i));
                     return false;
                 }
             }
@@ -3472,6 +3588,11 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 if (plan.late_q8_fast) {
                     const size_t act_elems = max_rows * size_t(late.streams) * late.width;
                     const VkDeviceSize act_q8_bytes = (VkDeviceSize) ggml_row_size(GGML_TYPE_Q8_0, act_elems);
+                    // P1-B packed weight layout: (blocks + 1 flag) * 36B.
+                    const uint64_t weight_blocks =
+                        uint64_t(late.late_rank) * late.streams * late.width / 32u;
+                    const VkDeviceSize packed_bytes =
+                        VkDeviceSize(weight_blocks + 1u) * (sizeof(float) + 8u * sizeof(uint32_t));
                     VkDescriptorBufferInfo act_q8_infos[6] = {
                         {late.bindings[1].buffer, late.bindings[1].offset, late.bindings[1].size},
                         {late.bindings[0].buffer, late.bindings[0].offset, late.bindings[0].size},
@@ -3482,7 +3603,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     };
                     tp5_update_storage_set(r.vkdev, plan.late_act_q8_ds[idx], act_q8_infos, 6);
                     VkDescriptorBufferInfo q8dot_infos[3] = {
-                        {late.down_weight.buffer, late.down_weight.offset, late.down_weight.size},
+                        {plan.late_down_packed_buf[i], 0, packed_bytes},
                         {plan.late_act_q8_buf[i], 0, act_q8_bytes},
                         {r.bcast_buf[b], 0, (VkDeviceSize) c.star_rank_stride},
                     };
@@ -3528,13 +3649,17 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 if (plan.late_q8_fast) {
                     const VkDeviceSize lo_q8_bytes =
                         (VkDeviceSize) ggml_row_size(GGML_TYPE_Q8_0, max_rows * late.late_rank);
+                    const uint64_t weight_blocks =
+                        uint64_t(late.late_rank) * late.streams * late.width / 32u;
+                    const VkDeviceSize packed_bytes =
+                        VkDeviceSize(weight_blocks + 1u) * (sizeof(float) + 8u * sizeof(uint32_t));
                     VkDescriptorBufferInfo lo_q8_infos[5] = {
                         lo_infos[0], lo_infos[1], lo_infos[2], lo_infos[3],
                         {plan.late_lo_q8_buf[i], 0, lo_q8_bytes},
                     };
                     tp5_update_storage_set(r.vkdev, plan.late_lo_q8_ds[idx], lo_q8_infos, 5);
                     VkDescriptorBufferInfo up_q8_infos[5] = {
-                        {late.up_weight.buffer, late.up_weight.offset, late.up_weight.size},
+                        {plan.late_up_packed_buf[i], 0, packed_bytes},
                         {plan.late_lo_q8_buf[i], 0, lo_q8_bytes},
                         {late.bindings[3].buffer, late.bindings[3].offset, late.bindings[3].size},
                         {late.mixed.buffer, late.mixed.offset, late.mixed.size},
@@ -3560,6 +3685,48 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                                       VK_ACCESS_SHADER_READ_BIT};
                 tp5_cmd_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_in, 0, nullptr, 0, nullptr);
+
+                // P1-B: one-shot weight repack (W_down then W_up) into the
+                // uint32-word layout consumed by Q8DOT/UP_Q8DOT. Recorded at
+                // the head of every cmd_late_pre replay; after the first
+                // execution the persistent done flag makes each replay a
+                // single guard-read no-op. Weights are immutable model data,
+                // so the pack result stays valid for the plan's lifetime.
+                if (plan.late_q8_fast && r.late_pack_pipe != VK_NULL_HANDLE &&
+                    plan.late_pack_ds[i] != VK_NULL_HANDLE) {
+                    const uint64_t weight_blocks =
+                        uint64_t(late.late_rank) * late.streams * late.width / 32u;
+                    const VkDeviceSize packed_bytes =
+                        VkDeviceSize(weight_blocks + 1u) * (sizeof(float) + 8u * sizeof(uint32_t));
+                    for (int which = 0; which < 2; ++which) {
+                        const VkBuffer src_buf  = which == 0 ? late.down_weight.buffer : late.up_weight.buffer;
+                        const VkDeviceSize src_off =
+                            which == 0 ? late.down_weight.offset : late.up_weight.offset;
+                        const VkBuffer dst_buf  =
+                            which == 0 ? plan.late_down_packed_buf[i] : plan.late_up_packed_buf[i];
+                        // Two pack descriptor sets: [0]=down, [1]=up.
+                        VkDescriptorBufferInfo pack_infos[2] = {
+                            {src_buf, src_off, (VkDeviceSize) ggml_row_size(
+                                 GGML_TYPE_Q8_0, weight_blocks * 32u)},
+                            {dst_buf, 0, packed_bytes},
+                        };
+                        tp5_update_storage_set(r.vkdev, plan.late_pack_ds[i + which * c.n_ranks],
+                                               pack_infos, 2);
+                        tp5_cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_pack_pipe);
+                        tp5_cmd_bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_pack_layout, 0, 1,
+                                                &plan.late_pack_ds[i + which * c.n_ranks], 0, nullptr);
+                        struct { uint32_t blocks; } pack_pc{uint32_t(weight_blocks)};
+                        static_assert(sizeof(pack_pc) == 4);
+                        tp5_cmd_push(cmd, r.late_pack_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                     sizeof(pack_pc), &pack_pc);
+                        tp5_cmd_dispatch(cmd, uint32_t((weight_blocks + 255u) / 256u), 1, 1);
+                        VkMemoryBarrier mb_pack{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+                        tp5_cmd_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_pack,
+                                             0, nullptr, 0, nullptr);
+                    }
+                }
 
                 tp5_cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_inject_pipe);
                 tp5_cmd_bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_inject_layout, 0, 1,
