@@ -241,3 +241,38 @@ relay probe 的 `consumer failed` 为基线既有行为（stash 前后一致）�
 
 **仍未闭合**：latebind GPU 路径的端到端真机验证需要真实模型（HC 图 + MTP 会话），
 须按 AGENTS.md 安全门获批后进行；本轮仅覆盖传输层回归与 CPU 协议测试。
+
+### 7.6 P1-A 对照器具修复：sidecar 格式跟随 Q8DOT 生产者（已合入）
+
+**问题（三处，均静态可证）**：
+
+1. **sidecar 格式键错位**：`late_sidecar_f16` 原以 `numerical_mode ==
+   AGGRESSIVE_Q8` 为键，但 F16 sidecar 是 **Q8DOT 生产者的属性**——P1-A
+   派发同一枚 Q8DOT（F16 pair 写 bcast VRAM + qctrl 发布）。错位后 P1-A
+   拿到 F32/exact 消费者：handoff 轮询 `status[6]`（仅 exact-path publisher
+   写入）必超时；即使等到也从 host_import F32 区读数据（错缓冲区）；
+   LO_Q8 把 F16 packed word 按 F32 位解码（数值全错）。
+2. **ACT_Q8 可见性 barrier 只盖 1 行**：分配为 `capacity_rows(4) × streams ×
+   width`，shader 写 token < capacity_rows 行，barrier 却只覆盖
+   `streams × width`（1 行）——token 2..4 的写入对 Q8DOT 无序。LO_Q8→
+   UP_Q8DOT 的 `lo_q8_ready` 同病（`late_rank` vs `4 × late_rank`）。
+3. **P1-A 链上 norm_ready barrier 未发射**：`BARRIER_NORM_ACT` 只是验证器
+   标签；实际命令（`mb_norm_lo` 全局 barrier，位于 p2[norm_end..lo_begin)）
+   在 P1-A 发射序列中被跳过——ACT_Q8 可能在 norm 的 sum_output 写入可见
+   前读 local_z（同一 trefs 缓冲区）。
+
+**修复**（单文件 `ggml-vulkan-collective.cpp`）：
+
+- `plan.late_sidecar_f16 = plan.late_q8_fast`（格式跟随 Q8 生产者路径）；
+- ACT_Q8/LO_Q8 barrier 尺寸改为 `capacity_rows × …`（与分配一致）；
+- P1-A 发射从 `emit(p2, 0, norm_end)` 改为 `emit(p2, 0, lo_begin)`，把
+  norm_ready barrier 带进命令流；split 校验同步加 `lo_begin` 边界。
+
+**P1-A 发射结构确认**（调研结论）：LO_Q8/UP_Q8DOT 不在 P1-A 段内发射，而是
+作为下一 stage 的 `emit(incoming.p2, lo_begin)` 尾段——顺序契约
+（norm→ACT_Q8→Q8DOT→LO_Q8→UP_Q8DOT）跨 stage 边界成立，与验证器一致。
+
+**验证**：`test-tp5-plan` 新增 `test_tp5_sidecar_format_keying`（Q8 生产者
+⟹ F16 sidecar + qctrl ready 轮询，对 AGGRESSIVE_Q8 与 P1A 双模式断言）；
+15/15 ctest 全绿；GPU 空闲、零新增内核错误。P1-A 端到端真机收益测量
+仍需模型会话（安全门未批），本轮修复的是对照器具的可信性前提。

@@ -3250,7 +3250,13 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
     plan.numerical_reason = resolved.second;
     plan.late_q8_fast    = (plan.numerical_mode == tp5_numerical_mode::AGGRESSIVE_Q8 ||
                             plan.numerical_mode == tp5_numerical_mode::P1A_NOSIDECAR_Q8);
-    plan.late_sidecar_f16 = (plan.numerical_mode == tp5_numerical_mode::AGGRESSIVE_Q8);
+    // The F16 sidecar format is a property of the Q8DOT producer, not of the
+    // aggressive schedule: P1-A dispatches the same tp5_hc_latebind Q8DOT,
+    // which packs F16 pairs into bcast VRAM and publishes the Q control
+    // region. Keying the format off the mode name left P1-A with F32/exact
+    // consumers: the handoff polled status[6] (written only by the exact-path
+    // publisher) and timed out, and LO decoded F16 words as F32 bits.
+    plan.late_sidecar_f16 = plan.late_q8_fast;
 
     static std::atomic<uint32_t> reported_modes_mask{0};
     const uint32_t mode_bit = 1u << (uint32_t) plan.numerical_mode;
@@ -3591,8 +3597,13 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                                  sizeof(act_pc), &act_pc);
                     tp5_cmd_dispatch(cmd, late.width / 64u, 1, 1);
 
-                    const VkDeviceSize act_q8_bytes =
-                        (VkDeviceSize) ggml_row_size(GGML_TYPE_Q8_0, size_t(late.streams) * late.width);
+                    // The visibility barrier must cover every row the shader
+                    // can write (capacity rows; word 5 only shrinks the loop),
+                    // matching the max_rows-sized allocation. A single-row
+                    // range left tokens 2..4 unordered w.r.t. Q8DOT.
+                    const VkDeviceSize act_q8_bytes = (VkDeviceSize) ggml_row_size(
+                        GGML_TYPE_Q8_0,
+                        size_t(late.capacity_rows ? late.capacity_rows : 1u) * late.streams * late.width);
                     VkBufferMemoryBarrier act_ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
                                                     VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                                     VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
@@ -3777,8 +3788,13 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                                          sizeof(lo_pc), &lo_pc);
                             tp5_cmd_dispatch(cmd, 1, 1, 1);
 
-                            const VkDeviceSize lo_q8_bytes =
-                                (VkDeviceSize) ggml_row_size(GGML_TYPE_Q8_0, late.late_rank);
+                            // Same capacity-coverage rule as the ACT_Q8 barrier:
+                            // the buffer is allocated for max_rows tokens and the
+                            // shader writes token < capacity_rows; the barrier
+                            // must order all of them for the UP_Q8DOT reader.
+                            const VkDeviceSize lo_q8_bytes = (VkDeviceSize) ggml_row_size(
+                                GGML_TYPE_Q8_0,
+                                size_t(late.capacity_rows ? late.capacity_rows : 1u) * late.late_rank);
                             VkBufferMemoryBarrier lo_q8_ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
                                                              VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                                              VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
@@ -4999,16 +5015,23 @@ static bool tp5_define_linear_chain(tp5_comm & c,
                 const size_t q_begin    = outgoing->late_q_begin[slot];
                 const size_t q_contract = outgoing->late_q_contract_begin[slot];
                 const size_t norm_end   = outgoing->late_norm_end[slot];
+                const size_t lo_begin   = outgoing->late_lo_begin[slot];
                 if (!inject_end || q_begin <= inject_end || q_begin > pre.code.size() ||
                     q_contract < q_begin || q_contract > pre.code.size() ||
-                    !norm_end || norm_end > p2.code.size()) {
+                    !norm_end || norm_end > p2.code.size() ||
+                    lo_begin <= norm_end || lo_begin > p2.code.size()) {
                     c.fail("LateBind linear semantic split is invalid"); return false;
                 }
                 if (outgoing->numerical_mode == tp5_numerical_mode::P1A_NOSIDECAR_Q8) {
                     // P1-A measurement instrument: no-sidecar aggressive Q8 HC
                     // Y is ready -> combine/RMS (late_norm) -> norm_ready -> ACT_Q8 -> act_ready ->
                     // down Q8DOT -> q_local_ready -> LO_Q8 -> lo_ready -> UP_Q8DOT.
-                    if (!emit(p2, 0, norm_end)) {
+                    // Emit through lo_begin: the p2 segment [norm_end, lo_begin)
+                    // is exactly the norm_ready global memory barrier. Without
+                    // it, ACT_Q8 could read local_z (trefs) before late_norm's
+                    // sum_output write to the same buffer is visible — the
+                    // BARRIER_NORM_ACT contract would be a label with no command.
+                    if (!emit(p2, 0, lo_begin)) {
                         return false;
                     }
                     linear->late_steps.push_back({tp5_latebind_semantic_step::kind::WRITE_TREFS, "late_norm"});

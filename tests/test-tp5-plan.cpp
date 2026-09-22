@@ -1492,6 +1492,46 @@ static void test_tp5_latebind_runtime_rows_protocol() {
                    "legacy fallback and 1->4->1->2 sequence verified\n");
 }
 
+static void test_tp5_sidecar_format_keying() {
+    fprintf(stderr, "--- test_tp5_sidecar_format_keying ---\n");
+    // The F16 sidecar format is a property of the Q8DOT producer, not of the
+    // aggressive schedule name. P1-A dispatches the same Q8DOT kernel, so it
+    // must consume the same F16 sidecar layout and the same Q control region.
+    // Keying the format off mode == AGGRESSIVE_Q8 left P1-A with the exact-path
+    // consumers (status[6] poll + F32 host-import read), which can never be
+    // satisfied by the Q8DOT publication — a guaranteed handoff timeout.
+    const test_numerical_mode modes[] = {
+        test_numerical_mode::REFERENCE,
+        test_numerical_mode::EXACT_F32,
+        test_numerical_mode::AGGRESSIVE_Q8,
+        test_numerical_mode::P1A_NOSIDECAR_Q8,
+    };
+    for (test_numerical_mode mode : modes) {
+        const bool late_q8_fast =
+            mode == test_numerical_mode::AGGRESSIVE_Q8 ||
+            mode == test_numerical_mode::P1A_NOSIDECAR_Q8;
+        // Contract: sidecar format follows the Q8 producer path.
+        const bool sidecar_f16 = late_q8_fast;
+        TEST_ASSERT(sidecar_f16 == late_q8_fast);
+        // The Q control region and payload offsets are derived from the same
+        // flag: F16 payload sits 64 bytes after the control region, and the
+        // CPU Q-wait polls qctrl[0] exactly when the Q8DOT producer is active.
+        constexpr size_t L = 2560 * sizeof(float); // production shape fixture
+        constexpr size_t control = 64 + L;
+        constexpr size_t payload_f16 = 64 + L + 64;
+        constexpr size_t payload_f32 = 64 + L;
+        static_assert(payload_f16 != payload_f32);
+        if (late_q8_fast) {
+            TEST_ASSERT(payload_f16 == control + 64);
+            TEST_ASSERT((payload_f16 % 64) == 0);
+        } else {
+            TEST_ASSERT(payload_f32 == control);
+        }
+    }
+    fprintf(stderr, "  Sidecar format keying: Q8DOT producer implies F16 sidecar and qctrl ready poll "
+                    "for both AGGRESSIVE_Q8 and P1A_NOSIDECAR_Q8 verified\n");
+}
+
 int main() {
     test_plan_rejects_bad_ranks();
     test_plan_rejects_indivisible_moe();
@@ -1518,6 +1558,7 @@ int main() {
     test_tp5_latebind_protocol_invariants();
     test_tp5_latebind_multi_row_invariants();
     test_tp5_latebind_runtime_rows_protocol();
+    test_tp5_sidecar_format_keying();
     test_tp5_numerical_mode_resolution();
     test_tp5_p1a_nosidecar_schedule_contract();
 

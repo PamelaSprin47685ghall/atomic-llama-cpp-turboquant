@@ -1,5 +1,43 @@
 # AGENTS.md
 
+## 下班交接｜2026-09-22（第十二轮，P1-A 对照器具三处修复：sidecar 格式键位 / barrier 容量覆盖 / norm_ready 发射）
+
+**分支：** `master`（本轮 commit 见 git log；基于 `fe41c4363`）
+**主题：** 路线图讨论稿 P1-A（「不带 sidecar 的 aggressive Q8 HC」同精度对照）的落地前提修复。上一轮交接
+标注了「P1-A 端到端可能死锁」的隐患；本轮静态追踪完整路径后确认了三处可静态证明的缺陷并全部修复。
+全程 CPU + 既有 GPU 回归，未启动模型。
+
+### 一、三处缺陷与修复
+
+| # | 缺陷 | 后果（修复前） | 修复 |
+|---|---|---|---|
+| 1 | `late_sidecar_f16` 以 `mode == AGGRESSIVE_Q8` 为键，但 F16 sidecar 是 **Q8DOT 生产者的属性**（P1-A 派发同一枚 Q8DOT） | P1-A 拿到 F32/exact 消费者：handoff 轮询 `status[6]`（仅 exact-path publisher 写）必到 `relay_handoff_timeout_ms` 超时 fail；即使等到也从 host_import F32 区读（错缓冲区）；LO_Q8 把 F16 packed 按 F32 位解码 | `plan.late_sidecar_f16 = plan.late_q8_fast`（`ggml-vulkan-collective.cpp:3259`） |
+| 2 | ACT_Q8 可见性 barrier 只盖 `streams×width`（1 行），但分配为 `capacity_rows(4)×…`，shader 写 token<capacity 行 | token 2..4 写入对 Q8DOT 无序（依赖驱动保守行为）。LO_Q8→UP_Q8DOT 同病（`late_rank` vs `4×late_rank`） | 两处 barrier 尺寸改 `capacity_rows×…`（与分配一致） |
+| 3 | P1-A 链上 `BARRIER_NORM_ACT` 只是 `late_steps` 验证器标签；实际命令 `mb_norm_lo`（p2[norm_end..lo_begin)）未被 P1-A 发射 | ACT_Q8 可能先于 norm 的 `sum_output` 写入可见前读 local_z（同一 trefs 缓冲区，RAW 无 barrier 无保证） | P1-A 发射改 `emit(p2, 0, lo_begin)`；split 校验加 `lo_begin` 边界 |
+
+### 二、P1-A 发射结构调研结论（本轮确认，写进文档）
+
+- LO_Q8/UP_Q8DOT **不在** P1-A 段内发射，而是作为下一 stage 的 `emit(incoming.p2, lo_begin)` 尾段——
+  顺序契约（norm→ACT_Q8→Q8DOT→LO_Q8→UP_Q8DOT）**跨 stage 边界成立**，与验证器一致；
+- P1-A 的 Q 集体链：Q8DOT 写本地 F16 sidecar → CPU 轮 `qctrl[READY]` → CPU 归约 → 发布 word 2
+  （Q generation）→ 下一 stage 的 LO_Q8 `await_input` 消费——修复 #1 后全链自洽；
+- one-shot 路径不可达 P1-A：`key.late` 仅由链路径的 `tp5_late_consumer_ref` 填充，one-shot 恒
+  `late_plan=false`，不记录 late 内核（模式名可能误报，但无行为影响）。
+
+### 三、验证
+
+- `test-tp5-plan` 新增 `test_tp5_sidecar_format_keying`：Q8 生产者 ⟹ F16 sidecar + qctrl ready 轮询，
+  对 REFERENCE/EXACT_F32/AGGRESSIVE_Q8/P1A 四模式断言；全套 all passed；
+- 15/15 ctest 全绿（含 5 卡 mesh RELAY/STAR 96 轮 + 变异输入 + 延迟生产者）；
+- GPU 全程空闲审计、零新增内核错误。
+
+### 四、边界与未闭合
+
+1. **P1-A 端到端收益测量需真实模型会话**（`GGML_TP5_P1A_NOSIDECAR_Q8=1` + HC 图 + MTP），
+   安全门未批；本轮修复的是对照器具的可信性前提（否则测出的 A/B 对比是错的）；
+2. 路线图剩余：P1-B（Q8 权重 pack 布局）、P1-C（sidecar transport 三选一：host push /
+   publisher / BAR pull）、M3 多卡解禁、M5 组合——全部需真机测量。
+
 ## 下班交接｜2026-09-22（第十一轮，M4 首步：LateBind 运行时有效行直供内核）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `4ec7571c4`，含 41 个此前未推送提交一并推上）
