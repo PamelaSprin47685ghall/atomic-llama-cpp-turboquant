@@ -5024,14 +5024,33 @@ struct fp_resident_row {
     std::bitset<LLAMA_MAX_SEQ> sig;
 };
 
-struct fp_resident_scan {
-    std::vector<fp_resident_row> rows;
+struct fp_run_key {
+    uint64_t episode_id = 0;
+    llama_rerot_run_id run_id = 0;
+    bool operator==(const fp_run_key & o) const {
+        return episode_id == o.episode_id && run_id == o.run_id;
+    }
 };
 
-// One pass over resident cells. No reader state is read: the result is valid
-// for every view group of this planning call.
-static void fp_scan_resident(const llama_kv_cells & cells, fp_resident_scan & out) {
+struct fp_run_key_hash {
+    size_t operator()(const fp_run_key & k) const {
+        return std::hash<uint64_t>()(k.episode_id) ^ (std::hash<uint32_t>()(k.run_id) + 0x9e3779b9 + (std::hash<uint64_t>()(k.episode_id) << 6) + (std::hash<uint64_t>()(k.episode_id) >> 2));
+    }
+};
+
+struct fp_resident_scan {
+    std::vector<fp_resident_row> rows;
+    std::vector<fp_base_member> base;
+    std::unordered_map<fp_run_key, std::vector<uint32_t>, fp_run_key_hash> run_buckets;
+};
+
+// One pass over resident cells. Partitions inactive cells into shared_base
+// and active cells into shared run_buckets. No reader state is read: the result
+// is valid for every view group of this planning call.
+static bool fp_scan_resident(const llama_kv_cells & cells, fp_resident_scan & out) {
     out.rows.clear();
+    out.base.clear();
+    out.run_buckets.clear();
     out.rows.reserve(cells.size());
     for (uint32_t idx = 0; idx < cells.size(); ++idx) {
         if (cells.is_empty(idx)) {
@@ -5040,10 +5059,35 @@ static void fp_scan_resident(const llama_kv_cells & cells, fp_resident_scan & ou
         fp_resident_row row;
         row.idx = idx;
         row.storage = cells.pos_get(idx);
+        if (row.storage < 0) {
+            return false;
+        }
         row.meta = cells.rerot_get(idx);
         row.sig = cells.seq_get_all(idx);
+
+        const uint32_t row_idx = (uint32_t) out.rows.size();
+        if (!row.meta.active()) {
+            if (row.sig.any()) {
+                out.base.push_back({ row.idx, row.storage, row.sig });
+            }
+        } else {
+            out.run_buckets[{ row.meta.episode_id, row.meta.run_id }].push_back(row_idx);
+        }
         out.rows.push_back(std::move(row));
     }
+
+    auto by_storage = [](const fp_base_member & a, const fp_base_member & b) {
+        if (a.storage != b.storage) { return a.storage < b.storage; }
+        return a.idx < b.idx;
+    };
+    bool base_sorted = true;
+    for (size_t i = 1; i < out.base.size(); ++i) {
+        if (by_storage(out.base[i], out.base[i - 1])) { base_sorted = false; break; }
+    }
+    if (!base_sorted) {
+        std::sort(out.base.begin(), out.base.end(), by_storage);
+    }
+    return true;
 }
 
 // RERoT-path fragment planning. One reusable run/span table per distinct
@@ -5119,12 +5163,15 @@ llama_flashprefill_build_status llama_flashprefill_build_rerot_plan(
     std::vector<std::map<llama_seq_id, std::unordered_map<llama_pos, std::pair<uint32_t, uint32_t>>>> own_by_vgroup;
     own_by_vgroup.reserve(vgroups.size());
 
-    // Round-18: ONE resident scan per planning call, shared by every view
-    // group. Was once-per-view (R full-cell scans for R readers); the scan's
-    // content is reader-independent, so only the visibility predicate below
-    // is per-reader.
+    // Round-18/19 Q3/Q4: ONE resident scan per planning call, shared by every view
+    // group. Inactive cells are pre-partitioned into shared scan.base (sorted once),
+    // and active cells into shared scan.run_buckets by (episode_id, run_id).
+    // The per-view loop below borrows scan.base with zero copies and looks up
+    // each ordered run directly, eliminating R*K hash lookups and O(K) rescans.
     fp_resident_scan scan;
-    fp_scan_resident(cells, scan);
+    if (!fp_scan_resident(cells, scan)) {
+        return hard_error("flashprefill layout: resident cell with negative position");
+    }
 
     // Reusable table per distinct view.
     for (const auto & vg : vgroups) {
@@ -5144,78 +5191,51 @@ llama_flashprefill_build_status llama_flashprefill_build_rerot_plan(
             }
         }
 
-        std::vector<fp_base_member> base;
+        // Base members are reader-independent: borrowed by const-ref, already sorted.
+        const auto & base = scan.base;
         std::vector<std::vector<fp_tagged_member>> runs(view.ordered_runs.size());
-        // Declared out-of-line so the sortedness probe below shares the exact
-        // comparator std::sort would use (never a partial re-implementation).
-        std::function<bool(const fp_tagged_member &, const fp_tagged_member &)> by_run_storage;
-        // Filter the SHARED resident table (scanned once above) for this
-        // reader view: bucket membership is the only reader-dependent step.
-        for (const auto & row : scan.rows) {
-            const llama_pos storage = row.storage;
-            if (storage < 0) {
-                return hard_error("flashprefill layout: resident cell with negative position");
+
+        // Round-19: Iterate only the runs requested by this view, looking up each
+        // pre-bucketed run in O(1). Eliminates R*K hash lookups across all resident cells.
+        for (uint32_t r = 0; r < view.ordered_runs.size(); ++r) {
+            const auto run_id = view.ordered_runs[r];
+            const auto bit = scan.run_buckets.find({ view.episode_id, run_id });
+            if (bit == scan.run_buckets.end()) {
+                continue;
             }
-            const auto & meta = row.meta;
-            if (!meta.active()) {
-                if (row.sig.none()) {
+            auto & run_vec = runs[r];
+            run_vec.reserve(bit->second.size());
+            for (uint32_t row_idx : bit->second) {
+                const auto & row = scan.rows[row_idx];
+                const bool full = llama_rerot_cell_visible_public_full(row.meta, view);
+                bool maybe = false;
+                if (!full) {
+                    if (row.meta.visibility == llama_rerot_visibility::public_live) {
+                        maybe = row.meta.frontier == view.frontier && row.meta.node_id == view.reader;
+                    } else if (row.meta.visibility == llama_rerot_visibility::private_control ||
+                               row.meta.visibility == llama_rerot_visibility::pending_record) {
+                        maybe = row.meta.node_id == view.reader;
+                    }
+                }
+                if (!full && !maybe) {
                     continue;
                 }
-                base.push_back({ row.idx, storage, row.sig });
-                continue;
+                run_vec.push_back({ row.idx, row.storage, row.meta.frontier, row.meta.visibility, !full, row.sig });
             }
-            if (meta.episode_id != view.episode_id) {
-                continue;
-            }
-            const auto rank_it = rank.find(meta.run_id);
-            if (rank_it == rank.end()) {
-                continue;
-            }
-            const bool full = llama_rerot_cell_visible_public_full(meta, view);
-            bool maybe = false;
-            if (!full) {
-                if (meta.visibility == llama_rerot_visibility::public_live) {
-                    maybe = meta.frontier == view.frontier && meta.node_id == view.reader;
-                } else if (meta.visibility == llama_rerot_visibility::private_control ||
-                           meta.visibility == llama_rerot_visibility::pending_record) {
-                    maybe = meta.node_id == view.reader;
-                }
-            }
-            if (!full && !maybe) {
-                continue;
-            }
-            runs[rank_it->second].push_back({ row.idx, storage, meta.frontier, meta.visibility, !full, row.sig });
         }
 
-        auto by_storage = [](const auto & a, const auto & b) {
-            if (a.storage != b.storage) { return a.storage < b.storage; }
-            return a.idx < b.idx;
-        };
-        by_run_storage = [](const fp_tagged_member & a, const fp_tagged_member & b) {
+        auto by_run_storage = [](const fp_tagged_member & a, const fp_tagged_member & b) {
             if (a.storage != b.storage) { return a.storage < b.storage; }
             if (a.frontier != b.frontier) { return a.frontier < b.frontier; }
             return a.idx < b.idx;
         };
-        // Round-18 Q4/Q2: the buckets are filled in shared-scan order, which is
-        // CELL-INDEX ascending, not storage ascending. Production writes the
-        // ring in storage order, so the two orders coincide most of the time;
-        // an O(n) probe (checking EVERY comparator component: storage, then the
-        // type-specific tiebreakers) decides per bucket, with std::sort as the
-        // only fallback. Skipping the sort when the probe passes is exact: the
-        // comparator is a total order, so an already-ordered range is fixed.
-        {
-            bool base_sorted = true;
-            for (size_t i = 1; i < base.size(); ++i) {
-                if (by_storage(base[i], base[i - 1])) { base_sorted = false; break; }
+        // Per-run sortedness probe (skips std::sort when cell order matches storage order).
+        for (auto & run : runs) {
+            bool run_sorted = true;
+            for (size_t i = 1; i < run.size(); ++i) {
+                if (by_run_storage(run[i], run[i - 1])) { run_sorted = false; break; }
             }
-            if (!base_sorted) { std::sort(base.begin(), base.end(), by_storage); }
-            for (auto & run : runs) {
-                bool run_sorted = true;
-                for (size_t i = 1; i < run.size(); ++i) {
-                    if (by_run_storage(run[i], run[i - 1])) { run_sorted = false; break; }
-                }
-                if (!run_sorted) { std::sort(run.begin(), run.end(), by_run_storage); }
-            }
+            if (!run_sorted) { std::sort(run.begin(), run.end(), by_run_storage); }
         }
 
         // Dense virtualization: base first, then runs in view order.
