@@ -4448,6 +4448,16 @@ ggml_tensor * llm_graph_context::build_rerot_q_groups(
     const int64_t heads = q_raw->ne[1];
     const int64_t groups = inp->get_rerot_q_indices()->ne[0];
 
+    // P2 evidence: the Q-prep region (GET_ROWS gather + effective-position
+    // RoPE below) processes the full bucketed group capacity, not the live
+    // group count. Count here — the single site where the padded rows are
+    // actually computed — so q_prep_rows vs live_groups quantifies the
+    // fill waste the fused live-row Q-prep candidate would remove. No-op
+    // when LLAMA_REROT_PROFILE is unset.
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->q_prep_rows.fetch_add((uint64_t) groups * (uint64_t) heads, std::memory_order_relaxed);
+    }
+
     ggml_tensor * q_flat = ggml_reshape_2d(ctx0, q_raw, head_dim * heads, n_tokens);
     ggml_tensor * q_grouped = ggml_get_rows(ctx0, q_flat, inp->get_rerot_q_indices());
     q_grouped = ggml_reshape_3d(ctx0, q_grouped, head_dim, heads, groups);
