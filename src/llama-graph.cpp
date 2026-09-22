@@ -1122,6 +1122,31 @@ void llm_graph_input_attn_rerot::fill_spans(
         }
     }
 
+    // Fail-loud guard for the GPU indexed-attention contract: the rerot
+    // kernel consumes these rows without a universal device-side bounds
+    // check on every pipeline variant, and an out-of-range physical key or
+    // group reads unmapped VRAM (GPUVM fault / ErrorDeviceLost). Validate
+    // against the device's real n_kv and the live group count here so the
+    // defect surfaces as an explicit host error with the offending index,
+    // never as a device-level crash.
+    if (!gpu_span_expand) {
+        const uint32_t n_kv_live = attn != nullptr ? attn->get_n_kv() : 0;
+        const uint32_t n_groups_live = (uint32_t) layout.groups.size();
+        for (size_t i = 0; i < n_entries; ++i) {
+            const int32_t key   = st_entries[2 * i + 0];
+            const int32_t group = st_entries[2 * i + 1];
+            const bool key_bad   = key < 0 || (n_kv_live > 0 && (uint32_t) key >= n_kv_live);
+            const bool group_bad = group < 0 || (uint32_t) group >= n_groups_live;
+            if (key_bad || group_bad) {
+                throw std::runtime_error(
+                    "RERoT DDVR: live entry out of range at index " + std::to_string(i) +
+                    " (key=" + std::to_string(key) + " n_kv=" + std::to_string(n_kv_live) +
+                    " group=" + std::to_string(group) + " n_groups=" + std::to_string(n_groups_live) +
+                    "); refusing to upload descriptors that would fault the device");
+            }
+        }
+    }
+
     st_offsets.assign(n_offsets, 0);
     for (size_t i = 0; i < n_offsets; ++i) {
         st_offsets[i] = (int32_t) layout.query_offsets[i];

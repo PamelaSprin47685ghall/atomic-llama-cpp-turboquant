@@ -3803,6 +3803,21 @@ private:
             return false;
         }
 
+        // pen_capacity is the hard in-flight-lane bound. The DAG activa-
+        // tion path below admits directly into physical slots and does not
+        // route through schedule_pens/allocate_pen; without this gate the
+        // ready queue can bind more lanes than the pen arena owns and two
+        // lanes end up sharing a physical slot (observed as slot reuse
+        // under a still-RUNNING lane). Count this episode's physically
+        // bound pens: ready_queue/starting hold *planned* nodes before
+        // admission, so counting them would gate admission itself (a DAG
+        // plan of W nodes with W == P must still admit all P). Excess
+        // lanes stay queued until a running lane finishes.
+        const uint64_t live_lanes = rerot->pens_for_person(episode_id).size();
+        if (episode->is_dag && live_lanes >= rerot->pen_capacity()) {
+            return true;
+        }
+
         while (!episode->suspended.empty() || !episode->ready_queue.empty()) {
             // Select the idle executor first and drop its stale prompt-cache
             // refs BEFORE measuring recurrent pressure: an idle slot's
