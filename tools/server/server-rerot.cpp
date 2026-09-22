@@ -995,11 +995,19 @@ std::string server_rerot_format_plan_prefix(
 }
 
 std::string_view server_rerot_routing_probe_prompt() {
+    // Keep the JSON opener teacher-forced so sampling only continues the
+    // strategy value. Must end exactly with server_rerot_routing_probe_json_prefix().
     static constexpr std::string_view prompt =
-        "Choose whether this request continues as a single answer or a DAG of independent sub-questions. "
-        "Output only JSON: {\"strategy\":\"simple\",\"payload\":{}} or "
-        "{\"strategy\":\"dag\",\"payload\":{\"questions\":[{\"id\":\"...\",\"intent\":\"...\"}],\"depends_on\":[]}}.";
+        "Let's choose whether this request needs deep think or not. "
+        "JSON: {\"strategy\":\"direct\"} or "
+        "{\"strategy\":\"dag\",\"payload\":{\"questions\":[{\"id\":\"...\",\"intent\":\"...\"}],\"depends_on\":[]}}\n"
+        "{\"strategy\":\"";
     return prompt;
+}
+
+std::string_view server_rerot_routing_probe_json_prefix() {
+    static constexpr std::string_view prefix = "{\"strategy\":\"";
+    return prefix;
 }
 
 std::string server_rerot_routing_grammar() {
@@ -1028,16 +1036,15 @@ std::string server_rerot_source_end_grammar(std::string_view close_marker) {
 }
 
 std::string server_rerot_routing_schema_json() {
-    // Exact schema from AGENTS.md §02.4
+    // Routing schema: direct (no payload) or dag(+payload).
     return R"({
   "oneOf": [
     {
       "type": "object",
-      "required": ["strategy", "payload"],
+      "required": ["strategy"],
       "additionalProperties": false,
       "properties": {
-        "strategy": {"const": "simple"},
-        "payload": {"const": {}}
+        "strategy": {"const": "direct"}
       }
     },
     {
@@ -1101,21 +1108,24 @@ server_rerot_routing_decision server_rerot_parse_routing_decision(const std::str
         return result;
     }
 
-    if (!root_json.is_object() || !root_json.contains("strategy") || !root_json.contains("payload")) {
-        result.error = "Missing strategy or payload";
+    if (!root_json.is_object() || !root_json.contains("strategy")) {
+        result.error = "Missing strategy";
         return result;
     }
-    if (!json_object_has_only_keys(root_json, {"strategy", "payload"}, &result.error, "routing root")) {
-        return result;
-    }
-
     std::string strategy = root_json["strategy"].is_string() ? root_json["strategy"].get<std::string>() : "";
-    if (strategy == "simple") {
-        if (!root_json["payload"].is_object() || !root_json["payload"].empty()) {
-            result.error = "simple payload must be empty object {}";
+    if (strategy == "direct") {
+        if (!json_object_has_only_keys(root_json, {"strategy"}, &result.error, "routing root")) {
             return result;
         }
         result.strategy = server_rerot_routing_decision::strategy_type::simple;
+        return result;
+    }
+
+    if (!root_json.contains("payload")) {
+        result.error = "Missing payload";
+        return result;
+    }
+    if (!json_object_has_only_keys(root_json, {"strategy", "payload"}, &result.error, "routing root")) {
         return result;
     }
 

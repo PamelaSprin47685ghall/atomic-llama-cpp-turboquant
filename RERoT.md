@@ -305,7 +305,7 @@ PROBE_CONTROL
 
 ---
 
-## 4. 自适应路由：C0、probe、simple、dag
+## 4. 自适应路由：C0、probe、direct、dag
 
 ### 4.1 C0 的定义
 
@@ -337,7 +337,7 @@ KV allocator 的“head/cursor”也不是通用 checkpoint。Unified KV 有共�
    └──→ 隔离 probe branch
             ↓
         schema-constrained JSON
-            ├─ simple
+            ├─ direct
             │    → 丢弃 probe branch
             │    → 原 C0 sampler/state 继续
             │
@@ -353,18 +353,26 @@ KV allocator 的“head/cursor”也不是通用 checkpoint。Unified KV 有共�
 
 ### 4.3 路由 schema
 
-正式 schema 不是旧的手写 GBNF，而是 JSON Schema 交给现有 schema→grammar 转换器：
+正式 schema 不是旧的手写 GBNF，而是 JSON Schema 交给现有 schema→grammar 转换器。
+
+隔离 probe 注入的短样板（末尾 JSON opener 为 teacher-forced，模型只续写 strategy）：
+
+```text
+Let's choose whether this request needs deep think or not. JSON: {"strategy":"direct"} or {"strategy":"dag","payload":{"questions":[{"id":"...","intent":"..."}],"depends_on":[]}}
+{"strategy":"
+```
+
+`direct` 线格式无 payload；内部仍映射到 `strategy_type::simple` / `is_simple()` 续写路径。
 
 ```json
 {
   "oneOf": [
     {
       "type": "object",
-      "required": ["strategy", "payload"],
+      "required": ["strategy"],
       "additionalProperties": false,
       "properties": {
-        "strategy": {"const": "simple"},
-        "payload": {"const": {}}
+        "strategy": {"const": "direct"}
       }
     },
     {
@@ -414,10 +422,10 @@ KV allocator 的“head/cursor”也不是通用 checkpoint。Unified KV 有共�
 }
 ```
 
-正确 simple：
+正确 direct：
 
 ```json
-{"strategy":"simple","payload":{}}
+{"strategy":"direct"}
 ```
 
 正确 DAG 例子：

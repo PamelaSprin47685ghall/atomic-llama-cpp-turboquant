@@ -1,12 +1,11 @@
 [schema]
 type = "object"
-required = ["strategy", "payload"]
+required = ["strategy"]
 properties.strategy = { type = "string" }
 
 [[schema.oneOf]]
-description = "当前不适合拆解，则使用简单的线性思路"
-properties.strategy = { const = "simple" }
-properties.payload = { type = "object" }
+description = "不需要 deep think，则直接续写"
+properties.strategy = { const = "direct" }
 
 [[schema.oneOf]]
 description = "拆解为拓扑思维导图，则使用 DAG"
@@ -42,4 +41,6 @@ depends_on = {
 }
 
 [data]
-strategy = 
+# Production probe teacher-forces JSON opener {"strategy":" then samples.
+# This scratch file keeps an empty strategy value as the same idea.
+strategy = ""

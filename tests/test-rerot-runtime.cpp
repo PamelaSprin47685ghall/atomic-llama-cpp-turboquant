@@ -3030,7 +3030,7 @@ static void test_rerot_enter_simple_sampler_state_preservation_and_anti_pollutio
         // and a probe sampler is initialized and polluted with probe tokens.
         server_task probe_task = clone_mock_task(transport.response_task);
         probe_task.params.sampling.reasoning_budget_tokens = -1;
-        probe_task.params.sampling.grammar = { COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, R"({"strategy": "simple"})" };
+        probe_task.params.sampling.grammar = { COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, R"({"strategy": "direct"})" };
         slot.task = std::make_unique<const server_task>(std::move(probe_task));
 
         // Swap to probe sampler
@@ -3816,9 +3816,9 @@ static void test_dag_c0_probe_to_simple_continuation_and_grammar_isolation() {
     CHECK(ep_b_ptr->probe_seq >= 8);
     CHECK(root_b->exec_seq == ep_b_ptr->probe_seq);
 
-    // In probe mode, planner generates routing decision JSON (e.g. strategy: simple)
+    // In probe mode, planner generates routing decision JSON (e.g. strategy: direct)
     // Probe writes go to probe_seq; C0 state on slot 0 is untouched
-    const auto routing_decision = server_rerot_parse_routing_decision(R"({"strategy":"simple","payload":{}})");
+    const auto routing_decision = server_rerot_parse_routing_decision(R"({"strategy":"direct"})");
     CHECK(routing_decision.is_simple());
 
     // Rollback isolated probe -> restore C0 exact quantum state

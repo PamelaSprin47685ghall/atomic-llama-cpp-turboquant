@@ -308,15 +308,18 @@ static void test_rejects_obsolete_or_malformed_delimiters() {
 }
 
 static void test_routing_decision_parser() {
-    // AGENTS.md §02: simple
-    const std::string simple_json = R"({"strategy":"simple","payload":{}})";
-    const auto dec_simple = server_rerot_parse_routing_decision(simple_json);
-    CHECK(dec_simple.is_simple());
-    CHECK(!dec_simple.is_dag());
+    // direct = ordinary continuation (internal strategy_type::simple)
+    const std::string direct_json = R"({"strategy":"direct"})";
+    const auto dec_direct = server_rerot_parse_routing_decision(direct_json);
+    CHECK(dec_direct.is_simple());
+    CHECK(!dec_direct.is_dag());
 
-    // Simple with non-empty payload -> rejected (§02.4)
-    const std::string simple_bad = R"({"strategy":"simple","payload":{"foo":"bar"}})";
-    CHECK(!server_rerot_parse_routing_decision(simple_bad).is_simple());
+    // direct must not carry a payload
+    const std::string direct_bad = R"({"strategy":"direct","payload":{}})";
+    CHECK(!server_rerot_parse_routing_decision(direct_bad).is_simple());
+    // obsolete wire name "simple" is rejected
+    CHECK(!server_rerot_parse_routing_decision(
+        R"({"strategy":"simple","payload":{}})").is_simple());
 
     // DAG valid (§02.4)
     const std::string dag_json = R"({
@@ -406,9 +409,9 @@ static void test_routing_decision_parser() {
 
     // Extra fields and duplicate keys are rejected (§02.4 / §02.6)
     CHECK(!server_rerot_parse_routing_decision(
-        R"({"strategy":"simple","payload":{},"extra":true})").is_simple());
+        R"({"strategy":"direct","extra":true})").is_simple());
     CHECK(!server_rerot_parse_routing_decision(
-        R"({"strategy":"simple","strategy":"dag","payload":{}})").is_simple());
+        R"({"strategy":"direct","strategy":"dag"})").is_simple());
     CHECK(!server_rerot_parse_routing_decision(R"({
       "strategy": "dag",
       "payload": {
@@ -654,8 +657,9 @@ static void test_dag_protocol_does_not_require_source_end_grammar() {
 static void test_routing_schema_grammar() {
     const std::string grammar = server_rerot_routing_grammar();
     CHECK(!grammar.empty());
-    CHECK(grammar_accepts(grammar, R"({"strategy":"simple","payload":{}})"));
-    CHECK(!grammar_accepts(grammar, R"({"strategy":"simple","payload":{"x":1}})"));
+    CHECK(grammar_accepts(grammar, R"({"strategy":"direct"})"));
+    CHECK(!grammar_accepts(grammar, R"({"strategy":"direct","payload":{}})"));
+    CHECK(!grammar_accepts(grammar, R"({"strategy":"simple","payload":{}})"));
     CHECK(grammar_accepts(
         grammar,
         R"({"strategy":"dag","payload":{"questions":[{"id":"A","intent":"Fact A"}],"depends_on":[]}})"));

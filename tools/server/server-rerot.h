@@ -177,6 +177,7 @@ private:
 std::string_view server_rerot_planner_prompt();
 std::string_view server_rerot_planner_grammar();
 std::string_view server_rerot_routing_probe_prompt();
+std::string_view server_rerot_routing_probe_json_prefix();
 std::string server_rerot_routing_grammar();
 std::string server_rerot_source_end_grammar(std::string_view close_marker);
 // Eager grammar for one child: arbitrary text must eventually terminate with
@@ -505,6 +506,9 @@ struct server_rerot_episode {
     std::string source_end_marker;
     std::string think_start_marker = "<think>";
     std::string probe_bytes;
+    // Exact tokens that decode to server_rerot_routing_probe_json_prefix();
+    // accepted into the probe sampler after the forced prompt finishes.
+    std::vector<llama_token> probe_json_prefix_tokens;
     server_rerot_prebranch_checkpoint c0;
     server_rerot_prebranch_checkpoint c_base;
     uint64_t frozen_read_publish_epoch = 0;
