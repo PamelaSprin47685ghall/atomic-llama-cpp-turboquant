@@ -339,3 +339,35 @@ relay probe 的 `consumer failed` 为基线既有行为（stash 前后一致）�
 健康，§4.1 的几何搜索（row/wave/K tile 候选）不会先撞寄存器場。`resume_norm`
 code size 18920 是最大者，是几何优化的下一候选。**注意**：此表来自 5 卡 mesh
 创建路径（pipeline 创建期统计），不是模型会话吞吐证据。
+
+### 7.9 P1-B 第二步：激活侧同布局打包（已合入）
+
+**问题**：P1-B 首步只打包了权重；Q8DOT/UP_Q8DOT 的内层循环对 activation 侧
+仍每 k 执行 `pack_q8_pair`（i16→i32 位拼接，2 ALU/4 元素）。activation 流量小
+（10.9KB/token），但它在**每个消费者每次读时**重复支付。
+
+**改动**（位级等价除 d 精度外，见下）：
+
+1. `TP5_LATE_ACT_Q8`（tp5_hc_latebind.comp）与 `TP5_RESUME_LO_Q8`
+   （tp5_hc_resume.comp）输出改 `late_q8_packed`（36B/块，**无 flag 块**：
+   per-token 瞬态，每 epoch 重写，自禁用协议无意义；索引 i 即块 i）；
+2. Q8DOT 绑定 1、UP_Q8DOT 绑定 1 改读 packed；内层循环变纯
+   `dotPacked4x8EXT(w.qs_words[k], a.qs_words[k])`——零打包 ALU；
+3. 主机侧 `tp5_late_q8_packed_bytes()` 统一四处字节计算（分配×2 + barrier×2）。
+
+**数值变化（非回归，是精度提升）**：块尺度 d 从 f16（11 位尾数）拓宽为 f32
+（24 位）。原路径 `float16_t(d)` 对尺度做舍入；packed 布局存全 f32。int8 载荷
+不变，aggressive 路径的去量化误差严格缩小。
+
+**RADV codegen 实测**（同 5 卡 mesh 创建路径）：
+
+| kernel | code 前→后 | Δ |
+|---|---|---|
+| tp5_hc_late_q_q8dot | 2676 → 1696 | **−36.6%** |
+| tp5_hc_late_up_q8dot | 6152 → 5044 | **−18.0%** |
+| tp5_hc_late_act_q8 | 1952 → 2064 | +5.7% |
+| tp5_hc_resume_lo_q8 | 3996 → 4000 | +0.1% |
+
+两个点积消费者代码量大幅缩减；两个生产者开销微增。VGPR 全部维持 64、零 spill。
+**代价**：activation 显存 +6%（36B vs 34B/块，46080B vs 43520B @max_rows=4）。
+真机收益仍需模型会话（安全门未批）。

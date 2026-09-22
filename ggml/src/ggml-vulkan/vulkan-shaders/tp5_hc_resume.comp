@@ -54,11 +54,13 @@ layout(std430, binding = 1) readonly buffer Rho { float inverse_rho[]; };
 layout(std430, binding = 2) writeonly buffer Lo { float lo[]; };
 layout(std430, binding = 3) coherent volatile buffer Status { uint status[]; };
 #ifdef TP5_RESUME_LO_Q8
-struct late_lo_q8_0 {
-    float16_t d;
-    int16_t   qs[16];
+// P1-B activation layout: packed uint32 words, matching the weight side. No
+// flag block here — this is per-token transient output, not immutable data.
+struct late_lo_q8_packed {
+    float   d;
+    uint    qs_words[8];
 };
-layout(std430, binding = 4) writeonly buffer LoQ8 { late_lo_q8_0 lo_q8[]; };
+layout(std430, binding = 4) writeonly buffer LoQ8 { late_lo_q8_packed lo_q8[]; };
 shared int lo_q_tmp[320];
 #endif
 layout(push_constant) uniform Params {
@@ -216,9 +218,9 @@ void main() {
                 lo[token * p.rank_dim + row] = uintBitsToFloat(0x7fc00000u);
 #ifdef TP5_RESUME_LO_Q8
             if (lane < 10u) {
-                lo_q8[token * 10u + lane].d = float16_t(uintBitsToFloat(0x7fc00000u));
-                [[unroll]] for (uint k = 0u; k < 16u; ++k)
-                    lo_q8[token * 10u + lane].qs[k] = int16_t(0);
+                lo_q8[token * 10u + lane].d = uintBitsToFloat(0x7fc00000u);
+                [[unroll]] for (uint k = 0u; k < 8u; ++k)
+                    lo_q8[token * 10u + lane].qs_words[k] = 0u;
             }
 #endif
         }
@@ -252,12 +254,13 @@ void main() {
 
         const uint sub = gl_SubgroupID;
         const uint sublane = gl_SubgroupInvocationID;
-        if (sublane == 0u) lo_q8[token * 10u + sub].d = float16_t(d);
-        if (sublane < 16u) {
-            const uint base = sub * 32u + 2u * sublane;
-            const uint q0 = uint(lo_q_tmp[base]) & 0xffu;
-            const uint q1 = uint(lo_q_tmp[base + 1u]) & 0xffu;
-            lo_q8[token * 10u + sub].qs[sublane] = int16_t(q0 | (q1 << 8u));
+        if (sublane == 0u) lo_q8[token * 10u + sub].d = d;
+        if (sublane < 8u) {
+            const uint base = sub * 32u + 4u * sublane;
+            const uint w0 = uint(lo_q_tmp[base]) & 0xffu | (uint(lo_q_tmp[base + 1u]) & 0xffu) << 8u;
+            const uint w1 = uint(lo_q_tmp[base + 2u]) & 0xffu | (uint(lo_q_tmp[base + 3u]) & 0xffu) << 8u;
+            lo_q8[token * 10u + sub].qs_words[2u * sublane] = w0;
+            lo_q8[token * 10u + sub].qs_words[2u * sublane + 1u] = w1;
         }
         barrier();
     }

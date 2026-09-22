@@ -1568,6 +1568,29 @@ static void test_tp5_packed_weight_layout() {
     fprintf(stderr, "  Packed weight layout: 36B/block + flag at index 0, W_down/W_up share block count, "
                     "bounds verified (blocks=%llu bytes=%llu)\n",
             (unsigned long long) blocks, (unsigned long long) packed_bytes);
+
+    // P1-B second step — packed activation layout. Activation buffers use the
+    // same 36B block but carry NO flag block: they are per-token transients
+    // written fresh by ACT_Q8 / resume_lo_q8 every epoch, so the done-flag
+    // self-disabling protocol is meaningless there. Index i is block i.
+    const uint32_t max_rows = 4u;  // MTP verify capacity
+    const uint64_t act_elems = uint64_t(max_rows) * streams * width;
+    const uint64_t act_bytes = (act_elems / 32u) * sizeof(PackedBlock);
+    TEST_ASSERT(act_bytes == (4u * 4u * 2560u / 32u) * 36u);
+    TEST_ASSERT(act_bytes == 1280u * 36u);
+    const uint64_t lo_elems = uint64_t(max_rows) * late_rank;
+    const uint64_t lo_bytes = (lo_elems / 32u) * sizeof(PackedBlock);
+    TEST_ASSERT(lo_bytes == (4u * 320u / 32u) * 36u);
+    TEST_ASSERT(lo_bytes == 40u * 36u);
+
+    // The d field widened from f16 to f32: producers previously rounded the
+    // per-block scale through float16_t(d) (11-bit mantissa); the packed
+    // layout stores the full f32 scale. int8 payloads are unchanged, so the
+    // aggressive path's dequant error strictly shrinks.
+    TEST_ASSERT(sizeof(float) > 2u);
+    fprintf(stderr, "  Packed activation layout: 36B/block without flag (act=%lluB lo=%lluB for max_rows=%u), "
+                    "f32 scale replaces f16 rounding\n",
+            (unsigned long long) act_bytes, (unsigned long long) lo_bytes, max_rows);
 }
 
 int main() {

@@ -1,5 +1,52 @@
 # AGENTS.md
 
+## 下班交接｜2026-09-22（第十五轮，P1-B 第二步：激活侧同布局打包，点积内层零打包 ALU）
+
+**分支：** `master`（本轮 commit 见 git log；基于 `86dcfd2fb`）
+**主题：** 承接第十四轮的 codegen 证据通道，完成 P1-B 的激活侧：Q8DOT/UP_Q8DOT
+内层循环的 `pack_q8_pair` 全部消除。全程 CPU + 既有 GPU 回归，未启动模型。
+
+### 一、改动（三文件）
+
+1. **`tp5_hc_latebind.comp`**：`TP5_LATE_ACT_Q8` 输出改 `late_q8_packed`
+   （36B/块，**无 flag 块**——per-token 瞬态每 epoch 重写，自禁用协议无意义，
+   索引 i 即块 i）；Q8DOT 绑定 1 / UP_Q8DOT 绑定 1 改读 packed，内层变纯
+   `dotPacked4x8EXT(w.qs_words[k], a.qs_words[k])`；两个 `pack_*_pair` helper 删除；
+2. **`tp5_hc_resume.comp`**：`TP5_RESUME_LO_Q8` 输出同改 packed（含 NaN 失败路径）；
+3. **`ggml-vulkan-collective.cpp`**：`tp5_late_q8_packed_bytes()` 统一四处字节
+   计算（act/lo 分配×2 + barrier×2）。
+
+### 二、RADV codegen 实测（第十四轮通道的直接兑付）
+
+| kernel | code 前→后 | Δ |
+|---|---|---|
+| late_q_q8dot | 2676 → 1696 | **−36.6%** |
+| late_up_q8dot | 6152 → 5044 | **−18.0%** |
+| late_act_q8 | 1952 → 2064 | +5.7% |
+| resume_lo_q8 | 3996 → 4000 | +0.1% |
+
+消费者大幅缩、生产者微增；VGPR 维持 64、零 spill。**这是"先修证据通道再
+优化"路线的第一次完整闭环：改前有 baseline 表，改后有对比表。**
+
+### 三、数值变化（精度提升，非回归）
+
+块尺度 d 从 f16（11 位尾数）拓宽为 f32（24 位）：原路径 `float16_t(d)`
+对尺度舍入，packed 存全 f32；int8 载荷不变 → aggressive 去量化误差严格缩小。
+验收时注意：aggressive 输出与旧版**不位级一致**（更准），对照基线需重采。
+
+### 四、验证
+
+`test_tp5_packed_weight_layout` 扩展激活断言（无 flag 块、act=46080B/lo=1440B
+@max_rows=4、f32>d16 尾数）；全套 all passed；15/15 ctest 全绿；GPU 空闲、
+零新增内核错误。
+
+### 五、下一步
+
+1. P1-B 至此收口（权重＋激活全 packed，内层零打包 ALU）；真机收益等模型会话；
+2. §4.1 几何搜索（row/wave/K tile）有完整测量器可用，resume_norm（18920B）
+   是最大候选；
+3. P1-C transport 三选一需真机测量。
+
 ## 下班交接｜2026-09-22（第十四轮，RADV codegen 证据通道：feature 未开修复 + TP5 kernel 统计落地）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `c9bb1c808`）

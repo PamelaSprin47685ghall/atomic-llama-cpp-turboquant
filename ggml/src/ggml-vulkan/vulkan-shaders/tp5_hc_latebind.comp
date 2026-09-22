@@ -160,7 +160,7 @@ void main() {
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer UpWeightsQ8 { late_q8_packed up_w[]; };
-layout(std430, binding = 1) readonly buffer LoQ8Input { late_q8_0 lo_q8_in[]; };
+layout(std430, binding = 1) readonly buffer LoQ8Input { late_q8_packed lo_q8_in[]; };
 layout(std430, binding = 2) readonly buffer NormalizedInput { float norm_in[]; };
 layout(std430, binding = 3) writeonly buffer MixedOutput { float mixed_out[]; };
 // Runtime active rows from the RELAY broadcast header (word 5).
@@ -175,10 +175,6 @@ layout(push_constant) uniform UpQ8Params {
     uint rows_per_wg;
     uint active_rows;
 } p;
-
-int32_t pack_up_q8_pair(const int16_t a, const int16_t b) {
-    return int32_t((uint32_t(a) & 0xffffu) | (uint32_t(uint16_t(b)) << 16u));
-}
 
 shared vec4 up_partial[240]; // 24 rows * 10 R320 blocks
 
@@ -197,7 +193,7 @@ void main() {
             const uint row_slot = wave * 3u + wave_row;
             const uint row = gl_WorkGroupID.x * 24u + row_slot;
             vec4 partial = vec4(0.0);
-            const late_q8_0 a = lo_q8_in[token * blocks + block];
+            const late_q8_packed a = lo_q8_in[token * blocks + block];
             if (row < p.width) {
             [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
                 const uint weight_row = stream * p.width + row;
@@ -206,11 +202,9 @@ void main() {
                 const late_q8_packed w = up_w[weight_row * blocks + block + 1u];
                 int32_t isum = 0;
                 [[unroll]] for (uint k = 0u; k < 8u; ++k) {
-                    const int32_t wp = int32_t(w.qs_words[k]);
-                    const int32_t ap = pack_up_q8_pair(a.qs[2u*k], a.qs[2u*k + 1u]);
-                    isum += dotPacked4x8EXT(wp, ap);
+                    isum += dotPacked4x8EXT(int32_t(w.qs_words[k]), int32_t(a.qs_words[k]));
                 }
-                    partial[stream] = float(isum) * (w.d * float(a.d));
+                    partial[stream] = float(isum) * (w.d * a.d);
                 }
             }
             up_partial[row_slot * 10u + block] = partial;
@@ -250,7 +244,7 @@ layout(std430, binding = 0) readonly buffer Gamma { float gamma[]; };
 layout(std430, binding = 1) readonly buffer Residual { float residual[]; };
 layout(std430, binding = 2) readonly buffer LocalZ { float local_z[]; };
 layout(std430, binding = 3) readonly buffer Scatter { float scatter[]; };
-layout(std430, binding = 4) writeonly buffer ActivationQ8 { late_q8_0 act_q8[]; };
+layout(std430, binding = 4) writeonly buffer ActivationQ8 { late_q8_packed act_q8[]; };
 // Runtime active rows from the RELAY broadcast header (word 5).
 layout(std430, binding = 5) readonly buffer RowsHeader {
     uint rows_header[];
@@ -294,12 +288,13 @@ void main() {
         barrier();
 
         const uint out_block = token * (p.streams * blocks) + stream * blocks + block;
-        if (lane == 0u) act_q8[out_block].d = float16_t(d);
-        if (lane < 16u) {
-            const uint base = subgroup * 32u + 2u * lane;
-            const uint lo = uint(q_shared[base]) & 0xffu;
-            const uint hi = uint(q_shared[base + 1u]) & 0xffu;
-            act_q8[out_block].qs[lane] = int16_t(lo | (hi << 8u));
+        if (lane == 0u) act_q8[out_block].d = d;
+        if (lane < 8u) {
+            const uint base = subgroup * 32u + 4u * lane;
+            const uint w0 = uint(q_shared[base]) & 0xffu | (uint(q_shared[base + 1u]) & 0xffu) << 8u;
+            const uint w1 = uint(q_shared[base + 2u]) & 0xffu | (uint(q_shared[base + 3u]) & 0xffu) << 8u;
+            act_q8[out_block].qs_words[2u * lane] = w0;
+            act_q8[out_block].qs_words[2u * lane + 1u] = w1;
         }
         barrier();
     }
@@ -314,7 +309,7 @@ void main() {
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer DownWeightsQ8 { late_q8_packed w_q8[]; };
-layout(std430, binding = 1) readonly buffer ActivationQ8 { late_q8_0 act_q8[]; };
+layout(std430, binding = 1) readonly buffer ActivationQ8 { late_q8_packed act_q8[]; };
 // Cached HOST_VISIBLE|HOST_COHERENT|DEVICE_COHERENT_AMD local VRAM. The
 // The compact F16 sidecar starts at p.late_word_offset. The immediately
 // preceding 64-byte cache line is Q-only control, avoiding false sharing with
@@ -335,10 +330,6 @@ layout(push_constant) uniform Q8DotParams {
 shared uint publish_last;
 shared vec4 row_partial[256];
 shared vec4 group_out[16];
-
-int32_t pack_q8_pair(const int16_t a, const int16_t b) {
-    return int32_t((uint32_t(a) & 0xffffu) | (uint32_t(uint16_t(b)) << 16u));
-}
 
 void main() {
     if (p.streams != 4u || p.rows_per_wg != 16u || gl_WorkGroupID.x >= p.n_workgroups) return;
@@ -362,11 +353,10 @@ void main() {
                 const uint ai = token_act_offset + stream * blocks + block;
                 int32_t isum = 0;
                 [[unroll]] for (uint k = 0u; k < 8u; ++k) {
-                    const int32_t wp = int32_t(w_q8[wi].qs_words[k]);
-                    const int32_t ap = pack_q8_pair(act_q8[ai].qs[2u*k], act_q8[ai].qs[2u*k + 1u]);
-                    isum += dotPacked4x8EXT(wp, ap);
+                    isum += dotPacked4x8EXT(int32_t(w_q8[wi].qs_words[k]),
+                                            int32_t(act_q8[ai].qs_words[k]));
                 }
-                acc[stream] = fma(float(isum), w_q8[wi].d * float(act_q8[ai].d), acc[stream]);
+                acc[stream] = fma(float(isum), w_q8[wi].d * act_q8[ai].d, acc[stream]);
             }
         }
         row_partial[lid] = acc;

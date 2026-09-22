@@ -199,6 +199,13 @@ static inline uint32_t tp5_late_q_payload_word_offset(size_t late_host_offset, b
     return (uint32_t) (tp5_late_q_bcast_payload_offset(late_host_offset, late_q8_fast) / 4);
 }
 
+// P1-B packed Q8 activation/weight layout: one block per 32 elements, each
+// block { float d; uint qs_words[8]; } = 36 bytes. The activation buffers
+// carry no done-flag block (per-token transients, not immutable weights).
+static inline VkDeviceSize tp5_late_q8_packed_bytes(size_t elems) {
+    return VkDeviceSize(elems / 32u) * (sizeof(float) + 8u * sizeof(uint32_t));
+}
+
 static bool tp5_latebind_hc_enabled() {
     const char * env = getenv("GGML_TP5_LATEBIND");
     return env && (strcmp(env, "hc-down") == 0 || strcmp(env, "1") == 0 || strcmp(env, "on") == 0);
@@ -3463,15 +3470,14 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
             }
             if (plan.late_q8_fast) {
                 const size_t act_elems = max_rows * size_t(late.streams) * late.width;
-                const VkDeviceSize act_q8_bytes = (VkDeviceSize) ggml_row_size(GGML_TYPE_Q8_0, act_elems);
+                const VkDeviceSize act_q8_bytes = tp5_late_q8_packed_bytes(act_elems);
                 if (act_q8_bytes == 0 || act_q8_bytes > r.caps.max_storage_buffer_range ||
                     !tp5_alloc_device_buffer(r, act_q8_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
                                              plan.late_act_q8_buf[i], plan.late_act_q8_mem[i], nullptr)) {
                     c.fail("allocation of LateBind Q8 activation buffer failed on rank " + std::to_string(i));
                     return false;
                 }
-                const VkDeviceSize lo_q8_bytes =
-                    (VkDeviceSize) ggml_row_size(GGML_TYPE_Q8_0, max_rows * late.late_rank);
+                const VkDeviceSize lo_q8_bytes = tp5_late_q8_packed_bytes(size_t(max_rows) * late.late_rank);
                 if (lo_q8_bytes == 0 || lo_q8_bytes > r.caps.max_storage_buffer_range ||
                     !tp5_alloc_device_buffer(r, lo_q8_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
                                              plan.late_lo_q8_buf[i], plan.late_lo_q8_mem[i], nullptr)) {
@@ -3654,7 +3660,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 tp5_update_storage_set(r.vkdev, plan.late_inject_ds[idx], inject_infos, 4);
                 if (plan.late_q8_fast) {
                     const size_t act_elems = max_rows * size_t(late.streams) * late.width;
-                    const VkDeviceSize act_q8_bytes = (VkDeviceSize) ggml_row_size(GGML_TYPE_Q8_0, act_elems);
+                    const VkDeviceSize act_q8_bytes = tp5_late_q8_packed_bytes(act_elems);
                     // P1-B packed weight layout: (blocks + 1 flag) * 36B.
                     const uint64_t weight_blocks =
                         uint64_t(late.late_rank) * late.streams * late.width / 32u;
@@ -3714,8 +3720,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     {r.host_import_buf[b], 0, (VkDeviceSize) c.star_rank_stride},
                 };
                 if (plan.late_q8_fast) {
-                    const VkDeviceSize lo_q8_bytes =
-                        (VkDeviceSize) ggml_row_size(GGML_TYPE_Q8_0, max_rows * late.late_rank);
+                    const VkDeviceSize lo_q8_bytes = tp5_late_q8_packed_bytes(size_t(max_rows) * late.late_rank);
                     const uint64_t weight_blocks =
                         uint64_t(late.late_rank) * late.streams * late.width / 32u;
                     const VkDeviceSize packed_bytes =
@@ -3835,8 +3840,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     // can write (capacity rows; word 5 only shrinks the loop),
                     // matching the max_rows-sized allocation. A single-row
                     // range left tokens 2..4 unordered w.r.t. Q8DOT.
-                    const VkDeviceSize act_q8_bytes = (VkDeviceSize) ggml_row_size(
-                        GGML_TYPE_Q8_0,
+                    const VkDeviceSize act_q8_bytes = tp5_late_q8_packed_bytes(
                         size_t(late.capacity_rows ? late.capacity_rows : 1u) * late.streams * late.width);
                     VkBufferMemoryBarrier act_ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
                                                     VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
@@ -4026,8 +4030,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                             // the buffer is allocated for max_rows tokens and the
                             // shader writes token < capacity_rows; the barrier
                             // must order all of them for the UP_Q8DOT reader.
-                            const VkDeviceSize lo_q8_bytes = (VkDeviceSize) ggml_row_size(
-                                GGML_TYPE_Q8_0,
+                            const VkDeviceSize lo_q8_bytes = tp5_late_q8_packed_bytes(
                                 size_t(late.capacity_rows ? late.capacity_rows : 1u) * late.late_rank);
                             VkBufferMemoryBarrier lo_q8_ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
                                                              VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
