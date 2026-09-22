@@ -9627,8 +9627,14 @@ private:
                 const int64_t t0 = ggml_time_us();
                 llama_synchronize(ctx_tgt);
                 const int64_t dur_us = ggml_time_us() - t0;
+                // Completed-token generation: n_p_eval + n_eval only advance
+                // inside llama_context::synchronize() after real GPU work
+                // drained. A repeated sync with no new submissions reports
+                // the same generation — the dedup evidence P11 needs.
+                const llama_perf_context_data perf = llama_perf_context(ctx_tgt);
+                const uint64_t sync_gen = (uint64_t) perf.n_p_eval + (uint64_t) perf.n_eval;
                 if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
-                    prof->record_sync((uint64_t) dur_us, 0);
+                    prof->record_sync((uint64_t) dur_us, sync_gen);
                 }
                 rerot_metrics.sync_capture_us += dur_us;
                 ++rerot_metrics.sync_capture_count;
@@ -9669,8 +9675,10 @@ private:
                 const int64_t t0 = ggml_time_us();
                 llama_synchronize(ctx_tgt);
                 const int64_t dur_us = ggml_time_us() - t0;
+                const llama_perf_context_data perf = llama_perf_context(ctx_tgt);
+                const uint64_t sync_gen = (uint64_t) perf.n_p_eval + (uint64_t) perf.n_eval;
                 if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
-                    prof->record_sync((uint64_t) dur_us, 0);
+                    prof->record_sync((uint64_t) dur_us, sync_gen);
                 }
                 rerot_metrics.sync_sample_us += dur_us;
                 ++rerot_metrics.sync_sample_count;
