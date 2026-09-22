@@ -15,7 +15,8 @@ enum class ggml_tp5_rerot_reject_reason : uint32_t {
     unsupported_type = 3,
     subgroup = 4,
     unsupported_quant_pq2_0 = 5,
-    count = 6,
+    layout = 6,
+    count = 7,
 };
 const char * ggml_tp5_rerot_reject_reason_name(ggml_tp5_rerot_reject_reason reason);
 

@@ -10,6 +10,7 @@ const char * ggml_tp5_rerot_reject_reason_name(ggml_tp5_rerot_reject_reason reas
         case ggml_tp5_rerot_reject_reason::unsupported_type:        return "unsupported_type";
         case ggml_tp5_rerot_reject_reason::subgroup:                return "subgroup";
         case ggml_tp5_rerot_reject_reason::unsupported_quant_pq2_0: return "unsupported_quant_pq2_0";
+        case ggml_tp5_rerot_reject_reason::layout:                   return "layout";
         default:                                                     return "unknown";
     }
 }
@@ -122,7 +123,11 @@ void ggml_tp5_profile::print_summary() const {
     }
     const uint64_t r_rej_type = vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::unsupported_type].load();
     const uint64_t r_rej_pq2_0 = vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::unsupported_quant_pq2_0].load();
-    if (vk_rerot_dispatch.load() != 0 || vk_rerot_shmem_reject.load() != 0 || r_rej_type != 0 || r_rej_pq2_0 != 0) {
+    const uint64_t r_rej_shape = vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::unsupported_shape].load();
+    const uint64_t r_rej_subgrp = vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::subgroup].load();
+    const uint64_t r_rej_layout = vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::layout].load();
+    if (vk_rerot_dispatch.load() != 0 || vk_rerot_shmem_reject.load() != 0 || r_rej_type != 0 || r_rej_pq2_0 != 0 ||
+        r_rej_shape != 0 || r_rej_subgrp != 0 || r_rej_layout != 0) {
         const uint64_t r_disp = vk_rerot_dispatch.load();
         const uint64_t r_sk_tot = vk_rerot_split_k_total.load();
         fprintf(stderr,
@@ -131,7 +136,9 @@ void ggml_tp5_profile::print_summary() const {
                 " queries=%" PRIu64 " entries=%" PRIu64
                 " live_entries=%" PRIu64 " cap_entries=%" PRIu64
                 " shmem_reject=%" PRIu64 " reject_tune=%" PRIu64
-                " reject_type=%" PRIu64 " reject_pq2_0=%" PRIu64 "\n",
+                " reject_type=%" PRIu64 " reject_pq2_0=%" PRIu64
+                " reject_shape=%" PRIu64 " reject_subgroup=%" PRIu64
+                " reject_layout=%" PRIu64 "\n",
                 graph_exec_id, r_disp,
                 r_disp ? double(r_sk_tot) / double(r_disp) : 0.0,
                 vk_rerot_split_k_max.load(),
@@ -140,7 +147,10 @@ void ggml_tp5_profile::print_summary() const {
                 vk_rerot_shmem_reject.load(),
                 vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::shmem_tune].load(),
                 r_rej_type,
-                r_rej_pq2_0);
+                r_rej_pq2_0,
+                r_rej_shape,
+                r_rej_subgrp,
+                r_rej_layout);
     }
 }
 

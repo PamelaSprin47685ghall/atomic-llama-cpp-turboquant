@@ -25641,6 +25641,16 @@ static bool ggml_vk_xkv_single_device(ggml_backend_dev_t dev, const ggml_tensor 
     return true;
 }
 
+// §9.1 rejection-reason evidence: count each bare supports_op rejection of
+// the RERoT indexed attention with its reason bucket so the ledger can
+// answer "which eligibility condition actually blocks multi-Lane hits".
+// Zero-overhead when GGML_TP5_PROFILE is unset.
+static void ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason reason) {
+    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+        prof->vk_rerot_reject_reasons[(size_t) reason].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
@@ -25859,27 +25869,35 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const ggml_tensor * offsets = op->src[4];
                 const ggml_tensor * sinks = op->src[5];
                 if (q == nullptr || k == nullptr || v == nullptr || entries == nullptr || offsets == nullptr) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::layout);
                     return false;
                 }
                 if (q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::unsupported_type);
                     return false;
                 }
                 if (entries->type != GGML_TYPE_I32 || entries->ne[0] != 2) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::layout);
                     return false;
                 }
                 if (offsets->type != GGML_TYPE_I32 || !ggml_is_vector(offsets) || offsets->ne[0] < 2) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::layout);
                     return false;
                 }
                 if (sinks != nullptr && sinks->type != GGML_TYPE_F32) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::unsupported_type);
                     return false;
                 }
                 if (q->ne[0] != k->ne[0] || k->ne[1] != v->ne[1]) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::unsupported_shape);
                     return false;
                 }
                 if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::unsupported_shape);
                     return false;
                 }
                 if (k->ne[2] < 1 || v->ne[2] < 1) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::unsupported_shape);
                     return false;
                 }
                 const bool tp5_mapped = op->op_params[8] == GGML_TP5_HEADMAP_MAGIC;
@@ -25888,35 +25906,44 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     // mapped dispatch uses one Q head per workgroup (Br=1), so
                     // it does not require an integer local GQA ratio.
                     if (k->ne[2] != v->ne[2] || !ggml_vk_fa_headmap_valid(op)) {
+                        ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::layout);
                         return false;
                     }
                 } else if (q->ne[2] % k->ne[2] != 0 || q->ne[2] % v->ne[2] != 0) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::unsupported_shape);
                     return false;
                 }
                 if (q->nb[0] != sizeof(float) || entries->nb[0] != sizeof(int32_t) || offsets->nb[0] != sizeof(int32_t)) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::layout);
                     return false;
                 }
                 if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::layout);
                     return false;
                 }
                 if (q->nb[1] % sizeof(float) != 0 || q->nb[2] % sizeof(float) != 0) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::layout);
                     return false;
                 }
                 const uint32_t HSK = (uint32_t) k->ne[0];
                 const uint32_t HSV = (uint32_t) v->ne[0];
                 if ((HSK % 8) != 0 || (HSV % 8) != 0) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::unsupported_shape);
                     return false;
                 }
                 if (!ggml_vk_fa_kv_type_ok(k->type) || !ggml_vk_fa_kv_type_ok(v->type)) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::unsupported_type);
                     return false;
                 }
                 if ((k->type == GGML_TYPE_BF16) != (v->type == GGML_TYPE_BF16)) {
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::unsupported_type);
                     return false;
                 }
                 if (!(device->subgroup_shuffle && device->subgroup_vote)) {
                     // RERoT-DDVR runs on the scalar FA family: its kernel uses
                     // shared-memory reductions only, but keep the family
                     // requirement for v1.
+                    ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason::subgroup);
                     return false;
                 }
                 vk_fa_tuning_params rerot_tuning;

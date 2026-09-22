@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
+#include "llama-rerot-profile.h"
 #include "../../ggml/src/ggml-impl.h"
 
 #include <algorithm>
@@ -468,6 +469,18 @@ llm_build_delta_net_base::build_delta_net_rbb(
     const int64_t H_v = v->ne[1];
     const int64_t n_tokens = v->ne[2];
     const int64_t n_seqs = v->ne[3];
+
+    // P8 evidence: count multi-row direct-state-row GDN dispatches. This is
+    // the §4.3 "多行 GDN 命中" observation — one native RBB op serving
+    // n_seqs logical state rows in a single dispatch (vs. per-row GEMV
+    // fallbacks). Zero-overhead no-op when LLAMA_REROT_PROFILE is unset.
+    if (n_seqs > 1) {
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->multi_row_gdn_hits.fetch_add(1, std::memory_order_relaxed);
+            prof->ring.push(4 /* custom/gdn-audit */, 5 /* multi-row RBB */, (uint16_t) il,
+                            (uint32_t) n_seqs, 0);
+        }
+    }
 
     GGML_ASSERT(n_tokens == 1);
     GGML_ASSERT(n_seqs >= 1);
