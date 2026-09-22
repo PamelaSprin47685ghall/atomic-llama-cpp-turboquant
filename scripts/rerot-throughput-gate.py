@@ -237,6 +237,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Required RERoT/serial throughput ratio; comparison is strict.",
     )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        help="Number of paired measurement rounds. When rounds > 1, executes in A/B/B/A pattern (§17).",
+    )
     # TODO: Enable operator route gate once P0 low-level operator route counters land in /metrics.
     parser.add_argument(
         "--enable-operator-route-gate",
@@ -252,7 +258,47 @@ def parse_args() -> argparse.Namespace:
         parser.error("--api-key or LLAMA_API_KEY is required")
     if args.min_ratio <= 0:
         parser.error("--min-ratio must be positive")
+    if args.rounds <= 0:
+        parser.error("--rounds must be >= 1")
     return args
+
+
+
+def calculate_percentiles(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {}
+    s = sorted(values)
+    n = len(s)
+    median = s[n // 2] if n % 2 == 1 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+    p95_idx = min(n - 1, int(0.95 * n))
+    return {
+        "min": s[0],
+        "max": s[-1],
+        "mean": sum(s) / n,
+        "median": median,
+        "p95": s[p95_idx],
+    }
+
+
+def extract_rerot_token_breakdown(response: dict[str, Any]) -> dict[str, Any]:
+    usage = response.get("usage", {})
+    rerot_meta = usage.get("rerot", {})
+    timings = response.get("timings", {})
+    
+    # Prompt processing time as proxy for TTFT if available
+    ttft_ms = timings.get("prompt_ms", 0.0)
+    
+    return {
+        "prompt_tokens": usage.get("prompt_tokens", 0),
+        "completion_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+        "probe_tokens": rerot_meta.get("probe_tokens", 0),
+        "frame_tokens": rerot_meta.get("frame_tokens", 0),
+        "actual_replayed_tokens": rerot_meta.get("actual_replayed_tokens", 0),
+        "sampled_tokens": rerot_meta.get("sampled_tokens", 0),
+        "useful_body_tokens": rerot_meta.get("sampled_tokens", 0),
+        "ttft_ms": ttft_ms,
+    }
 
 
 def main() -> int:
@@ -272,73 +318,121 @@ def main() -> int:
     # Pre-flight health check before issuing any benchmark load (fail-closed if server is down)
     verify_server_health(args.base_url, args.api_key, args.timeout)
 
-    if args.baseline_response:
-        serial_wall = None
-        serial_response = json.loads(args.baseline_response.read_text(encoding="utf-8"))
-    else:
-        serial_wall, serial_response = request_json(
-            endpoint, serial_payload, args.api_key, args.timeout
-        )
-    serial_tps = serial_throughput(serial_response)
+    # §17 A/B/B/A paired measurement pattern
+    # When rounds > 1, interleave execution order to neutralize warm-cache drift
+    serial_samples: list[dict[str, Any]] = []
+    rerot_samples: list[dict[str, Any]] = []
+    serial_tps_list: list[float] = []
+    aggregate_tps_list: list[float] = []
+    parallel_tps_list: list[float] = []
+    last_deltas: dict[str, float] = {}
+    last_rerot_response: dict[str, Any] = {}
+    last_serial_response: dict[str, Any] = {}
 
-    before = fetch_metrics(args.base_url, args.api_key, args.timeout)
-    rerot_wall, rerot_response = request_json(
-        endpoint, rerot_payload, args.api_key, args.timeout
-    )
-    after = fetch_metrics(args.base_url, args.api_key, args.timeout)
-    deltas = {name: metric_delta(before, after, name) for name in METRICS}
+    total_pairs = args.rounds
+    for round_idx in range(total_pairs):
+        # A/B/B/A ordering pattern for round parity
+        run_serial_first = (round_idx % 2 == 0)
 
-    episode_seconds = deltas["rerot_completed_episode_seconds"]
-    model_tokens = deltas["rerot_completed_model_tokens"]
-    parallel_seconds = deltas["rerot_parallel_seconds"]
-    parallel_tokens = deltas["rerot_parallel_model_tokens"]
-    if episode_seconds <= 0 or model_tokens <= 0:
-        raise RuntimeError("completed RERoT episode did not publish positive token/time counters")
-    if parallel_seconds <= 0 or parallel_tokens <= 0:
-        parallel_seconds = episode_seconds
-        parallel_tokens = model_tokens
+        def do_serial() -> tuple[float | None, dict[str, Any], float]:
+            if args.baseline_response and round_idx == 0:
+                s_resp = json.loads(args.baseline_response.read_text(encoding="utf-8"))
+                s_wall = None
+            else:
+                s_wall, s_resp = request_json(endpoint, serial_payload, args.api_key, args.timeout)
+            s_tps = serial_throughput(s_resp)
+            return s_wall, s_resp, s_tps
 
-    aggregate_tps = model_tokens / episode_seconds
-    parallel_tps = parallel_tokens / parallel_seconds
+        def do_rerot() -> tuple[float, dict[str, Any], dict[str, float], float, float]:
+            before_m = fetch_metrics(args.base_url, args.api_key, args.timeout)
+            r_wall, r_resp = request_json(endpoint, rerot_payload, args.api_key, args.timeout)
+            after_m = fetch_metrics(args.base_url, args.api_key, args.timeout)
+            d = {name: metric_delta(before_m, after_m, name) for name in METRICS}
+            
+            ep_sec = d["rerot_completed_episode_seconds"]
+            m_tok = d["rerot_completed_model_tokens"]
+            par_sec = d["rerot_parallel_seconds"]
+            par_tok = d["rerot_parallel_model_tokens"]
+            if ep_sec <= 0 or m_tok <= 0:
+                raise RuntimeError("completed RERoT episode did not publish positive token/time counters")
+            if par_sec <= 0 or par_tok <= 0:
+                par_sec = ep_sec
+                par_tok = m_tok
+            agg_tps = m_tok / ep_sec
+            par_tps = par_tok / par_sec
+            return r_wall, r_resp, d, agg_tps, par_tps
+
+        if run_serial_first:
+            sw, sr, stps = do_serial()
+            rw, rr, d, atps, ptps = do_rerot()
+        else:
+            rw, rr, d, atps, ptps = do_rerot()
+            sw, sr, stps = do_serial()
+
+        serial_samples.append({"round": round_idx, "client_wall_seconds": sw, "tokens_per_second": stps})
+        serial_tps_list.append(stps)
+        rerot_samples.append({
+            "round": round_idx,
+            "client_wall_seconds": rw,
+            "aggregate_tokens_per_second": atps,
+            "parallel_tokens_per_second": ptps,
+            "token_breakdown": extract_rerot_token_breakdown(rr),
+            "metrics_delta": d,
+        })
+        aggregate_tps_list.append(atps)
+        parallel_tps_list.append(ptps)
+        last_deltas = d
+        last_rerot_response = rr
+        last_serial_response = sr
+
+    # Use median metrics across rounds for gate verdict (§17)
+    serial_stats = calculate_percentiles(serial_tps_list)
+    aggregate_stats = calculate_percentiles(aggregate_tps_list)
+    parallel_stats = calculate_percentiles(parallel_tps_list)
+
+    median_serial_tps = serial_stats["median"]
+    median_aggregate_tps = aggregate_stats["median"]
+    median_parallel_tps = parallel_stats["median"]
+
     visible_tokens = sum(
-        deltas[name]
+        last_deltas[name]
         for name in ("rerot_public_tokens", "rerot_private_tokens", "rerot_pending_tokens")
     )
     is_dag_payload, dag_structure_err = validate_dag_payload(payload)
 
-    threshold = serial_tps * args.min_ratio
+    threshold = median_serial_tps * args.min_ratio
     checks = {
         # Preserved existing checks (never removed or weakened; one_final_fence compatibility intact)
-        "one_completed_episode": deltas["rerot_completed_episode_total"] == 1,
-        "no_hard_abort": deltas["rerot_hard_aborts"] == 0,
-        "one_final_fence": deltas["rerot_final_fences"] == 1,
-        "visibility_accounting_exact": visible_tokens == model_tokens,
-        "aggregate_faster_than_serial": aggregate_tps > threshold,
-        "parallel_faster_than_serial": parallel_tps > threshold,
-        # New assertions: DAG/multi-Lane payload structure and multi-Lane metrics
+        "one_completed_episode": last_deltas["rerot_completed_episode_total"] == 1,
+        "no_hard_abort": last_deltas["rerot_hard_aborts"] == 0,
+        "one_final_fence": last_deltas["rerot_final_fences"] == 1,
+        "visibility_accounting_exact": visible_tokens == last_deltas["rerot_completed_model_tokens"],
+        "aggregate_faster_than_serial": median_aggregate_tps > threshold,
+        "parallel_faster_than_serial": median_parallel_tps > threshold,
+        # Assertions: DAG/multi-Lane payload structure and multi-Lane metrics
         "request_dag_structure": is_dag_payload,
-        "multi_lane_pens_allocated": deltas["rerot_pens_allocated"] > 1,
-        "multi_lane_batch_pens": deltas["rerot_batch_pens"] > 1,
+        "multi_lane_pens_allocated": last_deltas["rerot_pens_allocated"] > 1,
+        "multi_lane_batch_pens": last_deltas["rerot_batch_pens"] > 1,
     }
 
     evidence_details: dict[str, str] = {
         "one_completed_episode": (
-            f"rerot_completed_episode_total delta must equal 1, observed {deltas['rerot_completed_episode_total']}"
+            f"rerot_completed_episode_total delta must equal 1, observed {last_deltas['rerot_completed_episode_total']}"
         ),
         "no_hard_abort": (
-            f"rerot_hard_aborts delta must equal 0, observed {deltas['rerot_hard_aborts']}"
+            f"rerot_hard_aborts delta must equal 0, observed {last_deltas['rerot_hard_aborts']}"
         ),
         "one_final_fence": (
-            f"rerot_final_fences delta must equal 1, observed {deltas['rerot_final_fences']}"
+            f"rerot_final_fences delta must equal 1, observed {last_deltas['rerot_final_fences']}"
         ),
         "visibility_accounting_exact": (
-            f"visible tokens ({visible_tokens}) must equal completed model tokens ({model_tokens})"
+            f"visible tokens ({visible_tokens}) must equal completed model tokens ({last_deltas['rerot_completed_model_tokens']})"
         ),
         "aggregate_faster_than_serial": (
-            f"aggregate throughput ({aggregate_tps:.3f} tok/s) must exceed threshold ({threshold:.3f} tok/s)"
+            f"aggregate throughput median ({median_aggregate_tps:.3f} tok/s) must exceed threshold ({threshold:.3f} tok/s)"
         ),
         "parallel_faster_than_serial": (
-            f"parallel throughput ({parallel_tps:.3f} tok/s) must exceed threshold ({threshold:.3f} tok/s)"
+            f"parallel throughput median ({median_parallel_tps:.3f} tok/s) must exceed threshold ({threshold:.3f} tok/s)"
         ),
         "request_dag_structure": (
             "payload verified as DAG/multi-Lane structure"
@@ -346,18 +440,15 @@ def main() -> int:
             else f"missing required DAG/multi-Lane structure in request: {dag_structure_err}"
         ),
         "multi_lane_pens_allocated": (
-            f"rerot_pens_allocated delta must be > 1 for real multi-Lane execution, observed {deltas['rerot_pens_allocated']}"
+            f"rerot_pens_allocated delta must be > 1 for real multi-Lane execution, observed {last_deltas['rerot_pens_allocated']}"
         ),
         "multi_lane_batch_pens": (
-            f"rerot_batch_pens delta must be > 1 for real multi-Lane execution, observed {deltas['rerot_batch_pens']}"
+            f"rerot_batch_pens delta must be > 1 for real multi-Lane execution, observed {last_deltas['rerot_batch_pens']}"
         ),
     }
 
-    # TODO: Hook for operator route hit assertion.
-    # Enable once P0 low-level operator route counters land in /metrics.
-    # Current behavior: disabled by default; does not fabricate unreleased metrics.
     if getattr(args, "enable_operator_route_gate", False):
-        operator_route_hits = deltas.get("rerot_operator_route_hits", 0.0)
+        operator_route_hits = last_deltas.get("rerot_operator_route_hits", 0.0)
         checks["operator_route_hit"] = operator_route_hits > 0
         evidence_details["operator_route_hit"] = (
             f"operator route hits must be > 0, observed {operator_route_hits}"
@@ -366,20 +457,27 @@ def main() -> int:
     passed = all(checks.values())
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "rounds": args.rounds,
         "request": rerot_payload,
         "minimum_ratio": args.min_ratio,
+        "statistics": {
+            "serial_tps": serial_stats,
+            "aggregate_tps": aggregate_stats,
+            "parallel_tps": parallel_stats,
+        },
         "serial": {
-            "client_wall_seconds": serial_wall,
-            "tokens_per_second": serial_tps,
-            "response": serial_response,
+            "tokens_per_second": median_serial_tps,
+            "samples": serial_samples,
+            "response": last_serial_response,
         },
         "rerot": {
-            "client_wall_seconds": rerot_wall,
-            "aggregate_tokens_per_second": aggregate_tps,
-            "parallel_tokens_per_second": parallel_tps,
-            "metrics_delta": deltas,
-            "response": rerot_response,
+            "aggregate_tokens_per_second": median_aggregate_tps,
+            "parallel_tokens_per_second": median_parallel_tps,
+            "token_breakdown": extract_rerot_token_breakdown(last_rerot_response),
+            "samples": rerot_samples,
+            "metrics_delta": last_deltas,
+            "response": last_rerot_response,
         },
         "checks": checks,
         "check_details": evidence_details,
@@ -390,9 +488,10 @@ def main() -> int:
     )
 
     print(
-        f"serial={serial_tps:.3f} tok/s "
-        f"rerot_aggregate={aggregate_tps:.3f} tok/s "
-        f"rerot_parallel={parallel_tps:.3f} tok/s "
+        f"rounds={args.rounds} "
+        f"serial_median={median_serial_tps:.3f} tok/s "
+        f"rerot_aggregate_median={median_aggregate_tps:.3f} tok/s "
+        f"rerot_parallel_median={median_parallel_tps:.3f} tok/s "
         f"passed={str(passed).lower()}"
     )
     if not passed:
