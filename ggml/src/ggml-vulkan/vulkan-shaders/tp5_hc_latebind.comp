@@ -117,7 +117,7 @@ void main() {
     }
     const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
     const uint k_dim = p.width * p.streams;
-    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
         if (token >= active_rows) break;
         float acc = 0.0;
         const uint token_x_offset = token * k_dim;
@@ -191,7 +191,7 @@ void main() {
     const uint row_in_wave = lane >> 3u;   // 4 rows per wave32
     const uint k_lane = lane & 7u;         // 8 K-lanes per row
 
-    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
         if (token >= active_rows) break;
         const uint row = gl_WorkGroupID.x * 32u + wave * 4u + row_in_wave;
         vec4 partial = vec4(0.0);
@@ -256,8 +256,10 @@ layout(push_constant) uniform ActQ8Params {
     uint active_rows;
 } p;
 
-shared int q_shared[256];
-shared float z_shared[64];
+// §4.1 step 3: both LDS round-trips are gone. Every stream reads the same
+// z_p block directly from global memory (the eight subgroups of a workgroup
+// share one CU, so the redundant per-stream loads hit L1), and the Q8 pack
+// uses the same aligned-4-lane shuffle rebuild as resume_lo_q8.
 
 void main() {
     const uint lane = gl_SubgroupInvocationID;
@@ -269,13 +271,11 @@ void main() {
     if (p.streams != 4u || gl_NumSubgroups != 8u || (blocks & 1u) != 0u || block >= blocks) return;
     const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
 
-    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
         if (token >= active_rows) break;
         const uint col = block * 32u + lane;
         const uint global_col = stream * p.width + col;
-        if (stream == 0u) z_shared[block_slot * 32u + lane] = local_z[token * p.width + col];
-        barrier();
-        precise float value = z_shared[block_slot * 32u + lane] * scatter[token * p.streams + stream];
+        precise float value = local_z[token * p.width + col] * scatter[token * p.streams + stream];
         if (p.my_rank == 0u) value = value + residual[token * (p.streams * p.width) + global_col];
         value = value * gamma[global_col];
 
@@ -283,24 +283,24 @@ void main() {
         const float d = amax * (1.0 / 127.0);
         const float inv_d = d != 0.0 ? 1.0 / d : 0.0;
         const int q = clamp(int(round(value * inv_d)), -127, 127);
-        q_shared[subgroup * 32u + lane] = q;
-        barrier();
+        // Wave-local pack: lanes 4j..4j+3 combine into qs_words[j]. Every
+        // lane rebuilds its aligned 4-value group with three shuffles; lanes
+        // 0,4,8,...,28 commit the words. No LDS, no barrier.
+        const uint g0 = lane & ~3u;
+        const int q0 = subgroupShuffle(q, g0);
+        const int q1 = subgroupShuffle(q, g0 + 1u);
+        const int q2 = subgroupShuffle(q, g0 + 2u);
+        const int q3 = subgroupShuffle(q, g0 + 3u);
+        const uint word = (uint(q0) & 0xffu) | (uint(q1) & 0xffu) << 8u |
+                          (uint(q2) & 0xffu) << 16u | (uint(q3) & 0xffu) << 24u;
 
         const uint out_block = token * (p.streams * blocks) + stream * blocks + block;
         if (lane == 0u) act_q8[out_block].d = d;
-        // §7.9 layout fix: qs_words[j] must be a 4x8 little-endian word
+        // §7.9 layout contract: qs_words[j] is a 4x8 little-endian word
         // (lanes 4j..4j+3), matching PACK_WEIGHTS and the Q8DOT consumers.
-        // The previous store wrote sixteen half-words at indices 0..15 —
-        // past the 8-word array and with only 16 of 32 payload bits set.
         if (lane < 8u) {
-            const uint base = subgroup * 32u + 4u * lane;
-            const uint word = uint(q_shared[base]) & 0xffu |
-                              (uint(q_shared[base + 1u]) & 0xffu) << 8u |
-                              (uint(q_shared[base + 2u]) & 0xffu) << 16u |
-                              (uint(q_shared[base + 3u]) & 0xffu) << 24u;
             act_q8[out_block].qs_words[lane] = word;
         }
-        barrier();
     }
 }
 #endif
@@ -343,7 +343,7 @@ void main() {
     const uint row = gl_WorkGroupID.x * 16u + row_slot;
     const uint blocks = p.width / 32u;
 
-    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
         if (token >= active_rows) break;
         vec4 acc = vec4(0.0);
         const uint token_act_offset = token * (p.streams * blocks);
@@ -451,7 +451,7 @@ void main() {
     const uint k_dim = p.width * p.streams;
     const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
 
-    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
         if (token >= active_rows) break;
         float acc[4] = { 0.0, 0.0, 0.0, 0.0 };
         const vec4 scatter4 = vec4(

@@ -62,7 +62,8 @@ enum class tp5_wire_type { F32, F16 };
 enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE, GPUFLAG, DRM, STAR, RELAY };
 
 static constexpr size_t TP5_MAILBOX_BANKS = 2;
-static constexpr size_t TP5_LATE_MAX_FLOATS = 8192; // up to 4 rows * 4 streams * rank <= 512
+// TP5_LATE_MAX_FLOATS and the Q-sidecar mailbox ABI now live in
+// ggml-vulkan-tp5-rows.h (shared with the tests; single source of truth).
 enum class tp5_numerical_mode {
     REFERENCE,        // 未启用 LateBind（REFERENCE/回退模式）：常规无 LateBind 路径，完全遵循原图/标准 AllReduce 数值
     EXACT_F32,        // 调度收益但数学严格等价（EXACT_F32 模式）：启用 LateBind 解耦提前搬运，但 Q 充分统计量保持 FP32 精确路径无量化
@@ -169,42 +170,8 @@ static inline std::pair<tp5_numerical_mode, tp5_numerical_reason> tp5_resolve_nu
     return { tp5_numerical_mode::AGGRESSIVE_Q8, tp5_numerical_reason::NONE };
 }
 
-static constexpr size_t TP5_RELAY_HEADER_BYTES = 64;
-static constexpr size_t TP5_LATE_Q_CONTROL_BYTES = 64;
-static constexpr size_t TP5_LATE_Q_READY_WORD = 0;
-static constexpr size_t TP5_LATE_Q_COUNTER_WORD = 1;
-
-// LateBind Q sidecar layout helper (single source of truth for both CPU and GPU push constants).
-// In aggressive Q8 fast path, the 64-byte control area lives at B + 64 + L, and payload starts at B + 128 + L.
-// In exact fallback path, control uses status[6] (host-imported RAM), and payload broadcast destination is B + 64 + L.
-static inline size_t tp5_late_q_control_offset(size_t late_host_offset) {
-    return TP5_RELAY_HEADER_BYTES + late_host_offset;
-}
-
-static inline volatile uint32_t * tp5_late_q_control_ptr(void * bcast_host, size_t late_host_offset) {
-    if (!bcast_host || late_host_offset == 0) return nullptr;
-    return (volatile uint32_t *) ((char *) bcast_host + tp5_late_q_control_offset(late_host_offset));
-}
-
-static inline const volatile uint32_t * tp5_late_q_control_cptr(const void * bcast_host, size_t late_host_offset) {
-    if (!bcast_host || late_host_offset == 0) return nullptr;
-    return (const volatile uint32_t *) ((const char *) bcast_host + tp5_late_q_control_offset(late_host_offset));
-}
-
-static inline size_t tp5_late_q_bcast_payload_offset(size_t late_host_offset, bool late_q8_fast) {
-    return TP5_RELAY_HEADER_BYTES + late_host_offset + (late_q8_fast ? TP5_LATE_Q_CONTROL_BYTES : 0);
-}
-
-static inline uint32_t tp5_late_q_payload_word_offset(size_t late_host_offset, bool late_q8_fast) {
-    return (uint32_t) (tp5_late_q_bcast_payload_offset(late_host_offset, late_q8_fast) / 4);
-}
-
-// P1-B packed Q8 activation/weight layout: one block per 32 elements, each
-// block { float d; uint qs_words[8]; } = 36 bytes. The activation buffers
-// carry no done-flag block (per-token transients, not immutable weights).
-static inline VkDeviceSize tp5_late_q8_packed_bytes(size_t elems) {
-    return VkDeviceSize(elems / 32u) * (sizeof(float) + 8u * sizeof(uint32_t));
-}
+// Q-sidecar mailbox ABI (control/payload offsets, ready/counter words,
+// packed Q8 byte count) is defined once in ggml-vulkan-tp5-rows.h.
 
 static bool tp5_latebind_hc_enabled() {
     const char * env = getenv("GGML_TP5_LATEBIND");

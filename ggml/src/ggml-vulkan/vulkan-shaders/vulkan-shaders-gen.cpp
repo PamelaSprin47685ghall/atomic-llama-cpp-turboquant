@@ -1,5 +1,9 @@
 #include <iostream>
 #include <fstream>
+// VK_TP5_DIRECT_COLUMN_TILE: the LateBind token capacity is injected into the
+// late shaders as TP5_LATE_CAPACITY_ROWS so the C++ constant stays the single
+// source of truth (see the late_* string_to_spv variants below).
+#include "../ggml-vulkan-tp5-rows.h"
 #include <sstream>
 #include <string>
 #include <stdexcept>
@@ -952,6 +956,12 @@ void process_shaders() {
         {"DATA_A_IQ4_NL", "1"}
     });
 
+    // LateBind token capacity: the shaders' unrolled token loops must track
+    // VK_TP5_DIRECT_COLUMN_TILE (ggml-vulkan-tp5-rows.h). Passing it as a
+    // define makes the C++ constant the single source; a change there
+    // recompiles every late kernel instead of silently diverging.
+    const std::string late_capacity = std::to_string(VK_TP5_DIRECT_COLUMN_TILE);
+
     // TP5 collective transport (TP5.md T12): mesh sum + canonical F16 wire pack.
     string_to_spv("tp5_sum_f32", "tp5_sum_f32.comp", {});
     string_to_spv("tp5_sum_f16", "tp5_sum_f16.comp", {});
@@ -959,31 +969,31 @@ void process_shaders() {
     string_to_spv("tp5_bda_push_f16", "tp5_bda_push_f16.comp", {});
     string_to_spv("tp5_hc_late_inject", "tp5_hc_latebind.comp",
                   {
-                      { "TP5_LATE_INJECT", "1" }
+                      { "TP5_LATE_INJECT", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
     });
     string_to_spv("tp5_hc_late_q", "tp5_hc_latebind.comp",
                   {
-                      { "TP5_LATE_Q", "1" }
+                      { "TP5_LATE_Q", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
     });
     string_to_spv("tp5_hc_late_act_q8", "tp5_hc_latebind.comp",
                   {
-                      { "TP5_LATE_ACT_Q8", "1" }
+                      { "TP5_LATE_ACT_Q8", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
     });
     string_to_spv("tp5_hc_late_pack", "tp5_hc_latebind.comp",
                   {
-                      { "TP5_LATE_PACK_WEIGHTS", "1" }
+                      { "TP5_LATE_PACK_WEIGHTS", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
     });
     string_to_spv("tp5_hc_late_q_q8dot", "tp5_hc_latebind.comp",
                   {
-                      { "TP5_LATE_Q_Q8DOT", "1" }
+                      { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
     });
-    string_to_spv("tp5_hc_resume_norm", "tp5_hc_resume.comp", {{ "TP5_RESUME_NORM", "1" }});
-    string_to_spv("tp5_hc_resume_lo", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO", "1" }});
-    string_to_spv("tp5_hc_resume_lo_q8", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO_Q8", "1" }});
+    string_to_spv("tp5_hc_resume_norm", "tp5_hc_resume.comp", {{ "TP5_RESUME_NORM", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
+    string_to_spv("tp5_hc_resume_lo", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
+    string_to_spv("tp5_hc_resume_lo_q8", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO_Q8", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
     string_to_spv("tp5_hc_publish", "tp5_hc_publish.comp", {});
     string_to_spv("tp5_hc_late_up_q8dot", "tp5_hc_latebind.comp",
                   {
-                      { "TP5_LATE_UP_Q8DOT", "1" }
+                      { "TP5_LATE_UP_Q8DOT", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
     });
     string_to_spv("tp5_hc_publish_f16", "tp5_hc_publish.comp", {{ "TP5_PUBLISH_F16", "1" }});
     string_to_spv("qwen4_hc_up_fold", "qwen4_hc_up_fold.comp", {});

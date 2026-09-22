@@ -12,6 +12,7 @@
 
 #include "../ggml/src/ggml-impl.h" // ggml_set_op_params (private FA node construction)
 #include "../ggml/src/ggml-vulkan/ggml-vulkan-collective.hpp"
+#include "../ggml/src/ggml-vulkan/ggml-vulkan-tp5-rows.h"
 
 #include <memory>
 #include <cstdio>
@@ -1125,16 +1126,17 @@ static void test_tp5_numerical_mode_resolution() {
 
 static void test_tp5_latebind_protocol_invariants() {
     fprintf(stderr, "--- test_tp5_latebind_protocol_invariants ---\n");
-    // Layout invariants from TP5 LateBind protocol
-    constexpr size_t TP5_RELAY_HEADER_BYTES = 64;
-    constexpr size_t TP5_LATE_Q_CONTROL_BYTES = 64;
-    constexpr size_t TP5_LATE_Q_READY_WORD = 0;
-    constexpr size_t TP5_LATE_Q_COUNTER_WORD = 1;
+    // Layout invariants asserted against the PRODUCTION ABI in
+    // ggml-vulkan-tp5-rows.h (M0: no mirrored constants — a diverging copy in
+    // collective.cpp or the shaders must fail this fixture, not pass it).
+    static_assert(TP5_RELAY_HEADER_BYTES == 64);
+    static_assert(TP5_LATE_Q_CONTROL_BYTES == 64);
+    static_assert(TP5_LATE_Q_READY_WORD == 0);
+    static_assert(TP5_LATE_Q_COUNTER_WORD == 1);
+    static_assert(TP5_LATE_MAX_FLOATS == 8192);
 
-    const auto ctrl_offset = [](size_t L) { return TP5_RELAY_HEADER_BYTES + L; };
-    const auto payload_offset = [](size_t L, bool fast) {
-        return TP5_RELAY_HEADER_BYTES + L + (fast ? TP5_LATE_Q_CONTROL_BYTES : 0);
-    };
+    const auto ctrl_offset    = tp5_late_q_control_offset;
+    const auto payload_offset = tp5_late_q_bcast_payload_offset;
 
     // Test a variety of realistic alignments and offsets (e.g. 2560 elements * sizeof(float))
     const size_t test_offsets[] = { 2560 * sizeof(float), 4096 * sizeof(float), 10240, 16384 };
@@ -1281,14 +1283,9 @@ static void test_tp5_latebind_multi_row_invariants() {
     fprintf(stderr, "--- test_tp5_latebind_multi_row_invariants ---\n");
     // Contract: Multi-row verification (active_rows in {1, 2, 4}) within single capacity=4 definition.
     // Layout/parameters defined once; Q/sidecar layout contiguous; single-row non-regression guaranteed.
-    constexpr size_t TP5_RELAY_HEADER_BYTES = 64;
-    constexpr size_t TP5_LATE_Q_CONTROL_BYTES = 64;
-    constexpr size_t TP5_LATE_MAX_FLOATS = 8192;
-
-    const auto ctrl_offset = [](size_t L) { return TP5_RELAY_HEADER_BYTES + L; };
-    const auto payload_offset = [](size_t L, bool fast) {
-        return TP5_RELAY_HEADER_BYTES + L + (fast ? TP5_LATE_Q_CONTROL_BYTES : 0);
-    };
+    // Offsets come from the production ABI (ggml-vulkan-tp5-rows.h).
+    const auto ctrl_offset    = tp5_late_q_control_offset;
+    const auto payload_offset = tp5_late_q_bcast_payload_offset;
 
     const uint32_t width = 2560;
     const uint32_t streams = 4;
@@ -1516,10 +1513,11 @@ static void test_tp5_sidecar_format_keying() {
         // The Q control region and payload offsets are derived from the same
         // flag: F16 payload sits 64 bytes after the control region, and the
         // CPU Q-wait polls qctrl[0] exactly when the Q8DOT producer is active.
+        // Offsets come from the production ABI helpers, not local arithmetic.
         constexpr size_t L = 2560 * sizeof(float); // production shape fixture
-        constexpr size_t control = 64 + L;
-        constexpr size_t payload_f16 = 64 + L + 64;
-        constexpr size_t payload_f32 = 64 + L;
+        constexpr size_t control     = tp5_late_q_control_offset(L);
+        constexpr size_t payload_f16 = tp5_late_q_bcast_payload_offset(L, true);
+        constexpr size_t payload_f32 = tp5_late_q_bcast_payload_offset(L, false);
         static_assert(payload_f16 != payload_f32);
         if (late_q8_fast) {
             TEST_ASSERT(payload_f16 == control + 64);

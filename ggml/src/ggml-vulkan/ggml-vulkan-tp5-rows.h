@@ -118,3 +118,48 @@ inline bool vk_tp5_latebind_token_is_active(uint32_t token, uint32_t active_rows
 inline uint64_t vk_tp5_latebind_active_q_elements(uint32_t active_rows, uint32_t streams, uint32_t rank_dim) {
     return uint64_t(active_rows) * streams * rank_dim;
 }
+
+// ===== LateBind Q-sidecar mailbox ABI (single source of truth) =====
+//
+// M0 closure: this layout was previously defined as statics in
+// ggml-vulkan-collective.cpp and mirrored by hand in three test-tp5-plan
+// fixtures. CPU reset, CPU polling, CPU reduce, shader push constants and
+// the tests must all derive from these definitions — never a second copy.
+// In the aggressive Q8 fast path the 64-byte control area lives at
+// B + 64 + L and the payload at B + 128 + L; in the exact fallback the
+// control uses status[6] (host-imported RAM) and the payload is B + 64 + L.
+constexpr size_t TP5_RELAY_HEADER_BYTES   = 64;
+constexpr size_t TP5_LATE_Q_CONTROL_BYTES = 64;
+constexpr size_t TP5_LATE_Q_READY_WORD    = 0; // qctrl[0]: sidecar ready
+constexpr size_t TP5_LATE_Q_COUNTER_WORD  = 1; // qctrl[1]: WG completion counter
+// Capacity ceiling: VK_TP5_DIRECT_COLUMN_TILE rows * 4 streams * rank <= 512.
+constexpr size_t TP5_LATE_MAX_FLOATS      = 8192;
+
+constexpr size_t tp5_late_q_control_offset(size_t late_host_offset) {
+    return TP5_RELAY_HEADER_BYTES + late_host_offset;
+}
+
+inline volatile uint32_t * tp5_late_q_control_ptr(void * bcast_host, size_t late_host_offset) {
+    if (!bcast_host || late_host_offset == 0) return nullptr;
+    return (volatile uint32_t *) ((char *) bcast_host + tp5_late_q_control_offset(late_host_offset));
+}
+
+inline const volatile uint32_t * tp5_late_q_control_cptr(const void * bcast_host, size_t late_host_offset) {
+    if (!bcast_host || late_host_offset == 0) return nullptr;
+    return (const volatile uint32_t *) ((const char *) bcast_host + tp5_late_q_control_offset(late_host_offset));
+}
+
+constexpr size_t tp5_late_q_bcast_payload_offset(size_t late_host_offset, bool late_q8_fast) {
+    return TP5_RELAY_HEADER_BYTES + late_host_offset + (late_q8_fast ? TP5_LATE_Q_CONTROL_BYTES : 0);
+}
+
+constexpr uint32_t tp5_late_q_payload_word_offset(size_t late_host_offset, bool late_q8_fast) {
+    return (uint32_t) (tp5_late_q_bcast_payload_offset(late_host_offset, late_q8_fast) / 4);
+}
+
+// P1-B packed Q8 activation/weight layout: one block per 32 elements, each
+// block { float d; uint qs_words[8]; } = 36 bytes. The activation buffers
+// carry no done-flag block (per-token transients, not immutable weights).
+constexpr uint64_t tp5_late_q8_packed_bytes(size_t elems) {
+    return (elems / 32u) * (sizeof(float) + 8u * sizeof(uint32_t));
+}

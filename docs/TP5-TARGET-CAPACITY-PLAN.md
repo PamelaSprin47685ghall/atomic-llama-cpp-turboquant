@@ -398,6 +398,37 @@ over 256 线程 → 每 subgroup 恰 2 行），但旧实现走 LDS 往返：`ro
 **语义**：归并仍是 16 项的树状重结合（旧版是 16 项串行链）——aggressive 模式
 本就声明重结合自由；发布顺序与 word 地址逐一保持。
 
+### 7.14 M0 收口 + §4.1 第三步：ACT_Q8 LDS 清零 + 容量常量单源（已合入）
+
+**三项改动**（本轮，全部 CPU/定义期验证）：
+
+1. **Q-sidecar mailbox ABI 单源化（M0 收口）**：`TP5_RELAY_HEADER_BYTES` /
+   `TP5_LATE_Q_CONTROL_BYTES` / `TP5_LATE_Q_READY_WORD` / `TP5_LATE_Q_COUNTER_WORD` /
+   `TP5_LATE_MAX_FLOATS` / `tp5_late_q_control_offset/_ptr/_cptr` /
+   `tp5_late_q_bcast_payload_offset` / `tp5_late_q_payload_word_offset` /
+   `tp5_late_q8_packed_bytes` 全部从 `ggml-vulkan-collective.cpp` 的文件内 static
+   **移入 `ggml-vulkan-tp5-rows.h`**（与 `VK_TP5_DIRECT_COLUMN_TILE`、
+   `vk_tp5_latebind_layout` 同处）。`test-tp5-plan` 三个 fixture 原先各自手抄
+   64/64/0/1/8192 镜像常量与偏移 lambda——正是路线图 M0 指出的"每个端点各自
+   维护一份差不多真理"。现全部改调生产 helper（含 static_assert 钉死数值），
+   生产侧与测试侧任何漂移立即红。
+2. **§4.1 第三步：ACT_Q8 两个 LDS 往返全消**：`z_shared[64]` 广播（stream-0
+   暂存 + 全 stream 读回 + barrier）删除——8 个 subgroup 同 WG 共享一个 CU，
+   每 stream 直接重读 `local_z` 命中 L1；`q_shared[256]` 打包往返（写 →
+   barrier → 8 lane 跨步读）换成与 `resume_lo_q8` 第十七轮相同的
+   `sublane & ~3u` 三次 shuffle 重建 4-lane 组。每 token 3 个 barrier 全消。
+   RADV 实测：code 2064→**1744**（−15.5%），LDS 2048→**0**（−100%），
+   VGPR 64 / 零 spill 不变。
+3. **LateBind 容量常量单源**：10 处 shader 硬编码 `token < 4u`（latebind 5 +
+   resume 5，含 NaN 失败态路径）改为 `token < TP5_LATE_CAPACITY_ROWS`，
+   由 `vulkan-shaders-gen.cpp` 从 `VK_TP5_DIRECT_COLUMN_TILE` 派生注入
+   （`std::to_string` → `-D`）。C++ 常量从此是唯一真理；改 tile 值会重编全部
+   late kernel，而不是让 shader 悄悄保留旧值。
+
+**验证**：`test-tp5-plan` all passed（三 fixture 改调生产 ABI 后全绿）；
+15/15 ctest 全绿；RADV codegen 表其余 kernel 逐字节不变（define=4 与旧字面
+量等价）；GPU 空闲（5×0%）；零内核错误。
+
 ### 7.13 ACT_Q8 打包约定 bug 修复（§7.9 引入，本轮静态发现）
 
 第十七轮把 resume_lo_q8 的打包换成 shuffle 时推导了 `qs_words[j] = lanes

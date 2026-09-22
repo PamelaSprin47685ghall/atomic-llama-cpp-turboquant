@@ -118,7 +118,7 @@ void finalize_stream(const uint iterations, const uint active_rows) {
     const uint stream = gl_WorkGroupID.x;
     if (!await_input()) {
         const float nanv = uintBitsToFloat(0x7fc00000u);
-        for (uint token = 0u; token < 4u; ++token) {
+        for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
             if (token >= active_rows) break;
             const uint base = token * (p.streams * p.width) + stream * p.width;
             for (uint col = lane; col < p.width; col += 256u) {
@@ -130,7 +130,7 @@ void finalize_stream(const uint iterations, const uint active_rows) {
         }
         return;
     }
-    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
         if (token >= active_rows) break;
         const uint base = token * (p.streams * p.width) + stream * p.width;
         const float s = scatter[token * p.streams + stream];
@@ -217,7 +217,7 @@ void main() {
     }
     const uint active_rows = inbox[ACTIVE_ROWS_WORD] != 0u ? inbox[ACTIVE_ROWS_WORD] : p.active_rows;
     if (!await_input()) {
-        for (uint token = 0u; token < 4u; ++token) {
+        for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
             if (token >= active_rows) break;
             for (uint row = lane; row < p.rank_dim; row += 256u)
                 lo[token * p.rank_dim + row] = uintBitsToFloat(0x7fc00000u);
@@ -233,7 +233,7 @@ void main() {
     }
 #ifdef TP5_RESUME_LO_Q8
     const uint row = lane;
-    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
         if (token >= active_rows) break;
         const vec4 scale = vec4(
             inverse_rho[token * 4u + 0u],
@@ -273,7 +273,7 @@ void main() {
         if ((sublane & 3u) == 0u) lo_q8[token * 10u + sub].qs_words[sublane >> 2u] = word;
     }
 #else
-    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
         if (token >= active_rows) break;
         const vec4 scale = vec4(
             inverse_rho[token * 4u + 0u],
