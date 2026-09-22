@@ -1,5 +1,7 @@
 #include "llama-rerot.h"
 
+#include <cstdio>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -2444,7 +2446,15 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
             // value; eff holds exactly that one value and the merge treats
             // the whole list as one bulk group (no per-row eff reads).
             bool const_eff = false;
+            // Const lists whose run carries fast_keys (the production
+            // shape) REFERENCE the run's key-id array instead of copying
+            // it: the emission reads fast_keys directly, so no per-query
+            // key_ids buffer, no R x K uint32 copy pass.
+            const uint32_t * key_ptr = nullptr; // null => use key_ids
+            size_t key_n = 0;
             int64_t head(int64_t i) const { return eff[const_eff ? 0 : i]; }
+            const uint32_t * keys() const { return key_ptr ? key_ptr : key_ids.data(); }
+            size_t n_rows() const { return const_eff ? key_n : eff.size(); }
         };
         std::vector<eff_list> lists(1 + segs.size());
         std::vector<uint64_t> vis_count(lists.size(), 0);
@@ -2453,9 +2463,31 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
 
         // Per-segment causal cuts (tagged-order prefix) reused per query.
         std::vector<size_t> seg_cut(segs.size(), 0);
-        for (auto & L : lists) {
-            L.eff.reserve(keys_ref.size() / 2 + 8);
-            L.key_ids.reserve(keys_ref.size() / 2 + 8);
+        // Per-list buffer sizing (fifteenth round): the old code reserved
+        // keys/2 entries in EVERY list (R lists x ~K/2 x 12B per reader —
+        // hundreds of MB of fresh allocation per frontier at production
+        // shapes, all of it page-faulted). Size each list by its actual
+        // content need: the base arm by the owned count, each segment by
+        // the run's row count (the passing subset is <= that), and const
+        // lists barely at all (one eff slot; keys are referenced).
+        for (size_t li = 0; li < lists.size(); ++li) {
+            auto & L = lists[li];
+            if (li == 0) {
+                const size_t hint = base.size() + 8;
+                L.eff.reserve(hint);
+                L.key_ids.reserve(hint);
+                continue;
+            }
+            const auto & sv = segs[li - 1];
+            const bool const_with_keys =
+                sv.identity && sv.run->contiguous && !sv.run->fast_keys.empty();
+            if (const_with_keys) {
+                L.eff.reserve(4); // the single constant effective value
+                continue;         // keys reference the run; no buffer needed
+            }
+            const size_t hint = sv.run->rows.size() + 8;
+            L.eff.reserve(hint);
+            L.key_ids.reserve(hint);
         }
         for (size_t qi = 0; qi < query_storage_pos[r].size(); ++qi) {
             const llama_pos q_pos = query_storage_pos[r][qi];
@@ -2582,6 +2614,8 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                     L.key_ids.clear();
                     L.sorted = true;
                     L.const_eff = false; // stale const_eff would alias head()
+                    L.key_ptr = nullptr;
+                    L.key_n = 0;
                 }
                 // Base arm: causal prefix of the (storage, idx)-ascending
                 // array; virtual = position in the base list.
@@ -2607,18 +2641,22 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                             // Contiguous identity (the production decode
                             // shape): storage[t] - t is the CONSTANT
                             // storage[0] — one effective value for the whole
-                            // list. Store it once and bulk-copy the key ids.
+                            // list. When the run carries fast_keys the key
+                            // ids are REFERENCED (no copy, no buffer);
+                            // otherwise they are gathered once.
                             L.const_eff = true;
                             L.eff.push_back(qv + int64_t(sv.run->storage[0]) -
                                             int64_t(vis_before[si + 1]));
-                            if (!sv.run->fast_keys.empty()) {
-                                L.key_ids.assign(sv.run->fast_keys.begin(),
-                                                 sv.run->fast_keys.begin() + cut);
+                            if (!sv.run->fast_keys.empty() &&
+                                sv.run->fast_keys.size() >= cut) {
+                                L.key_ptr = sv.run->fast_keys.data();
+                                L.key_n = cut;
                             } else {
                                 L.key_ids.reserve(cut);
                                 for (size_t t = 0; t < cut; ++t) {
                                     L.key_ids.push_back(keys_ref[sv.run->rows[t]].key_index);
                                 }
+                                L.key_n = cut;
                             }
                         } else if (sv.identity) {
                             // Identity passing set, non-contiguous storage
@@ -2690,7 +2728,6 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                 size_t emit_cursor = 0;
                 if (sink) {
                     emit_out = sink->entries + sink->entry_cursor;
-                    group_base = uint32_t(sink->group_cursor);
                 } else {
                     layout.entries.resize(size_t(total));
                     emit_out = layout.entries.data();
@@ -2699,8 +2736,7 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                     int64_t best = std::numeric_limits<int64_t>::max();
                     bool any = false;
                     for (size_t li = 0; li < lists.size(); ++li) {
-                        const size_t n_rows = lists[li].const_eff
-                            ? lists[li].key_ids.size() : lists[li].eff.size();
+                        const size_t n_rows = lists[li].n_rows();
                         if (merge_pos[li] < n_rows) {
                             const int64_t v = lists[li].head(int64_t(merge_pos[li]));
                             if (!any || v < best) {
@@ -2713,23 +2749,24 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                         break;
                     }
                     const uint32_t group_index = sink
-                        ? uint32_t(sink->group_cursor)
+                        ? uint32_t(sink->groups_out->size())
                         : uint32_t(layout.groups.size());
                     bool emitted = false;
                     for (size_t li = 0; li < lists.size(); ++li) {
                         // Contiguous-identity fast path: the whole list
                         // shares one effective value, so when it matches
                         // best the ENTIRE remainder is one bulk fill (no
-                        // per-entry loop body).
-                        const size_t n_rows = lists[li].const_eff
-                            ? lists[li].key_ids.size() : lists[li].eff.size();
+                        // per-entry loop body). The key ids come either
+                        // from the referenced run array or from the local
+                        // gather buffer.
+                        const size_t n_rows = lists[li].n_rows();
                         const bool bulk_ok = lists[li].const_eff;
                         if (bulk_ok && merge_pos[li] < n_rows &&
                             lists[li].head(int64_t(merge_pos[li])) == best) {
                             const size_t p = merge_pos[li];
                             const size_t n = n_rows - p;
                             llama_rerot_attn_entry * out = emit_out + emit_cursor;
-                            const uint32_t * kids = lists[li].key_ids.data() + p;
+                            const uint32_t * kids = lists[li].keys() + p;
                             for (size_t i = 0; i < n; ++i) {
                                 out[i] = { kids[i], group_index };
                             }
@@ -2740,7 +2777,7 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                         }
                         while (merge_pos[li] < n_rows &&
                                lists[li].head(int64_t(merge_pos[li])) == best) {
-                            emit_out[emit_cursor++] = { lists[li].key_ids[merge_pos[li]], group_index };
+                            emit_out[emit_cursor++] = { lists[li].keys()[merge_pos[li]], group_index };
                             ++merge_pos[li];
                             emitted = true;
                         }
@@ -2752,7 +2789,8 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                         throw std::overflow_error("RERoT effective query position is outside llama_pos range");
                     }
                     if (sink) {
-                        sink->groups[sink->group_cursor++] = { sink->query_index_per_reader[r][qi], llama_pos(best) };
+                        GGML_ASSERT(sink->groups_out->size() < sink->groups_out->capacity());
+                        sink->groups_out->push_back({ sink->query_index_per_reader[r][qi], llama_pos(best) });
                     } else {
                         layout.groups.push_back({ 0, llama_pos(best) });
                     }

@@ -235,6 +235,26 @@ struct llama_rerot_attn_layout {
         return n_queries == 0;
     }
 
+    // Reset for a fresh build while RETAINING capacity AND the entries'
+    // exact size: the builder pre-sizes `entries` to the frontier's upper
+    // bound by cursor write, so keeping the size makes the steady-state
+    // resize a no-op (no value-init pass over ~25MB). `groups` are
+    // appended by the sink (push_back) and must start empty; offsets are
+    // rebuilt by push_back. Stale bytes in `entries` beyond the emitted
+    // cursor are never read: the shrink at the end caps the size.
+    // Reset for a fresh build while RETAINING capacity AND the entries'
+    // exact size: the builder pre-sizes `entries` to the frontier's upper
+    // bound by cursor write, so keeping the size makes the steady-state
+    // resize a no-op (no value-init pass over ~25MB). `groups` are
+    // appended by the sink (push_back) and must start empty; offsets are
+    // rebuilt by push_back. Stale bytes in `entries` beyond the emitted
+    // cursor are never read: the shrink at the end caps the size.
+    void clear() {
+        n_queries = 0;
+        groups.clear();
+        query_offsets.clear();
+    }
+
     bool validate(uint32_t n_keys, std::string * error = nullptr) const;
 
     // Persistent duplicate-key scratch for the validating mode: the layout
@@ -567,15 +587,20 @@ private:
 // per-query layouts and the assembly copy disappear. The sink arrays must
 // be pre-sized to the exact totals; cursors track emission positions.
 struct rerot_emission_sink {
+    // Entries are written by raw cursor into a PRE-SIZED array (the sink
+    // overwrites every element; a value-init pass would be pure waste).
+    // Groups are APPENDED to a capacity-reserved vector (push_back) —
+    // the group count is data-dependent and pre-sizing it by entry count
+    // would both zero-fill megabytes and then be overwritten on the
+    // closing resize growth.
     llama_rerot_attn_entry * entries = nullptr;
-    llama_rerot_attn_group * groups = nullptr;
+    std::vector<llama_rerot_attn_group> * groups_out = nullptr;
     std::vector<uint32_t> * query_offsets = nullptr;
     std::vector<llama_pos> * query_virtual_pos = nullptr;
     // Per-reader ubatch-row arrays: query_index_per_reader[r][qi] is the
     // ubatch row stamped on the groups emitted for that (reader, query).
     std::vector<const uint32_t *> query_index_per_reader;
     size_t entry_cursor = 0;
-    size_t group_cursor = 0;
 };
 
 std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader_world(

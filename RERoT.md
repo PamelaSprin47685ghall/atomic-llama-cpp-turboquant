@@ -2508,6 +2508,24 @@ c3648d789  DAG logical/view/fixed-entry implementation
   - R=6 K=65536（validate=0）：**4,863 us（9.65×）**
 - **验证**：全 rerot/xkv/flashprefill 电池 100% 绿；ASAN 干净无越界；Phase 1–7 生命周期增量与重建测试全通。
 
+**第十五轮：消灭 size 阶段的 value-init 浪费＋groups append 化（09-22 白班）**：
+
+- **背景**：第十四轮后 phase 细分显示 layout build 的 `size` 阶段占 28–38ms（R=12 K=262k），远超 emit（4.3ms）。逐层定位发现三处结构性浪费：(a) `rerot_build_attn_layout` 入口 `result = llama_rerot_attn_layout{}` 把调用方 scratch 的 capacity **整体释放**，每次 frontier 重新 reserve 25MB+37MB（page fault + zero-fill）；(b) `entries.resize(entry_bound)` 每轮把 25MB value-init 置零后被 emit 全量覆写；(c) `groups.resize(group_bound)` 把 **37MB** 的 entry_bound 规模组数组 zero-fill，而实际组数只有个位数。
+- **改动一（`llama_rerot_attn_layout::clear()` 替代对象重置）**：`clear()` 只重置 `n_queries`/`query_offsets`，`entries` 的 size **保持不变**（稳态下等于上轮 emitted cursor ≈ bound → 预 size 变成 no-op），capacity 全程保留。曾在“清空 entries size”的实验版本中观察到 `emit_cursor != total` 之后 groups 被 zero-fill 覆写——正是 size 路径与 sink 写路径交互出的数据破坏，本轮测试矩阵（含 MTP 重复 storage 形状）已钉住。
+- **改动二（groups 由 sink append，不再预 size）**：`rerot_emission_sink` 的 `groups` 改为 `std::vector *`（`groups_out`），merge 命中新组时 `push_back`（capacity 已 reserve，不 realloc、不 zero-fill）；**entries 保持 raw cursor 预 size**（全量覆写）。`entry_cursor` 仍由 sink 跟踪，最终只 shrink entries。
+- **改动三（const 列表直接引用 run 的 fast_keys）**：`eff_list` 增加 `key_ptr/key_n`，contiguous+identity 段（生产 decode 形状）**不再把 run 的 key-id 数组拷进 per-query 缓冲**，emission 直接读 `run->fast_keys`；每 list 的 buffer reserve 也改按实际内容规模（base=owned 数、段=run 行数、const=1），取代旧的统一 `keys/2`（每 reader 13 lists × 1.5MB 的分配浪费）。
+- **改动四（PQ2_0 LUT 负结论，Q7）**：验证十问第 7 问的 LUT 路线在**当前仓库取值域与粒度下是负收益**：16 项表每 4 个 activation 重建一次（100k×128 权重实测 2178us→57650us，26× 慢），T-MAC 的收益前提是表服务大量权重行（矩阵乘形态），单 vec_dot 不成立；且现有 x86 路径已有 AVX-512-VNNI 结构化利用。结论：Q7 若要推进，必须以 **GEMM 级**共享表重新设计，不在 vec_dot 层面。
+- **实测**（cache-prod bench：经 context 装配 scratch 的生产路径，min-of-5，validate=0/默认）：
+
+|形状|14轮（旧 clear）|15轮 validate=0|15轮默认 validate|基线（班11前）|
+|---|---|---|---|---|
+|R=12 K=262144|37,778 us|**4,311 us（69×）**|**9,307 us（32×）**|297,450 us|
+|R=6 K=131072|10,082 us|**1,180 us（76×）**|2,420 us|90,135 us|
+|R=6 K=65536|4,863 us|**610 us（77×）**|—|46,919 us|
+
+  默认 validate（tier-1 max-reduce）在 R=12 上固定占 ~5ms；val=0 时 numeric+direct-emit=4.3ms，已逼近 25MB emit 的内存带宽下界。
+- **验证**：全 rerot/xkv/flashprefill 电池 0 failure；ASAN（/tmp/asan15，Debug+ASAN 全量重建）0 错误；`test_rerot_world_incremental_decode` Phase 1–7 全过（含 MTP 重复 storage 形状——正是它把 groups size 交互 bug 钉住）。
+
 ### 21.2 验证证据
 
 - `test-rerot-math`：0 failure。Q3 对拍独立全 softmax oracle（含不可见读者、合并顺序无关性）；Q5 对拍稠密 §2.3 逐步递推（12 步，α<1，异构 β，秩每步恰 +1，dense/output 双等价，多 lane 共享投影位级一致）；Q6 24 个随机 chunk（T=1..8，含 β=0 纯衰减，此时 M=G·I、Y=0 精确成立）对拍逐步 oracle ≤1e-10；Q7 全部四种编码存在下对拍 (code−1) 解码 oracle，整数 activation 时位级相等。
@@ -2535,4 +2553,4 @@ c3648d789  DAG logical/view/fixed-entry implementation
 - Q7 的 LUT 路径在 GPU 上“减乘法≠减耗时”，需实测；块 scale 与 Hadamard 域不得交换。
 - Q8（跳块上界）与 Q10（K×H 联合投机）是近似/研究路线：本轮已把它们的**数学契约与可执行反例**落成参考代码（界、验证引擎、naive 对照），但收益测量、接受率账目与生产接入仍未做，不得与等义改写的收益混记。Q10 的保守“全笔通过才前进”方案在独立接受率 a、b 笔下整步通过率为 a^b，联合草稿必须学会预测多笔相互影响后的下一 frontier，而不是 b 条各自向前冲的草稿。
 - Q2/Q4 生产化已推进到单一共享 key world＋生产形态快路径（decode 热路径，见 21.1 第五～十轮）：结构扫描与排序对 R 个 reader 各只做一次，reader 无关段属性（uniform、fast_keys）已上收共享结构 pass（R=12 K=262144 builder −50%），ownership 列 bitset 直供（cache 级 R×K 字节展开删除），Q=6（MTP verify）数值通道已 1.85×（8758 us，接近 entry 输出 memcpy 地板）；剩余方向：让写入布局主动维持长而规则的 span（`llama_rerot_span_long_fraction` 是验收指标）；把 run-order 签名接入 flashprefill 的 `llama_rerot_split_table_fragments` 调用点，结构事件才重算 fragments，数值增长走增量前缀和——注意 flashprefill 侧已有 fp_key+freshness 整层缓存，fragment 级缓存的边际收益需先证明再动手。
-- Q3 host 侧：结构 pass 持久化＋cache 级增量接入彻底闭环。第十四轮引入直写 Sink（`rerot_emission_sink`）将 assembly 完全消除（22ms → 0），默认 validate 采用 branchless max-reduce 压进 5ms，`try_append_key_fast` 接入 decode 热路径。cache 级总耗时在 R=12 K=262k 突破 40ms 大关（**37.7ms / 7.87×**，默认 validate 下 **41.1ms**）。Host 侧组织优化已达到 CPU-only 极限，后续重点转移至 GPU 侧 shared KV 块多读者与张量化段描述。剩余工作全在 cache 级接入：`replace_keys`（环形 cell 复用）＋ `apply_ubatch` on_cell 协调 ＋ purge/回滚失效语义；接入后每 frontier 只付数值 pass。真机收益需目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键，不是模型证据）。
+- Q3 host 侧：第十五轮消灭 layout build 的 size 阶段 value-init 浪费（scratch capacity 释放、25MB entries zero-fill、37MB groups zero-fill）并让 groups 由 sink 直接 append、const 段零拷贝引用 fast_keys。cache 级稳态（生产 scratch 路径）R=12 K=262k：**4.3ms（69× vs 班11前基线）**，默认 validate 下 9.3ms——逼近 25MB emit 的带宽下界，host 侧布局构建实质归零；剩余成本是语义必需 emission（GPU 搬运用途下还应走段描述压缩，见 Q2）。剩余工作全在 cache 级接入：`replace_keys`（环形 cell 复用）＋ `apply_ubatch` on_cell 协调 ＋ purge/回滚失效语义；接入后每 frontier 只付数值 pass。真机收益需目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键，不是模型证据）。

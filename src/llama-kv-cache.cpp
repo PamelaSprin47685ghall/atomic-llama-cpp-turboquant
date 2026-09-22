@@ -6462,9 +6462,14 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
     // built layout out, leaving the previous frontier's buffers in the
     // scratch for the next build). Without a scratch this is the plain
     // by-value build.
+    // Fifteenth round: reset through clear(), NOT a fresh object: a
+    // heap-allocated object's operator= RELEASES the retained capacity,
+    // so every frontier re-reserved ~25MB of entries/groups (page
+    // faults + zero-fill dominated the whole layout build). clear()
+    // keeps the capacity and only resets the sizes.
     llama_rerot_attn_layout local;
     llama_rerot_attn_layout & result = assembly_scratch ? *assembly_scratch : local;
-    result = llama_rerot_attn_layout{};
+    result.clear();
     if (!rerot_batch_active(ubatch)) {
         return std::move(result);
     }
@@ -6586,7 +6591,6 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         }
     }
     const auto t_cols1 = std::chrono::steady_clock::now();
-    const auto t_num1 = std::chrono::steady_clock::now();
     // Fourteenth round: DIRECT EMISSION. The builder's per-query merge
     // writes the FINAL entries/groups arrays through the sink (group base
     // and query index stamped inline) — the intermediate per-query layout
@@ -6597,33 +6601,50 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
     // downward resize never reallocates).
     {
         const size_t n_queries_total = size_t(ubatch.n_tokens);
-        // Worst case every visible entry of every query is its own group
-        // (distinct effective positions), so the group bound is the same
-        // as the entry bound — a (runs + 2) * n_queries bound is NOT an
-        // upper bound on merge output groups.
-        const size_t n_queries_total_ = n_queries_total;
+        // Upper bound (fifteenth round): each query's visible set is a
+        // subset of the world's records, so K * n_queries bounds the
+        // entries. Tighten when every reader group has a query: the
+        // steady state is exactly K per query, so sum over queries of
+        // min(records, ...) degenerates to the same — records x queries
+        // stays the honest bound. (A (runs + 2) * n_queries bound is
+        // NOT an upper bound on merge output groups, so the group bound
+        // matches the entry bound.)
         const size_t entry_bound = world.keys_ref().size() * n_queries_total;
         const size_t group_bound = entry_bound;
-        GGML_UNUSED(n_queries_total_);
+        // entries: pre-sized to the bound (the sink writes by raw
+        // cursor, so the value-init is wasted work — mitigated by the
+        // size-preserving clear(): the steady state's resize is a no-op).
+        // groups: NOT pre-sized — the merge appends them by push_back
+        // (capacity reserved, no zero-fill; group count is data-
+        // dependent and typically orders of magnitude below the entry
+        // count, so zero-filling the entry_bound-sized array would cost
+        // more than the groups themselves).
         if (result.entries.capacity() < entry_bound) {
             result.entries.reserve(entry_bound);
         }
         if (result.groups.capacity() < group_bound) {
             result.groups.reserve(group_bound);
         }
-        result.entries.resize(entry_bound);
-        result.groups.resize(group_bound);
+        // Entries: overwrite the full bound by cursor; only grow (and
+        // zero-fill) when the previous frontier left it smaller.
+        if (result.entries.size() != entry_bound) {
+            result.entries.resize(entry_bound);
+        }
         result.query_offsets.reserve(n_queries_total + 1);
         // NOTE: the leading 0 was pushed before the group scan; the sink
         // appends one offset per emitted query, so the vector ends as
         // [0, q0_end, q1_end, ...] with n_queries + 1 entries.
     }
+    const auto t_size1 = std::chrono::steady_clock::now();
     {
         rerot_emission_sink sink;
         sink.entries = result.entries.data();
-        sink.groups = result.groups.data();
+        sink.groups_out = &result.groups;
         sink.query_offsets = &result.query_offsets;
         sink.query_virtual_pos = &rerot_qvp_sink;
+        // Groups are appended by the sink: start from an empty (but
+        // capacity-retaining) vector; entries are overwritten by cursor.
+        result.groups.clear();
         rerot_qvp_sink.clear();
         rerot_qvp_sink.reserve(size_t(ubatch.n_tokens));
         // Per-reader ubatch-row pointers: groups[g].rows in order — the
@@ -6637,29 +6658,26 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
             llama_rerot_build_query_layouts_multi_reader_world(
                 group_readers, group_qpos, world, owned_views, &rerot_multi_scratch, &sink);
         rerot_multi_scratch = std::move(multi_moved);
-        // Shrink to the emitted counts (no realloc; capacity stays for the
-        // next frontier via the assembly scratch).
+        // Shrink the entries to the emitted count (no realloc; capacity
+        // stays for the next frontier via the assembly scratch). The
+        // groups vector is already exactly at its emitted size (the sink
+        // appended them).
         result.entries.resize(sink.entry_cursor);
-        result.groups.resize(sink.group_cursor);
     }
-    const auto t_asm1 = t_num1; // assembly is now part of the numeric pass
+    const auto t_build1 = std::chrono::steady_clock::now();
+    const auto t_num1 = t_build1; // numeric + direct emission
+    const auto t_asm1 = t_num1; // fused: the emission IS the numeric tail
     std::string error;
     if (!result.validate(n_kv, &error)) {
         throw std::runtime_error("invalid RERoT attention layout: " + error);
     }
-    if (getenv("LLAMA_REROT_PHASE_DEBUG")) {
-        fprintf(stderr, "[layout-out] nq=%u offs=%zu entries=%zu groups=%zu:",
-            result.n_queries, result.query_offsets.size(), result.entries.size(), result.groups.size());
-        for (auto o : result.query_offsets) fprintf(stderr, " %u", o);
-        fprintf(stderr, "\n");
-    }
     const auto t_val1 = std::chrono::steady_clock::now();
     if (getenv("LLAMA_REROT_PHASE_DEBUG")) {
-        fprintf(stderr, "[rerot-phase] world=%.0f cols=%.0f num=%.0f asm=%.0f val=%.0f us\n",
+        fprintf(stderr, "[rerot-phase] world=%.0f cols=%.0f size=%.0f emit=%.0f val=%.0f us\n",
             std::chrono::duration<double, std::micro>(t_world1 - t_world0).count(),
             std::chrono::duration<double, std::micro>(t_cols1 - t_world1).count(),
-            std::chrono::duration<double, std::micro>(t_num1 - t_cols1).count(),
-            std::chrono::duration<double, std::micro>(t_asm1 - t_num1).count(),
+            std::chrono::duration<double, std::micro>(t_size1 - t_cols1).count(),
+            std::chrono::duration<double, std::micro>(t_build1 - t_size1).count(),
             std::chrono::duration<double, std::micro>(t_val1 - t_asm1).count());
     }
     const auto t_layout_end = std::chrono::steady_clock::now();

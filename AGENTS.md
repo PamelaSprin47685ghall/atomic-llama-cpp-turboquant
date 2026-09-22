@@ -311,6 +311,46 @@ LateBind 全部 7 个内核的 push constant 把 `capacity_rows` 当执行行数
 
 ---
 
+## 下班交接｜2026-09-22（第十五轮，size 阶段价值初始化清零＋groups append 化：R=12 4.3ms / 69×）
+
+**分支：** `master`（本轮 commit 见 git log；第十四轮 `09dcdd4f6` 在历史里）
+
+### 一、第十四轮后的剖面疑点
+
+第十四轮 phase 细分暴露：`size` 阶段占 **28–38ms**（R=12 K=262k），而 emit 仅 4.3ms —— 一个 builder 的“预分配”步骤比全部数值工作贵 6 倍。逐层定位后确认三处结构性浪费，全部与“清空 scratch 再重建”的惯性写法有关。
+
+### 二、本轮改动
+
+1. **`clear()` 取代对象重置（根因）**：`rerot_build_attn_layout` 入口原先 `result = llama_rerot_attn_layout{}`，把调用方 scratch 的 capacity **整体释放**——每次 frontier 重新 reserve `entries` 25MB＋`groups` 37MB（page fault + zero-fill 主导）。`llama_rerot_attn_layout::clear()` 改为只重置 `n_queries`/`query_offsets`，**不动 entries 的 size**：稳态下 size 等于上轮 emitted cursor ≈ bound，builder 的预 size 退化为 no-op，capacity 全程存活。
+2. **groups 改由 sink append**：`rerot_emission_sink::groups` 由裸指针改为 `std::vector<llama_rerot_attn_group> *`，merge 产组时 `push_back`（capacity 已 reserve 至 entry_bound——只占容量不 zero-fill）。原 `groups.resize(group_bound)` 把整个 37MB 数组 value-init 置零，而实际组数只有个位数——**同时这个 resize 的“增长路径”还会把 sink 已写入的组覆写为 0**（本轮被多 query MTP 形状测试抓住：`test_rerot_shared_reader_multi_query`/`incremental_decode` 的 effective_pos 全 0）。entries 保持 raw cursor 预 size（emit 全量覆写，无可避免但已被 size 保持抵消）。
+3. **const 段零拷贝引用**：`eff_list` 增 `key_ptr/key_n`，contiguous+identity 段**直接引用 `run->fast_keys`** 而非拷进 per-query 缓冲；每 list reserve 按实际内容规模（base=owned 数、段=run 行数、const=1 slot），取代统一 `keys/2`（R×13 lists ~1.5MB/list 的分配浪费）。
+4. **PQ2_0 LUT 负结论（Q7 记录）**：十问第 7 问的 16 项 LUT 在 vec_dot 粒度实测 26× 慢（2178→57650us）——T-MAC 的收益前提是**表服务大量权重行**（GEMM 形态），单 vec_dot 每 4 activation 重建表是纯亏；x86 路径已有 AVX-512-VNNI 结构化利用。**结论：Q7 要推进必须以 GEMM 级共享表重做，vec_dot 层面已证伪**。
+
+### 三、实测（cache-prod：经装配 scratch 的生产路径，min-of-5）
+
+|形状|14轮|15轮 validate=0|15轮默认 validate|基线（班11前）|
+|---|---|---|---|---|
+|R=12 K=262144|37,778us|**4,311us（69×）**|**9,307us（32×）**|297,450us|
+|R=6 K=131072|10,082us|**1,180us（76×）**|2,420us|90,135us|
+|R=6 K=65536|4,863us|**610us（77×）**|—|46,919us|
+
+默认 validate tier-1 在 R=12 固定 ~5ms；val=0 时 numeric+emit=4.3ms，逼近 25MB emit 的带宽下界。**host 侧布局构建实质归零**；下一档收益在 GPU 侧（Q2 段描述：25MB entries 压到段级张量）。
+
+### 四、调试记录（重要教训）
+
+- “`emit_cursor != total` 不抛却数据错”类 bug 的排查法：builder 内加 `[grp] best` 与 cache 侧 `post-build/post-resize` 两级 dump，最终把零点定位在 **`resize()` 增长路径的 value-init 覆写**——C++ vector 的 size 增长会零填 POD，sink 裸指针写越过了 size 边界，收尾 resize 把写好的数据擦掉。**教训：raw-cursor 写入必须保证 vector 的 size 在写入前已覆盖写范围**（entries 预 size 满足，groups 改 append 才满足）。
+- 磁盘 100% 一次：build/bin 下每次 make 生成新版本化 .so（libllama.so.0.0.11037 → 11097 各 124MB），**21 个陈旧版本吃掉 ~2.6GB**。已按 `readlink(base) != f` 清理，后续每班可重复执行；另清 ccache 3.7G。
+- 测试二进制若不是最新（stale .o 链接）会出现 `corrupted double-linked list`/std::sort 死循环等假警报；改类布局后必须全量重编测试目标。
+
+### 五、下一班建议
+
+1. **Q2 段描述化（GPU 侧最大项）**：entries（2,N i32）改为段张量（start,count,effective_pos）——R=12 时上传从 25MB 降到段级；需要动 `llm_graph_input_attn_rerot::fill_spans` 与 attention op 契约，CPU 参考路径先落地。
+2. Q3 GPU 化（公共 KV 块多读者）：真机批准后启动。
+3. Q5/Q6（GDN 共同基底＋块递推）：`llama-rerot-math` 已有 FP64 参考层，可补 F32 门禁量化。
+4. PQ2_0 若要推进只有 GEMM 级共享表一条路（见上）。
+
+---
+
 ## 下班交接｜2026-09-22（第十四轮，直写 Sink 消除 Assembly＋三档 Validate＋Fast-Append：41.1ms / 7.23×）
 
 **分支：** `master`（本轮 commit 见 git log；第十三轮 `a6fb490f3` 在历史里）
