@@ -6738,6 +6738,22 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
             }
             prof->run_count.fetch_add(runs_total, std::memory_order_relaxed);
             prof->continuous_span_count.fetch_add(contig_total, std::memory_order_relaxed);
+            // Sixteenth-round span side-channel coverage: how much of the
+            // live entry stream the O(spans) loader path actually covers.
+            // The ratio (not the absolute time) is the evidence: a healthy
+            // decode frontier sits near 1.0; a fragmented one (holes,
+            // non-contiguous runs, scalar merge arms) reports its spill.
+            {
+                uint64_t span_row_total = 0;
+                for (const auto & sp : result.spans) {
+                    span_row_total += sp.count;
+                }
+                prof->span_rows.fetch_add(span_row_total, std::memory_order_relaxed);
+                const uint64_t spills = (uint64_t) result.entries.size() - span_row_total;
+                prof->span_row_spill.fetch_add(spills, std::memory_order_relaxed);
+                const uint32_t cov = (uint32_t) result.entries.size();
+                prof->ring.push(4 /* custom/layout-audit */, 5 /* span-coverage */, cov, (uint32_t) span_row_total, (uint32_t) spills);
+            }
         }
         for (size_t q = 1; q < result.query_offsets.size(); ++q) {
             const uint64_t visible = (uint64_t) result.query_offsets[q] - result.query_offsets[q - 1];

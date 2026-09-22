@@ -142,6 +142,8 @@ void llama_rerot_profile::reset(uint64_t new_request_id) {
     reader_visible_keys_samples.store(0, std::memory_order_relaxed);
     run_count.store(0, std::memory_order_relaxed);
     continuous_span_count.store(0, std::memory_order_relaxed);
+    span_rows.store(0, std::memory_order_relaxed);
+    span_row_spill.store(0, std::memory_order_relaxed);
     high_watermark_n_kv.store(0, std::memory_order_relaxed);
 
     layout_view_build_us.store(0, std::memory_order_relaxed);
@@ -331,6 +333,14 @@ std::string llama_rerot_profile::format_tsv() const {
     ss << "reader_visible_keys_samples\t" << reader_visible_keys_samples.load(std::memory_order_relaxed) << "\n";
     ss << "run_count\t" << run_count.load(std::memory_order_relaxed) << "\n";
     ss << "continuous_span_count\t" << continuous_span_count.load(std::memory_order_relaxed) << "\n";
+    {
+        const uint64_t rows = span_rows.load(std::memory_order_relaxed);
+        const uint64_t spill = span_row_spill.load(std::memory_order_relaxed);
+        ss << "span_rows\t" << rows << "\n";
+        ss << "span_row_spill\t" << spill << "\n";
+        const uint64_t total = rows + spill;
+        ss << "span_row_coverage\t" << (total ? double(rows) / double(total) : 0.0) << "\n";
+    }
     ss << "high_watermark_n_kv\t" << high_watermark_n_kv.load(std::memory_order_relaxed) << "\n";
 
     // Host & command
@@ -447,14 +457,21 @@ void llama_rerot_profile::print_summary(FILE * stream) const {
     std::fprintf(stream,
         "[rerot-profile-layout] req=%" PRIu64
         " groups=%" PRIu64 "/%" PRIu64 " entries=%" PRIu64 "/%" PRIu64 " q_rows=%" PRIu64
-        " runs=%" PRIu64 " spans=%" PRIu64 " hwm_kv=%" PRIu64 "\n",
+        " runs=%" PRIu64 " cont_spans=%" PRIu64
+        " span_rows=%" PRIu64 " span_spill=%" PRIu64 " span_cov=%.4f hwm_kv=%" PRIu64 "\n",
         request_id,
         live_groups.load(std::memory_order_relaxed), cap_groups.load(std::memory_order_relaxed),
         live_entries.load(std::memory_order_relaxed), cap_entries.load(std::memory_order_relaxed),
         actual_query_rows.load(std::memory_order_relaxed),
         run_count.load(std::memory_order_relaxed),
         continuous_span_count.load(std::memory_order_relaxed),
+        span_rows.load(std::memory_order_relaxed),
+        span_row_spill.load(std::memory_order_relaxed),
+        live_entries.load(std::memory_order_relaxed) ?
+            double(span_rows.load(std::memory_order_relaxed)) /
+                double(live_entries.load(std::memory_order_relaxed)) : 0.0,
         high_watermark_n_kv.load(std::memory_order_relaxed));
+
 
     std::fprintf(stream,
         "[rerot-profile-host] req=%" PRIu64

@@ -160,6 +160,13 @@ struct llama_rerot_profile {
     std::atomic<uint64_t> reader_visible_keys_samples{0};
     std::atomic<uint64_t> run_count{0};
     std::atomic<uint64_t> continuous_span_count{0};
+    // Sixteenth-round span side-channel coverage: rows the span table
+    // covers versus rows that fall back to scalar entries. A healthy
+    // decode frontier is ~fully covered (query rows payout = O(spans));
+    // high spill means the shape is fragmented (holes / non-contiguous /
+    // scalar merge arms) and the loader pays per-entry.
+    std::atomic<uint64_t> span_rows{0};
+    std::atomic<uint64_t> span_row_spill{0};
     std::atomic<uint64_t> high_watermark_n_kv{0};
 
     // (4) Host and command — P0 evidence split: layout_* accumulates ONLY in

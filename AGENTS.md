@@ -456,6 +456,57 @@ LateBind 全部 7 个内核的 push constant 把 `capacity_rows` 当执行行数
 
 ---
 
+## 下班交接｜2026-09-22（第十七轮，十问收敛后第一轮：F32 数值门 ×5 ＋ Q3 CPU A/B 1.36–1.97×）
+
+**分支：** `master`（本轮 commit 见 git log；第十六轮 `0cf626757` 在历史里）
+
+### 一、本轮定位
+
+十问收敛稿定调：**以 frontier 为执行单位、公共数据块为供给单位、逻辑 Lane 为状态所有者、结构事件为重新定义边界**。前十轮已把 Q2–Q10 的数学层（FP64 oracle）全部落地；本轮专攻「数学上成立」到「可以进入 GPU 实现」之间缺失的一环——**F32 验收入口**，并把十问问题三（一块公共 KV 服务多个 reader）第一次跑出真实 CPU 倍数。
+
+### 二、改动
+
+1. **span coverage 证据**（`llama-rerot-profile.{h,cpp}`、`llama-kv-cache.cpp`）：新 ledger 字段 `span_rows` / `span_row_spill` / `span_row_coverage`＋ring event。生产形状 **coverage=1.0000**；交错写入对照跌到 0.666（spark 探针，未入库）。**span 长 63 是 merge 分组尺寸不是 run 长度**——碎片信号看 spill，不看 span 数。
+2. **F32 门补三族**（`tests/test-rerot-math.cpp::test_f32_gate`）：
+   - Q3 float 在线 merge vs FP64 全量 softmax：**rel 4.3e-07**（12 块 × block max 相差数量级的极端 rescale）；
+   - Q7 对**真实 ggml `block_pq2_0`**：bitplane/LUT 恒等式与 ggml decode+dot 差 2.98e-08（在其自身反向累加带内），FP64 逐位一致；
+   - Q9 对**生产 `llama_sampler_chain`**：40/40 kept-set 一致。
+3. **Q3 CPU A/B shadow oracle**（`tests/test-rerot-shared-block.cpp`，新 ctest）：A=R 次逐 reader `DdvrQsideGqa`；B=一次共享 pass。输出互拍＋计时。
+
+### 三、实测
+
+|指标|数字|
+|---|---|
+|Q3 A/B speedup|**R=2：1.36×｜R=4：1.63×｜R=6：1.76–1.81×｜R=12：1.89–1.97×**|
+|Q3 rel_err|1.5e-6 – 3.9e-6（float online vs FP64 full）|
+|Q7 ggml-block err|2.98e-08（FP64 下 0）|
+|Q9 kept-set|40/40 一致|
+|span coverage|生产 1.0000 / 交错 0.666|
+
+结论与十问一致：共享的是数据供给而非 FLOPs；R 越大越高，是「一块 KV 服务尽可能多合法消费者」而不是「全 K 笔塞进一个 workgroup」。
+
+### 四、契约级踩坑（写进 RERoT.md §21 第十七轮，务必读）
+
+1. **Q9：survivor SET 才是契约**。生产 `partial_sort` 对相等 logit **不稳定**——并列时 survivor ORDER 是实现定义的。Gate 必须两侧排序后比较集合、tie 种在 k 边界之上、贪心只在唯一最大时比较。RNG 体系不同（per-pen xorshift vs std::mt19937），**逐 token 轨迹不可直接对拍**。
+2. **Q9：生产链序 `top_k→top_p→temp→dist`**，top-p 看**原始 logit**；参考实现先除温度会系统性分叉。
+3. **Q3 A/B：`DdvrQsideGqa` 是 kv-head-major 布局**（`raw_k[(hkv*n_keys+key)*d]`）。新读者用单 slab 会越界 segfault（本轮实测）。A/B 两侧必须填相同物理行，否则比的是两份不同数据。
+4. `print_summary`/TSV 行数被 `test-rerot-profile.cpp` 钉住（现为 98）；加 profile 字段必须同步。
+
+### 五、边界与未闭合
+
+1. **defrag 长 run 臂：评估后推迟**。交错形状 coverage 0.666 是真实信号，但 `compact()` 在该形状无恢复、且保长 span 要改分配器（`find_slot` 环语义）——收益中等、风险高。等出现「碎片化 shape 成为生产常态」的证据再动手。
+2. **Q3 GPU 化**：CPU A/B 证明供给组织方向正确（1.4–2×），但 GPU 侧 kernel 契约（共享 K/V tile + per-reader m/z/u registers）仍是最大真实项，需批准＋真机。
+3. 十问 Q1（图定义期公共子表达式单生产者）、Q4（结构/数值分离接入 flashprefill `split_table_fragments` 缓存）、Q5/Q6/Q7 GPU 化均未动。
+4. Q8（近似跳块）、Q10（联合多步投机）按十问要求**不与等义共享混记收益**，仍属独立研究线。
+
+### 六、下一班建议
+
+1. Q4 接入点最便宜：`llama_rerot_split_table_fragments` 调用点（`llama-kv-cache.cpp:5265`）按 run-order 签名缓存 fragments，结构事件才重算（数学层已有 `run_order_signature`）。
+2. Q3 GPU kernel 契约设计先落 `RERoT.md`：共享 K/V tile 布局 + per-reader (m,z,u) 常驻 + reader_visible 边界的一致性规则，再谈 SPIR-V。
+3. F32 门数字已固定为验收基线：Q3 4.3e-7 / Q5 1.9e-7 / Q6 2.5e-5 / Q7 0 / Q9 set-exact。GPU 化后逐项对拍。
+
+---
+
 ## 下班交接｜2026-09-22（第十六轮，十问问题二落地：span 侧信道消灭默认 validate 成本——4.1ms / validate 免费）
 
 **分支：** `master`（本轮 commit 见 git log；第十五轮 `4f33d005a` 在历史里）

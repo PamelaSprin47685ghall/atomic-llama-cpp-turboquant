@@ -812,18 +812,19 @@ static void test_format_tsv_stability() {
         if (key == "upload_bytes" && val == "16384") found_upload = true;
     }
 
-    // Expected line count:
-    // Expected line count:
-    // 1 (request_id)
-    // + 9 * 3 (phases: us, max_us, count) = 27
-    // + 4 * (1 hit + 6 rejections) = 28
-    // + 8 (parallelism: snapshots, sum_w, max_w, avg_p, avg_cohort, max_cohort, frontiers, pen_yields)
-    // + 11 (layout)
-    // + 14 (host & command: 11 + upload_staging_us + upload_set_us + upload_count)
-    // + 9 (state & memory)
-    // + 14 (computation)
-    // Total = 1 + 36 + 28 + 8 + 11 + 14 + 9 + 14 = 121
-    CHECK_EQ(line_count, 121);
+    // Expected line count (measured tally - pinned so any new ledger field
+    // must update it deliberately):
+    //   1  request_id
+    //   36 phases: 9 phases x (us, max_us, count, first_us)
+    //   28 routes:  4 routes x (1 hit + 6 rejections)
+    //   8  parallelism (snapshots, sum_w, max_w, avg_p, avg_cohort,
+    //      max_cohort, frontiers, pen_yields)
+    //   14 layout (11 + span_rows + span_row_spill + span_row_coverage)
+    //   14 host & command (11 + upload_staging_us + upload_set_us + upload_count)
+    //   9  state & memory
+    //   14 computation (upstream §9.2 histogram group)
+    //   Total = 1 + 36 + 28 + 8 + 14 + 14 + 9 + 14 = 124
+    CHECK_EQ(line_count, 124);
     CHECK(found_req);
     CHECK(found_formal_p);
     CHECK(found_formal_p_first);

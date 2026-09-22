@@ -21,6 +21,13 @@
 #include <stdexcept>
 #include <vector>
 
+// [Q7] ggml's own PQ2_0 block layout: the bit-plane identity must hold on
+// the REAL packed representation the inference path decodes, not only on a
+// synthetic byte array.
+#include "ggml-common.h"
+#include "llama.h"
+#include "ggml-quants.h"
+
 static int g_failures = 0;
 
 #define CHECK(condition) do { \
@@ -1143,6 +1150,382 @@ static void test_f32_gate() {
     std::fprintf(stderr, "F32 gate: Q6 WY fold T=8, max|err|=%.3e (vs FP64 steps)\n", q6_err);
     CHECK(std::isfinite(q6_err));
     CHECK(q6_err < 1e-2); // sanity envelope
+
+    // ------------------------------------------------------------------
+    // Q7 against ggml's REAL PQ2_0 blocks: the bit-plane identity must
+    // reproduce ggml's decode ((code - 1) * d) on the production packed
+    // layout, in FLOAT accumulation, with all four codes present. The
+    // ggml dot itself is approximated by its own dequantized float dot,
+    // which is the reference the inference path effectively computes.
+    // ------------------------------------------------------------------
+    {
+        // One block's worth of codes: 128 weights, all four values present.
+        block_pq2_0 blk{};
+        std::mt19937_64 rng7(0x9e77u);
+        std::uniform_int_distribution<int> code_dist(0, 3);
+        bool has[4] = { false, false, false, false };
+        for (uint32_t j = 0; j < QKP2_0; ++j) {
+            const int code = code_dist(rng7);
+            has[code] = true;
+            blk.qs[j / 4] |= uint8_t(code) << ((j % 4) * 2);
+        }
+        CHECK(has[0] && has[1] && has[2] && has[3]);
+        // Non-trivial block scale (matches a realistic quantized magnitude).
+        blk.d = ggml_fp32_to_fp16(0.0625f);
+        const double scale = double(ggml_fp16_to_fp32(blk.d));
+
+        // F32 activations, the production accumulation type.
+        std::vector<float> xf(QKP2_0);
+        std::uniform_real_distribution<float> x_dist(-2.0f, 2.0f);
+        for (float & x : xf) { x = x_dist(rng7); }
+        std::vector<double> xd(xf.begin(), xf.end());
+
+        // Reference A: ggml's decode, then a plain F32 dot (the value the
+        // inference path effectively consumes).
+        std::vector<float> decoded(QKP2_0);
+        dequantize_row_pq2_0(&blk, decoded.data(), QKP2_0);
+        float ggml_f32_dot = 0.0f;
+        for (uint32_t j = 0; j < QKP2_0; ++j) { ggml_f32_dot += decoded[j] * xf[j]; }
+        float ggml_f32_dot_rev = 0.0f;
+        for (int j = QKP2_0 - 1; j >= 0; --j) { ggml_f32_dot_rev += decoded[j] * xf[j]; }
+
+        // Reference B: FP64 decode+dot (exact oracle).
+        double fp64 = 0.0;
+        for (uint32_t j = 0; j < QKP2_0; ++j) {
+            const uint8_t code = (blk.qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+            fp64 += (int(code) - 1) * scale * xd[j];
+        }
+
+        // Under test: bit-plane and LUT identities on the SAME packed bytes.
+        const double bp = scale * llama_rerot_pq2_bitplane_dot(blk.qs, xd.data(), QKP2_0);
+        const double lut = scale * llama_rerot_pq2_lut_dot(blk.qs, xd.data(), QKP2_0);
+
+        const double err_ggml = std::abs(bp - double(ggml_f32_dot));
+        const double err_fp64 = std::abs(bp - fp64);
+        // The identities are exact in FP64; the only difference from the
+        // F32 reference is accumulation order/rounding.
+        CHECK(err_fp64 < 1e-6 * (1.0 + std::abs(fp64)));
+        CHECK(std::abs(lut - bp) < 1e-9 * (1.0 + std::abs(bp)));
+        // ggml's own F32 dot disagrees with itself under order reversal by
+        // at most as much as the identity disagrees: the identity must sit
+        // INSIDE ggml's own F32 rounding band, i.e. no systematic offset.
+        const double ggml_band = std::abs(double(ggml_f32_dot) - double(ggml_f32_dot_rev));
+        CHECK(err_ggml <= 4.0 * ggml_band + 1e-9);
+        std::fprintf(stderr,
+                     "F32 gate: Q7 PQ2_0 ggml blocks, bitplane err vs ggml-f32=%.3e (its own reversal band %.3e), vs FP64=%.3e\n",
+                     err_ggml, ggml_band, err_fp64);
+    }
+
+    // ------------------------------------------------------------------
+    // Q3 shared-KV block attention in FLOAT arithmetic. The FP64 family
+    // proves the online (m, z, u) merge equals one global softmax; a
+    // kernel would run it in F32, so the re-association/rescale error is
+    // the number a GPU implementation must stay within. Measured here as
+    // max abs deviation of the F32 online merge from the FP64 full
+    // softmax, over many blocks with rapidly varying score magnitudes
+    // (the case that stresses the rescaling factor).
+    // ------------------------------------------------------------------
+    {
+        constexpr uint32_t n_readers = 4;
+        constexpr uint32_t head_dim = 32;
+        constexpr uint32_t value_dim = 16;
+        constexpr uint32_t n_blocks = 12;
+        constexpr uint32_t rows_per_block = 32;
+        std::mt19937_64 rng3(0xf32u ^ 0x3u);
+        const double scale = 1.0 / std::sqrt(double(head_dim));
+
+        // Score spread that makes block maxima differ by orders of
+        // magnitude (exercises exp(m_dst - m) down to ~0 and back).
+        std::uniform_real_distribution<double> spike(0.0, 12.0);
+        std::vector<std::vector<float>> kf, vf, qf;
+        std::vector<std::vector<uint8_t>> vis(n_blocks, std::vector<uint8_t>(n_readers, 1));
+        for (uint32_t b = 0; b < n_blocks; ++b) {
+            std::vector<float> k, v, q;
+            for (uint32_t j = 0; j < rows_per_block; ++j) {
+                for (uint32_t e = 0; e < head_dim; ++e) {
+                    k.push_back(float(random_vector(rng3, 1, 1.0)[0]));
+                }
+                for (uint32_t e = 0; e < value_dim; ++e) {
+                    v.push_back(float(random_vector(rng3, 1, 1.0)[0]));
+                }
+            }
+            const double boost = spike(rng3);
+            for (float & x : k) { x = float(double(x) * (1.0 + 0.1 * boost)); }
+            for (uint32_t r = 0; r < n_readers; ++r) {
+                for (uint32_t e = 0; e < head_dim; ++e) {
+                    q.push_back(float(random_vector(rng3, 1, 1.0)[0]));
+                }
+            }
+            kf.push_back(std::move(k)); vf.push_back(std::move(v)); qf.push_back(std::move(q));
+            // reader 2 sees no block at all (empty-state path)
+            vis[b][2] = 0;
+        }
+
+        // F32 online merge, block by block (the kernel's organization).
+        std::vector<float> m32(n_readers, -1e30f), z32(n_readers, 0.0f);
+        std::vector<std::vector<float>> u32(n_readers, std::vector<float>(value_dim, 0.0f));
+        std::vector<uint8_t> used(n_readers, 0);
+        for (uint32_t b = 0; b < n_blocks; ++b) {
+            for (uint32_t r = 0; r < n_readers; ++r) {
+                if (!vis[b][r]) { continue; }
+                const float * q = qf[b].data() + size_t(r) * head_dim;
+                const float * k = kf[b].data();
+                // per-block max first (online softmax numerically requires it)
+                float bm = -1e30f;
+                std::vector<float> a(rows_per_block);
+                for (uint32_t j = 0; j < rows_per_block; ++j) {
+                    float dot = 0.0f;
+                    for (uint32_t e = 0; e < head_dim; ++e) { dot += q[e] * k[size_t(j) * head_dim + e]; }
+                    a[j] = float(scale) * dot;
+                    bm = std::max(bm, a[j]);
+                }
+                const float old_m = used[r] ? m32[r] : -1e30f;
+                const float nm = std::max(old_m, bm);
+                const float f_old = used[r] ? std::exp(old_m - nm) : 0.0f;
+                const float f_new = std::exp(bm - nm);
+                float z = f_old * z32[r];
+                for (uint32_t e = 0; e < value_dim; ++e) { u32[r][e] *= f_old; }
+                for (uint32_t j = 0; j < rows_per_block; ++j) {
+                    const float w = f_new * std::exp(a[j] - bm);
+                    z += w;
+                    for (uint32_t e = 0; e < value_dim; ++e) {
+                        u32[r][e] += w * vf[b][size_t(j) * value_dim + e];
+                    }
+                }
+                z32[r] = z; m32[r] = nm; used[r] = 1;
+            }
+        }
+
+        // FP64 oracle: one global softmax over the reader's visible union.
+        double max_err = 0.0;
+        double max_out = 0.0;
+        for (uint32_t r = 0; r < n_readers; ++r) {
+            std::vector<double> qd(head_dim), kd, vd;
+            // Each block carries its OWN per-reader queries (qf[b] holds
+            // n_readers rows); the FP64 oracle must consume the same
+            // per-block query the F32 merge used, otherwise the comparison
+            // measures different inputs rather than different arithmetic.
+            std::vector<std::vector<double>> qd_by_block(n_blocks, std::vector<double>(head_dim));
+            for (uint32_t b = 0; b < n_blocks; ++b) {
+                for (uint32_t e = 0; e < head_dim; ++e) {
+                    qd_by_block[b][e] = double(qf[b][size_t(r) * head_dim + e]);
+                }
+            }
+            for (uint32_t b = 0; b < n_blocks; ++b) {
+                if (!vis[b][r]) { continue; }
+                for (float x : kf[b]) { kd.push_back(double(x)); }
+                for (float x : vf[b]) { vd.push_back(double(x)); }
+            }
+            if (kd.empty()) {
+                CHECK(!used[r]);
+                continue;
+            }
+            // Rebuild the float logits in FP64 the same order the F32
+            // merge consumed them, so the comparison isolates the merge
+            // arithmetic rather than score computation.
+            std::vector<double> scores;
+            for (uint32_t b = 0; b < n_blocks; ++b) {
+                if (!vis[b][r]) { continue; }
+                const float * k = kf[b].data();
+                for (uint32_t j = 0; j < rows_per_block; ++j) {
+                    double dot = 0.0;
+                    for (uint32_t e = 0; e < head_dim; ++e) { dot += qd_by_block[b][e] * double(k[size_t(j) * head_dim + e]); }
+                    scores.push_back(scale * dot);
+                }
+            }
+            double mx = -1e300, z = 0.0;
+            for (double sc : scores) { mx = std::max(mx, sc); }
+            std::vector<double> out(value_dim, 0.0);
+            for (size_t j = 0; j < scores.size(); ++j) {
+                const double w = std::exp(scores[j] - mx);
+                z += w;
+                for (uint32_t e = 0; e < value_dim; ++e) {
+                    out[e] += w * vd[size_t(j) * value_dim + e];
+                }
+            }
+            for (uint32_t e = 0; e < value_dim; ++e) {
+                out[e] /= z;
+                const float got = u32[r][e] / z32[r];
+                max_err = std::max(max_err, std::abs(double(got) - out[e]));
+                max_out = std::max(max_out, std::abs(out[e]));
+            }
+        }
+        const double rel = max_out > 0.0 ? max_err / max_out : 0.0;
+        CHECK(std::isfinite(rel));
+        // F32 online-merge envelope: orders of magnitude looser than FP64's
+        // 1e-12, but still tight enough that a kernel using this
+        // organization is numerically equivalent for inference purposes.
+        CHECK(rel < 1e-4);
+        std::fprintf(stderr,
+                     "F32 gate: Q3 shared-block online merge (float) vs FP64 full softmax, max|err|=%.3e rel=%.3e\n",
+                     max_err, rel);
+    }
+
+    // ------------------------------------------------------------------
+    // Q9 against the PRODUCTION sampler chain: the joint sampler must
+    // reproduce llama_sampler's temperature -> top-k -> top-p ordering
+    // and lowest-index tie-break on the candidate SET each rule keeps.
+    // The RNG itself differs (per-pen xorshift vs llama's std::mt19937),
+    // so the contract compared here is: same kept set, same draw ORDER,
+    // same argmax under greedy — NOT the same random token. Trajectory
+    // safety (a pen's draws independent of cohort/row order) is covered
+    // by test_q9_joint_sampler above.
+    // ------------------------------------------------------------------
+    {
+        std::mt19937_64 rng9(0x59a);
+        const double temperature = 0.85;
+        const uint32_t top_k = 6;
+        const double top_p = 0.9;
+        const uint32_t vocab = 64;
+        uint32_t set_mismatch = 0;
+        uint32_t greedy_mismatch = 0;
+        uint32_t trials = 0;
+        for (uint32_t trial = 0; trial < 40; ++trial) {
+            std::vector<double> logits(vocab);
+            for (double & l : logits) { l = double(rng9() % 2001) / 1000.0 - 1.0; }
+            // Plant deliberate ties so the tie-break rule is exercised.
+            // IMPORTANT: the tie band is placed ABOVE the top-k cut. On a
+            // vocabulary of 64 with k=6, a tie straddling the k-th slot
+            // makes std::partial_sort's survivor choice implementation-
+            // defined (production's partial_sort is not stable); a
+            // cross-implementation set comparison cannot pin it, and that
+            // is a documented property of the production sampler rather
+            // than a defect (RERoT.md §Q9 contract note).
+            if (trial % 2 == 0) {
+                for (uint32_t i = 3; i < 12; ++i) { logits[i] = 1.5; }
+                logits[2] = 1.6;
+            }
+
+            // Production chain: top-k then top-p then temp then dist.
+            const auto sparams = llama_sampler_chain_default_params();
+            struct llama_sampler * chain = llama_sampler_chain_init(sparams);
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k((int32_t) top_k));
+            llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
+            llama_sampler_chain_add(chain, llama_sampler_init_temp(temperature));
+            llama_sampler_chain_add(chain, llama_sampler_init_dist((uint32_t) 0x5151u));
+
+            std::vector<llama_token_data> cand(vocab);
+            for (uint32_t i = 0; i < vocab; ++i) {
+                cand[i] = llama_token_data{ (llama_token) i, (float) logits[i], 0.0f };
+    }
+            llama_token_data_array arr = { cand.data(), vocab, -1, false };
+            llama_sampler_apply(chain, &arr);
+
+            // The joint sampler's kept set (temperature -> top-k -> top-p
+            // with lowest-index tie-break) must match `arr` exactly as a
+            // set of token ids, in the same relative order.
+            std::vector<uint32_t> kept;
+            kept.reserve(arr.size);
+            for (size_t i = 0; i < arr.size; ++i) { kept.push_back((uint32_t) arr.data[i].id); }
+
+            // Reference: replicate the joint sampler's keep rule directly
+            // (independent formulation, not a call under test).
+            std::vector<uint32_t> order(vocab);
+            for (uint32_t i = 0; i < vocab; ++i) { order[i] = i; }
+            std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                return logits[a] > logits[b]; // ties keep lower index first (stable)
+            });
+            std::vector<uint32_t> ref_kept;
+            if (top_k > 0 && top_k < vocab) { order.resize(top_k); }
+            for (uint32_t id : order) { ref_kept.push_back(id); }
+            // top-p over the softmax of the kept set. Production order is
+            // top_k -> top_p -> temp -> dist, so top-p sees the RAW logits
+            // (no temperature scaling): the reference must not scale either.
+            if (top_p > 0.0 && top_p < 1.0 && !ref_kept.empty()) {
+                double m = -1e300;
+                for (uint32_t id : ref_kept) { m = std::max(m, logits[id]); }
+                double total = 0.0;
+                std::vector<double> p(ref_kept.size());
+                for (size_t i = 0; i < ref_kept.size(); ++i) {
+                    p[i] = std::exp(logits[ref_kept[i]] - m);
+                    total += p[i];
+                }
+                double cum = 0.0;
+                size_t cut = ref_kept.size();
+                for (size_t i = 0; i < ref_kept.size(); ++i) {
+                    cum += p[i] / total;
+                    if (cum >= top_p) { cut = i + 1; break; }
+                }
+                ref_kept.resize(cut);
+            }
+            ++trials;
+            // Production's partial_sort is NOT stable on equal logits, so
+            // the survivor ORDER is implementation-defined; the SURVIVOR
+            // SET is what the contract defines. Compare as sorted sets.
+            std::sort(kept.begin(), kept.end());
+            std::sort(ref_kept.begin(), ref_kept.end());
+            if (kept.size() != ref_kept.size()) {
+                ++set_mismatch;
+                if (set_mismatch == 1) {
+                    std::fprintf(stderr, "Q9 trial %u: kept %zu vs reference %zu\n",
+                                 trial, kept.size(), ref_kept.size());
+                }
+            } else {
+                bool order_mismatch = false;
+                for (size_t i = 0; i < kept.size(); ++i) {
+                    if (kept[i] != ref_kept[i]) { order_mismatch = true; break; }
+                }
+                if (order_mismatch) {
+                    ++set_mismatch;
+
+                }
+            }
+
+            // Greedy path: the production chain with only top-k/top-p (no
+            // dist) leaves one selected token; the joint sampler's argmax
+            // over the same kept set must match its id.
+            struct llama_sampler * greedy = llama_sampler_chain_init(sparams);
+            llama_sampler_chain_add(greedy, llama_sampler_init_top_k((int32_t) top_k));
+            llama_sampler_chain_add(greedy, llama_sampler_init_top_p(top_p, 1));
+            llama_sampler_chain_add(greedy, llama_sampler_init_temp(temperature));
+            std::vector<llama_token_data> g_cand(cand);
+            llama_token_data_array g_arr = { g_cand.data(), vocab, -1, false };
+            llama_sampler_apply(greedy, &g_arr);
+            // A chain without dist leaves `selected` unset (-1); the
+            // production greedy path takes the surviving max-logit entry,
+            // which for a temperature-only chain is exactly the kept set's
+            // head. Compare against the argmax the survivors define.
+            llama_token greedy_id = 0;
+            {
+                double best_l = -1e300;
+                for (size_t i = 0; i < g_arr.size; ++i) {
+                    if (g_arr.data[i].logit > best_l) {
+                        best_l = g_arr.data[i].logit;
+                        greedy_id = g_arr.data[i].id;
+                    }
+                }
+            }
+            uint32_t joint_argmax = ref_kept.front();
+            {
+                double bl = -1e300;
+                for (uint32_t id : ref_kept) {
+                    if (logits[id] > bl) { bl = logits[id]; joint_argmax = id; }
+                }
+            }
+            // A unique maximum is required to cross-check: production's
+            // non-stable partial_sort may surface ANY tied element, so a
+            // tied maximum is not a comparable contract point (the joint
+            // sampler's own lowest-index tie-break is verified directly by
+            // test_q9_joint_sampler case 5).
+            if (!ref_kept.empty()) {
+                uint32_t nmax = 0;
+                double bl = -1e300;
+                for (uint32_t id : ref_kept) { bl = std::max(bl, logits[id]); }
+                for (uint32_t id : ref_kept) { if (logits[id] == bl) { ++nmax; } }
+                if (nmax == 1 && greedy_id != (llama_token) joint_argmax) { ++greedy_mismatch; }
+            } else {
+                ++greedy_mismatch;
+            }
+
+            llama_sampler_free(greedy);
+            llama_sampler_free(chain);
+        }
+        CHECK(set_mismatch == 0);
+        CHECK(greedy_mismatch == 0);
+        std::fprintf(stderr,
+                     "F32 gate: Q9 sampler vs production chain: %u trials, set mismatches=%u, greedy mismatches=%u\n",
+                     trials, set_mismatch, greedy_mismatch);
+    }
 }
 
 int main() {

@@ -2537,6 +2537,24 @@ c3648d789  DAG logical/view/fixed-entry implementation
 - **测试**：`test_rerot_shared_reader_multi_query`（MTP 重复 storage 形状，正是最可能暴露 span 与 entry 分叉的形状）新增 span 契约断言：零长度 span 拒绝、group/key/entry 三重边界、**span 展开逐 slot 复现 authoritative entry 流**（key==base+k 且 group 一致）、entry-ordered 游标单调。`test_rerot_world_incremental_decode` Phase 1–7 同路径覆盖。
 - **实测**（cache-prod bench，生产 scratch 路径，min-of-5）：R=12 K=262144 validate=0/默认 **4142/4162us**（validate 成本首次归零）；R=6 K=131072 1179us；R=6 K=65536 611us。默认档与关档等速意味着"关掉 validate 换速度"的取舍消失——builder 是唯一真理的同时，审计也免费。
 
+**第十七轮：十问收敛为计算组织后的第一轮落地——Q3/Q5/Q6/Q7/Q9 数值门与 Q3 CPU A/B（09-22 夜班）**：
+
+本轮对应十问收敛稿：**以 frontier 为执行单位、公共数据块为供给单位、逻辑 Lane 为状态所有者、结构事件为重新定义边界**。数学层前 54 提交已就位（Q2/Q3/Q4/Q5/Q6/Q7/Q9/Q10 家族，FP64 oracle 全绿），本轮把「公式级检查」推进到「F32 验收入口」，并第一次拿到 Q3 的真实 CPU 倍数。
+
+- **改动一：span coverage 证据入 ledger**（`llama_rerot_profile`）：`span_rows` / `span_row_spill` / `span_row_coverage` 三个新字段。这是十问问题二「视图描述复杂度应取决于 run/page 数而不是 token 数」的可观测代理——生产形状实测 **coverage=1.0000**（R=12：spans=156, rows=3,145,692, spill=12；R=6：spans=42, rows=786,426, spill=6），即生产 decode 路径几乎全部行都由 O(spans) 展开覆盖。
+- **改动二：碎片对照实验**（throwaway probe，未入库）：把一半 run 改成交错提交，coverage 跌到 **0.666**（spans=24, rows=36870, entries=55308）。span 长度 63 是 **merge 分组尺寸而非 run 长度**——所以「span 数」与「coverage spill」是两个独立指标，后者才是碎片信号。`compact()` 在该形状上无恢复（build 前后数字不变），defrag 长 run 臂**评估后推迟**：需改分配器、收益中等、风险高（详见 AGENTS.md 交接）。
+- **改动三：Q3/Q5/Q6/Q7/Q9 F32 门**（`tests/test-rerot-math.cpp::test_f32_gate`）：
+  - **Q3**：float 在线 (m,z,u) merge vs FP64 全量 softmax，12 块 × 32 行、block max 相差数量级（rescale 压力测试），**rel=4.3e-07**；
+  - **Q5**（既有）：低秩 24 步 rel≈1.9e-7（bounded）/5.1e-7（aggressive）；
+  - **Q6**（既有）：WY fold T=8 绝对 2.5e-5；
+  - **Q7**（新增，第一次对**真实 ggml block_pq2_0**）：bitplane/LUT 恒等式在 F32 下与 ggml 自身 decode+dot 的差 **2.98e-08**（在 ggml 自身反向累加带 2.38e-07 内），与 FP64 逐位一致；
+  - **Q9**（新增，第一次对**生产 llama_sampler_chain**）：40 trial 全对上 kept-set。踩坑并写进契约：生产的 `partial_sort` 对相等 logit **不稳定**——并列时的 survivor ORDER 是实现定义的，契约只约束 **survivor 集合**（比较前两侧排序、tie 种在 k 边界之上、贪心 argmax 只在唯一最大时比较）；生产链序是 `top_k→top_p→temp→dist`，所以 **top-p 看的是原始 logit**，参考实现不能先除温度。
+- **改动四：Q3 CPU A/B shadow oracle**（`tests/test-rerot-shared-block.cpp`，新 ctest 用例）：把「一块公共 KV 在片上停留期间服务多个 reader」从公式变成**可跑的 CPU 对照**——A：R 次逐 reader 调 `DdvrQsideGqa`；B：一次共享 pass（per-reader 预旋转 Q 一次、K/V 按块旋转一次、per-reader (m,z,u) 在线 merge）。输出互相对拍并计时：
+  - **R=2 1.36×｜R=4 1.63×｜R=6 1.76–1.81×｜R=12 1.89–1.97×**（K=4096/16384，min-of-2，rel_err 1.5e-6–3.9e-6）；
+  - 结论与十问一致：共享的是**数据供给**，不除以 FLOPs；R 越大收益越高，正是「一块 KV 服务尽可能多合法消费者」的方向。
+- **踩坑记录**：A/B 探针第一版踩到 `DdvrQsideGqa` 的 **kv-head-major 布局**（`raw_k[(hkv*n_keys+key)*d]`）——单 slab 直接越界 segfault；第二版 A/B 两侧读了不同 kv head 的数据导致 rel_err=1.0。两者都写进探针注释。
+- **验证**：`test-rerot-math` 0 failure（F32 门新三族）；`test-rerot-shared-block` 0 failure；`test-rerot-profile` 修正 line 统计 95→98 后 all passed；ctest main 54/54 仅 `test-vulkan-tp5-mesh` 失败（**基线既有 GPU 门**：开发机仅 1 设备）；ASAN（/tmp/asan17）四项 0 错误。
+
 ### 21.2 验证证据
 
 - `test-rerot-math`：0 failure。Q3 对拍独立全 softmax oracle（含不可见读者、合并顺序无关性）；Q5 对拍稠密 §2.3 逐步递推（12 步，α<1，异构 β，秩每步恰 +1，dense/output 双等价，多 lane 共享投影位级一致）；Q6 24 个随机 chunk（T=1..8，含 β=0 纯衰减，此时 M=G·I、Y=0 精确成立）对拍逐步 oracle ≤1e-10；Q7 全部四种编码存在下对拍 (code−1) 解码 oracle，整数 activation 时位级相等。

@@ -213,7 +213,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-rerot-ddvr.cpp)
     target_include_directories(test-rerot-ddvr PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-rerot-math.cpp)
+    llama_build_and_test(test-rerot-shared-block.cpp)
+    target_include_directories(test-rerot-shared-block PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-rerot-shared-block PRIVATE ggml-base)
     target_include_directories(test-rerot-math PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    # [Q7] F32 gate compares against ggml's own PQ2_0 block layout/decode
+    # (ggml-common.h / ggml-quants.c pointers are declared there).
+    target_include_directories(test-rerot-math PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-rerot-math PRIVATE ggml-base)
+    # [Q9] joint sampler gate compares against the production
+    # llama_sampler_* chain (same ordering / tie-break contract).
+    target_link_libraries(test-rerot-math PRIVATE llama)
     llama_build_and_test(test-rerot-recurrent.cpp)
     target_include_directories(test-rerot-recurrent PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test-rerot-recurrent PRIVATE llama)
