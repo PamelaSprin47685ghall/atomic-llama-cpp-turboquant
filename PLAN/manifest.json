@@ -1,0 +1,39 @@
+{
+  "date": "2026-09-22",
+  "kind": "PLANNING_DELIVERABLE",
+  "audited_repository_head": "f51efe8208fdf6f7998b39483510c3e73c124310",
+  "remote_modifications": false,
+  "builds_or_tests_executed": false,
+  "gpu_or_models_launched": false,
+  "parent_tasks": 23,
+  "files": {
+    "Agent执行指令.md": {
+      "bytes": 4197,
+      "sha256": "9d3b5b8fe0f6073ceb6c07afd1ecfe72b3c654c4cbb162dc7cb7c87f66983105"
+    },
+    "README.md": {
+      "bytes": 1155,
+      "sha256": "597df609b0bf24973eaace1665aad564bb5f7b980fd725e86a825767ff7e1bfb"
+    },
+    "run-envelope.example.json": {
+      "bytes": 2188,
+      "sha256": "db108ad153f8c5e2e4e81684552abb7dd016a34fe862ec1bb14a9759d0e4865f"
+    },
+    "task-board.json": {
+      "bytes": 45963,
+      "sha256": "1437a024f4de162b934615e4f1c89298b6c48ca2dc71fa0adff3e8b6ea2c2a2d"
+    },
+    "攻坚总计划.md": {
+      "bytes": 60226,
+      "sha256": "b13cbb2980ad0350ffd5a4880be19cca3b8b7f4d6e463e9f143c7e63e4ff6dfe"
+    },
+    "核验记录.md": {
+      "bytes": 7093,
+      "sha256": "d13df6da6f06cd59ae73281b5c9adaac0c2324c6247a335fab0f1c0ab9fe1506"
+    },
+    "缺口_原始附件.md": {
+      "bytes": 27502,
+      "sha256": "01c6e01c8524084b2bd7f9d150722a33b93fe0d51b1c7a45074d98f36c32529c"
+    }
+  }
+}
