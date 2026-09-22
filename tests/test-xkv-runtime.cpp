@@ -1589,6 +1589,31 @@ static void test_rerot_shared_reader_multi_query() {
             want.emplace_back(oracle.entries[i].key_index,
                               oracle.groups[oracle.entries[i].group_index].effective_pos);
         }
+        // Dump BEFORE sorting: a corrupted layout (out-of-bounds group
+        // index, garbage effective_pos) makes std::sort itself loop.
+        for (size_t x = 0; x < got.size(); ++x) {
+            if (got[x].second < -1000000 || got[x].second > 1000000) {
+                fprintf(stderr, "GARBAGE eff at %zu: k%u eff=%d (groups=%zu gi=%u)\n",
+                    x, got[x].first, (int) got[x].second, layout.groups.size(),
+                    x < layout.entries.size() ? layout.entries[e0 + x].group_index : 999u);
+            }
+        }
+        for (uint32_t e = e0; e < e1; ++e) {
+            if (layout.entries[e].group_index >= layout.groups.size()) {
+                fprintf(stderr, "OOB group_index %u >= %zu at entry %u\n",
+                    layout.entries[e].group_index, layout.groups.size(), e);
+            }
+        }
+        fprintf(stderr, "[check-q%zu] e0=%u e1=%u got=%zu want=%zu\n",
+            q, e0, e1, got.size(), want.size());
+        for (size_t x = 0; x < got.size(); ++x) {
+            fprintf(stderr, " g[%zu]=k%u,%d", x, got[x].first, (int) got[x].second);
+        }
+        fprintf(stderr, "\n");
+        for (size_t x = 0; x < want.size(); ++x) {
+            fprintf(stderr, " w[%zu]=k%u,%d", x, want[x].first, (int) want[x].second);
+        }
+        fprintf(stderr, "\n");
         std::sort(got.begin(), got.end());
         std::sort(want.begin(), want.end());
         TEST_ASSERT(got == want);
@@ -1671,7 +1696,7 @@ static void test_rerot_world_incremental_decode() {
         }
         for (size_t q = 0; q < positions.size(); ++q) {
             const auto oracle = llama_rerot_build_query_layout(reader, positions[q], oracle_keys);
-            const uint32_t e0 = layout.query_offsets[q];
+const uint32_t e0 = layout.query_offsets[q];
             const uint32_t e1 = layout.query_offsets[q + 1];
             TEST_ASSERT(e1 - e0 == oracle.entries.size());
             std::vector<std::pair<uint32_t, llama_pos>> got, want;
@@ -1687,7 +1712,7 @@ static void test_rerot_world_incremental_decode() {
             }
             std::sort(got.begin(), got.end());
             std::sort(want.begin(), want.end());
-            TEST_ASSERT(got == want);
+                        TEST_ASSERT(got == want);
         }
     };
 
@@ -1695,7 +1720,10 @@ static void test_rerot_world_incremental_decode() {
     // gated) — builds the world the first time.
     check_layout({5, 9, 4});
 
-    // Phase 2: decode appends extend run 2 (world upsert path).
+    // Phase 2: decode appends extend run 2. Fresh key indices extending a
+    // contiguous+uniform tail take the O(1) try_append_key_fast route
+    // (fourteenth round); the oracle comparison below proves the fast
+    // append produced the same world the structural pass would have.
     commit_tokens(kv, 0, {6, 7}, true, &own_tag);
     check_layout({7, 5});
 
@@ -1704,7 +1732,9 @@ static void test_rerot_world_incremental_decode() {
     check_layout({7, 5, 9});
 
     // Phase 4: more appends AFTER publish (mixed-bucket run: uniform probe
-    // must flip false; tagged order still holds).
+    // must flip false; tagged order still holds). This append must FALL
+    // BACK to the upsert path (visibility differs from the run tail), and
+    // the fallback split must consume it exactly once.
     llama_kv_rerot_meta own_pub = own_tag;
     own_pub.visibility = llama_rerot_visibility::public_live;
     own_pub.publish_epoch = 4;

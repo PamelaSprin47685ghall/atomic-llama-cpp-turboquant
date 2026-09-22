@@ -32,6 +32,8 @@ struct llama_context;
 // llama_kv_cache
 //
 
+class llama_kv_cache_context;
+
 class llama_kv_cache : public llama_memory_i {
     friend class llama_xkv::llama_xkv_runtime;
 public:
@@ -462,7 +464,8 @@ public:
     // current unified stream.
     llama_rerot_attn_layout rerot_build_attn_layout(
         const llama_ubatch & ubatch,
-        uint32_t n_kv) const;
+        uint32_t n_kv,
+        llama_rerot_attn_layout * assembly_scratch = nullptr) const;
 
     // World maintenance (twelfth round). ensure_rerot_world() brings the
     // persistent shared world to the current cells state: valid + generation
@@ -855,6 +858,18 @@ private:
     // sequence owns nothing) — the layout's ownership probe.
     mutable std::unordered_map<llama_seq_id, std::vector<uint64_t>> rerot_world_owned;
 
+    // Layout assembly + builder-output scratch (fourteenth round): the
+    // per-frontier build reuses these buffers across frontiers (capacity
+    // and warmed pages survive), eliminating the steady-state
+    // allocations: rerot_assembly_scratch feeds the final layout vectors,
+    // rerot_multi_scratch feeds the multi-reader builder's per-reader
+    // outputs. Not serialized; mutable because the build path is const.
+    mutable llama_rerot_attn_layout rerot_assembly_scratch;
+    mutable std::vector<std::vector<llama_rerot_query_layout>> rerot_multi_scratch;
+    mutable std::vector<llama_pos> rerot_qvp_sink;
+
+    friend class llama_kv_cache_context;
+
     // Feed the world: called by the tracked mutation entry points. When the
     // world is valid, the increment is applied immediately; when invalid,
     // the records are dropped (the rebuild rescans the cells).
@@ -1233,6 +1248,12 @@ private:
 
     mutable bool rerot_layout_ready = false;
     mutable llama_rerot_attn_layout rerot_layout;
+    // Assembly scratch (fourteenth round): the per-frontier layout is built
+    // into a FRESH object every call, so entries/groups/query_offsets
+    // reallocate from zero each time (the reserve pass still pays one
+    // allocation + zeroing per vector). The scratch keeps the vectors alive
+    // across frontiers: build into it, then move it into rerot_layout —
+    // capacity survives the move and the next frontier reuses it.
 
     // FlashPrefill planning cache (mutable so const graph KV inputs can build;
     // same discipline as rerot_layout above). Keyed by owned ubatch + role +

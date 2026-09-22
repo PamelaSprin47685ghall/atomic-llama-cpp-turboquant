@@ -236,6 +236,15 @@ struct llama_rerot_attn_layout {
     }
 
     bool validate(uint32_t n_keys, std::string * error = nullptr) const;
+
+    // Persistent duplicate-key scratch for the validating mode: the layout
+    // object lives across frontiers inside the KV cache, so the bitmap is
+    // allocated once and only touched bytes are walked per query (the
+    // validating walk itself clears what it sets — the scratch is all-zero
+    // between validate() calls by construction).
+    // Not serialized, not part of layout identity; mutable because
+    // validate() is const.
+    mutable std::vector<uint8_t> validate_scratch_storage;
 };
 
 // Minimal physical-key description used by the pure layout builder. The KV
@@ -552,11 +561,30 @@ private:
 // query_virtual_pos; same exceptions). The structural pass is skipped —
 // the reader-side ownership filtering and per-query numeric pass run
 // directly over the world's run/untagged structure.
+// Direct-emission sink (fourteenth round): when passed to the world
+// builder, the per-query merge writes straight into the FINAL layout
+// arrays (group base and query index applied inline) — the intermediate
+// per-query layouts and the assembly copy disappear. The sink arrays must
+// be pre-sized to the exact totals; cursors track emission positions.
+struct rerot_emission_sink {
+    llama_rerot_attn_entry * entries = nullptr;
+    llama_rerot_attn_group * groups = nullptr;
+    std::vector<uint32_t> * query_offsets = nullptr;
+    std::vector<llama_pos> * query_virtual_pos = nullptr;
+    // Per-reader ubatch-row arrays: query_index_per_reader[r][qi] is the
+    // ubatch row stamped on the groups emitted for that (reader, query).
+    std::vector<const uint32_t *> query_index_per_reader;
+    size_t entry_cursor = 0;
+    size_t group_cursor = 0;
+};
+
 std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader_world(
     const std::vector<llama_rerot_reader_state> & readers,
     const std::vector<std::vector<llama_pos>> & query_storage_pos,
     const llama_rerot_shared_world & world,
-    const std::vector<llama_rerot_owned_view> & base_owned_bits);
+    const std::vector<llama_rerot_owned_view> & base_owned_bits,
+    std::vector<std::vector<llama_rerot_query_layout>> * output_scratch = nullptr,
+    rerot_emission_sink * sink = nullptr);
 
 // Pure logical document/tree model. It never stores physical KV indices.
 class llama_rerot_document {

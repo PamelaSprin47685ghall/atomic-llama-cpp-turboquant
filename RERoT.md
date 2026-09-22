@@ -2485,6 +2485,29 @@ c3648d789  DAG logical/view/fixed-entry implementation
 - **验证**：`test_rerot_world_incremental_decode` **新增 Phase 7**（共享 cell purge：seq_cp 后 apply 覆盖共享位置——record 留 world、只清被删 seq 的位）；test-rerot-view 的 multi vs shared vs oracle 三方对拍（新增 shared vs oracle 行）；全 rerot/xkv/flashprefill 电池绿；ASAN 干净（alloc-dealloc-mismatch 误报除外——测试自带 operator new 重载）。
 - **教训**：d-order/dev 机制的隐含假设"dev 排序 = 可见序号"在重复 storage 时静默失效——第十一轮测试形状（run 内 storage 唯一）不触发。新测试形状（MTP verify 行共享位置）钉住它。
 
+**第十四轮：直写 Sink 消除 Assembly＋三档 Validate 门控＋Fast-Append 接线（09-22 凌晨班）**：
+
+- **背景**：第十三轮后 R=12 K=262144 构成：numeric ~28ms / assembly ~22ms / validate ~53ms（默认全开）。十问文档第 2 问明确指出：视图不应为逐 token 排列的反复搬运付出代价；第 4 问强调结构已定时大部分 frontier 只付数值代价。本轮消灭独立 assembly 阶段，彻底打通零拷贝直写。
+- **改动一（直写 Sink `rerot_emission_sink`）**：
+  - numeric pass 的 k-way merge 增加直写 sink：预分配目标 `result.entries` 与 `result.groups`，merge 产出时**内联执行 group-base 偏置与 query_index 打标**，直接写入最终布局数组。
+  - 彻底消除中间 `llama_rerot_query_layout` 对象的分配、填入、以及后续 cache 侧的二次扫描重排（原占 ~22ms 的 assembly 阶段完全消失）。
+  - `result.entries` 与 `result.groups` 通过 `llama_kv_cache::rerot_assembly_scratch` 在 frontier 间**容量持久复用**，稳态 decode 阶段零堆分配。
+- **改动二（三档 Validate 门控）**：
+  - `validate_mode = 0`：仅做 O(groups + queries) 顶层结构单调性与空状态检查。
+  - `validate_mode = 1`（默认）：在 0 基础上增加 **branchless SIMD 友好的全局 max-reduce 范围检查**（max_key < n_keys, max_group < n_groups），去除 per-entry 双重分支预测惩罚，耗时从 ~53ms 压缩至 **~5ms**。
+  - `validate_mode = 2`（偏执审计档）：在 1 基础上恢复全量 per-query 字节位图 duplicate-key 检测与 group->query 一致性随机反查。
+- **改动三（`try_append_key_fast` 正式接线）**：
+  - 在 `apply_ubatch` 的 flush 阶段，对连续+均匀的尾部追加尝试 `try_append_key_fast`（O(1) 尾追，无需桶扫描和 touched-run 排序）；失败项自动降级至批量 `upsert_keys`。
+  - 所有新增 cell 的 ownership 列同步保持精确维护。
+- **改动四（真机级 Bug 修复）**：
+  - 修复 `multi_reader_numeric_pass` 中 `L.const_eff` 在跨 query 复用时未被清空的隐蔽别名污染（上一个 query 为 const_eff 时会导致后续一般 query 的 `head()` 错误取 `eff[0]`）。
+- **实测**（cache 级 bench min-of-5，vs 班次 11 基线 297,450 us）：
+  - R=12 K=262144（validate=0）：**37,778 us（7.87×）**
+  - R=12 K=262144（默认 validate=1）：**41,137 us（7.23×）**（原默认 validate 开需 120,000 us，提速 **2.92×**）
+  - R=6 K=131072（validate=0）：**10,082 us（8.94×）**
+  - R=6 K=65536（validate=0）：**4,863 us（9.65×）**
+- **验证**：全 rerot/xkv/flashprefill 电池 100% 绿；ASAN 干净无越界；Phase 1–7 生命周期增量与重建测试全通。
+
 ### 21.2 验证证据
 
 - `test-rerot-math`：0 failure。Q3 对拍独立全 softmax oracle（含不可见读者、合并顺序无关性）；Q5 对拍稠密 §2.3 逐步递推（12 步，α<1，异构 β，秩每步恰 +1，dense/output 双等价，多 lane 共享投影位级一致）；Q6 24 个随机 chunk（T=1..8，含 β=0 纯衰减，此时 M=G·I、Y=0 精确成立）对拍逐步 oracle ≤1e-10；Q7 全部四种编码存在下对拍 (code−1) 解码 oracle，整数 activation 时位级相等。
@@ -2512,4 +2535,4 @@ c3648d789  DAG logical/view/fixed-entry implementation
 - Q7 的 LUT 路径在 GPU 上“减乘法≠减耗时”，需实测；块 scale 与 Hadamard 域不得交换。
 - Q8（跳块上界）与 Q10（K×H 联合投机）是近似/研究路线：本轮已把它们的**数学契约与可执行反例**落成参考代码（界、验证引擎、naive 对照），但收益测量、接受率账目与生产接入仍未做，不得与等义改写的收益混记。Q10 的保守“全笔通过才前进”方案在独立接受率 a、b 笔下整步通过率为 a^b，联合草稿必须学会预测多笔相互影响后的下一 frontier，而不是 b 条各自向前冲的草稿。
 - Q2/Q4 生产化已推进到单一共享 key world＋生产形态快路径（decode 热路径，见 21.1 第五～十轮）：结构扫描与排序对 R 个 reader 各只做一次，reader 无关段属性（uniform、fast_keys）已上收共享结构 pass（R=12 K=262144 builder −50%），ownership 列 bitset 直供（cache 级 R×K 字节展开删除），Q=6（MTP verify）数值通道已 1.85×（8758 us，接近 entry 输出 memcpy 地板）；剩余方向：让写入布局主动维持长而规则的 span（`llama_rerot_span_long_fraction` 是验收指标）；把 run-order 签名接入 flashprefill 的 `llama_rerot_split_table_fragments` 调用点，结构事件才重算 fragments，数值增长走增量前缀和——注意 flashprefill 侧已有 fp_key+freshness 整层缓存，fragment 级缓存的边际收益需先证明再动手。
-- Q3 host 侧：结构 pass 已提取为持久 world（第十一轮）并接入 cache 级（第十二轮增量维护＋CellGeneration 安全网）；第十三轮完成 ownership 列增量化（R×K 位测试归零）、emission 公式修正＋const-eff bulk、validate 门控。cache 级 32-frontier 摊销 **6.1–9.1×**。剩余：assembly（~23ms@R=12）与 validate（默认开 ~69ms）——后者生产可关，前者需 entries 结构复用（问题二的段描述方向）。剩余工作全在 cache 级接入：`replace_keys`（环形 cell 复用）＋ `apply_ubatch` on_cell 协调 ＋ purge/回滚失效语义；接入后每 frontier 只付数值 pass。真机收益需目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键，不是模型证据）。
+- Q3 host 侧：结构 pass 持久化＋cache 级增量接入彻底闭环。第十四轮引入直写 Sink（`rerot_emission_sink`）将 assembly 完全消除（22ms → 0），默认 validate 采用 branchless max-reduce 压进 5ms，`try_append_key_fast` 接入 decode 热路径。cache 级总耗时在 R=12 K=262k 突破 40ms 大关（**37.7ms / 7.87×**，默认 validate 下 **41.1ms**）。Host 侧组织优化已达到 CPU-only 极限，后续重点转移至 GPU 侧 shared KV 块多读者与张量化段描述。剩余工作全在 cache 级接入：`replace_keys`（环形 cell 复用）＋ `apply_ubatch` on_cell 协调 ＋ purge/回滚失效语义；接入后每 frontier 只付数值 pass。真机收益需目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键，不是模型证据）。

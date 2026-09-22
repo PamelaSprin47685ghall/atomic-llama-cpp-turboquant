@@ -196,6 +196,52 @@ LateBind 全部 7 个内核的 push constant 把 `capacity_rows` 当执行行数
 
 ---
 
+## 下班交接｜2026-09-22（第十四轮，直写 Sink 消除 Assembly＋三档 Validate＋Fast-Append：41.1ms / 7.23×）
+
+**分支：** `master`（本轮 commit 见 git log；第十三轮 `a6fb490f3` 在历史里）
+
+### 一、本轮改动（消灭独立 Assembly 与重载 Validate 开销）
+
+针对十问文档第 2 问（避免逐 token 重复搬运）与第 4 问（固定结构下仅付数值代价）：
+
+1. **直写 Sink `rerot_emission_sink`（Assembly 阶段归零）**：
+   - numeric pass 的 k-way merge 增加直写 sink：直接分配好最终的 `result.entries` 与 `result.groups`，merge 产出时**内联打标 query_index 并加上 group_base 偏置**。
+   - 彻底移除了中间逐 query 的 `llama_rerot_query_layout` 对象创建，以及 cache 层随后遍历拷贝的二次装配（Assembly 从 ~22ms 缩减至 0）。
+   - `llama_kv_cache::rerot_assembly_scratch` 与 `rerot_multi_scratch` 提供跨 frontier 的向量容量保留与热页复用。
+2. **三档 Validate 门控（默认档 53ms → 5ms）**：
+   - `validate_mode = 0`：仅做 O(groups + queries) 顶层单调性及范围检查。
+   - `validate_mode = 1`（默认）：增加 SIMD 友好的全局无分支 max-reduce 范围检查，消除 per-entry 双重分支预测开销，由 ~53ms 降至 **~5ms**。
+   - `validate_mode = 2`（偏执审计）：保留全量 per-query 字节位图重重检查与 group->query 一致性反查。
+3. **`try_append_key_fast` 正式接线**：
+   - `apply_ubatch` 的 flush 循环中，优先对连续+均匀的尾部追加调用 `try_append_key_fast`（O(1) 尾追，跳过桶扫描和 touched-run 排序）；非连续/非均匀项安全回退至批量 `upsert_keys`。
+4. **隐蔽 Bug 修复**：
+   - 修复 `multi_reader_numeric_pass` 中 `L.const_eff` 在跨 query 列表复用时未被清空的别名污染（上一个 query 若为 const_eff，会导致下一个普通 query 的 `head()` 错误读 `eff[0]`）。
+   - 修复 `got/want` 测试中断言比较器的 cross-vector 迭代器混淆死循环。
+
+### 二、实测对比（min-of-5，vs 班次 11 基线 297,450 us）
+
+| 形状 | 基线 (11轮前) | 13轮完成 | 14轮 (默认 validate=1) | 14轮 (validate=0) | 相对基线加速 |
+|---|---|---|---|---|---|
+| R=12 K=262144 | 297,450 us | 48,472 us (val=0) | **41,137 us** | **37,778 us** | **7.87×** |
+| R=6 K=131072 | 90,135 us | 9,956 us (val=0) | **10,743 us** | **10,082 us** | **8.94×** |
+| R=6 K=65536 | 46,919 us | 5,244 us (val=0) | **5,772 us** | **4,863 us** | **9.65×** |
+
+默认校验档从 120ms 压缩至 41.1ms（提升 2.92×）。
+
+### 三、验证与鲁棒性
+
+- 全 rerot/xkv/flashprefill 电池 0 failure（test-rerot-view/attn/runtime/ddvr/math/parser/profile, test-xkv-runtime/factor/reader, test-flashprefill-attn/routing/select/state 全部 PASS）。
+- ASAN 干净（/tmp/asan13，0 错误）。
+- Phase 1–7 增量与重建测试全部通过。
+
+### 四、下一班建议
+
+1. **GPU 侧 Q3（Hydragen 式公共 KV 块多读者共享）**：进入真机 Vulkan 阶段，验证片上多读者并行注意力的寄存器开销与带宽节省。
+2. **张量化段描述（Q2）**：将 entries 矩阵由点列表转为段列表（起始 cell, count, effective_pos），将 GPU 搬运量从 25MB 压缩至几十字节。
+3. **GDN 低秩增量基底（Q5）**：验证多 pen 共享 GDN 基底 $B$ 的 FP64/F32 精度误差界。
+
+---
+
 ## 下班交接｜2026-09-22（第十三轮，cache 级三连击：6.1–9.1×＋emission 公式真 bug 修复）
 
 **分支：** `master`（本轮 commit 见 git log；第十二轮 `3e5a13561` 在历史里）

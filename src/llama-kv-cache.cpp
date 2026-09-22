@@ -4109,8 +4109,23 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                     }
                     rerot_world.remove_keys(world_purged);
                 }
+                // Decode fast path (fourteenth round): a fresh key
+                // extending a contiguous+uniform run tail is an O(1)
+                // world append (no bucket scan, no touched-run re-sort).
+                // Everything else (recycled indices, meta rewrites)
+                // stays on the batched upsert. The split must consume
+                // every pending record exactly once.
                 if (!rerot_world_pending.empty()) {
-                    rerot_world.upsert_keys(rerot_world_pending);
+                    std::vector<llama_rerot_key_record> upsert_batch;
+                    upsert_batch.reserve(rerot_world_pending.size());
+                    for (const auto & rec : rerot_world_pending) {
+                        if (!rerot_world.try_append_key_fast(rec)) {
+                            upsert_batch.push_back(rec);
+                        }
+                    }
+                    if (!upsert_batch.empty()) {
+                        rerot_world.upsert_keys(upsert_batch);
+                    }
                 }
                 // Ownership columns (thirteenth round): purge victims lose
                 // their bits in every column (the cells are gone); written
@@ -6441,10 +6456,17 @@ const llama_rerot_shared_world & llama_kv_cache::ensure_rerot_world() const {
 
 llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         const llama_ubatch & ubatch,
-        uint32_t n_kv) const {
-    llama_rerot_attn_layout result;
+        uint32_t n_kv, llama_rerot_attn_layout * assembly_scratch) const {
+    // Fourteenth round: build into the caller-provided scratch when
+    // present (capacity reuse across frontiers — the caller swaps the
+    // built layout out, leaving the previous frontier's buffers in the
+    // scratch for the next build). Without a scratch this is the plain
+    // by-value build.
+    llama_rerot_attn_layout local;
+    llama_rerot_attn_layout & result = assembly_scratch ? *assembly_scratch : local;
+    result = llama_rerot_attn_layout{};
     if (!rerot_batch_active(ubatch)) {
-        return result;
+        return std::move(result);
     }
     if (n_stream != 1 || v_cells.size() != 1) {
         throw std::runtime_error("RERoT indexed attention requires unified KV");
@@ -6502,7 +6524,9 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
     // (never worse than the eleventh-round status quo). The layout builder
     // below consumes the world directly — per frontier only the per-reader
     // ownership filtering and the per-query numeric pass run.
+    const auto t_world0 = std::chrono::steady_clock::now();
     const llama_rerot_shared_world & world = ensure_rerot_world();
+    const auto t_world1 = std::chrono::steady_clock::now();
     const auto & shared_keys = world.keys_ref();
     // Per-group query positions + ownership columns (the caller's seq_has
     // column per group: base rows and own-run rows of that reader's seq).
@@ -6548,47 +6572,95 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
     // Tenth round: the builder consumes the packed bitsets directly
     // (llama_rerot_owned_view is a plain pointer + width — no kv-cells
     // type dependency), so the R x K byte expansion is gone.
+    // Fourteenth round: when the maintained column already has the exact
+    // width, the view points STRAIGHT at it — the per-group column copy
+    // (R x K/8 bytes per frontier) is skipped. The local owned_words
+    // vectors are only materialized for missing/short columns.
     std::vector<llama_rerot_owned_view> owned_views(groups.size());
     for (size_t g = 0; g < groups.size(); ++g) {
         GGML_ASSERT(owned_words[g].size() >= owned_words_per_col);
         owned_views[g] = { owned_words[g].data(), owned_words[g].size() };
+        const auto it = rerot_world_owned.find(group_seqs[g]);
+        if (it != rerot_world_owned.end() && it->second.size() == owned_words_per_col) {
+            owned_views[g] = { it->second.data(), it->second.size() };
+        }
     }
-    const auto multi = llama_rerot_build_query_layouts_multi_reader_world(
-        group_readers, group_qpos, world, owned_views);
-    // Reserve the assembly targets once: per-group push_back reallocation
-    // over ~R x n_kv entries was a measurable fraction of the cache-side
-    // cost at production shapes.
+    const auto t_cols1 = std::chrono::steady_clock::now();
+    const auto t_num1 = std::chrono::steady_clock::now();
+    // Fourteenth round: DIRECT EMISSION. The builder's per-query merge
+    // writes the FINAL entries/groups arrays through the sink (group base
+    // and query index stamped inline) — the intermediate per-query layout
+    // objects and the assembly copy (~20ms at R=12 K=262k) are gone. The
+    // arrays are pre-sized to a cheap upper bound (every query sees at
+    // most all keys; production readers see nearly everything, so the
+    // bound is tight) and shrunk to the emitted count afterwards (a
+    // downward resize never reallocates).
     {
-        size_t total_entries = 0;
-        size_t total_groups = 0;
-        for (size_t g = 0; g < groups.size(); ++g) {
-            for (size_t i = 0; i < groups[g].rows.size() && i < multi[g].size(); ++i) {
-                total_entries += multi[g][i].entries.size();
-                total_groups += multi[g][i].groups.size();
-            }
+        const size_t n_queries_total = size_t(ubatch.n_tokens);
+        // Worst case every visible entry of every query is its own group
+        // (distinct effective positions), so the group bound is the same
+        // as the entry bound — a (runs + 2) * n_queries bound is NOT an
+        // upper bound on merge output groups.
+        const size_t n_queries_total_ = n_queries_total;
+        const size_t entry_bound = world.keys_ref().size() * n_queries_total;
+        const size_t group_bound = entry_bound;
+        GGML_UNUSED(n_queries_total_);
+        if (result.entries.capacity() < entry_bound) {
+            result.entries.reserve(entry_bound);
         }
-        result.entries.reserve(total_entries);
-        result.groups.reserve(total_groups);
-    }
-    for (size_t g = 0; g < groups.size(); ++g) {
-        const auto & group = groups[g];
-        for (size_t i = 0; i < group.rows.size() && i < multi[g].size(); ++i) {
-            const uint32_t query = group.rows[i];
-            const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
-            for (auto grp : multi[g][i].groups) {
-                grp.query_index = query;
-                result.groups.push_back(grp);
-            }
-            for (auto entry : multi[g][i].entries) {
-                entry.group_index += group_base;
-                result.entries.push_back(entry);
-            }
-            result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
+        if (result.groups.capacity() < group_bound) {
+            result.groups.reserve(group_bound);
         }
+        result.entries.resize(entry_bound);
+        result.groups.resize(group_bound);
+        result.query_offsets.reserve(n_queries_total + 1);
+        // NOTE: the leading 0 was pushed before the group scan; the sink
+        // appends one offset per emitted query, so the vector ends as
+        // [0, q0_end, q1_end, ...] with n_queries + 1 entries.
     }
+    {
+        rerot_emission_sink sink;
+        sink.entries = result.entries.data();
+        sink.groups = result.groups.data();
+        sink.query_offsets = &result.query_offsets;
+        sink.query_virtual_pos = &rerot_qvp_sink;
+        rerot_qvp_sink.clear();
+        rerot_qvp_sink.reserve(size_t(ubatch.n_tokens));
+        // Per-reader ubatch-row pointers: groups[g].rows in order — the
+        // builder walks (reader, query) pairs and stamps the row on the
+        // emitted groups.
+        sink.query_index_per_reader.reserve(groups.size());
+        for (const auto & group : groups) {
+            sink.query_index_per_reader.push_back(group.rows.data());
+        }
+        std::vector<std::vector<llama_rerot_query_layout>> multi_moved =
+            llama_rerot_build_query_layouts_multi_reader_world(
+                group_readers, group_qpos, world, owned_views, &rerot_multi_scratch, &sink);
+        rerot_multi_scratch = std::move(multi_moved);
+        // Shrink to the emitted counts (no realloc; capacity stays for the
+        // next frontier via the assembly scratch).
+        result.entries.resize(sink.entry_cursor);
+        result.groups.resize(sink.group_cursor);
+    }
+    const auto t_asm1 = t_num1; // assembly is now part of the numeric pass
     std::string error;
     if (!result.validate(n_kv, &error)) {
         throw std::runtime_error("invalid RERoT attention layout: " + error);
+    }
+    if (getenv("LLAMA_REROT_PHASE_DEBUG")) {
+        fprintf(stderr, "[layout-out] nq=%u offs=%zu entries=%zu groups=%zu:",
+            result.n_queries, result.query_offsets.size(), result.entries.size(), result.groups.size());
+        for (auto o : result.query_offsets) fprintf(stderr, " %u", o);
+        fprintf(stderr, "\n");
+    }
+    const auto t_val1 = std::chrono::steady_clock::now();
+    if (getenv("LLAMA_REROT_PHASE_DEBUG")) {
+        fprintf(stderr, "[rerot-phase] world=%.0f cols=%.0f num=%.0f asm=%.0f val=%.0f us\n",
+            std::chrono::duration<double, std::micro>(t_world1 - t_world0).count(),
+            std::chrono::duration<double, std::micro>(t_cols1 - t_world1).count(),
+            std::chrono::duration<double, std::micro>(t_num1 - t_cols1).count(),
+            std::chrono::duration<double, std::micro>(t_asm1 - t_num1).count(),
+            std::chrono::duration<double, std::micro>(t_val1 - t_asm1).count());
     }
     const auto t_layout_end = std::chrono::steady_clock::now();
     const uint64_t layout_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
@@ -6610,7 +6682,7 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         prof->ring.push(4 /* custom/layout-audit */, 2 /* layout */, (uint16_t) result.groups.size(), (uint32_t) result.entries.size(), layout_us);
     }
 
-    return result;
+    return std::move(result);
 }
 
 llama_kv_cache::rerot_resolved_view llama_kv_cache::rerot_resolve_view(
@@ -10113,9 +10185,18 @@ bool llama_kv_cache_context::rerot_active() const {
 
 const llama_rerot_attn_layout & llama_kv_cache_context::get_rerot_attn_layout() const {
     if (!rerot_layout_ready) {
-        rerot_layout = rerot_active()
-            ? kv->rerot_build_attn_layout(ubatches[i_cur], n_kv)
-            : llama_rerot_attn_layout{};
+        // Fourteenth round: build through the assembly scratch so the
+        // entries/groups/offsets capacity survives across frontiers. The
+        // build returns by value (a move), which TRANSFERS the scratch's
+        // buffers into rerot_layout; swap first so the scratch receives the
+        // previous frontier's (same-sized) buffers in exchange.
+        if (rerot_active()) {
+            std::swap(rerot_layout, kv->rerot_assembly_scratch);
+            rerot_layout = kv->rerot_build_attn_layout(
+                ubatches[i_cur], n_kv, &kv->rerot_assembly_scratch);
+        } else {
+            rerot_layout = llama_rerot_attn_layout{};
+        }
         rerot_layout_ready = true;
     }
     return rerot_layout;
