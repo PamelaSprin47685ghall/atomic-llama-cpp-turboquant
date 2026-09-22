@@ -345,6 +345,14 @@ struct tp5_rank {
     vk_device device;
     VkDevice vkdev = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+
+    // Pipeline executable statistics (RADV codegen evidence: VGPR/SGPR/LDS/
+    // spill) for the TP5 collective kernels, gated on the same extension as
+    // GGML_VK_PIPELINE_STATS. Filter selects by pipeline name substring;
+    // empty filter matches every TP5 kernel.
+    bool pipeline_stats = false;
+    char pipeline_stats_filter[64] {};
+
     uint32_t queue_family = 0;
     // Distinct SDMA transfer queue when available; cross-device PUSH copies run here
     // (the graphics ring stalls on P2P copies: measured ring gfx_0.0.0 timeouts).
@@ -1200,6 +1208,55 @@ uint32_t find_memory_type(const VkPhysicalDeviceMemoryProperties & props,
     return UINT32_MAX;
 }
 
+static void tp5_print_pipeline_statistics(VkDevice dev, VkPipeline pipeline, const char * pipe_name) {
+    // Mirrors the main ggml-vulkan stats reporting (GGML_VK_PIPELINE_STATS)
+    // for the TP5 collective kernels. Requires the pipeline to have been
+    // created with VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR.
+    PFN_vkGetPipelineExecutablePropertiesKHR get_props =
+        (PFN_vkGetPipelineExecutablePropertiesKHR) vkGetDeviceProcAddr(
+            dev, "vkGetPipelineExecutablePropertiesKHR");
+    PFN_vkGetPipelineExecutableStatisticsKHR get_stats =
+        (PFN_vkGetPipelineExecutableStatisticsKHR) vkGetDeviceProcAddr(
+            dev, "vkGetPipelineExecutableStatisticsKHR");
+    if (!get_props || !get_stats) return;
+
+    VkPipelineInfoKHR pinfo{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+    pinfo.pipeline = pipeline;
+    uint32_t n_exec = 0;
+    if (get_props(dev, &pinfo, &n_exec, nullptr) != VK_SUCCESS || n_exec == 0) return;
+    std::vector<VkPipelineExecutablePropertiesKHR> props(n_exec,
+        VkPipelineExecutablePropertiesKHR{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+    if (get_props(dev, &pinfo, &n_exec, props.data()) != VK_SUCCESS) return;
+
+    for (uint32_t e = 0; e < n_exec; ++e) {
+        fprintf(stderr, "tp5: pipeline stats for %s [%.*s]:\n", pipe_name,
+                (int) sizeof(props[e].name), props[e].name);
+        VkPipelineExecutableInfoKHR einfo{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+        einfo.pipeline = pipeline;
+        einfo.executableIndex = e;
+        uint32_t n_stats = 0;
+        if (get_stats(dev, &einfo, &n_stats, nullptr) != VK_SUCCESS || n_stats == 0) continue;
+        std::vector<VkPipelineExecutableStatisticKHR> stats(n_stats,
+            VkPipelineExecutableStatisticKHR{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+        if (get_stats(dev, &einfo, &n_stats, stats.data()) != VK_SUCCESS) continue;
+        for (const auto & st : stats) {
+            fprintf(stderr, "tp5:   %s: ", st.name);
+            switch (st.format) {
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+                    fprintf(stderr, "%s", st.value.b32 ? "true" : "false"); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+                    fprintf(stderr, "%lld", (long long) st.value.i64); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+                    fprintf(stderr, "%llu", (unsigned long long) st.value.u64); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+                    fprintf(stderr, "%g", st.value.f64); break;
+                default: break;
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+}
+
 static bool tp5_create_shader_module(VkDevice dev,
                                      const unsigned char * spv, uint64_t len,
                                      VkShaderModule * out) {
@@ -1485,7 +1542,8 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
             const auto make_late = [&](uint32_t bindings, uint32_t pc_bytes,
                                        const unsigned char * spv, uint64_t spv_len,
                                        VkDescriptorSetLayout & dsl, VkPipelineLayout & layout,
-                                       VkPipeline & pipeline, uint32_t required_subgroup = 0) -> bool {
+                                       VkPipeline & pipeline, const char * pipe_name,
+                                       uint32_t required_subgroup = 0) -> bool {
                 std::vector<VkDescriptorSetLayoutBinding> bs(bindings);
                 for (uint32_t i = 0; i < bindings; ++i) {
                     bs[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -1506,7 +1564,15 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
                 VkShaderModule mod = VK_NULL_HANDLE;
                 if (!tp5_create_shader_module(r.vkdev, spv, spv_len, &mod))
                     return false;
+                // Capture statistics when the extension is live so the same
+                // RADV codegen evidence (VGPR/SGPR/LDS/spill) is available for
+                // the TP5 collective kernels as for the main pipelines
+                // (roadmap §4.3: judge codegen, not shader names).
+                const bool want_stats = r.pipeline_stats && pipe_name != nullptr &&
+                                        (!r.pipeline_stats_filter[0] ||
+                                         strstr(pipe_name, r.pipeline_stats_filter));
                 VkComputePipelineCreateInfo pci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+                pci.flags = want_stats ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
                 pci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
                 pci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
                 pci.stage.module = mod;
@@ -1521,18 +1587,19 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
                 const bool made =
                     vkCreateComputePipelines(r.vkdev, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline) == VK_SUCCESS;
                 vkDestroyShaderModule(r.vkdev, mod, nullptr);
+                if (made && want_stats) tp5_print_pipeline_statistics(r.vkdev, pipeline, pipe_name);
                 return made;
             };
             if (!make_late(4, 12, tp5_hc_late_inject_data, tp5_hc_late_inject_len,
-                           r.late_inject_dsl, r.late_inject_layout, r.late_inject_pipe) ||
+                           r.late_inject_dsl, r.late_inject_layout, r.late_inject_pipe, "tp5_hc_late_inject") ||
                 !make_late(7, 20, tp5_hc_late_q_data, tp5_hc_late_q_len,
-                           r.late_q_dsl, r.late_q_layout, r.late_q_pipe) ||
+                           r.late_q_dsl, r.late_q_layout, r.late_q_pipe, "tp5_hc_late_q") ||
                 !make_late(3, 4, tp5_hc_publish_data, tp5_hc_publish_len,
-                           r.late_publish_dsl, r.late_publish_layout, r.late_publish_pipe) ||
+                           r.late_publish_dsl, r.late_publish_layout, r.late_publish_pipe, "tp5_hc_publish") ||
                 !make_late(9, 28, tp5_hc_resume_norm_data, tp5_hc_resume_norm_len,
-                           r.late_norm_dsl, r.late_norm_layout, r.late_norm_pipe) ||
+                           r.late_norm_dsl, r.late_norm_layout, r.late_norm_pipe, "tp5_hc_resume_norm") ||
                 !make_late(4, 32, tp5_hc_resume_lo_data, tp5_hc_resume_lo_len,
-                           r.late_lo_dsl, r.late_lo_layout, r.late_lo_pipe)) {
+                           r.late_lo_dsl, r.late_lo_layout, r.late_lo_pipe, "tp5_hc_resume_lo")) {
                 return false;
             }
             const bool q8_wave32 =
@@ -1542,15 +1609,15 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
             if (q8_wave32) {
                 const bool q8_ok =
                     make_late(2, 4, tp5_hc_late_pack_data, tp5_hc_late_pack_len,
-                              r.late_pack_dsl, r.late_pack_layout, r.late_pack_pipe) &&
+                              r.late_pack_dsl, r.late_pack_layout, r.late_pack_pipe, "tp5_hc_late_pack") &&
                     make_late(6, 16, tp5_hc_late_act_q8_data, tp5_hc_late_act_q8_len,
-                              r.late_act_q8_dsl, r.late_act_q8_layout, r.late_act_q8_pipe, 32u) &&
+                              r.late_act_q8_dsl, r.late_act_q8_layout, r.late_act_q8_pipe, "tp5_hc_late_act_q8", 32u) &&
                     make_late(3, 28, tp5_hc_late_q_q8dot_data, tp5_hc_late_q_q8dot_len,
-                              r.late_q8dot_dsl, r.late_q8dot_layout, r.late_q8dot_pipe, 32u) &&
+                              r.late_q8dot_dsl, r.late_q8dot_layout, r.late_q8dot_pipe, "tp5_hc_late_q_q8dot", 32u) &&
                     make_late(5, 32, tp5_hc_resume_lo_q8_data, tp5_hc_resume_lo_q8_len,
-                              r.late_lo_q8_dsl, r.late_lo_q8_layout, r.late_lo_q8_pipe, 32u) &&
+                              r.late_lo_q8_dsl, r.late_lo_q8_layout, r.late_lo_q8_pipe, "tp5_hc_resume_lo_q8", 32u) &&
                     make_late(5, 20, tp5_hc_late_up_q8dot_data, tp5_hc_late_up_q8dot_len,
-                              r.late_up_q8dot_dsl, r.late_up_q8dot_layout, r.late_up_q8dot_pipe, 32u);
+                              r.late_up_q8dot_dsl, r.late_up_q8dot_layout, r.late_up_q8dot_pipe, "tp5_hc_late_up_q8dot", 32u);
                 if (!q8_ok) {
                     if (r.late_pack_pipe) { vkDestroyPipeline(r.vkdev, r.late_pack_pipe, nullptr);
                                            vkDestroyPipelineLayout(r.vkdev, r.late_pack_layout, nullptr);
@@ -7355,6 +7422,19 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
         }
         r.vkdev = ggml_vk_tp5_vk_device(r.device);
         r.caps = ggml_vk_tp5_device_caps(r.device);
+
+        // Same evidence channel as GGML_VK_PIPELINE_STATS, extended to the
+        // TP5 collective kernels: real RADV codegen statistics (VGPR/SGPR/
+        // LDS/spill) instead of shader-name-based reasoning.
+        if (const char * stats_env = getenv("GGML_TP5_PIPELINE_STATS")) {
+            if (r.caps.pipeline_executable_properties) {
+                r.pipeline_stats = true;
+                snprintf(r.pipeline_stats_filter, sizeof(r.pipeline_stats_filter), "%s", stats_env);
+            } else {
+                fprintf(stderr, "ggml-vulkan-collective: GGML_TP5_PIPELINE_STATS requested but "
+                                "VK_KHR_pipeline_executable_properties is unavailable; ignoring\n");
+            }
+        }
         if (c->sync_mode == tp5_sync_mode::RELAY &&
             (!r.caps.device_coherent_memory || r.caps.vendor_id != 0x1002)) {
             fprintf(stderr, "ggml-vulkan-collective: RELAY requires AMD device-coherent memory on rank %zu\n", i);

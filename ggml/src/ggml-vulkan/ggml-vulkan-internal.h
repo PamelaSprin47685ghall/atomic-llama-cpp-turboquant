@@ -46,6 +46,7 @@ struct vk_tp5_device_caps {
     uint64_t min_storage_buffer_offset_alignment = 0;
     bool     storage_buffer_array_dynamic_indexing   = false;
     bool     integer_dot_product                     = false;
+    bool     pipeline_executable_properties            = false;
     uint32_t subgroup_size                           = 0;
     bool     subgroup_size_control                   = false;
     uint32_t subgroup_min_size                       = 0;

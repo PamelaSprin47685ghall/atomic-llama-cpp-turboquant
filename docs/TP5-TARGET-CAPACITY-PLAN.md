@@ -304,3 +304,38 @@ relay probe 的 `consumer failed` 为基线既有行为（stash 前后一致）�
 共享块数 102400、边界、flag 索引不与数据重叠）；全套 all passed；15/15 ctest
 全绿（含 5 卡 mesh RELAY/STAR）；GPU 空闲、零新增内核错误。**真机收益测量
 （内层循环 ALU 消除 vs +6% 显存）需模型会话，安全门未批**。
+
+### 7.8 RADV codegen 证据通道修复与首次实测（已合入）
+
+**两处器具修复**（路线图 §4.3 “看实际 RADV codegen，而不是 shader 名字”的前提）：
+
+1. **主路径 `GGML_VK_PIPELINE_STATS` 一直无效**：`pep_features` 值初始化后
+   `pipelineExecutableInfo` 从未被置 `VK_TRUE`——扩展启用了但 feature 未开，
+   `vkGetPipelineExecutableStatisticsKHR` 按规范属无效调用。修复后主路径
+   实测出 `mul_mat_vec_f32_f32_f32`：VGPR 32 / SGPR 108 / 零 spill。
+2. **TP5 collective kernel 无统计通道**：`make_late` 工厂不捕获统计。新增
+   `GGML_TP5_PIPELINE_STATS`（过滤子串，空串全匹配）＋ `tp5_print_pipeline_statistics`，
+   pipeline 以 `CAPTURE_STATISTICS` 位创建；caps 新增
+   `pipeline_executable_properties` 探测（`ggml_vk_tp5_device_caps`）。
+
+**首次 RADV 实测**（RX 6800，`--sync relay --rounds 1`，5 卡 mesh 创建路径）：
+
+| kernel | VGPR | SGPR | spilled | LDS | code size |
+|---|---|---|---|---|---|
+| tp5_hc_late_inject | 32 | 108 | 0/0 | 1024 | 1144 |
+| tp5_hc_late_q | 64 | 108 | 0/0 | — | 2316 |
+| tp5_hc_publish | 8 | 108 | 0/0 | 0 | 120 |
+| tp5_hc_resume_norm | — | — | — | — | 18920 |
+| tp5_hc_resume_lo | — | — | — | — | 1340 |
+| tp5_hc_late_pack | 24 | 108 | 0/0 | — | 452 |
+| tp5_hc_late_act_q8 | — | — | — | 2048 | 1952 |
+| tp5_hc_late_q_q8dot | 64 | 108 | 0/0 | 5120 | 2676 |
+| tp5_hc_resume_lo_q8 | — | — | — | — | 3996 |
+| tp5_hc_late_up_q8dot | — | — | — | 4096 | 6152 |
+
+（“—”为 RADV 未报告该项；spilled 为 SGPR/VGPR 两项。）
+
+**结论**：全部 latebind kernel 零 spill——P1-B 打包布局与现有几何在寄存器压力下
+健康，§4.1 的几何搜索（row/wave/K tile 候选）不会先撞寄存器場。`resume_norm`
+code size 18920 是最大者，是几何优化的下一候选。**注意**：此表来自 5 卡 mesh
+创建路径（pipeline 创建期统计），不是模型会话吞吐证据。

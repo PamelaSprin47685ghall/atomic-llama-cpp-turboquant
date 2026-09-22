@@ -1,5 +1,62 @@
 # AGENTS.md
 
+## 下班交接｜2026-09-22（第十四轮，RADV codegen 证据通道：feature 未开修复 + TP5 kernel 统计落地）
+
+**分支：** `master`（本轮 commit 见 git log；基于 `c9bb1c808`）
+**主题：** 落实路线图第二稿 §4.3“看实际 RADV codegen，而不是只看 shader 名字”。
+两件：修好主路径一直无效的 `GGML_VK_PIPELINE_STATS`；给 TP5 collective kernel
+接上同一证据通道并取得首次实测。全程 CPU + 既有 GPU 回归，未启动模型。
+
+### 一、主路径 stats 一直无效（静默 bug，已修）
+
+`ggml_vk_get_device_init` 中 `pep_features` 值初始化（`{}`）后从未置
+`pipelineExecutableInfo = VK_TRUE`——扩展启用了、feature 没开，
+`vkGetPipelineExecutableStatisticsKHR` 按规范属无效调用（RADV 实际返回空）。
+`GGML_VK_PIPELINE_STATS` 环境变量因此从未真正工作过。修复：一行
+`pep_features.pipelineExecutableInfo = VK_TRUE;`。实测
+`mul_mat_vec_f32_f32_f32`：VGPR 32 / SGPR 108 / 零 spill——通道恢复。
+
+### 二、TP5 collective kernel 统计通道（新）
+
+`make_late` 工厂原来不捕获统计。新增：
+
+1. `GGML_TP5_PIPELINE_STATS`（过滤子串，空串全匹配；无扩展时告警忽略）；
+2. `tp5_rank.pipeline_stats/pipeline_stats_filter`；caps 新增
+   `pipeline_executable_properties` 探测（`ggml_vk_tp5_device_caps` 枚举）；
+3. `tp5_print_pipeline_statistics`（C API：`VkPipelineInfoKHR`/`VkPipelineExecutableInfoKHR`）；
+4. `make_late` 增 `pipe_name` 参数，`want_stats` 时以
+   `VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR` 创建。
+
+### 三、首次 RADV 实测（5 卡 mesh 创建路径，`--sync relay`）
+
+| kernel | VGPR | SGPR | spill | LDS | code |
+|---|---|---|---|---|---|
+| late_inject | 32 | 108 | 0 | 1024 | 1144 |
+| late_q | 64 | 108 | 0 | — | 2316 |
+| publish | 8 | 108 | 0 | 0 | 120 |
+| resume_norm | — | — | — | — | 18920 |
+| resume_lo | — | — | — | — | 1340 |
+| late_pack | 24 | 108 | 0 | — | 452 |
+| late_act_q8 | — | — | — | 2048 | 1952 |
+| late_q_q8dot | 64 | 108 | 0 | 5120 | 2676 |
+| resume_lo_q8 | — | — | — | — | 3996 |
+| late_up_q8dot | — | — | — | 4096 | 6152 |
+
+**结论**：全部零 spill——P1-B 打包布局与现有几何在寄存器压力下健康；
+§4.1 几何搜索（row/wave/K tile）不会先撞寄存器墙。resume_norm（18920B）
+是下一候选。
+
+### 四、验证
+
+mesh relay 全绿；`test-backend-ops -o MUL_MAT -b Vulkan0` 全 OK 且 stats 出图；
+15/15 ctest 全绿；GPU 空闲、零新增内核错误。
+
+### 五、下一步
+
+1. §4.1 几何搜索现在有了测量器：每候选一行 VGPR/SGPR/LDS/code，离线选型、定义期固化；
+2. resume_norm code size 18920 值得先看（最大者）；
+3. P1-B/P1-C 真机收益仍需模型会话（安全门未批）。
+
 ## 下班交接｜2026-09-22（第十三轮，路线图审计 + P1-B 首步：Q8 权重定义期打包布局）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `3e3e11bb3`）

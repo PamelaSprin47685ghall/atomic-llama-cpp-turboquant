@@ -8410,6 +8410,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pep_features {};
         pep_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+        // The feature must be enabled or vkGetPipelineExecutableStatisticsKHR is
+        // invalid (spec: pipelineExecutableInfo must be VK_TRUE). This is what
+        // backs GGML_VK_PIPELINE_STATS register/occupancy reporting.
+        pep_features.pipelineExecutableInfo = VK_TRUE;
         if (pipeline_executable_properties_support) {
             last_struct->pNext = (VkBaseOutStructure *)&pep_features;
             last_struct = (VkBaseOutStructure *)&pep_features;
@@ -27382,6 +27386,9 @@ vk_tp5_device_caps ggml_vk_tp5_device_caps(vk_device device) {
         }
         if (strncmp(p.extensionName, VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME, 256) == 0) {
             caps.device_coherent_memory = true;
+        }
+        if (strncmp(p.extensionName, "VK_KHR_pipeline_executable_properties", 256) == 0) {
+            caps.pipeline_executable_properties = true;
         }
         if (strncmp(p.extensionName, "VK_KHR_external_semaphore_fd", 256) == 0) {
             caps.external_semaphore_fd = true;
