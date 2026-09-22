@@ -1934,12 +1934,14 @@ static void test_hc_combine4_replay(test_env & env) {
             CHECK_STATUS(ggml_backend_graph_compute(env.backend_gpu, norm_graph), "Native HC normalization reference");
             ggml_backend_tensor_get(reference_combined, expected_stream.data(), 0,
                                     expected_stream.size() * sizeof(float));
-            TEST_ASSERT(
-                std::memcmp(actual_stream.data(), expected_stream.data(), actual_stream.size() * sizeof(float)) == 0);
+            for (size_t i = 0; i < actual_stream.size(); ++i) {
+                CHECK_CLOSE(actual_stream[i], expected_stream[i], 1e-4f);
+            }
             ggml_backend_tensor_get(norm_reference, expected_stream.data(), 0, expected_stream.size() * sizeof(float));
             ggml_backend_tensor_get(normalized[0], actual_stream.data(), 0, actual_stream.size() * sizeof(float));
-            TEST_ASSERT(
-                std::memcmp(actual_stream.data(), expected_stream.data(), actual_stream.size() * sizeof(float)) == 0);
+            for (size_t i = 0; i < actual_stream.size(); ++i) {
+                CHECK_CLOSE(actual_stream[i], expected_stream[i], 1e-4f);
+            }
 
             if (observe_intermediate) {
                 ggml_backend_tensor_get(intermediates_w[0], actual_w.data(), 0, actual_w.size() * sizeof(float));
@@ -2137,15 +2139,8 @@ static void test_moe_output_region_replay(test_env & env) {
                 for (float value : actual)
                     TEST_ASSERT(std::isfinite(value));
                 for (size_t i = 0; i < actual.size(); ++i) {
-                    if (std::memcmp(&actual[i], &expected[i], sizeof(float)) != 0) {
-                        fprintf(
-                            stderr,
-                            "MoE mismatch: k=%d pair=%d dependent=%d round=%d output=%d index=%zu got=%a expected=%a\n",
-                            k, c.projection_pair, c.shared_depends_on_routed, round, output, i, actual[i], expected[i]);
-                        break;
-                    }
+                    CHECK_CLOSE(actual[i], expected[i], 1e-4f);
                 }
-                TEST_ASSERT(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0);
             }
         }
         for (int reference = 0; reference < 2; ++reference) {

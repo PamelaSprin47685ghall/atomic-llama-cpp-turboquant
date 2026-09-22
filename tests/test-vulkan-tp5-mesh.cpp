@@ -83,8 +83,8 @@ static void setup(const std::vector<int> & dev_ids) {
     size_t n_reg = ggml_backend_reg_dev_count(ggml_backend_vk_reg());
     for (int id : dev_ids) {
         if ((size_t) id >= n_reg) {
-            fprintf(stderr, "device index %d out of range (%zu Vulkan devices)\n", id, n_reg);
-            exit(2);
+            fprintf(stderr, "device index %d out of range (%zu Vulkan devices, skipping multi-gpu mesh test)\n", id, n_reg);
+            exit(77);
         }
         ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_vk_reg(), id);
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
