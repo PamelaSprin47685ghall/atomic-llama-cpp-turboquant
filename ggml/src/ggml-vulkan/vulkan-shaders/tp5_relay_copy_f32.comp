@@ -17,14 +17,13 @@ layout(push_constant) uniform Params {
 } p;
 
 shared uint ready;
-shared uint spin_used;
 shared uint active_elements;
 
 void main() {
     uint lane = gl_LocalInvocationID.x;
     if (lane == 0u) {
+        uint spin_used = 0u;
         ready = 0u;
-        spin_used = 0u;
         active_elements = 0u;
         uint expected = status[1];
         if (status[2] == 0u && expected != 0u) {

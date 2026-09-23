@@ -201,6 +201,64 @@ int main() {
     std::printf("test-rerot-q-prep: CPU op matches llama_rerot_q_prep_reference (atol=%g) + poison-tail.\n",
                 double(kAtol));
 
+    // Edge cases: active == 0, active == capacity, non-contiguous indices
+    {
+        // 1. active == 0 (fully poisoned)
+        llama_rerot_q_prep_contract c_zero = c;
+        c_zero.active = 0;
+        const auto ref_zero = llama_rerot_q_prep_reference(
+            q_raw.data(), q_indices.data(), q_pos.data(), c_zero);
+        std::vector<float> cpu_zero = run_q_prep_graph(
+            cpu_backend, q_raw, q_indices, q_pos,
+            head_dim, heads, n_tokens, capacity, /*active=*/0,
+            n_rot, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, nullptr);
+        compare_to_reference(cpu_zero, ref_zero, head_dim, heads, capacity, 0);
+
+        // 2. active == capacity (full live grid, no tail poison)
+        llama_rerot_q_prep_contract c_full = c;
+        c_full.active = (int32_t) capacity;
+        const auto ref_full = llama_rerot_q_prep_reference(
+            q_raw.data(), q_indices.data(), q_pos.data(), c_full);
+        std::vector<float> cpu_full = run_q_prep_graph(
+            cpu_backend, q_raw, q_indices, q_pos,
+            head_dim, heads, n_tokens, capacity, /*active=*/(int32_t) capacity,
+            n_rot, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, nullptr);
+        compare_to_reference(cpu_full, ref_full, head_dim, heads, capacity, capacity);
+
+        // 3. Non-contiguous arbitrary indices and positions
+        std::vector<int32_t> non_contig_idx = { 4, 0, 3, 1 };
+        std::vector<int32_t> non_contig_pos = { 101, 202, 303, 404 };
+        llama_rerot_q_prep_contract c_nc = c;
+        c_nc.active = 3;
+        const auto ref_nc = llama_rerot_q_prep_reference(
+            q_raw.data(), non_contig_idx.data(), non_contig_pos.data(), c_nc);
+        std::vector<float> cpu_nc = run_q_prep_graph(
+            cpu_backend, q_raw, non_contig_idx, non_contig_pos,
+            head_dim, heads, n_tokens, capacity, /*active=*/3,
+            n_rot, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, nullptr);
+        compare_to_reference(cpu_nc, ref_nc, head_dim, heads, capacity, 3);
+
+        std::printf("test-rerot-q-prep: CPU op edge cases (active=0, active=cap, non-contig) passed.\n");
+    }
+
+    // Multi-head test (heads=4, head_dim=16)
+    {
+        const int64_t mh_head_dim = 16;
+        const int64_t mh_heads    = 4;
+        std::vector<float> mh_q_raw(size_t(mh_head_dim) * mh_heads * n_tokens, 0.5f);
+        llama_rerot_q_prep_contract c_mh = c;
+        c_mh.head_dim = mh_head_dim;
+        c_mh.heads    = mh_heads;
+        c_mh.n_rot    = 16;
+        const auto ref_mh = llama_rerot_q_prep_reference(
+            mh_q_raw.data(), q_indices.data(), q_pos.data(), c_mh);
+        std::vector<float> cpu_mh = run_q_prep_graph(
+            cpu_backend, mh_q_raw, q_indices, q_pos,
+            mh_head_dim, mh_heads, n_tokens, capacity, active,
+            16, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, nullptr);
+        compare_to_reference(cpu_mh, ref_mh, mh_head_dim, mh_heads, capacity, active);
+    }
+
     // GPU path: env-gated skip unless LLAMA_REROT_GPU_Q_PREP=1 and device present.
     const char * gpu_env = std::getenv("LLAMA_REROT_GPU_Q_PREP");
     const bool want_gpu = gpu_env && std::strcmp(gpu_env, "1") == 0;
@@ -213,6 +271,34 @@ int main() {
                 head_dim, heads, n_tokens, capacity, active,
                 n_rot, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, nullptr);
             compare_to_reference(vk_out, ref, head_dim, heads, capacity, active);
+
+            // GPU edge cases
+            {
+                // active == 0
+                llama_rerot_q_prep_contract c_zero = c;
+                c_zero.active = 0;
+                const auto ref_zero = llama_rerot_q_prep_reference(
+                    q_raw.data(), q_indices.data(), q_pos.data(), c_zero);
+                std::vector<float> vk_zero = run_q_prep_graph(
+                    vk, q_raw, q_indices, q_pos,
+                    head_dim, heads, n_tokens, capacity, /*active=*/0,
+                    n_rot, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, nullptr);
+                compare_to_reference(vk_zero, ref_zero, head_dim, heads, capacity, 0);
+
+                // active == capacity
+                llama_rerot_q_prep_contract c_full = c;
+                c_full.active = (int32_t) capacity;
+                const auto ref_full = llama_rerot_q_prep_reference(
+                    q_raw.data(), q_indices.data(), q_pos.data(), c_full);
+                std::vector<float> vk_full = run_q_prep_graph(
+                    vk, q_raw, q_indices, q_pos,
+                    head_dim, heads, n_tokens, capacity, /*active=*/(int32_t) capacity,
+                    n_rot, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, nullptr);
+                compare_to_reference(vk_full, ref_full, head_dim, heads, capacity, capacity);
+
+                std::printf("test-rerot-q-prep: Vulkan GPU edge cases (active=0, active=cap) passed.\n");
+            }
+
             std::printf("test-rerot-q-prep: Vulkan GPU op matches reference.\n");
             ggml_backend_free(vk);
         } else {

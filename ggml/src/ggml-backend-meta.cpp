@@ -3878,7 +3878,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         if (backend_ctx->predefined_valid &&
             backend_ctx->predefined_n_subgraphs == backend_ctx->n_subgraphs &&
             backend_ctx->predefined_uid == backend_ctx->uid) {
-            static const bool chain_timing_enabled = getenv("GGML_TP5_PROFILE") != nullptr;
+            static const bool chain_timing_enabled = [] {
+                const char * env = getenv("GGML_TP5_PROFILE");
+                return env && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
+            }();
             static int chain_hit_log = 0;
             bool chain_ok = false;
             if (chain_timing_enabled) {
@@ -3976,7 +3979,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             // One queue call per rank; owner retirement may wait once per chain,
             // never between individual compute/reduction stages.
-            static const bool chain_timing_enabled = getenv("GGML_TP5_PROFILE") != nullptr;
+            static const bool chain_timing_enabled = [] {
+                const char * env = getenv("GGML_TP5_PROFILE");
+                return env && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
+            }();
             static int        chain_hit_log = 0;
             bool              chain_ok;
             if (chain_timing_enabled) {

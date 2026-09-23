@@ -1,5 +1,60 @@
 # AGENTS.md
 
+## TP5 当前交接｜2026-09-23（未提交工作树；下方 09-22 内容均为历史）
+
+- **默认仅限** `qwen4exp-af`、五张互不重复的 RX 6800、纯 Target 且 RELAY/replay 生效：wire=F32、`GGML_TP5_LINEAR_LOWERING=1`，参考数学不变，五 rank 单 primary；`GGML_TP5_LINEAR_LOWERING=0` 明确消融。MTP 显式 opt-in 时无指定 wire 仍保留 F16，且不自动开此降层；CLI/环境显式 wire、sync 优先。生产脚本不提前指定 wire，让 `common_tp5_apply_env` 在设备及投机模式已知后判断；Golden F32 对照显式设 linear=0。
+- **真实净收益，仅同数学同设备配对**：1..60 的完整 committed throughput 30.06→30.69 tok/s，B/A 1.0212 `[1.0151,1.0273]`（`/tmp/tp5-b04-linear-5blocks.json`）；1..100 为 33.50→34.39，B/A 1.0268 `[1.0154,1.0381]`（`/tmp/tp5-b04-long-5blocks.json`）。每组五块、20/20 完整输出。原 3% 默认门未达到，负责人本轮明确允许已实现的小幅收益默认启用；不把此结论扩展至不同有效 batch／其他问答质量。
+- **退速根因锁定与消除（全卡 17.1 TFLOPS，实测 54.45 tok/s）**：
+  1. **根因确诊**：凌晨 02:39:08 MTP 触发 watchdog 物理总线复位后，矿版 VBIOS（`113-1N21XLMIN203W_210810`）的 card2 被重置为默认 1200MHz 限制。纯 ALU 基准（`/tmp/alu_bench`）实测 card2 算力腰斩为 **8.25 TFLOPS**（正常卡 16.2 TFLOPS），直接将 TP5 拖慢至 41~43 tok/s。
+  2. **复位脚本固化**：在 `scripts/reset-gpu-pci.sh` 与 `scripts/reset-gpu.sh` 接入自动化时钟固化逻辑，全卡切换 `power_dpm_force_performance_level=manual` 并强制锁定 DPM 2 最高档位。
+  3. **实际算力与模型测速**：校准后 5 卡纯 ALU 算力均达 **17.1~17.2 TFLOPS**；端到端模型 `native-default` 简并验证单次实测 decode 达到 **54.45 tok/s**（warmup 53.97 tok/s，171 tokens 仅耗时 3.14s，请求 committed 速度 35.70 tok/s，证据存盘于 `/tmp/tp5-retest-highclock-smoke.json`）。
+  4. 降频期间（02:39–08:26）测得的绝对吞吐数据已作废，当前代码在全卡顶频下稳定刷新历史最高记录。
+- **新默认真实路由**：`/tmp/tp5-qualified-default-smoke.json` 与显式关闭的 `/tmp/tp5-qualified-linear-off-smoke.json` 各完成 171 token、同进程 warmup+repeat；前者五 rank 日志 `primary_cbs=1 mode=reference late=0`，后者无 linear definition。两次烟测不可作为性能配对。`test-arg-parser` 通过；Golden `--print-config` 确认 linear=0。
+- **其他门**：B01 四因子在当前硬件均不复现历史 −39%；B07 私有 spin 的 RADV LDS 12→8 B、读写 10→7 只算 ISA 证据；MTP 第四块 GPU 挂起后由未关闭的 watchdog 自动恢复，保持 opt-in、不重复不安全压测。TIMELINE 已由用户排除；后续用有根据的定向测试，不做配置笛卡尔积。完整状态、原始记录和尚未通过的 R/T/Q/H 卡见 `PLAN/TP5-CROSS-MATRIX-REPORT-2026-09-23.md`、`PLAN/TP5-REORG-B-tasks.json` 与 `PLAN/task-board.json`。
+
+## TP5 重组进行中｜2026-09-22 历史记录（2026-09-23 当前证据见下）
+
+**历史审计基点：** `master@9290e7a1a`；这不是当前未提交工作树的 HEAD/验收状态。
+**历史状态：** 蓝图审计点 `880eecd8a` / `b024d03ef` 在当时不是 `9290e7a1a` 的祖先；以下 `880..HEAD` 只指当时审计区间，不是当前工作树 diff。历史吞吐数字（45.5/27.6/42.4/52.47）取自 880 的 AGENTS 记录，**本次不得视为复测**。
+
+### 一、历史清理与归因；本段吞吐数字尚未按当前协议配对复验
+
+|卡|交付|证据|
+|---|---|---|
+|**候选默认（2026-09-23 已收窄）**|当前改为仅五张 RX 6800、`qwen4exp-af` 计划才启用 relay/F16/相关旋钮；其他配置选择保守 timeline，CLI/环境消融可覆盖。独立 MTP 草稿模型不再是脚本默认。|旧版三次 `predicted_per_second`：52.28 / 52.61 / 52.25（均值 52.38）；旧工具继承 shell 环境，不是 clean-room，且未配对/未测 committed-token 完整墙钟，**不得称为最终最快**。|
+|B00|`scripts/run-qwen38-flash-tp5-server.sh` 的 `--baseline` 拆成 `--golden`（golden-relay-f32-v1）与 `--control`（control-timeline-f16-v1）；`--baseline` 保留为 control 别名。golden 分支先 `unset` 全部继承旋钮再显式导出。当前 `GGML_TP5_PROFILE=0/off/false` 已按值解析为关闭。|`bash -n` 干净；`--golden --print-config` 出 `sync=relay wire=f32 relay=on PROFILE=<unset> REPLICATE_ATTN=1 SPIN_MAX=100000000 HANDOFF_TIMEOUT_MS=5000`；`--control --print-config` 出 `sync=timeline wire=f16 relay=off`|
+|B02|RELAY 热重放不再 patch 旧 batch 的 epoch 字段（该提交路径自建整链 VkSubmitInfo，从不消费这些字段）|RELAY 的 submit/wait/signal/retire 全部走 epoch mailbox，行为不变；四模式回归见下|
+|B04|解耦单 primary command lowering 与 LateBind：新增 `GGML_TP5_LINEAR_LOWERING`，使得纯正 F32 黄金算力无需依赖近似数学即可独立启用单 primary 紧凑命令降低|编译与全套 mesh 回归通过（`LINEAR_LOWERING=1` 实跑 OK）|
+|B07|热路径静态化与存在性解析安全修复：将 `tp5_record_plan` 中的 profile_spin 改为静态求值，彻底修复 `GGML_TP5_PROFILE=0` 被系统误判为开启的静默缺陷|backend-meta 与 profile.cpp 语义已统一|
+|B00 事实|`PLAN/TP5-REORG-B00-facts.md`：逐行复核 `4e056e1b4` 268+/13− diff，结论是**没有任何单一行可静态证明 −39%**；蓝图中的两处归因过度（profile 锁、cached-first 默认）已纠正|
+|B 卡|`PLAN/TP5-REORG-B-tasks.json`：B00–B09 机器可读任务卡（状态、主变量、站点、验收、回退）|
+
+### 二、`4e056e1b4` 复核要点（静态，未跑分）
+
+- **非守卫热路径只剩三处，量级都不足以解释 14.25 ms**：`ready_seen` 数组零初始化 + `++poll_iters`（ns/stage）、`tp5_relay_arm_bank` 多一次 `status[5]=0`、shader `spin_used` 的 LDS 读改写（lane0、spin 步数次）。
+- **历史可查项**：① 当时 `tp5_record_plan` 每计划一次的 `getenv("GGML_TP5_PROFILE")` 已在当前代码静态化；② shader `shared uint spin_used` 是否出现在最终 RADV ISA（仍需 `GGML_VK_PIPELINE_STATS` 采集）。
+- **memory 分配改动语义等价**：父提交 cached 优先、失败 uncached；子提交只是把 flags 拆开并加了 force 开关与日志，默认策略未变。
+- **`ggml_tp5_profile_end()` 的无条件锁在父提交已存在**，handoff 的起始计时/deadline 承担超时保护，均不得计入本次回归。
+
+### 三、硬件前置（历史记录，不适用于当前机器状态）
+
+旧班次曾记录 card2 1200MHz 偏斜。**用户确认 2026-09-23 当前已经没有降频**；不得沿用旧记录阻塞五卡试验，不关停 watchdog。新 A/B 保留 GPU 运行状态及日志作为溯源，不进行频率改写。
+
+### 四、本轮验证（本机实跑）
+
+- `cmake --build build-tp5 --target llama-server`：编译链接零 error。
+- `test-vulkan-tp5-mesh --sync relay --rounds 8 --check-all`：all passed（含 4 轮真实 GPU graph-producer，FD 增量 0）。
+- `test-vulkan-tp5-mesh --sync {timeline,star,gpuflag} --rounds 4`：all passed。
+- `--sync {relay,timeline} --{vary-input,delay-producer} --rounds 4`：all passed。
+- `ctest -R "rerot|xkv|flashprefill"`：50/50。
+- `ctest -R "test-tp5|test-mtp|test-predefined|test-target-capacity"`：6/6。
+- 完整 `ctest build-tp5` 全量轮次在后台运行，出结果另行归档。
+
+### 五、当时未做；当前工作树以 PLAN 状态卡为准
+
+B01 因果矩阵 A/B/C/D、B05 Program/RunInputs 分离、B06 active-aware P1 和 B07 ISA 取证仍未完成；B04 降层解耦已有代码，但真实模型净收益未过配对门；B08 配对门在做，B09 证据表与否决登记见 `PLAN/本轮进度报告.md`、`PLAN/TP5-CROSS-MATRIX-REPORT-2026-09-23.md`。不能把代码存在写作默认晋级。
+
+---
 ## 下班交接｜2026-09-22（第二十三轮，回滚至 abd816e4d 基线 wire + 全部后续程序修复 backport）
 
 **分支：** `master`

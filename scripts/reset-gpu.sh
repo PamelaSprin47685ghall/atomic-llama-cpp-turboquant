@@ -37,6 +37,9 @@ if [ "$NEED_HARDWARE_RESET" -eq 1 ]; then
     echo "PCIe 硬件总线复位完成！"
 else
     echo "所有卡片状态已完全恢复至空闲基线 (busy=0%)，无需触发 PCIe 硬件复位。"
+    # 即使未触发硬件总线复位，也自动检查并确保各卡时钟正常
+    echo "正在确保各卡时钟频率未异常受限..."
+    sudo -n "$REPO/scripts/reset-gpu-pci.sh" check-clocks-only 2>/dev/null || true
 fi
 
 echo "=================================================="

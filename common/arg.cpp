@@ -3049,7 +3049,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--tp5-sync"}, "MODE",
-        "TP5 sync: host | syncfd | timeline | star | l3_star | relay | gpuflag (default: timeline)",
+        "TP5 sync: relay | timeline | star | l3_star | host | syncfd | gpuflag (default: auto; relay on five RX 6800 ranks)",
         [](common_params & params, const std::string & value) {
             params.tp5.enabled = true;
             if (value == "star" || value == "l3_star") {

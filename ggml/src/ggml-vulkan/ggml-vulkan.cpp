@@ -950,9 +950,6 @@ struct vk_device_struct {
     bool integer_dot_product;
     // NativeHC zone: shared DSL binding count (12 normally, 13 with HC q8).
     uint32_t descriptor_binding_count = MAX_PARAMETER_COUNT;
-    // 0: default, 1: force mmvq, -1: disable mmvq
-    int32_t mmvq_mode;
-
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
     uint32_t subgroup_max_size;
@@ -2779,6 +2776,9 @@ struct ggml_backend_vk_context {
     std::string name;
 
     vk_device device;
+    // Device discovery can precede TP5 environment selection. Read the policy
+    // when this execution context is created, not when the physical GPU is probed.
+    int32_t mmvq_mode = 0; // 0: auto, 1: force, -1: disable
 
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
@@ -8768,15 +8768,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         const char * isolate_bo_env = getenv("GGML_TP5_ISOLATE_BO");
         const char * tp5_sync_env = getenv("GGML_TP5_SYNC");
         const bool is_star_mode = tp5_sync_env && (strcmp(tp5_sync_env, "star") == 0 || strcmp(tp5_sync_env, "l3_star") == 0);
-        const bool is_relay_mode = tp5_sync_env && strcmp(tp5_sync_env, "relay") == 0;
-        // RELAY's transport is descriptor-based and no longer needs BDA on
-        // imported host buffers.  That does NOT mean the entire Vulkan device
-        // should be created without BDA/descriptor-indexing: those are backend
-        // capabilities used by unrelated built-in kernels (and by derived
-        // coopmat2 paths).  TP5 isolation must stay local to TP5 resources and
-        // must never disable orthogonal device-wide optimizations.
-        // Under RELAY with ISOLATE_BO, BDA, descriptorIndexing, and coopmat2
-        // are cleanly disabled to allow RADV's nobolist to take effect.
+        // This is an explicit process-start, device-wide tradeoff, not a
+        // per-collective isolation toggle: BDA, descriptor indexing and CM2
+        // become unavailable to all graphs on the VkDevice. Never infer this
+        // setting from a late TP5 model-load decision.
         if (!is_star_mode && isolate_bo_env && atoi(isolate_bo_env) != 0) {
             if (device->architecture != AMD_RDNA2 || device->driver_id != vk::DriverId::eMesaRadv) {
                 GGML_ABORT("GGML_TP5_ISOLATE_BO requires RADV on RDNA2\n");
@@ -8977,13 +8972,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
                                  device->vendor_id != VK_VENDOR_ID_INTEL;
         device->partials_binding_alignment =
             std::max(4u, (uint32_t)device->properties.limits.minStorageBufferOffsetAlignment);
-
-        device->mmvq_mode = 0;
-        if (getenv("GGML_VK_DISABLE_MMVQ")) {
-            device->mmvq_mode = -1;
-        } else if (getenv("GGML_VK_FORCE_MMVQ")) {
-            device->mmvq_mode = 1;
-        }
 
         return device;
     }
@@ -9505,6 +9493,14 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->name = GGML_VK_NAME + std::to_string(idx);
 
     ctx->device = ggml_vk_get_device(idx);
+    const auto requested = [](const char * name) {
+        const char * value = getenv(name);
+        return value && strcmp(value, "0") != 0 && strcmp(value, "off") != 0 && strcmp(value, "false") != 0;
+    };
+    ctx->mmvq_mode = requested("GGML_VK_DISABLE_MMVQ") ? -1 :
+                     requested("GGML_VK_FORCE_MMVQ") ? 1 : 0;
+    fprintf(stderr, "[vulkan-mmvq-policy] backend=%s mode=%s\n", ctx->name.c_str(),
+            ctx->mmvq_mode < 0 ? "disabled" : ctx->mmvq_mode > 0 ? "forced" : "auto");
     {
         std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
         ctx->device->registered_contexts.push_back(ctx);
@@ -12028,7 +12024,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
 // Contraction policy, also used by MMVQ-capable fused regions. It selects an
 // arithmetic implementation, never whether a surrounding fusion is legal.
-static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_t n, uint32_t k, ggml_type src0_type) {
+static bool ggml_vk_should_use_mmvq(const ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, ggml_type src0_type) {
+    const vk_device & device = ctx->device;
     if (m == 0 || n == 0 || k == 0 || !device->integer_dot_product)
         return false;
     // Match the integer-dot variants actually emitted by vulkan-shaders-gen.
@@ -12046,9 +12043,9 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         default:
             return false;
     }
-    if (device->mmvq_mode == 1) {
+    if (ctx->mmvq_mode == 1) {
         return true;
-    } else if (device->mmvq_mode == -1) {
+    } else if (ctx->mmvq_mode == -1) {
         return false;
     }
     // q6_k only has 2-byte alignment which makes it somewhat problematic,
@@ -12295,7 +12292,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (mat_vec_cols * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, mat_vec_cols, ne10, src0->type);
+    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (mat_vec_cols * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx, ne01, mat_vec_cols, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -13462,7 +13459,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
+    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx, ne01, ne12, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -16444,7 +16441,7 @@ static void ggml_vk_segment_project(ggml_backend_vk_context * ctx,
     // replace its contraction without removing prep/state/cache/epilogue work.
     // The same choice composes with local-wire and direct-host output sinks.
     if (weights->type == GGML_TYPE_Q5_K && !extra && !b_override &&
-        ggml_vk_should_use_mmvq(ctx->device, m, 1, k, weights->type)) {
+        ggml_vk_should_use_mmvq(ctx, m, 1, k, weights->type)) {
         auto candidate = ggml_vk_get_dequantize_mul_mat_vec(ctx, weights->type, GGML_TYPE_Q8_1, 1, m, k);
         if (candidate && ggml_vk_region_q8_input(ctx, subctx, input, b_sub)) {
             contraction = candidate;
@@ -16885,11 +16882,11 @@ static void ggml_vk_attention_projections(ggml_backend_vk_context * ctx,
     const uint32_t groups = CEIL_DIV(pc.rows0, 2) + CEIL_DIV(pc.rows1, 2) + CEIL_DIV(pc.rows2, 2);
     uint32_t mmvq_mask = 0;
     if (ctx->device->integer_dot_product) {
-        if (ggml_vk_should_use_mmvq(ctx->device, pc.rows0, 1, pc.width, GGML_TYPE_Q5_K))
+        if (ggml_vk_should_use_mmvq(ctx, pc.rows0, 1, pc.width, GGML_TYPE_Q5_K))
             mmvq_mask |= 1u;
-        if (!qsa && ggml_vk_should_use_mmvq(ctx->device, pc.rows1, 1, pc.width, GGML_TYPE_Q5_K))
+        if (!qsa && ggml_vk_should_use_mmvq(ctx, pc.rows1, 1, pc.width, GGML_TYPE_Q5_K))
             mmvq_mask |= 2u;
-        if (ggml_vk_should_use_mmvq(ctx->device, qsa ? pc.rows1 : pc.rows2, 1, pc.width, GGML_TYPE_Q6_K))
+        if (ggml_vk_should_use_mmvq(ctx, qsa ? pc.rows1 : pc.rows2, 1, pc.width, GGML_TYPE_Q6_K))
             mmvq_mask |= 4u;
     }
     const auto report_policy = [&](uint32_t mask) {

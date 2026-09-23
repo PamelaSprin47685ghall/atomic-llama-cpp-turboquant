@@ -1,6 +1,7 @@
 #include "ggml-tp5-profile.h"
 
 #include <cstdlib>
+#include <cstring>
 
 const char * ggml_tp5_rerot_reject_reason_name(ggml_tp5_rerot_reject_reason reason) {
     switch (reason) {
@@ -175,7 +176,8 @@ ggml_tp5_profile * ggml_tp5_profile_active() {
 }
 
 void ggml_tp5_profile_begin(uint64_t exec_id, bool decode) {
-    if (!getenv("GGML_TP5_PROFILE")) {
+    const char * env = getenv("GGML_TP5_PROFILE");
+    if (!env || strcmp(env, "0") == 0 || strcmp(env, "off") == 0 || strcmp(env, "false") == 0) {
         return;
     }
     std::lock_guard<std::mutex> lock(g_prof_mu);
@@ -185,7 +187,9 @@ void ggml_tp5_profile_begin(uint64_t exec_id, bool decode) {
 
 void ggml_tp5_profile_end() {
     std::lock_guard<std::mutex> lock(g_prof_mu);
-    if (g_prof && getenv("GGML_TP5_PROFILE")) {
+    const char * env = getenv("GGML_TP5_PROFILE");
+    const bool env_active = env && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
+    if (g_prof && env_active) {
         g_prof->print_summary();
     }
     g_prof = nullptr;

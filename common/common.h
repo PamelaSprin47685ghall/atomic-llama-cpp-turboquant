@@ -642,8 +642,8 @@ struct common_params : wanxiangqi_common_params {
     struct common_params_tp5 {
         bool        enabled  = false;
         std::string plan     = "qwen4exp-af";
-        std::string wire     = "f16";      // f32 | f16
-        std::string sync     = "timeline"; // host | syncfd | timeline
+        std::string wire;                  // empty = f16 backend default; explicit CLI overrides env
+        std::string sync;                  // empty = hardware-qualified auto; explicit modes override it
         std::string collective = "mesh";
         std::string manifest;              // optional tp5-manifest.json path
         std::string trace;

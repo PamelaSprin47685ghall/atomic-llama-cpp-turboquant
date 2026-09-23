@@ -20,20 +20,32 @@
 # profile. It ignores production TP5_ARGS/EXTRA_ARGS and slot/cache settings,
 # logs the resolved command and provenance, and execs the server on stdout.
 # MODEL/BIN/HOST/PORT and explicitly supplied debug environment remain visible.
+#
+# Two mutually exclusive named recipes exist; neither inherits silently:
+#   --golden   golden-relay-f32-v1     SYNC=relay WIRE=f32 RELAY=on (+ golden env)
+#   --control  control-timeline-f16-v1  SYNC=timeline WIRE=f16 RELAY=off (old --baseline)
+# The golden recipe fixes the historical F32 route identity; its old decode
+# numbers are not current paired, committed-token acceptance evidence.
 
 set -euo pipefail
 
 BASELINE=0
+GOLDEN=0
 PRINT_CONFIG=0
 for arg in "$@"; do
     case "$arg" in
-        --baseline) BASELINE=1 ;;
+        # --baseline is kept as an alias of the historical timeline/f16
+        # control recipe (control-timeline-f16-v1). --golden selects the
+        # documented golden workload (golden-relay-f32-v1). The two names
+        # must never silently share one configuration.
+        --baseline|--control) BASELINE=1 ;;
+        --golden) BASELINE=1; GOLDEN=1 ;;
         --print-config) PRINT_CONFIG=1 ;;
-        *) printf 'Unknown option: %s\nUsage: %s [--baseline [--print-config]]\n' "$arg" "$0" >&2; exit 2 ;;
+        *) printf 'Unknown option: %s\nUsage: %s [--golden|--control] [--print-config]\n' "$arg" "$0" >&2; exit 2 ;;
     esac
 done
 if [ "$PRINT_CONFIG" -eq 1 ] && [ "$BASELINE" -eq 0 ]; then
-    printf '%s\n' '--print-config requires --baseline' >&2
+    printf '%s\n' '--print-config requires --golden or --control' >&2
     exit 2
 fi
 
@@ -50,14 +62,16 @@ KV_SIZE=${KV_SIZE:-1441792}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 
 export GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=${GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM:-1}
-# CLI --tp5* flags (common_tp5_apply_env) override these when passed on the command line.
-export GGML_TP5_WIRE=${GGML_TP5_WIRE:-f16}
-export GGML_TP5_SYNC=${GGML_TP5_SYNC:-timeline}
+# common_tp5_apply_env chooses the wire after it knows the device set and
+# whether speculation is active. An explicit CLI or inherited wire still wins.
+export GGML_TP5_SYNC=${GGML_TP5_SYNC:-relay}
 export GGML_TP5_MERGE_SUBMIT=${GGML_TP5_MERGE_SUBMIT:-1}
-export GGML_TP5_RELAY=${GGML_TP5_RELAY:-off}
+export GGML_TP5_RELAY=${GGML_TP5_RELAY:-on}
 export GGML_VK_CMD_REPLAY=${GGML_VK_CMD_REPLAY:-1}
 export GGML_VK_ALLOW_GRAPHICS_QUEUE=${GGML_VK_ALLOW_GRAPHICS_QUEUE:-1}
-TP5_ARGS=${TP5_ARGS:---tp5 qwen4exp-af --tp5-wire f16 --tp5-sync timeline -md "$MTP_MODEL" --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0}
+# MTP requires a separate draft model and a measured committed-token gain;
+# opt in via TP5_ARGS rather than silently enabling speculation for everyone.
+TP5_ARGS=${TP5_ARGS:---tp5 qwen4exp-af}
 
 say() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
@@ -66,23 +80,66 @@ if [ "$BASELINE" -eq 1 ]; then
     # empty RADV_DEBUG is retained for controlled comparisons, not silently fixed.
     export RADV_DEBUG=${RADV_DEBUG-nobolist}
     export GGML_TP5_ISOLATE_BO=${GGML_TP5_ISOLATE_BO:-1}
-    # Do not silently disable a backend optimization in the canonical
-    # baseline. MMVQ "auto" now composes with Qwen region fusion; explicit
-    # GGML_VK_DISABLE_MMVQ=1 / GGML_VK_FORCE_MMVQ=1 remain diagnostic A/Bs.
     export GGML_TP5_CMD_REPLAY=${GGML_TP5_CMD_REPLAY:-1}
-    export GGML_TP5_WIRE=f16 GGML_TP5_SYNC=timeline GGML_TP5_RELAY=off
+    if [ "$GOLDEN" -eq 1 ]; then
+        # golden-relay-f32-v1. Inherited values would silently produce a
+        # different experiment, so every knob the recipe controls is unset
+        # first. GGML_TP5_PROFILE now parses 0/off/false as disabled, but a
+        # golden run must not inherit an enabled profile from the shell.
+        unset GGML_TP5_WIRE GGML_TP5_SYNC GGML_TP5_RELAY GGML_TP5_MERGE_SUBMIT
+        unset GGML_TP5_CHAIN_CACHE GGML_TP5_SPIN_MAX GGML_TP5_REPLICATE_ATTN
+        unset GGML_TP5_RELAY_HANDOFF_TIMEOUT_MS GGML_TP5_PROFILE_RELAY_STAGES
+        unset GGML_VK_DISABLE_PRODUCER_WIRE GGML_VK_DISABLE_MMVQ GGML_VK_FORCE_MMVQ
+        unset GGML_VK_CMD_REPLAY GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM
+        unset GGML_VK_ALLOW_GRAPHICS_QUEUE GGML_TP5_GPU_TIMING GGML_TP5_PROFILE
+        unset GGML_TP5_LATEBIND GGML_TP5_LATEBIND_EXACT_Q GGML_TP5_LATEBIND_FUSED_FINALIZE
+        unset GGML_TP5_P1A_NOSIDECAR_Q8 GGML_TP5_RELAY_FORCE_UNCACHED GGML_TP5_LINEAR_LOWERING
+        export GGML_TP5_WIRE=f32
+        export GGML_TP5_SYNC=relay
+        export GGML_TP5_RELAY=on
+        export GGML_TP5_MERGE_SUBMIT=1
+        export GGML_TP5_CHAIN_CACHE=1
+        export GGML_TP5_SPIN_MAX=100000000
+        export GGML_TP5_REPLICATE_ATTN=1
+        export GGML_TP5_RELAY_HANDOFF_TIMEOUT_MS=5000
+        export GGML_VK_DISABLE_PRODUCER_WIRE=1
+        export GGML_VK_DISABLE_MMVQ=1
+        export GGML_VK_CMD_REPLAY=1
+        # Preserve the historical F32 control when the qualified default
+        # selects linear lowering; this recipe is the explicit ablation.
+        export GGML_TP5_LINEAR_LOWERING=0
+        export GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1
+        export GGML_VK_ALLOW_GRAPHICS_QUEUE=1
+    else
+        # control-timeline-f16-v1 (historical --baseline configuration).
+        export GGML_TP5_WIRE=f16 GGML_TP5_SYNC=timeline GGML_TP5_RELAY=off
+    fi
     BIN=$(realpath -e "$BIN")
     BIN_DIR=$(dirname "$BIN")
     export LD_LIBRARY_PATH="$BIN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    baseline_cmd=("$BIN" -m "$MODEL" -dev Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4
-        --split-mode tensor --fit off --tp5 qwen4exp-af --tp5-sync timeline --tp5-wire f16
+    if [ "$GOLDEN" -eq 1 ]; then
+        baseline_cmd=("$BIN" -m "$MODEL" -dev Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4
+            --split-mode tensor --fit off --tp5 qwen4exp-af --tp5-sync relay --tp5-wire f32
         -ngl 999 -c 256 -b 32 -ub 32 --no-mmap --no-host --spec-type none -np 1
         --host "$HOST" --port "$PORT")
-    say 'PROFILE=pure-tp-baseline; production TP5_ARGS/EXTRA_ARGS/slot/cache overrides are not used'
+        say 'RECIPE=golden-relay-f32-v1 (historical route identity, not current performance acceptance)'
+    else
+        baseline_cmd=("$BIN" -m "$MODEL" -dev Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4
+            --split-mode tensor --fit off --tp5 qwen4exp-af --tp5-sync timeline --tp5-wire f16
+        -ngl 999 -c 256 -b 32 -ub 32 --no-mmap --no-host --spec-type none -np 1
+        --host "$HOST" --port "$PORT")
+        say 'RECIPE=control-timeline-f16-v1 (alias --baseline; NOT the golden workload)'
+    fi
+    # The environment dump below is the effective/requested audit trail:
+    # compare it byte-for-byte between paired runs before trusting any delta.
+    say 'production TP5_ARGS/EXTRA_ARGS/slot/cache overrides are not used'
     printf 'command:'; printf ' %q' "${baseline_cmd[@]}"; printf '\n'
     for key in RADV_DEBUG GGML_TP5_ISOLATE_BO GGML_TP5_SYNC GGML_TP5_WIRE GGML_TP5_RELAY \
         GGML_VK_CMD_REPLAY GGML_TP5_CMD_REPLAY GGML_VK_DISABLE_MMVQ GGML_VK_FORCE_MMVQ \
         GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM GGML_VK_ALLOW_GRAPHICS_QUEUE \
+        GGML_TP5_REPLICATE_ATTN GGML_TP5_SPIN_MAX GGML_TP5_RELAY_HANDOFF_TIMEOUT_MS \
+        GGML_TP5_PROFILE_RELAY_STAGES GGML_TP5_GPU_TIMING GGML_TP5_P1A_NOSIDECAR_Q8 \
+        GGML_TP5_LATEBIND GGML_TP5_RELAY_FORCE_UNCACHED GGML_TP5_LINEAR_LOWERING \
         GGML_VK_DISABLE_HC_SUM GGML_VK_DISABLE_PRODUCER_WIRE GGML_VK_DISABLE_ATTENTION_COMPACT \
         GGML_TP5_CHAIN_CACHE GGML_TP5_SHARE_P1 GGML_TP5_PROFILE GGML_VK_PERF_LOGGER \
         GGML_VK_HC_DOWN_WG GGML_VK_HC_UP_R320 GGML_VK_HC_DOT GGML_VK_MOE_DOWN_K128 \

@@ -1,0 +1,153 @@
+{
+  "schema": "tp5-reorg/task-cards@2",
+  "audit": {
+    "source_commit": "9290e7a1a",
+    "blueprint_audit_commit": "880eecd8a",
+    "blueprint_audit_commit_in_history": false,
+    "blueprint_code_commit": "b024d03ef",
+    "blueprint_code_commit_in_history": false,
+    "tp5_collective_churn_880_to_head": 0
+  },
+  "gates": {
+    "noninferiority_ratio_lower_bound": 0.99,
+    "default_promotion_median_gain_min": 0.03,
+    "profiler_off_vs_no_trace_build_budget": 0.01,
+    "min_paired_blocks": 5
+  },
+  "tasks": [
+    {
+      "id": "B00",
+      "title": "Baseline contract: golden/control recipes + effective-config audit",
+      "status": "implemented-this-shift",
+      "primary_variable": "recipe identity (golden-relay-f32-v1 vs control-timeline-f16-v1)",
+      "changed_files": ["scripts/run-qwen38-flash-tp5-server.sh", "PLAN/TP5-REORG-B00-facts.md"],
+      "deliverables": [
+        "--golden / --control flags; --baseline stays an alias of control",
+        "golden recipe clears inherited knobs, then explicitly disables linear lowering to preserve its historical F32 control; GGML_TP5_PROFILE treats 0/off/false as disabled",
+        "CLI and env dump extend to all golden-controlled knobs"
+      ],
+      "acceptance": [
+        "bash -n clean",
+        "--golden --print-config shows sync=relay wire=f32 relay=on PROFILE=<unset>",
+        "--control --print-config shows sync=timeline wire=f16 relay=off",
+        "no GPU run required (config-only change)"
+      ],
+      "rollback": "revert two-file diff; --baseline behavior unchanged"
+    },
+    {
+      "id": "B01",
+      "title": "Causal split of 4e056e1b4 host x GPU observation code",
+      "status": "measured-current-hardware-regression-not-reproduced",
+      "primary_variable": "host observation impl present/absent x GPU spin capture present/absent (A/B/C/D)",
+      "changed_files": [],
+      "factor_matrix": {
+        "A": "parent b36e47359 (host absent, shader absent)",
+        "B": "parent plus child host/profile files (host present, shader absent)",
+        "C": "parent plus child relay-copy shader (host absent, shader present)",
+        "D": "child 4e056e1b4 (host present, shader present)"
+      },
+      "factor_source_proof": "Three host/profile files in B are SHA256-identical to D, three host/profile files in C are SHA256-identical to A, shader in B equals A, shader in C equals D; four RelWithDebInfo Vulkan llama-server binaries built using identical CMake flags and ccache; CMake-generated relay shader SPIR-V A=B and C=D bit-for-bit",
+      "isa_evidence": "nm/objdump tp5_record_plan getenv@plt callsites A=2 B=3 (one new GGML_TP5_PROFILE call); RADV compiled A/C relay shader without dispatch: shared_size=4/8 B, LDS operations 4/6, raw logs /tmp/tp5-b01-isa-{parent,shader}.log",
+      "blocked_on": [],
+      "paired_result": {
+        "metric": "171 committed output tokens / full HTTP request wall; exact 1..60, natural stop, relay F32, isolated process per trial",
+        "trials_per_comparison": 20,
+        "complete_abba_blocks_per_comparison": 5,
+        "parent_to_child": { "ratio": 1.001821, "ci95": [0.995667, 1.007975], "artifact": "/tmp/tp5-b01-parent-child-5blocks.json" },
+        "parent_to_host_only": { "ratio": 1.000282, "ci95": [0.990541, 1.010022], "artifact": "/tmp/tp5-b01-host-effect-5blocks.json" },
+        "parent_to_shader_only": { "ratio": 1.003570, "ci95": [0.994583, 1.012558], "artifact": "/tmp/tp5-b01-shader-effect-5blocks.json" },
+        "interaction_point_ratio": 0.997976,
+        "conclusion": "Neither complete child nor isolated factor reproduces historical -39% on this current machine and full-request metric; interaction point estimate is not an independent significance test. Old throughput remains historical, not code-causally attributed. All four variants passed exact-output smoke; fault-injection semantics were checked in the source diff, not separately GPU-injected."
+      },
+      "deliverables": [
+        "isolated parent/child worktrees, same toolchain and golden recipe",
+        "variant matrix A/B/C/D with both directions (strip-from-child, add-to-parent)",
+        "CPU ISA of record_plan getenv sites; RADV ISA of tp5_relay_copy_f32.spin_used"
+      ],
+      "acceptance": [
+        "recovery or explicit interaction-effect statement",
+        "narrow diff, not 'suspect the profiler'",
+        "sticky error/deadline/abort/drain/generation/bank-credit preserved in every variant"
+      ]
+    },
+    {
+      "id": "B02",
+      "title": "Remove RELAY dead batch epoch metadata patching",
+      "status": "implemented-this-shift",
+      "primary_variable": "warm-path patch loop executed vs skipped under RELAY",
+      "changed_files": ["ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp"],
+      "mechanism": "tp5_relay_submit_epoch_chain resubmits scratch.compute as its own per-rank VkSubmitInfo; per-batch wait/signal fields are never consumed",
+      "acceptance": [
+        "RELAY submit path, waits, signals, epoch retirement unchanged (mailbox-only)",
+        "non-RELAY timeline/star/gpuflag patch behavior byte-identical",
+        "mesh regression relay/timeline/star/gpuflag + vary-input + delay-producer pass",
+        "CPU suites tp5/mtp/predefined/target-capacity pass",
+        "rerot|xkv|flashprefill 50/50 pass"
+      ],
+      "rollback": "single-hunk revert of the sync_mode guard"
+    },
+    {
+      "id": "B03",
+      "title": "AGENTS.md current-status record for this shift",
+      "status": "historical-record-present-current-audit-pending",
+      "changed_files": ["AGENTS.md"],
+      "acceptance": ["documents facts and currently verified tests without carrying forward the old downclock assertion"]
+    },
+    {
+      "id": "B04",
+      "title": "Decouple command lowering from LateBind (linear = relay && f32 only)",
+      "status": "user-approved-qualified-default-target-only-other-batches-unverified",
+      "primary_variable": "command organization change with identical math/wire",
+      "sites": [
+        "ggml-vulkan-collective.cpp::tp5_inline_lowering_enabled (one shared lowering predicate)",
+        "ggml-vulkan-collective.cpp::tp5_record_plan (P1/P2 tape capture)",
+        "ggml-vulkan-collective.cpp::ggml_backend_vk_tp5_prepare_graph (source graph capture)",
+        "ggml-vulkan-collective.cpp::tp5_relay_submit_epoch_chain (single-primary definition and submission)"
+      ],
+      "note": "Initial actual-model opt-in failed closed: source graph capture and P1/P2 tape capture were still gated on LateBind despite selecting linear lowering; both now use the RELAY/F32 lowering predicate. Matched F32/device/binary/DSO five-block trials: 1..60 30.06→30.69 committed tok/s, B/A 1.0212 [1.0151,1.0273] (/tmp/tp5-b04-linear-5blocks.json); 1..100 33.50→34.39, B/A 1.0268 [1.0154,1.0381] (/tmp/tp5-b04-long-5blocks.json); both 20/20 exact. Although these gains are below the original 3% promotion rule, the user explicitly approved defaulting this already implemented small improvement on 2026-09-23. Only qualified five-distinct-RX6800, target-only RELAY with working command replay defaults to F32 plus lowering. /tmp/tp5-qualified-default-smoke.json and /tmp/tp5-qualified-linear-off-smoke.json pass complete 171-token answers; all ranks log reference mode with primary_cbs=1 only in the default, opt-out env=0 preserves ordinary F32. Golden explicitly sets lowering=0; speculative MTP retains old wire default and remains opt-in. Different effective batches and other task quality are not performance-proven. Existing RELAY already submits one whole-chain VkSubmitInfo per rank: not a submit-count reduction."
+    },
+    {
+      "id": "B05",
+      "title": "Definition-time Program / RunInputs separation with structure generation",
+      "status": "blocked-on-child-generation-contract",
+      "primary_variable": "warm-chain work: full stage_key/stage_compute_cbs vector compare vs generation check",
+      "sites": ["ggml-vulkan-collective.cpp:7002-7008", "5376-5569"],
+      "unmeasured_cost": "stage_compute_cbs deep-compare is per-token O(n_stages x n_ranks); no measured wall-time attribution",
+      "safety_gate": "child Vulkan CB re-recording, scratch/buffer relocation, and direct collective callers must invalidate a definition generation before deep equality can be removed",
+      "current_decision": "keep deep equality and cached CB fingerprint checks; do not invent a child generation API solely to remove a cheap, unmeasured comparison. The backend-meta predefined UID fast path skips child CB lookup, while child validity depends on graph buffer fingerprints; a partial generation would make stale VkCommandBuffers more likely. No performance promotion without measured attribution and all-caller relocation/lifetime coverage."
+    },
+    {
+      "id": "B06",
+      "title": "Active-aware P1 transport or explicit rejection for active<capacity",
+      "status": "not-started",
+      "current_contract": "requires RELAY with every stage direct producer, else return false",
+      "site": "ggml-vulkan-collective.cpp:7218-7230",
+      "forbidden": "no forcing direct producer to fake capacity completion; no padding copy"
+    },
+    {
+      "id": "B07",
+      "title": "Hot-path getenv removal + lane-private shader spin observation",
+      "status": "implemented-static-env-and-private-spin-isa-verified-net-unmeasured",
+      "targets": [
+        "collective.cpp:3617 profile_spin getenv per plan record",
+        "collective.cpp:3924 profile_spin getenv per plan record",
+        "ggml-backend-meta.cpp:3881,3979 existence-parsed profile switch",
+        "ggml-tp5-profile.cpp:178,188 existence-parsed profile switch",
+        "tp5_relay_copy_f32 spin_used presence in final RADV ISA"
+      ],
+      "evidence": "PROFILE=0 vs PROFILE=1 five-card RELAY mesh passed on F16/F32 respectively, real graph producers 4 rounds each and FD delta zero. The spin count is used only in lane zero and now lives in a private local instead of WG shared memory; actual RADV pipeline ISA LDS 12->8 B, LDS read/write operations 10->7 (no dispatch during ISA collection), raw /tmp/tp5-relay-current-{before,after}-isa.log. No end-to-end improvement claimed from ISA size alone."
+    },
+    {
+      "id": "B08",
+      "title": "LateBind / MTP / multi-reader net-benefit gates at their own workloads",
+      "status": "heuristic-comparisons-complete-mtp-and-other-workloads-unverified",
+      "rule": "no same-numeric control -> no overlap claim; no committed-token wall clock -> no MTP claim; CPU microbenchmarks never offset pure-TP regression"
+    },
+    {
+      "id": "B09",
+      "title": "Rejected-implementation registry and single current-state table",
+      "status": "implemented-evidence-table-and-rejection-registry",
+      "evidence": ["PLAN/本轮进度报告.md:2026-09-23 当前树验收补记", "PLAN/TP5-CROSS-MATRIX-REPORT-2026-09-23.md:否决实施登记"]
+    }
+  ]
+}

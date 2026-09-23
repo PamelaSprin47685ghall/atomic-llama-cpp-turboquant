@@ -27,6 +27,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -406,11 +407,42 @@ void common_tp5_apply_env(const common_params & params) {
     if (!params.tp5.enabled) {
         return;
     }
+    const char * inherited_wire_env = getenv("GGML_TP5_WIRE");
+    const std::string inherited_wire = inherited_wire_env ? inherited_wire_env : "";
     if (!params.tp5.wire.empty()) {
         setenv("GGML_TP5_WIRE", params.tp5.wire.c_str(), 1);
     }
-    if (!params.tp5.sync.empty()) {
-        setenv("GGML_TP5_SYNC", params.tp5.sync.c_str(), 1);
+    // This measured recipe is specific to five RX 6800 ranks running the
+    // Qwen4EXP-AF plan. Unknown device sets keep the conservative timeline
+    // path; explicit CLI or environment choices remain authoritative.
+    // The parsed -dev list is null-terminated; the terminator is not a rank.
+    const bool qualified = params.tp5.plan == "qwen4exp-af" && params.devices.size() == 6 &&
+        params.devices.back() == nullptr &&
+        std::all_of(params.devices.begin(), params.devices.end() - 1, [&](ggml_backend_dev_t dev) {
+            if (!dev || std::count(params.devices.begin(), params.devices.end() - 1, dev) != 1) {
+                return false;
+            }
+            const char * description = ggml_backend_dev_description(dev);
+            if (!description) { return false; }
+            const std::string_view name(description);
+            constexpr std::string_view model = "Radeon RX 6800";
+            const size_t pos = name.find(model);
+            return pos != std::string_view::npos &&
+                   (pos + model.size() == name.size() || name.substr(pos + model.size(), 2) == " (");
+        });
+    const bool target_only = std::all_of(params.speculative.types.begin(), params.speculative.types.end(),
+        [](common_speculative_type type) { return type == COMMON_SPECULATIVE_TYPE_NONE; });
+    const char * inherited_sync_env = getenv("GGML_TP5_SYNC");
+    const std::string inherited_sync = inherited_sync_env ? inherited_sync_env : "";
+    const std::string effective_sync = !params.tp5.sync.empty() ? params.tp5.sync :
+        !inherited_sync.empty() ? inherited_sync : qualified ? "relay" : "timeline";
+    const char * reason = !params.tp5.sync.empty() ? "cli" :
+        !inherited_sync.empty() ? "environment" : qualified ? "qualified-5x-rx6800" : "conservative-default";
+    setenv("GGML_TP5_SYNC", effective_sync.c_str(), 1);
+    const std::string effective_wire = !params.tp5.wire.empty() ? params.tp5.wire :
+        !inherited_wire.empty() ? inherited_wire : qualified && target_only && effective_sync == "relay" ? "f32" : "f16";
+    if (qualified && target_only && effective_sync == "relay" && params.tp5.wire.empty() && inherited_wire.empty()) {
+        setenv("GGML_TP5_WIRE", "f32", 1);
     }
     if (!params.tp5.latebind.empty()) {
         if (params.tp5.latebind == "off") {
@@ -424,8 +456,34 @@ void common_tp5_apply_env(const common_params & params) {
             setenv("GGML_TP5_LATEBIND_EXACT_Q", "0", 1);
         }
     }
-    unsetenv("GGML_TP5_RELAY");
-    setenv("GGML_VK_CMD_REPLAY", params.tp5.cmd_replay ? "1" : "0", 1);
+    // Only options consumed after device discovery belong here. Queue family
+    // and VRAM allocation choices are fixed before -dev parsing finishes and
+    // cannot be changed by setenv at model load time.
+    if (qualified && effective_sync == "relay") {
+        for (const char * knob : { "GGML_TP5_REPLICATE_ATTN",
+                                   "GGML_VK_DISABLE_PRODUCER_WIRE", "GGML_VK_DISABLE_MMVQ" }) {
+            if (!getenv(knob)) {
+                setenv(knob, "1", 1);
+            }
+        }
+    }
+    if (!params.tp5.cmd_replay) {
+        setenv("GGML_TP5_CMD_REPLAY", "0", 1);
+        setenv("GGML_VK_CMD_REPLAY", "0", 1);
+    } else if (!getenv("GGML_TP5_CMD_REPLAY") && !getenv("GGML_VK_CMD_REPLAY")) {
+        setenv("GGML_VK_CMD_REPLAY", "1", 1);
+    }
+    const char * replay_env = getenv("GGML_TP5_CMD_REPLAY");
+    if (!replay_env) { replay_env = getenv("GGML_VK_CMD_REPLAY"); }
+    const std::string effective_replay = replay_env ? replay_env : "1";
+    // An inline primary needs Vulkan source-command capture. Keep direct
+    // collective callers and explicit replay-off configurations on their
+    // existing path; an explicit lowering value (including 0) always wins.
+    const char * vk_replay = getenv("GGML_VK_CMD_REPLAY");
+    if (qualified && target_only && effective_sync == "relay" && effective_wire == "f32" &&
+        vk_replay && atoi(vk_replay) != 0 && !getenv("GGML_TP5_LINEAR_LOWERING")) {
+        setenv("GGML_TP5_LINEAR_LOWERING", "1", 1);
+    }
     if (!params.tp5.manifest.empty()) {
         if (!std::filesystem::exists(params.tp5.manifest)) {
             throw std::runtime_error("TP5 manifest not found: " + params.tp5.manifest);
@@ -435,9 +493,13 @@ void common_tp5_apply_env(const common_params & params) {
     if (!params.tp5.trace.empty()) {
         setenv("GGML_TP5_TRACE", params.tp5.trace.c_str(), 1);
     }
-    LOG_INF("%s: TP5 enabled plan=%s wire=%s sync=%s replay=%d\n", __func__,
-            params.tp5.plan.c_str(), params.tp5.wire.c_str(), params.tp5.sync.c_str(),
-            (int) params.tp5.cmd_replay);
+    LOG_INF("%s: TP5 plan=%s wire requested=%s effective=%s sync requested=%s effective=%s reason=%s recipe=%s replay=%s\n", __func__,
+            params.tp5.plan.c_str(),
+            params.tp5.wire.empty() ? (inherited_wire.empty() ? "auto" : inherited_wire.c_str()) : params.tp5.wire.c_str(),
+            effective_wire.c_str(),
+            params.tp5.sync.empty() ? (inherited_sync.empty() ? "auto" : inherited_sync.c_str()) : params.tp5.sync.c_str(),
+            effective_sync.c_str(), reason, qualified ? "5x-rx6800-qwen4exp-af" : "none",
+            effective_replay.c_str());
 }
 
 void common_params_print_info(const common_params & params, bool print_devices) {

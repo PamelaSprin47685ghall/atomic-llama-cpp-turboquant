@@ -173,6 +173,11 @@ static inline std::pair<tp5_numerical_mode, tp5_numerical_reason> tp5_resolve_nu
 // Q-sidecar mailbox ABI (control/payload offsets, ready/counter words,
 // packed Q8 byte count) is defined once in ggml-vulkan-tp5-rows.h.
 
+static bool tp5_linear_lowering_requested() {
+    const char * env = getenv("GGML_TP5_LINEAR_LOWERING");
+    return env && (strcmp(env, "1") == 0 || strcmp(env, "on") == 0 || strcmp(env, "true") == 0);
+}
+
 static bool tp5_latebind_hc_enabled() {
     const char * env = getenv("GGML_TP5_LATEBIND");
     return env && (strcmp(env, "hc-down") == 0 || strcmp(env, "1") == 0 || strcmp(env, "on") == 0);
@@ -1171,6 +1176,13 @@ struct tp5_comm {
     }
 };
 
+// The source graph and P1/P2 tapes must be captured whenever the epoch chain
+// will lower them into a single primary, even without LateBind arithmetic.
+static bool tp5_inline_lowering_enabled(const tp5_comm & c) {
+    return c.sync_mode == tp5_sync_mode::RELAY && c.wire == tp5_wire_type::F32 &&
+           (tp5_latebind_hc_enabled() || tp5_linear_lowering_requested());
+}
+
 uint32_t find_memory_type(const VkPhysicalDeviceMemoryProperties & props,
                           uint32_t type_bits, VkMemoryPropertyFlags req) {
     for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
@@ -1478,9 +1490,17 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
         relay_ci.stage.module = relay_mod;
         relay_ci.stage.pName = "main";
         relay_ci.layout = r.relay_copy_layout;
+        const bool relay_stats = r.pipeline_stats &&
+            strstr("tp5_relay_copy_f32", r.pipeline_stats_filter) != nullptr;
+        if (relay_stats) {
+            relay_ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+        }
         ok = vkCreateComputePipelines(r.vkdev, VK_NULL_HANDLE, 1, &relay_ci, nullptr, &r.relay_copy_pipe) == VK_SUCCESS;
         vkDestroyShaderModule(r.vkdev, relay_mod, nullptr);
         if (!ok) return false;
+        if (relay_stats) {
+            tp5_print_pipeline_statistics(r.vkdev, r.relay_copy_pipe, "tp5_relay_copy_f32");
+        }
 
         VkDescriptorSetLayoutBinding p1b[2] = {
             {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -2380,7 +2400,9 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
                         bcast_ok = tp5_alloc_host_visible_buffer(r, total_bcast_size, r.bcast_buf[b], r.bcast_mem[b],
                                                                  &r.bcast_host[b], relay_uncached);
                     }
-                    if (bcast_ok && getenv("GGML_TP5_PROFILE")) {
+                    const char * profile = getenv("GGML_TP5_PROFILE");
+                    if (bcast_ok && profile && strcmp(profile, "0") != 0 && strcmp(profile, "off") != 0 &&
+                        strcmp(profile, "false") != 0) {
                         fprintf(stderr, "[tp5-relay-config] rank=%zu bank=%zu bcast_cache=%s\n",
                                 i, b, used_uncached ? "uncached" : "cached");
                     }
@@ -2795,8 +2817,7 @@ static void tp5_update_push_descriptor(tp5_comm & c, tp5_rank & r, size_t rank_i
 
 bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<tensor_dev_ref> & trefs,
                      size_t n_elems, VkDeviceSize flags_base) {
-    const bool define_inline = c.sync_mode == tp5_sync_mode::RELAY &&
-                                c.wire == tp5_wire_type::F32 && tp5_latebind_hc_enabled();
+    const bool define_inline = tp5_inline_lowering_enabled(c);
     plan.owners.clear();
     for (size_t i = 0; i < c.n_ranks; ++i) {
         if (trefs[i].owner)
@@ -3614,7 +3635,11 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
     }
 
     if (late_plan) {
-        const uint32_t profile_spin = getenv("GGML_TP5_PROFILE") ? 1u : 0u;
+        static const bool profile_spin_active = [] {
+            const char * env = getenv("GGML_TP5_PROFILE");
+            return env && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
+        }();
+        const uint32_t profile_spin = profile_spin_active ? 1u : 0u;
         (void) profile_spin;
         for (size_t i = 0; i < c.n_ranks; ++i) {
             tp5_rank & r = c.ranks[i];
@@ -3921,7 +3946,11 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
             if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
                 const size_t bcast_bytes = tensor_bytes; // CPU accumulation produces F32, regardless of wire type.
                 if (c.sync_mode == tp5_sync_mode::RELAY) {
-                    const uint32_t profile_spin = getenv("GGML_TP5_PROFILE") ? 1u : 0u;
+                    static const bool profile_spin_active = [] {
+                        const char * env = getenv("GGML_TP5_PROFILE");
+                        return env && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
+                    }();
+                    const uint32_t profile_spin = profile_spin_active ? 1u : 0u;
                     const auto record_relay_copy = [&]() {
                         VkDescriptorBufferInfo src_info{r.bcast_buf[b], 0, 64 + tensor_bytes};
                         VkDescriptorBufferInfo dst_info{trefs[i].buf, trefs[i].offset, tensor_bytes};
@@ -5515,7 +5544,7 @@ static bool tp5_relay_submit_epoch_chain(
     for (size_t i = 0; i < c.n_ranks; ++i) {
         auto & scratch = c.chain_scratch[i];
         const size_t min_collective_cbs = 2 * n_stages - n_direct_stages + n_late_stages;
-        const bool linear = c.wire == tp5_wire_type::F32 && tp5_latebind_hc_enabled();
+        const bool linear = tp5_inline_lowering_enabled(c);
         if ((linear ? scratch.compute.size() != 1 : scratch.compute.size() < min_collective_cbs) ||
             scratch.compute.size() > UINT32_MAX) {
             if (submitted_any) tp5_relay_request_abort(c);
@@ -6992,8 +7021,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     // is not a topology lock or a graph-validation bypass. RELAY needs the
     // same reusable full-chain layout to keep every P2 prequeued.
     const bool   allow_chain_cache = chain_cache_env == nullptr || atoi(chain_cache_env) != 0;
-    const bool linear = c.sync_mode == tp5_sync_mode::RELAY && c.wire == tp5_wire_type::F32 &&
-                        tp5_latebind_hc_enabled();
+    const bool linear = tp5_inline_lowering_enabled(c);
     if (!linear && n_late_stages > 0) {
         c.fail("LateBind stage requested in non-linear submit_epoch_chain; LateBind requires RELAY F32 linear program lowering");
         return false;
@@ -7029,6 +7057,14 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
         // Warm path: patch only epoch values
         for (size_t i = 0; i < c.n_ranks; ++i) {
             auto & scratch = c.chain_scratch[i];
+            if (c.sync_mode == tp5_sync_mode::RELAY) {
+                // RELAY ignores these per-batch submit fields: its submission
+                // path resubmits the whole chain from scratch.compute with a
+                // per-rank VkSubmitInfo of its own and carries every changing
+                // dependency in the epoch mailbox. Patching here would be
+                // dead metadata work on the hot path.
+                continue;
+            }
             for (size_t s = 0; s < n_stages; ++s) {
                 const uint64_t epoch = c.allreduce_calls + s + 1;
                 if (isolate_bo && s > 0) {
@@ -7362,6 +7398,27 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     const char * wire_env = getenv("GGML_TP5_WIRE");
     c->wire = (wire_env && strcmp(wire_env, "f32") == 0) ? tp5_wire_type::F32 : tp5_wire_type::F16;
 
+    bool five_rx6800 = n == 5;
+    for (size_t i = 0; five_rx6800 && i < n; ++i) {
+        vk_device device = ggml_vk_tp5_backend_device(backends[i]);
+        if (!device) {
+            five_rx6800 = false;
+            break;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            vk_device previous = ggml_vk_tp5_backend_device(backends[j]);
+            if (previous && ggml_vk_tp5_vk_physical_device(previous) == ggml_vk_tp5_vk_physical_device(device)) {
+                five_rx6800 = false;
+                break;
+            }
+        }
+        if (!five_rx6800) break;
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties((VkPhysicalDevice) ggml_vk_tp5_vk_physical_device(device), &props);
+        const char * name = strstr(props.deviceName, "Radeon RX 6800");
+        five_rx6800 = props.vendorID == 0x1002 && name &&
+                      (name[14] == '\0' || (name[14] == ' ' && name[15] == '('));
+    }
     const char * sync_env = getenv("GGML_TP5_SYNC");
     if (sync_env && (strcmp(sync_env, "star") == 0 || strcmp(sync_env, "l3_star") == 0)) {
         c->sync_mode = tp5_sync_mode::STAR;
@@ -7379,7 +7436,9 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
         fprintf(stderr, "ggml-vulkan-collective: sync mode 'gpuflag' is experimental and unsafe under current driver memory model; falling back to timeline\n");
         c->sync_mode = tp5_sync_mode::TIMELINE;
     } else {
-        c->sync_mode = (n == 5) ? tp5_sync_mode::STAR : tp5_sync_mode::TIMELINE;
+        // The measured RELAY recipe is restricted to the five RX 6800 ranks;
+        // other device sets retain the conservative timeline default.
+        c->sync_mode = five_rx6800 ? tp5_sync_mode::RELAY : tp5_sync_mode::TIMELINE;
     }
 
     const char * replay_env = getenv("GGML_TP5_CMD_REPLAY");
@@ -7924,7 +7983,10 @@ bool ggml_backend_vk_tp5_prepare_graph(void * comm, size_t rank, ggml_cgraph * g
         (reduce && stage >= tp5_comm::MAX_OUTSTANDING_EPOCHS))
         return false;
 
-    static const bool disable_producer_wire = (getenv("GGML_VK_DISABLE_PRODUCER_WIRE") != nullptr);
+    static const bool disable_producer_wire = [] {
+        const char * value = getenv("GGML_VK_DISABLE_PRODUCER_WIRE");
+        return value && strcmp(value, "0") != 0 && strcmp(value, "off") != 0 && strcmp(value, "false") != 0;
+    }();
     // Direct writes from a large terminal GEMV/MoE producer into imported host
     // memory are deliberately not the automatic RELAY policy.  On discrete
     // GPUs that couples the producer's critical path to scalar/coherent system
@@ -7943,8 +8005,9 @@ bool ggml_backend_vk_tp5_prepare_graph(void * comm, size_t rank, ggml_cgraph * g
     uint32_t predefined_active = 0, predefined_capacity = 0;
     const bool predefined_definition =
         ggml_vk_tp5_predefined_rows(c->backends[rank], &predefined_active, &predefined_capacity);
-    const bool define_program = c->sync_mode == tp5_sync_mode::RELAY && c->wire == tp5_wire_type::F32 &&
-                                (tp5_latebind_hc_enabled() || predefined_definition);
+    const bool define_program = tp5_inline_lowering_enabled(*c) ||
+                                (c->sync_mode == tp5_sync_mode::RELAY && c->wire == tp5_wire_type::F32 &&
+                                 predefined_definition);
     if (define_program && tp5_latebind_fused_finalize_enabled()) {
         c->fail("GGML_TP5_LATEBIND_FUSED_FINALIZE is incompatible with independent y/Q generations; unset it");
         return false;
