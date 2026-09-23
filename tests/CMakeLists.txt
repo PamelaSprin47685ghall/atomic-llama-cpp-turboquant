@@ -249,11 +249,23 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-rerot-model-single.cpp)
     llama_build(test-rerot-model-permute.cpp)
     llama_build(test-native-determinism.cpp)
-    llama_build_and_test(test-rerot-parser.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp)
+    llama_build_and_test(test-rerot-parser.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap.cpp)
+    # MM-R1 mindmap wire parser (strict incremental parser, no llama deps)
+    llama_build_and_test(test-rerot-mindmap-parser.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap.cpp)
+    target_include_directories(test-rerot-mindmap-parser PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    # MM-R1 G1 incremental sampler (protocol mask) + strict-parser oracle
+    llama_build_and_test(test-rerot-mindmap-sampler.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap-sampler.cpp)
+    target_include_directories(test-rerot-mindmap-sampler PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_include_directories(test-rerot-parser PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
-    llama_build_and_test(test-rerot-runtime.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp)
+    llama_build_and_test(test-rerot-runtime.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap.cpp)
     target_include_directories(test-rerot-runtime PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server
@@ -285,7 +297,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # test-flashprefill-state exercises the real RERoT runtime (chains B/E/G:
     # episode codec, context shift, pen suspend/resume) — same extra source
     # and include dir as test-rerot-runtime.
-    target_sources(test-flashprefill-state PRIVATE ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp)
+    target_sources(test-flashprefill-state PRIVATE
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap.cpp)
     target_include_directories(test-flashprefill-state PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     llama_build_and_test(test-xkv-memory-model.cpp)
     target_include_directories(test-xkv-memory-model PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -529,6 +543,9 @@ set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# G2 indent-aware GBNF extension (opt-in; the plain grammar path is unchanged)
+llama_build_and_test(test-grammar-indent.cpp)
+target_include_directories(test-grammar-indent PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately

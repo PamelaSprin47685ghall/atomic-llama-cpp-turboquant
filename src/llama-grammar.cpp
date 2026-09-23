@@ -261,6 +261,8 @@ static void print_rule_binary(FILE * file, const llama_grammar_rule & rule) {
             case LLAMA_GRETYPE_CHAR_ANY:       fprintf(file, "CHAR_ANY");       break;
             case LLAMA_GRETYPE_TOKEN:          fprintf(file, "TOKEN");          break;
             case LLAMA_GRETYPE_TOKEN_NOT:      fprintf(file, "TOKEN_NOT");      break;
+            case LLAMA_GRETYPE_INDENT:         fprintf(file, "INDENT");         break;
+            case LLAMA_GRETYPE_DEDENT:         fprintf(file, "DEDENT");         break;
         }
         switch (elem.type) {
             case LLAMA_GRETYPE_END:
@@ -582,6 +584,23 @@ const char * llama_grammar_parser::parse_sequence(
             n_prev_rules = 1;
             rule.push_back({type, token_pair.first});
             pos = parse_space(token_end, is_nested);
+        } else if (*pos == '%') {
+            // G2 indent-aware lexical events. These are NOT terminals in the
+            // character sense: they are placeholders that only make sense with
+            // the indent lexer enabled, so they are recorded as elements and
+            // rejected at apply time if the lexer is off.
+            const char * name_end = parse_name(pos + 1);
+            const std::string name(pos, name_end - pos);
+            if (name == "%indent") {
+                rule.push_back({LLAMA_GRETYPE_INDENT, 0});
+            } else if (name == "%dedent") {
+                rule.push_back({LLAMA_GRETYPE_DEDENT, 0});
+            } else {
+                throw std::runtime_error(std::string("unknown grammar directive: ") + name);
+            }
+            pos = parse_space(name_end, is_nested);
+            last_sym_start = rule.size();
+            n_prev_rules = 1;
         } else if (is_word_char(*pos)) { // rule reference
             const char * name_end    = parse_name(pos);
             uint32_t ref_rule_id = get_symbol_id(pos, name_end - pos);
@@ -919,6 +938,11 @@ static void llama_grammar_advance_stack(
         case LLAMA_GRETYPE_CHAR_ANY:
         case LLAMA_GRETYPE_TOKEN:
         case LLAMA_GRETYPE_TOKEN_NOT:
+        // G2 indent events are terminals of the same shape: the lexer produces
+        // them and the PDA consumes them without touching the stack beyond the
+        // ordinary advance.
+        case LLAMA_GRETYPE_INDENT:
+        case LLAMA_GRETYPE_DEDENT:
             if (std::find(new_stacks.begin(), new_stacks.end(), curr_stack) == new_stacks.end()) {
                 // only add the stack if it's not a duplicate of one we already have
                 new_stacks.emplace_back(std::move(curr_stack));
@@ -1201,6 +1225,7 @@ struct llama_grammar * llama_grammar_init_impl(
         /* .trigger_buffer_positions = */ {},
         /* .trigger_tokens = */           {},
         /* .trigger_patterns = */         {},
+        /* .indent_lexer = */             false,
     };
 }
 
@@ -1242,6 +1267,23 @@ struct llama_grammar * llama_grammar_init_impl(
             vec_rules[i].push_back(*pos);
         }
         vec_rules[i].push_back({LLAMA_GRETYPE_END, 0});
+    }
+
+    // G2: the indent lexer is enabled only when the parsed grammar actually
+    // references an indent event. Scanning the already-parsed rules (rather
+    // than the source text) means an ordinary grammar that merely mentions a
+    // percent sign cannot accidentally enable it.
+    bool indent_lexer = false;
+    for (const auto & rule : vec_rules) {
+        for (const auto & elem : rule) {
+            if (elem.type == LLAMA_GRETYPE_INDENT || elem.type == LLAMA_GRETYPE_DEDENT) {
+                indent_lexer = true;
+                break;
+            }
+        }
+        if (indent_lexer) {
+            break;
+        }
     }
 
     // Check for left recursion
@@ -1307,6 +1349,7 @@ struct llama_grammar * llama_grammar_init_impl(
         /* .trigger_buffer_positions = */ {},
         std::move(vec_trigger_tokens),
         std::move(vec_trigger_patterns),
+        /* .indent_lexer = */             indent_lexer,
     };
 }
 
@@ -1330,6 +1373,14 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
         grammar.trigger_buffer_positions,
         grammar.trigger_tokens,
         grammar.trigger_patterns,
+        // G2 lexer state: cloned by value so a cloned grammar continues lexing
+        // exactly where the original was.
+        grammar.indent_lexer,
+        grammar.indent_stack,
+        grammar.indent_pending_spaces,
+        grammar.indent_pending_tab,
+        grammar.indent_line_started,
+        grammar.indent_saw_byte,
     };
 
     // redirect elements in stacks to point to new rules
@@ -1448,6 +1499,152 @@ void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token
     }
 
     llama_grammar_accept_token(grammar, token, piece);
+}
+
+// ---------------------------------------------------------------------------
+// G2 indent-aware lexer (M12).
+//
+// Converts accepted bytes into the event stream the PDA consumes. The events
+// are produced in line with the ordinary scalars so a token carrying
+// "text\n  more" yields: 't','e','x','t', NEWLINE, INDENT, 'm','o','r','e'.
+//
+// Policy notes (deliberate, and pinned by tests):
+//   * A blank line yields NEWLINE only; the next non-empty line re-settles.
+//   * A TAB in the indentation run sets the column to 0, which a strict
+//     grammar rejects through the ordinary terminals.
+//   * A dedent to a column that was never opened is reported as
+//     DEDENT* + INDENT so the grammar can reject it: the lexer never silently
+//     rewrites the input.
+//   * End-of-input settles an unterminated final line.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+enum class indent_event_kind : uint8_t {
+    ch,
+    newline,
+    indent,
+    dedent,
+    eof,
+};
+
+struct indent_event {
+    indent_event_kind kind = indent_event_kind::ch;
+    uint32_t cp = 0;
+};
+
+void indent_settle(struct llama_grammar & g, std::vector<indent_event> & out) {
+    const uint32_t column = g.indent_pending_tab ? 0u : g.indent_pending_spaces;
+    if (g.indent_stack.empty() || column > g.indent_stack.back()) {
+        // The first real line opens level 0 without an event.
+        if (!g.indent_stack.empty()) {
+            out.push_back({indent_event_kind::indent, 0});
+        }
+        g.indent_stack.push_back(column);
+        return;
+    }
+    while (!g.indent_stack.empty() && column < g.indent_stack.back()) {
+        g.indent_stack.pop_back();
+        out.push_back({indent_event_kind::dedent, 0});
+    }
+    if (!g.indent_stack.empty() && column != g.indent_stack.back()) {
+        // Unmatched column: unwind to the root and re-open, never normalise.
+        while (g.indent_stack.size() > 1) {
+            g.indent_stack.pop_back();
+            out.push_back({indent_event_kind::dedent, 0});
+        }
+        if (column != g.indent_stack.back()) {
+            g.indent_stack.back() = column;
+        }
+        out.push_back({indent_event_kind::indent, 0});
+    }
+}
+
+void indent_feed_byte(struct llama_grammar & g, uint8_t c, std::vector<indent_event> & out) {
+    g.indent_saw_byte = true;
+    if (g.indent_line_started) {
+        if (c == ' ') {
+            ++g.indent_pending_spaces;
+            return;
+        }
+        if (c == '\t') {
+            // A TAB is NOT silently converted to a column: it closes the
+            // indentation run and is handed through as an ordinary scalar, so
+            // a grammar that only accepts spaces rejects the line instead of
+            // accepting a rewritten indent.
+            g.indent_line_started = false;
+            indent_settle(g, out);
+            out.push_back({indent_event_kind::ch, c});
+            return;
+        }
+        g.indent_line_started = false;
+        indent_settle(g, out);
+        if (c == '\n') {
+            out.push_back({indent_event_kind::newline, 0});
+            g.indent_line_started  = true;
+            g.indent_pending_spaces = 0;
+            g.indent_pending_tab    = false;
+            return;
+        }
+        out.push_back({indent_event_kind::ch, c});
+        return;
+    }
+    if (c == '\n') {
+        out.push_back({indent_event_kind::newline, 0});
+        g.indent_line_started   = true;
+        g.indent_pending_spaces = 0;
+        g.indent_pending_tab    = false;
+        return;
+    }
+    out.push_back({indent_event_kind::ch, c});
+}
+
+} // namespace
+
+std::vector<llama_grammar_indent_event> llama_grammar_indent_lex(
+        struct llama_grammar & grammar,
+        const std::string & piece) {
+    std::vector<llama_grammar_indent_event> out;
+    if (!grammar.indent_lexer) {
+        // Not enabled: the byte stream is the event stream, so the caller's
+        // ordinary path is untouched.
+        return out;
+    }
+    std::vector<indent_event> raw;
+    for (const char c : piece) {
+        indent_feed_byte(grammar, (uint8_t) c, raw);
+    }
+    out.reserve(raw.size());
+    for (const auto & e : raw) {
+        out.push_back({(uint8_t) e.kind, e.cp});
+    }
+    return out;
+}
+
+std::vector<llama_grammar_indent_event> llama_grammar_indent_finish(
+        struct llama_grammar & grammar) {
+    std::vector<llama_grammar_indent_event> out;
+    if (!grammar.indent_lexer) {
+        return out;
+    }
+    std::vector<indent_event> raw;
+    if (grammar.indent_line_started && grammar.indent_saw_byte) {
+        indent_settle(grammar, raw);
+    }
+    // EOF closes every still-open DEEPER level. The base level (stack[0]) is
+    // the document's own indentation, not a block the grammar opened, so it is
+    // left in place -- unwinding it too would emit one spurious DEDENT per
+    // document tail.
+    while (grammar.indent_stack.size() > 1) {
+        grammar.indent_stack.pop_back();
+        raw.push_back({indent_event_kind::dedent, 0});
+    }
+    raw.push_back({indent_event_kind::eof, 0});
+    out.reserve(raw.size());
+    for (const auto & e : raw) {
+        out.push_back({(uint8_t) e.kind, e.cp});
+    }
+    return out;
 }
 
 void llama_grammar_accept_str(struct llama_grammar & grammar, const std::string & piece) {

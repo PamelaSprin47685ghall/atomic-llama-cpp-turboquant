@@ -738,6 +738,52 @@ public:
     // once; query_virtual_pos == L. Throws std::out_of_range for an unknown
     // reader.
     llama_rerot_reader_view build_view(llama_rerot_node_id reader) const;
+    // Reader-order providers (MM-R1 M06). `build_dag_view` and `build_view`
+    // are the two orderings the runtime may select between; the provider is a
+    // pure function of the document topology and the runs' visibility, never
+    // of scheduling state (queued/running/retired) or physical slot order.
+    //
+    //   kahn        : cycle-preferred topological sort with the reader's own
+    //                 work last -- the shipped DAG ordering.
+    //   tree_dfs    : Path-Anchored Cyclic DFS -- at every node on the reader's
+    //                 root path, the subtree containing the reader renders
+    //                 LAST and the other subtrees keep document order.
+    //
+    // `order_version` guards order caches: bumping it invalidates every cached
+    // order without touching the document, so a caller that changes provider
+    // selection (or republishes structure) cannot reuse a stale order.
+    enum class order_provider : uint8_t {
+        kahn = 0,
+        tree_dfs,
+    };
+
+    // Flattened LEAF order for one reader under a provider: the sequence of
+    // leaf node ids the reader must be able to see, in view order. Returning
+    // leaves (rather than runs) lets the caller compose the order with any
+    // run-level visibility filter, and lets the order be cached per
+    // (tree, reader, provider) because it depends on topology alone.
+    // The reader's own leaf is always last when it is a leaf itself.
+    // Throws std::out_of_range for an unknown reader.
+    std::vector<llama_rerot_node_id> leaf_order(
+            llama_rerot_node_id reader,
+            order_provider provider) const;
+
+    // Render the view for one reader under a provider. Equivalent to
+    // build_dag_view(reader, started_nodes, epoch) for kahn and
+    // build_view(reader) for tree_dfs -- the two selection paths share the
+    // same run-level visibility rules, only the ORDER differs.
+    llama_rerot_reader_view build_view_for(
+            llama_rerot_node_id reader,
+            order_provider provider,
+            const std::vector<llama_rerot_node_id> & started_nodes = {},
+            uint64_t frozen_read_publish_epoch = 0) const;
+
+    // Monotonic order-version counter for this document. Bumped by
+    // invalidate_order_cache(); order caches keyed on a stale value must be
+    // rebuilt, so a caller can never reuse an order from before a structural
+    // change.
+    uint64_t order_version() const { return order_version_; }
+    void invalidate_order_cache() { ++order_version_; }
 
     // Verifies episode/node/run id density and backlinks, the
     // publish-epoch/visibility contract, and -- for EVERY node as reader --
@@ -758,6 +804,7 @@ private:
 
     uint64_t episode_id_ = 0;
     bool is_dag_mode_ = false;
+    uint64_t order_version_ = 1;
     std::vector<llama_rerot_node> nodes_;
     std::vector<llama_rerot_run> runs_;
 };

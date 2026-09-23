@@ -1,0 +1,296 @@
+# MM-R1 mindmap wire fixtures (protocol MM-R1, section 3).
+#
+# One document per record. `EXPECT` is the verdict the strict C++ parser
+# (tools/server/server-rerot-mindmap.cpp) MUST return for the document, using
+# the default limits:
+#   depth 4, nodes 64, leaves 8, label 96 bytes, wire 16384 bytes.
+#
+# These fixtures pin the BYTE-level contract: the probe may emit any prefix of
+# a legal document at any token boundary, so the same corpus also seeds the
+# incremental prefix test (every prefix of a `complete` record must be
+# `incomplete`, never `invalid`).
+
+--- id: valid-root-only
+EXPECT: complete
+```mermaid
+mindmap
+  总目标
+```
+
+--- id: valid-root-one-child
+EXPECT: complete
+```mermaid
+mindmap
+  Root
+    Leaf
+```
+
+--- id: valid-full-depth
+EXPECT: complete
+```mermaid
+mindmap
+  R
+    A
+      B
+        C
+```
+
+--- id: valid-two-branches
+EXPECT: complete
+```mermaid
+mindmap
+  R
+    A
+      A1
+      A2
+    B
+      B1
+      B2
+```
+
+--- id: valid-duplicate-labels
+EXPECT: complete
+Node identity is host-assigned; equal labels on different paths are distinct.
+```mermaid
+mindmap
+  R
+    重复
+    重复
+```
+
+--- id: valid-tasks-with-space
+EXPECT: complete
+Single ASCII spaces separate words inside a label.
+```mermaid
+mindmap
+  求总和
+    求 25 × 12
+    求 15 × 16
+```
+
+--- id: valid-kana-hangul
+EXPECT: complete
+```mermaid
+mindmap
+  R
+    テスト
+    검증
+```
+
+--- id: valid-ascii-digits
+EXPECT: complete
+```mermaid
+mindmap
+  R
+    42
+```
+
+--- id: valid-exactly-eight-leaves
+EXPECT: complete
+The leaf budget is 8; this document has exactly 8.
+```mermaid
+mindmap
+  R
+    A
+    B
+    C
+    D
+    E
+    F
+    G
+    H
+```
+
+--- id: invalid-empty
+EXPECT: invalid
+envelope
+## (no bytes at all -- kept as a record so the corpus documents the shape)
+
+--- id: invalid-prose-before-header
+EXPECT: invalid
+envelope
+WIRE: text```mermaid
+mindmap
+  R
+```
+
+--- id: invalid-mindmap-typo
+EXPECT: invalid
+envelope
+```mermaid
+mind-map
+  R
+```
+
+--- id: invalid-crlf
+EXPECT: invalid
+envelope
+```mermaid
+mindmap
+  R
+
+```
+
+--- id: invalid-tab-indent
+EXPECT: invalid
+envelope
+```mermaid
+mindmap
+  R
+	tab
+```
+
+--- id: invalid-second-root
+EXPECT: invalid
+structure
+```mermaid
+mindmap
+  R
+  S
+```
+
+--- id: invalid-root-deeper-than-one
+EXPECT: invalid
+structure
+```mermaid
+mindmap
+    R
+```
+
+--- id: invalid-root-at-column-zero
+EXPECT: invalid
+structure
+```mermaid
+mindmap
+R
+```
+
+--- id: invalid-odd-indent
+EXPECT: invalid
+structure
+```mermaid
+mindmap
+  R
+   X
+```
+
+--- id: invalid-skipped-level
+EXPECT: invalid
+structure
+```mermaid
+mindmap
+  R
+      X
+```
+
+--- id: invalid-blank-line
+EXPECT: invalid
+structure
+```mermaid
+mindmap
+  R
+
+```
+
+--- id: invalid-depth-five
+EXPECT: invalid
+budget
+Depth 5 exceeds the default max_depth of 4.
+```mermaid
+mindmap
+  R
+    A
+      B
+        C
+          D
+```
+
+--- id: invalid-nine-leaves
+EXPECT: invalid
+budget
+Nine leaves exceed the default max_leaves of 8. The verdict is only possible
+once the tree closes, because a late promotion can reduce the leaf count.
+```mermaid
+mindmap
+  R
+    A1
+    A2
+    B1
+    B2
+    C1
+    C2
+    D1
+    D2
+    E1
+```
+
+--- id: invalid-trailing-space-in-label
+EXPECT: invalid
+label
+```mermaid
+mindmap
+  R 
+```
+
+--- id: invalid-double-space-in-label
+EXPECT: invalid
+label
+```mermaid
+mindmap
+  two  spaces
+```
+
+--- id: invalid-empty-label
+EXPECT: invalid
+label
+```mermaid
+mindmap
+  
+```
+
+--- id: invalid-brackets
+EXPECT: invalid
+label
+`[` is outside the MM-R1 character set (the G0 grammar fixes the subset).
+```mermaid
+mindmap
+  R
+    [leaf]
+```
+
+--- id: invalid-quote
+EXPECT: invalid
+label
+```mermaid
+mindmap
+  R
+    a"b
+```
+
+--- id: invalid-backtick
+EXPECT: invalid
+label
+A backtick inside a node label would forge a fence boundary.
+```mermaid
+mindmap
+  R
+    `code`
+```
+
+--- id: invalid-trailing-junk-after-fence
+EXPECT: invalid
+envelope
+WIRE: ```mermaid
+mindmap
+  R
+```junk
+
+--- id: invalid-fence-not-at-column-zero
+EXPECT: invalid
+envelope
+The closing fence must sit at column 0.
+```mermaid
+mindmap
+  R
+  ```
+```

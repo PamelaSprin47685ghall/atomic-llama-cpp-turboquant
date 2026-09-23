@@ -42,6 +42,16 @@ enum llama_gretype {
 
     // inverse token (!<[token-id]>)
     LLAMA_GRETYPE_TOKEN_NOT      = 9,
+
+    // G2 indent-aware lexical events (opt-in, default off). They are only
+    // produced when a grammar text uses the `%indent` / `%dedent` directives,
+    // which enable the indent lexer. Existing grammar texts never reference
+    // these types, so their path stays byte-identical.
+    //
+    //   LLAMA_GRETYPE_INDENT  : a new indentation level was opened
+    //   LLAMA_GRETYPE_DEDENT  : the last opened level was closed
+    LLAMA_GRETYPE_INDENT         = 10,
+    LLAMA_GRETYPE_DEDENT         = 11,
 };
 
 typedef struct llama_grammar_element {
@@ -67,6 +77,33 @@ using llama_grammar_stack = std::vector<const llama_grammar_element *>;
 using llama_grammar_rules      = std::vector<llama_grammar_rule>;
 using llama_grammar_stacks     = std::vector<llama_grammar_stack>;
 using llama_grammar_candidates = std::vector<llama_grammar_candidate>;
+
+// G2 indent-aware lexer events. Emitted only for a grammar that enabled the
+// indent lexer (its text uses %indent / %dedent); the producer never returns a
+// non-empty vector for any other grammar, so every existing caller is
+// byte-identical.
+enum llama_grammar_indent_event_kind : uint8_t {
+    LLAMA_GRAMMAR_INDENT_CH      = 0,
+    LLAMA_GRAMMAR_INDENT_NEWLINE = 1,
+    LLAMA_GRAMMAR_INDENT_INDENT  = 2,
+    LLAMA_GRAMMAR_INDENT_DEDENT  = 3,
+    LLAMA_GRAMMAR_INDENT_EOF     = 4,
+};
+
+struct llama_grammar_indent_event {
+    uint8_t  kind = LLAMA_GRAMMAR_INDENT_CH;
+    uint32_t cp   = 0;
+};
+
+// Lexes `piece` into events for a grammar with the indent lexer enabled.
+// Returns an empty vector otherwise.
+std::vector<llama_grammar_indent_event> llama_grammar_indent_lex(
+        struct llama_grammar & grammar,
+        const std::string & piece);
+
+// Settles the tail at end-of-input and appends the EOF event.
+std::vector<llama_grammar_indent_event> llama_grammar_indent_finish(
+        struct llama_grammar & grammar);
 
 // TODO: remove, needed for tests atm
 const llama_grammar_rules  & llama_grammar_get_rules (const struct llama_grammar * grammar);
@@ -148,6 +185,18 @@ struct llama_grammar {
                              trigger_patterns;         // Regular expressions that trigger a lazy grammar. Must be a full match of the entire generated
                                                        // string, and the grammar will be given the string from the first match group onwards.
 
+
+    // G2 indent-aware lexer state (opt-in; false for every existing grammar).
+    // When enabled, the grammar's terminals are matched against the LEXED
+    // event stream (INDENT / DEDENT / NEWLINE / EOF plus ordinary characters)
+    // instead of the raw byte stream. All fields are value types, so the
+    // generated clone/reset helpers carry the lexer state with them.
+    bool                       indent_lexer = false;
+    std::vector<uint32_t>      indent_stack;   // open columns, deepest last
+    uint32_t                   indent_pending_spaces = 0;
+    bool                       indent_pending_tab    = false;
+    bool                       indent_line_started  = true;
+    bool                       indent_saw_byte      = false;
 };
 
 //

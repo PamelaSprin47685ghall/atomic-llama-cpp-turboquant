@@ -587,6 +587,16 @@ struct common_params : wanxiangqi_common_params {
     // Explicit opt-in for RERoT lane-trace SSE events (rerot.trace.*). Default off:
     // streaming stays a single assistant response with one finish event + [DONE].
     bool rerot_trace = false;
+    // Planning wire for the isolated routing probe. `json` is the shipped
+    // strategy+payload DAG protocol; `mindmap` selects the MM-R1 research
+    // line (native Mermaid mindmap, no leaf-to-leaf dependencies). Recording
+    // the wire keeps the experiment matrix honest: arms must not pretend a
+    // different plan kind ran.
+    std::string rerot_plan_wire = "json";
+    // MM-R1 final mode for the global entity: "reason" (S1, natural synthesis
+    // reasoning then content) or "direct" (S0, content immediately). Research arm
+    // selector; the shipped default keeps S1.
+    std::string rerot_final_mode = "reason";
 
     // FlashPrefill V2 policy (PREFILL.md §12). Initialized from the PolicyCore
     // frozen defaults (mode OFF); transferred by value into

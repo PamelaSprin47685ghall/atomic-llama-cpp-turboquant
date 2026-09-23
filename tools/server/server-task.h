@@ -117,6 +117,14 @@ struct task_params {
     bool rerot_enabled = false;
     llama_rerot_frontier_mode rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
     bool rerot_trace = false; // explicit opt-in for rerot.trace.* SSE events; default off
+    // Planning wire for this request's isolated probe: "json" (shipped DAG)
+    // or "mindmap" (MM-R1 research line). The probe path fails closed on any
+    // other value so a misconfigured request can never silently run DAG and
+    // be reported as a mindmap experiment.
+    std::string rerot_plan_wire;
+    // MM-R1 final mode: "reason" (S1) or "direct" (S0). Empty follows the
+    // server default; an unknown value fails closed in the probe path.
+    std::string rerot_final_mode;
 
     // Fill rerot_* from the server-global base params. No-op when base OFF.
     void apply_rerot_defaults(const common_params & base);
@@ -933,6 +941,12 @@ struct server_task {
     // stale callbacks carry an older generation and must be dropped.
     uint64_t rerot_episode_id = 0;
     uint64_t rerot_generation = 0;
+    // Planning wire of the episode this slot is currently driving:
+    // "dag" (shipped strategy JSON) or "mindmap" (MM-R1). Empty means no
+    // routing probe has committed. Recorded on the slot so the transition,
+    // the audit trace and the harness all name the same plan kind instead of
+    // re-deriving it from a payload.
+    std::string rerot_plan_kind;
     // Exact last real user text for the private final-acquire instruction.
     // This is never published as a RERoT run; the original prompt remains the
     // causal source. Empty for non-chat/multimedia-only requests.

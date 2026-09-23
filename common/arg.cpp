@@ -1826,6 +1826,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_REROT").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--rerot-plan-wire"}, "json|mindmap",
+        "planning wire for the isolated RERoT routing probe: json = shipped strategy+payload DAG; "
+        "mindmap = MM-R1 research line (native Mermaid mindmap, leaves carry no hard dependency); implies --rerot",
+        [](common_params & params, const std::string & value) {
+            if (value != "json" && value != "mindmap") {
+                throw std::invalid_argument("RERoT plan wire must be 'json' or 'mindmap'");
+            }
+            params.rerot_plan_wire = value;
+            params.rerot_enabled = true;
+            params.kv_unified = true;
+        }
+    ).set_env("LLAMA_ARG_REROT_PLAN_WIRE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--rerot-final-mode"}, "reason|direct",
+        "MM-R1 mindmap final mode for the global entity: reason = S1 natural synthesis reasoning then content; "
+        "direct = S0 content immediately (research arm); implies --rerot",
+        [](common_params & params, const std::string & value) {
+            if (value != "reason" && value != "direct") {
+                throw std::invalid_argument("RERoT final mode must be 'reason' or 'direct'");
+            }
+            params.rerot_final_mode = value;
+            params.rerot_enabled = true;
+            params.kv_unified = true;
+        }
+    ).set_env("LLAMA_ARG_REROT_FINAL_MODE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--rerot-frontier"}, "strong|lag1",
         string_format("RERoT frontier visibility mode (default: %s; implies --rerot)",
             llama_rerot_frontier_mode_name(params.rerot_frontier)),

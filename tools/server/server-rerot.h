@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "server-rerot-mindmap.h"
+
 // Server-side control-plane helpers for Recursive Elastic Ring-of-Thought.
 //
 // The model-facing planner protocol is byte-oriented, while KV visibility is
@@ -355,10 +357,16 @@ struct server_rerot_routing_decision {
         invalid = 0,
         simple,
         dag,
+        mindmap,
     } strategy = strategy_type::invalid;
 
     std::vector<server_rerot_dag_plan_item> questions;
     std::vector<server_rerot_dag_edge> dependencies;
+    // Accepted MM-R1 tree plan. Only populated for the mindmap strategy; the
+    // questions/dependencies vectors stay empty there because MM-R1 assigns
+    // no leaf-to-leaf dependency by construction.
+    server_mindmap::plan tree;
+    bool has_tree = false;
     std::string error;
     // Set when the text is not yet syntactically complete JSON: the probe is
     // still streaming and must keep sampling. A syntactically complete plan
@@ -367,6 +375,19 @@ struct server_rerot_routing_decision {
 
     bool is_simple() const { return strategy == strategy_type::simple; }
     bool is_dag() const { return strategy == strategy_type::dag && error.empty(); }
+    bool is_mindmap() const { return strategy == strategy_type::mindmap && error.empty(); }
+    // Planning wire that produced this episode. Kept separate from the
+    // strategy enum so the plan-prefix formatter can dispatch on it without
+    // re-deriving the kind from the payload.
+    const char * plan_kind() const {
+        if (is_mindmap()) {
+            return "mindmap";
+        }
+        if (is_dag()) {
+            return "dag";
+        }
+        return "none";
+    }
 };
 
 // Parses and strictly validates a routing probe decision. The wire format is
@@ -376,6 +397,26 @@ struct server_rerot_routing_decision {
 // Fail-closed: any parse, shape or graph defect leaves strategy invalid with a
 // non-empty error; nothing is repaired, dropped or reordered.
 server_rerot_routing_decision server_rerot_parse_routing_decision(const std::string & json_str);
+
+// MM-R1 Mermaid mindmap planning prompt. Same trailing-LF contract as the
+// JSON probe: the fence must open on a fresh line.
+std::string_view server_rerot_mindmap_probe_prompt();
+// Depth-bounded (default depth 4) GBNF for the MM-R1 wire. Node/leaf/label/
+// byte budgets stay in the strict parser; the grammar only fixes depth and
+// the character subset.
+std::string server_rerot_mindmap_grammar();
+// Composes the scoped intent text one MM-R1 worker sees in its fixed entry.
+// The collaboration text is narrative only: it must never introduce a marker
+// the runtime would treat as a barrier, a wait, or a yield. Returns an empty
+// string for an unknown leaf (fail-closed; the caller must not start that
+// worker).
+std::string server_rerot_mindmap_worker_intent(
+        const server_mindmap::plan & tree,
+        uint32_t leaf_id,
+        std::string_view collaboration = {});
+// Strict incremental parse of one MM-R1 probe output. Fail-closed; incomplete
+// is reported separately so the caller keeps sampling on truncation.
+server_rerot_routing_decision server_rerot_parse_mindmap_decision(const std::string & wire);
 
 // Returns JSON schema string for GBNF conversion (§02.4)
 std::string server_rerot_routing_schema_json();
@@ -422,6 +463,12 @@ struct server_rerot_node_runtime {
     llama_rerot_event_origin completion_origin = llama_rerot_event_origin::unknown;
     llama_rerot_stage_role stage_role = llama_rerot_stage_role::planner;
     uint32_t remaining_preds = 0;
+    // MM-R1 tree placement. `scope_path` is the ancestor chain (root .. parent)
+    // the worker's intent must quote; `tree_leaf_id` is the host node id in the
+    // frozen TreePlan so the reader order provider can rotate views without
+    // trusting the model's labels. UINT32_MAX for non-worker roles.
+    std::string scope_path;
+    uint32_t tree_leaf_id = UINT32_MAX;
     llama_pos frame_injection_end = -1;
 
     // A.8 opaque per-lane extension state. Filled by the server integration
@@ -508,7 +555,23 @@ struct server_rerot_episode {
 
     // True when episode runs in DAG mode (AGENTS.md §§01, 02)
     bool is_dag = false;
+    // Planning wire of this episode: "dag" (shipped strategy JSON) or
+    // "mindmap" (MM-R1 research line). Empty before the probe commits.
+    // Every consumer that must behave differently for the research line
+    // (formal P, worker frames, reader order, persistence) keys off this.
+    std::string plan_kind;
     bool strategy_decided = false;
+    // Frozen MM-R1 TreePlan. Present only for plan_kind == "mindmap"; internal
+    // concept nodes stay here even though they never take a pen, because the
+    // hierarchical reader order and the scoped worker frames both need the
+    // ancestor chain.
+    server_mindmap::plan mindmap_tree;
+    bool mindmap_tree_valid = false;
+    // MM-R1 final mode for the global entity: "reason" (S1, natural
+    // synthesis reasoning then content) or "direct" (S0, content immediately).
+    // Empty/non-"direct" means S1; an unknown value must fail closed rather
+    // than silently degrade to S1.
+    std::string final_mode;
     bool probing = false;
     llama_rerot_node_id synthesis_node = LLAMA_REROT_NODE_INVALID;
     mutable int64_t t_synthesis_eligible_us = 0;
@@ -670,7 +733,21 @@ public:
     bool initialize_dag(
         uint64_t episode_id,
         const server_rerot_routing_decision & decision,
-        std::string * error_out = nullptr);
+            std::string * error_out);
+    // MM-R1 entry: same execution container as DAG, but leaves become workers
+    // with NO leaf-to-leaf edge and the whole TreePlan is retained on the
+    // episode. `model_declared_dependencies` is false for MM-R1 (hard zero
+    // edges) and true only for the legacy compatibility entry.
+    bool initialize_mindmap(
+        uint64_t episode_id,
+        const server_rerot_routing_decision & decision,
+            std::string * error_out);
+    // Shared body of initialize_dag / initialize_mindmap.
+    bool initialize_plan_impl(
+        uint64_t episode_id,
+        const server_rerot_routing_decision & decision,
+            std::string * error_out,
+            bool model_declared_dependencies);
 
     void set_dag_protocol_markers(
         uint64_t episode_id,

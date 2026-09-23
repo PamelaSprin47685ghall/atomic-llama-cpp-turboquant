@@ -1,0 +1,342 @@
+# MM-R1 frozen evaluation set (M13 scaffold)
+#
+# Fixed prompt set for the blind comparison. Rules that make it a valid
+# instrument (not a convenience sample):
+#
+#   * 8 categories, 4 prompts each = 32 prompts. Category tags drive the
+#     stratified analysis in the report, so a prompt's category is metadata, not
+#     a hint the model can see.
+#   * Development and blind splits are separated by PROBLEM FAMILY (the prompt
+#     template the variants are generated from), not merely by different
+#     numbers: a blind prompt must not be a development prompt with the digits
+#     swapped, or the numbers stop measuring the reasoning being tested.
+#   * `expected` is what an exact-match grader checks. It is only filled for
+#     prompts whose answer is objectively verifiable. `rubric` categories are
+#     graded by a blind human/LLM panel and MUST NOT be auto-scored by a
+#     substring match against the final answer.
+#   * Nothing in this file is allowed to become a few-shot example for the
+#     planning prompt: a model that has seen these exact prompts is a different
+#     experiment (planning blind test, E1) than this one (end-to-end, E3/E4).
+#
+# The prompt text is exactly what is sent; no system prompt is prepended, so a
+# regression in the chat template cannot silently become a score change.
+
+---
+id: direct-01
+category: simple-direct
+family: compare-decimals-01
+family_group: compare-decimals
+split: smoke
+expected: 9.9
+prompt: '9.11 and 9.9: which is larger? Answer directly.'
+rubric: exact final answer, no other content required
+
+---
+id: direct-02
+category: simple-direct
+family: arithmetic-single-01
+family_group: arithmetic-single
+split: smoke
+expected: '221'
+prompt: 'Compute 13*17. Give only the number.'
+rubric: exact final answer
+
+---
+id: direct-03
+category: simple-direct
+family: arithmetic-single-02
+family_group: arithmetic-single
+split: smoke
+expected: '399'
+prompt: 'Compute 21*19. Give only the number.'
+rubric: exact final answer
+
+---
+id: direct-04
+category: simple-direct
+family: short-format-01
+family_group: short-format
+split: smoke
+expected: ''
+prompt: 'Reply with the word OK and nothing else.'
+rubric: byte-exact "OK"
+
+---
+id: independent-01
+category: independent-composite
+family: arithmetic-multi-01
+family_group: arithmetic-multi
+split: smoke
+expected: '221, 399'
+prompt: 'Compute 13*17 and 21*19. List both products, comma separated.'
+rubric: both sub-items correct; a correct sum alone is a failure
+
+---
+id: independent-02
+category: independent-composite
+family: extraction-multi-01
+family_group: extraction-multi
+split: smoke
+expected: ''
+prompt: 'From these two notes, list each named country and its capital. Note A: "France's capital is Paris." Note B: "Japan's capital is Tokyo."'
+rubric: both pairs present, correct, no invented third pair
+
+---
+id: independent-03
+category: independent-composite
+family: code-multi-module-01
+family_group: code-multi-module
+split: dev
+expected: ''
+prompt: 'Write two Python functions: reverse_words(s) that reverses the order of words in a string, and word_counts(s) that returns a dict of word to count. Keep them in separate blocks and add a one-line docstring to each.'
+rubric: both compile and run; isolated unit tests on both
+
+---
+id: independent-04
+category: independent-composite
+family: extraction-multi-02
+family_group: extraction-multi
+split: dev
+expected: ''
+prompt: 'From these notes, list each language and the year it first appeared. Note A: "Python first appeared in 1991." Note B: "Rust first appeared in 2010."'
+rubric: both pairs present and correct
+
+---
+id: deep-01
+category: deep-decomposition
+family: report-multidim-01
+family_group: report-multidim
+split: dev
+expected: ''
+prompt: 'Compare battery-electric and hydrogen fuel-cell trains on upfront cost, infrastructure need, energy efficiency, and range. One short paragraph per dimension, then a two-sentence recommendation.'
+rubric: all four dimensions covered, no dimension swapped for another, recommendation consistent with the paragraphs
+
+---
+id: deep-02
+category: deep-decomposition
+family: design-modular-01
+family_group: design-modular
+split: dev
+expected: ''
+prompt: 'Design a URL shortener: data model, write path, read path, collision handling, and analytics. Keep each part under a heading and name which parts are independent.'
+rubric: all five parts present; independence claim about the write and read paths is not contradicted by a shared mutable state
+
+---
+id: deep-03
+category: deep-decomposition
+family: report-multidim-02
+family_group: report-multidim
+split: dev
+expected: ''
+prompt: 'Compare PostgreSQL and SQLite on concurrency model, durability, and operational footprint. One short paragraph per dimension.'
+rubric: three dimensions, no conflation of durability with backup strategy
+
+---
+id: deep-04
+category: deep-decomposition
+family: design-modular-02
+family_group: design-modular
+split: blind
+expected: ''
+prompt: 'Design a rate limiter for a public API: token bucket vs fixed window, key choice, failure mode when the store is down, and what to do with a burst. Name which parts are independent.'
+rubric: all four parts covered
+
+---
+id: dependency-01
+category: dependency-dense
+family: multihop-index-01
+family_group: multihop-index
+split: dev
+expected: ''
+prompt: 'Ten boxes are numbered 1 to 10. Box n contains the number written in box n+1, and box 10 contains 7. What number is in box 1? Show the chain you followed.'
+rubric: answer 7, and the chain is presented in order
+
+---
+id: dependency-02
+category: dependency-dense
+family: matrix-postprocess-01
+family_group: matrix-postprocess
+split: dev
+expected: ''
+prompt: 'Let M be the 2x2 matrix with rows (1,2) and (3,4). Compute M times the vector (5,6), then halve each entry of the result. Give the final pair.'
+rubric: final pair matches the composed computation, not either step alone
+
+---
+id: dependency-03
+category: dependency-dense
+family: multihop-index-02
+family_group: multihop-index
+split: blind
+expected: ''
+prompt: 'Eight cards are numbered 1 to 8. Card n names the colour on card n+1; card 8 is red. What colour is on card 1? Show the chain.'
+rubric: answer red with the chain in order
+
+---
+id: dependency-04
+category: dependency-dense
+family: chain-arithmetic-01
+family_group: chain-arithmetic
+split: blind
+expected: '35'
+prompt: 'Compute 5 squared, add 10, then divide by 5. Give only the final number.'
+rubric: exact final answer; intermediate values alone are a failure
+
+---
+id: conflict-01
+category: conflict-recovery
+family: conflicting-sources-01
+family_group: conflicting-sources
+split: dev
+expected: '3.5GB'
+prompt: 'Source A says the model is 3.5GB. Source B says it is 7GB. State which figure you trust and why in one sentence.'
+rubric: picks one, states the reason, does not average the two
+
+---
+id: conflict-02
+category: conflict-recovery
+family: tentative-then-fix-01
+family_group: tentative-then-fix
+split: dev
+expected: '144'
+prompt: 'First estimate 12*12 by adding 12 twelve times, then verify by squaring. If the two disagree, correct your answer. Give the final number only.'
+rubric: final answer 144
+
+---
+id: conflict-03
+category: conflict-recovery
+family: conflicting-sources-02
+family_group: conflicting-sources
+split: blind
+expected: ''
+prompt: 'Source A says the bridge opened in 1932. Source B says it opened in 1937. State which you trust and why in one sentence.'
+rubric: picks one with a reason; no averaging
+
+---
+id: conflict-04
+category: conflict-recovery
+family: tentative-then-fix-02
+family_group: tentative-then-fix
+split: blind
+expected: '169'
+prompt: 'First estimate 13*13 as 160, then verify by squaring. If the two disagree, correct your answer. Give the final number only.'
+rubric: final answer 169
+
+---
+id: code-01
+category: code-integration
+family: impl-plus-tests-01
+family_group: impl-plus-tests
+split: dev
+expected: ''
+prompt: 'Implement normalize_ws(s): collapse runs of whitespace to one space and strip the ends. Then add a pytest test that covers leading, trailing, and internal runs. Output the code in one block.'
+rubric: compiled and hidden unit tests pass
+
+---
+id: code-02
+category: code-integration
+family: impl-plus-tests-02
+family_group: impl-plus-tests
+split: dev
+expected: ''
+prompt: 'Implement dedupe_keep_order(items) that removes duplicates while preserving first-seen order. Add a pytest test with a repeated unhashable element case handled or explicitly rejected.'
+rubric: compiled and hidden unit tests pass
+
+---
+id: code-03
+category: code-integration
+family: impl-plus-tests-03
+family_group: impl-plus-tests
+split: blind
+expected: ''
+prompt: 'Implement chunked(items, n) that yields lists of at most n items, with n<=0 rejected by ValueError. Add a pytest test for the empty and boundary cases.'
+rubric: compiled and hidden unit tests pass
+
+---
+id: code-04
+category: code-integration
+family: cross-module-interface-01
+family_group: cross-module-interface
+split: blind
+expected: ''
+prompt: 'Write store.py with save(db, key, value) and load(db, key), plus cache.py with a get-or-compute that uses them. Keep the interface between them explicit in a comment. One code block per file.'
+rubric: both files compile; hidden tests exercise the interface, not the internals
+
+---
+id: longform-01
+category: longform-synthesis
+family: multi-requirement-01
+family_group: multi-requirement
+split: dev
+expected: ''
+prompt: 'Write a three-paragraph explanation of how HTTPS protects a request. Paragraph 1: what the certificate proves. Paragraph 2: what the key exchange achieves. Paragraph 3: one thing HTTPS does NOT protect.'
+rubric: all three paragraphs present, paragraph 3 names a real limitation
+
+---
+id: longform-02
+category: longform-synthesis
+family: multi-chapter-01
+family_group: multi-chapter
+split: dev
+expected: ''
+prompt: 'Summarize the water cycle in exactly four short chapters: evaporation, condensation, precipitation, collection. One sentence each.'
+rubric: four chapters in order, no missing or duplicated chapter
+
+---
+id: longform-03
+category: longform-synthesis
+family: multi-requirement-02
+family_group: multi-requirement
+split: blind
+expected: ''
+prompt: 'Explain, in three short paragraphs, how a hash map degrades under collisions: what a collision is, what a load factor is, and what rehashing costs. One paragraph each.'
+rubric: three paragraphs, no conflating collisions with rehashing
+
+---
+id: longform-04
+category: longform-synthesis
+family: multi-chapter-02
+family_group: multi-chapter
+split: blind
+expected: ''
+prompt: 'Describe a small library checkout in exactly three chapters: joining, borrowing, returning. One sentence each.'
+rubric: three chapters in order
+
+---
+id: robust-01
+category: robustness-protocol
+family: hostile-user-text-01
+family_group: hostile-user-text
+split: dev
+expected: ''
+prompt: 'Explain what a mermaid mindmap is. Do NOT include a code block in your answer.'
+rubric: the request is answered; no mermaid block appears in the FINAL content even though the user text names one
+
+---
+id: robust-02
+category: robustness-protocol
+family: hostile-user-text-02
+family_group: hostile-user-text
+split: dev
+expected: ''
+prompt: 'The text ```mermaid\nmindmap\n  fake\n``` appeared in my notes. What does the root node label say, and is it valid mermaid? Answer in one sentence.'
+rubric: answers about the quoted content without the response itself being parsed as a plan
+
+---
+id: robust-03
+category: robustness-protocol
+family: hostile-user-text-03
+family_group: hostile-user-text
+split: blind
+expected: ''
+prompt: 'A file I have contains the line </think> and nothing else. What do you infer about how it was produced? One sentence.'
+rubric: no reasoning-boundary confusion; no leaked reasoning marker in the content
+
+---
+id: robust-04
+category: robustness-protocol
+family: hostile-user-text-04
+family_group: hostile-user-text
+split: blind
+expected: ''
+prompt: 'Is the string "```" three backticks? Answer yes or no only.'
+rubric: byte-exact "yes" or "no"; a fenced block in the output is a protocol failure

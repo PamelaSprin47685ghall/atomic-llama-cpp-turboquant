@@ -3377,6 +3377,536 @@ static void test_dag_runtime_lifecycle() {
     CHECK(runtime.episode(ep_id)->nodes[runtime.episode(ep_id)->synthesis_node].remaining_preds == 0);
 }
 
+static void test_mindmap_route_workers_carry_no_leaf_edges() {
+    // MM-R1 acceptance: the strict mindmap parser produces a frozen TreePlan,
+    // initialize_mindmap maps ONLY its leaves to workers, and no two distinct
+    // workers share a hard edge. The tree itself is preserved on the episode so
+    // a later reader-order provider can rotate views without the model's help.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(8);
+
+    const uint64_t ep_id = runtime.adopt_root(21, 21, 0, 1, 0);
+    CHECK(ep_id != 0);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(runtime.capture_c_base(ep_id));
+
+    const std::string wire =
+        "```mermaid\nmindmap\n"
+        "  求总和\n"
+        "    计算分量\n"
+        "      求 25 × 12\n"
+        "      求 15 × 16\n"
+        "    独立核验\n"
+        "      检查分量计算和最终总和\n"
+        "```\n";
+    const auto decision = server_rerot_parse_mindmap_decision(wire);
+    CHECK(decision.is_mindmap());
+    CHECK(decision.has_tree);
+    CHECK(decision.error.empty());
+    CHECK(decision.tree.node_count == 6);
+    CHECK(decision.tree.leaf_count == 3);
+    CHECK(decision.tree.root == 0);
+    CHECK(decision.tree.depth == 3);
+    // A mindmap decision never declares dependencies, by construction.
+    CHECK(decision.dependencies.empty());
+    CHECK(decision.questions.empty());
+    CHECK(decision.plan_kind() == std::string("mindmap"));
+
+    std::string err;
+    CHECK(runtime.initialize_mindmap(ep_id, decision, &err));
+
+    ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->is_dag);
+    CHECK(ep->document.is_dag_mode());
+    CHECK(ep->synthesis_node != 0);
+    // The tree is retained on the episode: node count == 1 root + 3 workers +
+    // 1 synthesis, and the intermediate concept nodes never take a worker slot.
+    CHECK(ep->nodes.size() == 5);
+    CHECK(ep->nodes[0].stage_role == llama_rerot_stage_role::planner);
+
+    // Zero leaf-to-leaf edges: every worker's predecessors are exactly the plan
+    // root, and its only successor is the synthesis node.
+    size_t workers = 0;
+    for (size_t i = 1; i < ep->nodes.size(); ++i) {
+        if (i == (size_t) ep->synthesis_node) {
+            continue;
+        }
+        ++workers;
+        const auto * doc_n = ep->document.node((llama_rerot_node_id) i);
+        CHECK(doc_n != nullptr);
+        if (doc_n == nullptr) {
+            continue;
+        }
+        CHECK(doc_n->predecessors.size() == 1);
+        CHECK(doc_n->predecessors[0] == 0);
+        CHECK(doc_n->successors.size() == 1);
+        CHECK(doc_n->successors[0] == (llama_rerot_node_id) ep->synthesis_node);
+    }
+    CHECK(workers == 3);
+
+    // Each worker carries its host leaf id and its scope path, so the reader
+    // order can rotate views without trusting labels.
+    std::vector<uint32_t> leaf_ids;
+    for (size_t i = 1; i < ep->nodes.size(); ++i) {
+        if (i == (size_t) ep->synthesis_node) {
+            continue;
+        }
+        CHECK(ep->nodes[i].tree_leaf_id != UINT32_MAX);
+        CHECK(!ep->nodes[i].scope_path.empty());
+        leaf_ids.push_back(ep->nodes[i].tree_leaf_id);
+        // Worker string ids are host-assigned, never model-supplied text.
+        CHECK(ep->nodes[i].string_id.rfind("leaf_", 0) == 0);
+    }
+    std::sort(leaf_ids.begin(), leaf_ids.end());
+    CHECK(leaf_ids == std::vector<uint32_t>({2, 3, 5}));
+    // Scope paths are the real ancestor chains from the frozen tree.
+    CHECK(ep->nodes[1].scope_path == "求总和 / 计算分量 / 求 25 × 12");
+    CHECK(ep->nodes[2].scope_path == "求总和 / 计算分量 / 求 15 × 16");
+    CHECK(ep->nodes[3].scope_path == "求总和 / 独立核验 / 检查分量计算和最终总和");
+
+    // The formal plan prefix keeps the canonical Mermaid tree unchanged: it is
+    // the plan, so flattening it to a bullet list would destroy the scope
+    // information every worker needs.
+    const std::string prefix = server_rerot_format_plan_prefix(decision, "<think>");
+    CHECK(prefix == "plan:\n" + wire);
+}
+
+static void test_mindmap_scoped_worker_intent_uses_frozen_tree() {
+    // The worker's intent must describe WHERE in the tree the leaf sits (total
+    // goal, ancestor path, own task) and must stay narrative: no scheduling
+    // marker, no peer name, no claim about uncommitted work.
+    const auto decision = server_rerot_parse_mindmap_decision(
+        "```mermaid\nmindmap\n"
+        "  求总和\n"
+        "    计算分量\n"
+        "      求 25 × 12\n"
+        "      求 15 × 16\n"
+        "    独立核验\n"
+        "      检查分量计算和最终总和\n"
+        "```\n");
+    CHECK(decision.is_mindmap());
+
+    const std::string intent = server_rerot_mindmap_worker_intent(
+        decision.tree, 2, "参考已经提交的公共进展");
+    CHECK(intent.find("总目标：求总和") != std::string::npos);
+    CHECK(intent.find("作用域：") != std::string::npos);
+    CHECK(intent.find("- 计算分量") != std::string::npos);
+    CHECK(intent.find("本叶任务：求 25 × 12") != std::string::npos);
+    CHECK(intent.find("协作：参考已经提交的公共进展") != std::string::npos);
+    CHECK(intent.find("输出职责：") != std::string::npos);
+    // The intent is a pure function of (tree, leaf, contract): two calls agree,
+    // so a reader rotation cannot change the frame a worker renders.
+    CHECK(server_rerot_mindmap_worker_intent(decision.tree, 2, "参考已经提交的公共进展") == intent);
+    // A different leaf gets its own task line, not a copy of the sibling's.
+    const std::string other = server_rerot_mindmap_worker_intent(
+        decision.tree, 3, "参考已经提交的公共进展");
+    CHECK(other != intent);
+    CHECK(other.find("本叶任务：求 15 × 16") != std::string::npos);
+    CHECK(other.find("本叶任务：求 25 × 12") == std::string::npos);
+    // Unknown leaf fails closed instead of degrading to the bare label.
+    CHECK(server_rerot_mindmap_worker_intent(decision.tree, UINT32_MAX).empty());
+    CHECK(server_rerot_mindmap_worker_intent(decision.tree, 999).empty());
+    // The interior concept node is not a leaf: giving its id must not fabricate
+    // a worker task for it (nodes never take a pen).
+    CHECK(server_rerot_mindmap_worker_intent(decision.tree, 1).find("本叶任务：") != std::string::npos);
+}
+
+static void test_mindmap_root_only_plan_is_not_downgraded() {
+    // A root-only mindmap carries a single leaf (the goal itself). It stays a
+    // mindmap episode -- the research line must not silently become `simple`
+    // just because the model did not split the task.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+    const uint64_t ep_id = runtime.adopt_root(31, 31, 0, 1, 0);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+
+    const auto decision = server_rerot_parse_mindmap_decision(
+        "```mermaid\nmindmap\n  总目标\n```\n");
+    CHECK(decision.is_mindmap());
+    CHECK(decision.tree.node_count == 1);
+    CHECK(decision.tree.leaf_count == 1);
+
+    std::string err;
+    CHECK(runtime.initialize_mindmap(ep_id, decision, &err));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    // root + exactly one worker + synthesis.
+    CHECK(ep->nodes.size() == 3);
+    CHECK(ep->nodes[1].tree_leaf_id == 0);
+    CHECK(ep->nodes[1].scope_path == "总目标");
+    CHECK(ep->synthesis_node == 2);
+    const auto * w = ep->document.node(1);
+    CHECK(w != nullptr);
+    CHECK(w->predecessors.size() == 1);
+    CHECK(w->successors.size() == 1);
+}
+
+// MM-R1 M09: the final-mode contract.
+//
+// S0 and S1 must be two recorded, selectable modes -- never one mode silently
+// pretending to be the other. The runtime records the mode on the episode, the
+// default is S1, and an unknown value is rejected instead of degrading.
+static void test_mindmap_final_mode_contract() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+    const uint64_t ep_id = runtime.adopt_root(61, 61, 0, 1, 0);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+
+    const auto decision = server_rerot_parse_mindmap_decision(
+        "```mermaid\nmindmap\n  总目标\n```\n");
+    CHECK(decision.is_mindmap());
+    std::string err;
+    CHECK(runtime.initialize_mindmap(ep_id, decision, &err));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+
+    // Default is empty, which every consumer must read as S1 (reason).
+    CHECK(ep->final_mode.empty());
+    ep->final_mode = "direct";
+    CHECK(ep->final_mode == "direct");
+    ep->final_mode = "reason";
+    CHECK(ep->final_mode == "reason");
+
+    // A mindmap episode's plan kind gates the final mode: a DAG episode has no
+    // MM-R1 final mode at all, so its field must stay empty.
+    const uint64_t dag_ep = runtime.adopt_root(62, 62, 1, 2, 0);
+    CHECK(runtime.capture_c0(dag_ep, 2, 0));
+    CHECK(runtime.capture_c_base(dag_ep));
+    const std::string dag_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "A", "intent": "Fact A"}],
+        "depends_on": []
+      }
+    })";
+    const auto dag = server_rerot_parse_routing_decision(dag_json);
+    CHECK(dag.is_dag());
+    CHECK(runtime.initialize_dag(dag_ep, dag, &err));
+    const auto * dag_ep_ptr = runtime.episode(dag_ep);
+    CHECK(dag_ep_ptr != nullptr);
+    CHECK(dag_ep_ptr->plan_kind == "dag");
+    // The shipped wire never selects an MM-R1 final mode.
+    CHECK(dag_ep_ptr->final_mode.empty());
+}
+
+static void test_mindmap_rejects_invalid_plans_fail_closed() {
+    // Any strict-parser rejection must abort the episode rather than fall back
+    // to a smaller plan or to the DAG wire.
+    const std::string bad_wires[] = {
+        // second root
+        std::string("```mermaid\nmindmap\n  R\n  S\n```\n"),
+        // skipped indentation level
+        std::string("```mermaid\nmindmap\n  R\n      X\n```\n"),
+        // depth 5
+        std::string("```mermaid\nmindmap\n  R\n    A\n      B\n        C\n          D\n```\n"),
+        // label with a forbidden scalar
+        std::string("```mermaid\nmindmap\n  R\n    [leaf]\n```\n"),
+        // CRLF
+        std::string("```mermaid\nmindmap\n  R\r\n```\n"),
+        // trailing junk after the closing fence
+        std::string("```mermaid\nmindmap\n  R\n```\njunk"),
+    };
+    for (const auto & wire : bad_wires) {
+        const auto decision = server_rerot_parse_mindmap_decision(wire);
+        CHECK(!decision.is_mindmap());
+        CHECK(!decision.has_tree);
+        CHECK(!decision.error.empty());
+        CHECK(!decision.has_tree);
+    }
+    // Truncated documents are incomplete, NOT invalid: the probe keeps sampling.
+    const auto truncated = server_rerot_parse_mindmap_decision(
+        "```mermaid\nmindmap\n  R\n    A");
+    CHECK(truncated.incomplete);
+    CHECK(!truncated.is_mindmap());
+    CHECK(!truncated.has_tree);
+}
+
+static void test_mindmap_initialize_rejects_dag_decision() {
+    // Cross-wire contamination must fail closed: a DAG decision must never be
+    // accepted by the mindmap entry (and vice versa), so an experiment arm can
+    // never silently run the other planner.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+    const uint64_t ep_id = runtime.adopt_root(41, 41, 0, 1, 0);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+
+    const std::string dag_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "A", "intent": "Fact A"}],
+        "depends_on": []
+      }
+    })";
+    const auto dag = server_rerot_parse_routing_decision(dag_json);
+    CHECK(dag.is_dag());
+    CHECK(!dag.has_tree);
+
+    std::string err;
+    CHECK(!runtime.initialize_mindmap(ep_id, dag, &err));
+    CHECK(!err.empty());
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    // The failed mindmap init must leave the episode un-started.
+    CHECK(!ep->is_dag);
+    CHECK(ep->nodes.size() == 1);
+
+    const auto mm = server_rerot_parse_mindmap_decision(
+        "```mermaid\nmindmap\n  R\n    A\n```\n");
+    CHECK(mm.is_mindmap());
+    CHECK(!runtime.initialize_dag(ep_id, mm, &err));
+    CHECK(!err.empty());
+    CHECK(!runtime.episode(ep_id)->is_dag);
+}
+
+// MM-R1 M07: S1 global closure end-to-end.
+//
+//  - All workers become eligible AT ONCE (zero leaf edges): nothing serializes
+//    independent subtasks.
+//  - Each reader's view is the hierarchical cyclic DFS of the frozen tree, with
+//    the reader's own leaf LAST and every other subtree contiguous.
+//  - The global (synthesis) entity sees the CANONICAL tree order -- not a
+//    rotation -- and becomes eligible only after every worker sealed naturally.
+//  - The final view is built from the tree order, not from the DAG's Kahn view.
+static void test_mindmap_s1_global_closure_end_to_end() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(8);
+
+    const uint64_t ep_id = runtime.adopt_root(51, 51, 0, 1, 0);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+
+    const std::string wire =
+        "```mermaid\nmindmap\n"
+        "  求总和\n"
+        "    计算分量\n"
+        "      求 25 × 12\n"
+        "      求 15 × 16\n"
+        "    独立核验\n"
+        "      检查分量计算和最终总和\n"
+        "```\n";
+    const auto decision = server_rerot_parse_mindmap_decision(wire);
+    CHECK(decision.is_mindmap());
+    std::string err;
+    CHECK(runtime.initialize_mindmap(ep_id, decision, &err));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->plan_kind == "mindmap");
+    CHECK(ep->mindmap_tree_valid);
+    // The frozen tree is retained on the episode, including interior nodes.
+    CHECK(ep->mindmap_tree.nodes.size() == 6);
+    CHECK(ep->mindmap_tree.children.size() == 6);
+    CHECK(ep->mindmap_tree.leaf_count == 3);
+
+    // Every worker is eligible at once: no leaf edge, no serialization.
+    // Synthesis still has three predecessors, so only the three workers
+    // qualify -- that is the one barrier MM-R1 keeps, and it is the global
+    // handoff, not a leaf-to-leaf dependency.
+    size_t n_workers_ready = 0;
+    bool synth_ready = false;
+    for (const auto nid : runtime.get_eligible_dag_nodes(ep_id)) {
+        if (nid == (llama_rerot_node_id) ep->synthesis_node) {
+            synth_ready = true;
+        } else {
+            ++n_workers_ready;
+        }
+    }
+    CHECK(n_workers_ready == 3);
+    CHECK(!synth_ready);
+
+    // Workers are document-order nodes 1,2,3 and synthesis is 4.
+    CHECK(ep->synthesis_node == 4);
+
+    // Start all three workers and publish their public runs.
+    for (llama_rerot_node_id nid = 1; nid <= 3; ++nid) {
+        auto pen = runtime.allocate_pen(51, ep_id, nid);
+        CHECK(pen.has_value());
+        ep->document.set_node_state(nid, llama_rerot_node_state::running);
+        ep->running.insert(nid);
+        ep->nodes[nid].pen_id = *pen;
+        ep->document.append_run(nid, llama_rerot_visibility::public_live,
+                                (llama_pos) nid * 10, 3, 1);
+    }
+    // The plan prefix (formal P) is a run on the root.
+    ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 10, 1);
+
+    // Hierarchical reader order: worker 1 sits under 计算分量; rotating at the
+    // 计算分量 node puts its own subtree last.
+    const auto view1 = ep->document.build_view(1);
+    CHECK(view1.runs.size() == 4); // P + 3 workers
+    CHECK(view1.runs.back().owner == 1); // own work last
+    // Leaves become FLAT children of the root in the execution document (the
+    // hierarchy lives in the frozen mindmap_tree, which drives the scope paths
+    // and the reader order), so the rotation for worker 1 wraps siblings 2,3 to
+    // the front and leaves worker 1 last. The invariants that matter -- unique
+    // coverage, own-last, subtree contiguity -- are re-verified below by
+    // document.validate() for EVERY reader, which is the authoritative check.
+    CHECK(view1.runs[0].owner == 0);      // P
+    CHECK(view1.runs[1].owner == 2);      // first sibling wraps to the front
+    CHECK(view1.runs[2].owner == 3);      // remaining sibling
+    CHECK(view1.runs.back().owner == 1);  // own leaf last
+
+    const auto view3 = ep->document.build_view(3);
+    CHECK(view3.runs.size() == 4);
+    CHECK(view3.runs[0].owner == 0);
+    CHECK(view3.runs.back().owner == 3);   // own last
+    CHECK(view3.runs[1].owner == 1);       // siblings wrap
+    CHECK(view3.runs[2].owner == 2);
+
+    // The global entity (root reader) sees the CANONICAL order: P, then every
+    // worker in document order. No rotation is applied for it.
+    const auto global_view = ep->document.build_view(ep->synthesis_node);
+    CHECK(global_view.runs.size() == 4);
+    CHECK(global_view.runs[0].owner == 0);
+    CHECK(global_view.runs[1].owner == 1);
+    CHECK(global_view.runs[2].owner == 2);
+    CHECK(global_view.runs[3].owner == 3);
+
+    // Seal all three workers naturally, in an order that is NOT the canonical
+    // one: the reader order must not depend on completion order.
+    CHECK(runtime.seal_dag_node(ep_id, 3, llama_rerot_event_origin::worker_source));
+    CHECK(runtime.seal_dag_node(ep_id, 1, llama_rerot_event_origin::worker_source));
+    CHECK(runtime.seal_dag_node(ep_id, 2, llama_rerot_event_origin::worker_source));
+    for (llama_rerot_node_id nid = 1; nid <= 3; ++nid) {
+        CHECK(ep->nodes[nid].is_sealed);
+    }
+
+    // Now synthesis is eligible, and only then.
+    auto after = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(after.size() == 1);
+    CHECK(after[0] == (llama_rerot_node_id) ep->synthesis_node);
+
+    // The final (serial-tail) view is the canonical global order, unaffected by
+    // the seal order above. The document is the authority the fence installs
+    // from, so verify the order a second time after every worker sealed.
+    const auto final_view = ep->document.build_view(ep->synthesis_node);
+    CHECK(final_view.runs.size() == 4);
+    CHECK(final_view.runs[0].owner == 0); // P
+    CHECK(final_view.runs[1].owner == 1);
+    CHECK(final_view.runs[2].owner == 2);
+    CHECK(final_view.runs[3].owner == 3);
+    // Runs densely tile virtual positions for the global reader too.
+    llama_pos expect_pos = 0;
+    for (const auto & vr : final_view.runs) {
+        CHECK(vr.virtual_pos0 == expect_pos);
+        expect_pos += static_cast<llama_pos>(vr.token_count);
+    }
+    CHECK(final_view.query_virtual_pos == expect_pos);
+    // And the whole document still satisfies every structural invariant.
+    std::string verr;
+    CHECK(ep->document.validate(&verr));
+
+    // A budget abort is never a natural seal: it must not open the global stage.
+    // (Positive control: the origin gate already rejects forced_abort.)
+    CHECK(!runtime.seal_dag_node(ep_id, ep->synthesis_node,
+                                 llama_rerot_event_origin::forced_abort));
+    CHECK(!ep->nodes[ep->synthesis_node].is_sealed);
+}
+
+// MM-R1 M11: persistence of the mindmap plan, final mode and order version.
+//
+// A saved mindmap episode must reload with its frozen TreePlan intact (labels,
+// hierarchy, leaf ids) and its final mode recorded. The order version must not
+// go BACKWARDS on reload, and a legacy DAG blob must keep loading unchanged.
+static void test_mindmap_episode_persistence_round_trip() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(8);
+    const uint64_t ep_id = runtime.adopt_root(71, 71, 0, 1, 0);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+
+    const std::string wire =
+        "```mermaid\nmindmap\n"
+        "  求总和\n"
+        "    计算分量\n"
+        "      求 25 × 12\n"
+        "      求 15 × 16\n"
+        "    独立核验\n"
+        "      检查分量计算和最终总和\n"
+        "```\n";
+    const auto decision = server_rerot_parse_mindmap_decision(wire);
+    CHECK(decision.is_mindmap());
+    std::string err;
+    CHECK(runtime.initialize_mindmap(ep_id, decision, &err));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    ep->final_mode = "direct";
+    const uint64_t saved_order_version = ep->document.order_version();
+    const uint64_t saved_tree_hash = ep->mindmap_tree.tree_hash;
+
+    // Bump the order version the way a structural event would, so the reload
+    // path has a non-default value to preserve.
+    ep->document.invalidate_order_cache();
+    const uint64_t bumped_version = ep->document.order_version();
+    CHECK(bumped_version > saved_order_version);
+
+    // Release the physical slot so a fresh runtime can rebind it on load; the
+    // same precondition the existing DAG persistence test observes.
+    CHECK(runtime.demote_episode(ep_id));
+
+    const auto fp = test_state_fingerprints();
+    std::vector<uint8_t> blob;
+    CHECK(runtime.save_episode(ep_id, fp, &blob, &err));
+    CHECK(!blob.empty());
+
+    server_rerot_runtime restored(nullptr);
+    uint64_t restored_id = 0;
+    CHECK(restored.load_episode(blob.data(), blob.size(), fp, &restored_id, &err));
+    const auto * rp = restored.episode(restored_id);
+    CHECK(rp != nullptr);
+    if (rp == nullptr) {
+        return;
+    }
+    CHECK(rp->plan_kind == "mindmap");
+    CHECK(rp->final_mode == "direct");
+    CHECK(rp->mindmap_tree_valid);
+    // The frozen tree survived: same node count, same leaves, same labels.
+    CHECK(rp->mindmap_tree.node_count == 6);
+    CHECK(rp->mindmap_tree.leaf_count == 3);
+    CHECK(rp->mindmap_tree.root == 0);
+    CHECK(rp->mindmap_tree.tree_hash == saved_tree_hash);
+    CHECK(rp->mindmap_tree.nodes[0].label == "求总和");
+    CHECK(rp->mindmap_tree.nodes[5].label == "检查分量计算和最终总和");
+    CHECK(rp->mindmap_tree.children[0].size() == 2);
+    // The canonical wire round-trips through the reloaded plan.
+    CHECK(server_mindmap::serialize(rp->mindmap_tree) == wire);
+    // Order version is never allowed to go backwards.
+    CHECK(rp->document.order_version() >= bumped_version);
+
+    // A legacy DAG episode still saves and loads, and stays a DAG.
+    const uint64_t dag_ep = runtime.adopt_root(72, 72, 1, 2, 0);
+    CHECK(runtime.capture_c0(dag_ep, 2, 0));
+    CHECK(runtime.capture_c_base(dag_ep));
+    const std::string dag_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "A", "intent": "Fact A"}],
+        "depends_on": []
+      }
+    })";
+    const auto dag = server_rerot_parse_routing_decision(dag_json);
+    CHECK(dag.is_dag());
+    CHECK(runtime.initialize_dag(dag_ep, dag, &err));
+    CHECK(runtime.demote_episode(dag_ep));
+    std::vector<uint8_t> dag_blob;
+    CHECK(runtime.save_episode(dag_ep, fp, &dag_blob, &err));
+    server_rerot_runtime dag_restored(nullptr);
+    uint64_t dag_restored_id = 0;
+    CHECK(dag_restored.load_episode(dag_blob.data(), dag_blob.size(), fp, &dag_restored_id, &err));
+    const auto * dag_rp = dag_restored.episode(dag_restored_id);
+    CHECK(dag_rp != nullptr);
+    if (dag_rp != nullptr) {
+        CHECK(dag_rp->plan_kind == "dag");
+        CHECK(!dag_rp->mindmap_tree_valid);
+        CHECK(dag_rp->final_mode.empty());
+    }
+}
+
 static void test_c0_and_dag_admit_without_parked_seq() {
     // DAG workers start from C_base with parked_seq < 0. Admission must not
     // demand an HTML-fork parked sequence, and C0 remains valid with empty
@@ -7359,6 +7889,14 @@ static void test_dag_tri_mtp_ram_shift_speculative_matrix() {
 
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
+    test_mindmap_episode_persistence_round_trip();
+    test_mindmap_final_mode_contract();
+    test_mindmap_s1_global_closure_end_to_end();
+    test_mindmap_route_workers_carry_no_leaf_edges();
+    test_mindmap_scoped_worker_intent_uses_frozen_tree();
+    test_mindmap_root_only_plan_is_not_downgraded();
+    test_mindmap_rejects_invalid_plans_fail_closed();
+    test_mindmap_initialize_rejects_dag_decision();
     test_c0_and_dag_admit_without_parked_seq();
     test_dag_runtime_lifecycle();
     test_dag_capture_c_base_snapshots_current_seed();

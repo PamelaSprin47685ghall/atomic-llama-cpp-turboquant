@@ -220,6 +220,34 @@ static void test(void) {
         argv = {"binary_name", "--rerot-frontier", "eventual"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_rerot_params, LLAMA_EXAMPLE_SERVER));
 
+        // MM-R1 planning wire and final mode (mindmap research line).
+        common_params mm_default;
+        assert(mm_default.rerot_plan_wire == "json");
+        assert(mm_default.rerot_final_mode == "reason");
+
+        common_params mm_params;
+        argv = {"binary_name", "--rerot-plan-wire", "mindmap"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mm_params, LLAMA_EXAMPLE_SERVER));
+        assert(mm_params.rerot_enabled);
+        assert(mm_params.kv_unified);
+        assert(mm_params.rerot_plan_wire == "mindmap");
+        // The wire selector alone must not change the final mode.
+        assert(mm_params.rerot_final_mode == "reason");
+
+        common_params s0_params;
+        argv = {"binary_name", "--rerot-plan-wire", "mindmap", "--rerot-final-mode", "direct"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), s0_params, LLAMA_EXAMPLE_SERVER));
+        assert(s0_params.rerot_plan_wire == "mindmap");
+        assert(s0_params.rerot_final_mode == "direct");
+
+        common_params bad_wire;
+        argv = {"binary_name", "--rerot-plan-wire", "yaml"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), bad_wire, LLAMA_EXAMPLE_SERVER));
+
+        common_params bad_mode;
+        argv = {"binary_name", "--rerot-final-mode", "stream"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), bad_mode, LLAMA_EXAMPLE_SERVER));
+
         // Phase 0: full-auto contract and fail-fast checks (§B.3.1, §B.13)
         common_params full_auto_params;
         argv = {"binary_name", "--rerot", "--total-kv", "auto"};

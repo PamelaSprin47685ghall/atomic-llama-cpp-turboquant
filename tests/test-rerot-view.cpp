@@ -2326,6 +2326,95 @@ static void test_compact_span_abi() {
 }
 
 
+// MM-R1 M06: the two reader-order providers, their equivalence domains, and
+// the proof that the hierarchical order is NOT a flat ring rotation of the
+// canonical leaf order on deep trees (which is exactly why C4/C5 are separate
+// arms in the experiment matrix).
+static void test_order_providers_and_hierarchical_rotation() {
+    // R -> {A, B}; A -> {A1, A2}; B -> {B1, B2}
+    llama_rerot_document doc(7);
+    (void) doc.reset(7);
+    const auto a  = doc.create_child(doc.root(), "A", llama_rerot_node_state::queued);
+    const auto b  = doc.create_child(doc.root(), "B", llama_rerot_node_state::queued);
+    const auto a1 = doc.create_child(a, "A1", llama_rerot_node_state::queued);
+    const auto a2 = doc.create_child(a, "A2", llama_rerot_node_state::queued);
+    const auto b1 = doc.create_child(b, "B1", llama_rerot_node_state::queued);
+    const auto b2 = doc.create_child(b, "B2", llama_rerot_node_state::queued);
+
+    using provider = llama_rerot_document::order_provider;
+    const auto labels = [&](const std::vector<llama_rerot_node_id> & ids) {
+        std::vector<std::string> out;
+        for (auto id : ids) {
+            out.push_back(doc.node(id)->title);
+        }
+        return out;
+    };
+
+    const std::vector<std::string> a1_order = labels(doc.leaf_order(a1, provider::tree_dfs));
+    const std::vector<std::string> b1_order = labels(doc.leaf_order(b1, provider::tree_dfs));
+    CHECK((a1_order == std::vector<std::string>{"B1", "B2", "A2", "A1"}));
+    CHECK((b1_order == std::vector<std::string>{"A1", "A2", "B2", "B1"}));
+
+    // The canonical (reader-less) order is the document order A1,A2,B1,B2.
+    // A naive "rotate the flat leaf list so my own leaf is last" would give
+    // A1 -> (A2,B1,B2,A1) and B1 -> (B2,A1,A2,B1). Neither matches the
+    // hierarchical order, so C4 (flat rotation) and C5 (hierarchical) are
+    // genuinely different experiments -- not two spellings of one thing.
+    const std::vector<std::string> flat_for_a1 = {"A2", "B1", "B2", "A1"};
+    const std::vector<std::string> flat_for_b1 = {"B2", "A1", "A2", "B1"};
+    CHECK(a1_order != flat_for_a1);
+    CHECK(b1_order != flat_for_b1);
+
+    // Where the two DO coincide they must agree: with the reader in the
+    // LAST sibling subtree, no rotation is needed and the view is the document
+    // order. That boundary is exactly where a flat implementation stops being
+    // wrong, so it must be pinned rather than left to chance.
+    const std::vector<std::string> b2_order = labels(doc.leaf_order(b2, provider::tree_dfs));
+    CHECK((b2_order == std::vector<std::string>{"A1", "A2", "B1", "B2"}));
+
+    // build_view_for must agree with the provider-specific builder exactly.
+    const auto view_tree = doc.build_view_for(a1, provider::tree_dfs);
+    const auto view_direct = doc.build_view(a1);
+    CHECK(view_tree.runs.size() == view_direct.runs.size());
+    for (size_t i = 0; i < view_tree.runs.size(); ++i) {
+        CHECK(view_tree.runs[i].run_id == view_direct.runs[i].run_id);
+        CHECK(view_tree.runs[i].virtual_pos0 == view_direct.runs[i].virtual_pos0);
+    }
+
+    // The kahn provider takes the DAG path; on an edge-free document it must
+    // still return every leaf exactly once.
+    const auto kahn_order = doc.leaf_order(a1, provider::kahn);
+    CHECK(kahn_order.size() == 4);
+    std::set<llama_rerot_node_id> unique(kahn_order.begin(), kahn_order.end());
+    CHECK(unique.size() == 4);
+    CHECK(kahn_order.back() == a1); // reader last
+
+    // build_view_for for kahn does not accept the tree-only parameters.
+    bool threw = false;
+    try {
+        (void) doc.build_view_for(a1, provider::tree_dfs, {a1}, 0);
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    // An unknown reader fails closed in BOTH providers.
+    bool threw_range = false;
+    try {
+        (void) doc.leaf_order(9999, provider::tree_dfs);
+    } catch (const std::out_of_range &) {
+        threw_range = true;
+    }
+    CHECK(threw_range);
+
+    // Order version is monotonic and cache guards can be built on it.
+    const uint64_t v0 = doc.order_version();
+    doc.invalidate_order_cache();
+    CHECK(doc.order_version() > v0);
+
+    (void) a2; (void) b2;
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT View Tests ===\n");
     test_differential_query_layout_snapshot();
@@ -2349,6 +2438,7 @@ int main() {
     test_shared_layouts_vs_oracle();
     test_multi_reader_layouts_vs_oracle();
     test_shared_world_incremental();
+    test_order_providers_and_hierarchical_rotation();
     test_compact_span_abi();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;

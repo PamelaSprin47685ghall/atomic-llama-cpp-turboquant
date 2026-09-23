@@ -167,6 +167,8 @@ void task_params::apply_rerot_defaults(const common_params & base) {
     rerot_enabled = base.rerot_enabled;
     rerot_frontier = base.rerot_frontier;
     rerot_trace = base.rerot_trace;
+    rerot_plan_wire = base.rerot_plan_wire;
+    rerot_final_mode = base.rerot_final_mode;
 }
 
 bool task_params::rerot_effective(server_task_type task_type) const {

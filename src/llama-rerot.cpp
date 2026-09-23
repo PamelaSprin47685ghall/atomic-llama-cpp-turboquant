@@ -873,6 +873,97 @@ bool llama_rerot_document::validate(std::string * error) const {
     return true;
 }
 
+std::vector<llama_rerot_node_id> llama_rerot_document::leaf_order(
+        llama_rerot_node_id reader,
+        order_provider provider) const {
+    if (reader >= nodes_.size()) {
+        throw std::out_of_range("RERoT reader node does not exist");
+    }
+    std::vector<llama_rerot_node_id> order;
+    if (provider == order_provider::kahn) {
+        // Cycle-preferred topological sort over the DAG edges. The reader's own
+        // node renders last; ties break by plan_rank so the order is stable.
+        std::vector<llama_rerot_node_id> all;
+        all.reserve(nodes_.size());
+        for (const auto & n : nodes_) {
+            if (n.children.empty()) {
+                all.push_back(n.id);
+            }
+        }
+        std::sort(all.begin(), all.end(), [&](llama_rerot_node_id a, llama_rerot_node_id b) {
+            const bool a_last = (a == reader);
+            const bool b_last = (b == reader);
+            if (a_last != b_last) {
+                return b_last; // reader last
+            }
+            return nodes_[a].plan_rank < nodes_[b].plan_rank;
+        });
+        return all;
+    }
+
+    // tree_dfs: emit leaves in Path-Anchored Cyclic DFS order. Emitting through
+    // the same render walk guarantees the leaf order and the run-level view can
+    // never disagree -- a divergence between the two would silently change the
+    // attention layout, so they are computed from one traversal.
+    std::vector<llama_rerot_node_id> stack;
+    stack.push_back(root());
+    while (!stack.empty()) {
+        const llama_rerot_node_id u = stack.back();
+        stack.pop_back();
+        const auto & node = nodes_[u];
+        if (node.children.empty()) {
+            order.push_back(u);
+            continue;
+        }
+        size_t reader_child = node.children.size();
+        for (size_t i = 0; i < node.children.size(); ++i) {
+            if (is_ancestor(node.children[i], reader)) {
+                reader_child = i;
+                break;
+            }
+        }
+        // Push in reverse of emission order: following siblings, then preceding
+        // siblings, then the reader branch.
+        std::vector<llama_rerot_node_id> emit;
+        emit.reserve(node.children.size());
+        if (reader_child == node.children.size()) {
+            for (const auto c : node.children) {
+                emit.push_back(c);
+            }
+        } else {
+            for (size_t i = reader_child + 1; i < node.children.size(); ++i) {
+                emit.push_back(node.children[i]);
+            }
+            for (size_t i = 0; i < reader_child; ++i) {
+                emit.push_back(node.children[i]);
+            }
+            emit.push_back(node.children[reader_child]);
+        }
+        for (size_t k = emit.size(); k-- > 0;) {
+            stack.push_back(emit[k]);
+        }
+    }
+    return order;
+}
+
+llama_rerot_reader_view llama_rerot_document::build_view_for(
+        llama_rerot_node_id reader,
+        order_provider provider,
+        const std::vector<llama_rerot_node_id> & started_nodes,
+        uint64_t frozen_read_publish_epoch) const {
+    if (provider == order_provider::kahn) {
+        return build_dag_view(reader, started_nodes, frozen_read_publish_epoch);
+    }
+    if (frozen_read_publish_epoch != 0 || !started_nodes.empty()) {
+        // Missing parameters are a caller defect, not a permissive path: the
+        // tree provider has no Kahn equivalents for them, so silently ignoring
+        // the arguments would produce a view the caller did not ask for.
+        throw std::invalid_argument(
+            "RERoT tree_dfs order provider does not accept started_nodes or epoch freeze");
+    }
+    return build_view(reader);
+}
+
 bool llama_rerot_attn_layout::validate(uint32_t n_keys, std::string * error) const {
     // Predefine discipline (thirteenth round): the builder is the single
     // source of truth and its construction already guarantees the checked

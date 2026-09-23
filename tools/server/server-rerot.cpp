@@ -970,12 +970,63 @@ std::string server_rerot_format_fixed_entry(
     return frame;
 }
 
+// Composes the intent text a MM-R1 worker sees in its fixed entry. The frozen
+// tree supplies the scope (total goal + ancestor path + own task); the
+// collaboration contract is narrative, NOT a scheduling DSL -- it must never
+// introduce a marker the runtime would treat as a barrier, a wait, or a yield.
+// A worker that cannot see a peer's result must say so, not assume it.
+std::string server_rerot_mindmap_worker_intent(
+        const server_mindmap::plan & tree,
+        uint32_t leaf_id,
+        std::string_view collaboration) {
+    if (leaf_id == UINT32_MAX || leaf_id >= tree.nodes.size()) {
+        return {};
+    }
+    if (tree.root == UINT32_MAX || tree.root >= tree.nodes.size()) {
+        return {};
+    }
+    std::string out = "总目标：";
+    out += tree.nodes[tree.root].label;
+    out += "\n作用域：";
+    std::vector<uint32_t> chain;
+    uint32_t u = leaf_id;
+    while (u != UINT32_MAX) {
+        chain.push_back(u);
+        u = tree.nodes[u].parent;
+    }
+    // Ancestors strictly between the root and the leaf, root-first.
+    for (size_t k = chain.size() - 1; k-- > 0;) {
+        if (chain[k] == tree.root) {
+            continue;
+        }
+        out += "\n- ";
+        out += tree.nodes[chain[k]].label;
+    }
+    out += "\n本叶任务：";
+    out += tree.nodes[leaf_id].label;
+    if (!collaboration.empty()) {
+        out += "\n协作：";
+        out += std::string(collaboration);
+    }
+    out += "\n输出职责：完成本叶推导，不冒充最终全局回答。";
+    return out;
+}
+
 std::string server_rerot_format_plan_prefix(
         const server_rerot_routing_decision & decision,
         std::string_view think_start) {
+    if (decision.is_mindmap()) {
+        // Formal P keeps the canonical Mermaid tree: the hierarchy is the
+        // plan, so flattening it to a bullet list would destroy the scope
+        // information every worker needs.
+        std::string prefix = "plan:\n";
+        prefix += server_mindmap::serialize(decision.tree);
+        return prefix;
+    }
     if (!decision.is_dag() || decision.questions.empty()) {
         return {};
     }
+    (void) think_start;
     std::vector<const server_rerot_dag_plan_item *> ordered;
     ordered.reserve(decision.questions.size());
     for (const auto & q : decision.questions) {
@@ -1067,6 +1118,36 @@ std::string server_rerot_routing_schema_json() {
 std::string server_rerot_routing_grammar() {
     const auto schema = nlohmann::ordered_json::parse(server_rerot_routing_schema_json());
     return json_schema_to_grammar(schema);
+}
+
+std::string_view server_rerot_mindmap_probe_prompt() {
+    // MM-R1 planning prompt. The model continues its own thinking with one
+    // instruction line, then emits the fenced mindmap. No example block is
+    // given on purpose: a worked example gets copied verbatim (observed with a
+    // named example producing a plan referencing undefined ids), and the role
+    // nouns here are instructions, not labels to echo.
+    //
+    // Every node label MUST be real content drawn from the user's request --
+    // never a placeholder like "A", "B", "task1" or the word "root".
+    static constexpr std::string_view prompt =
+        "Let me organize this with a mindmap first. Output only one mermaid code block.\n"
+        "The top node is the user's overall goal in their own words.\n"
+        "The next levels break it into concrete dimensions.\n"
+        "The deepest nodes name individual executable subtasks, each one a piece of work that "
+        "can be reasoned about on its own.\n"
+        "Every node label must be real content from the request: never a placeholder such as "
+        "\"A\", \"B\", \"task1\" or the word \"root\".\n"
+        "Indent two spaces per level; the top node is indented two spaces. At most six levels.\n"
+        "Split by the dimensions the request actually names -- do not add or drop any.\n"
+        "Keep a continuous derivation inside one node instead of splitting it step by step.\n"
+        "Nodes work concurrently and can see each other's committed progress at submission boundaries.\n"
+        "Cross-branch conclusions are integrated afterwards, so a node need not force a total order.\n"
+        "Do not output task ids, dependency edges, styles, or the final answer.\n";
+    return prompt;
+}
+
+std::string server_rerot_mindmap_grammar() {
+    return server_mindmap::grammar_g0();
 }
 
 std::string server_rerot_source_end_grammar(std::string_view close_marker) {
@@ -1261,6 +1342,34 @@ server_rerot_routing_decision server_rerot_parse_routing_decision(const std::str
     }
 
     result.error = "unknown strategy: " + strategy;
+    return result;
+}
+
+// Parses one MM-R1 Mermaid mindmap probe decision. The wire is the fenced
+// mindmap block itself; the strict incremental parser decides incomplete /
+// complete / invalid and carries its own diagnosis. Fail-closed: any budget
+// or protocol defect leaves the decision invalid; nothing is repaired,
+// dropped, or reordered.
+server_rerot_routing_decision server_rerot_parse_mindmap_decision(const std::string & wire) {
+    server_rerot_routing_decision result;
+    const auto parsed = server_mindmap::parse(wire);
+
+    if (parsed.is_incomplete()) {
+        result.incomplete = true;
+        result.error = "incomplete mindmap document";
+        return result;
+    }
+    if (parsed.is_invalid()) {
+        result.error = parsed.error;
+        return result;
+    }
+
+    result.strategy = server_rerot_routing_decision::strategy_type::mindmap;
+    result.tree = parsed.tree;
+    result.has_tree = true;
+    // A root-only mindmap carries no executable leaf beyond the goal itself:
+    // it is the mindmap wire's `simple` and MUST NOT be downgraded silently
+    // by the caller -- the episode keeps plan_kind=mindmap.
     return result;
 }
 
@@ -2249,9 +2358,14 @@ bool server_rerot_runtime::build_reader_view_desc(
         llama_rerot_run_id query_run,
         std::vector<uint32_t> & ordered_runs,
         llama_rerot_reader_view_desc & desc) const {
-    const auto view = episode.is_dag
-        ? build_dag_view_for_reader(episode.id, node.id)
-        : episode.document.build_view(node.id);
+    // MM-R1 orders readers by the hierarchical cyclic DFS (the frozen tree),
+    // not by the DAG's cycle-preferred topological sort: the plan kind decides
+    // the provider, and `is_dag` alone would silently fall back to Kahn.
+    const auto view = episode.plan_kind == "mindmap"
+        ? episode.document.build_view(node.id)
+        : (episode.is_dag
+            ? build_dag_view_for_reader(episode.id, node.id)
+            : episode.document.build_view(node.id));
     ordered_runs.clear();
     ordered_runs.reserve(view.runs.size() + 1);
     // Explicit research control, never selected as an automatic fallback.
@@ -2817,14 +2931,54 @@ bool server_rerot_runtime::initialize_dag(
         uint64_t episode_id,
         const server_rerot_routing_decision & decision,
         std::string * error_out) {
+    // The shipped DAG wire is unchanged: model-declared ids, intents and
+    // dependencies. MM-R1 has its own entry below and must never be reached
+    // through this path, so an absent tree is an error rather than a fallback.
+    if (decision.has_tree) {
+        if (error_out) *error_out = "DAG initialization received a mindmap plan";
+        return false;
+    }
+    return initialize_plan_impl(episode_id, decision, error_out, true);
+}
+
+bool server_rerot_runtime::initialize_mindmap(
+        uint64_t episode_id,
+        const server_rerot_routing_decision & decision,
+        std::string * error_out) {
+    return initialize_plan_impl(episode_id, decision, error_out, false);
+}
+
+bool server_rerot_runtime::initialize_plan_impl(
+        uint64_t episode_id,
+        const server_rerot_routing_decision & decision,
+        std::string * error_out,
+        bool model_declared_dependencies) {
     auto * ep = episode(episode_id);
     if (!ep) {
         if (error_out) *error_out = "episode not found";
         return false;
     }
-    if (!decision.is_dag()) {
-        if (error_out) *error_out = "invalid DAG decision: " + decision.error;
-        return false;
+    if (model_declared_dependencies) {
+        // Shipped DAG wire: model-declared questions and dependencies.
+        if (!decision.is_dag()) {
+            if (error_out) *error_out = "invalid DAG decision: " + decision.error;
+            return false;
+        }
+        if (decision.questions.empty()) {
+            if (error_out) *error_out = "DAG decision has no question";
+            return false;
+        }
+    } else {
+        // MM-R1: a strict mindmap plan is mandatory, never optional.
+        if (!decision.has_tree || !decision.is_mindmap()) {
+            if (error_out) *error_out = "invalid mindmap decision: " + decision.error;
+            return false;
+        }
+        if (decision.tree.nodes.empty() || decision.tree.root == UINT32_MAX ||
+            decision.tree.root >= decision.tree.nodes.size()) {
+            if (error_out) *error_out = "mindmap plan has no root";
+            return false;
+        }
     }
     if (ep->hard_aborted) {
         if (error_out) *error_out = "episode is hard aborted";
@@ -2849,6 +3003,11 @@ bool server_rerot_runtime::initialize_dag(
 
     ep->is_dag = true;
     ep->strategy_decided = true;
+    ep->plan_kind = model_declared_dependencies ? "dag" : "mindmap";
+    if (!model_declared_dependencies) {
+        ep->mindmap_tree = decision.tree;
+        ep->mindmap_tree_valid = true;
+    }
     ep->document.set_dag_mode(true);
     ep->document.set_stage_role(0, llama_rerot_stage_role::planner);
     if (!ep->nodes.empty()) {
@@ -2856,46 +3015,129 @@ bool server_rerot_runtime::initialize_dag(
         ep->nodes[0].planner_armed = false;
     }
 
-    std::unordered_map<std::string, llama_rerot_node_id> str_to_nid;
+    // ---- plan -> workers ----------------------------------------------------
+    // MM-R1: only LEAVES become workers. Internal concept nodes stay in the
+    // document tree for scope paths and reader ordering, but they never take a
+    // pen, a seq, or a recurrent blob. One leaf produces exactly one worker:
+    // no path duplication, no re-expansion, no recomputation.
+    // The shipped DAG wire keeps its flat questions list.
 
-    for (const auto & q : decision.questions) {
-        auto nid = ep->document.create_child(ep->document.root(), q.intent, llama_rerot_node_state::queued);
-        ep->document.set_plan_rank(nid, q.plan_rank);
+    // Per-worker descriptor resolved from either plan source. `leaf_id` is the
+    // host node id in the frozen TreePlan (UINT32_MAX for the flat DAG wire,
+    // which has no tree) and drives the hierarchical reader order.
+    struct worker_desc {
+        std::string id;
+        std::string intent;
+        std::string scope;
+        uint32_t leaf_id = UINT32_MAX;
+    };
+    std::vector<worker_desc> workers;
+
+    if (model_declared_dependencies) {
+        for (const auto & q : decision.questions) {
+            worker_desc w;
+            w.id = q.id;
+            w.intent = q.intent;
+            workers.push_back(std::move(w));
+        }
+    } else {
+        const server_mindmap::plan & tree = decision.tree;
+        std::vector<uint32_t> leaf_ids;
+        tree.leaves(leaf_ids);
+        for (uint32_t id : leaf_ids) {
+            const auto & node = tree.nodes[id];
+            // Scope path (root .. parent): the intent a worker sees must
+            // describe WHERE in the tree it sits, not just what to compute.
+            std::string scope;
+            std::vector<uint32_t> chain;
+            uint32_t u = id;
+            while (u != UINT32_MAX) {
+                chain.push_back(u);
+                u = tree.nodes[u].parent;
+            }
+            for (size_t k = chain.size(); k-- > 0;) {
+                if (k + 1 < chain.size()) {
+                    scope += " / ";
+                }
+                scope += tree.nodes[chain[k]].label;
+            }
+            worker_desc w;
+            w.id = "leaf_" + std::to_string(id);
+            w.intent = node.label;
+            w.scope = scope;
+            w.leaf_id = id;
+            workers.push_back(std::move(w));
+        }
+    }
+    if (workers.empty()) {
+        if (error_out) *error_out = model_declared_dependencies
+            ? "DAG decision has no question"
+            : "mindmap plan has no leaf";
+        return false;
+    }
+
+    std::unordered_map<std::string, llama_rerot_node_id> worker_to_nid;
+    uint32_t rank = 0;
+    for (const auto & w : workers) {
+        auto nid = ep->document.create_child(
+            ep->document.root(), w.intent, llama_rerot_node_state::queued);
+        ep->document.set_plan_rank(nid, rank++);
         ep->document.set_stage_role(nid, llama_rerot_stage_role::worker);
 
         server_rerot_node_runtime nr;
         nr.id = nid;
-        nr.string_id = q.id;
-        nr.intent = q.intent;
+        nr.string_id = w.id;
+        nr.intent = w.intent;
+        nr.scope_path = w.scope;
+        nr.tree_leaf_id = w.leaf_id;
         nr.planner_armed = false;
         nr.stage_role = llama_rerot_stage_role::worker;
         if (!ep->source_end_marker.empty()) {
             nr.exit_parser = server_rerot_marker_parser(ep->source_end_marker, true);
         }
-
         if (nid >= ep->nodes.size()) {
             ep->nodes.resize(nid + 1);
         }
         ep->nodes[nid] = std::move(nr);
-        str_to_nid[q.id] = nid;
+        worker_to_nid.emplace(w.id, nid);
     }
 
-    for (const auto & dep : decision.dependencies) {
-        auto from_nid = str_to_nid.at(dep.from_id);
-        auto to_nid = str_to_nid.at(dep.to_id);
-        if (!ep->document.add_edge(from_nid, to_nid, error_out)) {
+    if (model_declared_dependencies && !decision.dependencies.empty()) {
+        // Shipped DAG semantics: the model-declared dependency list is honoured
+        // verbatim. MM-R1 never reaches this branch because its parser leaves
+        // `dependencies` empty by construction -- that emptiness is the
+        // zero-hard-edge invariant the research line is testing.
+        for (const auto & dep : decision.dependencies) {
+            auto from_it = worker_to_nid.find(dep.from_id);
+            auto to_it = worker_to_nid.find(dep.to_id);
+            if (from_it == worker_to_nid.end() || to_it == worker_to_nid.end()) {
+                if (error_out) *error_out = "unknown dependency endpoint: " +
+                    dep.from_id + " -> " + dep.to_id;
+                return false;
+            }
+            if (!ep->document.add_edge(from_it->second, to_it->second, error_out)) {
+                return false;
+            }
+        }
+    }
+
+    for (const auto & w : workers) {
+        auto it = worker_to_nid.find(w.id);
+        if (it == worker_to_nid.end() ||
+            !ep->document.add_edge(0, it->second, error_out)) {
             return false;
         }
     }
 
-    for (const auto & q : decision.questions) {
-        if (!ep->document.add_edge(0, str_to_nid.at(q.id), error_out)) {
-            return false;
-        }
-    }
-
-    auto synth = ep->document.create_child(ep->document.root(), "0.synthesize", llama_rerot_node_state::queued);
-    ep->document.set_plan_rank(synth, static_cast<uint32_t>(decision.questions.size()));
+    // The global node's document title is host-side bookkeeping, but it is also
+    // rendered into the fixed entry label, so MM-R1 names it in its own
+    // vocabulary ("global root") rather than reusing the DAG "0.synthesize"
+    // string a reader would recognise as the old protocol.
+    auto synth = ep->document.create_child(
+        ep->document.root(),
+        model_declared_dependencies ? "0.synthesize" : "global root",
+        llama_rerot_node_state::queued);
+    ep->document.set_plan_rank(synth, static_cast<uint32_t>(workers.size()));
     ep->document.set_stage_role(synth, llama_rerot_stage_role::synthesis);
     if (synth >= ep->nodes.size()) {
         ep->nodes.resize(synth + 1);
@@ -2903,7 +3145,9 @@ bool server_rerot_runtime::initialize_dag(
     server_rerot_node_runtime synth_nr;
     synth_nr.id = synth;
     synth_nr.string_id = "0";
-    synth_nr.intent = "0.synthesize";
+    synth_nr.intent = model_declared_dependencies
+        ? "0.synthesize"
+        : "Integrate every mindmap node's committed result into one final answer";
     synth_nr.planner_armed = false;
     synth_nr.stage_role = llama_rerot_stage_role::synthesis;
     if (!ep->source_end_marker.empty()) {
@@ -2911,8 +3155,10 @@ bool server_rerot_runtime::initialize_dag(
     }
     ep->nodes[synth] = std::move(synth_nr);
     ep->synthesis_node = synth;
-    for (const auto & q : decision.questions) {
-        if (!ep->document.add_edge(str_to_nid.at(q.id), synth, error_out)) {
+    for (const auto & w : workers) {
+        auto it = worker_to_nid.find(w.id);
+        if (it == worker_to_nid.end() ||
+            !ep->document.add_edge(it->second, synth, error_out)) {
             return false;
         }
     }
@@ -4778,9 +5024,11 @@ bool server_rerot_runtime::refresh_final_fence(
     // does NOT decode/re-evaluate the closing sequence; neither does the core
     // refresh barrier (synchronize only). Full §21.4 close replay still needs
     // a causal checkpoint and must not double-apply recurrent transitions.
-    const auto view = current->is_dag
-        ? build_dag_view_for_reader(current->id, node_id)
-        : current->document.build_view(node_id);
+    const auto view = current->plan_kind == "mindmap"
+        ? current->document.build_view(node_id)
+        : (current->is_dag
+            ? build_dag_view_for_reader(current->id, node_id)
+            : current->document.build_view(node_id));
     if (ordered_runs_out) {
         ordered_runs_out->clear();
         ordered_runs_out->reserve(view.runs.size());
@@ -5335,6 +5583,43 @@ std::vector<uint8_t> server_rerot_episode_save(
     w.u64(episode.forced_heading_tokens);
     w.u64(episode.pending_tokens);
     w.u64(episode.queue_peak);
+    // MM-R1 plan identity. plan_kind is a short enum-valued string, final_mode
+    // the selected global shape, and order_version guards every cached reader
+    // order: a blob restored into a binary whose order providers changed must
+    // rebuild its orders instead of reusing positions computed by an older
+    // provider.
+    w.str(episode.plan_kind);
+    w.str(episode.final_mode);
+    w.u64(episode.document.order_version());
+    // The frozen TreePlan, only present for a mindmap episode. Writing an empty
+    // plan for any other kind keeps a legacy-shaped blob byte-compatible in the
+    // fields AFTER this point.
+    const bool has_tree = episode.plan_kind == "mindmap" && episode.mindmap_tree_valid;
+    w.u8(has_tree ? 1 : 0);
+    if (has_tree) {
+        const server_mindmap::plan & tree = episode.mindmap_tree;
+        w.u32(tree.root);
+        w.u64(tree.tree_hash);
+        w.u32(tree.leaf_count);
+        w.u32(tree.node_count);
+        w.u32(tree.depth);
+        w.u32(static_cast<uint32_t>(tree.nodes.size()));
+        for (const auto & node : tree.nodes) {
+            w.u32(node.host_node_id);
+            w.u32(node.parent);
+            w.u32(node.depth);
+            w.u64(node.subtree_eleaves);
+            w.u32(node.preorder_rank);
+            w.str(node.label);
+        }
+        w.u32(static_cast<uint32_t>(tree.children.size()));
+        for (const auto & kids : tree.children) {
+            w.u32(static_cast<uint32_t>(kids.size()));
+            for (const uint32_t kid : kids) {
+                w.u32(kid);
+            }
+        }
+    }
     w.u64(episode.hard_limits.max_total_tokens);
     w.u64(episode.hard_limits.max_nodes);
     w.u64(episode.hard_limits.max_queue_descriptors);
@@ -5615,6 +5900,58 @@ bool server_rerot_episode_load(
     const uint64_t forced_heading = r.u64();
     const uint64_t pending_tokens = r.u64();
     const uint64_t queue_peak = r.u64();
+    // MM-R1 plan identity (see the writer). A version-6 blob always carries
+    // these fields; a version-5 blob is rejected outright above, so there is no
+    // "old shape without them" path to guess about.
+    std::string plan_kind = r.str();
+    std::string final_mode = r.str();
+    const uint64_t order_version = r.u64();
+    const bool has_tree = r.u8() != 0;
+    server_mindmap::plan tree;
+    if (has_tree) {
+        tree.root = r.u32();
+        tree.tree_hash = r.u64();
+        tree.leaf_count = r.u32();
+        tree.node_count = r.u32();
+        tree.depth = r.u32();
+        const uint32_t n_nodes = r.u32();
+        if (!r.ok || n_nodes > (r.n - r.off)) {
+            r.ok = false;
+            return rerot_state_set_error(error_out, "RERoT episode load refused: corrupt mindmap node count");
+        }
+        tree.nodes.resize(n_nodes);
+        for (auto & node : tree.nodes) {
+            node.host_node_id = r.u32();
+            node.parent = r.u32();
+            node.depth = r.u32();
+            node.subtree_eleaves = r.u64();
+            node.preorder_rank = r.u32();
+            node.label = r.str();
+            if (!r.ok) {
+                return rerot_state_set_error(error_out, "RERoT episode load refused: truncated mindmap node");
+            }
+        }
+        const uint32_t n_child_lists = r.u32();
+        if (!r.ok || n_child_lists > (r.n - r.off)) {
+            r.ok = false;
+            return rerot_state_set_error(error_out, "RERoT episode load refused: corrupt mindmap child count");
+        }
+        tree.children.resize(n_child_lists);
+        for (auto & kids : tree.children) {
+            const uint32_t n_kids = r.u32();
+            if (!r.ok || n_kids > (r.n - r.off)) {
+                r.ok = false;
+                return rerot_state_set_error(error_out, "RERoT episode load refused: corrupt mindmap child list");
+            }
+            kids.resize(n_kids);
+            for (auto & kid : kids) {
+                kid = r.u32();
+            }
+        }
+    }
+    if (!r.ok) {
+        return rerot_state_set_error(error_out, "RERoT episode load refused: truncated mindmap plan");
+    }
     server_rerot_hard_limits limits;
     limits.max_total_tokens = r.u64();
     limits.max_nodes = r.u64();
@@ -6094,6 +6431,39 @@ bool server_rerot_episode_load(
     rebuilt.dag_step_committed = std::set<llama_rerot_node_id>(
         dag_step_committed_vec.begin(), dag_step_committed_vec.end());
     rebuilt.synthesis_node = synthesis_node;
+    // MM-R1 plan identity. A mindmap blob must carry a tree, and any other
+    // kind must not: the check keeps a future "mindmap without a plan" blob
+    // from silently becoming a DAG on reload.
+    rebuilt.plan_kind = std::move(plan_kind);
+    rebuilt.final_mode = std::move(final_mode);
+    if (rebuilt.plan_kind == "mindmap") {
+        if (!has_tree) {
+            return rerot_state_set_error(error_out, "RERoT episode load refused: mindmap plan without its tree");
+        }
+        rebuilt.mindmap_tree = std::move(tree);
+        rebuilt.mindmap_tree_valid = true;
+        // The frozen tree is re-validated on load: a corrupt archive must not
+        // become a plan the runtime trusts.
+        const std::string canonical = server_mindmap::serialize(rebuilt.mindmap_tree);
+        if (canonical.empty() || server_mindmap::parse(canonical).tree.tree_hash !=
+                                    rebuilt.mindmap_tree.tree_hash) {
+            return rerot_state_set_error(error_out, "RERoT episode load refused: mindmap tree failed round-trip validation");
+        }
+    } else if (has_tree) {
+        return rerot_state_set_error(error_out, "RERoT episode load refused: non-mindmap episode carried a tree");
+    }
+    if (rebuilt.plan_kind.empty() && is_dag) {
+        // A version-6 blob written by a DAG episode carries the literal "dag".
+        rebuilt.plan_kind = "dag";
+    }
+    if (!rebuilt.plan_kind.empty() &&
+        rebuilt.plan_kind != "dag" && rebuilt.plan_kind != "mindmap") {
+        return rerot_state_set_error(error_out, "RERoT episode load refused: unknown plan kind");
+    }
+    // Order caches keyed on a smaller version are stale by construction.
+    while (rebuilt.document.order_version() < order_version) {
+        rebuilt.document.invalidate_order_cache();
+    }
     rebuilt.source_end_marker = std::move(source_end_marker);
     rebuilt.think_start_marker = think_start_marker.empty() ? std::string("<think>") : std::move(think_start_marker);
     if (rebuilt.probing || rebuilt.probe_seq >= 0) {

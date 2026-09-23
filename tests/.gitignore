@@ -5,3 +5,11 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+
+# MM-R1 protocol fixtures and frozen evaluation set: these are inputs to the
+# parser/sampler tests and the experiment harness, not build output, so they
+# must be versioned. (The blanket `*` rule above would otherwise swallow the
+# directory itself, and git would never descend into it.)
+!data/
+!data/rerot-mindmap/
+!data/rerot-mindmap/*
