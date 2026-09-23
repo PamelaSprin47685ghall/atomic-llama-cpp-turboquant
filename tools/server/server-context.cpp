@@ -169,13 +169,6 @@ enum class server_rerot_injection_kind : uint8_t {
 // for 240s with zero bytes streamed). Fail closed well before that.
 static constexpr uint64_t SERVER_REROT_PROBE_MAX_TOKENS = 512;
 
-// Anti-livelock bound for DAG admission. A cohort member that is admitted,
-// holds a pen, and still never receives a batch row is a scheduler stall, not a
-// slow lane: the cohort cannot complete, so no pen is ever released. This many
-// consecutive no-progress admissions aborts the episode with a diagnosis
-// instead of spinning until the client times out. Large enough that a healthy
-// slow lane never trips it, small enough to fail in seconds rather than minutes.
-static constexpr uint32_t k_rerot_admit_stall_limit = 64;
 static constexpr size_t SERVER_REROT_PRIVATE_BATCH = 32;
 
 static bool server_rerot_private_microbatch(server_rerot_injection_kind injection) {
@@ -4106,10 +4099,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
         return true;
     }
 
-    // Consecutive admissions that made no cohort progress (see the guard in
-    // rerot_admit_ready). Reset whenever a lane commits a frontier token.
-    uint32_t rerot_admit_stall_strikes = 0;
-
     // Advisory result: `ok` = admission ran, `saturated` = pen arena full
     // (no progress this step, not an error), `failed` = episode aborted.
     enum class rerot_admit_ready_result : uint8_t { ok = 0, saturated, failed };
@@ -4118,6 +4107,46 @@ llama_tokens rerot_native_fixed_entry_tokens(
         auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
         if (!episode || episode->hard_aborted) {
             return rerot_admit_ready_result::failed;
+        }
+
+        // Cohort-barrier deadlock guard.
+        //
+        // Failure mode observed: a logical step's members split into lanes that
+        // hold a pen in STARTING (their fixed entry never received a batch row)
+        // and lanes that were suspended waiting for the step to advance. Both
+        // sides wait for the other, no token is ever produced, and the decode
+        // loop spins at 100% CPU until the client times out.
+        //
+        // The state is detectable exactly: the cohort is open, it is not
+        // complete, NOTHING is RUNNING, and no admitted lane is currently
+        // generating on its executor. In that state no admission can make
+        // progress, so failing closed with a diagnosis is strictly better than
+        // an unbounded spin. `starting` alone is NOT treated as runnable here:
+        // a lane whose frame never advances holds its pen forever without ever
+        // producing a token.
+        if (episode->is_dag && !episode->dag_step_cohort.empty() &&
+            !rerot->dag_logical_step_complete(episode_id) &&
+            !episode->serial_tail) {
+            bool any_running = false;
+            for (const auto nid : episode->running) {
+                if (nid != 0) { any_running = true; break; }
+            }
+            bool any_generating = false;
+            for (auto & candidate : slots) {
+                if (candidate.rerot_internal &&
+                    candidate.rerot_episode_id == episode_id &&
+                    candidate.state == SLOT_STATE_GENERATING) {
+                    any_generating = true;
+                    break;
+                }
+            }
+            if (!any_running && !any_generating) {
+                rerot->hard_abort(
+                    episode_id,
+                    "rerot_scheduler_error: cohort barrier deadlock (no running lane and no "
+                    "generating executor while a logical step is open)");
+                return rerot_admit_ready_result::failed;
+            }
         }
 
         // pen_capacity is the hard in-flight-lane bound. The DAG activa-
@@ -4189,10 +4218,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
                 if (pending.has_value()) {
                     const llama_rerot_node_id nid = *pending;
                     const bool is_synth = (nid == episode->synthesis_node);
-                    // This branch re-selects a cohort member that already holds
-                    // or is about to hold a pen. Repeating it without any token
-                    // committing in between is the stall signature.
-                    ++rerot_admit_stall_strikes;
                     if (episode->suspended.count(nid) != 0) {
                         if (!rerot->resume_pen(episode_id, nid, free_slot->id, free_slot->id) ||
                             !rerot_prepare_child_slot(episode_id, nid, *free_slot)) {
@@ -4238,12 +4263,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
                 // Detecting it here turns a silent hang into a diagnosable
                 // hard abort instead of burning the request until the client
                 // times out.
-                if (rerot_admit_stall_strikes >= k_rerot_admit_stall_limit) {
-                    rerot->hard_abort(
-                        episode_id,
-                        "rerot_scheduler_error: admission made no progress for a cohort member");
-                    return rerot_admit_ready_result::failed;
-                }
                 if (!rerot->admit_next_child(
                         episode_id, free_slot->id, free_slot->id, &admitted) ||
                     admitted == LLAMA_REROT_NODE_INVALID ||
@@ -4379,7 +4398,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
     // when the piece leaves no legal completion. Returns false (and aborts) on
     // a protocol violation; true otherwise.
     bool rerot_mindmap_probe_admit(
-            server_slot & slot,
             server_rerot_episode & episode,
             const std::string & piece) {
         const server_mindmap::sampler_limits lim =
@@ -4527,11 +4545,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
 
         const bool forced = slot.rerot_inflight_forced;
         auto * episode_now = rerot->episode(episode_id);
-        // A committed row is progress: clear the admission-stall strike so only
-        // CONSECUTIVE no-progress admissions can trip the guard.
-        if (!forced) {
-            rerot_admit_stall_strikes = 0;
-        }
         if (episode_now && episode_now->probing && !forced) {
             // MM-R1 G1 audit: the probe is constrained by the bounded-depth
             // GBNF, which fixes the structure but not the budgets or the
@@ -4539,11 +4552,11 @@ llama_tokens rerot_native_fixed_entry_tokens(
             // and fails closed on any token after which no legal document can
             // be completed. This is a correction net, not a second grammar.
             if (episode_now->plan_kind == "mindmap") {
-                if (!rerot_mindmap_probe_admit(slot, *episode_now, slot.rerot_inflight_bytes)) {
+                if (!rerot_mindmap_probe_admit(*episode_now, slot.rerot_inflight_bytes)) {
                     return false;
                 }
                 for (const auto & extra : slot.rerot_inflight_extra_bytes) {
-                    if (!rerot_mindmap_probe_admit(slot, *episode_now, extra)) {
+                    if (!rerot_mindmap_probe_admit(*episode_now, extra)) {
                         return false;
                     }
                 }
@@ -5081,6 +5094,7 @@ llama_tokens rerot_native_fixed_entry_tokens(
         if (episode->is_dag) {
             rerot->yield_dag_pen_for_ready(episode_id);
             rerot_idle_unbound_slots(episode_id);
+
         }
 
         if (rerot_admit_ready(episode_id) == rerot_admit_ready_result::failed) {
