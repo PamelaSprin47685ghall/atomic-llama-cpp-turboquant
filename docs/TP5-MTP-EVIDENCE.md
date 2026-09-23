@@ -1,5 +1,9 @@
 # TP5 MTP 单最大定义闭环与协议修正：受控运行可观察证据面规约
 
+## 当前状态覆盖说明（2026-09-23）
+
+下文原有 TIMELINE/F16 真机运行配方是历史证据面草案，**不是当前可执行的性能验收指令**。本机 TP5 生产路线已收敛到 RELAY；MTP 默认关闭，不能为了生成本文件的 type=3 日志绕过风险门。五卡草稿 `draft-mtp` 曾在单次 171 committed token 计数请求完成，但随后的重复请求五块 ABBA 在第 4 块 B2 报 card4 `gpu_busy=99%` 持续 ≥20 秒；`eagle-gpu-watchdog.service` 自动重置五卡。不能把前三块或 server `predicted_per_second` 当成 MTP 净收益；复现及根因、安全排空闭环未完成之前不重复该危险会话，也不修改或停用 watchdog。后续若解禁，验收以每个请求 `usage.completion_tokens / 完整客户端墙钟`、完整正确答案、无 GPU reset 与下表代际/容量状态机证据同时判定。纯 Target 的 54.45 decode tok/s 烟测不证明 MTP。
+
 本文档为 MTP 单最大定义闭环（Predefined MTP）与协议修正的受控真机运行提供完整的可观察证据面清单、检查方法、期望读数与判定阈值。
 与 `docs/TP5-MTP-VERIFICATION-PROPOSAL.md` 第四节保持同步：凡脚本不查的项，一律不得写成硬门禁。
 

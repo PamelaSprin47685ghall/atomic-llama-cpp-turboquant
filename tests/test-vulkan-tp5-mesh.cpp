@@ -2026,7 +2026,8 @@ int main(int argc, char ** argv) {
     bool             run_chain_reg   = false;
     bool             benchmark_chain = false;
     bool             test_capacity_chain = false;
-    std::string wire_str = "f16"; // default matches production collective
+    const char * env_wire = getenv("GGML_TP5_WIRE");
+    std::string wire_str = env_wire ? env_wire : "f16";
     std::string sync_str = "timeline";
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];

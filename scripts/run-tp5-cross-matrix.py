@@ -161,6 +161,24 @@ def get_available_variants(model_path: str, mtp_model_path: str) -> Dict[str, Di
         "env": {"RADV_DEBUG": "nobolist", "GGML_TP5_LINEAR_LOWERING": "0"},
         "requires_linear": False,
     }
+    variants["native-wire-f16"] = {
+        **variants["native-default"],
+        "name": "native-wire-f16",
+        "description": "Qualified native RELAY route with only GGML_TP5_WIRE=f16; different wire arithmetic",
+        "env": {"RADV_DEBUG": "nobolist", "GGML_TP5_WIRE": "f16"},
+        "expected_wire": "f16",
+        "requires_linear": False,
+    }
+    variants["native-launcher-device"] = {
+        **variants["native-default"],
+        "name": "native-launcher-device",
+        "description": "Native default plus production launcher's graphics queue and device-local VRAM policy",
+        "env": {
+            "RADV_DEBUG": "nobolist",
+            "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM": "1",
+            "GGML_VK_ALLOW_GRAPHICS_QUEUE": "1",
+        },
+    }
 
     # 4. Control Timeline F16: historical baseline
     timeline_env = dict(base_common_env)
@@ -515,6 +533,8 @@ def verify_server_log_routes(log_path: Path, requires_linear: bool, expected_syn
             res["error"] = f"Missing effective MMVQ policy={expected_mmvq} device log"
         elif requires_linear and not res["linear_definition_hit"]:
             res["error"] = "Variant requires linear lowering but '[tp5-linear-definition]' was never logged by server."
+        elif not requires_linear and res["linear_definition_hit"]:
+            res["error"] = "Control variant unexpectedly hit '[tp5-linear-definition]'"
     except Exception as e:
         res["error"] = str(e)
     return res
@@ -875,9 +895,10 @@ def run_abba_cross_matrix(
     bin_path_b: Optional[str] = None,
     legacy_mmvq_policy_unobservable: bool = False,
     max_wall_seconds: float = 1800.0,
+    pilot: bool = False,
 ) -> Dict[str, Any]:
-    if blocks < 5 and not dry_run:
-        raise ValueError(f"hardware comparison requires at least 5 complete ABBA blocks, got {blocks}")
+    if blocks < 5 and not (dry_run or pilot):
+        raise ValueError(f"formal hardware comparison requires at least 5 complete ABBA blocks; use --pilot for {blocks} exploratory blocks")
     if blocks <= 0:
         raise ValueError(f"blocks must be positive, got {blocks}")
     if repeats <= 0:
@@ -910,6 +931,7 @@ def run_abba_cross_matrix(
         "server_binary_b_sha256": compute_sha256(bin_path_b or bin_path),
         "legacy_mmvq_policy_unobservable": legacy_mmvq_policy_unobservable,
         "blocks_requested": blocks,
+        "pilot": pilot,
         "max_wall_seconds": max_wall_seconds,
         "count_to": count_to,
         "blocks_completed": 0,
@@ -1023,9 +1045,14 @@ def run_abba_cross_matrix(
     results_data["paired_samples_a_reported"] = samples_a_rep
     results_data["paired_samples_b_reported"] = samples_b_rep
 
-    results_data["stats_committed_tps"] = compute_paired_statistics(samples_a_com, samples_b_com)
-    results_data["stats_reported_tps"] = compute_paired_statistics(samples_a_rep, samples_b_rep)
-    results_data["status"] = "success"
+    if pilot:
+        # A short directed experiment reports observations, not a confidence
+        # interval or a default-promotion decision.
+        results_data["status"] = "PILOT_COMPLETE_NOT_ACCEPTANCE"
+    else:
+        results_data["stats_committed_tps"] = compute_paired_statistics(samples_a_com, samples_b_com)
+        results_data["stats_reported_tps"] = compute_paired_statistics(samples_a_rep, samples_b_rep)
+        results_data["status"] = "success"
 
     return results_data
 
@@ -1043,6 +1070,14 @@ def print_summary_table(results: Dict[str, Any]):
 
     if results.get("status") == "SMOKE_PASS":
         print("Single-trial route and full-response smoke passed. NO PERFORMANCE WIN CLAIM.")
+        print("=" * 80)
+        return
+
+    if results.get("status") == "PILOT_COMPLETE_NOT_ACCEPTANCE":
+        a = results["paired_samples_a_committed"]
+        b = results["paired_samples_b_committed"]
+        print(f"Exploratory {results['blocks_completed']}-block ABBA; committed A={statistics.mean(a):.2f}, B={statistics.mean(b):.2f} tok/s")
+        print("No confidence interval or default-promotion claim from reduced rounds.")
         print("=" * 80)
         return
 
@@ -1082,6 +1117,7 @@ def main():
     parser.add_argument("--variant-a", "-a", default="golden-relay-f32", help="Variant A name (baseline/control)")
     parser.add_argument("--variant-b", "-b", default="relay-f16-target", help="Variant B name (treatment/candidate)")
     parser.add_argument("--blocks", "-k", type=int, default=5, help="Number of ABBA blocks (default: 5, yielding 20 trials)")
+    parser.add_argument("--pilot", action="store_true", help="Allow fewer than 5 ABBA blocks for a quick exploratory comparison, without an acceptance claim")
     parser.add_argument("--repeats", "-r", type=int, default=1, help="Number of request repeats per trial (default: 1)")
     parser.add_argument("--max-wall-seconds", type=float, default=1800.0,
                         help="Maximum matrix wall time in seconds (default: 1800; each request is also capped at 120)")
@@ -1146,6 +1182,7 @@ def main():
             repeats=args.repeats, count_to=args.count_to, bin_path_b=args.bin_b,
             legacy_mmvq_policy_unobservable=args.legacy_mmvq_policy_unobservable,
             max_wall_seconds=args.max_wall_seconds,
+            pilot=args.pilot,
         )
 
     print_summary_table(results)
@@ -1157,7 +1194,7 @@ def main():
             json.dump(results, f, indent=2)
         print(f"[+] Detailed output saved to: {args.output}")
 
-    if results.get("status") not in ("success", "DRY_RUN_NOT_MEASURED", "SMOKE_PASS"):
+    if results.get("status") not in ("success", "DRY_RUN_NOT_MEASURED", "SMOKE_PASS", "PILOT_COMPLETE_NOT_ACCEPTANCE"):
         sys.exit(1)
 
 

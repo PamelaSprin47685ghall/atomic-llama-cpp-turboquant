@@ -1,9 +1,0 @@
-{
-  "status": "INCOMPLETE",
-  "fabricated": false,
-  "ranks": [],
-  "submitted_values": [],
-  "completed_values": [],
-  "drain_conclusion": "NOT_ATTEMPTED",
-  "note": "Dry-run refuses to invent completion. Wait only actually submitted values; retain resources if completion unknown."
-}

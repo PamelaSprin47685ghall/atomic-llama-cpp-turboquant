@@ -3,6 +3,55 @@
 - GPU timing ledger 对 LateBind stage 单独报告 `p1_us` 与 `late_pre_us`，避免再把两者混成旧的 `producer_slot_us`；direct-host 实验同时打印 `direct=1`，便于下一轮严格拆账。
 # TP5：Qwen4EXP 在五张 RX 6800 上的 Vulkan 张量并行实现方案
 
+## 当前五卡验收决策（2026-09-23；覆盖本文较早的草案和历史基线）
+
+**可用默认**：五张不同 RX 6800、`qwen4exp-af`、纯 Target、RELAY、命令重放时选择 F32 wire 和 `GGML_TP5_LINEAR_LOWERING=1`；未满足资格或显式关闭时不强制开启。该降层将五 rank 的 stage 命令合为各自单 primary CB，保持参考数学；`GGML_TP5_LINEAR_LOWERING=0` 是同数学消融。生产服务不默认加载 MTP 草稿。`TIMELINE` 不再是这台机器的候选性能路线；本文旧表格中的 TIMELINE 只保留历史背景。
+
+**测量边界**：2026-09-23 02:39–08:26，watchdog 自动 PCIe 复位后 card2 性能一度只有 8.25 TFLOPS，其间取得的绝对 tok/s 和候选排序全部作废，不能拿来证明增益。五卡进入 manual 并选择最高 DPM 档后，独立 F32 ALU 探针观察到各卡 17.08–17.22 TFLOPS；card2 的静态 `pp_dpm_sclk` 表仍可能显示 1200MHz，**静态标称值不是负载算力**。不要为凑齐表面频率擅自复位、修改 watchdog 或无限制 OverDrive。`scripts/reset-gpu-pci.sh check-clocks-only` 只将五卡设 manual 并锁定各自最高 DPM，硬件复位后的路径调用同一逻辑。模型单次预热＋一次实测：171-token `1..60` 完整正确、自然停止，server decode **54.45 tok/s**（3.140752 s），完整客户端请求 **35.70 committed tok/s**（4.789839 s，含 prompt 1.453185 s）。这是当前资格与题型的**观察值**，不是所有请求的最优证明；原始响应、二进制/映射 DSO 哈希和设备身份来自 `/tmp/tp5-retest-highclock-smoke.json`（commit 前 dirty-tree 构建，二进制 SHA256 `8608fdee2737c5e1dac81068f0e1b5a209d3e5fa0107557b536d03217d9163ca`）。
+
+**B00–B09 的四道门**（代码、GPU 正确性、同口径完整请求净收益、默认许可分开）：
+
+|卡|已证明|尚未证明／决策|
+|---|---|---|
+|B00/B02/B03|Golden RELAY/F32 和旧 Control TIMELINE/F16 名称已拆；RELAY 热重放不再写从不消费的旧 batch epoch；历史 AGENTS 记录可追溯。|Golden 是 F32 对照，强制 `linear=0`；不是最佳默认。|
+|B01|历史 `4e056e1b4` 的 Host×Shader 四因子各五块曾观察 child/parent 比 1.0018、host-only 1.0003、shader-only 1.0036；但都落在降频时窗，**完整作废，不能作为历史 −39% 是否复现的判据**。静态证据仍是 `tp5_record_plan` 多一处定义期 getenv 调用；旧 shader RADV LDS 4→8 B、读写 4→6 条。|需恢复后重新在同钟态配对才有性能判决；不能用 ISA 变化硬换算吞吐。旧 880 审计提交非当前 master 祖先。|
+|B04|代码解耦使参考 F32 不依赖 LateBind；五 rank 已确认 `mode=reference late=0` 且各用单 primary，mesh 与实际模型均完整正确。顶频后简并单因子 ABBA 结果见下。|先前五块配对结果在降频时窗，**全部作废**。顶频试验仅一块、不能用旧置信区间或单块比例声称通过原定 3% 晋级门；用户允许限定五卡纯 Target 默认。其它 batch/问答无净收益证据。|
+|B05/B06|保留 `stage_compute_cbs`、graph/buffer 指纹及代际深比较，`active<capacity` 缺全 direct stage 时拒绝。|B05 缺子后端 command-buffer relocation/invalidation 代际契约，不能删深比较；B06 未实现 active-aware P1，不用 padding 假装有效工作。|
+|B07|profile 环境按值且静态解析；lane0 spin 改私有局部，RADV LDS 12→8 B、读写 10→7；五卡 RELAY mesh 和 FD 审计通过。|仅 ISA／算子正确性证据，无单独模型净收益。|
+|B08/B09|任务归档按数值／路由／请求墙钟和失败安全分离，否决伪共享与无证据晋级。|MTP 的五块验收在第四块重复请求时 card4 99% busy、watchdog 自动恢复；**保持显式 opt-in**，既不能宣称 MTP committed 净收益也不应未经根因分析重复该负载。|
+
+**其他未闭合线**：T1C 只有三 transport 定义期 publish-order mock，缺同算术多卡路径与模型净收益；T2 分层 LateBind 与 T3A 跨层 chunk 未路由至生产；TM3 的 GDN/recurrent 和 QSA 准入保持 fail-closed（下文及 `docs/TP5-TARGET-CAPACITY-PLAN.md`）；TM5 在 MTP 挂起前只有功能烟测，不能依据 draft tokens 宣布增益；Tnorm `resume_norm` 几何只有 codegen 非模型配对。R02/R13 的独立 Vulkan oracle、Q3 的双 reader 离线原型和 H16 的共享 run 分桶都不能拿这条纯 Target TP5 计数请求声称 route-hit 或提速；对应详细门见 `RERoT.md` 与 `缺口.md`。未验收项保留关闭或 opt-in，**不以删掉原始计划代替完成验收**。
+
+**顶频后的快速定向筛选（同一 server SHA256，1 个独立 A/B/B/A 块，四进程各先预热再测一次）**：所有请求精确输出 `1..60`、171 committed tokens、自然停止，RELAY/F32 的两个 B04 臂均命中或明确未命中单 primary，五张 PCI 设备身份不变。`--pilot` 明确不计算 CI，下面是**观察值而非统计晋级**。
+
+|对照与证据|完整请求 committed tok/s（A→B）|server decode tok/s（A→B）|可推断范围|
+|---|---:|---:|---|
+|仅 `LINEAR_LOWERING=0` → native F32 降层；`/tmp/tp5-highclock-linear-pilot.json`|34.22→35.69（比 1.0428）|50.72→54.28|同数学单因子，当前时钟下支持保留降层；1 块不产生 CI|
+|native F32 降层 → 同一路由加生产启动器的 `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1`、`GGML_VK_ALLOW_GRAPHICS_QUEUE=1`；`/tmp/tp5-highclock-launcher-pilot.json`|35.56→**36.37**（比 1.0226）|54.27→**54.49**|两项一起变，只能评价**组合**，不能拆出单项贡献|
+
+`native-wire-f16` 的单次完整输出烟测为 **51.19 decode / 34.71 committed tok/s**；因数学精度与降层资格不同且仅一次独立运行，不把它与 F32 相减作正式收益或质量判定。两次 pilot 的最佳单次 decode 为 **54.72 tok/s**（生产启动器组合），但“最快单次”不等于稳定分布。此前 54.45 tok/s 是无额外 device 开关的独立烟测。**目前该模型和单 slot 计数负载下最快的已观测组合**是原生 RELAY/F32+单 primary，加生产启动器两项早期 Vulkan device 策略；默认的 `scripts/run-qwen38-flash-tp5-server.sh` 已在 Vulkan device discovery 前导出这两项。该脚本自己的多 slot/context 参数未用这些单 slot 数字验收。
+
+同一组合的独立 `1..100` 完整输出预热＋一次重复烟测：292 committed tokens、自然停止、内容完全一致，**53.52 decode / 41.20 committed tok/s**，总请求 7.087706 s（`/tmp/tp5-launcher-highclock-long-smoke.json`）；这是较长形状的功能与观察值，不是另一组配对结论。两个长度均保留相同 server SHA256 `8608fdee2737c5e1dac81068f0e1b5a209d3e5fa0107557b536d03217d9163ca`；用于归因的详细响应、map DSO 哈希和五卡快照保存在各 JSON 及同名 `_logs/`。
+
+**可复现单 slot 命令**（计数题，非生产多 slot 外推）：
+
+```bash
+# 在未继承其它 GGML_TP5_* 消融变量的 shell 中单独启动；不要与下方的脚本同时运行。
+RADV_DEBUG=nobolist GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1 GGML_VK_ALLOW_GRAPHICS_QUEUE=1 \
+./build-tp5/bin/llama-server \
+  -m /home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf \
+  -dev Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4 --split-mode tensor --fit off \
+  -ngl 999 -c 256 -b 32 -ub 32 --no-mmap --no-host -np 1 --tp5 qwen4exp-af
+
+# 或独立运行：白名单环境、自有服务、预热、完整答案与 GPU 身份核验。
+python3 scripts/run-tp5-cross-matrix.py --smoke -a native-launcher-device \
+  --max-wall-seconds 180 -o /tmp/tp5-launcher-smoke.json
+```
+
+`--smoke` 只核对路线、完整答案和观测值；`--pilot -k 1` 做一个 A/B/B/A 缩短轮数，输出观察值而**不**给置信区间或晋级结论；若需正式新默认的净收益推断，执行同口径五块并确认设备身份、实际算力和 MTP 安全门。不可把旧降频区间样本与高频烟测相减宣称收益。
+
+五卡链路的快速正确性核对：`build-tp5/bin/test-vulkan-tp5-mesh --wire f32 --sync relay --rounds 4 --check-all`（常数、四轮、四轮真实 GPU graph-producer、FD 差 0）。本轮还修复测试本身的环境继承：CLI 未传 wire 时，CPU oracle 现在从 `GGML_TP5_WIRE` 读取有效值，不再把真实 F32 错按默认 F16 比较；修后 `GGML_TP5_WIRE=f32 build-tp5/bin/test-vulkan-tp5-mesh --sync relay --rounds 4 --check-all` 通过。RERoT Q-prep/span GPU reference 可分别单跑 `LLAMA_REROT_GPU_Q_PREP=1 build-tp5/bin/test-rerot-q-prep` 和 `LLAMA_REROT_GPU_SPAN_EXPAND=1 build-tp5/bin/test-rerot-span-expand`；它们验证局部数值，不能证明 TP5 计数路由命中。
+
 版本：工程交付与收敛标准稿（2026-09-14 晚）。源码基线：`64ad8cdff0f1f932f05fa489614deb63a84cd088`，分支 `master`。
 
 本文面向实际实现者、维护者与验证者。本文涵盖 TP5 架构设计、工程实施闭环、真机拓扑与安全审计、微秒级系统调用剖析、收敛优化路线及严格验收准则。

@@ -7,8 +7,8 @@
   "expires_at": null,
   "warning": "本文件是待填写示例，不是启动许可。不得自动改为已批准；不得直接据此运行GPU、mesh或模型。",
   "target": {
-    "workspace": "/home/kunweiz/atomic-llama-cpp-turboquant",
-    "audited_head": "f51efe8208fdf6f7998b39483510c3e73c124310",
+    "workspace": null,
+    "audited_head": null,
     "host_identity": null,
     "device_bdfs": [],
     "device_uuids": []

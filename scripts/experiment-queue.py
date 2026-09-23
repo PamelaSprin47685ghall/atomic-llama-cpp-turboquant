@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline experiment queue and executor scheduler (C03).
 
-Validates PLAN/run-envelope.example.json schema fields, dry-runs the
+Validates tests/fixtures/run-envelope.example.json schema fields, dry-runs the
 run-id evidence directory layout from 攻坚总计划 §11.5, and serializes
 experiment packs under an exclusive lock file. Never fabricates completion
 records or GPU results. Does not require 5 GPUs.
@@ -24,11 +24,11 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ENVELOPE = REPO_ROOT / "PLAN" / "run-envelope.example.json"
-DEFAULT_QUEUE_DIR = REPO_ROOT / "PLAN" / "experiment-queue"
+DEFAULT_ENVELOPE = REPO_ROOT / "tests" / "fixtures" / "run-envelope.example.json"
+DEFAULT_QUEUE_DIR = Path(os.environ.get("LLAMA_EXPERIMENT_QUEUE_DIR", "/tmp/llama-experiment-queue"))
 DEFAULT_LOCK_PATH = DEFAULT_QUEUE_DIR / ".exclusive.lock"
 
-# Top-level and nested fields required by PLAN/run-envelope.example.json.
+# Top-level and nested fields required by run-envelope schema.
 REQUIRED_TOP_LEVEL = (
     "schema_version",
     "document_kind",
@@ -139,7 +139,7 @@ def _missing_keys(obj: dict[str, Any], required: tuple[str, ...], prefix: str) -
 
 
 def validate_envelope(envelope: dict[str, Any], *, require_approved: bool = False) -> list[str]:
-    """Validate schema fields from PLAN/run-envelope.example.json.
+    """Validate schema fields from run-envelope schema.
 
     Returns a list of human-readable problems (empty means structurally OK).
     Never promotes an inert/unapproved example into an executable approval.
@@ -646,7 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Offline experiment queue / executor scheduler (C03).\n"
-            "Validates PLAN/run-envelope.example.json schema fields, dry-runs the\n"
+            "Validates run-envelope schema fields, dry-runs the\n"
             "§11.5 run-id evidence directory layout, and serializes packs under an\n"
             "exclusive lock. Never fabricates completion. No 5-GPU required."
         ),
@@ -663,7 +663,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_val = sub.add_parser(
         "validate-envelope",
-        help="Validate schema fields of PLAN/run-envelope.example.json (or --envelope).",
+        help="Validate schema fields of tests/fixtures/run-envelope.example.json (or --envelope).",
     )
     p_val.add_argument(
         "--envelope",

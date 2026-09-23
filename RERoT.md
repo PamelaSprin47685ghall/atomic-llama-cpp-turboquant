@@ -2,8 +2,8 @@
 
 更新：2026-09-09。项目：`atomic-llama-cpp-turboquant`。本文核对的 `master` HEAD：`4e7769152`。
 更新：2026-09-11（第十四轮静态审计校正）。项目：`atomic-llama-cpp-turboquant`。本文核对的 `master` HEAD：`ceba57b96`。
-更新：2026-09-11（第十五轮静态审计，全平台修复）。设备级验证：CPU、CUDA（RTX 2080 Ti sm_75）、Vulkan（NVIDIA ICD；AMD RADV 本机暂不可枚举）。本轮修复（均带设备证据，详见当日交接）：① Vulkan RERoT 共享内存预算按整模块静态 shared 计（74496B > 49152B 限制导致队列报错/fence 永不 signal 的挂死），`test-rerot-attn` 从 240s 挂死变为 ~1s 内 0 failure；② RERoT Parallel Delta GDN（RBB）在 CUDA/Vulkan 两侧补齐 density 归一化与并发求解：CUDA 新增设备端 RBB 分支，Vulkan 接入 `RBB=2` pipeline，`test-rerot-attn` GPU sections 从 57 failure 变为 0（CUDA 与 Vulkan 两树均验证）；③ CUDA ordinary FA 对 Turbo KV 的 TILE/MMA f16 临时缓冲漏分配（堆越界导致 turbo3 错解与 igu4_nl 非法指令崩溃）；④ CUDA TriAttention 打分器支持 partial-rotary Turbo（不再对 Ornith 类 partial IMRoPE 回退到主机）。这些改动只修复实现缺陷，不改第 2/4/6 节的执行语义与不变量。
-更新：2026-09-11（第十六轮静态审计与 upstream sync ×2）。项目：`atomic-llama-cpp-turboquant`。基线：`git pull origin master` 两次——第一次快进到 `81f5b0198`（含随后被回退的 `--fit` 容量求解重写），第二次 origin/master 被**强制更新**到 `88fca9ced`（回退那 5 笔 `--fit` 重写，改用 dry-measurement + joint pool/slot solve + kernel VRAM 数字的正确修法）；`git pull upstream master` 两次均为 up-to-date。本轮：① `--total-kv`（别名 `--kv-size`，server scope）由上游正确提供：`auto` → `n_ctx_kv_auto`，`-c`/`-np` 语义保留，RERoT 阶段 0 门「auto + 显式 -np」仍拒绝；本地为第一次 pull 打的临时兼容 shim 已删除（clean cutover，不留第二套机制）；② 校正文档漂移（Vulkan 精度门硬件、raw-Q 钩子覆盖范围、HEAD 基线）；③ 三平台（CPU/CUDA/Vulkan）特性测试矩阵两次合并后均为 0 failure。残余：AMD RX 6800 RADV 本机不可枚举，AMD 侧验收仍待；host 参考路径在**多 segment + boundary refine/部分因果切割**时仍显式拒绝（`--xkv-landmark-refine` 默认 `none`，设备路径按行 `refine_cap` 支持）。
+更新：2026-09-11（第十五轮静态审计，全平台修复）。设备级验证：CPU、CUDA（RTX 2080 Ti sm_75）、Vulkan（NVIDIA ICD；AMD RADV 设备支持已恢复）。本轮修复（均带设备证据，详见当日交接）：① Vulkan RERoT 共享内存预算按整模块静态 shared 计（74496B > 49152B 限制导致队列报错/fence 永不 signal 的挂死），`test-rerot-attn` 从 240s 挂死变为 ~1s 内 0 failure；② RERoT Parallel Delta GDN（RBB）在 CUDA/Vulkan 两侧补齐 density 归一化与并发求解：CUDA 新增设备端 RBB 分支，Vulkan 接入 `RBB=2` pipeline，`test-rerot-attn` GPU sections 从 57 failure 变为 0（CUDA 与 Vulkan 两树均验证）；③ CUDA ordinary FA 对 Turbo KV 的 TILE/MMA f16 临时缓冲漏分配（堆越界导致 turbo3 错解与 igu4_nl 非法指令崩溃）；④ CUDA TriAttention 打分器支持 partial-rotary Turbo（不再对 Ornith 类 partial IMRoPE 回退到主机）。这些改动只修复实现缺陷，不改第 2/4/6 节的执行语义与不变量。
+更新：2026-09-11（第十六轮静态审计与 upstream sync ×2）。项目：`atomic-llama-cpp-turboquant`。基线：`git pull origin master` 两次——第一次快进到 `81f5b0198`（含随后被回退的 `--fit` 容量求解重写），第二次 origin/master 被**强制更新**到 `88fca9ced`（回退那 5 笔 `--fit` 重写，改用 dry-measurement + joint pool/slot solve + kernel VRAM 数字的正确修法）；`git pull upstream master` 两次均为 up-to-date。本轮：① `--total-kv`（别名 `--kv-size`，server scope）由上游正确提供：`auto` → `n_ctx_kv_auto`，`-c`/`-np` 语义保留，RERoT 阶段 0 门「auto + 显式 -np」仍拒绝；本地为第一次 pull 打的临时兼容 shim 已删除（clean cutover，不留第二套机制）；② 校正文档漂移（Vulkan 精度门硬件、raw-Q 钩子覆盖范围、HEAD 基线）；③ 三平台（CPU/CUDA/Vulkan）特性测试矩阵两次合并后均为 0 failure。残余：host 参考路径在**多 segment + boundary refine/部分因果切割**时仍显式拒绝（`--xkv-landmark-refine` 默认 `none`，设备路径按行 `refine_cap` 支持）。AMD RX 6800 RADV 设备现已完全可枚举并运行。
 
 本文是 RERoT 的单一自包含事实源，吸收当前 `AGENTS.md` 的最新方案，并结合当前源码与最近两笔 DAG 实现提交校正“已经实现什么、还缺什么”。以后不要再用旧 `RERoT指南.md`、旧数学审计、每日交接或脚本名字推断项目阶段。
 
@@ -1552,7 +1552,7 @@ run B: probe → simple → restore
   - `1->2`, `1->3`, `2->4`, `3->4` 菱形依赖门控、不等长生成（3 vs 10 tokens）、前驱 1 唯一样本去重展开与阶段自然完结测试通过（`test_dag_diamond_and_unequal_length_history`）。
   - synthesis 互补结果与独立意图测试通过（`test_dag_synthesis_complementary_results_distinct_intents`）：验证并行 Worker 各自独立意图（代数推导 vs 几何剖分）生成互补结论，所有前驱完结后 synthesis 节点精确解锁；synthesis 读者视界中按拓扑偏序单次且完整呈现各前驱结论，无 intent 串线或跨阶段污染。
   - `test-rerot-view` 包含 4 节点全 DAG 拓扑、循环偏序及菱形单次祖先展开断言。
-  - Vulkan 周期注意力精度门（`test-rerot-attn --precision-only`，RTX 2080 Ti NVIDIA ICD 与 CPU reference，keys=33/257，误差 $\le 1.19 \times 10^{-7}$）及 DDVR 多 span 相位补偿门 100% 通过（本机 AMD RX 6800 RADV 驱动因系统层原因暂不可枚举，GPU 验证由 NVIDIA ICD 承载）。
+  - Vulkan 周期注意力精度门（`test-rerot-attn --precision-only`，RTX 2080 Ti NVIDIA ICD 与 CPU reference，keys=33/257，误差 $\le 1.19 \times 10^{-7}$）及 DDVR 多 span 相位补偿门 100% 通过（AMD RX 6800 RADV 设备现已完全可枚举并运行）。
 - **目标大模型 Ornith-1.5-35B 真机端到端全量通过**（`scripts/rerot-target-ornith-multi-lane.py`）：
   - Flat 2-worker DAG：$25 \times 12$ 与 $15 \times 16$ 独立并行并汇聚综合为 $\boxed{540}$；
   - `A->C` + B independent：A ($14 \times 15=210$) 与 B ($30 \times 20=600$) 并行，C 依赖 A 产出 $210+50=260$，最终汇聚输出 **860**；
@@ -1611,7 +1611,7 @@ run B: probe → simple → restore
   - **Tier 3 形式数学（AIME 样例）**：`math-aime25-base-divisor`（通过整除条件转换为 $b+7 \mid 56$，正确得出 $b \in \{21, 49\}$ 之和 70 并给出 $\boxed{70}$）；
   - **Tier 4 长上下文与生产任务**：Needle in haystack 密钥检索（通过，准确提取 `REROT-TURBO-778899`）与多章节操作系统结构化分析报告（通过，篇幅 > 1500 字，完整涵盖进程、内存、文件三大核心原理与对比表格）；
 - 多 Lane DAG 真实推理测试（`scripts/rerot-target-ornith-multi-lane.py`）：flat 2-worker DAG（25*12 与 15*16 并行推导并在 Lane C 汇聚合成 540）、A->C 带独立 B 重叠（14*15 与 30*20 并行，C 依赖 A 产出 260 并汇聚为 860）、菱形依赖（100*3 与 100*5 汇聚合成 800）均自然完结并通过无 internal token 泄漏断言；
-- 显卡上的 Vulkan 精度门（`test-rerot-attn --precision-only`，RTX 2080 Ti NVIDIA ICD，F16/Turbo keys=33/257，误差 $\le 1.19 \times 10^{-7}$）与 DDVR 多 span 门 100% 通过；
+- 显卡上的 Vulkan 精度门（`test-rerot-attn --precision-only`，RTX 2080 Ti NVIDIA ICD 与 AMD RX 6800，F16/Turbo keys=33/257，误差 $\le 1.19 \times 10^{-7}$）与 DDVR 多 span 门 100% 通过；
 - 生产环境服务依据授权保持永久停用状态；测试日志、单项输出与构建库哈希清单完整保存归档。
 
 #### 质量
@@ -2641,3 +2641,46 @@ cell，记录 (idx, storage, meta, sig)。每个 view group 由「扫描」退�
 
 **最终状态与缺口归档**：
 本轮为全案最终交付班次。主机端布局构建已全面收敛至内存带宽与必要产物发射下界。所有后续 GPU Kernel 编写、真机 A/B 吞吐量测量以及十问核心算法闭环，均已规范化整理追加至根目录 `缺口.md`（共 17 项核心缺口），完成全面交接。
+
+---
+
+## 22. RERoT 与计算组织核心候选四轴验收账本与交付准则（2026-09-23 审计）
+
+为确保 RERoT 方案自包含、事实单源，现将算子优化（R 系列）、计算组织重构（Q 系列）及布局亲和（H 系列）的核心候选统一遵循四轴准入裁决门进行事实对齐：
+1. **实现状态 (Implementation)**：生产代码 / 桥接代码 / 原型代码 / 仅 CPU 参考；
+2. **正确性验证 (Correctness)**：位级对拍 / 容差对拍 / 仅离线门 / 未经验证；
+3. **真实路由与端到端净收益 (Real Route-hit & Paired Benefit)**：真实多 Lane 请求是否命中、真实客户端 committed tokens/墙钟是否有正向加速比；
+4. **默认决策 (Default Decision)**：保持 opt-in / 保持研究态 / 拒绝 / 不予晋级。
+
+> **执行纪律与基准要求**：
+> - 历史降频时段数据作废，禁止以异常基线宣称性能收益；
+> - MTP 与推测机制目前仍存在稳定性/挂起风险，严格保持 opt-in，严禁擅自默认启用；
+> - Timeline 路线已排除，不再列入测试矩阵；
+> - 任何离线微基准或局部倍率均不可替代真实模型 A/B/B/A 配对净收益。
+
+### 22.1 核心候选四轴状态与后续门禁对照表
+
+| 编号 | 候选名称 | 实现状态 | 正确性验证 | 真实路由与端到端收益 | 默认决策 | 当前阻断与下一步准入门槛 (Next Gate) |
+|---|---|---|---|---|---|---|
+| **R02** | Live Q-prep 算子 | Vulkan `rerot_q_prep.comp` 与 CPU oracle 已就绪（环境变量 `LLAMA_REROT_GPU_Q_PREP=1`） | `test-rerot-q-prep` CPU/GPU 对拍通过（覆盖 active=0/cap，非活跃行强行灌入 NaN 毒值） | 尚未在生产模型真实 RERoT 路由中命中；Shader 虽只旋转 live 行但当前仍按 capacity×head 派发 | **保持 Opt-in**（严禁默认开启） | 必须在真实模型多 Lane 会话中取得端到端 A/B/B/A 净收益；后续 WHT 融合必须严格保持数学时序。 |
+| **R07** | 多行 / PQ2_0 投影 Recipe | 通用 PQ2_0 GEMV / MMQ 存在 | 专用 $b \in \{1,2,3,4,6\}$、非零 offset 的共享权重 Tile 路径未测试 | 目标 GPU 上的多行加速收益未测 | **不予晋级** | 须完成专用 Tile 复用 Recipe 并通过尾行/边界对拍。 |
+| **R09** | 长短 Reader 分桶与非均匀 Head Map | 现有 Head Map 与标量全局 Split-K 存在 | 混合长短行（如 100 vs 32768 tokens）GPU 对拍未完成 | 缺乏自适应分桶在真实模型上的延迟削减证据 | **不予晋级** | 须基于 Reader 长度方差建立短/长双桶，在 GPU 端消除短行过度切分的归约开销。 |
+| **R10** | 逻辑 State 驻留池：D2D Parking | Host 侧 `capture_hand_seed` / restore 可用 | 仅 Host 序列化验证；显存 D2D Parking 槽位未验证 | 缺乏 D2D 替换 CPU 往返的端到端时延收益 | **不予晋级** | 须在显存建立 native state slots，通过跨 Lane 换笔状态等价测试。 |
+| **R12** | 阶段预定义图族 | predefined graph 基础设施存在 | 真实 RERoT 多阶段生命周期审计未完成 | 尚未取得稳态 graph_def_count 归零带来的端到端冷启动延迟收益 | **不得宣称净收益** | 须按原因桶为常用阶段建立固定图族，消除执行期图重构开销。 |
+| **R13** | Compact Span ABI 展开桥与直通 | ABI v1 固化，CPU 展开与 Vulkan 展开核函数（`rerot_span_expand.comp`）已交付 | `test-rerot-span-expand` 与 CPU 位级对拍 100% 通过（`LLAMA_REROT_GPU_SPAN_EXPAND=1`） | GPU 展开后仍生成逐 entry 密集张量输入，未直通 attention 算子；真实路由收益未测 | **保持 Opt-in**（严禁默认开启） | 阶段 A：测定 GPU 展开真实净收益；阶段 B：改造 Attention 核函数直通消费 Span 描述符。 |
+| **R14** | RERoT 端到端净收益 A/B/B/A | 测量脚本 `rerot-throughput-gate.py` 已重构（四态判定、配对中位数、Counter 分离） | Mock 单测 6/6 通过；定向测试可运行 | 真实全特性开启与纯 Target 真实请求配对净收益尚缺 | **未获验收** | 须在真实模型上执行多轮 A/B/B/A，以客户端 committed tokens/完整请求墙钟为准。 |
+| **Q1** | 图级公共输入复用 + MoE 专家聚集 | 仅激活旋转局部共享；图级 CSE 与专家聚集未实现 | 无 GPU 共享输入执行证据 | 未测量 | **保持研究态** | 须在 `llama-graph` 中实现具名 norm/量化共享，并建立专家分桶重排逻辑。 |
+| **Q3** | 公共 KV 块多 Reader Attention | 主机端共享 World 已交付；离线 2-Reader 单 invocation Shader 原型存在 | CPU 参考层与 shadow oracle 通过对拍（误差 < 3.9e-6） | 未进入生产调度；可变长多 Reader 真实加速未测 | **保持研究态** | 须平衡 LDS/VGPR 占用，编写生产级多 Reader 共享 Attention 核函数。 |
+| **Q5** | GDN 状态共同基底 + 低秩增量 | CPU 参考层已交付（`llama-rerot-math.*`） | F32 数值门实测通过（相对误差 ~1.9e-7 有界 / ~5.1e-7 弱衰减） | 无生产 GPU 低秩递推路由与收益 | **保持研究态** | 须编写 GPU 端低秩递推算子，并设立增量步数 $r$ 超标时平滑回退至稠密矩阵的安全机制。 |
+| **Q6** | 已知 Token WY 块折叠 | CPU 参考层已交付 | F32 数值门实测通过（$T \in [1,8]$ 绝对误差 < 2.5e-5） | 缺乏生产 GPU 路由与收益证据 | **保持研究态** | 须将紧凑块表示接入固定入口重放与 Target 验证块，严禁破坏因果可见性边界。 |
+| **Q7** | PQ2_0 位平面子集求和与 LUT 路径 | CPU 建立 2 bit-plane 公式与 16 项 activation 表 | 真实 `block_pq2_0` 误差 2.98e-8；已知单 `vec_dot` 粒度存在性能劣化 | 缺乏矩阵级共享查表在 GPU 上的实机基准 | **保持研究态** | 须在矩阵级粒度评估查表与 LDS 寻址开销，在真实硬件上验证超越解码+点积的能力。 |
+| **Q8** | 上下文跳块：Cauchy-Schwarz 质量界 | CPU 建立 Cauchy-Schwarz 跳过质量界 $\delta$ 公式 | 反例已证明不存在有限充分统计量；缺乏模型级质量门 | 无生产跳块 GPU 加速 | **保持研究态（近似路线）** | 必须在独立近似开关下进行 Shadow 评测，验证长文质量与任务准确率不降，严禁与等义优化收益混淆。 |
+| **Q9** | 越过 Logits 的批量 GPU 采样器 | CPU 参考契约已固化（确定性、独立 RNG 流、tied logit、贪心分块 argmax） | 仅在 CPU 建立生产链序（top-k $\to$ top-p $\to$ temp $\to$ dist）；无 GPU 着色器实现 | 无 GPU LM Head 采样收益 | **保持研究态** | 须编写原生 GPU 批量采样 Kernel，直接输出 token ID 向量，并与服务端状态机完全打通。 |
+| **Q10** | $K \times H$ 联合投机网格验证 | CPU 实现基于列推进和依赖传染的 `verify_grid` oracle | 仅 CPU 逻辑验证；成功复现 naive 对照的错误分支 | 无端到端跨笔推测执行与多请求有效 token 产出收益 | **保持研究态** | 须设计多笔交互后的联合 Frontier 推测逻辑，并在 GPU 建立列未命中时的快速回滚机制。 |
+| **H16** | FlashPrefill 跨 View 共享 Run 切片 | 相同 `fp_rerot_view_key` 已合并至同一 View Group；共享扫描与 Base 零拷贝已进生产 | 直接跨不同 View 借用切片会破坏 `vgroup_frags` 连续区间及 `run_v0/phase_bias` 偏移，已主动拒绝直接指针复用 | 现行架构下无安全净收益 | **拒绝直接指针复用** | 须重新设计解耦 `phase_bias` 的切片元数据表示，仅在证明真实多 View 场景产生显著分配开销时方可重启。 |
+| **H17** | 写入端长 Span 亲和性 | 分配器已有连续性选择基础设施 | 碎片化场景下主动重排的连续性不变量未验证 | 生产环境下 coverage 已接近 1.0，主动整序未证明能带来显著端到端加速 | **保持研究态** | 须在特定重度碎片化工作负载下评估 span 连续度提升对上传与 Attention 遍历的实际收益，不阻塞主干。 |
+
+### 22.2 自包含交付与后续准入门槛总结
+- **不可混用口径**：严禁将近似算法（Q8）的收益计入严格等义优化，亦不可将 CPU 布局阶段的吞吐倍率（如 3.68×）直接等同于整机端到端加速；
+- **生产闭环唯一标准**：任何待晋级特性必须通过 `scripts/rerot-throughput-gate.py` 的 A/B/B/A 配对跑分，以客户端每秒交付的有效 committed tokens 与完整请求墙钟为唯一黄金准则；
+- **文档闭环**：本文档与 `缺口.md` 共同构成本阶段 RERoT 架构与未决事项的自包含完整事实源。

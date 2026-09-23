@@ -25,31 +25,26 @@ declare -A CARD_BDF=(
 
 TARGET=${1:-"all"}
 
-if [ "$TARGET" = "check-clocks-only" ]; then
-    say "=== 设置全部卡为 manual 模式并锁定最高频率 ==="
+lock_manual_clocks() {
+    say "=== 设置全部卡为 manual 模式并锁定最高 DPM 档位 ==="
     for c in card1 card2 card3 card4 card5; do
-        od_file="/sys/class/drm/$c/device/pp_od_clk_voltage"
         sclk_file="/sys/class/drm/$c/device/pp_dpm_sclk"
         perf_level="/sys/class/drm/$c/device/power_dpm_force_performance_level"
-
-        say "  [$c] 设置 power_dpm_force_performance_level -> manual"
-        echo "manual" > "$perf_level" 2>&1 || say "  [$c] failed to set manual"
-
-        if [ -f "$od_file" ]; then
-            say "  [$c] 尝试设置 OverDrive 最大频率 2475MHz..."
-            echo "s 1 2475" > "$od_file" 2>&1 || say "  [$c] od s 1 2475 error: $?"
-            echo "c" > "$od_file" 2>&1 || say "  [$c] od commit error: $?"
-        fi
-
-        # 锁定最高 DPM 档位 (例如最后一行或者编号 2)
-        if [ -f "$sclk_file" ]; then
-            last_idx=$(grep -oE '^[0-9]+' "$sclk_file" | tail -1 || echo "2")
-            say "  [$c] 锁定 DPM 档位至 $last_idx..."
-            echo "$last_idx" > "$sclk_file" 2>&1 || say "  [$c] failed to write $last_idx to sclk"
-            say "  [$c] 当前 sclk 状态:"
-            cat "$sclk_file"
-        fi
+        [ -r "$sclk_file" ] && [ -w "$perf_level" ] || {
+            say "  [$c] 缺少可访问的 DPM sysfs 节点，无法确认时钟策略"
+            return 1
+        }
+        last_idx=$(grep -oE '^[0-9]+' "$sclk_file" | tail -1)
+        [ -n "$last_idx" ] || { say "  [$c] 未找到有效 DPM 档位"; return 1; }
+        echo manual > "$perf_level"
+        echo "$last_idx" > "$sclk_file"
+        [ "$(cat "$perf_level")" = manual ] || { say "  [$c] manual 模式未生效"; return 1; }
+        say "  [$c] manual + DPM $last_idx 已写入；静态频率表不等于负载下的实际算力"
     done
+}
+
+if [ "$TARGET" = "check-clocks-only" ]; then
+    lock_manual_clocks
     exit 0
 fi
 
@@ -127,23 +122,7 @@ for c in sorted(glob.glob('/sys/class/drm/card[1-5]/device/gpu_busy_percent')):
     print(f'  {card}: busy={busy}%, vram={vram:.2f} MB')
 "
 
-# 3. 恢复显卡运行频率（特别是矿版 VBIOS 默认被卡在 1200MHz 的 card2 / 0000:09:00.0）
-say "=== 阶段 6: 自动校准并恢复各卡时钟 (避免 VBIOS 锁频 1200MHz) ==="
-for c in card1 card2 card3 card4 card5; do
-    od_file="/sys/class/drm/$c/device/pp_od_clk_voltage"
-    sclk_file="/sys/class/drm/$c/device/pp_dpm_sclk"
-    perf_level="/sys/class/drm/$c/device/power_dpm_force_performance_level"
-    if [ -f "$od_file" ]; then
-        # 检查当前最高 DPM 档位，如果是 1200MHz 则通过 OverDrive 恢复至 2475MHz
-        max_mhz=$(grep -oE '[0-9]+Mhz' "$sclk_file" 2>/dev/null | tr -d 'Mhz' | sort -n | tail -1 || echo "2475")
-        if [ "$max_mhz" -le 1500 ]; then
-            say "  [$c] 检测到异常低频上限 ($max_mhz MHz)，正在通过 OverDrive 恢复至 2475MHz..."
-            echo "manual" > "$perf_level" || say "  [$c] failed to set manual"
-            # 查看 od 表格式
-            say "  [$c] 当前 pp_od_clk_voltage 前 10 行:"
-            head -n 10 "$od_file"
-        fi
-    fi
-done
+# 与无需总线复位的路径共用同一套时钟策略；失败时不得打印成功。
+lock_manual_clocks
 
 say "硬件复位全流程结束。"

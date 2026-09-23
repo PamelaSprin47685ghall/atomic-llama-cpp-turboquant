@@ -1,5 +1,9 @@
 # TP5 TARGET 验证容量化设计（M3 定稿，供评审与实施依循）
 
+## 2026-09-23 当前实现核验（下文初稿的“未实施”仅指其写作时）
+
+`evaluate_target_capacity_admission` 对 GDN/recurrent、QSA/PLE、多序列仍 fail-closed；单序列普通 dense 的容量路径已分区实现并有局部证据，但**不能把局部测试当作 qwen4exp 48 层 GDN 主干通过**。区 0 输入/位置的边界、reuse key、尾部清零有 CPU 契约；区 1 FlashAttention 活跃行对毒尾的 GPU 输出有独立测试；区 2 GDN 的 CPU state tail/rollback 已有局部对拍但生产准入仍拒绝；区 3 MoE active logits 毒尾隔离只有 CPU 对拍；区 4 terminal result 非活跃行清零有 CPU 回归；区 5 RELAY active payload 有五卡 mesh 真 GPU 证据。这些证据彼此不能拼成完整 Target 多卡动态行会话。解禁仍需同一真实模型的 `1→4→1→2` active 行、状态回滚/续跑、所有 rank 消费 active 而非 capacity 的完整结果对拍。最新四维验收表与五卡性能边界见仓库根目录 `TP5.md` 的当前验收节。
+
 - 状态：设计定稿待评审，未实施。本文只定契约与分区闭环，不改代码。
 - 约束：只读现状已盘点；本文只新增本文档；不构建、不运行、不改代码。
 - 适用对象：qwen4exp 48 层有状态主干的 TARGET 验证 phase（`GGML_PREDEFINED_TARGET`），单序列第一阶段。

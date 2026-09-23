@@ -1,5 +1,9 @@
 # TP5 / Predefined / MTP / LateBind 真机受控验证规程草案
 
+## 2026-09-23 执行覆盖说明
+
+下文 v1.0 的“硬件已彻底安全、可全面 ctest”是写作当时的推测，不能代替本机已观察到的故障边界。2026-09-22 全量 `ctest` 中 `test-llama-archs` 在 `0000:0f:00.0` 触发 GPUVM page fault、非法 command stream、compute ring reset，曾伴系统重启；此前同一测试也曾在另一卡引发保护故障。该测试须与五卡 TP5 性能会话隔离；只跑目标测试（例如 RELAY mesh `--rounds 4 --check-all`），不执行 GPU 可达的全量 ctest，也不以“无内核日志”替代目标路径验证。MTP 重复请求另有 card4 GPU 挂起及 watchdog 自动恢复记录，见 `docs/TP5-MTP-EVIDENCE.md` 当前状态节；保持显式 opt-in，禁止停用 watchdog。操作员不需要为了观察静态 `pp_dpm_sclk` 表中 1200MHz 去人为修改设备时钟，实测 ALU 算力才是负载证据。旧方案涉及 TIMELINE 的运行序列在这台五卡目标机上已被用户废弃；当前接收口径在仓库根目录 `TP5.md`。
+
 > **版本**：v1.0-draft  
 > **状态**：待用户批准（Pending User Approval）  
 > **适用范围**：Q sidecar ABI 统一、F32-Q 输入生命周期、MTP 动态行数预定义复用、MTP cycle 计时账本及 LateBind 数值模式定义期核验。
