@@ -4,10 +4,11 @@
 更新：2026-09-11（第十四轮静态审计校正）。项目：`atomic-llama-cpp-turboquant`。本文核对的 `master` HEAD：`ceba57b96`。
 更新：2026-09-11（第十五轮静态审计，全平台修复）。设备级验证：CPU、CUDA（RTX 2080 Ti sm_75）、Vulkan（NVIDIA ICD；AMD RADV 设备支持已恢复）。本轮修复（均带设备证据，详见当日交接）：① Vulkan RERoT 共享内存预算按整模块静态 shared 计（74496B > 49152B 限制导致队列报错/fence 永不 signal 的挂死），`test-rerot-attn` 从 240s 挂死变为 ~1s 内 0 failure；② RERoT Parallel Delta GDN（RBB）在 CUDA/Vulkan 两侧补齐 density 归一化与并发求解：CUDA 新增设备端 RBB 分支，Vulkan 接入 `RBB=2` pipeline，`test-rerot-attn` GPU sections 从 57 failure 变为 0（CUDA 与 Vulkan 两树均验证）；③ CUDA ordinary FA 对 Turbo KV 的 TILE/MMA f16 临时缓冲漏分配（堆越界导致 turbo3 错解与 igu4_nl 非法指令崩溃）；④ CUDA TriAttention 打分器支持 partial-rotary Turbo（不再对 Ornith 类 partial IMRoPE 回退到主机）。这些改动只修复实现缺陷，不改第 2/4/6 节的执行语义与不变量。
 更新：2026-09-11（第十六轮静态审计与 upstream sync ×2）。项目：`atomic-llama-cpp-turboquant`。基线：`git pull origin master` 两次——第一次快进到 `81f5b0198`（含随后被回退的 `--fit` 容量求解重写），第二次 origin/master 被**强制更新**到 `88fca9ced`（回退那 5 笔 `--fit` 重写，改用 dry-measurement + joint pool/slot solve + kernel VRAM 数字的正确修法）；`git pull upstream master` 两次均为 up-to-date。本轮：① `--total-kv`（别名 `--kv-size`，server scope）由上游正确提供：`auto` → `n_ctx_kv_auto`，`-c`/`-np` 语义保留，RERoT 阶段 0 门「auto + 显式 -np」仍拒绝；本地为第一次 pull 打的临时兼容 shim 已删除（clean cutover，不留第二套机制）；② 校正文档漂移（Vulkan 精度门硬件、raw-Q 钩子覆盖范围、HEAD 基线）；③ 三平台（CPU/CUDA/Vulkan）特性测试矩阵两次合并后均为 0 failure。残余：host 参考路径在**多 segment + boundary refine/部分因果切割**时仍显式拒绝（`--xkv-landmark-refine` 默认 `none`，设备路径按行 `refine_cap` 支持）。AMD RX 6800 RADV 设备现已完全可枚举并运行。
+更新：2026-09-23（第二十/二十一轮核对）。项目：`atomic-llama-cpp-turboquant`。本文核对的 `master` HEAD：`a35ec96f6`。本轮核对并修正了路由 wire 的事实源：routing wire 已**语义回滚**到 `abd816e4d` 的 `strategy+payload` JSON 基线（此前试用的 Makefile 行式 DSL 与扁平 Compact Dict JSON 均已作废清理），探针治理补齐 512-token 硬上限、截断/拒绝语义区分与成对 trace。修正了 §4.2/4.3/4.4/4.6、§1.1/1.2/1.3、§13.1/13.3、§15.1、§20 的过期描述；阶段 5/6/8 的目标机（Ornith-1.5-35B）验收结论保留为 artifact 边界历史证据，不自动覆盖当前 HEAD。
 
 本文是 RERoT 的单一自包含事实源，吸收当前 `AGENTS.md` 的最新方案，并结合当前源码与最近两笔 DAG 实现提交校正“已经实现什么、还缺什么”。以后不要再用旧 `RERoT指南.md`、旧数学审计、每日交接或脚本名字推断项目阶段。
 
-**当前状态包含 `4e7769152` 之后的多笔实现提交（如 `8a2b25848`、`47f651b3d`，含第 12 节记录的 Stage 8 多 Lane DAG 认证）及其后的工作树修改，不等同于这些历史 HEAD，也不等同于生产部署。** 保留既有 `src/llama-triattention.cpp` buffer-type API 修改；没有修改 `AGENTS.md`。生产服务与当前候选 artifact 分开记录，不继承旧部署的验收结论。
+**当前状态包含 `4e7769152` 之后的多笔实现提交（含第 12 节记录的 Stage 8 多 Lane DAG 认证）直至 `a35ec96f6`，不等同于这些历史 HEAD，也不等同于生产部署。** routing wire 经三次试验后已回滚至 `abd816e4d` 基线（见 §4.3/§13.3），其余程序修复全部保留。生产服务与当前候选 artifact 分开记录：阶段 5/6/8 的 Ornith-1.5-35B 真机结论绑定在回滚前 artifact 上，当前 HEAD 尚未在目标机重跑；不继承旧部署的验收结论。
 
 ---
 
@@ -90,7 +91,7 @@ HTML <ol>/<li> planner
 
 | 旧概念 | 新定义 |
 |---|---|
-| `<ol>/<li>` 决定拓扑 | schema probe 产生显式 DAG `questions + depends_on` |
+| `<ol>/<li>` 决定拓扑 | schema probe 产生显式 DAG（`questions` + `depends_on` 边表） |
 | tree parent/child 就是依赖 | 创建关系、硬依赖、状态来源、物理 binding 分开 |
 | PAC-DFS 决定所有 reader 顺序 | DAG 上的循环优先 Kahn 排序，依赖约束优先 |
 | 随机 Base62 `</ID>` 唯一完成 | 当前 WORKER 源流自己的原生 reasoning-end 完成 |
@@ -101,23 +102,13 @@ HTML <ol>/<li> planner
 
 ### 1.2 当前工程阶段
 
-最近两笔提交已经把新方案的一部分落到代码：
-
-```text
-c3648d789
-feat(rerot): implement adaptive DAG scheduling,
-             cycle-preferred topological views,
-             and fixed-entry framing
-
-4e7769152
-feat(rerot): wire DAG scheduling and routing probe into server decode
-```
+早期 DAG 接线提交（`c3648d789` 调度/view/framing、`4e7769152` server decode 接线）之后，wire 格式经历了一轮试验与**语义回滚**：Makefile 行式 DSL、Compact Dict JSON、lazy grammar 先后被否决，`9290e7a1a` 把 routing wire 恢复为 `abd816e4d` 的 `strategy+payload` 基线，同时保留其后全部不涉及 wire 的程序修复。
 
 因此项目已经不是“旧 Ring Phase 1 长题闭合”状态，也不能继续用旧 `Phase 0..12` 作为当前推进编号。
 
 当前更准确的定级是：
 
-> **DAG production path wired, not production-certified**：隔离 probe、正式 P/C_base、循环优先 Kahn、原生 tool-round 固定入口、按 token LCP 的启动前缀重建、simple 完整 sampler clone 与用户预算恢复、源结束、W>P 逻辑 cohort、PUBLIC BODY/FRAME 冻结视图均已接线。shift、MTP 与 episode 持久化也有实现，但实现存在不等于完整兼容矩阵通过。当前仍不能称 DAG RERoT 完成或 production-compatible；各阶段证据与限制见第 12/13 节。
+> **DAG production path wired, not production-certified**：隔离 probe、正式 P/C_base、循环优先 Kahn、原生 tool-round 固定入口、按 token LCP 的启动前缀重建、simple 完整 sampler clone 与用户预算恢复、源结束、W>P 逻辑 cohort、PUBLIC BODY/FRAME 冻结视图均已接线。阶段 0–8 的核心门（单 child 闭环、多 lane 真机、兼容矩阵、阶段 8 质量门）已在目标 CPU artifact 上通过；**但当前 HEAD（`a35ec96f6`，含 wire 回滚与 512 probe 上限）尚未在该 artifact 上重跑**，历史验收不自动覆盖当前版本。各阶段证据与版本边界见第 12/13 节。
 
 新的实施阶段只保留第 12 节的 **阶段 0–8**。
 
@@ -126,15 +117,16 @@ feat(rerot): wire DAG scheduling and routing probe into server decode
 这几项后续最容易被“代码已经有名字”误判为完成：
 
 1. **隔离 probe 已把 JSON 写到临时 `probe_seq`，C0 的 slot seq 不再被 probe 追加。** 这仍是 COW 拷贝后的分叉，不是独立 llama_context。simple 保留真实 C0 logits 的首个采样决策及完整 sampler，不再 `init_sampler()` 重置 RNG/惩罚链。目标 Ornith 的 CPU A/B 已通过贪心、seeded logprobs、用户 JSON grammar 与 SSE；不据此推断 GPU 或 RAM 恢复等价。
-2. **`capture_c_base()` 在正式 P 的 `plan_prefix` 注入完成之后调用，并覆盖当前 root hand_seed（含 conv tails）。** sampler prev/seed 写入 `sampler_snapshot_bytes`。仍需用真实 recurrent 模型核对 brain/hand 配对。
-3. **固定入口用真实请求 messages + spawn_lane 渲染 F_i。** 普通 C0 tape 与 DAG-with-tools 再渲染比较 token LCP；合法前缀变化在 DAG 启动时重建必要状态，不污染 simple 的普通 C0。模板无法无损渲染 CLOSE+handoff+OPEN 时仍 hard_abort。
-4. **W>P：eligible 节点可在未 SEAL 时 START；同一逻辑步的 BODY 写 PENDING，直到 cohort 全员 commit 后才发布。** 物理 pens 仍分时。逻辑 cohort 与分时全周期（`test_dag_w_gt_p_logical_cohort_and_time_slice_certification`）以及目标大模型多 Lane 真机端到端已全量通过；生产服务依据授权保持永久停用。
-5. **HTML `<ol>` / 随机 Base62 / PAC-DFS 的生产入口已 hard_abort；DAG 上的 HTML fork 会失败。** 解析器、PAC-DFS `build_view` 和大量旧测试仍在树里。递归嵌套 DAG 没有实现。
-6. **0.synthesize 作为独立阶段 admit。** 目标大模型 35B 在单 child（$13 \times 17=221$）、flat 2-worker（$25 \times 12$ 与 $15 \times 16 \to \boxed{540}$）、$A \to C$ 独立 B（$14 \times 15=210, 30 \times 20=600, C=260 \to 860$）以及菱形拓扑（$100 \times 3$ 与 $100 \times 5 \to 800$）下均顺利完成综合闭环，单次自然 stop，无 P 泄漏与 internal FRAME 泄漏。
-7. **Episode 持久化（state v5）包含 C0/C_base、frozen epoch、逻辑步 cohort、conv tails 与 sampler prev。** probe 进行中的 save 被拒绝。RAM 持久化跨槽位恢复已在单测与多读者矩阵中完成验证（`test_dag_tri_mtp_ram_shift_speculative_matrix`）。
-8. **DAG context shift pin 已启动节点的全部 PUBLIC 与全部 FRAME。** 无法腾出空间时 `tokens_removed=0`，由 decode 路径 resource abort。非 DAG 仍可截断未 pin 的旧 PUBLIC。
-9. **RERoT lane 不再永久跳过 MTP drafting。** 强制注入期间不 draft；draft 绑定 topology/publish/layout stamp；过期 draft 恢复 checkpoint。DAG 读者视角 MTP 草稿失效与重草稿矩阵（`test_dag_tri_mtp_ram_shift_speculative_matrix`）已认证通过。
-10. **`n_cmpl>1` 仍在 prelude 串行化额外 RERoT root**（避免共用 visibility domain）。阶段/RNG/图不串线，但不是并发多 completion。
+2. **probe 有 512-token 硬上限，且截断与语义拒绝被显式区分。** 探针 token 被排除在用户 `n_predict` 与普通预算统计之外（原 240s 挂死的根因），现在超限即 `rerot_resource_exhausted` fail-closed；`incomplete`（JSON 未闭合，继续采样）与「语法完整但校验失败」（立即 final 并回报解析器诊断）是两条不同路径。成对 trace `probe_reject`/`probe_plan` 把计划压成单行，多任务计划不会被日志按行截断。
+3. **`capture_c_base()` 在正式 P 的 `plan_prefix` 注入完成之后调用，并覆盖当前 root hand_seed（含 conv tails）。** sampler prev/seed 写入 `sampler_snapshot_bytes`。仍需用真实 recurrent 模型核对 brain/hand 配对。
+4. **固定入口用真实请求 messages + spawn_lane 渲染 F_i。** 普通 C0 tape 与 DAG-with-tools 再渲染比较 token LCP；合法前缀变化在 DAG 启动时重建必要状态，不污染 simple 的普通 C0。模板无法无损渲染 CLOSE+handoff+OPEN 时仍 hard_abort。
+5. **W>P：eligible 节点可在未 SEAL 时 START；同一逻辑步的 BODY 写 PENDING，直到 cohort 全员 commit 后才发布。** 物理 pens 仍分时。逻辑 cohort 与分时全周期（`test_dag_w_gt_p_logical_cohort_and_time_slice_certification`）以及目标大模型多 Lane 真机端到端已全量通过；生产服务依据授权保持永久停用。
+6. **HTML `<ol>` / 随机 Base62 / PAC-DFS 的生产入口已 hard_abort；DAG 上的 HTML fork 会失败。** 解析器、PAC-DFS `build_view` 和大量旧测试仍在树里。递归嵌套 DAG 没有实现。
+7. **0.synthesize 作为独立阶段 admit。** 目标大模型 35B 在单 child（$13 \times 17=221$）、flat 2-worker（$25 \times 12$ 与 $15 \times 16 \to \boxed{540}$）、$A \to C$ 独立 B（$14 \times 15=210, 30 \times 20=600, C=260 \to 860$）以及菱形拓扑（$100 \times 3$ 与 $100 \times 5 \to 800$）下均顺利完成综合闭环，单次自然 stop，无 P 泄漏与 internal FRAME 泄漏。
+8. **Episode 持久化（state v5）包含 C0/C_base、frozen epoch、逻辑步 cohort、conv tails 与 sampler prev。** probe 进行中的 save 被拒绝。RAM 持久化跨槽位恢复已在单测与多读者矩阵中完成验证（`test_dag_tri_mtp_ram_shift_speculative_matrix`）。
+9. **DAG context shift pin 已启动节点的全部 PUBLIC 与全部 FRAME。** 无法腾出空间时 `tokens_removed=0`，由 decode 路径 resource abort。非 DAG 仍可截断未 pin 的旧 PUBLIC。
+10. **RERoT lane 不再永久跳过 MTP drafting。** 强制注入期间不 draft；draft 绑定 topology/publish/layout stamp；过期 draft 恢复 checkpoint。DAG 读者视角 MTP 草稿失效与重草稿矩阵（`test_dag_tri_mtp_ram_shift_speculative_matrix`）已认证通过。
+11. **`n_cmpl>1` 仍在 prelude 串行化额外 RERoT root**（避免共用 visibility domain）。阶段/RNG/图不串线，但不是并发多 completion。
 
 ---
 
@@ -336,12 +328,12 @@ KV allocator 的“head/cursor”也不是通用 checkpoint。Unified KV 有共�
   C0
    └──→ 隔离 probe branch
             ↓
-        Compact Dict JSON 计划
-            ├─ 单任务无依赖 → simple
+        strategy-json 计划
+            ├─ strategy=simple → simple
             │    → 丢弃 probe branch
             │    → 原 C0 sampler/state 继续
             │
-            └─ 多任务或含依赖 → dag
+            └─ strategy=dag → dag
                  → 校验整张计划
                  → 丢弃 probe branch
                  → 从 C0 构建正式规划边界 P
@@ -351,73 +343,111 @@ KV allocator 的“head/cursor”也不是通用 checkpoint。Unified KV 有共�
 
 “隔离”不是因为 PRIVATE 可以消除因果影响，而是反过来：**PRIVATE 不能从已经运行过的 recurrent/sampler 里扣掉。** 要得到干净 simple continuation，必须保留真正的 C0 边界。
 
-### 4.3 路由 JSON（Compact Dict JSON）
+### 4.3 路由 JSON（strategy + payload）
 
-路由探针的输出格式为**极简扁平键值对 JSON**：`tasks` 先给出全部任务与意图，`deps` 再集中给出依赖连线。这一顺序符合正常思维序（先想清楚要做哪些事，再决定谁依赖谁），避免「生成意图前先决定依赖图」的因果倒置；同时没有 `strategy` / `payload` / `questions` / `depends_on_id` 这些冗余层级，写 Token 显著低于旧 schema，也无需任何语法长篇说明——JSON 是模型的原生先验（此前试用的 Makefile 行式 DSL `ID [<- DEPS]: INTENT` 因 Prompt 解释开销与因果倒置问题**已作废并清理**）。
+路由探针的输出格式为**显式 `strategy` + `payload` 的 JSON**。这是当前 `master` 的线上 wire 格式；历史上先后试用的 Makefile 行式 DSL（`ID [<- DEPS]: INTENT`）与扁平 Compact Dict JSON（`{"tasks":…,"deps":…}`）已按负责人指示**作废并清理**，wire 语义回滚至 `abd816e4d` 基线（commit `9290e7a1a`），其后不涉及 wire 的程序修复（Vulkan OOB 地毯、seq 单一权威分区、admission 三态、probe 截断/重复成员/512 上限/成对 trace）全部保留。
 
 隔离 probe 注入的单行模板（末尾带换行，首颗 Token 直接落进对象体，不粘连）：
 
 ```text
-Plan in JSON: {"tasks":{"<id>":"<intent>",...},"deps":{"<id>":["<dep_id>"],...}}
+Choose whether this request continues as a single answer or a DAG of independent sub-questions. Output only JSON: {"strategy":"simple","payload":{}} or {"strategy":"dag","payload":{"questions":[{"id":"...","intent":"..."}],"depends_on":[]}}.
 ```
 
-> 注：模板用 `<id>` / `<intent>` / `<dep_id>` 占位符，并以 `...` 明示「可继续追加条目」（模型此前不知道能否再加任务，导致单条目塌缩或自造汇聚节点）；要求**一致替换**：`deps` 的键与数组元素都必须取自 `tasks` 已声明的 id。
-> 早期模板写成 `{"tasks":{"A":"..."},"deps":{"C":["A"]}}`（具名示例）时，模型会忠实照抄出「未声明的 C」而被 fail-closed 拒绝（真机实测：`unknown endpoint in dependency: C`）；改为占位符后模型必须给出真实 id，不再有可照抄的具名依赖。
+> 注：末尾 `.\n` 是**强制契约**——`server-context.cpp` 在 arm probe 前显式校验 `probe_prompt.back() == '\n'`，不满足即 `rerot_protocol_error: routing probe prompt missing trailing newline`。这样 JSON 文法从 `{` 起，首颗模型 Token 直接开对象，prompt prose 永远不进文法栈，也不需要 forced prompt token。
 
-多任务 DAG 形态：
+simple 形态：
+
+```json
+{ "strategy": "simple", "payload": {} }
+```
+
+dag 形态（`questions` 数组顺序即 `plan_rank`，`depends_on` 是 `{id, depends_on_id}` 边表）：
 
 ```json
 {
-  "tasks": {
-    "A": "计算第一项所需事实",
-    "B": "独立检查第二项",
-    "C": "使用 A 的结果继续推导"
-  },
-  "deps": { "C": ["A"] }
+  "strategy": "dag",
+  "payload": {
+    "questions": [
+      {"id": "A", "intent": "计算第一项所需事实"},
+      {"id": "B", "intent": "独立检查第二项"},
+      {"id": "C", "intent": "使用 A 的结果继续推导"}
+    ],
+    "depends_on": [
+      {"id": "C", "depends_on_id": "A"}
+    ]
+  }
 }
-```
-
-单任务（= 直接/简单路线）时 `deps` 可省略或为 `{}`：
-
-```json
-{ "tasks": { "A": "直接回答用户问题" } }
 ```
 
 Schema（`server_rerot_routing_schema_json()`，经 `json_schema_to_grammar()` 生成探针 GBNF）：
 
 ```json
 {
-  "type": "object",
-  "required": ["tasks"],
-  "additionalProperties": false,
-  "properties": {
-    "tasks": { "type": "object", "minProperties": 1,
-               "additionalProperties": { "type": "string", "minLength": 1 } },
-    "deps":  { "type": "object",
-               "additionalProperties": { "type": "array", "items": { "type": "string", "minLength": 1 } } }
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["strategy", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {"const": "simple"},
+        "payload": {"const": {}}
+      }
+    },
+    {
+      "type": "object",
+      "required": ["strategy", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {"const": "dag"},
+        "payload": {"$ref": "#/$defs/DagPayload"}
+      }
+    }
+  ],
+  "$defs": {
+    "DagPayload": {
+      "type": "object",
+      "required": ["questions", "depends_on"],
+      "additionalProperties": false,
+      "properties": {
+        "questions": { "type": "array", "minItems": 1,
+                        "items": { "type": "object", "required": ["id", "intent"],
+                                    "additionalProperties": false,
+                                    "properties": { "id": { "type": "string", "minLength": 1 },
+                                                    "intent": { "type": "string", "minLength": 1 } } } },
+        "depends_on": { "type": "array",
+                         "items": { "type": "object", "required": ["id", "depends_on_id"],
+                                     "additionalProperties": false,
+                                     "properties": { "id": { "type": "string", "minLength": 1 },
+                                                     "depends_on_id": { "type": "string", "minLength": 1 } } } }
+      }
+    }
   }
 }
 ```
 
-强制分层：`minLength` / `additionalProperties:false` 由**文法**物理屏蔽；转换器未渲染 `minProperties`，故「空 `tasks` 对象」由**解析器**拒绝。解析器同时 fail-closed 校验：重复 JSON 成员（nlohmann 会静默保留最后一个，必须先拒绝）、id/intent 非空且非纯空白、保留 id `"0"`、未知依赖端点、自环、重复边、Kahn 全拓扑覆盖（有环则整张图拒绝）。
+强制分层：`minLength` / `additionalProperties:false` / `oneOf` 的 strategy 常量由**文法**物理屏蔽；转换器未渲染 `minItems`，故「空 `questions` 数组」由**解析器**拒绝。解析器 fail-closed 校验：重复 JSON 成员（nlohmann 会静默保留最后一个，必须先拒绝）、id/intent 非空且非纯空白、保留 id `"0"`、未知依赖端点、自环、重复边、Kahn 全拓扑覆盖（有环则整张图拒绝）。
 
-语义映射：单任务且无依赖边 → `strategy_type::simple`（丢弃 probe、恢复 C0 续写）；多任务或显式依赖边 → `strategy_type::dag`（正式 P 注入、C_base 捕获与多 Lane 调度）。Stage-5 单 worker DAG 测试经 `force_single_node_dag` 显式维持 dag 模式。
+**截断不是判决。** 解析器区分两类失败：JSON 尚不能合法解析（探针还在逐 token 流式）→ `incomplete = true`，继续采样；语法完整但校验失败 → 立即 final 并回报解析器自己的诊断，不等 EOG。因此文法绝不会接受 malformed 对象，`incomplete` 不可能是损坏计划。
+
+语义映射：`strategy == "simple"` 且 payload 为空对象 → 丢弃 probe、恢复 C0 续写；`strategy == "dag"` → 正式 P 注入、C_base 捕获与多 Lane 调度。**模型不再自行推断拓扑**：worker 数 = `questions` 数，显式边决定依赖。Stage-5 单 worker DAG 由测试显式构造成 `strategy:"dag"` 维持 dag 模式（不再有"单任务自动降级 simple"的规则）。
 
 ### 4.4 控制面语义校验
 
 grammar 只负责结构子集。正式计划提交前还必须：
 
-1. `tasks` 为 JSON 对象且非空；无重复 JSON 成员；缺 `tasks` 或空 `tasks` 一律拒绝。
+1. `strategy` ∈ {`simple`, `dag`}；`simple` 的 payload 必须是空对象 `{}`，`dag` 的 payload 必须同时含非空 `questions` 数组与 `depends_on` 数组。
 2. ID、intent 非空且非纯空白。
 3. ID 唯一；`0` 保留给内部主体阶段。
 4. questions 数组顺序固定为 `plan_rank`。
-5. `deps` 的 `{id: [dep_id...]}` 转成 `dep_id → id`。
+5. `depends_on` 的 `{id, depends_on_id}` 转成 `depends_on_id → id`。
 6. 拒绝未知端点、自环、重复边。
 7. Kahn 必须消费全部工作节点，否则整张计划拒绝。
 8. runtime 自动建立 `0.plan` 的公共起点语义和“全部工作 → 0.synthesize”的最终条件。
 9. 完整 descriptors/resources 可建立后再原子发布计划；失败不能留下半张图。
 
 无效计划不能通过删边、裁问题、偷偷改 simple 或加 judge 来修复。
+
+**重复成员扫描必须在 `json::parse` 之后**：扫描器会把截断输入误报成「重复成员」（实测两个字节的 `{` 就被拒），先解析再扫描才能把「语法错误」和「歧义对象」分开。nlohmann 对重复成员静默取最后一个，所以歧义对象必须显式拒绝而不是被悄悄修复。
 
 ### 4.5 simple 的恢复义务
 
@@ -438,14 +468,13 @@ simple 恢复后必须证明：
 
 当前 HEAD 已有：
 
-- `server_rerot_routing_schema_json()`（Compact Dict JSON Schema）/ `server_rerot_routing_probe_prompt()`（单行模板，末尾带换行）；
-- `server_rerot_routing_grammar()`；
-- `server_rerot_parse_routing_decision()`，含 duplicate IDs/edges、自环、unknown endpoint、Kahn cycle check；
-- `capture_c0()` / `rerot_start_root()` / `rerot_try_finish_probe()`；
-- `rerot_enter_simple()`；
-- `rerot_enter_dag()`。
+- `server_rerot_routing_schema_json()`（`oneOf` strategy/payload Schema）/ `server_rerot_routing_probe_prompt()`（单行模板，末尾带换行，arm 前强制校验）；
+- `server_rerot_routing_grammar()`（schema → GBNF，eager，非 lazy）；
+- `server_rerot_parse_routing_decision()`：`incomplete` 截断语义 + 重复成员、extra key、id/intent 空白、保留 `"0"`、重复 id、未知端点、自环、重复边、Kahn 环检测；
+- probe 运行时治理：`probe_seq` 隔离、`SERVER_REROT_PROBE_MAX_TOKENS = 512` 硬上限（超限即 `rerot_resource_exhausted` fail-closed）、成对 trace `rerot.trace.probe_reject` / `rerot.trace.probe_plan`（计划压成单行，`\n`/`\r`/`\t` 转义）、EOG 文案区分「探针未决」与「子分隔符未关」；
+- `capture_c0()` / `rerot_start_root()` / `rerot_try_finish_probe()` / `rerot_enter_simple()` / `rerot_enter_dag()`。
 
-工作树使用独立 `probe_seq`，而不是继续向 C0 的 slot sequence 追加 planner。probe 丢弃后恢复 C0 lineage；simple 绑定保留的完整 sampler clone，并保留用户原 reasoning budget。
+probe 写入独立 `probe_seq`，C0 的 slot seq 不被 probe 追加；probe 丢弃后恢复 C0 lineage，simple 绑定保留的完整 sampler clone 并保留用户原 reasoning budget。probe 进行中的 episode save 被拒绝（`test_dag_save_refuses_probe_and_persists_c0`）。
 
 DAG 模板新增 tools 可能改变普通前缀。`rerot_render_dag_prefix()` 比较真实 token LCP；`rerot_rebuild_dag_prefix_memory()` 在 DAG 启动时重建必要前缀，深度 recurrent rollback 不可用时从空状态重新计算正式 P。该工作只发生在启动边界，不是逐 frontier 重算 FRAME。不能仅因合法工具模板改变前缀就拒绝整个 DAG。
 
@@ -1317,14 +1346,19 @@ C0/C_base 当前到底保存哪些 state？
 
 | case | 期望 |
 |---|---|
-| simple + DAG payload | reject |
-| dag + `{}` payload | reject |
+| `simple` + 非空 payload | reject |
+| `dag` + 空 payload（缺 questions/depends_on） | reject |
+| unknown strategy 值 / 非字符串 strategy | reject |
+| extra 成员（root/payload/question/depends_on 任一） | reject |
+| 重复 JSON 成员（nlohmann 静默取最后） | reject |
+| 截断 JSON | `incomplete`，继续采样而不是判决 |
 | duplicate ID | reject |
 | self-loop | reject |
 | duplicate edge | reject |
 | unknown endpoint | reject |
 | cycle | reject whole plan |
 | questions order != topo order | dependency first, `plan_rank` 只 tie-break |
+| single question `questions:[A]` + `depends_on:[]` | 仍是 dag（不再自动降级 simple） |
 | flat 1/2/3 | reader 1=`2,3,1`; 2=`3,1,2`; 3=`1,2,3` |
 | A→C，B independent | A seal 后 C eligible；B 不需等；B 仍看 A |
 | diamond | shared ancestor/run exactly once |
@@ -1729,7 +1763,7 @@ shadow
 | 范围 | 当前实现 |
 |---|---|
 | routing schema | JSON Schema + schema-to-grammar |
-| routing parse | simple/dag strict parse，duplicate member/ID/edge、自环、unknown endpoint、cycle check |
+| routing parse | strategy/payload strict parse，`incomplete` 截断语义、duplicate member/ID/edge、自环、unknown endpoint、cycle check |
 | prebranch state | `server_rerot_prebranch_checkpoint`，C0/C_base fields |
 | node DAG metadata | `string_id / intent / plan_rank / predecessors / successors / remaining_preds / stage_role / is_sealed` |
 | document mode | DAG mode、edge、cycle-preferred Kahn、DAG reader view |
@@ -1739,6 +1773,7 @@ shadow
 | native end | template thinking end tag → 当前源流 parser/origin gate，不用 grammar 强制完成 |
 | DAG init | workers + synthesis node + dependency count |
 | server wiring | 隔离 probe → simple/dag；正式前缀重建；DAG admission；FRAME injection；源结束与最终输出分流 |
+| probe governance | `probe_seq` 隔离、512-token 硬上限 fail-closed、成对 trace `probe_reject`/`probe_plan`（单行转义）、EOG 文案区分「探针未决」 |
 | serialization | DAG flags/node fields/source marker 已进入 episode state path |
 | offline reference | `scripts/rerot-dag-reference.py` |
 
@@ -1759,26 +1794,11 @@ shadow
 | Tri/MTP/RAM/shift DAG matrix | **已实现并认证通过**（`test_dag_tri_mtp_ram_shift_speculative_matrix` 覆盖 DAG 读者视角 MTP 草稿失效与重草稿、活跃 DAG 框架与正文 shift 严格钉扎、RAM 持久化换槽恢复完整性） |
 | DAG quality/performance/soak | **已完成阶段 8 正式 Quality Acceptance Gate 评测**（通过 `scripts/rerot-phase8-quality.py --cpu-only` 评测全量 11 项跨层基准：Tier 1 确定性微题 4/4 全部 100% 通过；Tier 2 代码算法编译与单元测试 3/3 全部 100% 通过；Tier 3 形式数学 AIME 样例通过；Tier 4 长上下文 Needle-in-haystack 密钥提取与多章节系统分析报告全部通过；总体通过率 10/11 达到 PASS 标准，全量结果、分项 JSON 记录与动态库 SHA256 审计清单已落地归档在 `reports/phase8-quality/`） |
 
-### 13.3 两个最近提交的边界
+### 13.3 wire 基线与最近提交的边界
 
-`c3648d789` 主要覆盖：
+**wire 基线 = `abd816e4d`（由 `9290e7a1a` 恢复）。** 早期 DAG 接线提交 `c3648d789`（调度/view/framing）与 `4e7769152`（server decode 接线）之后，routing wire 经过 Makefile DSL → Compact Dict JSON → lazy grammar 三次试验，最终**语义回滚**到 `abd816e4d` 的 `strategy+payload` 基线。回滚时保留的程序修复（不触及 wire）：Vulkan workgroup stride OOB 地毯修复（`turbo_wht` + 29 个 shader 的 `NumWorkGroups` 线性化、host `wg_scale`、rope 行跨步、`flash_attn_rerot` 的 `Br=1` 网格钉扎）、seq id 单一权威分区（`set_pen_capacity` 唯一划分点、`alloc_internal_seq` 别名断言、`rerot_seq_retarget` 拷前清空、park/resume 空决策语义）、admission 三态闸门（`ok/saturated/failed`，消灭 5000+ 次活锁刷屏）、probe 加固（512 上限、截断/拒绝区分、重复成员扫描后置于 parse、成对 trace）。
 
-- 文档合并；
-- DAG logical metadata；
-- cycle-preferred views；
-- fixed-entry framing scaffolding；
-- parser/runtime/view tests。
-
-`4e7769152` 主要覆盖：
-
-- server decode routing probe；
-- C0 simple/dag wiring；
-- DAG scheduler/server admission；
-- source-end grammar；
-- 更多 parser/runtime/view tests；
-- offline DAG reference script。
-
-提交标题和代码存在只证明 implementation landed，不证明 target artifact 的 Stage 0–8 gates 已通过。
+提交标题和代码存在只证明 implementation landed，不证明 target artifact 的 Stage 0–8 gates 已通过。**当前 HEAD `a35ec96f6` 的状态必须按 artifact 重新认证**—— wire 回滚后 parser/runtime/view/attn/flashprefill 已在开发机复跑（`50/50`，见 §21.2），真机 smoke 用 780M + `K=q8_0/V=turbo4` 完成（simple 200、循环计划 500 精确拒绝、GPUVM=0），但 Ornith-1.5-35B 的阶段 5/6/8 目标机验收仍绑定在回滚前的 artifact 上。
 
 ---
 
@@ -1890,8 +1910,10 @@ valid multi-node dag
 duplicate JSON member
 missing fields
 extra fields
-simple + dag payload mismatch
-dag + empty simple payload mismatch
+simple with non-empty payload
+dag with empty/shaped payload
+unknown strategy value
+truncated JSON -> incomplete (keep sampling)
 whitespace-only id/intent
 id "0"
 duplicate id
@@ -1899,6 +1921,7 @@ unknown endpoint
 self-loop
 duplicate edge
 cycle
+grammar accepts exactly the schema subset (accept/reject matrix)
 ```
 
 ### 15.2 DAG property tests
@@ -2325,6 +2348,9 @@ git diff --check
 47432e525  before DAG cutover commits
 c3648d789  DAG logical/view/fixed-entry implementation
 4e7769152  DAG routing/server wiring
+abd816e4d  DAG server/state lanes + C03/C11/C12 fixtures (routing wire 基线)
+9290e7a1a  wire 语义回滚至 abd816e4d，保留全部后续 bugfix
+a35ec96f6  当前 HEAD（TP5 默认 F32 linear lowering + reset 脚本 sclk 固化 + 54.45 tok/s）
 ```
 
 需要旧文件原文可从对应 commit `git show <commit>:<path>` 获取，不把旧文本重新复制回仓库作为第二事实源。
@@ -2642,6 +2668,37 @@ cell，记录 (idx, storage, meta, sig)。每个 view group 由「扫描」退�
 **最终状态与缺口归档**：
 本轮为全案最终交付班次。主机端布局构建已全面收敛至内存带宽与必要产物发射下界。所有后续 GPU Kernel 编写、真机 A/B 吞吐量测量以及十问核心算法闭环，均已规范化整理追加至根目录 `缺口.md`（共 17 项核心缺口），完成全面交接。
 
+### 21.6 第二十/二十一轮：wire 回滚后的文档核对与回归复跑（09-23）
+
+**核对对象。** 逐行比对当前 `master` HEAD `a35ec96f6` 的源码与本文正文，发现的最大漂移是**路由 wire 格式**：文中 §4.2/4.3/4.4/4.6/§13.1/§15.1 仍描述已作废的扁平 Compact Dict JSON（`{"tasks":…,"deps":…}` + 单任务自动降级 simple + `force_single_node_dag`），而 `server_rerot_routing_probe_prompt()` / `server_rerot_routing_schema_json()` / `server_rerot_parse_routing_decision()` 早已回滚到 `strategy+payload` 基线。这是「文档先于代码试验、回滚后未回写」的典型漂移，按 §20 规则 1（先改当前状态、直接改正文）一次性修正。
+
+**核对中确认仍属实的陈述**（未改）：
+
+| 文档陈述 | 源码核对点 |
+|---|---|
+| probe 模板末尾必须带换行 | `server-context.cpp` arm probe 前显式校验 `probe_prompt.back() != '\n'` → `rerot_protocol_error` |
+| probe 写独立 `probe_seq`，C0 slot seq 不被追加 | `rerot_start_root` / `arm_isolated_probe` / `discard_isolated_probe` |
+| `capture_c_base()` 在正式 P 注入后调用 | `rerot_enter_dag`：rebuild → `set_dag_protocol_markers` → `initialize_dag` → formal P forward |
+| LCP 前缀重建只发生在启动边界 | `rerot_render_dag_prefix` / `rerot_rebuild_dag_prefix_memory`（仅在 `rerot_enter_dag` 调用） |
+| DAG 模式下旧 fork/fence 生产语义 hard_abort | `publish_pending_record` / `freeze_fork_parent` 在 DAG 路径的条件分支 |
+
+**本轮修正要点**（详见正文）：§4.2 流程图、§4.3 wire 格式/Schema/强制分层/语义映射、§4.4 控制面列表 1 与 5、§4.6 实现清单（补 probe 治理）、§1.1 旧概念表、§1.2 定级与 wire 回滚叙述、§1.3 新增 probe 512 上限与截断/拒绝区分条目、§13.1 inventory、§13.3 改为 wire 基线与保留修复清单、§15.1 parser 矩阵、§20 锚点。
+
+**回归复跑**（`build/` Release，Vulkan ON；`test-rerot-parser` 已按 `9290e7a1a` 重编）：
+
+| 检查 | 结果 |
+|---|---|
+| `build/bin/test-rerot-parser` | 0 failure（覆盖新 wire 的 accept/reject 矩阵、重复成员、自环、重复边、保留 id `"0"`、空白 intent、grammar accept/reject） |
+| `build/bin/test-rerot-runtime` | 0 failure |
+| `build/bin/test-rerot-view` | 0 failure |
+| `ctest -R "rerot\|xkv\|flashprefill"` | **50/50 通过** |
+| `scripts/rerot-dag-reference.py` | 通过，统计不变（DAGs 543 / Legal live states 3007 / Reader views 3904 / Fixed-frame compositions 384） |
+
+注：首次 `ctest` 有 3 项 `Not Run`（`test-rerot-span-expand` / `test-rerot-q-prep` / `test-rerot-q3-shared-kv-2reader`）——纯粹是这些目标从未在本 build 目录构建过（源码在 `tests/CMakeLists.txt` 已注册），构建后单独跑 3/3 通过，再跑全套 50/50。这不是回归，是构建目录陈旧。
+
+**边界。** 本轮是**文档核对 + 源码静态比对 + CPU 回归**，未启动模型、未跑 GPU、未在目标机重跑阶段 5/6/8。§12.5–12.9 与 §13.2 中的 Ornith-1.5-35B 结论仍是回滚前 artifact 的历史证据。
+
+**遗留未闭合。** ① 目标机（5×RX 6800 / Ornith-1.5-35B）阶段 5/6/8 未按 `a35ec96f6` 重跑；② wire 回滚后真机 probe 质量（780M + `K=q8_0/V=turbo4`）已有 5/5 HTTP 200 与环拒绝证据，但那是 AGENTS.md 交接记录，本文只引用不重复记账；③ 当时 `缺口.md` 未随 wire 核对更新，现见 §22 与 `缺口.md` 第五部分的候选验收账本。
 ---
 
 ## 22. RERoT 与计算组织核心候选四轴验收账本与交付准则（2026-09-23 审计）
