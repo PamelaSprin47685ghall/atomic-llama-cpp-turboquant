@@ -297,6 +297,12 @@ def get_available_variants(model_path: str, mtp_model_path: str) -> Dict[str, Di
         "description": "Same MTP binary with rank-local pinned readback disabled; one-factor W1 control",
         "env": dict(variants["native-mtp-single-draft"]["env"], GGML_META_ASYNC_READBACK="0"),
     }
+    variants["native-mtp-materialized-draft"] = {
+        **variants["native-mtp-single-draft"],
+        "name": "native-mtp-materialized-draft",
+        "description": "Same MTP binary with legacy CPU top-k draft candidates; confidence-free selection control",
+        "env": dict(variants["native-mtp-single-draft"]["env"], GGML_MTP_DRAFT_RAW_GREEDY="0"),
+    }
     variants["native-mtp-bo-isolated"] = {
         **variants["native-mtp-single-draft"],
         "name": "native-mtp-bo-isolated",

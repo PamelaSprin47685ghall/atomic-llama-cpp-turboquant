@@ -1782,6 +1782,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto & ctx_dft = params.ctx_dft;
 
+        static const bool raw_greedy_enabled = []() {
+            const char * env = std::getenv("GGML_MTP_DRAFT_RAW_GREEDY");
+            return !env || std::strcmp(env, "0") != 0;
+        }();
+        // The private draft sampler's random draw is discarded in favor of
+        // sorted candidate[0]. Keep probability/debug consumers on that path;
+        // the target's sampler and RNG are never changed here.
+        const bool raw_greedy =
+            raw_greedy_enabled && params.p_min <= 0.0f && common_log_get_verbosity_thold() < LOG_LEVEL_DEBUG;
+        const llama_vocab * vocab        = raw_greedy ? llama_model_get_vocab(llama_get_model(ctx_dft)) : nullptr;
+        const int32_t       n_vocab      = vocab ? llama_vocab_n_tokens(vocab) : 0;
+        int32_t             n_suppressed = 0;
+        const llama_token * suppressed   = vocab ? llama_vocab_get_suppress_tokens(vocab, &n_suppressed) : nullptr;
+
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -1861,15 +1875,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                const llama_token sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                llama_token sampled = LLAMA_TOKEN_NULL;
+                if (raw_greedy && !backend_chains[seq_id]) {
+                    sampled = common_mtp_confidence_free_token(llama_get_logits_ith(ctx_dft, i_last[seq_id]), n_vocab,
+                                                               suppressed, n_suppressed);
+                }
+                const llama_token_data_array * cur_p = nullptr;
+                if (sampled == LLAMA_TOKEN_NULL) {
+                    sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                    cur_p   = backend_chains[seq_id] ? nullptr : common_sampler_get_candidates(smpl, true);
+                }
                 const float * h_row = device_hidden ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
                 if (device_hidden && llama_predefined_hidden_rows(ctx_dft) != 1) {
                     throw std::runtime_error("device MTP draft did not produce one hidden row");
                 }
-
-                // Backend sampling transfers only the chosen id, not the full
-                // probability vector. A positive p_min requires the CPU path.
-                const auto * cur_p = backend_chains[seq_id] ? nullptr : common_sampler_get_candidates(smpl, true);
 
                 if (cur_p) {
                     for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {

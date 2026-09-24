@@ -3,11 +3,57 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <vector>
+
+// The MTP CPU draft sampler uses top-k + dist, then discards the random draw
+// and chooses candidate[0]. With no confidence threshold, a unique finite
+// maximum gives the same token without materializing candidates. Leave ties,
+// non-finite logits and a suppressed winner to the original sampler: its
+// partial-sort tie ordering and suppression semantics remain authoritative.
+inline llama_token common_mtp_confidence_free_token(const float *       logits,
+                                                    int32_t             n_vocab,
+                                                    const llama_token * suppressed,
+                                                    int32_t             n_suppressed) {
+    if (!logits || n_vocab <= 0 || n_suppressed < 0 || (n_suppressed > 0 && !suppressed)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    // Independent lanes avoid a vocabulary-length scalar dependency chain.
+    // The second, branch-free pass checks uniqueness and exceptional values;
+    // no floating-point arithmetic or changed tie order is introduced.
+    float   maxima[4] = { -INFINITY, -INFINITY, -INFINITY, -INFINITY };
+    int32_t i         = 0;
+    for (; i <= n_vocab - 4; i += 4) {
+        for (int lane = 0; lane < 4; ++lane) {
+            maxima[lane] = std::max(maxima[lane], logits[i + lane]);
+        }
+    }
+    float maximum = std::max(std::max(maxima[0], maxima[1]), std::max(maxima[2], maxima[3]));
+    for (; i < n_vocab; ++i) {
+        maximum = std::max(maximum, logits[i]);
+    }
+    int32_t     matches = 0, invalid = 0;
+    llama_token best = 0;
+    for (i = 0; i < n_vocab; ++i) {
+        const bool match = logits[i] == maximum;
+        matches += match;
+        invalid += !std::isfinite(logits[i]);
+        best |= match ? i : 0;
+    }
+    if (matches != 1 || invalid != 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+    for (int32_t i = 0; i < n_suppressed; ++i) {
+        if (suppressed[i] == best) {
+            return LLAMA_TOKEN_NULL;
+        }
+    }
+    return best;
+}
 
 // One maximum-sized host handoff arena for an MTP driver. A verification batch
 // is shared by all its sequences, so allocate rows*width once, NOT
