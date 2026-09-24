@@ -1,0 +1,29 @@
+{
+  "done": true,
+  "answer": "221\n399",
+  "last": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "delta": {}
+      }
+    ],
+    "created": 1790260393,
+    "id": "chatcmpl-Z20u5kpz4cDJMvPuVdL45T23yGViUsrx",
+    "model": "/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf",
+    "system_fingerprint": "b1689-43b290eff",
+    "object": "chat.completion.chunk",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 75,
+      "prompt_ms": 556.144,
+      "prompt_per_token_ms": 7.415253333333333,
+      "prompt_per_second": 134.85715929687277,
+      "predicted_n": 274,
+      "predicted_ms": 11989.667,
+      "predicted_per_token_ms": 43.757908759124085,
+      "predicted_per_second": 22.853011680808148
+    }
+  }
+}

@@ -2785,3 +2785,162 @@ R02/Q1/Q3/Q5/Q6/Q7/Q8/Q9/Q10 与 R07/R09/R10/R12/R13 的生产级跨 reader/跨�
 唯一内部工具为 `become`，唯一参数为 `node`，值是冻结 TreePlan 中当前节点的**原始标签**，不是 `leaf_N` 或其他 host id。工具回复固定为 `Now you became the node <原始标签>, please think about it.`，接模型原生 assistant reasoning 入口；不再附加 scope、depth、phase、final_mode 或其他角色提示。汇总阶段同样 `become({"node":"root"})` 回到原图根节点，不向模型解释 runtime 的 synthesis 角色。调度和 reader-view 所需编号仍在内部保存，工具参数及该帧的 call id 不携带这些编号。旧 JSON-DAG 路径不在本次协议改动范围内。
 
 删除了 scoped-worker-intent helper、未被消费的 scope_path 存储及固定话术断言；保留并验证全图在 P 中往返解析后 TreePlan hash 不变。`llama-server` 构建通过，`test-rerot-runtime` / `test-rerot-parser` / `test-rerot-mindmap-parser` **3/3**。Bonsai 实际词表与原生模板的无推理烟测，`求 25 × 12` 与 `root` 两种 become 帧均正常序列化、只含一个 node 参数并以 `<think>` 打开：分别 **71 / 56 token**。此证据是协议渲染验证，不是模型遵循性或吞吐获益证明；没有在本次切换后重复跑模型长请求。
+### 22.5 thinking wire：把思考本身拆成并行 aspect（2026-09-25）
+
+mindmap wire 的失效不是措辞问题，而是**缩进协议 + 错误的概念**：深度可跳级、父节点重述子节点、模型漂进大纲编号；更根本的是 `goal`/`sub-goal` 这个词指"要达成的目标"，天然招来动作步骤。新增 `--rerot-plan-wire thinking`，`json` / `mindmap` / `todo` 全部保留作对照。
+
+**概念来自模型自己的自然思考，不是猜的。** 关 RERoT 跑同一台机器、同模型、同采样，抓 `/healthz` 这类真实 agent-coding 任务的裸思考（41 段 / 12841 字，`artifacts/rerot-thinking-wire/natural-thinking-healthz.txt`）：约 25 段在反复打转**同一个关于材料的未知**（"这个代码库里的 wire 指什么"），其余是回忆 struct 字段，以及覆盖请求列举的四件交付物。它的自然单元既不是"问用户的问题"，也不是"答案切片"，而是**思考必须覆盖的面**——一部分是"我得自己敲定的未知"，一部分是"我得产出的东西"。所以单位叫 **aspect**。
+
+#### 协议
+
+- 注入固定前缀（指令 + `<ul>` + 起句 + 第一个 `<li>`），模型的第一个采样 token 已经在第一个 aspect 里面：
+  ```
+  My thinking splits here: once the aspects are listed, copies of me think them all in parallel
+  and their raw thinking comes back to me; then I decide — tool call or answer. No aspect may
+  need another's outcome. Here I only name them, one per line, as bare sub-titles in words
+  with no punctuation: what I must pin down myself and what I must produce.
+  <ul>Let me see what can be thought through on its own here: <li>
+  ```
+  起句以**冒号加空格**收尾而不是省略号：省略号还在邀请它继续沉思，硬接 `<li>` 会逼出最空的 aspect（"what I need to decide now"）；冒号是"列表就要来了"的规范信号。
+- **没有自由头部区间。** 头部试过三种，全部失败：无界头部永不进列表（出口 token 被 min_p 屏蔽，一次跑到 1749 token 零条目）；在每个换气点注入提示语，模型把提示语原样复读几十遍（1633 token 零条目）；强制但有界的头部只产出一句垃圾过渡句，并把 aspect 拖成元话术（"这是规划问题还是实现问题"、"内容是否是陷阱"）。测得最好的计划**头部都是空的**，于是协议直接固化这一点。
+- GBNF（全文 `artifacts/rerot-thinking-wire/thinking.gbnf`）：
+  ```
+  root  ::= sp? text "</li>" (nl? item)* nl? "</ul>"
+  item  ::= "<li>" sp? text "</li>"
+  text  ::= wchar tchar*
+  tchar ::= wchar | sp | comma
+  wchar ::= [0-9A-Za-z/_\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u3040-\u30FA\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF-]
+  comma ::= "," | "\uFF0C"
+  ```
+  三条结构红线，每条都由实测换来：**条目内禁一切句读标点**（只留字母/数字/空格/逗号/CJK/假名/谚文/西里尔 + `/ _ -`，保住文件路径与标识符）；**条目之间只允许一个换行、不允许任何文字**（放开就会每两条之间思考一轮并永不收尾）；**`</ul>` 只在至少一个完整条目之后可达**（否则模型敲的第一个 `<` 就能关掉空列表）。条目是裸 `<li>`——自写 `<ul class="thinking">` 触发 lazy grammar 不可行（模型根本不会写），class 属性也是它最先丢的东西。
+
+#### 决定性测量：`</li>` 与 `<` 不是"概率低"，是被 min_p 屏蔽
+
+在探针头部的真实上下文上取原始分布（`/completion` + `n_probs=40`，同模型同模板）：
+
+| 头部已生成 | `<` 排名 | p | p/p_top | min_p=0.05 |
+|---|---|---|---|---|
+| 0 token（紧跟注入起句） | **2** | **0.0859** | **0.277** | 通过 |
+| 40 token | 掉出 top-40 | < 1.2e-3 | < 2.7e-3 | **被裁** |
+| 300 token | 掉出 top-40 | < 1.2e-4 | < 1.5e-4 | **被裁** |
+| 1749 token | 掉出 top-40 | < 3.2e-5 | < 3.3e-5 | **被裁** |
+
+模型卡 thinking mode 要求 `min_p=0.05`，因此一旦写完一句散文，出口 token 被**从候选池删除**，再等多久都不出现。两个实测后果：无界头部跑到 1749 token 不收尾；`</li>` 同理——一个条目跑了 1670 token / 6061 字符、无换行、永不闭合。所以：
+
+- **唯一有效的机制是禁标点。** 没有句号冒号分号（只留逗号），模型必须"一口气"说完，说不动了就只剩 `</li>`；顺带消掉 `&lt;` 转义与条目内换行两类失败。注入提示语的做法明确失败（模型复读提示语），语法层强制上限（1~3 行头部、条目必须以 `?` 收尾）也都失败——后者会误杀"列出亚洲国家"这类祈使式合法条目。
+
+#### 帧协议（三条 tree wire 共享，thinking 用 aspect 措辞）
+
+身份投递经过四轮实测才定型，前三轮全部失败：
+
+1. **第二人称写在工具回复**（`Your sub-goal: "X" — that alone is your job`，身份放句末靠 recency）：coding 题 4 个 worker 里 2 个都认领 #3，1 个自述"become 把我的节点选择和目标合并了"后退回整题。所有 lane 的帧在同一块 unified KV、除标签外逐字相同、call id 为空，**一条对"你"说的指令从任何 lane 读起来都一样**。
+2. **加数字标记 `#3` / `"i":3`**：标记反而成了最显眼的锚点，3 个 worker 认领 #3，node 2 原话 "I've already called become on node 3 … it seems I'm now working on that sub-goal"。
+3. **第一人称种子放思考开头、以句号收尾**：每个 worker 的**第一个 token 就是 `</think>`**（零推理零内容），synthesis 照抄帧格式把 `<tool_call><function=become>` 当公开答案输出，请求 11.9 秒"完成"——伪完成，反例存 `rejected-seed-fullstop.sse`。
+4. **第一人称种子 + 冒号收尾（当前）**：工具回复退成纯数据回显 `#3 "<label>"`，契约用 lane 自己的第一人称追加在模板渲染出的 think-start 之后：
+   `I think only about aspect #3: "<label>". The others are being thought in parallel, so I don't redo them. Let me think:`
+   synthesis 用 `Every aspect is thought through and all of it is in front of me. Now I decide what to do with it — tool call or answer:`。`become` 的 description 缩成一句 `Think one aspect of the list.`（此前为空，模型把帧判为"奇怪的工具调用"并据此重答整题，6/6）。
+
+#### 前缀复用、内部工具的广告与身份锚点（2026-09-25 续）
+
+每 episode 一次的全量重预填来自模板：提供 tools 时 `# Tools` 块插在渲染**靠前**的位置，于是 ordinary 渲染不是帧渲染的前缀，token LCP 被截断在 system 前导（实测 `ordinary=58 lcp=40 dag=305 replay_from=0`，且 LCP 不随提示变长而变长）。三种走法都实测过：
+
+| 配置 | 结果 |
+|---|---|
+| 只在帧里广告 | 计划最好，但每 episode 全量重预填 |
+| 哪里都不广告（保留 tool_call 形状，tools 列表为空——模板照样渲染 `<tool_call>`，实测 551 vs 1641 字符、共同前缀 226 字符） | 重建归零，但 **worker 身份保真掉到约 3/6**：有 lane 自称 #1 却持有 #3，有 lane 只复述题目，有 lane 宣称"其他面已经有人做了"后重答整题 |
+| **C0 幂等广告（当前默认）** | **重建归零**（日志里再无 `DAG prefix rebuild`），代价是探针上下文里多了一个 tools 块 → 靠提示词精修补偿 |
+
+广告后 `become` 进了模型的工具菜单，所以内部工具名前缀改成**保留单 token**：启动时按 `<|file_sep|> → <|repo_name|> → <|fim_pad|> → <|fim_prefix|> → …` 顺序挑第一个「恰好一个 token 且不是 EOG」的标记（本模型选到 `<|fim_prefix|>`，token 248060），并给那一个 id 加 `-inf` logit bias，对**所有**生成任务生效（lane 克隆经 `rerot_clone_task` 继承）。服务端写帧用的是 forced token，从不过采样器，所以禁采样不妨碍协议自身。两条被否决的选择：`-` 前缀（`-become` 切成 `['-b','ecome']`，而 `well-known` → `['well','-known']`，全局禁会毁正文）；视觉占位 token（选到 `<|vision_pad|>` 时探针计划从 5–6 条具体面塌成 2 条指令回声——它是图像占位符，出现在 system 块里等于暗示"有图"）。
+
+提示词随之精修，两处都是为了不被当成条目抄走：指令尾句改成「none of them restates this instruction: each one names something specific in the request」，起句改成 `<ul>Looking at this request, the parts that stand alone are: <li>`。此前的尾句 "what I must pin down myself and what I must produce" 与起句 "what can be thought through on its own here" 都曾被原样抄成条目。
+
+身份锚点分层，关键是**哪一层被谁读到**：
+
+- `become` 的 description 只有一句（`Think one aspect of the plan.`）。它是帧里**唯一同时被探针读到**的文本（块在 C0 里），把排他契约写进去会让计划变粗（六条具体面塌到三条）。
+- 排他契约放在**按 lane 渲染的工具回复**里，探针永不可见：`aspect #3 of 4: "<label>" is yours alone. The other aspects are being written at the same time by copies of you: their notes are theirs, so build on them and never take them over. Their notes appear a little at a time, so anything that looks unfinished there is only unwritten yet and fills in on its own.`
+- 最后一句是第一人称种子：`I am aspect #3 of 4 and only #3: "<label>". My notes on #3:`
+- `of N`（N = 冻结计划的叶数）比裸 `#3` 更难与 peer 的身份混淆；实测中有 lane 自报 "Aspect #2 of 4"。
+- "fills in on its own" 这句不是客套：lane 曾把 peer **没写完**的笔记当缺口，于是要么接管别人的面，要么宣称"都做完了"并重答整题。
+
+大洲题最终状态：4 个 aspect，**4/4 各守其位**，无接管话术；计划粒度在不同措辞下浮动过 3–6 条，每种配置各一次运行，不宣称最优。
+
+#### 实测（单卡 RX 6800 `Vulkan0`、Bonsai-2 27B PQ2_0、`-c 262144 -np 6 --rerot-pens 6 -ctk q8_0 -ctv turbo4`、模型卡 thinking-mode 采样、**60 秒客户端预算**）
+
+| 提示 | seed | 计划 |
+|---|---|---|
+| `/healthz` 端点 | 20260923 | 6 个 aspect，probe **204 token**：要暴露什么且在代码哪里 / slot 是什么及报哪些字段 / JSON 形状 / 测试怎么写且可运行 / 哪里会出问题 / 答案怎么呈现 |
+| `/healthz` 端点 | 777 | 6 个 aspect，probe **223 token**：返回哪些字段及映射 / 怎么从现有状态取 slot+KV+wire / handler 注册在哪 / 怎么单测含假数据 / 改哪些文件及测试怎么接进构建 / 风险与兼容性 |
+| 世界上每个大洲有哪些国家 | 20260923 | 5 个 aspect，probe **165 token**：列哪些洲及顺序 / 每国如何归类 / 跨洲国家怎么办 / 是否用 ISO 3166-1 / 南极洲 |
+
+换 seed 得到**不同但同样具体**的计划，说明本节各配置之间的差异不是采样噪声（同一配置同一 seed 可复现）。
+
+大洲题这组元问题**正是正确的味道**：列国家本身很简单、正文直接列即可，值得并行思考的恰恰是分类口径、跨洲归属、是否用 ISO 码这些决策。早前一次用 `question` 措辞时曾切出逐洲 6 条，看起来"更像分工"，但把简单枚举摊给 6 个 worker 并不是这套机制该做的事。
+
+之前 worker 侧的验收（`aspect` + 带 class 的条目、probe 286 token）：/healthz 题 8 个 aspect、7 个 worker 各守一个（JSON 形状 / 注册位置 / slot 字段 / 测试位置 / 风险 / 是否给代码 / 措辞），无 token 级循环；大洲题 3 个 aspect、3 个 worker 各守一个。协议此后只改了前缀与字符集，worker 侧未复跑。
+
+被否决的措辞（每条都是对症状打补丁，而非陈述机制）记录在 `tools/server/server-rerot-thinking.h` 的注释里：`What is the goal? Which sub-goals can run in parallel?`（在列表里回答了自己的问题）、`each self-contained / concrete task`（仍是流水线阶段）、`by category, not by stage`（被读成"工作类别"）、`one per thing the goal covers`（不泛化）、`cut the answer into parts joined with nothing added`（多数任务没有"答案文档"可切）、`one short line per question`（产出无关的示例问题）、以及要求条目以 `?` 结尾的语法约束。
+
+#### 边界
+
+- 除那次伪完成外**全部**在 60 秒客户端截止时结束；`completed_episode_total` 未验证，**没有**完整公开答案、没有 A/B 吞吐比、没有全请求验收。本节只证明计划层与身份层的缺陷消除。
+- 早前用 `question` 措辞时大洲题曾切出**逐洲** 6 条（`Asia` / `Africa` / `Europe` / `Americas` / `Oceania` / `Polar`），换 `aspect` 后变成 3 条更粗的面。哪种更适合调度尚无验收数据，不宣称优劣。
+- 采样口径：模型卡（`prism-ml/Ternary-Bonsai-2-27B-gguf`）thinking mode 推荐 `temperature=1.0 / top_p=0.95 / top_k=20 / min_p=0.05 / presence_penalty=0.0 / repetition_penalty=1.0`；本轮显式传前三项，后三项取 llama.cpp 默认值且与卡片一致。卡片明确 thinking mode **不开**惩罚，因此早前观测到的 `、马拉尼` 周期-6 退化重复不是配置错误；卡片自己给的短化手段是把 reasoning effort 从默认 `xhigh` 降到 `medium`，本轮未动——六个 worker 各跑 xhigh 正是 60 秒收不了尾的直接原因。
+- 单 seed、单卡、单模型、每题一次。
+
+验证：`llama-server` 构建通过；`test-rerot-thinking`（新增，ASan/UBSan 复跑）、`test-rerot-todo`、`test-rerot-mindmap-parser`、`test-rerot-parser`、`test-rerot-runtime`、`test-server-task`、`test-arg-parser`、`test-flashprefill-state` 全绿；GBNF 经 `test-gbnf-validator` 逐条验证：字母/CJK/路径字符接受，逗号句号冒号问号反斜杠在精确位置被拒，条目间自由文本被拒，空列表 `</ul>` 被拒，`<li class=...>` 被拒。
+
+### 22.6 让并行真的比串行快（2026-09-25）
+
+三处改动叠起来，RERoT 在同题上第一次**反超**串行基线。全部数据为单卡 RX 6800 `Vulkan0`、Bonsai-2 27B PQ2_0、`-fa on -ctk q8_0 -ctv turbo4`、模型卡 thinking-mode 采样。
+
+#### 一、多列 matvec：权重共享 + 激活重读
+
+起点是一个反常识的事实：多行解码几乎不标定（6 行只有单行的 2.08×，8 行退化到 1.90×）。`GGML_VK_PERF_LOGGER` 的逐算子分账定位到主导算子 `MUL_MAT_VEC pq2_0 m=17408 k=5120`（FFN 上投影）：
+
+| | 每次调用 | 权重流量折算 |
+|---|---|---|
+| n=1 | 74.9 us | 23.7 MB → 317 GB/s（接近该卡可持续带宽，确实带宽受限） |
+| n=6 | 249.1 us | 同样 23.7 MB → 95 GB/s（已不受带宽限制，所以瓶颈在"每列"的东西） |
+
+两处每列成本，各自修掉：
+
+1. **权重按 (列 × 行) 重复解量化。** `mul_mat_vec.comp` 的通用循环把列放在行外层，已有的共享解量化快路只覆盖 `num_rows == 1`，而量化管线是按 `NUM_ROWS = 2*rm_stdq` 创建的，永不命中。现在 `NUM_COLS > 1` 时把循环交换过来：每行解量化一次、所有列复用；列数 ≤ 4 时把各列激活先进寄存器。
+2. **每个 workgroup 重读整个激活向量**，所以这部分流量 ∝ workgroup 数 = m/rows。n=1 时它已与权重访存同量级（178 MB 过缓存 ≈ 71 us，旁边是 55 us 权重 DRAM，实测 74.9 us）；n=6 时是 **1.07 GB**。因此 PQ2_0 的 matvec 管线在宽派发时加宽行块（≥2 列用 2 倍行，≥4 列用 4 倍行），按比例摊掉该流量，权重流量不变。
+
+`llama-batched-bench -npp 16 -ntg 64` 解码 t/s，改动前 → 后：
+
+| lanes | 前 | 后 | 增幅 |
+|---|---|---|---|
+| 1 | 33.10 | 33.47 | +1.1%（无回归） |
+| 2 | 48.26 | 55.46 | +14.9% |
+| 3 | 51.49 | 68.90 | +33.8% |
+| 4 | 51.09 | 82.54 | +61.6% |
+| **6** | **68.99** | **98.90** | **+43.4%** |
+| 8 | 63.03 | 103.40 | +64.0% |
+
+对单 lane 的标定从 2.08× 升到 **2.95×**（6 lane），8 lane 不再倒退（1.90× → 3.09×）。膝点在 6：4→6 还有 +20%，6→8 只剩 +4.6%——**这就是"几个最好"的答案**。数值等价：循环交换不改每个累加器的 K 顺序，行块只改 workgroup 归属；真机贪心解码验证 6 路并发（即内核 6 列路径）与单列输出**逐字相同**。
+
+#### 二、lane 必须收尾：预算算术
+
+并行只在**聚合 lane token < 串行 token × 多 lane 加速比**时才划算。大洲题串行要 3085 token，6 lane 的加速比 2.95×，所以预算约 **9100 aggregate token**。而实测 lane 各自写到 1240 token 仍未停，7 lane 已 8680——episode 600 秒不收尾，对面基线 134 秒就结束了。
+
+`--rerot-lane-wrap-tokens N`（默认 512）给每个 worker **一次**第一人称收尾提醒。它是注入，所以把 lane 刚采样的那个 token 放在提醒开头，不丢字。kind 必须用 `refresh`——`worker` 会用 `lane->exit_parser.marker()` 重装 child-close 语法，而原生 DAG worker 没有该标记（实测 hard abort `invalid child close grammar`）；`dag_frame` 会重跑一次性 admission。
+
+#### 三、结果（口径已修正）
+
+先前版本用 `timings.predicted_n / wall` 作"端到端吞吐"，**那是错的**：RERoT 下该计数把 lane 的内部 token 也算进分子，所以会虚高。正确口径只有两条：**同一固定清单覆盖度下的墙钟**，以及**总模型 token**。清单事前固定为七大洲标记 + 俄罗斯、土耳其两个跨洲例（8 项）。
+
+同题（`世界上每个大洲有哪些国家`）、同 seed、单卡 RX 6800：
+
+| 配置 | 墙钟 | 总 token | 答案字符 | 覆盖 |
+|---|---|---|---|---|
+| 串行基线（RERoT off） | 134.37 s | 3085 | 1774 | — |
+| RERoT，lane 预算 512 | 251.65 s | 5575 | 1423 | 8/8 |
+| **RERoT，lane 预算 256（默认）** | **101.51 s** | **2959** | 1024 | **8/8** |
+| RERoT，lane 预算 128 | 53.37 s | 1588 | 762 | **1/8** |
+
+`--rerot-lane-wrap-tokens 256`：**墙钟 1.32× 于串行，而总 token 还少 4%（2959 vs 3085）**，清单全覆盖——所以这不是把内部 token 算进分子换来的，而是真实的时间压缩。代价是答案更简洁（1024 vs 1774 字符）。128 那一档覆盖度塌到 1/8，正好证明这个护栏有用：只压时间不看覆盖会得出假胜利。
+
+lane 与 synthesis 都要有界。`nudge` 只发给 worker 时，4-worker 的计划里 synthesis 拿着四份笔记无界地写，153 s 时已 1560 token 仍未停，700 s 预算都撑不住；给 synthesis 三倍 lane 预算的同类提醒后，同一计划 251.65 s 收尾。提醒还必须跳过任何含 `<`/`>` 的 piece：注入会把刚采样的 token 带进 lane 的**私有** run，若那个 token 正是收尾标记，它就进不了被解析的公开流，lane 永不 seal。
+
+边界：答案很短的题不适用墙钟口径——算术题 RERoT 的公开输出是串行的 4 倍（1436 vs 363 token），墙钟 42.6 s vs 17.0 s 比的是不同工作量，其速率仍占优（33.7 vs 21.4 tok/s）。**墙钟结论只在输出长度可比时成立。**

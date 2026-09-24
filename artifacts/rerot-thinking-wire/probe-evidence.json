@@ -1,0 +1,484 @@
+{
+  "device": "single AMD RX 6800 (Vulkan0)",
+  "model": "Ternary-Bonsai-2-27B-PQ2_0.gguf",
+  "server_flags": "-c 262144 -np 6 -ngl 99 -b 2048 -ub 512 -fa on -ctk q8_0 -ctv turbo4 --rerot-people 6 --rerot-pens 6 --rerot-trace --metrics --temp 1.0 --top-p 0.95 --top-k 20",
+  "request": "seed 20260923, max_tokens 8192, stream, 60 s client deadline",
+  "sampling": {
+    "source": "prism-ml/Ternary-Bonsai-2-27B-gguf model card, thinking mode",
+    "recommended": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.05,
+      "presence_penalty": 0.0,
+      "repetition_penalty": 1.0
+    },
+    "used": "first three explicit, the rest are llama.cpp defaults and match the card (common/common.h:235/243/244)"
+  },
+  "min_p_masking_measurement": {
+    "method": "/completion with n_probs=40 on the exact probe-head context (plain server, same model/template); raw pre-sampling distribution",
+    "head_tokens_consumed": {
+      "0": {
+        "rank": 2,
+        "p": 0.0859,
+        "ratio_to_top": 0.277,
+        "kept_by_min_p": true
+      },
+      "40": {
+        "rank": ">40",
+        "p_upper": 0.001226,
+        "ratio_upper": 0.00269,
+        "kept_by_min_p": false
+      },
+      "300": {
+        "rank": ">40",
+        "p_upper": 0.0001159,
+        "ratio_upper": 0.0001519,
+        "kept_by_min_p": false
+      },
+      "1749": {
+        "rank": ">40",
+        "p_upper": 3.194e-05,
+        "ratio_upper": 3.264e-05,
+        "kept_by_min_p": false
+      }
+    },
+    "conclusion": "The escape token '<' is not unlikely, it is removed from the sampling pool once prose starts. Same applies to '</li>' inside an item. Hence the line-end nudge for the head and the punctuation ban for items."
+  },
+  "natural_thinking_baseline": {
+    "file": "natural-thinking-healthz.txt",
+    "rerot": false,
+    "budget_s": 120,
+    "paragraphs": 41,
+    "chars": 12841,
+    "finding": "~25 of 41 paragraphs circle one unknown about the material (\"what is a wire in this codebase\"); the rest recall struct fields and cover the four deliverables the request listed. The unit of natural thinking is an aspect to cover, not a question for the user and not a slice of an answer document."
+  },
+  "note": "Only seed-coding returned before the deadline and that was a false completion. No episode completed its plan; no throughput claim.",
+  "runs": [
+    {
+      "dir": "v3-coding",
+      "wire": "mindmap",
+      "prompt": "python CLI refactor (zh)",
+      "note": "junk single child, 3/3 workers claimed 测试",
+      "plan": {
+        "probe_tokens": 63,
+        "strategy": "mindmap",
+        "text": "```mermaid\nmindmap\n  root\n    目录\n      核心\n      测试\n      错误处理\n```\n"
+      },
+      "probe_lane_sampled_chars": 0,
+      "workers": {
+        "1": {
+          "sampled_tokens": 647,
+          "tail_cycle_period": 0,
+          "opening_160": "The user is asking me to refactor a single-file Python CLI (which reads CSV, filters rows by conditions, and writes out JSON) into a testable module. What's req"
+        },
+        "2": {
+          "sampled_tokens": 647,
+          "tail_cycle_period": 0,
+          "opening_160": "I am the node \"test\". My whole job is to write the test section: unit tests for the refactored module. I should write tests for the core functions (filtering lo"
+        },
+        "3": {
+          "sampled_tokens": 647,
+          "tail_cycle_period": 0,
+          "opening_160": "I'm the \"测试\" node (the tests node). My job: write unit tests and error-handling tests for a refactored CSV→JSON module. Other nodes handle 目录 (directory structu"
+        }
+      },
+      "client": null
+    },
+    {
+      "dir": "goal2-coding",
+      "wire": "goal + second-person frame",
+      "prompt": "python CLI refactor (zh)",
+      "note": "2 of 4 claimed the same sub-goal, 1 lost identity",
+      "plan": {
+        "probe_tokens": 100,
+        "strategy": "goal",
+        "text": "<ul class=\"goal\"><li class=\"sub-goal\">Read a CSV and convert it to a list of dictionaries</li><li class=\"sub-goal\">Apply filtering conditions and narrow down the rows</li><li class=\"sub-goal\">Write the results out as JSON</li><li class=\"sub-goal\">Add error handling and make it testable</li></ul>"
+      },
+      "probe_lane_sampled_chars": 0,
+      "workers": {
+        "1": {
+          "sampled_tokens": 479,
+          "tail_cycle_period": 0,
+          "opening_160": "The sub-goal is to write the results as JSON. I need to think about the design of the whole refactoring and how the JSON output part fits in. The other sub-goal"
+        },
+        "2": {
+          "sampled_tokens": 480,
+          "tail_cycle_period": 0,
+          "opening_160": "The user has asked to refactor a single-file Python CLI (one that reads a CSV, filters rows by conditions, and writes out a JSON) as a testable module. I have b"
+        },
+        "3": {
+          "sampled_tokens": 480,
+          "tail_cycle_period": 0,
+          "opening_160": "The user is asking, in Chinese, to refactor a single-file Python CLI (that reads CSV, filters rows based on conditions, and writes out JSON) into a testable mod"
+        },
+        "4": {
+          "sampled_tokens": 480,
+          "tail_cycle_period": 0,
+          "opening_160": "I'm responsible for the \"add error handling and make it testable\" subgoal. The other subgoals (CSV reading, filtering, JSON writing) are handled in parallel. I "
+        }
+      },
+      "client": null
+    },
+    {
+      "dir": "tag-coding",
+      "wire": "goal + numeric frame tag",
+      "prompt": "python CLI refactor (zh)",
+      "note": "REJECTED: tag became the anchor, 3 of 4 took #3",
+      "plan": {
+        "probe_tokens": 100,
+        "strategy": "goal",
+        "text": "<ul class=\"goal\"><li class=\"sub-goal\">Read a CSV and convert it to a list of dictionaries</li><li class=\"sub-goal\">Apply filtering conditions and narrow down the rows</li><li class=\"sub-goal\">Write the results out as JSON</li><li class=\"sub-goal\">Add error handling and make it testable</li></ul>"
+      },
+      "probe_lane_sampled_chars": 0,
+      "workers": {
+        "1": {
+          "sampled_tokens": 479,
+          "tail_cycle_period": 0,
+          "opening_160": "The goal is to convert a single-file Python CLI (reads CSV, filters rows by condition, outputs JSON) into a testable module. I need to provide:1. Directory stru"
+        },
+        "2": {
+          "sampled_tokens": 479,
+          "tail_cycle_period": 0,
+          "opening_160": "The user asked me to refactor a single-file Python CLI (one that reads CSV, filters rows by condition, and outputs JSON) into testable modules. I should provide"
+        },
+        "3": {
+          "sampled_tokens": 479,
+          "tail_cycle_period": 0,
+          "opening_160": "The user is asking, in Chinese, to refactor a single-file Python CLI (the kind that loads a CSV, filters rows by conditions, and writes out JSON) into a testabl"
+        },
+        "4": {
+          "sampled_tokens": 479,
+          "tail_cycle_period": 0,
+          "opening_160": "I've adopted the subgoal of \"add error handling and make it testable.\" Let me focus on this: error handling for a CSV→JSON pipeline, plus making it testable (de"
+        }
+      },
+      "client": null
+    },
+    {
+      "dir": "seed-coding",
+      "wire": "goal + first-person seed ending in a full stop",
+      "prompt": "python CLI refactor (zh)",
+      "note": "REJECTED: every worker sampled </think> first; synthesis emitted a become tool call as the public answer (false 11.9 s completion)",
+      "plan": {
+        "probe_tokens": 100,
+        "strategy": "goal",
+        "text": "<ul class=\"goal\"><li class=\"sub-goal\">Read a CSV and convert it to a list of dictionaries</li><li class=\"sub-goal\">Apply filtering conditions and narrow down the rows</li><li class=\"sub-goal\">Write the results out as JSON</li><li class=\"sub-goal\">Add error handling and make it testable</li></ul>"
+      },
+      "probe_lane_sampled_chars": 0,
+      "workers": {
+        "1": {
+          "sampled_tokens": 1,
+          "tail_cycle_period": 0,
+          "opening_160": "</think>"
+        },
+        "2": {
+          "sampled_tokens": 1,
+          "tail_cycle_period": 0,
+          "opening_160": "</think>"
+        },
+        "3": {
+          "sampled_tokens": 1,
+          "tail_cycle_period": 0,
+          "opening_160": "</think>"
+        },
+        "4": {
+          "sampled_tokens": 1,
+          "tail_cycle_period": 0,
+          "opening_160": "</think>"
+        },
+        "5": {
+          "sampled_tokens": 1,
+          "tail_cycle_period": 0,
+          "opening_160": "</think>"
+        }
+      },
+      "client": null
+    },
+    {
+      "dir": "seed2-coding",
+      "wire": "goal + first-person seed ending on a colon",
+      "prompt": "python CLI refactor (zh)",
+      "note": "4/4 on their own sub-goal",
+      "plan": {
+        "probe_tokens": 100,
+        "strategy": "goal",
+        "text": "<ul class=\"goal\"><li class=\"sub-goal\">Read a CSV and convert it to a list of dictionaries</li><li class=\"sub-goal\">Apply filtering conditions and narrow down the rows</li><li class=\"sub-goal\">Write the results out as JSON</li><li class=\"sub-goal\">Add error handling and make it testable</li></ul>"
+      },
+      "probe_lane_sampled_chars": 0,
+      "workers": {
+        "1": {
+          "sampled_tokens": 472,
+          "tail_cycle_period": 0,
+          "opening_160": " CSV reading.What I need to design:- A directory structure for the whole package (to make the code coherent, I should present the full structure — but since the"
+        },
+        "2": {
+          "sampled_tokens": 473,
+          "tail_cycle_period": 0,
+          "opening_160": " filtering. I need to produce a self-contained module with a clean API for the filtering, plus tests for it.Let me design the filtering module. The goal: a CSV "
+        },
+        "3": {
+          "sampled_tokens": 473,
+          "tail_cycle_period": 0,
+          "opening_160": " JSON output.Since I only know my sub-goal, I need to infer the overall module design and be consistent with what the other branches probably did:1. \"Read a CSV"
+        },
+        "4": {
+          "sampled_tokens": 473,
+          "tail_cycle_period": 0,
+          "opening_160": " error handling + testability.Design: a `csv2json` package. Core module `csv2json/filter.py` (or `csv2json.py`) with:- `FilterSpec` / predicate functions- `filt"
+        }
+      },
+      "client": null
+    },
+    {
+      "dir": "indep-continents",
+      "wire": "goal + \"split as fine as that allows\"",
+      "prompt": "世界上每个大洲有哪些国家",
+      "note": "REJECTED: 1739 tokens of deliberation inside items, </ul> never reached",
+      "plan": null,
+      "probe_lane_sampled_chars": 0,
+      "workers": {},
+      "client": null
+    },
+    {
+      "dir": "head-continents",
+      "wire": "thinking + unbounded free head",
+      "prompt": "世界上每个大洲有哪些国家",
+      "note": "REJECTED: 1749-token head, no <li> at all -- the min_p masking measurement came from this run",
+      "plan": null,
+      "probe_lane_sampled_chars": 0,
+      "workers": {},
+      "client": null
+    },
+    {
+      "dir": "nudge-continents",
+      "wire": "thinking + line-end nudge, class attributes",
+      "prompt": "世界上每个大洲有哪些国家",
+      "note": "per-continent split, 6 workers distinct",
+      "plan": {
+        "probe_tokens": 191,
+        "strategy": "thinking",
+        "text": "<ul>Let me see what can be thought through on its own here...<li>Asia: list of countries and sub-regions if needed</li>\n<li>Africa: list of countries and sub-regions if needed</li>\n<li>Europe: list of countries</li>\n<li>Americas: North, Central, South America, Caribbean</li>\n<li>Oceania: countries and territories</li>\n<li>Polar / other considerations: Antarctica has no sovereign countries, but research stations are operated by some; maybe mention it</li>\n</ul>"
+      },
+      "probe_lane_sampled_chars": 0,
+      "workers": {
+        "1": {
+          "sampled_tokens": 479,
+          "tail_cycle_period": 0,
+          "opening_160": " the list of Asian countries. I'll list the 48/50 countries of Asia. I can organize it by sub-region.Asian countries (UN member states, 47? let me try to recall"
+        },
+        "2": {
+          "sampled_tokens": 479,
+          "tail_cycle_period": 0,
+          "opening_160": " Africa's list of countries — 54 recognized member states of the African Union. Sub-regions: West Africa (ECOWAS: 15 countries: Benin, Burkina Faso, Côte d'Ivoi"
+        },
+        "3": {
+          "sampled_tokens": 2,
+          "tail_cycle_period": 0,
+          "opening_160": "</think>"
+        },
+        "4": {
+          "sampled_tokens": 329,
+          "tail_cycle_period": 0,
+          "opening_160": "North America (US/Canada):- United States- Canada- Mexico- Guatemala- Belize- El Salvador- Honduras- Nicaragua- Costa Rica- Panama- Cuba- Jamaica- Haiti- Domini"
+        },
+        "5": {
+          "sampled_tokens": 403,
+          "tail_cycle_period": 0,
+          "opening_160": "- Australia: mainland, Tasmania- New Zealand: North Island, South Island, Chatham Islands- Melanesia:  - Fiji  - Vanuatu  - Solomon Islands  - Papua New Guinea-"
+        },
+        "6": {
+          "sampled_tokens": 224,
+          "tail_cycle_period": 0,
+          "opening_160": "Antarctica: no sovereign states. The Antarctic Treaty (1959, entered into force 1961) suspends territorial claims, freezes existing claims. 53+ countries signat"
+        }
+      },
+      "client": null
+    },
+    {
+      "dir": "q-coding",
+      "wire": "thinking + \"only ask\"",
+      "prompt": "python CLI refactor (zh)",
+      "note": "15 clarification questions for the user",
+      "plan": {
+        "probe_tokens": 613,
+        "strategy": "thinking",
+        "text": "<ul>Let me see what can be thought through on its own here...<li>How is the CSV file structured — which columns are read, which are filtered, and how is the JSON written (keys, nesting, encoding, formatting)?</li>\n<li>What does \"filter by condition\" mean exactly — what field and what comparison (numeric threshold, string equality/regex, date range, multi-condition AND/OR), and should empty values or missing fields be treated as errors or skipped?</li>\n<li>Are the CLI arguments fixed or flexible (e.g., </li>\n<li>Which Python version and environment constraints — standard library only, or can pytest/pandas/Pydantic etc. be used? Is it a local script or does it need to be published as a package (setuptools/pyproject)?</li>\n<li>How should errors be handled — what to output to stdout/stderr, which exit codes (non-zero on failure?), and whether the JSON should be written atomically (write to temp file and then rename) to avoid half-written files?</li>\n<li>How do you want the test data to be handled — fixture CSV files in the repo, or generated in memory (tempfile)? Are you okay with using pytest? What coverage is expected (at least all branches: happy path, empty file, BOM, quoted fields, encoding, filter conditions, no matches, malformed rows)?</li>\n<li>Should the CLI support multiple conditions / a JSON filter spec, or just a fixed filter (e.g., status == active AND score &gt; 80)?</li>\n<li>Are there performance or file-size concerns (streaming vs. reading the whole file into memory)?</li>\n<li>Should it also support reading from stdin (echo data | python ...), or is file input only?</li>\n<li>What about locale / newline issues (CRLF), header aliasing, duplicate columns?</li>\n<li>Do you need logging or just print?</li>\n<li>What is the output path when it's the same as the input path, or an overwrite?</li>\n<li>Is there a schema for the JSON output (array of objects, or a summary with metadata: row count, filtered count)?</li>\n<li>Do you want i18n or Chinese error messages? (You asked in Chinese, so probably Chinese error messages.)</li>\n<li>Should the refactoring preserve backward compatibility with the CLI arguments of the original script, or are you free to design them from scratch?</li>\n</ul>"
+      },
+      "probe_lane_sampled_chars": 0,
+      "workers": {
+        "1": {
+          "sampled_tokens": 188,
+          "tail_cycle_period": 0,
+          "opening_160": " the user is asking for a refactoring of a single-file Python CLI (loads CSV, filters rows by condition, writes JSON) into testable modules. Since no original c"
+        },
+        "2": {
+          "sampled_tokens": 113,
+          "tail_cycle_period": 0,
+          "opening_160": " the user wants a generic refactor, but a concrete example is needed for the example. I'll assume the following: a CSV with columns id, name, status, score, cre"
+        },
+        "3": {
+          "sampled_tokens": 190,
+          "tail_cycle_period": 0,
+          "opening_160": " the user is asking for the complete refactor, so the best answer is to present a complete solution that clearly states the design assumptions. But before I fin"
+        },
+        "4": {
+          "sampled_tokens": 187,
+          "tail_cycle_period": 0,
+          "opening_160": "The user's request: refactor a single-file Python CLI (read CSV, filter rows by condition, write JSON) into a testable module: present directory structure, core"
+        },
+        "5": {
+          "sampled_tokens": 186,
+          "tail_cycle_period": 0,
+          "opening_160": "For a CSV → JSON CLI:- stdout: keep it clean (the user may pipe), or only output a summary line. JSON goes to a file, not stdout (because the user said \"write J"
+        },
+        "6": {
+          "sampled_tokens": 185,
+          "tail_cycle_period": 0,
+          "opening_160": "The user is asking for a complete refactor: directory structure, core code, unit tests, error handling. The best answer is to design the whole thing with explic"
+        },
+        "7": {
+          "sampled_tokens": 68,
+          "tail_cycle_period": 0,
+          "opening_160": "Should I support a fixed filter, or a flexible one?Best: flexible but simple. Design the filter as a dataclass, and have the CLI accept a `--filter` flag (repea"
+        }
+      },
+      "client": null
+    },
+    {
+      "dir": "asp-continents",
+      "wire": "thinking + aspect, punctuation still allowed",
+      "prompt": "世界上每个大洲有哪些国家",
+      "note": "REJECTED: one item ran 1670 tokens / 6061 chars, never closed </li>",
+      "plan": null,
+      "probe_lane_sampled_chars": 0,
+      "workers": {},
+      "client": null
+    },
+    {
+      "dir": "asp2-healthz",
+      "wire": "thinking + aspect + punctuation-free items (current)",
+      "prompt": "/healthz endpoint in tools/server (zh)",
+      "note": "8 aspects, 7 workers each on their own, no loops",
+      "plan": {
+        "probe_tokens": 286,
+        "strategy": "thinking",
+        "text": "<ul>Let me see what can be thought through on its own here...<li>What exact shape of the /healthz JSON I will commit to in the answer</li>\n<li>Which llama-server files and headers the endpoint will live in and how it gets registered</li>\n<li>Which slot fields and KV metrics the endpoint must expose from existing state</li>\n<li>How to wire in a unit test so it builds and runs without a full server</li>\n<li>What risks this change creates and how to mitigate each one</li>\n<li>Whether the answer should include code snippets or only the plan and file list</li>\n<li>How to phrase the implementation approach so it is actionable but not tied to the latest upstream layout</li>\n<li>What to do if nlohmann/json or the slot/KV/wire state does not exist under the expected names</li></ul>"
+      },
+      "probe_lane_sampled_chars": 0,
+      "workers": {
+        "1": {
+          "sampled_tokens": 303,
+          "tail_cycle_period": 0,
+          "opening_160": " what should the JSON look like?The user wants: \"Return the occupancy status of each slot, KV usage, and current wire, and output in nlohmann::json.\"So the JSON"
+        },
+        "2": {
+          "sampled_tokens": 303,
+          "tail_cycle_period": 0,
+          "opening_160": " in llama.cpp tools/server, the main server loop is in server.cpp. Endpoint registration goes through the routing in main.cpp (llama-server's main.cpp) — in rec"
+        },
+        "3": {
+          "sampled_tokens": 304,
+          "tail_cycle_period": 0,
+          "opening_160": "In llama.cpp's tools/server, a \"slot\" is server_state::slot (server_state.h) which contains:- int64_t id- uint32_t context_id (context id)- int64_t t_start_time"
+        },
+        "4": {
+          "sampled_tokens": 303,
+          "tail_cycle_period": 0,
+          "opening_160": "In llama.cpp, tests live in tools/server/tests (there's a CMakeLists adding tests like test_server.cpp). Actually there's a tests/ directory and tools/server/te"
+        },
+        "5": {
+          "sampled_tokens": 304,
+          "tail_cycle_period": 0,
+          "opening_160": "Risks of adding a /healthz endpoint in llama-server:1. **Concurrency / data races**: The slot map is owned by the server and mutated by request handlers (slot a"
+        },
+        "6": {
+          "sampled_tokens": 149,
+          "tail_cycle_period": 0,
+          "opening_160": "The user asked for \"implementation plan, files to change, tests and risks\" (给出实现方案、需要改的文件、测试和风险). They explicitly asked for an implementation approach. For an e"
+        },
+        "7": {
+          "sampled_tokens": 150,
+          "tail_cycle_period": 0,
+          "opening_160": "When phrasing the implementation, I should:- Give a conceptual design that maps to the existing architecture (server.cpp, server_state.h, routing in main.cpp)- "
+        }
+      },
+      "client": null
+    },
+    {
+      "dir": "asp2-continents",
+      "wire": "thinking + aspect + punctuation-free items (current)",
+      "prompt": "世界上每个大洲有哪些国家",
+      "note": "3 aspects, 3 workers each on their own, no loops",
+      "plan": {
+        "probe_tokens": 148,
+        "strategy": "thinking",
+        "text": "<ul>Let me see what can be thought through on its own here...<li>geography and political recognition of the continents</li>\n<li>number of countries per continent</li>\n<li>country lists by continent</li>\n</ul>"
+      },
+      "probe_lane_sampled_chars": 0,
+      "workers": {
+        "1": {
+          "sampled_tokens": 621,
+          "tail_cycle_period": 0,
+          "opening_160": " how are continents defined, how many continents (7 vs 5 vs 6), which countries are assigned to which, disputed cases: Russia (Europe/Asia), Turkey (Europe/Asia"
+        },
+        "2": {
+          "sampled_tokens": 621,
+          "tail_cycle_period": 0,
+          "opening_160": " the number of countries in each continent — depends on the classification. 7-continent model: Africa has 54 (recognized by the UN, all on the African continent"
+        },
+        "3": {
+          "sampled_tokens": 621,
+          "tail_cycle_period": 0,
+          "opening_160": "#2 \"geography and political recognition of continents\": 6 or 7 continents; 5-continents (Olympic) model vs 7-continent; common schoolbook: Asia, Europe, Africa,"
+        }
+      },
+      "client": null
+    }
+  ],
+  "final_protocol": {
+    "prefix": "<ul>Let me see what can be thought through on its own here: <li>",
+    "head_region": "none (three head designs measured and dropped)",
+    "item_charset": "letters, digits, space, comma (ASCII and fullwidth), CJK/kana/hangul/Greek/Cyrillic, and / _ - ; no sentence punctuation, no newline",
+    "terminator": "</ul>, reachable only after one complete item",
+    "runs": {
+      "col2-healthz": {
+        "probe_tokens": 204,
+        "text": "<ul>Let me see what can be thought through on its own here: <li>what the server needs to expose and where it lives in llama_cpp </li>\n<li>what each slot is, how to query it, and which fields to report </li>\n<li>how the JSON should be shaped so the caller can use it </li>\n<li>what to put in a test and how to make it runnable </li>\n<li>what might go wrong in this change </li>\n<li>how to present the plan cleanly in the answer </li>\n</ul>"
+      },
+      "var777c-healthz": {
+        "probe_tokens": 223,
+        "text": "<ul>Let me see what can be thought through on its own here: <li>What the endpoint should return, field names, and how to map each server field into JSON </li>\n<li>How to get slot, KV, and current wire from the existing state without touching internals </li>\n<li>Where to add the handler in the router and how to register /healthz </li>\n<li>How to unit-test the JSON output, including the fake slot data </li>\n<li>Which files must be changed and how the test should be wired into the build </li>\n<li>The risks, the compatibility concerns, and how to mitigate them </li>\n</ul>"
+      },
+      "col2-continents": {
+        "probe_tokens": 165,
+        "text": "<ul>Let me see what can be thought through on its own here: <li>Which continents to list and in what order</li><li>How to classify each country into a continent</li><li>How to handle multi-continent countries</li><li>Whether to use ISO 3166-1 alpha-2 codes</li><li>What about the Antarctic continent</li></ul>"
+      },
+      "noh-healthz": {
+        "probe_tokens": 184,
+        "text": "<ul>Let me see what can be thought through on its own here...<li>What the actual request asks for</li><li>Whether to inspect code first or answer from knowledge</li><li>What files should be named and what should change</li><li>How the endpoint should be implemented</li><li>How the unit test should look</li><li>How the risk section should be shaped</li><li>How to combine those answers into the final response</li></ul>"
+      },
+      "noh-continents": {
+        "probe_tokens": 120,
+        "text": "<ul>Let me see what can be thought through on its own here...<li>what I need to decide now</li><li>what I must give at the end</li></ul>"
+      },
+      "col-healthz": {
+        "probe_tokens": 203,
+        "text": "<ul>Let me see what can be thought through on its own here... no wait, no aspect needs another one:<li>what I must pin down myself and what I must produce</li><li>whether this is a planning question or an implementation question</li><li>what the user actually wants to be done and whether I can actually do it</li><li>how to judge what should be included in the final answer</li><li>whether the content itself is sensitive or a trap</li><li>how to answer to satisfy the user as much as possible</li></ul>"
+      },
+      "br-healthz": {
+        "probe_tokens": null,
+        "text": null,
+        "note": "probe never closed within the budget"
+      }
+    },
+    "determinism": "same config + same seed reproduces byte-identical plans; seed 777 vs 20260923 on /healthz gives different but equally concrete plans (204 vs 223 probe tokens), so the config differences recorded here are not sampling noise.",
+    "dropped": {
+      "mandatory_head": "junk bridge clause, aspects degrade to meta-talk",
+      "injected_breath_reminder": "lane copies the reminder back verbatim dozens of times (1633 tokens, zero items)",
+      "unbounded_head": "1749 tokens, zero items (min_p masks the exit token)",
+      "question_mark_terminated_items": "kills legitimate imperative aspects",
+      "ellipsis_before_forced_li": "vaguest possible aspects"
+    }
+  }
+}

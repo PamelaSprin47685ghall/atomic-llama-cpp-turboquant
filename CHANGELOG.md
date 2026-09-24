@@ -18,6 +18,75 @@ full-model correctness acceptance; repaired-model measurements are required.
 
 ### Fixed
 
+- **Multi-lane decode is now worth its lanes, and RERoT finally beats serial.**
+  Two Vulkan matvec fixes and two scheduling bounds. The shader dequantized each
+  weight block once per (column,row) pair, because the generic loop nests columns
+  outside rows and the existing shared-dequant fast path only covered
+  `num_rows == 1`, which quantized pipelines never reach; and every workgroup
+  re-reads the whole activation vector, which at six columns is 1.07 GB against
+  23.7 MB of weights. The loop is inverted for multi-column dispatches and PQ2_0
+  matvec pipelines widen their row tile when the dispatch is wide.
+  `llama-batched-bench` decode t/s: 33.10 -> 33.47 at one lane (no regression),
+  51.09 -> 82.54 at four, 68.99 -> 98.90 at six, 63.03 -> 103.40 at eight;
+  scaling against one lane goes 2.08x -> 2.95x at six and eight lanes stops
+  regressing. Output is bitwise identical (greedy decode, six concurrent requests
+  versus one).
+
+  Parallel thinking then has to fit a token budget to pay off, so
+  `--rerot-lane-wrap-tokens` (default 256) gives a long worker lane, and the
+  synthesis lane at three times that allowance, escalating in-voice reminders to
+  close. Without them lanes ran past 1240 tokens each and the request never
+  finished; with a worker-only bound the synthesis took over as the unbounded
+  phase. On the geography prompt against a fixed eight-item checklist:
+  serial 134.37 s / 3085 tokens / full coverage; RERoT at 256 **101.51 s / 2959
+  tokens / full coverage** (1.32x faster on fewer total tokens, terser answer);
+  at 512 it regresses to 251.65 s / 5575 tokens; at 128 it finishes in 53.37 s but
+  coverage collapses to 1/8, which is what the checklist is there to catch.
+  Earlier drafts of this entry quoted an "end-to-end tok/s" built from
+  `timings.predicted_n`, which counts lane tokens and therefore flatters RERoT;
+  the numbers above are wall clock at equal coverage. Details in `RERoT.md` §22.6.
+
+- **RERoT planning wire: parallel thinking aspects instead of Mermaid indentation.**
+  New `--rerot-plan-wire thinking` injects one instruction sentence plus
+  `<ul>Let me see what can be thought through on its own here...`, then constrains
+  generation with a six-rule GBNF and stops at the first `</ul>`. Items are bare
+  `<li>` sub-titles in words with no punctuation at all (path characters `/ _ -`
+  stay legal), so the wire cannot drift into indentation, outline numbering or
+  `&lt;` escaping. Execution is the flat shape the pen cohort wants: synthetic
+  root plus one peer worker per aspect. `json` / `mindmap` / `todo` remain
+  selectable controls.
+
+  Two structural facts drove the design and are worth knowing before tuning it.
+  First, the unit is an *aspect* because that is what the model's own
+  unconstrained thinking is made of: an RERoT-off capture on a real
+  agent-coding task spends about 25 of 41 paragraphs circling one unknown about
+  the codebase and the rest covering the requested deliverables. Second, the
+  escape token that ends a free-form region is not merely unlikely under the
+  model card's thinking-mode sampling, it is masked: measured on the real probe
+  context, `<` sits at rank 2 with p=0.086 while the head is empty and falls
+  below 1.2e-3 (2.7e-3 of the top token) after one sentence, i.e. under
+  `min_p=0.05` it leaves the pool. An unbounded region therefore never
+  terminates — one head ran 1749 tokens with no list, one item ran 1670 tokens
+  with no close. The server answers this in two ways: when the lane ends a head
+  line the newline is replaced by a reminder plus that same newline (capped), and
+  item text carries no punctuation, so a label cannot hold prose.
+
+  The `become` frame was rewritten for all tree wires: the tool carries a
+  one-clause description, the tool reply is a data echo, and the contract is the
+  lane's own first-person sentence at the start of its thinking, ending on a colon
+  so the thought continues. Second person in the reply does not survive a shared
+  KV (6/6 mindmap workers dismissed the handoff and re-answered the whole
+  request; 3/3 coding workers claimed the same node; a numeric tag only made the
+  tag the anchor), and a seed ending in a full stop made every worker sample
+  `</think>` immediately while the synthesis lane emitted a `become` tool call as
+  the public answer. On a single RX 6800 with Bonsai-2 27B PQ2_0 and six pens, the
+  wire planned a `/healthz` endpoint task in 286 probe tokens (8 aspects, 7
+  workers each on their own) and a geography prompt in 148 (3 aspects, 3
+  workers). Every run hit its 60 s client deadline: there is no completed
+  episode, no public answer and no throughput comparison. Evidence, including the
+  distribution measurement and the natural-thinking baseline:
+  `artifacts/rerot-thinking-wire/`; scope and limits in `RERoT.md` §22.5.
+
 - **Meta rank-local asynchronous readback.** Eligible contiguous F32 vocabulary
   shards now copy into persistent per-device pinned host slots, submit every
   rank before waiting, and assemble at the existing consumption boundary.

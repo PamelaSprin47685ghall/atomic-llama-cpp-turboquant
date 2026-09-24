@@ -1,3 +1,27 @@
+## 下班交接｜2026-09-24｜rerot-wip（用户要求暂停并推送）
+
+### 已完成：无约束平面 todo 探针
+
+- 新增独立试验入口 `--rerot-plan-wire todo`，保留 json/mindmap 对照；固定注入 `Let me write a parallel todo list for my thinking.\n- `，不安装 GBNF 或缩进采样器。
+- 每行 `- xxx` 成为一个同级 worker；新行首字节不是 `-` 就结束。一个 token 若跨越列表末尾和终止行，只保留边界前的列表，终止字符及后续全部丢弃；整个隔离 probe KV 在 formal P 前丢弃。EOG 可结束最后一项；空项/空计划报错，不静默补任务。
+- formal P 是原句加规范化平面列表，native `become(node)` 交接不变；保存/恢复保持 `plan_kind=todo`，内部仅借用 synthetic root + depth-2 leaves 的执行结构，无 worker 间硬依赖。
+- `llama-server` 已构建；`test-rerot-todo`、`test-rerot-runtime`、`test-rerot-parser`、`test-arg-parser` **4/4 通过**。首次实跑暴露旧的“grammar 不能为空”启动守卫，已限定为有约束 wire，修正后实跑成功。
+- 单 RX 6800 / Bonsai 27B PQ2_0、K=q8_0/V=turbo4：大洲题 probe **92 tokens / 2.99 秒**完成，接受 4 项；60 秒窗口中已进入 4-worker 执行但无最终答案，worker 有重复展开，**不能称整题通过**。
+- 双算术题完整 **HTTP 200 / stop**，最终输出 `221\n399`，274 predicted tokens，server predicted_ms=11989.667。详细证据在 `artifacts/rerot-wip/`。
+
+### 当前优先项：Vulkan 真缺陷已复现，尚未修复
+
+- 用户提供的五卡报告作为已知事实：`e4510fe0a` 即使关闭 MTP 也计数岔错（`…16,1…`、185 token、255/256 截断、无自然停止）。不得归因 MTP，也不得拿单卡 Bonsai 结果为五卡 TP5 背书。
+- 历史 `4e17c2faf → e4510fe0a` 之间修改 Vulkan 的提交为 `f80718126`、`fdd1da342`。前者保活异步读写 buffer；后者也有 HC 多行、GDN 和 skinny matmul 派发改动，不能只按 mindmap 提交名归因。
+- **已确认的独立 bug（来自 fdd1da342）：** `ggml_vk_mul_mat_vec_q_f16` 的 `skinny_as_batch` 把局部 `column_view_src1` 的栈地址写入 `prealloc_y_last_tensor_used`；连续调用可能复用同一地址，误认为新输入已量化，从而消费上一份输入。
+- 真机最小复现：Q8_0 权重 `[2048,64]`，两份不同 F32 输入 `[2048,27]`，同一 graph 连续 matmul。默认 auto 输出 `127/-254`，最大误差 `0/0`；`GGML_VK_FORCE_MMVQ=1` 输出 `126.992/126.992`，第二份本应 `-254`，最大误差 **380.992**。复现源 `artifacts/rerot-wip/vulkan-skinny-cache.cpp`（链接当前 build/bin 的 ggml；无参数为 auto，传任意参数为 forced）。**生产源码尚未修复。**
+- 该 bug 在本机默认 auto 下不触发；尚未证明它就是用户五卡报告的根因。下一步：用稳定的原始 tensor 身份作为缓存键，保留布局 view 仅用于几何；增加连续不同输入及 replay 的回归，再完成 HC/GDN 审计。
+- `f80718126` 保活路径定向烟测通过：48 轮，206640 个整数精确，含非零 offset、不同 stride、异步提交后提前释放源 buffer wrapper。复现源 `artifacts/rerot-wip/vulkan-copy-lifetime.cpp`。不应无证据正式撤回保活，否则可能重引入异步悬空资源。
+- 先前普通路径对拍的边界：单卡 Bonsai、RERoT 关闭，`9290e7a1a` 与 `43b290eff` 在同一 58+1383 token 轨迹的 149 检查点、36999680 个 logits，CPU 历史/当前与 Vulkan 历史/当前均逐值一致；CPU↔Vulkan 差异在两版本相同（max=0.396335，RMS=0.032676，argmax 148/149）。这不证明五卡正确。摘要 `artifacts/rerot-wip/ordinary-baseline-evidence.json`。
+- 用户要求优先 Vulkan 后又要求下班保存；todo 文档整理与 Vulkan 修复均暂停。没有提交新的 Vulkan 生产修复，没有关闭 watchdog/修改时钟；模型服务已停止。没有配置可用 SSH 目标。
+
+---
+
 ## 结论
 
 **应该把主线改成“TP5 原生的多步 MTP 执行程序”，而不是继续给两个独立上下文拼出来的草稿路径调参数。当前约 72 tok/s，不能视为这套硬件上 MTP 的上限。**

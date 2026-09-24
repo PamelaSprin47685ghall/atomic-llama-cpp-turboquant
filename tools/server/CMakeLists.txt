@@ -17,6 +17,10 @@ add_library(${TARGET} STATIC
     server-rerot.h
     server-rerot-mindmap.cpp
     server-rerot-mindmap.h
+    server-rerot-todo.cpp
+    server-rerot-todo.h
+    server-rerot-thinking.cpp
+    server-rerot-thinking.h
     server-context.cpp
     server-context.h
     server-stream.cpp

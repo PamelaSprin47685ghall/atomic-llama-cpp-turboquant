@@ -1,0 +1,352 @@
+# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.
+# TYPE llamacpp:prompt_tokens_total counter
+llamacpp:prompt_tokens_total 0
+# HELP llamacpp:prompt_seconds_total Prompt process time
+# TYPE llamacpp:prompt_seconds_total counter
+llamacpp:prompt_seconds_total 0
+# HELP llamacpp:tokens_predicted_total Number of generation tokens processed.
+# TYPE llamacpp:tokens_predicted_total counter
+llamacpp:tokens_predicted_total 0
+# HELP llamacpp:tokens_predicted_seconds_total Predict process time
+# TYPE llamacpp:tokens_predicted_seconds_total counter
+llamacpp:tokens_predicted_seconds_total 0
+# HELP llamacpp:n_decode_total Total number of llama_decode() calls
+# TYPE llamacpp:n_decode_total counter
+llamacpp:n_decode_total 572
+# HELP llamacpp:n_tokens_max Largest observed n_tokens.
+# TYPE llamacpp:n_tokens_max counter
+llamacpp:n_tokens_max 966
+# HELP llamacpp:tri_drain_total TriAttention initial pressure drains completed.
+# TYPE llamacpp:tri_drain_total counter
+llamacpp:tri_drain_total 0
+# HELP llamacpp:tri_maintenance_total TriAttention sticky maintenance reclaims completed.
+# TYPE llamacpp:tri_maintenance_total counter
+llamacpp:tri_maintenance_total 0
+# HELP llamacpp:tri_floor_exhausted_total KV pressure events that reached the TriAttention residency floor.
+# TYPE llamacpp:tri_floor_exhausted_total counter
+llamacpp:tri_floor_exhausted_total 0
+# HELP llamacpp:tri_cells_freed_total Physical KV cells freed by TriAttention over the process lifetime.
+# TYPE llamacpp:tri_cells_freed_total counter
+llamacpp:tri_cells_freed_total 0
+# HELP llamacpp:tri_score_seconds Wall time spent in TriAttention importance scoring.
+# TYPE llamacpp:tri_score_seconds counter
+llamacpp:tri_score_seconds 0
+# HELP llamacpp:tri_pack_seconds Wall time spent compacting TriAttention K/V data.
+# TYPE llamacpp:tri_pack_seconds counter
+llamacpp:tri_pack_seconds 0
+# HELP llamacpp:prompt_tokens_seconds Average prompt throughput in tokens/s.
+# TYPE llamacpp:prompt_tokens_seconds gauge
+llamacpp:prompt_tokens_seconds 0
+# HELP llamacpp:predicted_tokens_seconds Average generation throughput in tokens/s.
+# TYPE llamacpp:predicted_tokens_seconds gauge
+llamacpp:predicted_tokens_seconds 0
+# HELP llamacpp:requests_processing Number of requests processing.
+# TYPE llamacpp:requests_processing gauge
+llamacpp:requests_processing 0
+# HELP llamacpp:requests_deferred Number of requests deferred.
+# TYPE llamacpp:requests_deferred gauge
+llamacpp:requests_deferred 0
+# HELP llamacpp:n_busy_slots_per_decode Average number of busy slots per llama_decode() call
+# TYPE llamacpp:n_busy_slots_per_decode gauge
+llamacpp:n_busy_slots_per_decode 3.50175
+# HELP llamacpp:tri_cells_before Physical KV cells before the most recent successful TriAttention reclaim.
+# TYPE llamacpp:tri_cells_before gauge
+llamacpp:tri_cells_before 0
+# HELP llamacpp:tri_cells_after Physical KV cells after the most recent successful TriAttention reclaim.
+# TYPE llamacpp:tri_cells_after gauge
+llamacpp:tri_cells_after 0
+# HELP llamacpp:tri_cells_freed Physical KV cells freed by the most recent successful TriAttention reclaim.
+# TYPE llamacpp:tri_cells_freed gauge
+llamacpp:tri_cells_freed 0
+# HELP llamacpp:tri_references_removed Per-sequence KV references removed by the most recent successful TriAttention reclaim.
+# TYPE llamacpp:tri_references_removed gauge
+llamacpp:tri_references_removed 0
+# HELP llamacpp:tri_target_references Reference-level residency targets in the most recent successful TriAttention reclaim.
+# TYPE llamacpp:tri_target_references gauge
+llamacpp:tri_target_references 0
+# HELP llamacpp:tri_hard_keep Hard-protected KV references in the most recent successful TriAttention reclaim.
+# TYPE llamacpp:tri_hard_keep gauge
+llamacpp:tri_hard_keep 0
+# HELP llamacpp:tri_shared_keep Physical KV cells retained by multiple sequences after the most recent TriAttention reclaim.
+# TYPE llamacpp:tri_shared_keep gauge
+llamacpp:tri_shared_keep 0
+# HELP llamacpp:rerot_episode_total RERoT episodes started.
+# TYPE llamacpp:rerot_episode_total counter
+llamacpp:rerot_episode_total 1
+# HELP llamacpp:rerot_episode_active RERoT episodes currently active.
+# TYPE llamacpp:rerot_episode_active gauge
+llamacpp:rerot_episode_active 0
+# HELP llamacpp:rerot_nodes_created RERoT logical nodes created.
+# TYPE llamacpp:rerot_nodes_created counter
+llamacpp:rerot_nodes_created 1
+# HELP llamacpp:rerot_nodes_started RERoT logical nodes admitted to execution.
+# TYPE llamacpp:rerot_nodes_started counter
+llamacpp:rerot_nodes_started 5
+# HELP llamacpp:rerot_nodes_retired RERoT logical nodes retired.
+# TYPE llamacpp:rerot_nodes_retired counter
+llamacpp:rerot_nodes_retired 0
+# HELP llamacpp:rerot_nodes_queued RERoT logical nodes enqueued.
+# TYPE llamacpp:rerot_nodes_queued counter
+llamacpp:rerot_nodes_queued 0
+# HELP llamacpp:rerot_queue_max Largest observed RERoT ready queue.
+# TYPE llamacpp:rerot_queue_max gauge
+llamacpp:rerot_queue_max 3
+# HELP llamacpp:rerot_forks_total RERoT fork publications.
+# TYPE llamacpp:rerot_forks_total counter
+llamacpp:rerot_forks_total 0
+# HELP llamacpp:rerot_max_depth Largest observed RERoT tree depth.
+# TYPE llamacpp:rerot_max_depth gauge
+llamacpp:rerot_max_depth 0
+# HELP llamacpp:rerot_max_live_lanes Largest observed concurrent RERoT Lane count.
+# TYPE llamacpp:rerot_max_live_lanes gauge
+llamacpp:rerot_max_live_lanes 4
+# HELP llamacpp:rerot_public_tokens RERoT PUBLIC tokens committed.
+# TYPE llamacpp:rerot_public_tokens counter
+llamacpp:rerot_public_tokens 396
+# HELP llamacpp:rerot_private_tokens RERoT PRIVATE control tokens committed.
+# TYPE llamacpp:rerot_private_tokens counter
+llamacpp:rerot_private_tokens 92
+# HELP llamacpp:rerot_pending_tokens RERoT PENDING record tokens committed.
+# TYPE llamacpp:rerot_pending_tokens counter
+llamacpp:rerot_pending_tokens 2249
+# HELP llamacpp:rerot_completed_episode_total RERoT episodes that produced a final response.
+# TYPE llamacpp:rerot_completed_episode_total counter
+llamacpp:rerot_completed_episode_total 0
+# HELP llamacpp:rerot_completed_model_tokens Model-forward tokens committed by completed RERoT episodes; includes PUBLIC, PRIVATE, and PENDING tokens.
+# TYPE llamacpp:rerot_completed_model_tokens counter
+llamacpp:rerot_completed_model_tokens 0
+# HELP llamacpp:rerot_parallel_model_tokens Model-forward tokens committed between first multi-Lane admission and the final acquire fence.
+# TYPE llamacpp:rerot_parallel_model_tokens counter
+llamacpp:rerot_parallel_model_tokens 0
+# HELP llamacpp:rerot_completed_episode_seconds RERoT episode wall time after prompt prefill; divide completed model tokens by this value for aggregate throughput.
+# TYPE llamacpp:rerot_completed_episode_seconds counter
+llamacpp:rerot_completed_episode_seconds 0
+# HELP llamacpp:rerot_parallel_seconds Multi-Lane phase wall time; divide parallel model tokens by this value for parallel aggregate throughput.
+# TYPE llamacpp:rerot_parallel_seconds counter
+llamacpp:rerot_parallel_seconds 0
+# HELP llamacpp:rerot_parallel_peak_lanes_total Sum over completed RERoT episodes of peak concurrent Lane count during the episode's multi-Lane phase (C02 evidence counter).
+# TYPE llamacpp:rerot_parallel_peak_lanes_total counter
+llamacpp:rerot_parallel_peak_lanes_total 0
+# HELP llamacpp:rerot_frontiers RERoT frontiers committed.
+# TYPE llamacpp:rerot_frontiers counter
+llamacpp:rerot_frontiers 569
+# HELP llamacpp:rerot_topology_barriers RERoT topology barriers completed.
+# TYPE llamacpp:rerot_topology_barriers counter
+llamacpp:rerot_topology_barriers 2
+# HELP llamacpp:rerot_refresh_total RERoT view refreshes completed.
+# TYPE llamacpp:rerot_refresh_total counter
+llamacpp:rerot_refresh_total 2
+# HELP llamacpp:rerot_mtp_invalidations RERoT-stale speculative drafts invalidated.
+# TYPE llamacpp:rerot_mtp_invalidations counter
+llamacpp:rerot_mtp_invalidations 0
+# HELP llamacpp:rerot_context_shifts RERoT shared-log context shifts completed.
+# TYPE llamacpp:rerot_context_shifts counter
+llamacpp:rerot_context_shifts 0
+# HELP llamacpp:rerot_hard_aborts RERoT episodes atomically aborted.
+# TYPE llamacpp:rerot_hard_aborts counter
+llamacpp:rerot_hard_aborts 0
+# HELP llamacpp:rerot_final_fences RERoT final acquire fences completed.
+# TYPE llamacpp:rerot_final_fences counter
+llamacpp:rerot_final_fences 0
+# HELP llamacpp:rerot_span_count DDVR spans rendered for RERoT views.
+# TYPE llamacpp:rerot_span_count counter
+llamacpp:rerot_span_count 1803120
+# HELP llamacpp:rerot_parked_total RERoT recurrent lineages parked.
+# TYPE llamacpp:rerot_parked_total counter
+llamacpp:rerot_parked_total 0
+# HELP llamacpp:rerot_archive_total RERoT public runs archived.
+# TYPE llamacpp:rerot_archive_total counter
+llamacpp:rerot_archive_total 0
+# HELP llamacpp:rerot_ddvr_seconds Wall time spent building RERoT DDVR views.
+# TYPE llamacpp:rerot_ddvr_seconds counter
+llamacpp:rerot_ddvr_seconds 0.058284
+# HELP llamacpp:rerot_probe_seconds Wall time spent in RERoT isolated routing probe.
+# TYPE llamacpp:rerot_probe_seconds counter
+llamacpp:rerot_probe_seconds 2.99151
+# HELP llamacpp:rerot_probe_count Total RERoT isolated routing probe executions.
+# TYPE llamacpp:rerot_probe_count counter
+llamacpp:rerot_probe_count 1
+# HELP llamacpp:rerot_prefix_rebuild_seconds Wall time spent in RERoT DAG prefix rebuild.
+# TYPE llamacpp:rerot_prefix_rebuild_seconds counter
+llamacpp:rerot_prefix_rebuild_seconds 0.025845
+# HELP llamacpp:rerot_prefix_rebuild_count Total RERoT DAG prefix rebuild executions.
+# TYPE llamacpp:rerot_prefix_rebuild_count counter
+llamacpp:rerot_prefix_rebuild_count 1
+# HELP llamacpp:rerot_ordinary_prompt_tokens Cumulative ordinary prompt tokens before RERoT DAG prefix rebuild.
+# TYPE llamacpp:rerot_ordinary_prompt_tokens counter
+llamacpp:rerot_ordinary_prompt_tokens 58
+# HELP llamacpp:rerot_dag_lcp_tokens Cumulative token LCP between ordinary prompt and DAG template in RERoT rebuild.
+# TYPE llamacpp:rerot_dag_lcp_tokens counter
+llamacpp:rerot_dag_lcp_tokens 40
+# HELP llamacpp:rerot_replay_from_tokens Cumulative rebuild replay starting positions in RERoT prefix rebuild.
+# TYPE llamacpp:rerot_replay_from_tokens counter
+llamacpp:rerot_replay_from_tokens 0
+# HELP llamacpp:rerot_actual_replayed_tokens Cumulative tokens actually replayed during RERoT DAG prefix rebuild.
+# TYPE llamacpp:rerot_actual_replayed_tokens counter
+llamacpp:rerot_actual_replayed_tokens 305
+# HELP llamacpp:rerot_fixed_entry_seconds Wall time spent rendering RERoT fixed entry templates.
+# TYPE llamacpp:rerot_fixed_entry_seconds counter
+llamacpp:rerot_fixed_entry_seconds 0.003056
+# HELP llamacpp:rerot_fixed_entry_count Total RERoT fixed entry template renders.
+# TYPE llamacpp:rerot_fixed_entry_count counter
+llamacpp:rerot_fixed_entry_count 1
+# HELP llamacpp:rerot_synthesis_switch_seconds Wall time spent switching and admitting DAG synthesis.
+# TYPE llamacpp:rerot_synthesis_switch_seconds counter
+llamacpp:rerot_synthesis_switch_seconds 0
+# HELP llamacpp:rerot_synthesis_switch_count Total DAG synthesis transitions executed.
+# TYPE llamacpp:rerot_synthesis_switch_count counter
+llamacpp:rerot_synthesis_switch_count 0
+# HELP llamacpp:rerot_sync_capture_us GPU synchronization duration at post-decode decision capture.
+# TYPE llamacpp:rerot_sync_capture_us counter
+llamacpp:rerot_sync_capture_us 45981571
+# HELP llamacpp:rerot_sync_capture_count Total GPU synchronizations at post-decode decision capture.
+# TYPE llamacpp:rerot_sync_capture_count counter
+llamacpp:rerot_sync_capture_count 475
+# HELP llamacpp:rerot_sync_sample_us GPU synchronization duration at post-decode sampling.
+# TYPE llamacpp:rerot_sync_sample_us counter
+llamacpp:rerot_sync_sample_us 2496395
+# HELP llamacpp:rerot_sync_sample_count Total GPU synchronizations at post-decode sampling.
+# TYPE llamacpp:rerot_sync_sample_count counter
+llamacpp:rerot_sync_sample_count 78
+# HELP llamacpp:rerot_sync_sample_no_work_us GPU synchronization duration at sampling where no new GPU work was submitted since last sync (redundant wait).
+# TYPE llamacpp:rerot_sync_sample_no_work_us counter
+llamacpp:rerot_sync_sample_no_work_us 0
+# HELP llamacpp:rerot_sync_sample_no_work_count Total GPU synchronizations at sampling without new GPU work since last sync.
+# TYPE llamacpp:rerot_sync_sample_no_work_count counter
+llamacpp:rerot_sync_sample_no_work_count 0
+# HELP llamacpp:rerot_sync_sample_with_work_us GPU synchronization duration at sampling with un-synchronized GPU work.
+# TYPE llamacpp:rerot_sync_sample_with_work_us counter
+llamacpp:rerot_sync_sample_with_work_us 2496395
+# HELP llamacpp:rerot_sync_sample_with_work_count Total GPU synchronizations at sampling with un-synchronized GPU work.
+# TYPE llamacpp:rerot_sync_sample_with_work_count counter
+llamacpp:rerot_sync_sample_with_work_count 78
+# HELP llamacpp:rerot_people_capacity Maximum concurrent people / independent brains (B).
+# TYPE llamacpp:rerot_people_capacity gauge
+llamacpp:rerot_people_capacity 6
+# HELP llamacpp:rerot_people_resident Currently resident people / independent brains.
+# TYPE llamacpp:rerot_people_resident gauge
+llamacpp:rerot_people_resident 0
+# HELP llamacpp:rerot_people_runnable Currently runnable people / independent brains.
+# TYPE llamacpp:rerot_people_runnable gauge
+llamacpp:rerot_people_runnable 0
+# HELP llamacpp:rerot_people_waiting Currently waiting people in admission queue.
+# TYPE llamacpp:rerot_people_waiting gauge
+llamacpp:rerot_people_waiting 0
+# HELP llamacpp:rerot_pens_capacity Total execution pens / decode rows (P).
+# TYPE llamacpp:rerot_pens_capacity gauge
+llamacpp:rerot_pens_capacity 6
+# HELP llamacpp:rerot_pens_allocated Currently allocated pens.
+# TYPE llamacpp:rerot_pens_allocated gauge
+llamacpp:rerot_pens_allocated 0
+# HELP llamacpp:rerot_pens_running Currently running pens.
+# TYPE llamacpp:rerot_pens_running gauge
+llamacpp:rerot_pens_running 0
+# HELP llamacpp:rerot_pens_suspended Currently suspended pens awaiting resume.
+# TYPE llamacpp:rerot_pens_suspended gauge
+llamacpp:rerot_pens_suspended 0
+# HELP llamacpp:rerot_pen_queue_depth Current queue depth of unadmitted children awaiting pens.
+# TYPE llamacpp:rerot_pen_queue_depth gauge
+llamacpp:rerot_pen_queue_depth 0
+# HELP llamacpp:rerot_pens_per_person_max_observed Maximum pens observed allocated to a single person.
+# TYPE llamacpp:rerot_pens_per_person_max_observed gauge
+llamacpp:rerot_pens_per_person_max_observed 0
+# HELP llamacpp:rerot_pen_utilization Fraction of pen capacity currently allocated.
+# TYPE llamacpp:rerot_pen_utilization gauge
+llamacpp:rerot_pen_utilization 0
+# HELP llamacpp:rerot_batch_people People present in last decoded batch.
+# TYPE llamacpp:rerot_batch_people gauge
+llamacpp:rerot_batch_people 1
+# HELP llamacpp:rerot_batch_pens Pens / rows present in last decoded batch.
+# TYPE llamacpp:rerot_batch_pens gauge
+llamacpp:rerot_batch_pens 4
+# HELP llamacpp:rerot_frontier_rows Cumulative frontier rows decoded across all pens.
+# TYPE llamacpp:rerot_frontier_rows counter
+llamacpp:rerot_frontier_rows 2000
+# HELP llamacpp:rerot_six_row_batches Successful decode slices containing at least six RERoT pen rows in one llama_decode call.
+# TYPE llamacpp:rerot_six_row_batches counter
+llamacpp:rerot_six_row_batches 0
+# HELP llamacpp:rerot_brain_bytes Estimated recurrent brain memory in bytes.
+# TYPE llamacpp:rerot_brain_bytes gauge
+llamacpp:rerot_brain_bytes 56623104
+# HELP llamacpp:rerot_hand_bytes Estimated recurrent hand memory in bytes.
+# TYPE llamacpp:rerot_hand_bytes gauge
+llamacpp:rerot_hand_bytes 6291456
+# HELP llamacpp:rerot_grouped_scratch_bytes Estimated grouped multi-reader / RBB scratch in bytes.
+# TYPE llamacpp:rerot_grouped_scratch_bytes gauge
+llamacpp:rerot_grouped_scratch_bytes 2097152
+# HELP llamacpp:tri_atomic_fallback_total Atomic fallback entries after dynamic-memory pressure, by reason.
+# TYPE llamacpp:tri_atomic_fallback_total counter
+llamacpp:tri_atomic_fallback_total{reason="kv"} 0
+llamacpp:tri_atomic_fallback_total{reason="recurrent"} 0
+# HELP llamacpp:flashprefill_eligible_rows_total Source rows presented with a sparse-eligible role and known boundary.
+# TYPE llamacpp:flashprefill_eligible_rows_total counter
+llamacpp:flashprefill_eligible_rows_total 0
+# HELP llamacpp:flashprefill_sparse_rows_total Packed execution rows confirmed sparse by the plan headers after successful completion.
+# TYPE llamacpp:flashprefill_sparse_rows_total counter
+llamacpp:flashprefill_sparse_rows_total 0
+# HELP llamacpp:flashprefill_dense_packed_rows_total Packed execution rows the plans ran dense.
+# TYPE llamacpp:flashprefill_dense_packed_rows_total counter
+llamacpp:flashprefill_dense_packed_rows_total 0
+# HELP llamacpp:flashprefill_selected_blocks_total Plan exact uses summed over layers.
+# TYPE llamacpp:flashprefill_selected_blocks_total counter
+llamacpp:flashprefill_selected_blocks_total 0
+# HELP llamacpp:flashprefill_corrected_blocks_total Plan proxy (mean-corrected) uses summed over layers.
+# TYPE llamacpp:flashprefill_corrected_blocks_total counter
+llamacpp:flashprefill_corrected_blocks_total 0
+# HELP llamacpp:flashprefill_visible_tokens_total Plan use-record token sum over layers (64-bit, subhead fan-out not multiplied).
+# TYPE llamacpp:flashprefill_visible_tokens_total counter
+llamacpp:flashprefill_visible_tokens_total 0
+# HELP llamacpp:flashprefill_exact_tokens_total Plan exact-use token sum over layers (64-bit).
+# TYPE llamacpp:flashprefill_exact_tokens_total counter
+llamacpp:flashprefill_exact_tokens_total 0
+# HELP llamacpp:flashprefill_scratch_bytes Live FlashPrefill scratch bytes from the last successful slice.
+# TYPE llamacpp:flashprefill_scratch_bytes gauge
+llamacpp:flashprefill_scratch_bytes 0
+# HELP llamacpp:flashprefill_scratch_peak_bytes Peak FlashPrefill scratch bytes over successful slices.
+# TYPE llamacpp:flashprefill_scratch_peak_bytes gauge
+llamacpp:flashprefill_scratch_peak_bytes 0
+# HELP llamacpp:flashprefill_layout_seconds Host layout time over measured slices.
+# TYPE llamacpp:flashprefill_layout_seconds counter
+llamacpp:flashprefill_layout_seconds 0
+# HELP llamacpp:flashprefill_pool_seconds GPU pool-dispatch time over sampled calls (0 until the timestamp hook reports).
+# TYPE llamacpp:flashprefill_pool_seconds counter
+llamacpp:flashprefill_pool_seconds 0
+# HELP llamacpp:flashprefill_select_seconds GPU select-dispatch time over sampled calls (0 until the timestamp hook reports).
+# TYPE llamacpp:flashprefill_select_seconds counter
+llamacpp:flashprefill_select_seconds 0
+# HELP llamacpp:flashprefill_attention_seconds GPU attention-dispatch time over sampled calls, merge included (0 until the timestamp hook reports).
+# TYPE llamacpp:flashprefill_attention_seconds counter
+llamacpp:flashprefill_attention_seconds 0
+# HELP llamacpp:flashprefill_dense_rows_total Packed rows executed dense by granular reason.
+# TYPE llamacpp:flashprefill_dense_rows_total counter
+llamacpp:flashprefill_dense_rows_total{reason="decode"} 0
+llamacpp:flashprefill_dense_rows_total{reason="mtp_verify"} 0
+llamacpp:flashprefill_dense_rows_total{reason="role_other"} 0
+llamacpp:flashprefill_dense_rows_total{reason="short_context"} 0
+llamacpp:flashprefill_dense_rows_total{reason="dense_tail"} 0
+llamacpp:flashprefill_dense_rows_total{reason="unknown_boundary"} 0
+llamacpp:flashprefill_dense_rows_total{reason="unsupported"} 0
+llamacpp:flashprefill_dense_rows_total{reason="high_cost"} 0
+llamacpp:flashprefill_dense_rows_total{reason="no_plan"} 0
+llamacpp:flashprefill_dense_rows_total{reason="full_attention_layer"} 0
+# HELP llamacpp:flashprefill_server_dense_rows_total Source rows routed dense by frozen server reason.
+# TYPE llamacpp:flashprefill_server_dense_rows_total counter
+llamacpp:flashprefill_server_dense_rows_total{reason="off"} 0
+llamacpp:flashprefill_server_dense_rows_total{reason="role"} 0
+llamacpp:flashprefill_server_dense_rows_total{reason="unsupported"} 0
+llamacpp:flashprefill_server_dense_rows_total{reason="short_context"} 0
+llamacpp:flashprefill_server_dense_rows_total{reason="dense_tail"} 0
+llamacpp:flashprefill_server_dense_rows_total{reason="unknown_boundary"} 0
+llamacpp:flashprefill_server_dense_rows_total{reason="capacity"} 0
+# HELP llamacpp:flashprefill_pool_rebuild_total Pool-mean rebuilds by reason.
+# TYPE llamacpp:flashprefill_pool_rebuild_total counter
+llamacpp:flashprefill_pool_rebuild_total{reason="slice"} 0
+llamacpp:flashprefill_pool_rebuild_total{reason="exact_all"} 0
+# HELP llamacpp:flashprefill_plan_invalidations_total Plan invalidations by reason.
+# TYPE llamacpp:flashprefill_plan_invalidations_total counter
+llamacpp:flashprefill_plan_invalidations_total{reason="bypassed"} 0
+llamacpp:flashprefill_plan_invalidations_total{reason="empty_snapshot"} 0
+llamacpp:flashprefill_plan_invalidations_total{reason="no_plan"} 0
+# HELP llamacpp:flashprefill_policy_fingerprint_info Active FlashPrefill policy fingerprint (single series).
+# TYPE llamacpp:flashprefill_policy_fingerprint_info gauge
+llamacpp:flashprefill_policy_fingerprint_info{fingerprint="e17baffb9fa61800"} 1

@@ -1,0 +1,10 @@
+root ::= head item (nl? item)* nl? "</ul>"
+head ::= (tchar* colon)?
+item ::= "<li>" sp? text "</li>"
+text ::= wchar tchar*
+tchar ::= wchar | sp | comma
+wchar ::= [0-9A-Za-z/_\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u3040-\u30FA\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF-]
+sp ::= " "
+comma ::= "," | "\uFF0C"
+colon ::= ":" | "\uFF1A"
+nl ::= "\n"

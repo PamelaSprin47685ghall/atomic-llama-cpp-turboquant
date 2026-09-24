@@ -1,0 +1,50 @@
+{
+  "status": "paused on user request; defect reproduced but not fixed",
+  "range": {
+    "historical": "4e17c2faf",
+    "reportedBroken": "e4510fe0a",
+    "vulkanCommits": [
+      "f80718126",
+      "fdd1da342"
+    ]
+  },
+  "asyncCopy": {
+    "rounds": 48,
+    "exactIntegers": 206640,
+    "passed": true
+  },
+  "skinny": {
+    "origin": "fdd1da342",
+    "shape": {
+      "K": 2048,
+      "M": 64,
+      "N": 27,
+      "type": "Q8_0"
+    },
+    "auto": {
+      "first": 127,
+      "second": -254,
+      "maxErrors": [
+        0,
+        0
+      ]
+    },
+    "forced": {
+      "first": 126.992,
+      "second": 126.992,
+      "expectedSecond": -254,
+      "maxErrors": [
+        0.00775146,
+        380.992
+      ]
+    },
+    "cause": "skinny_as_batch puts a temporary stack view address into prealloc_y_last_tensor_used; repeated calls can alias that address and skip quantization of a different input",
+    "fixNotApplied": true,
+    "scope": "Reproduced with GGML_VK_FORCE_MMVQ=1. Default auto passed. Not established as the reported five-GPU pure-target failure."
+  },
+  "pending": [
+    "Fix cache identity using stable original tensor identity; add regression for successive distinct inputs and replay",
+    "Complete HC and GDN path audit and targeted verification",
+    "No configured SSH target; five-card end-to-end result not reproduced locally"
+  ]
+}

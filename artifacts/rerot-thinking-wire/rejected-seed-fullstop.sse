@@ -1,0 +1,98 @@
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"<tool_call>"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"\n"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"<"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"function"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"="}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"bec"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"ome"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":">"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"\n"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"<"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"parameter"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"=i"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":">"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"\n"}}],"created":1790294052,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"1"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"\n"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"</"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"parameter"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":">"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"\n"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"<"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"parameter"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"=node"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":">"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"\n"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"Read"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" the"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" CSV"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" and"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" convert"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" it"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" into"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" a"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" list"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" of"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" dictionaries"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"\n"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"</"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"parameter"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":">"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"\n"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"</"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"function"}}],"created":1790294053,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":">"}}],"created":1790294054,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"\n"}}],"created":1790294054,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"</tool_call>"}}],"created":1790294054,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":"stop","index":0,"delta":{}}],"created":1790294054,"id":"chatcmpl-8ObD61UrmKZan6xNk4ApyuvaDnj7JFsw","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk","timings":{"cache_n":0,"prompt_n":88,"prompt_ms":376.769,"prompt_per_token_ms":4.281465909090909,"prompt_per_second":233.5648633512842,"predicted_n":118,"predicted_ms":10905.295,"predicted_per_token_ms":92.41775423728814,"predicted_per_second":10.820431726056011}}
+
+data: [DONE]
+

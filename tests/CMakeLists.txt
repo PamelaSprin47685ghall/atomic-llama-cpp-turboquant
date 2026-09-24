@@ -261,6 +261,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-native-determinism.cpp)
     llama_build_and_test(test-rerot-parser.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-todo.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-thinking.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap.cpp)
     # MM-R1 mindmap wire parser (strict incremental parser, no llama deps)
     llama_build_and_test(test-rerot-mindmap-parser.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap.cpp)
@@ -270,7 +272,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/tools/server)
     llama_build_and_test(test-rerot-runtime.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-todo.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-thinking.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap.cpp)
+    llama_build_and_test(test-rerot-todo.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-todo.cpp)
+    target_include_directories(test-rerot-todo PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    # Goal wire: flat HTML sub-goal list, GBNF-constrained, </ul>-terminated
+    llama_build_and_test(test-rerot-thinking.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-thinking.cpp)
+    target_include_directories(test-rerot-thinking PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_include_directories(test-rerot-runtime PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server
@@ -303,6 +314,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # episode codec, context shift, pen suspend/resume) — same extra source
     # and include dir as test-rerot-runtime.
     target_sources(test-flashprefill-state PRIVATE
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-todo.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-thinking.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap.cpp)
     target_include_directories(test-flashprefill-state PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)

@@ -168,6 +168,7 @@ void task_params::apply_rerot_defaults(const common_params & base) {
     rerot_frontier = base.rerot_frontier;
     rerot_trace = base.rerot_trace;
     rerot_plan_wire = base.rerot_plan_wire;
+    rerot_lane_wrap_tokens = base.rerot_lane_wrap_tokens;
     rerot_final_mode = base.rerot_final_mode;
 }
 

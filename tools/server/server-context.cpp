@@ -5,6 +5,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-rerot.h"
+#include "server-rerot-todo.h"
 #include "server-task.h"
 #include "chat.h"
 #include "server-queue.h"
@@ -164,7 +165,13 @@ enum class server_rerot_injection_kind : uint8_t {
 // episode's context-sized token budget instead of a fixed planning quota.
 static constexpr uint64_t SERVER_REROT_PROBE_MAX_TOKENS = 512;
 
-static constexpr size_t SERVER_REROT_PRIVATE_BATCH = 32;
+// Upper bound on forced (teacher-forced) tokens per forward. It is deliberately
+// larger than any frame or probe prefix so the real bound is the batch the
+// hardware was configured with: rerot_private_batch_size() also clamps to
+// llama_n_batch / slots, which with -b 2048 and 7 slots is 292. At the previous
+// value of 32 that constant, not the batch, decided how many forwards a frame
+// cost (a ~70-token probe prefix took three, a frame two).
+static constexpr size_t SERVER_REROT_PRIVATE_BATCH = 512;
 
 static bool server_rerot_private_microbatch(server_rerot_injection_kind injection) {
     return injection == server_rerot_injection_kind::planner ||
@@ -383,7 +390,7 @@ struct server_slot {
     bool rerot_internal = false;
     uint64_t rerot_episode_id = 0;
     // Planning wire of the episode this slot is driving: "dag" (shipped
-    // strategy JSON) or "mindmap" (MM-R1 research line). Empty until a routing
+    // strategy JSON), "mindmap" (tree) or "todo" (flat list). Empty until a routing
     // probe commits. Recorded here so the transition, the audit trace and the
     // experiment harness all name the same plan kind instead of re-deriving it
     // from a payload.
@@ -2097,10 +2104,138 @@ private:
         return text;
     }
 
+    // The internal handoff tool is advertised in every render (see
+    // rerot_fill_chat_inputs), which is what lets the ordinary C0 prefix stay
+    // valid. Advertising it also puts it in the model's menu, so its name starts
+    // with a reserved single-token marker and that one token id is banned from
+    // sampling in every task: the server writes the call as forced tokens, which
+    // never pass a sampler, so the ban cannot block our own use of it.
+    //
+    // A leading '-' was considered and rejected: "-become" tokenizes as
+    // ['-b','ecome'] and prose hyphenation shares those pieces ("well-known" ->
+    // ['well','-known']), so a global ban on them would corrupt normal text. The
+    // reserved markers below are one token each and never legitimate output.
+    static const std::vector<std::string> & rerot_tool_marker_candidates() {
+        // Order matters. Vision placeholders come last: <|vision_pad|> is what the
+        // multimodal path uses for image tokens, and putting it in the advertised
+        // tool name (hence in the system block of every request) reads as "an image
+        // is present" -- with it selected, the probe collapsed from five or six
+        // concrete aspects to two echoes of the instruction's own words. Prefer
+        // corpus-structure markers, which carry no runtime meaning in chat.
+        static const std::vector<std::string> candidates = {
+            "<|file_sep|>", "<|repo_name|>", "<|fim_pad|>", "<|fim_prefix|>",
+            "<|fim_suffix|>", "<|object_ref_start|>", "<|quad_start|>",
+            "<|vision_pad|>", "<|image_pad|>",
+        };
+        return candidates;
+    }
+
+    void rerot_resolve_tool_marker() {
+        rerot_tool_marker.clear();
+        rerot_tool_marker_tok = LLAMA_TOKEN_NULL;
+        if (ctx_tgt == nullptr) {
+            return;
+        }
+        const llama_vocab * v = llama_model_get_vocab(model_tgt);
+        for (const auto & cand : rerot_tool_marker_candidates()) {
+            const llama_tokens toks = common_tokenize(ctx_tgt, cand, false, true);
+            if (toks.size() != 1 || llama_vocab_is_eog(v, toks[0])) {
+                continue;
+            }
+            rerot_tool_marker = cand;
+            rerot_tool_marker_tok = toks[0];
+            SRV_INF("RERoT internal tool marker: %s (token %d, banned from sampling)\n",
+                cand.c_str(), (int) toks[0]);
+            return;
+        }
+        SRV_WRN("%s", "RERoT found no single-token reserved marker: the internal handoff tool "
+                      "keeps its bare name and cannot be banned from sampling\n");
+    }
+
+    // oaicompat JSON of the internal tool for the configured wire, or null when
+    // RERoT is off. Must render byte-identically to rerot_slot_dag_tools()'s entry.
+    json rerot_internal_tool_json() const {
+        if (!params_base.rerot_enabled) {
+            return json();
+        }
+        // Default ON: advertising the tool from the first token removes the
+        // per-episode prompt re-prefill entirely (no "DAG prefix rebuild" line at
+        // all). The cost is that the probe now has a tools block in its own context,
+        // which made it echo the instruction instead of naming task-specific aspects;
+        // that is answered in the instruction wording (see server-rerot-thinking.h),
+        // not by dropping the block. LLAMA_REROT_ADVERTISE_TOOL=0 restores
+        // frame-only advertising for A/B.
+        if (const char * off = std::getenv("LLAMA_REROT_ADVERTISE_TOOL")) {
+            if (off[0] == '0') {
+                return json();
+            }
+        }
+        const bool tree_wire = server_rerot_plan_kind_has_tree(params_base.rerot_plan_wire);
+        const common_chat_tool tool = tree_wire
+            ? rerot_become_tool(params_base.rerot_plan_wire == "thinking")
+            : rerot_spawn_lane_tool();
+        json fn = json{
+            { "name", tool.name },
+        };
+        if (!tool.description.empty()) {
+            fn["description"] = tool.description;
+        }
+        try {
+            fn["parameters"] = json::parse(tool.parameters);
+        } catch (...) {
+            return json();
+        }
+        return json{
+            { "type", "function" },
+            { "function", std::move(fn) },
+        };
+    }
+
+    std::string rerot_internal_tool_name(const char * bare) const {
+        return rerot_tool_marker + bare;
+    }
+
+    // Idempotent: the same bias may be applied to a task and to every lane clone.
+    void rerot_ban_tool_marker(common_params_sampling & sampling) const {
+        if (rerot_tool_marker_tok == LLAMA_TOKEN_NULL) {
+            return;
+        }
+        for (const auto & b : sampling.logit_bias) {
+            if (b.token == rerot_tool_marker_tok) {
+                return;
+            }
+        }
+        sampling.logit_bias.push_back({ rerot_tool_marker_tok, -INFINITY });
+    }
+
+    // Wire names and plan_kind values coincide for the tree wires, so one
+    // predicate answers both "is this a legal wire" and "does it own a tree".
+    static bool rerot_wire_has_tree(std::string_view wire) {
+        return server_rerot_plan_kind_has_tree(wire);
+    }
+    static bool rerot_wire_known(std::string_view wire) {
+        return wire == "json" || rerot_wire_has_tree(wire);
+    }
+
     // The complete map is already in P. A handoff only names its next node.
-    static common_chat_tool rerot_become_tool() {
+    // The description is the only place that legitimises the frame: without it
+    // workers read the synthesized call as an accidental tool invocation and
+    // fall back to answering the whole request (observed 6/6 on the mindmap
+    // wire), which is exactly the duplicated work the DAG exists to avoid.
+    common_chat_tool rerot_become_tool(bool thinking_wire) const {
         common_chat_tool node;
-        node.name = "become";
+        node.name = rerot_internal_tool_name("become");
+        // One clause: enough that the model does not read the synthesized call as
+        // a stray tool invocation, without restating the contract the planning
+        // prompt states once and the frame seed states in first person.
+        // One clause only. This is the single piece of the frame that the probe also
+        // reads: the block is advertised in C0 so the ordinary prefix stays shared,
+        // which puts every word here in the planner's context too. Measured: spelling
+        // the exclusivity contract out here made plans coarser (six concrete aspects
+        // fell to three). The contract lives in the per-lane tool reply instead, which
+        // no planner ever sees.
+        node.description = thinking_wire ? "Think one aspect of the plan."
+                                         : "Become one node of the plan.";
         node.parameters =
             "{\"type\":\"object\",\"properties\":{"
             "\"node\":{\"type\":\"string\"}"
@@ -2108,9 +2243,9 @@ private:
         return node;
     }
 
-    static common_chat_tool rerot_spawn_lane_tool() {
+    common_chat_tool rerot_spawn_lane_tool() const {
         common_chat_tool spawn;
-        spawn.name = "spawn_lane";
+        spawn.name = rerot_internal_tool_name("spawn_lane");
         spawn.description = "Internal DAG lane handoff. Not a user-visible tool.";
         spawn.parameters =
             "{\"type\":\"object\",\"properties\":{"
@@ -2152,18 +2287,53 @@ private:
                 tools.clear();
             }
         }
-        tools.push_back(wire == "mindmap" ? rerot_become_tool() : rerot_spawn_lane_tool());
+        const common_chat_tool internal = rerot_wire_has_tree(wire)
+            ? rerot_become_tool(wire == "thinking")
+            : rerot_spawn_lane_tool();
+        // The chat route already advertises it, so the request tools normally
+        // contain it: appending a second copy would change the rendered block and
+        // bring the prefix rebuild back.
+        const bool already = std::any_of(tools.begin(), tools.end(),
+            [&](const common_chat_tool & t) { return t.name == internal.name; });
+        if (!already) {
+            tools.push_back(internal);
+        }
         return tools;
     }
 
-    void rerot_fill_chat_inputs(common_chat_templates_inputs & inputs, const server_slot & slot) const {
+    // Whether the frame render advertises the internal handoff tool.
+    //
+    // Not advertising it is tempting: the "# Tools" block is inserted near the
+    // front of the render, which truncates the token LCP against the live
+    // ordinary tape at the system preamble and forces a full re-prefill of the
+    // prompt once per episode (measured: ordinary=58 lcp=40 dag=305
+    // replay_from=0, and the LCP stays at the preamble however long the prompt
+    // is). The schema is not needed for the frame to *work*: the server writes
+    // the call, the argument is visible in the rendered call, and the round is
+    // legitimised by the lane's own first-person seed.
+    //
+    // But it is needed for worker identity. Measured on the geography prompt,
+    // same seed, 60 s: with the block, 5/5 lanes worked on their own aspect;
+    // without it, roughly 3/6 did -- one lane announced "#1" while holding #3,
+    // one only restated the request, and one declared "the other aspects have
+    // already been handled". The plans differed (6 aspects versus 5), so this is
+    // not a strictly matched pair, but the direction is clear enough to keep the
+    // block. Removing the rebuild has to come from rendering the same block in
+    // the ordinary C0 too, not from dropping it here.
+    void rerot_fill_chat_inputs(common_chat_templates_inputs & inputs,
+                                const server_slot & slot,
+                                bool advertise_tools = true) const {
         inputs.use_jinja = chat_params.use_jinja;
         inputs.enable_thinking = true;
         inputs.reasoning_format = chat_params.reasoning_format;
         inputs.chat_template_kwargs = chat_params.chat_template_kwargs;
         inputs.add_generation_prompt = true;
         inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
-        inputs.tools = rerot_slot_dag_tools(slot);
+        if (advertise_tools) {
+            inputs.tools = rerot_slot_dag_tools(slot);
+        } else {
+            inputs.tools.clear();
+        }
         const auto * params = rerot_slot_params(slot);
         if (params && params->rerot_chat_now_ms != 0) {
             inputs.now = std::chrono::system_clock::time_point(
@@ -2192,10 +2362,23 @@ private:
                                                  const std::string & node_label,
                                                  const std::string & intent,
                                                  bool                is_synthesis,
-                                                 // Legacy JSON-DAG metadata; mindmap frames do not expose it.
+                                                 // Legacy JSON-DAG metadata; tree/list frames do not expose it.
                                                  std::string_view    final_mode,
                                                  std::string_view    think_end,
-                                                 std::string_view    think_start) const {
+                                                 std::string_view    think_start,
+                                                 // Unique per-lane tag for tree wires (0 = none). Every lane's
+                                                 // frame is otherwise identical except the label, and they all
+                                                 // live in the same unified KV, so without a tag a worker can
+                                                 // bind the reply of a peer's call to its own (measured: 2 of 4
+                                                 // lanes claimed the same question, 1 lost its identity). The tag
+                                                 // is the frozen tree leaf id, printed in both the call and the
+                                                 // reply so the pairing is visible in the rendered text.
+                                                 uint32_t            frame_tag = 0,
+                                                 // Total aspects in the frozen plan. "#3 of 6" is
+                                                 // far harder to mistake for a peer's identity than
+                                                 // a bare "#3", and it tells the lane how many other
+                                                 // sets of notes it will see.
+                                                 uint32_t            frame_total = 0) const {
         if (!chat_params.tmpls || !chat_params.use_jinja || think_end.empty() || think_start.empty()) {
             return {};
         }
@@ -2219,10 +2402,13 @@ private:
             return {};
         }
         const task_params * frame_params  = rerot_slot_params(slot);
-        const bool          mindmap_frame = frame_params && frame_params->rerot_plan_wire == "mindmap";
+        const bool          mindmap_frame = frame_params &&
+            rerot_wire_has_tree(frame_params->rerot_plan_wire);
         const std::string   call_id       = mindmap_frame ? std::string{} : "rerot-lane-" + label;
 
-        common_chat_tool             spawn    = mindmap_frame ? rerot_become_tool() : rerot_spawn_lane_tool();
+        const bool                   thinking_frame = frame_params && frame_params->rerot_plan_wire == "thinking";
+        common_chat_tool             spawn    = mindmap_frame ? rerot_become_tool(thinking_frame)
+                                                             : rerot_spawn_lane_tool();
         std::vector<common_chat_msg> messages = rerot_slot_chat_messages(slot);
         if (messages.empty()) {
             common_chat_msg user;
@@ -2233,6 +2419,9 @@ private:
 
         json        call_args;
         std::string tool_content;
+        // Appended after the template's think-start so the lane opens its own
+        // reasoning with it. Empty for the legacy JSON-DAG wire.
+        std::string think_seed;
         if (mindmap_frame) {
             if (intent.empty()) {
                 return {};
@@ -2240,7 +2429,57 @@ private:
             call_args = json{
                 { "node", intent }
             };
-            tool_content = "Now you became the node " + intent + ", please think about it.";
+            std::string tag;
+            std::string of;
+            if (frame_tag != 0) {
+                tag = "#" + std::to_string(frame_tag);
+                call_args["i"] = frame_tag;
+                if (frame_total != 0) {
+                    of = " of " + std::to_string(frame_total);
+                    call_args["of"] = frame_total;
+                }
+            }
+            // Second person in the tool reply does not survive a shared KV.
+            // Every lane's frame is textually identical except the label, all of
+            // them are visible at once, and an instruction addressed to "you"
+            // reads the same from any lane: with the identity in the reply, 3/3
+            // and then (with a numeric tag) 3/4 coding lanes adopted a peer's
+            // question, one of them quoting "I've already called become on node
+            // 3". So the reply keeps only the data echo, and the contract moves
+            // into the lane's own first-person voice at the start of its
+            // thinking -- the one position that belongs to this lane alone and
+            // is the most recent text before it samples.
+            const char * noun = thinking_frame ? "aspect" : "node";
+            const std::string id_part = tag.empty() ? std::string() : tag + " ";
+            // The seed must open the thought, not close it. A self-contained
+            // sentence here made every worker sample "</think>" as its very
+            // first token (zero reasoning, zero content, and the synthesis lane
+            // then imitated the frame and emitted a become tool call as the
+            // public answer), so it ends on a colon that demands continuation.
+            if (is_synthesis) {
+                tool_content = thinking_frame ? "all aspects" : "the root";
+                think_seed   = thinking_frame
+                    ? std::string("Every aspect is thought through and all of it is in front of me. "
+                                  "Now I decide what to do with it — tool call or answer:")
+                    : std::string("I am the root: the nodes are done, so I combine their results into "
+                                  "the final answer without redoing their work. Let me write it out:");
+            } else if (thinking_frame) {
+                // Rendered per lane, after the plan is frozen, so none of this reaches
+                // the planner. "fills in on its own" is load-bearing: lanes that read a
+                // peer's half-written notes as a gap either took that aspect over or
+                // declared everything already handled and re-answered the request.
+                tool_content = "aspect " + tag + of + ": \"" + intent + "\" is yours alone. The "
+                    "other aspects are being written at the same time by copies of you: their "
+                    "notes are theirs, so build on them and never take them over. Their notes "
+                    "appear a little at a time, so anything that looks unfinished there is only "
+                    "unwritten yet and fills in on its own.";
+                think_seed   = "I am aspect " + tag + of + " and only " + tag + ": \"" + intent +
+                    "\". My notes on " + tag + ":";
+            } else {
+                tool_content = id_part + "\"" + intent + "\"";
+                think_seed   = std::string("I am ") + noun + " " + id_part + "\"" + intent +
+                    "\". Only this is mine — I won't redo the others. Let me work through it:";
+            }
         } else {
             call_args = json{
                 { "id",     label  },
@@ -2315,6 +2554,21 @@ private:
         const std::string suffix_text = rerot_detokenize_injection(suffix);
         if (!rerot_frame_has_native_boundaries(suffix_text, think_end, think_start)) {
             return {};
+        }
+        if (!think_seed.empty()) {
+            // The render already emitted the think-start; continue inside it.
+            std::string seed_text;
+            if (!suffix_text.empty() && suffix_text.back() != '\n') {
+                seed_text += '\n';
+            }
+            // No trailing newline: the seed ends mid-sentence on purpose, so
+            // the model continues inline instead of opening a new block.
+            seed_text += think_seed;
+            const llama_tokens seed = rerot_tokenize_injection(seed_text);
+            if (seed.empty()) {
+                return {};
+            }
+            suffix.insert(suffix.end(), seed.begin(), seed.end());
         }
         return suffix;
     }
@@ -2477,12 +2731,14 @@ private:
 
     static void rerot_install_routing_grammar(task_params & params) {
         (void) server_rerot_take_user_grammar(params);
-        // The probe grammar follows the selected planning wire. An unknown
-        // wire is rejected here instead of defaulting to JSON, so the probe
-        // can never sample a document its own parser cannot judge.
+        // Todo sampling is unconstrained: a non-bullet at line start must
+        // remain available to end the probe, not be masked by a grammar.
+        // Unknown wire names are rejected before the probe is injected.
         std::string grammar;
         if (params.rerot_plan_wire == "mindmap") {
             grammar = server_rerot_mindmap_grammar();
+        } else if (params.rerot_plan_wire == "thinking") {
+            grammar = server_rerot_thinking_grammar();
         } else if (params.rerot_plan_wire == "json") {
             grammar = server_rerot_routing_grammar();
         } else {
@@ -2529,6 +2785,111 @@ private:
             return false;
         }
         return true;
+    }
+
+    // One in-voice reminder per worker lane once it has sampled
+    // rerot_lane_wrap_tokens tokens. Parallel thinking only beats the serial
+    // baseline while the aggregate lane tokens stay under (baseline tokens x the
+    // multi-lane decode speedup): measured on this hardware that speedup is 2.95x
+    // at six lanes, and the geography prompt takes the serial path 3085 tokens, so
+    // six lanes have about 9100 aggregate tokens to work with. Without a reminder
+    // lanes ran past 1240 tokens each and the episode never converged.
+    //
+    // The injection replaces the next input, so the lane's own just-sampled token
+    // is prepended to the reminder and nothing is lost.
+    bool rerot_lane_wrap_nudge(server_slot & slot, llama_token id) {
+        if (!slot.task || slot.task->params.rerot_lane_wrap_tokens == 0) {
+            return false;
+        }
+        auto * ep = rerot ? rerot->episode(slot.rerot_episode_id) : nullptr;
+        if (ep == nullptr || ep->probing) {
+            return false;
+        }
+        auto * lane = rerot ? rerot->node(slot.rerot_episode_id, slot.rerot_node_id) : nullptr;
+        const bool is_worker = lane != nullptr && lane->stage_role == llama_rerot_stage_role::worker;
+        const bool is_synth  = lane != nullptr && lane->stage_role == llama_rerot_stage_role::synthesis;
+        if (!is_worker && !is_synth) {
+            return false;
+        }
+        // Synthesis is unbounded too, and it owns the wall clock: with four workers
+        // it had four sets of notes to integrate and was still writing at 1560
+        // tokens in 153 s, pushing the request past every budget while the serial
+        // baseline finished in 134 s. It gets three times a lane's allowance because
+        // it owns the public answer.
+        const uint32_t budget = is_synth
+            ? 3u * slot.task->params.rerot_lane_wrap_tokens
+            : slot.task->params.rerot_lane_wrap_tokens;
+        ++lane->sampled_tokens;
+        if (lane->sampled_tokens < budget) {
+            return false;
+        }
+        // Escalate instead of asking once. The first reminder is a suggestion the
+        // lane can ignore, and an ignored reminder means no seal, which means
+        // synthesis never starts. Re-ask every quarter budget, getting shorter and
+        // more explicit, and stop after six tries so a lane that will not close at
+        // least stops paying for reminders.
+        // Hard stop for workers. Reminders are only a suggestion and a lane can
+        // simply ignore them: measured, two workers reached 3584 tokens each after
+        // 53 reminders apiece and the request blew a 420 s budget. Their notes are
+        // internal, so truncating them costs far less than never converging.
+        // Synthesis is left to the reminders because it owns the public answer and a
+        // hard cut there would truncate what the user sees.
+        if (is_worker && lane->sampled_tokens >= 2u * budget) {
+            SRV_INF("rerot.trace.lane_force_seal: episode=%" PRIu64 " node=%u tokens=%u\n",
+                slot.rerot_episode_id, slot.rerot_node_id, lane->sampled_tokens);
+            if (rerot->seal_dag_node(slot.rerot_episode_id, slot.rerot_node_id,
+                                     llama_rerot_event_origin::worker_source)) {
+                return false;
+            }
+        }
+        const uint32_t step = std::max<uint32_t>(1, budget / 4);
+        const uint32_t due = budget + lane->wrap_nudges * step;
+        // No cap on the number of reminders. Capping at six let a stubborn lane --
+        // in practice the synthesis lane, which owns the public answer -- run free
+        // again once the budget of reminders was spent: that run never published a
+        // final fence and blew a 420 s budget, while an otherwise identical run
+        // whose synthesis closed after fewer reminders finished in 101.5 s. Each
+        // reminder costs about ten tokens every quarter budget, which is the price
+        // of keeping the pressure on.
+        if (lane->sampled_tokens < due) {
+            return false;
+        }
+        static const char * const synth_escalation[6] = {
+            " I have what I need from every aspect; let me finish the answer now without adding new material.",
+            " Time to land this: I finish the remaining part briefly and stop.",
+            " Finishing now, no new sections.",
+            " Last part of the answer:",
+            " Closing the answer here.",
+            " End of answer.",
+        };
+        static const char * const escalation[6] = {
+            " That is enough for this aspect; let me close with my conclusion in one or two sentences.",
+            " I am past my budget: one sentence of conclusion and then I stop.",
+            " Wrapping up now. My conclusion:",
+            " Final sentence for this aspect:",
+            " I stop here. Conclusion:",
+            " Done thinking. Conclusion:",
+        };
+        // The sampled token is carried inside the injection, which lands in the
+        // lane's PRIVATE run: a token swallowed this way never reaches the parsed
+        // public stream. That is invisible for prose, and fatal for the lane's
+        // source-end marker -- swallowing it means the lane never seals and
+        // synthesis waits forever (measured: lane 4 went quiet for six minutes
+        // after its third reminder and the episode had to be cancelled). Any piece
+        // that could be markup is therefore left alone; the next plain token will
+        // carry the reminder instead.
+        std::string text = common_token_to_piece(ctx_tgt, id, true);
+        if (text.find('<') != std::string::npos || text.find('>') != std::string::npos) {
+            return false;
+        }
+        const uint32_t step_idx = std::min<uint32_t>(lane->wrap_nudges, 5u);
+        const char * const tail = is_synth ? synth_escalation[step_idx]
+                                           : escalation[step_idx];
+        ++lane->wrap_nudges;
+        text += tail;
+        SRV_INF("rerot.trace.lane_wrap: episode=%" PRIu64 " node=%u tokens=%u nudge=%u\n",
+            slot.rerot_episode_id, slot.rerot_node_id, lane->sampled_tokens, lane->wrap_nudges);
+        return rerot_set_injection(slot, server_rerot_injection_kind::refresh, text);
     }
 
     bool rerot_set_injection(
@@ -2711,15 +3072,16 @@ private:
         root_lane_task.params.sampling.reasoning_budget_start.clear();
         root_lane_task.params.sampling.reasoning_budget_end.clear();
         root_lane_task.params.sampling.reasoning_budget_tokens = -1;
-        // The probe is a plain reasoning turn: one instruction line followed by
-        // a fenced document. It must NOT see the internal lane-spawn tool
+        // The probe is a plain reasoning turn: one instruction followed by
+        // its selected plan wire. It must NOT see the internal lane-spawn tool
         // schema -- with it in the rendered prefix the model routes into the
         // tool-call channel and invents ids ("A", "A1", "B1") instead of
         // writing the wire. Dropping the request's tools here keeps the probe
         // honest and leaves the worker render below untouched.
         root_lane_task.params.rerot_chat_tools = json::array();
         rerot_install_routing_grammar(root_lane_task.params);
-        if (root_lane_task.params.sampling.grammar.empty()) {
+        if (root_lane_task.params.rerot_plan_wire != "todo" &&
+            root_lane_task.params.sampling.grammar.empty()) {  // only todo samples unconstrained
             return false;
         }
         if (root_lane_task.params.sampling.seed != LLAMA_DEFAULT_SEED &&
@@ -2809,9 +3171,9 @@ private:
             LLAMA_MAX_SEQ > slots.size() ? LLAMA_MAX_SEQ - slots.size() : 1;
         rerot->set_hard_limits(episode_id, {
             episode_token_budget,
-            slot.task->params.rerot_plan_wire == "mindmap"
+            slot.task->params.rerot_plan_wire != "json"
                 ? 0 : std::max<uint64_t>(64, internal_seq_budget * 16),
-            slot.task->params.rerot_plan_wire == "mindmap" ? 0 : internal_seq_budget,
+            slot.task->params.rerot_plan_wire != "json" ? 0 : internal_seq_budget,
             context_limit,
         });
 
@@ -2912,7 +3274,7 @@ private:
         // silently run the other planner and be recorded as a different
         // experiment arm.
         const std::string & plan_wire = slot.task->params.rerot_plan_wire;
-        if (plan_wire != "json" && plan_wire != "mindmap") {
+        if (!rerot_wire_known(plan_wire)) {
             rerot->hard_abort(
                 episode_id,
                 "rerot_protocol_error: unknown rerot plan wire: " + plan_wire);
@@ -2920,12 +3282,13 @@ private:
             return false;
         }
         {
-            std::string probe_prompt(plan_wire == "mindmap"
-                ? std::string(server_rerot_mindmap_probe_prompt())
+            std::string probe_prompt(plan_wire == "todo" ? std::string(server_todo::prompt)
+                : plan_wire == "thinking" ? std::string(server_rerot_thinking_probe_prompt())
+                : plan_wire == "mindmap" ? std::string(server_rerot_mindmap_probe_prompt())
                 : std::string(server_rerot_routing_probe_prompt()));
-            // The instruction ends on a fresh line. Mindmap then injects its
-            // fixed wire prefix through the first child's indentation; its
-            // grammar samples only the remaining subtree and closing fence.
+            // The instruction ends on a fresh line. The selected wire then
+            // injects its fixed prefix through the first item's start. Todo
+            // continues freely; only mindmap constrains a closing fence.
             if (probe_prompt.empty() || probe_prompt.back() != '\n') {
                 rerot->hard_abort(
                     episode_id,
@@ -2935,6 +3298,10 @@ private:
             }
             if (plan_wire == "mindmap") {
                 probe_prompt += server_mindmap::probe_prefix;
+            } else if (plan_wire == "todo") {
+                probe_prompt += server_todo::probe_prefix;
+            } else if (plan_wire == "thinking") {
+                probe_prompt += server_thinking::probe_prefix;
             }
             llama_tokens probe_tokens = rerot_tokenize_injection(probe_prompt);
             if (probe_tokens.empty()) {
@@ -2944,8 +3311,9 @@ private:
                 rerot_propagate_hard_abort();
                 return false;
             }
-            episode->probe_bytes = plan_wire == "mindmap"
-                ? std::string(server_mindmap::probe_prefix) : std::string{};
+            episode->probe_bytes = plan_wire == "todo" ? std::string(server_todo::probe_prefix)
+                : plan_wire == "thinking" ? std::string(server_thinking::probe_prefix)
+                : plan_wire == "mindmap" ? std::string(server_mindmap::probe_prefix) : std::string{};
             if (!rerot_set_injection(
                     slot,
                     server_rerot_injection_kind::probe,
@@ -3177,13 +3545,10 @@ private:
             server_slot & slot,
             uint64_t episode_id,
             const server_rerot_routing_decision & decision) {
-        // MM-R1 shares the whole DAG transition machinery. What changes is the
-        // plan: the strict mindmap parser already produced a frozen TreePlan,
-        // initialize_mindmap maps its LEAVES to workers with zero leaf edges,
-        // and the formal P carries the canonical tree instead of a flat list.
-        // Recording the kind here (not inside the impl) keeps the audit trail
-        // truthful even when a future wire reuses the same transition.
-        slot.rerot_plan_kind = "mindmap";
+        // Both tree and flat-list plans use the no-hard-edge execution path:
+        // every leaf becomes one worker. Preserve the actual wire identity;
+        // formal P is rendered by that wire's formatter.
+        slot.rerot_plan_kind = decision.plan_kind();
         return rerot_enter_dag_impl(slot, episode_id, decision);
     }
 
@@ -3284,7 +3649,7 @@ private:
         // transport at start; drop the flag so only simple can consume it.
         slot.rerot_c0_ready = false;
         std::string err;
-        const bool mindmap = slot.rerot_plan_kind == "mindmap";
+        const bool mindmap = decision.has_tree;
         const bool ok = mindmap
             ? rerot->initialize_mindmap(episode_id, decision, &err)
             : rerot->initialize_dag(episode_id, decision, &err);
@@ -3335,7 +3700,7 @@ private:
         return true;
     }
 
-    bool rerot_try_finish_probe(server_slot & slot) {
+    bool rerot_try_finish_probe(server_slot & slot, bool todo_finished = false) {
         auto * episode = rerot ? rerot->episode(slot.rerot_episode_id) : nullptr;
         if (!episode || !episode->probing || episode->strategy_decided) {
             return true;
@@ -3344,7 +3709,7 @@ private:
         // was armed with; mixing them would judge a Mermaid document as JSON
         // (or vice versa) and fail the request on a legal plan.
         const std::string & plan_wire = slot.task->params.rerot_plan_wire;
-        if (plan_wire != "json" && plan_wire != "mindmap") {
+        if (!rerot_wire_known(plan_wire)) {
             rerot->hard_abort(
                 slot.rerot_episode_id,
                 "rerot_protocol_error: unknown rerot plan wire: " + plan_wire);
@@ -3354,7 +3719,7 @@ private:
         // unknown value must fail closed rather than quietly become S1: the
         // experiment ledger could not otherwise tell which arm ran.
         const std::string & final_mode = slot.task->params.rerot_final_mode;
-        if (plan_wire == "mindmap" && final_mode != "reason" && final_mode != "direct") {
+        if (plan_wire != "json" && final_mode != "reason" && final_mode != "direct") {
             rerot->hard_abort(
                 slot.rerot_episode_id,
                 "rerot_protocol_error: unknown rerot final mode: " + final_mode);
@@ -3363,8 +3728,11 @@ private:
         if (auto * ep_now = rerot->episode(slot.rerot_episode_id)) {
             ep_now->final_mode = final_mode;
         }
-        const auto decision = plan_wire == "mindmap"
-            ? server_rerot_parse_mindmap_decision(episode->probe_bytes)
+        const auto decision = plan_wire == "todo"
+            ? server_rerot_parse_todo_decision(episode->probe_bytes, todo_finished)
+            : plan_wire == "thinking"
+                ? server_rerot_parse_thinking_decision(episode->probe_bytes, todo_finished)
+            : plan_wire == "mindmap" ? server_rerot_parse_mindmap_decision(episode->probe_bytes)
             : server_rerot_parse_routing_decision(episode->probe_bytes);
         if (decision.incomplete) {
             // A truncated document may still have a legal completion. The
@@ -3406,8 +3774,7 @@ private:
             SRV_INF("rerot.trace.probe_plan: episode=%" PRIu64 " tokens=%" PRIu64
                     " strategy=%s text=%s\n",
                 slot.rerot_episode_id, episode->probe_tokens,
-                decision.is_simple() ? "simple"
-                    : (decision.is_mindmap() ? "mindmap" : "dag"),
+                decision.is_simple() ? "simple" : decision.plan_kind(),
                 plan_line.c_str());
         }
         const uint64_t probe_ep_id = slot.rerot_episode_id;
@@ -3416,7 +3783,19 @@ private:
         bool probe_ok = false;
         if (decision.is_simple()) {
             probe_ok = rerot_enter_simple(slot, slot.rerot_episode_id);
-        } else if (decision.is_mindmap()) {
+        } else if (decision.is_flat_list() && decision.tree.leaf_count <= 1) {
+            // One aspect is not a plan. The DAG would still pay the prefix rebuild,
+            // a frame round and a synthesis round for a single lane that can never
+            // overlap with anything: measured on an arithmetic request, 9.67 s wall
+            // versus 5.92 s with RERoT off, with rerot_parallel_model_tokens = 0
+            // (the parallel window only opens at live_lanes > 1). Resume the
+            // ordinary tape instead and keep only the probe's cost. Restricted to
+            // the flat wires: a root-only mindmap is its own documented case and
+            // must not be downgraded here (RERoT.md 22.3).
+            SRV_INF("rerot.trace.single_aspect_exit: episode=%" PRIu64 " leaves=%u\n",
+                slot.rerot_episode_id, decision.tree.leaf_count);
+            probe_ok = rerot_enter_simple(slot, slot.rerot_episode_id);
+        } else if (decision.has_tree) {
             // MM-R1 reuses the DAG execution container with a frozen plan:
             // leaves become workers with NO leaf-to-leaf edge, the tree is
             // preserved on the episode, and the reader order is hierarchical.
@@ -3915,7 +4294,13 @@ private:
                     const bool is_synth = lane->stage_role == llama_rerot_stage_role::synthesis;
                     const std::string label = lane->string_id.empty() ? "0" : lane->string_id;
                     std::string frame_intent = lane->intent;
-                    if (episode->plan_kind == "mindmap") {
+                    // Per-lane frame tag: the frozen tree leaf id, which is the
+                    // 1-based item position on the flat wires. Never 0 (host id 0
+                    // is the synthetic root), so 0 stays reserved for "no tag":
+                    // synthesis and the tree-less JSON-DAG wire.
+                    uint32_t frame_tag = 0;
+                    uint32_t frame_total = 0;
+                    if (episode->mindmap_tree_valid) {
                         const auto & tree = episode->mindmap_tree;
                         const uint32_t tree_node = is_synth ? tree.root : lane->tree_leaf_id;
                         if (!episode->mindmap_tree_valid || tree_node >= tree.nodes.size() ||
@@ -3926,6 +4311,8 @@ private:
                             return false;
                         }
                         frame_intent = tree.nodes[tree_node].label;
+                        frame_tag    = is_synth ? 0u : tree_node;
+                        frame_total  = is_synth ? 0u : tree.leaf_count;
                     }
                     llama_tokens frame_tokens = rerot_native_fixed_entry_tokens(
                         slot,
@@ -3934,7 +4321,9 @@ private:
                         is_synth,
                         is_synth ? rerot_final_mode_for(episode) : std::string_view{},
                         episode->source_end_marker,
-                        episode->think_start_marker);
+                        episode->think_start_marker,
+                        frame_tag,
+                        frame_total);
                     if (frame_tokens.empty()) {
                         rerot->hard_abort(
                             episode_id,
@@ -4217,7 +4606,7 @@ private:
     // shipped S1 shape; "direct" is the S0 research arm. Anything else fails
     // closed: an unknown mode must not silently become S1.
     static std::string_view rerot_final_mode_for(const server_rerot_episode * episode) {
-        if (episode == nullptr || episode->plan_kind != "mindmap") {
+        if (episode == nullptr || !server_rerot_plan_kind_has_tree(episode->plan_kind)) {
             return {};
         }
         if (episode->final_mode == "direct") {
@@ -4348,6 +4737,18 @@ private:
             slot.rerot_inflight_extra_plans.clear();
             slot.rerot_inflight_extra_bytes.clear();
             slot.rerot_inflight_forced = false;
+            if (slot.task->params.rerot_plan_wire == "todo") {
+                const size_t stop = server_todo::stop_offset(episode_now->probe_bytes, previous_bytes);
+                if (stop == std::string_view::npos) {
+                    return true;
+                }
+                // Preserve any completed item before the boundary, even when
+                // one token also contains the terminating line and more text.
+                // Probe KV (including that token) is discarded before formal P;
+                // neither the sentinel nor its suffix can reach a worker.
+                episode_now->probe_bytes.resize(stop);
+                return rerot_try_finish_probe(slot, true);
+            }
             // JSON keeps its short-plan limit; mindmap may keep decomposing
             // until the episode's native context token budget is reached.
             if (slot.task->params.rerot_plan_wire == "json" &&
@@ -4359,6 +4760,13 @@ private:
                         " tokens without a plan terminator",
                         SERVER_REROT_PROBE_MAX_TOKENS));
                 return false;
+            }
+            // The goal list is incomplete until its closing </ul>. Scan only
+            // the new bytes plus the overlap for a tag split across tokens.
+            if (slot.task->params.rerot_plan_wire == "thinking" &&
+                server_thinking::stop_offset(episode_now->probe_bytes, previous_bytes) ==
+                    std::string_view::npos) {
+                return true;
             }
             // A large mindmap is still incomplete until its closing fence.
             // Search only newly appended bytes plus the three-byte overlap for
@@ -4968,12 +5376,21 @@ private:
             if (llama_vocab_is_eog(vocab, id)) {
                 const auto * ep = rerot ? rerot->episode(slot.rerot_episode_id) : nullptr;
                 const bool undecided_probe = ep && ep->probing && !ep->strategy_decided;
+                if (undecided_probe && slot.task->params.rerot_plan_wire == "todo") {
+                    slot.sampled = LLAMA_TOKEN_NULL;
+                    return rerot_try_finish_probe(slot, true);
+                }
                 rerot->hard_abort(
                     slot.rerot_episode_id,
                     undecided_probe
                         ? "rerot_protocol_error: EOG sampled while the routing plan was still undecided"
                         : "rerot_protocol_error: EOG sampled before the current child delimiter closed");
                 return false;
+            }
+            if (rerot_lane_wrap_nudge(slot, id)) {
+                // The reminder carries this token as its first piece.
+                slot.sampled = LLAMA_TOKEN_NULL;
+                return true;
             }
             slot.sampled = id;
             return true;
@@ -5180,6 +5597,11 @@ private:
 
     server_metrics metrics;
     server_rerot_metrics rerot_metrics;
+    // Reserved single-token prefix of the internal handoff tool name, and that
+    // token id (banned from sampling everywhere). Empty/NULL when the vocab has
+    // no suitable marker: then the tool keeps its bare name and is not banned.
+    std::string rerot_tool_marker;
+    llama_token rerot_tool_marker_tok = LLAMA_TOKEN_NULL;
 
     uint64_t tri_drain_count = 0;
     uint64_t tri_maintenance_count = 0;
@@ -5479,6 +5901,9 @@ private:
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
+        if (params_base.rerot_enabled) {
+            rerot_resolve_tool_marker();
+        }
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -10526,6 +10951,8 @@ server_context_meta server_context::get_meta() const {
         /* fim_sep_token          */ llama_vocab_fim_sep(impl->vocab),
 
         /* logit_bias_eog         */ impl->params_base.sampling.logit_bias_eog,
+        /* rerot_tool_marker_tok  */ impl->rerot_tool_marker_tok,
+        /* rerot_internal_tool    */ impl->rerot_internal_tool_json(),
 
         /* model_vocab_type       */ llama_vocab_type(impl->vocab),
         /* model_vocab_n_tokens   */ llama_vocab_n_tokens(impl->vocab),
@@ -10708,6 +11135,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
             server_rerot_apply_request_json(task, data, params);
+            // The internal handoff tool is advertised in every render, so no task
+            // may sample the reserved token its name starts with. Lane clones
+            // inherit this bias through rerot_clone_task. The server writes the
+            // call itself as forced tokens, which never pass a sampler.
+            if (meta->rerot_tool_marker_tok != LLAMA_TOKEN_NULL) {
+                bool banned = false;
+                for (const auto & bias : task.params.sampling.logit_bias) {
+                    banned = banned || bias.token == meta->rerot_tool_marker_tok;
+                }
+                if (!banned) {
+                    task.params.sampling.logit_bias.push_back(
+                        { meta->rerot_tool_marker_tok, -INFINITY });
+                }
+            }
 
             std::string rerot_error;
             if (!server_rerot_validate_task(task, rerot_error)) {
@@ -11490,9 +11931,10 @@ void server_routes::init_routes() {
             { "wire", params.rerot_enabled ? params.rerot_plan_wire : "none" },
             { "final", params.rerot_enabled ? params.rerot_final_mode : "plain" },
             { "order", !params.rerot_enabled ? "plain" :
+                params.rerot_plan_wire == "todo" || params.rerot_plan_wire == "thinking" ? "flat-cyclic" :
                 params.rerot_plan_wire == "mindmap" ? "hierarchical-cyclic-dfs" : "kahn" },
             { "deps", !params.rerot_enabled ? "none" :
-                params.rerot_plan_wire == "mindmap" ? "none" : "model" },
+                params.rerot_plan_wire == "json" ? "model" : "none" },
         };
         props["spec_draft_n_max"] = params.speculative.draft.n_max;
         props["triattention_ratio"] = "3/32";
@@ -11624,6 +12066,26 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+        // Advertise RERoT's internal handoff tool from the first token, exactly as
+        // the frame renders advertise it, so the ordinary prefix stays a valid
+        // prefix of every frame render and no episode pays a prompt re-prefill.
+        // Idempotent: a client that echoes it back does not get a second copy.
+        if (!meta->rerot_internal_tool.is_null()) {
+            json & tools = body["tools"];
+            if (!tools.is_array()) {
+                tools = json::array();
+            }
+            const std::string internal_name =
+                meta->rerot_internal_tool.at("function").at("name").get<std::string>();
+            bool present = false;
+            for (const auto & t : tools) {
+                present = present || (t.contains("function") && t.at("function").contains("name") &&
+                                      t.at("function").at("name") == internal_name);
+            }
+            if (!present) {
+                tools.push_back(meta->rerot_internal_tool);
+            }
+        }
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,

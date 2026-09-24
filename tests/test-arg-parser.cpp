@@ -240,6 +240,22 @@ static void test(void) {
         assert(s0_params.rerot_plan_wire == "mindmap");
         assert(s0_params.rerot_final_mode == "direct");
 
+        common_params todo_params;
+        argv = {"binary_name", "--rerot-plan-wire", "todo"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), todo_params, LLAMA_EXAMPLE_SERVER));
+        assert(todo_params.rerot_enabled);
+        assert(todo_params.kv_unified);
+        assert(todo_params.rerot_plan_wire == "todo");
+
+        common_params goal_params;
+        argv = {"binary_name", "--rerot-plan-wire", "thinking"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), goal_params, LLAMA_EXAMPLE_SERVER));
+        assert(goal_params.rerot_enabled);
+        assert(goal_params.kv_unified);
+        assert(goal_params.rerot_plan_wire == "thinking");
+        // The wire selector alone must not change the final mode.
+        assert(goal_params.rerot_final_mode == "reason");
+
         common_params bad_wire;
         argv = {"binary_name", "--rerot-plan-wire", "yaml"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), bad_wire, LLAMA_EXAMPLE_SERVER));

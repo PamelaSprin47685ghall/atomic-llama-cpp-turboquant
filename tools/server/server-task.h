@@ -122,6 +122,7 @@ struct task_params {
     // other value so a misconfigured request can never silently run DAG and
     // be reported as a mindmap experiment.
     std::string rerot_plan_wire;
+    uint32_t rerot_lane_wrap_tokens = 0;
     // MM-R1 final mode: "reason" (S1) or "direct" (S0). Empty follows the
     // server default; an unknown value fails closed in the probe path.
     std::string rerot_final_mode;

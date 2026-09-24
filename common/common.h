@@ -589,11 +589,12 @@ struct common_params : wanxiangqi_common_params {
     bool rerot_trace = false;
     // Planning wire for the isolated routing probe. `json` is the shipped
     // strategy+payload DAG protocol; `mindmap` selects the MM-R1 research
-    // line (native Mermaid mindmap, no leaf-to-leaf dependencies). Recording
+    // line (native Mermaid mindmap, no leaf-to-leaf dependencies); `todo`
+    // samples a flat parallel list without grammar, stopping at a non-bullet line. Recording
     // the wire keeps the experiment matrix honest: arms must not pretend a
     // different plan kind ran.
     std::string rerot_plan_wire = "json";
-    // MM-R1 final mode for the global entity: "reason" (S1, natural synthesis
+    // Mindmap/todo final mode for the global entity: "reason" (S1, natural synthesis
     // reasoning then content) or "direct" (S0, content immediately). Research arm
     // selector; the shipped default keeps S1.
     std::string rerot_final_mode = "reason";
@@ -609,6 +610,12 @@ struct common_params : wanxiangqi_common_params {
     // no production per-person or total-pen CLI is exposed.
     uint32_t rerot_person_max = 0; // auto-selected B (people / independent brains)
     uint32_t rerot_pen_max    = 0; // auto-selected P (pens / execution states)
+    // Tokens a RERoT lane may sample before it is reminded, once, to close its
+    // notes. Parallel thinking only beats the serial baseline while the aggregate
+    // lane tokens stay under (baseline tokens x multi-lane speedup); measured on
+    // this hardware that speedup is ~2.95x at six lanes, so six lanes of 1500+
+    // tokens each cannot win. 0 disables the reminder.
+    uint32_t rerot_lane_wrap_tokens = 256;
     uint32_t rerot_brain_rows = 0; // derived from B
     uint32_t rerot_hand_rows  = 0; // derived from P
 

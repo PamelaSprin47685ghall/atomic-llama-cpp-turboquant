@@ -1,0 +1,189 @@
+We need answer in Chinese. User asks: 在 llama.cpp 的 tools/server 里新增一个 /healthz 端点：返回每个 slot 的占用状态、KV 用量和当前 wire，用 nlohmann::json 输出，并加一个单元测试。给出实现方案、需要改的文件、测试和风险。
+
+Need provide implementation plan, files to change, tests and risks. We need know llama.cpp tools/server code? Need be accurate. Need maybe mention CMake? Let's reason.
+
+llama.cpp has server tool with slots, KV cache, wires? "当前 wire" likely llama_cpp's server has slots (per-request slots?), and a current wire? In llama.cpp server, there is slot management (slots) with KV cache usage, and "current wire"? Maybe in server it has "slot" and "wire"? Let's recall.
+
+llama.cpp server: tools/server/server.cpp has class Server, methods handle_request, slots (vector<Slot>), slot_kv_cache? There's "current" slot? There is maybe "server::get_current_slot()"? Need recall exact code. It might have nlohmann/json. Need know how to get slot occupancy, KV usage, current wire.
+
+Let's search memory. llama.cpp server has /slots? /slots endpoint returns slots? There is /slot/{id} endpoints. There is "slots" in server: `slots` vector, `slot_kv_cache`? Each slot has `kv_cache`? `kv_cache` per slot? "KV usage" maybe `slot.kv_cache->kv_cache_size()`? Or `kv_cache_size`? There is `slot_kv_cache`? Let's recall from llama.cpp server source.
+
+In llama.cpp, server has:
+- `struct Slot { ... nlohmann::json kv_cache; ... }`?
+- There is `server::get_slots()`? 
+- There is endpoint `/slots` returning JSON of slots? 
+Maybe from PR? The question specifically: "返回每个 slot 的占用状态、KV 用量和当前 wire" in llama.cpp's tools/server. "当前 wire" maybe "current wire" is a server concept? In llama.cpp there is "wire" for server? Let's search memory: There is a "wire" endpoint? In llama.cpp, there is `server::get_current()`? No.
+
+Maybe "wire" refers to `llama_model`? No. "当前 wire" likely translation from Chinese "当前 wire"? In networking, wire? In llama.cpp server, there is "slot" and "wire"? Let's recall code names: `slot_kv_cache`, `kv_cache`, `kv_cache_size`, `kv_cache_used`. In `llama.cpp` server there is `struct Slot { ... bool slot_idle = false; int kv_cache_size = 0; ... };` Wait.
+
+Maybe "wire" is not wire but "wire" as in "当前 wire"? Could be "current wire" = `server.current_wire`? Is there a "wire" object in llama.cpp? There is `llama_chat`? Let's inspect memory.
+
+llama.cpp tools/server: file `server.h`, `server.cpp`. There are classes: `Server`, `Slot`? It has `slot_kv_cache` maybe. Endpoint `/slot/{id}/generate`, `/slot/{id}/generate_stream`, `/slot/{id}/decode`, `/slot/{id}/create`, `/slot/{id}/release`, `/slot/{id}/status`. There is a slot ID and maybe `slot_kv_cache` is a `kv_cache` object? 
+
+The current wire: maybe `slot.wire`? Could be `wire` in llama.cpp is a concept from `llama_kv_cache`? No.
+
+Maybe the user's term "当前 wire" means "current slot's wire" i.e., the request wire? Let's think of llama.cpp's `llama_kv_cache`? No.
+
+Maybe they mean "current wire" as "current slot's request id/wire"? Could be "wire" is the current request wire in the server's slot: each slot has `llama_request`? There is `slot.wire`? Let's search memory of llama.cpp code:
+
+I remember `llama.cpp` server has `Slot` struct:
+```
+struct Slot {
+    int slot_id = -1;
+    int model_id = -1;
+    std::string tag = "";
+    std::string prompt = "";
+    std::string response = "";
+    bool slot_idle = false;
+    int kv_cache_size = 0;
+    int kv_cache_used = 0;
+    ...
+};
+```
+No wire.
+
+Maybe "wire" is an API concept in the server: `/wire`? There is a `llama.cpp` server with "wire" for OpenAI? Wait, there is `wire` in llama.cpp? Could be `llama.cpp` has `llama_kv_cache` and "current wire" maybe from `llama_chat`? Let's search internal memory: I've seen `server::get_current`? No.
+
+Maybe "当前 wire" is "current slot's wire" = `slot.current_wire`? There is `struct wire`? In llama.cpp `tools/server` maybe uses `llama_chat` and `llama_chat_request`? Not.
+
+Let's search memory of llama.cpp source: It has `class server` with methods:
+- `bool handle_request(std::string& uri, std::string& data)`
+- `void handle_slots()`?
+- `void handle_generate()`?
+- `void handle_generate_stream()`?
+- `void handle_decode()`?
+- `void handle_create()`?
+- `void handle_release()`?
+- `void handle_status()`?
+- `void handle_get_slots()`?
+
+There is `slots` vector. There is `server::get_slot(int id)`? It returns pointer. There is `slot_kv_cache`? There is `slot_kv_cache` per slot? In code, there is `slot_kv_cache` maybe in `llama_kv_cache*`? Actually, in llama.cpp, each slot has a `kv_cache` of type `llama_kv_cache*`? Let's recall.
+
+llama.cpp server slot implementation (from memory):
+```
+struct Slot {
+    int slot_id = -1;
+    int model_id = -1;
+    std::string tag = "";
+    std::string prompt = "";
+    std::string response = "";
+    bool slot_idle = false;
+    int kv_cache_size = 0;
+    int kv_cache_used = 0;
+    llama_kv_cache *kv_cache = nullptr;
+    std::vector<llama_request> requests;
+    ...
+};
+```
+Maybe there is `slot_kv_cache`? In newer code, each slot has a `kv_cache` object. There is `server::slot_kv_cache`? Hmm.
+
+Could be "KV 用量" from `slot.kv_cache->kv_cache_size()` and `kv_cache_used()`? Let's search memory: In `llama.cpp` `llama_kv_cache.h` there are functions:
+- `int llama_kv_cache_size(llama_kv_cache* c)`
+- `int llama_kv_cache_used(llama_kv_cache* c)`
+Maybe.
+
+Slot status endpoint returns:
+```
+{
+  "slot": 0,
+  "kv_cache_size": 1048576,
+  "kv_cache_used": 123,
+  "current_wire": ...
+}
+```
+What is current_wire? Maybe in `llama_kv_cache`, there is `kv_cache_current()`? No.
+
+Maybe "当前 wire" = `slot.wire`? Could be "current wire" means "当前请求的 wire" as in `llama_request`? In llama.cpp, `llama_request` has `slot`? Let's recall `llama_request` struct:
+```
+struct llama_request {
+    int slot = -1;
+    int model_id = -1;
+    ...
+};
+```
+There's no wire.
+
+Could "wire" be a mistranslation of "slot"? The user asks "返回每个 slot 的占用状态、KV 用量和当前 wire" maybe they want "current wire" as "current slot" (当前 slot?) Wait Chinese "当前 wire" not "当前 slot". Maybe they mean "current slot"? Could be "当前 wire" means "current wire" as in "当前 wire" (当前线缆? no). In Chinese, "wire" could be a typo for "slot"? No.
+
+Could be from an internal term: "current wire" in server: Each slot has a `wire`? Let's search memory: In `llama.cpp`, there is `llama_kv_cache` with `kv_cache` and maybe `slot.wire`? There is a "wire" in `server` to handle a client request? Could be `slot.wire` is a `std::shared_ptr<...>`? No.
+
+Maybe it's "当前 wire" = "当前 wire" in "llama.cpp's tools/server" = a concept in the server: a "wire" is the connection to a client? There is `llama_cpp`? Hmm.
+
+Maybe user uses "wire" because there is `server::get_current_wire()`? Let's inspect memory of llama.cpp PRs: There was a PR "server: add /healthz endpoint" maybe. It returns slot info and "current wire"? Could be a real PR? Let's search memory.
+
+I recall in llama.cpp server there is `get_current_wire()`? Wait, "wire" could be a mistranslation from "current slot"? There is `server::get_current_slot()`? Maybe `current` means "current slot"? In server, each slot can be "current" if it's the active slot? The endpoint `/healthz` might return slots with `current` boolean. In Chinese, "当前 wire" maybe "当前 slot"? No.
+
+Maybe "wire" = "current slot" (当前 slot) if OCR? Let's consider the exact phrase: "返回每个 slot 的占用状态、KV 用量和当前 wire". They say each slot's occupancy state, KV usage and current wire. Maybe they want to return for each slot: occupied status, KV usage, and "current wire". If they meant current slot, they'd say "当前 slot" not wire. Could be "current wire" is a term they know: server's `current_wire`? Could be "当前 wire" = "current wire" (the wire associated with slot). Need answer accordingly but maybe clarify if uncertain? We can mention if by “当前 wire” you mean server’s current wire (if field exists), use `server->current_wire()`; if not, adapt to `current slot`? But user likely expects concrete.
+
+Need produce implementation plan with files: `tools/server/server.h`, `server.cpp`, maybe `tests/server_test.cpp` or `tests/llama.cpp`? Unit tests in llama.cpp usually in `tests/` directory? There is `tests/llama.cpp`? Let's recall. llama.cpp has `tests/` with `llama.cpp`, `chatgpt.cpp`? It uses GoogleTest. There is `tests/server_test.cpp`? Maybe not. There is `tests/llama.cpp` and `tests/llama_batch.cpp` etc. For server tests maybe `tests/server_test.cpp`? Need propose.
+
+llama.cpp builds tools/server as executable `llama-server`. Unit tests with GoogleTest likely under `tests/` with CMake `add_executable(llama-tests ...)`? There is `tests/llama-tests`? Let's recall: CMakeLists: `add_executable(llama-tests ${LlamaCPP_DIR}/tests/*.cpp ...)`? It compiles tests. There is `tests/server_test.cpp` maybe. We can say add `tests/server_test.cpp`, or if no server tests, create `tests/server_test.cpp` and include in tests glob. If not glob, add to CMake.
+
+Need nlohmann::json output. Need maybe use `server->slots()` or `slots` vector.
+
+Need know slot fields. Let's think of actual current code as of 2026? Current llama.cpp maybe has slots with `slot` struct:
+```
+struct Slot {
+    int slot_id;
+    int model_id;
+    std::string tag;
+    std::string prompt;
+    std::string response;
+    bool slot_idle;
+    int kv_cache_size;
+    int kv_cache_used;
+    ...
+};
+```
+Maybe there is `slot_kv_cache`? Let's search memory from code: In `server.h`:
+```
+struct Slot {
+    int slot_id = -1;
+    int model_id = -1;
+    std::string tag = "";
+    std::string prompt = "";
+    std::string response = "";
+    bool slot_idle = false;
+    int kv_cache_size = 0;
+    int kv_cache_used = 0;
+    ...
+};
+```
+Actually, in server.cpp, when creating slot:
+```
+slots.emplace_back();
+slots.back().slot_id = id;
+slots.back().model_id = model_id;
+slots.back().tag = tag;
+slots.back().kv_cache_size = ctx.kv_cache_size();
+slots.back().kv_cache_used = ctx.kv_cache_used();
+```
+Maybe `ctx` is a per-slot llama_ctx? In newer llama.cpp, server uses `llama_context` per slot. Each slot has a `llama_ctx* ctx`? There is `slot.ctx`? Let's recall: Server maintains multiple slots, each slot has its own llama_context? Or uses one context? In llama.cpp 3.x, there is per-slot context? The endpoint `/slot/{id}/...` maybe uses slot's `ctx`. There is `slot.ctx`? The server has `slots` vector with `llama_ctx* ctx`. KV usage from `llama_ctx_kv_cache_size(slot.ctx)` and `llama_ctx_kv_cache_used(slot.ctx)`. Yes.
+
+The "current wire" maybe `slot.ctx->current()`? Hmm.
+
+What is "wire" in llama.cpp? Maybe "current wire" = `slot.ctx->current()`? Wait, `llama_context` has methods? `llama_context_current`? No.
+
+Maybe in llama.cpp, a "wire" is a type of request in server? Let's search memory: There is `llama_chat`? There is `llama_chat_request`? No.
+
+Maybe the user means "当前 wire" = "current wire" = "current slot"? Could be a typo of "当前 slot"? The Chinese phrase could be "当前 wire" from "current wire"? I need answer robust: define wire as the current request/session wire if present. But maybe there is no field, so propose if codebase lacks `current_wire`, add it or use `current slot id`?
+
+Let's search mental memory of llama.cpp code: There is `llama.cpp` server has `/healthz`? Maybe not. There is "slot" with `current_wire`? I recall reading server code: There is `slot.wire`? In `server.cpp`, there's a function `slot_get_kv_cache`? There is `slot.wire`? Wait, maybe "wire" is a variable in `llama_kv_cache`? No.
+
+Could be from "llama.cpp" tools/server has "wire" as a concept in `llama_request`? Let's inspect memory of `llama_request` struct (from `llama.h`): 
+```
+struct llama_request {
+    int slot = -1;
+    int model_id = -1;
+    ...
+};
+```
+No wire.
+
+Could "wire" be "current wire" = "current wire" of `llama_kv_cache`: `llama_kv_cache_current`? Let's search memory: `llama_kv_cache` has `llama_kv_cache_current`? In KV cache, there is `kv_cache_current`? There are functions: `llama_kv_cache_kv_dims`, `llama_kv_cache_size`, `llama_kv_cache_used`. Maybe `llama_kv_cache_current`? Not.
+
+Could be "wire" is not from llama.cpp but from the user: "当前 wire" might mean "current wire" as in "current slot's wire" maybe a field they want to expose. They may ask to add a /healthz endpoint returning each slot occupancy, KV usage and current wire, using nlohmann/json, unit test. Need propose.
+
+We can frame: In current llama.cpp server, slot object likely stores `slot_idle` and KV usage; current wire may be a per-slot `wire`/`current_wire` field if present; if not, use the active request/ctx or add a field. To avoid inaccurate API, say: if your branch already has `Slot::current_wire`, use it; otherwise expose `current wire` as the active request id / `slot->ctx->current_request()`? Need be more concrete.
+
+Maybe we can say: "这里我把 current wire 理解成 slot 当前正在服务的 wire（即当前请求/会话的 wire，代码里对应 `slot.wire` / `server.current_wire(slot)`；如果你们代码里叫法不同，把字段

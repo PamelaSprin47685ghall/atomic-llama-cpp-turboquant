@@ -1,0 +1,78 @@
+{
+  "baseline": "9290e7a1a",
+  "current": "43b290eff",
+  "ordinary": {
+    "complete": true,
+    "reasoningEqual": true,
+    "answerEqual": true
+  },
+  "closure": {
+    "vocabCases": 8,
+    "vocabFailures": 0,
+    "sampledSteps": 512,
+    "legalFenceStates": 121,
+    "rawBestFenceAttempts": 0,
+    "minLegalFenceLogitGap": 5.1413726806640625
+  },
+  "historicalVulkan": {
+    "checkpoints": 149,
+    "logits": 36999680,
+    "maxAbs": 0
+  },
+  "currentCpuVsVulkan": {
+    "checkpoints": 149,
+    "maxAbs": 0.39633457362651825,
+    "rms": 0.03267590709224072,
+    "cosine": 0.9999149327010487,
+    "argmaxEqual": 148
+  },
+  "historicalCpu": {
+    "a": "/tmp/baseline-cpu-serial",
+    "b": "/tmp/current-cpu",
+    "checkpoints": 149,
+    "logits": 36999680,
+    "maxAbs": 0,
+    "rms": 0,
+    "cosine": 1,
+    "nonzero": 0,
+    "argmaxMatching": 149,
+    "mismatches": []
+  },
+  "historicalCpuVsVulkan": {
+    "a": "/tmp/baseline-cpu-serial",
+    "b": "/tmp/baseline-vulkan",
+    "checkpoints": 149,
+    "logits": 36999680,
+    "maxAbs": 0.39633457362651825,
+    "rms": 0.03267590709224072,
+    "cosine": 0.9999149327010487,
+    "nonzero": 36999595,
+    "argmaxMatching": 148,
+    "mismatches": [
+      {
+        "position": 147,
+        "topA": 110920,
+        "topB": 98653,
+        "marginA": 0.05057716369628906,
+        "marginB": 0.03283977508544922,
+        "maxAbs": 0.17595577239990234,
+        "rms": 0.030863430167052272
+      }
+    ]
+  },
+  "numericalProtocol": {
+    "promptTokens": 58,
+    "forcedContinuationTokens": 1383,
+    "contextCapacity": 8192,
+    "checkpoints": "Prompt end; first 128 continuation tokens decoded singly; thereafter every 64-token batch end, including final partial batch",
+    "rerot": false,
+    "kCache": "q8_0",
+    "vCache": "turbo4",
+    "cpu": "All layers CPU, offload_kqv=false, op_offload=false, 6 threads"
+  },
+  "limitations": [
+    "One geography trajectory; not general correctness proof",
+    "Closing-fence runtime audit used a standalone ordinary context with probe prefix and both constraints, 512 generated steps; not the full original looping server trace",
+    "No confirmed production defect or source fix"
+  ]
+}

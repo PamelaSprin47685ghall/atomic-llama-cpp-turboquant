@@ -981,6 +981,23 @@ std::string server_rerot_format_plan_prefix(
         prefix += server_mindmap::serialize(decision.tree);
         return prefix;
     }
+    if (decision.is_todo() || decision.is_thinking()) {
+        // Flat formal P: instruction + canonical list. Every worker reads the
+        // whole plan, so the render must be the canonical one, not the raw wire.
+        std::vector<std::string> items;
+        items.reserve(decision.tree.nodes.size() > 1 ? decision.tree.nodes.size() - 1 : 0);
+        for (size_t i = 1; i < decision.tree.nodes.size(); ++i) {
+            items.push_back(decision.tree.nodes[i].label);
+        }
+        if (decision.is_thinking()) {
+            std::string prefix(server_rerot_thinking_probe_prompt());
+            prefix += server_thinking::serialize(items);
+            return prefix;
+        }
+        std::string prefix(server_todo::prompt);
+        prefix += server_todo::serialize(items);
+        return prefix;
+    }
     if (!decision.is_dag() || decision.questions.empty()) {
         return {};
     }
@@ -1079,11 +1096,31 @@ std::string server_rerot_routing_grammar() {
 }
 
 std::string_view server_rerot_mindmap_probe_prompt() {
-    return "Let me lay out a mind map.\n";
+    // Every node of this tree is executed by a separate parallel worker whose
+    // frame carries the raw label and nothing else (no ancestor path), so the
+    // instruction has to buy four things per token it spends: parts that stand
+    // alone, labels that are concrete enough to act on out of context (a bare
+    // "country2b" stalls its worker), no duplicates (the old "mind map" wording
+    // produced the same leaf twice), and nesting only as refinement. Kept
+    // domain-free: the same sentence serves agent coding, analysis and QA.
+    // Wording note: do NOT mention indentation or root here. Tested variant
+    // "one per line at the same indent under root ... indent deeper only to
+    // split a part" pushed the model into outline formatting (304-token plan of
+    // "1" / "1.1" / "1.1.1" nodes). Naming the task is what shapes the tree.
+    return "Let me split the work into parallel parts, one per line, each a concrete task "
+           "that makes sense on its own: no overlap, no repeats; nest only to break one down.\n";
 }
 
 std::string server_rerot_mindmap_grammar() {
     return server_mindmap::grammar_g0();
+}
+
+std::string_view server_rerot_thinking_probe_prompt() {
+    return server_thinking::prompt;
+}
+
+std::string server_rerot_thinking_grammar() {
+    return server_thinking::grammar();
 }
 
 std::string server_rerot_source_end_grammar(std::string_view close_marker) {
@@ -1278,6 +1315,99 @@ server_rerot_routing_decision server_rerot_parse_routing_decision(const std::str
     }
 
     result.error = "unknown strategy: " + strategy;
+    return result;
+}
+
+// Both flat wires (todo bullets, thinking questions) execute the same way: one
+// synthetic root at depth 1 plus every item as a depth-2 leaf, i.e. all workers
+// are peers with no inter-worker dependency. Shared here so the two lexers
+// cannot drift apart in hashing, ranks or leaf accounting.
+static server_mindmap::plan flat_tree_from_items(const std::vector<std::string> & items) {
+    server_mindmap::plan tree;
+    const uint32_t num_items = static_cast<uint32_t>(items.size());
+    tree.nodes.resize(num_items + 1);
+    tree.children.resize(num_items + 1);
+    tree.root = 0;
+
+    // Root node: host_node_id 0, parent UINT32_MAX, depth 1, label "root"
+    tree.nodes[0].host_node_id = 0;
+    tree.nodes[0].parent = UINT32_MAX;
+    tree.nodes[0].depth = 1;
+    tree.nodes[0].label = "root";
+    tree.nodes[0].subtree_eleaves = num_items;
+    tree.nodes[0].preorder_rank = 0;
+
+    // Children (items): host_node_id 1..num_items, parent 0, depth 2, leaves
+    tree.children[0].reserve(num_items);
+    for (uint32_t i = 0; i < num_items; ++i) {
+        const uint32_t child_id = i + 1;
+        tree.children[0].push_back(child_id);
+
+        tree.nodes[child_id].host_node_id = child_id;
+        tree.nodes[child_id].parent = 0;
+        tree.nodes[child_id].depth = 2;
+        tree.nodes[child_id].label = items[i];
+        tree.nodes[child_id].subtree_eleaves = 1;
+        tree.nodes[child_id].preorder_rank = child_id;
+    }
+
+    tree.node_count = num_items;
+    tree.leaf_count = num_items;
+    tree.depth = 2;
+    tree.tree_hash = server_mindmap::hash_tree(tree);
+    return tree;
+}
+
+server_rerot_routing_decision server_rerot_parse_todo_decision(const std::string & wire, bool eof) {
+    server_rerot_routing_decision result;
+    const auto parsed = server_todo::parse(wire, eof);
+
+    // Strict check: parsed.error takes precedence so empty/whitespace-only items hard-fail fail-closed.
+    if (!parsed.error.empty()) {
+        result.error = parsed.error;
+        return result;
+    }
+    if (!parsed.complete) {
+        result.incomplete = true;
+        result.error = "incomplete todo list";
+        return result;
+    }
+    if (parsed.items.empty()) {
+        result.error = "todo list has no items";
+        return result;
+    }
+
+    result.strategy = server_rerot_routing_decision::strategy_type::todo;
+    result.tree = flat_tree_from_items(parsed.items);
+    result.has_tree = true;
+    return result;
+}
+
+// Thinking wire: `<ul class="thinking">` of `<li class="question">` items, closed by
+// `</ul>`. Same flat execution shape as todo; the difference is that the wire is
+// GBNF-constrained and its terminator is an explicit tag rather than a
+// line-shape heuristic, so a long question can never end the plan by accident.
+server_rerot_routing_decision server_rerot_parse_thinking_decision(const std::string & wire, bool eof) {
+    server_rerot_routing_decision result;
+    const auto parsed = server_thinking::parse(wire, eof);
+
+    if (!parsed.error.empty()) {
+        result.error = parsed.error;
+        return result;
+    }
+    if (!parsed.complete) {
+        result.incomplete = true;
+        result.error = "incomplete question list";
+        return result;
+    }
+    if (parsed.items.empty()) {
+        result.error = "question list has no questions";
+        return result;
+    }
+
+    result.strategy = server_rerot_routing_decision::strategy_type::thinking;
+    result.tree = flat_tree_from_items(parsed.items);
+    result.has_tree = true;
     return result;
 }
 
@@ -2309,7 +2439,7 @@ bool server_rerot_runtime::build_reader_view_desc(
     // MM-R1 orders readers by the hierarchical cyclic DFS (the frozen tree),
     // not by the DAG's cycle-preferred topological sort: the plan kind decides
     // the provider, and `is_dag` alone would silently fall back to Kahn.
-    const auto view = episode.plan_kind == "mindmap"
+    const auto view = server_rerot_plan_kind_has_tree(episode.plan_kind)
         ? episode.document.build_view(node.id)
         : (episode.is_dag
             ? build_dag_view_for_reader(episode.id, node.id)
@@ -2917,14 +3047,14 @@ bool server_rerot_runtime::initialize_plan_impl(
             return false;
         }
     } else {
-        // MM-R1: a strict mindmap plan is mandatory, never optional.
-        if (!decision.has_tree || !decision.is_mindmap()) {
-            if (error_out) *error_out = "invalid mindmap decision: " + decision.error;
+        // Tree plan (mindmap, todo or goal): a strict tree plan is mandatory, never optional.
+        if (!decision.has_tree || (!decision.is_mindmap() && !decision.is_flat_list())) {
+            if (error_out) *error_out = "invalid tree decision: " + decision.error;
             return false;
         }
         if (decision.tree.nodes.empty() || decision.tree.root == UINT32_MAX ||
             decision.tree.root >= decision.tree.nodes.size()) {
-            if (error_out) *error_out = "mindmap plan has no root";
+            if (error_out) *error_out = "tree plan has no root";
             return false;
         }
     }
@@ -2951,7 +3081,7 @@ bool server_rerot_runtime::initialize_plan_impl(
 
     ep->is_dag = true;
     ep->strategy_decided = true;
-    ep->plan_kind = model_declared_dependencies ? "dag" : "mindmap";
+    ep->plan_kind = model_declared_dependencies ? "dag" : decision.plan_kind();
     if (!model_declared_dependencies) {
         ep->mindmap_tree = decision.tree;
         ep->mindmap_tree_valid = true;
@@ -3003,7 +3133,7 @@ bool server_rerot_runtime::initialize_plan_impl(
     if (workers.empty()) {
         if (error_out) *error_out = model_declared_dependencies
             ? "DAG decision has no question"
-            : "mindmap plan has no leaf";
+            : "tree plan has no leaf";
         return false;
     }
 
@@ -3065,7 +3195,7 @@ bool server_rerot_runtime::initialize_plan_impl(
     // string a reader would recognise as the old protocol.
     auto synth = ep->document.create_child(
         ep->document.root(),
-        model_declared_dependencies ? "0.synthesize" : "global root",
+        model_declared_dependencies ? "0.synthesize" : (decision.is_flat_list() ? "root" : "global root"),
         llama_rerot_node_state::queued);
     ep->document.set_plan_rank(synth, static_cast<uint32_t>(workers.size()));
     ep->document.set_stage_role(synth, llama_rerot_stage_role::synthesis);
@@ -3077,7 +3207,11 @@ bool server_rerot_runtime::initialize_plan_impl(
     synth_nr.string_id = "0";
     synth_nr.intent = model_declared_dependencies
         ? "0.synthesize"
-        : "Integrate every mindmap node's committed result into one final answer";
+        : (decision.is_thinking()
+            ? "Use every question's committed thinking to decide and answer"
+            : decision.is_todo()
+                ? "Integrate every todo item's committed result into one final answer"
+                : "Integrate every mindmap node's committed result into one final answer");
     synth_nr.planner_armed = false;
     synth_nr.stage_role = llama_rerot_stage_role::synthesis;
     if (!ep->source_end_marker.empty()) {
@@ -4850,7 +4984,7 @@ bool server_rerot_runtime::refresh_final_fence(
     // does NOT decode/re-evaluate the closing sequence; neither does the core
     // refresh barrier (synchronize only). Full §21.4 close replay still needs
     // a causal checkpoint and must not double-apply recurrent transitions.
-    const auto view = current->plan_kind == "mindmap"
+    const auto view = server_rerot_plan_kind_has_tree(current->plan_kind)
         ? current->document.build_view(node_id)
         : (current->is_dag
             ? build_dag_view_for_reader(current->id, node_id)
@@ -5420,7 +5554,7 @@ std::vector<uint8_t> server_rerot_episode_save(
     // The frozen TreePlan, only present for a mindmap episode. Writing an empty
     // plan for any other kind keeps a legacy-shaped blob byte-compatible in the
     // fields AFTER this point.
-    const bool has_tree = episode.plan_kind == "mindmap" && episode.mindmap_tree_valid;
+    const bool has_tree = server_rerot_plan_kind_has_tree(episode.plan_kind) && episode.mindmap_tree_valid;
     w.u8(has_tree ? 1 : 0);
     if (has_tree) {
         const server_mindmap::plan & tree = episode.mindmap_tree;
@@ -6272,28 +6406,54 @@ bool server_rerot_episode_load(
     // from silently becoming a DAG on reload.
     rebuilt.plan_kind = std::move(plan_kind);
     rebuilt.final_mode = std::move(final_mode);
-    if (rebuilt.plan_kind == "mindmap") {
+    if (server_rerot_plan_kind_has_tree(rebuilt.plan_kind)) {
         if (!has_tree) {
-            return rerot_state_set_error(error_out, "RERoT episode load refused: mindmap plan without its tree");
+            return rerot_state_set_error(error_out, "RERoT episode load refused: tree plan without its tree");
         }
         rebuilt.mindmap_tree = std::move(tree);
         rebuilt.mindmap_tree_valid = true;
-        // The frozen tree is re-validated on load: a corrupt archive must not
-        // become a plan the runtime trusts.
-        const std::string canonical = server_mindmap::serialize(rebuilt.mindmap_tree);
-        if (canonical.empty() || server_mindmap::parse(canonical).tree.tree_hash !=
-                                    rebuilt.mindmap_tree.tree_hash) {
-            return rerot_state_set_error(error_out, "RERoT episode load refused: mindmap tree failed round-trip validation");
+        if (rebuilt.plan_kind == "mindmap") {
+            // The frozen tree is re-validated on load: a corrupt archive must not
+            // become a plan the runtime trusts.
+            const std::string canonical = server_mindmap::serialize(rebuilt.mindmap_tree);
+            if (canonical.empty() || server_mindmap::parse(canonical).tree.tree_hash !=
+                                        rebuilt.mindmap_tree.tree_hash) {
+                return rerot_state_set_error(error_out, "RERoT episode load refused: mindmap tree failed round-trip validation");
+            }
+        } else {
+            // Todo plan validation: accept free labels and enforce flat root+leaves and stable hash.
+            const auto & t = rebuilt.mindmap_tree;
+            if (t.nodes.empty() || t.root != 0 || t.depth != 2 || t.nodes[0].depth != 1 ||
+                t.leaf_count == 0 || t.node_count != t.leaf_count || t.nodes.size() != t.children.size() ||
+                t.nodes.size() != t.leaf_count + 1) {
+                return rerot_state_set_error(error_out, "RERoT episode load refused: todo tree structure invalid");
+            }
+            for (size_t i = 1; i < t.nodes.size(); ++i) {
+                if (t.nodes[i].parent != 0 || t.nodes[i].depth != 2 || t.nodes[i].label.empty()) {
+                    return rerot_state_set_error(error_out, "RERoT episode load refused: todo leaf node invalid");
+                }
+            }
+            if (t.children[0].size() != t.leaf_count) {
+                return rerot_state_set_error(error_out, "RERoT episode load refused: todo root children count mismatch");
+            }
+            for (size_t i = 1; i < t.children.size(); ++i) {
+                if (!t.children[i].empty()) {
+                    return rerot_state_set_error(error_out, "RERoT episode load refused: todo leaf has children");
+                }
+            }
+            if (server_mindmap::hash_tree(t) != t.tree_hash) {
+                return rerot_state_set_error(error_out, "RERoT episode load refused: todo tree failed hash validation");
+            }
         }
     } else if (has_tree) {
-        return rerot_state_set_error(error_out, "RERoT episode load refused: non-mindmap episode carried a tree");
+        return rerot_state_set_error(error_out, "RERoT episode load refused: non-tree episode carried a tree");
     }
     if (rebuilt.plan_kind.empty() && is_dag) {
         // A DAG episode written in the current format carries "dag".
         rebuilt.plan_kind = "dag";
     }
     if (!rebuilt.plan_kind.empty() &&
-        rebuilt.plan_kind != "dag" && rebuilt.plan_kind != "mindmap") {
+        rebuilt.plan_kind != "dag" && !server_rerot_plan_kind_has_tree(rebuilt.plan_kind)) {
         return rerot_state_set_error(error_out, "RERoT episode load refused: unknown plan kind");
     }
     // Order caches keyed on a smaller version are stale by construction.

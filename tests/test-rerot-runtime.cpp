@@ -3920,6 +3920,114 @@ static void test_mindmap_episode_persistence_round_trip() {
     }
 }
 
+static void test_todo_runtime_lifecycle_and_persistence() {
+    // RERoT todo acceptance:
+    // 1. Unconstrained items parsed to flat TreePlan (root depth 1, leaves depth 2).
+    // 2. All items map to independent peer workers (no worker-to-worker edges, all ready at once).
+    // 3. Plan identity preserved as "todo".
+    // 4. Persistence round-trips with arbitrary punctuation in labels and stable hash.
+    // 5. Formal P prefix only contains accepted items and prompt, excluding non-dash terminator text.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(8);
+    const uint64_t ep_id = runtime.adopt_root(81, 81, 0, 1, 0);
+    CHECK(ep_id != 0);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+
+    const std::string todo_wire =
+        "- Step 1: Initialize tensors & verify shapes!\n"
+        "- Step 2: Compute intermediate products (A * B + C).\n"
+        "- Step 3: Run sanity-check on outputs: [min, max] in range.\n"
+        "Note: The above list is sufficient for our parallel workers.\n";
+
+    const auto decision = server_rerot_parse_todo_decision(todo_wire, true);
+    CHECK(decision.is_todo());
+    CHECK(decision.has_tree);
+    CHECK(decision.error.empty());
+    CHECK(!decision.incomplete);
+    CHECK(decision.tree.nodes.size() == 4); // root + 3 leaves
+    CHECK(decision.tree.leaf_count == 3);
+    CHECK(decision.tree.node_count == 3);
+    CHECK(decision.tree.root == 0);
+    CHECK(decision.tree.depth == 2);
+    CHECK(decision.tree.nodes[0].depth == 1);
+    CHECK(decision.tree.nodes[1].depth == 2);
+    CHECK(decision.tree.nodes[2].depth == 2);
+    CHECK(decision.tree.nodes[3].depth == 2);
+    CHECK(decision.dependencies.empty());
+    CHECK(decision.questions.empty());
+    CHECK(decision.plan_kind() == std::string("todo"));
+
+    // Formal P formatting: prompt + canonical bullet items only, discarded note excluded.
+    const std::string formal_p = server_rerot_format_plan_prefix(decision, "<think>");
+    CHECK(formal_p.find(server_todo::prompt) == 0);
+    CHECK(formal_p.find("- Step 1: Initialize tensors & verify shapes!\n") != std::string::npos);
+    CHECK(formal_p.find("- Step 2: Compute intermediate products (A * B + C).\n") != std::string::npos);
+    CHECK(formal_p.find("- Step 3: Run sanity-check on outputs: [min, max] in range.\n") != std::string::npos);
+    CHECK(formal_p.find("Note:") == std::string::npos);
+
+    std::string err;
+    CHECK(runtime.initialize_mindmap(ep_id, decision, &err));
+
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->is_dag);
+    CHECK(ep->plan_kind == "todo");
+    CHECK(ep->mindmap_tree_valid);
+    CHECK(ep->synthesis_node != 0);
+    CHECK(ep->nodes.size() == 5); // 0.planner + 3 workers + 1 synthesis
+
+    // Independent peer workers: all 3 workers ready immediately, zero worker-to-worker edges.
+    size_t n_workers_ready = 0;
+    bool synth_ready = false;
+    for (const auto nid : runtime.get_eligible_dag_nodes(ep_id)) {
+        if (nid == (llama_rerot_node_id) ep->synthesis_node) {
+            synth_ready = true;
+        } else {
+            ++n_workers_ready;
+        }
+    }
+    CHECK(n_workers_ready == 3);
+    CHECK(!synth_ready);
+
+    for (size_t i = 1; i <= 3; ++i) {
+        const auto * doc_n = ep->document.node((llama_rerot_node_id) i);
+        CHECK(doc_n != nullptr);
+        if (doc_n) {
+            CHECK(doc_n->predecessors.size() == 1);
+            CHECK(doc_n->predecessors[0] == 0); // only root predecessor
+            CHECK(doc_n->successors.size() == 1);
+            CHECK(doc_n->successors[0] == ep->synthesis_node); // only synthesis successor
+        }
+    }
+
+    // Persistence round-trip: save and reload preserving plan_kind == "todo", flat tree, free labels.
+    server_rerot_state_fingerprints fp;
+    fp.caps = LLAMA_REROT_STATE_CAP_REROT | LLAMA_REROT_STATE_CAP_REROT_TREE | LLAMA_REROT_STATE_CAP_REROT_PRIVATE;
+    CHECK(runtime.demote_episode(ep_id));
+    std::vector<uint8_t> blob;
+    CHECK(runtime.save_episode(ep_id, fp, &blob, &err));
+    CHECK(!blob.empty());
+
+    server_rerot_runtime restored(nullptr);
+    uint64_t restored_id = 0;
+    CHECK(restored.load_episode(blob.data(), blob.size(), fp, &restored_id, &err));
+    CHECK(restored_id == ep_id);
+    const auto * rep = restored.episode(restored_id);
+    CHECK(rep != nullptr);
+    if (rep != nullptr) {
+        CHECK(rep->plan_kind == "todo");
+        CHECK(rep->mindmap_tree_valid);
+        CHECK(rep->mindmap_tree.node_count == 3);
+        CHECK(rep->mindmap_tree.leaf_count == 3);
+        CHECK(rep->mindmap_tree.root == 0);
+        CHECK(rep->mindmap_tree.depth == 2);
+        CHECK(rep->mindmap_tree.nodes[1].label == "Step 1: Initialize tensors & verify shapes!");
+        CHECK(rep->mindmap_tree.nodes[2].label == "Step 2: Compute intermediate products (A * B + C).");
+        CHECK(rep->mindmap_tree.nodes[3].label == "Step 3: Run sanity-check on outputs: [min, max] in range.");
+    }
+}
+
 static void test_c0_and_dag_admit_without_parked_seq() {
     // DAG workers start from C_base with parked_seq < 0. Admission must not
     // demand an HTML-fork parked sequence, and C0 remains valid with empty
@@ -7612,6 +7720,7 @@ static void test_dag_tri_mtp_ram_shift_speculative_matrix() {
 
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
+    test_todo_runtime_lifecycle_and_persistence();
     test_mindmap_episode_persistence_round_trip();
     test_mindmap_final_mode_contract();
     test_mindmap_s1_global_closure_end_to_end();

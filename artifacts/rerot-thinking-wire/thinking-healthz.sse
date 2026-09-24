@@ -1,0 +1,216 @@
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1790300500,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":" what should the JSON look like?\n"}}],"created":1790300500,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"Risks of adding a /healthz endpoint in llama-server:\n"}}],"created":1790300501,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"In llama.cpp's tools/server, a \"slot\" is server_state::slot (server_state.h) which contains:\n"}}],"created":1790300503,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- int64_t id\n"}}],"created":1790300503,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"The user wants: \"Return the occupancy status of each slot, KV usage, and current wire, and output in nlohmann::json.\"\n"}}],"created":1790300504,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"So the JSON shape:\n"}}],"created":1790300505,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- uint32_t context_id (context id)\n"}}],"created":1790300505,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```json\n"}}],"created":1790300505,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"{\n"}}],"created":1790300505,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"The user asked for \"implementation plan, files to change, tests and risks\" (给出实现方案、需要改的文件、测试和风险). They explicitly asked for an implementation approach. For an engineering task like adding an endpoint, a good answer would include:\n"}}],"created":1790300506,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- int64_t t_start_time\n"}}],"created":1790300506,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- JSON shape\n"}}],"created":1790300506,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"  \"status\": \"ok\",\n"}}],"created":1790300506,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- Files to modify\n"}}],"created":1790300507,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"  \"slots\": {\n"}}],"created":1790300507,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- std::vector<std::string> prompt (prompt tokens)\n"}}],"created":1790300508,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    \"1\": {\n"}}],"created":1790300508,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"      \"id\": 1,\n"}}],"created":1790300509,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- int64_t n_prompt, n_ctx, etc.\n"}}],"created":1790300509,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"      \"active\": true,\n"}}],"created":1790300510,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- Sketch of the implementation (code snippets at key points — handler, route registration, slot fields, KV stats)\n"}}],"created":1790300510,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- int64_t n_len\n"}}],"created":1790300510,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- Test design\n"}}],"created":1790300510,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"      \"context_id\": \"...\",\n"}}],"created":1790300511,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- ll\n"}}],"created":1790300511,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- Risks\n"}}],"created":1790300511,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"      \"n_ctx\": 4096,\n"}}],"created":1790300512,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"1. **Concurrency / data races**: The slot map is owned by the server and mutated by request handlers (slot acquire/release). If /healthz reads `slot` while another thread is acquiring/releasing, that's a data race. Mitigation: take a lock (server has a mutex; e.g. `srv.mutex`), or make the read non-invasive. The server already holds a mutex for slot management. Healthz should lock it too.\n"}}],"created":1790300513,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"      \"n_tokens\": 512,\n"}}],"created":1790300514,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"The slot fields are: id, n_ctx, n_len, n_prompt, n_output, etc. Let me recall the actual struct.\n"}}],"created":1790300514,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"      \"n_prompt_tokens\": 16,\n"}}],"created":1790300515,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"Including a small amount of code snippets is appropriate — it's the \"implementation approach.\" But not a full file rewrite. Keep the snippets focused: route registration line, handler skeleton, test skeleton.\n"}}],"created":1790300516,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"      \"n_output_tokens\": 496,\n"}}],"created":1790300517,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"From llama.cpp's server_state.h (llama_server.h in older versions):\n"}}],"created":1790300517,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```cpp\n"}}],"created":1790300517,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"      \"kv\": {\n"}}],"created":1790300517,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"struct slot {\n"}}],"created":1790300517,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"The answer should be in Chinese (the user asked in Chinese).\n"}}],"created":1790300518,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"In llama.cpp, tests live in tools/server/tests (there's a CMakeLists adding tests like test_server.cpp). Actually there's a tests/ directory and tools/server/tests? Let me recall: llama.cpp has `tests/` at top level with unit tests (test_llama.cpp etc.) and `tools/server/` has the server. There's a `tools/server/tests/` subdirectory? I recall `tools/server/tests/test_server.cpp`? Not 100% sure. In recent llama.cpp, the server is in tools/server, and there's CMakeLists.txt with add_executable(llama-server ...) and there's `tests` added via `if (LLAMA_BUILD_TESTS)`. Hmm.\n"}}],"created":1790300519,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int64_t id;\n"}}],"created":1790300520,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":" in llama.cpp tools/server, the main server loop is in server.cpp. Endpoint registration goes through the routing in main.cpp (llama-server's main.cpp) — in recent versions there's a routing table `const std::vector<route> routes = { ... }` inside main.cpp, mapping path patterns to handlers like `/v1/completion`, `/generate`, etc. Handlers are in `llama-server.cpp` (functions like `llama_server::get_completion`). So /healthz would be a new handler `llama_server::healthz` (or similar) that takes a `llama_context*` (actually `llama_state`/`llama_context` pointer and possibly the server state). Let me recall the handler signatures:\n"}}],"created":1790300520,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"        \"used\": 0.83,\n"}}],"created":1790300520,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```cpp\n"}}],"created":1790300520,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"When phrasing the implementation, I should:\n"}}],"created":1790300521,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"        \"total\": 1.0,\n"}}],"created":1790300522,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    uint32_t context_id; // old context id\n"}}],"created":1790300522,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"llama_server::llama_server_handler(\n"}}],"created":1790300522,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"        ...\n"}}],"created":1790300522,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"      },\n"}}],"created":1790300522,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int id,\n"}}],"created":1790300522,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    std::string prompt;\n"}}],"created":1790300523,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"      \"prompt_len\": 16\n"}}],"created":1790300524,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"Actually, the standard approach: The CMake project has `LLAMA_BUILD_TESTS` option. In `tools/server/CMakeLists.txt`, there's:\n"}}],"created":1790300524,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    },\n"}}],"created":1790300524,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int64_t t_start_time;\n"}}],"created":1790300524,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```\n"}}],"created":1790300524,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    const std::vector<llama_token> &prompt\n"}}],"created":1790300524,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    ...\n"}}],"created":1790300524,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":");\n"}}],"created":1790300524,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```\n"}}],"created":1790300525,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"  }\n"}}],"created":1790300525,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- Give a conceptual design that maps to the existing architecture (server.cpp, server_state.h, routing in main.cpp)\n"}}],"created":1790300525,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"if(LLAMA_BUILD_TESTS)\n"}}],"created":1790300525,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"}\n"}}],"created":1790300525,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int64_t n_ctx;\n"}}],"created":1790300525,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```\n"}}],"created":1790300525,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"  add_executable(...)\n"}}],"created":1790300526,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"endif\n"}}],"created":1790300526,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```\n"}}],"created":1790300526,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int64_t n_len;\n"}}],"created":1790300526,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int64_t n_prompt;\n"}}],"created":1790300528,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- Use placeholders like \"the current server routing table\" and \"the current slot struct fields\" so the user can adapt\n"}}],"created":1790300528,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int64_t n_output;\n"}}],"created":1790300529,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int64_t n_generated;\n"}}],"created":1790300530,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"No, in recent versions, handlers take a `llama_context*`? Let me recall: In `llama-server.h` (or `server_state.h`), the handler functions have the form:\n"}}],"created":1790300531,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```cpp\n"}}],"created":1790300531,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"What does \"KV usage\" mean? KV cache usage. In slot, there's a concept of \"kv_usage\" or something? Let me think. In llama.cpp's server, the slot has:\n"}}],"created":1790300531,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int64_t n_past;\n"}}],"created":1790300532,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- `n_ctx`\n"}}],"created":1790300532,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- Show a minimal code skeleton that's language-idiomatic for llama.cpp (C++17, nlohmann/json)\n"}}],"created":1790300532,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"llama_server::get_completion(...)\n"}}],"created":1790300532,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```\n"}}],"created":1790300533,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- `n_len`\n"}}],"created":1790300533,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int64_t t_start_time;\n"}}],"created":1790300533,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    bool active;\n"}}],"created":1790300534,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- `n_prompt`\n"}}],"created":1790300534,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"Actually, I remember the routing table in main.cpp:\n"}}],"created":1790300534,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- `n_output`\n"}}],"created":1790300535,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```cpp\n"}}],"created":1790300535,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int64_t n_staled;\n"}}],"created":1790300535,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"2. **Performance / latency**: Health checks are frequent (load balancers probe every few seconds). Building a full JSON with nlohmann::json per slot may be costly; iterating all slots is cheap (max around 256/512 slots? In older versions the max slot limit was 256, now `server_state` has slot limit based on RAM? Actually in recent versions the number of slots can be up to `model.max_workers`? No, that's the number of models). Still, iterating slots and building JSON is light, but under load it might add overhead. Mitigation: lock only for the duration of the read; use `const` access; limit JSON size; or use a non-blocking snapshot.\n"}}],"created":1790300535,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"static const struct {\n"}}],"created":1790300536,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- `n_generated`\n"}}],"created":1790300536,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- `n_past`\n"}}],"created":1790300537,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    const char *path;\n"}}],"created":1790300537,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    int64_t n_stalled;\n"}}],"created":1790300537,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- Note where the version may have diverged (e.g. in older versions the file was llama-server.cpp, in newer it's server.cpp)\n"}}],"created":1790300537,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    ...\n"}}],"created":1790300537,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"};\n"}}],"created":1790300538,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- `n_staled`\n"}}],"created":1790300538,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```\n"}}],"created":1790300538,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"- `n_stalled`\n"}}],"created":1790300539,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"Actually, in recent versions:\n"}}],"created":1790300539,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"```cpp\n"}}],"created":1790300539,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"    std::string (*handler)(llama_context*, std::string, std::string);\n"}}],"created":1790300540,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"struct slot {\n"}}],"created":1790300540,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"} routes[] = { ... };\n"}}],"created":1790300541,"id":"chatcmpl-JpUy6iWqZeIXZgQeqdoLrk5MYwI9kCBD","model":"/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf","system_fingerprint":"b1697-3eae8b842","object":"chat.completion.chunk"}
+

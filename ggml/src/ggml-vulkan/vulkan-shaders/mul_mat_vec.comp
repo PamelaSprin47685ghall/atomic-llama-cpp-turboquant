@@ -182,45 +182,110 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 // The q8dot variant redefines B as a quant block buffer; the shared
 // float-vector fast path cannot read it and is never dispatched there.
 #if K_PER_ITER == 8 && !defined(MUL_MAT_ID) && !defined(HC_DOWN_Q8_DOT)
-    // Recurrent decode stores concurrent Lane vectors as columns sharing one
-    // matrix. For the dominant one-row tile, dequantize that matrix block once
-    // and reuse it for every Lane instead of repeating the weight load/work.
-    if (num_rows == 1u && NUM_COLS > 1u) {
+    // Concurrent lanes are columns sharing one weight matrix. Compute all of them
+    // in one pass: fetch every column's activations into registers first, then walk
+    // the rows dequantizing each weight block exactly once and issuing all NUM_COLS
+    // products from registers. The generic loop below instead nests columns outside
+    // rows, which re-reads and re-dequantizes the same block once per (column,row)
+    // pair -- with six lanes that is six times the weight traffic, and it showed up
+    // as a ~7x cost per multi-row forward (235 ms at six rows versus 33 ms at one).
+    // The previous version of this fast path only covered num_rows == 1, which the
+    // quantized pipelines never reach because they are created with
+    // NUM_ROWS = 2*rm_stdq. Register budget: two vec4 per column, so the staged
+    // form is limited to NUM_COLS <= 8 and wider dispatches keep the per-row fetch.
+    if (NUM_COLS > 1u) {
         const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
         const uint iqs = (col%QUANT_K)/QUANT_R;
         const uint iybs = col - col%QUANT_K;
-        const uint ib = (first_row*p.ncols + col)/QUANT_K;
 
-        vec4 v = dequantize4(ib, iqs, a_offset);
-        vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
-        const vec2 dm = get_dm(ib, a_offset);
-        if (dm.y != 0) {
-            v = v * dm.x + dm.y;
-            v2 = v2 * dm.x + dm.y;
+#define MMV_LOAD_B(dst0, dst1, jj)                                                  \
+        {                                                                            \
+            const uint bbase = (jj)*p.batch_stride_b + b_offset + iybs + iqs;        \
+            MMV_LOAD_B_AT(dst0, dst1, bbase)                                         \
+        }
+#if QUANT_R == 2
+#define MMV_LOAD_B_AT(dst0, dst1, bbase)                                            \
+            const vec4 bv02 = vec4(data_b_v4[(bbase) / 4]);                           \
+            const vec4 bv13 = vec4(data_b_v4[((bbase) + y_offset) / 4]);              \
+            dst0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);                              \
+            dst1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
+#else
+#define MMV_LOAD_B_AT(dst0, dst1, bbase)                                            \
+            dst0 = vec4(data_b_v4[(bbase) / 4]);                                      \
+            dst1 = vec4(data_b_v4[(bbase) / 4 + 1]);
+#endif
+
+        if (NUM_COLS <= 4u) {
+            // Staged: activations for every column live in registers, so the row
+            // walk touches memory only for its own weight block.
+            vec4 bstage0[NUM_COLS];
+            vec4 bstage1[NUM_COLS];
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                MMV_LOAD_B(bstage0[j], bstage1[j], j)
+            }
+
+            uint ibi = first_row*p.ncols;
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+#ifdef HC_UP_FOLD
+                const uint weight_row = (first_row % p.stride_d) + n * p.stride_d;
+                const uint ib = (weight_row * p.ncols + col)/QUANT_K;
+                ibi += p.ncols * p.stride_d;
+#else
+                const uint ib = (ibi + col)/QUANT_K;
+                ibi += p.ncols;
+#endif
+                vec4 v = dequantize4(ib, iqs, a_offset);
+                vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
+                const vec2 dm = get_dm(ib, a_offset);
+                if (dm.y != 0) {
+                    v = v * dm.x + dm.y;
+                    v2 = v2 * dm.x + dm.y;
+                }
+
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    FLOAT_TYPE rowtmp = dot(bstage0[j], v) + dot(bstage1[j], v2);
+                    if (dm.y == 0) {
+                        rowtmp *= dm.x;
+                    }
+                    temp[j][n] += rowtmp;
+                }
+            }
+            return;
         }
 
-        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-#if QUANT_R == 2
-            const vec4 bv02 = vec4(data_b_v4[
-                (j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
-            const vec4 bv13 = vec4(data_b_v4[
-                (j*p.batch_stride_b + b_offset + iybs + iqs + y_offset) / 4]);
-            const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
-            const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
+        uint ibi = first_row*p.ncols;
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+#ifdef HC_UP_FOLD
+            const uint weight_row = (first_row % p.stride_d) + n * p.stride_d;
+            const uint ib = (weight_row * p.ncols + col)/QUANT_K;
+            ibi += p.ncols * p.stride_d;
 #else
-            const vec4 bv0 = vec4(data_b_v4[
-                (j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
-            const vec4 bv1 = vec4(data_b_v4[
-                (j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
+            const uint ib = (ibi + col)/QUANT_K;
+            ibi += p.ncols;
 #endif
-            FLOAT_TYPE rowtmp = dot(bv0, v) + dot(bv1, v2);
-            if (dm.y == 0) {
-                rowtmp *= dm.x;
+            vec4 v = dequantize4(ib, iqs, a_offset);
+            vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
+            const vec2 dm = get_dm(ib, a_offset);
+            if (dm.y != 0) {
+                v = v * dm.x + dm.y;
+                v2 = v2 * dm.x + dm.y;
             }
-            temp[j][0] += rowtmp;
+
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                vec4 bv0;
+                vec4 bv1;
+                MMV_LOAD_B(bv0, bv1, j)
+                FLOAT_TYPE rowtmp = dot(bv0, v) + dot(bv1, v2);
+                if (dm.y == 0) {
+                    rowtmp *= dm.x;
+                }
+                temp[j][n] += rowtmp;
+            }
         }
         return;
     }
+#undef MMV_LOAD_B
+#undef MMV_LOAD_B_AT
 #endif
 
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {

@@ -397,6 +397,19 @@ struct server_context_meta {
 
     // sampling
     std::vector<llama_logit_bias> logit_bias_eog;
+    // Reserved single-token prefix of RERoT's internal handoff tool name. The
+    // tool is advertised in every render so the ordinary prefix stays valid, so
+    // this token must never be sampled: every generation task gets a -inf bias
+    // on it. LLAMA_TOKEN_NULL when the vocab has no suitable marker.
+    llama_token rerot_tool_marker_tok;
+    // RERoT's internal handoff tool in oaicompat form, or null. The chat route
+    // appends it to every request's tools when RERoT is enabled: the template puts
+    // the "# Tools" block near the front of the render, so a block that appears
+    // only in the frame renders truncates the token LCP against the live ordinary
+    // tape at the system preamble and costs a full re-prefill of the prompt once
+    // per episode. Rendering the same block from the first token keeps the prefix
+    // valid; the reserved marker above keeps the advertised tool unsampleable.
+    json rerot_internal_tool;
 
     // model meta
     enum llama_vocab_type model_vocab_type;

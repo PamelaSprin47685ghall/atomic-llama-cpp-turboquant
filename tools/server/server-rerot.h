@@ -12,6 +12,8 @@
 #include <vector>
 
 #include "server-rerot-mindmap.h"
+#include "server-rerot-todo.h"
+#include "server-rerot-thinking.h"
 
 // Server-side control-plane helpers for Recursive Elastic Ring-of-Thought.
 //
@@ -358,6 +360,8 @@ struct server_rerot_routing_decision {
         simple,
         dag,
         mindmap,
+        todo,
+        thinking,
     } strategy = strategy_type::invalid;
 
     std::vector<server_rerot_dag_plan_item> questions;
@@ -376,10 +380,21 @@ struct server_rerot_routing_decision {
     bool is_simple() const { return strategy == strategy_type::simple; }
     bool is_dag() const { return strategy == strategy_type::dag && error.empty(); }
     bool is_mindmap() const { return strategy == strategy_type::mindmap && error.empty(); }
+    bool is_todo() const { return strategy == strategy_type::todo && error.empty(); }
+    bool is_thinking() const { return strategy == strategy_type::thinking && error.empty(); }
+    // Flat wires share one execution shape: synthetic root + depth-2 leaves,
+    // every question a peer worker.
+    bool is_flat_list() const { return is_todo() || is_thinking(); }
     // Planning wire that produced this episode. Kept separate from the
     // strategy enum so the plan-prefix formatter can dispatch on it without
     // re-deriving the kind from the payload.
     const char * plan_kind() const {
+        if (is_thinking()) {
+            return "thinking";
+        }
+        if (is_todo()) {
+            return "todo";
+        }
         if (is_mindmap()) {
             return "mindmap";
         }
@@ -389,6 +404,15 @@ struct server_rerot_routing_decision {
         return "none";
     }
 };
+
+// Plan kinds whose episode carries a frozen TreePlan and therefore uses the
+// hierarchical reader order plus become(node) handoffs: "mindmap" (nested) and
+// the flat wires "todo" / "thinking" (synthetic root + peer leaves). Single source
+// of truth so the runtime, the state blob and the views cannot disagree about
+// which kinds own a tree.
+inline bool server_rerot_plan_kind_has_tree(std::string_view kind) {
+    return kind == "mindmap" || kind == "todo" || kind == "thinking";
+}
 
 // Parses and strictly validates a routing probe decision. The wire format is
 // {"strategy":"simple","payload":{}} or
@@ -407,6 +431,19 @@ std::string server_rerot_mindmap_grammar();
 // Strict incremental parse of one MM-R1 probe output. Fail-closed; incomplete
 // is reported separately so the caller keeps sampling on truncation.
 server_rerot_routing_decision server_rerot_parse_mindmap_decision(const std::string & wire);
+
+// Strict parse of one RERoT todo probe output into a flat synthetic root TreePlan.
+server_rerot_routing_decision server_rerot_parse_todo_decision(const std::string & wire, bool eof = false);
+
+// One-line thinking-split instruction; the server appends the fixed HTML prefix
+// through the opening <ul class="thinking"><li class="question">.
+std::string_view server_rerot_thinking_probe_prompt();
+// GBNF for the bytes generated after that prefix, not a whole document.
+std::string server_rerot_thinking_grammar();
+// Strict parse of one RERoT thinking probe output (flat HTML question list) into the
+// same synthetic-root TreePlan shape the todo wire uses. eof without the closing
+// </ul> fails closed.
+server_rerot_routing_decision server_rerot_parse_thinking_decision(const std::string & wire, bool eof = false);
 
 // Returns JSON schema string for GBNF conversion (§02.4)
 std::string server_rerot_routing_schema_json();
@@ -459,6 +496,16 @@ struct server_rerot_node_runtime {
     // Internal tree placement for reader ordering; never exposed in prompts.
     // UINT32_MAX for non-worker roles.
     uint32_t tree_leaf_id = UINT32_MAX;
+    // Tokens this lane has sampled itself (forced frame tokens excluded), and
+    // whether it has already been asked to wrap up. Parallel thinking only pays
+    // off while the aggregate stays inside the budget the serial baseline would
+    // have spent, so a lane that runs long gets one in-voice reminder to close.
+    uint32_t sampled_tokens = 0;
+    // Reminders already sent. One is a suggestion a lane can ignore, and a lane
+    // that ignores it never seals, so synthesis waits forever: measured with four
+    // workers where all four were reminded once and the episode never converged,
+    // while a three-worker episode whose lanes did close finished in 104 s.
+    uint32_t wrap_nudges = 0;
     llama_pos frame_injection_end = -1;
 
     // A.8 opaque per-lane extension state. Filled by the server integration

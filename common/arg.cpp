@@ -1826,12 +1826,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_REROT").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--rerot-plan-wire"}, "json|mindmap",
+        {"--rerot-lane-wrap-tokens"}, "N",
+        string_format("tokens a RERoT lane may sample before one in-voice reminder to close its notes "
+                      "(default: %u, 0 = never remind; implies --rerot)", params.rerot_lane_wrap_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --rerot-lane-wrap-tokens must be >= 0\n");
+            }
+            params.rerot_lane_wrap_tokens = (uint32_t) value;
+            params.rerot_enabled = true;
+            params.kv_unified = true;
+        }
+    ).set_env("LLAMA_ARG_REROT_LANE_WRAP_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--rerot-plan-wire"}, "json|mindmap|todo|thinking",
         "planning wire for the isolated RERoT routing probe: json = shipped strategy+payload DAG; "
-        "mindmap = MM-R1 research line (native Mermaid mindmap, leaves carry no hard dependency); implies --rerot",
+        "mindmap = native Mermaid tree; todo = unconstrained flat parallel list ending on a non-bullet line; "
+        "thinking = GBNF-constrained flat HTML list of parallel questions closed by </ul>; implies --rerot",
         [](common_params & params, const std::string & value) {
-            if (value != "json" && value != "mindmap") {
-                throw std::invalid_argument("RERoT plan wire must be 'json' or 'mindmap'");
+            if (value != "json" && value != "mindmap" && value != "todo" && value != "thinking") {
+                throw std::invalid_argument("RERoT plan wire must be 'json', 'mindmap', 'todo' or 'sections'");
             }
             params.rerot_plan_wire = value;
             params.rerot_enabled = true;
@@ -1840,7 +1854,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REROT_PLAN_WIRE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--rerot-final-mode"}, "reason|direct",
-        "MM-R1 mindmap final mode for the global entity: reason = S1 natural synthesis reasoning then content; "
+        "mindmap/todo final mode for the global entity: reason = S1 natural synthesis reasoning then content; "
         "direct = S0 content immediately (research arm); implies --rerot",
         [](common_params & params, const std::string & value) {
             if (value != "reason" && value != "direct") {
