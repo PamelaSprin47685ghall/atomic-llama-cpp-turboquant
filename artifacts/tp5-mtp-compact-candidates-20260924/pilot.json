@@ -1,0 +1,1796 @@
+{
+  "variant_a": {
+    "name": "native-mtp-full-candidates",
+    "description": "Same MTP binary with compact CPU top-k materialization disabled",
+    "env": {
+      "RADV_DEBUG": "nobolist",
+      "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM": "1",
+      "GGML_VK_ALLOW_GRAPHICS_QUEUE": "1",
+      "GGML_TP5_WIRE": "f32",
+      "GGML_TP5_LINEAR_LOWERING": "1",
+      "GGML_TP5_MTP_DRAFT_SINGLE_GPU": "1",
+      "GGML_TP5_SPIN_MAX": "10000000",
+      "GGML_SAMPLER_COMPACT_TOP_K": "0"
+    },
+    "cli_args": [
+      "--tp5",
+      "qwen4exp-af",
+      "-md",
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+      "--spec-type",
+      "draft-mtp",
+      "--spec-draft-device",
+      "Vulkan0",
+      "--spec-draft-n-max",
+      "6",
+      "--spec-draft-p-min",
+      "0.0"
+    ],
+    "expected_sync": "relay",
+    "expected_wire": "f32",
+    "is_mtp": true,
+    "requires_linear": true
+  },
+  "variant_b": {
+    "name": "native-mtp-single-draft",
+    "description": "RELAY/F32 five-rank target with local Vulkan0 n=6 MTP draft; unprofiled Decode measurement",
+    "env": {
+      "RADV_DEBUG": "nobolist",
+      "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM": "1",
+      "GGML_VK_ALLOW_GRAPHICS_QUEUE": "1",
+      "GGML_TP5_WIRE": "f32",
+      "GGML_TP5_LINEAR_LOWERING": "1",
+      "GGML_TP5_MTP_DRAFT_SINGLE_GPU": "1",
+      "GGML_TP5_SPIN_MAX": "10000000"
+    },
+    "cli_args": [
+      "--tp5",
+      "qwen4exp-af",
+      "-md",
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+      "--spec-type",
+      "draft-mtp",
+      "--spec-draft-device",
+      "Vulkan0",
+      "--spec-draft-n-max",
+      "6",
+      "--spec-draft-p-min",
+      "0.0"
+    ],
+    "expected_sync": "relay",
+    "expected_wire": "f32",
+    "is_mtp": true,
+    "requires_linear": true
+  },
+  "server_binary": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/llama-server",
+  "server_binary_sha256": "19034e02f0174e0388043f7a0f2ade27e41a3baf7c3df6b44cd5ac29ce07d8b4",
+  "server_binary_b": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/llama-server",
+  "server_binary_b_sha256": "19034e02f0174e0388043f7a0f2ade27e41a3baf7c3df6b44cd5ac29ce07d8b4",
+  "legacy_mmvq_policy_unobservable": false,
+  "blocks_requested": 1,
+  "pilot": true,
+  "max_wall_seconds": 420.0,
+  "count_to": 60,
+  "blocks_completed": 1,
+  "repeats_per_trial": 2,
+  "git_provenance": {
+    "head_commit": "b4e87a01c9c6ea5419d98f13e5606113b20bb8ba",
+    "is_dirty": true,
+    "diff_sha256": "3564f578a91a2cb7cb3e4ed6f47a56ebddac6c30c925672d38cd850a4f0edb69",
+    "script_sha256": "32766f6eb1a7dbf87bb9553d064ba5c6b734b90cabaf4ed9f562fc38daba4f97",
+    "porcelain_status": "M common/sampling.cpp\n M scripts/run-tp5-cross-matrix.py\n M tests/test-sampling.cpp\n?? common/sampling-top-k.h"
+  },
+  "trials": [
+    {
+      "variant": "native-mtp-full-candidates",
+      "trial_tag": "blk1_A1",
+      "count_to": 60,
+      "port": 8097,
+      "is_mtp": true,
+      "requires_linear": true,
+      "metrics": [
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 3.233704130005208,
+          "reported_predicted_tps": 74.77387462039141,
+          "decode_tps": 74.77387462039141,
+          "predicted_ms": 2286.895,
+          "prompt_n": 31,
+          "predicted_n": 171,
+          "completion_tokens": 171,
+          "committed_tps": 52.88053363117194,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+                }
+              }
+            ],
+            "created": 1790286801,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2128-b4e87a01c",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 171,
+              "prompt_tokens": 31,
+              "total_tokens": 202,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-03gffVMt7rSpuot4EiwGGtRh1mXyb4ah",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 748.91,
+              "prompt_per_token_ms": 24.15838709677419,
+              "prompt_per_second": 41.39349187485813,
+              "predicted_n": 171,
+              "predicted_ms": 2286.895,
+              "predicted_per_token_ms": 13.373654970760233,
+              "predicted_per_second": 74.77387462039141,
+              "draft_n": 150,
+              "draft_n_accepted": 149
+            }
+          },
+          "error_message": null
+        },
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 3.042130501009524,
+          "reported_predicted_tps": 75.06077288892673,
+          "decode_tps": 75.06077288892673,
+          "predicted_ms": 2278.154,
+          "prompt_n": 31,
+          "predicted_n": 171,
+          "completion_tokens": 171,
+          "committed_tps": 56.210606331074246,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+                }
+              }
+            ],
+            "created": 1790286805,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2128-b4e87a01c",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 171,
+              "prompt_tokens": 31,
+              "total_tokens": 202,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-XNi5ktQ0qvZ7Kl8jTmVxVIKztd4kkdWk",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 760.656,
+              "prompt_per_token_ms": 24.537290322580642,
+              "prompt_per_second": 40.75429629162197,
+              "predicted_n": 171,
+              "predicted_ms": 2278.154,
+              "predicted_per_token_ms": 13.322538011695906,
+              "predicted_per_second": 75.06077288892673,
+              "draft_n": 150,
+              "draft_n_accepted": 149
+            }
+          },
+          "error_message": null
+        }
+      ],
+      "mapped_dso_hashes": {
+        "/home/kunweiz/.cache/radv_builtin_shaders/index": "e33aed84c876e17146c31c9e035983814d8f1c8817144ec34630bba6c53991f3",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-base.so.0.18.1": "e33eab955326fa69670cd7e327cf1f991d1fdfd394eb8c504085d36087ae1251",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-cpu.so.0.18.1": "9b4fdd9d6551f3381e0f13030b675bb793c8cec177fcdfeb62ed5a505d251440",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-vulkan.so.0.18.1": "03cba7617faacd4aec7c676c711b1a05d9ca4e705792e4a3977f2b3081611f24",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml.so.0.18.1": "0fa8359a7abd07e68393bf24fb70bf7eb55d6e4918d291d0a3aa6b26690ea3e7",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama-common.so.0.0.2128": "228756b999059d98ded80aa0c6bbe4e57b6e64e0b2db21eacc7a85864e3d3645",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama-server-impl.so": "9c51bb1cbb36cb99ea79885ae53fd80aaf23d750182d9cfe498b02c727282ce5",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama.so.0.0.2128": "6e48c0f21c4fd2d9c1f9821e92a8f87b4b89d965acf3a1a7b558a2a41c004567",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libmtmd.so.0.0.2128": "8100c9330302a5f033d60fd86d6ac7a7d5fbd710a7f576365f555426eb107fbe",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/llama-server": "19034e02f0174e0388043f7a0f2ade27e41a3baf7c3df6b44cd5ac29ce07d8b4",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac"
+      },
+      "gpu_snapshot_before": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17203200,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        }
+      ],
+      "gpu_snapshot_after": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 3081396224,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 963932160,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2009251840,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 963932160,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2345Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2010480640,
+          "gpu_busy_percent": 98
+        }
+      ],
+      "log_route_verification": {
+        "log_exists": true,
+        "linear_definition_hit": true,
+        "route_verified": true,
+        "mmvq_policy_seen": true,
+        "mmvq_policy_unobservable": false,
+        "error": null
+      },
+      "success": true,
+      "log_path": "/var/tmp/tp5-mtp-compact-candidates-20260924/pilot_logs/server_native-mtp-full-candidates_blk1_A1.log",
+      "log_sha256": "9847cd19449b5d2124439351f1d1b9b458e5de5866fcbb7ed62e508c58085681",
+      "command": [
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/llama-server",
+        "-m",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+        "-dev",
+        "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+        "--split-mode",
+        "tensor",
+        "--fit",
+        "off",
+        "-ngl",
+        "999",
+        "-c",
+        "256",
+        "-b",
+        "32",
+        "-ub",
+        "32",
+        "--no-mmap",
+        "--no-host",
+        "-np",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8097",
+        "--tp5",
+        "qwen4exp-af",
+        "-md",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-device",
+        "Vulkan0",
+        "--spec-draft-n-max",
+        "6",
+        "--spec-draft-p-min",
+        "0.0"
+      ],
+      "env_snapshot": {
+        "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+        "HOME": "/home/kunweiz",
+        "USER": "kunweiz",
+        "SHELL": "/bin/bash",
+        "LANG": "en_US.UTF-8",
+        "LD_LIBRARY_PATH": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin",
+        "RADV_DEBUG": "nobolist",
+        "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM": "1",
+        "GGML_VK_ALLOW_GRAPHICS_QUEUE": "1",
+        "GGML_TP5_WIRE": "f32",
+        "GGML_TP5_LINEAR_LOWERING": "1",
+        "GGML_TP5_MTP_DRAFT_SINGLE_GPU": "1",
+        "GGML_TP5_SPIN_MAX": "10000000",
+        "GGML_SAMPLER_COMPACT_TOP_K": "0"
+      },
+      "warmup": {
+        "success": true,
+        "status_code": 200,
+        "client_wall_sec": 3.9224022120033624,
+        "reported_predicted_tps": 65.09038809097123,
+        "decode_tps": 65.09038809097125,
+        "predicted_ms": 2627.116,
+        "prompt_n": 31,
+        "predicted_n": 171,
+        "completion_tokens": 171,
+        "committed_tps": 43.59573311393325,
+        "finish_reason": "stop",
+        "exact_content_match": true,
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+            }
+          ],
+          "temperature": 0,
+          "seed": 42,
+          "max_tokens": 192,
+          "cache_prompt": false,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        },
+        "raw_response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+              }
+            }
+          ],
+          "created": 1790286797,
+          "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+          "system_fingerprint": "b2128-b4e87a01c",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 171,
+            "prompt_tokens": 31,
+            "total_tokens": 202,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-5yrRV9e9ighS9iZxshnoyXDxyoyKTV8p",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 31,
+            "prompt_ms": 1292.124,
+            "prompt_per_token_ms": 41.68141935483871,
+            "prompt_per_second": 23.99150545922837,
+            "predicted_n": 171,
+            "predicted_ms": 2627.116,
+            "predicted_per_token_ms": 15.363251461988304,
+            "predicted_per_second": 65.09038809097123,
+            "draft_n": 150,
+            "draft_n_accepted": 149
+          }
+        },
+        "error_message": null
+      }
+    },
+    {
+      "variant": "native-mtp-single-draft",
+      "trial_tag": "blk1_B1",
+      "count_to": 60,
+      "port": 8097,
+      "is_mtp": true,
+      "requires_linear": true,
+      "metrics": [
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 3.2487712189904414,
+          "reported_predicted_tps": 74.25339513879088,
+          "decode_tps": 74.25339513879088,
+          "predicted_ms": 2302.925,
+          "prompt_n": 31,
+          "predicted_n": 171,
+          "completion_tokens": 171,
+          "committed_tps": 52.6352853043122,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+                }
+              }
+            ],
+            "created": 1790286865,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2128-b4e87a01c",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 171,
+              "prompt_tokens": 31,
+              "total_tokens": 202,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-no0ZVfJVgNPMZgS3L2Vo0xE46fOw7a89",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 743.74,
+              "prompt_per_token_ms": 23.991612903225807,
+              "prompt_per_second": 41.681232688842876,
+              "predicted_n": 171,
+              "predicted_ms": 2302.925,
+              "predicted_per_token_ms": 13.467397660818715,
+              "predicted_per_second": 74.25339513879088,
+              "draft_n": 150,
+              "draft_n_accepted": 149
+            }
+          },
+          "error_message": null
+        },
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 3.0664376909990096,
+          "reported_predicted_tps": 74.65472191116088,
+          "decode_tps": 74.65472191116088,
+          "predicted_ms": 2290.545,
+          "prompt_n": 31,
+          "predicted_n": 171,
+          "completion_tokens": 171,
+          "committed_tps": 55.76503331600069,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+                }
+              }
+            ],
+            "created": 1790286869,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2128-b4e87a01c",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 171,
+              "prompt_tokens": 31,
+              "total_tokens": 202,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-JaPACVvosG0TS1MlxhKsSKt1jtbgBgx1",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 772.467,
+              "prompt_per_token_ms": 24.918290322580646,
+              "prompt_per_second": 40.131164179181766,
+              "predicted_n": 171,
+              "predicted_ms": 2290.545,
+              "predicted_per_token_ms": 13.395,
+              "predicted_per_second": 74.65472191116088,
+              "draft_n": 150,
+              "draft_n_accepted": 149
+            }
+          },
+          "error_message": null
+        }
+      ],
+      "mapped_dso_hashes": {
+        "/home/kunweiz/.cache/radv_builtin_shaders/index": "e33aed84c876e17146c31c9e035983814d8f1c8817144ec34630bba6c53991f3",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-base.so.0.18.1": "e33eab955326fa69670cd7e327cf1f991d1fdfd394eb8c504085d36087ae1251",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-cpu.so.0.18.1": "9b4fdd9d6551f3381e0f13030b675bb793c8cec177fcdfeb62ed5a505d251440",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-vulkan.so.0.18.1": "03cba7617faacd4aec7c676c711b1a05d9ca4e705792e4a3977f2b3081611f24",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml.so.0.18.1": "0fa8359a7abd07e68393bf24fb70bf7eb55d6e4918d291d0a3aa6b26690ea3e7",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama-common.so.0.0.2128": "228756b999059d98ded80aa0c6bbe4e57b6e64e0b2db21eacc7a85864e3d3645",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama-server-impl.so": "9c51bb1cbb36cb99ea79885ae53fd80aaf23d750182d9cfe498b02c727282ce5",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama.so.0.0.2128": "6e48c0f21c4fd2d9c1f9821e92a8f87b4b89d965acf3a1a7b558a2a41c004567",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libmtmd.so.0.0.2128": "8100c9330302a5f033d60fd86d6ac7a7d5fbd710a7f576365f555426eb107fbe",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/llama-server": "19034e02f0174e0388043f7a0f2ade27e41a3baf7c3df6b44cd5ac29ce07d8b4",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac"
+      },
+      "gpu_snapshot_before": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2009247744,
+          "gpu_busy_percent": 97
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 963932160,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2009251840,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 19451904,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2345Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 965160960,
+          "gpu_busy_percent": 98
+        }
+      ],
+      "gpu_snapshot_after": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2009247744,
+          "gpu_busy_percent": 97
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 963932160,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2009251840,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2009251840,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2345Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 965160960,
+          "gpu_busy_percent": 97
+        }
+      ],
+      "log_route_verification": {
+        "log_exists": true,
+        "linear_definition_hit": true,
+        "route_verified": true,
+        "mmvq_policy_seen": true,
+        "mmvq_policy_unobservable": false,
+        "error": null
+      },
+      "success": true,
+      "log_path": "/var/tmp/tp5-mtp-compact-candidates-20260924/pilot_logs/server_native-mtp-single-draft_blk1_B1.log",
+      "log_sha256": "baadc1ce1cdc9fe077717699edd1e5a5821dff2568eb1ab087f802b5f8585807",
+      "command": [
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/llama-server",
+        "-m",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+        "-dev",
+        "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+        "--split-mode",
+        "tensor",
+        "--fit",
+        "off",
+        "-ngl",
+        "999",
+        "-c",
+        "256",
+        "-b",
+        "32",
+        "-ub",
+        "32",
+        "--no-mmap",
+        "--no-host",
+        "-np",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8097",
+        "--tp5",
+        "qwen4exp-af",
+        "-md",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-device",
+        "Vulkan0",
+        "--spec-draft-n-max",
+        "6",
+        "--spec-draft-p-min",
+        "0.0"
+      ],
+      "env_snapshot": {
+        "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+        "HOME": "/home/kunweiz",
+        "USER": "kunweiz",
+        "SHELL": "/bin/bash",
+        "LANG": "en_US.UTF-8",
+        "LD_LIBRARY_PATH": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin",
+        "RADV_DEBUG": "nobolist",
+        "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM": "1",
+        "GGML_VK_ALLOW_GRAPHICS_QUEUE": "1",
+        "GGML_TP5_WIRE": "f32",
+        "GGML_TP5_LINEAR_LOWERING": "1",
+        "GGML_TP5_MTP_DRAFT_SINGLE_GPU": "1",
+        "GGML_TP5_SPIN_MAX": "10000000"
+      },
+      "warmup": {
+        "success": true,
+        "status_code": 200,
+        "client_wall_sec": 3.9290794440021273,
+        "reported_predicted_tps": 65.28077988771706,
+        "decode_tps": 65.28077988771706,
+        "predicted_ms": 2619.454,
+        "prompt_n": 31,
+        "predicted_n": 171,
+        "completion_tokens": 171,
+        "committed_tps": 43.521644812002286,
+        "finish_reason": "stop",
+        "exact_content_match": true,
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+            }
+          ],
+          "temperature": 0,
+          "seed": 42,
+          "max_tokens": 192,
+          "cache_prompt": false,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        },
+        "raw_response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+              }
+            }
+          ],
+          "created": 1790286861,
+          "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+          "system_fingerprint": "b2128-b4e87a01c",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 171,
+            "prompt_tokens": 31,
+            "total_tokens": 202,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-3EaAQWGhXxK5hw6KjzWYF8MlQxoRfrQE",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 31,
+            "prompt_ms": 1306.534,
+            "prompt_per_token_ms": 42.14625806451613,
+            "prompt_per_second": 23.726898802480456,
+            "predicted_n": 171,
+            "predicted_ms": 2619.454,
+            "predicted_per_token_ms": 15.318444444444445,
+            "predicted_per_second": 65.28077988771706,
+            "draft_n": 150,
+            "draft_n_accepted": 149
+          }
+        },
+        "error_message": null
+      }
+    },
+    {
+      "variant": "native-mtp-single-draft",
+      "trial_tag": "blk1_B2",
+      "count_to": 60,
+      "port": 8097,
+      "is_mtp": true,
+      "requires_linear": true,
+      "metrics": [
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 3.230885238997871,
+          "reported_predicted_tps": 74.51382994113843,
+          "decode_tps": 74.51382994113843,
+          "predicted_ms": 2294.876,
+          "prompt_n": 31,
+          "predicted_n": 171,
+          "completion_tokens": 171,
+          "committed_tps": 52.92667097424957,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+                }
+              }
+            ],
+            "created": 1790286929,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2128-b4e87a01c",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 171,
+              "prompt_tokens": 31,
+              "total_tokens": 202,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-9dhVbkW5CHkgUKpBY875UeV82GyBCqI4",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 738.645,
+              "prompt_per_token_ms": 23.82725806451613,
+              "prompt_per_second": 41.96874005780855,
+              "predicted_n": 171,
+              "predicted_ms": 2294.876,
+              "predicted_per_token_ms": 13.420327485380119,
+              "predicted_per_second": 74.51382994113843,
+              "draft_n": 150,
+              "draft_n_accepted": 149
+            }
+          },
+          "error_message": null
+        },
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 3.0670191810058895,
+          "reported_predicted_tps": 74.46554640292219,
+          "decode_tps": 74.46554640292219,
+          "predicted_ms": 2296.364,
+          "prompt_n": 31,
+          "predicted_n": 171,
+          "completion_tokens": 171,
+          "committed_tps": 55.7544605716868,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+                }
+              }
+            ],
+            "created": 1790286932,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2128-b4e87a01c",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 171,
+              "prompt_tokens": 31,
+              "total_tokens": 202,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-vbbuHrO5dwQTqot8KYxXliF5iHsFTXXf",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 767.283,
+              "prompt_per_token_ms": 24.751064516129034,
+              "prompt_per_second": 40.402302670592206,
+              "predicted_n": 171,
+              "predicted_ms": 2296.364,
+              "predicted_per_token_ms": 13.429029239766082,
+              "predicted_per_second": 74.46554640292219,
+              "draft_n": 150,
+              "draft_n_accepted": 149
+            }
+          },
+          "error_message": null
+        }
+      ],
+      "mapped_dso_hashes": {
+        "/home/kunweiz/.cache/radv_builtin_shaders/index": "e33aed84c876e17146c31c9e035983814d8f1c8817144ec34630bba6c53991f3",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-base.so.0.18.1": "e33eab955326fa69670cd7e327cf1f991d1fdfd394eb8c504085d36087ae1251",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-cpu.so.0.18.1": "9b4fdd9d6551f3381e0f13030b675bb793c8cec177fcdfeb62ed5a505d251440",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-vulkan.so.0.18.1": "03cba7617faacd4aec7c676c711b1a05d9ca4e705792e4a3977f2b3081611f24",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml.so.0.18.1": "0fa8359a7abd07e68393bf24fb70bf7eb55d6e4918d291d0a3aa6b26690ea3e7",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama-common.so.0.0.2128": "228756b999059d98ded80aa0c6bbe4e57b6e64e0b2db21eacc7a85864e3d3645",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama-server-impl.so": "9c51bb1cbb36cb99ea79885ae53fd80aaf23d750182d9cfe498b02c727282ce5",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama.so.0.0.2128": "6e48c0f21c4fd2d9c1f9821e92a8f87b4b89d965acf3a1a7b558a2a41c004567",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libmtmd.so.0.0.2128": "8100c9330302a5f033d60fd86d6ac7a7d5fbd710a7f576365f555426eb107fbe",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/llama-server": "19034e02f0174e0388043f7a0f2ade27e41a3baf7c3df6b44cd5ac29ce07d8b4",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac"
+      },
+      "gpu_snapshot_before": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2009247744,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 963932160,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 963932160,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 963932160,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2345Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 965160960,
+          "gpu_busy_percent": 98
+        }
+      ],
+      "gpu_snapshot_after": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2009247744,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 963932160,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2009251840,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2009251840,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2345Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 965160960,
+          "gpu_busy_percent": 97
+        }
+      ],
+      "log_route_verification": {
+        "log_exists": true,
+        "linear_definition_hit": true,
+        "route_verified": true,
+        "mmvq_policy_seen": true,
+        "mmvq_policy_unobservable": false,
+        "error": null
+      },
+      "success": true,
+      "log_path": "/var/tmp/tp5-mtp-compact-candidates-20260924/pilot_logs/server_native-mtp-single-draft_blk1_B2.log",
+      "log_sha256": "203328aa0d0b3187ddb7ef5acaba757fb8214b605e70cf8acb275172e1e44748",
+      "command": [
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/llama-server",
+        "-m",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+        "-dev",
+        "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+        "--split-mode",
+        "tensor",
+        "--fit",
+        "off",
+        "-ngl",
+        "999",
+        "-c",
+        "256",
+        "-b",
+        "32",
+        "-ub",
+        "32",
+        "--no-mmap",
+        "--no-host",
+        "-np",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8097",
+        "--tp5",
+        "qwen4exp-af",
+        "-md",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-device",
+        "Vulkan0",
+        "--spec-draft-n-max",
+        "6",
+        "--spec-draft-p-min",
+        "0.0"
+      ],
+      "env_snapshot": {
+        "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+        "HOME": "/home/kunweiz",
+        "USER": "kunweiz",
+        "SHELL": "/bin/bash",
+        "LANG": "en_US.UTF-8",
+        "LD_LIBRARY_PATH": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin",
+        "RADV_DEBUG": "nobolist",
+        "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM": "1",
+        "GGML_VK_ALLOW_GRAPHICS_QUEUE": "1",
+        "GGML_TP5_WIRE": "f32",
+        "GGML_TP5_LINEAR_LOWERING": "1",
+        "GGML_TP5_MTP_DRAFT_SINGLE_GPU": "1",
+        "GGML_TP5_SPIN_MAX": "10000000"
+      },
+      "warmup": {
+        "success": true,
+        "status_code": 200,
+        "client_wall_sec": 3.9635684010136174,
+        "reported_predicted_tps": 65.59474873758877,
+        "decode_tps": 65.59474873758877,
+        "predicted_ms": 2606.916,
+        "prompt_n": 31,
+        "predicted_n": 171,
+        "completion_tokens": 171,
+        "committed_tps": 43.14294158674531,
+        "finish_reason": "stop",
+        "exact_content_match": true,
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+            }
+          ],
+          "temperature": 0,
+          "seed": 42,
+          "max_tokens": 192,
+          "cache_prompt": false,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        },
+        "raw_response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+              }
+            }
+          ],
+          "created": 1790286925,
+          "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+          "system_fingerprint": "b2128-b4e87a01c",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 171,
+            "prompt_tokens": 31,
+            "total_tokens": 202,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-nNY3vGRtkFdVdseJY2jal98Q95Mng0zV",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 31,
+            "prompt_ms": 1353.201,
+            "prompt_per_token_ms": 43.651645161290325,
+            "prompt_per_second": 22.908644022580532,
+            "predicted_n": 171,
+            "predicted_ms": 2606.916,
+            "predicted_per_token_ms": 15.245122807017545,
+            "predicted_per_second": 65.59474873758877,
+            "draft_n": 150,
+            "draft_n_accepted": 149
+          }
+        },
+        "error_message": null
+      }
+    },
+    {
+      "variant": "native-mtp-full-candidates",
+      "trial_tag": "blk1_A2",
+      "count_to": 60,
+      "port": 8097,
+      "is_mtp": true,
+      "requires_linear": true,
+      "metrics": [
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 3.2568493979924824,
+          "reported_predicted_tps": 74.32656222698029,
+          "decode_tps": 74.32656222698029,
+          "predicted_ms": 2300.658,
+          "prompt_n": 31,
+          "predicted_n": 171,
+          "completion_tokens": 171,
+          "committed_tps": 52.50473052435405,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+                }
+              }
+            ],
+            "created": 1790286993,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2128-b4e87a01c",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 171,
+              "prompt_tokens": 31,
+              "total_tokens": 202,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-DL3qog89909o02rchtQy412nIVT4Rht7",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 758.072,
+              "prompt_per_token_ms": 24.453935483870968,
+              "prompt_per_second": 40.89321330955371,
+              "predicted_n": 171,
+              "predicted_ms": 2300.658,
+              "predicted_per_token_ms": 13.454140350877193,
+              "predicted_per_second": 74.32656222698029,
+              "draft_n": 150,
+              "draft_n_accepted": 149
+            }
+          },
+          "error_message": null
+        },
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 3.0600305590050993,
+          "reported_predicted_tps": 74.70471976555824,
+          "decode_tps": 74.70471976555824,
+          "predicted_ms": 2289.012,
+          "prompt_n": 31,
+          "predicted_n": 171,
+          "completion_tokens": 171,
+          "committed_tps": 55.88179487187763,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+                }
+              }
+            ],
+            "created": 1790286996,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2128-b4e87a01c",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 171,
+              "prompt_tokens": 31,
+              "total_tokens": 202,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-ywliDr73WjhuPavrDR4E6n3tyQgBYtMz",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 767.684,
+              "prompt_per_token_ms": 24.764,
+              "prompt_per_second": 40.381198513971896,
+              "predicted_n": 171,
+              "predicted_ms": 2289.012,
+              "predicted_per_token_ms": 13.3860350877193,
+              "predicted_per_second": 74.70471976555824,
+              "draft_n": 150,
+              "draft_n_accepted": 149
+            }
+          },
+          "error_message": null
+        }
+      ],
+      "mapped_dso_hashes": {
+        "/home/kunweiz/.cache/radv_builtin_shaders/index": "e33aed84c876e17146c31c9e035983814d8f1c8817144ec34630bba6c53991f3",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-base.so.0.18.1": "e33eab955326fa69670cd7e327cf1f991d1fdfd394eb8c504085d36087ae1251",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-cpu.so.0.18.1": "9b4fdd9d6551f3381e0f13030b675bb793c8cec177fcdfeb62ed5a505d251440",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml-vulkan.so.0.18.1": "03cba7617faacd4aec7c676c711b1a05d9ca4e705792e4a3977f2b3081611f24",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libggml.so.0.18.1": "0fa8359a7abd07e68393bf24fb70bf7eb55d6e4918d291d0a3aa6b26690ea3e7",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama-common.so.0.0.2128": "228756b999059d98ded80aa0c6bbe4e57b6e64e0b2db21eacc7a85864e3d3645",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama-server-impl.so": "9c51bb1cbb36cb99ea79885ae53fd80aaf23d750182d9cfe498b02c727282ce5",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libllama.so.0.0.2128": "6e48c0f21c4fd2d9c1f9821e92a8f87b4b89d965acf3a1a7b558a2a41c004567",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/libmtmd.so.0.0.2128": "8100c9330302a5f033d60fd86d6ac7a7d5fbd710a7f576365f555426eb107fbe",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/llama-server": "19034e02f0174e0388043f7a0f2ade27e41a3baf7c3df6b44cd5ac29ce07d8b4",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac"
+      },
+      "gpu_snapshot_before": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2009247744,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 963932160,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 963932160,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 963932160,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2345Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 965160960,
+          "gpu_busy_percent": 98
+        }
+      ],
+      "gpu_snapshot_after": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 3081396224,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 2009251840,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 3081400320,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 3081400320,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2345Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2010480640,
+          "gpu_busy_percent": 97
+        }
+      ],
+      "log_route_verification": {
+        "log_exists": true,
+        "linear_definition_hit": true,
+        "route_verified": true,
+        "mmvq_policy_seen": true,
+        "mmvq_policy_unobservable": false,
+        "error": null
+      },
+      "success": true,
+      "log_path": "/var/tmp/tp5-mtp-compact-candidates-20260924/pilot_logs/server_native-mtp-full-candidates_blk1_A2.log",
+      "log_sha256": "ae6ab79208121f4e5bc09f858dc2fab9680464b52a68611c035299c9476bbfba",
+      "command": [
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin/llama-server",
+        "-m",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+        "-dev",
+        "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+        "--split-mode",
+        "tensor",
+        "--fit",
+        "off",
+        "-ngl",
+        "999",
+        "-c",
+        "256",
+        "-b",
+        "32",
+        "-ub",
+        "32",
+        "--no-mmap",
+        "--no-host",
+        "-np",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8097",
+        "--tp5",
+        "qwen4exp-af",
+        "-md",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-device",
+        "Vulkan0",
+        "--spec-draft-n-max",
+        "6",
+        "--spec-draft-p-min",
+        "0.0"
+      ],
+      "env_snapshot": {
+        "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+        "HOME": "/home/kunweiz",
+        "USER": "kunweiz",
+        "SHELL": "/bin/bash",
+        "LANG": "en_US.UTF-8",
+        "LD_LIBRARY_PATH": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5/bin",
+        "RADV_DEBUG": "nobolist",
+        "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM": "1",
+        "GGML_VK_ALLOW_GRAPHICS_QUEUE": "1",
+        "GGML_TP5_WIRE": "f32",
+        "GGML_TP5_LINEAR_LOWERING": "1",
+        "GGML_TP5_MTP_DRAFT_SINGLE_GPU": "1",
+        "GGML_TP5_SPIN_MAX": "10000000",
+        "GGML_SAMPLER_COMPACT_TOP_K": "0"
+      },
+      "warmup": {
+        "success": true,
+        "status_code": 200,
+        "client_wall_sec": 3.9151600469922414,
+        "reported_predicted_tps": 65.44555217101268,
+        "decode_tps": 65.44555217101268,
+        "predicted_ms": 2612.859,
+        "prompt_n": 31,
+        "predicted_n": 171,
+        "completion_tokens": 171,
+        "committed_tps": 43.67637540931896,
+        "finish_reason": "stop",
+        "exact_content_match": true,
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+            }
+          ],
+          "temperature": 0,
+          "seed": 42,
+          "max_tokens": 192,
+          "cache_prompt": false,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        },
+        "raw_response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+              }
+            }
+          ],
+          "created": 1790286989,
+          "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+          "system_fingerprint": "b2128-b4e87a01c",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 171,
+            "prompt_tokens": 31,
+            "total_tokens": 202,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-XlscBsqrjaxWCQCPa77iOqa0OCXccCy0",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 31,
+            "prompt_ms": 1298.957,
+            "prompt_per_token_ms": 41.90183870967742,
+            "prompt_per_second": 23.865301160854436,
+            "predicted_n": 171,
+            "predicted_ms": 2612.859,
+            "predicted_per_token_ms": 15.279877192982456,
+            "predicted_per_second": 65.44555217101268,
+            "draft_n": 150,
+            "draft_n_accepted": 149
+          }
+        },
+        "error_message": null
+      }
+    }
+  ],
+  "paired_samples_a_committed": [
+    54.36941633961947
+  ],
+  "paired_samples_b_committed": [
+    54.270362541562314
+  ],
+  "paired_samples_a_decode": [
+    74.71648237546417
+  ],
+  "paired_samples_b_decode": [
+    74.4718733485031
+  ],
+  "stats_committed_tps": {},
+  "stats_decode_tps": {},
+  "status": "PILOT_COMPLETE_NOT_ACCEPTANCE",
+  "baseline_gpu_identity": [
+    [
+      "card1",
+      "0000:0f:00.0",
+      22355
+    ],
+    [
+      "card2",
+      "0000:09:00.0",
+      22692
+    ],
+    [
+      "card3",
+      "0000:0c:00.0",
+      23029
+    ],
+    [
+      "card4",
+      "0000:06:00.0",
+      23366
+    ],
+    [
+      "card5",
+      "0000:03:00.0",
+      93678
+    ]
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "qualified": false,
+  "promotion": "NOT_MERGED_TO_MASTER",
+  "published_best": "b4e87a01c",
+  "candidate": "compact CPU target top-k materialization and clone-owned candidate views",
+  "cpu_checks": [
+    "test-sampling passed",
+    "test-mtp-workspace passed"
+  ],
+  "route_probe": {
+    "requests": 2,
+    "compact_hits": 350,
+    "all_exact171_stop": true,
+    "performance_eligible": false,
+    "reason": "log verbosity 5 diagnostic"
+  },
+  "pilot": {
+    "status": "PILOT_COMPLETE_NOT_ACCEPTANCE",
+    "blocks": 1,
+    "A": [
+      74.71648237546417
+    ],
+    "B": [
+      74.4718733485031
+    ],
+    "trials": [
+      {
+        "tag": "blk1_A1",
+        "variant": "native-mtp-full-candidates",
+        "cold_ms": 2627.116,
+        "steady_ms": [
+          2286.895,
+          2278.154
+        ],
+        "all_exact": true
+      },
+      {
+        "tag": "blk1_B1",
+        "variant": "native-mtp-single-draft",
+        "cold_ms": 2619.454,
+        "steady_ms": [
+          2302.925,
+          2290.545
+        ],
+        "all_exact": true
+      },
+      {
+        "tag": "blk1_B2",
+        "variant": "native-mtp-single-draft",
+        "cold_ms": 2606.916,
+        "steady_ms": [
+          2294.876,
+          2296.364
+        ],
+        "all_exact": true
+      },
+      {
+        "tag": "blk1_A2",
+        "variant": "native-mtp-full-candidates",
+        "cold_ms": 2612.859,
+        "steady_ms": [
+          2300.658,
+          2289.012
+        ],
+        "all_exact": true
+      }
+    ]
+  },
+  "decision": "No observed win in the prearranged single-block pilot. A=74.71648237546417 and B=74.4718733485031 tok/s. Not evidence of statistically stable regression. No promotion and no five-block acceptance run.",
+  "verification_limitations": [
+    "Candidate only has helper/chain CPU tests and counting MTP requests; no complete candidate rejection/grammar/penalty/cancellation/non-MTP matrix.",
+    "Clone offset fix has not received a standalone real-context aliasing regression."
+  ],
+  "source_sha256": {
+    "common/sampling-top-k.h": "f81824c0b3f7f5cdffdd54e55129d9c6380afbaad55670a4693b539a8565ff94",
+    "common/sampling.cpp": "7adc4c0c02c07e2974420f7f16e6399804474d9193480f1571639bfe948ac0c4",
+    "tests/test-sampling.cpp": "4d4e3b56032c6361b56dd17a56292af48541ba65bca100ecc294d34b8dd82b81",
+    "scripts/run-tp5-cross-matrix.py": "32766f6eb1a7dbf87bb9553d064ba5c6b734b90cabaf4ed9f562fc38daba4f97"
+  }
+}

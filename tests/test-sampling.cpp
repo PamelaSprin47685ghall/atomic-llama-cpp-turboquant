@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "sampling-top-k.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -92,6 +93,194 @@ static void test_top_k(const std::vector<float> & probs, const std::vector<float
     DUMP(&tester.cur_p);
 
     tester.check();
+}
+
+static void test_compact_top_k_behavioral(void) {
+    printf("Testing compact top-k candidate preselection:\n");
+
+    // Direct regression vs legacy llama_sampler_init_top_k over full ascending IDs after suppression
+    {
+        const int          n_vocab = 32007;  // non-aligned vocab length
+        std::vector<float> logits(n_vocab);
+        for (int i = 0; i < n_vocab; i++) {
+            // Coprime multiplier gives exact unique integer permutation scaled by power of two
+            const uint32_t perm = ((uint32_t) i * 17977u) % (uint32_t) n_vocab;
+            logits[i]           = (float) perm / 256.0f;
+        }
+
+        std::vector<llama_token> suppressed = { 13, 42, 100, 512, 1024, 7777, 12345, 20000, 30000, 32006 };
+
+        const std::vector<int> test_ks = { 1, 2, 5, 32, 64, 128 };
+        for (int k : test_ks) {
+            std::vector<llama_token_data> legacy_cur;
+            legacy_cur.reserve(n_vocab);
+            for (llama_token id = 0; id < n_vocab; id++) {
+                legacy_cur.push_back({ id, logits[id], 0.0f });
+            }
+            for (llama_token s_id : suppressed) {
+                if (s_id >= 0 && s_id < n_vocab) {
+                    legacy_cur[s_id].logit = -INFINITY;
+                }
+            }
+            llama_token_data_array legacy_p = { legacy_cur.data(), legacy_cur.size(), -1, false };
+            struct llama_sampler * smp_k    = llama_sampler_init_top_k(k);
+            llama_sampler_apply(smp_k, &legacy_p);
+            llama_sampler_free(smp_k);
+
+            std::vector<llama_token_data> compact_cur;
+            bool ok = common_sampler_compact_top_k(logits.data(), n_vocab, k, suppressed, compact_cur);
+            GGML_ASSERT(ok);
+            GGML_ASSERT(compact_cur.size() == (size_t) k);
+            GGML_ASSERT(legacy_p.size == (size_t) k);
+
+            for (size_t i = 0; i < (size_t) k; i++) {
+                GGML_ASSERT(compact_cur[i].id == legacy_p.data[i].id);
+                GGML_ASSERT(compact_cur[i].logit == legacy_p.data[i].logit);
+                GGML_ASSERT(compact_cur[i].p == legacy_p.data[i].p);
+                if (i > 0) {
+                    GGML_ASSERT(compact_cur[i - 1].logit > compact_cur[i].logit);
+                }
+            }
+        }
+    }
+
+    // Full chain regression with reused chains across >=32 rows verifying RNG advancement and observable probabilities
+    {
+        const int      n_vocab = 4096;
+        const int      k       = 40;
+        const float    temp    = 0.8f;
+        const float    top_p   = 0.9f;
+        const float    min_p   = 0.05f;
+        const uint32_t seed    = 424242;
+        const int      n_rows  = 36;
+
+        std::vector<llama_token> suppressed = { 0, 10, 50, 200, 1000, 3000 };
+
+        // Chains created once before the loop and reused across rows
+        struct llama_sampler * chain_compact = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(chain_compact, llama_sampler_init_top_k(k));
+        llama_sampler_chain_add(chain_compact, llama_sampler_init_top_p(top_p, 1));
+        llama_sampler_chain_add(chain_compact, llama_sampler_init_min_p(min_p, 1));
+        llama_sampler_chain_add(chain_compact, llama_sampler_init_temp(temp));
+        llama_sampler_chain_add(chain_compact, llama_sampler_init_dist(seed));
+
+        struct llama_sampler * chain_full = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(chain_full, llama_sampler_init_top_k(k));
+        llama_sampler_chain_add(chain_full, llama_sampler_init_top_p(top_p, 1));
+        llama_sampler_chain_add(chain_full, llama_sampler_init_min_p(min_p, 1));
+        llama_sampler_chain_add(chain_full, llama_sampler_init_temp(temp));
+        llama_sampler_chain_add(chain_full, llama_sampler_init_dist(seed));
+
+        for (int row = 0; row < n_rows; row++) {
+            std::vector<float> logits(n_vocab);
+            for (int i = 0; i < n_vocab; i++) {
+                // Exact integer permutation scaled by power of two
+                const uint32_t perm = ((uint32_t) i * 1583u + (uint32_t) row * 37u) % (uint32_t) n_vocab;
+                logits[i]           = (float) perm / 256.0f;
+            }
+
+            std::vector<llama_token_data> compact_cur;
+            bool ok = common_sampler_compact_top_k(logits.data(), n_vocab, k, suppressed, compact_cur);
+            GGML_ASSERT(ok);
+            llama_token_data_array compact_p = { compact_cur.data(), compact_cur.size(), -1, true };
+
+            std::vector<llama_token_data> full_cur;
+            full_cur.reserve(n_vocab);
+            for (llama_token id = 0; id < n_vocab; id++) {
+                full_cur.push_back({ id, logits[id], 0.0f });
+            }
+            for (llama_token s_id : suppressed) {
+                full_cur[s_id].logit = -INFINITY;
+            }
+            llama_token_data_array full_p = { full_cur.data(), full_cur.size(), -1, false };
+
+            llama_sampler_apply(chain_compact, &compact_p);
+            llama_sampler_apply(chain_full, &full_p);
+
+            GGML_ASSERT(compact_p.selected >= 0 && (size_t) compact_p.selected < compact_p.size);
+            GGML_ASSERT(full_p.selected >= 0 && (size_t) full_p.selected < full_p.size);
+
+            llama_token sample_compact = compact_p.data[compact_p.selected].id;
+            llama_token sample_full    = full_p.data[full_p.selected].id;
+
+            GGML_ASSERT(sample_compact == sample_full);
+
+            // Observable candidate view and exact probabilities
+            GGML_ASSERT(compact_p.size == full_p.size);
+            for (size_t i = 0; i < compact_p.size; i++) {
+                GGML_ASSERT(compact_p.data[i].id == full_p.data[i].id);
+                GGML_ASSERT(compact_p.data[i].logit == full_p.data[i].logit);
+                GGML_ASSERT(compact_p.data[i].p == full_p.data[i].p);
+            }
+        }
+
+        llama_sampler_free(chain_compact);
+        llama_sampler_free(chain_full);
+    }
+
+    // Fallback cases: must decline without applying sampler
+    {
+        std::vector<llama_token_data> cur;
+        std::vector<llama_token>      no_suppression;
+
+        // Invalid k: <= 0, > 128, >= n_vocab
+        {
+            float logits[10] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+            GGML_ASSERT(!common_sampler_compact_top_k(logits, 10, 0, no_suppression, cur));
+            GGML_ASSERT(!common_sampler_compact_top_k(logits, 10, -1, no_suppression, cur));
+            GGML_ASSERT(!common_sampler_compact_top_k(logits, 10, 10, no_suppression, cur));
+            GGML_ASSERT(!common_sampler_compact_top_k(logits, 10, 15, no_suppression, cur));
+
+            std::vector<float> big_logits(200, 1.0f);
+            GGML_ASSERT(!common_sampler_compact_top_k(big_logits.data(), 200, 129, no_suppression, cur));
+        }
+
+        // Nullptr or zero n_vocab
+        {
+            GGML_ASSERT(!common_sampler_compact_top_k(nullptr, 100, 10, no_suppression, cur));
+            float logits[10] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+            GGML_ASSERT(!common_sampler_compact_top_k(logits, 0, 10, no_suppression, cur));
+            GGML_ASSERT(!common_sampler_compact_top_k(logits, -5, 10, no_suppression, cur));
+        }
+
+        // NaN and Inf handling
+        {
+            float logits_nan[8] = { 1.0f, 2.0f, NAN, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f };
+            GGML_ASSERT(!common_sampler_compact_top_k(logits_nan, 8, 4, no_suppression, cur));
+
+            float logits_inf[8] = { 1.0f, 2.0f, INFINITY, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f };
+            GGML_ASSERT(!common_sampler_compact_top_k(logits_inf, 8, 4, no_suppression, cur));
+
+            float logits_neginf[8] = { 1.0f, 2.0f, -INFINITY, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f };
+            GGML_ASSERT(!common_sampler_compact_top_k(logits_neginf, 8, 4, no_suppression, cur));
+        }
+
+        // Ambiguous ties within selection
+        {
+            float logits_tie[8] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 7.0f };
+            GGML_ASSERT(!common_sampler_compact_top_k(logits_tie, 8, 4, no_suppression, cur));
+        }
+
+        // Ambiguous ties at cutoff / boundary with outside elements
+        {
+            float logits_cutoff_tie[8] = { 1.0f, 2.0f, 3.0f, 5.0f, 5.0f, 6.0f, 7.0f, 8.0f };
+            GGML_ASSERT(!common_sampler_compact_top_k(logits_cutoff_tie, 8, 4, no_suppression, cur));
+        }
+
+        // All or mostly suppressed: selected -inf ties must decline
+        {
+            float                    logits[8]      = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f };
+            // Suppress all 8 tokens
+            std::vector<llama_token> all_suppressed = { 0, 1, 2, 3, 4, 5, 6, 7 };
+            GGML_ASSERT(!common_sampler_compact_top_k(logits, 8, 4, all_suppressed, cur));
+
+            // Suppress 6 tokens leaving only 2 finite tokens when k=4
+            std::vector<llama_token> mostly_suppressed = { 0, 1, 2, 3, 4, 5 };
+            GGML_ASSERT(!common_sampler_compact_top_k(logits, 8, 4, mostly_suppressed, cur));
+        }
+    }
+
+    printf("Compact top-k candidate preselection tests OK\n");
 }
 
 static void test_top_p(const std::vector<float> & probs, const std::vector<float> & probs_expected, float p) {
@@ -307,6 +496,8 @@ static void test_perf() {
 
 int main(void) {
     ggml_time_init();
+
+    test_compact_top_k_behavioral();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);

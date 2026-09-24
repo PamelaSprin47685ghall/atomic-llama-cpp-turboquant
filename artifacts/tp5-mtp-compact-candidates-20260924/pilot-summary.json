@@ -1,0 +1,52 @@
+{
+  "status": "PILOT_COMPLETE_NOT_ACCEPTANCE",
+  "blocks": 1,
+  "A": [
+    74.71648237546417
+  ],
+  "B": [
+    74.4718733485031
+  ],
+  "trials": [
+    {
+      "tag": "blk1_A1",
+      "variant": "native-mtp-full-candidates",
+      "cold_ms": 2627.116,
+      "steady_ms": [
+        2286.895,
+        2278.154
+      ],
+      "all_exact": true
+    },
+    {
+      "tag": "blk1_B1",
+      "variant": "native-mtp-single-draft",
+      "cold_ms": 2619.454,
+      "steady_ms": [
+        2302.925,
+        2290.545
+      ],
+      "all_exact": true
+    },
+    {
+      "tag": "blk1_B2",
+      "variant": "native-mtp-single-draft",
+      "cold_ms": 2606.916,
+      "steady_ms": [
+        2294.876,
+        2296.364
+      ],
+      "all_exact": true
+    },
+    {
+      "tag": "blk1_A2",
+      "variant": "native-mtp-full-candidates",
+      "cold_ms": 2612.859,
+      "steady_ms": [
+        2300.658,
+        2289.012
+      ],
+      "all_exact": true
+    }
+  ]
+}

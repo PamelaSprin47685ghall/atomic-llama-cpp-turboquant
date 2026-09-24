@@ -2,10 +2,10 @@
 
 #include "common.h"
 #include "fit.h"
+#include "ggml.h"
 #include "log.h"
 #include "reasoning-budget.h"
-
-#include "ggml.h"
+#include "sampling-top-k.h"
 
 #include <algorithm>
 #include <cctype>
@@ -117,6 +117,11 @@ struct common_sampler {
 
     ring_buffer<llama_token> prev;
 
+    // Compact top-k preselection cache & state
+    std::vector<llama_token> sorted_suppressed;
+    int32_t                  compact_top_k = 0;
+    mutable bool             chain_exposed = false;
+
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
@@ -152,10 +157,32 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+
+            static const bool compact_enabled = []() {
+                const char * env = getenv("GGML_SAMPLER_COMPACT_TOP_K");
+                return env ? (strcmp(env, "0") != 0) : true;
+            }();
+
+            bool compacted = false;
+            // Preselection requires: feature enabled, not exposed, valid cached top_k,
+            // no external active grammar or reasoning budget, and no user logit bias.
+            if (compact_enabled && !chain_exposed && compact_top_k > 0 && !grmr && !rbudget &&
+                params.logit_bias.empty()) {
+                if (common_sampler_compact_top_k(logits, n_vocab, compact_top_k, sorted_suppressed, cur)) {
+                    cur_p     = { cur.data(), cur.size(), -1, true };
+                    compacted = true;
+                    LOG_DBG("%s: compact top-k preselected %zu candidates\n", __func__, cur.size());
+                }
             }
+
+            if (!compacted) {
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{ token_id, logits[token_id], 0.0f };
+                }
+                cur_p = { cur.data(), cur.size(), -1, false };
+            }
+            return;
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
@@ -448,14 +475,61 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
-    auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
-        /* .cur_p   = */ {},
+    // Prepare sorted model suppress tokens for compact top-k preselection
+    std::vector<llama_token> sorted_suppressed;
+    {
+        int32_t             n_suppress = 0;
+        const llama_token * suppress   = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        if (suppress && n_suppress > 0) {
+            sorted_suppressed.assign(suppress, suppress + n_suppress);
+            std::sort(sorted_suppressed.begin(), sorted_suppressed.end());
+            sorted_suppressed.erase(std::unique(sorted_suppressed.begin(), sorted_suppressed.end()),
+                                    sorted_suppressed.end());
+        }
+    }
+
+    // Preselection eligibility: first effective sampler is TOP_K (1 <= k <= 128),
+    // preceding samplers are verified no-ops, mirostat=0, no user bias, no grammar/budget.
+    int32_t compact_top_k = 0;
+    if (params.mirostat == 0 && params.logit_bias.empty() && !grmr && !rbudget) {
+        for (const auto & cnstr : params.samplers) {
+            if (cnstr == COMMON_SAMPLER_TYPE_TOP_K) {
+                if (params.top_k >= 1 && params.top_k <= 128) {
+                    compact_top_k = params.top_k;
+                }
+                break;
+            } else if (cnstr == COMMON_SAMPLER_TYPE_PENALTIES) {
+                if (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f) {
+                    continue;
+                }
+                break;
+            } else if (cnstr == COMMON_SAMPLER_TYPE_DRY) {
+                if (params.dry_multiplier == 0.0f) {
+                    continue;
+                }
+                break;
+            } else if (cnstr == COMMON_SAMPLER_TYPE_TOP_N_SIGMA) {
+                if (params.top_n_sigma <= 0.0f) {
+                    continue;
+                }
+                break;
+            } else {
+                break;
+            }
+        }
+    }
+
+    auto * result = new common_sampler{
+        /* .params            = */ params,
+        /* .grmr              = */ grmr,
+        /* .rbudget           = */ rbudget,
+        /* .chain             = */ chain,
+        /* .prev              = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+        /* .sorted_suppressed = */ std::move(sorted_suppressed),
+        /* .compact_top_k     = */ compact_top_k,
+        /* .chain_exposed     = */ false,
+        /* .cur               = */ {},
+        /* .cur_p             = */ {},
     };
 
     return result;
@@ -531,15 +605,31 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+    auto * cloned = new common_sampler{
+        /* .params            = */ gsmpl->params,
+        /* .grmr              = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget           = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain             = */ llama_sampler_clone(gsmpl->chain),
+        /* .prev              = */ gsmpl->prev,
+        /* .sorted_suppressed = */ gsmpl->sorted_suppressed,
+        /* .compact_top_k     = */ gsmpl->compact_top_k,
+        /* .chain_exposed     = */ gsmpl->chain_exposed,
+        /* .cur               = */ gsmpl->cur,
+        /* .cur_p             = */ gsmpl->cur_p,
     };
+
+    // Rebind cur_p.data to cloned storage if it points into original cur (including zero-size one-past view).
+    if (gsmpl->cur_p.data) {
+        const uintptr_t p_addr     = reinterpret_cast<uintptr_t>(gsmpl->cur_p.data);
+        const uintptr_t begin_addr = reinterpret_cast<uintptr_t>(gsmpl->cur.data());
+        const uintptr_t end_addr   = begin_addr + gsmpl->cur.size() * sizeof(llama_token_data);
+        if (p_addr >= begin_addr && p_addr <= end_addr && ((p_addr - begin_addr) % sizeof(llama_token_data) == 0)) {
+            const size_t offset_elems = (p_addr - begin_addr) / sizeof(llama_token_data);
+            cloned->cur_p.data        = cloned->cur.data() + offset_elems;
+        }
+    }
+
+    return cloned;
 }
 
 void common_sampler_append_grammar(common_sampler * gsmpl, llama_sampler * extra) {
@@ -599,6 +689,9 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return nullptr;
     }
+
+    // Public access to chain permits mutation; disable compact optimization.
+    gsmpl->chain_exposed = true;
 
     return gsmpl->chain;
 }
