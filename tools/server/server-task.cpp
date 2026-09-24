@@ -222,7 +222,7 @@ bool server_rerot_metrics::empty() const {
         && people_capacity == 0 && people_resident == 0 && people_runnable == 0 && people_waiting == 0
         && pens_capacity == 0 && pens_allocated == 0 && pens_running == 0 && pens_suspended == 0
         && pen_queue_depth == 0 && pens_per_person_max_observed == 0 && pen_utilization == 0.0
-        && batch_people == 0 && batch_pens == 0 && frontier_rows == 0
+        && batch_people == 0 && batch_pens == 0 && frontier_rows == 0 && six_row_batches == 0
         && brain_bytes == 0 && hand_bytes == 0 && grouped_scratch_bytes == 0
         && probe_seconds == 0.0 && probe_count == 0
         && prefix_rebuild_seconds == 0.0 && prefix_rebuild_count == 0
@@ -288,6 +288,7 @@ json server_rerot_metrics::to_json() const {
         { "rerot_batch_people",        batch_people },
         { "rerot_batch_pens",          batch_pens },
         { "rerot_frontier_rows",       frontier_rows },
+        { "rerot_six_row_batches",     six_row_batches },
 
         { "rerot_brain_bytes",         brain_bytes },
         { "rerot_hand_bytes",          hand_bytes },
@@ -370,6 +371,7 @@ void server_rerot_metrics::accumulate(const server_rerot_metrics & delta) {
     batch_people        = delta.batch_people;
     batch_pens          = delta.batch_pens;
     frontier_rows       += delta.frontier_rows;
+    six_row_batches     += delta.six_row_batches;
 
     brain_bytes         = delta.brain_bytes;
     hand_bytes          = delta.hand_bytes;

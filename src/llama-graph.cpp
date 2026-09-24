@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <tuple>
 #include <sstream>
@@ -1058,7 +1059,24 @@ void llm_graph_input_attn_rerot::fill_spans(
         }
         st_entries.clear(); // dense entries produced by expand op
     } else {
-        st_entries.assign((size_t) entries->ne[1] * 2, 0);
+        st_entries.resize((size_t) entries->ne[1] * 2);
+        if (zeroed_capacity != (uint32_t) group_cap) {
+            // A fresh capacity needs a zero tail for padded reads; the live
+            // prefix is overwritten below and needs no preliminary clear.
+            std::fill(st_entries.begin() + 2 * n_entries, st_entries.end(), 0);
+        }
+        const uint32_t n_kv_live = attn != nullptr ? attn->get_n_kv() : 0;
+        const uint32_t n_groups_live = (uint32_t) layout.groups.size();
+        const auto check_entry = [&](size_t i, int32_t key, int32_t group) {
+            if (key < 0 || (n_kv_live > 0 && (uint32_t) key >= n_kv_live) ||
+                group < 0 || (uint32_t) group >= n_groups_live) {
+                throw std::runtime_error(
+                    "RERoT DDVR: live entry out of range at index " + std::to_string(i) +
+                    " (key=" + std::to_string(key) + " n_kv=" + std::to_string(n_kv_live) +
+                    " group=" + std::to_string(group) + " n_groups=" + std::to_string(n_groups_live) +
+                    "); refusing to upload descriptors that would fault the device");
+            }
+        };
         // Sixteenth round (question two): const-effective contiguous segments
         // arrive as a span side-channel (key range + group + entry slot), so
         // the i32 staging buffer expands from O(spans) range writes instead of
@@ -1079,8 +1097,11 @@ void llm_graph_input_attn_rerot::fill_spans(
             // General shape (duplicate storage, non-contiguous runs, tests):
             // the plain copy.
             for (size_t i = 0; i < n_entries; ++i) {
-                st_entries[2 * i + 0] = (int32_t) layout.entries[i].key_index;
-                st_entries[2 * i + 1] = (int32_t) layout.entries[i].group_index;
+                const int32_t key = (int32_t) layout.entries[i].key_index;
+                const int32_t group = (int32_t) layout.entries[i].group_index;
+                check_entry(i, key, group);
+                st_entries[2 * i + 0] = key;
+                st_entries[2 * i + 1] = group;
             }
         } else {
             // Expand by entry ranges (sixteenth round): the span table is
@@ -1106,10 +1127,20 @@ void llm_graph_input_attn_rerot::fill_spans(
                         "RERoT DDVR: span table is not entry-ordered;"
                         " rebuild required");
                 }
+                if (sp.count > 0) {
+                    const uint64_t last = (uint64_t) sp.key_start + sp.count - 1;
+                    if (last > (uint64_t) std::numeric_limits<int32_t>::max()) {
+                        throw std::runtime_error("RERoT DDVR: span key exceeds i32 device index");
+                    }
+                    check_entry(sp.entry_index, (int32_t) last, (int32_t) sp.group_index);
+                }
                 // Scalar rows before this span.
                 for (; cursor < sp.entry_index; ++cursor) {
-                    st_entries[2 * cursor + 0] = (int32_t) layout.entries[cursor].key_index;
-                    st_entries[2 * cursor + 1] = (int32_t) layout.entries[cursor].group_index;
+                    const int32_t key = (int32_t) layout.entries[cursor].key_index;
+                    const int32_t group = (int32_t) layout.entries[cursor].group_index;
+                    check_entry(cursor, key, group);
+                    st_entries[2 * cursor + 0] = key;
+                    st_entries[2 * cursor + 1] = group;
                 }
                 // Span rows: ascending run range with one group (branchless
                 // inner loop — vectorizes to two interleaved stores).
@@ -1122,33 +1153,11 @@ void llm_graph_input_attn_rerot::fill_spans(
             }
             // Tail rows after the last span.
             for (; cursor < n_entries; ++cursor) {
-                st_entries[2 * cursor + 0] = (int32_t) layout.entries[cursor].key_index;
-                st_entries[2 * cursor + 1] = (int32_t) layout.entries[cursor].group_index;
-            }
-        }
-    }
-
-    // Fail-loud guard for the GPU indexed-attention contract: the rerot
-    // kernel consumes these rows without a universal device-side bounds
-    // check on every pipeline variant, and an out-of-range physical key or
-    // group reads unmapped VRAM (GPUVM fault / ErrorDeviceLost). Validate
-    // against the device's real n_kv and the live group count here so the
-    // defect surfaces as an explicit host error with the offending index,
-    // never as a device-level crash.
-    if (!gpu_span_expand) {
-        const uint32_t n_kv_live = attn != nullptr ? attn->get_n_kv() : 0;
-        const uint32_t n_groups_live = (uint32_t) layout.groups.size();
-        for (size_t i = 0; i < n_entries; ++i) {
-            const int32_t key   = st_entries[2 * i + 0];
-            const int32_t group = st_entries[2 * i + 1];
-            const bool key_bad   = key < 0 || (n_kv_live > 0 && (uint32_t) key >= n_kv_live);
-            const bool group_bad = group < 0 || (uint32_t) group >= n_groups_live;
-            if (key_bad || group_bad) {
-                throw std::runtime_error(
-                    "RERoT DDVR: live entry out of range at index " + std::to_string(i) +
-                    " (key=" + std::to_string(key) + " n_kv=" + std::to_string(n_kv_live) +
-                    " group=" + std::to_string(group) + " n_groups=" + std::to_string(n_groups_live) +
-                    "); refusing to upload descriptors that would fault the device");
+                const int32_t key = (int32_t) layout.entries[cursor].key_index;
+                const int32_t group = (int32_t) layout.entries[cursor].group_index;
+                check_entry(cursor, key, group);
+                st_entries[2 * cursor + 0] = key;
+                st_entries[2 * cursor + 1] = group;
             }
         }
     }

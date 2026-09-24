@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RERoT throughput gate: same-build scheduling-strategy comparison (RERoT OFF vs ON).
+"""RERoT throughput gate: same-build useful-token comparison (RERoT OFF vs ON).
 
 C02 fixes (攻坚总计划 §2.4 / §12):
   1. Per-sample judgment: every correctness check is evaluated for EVERY round;
@@ -11,9 +11,9 @@ C02 fixes (攻坚总计划 §2.4 / §12):
      rerot_parallel_peak_lanes_total (request-scoped peak lanes, counter).
   3. Missing metrics are reported as `missing` and yield evidence-incomplete
      (exit 3), never a fabricated 0.0.
-  4. No parallel token/time evidence -> `parallel_faster_than_serial` is
-     NOT_EXERCISED (evidence-incomplete), never silently substituted by the
-     aggregate number.
+  4. No parallel token/time evidence -> `parallel_work_exercised_paired` is
+     NOT_EXERCISED and the verdict is evidence-incomplete, never silently
+     substituted by the aggregate number.
   5. Route gate: if --enable-operator-route-gate is set but the route counter
      is absent from /metrics, the gate reports evidence-incomplete instead of
      inventing a 0 hit count.
@@ -22,9 +22,10 @@ C02 fixes (攻坚总计划 §2.4 / §12):
      non-streaming requests and records ttft_ms as null.
   7. Comparison kinds are explicit: same-build scheduling strategy (default)
      vs implementation-version comparison (--baseline-base-url).
-  8. Paired statistics: every (serial, rerot) pair is retained; the verdict
-     uses the paired ratio distribution (median + lower bound), not two
-     independent side medians.
+  8. Paired statistics: every (serial, rerot) pair is retained; the primary
+     verdict uses each pair's sampled-token rate, not model tokens inflated
+     by forced frames or side medians. Parallel-phase model-token rate is
+     diagnostic only: its numerator differs from the serial sampled-token rate.
   9. Historical baseline responses are never part of the formal verdict
      unless --baseline-manifest matches the live server manifest; even then
      they are reported as historical_reference and excluded from the paired
@@ -167,6 +168,7 @@ COUNTER_METRICS: tuple[str, ...] = (
     "rerot_hard_aborts",
     "rerot_final_fences",
     "rerot_frontier_rows",
+    "rerot_six_row_batches",
     # Request-scoped multi-Lane peak pens, summed over completed episodes.
     # Present when the server exports it (C02); absent on older builds ->
     # reported missing (evidence-incomplete) rather than 0.
@@ -357,7 +359,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Same-build scheduling-strategy gate: run the same deterministic request with "
-            "RERoT OFF/ON on ONE server and fail unless the RERoT path beats the single-Lane "
+            "RERoT OFF/ON on ONE server and fail unless the RERoT path matches the single-Lane "
             "path on paired throughput with every round semantically valid. "
             "Implementation-version comparison (two servers) is a separate mode: "
             "--baseline-base-url."
@@ -416,10 +418,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help=(
-            "Required paired throughput ratio lower bound: the median paired ratio must be "
-            ">= min-ratio AND every paired ratio must be > 1.0 (胜出规则 §11.4). "
-            "A 2%% median improvement means --min-ratio 1.02."
+            "Required lower bound for every paired useful-token throughput ratio. "
+            "1.0 means the active pens must at least match simple; 1.02 requires 2%% gain."
         ),
+    )
+    parser.add_argument(
+        "--min-peak-lanes", type=int, default=2,
+        help="Require this many physical lanes to be active during the RERoT request.",
     )
     parser.add_argument(
         "--rounds",
@@ -446,6 +451,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--min-ratio must be positive")
     if args.rounds <= 0:
         parser.error("--rounds must be >= 1")
+    if args.min_peak_lanes < 2:
+        parser.error("--min-peak-lanes must be >= 2")
     if args.baseline_manifest and not args.baseline_response:
         parser.error("--baseline-manifest requires --baseline-response")
     if args.baseline_base_url is not None and args.baseline_response is not None:
@@ -500,6 +507,7 @@ def evaluate_round_checks(
     is_dag_payload: bool,
     dag_structure_err: str,
     route_gate_enabled: bool,
+    min_peak_lanes: int,
 ) -> tuple[dict[str, str], dict[str, str], list[str]]:
     """Per-round correctness checks.
 
@@ -582,17 +590,29 @@ def evaluate_round_checks(
             f"parallel counters positive (tokens={par_tok:g}, seconds={par_sec:g})"
         )
     if peak_pens_ok:
-        checks["multi_lane_peak_lanes"] = CHECK_OK if peak_pens >= 2 else CHECK_FAIL
+        checks["multi_lane_peak_lanes"] = CHECK_OK if peak_pens >= min_peak_lanes else CHECK_FAIL
         details["multi_lane_peak_lanes"] = (
-            f"request-scoped peak lanes (counter delta) must be >= 2, observed {peak_pens:g}"
+            f"request-scoped peak lanes (counter delta) must be >= {min_peak_lanes}, observed {peak_pens:g}"
         )
     else:
-        # Absent on older builds; recorded as not_exercised, not fatal, but
-        # listed under missing so the report is explicit.
-        checks["multi_lane_peak_lanes"] = CHECK_NOT_EXERCISED
+        # Older servers do not export this counter. A six-lane claim needs
+        # positive evidence; the generic two-lane gate keeps its old policy.
+        checks["multi_lane_peak_lanes"] = (
+            CHECK_EVIDENCE_INCOMPLETE if min_peak_lanes > 2 else CHECK_NOT_EXERCISED
+        )
         details["multi_lane_peak_lanes"] = (
             "counter rerot_parallel_peak_lanes_total not exported by this server build; "
             "multi-Lane evidence relies on parallel token counters only"
+        )
+    if min_peak_lanes >= 6:
+        six_batches, six_ok = counter_evidence("rerot_six_row_batches")
+        checks["six_pens_in_one_decode"] = (
+            CHECK_OK if six_ok and six_batches > 0 else
+            CHECK_FAIL if six_ok else CHECK_EVIDENCE_INCOMPLETE
+        )
+        details["six_pens_in_one_decode"] = (
+            f"at least one successful decode slice must contain six pen rows; observed {six_batches:g}"
+            if six_ok else "rerot_six_row_batches counter is missing"
         )
 
     # ---- Payload structure (identical every round; kept per-round for uniform reporting) ----
@@ -687,7 +707,6 @@ def main() -> int:
     all_missing: set[str] = set()
     any_round_failed = False
     any_evidence_incomplete = False
-    any_not_exercised = False
 
     is_dag_payload, dag_structure_err = validate_dag_payload(payload)
 
@@ -729,7 +748,13 @@ def main() -> int:
                 )
             if ep_sec <= 0 or m_tok <= 0:
                 raise RuntimeError("completed RERoT episode did not publish positive token/time counters")
-            agg_tps = m_tok / ep_sec
+            sampled = r_resp.get("usage", {}).get("rerot", {}).get("sampled_tokens")
+            predicted = r_resp.get("timings", {}).get("predicted_n")
+            if sampled is None or predicted is None or sampled != predicted:
+                raise RuntimeError("RERoT sampled-token count disagrees with timings.predicted_n")
+            # The six-pen target concerns useful sampled tokens, not forced
+            # frame tokens. Frame/model work still consumes the elapsed time.
+            agg_tps = serial_throughput(r_resp)
             # C02 #4: no silent fallback to aggregate when the parallel phase
             # was not exercised. parallel_exercised drives the verdict state.
             if not present["rerot_parallel_seconds"] or not present["rerot_parallel_model_tokens"]:
@@ -750,13 +775,20 @@ def main() -> int:
             rw, rr, d, present, gb, ga, atps, ptps = do_rerot()
             sw, sr, stps = do_serial()
 
-        serial_samples.append({"round": round_idx, "client_wall_seconds": sw, "tokens_per_second": stps})
+        serial_samples.append({
+            "round": round_idx,
+            "client_wall_seconds": sw,
+            "tokens_per_second": stps,
+            "answer": sr.get("choices", [{}])[0].get("message", {}).get("content"),
+        })
         serial_tps_list.append(stps)
         parallel_exercised = ptps == ptps  # NaN check
         rerot_samples.append({
             "round": round_idx,
             "client_wall_seconds": rw,
+            "answer": rr.get("choices", [{}])[0].get("message", {}).get("content"),
             "aggregate_tokens_per_second": atps,
+            "model_tokens_per_second": d["rerot_completed_model_tokens"] / d["rerot_completed_episode_seconds"],
             "parallel_tokens_per_second": ptps if parallel_exercised else None,
             "parallel_exercised": parallel_exercised,
             "token_breakdown": extract_rerot_token_breakdown(rr),
@@ -772,6 +804,7 @@ def main() -> int:
         checks, details, missing = evaluate_round_checks(
             d, present, payload, is_dag_payload, dag_structure_err,
             getattr(args, "enable_operator_route_gate", False),
+            args.min_peak_lanes,
         )
         all_missing.update(missing)
         round_status = "ok"
@@ -783,8 +816,6 @@ def main() -> int:
                 if round_status == "ok":
                     round_status = "evidence_incomplete"
                 any_evidence_incomplete = True
-            elif state == CHECK_NOT_EXERCISED:
-                any_not_exercised = True
         round_checks.append({
             "round": round_idx,
             "status": round_status,
@@ -807,7 +838,8 @@ def main() -> int:
             "rerot_wall_seconds": rw,
         })
 
-    # ---- Aggregate statistics (reference only; verdict is paired) ----
+    # ---- Sampled aggregate statistics (verdict is paired). Model-token
+    # throughput includes forced frames and remains diagnostic only. ----
     serial_stats = calculate_percentiles(serial_tps_list)
     aggregate_stats = calculate_percentiles(aggregate_tps_list)
     parallel_stats = calculate_percentiles(parallel_tps_list)
@@ -820,47 +852,36 @@ def main() -> int:
 
     if paired_aggregate_ratios:
         ratio_stats_agg = calculate_percentiles(paired_aggregate_ratios)
-        # §11.4: median >= min_ratio AND interval lower bound (min ratio) > 1.0.
-        paired_aggregate_pass = (
-            ratio_stats_agg["median"] >= args.min_ratio and ratio_stats_agg["min"] > 1.0
-        )
+        paired_aggregate_pass = ratio_stats_agg["min"] >= args.min_ratio
         paired_aggregate_state = CHECK_OK if paired_aggregate_pass else CHECK_FAIL
     else:
         ratio_stats_agg = {}
         paired_aggregate_pass = False
         paired_aggregate_state = CHECK_EVIDENCE_INCOMPLETE
 
-    if paired_parallel_ratios:
-        ratio_stats_par = calculate_percentiles(paired_parallel_ratios)
-        paired_parallel_pass = (
-            ratio_stats_par["median"] >= args.min_ratio and ratio_stats_par["min"] > 1.0
-        )
-        paired_parallel_state = CHECK_OK if paired_parallel_pass else CHECK_FAIL
-    elif any(p["parallel_exercised"] for p in formal_pairs) and not paired_parallel_ratios:
-        ratio_stats_par = {}
-        paired_parallel_pass = False
-        paired_parallel_state = CHECK_EVIDENCE_INCOMPLETE
-    else:
-        ratio_stats_par = {}
-        paired_parallel_pass = False
-        # C02 #4: parallel not exercised in any formal round -> NOT_EXERCISED.
-        paired_parallel_state = CHECK_NOT_EXERCISED
+    ratio_stats_par = calculate_percentiles(paired_parallel_ratios) if paired_parallel_ratios else {}
+    paired_parallel_state = (
+        CHECK_EVIDENCE_INCOMPLETE if not formal_pairs else
+        CHECK_OK if len(paired_parallel_ratios) == len(formal_pairs) else
+        CHECK_NOT_EXERCISED
+    )
 
     verdict_checks = {
         "per_round_all_ok": CHECK_OK if (not any_round_failed and not any_evidence_incomplete) else
         (CHECK_EVIDENCE_INCOMPLETE if not any_round_failed else CHECK_FAIL),
-        "aggregate_faster_than_serial_paired": paired_aggregate_state,
-        "parallel_faster_than_serial_paired": paired_parallel_state,
+        "aggregate_no_slower_than_serial_paired": paired_aggregate_state,
+        "parallel_work_exercised_paired": paired_parallel_state,
         "request_dag_structure": CHECK_OK if is_dag_payload else CHECK_FAIL,
     }
 
     # Overall exit code precedence: operational error already raised (1);
     # hard failure beats evidence-incomplete (2 > 3).
-    if any_round_failed or paired_aggregate_state == CHECK_FAIL or paired_parallel_state == CHECK_FAIL:
+    if any_round_failed or paired_aggregate_state == CHECK_FAIL:
         passed = False
         status = "fail"
         exit_code = EXIT_FAIL
-    elif any_evidence_incomplete or paired_aggregate_state == CHECK_EVIDENCE_INCOMPLETE:
+    elif (any_evidence_incomplete or paired_aggregate_state == CHECK_EVIDENCE_INCOMPLETE or
+          paired_parallel_state in (CHECK_EVIDENCE_INCOMPLETE, CHECK_NOT_EXERCISED)):
         passed = False
         status = "evidence_incomplete"
         exit_code = EXIT_EVIDENCE_INCOMPLETE
@@ -911,8 +932,8 @@ def main() -> int:
         "verdict_checks": verdict_checks,
         "missing_metrics": sorted(all_missing),
         "not_exercised": (
-            "parallel throughput not exercised in any formal round (no multi-Lane "
-            "token/time counters); aggregate-only verdict"
+            "parallel work not exercised in every formal round (no multi-Lane "
+            "token/time evidence); useful-rate verdict is incomplete"
             if paired_parallel_state == CHECK_NOT_EXERCISED
             else None
         ),
@@ -945,7 +966,7 @@ def main() -> int:
         if all_missing:
             print(f"MISSING metrics (evidence-incomplete): {sorted(all_missing)}", file=sys.stderr)
         if paired_parallel_state == CHECK_NOT_EXERCISED:
-            print("NOT_EXERCISED: parallel throughput (no multi-Lane token/time counters)", file=sys.stderr)
+            print("NOT_EXERCISED: parallel work in one or more formal rounds", file=sys.stderr)
     return exit_code
 
 

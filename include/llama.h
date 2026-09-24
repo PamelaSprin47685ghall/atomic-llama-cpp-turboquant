@@ -1232,7 +1232,7 @@ extern "C" {
     //
 
     #define LLAMA_REROT_STATE_MAGIC   0x52524f54u // 'RROT'
-    #define LLAMA_REROT_STATE_VERSION 8u // synthetic MM-R1 root excluded from logical nodes
+    #define LLAMA_REROT_STATE_VERSION 9u // P-bound cohorts; v8 all-worker steps are incompatible
 
     enum llama_rerot_state_cap {
         LLAMA_REROT_STATE_CAP_NONE          = 0,

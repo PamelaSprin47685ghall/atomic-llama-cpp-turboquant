@@ -136,7 +136,6 @@ void llama_rerot_profile::reset(uint64_t new_request_id) {
     sum_cohort.store(0, std::memory_order_relaxed);
     max_cohort.store(0, std::memory_order_relaxed);
     logical_frontiers.store(0, std::memory_order_relaxed);
-    pen_yields.store(0, std::memory_order_relaxed);
 
     live_groups.store(0, std::memory_order_relaxed);
     cap_groups.store(0, std::memory_order_relaxed);
@@ -332,7 +331,6 @@ std::string llama_rerot_profile::format_tsv() const {
     ss << "avg_cohort\t" << (parallel_snapshots.load(std::memory_order_relaxed) > 0 ? sum_cohort.load(std::memory_order_relaxed) / parallel_snapshots.load(std::memory_order_relaxed) : 0) << "\n";
     ss << "max_cohort\t" << max_cohort.load(std::memory_order_relaxed) << "\n";
     ss << "logical_frontiers\t" << logical_frontiers.load(std::memory_order_relaxed) << "\n";
-    ss << "pen_yields\t" << pen_yields.load(std::memory_order_relaxed) << "\n";
     ss << "actual_query_rows\t" << actual_query_rows.load(std::memory_order_relaxed) << "\n";
     ss << "reader_visible_keys_total\t" << reader_visible_keys_total.load(std::memory_order_relaxed) << "\n";
     ss << "reader_visible_keys_max\t" << reader_visible_keys_max.load(std::memory_order_relaxed) << "\n";
@@ -440,7 +438,7 @@ void llama_rerot_profile::print_summary(FILE * stream) const {
         "[rerot-profile-parallel] req=%" PRIu64
         " snaps=%" PRIu64 " W_sum=%" PRIu64 " W_max=%" PRIu64
         " P_avg=%" PRIu64 " cohort_avg=%" PRIu64 " cohort_max=%" PRIu64
-        " frontiers=%" PRIu64 " pen_yields=%" PRIu64 "\n",
+        " frontiers=%" PRIu64 "\n",
         request_id,
         parallel_snapshots.load(std::memory_order_relaxed),
         sum_w.load(std::memory_order_relaxed),
@@ -450,8 +448,7 @@ void llama_rerot_profile::print_summary(FILE * stream) const {
         parallel_snapshots.load(std::memory_order_relaxed) > 0
             ? sum_cohort.load(std::memory_order_relaxed) / parallel_snapshots.load(std::memory_order_relaxed) : 0,
         max_cohort.load(std::memory_order_relaxed),
-        logical_frontiers.load(std::memory_order_relaxed),
-        pen_yields.load(std::memory_order_relaxed));
+        logical_frontiers.load(std::memory_order_relaxed));
 
     std::fprintf(stream,
         "[rerot-profile-routes] req=%" PRIu64

@@ -7,6 +7,10 @@
 
 #include "server-rerot-mindmap.h"
 
+#include "../src/llama-grammar.h"
+#include "../src/unicode.h"
+
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -109,6 +113,9 @@ static void test_invalid_structure() {
     CHECK(parse(std::string(HEADER)).is_incomplete());
     CHECK(parse(std::string(probe_prefix)).is_incomplete());
     CHECK(parse(std::string(HEADER) + "  ro").is_incomplete());
+    expect_reject(std::string(HEADER) + "   ", error_class::structure, "impossible root indentation prefix");
+    expect_reject(std::string(probe_prefix) + "A\n       ", error_class::structure,
+                  "impossible skipped indentation prefix");
     expect_reject(std::string(HEADER) + "  R", error_class::structure, "impossible root prefix");
     expect_reject(std::string(HEADER) + "  root\n    A\n" + "```junk\n", error_class::envelope, "fence with junk");
     expect_reject(wire("  root\n    A\n") + "trailing", error_class::envelope, "trailing bytes after fence");
@@ -130,6 +137,88 @@ static void test_invalid_structure() {
     expect_reject(wire("  root\n    [leaf]\n"), error_class::label, "brackets");
     expect_reject(wire("  root\n    a\"b\n"), error_class::label, "quote");
     expect_reject(wire("  root\n    `code`\n"), error_class::label, "backtick");
+}
+
+static bool grammar_accepts_suffix(const std::string & suffix) {
+    const std::string grammar_text = grammar_g0();
+    llama_grammar * grammar = llama_grammar_init_impl(
+        nullptr, grammar_text.c_str(), "root", false, nullptr, 0, nullptr, 0);
+    CHECK(grammar != nullptr);
+    if (!grammar) {
+        return false;
+    }
+    auto & stacks = llama_grammar_get_stacks(grammar);
+    for (const auto cpt : unicode_cpts_from_utf8(suffix)) {
+        llama_grammar_accept(grammar, cpt);
+        if (stacks.empty()) {
+            llama_grammar_free_impl(grammar);
+            return false;
+        }
+    }
+    const bool complete = std::any_of(stacks.begin(), stacks.end(),
+        [](const auto & stack) { return stack.empty(); });
+    llama_grammar_free_impl(grammar);
+    return complete;
+}
+
+static void test_grammar_and_depth_agree() {
+    const std::vector<std::string> legal = {
+        "A\n```\n",
+        "A\n      B\n        C\n    D\n```\n",
+        "A\n    B\n    C\n```\n",
+    };
+    for (const auto & suffix : legal) {
+        CHECK(grammar_accepts_suffix(suffix));
+        indent_state state;
+        // Token pieces can split a whitespace run or contain several lines.
+        for (const char & c : suffix) {
+            CHECK(state.consume(std::string_view(&c, 1)));
+        }
+        CHECK(state.closed);
+        CHECK(parse(std::string(probe_prefix) + suffix).is_complete());
+    }
+
+    const std::string skipped = "A\n        B\n```\n";
+    CHECK(grammar_accepts_suffix(skipped)); // old GBNF alone admitted this
+    CHECK(parse(std::string(probe_prefix) + skipped).is_invalid());
+    indent_state state;
+    CHECK(state.consume("A\n"));
+    CHECK(!state.consume("        B")); // reject an entire mixed token
+    CHECK(!state.consume("       "));  // reject a partial whitespace token
+    CHECK(state.consume("      B\n```\n")); // rejection did not mutate state
+    CHECK(state.closed);
+
+    indent_state multiline;
+    CHECK(!multiline.consume("A\n      B\n          C"));
+    CHECK(multiline.consume("A\n      B\n        C\n```\n"));
+    CHECK(multiline.closed);
+
+    // Every next-depth transition through three lines must agree with the
+    // strict parser, including deepening after a dedent and skipped levels.
+    for (size_t second = 2; second <= 6; ++second) {
+        for (size_t third = 2; third <= 6; ++third) {
+            const std::string suffix = "A\n" + std::string(second * 2, ' ') + "B\n" +
+                std::string(third * 2, ' ') + "C\n```\n";
+            indent_state candidate;
+            const bool accepted = candidate.consume(suffix);
+            CHECK(accepted == parse(std::string(probe_prefix) + suffix).is_complete());
+            if (accepted) {
+                CHECK(candidate.closed);
+            }
+        }
+    }
+
+    std::string deep = "A\n";
+    for (size_t d = 3; d <= 80; ++d) {
+        deep.append(d * 2, ' ');
+        deep += "N\n";
+    }
+    deep += "```\n";
+    CHECK(grammar_accepts_suffix(deep));
+    indent_state unbounded;
+    CHECK(unbounded.consume(deep));
+    CHECK(unbounded.closed);
+    CHECK(parse(std::string(probe_prefix) + deep).is_complete());
 }
 
 // An incomplete prefix must stay incomplete as long as a legal completion
@@ -240,6 +329,7 @@ static void test_roundtrip_and_hash() {
 int main() {
     test_valid_documents();
     test_invalid_structure();
+    test_grammar_and_depth_agree();
     test_incremental_prefixes();
     test_plan_shape();
     test_roundtrip_and_hash();

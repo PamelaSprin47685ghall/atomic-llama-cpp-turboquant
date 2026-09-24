@@ -724,7 +724,6 @@ static void test_parallel_ledger() {
     CHECK_EQ(prof.sum_cohort.load(), 0);
     CHECK_EQ(prof.max_cohort.load(), 0);
     CHECK_EQ(prof.logical_frontiers.load(), 0);
-    CHECK_EQ(prof.pen_yields.load(), 0);
 
     // Two logical-step snapshots: W=5/P=6/cohort=3, then W=5/P=6/cohort=2
     // (a member sealed between steps). Mirrors the snapshot site's exact
@@ -748,12 +747,10 @@ static void test_parallel_ledger() {
     CHECK_EQ(prof.sum_cohort.load(), 5);
     CHECK_EQ(prof.max_cohort.load(), 3);
 
-    // Frontier commits and pen yields
+    // Frontier commits
     prof.logical_frontiers.fetch_add(1, std::memory_order_relaxed);
     prof.logical_frontiers.fetch_add(1, std::memory_order_relaxed);
-    prof.pen_yields.fetch_add(1, std::memory_order_relaxed);
     CHECK_EQ(prof.logical_frontiers.load(), 2);
-    CHECK_EQ(prof.pen_yields.load(), 1);
 
     // Reset clears the whole parallel block
     prof.reset(1101);
@@ -762,7 +759,6 @@ static void test_parallel_ledger() {
     CHECK_EQ(prof.sum_p.load(), 0);
     CHECK_EQ(prof.max_cohort.load(), 0);
     CHECK_EQ(prof.logical_frontiers.load(), 0);
-    CHECK_EQ(prof.pen_yields.load(), 0);
 }
 
 // ----------------------------------------------------------------------------
@@ -823,14 +819,14 @@ static void test_format_tsv_stability() {
     //   1  request_id
     //   36 phases: 9 phases x (us, max_us, count, first_us)
     //   28 routes:  4 routes x (1 hit + 6 rejections)
-    //   8  parallelism (snapshots, sum_w, max_w, avg_p, avg_cohort,
-    //      max_cohort, frontiers, pen_yields)
+    //   7  parallelism (snapshots, sum_w, max_w, avg_p, avg_cohort,
+    //      max_cohort, frontiers)
     //   14 layout (11 + span_rows + span_row_spill + span_row_coverage)
     //   14 host & command (11 + upload_staging_us + upload_set_us + upload_count)
     //   9  state & memory
     //   14 computation (upstream §9.2 histogram group)
-    //   Total = 1 + 36 + 28 + 8 + 14 + 14 + 9 + 14 = 124
-    CHECK_EQ(line_count, 124);
+    //   Total = 1 + 36 + 28 + 7 + 14 + 14 + 9 + 14 = 123
+    CHECK_EQ(line_count, 123);
     CHECK(found_req);
     CHECK(found_formal_p);
     CHECK(found_formal_p_first);

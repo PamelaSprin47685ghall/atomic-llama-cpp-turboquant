@@ -13821,7 +13821,13 @@ static bool ggml_vk_flash_attn_rerot_shmem_support(const vk_device & device, con
 // retain the single-head scalar path and its direct-load fallback.
 static bool ggml_vk_flash_attn_rerot_tune(const vk_device & device, uint32_t hsk, uint32_t hsv, uint32_t n_kv, ggml_type k_type, ggml_type v_type, uint32_t head_group, vk_fa_tuning_params & out) {
     vk_fa_tuning_params params = get_fa_tuning_params_scalar(device, hsk, hsv, 1, n_kv, k_type, v_type, true);
-    if (!params.disable_subgroups && params.subgroup_size > 0) {
+    const char * grouped_env = getenv("GGML_VK_REROT_GROUPED_HEADS");
+    if (grouped_env && strcmp(grouped_env, "1") != 0) {
+        GGML_ABORT("GGML_VK_REROT_GROUPED_HEADS must be exactly '1' (got '%s')", grouped_env);
+    }
+    // Preserve the historically validated Br=1 route until a complete
+    // paired model run qualifies grouped RERoT attention.
+    if (grouped_env && !params.disable_subgroups && params.subgroup_size > 0) {
         for (uint32_t heads = head_group; heads > 1; --heads) {
             if (head_group % heads != 0) {
                 continue;
@@ -14504,19 +14510,12 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
     vk_fa_tuning_params tuning_params;
     GGML_ASSERT(ggml_vk_flash_attn_rerot_tune(
         ctx->device, HSK, HSV, n_kv, k->type, v->type, head_group, tuning_params));
-    // The dedicated shader hard-codes `Br = 1` (flash_attn_base.glsl,
-    // constant_id 1) and derives every head/row identity from
-    // `WorkGroupID.y` and `ne2 = n_head_q`. The Y grid must therefore stay
-    // n_head_q: shrinking it by tuning.block_rows leaves heads uncomputed and
-    // desynchronises the split-K partial stride (rows beyond the allocation ->
-    // GPUVM fault / device lost). GQA grouping is a property of the ordinary
-    // FA path, not of this kernel, so only the shared-memory staged variant is
-    // requested here.
-    const uint32_t head_groups = n_head_q;
-    // Keep the requested variant consistent with that contract: the RERoT
-    // kernel stages its own K/V tile, so the ordinary path's multi-row GQA
-    // grouping (block_rows > 1) is not a variant this shader implements.
-    tuning_params.block_rows = 1;
+    // The grouped shader uses one subgroup per Q head and stages each KV tile
+    // once per group. WorkGroupID.y addresses the group, while p.neq2 and
+    // split-K scratch continue to use the full flattened Q-head count. A
+    // scalar variant still uses one workgroup per head.
+    GGML_ASSERT(tuning_params.block_rows > 0 && n_head_q % tuning_params.block_rows == 0);
+    const uint32_t head_groups = n_head_q / tuning_params.block_rows;
 
     // Strides in ordinary FA units (see the rerot_main push-constant overlay
     // in flash_attn_base.glsl).

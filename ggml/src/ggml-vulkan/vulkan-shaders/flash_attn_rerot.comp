@@ -397,6 +397,7 @@ void rerot_main() {
     bool  cvalid[REROT_MAXC];
 
     uint run_b = start;
+    uint previous_group = 0xffffffffu;
     while (run_b < stop) {
         const int g_signed = rerot_entries[2u * run_b + 1u];
         const bool run_ok = (g_signed >= 0 && uint(g_signed) < p.nem2);
@@ -405,17 +406,26 @@ void rerot_main() {
         }
         const uint g = uint(g_signed);
 
-        uint run_e = run_b + 1u;
-        while (run_e < stop && uint(rerot_entries[2u * run_e + 1u]) == g) {
-            ++run_e;
+        if (tid == 0u) {
+            rerot_run_end = min(run_b + Bc, stop);
         }
+        barrier();
+        const uint limit = min(run_b + Bc, stop);
+        for (uint e = run_b + tid; e < limit; e += WGS) {
+            if (uint(rerot_entries[2u * e + 1u]) != g) {
+                atomicMin(rerot_run_end, e);
+            }
+        }
+        barrier();
+        const uint run_e = rerot_run_end;
 
-        if (run_ok) {
+        if (run_ok && g != previous_group) {
             const uint q_base = g * q_grp_stride + (h * p.nb02) / 4u;
             for (uint d = tid; d < HSK4; d += WGS) {
                 rerot_qf[d] = rerot_qv4[q_base + d] * p.scale;
             }
         }
+        previous_group = g;
         barrier();
 
         for (uint b = run_b; b < run_e; b += Bc) {

@@ -3331,7 +3331,7 @@ common_rerot_fit_result common_fit_rerot_capacities(
         test.n_ctx_kv = k_val;
         test.n_person_max = b;
         test.n_pen_max = p;
-        test.n_seq_recurrent = b;
+        test.n_seq_recurrent = std::max(2u, p); // the isolated probe needs a second row even at P=1
         test.n_seq_max = LLAMA_MAX_SEQ;
         test.n_outputs_max = std::max(1u, p * (1u + test.n_rs_seq));
 

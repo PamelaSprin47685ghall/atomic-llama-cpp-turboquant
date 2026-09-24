@@ -215,6 +215,7 @@ struct server_rerot_metrics {
     uint64_t batch_people = 0;
     uint64_t batch_pens = 0;
     uint64_t frontier_rows = 0;
+    uint64_t six_row_batches = 0;
 
     uint64_t brain_bytes = 0;
     uint64_t hand_bytes = 0;

@@ -1,0 +1,13 @@
+{
+  "model": "/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf",
+  "messages": [
+    {
+      "role": "user",
+      "content": "把整数 1 到 20 的平方分别作为独立子题计算，最后只按顺序列出二十个结果。"
+    }
+  ],
+  "temperature": 0.4,
+  "seed": 20260923,
+  "max_tokens": 8192,
+  "stream": false
+}

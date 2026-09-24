@@ -120,7 +120,7 @@ HTML <ol>/<li> planner
 2. **probe 有 512-token 硬上限，且截断与语义拒绝被显式区分。** 探针 token 被排除在用户 `n_predict` 与普通预算统计之外（原 240s 挂死的根因），现在超限即 `rerot_resource_exhausted` fail-closed；`incomplete`（JSON 未闭合，继续采样）与「语法完整但校验失败」（立即 final 并回报解析器诊断）是两条不同路径。成对 trace `probe_reject`/`probe_plan` 把计划压成单行，多任务计划不会被日志按行截断。
 3. **`capture_c_base()` 在正式 P 的 `plan_prefix` 注入完成之后调用，并覆盖当前 root hand_seed（含 conv tails）。** sampler prev/seed 写入 `sampler_snapshot_bytes`。仍需用真实 recurrent 模型核对 brain/hand 配对。
 4. **固定入口用真实请求 messages + spawn_lane 渲染 F_i。** 普通 C0 tape 与 DAG-with-tools 再渲染比较 token LCP；合法前缀变化在 DAG 启动时重建必要状态，不污染 simple 的普通 C0。模板无法无损渲染 CLOSE+handoff+OPEN 时仍 hard_abort。
-5. **W>P：eligible 节点可在未 SEAL 时 START；同一逻辑步的 BODY 写 PENDING，直到 cohort 全员 commit 后才发布。** 物理 pens 仍分时。逻辑 cohort 与分时全周期（`test_dag_w_gt_p_logical_cohort_and_time_slice_certification`）以及目标大模型多 Lane 真机端到端已全量通过；生产服务依据授权保持永久停用。
+5. **W>P：在 $P$ 个物理 Pen 约束下，每个逻辑 step cohort 至多纳入 $P$ 个绑定 worker（同批 decode 每 pen 一 token）。** 运行中/启动中的 worker 保持绑定在对应 Pen 上直至自然 seal，不再每 token 轮转分时；多出的 $W - P$ 个 eligible 节点在就绪队列中排队，待有 Pen 自然释放后按确定性顺序绑定进入后续 step cohort。当前同批 bound cohort 内部写入保持 PENDING 并在全员 commit 后原子发布；已废止旧版每 token 强行分时轮转全部 $W$ 节点的逻辑步全量 cohort 机制（旧分时单测已被 P-bound 队列契约取代）。
 6. **HTML `<ol>` / 随机 Base62 / PAC-DFS 的生产入口已 hard_abort；DAG 上的 HTML fork 会失败。** 解析器、PAC-DFS `build_view` 和大量旧测试仍在树里。递归嵌套 DAG 没有实现。
 7. **0.synthesize 作为独立阶段 admit。** 目标大模型 35B 在单 child（$13 \times 17=221$）、flat 2-worker（$25 \times 12$ 与 $15 \times 16 \to \boxed{540}$）、$A \to C$ 独立 B（$14 \times 15=210, 30 \times 20=600, C=260 \to 860$）以及菱形拓扑（$100 \times 3$ 与 $100 \times 5 \to 800$）下均顺利完成综合闭环，单次自然 stop，无 P 泄漏与 internal FRAME 泄漏。
 8. **Episode 持久化（state v5）包含 C0/C_base、frozen epoch、逻辑步 cohort、conv tails 与 sampler prev。** probe 进行中的 save 被拒绝。RAM 持久化跨槽位恢复已在单测与多读者矩阵中完成验证（`test_dag_tri_mtp_ram_shift_speculative_matrix`）。
@@ -895,69 +895,60 @@ C0/simple 使用保留的 sampler clone。checkpoint 中的 seed/prev 元数据�
 |---|---|
 | B | resident 独立 request/person 数 |
 | P | 可同时绑定执行的 physical pens |
-| W | 某 episode 当前已经逻辑启动、尚未完成的工作阶段数 |
+| W | 某 episode 已满足依赖、尚未完成的逻辑工作数，包含仍在排队的叶 |
 | K | unified physical KV capacity |
 
 ```text
-physical bound stages <= P
-logical active stages = W，可以 > P
+active worker states <= P
+eligible workers = W，可以 > P；未绑定的只排队
 ```
 
-blocked 节点还不算 W；它们只持 descriptor/依赖和共同 C_base 引用，不提前拥有完整 per-stage state/FRAME。
+未启动的排队叶只持 descriptor/依赖和共同 C_base 引用，不提前生成 FRAME、KV 或采样状态；被依赖阻塞的节点还不算这里的 W。性能账本中的 `W_sum/W_max` 是**计划节点总数减 root**，另含 blocked 与 synthesis，不代表当下运行的 pen 数。拟合的 recurrent 行数必须至少为 P，而不是只按 B 配置。
 
 ### 8.2 “eligible 同时启动”的精确含义
 
-同一已提交边界上，新满足依赖的所有节点一起进入逻辑 STARTING cohort。
+在存在 $P$ 个物理 Pen 的执行语义下，“eligible 同时就绪”意味着所有新满足依赖的叶节点均进入调度器的就绪队列。但每个 decode 批次受物理并发限制：**每个逻辑步的 bound cohort 至多选择 $P$ 个 worker**（先纳入所有已绑定的 running/starting 节点，若有空闲 Pen 则按确定性队列顺序填入 queued 状态的 eligible 节点）。
 
-它们不必同一纳秒占用 GPU，但不能因为只有 P 个 slot，就让前 P 个 task 一直跑到自然结束，然后才创建剩余 task。那会改变 peer 可见轨迹和用户要求的逻辑计算。
+单个 episode 内，一旦 worker 绑定到物理 Pen，它将持续保持绑定跨逻辑步推进，直到其自然达到 source_end 并执行自然 seal，**不再为同 episode 的排队叶进行每 token 的分时轮转**。超出物理容量的 $W > P$ 额外 eligible 节点在就绪队列中等待，直到某个活跃节点自然 seal 并释放 Pen 后，才进入后续 step cohort 启动。多个独立 episode 争用同一组 pen 时，既有跨 episode 公平性让位仍是另一条路径，不作为单 episode W>P 的常规调度。
+
+**语义差异与跨波次可见性说明**：此语义与旧版“每一步强行切片轮转全部 $W$ 个节点使所有任务并行生成一词”的逻辑步全量 cohort 不再等价。已绑定的 $P$ 个 worker 每步读取上一步发布的冻结视界；后排队的节点在先前任务自然 seal 并发布正文之后才启动，因而可能观测到先完结 peer 的产物。这种跨波次（cross-wave）可见性的改变**在数学上与旧全量 time-slice 并不等价**，不得混同；新路径尚未经真机吞吐验收。
 
 ### 8.3 一个逻辑 frontier
 
 ```text
-1. 从上一 commit 的 SEALED 状态计算新 eligible
-2. 固定本 frontier active cohort
-3. 固定所有 reader 的 read publish/version
-4. 固定每 stage 本轮应该推进的工作量
-5. 用最多 P 个 pens 分 microbatch 计算
-6. later microbatch 仍然只读本 frontier 冻结的 old world
-7. 所有成员成功后统一 publish PUBLIC/FRAME
-8. 提交合法 SOURCE_END
-9. seal 一次，精确减少 successor remaining_preds
-10. frontier++，再计算新 eligible
+1. 从上一步 commit 的状态计算新满足依赖的 eligible 节点，入队就绪队列
+2. 选取本逻辑步 bound cohort（至多 P 个）：优先保留已 bound 节点，空闲 Pen 按队列顺序接纳 queued eligible 节点
+3. 固定当前 bound cohort 所有 worker 的只读公开视界（frozen read publish frontier/epoch）
+4. 六个物理 pen 在单批次（same batch）中并发 decode 各推进 1 token
+5. bound 节点本步写入的 BODY 统一暂存为 PENDING
+6. 本 step cohort 全员 commit 完成后原子发布（atomic publication），推进发布版本
+7. 若有节点自然产出合法 SOURCE_END，则执行自然 seal：
+   a. 释放对应 physical pen 回空闲池
+   b. 精确执行 remaining_preds-- 解锁直接后继（有未完前驱的依赖后继严格阻塞，直到全部前驱自然 seal）
+8. 若就绪队列仍有未绑定 eligible 节点，在下一步调度时绑定空出的 Pen 进入下一 bound cohort
+9. bound 节点若未到达 source_end，则继续保持 pen 绑定进入下一步，不发生例行 yield/resume
 ```
 
-physical microbatch order 只决定什么时候算，不得决定读到哪个版本。
+物理 batch 并发保证同批次 $P$ 支笔同时 decode；同步 co-bound 成员阅读同一份冻结先验世界，且在整步 commit 时原子发布。
 
 ### 8.4 为什么“排队到别的任务结束”不等价
 
-假设 A/B/C 同 frontier old state 分别为 1/2/3，简化更新：
+在旧版“试图实现全量 W 并行”的理想模型中，若 A/B/C 在同 frontier old state 下，每一步都读相同 frozen old，则数学上严格保持对称无先后偏置。
 
-```text
-new(i) = old(i) + 0.1 * sum(old(peer))
-```
+而在当前 $P$-bound cohort 队列语义下：
+若 $P=2$，则先调度 A、B 绑定直到自然 seal；C 必须在队列中等待 A 或 B 释放 Pen。当 A 完结 seal 后，C 绑定 Pen 启动，此时 C 读取到的公共前缀中已经包含了 A 完整 commit 的正文。
 
-正确逻辑中三者都读冻结 old，怎么分批都得到同一结果。
+这意味着：
+1. **C 启动时可观测到已自然 seal 的 A 的输出**；旧版每 token 分时轮转中，C 从第一步就参与，之后只能逐步观测 A 先前 frontier 已发布的部分输出，而不是启动时一次看到完整 A；
+2. **跨波次可见性发生了实质性改变**：由于 A 先行完结并公开，C 的注意力视野和 prompt context 包含了 A 的最终正文，不再与 A 呈现严格的对称解耦。
 
-若先算 A 并立即 publish，再算 B/C，后者读到了 A_new，数学已经变了。
+因此必须诚实记录：**当前 P-bound cohort 队列调度与旧版 W>P 全量分时调度在数学与注意力可见性上并不等价**。用户明确选择此方案以消除频繁上下文与采样器换槽的高昂开销，使物理 Pens 能以批处理最大吞吐执行至自然完结。
 
-真实 Transformer/GDN 更复杂，但这个反例已经足够证明：
+### 8.5 仅已绑定的 P 份局部 state 驻留
 
-> **“有一个 queue”不等于支持 W>P。**
+在队列调度模型下，系统同时处于活跃执行状态的阶段数受限于物理 Pen 数（最多 $P$ 份活跃 state 驻留于物理槽位）。未获得 Pen 的 queued eligible 节点仅保留初始描述符和对前驱/基底的只读引用，直到首次分配 Pen 绑定时正式初始化其独立 recurrent/conv/sampler state。
 
-### 8.5 W 份局部 state 要真实存在
-
-native lane-local recurrence 下，每个已经推进过的 active stage 都有自己的 recurrent/conv/sampler 状态。
-
-P 只是 executor 数，不会让 W-P 份 state 消失。
-
-可用承载手段：
-
-- device-resident logical state，多路绑定少量 pens；
-- parked/COW lineage；
-- 完整 RAM demotion/restore；
-- 其它经定义的 state virtualization。
-
-不能让 suspended stage 恢复时重新拿 C_base，假装之前没有思考过。
+旧版为同一 episode 的排队叶让位的 `yield_dag_pen_for_ready` 已删除；空闲 pen 却缺 recurrent 行属于容量/释放不变量错误，不通过换笔掩盖。跨 episode 公平性与持久化状态恢复仍有独立的 suspend/resume 路径；**单 episode 正常排队不触发停放或恢复**。
 
 ### 8.6 seal 是恰好一次事务
 
@@ -988,27 +979,27 @@ seal 事务：
 
 不把 DAG 深度直接当作任务时长，不用 CPM/置信度/标题内容决定谁先长期运行。
 
-第一目标是：
+目标调度契约：
 
 ```text
-same logical cohort
-same frozen read world
-same math
-independent of physical packing
+P-bound cohort (up to P workers)
+same frozen read world for co-bound peers
+atomic publication of bound cohort step
+queued eligible workers wait for natural seal
 ```
 
-之后才允许对同一逻辑计算做物理排布优化。
+物理 pens 同批 decode，同步 co-bound 成员读取同一冻结视界；依赖后继严格阻塞直到其全部前置节点自然 seal。
 
-### 8.8 当前实现与实测认证
+### 8.8 当前实现与待验收项
 
-runtime 已严格区分逻辑 cohort 与物理 pen，并用冻结 publish epoch 约束每个逻辑步的读取。正文在整个 cohort 提交前保持 PENDING，物理 binding 可以在工作阶段自然结束前切换。
+当前运行时采用 **P-bound cohort 队列调度契约**：
+1. 每个逻辑步的 step cohort 最多接纳 $P$ 个（如 6 个）已绑定或自队列出队的 worker，物理 pens 在同批（same batch）中并发执行 decode；
+2. 绑定在 Pen 上的 worker 跨逻辑步持续运行，直至自然到达 source_end 并完成自然 seal，取消了每 token 轮转分时的例行切换开销；
+3. 超额 eligible 节点（$W > P$）在就绪队列中严格等待空闲 Pen，前序节点自然 seal 释放槽位后按确定性次序入队绑定；
+4. 当前同步 bound cohort 成员依然遵循原子发布契约：未发布正文保持 PENDING，全员 commit 后原子公开，本批次内部共享冻结的先验读者视界；依赖后继节点必须等待所有前驱自然 seal 完成后方可变为 eligible。
 
-这部分调度契约已获全生命周期严格证明（`test_dag_w_gt_p_logical_cohort_and_time_slice_certification`）：
-- 证明无未满足依赖的 $W=3$ 个全部 eligible 节点在同一个逻辑调度边界统一入队并被 `snapshot_dag_logical_step` 纳入 `dag_step_cohort`，不等待前序任务自然完结或释放 Pen；
-- 证明逻辑步执行期间严格冻结公开读取视界（`frozen_read_publish_epoch`），各物理切片轮转执行（Time-slice 1 -> 2 -> 3）期间，后来切片（如 Worker 2/3）绝不提前泄露或观测同一步前面切片已写入但尚未发布的 token；
-- 证明在中途只有部分成员提交时，`finish_frontier` 严格守门拒绝半发布（`dag_logical_step_complete == false`）；
-- 证明在全量成员全部 commit 后，`finish_frontier` 触发原子整步发布，推进 frontier 步数、发布新 epoch、清空提交缓存并同步使各成员读者视界实时互见，最终各成员自然完结并解锁综合节点。
-同时在目标大模型 Ornith-1.5-35B 上完成 flat 2-worker、A->C 带独立 B 以及菱形拓扑的真机端到端全量验证（`scripts/rerot-target-ornith-multi-lane.py`）。生产环境服务依据授权保持永久停用状态。
+**历史验收状态标记**：
+旧版基于全部 eligible 节点同一逻辑步全量入队并在单个/受限 Pen 上逐 token 轮转分时的证明测试（`test_dag_w_gt_p_logical_cohort_and_time_slice_certification`）**已作废**。新增 `test_dag_p_bound_cohort_queue_until_natural_seal` 钉住队列与自然释放，但受禁跑要求尚未执行。真机验收尚须证明同配置六 pen 合计采样吞吐不低于 simple 单流；当前历史跑分均来自旧调度，不能拿来证明新路径。
 
 ---
 
@@ -1236,7 +1227,7 @@ model resident weights
 + shared prompt/public KV physical union
 + DAG FRAME/BODY resident KV
 + C0 / C_base lineage state
-+ W active stages 的实际 lane-local recurrent/conv/sampler state
++ 至多 P 个当前 bound workers 的物理槽位 recurrent/conv/sampler state（未绑定 queued eligible 仅持轻量描述符与前驱引用）
 + P executor graph/workspace
 + Tri score/pack scratch
 + MTP draft/verify/checkpoint
@@ -1250,7 +1241,7 @@ model resident weights
 - 用 Turbo4/Turbo2 KV 类型推算权重 resident bytes；
 - 用 MoE active params 推算全部模型驻留；
 - 按 reader 数重复计 shared prefix physical KV；
-- 只按 P 份 recurrent state 计预算，却允许 W>P active；
+- 忽略 queued 阶段激增时的描述符/KV 累积；
 - 忽略 FRAME/probe token 与 KV；
 - 用真实 OOM/driver reset 来探容量。
 
@@ -1279,16 +1270,17 @@ auto-fit 如果声称某组合可运行，真实压力下不能因漏计 W state
 分清：
 
 ```text
-暂时无 pen
-    = scheduling/residency 问题
+暂时无 pen（W > P，多余 eligible 处于 queued 状态）
+    = 队列调度正常等待（排队直到前序 worker 自然 seal 释放 Pen）
     ≠ task failure
 
-计划要求的逻辑 state 总量无法承载
+计划要求的全局 KV / 节点数 / 内存上限无法承载
     = resource capability failure
     → 明确 fail/abort
 ```
 
-不允许把后者偷偷改成“只运行前 P 个问题，剩下的等它们完成”，因为那改变了 W>P 的逻辑并发语义。
+在当前 P-bound cohort 队列语义下，当所有可用 Pen 均处于 bound 占用状态时，超出 $P$ 的 eligible 节点进入确定性队列排队，直至前驱/已绑定节点自然 seal 释放 Pen。
+这明确为调度器在固定物理 Pen 并发下的正规队列行为，不再进行每步例行分时换槽。
 
 ---
 
@@ -1478,10 +1470,10 @@ run B: probe → simple → restore
 #### 工作
 
 - logical active 与 physical bound 分离；
-- 同 frontier eligible cohort；
+- P-bound logical step cohort（至多 P 个 worker）与 eligible 就绪排队；
 - frozen read version；
-- finite pens microbatch；
-- W stage state persistence / swap；
+- finite pens 同批并发 decode 与 bound worker 保持绑定至自然 seal；
+- 删除 W>P 每步换笔路径，排队叶只在自然释放 pen 后启动；
 - atomic frontier publish；
 - exactly-once seal；
 - synthesis start transaction；
@@ -1490,9 +1482,9 @@ run B: probe → simple → restore
 #### 必须通过
 
 1. A 完成可立即解锁 C，不等无关 B。
-2. W>P 时全部 eligible 在同逻辑边界 active，不等前 P 个任务自然退出。
-3. 同一逻辑 frontier 不同 microbatch 分割/row order 得到同一规定结果。
-4. later slice 不偷读 earlier slice 本 frontier 新 PUBLIC。
+2. $W > P$ 时，当前 bound cohort 严格至多接纳 $P$ 个已绑定/就绪节点，同批并发 decode；多余 eligible 节点在就绪队列排队，直至前驱节点自然 seal 释放 Pen 后按确定性次序接入。
+3. 同一 bound cohort 内各 worker 共享冻结前沿视界，本步内不提前互见本步未发布的 peer 正文。
+4. bound cohort 整步原子发布，未全员 commit 之前正文严格保持 PENDING。
 5. 任一 slice 失败不发布半个 frontier。
 6. duplicate end callback 不重复 `remaining_preds--`。
 7. abort/cancel 后无 orphan state/ref/response。
@@ -1500,18 +1492,18 @@ run B: probe → simple → restore
 
 #### 当前状态
 
-**逻辑步已接线，调度不变量、分时、微批次切片隔离、重复结束幂等与取消清理已获单测覆盖，真机分时未验收。** eligible 可在未 SEAL 时 START；同一逻辑步 BODY 保持 PENDING，直到 cohort 全员 commit 后发布。CPU fixture 证明 foreign reader 看不到未发布 BODY。针对阶段 4 核心约束已单测验证：
+**P-bound 队列调度源码已接线，尚未执行新测试或真机复测；以下既有认证仅适用于未改变的基础不变量。** 同一 bound cohort BODY 保持 PENDING，直到 cohort 全员 commit 后发布。针对阶段 4 核心约束，旧测试曾验证：
 1. **调度不变量硬门**（必须通过 8）：合法 DAG 无 runnable 却有 unfinished 节点时立即触发 `rerot_scheduler_invariant_error` 终止 episode（`activate_dag_frontier`）；
-2. **切片微批次执行顺序与隔离**（必须通过 3 与 4，`test_dag_microbatch_slice_order_and_no_earlier_public_leak`）：同一逻辑 frontier 内不同 microbatch 分割/row 顺序产生严格一致的状态与视图结构；且 later slice 在本 frontier commit 之前绝不泄漏或提前读取 earlier slice 的新写入；
+2. **Bound Cohort 批次隔离与原子发布**（必须通过 3 与 4）：同一 bound cohort 内各 worker 在本 step commit 之前绝不泄漏或提前读取同步其他 worker 的新写入；全员 commit 后原子公开；
 3. **重复 source-end 与恢复通知幂等性**（必须通过 6，`test_dag_duplicate_source_end_and_restore_no_double_decrement`）：重复触发同一已完成节点的 source_end 事件或经持久化状态加载后，其后继依赖的 `remaining_preds` 严格执行 exactly-once 扣减，绝不发生重复扣减或负数溢出；
 4. **取消/资源异常清理不留孤儿状态**（必须通过 7，`test_dag_abort_clears_orphan_refs_and_pens`）：hard_abort / client cancellation 触发后，所有活跃执行绑定的 pen 立即全量回收为 free 态，节点 physical_slot 重置为 -1，无孤儿 sequence 引用或残存运行状态；
-5. **W 活跃阶段局部状态保留与换槽换出**（`test_dag_w_active_state_retention_and_swap`）：在 $W > P$（$P=1, W=2$ 并发 Worker）受限物理 Pen 竞争下，当 Worker 1 在逻辑 Frontier 边界让出/挂起 Pen 0 给 Worker 2 运行时，Worker 1 所累积的私有局部状态（`sampler_blob`、`mtp_blob`、`hand_seed` 与 `storage_pos_next`）100% 完整保留在逻辑节点运行时中，绝不重置为 C_base 或丢失思考进展；在换回 Pen 0 恢复（`resume_pen`）后精确延续状态与存储游标，两 Worker 均完成生成并自然 SEAL；
-6. **W>P 逻辑 Cohort 与物理分时全生命周期认证**（必须通过 2，`test_dag_w_gt_p_logical_cohort_and_time_slice_certification`）：在极端受限物理执行槽位（$P=1, W=3$ 并发独立 Worker）下：
-   - 证明无未满足依赖的 $W=3$ 个全部 eligible 节点在同一个逻辑调度边界统一入队并被 `snapshot_dag_logical_step` 纳入 `dag_step_cohort`，不等待前序任务自然完结或释放 Pen；
-   - 证明逻辑步执行期间严格冻结公开读取视界（`frozen_read_publish_epoch`），各物理切片轮转执行（Time-slice 1 -> 2 -> 3）期间，后来切片（如 Worker 2/3）绝不提前泄露或观测同一步前面切片已写入但尚未发布的 token；
-   - 证明在中途只有部分成员提交时，`finish_frontier` 严格守门拒绝半发布（`dag_logical_step_complete == false`）；
-   - 证明在全量成员全部 commit 后，`finish_frontier` 触发原子整步发布，推进 frontier 步数、发布新 epoch、清空提交缓存并同步使各成员读者视界实时互见，最终各成员自然完结并解锁综合节点。
-真实大模型目标推理已由 `scripts/rerot-target-ornith-multi-lane.py` 完整覆盖并通过。生产服务依据授权保持永久停用状态。
+5. **物理容量不变量**：拟合与最终上下文均为 $P$ 支 pen 预留 recurrent 行；配置的 batch/microbatch 至少容纳 $P$ 行。空闲笔缺行是状态错误，不能换笔或悄悄减少并发；
+6. **【历史认证作废，待复验】W>P 调度语义已转为 P-bound Cohort 队列契约**：旧版以全部 $W$ 个 eligible 节点强行同入逻辑 cohort 并每 token 轮流切片的单测（`test_dag_w_gt_p_logical_cohort_and_time_slice_certification`）**已作废**。新测试尚未执行，预期契约为：
+   - 调度器在每个逻辑步至多将 $P$ 个 worker 纳入 `dag_step_cohort` 并绑定物理 Pen；
+   - 绑定的 worker 跨步持续执行，直到其自然 source_end 完成自然 seal 并释放 Pen；
+   - 多出的 $W > P$ 个 eligible 节点在就绪队列中排队，待空出物理 Pen 后按确定性次序入队绑定；
+   - 同一步内 bound cohort 成员保持原子提交发布与冻结视图，依赖后继仍保持阻塞直至全部前驱自然 seal。
+旧版真实大模型目标推理曾由 `scripts/rerot-target-ornith-multi-lane.py` 覆盖；新调度尚无实测结果。
 
 ---
 
@@ -1785,8 +1777,8 @@ shadow
 | C_base = 正式 P 之后的 state | **已实现并认证通过**（`capture_c_base` 在正式 P 完成后捕获；`test_dag_capture_c_base_snapshots_current_seed` 与 `test_dag_predecessor_completion_order_and_physical_row_invariance` 严格证明：多 stage 从 C_base 继承种子，前驱完成顺序与物理槽位/Pen 变动不改变后继种子与读者视图，且首写 COW 彼此完全隔离） |
 | actual native tool-round FRAME | **已实现并认证通过**（`test_dag_actual_native_tool_round_frame_certification` 在 Qwen3.5、DeepSeek-V4、DeepSeek-V4-Flash、DeepSeek-V3.2 等生产模板上，严格证明 $F_i$ 渲染基于原生 `spawn_lane` 工具回合与意图序列化，具备阶段独立性与槽位无关性；任意合法循环排列 $P + B_2 + B_3 + B_1$ 严格保证封口前段并独留当前读者 reasoning 打开；终极综合视图中所有前置工作片段自然完结闭合，唯独综合帧 reasoning 打开） |
 | tokenizer-level source-end 无损边界 | **已实现并认证通过**（`test_multi_template_source_end_boundary_certification` 覆盖 XML `</think>`、Command-R `[/THINK]`、ChatML `<|im_end|>`、Specialized `<|close|>think<|sep|>`, `<|END_THINKING|>`, `</mm:think>`, `<|channel|>` 等模板的 token 切分保留、候选 PENDING 挂起与 snapshot 还原） |
-| W>P logical cohort + physical time-slice | **已实现并认证通过**（`test_dag_w_gt_p_logical_cohort_and_time_slice_certification` 严格证明：在 $P=1, W=3$ 场景下，全部 eligible 节点同一调度边界进入逻辑 cohort，不待先前任务退出；分片切片执行期间冻结读取视界，后来切片绝不提前观测同一步未发布的 peer 写入；全员 commit 完成前绝不提前发布半个 frontier；全员 commit 后原子发布全量正文并统一更新读者视界；各节点自然完结释放依赖解锁综合） |
-| W active state budget/restore | **已实现并单测验证**（`test_dag_w_active_state_retention_and_swap` 证明挂起节点局部 state/sampler/hand 完整保留且换槽恢复后零丢失） |
+| W>P P-bound cohort + natural seal queue | **源码已接线，尚未执行新回归或真机吞吐验收；旧 all-W time-slice 认证已作废**（新契约：至多 $P$ 个 worker 组成同批 bound cohort，保持绑定直至自然 seal；超出 $P$ 的 eligible 节点排队；同批成员保持冻结视图和原子发布，依赖后继等待全部前驱 seal。新增 `test_dag_p_bound_cohort_queue_until_natural_seal` 尚未运行） |
+| W active state budget/restore | **旧轮转测试已删除**；未启动的排队叶不占活跃 recurrent/sampler/KV 行，当前仅运行中的 $P$ 支 pen 占行；新调度尚未实测。 |
 | final 0.synthesize clean cutover | **已通过**（单 child 闭环下作为独立 stage 启动，使用稳定最终视图及新 logits，输出准确 221） |
 | 删除旧 random-ID/tree/fence production semantics | **已实现硬阻断与 clean cutover**（DAG 模式下 `publish_pending_record` 与 `freeze_fork_parent` 严格拒绝 HTML planner records 并 hard_abort；非 DAG 保留用于回归测试） |
 | target Ornith single child DAG | **已通过**（分配律 13x17=221 单 worker 自然 end 与 synthesis 闭环） |
@@ -2725,7 +2717,7 @@ cell，记录 (idx, storage, meta, sig)。每个 view group 由「扫描」退�
 | **R10** | 逻辑 State 驻留池：D2D Parking | Host 侧 `capture_hand_seed` / restore 可用 | 仅 Host 序列化验证；显存 D2D Parking 槽位未验证 | 缺乏 D2D 替换 CPU 往返的端到端时延收益 | **不予晋级** | 须在显存建立 native state slots，通过跨 Lane 换笔状态等价测试。 |
 | **R12** | 阶段预定义图族 | predefined graph 基础设施存在 | 真实 RERoT 多阶段生命周期审计未完成 | 尚未取得稳态 graph_def_count 归零带来的端到端冷启动延迟收益 | **不得宣称净收益** | 须按原因桶为常用阶段建立固定图族，消除执行期图重构开销。 |
 | **R13** | Compact Span ABI 展开桥与直通 | ABI v1 固化，CPU 展开与 Vulkan 展开核函数（`rerot_span_expand.comp`）已交付 | `test-rerot-span-expand` 与 CPU 位级对拍 100% 通过（`LLAMA_REROT_GPU_SPAN_EXPAND=1`） | GPU 展开后仍生成逐 entry 密集张量输入，未直通 attention 算子；真实路由收益未测 | **保持 Opt-in**（严禁默认开启） | 阶段 A：测定 GPU 展开真实净收益；阶段 B：改造 Attention 核函数直通消费 Span 描述符。 |
-| **R14** | RERoT 端到端净收益 A/B/B/A | 测量脚本 `rerot-throughput-gate.py` 已重构（四态判定、配对中位数、Counter 分离） | Mock 单测 6/6 通过；定向测试可运行 | 真实全特性开启与纯 Target 真实请求配对净收益尚缺 | **未获验收** | 须在真实模型上执行多轮 A/B/B/A，以客户端 committed tokens/完整请求墙钟为准。 |
+| **R14** | RERoT 端到端净收益 A/B/B/A | 测量脚本 `rerot-throughput-gate.py` 区分 sampled-token 速率与 model-token 诊断，校验六行同批计数 | Mock 单测 10/10 通过；首次同请求配对的 RERoT 探针语法被拒 | 无完整真实配对净收益数据 | **未获验收** | 完成合法真实路由、多轮 A/B/B/A，以客户端 committed tokens/完整请求墙钟为准；不能用单次失败或 generation-only 速率代替。 |
 | **Q1** | 图级公共输入复用 + MoE 专家聚集 | 仅激活旋转局部共享；图级 CSE 与专家聚集未实现 | 无 GPU 共享输入执行证据 | 未测量 | **保持研究态** | 须在 `llama-graph` 中实现具名 norm/量化共享，并建立专家分桶重排逻辑。 |
 | **Q3** | 公共 KV 块多 Reader Attention | 主机端共享 World 已交付；离线 2-Reader 单 invocation Shader 原型存在 | CPU 参考层与 shadow oracle 通过对拍（误差 < 3.9e-6） | 未进入生产调度；可变长多 Reader 真实加速未测 | **保持研究态** | 须平衡 LDS/VGPR 占用，编写生产级多 Reader 共享 Attention 核函数。 |
 | **Q5** | GDN 状态共同基底 + 低秩增量 | CPU 参考层已交付（`llama-rerot-math.*`） | F32 数值门实测通过（相对误差 ~1.9e-7 有界 / ~5.1e-7 弱衰减） | 无生产 GPU 低秩递推路由与收益 | **保持研究态** | 须编写 GPU 端低秩递推算子，并设立增量步数 $r$ 超标时平滑回退至稠密矩阵的安全机制。 |
@@ -2756,8 +2748,20 @@ cell，记录 (idx, storage, meta, sig)。每个 view group 由「扫描」退�
 
 #### 当前协议：固定前缀、逻辑叶与物理 pen 解耦
 
-用户明确要求保留细分，不再以 pen 数或固定 16/96 节点阈值缩减逻辑计划。当前探针只给一句 `Let me lay out a mind map.`；其后强制注入标准 Mermaid 前缀 `` ```mermaid\nmindmap\n  root\n    ``，文法仅生成第一个子节点开始的后缀。字面 `root` 是树形协议锚点：仍作为内部索引 0 以维持父子结构，但不计入 `node_count`、不成为 leaf/worker，也不会进入 worker 作用域文字。解析器已删除节点数、叶数、wire 字节数、深度与单标签长度的预算参数；mindmap 也不再走新增的增量审计或 JSON 独有的 512-token 探针闸门。探针在检测到末尾围栏后才完整解析一次，避免宽树每 token 重扫。仍对围栏、两空格一级且不得跳级的缩进及字符集作严格语法校验；最终工作总量受所选模型的 context 与实际运行资源约束，不截枝。旧版状态 blob 因 root 语义变更在 RERoT state v8 明确拒绝。
+用户明确要求保留细分，不再以 pen 数或固定 16/96 节点阈值缩减逻辑计划。当前探针只给一句 `Let me lay out a mind map.`；其后强制注入标准 Mermaid 前缀 `` ```mermaid\nmindmap\n  root\n    ``，文法仅生成第一个子节点开始的后缀。字面 `root` 是树形协议锚点：仍作为内部索引 0 以维持父子结构，但不计入 `node_count`、不成为 leaf/worker，也不会进入 worker 作用域文字。解析器已删除节点数、叶数、wire 字节数、深度与单标签长度的预算参数；mindmap 也不再走新增的增量审计或 JSON 独有的 512-token 探针闸门。探针在检测到末尾围栏后才完整解析一次，避免宽树每 token 重扫。仍对围栏、两空格一级且不得跳级的缩进及字符集作严格语法校验；最终工作总量受所选模型的 context 与实际运行资源约束，不截枝。RERoT state v9 拒绝旧版全 W cohort 的 v8 blob，防止恢复后绕过 P-bound 队列约束。
 
-CPU 回归：2048 叶且超过旧 16384-byte wire 上限可完整 parse/serialize；64 层单链与 256-byte 标签亦合法；25 叶在单 pen 上同 cohort 排队、yield 后继续 admission。真机使用 Bonsai-2 27B PQ2_0、RX 6800 `Vulkan0`、模型原生 `-c 262144`、六 pen：请求「把整数 1 到 20 的平方分别作为独立子题计算，最后只按顺序列出二十个结果。」实际生成 **21 个叶子 / 21 个逻辑节点**（额外生成一枚 `1 to 20` 叶），probe 119 token、frame 5016 token，HTTP **200 / stop / 1254.7 s**；公开输出严格等于 1²..20²。证据为 `artifacts/mm-r1/2026-09-24-bonsai-raft-gpu/fixed-prefix-wide-squares.json`、`fixed-prefix-completed-route.log`、`fixed-prefix-six-workers.log`。通用缩进文法及无预算解析器另以 `只回答 5+7 等于几？` 真机烟测两次：HTTP **200 / stop / 44.0 s** 与 **43.9 s**，答案均为 `12`；见 `fixed-prefix-generic-depth-smoke.json`、`fixed-prefix-generic-depth-plan.log` 和 `fixed-prefix-final-smoke.json`。
+旧版 CPU 回归：2048 叶且超过旧 16384-byte wire 上限可完整 parse/serialize；64 层单链与 256-byte 标签亦合法；25 叶在单 pen 上按当时的全量 cohort 轮转 admission。旧版真机使用 Bonsai-2 27B PQ2_0、RX 6800 `Vulkan0`、模型原生 `-c 262144`、六 pen：请求「把整数 1 到 20 的平方分别作为独立子题计算，最后只按顺序列出二十个结果。」实际生成 **21 个叶子 / 21 个逻辑节点**（额外生成一枚 `1 to 20` 叶），probe 119 token、frame 5016 token，HTTP **200 / stop / 1254.7 s**；公开输出严格等于 1²..20²。证据为 `artifacts/mm-r1/2026-09-24-bonsai-raft-gpu/fixed-prefix-wide-squares.json`、`fixed-prefix-completed-route.log`、`fixed-prefix-six-workers.log`。通用缩进文法及无预算解析器另以 `只回答 5+7 等于几？` 真机烟测两次：HTTP **200 / stop / 44.0 s** 与 **43.9 s**，答案均为 `12`；见 `fixed-prefix-generic-depth-smoke.json`、`fixed-prefix-generic-depth-plan.log` 和 `fixed-prefix-final-smoke.json`。
 
-原样 Raft 提示在本轮固定前缀、已撤销叶数阈值但尚未撤销旧深度/标签边界的中间构建中形成 **73 个逻辑节点、51 叶 / 六 pen**，probe **613 token**（确实越过旧 512 闸门），进入 53-node runtime 并实际轮转；客户端 **3600 s 截止时已进入 synthesis，但尚无完整公开答复**，服务器随后因客户端断开取消该请求。最终无预算构建只做了上面的短题真机烟测，未重跑该 Raft 长任务；此轮只能证明当时宽树规划和执行推进，**不能**拿旧版 7/16 评分外推当前协议的 Raft 教学质量；记录见 `fixed-prefix-plan.log`、`fixed-prefix-raft-stress.json`。当前这条长请求的端到端时延仍是未闭合问题，不伪称 HTTP 200。
+原样 Raft 提示在固定前缀、已撤销叶数阈值但尚未撤销旧深度/标签边界的**旧调度构建**中形成 **73 个逻辑节点、51 叶 / 六 pen**，probe **613 token**（确实越过旧 512 闸门），进入 53-node runtime，以当时的 all-W 逻辑步轮转推进；客户端 **3600 s 截止时已进入 synthesis，但尚无完整公开答复**，服务器随后因客户端断开取消该请求。最终无预算构建只做了上面的短题真机烟测，未重跑该 Raft 长任务；此轮只能证明当时宽树规划和执行推进，**不能**拿旧版 7/16 评分外推当前协议的 Raft 教学质量；记录见 `fixed-prefix-plan.log`、`fixed-prefix-raft-stress.json`。当前这条长请求的端到端时延仍是未闭合问题，不伪称 HTTP 200。新调度的第一阶段吞吐验收要求六个物理 pen 在单批内同时 decode，超出的 eligible 节点排队，不在每步换槽；下述唯一一次配对尝试未进入 DAG，故尚未测得此条件。
+
+### 22.4 六 pen 固定 cohort 性能候选与一次配对尝试（2026-09-24）
+
+调度已从按所有逻辑 worker 每 token 换槽改成至多 P 个物理 pen 常驻同一 cohort，超出的 eligible worker 排队，直到现有 pen 自然完成才补位；recurrent KV 行与 pens 同容量，排队 worker 在获得 pen 时才克隆 lineage。RERoT host 布局删除未消费的 per-reader Base 排序，span staging 不再每 token 全量清零或二次遍历；Vulkan indexed attention 可将 GQA 同 KV-head 行按 Br 分组并在 tile 内并行找相位边界。后者尚未完成真实模型收益/质量门，**默认保留历史 Br=1**，须显式 `GGML_VK_REROT_GROUPED_HEADS=1` 才启用候选。`rerot_six_row_batches` 只在一次成功 `llama_decode` 的输入中确有至少六条 RERoT pen 行时递增，验收脚本要求 `--min-peak-lanes 6` 时该 counter 为正；峰值分配六 pen 本身不等于六行同批执行。`test-rerot-attn`、`test-rerot-runtime`、`test-rerot-profile`、`test-rerot-span-expand`、`test-rerot-view` 与 `test-server-task` 的定向测试通过；吞吐 gate mock 10/10 通过。上述只能证明这些局部正确性路径，不证明模型端到端吞吐获益。
+
+同一 Bonsai-2 27B PQ2_0、RX 6800 `Vulkan0`、`-c 262144 -np 6 --rerot-people 6 --rerot-pens 6 -ctk q8_0 -ctv turbo4`、固定前缀 mindmap 和相同 1..20 平方请求，**只发起一次**先 simple 后 RERoT 的配对试验（seed 20260923；gate `--rounds 1 --min-ratio 1.001 --min-peak-lanes 6`；试验时 grouped attention 尚未收回 opt-in）。simple 先完成，服务端记录 448 decode tokens、18,925.09 ms eval（23.67 tok/s）、19,920.13 ms total；随后 RERoT 探针被解析器拒绝 `structure: skipped an indentation level`，HTTP 500，episode 未进入 worker 执行。**这是 GBNF 与解析器的契约缺口，不能简单归责模型违反 GBNF**：`grammar_g0()` 的 `indent ::= "    " ("  ")*` 允许后续行任意偶数层级，解析器却要求新深度至多比当前父链加一；例如首子节点四空格之后直接八空格，文法允许而解析器拒绝。该次未启用 `rerot_trace`，因此没有保存被拒计划原文，只有解析器诊断；无法确定具体跳级行，亦不能归因于 grouped numerics。脚本在第二臂中止，**未生成完整配对 JSON、未测到六行同批或有效 token 吞吐比，更不能声称打败 simple**。不应通过静默补齐父节点绕开 fail-closed；按一次运行的约束未补跑。可复现请求配置在 `scripts/rerot-bonsai-throughput-request.json`。
+
+R02/Q1/Q3/Q5/Q6/Q7/Q8/Q9/Q10 与 R07/R09/R10/R12/R13 的生产级跨 reader/跨算子优化仍受上表数值、安全及真实路由准入门约束；此轮没有将研究原型伪装成已验证默认路径。全请求客户端 committed-token/墙钟仍是最终黄金口径，脚本的 sampled-token generation rate 只是其中一个诊断维度，不能取代多轮 A/B/B/A 验收。
+
+#### 后续修复：GBNF 与严格缩进口径对齐
+
+保持固定前缀 Mermaid mindmap 和任意有限树深度；静态 GBNF 仍约束标签、行形与结束围栏，在其后叠加一个**有状态的缩进采样约束**。它在选 token 前检查整个 token piece（包括跨行和只含部分空格的 piece），禁止下一行深度超过上一行加一；缩进判断与最终解析器共用 `next_depth_valid()`，不生成缺失的父节点，也不引入固定最大深度；独立解析器还会立即拒绝已经不可能补全的过深缩进前缀。普通回答与其他路由文法不安装此约束。`test-rerot-mindmap-parser` 覆盖原先「GBNF 允许、解析器拒绝」的跳级例、分段 token、同 token 多行、回退后再加深、80 层单链及相邻层级状态对拍；`test-rerot-parser`、`test-rerot-runtime` 同过。词表专用的 Qwen2 GGUF 上真实采样器链烟测：单独 GBNF 对合法/跳级两例均接受，叠加深度约束后仅接受合法例（`valid=1, skipped=0`），未启动模型推理。旧 HTTP 500 仍为历史事实，此修复**没有再次运行真实模型或取得吞吐比**。

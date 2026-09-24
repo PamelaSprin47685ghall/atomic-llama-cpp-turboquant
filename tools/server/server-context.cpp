@@ -2824,6 +2824,9 @@ llama_tokens rerot_native_fixed_entry_tokens(
                 model_tgt,
                 root_lane_task.params.sampling,
                 (int32_t) llama_n_ctx(ctx_tgt)));
+            if (root_lane_task.params.rerot_plan_wire == "mindmap") {
+                common_sampler_append_grammar(root_lane_sampler.get(), server_mindmap::init_indent_sampler(vocab));
+            }
         } catch (const std::exception &) {
             return false;
         }
@@ -3228,18 +3231,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
         transport_it->second->segmented_active = true;
         auto & lineage = transport_it->second->lineage_tokens;
         lineage.insert_or_assign(0, slot.prompt.tokens.clone());
-        auto root_lineage = lineage.find(0);
-        if (root_lineage == lineage.end()) {
-            rerot->hard_abort(episode_id, "rerot_state_error: missing C0 lineage tape");
-            return false;
-        }
-        episode = rerot->episode(episode_id);
-        if (!episode) {
-            return false;
-        }
-        for (size_t i = 1; i < episode->nodes.size(); ++i) {
-            lineage.insert_or_assign(static_cast<llama_rerot_node_id>(i), root_lineage->second.clone());
-        }
         const int released_slot = slot.id;
         if (!rerot->detach_node(episode_id, 0)) {
             rerot->hard_abort(episode_id, "rerot_state_error: failed to detach 0.plan after DAG submit");
@@ -3460,13 +3451,14 @@ llama_tokens rerot_native_fixed_entry_tokens(
             ? server_rerot_parse_mindmap_decision(episode->probe_bytes)
             : server_rerot_parse_routing_decision(episode->probe_bytes);
         if (decision.incomplete) {
-            // Truncated document: the probe is still streaming. Each grammar
-            // admits no malformed document, so this cannot be a corrupt plan.
+            // A truncated document may still have a legal completion. The
+            // mindmap grammar and depth sampler constrain new tokens; the
+            // parser remains the final fail-closed check.
             return true;
         }
         if (!decision.error.empty()) {
-            // Syntactically complete JSON that fails validation is final: no
-            // later token can repair it. Report the parser's own diagnosis
+            // A complete plan that fails validation is final: no later token
+            // can repair it. Report the parser's own diagnosis
             // immediately instead of letting the sampler emit EOG and surfacing
             // an unrelated delimiter error.
             if (slot.task && slot.task->params.rerot_trace) {
@@ -3799,10 +3791,9 @@ llama_tokens rerot_native_fixed_entry_tokens(
         const auto * episode = rerot ? rerot->episode(slot.rerot_episode_id) : nullptr;
         const auto * logical = episode ? episode->document.node(slot.rerot_node_id) : nullptr;
         const auto * lane = rerot ? rerot->node(slot.rerot_episode_id, slot.rerot_node_id) : nullptr;
-        // DAG only: legacy HTML/probe paths have no yield between commit and
-        // sample, so capturing there would only perturb their long-settled
-        // order (e.g. an extra sample before fork-idle). Probing and formal-P
-        // rows are pre-DAG-init by construction and skip the same way.
+        // DAG only: legacy HTML/probe and serial-tail rows sample below, not
+        // during commit. Capturing them here would sample twice or perturb
+        // their order (e.g. before fork-idle).
         if (!episode || !logical || !lane || episode->hard_aborted || !episode->is_dag ||
             logical->state == llama_rerot_node_state::forked ||
             logical->state == llama_rerot_node_state::retired ||
@@ -3864,22 +3855,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
         }
     }
 
-    void rerot_idle_unbound_slots(uint64_t episode_id) {
-        if (!rerot) {
-            return;
-        }
-        for (auto & cand : slots) {
-            if (!cand.rerot_internal || cand.rerot_episode_id != episode_id || !cand.is_processing()) {
-                continue;
-            }
-            const auto * lane = rerot->node(episode_id, cand.rerot_node_id);
-            if (!lane || lane->physical_slot != cand.id) {
-                rerot_park_slot_lineage(cand);
-                rerot_make_slot_idle(cand);
-            }
-        }
-    }
-
     bool rerot_prepare_child_slot(
             uint64_t episode_id,
             llama_rerot_node_id node_id,
@@ -3892,8 +3867,17 @@ llama_tokens rerot_native_fixed_entry_tokens(
             return false;
         }
 
-        auto lineage_it = transport_it->second->lineage_tokens.find(node_id);
-        if (lineage_it == transport_it->second->lineage_tokens.end()) {
+        auto & lineage = transport_it->second->lineage_tokens;
+        auto lineage_it = lineage.find(node_id);
+        if (lineage_it == lineage.end() && episode->is_dag &&
+            episode->starting.count(node_id) != 0 &&
+            transport_it->second->lane_samplers.count(node_id) == 0) {
+            const auto root_it = lineage.find(0);
+            if (root_it != lineage.end()) {
+                lineage_it = lineage.emplace(node_id, root_it->second.clone()).first;
+            }
+        }
+        if (lineage_it == lineage.end()) {
             rerot->hard_abort(episode_id, "rerot_state_error: missing child lineage token tape");
             return false;
         }
@@ -3992,7 +3976,7 @@ llama_tokens rerot_native_fixed_entry_tokens(
                 // Entry template/model/adapter lineage is fixed per episode,
                 // so no repeated full-render is needed. Either way the parked
                 // sampler carried over above binds as-is: init_sampler()
-                // would reseed RNG and replay the tape on every time-slice.
+                // would reseed RNG and replay the tape after a suspension.
                 auto parked_frame_it = transport_it->second->parked_injections.find(node_id);
                 const bool resume_frame =
                     parked_frame_it != transport_it->second->parked_injections.end() &&
@@ -4137,17 +4121,16 @@ llama_tokens rerot_native_fixed_entry_tokens(
         while (!episode->suspended.empty() || !episode->ready_queue.empty()) {
             // Admission can bind several peers in this loop. Once the last
             // free pen is filled, return to decode so those STARTING lanes
-            // actually consume their frames. Continuing into the pressure
-            // branch below would yield one and resume another indefinitely
-            // (6/6 recurrent rows, W>P, unfinished logical cohort).
+            // actually consume their frames. Extra eligible workers remain
+            // queued until a bound worker naturally seals.
             if (episode->is_dag &&
                 rerot->pens_for_person(episode_id).size() >= rerot->pen_capacity()) {
                 break;
             }
-            // Select the idle executor first and drop its stale prompt-cache
-            // refs BEFORE measuring recurrent pressure: an idle slot's
-            // retained refs would otherwise read as live pressure and force
-            // needless yields. prompt_clear touches only this slot's own seq;
+            // Select an idle executor first. All busy pens mean normal queue
+            // pressure, not a recurrent allocation failure. Drop an idle
+            // slot's stale prompt-cache refs before checking its reserved
+            // recurrent row. prompt_clear touches only this slot's own seq;
             // C_base, archive, parked, and other owners' refs are untouched.
             server_slot * free_slot = nullptr;
             for (auto & candidate : slots) {
@@ -4156,9 +4139,10 @@ llama_tokens rerot_native_fixed_entry_tokens(
                     break;
                 }
             }
-            if (free_slot) {
-                free_slot->prompt_clear();
+            if (!free_slot) {
+                break;
             }
+            free_slot->prompt_clear();
 
             llama_memory_kv_usage recurrent = {};
             if (llama_memory_get_recurrent_usage(llama_get_memory(ctx_tgt), &recurrent)) {
@@ -4167,22 +4151,16 @@ llama_tokens rerot_native_fixed_entry_tokens(
                 // every STARTING Lane. Only the next admission is additional.
                 const uint64_t required_after_cow = recurrent.used + 1;
                 if (required_after_cow > recurrent.capacity) {
-                    // True resource pressure: force a DAG yield even when a
-                    // pen is free (the free executor has no free hand row).
-                    if (!episode->is_dag || !rerot->yield_dag_pen_for_ready(episode_id, true)) {
-                        break;
+                    // The fixed pen count already reserves recurrent rows.
+                    // A free pen without one means a prior row leaked or the
+                    // fitted capacity is wrong, not that queued leaves need
+                    // time-slicing or a smaller plan.
+                    if (episode->is_dag) {
+                        rerot->hard_abort(episode_id, "rerot_state_error: free DAG pen has no reserved recurrent row");
+                        return rerot_admit_ready_result::failed;
                     }
-                    rerot_idle_unbound_slots(episode_id);
-                    continue;
-                }
-            }
-
-            if (!free_slot) {
-                if (!episode->is_dag || !rerot->yield_dag_pen_for_ready(episode_id)) {
                     break;
                 }
-                rerot_idle_unbound_slots(episode_id);
-                continue;
             }
 
             if (episode->is_dag) {
@@ -4220,40 +4198,10 @@ llama_tokens rerot_native_fixed_entry_tokens(
                     }
                     continue;
                 }
-                if (rerot->has_open_dag_logical_step(episode_id) &&
-                    !rerot->dag_logical_step_complete(episode_id)) {
+                // Remaining ready nodes are outside this physical cohort.
+                // They wait for a natural seal and the next snapshot; never
+                // bypass the snapshot just because a slot is temporarily idle.
                     break;
-                }
-            }
-
-            if (episode->is_dag && !episode->ready_queue.empty()) {
-                llama_rerot_node_id admitted = LLAMA_REROT_NODE_INVALID;
-                // Anti-livelock guard. An admitted lane whose fixed entry never
-                // receives a batch row keeps its pen, never commits, and is
-                // re-selected on the next decode step: the cohort never
-                // completes and the episode spins without producing a token.
-                // Detecting it here turns a silent hang into a diagnosable
-                // hard abort instead of burning the request until the client
-                // times out.
-                if (!rerot->admit_next_child(
-                        episode_id, free_slot->id, free_slot->id, &admitted) ||
-                    admitted == LLAMA_REROT_NODE_INVALID ||
-                    !rerot_prepare_child_slot(episode_id, admitted, *free_slot)) {
-                    rerot->hard_abort(episode_id, "rerot_state_error: child admission failed");
-                    return rerot_admit_ready_result::failed;
-                }
-                if (admitted == episode->synthesis_node) {
-                    const int64_t start_us = episode->t_synthesis_eligible_us > 0 ? episode->t_synthesis_eligible_us : ggml_time_us();
-                    const int64_t dur_us = std::max<int64_t>(0, ggml_time_us() - start_us);
-                    const double dur_s = (double) dur_us / 1.0e6;
-                    rerot_metrics.synthesis_switch_seconds += dur_s;
-                    ++rerot_metrics.synthesis_switch_count;
-                    auto transport_it = rerot_transport.find(episode_id);
-                    if (transport_it != rerot_transport.end()) {
-                        transport_it->second->synthesis_switch_seconds += dur_s;
-                    }
-                }
-                continue;
             }
 
             if (!episode->suspended.empty()) {
@@ -5023,11 +4971,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
                     }
                 }
             }
-        }
-
-        if (episode->is_dag) {
-            rerot->yield_dag_pen_for_ready(episode_id);
-            rerot_idle_unbound_slots(episode_id);
         }
 
         if (rerot_admit_ready(episode_id) == rerot_admit_ready_result::failed) {
@@ -5834,6 +5777,15 @@ llama_tokens rerot_native_fixed_entry_tokens(
             const uint32_t pen_cap = params_base.rerot_pen_max > 0
                 ? params_base.rerot_pen_max
                 : (params_base.n_parallel > 0 ? (uint32_t) params_base.n_parallel : (uint32_t) slots.size());
+            if (n_seq_recr < pen_cap) {
+                SRV_ERR("RERoT pen capacity %u exceeds fitted recurrent rows %u\n", pen_cap, n_seq_recr);
+                return false;
+            }
+            if (llama_n_batch(ctx_tgt) < pen_cap || llama_n_ubatch(ctx_tgt) < pen_cap) {
+                SRV_ERR("RERoT pen capacity %u exceeds decode batch dimensions (%u, %u)\n",
+                    pen_cap, llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
+                return false;
+            }
             rerot->set_pen_capacity(pen_cap);
             rerot_episode_id = 0;
             SRV_INF("RERoT runtime armed (frontier=%s, pen_capacity=%u)\n",
@@ -5861,12 +5813,13 @@ llama_tokens rerot_native_fixed_entry_tokens(
             }
         }
 
-        // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
-        // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
+        // Reserve enough rows for every physical execution slot, including
+        // RERoT pens beyond the number of independent request slots.
+        // n_batch can exceed n_ctx (e.g. for non-causal attention models).
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
-            batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+            batch.init(std::max(n_batch, n_exec_slots), n_embd);
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -10018,9 +9971,13 @@ llama_tokens rerot_native_fixed_entry_tokens(
         // stale or missing row on the resumed executor.
         std::set<uint64_t> rerot_committed_episodes;
         bool rerot_ok = true;
+        uint64_t rerot_batch_rows = 0;
         iterate(slots, [&](server_slot & slot) {
             if (!is_inside_view(slot.i_batch)) {
                 return;
+            }
+            if (slot.rerot_internal && slot.state == SLOT_STATE_GENERATING) {
+                ++rerot_batch_rows;
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task &&
@@ -10061,19 +10018,30 @@ llama_tokens rerot_native_fixed_entry_tokens(
                 rerot_committed_episodes.insert(episode_id);
             }
         });
+        rerot_metrics.batch_people = rerot_batch_rows != 0 ? 1 : 0;
+        rerot_metrics.batch_pens = rerot_batch_rows;
+        rerot_metrics.frontier_rows += rerot_batch_rows;
+        if (rerot_batch_rows >= 6) {
+            ++rerot_metrics.six_row_batches;
+        }
 
         bool rerot_capture_needed = false;
+        bool rerot_decode_synchronized = false;
         if (rerot_ok) {
             iterate(slots, [&](server_slot & slot) {
+                const auto * episode = rerot && slot.rerot_episode_id != 0
+                    ? rerot->episode(slot.rerot_episode_id) : nullptr;
                 rerot_capture_needed |=
                     slot.rerot_internal &&
                     slot.state == SLOT_STATE_GENERATING &&
+                    episode && episode->is_dag && !slot.rerot_serial_tail &&
                     slot.rerot_injection == server_rerot_injection_kind::none &&
                     slot.i_batch >= off && slot.i_batch < off + n_batch_tokens;
             });
             if (rerot_capture_needed) {
                 const int64_t t0 = ggml_time_us();
                 llama_synchronize(ctx_tgt);
+                rerot_decode_synchronized = true;
                 const int64_t dur_us = ggml_time_us() - t0;
                 // Completed-token generation: n_p_eval + n_eval only advance
                 // inside llama_context::synchronize() after real GPU work
@@ -10099,13 +10067,14 @@ llama_tokens rerot_native_fixed_entry_tokens(
         if (rerot_ok && !rerot_capture_needed) {
             // A forced frame has no logit row to sample, so the capture pass
             // above did not synchronize. finish_frontier may retire sequences,
-            // and the subsequent DAG yield/admission copies and clears KV and
+            // and subsequent DAG admission copies and clears KV and
             // recurrent rows. Do not mutate those buffers while this slice's
             // asynchronous Vulkan graph is still reading them.
             for (const uint64_t episode_id : rerot_committed_episodes) {
                 const auto * episode = rerot->episode(episode_id);
                 if (episode && episode->is_dag) {
                     llama_synchronize(ctx_tgt);
+                    rerot_decode_synchronized = true;
                     break;
                 }
             }
@@ -10134,23 +10103,22 @@ llama_tokens rerot_native_fixed_entry_tokens(
                         server_rerot_injection_kind::none;
             });
             if (rerot_needs_sample) {
-                const bool had_new_gpu_work = !rerot_capture_needed;
-                const int64_t t0 = ggml_time_us();
-                llama_synchronize(ctx_tgt);
-                const int64_t dur_us = ggml_time_us() - t0;
-                const llama_perf_context_data perf = llama_perf_context(ctx_tgt);
-                const uint64_t sync_gen = (uint64_t) perf.n_p_eval + (uint64_t) perf.n_eval;
-                if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
-                    prof->record_sync((uint64_t) dur_us, sync_gen);
-                }
-                rerot_metrics.sync_sample_us += dur_us;
-                ++rerot_metrics.sync_sample_count;
-                if (had_new_gpu_work) {
+                // Capture or a topology-safe forced-frame barrier already
+                // drained this decode. Frontier bookkeeping can move KV but
+                // does not generate a new logit row for this sample.
+                if (!rerot_decode_synchronized) {
+                    const int64_t t0 = ggml_time_us();
+                    llama_synchronize(ctx_tgt);
+                    const int64_t dur_us = ggml_time_us() - t0;
+                    const llama_perf_context_data perf = llama_perf_context(ctx_tgt);
+                    const uint64_t sync_gen = (uint64_t) perf.n_p_eval + (uint64_t) perf.n_eval;
+                    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+                        prof->record_sync((uint64_t) dur_us, sync_gen);
+                    }
+                    rerot_metrics.sync_sample_us += dur_us;
+                    ++rerot_metrics.sync_sample_count;
                     rerot_metrics.sync_sample_with_work_us += dur_us;
                     ++rerot_metrics.sync_sample_with_work_count;
-                } else {
-                    rerot_metrics.sync_sample_no_work_us += dur_us;
-                    ++rerot_metrics.sync_sample_no_work_count;
                 }
             }
 
@@ -11300,6 +11268,7 @@ void server_routes::init_routes() {
             emit_rerot("gauge", "rerot_batch_people", "People present in last decoded batch.", r.batch_people);
             emit_rerot("gauge", "rerot_batch_pens", "Pens / rows present in last decoded batch.", r.batch_pens);
             emit_rerot("counter", "rerot_frontier_rows", "Cumulative frontier rows decoded across all pens.", r.frontier_rows);
+            emit_rerot("counter", "rerot_six_row_batches", "Successful decode slices containing at least six RERoT pen rows in one llama_decode call.", r.six_row_batches);
 
             emit_rerot("gauge", "rerot_brain_bytes", "Estimated recurrent brain memory in bytes.", r.brain_bytes);
             emit_rerot("gauge", "rerot_hand_bytes", "Estimated recurrent hand memory in bytes.", r.hand_bytes);

@@ -1467,7 +1467,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             cparams.n_person_max = fit_res.b_people;
             cparams.n_pen_max = fit_res.p_pens;
             cparams.n_ctx_kv = fit_res.k_tokens;
-            cparams.n_seq_recurrent = fit_res.b_people;
+            cparams.n_seq_recurrent = std::max(2u, fit_res.p_pens);
             cparams.n_seq_max = LLAMA_MAX_SEQ;
             cparams.n_outputs_max = params.n_outputs_max;
             if (extra_cparams != nullptr) {
@@ -1508,7 +1508,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                     cparams.n_person_max = fit_res.b_people;
                     cparams.n_pen_max = fit_res.p_pens;
                     cparams.n_ctx_kv = fit_res.k_tokens;
-                    cparams.n_seq_recurrent = fit_res.b_people;
+                    cparams.n_seq_recurrent = std::max(2u, fit_res.p_pens);
                     if (extra_cparams != nullptr) {
                         cparams_mtp.n_person_max = fit_res.b_people;
                         cparams_mtp.n_pen_max = fit_res.p_pens;

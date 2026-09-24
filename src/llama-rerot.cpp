@@ -2417,9 +2417,6 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
         const auto dp_size = [](const seg_view & s) -> size_t {
             return s.identity ? s.run->rows.size() : s.dp.size();
         };
-        const auto dp_at = [](const seg_view & s, size_t i) -> uint32_t {
-            return s.identity ? uint32_t(i) : s.dp[i];
-        };
         const auto prefix_at = [](const seg_view & s, size_t i) -> uint32_t {
             return s.identity ? uint32_t(i) : s.pass_prefix[i];
         };
@@ -2589,24 +2586,6 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
         for (size_t i = 0; i < base.size(); ++i) {
             base_storage[i] = keys_ref[base[i]].storage_pos;
         }
-        std::vector<uint32_t> base_order(base.size());
-        for (uint32_t k = 0; k < base_order.size(); ++k) {
-            base_order[k] = k;
-        }
-        if (!base.empty()) {
-            std::sort(base_order.begin(), base_order.end(), [&](uint32_t a, uint32_t b) {
-                const int64_t da = int64_t(base_storage[a]) - int64_t(a);
-                const int64_t db = int64_t(base_storage[b]) - int64_t(b);
-                if (da != db) {
-                    return da < db;
-                }
-                return a < b;
-            });
-        }
-        std::vector<int64_t> base_dev(base.size());
-        for (size_t k = 0; k < base_order.size(); ++k) {
-            base_dev[k] = int64_t(base_storage[base_order[k]]) - int64_t(base_order[k]);
-        }
 
         // ---- Per-reader numeric pass. ----
         // Merge-list buffers reused across queries (allocation was a
@@ -2664,8 +2643,6 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
             L.key_ids.reserve(hint);
         }
         for (size_t qi = 0; qi < query_storage_pos[r].size(); ++qi) {
-            const size_t query_span_start = sink && sink->spans_out
-                ? sink->spans_out->size() : 0;
             const llama_pos q_pos = query_storage_pos[r][qi];
 
             size_t base_cut = 0;

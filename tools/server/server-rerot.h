@@ -427,12 +427,8 @@ struct server_rerot_node_runtime {
     rerot_pen_id pen_id = -1;
     int physical_slot = -1;
     llama_seq_id exec_seq = -1;
-    // The cohort's committed set may contain a token from a previous binding.
-    // A resumed committed lane cannot yield again before it writes a new row.
-    bool committed_since_bind = false;
-    // A time-sliced fixed entry remains STARTING until its last frame token
-    // commits. ready_suspended alone does not distinguish it from a RUNNING
-    // worker; resume must restore the saved injection and sampler phase.
+    // A cross-episode suspension may interrupt a fixed entry before its last
+    // frame token; resumption restores the injection and sampler phase.
     bool suspended_from_starting = false;
     llama_seq_id parked_seq = -1;
     llama_pos storage_pos_next = 0;
@@ -592,9 +588,9 @@ struct server_rerot_episode {
     uint64_t probe_tokens = 0;
     uint64_t frame_tokens = 0;
     uint64_t source_end_tokens = 0;
-    // W-wide logical step (AGENTS.md §06): freeze the PUBLIC read-set, then
-    // physically time-slice pens. Members write BODY as PENDING until every
-    // cohort member has committed this step.
+    // Physical P-bound step: freeze the PUBLIC read-set for bound workers and
+    // pending admissions. Extra eligible nodes wait for a natural pen release.
+    // Members write BODY as PENDING until every cohort member commits.
     std::set<llama_rerot_node_id> dag_step_cohort;
     std::set<llama_rerot_node_id> dag_step_committed;
 
@@ -783,9 +779,8 @@ public:
         uint64_t episode_id,
         llama_pos base,
         std::string * error_out = nullptr);
-    // Enqueue newly eligible workers, snapshot the logical cohort, and
-    // time-slice pens. Returns false until c_base is captured (no cohort, no
-    // enqueue, no time-slicing). Root formal-P forced execution is unaffected.
+    // Enqueue newly eligible workers and snapshot at most P for this step.
+    // Returns false until c_base is captured; formal-P replay is unaffected.
     bool activate_dag_frontier(uint64_t episode_id);
     bool has_free_pen() const;
     // Snapshot the current logical cohort if one is not already open.
@@ -799,13 +794,6 @@ public:
     bool dag_logical_step_complete(uint64_t episode_id) const;
     // Unbound incomplete member of the open logical step, if any.
     std::optional<llama_rerot_node_id> dag_step_next_pending(uint64_t episode_id) const;
-    // W>P: suspend one physically bound DAG worker so a queued eligible node
-    // can START, or a suspended/incomplete step member can resume. Does not
-    // wait for SEAL. No-ops when a free pen already exists, and until c_base
-    // is captured — unless resource_pressure is set, which permits a yield
-    // under physical resource pressure (e.g. recurrent rows exhausted) even
-    // with a free pen: a free pen is not a free recurrent row.
-    bool yield_dag_pen_for_ready(uint64_t episode_id, bool resource_pressure = false);
     std::optional<std::vector<server_rerot_token_plan>> plan_frame_span(
         uint64_t episode_id,
         llama_rerot_node_id node_id,

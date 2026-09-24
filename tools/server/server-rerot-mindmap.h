@@ -105,8 +105,27 @@ uint64_t hash_tree(const plan & p);
 // character set (ASCII words plus the CJK/kana/hangul and operator scalars).
 bool label_ok(const std::string & label);
 
-// G0 grammar text for any even indentation depth after the injected prefix.
-// The parser checks structure; neither layer budgets plan dimensions.
+// G0 constrains the wire's line syntax. The companion sampler constrains
+// each line's depth relative to the preceding line; neither has a depth cap.
 std::string grammar_g0();
+
+// State starts after probe_prefix, at the first child's label. consume() is
+// transactional: callers may try a candidate token without mutating the
+// accepted prefix. The GBNF supplies labels/fences; this state supplies the
+// cross-line nesting constraint that an unbounded static GBNF cannot express.
+struct indent_state {
+    size_t last_depth = 1;
+    size_t spaces = 4;
+    bool at_indent = false;
+    bool has_label = false;
+    uint8_t fence_bytes = 0;
+    bool closed = false;
+
+    bool consume(std::string_view bytes);
+};
+
+// Composed after grammar_g0() in the probe grammar sampler only. Owns no
+// vocabulary; its immutable token-piece table is shared across clones.
+llama_sampler * init_indent_sampler(const llama_vocab * vocab);
 
 } // namespace server_mindmap

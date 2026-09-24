@@ -1677,7 +1677,6 @@ bool server_rerot_runtime::resume_pen(
     } else {
         ep->running.insert(node_id);
     }
-    n->committed_since_bind = false;
     const llama_rerot_node_state resume_state = ep->is_dag
         ? (n->suspended_from_starting
             ? llama_rerot_node_state::starting
@@ -2636,7 +2635,6 @@ bool server_rerot_runtime::commit_token(
         return false;
     }
     if (current->is_dag) {
-        current_node->committed_since_bind = true;
         note_dag_step_commit(*current, node_id);
     }
 
@@ -3397,7 +3395,6 @@ bool server_rerot_runtime::activate_dag_frontier(uint64_t episode_id) {
             ep->nodes[nid].enqueue_frontier = ep->frontier;
         }
     }
-    yield_dag_pen_for_ready(episode_id);
     snapshot_dag_logical_step(episode_id);
 
     // AGENTS.md §阶段4 / RERoT.md §12.5 item 8:
@@ -3473,14 +3470,20 @@ void server_rerot_runtime::snapshot_dag_logical_step(uint64_t episode_id) {
     for (const auto nid : ep->suspended) {
         consider(nid);
     }
+    // Keep bound workers on their pens across logical steps. Only as many
+    // queued workers as there are unbound pens join this step; the rest start
+    // after a worker seals and releases its executor. No per-token swapping.
     for (const auto nid : ep->ready_queue) {
+        if (ep->dag_step_cohort.size() >= pen_capacity()) {
+            break;
+        }
         consider(nid);
     }
     ep->dag_step_committed.clear();
-    // §4.3 parallel ledger: one record per logical step snapshot. W counts
-    // logical workers (nodes minus the sealed planner root), P the physical
-    // pen capacity, cohort the members of this step (waiting-successor
-    // pressure shows as W_max/cohort_max vs the P average). No-op when
+    // §4.3 parallel ledger: W counts all planned nodes except the root
+    // (including queued, blocked, and synthesis), not active decode rows.
+    // P is physical capacity; cohort is bound workers plus pending admissions.
+    // No-op when
     // LLAMA_REROT_PROFILE is unset.
     if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
         const uint64_t w = ep->nodes.size() > 1 ? (uint64_t) ep->nodes.size() - 1 : 0;
@@ -3498,10 +3501,10 @@ void server_rerot_runtime::snapshot_dag_logical_step(uint64_t episode_id) {
     // boundary. The PUBLIC watermark is frozen at the last committed frontier
     // (advance_frontier) and never moves here: every foreign PUBLIC run —
     // BODY and FRAME alike — stamped above it stays invisible to later
-    // physical slices of this step; only the reader's own runs are exempt
+    // physical rows of this step; only the reader's own runs are exempt
     // (document build_dag_view). Mid-step FRAME publication bumps the publish
-    // counter but not the frozen watermark, so admitting or completing a
-    // worker can never leak a newly completed entry into this step's world.
+    // counter but not the frozen watermark, so a worker cannot read another
+    // bound worker's uncommitted entry.
 }
 
 bool server_rerot_runtime::has_open_dag_logical_step(uint64_t episode_id) const {
@@ -3730,8 +3733,8 @@ bool server_rerot_runtime::prepare_dag_prefix_rebuild(
     if (!ref_live(root->private_run)) {
         root->private_run.reset();
     }
-    // Stale lineage pins pre-rebuild cells; both are rebuilt on demand after
-    // the suffix replay (archive via ensure_archive_seq, parked via yield).
+    // Stale lineage pins pre-rebuild cells; archive and parked copies are
+    // rebuilt on demand after the suffix replay.
     if (ep->archive_seq >= 0) {
         if (memory_) {
             llama_memory_seq_rm(memory_, ep->archive_seq, -1, -1);
@@ -3749,128 +3752,6 @@ bool server_rerot_runtime::prepare_dag_prefix_rebuild(
     }
     root->storage_pos_next = base;
     return true;
-}
-
-bool server_rerot_runtime::yield_dag_pen_for_ready(uint64_t episode_id, bool resource_pressure) {
-    auto * ep = episode(episode_id);
-    if (!ep || !ep->is_dag || ep->hard_aborted || pens_.empty()) {
-        return false;
-    }
-    if (!ep->c_base.valid()) {
-        return false;
-    }
-    if (ep->ready_queue.empty() && ep->suspended.empty()) {
-        return false;
-    }
-    if (has_free_pen() && !resource_pressure) {
-        return false;
-    }
-
-    rerot_pen_id victim_pen = -1;
-    server_rerot_node_runtime * victim = nullptr;
-    const auto consider_victim = [&](llama_rerot_node_id nid, bool require_committed) -> bool {
-        if (nid == 0) {
-            return false;
-        }
-        auto * n = node(episode_id, nid);
-        const auto * dn = ep->document.node(nid);
-        if (!n || !dn || n->pen_id < 0) {
-            return false;
-        }
-        if (n->stage_role != llama_rerot_stage_role::worker &&
-            n->stage_role != llama_rerot_stage_role::synthesis) {
-            return false;
-        }
-        const bool starting = ep->starting.count(nid) != 0;
-        if (starting) {
-            if (!require_committed || ep->dag_step_committed.count(nid) == 0) {
-                return false;
-            }
-        } else if (dn->state != llama_rerot_node_state::running &&
-                   dn->state != llama_rerot_node_state::terminal_running) {
-            return false;
-        }
-        if (require_committed && ep->dag_step_committed.count(nid) == 0) {
-            return false;
-        }
-        // A cohort commit from a previous binding is not progress by this
-        // executor. A just-resumed committed lane cannot be yielded again
-        // before it writes a new row. Uncommitted lanes retain the existing
-        // storage-position rule below (they may be deliberately time-sliced).
-        if (ep->dag_step_committed.count(nid) != 0 && !n->committed_since_bind) {
-            return false;
-        }
-        // A lane that has produced nothing at all is even less eligible: it
-        // still needs the CPU to reach its first token.
-        if (n->storage_pos_next <= ep->c_base.n_prompt_tokens &&
-            ep->dag_step_committed.count(nid) == 0) {
-            return false;
-        }
-        victim_pen = n->pen_id;
-        victim = n;
-        return true;
-    };
-    if (!ep->dag_step_cohort.empty()) {
-        for (auto it = ep->running.rbegin(); it != ep->running.rend(); ++it) {
-            if (consider_victim(*it, true)) {
-                break;
-            }
-        }
-        if (victim_pen < 0) {
-            for (auto it = ep->starting.rbegin(); it != ep->starting.rend(); ++it) {
-                if (consider_victim(*it, true)) {
-                    break;
-                }
-            }
-        }
-    }
-    if (victim_pen < 0) {
-        for (auto it = ep->running.rbegin(); it != ep->running.rend(); ++it) {
-            if (ep->starting.count(*it) != 0) {
-                continue;
-            }
-            if (consider_victim(*it, false)) {
-                break;
-            }
-        }
-    }
-    if (victim_pen < 0 || !victim) {
-        return false;
-    }
-    if (memory_ && victim->exec_seq >= 0) {
-        if (victim->parked_seq < 0) {
-            const auto parked = alloc_internal_seq();
-            if (!parked.has_value()) {
-                return false;
-            }
-            victim->parked_seq = *parked;
-        }
-        rerot_seq_retarget(memory_, victim->exec_seq, victim->parked_seq);
-        const size_t seed_size =
-            llama_memory_rerot_capture_hand_seed(memory_, victim->exec_seq, nullptr, 0);
-        if (seed_size > 0) {
-            victim->hand_seed.resize(seed_size);
-            if (llama_memory_rerot_capture_hand_seed(
-                    memory_,
-                    victim->exec_seq,
-                    victim->hand_seed.data(),
-                    victim->hand_seed.size()) != victim->hand_seed.size()) {
-                return false;
-            }
-        }
-        llama_memory_seq_rm_attention(memory_, victim->exec_seq, -1, -1);
-        llama_memory_seq_rm_recurrent(memory_, victim->exec_seq, -1, -1);
-    }
-    // §4.3: a successful yield is one physical time-slice boundary (the
-    // W>P event that pays the hand-seed capture + attention copy). Counted
-    // only when the suspend actually happens.
-    const bool yielded = suspend_pen(victim_pen);
-    if (yielded) {
-        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
-            prof->pen_yields.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    return yielded;
 }
 
 std::vector<llama_rerot_node_id> server_rerot_runtime::get_eligible_dag_nodes(uint64_t episode_id) const {
@@ -4337,7 +4218,6 @@ bool server_rerot_runtime::admit_next_child(
 
     current->ready_queue.erase(best_it);
     current->starting.insert(child_id);
-    child->committed_since_bind = false;
     if (!current->document.set_node_state(child_id, llama_rerot_node_state::starting)) {
         return fail_episode(*current, "failed to enter RERoT child STARTING state");
     }

@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <memory>
+#include <stdexcept>
 #include <utility>
 
 namespace server_mindmap {
@@ -154,6 +157,10 @@ bool fence_prefix_at(const std::string & s, size_t pos) {
     return s[pos + 2] == '`';
 }
 
+bool next_depth_valid(size_t previous_depth, size_t next_depth) {
+    return next_depth <= previous_depth + 1;
+}
+
 } // namespace
 
 bool label_ok(const std::string & label) {
@@ -239,19 +246,71 @@ uint64_t hash_tree(const plan & p) {
 
 std::string grammar_g0() {
     // The fixed prefix has already emitted the fence, synthetic root, and
-    // first child's indentation. The parser validates nesting; the grammar
-    // allows any even depth without baking in a tree-size ceiling.
-    return
-        "root ::= label \"\\n\" node* \"```\\n\"\n"
-        "node ::= indent label \"\\n\"\n"
-        "indent ::= \"    \" (\"  \")*\n"
-        "label ::= word (\" \" word)*\n"
-        "word ::= char+\n"
-        "char ::= [A-Za-z0-9\\u3400-\\u4DBF\\u4E00-\\u9FFF\\u3040-\\u30FF"
-        "\\uAC00-\\uD7AF\\u3001-\\u3002\\u300C-\\u300F\\u2018-\\u201D"
-        "\\uFF01\\uFF0C\\uFF1A\\uFF1B\\uFF1F\\uFF3F-\\uFF5E"
-        "\\u00A1\\u00A8\\u00B0\\u00B7\\u00D7\\u00F7"
-        "*+/=.,?!;:_\\u002D]\n";
+    // first child's indentation. The paired stateful sampler and parser use
+    // next_depth_valid() to constrain nesting without a depth ceiling.
+    return "root ::= label \"\\n\" node* \"```\\n\"\n"
+           "node ::= indent label \"\\n\"\n"
+           "indent ::= \"    \" (\"  \")*\n"
+           "label ::= word (\" \" word)*\n"
+           "word ::= char+\n"
+           "char ::= [A-Za-z0-9\\u3400-\\u4DBF\\u4E00-\\u9FFF\\u3040-\\u30FF"
+           "\\uAC00-\\uD7AF\\u3001-\\u3002\\u300C-\\u300F\\u2018-\\u201D"
+           "\\uFF01\\uFF0C\\uFF1A\\uFF1B\\uFF1F\\uFF3F-\\uFF5E"
+           "\\u00A1\\u00A8\\u00B0\\u00B7\\u00D7\\u00F7"
+           "*+/=.,?!;:_\\u002D]\n";
+}
+
+bool indent_state::consume(std::string_view bytes) {
+    indent_state next = *this;
+    for (const char c : bytes) {
+        if (next.closed || c == '\r' || c == '\t') {
+            return false;
+        }
+        if (next.fence_bytes != 0) {
+            if (next.fence_bytes < CLOSE_LEN && c == '`') {
+                ++next.fence_bytes;
+            } else if (next.fence_bytes == CLOSE_LEN && c == '\n') {
+                next.closed = true;
+            } else {
+                return false;
+            }
+            continue;
+        }
+        if (next.at_indent) {
+            if (c == ' ') {
+                ++next.spaces;
+                if (next.spaces > 2 * (next.last_depth + 1)) {
+                    return false;
+                }
+                continue;
+            }
+            if (c == '`' && next.spaces == 0 && next.last_depth >= 2) {
+                next.fence_bytes = 1;
+                continue;
+            }
+            if (c == '\n' || c == '`' || next.spaces < 4 || next.spaces % 2 != 0 ||
+                !next_depth_valid(next.last_depth, next.spaces / 2)) {
+                return false;
+            }
+            next.at_indent = false;
+        }
+        if (c == '\n') {
+            if (!next.has_label) {
+                return false;
+            }
+            next.last_depth = next.spaces / 2;
+            next.spaces     = 0;
+            next.at_indent  = true;
+            next.has_label  = false;
+        } else {
+            if (c == '`') {
+                return false;
+            }
+            next.has_label = true;
+        }
+    }
+    *this = next;
+    return true;
 }
 
 result parse(const std::string & text) {
@@ -347,9 +406,8 @@ result parse(const std::string & text) {
         }
 
         // ---- node line ----
-        // Indentation can only be judged once the line is terminated: an
-        // unterminated tail of spaces may still grow to a legal indent (or
-        // to a legal label separator), so the verdict waits for the LF.
+        // A trailing indentation can still grow, unless it has already
+        // passed the next legal depth; no suffix could repair that prefix.
         if (text[pos] == '\t') {
             return fail(error_class::envelope, "envelope: TAB is not allowed", pos);
         }
@@ -367,7 +425,15 @@ result parse(const std::string & text) {
                         "structure: indentation must be a multiple of 2 spaces", pos);
         }
         if (content >= text.size()) {
-            return incomplete(); // only spaces so far: still completable
+            if (nodes.empty() && spaces > 2) {
+                return fail(error_class::structure,
+                            "structure: first node must be the root at indent 2", pos);
+            }
+            if (!nodes.empty() && spaces > 2 * (stack.size() + 1)) {
+                return fail(error_class::structure,
+                            "structure: skipped an indentation level", pos);
+            }
+            return incomplete(); // still completable
         }
         // Root is at exactly 2 spaces => level 1; each level adds 2 spaces.
         const uint32_t depth = spaces / 2;
@@ -384,7 +450,7 @@ result parse(const std::string & text) {
             return fail(error_class::structure,
                         "structure: second root node is not allowed", pos);
         }
-        if (depth > (uint32_t) stack.size() + 1) {
+        if (!next_depth_valid(stack.size(), depth)) {
             return fail(error_class::structure,
                         "structure: skipped an indentation level", pos);
         }
@@ -439,6 +505,108 @@ result parse(const std::string & text) {
 
         pos = i + 1;
     }
+}
+
+namespace {
+
+struct token_pieces {
+    std::vector<size_t> offsets;
+    std::string         bytes;
+
+    explicit token_pieces(const llama_vocab * vocab) {
+        const int32_t n_tokens = llama_vocab_n_tokens(vocab);
+        offsets.reserve(static_cast<size_t>(n_tokens) + 1);
+        std::string scratch(128, '\0');
+        for (llama_token id = 0; id < n_tokens; ++id) {
+            offsets.push_back(bytes.size());
+            int32_t n = llama_token_to_piece(vocab, id, scratch.data(), static_cast<int32_t>(scratch.size()), 0, true);
+            if (n < 0) {
+                scratch.resize(static_cast<size_t>(-n));
+                n = llama_token_to_piece(vocab, id, scratch.data(), static_cast<int32_t>(scratch.size()), 0, true);
+            }
+            if (n < 0) {
+                throw std::runtime_error("mindmap sampler could not decode a vocabulary token");
+            }
+            bytes.append(scratch.data(), static_cast<size_t>(n));
+        }
+        offsets.push_back(bytes.size());
+    }
+
+    std::string_view get(llama_token id) const {
+        if (id < 0 || static_cast<size_t>(id) + 1 >= offsets.size()) {
+            throw std::runtime_error("mindmap sampler received an invalid token id");
+        }
+        const size_t pos = offsets[static_cast<size_t>(id)];
+        return { bytes.data() + pos, offsets[static_cast<size_t>(id) + 1] - pos };
+    }
+};
+
+struct indent_sampler_context {
+    std::shared_ptr<const token_pieces> pieces;
+    indent_state                        state;
+};
+
+const char * indent_sampler_name(const llama_sampler *) {
+    return "mindmap-indent";
+}
+
+void indent_sampler_accept(llama_sampler * smpl, llama_token id) {
+    auto & ctx = *static_cast<indent_sampler_context *>(smpl->ctx);
+    if (!ctx.state.consume(ctx.pieces->get(id))) {
+        throw std::runtime_error("mindmap sampler accepted a structurally invalid token");
+    }
+}
+
+void indent_sampler_apply(llama_sampler * smpl, llama_token_data_array * candidates) {
+    const auto & ctx = *static_cast<const indent_sampler_context *>(smpl->ctx);
+    for (size_t i = 0; i < candidates->size; ++i) {
+        auto & candidate = candidates->data[i];
+        if (candidate.logit == -std::numeric_limits<float>::infinity()) {
+            continue;
+        }
+        indent_state next = ctx.state;
+        if (!next.consume(ctx.pieces->get(candidate.id))) {
+            candidate.logit = -std::numeric_limits<float>::infinity();
+        }
+    }
+}
+
+void indent_sampler_reset(llama_sampler * smpl) {
+    static_cast<indent_sampler_context *>(smpl->ctx)->state = {};
+}
+
+llama_sampler * indent_sampler_clone(const llama_sampler * smpl);
+
+void indent_sampler_free(llama_sampler * smpl) {
+    delete static_cast<indent_sampler_context *>(smpl->ctx);
+}
+
+llama_sampler_i indent_sampler_iface = {
+    /* .name              = */ indent_sampler_name,
+    /* .accept            = */ indent_sampler_accept,
+    /* .apply             = */ indent_sampler_apply,
+    /* .reset             = */ indent_sampler_reset,
+    /* .clone             = */ indent_sampler_clone,
+    /* .free              = */ indent_sampler_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+};
+
+llama_sampler * indent_sampler_clone(const llama_sampler * smpl) {
+    return llama_sampler_init(&indent_sampler_iface,
+                              new indent_sampler_context(*static_cast<const indent_sampler_context *>(smpl->ctx)));
+}
+
+}  // namespace
+
+llama_sampler * init_indent_sampler(const llama_vocab * vocab) {
+    if (!vocab) {
+        throw std::invalid_argument("mindmap sampler requires a vocabulary");
+    }
+    return llama_sampler_init(&indent_sampler_iface,
+                              new indent_sampler_context{ std::make_shared<token_pieces>(vocab), {} });
 }
 
 } // namespace server_mindmap

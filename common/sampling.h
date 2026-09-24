@@ -49,6 +49,12 @@ void                    common_sampler_accept(struct common_sampler * gsmpl, lla
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 
+// Append an additional constraint to an existing grammar sampler. Takes
+// ownership of extra; both constraints receive every generated token and
+// are cloned/reset together. Used by stateful wire constraints that GBNF
+// cannot express without a fixed depth bound.
+void common_sampler_append_grammar(struct common_sampler * gsmpl, struct llama_sampler * extra);
+
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
 

@@ -542,6 +542,14 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     };
 }
 
+void common_sampler_append_grammar(common_sampler * gsmpl, llama_sampler * extra) {
+    GGML_ASSERT(gsmpl && gsmpl->grmr && extra);
+    llama_sampler * combined = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(combined, gsmpl->grmr);
+    llama_sampler_chain_add(combined, extra);
+    gsmpl->grmr = combined;
+}
+
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
     // TODO: measure grammar performance
 

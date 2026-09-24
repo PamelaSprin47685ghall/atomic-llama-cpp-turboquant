@@ -3478,7 +3478,7 @@ static void test_mindmap_route_workers_carry_no_leaf_edges() {
 
 static void test_mindmap_more_leaves_than_pens() {
     server_rerot_runtime runtime(nullptr);
-    runtime.set_pen_capacity(1);
+    runtime.set_pen_capacity(6);
     const uint64_t ep_id = runtime.adopt_root(21, 21, 0, 1, 0);
     CHECK(ep_id != 0);
 
@@ -3504,19 +3504,23 @@ static void test_mindmap_more_leaves_than_pens() {
     CHECK(ep != nullptr);
     CHECK(ep->nodes.size() == 27); // root + all leaves + synthesis
     CHECK(ep->ready_queue.size() == 25);
-    CHECK(ep->dag_step_cohort.size() == 25);
-    llama_rerot_node_id first = LLAMA_REROT_NODE_INVALID;
-    CHECK(runtime.admit_next_child(ep_id, 0, 1, &first));
-    CHECK(first == 1);
-    CHECK(runtime.complete_admission(ep_id, first));
-    CHECK(commit_generated(runtime, ep_id, first,
-        runtime.node(ep_id, first)->storage_pos_next, "first slice"));
-    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
-    llama_rerot_node_id next = LLAMA_REROT_NODE_INVALID;
-    CHECK(runtime.admit_next_child(ep_id, 0, 2, &next));
-    CHECK(next != first);
-    CHECK(runtime.complete_admission(ep_id, next));
-    CHECK(ep->dag_step_cohort.size() == 25);
+    CHECK(ep->dag_step_cohort.size() == 6);
+    for (int slot = 0; slot < 6; ++slot) {
+        llama_rerot_node_id worker = LLAMA_REROT_NODE_INVALID;
+        CHECK(runtime.admit_next_child(ep_id, slot, slot, &worker));
+        CHECK(worker == static_cast<llama_rerot_node_id>(slot + 1));
+        CHECK(runtime.complete_admission(ep_id, worker));
+        CHECK(commit_generated(runtime, ep_id, worker,
+            runtime.node(ep_id, worker)->storage_pos_next, "one token"));
+        CHECK(runtime.dag_logical_step_complete(ep_id) == (slot == 5));
+    }
+    CHECK(!runtime.finish_frontier(ep_id).hard_aborted);
+    CHECK(ep->ready_queue.size() == 19);
+    CHECK(ep->dag_step_cohort.size() == 6);
+    for (int slot = 0; slot < 6; ++slot) {
+        CHECK(runtime.node(ep_id, slot + 1)->physical_slot == slot);
+        CHECK(ep->dag_step_cohort.count(slot + 1) != 0);
+    }
     CHECK(!ep->hard_aborted);
 }
 
@@ -4559,207 +4563,28 @@ static void test_dag_admission_view_survival() {
     CHECK(ep->nodes[3].remaining_preds == 1);
 }
 
-static void test_dag_w_gt_p_yield_without_seal() {
-    // P=1, W=3 independent workers: yield the running pen so the next
-    // eligible can admit without anyone sealing.
-    server_rerot_runtime runtime(nullptr);
-    runtime.set_pen_capacity(1);
+static void test_dag_p_bound_cohort_queue_until_natural_seal() {
+    // MM-R1 Throughput / Stage 4:
+    // P-bound cohort semantics under W > P.
+    // Invariant 1: With P=1 and W=3 eligible workers in ready_queue, the logical cohort
+    //              admits at most P workers (only w1 enters dag_step_cohort); w2 and w3
+    //              remain queued in ready_queue.
+    // Invariant 2: Bound worker w1 decodes continuously across successive frontiers
+    //              without being routine-yielded or swapped out mid-generation.
+    // Invariant 3: Atomic publication: while w1 has an uncommitted or pending record,
+    //              finish_frontier does not publish prematurely; mid-cohort uncommitted
+    //              writes remain invisible to frozen reader views.
+    // Invariant 4: Natural seal and release: only after w1 naturally finishes/seals is
+    //              its pen freed, allowing the next queued eligible worker (w2) to enter
+    //              the cohort on the subsequent logical step.
+    // Invariant 5: Reader view isolation: queued peers never observe uncommitted or
+    //              mid-cohort pending writes; after atomic publication of w1 upon seal,
+    //              subsequently admitted w2 observes published predecessor runs.
 
-    const uint64_t ep_id = runtime.adopt_root(14, 14, 0, 1, 0);
-    CHECK(ep_id != 0);
-
-    const auto decision = server_rerot_parse_routing_decision(R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [
-          {"id": "A", "intent": "Fact A"},
-          {"id": "B", "intent": "Fact B"},
-          {"id": "C", "intent": "Fact C"}
-        ],
-        "depends_on": []
-      }
-    })");
-    CHECK(decision.is_dag());
-    std::string err;
-    CHECK(runtime.initialize_dag(ep_id, decision, &err));
-    // Formal base capture after init, before any ready work: lineage,
-    // watermarks, and sampler clones do not exist until this point.
-    CHECK(runtime.capture_c0(ep_id, 1, 0));
-    CHECK(runtime.capture_c_base(ep_id));
-    CHECK(runtime.activate_dag_frontier(ep_id));
-    auto * ep = runtime.episode(ep_id);
-    CHECK(ep != nullptr);
-    CHECK(ep->ready_queue.size() >= 3);
-
-    dag_unbind_planner_if_bound(runtime, ep_id);
-
-    llama_rerot_node_id first = LLAMA_REROT_NODE_INVALID;
-    CHECK(runtime.admit_next_child(ep_id, 0, 1, &first));
-    CHECK(first == 1);
-    CHECK(runtime.complete_admission(ep_id, first));
-    CHECK(!runtime.node(ep_id, first)->is_sealed);
-    CHECK(dag_queue_contains(ep->ready_queue, 2) || dag_queue_contains(ep->ready_queue, 3) ||
-          ep->starting.count(2) || ep->starting.count(3) ||
-          ep->running.count(2) || ep->running.count(3));
-
-    // A freshly admitted worker has no slice to preserve yet. Commit one
-    // token before asking the scheduler to swap its pen to a queued peer.
-    CHECK(!runtime.yield_dag_pen_for_ready(ep_id));
-    CHECK(commit_generated(runtime, ep_id, first,
-        runtime.node(ep_id, first)->storage_pos_next, "A"));
-
-    auto find_other_started = [&]() -> llama_rerot_node_id {
-        for (llama_rerot_node_id nid : {llama_rerot_node_id(2), llama_rerot_node_id(3)}) {
-            const auto * dn = ep->document.node(nid);
-            if (!dn) {
-                continue;
-            }
-            if (ep->starting.count(nid) || ep->running.count(nid) ||
-                dn->state == llama_rerot_node_state::starting ||
-                dag_state_is_live_worker(dn->state) ||
-                dn->state == llama_rerot_node_state::ready_suspended) {
-                return nid;
-            }
-        }
-        return LLAMA_REROT_NODE_INVALID;
-    };
-
-    // First must not need is_sealed to yield its committed slice.
-    if (runtime.node(ep_id, first)->physical_slot >= 0) {
-        CHECK(runtime.yield_dag_pen_for_ready(ep_id));
-    }
-    CHECK(!runtime.node(ep_id, first)->is_sealed);
-    const auto first_state = ep->document.node(first)->state;
-    CHECK(first_state == llama_rerot_node_state::ready_suspended ||
-          dag_state_is_live_worker(first_state));
-    CHECK(first_state != llama_rerot_node_state::planning);
-
-    llama_rerot_node_id second = find_other_started();
-    if (second == LLAMA_REROT_NODE_INVALID) {
-        CHECK(runtime.admit_next_child(ep_id, 0, 2, &second));
-    }
-    CHECK(second != LLAMA_REROT_NODE_INVALID);
-    CHECK(second != first);
-    CHECK(!runtime.node(ep_id, first)->is_sealed);
-
-    ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 3, 1);
-    const auto run_a = ep->document.append_run(
-        first, llama_rerot_visibility::public_live, 3, 4, 2);
-    const auto run_b = ep->document.append_run(
-        second, llama_rerot_visibility::public_live, 7, 5, 2);
-
-    const auto view_first = runtime.build_dag_view_for_reader(ep_id, first);
-    const auto view_second = runtime.build_dag_view_for_reader(ep_id, second);
-    CHECK(dag_view_has_run(view_first, run_a));
-    CHECK(dag_view_has_run(view_second, run_a));
-    CHECK(dag_view_has_run(view_second, run_b));
-}
-
-static void test_dag_yield_requires_fresh_commit_after_resume() {
-    server_rerot_runtime runtime(nullptr);
-    runtime.set_pen_capacity(1);
-    const uint64_t ep_id = runtime.adopt_root(114, 114, 0, 1, 0);
-    CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision(R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [{"id": "A", "intent": "Fact A"}, {"id": "B", "intent": "Fact B"}],
-        "depends_on": []
-      }
-    })");
-    CHECK(decision.is_dag());
-    std::string err;
-    CHECK(runtime.initialize_dag(ep_id, decision, &err));
-    CHECK(runtime.capture_c0(ep_id, 1, 0));
-    CHECK(runtime.capture_c_base(ep_id));
-    CHECK(runtime.activate_dag_frontier(ep_id));
-    dag_unbind_planner_if_bound(runtime, ep_id);
-
-    llama_rerot_node_id first = LLAMA_REROT_NODE_INVALID;
-    CHECK(runtime.admit_next_child(ep_id, 0, 2, &first));
-    CHECK(runtime.complete_admission(ep_id, first));
-    const auto * lane = runtime.node(ep_id, first);
-    CHECK(lane != nullptr);
-    CHECK(commit_generated(runtime, ep_id, first, lane->storage_pos_next, "first"));
-    CHECK(runtime.episode(ep_id)->dag_step_committed.count(first) != 0);
-    CHECK(!runtime.finish_frontier(ep_id).hard_aborted); // only one scheduling round
-    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
-    CHECK(runtime.resume_pen(ep_id, first, 0, 2));
-    // The cohort still records the previous token, but no row was committed
-    // by this binding. Re-yielding it would spin without ever running B.
-    CHECK(!runtime.yield_dag_pen_for_ready(ep_id));
-    CHECK(runtime.node(ep_id, first)->physical_slot == 0);
-}
-
-static void test_dag_suspended_starting_resumes_fixed_entry() {
-    server_rerot_runtime runtime(nullptr);
-    runtime.set_pen_capacity(1);
-    const uint64_t ep_id = runtime.adopt_root(115, 115, 0, 1, 0);
-    CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision(R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [{"id": "A", "intent": "Fact A"}, {"id": "B", "intent": "Fact B"}],
-        "depends_on": []
-      }
-    })");
-    CHECK(decision.is_dag());
-    std::string err;
-    CHECK(runtime.initialize_dag(ep_id, decision, &err));
-    CHECK(runtime.capture_c0(ep_id, 1, 0));
-    CHECK(runtime.capture_c_base(ep_id));
-    CHECK(runtime.activate_dag_frontier(ep_id));
-    dag_unbind_planner_if_bound(runtime, ep_id);
-
-    llama_rerot_node_id first = LLAMA_REROT_NODE_INVALID;
-    CHECK(runtime.admit_next_child(ep_id, 0, 2, &first));
-    CHECK(runtime.episode(ep_id)->starting.count(first) != 0);
-    CHECK(commit_private(runtime, ep_id, first,
-        runtime.node(ep_id, first)->storage_pos_next));
-    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
-    CHECK(runtime.episode(ep_id)->suspended.count(first) != 0);
-    CHECK(runtime.node(ep_id, first)->suspended_from_starting);
-    const auto fp = test_state_fingerprints();
-    std::vector<uint8_t> blob;
-    CHECK(runtime.save_episode(ep_id, fp, &blob, &err));
-    server_rerot_runtime restored(nullptr);
-    restored.set_pen_capacity(1);
-    uint64_t restored_id = 0;
-    CHECK(restored.load_episode(blob.data(), blob.size(), fp, &restored_id, &err));
-    CHECK(restored.node(restored_id, first)->suspended_from_starting);
-    CHECK(restored.resume_pen(restored_id, first, 0, 2));
-    CHECK(restored.episode(restored_id)->document.node(first)->state == llama_rerot_node_state::starting);
-    CHECK(restored.complete_admission(restored_id, first));
-
-    CHECK(runtime.resume_pen(ep_id, first, 0, 2));
-    CHECK(runtime.episode(ep_id)->starting.count(first) != 0);
-    CHECK(runtime.episode(ep_id)->running.count(first) == 0);
-    CHECK(runtime.episode(ep_id)->document.node(first)->state == llama_rerot_node_state::starting);
-    CHECK(runtime.complete_admission(ep_id, first));
-    CHECK(runtime.episode(ep_id)->running.count(first) != 0);
-}
-
-static void test_dag_w_gt_p_logical_cohort_and_time_slice_certification() {
-    // Stage 4 (AGENTS.md §06 / RERoT.md §12.5 / §13.2):
-    // "W>P logical cohort + physical time-slice" full certification.
-    // Invariant 1: All W eligible workers enter the logical cohort in the same
-    //              scheduling boundary, without waiting for the first P workers to finish/SEAL.
-    // Invariant 2: The logical cohort freezes the public read watermark (frozen_read_publish_epoch);
-    //              any new public commits made in earlier physical time slices remain invisible
-    //              to later physical slices within the same logical step.
-    // Invariant 3: Time-slicing across limited physical pens (P=1, W=3) executes slice-by-slice
-    //              (using yield_dag_pen_for_ready / dag_step_next_pending / resume_pen)
-    //              until every cohort member commits.
-    // Invariant 4: Atomic publication: finish_frontier does not publish step bodies until
-    //              dag_logical_step_complete is true (every member committed).
-    // Invariant 5: Upon complete commit of the entire cohort, finish_frontier atomically
-    //              publishes all pending member bodies, advances frontier, clears cohort,
-    //              and updates reader views simultaneously.
-
-    std::fprintf(stderr, "--- test_dag_w_gt_p_logical_cohort_and_time_slice_certification (Stage 4) ---\n");
+    std::fprintf(stderr, "--- test_dag_p_bound_cohort_queue_until_natural_seal ---\n");
 
     server_rerot_runtime runtime(nullptr);
-    runtime.set_pen_capacity(1); // P = 1 physical pen, W = 3 independent workers
+    runtime.set_pen_capacity(1); // P = 1 physical pen, W = 3 independent eligible workers
 
     const uint64_t ep_id = runtime.adopt_root(115, 115, 0, 1, 0);
     CHECK(ep_id != 0);
@@ -4786,256 +4611,110 @@ static void test_dag_w_gt_p_logical_cohort_and_time_slice_certification() {
     auto * ep = runtime.episode(ep_id);
     CHECK(ep != nullptr);
 
-    // Initial state: W=3 eligible workers (nodes 1, 2, 3) in ready_queue
+    // Initial state: W=3 eligible workers (nodes 1, 2, 3) initially in ready_queue
     CHECK(ep->ready_queue.size() == 3);
 
-    // Invariant 1: Snapshot logical step captures all eligible unsealed workers into dag_step_cohort
+    // Invariant 1: P-bound cohort selects at most P=1 worker into dag_step_cohort
     CHECK(runtime.has_open_dag_logical_step(ep_id));
-    CHECK(ep->dag_step_cohort.size() == 3);
+    CHECK(ep->dag_step_cohort.size() == 1);
     CHECK(ep->dag_step_cohort.count(1) != 0);
-    CHECK(ep->dag_step_cohort.count(2) != 0);
-    CHECK(ep->dag_step_cohort.count(3) != 0);
+    CHECK(ep->dag_step_cohort.count(2) == 0);
+    CHECK(ep->dag_step_cohort.count(3) == 0);
     CHECK(!runtime.dag_logical_step_complete(ep_id));
 
-    // Time-slice 1: Admit w1 onto pen 0
+    // Admit w1 onto pen 0
     llama_rerot_node_id w1 = LLAMA_REROT_NODE_INVALID;
     CHECK(runtime.admit_next_child(ep_id, 0, 1, &w1));
     CHECK(w1 == 1);
     CHECK(runtime.complete_admission(ep_id, w1));
 
-    // w1 writes token in time-slice 1
+    // Invariant 2: w1 decodes continuously without routine yielding
+    // Frontier step 1: w1 generates token 1
     auto * nw1 = runtime.node(ep_id, w1);
     CHECK(nw1 != nullptr);
-    CHECK(commit_generated(runtime, ep_id, w1, nw1->storage_pos_next, "w1_slice1"));
+    CHECK(commit_generated(runtime, ep_id, w1, nw1->storage_pos_next, "w1_token1"));
     CHECK(nw1->pending_record.has_value());
-    const auto run_w1 = *nw1->pending_record;
+    const auto run_w1_t1 = *nw1->pending_record;
     CHECK(ep->dag_step_committed.count(w1) != 0);
-    CHECK(!runtime.dag_logical_step_complete(ep_id));
-
-    // Finish_frontier mid-cohort does NOT publish: w2 and w3 have not committed yet
-    const auto mid_res1 = runtime.finish_frontier(ep_id);
-    CHECK(!mid_res1.hard_aborted);
-    CHECK(runtime.has_open_dag_logical_step(ep_id));
-    CHECK(!runtime.dag_logical_step_complete(ep_id));
-    // w1's write must remain pending and unpublished
-    CHECK(ep->document.run(run_w1)->visibility == llama_rerot_visibility::pending_record);
-
-    // Yield pen 0 so w2 can run
-    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
-    CHECK(ep->suspended.count(w1) != 0);
-    CHECK(runtime.pens_allocated() == 0);
-
-    // Time-slice 2: Admit w2 onto pen 0
-    const auto next_pen2 = runtime.dag_step_next_pending(ep_id);
-    CHECK(next_pen2.has_value());
-    llama_rerot_node_id w2 = LLAMA_REROT_NODE_INVALID;
-    CHECK(runtime.admit_next_child(ep_id, 0, 2, &w2, *next_pen2));
-    CHECK(w2 == 2);
-    CHECK(runtime.complete_admission(ep_id, w2));
-
-    // Invariant 2: Reader view of w2 in time-slice 2 CANNOT observe w1's slice1 write
-    const auto view_w2_before_commit = runtime.build_dag_view_for_reader(ep_id, w2);
-    CHECK(!dag_view_has_run(view_w2_before_commit, run_w1));
-
-    // w2 writes token in time-slice 2
-    auto * nw2 = runtime.node(ep_id, w2);
-    CHECK(nw2 != nullptr);
-    CHECK(commit_generated(runtime, ep_id, w2, nw2->storage_pos_next, "w2_slice1"));
-    CHECK(nw2->pending_record.has_value());
-    const auto run_w2 = *nw2->pending_record;
-    CHECK(ep->dag_step_committed.count(w2) != 0);
-    CHECK(!runtime.dag_logical_step_complete(ep_id));
-
-    // Yield pen 0 so w3 can run
-    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
-    CHECK(ep->suspended.count(w2) != 0);
-
-    // Time-slice 3: Admit w3 onto pen 0
-    const auto next_pen3 = runtime.dag_step_next_pending(ep_id);
-    CHECK(next_pen3.has_value());
-    llama_rerot_node_id w3 = LLAMA_REROT_NODE_INVALID;
-    CHECK(runtime.admit_next_child(ep_id, 0, 3, &w3, *next_pen3));
-    CHECK(w3 == 3);
-    CHECK(runtime.complete_admission(ep_id, w3));
-
-    // Reader view of w3 still cannot see w1 or w2's uncommitted/unpublished writes
-    const auto view_w3_before_commit = runtime.build_dag_view_for_reader(ep_id, w3);
-    CHECK(!dag_view_has_run(view_w3_before_commit, run_w1));
-    CHECK(!dag_view_has_run(view_w3_before_commit, run_w2));
-
-    // w3 writes token in time-slice 3
-    auto * nw3 = runtime.node(ep_id, w3);
-    CHECK(nw3 != nullptr);
-    CHECK(commit_generated(runtime, ep_id, w3, nw3->storage_pos_next, "w3_slice1"));
-    CHECK(nw3->pending_record.has_value());
-    const auto run_w3 = *nw3->pending_record;
-    CHECK(ep->dag_step_committed.count(w3) != 0);
-
-    // Invariant 3 & 4: Now all 3 members have committed, logical step is complete!
+    // Cohort has 1 member (w1), so step is complete once w1 commits
     CHECK(runtime.dag_logical_step_complete(ep_id));
 
-    // Invariant 5: finish_frontier atomically publishes all 3 members at once
-    const uint64_t frontier_before = ep->frontier;
-    const uint64_t publish_epoch_before = ep->publish_epoch;
-    const auto finish_res = runtime.finish_frontier(ep_id);
-    CHECK(!finish_res.hard_aborted);
-    CHECK(ep->frontier == frontier_before + 1);
-    CHECK(ep->publish_epoch > publish_epoch_before);
-    // After finish_frontier, advance_frontier and activate_dag_frontier run:
-    // dag_step_committed is cleared, and snapshot_dag_logical_step initializes
-    // the next logical frontier cohort with all remaining unsealed live workers.
+    // A queued node has no runtime reader view yet. In a hypothetical view
+    // including w2, w1's pending run must still remain invisible.
+    const auto view_w2_before = ep->document.build_dag_view(2, {0, 1, 2}, ep->frozen_read_publish_epoch);
+    CHECK(!dag_view_has_run(view_w2_before, run_w1_t1));
+
+    // Invariant 3: Finish frontier for step 1 publishes w1_t1 and advances frontier
+    const uint64_t f1 = ep->frontier;
+    const auto res1 = runtime.finish_frontier(ep_id);
+    CHECK(!res1.hard_aborted);
+    CHECK(ep->frontier == f1 + 1);
+    CHECK(ep->document.run(run_w1_t1)->visibility == llama_rerot_visibility::public_live);
+
+    // w1 remains bound on pen 0 across logical steps: no yield or swap occurred!
+    CHECK(nw1->physical_slot == 0);
+    CHECK(ep->running.count(w1) != 0);
+    CHECK(ep->suspended.empty());
+    // In the next logical step, w1 is still bound and ready_queue still holds queued workers
+    CHECK(ep->dag_step_cohort.size() == 1);
+    CHECK(ep->dag_step_cohort.count(w1) != 0);
     CHECK(ep->dag_step_committed.empty());
-    CHECK(ep->dag_step_cohort.size() == 3);
 
-    // All 3 runs are now public_live
-    CHECK(ep->document.run(run_w1)->visibility == llama_rerot_visibility::public_live);
-    CHECK(ep->document.run(run_w2)->visibility == llama_rerot_visibility::public_live);
-    CHECK(ep->document.run(run_w3)->visibility == llama_rerot_visibility::public_live);
+    // Frontier step 2: w1 generates token 2 continuously without being yielded
+    CHECK(commit_generated(runtime, ep_id, w1, nw1->storage_pos_next, "w1_token2"));
+    CHECK(nw1->pending_record.has_value());
+    const auto run_w1_t2 = *nw1->pending_record;
+    CHECK(ep->dag_step_committed.count(w1) != 0);
+    CHECK(runtime.dag_logical_step_complete(ep_id));
 
-    // Reader views for all 3 workers now mutually observe all 3 published runs
-    const auto view_w1_post = runtime.build_dag_view_for_reader(ep_id, w1);
-    const auto view_w2_post = runtime.build_dag_view_for_reader(ep_id, w2);
-    const auto view_w3_post = runtime.build_dag_view_for_reader(ep_id, w3);
-    CHECK(dag_view_has_run(view_w1_post, run_w1));
-    CHECK(dag_view_has_run(view_w1_post, run_w2));
-    CHECK(dag_view_has_run(view_w1_post, run_w3));
-    CHECK(dag_view_has_run(view_w2_post, run_w1));
-    CHECK(dag_view_has_run(view_w2_post, run_w2));
-    CHECK(dag_view_has_run(view_w2_post, run_w3));
-    CHECK(dag_view_has_run(view_w3_post, run_w1));
-    CHECK(dag_view_has_run(view_w3_post, run_w2));
-    CHECK(dag_view_has_run(view_w3_post, run_w3));
+    const auto res2 = runtime.finish_frontier(ep_id);
+    CHECK(!res2.hard_aborted);
+    CHECK(ep->document.run(run_w1_t2)->visibility == llama_rerot_visibility::public_live);
 
-    // All workers naturally seal
-    CHECK(runtime.seal_dag_node(ep_id, w3, llama_rerot_event_origin::worker_source));
-    CHECK(runtime.resume_pen(ep_id, w1, 0, 1));
+    // Invariant 4: Natural seal and release: w1 completes and naturally seals
     CHECK(runtime.seal_dag_node(ep_id, w1, llama_rerot_event_origin::worker_source));
-    CHECK(runtime.resume_pen(ep_id, w2, 0, 2));
-    CHECK(runtime.seal_dag_node(ep_id, w2, llama_rerot_event_origin::worker_source));
+    CHECK(runtime.pens_allocated() == 0);
 
-    // Synthesis is unlocked
-    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 0);
-    CHECK(!runtime.get_eligible_dag_nodes(ep_id).empty());
+    // Finish the sealed step: retirement clears the old cohort and admits
+    // the next queued worker only after the pen is actually free.
+    CHECK(!runtime.finish_frontier(ep_id).hard_aborted);
+    CHECK(ep->dag_step_cohort.size() == 1);
+    CHECK(ep->dag_step_cohort.count(2) != 0);
+    CHECK(ep->dag_step_cohort.count(3) == 0); // w3 still remains queued
 
-    CHECK(runtime.erase_episode(ep_id));
-}
-
-static void test_dag_w_active_state_retention_and_swap() {
-    // AGENTS.md §06.4, RERoT.md §8.5 & §12.5 (Stage 4 / Stage 7):
-    // "W active stages state retention, swap and restore":
-    // 1. In native lane-local recurrence under W > P, logical active workers (W=3)
-    //    compete for limited physical pens (P=1).
-    // 2. When worker 1 yields/suspends for worker 2 to admit/execute, worker 1's local
-    //    accumulated state (hand_seed, sampler_blob, mtp_blob, token progress, next storage pos)
-    //    must be 100% retained across suspension.
-    // 3. Worker 1 must NOT be reset to C_base or lose its independent progress upon resumption.
-    // 4. Resumption of worker 1 onto the freed physical pen restores exact local state and continues
-    //    generation from its preserved storage cursor.
-
-    std::fprintf(stderr, "--- test_dag_w_active_state_retention_and_swap ---\n");
-
-    server_rerot_runtime runtime(nullptr);
-    runtime.set_pen_capacity(1); // Exactly P=1 physical pen
-
-    const uint64_t ep_id = runtime.adopt_root(114, 114, 0, 1, 0);
-    CHECK(ep_id != 0);
-
-    const auto decision = server_rerot_parse_routing_decision(R"json({
-      "strategy": "dag",
-      "payload": {
-        "questions": [
-          {"id": "w1", "intent": "Fact 1 derivation"},
-          {"id": "w2", "intent": "Fact 2 derivation"}
-        ],
-        "depends_on": []
-      }
-    })json");
-    CHECK(decision.is_dag());
-    std::string err;
-    CHECK(runtime.initialize_dag(ep_id, decision, &err));
-    CHECK(runtime.capture_c0(ep_id, 1, 0));
-    CHECK(runtime.capture_c_base(ep_id));
-    CHECK(runtime.activate_dag_frontier(ep_id));
-
-    dag_unbind_planner_if_bound(runtime, ep_id);
-    auto * ep = runtime.episode(ep_id);
-    CHECK(ep != nullptr);
-
-    // 1. Admit worker 1 into the only available physical pen (pen 0)
-    llama_rerot_node_id w1 = LLAMA_REROT_NODE_INVALID;
-    CHECK(runtime.admit_next_child(ep_id, 0, 1, &w1));
-    CHECK(w1 == 1);
-    CHECK(runtime.complete_admission(ep_id, w1));
-
-    auto * node1 = runtime.node(ep_id, w1);
-    CHECK(node1 != nullptr);
-    CHECK(node1->physical_slot == 0);
-
-    // Worker 1 makes local generation progress: stamp custom sampler/mtp blobs and hand state
-    node1->sampler_blob = {0x12, 0x34, 0x56};
-    node1->mtp_blob = {0x78, 0x9A};
-    node1->hand_seed = {0xBC, 0xDE, 0xF0};
-    node1->storage_pos_next = 25;
-
-    // Append public progress for worker 1
-    const auto run_w1_step1 = ep->document.append_run(w1, llama_rerot_visibility::public_live, 10, 15, 1);
-    CHECK(run_w1_step1 != LLAMA_REROT_RUN_INVALID);
-
-    // 2. Worker 1 yields pen 0 under resource pressure so worker 2 can start
-    CHECK(runtime.yield_dag_pen_for_ready(ep_id, /*resource_pressure=*/true));
-    CHECK(node1->physical_slot == -1);
-    CHECK(ep->suspended.count(w1) != 0);
-    CHECK(ep->document.node(w1)->state == llama_rerot_node_state::ready_suspended);
-
-    // Verify Worker 1 state is NOT wiped or reverted to empty/C_base
-    CHECK(node1->sampler_blob == std::vector<uint8_t>({0x12, 0x34, 0x56}));
-    CHECK(node1->mtp_blob == std::vector<uint8_t>({0x78, 0x9A}));
-    CHECK(node1->hand_seed == std::vector<uint8_t>({0xBC, 0xDE, 0xF0}));
-    CHECK(node1->storage_pos_next == 25);
-
-    // 3. Worker 2 admits onto the freed pen 0
+    // Admit w2 onto freed pen 0
     llama_rerot_node_id w2 = LLAMA_REROT_NODE_INVALID;
     CHECK(runtime.admit_next_child(ep_id, 0, 2, &w2));
     CHECK(w2 == 2);
     CHECK(runtime.complete_admission(ep_id, w2));
 
-    auto * node2 = runtime.node(ep_id, w2);
-    CHECK(node2 != nullptr);
-    CHECK(node2->physical_slot == 0);
+    // Invariant 5: Reader view of newly admitted w2 observes w1's published runs
+    const auto view_w2_active = runtime.build_dag_view_for_reader(ep_id, w2);
+    CHECK(dag_view_has_run(view_w2_active, run_w1_t1));
+    CHECK(dag_view_has_run(view_w2_active, run_w1_t2));
 
-    // Worker 2 advances its own separate state
-    node2->sampler_blob = {0xAA, 0xBB};
-    node2->storage_pos_next = 40;
-    const auto run_w2_step1 = ep->document.append_run(w2, llama_rerot_visibility::public_live, 25, 15, 1);
-    CHECK(run_w2_step1 != LLAMA_REROT_RUN_INVALID);
-
-    // Worker 2 yields pen 0 back so Worker 1 can resume
-    CHECK(runtime.yield_dag_pen_for_ready(ep_id, /*resource_pressure=*/true));
-    CHECK(node2->physical_slot == -1);
-    CHECK(ep->suspended.count(w2) != 0);
-
-    // 4. Resume Worker 1 onto freed pen 0
-    CHECK(runtime.resume_pen(ep_id, w1, 0, 1));
-    CHECK(node1->physical_slot == 0);
-    CHECK(ep->suspended.count(w1) == 0);
-    CHECK(ep->running.count(w1) != 0);
-
-    // Verify exact state continuity on Worker 1 after time-slice swap
-    CHECK(node1->sampler_blob == std::vector<uint8_t>({0x12, 0x34, 0x56}));
-    CHECK(node1->mtp_blob == std::vector<uint8_t>({0x78, 0x9A}));
-    CHECK(node1->hand_seed == std::vector<uint8_t>({0xBC, 0xDE, 0xF0}));
-    CHECK(node1->storage_pos_next == 25);
-
-    // Worker 1 can continue generation cleanly
-    const auto run_w1_step2 = ep->document.append_run(w1, llama_rerot_visibility::public_live, 40, 5, 2);
-    CHECK(run_w1_step2 != LLAMA_REROT_RUN_INVALID);
-    node1->storage_pos_next = 45;
-
-    // Both workers seal naturally
-    CHECK(runtime.seal_dag_node(ep_id, w1, llama_rerot_event_origin::worker_source));
-    CHECK(runtime.resume_pen(ep_id, w2, 0, 2));
+    // w2 decodes and seals naturally
+    auto * nw2 = runtime.node(ep_id, w2);
+    CHECK(nw2 != nullptr);
+    CHECK(commit_generated(runtime, ep_id, w2, nw2->storage_pos_next, "w2_token1"));
+    CHECK(runtime.finish_frontier(ep_id).hard_aborted == false);
     CHECK(runtime.seal_dag_node(ep_id, w2, llama_rerot_event_origin::worker_source));
 
+    // Pen 0 is free again: w3 enters the cohort and is admitted
+    CHECK(!runtime.finish_frontier(ep_id).hard_aborted);
+    CHECK(ep->dag_step_cohort.size() == 1);
+    CHECK(ep->dag_step_cohort.count(3) != 0);
+
+    llama_rerot_node_id w3 = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 3, &w3));
+    CHECK(w3 == 3);
+    CHECK(runtime.complete_admission(ep_id, w3));
+
+    // w3 seals naturally
+    CHECK(runtime.seal_dag_node(ep_id, w3, llama_rerot_event_origin::worker_source));
+    CHECK(!runtime.finish_frontier(ep_id).hard_aborted);
+
+    // Synthesis is unlocked
     CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 0);
     CHECK(!runtime.get_eligible_dag_nodes(ep_id).empty());
 
@@ -5475,12 +5154,10 @@ static void test_dag_complete_admission_evicts_no_peer() {
 }
 
 static void test_dag_seal_evicts_no_bound_peer() {
-    // P=1: A suspended, B just admitted+completed (host commit/sample still
-    // pending), C queued. Sealing A must stage only A's own completion —
-    // passivate self, debit successors — and leave bound B untouched. It must
-    // never select B as a yield victim mid-commit-loop.
+    // P=2: A and B remain bound while C waits. Naturally sealing A frees
+    // only A's pen; B continues on its original executor.
     server_rerot_runtime runtime(nullptr);
-    runtime.set_pen_capacity(1);
+    runtime.set_pen_capacity(2);
     const uint64_t ep_id = runtime.adopt_root(34, 34, 0, 1, 0);
     CHECK(ep_id != 0);
     const auto decision = server_rerot_parse_routing_decision(R"({
@@ -5508,12 +5185,10 @@ static void test_dag_seal_evicts_no_bound_peer() {
     CHECK(runtime.complete_admission(ep_id, a));
     CHECK(commit_generated(runtime, ep_id, a,
         runtime.node(ep_id, a)->storage_pos_next, "A"));
-    // Park A so B can start; B's host work has not run yet.
-    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
     auto * ep = runtime.episode(ep_id);
-    CHECK(ep != nullptr && ep->suspended.count(a) != 0);
+    CHECK(ep != nullptr);
     llama_rerot_node_id b = LLAMA_REROT_NODE_INVALID;
-    CHECK(runtime.admit_next_child(ep_id, 0, 3, &b));
+    CHECK(runtime.admit_next_child(ep_id, 1, 3, &b));
     CHECK(b == 2);
     CHECK(runtime.complete_admission(ep_id, b));
 
@@ -5524,63 +5199,9 @@ static void test_dag_seal_evicts_no_bound_peer() {
     CHECK(sealed->physical_slot < 0 && sealed->exec_seq < 0);
     // Bound B is untouched: still running on its pen, never suspended.
     const auto * peer = runtime.node(ep_id, b);
-    CHECK(peer && peer->physical_slot == 0 && peer->exec_seq == 3);
+    CHECK(peer && peer->physical_slot == 1 && peer->exec_seq == 3);
     CHECK(ep->running.count(b) != 0 && ep->suspended.empty());
     CHECK(ep->document.node(b)->state == llama_rerot_node_state::running);
-}
-
-static void test_dag_yield_force_under_resource_pressure() {
-    // Pens free, but recurrent rows exhausted: the default yield no-ops (a
-    // free pen is not a free recurrent row); the pressure yield suspends one
-    // bound worker so the queued peer can proceed.
-    server_rerot_runtime runtime(nullptr);
-    runtime.set_pen_capacity(2);
-    const uint64_t ep_id = runtime.adopt_root(32, 32, 0, 1, 0);
-    CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision(R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [
-          {"id": "A", "intent": "Fact A"},
-          {"id": "B", "intent": "Fact B"}
-        ],
-        "depends_on": []
-      }
-    })");
-    CHECK(decision.is_dag());
-    std::string err;
-    CHECK(runtime.initialize_dag(ep_id, decision, &err));
-    CHECK(runtime.capture_c0(ep_id, 1, 0));
-    CHECK(runtime.capture_c_base(ep_id));
-    CHECK(runtime.activate_dag_frontier(ep_id));
-    dag_unbind_planner_if_bound(runtime, ep_id);
-
-    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
-    CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
-    CHECK(a == 1);
-    CHECK(runtime.complete_admission(ep_id, a));
-
-    // One pen still free: default yield refuses, worker untouched.
-    CHECK(runtime.has_free_pen());
-    CHECK(!runtime.yield_dag_pen_for_ready(ep_id));
-    const auto * running = runtime.node(ep_id, a);
-    CHECK(running && running->physical_slot == 0 && running->exec_seq == 2);
-    auto * ep = runtime.episode(ep_id);
-    CHECK(ep != nullptr && ep->suspended.empty());
-
-    // Forced yield under pressure suspends the bound worker anyway.
-    CHECK(commit_generated(runtime, ep_id, a,
-        runtime.node(ep_id, a)->storage_pos_next, "A"));
-    CHECK(runtime.yield_dag_pen_for_ready(ep_id, true));
-    CHECK(ep->suspended.count(a) != 0);
-    CHECK(ep->document.node(a)->state == llama_rerot_node_state::ready_suspended);
-    CHECK(runtime.node(ep_id, a)->physical_slot < 0);
-    CHECK(runtime.has_free_pen());
-
-    // The queued peer admits onto the freed pen.
-    llama_rerot_node_id b = LLAMA_REROT_NODE_INVALID;
-    CHECK(runtime.admit_next_child(ep_id, 0, 2, &b));
-    CHECK(b == 2);
 }
 
 static void test_dag_admit_anchors_worker_storage_to_c_base() {
@@ -8050,10 +7671,7 @@ int main() {
     test_dag_c0_probe_cancel_and_isolation();
     test_dag_c0_probe_to_simple_continuation_and_grammar_isolation();
     test_dag_admission_view_survival();
-    test_dag_w_gt_p_yield_without_seal();
-    test_dag_yield_requires_fresh_commit_after_resume();
-    test_dag_suspended_starting_resumes_fixed_entry();
-    test_dag_w_gt_p_logical_cohort_and_time_slice_certification();
+    test_dag_p_bound_cohort_queue_until_natural_seal();
     test_dag_frozen_read_publish_epoch();
     test_dag_logical_step_hides_foreign_pending();
     test_dag_refuses_nested_html_fork();
@@ -8122,8 +7740,6 @@ int main() {
     test_dag_seal_releases_pen_parked_until_cohort_retire();
     test_dag_complete_admission_evicts_no_peer();
     test_dag_seal_evicts_no_bound_peer();
-    test_dag_yield_force_under_resource_pressure();
-    test_dag_w_active_state_retention_and_swap();
     test_dag_admit_anchors_worker_storage_to_c_base();
     test_dag_discard_probe_retracts_probe_runs();
     test_dag_frozen_view_gates_foreign_frame();
