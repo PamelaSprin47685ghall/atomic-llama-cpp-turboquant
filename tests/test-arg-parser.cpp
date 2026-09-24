@@ -1782,6 +1782,54 @@ static void test(void) {
             argv = {"binary_name", "--tp5-latebind", "invalid"};
             assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), p_invalid, LLAMA_EXAMPLE_SERVER));
         }
+
+        // Unmatched or unspecified draft ranks must reject device-hidden before
+        // target model construction or GPU graph work.
+        {
+            const char * previous = getenv("GGML_TP5_MTP_DEVICE_HIDDEN");
+            const std::string old_value = previous ? previous : "";
+            setenv("GGML_TP5_MTP_DEVICE_HIDDEN", "1", 1);
+            common_params p;
+            p.tp5.enabled = true;
+            p.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            bool rejected = false;
+            try {
+                common_tp5_apply_env(p);
+            } catch (const std::runtime_error &) {
+                rejected = true;
+            }
+            if (previous) {
+                setenv("GGML_TP5_MTP_DEVICE_HIDDEN", old_value.c_str(), 1);
+            } else {
+                unsetenv("GGML_TP5_MTP_DEVICE_HIDDEN");
+            }
+            assert(rejected);
+        }
+
+        // An unqualified MTP LateBind request is rejected. An explicit CLI
+        // off must still override an inherited LateBind experiment.
+        {
+            const char * previous = getenv("GGML_TP5_LATEBIND");
+            const std::string old_value = previous ? previous : "";
+            setenv("GGML_TP5_LATEBIND", "hc-down", 1);
+            common_params p;
+            p.tp5.enabled = true;
+            p.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            bool rejected = false;
+            try {
+                common_tp5_apply_env(p);
+            } catch (const std::runtime_error &) {
+                rejected = true;
+            }
+            assert(rejected);
+            p.tp5.latebind = "off";
+            common_tp5_apply_env(p);
+            if (previous) {
+                setenv("GGML_TP5_LATEBIND", old_value.c_str(), 1);
+            } else {
+                unsetenv("GGML_TP5_LATEBIND");
+            }
+        }
     }
 
     printf("test-arg-parser: all tests OK\n\n");

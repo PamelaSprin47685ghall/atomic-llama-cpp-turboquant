@@ -231,7 +231,7 @@ for f in /tmp/tp5-mtp-drill/*.log; do echo "=== $f"; bash scripts/check-tp5-mtp-
 | :--- | :--- | :--- | :--- |
 | **1. Target 验证耗时偏大** | 首轮由于冷启动或 CPU 调度抖动导致计时偏高 | 查看 `[tp5-mtp-cycle]` 第 2 周期以后的 `target_us` 是否收敛至稳定水准 | 保持单次请求，不扩大并发；单 cycle 异常不改变整体守恒逻辑。 |
 | **2. Generation 匹配警告** | 预定义 Hidden 的有效行数或槽位复用逻辑与当前批次状态冲突 | 检查警告日志打印的 `src_slot`、`exp_gen` 与 `actual_gen` 具体差值 | 抓取完整 stderr 日志后 `SIGTERM` 退出，交由 Engineer 调查状态机。 |
-| **3. 设备发生未捕获挂起** | Vulkan 队列调度异步栅障未对齐 | 查看 dmesg 是否出现 GPU 页面错误 | **立即执行一键免密安全自愈工具**：`./scripts/reset-gpu.sh`。 |
+| **3. 设备发生未捕获挂起** | GPUVM fault、驱动环停顿或异步栅障失配均待现场取证 | 保存目标 GPU 的 BDF、内核环超时/驱动 reset 完成日志与服务端 stderr | Watchdog 对新 BDF 环超时先等待内核自行恢复，成功后仅恢复该卡 manual／最高 DPM；驱动未完成或明确失败、超过宽限才尝试**单卡**恢复。未确认故障时 `./scripts/reset-gpu.sh` 只读审计。人工恢复须显式指定 `./scripts/reset-gpu.sh cardN`；DRM/音频句柄无法安全排空则拒绝摘卡。 |
 
 ### 为什么该验证必须是“单次、日志保护、最小请求”？
 1. **避免触发 Watchdog 重启**：历史事故（09-18 与 09-19）表明，未经验证的长时间压力或多并发易使显卡进入内核 `dma_fence_wait_timeout` 并引发 Panic。单次 12-token 请求足以完全激发从 Draft 到多行 Catch-up 的完整状态转移，无需付出宕机风险；
@@ -283,7 +283,7 @@ for f in /tmp/tp5-mtp-drill/*.log; do echo "=== $f"; bash scripts/check-tp5-mtp-
 - [ ] **S4. 驱动日志零新增报错**：`dmesg -T` 中无当前启动周期的 `GPUVM fault`、`dma_fence_wait_timeout`、`page fault` 或 GPU reset；
 - [ ] **S5. 零残留僵尸进程**：无任何 `llama-server`、`llama-cli` 或 `test-vulkan` 进程在后台运行；
 - [ ] **Watchdog 状态在位**：确认 IPMI 硬件 Watchdog 正常运作，**严禁关闭 Watchdog**；
-- [ ] **自愈工具可用**：确认一键免密安全自愈脚本 `./scripts/reset-gpu.sh` 随时可用。
+- [ ] **自愈路径可用**：确认 watchdog 正常运行、root-owned `/usr/local/bin/gpu-hard-unlock.sh` 与仓库审查版一致；`./scripts/reset-gpu.sh` 无参数仅审计，人工恢复必须指定故障卡。
 
 ### 8.2 运行边界约束（Runtime Boundaries & Constraints）
 - **单次、有界短请求**：恰好发送 1 次短请求（`prompt="1 2 3 4"`，`n_predict=12`，`stream=false`），绝对不做多并发压测，绝对不做 tok/s 测速；

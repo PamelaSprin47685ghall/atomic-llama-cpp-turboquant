@@ -486,6 +486,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
             server_stream_session_manager_stop();
             ctx_http.stop();
             ctx_server.terminate();
+            if (ctx_http.thread.joinable()) {
+                ctx_http.thread.join();
+            }
+            ctx_server.destroy();
             mcp_mgr.shutdown();
             llama_backend_free();
         };
@@ -506,9 +510,6 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
         if (!ctx_server.load_model(params)) {
             clean_up();
-            if (ctx_http.thread.joinable()) {
-                ctx_http.thread.join();
-            }
             SRV_ERR("%s", "exiting due to model loading error\n");
             return 1;
         }
@@ -574,17 +575,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
 
-        clean_up();
-        if (ctx_http.thread.joinable()) {
-            ctx_http.thread.join();
-        }
-        if (monitor_thread.joinable()) {
-            monitor_thread.join();
-        }
-
         auto * ll_ctx = ctx_server.get_llama_context();
         if (ll_ctx != nullptr) {
             common_memory_breakdown_print(ll_ctx);
+        }
+        clean_up();
+        if (monitor_thread.joinable()) {
+            monitor_thread.join();
         }
     }
 

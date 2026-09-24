@@ -1584,6 +1584,8 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
                 if (made && want_stats) tp5_print_pipeline_statistics(r.vkdev, pipeline, pipe_name);
                 return made;
             };
+            const bool norm_wave32 = r.caps.subgroup_size_control &&
+                r.caps.subgroup_min_size <= 32u && r.caps.subgroup_max_size >= 32u;
             if (!make_late(4, 12, tp5_hc_late_inject_data, tp5_hc_late_inject_len,
                            r.late_inject_dsl, r.late_inject_layout, r.late_inject_pipe, "tp5_hc_late_inject") ||
                 !make_late(7, 20, tp5_hc_late_q_data, tp5_hc_late_q_len,
@@ -1591,7 +1593,7 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
                 !make_late(3, 4, tp5_hc_publish_data, tp5_hc_publish_len,
                            r.late_publish_dsl, r.late_publish_layout, r.late_publish_pipe, "tp5_hc_publish") ||
                 !make_late(9, 28, tp5_hc_resume_norm_data, tp5_hc_resume_norm_len,
-                           r.late_norm_dsl, r.late_norm_layout, r.late_norm_pipe, "tp5_hc_resume_norm") ||
+                           r.late_norm_dsl, r.late_norm_layout, r.late_norm_pipe, "tp5_hc_resume_norm", norm_wave32 ? 32u : 0u) ||
                 !make_late(4, 32, tp5_hc_resume_lo_data, tp5_hc_resume_lo_len,
                            r.late_lo_dsl, r.late_lo_layout, r.late_lo_pipe, "tp5_hc_resume_lo")) {
                 return false;
@@ -4759,11 +4761,20 @@ static bool tp5_relay_publish_generation(tp5_comm & c, size_t bank, uint32_t wor
     for (size_t i = 0; i < c.n_ranks; ++i) {
         const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[bank] +
             i * c.star_rank_stride + c.star_rank_stride - 64);
-        if (!status[1] || status[2]) {
-            c.fail("RELAY generation publication rejected on rank " + std::to_string(i));
+        const uint32_t status_epoch = status[1];
+        const uint32_t status_err   = status[2];
+        if (!status_epoch) {
+            c.fail("RELAY generation publication rejected on rank " + std::to_string(i) +
+                   " (missing epoch, bank=" + std::to_string(bank) + ", word=" + std::to_string(word) + ")");
+            return false;
+        } else if (status_err) {
+            c.fail("RELAY generation publication rejected on rank " + std::to_string(i) +
+                   " (GPU-reported error status[2]=" + std::to_string(status_err) +
+                   ", epoch=" + std::to_string(status_epoch) +
+                   ", bank=" + std::to_string(bank) + ", word=" + std::to_string(word) + ")");
             return false;
         }
-        epochs[i] = status[1];
+        epochs[i] = status_epoch;
         if (i && epochs[i] != epochs[0]) {
             c.fail("RELAY publication epochs disagree across ranks"); return false;
         }
@@ -5249,6 +5260,7 @@ static bool tp5_define_linear_chain(tp5_comm & c,
             }
             timestamp(5 * s + 3);
             if (late_out) {
+                linear->late_steps.clear();
                 const auto & pre = outgoing->pre_definitions[slot];
                 const auto & p2  = outgoing->p2_definitions[slot];
                 const size_t inject_end = outgoing->late_inject_end[slot];
@@ -5360,23 +5372,25 @@ static bool tp5_define_linear_chain(tp5_comm & c,
                     }
                     linear->late_steps.push_back({tp5_latebind_semantic_step::kind::WRITE_TREFS, "late_norm"});
                 }
+
+                std::string war_err;
+                if (outgoing->numerical_mode == tp5_numerical_mode::P1A_NOSIDECAR_Q8) {
+                    if (!tp5_validate_p1a_schedule(linear->late_steps, war_err)) {
+                        c.fail("P1-A linear schedule validation failed on rank " + std::to_string(r) +
+                               " stage " + std::to_string(s) + ": " + war_err);
+                        return false;
+                    }
+                } else if (!tp5_validate_latebind_war_schedule(outgoing->late_q8_fast, linear->late_steps, war_err)) {
+                    c.fail("LateBind linear WAR schedule validation failed on rank " + std::to_string(r) +
+                           " stage " + std::to_string(s) + ": " + war_err);
+                    return false;
+                }
+                linear->late_steps.clear();
             }
             timestamp(5 * s + 4);
         }
         if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
             c.fail("LateBind linear primary end failed"); return false;
-        }
-        if (!linear->late_steps.empty()) {
-            std::string war_err;
-            if (p1a_sites > 0) {
-                if (!tp5_validate_p1a_schedule(linear->late_steps, war_err)) {
-                    c.fail("P1-A linear schedule validation failed on rank " + std::to_string(r) + ": " + war_err);
-                    return false;
-                }
-            } else if (!tp5_validate_latebind_war_schedule(q8_sites > 0, linear->late_steps, war_err)) {
-                c.fail("LateBind linear WAR schedule validation failed on rank " + std::to_string(r) + ": " + war_err);
-                return false;
-            }
         }
         const char * active_num_mode = (late_sites == 0) ? "reference" :
                                        (p1a_sites > 0 ? "p1a-nosidecar-q8" :

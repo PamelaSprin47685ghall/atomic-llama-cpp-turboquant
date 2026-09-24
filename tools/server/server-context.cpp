@@ -5310,6 +5310,12 @@ llama_tokens rerot_native_fixed_entry_tokens(
         rerot.reset();
         rerot_episode_id = 0;
 
+        // The target and detached draft can share a physical Vulkan device.
+        // On a graph-compute error there may be GPU work despite zero queued
+        // tokens; drain both contexts before either releases its buffers.
+        if (ctx_tgt) llama_synchronize(ctx_tgt);
+        if (ctx_dft) llama_synchronize(ctx_dft);
+
         spec.reset();
         spec_init.reset();
 
@@ -5544,7 +5550,12 @@ llama_tokens rerot_native_fixed_entry_tokens(
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        try {
+            llama_init = common_init_from_params(params_base);
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to initialize target model: %s\n", e.what());
+            return false;
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -5725,7 +5736,14 @@ llama_tokens rerot_native_fixed_entry_tokens(
                 spec.reset(common_speculative_init(params_base.speculative, n_exec_slots));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+                return false;
             }
+        }
+
+        if (has_spec && !spec) {
+            SRV_ERR("%s", "requested speculative decoding is unavailable for this context\n");
+            destroy();
+            return false;
         }
 
         if (ctx_dft) {
@@ -10539,6 +10557,10 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::destroy() {
+    impl->destroy();
 }
 
 llama_context * server_context::get_llama_context() const {

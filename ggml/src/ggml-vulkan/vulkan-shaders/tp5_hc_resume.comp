@@ -164,7 +164,7 @@ void finalize_stream(const uint iterations, const uint active_rows) {
         }
         barrier();
         float fold = 0.0;
-        [[unroll]] for (uint sgi = 0u; sgi < 8u; ++sgi) {
+        for (uint sgi = 0u; sgi < gl_NumSubgroups; ++sgi) {
             fold += partials[sgi];
         }
         const float scale = inversesqrt(fold / float(p.width) + p.epsilon);
@@ -180,11 +180,15 @@ void finalize_stream(const uint iterations, const uint active_rows) {
     }
 }
 void main() {
-    // The register fold below assumes the fixed 8-subgroup shape (256 threads
-    // / wave32). Any other topology must fail closed, matching the Q8 family
-    // convention, rather than read past the published partials.
-    if (p.streams != 4u || gl_WorkGroupID.x >= p.streams || p.width == 0u || p.width > 4096u ||
-        gl_NumSubgroups != 8u) {
+    // The register fold above bounds over gl_NumSubgroups partials, supporting
+    // both wave32 (8 subgroups) and wave64 (4 subgroups) for 256 threads.
+    // Any other topology fails closed to prevent out-of-bounds partial reads.
+    if (p.streams != 4u || gl_WorkGroupID.x >= p.streams || p.width == 0u || p.width > 4096u) {
+        if (gl_LocalInvocationID.x == 0u)
+            atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
+        return; // also rejected by the host recipe before recording
+    }
+    if (gl_NumSubgroups != 8u && gl_NumSubgroups != 4u) {
         if (gl_LocalInvocationID.x == 0u)
             atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
         return; // also rejected by the host recipe before recording

@@ -214,7 +214,8 @@ uint mat_vec_d_col_offset(const uint j, const uint d_offset) {
 
 uint mat_vec_first_row() {
 #ifdef HC_UP_FOLD
-    return gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z;
+    const uint token_row = gl_WorkGroupID.y;
+    return token_row * p.stride_d + (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 #elif defined(MUL_MAT_ID_GROUPED)
     return NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 #elif defined(MUL_MAT_ID)
@@ -317,9 +318,12 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
 #    elif defined(HC_UP_FOLD)
     if (tid == 0) {
         precise float acc = 0.0;
+        const uint col = first_row % p.stride_d;
+        const uint token_row = first_row / p.stride_d;
+        const uint fuse_token_base = token_row * (NUM_ROWS * p.stride_d);
         [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             precise float gate    = 1.0 / (1.0 + exp(-temp[0][n]));
-            precise float product = data_fuse0[n * p.stride_d + first_row] * gate;
+            precise float product = data_fuse0[fuse_token_base + n * p.stride_d + col] * gate;
             if (n == 0u)
                 acc = product;
             else

@@ -1895,6 +1895,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         t_ij->view_src = tensor->view_src;
         t_ij->view_offs = tensor->view_offs;
+
         if (t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer)) {
             t_ij->view_src = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
             const auto source_split = ggml_backend_meta_get_split_state(tensor->view_src, true);
@@ -3173,12 +3174,6 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    static int meta_compute_calls = 0;
-    if (++meta_compute_calls <= 10 || meta_compute_calls % 100 == 0) {
-        fprintf(stderr, "[META_GRAPH_COMPUTE] call=%d nodes=%d n_backends=%zu\n",
-                meta_compute_calls, cgraph->n_nodes, ggml_backend_meta_n_backends(backend));
-    }
-
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;

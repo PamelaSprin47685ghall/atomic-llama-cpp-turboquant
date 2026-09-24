@@ -407,6 +407,12 @@ void common_tp5_apply_env(const common_params & params) {
     if (!params.tp5.enabled) {
         return;
     }
+    // Reject unsupported device-hidden layouts before constructing target graphs.
+    // A matched five-rank Meta pair can copy mirrored F32 rows locally on each
+    // Vulkan device; the native handoff still preflights every actual buffer.
+    const bool mtp_requested = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const char * device_hidden = getenv("GGML_TP5_MTP_DEVICE_HIDDEN");
     const char * inherited_wire_env = getenv("GGML_TP5_WIRE");
     const std::string inherited_wire = inherited_wire_env ? inherited_wire_env : "";
     if (!params.tp5.wire.empty()) {
@@ -441,6 +447,16 @@ void common_tp5_apply_env(const common_params & params) {
     setenv("GGML_TP5_SYNC", effective_sync.c_str(), 1);
     const std::string effective_wire = !params.tp5.wire.empty() ? params.tp5.wire :
         !inherited_wire.empty() ? inherited_wire : qualified && target_only && effective_sync == "relay" ? "f32" : "f16";
+    if (mtp_requested && device_hidden && std::strcmp(device_hidden, "1") == 0) {
+        const auto & draft_devices = params.speculative.draft.devices;
+        const bool matching_ranks = qualified && params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+            effective_sync == "relay" && effective_wire == "f32" &&
+            draft_devices.size() == params.devices.size() &&
+            std::equal(draft_devices.begin(), draft_devices.end(), params.devices.begin());
+        if (!matching_ranks) {
+            throw std::runtime_error("TP5 device-hidden requires identical ordered five RX 6800 target/draft ranks, tensor split, and RELAY/F32");
+        }
+    }
     if (qualified && target_only && effective_sync == "relay" && params.tp5.wire.empty() && inherited_wire.empty()) {
         setenv("GGML_TP5_WIRE", "f32", 1);
     }
@@ -454,6 +470,15 @@ void common_tp5_apply_env(const common_params & params) {
         } else if (params.tp5.latebind == "aggressive") {
             setenv("GGML_TP5_LATEBIND", "hc-down", 1);
             setenv("GGML_TP5_LATEBIND_EXACT_Q", "0", 1);
+        }
+    }
+    const char * latebind = getenv("GGML_TP5_LATEBIND");
+    if (mtp_requested && latebind && (std::strcmp(latebind, "hc-down") == 0 ||
+        std::strcmp(latebind, "1") == 0 || std::strcmp(latebind, "on") == 0)) {
+        const char * exact_q = getenv("GGML_TP5_LATEBIND_EXACT_Q");
+        if (!qualified || effective_sync != "relay" || effective_wire != "f32" ||
+            !exact_q || std::strcmp(exact_q, "1") != 0) {
+            throw std::runtime_error("TP5+MTP LateBind requires five distinct RX 6800 ranks, RELAY/F32, and explicit exact Q");
         }
     }
     // Only options consumed after device discovery belong here. Queue family

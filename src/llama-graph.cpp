@@ -143,6 +143,12 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         auto copies = source.ranges;
         for (size_t i = 0; i < source.count; ++i) copies[i].dst = h;
         if (!ggml_backend_device_copy_ranges(source.executor, copies.data(), source.count, false)) {
+            const auto * src = copies[0].src;
+            LLAMA_LOG_ERROR("device MTP hidden copy: executor=%s src=%s src_buffer=%s dst=%s dst_buffer=%s src_rows=%lld dst_rows=%lld count=%zu\n",
+                            ggml_backend_name(source.executor), src->name,
+                            src->buffer ? ggml_backend_buffer_name(src->buffer) : "<none>",
+                            h->name, h->buffer ? ggml_backend_buffer_name(h->buffer) : "<none>",
+                            (long long) src->ne[1], (long long) h->ne[1], source.count);
             throw std::runtime_error("device MTP hidden input has no native local copy");
         }
         return;
@@ -6045,7 +6051,7 @@ void llm_graph_context::build_pooling(
 }
 
 void llm_graph_context::build_sampling() const {
-    if (samplers.empty() || !res->t_logits) {
+    if (samplers.empty() || !res->t_logits || res->t_logits->ne[1] == 0) {
         return;
     }
 

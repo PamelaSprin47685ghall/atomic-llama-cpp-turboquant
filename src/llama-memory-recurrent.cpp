@@ -1054,6 +1054,20 @@ void llama_memory_recurrent::clear_hand_row(int32_t hand_row) {
         ggml_backend_sched_synchronize(backend_sched);
     }
 
+    // In a non-grouped, single-cell cache this hand owns every recurrent
+    // tensor and every rollback plane. Clear the cache's dedicated buffers
+    // once instead of submitting and waiting for each layer's strided rows.
+    // The general path below must remain for other live hands/brain rows.
+    if (size == 1 && n_brain_rows == 0) {
+        for (const auto & entry : ctxs_bufs) {
+            ggml_backend_buffer_clear(entry.second.get(), 0);
+        }
+        if (backend_sched) {
+            ggml_backend_sched_synchronize(backend_sched);
+        }
+        return;
+    }
+
     // P11 clear transaction: one zero buffer per tensor, one strided 2d
     // write across all (n_rs_seq + 1) snapshots instead of a fresh zero
     // vector + tensor_set per snapshot. Rows are contiguous per snapshot

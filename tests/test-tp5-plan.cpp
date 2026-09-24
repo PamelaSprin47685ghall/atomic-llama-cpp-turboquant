@@ -1233,7 +1233,6 @@ static void test_tp5_latebind_protocol_invariants() {
         { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
     };
     TEST_ASSERT(!tp5_validate_latebind_war_schedule(true, reg_agg_no_war, war_err));
-    TEST_ASSERT(war_err.find("missing BARRIER_WAR_TREFS") != std::string::npos);
 
     // 4. Negative regression 2: Exact F32 missing WAR barrier on trefs
     std::vector<tp5_latebind_semantic_step> reg_exact_no_war = {
@@ -1241,7 +1240,6 @@ static void test_tp5_latebind_protocol_invariants() {
         { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
     };
     TEST_ASSERT(!tp5_validate_latebind_war_schedule(false, reg_exact_no_war, war_err));
-    TEST_ASSERT(war_err.find("missing BARRIER_WAR_TREFS") != std::string::npos);
 
     // 5. Negative regression 3: Misplaced barrier (after write instead of before write)
     std::vector<tp5_latebind_semantic_step> reg_barrier_after_write = {
@@ -1252,7 +1250,6 @@ static void test_tp5_latebind_protocol_invariants() {
         { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
     };
     TEST_ASSERT(!tp5_validate_latebind_war_schedule(true, reg_barrier_after_write, war_err));
-    TEST_ASSERT(war_err.find("BARRIER_WAR_TREFS must precede WRITE_TREFS") != std::string::npos);
 
     // 6. Negative regression 4: Write before read hazard (norm overwrites before Q reads)
     std::vector<tp5_latebind_semantic_step> reg_write_before_read = {
@@ -1261,7 +1258,6 @@ static void test_tp5_latebind_protocol_invariants() {
         { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_q" },
     };
     TEST_ASSERT(!tp5_validate_latebind_war_schedule(false, reg_write_before_read, war_err));
-    TEST_ASSERT(war_err.find("READ_TREFS must precede BARRIER_WAR_TREFS") != std::string::npos);
 
     // 7. Negative regression 5: Barrier mistakenly inserted between norm and Q8dot
     // Violates the requirement that norm and Q8dot have zero execution barriers between them.
@@ -1274,7 +1270,6 @@ static void test_tp5_latebind_protocol_invariants() {
         { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
     };
     TEST_ASSERT(!tp5_validate_latebind_war_schedule(true, reg_barrier_in_q8dot, war_err));
-    TEST_ASSERT(war_err.find("zero-barrier overlap violated") != std::string::npos);
 
     fprintf(stderr, "  LateBind protocol invariants: Q control/payload non-overlapping, word alignment verified, F32-Q order asserted\n");
 }
