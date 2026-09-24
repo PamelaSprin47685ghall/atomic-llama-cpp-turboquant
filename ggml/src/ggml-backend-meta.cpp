@@ -3166,6 +3166,107 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     }
 }
 
+// W1: rank-local output readback helpers. The per-rank chunk layout is derived
+// from the same split state the async getter uses, so the meta layer stays the
+// single owner of shard knowledge; the llama layer only allocates the
+// destinations and assembles them after synchronize.
+size_t ggml_backend_meta_dev_n_simple_devs(ggml_backend_dev_t dev) {
+    if (dev == nullptr || !ggml_backend_dev_is_meta(dev)) {
+        return 0;
+    }
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    return meta_dev_ctx->simple_devs.size();
+}
+
+ggml_backend_dev_t ggml_backend_meta_dev_get_simple_dev(ggml_backend_dev_t dev, size_t index) {
+    GGML_ASSERT(index < ggml_backend_meta_dev_n_simple_devs(dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    return meta_dev_ctx->simple_devs[index];
+}
+
+struct ggml_backend_meta_split_state ggml_backend_meta_dev_compute_split_state(ggml_backend_dev_t dev, const struct ggml_tensor * tensor) {
+    GGML_ASSERT(ggml_backend_meta_dev_n_simple_devs(dev) > 0);
+    GGML_ASSERT(tensor != nullptr);
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    return meta_dev_ctx->get_split_state(tensor, meta_dev_ctx->get_split_state_ud);
+}
+
+bool ggml_backend_meta_tensor_rank_chunks(ggml_backend_t backend, const struct ggml_tensor * tensor, size_t * chunk_bytes, size_t * n_chunks) {
+    if (backend == nullptr || tensor == nullptr || chunk_bytes == nullptr || n_chunks == nullptr) {
+        return false;
+    }
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    if (split_state.mapped_span || split_state.indexed_replica) {
+        return false;
+    }
+    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_0 &&
+        split_state.axis != GGML_BACKEND_SPLIT_AXIS_1 &&
+        split_state.axis != GGML_BACKEND_SPLIT_AXIS_2) {
+        return false;
+    }
+    if (split_state.n_segments != 1) {
+        return false;
+    }
+
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    for (size_t j = 0; j < n_backends; j++) {
+        const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+        chunk_bytes[j] = (simple_tensor != nullptr) ? simple_tensor->nb[split_state.axis + 1] : 0;
+    }
+    *n_chunks = n_backends;
+    return true;
+}
+
+void ggml_backend_meta_tensor_get_2d_async_per_rank(ggml_backend_t backend, const struct ggml_tensor * tensor, void * const * dsts, void * data, size_t offset, size_t size) {
+    if (dsts == nullptr || !ggml_backend_is_meta(backend)) {
+        ggml_backend_meta_get_tensor_async(backend, tensor, data, offset, size);
+        return;
+    }
+
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    GGML_ASSERT(split_state.n_segments == 1);
+    GGML_ASSERT(split_state.nr[0]      == 1);
+
+    // Only the simple contiguous-chunks form has a per-rank destination
+    // layout. Every other form (replica, mapped-span, mirrored) folds ranks
+    // into one strided view and keeps the exact single-destination semantics.
+    if (split_state.mapped_span || split_state.indexed_replica ||
+        (split_state.axis != GGML_BACKEND_SPLIT_AXIS_0 &&
+         split_state.axis != GGML_BACKEND_SPLIT_AXIS_1 &&
+         split_state.axis != GGML_BACKEND_SPLIT_AXIS_2)) {
+        ggml_backend_meta_get_tensor_async(backend, tensor, data, offset, size);
+        return;
+    }
+
+    const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
+    GGML_ASSERT(offset % chunk_size_full == 0);
+    GGML_ASSERT(size   % chunk_size_full == 0);
+    const int64_t i_start =  offset        / chunk_size_full;
+    const int64_t i_stop  = (offset + size)/ chunk_size_full;
+
+    size_t offset_j = 0;
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+        const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+        const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+        if (chunk_size_j == 0) {
+            continue;
+        }
+        GGML_ASSERT(dsts[j] != nullptr);
+        // dsts[j] receives this rank's own contiguous block with rank-local
+        // row stride, so the slot layout is [chunk_j, i_stop - i_start].
+        ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, dsts[j], i_start * chunk_size_j, chunk_size_j,
+            i_stop - i_start, chunk_size_j, chunk_size_j);
+        offset_j += chunk_size_j;
+    }
+    GGML_ASSERT(offset_j == chunk_size_full);
+}
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     for (size_t i = 0; i < n_backends; i++) {

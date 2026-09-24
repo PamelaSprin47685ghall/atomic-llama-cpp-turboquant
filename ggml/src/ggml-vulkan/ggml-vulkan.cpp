@@ -2794,6 +2794,9 @@ struct ggml_backend_vk_context {
     // Reported via ggml_backend_vk_flashprefill_scratch; the backing store
     // is the shared prealloc_split_k pool (fit-counted, grow-only).
     uint64_t fp_scratch_current {}, fp_scratch_peak {};
+    // W1 readback instrumentation (GGML_VK_READBACK_STATS): cumulative
+    // per-device counters for the pinned and staging-fallback readback paths.
+    uint64_t rb_pinned_hits {}, rb_pinned_bytes {}, rb_fallbacks {}, rb_fallback_bytes {}, rb_fallback_waits {}, rb_sync_calls {};
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -11071,6 +11074,10 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
 
     if (buf != nullptr) {
         // Memory is pinned, use as staging buffer
+        if (ggml_backend_vk_context * rb_ctx = subctx->vk_ctx) {
+            rb_ctx->rb_pinned_hits += 1;
+            rb_ctx->rb_pinned_bytes += width * height;
+        }
         ggml_vk_sync_buffers(nullptr, subctx);
         vk_tp5_hpp_commands(subctx->s->buffer->buf).copyBuffer(src->buffer, buf->buffer, slices);
         subctx->copy_buffers.push_back(src);
@@ -22486,6 +22493,8 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
 
     if (!ret) {
         const size_t staging_size = size * n_copies;
+        ctx->rb_fallbacks += 1;
+        ctx->rb_fallback_bytes += staging_size;
         ggml_vk_ensure_sync_staging_buffer(ctx, staging_size);
         ggml_vk_sync_buffers(nullptr, compute_ctx);
 
@@ -22513,6 +22522,7 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
                 deferred_memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)ctx->sync_staging->ptr + i * size, size, &compute_ctx->out_memcpys);
             }
         }
+        ctx->rb_fallback_waits += 1;
         ggml_vk_synchronize(ctx);
     }
 }
@@ -22712,11 +22722,39 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     }
 }
 
+// W1 readback instrumentation (GGML_VK_READBACK_STATS): cumulative
+// per-device counters for the pinned / staging-fallback readback paths.
+// Dumped on every synchronize while the env flag is on (default off).
+static bool ggml_vk_readback_stats_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_VK_READBACK_STATS");
+        return env != nullptr && atoi(env) > 0;
+    }();
+    return enabled;
+}
+
+static void ggml_vk_readback_stats_dump(const ggml_backend_vk_context * ctx) {
+    if (!ggml_vk_readback_stats_enabled()) {
+        return;
+    }
+    fprintf(stderr, "[vk-readback] dev=%s sync_calls=%llu pinned_hits=%llu pinned_bytes=%llu fallbacks=%llu fallback_bytes=%llu fallback_waits=%llu\n",
+        ctx->name.c_str(),
+        (unsigned long long) ctx->rb_sync_calls,
+        (unsigned long long) ctx->rb_pinned_hits,
+        (unsigned long long) ctx->rb_pinned_bytes,
+        (unsigned long long) ctx->rb_fallbacks,
+        (unsigned long long) ctx->rb_fallback_bytes,
+        (unsigned long long) ctx->rb_fallback_waits);
+}
+
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     ggml_vk_synchronize(ctx);
+
+    ctx->rb_sync_calls += 1;
+    ggml_vk_readback_stats_dump(ctx);
 
     // RouterPaths zone: no implicit diagnostic readback here. The owned
     // per-layer GPU storage is refreshed by the recorded CB copies every

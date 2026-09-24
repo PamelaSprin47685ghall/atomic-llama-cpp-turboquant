@@ -1415,6 +1415,14 @@ struct llm_graph_params {
     bool predefined_enabled = false;
     bool predefined_target_enabled = false;
 
+    // W4 MTP catch-up K/V-only graph selection. True only for the deferred
+    // catch-up decode in common/speculative.cpp::commit(); false for draft
+    // steps, verification and every non-MTP graph. The MTP head reads it to
+    // end the graph after the attention output (draft KV writes only), and
+    // it is part of the reuse key so a K/V-only definition never aliases the
+    // full draft definition.
+    bool mtp_catchup_kv = false;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -1564,6 +1572,13 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        // W4: the MTP catch-up K/V-only graph has a different topology than
+        // the full draft MTP graph (no gating/MoE/LM-head tail). The two
+        // definitions must never alias each other.
+        if (mtp_catchup_kv != other.mtp_catchup_kv) {
             return false;
         }
 

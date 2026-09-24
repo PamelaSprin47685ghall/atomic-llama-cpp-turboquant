@@ -1662,6 +1662,12 @@ void llama_context::synchronize() {
     // Always synchronize the scheduler to ensure pending asynchronous work
     // on the device/backends completes before buffer/resource release or teardown.
     ggml_backend_sched_synchronize(sched.get());
+
+    // W1: rank-local readback consumption boundary. All per-rank Vulkan copies
+    // have completed above, so assemble the pinned slots into the contiguous
+    // logits view here. No-op unless a slotted readback is pending.
+    output_assemble_logits();
+
     if (predefined_hidden && predefined_hidden->pending) {
         ggml_backend_synchronize(predefined_hidden->executor);
         predefined_hidden->pending = false;
@@ -2682,7 +2688,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     } guard{mctx, false};
 
-    auto * res = gf_res_prev.get();
+    // W4: the MTP catch-up decode runs a second, K/V-only graph definition
+    // (llm_graph_params::mtp_catchup_kv). Both slots stay in phase 0 under
+    // the predefined MTP exemption in ubatch_execution_phase, so alternating
+    // draft/catch-up decodes never reset a slot or release sched buffers;
+    // each slot keeps its own built definition and is reused frame to frame.
+    llm_graph_result * res = nullptr;
+    if (mtp_catchup_kv_active) {
+        if (!gf_res_catchup) {
+            // llm_graph_result has no default constructor: the graph budget
+            // (max_nodes) is required. Use the exact same budget as the
+            // sched_reserve() slots (gf_res_prev/gf_res_reserve) so the
+            // catch-up slot is a peer graph slot with identical capacity.
+            const uint32_t n_seqs_pp = cparams.n_seq_max_pp;
+            uint32_t n_seqs_tg = cparams.n_seq_max;
+            if (memory) {
+                const uint32_t recurrent_capacity = memory->get_recurrent_capacity();
+                if (recurrent_capacity > 0) {
+                    n_seqs_tg = std::min(n_seqs_tg, recurrent_capacity);
+                }
+            }
+            const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+            const uint32_t n_pp_align  = std::lcm(n_seqs_pp, n_seqs_tg);
+            const uint32_t n_tokens_pp = ((n_tokens + n_pp_align - 1) / n_pp_align) * n_pp_align;
+            gf_res_catchup = std::make_unique<llm_graph_result>(graph_max_nodes(n_tokens_pp));
+        }
+        res = gf_res_catchup.get();
+    } else {
+        res = gf_res_prev.get();
+    }
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -2941,7 +2975,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        // W1: per-rank pinned readback first; the single-destination path
+        // stays as the fallback for non-TP5 / non-vulkan / unsupported splits.
+        if (!output_get_logits_per_rank_async(backend_res, t_logits, 0, n_tokens)) {
+            ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        }
     }
 
     // extract embeddings
@@ -4274,7 +4312,11 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                // W1: per-rank pinned readback first; the single-destination
+                // path stays as the fallback.
+                if (!output_get_logits_per_rank_async(backend_res, t_logits, n_outputs_prev, n_outputs)) {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
 
                 static const int meta_debug = []() {
                     const char * env = getenv("GGML_META_DEBUG");
@@ -4282,6 +4324,8 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
                 }();
                 if (meta_debug > 0) {
                     ggml_backend_synchronize(backend_res);
+                    // W1: make any slotted readback visible to the scan below.
+                    output_assemble_logits();
                     float max_l = -1e9f, min_l = 1e9f; int max_idx = -1;
                     for (int v = 0; v < n_vocab; v++) {
                         if (logits_out[v] > max_l) { max_l = logits_out[v]; max_idx = v; }
@@ -4547,6 +4591,186 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
 // output
 //
 
+// W1: TP5 rank-local pinned output slots.
+//
+// TP5 keeps the LM head vocab-parallel: the meta readback gathers one vocab
+// slice per rank into the host logits view. With a single CPU destination that
+// gather degenerates into five serial per-rank submit+fence round trips (each
+// rank's readback misses its pinned registry, stages, and synchronizes inside
+// ggml_backend_vk_get_tensor_2d_async). These slots give every rank a
+// persistent, device-owned pinned destination so each readback only enqueues a
+// copyBuffer + Transfer->Host barrier; the five slices are assembled into the
+// contiguous logits view once, at the consumption boundary
+// (llama_context::synchronize). The upper-level llama_get_logits_ith contract
+// is unchanged.
+void llama_context::output_slots_reset() {
+    output_slot_pending = false;
+    output_slot_rows      = 0;
+    output_slot_dst_row   = 0;
+    output_slots.clear();
+    output_slot_f32.clear();
+    output_slot_dev       = nullptr;
+}
+
+void llama_context::setup_output_slots(int64_t n_vocab, int64_t n_outputs_max) {
+    output_slots_reset();
+
+    ggml_backend_dev_t output_dev = model.dev_output();
+    if (output_dev == nullptr) {
+        return;
+    }
+
+    // 0 for non-meta devices; a single simple device also keeps the existing
+    // single-destination path (nothing to parallelize).
+    const size_t n_ranks = ggml_backend_meta_dev_n_simple_devs(output_dev);
+    if (n_ranks < 2) {
+        return;
+    }
+
+    // Per-rank vocab chunks come from the meta device's own split-state channel
+    // (the TP5 plan / llama split policy stays its owner); this context never
+    // re-implements the split.
+    const ggml_tensor * output_weight = model.get_tensor("output.weight");
+    if (output_weight == nullptr) {
+        return;
+    }
+
+    const ggml_backend_meta_split_state st = ggml_backend_meta_dev_compute_split_state(output_dev, output_weight);
+    if (st.n_segments != 1) {
+        return;
+    }
+    if (st.axis != GGML_BACKEND_SPLIT_AXIS_0 &&
+        st.axis != GGML_BACKEND_SPLIT_AXIS_1 &&
+        st.axis != GGML_BACKEND_SPLIT_AXIS_2) {
+        return;
+    }
+
+    std::vector<int64_t> chunk_f32(n_ranks);
+    int64_t total = 0;
+    for (size_t j = 0; j < n_ranks; j++) {
+        chunk_f32[j] = st.ne[j];
+        if (chunk_f32[j] <= 0) {
+            return;
+        }
+        total += chunk_f32[j];
+    }
+    if (total != output_weight->ne[st.axis] || total != n_vocab) {
+        return;
+    }
+
+    std::vector<ggml_backend_buffer_ptr> slots(n_ranks);
+    for (size_t j = 0; j < n_ranks; j++) {
+        ggml_backend_dev_t simple_dev = ggml_backend_meta_dev_get_simple_dev(output_dev, j);
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(simple_dev);
+        if (host_buft == nullptr) {
+            // device without a host buffer type (non-vulkan, or vulkan without
+            // pinned support): keep the existing single-destination path.
+            return;
+        }
+        const size_t bytes = (size_t) chunk_f32[j] * (size_t) n_outputs_max * sizeof(float);
+        ggml_backend_buffer_ptr slot(ggml_backend_buft_alloc_buffer(host_buft, bytes));
+        if (slot == nullptr) {
+            LLAMA_LOG_WARN("%s: failed to allocate rank-%zu output slot (%.2f MiB); keeping the single-destination path\n",
+                       __func__, j, bytes / (1024.0 * 1024.0));
+            return;
+        }
+        // The vulkan host buffer type silently falls back to a plain CPU buffer
+        // when pinned allocation fails; such a slot would keep the old blocking
+        // readback (no benefit), so detect and decline it.
+        const char * slot_name = ggml_backend_buffer_name(slot.get());
+        if (slot_name == nullptr || strstr(slot_name, "CPU") != nullptr) {
+            LLAMA_LOG_WARN("%s: rank-%zu host buffer is not pinned; keeping the single-destination path\n", __func__, j);
+            return;
+        }
+        slots[j] = std::move(slot);
+    }
+
+    output_slots     = std::move(slots);
+    output_slot_f32  = std::move(chunk_f32);
+    output_slot_dev  = output_dev;
+
+    size_t total_bytes = 0;
+    for (size_t j = 0; j < n_ranks; j++) {
+        total_bytes += (size_t) output_slot_f32[j] * (size_t) n_outputs_max * sizeof(float);
+    }
+    LLAMA_LOG_INFO("%s: TP5 rank-local output slots enabled (%zu ranks, %.2f MiB)\n",
+                   __func__, n_ranks, total_bytes / (1024.0 * 1024.0));
+}
+
+bool llama_context::output_get_logits_per_rank_async(ggml_backend_t backend_res, const ggml_tensor * t_logits, uint64_t dst_row_offset, uint32_t n_rows) {
+    if (output_slots.empty() || output_slot_dev == nullptr) {
+        return false;
+    }
+    if (backend_res == nullptr || t_logits == nullptr || n_rows == 0 || logits.data == nullptr) {
+        return false;
+    }
+    if (ggml_backend_get_device(backend_res) != output_slot_dev) {
+        return false;
+    }
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+    if (n_vocab <= 0) {
+        return false;
+    }
+    if ((uint64_t) dst_row_offset + (uint64_t) n_rows > (uint64_t) (logits.size / n_vocab)) {
+        return false;
+    }
+
+    const size_t n_ranks = output_slots.size();
+    std::vector<size_t> chunk_bytes(n_ranks);
+    size_t n_chunks = 0;
+    if (!ggml_backend_meta_tensor_rank_chunks(backend_res, t_logits, chunk_bytes.data(), &n_chunks)) {
+        return false;
+    }
+    if (n_chunks != n_ranks) {
+        return false;
+    }
+
+    std::vector<void *> dsts(n_ranks);
+    for (size_t j = 0; j < n_ranks; j++) {
+        // the slot must have been sized for exactly this rank's logits slice
+        if (chunk_bytes[j] != (size_t) output_slot_f32[j] * sizeof(float)) {
+            return false;
+        }
+        dsts[j] = ggml_backend_buffer_get_base(output_slots[j].get());
+    }
+
+    // fallback_dst keeps the single-destination semantics for any split form
+    // the per-rank entry declines (replica / mapped-span / mirrored).
+    float * fallback_dst = logits.data + dst_row_offset * n_vocab;
+    ggml_backend_meta_tensor_get_2d_async_per_rank(backend_res, t_logits, dsts.data(), fallback_dst,
+        0, (size_t) n_rows * (size_t) n_vocab * sizeof(float));
+
+    output_slot_dst_row = dst_row_offset;
+    output_slot_rows    = n_rows;
+    output_slot_pending = true;
+    return true;
+}
+
+void llama_context::output_assemble_logits() {
+    if (!output_slot_pending) {
+        return;
+    }
+    output_slot_pending = false;
+
+    if (logits.data == nullptr || output_slots.empty()) {
+        return;
+    }
+
+    const uint32_t rows    = (uint32_t) output_slot_rows;
+    const int64_t  n_vocab = model.vocab.n_tokens();
+    int64_t col = 0;
+    for (size_t j = 0; j < output_slots.size(); j++) {
+        const int64_t chunk = output_slot_f32[j];
+        const float * src = (const float *) ggml_backend_buffer_get_base(output_slots[j].get());
+        for (uint32_t r = 0; r < rows; r++) {
+            memcpy(logits.data + (output_slot_dst_row + r) * n_vocab + col,
+                   src + (int64_t) r * chunk,
+                   (size_t) chunk * sizeof(float));
+        }
+        col += chunk;
+    }
+}
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
@@ -4628,6 +4852,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
             // TODO: not needed?
             buf_output = nullptr;
+            // W1: rank-local slots are sized against this buffer's row count;
+            // rebuild them with the new allocation (or not at all).
+            output_slots_reset();
             logits.data = nullptr;
             embd.data = nullptr;
             embd_nextn.data = nullptr;
@@ -4652,6 +4879,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             return 0;
         }
         ggml_backend_buffer_clear(buf_output.get(), 0);
+
+        // W1: attempt per-rank pinned output slots for the TP5 meta readback
+        // path; a no-op (and harmless) for every non-TP5 configuration.
+        setup_output_slots(n_vocab, n_outputs_max);
     }
 
     float * output_base = (float *) ggml_backend_buffer_get_base(buf_output.get());
@@ -5061,6 +5292,7 @@ llm_graph_params llama_context::graph_params(
         /*.predefined_capacity_outputs =*/ predefined_frame_current_valid ? predefined_capacity_outputs_current : 0u,
         /*.predefined_enabled =*/ predefined_frame_current_valid,
         /*.predefined_target_enabled =*/ predefined_target_enabled,
+        /*.mtp_catchup_kv =*/ mtp_catchup_kv_active,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.flashprefill_reserve_sizing =*/ fp_reserve_sizing_active,

@@ -10402,8 +10402,17 @@ llama_tokens rerot_native_fixed_entry_tokens(
 
             // verify and try to accept the draft
             {
-                // save the sampler sampler state in case we need to restore it
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // save the sampler state in case we need to restore it.
+                // W2-CPU: the MTP verify path only ever re-samples this clone through
+                // common_sampler_sample_and_accept_n, which obtains candidates via
+                // set_logits (or, in the pure-greedy fast path, reads the raw logits
+                // directly) before any candidate read, so the checkpoint clone -- which
+                // drops the ~n_vocab cur/cur_p arrays -- is observably equivalent here
+                // and avoids copying the full candidate array every speculative cycle.
+                // NOTE: the call site lives in the server (adjacent to
+                // common_sampler_sample_and_accept_n below), not in common/speculative.cpp,
+                // which contains no sampler clone at all.
+                common_sampler_ptr smpl_save(common_sampler_clone_checkpoint(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);

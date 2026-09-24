@@ -1476,14 +1476,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         device_hidden = true;
     }
 
-    int decode_device_target_rows(uint32_t first, uint32_t rows) {
+    int decode_device_target_rows(uint32_t first, uint32_t rows, bool catchup_kv = false) {
         if (rows == 0) return -1;
         const llama_predefined_hidden_range inputs[] = {
             {params.ctx_dft, LLAMA_PREDEFINED_H_SEED, LLAMA_PREDEFINED_H_INPUT, 0, 0, 1, 0},
             {params.ctx_tgt, LLAMA_PREDEFINED_H_RESULT, LLAMA_PREDEFINED_H_INPUT, first, 1, rows - 1,
                 device_target_generation},
         };
-        return llama_predefined_decode_hidden(params.ctx_dft, batch, inputs, rows > 1 ? 2 : 1);
+        // W4: commit()'s deferred catch-up runs the K/V-only MTP graph; draft
+        // verification (process_impl) keeps the full graph. The H_SEED/H_RESULT
+        // ranges are identical either way - the KV-only graph still consumes the
+        // seed and verified hidden rows, it just no longer produces logits/nextn.
+        return catchup_kv
+            ? llama_predefined_decode_hidden_kv(params.ctx_dft, batch, inputs, rows > 1 ? 2 : 1)
+            : llama_predefined_decode_hidden(params.ctx_dft, batch, inputs, rows > 1 ? 2 : 1);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1759,8 +1765,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const bool prof_active = std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr;
         const int64_t t_catchup_start = prof_active ? ggml_time_us() : 0;
 
-        const int32_t rc = device_hidden ? decode_device_target_rows(workspace->first_row(0), n_commit)
-                                         : llama_decode(params.ctx_dft, batch);
+        // W4: the deferred catch-up runs the K/V-only MTP graph on the same
+        // commit_row-aligned batch (row 0 seed hidden, row k verified hidden).
+        const int32_t rc = device_hidden ? decode_device_target_rows(workspace->first_row(0), n_commit, true)
+                                         : llama_decode_mtp_catchup(params.ctx_dft, batch);
         if (rc != 0) {
             SPC_ERR("llama_decode(ctx_dft) deferred catch-up failed rc=%d\n", (int) rc);
             return false;

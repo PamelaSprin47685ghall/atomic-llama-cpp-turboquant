@@ -84,6 +84,38 @@ struct llama_context {
     uint64_t predefined_hidden_generation() const;
     bool predefined_hidden_copy(const llama_predefined_hidden_range * ranges, size_t n_ranges);
     int decode_predefined_hidden(llama_batch batch, const llama_predefined_hidden_range * ranges, size_t n_ranges);
+
+    // W4: same transport as decode_predefined_hidden but builds the MTP
+    // head's CATCHUP_KV graph (draft KV writes only, no gating/MoE/LM-head).
+    int decode_predefined_hidden_kv(llama_batch batch, const llama_predefined_hidden_range * ranges, size_t n_ranges);
+
+    // W4 host-hidden counterpart: decode() under the CATCHUP_KV guard.
+    int decode_mtp_catchup(const llama_batch & batch) {
+        mtp_catchup_kv_guard guard(this);
+        return decode(batch);
+    }
+
+    // Shared transport body for the decode_predefined_hidden entries above.
+    int decode_predefined_hidden_impl(llama_batch batch, const llama_predefined_hidden_range * ranges, size_t n_ranges);
+
+    // W4 RAII scope marker for the MTP catch-up K/V-only decode, mirroring
+    // the fp_reserve_sizing_active pattern: graph_params() reads the flag
+    // into llm_graph_params::mtp_catchup_kv and the decode path selects the
+    // second (K/V-only) graph slot. Restores the previous value on every
+    // exit path, including exceptions.
+    struct mtp_catchup_kv_guard {
+        llama_context * ctx;
+        bool prev;
+        explicit mtp_catchup_kv_guard(llama_context * c)
+            : ctx(c), prev(c ? c->mtp_catchup_kv_active : false) {
+            if (ctx) { ctx->mtp_catchup_kv_active = true; }
+        }
+        ~mtp_catchup_kv_guard() {
+            if (ctx) { ctx->mtp_catchup_kv_active = prev; }
+        }
+        mtp_catchup_kv_guard(const mtp_catchup_kv_guard &) = delete;
+        mtp_catchup_kv_guard & operator=(const mtp_catchup_kv_guard &) = delete;
+    };
     bool predefined_hidden_carry_io(float * data, size_t bytes, bool write);
     bool predefined_hidden_reset();
     bool predefined_hidden_capture(ggml_backend_t producer, const ggml_tensor * tensor, uint32_t offset, uint32_t rows);
@@ -362,6 +394,17 @@ private:
     // Returns max number of outputs for which space was reserved.
     uint32_t output_reserve(int32_t n_outputs);
 
+    // W1: TP5 rank-local pinned output slots. When active, llama decodes the
+    // logits readback into per-rank device-owned pinned slots instead of one
+    // contiguous CPU destination, so every rank's Vulkan readback hits its own
+    // pinned buffer (copyBuffer + barrier only) and the five serial
+    // submit+fence round trips collapse into a single synchronize at the
+    // consumption boundary. llama_get_logits_ith keeps its exact contract.
+    void setup_output_slots(int64_t n_vocab, int64_t n_outputs_max);
+    void output_slots_reset();
+    bool output_get_logits_per_rank_async(ggml_backend_t backend_res, const ggml_tensor * t_logits, uint64_t dst_row_offset, uint32_t n_rows);
+    void output_assemble_logits();
+
     void output_reorder();
 
     // map the output row index `i` to batch index
@@ -619,6 +662,16 @@ private:
     // early returns and exceptions. OFF cost: one bool store per reserve.
     bool fp_reserve_sizing_active = false;
 
+    // W4 MTP catch-up K/V-only scope (speculative commit() writer, graph
+    // selection reader). True only while the deferred catch-up decode runs;
+    // false for draft steps, verification and every other decode. Read by
+    // graph_params() into llm_graph_params::mtp_catchup_kv (reuse-keyed, so
+    // the K/V-only definition never aliases the full draft definition) and
+    // by decode_impl to pick the second graph slot. Toggled only through
+    // llama_decode_mtp_catchup / decode_predefined_hidden_kv, both of which
+    // restore it via mtp_catchup_kv_guard on all exits.
+    bool mtp_catchup_kv_active = false;
+
     // Phase of the graph computed last: prompt processing and token generation never run at the
     // same time. On a change, the graph for the new phase is reserved, which releases the buffers
     // of the finished one (see graph_reserve).
@@ -758,10 +811,25 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+
+    // W4: second graph slot for the MTP catch-up K/V-only definition. Both
+    // slots stay in phase 0 under the predefined MTP exemption, so alternating
+    // draft and catch-up decodes reuse each slot's own built definition
+    // instead of resetting a single slot (and its sched buffers) every cycle.
+    llm_graph_result_ptr gf_res_catchup;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // W1: per-rank pinned output slots for the TP5 meta readback path; empty
+    // (and inert) for every non-TP5 / non-vulkan configuration.
+    ggml_backend_dev_t                   output_slot_dev = nullptr; // meta device the slots were sized for
+    std::vector<ggml_backend_buffer_ptr> output_slots;              // one pinned slot per simple device
+    std::vector<int64_t>                 output_slot_f32;           // per-rank vocab chunk (floats)
+    uint64_t                             output_slot_rows = 0;      // rows of the pending slotted readback
+    uint64_t                             output_slot_dst_row = 0;   // destination row inside logits.data
+    bool                                 output_slot_pending = false;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

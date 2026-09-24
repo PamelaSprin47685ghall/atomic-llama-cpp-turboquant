@@ -577,6 +577,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP currently only supports a single MTP block");
     GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
 
+    // W4 (CATCHUP_KV): the deferred catch-up decode in
+    // common/speculative.cpp::commit() runs this graph with zero logits
+    // consumers. Everything from the attention gating on had no consumer
+    // yet the whole tail still executed. kv_only ends the graph right after
+    // the attention output: build_attn() already expands q/k/v and the
+    // cache-write nodes into the cgraph itself, and expanding the attention
+    // output pulls its full ancestor chain (embedding, EH/HC projections,
+    // Q/K/V projections, norms, IMRoPE). t_logits/t_h_nextn stay null:
+    // the catch-up consumes seed/verified hidden and produces draft KV only.
+    const bool kv_only = params.mtp_catchup_kv;
+
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;
     GGML_ASSERT(hparams.n_embd_out() == (uint32_t) hc_dim && "QWEN4EXP MTP hidden width mismatch");
@@ -668,12 +679,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "mtp_Qcur_normed", il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, rows,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, rows);
-    cb(gate, "mtp_gate", il);
+    ggml_tensor * gate = nullptr;
+    if (!kv_only) {
+        gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, rows,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qcur_full) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, rows);
+        cb(gate, "mtp_gate", il);
+    }
 
     ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, rows);
@@ -701,6 +715,19 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             nullptr, nullptr, nullptr,
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "mtp_attn_pregate", il);
+
+    if (kv_only) {
+        // W4 CATCHUP_KV root: the attention output. build_attn() has already
+        // expanded q_cur/v_cur/k_cur plus the cpy_k/cpy_v draft-KV writes into
+        // this cgraph (llama-graph.cpp build_attn); expanding the attention
+        // output adds every remaining ancestor. The gating, wo, out_ids
+        // gather, hc_combine, MoE, hc mixes, t_h_nextn export, hc_head and
+        // LM head below are referenced by no expand target and therefore
+        // never enter the graph. res->t_logits / t_h_nextn stay null so the
+        // decode output paths (2939/4267/6045) no-op via their null checks.
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
     cb(cur, "mtp_attn_gated", il);

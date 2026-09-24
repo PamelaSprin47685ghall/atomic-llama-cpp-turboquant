@@ -42,6 +42,14 @@ LLAMA_API bool llama_predefined_hidden_copy(struct llama_context * dst,
 LLAMA_API int llama_predefined_decode_hidden(struct llama_context * ctx, struct llama_batch batch,
         const struct llama_predefined_hidden_range * ranges, size_t n_ranges);
 
+// W4 MTP catch-up variants. Same H_SEED/H_RESULT range contract as
+// llama_predefined_decode_hidden / llama_decode; they build the MTP head's
+// CATCHUP_KV graph (draft KV writes only) instead of the full draft graph.
+// Used exclusively by the deferred catch-up in common/speculative.cpp::commit().
+LLAMA_API int llama_predefined_decode_hidden_kv(struct llama_context * ctx, struct llama_batch batch,
+        const struct llama_predefined_hidden_range * ranges, size_t n_ranges);
+LLAMA_API int llama_decode_mtp_catchup(struct llama_context * ctx, struct llama_batch batch);
+
 // Explicit checkpoint/reset I/O only. Normal drafting/verification never uses
 // these host paths. bytes must be exactly one hidden row.
 LLAMA_API bool llama_predefined_hidden_carry_get(struct llama_context * ctx, float * data, size_t bytes);

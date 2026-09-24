@@ -226,7 +226,20 @@ bool llama_context::predefined_hidden_copy(const llama_predefined_hidden_range *
     return true;
 }
 
+// W4: verification and draft steps keep the full MTP graph. The deferred
+// catch-up (speculative.cpp::commit) goes through the _kv entry, whose guard
+// makes graph selection build the K/V-only definition instead. The H_SEED /
+// H_RESULT range binding below is identical for both; only the graph differs.
 int llama_context::decode_predefined_hidden(llama_batch batch, const llama_predefined_hidden_range * ranges, size_t n) {
+    return decode_predefined_hidden_impl(batch, ranges, n);
+}
+
+int llama_context::decode_predefined_hidden_kv(llama_batch batch, const llama_predefined_hidden_range * ranges, size_t n) {
+    mtp_catchup_kv_guard guard(this);
+    return decode_predefined_hidden_impl(batch, ranges, n);
+}
+
+int llama_context::decode_predefined_hidden_impl(llama_batch batch, const llama_predefined_hidden_range * ranges, size_t n) {
     if (!predefined_hidden || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
         predefined_hidden->bound_input || !batch.token || batch.n_tokens <= 0 ||
         uint32_t(batch.n_tokens) > predefined_hidden->capacity || !ranges || n == 0 || n > GGML_DEVICE_COPY_MAX_RANGES) {
@@ -375,6 +388,14 @@ bool llama_predefined_hidden_copy(llama_context * ctx, const llama_predefined_hi
 }
 int llama_predefined_decode_hidden(llama_context * ctx, llama_batch batch, const llama_predefined_hidden_range * r, size_t n) {
     return hidden_api(__func__, -3, [&] { return ctx ? ctx->decode_predefined_hidden(batch, r, n) : -1; });
+}
+int llama_predefined_decode_hidden_kv(llama_context * ctx, llama_batch batch, const llama_predefined_hidden_range * r, size_t n) {
+    return hidden_api(__func__, -3, [&] { return ctx ? ctx->decode_predefined_hidden_kv(batch, r, n) : -1; });
+}
+// W4 host-hidden MTP catch-up entry: guards the decode so the graph layer
+// builds the K/V-only MTP definition.
+int llama_decode_mtp_catchup(llama_context * ctx, llama_batch batch) {
+    return ctx ? ctx->decode_mtp_catchup(batch) : -1;
 }
 bool llama_predefined_hidden_carry_get(llama_context * ctx, float * data, size_t bytes) {
     return hidden_api(__func__, false, [&] { return ctx && ctx->predefined_hidden_carry_io(data, bytes, false); });

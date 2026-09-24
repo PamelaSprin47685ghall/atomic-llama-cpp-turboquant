@@ -49,6 +49,24 @@ void                    common_sampler_accept(struct common_sampler * gsmpl, lla
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 
+// W2-CPU: verification-dedicated checkpoint clone. Preserves the durable state
+// (params, the cloned chain/grmr/rbudget, prev history) and deliberately drops the
+// large cur/cur_p candidate scratch -- set_logits rebuilds cur_p from this object's
+// own cur before any sampling use, so the first sample behaves identically to the
+// generic clone. The observable semantics of common_sampler_clone are unchanged.
+struct common_sampler * common_sampler_clone_checkpoint(struct common_sampler * gsmpl);
+
+// W2-CPU: pure-greedy eligibility for the MTP multi-row verification path (params
+// decision core; boundaries mirror the audit F12 list). has_grammar /
+// has_reasoning_budget should be given from the gsmpl->grmr / gsmpl->rbudget pointers
+// so replace_grammar() state is covered. The chain structure walk is in the .cpp.
+bool common_sampler_is_pure_greedy_params(const struct common_params_sampling & params, bool has_grammar, bool has_reasoning_budget);
+
+// W2-CPU: per-row argmax over raw logits; tie-break identical to the greedy chain's
+// CPU semantics (llama_sampler_greedy_apply / llama_sampler_temp_impl with temp <= 0:
+// first maximum wins, i.e. the smallest token id in set_logits' id order).
+llama_token common_sampler_sample_greedy_row(const float * logits, int32_t n_vocab);
+
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
 

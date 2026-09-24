@@ -142,6 +142,10 @@ add_executable(test-mtp-workspace test-mtp-workspace.cpp)
 target_link_libraries(test-mtp-workspace PRIVATE llama llama-common)
 llama_test(test-mtp-workspace LABEL "predefined;cpu")
 
+add_executable(test-mtp-catchup-kv test-mtp-catchup-kv.cpp)
+target_link_libraries(test-mtp-catchup-kv PRIVATE llama llama-common)
+llama_test(test-mtp-catchup-kv LABEL "predefined;cpu")
+
 add_test(NAME test-gpu-recovery COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-gpu-recovery.sh)
 set_tests_properties(test-gpu-recovery PROPERTIES LABELS "recovery;cpu" TIMEOUT 15)
 
@@ -206,6 +210,8 @@ llama_build(test-recurrent-state-rollback.cpp)
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
+    # W2-CPU: MTP pure-greedy verification fast path / clone cur_p rebinding / checkpoint clone
+    llama_build_and_test(test-sampling-mtp-verify.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)
@@ -482,6 +488,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # TP5 meta backend CPU reduction boundaries and linear region deferral
     llama_build_and_test(test-meta-reduce-boundary.cpp)
     target_include_directories(test-meta-reduce-boundary PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+
+    # W1: rank-local logits readback (CPU-meta regression, no GPU required)
+    llama_build_and_test(test-tp5-rank-local-readback.cpp)
+    target_include_directories(test-tp5-rank-local-readback PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")

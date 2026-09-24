@@ -473,6 +473,215 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     delete gsmpl;
 }
 
+// W2-CPU: pure-greedy eligibility for the MTP multi-row verification path
+// (params decision core; boundaries mirror audit report F12 one-for-one).
+//
+// The fast path may only replace per-row common_sampler_sample calls with a direct
+// raw-logit argmax when the original loop's output provably equals that argmax.
+// Boundaries, in the same order as the audit:
+//   has_grammar / has_reasoning_budget: with a grammar (incl. lazy/trigger forms) or
+//     reasoning budget present, sample() performs the grammar first-check and, when
+//     grammar_first is false, rejection resampling with a second set_logits; accept()
+//     may replay the budget end sequence into the grammar. All of that depends on the
+//     accepted token sequence and sampler-internal state, so rows cannot be evaluated
+//     independently. Callers pass the presence from the gsmpl->grmr / gsmpl->rbudget
+//     pointers (not from params) so replace_grammar() state is covered too.
+//   backend_sampling / logit_bias: the backend or explicit biases own candidate
+//     selection or mutate logits; CPU must not substitute for them.
+//   temp > 0 / dynatemp_range != 0: stochastic sampling, or an effective temperature
+//     that can drift away from greedy.
+//   top_k / top_p / min_p / typical / top_n_sigma / xtc / dry / mirostat / penalty_* /
+//     adaptive: stateful or stochastic samplers in effect.
+// The chain structure walk (which also pins this repo's real greedy CPU shape,
+// temp(<=0) collapse + dist) lives in common_sampler_is_pure_greedy below.
+bool common_sampler_is_pure_greedy_params(const struct common_params_sampling & params, bool has_grammar, bool has_reasoning_budget) {
+    if (has_grammar || has_reasoning_budget) {
+        return false;
+    }
+
+    if (params.backend_sampling) {
+        return false;
+    }
+
+    if (!params.logit_bias.empty()) {
+        return false;
+    }
+
+    // the only accepted greedy temperature form is temp <= 0; dynatemp can push the
+    // effective temperature away from greedy, so it is rejected too
+    if (params.temp > 0.0f || params.dynatemp_range != 0.0f) {
+        return false;
+    }
+
+    if (params.top_k > 0) {
+        return false;
+    }
+
+    if (params.top_p < 1.0f) {
+        return false;
+    }
+
+    if (params.min_p > 0.0f) {
+        return false;
+    }
+
+    if (params.typ_p < 1.0f) {
+        return false;
+    }
+
+    if (params.top_n_sigma > 0.0f) {
+        return false;
+    }
+
+    if (params.xtc_probability > 0.0f) {
+        return false;
+    }
+
+    if (params.dry_multiplier != 0.0f) {
+        return false;
+    }
+
+    if (params.mirostat != 0) {
+        return false;
+    }
+
+    if (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f) {
+        return false;
+    }
+
+    if (params.adaptive_target >= 0.0f) {
+        return false;
+    }
+
+    for (const auto cnstr : params.samplers) {
+        if (cnstr == COMMON_SAMPLER_TYPE_INFILL || cnstr == COMMON_SAMPLER_TYPE_ADAPTIVE_P) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// W2-CPU: per-row argmax over raw logits.
+//
+// The comparison is verbatim-equivalent to the greedy chain's CPU semantics:
+//   llama_sampler_greedy_apply (src/llama-sampler.cpp):
+//     selected = 0; for i >= 1: if (data[i].logit > data[selected].logit) selected = i;
+//   llama_sampler_temp_impl(temp <= 0.0f): the same strict '>' scan, setting all
+//     non-maximum logits to -INFINITY, after which dist deterministically returns the
+//     single survivor -- this is exactly this repo's greedy CPU chain shape
+//     (common_sampler_init always appends dist).
+// Strict '>' starting from index 0 means the FIRST maximum wins; because
+// common_sampler::set_logits fills candidates in ascending token id order, that is
+// the smallest token id on ties. NaN comparisons are false under '>' exactly as in the
+// reference implementations.
+llama_token common_sampler_sample_greedy_row(const float * logits, int32_t n_vocab) {
+    if (logits == nullptr || n_vocab <= 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    int32_t best = 0;
+    for (int32_t i = 1; i < n_vocab; ++i) {
+        if (logits[i] > logits[best]) {
+            best = i;
+        }
+    }
+
+    return (llama_token) best;
+}
+
+// W2-CPU: instance-level pure-greedy check = params core + chain structure walk.
+// The chain must contain an argmax collapse source (a greedy sampler, or temp/temp-ext
+// in its temp <= 0 collapse); without one the trailing dist is stochastic and a raw
+// logit argmax cannot replace it. Every chain member must be explainable from params
+// or from its own no-op semantics; anything unknown falls back to the original loop.
+static bool common_sampler_is_pure_greedy(const common_sampler * gsmpl) {
+    if (gsmpl->grmr != nullptr || gsmpl->rbudget != nullptr) {
+        return false;
+    }
+
+    if (gsmpl->chain == nullptr) {
+        return false;
+    }
+
+    if (!common_sampler_is_pure_greedy_params(gsmpl->params, false, false)) {
+        return false;
+    }
+
+    if (strcmp(llama_sampler_name(gsmpl->chain), "chain") != 0) {
+        return false;
+    }
+
+    const int n_smpl = llama_sampler_chain_n(gsmpl->chain);
+    if (n_smpl <= 0) {
+        return false;
+    }
+
+    bool has_argmax_collapse = false;
+
+    for (int i = 0; i < n_smpl; ++i) {
+        const struct llama_sampler * smpl = llama_sampler_chain_get(gsmpl->chain, i);
+        const char * name = llama_sampler_name(smpl);
+
+        if (strcmp(name, "greedy") == 0) {
+            has_argmax_collapse = true;
+            continue;
+        }
+
+        if (strcmp(name, "temp") == 0 || strcmp(name, "temp-ext") == 0) {
+            // temp <= 0 (and dynatemp off) is guaranteed by the params core above
+            has_argmax_collapse = true;
+            continue;
+        }
+
+        if (strcmp(name, "dist") == 0) {
+            // deterministic pass-through of the collapsed argmax; only sound together
+            // with a collapse source, which has_argmax_collapse enforces
+            continue;
+        }
+
+        // penalties: default params (repeat=1, freq=0, present=0) leave logits
+        // unchanged; the params core guarantees these values
+        if (strstr(name, "penalt") != nullptr) {
+            continue;
+        }
+
+        if (strcmp(name, "top-k") == 0) {
+            if (gsmpl->params.top_k > 0) { return false; }
+            continue;
+        }
+        if (strcmp(name, "top-p") == 0) {
+            if (gsmpl->params.top_p < 1.0f) { return false; }
+            continue;
+        }
+        if (strcmp(name, "min-p") == 0) {
+            if (gsmpl->params.min_p > 0.0f) { return false; }
+            continue;
+        }
+        if (strcmp(name, "typical") == 0) {
+            if (gsmpl->params.typ_p < 1.0f) { return false; }
+            continue;
+        }
+        if (strcmp(name, "xtc") == 0) {
+            if (gsmpl->params.xtc_probability > 0.0f) { return false; }
+            continue;
+        }
+        if (strcmp(name, "top-n-sigma") == 0) {
+            if (gsmpl->params.top_n_sigma > 0.0f) { return false; }
+            continue;
+        }
+        if (strcmp(name, "dry") == 0) {
+            if (gsmpl->params.dry_multiplier != 0.0f) { return false; }
+            continue;
+        }
+
+        // adaptive-p / mirostat / mirostat-v2 / infill / logit-bias / grammar / stack / unknown
+        return false;
+    }
+
+    return has_argmax_collapse;
+}
+
 static bool grammar_should_apply(struct common_sampler * gsmpl) {
     if (!gsmpl->grmr) {
         return false;
@@ -531,7 +740,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    common_sampler * res = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -539,6 +748,44 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+    };
+
+    // F11 (W2-CPU): cur_p must be rebound onto the clone's own cur storage.
+    // Copying cur_p verbatim left clone->cur_p.data pointing at the original object's
+    // cur buffer, so any later rewrite/free of the original's candidate storage left the
+    // clone's candidate view dangling. Every other cur_p field keeps the copied values
+    // (set_logits always assigns cur_p = {cur.data(), cur.size(), -1, false} together,
+    // so cur_p.size == cur.size() in every reachable state).
+    res->cur_p.data = res->cur.data();
+
+    return res;
+}
+
+// W2-CPU: verification-dedicated checkpoint clone.
+//
+// The only difference from common_sampler_clone is that the two large candidate
+// scratch fields (cur / cur_p, ~n_vocab * llama_token_data each) are NOT copied: the
+// MTP verify path clones the sampler on every cycle, so materializing the full vocab
+// candidate array per cycle is pure waste when the fast path never reads it.
+// The preserved durable facts are exactly: params, the cloned internal state of
+// chain/grmr/rbudget, and the prev history. Dropping cur/cur_p is observably safe:
+// common_sampler::set_logits fully rebuilds cur_p ({cur.data(), cur.size(), ...},
+// pointing at this object's own cur) before any sampling use, and no code path reads
+// cur_p before set_logits. The observable semantics of the generic
+// common_sampler_clone are unchanged.
+struct common_sampler * common_sampler_clone_checkpoint(common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return nullptr;
+    }
+
+    return new common_sampler {
+        /* .params  = */ gsmpl->params,
+        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
+        /* .prev    = */ gsmpl->prev,
+        /* .cur     = */ {},
+        /* .cur_p   = */ {},
     };
 }
 
@@ -683,6 +930,75 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
+
+    // W2-CPU: pure-greedy fast path.
+    //
+    // common_sampler_is_pure_greedy covers the F12 fallback boundaries: grammar or
+    // reasoning budget present (incl. the grammar_first=false rejection-resampling
+    // double set_logits), stateful or stochastic chain members (penalty_* off default,
+    // dry, mirostat, xtc, temp > 0, top_k/top_p/min_p in effect), and a busy backend
+    // sampler. When eligible, each row is evaluated by scanning its raw logits for the
+    // argmax, skipping common_sampler::set_logits' full-vocab llama_token_data
+    // materialization (n_vocab candidates per row). The tie-break is the greedy chain's
+    // own comparison (first maximum wins).
+    //
+    // All per-row argmax ids are computed BEFORE any accept/prev write, so a row that
+    // turns out to be unavailable (logits == nullptr, or the backend sampler already
+    // selected the token) aborts the fast path with zero state consumed and falls
+    // through to the original loop below, preserving its exact failure semantics.
+    //
+    // Submit order (accept calls, prev updates, break/bonus) is identical to the
+    // original loop: same ids through the same common_sampler_accept calls.
+    if (common_sampler_is_pure_greedy(gsmpl)) {
+        const auto tm = gsmpl->tm();
+
+        llama_synchronize(ctx);
+
+        const llama_model * model = llama_get_model(ctx);
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+        std::vector<llama_token> ids;
+        ids.reserve(idxs.size());
+
+        bool eligible = true;
+        for (size_t k = 0; k < idxs.size(); ++k) {
+            const llama_token backend_token = llama_get_sampled_token_ith(ctx, idxs[k]);
+            const float * logits = llama_get_logits_ith(ctx, idxs[k]);
+
+            if (backend_token != LLAMA_TOKEN_NULL || logits == nullptr) {
+                eligible = false;
+                break;
+            }
+
+            ids.push_back(common_sampler_sample_greedy_row(logits, n_vocab));
+        }
+
+        if (eligible) {
+            size_t j = 0;
+            for (; j < draft.size(); j++) {
+                const llama_token id = ids[j];
+
+                common_sampler_accept(gsmpl, id, true);
+
+                result.push_back(id);
+
+                if (draft[j] != id) {
+                    break;
+                }
+            }
+
+            if (j == draft.size()) {
+                const llama_token id = ids[j];
+
+                common_sampler_accept(gsmpl, id, true);
+
+                result.push_back(id);
+            }
+
+            return result;
+        }
+        // fallback: nothing has been accepted or pushed to prev yet
+    }
 
     size_t i = 0;
     for (; i < draft.size(); i++) {

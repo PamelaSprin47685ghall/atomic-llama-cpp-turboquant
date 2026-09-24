@@ -549,6 +549,41 @@ extern "C" {
                                                         ggml_backend_meta_local_node_hook_t hook);
     GGML_API struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);
 
+    // W1: rank-local output readback support (TP5 five-GPU logits readback).
+    //
+    // Number of simple (per-rank) devices wrapped by a meta device; 0 for any
+    // non-meta device. Doubles as the "is meta" predicate at the llama layer.
+    GGML_API size_t ggml_backend_meta_dev_n_simple_devs(ggml_backend_dev_t dev);
+
+    // The index-th simple device of a meta device. Valid only when
+    // ggml_backend_meta_dev_n_simple_devs(dev) > index.
+    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_get_simple_dev(ggml_backend_dev_t dev, size_t index);
+
+    // Invoke the meta device's own split-state callback for `tensor`. This is
+    // the only sanctioned channel for callers that need the per-rank split
+    // plan (e.g. sizing rank-local output buffers): the split policy stays
+    // owned by whoever created the meta device.
+    GGML_API struct ggml_backend_meta_split_state ggml_backend_meta_dev_compute_split_state(ggml_backend_dev_t dev, const struct ggml_tensor * tensor);
+
+    // Query the per-rank chunk sizes (bytes of one row-plane per rank) that
+    // ggml_backend_tensor_get_async reads back for `tensor`. Fills
+    // chunk_bytes[0..*n_chunks-1] and sets *n_chunks to the number of simple
+    // backends. Returns false for non-meta backends, or when the tensor's
+    // split is not the simple contiguous-chunks form (replica, mapped-span or
+    // mirrored), in which case the caller must use the single-destination
+    // path.
+    GGML_API bool ggml_backend_meta_tensor_rank_chunks(ggml_backend_t backend, const struct ggml_tensor * tensor, size_t * chunk_bytes, size_t * n_chunks);
+
+    // Per-rank destination variant of ggml_backend_tensor_get_2d_async for
+    // meta backends. Matches the single-destination call except that each
+    // rank j's slice is written at dsts[j] with rank-local row stride
+    // (chunk_j), instead of being gathered into the global strided layout at
+    // `data`. dsts[j] must be non-null for every rank with a non-empty chunk.
+    // When dsts is nullptr, or the backend is not meta, or the tensor's split
+    // is not the simple contiguous-chunks form, this is exactly
+    // ggml_backend_tensor_get_async(backend, tensor, data, offset, size).
+    GGML_API void ggml_backend_meta_tensor_get_2d_async_per_rank(ggml_backend_t backend, const struct ggml_tensor * tensor, void * const * dsts, void * data, size_t offset, size_t size);
+
     // Predefined-row execution contract for TP-style meta backends. The graph
     // owns capacity-shaped tensors; active_rows is useful work for this
     // invocation. This only supplies host-side execution metadata. Backends
