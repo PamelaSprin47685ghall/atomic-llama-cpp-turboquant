@@ -7,6 +7,8 @@
 
 恢复分支与 WIP 已分别推送 `origin/fix/tp5-non-mtp-correctness` 和 `origin/wip/tp5-before-correctness-recovery-20260924`。续做分支为 `work/mtp-correctness-first`，不整包合入 WIP，也不把 RERoT 分支的未验证算法改动带入 TP5。
 
+**随后按用户要求发布 master：** 将上述已验证分支合入远端 master `43b290eff`，保留其已有历史，源码合并提交 **`46fd3594c`**。合并后二进制重建，skinny MMVQ、五卡 readback、MTP workspace、audit tests 通过；non-MTP 和 MTP 各三次全文正确、171/171、自然停止。MTP 三次 `predicted_ms` 为 **2622.314、2295.654、2301.620**，这是集成烟测，不能替换下文五组正式 A/B。见 [master-integration.json](artifacts/tp5-mtp-readback-20260924/master-integration.json)。未验收的新草稿选择实验独立保存为 `origin/wip/mtp-draft-selection-20260924`（`16f4705c4`），没有合入 master。
+
 ### RERoT 报告中的共享 Vulkan 缺陷
 
 审阅 `origin/rerot-wip` **`c2ffb0fda`** 的 `artifacts/rerot-wip/vulkan-investigation.json`、`ordinary-baseline-evidence.json` 及其源代码复现后，确认一个可独立修复的问题：`ggml_vk_mul_mat_vec_q_f16` 在 skinny-as-batch lowering 中令 `src1` 指向栈上 `column_view_src1`，却把该地址存入 `prealloc_y_last_tensor_used`。连续两个投影会复用同一栈地址，第二个输入错误命中第一个输入的转换缓存。
