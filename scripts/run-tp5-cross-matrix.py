@@ -291,6 +291,12 @@ def get_available_variants(model_path: str, mtp_model_path: str) -> Dict[str, Di
         "is_mtp": True,
         "requires_linear": True,
     }
+    variants["native-mtp-serial-readback"] = {
+        **variants["native-mtp-single-draft"],
+        "name": "native-mtp-serial-readback",
+        "description": "Same MTP binary with rank-local pinned readback disabled; one-factor W1 control",
+        "env": dict(variants["native-mtp-single-draft"]["env"], GGML_META_ASYNC_READBACK="0"),
+    }
     variants["native-mtp-bo-isolated"] = {
         **variants["native-mtp-single-draft"],
         "name": "native-mtp-bo-isolated",
@@ -613,6 +619,8 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
                     "success": False,
                     "status_code": status_code,
                     "client_wall_sec": elapsed,
+                    "request": payload,
+                    "raw_response": body_bytes.decode("utf-8", errors="replace"),
                     "error_message": f"Non-200 HTTP status: {status_code}",
                 }
 
@@ -631,6 +639,8 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
                     "success": False,
                     "status_code": status_code,
                     "client_wall_sec": elapsed,
+                    "request": payload,
+                    "raw_response": body,
                     "error_message": "Missing 'completion_tokens' in usage payload; fail-closed.",
                 }
             completion_tokens = int(usage["completion_tokens"])
@@ -639,7 +649,7 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
             choice = choices[0] if choices else {}
             finish_reason = str(choice.get("finish_reason", ""))
             message = choice.get("message", {})
-            content = str(message.get("content", "")).strip()
+            content = str(message.get("content", ""))
 
             exact_content_match = (content == expected_content)
 
@@ -682,6 +692,7 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
                 "committed_tps": committed_tps,
                 "finish_reason": finish_reason,
                 "exact_content_match": exact_content_match,
+                "request": payload,
                 "raw_response": body,
                 "error_message": err,
             }
@@ -700,6 +711,7 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
             "committed_tps": 0.0,
             "finish_reason": "exception",
             "exact_content_match": False,
+            "request": payload,
             "raw_response": {},
             "error_message": f"HTTP request exception: {str(e)}",
         }

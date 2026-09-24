@@ -1,0 +1,112 @@
+{
+  "blocks": [
+    {
+      "block": 1,
+      "serial_mean_ms": 2359.8085,
+      "pinned_mean_ms": 2302.9385,
+      "ms_saved": 56.86999999999989,
+      "speedup_percent": 2.4694537001313632
+    },
+    {
+      "block": 2,
+      "serial_mean_ms": 2359.1895,
+      "pinned_mean_ms": 2308.91125,
+      "ms_saved": 50.278249999999844,
+      "speedup_percent": 2.1775739539577232
+    },
+    {
+      "block": 3,
+      "serial_mean_ms": 2368.36575,
+      "pinned_mean_ms": 2289.1255,
+      "ms_saved": 79.24024999999983,
+      "speedup_percent": 3.461594831738135
+    },
+    {
+      "block": 4,
+      "serial_mean_ms": 2356.373,
+      "pinned_mean_ms": 2300.24075,
+      "ms_saved": 56.13225000000011,
+      "speedup_percent": 2.440277175334815
+    },
+    {
+      "block": 5,
+      "serial_mean_ms": 2391.1820000000002,
+      "pinned_mean_ms": 2310.7155000000002,
+      "ms_saved": 80.4665,
+      "speedup_percent": 3.482319653804189
+    }
+  ],
+  "stats_decode": {
+    "n_pairs": 5,
+    "mean_a": 72.24978565027574,
+    "stdev_a": 0.42886689682455015,
+    "mean_b": 74.27296006277376,
+    "stdev_b": 0.27591360540931614,
+    "mean_diff_b_minus_a": 2.0231744124980224,
+    "ci_95_diff": [
+      1.4881285010481382,
+      2.5582203239479067
+    ],
+    "mean_ratio_b_over_a": 1.028025883757458,
+    "ci_95_ratio": [
+      1.0204422974944778,
+      1.0356094700204383
+    ],
+    "noninferiority_0_99_met": true
+  },
+  "stats_client_wall": {
+    "n_pairs": 5,
+    "mean_a": 52.996882288601704,
+    "stdev_a": 0.371171015379909,
+    "mean_b": 54.07127902327107,
+    "stdev_b": 0.228109214165494,
+    "mean_diff_b_minus_a": 1.0743967346693695,
+    "ci_95_diff": [
+      0.6550068802560829,
+      1.493786589082656
+    ],
+    "mean_ratio_b_over_a": 1.0203022159610562,
+    "ci_95_ratio": [
+      1.012229521371053,
+      1.0283749105510593
+    ],
+    "noninferiority_0_99_met": true
+  },
+  "A": {
+    "measured_n": 20,
+    "mean_ms": 2366.98375,
+    "median_ms": 2362.2165,
+    "min_ms": 2341.138,
+    "max_ms": 2433.289,
+    "stdev_ms": 22.18822185393585,
+    "median_tps": 72.3896391376489,
+    "cold_n": 10,
+    "cold_median_ms": 2685.1175000000003,
+    "mean_client_wall_sec": 3.2290860076514947
+  },
+  "B": {
+    "measured_n": 20,
+    "mean_ms": 2302.3863,
+    "median_ms": 2302.1445,
+    "min_ms": 2285.722,
+    "max_ms": 2328.769,
+    "stdev_ms": 12.842489146742896,
+    "median_tps": 74.27856939475346,
+    "cold_n": 10,
+    "cold_median_ms": 2613.77,
+    "mean_client_wall_sec": 3.1650197189512257
+  },
+  "all_expected_samples_retained": {
+    "steady": 40,
+    "cold": 20,
+    "exact_171_stop": 60
+  },
+  "single_env_difference": {
+    "GGML_META_ASYNC_READBACK": [
+      "0",
+      null
+    ]
+  },
+  "goal_100_tps_achieved": false,
+  "binary_artifacts_unchanged_since_verification": true
+}

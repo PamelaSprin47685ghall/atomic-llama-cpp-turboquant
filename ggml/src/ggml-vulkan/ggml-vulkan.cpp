@@ -12253,6 +12253,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const ggml_tensor * src0 = dst->src[swap_inputs ? 1 : 0];
     const ggml_tensor * src1 = dst->src[swap_inputs ? 0 : 1];
 
+    // Conversion reuse belongs to the graph input, not the temporary column
+    // view: successive projections reuse that view's stack address.
+    const ggml_tensor * src1_identity = src1;
     ggml_tensor column_view_src1;
     ggml_tensor column_view_dst;
     if (skinny_as_batch) {
@@ -12425,27 +12428,27 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     if (y_non_contig) {
         GGML_ASSERT(y_sz == ggml_type_size(src1->type) * y_ne);
         if (ctx->prealloc_y_last_pipeline_used != to_fp16_vk_1.get() ||
-            ctx->prealloc_y_last_tensor_used != src1 ||
+            ctx->prealloc_y_last_tensor_used != src1_identity ||
             ctx->prealloc_y_last_decode_vector_staging) {
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
             ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, d_Qy, d_Y);
             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
-            ctx->prealloc_y_last_tensor_used = src1;
+            ctx->prealloc_y_last_tensor_used = src1_identity;
             ctx->prealloc_y_last_decode_vector_staging = false;
         }
     }
     if (quantize_y) {
         if (ctx->prealloc_y_last_pipeline_used != to_q8_1.get() ||
-            ctx->prealloc_y_last_tensor_used != src1 ||
+            ctx->prealloc_y_last_tensor_used != src1_identity ||
             ctx->prealloc_y_last_decode_vector_staging) {
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
             ggml_vk_quantize_q8_1(ctx, subctx, d_Qy, d_Y, y_ne);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
-            ctx->prealloc_y_last_tensor_used = src1;
+            ctx->prealloc_y_last_tensor_used = src1_identity;
             ctx->prealloc_y_last_decode_vector_staging = false;
         }
     }

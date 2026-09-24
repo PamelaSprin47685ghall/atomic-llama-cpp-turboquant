@@ -218,7 +218,7 @@ def main() -> int:
                 if kind.endswith("count"):
                     choice = body["choices"][0]
                     sample["count_start"] = count_start
-                    sample["correct"] = (choice["message"]["content"].strip() == ",".join(map(str, range(count_start, count_start + 60)))
+                    sample["correct"] = (choice["message"]["content"] == ",".join(map(str, range(count_start, count_start + 60)))
                                          and choice["finish_reason"] == "stop")
                 else:
                     t = body["timings"]

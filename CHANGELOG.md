@@ -18,6 +18,33 @@ full-model correctness acceptance; repaired-model measurements are required.
 
 ### Fixed
 
+- **Meta rank-local asynchronous readback.** Eligible contiguous F32 vocabulary
+  shards now copy into persistent per-device pinned host slots, submit every
+  rank before waiting, and assemble at the existing consumption boundary.
+  Pending reads retire before a subsequent read, slot growth, fallback, or
+  backend destruction; unsupported layouts retain the original getter.
+  Five-device byte/lifetime regressions and MTP acceptance prefixes 0–6 pass.
+  `GGML_META_ASYNC_READBACK=0` provides a same-binary control; timing evidence
+  and the unchanged model/sampler contract are recorded in `TP5.md`. Five paired
+  ABBA blocks measured 72.25→74.27 decode tok/s (+2.80%); all 60 retained cold
+  and steady requests were exact 171-token natural stops. This is not 100 tok/s.
+
+- **Vulkan skinny MMVQ projections keep distinct input identities.** The converted
+  activation cache now keys on the graph tensor, not a temporary stack view
+  reused by successive projections. Forced MMVQ could otherwise give the second
+  projection the first input's values. A sparse-weight numerical regression
+  checks distinct inputs and changed inputs across cold execution and replay;
+  it fails with the old backend and passes with the repair.
+
+- **TP5 counting acceptance preserves exact request evidence.** The cross-matrix
+  runner now records the submitted request alongside the full response, including
+  responses missing token usage. Counting gates no longer trim whitespace before
+  claiming a byte-for-byte match. The 171-token workload explicitly disables
+  thinking and prompt reuse; a reasoning-enabled request is a different workload
+  and needs its own context/output budget. A 40-character response preview is
+  not evidence of a miscount. See the September 24 correctness investigation in
+  `TP5.md` for the restored non-MTP binary and full-response evidence.
+
 - **MM-R1 logical leaves no longer inherit a physical pen budget.** Removed
   the incremental mindmap probe guard and parser node/leaf/wire-byte/depth/
   label budgets; the JSON probe retains its separate 512-token policy. After one English
