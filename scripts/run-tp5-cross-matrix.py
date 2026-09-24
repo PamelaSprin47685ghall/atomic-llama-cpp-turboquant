@@ -11,15 +11,14 @@ Guarantees & Invariants:
    - Full byte-for-byte match against canonical 1..60 counting string (170 chars).
    - finish_reason == "stop".
    - prompt_n == 31.
-   - For non-MTP runs, predicted_n == 171.
-   - For MTP (speculative decoding), predicted_n is recorded as observation and NOT strictly forced to 171
-     because draft accept/reject steps vary predicted token counter, while committed tokens in usage
-     and complete text output are strictly verified.
+   - For count-60, both predicted_n and completion_tokens must equal 171, including MTP.
+     Longer counting outputs are exploratory and do not enter the 171-token gate.
    - completion_tokens MUST be explicitly reported in usage payload; fail-closed with NO fallback.
 5. Timing & Throughput:
    - High-resolution monotonic timing (time.perf_counter) strictly spanning the entire request
      including resp.read().
-   - Committed client throughput = completion_tokens / client_wall_sec (primary metric).
+   - Decode throughput = 171 / (timings.predicted_ms / 1000) for count-60 (primary metric).
+   - Client wall throughput is retained as a secondary diagnostic, never the >100 gate.
 6. Server log route verification:
    - Parse server log to verify actual route activation:
      * relay vs timeline
@@ -273,6 +272,36 @@ def get_available_variants(model_path: str, mtp_model_path: str) -> Dict[str, Di
         ],
         "is_mtp": True,
         "requires_linear": False,
+    }
+    variants["native-mtp-single-draft"] = {
+        **variants["native-launcher-device"],
+        "name": "native-mtp-single-draft",
+        "description": "RELAY/F32 five-rank target with local Vulkan0 n=6 MTP draft; unprofiled Decode measurement",
+        "env": dict(variants["native-launcher-device"]["env"],
+                    GGML_TP5_WIRE="f32", GGML_TP5_LINEAR_LOWERING="1",
+                    GGML_TP5_MTP_DRAFT_SINGLE_GPU="1",
+                    GGML_TP5_SPIN_MAX="10000000"),
+        "cli_args": variants["native-default"]["cli_args"] + [
+            "-md", mtp_model_path,
+            "--spec-type", "draft-mtp",
+            "--spec-draft-device", "Vulkan0",
+            "--spec-draft-n-max", "6",
+            "--spec-draft-p-min", "0.0",
+        ],
+        "is_mtp": True,
+        "requires_linear": True,
+    }
+    variants["native-mtp-bo-isolated"] = {
+        **variants["native-mtp-single-draft"],
+        "name": "native-mtp-bo-isolated",
+        "description": "One-factor RADV nobolist experiment; disables device-wide BDA/indexing/CM2",
+        "env": dict(variants["native-mtp-single-draft"]["env"], GGML_TP5_ISOLATE_BO="1"),
+    }
+    variants["native-mtp-latebind-exact"] = {
+        **variants["native-mtp-single-draft"],
+        "name": "native-mtp-latebind-exact",
+        "description": "Experimental five-rank RELAY/F32 MTP with exact-Q HC LateBind",
+        "cli_args": variants["native-mtp-single-draft"]["cli_args"] + ["--tp5-latebind", "exact"],
     }
 
     # 6. Relay F16 + MMVQ Auto Ablation
@@ -544,12 +573,9 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
                           count_to: int, timeout_sec: float = 120.0) -> Dict[str, Any]:
     """Execute canonical count request with monotonic timing including read, and strict validation.
     
-    For MTP (speculative decoding):
-      - predicted_n is NOT forced to 171 (recorded as empirical observation).
-      - Strict complete content (canonical 1..60 string), finish_reason == 'stop', and prompt_n == 31 are enforced.
-      - completion_tokens MUST be present in usage; fail closed if absent.
-    For non-MTP:
-      - predicted_n == 171 is strictly required in addition to complete content.
+    For count-60, both MTP and pure Target must report exactly 171 predicted
+    and committed tokens, positive finite predicted_ms, and naturally stopped
+    exact content. Missing usage.completion_tokens always fails closed.
     """
     if timeout_sec <= 0:
         return {"success": False, "error_message": "Matrix wall-clock deadline exceeded before HTTP request"}
@@ -595,6 +621,7 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
             timings = body.get("timings", {})
             pred_tps = float(timings.get("predicted_per_second", 0.0))
             pred_n = int(timings.get("predicted_n", 0))
+            pred_ms = float(timings.get("predicted_ms", 0.0))
             prompt_n = int(timings.get("prompt_n", 0))
 
             usage = body.get("usage", {})
@@ -618,7 +645,8 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
 
             # The fixed prompt_n/predicted_n oracle is specific to count-60.
             # Longer shapes still require the entire exact response and stop.
-            pred_n_valid = True if is_mtp or count_to != 60 else (pred_n == EXPECTED_PREDICTED_N_TARGET)
+            pred_n_valid = pred_n == EXPECTED_PREDICTED_N_TARGET if count_to == 60 else pred_n > 0
+            completion_n_valid = completion_tokens == EXPECTED_PREDICTED_N_TARGET if count_to == 60 else completion_tokens > 0
             prompt_n_valid = prompt_n == EXPECTED_PROMPT_N if count_to == 60 else prompt_n > 0
 
             is_valid = (
@@ -626,17 +654,19 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
                 and finish_reason == "stop"
                 and prompt_n_valid
                 and pred_n_valid
-                and completion_tokens > 0
+                and completion_n_valid
+                and math.isfinite(pred_ms) and pred_ms > 0
             )
 
             committed_tps = (completion_tokens / elapsed) if elapsed > 0 else 0.0
+            decode_tps = completion_tokens * 1000.0 / pred_ms if math.isfinite(pred_ms) and pred_ms > 0 else 0.0
 
             err = None
             if not is_valid:
                 err = (
                     f"Validation failed: exact_content_match={exact_content_match} (len={len(content)} vs {len(expected_content)}), "
                     f"finish_reason={finish_reason}, prompt_n={prompt_n}, pred_n={pred_n} (valid={pred_n_valid}, is_mtp={is_mtp}), "
-                    f"completion_tokens={completion_tokens}"
+                    f"completion_tokens={completion_tokens} (valid={completion_n_valid}), predicted_ms={pred_ms}"
                 )
 
             return {
@@ -644,6 +674,8 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
                 "status_code": status_code,
                 "client_wall_sec": elapsed,
                 "reported_predicted_tps": pred_tps,
+                "decode_tps": decode_tps,
+                "predicted_ms": pred_ms,
                 "prompt_n": prompt_n,
                 "predicted_n": pred_n,
                 "completion_tokens": completion_tokens,
@@ -660,6 +692,8 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
             "status_code": getattr(e, "code", 0),
             "client_wall_sec": elapsed,
             "reported_predicted_tps": 0.0,
+            "decode_tps": 0.0,
+            "predicted_ms": 0.0,
             "prompt_n": 0,
             "predicted_n": 0,
             "completion_tokens": 0,
@@ -825,6 +859,7 @@ def run_single_variant_trial(
         print(f"[*] Running warmup request for {variant['name']} [{trial_tag}]...")
         warmup = execute_bench_request(host, port, owned_proc=server, is_mtp=variant.get("is_mtp", False),
                                        count_to=count_to, timeout_sec=bounded_timeout(deadline, 120.0))
+        result["warmup"] = warmup
         if deadline is not None and time.perf_counter() >= deadline:
             result["error"] = "Matrix wall-clock deadline exceeded during warmup"
             return result
@@ -833,10 +868,11 @@ def run_single_variant_trial(
             print(f"[!] {result['error']}", file=sys.stderr)
             return result
 
-        print(f"[+] Warmup passed (reported_tps={warmup['reported_predicted_tps']:.2f}, committed_tps={warmup['committed_tps']:.2f})")
+        print(f"[+] Warmup passed (decode_tps={warmup['decode_tps']:.2f}, client_wall_tps={warmup['committed_tps']:.2f})")
 
         # Measured repeats
         collected: List[Dict[str, Any]] = []
+        result["metrics"] = collected
         for r in range(repeats):
             time.sleep(0.5)
             metric = execute_bench_request(host, port, owned_proc=server, is_mtp=variant.get("is_mtp", False),
@@ -848,7 +884,7 @@ def run_single_variant_trial(
                 result["error"] = f"Repeat {r+1}/{repeats} failed: {metric.get('error_message')}"
                 print(f"[!] {result['error']}", file=sys.stderr)
                 return result
-            print(f"    Repeat {r+1}/{repeats}: reported_tps={metric['reported_predicted_tps']:.2f}, committed_tps={metric['committed_tps']:.2f}, wall={metric['client_wall_sec']:.3f}s")
+            print(f"    Repeat {r+1}/{repeats}: decode_tps={metric['decode_tps']:.2f}, client_wall_tps={metric['committed_tps']:.2f}, wall={metric['client_wall_sec']:.3f}s")
             collected.append(metric)
 
         # Post-flight: verify route logs for linear lowering / relay
@@ -864,7 +900,6 @@ def run_single_variant_trial(
             print(f"[!] {result['error']}", file=sys.stderr)
             return result
 
-        result["metrics"] = collected
         result["success"] = True
         return result
     finally:
@@ -940,10 +975,10 @@ def run_abba_cross_matrix(
         "trials": [],
         "paired_samples_a_committed": [],
         "paired_samples_b_committed": [],
-        "paired_samples_a_reported": [],
-        "paired_samples_b_reported": [],
+        "paired_samples_a_decode": [],
+        "paired_samples_b_decode": [],
         "stats_committed_tps": {},
-        "stats_reported_tps": {},
+        "stats_decode_tps": {},
         "status": "in_progress",
     }
 
@@ -976,8 +1011,8 @@ def run_abba_cross_matrix(
 
     port = base_port
 
-    samples_a_rep: List[float] = []
-    samples_b_rep: List[float] = []
+    samples_a_dec: List[float] = []
+    samples_b_dec: List[float] = []
     samples_a_com: List[float] = []
     samples_b_com: List[float] = []
     baseline_gpu_identity: Optional[List[Tuple[str, str, int]]] = None
@@ -1035,15 +1070,15 @@ def run_abba_cross_matrix(
         b_metrics = block_results["B1"]["metrics"] + block_results["B2"]["metrics"]
         samples_a_com.append(statistics.mean(m["committed_tps"] for m in a_metrics))
         samples_b_com.append(statistics.mean(m["committed_tps"] for m in b_metrics))
-        samples_a_rep.append(statistics.mean(m["reported_predicted_tps"] for m in a_metrics))
-        samples_b_rep.append(statistics.mean(m["reported_predicted_tps"] for m in b_metrics))
+        samples_a_dec.append(statistics.mean(m["decode_tps"] for m in a_metrics))
+        samples_b_dec.append(statistics.mean(m["decode_tps"] for m in b_metrics))
 
         results_data["blocks_completed"] += 1
 
     results_data["paired_samples_a_committed"] = samples_a_com
     results_data["paired_samples_b_committed"] = samples_b_com
-    results_data["paired_samples_a_reported"] = samples_a_rep
-    results_data["paired_samples_b_reported"] = samples_b_rep
+    results_data["paired_samples_a_decode"] = samples_a_dec
+    results_data["paired_samples_b_decode"] = samples_b_dec
 
     if pilot:
         # A short directed experiment reports observations, not a confidence
@@ -1051,7 +1086,7 @@ def run_abba_cross_matrix(
         results_data["status"] = "PILOT_COMPLETE_NOT_ACCEPTANCE"
     else:
         results_data["stats_committed_tps"] = compute_paired_statistics(samples_a_com, samples_b_com)
-        results_data["stats_reported_tps"] = compute_paired_statistics(samples_a_rep, samples_b_rep)
+        results_data["stats_decode_tps"] = compute_paired_statistics(samples_a_dec, samples_b_dec)
         results_data["status"] = "success"
 
     return results_data
@@ -1069,14 +1104,17 @@ def print_summary_table(results: Dict[str, Any]):
         return
 
     if results.get("status") == "SMOKE_PASS":
-        print("Single-trial route and full-response smoke passed. NO PERFORMANCE WIN CLAIM.")
+        print("Route and exact-response smoke passed. NO PAIRED PERFORMANCE WIN CLAIM.")
+        if results.get("count_to") == 60:
+            for metric in results["trials"][0]["metrics"]:
+                print(f"171-token Decode: {metric['decode_tps']:.2f} tok/s (predicted_ms={metric['predicted_ms']:.3f})")
         print("=" * 80)
         return
 
     if results.get("status") == "PILOT_COMPLETE_NOT_ACCEPTANCE":
-        a = results["paired_samples_a_committed"]
-        b = results["paired_samples_b_committed"]
-        print(f"Exploratory {results['blocks_completed']}-block ABBA; committed A={statistics.mean(a):.2f}, B={statistics.mean(b):.2f} tok/s")
+        a = results["paired_samples_a_decode"]
+        b = results["paired_samples_b_decode"]
+        print(f"Exploratory {results['blocks_completed']}-block ABBA; Decode A={statistics.mean(a):.2f}, B={statistics.mean(b):.2f} tok/s")
         print("No confidence interval or default-promotion claim from reduced rounds.")
         print("=" * 80)
         return
@@ -1090,23 +1128,23 @@ def print_summary_table(results: Dict[str, Any]):
     var_b = results["variant_b"]["name"]
 
     com = results["stats_committed_tps"]
-    rep = results["stats_reported_tps"]
+    dec = results["stats_decode_tps"]
 
     print(f"Completed Blocks: {results['blocks_completed']} (Total {len(results['trials'])} isolated process runs)")
     print(f"Variant A: {var_a}")
     print(f"Variant B: {var_b}")
     print("-" * 80)
-    print(f"COMMITTED CLIENT THROUGHPUT (Tokens / Client Wall Second) [PRIMARY METRIC]:")
-    print(f"  {var_a}: Mean = {com['mean_a']:.2f} tok/s (stdev: {com['stdev_a']:.2f})")
-    print(f"  {var_b}: Mean = {com['mean_b']:.2f} tok/s (stdev: {com['stdev_b']:.2f})")
-    print(f"  Difference (B - A): {com['mean_diff_b_minus_a']:+.2f} tok/s [95% CI: {com['ci_95_diff'][0]:.2f}, {com['ci_95_diff'][1]:.2f}]")
-    print(f"  Paired Ratio (B / A): {com['mean_ratio_b_over_a']:.4f} [95% CI: {com['ci_95_ratio'][0]:.4f}, {com['ci_95_ratio'][1]:.4f}]")
-    print(f"  Non-inferiority (Lower CI >= 0.99): {com['noninferiority_0_99_met']}")
+    if results.get("count_to", 60) == 60:
+        print("171-TOKEN DECODE THROUGHPUT (171 / timings.predicted_ms) [PRIMARY METRIC]:")
+    else:
+        print("LONG-OUTPUT DECODE THROUGHPUT (not the 171-token acceptance gate):")
+    print(f"  {var_a}: Mean = {dec['mean_a']:.2f} tok/s (stdev: {dec['stdev_a']:.2f})")
+    print(f"  {var_b}: Mean = {dec['mean_b']:.2f} tok/s (stdev: {dec['stdev_b']:.2f})")
+    print(f"  Difference (B - A): {dec['mean_diff_b_minus_a']:+.2f} tok/s [95% CI: {dec['ci_95_diff'][0]:.2f}, {dec['ci_95_diff'][1]:.2f}]")
+    print(f"  Paired Ratio (B / A): {dec['mean_ratio_b_over_a']:.4f} [95% CI: {dec['ci_95_ratio'][0]:.4f}, {dec['ci_95_ratio'][1]:.4f}]")
+    print(f"  Non-inferiority (Lower CI >= 0.99): {dec['noninferiority_0_99_met']}")
     print("-" * 80)
-    print(f"SERVER REPORTED TIMINGS (timings.predicted_per_second):")
-    print(f"  {var_a}: Mean = {rep['mean_a']:.2f} tok/s")
-    print(f"  {var_b}: Mean = {rep['mean_b']:.2f} tok/s")
-    print(f"  Ratio (B / A): {rep['mean_ratio_b_over_a']:.4f}")
+    print(f"CLIENT WALL THROUGHPUT (secondary diagnostic): {var_a}={com['mean_a']:.2f}, {var_b}={com['mean_b']:.2f} tok/s")
     print("=" * 80)
 
 

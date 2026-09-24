@@ -24,18 +24,21 @@ layout(push_constant) uniform Params {
 } p;
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.x;
+    uint token = gl_GlobalInvocationID.y;
     uint stride = p.n_elems / 4u;
-    if (i >= stride) {
+    if (col >= stride) {
         return;
     }
+    uint token_in_base  = token * (4u * stride) + col;
+    uint token_out_base = token * stride + col;
     // Match the unfused MUL, ADD, ADD, ADD, SCALE order. In particular, do
     // not contract a multiply into an add or introduce an initial +0.
-    precise vec4 acc = gate[i] * lo[i];
+    precise vec4 acc = gate[token_in_base] * lo[token_in_base];
     for (uint s = 1u; s < p.n_streams; ++s) {
-        precise vec4 product = gate[s * stride + i] * lo[s * stride + i];
+        precise vec4 product = gate[s * stride + token_in_base] * lo[s * stride + token_in_base];
         acc                  = acc + product;
     }
     precise vec4 result = acc * p.inv_c;
-    out_data[i]         = result;
+    out_data[token_out_base] = result;
 }

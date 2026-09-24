@@ -1659,18 +1659,18 @@ void llama_context::synchronize() {
     if (!sched) {
         return;
     }
+    // Always synchronize the scheduler to ensure pending asynchronous work
+    // on the device/backends completes before buffer/resource release or teardown.
+    ggml_backend_sched_synchronize(sched.get());
+    if (predefined_hidden && predefined_hidden->pending) {
+        ggml_backend_synchronize(predefined_hidden->executor);
+        predefined_hidden->pending = false;
+    }
+
     if (n_queued_tokens == 0) {
-        // Carry/seed/input copies may have been queued after sampling retired
-        // the decode. They still own persistent device buffers at teardown or
-        // a cross-context handoff, even though they do not count as tokens.
-        if (predefined_hidden && predefined_hidden->pending) {
-            ggml_backend_synchronize(predefined_hidden->executor);
-            predefined_hidden->pending = false;
-        }
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
     if (predefined_hidden) {
         predefined_hidden->pending = false;
     }
@@ -2545,7 +2545,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 // yet; zero remains a valid member of the immutable ABI.
                 request.draft_step = 0;
             }
-        } else if (n_outputs == (int32_t) ubatch.n_tokens &&
+        } else if (n_outputs == ubatch.n_tokens &&
                    ubatch.n_tokens <= capacity->verify_tokens) {
             // A target verification contains one sampled row per sequence plus
             // the candidate rows. Ordinary one-token decode is the degenerate
@@ -2609,13 +2609,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // useful work. The maximum-graph path will raise only capacity_rows
         // after all participating operators have adopted the frame contract.
         for (ggml_backend_t backend : backend_ptrs) {
-            if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_META &&
-                !ggml_backend_meta_set_predefined_frame(
-                    backend, &frame, predefined_capacity_rows_current,
-                    predefined_capacity_outputs_current)) {
-                LLAMA_LOG_ERROR("%s: failed to publish predefined execution frame to meta backend\n", __func__);
-                ret = GGML_STATUS_FAILED;
-                return nullptr;
+            if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_META) {
+                if (!ggml_backend_meta_set_predefined_frame(
+                        backend, &frame, predefined_capacity_rows_current,
+                        predefined_capacity_outputs_current)) {
+                    LLAMA_LOG_ERROR("%s: failed to publish predefined execution frame to meta backend\n", __func__);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+            } else if (gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+                // Detached MTP drafts run on one Vulkan device, not through
+                // meta. Its replayed capacity graph needs the same live row
+                // count as the multi-rank target to skip unused draft rows.
+                using set_frame_t = bool (*)(ggml_backend_t, const ggml_predefined_frame *, uint32_t, uint32_t);
+                const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+                const auto set_frame = reinterpret_cast<set_frame_t>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_predefined_frame"));
+                if (set_frame && !set_frame(backend, &frame, predefined_capacity_rows_current,
+                                             predefined_capacity_outputs_current)) {
+                    LLAMA_LOG_ERROR("%s: failed to publish MTP execution frame to draft backend\n", __func__);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
             }
         }
     }
@@ -2737,6 +2752,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (predefined_hidden && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            bool pinned = false;
+            for (const auto & input : res->inputs) {
+                auto * hidden = dynamic_cast<llm_graph_input_embd_h *>(input.get());
+                if (!hidden || !hidden->h) {
+                    continue;
+                }
+                ggml_backend_sched_set_tensor_backend(sched.get(), hidden->h, predefined_hidden->executor);
+                pinned = true;
+            }
+            if (!pinned) {
+                LLAMA_LOG_ERROR("%s: device MTP hidden graph has no hidden input to place on its native executor\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2746,8 +2778,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
-
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         try {
             // The borrowed device binding lives only for this call; gparams
@@ -2758,8 +2788,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {

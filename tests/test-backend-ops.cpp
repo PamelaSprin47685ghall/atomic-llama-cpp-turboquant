@@ -9210,6 +9210,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 GGML_TYPE_Q6_K, GGML_TYPE_F32,
                 64, n, 256, {1, 1}, {1, 1}));
     }
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q8_0, GGML_TYPE_F32,
+            4, 27, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q8_0, GGML_TYPE_F32,
+            4, 7, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q5_K, GGML_TYPE_F32,
+            2560, 7, 6144, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q8_0, GGML_TYPE_F32,
+            320, 27, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q6_K, GGML_TYPE_F32,
+            128, 27, 2560, {1, 1}, {1, 1}));
     // Recurrent/RERoT decode stores one column per outer batch instead of
     // ne11. Both layouts must hit the shared-matrix multi-column path without
     // changing the logical four-dimensional result.

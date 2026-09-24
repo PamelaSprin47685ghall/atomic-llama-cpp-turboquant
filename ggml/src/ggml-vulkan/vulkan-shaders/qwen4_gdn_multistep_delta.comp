@@ -194,17 +194,6 @@ void main() {
             data_attn[attn_off] = attn_col * scale;
         }
 
-        // Rollback snapshot writeback: reverse-mapped from eff_active: target_slot = eff_active - 1 - t
-        if (n_snapshots > 1u) {
-            const uint target_slot = eff_active - 1u - t;
-            if (target_slot < n_snapshots) {
-                const uint snap_base = target_slot * snap_slot_stride + state_base;
-                [[unroll]] for (uint r = 0u; r < 16u; ++r) {
-                    const uint row = r * 8u + lane;
-                    data_snapshots[snap_base + row] = s_shard[r];
-                }
-            }
-        }
     }
 
     // 4. Final state writeback: persist the state after step eff_active - 1

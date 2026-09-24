@@ -1374,6 +1374,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     uint64_t cur_cycle_catchup_us       = 0;
     uint32_t cur_cycle_draft_tokens     = 0;
     uint32_t cur_cycle_accepted_tokens  = 0;
+    bool     cur_cycle_drafted          = false;
     uint64_t cur_cycle_local_id         = 0;
     common_speculative * parent_spec    = nullptr;
 
@@ -1420,10 +1421,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
+        if (this->params.backend_sampling && this->params.p_min <= 0.0f) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_greedy());
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1812,6 +1813,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        const bool drafted_this_call = n_drafting > 0;
+        cur_cycle_drafted |= drafted_this_call;
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -1857,25 +1861,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                const llama_token sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = device_hidden ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
                 if (device_hidden && llama_predefined_hidden_rows(ctx_dft) != 1) {
                     throw std::runtime_error("device MTP draft did not produce one hidden row");
                 }
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                // Backend sampling transfers only the chosen id, not the full
+                // probability vector. A positive p_min requires the CPU path.
+                const auto * cur_p = backend_chains[seq_id] ? nullptr : common_sampler_get_candidates(smpl, true);
 
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                if (cur_p) {
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                const llama_token id = cur_p ? cur_p->data[0].id : sampled;
+                if (id == LLAMA_TOKEN_NULL) {
+                    throw std::runtime_error("MTP backend sampler returned no draft token");
+                }
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p && cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1943,7 +1954,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        if (prof_active) {
+        if (prof_active && drafted_this_call) {
             cur_cycle_draft_us += (ggml_time_us() - t_draft_start);
             for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
                 if (dparams[s].result) {
@@ -2534,6 +2545,7 @@ void common_speculative_impl_draft_mtp::reset() {
     cur_cycle_catchup_us      = 0;
     cur_cycle_draft_tokens    = 0;
     cur_cycle_accepted_tokens = 0;
+    cur_cycle_drafted         = false;
     if (parent_spec) {
         parent_spec->last_target_verify_us = 0;
     }
@@ -2541,7 +2553,7 @@ void common_speculative_impl_draft_mtp::reset() {
 
 void common_speculative_impl_draft_mtp::record_cycle_settle() {
     const bool prof_active = std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr;
-    if (prof_active) {
+    if (prof_active && cur_cycle_drafted) {
         common_speculative_cycle_record rec;
         if (parent_spec) {
             rec.cycle_id = ++parent_spec->cycle_id;
@@ -2583,6 +2595,7 @@ void common_speculative_impl_draft_mtp::record_cycle_settle() {
     cur_cycle_catchup_us       = 0;
     cur_cycle_draft_tokens     = 0;
     cur_cycle_accepted_tokens  = 0;
+    cur_cycle_drafted          = false;
     if (parent_spec) {
         parent_spec->last_target_verify_us = 0;
     }
@@ -2790,6 +2803,13 @@ common_speculative_init_result::common_speculative_init_result(
     const common_params params_dft = common_base_params_to_speculative(params);
     if (has_draft) {
         mparams = common_model_params_to_llama(const_cast<common_params &>(params_dft));
+        // A detached MTP draft on one device has no tensor-parallel shards.
+        // Keep the five-rank target untouched while evaluating draft placement.
+        const char * single_gpu = std::getenv("GGML_TP5_MTP_DRAFT_SINGLE_GPU");
+        if (spec_mtp && params_dft.devices.size() == 2 && params_dft.devices[0] && !params_dft.devices[1] &&
+            single_gpu && std::strcmp(single_gpu, "1") == 0) {
+            mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
+        }
     }
 
     if (spec_mtp) {

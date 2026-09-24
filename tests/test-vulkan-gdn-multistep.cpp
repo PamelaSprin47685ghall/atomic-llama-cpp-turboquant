@@ -82,11 +82,13 @@ struct gdn_test_tensors {
 static gdn_test_tensors build_gdn_27_node_graph(
         ggml_context * ctx,
         int64_t capacity,
-        int64_t active_tokens) {
+        int64_t active_tokens,
+        int64_t snapshots = 1,
+        int64_t hk = 1,
+        int64_t hv = 3,
+        const std::vector<uint8_t> & headmap = {}) {
 
     const int64_t S_v = 128;
-    const int64_t hk  = 1;
-    const int64_t hv  = 3; // hv == 3 * hk
     const int64_t channels    = 128 * (2 * hk + hv); // 640
     const int64_t head_values = 128 * hv;             // 384
     const int64_t n_time      = capacity;
@@ -101,7 +103,7 @@ static gdn_test_tensors build_gdn_27_node_graph(
     t.alpha_scale = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hv, 1);
     t.raw_beta    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hv, n_time);
     t.state_in    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S_v, S_v * hv);
-    t.cache_dst   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_values, n_time + 128);
+    t.cache_dst   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_values, n_time + 128 * snapshots);
     t.gamma       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, hv);
     t.raw_z       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, hv, n_time);
     t.out_w       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_values, head_values);
@@ -154,17 +156,22 @@ static gdn_test_tensors build_gdn_27_node_graph(
     ggml_tensor * n14 = ggml_reshape_4d(ctx, t.state_in, S_v, S_v, hv, 1);
 
     // 15. GGML_OP_GATED_DELTA_NET (with active_tokens in op_params[2])
-    ggml_tensor * n15 = ggml_gated_delta_net_ext(ctx, n3, n5, n6, n11, n13, n14, 1, active_tokens);
+    ggml_tensor * n15 = ggml_gated_delta_net_ext(ctx, n3, n5, n6, n11, n13, n14, snapshots, active_tokens);
+    if (!headmap.empty()) {
+        GGML_ASSERT((int64_t) headmap.size() == hv);
+        ggml_tp5_headmap_set(n15, headmap.data(), (int32_t) headmap.size());
+    }
+    const int64_t written = std::min(active_tokens == 0 ? capacity : active_tokens, snapshots);
 
     // 16. GGML_OP_VIEW (state_out_view) - offset strictly follows production delta-net-base.cpp: attn_score_elems * sizeof(float)
-    ggml_tensor * n16 = ggml_view_4d(ctx, n15, S_v, S_v, hv, 1,
+    ggml_tensor * n16 = ggml_view_4d(ctx, n15, S_v, S_v, hv, written,
                                      S_v * sizeof(float),
                                      S_v * S_v * sizeof(float),
                                      S_v * S_v * hv * sizeof(float),
                                      (size_t) n_time * head_values * sizeof(float));
 
     // 17. GGML_OP_VIEW (cache_dst_view)
-    ggml_tensor * n17 = ggml_view_4d(ctx, t.cache_dst, S_v, S_v, hv, 1,
+    ggml_tensor * n17 = ggml_view_4d(ctx, t.cache_dst, S_v, S_v, hv, written,
                                      S_v * sizeof(float),
                                      S_v * S_v * sizeof(float),
                                      S_v * S_v * hv * sizeof(float),
@@ -226,14 +233,15 @@ static void fill_tensors(
     // Conv weights: simple 4-tap box filter
     fill_tensor_uniform(backend, t.conv_w, 0.25f);
 
-    // Conv input: active steps get 1.0f, inactive get garbage
+    // Distinct mapped Q/K head vectors make a wrong V->QK map observable.
     {
         const int64_t n_in_time = capacity + 3;
         std::vector<float> data(channels * n_in_time, 0.0f);
         for (int64_t step = 0; step < capacity; ++step) {
             float v = (step < active) ? 1.0f : inactive_garbage;
             for (int64_t c = 0; c < channels; ++c) {
-                data[c * n_in_time + (step + 3)] = v;
+                const float pattern = hv > 3 ? 1.0f + 0.08f * float(((c / 128) * 7 + (c % 128) * 3) % 17 - 8) : 1.0f;
+                data[c * n_in_time + (step + 3)] = v * pattern;
             }
         }
         ggml_backend_tensor_set(t.conv_in, data.data(), 0, data.size() * sizeof(float));
@@ -255,8 +263,15 @@ static void fill_tensors(
         ggml_backend_tensor_set(t.raw_beta, beta_data.data(), 0, beta_data.size() * sizeof(float));
     }
 
-    // Initial state: identity-like
-    fill_tensor_uniform(backend, t.state_in, 0.01f);
+    if (hv > 3) {
+        std::vector<float> state(ggml_nelements(t.state_in));
+        for (size_t i = 0; i < state.size(); ++i) {
+            state[i] = 0.01f + 0.002f * float(int((i * 13 + i / (128 * 128) * 7) % 19) - 9);
+        }
+        ggml_backend_tensor_set(t.state_in, state.data(), 0, state.size() * sizeof(float));
+    } else {
+        fill_tensor_uniform(backend, t.state_in, 0.01f);
+    }
     fill_tensor_uniform(backend, t.cache_dst, 0.0f);
 
     // Norm and Z gate
@@ -270,10 +285,15 @@ static void fill_tensors(
 static bool test_gdn_multistep_step(
         backend_holder & fix,
         int64_t capacity,
-        int64_t active) {
+        int64_t active,
+        int64_t snapshots = 1,
+        int64_t hk = 1,
+        int64_t hv = 3,
+        const std::vector<uint8_t> & headmap = {}) {
 
     std::fprintf(stderr, "== Test GDN Multistep: Capacity C=%lld, Active A=%lld ==\n",
                  (long long)capacity, (long long)active);
+    const int64_t effective_active = active == 0 ? capacity : active;
 
     const size_t ctx_size = 32 * 1024 * 1024;
 
@@ -289,7 +309,7 @@ static bool test_gdn_multistep_step(
         ggml_context * ctx = ggml_init(params);
         CHECK_TRUE(ctx != nullptr, "ctx init");
 
-        auto t = build_gdn_27_node_graph(ctx, capacity, active);
+        auto t = build_gdn_27_node_graph(ctx, capacity, active, snapshots, hk, hv, headmap);
 
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, t.state_out);
@@ -298,7 +318,7 @@ static bool test_gdn_multistep_step(
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, fix.gpu);
         CHECK_TRUE(buf != nullptr, "gpu buf alloc");
 
-        fill_tensors(fix.gpu, t, capacity, active, -999.0f);
+        fill_tensors(fix.gpu, t, capacity, effective_active, -999.0f);
 
         ggml_status st = ggml_backend_graph_compute(fix.gpu, gf);
         CHECK_TRUE(st == GGML_STATUS_SUCCESS, "gpu graph compute failed");
@@ -318,7 +338,7 @@ static bool test_gdn_multistep_step(
         ggml_context * ctx = ggml_init(params);
         CHECK_TRUE(ctx != nullptr, "ctx init");
 
-        auto t = build_gdn_27_node_graph(ctx, capacity, active);
+        auto t = build_gdn_27_node_graph(ctx, capacity, active, snapshots, hk, hv, headmap);
 
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, t.state_out);
@@ -327,7 +347,7 @@ static bool test_gdn_multistep_step(
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, fix.gpu);
         CHECK_TRUE(buf != nullptr, "gpu buf alloc");
 
-        fill_tensors(fix.gpu, t, capacity, active, +888.0f);
+        fill_tensors(fix.gpu, t, capacity, effective_active, +888.0f);
 
         ggml_status st = ggml_backend_graph_compute(fix.gpu, gf);
         CHECK_TRUE(st == GGML_STATUS_SUCCESS, "gpu graph compute failed");
@@ -345,7 +365,7 @@ static bool test_gdn_multistep_step(
         ggml_context * ctx = ggml_init(params);
         CHECK_TRUE(ctx != nullptr, "ctx init");
 
-        auto t = build_gdn_27_node_graph(ctx, capacity, active);
+        auto t = build_gdn_27_node_graph(ctx, capacity, active, snapshots, hk, hv, headmap);
 
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, t.state_out);
@@ -354,7 +374,7 @@ static bool test_gdn_multistep_step(
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, fix.cpu);
         CHECK_TRUE(buf != nullptr, "cpu buf alloc");
 
-        fill_tensors(fix.cpu, t, capacity, active, -999.0f);
+        fill_tensors(fix.cpu, t, capacity, effective_active, -999.0f);
 
         ggml_status st = ggml_backend_graph_compute(fix.cpu, gf);
         CHECK_TRUE(st == GGML_STATUS_SUCCESS, "cpu graph compute failed");
@@ -375,8 +395,8 @@ static bool test_gdn_multistep_step(
     }
 
     // Invariant 2: Parity between GPU and CPU on active output steps
-    const int64_t head_values = 128 * 3;
-    for (int64_t step = 0; step < active; ++step) {
+    const int64_t head_values = 128 * hv;
+    for (int64_t step = 0; step < effective_active; ++step) {
         float gpu_first = gpu_out_run1[step * head_values];
         float cpu_first = cpu_out[step * head_values];
         float gpu_mid   = gpu_out_run1[step * head_values + head_values / 2];
@@ -425,13 +445,15 @@ int main() {
         int64_t active;
     };
 
-    // Test matrix:
-    // 1. C = 4 baseline suite: A in {1, 2, 4} (100% status quo preserved)
-    // 2. C = 8 maximum capacity envelope suite: A in {1, 2, 4, 8}
+    // A=0 is the op's full-row encoding; check both encodings against CPU.
     const std::vector<test_case> cases = {
+        {4, 0},
         {4, 1},
         {4, 2},
         {4, 4},
+        {7, 0},
+        {7, 7},
+        {8, 0},
         {8, 1},
         {8, 2},
         {8, 4},
@@ -444,6 +466,28 @@ int main() {
                          (long long)tc.active, (long long)tc.capacity);
             return 1;
         }
+    }
+    const std::vector<uint8_t> tp5_headmap{ 0, 1, 2, 3, 1, 2, 3, 0, 1, 2 };
+    // The partial K4 case must leave padding untouched and reverse-map only two snapshots.
+    for (int64_t active : { 0, 2, 4 }) {
+        if (!test_gdn_multistep_step(fix, 4, active, 4, 4, 10, tp5_headmap)) {
+            std::fprintf(stderr, "FAILED on mapped TP5 GDN K=4 active=%lld\n", (long long)active);
+            return 1;
+        }
+    }
+    if (!test_gdn_multistep_step(fix, 7, 0, 1, 4, 10, tp5_headmap)) {
+        std::fprintf(stderr, "FAILED on mapped TP5 GDN K=1 full-active seven-row graph\n");
+        return 1;
+    }
+    for (int64_t active : { 0, 3, 7 }) {
+        if (!test_gdn_multistep_step(fix, 7, active, 7)) {
+            std::fprintf(stderr, "FAILED on GDN K=7 rollback bank active=%lld\n", (long long)active);
+            return 1;
+        }
+    }
+    if (!test_gdn_multistep_step(fix, 7, 0, 7, 4, 10, tp5_headmap)) {
+        std::fprintf(stderr, "FAILED on mapped TP5 GDN K=7 rollback bank\n");
+        return 1;
     }
 
     std::printf("test-vulkan-gdn-multistep: ALL TESTS PASSED (Vulkan GPU verified)\n");

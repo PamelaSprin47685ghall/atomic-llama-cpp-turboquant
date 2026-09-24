@@ -251,10 +251,12 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 #endif
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-            const uint ib = (ibi + col)/QUANT_K; // block index
 #ifdef HC_UP_FOLD
+            const uint weight_row = (first_row % p.stride_d) + n * p.stride_d;
+            const uint ib = (weight_row * p.ncols + col)/QUANT_K; // block index
             ibi += p.ncols * p.stride_d;
 #else
+            const uint ib = (ibi + col)/QUANT_K; // block index
             ibi += p.ncols;
 #endif
 
@@ -555,7 +557,7 @@ void main() {
 
 #if defined(HC_UP_FOLD) && defined(HC_UP_R320)
     // Specialized fixed-tail R320 up fold: one row per workgroup as native.
-    if (first_row < p.stride_d) {
+    if (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z < p.stride_d) {
         hc_up_r320_compute(first_row);
     }
     return;
@@ -569,7 +571,7 @@ void main() {
         compute_outputs(first_row, rows);
     }
 #elif defined(HC_UP_FOLD)
-    if (first_row < p.stride_d) {
+    if (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z < p.stride_d) {
         compute_outputs(first_row, NUM_ROWS);
     }
 #else

@@ -128,6 +128,9 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-rerot-dag-reference
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/rerot-dag-reference.py)
     set_tests_properties(test-rerot-dag-reference PROPERTIES LABELS "python" TIMEOUT 60)
+    add_test(NAME test-gpu-recovery-mock
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-gpu-recovery-mock.py)
+    set_tests_properties(test-gpu-recovery-mock PROPERTIES LABELS "recovery;python" TIMEOUT 30)
 endif()
 
 # build test-tokenizer-0 target once and add many tests
@@ -138,6 +141,9 @@ llama_test(test-predefined-capacity LABEL "predefined;cpu")
 add_executable(test-mtp-workspace test-mtp-workspace.cpp)
 target_link_libraries(test-mtp-workspace PRIVATE llama llama-common)
 llama_test(test-mtp-workspace LABEL "predefined;cpu")
+
+add_test(NAME test-gpu-recovery COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-gpu-recovery.sh)
+set_tests_properties(test-gpu-recovery PROPERTIES LABELS "recovery;cpu" TIMEOUT 15)
 
 add_executable(test-target-capacity test-target-capacity.cpp)
 target_include_directories(test-target-capacity PRIVATE ${PROJECT_SOURCE_DIR}/src)

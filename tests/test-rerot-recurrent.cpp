@@ -1191,6 +1191,54 @@ static void test_hand_checkpoint_restore() {
     CHECK(snap_seq(mem, 0) == before);
 }
 
+static void test_single_cell_reset_scope() {
+    stub_model model;
+    model.hparams.n_layer_all = 2;
+    model.hparams.n_embd = 8;
+    model.hparams.n_embd_r_impl = 16;
+    model.hparams.ssm_d_state = 4;
+    model.hparams.ssm_d_inner = 8;
+
+    for (uint32_t cell_count : { 1u, 2u }) {
+        llama_memory_recurrent mem(model, GGML_TYPE_F32, GGML_TYPE_F32,
+            false, cell_count, cell_count, /*n_rs_seq=*/ 3,
+            /*n_brain_max=*/ 0, /*n_hand_max=*/ 0, nullptr);
+        CHECK(admit(mem, 0, 0, 1));
+        if (cell_count == 2) {
+            CHECK(admit(mem, 1, 1, 1));
+        }
+        const int32_t removed_row = mem.tails[0];
+        const int32_t peer_row = cell_count == 2 ? mem.tails[1] : -1;
+        CHECK(removed_row >= 0 && (cell_count == 1 || (peer_row >= 0 && peer_row != removed_row)));
+        if (removed_row < 0 || (cell_count == 2 && (peer_row < 0 || peer_row == removed_row))) {
+            return;
+        }
+
+        std::vector<ggml_tensor *> tensors = mem.r_l;
+        tensors.insert(tensors.end(), mem.s_l.begin(), mem.s_l.end());
+        for (ggml_tensor * tensor : tensors) {
+            std::vector<uint8_t> initial(ggml_nbytes(tensor), 0x5a);
+            ggml_backend_tensor_set(tensor, initial.data(), 0, initial.size());
+        }
+
+        CHECK(mem.seq_rm(0, 0, -1));
+        for (ggml_tensor * tensor : tensors) {
+            const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+            std::vector<uint8_t> actual(ggml_nbytes(tensor));
+            ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+            for (uint32_t snapshot = 0; snapshot < 4; ++snapshot) {
+                const size_t base = (size_t) snapshot * cell_count * row_bytes;
+                const auto * removed = actual.data() + base + (size_t) removed_row * row_bytes;
+                CHECK(std::all_of(removed, removed + row_bytes, [](uint8_t byte) { return byte == 0; }));
+                if (peer_row >= 0) {
+                    const auto * peer = actual.data() + base + (size_t) peer_row * row_bytes;
+                    CHECK(std::all_of(peer, peer + row_bytes, [](uint8_t byte) { return byte == 0x5a; }));
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     test_error_metric_rejects_invalid_outputs();
     if (argc == 2 && std::strcmp(argv[1], "--trajectory-only") == 0) {
@@ -1202,6 +1250,7 @@ int main(int argc, char ** argv) {
     test_child_persistent_native_trajectory();
     test_child_persistent_native_trajectory(2);
     test_child_snapshot_rollback();
+    test_single_cell_reset_scope();
     std::fprintf(stderr, "=== RERoT Recurrent Parking COW Tests ===\n");
     test_hand_checkpoint_restore();
     test_fence_replay_recurrent_oracle();
