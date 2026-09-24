@@ -29,7 +29,8 @@
   "six_pen_gpu_evidence": "Paired B1 GPU trace at 0:26.709-0:26.710 recorded node 1..6 at tok_idx 0..5 in one sampled batch; node 7 time-sliced at 0:26.903. See route-evidence.log. The separate repaired smoke shows the same at 0:29.661.",
   "additional_json_route_checks": [
     {"prompt": "Answer six independent arithmetic questions: calculate 13*17, 21*19, 8*9, 7*12, 6*15, and 14*11. Give each product and their total.", "actual_strategy": "simple", "wall_seconds": 8.9, "completion_tokens": 199, "probe_tokens": 66, "http_status": 200},
-    {"prompt": "Prepare a concise reference sheet with one short paragraph for each of six independent topics: Raft leader election, HTTP cache revalidation, B-tree node splits, Byzantine consensus, Bloom filters, and TCP congestion control. Finish with two cross-topic design tradeoffs.", "actual_strategy": "simple", "wall_seconds": 51.0, "completion_tokens": 1448, "probe_tokens": 66, "http_status": 200}
+    {"prompt": "Prepare a concise reference sheet with one short paragraph for each of six independent topics: Raft leader election, HTTP cache revalidation, B-tree node splits, Byzantine consensus, Bloom filters, and TCP congestion control. Finish with two cross-topic design tradeoffs.", "actual_strategy": "simple", "wall_seconds": 51.0, "completion_tokens": 1448, "probe_tokens": 66, "http_status": 200},
+    {"prompt": "I need parallel independent sub-questions, not one serial answer. Treat each calculation as a separate worker task, then combine the results: 13*17, 21*19, 8*9, 7*12, 6*15, 14*11. Report all six products and the total.", "actual_strategy": "simple", "wall_seconds": 17.0, "completion_tokens": 437, "probe_tokens": 66, "http_status": 200}
   ],
   "verification": {"ctest_rerot_xkv_flashprefill": "52/52 passed", "test_vulkan_command_replay": "24 tests passed", "post_fix_gpuvm_faults_observed": 0, "xorg_alive_after_gpu_smoke": true}
 }
