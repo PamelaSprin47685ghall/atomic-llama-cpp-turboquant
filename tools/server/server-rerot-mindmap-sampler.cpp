@@ -261,7 +261,7 @@ bool sampler_state::operator==(const sampler_state & other) const {
 
 advance_status advance(sampler_state & st, const char * piece, size_t n,
                        const sampler_limits & lim) {
-    if (st.budget_failed) {
+    if (st.budget_failed || st.utf8_partial_len >= sizeof(st.utf8_partial)) {
         return advance_status::dead;
     }
     const uint8_t * data = reinterpret_cast<const uint8_t *>(piece);
@@ -401,12 +401,11 @@ advance_status advance(sampler_state & st, const char * piece, size_t n,
             // Incomplete: carry the bytes of THIS piece forward.
             const size_t have = st.utf8_partial_len;
             const size_t take2 = n - i;
-            if (have + take2 > 4) {
+            if (have >= sizeof(st.utf8_partial) ||
+                take2 > sizeof(st.utf8_partial) - have) {
                 return advance_status::dead; // cannot be a valid sequence
             }
-            for (size_t k = 0; k < take2; ++k) {
-                st.utf8_partial[have + k] = data[i + k];
-            }
+            std::memcpy(st.utf8_partial + have, data + i, take2);
             st.utf8_partial_len = have + take2;
             st.utf8_partial_need = s.need;
             i = n;
@@ -417,9 +416,6 @@ advance_status advance(sampler_state & st, const char * piece, size_t n,
         }
         // Space is the only permitted separator; anything else printable that
         // the strict parser's `label_ok` would reject must die here too.
-        if (s.cp != 0x20 && !scalar_allowed(s.cp)) {
-            return advance_status::dead;
-        }
         if (s.cp == 0x20) {
             if (st.line_label.empty()) {
                 return advance_status::dead; // leading space inside the label
@@ -433,6 +429,9 @@ advance_status advance(sampler_state & st, const char * piece, size_t n,
             // buffer first, then the `s.len` bytes this piece contributed.
             uint8_t whole[4];
             const size_t carried = st.utf8_partial_len;
+            if (s.len > sizeof(whole) - carried) {
+                return advance_status::dead;
+            }
             for (size_t k = 0; k < carried; ++k) {
                 whole[k] = st.utf8_partial[k];
             }

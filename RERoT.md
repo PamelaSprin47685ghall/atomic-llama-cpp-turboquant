@@ -2741,3 +2741,11 @@ cell，记录 (idx, storage, meta, sig)。每个 view group 由「扫描」退�
 - **不可混用口径**：严禁将近似算法（Q8）的收益计入严格等义优化，亦不可将 CPU 布局阶段的吞吐倍率（如 3.68×）直接等同于整机端到端加速；
 - **生产闭环唯一标准**：任何待晋级特性必须通过 `scripts/rerot-throughput-gate.py` 的 A/B/B/A 配对跑分，以客户端每秒交付的有效 committed tokens 与完整请求墙钟为唯一黄金准则；
 - **文档闭环**：本文档与 `缺口.md` 共同构成本阶段 RERoT 架构与未决事项的自包含完整事实源。
+
+### 22.3 MM-R1 Bonsai-2 单卡 GPU 修复与真实路由对照（2026-09-24）
+
+同一 27B PQ2_0 GGUF、RX 6800 `Vulkan0`、`-np 6 --rerot-pens 6`、seed 20260923。七叶 mindmap 使第七名 worker 与前六名轮换；`GGML_VK_CMD_REPLAY=0` 仍复现硬复位，故不能归因于 replay。RADV hang dump 定位到 `CmdCopyBuffer` 读取已解绑的图分配器 VkBuffer：拷贝 3,973,120 字节，恰为四行 logits × 248320 词 × F32。`ggml_vk_buffer_read_2d_async` 对 pinned-host 目标只录制异步拷贝，局部 `vk_buffer` 所有者却在录制后离开；下一图的分配器可在 GPU 执行该拷贝前释放源。现由 `vk_context_struct::copy_buffers` 留住异步读/写两端的 VkBuffer，直到 backend fence 完成并清理该 context；先前试验性的 RERoT 强制同步及 split-K 预分配改动未解决故障，已移除。原始故障地址、BO 解绑记录和 copy 指令见 `artifacts/mm-r1/2026-09-24-bonsai-gpu/gpu-fault-evidence.json` 指向的 RADV dump。
+
+修复后的原复现提示 `Compute 13*17 and 21*19, then give both products and their sum.` 完整 **HTTP 200**：86.7 s / 1390 completion tokens，答案 221、399、620；同一批次 trace 在 0:29.661 显示 node 1..6 占据 `tok_idx=0..5`，第七叶实际轮换，非只申请六个空 pen。该次之后未见新增 GPUVM fault，Xorg 存活。这是该设备/提示的单次验证，不是所有硬件与长度的稳定性证明。
+
+相同二进制、模型、提示、seed、六 pen，按 JSON / mindmap / mindmap / JSON **各重新启动进程**的 A/B/B/A 完整请求墙钟为 **6.3 / 71.4 / 70.8 / 6.3 s**；四次答案均正确。JSON 实际选 `simple`（68 probe tokens、0 frame tokens、124 completion tokens），mindmap 选七叶（295 probe、2282 frame、1014 completion tokens），所以这组数据证明的是**当前真实路由的产品代价**，不是同工作量 DAG 算法的吞吐倍率；71.1/6.3 不能称为纯 wire 性能差。另两条六算术子题和六主题提示在 JSON 模式也实际选 `simple`，故本轮**没有**有效的 JSON-DAG 对等路由性能证据，不予默认晋级或净收益宣称。完整配对数据与配置见同一 artifact 目录。

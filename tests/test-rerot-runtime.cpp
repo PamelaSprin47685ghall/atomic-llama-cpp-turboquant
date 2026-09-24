@@ -3602,8 +3602,8 @@ static void test_mindmap_rejects_invalid_plans_fail_closed() {
         std::string("```mermaid\nmindmap\n  R\n  S\n```\n"),
         // skipped indentation level
         std::string("```mermaid\nmindmap\n  R\n      X\n```\n"),
-        // depth 5
-        std::string("```mermaid\nmindmap\n  R\n    A\n      B\n        C\n          D\n```\n"),
+        // Seven levels exceed the parser's six-level budget.
+        std::string("```mermaid\nmindmap\n  R\n    A\n      B\n        C\n          D\n            E\n              F\n```\n"),
         // label with a forbidden scalar
         std::string("```mermaid\nmindmap\n  R\n    [leaf]\n```\n"),
         // CRLF
@@ -4551,6 +4551,12 @@ static void test_dag_w_gt_p_yield_without_seal() {
           ep->starting.count(2) || ep->starting.count(3) ||
           ep->running.count(2) || ep->running.count(3));
 
+    // A freshly admitted worker has no slice to preserve yet. Commit one
+    // token before asking the scheduler to swap its pen to a queued peer.
+    CHECK(!runtime.yield_dag_pen_for_ready(ep_id));
+    CHECK(commit_generated(runtime, ep_id, first,
+        runtime.node(ep_id, first)->storage_pos_next, "A"));
+
     auto find_other_started = [&]() -> llama_rerot_node_id {
         for (llama_rerot_node_id nid : {llama_rerot_node_id(2), llama_rerot_node_id(3)}) {
             const auto * dn = ep->document.node(nid);
@@ -4567,8 +4573,7 @@ static void test_dag_w_gt_p_yield_without_seal() {
         return LLAMA_REROT_NODE_INVALID;
     };
 
-    // complete_admission may already have yielded; still require a yield when
-    // the first worker holds the only pen. First must not need is_sealed.
+    // First must not need is_sealed to yield its committed slice.
     if (runtime.node(ep_id, first)->physical_slot >= 0) {
         CHECK(runtime.yield_dag_pen_for_ready(ep_id));
     }
@@ -4597,6 +4602,90 @@ static void test_dag_w_gt_p_yield_without_seal() {
     CHECK(dag_view_has_run(view_first, run_a));
     CHECK(dag_view_has_run(view_second, run_a));
     CHECK(dag_view_has_run(view_second, run_b));
+}
+
+static void test_dag_yield_requires_fresh_commit_after_resume() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(1);
+    const uint64_t ep_id = runtime.adopt_root(114, 114, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "A", "intent": "Fact A"}, {"id": "B", "intent": "Fact B"}],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    dag_unbind_planner_if_bound(runtime, ep_id);
+
+    llama_rerot_node_id first = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &first));
+    CHECK(runtime.complete_admission(ep_id, first));
+    const auto * lane = runtime.node(ep_id, first);
+    CHECK(lane != nullptr);
+    CHECK(commit_generated(runtime, ep_id, first, lane->storage_pos_next, "first"));
+    CHECK(runtime.episode(ep_id)->dag_step_committed.count(first) != 0);
+    CHECK(!runtime.finish_frontier(ep_id).hard_aborted); // only one scheduling round
+    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
+    CHECK(runtime.resume_pen(ep_id, first, 0, 2));
+    // The cohort still records the previous token, but no row was committed
+    // by this binding. Re-yielding it would spin without ever running B.
+    CHECK(!runtime.yield_dag_pen_for_ready(ep_id));
+    CHECK(runtime.node(ep_id, first)->physical_slot == 0);
+}
+
+static void test_dag_suspended_starting_resumes_fixed_entry() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(1);
+    const uint64_t ep_id = runtime.adopt_root(115, 115, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "A", "intent": "Fact A"}, {"id": "B", "intent": "Fact B"}],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    dag_unbind_planner_if_bound(runtime, ep_id);
+
+    llama_rerot_node_id first = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &first));
+    CHECK(runtime.episode(ep_id)->starting.count(first) != 0);
+    CHECK(commit_private(runtime, ep_id, first,
+        runtime.node(ep_id, first)->storage_pos_next));
+    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
+    CHECK(runtime.episode(ep_id)->suspended.count(first) != 0);
+    CHECK(runtime.node(ep_id, first)->suspended_from_starting);
+    const auto fp = test_state_fingerprints();
+    std::vector<uint8_t> blob;
+    CHECK(runtime.save_episode(ep_id, fp, &blob, &err));
+    server_rerot_runtime restored(nullptr);
+    restored.set_pen_capacity(1);
+    uint64_t restored_id = 0;
+    CHECK(restored.load_episode(blob.data(), blob.size(), fp, &restored_id, &err));
+    CHECK(restored.node(restored_id, first)->suspended_from_starting);
+    CHECK(restored.resume_pen(restored_id, first, 0, 2));
+    CHECK(restored.episode(restored_id)->document.node(first)->state == llama_rerot_node_state::starting);
+    CHECK(restored.complete_admission(restored_id, first));
+
+    CHECK(runtime.resume_pen(ep_id, first, 0, 2));
+    CHECK(runtime.episode(ep_id)->starting.count(first) != 0);
+    CHECK(runtime.episode(ep_id)->running.count(first) == 0);
+    CHECK(runtime.episode(ep_id)->document.node(first)->state == llama_rerot_node_state::starting);
+    CHECK(runtime.complete_admission(ep_id, first));
+    CHECK(runtime.episode(ep_id)->running.count(first) != 0);
 }
 
 static void test_dag_w_gt_p_logical_cohort_and_time_slice_certification() {
@@ -5366,6 +5455,8 @@ static void test_dag_seal_evicts_no_bound_peer() {
     CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
     CHECK(a == 1);
     CHECK(runtime.complete_admission(ep_id, a));
+    CHECK(commit_generated(runtime, ep_id, a,
+        runtime.node(ep_id, a)->storage_pos_next, "A"));
     // Park A so B can start; B's host work has not run yet.
     CHECK(runtime.yield_dag_pen_for_ready(ep_id));
     auto * ep = runtime.episode(ep_id);
@@ -5427,6 +5518,8 @@ static void test_dag_yield_force_under_resource_pressure() {
     CHECK(ep != nullptr && ep->suspended.empty());
 
     // Forced yield under pressure suspends the bound worker anyway.
+    CHECK(commit_generated(runtime, ep_id, a,
+        runtime.node(ep_id, a)->storage_pos_next, "A"));
     CHECK(runtime.yield_dag_pen_for_ready(ep_id, true));
     CHECK(ep->suspended.count(a) != 0);
     CHECK(ep->document.node(a)->state == llama_rerot_node_state::ready_suspended);
@@ -7906,6 +7999,8 @@ int main() {
     test_dag_c0_probe_to_simple_continuation_and_grammar_isolation();
     test_dag_admission_view_survival();
     test_dag_w_gt_p_yield_without_seal();
+    test_dag_yield_requires_fresh_commit_after_resume();
+    test_dag_suspended_starting_resumes_fixed_entry();
     test_dag_w_gt_p_logical_cohort_and_time_slice_certification();
     test_dag_frozen_read_publish_epoch();
     test_dag_logical_step_hides_foreign_pending();

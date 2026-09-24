@@ -1,0 +1,13 @@
+A_json, paired arm A1:
+0.39.242.429 I srv  rerot_try_fi: rerot.trace.probe_plan: episode=1 tokens=68 strategy=simple text={"strategy": "simple", "payload": {}}
+
+B1_mindmap, paired arm B1:
+0.12.999.328 I srv  rerot_try_fi: rerot.trace.probe_plan: episode=1 tokens=295 strategy=mindmap text=```mermaid\nmindmap\n  root\n    13*17\n      13*17 = 221\n    21*19\n      21*19 = 399\n    sum\n      221\n      399\n      221\n      399\n      620\n```\n
+0.16.447.023 I srv  rerot_finish: RERoT DAG start: episode=1 nodes=9 released_slot=5
+0.26.709.462 I srv  rerot_sample: rerot.trace.sample episode=1 node=1 serial=0 tok_idx=0 token=1156 piece= user
+0.26.709.675 I srv  rerot_sample: rerot.trace.sample episode=1 node=2 serial=0 tok_idx=1 token=1156 piece= user
+0.26.709.869 I srv  rerot_sample: rerot.trace.sample episode=1 node=3 serial=0 tok_idx=2 token=4439 piece= asked
+0.26.710.059 I srv  rerot_sample: rerot.trace.sample episode=1 node=4 serial=0 tok_idx=3 token=369 piece= is
+0.26.710.248 I srv  rerot_sample: rerot.trace.sample episode=1 node=5 serial=0 tok_idx=4 token=2117 piece=map
+0.26.710.435 I srv  rerot_sample: rerot.trace.sample episode=1 node=6 serial=0 tok_idx=5 token=4439 piece= asked
+0.26.903.988 I srv  rerot_sample: rerot.trace.sample episode=1 node=7 serial=0 tok_idx=0 token=2117 piece=map

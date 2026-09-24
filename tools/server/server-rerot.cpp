@@ -1616,6 +1616,7 @@ bool server_rerot_runtime::suspend_pen(rerot_pen_id pen_id) {
     }
 
     // Preserve hand/private state + sampler/MTP binding in the node runtime (§B.8.4)
+    n->suspended_from_starting = ep->starting.count(nid) != 0;
     ep->running.erase(nid);
     ep->starting.erase(nid);
     ep->suspended.insert(nid);
@@ -1672,7 +1673,9 @@ bool server_rerot_runtime::resume_pen(
         return false;
     }
 
-    p.state = server_pen_state::running;
+    p.state = n->suspended_from_starting
+        ? server_pen_state::allocated
+        : server_pen_state::running;
     p.person = episode_id;
     p.episode_id = episode_id;
     p.node_id = node_id;
@@ -1693,13 +1696,23 @@ bool server_rerot_runtime::resume_pen(
     }
 
     ep->suspended.erase(node_id);
-    ep->running.insert(node_id);
+    if (n->suspended_from_starting) {
+        ep->starting.insert(node_id);
+    } else {
+        ep->running.insert(node_id);
+    }
+    n->committed_since_bind = false;
     const llama_rerot_node_state resume_state = ep->is_dag
-        ? llama_rerot_node_state::running
+        ? (n->suspended_from_starting
+            ? llama_rerot_node_state::starting
+            : llama_rerot_node_state::running)
         : (n->planner_armed
             ? llama_rerot_node_state::planning
             : llama_rerot_node_state::terminal_running);
-    ep->document.set_node_state(node_id, resume_state);
+    if (!ep->document.set_node_state(node_id, resume_state)) {
+        return fail_episode(*ep, "failed to restore RERoT suspended admission state");
+    }
+    n->suspended_from_starting = false;
 
     ep->topology_barrier_pending = true;
     ++ep->topology_epoch;
@@ -2647,6 +2660,7 @@ bool server_rerot_runtime::commit_token(
         return false;
     }
     if (current->is_dag) {
+        current_node->committed_since_bind = true;
         note_dag_step_commit(*current, node_id);
     }
 
@@ -3800,6 +3814,19 @@ bool server_rerot_runtime::yield_dag_pen_for_ready(uint64_t episode_id, bool res
         if (require_committed && ep->dag_step_committed.count(nid) == 0) {
             return false;
         }
+        // A cohort commit from a previous binding is not progress by this
+        // executor. A just-resumed committed lane cannot be yielded again
+        // before it writes a new row. Uncommitted lanes retain the existing
+        // storage-position rule below (they may be deliberately time-sliced).
+        if (ep->dag_step_committed.count(nid) != 0 && !n->committed_since_bind) {
+            return false;
+        }
+        // A lane that has produced nothing at all is even less eligible: it
+        // still needs the CPU to reach its first token.
+        if (n->storage_pos_next <= ep->c_base.n_prompt_tokens &&
+            ep->dag_step_committed.count(nid) == 0) {
+            return false;
+        }
         victim_pen = n->pen_id;
         victim = n;
         return true;
@@ -4331,6 +4358,7 @@ bool server_rerot_runtime::admit_next_child(
 
     current->ready_queue.erase(best_it);
     current->starting.insert(child_id);
+    child->committed_since_bind = false;
     if (!current->document.set_node_state(child_id, llama_rerot_node_state::starting)) {
         return fail_episode(*current, "failed to enter RERoT child STARTING state");
     }
@@ -5736,6 +5764,7 @@ std::vector<uint8_t> server_rerot_episode_save(
         w.u32(node.remaining_preds);
         w.u8(static_cast<uint8_t>(node.stage_role));
         w.u8(node.is_sealed ? 1 : 0);
+        w.u8(node.suspended_from_starting ? 1 : 0);
         w.str(node.string_id);
         w.str(node.intent);
         w.u8(static_cast<uint8_t>(node.completion_origin));
@@ -5790,6 +5819,7 @@ struct rerot_runtime_blob {
     uint32_t remaining_preds = 0;
     llama_rerot_stage_role stage_role = llama_rerot_stage_role::planner;
     bool is_sealed = false;
+    bool suspended_from_starting = false;
     std::string string_id;
     std::string intent;
     llama_rerot_event_origin completion_origin = llama_rerot_event_origin::unknown;
@@ -6177,16 +6207,19 @@ bool server_rerot_episode_load(
         rb.remaining_preds = r.u32();
         const uint8_t stage_role = r.u8();
         const uint8_t sealed = r.u8();
+        const uint8_t suspended_starting = r.u8();
         rb.string_id = r.str();
         rb.intent = r.str();
         const uint8_t origin = r.u8();
         if (!r.ok || stage_role > static_cast<uint8_t>(llama_rerot_stage_role::synthesis) ||
-            sealed > 1 || origin > static_cast<uint8_t>(llama_rerot_event_origin::forced_abort)) {
+            sealed > 1 || suspended_starting > 1 ||
+            origin > static_cast<uint8_t>(llama_rerot_event_origin::forced_abort)) {
             r.ok = false;
             break;
         }
         rb.stage_role = static_cast<llama_rerot_stage_role>(stage_role);
         rb.is_sealed = sealed != 0;
+        rb.suspended_from_starting = suspended_starting != 0;
         rb.completion_origin = static_cast<llama_rerot_event_origin>(origin);
         if (!r.ok || rb.storage_pos_next < 0 || rb.physical_slot < -1 ||
             rb.exec_seq < -1 || rb.parked_seq < -1) {
@@ -6371,9 +6404,15 @@ bool server_rerot_episode_load(
         node.remaining_preds = sb.remaining_preds;
         node.stage_role = sb.stage_role;
         node.is_sealed = sb.is_sealed;
+        node.suspended_from_starting = sb.suspended_from_starting;
         node.string_id = sb.string_id;
         node.intent = sb.intent;
         node.completion_origin = sb.completion_origin;
+        if (node.suspended_from_starting &&
+            (std::find(suspended_vec.begin(), suspended_vec.end(), node.id) == suspended_vec.end() ||
+             node_blobs[i].state != llama_rerot_node_state::ready_suspended)) {
+            return rerot_state_set_error(error_out, "RERoT episode load refused: suspended STARTING phase is not parked");
+        }
         const auto check_ref = [&](const std::optional<llama_rerot_run_id> & ref, llama_rerot_visibility want) {
             if (!ref.has_value()) {
                 return true;

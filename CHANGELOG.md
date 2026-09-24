@@ -63,6 +63,15 @@ full-model correctness acceptance; repaired-model measurements are required.
   five-GPU layer model now produces bitwise-identical replay/non-replay logits
   across 11 positions and the complete 248320-token vocabulary.
 
+- **Vulkan async output copies retain their buffers.** A queued readback of
+  four logits rows could outlive the graph allocator's source VkBuffer as
+  RERoT switched between six active pens and a seventh parked worker. Pinned
+  host transfers now retain both VkBuffer owners until the queue fence retires
+  the recording context. The Bonsai-2 seven-leaf GPU request that previously
+  triggered a CPG use-after-free now completes with the correct answer and no
+  new GPUVM fault. Mindmap remains opt-in; its paired wall time on that prompt
+  is slower than the JSON baseline, which chose a simple single-answer route.
+
 - **Lazy tensor payload and lifetime.** On-demand tables remain mapped after
   loader retirement, including when other weights use non-mmap loading.
   Preallocated fallback buffers are loaded instead of silently left empty.

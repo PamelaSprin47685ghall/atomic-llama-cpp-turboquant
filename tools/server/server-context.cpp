@@ -3554,6 +3554,14 @@ llama_tokens rerot_native_fixed_entry_tokens(
         const llama_token token = forced
             ? slot.rerot_injection_tokens[slot.rerot_injection_cursor]
             : slot.sampled;
+        if (token == LLAMA_TOKEN_NULL) {
+            SRV_ERR("RERoT missing input: episode=%" PRIu64 " node=%u slot=%d i_batch=%d injection=%d cursor=%zu/%zu\n",
+                slot.rerot_episode_id, slot.rerot_node_id, slot.id, slot.i_batch,
+                static_cast<int>(slot.rerot_injection), slot.rerot_injection_cursor,
+                slot.rerot_injection_tokens.size());
+            rerot->hard_abort(slot.rerot_episode_id, "rerot_state_error: Lane has no pending input token");
+            return false;
+        }
         const std::string bytes = common_token_to_piece(ctx_tgt, token, true);
 
         std::optional<server_rerot_token_plan> plan;
@@ -4094,8 +4102,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
             rerot_note_parallel_start(episode_id);
         }
 
-        SRV_INF("RERoT Lane admitted: episode=%" PRIu64 " node=%u slot=%d queued=%zu\n",
-            episode_id, node_id, slot.id, episode->ready_queue.size());
         return true;
     }
 
@@ -4107,46 +4113,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
         auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
         if (!episode || episode->hard_aborted) {
             return rerot_admit_ready_result::failed;
-        }
-
-        // Cohort-barrier deadlock guard.
-        //
-        // Failure mode observed: a logical step's members split into lanes that
-        // hold a pen in STARTING (their fixed entry never received a batch row)
-        // and lanes that were suspended waiting for the step to advance. Both
-        // sides wait for the other, no token is ever produced, and the decode
-        // loop spins at 100% CPU until the client times out.
-        //
-        // The state is detectable exactly: the cohort is open, it is not
-        // complete, NOTHING is RUNNING, and no admitted lane is currently
-        // generating on its executor. In that state no admission can make
-        // progress, so failing closed with a diagnosis is strictly better than
-        // an unbounded spin. `starting` alone is NOT treated as runnable here:
-        // a lane whose frame never advances holds its pen forever without ever
-        // producing a token.
-        if (episode->is_dag && !episode->dag_step_cohort.empty() &&
-            !rerot->dag_logical_step_complete(episode_id) &&
-            !episode->serial_tail) {
-            bool any_running = false;
-            for (const auto nid : episode->running) {
-                if (nid != 0) { any_running = true; break; }
-            }
-            bool any_generating = false;
-            for (auto & candidate : slots) {
-                if (candidate.rerot_internal &&
-                    candidate.rerot_episode_id == episode_id &&
-                    candidate.state == SLOT_STATE_GENERATING) {
-                    any_generating = true;
-                    break;
-                }
-            }
-            if (!any_running && !any_generating) {
-                rerot->hard_abort(
-                    episode_id,
-                    "rerot_scheduler_error: cohort barrier deadlock (no running lane and no "
-                    "generating executor while a logical step is open)");
-                return rerot_admit_ready_result::failed;
-            }
         }
 
         // pen_capacity is the hard in-flight-lane bound. The DAG activa-
@@ -4172,6 +4138,15 @@ llama_tokens rerot_native_fixed_entry_tokens(
         }
 
         while (!episode->suspended.empty() || !episode->ready_queue.empty()) {
+            // Admission can bind several peers in this loop. Once the last
+            // free pen is filled, return to decode so those STARTING lanes
+            // actually consume their frames. Continuing into the pressure
+            // branch below would yield one and resume another indefinitely
+            // (6/6 recurrent rows, W>P, unfinished logical cohort).
+            if (episode->is_dag &&
+                rerot->pens_for_person(episode_id).size() >= rerot->pen_capacity()) {
+                break;
+            }
             // Select the idle executor first and drop its stale prompt-cache
             // refs BEFORE measuring recurrent pressure: an idle slot's
             // retained refs would otherwise read as live pressure and force
@@ -5094,7 +5069,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
         if (episode->is_dag) {
             rerot->yield_dag_pen_for_ready(episode_id);
             rerot_idle_unbound_slots(episode_id);
-
         }
 
         if (rerot_admit_ready(episode_id) == rerot_admit_ready_result::failed) {
@@ -10163,6 +10137,21 @@ llama_tokens rerot_native_fixed_entry_tokens(
             });
         }
 
+        if (rerot_ok && !rerot_capture_needed) {
+            // A forced frame has no logit row to sample, so the capture pass
+            // above did not synchronize. finish_frontier may retire sequences,
+            // and the subsequent DAG yield/admission copies and clears KV and
+            // recurrent rows. Do not mutate those buffers while this slice's
+            // asynchronous Vulkan graph is still reading them.
+            for (const uint64_t episode_id : rerot_committed_episodes) {
+                const auto * episode = rerot->episode(episode_id);
+                if (episode && episode->is_dag) {
+                    llama_synchronize(ctx_tgt);
+                    break;
+                }
+            }
+        }
+
         if (rerot_ok) {
             for (const uint64_t episode_id : rerot_committed_episodes) {
                 if (!rerot_handle_finished_frontier(episode_id)) {
@@ -10208,16 +10197,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
 
             std::string rerot_trace_batch;
             iterate(slots, [&](server_slot & slot) {
-                if (slot.rerot_internal && slot.task && slot.task->params.rerot_trace) {
-                    rerot_trace_batch += string_format(
-                        "check episode=%" PRIu64
-                        " node=%u state=%d i_batch=%d off=%d n=%d inside=%d injection=%d serial=%d\n",
-                        slot.rerot_episode_id, slot.rerot_node_id, slot.state,
-                        slot.i_batch, off, n_batch_tokens,
-                        is_inside_view(slot.i_batch) ? 1 : 0,
-                        static_cast<int>(slot.rerot_injection),
-                        slot.rerot_serial_tail ? 1 : 0);
-                }
                 if (!slot.rerot_internal || slot.state != SLOT_STATE_GENERATING ||
                     !is_inside_view(slot.i_batch)) {
                     return;
@@ -11636,6 +11615,15 @@ void server_routes::init_routes() {
             props["xkv_landmark_seed"] = ss_lm.str();
         }
         props["rerot_frontier"] = std::string(llama_rerot_frontier_mode_name(params.rerot_frontier));
+        props["rerot"] = {
+            { "enabled", params.rerot_enabled },
+            { "wire", params.rerot_enabled ? params.rerot_plan_wire : "none" },
+            { "final", params.rerot_enabled ? params.rerot_final_mode : "plain" },
+            { "order", !params.rerot_enabled ? "plain" :
+                params.rerot_plan_wire == "mindmap" ? "hierarchical-cyclic-dfs" : "kahn" },
+            { "deps", !params.rerot_enabled ? "none" :
+                params.rerot_plan_wire == "mindmap" ? "none" : "model" },
+        };
         props["spec_draft_n_max"] = params.speculative.draft.n_max;
         props["triattention_ratio"] = "3/32";
         props["tri_recent_window"] = 128;

@@ -140,18 +140,22 @@ static void test_legal_documents_complete_byte_by_byte() {
 
 static void test_illegal_documents_die() {
     sampler_limits lim;
+    std::string too_many_leaves = "  R\n";
+    for (int i = 0; i < 17; ++i) {
+        too_many_leaves += "    L" + std::to_string(i) + "\n";
+    }
     const std::vector<std::pair<std::string, const char *>> bad = {
         {wire("  R\n  S\n"), "second root"},
         {wire("  R\n      X\n"), "skipped level"},
         {wire("  R\n   X\n"), "odd indent"},
-        {wire("  R\n    A\n      B\n        C\n          D\n"), "depth 5"},
+        {wire("  R\n    A\n      B\n        C\n          D\n            E\n              F\n"), "depth 7"},
         {wire("  R \n"), "trailing space"},
         {wire("  R\n    [leaf]\n"), "bracket"},
         {wire("  R\n    a\"b\n"), "quote"},
         {wire("  R\n    `code`\n"), "backtick"},
         {std::string(HEADER) + "  R\n\n```\n", "blank line"},
         {std::string(HEADER) + "  R\n" + std::string(97, 'A') + "\n```\n", "label bytes"},
-        {wire("  R\n    A1\n    A2\n    B1\n    B2\n    C1\n    C2\n    D1\n    D2\n    E1\n"), "9 leaves"},
+        {wire(too_many_leaves), "17 leaves"},
         {wire("  R\n") + "junk", "trailing junk after fence"},
         {std::string(HEADER) + "  R\n```junk\n", "fence with trailing text"},
         {std::string(HEADER) + "  R\r\n```\n", "CRLF"},
@@ -324,6 +328,7 @@ static void test_budget_latch_is_sticky() {
     // 9 are not, and the 9th dies when its line is committed. Fresh limits --
     // the node budget of `lim` above is irrelevant here.
     sampler_limits leaf_lim;
+    leaf_lim.max_leaves = 8;
     sampler_state leaf_st;
     CHECK(feed_bytes(wire("  R\n    A\n    B\n    C\n    D\n    E\n    F\n    G\n    H\n"),
                      leaf_st, leaf_lim) == advance_status::complete);

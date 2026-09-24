@@ -428,6 +428,13 @@ struct server_rerot_node_runtime {
     rerot_pen_id pen_id = -1;
     int physical_slot = -1;
     llama_seq_id exec_seq = -1;
+    // The cohort's committed set may contain a token from a previous binding.
+    // A resumed committed lane cannot yield again before it writes a new row.
+    bool committed_since_bind = false;
+    // A time-sliced fixed entry remains STARTING until its last frame token
+    // commits. ready_suspended alone does not distinguish it from a RUNNING
+    // worker; resume must restore the saved injection and sampler phase.
+    bool suspended_from_starting = false;
     llama_seq_id parked_seq = -1;
     llama_pos storage_pos_next = 0;
 

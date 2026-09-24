@@ -3,7 +3,7 @@
 # One document per record. `EXPECT` is the verdict the strict C++ parser
 # (tools/server/server-rerot-mindmap.cpp) MUST return for the document, using
 # the default limits:
-#   depth 4, nodes 64, leaves 8, label 96 bytes, wire 16384 bytes.
+#   depth 6, nodes 96, leaves 16, label 96 bytes, wire 16384 bytes.
 #
 # These fixtures pin the BYTE-level contract: the probe may emit any prefix of
 # a legal document at any token boundary, so the same corpus also seeds the
@@ -85,9 +85,9 @@ mindmap
     42
 ```
 
---- id: valid-exactly-eight-leaves
+--- id: valid-exactly-sixteen-leaves
 EXPECT: complete
-The leaf budget is 8; this document has exactly 8.
+The leaf budget is 16; this document has exactly 16.
 ```mermaid
 mindmap
   R
@@ -99,6 +99,14 @@ mindmap
     F
     G
     H
+    I
+    J
+    K
+    L
+    M
+    N
+    O
+    P
 ```
 
 --- id: invalid-empty
@@ -192,10 +200,10 @@ mindmap
 
 ```
 
---- id: invalid-depth-five
+--- id: invalid-depth-seven
 EXPECT: invalid
 budget
-Depth 5 exceeds the default max_depth of 4.
+Depth 7 exceeds the default max_depth of 6.
 ```mermaid
 mindmap
   R
@@ -203,12 +211,14 @@ mindmap
       B
         C
           D
+            E
+              F
 ```
 
---- id: invalid-nine-leaves
+--- id: invalid-seventeen-leaves
 EXPECT: invalid
 budget
-Nine leaves exceed the default max_leaves of 8. The verdict is only possible
+Seventeen leaves exceed the default max_leaves of 16. The verdict is only possible
 once the tree closes, because a late promotion can reduce the leaf count.
 ```mermaid
 mindmap
@@ -222,6 +232,14 @@ mindmap
     D1
     D2
     E1
+    E2
+    F1
+    F2
+    G1
+    G2
+    H1
+    H2
+    I1
 ```
 
 --- id: invalid-trailing-space-in-label

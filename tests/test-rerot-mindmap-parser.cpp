@@ -32,7 +32,7 @@ static std::string wire(const std::string & body) {
 // Every legal document is accepted, round-trips through serialize(), and its
 // canonical form is idempotent.
 static void test_valid_documents() {
-    const std::vector<std::string> valid = {
+    std::vector<std::string> valid = {
         wire("  总目标\n"),
         wire("  Root\n    Leaf\n"),
         wire("  R\n    A\n      B\n        C\n"),
@@ -41,9 +41,14 @@ static void test_valid_documents() {
         wire("  求总和\n    求 25 × 12\n    求 15 × 16\n"),
         wire("  R\n    テスト\n    검증\n"),
         wire("  R\n    A\n      X\n    B\n"),
-        wire("  R\n    A\n    B\n    C\n    D\n    E\n    F\n    G\n    H\n"), // exactly 8 leaves
+        wire("  R\n    A\n      B\n        C\n          D\n            E\n"), // depth 6
         wire("  R\n    42\n"), // label starting with a digit
     };
+    std::string sixteen_leaves = "  R\n";
+    for (int i = 0; i < 16; ++i) {
+        sixteen_leaves += "    L" + std::to_string(i) + "\n";
+    }
+    valid.push_back(wire(sixteen_leaves));
     for (const auto & text : valid) {
         auto res = parse(text);
         if (!res.is_complete()) {
@@ -102,16 +107,19 @@ static void test_invalid_structure() {
     expect_reject(std::string(HEADER) + "    R\n" + "```\n", error_class::structure, "root not at level 1");
     expect_reject(std::string(HEADER) + "  R\n\n" + "```\n", error_class::structure, "blank line");
     expect_reject(std::string(HEADER) + "  R\n   \n" + "```\n", error_class::structure, "odd-indent whitespace line");
-    expect_reject(std::string(HEADER) + "  R\n    A\n      B\n        C\n          D\n" + "```\n",
-        error_class::budget, "depth 5");
+    expect_reject(std::string(HEADER) + "  R\n    A\n      B\n        C\n          D\n            E\n              F\n" + "```\n",
+        error_class::budget, "depth 7");
     expect_reject(wire("  R \n"), error_class::label, "trailing space in label");
     expect_reject(wire("  R\n    [leaf]\n"), error_class::label, "brackets");
     expect_reject(wire("  R\n    a\"b\n"), error_class::label, "quote");
     expect_reject(wire("  R\n    `code`\n"), error_class::label, "backtick");
     expect_reject(std::string(HEADER) + "  " + std::string(97, 'A') + "\n```\n",
         error_class::budget, "label bytes");
-    expect_reject(wire("  R\n    A1\n    A2\n    B1\n    B2\n    C1\n    C2\n    D1\n    D2\n    E1\n"),
-        error_class::budget, "9 leaves");
+    std::string seventeen_leaves = "  R\n";
+    for (int i = 0; i < 17; ++i) {
+        seventeen_leaves += "    L" + std::to_string(i) + "\n";
+    }
+    expect_reject(wire(seventeen_leaves), error_class::budget, "17 leaves");
     {
         // Isolate the NODE budget from the leaf budget: a 65-node chain is
         // one leaf but 65 nodes. The budget fires on the node that would be
@@ -139,9 +147,8 @@ static void test_invalid_structure() {
         CHECK(res.is_invalid() && res.budget_hit());
     }
     {
-        // Four nodes is exactly at budget (legal); five is over. The depth
-        // budget stays at its default of 4 so the node budget is what binds
-        // here, not the depth of the chain.
+        // Four nodes is exactly at budget (legal); five is over. Raise the
+        // depth budget so the node budget is what binds, not chain depth.
         limits lim;
         lim.max_nodes = 4;
         lim.max_depth = 8;

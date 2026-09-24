@@ -2476,6 +2476,10 @@ struct vk_context_struct {
     std::vector<vk_staging_memcpy> in_memcpys;
     std::vector<vk_staging_memcpy> out_memcpys;
     std::vector<vk_staging_memset> memsets;
+    // The graph allocator may release a tensor buffer before a queued host
+    // readback runs. Keep both sides of every async copy alive until this
+    // context is retired after the queue fence.
+    std::vector<vk_buffer> copy_buffers;
 
     vk_command_pool * p {};
 };
@@ -10932,6 +10936,8 @@ static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, siz
 
         ggml_vk_sync_buffers(nullptr, subctx);
         vk_tp5_hpp_commands(subctx->s->buffer->buf).copyBuffer(buf->buffer, dst->buffer, slices);
+        subctx->copy_buffers.push_back(buf);
+        subctx->copy_buffers.push_back(dst);
         subctx->s->buffer->has_pending_mem_work = true;
         return true;
     }
@@ -11067,6 +11073,8 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
         // Memory is pinned, use as staging buffer
         ggml_vk_sync_buffers(nullptr, subctx);
         vk_tp5_hpp_commands(subctx->s->buffer->buf).copyBuffer(src->buffer, buf->buffer, slices);
+        subctx->copy_buffers.push_back(src);
+        subctx->copy_buffers.push_back(buf);
         subctx->s->buffer->has_pending_mem_work = true;
         vk_tp5_hpp_commands(subctx->s->buffer->buf).pipelineBarrier(
             vk::PipelineStageFlagBits::eTransfer,
@@ -24216,7 +24224,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
     }
-
     const bool replay_enabled = ggml_vk_cmd_replay_enabled();
     const bool replay_eligible = replay_enabled && ggml_vk_cgraph_decode_replay_eligible(ctx, cgraph);
 

@@ -202,6 +202,8 @@ def classify_wire(text: str) -> Tuple[str, str]:
     HEAD = "```mermaid\nmindmap\n"
     if not text:
         return "invalid", "empty"
+    if len(text.encode("utf-8")) > 16384:
+        return "invalid", "byte budget"
     if not text.startswith(HEAD):
         return "invalid", "envelope"
     if not text.endswith("```\n"):
@@ -226,6 +228,8 @@ def classify_wire(text: str) -> Tuple[str, str]:
             return "invalid", f"line {idx + 3}: no indent"
         if not label or label != label.strip():
             return "invalid", f"line {idx + 3}: label padding"
+        if len(label.encode("utf-8")) > 96:
+            return "invalid", f"line {idx + 3}: label budget"
         if "  " in label:
             return "invalid", f"line {idx + 3}: double space in label"
         for ch in label:
@@ -236,10 +240,10 @@ def classify_wire(text: str) -> Tuple[str, str]:
                     or 0x4E00 <= o <= 0x9FFF or 0xAC00 <= o <= 0xD7AF
                     or 0xFF01 <= o <= 0xFF5E or 0x2018 <= o <= 0x201D):
                 return "invalid", f"line {idx + 3}: forbidden scalar {ch!r}"
-        if depth > 4:
+        if depth > 6:
             return "invalid", f"line {idx + 3}: depth budget"
         nodes += 1
-        if nodes > 64:
+        if nodes > 96:
             return "invalid", f"line {idx + 3}: node budget"
         if not stack:
             if depth != 1:
@@ -263,7 +267,7 @@ def classify_wire(text: str) -> Tuple[str, str]:
             is_leaf = False
         if is_leaf:
             leaf_count += 1
-    if leaf_count > 8:
+    if leaf_count > 16:
         return "invalid", "leaf budget"
     return "complete", "ok"
 
@@ -428,18 +432,17 @@ class ServerHandshake:
         rerot = props.get("rerot") if isinstance(props, dict) else None
         if not isinstance(rerot, dict):
             return False, "server did not report a rerot capability block"
-        if not rerot.get("enabled"):
-            return False, "server rerot is not enabled (need --rerot)"
         if arm["wire"] not in KNOWN_WIRES:
             return False, f"unknown wire {arm['wire']}"
         if arm["final"] not in KNOWN_FINAL:
             return False, f"unknown final mode {arm['final']}"
         if arm["order"] not in KNOWN_ORDERS:
             return False, f"unknown reader order {arm['order']}"
-        if arm["wire"] == "mindmap":
-            supported = rerot.get("plan_wires")
-            if isinstance(supported, list) and "mindmap" not in supported:
-                return False, "server does not advertise the mindmap plan wire"
+        if bool(rerot.get("enabled")) != (arm["wire"] != "none"):
+            return False, "server RERoT enablement does not match the arm"
+        for key in ("wire", "final", "order", "deps"):
+            if rerot.get(key) != arm[key]:
+                return False, f"server {key}={rerot.get(key)!r} does not match {arm[key]!r}"
         return True, "ok"
 
 
@@ -454,24 +457,32 @@ def wait_port(host: str, port: int, timeout: float) -> bool:
     return False
 
 
-def completion(base_url: str, prompt: str, timeout: float) -> Dict[str, Any]:
+def completion(base_url: str, prompt: str, timeout: float, seed: int) -> Dict[str, Any]:
     payload = json.dumps({
-        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "temperature": 0.0,
-        "seed": 20260923,
-        "n_predict": 512,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "seed": seed,
+        "max_completion_tokens": 2048,
     }).encode("utf-8")
     req = urllib.request.Request(
-        base_url.rstrip("/") + "/completion",
+        base_url.rstrip("/") + "/chat/completions",
         data=payload,
         headers={"Content-Type": "application/json"},
     )
     started = time.monotonic()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = json.loads(resp.read().decode("utf-8"))
-    body["_wall_seconds"] = time.monotonic() - started
-    return body
+    choice = body["choices"][0]
+    return {
+        "content": choice["message"].get("content") or "",
+        "reasoning_chars": len(choice["message"].get("reasoning_content") or ""),
+        "finish_reason": choice.get("finish_reason"),
+        "usage": body.get("usage"),
+        "timings": body.get("timings"),
+        "_wall_seconds": time.monotonic() - started,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -592,14 +603,26 @@ class Harness:
                 "llama-server": sha256_file(
                     Path(self.args.build_dir) / "bin" / "llama-server")
                 if (Path(self.args.build_dir) / "bin" / "llama-server").is_file() else None,
+                "libllama-server-impl": sha256_file(
+                    Path(self.args.build_dir) / "bin" / "libllama-server-impl.so")
+                if (Path(self.args.build_dir) / "bin" / "libllama-server-impl.so").is_file() else None,
+                "libllama": sha256_file(
+                    Path(self.args.build_dir) / "bin" / "libllama.so")
+                if (Path(self.args.build_dir) / "bin" / "libllama.so").is_file() else None,
                 "test-rerot-mindmap-parser": sha256_file(
                     Path(self.args.build_dir) / "bin" / "test-rerot-mindmap-parser")
                 if (Path(self.args.build_dir) / "bin" / "test-rerot-mindmap-parser").is_file() else None,
             },
             "fixtures_sha256": sha256_file(FIXTURES) if FIXTURES.is_file() else None,
+            "prompts_sha256": sha256_file(Path(self.args.prompts))
+            if self.args.prompts and Path(self.args.prompts).is_file() else None,
+            "model_file": self.args.model_file,
+            "model_sha256": sha256_file(Path(self.args.model_file))
+            if self.args.model_file and Path(self.args.model_file).is_file() else None,
             "arms": {k: v for k, v in ARMS.items() if k in self.args.arms},
             "seed": self.args.seed,
             "prompt_limit_tokens": 512,
+            "completion_limit_tokens": 2048,
         }
         (self.out / "manifest.json").write_text(
             json.dumps(manifest, indent=2), encoding="utf-8")
@@ -666,7 +689,7 @@ class Harness:
             for prompt_id, prompt in enumerate(self.args_prompts()):
                 started = time.monotonic()
                 try:
-                    body = completion(base, prompt, self.args.timeout)
+                    body = completion(base, prompt, self.args.timeout, self.args.seed)
                 except Exception as exc:  # noqa: BLE001 - failures stay in the log
                     self.emit("arm_request", arm=arm_name, prompt=prompt_id,
                               ok=False, error=str(exc),
@@ -681,8 +704,11 @@ class Harness:
                     "order": arm["order"],
                     "final": arm["final"],
                     "prompt_id": prompt_id,
+                    "prompt": prompt,
+                    "content": content,
                     "wall_seconds": body.get("_wall_seconds"),
                     "content_chars": len(content),
+                    "reasoning_chars": body.get("reasoning_chars"),
                     "content_empty": not content.strip(),
                     "finish_reason": body.get("finish_reason"),
                     "timings": body.get("timings"),
@@ -782,6 +808,8 @@ def main() -> int:
                              "model-free section only")
     parser.add_argument("--prompts", default=None,
                         help="file with one prompt per line")
+    parser.add_argument("--model-file", default=None,
+                        help="local GGUF path to hash into the run manifest")
     parser.add_argument("--seed", type=int, default=20260923)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--handshake-timeout", type=float, default=30.0)

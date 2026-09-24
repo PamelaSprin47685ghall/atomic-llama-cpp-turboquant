@@ -1,0 +1,35 @@
+{
+  "experiment": "MM-R1 Bonsai-2 GPU, actual route, cold-process A/B/B/A",
+  "date": "2026-09-24",
+  "model": "/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf",
+  "model_sha256": "3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1",
+  "gpu": "AMD Radeon RX 6800 (RADV NAVI21), Vulkan0",
+  "binary_sha256": {
+    "llama-server": "bfefc541de18448bedc3da0a90d8d3e91a0558843a06e0270b90fd97c8674da2",
+    "libggml-vulkan.so": "2db54deaf2c9bdd295f397fcfccff8cfa0e9a04560c1a1471596c2c2d2de7cf5",
+    "libllama.so": "fbb8bc671771fc4179039692b2da5276f00d00856829ea0ad23d7adffc953901",
+    "libllama-server-impl.so": "7047bd01a3eba57f4acf39fef4411e22c57f34e08463ad17be8605202f30487b"
+  },
+  "common_server_args": ["-dev", "Vulkan0", "-c", "6144", "-b", "256", "-ub", "256", "-ngl", "999", "-np", "6", "-cb", "--rerot", "--rerot-final-mode", "reason", "--rerot-people", "8", "--rerot-pens", "6", "--temp", "0.6", "--top-p", "0.95", "--seed", "20260923", "--no-mmap"],
+  "request": {
+    "endpoint": "/v1/chat/completions",
+    "prompt": "Compute 13*17 and 21*19, then give both products and their sum.",
+    "max_tokens": 2048,
+    "stream": false,
+    "expected": {"13*17": 221, "21*19": 399, "sum": 620}
+  },
+  "arms": [
+    {"tag": "A_json", "wire": "json", "actual_strategy": "simple", "route_order": "kahn", "route_deps": "model", "wall_seconds": 6.3, "completion_tokens": 124, "probe_tokens": 68, "frame_tokens": 0, "server_predicted_tok_per_second": 29.9917, "http_status": 200, "finish": "stop", "answer_correct": true},
+    {"tag": "B1_mindmap", "wire": "mindmap", "actual_strategy": "mindmap", "plan_tree_nodes": 11, "runtime_nodes": 9, "plan_leaves": 7, "route_order": "hierarchical-cyclic-dfs", "route_deps": "none", "wall_seconds": 71.4, "completion_tokens": 1014, "probe_tokens": 295, "frame_tokens": 2282, "server_predicted_tok_per_second": 14.4371, "http_status": 200, "finish": "stop", "answer_correct": true},
+    {"tag": "B2_mindmap", "wire": "mindmap", "actual_strategy": "mindmap", "plan_tree_nodes": 11, "runtime_nodes": 9, "plan_leaves": 7, "route_order": "hierarchical-cyclic-dfs", "route_deps": "none", "wall_seconds": 70.8, "completion_tokens": 1014, "probe_tokens": 295, "frame_tokens": 2282, "server_predicted_tok_per_second": 14.5698, "http_status": 200, "finish": "stop", "answer_correct": true},
+    {"tag": "A2_json", "wire": "json", "actual_strategy": "simple", "route_order": "kahn", "route_deps": "model", "wall_seconds": 6.3, "completion_tokens": 124, "probe_tokens": 68, "frame_tokens": 0, "server_predicted_tok_per_second": 29.9741, "http_status": 200, "finish": "stop", "answer_correct": true}
+  ],
+  "paired_wall_mean_seconds": {"json_actual_simple": 6.3, "mindmap_actual_seven_leaf": 71.1},
+  "comparability_limit": "The JSON wire selected simple with no worker frame, while mindmap selected seven leaves and generated 2282 fixed-frame tokens. These are real-route product latencies, not equal-work DAG algorithm throughput or a speedup claim.",
+  "six_pen_gpu_evidence": "Paired B1 GPU trace at 0:26.709-0:26.710 recorded node 1..6 at tok_idx 0..5 in one sampled batch; node 7 time-sliced at 0:26.903. See route-evidence.log. The separate repaired smoke shows the same at 0:29.661.",
+  "additional_json_route_checks": [
+    {"prompt": "Answer six independent arithmetic questions: calculate 13*17, 21*19, 8*9, 7*12, 6*15, and 14*11. Give each product and their total.", "actual_strategy": "simple", "wall_seconds": 8.9, "completion_tokens": 199, "probe_tokens": 66, "http_status": 200},
+    {"prompt": "Prepare a concise reference sheet with one short paragraph for each of six independent topics: Raft leader election, HTTP cache revalidation, B-tree node splits, Byzantine consensus, Bloom filters, and TCP congestion control. Finish with two cross-topic design tradeoffs.", "actual_strategy": "simple", "wall_seconds": 51.0, "completion_tokens": 1448, "probe_tokens": 66, "http_status": 200}
+  ],
+  "verification": {"ctest_rerot_xkv_flashprefill": "52/52 passed", "test_vulkan_command_replay": "24 tests passed", "post_fix_gpuvm_faults_observed": 0, "xorg_alive_after_gpu_smoke": true}
+}

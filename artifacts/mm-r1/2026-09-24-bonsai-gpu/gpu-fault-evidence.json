@@ -1,0 +1,34 @@
+{
+  "model": "Ternary-Bonsai-2-27B-PQ2_0.gguf",
+  "pre_fix_run": "mm-yield-stage",
+  "radv_dump": "/home/kunweiz/radv_dumps_720940_2026.09.24_12.14.56",
+  "vm_fault": {
+    "client": "CPG",
+    "access": "read",
+    "page": "0x80038aee3000",
+    "radv_verdict": "Potential use-after-free detected",
+    "last_source_buffer": "0x564f9a19ec20",
+    "last_source_va": "0x80038ae00000-0x80038f7a63b0",
+    "source_unbound_before_execution": true
+  },
+  "last_reached_command": {
+    "operation": "CmdCopyBuffer",
+    "source_va": "0xffff80038ae643b0",
+    "destination_va": "0xffff8002adc00000",
+    "bytes": 3973120,
+    "size_crosscheck": "4 logits rows * 248320 vocabulary entries * 4 bytes = 3973120"
+  },
+  "source_lifetime_fix": "ggml/src/ggml-vulkan/ggml-vulkan.cpp pins both VkBuffer owners in the vk_context for asynchronous pinned-host reads and writes until graph cleanup after queue synchronization",
+  "post_fix_smoke": {
+    "wire": "mindmap",
+    "model_gpu": "Vulkan0 RX 6800",
+    "prompt": "Compute 13*17 and 21*19, then give both products and their sum.",
+    "http_status": 200,
+    "wall_seconds": 86.7,
+    "completion_tokens": 1390,
+    "answer": "13*17=221; 21*19=399; sum=620",
+    "worker_evidence": "at 0:29.661, nodes 1..6 sampled in one batched decode with tok_idx 0..5; node 7 time-sliced",
+    "new_gpuvm_fault": false,
+    "xorg_survived": true
+  }
+}

@@ -28,9 +28,9 @@ namespace server_mindmap {
 // Sampler-side resource limits. Identical defaults to the parser's so a probe
 // armed with one and judged by the other can never disagree.
 struct sampler_limits {
-    uint32_t max_depth      = 4;
-    uint32_t max_nodes      = 64;
-    uint32_t max_leaves     = 8;
+    uint32_t max_depth      = 6;
+    uint32_t max_nodes      = 96;
+    uint32_t max_leaves     = 16;
     uint32_t max_label_utf8 = 96;
     size_t   max_bytes      = 16384;
 
