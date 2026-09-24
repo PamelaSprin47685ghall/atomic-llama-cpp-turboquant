@@ -18,6 +18,15 @@ full-model correctness acceptance; repaired-model measurements are required.
 
 ### Fixed
 
+- **TP5 counting acceptance preserves exact request evidence.** The cross-matrix
+  runner now records the submitted request alongside the full response, including
+  responses missing token usage. Counting gates no longer trim whitespace before
+  claiming a byte-for-byte match. The 171-token workload explicitly disables
+  thinking and prompt reuse; a reasoning-enabled request is a different workload
+  and needs its own context/output budget. A 40-character response preview is
+  not evidence of a miscount. See the September 24 correctness investigation in
+  `TP5.md` for the restored non-MTP binary and full-response evidence.
+
 - **MM-R1 logical leaves no longer inherit a physical pen budget.** Removed
   the incremental mindmap probe guard and parser node/leaf/wire-byte/depth/
   label budgets; the JSON probe retains its separate 512-token policy. After one English

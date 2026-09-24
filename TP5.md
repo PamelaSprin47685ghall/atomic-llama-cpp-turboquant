@@ -3,6 +3,45 @@
 - GPU timing ledger 对 LateBind stage 单独报告 `p1_us` 与 `late_pre_us`，避免再把两者混成旧的 `producer_slot_us`；direct-host 实验同时打印 `direct=1`，便于下一轮严格拆账。
 # TP5：Qwen4EXP 在五张 RX 6800 上的 Vulkan 张量并行实现方案
 
+## non-MTP 正确性事故复核（2026-09-24；覆盖 Wave-4 的故障归因）
+
+**结论：本次没有找到需要回滚推理内核的证据。** `e4510fe0a` 的五卡 non-MTP 在原始验收请求下正确；Wave-4 确实发生了长度截断，但其请求契约与历史基准不同，且客户端把完整输出丢弃后只保存了 40 字符预览。不能据此宣布数值路径或硬件损坏，也不能把本次有限题型验证扩大为所有内核均无缺陷。
+
+### 现场证据与原因
+
+- `/var/tmp/tp5-mtp-wave4/req.py` 漏传 `chat_template_kwargs.enable_thinking=false` 与 `cache_prompt=false`。本次调用同一服务的 `/apply-template` 证明：该请求引入 `xhigh` reasoning system prompt 并打开 thinking，prompt 为 **71 token**；原基准关闭 thinking，prompt 为 **31 token**。缓存开关影响重复请求的重算口径，不是首个请求截断的原因。
+- 失败日志 `srv-base-nomtp.log` 的 **71 prompt + 185 completion = 256** 正好耗尽 `-c 256`。恢复后的主工作树二进制保留默认 thinking，仅改为 `-c 1024`、`max_tokens=768`，实测 **71 + 220 = 291 token**，完整 `1..60` 正确且自然停止。默认 thinking 不是错误；192 输出预算及 256 上下文不能沿用无 thinking 的 171-token 门。
+- `req.py` 保存的是 `content[:40]`。正确的完整答案也以 `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,1` 这 40 字符开头，最后一个 `1` 是 `17` 的开头。`wave4-summary.txt` 把这个预览称为“16 处岔错”没有依据；旧脚本未保留完整原始响应，不能事后恢复其全部生成文本。
+- `4e17c2faf` 的历史非 MTP 正确原始响应 `/var/tmp/tp5-mtp-theory-pure-target-smoke.json` 实际保存了 command/env、完整答案、171/171 和 prompt31。Wave-4 中“历史 JSON 无 command/env”的笼统结论不适用于此文件。旧树在不同请求下也截断，不能排除源码差异或证明 collective 非确定性。
+
+### 隔离、恢复与本次真实验收
+
+原有 17 个未提交文件完整保存为 `wip/tp5-before-correctness-recovery-20260924`，提交 **`b396f7be8`**。恢复分支 **`fix/tp5-non-mtp-correctness`** 从 `e4510fe0a` 开始，不合入 WIP。主工作树的 `build-tp5/bin/llama-server` 及依赖已重新构建，不能只切源码分支却继续运行旧 WIP 二进制。
+
+|本次运行|结果|
+|---|---|
+|已有干净 e451 基线二进制，五卡 RELAY/F32，`--spec-type none`，c256|冷请求及三次重复均逐字正确、171/171、自然停止|
+|同进程缓存复用两次、混合题后、首内容 token 后取消再请求|另四次 `1..60` 均正确、171/171；服务日志确认 `cancel task`；短计数及 `13×17=221` 也正确|
+|重建后的主工作树二进制，c1024|默认 thinking 的 `1..60` 为 220 completion，自然停止且答案精确；无 thinking 的 `1..100` 为 292 completion、精确自然停止；随后 `1..60` 恢复 171/171|
+|最终原生默认 non-MTP 路由，c256，正式脚本冷请求＋五次重复|**6/6** 全文逐字一致、prompt31、171/171、`finish_reason=stop`；RELAY/F32、linear lowering 路由门通过|
+
+最终六次 `predicted_ms` 按执行顺序为 **3396.618、3383.311、3378.776、3396.345、3394.117、3398.332**。这是正确性烟测，不是性能配对或 >100 tok/s 证明。独占五卡，watchdog 全程保持 active；结束后五卡空闲、PCI BDF/inode 未变，检查时内核 warning 无新增，所有自有服务器已停。
+
+原始证据目录：`/var/tmp/tp5-correctness-recovery-20260924/`。包括每个请求与完整响应、两种 rendered prompt、`observations.json`、实际映射二进制/DSO SHA256、模型分卷文件身份、GPU 前后状态、构建日志及服务器日志。最终验收文件为 **`main-final-smoke.json`**，保留全部六次样本，不选最快一次。
+
+复跑（空闲五卡、watchdog active；输出使用新路径）：
+
+```bash
+python3 scripts/run-tp5-cross-matrix.py --smoke \
+  --variant-a native-launcher-device --repeats 5 \
+  --bin "$PWD/build-tp5/bin/llama-server" --port 8097 \
+  --max-wall-seconds 300 --output /var/tmp/tp5-non-mtp-recheck.json
+```
+
+请求契约继续复用 `scripts/run-tp5-cross-matrix.py::PROMPT_PAYLOAD`，不要手抄出第二种计数配方。脚本现逐次保存实际 request，并保留缺失 usage 的失败响应；两个既有计数验收器不再 `.strip()` 后冒充逐字匹配。`tools/tp5/test-audit-tools.py` 新增完整答案/额外换行/预览截断/上下文耗尽的回归门，额外换行的误接收在修复前失败、修复后通过，CPU-only 共 5 项通过。
+
+**边界：** WIP 中的 `GGML_ASSERT(buffer)` 分配崩溃与此次错误的 non-MTP 回归归因是两件事。它留在 WIP 分支，未合入恢复分支；本次不宣称修复或验收这些 MTP 实验，更没有恢复 MTP 性能优化。
+
 ## 当前五卡验收决策（2026-09-23；覆盖本文较早的草案和历史基线）
 
 **当前用户验收口径（覆盖本文更早的完整客户端墙钟目标）**：只按完整正确、自然停止的 171-token `1..60` 响应计算 **Decode = 171 / server `predicted_ms`**；prompt、网络与完整 client wall 仍记录，但**不进入 >100 tok/s 的验收分母**。同目标和设备政策的纯 Target 两次 decode **50.61／50.87 tok/s**；显式单卡草稿、n=6 MTP 两次 **73.58／73.79 tok/s**，并非正式配对收益。MTP 25 个周期账中 target 验证总 **1.862／1.867s**、draft **0.428／0.418s**、catch-up **0.032／0.031s**；假设草稿和 catch-up 免费且原 target 不变，Decode 仍仅 **91.82／91.57 tok/s**。实际需 `predicted_ms < 1.71s`；保持当前草稿和 catch-up，target 总时长须降至 **1.250／1.262s**，约缩短 0.61s。这是固定实测工作量的**条件界**，不是架构绝对极限。原始数据 `/var/tmp/tp5-mtp-theory-pure-target-smoke.json`、`/var/tmp/tp5-mtp-n6-post-capacity-revert-smoke.json` 与后者 `_logs/`。
