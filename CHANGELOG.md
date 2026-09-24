@@ -18,6 +18,17 @@ full-model correctness acceptance; repaired-model measurements are required.
 
 ### Fixed
 
+- **Meta rank-local asynchronous readback.** Eligible contiguous F32 vocabulary
+  shards now copy into persistent per-device pinned host slots, submit every
+  rank before waiting, and assemble at the existing consumption boundary.
+  Pending reads retire before a subsequent read, slot growth, fallback, or
+  backend destruction; unsupported layouts retain the original getter.
+  Five-device byte/lifetime regressions and MTP acceptance prefixes 0–6 pass.
+  `GGML_META_ASYNC_READBACK=0` provides a same-binary control; timing evidence
+  and the unchanged model/sampler contract are recorded in `TP5.md`. Five paired
+  ABBA blocks measured 72.25→74.27 decode tok/s (+2.80%); all 60 retained cold
+  and steady requests were exact 171-token natural stops. This is not 100 tok/s.
+
 - **Vulkan skinny MMVQ projections keep distinct input identities.** The converted
   activation cache now keys on the graph tensor, not a temporary stack view
   reused by successive projections. Forced MMVQ could otherwise give the second

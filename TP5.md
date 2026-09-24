@@ -3,6 +3,65 @@
 - GPU timing ledger 对 LateBind stage 单独报告 `p1_us` 与 `late_pre_us`，避免再把两者混成旧的 `producer_slot_us`；direct-host 实验同时打印 `direct=1`，便于下一轮严格拆账。
 # TP5：Qwen4EXP 在五张 RX 6800 上的 Vulkan 张量并行实现方案
 
+## 正确性优先的 MTP 续做（2026-09-24）
+
+恢复分支与 WIP 已分别推送 `origin/fix/tp5-non-mtp-correctness` 和 `origin/wip/tp5-before-correctness-recovery-20260924`。续做分支为 `work/mtp-correctness-first`，不整包合入 WIP，也不把 RERoT 分支的未验证算法改动带入 TP5。
+
+### RERoT 报告中的共享 Vulkan 缺陷
+
+审阅 `origin/rerot-wip` **`c2ffb0fda`** 的 `artifacts/rerot-wip/vulkan-investigation.json`、`ordinary-baseline-evidence.json` 及其源代码复现后，确认一个可独立修复的问题：`ggml_vk_mul_mat_vec_q_f16` 在 skinny-as-batch lowering 中令 `src1` 指向栈上 `column_view_src1`，却把该地址存入 `prealloc_y_last_tensor_used`。连续两个投影会复用同一栈地址，第二个输入错误命中第一个输入的转换缓存。
+
+修复 **`ef48a9d40`** 保留原 graph tensor 作为转换缓存身份，不改核数学或浮点归约顺序。新增 `test-vulkan-command-replay --skinny-only` 用可精确表示的稀疏 Q8_0 权重检查两个不同输入及三轮输入变化：同一测试加载旧 e451 Vulkan 库，第二投影应为 **−254** 却得到 **126.992249**，失败；加载修复库，冷执行和 replay 全部通过。
+
+这个 bug 在报告的**强制 MMVQ** 路径可见，报告的 auto reproduction 通过。不能据此宣布所有 CPU/Vulkan 数值差异已消除：RERoT 普通模型证据显示历史与当前 Vulkan teacher-forcing logits 逐位相同，但二者都与 CPU 有差异；本次不把该差异冒称为新回归或已修复。RERoT 算法本身也未在本次验收。
+
+### Git 中真正中断的优化与取舍
+
+- **W1 rank-local 回读：本次继续。** WIP 把 slot 和新公共分片 API 放进 `llama_context`；续做改为 Meta backend 内部所有权，复用既有 `ggml_backend_tensor_get_async`／`synchronize`，不改上层输出契约。
+- **W2 greedy 验收：不盲合入。** WIP 守卫要求 top-k/top-p/min-p 全关闭，普通 `temperature=0` 请求仍继承这些参数，路径可能不命中；另外绕开 sampler 必须处理 RNG 和候选观察面。这里只确认风险，不通过放松守卫跳过语义验证。
+- **W4 catch-up 裁剪：继续隔离。** WIP 仍执行 attention，并引入第二个 graph-result slot；已有 multi-buffer NULL 断言。调用栈不能单独证明故障就是双图槽，但在 buffer 生命周期和每个接受位置 K/V 对拍前不能合入。没有删掉 catch-up，也没有宣布它已是 K/V-only。
+
+### 本次 W1 所有权与验证
+
+仅对 contiguous F32、axis0、单 segment、非 mapped/replicated 分片启用；其他布局、无专用 pinned host 类型或无异步 flush 的 backend 仍走原路径。每个 rank 使用本设备识别的持久 pinned slot；全部 copy 入队并非阻塞提交后，消费边界统一等待并拼回 caller destination。前一个读回必须在下一次读回（包括 fallback／扩容）前退休，销毁前也须完成并组装。没有用全局共享 host-buffer-type 指针冒充五个设备的 pinned 内存。
+
+`GGML_META_ASYNC_READBACK=0` 为同二进制单因素退选开关。`GGML_META_READBACK_STATS=1` 仅用于诊断，记录 fast/fallback、各 rank 提交数与 pinned bytes、host sync boundary 数；fallback 包括 hidden 等其他布局，**不是**“所有 logits staging 失败数”，host boundary 也**不是**硬件 fence 计数。
+
+已运行的正确性证据位于 `/var/tmp/tp5-mtp-resume-20260924/`：
+
+- `test-tp5-rank-local-readback` CPU fallback 与显式 `--vulkan` 五卡均通过：不等长和空分片、部分行、1→7→1、两个未同步目的缓冲与扩容、同 backend 的 pending gather→mirrored fallback、销毁前完成，以及字节与 guard 对拍。`--vulkan` 缺少五卡时返回 77，不会偷偷用 CPU 冒充通过。
+- `test-vulkan-gdn-multistep` 的 active/capacity、headmap、多快照输出及最终 recurrent state 对 CPU 测试通过；`test-mtp-workspace` 接受行和 hidden 对齐测试通过。这是算子／工作区证据，不是完整模型所有层状态逐位对拍。
+- 原基线与候选五卡 MTP 的全文输出一致，日志实际覆盖 accepted prefix **0…6**。包含 canonical 171/171 自然停止、算术、有效 penalty、强制 grammar、12-token 长度截断；grammar 拒绝后继续生成，不只比较最终 token 计数。
+- 候选流式首内容后取消，再请求正确；同进程两次 prompt-cache 复用正确；`1..100` 完整正确、292 completion、自然停止。诊断使用 c512、LLAMA_TRACE 和 readback stats，不作为正式速度结果。
+
+性能只比较同二进制、同模型、参考 F32/RELAY、n=6，且关闭 trace/profiler/stats：
+
+```bash
+python3 scripts/run-tp5-cross-matrix.py \
+  --variant-a native-mtp-serial-readback --variant-b native-mtp-single-draft \
+  --blocks 5 --repeats 2 --port 8097 --max-wall-seconds 2400 \
+  --bin "$PWD/build-tp5/bin/llama-server" \
+  --output /var/tmp/tp5-mtp-readback-abba.json
+```
+
+### 本次正式五组 ABBA 结果
+
+同一 binary/DSO、同模型、c256、n6、F32/RELAY；A 仅设 `GGML_META_ASYNC_READBACK=0`，B 使用默认 pinned route，其余环境相同。**5 个 ABBA block／20 个独立服务进程**，每进程首请求单列、之后两次稳态请求：**40 次稳态＋20 次首请求全部逐字正确、prompt31、171/171、自然停止**。没有 profiler／trace／readback stats，五卡独占，watchdog active，前后 GPU 身份门通过。
+
+|block|A 串行回读平均 predicted_ms|B pinned 回读平均 predicted_ms|每请求节省 ms|
+|---|---:|---:|---:|
+|1|2359.809|2302.939|56.870|
+|2|2359.190|2308.911|50.278|
+|3|2368.366|2289.126|79.240|
+|4|2356.373|2300.241|56.132|
+|5|2391.182|2310.716|80.467|
+
+稳态各20样本的 `predicted_ms` 中位数 **2362.217→2302.145**，范围 **2341.138–2433.289→2285.722–2328.769**，标准差 **22.188→12.842 ms**。按五个独立 block 配对的平均 Decode **72.2498→74.2730 tok/s**，比值 **1.02803**，95% CI **[1.02044, 1.03561]**；五组都更快。首请求各10样本单列中位数 **2685.118→2613.770 ms**，不能与稳态混算。client wall 平均 **3.22909→3.16502 s**，其配对吞吐比 **1.02030**，95% CI **[1.01223, 1.02837]**，说明收益不是只把等待移到 sampler 计时外。
+
+**这是约2.80%的局部真实收益，不是 >100 tok/s；离 predicted_ms<1710 仍有约592 ms 的中位数差距。** 不继续扫 horizon，不把 W1 的收益当作六步设备程序或状态重算已经完成。
+
+全部样本与完整响应已入库：[paired-results.json](artifacts/tp5-mtp-readback-20260924/paired-results.json)、[逐 block 分析](artifacts/tp5-mtp-readback-20260924/performance-summary.json)、[正确性／实际 DSO 哈希](artifacts/tp5-mtp-readback-20260924/verification.json)。此前一次计时尝试与主机 SHA256 取证重叠，已整次中止并排除；[排除原因和当时日志](artifacts/tp5-mtp-readback-20260924/excluded-attempt.json) 保留，随后哈希完成才完整重跑这五组，没有挑最快样本。最终非 MTP 保护门另外三次全通过；它不是非 MTP 配对性能声明。
+
 ## non-MTP 正确性事故复核（2026-09-24；覆盖 Wave-4 的故障归因）
 
 **结论：本次没有找到需要回滚推理内核的证据。** `e4510fe0a` 的五卡 non-MTP 在原始验收请求下正确；Wave-4 确实发生了长度截断，但其请求契约与历史基准不同，且客户端把完整输出丢弃后只保存了 40 字符预览。不能据此宣布数值路径或硬件损坏，也不能把本次有限题型验证扩大为所有内核均无缺陷。
