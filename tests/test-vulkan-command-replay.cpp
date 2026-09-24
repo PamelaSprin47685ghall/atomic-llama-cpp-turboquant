@@ -3590,6 +3590,56 @@ static void test_staged_router_alias(test_env & env) {
     printf("test_staged_router_alias PASSED: staged router matches native selection and normalization exactly.\n");
 }
 
+// Distinct skinny projections must not share converted activations via the
+// lowering's reused stack address. Sparse weights provide an exact oracle.
+static void test_skinny_distinct_inputs(test_env & env) {
+    constexpr int k = 2048, m = 64, n = 27;
+    ggml_context * ctx = ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true});
+    TEST_ASSERT(ctx != nullptr);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
+    ggml_tensor * inputs[2];
+    ggml_tensor * outputs[2];
+    for (int i = 0; i < 2; ++i) {
+        inputs[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_input(inputs[i]);
+        outputs[i] = ggml_mul_mat(ctx, weight, inputs[i]);
+        ggml_set_output(outputs[i]);
+        ggml_build_forward_expand(graph, outputs[i]);
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, env.backend_gpu);
+    TEST_ASSERT(buffer != nullptr);
+    std::vector<float> weights(k * m, 0.0f);
+    for (int row = 0; row < m; ++row) {
+        weights[row * k + row] = 127.0f;
+    }
+    std::vector<uint8_t> packed(ggml_nbytes(weight));
+    TEST_ASSERT(ggml_quantize_chunk(GGML_TYPE_Q8_0, weights.data(), packed.data(), 0, m, k, nullptr) == packed.size());
+    ggml_backend_tensor_set(weight, packed.data(), 0, packed.size());
+    std::vector<float> input(k * n), actual(m * n);
+    const float values[3][2] = {{1.0f, -2.0f}, {3.0f, -1.0f}, {2.0f, 4.0f}};
+    uint64_t hits_before = 0, hits_after = 0;
+    env.get_stats(env.backend_gpu, &hits_before, nullptr);
+    for (const auto & round : values) {
+        for (int i = 0; i < 2; ++i) {
+            std::fill(input.begin(), input.end(), round[i]);
+            ggml_backend_tensor_set(inputs[i], input.data(), 0, input.size() * sizeof(float));
+        }
+        CHECK_STATUS(ggml_backend_graph_compute(env.backend_gpu, graph), "skinny distinct inputs");
+        for (int i = 0; i < 2; ++i) {
+            ggml_backend_tensor_get(outputs[i], actual.data(), 0, actual.size() * sizeof(float));
+            for (float value : actual) {
+                CHECK_CLOSE(value, 127.0f * round[i], 0.1f);
+            }
+        }
+    }
+    env.get_stats(env.backend_gpu, &hits_after, nullptr);
+    TEST_ASSERT(hits_after > hits_before);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    printf("test_skinny_distinct_inputs PASSED: distinct projections and changed inputs across cold execution and replay.\n");
+}
+
 int main(int argc, char ** argv) {
     const bool transfer_only = argc == 2 && std::strcmp(argv[1], "--transfer-only") == 0;
     const bool snapshot_only              = argc == 2 && std::strcmp(argv[1], "--snapshot-only") == 0;
@@ -3607,21 +3657,22 @@ int main(int argc, char ** argv) {
     const bool attention_projections_only = argc == 2 && std::strcmp(argv[1], "--attention-projections-only") == 0;
     const bool attention_mmvq_only = argc == 2 && std::strcmp(argv[1], "--attention-mmvq-only") == 0;
     const bool attention_region_only      = argc == 2 && std::strcmp(argv[1], "--attention-region-only") == 0;
+    const bool skinny_only = argc == 2 && std::strcmp(argv[1], "--skinny-only") == 0;
     if (argc != 1 && !transfer_only && !snapshot_only && !moe_only && !moe_output_only && !gdn_only &&
         !gdn_cache_only && !staged_router_only && !router_gate_only && !rope_only && !rows_only && !hc_fold_only && !hc_combine_only &&
         !hc_variants_only &&
-        !attention_projections_only && !attention_mmvq_only && !attention_region_only) {
+        !attention_projections_only && !attention_mmvq_only && !attention_region_only && !skinny_only) {
         std::fprintf(stderr,
                      "Usage: %s "
                      "[--transfer-only|--snapshot-only|--moe-only|--moe-output-only|--gdn-only|--gdn-cache-only|--"
                      "staged-router-only|--router-gate-only|--rope-only|--rows-only|--hc-fold-only|--hc-combine-only|--hc-variants-only|--attention-"
-                     "projections-only|--attention-mmvq-only|--attention-region-only]\n",
+                     "projections-only|--attention-mmvq-only|--attention-region-only|--skinny-only]\n",
                      argv[0]);
         return 2;
     }
     // Enable Vulkan command replay for testing.
     setenv("GGML_VK_CMD_REPLAY", "1", 1);
-    if (attention_mmvq_only) {
+    if (attention_mmvq_only || skinny_only) {
         // Dedicated numerical regression, not a performance policy. Exercise
         // all implemented quantized members, including Q6_K on RDNA.
         unsetenv("GGML_VK_DISABLE_MMVQ");
@@ -3712,6 +3763,10 @@ int main(int argc, char ** argv) {
         test_attention_region_replay(env);
         return 0;
     }
+    if (skinny_only) {
+        test_skinny_distinct_inputs(env);
+        return 0;
+    }
 
     int tests_run = 0;
     test_alternating_inputs(env);          ++tests_run;
@@ -3752,6 +3807,8 @@ int main(int argc, char ** argv) {
     test_multi_rope_norm_replay(env);
     ++tests_run;
     test_predefined_variable_rows_replay(env);
+    ++tests_run;
+    test_skinny_distinct_inputs(env);
     ++tests_run;
 
     printf("All Vulkan command replay observable integration tests completed successfully (%d tests ran).\n", tests_run);

@@ -18,6 +18,13 @@ full-model correctness acceptance; repaired-model measurements are required.
 
 ### Fixed
 
+- **Vulkan skinny MMVQ projections keep distinct input identities.** The converted
+  activation cache now keys on the graph tensor, not a temporary stack view
+  reused by successive projections. Forced MMVQ could otherwise give the second
+  projection the first input's values. A sparse-weight numerical regression
+  checks distinct inputs and changed inputs across cold execution and replay;
+  it fails with the old backend and passes with the repair.
+
 - **TP5 counting acceptance preserves exact request evidence.** The cross-matrix
   runner now records the submitted request alongside the full response, including
   responses missing token usage. Counting gates no longer trim whitespace before
