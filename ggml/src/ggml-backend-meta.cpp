@@ -2638,12 +2638,47 @@ struct ggml_backend_meta_context {
         std::vector<cgraph_config>           cgraphs;
         std::vector<ggml_tensor *>           nodes;
         std::vector<ggml_backend_buffer_ptr> bufs;
+        void (*fn_flush_async)(ggml_backend_t backend) = nullptr;
 
-        backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
+        backend_config(ggml_backend_t backend,
+                       const size_t   n_reduce_steps,
+                       void (*fn_flush_async)(ggml_backend_t) = nullptr) :
+            backend(backend),
+            fn_flush_async(fn_flush_async) {
             bufs.resize(n_reduce_steps);
         }
     };
     std::string                 name;
+
+    // Rank-local pinned asynchronous readback transaction state (W1 contract)
+    struct pending_readback_chunk {
+        size_t rank              = 0;
+        size_t chunk_bytes       = 0;
+        size_t dst_offset_in_row = 0;
+    };
+
+    struct pending_readback_transaction {
+        void *                              dst            = nullptr;
+        size_t                              n_rows         = 0;
+        size_t                              row_stride_dst = 0;
+        std::vector<pending_readback_chunk> chunks;
+    };
+
+    bool                               has_pending_readback = false;
+    pending_readback_transaction       pending_readback;
+    std::vector<ggml_backend_buffer_t> pinned_slots;
+    std::vector<size_t>                pinned_slot_capacities;
+    uint64_t                           rb_async_fast_count = 0;
+    uint64_t                           rb_fallback_count   = 0;
+    uint64_t                           rb_wait_count       = 0;
+
+    struct rank_readback_stats {
+        uint64_t pinned_bytes = 0;
+        uint64_t submits      = 0;
+    };
+
+    std::vector<rank_readback_stats> rank_stats;
+
     std::vector<backend_config> backend_configs;
     ggml_context_ptr            ctx;
     std::vector<ggml_cgraph *>  cgraphs_aux;
@@ -2702,6 +2737,13 @@ struct ggml_backend_meta_context {
     void release_backends() {
         std::vector<ggml_backend_t> child_backends;
         child_backends.reserve(backend_configs.size());
+        for (ggml_backend_buffer_t slot_buf : pinned_slots) {
+            if (slot_buf != nullptr) {
+                ggml_backend_buffer_free(slot_buf);
+            }
+        }
+        pinned_slots.clear();
+        pinned_slot_capacities.clear();
         for (auto & bc : backend_configs) {
             // These buffers are allocated from bc.backend and must be freed
             // before its Vulkan context/device is destroyed.
@@ -2712,6 +2754,43 @@ struct ggml_backend_meta_context {
         for (ggml_backend_t child : child_backends) {
             ggml_backend_free(child);
         }
+    }
+
+    bool retire_pending_readback() {
+        if (!has_pending_readback) {
+            return false;
+        }
+        // Synchronize all child backends before host assembly; tracks host sync boundary count
+        for (const auto & bc : backend_configs) {
+            ggml_backend_synchronize(bc.backend);
+        }
+        rb_wait_count++;  // host sync boundary count
+
+        // Assemble output into caller destination
+        const auto & tx = pending_readback;
+        if (tx.dst != nullptr && tx.n_rows > 0) {
+            for (const auto & chunk : tx.chunks) {
+                if (chunk.chunk_bytes == 0) {
+                    continue;
+                }
+                ggml_backend_buffer_t slot_buf  = pinned_slots[chunk.rank];
+                const uint8_t *       slot_base = (const uint8_t *) ggml_backend_buffer_get_base(slot_buf);
+                GGML_ASSERT(slot_base != nullptr);
+
+                for (size_t r = 0; r < tx.n_rows; r++) {
+                    const uint8_t * src_row = slot_base + r * chunk.chunk_bytes;
+                    uint8_t *       dst_row = (uint8_t *) tx.dst + r * tx.row_stride_dst + chunk.dst_offset_in_row;
+                    memcpy(dst_row, src_row, chunk.chunk_bytes);
+                }
+            }
+        }
+
+        has_pending_readback            = false;
+        pending_readback.dst            = nullptr;
+        pending_readback.n_rows         = 0;
+        pending_readback.row_stride_dst = 0;
+        pending_readback.chunks.clear();
+        return true;
     }
 
     void release_graph_state() {
@@ -2729,9 +2808,30 @@ struct ggml_backend_meta_context {
         if (!release_comm()) {
             return false;
         }
+        retire_pending_readback();
+        dump_rb_stats("shutdown");
         release_graph_state();
         release_backends();
         return true;
+    }
+
+    void dump_rb_stats(const char * event = nullptr) const {
+        static const bool s_stats_enabled = []() {
+            const char * env1 = getenv("GGML_META_DEBUG");
+            const char * env2 = getenv("GGML_META_READBACK_STATS");
+            return (env1 && atoi(env1) > 0) || (env2 && atoi(env2) > 0);
+        }();
+        if (!s_stats_enabled) {
+            return;
+        }
+        fprintf(stderr,
+                "[tp5-meta] readback stats (%s): fast=%" PRIu64 " fallback=%" PRIu64 " host_sync_boundaries=%" PRIu64
+                "\n",
+                event ? event : "periodic", rb_async_fast_count, rb_fallback_count, rb_wait_count);
+        for (size_t j = 0; j < rank_stats.size(); j++) {
+            fprintf(stderr, "  rank %zu: submits=%" PRIu64 " pinned_bytes=%" PRIu64 "\n", j, rank_stats[j].submits,
+                    rank_stats[j].pinned_bytes);
+        }
     }
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
@@ -2754,8 +2854,13 @@ struct ggml_backend_meta_context {
                 return;
             }
             simple_backends.push_back(simple_backend);
-            backend_configs.emplace_back(simple_backends.back(), n_reduce_steps);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(simple_dev);
+            void (*fn_flush)(ggml_backend_t) =
+                reg ? (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_flush_async") :
+                      nullptr;
+            backend_configs.emplace_back(simple_backends.back(), n_reduce_steps, fn_flush);
         }
+        rank_stats.resize(n_devs);
         name += ")";
 
         const char * GGML_META_DEBUG = getenv("GGML_META_DEBUG");
@@ -3065,7 +3170,154 @@ static bool ggml_backend_meta_set_tensor_snapshot_async(ggml_backend_t backend,
     return true;
 }
 
+static bool ggml_backend_meta_try_get_tensor_async_pinned(ggml_backend_t      backend,
+                                                          const ggml_tensor * tensor,
+                                                          void *              data,
+                                                          size_t              offset,
+                                                          size_t              size) {
+    static const int s_async_enabled = []() {
+        const char * env = getenv("GGML_META_ASYNC_READBACK");
+        if (env && (strcmp(env, "0") == 0 || strcmp(env, "off") == 0 || strcmp(env, "false") == 0)) {
+            return 0;
+        }
+        return 1;
+    }();
+
+    if (!s_async_enabled) {
+        return false;
+    }
+
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    if (n_backends < 2) {
+        return false;
+    }
+
+    if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) {
+        return false;
+    }
+
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/false);
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1 || split_state.mapped_span ||
+        split_state.indexed_replica) {
+        return false;
+    }
+    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_0) {
+        return false;
+    }
+
+    const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
+    if (chunk_size_full == 0 || offset % chunk_size_full != 0 || size % chunk_size_full != 0) {
+        return false;
+    }
+
+    const int64_t i_start = offset / chunk_size_full;
+    const int64_t i_stop  = (offset + size) / chunk_size_full;
+    const size_t  n_rows  = (size_t) (i_stop - i_start);
+
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+
+    // Preflight every backend: get_tensor_2d_async iface, non-null flush callback, valid simple tensor
+    size_t total_chunk_bytes = 0;
+    for (size_t j = 0; j < n_backends; j++) {
+        const auto & bc = backend_ctx->backend_configs[j];
+        if (!bc.backend->iface.get_tensor_2d_async || bc.fn_flush_async == nullptr) {
+            return false;
+        }
+        const ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+        if (st == nullptr) {
+            return false;
+        }
+        total_chunk_bytes += st->nb[split_state.axis + 1];
+    }
+    if (total_chunk_bytes != chunk_size_full) {
+        return false;
+    }
+
+    // Preflight host buffer types and ensure persistent pinned slots match exact host type
+    if (backend_ctx->pinned_slots.size() < n_backends) {
+        backend_ctx->pinned_slots.resize(n_backends, nullptr);
+        backend_ctx->pinned_slot_capacities.resize(n_backends, 0);
+    }
+    for (size_t j = 0; j < n_backends; j++) {
+        const ggml_tensor * st           = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+        const size_t        chunk_size_j = st->nb[split_state.axis + 1];
+        if (chunk_size_j == 0) {
+            continue;
+        }
+        ggml_backend_dev_t         dev  = ggml_backend_get_device(backend_ctx->backend_configs[j].backend);
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
+        if (buft == nullptr) {
+            return false;
+        }
+        const size_t needed = chunk_size_j * n_rows;
+        if (backend_ctx->pinned_slots[j] == nullptr || backend_ctx->pinned_slot_capacities[j] < needed) {
+            ggml_backend_buffer_t nb = ggml_backend_buft_alloc_buffer(buft, needed);
+            if (nb == nullptr || nb->buft != buft) {
+                if (nb != nullptr) {
+                    ggml_backend_buffer_free(nb);
+                }
+                return false;
+            }
+            if (backend_ctx->pinned_slots[j] != nullptr) {
+                ggml_backend_buffer_free(backend_ctx->pinned_slots[j]);
+            }
+            backend_ctx->pinned_slots[j]           = nb;
+            backend_ctx->pinned_slot_capacities[j] = needed;
+        }
+    }
+
+    // Populate retained transaction metadata directly without temporary heap allocation
+    auto & tx         = backend_ctx->pending_readback;
+    tx.dst            = data;
+    tx.n_rows         = n_rows;
+    tx.row_stride_dst = chunk_size_full;
+    tx.chunks.resize(n_backends);
+
+    size_t offset_acc = 0;
+    for (size_t j = 0; j < n_backends; j++) {
+        const ggml_tensor * st           = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+        const size_t        chunk_size_j = st->nb[split_state.axis + 1];
+        tx.chunks[j]                     = { j, chunk_size_j, offset_acc };
+        offset_acc += chunk_size_j;
+        if (chunk_size_j == 0) {
+            continue;
+        }
+        void * slot_ptr = ggml_backend_buffer_get_base(backend_ctx->pinned_slots[j]);
+        GGML_ASSERT(slot_ptr != nullptr);
+        ggml_backend_tensor_get_2d_async(backend_ctx->backend_configs[j].backend, st, slot_ptr, i_start * chunk_size_j,
+                                         chunk_size_j, n_rows, chunk_size_j, chunk_size_j);
+        backend_ctx->rank_stats[j].pinned_bytes += chunk_size_j * n_rows;
+        backend_ctx->rank_stats[j].submits++;
+    }
+
+    // Nonblocking flush for each rank using its owner-local callback
+    for (size_t j = 0; j < n_backends; j++) {
+        backend_ctx->backend_configs[j].fn_flush_async(backend_ctx->backend_configs[j].backend);
+    }
+
+    backend_ctx->has_pending_readback = true;
+    backend_ctx->rb_async_fast_count++;
+    if (backend_ctx->rb_async_fast_count == 1 || backend_ctx->rb_async_fast_count % 100 == 0) {
+        backend_ctx->dump_rb_stats("periodic");
+    }
+    return true;
+}
+
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    // Invariant: Retire prior pending transaction upfront before any new read or slot allocation
+    backend_ctx->retire_pending_readback();
+
+    if (size == 0) {
+        return;
+    }
+
+    if (ggml_backend_meta_try_get_tensor_async_pinned(backend, tensor, data, offset, size)) {
+        return;
+    }
+
+    backend_ctx->rb_fallback_count++;
+
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
@@ -3167,6 +3419,11 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
 }
 
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    if (backend_ctx->retire_pending_readback()) {
+        // retire_pending_readback already synchronized all child backends before assembly
+        return;
+    }
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
