@@ -1,1674 +1,744 @@
-# AGENTS.md
+## 结论
 
-## TP5 当前交接｜2026-09-23（下方 09-22 内容均为历史）
+**应该把主线改成“TP5 原生的多步 MTP 执行程序”，而不是继续给两个独立上下文拼出来的草稿路径调参数。当前约 72 tok/s，不能视为这套硬件上 MTP 的上限。**
 
-- **最新用户验收口径**：完整正确、自然停止的 `1..60` **171 token，仅 Decode = 171 / server `predicted_ms`**；prompt／网络／client wall 不计入 >100 tok/s 分母。下文历史 committed/client wall 表仍是真实观测，但不再是本目标的通过指标。同目标与设备政策的纯 Target 两次 decode **50.61／50.87**，单卡草稿 n=6 MTP **73.58／73.79 tok/s**；两臂不是正式配对。MTP target 25 周期总 **1.862／1.867s**，仅 target 已超过 1.71s 的 Decode 预算；即使 draft 免费，固定 target 下仅 **91.82／91.57 tok/s**。保留现有约 0.42s draft 和 0.03s catch-up 时，target 须减约 **0.61s** 才可能 >100。证据 `/var/tmp/tp5-mtp-theory-pure-target-smoke.json`、`/var/tmp/tp5-mtp-n6-post-capacity-revert-smoke.json` 及后者日志。不得用完整客户端墙钟误判本验收，也不得把条件上界说成架构绝对上界。
+但需要区分两件事：**“草稿指定五张卡”已经做过；“草稿真正进入 TP5 的设备端多步执行、状态管理和通信体系”还没有完成。** 前一种实现跑得慢，不能证明后一种没有收益。
 
-- **默认仅限** `qwen4exp-af`、五张互不重复的 RX 6800、纯 Target 且 RELAY/replay 生效：wire=F32、`GGML_TP5_LINEAR_LOWERING=1`，参考数学不变，五 rank 单 primary；`GGML_TP5_LINEAR_LOWERING=0` 明确消融。MTP 显式 opt-in 时无指定 wire 仍保留 F16，且不自动开此降层；CLI/环境显式 wire、sync 优先。生产脚本不提前指定 wire，让 `common_tp5_apply_env` 在设备及投机模式已知后判断；Golden F32 对照显式设 linear=0。
-- **历史 B04 对照已作废**：1..60 的 30.06→30.69、1..100 的 33.50→34.39 committed tok/s 均处在随后识别的 card2 降频窗口；虽各五块、20/20 完整输出，仍**不可作为当前硬件的净收益证明**。此前用户允许限定设备纯 Target 路线暂开，当前状态与重新测量边界见 `TP5.md` 当前验收节。
-- **退速根因锁定与消除（全卡 17.1 TFLOPS，实测 54.45 tok/s）**：
-  1. **根因确诊**：凌晨 02:39:08 MTP 触发 watchdog 物理总线复位后，矿版 VBIOS（`113-1N21XLMIN203W_210810`）的 card2 被重置为默认 1200MHz 限制。纯 ALU 基准（`/tmp/alu_bench`）实测 card2 算力腰斩为 **8.25 TFLOPS**（正常卡 16.2 TFLOPS），直接将 TP5 拖慢至 41~43 tok/s。
-  2. **复位脚本固化**：`scripts/reset-gpu-pci.sh` 正常复位后及 `check-clocks-only` 共用手动最高 DPM 档设置，`scripts/reset-gpu.sh` 不再吞掉其失败；card2 静态表显示 1200MHz 不等于实测算力。
-  3. **实际算力与模型测速**：校准后 5 卡纯 ALU 算力均达 **17.1~17.2 TFLOPS**；端到端模型 `native-default` 简并验证单次实测 decode 达到 **54.45 tok/s**（warmup 53.97 tok/s，171 tokens 仅耗时 3.14s，请求 committed 速度 35.70 tok/s，证据存盘于 `/tmp/tp5-retest-highclock-smoke.json`）。
-  4. 降频期间（02:39–08:26）测得的绝对吞吐数据已作废；54.45 是完整正确的**单次观察值**，不是稳定性分布或所有模式的最优证明。
-- **新默认真实路由**：`/tmp/tp5-qualified-default-smoke.json` 与显式关闭的 `/tmp/tp5-qualified-linear-off-smoke.json` 各完成 171 token、同进程 warmup+repeat；前者五 rank 日志 `primary_cbs=1 mode=reference late=0`，后者无 linear definition。两次烟测不可作为性能配对。`test-arg-parser` 通过；Golden `--print-config` 确认 linear=0。
-- **顶频后的最优已观测单 slot 组合**：同二进制/五卡的 1-block exploratory ABBA，原生 RELAY/F32 降层较关闭臂 34.22→35.69 committed tok/s（server decode 50.72→54.28）；加生产启动器早期 device 选项 `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1`、`GGML_VK_ALLOW_GRAPHICS_QUEUE=1` 再观察到 35.56→**36.37 committed tok/s**、54.27→**54.49 decode tok/s**。另一次 1..100 烟测完整 292 token，53.52 decode／41.20 committed tok/s。简并轮数**没有 CI 或跨工作负载最优证明**；证据与可复现命令见 `TP5.md` 当前验收节，生产脚本本来已预设上述两项 device 选项。
-- **其他门**：B01 四因子在降频窗口取得的性能结果全部作废，仅源码差分和 ISA 结论仍有效；B07 私有 spin 的 RADV LDS 12→8 B、读写 10→7 只算 ISA 证据；MTP 第四块 GPU 挂起后由未关闭的 watchdog 自动恢复，保持 opt-in。TIMELINE 已由用户排除；后续用定向测试，不做配置笛卡尔积。正式状态和未通过的 R/T/Q/H 卡见 `TP5.md`、`RERoT.md` 与 `缺口.md`。
-- **故障恢复与 MTP 新实证（11:20 后）**：旧 watchdog 对 GPU busy 的跨卡计数曾导致误复位风险；首次修复后又实测其在 card5 内核 reset **已成功**时多余地再次 PCI 热摘。现仓库/`/usr/local/bin/` 中 root-owned 的 `eagle-gpu-watchdog.sh`、`gpu-hard-unlock.sh` 已二次修订部署，service 继续 enabled/active：忙只告警，BDF ring timeout 先持久取证并等待驱动最终成功（成功仅恢复 manual＋最高 DPM），90 秒无成功／明确失败 30 秒后才定向排空并恢复单卡。真实 card5 SBR 后写入、核验 manual＋最高 index 2；新状态机有合成回归但没有刻意重演故障。TP5+MTP 不支持 `GGML_TP5_MTP_DEVICE_HIDDEN=1`：初始化失败后同 PID GPUVM fault/环超时，现已在任何 GPU graph 提交前 fail-closed exit 1，勿再用此路径实验。安全的 RELAY/F32 本地 MTP draft 在同进程 warmup＋4 次完整 171-token 请求均正确，committed 35.71–36.48 tok/s；card5 实际恢复后另一次 35.02 tok/s。**未达到 >100，仍为 opt-in。**详见 `docs/TP5-MTP-EVIDENCE.md`。
-- **按用户要求复位后每卡纯 ALU 1 秒验频**：逐卡独占 Vulkan FP32 FMA，GPU timestamp 各累计 1.006–1.015 秒，card1..5 **18.027／16.531／18.426／17.331／17.363 TFLOPS**；card2 不在旧 8.25 TFLOPS 降频态，card5 真实 SBR 后亦正常。新探针和旧 `/tmp/alu_bench` 不同，不能对比绝对值当模型收益；完整记录 `/var/tmp/tp5-alu1s-results.json`，循环内八条 vec4 FMA 已从 SPIR-V 确认，测试后 kernel 无新增 GPU fault。
-- **RADV global BO list 定向复核**：两臂均设 `RADV_DEBUG=nobolist`，仅 B 臂额外设 `GGML_TP5_ISOLATE_BO=1`；显式隔离会关闭**整个 VkDevice** 的 BDA、descriptor indexing、coopmat2。五卡 F32 MTP 两块 A/B/B/A（共八个独立进程）的完整正确 171-token 请求均值 A=**35.28**、B=**35.41 committed tok/s**；警告由每进程五条降为零，但没有观察到模型级大幅提速。仅两块 exploratory pilot，不计算 CI、不自动晋级默认；证据 `/var/tmp/tp5-mtp-bo-isolation-abba2.json`，详见 `docs/TP5-MTP-EVIDENCE.md`。测试后每卡约 1 秒 ALU 再测 **18.114／16.538／18.424／17.387／17.359 TFLOPS**，无旧 card2 算力腰斩。原全局 BO list 对 timeline/F16 纯通信微基准影响很大，但不能直接外推当前 RELAY/F32 MTP；>100 committed tok/s 仍未达到。
-- **MTP+LateBind 修复后的准确边界**：旧两次实验分别遭多 site WAR 误拒、RELAY generation 拒选和清理 SIGSEGV；现在每 site 独立校验、`resume_norm` 兼容 RADV 4/8 subgroup、server 释放前同步 target/draft，CPU-only 非法容量仍 fail-closed exit 1。仅五张不同 RX 6800 的 RELAY/F32、显式 `--tp5-latebind exact` 可 opt-in；其它 MTP LateBind 图前拒绝，生产默认不启用。多行 HC producer 现以逐 token 寻址，五卡 `1..60` 完整正确 171 tokens，稳态 target 图 `late=46`；算术/短长计数混合及流式取消后后继请求均正确。**未晋级性能**：单次客户端重复 exact 34.81、reference 34.98 committed tok/s，target 热中位 49.186 对 46.782ms；没有 >100 或配对净收益证明。11:20 GPUVM 资源寿命根因与新版 watchdog 真实故障闭环仍未证实。证据 `/var/tmp/tp5-mtp-multirow-{exact,baseline}-smoke.json`、`/var/tmp/tp5-mtp-multirow-mixed-cancel.json`、`docs/TP5-MTP-EVIDENCE.md`。
-- **新增 MTP 同进程重复请求的真实收益（尚未达 >100）**：首字前 ~0.9s 停在 `slot.mem.seq_rm(p0=0)` 的 target 单-cell recurrent reset，48 层／3 个 rollback 快照逐 tensor 同步零写；既有 cache 专用 meta buffer 在 `size=1 && n_brain_rows==0` 时可一次 `ggml_backend_buffer_clear`，两侧 scheduler fence 保留，多-cell／RERoT 仍逐行。五卡 reset **907ms→12.8–16.8ms**；正确自然停止的 171-token 同进程重复请求由独立改前烟测 **35.60／37.28** 到改后 **44.33／46.05 committed tok/s**（3.857／3.713s）；n=3 MTP opt-in 与参考数学不变。`--spec-draft-n-max=6` 独立完整烟测仅 **32.19**，不晋级。小样本没有统计 CI，产品 >100 门仍是 171 token <1.71s；详见 `TP5.md` 当前验收节，证据 `/var/tmp/tp5-mtp-{hand-shape-baseline,bulk-clear-smoke}.json` 与 `_logs/`，保护 service 继续 enabled/active。
-- **后续 MTP 安全修复及拒选（仍未达 >100）**：generic Vulkan GDN 曾在 K4／容量4／有效行2 时把填充行写入 rollback，GPU↔CPU 异构 head-map 测试先红；现 shader 按有效行执行并反排快照，生产 graph `n_written` 同步收窄，回归与五卡完整请求通过；TARGET 动态容量门仍关闭。多快照全行 GDN 融合虽合成测试全过，却在真实五卡 MTP 产生错误正文，已撤销。Q5_K MMVQ 上移解包生成完全相同 RADV ISA、独立 op 无收益，且生产参考臂实际禁用 MMVQ；四行 GDN/QSA 投影融合虽使 48-stage rank0 dispatch **4115→3971** 并逐项 CPU↔GPU 对拍，客户端却 **42.77／44.73**，同二进制关闭臂 **44.43／45.80 committed tok/s**，也已彻底撤销。回退后五卡同进程正确自然停止 `1..60` 两次 **44.25／45.33**（171 token／3.864、3.773s），远低于 <1.71s 的门；watchdog enabled/active，未见新增内核故障。完整负结果和证据在 `TP5.md` 当前验收节。
-- **更深一步的权重复用同样无净收益**：再次试验单 WG 对四笔 F32 token 只解包一次 Q5_K/Q6_K 权重，GDN/QSA 位级 CPU↔GPU oracle 与五卡完整答复均正确，但 opt-in 客户端 **42.95／45.87**、同二进制关闭臂 **43.79／45.43 committed tok/s**，没有一致净收益，已撤销全部试验代码。回退后最后一次完整 `1..60` 两次为 **43.75／46.27**（171 token／3.909、3.696s），产品门仍是 <1.71s；详细原始 JSON、投影命中日志与负结果见 `TP5.md` 当前验收节。
-- **新的 MTP 草稿实测最优已观测臂，仍未达到 >100**：只在显式 `GGML_TP5_MTP_DRAFT_SINGLE_GPU=1`、一个真实草稿设备时将草稿模型从继承的五卡 tensor split 改为单设备 NONE，target 仍五卡 RELAY/F32；`--no-spec-draft-backend-sampling` 固定原 CPU top-k。五块 `1..60` 完整准确 ABBA，n=3 模式继承 **44.33→46.47 committed tok/s**，配对差 **+2.14 [2.06,2.22]**；同单设备草稿上 n=3→显式 `--spec-draft-n-max 6`，五块 **46.53→52.03**、配对差 **+5.51 [4.87,6.14]**。另一次 n=6 `1..100` 同进程两次完整正确 **55.65／61.39**，不可混入 171-token 门；n=10 热草稿 ~83ms、反而退速。短计数／算术／长计数及流式中断后短长均正确，watchdog 维持 enabled/active；正确性／A/B 证据见 `TP5.md`。**当前 171-token 最佳配对均值 52.03，仍需 <1.71s 而实测约 3.29s**；不自动晋级默认，不关 GPU 保护。
-- **新的 MoE 跨 token 路由负结果**：五卡纯 Target 临时读回 48 层×2×170 步 top-10 路由，连续七步的 70 次 expert 选取仅约 35.6 个不同 expert；这只证明该计数文本的路由重叠，不是可外推的 MTP 性能数字。复用既有 grouped IQ2_S／IQ3_XXS、增试 grouped IQ4_NL、以及三类合并，各经 Vulkan0↔CPU 和完整正确自然停止验证；同二进制 2-block ABBA 分别 **52.15→51.40**、**51.18→51.14**、**51.61→50.25 committed tok/s**，均无可晋级净收益。全部实验代码／诊断钩子已撤，重建后的原生 n=6 两次 171-token 完整响应 **52.71／52.60**（3.244／3.251s）；证据、范围和失败的初版 IQ4 reader 寻址在 `TP5.md` 当前验收节。>100 及 <1.71s 门仍未通过，保持既有 opt-in、安全闸和 watchdog。
-- **最大容量 MTP 再次 fail-closed，禁止仅修 phase 后放行**：临时联动 `n_seqs_unq` 与调用方显式 PREFILL／DRAFT／CATCHUP 后，两 token warmup 和 27-token 预填能够通过，但正式 draft 以容量7、活跃1行录制的 native 图有 **81 个 dispatch 中 46 个未分类**，`predefined-coverage` 主动拒绝 active<capacity，HTTP 500；错误后续 catch-up frame 亦被拒。`/var/tmp/tp5-mtp-n6-capacity-phase-smoke.json` 和 `_logs/` 是安全拒绝证据，不是速度证据；临时 API／phase／物理 seq／测试均撤销，旧门仍关闭。应先对 compute/state/dependency 的 native dispatch 做完整活跃行降层及真实图验证，**不可绕开 coverage gate**。见 `TP5.md` 当前验收节。
+我检查了 E5-2699A 上的工作树、《困惑.md》《TP5.md》、关键源码和现有分相日志片段。**本次没有改代码，也没有把历史测试冒充新的性能复跑。** 下面给出的是现场审计后的工程判断；没有可靠证据的计算、通信、信令细分，我不会编数字。
 
-## TP5 重组进行中｜2026-09-22 历史记录（2026-09-23 当前证据见下）
-
-**历史审计基点：** `master@9290e7a1a`；这不是当前未提交工作树的 HEAD/验收状态。
-**历史状态：** 蓝图审计点 `880eecd8a` / `b024d03ef` 在当时不是 `9290e7a1a` 的祖先；以下 `880..HEAD` 只指当时审计区间，不是当前工作树 diff。历史吞吐数字（45.5/27.6/42.4/52.47）取自 880 的 AGENTS 记录，**本次不得视为复测**。
-
-### 一、历史清理与归因；本段吞吐数字尚未按当前协议配对复验
-
-|卡|交付|证据|
-|---|---|---|
-|**候选默认（2026-09-23 已收窄）**|当前改为仅五张 RX 6800、`qwen4exp-af` 计划才启用 relay/F16/相关旋钮；其他配置选择保守 timeline，CLI/环境消融可覆盖。独立 MTP 草稿模型不再是脚本默认。|旧版三次 `predicted_per_second`：52.28 / 52.61 / 52.25（均值 52.38）；旧工具继承 shell 环境，不是 clean-room，且未配对/未测 committed-token 完整墙钟，**不得称为最终最快**。|
-|B00|`scripts/run-qwen38-flash-tp5-server.sh` 的 `--baseline` 拆成 `--golden`（golden-relay-f32-v1）与 `--control`（control-timeline-f16-v1）；`--baseline` 保留为 control 别名。golden 分支先 `unset` 全部继承旋钮再显式导出。当前 `GGML_TP5_PROFILE=0/off/false` 已按值解析为关闭。|`bash -n` 干净；`--golden --print-config` 出 `sync=relay wire=f32 relay=on PROFILE=<unset> REPLICATE_ATTN=1 SPIN_MAX=100000000 HANDOFF_TIMEOUT_MS=5000`；`--control --print-config` 出 `sync=timeline wire=f16 relay=off`|
-|B02|RELAY 热重放不再 patch 旧 batch 的 epoch 字段（该提交路径自建整链 VkSubmitInfo，从不消费这些字段）|RELAY 的 submit/wait/signal/retire 全部走 epoch mailbox，行为不变；四模式回归见下|
-|B04|解耦单 primary command lowering 与 LateBind：新增 `GGML_TP5_LINEAR_LOWERING`，使得纯正 F32 黄金算力无需依赖近似数学即可独立启用单 primary 紧凑命令降低|编译与全套 mesh 回归通过（`LINEAR_LOWERING=1` 实跑 OK）|
-|B07|热路径静态化与存在性解析安全修复：将 `tp5_record_plan` 中的 profile_spin 改为静态求值，彻底修复 `GGML_TP5_PROFILE=0` 被系统误判为开启的静默缺陷|backend-meta 与 profile.cpp 语义已统一|
-|B00 事实|`TP5.md` 当前验收节：逐行复核 `4e056e1b4` 268+/13− diff，没有任何单一行可静态证明 −39%；蓝图两处归因过度（profile 锁、cached-first 默认）已纠正|
-|B 卡|`TP5.md` 当前验收节：B00–B09 四轴状态与未通过的门|
-
-### 二、`4e056e1b4` 复核要点（静态，未跑分）
-
-- **非守卫热路径只剩三处，量级都不足以解释 14.25 ms**：`ready_seen` 数组零初始化 + `++poll_iters`（ns/stage）、`tp5_relay_arm_bank` 多一次 `status[5]=0`、shader `spin_used` 的 LDS 读改写（lane0、spin 步数次）。
-- **历史可查项**：① 当时 `tp5_record_plan` 每计划一次的 `getenv("GGML_TP5_PROFILE")` 已在当前代码静态化；② shader `shared uint spin_used` 是否出现在最终 RADV ISA（仍需 `GGML_VK_PIPELINE_STATS` 采集）。
-- **memory 分配改动语义等价**：父提交 cached 优先、失败 uncached；子提交只是把 flags 拆开并加了 force 开关与日志，默认策略未变。
-- **`ggml_tp5_profile_end()` 的无条件锁在父提交已存在**，handoff 的起始计时/deadline 承担超时保护，均不得计入本次回归。
-
-### 三、硬件前置（历史记录，不适用于当前机器状态）
-
-旧班次曾记录 card2 1200MHz 偏斜。**用户确认 2026-09-23 当前已经没有降频**；不得沿用旧记录阻塞五卡试验，不关停 watchdog。新 A/B 保留 GPU 运行状态及日志作为溯源，不进行频率改写。
-
-### 四、本轮验证（本机实跑）
-
-- `cmake --build build-tp5 --target llama-server`：编译链接零 error。
-- `test-vulkan-tp5-mesh --sync relay --rounds 8 --check-all`：all passed（含 4 轮真实 GPU graph-producer，FD 增量 0）。
-- `test-vulkan-tp5-mesh --sync {timeline,star,gpuflag} --rounds 4`：all passed。
-- `--sync {relay,timeline} --{vary-input,delay-producer} --rounds 4`：all passed。
-- `ctest -R "rerot|xkv|flashprefill"`：50/50。
-- `ctest -R "test-tp5|test-mtp|test-predefined|test-target-capacity"`：6/6。
-- 完整 `ctest build-tp5` 全量轮次在后台运行，出结果另行归档。
-
-### 五、当时未做；当前验收以 TP5.md 为准
-
-B01 因果矩阵 A/B/C/D 与 B07 ISA 取证已完成；B05 Program/RunInputs 分离、B06 active-aware P1 尚未完成，B08 MTP 安全门未过。B09 证据与否决登记见 `TP5.md` 当前验收节。不能把代码存在写作默认晋级。
+完整工单、源码索引和测试要求已整理成：[下载《TP5 MTP 现场审计与工程路线图》](sandbox:/mnt/data/TP5_MTP_现场审计与工程路线图_2026-09-24.md)。
 
 ---
-## 下班交接｜2026-09-22（第二十三轮，回滚至 abd816e4d 基线 wire + 全部后续程序修复 backport）
 
-**分支：** `master`
-**主题：** 按你的指示放弃 Makefile DSL / Compact Dict JSON / lazy-grammar 试验，**语义回滚至 `abd816e4d` 的最初 DAG JSON wire 形态（`strategy: "simple" / "dag"` + `payload`）**，同时**完整保留其后所有不涉及 wire 的程序修复**。
+## 一、先把账立正确：问题不只是 514 ms，也不是 target 已经没有优化空间
 
-### 一、语义回滚与保留矩阵
+《TP5.md》中那次 `predicted_ms=2437.917`、25 个 cycle、完整正确输出 171 token 的请求，可以重排成下面这张**互不重叠**的账：
 
-| 模块 | 回滚至 `abd816e4d` | 保留后来的程序修复（backport） |
-|---|---|---|
-| **探针话术** | `Choose whether this request continues as a single answer or a DAG of independent sub-questions. Output only JSON: {"strategy":"simple","payload":{}} or {"strategy":"dag","payload":{"questions":[{"id":"...","intent":"..."}],"depends_on":[]}}.
-` | 末尾补 `
-`（满足后来加的探针注入换行守卫） |
-| **文法** | `json_schema_to_grammar(server_rerot_routing_schema_json())`（eager，从 `{` 起） | 删除了全部 lazy + pattern trigger 试验代码 |
-| **Schema** | `oneOf`: `strategy:"simple" + payload:{}` ／ `strategy:"dag" + DagPayload` | 保留了去重扫描辅助 |
-| **解析器** | `strategy == "simple"` 校验 payload 为空对象；`"dag"` 走 `questions`/`depends_on` + Kahn 全拓扑 | `incomplete` 语义保留：截断继续采样，完整但校验失败立即定案；去重扫描放在 `json::parse` 之后 |
-| **测试** | `test-rerot-parser` / `test-rerot-runtime` 恢复 strategy wire 夹具 | 5 套测试（parser/runtime/view/attn/flashprefill）**全 0 failure** |
-| **Vulkan 修复** | — | **完整保留**：turbo_wht / 29 个同类 shader 的 `NumWorkGroups` 线性化；host `wg_scale`；rope 动态行跨步；`Br=1` 钉扎 |
-| **seq 分区修复** | — | **完整保留**：单一权威分区（`set_pen_capacity` 唯一划分点）、`alloc_internal_seq` 断言无别名、`rerot_seq_retarget` 拷前清空、park/resume 空决策语义 |
-| **容量闸门** | — | **完整保留**：`rerot_admit_ready_result` 三态（`ok/saturated/failed`），消灭 5000+ 次刷屏的 admission 活锁 |
+| 项目                       |          整次请求耗时 | 含义                     |
+| ------------------------ | --------------: | ---------------------- |
+| 草稿                       |  **514.051 ms** | 150 次串行单步，包含 GPU 等待和采样 |
+| target 图区间               | **1700.078 ms** | 包含建图、分配绑定、输入设置、提交与等待   |
+| target `llama_decode` 图外 |   **90.072 ms** | 图区间之外的准备、状态处理、输出提取等    |
+| target 验收后处理             |   **95.056 ms** | 主要是逐行验收采样              |
+| draft catch-up           |   **35.891 ms** | 对草稿上下文执行真实的补齐计算        |
+| 计时边界残差                   |    **2.769 ms** | 不是固定“系统开销”             |
+| **合计**                   | **2437.917 ms** | 与该请求计时一致               |
 
-### 二、真机验证（780M，K=q8_0 / V=turbo4，`-np 2 --rerot-people 2 --rerot-pens 4`）
+依据：`TP5.md`“不以‘额外开销’掩盖草稿与 target 账”段，以及对应的 `tp5-mtp-n6-granular-ledger-*` 日志。
 
-| 提示 | 响应时间 | 探针 | 策略 | 结果 |
-|---|---|---|---|---|
-| `9.11 和 9.9 哪个大？直接回答。` | 6.43s | probe=66 | simple | **HTTP 200** / 64 token 正常回答 |
-| `Compute 13*17 step by step.` | 7.95s | probe=74 | simple | **HTTP 200** / 80 token 正常回答 |
-| `Solve (1) 13*17, (2) 21*19` | 6.81s | probe=? | dag | **HTTP 500 精确拒绝**（`cycle detected: q1<->q2`） |
+这里有两个必须同时成立的判断：
 
-- **环路被拒原文**（`probe_reject` trace 铁证）：
-  ```json
-  {"strategy":"dag","payload":{"questions":[{"id":"q1","intent":"Compute 13*17"},{"id":"q2","intent":"Compute 21*19"}],"depends_on":[{"id":"q1","depends_on_id":"q2"},{"id":"q2","depends_on_id":"q1"}]}}
-  ```
-  Kahn 算法在 **6.8s** 精确抓住互相依赖的死锁并 fail-closed，**未发生挂起、未发生 GPU 越界、未引发 Xorg 崩溃**。
-- `ctest -R "rerot|xkv|flashprefill"`：**50/50 全绿**（12.7s 完成）。
-- `dmesg` GPUVM / page fault 计数 = **0**；Xorg 存活。
+**第一，仅处理 90 ms 和 95 ms 不够。** 即使把它们全部删掉，这个诊断样本也只到约 **75.9 tok/s**。
 
-## 下班交接｜2026-09-22（第二十二轮，多 lane 长序列三类真机缺陷：越界地毯二期 + 探针上限 + seq 域单一权威重构）
+**第二，1885 ms 的 target 总时间不是 GPU 计算下限。** 它包含首图绑定、首次执行、图外接口、验收采样。不能先把这些装进 target 总账，再用“target 自己已经超过 1710 ms”证明只能大改计算核。
 
-**分支：** `master`
-**主题：** 用「给学生讲 Raft」这个真实长输出任务压出三类缺陷；前两类按地毯法根治，第三类**按你的要求做了系统性重构**（不再头疼医头）：seq id 的四个角色改为单一权威分区。
+实际需要解决的是：
 
-### 一、GPUVM 越界二期：`flash_attn_rerot` 的 grid 与 `Br=1` 契约冲突（真 bug）
+$$
+T_{\text{请求}}=\sum_{\text{cycle}}
+(T_{\text{draft}}+T_{\text{verify}}+T_{\text{catchup}}+T_{\text{接口}})
++T_{\text{冷税}}
+$$
 
-**现场：** 6 lane 并行、长序列（`n=126`）时 `radv: GPUVM fault at 0x80061fe21000`、`CLIENT_ID (TCP)` → `vk::Queue::submit: ErrorDeviceLost`（compute 队列，不是显示）。
+这次请求平均每轮 **97.52 ms**，实际公开输出平均 **6.84 token/轮**。若仍为 25 轮，要过 100 tok/s，就必须压到**含冷税平均 68.4 ms/轮以内**。
 
-**根因（纯索引）：** 专用 shader 把 `Br` 硬编码为 1（`flash_attn_base.glsl`，`constant_id 1`），head/行身份完全由 `WorkGroupID.y` 与 `ne2 = n_head_q` 决定；而 host 却按 **`head_groups = n_head_q / tuning.block_rows`** 划 Y 网格（tuning 在 GQA 分组可用时返回 `block_rows>1`）→ ① 部分 head 永不被计算；② split-K 部分行的步进与分配尺寸脱钩，长序列时越过分配区。
+因此，合理方向是联合削减草稿、状态物化、验证接口和首图成本，而不是指望一个小补丁省出全部差额。
 
-**修复：** host 恒以 `n_head_q` 为 Y 网格，并把 tuning 变体钉为 `block_rows = 1`（多行 GQA 分组是普通 FA 路径的变体，不是这个 kernel 实现的东西）。
+---
 
-### 二、探针阶段的两个诊断缺陷（本轮新增证据通道）
+## 二、514 ms 里到底有哪些计算、通信和信令？
 
-1. **EOG 文案错位**：探针未决时采样到 EOG 会报「子分隔符未关」，与事实无关；现按 `episode->probing && !strategy_decided` 区分为「探针未决」。
-2. **缺「已接受计划」日志**：原有只有被拒计划（`probe_reject`）。新增 `rerot.trace.probe_plan`（已接受计划 + 选定策略），并**把计划压成单行**（转义 `\n/\r/\t`）——多任务计划的 JSON 是多行的，先前会被日志按行截断（本轮实测：第一版只拿到 `text={`）。
+### 1. 已知的是“等待位置”，还不是“等待原因”
 
-### 三、seq id 域：从「隐式分区」重构为「单一权威」（按你的指示）
+现有草稿细账是：
 
-**缺陷本质：** 一个 id 空间混了四种角色，靠「谁先谁后」隐式分区：
-- pen（物理执行 lane）默认 `exec_seq = first_internal_seq_ + i`；
-- 而 `alloc_internal_seq()` 的 arena **也从 `first_internal_seq_` 起发号**。
+* `llama_decode` enqueue：**67.454 ms**。
+* `common_sampler_sample` 外围计时：**445.386 ms**。
+* hidden getter：**0.099 ms**。
+* 其余：**1.112 ms**。
 
-于是 `--rerot-pens 6` 时，arena 前 6 个 id 已被 lane 占用，随后 park/archive/probe 再发号就会**与某条 lane 撞 id** → 两个 lane 写同一物理 KV 行 → 第二阶段越界（`0x80062382b000`）或静默污染；叠加「容量闸门返回成功」导致的 live-lock，表现为 `resumed RUNNING lane has no pending decision` / 无限 `Lane admitted`。
+平均每步约 **3.427 ms**，其中 enqueue 约 **0.450 ms**，等待加采样约 **2.969 ms**。
 
-**重构（单一权威 + 显式不变量）：**
-- `set_pen_capacity()` 是**唯一**划分点：
-  `lanes = [0, max(pen_capacity, first_internal_seq_))`，`internal arena = [该基址, max_seq_)`；
-  分区在两个 `std::array<bool, LLAMA_MAX_SEQ>` 角色位图里显式记录；
-- `alloc_internal_seq()` 在**分配点**断言 `!seq_role_lane_[id] && !seq_role_internal_[id]` —— 任何别名在源头 fail-closed，而不是等 GPU 越界；
-- `free_internal_seq()` 同样断言归还的确实是 arena id；
-- pen 超出请求并发数（`--rerot-pens > n_parallel`）时**不预置 id**（`-1`），由 admission 重绑到真实物理槽位。
+源码 `common/sampling.cpp::common_sampler_sample` 明确先同步上下文，再开始内部 sampler 计时。因此：
 
-顺带修掉两处同族真 bug：
-- **park 写入 `LLAMA_TOKEN_NULL` 占位** → resume 端把正常重入当损坏硬杀（`resumed RUNNING lane has no pending decision`）。改为：无待续判决就不写 pending，resume 端缺 pending 时以 `sampled=NULL, i_batch=-1` 走正常下一步。
-- **`yield_dag_pen_for_ready()` 的 `seq_cp` 假设目标 seq 干净** → 复用 `parked_seq` 时第二次 `seq_add` 触发 `llama_kv_cells` 断言。新增 `rerot_seq_retarget()`：拷贝前先清目标归属（4 处：yield / passivate / unpark）。
-- **`rerot_admit_ready()` 的容量闸门返回「成功」** → `finish_frontier` 把它当「cohort 已推进」，每个 decode 步重入 admission，反复重置仍在 STARTING 的 lane 的帧注入游标（`injection=8` 卡在 `n=11`），pen 永不释放 → live-lock。改为三态返回值（`ok / saturated / failed`），`saturated` 明确表示「无进展且非错误」。
+> **445 ms 不能叫“CPU 采样成本”，也不能叫“全是可以删掉的同步水分”。它包含上一段 GPU 尚未完成的时间。**
 
-### 四、KV 上限（负责人给定，未再下压）
+真正需要消除的是：**为什么每生成一个草稿 token，都必须让高层 CPU 采样器返回一次，才能启动下一步？**
 
-**K = q8_0、V = turbo4 已到极限。** 对照：`turbo3/turbo3` 时探针打转，换回后正常。
-
-### 五、验证记录
-
-- `test-rerot-runtime` / `test-rerot-attn` / `test-rerot-view` / `test-rerot-parser` / `test-rerot-recurrent` / `test-rerot-span-expand` 全 **0 failure**；
-- 真机（780M，K=q8_0/V=turbo4，`-np 2 --rerot-people 2 --rerot-pens 6`）「给学生讲 Raft」：探针 355 tokens → `dag`，**8 节点**（6 worker + 0.plan + synthesis），`deps` 为 `1→2→3→4→5→6` 递进链（第 4 步同时依赖 2、3），**HTTP 200**，`GPUVM/page fault = 0`，Xorg 存活。
-
-### 六、未闭合
-
-1. `--rerot-pens > n_parallel` 时超出部分不预置 seq（由 admission 重绑）；若未来要真正并行超过槽位数，需要同时抬高 `n_parallel`（请求并发）而不只是 pens。
-2. 5×6800 目标机的多 lane 收益与长序列压测仍需在该机复测。
-
-## 下班交接｜2026-09-22（第二十一轮，路由探针换轨：作废 Makefile 行式 DSL → Compact Dict JSON）
-
-**分支：** `master`
-**主题：** 按新规格作废上一轮的行式 DSL，改为**极简扁平键值对 JSON**（`tasks` 先给全部任务与意图，`deps` 再集中给依赖连线）。真机 5 次请求全部 HTTP 200，路由能自适应 simple / dag。
-
-### 一、换轨内容
-
-| 项 | 旧（已废弃） | 新 |
-|---|---|---|
-| 探针提示词 | `Plan 1+ tasks as DAG (ID [<- DEPS]: INTENT, …)` | `Plan in JSON: {"tasks":{"<id>":"<intent>",...},"deps":{"<id>":["<dep_id>"],...}}\n` |
-| 文法 | 手写扁平 GBNF（`dag-line`/`deps`/`id`/`intent`） | `server_rerot_routing_schema_json()` + `json_schema_to_grammar()` |
-| 解析 | 手写 `std::string_view` 行扫描 | `nlohmann::json::parse` + 恢复的重复成员扫描（nlohmann 会静默取最后一个成员） |
-| 冗余 Key | — | 彻底删除 `strategy` / `payload` / `questions` / `depends_on_id` |
-
-DSL 相关函数（`trim_dsl_view` / `valid_dsl_id` / 行扫描解析）与手写 GBNF **已全部删除**（`grep` 零残留，仅测试里保留一条「提示词不得含 dag-line」的守卫断言）。
-
-### 二、模板迭代的三个真机教训（重要）
-
-1. **具名示例会被照抄**：规格最初的 `{"tasks":{"A":"..."},"deps":{"C":["A"]}}` 里 `deps` 引用了未声明的 `C`，模型忠实照抄出 `{"tasks":{"A":"13*17=221","B":"21*19=399"},"deps":{"C":["A","B"]}}` → 按规格自身的「未知端点必须拒绝」被拒，**每个请求都失败**（实测 `unknown endpoint in dependency: C`）。
-2. **改用占位符 `<id>` / `<intent>` / `<dep_id>`**：模型不再照抄具名依赖，必须给出真实 id。
-3. **必须显式给出 `...`**：模板不含 `...` 时模型不知道能否继续追加条目（塌缩成单条目或自造汇聚节点）；加上 `...` 后计划正常。
-
-最终模板（`server_rerot_routing_probe_prompt()`）：
+`common/speculative.cpp::common_speculative_impl_draft_mtp::draft` 当前就是：
 
 ```text
-Plan in JSON: {"tasks":{"<id>":"<intent>",...},"deps":{"<id>":["<dep_id>"],...}}
+llama_decode 一步
+    → CPU 等待并取得采样结果
+    → CPU 构造下一步 batch
+    → llama_decode 下一步
 ```
 
-### 三、强制分层（转换器能力边界，测试已钉住）
+原生 device-hidden 只替换了 hidden 的交接方式，没有消除这条逐步控制链。
 
-`json_schema_to_grammar()` 渲染 `minLength` / `additionalProperties:false`（由**文法**物理屏蔽），但**不渲染 `minProperties`**，故「空 `tasks` 对象」由**解析器**拒绝。解析器还 fail-closed 校验：重复 JSON 成员、id/intent 非空且非纯空白、保留 id `"0"`、未知依赖端点、自环、重复边、Kahn 全拓扑覆盖（有环整张拒绝）。任何缺陷都不得删边/裁节点/静默修复。
+### 2. 草稿确实有实际计算，不能把“一层”理解成近乎免费
 
-### 四、探针完成判定与诊断（保留上轮加固 + 本轮新增）
+`src/models/qwen4exp.cpp::graph_mtp` 中，这一层包含 token embedding、EH 投影、HC 混合、完整注意力、MoE、输出混合与 LM head。
 
-- 解析器 `incomplete` 语义：JSON 尚不合法解析（截断，探针仍在流式）→ 继续采样；**语法完整但校验失败** → 立即 fail-closed 并回报解析器自己的诊断（不再等 EOG）；
-- 探针 512-token 硬上限；EOG 文案区分「探针未决 / worker 分隔符未关」；
-- trace 门控**成对**日志：`rerot.trace.probe_reject`（被拒计划全文）与 `rerot.trace.probe_plan`（**已接受计划 + 选定策略**），前者是抓住 C 照抄问题的关键，后者用于事后核对探针质量；
-- 去重扫描必须在 `json::parse` **之后**（扫描器会把截断误报为「重复成员」，实测 `{` 两字节即误拒）。
+所以，514 ms 中确实有矩阵计算和显存访问；但现在没有同一请求、同一时间线上的证据，能告诉我们其中各占多少。
 
-### 五、验证记录
+另外，**这个 MTP 草稿块走普通注意力；大量 GDN 前缀快照的问题主要在 target 验证侧。** 不能把两者的状态成本混为一谈。
 
-- **单测：** `test-rerot-parser` **0 failure**（合法：单任务/空 deps/并行双任务/链式/菱形/自由文本 intent/plan_rank；拒选：缺 tasks、空 tasks、类型错、空 intent、保留 0、未知端点、自环、重复边、环路、多余字段、重复成员、损坏 JSON；文法接受/拒选矩阵含「旧 DSL 不再可入」）；
-- **回归：** `ctest -R "rerot|xkv|flashprefill"` **50/50**；`test-rerot-view` / `test-rerot-runtime` 各 **0 failure**；
-- **真机**（780M，K=q8_0 / V=turbo4，`-np 2 --rerot-people 2 --rerot-pens 4`，最终模板）**5/5 全 HTTP 200**：
+### 3. TP5 的 P2 也不等于纯通信
 
-| 提示 | probe tokens | frame tokens | 策略 | 结果 |
-|---|---|---|---|---|
-| 9.11 vs 9.9 | 56 | 0 | simple | 200 / 8.8–9.5s |
-| 13*17 与 21*19 | 59 | 591 | dag（2 独立节点） | 200 / 23.2s，221 / 399 |
-| 13*17 step by step | 80 | 760 | dag（A→B 链） | 200 / 57.3s，10*17+3*17 → 221 |
-
-`rerot.trace.probe_plan` 实测原文（最终模板，占位符均被替换为真实 id）：
+我看了 `ggml-vulkan-collective.cpp::tp5_star_handoff`。当前 RELAY 路径实际包括：
 
 ```text
-episode=1 tokens=56 strategy=simple text={"tasks":{"a":"Compare 9.11 and 9.9 and determine which is larger"},"deps":{}}
-episode=2 tokens=59 strategy=dag    text={"tasks":{"task1":"Calculate 13*17","task2":"Calculate 21*19"},"deps":{}}
+等待五卡 producer ready
+    → CPU F32 归约
+    → 写回五张 BAR
+    → 发布 generation
+    → GPU 消费者继续执行
 ```
 
-即：单任务且无依赖 → `simple`（frame=0）；两任务无依赖 → `dag` 并行；A→B 链 → `dag` 带边。自适应行为与设计预期一致。
+现有代码已经有 `rank_ready_us`、`ready_skew_us`、`arm_us` 等字段。
 
-### 六、未闭合
+因此，七行链中的 **8.256 ms P2** 不能直接叫“PCIe 传输成本”：里面可能包含慢 rank、CPU relay、发布和恢复等待。**46.257 ms compute 也只是计算命令段，不是纯 ALU 时间。**
 
-1. `deps` 引用未声明 id 仍 fail-closed（规格要求）；模板已用占位符引导模型只在已声明 id 间连线。
-2. 目标机 5×6800 的 DAG 多 lane 收益仍未复测。
+正确的账应该区分：
 
-## 下班交接｜2026-09-22（第二十轮，核显 GPUVM 越界崩溃地毯修复 + RERoT 槽位/脑行修正 + 路由探针挂死上限）
+| 分类      | 应测内容                                         | 不能混进去的东西             |
+| ------- | -------------------------------------------- | -------------------- |
+| 计算与本地访存 | 矩阵、MoE、注意力、状态更新、临时物化                         | 别的 rank 尚未完成造成的等待    |
+| 数据传输    | logits/hidden/token、collective payload 的实际搬运 | 等 producer ready 的时间 |
+| 控制与信令   | 提交、generation 发布、协议处理、消费者恢复                  | 被依赖的 GPU 计算本身        |
 
-**分支：** `master`
-**主题：** 三组真机缺陷的根因定位与修复；全部有复现证据与回归证据。路由 DSL 换轨已在上一提交 `82c854de3` 落地，本轮是其**真机暴露出的下游缺陷**。
-
-### 一、核显 GPUVM page fault → Xorg 被内核重置（根因）
-
-**现场：** `journalctl -k` 记录 `[gfxhub] page fault from client 10 (TCP)`、`GPUVM fault at 0x800775210000`、`ring comp_1.1.0 timeout` → `ring gfx_0.0.0 timeout (Process Xorg pid 739)`，即 compute 队列复位传染图形队列，桌面被杀。
-
-**根因（纯数学，已静态证明）：** `turbo_wht.comp` 用硬编码线性化
-`base = (WorkGroupID.z*262144 + WorkGroupID.y*512 + WorkGroupID.x) * 128`，
-而 host `ggml_vk_turbo_wht` 按 `wg_denoms[0]=128` 反算网格、且把 `elements[0]` 写成 `512 * group_size`。
-当 `group_size=64`（本模型）时 X 维实际只有 **256** 个 workgroup，shader 却按 **512** 跨步：
-每推进一行 Y，基址前移 65536 元素而实际只覆盖 32768 → **2 倍虚增**，末行直接越界写显存。
-
-**修复：**
-1. `turbo_wht.comp` 改为 `((z*NumWorkGroups.y + y)*NumWorkGroups.x + x) * 128`，并恢复逐线程守卫 `base + tid >= p.ne`（此前误改为 `base >= p.ne`，barrier 分歧风险）；
-2. host 改 `total_wg = CEIL_DIV(pc.ne, 128)`、`elements[0] = 512*128`，与 local_size 解耦，**永不再乘 WHT group_size**；
-3. **地毯：** 同类「512-slab 折叠 + 硬编码跨步」全部改为 `gl_NumWorkGroups` 线性化——`generic_unary_head/binary_head.glsl`、`multi_add`、`out_prod`、`concat`、`conv2d_dw`、`pad`、`silu_back`、`upscale`、`opt_step_adamw/sgd`、`glu_main`、`copy_to_quant/copy_from_quant`、`conv2d_mm/conv3d_mm`(B_idx_NPQ)、`rope_*`×4、`argmax/cumsum/norm/l2_norm/rms_norm_back/soft_max/soft_max_back/solve_tri/sum_rows`；
-4. host 侧补 `wg_scale`（CPY f32↔quant 与 router 路径按 `wg_denoms[0]` 缩放 X 维）；ROPE 行切分改用 `maxComputeWorkGroupCount[0]`，shader 用 `NumWorkGroups.x` 作行跨步（消除 `32768` 硬编码）。
-
-**审计结论：** 「512-slab 折叠」类 dispatch（`cpy_to_contiguous`、`cpy_to_strided`、`SET_ROWS`、`ROPE`、`turbo_wht`、router quant、`multi_add`、`out_prod`）的消费者已全部 `NumWorkGroups` 化；其余「刚性网格」shader（dequant/qwen4/xkv/flash/tp5/ssm 等）由各自 dispatch 给精确网格、无折叠，属另一套正确契约。
-
-### 二、`brain_copy >= 0` assert（真 bug，非安全屏障）
-
-**根因链：** `common.cpp` 的 dynamic-KV「采用已解槽数」逻辑把 `cparams.n_seq_max` 回写进 `params.n_parallel`；RERoT 下 `n_seq_max = LLAMA_MAX_SEQ (256)` 是**逻辑停放 id 域**而非请求并发 B，于是 4 个 slot 全被当成根请求槽位，LRU 把根请求派给 **slot 3**，超出临时脑行映射 `seq_id < B=2` → `brain_row_for_seq` 返回 −1 → `data[i] >= 0` 断言。
-
-**修复：** ① `--rerot` 开启时跳过该回写；② 新增对齐：`n_parallel` 跟随 `--rerot-people`；③ `external_slot_eligible()` 用 `rerot_person_max` 限定根请求槽位（pens 只能作子 lane）；④ 断言换成点名 seq 的 fail-closed abort（`brain_copy[i] = -1 (seq needs acquire_brain_row or slot id < B)`）。
-
-**证据：** 日志由「capping 256→4 + 根请求落 slot 3 + 断言」变为 `n_slots = 4, n_request_slots = 2`，根请求落 slot 0/1，断言消失。
-
-### 三、路由探针无限生成（240s 挂死）→ 硬上限 + 精确诊断
-
-**现场（`--rerot-trace`）：** 探针在 `node=0 serial=0` 上以 ~12 tok/s 连续生成 240s，反复输出 `2: 9.9 is larger.` / `99 <- 1, 2: …` 一类循环计划行，**从不输出终止空行**；客户端 240s 零字节超时。
-
-**根因：** 探针 token 被刻意排除在用户 `n_predict` 之外，也不计入 `check_hard_limits` 统计的 public/private/pending → **没有任何上限**（episode 预算由 context 推导，可达 8k）。
-
-**修复：**
-1. `SERVER_REROT_PROBE_MAX_TOKENS = 512` 硬上限（探针提交路径逐 token 检查），超限即 fail-closed：`rerot_resource_exhausted: routing probe exceeded 512 tokens without a plan terminator`；
-2. `rerot_try_finish_probe`：终止空行已到且解析被拒时**立即定案**（文法只能在终止符完成 ⇒ 判决终局），不再等 EOG 白烧一步；
-3. trace 门控新增 `rerot.trace.probe_reject`（打印完整计划文本）；EOG abort 文案区分「探针未决」与「worker 分隔符未关」。
-
-**实测：** 挂死 → **40.2s** 精确报错（原 240s+ 无界）；语义非法计划 → **5.1–5.6s** `routing plan rejected: line 2: duplicate question id: -`；正常路径 `13*17` → **HTTP 200 / 9.4s**，`probe_tokens=37, frame_tokens=0` → 单节点判为 `simple`，产出 96 token 真实推理。
-
-### 四、KV 上限结论（负责人给定）
-
-**K = q8_0、V = turbo4 已是极限，不可再压。** 对照观察支持此结论：同一提示在 `-ctk turbo3 -ctv turbo3` 下探针**打转**，换 `q8_0/turbo4` 后能收尾。本轮真机复测一律使用 `-ctk q8_0 -ctv turbo4`。
-
-### 五、验证记录
-
-- `test-backend-ops -b Vulkan0`：**TURBO_WHT 45/45**、**SET_ROWS 319/319**、**CPY 250/250** 全部 OK；
-- `dmesg` GPUVM / page fault 计数 = **0**；多轮真机模型运行后 **Xorg_OK**（崩溃不再复现）；
-- `ctest -R "rerot|xkv|flashprefill"`：**50/50 全绿**（覆盖 `test-rerot-parser/view/runtime/attn/ddvr/math/profile/recurrent/span-expand/q-prep/q3-shared-kv-2reader/shared-block` 与 `test-flashprefill-{state,routing,select,attn}`、`test-xkv-*`）；
-- `llama-server` 与全部测试目标编译零 error、改动文件零 warning。
-
-### 六、未闭合与待决策
-
-1. **探针失败策略**：当前 fail-closed（整请求报错），与 RERoT.md「不可静默修复」红线一致；是否改为「探针失败 → 退化为普通单流续写」属产品语义变更，待负责人决定。
-2. **id 退化**：该模型常把 `-` 当项目符号 → 多行 id 全为 `-` → 重复拒选（文法 `id ::= [A-Za-z0-9_-]+` 允许）。可选收紧为「id 至少含一个字母数字」，只改报错措辞、不改变成败。
-3. 本轮全部为开发机单卡 780M 上真机验证；5×6800 目标机的 RERoT 多 lane 收益与 DAG 全链路仍需在该机复测。
-
-## 下班交接｜2026-09-22（第十九轮，最终交付：FlashPrefill 共享 Run 分桶与 Base 零拷贝 + 十问缺口完整盘点归档）
-
-**分支：** `master`
-**主题：** 本轮为最终交付班次。推进完成两项核心使命：
-1. **主机端布局构建性能收敛**：落实 FlashPrefill 路径上的 Q3/Q4 深度共享——消灭跨 View 对 $K$ 个常驻 Cell 的重复全量哈希查找，建立 `shared_base` 预排序与 `run_buckets` 一次性分桶，R=12 耗时由基线 1.14s 压缩至 **311ms (3.68×)**；
-2. **全计划剩余缺口审计与交接**：全面核对 P0–P14 原讨论稿与 2026-09-21《计算组织方式重画与十个根本问题》，将全部 17 项剩余缺口规范归档并追加至 `缺口.md`，为后续 GPU Kernel 落地与真机实测提供完整导航。
-
-硬件已彻底修复完成，不会死机，所有硬件限制和安全性门禁已全面解除，100% 单元测试与 ASAN 验证通过。
+**不要把“CPU 在等 GPU”的同一段时间，同时算一次 GPU 计算、再算一次同步浪费。**
 
 ---
 
-### 一、第十九轮代码改动：FlashPrefill 共享 Run 分桶与 Base 预排序（`src/llama-kv-cache.cpp`）
+# 三、路线图：按激进到普通排序
 
-针对第十八轮后剖析指出的“Filter 占单次构建 67% 时间、每 View 重复对 $K$ 个 Cell 执行 `unordered_map::find` 哈希查找”问题：
+## 路线 1：最激进，也最值得作为主线——把草稿纳入统一 TP5 执行程序
 
-| # | 改动 | 机制与收益 |
-|---|---|---|
-| 1 | **`shared_base` 预排序与零拷贝借用** | 静态非活跃但已拥有的 Cell 属于纯读者无关属性。在 `fp_scan_resident` 中直接提取至 `scan.base` 并预排序一次；后续各 View 直接以 `const &` 引用借用，彻底消灭每个 View 内部独立的 `base.push_back` 与排序探测。 |
-| 2 | **`run_buckets` 一次性键值分桶** | 在单趟扫描期间，活跃 Cell 按 `(episode_id, run_id)` 直接分桶为行索引数组；每 View 由 $O(K)$ 遍历全局 Cell 改为**仅遍历该 View 实际声明的 Ordered Runs**，哈希查找由 $R 	imes K$ 次（约 236 万次）降为 $R 	imes N_{\text{runs}}$ 次（12 次）。 |
-| 3 | **负坐标防御前置** | 负物理存储坐标检查在扫描阶段一次完成并立即 fail-closed，保证下游只读安全。 |
+### 目标不是五卡参数，而是一个完整的执行闭环
 
-### 二、性能对比实测（min-of-5，fragments 数量与位级输出 100% 一致）
+我建议首版只覆盖当前明确场景：**单序列、当前 Qwen MTP、RELAY/F32、n=6、语义允许的 greedy**。其他组合继续走已有路径。
 
-| 形状 | 优化前基线 | 第十八轮 (共享扫描) | **第十九轮 (共享分桶+Base)** | **总加速比** |
-|---|---|---|---|---|
-| **R=12 K=196609** | 1,143,707 us | 460,967 us | **311,096 us** | **3.68×** (单轮再省 32.5%) |
-| **R=8 K=131073** | — | 213,674 us | **146,770 us** | **1.46×** (相比第18轮) |
-| **R=6 K=98305** | 237,534 us | 128,921 us | **89,763 us** | **2.65×** (单轮再省 30.4%) |
-| **R=4 K=65537** | 105,332 us | 65,458 us | **46,694 us** | **2.26×** (单轮再省 28.7%) |
-| **R=1 K=16385** | 8,161 us | 7,132 us | **6,740 us** | **1.21×** |
+将执行层拆成：
 
-### 三、剩余缺口全貌归档（见 `缺口.md`）
+```text
+Program
+    固定算子与通信拓扑、rank 布局、描述符计划、scratch 生命周期
 
-已全部追加并同步至仓库根目录 `缺口.md`，分为三大模块：
-1. **第一部分：原计划 P0–P14 算子/架构缺口**（缺口一至七）：
-   - P2 融合 Q-prep 着色器（Live-count gather + RoPE）
-   - P7 多行/PQ2_0 投影 Recipe 扩展（$b \in [2, 6]$ 消除退化）
-   - P9 非均匀 Head Map 分组与自适应长短行 Split-K
-   - P10 逻辑 State 驻留池与 Device-Copy Parking（消灭跨进程序列化）
-   - P12 常用阶段预定义图句柄复用（消灭阶段冷启动）
-   - P13 紧凑 Span ABI 直通 Attention Op（25MB $	o$ 几十字节）
-   - P14 全特性真机 A/B/B/A 配对净收益测量
-2. **第二部分：2026-09-21 计算组织研究线（十问根本问题）缺口**（缺口八至十五）：
-   - Q1 算子输入共享与图级公共子图去重 / MoE 专家聚集
-   - Q3 公共 KV 块多读者共享注意力 GPU Kernel（Hydragen 模式）
-   - Q5 GDN 状态共同基底 + 低秩增量 GPU 落地与平滑转稠密门控
-   - Q6 已知 Token WY 块折叠 GPU 算子（固定入口与已知验证块）
-   - Q7 PQ2_0 位平面子集求和与 LUT 路径 GPU 真实带宽评测
-   - Q8 上下文跳块误差界与 Key 包围球硬件跳过
-   - Q9 越过 Logits 的联合 LM Head 与批量 GPU 原生采样器
-   - Q10 $K 	imes H$ 联合投机网格验证与多笔交互前沿预测
-3. **第三部分：主机端元数据与布局微细缺口**（缺口十六至十七）：
-   - FlashPrefill 跨 View 相同可见性 Run 切片引用复用
-   - 写入端分配器主动长 Span 维护与碎片整序
+RunInputs
+    token、position、KV 位置、active rows、接受长度、generation
 
-### 四、验证记录
-
-- **测试套件**：`ctest -R "rerot|xkv|flashprefill"` 47/47 全部通过（100% PASS）；
-- **专用验证**：`test-tp5-plan`、`test-flashprefill-state`、`test-flashprefill-routing`、`test-xkv-runtime` 全绿；
-- **ASAN 内存审计**：在 `/tmp/asan18` 下编译 `test-flashprefill-state`、`test-flashprefill-routing`、`test-rerot-view` 运行结果 **0 错误**；
-- **硬件与显存**：保持 GPU 空闲，无设备挂死，无内核 panic。
-
----
-
-## 下班交接｜2026-09-22（第十八轮，flashprefill 布局路径：常驻表共享扫描 + 每桶排序探测）
-
-**分支：** `master`
-**主题：** 十问讨论稿的主干前四问落到 **flashprefill 布局路径**（`llama_flashprefill_build_rerot_plan`）。
-上一轮交接以后，这条路径是唯一还没做过跨 reader 共享的主干环节。全程 CPU 验证完成。
-
-### 一、先测后改：相位剖析推翻了一个此前的结论
-
-在真实 builder 上临时插桩（**已 `git checkout` 回退，未提交**）后：
-
-- **92% 的单次 build 时间是每 view group 重复的全 cell 扫描**（R=6 是 R=1 的 7.6×，同 K）；
-- **排序只占 7.8%** —— 前几轮在 indexed 路径上得出的「排序是大头」**不能外推到这条路径**；
-- 匹配总 K 分解（K=131073）：R=1 = 60.7ms（共享扫描 + 1 view），R=8 = 230.7ms（共享扫描 + 8 view），每 view ≈ 21ms。
-
-### 二、两处改动（`src/llama-kv-cache.cpp`，+85 行）
-
-| # | 改动 | 依据 |
-|---|---|---|
-| 1 | **常驻表共享扫描**：新增 `fp_resident_row`/`fp_resident_scan`/`fp_scan_resident()`，一次扫完所有常驻 cell；每个 view group 由扫描退化为**过滤**（只有可见性谓词是 per-reader）。`sig` 直接取 `cells.seq_get_all(idx)`，删除 `live` + `member_sig` | 十问问题三「一块数据供给服务多个 reader」在 host 侧的对偶 |
-| 2 | **每桶 sortedness 探测**：桶按 cell index 序填充、排序键是 storage 序，生产形状两者一致；O(n) 探测失败才 `std::sort`。**比较器只写一次**，probe 与回退 sort 共用 | 十问问题四「结构不变就不重做」的最小实例 |
-
-### 三、实测（fragments/groups/uses 数量前后完全一致）
-
-| 形状 | 前 | 后 | 加速 |
-|---|---|---|---|
-| R=12 K=196609 | 1,143,707 us | 460,967 us | **2.48×** |
-| R=6 K=98305 | 237,534 us | 128,921 us | **1.84×** |
-| R=4 K=65537 | 105,332 us | 65,458 us | **1.61×** |
-| R=1 K=16385 | 8,161 us | 7,132 us | 1.14× |
-
-拆开看：共享扫描单独贡献 R=12 **2.25×** / R=6 **1.71×** / R=4 **1.54×**（R=1 仅 1.03×）；排序探测再 −5~7%。
-**收益随 reader 数增长**——与十问「K 笔共享结构天然在同一层、同一执行阶段」一致。
-
-### 四、新增回归臂（`tests/test-flashprefill-state.cpp`）
-
-`test_rerot_shared_scan_multi_reader`：一次规划调用里两个不同 reader + **物理 cell 被两个 reader 共享**。
-钉住三件事：每 reader 的 (physical, effective) 集与逐 query oracle 一致；A-only cell 对 B 不可见（共享 cell 语义）；
-B 的 base 段内出现**两个 DDVR 相位**（0@7 → 2@8，因为 cell 1 不属于 B）——这正是必须保持 per-reader 的相位，
-会被错误的共享化一次抹平。写这个臂时我先把期望值算错两次（run30 成员数 4 数成 3），由 oracle 纠正。
-
-### 五、本轮工程教训（重要，写进 RERoT.md §21.4）
-
-1. **绝不能在 1 万行文件上做全文字符串 strip**：一次 `s.replace(frag,'')` 清理插桩误删了真实 `}`，
-   把 85 行改动炸成 2047 行差、大括号 1983 vs 938。恢复：`git checkout` 回 HEAD → `git apply` 保存的测试 patch →
-   主文件用**逐条 `assert count==1` 的锚点替换**重做。
-2. **插桩必须可逆**：先插桩→测量→回退，才没有把 indexed 路径的相位结论外推到这条路径（实际结论相反）。
-3. **probe 与它替换的 sort 共用同一个比较器**，且覆盖排序键全部分量（第十一轮教训的第二次应用）。
-
-### 六、验证
-
-- ctest `rerot|xkv|flashprefill` **47/47**；`test-tp5-plan` / `test-meta-reduce-boundary` 全过。
-- ASAN（/tmp/asan18）：`flashprefill-state` / `flashprefill-routing` / `rerot-view` **0 错误**。
-  唯一已知报告是 `test-xkv-runtime` 基线既有的 alloc-dealloc-mismatch（测试自带的 operator new/delete 重载
-  与 libstdc++ `std::get_temporary_buffer` 冲突，在 oracle `llama_rerot_build_query_layout` 内，与本轮无关；
-  第十三轮起即为基线）。
-
-### 七、边界与未闭合
-
-1. **per-view 过滤仍是 O(K) 每 reader**：匹配总 K 下 R=8 是 R=1 的 3.8×。共享扫描只消除了重复扫描，没消除
-   **重复分桶**。下一步是让分桶按 run 复用（同一 run 成员集对所有 reader 相同，只有 own/gate 不同），把 Q4 的
-   `llama_rerot_run_order_signature` 接到这个调用点；flashprefill 侧已有 `fp_key` + freshness 整层缓存，
-   fragment 级缓存的边际收益需先证明再动手（21.3 节保留此判断，本轮未推翻）。
-2. 排序探测在生产形状收益有限（R=1 时探测本身有成本）；若写入侧后续主动维持长 span（Q2 的
-   `span_long_fraction` 验收指标），cell 序与 storage 序会更稳定，届时再评估把探测上移到写入侧。
-3. 真机收益仍需目标机跑模型会话验证；本轮全部数字是开发机 CPU 合成键，不是模型证据。
-
-
-## 下班交接｜2026-09-22（第十七轮，§4.1 几何第二步：resume_norm / resume_lo_q8 / UP_Q8DOT 三 kernel 收口）
-
-**分支：** `master`（本轮 commit 见 git log；基于 `c67819718`，rebase 过 RERoT `0cf626757`）
-**主题：** 第十六轮 Q8DOT 半波 shuffle 树的同一原则推到剩余三个 LDS 往返点。全程 CPU + 既有 GPU 回归。
-
-### 一、三项改动（单 shader 文件为主，UP_Q8DOT 另改 dispatch 常量）
-
-1. **resume_norm**：跨 subgroup 折叠原是"lane0 写 `partials[sg]`→barrier→subgroup 0 各 lane 读 `partials[i]`→subgroupAdd→lane0 回写 `partials[0]`→barrier"——subgroup 0 单波串行在四个 stream WG 的关键路径上。固定 8-subgroup 形状下全员直读 8 个 partial 寄存器求和：少一个 barrier、无单波串行、`partials[32]`→`[8]`。**code 18920→15412（−18.5%），VGPR 32→24（SIMD 占用率 +33%）**。加 `gl_NumSubgroups != 8u` fail-closed 守卫（Q8 家族惯例）。
-2. **resume_lo_q8**：`lo_q_tmp[320]` LDS 往返换 wave 内 `subgroupShuffle` 三次重建对齐 4-lane 组（`g0 = sublane & ~3u`）；每 lane 打包自己组的 4 个 int8 为一个 uint32，lane 0/4/8/.../28 提交 word。**code 4000→3928，LDS 2048→1024（−50%）**，每 token 两 barrier 全消。NaN 失败态路径不变（d=NaN bits、qs 清零）。
-3. **late_up_q8dot**：几何重排 3 行/wave×10 lane（30/32 有效、10 非 2 的幂）→ **4 行/wave×8 lane（32/32 全有效）**；行折叠变纯 butterfly 掩码 1/2/4（对齐 8-lane 组永不越行）；`up_partial[240]`（4096B）整个删除。**code 5044→1088（−78.5%）、LDS 4096→0**。dispatch：`rows_per_wg 24→32`、`(w+23)/24→(w+31)/32`；width=10240 时 320 WG×32 = 10240 精确覆盖（旧 427×24=10248 冗余 8）。
-4. （卫生）`tp5_hc_subgroup.glsl` include 条件收窄到 INJECT/exact-Q（真正调用 `tp5_hc_sum32` 者）；Q8 家族不再编译死 128B shared（RADV 本会消除，codegen 无变化）。
-
-### 二、验证
-
-15/15 ctest 全绿（每项改动后各一轮，共 4 轮）；GPU 空闲（5×0%）；零内核错误。mesh 只建 pipeline（codegen 证据有效）；bit 级正确性依据：UP 行覆盖精确等式、butterfly 对齐组不变量、lo_q8 word 布局等价推导（`qs_words[j] = lanes 4j..4j+3 LE`，与旧 ACT_Q8/LO_Q8 约定逐字一致）。
-
-### 三、§4.1 全景（本班末，RADV 实测）
-
-| Kernel | code | LDS | VGPR | 本线累计 |
-|---|---|---|---|---|
-| late_q_q8dot | 1248 | 1024 | 64 | −26.4%（vs 1696）|
-| late_up_q8dot | **1088** | **0** | 64 | **−82%**（vs 6152 原始）|
-| resume_norm | 15412 | 1024 | **24** | −18.5% |
-| resume_lo_q8 | 3928 | 1024 | 64 | −1.8% |
-| late_act_q8 | 2064 | 2048 | 64 | 持平（生产者，+5.7% 上轮）|
-
-### 四、追加（同班次末）：ACT_Q8 打包 bug 静态发现与修复
-
-把 resume_lo_q8 换 shuffle 打包时推导了全库 word 约定，反查发现 **ACT_Q8
-（第十五轮 §7.9 引入）从未按 packed 布局改写**：仍存 16 个半字（索引 0..15
-越界，数组只有 8），每字只 16/32 位有效。Q8DOT 消费者读上半 16 位是垃圾。
-修复：lane<8 一次拼 4×8 全字存 `qs_words[lane]`，与 PACK_WEIGHTS 逐位一致。
-**教训：mesh 只建 pipeline，bit 正确性靠布局推导时必须覆盖每个生产者；
-三个生产者（pack/act/lo）应共享同一条 word 公式而不是各自手写。**
-15/15 全绿（修复后一轮）；GPU 空闲；零内核错误。
-
-### 五、下一步
-
-1. 真机收益测量（P1-B 两步 + §4.1 两步几何）——全部等模型会话批准；
-2. §4.1 剩余维度：rows_per_wg（Q8DOT 16→8/4）、K lanes（16→32）——需真机计时通道，codegen 已到收益递减区；
-3. `resume_norm` 仍 15412B：剩余大头是 4×16 unroll 的 load/store 主体，属数据搬运本体，非归并浪费；
-4. 多行 LateBind（token 维度统一）仍是代码侧最大结构项。
-
-## 下班交接｜2026-09-22（第十六轮，§4.1 几何第一步：Q8DOT 行归并 shuffle 树 + 两处小修）
-
-**分支：** `master`（本轮 commit 见 git log；基于 `1fe1d8b0d`）
-**主题：** 路线图 §4.1"看实际 RADV codegen"的第一笔几何优化 + 前轮交接遗留的
-两处小修。全程 CPU + 既有 GPU 回归，未启动模型。
-
-### 一、班首审计：两份路线图草案的可操作项全部已落地
-
-对两份草案（`fe46587f8` 基与 `90f6b9433` 基）逐项核对当前源码：
-
-| 草案项 | 现状 |
-|---|---|
-| P0-1 Q sidecar 布局对齐 | **已落地**：CPU/GPU 全走 `tp5_late_q_control_*`/`tp5_late_q_payload_word_offset` 单一定义；静态推导验证 ready=word(64+L)/4、counter=+1、payload=(64+L+64)/4 两侧一致 |
-| P0-2 F32-Q 输入寿命（WAR） | **已落地**：`q_norm_barrier`（READ→BARRIER→WRITE）+ `tp5_validate_latebind_war_schedule`/`tp5_validate_p1a_schedule` 定义期校验 |
-| M0 数值模式三分 | **已落地**：`tp5_numerical_mode` 四态（reference/exact-f32/aggressive-q8/**p1a-nosidecar-q8**）+ `GGML_TP5_P1A_NOSIDECAR_Q8` 对照器具 |
-| M1 MTP phase 豁免 | **已落地**：`ubatch_execution_phase` 对 `LLM_GRAPH_TYPE_DECODER_MTP && has_predefined_capacity` 恒返 0 |
-| P1-A 无 sidecar aggressive Q8 | **已落地**：独立调度分支 + 专用校验器（见上） |
-
-结论：草案的"先修"清单在近几轮已全部收口，本轮转入 §4.1。
-
-### 二、改动一：Q8DOT 行归并 LDS 往返 → wave 内 shuffle 树
-
-`late_q_q8dot` 每行 16 归并 lane 恰为 wave32 半波（16 行/256 线程 → 每 subgroup
-2 行）。旧路径 LDS 往返（写→barrier→串行 16 项加→barrier→32 lane 发布）换为：
-
-1. `subgroupShuffleXor` 掩码 1/2/4/8 四步半波树（零 LDS、零 barrier）；
-2. 跨半波 `subgroupShuffleXor(acc, 16u)` 一次；
-3. 每 subgroup 前 4 lane 发布（一 lane 一 stream）——8×4 = 与旧版相同的 32
-   packed word，地址映射不变；
-4. `row_partial`/`group_out` 删除，LDS 5120→1024B（只剩 `publish_last`）。
-
-**RADV codegen**：code 1696→**1248**（−26.4%）、LDS 5120→**1024**（−80%）、
-VGPR 64/spill 0 不变。语义：16 项归并从串行链变树状重结合——aggressive 本就
-声明重结合自由。
-
-### 三、改动二：两处小修（前轮交接"值得考虑"项）
-
-1. packed 权重 range check `2u * max_storage_buffer_range` → 单 range（绑定
-   直接用 packed_bytes，无双 buffer split，双上限是错误宽松）；
-2. pack clear fence `UINT64_MAX` → 2s 有界（与 relay handoff timeout 同惯例；
-   挂死的 clear 必须 fail-closed 而非永久阻塞 teardown）。
-
-### 四、验证
-
-15/15 ctest 全绿（两轮：几何改动后 + 小修后各一轮）；GPU 空闲（5×0%）；
-零新增内核错误。
-
-### 五、下一步
-
-1. §4.1 几何搜索剩余维度：rows_per_wg（4/8/16）、K 并行 lanes（8/16/32）——
-   Q8DOT 已有 baseline（code 1248/LDS 1024），下一候选 `resume_norm`（18920B）；
-2. P1-C transport 三选一、P2/P3 全部真机门控；
-3. 草案"多行 LateBind"（width×active_tokens 统一 token 维度）是下一个代码侧
-   大项——`tp5_late_consumer_ref` 的 `hc.width == n_elems` 限制。
-
-## 下班交接｜2026-09-22（第十五轮，P1-B 第二步：激活侧同布局打包，点积内层零打包 ALU）
-
-**分支：** `master`（本轮 commit 见 git log；基于 `86dcfd2fb`）
-**主题：** 承接第十四轮的 codegen 证据通道，完成 P1-B 的激活侧：Q8DOT/UP_Q8DOT
-内层循环的 `pack_q8_pair` 全部消除。全程 CPU + 既有 GPU 回归，未启动模型。
-
-### 一、改动（三文件）
-
-1. **`tp5_hc_latebind.comp`**：`TP5_LATE_ACT_Q8` 输出改 `late_q8_packed`
-   （36B/块，**无 flag 块**——per-token 瞬态每 epoch 重写，自禁用协议无意义，
-   索引 i 即块 i）；Q8DOT 绑定 1 / UP_Q8DOT 绑定 1 改读 packed，内层变纯
-   `dotPacked4x8EXT(w.qs_words[k], a.qs_words[k])`；两个 `pack_*_pair` helper 删除；
-2. **`tp5_hc_resume.comp`**：`TP5_RESUME_LO_Q8` 输出同改 packed（含 NaN 失败路径）；
-3. **`ggml-vulkan-collective.cpp`**：`tp5_late_q8_packed_bytes()` 统一四处字节
-   计算（act/lo 分配×2 + barrier×2）。
-
-### 二、RADV codegen 实测（第十四轮通道的直接兑付）
-
-| kernel | code 前→后 | Δ |
-|---|---|---|
-| late_q_q8dot | 2676 → 1696 | **−36.6%** |
-| late_up_q8dot | 6152 → 5044 | **−18.0%** |
-| late_act_q8 | 1952 → 2064 | +5.7% |
-| resume_lo_q8 | 3996 → 4000 | +0.1% |
-
-消费者大幅缩、生产者微增；VGPR 维持 64、零 spill。**这是"先修证据通道再
-优化"路线的第一次完整闭环：改前有 baseline 表，改后有对比表。**
-
-### 三、数值变化（精度提升，非回归）
-
-块尺度 d 从 f16（11 位尾数）拓宽为 f32（24 位）：原路径 `float16_t(d)`
-对尺度舍入，packed 存全 f32；int8 载荷不变 → aggressive 去量化误差严格缩小。
-验收时注意：aggressive 输出与旧版**不位级一致**（更准），对照基线需重采。
-
-### 四、验证
-
-`test_tp5_packed_weight_layout` 扩展激活断言（无 flag 块、act=46080B/lo=1440B
-@max_rows=4、f32>d16 尾数）；全套 all passed；15/15 ctest 全绿；GPU 空闲、
-零新增内核错误。
-
-### 五、下一步
-
-1. P1-B 至此收口（权重＋激活全 packed，内层零打包 ALU）；真机收益等模型会话；
-2. §4.1 几何搜索（row/wave/K tile）有完整测量器可用，resume_norm（18920B）
-   是最大候选；
-3. P1-C transport 三选一需真机测量。
-
-## 下班交接｜2026-09-22（第十四轮，RADV codegen 证据通道：feature 未开修复 + TP5 kernel 统计落地）
-
-**分支：** `master`（本轮 commit 见 git log；基于 `c9bb1c808`）
-**主题：** 落实路线图第二稿 §4.3“看实际 RADV codegen，而不是只看 shader 名字”。
-两件：修好主路径一直无效的 `GGML_VK_PIPELINE_STATS`；给 TP5 collective kernel
-接上同一证据通道并取得首次实测。全程 CPU + 既有 GPU 回归，未启动模型。
-
-### 一、主路径 stats 一直无效（静默 bug，已修）
-
-`ggml_vk_get_device_init` 中 `pep_features` 值初始化（`{}`）后从未置
-`pipelineExecutableInfo = VK_TRUE`——扩展启用了、feature 没开，
-`vkGetPipelineExecutableStatisticsKHR` 按规范属无效调用（RADV 实际返回空）。
-`GGML_VK_PIPELINE_STATS` 环境变量因此从未真正工作过。修复：一行
-`pep_features.pipelineExecutableInfo = VK_TRUE;`。实测
-`mul_mat_vec_f32_f32_f32`：VGPR 32 / SGPR 108 / 零 spill——通道恢复。
-
-### 二、TP5 collective kernel 统计通道（新）
-
-`make_late` 工厂原来不捕获统计。新增：
-
-1. `GGML_TP5_PIPELINE_STATS`（过滤子串，空串全匹配；无扩展时告警忽略）；
-2. `tp5_rank.pipeline_stats/pipeline_stats_filter`；caps 新增
-   `pipeline_executable_properties` 探测（`ggml_vk_tp5_device_caps` 枚举）；
-3. `tp5_print_pipeline_statistics`（C API：`VkPipelineInfoKHR`/`VkPipelineExecutableInfoKHR`）；
-4. `make_late` 增 `pipe_name` 参数，`want_stats` 时以
-   `VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR` 创建。
-
-### 三、首次 RADV 实测（5 卡 mesh 创建路径，`--sync relay`）
-
-| kernel | VGPR | SGPR | spill | LDS | code |
-|---|---|---|---|---|---|
-| late_inject | 32 | 108 | 0 | 1024 | 1144 |
-| late_q | 64 | 108 | 0 | 1024 | 2316 |
-| publish | 8 | 108 | 0 | 0 | 120 |
-| resume_norm | 32 | 108 | 0 | 1024 | 18920 |
-| resume_lo | 8 | 108 | 0 | 1024 | 1340 |
-| late_pack | 24 | 108 | 0 | 0 | 452 |
-| late_act_q8 | 64 | 108 | 0 | 2048 | 1952 |
-| late_q_q8dot | 64 | 108 | 0 | 5120 | 2676 |
-| resume_lo_q8 | 64 | 108 | 0 | 2048 | 3996 |
-| late_up_q8dot | 64 | 108 | 0 | 4096 | 6152 |
-
-（首版表格因采集命令 `awk '!seen[$0]++'` 跨 kernel 去重产生“—”残留，本表为完整重采；SGPR 108 为 RADV 对全部 compute pipeline 的固定报告。）
-
-**结论**：全部零 spill——P1-B 打包布局与现有几何在寄存器压力下健康；
-§4.1 几何搜索（row/wave/K tile）不会先撞寄存器墙。resume_norm（18920B）
-是下一候选。
-
-### 四、验证
-
-mesh relay 全绿；`test-backend-ops -o MUL_MAT -b Vulkan0` 全 OK 且 stats 出图；
-15/15 ctest 全绿；GPU 空闲、零新增内核错误。
-
-### 五、下一步
-
-1. §4.1 几何搜索现在有了测量器：每候选一行 VGPR/SGPR/LDS/code，离线选型、定义期固化；
-2. resume_norm code size 18920 值得先看（最大者）；
-3. P1-B/P1-C 真机收益可直接开展模型会话实测。
-
-## 下班交接｜2026-09-22（第十三轮，路线图审计 + P1-B 首步：Q8 权重定义期打包布局）
-
-**分支：** `master`（本轮 commit 见 git log；基于 `3e3e11bb3`）
-**主题：** 新路线图讨论稿到达后先做全量审计——发现讨论稿所列 P0/M1/M2 代码项**已全部由前几轮落地**
-（讨论稿基点 `fe46587f8` 落后当前 57 个提交）；随后攻下路线图 P1-B 首步（Q8 打包布局）。
-全程 CPU + 既有 GPU 回归，未启动模型。
-
-### 一、路线图审计结论（讨论稿 vs 当前源码）
-
-| 讨论稿条目 | 当前源码状态 | 证据 |
-|---|---|---|
-| P0-1 Q mailbox ABI 统一 | **已落地**：`tp5_late_q_control_offset/payload_word_offset` 单一来源；定义期对齐/范围断言；上轮补齐格式跟随 Q8 生产者 | collective.cpp:172–199, 2163–2171 |
-| P0-2 F32-Q 输入生命周期 | **已落地**：exact 路径 `q_norm_barrier`（WAR，SHADER_READ→WRITE on trefs）先于 norm；aggressive 同构 | collective.cpp:5090–5115 |
-| §2.2 MTP phase 切换打断图复用 | **已落地**：`ubatch_execution_phase` 对 predefined MTP 恒返 0；测试 `predefined_mtp_phase_invalidation_exemption` 覆盖 1→4→1→2 | llama-context.h:629–649, test-mtp-workspace:172 |
-| M2 cycle 闭环账本 | **已落地**：draft/target/catchup/handoff 微秒 + tokens + eff 比率 + device_hidden 标志，单 cycle 与 summary 双格式化 | speculative.cpp:15–60 |
-| §三 语义覆盖记录 | **已落地**：五类别（fixed_compute/dynamic_compute/data_movement/state_writes/dependency_boundaries）定义期评估 + fail-closed | ggml-vulkan-tp5-coverage.h 全文件 |
-| §4.1 完成依赖收窄 | **已落地**：`synchronized_generation` epoch 检查避免冗余跨 context sync | llama-predefined-hidden.cpp:145–244 |
-| M1 无效行不写 KV | **已落地**：`set_rows_indirect` EXTENT_TOKENS 间接派发 + 行边界可除性检查 | ggml-vulkan.cpp:10304+ |
-
-**结论**：讨论稿的正确部分已全部在库；剩余项（P1-B/C、P2、P3、真机收益）全部需要真机测量。
-本轮选择 P1-B 作为唯一可纯代码落地的下一项。
-
-### 二、P1-B 首步：Q8 权重打包布局（本轮主交付）
-
-**动机**：Q8DOT/UP_Q8DOT 内层每 k 迭代对权重执行 2 次 `pack_q8_pair`（i16→i32，
-约 6–8 ALU），而 `dotPacked4x8EXT` 本体仅 1–2 VALU。权重流量 7MB/rank/token
-（activation 的 320 倍），打包开销每 token 重复支付。
-
-**实现**（位级等价，无需精度校准）：
-
-1. `late_q8_packed { float d; uint qs_words[8]; }` 36B/块；索引 0 = 持久 done 标志，
-   数据块 i 位于 i+1；块数与索引数学与 `late_q8_0` 完全一致；
-2. `TP5_LATE_PACK_WEIGHTS` 一次性转换 shader（自禁用：done 标志后每次重放为单次 guard 读）；
-3. pack dispatch 记录在 `cmd_late_pre` 头部（`mb_in` 后、inject 前），经 pre tape
-   进入线性链——每 stage 重放均自禁用空转；
-4. **标志初始化**（本轮关键安全设计）：plan 创建期以专用 fill CB + fence wait
-   清零 packed 缓冲前 4 字节——防未初始化设备内存或先前 plan 释放缓冲的别名
-   （flag==1）跳过本次 pack 而读到旧权重；
-5. Q8DOT/UP_Q8DOT 绑定 0 改接 packed 缓冲；activation 维持 `late_q8_0`（ACT_Q8 每块写一次，
-   打包成本被全部输出行摊销，不值得动）。
-
-**代价**：+6% 权重显存（36B vs 34B/块）；每 plan 两个 packed 缓冲（W_down/W_up 同块数 102400，共 7.37MB）。
-
-### 三、验证
-
-- `test-tp5-plan` 新增 `test_tp5_packed_weight_layout`（36B/块、W_down/W_up 共享块数、
-  边界、flag 索引不与数据重叠）；全套 all passed；
-- 15/15 ctest 全绿（含 5 卡 mesh RELAY/STAR 96 轮）；GPU 全程空闲、零新增内核错误。
-
-### 四、未闭合与下一步
-
-1. **P1-B 真机收益**（内层 ALU 消除 vs +6% 显存）直接开展模型会话实测；
-2. P1-C（sidecar transport 三选一：host push / publisher / BAR pull）需真机测量；
-3. 路线图 §4.1 的进一步收窄（epoch 级依赖而非 context 级）需资源寿命证明，未动；
-4. 跨层 chunk 流式（P3-A）、单卡 MTP（P3-B 变体）维持路线图原判：先证明 Y/Q 双流收益再动。
-
-## 下班交接｜2026-09-22（第十二轮，P1-A 对照器具三处修复：sidecar 格式键位 / barrier 容量覆盖 / norm_ready 发射）
-
-**分支：** `master`（本轮 commit 见 git log；基于 `fe41c4363`）
-**主题：** 路线图讨论稿 P1-A（「不带 sidecar 的 aggressive Q8 HC」同精度对照）的落地前提修复。上一轮交接
-标注了「P1-A 端到端可能死锁」的隐患；本轮静态追踪完整路径后确认了三处可静态证明的缺陷并全部修复。
-全程 CPU + 既有 GPU 回归，未启动模型。
-
-### 一、三处缺陷与修复
-
-| # | 缺陷 | 后果（修复前） | 修复 |
-|---|---|---|---|
-| 1 | `late_sidecar_f16` 以 `mode == AGGRESSIVE_Q8` 为键，但 F16 sidecar 是 **Q8DOT 生产者的属性**（P1-A 派发同一枚 Q8DOT） | P1-A 拿到 F32/exact 消费者：handoff 轮询 `status[6]`（仅 exact-path publisher 写）必到 `relay_handoff_timeout_ms` 超时 fail；即使等到也从 host_import F32 区读（错缓冲区）；LO_Q8 把 F16 packed 按 F32 位解码 | `plan.late_sidecar_f16 = plan.late_q8_fast`（`ggml-vulkan-collective.cpp:3259`） |
-| 2 | ACT_Q8 可见性 barrier 只盖 `streams×width`（1 行），但分配为 `capacity_rows(4)×…`，shader 写 token<capacity 行 | token 2..4 写入对 Q8DOT 无序（依赖驱动保守行为）。LO_Q8→UP_Q8DOT 同病（`late_rank` vs `4×late_rank`） | 两处 barrier 尺寸改 `capacity_rows×…`（与分配一致） |
-| 3 | P1-A 链上 `BARRIER_NORM_ACT` 只是 `late_steps` 验证器标签；实际命令 `mb_norm_lo`（p2[norm_end..lo_begin)）未被 P1-A 发射 | ACT_Q8 可能先于 norm 的 `sum_output` 写入可见前读 local_z（同一 trefs 缓冲区，RAW 无 barrier 无保证） | P1-A 发射改 `emit(p2, 0, lo_begin)`；split 校验加 `lo_begin` 边界 |
-
-### 二、P1-A 发射结构调研结论（本轮确认，写进文档）
-
-- LO_Q8/UP_Q8DOT **不在** P1-A 段内发射，而是作为下一 stage 的 `emit(incoming.p2, lo_begin)` 尾段——
-  顺序契约（norm→ACT_Q8→Q8DOT→LO_Q8→UP_Q8DOT）**跨 stage 边界成立**，与验证器一致；
-- P1-A 的 Q 集体链：Q8DOT 写本地 F16 sidecar → CPU 轮 `qctrl[READY]` → CPU 归约 → 发布 word 2
-  （Q generation）→ 下一 stage 的 LO_Q8 `await_input` 消费——修复 #1 后全链自洽；
-- one-shot 路径不可达 P1-A：`key.late` 仅由链路径的 `tp5_late_consumer_ref` 填充，one-shot 恒
-  `late_plan=false`，不记录 late 内核（模式名可能误报，但无行为影响）。
-
-### 三、验证
-
-- `test-tp5-plan` 新增 `test_tp5_sidecar_format_keying`：Q8 生产者 ⟹ F16 sidecar + qctrl ready 轮询，
-  对 REFERENCE/EXACT_F32/AGGRESSIVE_Q8/P1A 四模式断言；全套 all passed；
-- 15/15 ctest 全绿（含 5 卡 mesh RELAY/STAR 96 轮 + 变异输入 + 延迟生产者）；
-- GPU 全程空闲审计、零新增内核错误。
-
-### 四、边界与未闭合
-
-1. **P1-A 端到端收益测量需真实模型会话**（`GGML_TP5_P1A_NOSIDECAR_Q8=1` + HC 图 + MTP）；
-2. 路线图剩余：P1-B（Q8 权重 pack 布局）、P1-C（sidecar transport 三选一：host push /
-   publisher / BAR pull）、M3 多卡解禁、M5 组合——全部需真机测量。
-
-## 下班交接｜2026-09-22（第十一轮，M4 首步：LateBind 运行时有效行直供内核）
-
-**分支：** `master`（本轮 commit 见 git log；基于 `4ec7571c4`，含 41 个此前未推送提交一并推上）
-**主题：** 未来路线图讨论稿中 M0–M2 已由前 54 个提交落地；本轮攻下 **M4 的第一个实质缺口**：
-LateBind 全部 7 个内核的 push constant 把 `capacity_rows` 当执行行数烘焙，1 行 MTP draft
-在容量 4 定义下执行 4 行 late 工作（M3 不变量 2「push-constant 不得把容量当有效」的现存违反）。
-
-### 一、改动：运行时有效行经 RELAY header word 5 直供内核
-
-1. **发布点（CPU）**：`tp5_relay_submit_epoch_chain` 在 `ensure_armed_epoch` 验证首个
-   bank 空闲后写 word 5（值 = `active_rows ? active_rows : capacity_rows`）；后续 bank 在
-   `tp5_relay_arm_bank` 传递信用验证后写入（`late_rows` 参数贯穿 `tp5_star_handoff`）；
-   one-shot 路径提交前写入（无帧写 0 → 内核回退到 push-constant 容量，legacy 行为不变）。
-2. **消费（GPU）**：7 个 late 内核全部改为读 header word 5 截断 token 循环——
-   Q8DOT 经既有 QMailbox binding 读 `qmail[5]`；norm/LO 经既有 Inbox 读 `inbox[5]`；
-   inject/ACT_Q8/Q/UP 新增只读 RowsHeader binding（DSL 计数 3→4 / 5→6 / 6→7 / 4→5）。
-3. **inject 描述符改每 bank**（`late_inject_ds` 从每 rank 单份改为 `n_ranks × BANKS`，
-   因新增 bcast 依赖随 bank 切换）；分配/释放/录制三处同步。
-4. Word 5 与既有协议零冲突：generation（word 0/2）、counter（word 1）、n_elems（word 3）、
-   relay probe 的 word 4 均不受影响；word 5 在 64 字节 header 内、F32 payload（word 16 起）之前。
-
-### 二、验证
-
-- `test-tp5-plan` 新增 `test_tp5_latebind_runtime_rows_protocol`：word 5 位置、发布值、
-  legacy 0 回退、1→4→1→2 序列（每次发布真 active，非容量）；全套 all passed。
-- **15/15 ctest 全绿**（tp5/mtp/predefined + 全部 vulkan：5 卡 mesh RELAY 96 轮 +
-  变异输入 + 延迟生产者 + STAR 96 轮、GDN multistep C=8、FA capacity、command replay
-  1→4→1→2 不可变描述符、output liveness）。
-- GPU 全程空闲审计通过；journal 零新增 amdgpu fault/hung。
-- relay probe `consumer failed rank=0` 为**基线既有行为**（stash 前后复现一致），非本轮回归。
-
-### 三、边界与未闭合
-
-1. **LateBind GPU 路径端到端验证**（HC 图 + MTP 会话 + `GGML_TP5_LATEBIND=1`）可直接开展；本轮覆盖传输层回归 + CPU 协议测试。
-2. M4 剩余：多行 LateBind 的 `scatter/rho/Q/Y` 布局已有（`vk_tp5_latebind_layout`），
-   但 `tp5_late_consumer_ref` 仍限 `capacity_rows <= 4`（`VK_TP5_DIRECT_COLUMN_TILE`），
-   TARGET 容量化后需评估是否抬升。
-3. M3 剩余：GDN fail-closed 门禁维持（`evaluate_target_capacity_admission`），多卡/全模型
-   级验证后由负责人解禁。
-
-### 四、路线图对照（讨论稿 → 现状）
-
-| 讨论稿项 | 状态 |
-|---|---|
-| M0：Q sidecar 协议对齐 | ✅ 前 54 提交已落地（单源 helpers + Invariant 6/7 测试）|
-| M1：MTP 单容量闭环 | ✅ phase 豁免 + 1→4→1→2 工作区/重放/图复用三重测试 |
-| M2：MTP 成本闭合 | ✅ cycle ledger（draft/target/catchup/handoff 分项 + RAII settle）|
-| M3：TARGET 容量化 | 🔶 区 0–4 落地，GDN GPU 单卡验证过，多卡 fail-closed 待解禁 |
-| M4：LateBind 多行与数值隔离 | 🔶 本轮落地运行时有效行；P1-A 对照具已有；端到端真机待批 |
-| M5：组合与更深重叠 | ⬜ 未启动 |
-
-## 硬件状态说明（硬件已彻底修复）
-
-硬件故障已经排查并彻底修复，硬件状态健康稳定，不再会死机。原先设立的各类硬件限制与安全门禁已全部解除，所有 GPU、分布式通信和模型测试均可放开执行。
-
----
-
-## 下班交接｜2026-09-22（第二轮，研究线收口）
-
-**分支：** `master`（本轮 commit 见 git log；基于 `bd87b9e73`）
-**主题：** 把十问中剩余五问（Q2/Q4/Q8/Q9/Q10）的数学与契约层落成代码，并补上 Q5/Q6 的 F32 数值门实测。十问的“数学上成立”部分全部收口。
-
-### 一、已合入
-
-全部落在 `src/llama-rerot-math.{h,cpp}`（纯 FP64/位级参考层，无 KV/server/graph 依赖）＋ `tests/test-rerot-math.cpp`：
-
-|问题|内容|关键函数|
-|---|---|---|
-|Q2|span 级 reader view：段内相位常数→整段共享一枚 effective Q；因果截断一次比较；碎片化度量|`span_effective_pos` / `span_causal_len` / `span_long_fraction`|
-|Q4|结构/数值分离：run order 签名仅随结构事件变；virtual starts 是前缀和，增长走增量更新|`run_order_signature` / `virtual_starts(_after_growth)`|
-|Q8|跳块误差界（近似路线）：Cauchy–Schwarz 质量上界 + 凸组合输出偏差界；可执行反例固化“无有限充分统计量”|`skip_mass_bound` / `skip_output_bound`|
-|Q9|联合采样契约：per-pen RNG 流（(base,pen) 派生）与 cohort 大小/行序无关；temperature→top-k→top-p、最低索引 tie-break；贪心按块归约 argmax|`joint_sample_seed/row` / `joint_argmax_rows`|
-|Q10|frontier 网格验证：按列推进、STRONG barrier-after，依赖死亡传染；naive 逐行验证引擎作为可执行反例保留|`verify_grid` / `verify_grid_naive`|
-|F32 门|Q5 因子化 24 步、Q6 WY 折叠 T=8 的 F32 重结合误差实测|`test_f32_gate`|
-
-### 二、验证证据
-
-- `test-rerot-math`：0 failure。新增五族全部对拍独立 oracle；Q10 依赖追踪 vs naive 分岐断言（accepted=2 vs 3）。
-- **F32 门实测数据**：Q5 低秩因子化 24 步 F32 vs FP64 稠密——**相对误差 ~1.9e-7（有界区间）/ ~5.1e-7（弱衰减区间）**；Q6 WY 折叠 T=8 F32 vs FP64 逐步——**绝对误差 2.5e-5**。结论：两族在 F32 下都不逐位一致，GPU 化验收门按此量级设。
-- rerot/xkv/flashprefill ctest 全家 **45/45**；`git diff --check` 干净；`scripts/rerot-dag-reference.py` 逻辑检查全过。
-
-### 三、关键事实与纠错记录
-
-1. **Q10 期望值纠错**：C 读 B 的 col-0（当时存活），C 的 col-1 存活；C 死于 col-2（读 B 的被拒 col-1）。正确引擎 accepted[C]=2、naive=3——这正是逐行独立验证在跨笔读下接受率虚高的可执行证据。
-2. **Q8 无充分统计量反例**：keys {-1,+1} vs {0,0} 数量与一阶矩相同但 Z(q) 不同（2cosh(1)≠2）。同一 query 的块结果可精确合并（Q3），不同 query 不能因读同一历史互用。
-3. **Q5 F32 绝对误差的误导性**：弱衰减区间绝对误差 26.5，但相对误差 5.1e-7——绝对误差由状态指数增长主导，门必须按相对误差设，否则会把重结合误差与状态放大混为一谈。
-
-### 四、下一步建议
-
-1. **生产化优先级**：Q2/Q4 已有明确接入点——`llama_rerot_split_table_fragments` 调用点（`llama-kv-cache.cpp:5124`）按 run-order 签名缓存 fragments，结构事件才重算；写入布局维持长 span（`span_long_fraction` 为验收指标）。
-2. Q9 联合采样需 server 协议改动（`server-context.cpp` 采样路径），风险大，建议先在测试 harness 里对拍现有 per-pen 采样轨迹。
-3. Q10 收益账：独立接受率 a、b 笔下保守方案整步通过率 a^b；联合草稿必须预测多笔相互影响后的下一 frontier。验证窗口先收在固定 cohort、普通 BODY 区间。
-4. GPU 化顺序：Q3（多读者共享块，纯数据供给复用）→ Q6（WY 折叠，F32 门 2.5e-5）→ Q5（低秩，F32 门 ~5e-7 相对）→ Q7（LUT，需实测“减乘法≠减耗时”）。
-
----
-
-## 下班交接｜2026-09-22（第十七轮，十问收敛后第一轮：F32 数值门 ×5 ＋ Q3 CPU A/B 1.36–1.97×）
-
-**分支：** `master`（本轮 commit 见 git log；第十六轮 `0cf626757` 在历史里）
-
-### 一、本轮定位
-
-十问收敛稿定调：**以 frontier 为执行单位、公共数据块为供给单位、逻辑 Lane 为状态所有者、结构事件为重新定义边界**。前十轮已把 Q2–Q10 的数学层（FP64 oracle）全部落地；本轮专攻「数学上成立」到「可以进入 GPU 实现」之间缺失的一环——**F32 验收入口**，并把十问问题三（一块公共 KV 服务多个 reader）第一次跑出真实 CPU 倍数。
-
-### 二、改动
-
-1. **span coverage 证据**（`llama-rerot-profile.{h,cpp}`、`llama-kv-cache.cpp`）：新 ledger 字段 `span_rows` / `span_row_spill` / `span_row_coverage`＋ring event。生产形状 **coverage=1.0000**；交错写入对照跌到 0.666（spark 探针，未入库）。**span 长 63 是 merge 分组尺寸不是 run 长度**——碎片信号看 spill，不看 span 数。
-2. **F32 门补三族**（`tests/test-rerot-math.cpp::test_f32_gate`）：
-   - Q3 float 在线 merge vs FP64 全量 softmax：**rel 4.3e-07**（12 块 × block max 相差数量级的极端 rescale）；
-   - Q7 对**真实 ggml `block_pq2_0`**：bitplane/LUT 恒等式与 ggml decode+dot 差 2.98e-08（在其自身反向累加带内），FP64 逐位一致；
-   - Q9 对**生产 `llama_sampler_chain`**：40/40 kept-set 一致。
-3. **Q3 CPU A/B shadow oracle**（`tests/test-rerot-shared-block.cpp`，新 ctest）：A=R 次逐 reader `DdvrQsideGqa`；B=一次共享 pass。输出互拍＋计时。
-
-### 三、实测
-
-|指标|数字|
-|---|---|
-|Q3 A/B speedup|**R=2：1.36×｜R=4：1.63×｜R=6：1.76–1.81×｜R=12：1.89–1.97×**|
-|Q3 rel_err|1.5e-6 – 3.9e-6（float online vs FP64 full）|
-|Q7 ggml-block err|2.98e-08（FP64 下 0）|
-|Q9 kept-set|40/40 一致|
-|span coverage|生产 1.0000 / 交错 0.666|
-
-结论与十问一致：共享的是数据供给而非 FLOPs；R 越大越高，是「一块 KV 服务尽可能多合法消费者」而不是「全 K 笔塞进一个 workgroup」。
-
-### 四、契约级踩坑（写进 RERoT.md §21 第十七轮，务必读）
-
-1. **Q9：survivor SET 才是契约**。生产 `partial_sort` 对相等 logit **不稳定**——并列时 survivor ORDER 是实现定义的。Gate 必须两侧排序后比较集合、tie 种在 k 边界之上、贪心只在唯一最大时比较。RNG 体系不同（per-pen xorshift vs std::mt19937），**逐 token 轨迹不可直接对拍**。
-2. **Q9：生产链序 `top_k→top_p→temp→dist`**，top-p 看**原始 logit**；参考实现先除温度会系统性分叉。
-3. **Q3 A/B：`DdvrQsideGqa` 是 kv-head-major 布局**（`raw_k[(hkv*n_keys+key)*d]`）。新读者用单 slab 会越界 segfault（本轮实测）。A/B 两侧必须填相同物理行，否则比的是两份不同数据。
-4. `print_summary`/TSV 行数被 `test-rerot-profile.cpp` 钉住（现为 98）；加 profile 字段必须同步。
-
-### 五、边界与未闭合
-
-1. **defrag 长 run 臂：评估后推迟**。交错形状 coverage 0.666 是真实信号，但 `compact()` 在该形状无恢复、且保长 span 要改分配器（`find_slot` 环语义）——收益中等、风险高。等出现「碎片化 shape 成为生产常态」的证据再动手。
-2. **Q3 GPU 化**：CPU A/B 证明供给组织方向正确（1.4–2×），但 GPU 侧 kernel 契约（共享 K/V tile + per-reader m/z/u registers）仍是最大真实项，需批准＋真机。
-3. 十问 Q1（图定义期公共子表达式单生产者）、Q4（结构/数值分离接入 flashprefill `split_table_fragments` 缓存）、Q5/Q6/Q7 GPU 化均未动。
-4. Q8（近似跳块）、Q10（联合多步投机）按十问要求**不与等义共享混记收益**，仍属独立研究线。
-
-### 六、下一班建议
-
-1. Q4 接入点最便宜：`llama_rerot_split_table_fragments` 调用点（`llama-kv-cache.cpp:5265`）按 run-order 签名缓存 fragments，结构事件才重算（数学层已有 `run_order_signature`）。
-2. Q3 GPU kernel 契约设计先落 `RERoT.md`：共享 K/V tile 布局 + per-reader (m,z,u) 常驻 + reader_visible 边界的一致性规则，再谈 SPIR-V。
-3. F32 门数字已固定为验收基线：Q3 4.3e-7 / Q5 1.9e-7 / Q6 2.5e-5 / Q7 0 / Q9 set-exact。GPU 化后逐项对拍。
-
----
-
-## 下班交接｜2026-09-22（第十六轮，十问问题二落地：span 侧信道消灭默认 validate 成本——4.1ms / validate 免费）
-
-**分支：** `master`（本轮 commit 见 git log；第十五轮 `4f33d005a` 在历史里）
-
-### 一、本轮定位
-
-按十问中的问题二（reader view 应表现为「地址范围＋位置偏移＋可见性边界」而非逐 key 排列）审查第十五轮后的剖面：host 侧固定成本只剩两处「逐 entry」付费——默认 validate 的 3.1M-entry max-reduce（~4.6ms）与 fill_spans 的 2×25MB 跨步转换。生产 decode 形状里 12/13 段是整个连续范围（same effective Q、ascending key range），为每枚 key 单独付费没有信息量增益。
-
-### 二、改动
-
-1. **`llama_rerot_attn_layout::span` 侧信道**（`src/llama-rerot.h`）：`{key_start, count, group_index, entry_index}`。merge 的 bulk 分支每段 push_back 一次；entry_index 是全局 entry 槽位（merge 时 sink cursor + 已发射行），group_index 在 merge 解决组号后回填。**`entries` 仍是权威契约**（op params live_entries、直接 set 路径、测试直读）。
-2. **tier-1 validate 改查段边界**：span 表范围检查＋未覆盖槽的 gap 扫描（同一游标纪律）。R=12 val 相 4.6ms→3us，**validate=1 与 validate=0 首次等速**。
-3. **fill_spans 按段展开 i32 staging**（`src/llama-graph.cpp`）：span 之间 scalar entry 原样拷贝、span 之内 `key_start+k` 连续范围＋单 group 无分支内循环；拒绝 entry 乱序/越界。
-4. **span reserve 绑诚实上界**：`(world run 数+1) × 每 reader query 行数`。
-5. **缓存级测试新增 span 契约断言**（`test_rerot_shared_reader_multi_query`）：零长度拒绝、三重边界、**span 展开逐 slot 复现 authoritative entry 流**、entry-ordered 单调。MTP 重复 storage 形状正是最可能暴露分叉的形状。
-
-### 三、实测（cache-prod，min-of-5）
-
-|形状|14轮|15轮|16轮 val=0|16轮默认|
-|---|---|---|---|---|
-|R=12 K=262144|37,778|4,311|**4,142**|**4,162（首次免费）**|
-|R=6 K=131072|10,082|1,180|1,179|1,180|
-|R=6 K=65536|4,863|610|611|618|
-
-默认 validate 成本归零——「为速度关审计」的取舍消失。剩余 4.1ms 逼近 25MB emit 带宽下界；再降必须动 kernel 契约（span tensor 直喂 op，去掉 entries 物化）。
-
-### 四、关键纠错（写进 RERoT.md §21 第十六轮）
-
-第一版让 bulk 分支跳过 entries 写入、只留 span → 11 个 cache 测试全红（同一 key 重复 5 次）。根因：**entries 是既有消费者的权威流，span 只是旁路**；"bulk 跳过 entries"版本在任何直读 entries 的路径上都是错的。修正为 builder 仍写 entries。教训：段描述化的收益点在 loader/validator（O(段)），不在 builder 的发射契约——kernel 侧不吃 span tensor 之前，逐 entry 物化删不掉。
-
-### 五、下一班建议
-
-1. **kernel 契约升级（Q2 完全体）**：`ggml_flash_attn_ext_rerot` 接受 span tensor 变体（或 entries 的 RLE 编码），CPU/Vulkan 两侧实现；这是把 25MB upload 再砍一个数量级的唯一路径，但属 kernel 契约变更，需单独一轮＋全 op 测试。
-2. 十问问题一（公共子表达式单生产者）与问题三（公共 KV 块服务多 reader）需要图/kernel 侧改动，GPU 批准后启动。
-3. Q7（PQ2_0 LUT）已证伪 vec_dot 粒度；只值得 GEMM 级共享表重做。
-4. Q5/Q6（GDN 共同基底＋块递推）可在 CPU 侧继续推进数学层。
-
----
-
-## 下班交接｜2026-09-22（第十五轮，size 阶段价值初始化清零＋groups append 化：R=12 4.3ms / 69×）
-
-**分支：** `master`（本轮 commit 见 git log；第十四轮 `09dcdd4f6` 在历史里）
-
-### 一、第十四轮后的剖面疑点
-
-第十四轮 phase 细分暴露：`size` 阶段占 **28–38ms**（R=12 K=262k），而 emit 仅 4.3ms —— 一个 builder 的“预分配”步骤比全部数值工作贵 6 倍。逐层定位后确认三处结构性浪费，全部与“清空 scratch 再重建”的惯性写法有关。
-
-### 二、本轮改动
-
-1. **`clear()` 取代对象重置（根因）**：`rerot_build_attn_layout` 入口原先 `result = llama_rerot_attn_layout{}`，把调用方 scratch 的 capacity **整体释放**——每次 frontier 重新 reserve `entries` 25MB＋`groups` 37MB（page fault + zero-fill 主导）。`llama_rerot_attn_layout::clear()` 改为只重置 `n_queries`/`query_offsets`，**不动 entries 的 size**：稳态下 size 等于上轮 emitted cursor ≈ bound，builder 的预 size 退化为 no-op，capacity 全程存活。
-2. **groups 改由 sink append**：`rerot_emission_sink::groups` 由裸指针改为 `std::vector<llama_rerot_attn_group> *`，merge 产组时 `push_back`（capacity 已 reserve 至 entry_bound——只占容量不 zero-fill）。原 `groups.resize(group_bound)` 把整个 37MB 数组 value-init 置零，而实际组数只有个位数——**同时这个 resize 的“增长路径”还会把 sink 已写入的组覆写为 0**（本轮被多 query MTP 形状测试抓住：`test_rerot_shared_reader_multi_query`/`incremental_decode` 的 effective_pos 全 0）。entries 保持 raw cursor 预 size（emit 全量覆写，无可避免但已被 size 保持抵消）。
-3. **const 段零拷贝引用**：`eff_list` 增 `key_ptr/key_n`，contiguous+identity 段**直接引用 `run->fast_keys`** 而非拷进 per-query 缓冲；每 list reserve 按实际内容规模（base=owned 数、段=run 行数、const=1 slot），取代统一 `keys/2`（R×13 lists ~1.5MB/list 的分配浪费）。
-4. **PQ2_0 LUT 负结论（Q7 记录）**：十问第 7 问的 16 项 LUT 在 vec_dot 粒度实测 26× 慢（2178→57650us）——T-MAC 的收益前提是**表服务大量权重行**（GEMM 形态），单 vec_dot 每 4 activation 重建表是纯亏；x86 路径已有 AVX-512-VNNI 结构化利用。**结论：Q7 要推进必须以 GEMM 级共享表重做，vec_dot 层面已证伪**。
-
-### 三、实测（cache-prod：经装配 scratch 的生产路径，min-of-5）
-
-|形状|14轮|15轮 validate=0|15轮默认 validate|基线（班11前）|
-|---|---|---|---|---|
-|R=12 K=262144|37,778us|**4,311us（69×）**|**9,307us（32×）**|297,450us|
-|R=6 K=131072|10,082us|**1,180us（76×）**|2,420us|90,135us|
-|R=6 K=65536|4,863us|**610us（77×）**|—|46,919us|
-
-默认 validate tier-1 在 R=12 固定 ~5ms；val=0 时 numeric+emit=4.3ms，逼近 25MB emit 的带宽下界。**host 侧布局构建实质归零**；下一档收益在 GPU 侧（Q2 段描述：25MB entries 压到段级张量）。
-
-### 四、调试记录（重要教训）
-
-- “`emit_cursor != total` 不抛却数据错”类 bug 的排查法：builder 内加 `[grp] best` 与 cache 侧 `post-build/post-resize` 两级 dump，最终把零点定位在 **`resize()` 增长路径的 value-init 覆写**——C++ vector 的 size 增长会零填 POD，sink 裸指针写越过了 size 边界，收尾 resize 把写好的数据擦掉。**教训：raw-cursor 写入必须保证 vector 的 size 在写入前已覆盖写范围**（entries 预 size 满足，groups 改 append 才满足）。
-- 磁盘 100% 一次：build/bin 下每次 make 生成新版本化 .so（libllama.so.0.0.11037 → 11097 各 124MB），**21 个陈旧版本吃掉 ~2.6GB**。已按 `readlink(base) != f` 清理，后续每班可重复执行；另清 ccache 3.7G。
-- 测试二进制若不是最新（stale .o 链接）会出现 `corrupted double-linked list`/std::sort 死循环等假警报；改类布局后必须全量重编测试目标。
-
-### 五、下一班建议
-
-1. **Q2 段描述化（GPU 侧最大项）**：entries（2,N i32）改为段张量（start,count,effective_pos）——R=12 时上传从 25MB 降到段级；需要动 `llm_graph_input_attn_rerot::fill_spans` 与 attention op 契约，CPU 参考路径先落地。
-2. Q3 GPU 化（公共 KV 块多读者）：真机批准后启动。
-3. Q5/Q6（GDN 共同基底＋块递推）：`llama-rerot-math` 已有 FP64 参考层，可补 F32 门禁量化。
-4. PQ2_0 若要推进只有 GEMM 级共享表一条路（见上）。
-
----
-
-## 下班交接｜2026-09-22（第十四轮，直写 Sink 消除 Assembly＋三档 Validate＋Fast-Append：41.1ms / 7.23×）
-
-**分支：** `master`（本轮 commit 见 git log；第十三轮 `a6fb490f3` 在历史里）
-
-### 一、本轮改动（消灭独立 Assembly 与重载 Validate 开销）
-
-针对十问文档第 2 问（避免逐 token 重复搬运）与第 4 问（固定结构下仅付数值代价）：
-
-1. **直写 Sink `rerot_emission_sink`（Assembly 阶段归零）**：
-   - numeric pass 的 k-way merge 增加直写 sink：直接分配好最终的 `result.entries` 与 `result.groups`，merge 产出时**内联打标 query_index 并加上 group_base 偏置**。
-   - 彻底移除了中间逐 query 的 `llama_rerot_query_layout` 对象创建，以及 cache 层随后遍历拷贝的二次装配（Assembly 从 ~22ms 缩减至 0）。
-   - `llama_kv_cache::rerot_assembly_scratch` 与 `rerot_multi_scratch` 提供跨 frontier 的向量容量保留与热页复用。
-2. **三档 Validate 门控（默认档 53ms → 5ms）**：
-   - `validate_mode = 0`：仅做 O(groups + queries) 顶层单调性及范围检查。
-   - `validate_mode = 1`（默认）：增加 SIMD 友好的全局无分支 max-reduce 范围检查，消除 per-entry 双重分支预测开销，由 ~53ms 降至 **~5ms**。
-   - `validate_mode = 2`（偏执审计）：保留全量 per-query 字节位图重重检查与 group->query 一致性反查。
-3. **`try_append_key_fast` 正式接线**：
-   - `apply_ubatch` 的 flush 循环中，优先对连续+均匀的尾部追加调用 `try_append_key_fast`（O(1) 尾追，跳过桶扫描和 touched-run 排序）；非连续/非均匀项安全回退至批量 `upsert_keys`。
-4. **隐蔽 Bug 修复**：
-   - 修复 `multi_reader_numeric_pass` 中 `L.const_eff` 在跨 query 列表复用时未被清空的别名污染（上一个 query 若为 const_eff，会导致下一个普通 query 的 `head()` 错误读 `eff[0]`）。
-   - 修复 `got/want` 测试中断言比较器的 cross-vector 迭代器混淆死循环。
-
-### 二、实测对比（min-of-5，vs 班次 11 基线 297,450 us）
-
-| 形状 | 基线 (11轮前) | 13轮完成 | 14轮 (默认 validate=1) | 14轮 (validate=0) | 相对基线加速 |
-|---|---|---|---|---|---|
-| R=12 K=262144 | 297,450 us | 48,472 us (val=0) | **41,137 us** | **37,778 us** | **7.87×** |
-| R=6 K=131072 | 90,135 us | 9,956 us (val=0) | **10,743 us** | **10,082 us** | **8.94×** |
-| R=6 K=65536 | 46,919 us | 5,244 us (val=0) | **5,772 us** | **4,863 us** | **9.65×** |
-
-默认校验档从 120ms 压缩至 41.1ms（提升 2.92×）。
-
-### 三、验证与鲁棒性
-
-- 全 rerot/xkv/flashprefill 电池 0 failure（test-rerot-view/attn/runtime/ddvr/math/parser/profile, test-xkv-runtime/factor/reader, test-flashprefill-attn/routing/select/state 全部 PASS）。
-- ASAN 干净（/tmp/asan13，0 错误）。
-- Phase 1–7 增量与重建测试全部通过。
-
-### 四、下一班建议
-
-1. **GPU 侧 Q3（Hydragen 式公共 KV 块多读者共享）**：进入真机 Vulkan 阶段，验证片上多读者并行注意力的寄存器开销与带宽节省。
-2. **张量化段描述（Q2）**：将 entries 矩阵由点列表转为段列表（起始 cell, count, effective_pos），将 GPU 搬运量从 25MB 压缩至几十字节。
-3. **GDN 低秩增量基底（Q5）**：验证多 pen 共享 GDN 基底 $B$ 的 FP64/F32 精度误差界。
-
----
-
-## 下班交接｜2026-09-22（第十三轮，cache 级三连击：6.1–9.1×＋emission 公式真 bug 修复）
-
-**分支：** `master`（本轮 commit 见 git log；第十二轮 `3e5a13561` 在历史里）
-
-### 一、本轮改动（第十二轮摊销构成审计 → 三项依次消灭）
-
-第十二轮后 R=12 K=262144 摊销：ownership 位图 48.7ms / 数值 pass 32ms / assembly 23ms / validate（另计）69ms。
-
-1. **ownership 列增量化**（48.7ms → 0.04ms）：cache 持 `rerot_world_owned`（per-seq 位图，world records 位置索引）；`apply_ubatch` 增量（purge 清位/写 cell 重写位/共享 cell 只清被删 seq 位），`ensure` 重建同扫重填。**顺带修一个真 bug**：purge 收集原来用 `seq_has` 会把共享 cell（seq_count>1）误从 world 删除——改为匹配 seq_rm 的 `seq_count==1` 释放条件，共享 cell 只清位。
-2. **validate 门控**：`LLAMA_REROT_LAYOUT_VALIDATE=0` 跳过 per-entry 扫描（69ms → 4us），保留 O(groups+queries) 结构检查。默认全开（保守）。纯 Predefine 铁律：builder 是唯一真理。
-3. **emission 重写（最重要）**：
-   - **Bug A**：own-row 查找取 last storage match 而非 last **passing** match（同 pos 不可见重写行导致 qvp 偏移）。
-   - **Bug B（根本性）**：k-way merge 把 d-order 位置当可见序号——run 含不可见行占位时全部 effective 平移。**正确公式 `eff = qv + storage − (vis_before + tagged 前缀 passing 数)`**。重写为 per-list eff 数组（base=storage 序、段=tagged 序；非单调时段内 stable_sort）＋k-way merge＋contiguous identity 的 const-eff bulk（memcpy key_ids＋常数 eff＋整段 fill）。`llama_rerot_build_query_layouts_shared` 同步修复——**multi/shared/oracle 三方一致**。
-   - 教训：d-order 的"dev 排序 = 可见序号"假设在 run 内重复 storage（MTP verify 形状）时静默失效；第十一轮测试形状不触发。test-rerot-view 现有该形状（200 iter 随机）钉住。
-
-### 二、实测（min-of-5，validate off，vs 第十二轮前基线）
-
-|形状|基线|本轮|加速|
-|---|---|---|---|
-|R=12 K=262144|297450 us|**48472 us**|**6.1×**|
-|R=6 K=131072|90135|**9956**|**9.1×**|
-|R=6 K=65536|46919|**5244**|**8.9×**|
-
-### 三、验证
-
-- `test_rerot_world_incremental_decode` 新增 **Phase 7 共享 cell purge**（seq_cp→apply 覆盖共享位置：record 留 world、只清被删 seq 位）。
-- test-rerot-view：multi vs shared vs oracle **三方**对拍（新增 shared vs oracle）。
-- 全 rerot/xkv/flashprefill 电池 0 failure；ASAN 干净（/tmp/asan13，alloc-dealloc-mismatch 为测试自带 operator new 重载误报，关掉后全绿）。
-- 注意：改 `llama_kv_cache` 类布局后**必须全量重编**测试对象（增量链接旧 .o 会堆损坏——本轮 "corrupted double-linked list" 假警报的根因）。
-
-### 四、下一班
-
-1. **assembly 增量化**（~23ms@R=12）：entries/groups 每 query 重建——问题二方向：段描述（范围＋偏移）替代逐 entry，或跨 query 的 entries 结构复用（12 reader 的 key_index 序列 11/12 重叠）。
-2. `try_append_key_fast` 接线（O(1) 尾追 vs upsert 的桶扫描）——decode 热循环。
-3. 真机 semantic-smoke（需批准）。
-
----
-
-## 下班交接｜2026-09-22（第十二轮，cache 级 shared_world 接入：decode 热路径 1.3–1.6×）
-
-**分支：** `master`（本轮 commit 见 git log；注意 HEAD 已含他人合并的远端 TP5/P0-P14 提交，第十一轮 `787080bfd` 在历史里）
-**主题：** 第十一轮留下的最大项：把 `llama_rerot_shared_world` 接进 cache 级生产路径（`rerot_build_attn_layout`）。结构事件（apply/publish/reclassify）增量维护 world，普通 frontier 只付 ownership 位图＋数值 pass。全程 CPU。
-
-### 一、改动
-
-1. **world 生产原语**（`src/llama-rerot.h/.cpp`）：`upsert_keys`（环形复用：同 key_index 内容全换——旧 run 删行、按新 meta 入桶，records 位置稳定；内部桶序破坏回退 per-run tagged 重排）、`remove_keys`（apply purge 的被覆盖 cells）、`try_append_key_fast`（O(1) contiguous+uniform 尾追，本轮已实现未接线——下一班热循环用）。
-2. **cache 级**（`src/llama-kv-cache.h/.cpp`）：mutable world＋`rerot_world_gen`（CellGeneration 快照）；`ensure_rerot_world()` gen 匹配→复用/不匹配→一次全量重建（**最坏不劣于改动前**）；懒 `set_generation_enabled`（flashprefill 同模式，OFF 零开销）。增量接线：`apply_ubatch`（upsert 收集＋purge remove 收集＋gen resync）、publish/reclassify（set_key_meta 批量）。ownership 位图改按 world records 位置索引。
-3. **测试**（`tests/test-xkv-runtime.cpp`）：`test_rerot_world_incremental_decode`——6 阶段生产序列（pending 布局→追加→publish→publish 后追加→环形复用 seq_rm＋同 idx 新 run→seq_keep 安全网），每阶段 cache 级 layout 与逐 query oracle 对拍。
-
-### 二、本轮抓的真竞态（写进 RERoT.md §21.1 第十二轮）
-
-未跟踪变异（`seq_rm` 等）bump CellGeneration 后，若仍对**脏 world** 应用增量再 resync gen，脏数据会被 gen 匹配"洗白"——增量路径必须做**前置 gen 校验**（收集与应用两处），不匹配丢弃增量（重建时从 cells 重扫，无损）。测试 Phase 5/6 钉住：修复前 got=want+1 全行偏移。
-
-### 三、实测（cache 级 bench min-of-5，stash 对照）
-
-|形状|旧（每 frontier 全量）|新（增量摊销）|加速|
-|---|---|---|---|
-|R=6 K=65536|46919 us|28810 us|**1.63×**|
-|R=6 K=131072|90135 us|58461 us|**1.54×**|
-|R=12 K=262144|297450 us|230617 us|**1.29×**|
-
-低于纯模块的 4.6×：cache 侧剩余大头是 (a) ownership 位图每 frontier 从 `seq_get_all` 全量重建（R×K 位测试）、(b) layout assembly 拷贝。数值 pass 本身不可省。
-
-### 四、下一班
-
-1. **ownership 位图增量化**（新最大项）：world 已知道每 frontier 哪些 records 变了；位图可在 apply 时只改新写 cell 的位（R 个 reader 各 1 位/cell）。需要把位图从 layout 局部变量上移为 world 伴随结构。
-2. `try_append_key_fast` 接线进 `apply_ubatch` 的 upsert 路径（O(1) 尾追 vs upsert 的桶扫描）。
-3. layout assembly 增量化（entries/groups 的 reserve+push_back 每次全量）——低优先级。
-4. 真机 semantic-smoke（需批准）。
-
-### 五、验证
-
-全 rerot/xkv/flashprefill 电池 0 failure（landmark-standalone 2 failures 为预存基线，stash 验证）；test-rerot-view/attn/runtime 全绿；`test_rerot_world_incremental_decode` 六阶段 oracle 对拍通过。
-
----
-
-## 下班交接｜2026-09-22（第十一轮，结构 pass 提取为持久 shared_world：frontier 摊销 4.6–6.1×）
-
-**分支：** `master`（本轮 commit 见 git log）
-**主题：** 第四问"结构程序，多数 frontier 只更新数值"的 host 侧落地：builder 的结构 pass（run 分桶、tagged 排序、deviation 表、uniform、fast_keys、untagged 序）提取为 `llama_rerot_shared_world` 持久对象，结构事件付一次，后续 frontier 复用。纯模块＋对拍安全网，cache 级接入留给下一班。全程 CPU。
-
-### 一、改动
-
-1. **`src/llama-rerot.h`**：新增 `llama_rerot_shared_world`（纯模块，无 kv-cells 依赖）：`run` 结构体（rows/storage/d2t/t2d/dev/contiguous/uniform/u_vis/u_frontier/fast_keys，与旧 shared_run 字段一一对应）＋ API：`build_world`（全量，records 拷贝）、`build_world_structure`（公开，借用 caller 表的结构-only 构建——一次性路径零拷贝）、`append_keys`（增量，尾部字典序快路径，乱序回退全 run 重排）、`set_key_meta`（publish/reclassify：验证先行，桶内 frontier 变化时重探测 tagged 序）、`key(k)/runs()/untagged_sorted()/keys_ref()`。
-2. **`src/llama-rerot.cpp`**：bits 核心拆为 `multi_reader_numeric_pass`（匿名命名空间，reader+数值体，接 runs/untagged/keys_ref）＋两个公开入口：`_bits`（一次性，`build_world_structure` 借用 caller 表，输出与第十轮位级一致）与 `llama_rerot_build_query_layouts_multi_reader_world`（持久 world，跳过结构 pass）。
-3. **`tests/test-rerot-view.cpp`**：oracle 对拍加 world 探针（半表 build＋半表 append＋publish 式 meta 改写，逐 layout identical）；新增 `test_shared_world_incremental`（60 轮：乱序 append、重复 append 抛错、桶逃逸 meta 抛错、meta 改写后对拍 oracle）。
-
-### 二、本轮抓到的真 bug（语义修复）
-
-旧 sortedness probe 只查 (storage, frontier) 非降序，**不查 key_index tie-break**。增量路径（append/set_key_meta）遇到两行 (storage, frontier) 相等时保持到达序，而 oracle 全量重建按 key_index 重排——meta 改写（publish 把 frontier 拉平）后输出分叉（world e0=k6 vs oracle e0=k15，dev 差 1）。修复：probe 改完整字典序 (storage, frontier, key_index)，三处（build_world_structure / append 尾部检查 / set_key_meta 重探测）。**教训：任何"probe 通过就跳过 sort"的快路径，probe 必须覆盖排序键的全部分量，否则增量路径与全量重建静默分叉。**
-
-### 三、实测（-O2 独立编译，min-of-3/5，32-frontier 摊销）
-
-|形状|每 frontier 重建|world 摊销|加速|
-|---|---|---|---|
-|R=6 K=262144 Q=1|9069 us|1960 us|**4.6×**|
-|R=12 K=262144 Q=1|22945 us|3789 us|**6.1×**|
-|R=6 K=262144 Q=6|21804 us|12982 us|1.7×（数值 pass 主导）|
-
-bits 一次性路径回归已消除（12800 vs 12450 基线，噪声带内；R=12 +6% 来自 key_at 稀疏映射）。验证：test-rerot-view 0 failure（含 913→0 修复过程）；rerot/xkv/flashprefill 全家全绿（xkv-vulkan-landmark-standalone 2 failures 为预存基线，stash 验证）。
-
-### 四、cache 级接入未做的原因与下一班路径
-
-生产 key_index == cell idx，环形复用时**同 idx 内容全换**（`apply_ubatch` 里 `cells.rm(idx)` + `pos_set` + `rerot_set`），`append_keys` 的"key_index 必须新"前提在生产不成立。接入需要：
-1. `replace_keys`（同 key_index 内容更新：旧桶删行 O(run)＋入新桶/untagged＋结构重探测）；
-2. `apply_ubatch` 末尾（fp_bump 前、seq_rm purge 之后）逐 token on_cell 更新 world——注意 purge 的行必须从 world 删除，顺序上 purge 先于 world 更新即可（purge 后 cells 已 rm，world 更新时看不到它们，需显式删行）；
-3. 失效兜底：其余变异入口（shift/restore/defrag/try_clear）置 world 失效标记，下次布局惰性全量重建；
-4. `GGML_REROT_WORLD_VERIFY=1` 双路对拍安全网（cache 级同时跑 bits 与 world，断言位级一致）。
-
-### 五、下一步建议
-
-1. **cache 级 world 接入**（上述四步，收益 4.6×/frontier 直接落到 decode 热路径）。
-2. GPU 化 Q3（Hydragen 式公共块多读者）仍是最大真机项，等批准。
-3. 远期候选不变：Q2 写入布局长 span、Q9/Q10。
-
----
-
-## 下班交接｜2026-09-22（第十轮，ownership 列 bitset 直供：cache 级 R×K 字节展开删除）
-
-**分支：** `master`（本轮 commit 见 git log）
-**主题：** 第九轮交接的候选清单第三项：owned_col 字节扫描（R×K）→ bitset 消费 overload。三文件：`src/llama-rerot.h`、`src/llama-rerot.cpp`、`src/llama-kv-cache.cpp`＋测试探针。全程 CPU。
-
-### 一、改动：ownership 列从字节展开改为 packed bitset 直供
-
-第七轮起 cache 级就把 R 列 ownership 建成 bitset（owned_words），却为纯 builder 的字节接口展开成 R×K 字节（group_owned），builder 内再逐行读回——**展开与读回都是纯浪费**（约 2×R×K 次内存访问）。
-
-**改动**：
-1. `llama_rerot_owned_view`：裸 `const uint64_t*`＋字数，**无 kv-cells 类型依赖**（保持 llama-rerot 纯函数模块独立性）；
-2. `llama_rerot_build_query_layouts_multi_reader_bits`：核心实现，owned 探测变一次 AND（`bits[k>>6]>>(k&63)&1`）；
-3. 字节重载变打包转发壳（测试与外部字节调用方零改动）；
-4. cache 级（`llama-kv-cache.cpp`）直接传 owned_words，R×K 字节展开整段删除。
-
-### 二、实测（-O2 独立编译 min-of-10，production shape，多次重复）
-
-|形状|bytes 路径|bits 路径|Δ|
-|---|---|---|---|
-|R=6 K=262144|13090 us|12450|−5%|
-|R=12 K=262144|18200|16880|−7%|
-|R=12 K=65536|3943|3547|−10%|
-|R=1 K=65536|1703|1693|0（预期）|
-
-cache 级另省整个 R×K 字节展开＋R 个 K 长度向量分配（未计入上表 builder 数字）。
-
-### 三、验证
-
-- `test-rerot-view` 新增探针：同一 base_owned 打包走 bits 核心 vs 字节重载，逐迭代逐 layout 位级 identical，200 轮 0 failure；
-- 全家 rerot/xkv/flashprefill **45/45**；`git diff --check` 干净。
-
-### 四、接口教训（写进 RERoT.md §21.1 第十轮）
-
-纯函数模块的"类型独立"不必靠字节展开买——**POD view（指针＋宽度）同样零依赖**，还省掉转换。第七轮当时的"kept as bytes so llama-rerot stays independent"是伪约束。
-
-### 六、追加（同班次末尾）：oracle 去重 bitmap 化
-
-逐 query oracle（`llama_rerot_build_query_layout`）的 duplicate-key 检查仍是 unordered_set——shared/multi-reader 早在前几轮就换成 bitmap（实测 1141→45 us@K=65536）。oracle 不在 decode 热路径，但 view 测试 200 轮×R reader×每 query 都调它。已换 bitmap（语义不变：首个重复抛同消息），45/45 全绿，builder 基准无回归（bits 2409/16995 us 同噪声带）。commit `857286efe`。
-
-### 五、Q3 host 侧收口状态与下一步
-
-九轮＋本轮后，`rerot_build_attn_layout` 的 cache→builder 链路：单趟 cell 扫描（bitset 填充）→ bitset 直供 → 共享结构 pass → reader 无关属性共享 → Q=6 数值快通道。**host 侧 Q3（公共 KV 块服务多读者）的组织层工作已收口**；剩余大项全部需要目标机/批准：
-1. **GPU 化 Q3**（Hydragen 式公共块多读者）：host 副作用已清，等真机；
-2. 真机 semantic-smoke（需模型＋server）；
-3. Release 构建（磁盘 98%，余 2.5G，先清 build 再说）。
-
----
-
-## 下班交接｜2026-09-22（第九轮，reader 无关段属性上收结构 pass：R 越大省越多）
-
-**分支：** `master`（本轮 commit 见 git log）
-**主题：** 第八轮交接列的结构期 rank/node 分桶探测。单文件 `src/llama-rerot.cpp`。全程 CPU。
-
-### 一、改动：uniform 探测与 fast_keys 列上收到 shared run
-
-第八轮后 builder 的 reader 侧仍有两处 **R×K 重复工作**：
-
-1. **uniform 探测**：每个 reader 对每个段重读全部行 meta 验证 (visibility, frontier) 一致——但 uniform 是 **run 桶属性**（同一桶的行对所有 reader 相同），与 reader 无关。
-2. **fast_keys 列**：`keys[rows[p]].key_index` 内容 reader 无关，第八轮却每 reader 重建一次。
-
-**改动**：`shared_run` 增加 `uniform/u_vis/u_frontier`＋`fast_keys`，结构 pass 的 run 循环一次算好；reader 侧 uniform 分支直接读共享旗标（连首行 `keys[rows[0]].meta` 随机读都省了）。输出字节不变（纯计算位置移动）。
-
-### 二、实测（-O2 独立编译 min-of-10，production shape）
-
-|形状|第八轮|第九轮|Δ|
-|---|---|---|---|
-|R=6 K=65536|2904 us|2434|−16%|
-|R=12 K=65536|4612|3680|−20%|
-|R=6 K=262144|19419|12461|−36%|
-|R=12 K=262144|34035|16967|−50%|
-|R=1 K=65536|1665|1658|0（预期：无共享可收）|
-
-管线级：Q=1 R=6 总 4884→4475（−8%）；**Q=6 R=6 K=262144 总 66118→55506（−16%）**，build 34777→23260（−33%）。收益随 R、K 增长——正是“多笔共享结构”研究线的方向性验证。
-
-### 三、评估后放弃（两件，均有实测依据）
-
-1. **run 桶查找换 hash map**：unordered_map 每 key 的 hash＋probe 开销超过 6–12 桶线性扫描（struct pass 1396→2600 us 反向实测）。教训：桶数两位数时别上 hash。
-2. **Q2 写入布局主动维持长 span**：`find_slot` 已是 cont=true 连续分配；碎片来自 SWA 回收/环回/MTP 重复，修它需要 per-run 分配策略（侵入 find_slot 环语义，风险大），且第六轮快路径已对空洞优雅降级。等有生产 span 消费者再动。
-
-### 四、验证
-
-`test-rerot-view`（200 轮三路对拍）0 failure；`test-rerot-math`/`ddvr` 0 failure；`test-xkv-runtime` 全过；rerot/xkv/flashprefill 全家 **45/45**；`git diff --check` 干净。
-
-### 五、下一步
-
-1. 真机收益：目标机 `rerot-semantic-smoke.py`（需模型＋server）。
-2. **GPU 化 Q3**（公共 KV 块服务多读者）：host 侧九轮加速完毕，GPU 侧未动。
-3. reader 侧剩余：owned_col 字节扫描（R×K）——需 bitset 消费 overload 接口（llama-rerot 与 llama-kv-cells 解耦约束），收益 ~R×K/8，候选。
-4. Q2 写入布局维持长 span：等生产 span 消费者（已评估，见上）。
-
----
-
-## 下班交接｜2026-09-22（第八轮，Q=6 MTP verify 数值通道快发射＋磁盘清理）
-
-**分支：** `master`（本轮 commit 见 git log）
-**主题：** 攻下第七轮交接列出的最大遗留项：Q=6（MTP verify 形态）数值通道。单文件改动 `src/llama-rerot.cpp`（+61/−1）。全程 CPU。
-
-### 一、磁盘清理（班首）
-
-`~/.cache/semble`（918M）删除；`build/bin` 陈旧版本化 .so 剪除（保留符号链接指向的当前版）。99% → 98%（余 2.7G）。注意：每次 make 会再生成新版本号 .so，剪除脚本可重复执行。
-
-### 二、改动：连续 run＋恒等通过集的快发射列
-
-- **对象**：Q=6 时每 query 的 k 路归并对每 entry 走 `dp_at → d2t[dp] → rows[t] → keys[ki].key_index` 三次**依赖随机读**，且每 entry 重算 `qv + dev[dp] − vis_before` 与 best 比较。
-- **改动**：结构期两个既有探测（第六轮引入）——storage 严格 +1（dev 常数）＋恒等通过集——联合成立时，为段预计算 `fast_keys`（key-id 顺序列，每 reader 一次、全 query 批共享）。发射：`==best` 重检提升出循环；own 段因果截断退化为 `p < seg_cut` 前缀上界（恒等置换下 tagged 序 == d 序）；foreign 段顺序倾倒。不成立的段保留通用分支（快路径铁律）。
-- **实测**（-O2 独立编译管线基准，R=6）：Q=1：build 3372→2983 us（−12%）；**Q=6：16210→8758 us（1.85×）**；Q=6 K=262144：34.8ms（结构 ~1.8ms＋每 query ~1.2ms，接近 65k entry 输出 memcpy 地板）。相位：Q=6 总 18.3ms 中 validate 1.9ms、装配 ~7.6ms（后者是纯拷贝，见第七轮评估：不值得改对拍接口）。
-
-### 三、纠错（本轮唯一 bug）
-
-首版 foreign 快分支漏置 `emitted` 旗标 → `test_rerot_shared_reader_multi_query`（MTP verify 形状）以 "k-way merge lost a group head" 立即抓住。最小复现（`/tmp/repro_fast.cpp`：root/own/priv 三 run 世界，5 个跨界 query 位置）修复后 5/5 与逐 query oracle 逐字节一致。**教训：发射类快分支的每个出口都要置 emitted——丢头异常是免费的对拍哨兵，别急着删调试输出前先读懂它。**
-
-### 四、验证
-
-`test-rerot-view`（200 轮三路对拍）0 failure；`test-rerot-math`/`test-rerot-ddvr` 0 failure；`test-xkv-runtime` 全过；rerot/xkv/flashprefill 全家 **45/45**；`git diff --check` 干净。
-
-### 五、下一步
-
-1. 真机收益：目标机 `rerot-semantic-smoke.py`（需模型＋server，本机不可行）。
-2. GPU 化 Q3（公共 KV 块服务多读者）：host 侧已五轮加速（Q=6 builder 8.8ms），GPU 侧未动；数学契约在 `llama-rerot-math.h`（`llama_rerot_shared_block_attention`）。
-3. 装配融合（1.9ms@Q=1）：需改 oracle 对拍接口，收益小，维持第七轮评估。
-4. Q2 写入布局维持长 span（`llama_rerot_span_long_fraction` 验收）。
-5. Release 构建重测（磁盘已腾出 2.7G，可选）。
-
----
-
-## 下班交接｜2026-09-22（第七轮，cache 级布局路径：validate 位图＋ownership 单趟＋装配 reserve）
-
-**分支：** `master`（本轮 commit 见 git log）
-**主题：** 把剖面从纯 builder 推进到 cache 级全路径（`rerot_build_attn_layout` 端到端）。两文件改动（`src/llama-kv-cache.cpp` +58、`src/llama-rerot.cpp` +14）。全程 CPU。
-
-### 一、关键发现：开发机 build 是 Debug（-O0）
-
-cache 级绝对数字（111ms）与纯 builder -O2 数字（4ms）差 8.5×——查 `build/CMakeCache.txt` 是 `CMAKE_BUILD_TYPE=Debug`。**cache 级数字只作同库相对比较**；-O2 结论由独立编译基准（`g++ -O2` 直编 `src/llama-rerot.cpp`）补齐。目标机/生产数字必须 Release 构建。
-
-### 二、三项改动
-
-1. **validate 换字节位图（本轮最大项）**：`llama_rerot_attn_layout::validate` 的 per-query 重复 key 检查原是逐 entry `unordered_set::insert`——每 reader 每 query ~n_kv 次哈希插入，cache 级剖面最大单项。换 `vector<uint8_t>` 位图＋同走重置，fail-loud 语义不变。cache 级（-O0）**111.4→66.2ms（-41%）**；-O2 管线上 validate 项 0.3ms。
-2. **ownership 列单趟共享**：原 per (cell, reader) `seq_has`（R·n_kv 次）；现一趟读 `seq_get_all` 位图填 R 列 64 位字再展开字节列。语义不变；实测收益不可测（bitset test 本已廉价），保留为消除 R 倍冗余的结构改进。
-3. **装配 reserve**：`result.groups/entries` 跨 reader push_back 无 reserve；先数总量再 reserve，cache 级再 -9%（66.2→60.5ms）。
-
-### 三、-O2 管线全景（production shape Q=1，独立编译基准）
-
-| 形态 | build | validate | 合计 |
-|---|---|---|---|
-| R=6 K=65536 | 3.4ms | 0.3ms | **~5.6ms**（含装配 1.9ms） |
-| R=1 K=65536 | 2.6ms | 0.07ms | 2.7ms |
-| R=12 K=262144 | 47.4ms | 3.8ms | 59.7ms |
-
-装配（1.9ms）是对已物化 per-query 向量的纯拷贝（4.8ns/entry，memcpy 速度）；融合进 builder 发射需改 oracle 对拍接口，收益 1.9ms，暂不做。
-
-### 四、验证
-
-- `test-rerot-view` 0 failure；`test-xkv-runtime` 全过（cache 级对拍 oracle：`test_rerot_shared_reader_multi_query` MTP verify 形状＋`test_ddvr_two_query_groups` 双 reader 组）；rerot/xkv/flashprefill 全家 **45/45**；`git diff --check` 干净。
-
-### 五、评估后未做（含理由）
-
-1. **跨 ubatch 结构缓存（Q4 增量）**：增量 append 行可省 scan＋分桶（~build 的 30%），但 cell 重用/回收使 sortedness 假设可能失效，staleness 风险大于 1ms 级收益。候选后续。
-2. **装配融合**：见上，1.9ms 不值得改对拍接口。
-
-### 六、下一步
-
-1. **Release 构建重测**：目标机或本地 Release build 出诚实 -O3 数字（本地磁盘 99% 余 1.7G，谨慎）。
-2. 真机收益：目标机 `rerot-semantic-smoke.py` 对比 decode host 时间。
-3. Q=6（MTP verify）数值通道 ~15ms 仍是下一大头（每 query 重扫全部列表；可探索相邻 query 增量截断）。
-4. GPU 化 Q3（多读者共享块）：host 侧已四轮加速，GPU 侧未动。
-5. 磁盘清理（~/.cache/ccache 1.2G、~/.cache/semble 918M）。
-
-### 七、教训
-
-- **先查构建类型再解释 8×差距**：cache 级 108ms vs 纯 builder 4ms 的差距花了半小时排查（怀疑世界形状、ownership、装配），最后发现是 Debug 库。教训：跨基准比较前先确认编译参数一致。
-- **unordered_set 在热路径的隐性成本**：validate 的哈希去重占 cache 级 -O0 的近半时间；位图/字节列是 O(entries) 顺序写的正确替代。第五轮已在 builder 内做过同样替换（1141→45us），本轮是同一教训在 validate 上的复发——**审计时应全库 grep 热路径的 unordered_set**。
-
----
-
-## 下班交接｜2026-09-22（第六轮，multi-reader 布局生产形态快路径）
-
-**分支：** `master`（本轮 commit 见 git log）
-**主题：** 第五轮 `llama_rerot_build_query_layouts_multi_reader` 的三条生产形态快路径。全程 CPU 验证（未启动模型/GPU）。单文件改动（`src/llama-rerot.cpp`，+179/−44）。
-
-### 一、相位剖面驱动（先测后改）
-
-gprof 太粗、无 perf；用函数体拷贝＋相位计时的 throwaway 剖面（`struct/filter/numeric` 三段）：
-
-| 形态（K=65536 合成键） | struct | filter | numeric | 合计 |
-|---|---|---|---|---|
-| Q=1 R=6（decode，第五轮） | 3.1ms | 1.7ms | 2.8ms | 7.9ms |
-| Q=1 R=6（本轮后） | 1.0ms | 0.33ms | 1.8ms | **3.2ms** |
-| Q=6 R=6（MTP verify） | 1.1ms | 1.3ms | ~15ms | ~16ms |
-
-numeric 在 Q=1 时即 39 万 entry 发射（输出本体），接近地板；Q=6 时数值通道主导（每 query 重扫），维持。
-
-### 二、三条快路径（全部“探测为真才走，为假回通用”）
-
-1. **tagged 序预检跳排序**：append-only run 行到达序＝tagged (storage, frontier, idx) 序（tie 由 key_index 升序到达保证）。O(n) 非降探测，失败才 std::sort。
-2. **连续 storage 恒等偏差序**：桶内 storage 严格 +1 连续 ⟹ d=s₀ 常数 ⟹ 偏差序恒等，d2t/t2d 退化为顺序填充。空洞/重复（reclaim、MTP verify 共位）回通用排序＋置换。
-3. **uniform 桶＋全拥有恒等列表**：(visibility, frontier) 桶内全一致 ⟹ frontier 门整桶一次判定；own 桶 ownership 全 1（生产形态）⟹ dp/prefix 恒等，不物化。`seg_view.identity` 旗标＋`dp_size/dp_at/prefix_at` 访问器。foreign 桶天然恒等（不过滤）。
-
-### 三、实测与验证
-
-- **decode 形态（Q=1）**：R=6：7882→**3900 us（2.0×）**；R=1：6200→1946（**3.2×**）；K=262144 R=6：28864 us。Q=6 R=6 维持 ~16.4ms（数值通道主导，未动）。
-- 对 legacy（每组拷贝＋单 reader builder）Q=1 R=6：36961→3900 = **9.5×**；对 per-query oracle：21278→3900 = **5.5×**。
-- 乱序最坏形态不退化（快路径正确回退）。
-- `test-rerot-view` 0 failure（200 轮三路对拍：乱序世界走通用分支、恒等世界走快路径，输出逐字节一致）；`test-xkv-runtime` 全过（部分拥有、混合 frontier 桶覆盖非 uniform 回退）；rerot/xkv/flashprefill 全家 ctest **45/45**。
-
-### 四、纠错与教训
-
-1. **本轮唯一 bug（8054 断言失败）**：第二版编辑把 tagged 排序调用整个删掉、只留探测——本意是“探测为真跳过排序”，实际变成“永远不排序”（探测结果无人消费）。200 轮对拍立即抓住。教训：快路径必须写成 `if (!fast) { general }`，不能删除 general 分支；bisect 时发现“禁用快路径仍失败”即说明 general 路径被破坏。
-2. **flat merge 实验回退**：曾把归并改为“每 query 物化 (effective, key) 平面对再归并”——Q=6 时多出 37MB 中间流量，17885→25663 us 回退，`git checkout` 回退。教训：剖面说 numeric 慢不等于加拷贝层能救；发射本体不可省。
-3. 机器噪声：同配置多次运行波动 ±30–60%（legacy 41.7k↔66.9k）。结论取安静窗口的首次运行＋相对比较。
-
-### 五、下一步
-
-1. 真机收益：目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键）。
-2. Q=6（MTP verify 形态）数值通道 ~15ms 是下一个大头：每 query 重扫全部列表。可探索 per-query 增量（相邻 query 位置差小）或按 query 分组共享截断。
-3. GPU 化 Q3（多读者共享块）：host 侧供给已三次加速（第五轮共享 world＋本轮快路径），GPU 侧未动。
-4. 磁盘 99%（余 1.8G）：必要时清 ~/.cache/ccache(1.2G)、~/.cache/semble(918M)。
-
----
-
-## 下班交接｜2026-09-22（第五轮，Q3 共享 key world＋双 bug 修复）
-
-**分支：** `master`（本轮 commit 见 git log）
-**主题：** 把 Q3 host 侧推向单一共享 key world——R 个 pen 共享一次结构扫描＋排序，每 reader 只付 ownership 过滤＋数值 pass；同时修复第四轮两个已提交 bug。全程 CPU 验证（未启动模型/GPU）。
-
-### 一、两个已提交 bug（本轮先修，再谈优化）
-
-| Bug | 症状 | 根因 | 修复 |
-|---|---|---|---|
-| own private/pending 行被施加 frontier 门 | 探针：own private `frontier=9 > reader.frontier=3` 行被 shared builder 丢弃，oracle 保留 | shared builder 对**所有** own 行做 `frontier <= F && owned`；oracle 对 private/pending 只查 `node==reader && owned && causal cut`（pending 行就是当前写入批次） | private/pending 豁免 frontier 门（与 flashprefill builder 判定对齐）；200 轮对拍加 future-frontier arm |
-| 段内 storage 重复下偏差序置换破坏截断 | 探针：段内 storage `[0,1,1,2]` 时 7 个 case 全分歧（截断/own-row 均错） | 第四轮把段 storage 数组置换进偏差序（`s−i`），MTP verify 共享位置时置换非恒等、数组失序，`upper_bound` 二分失效 | 段内**双序**：tagged 序（升序 storage，截断＋own-row 用）与偏差序（置换 `d2t/t2d`，归并用）；截断是 tagged 前缀，归并按 `d2t[dp] < cut` 过滤 |
-
-两个 bug 第四轮 200 轮对拍都没抓到（测试世界没有段内 storage 重复、没有 future-frontier private 行）——对拍 generater 的形状覆盖就是安全边界，本轮都把形状加进了对拍。
-
-### 二、新生产路径：多 reader 共享 world
-
-- 新纯函数 `llama_rerot_build_query_layouts_multi_reader(readers, qpos, keys, base_owned)`（`src/llama-rerot.{h,cpp}`）：一次结构 pass 按 **(episode, run, owner-node)** 分桶（run id 可被多 node 先后持有——`test_sr_shared_physical_rows_3_ddvr_slots` 的 pub(1)/priv(9) 同 run_id 1 钉住），每桶 oracle 的 (storage, frontier, idx) 排序＋偏差序；每 reader：own 段（owner==reader，可多 run，causal 截断）、foreign 段（frontier 规则，不截断）、base 臂（`base_owned[r]` 列），逐 query k 路归并。
-- `rerot_build_attn_layout` 接入：一次扫描（上界 `used_max_p1()`，跳过空洞尾巴）＋一次 multi 调用；**每组不再整表拷贝 keys**（第三轮的 R×K memcpy 取消）。
-- own 判定语义：**段 owner node == reader**（不是 run==query_run——reader 的 node 可拥有多个 run：query run＋private run，`test_rerot_shared_reader_multi_query` 的 run 2+3 钉住）；query-row 查找限 query run 段。
-
-### 三、验证与实测
-
-- `test-rerot-view`：0 failure；新增 `test_multi_reader_layouts_vs_oracle`（200 轮三路对拍：multi vs 单 reader shared vs per-query oracle，全臂＋段内重复＋future-frontier private＋LAG1＋乱序物理序＋每 reader 独立 query 批次）。
-- `test-xkv-runtime`：all passed（cache 级路径含 own 多 run、同 run_id 双 node）。
-- 全家 ctest **45/45**。
-- **实测**（开发机 CPU，合成 K 键，production shape）：R=6：42293→17885 us（**2.36×**）；K=262144 R=6：259597→115992（2.24×）；R=12：92168→34039（2.71×）；R=1：1.10×（无冗余可省仍略快）。对 per-query oracle R=6/K=65536：112728→17885（6.3×）。乱序最坏：17758（不退化）。
-
-### 四、纠错与教训
-
-1. 首版 multi 把 own 误判为 `run==query_run`，漏掉 reader 自己 node 的 private run——cache 测试立即抓出（该 reader 同时拥有 run 2 和 3）。经验：oracle 按**行**的 node 判定 own，共享世界必须按 **(run, node) 桶**组织，不能按 run。
-2. 首版 per-segment 分裂 FULL/gated 两个列表导致同段两种 vis_before，虚拟编号与 oracle 不符——oracle 的虚拟编号只按**段**连续编号。教训：集合划分要跟随 oracle 的编号单位。
-3. 测试世界 peer run id 从 72 起编号与 own_priv(73) 撞号，制造了生产者不存在的形状——run id 全局唯一是数据前提，测试要守。
-
-### 五、下一步
-
-1. Q3 host 侧剩余：foreign 段 frontier 过滤在 reader 共享 (frontier, mode) 时组间相同，可按 cohort 预过滤共享。
-2. 结构 pass 仍是最大项（K=65536 共享排序约 3.3ms）——rank/node 分桶＋近排序检测（生产形态物理序≈写入序）可再省约 20%。
-3. Q2 剩余：写入布局维持长 span（`span_long_fraction` 验收指标）。
-4. 真机收益目标机 `rerot-semantic-smoke.py` 对比 decode host 时间。
-
----
-
-## 下班交接｜2026-09-22（第四轮，数值通道 k 路归并＋跨 reader 共享供给）
-
-**分支：** `master`（本轮 commit 见 git log；基于 `8772195ac`）
-**主题：** 第三轮落地的 `llama_rerot_build_query_layouts_shared` 仍有三个浪费点：每 query 的 O(V log V) stable_sort（占大头）、own-row 虚拟索引的 O(V) 指针扫描、重复键检测的 unordered_set；cache 侧每个 reader 组还各自 O(n_kv) 重建 key 表。本轮全部消除，输出与 oracle 仍逐字节一致。
-
-### 一、核心数学发现（本轮最重要）
-
-段内第 i 行（发射序）的 effective = `(qv − B) + d_i`，其中 **`d_i = s_i − i` 与 query 无关**（B 为该段可见前缀计数）。storage 重复使 d 下降、空洞使 d 上升，但 d 的稳定序在结构期内固定。于是：
-
-- **结构期**：每段（含 BASE 臂）按 d 稳定排序一次；
-- **每 query**：只做二分 causal 截断＋R+1 路 k 路归并（组边界＝归并中不同值；组内 entry 序＝列表序＝ oracle stable_sort 输出序）；own-row 虚拟索引＝段前缀算术 O(1)。
-
-这是 Q2“段内相位常数”在分组层的直接兑现：排序 K 个 entry 只为发现 ~R 个组的浪费消失。
-
-### 二、已合入
-
-|改动|位置|实测（开发机 CPU，合成 K 键）|
-|---|---|---|
-|数值通道：段级偏差序＋k 路归并＋O(1) own-row|`src/llama-rerot.cpp` `llama_rerot_build_query_layouts_shared` 数值 pass|per-query 从 ~2400 us（Q=6,K=65536）降到 261 us|
-|重复键检测 unordered_set → 字节位图|同上结构 pass|1141 → 45 us（K=65536）|
-|全序比较器（唯一 key_index 断尾）stable_sort → std::sort|同上两臂排序＋偏差排序|tagged 排序 4251→3364 us（N=57344）|
-|cache 侧 R 组各自 O(n_kv) cell 扫描 → 一次共享扫描＋R 次位图填 ownership|`src/llama-kv-cache.cpp` `rerot_build_attn_layout`|R 个 pen 同 frontier 时 cell 访问 R·n_kv → n_kv + R·位图填充|
-
-### 三、验证
-
-- `test-rerot-view` 0 failure（含 200 轮随机对拍，覆盖 storage 重复/边界位置/打乱行序）；`test-xkv-runtime` 全过（含 cache 级多行回归与多 reader 跨组）。
-- rerot/xkv/flashprefill 全家 **45/45**。
-- **收益**（对 oracle 逐 query 全路径，生产形态物理序＝写入序）：K=65536,Q=6：16073→4783 us（**3.4×**）；K=262144,Q=6：96613→28584 us（3.4×）。最坏形态（物理序全打乱）：K=65536,Q=6：13399→7200 us；K=262144,Q=6：82351→44704 us。
-
-### 四、剩余大头与纠错记录
-
-1. **结构期 tagged 全局排序 3330 us（K=65536）是下一个目标**：rank 分桶（先按 rank 计数分桶再各桶排序）实测可再省 ~20%（4251→3364 us），未做——留给下一轮，避免本轮变更面过大。
-2. **偏差序的发现过程**：先验证“段内 effective 单调”假设被 storage 空洞推翻（空洞使 s−i 上升），但“d 的稳定序与 query 无关”仍成立——排序的对象从 effective 换成 d 即可把 per-query 排序完全移出。这是本轮唯一的关键洞察，其余是常规优化。
-3. own-row 语义确认：段内升序 storage 数组顺序即发射序（tagged 比较器保证），最后一个等 storage 行＝oracle 的 last-match。
-
-### 五、下一步建议
-
-1. 结构期 rank 分桶排序（~20% 再省）；生产形态下结构期输入已近似有序（物理序≈写入序），可探索检测后跳过排序。
-2. Q2/Q4 剩余：写入布局维持长 span（`span_long_fraction` 验收指标）；flashprefill `llama_rerot_split_table_fragments` 调用点接 run-order 签名缓存。
-3. 真机收益需目标机跑 `rerot-semantic-smoke.py` 对比 decode host 时间（等价性已 CPU 证明；开发机无目标模型）。
-
----
-
-## 下班交接｜2026-09-22（第三轮，Q2/Q4 生产化）
-
-**分支：** `master`（本轮 commit 见 git log；基于 `2b7b479d2`）
-**主题：** 把上一轮交接“下一步建议 1”落地：Q2/Q4 的结构/数值分离接入 decode 热路径。
-
-### 一、已合入
-
-|内容|入口|
-|---|---|
-|`llama_rerot_build_query_layouts_shared`：同一 reader 多 query 行的批量布局——结构一次（可见性分类 FULL/gated、两臂排序、per-run 升序 storage 数组、own-row 查找），每 query 只做数值（二分 causal 截断、virtual 计数、一次稳定排序分组）|`src/llama-rerot.{h,cpp}`|
-|`rerot_build_attn_layout` 组内路径切换到共享构建器（按 reader 分组后一次结构扫描，ownership 由组首行解析一次）|`src/llama-kv-cache.cpp`|
-|逐 query `llama_rerot_build_query_layout` **保留为 oracle**，未删除未修改|同上|
-|随机对拍测试（200 轮：全臂共存、STRONG/LAG1、边界位置、打乱行序）＋ cache 级回归（真实 `llama_kv_cache` + view 安装 + 5 行单 seq MTP-verify 形态，逐行对拍 oracle）|`tests/test-rerot-view.cpp`、`tests/test-xkv-runtime.cpp`|
-
-### 二、验证证据
-
-- `test-rerot-view`：0 failure（含新 `test_shared_layouts_vs_oracle`，200 轮随机对拍 group-for-group/entry-for-entry 一致）。
-- `test-xkv-runtime`：全过（含新 `test_rerot_shared_reader_multi_query`，真实 cache 级路径）。
-- rerot/xkv/flashprefill 全家 **45/45** ctest；`git diff --check` 干净。
-- **实测收益**（开发机 CPU，合成 K 键/Q 行，throwaway bench 已清理）：Q=6（单 pen MTP verify 形态）**5–8×**（K=4096：1046→156 us；K=16384,Q=12：8920→1074 us；K=65536,Q=6：20737→3784 us）；Q=1 也 ~1.1×。
-
-### 三、关键事实与纠错记录
-
-1. **第一版实现曾把 FULL（foreign public）行提前 emission，与 oracle 的 base→tagged(rank序) 全局序不一致**，200 轮对拍立即抓出（14800 断言失败）。修正后按 oracle 两臂分解（BASE 臂 + TAGGED 臂 rank-major 段）全绿——对拍 oracle 的设计直接兑付了价值。
-2. **同 run 同 owner 是硬不变量**：causal 标志由 `(node==reader)` 决定，同 run 恒同 node；实现内加了运行时断言。合成测试数据若违反此约束会被拒绝（不是静默错排）。
-3. **ownership 组内恒定成立**：分组按 `&rerot_reader_views[seq]` 指针，一个 view slot 即一个 seq；MTP verify 多行同 seq 共享同 view。
-
-### 四、下一步建议
-
-1. Q2/Q4 生产化剩余方向（RERoT.md §21.3）：写入布局维持长 span（`span_long_fraction` 验收指标）；flashprefill `llama_rerot_split_table_fragments` 调用点接 run-order 签名缓存。
-2. 目标机验证顺序：`test-rerot-view`/`test-xkv-runtime` 已 CPU 证明等价；真机收益需在目标机用真实模型跑 `rerot-semantic-smoke.py` 对比 decode 阶段 host 时间。
-3. Q3（多读者共享块）GPU 化仍是最大跨笔共享机会；Q5/Q6 F32 门已实测（相对 ~5e-7 / 绝对 ~2.5e-5）。
-
----
-
-## 下班交接｜2026-09-21（晚）
-
-**分支：** `master` @ `29cd8f51a`（已推送 `origin/master`）
-**本轮主题：** 计算组织研究线——把 2026-09-21 十问中的四条等义数学落成代码，重构 indexed 布局 host 侧扫描。**未启动任何模型/GPU 测试**（开发机单 780M iGPU）。
-
-### 一、已合入（单笔 commit）
-
-|内容|入口|
-|---|---|
-|[Q3] 共享 KV 多读者块 attention（一次读块，逐读者 m/z/u，按读者合并）|`src/llama-rerot-math.*`|
-|[Q5] GDN 共同基底+低秩增量（每步精确追加一个秩一项；共享 B^T x）|同上|
-|[Q6] 已知 token WY 块折叠（M = I − K W K^T，W=(I+L)^{-1}diag(β)，**行索引 β**）|同上|
-|[Q7] PQ2_0 位平面恒等式（两 bit-plane 子集和 − Σx；16 表 LUT/4 权重）|同上|
-|indexed 布局按 distinct reader state 分组，每组一次扫描+排序（原为每 query O(n_kv) 全扫）|`llama_kv_cache::rerot_build_attn_layout`|
-|FP64/位级 oracle 测试（独立参考实现，不调被测核心）|`tests/test-rerot-math.cpp`|
-
-### 二、验证证据
-
-- `test-rerot-math`：0 failure（Q3 全 softmax 对拍+合并顺序无关；Q5 稠密递推 12 步对拍，秩每步恰 +1；Q6 24 随机 chunk T=1..8 对拍，β=0 时 M=G·I、Y=0 精确；Q7 四种编码全在位时位级相等）。
-- rerot/xkv/flashprefill ctest 全家 **45/45**（含 `test_ddvr_two_query_groups` 多 reader 多 query 精确组计数）。
-- 开发机预存失败（基线复现，与本轮无关）：vocabs、quantize-fns、archs、backend-ops timeout、vulkan-mesh（需 ≥2 设备）。
-- 磁盘曾满 100%：已清理 `build-o200k`、`build-landmark-check`、`build-xkv-landmark`、uv/puppeteer/codex-runtimes 缓存及 `build/bin` 陈旧版本化 so，现余 ~2.6G。
-
-### 三、下一步建议
-
-1. 数学参考层是 kernel 契约，**未进生产路径**；GPU 化前必须过 F32 数值门（Q5 重排、Q6 WY 重结合均不保证逐位一致）。
-2. Q6 的生产形态：秩算子 `x → G(x − K(W(K^T x)))` 应用折叠块，同一折叠块服务多 lane 固定入口重放——先在固定入口 F_i 上做收益测量。
-3. Q5 的 r 从离开共同基底起算（含固定入口）；超过约 d_k·d_v/(2(d_k+d_v)) 转稠密。
-4. Q8 跳块上界与 Q10 联合投机未动，不得与等义改写收益混记。
-
----
-
-RERoT 设计、验证入口与路线见 [RERoT.md](RERoT.md)。TP5 设计与收敛路线见 [TP5.md](TP5.md)。更长的 09-14 现场报告见 [下班交接.md](下班交接.md)。
-
----
-
-## 下班交接｜2026-09-17（晚）
-
-**分支：** `master` @ `c0e8948ae`（已推送 `origin/master`）
-**目标：** 5× AMD RX 6800 上 Qwen3.8-Flash TP5，纯 STAR 模式下单 Token 通信压进 10 ms（100 tok/s）
-
-### 一、本轮已合入（按 commit）
-
-| Commit | 内容 |
-|--------|------|
-| `baca3a3f0` | `tp5_bda_push_f16.comp` 向量化 128 位爆发写 + `tp5_drm_waiter` 5 核并发等待；单步通信降至 31.78 us |
-| `f27b776e5` | `submit_epoch_chain` 解除 P1 跨阶段等待；P2 等待掩码收窄为 TRANSFER_BIT；CPU 侧 9.24 us |
-| `c0e8948ae` | **删除 309 行碎片化 STAR 分支**，回归原版融合流水线 `[SUM(s-1) → COMPUTE(s) → PUSH(s)]` |
-
-**已验证：** `test-vulkan-tp5-mesh --sync star --rounds 96` 100% 通过（位级精确）。
-**CPU 侧单步 AllReduce 实测：** **7.06 us**（AVX2 sum 4.25 us + 根联合体广播 2.59 us），96 步合计 0.68 ms。
-
-### 二、关键代码事实
-
-1. **六大支柱体系（2026-09-17 修订版）**：
-
-| 支柱 | 机制 | 实测指标 | 状态 |
-|------|------|---------|------|
-| **一** | 系统物理内存直通：`posix_memalign` + `VK_EXT_external_memory_host`，GPU BDA 直写 CPU L3 缓存（Intel DDIO） | — | ✅ |
-| **二** | 64 位裸物理指针 + CPU 根联合体下行广播：`VK_KHR_buffer_device_address` + `memcpy` 5 通道并发直写显存 | 2.59 us | ✅ |
-| **三** | **CPU L3 Cache 自旋 polling + GPU completion flag（DRM IOCTL 已死）**：GPU 算子顺手写 `flag[0] = seq` 到 Host 内存，CPU 在 L3 缓存内 `_mm_pause()` 自旋检查，0 系统调用，0 中断 | 5.13 us | ✅ |
-| **四** | 22 物理核无锁 AVX2+F16C L3 驻留累加池：`tp5_avx2_pool`（纯 `std::atomic` + `_mm_pause()`，去除 OS 互斥锁与条件变量） | 4.25 us | ✅ |
-| **五** | 零提交常驻融合流水线：回归原版 `[SUM(s-1) → COMPUTE(s) → PUSH(s)]` 段拼接，三模式共用 `chain_scratch`，消除 192 个 Job 碎片 | — | ✅ |
-| **六** | **提交开销隐藏进上一 token**：当前 token 的 `vkQueueSubmit`（含命令录制与批组装）在上一 token 的 GPU 执行窗口内完成，提交耗时完全移出关键路径；辅以异步 Signal 线程池 0.04 us 原子交接 | 0.04 us | ✅ |
-
-| **单步 AllReduce 物理总和** | — | **7.06 us（96 步 0.68 ms）** | ✅ |
-
-2. **`submit_epoch_chain` 已回归统一融合流水线**：
-   STAR/TIMELINE/DRM 三种模式共用 `chain_scratch` 段拼接（`append_segment`），不再有 STAR 专属分支。
-   手写分支曾把 `[SUM(s-1) → COMPUTE(s) → PUSH(s)]` 切成 3 个独立 Submit，造成 192 个内核 Job 碎片与 5.9 ms/stage（1.24 tok/s）。
-3. **GPU → CPU 通知机制（支柱三定论）：**
-   - `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` 在多卡高频小步长下**已死**：
-     内核工作队列 10 ms 调度时钟惩罚 + 每 Token 960 次 ioctl 系统调用摩擦。
-   - 替代路线：**GPU BDA 直写 completion flag 到 CPU L3 缓存 + CPU `_mm_pause()` 自旋检查**，
-     实测 5.13 us，0 系统调用，不碰 GPU 硬件，无看门狗风险。
-   - `tp5_bda_push_f16.comp` 已含 `flag[0] = seq_val` 写回，flag 位于每个 rank 槽位尾部 -64 字节（严格在绑定内存内）。
-4. **CPU → GPU 通知机制（支柱六定论）：**
-   门铃（Doorbell）方向是 CPU→GPU；可走 `amdgpu_create_userqueue`（libdrm_amdgpu 已装）或异步 Signal 线程池。
-5. **支柱六的真正内涵（提交开销隐藏）：**
-   当前 token 的整图命令录制 + `vkQueueSubmit` 批组装，全部在上一 token 的 GPU 执行期间完成（Pipeline Overlap），
-   提交本身的 CPU 耗时（~1-2 ms）永不在当前 token 的关键路径上，等效于 0 提交开销。
-
-### 三、当前阻塞点
-
-`llama-server` STAR 模式启动时，`models/qwen4exp.cpp:1154` 的 `ggml_set_rows` 触发：
-
-```
-cmd_child_to_router:error: ggml/src/ggml.c:4025: GGML_ASSERT(a->ne[2] == b->ne[2]) failed
+RequestState
+    target 与 draft 各自的状态、有效前缀、取消与提交边界
 ```
 
-**根因：** `kq_mask_all`（`[1, n_kv, n_batch, n_stream]`）与 `zeros`（`[1, n_top_k, n_batch, n_stream]`）在 `n_batch`/`n_stream` 维度不匹配（GDN 掩码构建路径）。
+然后让六步草稿成为一个有限步执行程序，而不是六次高层 `llama_decode → sampler` 往返。
 
-**下一步：**
-1. 对比 `--tp5-sync timeline` 下 `llama-server` 能否启动，确认该断言是否 STAR 特有。
-2. 在 `qwen4exp.cpp:1145-1155` 加形状打印定位维度错配。
-3. 修复后用 `EXTRA_ARGS="-b 32 -ub 32 -c 512"` 做纯 Decode 压测（勿永久修改批次，Prefill 待后续优化）。
+**自回归依赖仍然存在，但不要求每一步都回 CPU 决策。** 投机解码的收益来自减少昂贵目标模型的串行调用，并不意味着草稿的因果依赖可以被取消。([Proceedings of Machine Learning Research][1])
 
-### 四、GPU 状态
+### 第一项关键改造：设备端 token → embedding → 下一步
 
-五卡空闲基线：`17.2 MB` / `31.9 MB`，`gpu_busy = 0%`，dmesg 零错误。
+每一步应形成：
+
+```text
+分片 LM head
+    → 每 rank 局部最大值与 global token id
+    → 全局候选发布
+    → 设备端 embedding lookup
+    → 下一步 MTP
+```
+
+这里最重要的是：
+
+**局部最大值与 token id 一起发布，不能先回读 index，再按 index 发第二次 logit 回读。**
+
+两级 GPU reduction 没问题；**两轮依赖 CPU 结果的设备回读才是应该消掉的结构。**
+
+首版完全可以复用现有 RELAY 线程：CPU 只合并五个小候选记录并发布 token，不再经过高层 sampler、全词表候选构造和逐 token decode 调度。这样仍然存在 CPU relay，但与现在的高层串行路径不是一个成本结构。
+
+必须对拍不等长词表分片、最小全局 id 平局规则、异常值处理和零行输出。之前两趟回读版比 CPU 慢，只说明那个实现没有优势，不说明设备端选择没有优势。
+
+### 第二项关键改造：共享执行资源，但不要偷偷共享模型状态
+
+**不要复制六套 graph scratch。** 六份命令或参数不等于六份大临时缓冲；token、hidden 可以用小环形缓冲，计算临时区按实际生存期复用。
+
+还有一个容易踩的具体坑：
+
+> **不要直接设置 `ctx_other=target` 来偷共享执行池。**
+
+当前 MTP 驱动会据此判断共享记忆模式，可能改变算法分支。应新增独立的执行资源共享契约，保留这个模型自身的 draft KV 所有权。
+
+同样，不能因两个张量都叫 `shared_head` 就共享 target/draft 权重。两个 GGUF 的量化类型、内容和布局必须先逐张量核对。
+
+### 第三项关键改造：有界设备控制，而不是危险的永久 kernel
+
+可以预录有限六步，使用设备端控制缓冲更新 token、位置和有效步数。Vulkan 的间接 dispatch 支持执行时从设备缓冲读取工作组数量，可作为实现手段之一；实际扩展和设备能力仍须在这台机器上确认。([Vulkan Documentation][2])
+
+EOG、取消和失效步骤必须同时约束状态写入与 collective 参与，不能某些 rank 退出、其他 rank 永久等 generation。
+
+**验收门：** 高层逐 token 往返消失，scratch 不按 horizon 倍增，取消可恢复，且整请求优于同版本单卡对照。只证明 hidden 在 GPU 上、只证明五卡能输出正确 token，都不算完成。
 
 ---
 
-## 下班交接｜2026-09-14（晚）
+## 路线 1 的重要子项：catch-up 做成 K/V-only，并接到 target 尾部
 
-**分支：** `master` @ `0bd9cd922`（已推送 `origin/master`）  
-**目标：** 5× AMD RX 6800 上 Qwen3.8-Flash TP5；生产快路径仍是 **timeline**，不是 gpuflag。
+这是本次源码审计中值得单独强调的机会。
 
-### 一、本轮已合入（按 commit）
+`common_speculative_impl_draft_mtp::commit()` 确实又执行一次 draft decode。它不是纯复制。原因是：
 
-| Commit | 内容 |
-|--------|------|
-| `c07616c28` | `llama_tp5_plan` 与 model split 统一；GDN §8.2 Q/K 预排列；`GGML_TP5_PROFILE`；`--tp5*` CLI；MoE/meta 回归；HC F3 shader 脚手架 |
-| `0bd9cd922` | **实验性** `GGML_TP5_SYNC=gpuflag` 全流程：ready/consumed 标志、shader 有界自旋、失败写 NaN、`epoch_buf` 动态 seq（可重放 plan） |
+**候选 token 全部被接受，不代表用“草稿预测 hidden”构建的 draft K/V，等于用“target 真实 hidden”构建的 K/V。**
 
-**本地已编译通过：** `test-tp5-plan`、`ggml-vulkan`。  
-**未在开发机跑：** 五卡 mesh / 端到端 tok/s（开发机不是测试机）。
+所以不能直接删除 catch-up。
 
-### 二、TP5 同步模式现状（代码事实）
+但对这里的普通注意力 MTP 块，验收补齐需要的是正确 draft K/V。建议新增明确的 **CATCHUP_KV phase**，只完成必要的：
 
-| 模式 | 环境变量 / CLI | 用途 |
-|------|----------------|------|
-| **timeline** | `GGML_TP5_SYNC=timeline` / `--tp5-sync timeline` | **生产默认快路径**；队列 timeline 等待，已验五卡 F16 |
-| host | `host` | 调试/参考；大量 fence + `vkDeviceWaitIdle` |
-| syncfd | `syncfd` | 对照；高主机 SYNC_FD 账 |
-| **gpuflag** | `gpuflag` 或 `gpu` | **实验开关**；GPU 读 mailbox 标志自旋，**未在目标机验收** |
-
-gpuflag 实现要点（`ggml-vulkan-collective.cpp` + `tp5_gpuflag.comp` + `tp5_sum_*.comp`）：
-
-1. **P1 前**：等所有 mailbox 上 `consumed[my_rank] >= seq-1`（槽位复用）
-2. **P1 后**：向本卡及 peer mailbox 写 `ready[my_rank] = seq`
-3. **P2 求和**：对每个 slot 自旋 `ready[r] >= seq`；超时 → NaN + error flag
-4. **P2 后**：写 `consumed[r] = seq`
-5. **seq** 在 host-coherent `epoch_buf` 每轮更新，**不**烘焙进可重放 CB
-
-可选：`GGML_TP5_SPIN_MAX`（默认 `100000000`）。
-
-**重要纠正（相对旧版《下班交接》第五节）：**
-
-- 不能把 strace 窗口里 ~721 ms `TIMELINE_WAIT` 直接当成「换自旋就能省掉的纯同步开销」；其中含设备未完成工作，且受 strace 扰动（见 `TP5.md`）。
-- gpuflag **不是**「打开就提速」；Vulkan Device scope **不保证**跨卡可见性，须在 **RADV/五卡** 上单独做正确性/性能证明后才能谈替换 timeline。
-- timeline 主线不变；gpuflag 仅用于对照实验。
-
-### 三、性能基线（目标机 09-14，未因本轮 commit 重测）
-
-| 指标 | 状态 |
-|------|------|
-| 端到端 decode | ~1.9–2.4 tok/s（目标 60 tok/s） |
-| 子图 | 96 归约 + 1 尾部 ≈ 97 阶段/ token |
-| 命令重放 | MoE decode 轴修复后 9/9 单元测试通过 |
-| MTP | 可加载；KV 复制序列化已修；曾测 draft 接受率 ~47% |
-| 正确性 | 计数 `1..12`、比较题与 CPU 参考对齐 |
-
-ioctl 剖析（4.64 s decode 窗口，见 `/tmp/tp5-reseat-connectivity/driver-ioctl-summary.json`）：`AMDGPU_CS` ~2.4 万次；`SYNCOBJ_TIMELINE_WAIT` ~9k 次。优化方向仍是 **批量提交减 ioctl** + **timeline 收敛**，不是先押 gpuflag。
-
-### 四、交付阶段验证证据（2026-09-14 交付收敛）
-
-1. **系统审计**：五卡（`card1..card5`）空闲显存 ~16.4 MB，`gpu_busy=0%`；系统调用无泄漏，进程生命周期退出干净。
-2. **Fence 环形缓冲落地**：在 `ggml-vulkan-collective.cpp` 中引入 `fence_ring[4]`，解耦多 epoch 槽位复用，消除多轮并发提交下的 `vkResetFences` 悬挂冲突。
-3. **Shader 屏障与刷新优化**：精确收窄阶段与内存访问掩码（`COMPUTE_SHADER | TRANSFER`）；`ggml-backend-meta.cpp` 优化条件 flush 减少空提交。
-4. **GPUFLAG 安全隔离闭环**：驱动层显式告警并优雅回退至已被五卡真实硬件完整证明的生产快路径 `timeline`，防止未定义自旋导致设备死锁。
-5. **五卡 Mesh 全测试全绿**：`test-vulkan-tp5-mesh` 在 F16/F32 wire 模式下 96 轮基准、变异输入、延迟生产者、真实 GPU graph-producer 及 8 步异步依赖重叠测试 100% 通过（FD 增量 0）。
-6. **CPU 回归全通**：`test-tp5-plan`、`test-meta-reduce-boundary`、`test-qsa-pooled-cache`、`test-alloc` 全部 PASS。
-7. **一键 GPU 复位与死锁自愈工具**：
-   - **当前只读审计默认入口**：`./scripts/reset-gpu.sh`；旧 `reset-gpu-user.sh`／`reset-gpu-hard.sh` 已删除。
-   - **明确选择单卡后才手动恢复**：`sudo ./scripts/reset-gpu-pci.sh card1`（替换为目标卡）；入口核对 root-owned 助手源码，自动恢复由运行中的 watchdog 管理。
-8. **P0 可信时间账全链路埋点完成**：`ggml_tp5_profile` 在 `ggml-vulkan.cpp`、`ggml-vulkan-collective.cpp` 与 `ggml-backend-meta.cpp` 完整挂载，全面捕获 queue submits、submit batches、host waits（次数与微秒）及 FD export/import。
-9. **端到端 5-GPU 推理与投机投送性能收敛**：`src/llama.cpp` 修正设备与超参数加载时序；`ggml-backend-meta.cpp` 闭环非均匀切分张量比率校验；`ggml-vulkan-collective.cpp` 扩展 16-epoch in-flight 环与 256 项计划缓存；`ggml-vulkan.cpp` 实现命令重放批量一次提交。实测 96 次 AllReduce 通信耗时压缩至 **25.1 ms**。结合 MTP 原生投机解码，在 5 卡纯直连下解码吞吐跨越至 **35.3 tok/s**（草稿接受率 91.3%）。
-10. **硬件状态彻底稳定**：已按用户指令清理全部陈旧硬件安全门与不稳定话术，5 张 RX 6800（`card1..card5`）PCIe 3.0 x16 运行稳健，显存空闲基线 16.41 MB，dmesg 保持零新增错误。
-
-### 五、下一班建议顺序
-
-1. **硬件状态与基线确认**：五卡 P2P 直连基线、驱动日志与显存空闲状态。
-2. **P0 可信时间账**：`GGML_TP5_PROFILE=1`，对照 timeline 下 submit/wait/FD 与墙钟（`TP5.md` §5.3）。
-3. **P2 批量提交**：先试 2-stage 合并 `vkQueueSubmit`，用 ioctl/墙钟证明收益。
-4. **gpuflag 实验**（仅开关开启后）：
-   ```bash
-   ./build/bin/test-vulkan-tp5-mesh --sync gpuflag --rounds 96 --check-all
-   ./build/bin/test-vulkan-tp5-mesh --sync gpuflag --delay-producer --vary-input
-   ./build/bin/test-vulkan-tp5-mesh --sync timeline --rounds 96   # 对照
-   ```
-   通过标准：延迟生产者、多轮槽复用、重放、非零 view offset；失败须 NaN/失败态，不能静默错和。
-5. **端到端**：`scripts/run-qwen38-flash-tp5-server.sh` + manifest；配对 timeline vs 优化后吞吐。
-
-### 六、常用命令
-
-```bash
-# 构建（Vulkan TP5）
-cmake --build build -j$(nproc)
-
-# CPU 回归（开发机可跑）
-build/bin/test-tp5-plan
-build/bin/test-meta-reduce-boundary
-
-# 生产倾向配置
-export GGML_TP5_SYNC=timeline
-export GGML_TP5_WIRE=f16
-# 实验 gpuflag（目标机）
-export GGML_TP5_SYNC=gpuflag
+```text
+正确 token + 对齐的 target hidden
+    → EH / HC 前缀
+    → K/V 投影、norm、RoPE
+    → draft KV 写入
 ```
 
-生产 server 常用启动参数模板（保持 timeline 生产快路径与 f16 wire）：
+不应为了“沿用完整 decode 接口”，继续执行没有消费者的输出头和其他计算。
 
-```bash
-./build-tp5/bin/llama-server \
-  -m /home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf \
-  -dev Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4 \
-  --tp5 qwen4exp-af \
-  --tp5-sync timeline \
-  --tp5-wire f16 \
-  -c 512 -b 32 -ub 32 -ngl 999
-```
+这里还需要一次验证：**列出当前零输出图实际执行的 dispatch。** 图构造源码看起来完整，不代表所有节点都会运行；不能在未看实际图前宣布已经找到了多少毫秒。
 
-### 七、关键源码索引
+进一步，在 target 宽 hidden 产生后，K/V 补齐可以进入同一执行计划，与 target 词表头中相互独立的工作安排重叠。重叠收益与新增显存必须一起算。
 
-| 主题 | 路径 |
-|------|------|
-| 集体通信 / 同步 | `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp` |
-| gpuflag shader | `ggml/src/ggml-vulkan/vulkan-shaders/tp5_gpuflag.comp` |
-| 求和 + 自旋 | `ggml/src/ggml-vulkan/vulkan-shaders/tp5_sum_f32.comp`, `tp5_sum_f16.comp` |
-| Plan / GDN 头映射 | `src/llama-tp5-plan.cpp`, `src/llama-model.cpp` |
-| CLI | `common/arg.cpp`, `common/common.cpp` |
-| 五卡 mesh 测试 | `tests/test-vulkan-tp5-mesh.cpp` |
-| 设计主文档 | `TP5.md` |
-
-### 八、工作树状态
-
-- 当前分支：`master`，包含 TP5 交付收敛与生产实现。
-- 全量测试（CPU plan/alloc/qsa 及 5-GPU direct mesh、command replay）100% 验证通过。
+对齐规则直接以当前 `workspace::commit_row` 为 oracle，逐个验 accepted=0…6；不要凭直觉手写“取第 a 行还是 a+1 行”。
 
 ---
 
-*接班工程师：先读本节与 `TP5.md` 文末收敛章节，再在目标机按第四节顺序验证；勿在开发机假设五卡结果。*
+## 路线 2：激进——GDN 改为 checkpoint＋精确重算，而不是每个前缀完整 snapshot
+
+**这一项应该比继续尝试 n=10、Q3、挪草稿卡更早。**
+
+`src/models/delta-net-base.cpp::build_recurrent_attn` 明确先让 `gdn_out` 包含多个完整状态，再把它们复制进 recurrent rollback bank。
+
+现有 n10 相比 n6，每卡 target scratch 增加约 **416 MiB**；加载后草稿卡 GTT 也出现约 **19 MB → 978 MB** 的差异。不能把这些直接命名为某块权重迁移，但足以说明**状态保存策略和驻留预算必须一起重做**。依据：`TP5.md` 的 n10 scratch、allocator 与 GTT 记录。
+
+### 推荐的正常路径
+
+```text
+保留起点 checkpoint
+    → 正常完成候选块验证
+    → 保留终点状态与少量恢复日志
+
+全接受：提交终点
+中途拒绝：从起点恢复到接受前缀
+```
+
+关键是：**拒绝时不一定要重跑整个 target。**
+
+第一版可以保存 GDN 每步使用的必要输入，例如 k、v、g、β 等，用相同 F32 运算序列重新执行状态转移：
+
+$$
+S_t = F_{\mathrm{F32}}(S_{t-1};k_t,v_t,g_t,\beta_t)
+$$
+
+这样恢复的是 recurrent transition，而不是所有投影、MoE 和输出头。卷积历史另保留较小的前缀记录；普通注意力 KV 按有效前缀提交。
+
+### 不要用平均接受率代替恢复概率
+
+必须分别统计：
+
+**真实模型拒绝、EOG、长度截断、取消。**
+
+最后一轮因为结束而少接受一个候选，不等于发生了需要继续生成的昂贵回滚。若请求结束且状态不再复用，可以让槽位失效；若要复用 prompt/KV，就必须恢复或明确标记失效。
+
+经济账应写成：
+
+$$
+\text{收益}
+=
+\text{少写完整快照及改善驻留的收益}
+-
+\text{恢复日志成本}
+-
+\sum_j P(\text{在位置 }j\text{拒绝})\,T_{\text{恢复},j}
+$$
+
+### 给工程师的实现阶梯
+
+先做**直接写持久 snapshot bank，去掉重复大临时物化**；再做稀疏 checkpoint；最后做起点/终点＋日志。每一步都能独立验收，不需要一口气重写所有状态管理。
+
+**验收门：** 每个拒绝位置、每层 GDN 状态、卷积历史、KV 有效范围、target hidden 选择、取消后的下一请求都要对拍。不能只看最终计数题正确。
+
+---
+
+## 路线 3：较激进——专门优化七行验证，不重新折腾成熟的单行 target
+
+我同意不另开一条“纯 target 50 tok/s 再挤一点”的主线。但：
+
+> **单行 target 已优化，不意味着七行 MTP 验证程序也已优化。**
+
+当前 n=7 仍落在 `mul_mat_vec_max_cols=18` 的 direct-quant 路径。这里应该研究的是**实际七行形状下的权重复用、量化解码、寄存器压力、状态写入和通信边界**，不是简单把阈值改成 GEMM。
+
+具体要求：
+
+**普通投影**看同一量化权重是否真被多行复用，是否为七行重复解码；**MoE**先统计这七行到底共享哪些专家，不能假设所有 token 都复用同一专家；**HC/GDN**看能否减少中间物化和重复状态读写，而不只是减少 dispatch 数。
+
+已有“dispatch 更少但整请求没更快”的融合试验不原样重做。每个候选必须先写出：它减少了多少真实字节、多少计算或多少关键路径依赖。
+
+前三个 stage 偏慢也值得查，但要在相同算子组合、同 rank、同驻留下比较。不同 stage 的算子不同，不能把 4–5 倍时间差直接命名为 DPM 或迁移。
+
+**验收门：** MTP 七行整周期变快，MTP-off 单行路径不回退；改变浮点归约顺序的核单列数值验证，不能把“输出 1..60 正确”当作位级等价。
+
+---
+
+## 路线 4：中等——首图可以研究 direct/recompute，但必须明确重算哪一层
+
+你提出“不必执着 cache”是有价值的，尤其在**状态恢复层**，我明确支持先做 checkpoint＋recompute。
+
+但首图这里要区分：
+
+| 操作                                   | 判断          |
+| ------------------------------------ | ----------- |
+| 不保存所有候选状态，拒绝时重算                      | **优先路线**    |
+| 首次图直接执行，不为一次性使用付完整 replay-cache 维护成本 | **值得做同构对照** |
+| 全局关闭 graph reuse，每轮重新建图和绑定           | **不是建议方向**  |
+
+现有首图约 100 ms 的主因是 **Meta tensor binding**，不是 backend fence。`TP5.md` 的分相记录中，binding 约 99–110 ms，backend sync 只有微秒级。
+
+因此：
+
+**只跳过 Vulkan CB cache，却仍然走原来的 Meta 张量展开和绑定，未必省掉这 100 ms。**
+
+真正该改的是固定执行定义与运行输入的分离：
+
+```text
+固定：拓扑、rank-local 布局、绑定计划、合法缓冲范围
+变化：token、KV 位置、active rows、scratch 起址、generation
+```
+
+首轮 one-shot、稳态 replay 都可以建立在这个契约上；不是缓存旧请求的状态，也不是拿旧 tensor 指针强行复用。
+
+现有 phase 切换还会释放计算缓冲，导致下一阶段重新建立资源。应该给 draft 单步、target 七行、K/V-only catch-up 明确程序身份，而不是只按 token 数猜 phase。
+
+**已有容量模式的 46 个未覆盖 dispatch 不能放宽守卫硬跑。** 要逐类证明 inactive rows 不读取非法输入、不写状态、不破坏通信参与者。
+
+---
+
+## 路线 5：普通，但已经有明确源码靶点——修 90 ms 图外回读
+
+这是本次最具体的一个定位。
+
+我追到了下面这条源码链：
+
+```text
+llama_context::output_reserve
+    尝试 output device 的 host buffer，否则普通 CPU buffer
+
+Meta::get_host_buffer_type
+    各 rank host buffer 类型不同 → 返回 nullptr
+
+Vulkan::get_host_buffer_type
+    按 device 分别创建类型
+
+Meta::get_tensor_async
+    按 rank 依次调用 get_tensor_2d_async
+
+Vulkan::get_tensor_2d_async
+    目标地址不是本 device 的 pinned buffer
+    → staging fallback
+    → 函数内部立即 synchronize
+```
+
+对应文件是 `src/llama-context.cpp`、`ggml-backend-meta.cpp` 和 `ggml-vulkan.cpp` 的上述函数。
+
+**所以，“async”这个名字并不保证五卡回读已经并行排队。** 这是非常具体的退化条件，比“在外层少调用一次 synchronize”更值得优先处理。
+
+但仍须测它的动态命中次数，不能把全部 90.072 ms 都扣在这里。`mctx::apply`、状态提交、输出缓冲处理等也位于相关图外边界。
+
+### 建议的修法
+
+每个 rank 使用自己可识别的、持久的 pinned 输出 slot。先让全部 rank 的 copy 入队，再在真正消费结果的边界等待；之后拼接，或者直接按分片采样。
+
+不要把不同设备的 host buffer type 强行返回同一个指针来蒙混过关；也不要只删除 staging 分支里的同步。那个同步目前保护了 deferred memcpy 和临时缓冲的生存期。
+
+slot 必须有 owner、generation、未完成状态与退休规则。Vulkan 对执行顺序和内存可见性要求显式同步，不能把“地址可映射”当作“CPU 已经可以安全读”。([Vulkan Documentation][3])
+
+**验收门：** 打印每 rank 的 pinned 命中、fallback、字节数、提交和等待次数，证明从逐 rank 阻塞变成全部入队后消费；随后确认时间没有只是从 decode 挪到 sampler。
+
+---
+
+## 路线 6：普通到中等——95 ms 后处理，重点改全词表物化和采样状态复制
+
+这 95.056 ms 已经有足够明确的方向：
+
+| 子项            |            耗时 |
+| ------------- | ------------: |
+| 验收采样          | **87.058 ms** |
+| sampler clone |  **6.363 ms** |
+| seq_rm        |      0.099 ms |
+| 已计输出循环        |      0.121 ms |
+| 其余            |      1.415 ms |
+
+源码 `common/sampling.cpp::set_logits` 会在 CPU 上逐词表构造 `llama_token_data`；`common_sampler_clone` 还会复制整个 `cur` 候选数组。优化重点应该落在这里，而不是 seq_rm。
+
+### 最强方案：七行只回小候选，不回完整 logits
+
+以仓库记录的 248320 词表计算，七行 F32 logits 是 **6,952,960 字节**。
+
+五 rank、七行、每行一对 F32 最大值和 32 位 token id，原始候选载荷只有 **280 字节**，另加对齐、header 和 generation。
+
+注意：**这减少回读和候选物化，不等于不再计算整个 LM head。**
+
+对语义允许的纯 greedy，先得到七行的全局最大 id，再一次确定接受前缀。第一版甚至可以只回读这几个 id，在 CPU 比较前缀；不必为了追求“全部在 GPU”而增加复杂性。
+
+有 grammar、有效 penalty、logit bias、reasoning budget 或其他状态性采样依赖时，不能擅自改成七行独立 argmax，必须保留顺序状态语义或回退。
+
+### 较小方案：CPU 也可以不构造整张候选表
+
+严格纯 greedy 的路径直接扫描 logits/词表分片，避免先构造全词表候选再 top-k/sort。草稿 `p_min<=0` 的情形，也应检查是否仍做了无用途的概率和候选物化。
+
+clone 则新增**验收专用的持久状态 checkpoint**：保存 RNG、grammar、history 等，临时候选 scratch 不复制。不要直接改变通用 clone 的可观察语义；`cur_p` 等指针也必须正确重绑。
+
+**验收门：** 拆出真正 CPU 独占采样时间，确认候选构造、排序和 scratch 复制减少，而不是只把等待藏到别处。
+
+---
+
+## 路线 7：最后才是普通策略优化——自适应 horizon，而不是继续扫 n
+
+在执行和驻留修好之前，我不会继续让工程师依次尝试 n7、n8、n10、n12、挪卡、Q3、Q2。
+
+horizon 应依据**前缀存活分布和边际成本**选择：
+
+> 再多猜一步带来的预计新增公开 token，必须值回新增 draft、target、恢复与内存压力成本。
+
+高接受率不授权无限增加 horizon。n10 已出现显著驻留风险与同形核退速，先解决状态和执行布局，再决定是否加长。
+
+此外，诊断中某个 MoE 算子的 `n=10` 是专家维度，不是 MTP horizon。所有性能表都应标明轴的含义，防止改错门限。依据：`TP5.md` 对 n6/n10 同形量化 GEMV 的记录。
+
+---
+
+## 四、不要再无目标试验：给整条路径一个可检验预算
+
+下面是我建议采用的**工程目标，不是已实现成绩，也不是收益保证**：
+
+| 项目                    |     目标预算 |
+| --------------------- | -------: |
+| 六步草稿闭环                | ≤10 ms/轮 |
+| 七行 target 设备链，含链内通信同步 | ≤48 ms/轮 |
+| 链外验证接口、验收和提交          |  ≤3 ms/轮 |
+| catch-up 新增的非重叠关键路径   |  ≤1 ms/轮 |
+| 整请求额外冷税               |  ≤100 ms |
+
+若仍是 25 轮：
+
+$$
+25\times(10+48+3+1)+100=1650\text{ ms}
+$$
+
+对应约 **103.6 tok/s**。
+
+这个预算的意义是：**每个工程任务必须说明自己在缩短哪一项，其他项是否恶化。** 不是声称这些数字一定能全部实现，更不是把几次不同进程的最好值拼成最终成绩。
+
+实际实现应继续留裕量；周期数、拒绝分布变化时重新算账。
+
+---
+
+## 五、实施管理：先交证据，再交补丁
+
+展示顺序按激进程度；实际落地可以拆成可独立验收的工单，不需要等一个巨型重写全部完成。
+
+我会要求首先交付三份材料：
+
+1. **514 ms 的同请求关键路径图。** 分清 GPU 运行、主机等待、真实 CPU 采样、传输与逐步控制开销。
+2. **90 ms 的回读分支命中账。** 每 rank 的 host buffer、pinned 命中、staging fallback、字节数和等待次数。
+3. **GDN 重算的状态与内存账。** 每个拒绝位置的恢复正确性、恢复成本、live allocation 和峰值驻留。
+
+CPU/GPU 时间线需要校准后关联；不同设备原始 timestamp 不能直接拿来对齐。Vulkan 提供 calibrated timestamps 契约，但要检查机器支持并记录偏差。([Vulkan Documentation][4])
+
+之后所有候选都必须经过：完整接受、各位置拒绝、EOG、取消后下一请求、零输出 catch-up、1→7→1 形状切换和非支持采样器回退。状态改动要对拍状态，不能只看最终文本。
+
+正式性能仍坚持：**独占五卡、watchdog active、参考 F32/RELAY、未开 profiler、逐字正确、自然停止、171/171、server `predicted_ms<1710`。** 保留所有预先安排的 A/B 样本，不挑最快一条。
+
+**最终建议很明确：保留成熟的单行 target，停止继续扫草稿参数；以“统一 TP5 多步执行＋精确状态重算”为主线，以“rank-local 回读＋批量验收”为可独立兑现的改进。现有五卡草稿的负结果应成为重做执行结构的证据，而不是给 MTP 潜力封顶的理由。**
+
+[1]: https://proceedings.mlr.press/v202/leviathan23a "https://proceedings.mlr.press/v202/leviathan23a"
+[2]: https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdDispatchIndirect.html "https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdDispatchIndirect.html"
+[3]: https://docs.vulkan.org/spec/latest/chapters/synchronization.html "Synchronization and Cache Control :: Vulkan Documentation Project"
+[4]: https://docs.vulkan.org/refpages/latest/refpages/source/vkGetCalibratedTimestampsKHR.html "https://docs.vulkan.org/refpages/latest/refpages/source/vkGetCalibratedTimestampsKHR.html"
+# TP5 + MTP 现场审计与工程路线图
+
+日期：2026-09-24  
+工程：E5-2699A，`/home/kunweiz/atomic-llama-cpp-turboquant`  
+审计对象：当前未提交工作树、`困惑.md`、`TP5.md`、关键执行源码、现有分相日志片段。
+
+## 0. 结论与证据边界
+
+主方向应从“给独立草稿模型调参数”转为“把 MTP 做成 TP5 执行程序的组成部分”。保留单卡草稿作为性能对照，不把它当最终架构；也不能把已经存在、但有逐步主机往返的五卡草稿当作融合版的性能上限。
+
+本次没有修改仓库、没有启动新一轮模型性能测试、没有把历史数据说成此次复跑。已检查机器现场：检查时没有 llama-server，五卡 GPU busy 均为 0，eagle-gpu-watchdog 为 active。仓库 master 的 HEAD 为 `4e17c2faf`，但存在大量未提交改动，不能只用 HEAD 标识被审计源码或历史测试二进制。源码定位以下以函数名为准；历史临时计时器已有撤回，不能假定当前二进制能原样输出每个字段。
+
+本报告最重要的新定位，是图外回读的完整源码条件链、MTP catch-up 的 K/V 专用化机会，以及将设备端多步草稿、精确状态重算、批量验证组成同一个路线，而不是重复已有负收益试验。
+
+没有现成的可靠数字可以把 514 ms 精确拆成“纯 GPU 计算多少、传输多少、信令多少”。给出三个百分比会是编造。以下区分已测值、源码确定行为、待验证归因与工程预算。
+
+## 1. 已有实测账：一个请求只能算一次
+
+`TP5.md` 的“不以‘额外开销’掩盖草稿与 target 账”记录了一次开启分相诊断、内容正确、自然停止、171 个输出 token 的请求：`predicted_ms=2437.917`，25 个 MTP cycle。
+
+| 互不重叠的项目 | 整请求 ms | 解释 |
+|---|---:|---|
+| 草稿 | 514.051 | 150 次串行单步，含等待与采样 |
+| target 图区间 | 1700.078 | 含建图、绑定、输入设置、提交与等待 |
+| target llama_decode 图外 | 90.072 | 尚未逐项测清，不可全算 CPU 计算 |
+| target decode 后处理 | 95.056 | 大头是逐行验收采样 |
+| draft catch-up | 35.891 | 对草稿上下文执行真实补齐计算 |
+| 计时边界残差 | 2.769 | 不是固定系统开销 |
+| 合计 | 2437.917 | 与该请求 server 计时一致 |
+
+嵌套关系为：target 总时间 1885.206 = llama_decode 1790.150 + 后处理 95.056；llama_decode 1790.150 = 图区间 1700.078 + 图外 90.072。禁止把父项与子项重复相加。
+
+草稿内部：enqueue 67.454 ms，`common_sampler_sample` 外围计时 445.386 ms，hidden getter 0.099 ms，其余 1.112 ms。每步平均 3.427 ms，其中 enqueue 0.450 ms、等待加采样 2.969 ms。`common_sampler_sample` 内部先同步，再开始自身的 CPU sampler 计时；外部包围计时和内部 sampler 计时口径不同。
+
+后处理内部：clone 6.363 ms，sample-and-accept 87.058 ms，seq_rm 0.099 ms，已计 token 输出循环 0.121 ms，其余 1.415 ms。每轮后处理约 3.802 ms。不要去优化占不到一毫秒的 seq_rm/输出循环以解释这 95 ms。
+
+图内部：build 2.238 ms，alloc 121.978 ms，submit+wait 1574.206 ms，set_inputs 1.357 ms，剩余约 0.299 ms 为边界。首次图 287.519 ms，后续同形图约 58–59 ms。
+
+已有未开 profiler 的参考结果约 72 tok/s，例如 2370.901/2376.041 ms，见 `/var/tmp/tp5-restored-after-greedy-rejection-unprofiled.json`。上述 2437.917 ms 是归因样本，不能冒充未开 profiler 基准。
+
+### 吞吐预算
+
+该请求平均每 cycle 97.517 ms，公开输出平均 171/25 = 6.84 token/cycle。若周期数仍为 25，100 tok/s 要求含冷启动在内平均小于 68.4 ms/cycle。不能按每轮必出 7 个公开 token 计算，也不能把 accepted+bonus 的内部计数直接等同公开 completion_tokens。
+
+仅把图外 90.072 ms 和后处理 95.056 ms 假设全部删掉，此诊断样本也只有约 75.91 tok/s。另一方面，target 的 1885.206 ms 含冷启动和接口开销，不是不可改变的 GPU 计算下限。两句话都成立。
+
+以下是工程目标，不是预测或新实测：
+
+| 目标项 | 建议预算 |
+|---|---:|
+| 六步草稿闭环 | ≤10 ms/cycle |
+| target 七行设备链，包含该链通信与同步 | ≤48 ms/cycle |
+| 设备链之外的验证接口、验收、提交 | ≤3 ms/cycle |
+| catch-up 的新增非重叠关键路径 | ≤1 ms/cycle |
+| 整请求额外冷税 | ≤100 ms |
+
+若这些互斥口径均实现且仍为 25 轮，总时间为 25×(10+48+3+1)+100=1650 ms，约 103.64 tok/s。实际研发应继续留出裕量；若真实周期数、拒绝分布或边界改变，必须重算预算。
+
+## 2. 正确拆分计算、通信、信令
+
+### 草稿 514 ms
+
+当前单卡草稿没有五卡草稿内部的张量归约；它仍有 GPU 计算、局部显存读写、logits/token/hidden 的主机与设备搬运、命令提交及完成等待。这个 MTP 不是单个微小矩阵：源码包含 token embedding、EH 投影、HC 混合、完整注意力块、MoE 和 LM head。
+
+445 ms 的 sample 外围时间混合了“上一段 GPU 尚未完成”和“CPU 真正在处理候选”。GPU 运行的时间不会因为删掉等待函数而消失。应消除的是每个 token 都回到 CPU 决定下一次 decode 的控制依赖。
+
+### TP5 的通信不等于 P2
+
+源码 `tp5_star_handoff` 会轮询五个 producer ready，记录 rank-ready 时间，执行 CPU F32 归约，写五张 BAR，再发布 generation。P2 区间可能包括等待慢 rank、等待 CPU、传输和消费者恢复；它不是独立纯 PCIe 带宽账。计算命令段本身也包含 dispatch、屏障、访存和调度，不是纯 ALU 时间。
+
+已有独立进程 GPU 诊断中，七行 rank0 compute/P2/total 为 46.257/8.256/54.523 ms；单行为 20.422/5.129/25.564 ms。七行链相对七次单行有摊销，但这些数不能与另一次请求的主机账逐项相减，也不能相加五个 rank 的 compute 当作请求延迟。
+
+### 必须交付的观测格式
+
+所有记录带 request_id、cycle_id、phase、step、rank、stage、rows、generation。CPU 使用互斥范围，GPU 用每 rank 的设备时间线；需要跨时钟关联时检查 calibrated timestamp 支持并记录最大偏差，不直接比较原始 tick。
+
+需要区分以下边界：CPU prepare/enqueue；GPU 首次开始、各计算段、copy、结束；producer ready；最后一个 rank ready；CPU reduce/broadcast；generation publish；消费者开始；主机等待结束；CPU sampler 独占时间；accepted prefix commit。将等待归因到依赖的生产者，不能把全部等待再算一遍信令浪费。
+
+记录 H2D/D2H 字节、每 rank staging fallback 次数、queue submit 次数、fence/timeline 等待次数、scratch 峰值、buffer 身份及显存/GTT。优先复用现有 `tp5_star_times` 的 ready skew、arm、publish 等字段。
+
+记录放预分配内存，请求结束统一输出。先用阶段级采样保留 replay，不给每个 op 强插屏障。已有逐 op logger 会禁用 replay，并曾把整请求扰动到约 24 秒，不能拿它作为性能 A/B。
+
+## 3. 路线一：最激进——统一 TP5 MTP 执行程序
+
+### 3.1 结束两个独立主机驱动器逐 token 往返
+
+现有 `common_speculative_impl_draft_mtp::draft` 每一步都 llama_decode → common_sampler_sample → CPU 构造下个 batch。原生 hidden 交接只换了 hidden 的传输方式，没有去掉这条控制链。原五卡草稿更慢，因此不能简单将设备列表改为五卡就宣布完成 TP5 化。
+
+建议新增专用执行层（模块名为建议，不是已存在 API），形成 Program 与 RunInputs：
+
+- Program：固定算子/通信拓扑、rank 布局、描述符计划、合法 scratch 区间、phase 定义。
+- RunInputs：token、position、KV 位置、active rows、accept 长度、取消标志、generation。
+- RequestState：target 与 draft 各自的有效状态和提交边界。
+
+先覆盖单序列、当前 Qwen MTP、参考 RELAY/F32、n=6、语义允许的 greedy。其他组合走原路径。不要一开始把所有模型、采样器和并发情况卷入首版。
+
+重要：共享执行池不等于共享 KV。不要直接把 `ctx_other` 指向 target 来偷共享资源；当前 MTP 驱动用它判断共享记忆分支，可能改变模型语义。应给执行 arena/命令资源独立的共享契约，保留本模型独立 draft KV。
+
+### 3.2 TP5 是放置和执行策略，不要求每个微小算子切五份
+
+大权重与 LM head 采用与模型分片契约一致的 TP5；小的归一化、门控和必要镜像可在 rank 内完成，避免为省极少 FLOPs 引入额外 collective。先用实际张量形状与字节数确定切法。
+
+target/draft 量化权重不一定相同。只有逐张量证明类型、内容、布局和所有权一致时才共享权重；不能因名称含 shared_head 就直接 alias 两个 GGUF 的输出矩阵。
+
+### 3.3 六步仍自回归，但不需要六次 CPU 决策
+
+预录有限步程序：LM head → 本地候选归约 → 全局候选发布 → embedding lookup → 下一步 MTP。token id、hidden、positions 和 active 状态留在设备控制缓冲。
+
+局部 argmax 一次产生 `(max_logit, global_token_id)`，不再先读 index、再为该 index 发第二次 logit 回读。五 rank 候选可由现有 RELAY 线程合并并写回各 rank；这仍有 CPU relay，但没有高层 sampler/fence/llama_decode 的逐 token往返。直接跨 GPU 方案必须先证明实际互操作路径，不假设有现成高速 P2P。
+
+最小全局 id 的 tie-break、不等长词表切片、NaN/Inf 策略必须与参考一致。词表归约不是浮点求和归约，要有独立 payload ABI 和有效位。
+
+不能把六个有依赖的草稿 token 改成六个并行 token；改变的是控制位置，不是模型因果关系。
+
+### 3.4 不复制六份大 scratch
+
+只保留必要的 token/hidden 环形缓冲和 per-step 参数，复用峰值 scratch。每步的命令/参数不等于每步一套模型 scratch。资源复用须建立真正的 live range 和退休条件；未完成提交引用的 descriptor、地址与参数不得重写。
+
+GPU 侧可通过间接 dispatch 参数控制后续工作；feature 支持时也可评估 conditional rendering。无论采用哪种方案，EOG、取消和 active=0 都要阻止无效 KV/状态写入，而且 collective 的参与者必须一致，不能让部分 rank 退出而其他 rank 永久等 generation。不要用占满 GPU 工作组的无限自旋充当跨步同步。
+
+### 3.5 catch-up 先做 K/V-only，再谈重叠
+
+`commit()` 确实对 draft 再做 decode。即使候选 token 全接受，draft 中由预测 hidden 构建的 K/V 也不等于由 target 真实 hidden 构建的 K/V，因此不能直接删 catch-up。
+
+本模型 MTP 块是完整注意力，不是 target 的 GDN。验收补齐的目标是正确 draft K/V；应新增明确的 CATCHUP_KV phase，计算必要的 EH/HC 前缀、K/V 投影、norm/RoPE 和缓存写入。先列出当前零输出图实际 dispatch，确认已有图裁剪到了哪里，不能仅看源码有完整 attention 就断言所有算子都执行。
+
+以现有 workspace::commit_row 的 token/position/hidden 对齐为唯一 oracle，检查是否能消除无消费者的 Q/attention/output/MoE/LM-head 工作。不要凭 accepted 数手写 off-by-one 规则。
+
+进一步可以在 target 宽 hidden 产生后，把候选前缀的 draft K/V 补齐挂到同一执行计划，和 target 词表头的独立工作安排重叠；只有经过验收的前缀可发布为有效。重叠会增加同时存活的缓冲需求，不能同时宣称所有 target/draft scratch 都可无条件 alias。
+
+### 3.6 验收
+
+主机逐步高层采样往返从每轮六次变为轮级交互；记录 RELAY 控制仍有多少步。D+C 及总请求必须优于同版本单卡对照；观察 target 是否因资源竞争变慢。单独 hidden 复制正确或单独 argmax kernel 快不算成功。
+
+## 4. 路线二：激进——GDN checkpoint + 精确重算
+
+### 4.1 原问题
+
+`build_recurrent_attn` 让 GDN 产生多份完整 F32 状态，形成 gdn_out 中间张量，再拷贝进 recurrent rollback bank；卷积历史也按候选前缀保存。n10 的目标 scratch 比 n6 每卡约多 416 MiB，加载后草稿卡 GTT 从约 19 MB 增到约 978 MB，存在显著驻留风险。
+
+但 416 MiB 不等于已经证明全由 GDN 构成；GTT 也不等于已经证明迁移的是 Q4 draft 权重。应按 allocation/张量生命周期建立表，不给未知 BO 身份起名字。
+
+### 4.2 推荐策略
+
+正常路径保留起点 checkpoint、工作/终点状态，以及足够精确恢复的逐步输入日志；全接受直接提交终点，真正中途拒绝才从起点恢复到接受前缀。
+
+第一版最稳妥地保存每步 GDN 使用的 k、v、g、b 等必要输入，并按原算子相同 F32 运算序列执行仅更新状态的恢复核。也可研究保存更新向量，但不能未经证明用简化代数替换原舍入顺序。不要默认必须重跑整个 target；有必要中间输入时只重放 recurrent transition。卷积历史单独保留小前缀或恢复日志；普通注意力 KV 通过有效前缀/位置管理提交。
+
+有三种阶梯方案：直接写持久 snapshot bank，先去掉重复大临时物化；每隔几个候选留 checkpoint；起点/终点加日志。选择依据是实测恢复分布与内存峰值，不是穷举 horizon 与 flag。
+
+### 4.3 正确性与经济账
+
+必须分别统计真实 model mismatch、EOG、长度限制、取消。token 接受率不等于 block 完全接受率，也不等于恢复概率。请求已结束且状态不复用时，可让槽位失效而不为无后续消费者的尾块做恢复；若会复用 prompt/KV，则必须恢复或明确失效，不能保留错误 cache。
+
+期望收益 = 全前缀快照写入/物化与驻留代价的减少 − 日志开销 − 各拒绝位置概率×该位置恢复成本。
+
+测试每个拒绝位置、target hidden 选择、所有 GDN 层状态、卷积历史、普通 KV 有效区间、sampler 状态、取消及下一请求。重算路径优先保持原 F32 指令次序并逐位对拍。只验证最终计数题正确远远不够。
+
+### 4.4 验收
+
+给出修改前后的 live allocation 表、峰值 scratch、驻留/GTT、状态恢复分布和未插桩吞吐。若 n10 仍越过实际驻留预算，就不要升级 horizon。不要仅因释放了一块显存就宣布同形 kernel 变慢的根因已证明。
+
+## 5. 路线三：较激进——只优化 MTP 七行 target 执行路径
+
+无 MTP 的成熟单行路径作为保护线，不重开一轮泛化单 token 调优。但单行最优不等于七行验证最优，尤其多行状态快照与不同 MoE 路由均改变执行特征。
+
+针对实际七行形状设计量化小矩阵批处理，而不是只把 GEMV/GEMM 阈值改一下。现有 n=7 处在 `mul_mat_vec_max_cols=18` 的 direct-quant 路径。测量相同权重是否被七行复用、解量化次数、激活布局、寄存器压力与 spill；MoE 统计实际被多个 token 共用的专家，不默认七行都选同一专家。
+
+从投影组、HC、状态读写、通信边界之间减少真正的中间物化和生产者/消费者等待。已有减少 dispatch 却无净收益的融合试验不原样重做。减少 dispatch 数、提高单个核吞吐都不是最终证据。
+
+早期前三 stage 的慢点保留为定向问题：相同算子组合、同 rank、同驻留、同轮对比。不同 stage 有不同算子与输入，不能把 4–5 倍时间差直接归于 DPM；不需要写时钟或改 watchdog 来做路线图。
+
+验收使用完整周期和请求；MTP-off 单行路径不得回退。改变浮点归约次序的核要单列数值变更与对拍结果，不能冒称位级等价。
+
+## 6. 路线四：中等——首图 direct/recompute 与执行定义生命周期
+
+这里要分清三种“缓存”：执行程序/描述符、临时内存绑定、模型的 KV/GDN 状态。
+
+对模型状态，checkpoint + 拒绝时重算就是优先路线，不必执着保存每个前缀。
+
+对首图执行，建议做首轮一次性 direct execution 与构建 replay 缓存的同构对照。首轮没有复用收益，不能要求为了缓存而无条件付所有维护成本；但这不是一个现成 flag 一开就能省 100 ms 的结论。
+
+现有定位显示首图大头是 Meta tensor binding，约 99–110 ms；backend sync 只有微秒。跳过 Vulkan CB cache 而仍调用同一套 Meta 建图/绑定，不会自动消灭 binding。全局关闭 graph reuse 反而可能每轮重付它。建图、绑定、record、首次 GPU 执行必须分开记账。
+
+合理实现方向是将固定图拓扑和 rank-local 绑定计划编译成程序，将实际 KV 位置、active rows、scratch 起址和 generation 变成每次运行的参数。可在合法启动阶段构建执行定义，但要记录真实加载/首请求耗时，不用假 warmup 或把请求工作挪出计时窗口冒充收益。
+
+先维护有明确契约的 draft 单步、target 七行与 KV-only catch-up 程序，避免因 token 数猜 phase 再释放整个 arena。容量模式已有 46 个 dispatch 未证明 active<capacity 合法，必须逐类补齐输入读取、状态写入、依赖边界的覆盖；不放宽守卫硬跑。
+
+Program 复用也不等于复用旧 tensor 地址：取消、阶段转换、scratch 重分配与上下文销毁都要有 generation 和退休证明。
+
+## 7. 路线五：普通但具体——90 ms 图外回读
+
+### 7.1 源码链
+
+1. `llama_context::output_reserve` 尝试 output device 的 host buffer，否则普通 CPU buffer。
+2. `ggml_backend_meta_device_get_host_buffer_type` 只在所有 rank 返回同一个 host buffer type 时才提供统一类型；不同则 nullptr。
+3. Vulkan 的 host buffer type 按 device 分别创建。
+4. Meta 的 `get_tensor_async` 对词表分片按 rank 依次调用 `get_tensor_2d_async`。
+5. Vulkan 的 read helper 检查目标 host 地址是否属于该 device 的 pinned buffer；否则 async wrapper 走 staging，并在函数内部立即 `ggml_vk_synchronize(ctx)`。
+
+因此，“名字叫 async”不等于五卡回读被并行排队。对于 Meta 输出缓冲配置，这是一条非常具体的退化路径。它的动态命中次数和时间仍需测量；不把 90.072 ms 全归给它。
+
+图外还要单独记 memory batch prepare、mctx::apply、postcompute_success、compute guard 生命周期及输出提取。边界名称不能替代归因。
+
+### 7.2 修法
+
+为每 rank 建立自身可识别的持久 pinned output ring/slot；该 rank 的 logits 子片先写入自己的连续区域。先 enqueue 全 rank 的 copy，再在真正消费结果的边界统一退休，随后拼接或直接按分片采样。
+
+每个 slot 必须有归属、generation、未完成标志，不能让多个异步 copy 覆盖同一 sync_staging。不要只删除 synchronize；它目前保护 deferred memcpy 与 staging 生存期。映射内存可见性和 CPU 消费同样须满足 Vulkan 同步契约。
+
+测试从 buffer 构造、copy offset/stride、五 rank 不等长片段、部分输出行、并发提交和取消开始。新方案即使“更异步”也必须能证明输出字节正确。
+
+### 7.3 验收
+
+记录 rank、host buffer 类型、pinned 命中、fallback 次数、字节数、提交/等待次数；证明从逐 rank 阻塞变为全部提交后消费。随后测完整请求，检查 copy/排队是否仅把时间移到 sampler 而非真正减少关键路径。
+
+## 8. 路线六：普通到中等——95 ms 后处理
+
+最强方案与统一程序共用：给语义允许的 greedy target 验证做七行局部候选归约和全局前缀验收，而不是回读全量词表。
+
+以仓库记录的 248320 词表举例，七行 F32 logits 是 6,952,960 字节；五 rank×七行×一个 F32 值与一个 32 位 id，原始候选载荷是 280 字节，不含对齐、header、generation。它减少的是回读和候选物化，不能声称不再需要计算 LM head 的全部候选分数。
+
+对纯 greedy、无有效 grammar/penalty/logit bias/reasoning-budget 等依赖的路径，可独立生成每行 argmax，然后只提交首个 mismatch 之前的正确前缀以及参考语义要求的纠正/bonus token。一般状态性采样不得改为七行无条件并行 argmax；保留原 fallback 与 RNG/grammar/penalty 状态顺序。
+
+较小实现不必等待 GPU sampler：在严格等价的纯 greedy 路径上直接扫描 logits 或 rank 分片，不先构造全词表 `llama_token_data` 数组再 top-k/sort。草稿 p_min<=0 时也可研究删除无用途的概率/候选物化；p_min>0 必须保留置信度语义。
+
+`common_sampler_clone` 会复制整个 cur 候选数组。新增验收用 durable-state checkpoint，只保存 RNG、grammar、penalty/history 等必要状态，并在新采样时重建 scratch。不要盲改通用 clone 的可观察语义；也要正确重绑 cur_p，不能让临时 checkpoint 持有旧候选指针。
+
+已有“一批只调用一次 synchronize”的试验没有证明收益，原因不能简化成“同步不重要”：getter 仍有同步、全词表 materialization 仍存在，底层回读也可能已阻塞。应改结构，而非只改一层函数参数。
+
+## 9. 路线七：普通——最后再调 horizon 与策略
+
+在执行与驻留修好以前，不再直接尝试 n7/n8/n10/n12、挪草稿卡、改 Q3/Q2 量化。历史已经说明接受率和更多候选本身不足以保证收益。
+
+动态 horizon 使用实际前缀存活率分布：本轮再多一步的预计新增公开 token，必须值回新增 draft、target、恢复和内存压力成本。连续接受并不授权无限加长；检测到驻留恶化或 target 批宽成本跳变时，应缩短。
+
+同形 MoE kernel 标签中的 n=10 可能是 top-10 专家维度，不是草稿 horizon。所有性能表明确写形状轴含义，避免改错 kernel 门限。
+
+Q2 的命中下降已使总体退速，不把低比特当作必然优化；任何更换草稿权重的实验与执行优化分开记录。
+
+## 10. 实施工单与依赖
+
+展示顺序按激进程度。实际合并不应等一个巨型重写全部完成；先完成可审计计时与精确前缀测试，再分支推进，最终集成为同一执行程序。
+
+| 工单 | 修改入口 | 必交付证据 | 禁止的替代品 |
+|---|---|---|---|
+| W0：同请求关键路径账 | speculative/server/context/collective | 同 cycle 的 CPU、GPU、ready、发布、回读、采样互斥账 | 不同进程 profiler 相减 |
+| W1：rank-local 回读 | meta/Vulkan/context 输出缓冲 | pinned/fallback/bytes/waits，字节对拍，总请求 A/B | 只删 fence |
+| W2：greedy 前缀验收 | sampling、Meta lowering、Vulkan kernel | 不等长词表、tie、零行、所有拒绝位置、fallback | 两趟 index/logit D2H |
+| W3：状态重算 | delta-net-base、recurrent memory、GDN shader | 每层状态、卷积/KV、拒绝分布、显存峰值、恢复成本 | 丢 snapshot 不补契约 |
+| W4：K/V-only catch-up | qwen4exp::graph_mtp、workspace/commit | 零输出 dispatch 清单和每位置 K/V 等价 | 接受即删 catch-up |
+| W5：TP5 多步闭环 | 新执行 Program、speculative、Meta/Vulkan collective | 六步无高层逐 token 往返、scratch 寿命、取消代际、整请求收益 | 改五卡设备列表 |
+| W6：七行程序与首图 | context、Meta binding、Vulkan replay | 首图 build/bind/record/execute 分离、热图收益 | 假 UID、假 warmup、放开容量门 |
+| W7：自适应 horizon | speculative 策略层 | 前缀分布与边际成本决策，总请求分布 | 只看接受率 |
+
+### 固定验收规则
+
+独占五卡，保持 watchdog active，保持参考 F32/RELAY 与模型身份，记录实际二进制和 dirty diff、设备 UUID/BDF、环境、请求参数与采样链。诊断与正式性能两种构建/运行口径分开；不把 per-op logger 请求作为基准。
+
+完整 1..60 必须逐字正确、自然停止、predicted_n 与 completion_tokens 均为 171；正式判定用 server predicted_ms<1710。另保留真实 client wall/首 token 时间作体验指标，但不能替换验收口径。报告所有预先安排的正式样本，不从波动里挑最快一条。
+
+建议固定至少五个交错 A/B 比较块，报告各块结果、median 与离散程度；样本不足时只称 pilot，不称稳定收益。一个小补丁若收益小于噪声，先记录机制改善，不夸大吞吐。
+
+正确性集包括：全接受；各位置真实拒绝；EOG/长度截断；取消后下一请求；1→7→1 与部分行；零 logits catch-up；不等长词表/tie/异常值策略；不同提示和上下文；参考不支持的 sampler 路由回退。缓存/状态恢复改动要比最终文本更深地比较状态。
+
+首批需要看到的不是新旗标，而是三份证据：90 ms 回读路径命中账、514 ms 草稿完整关键路径、GDN 精确重算的内存与拒绝成本账。随后按同一预算把这些能力接进 TP5 MTP 程序。
+
+## 11. 本地证据索引
+
+- `困惑.md`；`TP5.md` 中“草稿与 target 账”“五卡草稿同次周期账”“七行 graph 首次分配”“五 rank 分片 GPU 贪心”“n10 scratch”各段。
+- 现场确认存在并读取过首尾片段的原始日志：`/var/tmp/tp5-mtp-n6-granular-ledger-{cycles,draft,target,graphs}.log`。汇总响应与未插桩参考路径见正文；本次没有声称重新完整解析所有历史 JSON 或重新复跑历史测量。
+- `common/speculative.cpp::common_speculative_impl_draft_mtp::{draft,commit,process_impl,enable_device_hidden}`。
+- `common/sampling.cpp::{common_sampler::set_logits,common_sampler_clone,common_sampler_sample,common_sampler_sample_and_accept_n}`。
+- `src/models/qwen4exp.cpp::llama_model_qwen4exp::graph_mtp::graph_mtp`，约 564–755 行。
+- `src/models/delta-net-base.cpp::build_recurrent_attn` 的 K/n_written/gdn_out 到 rollback bank 路径，约 933 行以后；`build_conv_state` 的前缀历史保存。
+- `src/llama-context.cpp::{process_ubatch,decode_impl,output_reserve}`；`src/llama-model.cpp::dev_output`。
+- `ggml/src/ggml-backend-meta.cpp::ggml_backend_meta_device_get_host_buffer_type`，约 438–459 行；`ggml_backend_meta_get_tensor_async`，约 3068–3167 行。
+- `ggml/src/ggml-vulkan/ggml-vulkan.cpp::ggml_backend_vk_device_get_host_buffer_type`，约 25862 行；`ggml_vk_buffer_read_2d_async`，约 11038 行；`ggml_backend_vk_get_tensor_2d_async`，约 22460–22510 行。
+- `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp::{tp5_star_handoff,tp5_poll_gpu_timing,tp5_relay_submit_epoch_chain}`。
+
+外部语义仅采用原始论文与官方 Vulkan 文档：Leviathan 等的 speculative decoding 论文；vkCmdDispatchIndirect/VkDispatchIndirectCommand；dispatch 的 conditional-rendering 语义；calibrated timestamps；Vulkan synchronization。它们说明算法与 API 契约，不证明本工程已实现上述新路线，也不证明机器实际支持所有可选扩展。
