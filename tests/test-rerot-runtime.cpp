@@ -309,11 +309,13 @@ static void test_marker_token_preserves_public_prefix() {
         return;
     }
     const std::string id(child->control_id());
+    const char other_initial = id[0] == 'p' ? 'q' : 'p';
+    const std::string body_prefix = std::string("answer</") + other_initial;
     server_rerot_line_mux mux;
 
     // In KISS architecture, ordinary child tokens are public_live immediately.
     auto plan = runtime.plan_generated_token(
-        episode_id, 1, child->storage_pos_next, "answer</p");
+        episode_id, 1, child->storage_pos_next, body_prefix);
     CHECK(plan.has_value());
     CHECK(plan && plan->visibility ==
         llama_rerot_visibility::public_live);
@@ -327,7 +329,7 @@ static void test_marker_token_preserves_public_prefix() {
     CHECK(body_before && body_before->visibility ==
         llama_rerot_visibility::public_live);
     auto ready = mux.append(
-        1, plan->run_id, "answer</p", runtime.episode(episode_id)->document);
+        1, plan->run_id, body_prefix, runtime.episode(episode_id)->document);
     CHECK(ready.ok && ready.lines.empty());
 
     child = runtime.node(episode_id, 1);
@@ -375,7 +377,7 @@ static void test_marker_token_preserves_public_prefix() {
 
     ready = mux.finish(1, runtime.episode(episode_id)->document);
     CHECK(ready.ok);
-    CHECK(ready.lines == std::vector<std::string>({"answer</p>\n"}));
+    CHECK(ready.lines == std::vector<std::string>({body_prefix + ">\n"}));
     CHECK(mux.empty());
     CHECK(runtime.erase_episode(episode_id));
 }
@@ -3394,7 +3396,7 @@ static void test_mindmap_route_workers_carry_no_leaf_edges() {
 
     const std::string wire =
         "```mermaid\nmindmap\n"
-        "  求总和\n"
+        "  root\n"
         "    计算分量\n"
         "      求 25 × 12\n"
         "      求 15 × 16\n"
@@ -3405,7 +3407,7 @@ static void test_mindmap_route_workers_carry_no_leaf_edges() {
     CHECK(decision.is_mindmap());
     CHECK(decision.has_tree);
     CHECK(decision.error.empty());
-    CHECK(decision.tree.node_count == 6);
+    CHECK(decision.tree.node_count == 5);
     CHECK(decision.tree.leaf_count == 3);
     CHECK(decision.tree.root == 0);
     CHECK(decision.tree.depth == 3);
@@ -3463,9 +3465,9 @@ static void test_mindmap_route_workers_carry_no_leaf_edges() {
     std::sort(leaf_ids.begin(), leaf_ids.end());
     CHECK(leaf_ids == std::vector<uint32_t>({2, 3, 5}));
     // Scope paths are the real ancestor chains from the frozen tree.
-    CHECK(ep->nodes[1].scope_path == "求总和 / 计算分量 / 求 25 × 12");
-    CHECK(ep->nodes[2].scope_path == "求总和 / 计算分量 / 求 15 × 16");
-    CHECK(ep->nodes[3].scope_path == "求总和 / 独立核验 / 检查分量计算和最终总和");
+    CHECK(ep->nodes[1].scope_path == "计算分量 / 求 25 × 12");
+    CHECK(ep->nodes[2].scope_path == "计算分量 / 求 15 × 16");
+    CHECK(ep->nodes[3].scope_path == "独立核验 / 检查分量计算和最终总和");
 
     // The formal plan prefix keeps the canonical Mermaid tree unchanged: it is
     // the plan, so flattening it to a bullet list would destroy the scope
@@ -3474,13 +3476,57 @@ static void test_mindmap_route_workers_carry_no_leaf_edges() {
     CHECK(prefix == "plan:\n" + wire);
 }
 
+static void test_mindmap_more_leaves_than_pens() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(1);
+    const uint64_t ep_id = runtime.adopt_root(21, 21, 0, 1, 0);
+    CHECK(ep_id != 0);
+
+    std::string wire = "```mermaid\nmindmap\n  root\n";
+    for (int i = 0; i < 25; ++i) {
+        wire += "    讲解子问题 " + std::to_string(i) + "\n";
+    }
+    wire += "```\n";
+    const auto decision = server_rerot_parse_mindmap_decision(wire);
+    CHECK(decision.is_mindmap());
+    CHECK(decision.tree.leaf_count == 25);
+    std::string err;
+    CHECK(runtime.initialize_mindmap(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->nodes.size() == 27); // root + all leaves + synthesis
+    CHECK(ep->ready_queue.size() == 25);
+    CHECK(ep->dag_step_cohort.size() == 25);
+    llama_rerot_node_id first = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 1, &first));
+    CHECK(first == 1);
+    CHECK(runtime.complete_admission(ep_id, first));
+    CHECK(commit_generated(runtime, ep_id, first,
+        runtime.node(ep_id, first)->storage_pos_next, "first slice"));
+    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
+    llama_rerot_node_id next = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &next));
+    CHECK(next != first);
+    CHECK(runtime.complete_admission(ep_id, next));
+    CHECK(ep->dag_step_cohort.size() == 25);
+    CHECK(!ep->hard_aborted);
+}
+
 static void test_mindmap_scoped_worker_intent_uses_frozen_tree() {
-    // The worker's intent must describe WHERE in the tree the leaf sits (total
-    // goal, ancestor path, own task) and must stay narrative: no scheduling
+    // The worker's intent describes the real ancestor path and own task,
+    // omitting the synthetic root. It stays narrative: no scheduling
     // marker, no peer name, no claim about uncommitted work.
     const auto decision = server_rerot_parse_mindmap_decision(
         "```mermaid\nmindmap\n"
-        "  求总和\n"
+        "  root\n"
         "    计算分量\n"
         "      求 25 × 12\n"
         "      求 15 × 16\n"
@@ -3491,7 +3537,7 @@ static void test_mindmap_scoped_worker_intent_uses_frozen_tree() {
 
     const std::string intent = server_rerot_mindmap_worker_intent(
         decision.tree, 2, "参考已经提交的公共进展");
-    CHECK(intent.find("总目标：求总和") != std::string::npos);
+    CHECK(intent.find("总目标：root") == std::string::npos);
     CHECK(intent.find("作用域：") != std::string::npos);
     CHECK(intent.find("- 计算分量") != std::string::npos);
     CHECK(intent.find("本叶任务：求 25 × 12") != std::string::npos);
@@ -3511,13 +3557,12 @@ static void test_mindmap_scoped_worker_intent_uses_frozen_tree() {
     CHECK(server_rerot_mindmap_worker_intent(decision.tree, 999).empty());
     // The interior concept node is not a leaf: giving its id must not fabricate
     // a worker task for it (nodes never take a pen).
-    CHECK(server_rerot_mindmap_worker_intent(decision.tree, 1).find("本叶任务：") != std::string::npos);
+    CHECK(server_rerot_mindmap_worker_intent(decision.tree, 1).empty());
 }
 
-static void test_mindmap_root_only_plan_is_not_downgraded() {
-    // A root-only mindmap carries a single leaf (the goal itself). It stays a
-    // mindmap episode -- the research line must not silently become `simple`
-    // just because the model did not split the task.
+static void test_mindmap_single_leaf_plan_is_not_downgraded() {
+    // A synthetic root with one child stays a mindmap episode rather than
+    // silently degrading to `simple` when the task is not split further.
     server_rerot_runtime runtime(nullptr);
     runtime.set_pen_capacity(4);
     const uint64_t ep_id = runtime.adopt_root(31, 31, 0, 1, 0);
@@ -3525,7 +3570,7 @@ static void test_mindmap_root_only_plan_is_not_downgraded() {
     CHECK(runtime.capture_c_base(ep_id));
 
     const auto decision = server_rerot_parse_mindmap_decision(
-        "```mermaid\nmindmap\n  总目标\n```\n");
+        "```mermaid\nmindmap\n  root\n    总目标\n```\n");
     CHECK(decision.is_mindmap());
     CHECK(decision.tree.node_count == 1);
     CHECK(decision.tree.leaf_count == 1);
@@ -3536,7 +3581,7 @@ static void test_mindmap_root_only_plan_is_not_downgraded() {
     CHECK(ep != nullptr);
     // root + exactly one worker + synthesis.
     CHECK(ep->nodes.size() == 3);
-    CHECK(ep->nodes[1].tree_leaf_id == 0);
+    CHECK(ep->nodes[1].tree_leaf_id == 1);
     CHECK(ep->nodes[1].scope_path == "总目标");
     CHECK(ep->synthesis_node == 2);
     const auto * w = ep->document.node(1);
@@ -3558,7 +3603,7 @@ static void test_mindmap_final_mode_contract() {
     CHECK(runtime.capture_c_base(ep_id));
 
     const auto decision = server_rerot_parse_mindmap_decision(
-        "```mermaid\nmindmap\n  总目标\n```\n");
+        "```mermaid\nmindmap\n  root\n    总目标\n```\n");
     CHECK(decision.is_mindmap());
     std::string err;
     CHECK(runtime.initialize_mindmap(ep_id, decision, &err));
@@ -3599,17 +3644,15 @@ static void test_mindmap_rejects_invalid_plans_fail_closed() {
     // to a smaller plan or to the DAG wire.
     const std::string bad_wires[] = {
         // second root
-        std::string("```mermaid\nmindmap\n  R\n  S\n```\n"),
+        std::string("```mermaid\nmindmap\n  root\n  S\n```\n"),
         // skipped indentation level
-        std::string("```mermaid\nmindmap\n  R\n      X\n```\n"),
-        // Seven levels exceed the parser's six-level budget.
-        std::string("```mermaid\nmindmap\n  R\n    A\n      B\n        C\n          D\n            E\n              F\n```\n"),
+        std::string("```mermaid\nmindmap\n  root\n      X\n```\n"),
         // label with a forbidden scalar
-        std::string("```mermaid\nmindmap\n  R\n    [leaf]\n```\n"),
+        std::string("```mermaid\nmindmap\n  root\n    [leaf]\n```\n"),
         // CRLF
-        std::string("```mermaid\nmindmap\n  R\r\n```\n"),
+        std::string("```mermaid\nmindmap\n  root\r\n```\n"),
         // trailing junk after the closing fence
-        std::string("```mermaid\nmindmap\n  R\n```\njunk"),
+        std::string("```mermaid\nmindmap\n  root\n    A\n```\njunk"),
     };
     for (const auto & wire : bad_wires) {
         const auto decision = server_rerot_parse_mindmap_decision(wire);
@@ -3620,7 +3663,7 @@ static void test_mindmap_rejects_invalid_plans_fail_closed() {
     }
     // Truncated documents are incomplete, NOT invalid: the probe keeps sampling.
     const auto truncated = server_rerot_parse_mindmap_decision(
-        "```mermaid\nmindmap\n  R\n    A");
+        "```mermaid\nmindmap\n  root\n    A");
     CHECK(truncated.incomplete);
     CHECK(!truncated.is_mindmap());
     CHECK(!truncated.has_tree);
@@ -3657,7 +3700,7 @@ static void test_mindmap_initialize_rejects_dag_decision() {
     CHECK(ep->nodes.size() == 1);
 
     const auto mm = server_rerot_parse_mindmap_decision(
-        "```mermaid\nmindmap\n  R\n    A\n```\n");
+        "```mermaid\nmindmap\n  root\n    A\n```\n");
     CHECK(mm.is_mindmap());
     CHECK(!runtime.initialize_dag(ep_id, mm, &err));
     CHECK(!err.empty());
@@ -3683,7 +3726,7 @@ static void test_mindmap_s1_global_closure_end_to_end() {
 
     const std::string wire =
         "```mermaid\nmindmap\n"
-        "  求总和\n"
+        "  root\n"
         "    计算分量\n"
         "      求 25 × 12\n"
         "      求 15 × 16\n"
@@ -3822,7 +3865,7 @@ static void test_mindmap_episode_persistence_round_trip() {
 
     const std::string wire =
         "```mermaid\nmindmap\n"
-        "  求总和\n"
+        "  root\n"
         "    计算分量\n"
         "      求 25 × 12\n"
         "      求 15 × 16\n"
@@ -3853,6 +3896,14 @@ static void test_mindmap_episode_persistence_round_trip() {
     std::vector<uint8_t> blob;
     CHECK(runtime.save_episode(ep_id, fp, &blob, &err));
     CHECK(!blob.empty());
+    CHECK(blob.size() > 8);
+    auto old_blob = blob;
+    old_blob[4] = 7; // magic occupies the first four bytes; v7 counted its root
+    old_blob[5] = old_blob[6] = old_blob[7] = 0;
+    server_rerot_runtime rejects_old_tree(nullptr);
+    std::string old_error;
+    CHECK(!rejects_old_tree.load_episode(old_blob.data(), old_blob.size(), fp, nullptr, &old_error));
+    CHECK(old_error.find("legacy RERoT state v7") != std::string::npos);
 
     server_rerot_runtime restored(nullptr);
     uint64_t restored_id = 0;
@@ -3866,11 +3917,11 @@ static void test_mindmap_episode_persistence_round_trip() {
     CHECK(rp->final_mode == "direct");
     CHECK(rp->mindmap_tree_valid);
     // The frozen tree survived: same node count, same leaves, same labels.
-    CHECK(rp->mindmap_tree.node_count == 6);
+    CHECK(rp->mindmap_tree.node_count == 5);
     CHECK(rp->mindmap_tree.leaf_count == 3);
     CHECK(rp->mindmap_tree.root == 0);
     CHECK(rp->mindmap_tree.tree_hash == saved_tree_hash);
-    CHECK(rp->mindmap_tree.nodes[0].label == "求总和");
+    CHECK(rp->mindmap_tree.nodes[0].label == "root");
     CHECK(rp->mindmap_tree.nodes[5].label == "检查分量计算和最终总和");
     CHECK(rp->mindmap_tree.children[0].size() == 2);
     // The canonical wire round-trips through the reloaded plan.
@@ -7986,8 +8037,9 @@ int main() {
     test_mindmap_final_mode_contract();
     test_mindmap_s1_global_closure_end_to_end();
     test_mindmap_route_workers_carry_no_leaf_edges();
+    test_mindmap_more_leaves_than_pens();
     test_mindmap_scoped_worker_intent_uses_frozen_tree();
-    test_mindmap_root_only_plan_is_not_downgraded();
+    test_mindmap_single_leaf_plan_is_not_downgraded();
     test_mindmap_rejects_invalid_plans_fail_closed();
     test_mindmap_initialize_rejects_dag_decision();
     test_c0_and_dag_admit_without_parked_seq();

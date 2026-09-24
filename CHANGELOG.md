@@ -18,6 +18,20 @@ full-model correctness acceptance; repaired-model measurements are required.
 
 ### Fixed
 
+- **MM-R1 logical leaves no longer inherit a physical pen budget.** Removed
+  the incremental mindmap probe guard and parser node/leaf/wire-byte/depth/
+  label budgets; the JSON probe retains its separate 512-token policy. After one English
+  instruction, the mindmap probe injects the Mermaid `mindmap` header, the
+  literal `root` line, and four child-indentation spaces; grammar generates
+  the subtree at any even indentation depth; the parser runs only once the
+  closing fence arrives, rather than rescanning every generated token.
+  `root` is a synthetic container, excluded from logical node and worker
+  counts. Persisted RERoT state advances to v8 rather than misreading older
+  trees. Bonsai-2 on Vulkan completed a 21-leaf plan on six pens with the
+  model's 262144-token context; the full 51-leaf Raft stress reached synthesis
+  but its HTTP client deadline expired before a public answer. See `RERoT.md`
+  §22.3 for the exact scope and artifacts.
+
 - **TP5 replay scheduling and shared transfer recordings.** Warm epoch chains
   reuse submission templates without skipping live binding, HC recipe, or full
   command-buffer sequence validation. Compatible reductions share owned P1

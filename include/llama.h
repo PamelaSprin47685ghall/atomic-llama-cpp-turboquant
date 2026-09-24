@@ -1232,7 +1232,7 @@ extern "C" {
     //
 
     #define LLAMA_REROT_STATE_MAGIC   0x52524f54u // 'RROT'
-    #define LLAMA_REROT_STATE_VERSION 7u // suspended STARTING phase alongside MM-R1 plan
+    #define LLAMA_REROT_STATE_VERSION 8u // synthetic MM-R1 root excluded from logical nodes
 
     enum llama_rerot_state_cap {
         LLAMA_REROT_STATE_CAP_NONE          = 0,

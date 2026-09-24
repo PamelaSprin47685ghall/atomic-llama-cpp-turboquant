@@ -5,15 +5,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Strict MM-R1 Mermaid mindmap wire parser (host side).
 //
 // Protocol (see the mindmap experiment design doc, section 3):
-//   ```mermaid\nmindmap\n  <root label>\n    <child>\n      ...\n  ```\n
+//   ```mermaid\nmindmap\n  root\n    <first child>\n      ...\n  ```\n
 //   - LF only; CRLF, TAB, blank lines and surrounding prose are rejected.
-//   - Root is indented by exactly 2 spaces; each level adds 2 spaces; no level
-//     skipping; a second root is rejected.
+//   - The literal root line is a synthetic container, not a logical node or
+//     worker. Children start at 4 spaces; each level adds 2 spaces; no level
+//     skipping or second root is allowed.
 //   - The document is only atomic after the whole closing line is consumed and
 //     the entire input is exhausted. Partial input yields status::incomplete
 //     with the guarantee that a legal completion still exists.
@@ -23,25 +25,14 @@
 
 namespace server_mindmap {
 
-// Resource limits. They are explicit budget checks, never syntax errors.
-struct limits {
-    uint32_t max_depth     = 6;
-    uint32_t max_nodes     = 96;
-    uint32_t max_leaves    = 16;
-    uint32_t max_label_utf8 = 96;  // UTF-8 bytes of one label
-    size_t   max_bytes     = 16384;
-
-    static limits defaults() { return limits{}; }
-};
+inline constexpr std::string_view probe_prefix = "```mermaid\nmindmap\n  root\n    ";
 
 enum class status : uint8_t {
     // A legal completion of the document still exists.
     incomplete = 0,
-    // The document is complete and legal (envelope closed, no trailing junk,
-    // all budgets respected).
+    // The document is complete and legal (envelope closed, no trailing junk).
     complete,
-    // No completion exists (protocol defect) or a budget was exceeded. The
-    // distinction is carried by error_class.
+    // No legal completion exists; the error class identifies the defect.
     invalid,
 };
 
@@ -50,7 +41,6 @@ enum class error_class : uint8_t {
     envelope,       // header/fence/trailing garbage/CR/Tab
     structure,      // root, indentation, skipped level, blank line
     label,          // empty/whitespace/bad scalar label
-    budget,         // depth/nodes/leaves/label/bytes exceeded
 };
 
 struct node {
@@ -64,8 +54,8 @@ struct node {
 };
 
 struct plan {
-    // Canonical plan tree. Node ids are dense document-order indices so the
-    // structure round-trips through serialization without a second mapping.
+    // Node id 0 is the synthetic wire root; node_count excludes it. Other
+    // ids are dense document-order indices for serialization and scheduling.
     std::vector<node> nodes;
     std::vector<std::vector<uint32_t>> children; // parallel to nodes
     uint32_t root = UINT32_MAX;
@@ -76,7 +66,7 @@ struct plan {
     uint32_t depth      = 0;
 
     size_t leaves(std::vector<uint32_t> & out) const;
-    bool   is_leaf(uint32_t id) const { return id < nodes.size() && children[id].empty(); }
+    bool   is_leaf(uint32_t id) const { return id != root && id < nodes.size() && id < children.size() && children[id].empty(); }
 };
 
 struct result {
@@ -95,13 +85,12 @@ struct result {
     bool is_incomplete() const { return st == status::incomplete; }
     bool is_complete()   const { return st == status::complete; }
     bool is_invalid()    const { return st == status::invalid; }
-    bool budget_hit()    const { return st == status::invalid && err == error_class::budget; }
 };
 
 // Incremental verdict over `text` (the whole probe output so far). `text` may
 // end mid-token, mid-line, or mid-fence. Purely functional: no state is kept
 // between calls, so callers may feed any prefix.
-result parse(const std::string & text, const limits & lim = limits::defaults());
+result parse(const std::string & text);
 
 // Canonical serialization of an accepted plan: the wire round-trips
 // (parse(serialize(p)) == p) and is the identity recorded as canonical_wire.
@@ -112,13 +101,12 @@ std::string serialize(const plan & p);
 // assignment hash equal only when labels/structure match.
 uint64_t hash_tree(const plan & p);
 
-// Per-label scalar check used by the parser and exposed for the incremental
-// sampler oracle. Returns true for one non-empty label made of the MM-R1
+// Per-label scalar check used by the parser. Returns true for a non-empty label made of the MM-R1
 // character set (ASCII words plus the CJK/kana/hangul and operator scalars).
 bool label_ok(const std::string & label);
 
-// G0 grammar text (bounded depth). Node/leaf/label/byte budgets remain the
-// parser's job; the grammar only fixes depth and the character subset.
+// G0 grammar text for any even indentation depth after the injected prefix.
+// The parser checks structure; neither layer budgets plan dimensions.
 std::string grammar_g0();
 
 } // namespace server_mindmap

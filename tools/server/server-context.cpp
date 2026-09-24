@@ -5,7 +5,6 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-rerot.h"
-#include "server-rerot-mindmap-sampler.h"
 #include "server-task.h"
 #include "chat.h"
 #include "server-queue.h"
@@ -161,12 +160,8 @@ enum class server_rerot_injection_kind : uint8_t {
 };
 
 
-// A routing plan is a few short lines by construction — that is the entire
-// point of the dependency-line DSL. Probe tokens are deliberately excluded
-// from the user's n_predict budget and from the episode visibility counters,
-// so without this cap a plan that never emits the blank-line terminator would
-// ramble until the whole context is full (observed: model looping plan lines
-// for 240s with zero bytes streamed). Fail closed well before that.
+// Preserve the shipped JSON probe's short-plan limit. Mindmap probes use the
+// episode's context-sized token budget instead of a fixed planning quota.
 static constexpr uint64_t SERVER_REROT_PROBE_MAX_TOKENS = 512;
 
 static constexpr size_t SERVER_REROT_PRIVATE_BATCH = 32;
@@ -2895,8 +2890,9 @@ llama_tokens rerot_native_fixed_entry_tokens(
             LLAMA_MAX_SEQ > slots.size() ? LLAMA_MAX_SEQ - slots.size() : 1;
         rerot->set_hard_limits(episode_id, {
             episode_token_budget,
-            std::max<uint64_t>(64, internal_seq_budget * 16),
-            internal_seq_budget,
+            slot.task->params.rerot_plan_wire == "mindmap"
+                ? 0 : std::max<uint64_t>(64, internal_seq_budget * 16),
+            slot.task->params.rerot_plan_wire == "mindmap" ? 0 : internal_seq_budget,
             context_limit,
         });
 
@@ -3005,20 +3001,21 @@ llama_tokens rerot_native_fixed_entry_tokens(
             return false;
         }
         {
-            const std::string probe_prompt(plan_wire == "mindmap"
+            std::string probe_prompt(plan_wire == "mindmap"
                 ? std::string(server_rerot_mindmap_probe_prompt())
                 : std::string(server_rerot_routing_probe_prompt()));
-            // Both grammars start at a fresh line: the JSON grammar opens on
-            // the brace and the Mermaid grammar opens on the fence, so the
-            // template must end on one. The model's first sampled token then
-            // opens the document (no glued preamble) and no forced prompt token
-            // ever enters the grammar stacks.
+            // The instruction ends on a fresh line. Mindmap then injects its
+            // fixed wire prefix through the first child's indentation; its
+            // grammar samples only the remaining subtree and closing fence.
             if (probe_prompt.empty() || probe_prompt.back() != '\n') {
                 rerot->hard_abort(
                     episode_id,
                     "rerot_protocol_error: routing probe prompt missing trailing newline");
                 rerot_propagate_hard_abort();
                 return false;
+            }
+            if (plan_wire == "mindmap") {
+                probe_prompt += server_mindmap::probe_prefix;
             }
             llama_tokens probe_tokens = rerot_tokenize_injection(probe_prompt);
             if (probe_tokens.empty()) {
@@ -3028,7 +3025,8 @@ llama_tokens rerot_native_fixed_entry_tokens(
                 rerot_propagate_hard_abort();
                 return false;
             }
-            episode->probe_bytes.clear();
+            episode->probe_bytes = plan_wire == "mindmap"
+                ? std::string(server_mindmap::probe_prefix) : std::string{};
             if (!rerot_set_injection(
                     slot,
                     server_rerot_injection_kind::probe,
@@ -3061,7 +3059,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
                 return false;
             }
         }
-        rerot_mindmap_probe_state.erase(episode->id);
         if (memory) {
             const auto & seed = episode->c0.gdn_recurrent_states;
             if (!seed.empty() &&
@@ -4363,39 +4360,6 @@ llama_tokens rerot_native_fixed_entry_tokens(
         }
     }
 
-    // MM-R1 G1 probe audit state, one entry per live episode. It is created
-    // lazily on the first probe token and dropped when the probe is discarded
-    // or the episode dies, so a stale state can never leak into the next
-    // request's plan.
-    std::unordered_map<uint64_t, server_mindmap::sampler_state> rerot_mindmap_probe_state;
-
-    // Advances the episode's G1 state by `piece` and fails the episode closed
-    // when the piece leaves no legal completion. Returns false (and aborts) on
-    // a protocol violation; true otherwise.
-    bool rerot_mindmap_probe_admit(
-            server_rerot_episode & episode,
-            const std::string & piece) {
-        const server_mindmap::sampler_limits lim =
-            server_mindmap::sampler_limits::from_limits(server_mindmap::limits::defaults());
-        auto it = rerot_mindmap_probe_state.find(episode.id);
-        if (it == rerot_mindmap_probe_state.end()) {
-            it = rerot_mindmap_probe_state.emplace(episode.id, server_mindmap::sampler_state{}).first;
-        }
-        const auto st = server_mindmap::advance(it->second, piece, lim);
-        if (st == server_mindmap::advance_status::dead) {
-            rerot_mindmap_probe_state.erase(it);
-            rerot->hard_abort(
-                episode.id,
-                "rerot_protocol_error: MM-R1 probe token leaves no legal mindmap completion");
-            return false;
-        }
-        if (st == server_mindmap::advance_status::complete) {
-            // Keep the state: any further byte on this probe is illegal and the
-            // terminal check in rerot_try_finish_probe reports trailing junk.
-        }
-        return true;
-    }
-
     // MM-R1 final mode for this episode's global entity. "reason" is the
     // shipped S1 shape; "direct" is the S0 research arm. Anything else fails
     // closed: an unknown mode must not silently become S1.
@@ -4521,21 +4485,7 @@ llama_tokens rerot_native_fixed_entry_tokens(
         const bool forced = slot.rerot_inflight_forced;
         auto * episode_now = rerot->episode(episode_id);
         if (episode_now && episode_now->probing && !forced) {
-            // MM-R1 G1 audit: the probe is constrained by the bounded-depth
-            // GBNF, which fixes the structure but not the budgets or the
-            // envelope tail. The incremental sampler re-checks the WHOLE piece
-            // and fails closed on any token after which no legal document can
-            // be completed. This is a correction net, not a second grammar.
-            if (episode_now->plan_kind == "mindmap") {
-                if (!rerot_mindmap_probe_admit(*episode_now, slot.rerot_inflight_bytes)) {
-                    return false;
-                }
-                for (const auto & extra : slot.rerot_inflight_extra_bytes) {
-                    if (!rerot_mindmap_probe_admit(*episode_now, extra)) {
-                        return false;
-                    }
-                }
-            }
+            const size_t previous_bytes = episode_now->probe_bytes.size();
             episode_now->probe_bytes += slot.rerot_inflight_bytes;
             for (const auto & extra : slot.rerot_inflight_extra_bytes) {
                 episode_now->probe_bytes += extra;
@@ -4545,9 +4495,10 @@ llama_tokens rerot_native_fixed_entry_tokens(
             slot.rerot_inflight_extra_plans.clear();
             slot.rerot_inflight_extra_bytes.clear();
             slot.rerot_inflight_forced = false;
-            // Nothing else bounds the probe (see SERVER_REROT_PROBE_MAX_TOKENS):
-            // a plan that never terminates must fail closed, not burn the context.
-            if (episode_now->probe_tokens > SERVER_REROT_PROBE_MAX_TOKENS) {
+            // JSON keeps its short-plan limit; mindmap may keep decomposing
+            // until the episode's native context token budget is reached.
+            if (slot.task->params.rerot_plan_wire == "json" &&
+                episode_now->probe_tokens > SERVER_REROT_PROBE_MAX_TOKENS) {
                 rerot->hard_abort(
                     episode_id,
                     string_format(
@@ -4555,6 +4506,14 @@ llama_tokens rerot_native_fixed_entry_tokens(
                         " tokens without a plan terminator",
                         SERVER_REROT_PROBE_MAX_TOKENS));
                 return false;
+            }
+            // A large mindmap is still incomplete until its closing fence.
+            // Search only newly appended bytes plus the three-byte overlap for
+            // a fence split across token boundaries; parse the full tree once.
+            if (slot.task->params.rerot_plan_wire == "mindmap" &&
+                episode_now->probe_bytes.find("```\n", previous_bytes > 3 ? previous_bytes - 3 : 0)
+                    == std::string::npos) {
+                return true;
             }
             return rerot_try_finish_probe(slot);
         }

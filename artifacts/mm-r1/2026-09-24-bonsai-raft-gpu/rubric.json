@@ -1,0 +1,18 @@
+{
+  "prompt": "给学生讲清楚 Raft 算法",
+  "reference": "https://raft.github.io/raft.pdf, Sections 2, 5.1-5.4, Figures 2-3",
+  "scoring": "Each core dimension receives 0=absent/wrong, 1=mentioned but unclear/incomplete, 2=accurate and explained. Count only the public final answer. Report severe inaccuracies separately; do not award points for mere length or plan node count.",
+  "core_dimensions": [
+    {"id": "replicated_state_machine", "requires": "A replicated log orders deterministic state-machine commands; explain why consensus is needed, and distinguish replication from merely copying files."},
+    {"id": "roles_and_terms", "requires": "Follower/candidate/leader and monotonically increasing terms; stale leaders must step down on a higher term."},
+    {"id": "election", "requires": "Randomized election timeout, RequestVote/self-vote and a majority for one leader per term; a candidate's log must be sufficiently up to date."},
+    {"id": "replication", "requires": "Leader uses AppendEntries/heartbeats, checks preceding index and term, rejects or repairs conflicts; followers converge on the leader log."},
+    {"id": "commit_and_apply", "requires": "Explain majority-backed commitment, then distinguish committed from applied: followers apply entries in log order. Do not require every server's acknowledgement. The previous-term restriction is an advanced bonus, not required for an introduction."},
+    {"id": "safety", "requires": "Explain how the election log-freshness restriction and majority intersection prevent an elected leader from overwriting committed entries; distinguish safety from mere eventual convergence."},
+    {"id": "failure_and_availability", "requires": "Concrete failure or partition scenario: a reachable majority can elect and make progress; a minority cannot commit, and split votes can retry without sacrificing safety."},
+    {"id": "teaching_sequence", "requires": "Use a coherent student-facing example or timeline that connects election, client command, replication, commit, apply and recovery; terminology is explained rather than listed."}
+  ],
+  "advanced_not_required": ["Snapshots/log compaction", "joint-consensus membership changes", "previous-term entries cannot be committed solely by replica counting"],
+  "severe_errors_to_flag": ["minority commits", "all nodes needed to commit", "two leaders simultaneously in the same term", "committed entries freely overwritten", "safety depends on timeouts"],
+  "comparison_limits": "Route selection, worker occupancy, wall time, and answer quality are different observations. One A/B pair is exploratory, not a stable performance distribution."
+}

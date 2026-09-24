@@ -255,11 +255,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # MM-R1 mindmap wire parser (strict incremental parser, no llama deps)
     llama_build_and_test(test-rerot-mindmap-parser.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap.cpp)
     target_include_directories(test-rerot-mindmap-parser PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    # MM-R1 G1 incremental sampler (protocol mask) + strict-parser oracle
-    llama_build_and_test(test-rerot-mindmap-sampler.cpp
-        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap.cpp
-        ${PROJECT_SOURCE_DIR}/tools/server/server-rerot-mindmap-sampler.cpp)
-    target_include_directories(test-rerot-mindmap-sampler PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_include_directories(test-rerot-parser PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)

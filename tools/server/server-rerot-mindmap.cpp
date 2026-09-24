@@ -25,10 +25,13 @@ struct scalar_range {
 };
 
 constexpr scalar_range kScalarRanges[] = {
+    { 0x21, 0x21 },      // !
     { 0x2A, 0x2A },      // *
     { 0x2B, 0x2B },      // +
+    { 0x2C, 0x2C },      // ,
     { 0x2D, 0x2D },      // -
     { 0x2E, 0x2E },      // .
+    { 0x2F, 0x2F },      // /
     { 0x30, 0x39 },      // 0-9
     { 0x3A, 0x3A },      // :
     { 0x3B, 0x3B },      // ;
@@ -186,7 +189,7 @@ bool label_ok(const std::string & label) {
 size_t plan::leaves(std::vector<uint32_t> & out) const {
     out.clear();
     for (uint32_t i = 0; i < nodes.size(); ++i) {
-        if (children[i].empty()) {
+        if (is_leaf(i)) {
             out.push_back(i);
         }
     }
@@ -235,36 +238,24 @@ uint64_t hash_tree(const plan & p) {
 }
 
 std::string grammar_g0() {
-    // Depth-bounded (4 levels) GBNF. Node/leaf/label/byte budgets stay the
-    // parser's job: a character grammar cannot express them, and pretending
-    // otherwise would misreport a budget failure as a syntax error.
+    // The fixed prefix has already emitted the fence, synthetic root, and
+    // first child's indentation. The parser validates nesting; the grammar
+    // allows any even depth without baking in a tree-size ceiling.
     return
-        "root ::= \"```mermaid\\nmindmap\\n\" node-1 \"```\\n\"\n"
-        "node-1 ::= \"  \" label \"\\n\" node-2*\n"
-        "node-2 ::= \"    \" label \"\\n\" node-3*\n"
-        "node-3 ::= \"      \" label \"\\n\" node-4*\n"
-        "node-4 ::= \"        \" label \"\\n\"\n"
+        "root ::= label \"\\n\" node* \"```\\n\"\n"
+        "node ::= indent label \"\\n\"\n"
+        "indent ::= \"    \" (\"  \")*\n"
         "label ::= word (\" \" word)*\n"
         "word ::= char+\n"
         "char ::= [A-Za-z0-9\\u3400-\\u4DBF\\u4E00-\\u9FFF\\u3040-\\u30FF"
         "\\uAC00-\\uD7AF\\u3001-\\u3002\\u300C-\\u300F\\u2018-\\u201D"
         "\\uFF01\\uFF0C\\uFF1A\\uFF1B\\uFF1F\\uFF3F-\\uFF5E"
         "\\u00A1\\u00A8\\u00B0\\u00B7\\u00D7\\u00F7"
-        "*/=.,?!;:_\\u002D]\n";
+        "*+/=.,?!;:_\\u002D]\n";
 }
 
-result parse(const std::string & text, const limits & lim) {
+result parse(const std::string & text) {
     result res;
-
-
-    if (text.size() > lim.max_bytes) {
-        res.st = status::invalid;
-        res.err = error_class::budget;
-        res.error = "resource_limit: wire bytes";
-        res.byte_offset = lim.max_bytes;
-        res.consumed_bytes = text.size();
-        return res;
-    }
 
     const uint32_t hs = header_state(text, 0);
     if (hs == UINT32_MAX) {
@@ -328,20 +319,20 @@ result parse(const std::string & text, const limits & lim) {
                             "envelope: trailing content after closing fence",
                             after + 1);
             }
-            if (nodes.empty()) {
+            if (nodes.size() < 2) {
                 return fail(error_class::structure,
-                            "structure: document has no root node", pos);
+                            "structure: synthetic root requires a child", pos);
             }
             res.st = status::complete;
             res.consumed_bytes = text.size();
             res.tree.nodes = std::move(nodes);
             res.tree.children = std::move(children);
             res.tree.root = 0;
-            res.tree.node_count = (uint32_t) res.tree.nodes.size();
+            res.tree.node_count = (uint32_t) res.tree.nodes.size() - 1;
             uint32_t depth_max = 0;
             std::vector<uint64_t> subtree_leaves(res.tree.nodes.size(), 0);
             for (size_t i = res.tree.nodes.size(); i-- > 0;) {
-                uint64_t l = res.tree.children[i].empty() ? 1 : 0;
+                uint64_t l = i != 0 && res.tree.children[i].empty() ? 1 : 0;
                 for (uint32_t c : res.tree.children[i]) {
                     l += subtree_leaves[c];
                 }
@@ -352,17 +343,6 @@ result parse(const std::string & text, const limits & lim) {
             res.tree.leaf_count = (uint32_t) subtree_leaves[0];
             res.tree.depth = depth_max;
             res.tree.tree_hash = hash_tree(res.tree);
-            if (res.tree.leaf_count > lim.max_leaves) {
-                // The leaf budget is only knowable once the tree closes: a
-                // late parent-to-internal promotion changes the count.
-                res.st = status::invalid;
-                res.err = error_class::budget;
-                res.error = "resource_limit: leaves";
-                res.byte_offset = pos;
-                res.consumed_bytes = pos;
-                res.tree = plan{};
-                return res;
-            }
             return res;
         }
 
@@ -395,9 +375,6 @@ result parse(const std::string & text, const limits & lim) {
             return fail(error_class::structure,
                         "structure: node line must be indented by at least 2 spaces", pos);
         }
-        if (depth > lim.max_depth) {
-            return fail(error_class::budget, "resource_limit: depth", pos);
-        }
         if (nodes.empty()) {
             if (depth != 1) {
                 return fail(error_class::structure,
@@ -429,8 +406,9 @@ result parse(const std::string & text, const limits & lim) {
             ++i;
         }
         const std::string label = text.substr(content, i - content);
-        if (label.size() > lim.max_label_utf8) {
-            return fail(error_class::budget, "resource_limit: label bytes", content);
+        if (nodes.empty() && (label.size() > 4 ||
+            std::string_view("root").substr(0, label.size()) != label)) {
+            return fail(error_class::structure, "structure: expected synthetic root", content);
         }
         if (!server_mindmap::label_ok(label)) {
             if (line_end || i + 1 < text.size()) {
@@ -443,13 +421,6 @@ result parse(const std::string & text, const limits & lim) {
         }
         if (label.empty()) {
             return fail(error_class::label, "label: empty node label", content);
-        }
-
-        if (nodes.size() >= lim.max_nodes) {
-            // Resource verdict, never a syntax one. The check sits AFTER the
-            // structure verdicts so a legal document that is merely over
-            // budget is never misreported as a protocol defect.
-            return fail(error_class::budget, "resource_limit: node count", pos);
         }
         const uint32_t parent = depth > 1 ? stack[depth - 2] : UINT32_MAX;
         const uint32_t nid = (uint32_t) nodes.size();

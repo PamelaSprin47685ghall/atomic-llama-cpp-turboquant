@@ -398,12 +398,11 @@ struct server_rerot_routing_decision {
 // non-empty error; nothing is repaired, dropped or reordered.
 server_rerot_routing_decision server_rerot_parse_routing_decision(const std::string & json_str);
 
-// MM-R1 Mermaid mindmap planning prompt. Same trailing-LF contract as the
-// JSON probe: the fence must open on a fresh line.
+// One-line MM-R1 planning instruction; the server appends the fixed Mermaid
+// prefix through the synthetic root and first child's indentation.
 std::string_view server_rerot_mindmap_probe_prompt();
-// Depth-bounded (default depth 4) GBNF for the MM-R1 wire. Node/leaf/label/
-// byte budgets stay in the strict parser; the grammar only fixes depth and
-// the character subset.
+// GBNF for the child subtree after the injected prefix, not a full document.
+// The parser remains responsible for structural and label validation.
 std::string server_rerot_mindmap_grammar();
 // Composes the scoped intent text one MM-R1 worker sees in its fixed entry.
 // The collaboration text is narrative only: it must never introduce a marker

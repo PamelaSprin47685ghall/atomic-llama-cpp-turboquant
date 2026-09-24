@@ -17,8 +17,6 @@ add_library(${TARGET} STATIC
     server-rerot.h
     server-rerot-mindmap.cpp
     server-rerot-mindmap.h
-    server-rerot-mindmap-sampler.cpp
-    server-rerot-mindmap-sampler.h
     server-context.cpp
     server-context.h
     server-stream.cpp

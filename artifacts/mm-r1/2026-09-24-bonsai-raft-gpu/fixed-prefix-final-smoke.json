@@ -1,0 +1,57 @@
+{
+  "status": 200,
+  "wall_s": 43.9,
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "12",
+          "reasoning_content": "<think>\nThe user is asking \"只回答 5+7 等于几？\" (Just answer what is 5+7 equal to?).\n\nThey want a simple answer. 5+7 = 12.\n\nI should just answer \"12\" or \"12。\" concisely as requested.\nThe user is asking a simple arithmetic question in Chinese: \"只回答 5+7 等于几？\" (Just answer what is 5+7 equal to?).\n\nThey explicitly asked to \"只回答\" (just answer). So I should give a concise answer.\n\n5 + 7 = 12.\n\nI already made a mindmap node call. Now I should just answer concisely. The user wants just the answer.\n\nI should respond in Chinese since the question is in Chinese. Just \"12\" would be the minimal answer.\nThe user is asking in Chinese: \"只回答 5+7 等于几？\" which means \"Just answer what is 5+7?\"\n\nThe answer is 12.\n\nThe user asked to \"只回答\" (just answer), so I should keep it brief.\nThe user is asking in Chinese: \"只回答 5+7 等于几？\" which means \"Just answer what is 5+7 equal to?\"\n\nThe answer is 12. The user wants just the answer, nothing else.\n\n\n"
+        }
+      }
+    ],
+    "created": 1790241220,
+    "model": "/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf",
+    "system_fingerprint": "b1683-a7a0f8bbd",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 326,
+      "prompt_tokens": 62,
+      "total_tokens": 388,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "rerot": {
+        "prompt_tokens": 62,
+        "cached_tokens": 0,
+        "probe_tokens": 43,
+        "frame_tokens": 1177,
+        "sampled_tokens": 326,
+        "source_end_tokens": 4,
+        "probe_seconds": 2.022557,
+        "prefix_rebuild_seconds": 0.024259,
+        "ordinary_prompt_tokens": 62,
+        "dag_lcp_tokens": 40,
+        "replay_from_tokens": 0,
+        "actual_replayed_tokens": 354,
+        "fixed_entry_seconds": 0.003704,
+        "synthesis_switch_seconds": 0.135043
+      }
+    },
+    "id": "chatcmpl-TBCWZvZ8Lr6C5maK1WSxAlSQp24XfB7X",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 62,
+      "prompt_ms": 783.101,
+      "prompt_per_token_ms": 12.63066129032258,
+      "prompt_per_second": 79.17241837259817,
+      "predicted_n": 326,
+      "predicted_ms": 42114.188,
+      "predicted_per_token_ms": 129.18462576687116,
+      "predicted_per_second": 7.7408592087778105
+    }
+  }
+}

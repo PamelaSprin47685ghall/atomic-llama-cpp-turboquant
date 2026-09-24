@@ -1,0 +1,47 @@
+{
+  "tag": "raft_B4_mindmap",
+  "ok": true,
+  "wall_s": 691.9,
+  "content_chars": 4283,
+  "content": "# 给学生讲清楚 Raft 算法\n\n## 一、为什么要学 Raft？\n\n想象你有一个公司，有多个**分支机构**（服务器），它们之间需要**达成一致**：比如\"这笔交易到底记不记？记成什么样？\"\n\n- 如果分支 A 说\"记下了\"，分支 B 说\"没记\"，那就出乱了。\n- **Raft 就是解决\"多个机器必须达成一致\"的共识算法。**\n\n> 对比 Paxos：Paxos 是\"数学家的共识\"，正确但极难理解和实现。Raft 的设计目标就是 **\"可理解、可实现\"**。\n\n---\n\n## 二、Raft 拆成三个小问题\n\nRaft 的核心思想：**把一个大难题拆成三个小难题**，每个小难题都更容易保证正确。\n\n```\nRaft\n├── 1. 领导者选举（Leader Election）\n│       谁来做\"决策者\"？\n├── 2. 日志复制（Log Replication）\n│       决策者怎么把决定通知给所有人？\n└── 3. 安全性（Safety）\n        怎么保证\"不会脑裂\"、\"不会丢数据\"？\n```\n\n---\n\n## 三、核心概念（先记住这几个词）\n\n| 概念 | 一句话解释 |\n|------|-----------|\n| **Term（轮次）** | 全局时钟，每次选举递增一个数字 |\n| **Leader（领导者）** | 唯一能接收客户端请求、做决策的节点 |\n| **Follower（跟随者）** | 只从 Leader 接收日志，不主动做任何事 |\n| **Candidate（候选人）** | 当前没有 Leader 时，想争取当 Leader 的节点 |\n| **Log（日志）** | 每个节点维护的一条命令序列，是 Raft 的核心 |\n| **Committed（已提交）** | 日志条目被**多数**节点确认后，才真正生效 |\n\n> 💡 **类比**：Term 就像\"第几届选举\"；Leader 就像\"班主任\"；Log 就像\"班级笔记本\"。\n\n---\n\n## 四、领导者选举（Leader Election）\n\n### 前提\n- 集群有 **5 个节点**（奇数，方便多数投票）\n- 每个节点都有自己的 **随机超时**（比如 150~300 ms）\n\n### 流程（分步骤）\n\n**步骤 1：心跳检测**\n- Leader 每隔一段时间发 **Heartbeat**（心跳包）给所有 Follower\n- 心跳里带着：\"我是 Leader，我的日志最新到第 N 条\"\n- Follower 收到心跳 → 重置自己的随机超时计时器\n\n**步骤 2：超时 → 成为 Candidate**\n- 如果 Follower 在超时时间内 **没收到心跳** → 认为 Leader 挂了\n- 该节点把自己的 **Term 加 1**，状态从 Follower → **Candidate**\n- 向所有其他节点发送 **VoteRequest**（\"请投给我\")\n\n**步骤 3：投票规则（关键！）**\n- 每个节点只在一个 Term 里 **最多投一票**\n- 收到 VoteRequest 的节点会检查：\n  - 对方 Term 是否 ≥ 自己的 Term？（如果对方 Term 更高，先更新自己的 Term）\n  - 对方的 **Log 是否至少和自己一样新**？（Log Matching 检查）\n- 如果两个条件都满足 → **投给他**\n\n**步骤 4：获得多数票 → 成为 Leader**\n- 如果 Candidate 收到 **> N/2** 的选票（5 个节点 → 至少 3 票）\n- 就成为 **Leader**\n- 开始向所有节点发送心跳和日志\n\n### 为什么需要\"随机超时\"？\n\n> 如果没有随机超时，5 个节点可能**同时超时**，同时成为 Candidate，同时投票 → **僵死**，选不出 Leader。\n>\n> 随机化让一个节点**大概率先超时**，先当 Candidate，先拿到多数票。\n\n---\n\n## 五、日志复制（Log Replication）\n\n这是 Raft 的**核心**。\n\n### 流程\n\n```\n客户端请求\n    │\n    ▼\n  Leader\n    ├─ 1. 把请求追加到自己的 Log\n    ├─ 2. 发送 AppendEntries RPC 给所有 Follower\n    │       （\"我把第 N 条日志发给你了，请确认\")\n    ├─ 3. 等 Follower 回复 \"我收到了\"\n    ├─ 4. 当 > N/2 个节点都确认收到\n    │       → 该日志条目标记为 **Committed**\n    └─ 5. 回复客户端 \"已提交\"\n```\n\n### 关键细节\n\n- **Log Entry** 的结构：\n  ```\n  { term: 3, index: 5, command: \"set key=A\" }\n  ```\n- **Committed 不等于 Leader 自己确认了**，而是**多数节点都确认了**。\n- Follower 收到日志后，如果发现自己之前的日志**不一致**，会**删除冲突的部分**，用 Leader 的日志覆盖。\n\n> 💡 **类比**：班主任（Leader）把作业写到自己的本子上，然后抄给其他同学（Follower）。如果 3 个同学都说\"抄好了\"，这条作业就**定稿了**（Committed）。\n\n---\n\n## 六、安全性（Safety）：为什么不会\"脑裂\"？\n\n这是学生最容易问的问题：**\"如果网络断了，会不会出现两个 Leader？\"**\n\n答案：**不会。** 靠两条铁律保证：\n\n### 铁律 1：Leader Election Restriction（选举限制）\n\n> 一个节点**只能投票给日志至少和自己一样新的节点**。\n\n- 如果一个旧 Leader 在分区中\"复活\"，它的日志可能不如新 Leader 新\n- 其他节点**不会给它投票** → 它选不出新 Leader → 无法成为 Leader\n- **两个 Leader 不可能同时存在**\n\n### 铁律 2：Log Matching Property（日志匹配属性）\n\n> 如果两个节点的 Log 在同一个 index 上有**相同的 term**，那么它们之前所有的日志都**完全相同**。\n\n- 这意味着：Committed 的日志**永远不会被覆盖或删除**\n- 即使 Leader 死了，新 Leader 的日志中**一定包含所有已提交的日志**\n\n> 💡 **一句话**：Raft 保证 **\"已提交的数据永远不会丢失，永远不会被修改\"**。\n\n---\n\n## 七、一个具体例子（5 节点）\n\n```\n节点：A  B  C  D  E\n初始状态：都是 Follower，Term=1\n```\n\n**场景 1：正常工作**\n- A 成为 Leader\n- 客户端发请求 \"set x=1\"\n- A 写入自己的 Log（index=1, term=1）\n- A 发 AppendEntries 给 B,C,D,E\n- B,C 回复 \"收到\"（3/5 多数）\n- A 标记 index=1 为 **Committed**\n- A 回复客户端 \"OK\"\n\n**场景 2：A 挂了**\n- B,C,D,E 的随机超时到期\n- B 先超时 → Term=2 → 成为 Candidate → 发 VoteRequest\n- C,D 收到 → 检查 B 的日志是否够新 → 是 → 投票给 B\n- B 收到 3 票 → 成为新 Leader\n- B 继续从自己的 Log 复制日志\n\n**场景 3：网络分区（关键！）**\n- A 还是 Leader，但和 B,C,D,E 断了网\n- A 还能接收客户端请求，**但它无法提交**（因为它拿不到多数票）\n- B,C,D,E 选出新 Leader D\n- 分区恢复后，A 发现 D 的 Term 更高 → A 降级为 Follower\n- A 的 Log 被 D 的 Log 覆盖\n\n> ⚠️ **注意**：A 在分区中**看起来**还在\"工作\"，但实际上**任何请求都不会被提交**。这是 Raft 安全性的体现。\n\n---\n\n## 八、常见误区（学生最容易搞错的地方）\n\n| 误区 | 正确理解 |\n|------|---------|\n| \"Leader 死了，数据就丢了\" | 不会。Committed 日志在多数节点上都有，新 Leader 一定会继承 |\n| \"Raft 要求所有节点在线\" | 不需要。只要 **> N/2** 在线就能工作（5 节点 → 至少 3 个） |\n| \"Raft 是同步的，很慢\" | 日志复制是异步的，性能取决于网络 RTT |\n| \"Term 越高越好\" | Term 只是\"轮次号\"，高 Term 的 Leader 会覆盖低 Term 的 |\n| \"Raft 只适用于数据库\" | 任何需要共识的场景：Kubernetes、etcd、TiKV、Consul 等 |\n\n---\n\n## 九、一句话总结\n\n> **Raft = 选一个 Leader + 让 Leader 把日志复制给多数节点 + 保证已提交的日志永远不丢。**\n\n---\n\n## 十、给学生的记忆口诀\n\n```\nRaft 三件事：\n  选一个（Leader Election）\n  抄一份（Log Replication）\n  保安全（Safety）\n\nRaft 一句话：\n  多数说了算，已提交永不丢。\n```\n\n---\n\n### 想继续深入？\n\n- **etcd**（Kubernetes 的底层存储）就是 Raft 实现\n- **TiKV**（分布式数据库）也用 Raft\n- 源码阅读建议：先看 [etcd 的 Raft 实现](https://github.com/etcd-io/etcd) 或 [HashiCorp 的 Raft 库](https://github.com/hashicorp/raft)\n\n有什么地方想让我展开讲的？比如选举的时序图、日志冲突怎么解决、或者和 Paxos 的详细对比？",
+  "reasoning_chars": 11934,
+  "completion_tokens": 6391,
+  "prompt_tokens": 59,
+  "usage": {
+    "completion_tokens": 6391,
+    "prompt_tokens": 59,
+    "total_tokens": 6450,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "rerot": {
+      "prompt_tokens": 59,
+      "cached_tokens": 0,
+      "probe_tokens": 378,
+      "frame_tokens": 4415,
+      "sampled_tokens": 6391,
+      "source_end_tokens": 17,
+      "probe_seconds": 6.679645,
+      "prefix_rebuild_seconds": 0.024574,
+      "ordinary_prompt_tokens": 59,
+      "dag_lcp_tokens": 40,
+      "replay_from_tokens": 0,
+      "actual_replayed_tokens": 351,
+      "fixed_entry_seconds": 0.003081,
+      "synthesis_switch_seconds": 0.115477
+    }
+  },
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 59,
+    "prompt_ms": 427.133,
+    "prompt_per_token_ms": 7.239542372881355,
+    "prompt_per_second": 138.13027792280155,
+    "predicted_n": 6391,
+    "predicted_ms": 690732.849,
+    "predicted_per_token_ms": 108.07899374119857,
+    "predicted_per_second": 9.25249176907178
+  },
+  "model": "/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf",
+  "finish": "stop"
+}

@@ -2,26 +2,26 @@
 #
 # One document per record. `EXPECT` is the verdict the strict C++ parser
 # (tools/server/server-rerot-mindmap.cpp) MUST return for the document, using
-# the default limits:
-#   depth 6, nodes 96, leaves 16, label 96 bytes, wire 16384 bytes.
+# unbounded default planning dimensions. Syntax and indentation remain strict.
 #
 # These fixtures pin the BYTE-level contract: the probe may emit any prefix of
 # a legal document at any token boundary, so the same corpus also seeds the
 # incremental prefix test (every prefix of a `complete` record must be
 # `incomplete`, never `invalid`).
 
---- id: valid-root-only
+--- id: valid-single-leaf
 EXPECT: complete
 ```mermaid
 mindmap
-  总目标
+  root
+    总目标
 ```
 
 --- id: valid-root-one-child
 EXPECT: complete
 ```mermaid
 mindmap
-  Root
+  root
     Leaf
 ```
 
@@ -29,7 +29,7 @@ mindmap
 EXPECT: complete
 ```mermaid
 mindmap
-  R
+  root
     A
       B
         C
@@ -39,7 +39,7 @@ mindmap
 EXPECT: complete
 ```mermaid
 mindmap
-  R
+  root
     A
       A1
       A2
@@ -53,7 +53,7 @@ EXPECT: complete
 Node identity is host-assigned; equal labels on different paths are distinct.
 ```mermaid
 mindmap
-  R
+  root
     重复
     重复
 ```
@@ -63,7 +63,7 @@ EXPECT: complete
 Single ASCII spaces separate words inside a label.
 ```mermaid
 mindmap
-  求总和
+  root
     求 25 × 12
     求 15 × 16
 ```
@@ -72,7 +72,7 @@ mindmap
 EXPECT: complete
 ```mermaid
 mindmap
-  R
+  root
     テスト
     검증
 ```
@@ -81,16 +81,16 @@ mindmap
 EXPECT: complete
 ```mermaid
 mindmap
-  R
+  root
     42
 ```
 
---- id: valid-exactly-sixteen-leaves
+--- id: valid-sixteen-leaves
 EXPECT: complete
-The leaf budget is 16; this document has exactly 16.
+Sixteen leaves are ordinary logical workers, not a capacity boundary.
 ```mermaid
 mindmap
-  R
+  root
     A
     B
     C
@@ -135,7 +135,7 @@ EXPECT: invalid
 envelope
 ```mermaid
 mindmap
-  R
+  root
 
 ```
 
@@ -144,7 +144,7 @@ EXPECT: invalid
 envelope
 ```mermaid
 mindmap
-  R
+  root
 	tab
 ```
 
@@ -153,7 +153,7 @@ EXPECT: invalid
 structure
 ```mermaid
 mindmap
-  R
+  root
   S
 ```
 
@@ -162,7 +162,7 @@ EXPECT: invalid
 structure
 ```mermaid
 mindmap
-    R
+    root
 ```
 
 --- id: invalid-root-at-column-zero
@@ -170,7 +170,7 @@ EXPECT: invalid
 structure
 ```mermaid
 mindmap
-R
+root
 ```
 
 --- id: invalid-odd-indent
@@ -178,7 +178,7 @@ EXPECT: invalid
 structure
 ```mermaid
 mindmap
-  R
+  root
    X
 ```
 
@@ -187,7 +187,7 @@ EXPECT: invalid
 structure
 ```mermaid
 mindmap
-  R
+  root
       X
 ```
 
@@ -196,17 +196,16 @@ EXPECT: invalid
 structure
 ```mermaid
 mindmap
-  R
+  root
 
 ```
 
---- id: invalid-depth-seven
-EXPECT: invalid
-budget
-Depth 7 exceeds the default max_depth of 6.
+--- id: valid-depth-seven
+EXPECT: complete
+Depth is not limited by the default parser or grammar.
 ```mermaid
 mindmap
-  R
+  root
     A
       B
         C
@@ -215,14 +214,12 @@ mindmap
               F
 ```
 
---- id: invalid-seventeen-leaves
-EXPECT: invalid
-budget
-Seventeen leaves exceed the default max_leaves of 16. The verdict is only possible
-once the tree closes, because a late promotion can reduce the leaf count.
+--- id: valid-seventeen-leaves
+EXPECT: complete
+Seventeen logical leaves may time-slice on fewer physical pens.
 ```mermaid
 mindmap
-  R
+  root
     A1
     A2
     B1
@@ -272,7 +269,7 @@ label
 `[` is outside the MM-R1 character set (the G0 grammar fixes the subset).
 ```mermaid
 mindmap
-  R
+  root
     [leaf]
 ```
 
@@ -281,7 +278,7 @@ EXPECT: invalid
 label
 ```mermaid
 mindmap
-  R
+  root
     a"b
 ```
 
@@ -291,7 +288,7 @@ label
 A backtick inside a node label would forge a fence boundary.
 ```mermaid
 mindmap
-  R
+  root
     `code`
 ```
 
@@ -300,7 +297,8 @@ EXPECT: invalid
 envelope
 WIRE: ```mermaid
 mindmap
-  R
+  root
+    A
 ```junk
 
 --- id: invalid-fence-not-at-column-zero
@@ -309,6 +307,7 @@ envelope
 The closing fence must sit at column 0.
 ```mermaid
 mindmap
-  R
+  root
+    A
   ```
 ```

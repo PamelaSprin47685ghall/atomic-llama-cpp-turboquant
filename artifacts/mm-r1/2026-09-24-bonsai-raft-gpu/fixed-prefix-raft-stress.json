@@ -1,0 +1,16 @@
+{
+  "prompt": "给学生讲清楚 Raft 算法",
+  "context": 262144,
+  "plan": {
+    "logical_nodes": 73,
+    "leaves": 51,
+    "runtime_nodes": 53,
+    "physical_pens": 6,
+    "probe_tokens": 613
+  },
+  "outcome": "HTTP client deadline at 3600 s; server cancelled request during synthesis; no completed public answer",
+  "proof": [
+    "fixed-prefix-plan.log",
+    "fixed-prefix-six-workers.log"
+  ]
+}

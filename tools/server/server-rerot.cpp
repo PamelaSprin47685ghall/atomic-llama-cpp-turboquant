@@ -979,15 +979,13 @@ std::string server_rerot_mindmap_worker_intent(
         const server_mindmap::plan & tree,
         uint32_t leaf_id,
         std::string_view collaboration) {
-    if (leaf_id == UINT32_MAX || leaf_id >= tree.nodes.size()) {
+    if (!tree.is_leaf(leaf_id)) {
         return {};
     }
     if (tree.root == UINT32_MAX || tree.root >= tree.nodes.size()) {
         return {};
     }
-    std::string out = "总目标：";
-    out += tree.nodes[tree.root].label;
-    out += "\n作用域：";
+    std::string out = "作用域：";
     std::vector<uint32_t> chain;
     uint32_t u = leaf_id;
     while (u != UINT32_MAX) {
@@ -1121,29 +1119,7 @@ std::string server_rerot_routing_grammar() {
 }
 
 std::string_view server_rerot_mindmap_probe_prompt() {
-    // MM-R1 planning prompt. The model continues its own thinking with one
-    // instruction line, then emits the fenced mindmap. No example block is
-    // given on purpose: a worked example gets copied verbatim (observed with a
-    // named example producing a plan referencing undefined ids), and the role
-    // nouns here are instructions, not labels to echo.
-    //
-    // Every node label MUST be real content drawn from the user's request --
-    // never a placeholder like "A", "B", "task1" or the word "root".
-    static constexpr std::string_view prompt =
-        "Let me organize this with a mindmap first. Output only one mermaid code block.\n"
-        "The top node is the user's overall goal in their own words.\n"
-        "The next levels break it into concrete dimensions.\n"
-        "The deepest nodes name individual executable subtasks, each one a piece of work that "
-        "can be reasoned about on its own.\n"
-        "Every node label must be real content from the request: never a placeholder such as "
-        "\"A\", \"B\", \"task1\" or the word \"root\".\n"
-        "Indent two spaces per level; the top node is indented two spaces. At most six levels.\n"
-        "Split by the dimensions the request actually names -- do not add or drop any.\n"
-        "Keep a continuous derivation inside one node instead of splitting it step by step.\n"
-        "Nodes work concurrently and can see each other's committed progress at submission boundaries.\n"
-        "Cross-branch conclusions are integrated afterwards, so a node need not force a total order.\n"
-        "Do not output task ids, dependency edges, styles, or the final answer.\n";
-    return prompt;
+    return "Let me lay out a mind map.\n";
 }
 
 std::string server_rerot_mindmap_grammar() {
@@ -3070,7 +3046,10 @@ bool server_rerot_runtime::initialize_plan_impl(
                 u = tree.nodes[u].parent;
             }
             for (size_t k = chain.size(); k-- > 0;) {
-                if (k + 1 < chain.size()) {
+                if (chain[k] == tree.root) {
+                    continue;
+                }
+                if (!scope.empty()) {
                     scope += " / ";
                 }
                 scope += tree.nodes[chain[k]].label;
@@ -5930,9 +5909,8 @@ bool server_rerot_episode_load(
     const uint64_t forced_heading = r.u64();
     const uint64_t pending_tokens = r.u64();
     const uint64_t queue_peak = r.u64();
-    // MM-R1 plan identity (see the writer). A version-6 blob always carries
-    // these fields; a version-5 blob is rejected outright above, so there is no
-    // "old shape without them" path to guess about.
+    // MM-R1 plan identity (see the writer). Legacy versions are rejected
+    // above; the current blob always carries these fields.
     std::string plan_kind = r.str();
     std::string final_mode = r.str();
     const uint64_t order_version = r.u64();
@@ -6492,7 +6470,7 @@ bool server_rerot_episode_load(
         return rerot_state_set_error(error_out, "RERoT episode load refused: non-mindmap episode carried a tree");
     }
     if (rebuilt.plan_kind.empty() && is_dag) {
-        // A version-6 blob written by a DAG episode carries the literal "dag".
+        // A DAG episode written in the current format carries "dag".
         rebuilt.plan_kind = "dag";
     }
     if (!rebuilt.plan_kind.empty() &&
