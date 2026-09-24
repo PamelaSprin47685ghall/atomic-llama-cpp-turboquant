@@ -2765,3 +2765,23 @@ R02/Q1/Q3/Q5/Q6/Q7/Q8/Q9/Q10 与 R07/R09/R10/R12/R13 的生产级跨 reader/跨�
 #### 后续修复：GBNF 与严格缩进口径对齐
 
 保持固定前缀 Mermaid mindmap 和任意有限树深度；静态 GBNF 仍约束标签、行形与结束围栏，在其后叠加一个**有状态的缩进采样约束**。它在选 token 前检查整个 token piece（包括跨行和只含部分空格的 piece），禁止下一行深度超过上一行加一；缩进判断与最终解析器共用 `next_depth_valid()`，不生成缺失的父节点，也不引入固定最大深度；独立解析器还会立即拒绝已经不可能补全的过深缩进前缀。普通回答与其他路由文法不安装此约束。`test-rerot-mindmap-parser` 覆盖原先「GBNF 允许、解析器拒绝」的跳级例、分段 token、同 token 多行、回退后再加深、80 层单链及相邻层级状态对拍；`test-rerot-parser`、`test-rerot-runtime` 同过。词表专用的 Qwen2 GGUF 上真实采样器链烟测：单独 GBNF 对合法/跳级两例均接受，叠加深度约束后仅接受合法例（`valid=1, skipped=0`），未启动模型推理。旧 HTTP 500 仍为历史事实，此修复**没有再次运行真实模型或取得吞吐比**。
+
+#### 批准复测后的 frontier 377 停滞与封口交接修复
+
+后续批准的真实模型运行成功通过探针（约 4.44 s），但 35 分钟长请求与 60 秒流式诊断均停在相同的 `rerot_frontiers=377`、`rerot_frontier_rows=1601`、`rerot_six_row_batches=244`。**这不是所有叶子完成后的 synthesis 等待**：trace 最后仍有 node 1、3、4、5、6 采样，node 2 刚产生原生 `</think>`。先前将进程存活和早期输出误判为“仅性能慢”不成立；取消后的空闲槽位也不是取消前状态的证据。
+
+根因是 runtime/host 两层资源所有权脱节：`seal_dag_node()` 封口即停放 KV 并释放 runtime pen，`physical_slot` 被清为 -1；`retire_node()` 随后走 parked 分支，无法再回报原 slot 编号。`rerot_commit_inflight()` 对普通生成 token 在 `!forced_complete` 处提前返回，服务端原 slot 因而一直留在 `GENERATING`。五个在跑节点完成下一步后，被 cohort 守卫挡住；候补 node 7 已进入新 cohort 却拿不到仍被 sealed node 2 占着的 host slot，形成无进展等待。
+
+修复在提交并冲刷完原生 source-end 后、普通 token 的提前返回前，对**已封口的 DAG worker**调用既有 `rerot_make_slot_idle()`；历史 KV 仍归 runtime 的 parked/archive 所有，sealed worker 永不恢复，故不再额外克隆 sampler/lineage。synthesis 的活槽保持不变，peer admission 仍在整批 commit/capture 后统一执行，未加入超时跳过或强制结束。
+
+验证：`llama-server` 构建通过，`test-rerot-runtime` 与 `test-rerot-mindmap-parser` **2/2**；同题、seed 20260923、六 pen、同 KV/原生 context 的 **60 秒 SSE** 复测，指标推进到 **429 frontier / 1914 行 / 297 次六行同批**，trace 明确显示 **node 7 已接替并持续采样**。客户端按约定在 60 秒截止（curl 28，接收 32505 字节），服务已停止；原始流和计数保存在 `artifacts/mm-r1/2026-09-24-bonsai-raft-gpu/rerot-slot-release.{sse,metrics}`。现有 CPU runtime 测试不覆盖 host slot 状态机，因此此次以原始真机失败与修复后同场景烟测证明缺陷消除，而非用 mock 复写生产逻辑。
+
+边界：本次没有等待完整 20 子题收尾，`completed_episode_total=0`，不是全请求吞吐验收。流式内容还显示多个 worker 重复回答整份平方表，而非只处理自己的节点；这是下一项任务范围/执行提示语义问题，不能用六行同批计数掩盖，也不能由本次诊断推定它的具体根因。
+
+#### Mermaid 提示协议收缩：become(node)
+
+按负责人要求删除节点描述器及其冗余 scope/协作/职责话术。探针和正式公共 P 均使用 `Let me lay out a mind map.` 的第一人称入口；P 后保留完整的规范化 Mermaid 图，每个节点都能读取，不再把祖先路径复制进各自工具帧。
+
+唯一内部工具为 `become`，唯一参数为 `node`，值是冻结 TreePlan 中当前节点的**原始标签**，不是 `leaf_N` 或其他 host id。工具回复固定为 `Now you became the node <原始标签>, please think about it.`，接模型原生 assistant reasoning 入口；不再附加 scope、depth、phase、final_mode 或其他角色提示。汇总阶段同样 `become({"node":"root"})` 回到原图根节点，不向模型解释 runtime 的 synthesis 角色。调度和 reader-view 所需编号仍在内部保存，工具参数及该帧的 call id 不携带这些编号。旧 JSON-DAG 路径不在本次协议改动范围内。
+
+删除了 scoped-worker-intent helper、未被消费的 scope_path 存储及固定话术断言；保留并验证全图在 P 中往返解析后 TreePlan hash 不变。`llama-server` 构建通过，`test-rerot-runtime` / `test-rerot-parser` / `test-rerot-mindmap-parser` **3/3**。Bonsai 实际词表与原生模板的无推理烟测，`求 25 × 12` 与 `root` 两种 become 帧均正常序列化、只含一个 node 参数并以 `<think>` 打开：分别 **71 / 56 token**。此证据是协议渲染验证，不是模型遵循性或吞吐获益证明；没有在本次切换后重复跑模型长请求。

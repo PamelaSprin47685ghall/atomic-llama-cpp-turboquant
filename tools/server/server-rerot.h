@@ -404,15 +404,6 @@ std::string_view server_rerot_mindmap_probe_prompt();
 // GBNF for the child subtree after the injected prefix, not a full document.
 // The parser remains responsible for structural and label validation.
 std::string server_rerot_mindmap_grammar();
-// Composes the scoped intent text one MM-R1 worker sees in its fixed entry.
-// The collaboration text is narrative only: it must never introduce a marker
-// the runtime would treat as a barrier, a wait, or a yield. Returns an empty
-// string for an unknown leaf (fail-closed; the caller must not start that
-// worker).
-std::string server_rerot_mindmap_worker_intent(
-        const server_mindmap::plan & tree,
-        uint32_t leaf_id,
-        std::string_view collaboration = {});
 // Strict incremental parse of one MM-R1 probe output. Fail-closed; incomplete
 // is reported separately so the caller keeps sampling on truncation.
 server_rerot_routing_decision server_rerot_parse_mindmap_decision(const std::string & wire);
@@ -465,11 +456,8 @@ struct server_rerot_node_runtime {
     llama_rerot_event_origin completion_origin = llama_rerot_event_origin::unknown;
     llama_rerot_stage_role stage_role = llama_rerot_stage_role::planner;
     uint32_t remaining_preds = 0;
-    // MM-R1 tree placement. `scope_path` is the ancestor chain (root .. parent)
-    // the worker's intent must quote; `tree_leaf_id` is the host node id in the
-    // frozen TreePlan so the reader order provider can rotate views without
-    // trusting the model's labels. UINT32_MAX for non-worker roles.
-    std::string scope_path;
+    // Internal tree placement for reader ordering; never exposed in prompts.
+    // UINT32_MAX for non-worker roles.
     uint32_t tree_leaf_id = UINT32_MAX;
     llama_pos frame_injection_end = -1;
 

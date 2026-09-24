@@ -3449,7 +3449,7 @@ static void test_mindmap_route_workers_carry_no_leaf_edges() {
     }
     CHECK(workers == 3);
 
-    // Each worker carries its host leaf id and its scope path, so the reader
+    // Each worker carries its internal leaf identity, so the reader
     // order can rotate views without trusting labels.
     std::vector<uint32_t> leaf_ids;
     for (size_t i = 1; i < ep->nodes.size(); ++i) {
@@ -3457,23 +3457,22 @@ static void test_mindmap_route_workers_carry_no_leaf_edges() {
             continue;
         }
         CHECK(ep->nodes[i].tree_leaf_id != UINT32_MAX);
-        CHECK(!ep->nodes[i].scope_path.empty());
         leaf_ids.push_back(ep->nodes[i].tree_leaf_id);
-        // Worker string ids are host-assigned, never model-supplied text.
-        CHECK(ep->nodes[i].string_id.rfind("leaf_", 0) == 0);
     }
     std::sort(leaf_ids.begin(), leaf_ids.end());
     CHECK(leaf_ids == std::vector<uint32_t>({2, 3, 5}));
-    // Scope paths are the real ancestor chains from the frozen tree.
-    CHECK(ep->nodes[1].scope_path == "计算分量 / 求 25 × 12");
-    CHECK(ep->nodes[2].scope_path == "计算分量 / 求 15 × 16");
-    CHECK(ep->nodes[3].scope_path == "独立核验 / 检查分量计算和最终总和");
 
     // The formal plan prefix keeps the canonical Mermaid tree unchanged: it is
     // the plan, so flattening it to a bullet list would destroy the scope
     // information every worker needs.
     const std::string prefix = server_rerot_format_plan_prefix(decision, "<think>");
-    CHECK(prefix == "plan:\n" + wire);
+    const size_t map_start = prefix.find("```mermaid\n");
+    CHECK(map_start != std::string::npos);
+    if (map_start != std::string::npos) {
+        const auto rendered = server_rerot_parse_mindmap_decision(prefix.substr(map_start));
+        CHECK(rendered.is_mindmap());
+        CHECK(rendered.tree.tree_hash == decision.tree.tree_hash);
+    }
 }
 
 static void test_mindmap_more_leaves_than_pens() {
@@ -3524,46 +3523,6 @@ static void test_mindmap_more_leaves_than_pens() {
     CHECK(!ep->hard_aborted);
 }
 
-static void test_mindmap_scoped_worker_intent_uses_frozen_tree() {
-    // The worker's intent describes the real ancestor path and own task,
-    // omitting the synthetic root. It stays narrative: no scheduling
-    // marker, no peer name, no claim about uncommitted work.
-    const auto decision = server_rerot_parse_mindmap_decision(
-        "```mermaid\nmindmap\n"
-        "  root\n"
-        "    计算分量\n"
-        "      求 25 × 12\n"
-        "      求 15 × 16\n"
-        "    独立核验\n"
-        "      检查分量计算和最终总和\n"
-        "```\n");
-    CHECK(decision.is_mindmap());
-
-    const std::string intent = server_rerot_mindmap_worker_intent(
-        decision.tree, 2, "参考已经提交的公共进展");
-    CHECK(intent.find("总目标：root") == std::string::npos);
-    CHECK(intent.find("作用域：") != std::string::npos);
-    CHECK(intent.find("- 计算分量") != std::string::npos);
-    CHECK(intent.find("本叶任务：求 25 × 12") != std::string::npos);
-    CHECK(intent.find("协作：参考已经提交的公共进展") != std::string::npos);
-    CHECK(intent.find("输出职责：") != std::string::npos);
-    // The intent is a pure function of (tree, leaf, contract): two calls agree,
-    // so a reader rotation cannot change the frame a worker renders.
-    CHECK(server_rerot_mindmap_worker_intent(decision.tree, 2, "参考已经提交的公共进展") == intent);
-    // A different leaf gets its own task line, not a copy of the sibling's.
-    const std::string other = server_rerot_mindmap_worker_intent(
-        decision.tree, 3, "参考已经提交的公共进展");
-    CHECK(other != intent);
-    CHECK(other.find("本叶任务：求 15 × 16") != std::string::npos);
-    CHECK(other.find("本叶任务：求 25 × 12") == std::string::npos);
-    // Unknown leaf fails closed instead of degrading to the bare label.
-    CHECK(server_rerot_mindmap_worker_intent(decision.tree, UINT32_MAX).empty());
-    CHECK(server_rerot_mindmap_worker_intent(decision.tree, 999).empty());
-    // The interior concept node is not a leaf: giving its id must not fabricate
-    // a worker task for it (nodes never take a pen).
-    CHECK(server_rerot_mindmap_worker_intent(decision.tree, 1).empty());
-}
-
 static void test_mindmap_single_leaf_plan_is_not_downgraded() {
     // A synthetic root with one child stays a mindmap episode rather than
     // silently degrading to `simple` when the task is not split further.
@@ -3586,7 +3545,6 @@ static void test_mindmap_single_leaf_plan_is_not_downgraded() {
     // root + exactly one worker + synthesis.
     CHECK(ep->nodes.size() == 3);
     CHECK(ep->nodes[1].tree_leaf_id == 1);
-    CHECK(ep->nodes[1].scope_path == "总目标");
     CHECK(ep->synthesis_node == 2);
     const auto * w = ep->document.node(1);
     CHECK(w != nullptr);
@@ -7659,7 +7617,6 @@ int main() {
     test_mindmap_s1_global_closure_end_to_end();
     test_mindmap_route_workers_carry_no_leaf_edges();
     test_mindmap_more_leaves_than_pens();
-    test_mindmap_scoped_worker_intent_uses_frozen_tree();
     test_mindmap_single_leaf_plan_is_not_downgraded();
     test_mindmap_rejects_invalid_plans_fail_closed();
     test_mindmap_initialize_rejects_dag_decision();

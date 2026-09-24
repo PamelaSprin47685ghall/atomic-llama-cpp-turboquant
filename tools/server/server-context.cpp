@@ -2097,23 +2097,14 @@ private:
         return text;
     }
 
-    // MM-R1's own native subagent announcement. Same structural role as the
-    // DAG lane handoff (assistant tool call + tool result) so the template's
-    // lossless-round contract still holds, but named and parameterised in the
-    // mindmap vocabulary so the episode never narrates itself as a DAG.
-    static common_chat_tool rerot_mindmap_node_tool() {
+    // The complete map is already in P. A handoff only names its next node.
+    static common_chat_tool rerot_become_tool() {
         common_chat_tool node;
-        node.name = "mindmap_node";
-        node.description = "Internal mindmap node description. Not a user-visible tool.";
+        node.name = "become";
         node.parameters =
             "{\"type\":\"object\",\"properties\":{"
-            "\"node_id\":{\"type\":\"string\"},"
-            "\"label\":{\"type\":\"string\"},"
-            "\"scope\":{\"type\":\"string\"},"
-            "\"depth\":{\"type\":\"integer\"},"
-            "\"phase\":{\"type\":\"string\"},"
-            "\"final_mode\":{\"type\":\"string\"}"
-            "},\"required\":[\"node_id\",\"label\"]}";
+            "\"node\":{\"type\":\"string\"}"
+            "},\"required\":[\"node\"]}";
         return node;
     }
 
@@ -2151,43 +2142,8 @@ private:
     }
 
     std::vector<common_chat_tool> rerot_slot_dag_tools(const server_slot & slot) const {
-        // A MM-R1 episode never renders the DAG lane-spawn tool. Two reasons,
-        // both observed:
-        //   1. The probe is a plain reasoning turn; the DAG schema in its
-        //      prefix pulls the model into the tool-call channel where it
-        //      invents ids ("A", "A1", "B1") instead of writing the wire.
-        //   2. Every later render of the same episode inherits that habit, so
-        //      a single leakage contaminates the whole mindmap narrative.
-        // If the template insists on a tool table (tool_choice != none), the
-        // mindmap shape is offered INSTEAD: a model that fabricates one then
-        // produces a mindmap node, not a DAG lane. The fields mirror the
-        // TreePlan (host node id, label, scope) so the fabrication is at least
-        // in-protocol.
         const task_params * params = rerot_slot_params(slot);
         const std::string & wire = params ? params->rerot_plan_wire : std::string();
-        if (wire == "mindmap") {
-            std::vector<common_chat_tool> tools;
-            if (params && params->rerot_chat_tools.is_array() && !params->rerot_chat_tools.empty()) {
-                try {
-                    tools = common_chat_tools_parse_oaicompat(params->rerot_chat_tools);
-                } catch (...) {
-                    tools.clear();
-                }
-            }
-            common_chat_tool node;
-            node.name = "mindmap_node";
-            node.description = "Internal mindmap node description. Not a user-visible tool.";
-            node.parameters =
-                "{\"type\":\"object\",\"properties\":{"
-                "\"node_id\":{\"type\":\"string\"},"
-                "\"label\":{\"type\":\"string\"},"
-                "\"scope\":{\"type\":\"string\"},"
-                "\"depth\":{\"type\":\"integer\"}"
-                "},\"required\":[\"node_id\",\"label\"]}";
-            tools.push_back(std::move(node));
-            return tools;
-        }
-
         std::vector<common_chat_tool> tools;
         if (params && params->rerot_chat_tools.is_array() && !params->rerot_chat_tools.empty()) {
             try {
@@ -2196,7 +2152,7 @@ private:
                 tools.clear();
             }
         }
-        tools.push_back(rerot_spawn_lane_tool());
+        tools.push_back(wire == "mindmap" ? rerot_become_tool() : rerot_spawn_lane_tool());
         return tools;
     }
 
@@ -2232,31 +2188,19 @@ private:
     // user when this is not a chat completion) so F_i stays independent of
     // neighbor, slot, and frontier. If the live prefix is a token prefix of the
     // full render, that LCP is used instead.
-        // MM-R1 collaboration contract text. Deliberately a single constant so the
-    // arm can be ablated as one variable: an experiment comparing collaboration
-    // hints swaps this string, not the scheduling path. It names no peer, never
-    // blocks, and never claims knowledge of uncommitted work.
-    static std::string rerot_mindmap_collaboration_contract() {
-        return "参考已经提交的公共进展；将暂定结论标明为暂定；发现矛盾时继续核验。";
-    }
-
-llama_tokens rerot_native_fixed_entry_tokens(
-            const server_slot & slot,
-            const std::string & node_label,
-            const std::string & intent,
-            bool is_synthesis,
-            // MM-R1 final mode for the synthesis entry: "reason" keeps the
-            // shipped S1 shape (native reasoning, then content); "direct"
-            // asks the template for the S0 shape (content starts immediately).
-            // Empty means the entry is not a synthesis entry at all.
-            std::string_view final_mode,
-            std::string_view think_end,
-            std::string_view think_start) const {
+    llama_tokens rerot_native_fixed_entry_tokens(const server_slot & slot,
+                                                 const std::string & node_label,
+                                                 const std::string & intent,
+                                                 bool                is_synthesis,
+                                                 // Legacy JSON-DAG metadata; mindmap frames do not expose it.
+                                                 std::string_view    final_mode,
+                                                 std::string_view    think_end,
+                                                 std::string_view    think_start) const {
         if (!chat_params.tmpls || !chat_params.use_jinja || think_end.empty() || think_start.empty()) {
             return {};
         }
         try {
-            const auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
+            const auto caps   = common_chat_templates_get_caps(chat_params.tmpls.get());
             const auto cap_it = caps.find("supports_tool_calls");
             if (cap_it == caps.end() || !cap_it->second) {
                 return {};
@@ -2271,59 +2215,36 @@ llama_tokens rerot_native_fixed_entry_tokens(
         // failure, not extra native role rounds. Valid labels/IDs pass
         // through byte-identical.
         const std::string label = node_label.empty() ? "0" : node_label;
-        if (rerot_text_decodes_reserved_control(label) ||
-            rerot_text_decodes_reserved_control(intent)) {
+        if (rerot_text_decodes_reserved_control(label) || rerot_text_decodes_reserved_control(intent)) {
             return {};
         }
-        const std::string call_id = std::string("rerot-lane-") + label;
-        json args = {
-            {"id", label},
-            {"intent", intent},
-        };
-        if (is_synthesis) {
-            args["phase"] = "synthesis";
-            // The final mode travels with the tool call so the template renders
-            // the shape the experiment arm asked for. It is recorded verbatim,
- // never interpreted here, so a template that does not know the mode must fail
-            // closed rather than silently render S1.
-            if (!final_mode.empty()) {
-                args["final_mode"] = std::string(final_mode);
-            }
-        }
+        const task_params * frame_params  = rerot_slot_params(slot);
+        const bool          mindmap_frame = frame_params && frame_params->rerot_plan_wire == "mindmap";
+        const std::string   call_id       = mindmap_frame ? std::string{} : "rerot-lane-" + label;
 
-        const task_params * frame_params = rerot_slot_params(slot);
-        const bool mindmap_frame =
-            frame_params && frame_params->rerot_plan_wire == "mindmap";
-
-        // The native subagent round is rendered through the chat template's
-        // tool-call channel. Which tool that round announces is part of the
-        // protocol the model sees: the DAG lane handoff for the shipped wire,
-        // and the mindmap node description for MM-R1. Reusing the DAG tool
-        // here would make a mindmap episode narrate itself with DAG
-        // vocabulary, which is exactly the contamination the research line is
-        // meant to avoid.
-        common_chat_tool spawn = mindmap_frame
-            ? rerot_mindmap_node_tool()
-            : rerot_spawn_lane_tool();
+        common_chat_tool             spawn    = mindmap_frame ? rerot_become_tool() : rerot_spawn_lane_tool();
         std::vector<common_chat_msg> messages = rerot_slot_chat_messages(slot);
         if (messages.empty()) {
             common_chat_msg user;
-            user.role = "user";
+            user.role    = "user";
             user.content = ".";
             messages.push_back(std::move(user));
         }
 
-        json call_args = args;
+        json        call_args;
         std::string tool_content;
         if (mindmap_frame) {
-            // Node-shaped arguments: the mindmap vocabulary is (node_id,
-            // label, scope), and the fixed entry carries the frozen tree's
-            // scope path through `intent`.
+            if (intent.empty()) {
+                return {};
+            }
             call_args = json{
-                {"node_id", label},
-                {"label", node_label.empty() ? std::string("global") : node_label},
-                {"scope", intent},
-                {"depth", 1},
+                { "node", intent }
+            };
+            tool_content = "Now you became the node " + intent + ", please think about it.";
+        } else {
+            call_args = json{
+                { "id",     label  },
+                { "intent", intent }
             };
             if (is_synthesis) {
                 call_args["phase"] = "synthesis";
@@ -2331,31 +2252,28 @@ llama_tokens rerot_native_fixed_entry_tokens(
                     call_args["final_mode"] = std::string(final_mode);
                 }
             }
-            tool_content = "You are mindmap node " + label +
-                ", working inside the planned tree. Scope and task: " + intent;
-        } else {
             tool_content = std::string("you are Lane ") + label + ", Intent: " + intent;
         }
 
         common_chat_msg assistant;
         assistant.role = "assistant";
         common_chat_tool_call call;
-        call.name = spawn.name;
+        call.name      = spawn.name;
         call.arguments = call_args.dump();
-        call.id = call_id;
+        call.id        = call_id;
         assistant.tool_calls.push_back(std::move(call));
 
         common_chat_msg tool;
-        tool.role = "tool";
+        tool.role         = "tool";
         tool.tool_call_id = call_id;
-        tool.content = std::move(tool_content);
+        tool.content      = std::move(tool_content);
 
         common_chat_templates_inputs base_inputs;
         rerot_fill_chat_inputs(base_inputs, slot);
         base_inputs.messages = messages;
 
         common_chat_templates_inputs full_inputs = base_inputs;
-        full_inputs.messages = messages;
+        full_inputs.messages                     = messages;
         full_inputs.messages.push_back(std::move(assistant));
         full_inputs.messages.push_back(std::move(tool));
 
@@ -2363,7 +2281,7 @@ llama_tokens rerot_native_fixed_entry_tokens(
         std::string full_prompt;
         try {
             baseline_prompt = common_chat_templates_apply(chat_params.tmpls.get(), base_inputs).prompt;
-            full_prompt = common_chat_templates_apply(chat_params.tmpls.get(), full_inputs).prompt;
+            full_prompt     = common_chat_templates_apply(chat_params.tmpls.get(), full_inputs).prompt;
         } catch (...) {
             return {};
         }
@@ -2372,22 +2290,20 @@ llama_tokens rerot_native_fixed_entry_tokens(
         }
 
         llama_tokens baseline_tokens = rerot_tokenize_injection(baseline_prompt);
-        llama_tokens full_tokens = rerot_tokenize_injection(full_prompt);
+        llama_tokens full_tokens     = rerot_tokenize_injection(full_prompt);
         if (full_tokens.empty() || baseline_tokens.empty()) {
             return {};
         }
 
         const server_tokens full_st(full_tokens, false);
-        llama_tokens suffix;
-        const size_t live_n = slot.prompt.tokens.has_mtmd ? 0 : slot.prompt.tokens.size();
-        const size_t live_lcp = (live_n == 0)
-            ? 0
-            : slot.prompt.tokens.get_common_prefix(full_st);
+        llama_tokens        suffix;
+        const size_t        live_n   = slot.prompt.tokens.has_mtmd ? 0 : slot.prompt.tokens.size();
+        const size_t        live_lcp = (live_n == 0) ? 0 : slot.prompt.tokens.get_common_prefix(full_st);
         if (live_n > 0 && live_lcp == live_n && live_lcp < full_tokens.size()) {
             suffix.assign(full_tokens.begin() + static_cast<std::ptrdiff_t>(live_lcp), full_tokens.end());
         } else {
             const server_tokens baseline_st(std::move(baseline_tokens), false);
-            const size_t render_lcp = baseline_st.get_common_prefix(full_st);
+            const size_t        render_lcp = baseline_st.get_common_prefix(full_st);
             if (render_lcp == 0 || render_lcp >= full_tokens.size()) {
                 return {};
             }
@@ -3998,29 +3914,18 @@ llama_tokens rerot_native_fixed_entry_tokens(
                 } else {
                     const bool is_synth = lane->stage_role == llama_rerot_stage_role::synthesis;
                     const std::string label = lane->string_id.empty() ? "0" : lane->string_id;
-                    // MM-R1 worker frames quote the frozen tree: the scope
-                    // (total goal + ancestor path + own task) is narrative
-                    // context, never a scheduling DSL. Workers that cannot see
-                    // a peer's committed result must say so instead of
-                    // assuming it. The intent is NOT re-tokenized per reader
-                    // rotation -- it depends only on the leaf and the frozen
-                    // tree, so frame rendering stays O(workers), not
-                    // O(workers x readers).
                     std::string frame_intent = lane->intent;
-                    if (!is_synth && episode->plan_kind == "mindmap" &&
-                        episode->mindmap_tree_valid) {
-                        const std::string scoped = server_rerot_mindmap_worker_intent(
-                            episode->mindmap_tree, lane->tree_leaf_id,
-                            rerot_mindmap_collaboration_contract());
-                        // Fail closed: an unknown leaf must not silently start
-                        // with the bare label as its whole task description.
-                        if (scoped.empty()) {
+                    if (episode->plan_kind == "mindmap") {
+                        const auto & tree = episode->mindmap_tree;
+                        const uint32_t tree_node = is_synth ? tree.root : lane->tree_leaf_id;
+                        if (!episode->mindmap_tree_valid || tree_node >= tree.nodes.size() ||
+                            (!is_synth && !tree.is_leaf(tree_node))) {
                             rerot->hard_abort(
                                 episode_id,
-                                "rerot_protocol_error: mindmap worker leaf is not in the frozen tree");
+                                "rerot_protocol_error: mindmap handoff node is not in the frozen tree");
                             return false;
                         }
-                        frame_intent = scoped;
+                        frame_intent = tree.nodes[tree_node].label;
                     }
                     llama_tokens frame_tokens = rerot_native_fixed_entry_tokens(
                         slot,
@@ -4521,6 +4426,21 @@ llama_tokens rerot_native_fixed_entry_tokens(
             slot.smpl = std::move(worker_sampler);
             rerot_bind_sampler(slot);
             return rerot_begin_serial_tail(episode_id, node_id, false);
+        }
+
+        if (episode_now && episode_now->is_dag && plan.marker_step.marker_closed) {
+            const auto * lane = rerot->node(episode_id, node_id);
+            if (lane && lane->is_sealed && lane->stage_role == llama_rerot_stage_role::worker) {
+                // commit_token() parked this worker's KV and freed its runtime
+                // pen. Release the host executor too, before central admission:
+                // retire_node() sees a parked lane and cannot report its old
+                // slot. Otherwise the sealed slot stays GENERATING forever,
+                // while its queued replacement prevents the next cohort from
+                // completing. No sampler/lineage snapshot is needed for a
+                // sealed worker: it will never resume; history is runtime-owned.
+                rerot_make_slot_idle(slot);
+                return true;
+            }
         }
 
         if (!forced_complete) {

@@ -970,46 +970,6 @@ std::string server_rerot_format_fixed_entry(
     return frame;
 }
 
-// Composes the intent text a MM-R1 worker sees in its fixed entry. The frozen
-// tree supplies the scope (total goal + ancestor path + own task); the
-// collaboration contract is narrative, NOT a scheduling DSL -- it must never
-// introduce a marker the runtime would treat as a barrier, a wait, or a yield.
-// A worker that cannot see a peer's result must say so, not assume it.
-std::string server_rerot_mindmap_worker_intent(
-        const server_mindmap::plan & tree,
-        uint32_t leaf_id,
-        std::string_view collaboration) {
-    if (!tree.is_leaf(leaf_id)) {
-        return {};
-    }
-    if (tree.root == UINT32_MAX || tree.root >= tree.nodes.size()) {
-        return {};
-    }
-    std::string out = "作用域：";
-    std::vector<uint32_t> chain;
-    uint32_t u = leaf_id;
-    while (u != UINT32_MAX) {
-        chain.push_back(u);
-        u = tree.nodes[u].parent;
-    }
-    // Ancestors strictly between the root and the leaf, root-first.
-    for (size_t k = chain.size() - 1; k-- > 0;) {
-        if (chain[k] == tree.root) {
-            continue;
-        }
-        out += "\n- ";
-        out += tree.nodes[chain[k]].label;
-    }
-    out += "\n本叶任务：";
-    out += tree.nodes[leaf_id].label;
-    if (!collaboration.empty()) {
-        out += "\n协作：";
-        out += std::string(collaboration);
-    }
-    out += "\n输出职责：完成本叶推导，不冒充最终全局回答。";
-    return out;
-}
-
 std::string server_rerot_format_plan_prefix(
         const server_rerot_routing_decision & decision,
         std::string_view think_start) {
@@ -1017,7 +977,7 @@ std::string server_rerot_format_plan_prefix(
         // Formal P keeps the canonical Mermaid tree: the hierarchy is the
         // plan, so flattening it to a bullet list would destroy the scope
         // information every worker needs.
-        std::string prefix = "plan:\n";
+        std::string prefix(server_rerot_mindmap_probe_prompt());
         prefix += server_mindmap::serialize(decision.tree);
         return prefix;
     }
@@ -3005,7 +2965,7 @@ bool server_rerot_runtime::initialize_plan_impl(
 
     // ---- plan -> workers ----------------------------------------------------
     // MM-R1: only LEAVES become workers. Internal concept nodes stay in the
-    // document tree for scope paths and reader ordering, but they never take a
+    // document tree for context and reader ordering, but they never take a
     // pen, a seq, or a recurrent blob. One leaf produces exactly one worker:
     // no path duplication, no re-expansion, no recomputation.
     // The shipped DAG wire keeps its flat questions list.
@@ -3016,7 +2976,6 @@ bool server_rerot_runtime::initialize_plan_impl(
     struct worker_desc {
         std::string id;
         std::string intent;
-        std::string scope;
         uint32_t leaf_id = UINT32_MAX;
     };
     std::vector<worker_desc> workers;
@@ -3034,28 +2993,9 @@ bool server_rerot_runtime::initialize_plan_impl(
         tree.leaves(leaf_ids);
         for (uint32_t id : leaf_ids) {
             const auto & node = tree.nodes[id];
-            // Scope path (root .. parent): the intent a worker sees must
-            // describe WHERE in the tree it sits, not just what to compute.
-            std::string scope;
-            std::vector<uint32_t> chain;
-            uint32_t u = id;
-            while (u != UINT32_MAX) {
-                chain.push_back(u);
-                u = tree.nodes[u].parent;
-            }
-            for (size_t k = chain.size(); k-- > 0;) {
-                if (chain[k] == tree.root) {
-                    continue;
-                }
-                if (!scope.empty()) {
-                    scope += " / ";
-                }
-                scope += tree.nodes[chain[k]].label;
-            }
             worker_desc w;
             w.id = "leaf_" + std::to_string(id);
             w.intent = node.label;
-            w.scope = scope;
             w.leaf_id = id;
             workers.push_back(std::move(w));
         }
@@ -3079,7 +3019,6 @@ bool server_rerot_runtime::initialize_plan_impl(
         nr.id = nid;
         nr.string_id = w.id;
         nr.intent = w.intent;
-        nr.scope_path = w.scope;
         nr.tree_leaf_id = w.leaf_id;
         nr.planner_armed = false;
         nr.stage_role = llama_rerot_stage_role::worker;
