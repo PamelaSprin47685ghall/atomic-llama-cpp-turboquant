@@ -6848,7 +6848,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // takes 249 us. Widening the row tile for wide dispatches divides that
             // traffic without touching the weight traffic, which is already shared
             // across the columns inside the shader.
-            const uint32_t rm_wide = (i + 1) >= 4 ? 4u : ((i + 1) >= 2 ? 2u : 1u);
+            // NUM_COLS 13..18 with the 4x row tile spill the per-thread accumulator
+            // array (temp[NUM_COLS][NUM_ROWS] = 13..18 x 8 floats) beyond the
+            // register budget and the shader falls off a cliff: measured prefill
+            // throughput drops 4x going from 12 to 13 columns (112.8 -> 28.2 t/s
+            // on Bonsai PQ2_0, RX 6800). Halve the row tile there so the
+            // accumulator fits; the extra activation re-reads are far cheaper
+            // than the spill (n=1 runs at 317 GB/s effective with this tile).
+            const uint32_t rm_wide = (i + 1) >= 13 ? 2u : ((i + 1) >= 4 ? 4u : ((i + 1) >= 2 ? 2u : 1u));
             (void) rm_wide;
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
