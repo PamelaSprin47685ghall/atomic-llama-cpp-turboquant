@@ -2943,4 +2943,14 @@ mindmap wire 的失效不是措辞问题，而是**缩进协议 + 错误的概�
 
 lane 与 synthesis 都要有界。`nudge` 只发给 worker 时，4-worker 的计划里 synthesis 拿着四份笔记无界地写，153 s 时已 1560 token 仍未停，700 s 预算都撑不住；给 synthesis 三倍 lane 预算的同类提醒后，同一计划 251.65 s 收尾。提醒还必须跳过任何含 `<`/`>` 的 piece：注入会把刚采样的 token 带进 lane 的**私有** run，若那个 token 正是收尾标记，它就进不了被解析的公开流，lane 永不 seal。
 
+
+#### 四、后续两轮实测（2026-09-25 晚）：13-18 列 matvec 悬崖与 grouped-heads 资格赛（本节为实测记录，非新功能）
+
+**matvec 13-18 列寄存器溢出悬崖。** 逐 npp 扫描发现 prefill 吞吐在 13 列处塌 4 倍（npp=12 为 112.8 t/s，npp=13 为 28.2 t/s）：宽派发行宽 (rm_wide=4) 让每线程累加器 `temp[NUM_COLS][NUM_ROWS]` 达到 13-18×8 个 float，超出寄存器预算；n=16 prefill 形态的有效权重带宽只有 35 GB/s（n=6 decode 形态为 129-141 GB/s）。对 13-18 列把行块减半 (rm_wide=2) 后，npp=13..18 全部回到 111-116 t/s，单流 n=16 prefill 提升 28%（86.6→110.9 t/s）。decode 不受影响（1-8 列管线未动，重复测量 1/4/6/8 lane = 32.6/81.6/97.6-98/102.5 t/s，与改动前一致）；贪心 6 路解码与单路输出仍逐字相同；test-backend-ops 全绿。反向方案（把小 N decode 改走标量 mul_mm GEMM）用临时 env 钩子实测后被否决：该路径在本机（无 coopmat 的 RADV）比 matvec 慢 3-7 倍（单 lane TG 33.4→4.4 t/s），调度阈值不放宽。
+
+**grouped-head attention 资格赛失败，维持 opt-in。** `GGML_VK_REROT_GROUPED_HEADS=1`（每 subgroup 一个 Q head，GQA 组内 KV tile 只 staging 一次）首次跑完整配对 episode：每 episode attention 成本从 18.7 s 降到 4.2 s（单次 dispatch 460 µs，n_kv=5376），索引路径对普通 FA 的效率差距从 2.7x 显著收窄；精度门两侧均过（indexed vs F64 < 1.2e-7；test-rerot-attn 全量 0 failure）。但同 seed 配对 episode 确定性地以 `<|fim_prefix|>become` 工具调用泄漏为公开答案收尾（finish=tool_calls，清单 0/9），而标量路径同 seed 干净收尾（finish=stop，9/9），各两次重复完全一致。着色器数值在 F32 容差内正确；分岐是 temperature=1.0 下的轨迹混沌重新暴露了 §22.5 记录过的 become 泄漏失败模式。按其自身资格门（“在完整配对模型运行资格化之前保持历史上验证过的 Br=1 路由”），配对运行失败，Br=1 维持默认，env 仍为 opt-in。
+
+**由此登记的开放缺陷（与 attention 路径无关）：** 最终 fence 必须拒绝把内部工具调用当作公开答案发布。当前泄漏在标量路径下同样可能发生（只是当前测试 seed 未触发）；修复属于协议层，不属于本节。
+### 22.7 边界
+
 边界：答案很短的题不适用墙钟口径——算术题 RERoT 的公开输出是串行的 4 倍（1436 vs 363 token），墙钟 42.6 s vs 17.0 s 比的是不同工作量，其速率仍占优（33.7 vs 21.4 tok/s）。**墙钟结论只在输出长度可比时成立。**

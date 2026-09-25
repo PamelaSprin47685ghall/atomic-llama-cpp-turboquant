@@ -16,7 +16,50 @@ Earlier TP5 measurements using `--no-mmap` ran with an empty lazy PLE table.
 Those historical throughput and GPU-to-GPU equivalence results are not
 full-model correctness acceptance; repaired-model measurements are required.
 
-### Fixed
+
+- **Vulkan matvec row tile spills at 13-18 columns; prefill gained 28%.**
+  The multi-column matvec pipelines kept the 4x row tile from the wide-
+  dispatch widening at every column count, so at NUM_COLS 13..18 the
+  per-thread accumulator array (13-18 x 8 floats) spilled past the register
+  budget. Measured on Bonsai PQ2_0 / RX 6800, prefill throughput fell off a
+  4x cliff exactly at 13 columns (112.8 t/s at npp=12 versus 28.2 at npp=13)
+  and the n=16 prefill shape ran at 35 GB/s effective weight bandwidth
+  against 129-141 GB/s for the n=6 decode shapes. Halving the row tile for
+  those widths (rm_wide 2) keeps the accumulator in registers: npp=13..18
+  now all measure 111-116 t/s, the single-stream n=16 prefill gains 28%
+  (86.6 -> 110.9 t/s at npl=1). Decode is untouched (1-8 column pipelines
+  unchanged); repeated runs confirm 1/4/6/8-lane decode at
+  32.6/81.6/97.6-98/102.5 t/s, matching the pre-change baseline within
+  noise. Greedy 6-lane decode remains byte-identical to the single-lane
+  path; test-backend-ops passes (368 s).
+
+  Routing small-N decode through the scalar mul_mm GEMM instead was
+  measured with a temporary env hook and rejected: 3-7x slower than the
+  matvec at these shapes on this no-coopmat RADV device (TG 33.4 -> 4.4
+  t/s at one lane). The matvec stays the decode path; the GEMM threshold is
+  not widened.
+
+- **RERoT grouped-head attention measured: 5x cheaper attention, one
+  protocol failure in the paired model run; stays opt-in.** The
+  `GGML_VK_REROT_GROUPED_HEADS=1` path (one subgroup per Q head, KV tile
+  staged once per GQA group) was qualified on a full episode for the first
+  time. Attention cost drops from 18.7 s to 4.2 s per episode (per-call
+  460 us -> ~150 us effective at n_kv 5376) and the indexed shader's
+  efficiency gap versus ordinary FA narrows from 2.7x. Precision gates
+  pass on both paths (indexed error < 1.2e-7 vs F64; test-rerot-attn 0
+  failures). However the paired same-seed episode ends in a leaked
+  `<|fim_prefix|>become` tool call as the public answer (finish=tool_calls,
+  0/9 checklist) while the scalar path completes cleanly (finish=stop,
+  9/9) - deterministic across two runs each. The grouped shader is
+  numerically correct within F32 tolerance; the divergence is trajectory
+  chaos at temperature 1.0 re-exposing the become-leak failure mode that
+  RERoT.md 22.5 documents for the scalar path under other seeds. Per its own
+  qualification gate ("preserve the historically validated Br=1 route
+  until a complete paired model run qualifies grouped RERoT attention"),
+  the paired run failed, so Br=1 remains the default and the env flag
+  stays opt-in. The protocol-level fix (final fence must reject a public
+  answer that is an internal tool call) is independent of the attention
+  path and is recorded in RERoT.md as an open defect.
 
 - **Multi-lane decode is now worth its lanes, and RERoT finally beats serial.**
   Two Vulkan matvec fixes and two scheduling bounds. The shader dequantized each
