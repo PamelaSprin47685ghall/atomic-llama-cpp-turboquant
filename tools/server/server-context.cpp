@@ -2837,10 +2837,23 @@ private:
         if (is_worker && lane->sampled_tokens >= 2u * budget) {
             SRV_INF("rerot.trace.lane_force_seal: episode=%" PRIu64 " node=%u tokens=%u\n",
                 slot.rerot_episode_id, slot.rerot_node_id, lane->sampled_tokens);
-            if (rerot->seal_dag_node(slot.rerot_episode_id, slot.rerot_node_id,
-                                     llama_rerot_event_origin::worker_source)) {
+            if (!rerot->seal_dag_node(slot.rerot_episode_id, slot.rerot_node_id,
+                                       llama_rerot_event_origin::worker_source)) {
                 return false;
             }
+            // The seal succeeded (true, or idempotently already sealed): this
+            // worker never resumes, so the host executor must leave GENERATING
+            // now. Without this the slot keeps rerot_internal=true pointing at
+            // the sealed node; once the episode tears down, every pre_decode
+            // round runs plan_next_token against a deleted episode (node() ==
+            // null -> silent false -> bare propagate storm) and the NEXT
+            // episode gets hard-aborted with a bare rerot_resource_exhausted
+            // (measured: episode 3 dies 42 ms after start, reproducible 3/3).
+            // Mirrors the natural-seal path in rerot_stream_finish_lane
+            // (marker-closed worker -> make_slot_idle).
+            slot.sampled = LLAMA_TOKEN_NULL;
+            rerot_make_slot_idle(slot);
+            return true;
         }
         const uint32_t step = std::max<uint32_t>(1, budget / 4);
         const uint32_t due = budget + lane->wrap_nudges * step;
@@ -5632,6 +5645,7 @@ private:
             const server_rerot_episode * ep = rerot->episode(episode_id);
             const std::string reason = (ep && !ep->abort_reason.empty())
                 ? ep->abort_reason : "rerot_resource_exhausted";
+
             rerot->hard_abort(episode_id, reason);
 
             const server_task * response_task = nullptr;
