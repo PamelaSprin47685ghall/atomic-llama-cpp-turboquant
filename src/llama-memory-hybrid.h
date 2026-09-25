@@ -124,6 +124,7 @@ public:
         llama_seq_id seq_id) override;
     bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
     void rerot_clear_reader_view(llama_seq_id seq_id) override;
+    bool rerot_occlude_base_range(llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) override;
 
     size_t rerot_hand_seed_size(llama_seq_id source_seq) const override;
     bool rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) override;

@@ -2539,6 +2539,20 @@ bool server_rerot_runtime::install_token_plan(
         llama_memory_rerot_clear_write_tag(memory_, current_node->exec_seq);
         return fail_episode(*current, "failed to install RERoT reader view");
     }
+    // Become-leak fix (RERoT.md 22.6): the synthesis view never sees the
+    // idempotently advertised internal-tool schema. Workers keep it (their
+    // identity anchors on it); the planner probe is handled separately by
+    // dropping the range from its private KV copy at arm time.
+    if (current_node->stage_role == llama_rerot_stage_role::synthesis &&
+        current->tools_ad_begin >= 0 && current->tools_ad_end > current->tools_ad_begin &&
+        !llama_memory_rerot_occlude_base_range(
+            memory_, current_node->exec_seq, current->tools_ad_begin, current->tools_ad_end)) {
+        std::fprintf(stderr,
+            "RERoT install warning: episode=%llu node=%u synthesis base occlusion failed\n",
+            static_cast<unsigned long long>(current->id), current_node->id);
+        // Non-fatal best-effort: the view stays complete and the leak risk
+        // returns to the pre-fix baseline for this lane, never a hard abort.
+    }
     return true;
 }
 

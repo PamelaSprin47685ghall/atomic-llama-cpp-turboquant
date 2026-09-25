@@ -284,6 +284,16 @@ void llama_kv_cache_iswa::rerot_clear_reader_view(llama_seq_id seq_id) {
     kv_swa->rerot_clear_reader_view(seq_id);
 }
 
+bool llama_kv_cache_iswa::rerot_occlude_base_range(
+        llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) {
+    // The base cache holds the full prompt; the SWA side may hold a tail
+    // window. Forward to both: each applies the range to its own reader
+    // view, and a base range outside the window is simply a no-op there.
+    const bool rb = kv_base->rerot_occlude_base_range(seq_id, pos_begin, pos_end);
+    const bool rs = kv_swa->rerot_occlude_base_range(seq_id, pos_begin, pos_end);
+    return rb || rs;
+}
+
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
     // the base cache is a superset of the SWA cache, so we can just check the SWA cache
     return kv_swa->seq_pos_min(seq_id);

@@ -7174,6 +7174,17 @@ bool llama_memory_rerot_set_reader_view(
     return mem->rerot_set_reader_view(seq_id, internal);
 }
 
+bool llama_memory_rerot_occlude_base_range(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+          llama_pos pos_begin,
+          llama_pos pos_end) {
+    if (!mem) {
+        return false;
+    }
+    return mem->rerot_occlude_base_range(seq_id, pos_begin, pos_end);
+}
+
 void llama_memory_rerot_clear_reader_view(
         llama_memory_t mem,
           llama_seq_id seq_id) {

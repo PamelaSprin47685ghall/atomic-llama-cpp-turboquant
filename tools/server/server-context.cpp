@@ -3059,6 +3059,7 @@ private:
         // into the same ledger (their prefill is parked at completion).
         const bool rerot_prof_first_root = rerot_transport.empty();
 
+
         // The C0 decision must have been pre-saved while C0 logits were valid
         // (post_decode, possibly when this root was still parked). Without it
         // plain continuation cannot reproduce the ordinary next token, so fail
@@ -3234,6 +3235,90 @@ private:
                 rerot_capture_sampler_snapshot(episode->c0, transport_it->second->c0_sampler.get());
             }
         }
+        // Become-leak fix (RERoT.md 22.6): discover the C0 storage range of the
+        // idempotently advertised internal-handoff tool, then occlude it from
+        // the planner probe (KV membership removal on the probe's private
+        // copy, below) and from the synthesis view (layout-level occlusion
+        // installed with the reader view). Workers keep the range: their
+        // identity anchors on the tool semantics (22.5 measured 3/6 identity
+        // without it). The range is computed once per episode; a request that
+        // carries user tools of its own keeps the whole block visible to
+        // everyone (occluding would hide real tools from synthesis) and the
+        // fix degrades to the pre-fix behavior for that request.
+        {
+            auto * episode = rerot->episode(slot.rerot_episode_id);
+            // The root lane task cleared rerot_chat_tools (the probe render
+            // must not re-advertise); the ORIGINAL request tools live on the
+            // transport's cloned response task. Read them there.
+            auto transport_it = rerot_transport.find(slot.rerot_episode_id);
+            const task_params * tparams = transport_it != rerot_transport.end()
+                ? &transport_it->second->response_task.params : nullptr;
+            if (episode && tparams && tparams->rerot_chat_tools.is_array() &&
+                tparams->rerot_chat_tools.size() == 1 &&
+                tparams->rerot_chat_tools[0].contains("function") &&
+                tparams->rerot_chat_tools[0].at("function").contains("name") &&
+                tparams->rerot_chat_tools[0].at("function").at("name") == rerot_internal_tool_name("become") &&
+                chat_params.tmpls && chat_params.use_jinja && !slot.prompt.tokens.has_mtmd) {
+                std::vector<common_chat_msg> messages;
+                try {
+                    messages = rerot_slot_chat_messages(slot);
+                } catch (...) {
+                    messages.clear();
+                }
+                if (!messages.empty()) {
+                    common_chat_templates_inputs no_tools;
+                    rerot_fill_chat_inputs(no_tools, slot, /* advertise_tools */ false);
+                    no_tools.messages = std::move(messages);
+                    std::string no_tools_prompt;
+                    try {
+                        no_tools_prompt = common_chat_templates_apply(chat_params.tmpls.get(), no_tools).prompt;
+                    } catch (...) {
+                        no_tools_prompt.clear();
+                    }
+                    if (!no_tools_prompt.empty()) {
+                        llama_tokens without_tokens = rerot_tokenize_injection(no_tools_prompt);
+                        llama_tokens with_tokens;
+                        with_tokens.reserve(slot.prompt.tokens.size());
+                        for (size_t i = 0; i < slot.prompt.tokens.size(); ++i) {
+                            if (slot.prompt.tokens[i] != LLAMA_TOKEN_NULL) {
+                                with_tokens.push_back(slot.prompt.tokens[i]);
+                            }
+                        }
+                        // The template inserts the # Tools block as one
+                        // contiguous chunk: the no-tools render shares a
+                        // token prefix AND token suffix with the C0 render.
+                        // The gap between the two LCPs is the advertised-tool
+                        // range. A render that does not fit that shape (no
+                        // shared suffix, or an inverted gap) leaves the
+                        // episode without an occlusion range — best-effort.
+                        size_t pre = 0;
+                        while (pre < without_tokens.size() && pre < with_tokens.size() &&
+                               without_tokens[pre] == with_tokens[pre]) {
+                            ++pre;
+                        }
+                        size_t suffix = 0;
+                        while (suffix < without_tokens.size() - pre &&
+                               suffix < with_tokens.size() - pre &&
+                               without_tokens[without_tokens.size() - 1 - suffix] ==
+                                   with_tokens[with_tokens.size() - 1 - suffix]) {
+                            ++suffix;
+                        }
+                        const llama_pos c0_n = episode->c0.n_prompt_tokens;
+                        const size_t tail_base = with_tokens.size() - suffix;
+                        if (suffix > 0 && pre < tail_base && tail_base <= (size_t) c0_n &&
+                            with_tokens.size() == (size_t) c0_n) {
+                            episode->tools_ad_begin = (llama_pos) pre;
+                            episode->tools_ad_end   = (llama_pos) tail_base;
+                            SRV_INF("RERoT tools-ad occlusion range: episode=%" PRIu64 " tokens=[%d, %d)\n",
+                                slot.rerot_episode_id,
+                                (int) episode->tools_ad_begin,
+                                (int) episode->tools_ad_end);
+                        }
+                    }
+                }
+            }
+        }
+
         episode->probing = true;
         episode->strategy_decided = false;
         if (rerot_prof_first_root) {
@@ -3264,6 +3349,32 @@ private:
             rerot->hard_abort(episode_id, "rerot_resource_exhausted: isolated probe sequence unavailable");
             rerot_propagate_hard_abort();
             return false;
+        }
+        // Become-leak fix: the probe's COW copy of C0 still carries the
+        // idempotently advertised internal-tool cells (the tools clearing on
+        // root_lane_task only affects fresh renders, not inherited KV). Drop
+        // the advertised range from the probe's membership: shared cells
+        // only lose this sequence's reference, C0 is untouched, positions
+        // of the remaining cells are unchanged. The probe is discarded after
+        // the plan, so the attention/recurrent divergence this creates inside
+        // the probe never leaves the episode.
+        {
+            auto * episode_ptr = rerot->episode(episode_id);
+            if (episode_ptr && episode_ptr->tools_ad_begin >= 0 &&
+                episode_ptr->tools_ad_end > episode_ptr->tools_ad_begin) {
+                llama_memory_t memory = llama_get_memory(ctx_tgt);
+                if (memory &&
+                    !llama_memory_seq_rm_attention(
+                        memory, episode_ptr->probe_seq,
+                        episode_ptr->tools_ad_begin, episode_ptr->tools_ad_end)) {
+                    rerot->hard_abort(episode_id, "rerot_state_error: failed to occlude tools range from probe");
+                    rerot_propagate_hard_abort();
+                    return false;
+                }
+                SRV_INF("RERoT probe tools-ad occluded: episode=%" PRIu64 " seq=%d range=[%d, %d)\n",
+                    episode_id, (int) episode_ptr->probe_seq,
+                    (int) episode_ptr->tools_ad_begin, (int) episode_ptr->tools_ad_end);
+            }
         }
         {
             auto * root = rerot->node(episode_id, 0);

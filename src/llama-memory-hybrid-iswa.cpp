@@ -354,6 +354,11 @@ void llama_memory_hybrid_iswa::rerot_clear_reader_view(llama_seq_id seq_id) {
     mem_attn->rerot_clear_reader_view(seq_id);
 }
 
+bool llama_memory_hybrid_iswa::rerot_occlude_base_range(
+        llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) {
+    return mem_attn->rerot_occlude_base_range(seq_id, pos_begin, pos_end);
+}
+
 void llama_memory_hybrid_iswa::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);

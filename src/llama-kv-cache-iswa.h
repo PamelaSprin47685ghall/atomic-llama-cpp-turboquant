@@ -100,6 +100,7 @@ public:
         llama_seq_id seq_id) override;
     bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
     void rerot_clear_reader_view(llama_seq_id seq_id) override;
+    bool rerot_occlude_base_range(llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) override;
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;

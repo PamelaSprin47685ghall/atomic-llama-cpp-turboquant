@@ -6424,8 +6424,15 @@ bool llama_kv_cache::rerot_set_reader_view(
         return false;
     }
 
+    // Preserve a previously installed base occlusion across view updates:
+    // the occluded range is a property of the C0 prompt (fixed for the
+    // episode), while the view is re-installed per stage transition.
+    const auto keep_occlude = rerot_reader_views[seq_id].occlude_base;
     rerot_reader_views[seq_id] = view;
     rerot_reader_views[seq_id].seq_id = seq_id;
+    if (view.occlude_base.first < 0 && keep_occlude.first >= 0) {
+        rerot_reader_views[seq_id].occlude_base = keep_occlude;
+    }
     fp_bump();
     return true;
 }
@@ -6435,6 +6442,28 @@ void llama_kv_cache::rerot_clear_reader_view(llama_seq_id seq_id) {
         rerot_reader_views[seq_id].reset();
         fp_bump();
     }
+}
+
+bool llama_kv_cache::rerot_occlude_base_range(
+        llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) {
+    if (seq_id < 0 || (size_t) seq_id >= rerot_reader_views.size()) {
+        return false;
+    }
+    auto & view = rerot_reader_views[seq_id];
+    if (!view.active()) {
+        return false;
+    }
+    // An inverted/empty range is the clear form; a valid range must be a
+    // non-empty, ordered half-open interval. Only untagged base rows are
+    // ever dropped (the builders apply the range solely on the untagged
+    // arm), so no tagged-episode validation is needed here.
+    if (pos_begin >= 0 && pos_end > pos_begin) {
+        view.occlude_base = { pos_begin, pos_end };
+    } else {
+        view.occlude_base = { -1, -1 };
+    }
+    fp_bump();
+    return true;
 }
 
 bool llama_kv_cache::rerot_batch_active(const llama_ubatch & ubatch) const {

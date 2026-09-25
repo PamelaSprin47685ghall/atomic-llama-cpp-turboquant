@@ -1269,7 +1269,9 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
             if (!meta.active()) {
                 // Untagged arm: owned rows are causally gated; foreign
                 // untagged rows are never visible to this reader.
-                if (key.owned_by_reader) {
+                // Base occlusion (become-leak fix) mirrors the multi-reader
+                // builder: occluded prompt ranges are invisible to this reader.
+                if (key.owned_by_reader && !reader.occludes(key.storage_pos)) {
                     base.push_back(&key);
                 }
                 continue;
@@ -2578,7 +2580,11 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
         // stable order).
         std::vector<uint32_t> base;
         for (const uint32_t ki : untagged_sorted) {
-            if (owned(ki)) {
+            // KV-level base occlusion (become-leak fix): a reader with an
+            // occluded C0 range never sees the untagged prompt keys inside
+            // it — the planner/synthesis views drop the advertised
+            // internal-tool schema while workers keep it.
+            if (owned(ki) && !reader.occludes(keys_ref[ki].storage_pos)) {
                 base.push_back(ki);
             }
         }
@@ -3128,7 +3134,9 @@ llama_rerot_query_layout llama_rerot_build_query_layout(
             // Ordinary prefix/private history is governed by stock sequence
             // ownership and causal position. RERoT-written cells are always
             // tagged, so this does not accidentally expose foreign lanes.
-            if (key.owned_by_reader && key.storage_pos <= query_storage_pos) {
+            // Base occlusion (become-leak fix) mirrors the batched builders.
+            if (key.owned_by_reader && key.storage_pos <= query_storage_pos &&
+                !reader.occludes(key.storage_pos)) {
                 base.push_back({ &key, 0, true, 0 });
             }
             continue;

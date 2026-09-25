@@ -613,7 +613,15 @@ struct server_rerot_episode {
     llama_rerot_node_id synthesis_node = LLAMA_REROT_NODE_INVALID;
     mutable int64_t t_synthesis_eligible_us = 0;
     std::string source_end_marker;
-    std::string think_start_marker = "<think>";
+    std::string think_start_marker = "·";
+    // KV-level occlusion range of the idempotently advertised internal-handoff
+    // tool inside the C0 prompt (become-leak fix, RERoT.md 22.6): [begin, end)
+    // in C0 storage positions, or begin < 0 when absent/not applicable. The
+    // planner probe drops the range from its private KV copy and the
+    // synthesis view occludes it in the layout; worker views keep it (the
+    // tool schema is what anchors worker identity, 22.5).
+    llama_pos tools_ad_begin = -1;
+    llama_pos tools_ad_end = -1;
     // DSL text sampled by the in-flight routing probe. Starts empty: the
     // teacher-forced prompt never enters it and never enters the grammar.
     std::string probe_bytes;

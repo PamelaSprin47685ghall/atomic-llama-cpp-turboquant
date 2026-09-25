@@ -458,6 +458,7 @@ public:
 
     bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
     void rerot_clear_reader_view(llama_seq_id seq_id) override;
+    bool rerot_occlude_base_range(llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) override;
 
     // Build the indexed, query-grouped layout consumed by the backend-neutral
     // RERoT attention op. The returned key indices address the K/V view for the

@@ -455,6 +455,20 @@ public:
         GGML_UNUSED(seq_id);
     }
 
+    // KV-level occlusion of an untagged base-prompt position range for one
+    // reader sequence (become-leak fix, RERoT.md 22.6): the layout builders
+    // drop every untagged base key whose storage position lies in
+    // [pos_begin, pos_end) from this sequence's reader view. Only the
+    // pre-episode prompt can be occluded; tagged (episode) rows are never
+    // affected. An empty range (pos_begin < 0) clears any previous occlusion
+    // for the sequence. Positions and other readers are untouched.
+    virtual bool rerot_occlude_base_range(llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(pos_begin);
+        GGML_UNUSED(pos_end);
+        return false;
+    }
+
     // Shared fork hand seed (§16.1, §16.4, §B.6.4)
     virtual size_t rerot_hand_seed_size(llama_seq_id source_seq) const {
         GGML_UNUSED(source_seq);

@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -192,6 +193,24 @@ struct llama_rerot_reader_state {
     std::vector<llama_rerot_run_id> ordered_runs;
     llama_seq_id seq_id = -1;
 
+    // KV-level occlusion of a base-prompt token range (2026-09-26 become-leak
+    // fix). The idempotently advertised internal-handoff tool lives in the C0
+    // prompt; workers must read its schema, but the planner probe and the
+    // synthesis lane must not (the probe copies the instruction into its plan
+    // and the synthesis lane has imitated the tool-call shape in its public
+    // stream, spelling the reserved marker character-by-character past the
+    // token-level sampling ban; see RERoT.md 22.6). A non-empty range drops
+    // every untagged base key whose storage position falls inside it from
+    // THIS reader's layout; positions and all other readers are untouched.
+    // Tagged (episode) rows are never affected: the range is only ever a
+    // sub-range of the pre-episode prompt.
+    std::pair<llama_pos, llama_pos> occlude_base = { -1, -1 };
+
+    bool occludes(llama_pos storage_pos) const {
+        return occlude_base.first >= 0 && storage_pos >= occlude_base.first &&
+               storage_pos < occlude_base.second;
+    }
+
     void reset() {
         episode_id = 0;
         reader = LLAMA_REROT_NODE_INVALID;
@@ -203,6 +222,7 @@ struct llama_rerot_reader_state {
         frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
         ordered_runs.clear();
         seq_id = -1;
+        occlude_base = { -1, -1 };
     }
 
     bool active() const {

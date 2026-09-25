@@ -350,6 +350,11 @@ void llama_memory_hybrid::rerot_clear_reader_view(llama_seq_id seq_id) {
     mem_attn->rerot_clear_reader_view(seq_id);
 }
 
+bool llama_memory_hybrid::rerot_occlude_base_range(
+        llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) {
+    return mem_attn->rerot_occlude_base_range(seq_id, pos_begin, pos_end);
+}
+
 size_t llama_memory_hybrid::rerot_hand_seed_size(llama_seq_id source_seq) const {
     return mem_recr ? mem_recr->rerot_hand_seed_size(source_seq) : 0;
 }
