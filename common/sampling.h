@@ -49,6 +49,11 @@ void                    common_sampler_accept(struct common_sampler * gsmpl, lla
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 
+// Clone only durable sampling state: grammar, reasoning budget, sampler-chain
+// state (including RNG), and accepted-token history. The current candidate
+// array is decode-local scratch and is deliberately not retained.
+struct common_sampler * common_sampler_clone_checkpoint(const struct common_sampler * gsmpl);
+
 // Append an additional constraint to an existing grammar sampler. Takes
 // ownership of extra; both constraints receive every generated token and
 // are cloned/reset together. Used by stateful wire constraints that GBNF

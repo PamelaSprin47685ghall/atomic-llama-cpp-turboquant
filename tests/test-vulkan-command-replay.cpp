@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define CHECK_CLOSE(val_gpu, val_cpu, tol) do { \
@@ -3640,6 +3641,430 @@ static void test_skinny_distinct_inputs(test_env & env) {
     printf("test_skinny_distinct_inputs PASSED: distinct projections and changed inputs across cold execution and replay.\n");
 }
 
+static void test_argmax_hierarchical_replay(test_env & env) {
+    printf("Running test_argmax_hierarchical_replay...\n");
+
+    ggml_backend_reg_t reg_gpu = ggml_backend_reg_by_name("Vulkan");
+    TEST_ASSERT(reg_gpu != nullptr);
+    ggml_backend_dev_t dev_gpu = ggml_backend_reg_dev_get(reg_gpu, 0);
+    TEST_ASSERT(dev_gpu != nullptr);
+
+    const char * orig_env = getenv("GGML_VK_ARGMAX_HIERARCHICAL");
+    std::string saved_env = orig_env ? orig_env : "";
+    bool had_env = (orig_env != nullptr);
+
+    setenv("GGML_VK_ARGMAX_HIERARCHICAL", "0", 1);
+    ggml_backend_t backend_gpu_ref = ggml_backend_dev_init(dev_gpu, nullptr);
+    TEST_ASSERT(backend_gpu_ref != nullptr);
+
+    if (had_env) {
+        setenv("GGML_VK_ARGMAX_HIERARCHICAL", saved_env.c_str(), 1);
+    } else {
+        unsetenv("GGML_VK_ARGMAX_HIERARCHICAL");
+    }
+
+    auto run_argmax_test = [&](const char * desc,
+                               int64_t cols, int64_t rows,
+                               const std::vector<std::vector<float>> & row_data,
+                               const std::vector<int32_t> & expected_ids,
+                               bool check_expected) {
+        TEST_ASSERT(rows == (int64_t)row_data.size());
+        TEST_ASSERT(!check_expected || rows == (int64_t)expected_ids.size());
+
+        struct ggml_init_params params = { 128 * 1024 + (size_t)rows * 1024, nullptr, true };
+
+        struct ggml_context * ctx_opt = ggml_init(params);
+        struct ggml_tensor  * a_opt   = ggml_new_tensor_2d(ctx_opt, GGML_TYPE_F32, cols, rows);
+        ggml_set_input(a_opt);
+        struct ggml_tensor  * out_opt = ggml_argmax(ctx_opt, a_opt);
+        ggml_set_output(out_opt);
+        struct ggml_cgraph  * gf_opt  = ggml_new_graph_custom(ctx_opt, 16, false);
+        ggml_build_forward_expand(gf_opt, out_opt);
+        ggml_backend_buffer_t buf_opt = ggml_backend_alloc_ctx_tensors(ctx_opt, env.backend_gpu);
+        TEST_ASSERT(buf_opt != nullptr);
+
+        struct ggml_context * ctx_ref = ggml_init(params);
+        struct ggml_tensor  * a_ref   = ggml_new_tensor_2d(ctx_ref, GGML_TYPE_F32, cols, rows);
+        ggml_set_input(a_ref);
+        struct ggml_tensor  * out_ref = ggml_argmax(ctx_ref, a_ref);
+        ggml_set_output(out_ref);
+        struct ggml_cgraph  * gf_ref  = ggml_new_graph_custom(ctx_ref, 16, false);
+        ggml_build_forward_expand(gf_ref, out_ref);
+        ggml_backend_buffer_t buf_ref = ggml_backend_alloc_ctx_tensors(ctx_ref, backend_gpu_ref);
+        TEST_ASSERT(buf_ref != nullptr);
+
+        std::vector<float> flat_data((size_t)(cols * rows));
+        for (int64_t r = 0; r < rows; ++r) {
+            TEST_ASSERT((int64_t)row_data[r].size() == cols);
+            memcpy(flat_data.data() + r * cols, row_data[r].data(), cols * sizeof(float));
+        }
+
+        ggml_backend_tensor_set(a_opt, flat_data.data(), 0, flat_data.size() * sizeof(float));
+        ggml_backend_tensor_set(a_ref, flat_data.data(), 0, flat_data.size() * sizeof(float));
+
+        CHECK_STATUS(ggml_backend_graph_compute(env.backend_gpu, gf_opt), desc);
+        CHECK_STATUS(ggml_backend_graph_compute(backend_gpu_ref, gf_ref), desc);
+
+        std::vector<int32_t> res_opt(rows);
+        std::vector<int32_t> res_ref(rows);
+        ggml_backend_tensor_get(out_opt, res_opt.data(), 0, rows * sizeof(int32_t));
+        ggml_backend_tensor_get(out_ref, res_ref.data(), 0, rows * sizeof(int32_t));
+
+        for (int64_t r = 0; r < rows; ++r) {
+            if (res_opt[r] != res_ref[r]) {
+                fprintf(stderr, "ARGMAX MISMATCH in %s at row %lld: opt=%d, ref=%d\n",
+                        desc, (long long)r, res_opt[r], res_ref[r]);
+                TEST_ASSERT(res_opt[r] == res_ref[r]);
+            }
+            if (check_expected) {
+                if (res_opt[r] != expected_ids[r]) {
+                    fprintf(stderr, "ARGMAX UNEXPECTED in %s at row %lld: opt=%d, expected=%d\n",
+                            desc, (long long)r, res_opt[r], expected_ids[r]);
+                    TEST_ASSERT(res_opt[r] == expected_ids[r]);
+                }
+            }
+        }
+
+        ggml_backend_buffer_free(buf_opt);
+        ggml_backend_buffer_free(buf_ref);
+        ggml_free(ctx_opt);
+        ggml_free(ctx_ref);
+    };
+
+    {
+        const int64_t cols = 2048;
+        const int64_t rows = 2;
+        std::vector<std::vector<float>> data(rows, std::vector<float>(cols, -1.0f));
+        data[0][42] = 100.0f;
+        data[1][2000] = 50.0f;
+        std::vector<int32_t> expected = { 42, 2000 };
+        run_argmax_test("small-row fallback (cols=2048)", cols, rows, data, expected, true);
+    }
+
+    {
+        const int64_t cols = 248320;
+        const int64_t rows = 3;
+        std::vector<std::vector<float>> data(rows);
+        for (int64_t r = 0; r < rows; ++r) {
+            data[r].resize(cols);
+            for (int64_t c = 0; c < cols; ++c) {
+                data[r][c] = -10.0f - (float)(c % 17) * 0.1f;
+            }
+        }
+        data[0][123] = 500.0f;
+        data[1][125000] = 750.0f;
+        data[2][248315] = 999.0f;
+        std::vector<int32_t> expected = { 123, 125000, 248315 };
+        run_argmax_test("large 248320 row unique max", cols, rows, data, expected, true);
+    }
+
+    {
+        const int64_t cols = 248327;
+        const int64_t rows = 2;
+        std::vector<std::vector<float>> data(rows);
+        for (int64_t r = 0; r < rows; ++r) {
+            data[r].resize(cols);
+            for (int64_t c = 0; c < cols; ++c) {
+                data[r][c] = -5.0f;
+            }
+        }
+        data[0][248326] = 1234.0f;
+        data[1][100000] = 5678.0f;
+        std::vector<int32_t> expected = { 248326, 100000 };
+        run_argmax_test("nonaligned 248327 row outputs", cols, rows, data, expected, true);
+    }
+
+    {
+        const int64_t cols = 65536;
+        const int64_t rows = 3;
+        std::vector<std::vector<float>> data(rows, std::vector<float>(cols, -10.0f));
+        data[0][2048 + 5]  = 50.0f;
+        data[0][10240 + 5] = 50.0f;
+        data[0][40960 + 5] = 50.0f;
+
+        data[1][3]  = 80.0f;
+        data[1][7]  = 80.0f;
+        data[1][15] = 80.0f;
+
+        std::fill(data[2].begin(), data[2].end(), 1.0f);
+
+        run_argmax_test("ties across chunks and lane priorities", cols, rows, data, {}, false);
+    }
+
+    {
+        const int64_t cols = 32768;
+        const int64_t rows = 2;
+        std::vector<std::vector<float>> data(rows);
+        data[0].resize(cols, -0.0f);
+        data[0][5000] = +0.0f;
+        data[1].resize(cols, -1.0f);
+        data[1][0] = -0.0f;
+        data[1][10000] = +0.0f;
+
+        run_argmax_test("signed-zero ties", cols, rows, data, {}, false);
+    }
+
+    {
+        const int64_t cols = 32768;
+        const int64_t rows = 4;
+        std::vector<std::vector<float>> data(rows, std::vector<float>(cols, 0.0f));
+
+        const float qnan = std::numeric_limits<float>::quiet_NaN();
+
+        data[0][0] = qnan;
+        data[0][100] = 50.0f;
+        data[0][20000] = 75.0f;
+
+        data[1][500] = 100.0f;
+        data[1][2048] = qnan;
+        data[1][15000] = qnan;
+
+        std::fill(data[2].begin(), data[2].end(), qnan);
+
+        for (int64_t c = 0; c < cols; ++c) {
+            data[3][c] = (c % 13 == 0) ? qnan : -2.0f;
+        }
+        data[3][4000] = 10.0f;
+
+        run_argmax_test("NaN in initial/later positions and all-NaN", cols, rows, data, {}, false);
+    }
+
+    {
+        const int64_t cols = 32768;
+        const int64_t rows = 4;
+        const float inf_pos = std::numeric_limits<float>::infinity();
+        const float inf_neg = -std::numeric_limits<float>::infinity();
+        std::vector<std::vector<float>> data(rows, std::vector<float>(cols, 0.0f));
+
+        data[0][15555] = inf_pos;
+
+        data[1][100] = inf_pos;
+        data[1][5000] = inf_pos;
+
+        std::fill(data[2].begin(), data[2].end(), inf_neg);
+
+        std::fill(data[3].begin(), data[3].end(), inf_neg);
+        data[3][7777] = -50.0f;
+
+        run_argmax_test("+/-Inf and all -Inf", cols, rows, data, {}, false);
+    }
+
+    {
+        const int64_t colsA = 32768;
+        const int64_t colsB = 65536;
+        const int64_t rows = 2;
+
+        struct ggml_init_params params = { 256 * 1024, nullptr, true };
+        struct ggml_context * ctx = ggml_init(params);
+        struct ggml_tensor  * a   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, colsA, rows);
+        struct ggml_tensor  * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, colsB, rows);
+        ggml_set_input(a);
+        ggml_set_input(b);
+
+        struct ggml_tensor  * outA = ggml_argmax(ctx, a);
+        struct ggml_tensor  * outB = ggml_argmax(ctx, b);
+        ggml_set_output(outA);
+        ggml_set_output(outB);
+
+        struct ggml_tensor  * a_sub = ggml_view_1d(ctx, a, 16, 0);
+        struct ggml_tensor  * b_sub = ggml_view_1d(ctx, b, 16, 0);
+        struct ggml_tensor  * out_sum = ggml_add(ctx, a_sub, b_sub);
+        ggml_set_output(out_sum);
+
+        struct ggml_cgraph  * gf = ggml_new_graph_custom(ctx, 32, false);
+        ggml_build_forward_expand(gf, outA);
+        ggml_build_forward_expand(gf, outB);
+        ggml_build_forward_expand(gf, out_sum);
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, env.backend_gpu);
+        TEST_ASSERT(buf != nullptr);
+
+        std::vector<float> a_data(colsA * rows, 0.0f);
+        std::vector<float> b_data(colsB * rows, 0.0f);
+
+        uint64_t hits_before = 0, misses_before = 0;
+        env.get_stats(env.backend_gpu, &hits_before, &misses_before);
+
+        for (int iter = 0; iter < 4; ++iter) {
+            std::fill(a_data.begin(), a_data.end(), -1.0f);
+            std::fill(b_data.begin(), b_data.end(), -2.0f);
+
+            int32_t expected_a0 = 100 + iter * 50;
+            int32_t expected_a1 = 1000 + iter * 100;
+            int32_t expected_b0 = 5000 + iter * 200;
+            int32_t expected_b1 = 20000 + iter * 300;
+
+            a_data[expected_a0] = 1000.0f;
+            a_data[colsA + expected_a1] = 2000.0f;
+            b_data[expected_b0] = 3000.0f;
+            b_data[colsB + expected_b1] = 4000.0f;
+
+            for (int i = 0; i < 16; ++i) {
+                a_data[i] = (float)(i + iter);
+                b_data[i] = (float)(iter * 2);
+            }
+
+            ggml_backend_tensor_set(a, a_data.data(), 0, a_data.size() * sizeof(float));
+            ggml_backend_tensor_set(b, b_data.data(), 0, b_data.size() * sizeof(float));
+
+            CHECK_STATUS(ggml_backend_graph_compute(env.backend_gpu, gf), "two independent argmax nodes");
+
+            std::vector<int32_t> resA(rows);
+            std::vector<int32_t> resB(rows);
+            std::vector<float>   res_sum(16);
+            ggml_backend_tensor_get(outA, resA.data(), 0, rows * sizeof(int32_t));
+            ggml_backend_tensor_get(outB, resB.data(), 0, rows * sizeof(int32_t));
+            ggml_backend_tensor_get(out_sum, res_sum.data(), 0, 16 * sizeof(float));
+
+            TEST_ASSERT(resA[0] == expected_a0);
+            TEST_ASSERT(resA[1] == expected_a1);
+            TEST_ASSERT(resB[0] == expected_b0);
+            TEST_ASSERT(resB[1] == expected_b1);
+
+            for (int i = 0; i < 16; ++i) {
+                CHECK_CLOSE(res_sum[i], (float)(i + iter + iter * 2), 1e-4f);
+            }
+        }
+
+        uint64_t hits_after = 0, misses_after = 0;
+        env.get_stats(env.backend_gpu, &hits_after, &misses_after);
+        TEST_ASSERT(hits_after > hits_before);
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    {
+        // Scratch growth lifecycle: use a fresh optimized backend so preceding test cases have not already
+        // expanded the scratch allocation. Backend init reserves min prealloc_size_split_k = 1 MiB.
+        // We scope GGML_VK_UBATCH=1 and GGML_VK_N_PARALLEL=1 for the dedicated backend lifetime
+        // (and restore afterward) so envelope starts at 1 MiB.
+        // Graph 2 uses width 248327, rows 272 => 243 chunks * 16 bytes * 272 rows = 1,057,536 bytes (>1 MiB),
+        // forcing real dynamic growth of prealloc_split_k.
+        const char * orig_ubatch = getenv("GGML_VK_UBATCH");
+        std::string saved_ubatch = orig_ubatch ? orig_ubatch : "";
+        bool had_ubatch = (orig_ubatch != nullptr);
+
+        const char * orig_parallel = getenv("GGML_VK_N_PARALLEL");
+        std::string saved_parallel = orig_parallel ? orig_parallel : "";
+        bool had_parallel = (orig_parallel != nullptr);
+
+        setenv("GGML_VK_UBATCH", "1", 1);
+        setenv("GGML_VK_N_PARALLEL", "1", 1);
+        setenv("GGML_VK_ARGMAX_HIERARCHICAL", "1", 1);
+        ggml_backend_t backend_growth = ggml_backend_dev_init(dev_gpu, nullptr);
+        TEST_ASSERT(backend_growth != nullptr);
+
+        // Graph 1: width 32768, rows 1 (hierarchical)
+        struct ggml_init_params params1 = { 128 * 1024, nullptr, true };
+        struct ggml_context * ctx1 = ggml_init(params1);
+        struct ggml_tensor  * a1   = ggml_new_tensor_2d(ctx1, GGML_TYPE_F32, 32768, 1);
+        ggml_set_input(a1);
+        struct ggml_tensor  * out1 = ggml_argmax(ctx1, a1);
+        ggml_set_output(out1);
+        struct ggml_cgraph  * gf1  = ggml_new_graph_custom(ctx1, 16, false);
+        ggml_build_forward_expand(gf1, out1);
+        ggml_backend_buffer_t buf1 = ggml_backend_alloc_ctx_tensors(ctx1, backend_growth);
+        TEST_ASSERT(buf1 != nullptr);
+
+        // Graph 2: width 248327, rows 272 (exceeding 1 MiB partials scratch envelope)
+        const int64_t g2_cols = 248327;
+        const int64_t g2_rows = 272;
+        struct ggml_init_params params2 = { 256 * 1024 + (size_t)g2_rows * 1024, nullptr, true };
+        struct ggml_context * ctx2 = ggml_init(params2);
+        struct ggml_tensor  * a2   = ggml_new_tensor_2d(ctx2, GGML_TYPE_F32, g2_cols, g2_rows);
+        ggml_set_input(a2);
+        struct ggml_tensor  * out2 = ggml_argmax(ctx2, a2);
+        ggml_set_output(out2);
+        struct ggml_cgraph  * gf2  = ggml_new_graph_custom(ctx2, 16, false);
+        ggml_build_forward_expand(gf2, out2);
+        ggml_backend_buffer_t buf2 = ggml_backend_alloc_ctx_tensors(ctx2, backend_growth);
+        TEST_ASSERT(buf2 != nullptr);
+
+        std::vector<float> data1(32768, 0.0f);
+        data1[512] = 42.0f;
+        ggml_backend_tensor_set(a1, data1.data(), 0, data1.size() * sizeof(float));
+
+        CHECK_STATUS(ggml_backend_graph_compute(backend_growth, gf1), "graph1 initial compute");
+        int32_t res1 = -1;
+        ggml_backend_tensor_get(out1, &res1, 0, sizeof(int32_t));
+        TEST_ASSERT(res1 == 512);
+
+        std::vector<float> data2((size_t)(g2_cols * g2_rows), 0.0f);
+        for (int64_t r = 0; r < g2_rows; ++r) {
+            int64_t winner_pos = (100 * (r + 1)) % (g2_cols - 100);
+            data2[(size_t)r * g2_cols + winner_pos] = 50.0f + (float)r;
+        }
+        ggml_backend_tensor_set(a2, data2.data(), 0, data2.size() * sizeof(float));
+
+        CHECK_STATUS(ggml_backend_graph_compute(backend_growth, gf2), "graph2 compute (growth)");
+        std::vector<int32_t> res2(g2_rows, -1);
+        ggml_backend_tensor_get(out2, res2.data(), 0, g2_rows * sizeof(int32_t));
+        for (int64_t r = 0; r < g2_rows; ++r) {
+            int64_t winner_pos = (100 * (r + 1)) % (g2_cols - 100);
+            TEST_ASSERT(res2[r] == winner_pos);
+        }
+
+        // Replay Graph 1 with new input value (validating prior graph replay after growth)
+        data1[512] = 0.0f;
+        data1[9999] = 123.0f;
+        ggml_backend_tensor_set(a1, data1.data(), 0, data1.size() * sizeof(float));
+
+        CHECK_STATUS(ggml_backend_graph_compute(backend_growth, gf1), "graph1 replay after scratch growth");
+        res1 = -1;
+        ggml_backend_tensor_get(out1, &res1, 0, sizeof(int32_t));
+        TEST_ASSERT(res1 == 9999);
+
+        // Replay Graph 2 with new inputs (same-graph replay after growth)
+        for (int64_t r = 0; r < g2_rows; ++r) {
+            int64_t old_winner_pos = (100 * (r + 1)) % (g2_cols - 100);
+            int64_t new_winner_pos = g2_cols - 1 - (r % 500);
+            data2[(size_t)r * g2_cols + old_winner_pos] = 0.0f;
+            data2[(size_t)r * g2_cols + new_winner_pos] = 100.0f + (float)r;
+        }
+        ggml_backend_tensor_set(a2, data2.data(), 0, data2.size() * sizeof(float));
+
+        uint64_t g2_hits_before = 0;
+        env.get_stats(backend_growth, &g2_hits_before, nullptr);
+        CHECK_STATUS(ggml_backend_graph_compute(backend_growth, gf2), "graph2 replay");
+        uint64_t g2_hits_after = 0;
+        env.get_stats(backend_growth, &g2_hits_after, nullptr);
+        TEST_ASSERT(g2_hits_after > g2_hits_before);
+
+        ggml_backend_tensor_get(out2, res2.data(), 0, g2_rows * sizeof(int32_t));
+        for (int64_t r = 0; r < g2_rows; ++r) {
+            int64_t new_winner_pos = g2_cols - 1 - (r % 500);
+            TEST_ASSERT(res2[r] == new_winner_pos);
+        }
+
+        ggml_backend_buffer_free(buf1);
+        ggml_backend_buffer_free(buf2);
+        ggml_free(ctx1);
+        ggml_free(ctx2);
+        ggml_backend_free(backend_growth);
+
+        // Restore environment variables
+        if (had_ubatch) {
+            setenv("GGML_VK_UBATCH", saved_ubatch.c_str(), 1);
+        } else {
+            unsetenv("GGML_VK_UBATCH");
+        }
+        if (had_parallel) {
+            setenv("GGML_VK_N_PARALLEL", saved_parallel.c_str(), 1);
+        } else {
+            unsetenv("GGML_VK_N_PARALLEL");
+        }
+        if (had_env) {
+            setenv("GGML_VK_ARGMAX_HIERARCHICAL", saved_env.c_str(), 1);
+        } else {
+            unsetenv("GGML_VK_ARGMAX_HIERARCHICAL");
+        }
+    }
+
+    ggml_backend_free(backend_gpu_ref);
+    printf("test_argmax_hierarchical_replay PASSED: small fallback, wide/nonaligned rows, ties/signed-zero, NaN/Inf boundaries, multi-node and scratch growth replay.\n");
+}
+
 int main(int argc, char ** argv) {
     const bool transfer_only = argc == 2 && std::strcmp(argv[1], "--transfer-only") == 0;
     const bool snapshot_only              = argc == 2 && std::strcmp(argv[1], "--snapshot-only") == 0;
@@ -3658,20 +4083,26 @@ int main(int argc, char ** argv) {
     const bool attention_mmvq_only = argc == 2 && std::strcmp(argv[1], "--attention-mmvq-only") == 0;
     const bool attention_region_only      = argc == 2 && std::strcmp(argv[1], "--attention-region-only") == 0;
     const bool skinny_only = argc == 2 && std::strcmp(argv[1], "--skinny-only") == 0;
+    const bool argmax_only = argc == 2 && std::strcmp(argv[1], "--argmax-only") == 0;
     if (argc != 1 && !transfer_only && !snapshot_only && !moe_only && !moe_output_only && !gdn_only &&
         !gdn_cache_only && !staged_router_only && !router_gate_only && !rope_only && !rows_only && !hc_fold_only && !hc_combine_only &&
         !hc_variants_only &&
-        !attention_projections_only && !attention_mmvq_only && !attention_region_only && !skinny_only) {
+        !attention_projections_only && !attention_mmvq_only && !attention_region_only && !skinny_only && !argmax_only) {
         std::fprintf(stderr,
                      "Usage: %s "
                      "[--transfer-only|--snapshot-only|--moe-only|--moe-output-only|--gdn-only|--gdn-cache-only|--"
                      "staged-router-only|--router-gate-only|--rope-only|--rows-only|--hc-fold-only|--hc-combine-only|--hc-variants-only|--attention-"
-                     "projections-only|--attention-mmvq-only|--attention-region-only|--skinny-only]\n",
+                     "projections-only|--attention-mmvq-only|--attention-region-only|--skinny-only|--argmax-only]\n",
                      argv[0]);
         return 2;
     }
     // Enable Vulkan command replay for testing.
     setenv("GGML_VK_CMD_REPLAY", "1", 1);
+    if (argmax_only || argc == 1) {
+        // Explicitly force hierarchical argmax enabled for testing, so an external
+        // environment variable cannot cause opt and ref to both run in legacy mode.
+        setenv("GGML_VK_ARGMAX_HIERARCHICAL", "1", 1);
+    }
     if (attention_mmvq_only || skinny_only) {
         // Dedicated numerical regression, not a performance policy. Exercise
         // all implemented quantized members, including Q6_K on RDNA.
@@ -3767,6 +4198,10 @@ int main(int argc, char ** argv) {
         test_skinny_distinct_inputs(env);
         return 0;
     }
+    if (argmax_only) {
+        test_argmax_hierarchical_replay(env);
+        return 0;
+    }
 
     int tests_run = 0;
     test_alternating_inputs(env);          ++tests_run;
@@ -3809,6 +4244,8 @@ int main(int argc, char ** argv) {
     test_predefined_variable_rows_replay(env);
     ++tests_run;
     test_skinny_distinct_inputs(env);
+    ++tests_run;
+    test_argmax_hierarchical_replay(env);
     ++tests_run;
 
     printf("All Vulkan command replay observable integration tests completed successfully (%d tests ran).\n", tests_run);

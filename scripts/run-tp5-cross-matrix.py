@@ -291,11 +291,53 @@ def get_available_variants(model_path: str, mtp_model_path: str) -> Dict[str, Di
         "is_mtp": True,
         "requires_linear": True,
     }
+    variants["native-mtp-fused-default"] = {
+        "name": "native-mtp-fused-default",
+        "description": "Qualified fused MTP profile with no tuning environment or draft placement/horizon arguments",
+        "env": {"RADV_DEBUG": "nobolist"},
+        "cli_args": ["--tp5", "qwen4exp-af", "-md", mtp_model_path, "--spec-type", "draft-mtp"],
+        "expected_sync": "relay",
+        "expected_wire": "f32",
+        "expected_mmvq": "disabled",
+        "is_mtp": True,
+        "requires_linear": True,
+    }
     variants["native-mtp-serial-readback"] = {
         **variants["native-mtp-single-draft"],
         "name": "native-mtp-serial-readback",
         "description": "Same MTP binary with rank-local pinned readback disabled; one-factor W1 control",
         "env": dict(variants["native-mtp-single-draft"]["env"], GGML_META_ASYNC_READBACK="0"),
+    }
+    variants["native-mtp-reference"] = {
+        **variants["native-mtp-single-draft"],
+        "name": "native-mtp-reference",
+        "description": "Published n6 mirrored-attention configuration with legacy single-workgroup argmax",
+        "env": dict(variants["native-mtp-single-draft"]["env"],
+                    GGML_VK_ARGMAX_HIERARCHICAL="0", GGML_VK_SMALL_Q8_COLUMNS="0",
+                    GGML_TP5_REPLICATE_ATTN="1", GGML_TP5_QSA_HEADMAP="0", GGML_TP5_GDN_HEADMAP="0"),
+    }
+    variants["native-mtp-mapped"] = {
+        **variants["native-mtp-single-draft"],
+        "name": "native-mtp-mapped",
+        "description": "n6 with mapped QSA/GDN state, column-parallel small Q8 projections and hierarchical argmax",
+        "env": dict(variants["native-mtp-single-draft"]["env"],
+                    GGML_VK_ARGMAX_HIERARCHICAL="1", GGML_VK_SMALL_Q8_COLUMNS="1",
+                    GGML_MTP_KV_ONLY="0",
+                    GGML_TP5_REPLICATE_ATTN="0", GGML_TP5_QSA_HEADMAP="1", GGML_TP5_GDN_HEADMAP="1"),
+    }
+    variants["native-mtp-kv-only"] = {
+        **variants["native-mtp-mapped"],
+        "name": "native-mtp-kv-only",
+        "description": "Mapped n6 with explicit output-free K/V-only MTP catch-up",
+        "env": dict(variants["native-mtp-mapped"]["env"], GGML_MTP_KV_ONLY="1"),
+    }
+    mapped_wide_args = list(variants["native-mtp-mapped"]["cli_args"])
+    mapped_wide_args[mapped_wide_args.index("--spec-draft-n-max") + 1] = "16"
+    variants["native-mtp-mapped-n16"] = {
+        **variants["native-mtp-mapped"],
+        "name": "native-mtp-mapped-n16",
+        "description": "Mapped-state n16 candidate; ordinary projections and MoE have separate dispatch policies",
+        "cli_args": mapped_wide_args,
     }
     variants["native-mtp-bo-isolated"] = {
         **variants["native-mtp-single-draft"],

@@ -328,6 +328,7 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    bool    n_max_explicit = false; // preserve an explicit --spec-draft-n-max override
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -1261,7 +1262,8 @@ inline size_t common_rerot_scratch_reserve_bytes(const common_params & params) {
 void common_init();
 
 // Apply TP5 CLI selections to GGML_TP5_* environment (no-op when tp5.enabled is false).
-void common_tp5_apply_env(const common_params & params);
+// Qualified MTP requests also receive the verified runtime defaults unless callers override them.
+void common_tp5_apply_env(common_params & params);
 
 void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);

@@ -1,0 +1,123 @@
+#version 450
+
+#include "generic_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#define FLT_MAX 3.402823466e+38F
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+
+struct PartialRecord {
+    float max_val;
+    uint max_id;
+    uint count;
+    uint nonfinite;
+};
+
+layout (binding = 1) readonly buffer P {PartialRecord data_partials[];};
+layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+shared float tmpmax[BLOCK_SIZE];
+shared uint tmpid[BLOCK_SIZE];
+shared uint tmpcnt[BLOCK_SIZE];
+shared uint tmpnonfinite[BLOCK_SIZE];
+shared FLOAT_TYPE fallback_tmpmax[BLOCK_SIZE];
+shared uint fallback_tmp[BLOCK_SIZE];
+
+void main() {
+    const uint row = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (row >= p.KY) {
+        return;
+    }
+
+    const uint chunks_per_row = uint(p.param2);
+    const uint partials_offset = row * chunks_per_row;
+    float amax = -FLT_MAX;
+    uint acol = 0;
+    uint cnt = 0;
+    uint nonfinite = 0;
+
+    for (uint i = tid; i < chunks_per_row; i += BLOCK_SIZE) {
+        PartialRecord rec = data_partials[partials_offset + i];
+        nonfinite |= rec.nonfinite;
+        if (rec.max_val > amax) {
+            amax = rec.max_val;
+            acol = rec.max_id;
+            cnt = rec.count;
+        } else if (rec.max_val == amax && amax > -FLT_MAX) {
+            cnt = min(2u, cnt + rec.count);
+        }
+    }
+
+    tmpmax[tid] = amax;
+    tmpid[tid] = acol;
+    tmpcnt[tid] = cnt;
+    tmpnonfinite[tid] = nonfinite;
+
+    barrier();
+
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            uint other = tid + s;
+            tmpnonfinite[tid] |= tmpnonfinite[other];
+            if (tmpmax[other] > tmpmax[tid]) {
+                tmpmax[tid] = tmpmax[other];
+                tmpid[tid] = tmpid[other];
+                tmpcnt[tid] = tmpcnt[other];
+            } else if (tmpmax[other] == tmpmax[tid] && tmpmax[tid] > -FLT_MAX) {
+                tmpcnt[tid] = min(2u, tmpcnt[tid] + tmpcnt[other]);
+            }
+        }
+        barrier();
+    }
+
+    const bool is_fast = (tmpnonfinite[0] == 0) && (tmpcnt[0] == 1) && (tmpmax[0] > -FLT_MAX);
+    if (is_fast) {
+        if (tid == 0) {
+            data_d[row] = D_TYPE(tmpid[0]);
+        }
+        return;
+    }
+
+    barrier();
+
+    A_TYPE fb_amax = -FLT_MAX;
+    uint fb_acol = tid;
+    if (tid < p.KX) {
+        fb_amax = data_a[row*p.KX + tid];
+    }
+
+    for (uint i = tid + BLOCK_SIZE; i < p.KX; i += BLOCK_SIZE) {
+        A_TYPE val = data_a[row*p.KX + i];
+        if (val > fb_amax) {
+            fb_amax = val;
+            fb_acol = i;
+        }
+    }
+
+    fallback_tmp[tid] = fb_acol;
+    fallback_tmpmax[tid] = fb_amax;
+
+    barrier();
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < p.KX) {
+            if (fallback_tmpmax[tid] < fallback_tmpmax[tid + s]) {
+                fallback_tmpmax[tid] = fallback_tmpmax[tid + s];
+                fallback_tmp[tid] = fallback_tmp[tid + s];
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        data_d[row] = D_TYPE(fallback_tmp[0]);
+    }
+}

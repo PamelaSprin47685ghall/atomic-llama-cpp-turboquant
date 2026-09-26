@@ -994,6 +994,11 @@ llama_context::llama_context(
         }
     }
 
+    mtp_kv_only = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+    if (const char * kv_only = getenv("GGML_MTP_KV_ONLY")) {
+        mtp_kv_only = atoi(kv_only) != 0;
+    }
+
     {
         const char * LLAMA_TARGET_CAPACITY = getenv("LLAMA_TARGET_CAPACITY");
         predefined_target_enabled = LLAMA_TARGET_CAPACITY ? (atoi(LLAMA_TARGET_CAPACITY) != 0) : predefined_target_enabled;
@@ -2471,6 +2476,19 @@ llama_context::target_capacity_decision llama_context::evaluate_target_capacity_
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // No output consumer exists in native masked catch-up. Keep this a
+    // distinct graph identity; capacity execution and unmasked hidden output
+    // retain their existing contracts rather than borrowing a zero-row graph.
+    if (mtp_kv_only && model.arch == LLM_ARCH_QWEN4EXP &&
+        gtype == LLM_GRAPH_TYPE_DECODER_MTP && n_outputs == 0 &&
+        !cparams.embeddings && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE &&
+        (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) &&
+        !cparams.rerot_enabled && !predefined_capacity()) {
+        gtype = LLM_GRAPH_TYPE_DECODER_MTP_KV;
+        if (getenv("GGML_MTP_KV_AUDIT_DIR")) {
+            LLAMA_LOG_INFO("[mtp-kv-phase] rows=%u outputs=0\n", ubatch.n_tokens);
+        }
+    }
     predefined_frame_current_valid = false;
     predefined_capacity_rows_current = 0;
     predefined_capacity_outputs_current = 0;
