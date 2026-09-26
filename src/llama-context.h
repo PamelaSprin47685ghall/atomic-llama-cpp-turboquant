@@ -770,6 +770,8 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+    // Opt-in until native catch-up state equivalence is qualified.
+    bool mtp_kv_only = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

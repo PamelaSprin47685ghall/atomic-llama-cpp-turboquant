@@ -1101,6 +1101,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     tensor->ne[2] == tokens && tensor->ne[3] == sequences) {
                     ret.axis = GGML_BACKEND_SPLIT_AXIS_1;
                 } else if (tensor->view_offs >= scores_bytes &&
+                           (tensor->view_offs - scores_bytes) % (state_plane * sequences) == 0 &&
+                           tensor->ne[0] == width * width * heads && tensor->ne[1] == sequences &&
+                           tensor->ne[3] == 1 && tensor->nb[0] == sizeof(float) &&
+                           tensor->nb[1] == state_plane && tensor->nb[2] == state_plane * sequences &&
+                           tensor->view_offs + ggml_nbytes(tensor) <= ggml_nbytes(gdn)) {
+                    // Native rollback copies [flattened head state, sequence, snapshot].
+                    // Expand the V-head map into state elements without changing slot order.
+                    ret = ggml_meta_mapped_slice(v_ss, n_bufs, 0, heads, 0, width * width, 1);
+                } else if (tensor->view_offs >= scores_bytes &&
                            (tensor->view_offs - scores_bytes) % state_plane == 0 &&
                            tensor->ne[0] == width && tensor->ne[1] == width && tensor->ne[2] == heads &&
                            tensor->view_offs + ggml_nbytes(tensor) <= ggml_nbytes(gdn)) {
@@ -3486,9 +3495,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                    // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
-                    // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
+                if (ggml_op_is_empty(node->op) && node->view_src != nullptr &&
+                        node->view_src->op == GGML_OP_NONE &&
+                        !ggml_backend_buffer_is_meta(node->view_src->buffer) &&
+                        ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                    // External CPU views such as s_copy_main need no rank-local clone.
+                    // Host-backed Meta buffers still have virtual global addresses; CPY
+                    // and all other real operations must use their physical rank tensors.
                     bcj.nodes[i] = node;
                     continue;
                 }

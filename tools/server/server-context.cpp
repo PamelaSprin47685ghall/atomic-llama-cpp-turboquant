@@ -5728,6 +5728,9 @@ private:
 
         const bool is_resume = sleeping;
 
+        // Qualified MTP defaults determine draft horizon and placement; apply
+        // them before deriving the target output-row capacity.
+        common_tp5_apply_env(params);
         params_base = params;
         params_base.n_ctx_kv_reserve.clear();
         params_base.n_parallel_pp = 1;
@@ -10716,7 +10719,9 @@ private:
             // verify and try to accept the draft
             {
                 // save the sampler sampler state in case we need to restore it
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // The candidate array belongs to the preceding decode and is
+                // rebuilt before any sampler state can observe it again.
+                common_sampler_ptr smpl_save(common_sampler_clone_checkpoint(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);

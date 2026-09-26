@@ -3,6 +3,14 @@
 - GPU timing ledger 对 LateBind stage 单独报告 `p1_us` 与 `late_pre_us`，避免再把两者混成旧的 `producer_slot_us`；direct-host 实验同时打印 `direct=1`，便于下一轮严格拆账。
 # TP5：Qwen4EXP 在五张 RX 6800 上的 Vulkan 张量并行实现方案
 
+## 83 tok/s 融合配置资格（2026-09-26）
+
+融合源以已验证 82.779 tok/s MTP 配置为基座，保留五卡 RELAY/F32、W1 rank-local readback、单卡 n=6 draft、hierarchical ARGMAX、small-Q8、QSA/GDN headmap 与 K/V-only catch-up；只叠加 durable sampler checkpoint。已拒绝的 strict greedy candidate、host-hidden chain、device loop、direct GDN snapshot 和 CPU compact sampler 不进入该版本。
+
+同一重建基座、同一完整 `1..60`/prompt31/171-token/自然停止 workload 的五块 ABBA：基座 **83.45** Decode tok/s，融合 **83.41**，差 **−0.04**，95% CI **[−0.68,+0.60]**，非劣性下界 **0.9919 ≥ 0.99**；记录 `/var/tmp/tp5-mtp-100-20260925/fusion-checkpoint-abba5.json`。因此 checkpoint 保留为语义安全、无可测回退的融合成员，不宣称单独吞吐提升。
+
+无 TP5/MTP 调优环境、无草稿设备/horizon 参数的 fused-default canonical 亦逐字通过，`2076.556 ms / 82.35 Decode tok/s`；记录 `/var/tmp/tp5-mtp-100-20260925/fusion-default-smoke.json`。这仍不是 100 tok/s：尚未达到 `predicted_ms < 1710`。
+
 ## 正确性优先的 MTP 续做（2026-09-24）
 
 恢复分支与 WIP 已分别推送 `origin/fix/tp5-non-mtp-correctness` 和 `origin/wip/tp5-before-correctness-recovery-20260924`。续做分支为 `work/mtp-correctness-first`，不整包合入 WIP，也不把 RERoT 分支的未验证算法改动带入 TP5。

@@ -829,6 +829,136 @@ static void test_gdn_headmap_qkv_span_values() {
     ggml_backend_free(backend);
 }
 
+static void test_gdn_headmap_snapshot_bank(int64_t tokens, int64_t sequences, int64_t active) {
+    fprintf(stderr, "--- test_gdn_headmap_snapshot_bank T=%lld B=%lld A=%lld ---\n",
+            (long long) tokens, (long long) sequences, (long long) active);
+    headmap_env env;
+    auto params = llama_model_default_params();
+    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN4EXP, params));
+    model->hparams = make_hparams();
+    auto & ud = model->get_split_state_ud;
+    ud.model = model.get();
+    ud.n_devices = 5;
+    llama_tp5_error err;
+    ud.has_tp5_plan = llama_tp5_plan_build(model->hparams, 5, 248320, false, ud.tp5_plan, err);
+    TEST_ASSERT(ud.has_tp5_plan);
+    auto * cpu = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+    ggml_backend_dev_t devices[5] = { cpu, cpu, cpu, cpu, cpu };
+    auto * device = ggml_backend_meta_device(devices, 5, llama_meta_device_get_split_state, &ud);
+    ggml_backend_meta_set_local_node_hook(device, [](ggml_tensor * node, size_t rank, void * data) {
+        const auto * state = static_cast<llama_meta_device_get_split_state_userdata *>(data);
+        return llama_tp5_gdn_headmap_stamp(state->tp5_plan, rank, node);
+    });
+
+    const int64_t width = 128, heads = 48, qk_heads = 16, keep = tokens;
+    const int64_t channels = width * (2 * qk_heads + heads);
+    const int64_t state_elems = width * width * heads;
+    const int64_t written = active == 0 ? tokens : active;
+    std::vector<float> results[2];
+    std::vector<float> scores[2];
+    std::vector<float> selected_states[2];
+    for (int mode = 0; mode < 2; ++mode) {
+        auto backend = ggml_backend_dev_init(mode == 0 ? cpu : device, nullptr);
+        TEST_ASSERT(backend != nullptr);
+        auto * buft = ggml_backend_get_default_buffer_type(backend);
+        auto * weights = ggml_init({ 2 * 1024 * 1024, nullptr, true });
+        auto * compute = ggml_init({ 2 * 1024 * 1024, nullptr, true });
+        auto * qkv = ggml_new_tensor_2d(weights, GGML_TYPE_F32, 1, channels);
+        ggml_set_name(qkv, "blk.0.attn_qkv.weight");
+        auto * alpha = ggml_new_tensor_2d(weights, GGML_TYPE_F32, 1, heads);
+        ggml_set_name(alpha, "blk.0.ssm_alpha.weight");
+        auto * beta = ggml_new_tensor_2d(weights, GGML_TYPE_F32, 1, heads);
+        ggml_set_name(beta, "blk.0.ssm_beta.weight");
+        auto * input = ggml_new_tensor_2d(weights, GGML_TYPE_F32, 1, tokens * sequences);
+        ggml_set_name(input, "input");
+        auto * bank = ggml_new_tensor_2d(weights, GGML_TYPE_F32, state_elems, sequences * (keep + 2));
+        ggml_set_name(bank, "cache_s_l0");
+        auto * indices = ggml_new_tensor_1d(weights, GGML_TYPE_I32, written * sequences);
+        ggml_set_name(indices, "read_indices");
+        auto wbuf = ggml_backend_alloc_ctx_tensors_from_buft(weights, buft);
+        TEST_ASSERT(wbuf != nullptr);
+        ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        auto * projected = ggml_mul_mat(compute, qkv, input);
+        auto view_qkv = [&](int64_t count, int64_t offset) {
+            return ggml_view_4d(compute, projected, width, count, tokens, sequences,
+                    width * sizeof(float), channels * sizeof(float),
+                    channels * tokens * sizeof(float), offset * sizeof(float));
+        };
+        auto * q = view_qkv(qk_heads, 0);
+        auto * k = view_qkv(qk_heads, width * qk_heads);
+        auto * v = view_qkv(heads, 2 * width * qk_heads);
+        auto * g = ggml_reshape_4d(compute, ggml_mul_mat(compute, alpha, input), 1, heads, tokens, sequences);
+        auto * b = ggml_reshape_4d(compute, ggml_mul_mat(compute, beta, input), 1, heads, tokens, sequences);
+        auto * initial = ggml_view_4d(compute, bank, width, width, heads, sequences,
+                width * sizeof(float), width * width * sizeof(float), state_elems * sizeof(float), 0);
+        auto * gdn = ggml_gated_delta_net_ext(compute, q, k, v, g, b, initial, keep, active);
+        const size_t score_bytes = width * heads * tokens * sequences * sizeof(float);
+        auto * snapshots = ggml_view_3d(compute, gdn, state_elems, sequences, written,
+                state_elems * sizeof(float), state_elems * sequences * sizeof(float), score_bytes);
+        // Preserve the initial plane and a trailing guard; write all active rollback slots.
+        auto * destination = ggml_view_3d(compute, bank, state_elems, sequences, written,
+                state_elems * sizeof(float), state_elems * sequences * sizeof(float),
+                state_elems * sequences * sizeof(float));
+        auto * copied = ggml_cpy(compute, snapshots, destination);
+        auto * output = ggml_view_4d(compute, gdn, width, heads, tokens, sequences,
+                width * sizeof(float), width * heads * sizeof(float),
+                width * heads * tokens * sizeof(float), 0);
+        ggml_set_output(output);
+        auto * selected = ggml_get_rows(compute, bank, indices);
+        ggml_set_output(selected);
+        auto * graph = ggml_new_graph(compute);
+        ggml_build_forward_expand(graph, copied);
+        ggml_build_forward_expand(graph, output);
+        ggml_build_forward_expand(graph, selected);
+        auto allocator = ggml_gallocr_new(buft);
+        TEST_ASSERT(ggml_gallocr_alloc_graph(allocator, graph));
+
+        std::vector<float> qkv_data(channels), alpha_data(heads), beta_data(heads);
+        std::vector<float> input_data(tokens * sequences), bank_data(ggml_nelements(bank), -9.0f);
+        for (int64_t i = 0; i < channels; ++i) qkv_data[i] = float(i % 127 - 63) / 4096.0f;
+        for (int64_t h = 0; h < heads; ++h) {
+            alpha_data[h] = -float(h + 1) / 1024.0f;
+            beta_data[h] = float(h % 5 + 1) / 16.0f;
+        }
+        for (int64_t t = 0; t < tokens * sequences; ++t) input_data[t] = float(t + 1) / 16.0f;
+        for (int64_t i = 0; i < state_elems * sequences; ++i) bank_data[i] = float(i % 251 - 125) / 8192.0f;
+        ggml_backend_tensor_set(qkv, qkv_data.data(), 0, qkv_data.size() * sizeof(float));
+        ggml_backend_tensor_set(alpha, alpha_data.data(), 0, alpha_data.size() * sizeof(float));
+        ggml_backend_tensor_set(beta, beta_data.data(), 0, beta_data.size() * sizeof(float));
+        ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
+        ggml_backend_tensor_set(bank, bank_data.data(), 0, bank_data.size() * sizeof(float));
+        std::vector<int32_t> row_ids(written * sequences);
+        for (int64_t i = 0; i < written * sequences; ++i) row_ids[i] = int32_t(sequences + i);
+        ggml_backend_tensor_set(indices, row_ids.data(), 0, row_ids.size() * sizeof(int32_t));
+        TEST_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        results[mode].resize(bank_data.size());
+        scores[mode].resize(ggml_nelements(output));
+        selected_states[mode].resize(ggml_nelements(selected));
+        ggml_backend_tensor_get(bank, results[mode].data(), 0, ggml_nbytes(bank));
+        ggml_backend_tensor_get(output, scores[mode].data(), 0, ggml_nbytes(output));
+        ggml_backend_tensor_get(selected, selected_states[mode].data(), 0, ggml_nbytes(selected));
+        TEST_ASSERT(memcmp(selected_states[mode].data(), results[mode].data() + state_elems * sequences,
+                selected_states[mode].size() * sizeof(float)) == 0);
+        TEST_ASSERT(memcmp(results[mode].data(), bank_data.data(), state_elems * sequences * sizeof(float)) == 0);
+        const size_t untouched = state_elems * sequences * (written + 1);
+        TEST_ASSERT(memcmp(results[mode].data() + untouched, bank_data.data() + untouched,
+                (bank_data.size() - untouched) * sizeof(float)) == 0);
+        ggml_gallocr_free(allocator);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(compute);
+        ggml_free(weights);
+        ggml_backend_free(backend);
+    }
+    TEST_ASSERT(results[0] == results[1]);
+    TEST_ASSERT(selected_states[0] == selected_states[1]);
+    for (int64_t seq = 0; seq < sequences; ++seq) {
+        const size_t offset = seq * tokens * width * heads;
+        TEST_ASSERT(memcmp(scores[0].data() + offset, scores[1].data() + offset,
+                written * width * heads * sizeof(float)) == 0);
+    }
+}
+
 static void test_tp5_split_state_gdn_qkv(bool replicate_attention) {
     auto                         params = llama_model_default_params();
     std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN4EXP, params));
@@ -1601,6 +1731,9 @@ int main() {
     test_gdn_headmap_plan_tables();
     test_gdn_headmap_execution_cpu();
     test_gdn_headmap_qkv_span_values();
+    test_gdn_headmap_snapshot_bank(7, 1, 0);
+    test_gdn_headmap_snapshot_bank(17, 1, 0);
+    test_gdn_headmap_snapshot_bank(4, 2, 2);
     // QSA headmap fixture owns the opt-in flag: enable it only around its own
     // plan build so every other fixture keeps the native default layout.
     setenv("GGML_TP5_QSA_HEADMAP", "1", 1);
