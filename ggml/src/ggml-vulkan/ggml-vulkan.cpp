@@ -13876,13 +13876,20 @@ static bool ggml_vk_flash_attn_rerot_shmem_support(const vk_device & device, con
 // retain the single-head scalar path and its direct-load fallback.
 static bool ggml_vk_flash_attn_rerot_tune(const vk_device & device, uint32_t hsk, uint32_t hsv, uint32_t n_kv, ggml_type k_type, ggml_type v_type, uint32_t head_group, vk_fa_tuning_params & out) {
     vk_fa_tuning_params params = get_fa_tuning_params_scalar(device, hsk, hsv, 1, n_kv, k_type, v_type, true);
+    // Grouped heads is the DEFAULT since the 2026-09-26 qualification: a
+    // complete paired model run (Bonsai PQ2_0 / RX 6800 / thinking wire,
+    // seeds 777/12345/20260923 back-to-back) passed after the become-leak fix
+    // (KV-level tools-ad occlusion) and the force-seal slot-release fix --
+    // the two defects that had failed its earlier qualification were both
+    // elsewhere. Per-episode attention cost drops 18.7 s -> 4.2 s. Devices
+    // or shapes that cannot stage the group keep the single-head scalar path
+    // below. GGML_VK_REROT_GROUPED_HEADS=0 restores the Br=1 route for A/B.
     const char * grouped_env = getenv("GGML_VK_REROT_GROUPED_HEADS");
-    if (grouped_env && strcmp(grouped_env, "1") != 0) {
-        GGML_ABORT("GGML_VK_REROT_GROUPED_HEADS must be exactly '1' (got '%s')", grouped_env);
+    if (grouped_env && strcmp(grouped_env, "1") != 0 && strcmp(grouped_env, "0") != 0) {
+        GGML_ABORT("GGML_VK_REROT_GROUPED_HEADS must be '1' or '0' (got '%s')", grouped_env);
     }
-    // Preserve the historically validated Br=1 route until a complete
-    // paired model run qualifies grouped RERoT attention.
-    if (grouped_env && !params.disable_subgroups && params.subgroup_size > 0) {
+    const bool grouped_on = !grouped_env || strcmp(grouped_env, "1") == 0;
+    if (grouped_on && !params.disable_subgroups && params.subgroup_size > 0) {
         for (uint32_t heads = head_group; heads > 1; --heads) {
             if (head_group % heads != 0) {
                 continue;

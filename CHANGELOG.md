@@ -39,27 +39,37 @@ full-model correctness acceptance; repaired-model measurements are required.
   t/s at one lane). The matvec stays the decode path; the GEMM threshold is
   not widened.
 
-- **RERoT grouped-head attention measured: 5x cheaper attention, one
-  protocol failure in the paired model run; stays opt-in.** The
-  `GGML_VK_REROT_GROUPED_HEADS=1` path (one subgroup per Q head, KV tile
+- **RERoT grouped-head attention is now the DEFAULT.** The
+  `GGML_VK_REROT_GROUPED_HEADS path (one subgroup per Q head, KV tile
   staged once per GQA group) was qualified on a full episode for the first
   time. Attention cost drops from 18.7 s to 4.2 s per episode (per-call
-  460 us -> ~150 us effective at n_kv 5376) and the indexed shader's
-  efficiency gap versus ordinary FA narrows from 2.7x. Precision gates
-  pass on both paths (indexed error < 1.2e-7 vs F64; test-rerot-attn 0
-  failures). However the paired same-seed episode ends in a leaked
-  `<|fim_prefix|>become` tool call as the public answer (finish=tool_calls,
-  0/9 checklist) while the scalar path completes cleanly (finish=stop,
-  9/9) - deterministic across two runs each. The grouped shader is
-  numerically correct within F32 tolerance; the divergence is trajectory
-  chaos at temperature 1.0 re-exposing the become-leak failure mode that
-  RERoT.md 22.5 documents for the scalar path under other seeds. Per its own
-  qualification gate ("preserve the historically validated Br=1 route
-  until a complete paired model run qualifies grouped RERoT attention"),
-  the paired run failed, so Br=1 remains the default and the env flag
-  stays opt-in. The protocol-level fix (final fence must reject a public
-  answer that is an internal tool call) is independent of the attention
-  path and is recorded in RERoT.md as an open defect.
+  460 us -> ~150-200 us at n_kv 4-5k) and the indexed shader's efficiency
+  gap versus ordinary FA narrows from 2.7x (273 -> 478 GFLOPS/s at the
+  production shape). Precision gates pass on both paths (indexed error
+  < 1.2e-7 vs F64; test-rerot-attn 0 failures).
+
+  The earlier qualification run FAILED, and the two defects responsible
+  were both found, fixed, and re-verified -- neither was in the grouped
+  shader itself:
+  (1) The synthesis lane leaked a `<|fim_prefix|>become` tool call as
+  the public answer, spelling the reserved marker character-by-character
+  (the token-level sampling ban only covers the single-token spelling).
+  Fixed by KV-level occlusion of the advertised tools block from the
+  planner and synthesis readers (workers keep it; see the occlusion
+  commit). The deterministic leak seed is now clean 3/3.
+  (2) Every third back-to-back episode died 42 ms after start with a bare
+  rerot_resource_exhausted. Pinned by backtrace + slot-state dump to a
+  force-sealed worker whose host slot was never released (an inverted
+  branch in the lane hard stop), leaving a GENERATING slot pointing at
+  a deleted episode; the bare propagation then killed the next innocent
+  episode. Fixed by releasing the slot on seal success; the failing
+  three-episode sequence now completes on scalar and grouped alike.
+
+  With both fixed, the complete paired run (seeds 777/12345/20260923
+  back-to-back, thinking wire, Bonsai PQ2_0 / RX 6800) passes 3/3 on the
+  grouped path, so grouped is now the default. Devices or shapes that
+  cannot stage the group keep the single-head scalar path;
+  GGML_VK_REROT_GROUPED_HEADS=0 restores Br=1 for A/B.
 
 - **Multi-lane decode is now worth its lanes, and RERoT finally beats serial.**
   Two Vulkan matvec fixes and two scheduling bounds. The shader dequantized each
