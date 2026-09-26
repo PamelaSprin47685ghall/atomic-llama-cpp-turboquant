@@ -1377,6 +1377,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool     cur_cycle_drafted          = false;
     uint64_t cur_cycle_local_id         = 0;
     common_speculative * parent_spec    = nullptr;
+    uint64_t kv_audit_id                = 0;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -1768,6 +1769,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (prof_active) {
             cur_cycle_catchup_us += (ggml_time_us() - t_catchup_start);
+        }
+
+        if (const char * audit_dir = std::getenv("GGML_MTP_KV_AUDIT_DIR")) {
+            const uint64_t id = ++kv_audit_id;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const std::string path = std::string(audit_dir) + "/" + std::to_string(id) +
+                    "-seq" + std::to_string(seq_id) + ".bin";
+                const size_t bytes = llama_state_seq_save_file(params.ctx_dft, path.c_str(), seq_id, nullptr, 0);
+                if (bytes == 0) {
+                    SPC_ERR("failed to capture MTP K/V audit state: %s\n", path.c_str());
+                    return false;
+                }
+                SPC_INF("MTP_KV_AUDIT id=%llu seq=%d rows_total=%u bytes=%zu path=%s\n",
+                        (unsigned long long) id, seq_id, n_commit, bytes, path.c_str());
+            }
         }
 
         guard.settle();

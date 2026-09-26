@@ -403,7 +403,7 @@ void common_init() {
     llama_log_set(common_log_default_callback, NULL);
 }
 
-void common_tp5_apply_env(const common_params & params) {
+void common_tp5_apply_env(common_params & params) {
     if (!params.tp5.enabled) {
         return;
     }
@@ -436,8 +436,6 @@ void common_tp5_apply_env(const common_params & params) {
             return pos != std::string_view::npos &&
                    (pos + model.size() == name.size() || name.substr(pos + model.size(), 2) == " (");
         });
-    const bool target_only = std::all_of(params.speculative.types.begin(), params.speculative.types.end(),
-        [](common_speculative_type type) { return type == COMMON_SPECULATIVE_TYPE_NONE; });
     const char * inherited_sync_env = getenv("GGML_TP5_SYNC");
     const std::string inherited_sync = inherited_sync_env ? inherited_sync_env : "";
     const std::string effective_sync = !params.tp5.sync.empty() ? params.tp5.sync :
@@ -446,7 +444,21 @@ void common_tp5_apply_env(const common_params & params) {
         !inherited_sync.empty() ? "environment" : qualified ? "qualified-5x-rx6800" : "conservative-default";
     setenv("GGML_TP5_SYNC", effective_sync.c_str(), 1);
     const std::string effective_wire = !params.tp5.wire.empty() ? params.tp5.wire :
-        !inherited_wire.empty() ? inherited_wire : qualified && target_only && effective_sync == "relay" ? "f32" : "f16";
+        !inherited_wire.empty() ? inherited_wire : qualified && effective_sync == "relay" ? "f32" : "f16";
+    if (qualified && mtp_requested) {
+        // The measured MTP profile keeps the draft detached from the five-rank
+        // target and uses the six-step horizon. Explicit CLI/environment
+        // selections retain ownership of both choices.
+        const char * single_draft_env = getenv("GGML_TP5_MTP_DRAFT_SINGLE_GPU");
+        const bool single_draft_opt_out = single_draft_env && atoi(single_draft_env) == 0;
+        if (params.speculative.draft.devices.empty()) {
+            params.speculative.draft.devices = single_draft_opt_out ? params.devices :
+                std::vector<ggml_backend_dev_t>{ params.devices.front(), nullptr };
+        }
+        if (!params.speculative.draft.n_max_explicit) {
+            params.speculative.draft.n_max = 6;
+        }
+    }
     if (mtp_requested && device_hidden && std::strcmp(device_hidden, "1") == 0) {
         const auto & draft_devices = params.speculative.draft.devices;
         const bool matching_ranks = qualified && params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
@@ -457,7 +469,7 @@ void common_tp5_apply_env(const common_params & params) {
             throw std::runtime_error("TP5 device-hidden requires identical ordered five RX 6800 target/draft ranks, tensor split, and RELAY/F32");
         }
     }
-    if (qualified && target_only && effective_sync == "relay" && params.tp5.wire.empty() && inherited_wire.empty()) {
+    if (qualified && effective_sync == "relay" && params.tp5.wire.empty() && inherited_wire.empty()) {
         setenv("GGML_TP5_WIRE", "f32", 1);
     }
     if (!params.tp5.latebind.empty()) {
@@ -481,14 +493,26 @@ void common_tp5_apply_env(const common_params & params) {
             throw std::runtime_error("TP5+MTP LateBind requires five distinct RX 6800 ranks, RELAY/F32, and explicit exact Q");
         }
     }
-    // Only options consumed after device discovery belong here. Queue family
-    // and VRAM allocation choices are fixed before -dev parsing finishes and
-    // cannot be changed by setenv at model load time.
     if (qualified && effective_sync == "relay") {
-        for (const char * knob : { "GGML_TP5_REPLICATE_ATTN",
-                                   "GGML_VK_DISABLE_PRODUCER_WIRE", "GGML_VK_DISABLE_MMVQ" }) {
+        if (!getenv("GGML_TP5_REPLICATE_ATTN")) {
+            setenv("GGML_TP5_REPLICATE_ATTN", mtp_requested ? "0" : "1", 1);
+        }
+        for (const char * knob : { "GGML_VK_DISABLE_PRODUCER_WIRE", "GGML_VK_DISABLE_MMVQ",
+                                   "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM", "GGML_VK_ALLOW_GRAPHICS_QUEUE" }) {
             if (!getenv(knob)) {
                 setenv(knob, "1", 1);
+            }
+        }
+        if (mtp_requested) {
+            for (const char * knob : { "GGML_TP5_QSA_HEADMAP", "GGML_TP5_GDN_HEADMAP",
+                                       "GGML_MTP_KV_ONLY", "GGML_TP5_MTP_DRAFT_SINGLE_GPU",
+                                       "GGML_VK_SMALL_Q8_COLUMNS" }) {
+                if (!getenv(knob)) {
+                    setenv(knob, "1", 1);
+                }
+            }
+            if (!getenv("GGML_TP5_SPIN_MAX")) {
+                setenv("GGML_TP5_SPIN_MAX", "10000000", 1);
             }
         }
     }
@@ -505,7 +529,7 @@ void common_tp5_apply_env(const common_params & params) {
     // collective callers and explicit replay-off configurations on their
     // existing path; an explicit lowering value (including 0) always wins.
     const char * vk_replay = getenv("GGML_VK_CMD_REPLAY");
-    if (qualified && target_only && effective_sync == "relay" && effective_wire == "f32" &&
+    if (qualified && effective_sync == "relay" && effective_wire == "f32" &&
         vk_replay && atoi(vk_replay) != 0 && !getenv("GGML_TP5_LINEAR_LOWERING")) {
         setenv("GGML_TP5_LINEAR_LOWERING", "1", 1);
     }

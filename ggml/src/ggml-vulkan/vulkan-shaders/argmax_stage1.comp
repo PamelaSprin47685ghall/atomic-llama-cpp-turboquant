@@ -1,0 +1,96 @@
+#version 450
+
+#include "generic_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#define FLT_MAX 3.402823466e+38F
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+
+struct PartialRecord {
+    float max_val;
+    uint max_id;
+    uint count;
+    uint nonfinite;
+};
+
+layout (binding = 1) writeonly buffer P {PartialRecord data_partials[];};
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+shared float tmpmax[BLOCK_SIZE];
+shared uint tmpid[BLOCK_SIZE];
+shared uint tmpcnt[BLOCK_SIZE];
+shared uint tmpnonfinite[BLOCK_SIZE];
+
+void main() {
+    const uint chunk_size = uint(p.param1);
+    const uint chunks_per_row = uint(p.param2);
+    const uint chunk_idx = gl_WorkGroupID.x;
+    const uint row = gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (row >= p.KY || chunk_idx >= chunks_per_row) {
+        return;
+    }
+
+    const uint chunk_start = chunk_idx * chunk_size;
+    if (chunk_start >= p.KX) {
+        return;
+    }
+    const uint chunk_end = min(chunk_start + chunk_size, p.KX);
+
+    float amax = -FLT_MAX;
+    uint acol = chunk_start + tid;
+    uint cnt = 0;
+    uint nonfinite = 0;
+    const uint row_offset = row * p.KX;
+
+    for (uint i = chunk_start + tid; i < chunk_end; i += BLOCK_SIZE) {
+        float val = float(data_a[row_offset + i]);
+        if (isnan(val) || isinf(val)) {
+            nonfinite = 1;
+        }
+        if (val > amax) {
+            amax = val;
+            acol = i;
+            cnt = 1;
+        } else if (val == amax) {
+            cnt = min(2u, cnt + 1u);
+        }
+    }
+
+    tmpmax[tid] = amax;
+    tmpid[tid] = acol;
+    tmpcnt[tid] = cnt;
+    tmpnonfinite[tid] = nonfinite;
+
+    barrier();
+
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            uint other = tid + s;
+            tmpnonfinite[tid] |= tmpnonfinite[other];
+            if (tmpmax[other] > tmpmax[tid]) {
+                tmpmax[tid] = tmpmax[other];
+                tmpid[tid] = tmpid[other];
+                tmpcnt[tid] = tmpcnt[other];
+            } else if (tmpmax[other] == tmpmax[tid] && tmpmax[tid] > -FLT_MAX) {
+                tmpcnt[tid] = min(2u, tmpcnt[tid] + tmpcnt[other]);
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        const uint out_idx = row * chunks_per_row + chunk_idx;
+        data_partials[out_idx].max_val = tmpmax[0];
+        data_partials[out_idx].max_id = tmpid[0];
+        data_partials[out_idx].count = tmpcnt[0];
+        data_partials[out_idx].nonfinite = tmpnonfinite[0];
+    }
+}

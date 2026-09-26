@@ -530,16 +530,39 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     gsmpl->reset();
 }
 
-struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+static common_sampler * common_sampler_clone_impl(const common_sampler * gsmpl, bool keep_candidates) {
+    if (!gsmpl) {
+        return nullptr;
+    }
+
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .cur     = */ {},
+        /* .cur_p   = */ {},
     };
+
+    if (keep_candidates) {
+        // `cur_p` always views `cur`; copying its raw pointer would leave the
+        // clone observing source-owned storage after a rollback.
+        GGML_ASSERT(gsmpl->cur_p.data == nullptr || gsmpl->cur_p.data == gsmpl->cur.data());
+        result->cur = gsmpl->cur;
+        result->cur_p = gsmpl->cur_p;
+        result->cur_p.data = result->cur.empty() ? nullptr : result->cur.data();
+    }
+
+    return result;
+}
+
+struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+    return common_sampler_clone_impl(gsmpl, true);
+}
+
+struct common_sampler * common_sampler_clone_checkpoint(const common_sampler * gsmpl) {
+    return common_sampler_clone_impl(gsmpl, false);
 }
 
 void common_sampler_append_grammar(common_sampler * gsmpl, llama_sampler * extra) {

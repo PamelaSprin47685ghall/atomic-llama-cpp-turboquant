@@ -1235,6 +1235,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_cumsum_multipass1_f32;
     vk_pipeline pipeline_cumsum_multipass2_f32;
     vk_pipeline pipeline_argmax_f32;
+    vk_pipeline pipeline_argmax_stage1_f32;
+    vk_pipeline pipeline_argmax_stage2_f32;
     vk_pipeline pipeline_count_equal_i32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
@@ -2784,6 +2786,7 @@ struct ggml_backend_vk_context {
     // Device discovery can precede TP5 environment selection. Read the policy
     // when this execution context is created, not when the physical GPU is probed.
     int32_t mmvq_mode = 0; // 0: auto, 1: force, -1: disable
+    bool argmax_hierarchical = true;
 
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
@@ -7403,6 +7406,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_argmax_stage1_f32, "argmax_stage1_f32", argmax_stage1_f32_len, argmax_stage1_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_argmax_stage2_f32, "argmax_stage2_f32", argmax_stage2_f32_len, argmax_stage2_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     // Intel Windows driver older than 32.0.101.8860 will crash when using fwht kernels on Xe2+ GPUS so we gate that here
@@ -7971,7 +7976,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->prefer_host_memory = GGML_VK_PREFER_HOST_MEMORY != nullptr;
 
         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
-        device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;
+        device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM && atoi(GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM) != 0;
 
         const char* GGML_VK_ALLOW_SYSMEM_FALLBACK = getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK");
         device->allow_sysmem_fallback = GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;
@@ -8273,7 +8278,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         // Try to find a non-graphics compute queue and transfer-focused queues
         // Allow overriding avoiding the graphics queue because it can increase performance on RADV
-        const bool allow_graphics_queue = (getenv("GGML_VK_ALLOW_GRAPHICS_QUEUE") != nullptr);
+        const char * allow_graphics_queue_env = getenv("GGML_VK_ALLOW_GRAPHICS_QUEUE");
+        const bool allow_graphics_queue = allow_graphics_queue_env && atoi(allow_graphics_queue_env) != 0;
         const vk::QueueFlagBits graphics_flag = allow_graphics_queue ? (vk::QueueFlagBits)0 : vk::QueueFlagBits::eGraphics;
         const uint32_t compute_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, graphics_flag, -1, 1);
         const uint32_t transfer_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
@@ -9506,6 +9512,10 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
                      requested("GGML_VK_FORCE_MMVQ") ? 1 : 0;
     fprintf(stderr, "[vulkan-mmvq-policy] backend=%s mode=%s\n", ctx->name.c_str(),
             ctx->mmvq_mode < 0 ? "disabled" : ctx->mmvq_mode > 0 ? "forced" : "auto");
+    if (const char * env_argmax = getenv("GGML_VK_ARGMAX_HIERARCHICAL")) {
+        ctx->argmax_hierarchical = strcmp(env_argmax, "0") != 0 && strcmp(env_argmax, "off") != 0 && strcmp(env_argmax, "false") != 0;
+    }
+    fprintf(stderr, "[vulkan-argmax-policy] backend=%s hierarchical=%s\n", ctx->name.c_str(), ctx->argmax_hierarchical ? "enabled" : "disabled");
     {
         std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
         ctx->device->registered_contexts.push_back(ctx);
@@ -12310,6 +12320,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const bool batch_n = ne11 > 1;
     const uint64_t outer_batches = ne12 * ne13;
     const bool batch_outer =
+        !skinny_as_batch &&
         ne11 == 1 &&
         outer_batches > 1 &&
         outer_batches <= mul_mat_vec_max_cols &&
@@ -12827,6 +12838,10 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     // This only supports batchsize == 1.
     const size_t nbytes = ggml_nbytes(src0);
     const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
+    static const bool small_q8_columns = [] {
+        const char * value = getenv("GGML_VK_SMALL_Q8_COLUMNS");
+        return value && atoi(value) != 0;
+    }();
     if (needs_split) {
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
         const uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * src0->nb[1]);
@@ -12856,7 +12871,9 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
                src1->type == GGML_TYPE_F32 &&
                src0->ne[2] == 1 && src0->ne[3] == 1 &&
                src0->ne[0] <= UINT32_MAX &&
-               src1->ne[1] > mul_mat_vec_max_cols && src1->ne[1] <= 32 &&
+               ((src1->ne[1] > mul_mat_vec_max_cols && src1->ne[1] <= 32) ||
+                (small_q8_columns && src0->type == GGML_TYPE_Q8_0 &&
+                 src1->ne[1] > 1 && src1->ne[1] <= mul_mat_vec_max_cols)) &&
                src1->ne[2] == 1 && src1->ne[3] == 1 &&
                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
                get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, src1) == 0 &&
@@ -19550,8 +19567,110 @@ static void ggml_vk_cumsum(ggml_backend_vk_context * ctx, vk_context& subctx, co
     ctx->prealloc_split_k_need_sync = true;
 }
 
+static bool ggml_vk_argmax_hierarchical_eligible(const ggml_backend_vk_context * ctx,
+                                                 const ggml_tensor * src0,
+                                                 const ggml_tensor * dst,
+                                                 uint32_t * out_chunk_size,
+                                                 uint32_t * out_chunks_per_row,
+                                                 uint32_t * out_wy,
+                                                 uint32_t * out_wz,
+                                                 size_t * out_temp_size) {
+    if (!ctx || !ctx->argmax_hierarchical || !src0) {
+        return false;
+    }
+    if (dst && dst->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0)) {
+        return false;
+    }
+    const uint32_t ncols = (uint32_t)src0->ne[0];
+    const uint32_t nrows = (uint32_t)ggml_nrows(src0);
+    if (ncols < 16384 || nrows == 0) {
+        return false;
+    }
+    const uint32_t chunk_size = ctx->device->subgroup_size * 32;
+    if (chunk_size == 0) {
+        return false;
+    }
+    const uint32_t chunks_per_row = (uint32_t)CEIL_DIV(ncols, chunk_size);
+    if (chunks_per_row <= 1 || chunks_per_row > 65536) {
+        return false;
+    }
+    const uint32_t max_wg_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+    const uint32_t max_wg_y = ctx->device->properties.limits.maxComputeWorkGroupCount[1];
+    const uint32_t max_wg_z = ctx->device->properties.limits.maxComputeWorkGroupCount[2];
+    if (chunks_per_row > max_wg_x) {
+        return false;
+    }
+    const uint32_t wy = std::min(nrows, max_wg_y);
+    const uint32_t wz = (uint32_t)CEIL_DIV(nrows, wy);
+    if (wz > max_wg_z) {
+        return false;
+    }
+    if (out_chunk_size) *out_chunk_size = chunk_size;
+    if (out_chunks_per_row) *out_chunks_per_row = chunks_per_row;
+    if (out_wy) *out_wy = wy;
+    if (out_wz) *out_wz = wz;
+    if (out_temp_size) *out_temp_size = sizeof(uint32_t) * 4 * chunks_per_row * (size_t)nrows;
+    return true;
+}
+
 static void ggml_vk_argmax(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ARGMAX, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], 0.0f, 0.0f, 0.0f, 0.0f });
+    const uint32_t nrows = (uint32_t)ggml_nrows(src0);
+    const uint32_t ncols = (uint32_t)src0->ne[0];
+
+    uint32_t chunk_size = 0;
+    uint32_t chunks_per_row = 0;
+    uint32_t wy = 0;
+    uint32_t wz = 0;
+    size_t temp_size = 0;
+
+    if (!ggml_vk_argmax_hierarchical_eligible(ctx, src0, dst, &chunk_size, &chunks_per_row, &wy, &wz, &temp_size) ||
+        ctx->device->pipeline_argmax_stage1_f32 == nullptr ||
+        ctx->device->pipeline_argmax_stage2_f32 == nullptr) {
+        ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ARGMAX, { ncols, nrows, 0.0f, 0.0f, 0.0f, 0.0f });
+        return;
+    }
+
+    vk_pipeline pipeline1 = ctx->device->pipeline_argmax_stage1_f32;
+    vk_pipeline pipeline2 = ctx->device->pipeline_argmax_stage2_f32;
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline1, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline2, 1);
+
+    if (ctx->prealloc_size_split_k < temp_size) {
+        ctx->prealloc_size_split_k = temp_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+
+    vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer temp_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    // Stage 1 dispatch:
+    // Grid: (chunks_per_row, wy, wz) such that wy * wz == nrows, matching row mapping:
+    // row = gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y.
+    vk_op_push_constants pc1 {
+        ncols, nrows,
+        float(chunk_size), float(chunks_per_row),
+        0.0f, 0.0f
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline1, {src_buf, temp_buf}, pc1, {chunks_per_row, wy, wz});
+
+    // Pipeline barrier between stage 1 and stage 2
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // Stage 2 dispatch: one workgroup per row
+    const std::array<uint32_t, 3> elements2 = (nrows > 262144) ? std::array<uint32_t, 3>{ 512, 512, (uint32_t)CEIL_DIV(nrows, 262144) } :
+                                              (nrows > 512)    ? std::array<uint32_t, 3>{ 512, (uint32_t)CEIL_DIV(nrows, 512), 1 } :
+                                                                 std::array<uint32_t, 3>{ nrows, 1, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline2, {src_buf, temp_buf, dst_buf}, pc1, elements2);
+    ctx->prealloc_split_k_need_sync = true;
 }
 
 static void ggml_vk_count_equal(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -24296,6 +24415,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 if (meta_size_bytes <= ctx->device->properties.limits.maxStorageBufferRange) {
                     if (ctx->prealloc_size_sparse_meta < meta_size_bytes) {
                         ctx->prealloc_size_sparse_meta = meta_size_bytes;
+                        ggml_vk_preallocate_buffers(ctx, nullptr);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pre-pass scratch sizing for hierarchical argmax: preallocate before checking replay cache
+    // or starting replay recording, ensuring prealloc_split_k is pre-sized and never resized mid-recording!
+    if (ctx->argmax_hierarchical) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_ARGMAX && node->src[0] != nullptr) {
+                size_t temp_size = 0;
+                if (ggml_vk_argmax_hierarchical_eligible(ctx, node->src[0], node, nullptr, nullptr, nullptr, nullptr, &temp_size)) {
+                    if (ctx->prealloc_size_split_k < temp_size) {
+                        ctx->prealloc_size_split_k = temp_size;
                         ggml_vk_preallocate_buffers(ctx, nullptr);
                     }
                 }
