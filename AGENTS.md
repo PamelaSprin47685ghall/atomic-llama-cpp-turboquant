@@ -1,768 +1,377 @@
-## 下班交接｜2026-09-24｜rerot-wip（用户要求暂停并推送）
+# TP5 融合版下一阶段执行手册
 
-### 已完成：无约束平面 todo 探针
+更新：2026-09-26。适用：五张 RX 6800、Qwen4EXP TP5 + MTP，仓库 `~/atomic-llama-cpp-turboquant`。
 
-- 新增独立试验入口 `--rerot-plan-wire todo`，保留 json/mindmap 对照；固定注入 `Let me write a parallel todo list for my thinking.\n- `，不安装 GBNF 或缩进采样器。
-- 每行 `- xxx` 成为一个同级 worker；新行首字节不是 `-` 就结束。一个 token 若跨越列表末尾和终止行，只保留边界前的列表，终止字符及后续全部丢弃；整个隔离 probe KV 在 formal P 前丢弃。EOG 可结束最后一项；空项/空计划报错，不静默补任务。
-- formal P 是原句加规范化平面列表，native `become(node)` 交接不变；保存/恢复保持 `plan_kind=todo`，内部仅借用 synthetic root + depth-2 leaves 的执行结构，无 worker 间硬依赖。
-- `llama-server` 已构建；`test-rerot-todo`、`test-rerot-runtime`、`test-rerot-parser`、`test-arg-parser` **4/4 通过**。首次实跑暴露旧的“grammar 不能为空”启动守卫，已限定为有约束 wire，修正后实跑成功。
-- 单 RX 6800 / Bonsai 27B PQ2_0、K=q8_0/V=turbo4：大洲题 probe **92 tokens / 2.99 秒**完成，接受 4 项；60 秒窗口中已进入 4-worker 执行但无最终答案，worker 有重复展开，**不能称整题通过**。
-- 双算术题完整 **HTTP 200 / stop**，最终输出 `221\n399`，274 predicted tokens，server predicted_ms=11989.667。详细证据在 `artifacts/rerot-wip/`。
+**当前已验证基座约 83 tok/s，尚未达到 100 tok/s。下一步先核验已有的多行 matvec 改动，再推进执行资源复用、GDN 精确恢复与真正的设备端草稿闭环；不要重新从 72 tok/s 的旧账开工。**
 
-### 当前优先项：Vulkan 真缺陷已复现，尚未修复
+本文件替换旧路线图，不重复保留两套互相冲突的实施顺序。历史性能与失败记录仍查 `TP5.md`、Git 历史和 `TP5_FUSION_HANDOFF_2026-09-26.md`。后者是最新性能战报，但其分支/推送状态已落后于本次看到的本地 Git 引用，修正见第 1 节。
 
-- 用户提供的五卡报告作为已知事实：`e4510fe0a` 即使关闭 MTP 也计数岔错（`…16,1…`、185 token、255/256 截断、无自然停止）。不得归因 MTP，也不得拿单卡 Bonsai 结果为五卡 TP5 背书。
-- 历史 `4e17c2faf → e4510fe0a` 之间修改 Vulkan 的提交为 `f80718126`、`fdd1da342`。前者保活异步读写 buffer；后者也有 HC 多行、GDN 和 skinny matmul 派发改动，不能只按 mindmap 提交名归因。
-- **已确认的独立 bug（来自 fdd1da342）：** `ggml_vk_mul_mat_vec_q_f16` 的 `skinny_as_batch` 把局部 `column_view_src1` 的栈地址写入 `prealloc_y_last_tensor_used`；连续调用可能复用同一地址，误认为新输入已量化，从而消费上一份输入。
-- 真机最小复现：Q8_0 权重 `[2048,64]`，两份不同 F32 输入 `[2048,27]`，同一 graph 连续 matmul。默认 auto 输出 `127/-254`，最大误差 `0/0`；`GGML_VK_FORCE_MMVQ=1` 输出 `126.992/126.992`，第二份本应 `-254`，最大误差 **380.992**。复现源 `artifacts/rerot-wip/vulkan-skinny-cache.cpp`（链接当前 build/bin 的 ggml；无参数为 auto，传任意参数为 forced）。**生产源码尚未修复。**
-- 该 bug 在本机默认 auto 下不触发；尚未证明它就是用户五卡报告的根因。下一步：用稳定的原始 tensor 身份作为缓存键，保留布局 view 仅用于几何；增加连续不同输入及 replay 的回归，再完成 HC/GDN 审计。
-- `f80718126` 保活路径定向烟测通过：48 轮，206640 个整数精确，含非零 offset、不同 stride、异步提交后提前释放源 buffer wrapper。复现源 `artifacts/rerot-wip/vulkan-copy-lifetime.cpp`。不应无证据正式撤回保活，否则可能重引入异步悬空资源。
-- 先前普通路径对拍的边界：单卡 Bonsai、RERoT 关闭，`9290e7a1a` 与 `43b290eff` 在同一 58+1383 token 轨迹的 149 检查点、36999680 个 logits，CPU 历史/当前与 Vulkan 历史/当前均逐值一致；CPU↔Vulkan 差异在两版本相同（max=0.396335，RMS=0.032676，argmax 148/149）。这不证明五卡正确。摘要 `artifacts/rerot-wip/ordinary-baseline-evidence.json`。
-- 用户要求优先 Vulkan 后又要求下班保存；todo 文档整理与 Vulkan 修复均暂停。没有提交新的 Vulkan 生产修复，没有关闭 watchdog/修改时钟；模型服务已停止。没有配置可用 SSH 目标。
+## 0. 开工规则与本轮授权边界
 
----
+本轮仅审阅和更新规划：不恢复编译、模型服务或 GPU 实验，不修改生产代码，不提交或推送。以下命令是后续明确恢复实施时的操作说明，不是现在启动跑测的授权。
 
-## 结论
+后续执行者必须先读本文件，再读战报。遇到冲突，按以下顺序处理：用户最新要求；当前源码/提交和对应原始证据；本文件；历史叙述。**提交已合并不等于已测，单次 smoke 不等于性能资格，功能非劣不等于独立提速。**
 
-**应该把主线改成“TP5 原生的多步 MTP 执行程序”，而不是继续给两个独立上下文拼出来的草稿路径调参数。当前约 72 tok/s，不能视为这套硬件上 MTP 的上限。**
+- 不切换、重置、清理或覆盖当前 dirty 工作树；不对用户改动执行 `reset --hard`、`clean` 或自动 stash。实验另建工作树，基座固定到提交，不追随可移动分支。
+- 不停止 watchdog，不改 GPU 时钟/功耗/驱动/PCI 拓扑，不用故障复位制造更快样本。只管理本次 harness 创建的服务进程，不广域 kill 用户任务。
+- 一次只允许一组 GPU 实验。正式测量期间不并行编译、哈希大模型、拷贝权重、运行其他 GPU 负载。取证在测量前后进行。
+- 保留非 MTP、grammar、penalty、JSON、reasoning budget、RERoT 和其他模型的原回退路径。不要以 TP5 优化为名删除共享 Vulkan 的保活、稳定 tensor 身份及同步契约。
+- 不绕过工具的目录访问限制。无法读取某个 worktree/artifact，就记录边界；可审阅本仓库可见的提交对象，但不得声称检查了不可访问的二进制或日志。
 
-但需要区分两件事：**“草稿指定五张卡”已经做过；“草稿真正进入 TP5 的设备端多步执行、状态管理和通信体系”还没有完成。** 前一种实现跑得慢，不能证明后一种没有收益。
+## 1. 基座、源码与证据：先把三个版本分清
 
-我检查了 E5-2699A 上的工作树、《困惑.md》《TP5.md》、关键源码和现有分相日志片段。**本次没有改代码，也没有把历史测试冒充新的性能复跑。** 下面给出的是现场审计后的工程判断；没有可靠证据的计算、通信、信令细分，我不会编数字。
+### 1.1 本次核验的本地 Git 状态
 
-完整工单、源码索引和测试要求已整理成：[下载《TP5 MTP 现场审计与工程路线图》](sandbox:/mnt/data/TP5_MTP_现场审计与工程路线图_2026-09-24.md)。
+| 对象 | 本次看到的状态 | 用途/限制 |
+|---|---|---|
+| 当前目录 | `work/mtp-100`，HEAD `aa9e7f5de`，已有大量未提交实验 | 不是 83 tok/s 的性能对照，不在这里继续堆实验 |
+| 已验收融合提交 | `16e28b8ac63c9fd5a54611070c6405f064f69a21`；分支 `work/mtp-fused-83`；tag `tp5-fused-83-20260926` | 后续实验的固定性能/行为基座 |
+| 整合提交 | `5742c9c59`，父提交为 `9e4926382` 与 `16e28b8ac` | 已发生源码 merge，不等于完整 TP5 验证通过 |
+| 本地 `origin/master` 与 `work/mtp-fused-master` | 均指向 `9b3c33881`，即整合提交之后的战报文档提交 | 本次未 fetch/查询真实远端；只陈述本地引用，不再照抄“尚未 merge/未 push” |
 
----
+战报 §4 的 `origin/master=9e4926382` 和“未 push”属于较早快照。当前没有新增证据证明整合版已完成构建、canonical、状态与性能验收，因此其资格仍为 **待验证**。不得据此自动发布、部署或修改远端历史。
 
-## 一、先把账立正确：问题不只是 514 ms，也不是 target 已经没有优化空间
+原融合 worktree 记录为 `/var/tmp/tp5-fusion-82-wt`。本次工具不允许打开该目录，因此审阅的是仓库中的融合提交及可访问源码；没有重解析 `/var/tmp` 的 ABBA 原始结果，没有新跑性能。以下历史成绩均明确来自战报，而非本次复测。
 
-《TP5.md》中那次 `predicted_ms=2437.917`、25 个 cycle、完整正确输出 171 token 的请求，可以重排成下面这张**互不重叠**的账：
+### 1.2 必须使用的历史性能口径
 
-| 项目                       |          整次请求耗时 | 含义                     |
-| ------------------------ | --------------: | ---------------------- |
-| 草稿                       |  **514.051 ms** | 150 次串行单步，包含 GPU 等待和采样 |
-| target 图区间               | **1700.078 ms** | 包含建图、分配绑定、输入设置、提交与等待   |
-| target `llama_decode` 图外 |   **90.072 ms** | 图区间之外的准备、状态处理、输出提取等    |
-| target 验收后处理             |   **95.056 ms** | 主要是逐行验收采样              |
-| draft catch-up           |   **35.891 ms** | 对草稿上下文执行真实的补齐计算        |
-| 计时边界残差                   |    **2.769 ms** | 不是固定“系统开销”             |
-| **合计**                   | **2437.917 ms** | 与该请求计时一致               |
+| 证据 | 数值 | 可以得出的结论 |
+|---|---|---|
+| 历史 canonical `native-mtp-kv-only` | `2065.730 ms / 82.779 tok/s`，prompt31、171/171、自然 stop、全文正确 | 已有有效成绩；旧 binary 本体未保留，不能假装仍可直接复用 |
+| 融合 checkpoint 五块 ABBA | A mean `83.45`、B mean `83.41 tok/s`；B/A `0.9995`，95% CI `[0.9919, 1.0072]` | checkpoint 满足既定 0.99 非劣界；没有可测的独立正收益 |
+| 融合单次 smoke | `2058.120 ms / 83.09 tok/s` | 功能与路线核验，不替代 ABBA |
+| 无调优参数默认 smoke | `2076.556 ms / 82.35 tok/s` | 默认解析/功能通过，不用单次值与 ABBA 均值比较 |
+| 当前实验目录的 78–79 tok/s smoke | 不是融合基座 | 不可降格选择弱对照以制造收益 |
 
-依据：`TP5.md`“不以‘额外开销’掩盖草稿与 target 账”段，以及对应的 `tp5-mtp-n6-granular-ledger-*` 日志。
+证据路径见战报 §1–3、§8；其中关键结果是 `fusion-checkpoint-abba5.json`。新实验必须同时保存 server、实际加载 DSO、shader/构建配置及源码身份，不能仅记 HEAD 或 server 文件名。
 
-这里有两个必须同时成立的判断：
+### 1.3 距离目标还有多少
 
-**第一，仅处理 90 ms 和 95 ms 不够。** 即使把它们全部删掉，这个诊断样本也只到约 **75.9 tok/s**。
+最终门仍为相同 canonical：全文精确 `1..60`、prompt31、`predicted_n=completion_tokens=171`、自然 `stop`，无 profiler 的 server `predicted_ms < 1710`。
 
-**第二，1885 ms 的 target 总时间不是 GPU 计算下限。** 它包含首图绑定、首次执行、图外接口、验收采样。不能先把这些装进 target 总账，再用“target 自己已经超过 1710 ms”证明只能大改计算核。
+以 **2065.730 ms 这一单次历史样本**作工程量级估算，还需减少 `355.730 ms`，即约 `17.22%` 的请求时间。若新的测量仍为 25 cycles，等价于每轮约 `14.23 ms`；25 轮来自历史诊断，必须在融合版重新确认，不能假定不变。不要把平均 tok/s 的倒数当作平均请求时间。
 
-实际需要解决的是：
+旧的 `2437.917 ms` 分相账、`514.051 ms` draft、`90.072 ms` 图外和 `95.056 ms` 验收只保留为历史定位线索。W1、K/V-only、ARGMAX、checkpoint 已改变执行路径，禁止拿这些旧数直接承诺新收益。
 
-$$
-T_{\text{请求}}=\sum_{\text{cycle}}
-(T_{\text{draft}}+T_{\text{verify}}+T_{\text{catchup}}+T_{\text{接口}})
-+T_{\text{冷税}}
-$$
+## 2. 已完成项与负结果：不再列成“从零实现”
 
-这次请求平均每轮 **97.52 ms**，实际公开输出平均 **6.84 token/轮**。若仍为 25 轮，要过 100 tok/s，就必须压到**含冷税平均 68.4 ms/轮以内**。
+### 2.1 融合基座必须保护的成员
 
-因此，合理方向是联合削减草稿、状态物化、验证接口和首图成本，而不是指望一个小补丁省出全部差额。
+RELAY/F32、linear lowering、单卡 draft、n=6、hierarchical ARGMAX、rank-local pinned readback、small-Q8 columns、non-replicated attention、QSA/GDN headmap、K/V-only catch-up、durable sampler checkpoint 均按战报属于融合成员。
 
----
+源码审阅进一步确认：
 
-## 二、514 ms 里到底有哪些计算、通信和信令？
+- `common/speculative.cpp` 在 backend sampling 可用且 `p_min<=0` 时挂接 greedy backend chain；`draft()` 仍逐步 decode、等待所选 token、重建 batch。因此“再把草稿 argmax 搬到 GPU”不是新任务，**消除高层逐步控制依赖**才是。
+- `src/models/qwen4exp.cpp::graph_mtp` 的 `LLM_GRAPH_TYPE_DECODER_MTP_KV` 分支完成 K/V 旋转和缓存写入后直接返回；后面的 Q、attention、输出投影、MoE、LM head 不在该数学路径内。不能再把删掉它们当作待兑现大收益。
+- W1 的持久 pinned slots、全部 rank 入队后消费已经实现。剩余 fallback 必须先证明动态命中、语义范围和关键路径成本，不能重复实现另一套所有权。
+- checkpoint 是已经保留的状态管理优化，不再从旧 clone 的 6.363 ms 推算它的“预期收益”。
 
-### 1. 已知的是“等待位置”，还不是“等待原因”
+默认启动只需保留模型/模式身份：`--tp5 qwen4exp-af -md <mtp.gguf> --spec-type draft-mtp`。不要强迫用户重新填写已默认的 draft 卡、n=6 或一长串性能环境变量。显式退选仍保留，详见战报 §3。
 
-现有草稿细账是：
+### 2.2 失败档案与重启门
 
-* `llama_decode` enqueue：**67.454 ms**。
-* `common_sampler_sample` 外围计时：**445.386 ms**。
-* hidden getter：**0.099 ms**。
-* 其余：**1.112 ms**。
+| 路线 | 已知结论 | 只有满足什么新条件才能重启 |
+|---|---|---|
+| strict GPU target top-1 | audit-free pilot 比关闭慢 22.425 ms | 新账证明存在可省的关键路径；消除新增同步/全量物化；采样状态契约先通过 |
+| host-hidden unrolled chain | 3488.112 ms；同 horizon 普通 n=2 为 3019.149 ms | token、embedding、hidden、索引和 mask 真正闭环，且两步同形对照先赢 |
+| CPU stateless greedy / compact top-k | 正确但 pilot 回退 | 新机制有字节/工作量和整请求证据，不只换名字再试 |
+| device feedback / external token fence / staged relay draft | 未证明净收益，已撤回/退选 | 不再依赖逐 token host embedding materialization 与高层调度 |
+| direct GDN snapshot injection | 状态语义不安全 | 先有独立 shadow 恢复 oracle、所有权与事务协议；不直接复活旧写入补丁 |
+| GDN target-capacity | fail-closed | inactive rows、KV、rollback、collective 全部证明后才准入 |
+| horizon、五卡 draft、挪 rank、Q2/Q3、LateBind 等扫描 | 已有负结果或驻留风险 | 先有瓶颈变化与成本模型；不原样重跑参数矩阵 |
+| device embedding placement | 孤立高值 smoke，无独立资格 | 作为完整 D1 闭环的组成部分验证，不单独晋级默认 |
 
-平均每步约 **3.427 ms**，其中 enqueue 约 **0.450 ms**，等待加采样约 **2.969 ms**。
+同样保护已修复的 skinny matvec 输入转换缓存身份问题：不得将栈上临时 view 地址重新用作跨调用缓存键。不要照抄整合分支 AGENTS 中更早的“生产源码尚未修复”叙述；查 `TP5.md` 的 `ef48a9d40` 修复与对应回归。
 
-源码 `common/sampling.cpp::common_sampler_sample` 明确先同步上下文，再开始内部 sampler 计时。因此：
+## 3. 实际实施顺序与交付清单
 
-> **445 ms 不能叫“CPU 采样成本”，也不能叫“全是可以删掉的同步水分”。它包含上一段 GPU 尚未完成的时间。**
+编号为本轮新编号，括号中仅标旧 W 工单的对应关系。**先通过 G0/G1，再选择有证据的改造；不要同时改 shader、状态协议、采样器和 horizon。**
 
-真正需要消除的是：**为什么每生成一个草稿 token，都必须让高层 CPU 采样器返回一次，才能启动下一步？**
-
-`common/speculative.cpp::common_speculative_impl_draft_mtp::draft` 当前就是：
-
-```text
-llama_decode 一步
-    → CPU 等待并取得采样结果
-    → CPU 构造下一步 batch
-    → llama_decode 下一步
-```
-
-原生 device-hidden 只替换了 hidden 的交接方式，没有消除这条逐步控制链。
-
-### 2. 草稿确实有实际计算，不能把“一层”理解成近乎免费
-
-`src/models/qwen4exp.cpp::graph_mtp` 中，这一层包含 token embedding、EH 投影、HC 混合、完整注意力、MoE、输出混合与 LM head。
-
-所以，514 ms 中确实有矩阵计算和显存访问；但现在没有同一请求、同一时间线上的证据，能告诉我们其中各占多少。
-
-另外，**这个 MTP 草稿块走普通注意力；大量 GDN 前缀快照的问题主要在 target 验证侧。** 不能把两者的状态成本混为一谈。
-
-### 3. TP5 的 P2 也不等于纯通信
-
-我看了 `ggml-vulkan-collective.cpp::tp5_star_handoff`。当前 RELAY 路径实际包括：
-
-```text
-等待五卡 producer ready
-    → CPU F32 归约
-    → 写回五张 BAR
-    → 发布 generation
-    → GPU 消费者继续执行
-```
-
-现有代码已经有 `rank_ready_us`、`ready_skew_us`、`arm_us` 等字段。
-
-因此，七行链中的 **8.256 ms P2** 不能直接叫“PCIe 传输成本”：里面可能包含慢 rank、CPU relay、发布和恢复等待。**46.257 ms compute 也只是计算命令段，不是纯 ALU 时间。**
-
-正确的账应该区分：
-
-| 分类      | 应测内容                                         | 不能混进去的东西             |
-| ------- | -------------------------------------------- | -------------------- |
-| 计算与本地访存 | 矩阵、MoE、注意力、状态更新、临时物化                         | 别的 rank 尚未完成造成的等待    |
-| 数据传输    | logits/hidden/token、collective payload 的实际搬运 | 等 producer ready 的时间 |
-| 控制与信令   | 提交、generation 发布、协议处理、消费者恢复                  | 被依赖的 GPU 计算本身        |
-
-**不要把“CPU 在等 GPU”的同一段时间，同时算一次 GPU 计算、再算一次同步浪费。**
-
----
-
-# 三、路线图：按激进到普通排序
-
-## 路线 1：最激进，也最值得作为主线——把草稿纳入统一 TP5 执行程序
-
-### 目标不是五卡参数，而是一个完整的执行闭环
-
-我建议首版只覆盖当前明确场景：**单序列、当前 Qwen MTP、RELAY/F32、n=6、语义允许的 greedy**。其他组合继续走已有路径。
-
-将执行层拆成：
-
-```text
-Program
-    固定算子与通信拓扑、rank 布局、描述符计划、scratch 生命周期
-
-RunInputs
-    token、position、KV 位置、active rows、接受长度、generation
-
-RequestState
-    target 与 draft 各自的状态、有效前缀、取消与提交边界
-```
-
-然后让六步草稿成为一个有限步执行程序，而不是六次高层 `llama_decode → sampler` 往返。
-
-**自回归依赖仍然存在，但不要求每一步都回 CPU 决策。** 投机解码的收益来自减少昂贵目标模型的串行调用，并不意味着草稿的因果依赖可以被取消。([Proceedings of Machine Learning Research][1])
-
-### 第一项关键改造：设备端 token → embedding → 下一步
-
-每一步应形成：
-
-```text
-分片 LM head
-    → 每 rank 局部最大值与 global token id
-    → 全局候选发布
-    → 设备端 embedding lookup
-    → 下一步 MTP
-```
-
-这里最重要的是：
-
-**局部最大值与 token id 一起发布，不能先回读 index，再按 index 发第二次 logit 回读。**
-
-两级 GPU reduction 没问题；**两轮依赖 CPU 结果的设备回读才是应该消掉的结构。**
-
-首版完全可以复用现有 RELAY 线程：CPU 只合并五个小候选记录并发布 token，不再经过高层 sampler、全词表候选构造和逐 token decode 调度。这样仍然存在 CPU relay，但与现在的高层串行路径不是一个成本结构。
-
-必须对拍不等长词表分片、最小全局 id 平局规则、异常值处理和零行输出。之前两趟回读版比 CPU 慢，只说明那个实现没有优势，不说明设备端选择没有优势。
-
-### 第二项关键改造：共享执行资源，但不要偷偷共享模型状态
-
-**不要复制六套 graph scratch。** 六份命令或参数不等于六份大临时缓冲；token、hidden 可以用小环形缓冲，计算临时区按实际生存期复用。
-
-还有一个容易踩的具体坑：
-
-> **不要直接设置 `ctx_other=target` 来偷共享执行池。**
-
-当前 MTP 驱动会据此判断共享记忆模式，可能改变算法分支。应新增独立的执行资源共享契约，保留这个模型自身的 draft KV 所有权。
-
-同样，不能因两个张量都叫 `shared_head` 就共享 target/draft 权重。两个 GGUF 的量化类型、内容和布局必须先逐张量核对。
-
-### 第三项关键改造：有界设备控制，而不是危险的永久 kernel
-
-可以预录有限六步，使用设备端控制缓冲更新 token、位置和有效步数。Vulkan 的间接 dispatch 支持执行时从设备缓冲读取工作组数量，可作为实现手段之一；实际扩展和设备能力仍须在这台机器上确认。([Vulkan Documentation][2])
-
-EOG、取消和失效步骤必须同时约束状态写入与 collective 参与，不能某些 rank 退出、其他 rank 永久等 generation。
-
-**验收门：** 高层逐 token 往返消失，scratch 不按 horizon 倍增，取消可恢复，且整请求优于同版本单卡对照。只证明 hidden 在 GPU 上、只证明五卡能输出正确 token，都不算完成。
-
----
-
-## 路线 1 的重要子项：catch-up 做成 K/V-only，并接到 target 尾部
-
-这是本次源码审计中值得单独强调的机会。
-
-`common_speculative_impl_draft_mtp::commit()` 确实又执行一次 draft decode。它不是纯复制。原因是：
-
-**候选 token 全部被接受，不代表用“草稿预测 hidden”构建的 draft K/V，等于用“target 真实 hidden”构建的 K/V。**
-
-所以不能直接删除 catch-up。
-
-但对这里的普通注意力 MTP 块，验收补齐需要的是正确 draft K/V。建议新增明确的 **CATCHUP_KV phase**，只完成必要的：
-
-```text
-正确 token + 对齐的 target hidden
-    → EH / HC 前缀
-    → K/V 投影、norm、RoPE
-    → draft KV 写入
-```
-
-不应为了“沿用完整 decode 接口”，继续执行没有消费者的输出头和其他计算。
-
-这里还需要一次验证：**列出当前零输出图实际执行的 dispatch。** 图构造源码看起来完整，不代表所有节点都会运行；不能在未看实际图前宣布已经找到了多少毫秒。
-
-进一步，在 target 宽 hidden 产生后，K/V 补齐可以进入同一执行计划，与 target 词表头中相互独立的工作安排重叠。重叠收益与新增显存必须一起算。
-
-对齐规则直接以当前 `workspace::commit_row` 为 oracle，逐个验 accepted=0…6；不要凭直觉手写“取第 a 行还是 a+1 行”。
-
----
-
-## 路线 2：激进——GDN 改为 checkpoint＋精确重算，而不是每个前缀完整 snapshot
-
-**这一项应该比继续尝试 n=10、Q3、挪草稿卡更早。**
-
-`src/models/delta-net-base.cpp::build_recurrent_attn` 明确先让 `gdn_out` 包含多个完整状态，再把它们复制进 recurrent rollback bank。
-
-现有 n10 相比 n6，每卡 target scratch 增加约 **416 MiB**；加载后草稿卡 GTT 也出现约 **19 MB → 978 MB** 的差异。不能把这些直接命名为某块权重迁移，但足以说明**状态保存策略和驻留预算必须一起重做**。依据：`TP5.md` 的 n10 scratch、allocator 与 GTT 记录。
-
-### 推荐的正常路径
-
-```text
-保留起点 checkpoint
-    → 正常完成候选块验证
-    → 保留终点状态与少量恢复日志
-
-全接受：提交终点
-中途拒绝：从起点恢复到接受前缀
-```
-
-关键是：**拒绝时不一定要重跑整个 target。**
-
-第一版可以保存 GDN 每步使用的必要输入，例如 k、v、g、β 等，用相同 F32 运算序列重新执行状态转移：
-
-$$
-S_t = F_{\mathrm{F32}}(S_{t-1};k_t,v_t,g_t,\beta_t)
-$$
-
-这样恢复的是 recurrent transition，而不是所有投影、MoE 和输出头。卷积历史另保留较小的前缀记录；普通注意力 KV 按有效前缀提交。
-
-### 不要用平均接受率代替恢复概率
-
-必须分别统计：
-
-**真实模型拒绝、EOG、长度截断、取消。**
-
-最后一轮因为结束而少接受一个候选，不等于发生了需要继续生成的昂贵回滚。若请求结束且状态不再复用，可以让槽位失效；若要复用 prompt/KV，就必须恢复或明确标记失效。
-
-经济账应写成：
-
-$$
-\text{收益}
-=
-\text{少写完整快照及改善驻留的收益}
--
-\text{恢复日志成本}
--
-\sum_j P(\text{在位置 }j\text{拒绝})\,T_{\text{恢复},j}
-$$
-
-### 给工程师的实现阶梯
-
-先做**直接写持久 snapshot bank，去掉重复大临时物化**；再做稀疏 checkpoint；最后做起点/终点＋日志。每一步都能独立验收，不需要一口气重写所有状态管理。
-
-**验收门：** 每个拒绝位置、每层 GDN 状态、卷积历史、KV 有效范围、target hidden 选择、取消后的下一请求都要对拍。不能只看最终计数题正确。
-
----
-
-## 路线 3：较激进——专门优化七行验证，不重新折腾成熟的单行 target
-
-我同意不另开一条“纯 target 50 tok/s 再挤一点”的主线。但：
-
-> **单行 target 已优化，不意味着七行 MTP 验证程序也已优化。**
-
-当前 n=7 仍落在 `mul_mat_vec_max_cols=18` 的 direct-quant 路径。这里应该研究的是**实际七行形状下的权重复用、量化解码、寄存器压力、状态写入和通信边界**，不是简单把阈值改成 GEMM。
-
-具体要求：
-
-**普通投影**看同一量化权重是否真被多行复用，是否为七行重复解码；**MoE**先统计这七行到底共享哪些专家，不能假设所有 token 都复用同一专家；**HC/GDN**看能否减少中间物化和重复状态读写，而不只是减少 dispatch 数。
-
-已有“dispatch 更少但整请求没更快”的融合试验不原样重做。每个候选必须先写出：它减少了多少真实字节、多少计算或多少关键路径依赖。
-
-前三个 stage 偏慢也值得查，但要在相同算子组合、同 rank、同驻留下比较。不同 stage 的算子不同，不能把 4–5 倍时间差直接命名为 DPM 或迁移。
-
-**验收门：** MTP 七行整周期变快，MTP-off 单行路径不回退；改变浮点归约顺序的核单列数值验证，不能把“输出 1..60 正确”当作位级等价。
-
----
-
-## 路线 4：中等——首图可以研究 direct/recompute，但必须明确重算哪一层
-
-你提出“不必执着 cache”是有价值的，尤其在**状态恢复层**，我明确支持先做 checkpoint＋recompute。
-
-但首图这里要区分：
-
-| 操作                                   | 判断          |
-| ------------------------------------ | ----------- |
-| 不保存所有候选状态，拒绝时重算                      | **优先路线**    |
-| 首次图直接执行，不为一次性使用付完整 replay-cache 维护成本 | **值得做同构对照** |
-| 全局关闭 graph reuse，每轮重新建图和绑定           | **不是建议方向**  |
-
-现有首图约 100 ms 的主因是 **Meta tensor binding**，不是 backend fence。`TP5.md` 的分相记录中，binding 约 99–110 ms，backend sync 只有微秒级。
-
-因此：
-
-**只跳过 Vulkan CB cache，却仍然走原来的 Meta 张量展开和绑定，未必省掉这 100 ms。**
-
-真正该改的是固定执行定义与运行输入的分离：
-
-```text
-固定：拓扑、rank-local 布局、绑定计划、合法缓冲范围
-变化：token、KV 位置、active rows、scratch 起址、generation
-```
-
-首轮 one-shot、稳态 replay 都可以建立在这个契约上；不是缓存旧请求的状态，也不是拿旧 tensor 指针强行复用。
-
-现有 phase 切换还会释放计算缓冲，导致下一阶段重新建立资源。应该给 draft 单步、target 七行、K/V-only catch-up 明确程序身份，而不是只按 token 数猜 phase。
-
-**已有容量模式的 46 个未覆盖 dispatch 不能放宽守卫硬跑。** 要逐类证明 inactive rows 不读取非法输入、不写状态、不破坏通信参与者。
-
----
-
-## 路线 5：普通，但已经有明确源码靶点——修 90 ms 图外回读
-
-这是本次最具体的一个定位。
-
-我追到了下面这条源码链：
-
-```text
-llama_context::output_reserve
-    尝试 output device 的 host buffer，否则普通 CPU buffer
-
-Meta::get_host_buffer_type
-    各 rank host buffer 类型不同 → 返回 nullptr
-
-Vulkan::get_host_buffer_type
-    按 device 分别创建类型
-
-Meta::get_tensor_async
-    按 rank 依次调用 get_tensor_2d_async
-
-Vulkan::get_tensor_2d_async
-    目标地址不是本 device 的 pinned buffer
-    → staging fallback
-    → 函数内部立即 synchronize
-```
-
-对应文件是 `src/llama-context.cpp`、`ggml-backend-meta.cpp` 和 `ggml-vulkan.cpp` 的上述函数。
-
-**所以，“async”这个名字并不保证五卡回读已经并行排队。** 这是非常具体的退化条件，比“在外层少调用一次 synchronize”更值得优先处理。
-
-但仍须测它的动态命中次数，不能把全部 90.072 ms 都扣在这里。`mctx::apply`、状态提交、输出缓冲处理等也位于相关图外边界。
-
-### 建议的修法
-
-每个 rank 使用自己可识别的、持久的 pinned 输出 slot。先让全部 rank 的 copy 入队，再在真正消费结果的边界等待；之后拼接，或者直接按分片采样。
-
-不要把不同设备的 host buffer type 强行返回同一个指针来蒙混过关；也不要只删除 staging 分支里的同步。那个同步目前保护了 deferred memcpy 和临时缓冲的生存期。
-
-slot 必须有 owner、generation、未完成状态与退休规则。Vulkan 对执行顺序和内存可见性要求显式同步，不能把“地址可映射”当作“CPU 已经可以安全读”。([Vulkan Documentation][3])
-
-**验收门：** 打印每 rank 的 pinned 命中、fallback、字节数、提交和等待次数，证明从逐 rank 阻塞变成全部入队后消费；随后确认时间没有只是从 decode 挪到 sampler。
-
----
-
-## 路线 6：普通到中等——95 ms 后处理，重点改全词表物化和采样状态复制
-
-这 95.056 ms 已经有足够明确的方向：
-
-| 子项            |            耗时 |
-| ------------- | ------------: |
-| 验收采样          | **87.058 ms** |
-| sampler clone |  **6.363 ms** |
-| seq_rm        |      0.099 ms |
-| 已计输出循环        |      0.121 ms |
-| 其余            |      1.415 ms |
-
-源码 `common/sampling.cpp::set_logits` 会在 CPU 上逐词表构造 `llama_token_data`；`common_sampler_clone` 还会复制整个 `cur` 候选数组。优化重点应该落在这里，而不是 seq_rm。
-
-### 最强方案：七行只回小候选，不回完整 logits
-
-以仓库记录的 248320 词表计算，七行 F32 logits 是 **6,952,960 字节**。
-
-五 rank、七行、每行一对 F32 最大值和 32 位 token id，原始候选载荷只有 **280 字节**，另加对齐、header 和 generation。
-
-注意：**这减少回读和候选物化，不等于不再计算整个 LM head。**
-
-对语义允许的纯 greedy，先得到七行的全局最大 id，再一次确定接受前缀。第一版甚至可以只回读这几个 id，在 CPU 比较前缀；不必为了追求“全部在 GPU”而增加复杂性。
-
-有 grammar、有效 penalty、logit bias、reasoning budget 或其他状态性采样依赖时，不能擅自改成七行独立 argmax，必须保留顺序状态语义或回退。
-
-### 较小方案：CPU 也可以不构造整张候选表
-
-严格纯 greedy 的路径直接扫描 logits/词表分片，避免先构造全词表候选再 top-k/sort。草稿 `p_min<=0` 的情形，也应检查是否仍做了无用途的概率和候选物化。
-
-clone 则新增**验收专用的持久状态 checkpoint**：保存 RNG、grammar、history 等，临时候选 scratch 不复制。不要直接改变通用 clone 的可观察语义；`cur_p` 等指针也必须正确重绑。
-
-**验收门：** 拆出真正 CPU 独占采样时间，确认候选构造、排序和 scratch 复制减少，而不是只把等待藏到别处。
-
----
-
-## 路线 7：最后才是普通策略优化——自适应 horizon，而不是继续扫 n
-
-在执行和驻留修好之前，我不会继续让工程师依次尝试 n7、n8、n10、n12、挪卡、Q3、Q2。
-
-horizon 应依据**前缀存活分布和边际成本**选择：
-
-> 再多猜一步带来的预计新增公开 token，必须值回新增 draft、target、恢复与内存压力成本。
-
-高接受率不授权无限增加 horizon。n10 已出现显著驻留风险与同形核退速，先解决状态和执行布局，再决定是否加长。
-
-此外，诊断中某个 MoE 算子的 `n=10` 是专家维度，不是 MTP horizon。所有性能表都应标明轴的含义，防止改错门限。依据：`TP5.md` 对 n6/n10 同形量化 GEMV 的记录。
-
----
-
-## 四、不要再无目标试验：给整条路径一个可检验预算
-
-下面是我建议采用的**工程目标，不是已实现成绩，也不是收益保证**：
-
-| 项目                    |     目标预算 |
-| --------------------- | -------: |
-| 六步草稿闭环                | ≤10 ms/轮 |
-| 七行 target 设备链，含链内通信同步 | ≤48 ms/轮 |
-| 链外验证接口、验收和提交          |  ≤3 ms/轮 |
-| catch-up 新增的非重叠关键路径   |  ≤1 ms/轮 |
-| 整请求额外冷税               |  ≤100 ms |
-
-若仍是 25 轮：
-
-$$
-25\times(10+48+3+1)+100=1650\text{ ms}
-$$
-
-对应约 **103.6 tok/s**。
-
-这个预算的意义是：**每个工程任务必须说明自己在缩短哪一项，其他项是否恶化。** 不是声称这些数字一定能全部实现，更不是把几次不同进程的最好值拼成最终成绩。
-
-实际实现应继续留裕量；周期数、拒绝分布变化时重新算账。
-
----
-
-## 五、实施管理：先交证据，再交补丁
-
-展示顺序按激进程度；实际落地可以拆成可独立验收的工单，不需要等一个巨型重写全部完成。
-
-我会要求首先交付三份材料：
-
-1. **514 ms 的同请求关键路径图。** 分清 GPU 运行、主机等待、真实 CPU 采样、传输与逐步控制开销。
-2. **90 ms 的回读分支命中账。** 每 rank 的 host buffer、pinned 命中、staging fallback、字节数和等待次数。
-3. **GDN 重算的状态与内存账。** 每个拒绝位置的恢复正确性、恢复成本、live allocation 和峰值驻留。
-
-CPU/GPU 时间线需要校准后关联；不同设备原始 timestamp 不能直接拿来对齐。Vulkan 提供 calibrated timestamps 契约，但要检查机器支持并记录偏差。([Vulkan Documentation][4])
-
-之后所有候选都必须经过：完整接受、各位置拒绝、EOG、取消后下一请求、零输出 catch-up、1→7→1 形状切换和非支持采样器回退。状态改动要对拍状态，不能只看最终文本。
-
-正式性能仍坚持：**独占五卡、watchdog active、参考 F32/RELAY、未开 profiler、逐字正确、自然停止、171/171、server `predicted_ms<1710`。** 保留所有预先安排的 A/B 样本，不挑最快一条。
-
-**最终建议很明确：保留成熟的单行 target，停止继续扫草稿参数；以“统一 TP5 多步执行＋精确状态重算”为主线，以“rank-local 回读＋批量验收”为可独立兑现的改进。现有五卡草稿的负结果应成为重做执行结构的证据，而不是给 MTP 潜力封顶的理由。**
-
-[1]: https://proceedings.mlr.press/v202/leviathan23a "https://proceedings.mlr.press/v202/leviathan23a"
-[2]: https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdDispatchIndirect.html "https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdDispatchIndirect.html"
-[3]: https://docs.vulkan.org/spec/latest/chapters/synchronization.html "Synchronization and Cache Control :: Vulkan Documentation Project"
-[4]: https://docs.vulkan.org/refpages/latest/refpages/source/vkGetCalibratedTimestampsKHR.html "https://docs.vulkan.org/refpages/latest/refpages/source/vkGetCalibratedTimestampsKHR.html"
-# TP5 + MTP 现场审计与工程路线图
-
-日期：2026-09-24  
-工程：E5-2699A，`/home/kunweiz/atomic-llama-cpp-turboquant`  
-审计对象：当前未提交工作树、`困惑.md`、`TP5.md`、关键执行源码、现有分相日志片段。
-
-## 0. 结论与证据边界
-
-主方向应从“给独立草稿模型调参数”转为“把 MTP 做成 TP5 执行程序的组成部分”。保留单卡草稿作为性能对照，不把它当最终架构；也不能把已经存在、但有逐步主机往返的五卡草稿当作融合版的性能上限。
-
-本次没有修改仓库、没有启动新一轮模型性能测试、没有把历史数据说成此次复跑。已检查机器现场：检查时没有 llama-server，五卡 GPU busy 均为 0，eagle-gpu-watchdog 为 active。仓库 master 的 HEAD 为 `4e17c2faf`，但存在大量未提交改动，不能只用 HEAD 标识被审计源码或历史测试二进制。源码定位以下以函数名为准；历史临时计时器已有撤回，不能假定当前二进制能原样输出每个字段。
-
-本报告最重要的新定位，是图外回读的完整源码条件链、MTP catch-up 的 K/V 专用化机会，以及将设备端多步草稿、精确状态重算、批量验证组成同一个路线，而不是重复已有负收益试验。
-
-没有现成的可靠数字可以把 514 ms 精确拆成“纯 GPU 计算多少、传输多少、信令多少”。给出三个百分比会是编造。以下区分已测值、源码确定行为、待验证归因与工程预算。
-
-## 1. 已有实测账：一个请求只能算一次
-
-`TP5.md` 的“不以‘额外开销’掩盖草稿与 target 账”记录了一次开启分相诊断、内容正确、自然停止、171 个输出 token 的请求：`predicted_ms=2437.917`，25 个 MTP cycle。
-
-| 互不重叠的项目 | 整请求 ms | 解释 |
-|---|---:|---|
-| 草稿 | 514.051 | 150 次串行单步，含等待与采样 |
-| target 图区间 | 1700.078 | 含建图、绑定、输入设置、提交与等待 |
-| target llama_decode 图外 | 90.072 | 尚未逐项测清，不可全算 CPU 计算 |
-| target decode 后处理 | 95.056 | 大头是逐行验收采样 |
-| draft catch-up | 35.891 | 对草稿上下文执行真实补齐计算 |
-| 计时边界残差 | 2.769 | 不是固定系统开销 |
-| 合计 | 2437.917 | 与该请求 server 计时一致 |
-
-嵌套关系为：target 总时间 1885.206 = llama_decode 1790.150 + 后处理 95.056；llama_decode 1790.150 = 图区间 1700.078 + 图外 90.072。禁止把父项与子项重复相加。
-
-草稿内部：enqueue 67.454 ms，`common_sampler_sample` 外围计时 445.386 ms，hidden getter 0.099 ms，其余 1.112 ms。每步平均 3.427 ms，其中 enqueue 0.450 ms、等待加采样 2.969 ms。`common_sampler_sample` 内部先同步，再开始自身的 CPU sampler 计时；外部包围计时和内部 sampler 计时口径不同。
-
-后处理内部：clone 6.363 ms，sample-and-accept 87.058 ms，seq_rm 0.099 ms，已计 token 输出循环 0.121 ms，其余 1.415 ms。每轮后处理约 3.802 ms。不要去优化占不到一毫秒的 seq_rm/输出循环以解释这 95 ms。
-
-图内部：build 2.238 ms，alloc 121.978 ms，submit+wait 1574.206 ms，set_inputs 1.357 ms，剩余约 0.299 ms 为边界。首次图 287.519 ms，后续同形图约 58–59 ms。
-
-已有未开 profiler 的参考结果约 72 tok/s，例如 2370.901/2376.041 ms，见 `/var/tmp/tp5-restored-after-greedy-rejection-unprofiled.json`。上述 2437.917 ms 是归因样本，不能冒充未开 profiler 基准。
-
-### 吞吐预算
-
-该请求平均每 cycle 97.517 ms，公开输出平均 171/25 = 6.84 token/cycle。若周期数仍为 25，100 tok/s 要求含冷启动在内平均小于 68.4 ms/cycle。不能按每轮必出 7 个公开 token 计算，也不能把 accepted+bonus 的内部计数直接等同公开 completion_tokens。
-
-仅把图外 90.072 ms 和后处理 95.056 ms 假设全部删掉，此诊断样本也只有约 75.91 tok/s。另一方面，target 的 1885.206 ms 含冷启动和接口开销，不是不可改变的 GPU 计算下限。两句话都成立。
-
-以下是工程目标，不是预测或新实测：
-
-| 目标项 | 建议预算 |
-|---|---:|
-| 六步草稿闭环 | ≤10 ms/cycle |
-| target 七行设备链，包含该链通信与同步 | ≤48 ms/cycle |
-| 设备链之外的验证接口、验收、提交 | ≤3 ms/cycle |
-| catch-up 的新增非重叠关键路径 | ≤1 ms/cycle |
-| 整请求额外冷税 | ≤100 ms |
-
-若这些互斥口径均实现且仍为 25 轮，总时间为 25×(10+48+3+1)+100=1650 ms，约 103.64 tok/s。实际研发应继续留出裕量；若真实周期数、拒绝分布或边界改变，必须重算预算。
-
-## 2. 正确拆分计算、通信、信令
-
-### 草稿 514 ms
-
-当前单卡草稿没有五卡草稿内部的张量归约；它仍有 GPU 计算、局部显存读写、logits/token/hidden 的主机与设备搬运、命令提交及完成等待。这个 MTP 不是单个微小矩阵：源码包含 token embedding、EH 投影、HC 混合、完整注意力块、MoE 和 LM head。
-
-445 ms 的 sample 外围时间混合了“上一段 GPU 尚未完成”和“CPU 真正在处理候选”。GPU 运行的时间不会因为删掉等待函数而消失。应消除的是每个 token 都回到 CPU 决定下一次 decode 的控制依赖。
-
-### TP5 的通信不等于 P2
-
-源码 `tp5_star_handoff` 会轮询五个 producer ready，记录 rank-ready 时间，执行 CPU F32 归约，写五张 BAR，再发布 generation。P2 区间可能包括等待慢 rank、等待 CPU、传输和消费者恢复；它不是独立纯 PCIe 带宽账。计算命令段本身也包含 dispatch、屏障、访存和调度，不是纯 ALU 时间。
-
-已有独立进程 GPU 诊断中，七行 rank0 compute/P2/total 为 46.257/8.256/54.523 ms；单行为 20.422/5.129/25.564 ms。七行链相对七次单行有摊销，但这些数不能与另一次请求的主机账逐项相减，也不能相加五个 rank 的 compute 当作请求延迟。
-
-### 必须交付的观测格式
-
-所有记录带 request_id、cycle_id、phase、step、rank、stage、rows、generation。CPU 使用互斥范围，GPU 用每 rank 的设备时间线；需要跨时钟关联时检查 calibrated timestamp 支持并记录最大偏差，不直接比较原始 tick。
-
-需要区分以下边界：CPU prepare/enqueue；GPU 首次开始、各计算段、copy、结束；producer ready；最后一个 rank ready；CPU reduce/broadcast；generation publish；消费者开始；主机等待结束；CPU sampler 独占时间；accepted prefix commit。将等待归因到依赖的生产者，不能把全部等待再算一遍信令浪费。
-
-记录 H2D/D2H 字节、每 rank staging fallback 次数、queue submit 次数、fence/timeline 等待次数、scratch 峰值、buffer 身份及显存/GTT。优先复用现有 `tp5_star_times` 的 ready skew、arm、publish 等字段。
-
-记录放预分配内存，请求结束统一输出。先用阶段级采样保留 replay，不给每个 op 强插屏障。已有逐 op logger 会禁用 replay，并曾把整请求扰动到约 24 秒，不能拿它作为性能 A/B。
-
-## 3. 路线一：最激进——统一 TP5 MTP 执行程序
-
-### 3.1 结束两个独立主机驱动器逐 token 往返
-
-现有 `common_speculative_impl_draft_mtp::draft` 每一步都 llama_decode → common_sampler_sample → CPU 构造下个 batch。原生 hidden 交接只换了 hidden 的传输方式，没有去掉这条控制链。原五卡草稿更慢，因此不能简单将设备列表改为五卡就宣布完成 TP5 化。
-
-建议新增专用执行层（模块名为建议，不是已存在 API），形成 Program 与 RunInputs：
-
-- Program：固定算子/通信拓扑、rank 布局、描述符计划、合法 scratch 区间、phase 定义。
-- RunInputs：token、position、KV 位置、active rows、accept 长度、取消标志、generation。
-- RequestState：target 与 draft 各自的有效状态和提交边界。
-
-先覆盖单序列、当前 Qwen MTP、参考 RELAY/F32、n=6、语义允许的 greedy。其他组合走原路径。不要一开始把所有模型、采样器和并发情况卷入首版。
-
-重要：共享执行池不等于共享 KV。不要直接把 `ctx_other` 指向 target 来偷共享资源；当前 MTP 驱动用它判断共享记忆分支，可能改变模型语义。应给执行 arena/命令资源独立的共享契约，保留本模型独立 draft KV。
-
-### 3.2 TP5 是放置和执行策略，不要求每个微小算子切五份
-
-大权重与 LM head 采用与模型分片契约一致的 TP5；小的归一化、门控和必要镜像可在 rank 内完成，避免为省极少 FLOPs 引入额外 collective。先用实际张量形状与字节数确定切法。
-
-target/draft 量化权重不一定相同。只有逐张量证明类型、内容、布局和所有权一致时才共享权重；不能因名称含 shared_head 就直接 alias 两个 GGUF 的输出矩阵。
-
-### 3.3 六步仍自回归，但不需要六次 CPU 决策
-
-预录有限步程序：LM head → 本地候选归约 → 全局候选发布 → embedding lookup → 下一步 MTP。token id、hidden、positions 和 active 状态留在设备控制缓冲。
-
-局部 argmax 一次产生 `(max_logit, global_token_id)`，不再先读 index、再为该 index 发第二次 logit 回读。五 rank 候选可由现有 RELAY 线程合并并写回各 rank；这仍有 CPU relay，但没有高层 sampler/fence/llama_decode 的逐 token往返。直接跨 GPU 方案必须先证明实际互操作路径，不假设有现成高速 P2P。
-
-最小全局 id 的 tie-break、不等长词表切片、NaN/Inf 策略必须与参考一致。词表归约不是浮点求和归约，要有独立 payload ABI 和有效位。
-
-不能把六个有依赖的草稿 token 改成六个并行 token；改变的是控制位置，不是模型因果关系。
-
-### 3.4 不复制六份大 scratch
-
-只保留必要的 token/hidden 环形缓冲和 per-step 参数，复用峰值 scratch。每步的命令/参数不等于每步一套模型 scratch。资源复用须建立真正的 live range 和退休条件；未完成提交引用的 descriptor、地址与参数不得重写。
-
-GPU 侧可通过间接 dispatch 参数控制后续工作；feature 支持时也可评估 conditional rendering。无论采用哪种方案，EOG、取消和 active=0 都要阻止无效 KV/状态写入，而且 collective 的参与者必须一致，不能让部分 rank 退出而其他 rank 永久等 generation。不要用占满 GPU 工作组的无限自旋充当跨步同步。
-
-### 3.5 catch-up 先做 K/V-only，再谈重叠
-
-`commit()` 确实对 draft 再做 decode。即使候选 token 全接受，draft 中由预测 hidden 构建的 K/V 也不等于由 target 真实 hidden 构建的 K/V，因此不能直接删 catch-up。
-
-本模型 MTP 块是完整注意力，不是 target 的 GDN。验收补齐的目标是正确 draft K/V；应新增明确的 CATCHUP_KV phase，计算必要的 EH/HC 前缀、K/V 投影、norm/RoPE 和缓存写入。先列出当前零输出图实际 dispatch，确认已有图裁剪到了哪里，不能仅看源码有完整 attention 就断言所有算子都执行。
-
-以现有 workspace::commit_row 的 token/position/hidden 对齐为唯一 oracle，检查是否能消除无消费者的 Q/attention/output/MoE/LM-head 工作。不要凭 accepted 数手写 off-by-one 规则。
-
-进一步可以在 target 宽 hidden 产生后，把候选前缀的 draft K/V 补齐挂到同一执行计划，和 target 词表头的独立工作安排重叠；只有经过验收的前缀可发布为有效。重叠会增加同时存活的缓冲需求，不能同时宣称所有 target/draft scratch 都可无条件 alias。
-
-### 3.6 验收
-
-主机逐步高层采样往返从每轮六次变为轮级交互；记录 RELAY 控制仍有多少步。D+C 及总请求必须优于同版本单卡对照；观察 target 是否因资源竞争变慢。单独 hidden 复制正确或单独 argmax kernel 快不算成功。
-
-## 4. 路线二：激进——GDN checkpoint + 精确重算
-
-### 4.1 原问题
-
-`build_recurrent_attn` 让 GDN 产生多份完整 F32 状态，形成 gdn_out 中间张量，再拷贝进 recurrent rollback bank；卷积历史也按候选前缀保存。n10 的目标 scratch 比 n6 每卡约多 416 MiB，加载后草稿卡 GTT 从约 19 MB 增到约 978 MB，存在显著驻留风险。
-
-但 416 MiB 不等于已经证明全由 GDN 构成；GTT 也不等于已经证明迁移的是 Q4 draft 权重。应按 allocation/张量生命周期建立表，不给未知 BO 身份起名字。
-
-### 4.2 推荐策略
-
-正常路径保留起点 checkpoint、工作/终点状态，以及足够精确恢复的逐步输入日志；全接受直接提交终点，真正中途拒绝才从起点恢复到接受前缀。
-
-第一版最稳妥地保存每步 GDN 使用的 k、v、g、b 等必要输入，并按原算子相同 F32 运算序列执行仅更新状态的恢复核。也可研究保存更新向量，但不能未经证明用简化代数替换原舍入顺序。不要默认必须重跑整个 target；有必要中间输入时只重放 recurrent transition。卷积历史单独保留小前缀或恢复日志；普通注意力 KV 通过有效前缀/位置管理提交。
-
-有三种阶梯方案：直接写持久 snapshot bank，先去掉重复大临时物化；每隔几个候选留 checkpoint；起点/终点加日志。选择依据是实测恢复分布与内存峰值，不是穷举 horizon 与 flag。
-
-### 4.3 正确性与经济账
-
-必须分别统计真实 model mismatch、EOG、长度限制、取消。token 接受率不等于 block 完全接受率，也不等于恢复概率。请求已结束且状态不复用时，可让槽位失效而不为无后续消费者的尾块做恢复；若会复用 prompt/KV，则必须恢复或明确失效，不能保留错误 cache。
-
-期望收益 = 全前缀快照写入/物化与驻留代价的减少 − 日志开销 − 各拒绝位置概率×该位置恢复成本。
-
-测试每个拒绝位置、target hidden 选择、所有 GDN 层状态、卷积历史、普通 KV 有效区间、sampler 状态、取消及下一请求。重算路径优先保持原 F32 指令次序并逐位对拍。只验证最终计数题正确远远不够。
-
-### 4.4 验收
-
-给出修改前后的 live allocation 表、峰值 scratch、驻留/GTT、状态恢复分布和未插桩吞吐。若 n10 仍越过实际驻留预算，就不要升级 horizon。不要仅因释放了一块显存就宣布同形 kernel 变慢的根因已证明。
-
-## 5. 路线三：较激进——只优化 MTP 七行 target 执行路径
-
-无 MTP 的成熟单行路径作为保护线，不重开一轮泛化单 token 调优。但单行最优不等于七行验证最优，尤其多行状态快照与不同 MoE 路由均改变执行特征。
-
-针对实际七行形状设计量化小矩阵批处理，而不是只把 GEMV/GEMM 阈值改一下。现有 n=7 处在 `mul_mat_vec_max_cols=18` 的 direct-quant 路径。测量相同权重是否被七行复用、解量化次数、激活布局、寄存器压力与 spill；MoE 统计实际被多个 token 共用的专家，不默认七行都选同一专家。
-
-从投影组、HC、状态读写、通信边界之间减少真正的中间物化和生产者/消费者等待。已有减少 dispatch 却无净收益的融合试验不原样重做。减少 dispatch 数、提高单个核吞吐都不是最终证据。
-
-早期前三 stage 的慢点保留为定向问题：相同算子组合、同 rank、同驻留、同轮对比。不同 stage 有不同算子与输入，不能把 4–5 倍时间差直接归于 DPM；不需要写时钟或改 watchdog 来做路线图。
-
-验收使用完整周期和请求；MTP-off 单行路径不得回退。改变浮点归约次序的核要单列数值变更与对拍结果，不能冒称位级等价。
-
-## 6. 路线四：中等——首图 direct/recompute 与执行定义生命周期
-
-这里要分清三种“缓存”：执行程序/描述符、临时内存绑定、模型的 KV/GDN 状态。
-
-对模型状态，checkpoint + 拒绝时重算就是优先路线，不必执着保存每个前缀。
-
-对首图执行，建议做首轮一次性 direct execution 与构建 replay 缓存的同构对照。首轮没有复用收益，不能要求为了缓存而无条件付所有维护成本；但这不是一个现成 flag 一开就能省 100 ms 的结论。
-
-现有定位显示首图大头是 Meta tensor binding，约 99–110 ms；backend sync 只有微秒。跳过 Vulkan CB cache 而仍调用同一套 Meta 建图/绑定，不会自动消灭 binding。全局关闭 graph reuse 反而可能每轮重付它。建图、绑定、record、首次 GPU 执行必须分开记账。
-
-合理实现方向是将固定图拓扑和 rank-local 绑定计划编译成程序，将实际 KV 位置、active rows、scratch 起址和 generation 变成每次运行的参数。可在合法启动阶段构建执行定义，但要记录真实加载/首请求耗时，不用假 warmup 或把请求工作挪出计时窗口冒充收益。
-
-先维护有明确契约的 draft 单步、target 七行与 KV-only catch-up 程序，避免因 token 数猜 phase 再释放整个 arena。容量模式已有 46 个 dispatch 未证明 active<capacity 合法，必须逐类补齐输入读取、状态写入、依赖边界的覆盖；不放宽守卫硬跑。
-
-Program 复用也不等于复用旧 tensor 地址：取消、阶段转换、scratch 重分配与上下文销毁都要有 generation 和退休证明。
-
-## 7. 路线五：普通但具体——90 ms 图外回读
-
-### 7.1 源码链
-
-1. `llama_context::output_reserve` 尝试 output device 的 host buffer，否则普通 CPU buffer。
-2. `ggml_backend_meta_device_get_host_buffer_type` 只在所有 rank 返回同一个 host buffer type 时才提供统一类型；不同则 nullptr。
-3. Vulkan 的 host buffer type 按 device 分别创建。
-4. Meta 的 `get_tensor_async` 对词表分片按 rank 依次调用 `get_tensor_2d_async`。
-5. Vulkan 的 read helper 检查目标 host 地址是否属于该 device 的 pinned buffer；否则 async wrapper 走 staging，并在函数内部立即 `ggml_vk_synchronize(ctx)`。
-
-因此，“名字叫 async”不等于五卡回读被并行排队。对于 Meta 输出缓冲配置，这是一条非常具体的退化路径。它的动态命中次数和时间仍需测量；不把 90.072 ms 全归给它。
-
-图外还要单独记 memory batch prepare、mctx::apply、postcompute_success、compute guard 生命周期及输出提取。边界名称不能替代归因。
-
-### 7.2 修法
-
-为每 rank 建立自身可识别的持久 pinned output ring/slot；该 rank 的 logits 子片先写入自己的连续区域。先 enqueue 全 rank 的 copy，再在真正消费结果的边界统一退休，随后拼接或直接按分片采样。
-
-每个 slot 必须有归属、generation、未完成标志，不能让多个异步 copy 覆盖同一 sync_staging。不要只删除 synchronize；它目前保护 deferred memcpy 与 staging 生存期。映射内存可见性和 CPU 消费同样须满足 Vulkan 同步契约。
-
-测试从 buffer 构造、copy offset/stride、五 rank 不等长片段、部分输出行、并发提交和取消开始。新方案即使“更异步”也必须能证明输出字节正确。
-
-### 7.3 验收
-
-记录 rank、host buffer 类型、pinned 命中、fallback 次数、字节数、提交/等待次数；证明从逐 rank 阻塞变为全部提交后消费。随后测完整请求，检查 copy/排队是否仅把时间移到 sampler 而非真正减少关键路径。
-
-## 8. 路线六：普通到中等——95 ms 后处理
-
-最强方案与统一程序共用：给语义允许的 greedy target 验证做七行局部候选归约和全局前缀验收，而不是回读全量词表。
-
-以仓库记录的 248320 词表举例，七行 F32 logits 是 6,952,960 字节；五 rank×七行×一个 F32 值与一个 32 位 id，原始候选载荷是 280 字节，不含对齐、header、generation。它减少的是回读和候选物化，不能声称不再需要计算 LM head 的全部候选分数。
-
-对纯 greedy、无有效 grammar/penalty/logit bias/reasoning-budget 等依赖的路径，可独立生成每行 argmax，然后只提交首个 mismatch 之前的正确前缀以及参考语义要求的纠正/bonus token。一般状态性采样不得改为七行无条件并行 argmax；保留原 fallback 与 RNG/grammar/penalty 状态顺序。
-
-较小实现不必等待 GPU sampler：在严格等价的纯 greedy 路径上直接扫描 logits 或 rank 分片，不先构造全词表 `llama_token_data` 数组再 top-k/sort。草稿 p_min<=0 时也可研究删除无用途的概率/候选物化；p_min>0 必须保留置信度语义。
-
-`common_sampler_clone` 会复制整个 cur 候选数组。新增验收用 durable-state checkpoint，只保存 RNG、grammar、penalty/history 等必要状态，并在新采样时重建 scratch。不要盲改通用 clone 的可观察语义；也要正确重绑 cur_p，不能让临时 checkpoint 持有旧候选指针。
-
-已有“一批只调用一次 synchronize”的试验没有证明收益，原因不能简化成“同步不重要”：getter 仍有同步、全词表 materialization 仍存在，底层回读也可能已阻塞。应改结构，而非只改一层函数参数。
-
-## 9. 路线七：普通——最后再调 horizon 与策略
-
-在执行与驻留修好以前，不再直接尝试 n7/n8/n10/n12、挪草稿卡、改 Q3/Q2 量化。历史已经说明接受率和更多候选本身不足以保证收益。
-
-动态 horizon 使用实际前缀存活率分布：本轮再多一步的预计新增公开 token，必须值回新增 draft、target、恢复和内存压力成本。连续接受并不授权无限加长；检测到驻留恶化或 target 批宽成本跳变时，应缩短。
-
-同形 MoE kernel 标签中的 n=10 可能是 top-10 专家维度，不是草稿 horizon。所有性能表明确写形状轴含义，避免改错 kernel 门限。
-
-Q2 的命中下降已使总体退速，不把低比特当作必然优化；任何更换草稿权重的实验与执行优化分开记录。
-
-## 10. 实施工单与依赖
-
-展示顺序按激进程度。实际合并不应等一个巨型重写全部完成；先完成可审计计时与精确前缀测试，再分支推进，最终集成为同一执行程序。
-
-| 工单 | 修改入口 | 必交付证据 | 禁止的替代品 |
+| 优先级/工单 | 第一件事 | 可交付结果 | 停止条件 |
 |---|---|---|---|
-| W0：同请求关键路径账 | speculative/server/context/collective | 同 cycle 的 CPU、GPU、ready、发布、回读、采样互斥账 | 不同进程 profiler 相减 |
-| W1：rank-local 回读 | meta/Vulkan/context 输出缓冲 | pinned/fallback/bytes/waits，字节对拍，总请求 A/B | 只删 fence |
-| W2：greedy 前缀验收 | sampling、Meta lowering、Vulkan kernel | 不等长词表、tie、零行、所有拒绝位置、fallback | 两趟 index/logit D2H |
-| W3：状态重算 | delta-net-base、recurrent memory、GDN shader | 每层状态、卷积/KV、拒绝分布、显存峰值、恢复成本 | 丢 snapshot 不补契约 |
-| W4：K/V-only catch-up | qwen4exp::graph_mtp、workspace/commit | 零输出 dispatch 清单和每位置 K/V 等价 | 接受即删 catch-up |
-| W5：TP5 多步闭环 | 新执行 Program、speculative、Meta/Vulkan collective | 六步无高层逐 token 往返、scratch 寿命、取消代际、整请求收益 | 改五卡设备列表 |
-| W6：七行程序与首图 | context、Meta binding、Vulkan replay | 首图 build/bind/record/execute 分离、热图收益 | 假 UID、假 warmup、放开容量门 |
-| W7：自适应 horizon | speculative 策略层 | 前缀分布与边际成本决策，总请求分布 | 只看接受率 |
+| P0 / G0 基座与整合资格 | 固定 `16e28b8ac`，区分整合版和 dirty 实验 | manifest、干净构建、行为门、可重建对照 | 对照无法重现约 83 的合理水平，先查来源，不用 79 作新基座 |
+| P0 / G1 当前关键路径（W0） | 测融合版，而不是拼历史数字 | 同请求互斥账、stage/shape 排名、驻留表 | profiler 扰动/归因不清时，不依据它宣称净收益 |
+| P1 / K1 现成多行 matvec 增量（W6 的计算侧） | 隔离上游已存在的 shader 改动并统计命中 | 同形核数值、实际七行 target、完整请求对照 | 不命中、VGPR/spill 恶化或整请求不赢即退选 |
+| P1 / E1 exact 程序与资源复用（W6） | 计数 phase reset、release、bind、record | 明确 phase 身份、稳定 arena、冷热分账 | 不能只少一次 reset，却留下旧 tensor/descriptor 引用 |
+| P1 / S1 GDN shadow → 精确恢复（W3） | 保留旧快照，先逐层 shadow replay | 状态 oracle、日志字节、拒绝恢复成本 | 任一位置状态不等价，禁止删除旧快照 |
+| P2 / D1 两步设备闭环 → 六步（W5） | 先证明当前单卡 draft 可两步无高层往返 | 完整输入/状态 ABI、两步及六步整请求收益 | 两步不赢，不继续复制六份图或切五卡 |
+| P3 / V1 target 小候选（W2） | 证明默认 sampler 的完整可观察语义 | 单次候选发布、状态一致、有效 fallback | 只在换了采样链的合成 workload 上快，不算 canonical 优化 |
+| P3 / H1 自适应 horizon（W7） | 获取新执行结构下的前缀存活分布 | 有边际成本的策略 | 仅凭接受率高就增大 horizon，拒绝 |
 
-### 固定验收规则
+K1、E1、S1 的设计/CPU 测试可独立推进；GPU 实验串行。D1 的契约设计不必等全部工作结束，但大规模实现必须经过两步生死门。每个候选单独 qualification；最终组合仍须重新测，不能相加各自最佳收益。
 
-独占五卡，保持 watchdog active，保持参考 F32/RELAY 与模型身份，记录实际二进制和 dirty diff、设备 UUID/BDF、环境、请求参数与采样链。诊断与正式性能两种构建/运行口径分开；不把 per-op logger 请求作为基准。
+## 4. G0/G1：基座、最小观测与收益归因
 
-完整 1..60 必须逐字正确、自然停止、predicted_n 与 completion_tokens 均为 171；正式判定用 server predicted_ms<1710。另保留真实 client wall/首 token 时间作体验指标，但不能替换验收口径。报告所有预先安排的正式样本，不从波动里挑最快一条。
+### 4.1 G0 的具体步骤
 
-建议固定至少五个交错 A/B 比较块，报告各块结果、median 与离散程度；样本不足时只称 pilot，不称稳定收益。一个小补丁若收益小于噪声，先记录机制改善，不夸大吞吐。
+1. 保存当前 branch、HEAD、dirty diff、未跟踪文件清单；不要修改它们。固定 control 为 `16e28b8ac`。另建 integration 候选检查 `9b3c33881`，但不要混称为 control。
+2. 在新的 build 目录干净构建；记录 compiler、CMake、shader compiler、构建选项和动态库搜索路径。特别验证 ARGMAX stage1/stage2 文件、descriptor 数与 shader generator 对应；不能借旧生成文件掩盖干净构建失败。
+3. 先运行已有单测，再做 canonical/default route 与行为门。保留实际模型分片身份、量化、KV 类型、context、batch、sampler chain、默认解析结果、设备 UUID/BDF、driver 和 watchdog 状态。
+4. 同机新 control 的 A/A pilot 用于发现环境漂移/测量异常，不赋予性能提升资格。恢复约 83 tok/s 的稳定参照后才测候选；偏低时检查 DSO 混用、构建差异、环境继承和驻留，不把旧最快值拼进新表。
+5. 整合版先过构建和行为门，再对 control 做配对性能。若失败，隔离共享 shader 与 server/RERoT 改动；不声称无冲突 merge 已兼容所有行为。
 
-正确性集包括：全接受；各位置真实拒绝；EOG/长度截断；取消后下一请求；1→7→1 与部分行；零 logits catch-up；不等长词表/tie/异常值策略；不同提示和上下文；参考不支持的 sampler 路由回退。缓存/状态恢复改动要比最终文本更深地比较状态。
+### 4.2 G1 只收集能推动决策的账
 
-首批需要看到的不是新旗标，而是三份证据：90 ms 回读路径命中账、514 ms 草稿完整关键路径、GDN 精确重算的内存与拒绝成本账。随后按同一预算把这些能力接进 TP5 MTP 程序。
+每条记录至少关联 `request/cycle/phase/step/rank/stage/rows/generation`。第一轮只收阶段级信息，请求结束统一输出，不逐 op 打日志、不强插每算子等待来破坏 replay。
 
-## 11. 本地证据索引
+CPU 互斥账包括：prepare/build/bind/record、enqueue、等待、真正 sampler CPU 独占工作、accept/commit、K/V catch-up。GPU 账按各 rank 记录 compute、copy、producer-ready、CPU publish 对应边界和 consumer resume。不能相加五卡时间作为请求延迟，也不能把 CPU 等待和被等待的 GPU 工作再相加。
 
-- `困惑.md`；`TP5.md` 中“草稿与 target 账”“五卡草稿同次周期账”“七行 graph 首次分配”“五 rank 分片 GPU 贪心”“n10 scratch”各段。
-- 现场确认存在并读取过首尾片段的原始日志：`/var/tmp/tp5-mtp-n6-granular-ledger-{cycles,draft,target,graphs}.log`。汇总响应与未插桩参考路径见正文；本次没有声称重新完整解析所有历史 JSON 或重新复跑历史测量。
-- `common/speculative.cpp::common_speculative_impl_draft_mtp::{draft,commit,process_impl,enable_device_hidden}`。
-- `common/sampling.cpp::{common_sampler::set_logits,common_sampler_clone,common_sampler_sample,common_sampler_sample_and_accept_n}`。
-- `src/models/qwen4exp.cpp::llama_model_qwen4exp::graph_mtp::graph_mtp`，约 564–755 行。
-- `src/models/delta-net-base.cpp::build_recurrent_attn` 的 K/n_written/gdn_out 到 rollback bank 路径，约 933 行以后；`build_conv_state` 的前缀历史保存。
-- `src/llama-context.cpp::{process_ubatch,decode_impl,output_reserve}`；`src/llama-model.cpp::dev_output`。
-- `ggml/src/ggml-backend-meta.cpp::ggml_backend_meta_device_get_host_buffer_type`，约 438–459 行；`ggml_backend_meta_get_tensor_async`，约 3068–3167 行。
-- `ggml/src/ggml-vulkan/ggml-vulkan.cpp::ggml_backend_vk_device_get_host_buffer_type`，约 25862 行；`ggml_vk_buffer_read_2d_async`，约 11038 行；`ggml_backend_vk_get_tensor_2d_async`，约 22460–22510 行。
-- `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp::{tp5_star_handoff,tp5_poll_gpu_timing,tp5_relay_submit_epoch_chain}`。
+战报的 96-stage relay 诊断为 producer-ready cumulative 46.403 ms、CPU relay work 3.225 ms、prefix transfer 0.106 ms。这是**特定旧诊断范围**，不是新的 83 tok/s 请求完整分账。它足以提示优先查 producer，但不足以给 CPU relay 承诺某个整请求节省数。
 
-外部语义仅采用原始论文与官方 Vulkan 文档：Leviathan 等的 speculative decoding 论文；vkCmdDispatchIndirect/VkDispatchIndirectCommand；dispatch 的 conditional-rendering 语义；calibrated timestamps；Vulkan synchronization。它们说明算法与 API 契约，不证明本工程已实现上述新路线，也不证明机器实际支持所有可选扩展。
+输出三张可决策表：
+
+- **阶段表**：每 phase 的调用数、rebuild/reuse、release/alloc、bind/record、首次与稳态时间；特别区分 native K/V-only 和 predefined 路径。
+- **producer 表**：按 stage 的关键路径贡献排序，列各 rank 的 shape、量化、实际 kernel、最慢 rank、ready skew。进一步区分大家都慢与某 rank 慢，不直接把 skew 命名为通信或 DPM。
+- **内存表**：权重、持久 KV/GDN、snapshot bank、临时 gdn_out、日志、target/draft scratch、readback slot 的 owner/live range/每卡字节；分别记录逻辑分配与 VRAM/GTT，不凭 GTT 猜某张权重发生迁移。
+
+跨 CPU/GPU 关联使用支持的 calibrated timestamps 并保存 deviation；不支持时保留各时钟域的局部时长与因果关系，不直接比较原始 tick。正式性能关闭 profiler。需要硬件 counters 时另开诊断，不把多 pass 的 counter 采样当正式吞吐。[外部契约 A、B]
+
+**G1 完成门：** 能解释当前总请求的大部分时间且残差公开；有未插桩对照证明观测扰动的量级；排名能明确选择 K1/E1/S1/D1 的下一项。没有可归因的大头，就不要再堆全局 flag。
+
+## 5. K1：首先核验已有的七行 matvec 改动
+
+### 5.1 本次发现的具体增量
+
+`git diff 16e28b8ac 9b3c33881` 显示，整合版的 `mul_mat_vec.comp` 已把原来 `num_rows == 1 && NUM_COLS > 1` 的复用快路扩展到多输出行。入口仍受 `K_PER_ITER == 8`、非 `MUL_MAT_ID`、非 `HC_DOWN_Q8_DOT` 等编译条件约束。
+
+必须区分三件事：
+
+1. **权重跨列复用**：整合版已有相应循环调整，不应重新从零实现，也不能未经命中统计断言所有 Qwen 投影都会获益。
+2. **activation staging**：实际代码条件是 `NUM_COLS <= 4`。附近注释写到 8，但不是当前执行条件。七列路径仍在每个输出行中加载 B；“只把 4 改成 7/8”不是已证明正确且更快的方案。
+3. **输出行 tile 扩大**：`ggml-vulkan.cpp` 的 `rm_wide` 改动只应用到 PQ2_0 对应 pipeline。不能把它的注释数字外推到本模型所有量化类型，也不能混淆输出行 tile 和 MTP 的 token 行数。
+
+### 5.2 实施阶梯
+
+先列实际七行执行中每类权重的 `(type, M, N, K, strides, rows-per-WG, NUM_COLS, flags)`，记录 guard 命中和关键路径占比。普通 `MUL_MAT`、专家 `MUL_MAT_ID`、HC fused region、small-Q8 要分开；MoE 的专家维度不是 horizon。
+
+做独立候选 K1a：从 `16e28b8ac` 出发，只移植/评估多行复用相关最小增量，保持编译和所有其他默认不变。完整整合版 B 另做兼容验证；不要用 B 相对 A 的收益冒充 K1a 独立收益。
+
+K1a 通过后，才选 K1b：对真实高占比的七列 shape 比较当前 per-row B load、有限列 staging、合理 row tile。每次只改变一个维度；记录寄存器、spill、LDS/occupancy（工具可用时）、真实字节模型与同形时间。寄存器占用可能限制并发，不能把“少 load”或“更高 occupancy”直接等同净收益。[外部契约 C]
+
+MoE 另统计每轮七个 token 的专家并集与复用次数。只有实际存在复用且重排不改变每 token 的专家选择/累加顺序，才讨论 grouping；不能把普通矩阵快路直接套到 `MUL_MAT_ID`。
+
+### 5.3 验收与退出
+
+先对齐真实 shape 和尾块：1、2、4、7 行及非整齐权重分片，覆盖连续不同输入、cold/replay、HC fold stride、small-Q8 和被排除的 fallback。逐元素比较，并明确是否改了浮点运算次序；改变数学顺序的候选单列数值资格。
+
+再看完整七行 target 和 MTP-off 单行保护线，最后完整 canonical ABBA。新核不命中就关闭该任务；局部快但整请求慢则退选。禁止取消既有 small-Q8 特例或强开 MMVQ 来掩盖问题。
+
+## 6. E1：先修 exact phase 生命周期，不先放宽 capacity
+
+源码入口：`llama_context::process_ubatch()`、`ubatch_execution_phase()`、`llm_graph_result::can_reuse()`、Meta binding 与 Vulkan replay。
+
+当前 native K/V-only 有独立 graph type；phase helper 对普通路径仍按 `n_tokens > n_seqs` 分类。phase 改变会 `gf_res_prev->reset()` 后 `ggml_backend_sched_release_buffers()`；predefined MTP 有豁免，但这不等于 native K/V-only 同样获益。这是**可核验的重复建图/分配风险**，其在 83 基座上的动态成本尚未测定。
+
+实施顺序：
+
+1. 在融合 control 记录 `DRAFT_ONE → CATCHUP_KV(rows) → DRAFT_ONE` 和 `TARGET_VERIFY(7) → partial → 7` 的 phase、graph UID、release/alloc、buffer generation 和实际 bind 时间。先确认发生几次、占多少，而不是引用旧首图约 100 ms。
+2. 建立显式的 draft、target verify、K/V-only 程序身份。第一版保持 **exact rows**；cache key 包含 graph type、真实形状/布局、headmap、精度、设备、内存 plan generation 及必要的 KV/attention 结构。positions、token 和 active metadata 只有在契约允许时才作为运行输入。
+3. 把可复用的执行定义与临时 arena 所有权分开。先解决安全保活与绑定计划，不急于同时存多份完整 scratch。记录新常驻内存；串行 phase 才可能复用同一 arena，重叠执行不能无条件 alias。
+4. 为输入 slot、descriptor、tensor view 和命令引用建立退休规则。旧 GPU 提交结束前不重写、不释放；异常、取消、shape 变化、context 销毁都要退回安全路径。
+
+不要为了少 reset 保留失效的旧 tensor 指针；不要复制一个 graph-result slot 就宣称有稳定双图；不要全局关闭 graph reuse，也不要通过伪造 UID 命中 cache。是否需要多个 exact shape 条目由实测频次和驻留预算决定，不一次缓存所有可能长度。
+
+**验收：** 反复 1→7→1、accepted=0…6、零输出 catch-up、context 扩展、取消后下一请求、销毁时 pending copy；guard/状态均正确。把进程首请求、请求内首 shape、steady replay 分开报告。仅降低服务启动成本的收益不能算作已降低 warm generation 时间。
+
+## 7. S1：GDN 精确恢复，先 shadow，后减少快照
+
+### 7.1 先建立状态合同
+
+`src/models/delta-net-base.cpp::build_recurrent_attn()` 当前用 `ggml_gated_delta_net_ext` 产生 `gdn_out`，再从其中的 snapshot view 拷贝到 recurrent bank；`K=n_rs_seq+1`、`n_written=min(executed_rows,K)`。共享/RERoT 状态另有分支。第一版只覆盖目标的单序列、非共享 GDN 路径，其他路径保留原实现。
+
+逐层列清：状态输入、工作状态、snapshot 顺序、`rs_idx`、卷积历史、普通 attention KV 有效范围、QSA 相关缓存、target hidden、sampler checkpoint，以及每次 accept 后的提交边界。**accepted=0 不自动等于消费了零个 target row**；anchor/bonus/correction 的映射必须来自现有 workspace/server oracle，禁止自行写 a 或 a+1。
+
+### 7.2 四级实现门
+
+**S1a：只读字节与成本模型。** 按每层、每 rank 的真实 headmap 计算 `state_bytes = sizeof(F32) × S_v × S_v × H_v_local`，再算实际快照数、临时物化、bank copy 及峰值 live allocation。逻辑写入、copy 读写、allocator 峰值不能混为一个数；先查后端是否已消除了某次 copy。
+
+**S1b：shadow replay。** 保留全部原快照。增加起点状态与逐步转移必要输入的只读日志，至少审阅 k/v/有效 gate/beta 和对应 head/layout/position 参数。复用原 GDN 的 F32 状态更新次序，在独立 shadow buffer 恢复每一个合法前缀，与原快照逐层逐位比较。不是重跑投影、MoE 和 LM head，也不是用代数简化改变舍入顺序。
+
+多行 kernel 与单步 kernel 未必有相同浮点顺序；未证明等价前不能只重复调用现成单步核冒称 exact。日志必须保存实际消费的精度和布局，不能通过低精度重算输入来“压缩”后又称精确恢复。
+
+**S1c：事务式恢复。** 仍保留原实现作为 oracle，验证起点 checkpoint、最终 working state、replay log 的 owner/generation。接受时按合法前缀发布，拒绝时恢复相应前缀，取消/失败时恢复或明确失效整个可复用槽位。卷积历史和 KV 有效区间同时处理，不只恢复 GDN 矩阵。
+
+**S1d：减少生产快照。** 前三门通过后，才在受限路径改成起点/终点＋日志或实测更划算的稀疏 checkpoint。旧全快照路径保留为回退；这不是重新启用已撤回的 direct snapshot injection。若专门研究消除中间 CPY，也必须先有相同的所有权/状态门，单独立项。
+
+### 7.3 收益与停止条件
+
+按实际事件区分 model mismatch、EOG、长度限制、取消、请求结束且不复用。不要把 token 接受率当作无恢复概率；不能只测计数题接近全接受的情况。
+
+`净收益 = 少物化/少写快照及驻留改善 − 日志开销 − Σ P(恢复到前缀 j) × 恢复成本(j)`。
+
+输出每个前缀的恢复时间、日志字节、峰值内存以及短/长上下文的真实事件分布。只有结束且明确不再复用状态，才可跳过无消费者的恢复；保留 prompt cache 时必须恢复或失效，不能留脏状态。
+
+任何一层、一个拒绝位置或下一请求不一致，停在 shadow，不删快照。若日志/恢复抵消收益，保留较简单的全快照实现。S1 的时间收益属于 target verify/恢复总项，不能与“target 提速”再相加一次。
+
+## 8. D1：两步设备闭环先过生死门，再做六步
+
+### 8.1 执行统一不等于所有算子强切五卡
+
+保留当前单卡 draft 的权重/放置作为第一版，和 TP5 target 统一提交、状态和生命周期契约。先证明去掉高层往返有收益，再决定是否需要多卡 draft。五卡放置本身已有负结果，不是完成闭环的标志。
+
+设备端仍有严格自回归因果关系。每一步依赖前一步 token/hidden，不得把六个草稿 token 当作独立并行 batch。可用有限步录制或有界命令程序，不使用永久满占用自旋 kernel。
+
+### 8.2 写代码前必须交的输入表
+
+| 输入/输出 | 每步规则 | 必须证明的事 |
+|---|---|---|
+| token | 第一步来自已提交 token，后续来自前步 sampler | 不再逐 token 回 CPU 才能做 embedding；无效 token 不得触发越界读取 |
+| embedding | 与该 token 对应的原权重行 | 检查实际 backend placement，不因图上存在 GET_ROWS 就假定设备闭环；不得盲目复制巨量 embedding 权重 |
+| hidden | 第一步用正确 carry，后续用本步 `t_h_nextn` | rank/宽度/owner/generation 正确，不 alias 未退休 scratch |
+| position、K/V index、mask | 每步与原单步执行相同 | 第一版可一次预制有界的六步 metadata，但不得漏掉环形 KV、上下文边界或按步有效范围 |
+| candidate、valid/EOG/cancel | 按 reference 的停止与提交语义处理 | 不能只有 dispatch=0，却仍写无效 KV 或让其他 rank 等不存在的 generation |
+| catch-up | 验收后使用 target 真实 hidden | 复用已验证 K/V-only，不能因 token 全接受就直接删掉 |
+
+源码入口为 `common_speculative_impl_draft_mtp::draft/commit`、`qwen4exp::graph_mtp`、`llm_graph_input_embd_h::set_input`、attention/KV input setter 与 backend replay。当前 setter 仍接受 host ubatch，所以只加 token CPY 或 external fence 不构成完整方案。
+
+### 8.3 两步原型的硬门
+
+先用相同权重、context、sampler、放置和 **n=2** 对照原实现：第一步 candidate → 第二步 embedding/MTP 必须在没有高层逐 token `llama_decode/common_sampler_sample` 往返的情况下完成。检查所有实际 enqueue、readback、host wait，而不是只计 API 名称。
+
+原型包含有效的 attention/KV 位置和 mask；不得以少做状态更新换速度。记录计算、真实 CPU 控制、额外 copy、首次录制和驻留。两步只是执行机制筛选，不与 n=6 的 83 tok/s 混比。
+
+两步完整请求不优于同 horizon 对照，或节省的边界成本小于新增开销，就停；不要机械扩到六步。通过后扩展 n=6，再与固定融合 control 做行为/性能全门。
+
+### 8.4 内存、同步与回退
+
+计算 scratch 按 live range 复用，token/hidden/metadata 用有界 slots。六份参数/命令不应自然膨胀成六份大 scratch。共享执行资源不能通过 `ctx_other=target` 偷换共享模型状态；target/draft 权重也必须逐张量核对后才允许 alias。
+
+shader 写入下一步输入后，满足 compute-write → compute-read 的可见性；如果写的是间接 dispatch 参数，另满足 compute-write → indirect-command-read，而不只加普通 shader-read barrier。是否支持具体 API/扩展以设备能力为准。[外部契约 A、D]
+
+第一版只覆盖明确证明的单序列、Qwen 单 MTP head、无共享 KV、受支持 greedy/backend sampling 条件。`p_min>0`、其他采样器/模型、并发、状态复用不满足契约时，在修改状态之前回退。执行后出错不能直接从半提交状态“重跑 fallback”；必须先恢复事务。
+
+## 9. V1/H1：最后兑现的小候选与策略
+
+### 9.1 target 小候选不是“temp=0 就可绕过采样器”
+
+`common/sampling.cpp` 的普通 chain 默认末尾仍添加 `dist`。即便当前输出 token 相同，RNG、history、grammar、reasoning budget、候选观察接口的状态都可能不同。不能为命中新快路把 canonical 的 chain 改成另一个 greedy workload。
+
+只有证明原链完整可观察行为等价的路径才准入；否则保持原路径。测试必须包含 checkpoint/rollback 后继续采样，不能只比当前 argmax。无效 logits 的策略、全无效词表、NaN/Inf、有符号零和相同最大值的 global-id tie 都以 reference 为准。
+
+候选 ABI 一次产生 `(value, global_token_id, valid, generation)`，支持不等长/空 vocab shard。不得先回读 index，再由 CPU 决定第二次 logit 回读。第一版可以在 CPU 合并小候选并顺序验收，不强求所有逻辑都上 GPU。
+
+以词表 248320、七行 F32 为例，全 logits 原始载荷为 6,952,960 字节；五 rank × 七行 × F32/I32 pair 是 280 字节，实际还要 valid/header/alignment。它只减少回读/物化，**不会免去 LM head 全词表计算**。所有字节数仍应由实际张量校验。
+
+只有 G1 证明此边界仍值得优化且新的端到端 pilot 改善，才继续。原 strict candidate、CPU compact 的负结果保持有效，不用“理论上少拷贝”推翻它们。
+
+### 9.2 自适应 horizon
+
+先固定 n=6 完成执行优化。随后记录每个候选位置的前缀存活概率、新增 draft/verify 成本、恢复分布、峰值显存和公开输出 token，而不是只记 accepted 总数。
+
+选择 horizon 的目标是提高 `E[公开提交 token] / E[完整 cycle 时间]`；多猜一步的边际收益要覆盖额外计算、恢复和驻留成本。合法策略不得使用尚不可得的 target 结果作弊。更换量化、卡布局、context 和 horizon 是不同因素，分别实验。
+
+## 10. 可直接执行的后续操作模板
+
+以下仅在明确恢复实施、工具允许相应目录、G0 的前置检查完成后使用。不得覆盖已存在的同名 worktree/build/artifact；缺少模型、工具链或证据时先停止该步骤并报告。
+
+### 10.1 建立固定 control 与候选
+
+```bash
+set -euo pipefail
+REPO="$HOME/atomic-llama-cpp-turboquant"
+CONTROL_WT="$HOME/tp5-control-20260926"
+CANDIDATE_WT="$HOME/tp5-candidate-20260926"
+BASE=16e28b8ac63c9fd5a54611070c6405f064f69a21
+
+git -C "$REPO" status --short
+git -C "$REPO" show --no-patch --format=fuller "$BASE"
+test ! -e "$CONTROL_WT" && test ! -e "$CANDIDATE_WT"
+git -C "$REPO" worktree add --detach "$CONTROL_WT" "$BASE"
+git -C "$REPO" worktree add -b work/tp5-next-20260926 "$CANDIDATE_WT" "$BASE"
+```
+
+这建立的是单因素实验起点，不是把 current dirty 或整合版整包抄进去。若任务专门验证整合版，另选固定 `9b3c33881`，保留相同 control。
+
+干净构建的最小模板如下；实际应先恢复已验收 toolchain/选项，不能声称这些默认值必然与历史构建完全一致。A/B 使用相同配置，build 目录必须新建。
+
+```bash
+: "${BUILD_JOBS:=4}"
+for WT in "$CONTROL_WT" "$CANDIDATE_WT"; do
+    test ! -e "$WT/build-review"
+    cmake -S "$WT" -B "$WT/build-review" \
+      -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DLLAMA_BUILD_TESTS=ON
+    cmake --build "$WT/build-review" --parallel "$BUILD_JOBS"
+    ctest --test-dir "$WT/build-review" -N
+    ctest --test-dir "$WT/build-review" --output-on-failure --no-tests=error \
+      -R '^(test-sampling|test-arg-parser|test-mtp-workspace|test-tp5-plan|test-target-capacity)$'
+done
+```
+
+不把 `ctest -N` 当通过，不把零测试或 return 77 的 GPU skip 当通过。GPU 定向测试按现有测试入口及所需 fixture 运行：ARGMAX、skinny/replay、rank-local readback `--vulkan`、GDN multistep、recurrent rollback；必须记录 backend 身份。新增状态/两步程序行为不由旧单测自动覆盖。
+
+### 10.2 正式性能模板
+
+先完成模型身份、五卡独占、watchdog、DSO、白名单环境与行为门。下面使用固定 control 的 harness，同一个已存在的 `native-mtp-fused-default` variant、两份二进制比较，避免误用脚本默认的不同 sync/wire 对照。
+
+```bash
+: "${TARGET_MODEL:?设为同一已验收 target GGUF 的首分片}"
+: "${MTP_MODEL:?设为同一已验收 MTP GGUF}"
+: "${RUN_DIR:?设为本实验新的证据目录}"
+test ! -e "$RUN_DIR"
+mkdir -p "$RUN_DIR"
+
+python3 "$CONTROL_WT/scripts/run-tp5-cross-matrix.py" \
+  --variant-a native-mtp-fused-default \
+  --variant-b native-mtp-fused-default \
+  --bin "$CONTROL_WT/build-review/bin/llama-server" \
+  --bin-b "$CANDIDATE_WT/build-review/bin/llama-server" \
+  --model "$TARGET_MODEL" --mtp-model "$MTP_MODEL" \
+  --blocks 5 --repeats 2 --count-to 60 \
+  --host 127.0.0.1 --port 8097 --max-wall-seconds 2400 \
+  --output "$RUN_DIR/abba.json"
+```
+
+候选必须在 B 中实际命中新机制；若以 opt-in 方式开发，需要显式加入同因素 B variant 并确认 resolved route，不能关着 feature 做虚假 ABBA。先用 `--list-variants`/`--dry-run` 检查 harness；dry run 是 NOT_MEASURED。`--smoke` 只验路线；不足五块须用 `--pilot`，不能升级为正式收益。
+
+harness 的 Git provenance 来自脚本所在仓库，不天然证明 B 的源码身份。额外保存 A/B 各自的 commit、dirty patch、未跟踪源码、CMake 配置、server 与所有实际 DSO 哈希。不要让两份 server 意外加载同一目录的旧 DSO。
+
+### 10.3 统计与发布门
+
+五个 ABBA block 是独立配对单元；A1/B1/B2/A2 内的重复请求不能伪装成更多独立 block。按 block 计算差值/比值和预先选定的置信区间，报告完整样本、mean/median、离散度和冷/热分类。保留首请求，不能丢弃坏样本后再称稳定。
+
+普通性能晋级要求完整行为通过、实际机制命中、整请求改善，并由预注册配对统计支持；仅非劣可因明确的正确性/维护价值保留，但不得宣传提速。小于噪声只称未检出收益，不反复抽样直到碰到显著。
+
+100 tok/s 的声明必须满足原 workload、无 profile、逐字正确、自然停止和 171/171；对应声明类别的预定正式样本都要满足 `predicted_ms<1710`，并给出完整分布。若仅 warm 达标，必须写“热请求达标”，不能隐去 cold 或把启动预计算说成免费。额外记录 client wall/首 token，但不替代 server 判据。
+
+成功合并后重新跑组合回归和正式对照，不相加 K1/S1/E1/D1 的局部最好值。未经用户明确要求不 commit/push；即使已授权推送，也先完成该实际提交的资格验证。
+
+## 11. 正确性矩阵、实验记录与源码索引
+
+### 11.1 每个相关工单必须覆盖的矩阵
+
+| 类别 | 覆盖要求 | 比较内容 |
+|---|---|---|
+| 接受/拒绝 | 全接受、accepted=0…6、真实 mismatch 与定向强制位置 | token/position、hidden carry、target/draft K/V、各层 GDN、卷积历史、有效范围 |
+| 结束/复用 | EOG、长度限制、stream cancel、取消后短/长请求、prompt-cache 复用 | 槽位有效性、generation、恢复/失效策略、下一请求输出与状态 |
+| 形状/寿命 | 1→7→1、partial rows、零 logits catch-up、扩容、pending readback、context 销毁 | guard bytes、旧指针/descriptor、未完成提交、无越界/悬空引用 |
+| 采样 | 原 canonical chain、有效 penalty、grammar、JSON、reasoning budget、随机采样与 rollback | 当前 token 以及后续 RNG/history/grammar 状态，unsupported 路径回退 |
+| 分片/数值 | 不等长/空 shard、tie、NaN/Inf、尾块、headmap、不同输入连续 replay | 与明确 reference 对拍；布局先规范化；浮点次序改变单列资格 |
+| 保护线 | MTP-off、既有 shared Vulkan/RERoT 回归、其他模型不命中新路径 | 不改变默认语义，不把单卡合成题作为五卡模型背书 |
+
+强制拒绝是定向测试手段，不替代真实模型拒绝；合成全接受性能不能冒充真实 workload。状态优化至少比较所有受影响层与下一次转移，不只看最终计数文本。
+
+### 11.2 每项实验留一个完整档案
+
+在新的 `artifacts/tp5-next-<日期>/<工单>/<run-id>/` 保存 manifest、单因素 diff、编译/单测日志、完整请求/响应、未插桩 ABBA、独立诊断、内存表、状态对拍、全部失败和最终裁决。临时日志可放 scratch，但正式资格证据应入库或明确可持久访问；不要再次只留下 SHA 前缀和已经消失的旧 binary。
+
+每份 `decision.md` 回答：改了什么；此前为什么失败、本次机制何处不同；实际命中什么；节省哪个互斥时间项/字节；新增多少内存/恢复成本；正确性和 fallback 是否通过；完整请求结果；保留还是撤回。没有证据就写待测，不补猜测数字。
+
+### 11.3 源码/本地证据索引
+
+- 最新性能：`TP5_FUSION_HANDOFF_2026-09-26.md` §1–3、§5–9；分支更正以本文件 §1 的本地 Git 核验为准。
+- 已完成 W1 与状态回归记录：`TP5.md` 开头“正确性优先的 MTP 续做”，`artifacts/tp5-mtp-readback-20260924/`。
+- 基座/整合差异：`git diff 16e28b8ac 9b3c33881 -- ggml/src/ggml-vulkan/ggml-vulkan.cpp ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp`。
+- 草稿与 catch-up：`common/speculative.cpp`、`common/speculative-mtp-workspace.h`、`src/models/qwen4exp.cpp`、`src/llama-graph.cpp`。
+- 状态：`src/models/delta-net-base.cpp`、`src/llama-memory-recurrent.{cpp,h}`、GDN shaders 与 `tests/test-vulkan-gdn-multistep.cpp`、`tests/test-recurrent-state-rollback.cpp`。
+- 程序/回读：`src/llama-context.{cpp,h}`、`ggml/src/ggml-backend-meta.cpp`、`ggml/src/ggml-vulkan/ggml-vulkan{,-collective}.cpp`。
+- 采样：`common/sampling.{cpp,h}`、`tools/server/server-context.cpp`、ARGMAX stage1/stage2 shaders。
+- 测试/跑测：`tests/CMakeLists.txt`、`tests/test-mtp-workspace.cpp`、`tests/test-tp5-plan.cpp`、`tests/test-target-capacity.cpp`、`tests/test-tp5-rank-local-readback.cpp`、`tests/test-vulkan-command-replay.cpp`、`scripts/run-tp5-cross-matrix.py`。
+
+外部契约仅解释 API/硬件约束，不证明本工程获得了性能收益；查阅日期 2026-09-26：
+
+- A：Khronos《Synchronization and Cache Control》与《Synchronization Examples》：`https://docs.vulkan.org/spec/latest/chapters/synchronization.html`、`https://docs.vulkan.org/guide/latest/synchronization_examples.html`。
+- B：Khronos《Calibrated Timestamps》：`https://docs.vulkan.org/samples/latest/samples/extensions/calibrated_timestamps/README.html`。
+- C：AMD GPUOpen《Occupancy explained》：`https://gpuopen.com/learn/occupancy-explained/`。
+- D：Khronos《Indirect Dispatch: Building Parameters on the GPU》：`https://github.khronos.org/Vulkan-Site/tutorial/latest/Advanced_Vulkan_Compute/07_GPU_Driven_Pipelines/02_indirect_dispatch.html`。
+
+**下一次恢复工作的首个交付不是新的 flag：是固定基座、现成 matvec 增量的命中清单，以及融合版当前的 phase/producer/内存三张账。随后用最小可验收补丁兑现约 350 ms 的缺口；无证据就停止该候选，不把实现规模当作进展。**
