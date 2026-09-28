@@ -818,6 +818,21 @@ void ggml_gallocr_buffer_pool_trim(ggml_gallocr_buffer_pool_t pool) {
             if (need >= cur) {
                 continue;
             }
+            // TP5 replay-cache stability: freeing a compute chunk at a decode/prefill
+            // phase transition erases every vk command-replay entry whose recorded CBs
+            // bind that buffer (ggml_backend_vk_buffer_free_buffer -> silent erase).
+            // On this 5xRX6800 box VRAM is not scarce and the re-record costs ~0.4 s per
+            // request (measured, decision.md §12.7), so keep the chunk instead. The next
+            // reserve still grows chunks when a larger size is required; only the
+            // shrink-to-zero/free churn is suppressed.
+            static int keep_chunks = -1;
+            if (keep_chunks < 0) {
+                const char * env = getenv("GGML_GALLOC_KEEP_CHUNKS");
+                keep_chunks = env ? atoi(env) : 1;   // default ON for the TP5 recipe
+            }
+            if (keep_chunks) {
+                continue;
+            }
             // need == 0 means nothing needs this chunk at all any more: free it and let the next
             // reserve allocate what its own graph asks for. Treating that case as "nothing to do"
             // is what made the release a no-op.
