@@ -130,6 +130,19 @@ bool common_sampler_replace_grammar(
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
+// G4a verify-argmax eligibility: true when the sampler's CPU result is
+// provably identical to per-row argmax for every row: temp<=0, mirostat off,
+// no grammar / reasoning budget / logit bias / penalties / dry / xtc, and the
+// remaining masking samplers (top_k/top_p/min_p/typical/top_n_sigma) at values
+// that can never remove the argmax. Used to gate backend verify-argmax mode.
+bool common_sampler_is_greedy_argmax_eligible(const struct common_sampler * gsmpl, const struct llama_vocab * vocab);
+
+// G4b verify-argmax (host): after the eligibility check above passes, enable
+// raw-argmax sampling (skips full-vocab materialization + chain walk per
+// row; RNG stream kept bit-identical). Opt-in; never enable for ineligible
+// chains.
+void common_sampler_set_verify_argmax_host(struct common_sampler * gsmpl, bool enabled);
+
 // helpers
 
 // access the internal list of current candidate tokens

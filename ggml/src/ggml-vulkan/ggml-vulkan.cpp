@@ -2964,7 +2964,7 @@ struct ggml_backend_vk_context {
     vk::CommandBuffer last_submitted_cmd_buf = VK_NULL_HANDLE;
     uint64_t scratch_generation = 0;
     const char * invalidate_reason = nullptr;
-    std::unordered_map<const ggml_cgraph *, vk_cached_subgraph> cgraph_cmd_cache;
+    std::unordered_map<const ggml_cgraph *, std::vector<vk_cached_subgraph>> cgraph_cmd_cache;
     // Reused only within one strict fingerprint comparison. It never survives
     // a comparison generation, so every replay lookup still validates its live
     // bindings; the caller separately checks the current scratch generation.
@@ -3317,25 +3317,38 @@ static bool ggml_vk_relay_payloads_ready(const ggml_backend_vk_context * ctx) {
 static bool ggml_vk_cache_fingerprint_match(ggml_backend_vk_context *                           ctx,
                                             const ggml_backend_vk_context::vk_cached_subgraph & entry,
                                             const ggml_cgraph *                                 cgraph) {
+    static int miss_diag_cnt = 0;
     const bool latebind_capture_requested = ctx->latebind_capture_graph == cgraph;
-    if (entry.latebind_capture_requested != latebind_capture_requested)
+    if (entry.latebind_capture_requested != latebind_capture_requested) {
+        if (++miss_diag_cnt <= 10) fprintf(stderr, "[FP-MISS] latebind_capture mismatch: entry=%d ctx=%d\n", (int)entry.latebind_capture_requested, (int)latebind_capture_requested);
         return false;
-    if (entry.tp5_program_requested != (ctx->tp5_definition_graph == cgraph))
+    }
+    if (entry.tp5_program_requested != (ctx->tp5_definition_graph == cgraph)) {
+        if (++miss_diag_cnt <= 10) fprintf(stderr, "[FP-MISS] tp5_program mismatch: entry=%d ctx=%d\n", (int)entry.tp5_program_requested, (int)(ctx->tp5_definition_graph == cgraph));
         return false;
+    }
     const bool wire_requested = cgraph->n_nodes > 0 && ctx->wire_target == cgraph->nodes[cgraph->n_nodes - 1];
-    if (entry.wire_requested != wire_requested)
+    if (entry.wire_requested != wire_requested) {
+        if (++miss_diag_cnt <= 10) fprintf(stderr, "[FP-MISS] wire_requested mismatch: entry=%d ctx=%d\n", (int)entry.wire_requested, (int)wire_requested);
         return false;
+    }
     const size_t requested_route_stage = wire_requested ? ctx->wire_relay_stage : SIZE_MAX;
-    if (entry.wire_route_stage != requested_route_stage)
+    if (entry.wire_route_stage != requested_route_stage) {
+        if (++miss_diag_cnt <= 10) fprintf(stderr, "[FP-MISS] wire_route_stage mismatch: entry=%zu ctx=%zu\n", entry.wire_route_stage, requested_route_stage);
         return false;
-    if (entry.wire_relay_f32 != (wire_requested && ctx->wire_relay_stage != SIZE_MAX && ctx->wire_relay_f32))
+    }
+    if (entry.wire_relay_f32 != (wire_requested && ctx->wire_relay_stage != SIZE_MAX && ctx->wire_relay_f32)) {
+        if (++miss_diag_cnt <= 10) fprintf(stderr, "[FP-MISS] wire_relay_f32 mismatch: entry=%d ctx=%d\n", (int)entry.wire_relay_f32, (int)(wire_requested && ctx->wire_relay_stage != SIZE_MAX && ctx->wire_relay_f32));
         return false;
+    }
     const uint64_t relay_payload_generation =
         entry.wire_relay_direct && wire_requested && ctx->wire_relay_stage != SIZE_MAX &&
                 ggml_vk_relay_payloads_ready(ctx) ?
             ctx->relay_payload_generation : 0;
-    if (entry.relay_payload_generation != relay_payload_generation)
+    if (entry.relay_payload_generation != relay_payload_generation) {
+        if (++miss_diag_cnt <= 10) fprintf(stderr, "[FP-MISS] relay_payload_gen mismatch: entry=%" PRIu64 " ctx=%" PRIu64 "\n", entry.relay_payload_generation, relay_payload_generation);
         return false;
+    }
     // Many tensors share one backend allocation. Resolve its current Vulkan
     // handle once within this validation call, never across graph mutations.
     std::array<std::pair<ggml_backend_buffer_t, VkBuffer>, 8> resolved_buffers{};
@@ -3357,22 +3370,36 @@ static bool ggml_vk_cache_fingerprint_match(ggml_backend_vk_context *           
     };
     auto match = [&](const ggml_tensor * t, const ggml_backend_vk_context::vk_tensor_fingerprint & fp) {
         if (fp.type != (uint32_t) t->type || fp.op != (int32_t) t->op) {
+            static int mtype_cnt = 0;
+            if (++mtype_cnt <= 10) fprintf(stderr, "[FP-TMISS] type/op t=%s entry=%u/%d cur=%d/%d\n", t->name, fp.type, fp.op, (int)t->type, (int)t->op);
             return false;
         }
         for (int k = 0; k < 4; ++k) {
-            if (fp.ne[k] != t->ne[k] || fp.nb[k] != t->nb[k])
+            if (fp.ne[k] != t->ne[k] || fp.nb[k] != t->nb[k]) {
+                static int mdim_cnt = 0;
+                if (++mdim_cnt <= 10) fprintf(stderr, "[FP-TMISS] ne/nb t=%s dim=%d entry ne=%" PRId64 " nb=%zu cur ne=%" PRId64 " nb=%zu\n", t->name, k, fp.ne[k], fp.nb[k], t->ne[k], t->nb[k]);
                 return false;
+            }
         }
-        if (memcmp(fp.op_params, t->op_params, sizeof(fp.op_params)) != 0)
+        if (memcmp(fp.op_params, t->op_params, sizeof(fp.op_params)) != 0) {
+            static int mop_cnt = 0;
+            if (++mop_cnt <= 10) fprintf(stderr, "[FP-TMISS] op_params t=%s\n", t->name);
             return false;
+        }
 
         size_t total_offs = 0;
         const ggml_tensor * root = ggml_vk_resolve_root_tensor(t, total_offs);
-        if (fp.data != root->data || fp.view_offs != total_offs)
+        if (fp.data != root->data || fp.view_offs != total_offs) {
+            static int mdata_cnt = 0;
+            if (++mdata_cnt <= 10) fprintf(stderr, "[FP-TMISS] data/offs t=%s\n", t->name);
             return false;
+        }
         ggml_backend_buffer_t buffer = root->buffer ? root->buffer : t->buffer;
-        if (fp.dev_buffer != current_buffer(buffer))
+        if (fp.dev_buffer != current_buffer(buffer)) {
+            static int mbuf_cnt = 0;
+            if (++mbuf_cnt <= 10) fprintf(stderr, "[FP-TMISS] dev_buffer t=%s\n", t->name);
             return false;
+        }
         return true;
     };
     bool     same_tensors = true;
@@ -3436,7 +3463,12 @@ static bool ggml_vk_cache_fingerprint_match(ggml_backend_vk_context *           
                 return false;
         }
     }
-    return index == entry.fingerprint_bindings.size() && n_unique == entry.fingerprint.size();
+    if (index != entry.fingerprint_bindings.size() || n_unique != entry.fingerprint.size()) {
+        static int mcnt_cnt = 0;
+        if (++mcnt_cnt <= 10) fprintf(stderr, "[FP-MISS] count mismatch: index=%zu bindings=%zu n_unique=%zu fp=%zu\n", index, entry.fingerprint_bindings.size(), n_unique, entry.fingerprint.size());
+        return false;
+    }
+    return true;
 }
 
 static void ggml_vk_cache_entry_free_resources(ggml_backend_vk_context * ctx, ggml_backend_vk_context::vk_cached_subgraph & entry) {
@@ -3475,8 +3507,8 @@ static void ggml_vk_cache_invalidate_all(ggml_backend_vk_context * ctx) {
     if (!ctx->cgraph_cmd_cache.empty()) {
         static int inv_log = 0;
         if (++inv_log <= 40) {
-            fprintf(stderr, "[cache-invalidate-all] sz=%zu scratch_gen=%llu reason=%s\n",
-                    ctx->cgraph_cmd_cache.size(), (unsigned long long) ctx->scratch_generation, ctx->invalidate_reason ? ctx->invalidate_reason : "?");
+            fprintf(stderr, "[cache-invalidate-all] ctx=%s sz=%zu scratch_gen=%llu reason=%s caller=%p\n",
+                    ctx->name.c_str(), ctx->cgraph_cmd_cache.size(), (unsigned long long) ctx->scratch_generation, ctx->invalidate_reason ? ctx->invalidate_reason : "?", __builtin_return_address(0));
             ctx->invalidate_reason = nullptr;
         }
     }
@@ -3486,7 +3518,9 @@ static void ggml_vk_cache_invalidate_all(ggml_backend_vk_context * ctx) {
         ggml_vk_synchronize(ctx);
     }
     for (auto & pair : ctx->cgraph_cmd_cache) {
-        ggml_vk_cache_entry_free_resources(ctx, pair.second);
+        for (auto & entry : pair.second) {
+            ggml_vk_cache_entry_free_resources(ctx, entry);
+        }
     }
     ctx->cgraph_cmd_cache.clear();
     ctx->wire_outputs.clear();
@@ -6843,29 +6877,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                               SHADER_REDUCTION_MODE_SHMEM;
 
         for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
-            // Every workgroup of a matvec re-reads the whole activation vector, so
-            // the B traffic scales with the workgroup count (m / rows). At one
-            // column that traffic is already the co-dominant term (m=17408 k=5120:
-            // 178 MB of B through L2 at ~2.5 TB/s = 71 us next to 55 us of weight
-            // DRAM, measured 74.9 us); at six columns it is 1.07 GB and the same op
-            // takes 249 us. Widening the row tile for wide dispatches divides that
-            // traffic without touching the weight traffic, which is already shared
-            // across the columns inside the shader.
-            // NUM_COLS 13..18 with the 4x row tile spill the per-thread accumulator
-            // array (temp[NUM_COLS][NUM_ROWS] = 13..18 x 8 floats) beyond the
-            // register budget and the shader falls off a cliff: measured prefill
-            // throughput drops 4x going from 12 to 13 columns (112.8 -> 28.2 t/s
-            // on Bonsai PQ2_0, RX 6800). Halve the row tile there so the
-            // accumulator fits; the extra activation re-reads are far cheaper
-            // than the spill (n=1 runs at 317 GB/s effective with this tile).
-            const uint32_t rm_wide = (i + 1) >= 13 ? 2u : ((i + 1) >= 4 ? 4u : ((i + 1) >= 2 ? 2u : 1u));
-            (void) rm_wide;
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f32_f32", arr_dmmv_q1_0_f32_f32_len[reduc], arr_dmmv_q1_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f32_f32", arr_dmmv_q2_0_f32_f32_len[reduc], arr_dmmv_q2_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_PQ2_0][i], "mul_mat_vec_pq2_0_f32_f32", arr_dmmv_pq2_0_f32_f32_len[reduc], arr_dmmv_pq2_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*2*rm_stdq, 1, 1}, {wg_size_subgroup, rm_wide*2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_PQ2_0][i], "mul_mat_vec_pq2_0_f32_f32", arr_dmmv_pq2_0_f32_f32_len[reduc], arr_dmmv_pq2_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f32_f32", arr_dmmv_q4_0_f32_f32_len[reduc], arr_dmmv_q4_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_f32_f32", arr_dmmv_q4_1_f32_f32_len[reduc], arr_dmmv_q4_1_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f32_f32", arr_dmmv_q5_0_f32_f32_len[reduc], arr_dmmv_q5_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
@@ -6893,7 +6910,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f16_f32", arr_dmmv_bf16_f16_f32_len[reduc], arr_dmmv_bf16_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f16_f32", arr_dmmv_q1_0_f16_f32_len[reduc], arr_dmmv_q1_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f16_f32", arr_dmmv_q2_0_f16_f32_len[reduc], arr_dmmv_q2_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_PQ2_0][i], "mul_mat_vec_pq2_0_f16_f32", arr_dmmv_pq2_0_f16_f32_len[reduc], arr_dmmv_pq2_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_wide*2*rm_stdq, 1, 1}, {wg_size_subgroup, rm_wide*2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_PQ2_0][i], "mul_mat_vec_pq2_0_f16_f32", arr_dmmv_pq2_0_f16_f32_len[reduc], arr_dmmv_pq2_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f16_f32", arr_dmmv_q4_0_f16_f32_len[reduc], arr_dmmv_q4_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_f16_f32", arr_dmmv_q4_1_f16_f32_len[reduc], arr_dmmv_q4_1_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f16_f32", arr_dmmv_q5_0_f16_f32_len[reduc], arr_dmmv_q5_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
@@ -9525,8 +9542,8 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
         const char * value = getenv(name);
         return value && strcmp(value, "0") != 0 && strcmp(value, "off") != 0 && strcmp(value, "false") != 0;
     };
-    ctx->mmvq_mode = requested("GGML_VK_DISABLE_MMVQ") ? -1 :
-                     requested("GGML_VK_FORCE_MMVQ") ? 1 : 0;
+    ctx->mmvq_mode = requested("GGML_VK_FORCE_MMVQ") ? 1 :
+                     requested("GGML_VK_DISABLE_MMVQ") ? -1 : 0;
     fprintf(stderr, "[vulkan-mmvq-policy] backend=%s mode=%s\n", ctx->name.c_str(),
             ctx->mmvq_mode < 0 ? "disabled" : ctx->mmvq_mode > 0 ? "forced" : "auto");
     if (const char * env_argmax = getenv("GGML_VK_ARGMAX_HIERARCHICAL")) {
@@ -13893,20 +13910,13 @@ static bool ggml_vk_flash_attn_rerot_shmem_support(const vk_device & device, con
 // retain the single-head scalar path and its direct-load fallback.
 static bool ggml_vk_flash_attn_rerot_tune(const vk_device & device, uint32_t hsk, uint32_t hsv, uint32_t n_kv, ggml_type k_type, ggml_type v_type, uint32_t head_group, vk_fa_tuning_params & out) {
     vk_fa_tuning_params params = get_fa_tuning_params_scalar(device, hsk, hsv, 1, n_kv, k_type, v_type, true);
-    // Grouped heads is the DEFAULT since the 2026-09-26 qualification: a
-    // complete paired model run (Bonsai PQ2_0 / RX 6800 / thinking wire,
-    // seeds 777/12345/20260923 back-to-back) passed after the become-leak fix
-    // (KV-level tools-ad occlusion) and the force-seal slot-release fix --
-    // the two defects that had failed its earlier qualification were both
-    // elsewhere. Per-episode attention cost drops 18.7 s -> 4.2 s. Devices
-    // or shapes that cannot stage the group keep the single-head scalar path
-    // below. GGML_VK_REROT_GROUPED_HEADS=0 restores the Br=1 route for A/B.
     const char * grouped_env = getenv("GGML_VK_REROT_GROUPED_HEADS");
-    if (grouped_env && strcmp(grouped_env, "1") != 0 && strcmp(grouped_env, "0") != 0) {
-        GGML_ABORT("GGML_VK_REROT_GROUPED_HEADS must be '1' or '0' (got '%s')", grouped_env);
+    if (grouped_env && strcmp(grouped_env, "1") != 0) {
+        GGML_ABORT("GGML_VK_REROT_GROUPED_HEADS must be exactly '1' (got '%s')", grouped_env);
     }
-    const bool grouped_on = !grouped_env || strcmp(grouped_env, "1") == 0;
-    if (grouped_on && !params.disable_subgroups && params.subgroup_size > 0) {
+    // Preserve the historically validated Br=1 route until a complete
+    // paired model run qualifies grouped RERoT attention.
+    if (grouped_env && !params.disable_subgroups && params.subgroup_size > 0) {
         for (uint32_t heads = head_group; heads > 1; --heads) {
             if (head_group % heads != 0) {
                 continue;
@@ -22018,23 +22028,37 @@ static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
             std::lock_guard<std::recursive_mutex> guard(dev->mutex);
             for (auto * bctx : dev->registered_contexts) {
                 bool any_freed = false;
-                for (auto it = bctx->cgraph_cmd_cache.begin(); it != bctx->cgraph_cmd_cache.end(); ) {
-                    bool uses_freed = false;
-                    for (const auto & owner : it->second.buffer_owners) {
-                        if (owner && owner->buffer == freed_handle) {
-                            uses_freed = true;
-                            break;
+                for (auto map_it = bctx->cgraph_cmd_cache.begin(); map_it != bctx->cgraph_cmd_cache.end(); ) {
+                    auto & vec = map_it->second;
+                    for (auto it = vec.begin(); it != vec.end(); ) {
+                        bool uses_freed = false;
+                        for (const auto & owner : it->buffer_owners) {
+                            if (owner && owner->buffer == freed_handle) {
+                                uses_freed = true;
+                                break;
+                            }
+                        }
+                        if (uses_freed) {
+                            any_freed = true;
+                            ggml_vk_cache_entry_free_resources(bctx, *it);
+                            it = vec.erase(it);
+                        } else {
+                            ++it;
                         }
                     }
-                    if (uses_freed) {
-                        any_freed = true;
-                        ggml_vk_cache_entry_free_resources(bctx, it->second);
-                        it = bctx->cgraph_cmd_cache.erase(it);
+                    if (vec.empty()) {
+                        map_it = bctx->cgraph_cmd_cache.erase(map_it);
                     } else {
-                        ++it;
+                        ++map_it;
                     }
                 }
                 if (any_freed) {
+                    static const bool trace_free = getenv("GGML_VK_TRACE_CACHE_FREE") != nullptr;
+                    if (trace_free) {
+                        fprintf(stderr, "[vk-cache-free] ctx=%s freed_buffer=%p size=%zu remaining_graphs=%zu\n",
+                                bctx->name.c_str(), (void *) freed_handle, ggml_backend_buffer_get_size(buffer),
+                                bctx->cgraph_cmd_cache.size());
+                    }
                     ggml_vk_synchronize(bctx);
                 }
             }
@@ -24464,28 +24488,36 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
     const bool replay_enabled = ggml_vk_cmd_replay_enabled();
     const bool replay_eligible = replay_enabled && ggml_vk_cgraph_decode_replay_eligible(ctx, cgraph);
-
-    // Evict if cache exceeds working set capacity (512 entries to hold trunk 97 + MTP 4 subgraphs + variations)
-    // Do this BEFORE looking up or creating cache_entry to avoid invalidating a live reference!
-    if (ctx->cgraph_cmd_cache.size() >= 512) {
-        ctx->invalidate_reason = "cache_capacity_512";
-        ggml_vk_cache_invalidate_all(ctx);
+    static int g_compute_call = 0;
+    if (0 && ++g_compute_call <= 35) {
+        fprintf(stderr, "[graph-compute-call %d] ctx=%s n_nodes=%d replay_eligible=%d cgraph=%p\n",
+                g_compute_call, ctx->name.c_str(), cgraph->n_nodes, replay_eligible, (const void*)cgraph);
     }
 
-    auto it = ctx->cgraph_cmd_cache.find(cgraph);
-    if (it == ctx->cgraph_cmd_cache.end()) {
-        for (auto iter = ctx->cgraph_cmd_cache.begin(); iter != ctx->cgraph_cmd_cache.end(); ++iter) {
-            if (iter->second.valid && iter->second.n_nodes == cgraph->n_nodes &&
-                ggml_vk_cache_fingerprint_match(ctx, iter->second, cgraph)) {
-                it = iter;
+    ggml_backend_vk_context::vk_cached_subgraph * it_entry = nullptr;
+    auto map_it = ctx->cgraph_cmd_cache.find(cgraph);
+    if (map_it != ctx->cgraph_cmd_cache.end()) {
+        for (auto & entry : map_it->second) {
+            if (entry.valid && entry.n_nodes == cgraph->n_nodes &&
+                entry.scratch_gen == ctx->scratch_generation &&
+                ggml_vk_cache_fingerprint_match(ctx, entry, cgraph)) {
+                it_entry = &entry;
                 break;
             }
         }
     }
-    if (it != ctx->cgraph_cmd_cache.end() && it->second.valid &&
-        (!replay_eligible || it->second.scratch_gen != ctx->scratch_generation ||
-         !ggml_vk_cache_fingerprint_match(ctx, it->second, cgraph))) {
-        ggml_vk_cache_entry_free_resources(ctx, it->second);
+    if (it_entry == nullptr) {
+        for (auto & pair : ctx->cgraph_cmd_cache) {
+            for (auto & entry : pair.second) {
+                if (entry.valid && entry.n_nodes == cgraph->n_nodes &&
+                    entry.scratch_gen == ctx->scratch_generation &&
+                    ggml_vk_cache_fingerprint_match(ctx, entry, cgraph)) {
+                    it_entry = &entry;
+                    break;
+                }
+            }
+            if (it_entry) break;
+        }
     }
 
     if (replay_eligible) {
@@ -24495,12 +24527,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_tp5_flush_async(backend);
     }
 
-    if (it != ctx->cgraph_cmd_cache.end() && replay_enabled && replay_eligible && it->second.valid &&
-        it->second.n_nodes == cgraph->n_nodes && it->second.scratch_gen == ctx->scratch_generation &&
-        ggml_vk_cache_fingerprint_match(ctx, it->second, cgraph)) {
+    if (it_entry != nullptr && replay_enabled && replay_eligible) {
+        auto & matched_entry = *it_entry;
         if (standalone_mtp) {
-            if (it->second.cmd_bufs.empty()) return GGML_STATUS_FAILED;
-            const auto first_cb = (void *) (VkCommandBuffer) it->second.cmd_bufs.front();
+            if (matched_entry.cmd_bufs.empty()) return GGML_STATUS_FAILED;
+            const auto first_cb = (void *) (VkCommandBuffer) matched_entry.cmd_bufs.front();
             const auto program = ggml_vk_tp5_graph_program(backend, first_cb);
             // No indirect slots means every command already computes the full
             // capacity, exactly as detached MTP drafts did before this path.
@@ -24523,18 +24554,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         ctx->replay_hits++;
-        if (!ggml_vk_publish_wire_output(ctx, terminal, it->second.wire_output,
-                                    it->second.wire_relay_direct, it->second.wire_route_stage,
-                                    it->second.wire_relay_f32, it->second.wire_row_dispatch)) {
+        if (!ggml_vk_publish_wire_output(ctx, terminal, matched_entry.wire_output,
+                                    matched_entry.wire_relay_direct, matched_entry.wire_route_stage,
+                                    matched_entry.wire_relay_f32, matched_entry.wire_row_dispatch)) {
             return GGML_STATUS_FAILED;
         }
         if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
             prof->compute_replay_hits++;
         }
         ggml_vk_submit_transfer_ctx(ctx);
-        if (!it->second.cmd_bufs.empty()) {
+        if (!matched_entry.cmd_bufs.empty()) {
             std::vector<vk::SubmitInfo> submits;
-            submits.reserve(it->second.cmd_bufs.size());
+            submits.reserve(matched_entry.cmd_bufs.size());
             vk::TimelineSemaphoreSubmitInfo tl_info{};
             vk::PipelineStageFlags stage{};
             bool need_transfer_wait = ctx->device->async_use_transfer_queue &&
@@ -24544,10 +24575,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 tl_info.pWaitSemaphoreValues = &ctx->transfer_semaphore.value;
                 stage = ctx->device->transfer_queue->stage_flags;
             }
-            for (size_t c_idx = 0; c_idx < it->second.cmd_bufs.size(); ++c_idx) {
+            for (size_t c_idx = 0; c_idx < matched_entry.cmd_bufs.size(); ++c_idx) {
                 vk::SubmitInfo si{};
                 si.commandBufferCount = 1;
-                si.pCommandBuffers = &it->second.cmd_bufs[c_idx];
+                si.pCommandBuffers = &matched_entry.cmd_bufs[c_idx];
                 if (c_idx == 0 && need_transfer_wait) {
                     si.waitSemaphoreCount = 1;
                     si.pWaitSemaphores = &ctx->transfer_semaphore.s;
@@ -25251,7 +25282,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         total_vk_compute_us = 0;
     }
     if (ctx->replay_recording) {
-        auto & cache_entry = ctx->cgraph_cmd_cache[cgraph];
+        auto & vec = ctx->cgraph_cmd_cache[cgraph];
+        if (vec.size() >= 4) {
+            ggml_vk_cache_entry_free_resources(ctx, vec.front());
+            vec.erase(vec.begin());
+        }
+        vec.emplace_back();
+        auto & cache_entry = vec.back();
         cache_entry.valid = true;
         cache_entry.n_nodes = cgraph->n_nodes;
         cache_entry.cgraph_uid = cgraph->uid;
@@ -27772,49 +27809,56 @@ bool ggml_vk_tp5_get_cached_cmd_bufs(ggml_backend_t backend, ggml_cgraph * cgrap
         fprintf(stderr, "[pfn_get_cbs-inelig] nodes=%d uid=%llu\n", cgraph->n_nodes, (unsigned long long) cgraph->uid);
         return false;
     }
-    // Prefer the exact graph. UID zero is unset, not an identity shared by
-    // every hand-built graph; it must never shadow an exact cache entry.
-    auto it = ctx->cgraph_cmd_cache.find(cgraph);
-    if (it == ctx->cgraph_cmd_cache.end()) {
-        for (auto iter = ctx->cgraph_cmd_cache.begin(); iter != ctx->cgraph_cmd_cache.end(); ++iter) {
-            if (iter->second.valid && iter->second.n_nodes == cgraph->n_nodes &&
-                ggml_vk_cache_fingerprint_match(ctx, iter->second, cgraph)) {
-                it = iter;
+    const ggml_backend_vk_context::vk_cached_subgraph * it_entry = nullptr;
+    auto map_it = ctx->cgraph_cmd_cache.find(cgraph);
+    if (map_it != ctx->cgraph_cmd_cache.end()) {
+        for (const auto & entry : map_it->second) {
+            if (entry.valid && entry.n_nodes == cgraph->n_nodes &&
+                entry.scratch_gen == ctx->scratch_generation &&
+                ggml_vk_cache_fingerprint_match(ctx, entry, cgraph)) {
+                it_entry = &entry;
                 break;
             }
         }
     }
-    if (it == ctx->cgraph_cmd_cache.end()) {
+    if (!it_entry) {
+        for (auto & pair : ctx->cgraph_cmd_cache) {
+            for (auto & entry : pair.second) {
+                if (entry.valid && entry.n_nodes == cgraph->n_nodes &&
+                    entry.scratch_gen == ctx->scratch_generation &&
+                    ggml_vk_cache_fingerprint_match(ctx, entry, cgraph)) {
+                    it_entry = &entry;
+                    break;
+                }
+            }
+            if (it_entry) break;
+        }
+    }
+    if (!it_entry) {
+        static int fail_cnt = 0;
+        if (++fail_cnt <= 20) {
+            fprintf(stderr, "[pfn_get_cbs-miss-detail] cache_size=%zu scratch_gen=%zu cgraph=%p nodes=%d uid=%llu\n",
+                    ctx->cgraph_cmd_cache.size(), ctx->scratch_generation, (void*)cgraph, cgraph->n_nodes, (unsigned long long)cgraph->uid);
+        }
         return false;
     }
-    if (it != ctx->cgraph_cmd_cache.end() && it->second.valid && it->second.n_nodes == cgraph->n_nodes &&
-        it->second.scratch_gen == ctx->scratch_generation &&
-        ggml_vk_cache_fingerprint_match(ctx, it->second, cgraph)) {
+    const auto & entry = *it_entry;
         out_cbs.clear();
-        out_cbs.reserve(it->second.cmd_bufs.size());
-        for (auto cb : it->second.cmd_bufs) {
+        out_cbs.reserve(entry.cmd_bufs.size());
+        for (auto cb : entry.cmd_bufs) {
             out_cbs.push_back((void *) (VkCommandBuffer) cb);
-        }
-        if (!ggml_vk_publish_wire_output(ctx, cgraph->nodes[cgraph->n_nodes - 1], it->second.wire_output,
-                                    it->second.wire_relay_direct, it->second.wire_route_stage,
-                                    it->second.wire_relay_f32, it->second.wire_row_dispatch)) {
-            out_cbs.clear();
+    }
+        if (!ggml_vk_publish_wire_output(ctx, cgraph->nodes[cgraph->n_nodes - 1], entry.wire_output,
+                                    entry.wire_relay_direct, entry.wire_route_stage,
+                                    entry.wire_relay_f32, entry.wire_row_dispatch)) {
+        out_cbs.clear();
             return false;
-        }
+    }
         ctx->replay_hits++;
         if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
             prof->compute_replay_hits++;
-        }
+    }
         return true;
-    }
-    static int mismatch_cnt = 0;
-    if (++mismatch_cnt <= 5) {
-        fprintf(stderr, "[pfn_get_cbs-mismatch] valid=%d nodes=(%d vs %d) sgen=(%llu vs %llu) n_cbs=%zu fpmatch=%d\n",
-                it->second.valid, it->second.n_nodes, cgraph->n_nodes, (unsigned long long) it->second.scratch_gen,
-                (unsigned long long) ctx->scratch_generation, it->second.cmd_bufs.size(),
-                ggml_vk_cache_fingerprint_match(ctx, it->second, cgraph));
-    }
-    return false;
 }
 
 // Transfer (SDMA) queue accessor: cross-device DMA-BUF copies belong on the DMA engine,

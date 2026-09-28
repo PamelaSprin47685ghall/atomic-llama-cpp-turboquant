@@ -4045,6 +4045,16 @@ struct llama_sampler * llama_sampler_init_infill(const struct llama_vocab * voca
 
 // utils
 
+bool llama_sampler_dist_draw(struct llama_sampler * smpl) {
+    if (!smpl || !smpl->iface || strcmp(smpl->iface->name(smpl), "dist") != 0) {
+        return false;
+    }
+    auto * ctx = (llama_sampler_dist *) smpl->ctx;
+    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+    dist(ctx->rng);
+    return true;
+}
+
 uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl) {
     if (smpl->iface == &llama_sampler_dist_i) {
         return ((const llama_sampler_dist *) smpl->ctx)->seed_cur;

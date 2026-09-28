@@ -488,8 +488,14 @@ void common_tp5_apply_env(common_params & params) {
     if (mtp_requested && latebind && (std::strcmp(latebind, "hc-down") == 0 ||
         std::strcmp(latebind, "1") == 0 || std::strcmp(latebind, "on") == 0)) {
         const char * exact_q = getenv("GGML_TP5_LATEBIND_EXACT_Q");
+        // Approximate-Q LateBind modes (aggressive-q8, p1a-nosidecar-q8) stay
+        // fail-closed by default. Explicit opt-in via GGML_TP5_LATEBIND_ALLOW_APPROX
+        // releases only the "explicit exact Q" clause, never the topology/wire checks.
+        const char * allow_approx_env = getenv("GGML_TP5_LATEBIND_ALLOW_APPROX");
+        const bool   allow_approx     = allow_approx_env && atoi(allow_approx_env) != 0;
+        const bool   exact_ok         = exact_q && std::strcmp(exact_q, "1") == 0;
         if (!qualified || effective_sync != "relay" || effective_wire != "f32" ||
-            !exact_q || std::strcmp(exact_q, "1") != 0) {
+            (!exact_ok && !allow_approx)) {
             throw std::runtime_error("TP5+MTP LateBind requires five distinct RX 6800 ranks, RELAY/F32, and explicit exact Q");
         }
     }
@@ -2351,6 +2357,12 @@ std::string common_token_to_piece(const struct llama_context * ctx, llama_token 
 }
 
 std::string common_token_to_piece(const struct llama_vocab * vocab, llama_token token, bool special) {
+    static std::vector<std::string> token_piece_cache(262144);
+    if (token >= 0 && (size_t) token < token_piece_cache.size() && !special) {
+        if (!token_piece_cache[token].empty()) {
+            return token_piece_cache[token];
+        }
+    }
     std::string piece;
     piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
     const int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
@@ -2361,6 +2373,9 @@ std::string common_token_to_piece(const struct llama_vocab * vocab, llama_token 
     }
     else {
         piece.resize(n_chars);
+    }
+    if (token >= 0 && (size_t) token < token_piece_cache.size() && !special) {
+        token_piece_cache[token] = piece;
     }
 
     return piece;

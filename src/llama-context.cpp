@@ -2796,6 +2796,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
+        const int64_t t_inp_0 = ggml_time_us();
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         try {
             // The borrowed device binding lives only for this call; gparams
@@ -2806,8 +2807,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        const int64_t t_inp_us = ggml_time_us() - t_inp_0;
+        static int inp_log = 0; if (ubatch.n_tokens == 1 && ++inp_log <= 10) fprintf(stderr, "[NOMTP_DECOMPOSE] set_inputs=%5.2f ms\n", t_inp_us / 1000.0);
     }
+    const int64_t t_comp_0 = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const int64_t t_comp_us = ggml_time_us() - t_comp_0;
+    static int comp_log = 0; if (ubatch.n_tokens == 1 && ++comp_log <= 10) fprintf(stderr, "[NOMTP_DECOMPOSE] graph_compute=%5.2f ms status=%d\n", t_comp_us / 1000.0, status);
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -7190,17 +7197,6 @@ bool llama_memory_rerot_set_reader_view(
     internal.frontier_mode = view->frontier_mode;
     internal.ordered_runs.assign(view->ordered_run_ids, view->ordered_run_ids + view->n_ordered_runs);
     return mem->rerot_set_reader_view(seq_id, internal);
-}
-
-bool llama_memory_rerot_occlude_base_range(
-        llama_memory_t mem,
-          llama_seq_id seq_id,
-          llama_pos pos_begin,
-          llama_pos pos_end) {
-    if (!mem) {
-        return false;
-    }
-    return mem->rerot_occlude_base_range(seq_id, pos_begin, pos_end);
 }
 
 void llama_memory_rerot_clear_reader_view(

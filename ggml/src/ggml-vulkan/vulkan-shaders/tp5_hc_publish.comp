@@ -33,9 +33,24 @@ layout(std430, binding = 1) coherent writeonly buffer HostSidecar {
 layout(std430, binding = 2) coherent volatile buffer Status {
     uint status[];
 };
+#ifdef TP5_PUBLISH_STATS
+// LB2: the same publication also carries the RMS sufficient statistics
+// (a_b, d_b, s_b per token per stream: 12 words per token, raw layout)
+// so the CPU can finish rho during the Y reduction — no second doorbell
+// for the Q sidecar.
+layout(std430, binding = 3) readonly buffer LocalStats {
+    uint stats_src[];
+};
+layout(std430, binding = 4) coherent writeonly buffer HostStats {
+    uint stats_dst[];
+};
+#endif
 
 layout(push_constant) uniform Params {
     uint n_uvec4;
+#ifdef TP5_PUBLISH_STATS
+    uint n_stats;   // raw word count (tokens * 12)
+#endif
 } p;
 
 void main() {
@@ -47,6 +62,11 @@ void main() {
         dst[i] = src[i];
 #endif
     }
+#ifdef TP5_PUBLISH_STATS
+    for (uint i = lane; i < p.n_stats; i += 64u) {
+        stats_dst[i] = stats_src[i];
+    }
+#endif
 
     // All sidecar stores come from this one workgroup. Order every lane's
     // payload stores before publishing the CPU-visible ready word.

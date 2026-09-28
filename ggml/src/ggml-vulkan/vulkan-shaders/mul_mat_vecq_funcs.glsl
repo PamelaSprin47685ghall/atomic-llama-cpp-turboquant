@@ -562,3 +562,103 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     return sum;
 }
 #endif
+
+// Multi-column dot helper: only meaningful inside the MMVQ mat-vec kernel, which
+// is the only unit that declares NUM_COLS / NUM_ROWS (mul_mat_vec_base.glsl, as
+// spec constants) and defines K_PER_ITER. Other includers -- notably
+// qwen4_attention_mmvq.glsl, which pulls this file in four times just for the
+// quant dot helpers and carries its own fixed cache_b_qs[4] -- define the same
+// DATA_A_*_K macros without any of those parameters, so a guard keyed on the
+// quant type alone selects this code in a context where it cannot compile.
+// MMQ is the discriminator: mul_mat_vecq.comp defines it; the qwen4 path does not.
+#if defined(MMQ) && (defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K))
+void mmvq_dot_multi(const uint ib_a, const uint iqs, inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint n,
+                    const int32_t b_qs_multi[NUM_COLS][K_PER_ITER / 4], const vec2 b_ds_multi[NUM_COLS]) {
+    const i32vec4 qs_a = repack4(ib_a, iqs * 4);
+    const vec2 dm_scale = get_dm_scale(ib_a, iqs * 4);
+    const float dm_scale_x = float(dm_scale.x);
+    const float dm_scale_y = float(dm_scale.y);
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#ifdef TP5_RELAY_ROWS
+        if (!mat_vec_col_active(j)) continue;
+#endif
+        int32_t q_sum = 0;
+        q_sum += dotPacked4x8EXT(qs_a.x, b_qs_multi[j][0]);
+        q_sum += dotPacked4x8EXT(qs_a.y, b_qs_multi[j][1]);
+        q_sum += dotPacked4x8EXT(qs_a.z, b_qs_multi[j][2]);
+        q_sum += dotPacked4x8EXT(qs_a.w, b_qs_multi[j][3]);
+
+        temp[j][n] += FLOAT_TYPE(float(b_ds_multi[j].x) * dm_scale_x * float(q_sum) - dm_scale_y * float(b_ds_multi[j].y / 2));
+    }
+}
+#define HAS_MMVQ_DOT_MULTI 1
+#elif defined(MMQ) && (defined(DATA_A_Q6_K))
+void mmvq_dot_multi(const uint ib_a, const uint iqs, inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint n,
+                    const int32_t b_qs_multi[NUM_COLS][K_PER_ITER / 4], const vec2 b_ds_multi[NUM_COLS]) {
+    const i32vec4 qs_a = repack4(ib_a, iqs * 4);
+    const float d_scale = get_d_scale(ib_a, iqs * 4);
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#ifdef TP5_RELAY_ROWS
+        if (!mat_vec_col_active(j)) continue;
+#endif
+        int32_t q_sum = 0;
+        q_sum += dotPacked4x8EXT(qs_a.x, b_qs_multi[j][0]);
+        q_sum += dotPacked4x8EXT(qs_a.y, b_qs_multi[j][1]);
+        q_sum += dotPacked4x8EXT(qs_a.z, b_qs_multi[j][2]);
+        q_sum += dotPacked4x8EXT(qs_a.w, b_qs_multi[j][3]);
+
+        temp[j][n] += FLOAT_TYPE(float(b_ds_multi[j].x) * d_scale * float(q_sum));
+    }
+}
+#define HAS_MMVQ_DOT_MULTI 1
+#elif defined(MMQ) && (defined(DATA_A_Q2_K))
+void mmvq_dot_multi(const uint ib_a, const uint iqs, inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint n,
+                    const int32_t b_qs_multi[NUM_COLS][K_PER_ITER / 4], const vec2 b_ds_multi[NUM_COLS]) {
+    const i32vec4 qs_a = repack4(ib_a, iqs * 4);
+    const uint8_t scale = get_scale(ib_a, iqs * 4);
+    const vec2 dm = vec2(get_dm(ib_a));
+    const int32_t scale_m = int32_t(scale >> 4) * 0x01010101;
+    const int32_t scale_d = int32_t(scale & 0xF);
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#ifdef TP5_RELAY_ROWS
+        if (!mat_vec_col_active(j)) continue;
+#endif
+        int32_t sum_d = 0;
+        int32_t sum_m = 0;
+        sum_d += dotPacked4x8EXT(qs_a.x, b_qs_multi[j][0]) * scale_d;
+        sum_m += dotPacked4x8EXT(scale_m, b_qs_multi[j][0]);
+        sum_d += dotPacked4x8EXT(qs_a.y, b_qs_multi[j][1]) * scale_d;
+        sum_m += dotPacked4x8EXT(scale_m, b_qs_multi[j][1]);
+        sum_d += dotPacked4x8EXT(qs_a.z, b_qs_multi[j][2]) * scale_d;
+        sum_m += dotPacked4x8EXT(scale_m, b_qs_multi[j][2]);
+        sum_d += dotPacked4x8EXT(qs_a.w, b_qs_multi[j][3]) * scale_d;
+        sum_m += dotPacked4x8EXT(scale_m, b_qs_multi[j][3]);
+
+        temp[j][n] += FLOAT_TYPE(float(b_ds_multi[j].x) * (float(dm.x) * float(sum_d) - float(dm.y) * float(sum_m)));
+    }
+}
+#define HAS_MMVQ_DOT_MULTI 1
+#elif defined(MMQ) && (defined(DATA_A_Q3_K))
+void mmvq_dot_multi(const uint ib_a, const uint iqs, inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint n,
+                    const int32_t b_qs_multi[NUM_COLS][K_PER_ITER / 4], const vec2 b_ds_multi[NUM_COLS]) {
+    const i32vec4 qs_a = repack4(ib_a, iqs * 4);
+    const float d_scale = get_d_scale(ib_a, iqs * 4);
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#ifdef TP5_RELAY_ROWS
+        if (!mat_vec_col_active(j)) continue;
+#endif
+        int32_t q_sum = 0;
+        q_sum += dotPacked4x8EXT(qs_a.x, b_qs_multi[j][0]);
+        q_sum += dotPacked4x8EXT(qs_a.y, b_qs_multi[j][1]);
+        q_sum += dotPacked4x8EXT(qs_a.z, b_qs_multi[j][2]);
+        q_sum += dotPacked4x8EXT(qs_a.w, b_qs_multi[j][3]);
+
+        temp[j][n] += FLOAT_TYPE(float(b_ds_multi[j].x) * d_scale * float(q_sum));
+    }
+}
+#define HAS_MMVQ_DOT_MULTI 1
+#endif

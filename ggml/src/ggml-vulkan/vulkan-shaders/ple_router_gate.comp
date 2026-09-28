@@ -1,0 +1,83 @@
+#version 450
+
+// K1d: fused PLE router gate chain (Qwen4EXP build_ple):
+//   MUL(key,query) -> SUM_ROWS -> SCALE -> SGN -> ABS -> CLAMP -> SQRT -> MUL -> SIGMOID
+// One workgroup per row. The row dot-product uses the exact sum_rows.comp
+// strided accumulation + tree reduction (same BLOCK_SIZE spec constant), and
+// the scalar chain applies the formulas verbatim from scale.comp (x*s+b) and
+// unary.comp (sign/abs/clamp/sqrt/1/(1+exp(-x))). Every float operation and
+// its order matches the unfused sequence, so the gate is bit-exact on the
+// same GPU. Only the final SIGMOID destination is written.
+
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+layout (push_constant) uniform parameter
+{
+    uint ne;      // rows
+    uint ne00;    // columns per row
+    uint a_offset; // src0 base (elements)
+    uint b_offset; // src1 base (elements)
+    uint d_offset; // dst base (elements)
+    float scale;
+    float bias;
+    float clamp_min;
+    float clamp_max;
+} p;
+
+layout (binding = 0) readonly buffer A { float data_a[]; };
+layout (binding = 1) readonly buffer B { float data_b[]; };
+layout (binding = 2) writeonly buffer D { float data_d[]; };
+
+shared float prod_sum[BLOCK_SIZE];
+
+void main() {
+    const uint row = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= p.ne) {
+        return;
+    }
+
+    // src0/src1 are contiguous with identical shape (fusion guard): row r
+    // starts at base + r*ne00; the [1, ne] dst is contiguous: base + r.
+    const uint a_row_base = p.a_offset + row * p.ne00;
+    const uint b_row_base = p.b_offset + row * p.ne00;
+
+    prod_sum[tid] = 0.0f;
+
+    // MUL + SUM_ROWS: multiply-accumulate in the sum_rows.comp pattern
+    // (thread tid sums elements tid, tid+BLOCK_SIZE, ...). The product is
+    // computed with precise to forbid FMA contraction into the accumulate:
+    // the unfused chain rounds x*y to f32 (MUL writes to memory) before the
+    // sum consumes it, so the fused kernel must round identically.
+    for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
+        const float x = data_a[a_row_base + i0];
+        const float y = data_b[b_row_base + i0];
+        precise float prod = x * y;
+        prod_sum[tid] += prod;
+    }
+
+    barrier();
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            prod_sum[tid] += prod_sum[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        // SCALE (scale.comp: x*scale + bias)
+        const float s = prod_sum[0] * p.scale + p.bias;
+        // SGN / ABS / CLAMP / SQRT — unary.comp formulas verbatim
+        const float sgn = sign(s);
+        const float mag = sqrt(clamp(abs(s), p.clamp_min, p.clamp_max));
+        const float g   = sgn * mag;
+        // SIGMOID (unary.comp op_sigmoid)
+        data_d[p.d_offset + row] = 1.0f / (1.0f + exp(-g));
+    }
+}

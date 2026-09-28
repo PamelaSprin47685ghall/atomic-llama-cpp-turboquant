@@ -638,7 +638,7 @@ public:
         // prefill vs token generation to prevent large buffers staying allocated.
         // Predefined MTP maintains identical execution identity regardless of active token count,
         // and must not trigger gf_res_prev reset or sched buffer release.
-        if (gtype == LLM_GRAPH_TYPE_DECODER_MTP && has_predefined_capacity && predefined_capacity_rows > 0) {
+        if ((has_predefined_capacity || predefined_capacity_rows > 0) && (predefined_capacity_rows == 0 || n_tokens <= (int)predefined_capacity_rows)) {
             return 0;
         }
         return n_tokens > n_seqs ? 1 : 0;
@@ -740,6 +740,10 @@ private:
     bool predefined_frame_current_valid = false;
     bool predefined_target_enabled = false;
     ggml_backend_sched_ptr sched;
+    ggml_backend_t get_tensor_backend(const struct ggml_tensor * t) const {
+        auto * node = const_cast<struct ggml_tensor *>(t);
+        return ggml_backend_sched_get_tensor_backend(sched.get(), node);
+    }
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

@@ -15,6 +15,22 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__x86_64__)
+__attribute__((target("avx2,fma")))
+static inline llama_token fast_host_argmax(const float * logits, llama_token n) {
+    llama_token best = 0;
+    float best_l = logits[0];
+    for (llama_token t = 1; t < n; ++t) {
+        if (logits[t] > best_l) {
+            best = t;
+            best_l = logits[t];
+        }
+    }
+    return best;
+}
+#endif
+
+
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
 template<typename T>
@@ -120,6 +136,15 @@ struct common_sampler {
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
+
+    // G4b verify-argmax (host): when true, common_sampler_sample skips the
+    // full-vocab cur[] materialization + chain walk and returns the raw
+    // argmax of the logits row (first-max-wins, NaN-never-wins — identical
+    // comparison semantics to the greedy chain's temp collapse), advancing
+    // the dist RNG once per call to keep the stream bit-identical. Only set
+    // after common_sampler_is_greedy_argmax_eligible() proved the chain
+    // result equals per-row argmax.
+    bool verify_argmax_host = false;
 
     void reset() {
         prev.clear();
@@ -545,6 +570,10 @@ static common_sampler * common_sampler_clone_impl(const common_sampler * gsmpl, 
         /* .cur_p   = */ {},
     };
 
+    // G4b: the verify-argmax eligibility is a property of the (cloned,
+    // unchanged) chain, so the flag survives checkpoint rollback.
+    result->verify_argmax_host = gsmpl->verify_argmax_host;
+
     if (keep_candidates) {
         // `cur_p` always views `cur`; copying its raw pointer would leave the
         // clone observing source-owned storage after a rollback.
@@ -655,9 +684,46 @@ llama_token common_sampler_sample(
     if (id != LLAMA_TOKEN_NULL) {
         LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
+        // Note: the chain's dist RNG is NOT drawn here. The backend sampling
+        // path already advanced it once per row via
+        // llama_sampler_dist_backend_set_input, matching the CPU path's one
+        // draw per sample call (G4a's extra loop here was removed: it would
+        // have double-advanced the mt19937 stream for non-spec backend slots).
+
         GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
         GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
         return id;
+    }
+
+    // G4b verify-argmax (host): eligible greedy chain — sample by raw argmax
+    // over the logits row. Comparison semantics are identical to the chain's
+    // temp collapse (llama_sampler_temp_impl: strict >, first max wins,
+    // NaN comparisons false so NaN can never win), and the eligibility gate
+    // proved no masker alters rank-1, so the returned token equals the CPU
+    // chain result. The dist RNG advances once per call, exactly as the
+    // chain's dist would, keeping the mt19937 stream bit-identical (rollback
+    // restores the same cloned state either way).
+    if (gsmpl->verify_argmax_host && !gsmpl->grmr && !gsmpl->rbudget) {
+        const llama_token n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        const float * logits_row = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits_row != nullptr);
+#if defined(__x86_64__)
+        const llama_token best = fast_host_argmax(logits_row, n_vocab);
+#else
+        llama_token best = 0;
+        float best_l = logits_row[0];
+        for (llama_token t = 1; t < n_vocab; ++t) {
+            if (logits_row[t] > best_l) {
+                best = t;
+                best_l = logits_row[t];
+            }
+        }
+#endif
+        const int n_chain = llama_sampler_chain_n(gsmpl->chain);
+        for (int i = 0; i < n_chain; ++i) {
+            llama_sampler_dist_draw(llama_sampler_chain_get(gsmpl->chain, i));
+        }
+        return best;
     }
 
     gsmpl->set_logits(ctx, idx);
@@ -817,6 +883,128 @@ llama_tokens common_sampler_get_token_history(const struct common_sampler * gsmp
         return {};
     }
     return gsmpl->prev.to_vector();
+}
+
+void common_sampler_set_verify_argmax_host(struct common_sampler * gsmpl, bool enabled) {
+    if (gsmpl) {
+        gsmpl->verify_argmax_host = enabled;
+    }
+}
+
+bool common_sampler_is_greedy_argmax_eligible(const struct common_sampler * gsmpl, const struct llama_vocab * vocab) {
+    // G4a verify-argmax gate: the CPU chain result must provably equal
+    // per-row argmax over the raw logits row. Walk the actual chain:
+    //  - temp with temp<=0 collapses everything but the argmax (exact)
+    //  - dist then re-selects the argmax (its softmax mass is 1.0 on it)
+    //  - top_k / top-p / min-p provably keep rank-1 at any parameter value
+    //  - typical admitted only as a no-op (typ_p >= 1.0)
+    //  - top-n-sigma admitted only disabled (n <= 0)
+    //  - penalties / dry / xtc / logit-bias / grammar / budget / anything
+    //    unknown: reject outright (not provably argmax-preserving).
+    if (!gsmpl || !gsmpl->chain || vocab == nullptr) {
+        return false;
+    }
+
+    if (gsmpl->grmr || gsmpl->rbudget) {
+        return false;
+    }
+
+    bool have_temp = false;
+    bool have_dist = false;
+
+    const int n = llama_sampler_chain_n(gsmpl->chain);
+    for (int i = 0; i < n; ++i) {
+        struct llama_sampler * smpl = llama_sampler_chain_get(gsmpl->chain, i);
+        const char * name = llama_sampler_name(smpl);
+        if (!name) {
+            return false;
+        }
+
+        // Disabled samplers are installed as empty placeholders named
+        // "?<name>" (llama_sampler_init_empty): their apply is a provable
+        // no-op, so they are always admissible.
+        if (name[0] == '?') {
+            continue;
+        }
+
+        if (strcmp(name, "temp") == 0 || strncmp(name, "+temp", 5) == 0 || strncmp(name, "-temp", 5) == 0 ||
+            strcmp(name, "temp-ext") == 0 || strncmp(name, "+temp-ext", 9) == 0 || strncmp(name, "-temp-ext", 9) == 0) {
+            // The chain stores the authoritative params on the common_sampler.
+            // temp<=0 collapses everything but the argmax (plain temp and
+            // temp-ext share llama_sampler_temp_impl for the static branch);
+            // temp-ext additionally requires dynatemp_range<=0 so the entropy
+            // branch cannot alter the collapse.
+            have_temp = gsmpl->params.temp <= 0.0f && gsmpl->params.dynatemp_range <= 0.0f;
+            continue;
+        }
+        if (strcmp(name, "dist") == 0 || strncmp(name, "+dist", 5) == 0 || strncmp(name, "-dist", 5) == 0) {
+            have_dist = true;
+            continue;
+        }
+        // top_k / top-p / min-p operate on softmax ranks and provably keep
+        // rank-1 (the argmax): top_k always includes the top entry; top_p's
+        // cumulative loop keeps the first (highest-p) token; min_p's
+        // threshold is min_p*max_p which rank-1 always meets. Admissible at
+        // any parameter value.
+        if (strcmp(name, "top-k") == 0 || strncmp(name, "+top-k", 6) == 0 || strncmp(name, "-top-k", 6) == 0 ||
+            strcmp(name, "top-p") == 0 || strncmp(name, "+top-p", 6) == 0 || strncmp(name, "-top-p", 6) == 0 ||
+            strcmp(name, "min-p") == 0 || strncmp(name, "+min-p", 6) == 0 || strncmp(name, "-min-p", 6) == 0) {
+            continue;
+        }
+        if (strcmp(name, "typical") == 0 || strncmp(name, "+typical", 8) == 0 || strncmp(name, "-typical", 8) == 0) {
+            if (gsmpl->params.typ_p < 1.0f || gsmpl->params.min_keep < 1) {
+                return false;
+            }
+            continue;
+        }
+        if (strcmp(name, "top-n-sigma") == 0) {
+            if (gsmpl->params.top_n_sigma > 0.0f) {
+                return false;
+            }
+            continue;
+        }
+        // Provably-inert samplers at their disabled defaults:
+        //  - penalties: is_disabled (last_n==0 or all coefficients neutral)
+        //    → CPU apply no-ops (llama_sampler_penalties_apply early return)
+        //  - dry: dry_multiplier==0 → apply early-returns
+        //  - xtc: xtc_probability<=0 → apply early-returns
+        // Their accept() hooks still run identically on both paths (the
+        // common_sampler_accept flow is unchanged by verify-argmax).
+        if (strcmp(name, "penalties") == 0 || strncmp(name, "+penalties", 10) == 0 || strncmp(name, "-penalties", 10) == 0) {
+            if (!(gsmpl->params.penalty_last_n == 0 ||
+                  (gsmpl->params.penalty_repeat == 1.0f &&
+                   gsmpl->params.penalty_freq == 0.0f &&
+                   gsmpl->params.penalty_present == 0.0f))) {
+                return false;
+            }
+            continue;
+        }
+        if (strcmp(name, "dry") == 0 || strncmp(name, "+dry", 4) == 0 || strncmp(name, "-dry", 4) == 0) {
+            if (gsmpl->params.dry_multiplier != 0.0f) {
+                return false;
+            }
+            continue;
+        }
+        if (strcmp(name, "xtc") == 0 || strncmp(name, "+xtc", 4) == 0 || strncmp(name, "-xtc", 4) == 0) {
+            if (gsmpl->params.xtc_probability > 0.0f) {
+                return false;
+            }
+            continue;
+        }
+        // logit-bias / mirostat / adaptive / infill / greedy / anything
+        // unknown: not provably argmax-preserving.
+        if (getenv("GGML_TP5_VERIFY_ARGMAX_DEBUG")) {
+            fprintf(stderr, "[verify-argmax-elig] rejected chain element: name='%s'\n", name);
+        }
+        return false;
+    }
+
+    const bool eligible = have_temp && have_dist;
+    if (getenv("GGML_TP5_VERIFY_ARGMAX_DEBUG")) {
+        fprintf(stderr, "[verify-argmax-elig] final: have_temp=%d have_dist=%d eligible=%d\n",
+                (int) have_temp, (int) have_dist, (int) eligible);
+    }
+    return eligible;
 }
 
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {

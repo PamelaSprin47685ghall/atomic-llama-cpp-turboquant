@@ -78,6 +78,40 @@ const uint SPIN_WORD = 7u;
 const uint ACTIVE_ROWS_WORD = 5u;
 #endif
 
+
+#ifdef TP5_RESUME_LO_U
+// LB2: LO waits the single Y generation (word 0), then folds
+// u = 0.25 * sum_b rho_b * Q_b itself from the bank-published rho and the
+// 5-rank-reduced Q sidecar — no CPU u, no second doorbell, no rho buffer.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) coherent volatile readonly buffer Inbox { uint inbox[]; };
+layout(std430, binding = 1) writeonly buffer Lo { float lo[]; };
+layout(std430, binding = 2) coherent volatile buffer Status { uint status[]; };
+layout(push_constant) uniform Params {
+    uint rank_dim;
+    uint late_word_offset;   // Q payload word offset in the bank
+    uint spin_max;
+    uint status_word_offset;
+    uint profile_spin;
+    uint active_rows;
+    uint rho_word_offset;    // stats region word offset (12 words/token)
+    // NOTE: the norm path's inversesqrt(fold / width + epsilon) regularisation was
+    // tried here and REVERTED. Measured: the norm path's fold/width is about 1
+    // (its values are already normalised), while this identity's ss/width is about
+    // 3e-6 -- five orders of magnitude apart. So epsilon does not bound anything on
+    // this scale; dividing by width merely moves rho from ~11 to ~500 and the
+    // output became uniformly degenerate (10/10 requests reached 171 tokens but
+    // none was coherent, versus 5/10 with 1 coherent before). The scale mismatch
+    // is the real open question, not the regulariser.
+    float width;
+    float epsilon;
+} p;
+const uint GENERATION_WORD = 0u;
+const uint SPIN_WORD = 7u;
+const uint ACTIVE_ROWS_WORD = 5u;
+#endif
+
+#if defined(TP5_RESUME_LO) || defined(TP5_RESUME_LO_Q8) || defined(TP5_RESUME_LO_U) || defined(TP5_RESUME_NORM)
 shared uint ready;
 shared uint expected;
 
@@ -111,6 +145,7 @@ bool await_input() {
     memoryBarrierBuffer();
     return ready != 0u;
 }
+#endif
 
 #ifdef TP5_RESUME_NORM
 void finalize_stream(const uint iterations, const uint active_rows) {
@@ -169,6 +204,12 @@ void finalize_stream(const uint iterations, const uint active_rows) {
         }
         const float scale = inversesqrt(fold / float(p.width) + p.epsilon);
         if (lane == 0u) inverse_rho[token * p.streams + stream] = scale;
+        // L2 in-chain check (profile_spin bit 1): publish the reference inverse RMS
+        // this kernel just formed into the free host-status words 8..15 (2 tokens x
+        // 4 streams). The status line is host-imported RAM, so the relay can compare
+        // it with its own sufficient-statistic rho without any device readback.
+        if (lane == 0u && (p.profile_spin & 2u) != 0u && token < 2u)
+            status[p.status_word_offset + 8u + token * 4u + stream] = floatBitsToUint(scale);
         [[unroll]] for (uint i = 0u; i < 16u; ++i) {
             const uint col = lane + i * 256u;
             if (i < iterations && col < p.width) {
@@ -296,6 +337,73 @@ void main() {
         }
     }
 #endif
+    memoryBarrierBuffer();
+    barrier();
+    if (lane == 0u && status[p.status_word_offset + 2u] == 0u) {
+        status[p.status_word_offset + 3u] = expected;
+        memoryBarrierBuffer();
+    }
+}
+#endif
+
+#ifdef TP5_RESUME_LO_U
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    if (p.rank_dim == 0u || p.rank_dim > 512u) {
+        if (lane == 0u) atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
+        return;
+    }
+    const uint active_rows = inbox[ACTIVE_ROWS_WORD] != 0u ? inbox[ACTIVE_ROWS_WORD] : p.active_rows;
+    if (!await_input()) {
+        for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
+            if (token >= active_rows) break;
+            for (uint row = lane; row < p.rank_dim; row += 256u)
+                lo[token * p.rank_dim + row] = uintBitsToFloat(0x7fc00000u);
+        }
+        return;
+    }
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
+        if (token >= active_rows) break;
+        // L2: rho is derived HERE from the sufficient statistics rather than being
+        // computed by the CPU and read back. late_publish_stats already writes, into
+        // this same bank region, per token: A_b = |R_b|^2 at 2b+0, D_b = sum_p <R_b,z_p>
+        // at 2b+1, and s_b at 8+b. The relay therefore has nothing left to publish
+        // except cc, which only its reduction can form -- and which sits right after
+        // the 12-word-per-token block, one word per token (see
+        // ggml-vulkan-collective.cpp, cc_offset = stats_offset + 12*16*sizeof(float)).
+        //
+        // The identity is the same one the CPU used:
+        //     ss = A_b + 2*s_b*D_b + s_b^2*cc ;  rho_b = ss > 0 ? 1/sqrt(ss) : 0
+        // 1/sqrt is kept over inversesqrt so this migration is bit-identical to the
+        // CPU path it replaces; otherwise a later tip-to-tip would measure the ULP.
+        const uint so = p.rho_word_offset + token * 12u;
+        // The cc tail starts one full statistics block past the base: 12 words per
+        // token at TP5_LATE_CAPACITY_ROWS capacity. This MUST use the define the
+        // generator passes (VK_TP5_DIRECT_COLUMN_TILE), not a hardcoded 16: the
+        // capacity is 4, so a literal 16 read 512 bytes past the region the CPU's
+        // bounds check covers, straight out of whatever else lives in the bank.
+        const float cc = uintBitsToFloat(inbox[p.rho_word_offset + 12u * TP5_LATE_CAPACITY_ROWS + token]);
+        const float a0 = uintBitsToFloat(inbox[so + 0u]), d0 = uintBitsToFloat(inbox[so + 1u]), q0s = uintBitsToFloat(inbox[so + 8u]);
+        const float a1 = uintBitsToFloat(inbox[so + 2u]), d1 = uintBitsToFloat(inbox[so + 3u]), q1s = uintBitsToFloat(inbox[so + 9u]);
+        const float a2 = uintBitsToFloat(inbox[so + 4u]), d2 = uintBitsToFloat(inbox[so + 5u]), q2s = uintBitsToFloat(inbox[so + 10u]);
+        const float a3 = uintBitsToFloat(inbox[so + 6u]), d3 = uintBitsToFloat(inbox[so + 7u]), q3s = uintBitsToFloat(inbox[so + 11u]);
+        const float ss0 = a0 + 2.0 * q0s * d0 + q0s * q0s * cc;
+        const float ss1 = a1 + 2.0 * q1s * d1 + q1s * q1s * cc;
+        const float ss2 = a2 + 2.0 * q2s * d2 + q2s * q2s * cc;
+        const float ss3 = a3 + 2.0 * q3s * d3 + q3s * q3s * cc;
+        const float rho0 = ss0 > 0.0 ? 1.0 / sqrt(ss0) : 0.0;
+        const float rho1 = ss1 > 0.0 ? 1.0 / sqrt(ss1) : 0.0;
+        const float rho2 = ss2 > 0.0 ? 1.0 / sqrt(ss2) : 0.0;
+        const float rho3 = ss3 > 0.0 ? 1.0 / sqrt(ss3) : 0.0;
+        for (uint row = lane; row < p.rank_dim; row += 256u) {
+            const float q0 = uintBitsToFloat(inbox[p.late_word_offset + (token * 4u + 0u) * p.rank_dim + row]);
+            const float q1 = uintBitsToFloat(inbox[p.late_word_offset + (token * 4u + 1u) * p.rank_dim + row]);
+            const float q2 = uintBitsToFloat(inbox[p.late_word_offset + (token * 4u + 2u) * p.rank_dim + row]);
+            const float q3 = uintBitsToFloat(inbox[p.late_word_offset + (token * 4u + 3u) * p.rank_dim + row]);
+            const float u = 0.25 * (rho0 * q0 + rho1 * q1 + rho2 * q2 + rho3 * q3);
+            lo[token * p.rank_dim + row] = u / (1.0 + exp(-u));
+        }
+    }
     memoryBarrierBuffer();
     barrier();
     if (lane == 0u && status[p.status_word_offset + 2u] == 0u) {

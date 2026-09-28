@@ -333,7 +333,11 @@ bool ggml_backend_tensor_set_snapshot_async(ggml_backend_t backend, struct ggml_
 }
 
 void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    GGML_ASSERT(tensor);
+    if (!tensor) {
+        fprintf(stderr, "[TENSOR_SET_NULL] called with tensor=NULL! size=%zu offset=%zu\n", size, offset);
+        ggml_print_backtrace();
+        GGML_ASSERT(tensor);
+    }
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
 
@@ -1160,7 +1164,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ABORT("%s: failed to initialize context\n", __func__);
     }
 
-    graph->uid = ggml_graph_next_uid();
+    if (graph->uid == 0) {
+        graph->uid = ggml_graph_next_uid();
+    }
 
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
@@ -1551,6 +1557,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
+        split->graph.uid = graph->uid;
 
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
     }
@@ -1674,7 +1681,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     // set ids for all splits
     for (int i = 0; i < sched->n_splits; ++i) {
-        sched->splits[i].graph.uid = ggml_graph_next_uid();
+        sched->splits[i].graph.uid = (graph->uid != 0) ?
+            ((graph->uid << 8) | (uint64_t) i) : ggml_graph_next_uid();
     }
 }
 

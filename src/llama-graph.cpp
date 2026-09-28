@@ -90,8 +90,9 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         if (tokens && n_tokens > tokens->ne[0]) {
             throw std::runtime_error("predefined token rows exceed fixed token capacity");
         }
-
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        if (tokens) {
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        }
     }
 
     if (ubatch->embd) {
@@ -101,8 +102,9 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         if (embd && n_tokens > embd->ne[1]) {
             throw std::runtime_error("predefined embedding rows exceed fixed embedding capacity");
         }
-
-        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
+        if (embd) {
+            ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
+        }
     }
 }
 
@@ -123,14 +125,16 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         if (tokens && n_tokens > tokens->ne[0]) {
             throw std::runtime_error("predefined token rows exceed fixed token capacity");
         }
-
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        if (tokens) {
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        }
     } else {
         // note: mtmd embedding input goes through here
         GGML_ASSERT(ubatch->embd);
         GGML_ASSERT(n_embd == embd->ne[0]);
-
-        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        if (embd) {
+            ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        }
     }
 
     if (ubatch->device_hidden) {

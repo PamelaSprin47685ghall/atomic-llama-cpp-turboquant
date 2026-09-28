@@ -17,6 +17,12 @@ layout(std430, binding = 1) coherent writeonly buffer DstBuffer {
     uvec4 dst_data[];
 };
 
+#ifdef TP5_COPY_FOLD_READY
+layout(std430, binding = 2) coherent volatile buffer ReadyWord {
+    uint ready_word[];
+};
+#endif
+
 layout(push_constant) uniform Params {
     uint n_uvec4;
 } p;
@@ -27,4 +33,17 @@ void main() {
     for (; idx < p.n_uvec4; idx += stride) {
         dst_data[idx] = src_data[idx];
     }
+
+#ifdef TP5_COPY_FOLD_READY
+    // Single-workgroup fold: every payload store comes from this workgroup,
+    // so the workgroup barrier is a complete ordering point. The caller
+    // binds the same host import buffer at binding 2 as the destination at
+    // binding 1; the ready word sits at the caller-fixed offset in it.
+    memoryBarrierBuffer();
+    barrier();
+    if (gl_GlobalInvocationID.x == 0u) {
+        ready_word[0] = 1u;
+        memoryBarrierBuffer();
+    }
+#endif
 }

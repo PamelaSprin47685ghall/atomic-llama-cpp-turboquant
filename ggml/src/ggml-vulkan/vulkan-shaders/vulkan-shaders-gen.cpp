@@ -829,6 +829,8 @@ void process_shaders() {
     string_to_spv("rms_norm_mul_rope_f32_f16", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("l2_norm_pair_f32", "l2_norm_pair.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("ple_router_gate_f32", "ple_router_gate.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "0"}}));
 
     string_to_spv("cpy_f32_f32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
@@ -985,6 +987,14 @@ void process_shaders() {
                   {
                       { "TP5_LATE_Q", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
     });
+    string_to_spv("tp5_hc_late_stats", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_STATS", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
+    });
+    string_to_spv("tp5_hc_late_q_stats", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_Q", "1" }, { "TP5_LATE_Q_STATS", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
+    });
     string_to_spv("tp5_hc_late_act_q8", "tp5_hc_latebind.comp",
                   {
                       { "TP5_LATE_ACT_Q8", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
@@ -997,15 +1007,44 @@ void process_shaders() {
                   {
                       { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
     });
+    // LB2 on the aggressive blade. The q8dot-approx Q producer used to carry no
+    // statistics at all (TP5_LATE_Q_STATS existed only inside the exact TP5_LATE_Q
+    // block), so GGML_TP5_LATEBIND_RHO had nothing to read and the relay waited
+    // forever for (a_b, d_b, s_b). This variant folds the same statistics into the
+    // same producer, which is what makes RHO reachable on the aggressive path.
+    string_to_spv("tp5_hc_late_q_q8dot_stats", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_Q_STATS", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
+    });
+    // L2 (tip): RMS sufficient-statistic partials formed in ACT_Q8 (the only point
+    // where live R and z_p are both guaranteed), folded by Q8DOT workgroup 0 into
+    // the Q control aperture, and the UP consumer of the relay-formed LO blocks.
+    string_to_spv("tp5_hc_late_act_q8_l2", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_ACT_Q8", "1" }, { "TP5_LATE_L2", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity },
+                      { "TP5_RELAY_EPOCH_WORD", std::to_string(TP5_RELAY_EPOCH_WORD) + "u" }
+    });
+    string_to_spv("tp5_hc_late_q_q8dot_l2", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_L2", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity },
+                      { "TP5_LATE_STATS_WORDS", std::to_string(TP5_LATE_STATS_WORDS_PER_TOKEN) + "u" }
+    });
+    string_to_spv("tp5_hc_late_up_q8dot_bcast", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_UP_Q8DOT", "1" }, { "TP5_LATE_UP_BCAST", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity },
+                      { "TP5_RELAY_EPOCH_WORD", std::to_string(TP5_RELAY_EPOCH_WORD) + "u" }
+    });
     string_to_spv("tp5_hc_resume_norm", "tp5_hc_resume.comp", {{ "TP5_RESUME_NORM", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
     string_to_spv("tp5_hc_resume_lo", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
     string_to_spv("tp5_hc_resume_lo_q8", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO_Q8", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
+    string_to_spv("tp5_hc_resume_lo_u", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO_U", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
     string_to_spv("tp5_hc_publish", "tp5_hc_publish.comp", {});
     string_to_spv("tp5_hc_late_up_q8dot", "tp5_hc_latebind.comp",
                   {
                       { "TP5_LATE_UP_Q8DOT", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
     });
     string_to_spv("tp5_hc_publish_f16", "tp5_hc_publish.comp", {{ "TP5_PUBLISH_F16", "1" }});
+    string_to_spv("tp5_hc_publish_stats", "tp5_hc_publish.comp", {{ "TP5_PUBLISH_STATS", "1" }});
     string_to_spv("qwen4_hc_up_fold", "qwen4_hc_up_fold.comp", {});
     string_to_spv("qwen4_hc_segment_norm", "qwen4_hc_segment_norm.comp", {});
     string_to_spv("qwen4_hc_sum_f16", "qwen4_hc_segment_norm.comp",
@@ -1349,6 +1388,7 @@ void process_shaders() {
     }
     string_to_spv("tp5_pack_f16_vec", "tp5_pack_f16_vec.comp", {});
     string_to_spv("tp5_copy_u128", "tp5_copy_u128.comp", {});
+    string_to_spv("tp5_copy_u128_fold", "tp5_copy_u128.comp", {{"TP5_COPY_FOLD_READY", "1"}});
     string_to_spv("tp5_gpuflag", "tp5_gpuflag.comp", {});
     string_to_spv("tp5_relay", "tp5_relay.comp", {});
     string_to_spv("tp5_relay_copy_f32", "tp5_relay_copy_f32.comp", {});

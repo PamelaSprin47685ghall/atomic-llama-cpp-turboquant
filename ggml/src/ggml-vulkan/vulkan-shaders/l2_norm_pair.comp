@@ -1,0 +1,83 @@
+#version 450
+
+// Fused pair of L2_NORM ops (K1c): normalizes two same-shape source views in a
+// single dispatch. Rows [0, p.ne) are served by group 0 (data_a/data_d), rows
+// [p.ne, 2*p.ne) by group 1 (data_a_pair/data_d_pair). Per-row reduction order
+// is identical to l2_norm.comp (BLOCK_SIZE strided grid + tree reduction), so
+// outputs are bit-exact with the unfused pair.
+
+#include "generic_unary_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#define BLOCK_SIZE 512
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+shared FLOAT_TYPE sum[BLOCK_SIZE];
+shared FLOAT_TYPE pair_sum[BLOCK_SIZE];
+
+void main() {
+    const uint row = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= 2u * p.ne) {
+        return;
+    }
+
+    const bool is_pair = row >= p.ne;
+    const uint local_row = is_pair ? row - p.ne : row;
+
+    // Group 1 reuses the group-0 row layout (identical shape is a fusion guard).
+    const uint a_row_base = local_row * p.ne00;
+    const uint d_row_base = local_row * p.ne10;
+
+    const uint a_misalign = is_pair ? floatBitsToUint(p.param2) : get_aoffset();
+    const uint d_misalign = is_pair ? floatBitsToUint(p.param3) : get_doffset();
+
+    const uint a_base = a_misalign + src0_idx(a_row_base);
+    const uint d_base = d_misalign + dst_idx(d_row_base);
+
+    if (is_pair) {
+        pair_sum[tid] = FLOAT_TYPE(0.0f);
+
+        [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
+            const FLOAT_TYPE xi = FLOAT_TYPE(data_a_pair[a_base + i0*p.nb00]);
+            pair_sum[tid] += xi * xi;
+        }
+
+        barrier();
+        [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                pair_sum[tid] += pair_sum[tid + s];
+            }
+            barrier();
+        }
+
+        const FLOAT_TYPE scale = 1.0f / max(sqrt(pair_sum[0]), FLOAT_TYPE(p.param1));
+
+        [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
+            data_d_pair[d_base + i0*p.nb10] = D_TYPE(scale * FLOAT_TYPE(data_a_pair[a_base + i0*p.nb00]));
+        }
+    } else {
+        sum[tid] = FLOAT_TYPE(0.0f);
+
+        [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
+            const FLOAT_TYPE xi = FLOAT_TYPE(data_a[a_base + i0*p.nb00]);
+            sum[tid] += xi * xi;
+        }
+
+        barrier();
+        [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sum[tid] += sum[tid + s];
+            }
+            barrier();
+        }
+
+        const FLOAT_TYPE scale = 1.0f / max(sqrt(sum[0]), FLOAT_TYPE(p.param1));
+
+        [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
+            data_d[d_base + i0*p.nb10] = D_TYPE(scale * FLOAT_TYPE(data_a[a_base + i0*p.nb00]));
+        }
+    }
+}

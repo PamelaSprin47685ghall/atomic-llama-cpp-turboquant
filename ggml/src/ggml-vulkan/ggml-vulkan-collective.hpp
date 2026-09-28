@@ -494,6 +494,7 @@ private:
 struct tp5_latebind_semantic_step {
     enum class kind {
         READ_TREFS,           // late_q (exact) or late_act_q8 (aggressive) reads z_p from bindings[r]
+        READ_ZSNAP,           // LB1: late_q reads z_p from the private snapshot buffer
         BARRIER_ACT_BUF,      // act_ready barrier on late_act_q8_buf (aggressive only)
         BARRIER_WAR_TREFS,    // explicit SHADER_READ -> SHADER_WRITE barrier on bindings[r]
         WRITE_TREFS,          // late_norm writes canonical y to bindings[r]
@@ -509,6 +510,27 @@ struct tp5_latebind_semantic_step {
     const char * name;
 };
 
+// Validates that within a primary command buffer, norm (WRITE_TREFS) is emitted
+// before Q dispatch (DISPATCH_Q8DOT or READ_TREFS/READ_ZSNAP), preventing
+// regression to the serialized Q-before-norm submission order.
+static inline bool tp5_validate_norm_before_q_schedule(
+        const std::vector<tp5_latebind_semantic_step> & steps,
+        std::string & err) {
+    int write_idx = -1;
+    int q_idx = -1;
+    for (int i = 0; i < (int) steps.size(); ++i) {
+        if (steps[i].type == tp5_latebind_semantic_step::kind::WRITE_TREFS && write_idx == -1) write_idx = i;
+        if ((steps[i].type == tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT ||
+             steps[i].type == tp5_latebind_semantic_step::kind::READ_TREFS ||
+             steps[i].type == tp5_latebind_semantic_step::kind::READ_ZSNAP) && q_idx == -1) q_idx = i;
+    }
+    if (write_idx != -1 && q_idx != -1 && write_idx >= q_idx) {
+        err = "norm (WRITE_TREFS) must be emitted before Q dispatch";
+        return false;
+    }
+    return true;
+}
+
 // Validates that the LateBind command sequence satisfies the Write-After-Read (WAR)
 // hazard contract on trefs (bindings[r]) and preserves the zero-barrier overlap
 // between norm and Q8dot. Returns true on success; fills err on violation.
@@ -521,12 +543,17 @@ static inline bool tp5_validate_latebind_war_schedule(
     int war_barrier_idx = -1;
     int write_idx = -1;
     int q8dot_idx = -1;
+    bool zsnap = false;
 
     for (int i = 0; i < (int) steps.size(); ++i) {
         switch (steps[i].type) {
             case tp5_latebind_semantic_step::kind::READ_TREFS:
                 if (read_idx != -1) { err = "duplicate READ_TREFS"; return false; }
                 read_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::READ_ZSNAP:
+                if (read_idx != -1 || zsnap) { err = "duplicate z_p read"; return false; }
+                zsnap = true;
                 break;
             case tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF:
                 if (act_barrier_idx == -1) { act_barrier_idx = i; }
@@ -545,16 +572,20 @@ static inline bool tp5_validate_latebind_war_schedule(
         }
     }
 
-    if (read_idx == -1) { err = "missing READ_TREFS"; return false; }
-    if (war_barrier_idx == -1) { err = "missing BARRIER_WAR_TREFS"; return false; }
+    // LB1: a z_p snapshot read replaces the READ->WAR->WRITE chain; the
+    // snapshot copy's own TRANSFER->COMPUTE barrier orders Q's reads, so
+    // neither READ_TREFS nor BARRIER_WAR_TREFS is required.
+    if (read_idx == -1 && !zsnap) { err = "missing READ_TREFS"; return false; }
+    if (read_idx == -1 && war_barrier_idx != -1) { err = "WAR barrier without a trefs read"; return false; }
+    if (read_idx != -1 && war_barrier_idx == -1) { err = "missing BARRIER_WAR_TREFS"; return false; }
     if (write_idx == -1) { err = "missing WRITE_TREFS"; return false; }
 
     // Core WAR rule: READ must precede WAR barrier, WAR barrier must precede WRITE
-    if (read_idx >= war_barrier_idx) {
+    if (read_idx != -1 && war_barrier_idx != -1 && read_idx >= war_barrier_idx) {
         err = "READ_TREFS must precede BARRIER_WAR_TREFS";
         return false;
     }
-    if (war_barrier_idx >= write_idx) {
+    if (war_barrier_idx != -1 && war_barrier_idx >= write_idx) {
         err = "BARRIER_WAR_TREFS must precede WRITE_TREFS";
         return false;
     }
@@ -569,6 +600,20 @@ static inline bool tp5_validate_latebind_war_schedule(
         if (act_barrier_idx >= war_barrier_idx) {
             err = "BARRIER_ACT_BUF must precede BARRIER_WAR_TREFS";
             return false;
+        }
+        if (q8dot_idx < write_idx) {
+            // Q8DOT-first order (GGML_TP5_LATEBIND_Q8_ORDER=first): the contraction is
+            // launched after the WAR barrier and immediately before norm, again with no
+            // barrier between the two dispatches.
+            if (war_barrier_idx >= q8dot_idx) {
+                err = "BARRIER_WAR_TREFS must precede DISPATCH_Q8DOT";
+                return false;
+            }
+            if (write_idx != q8dot_idx + 1) {
+                err = "unexpected barrier between Q8dot and norm: zero-barrier overlap violated";
+                return false;
+            }
+            return true;
         }
         if (write_idx >= q8dot_idx) {
             err = "WRITE_TREFS (norm) must precede DISPATCH_Q8DOT";

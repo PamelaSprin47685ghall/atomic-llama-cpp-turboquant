@@ -1197,17 +1197,6 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
-    // KV-level occlusion of an untagged base-prompt position range for one
-    // reader sequence: the RERoT layout builders drop every untagged base
-    // key whose storage position lies in [pos_begin, pos_end) from this
-    // sequence's reader view (become-leak fix; workers keep the range,
-    // planner/synthesis views drop it). pos_begin < 0 clears the occlusion.
-    LLAMA_API bool llama_memory_rerot_occlude_base_range(
-            llama_memory_t mem,
-              llama_seq_id seq_id,
-                llama_pos pos_begin,
-                llama_pos pos_end);
-
     // Shared fork hand seed (§§16.1, 16.4, B.6.4).
     // Passing dst == NULL returns required size in bytes (or 0 if unsupported/invalid).
     LLAMA_API size_t llama_memory_rerot_capture_hand_seed(
@@ -2453,6 +2442,10 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_init_infill(const struct llama_vocab * vocab);
 
     // Returns the seed used by the sampler if applicable, LLAMA_DEFAULT_SEED otherwise
+
+    // G4b verify-argmax RNG alignment: advance a dist sampler's mt19937 once,
+    // exactly as the CPU dist path would per sample call.
+    LLAMA_API bool llama_sampler_dist_draw(struct llama_sampler * smpl);
     LLAMA_API uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl);
 
     /// @details Sample and accept a token from the idx-th output of the last evaluation

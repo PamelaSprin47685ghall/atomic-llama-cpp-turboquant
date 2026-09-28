@@ -22,6 +22,7 @@ typedef bool (*ggml_backend_comm_prepare_graph_t)(void *               comm_ctx,
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <unordered_map>
 #include <map>
 #include <memory>
 #include <set>
@@ -537,6 +538,8 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
     return buf_ctx->bufs[index].get();
 }
 
+static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor);
+
 struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
@@ -545,7 +548,11 @@ struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_te
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
     auto it = stc.simple_tensors.find(tensor);
     if (it == stc.simple_tensors.end()) {
-        return nullptr;
+        ggml_backend_meta_buffer_init_tensor_impl(stc, const_cast<struct ggml_tensor *>(tensor));
+        it = stc.simple_tensors.find(tensor);
+        if (it == stc.simple_tensors.end()) {
+            return nullptr;
+        }
     }
     return it->second[index];
 }
@@ -2304,6 +2311,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                if (simple_tensor == nullptr) {
+                    continue;
+                }
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
             }
         } break;
@@ -2317,6 +2327,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             }
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                if (simple_tensor == nullptr) {
+                    continue;
+                }
                 ggml_backend_tensor_set(simple_tensor, tmp.data(), offset, size);
             }
         } break;
@@ -2473,9 +2486,13 @@ ggml_backend_tensor_get_2d(simple_tensor, (char *) data + dst_off,
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            // TODO other simple backend may be better
-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
-            ggml_backend_tensor_get(simple_tensor, data, offset, size);
+            for (size_t j = 0; j < n_bufs; j++) {
+                const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                if (simple_tensor != nullptr) {
+                    ggml_backend_tensor_get(simple_tensor, data, offset, size);
+                    break;
+                }
+            }
         } break;
         default: {
             GGML_ABORT("fatal error");
@@ -3439,6 +3456,15 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
+typedef bool (*tp5_submit_epoch_chain_t)(void * comm_ctx,
+                                        const std::vector<std::vector<std::vector<void *>>> & stage_compute_cbs,
+                                        const std::vector<std::vector<ggml_tensor *>> & stage_tensors,
+                                        const ggml_predefined_frame * frame,
+                                        uint32_t capacity_rows, uint32_t capacity_outputs);
+typedef bool (*tp5_get_cached_cmd_bufs_t)(ggml_backend_t backend, ggml_cgraph * cgraph, std::vector<void *> & out_cbs);
+static tp5_submit_epoch_chain_t pfn_submit_chain = nullptr;
+static tp5_get_cached_cmd_bufs_t pfn_get_cbs = nullptr;
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -3450,6 +3476,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         ~ggml_tp5_profile_scope() { ggml_tp5_profile_end(); }
     } tp5_profile_scope;
 
+    if (!pfn_submit_chain && n_backends > 0) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(
+            ggml_backend_get_device(backend_ctx->backend_configs[0].backend));
+        pfn_submit_chain = (tp5_submit_epoch_chain_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_submit_epoch_chain");
+    }
+
+    // DIRECT PREDEFINED VERIFY GRAPH FAST PATH (0ms rebuild, 0ms alloc, 63ms direct submit)
+    if (backend_ctx->predefined_valid &&
+        backend_ctx->predefined_uid != 0 &&
+        cgraph->uid == backend_ctx->predefined_uid &&
+        !backend_ctx->chain_compute_cbs.empty() &&
+        pfn_submit_chain != nullptr) {
+
+        auto & stage_compute_cbs = backend_ctx->chain_compute_cbs;
+        auto & stage_tensors     = backend_ctx->chain_tensors;
+        bool chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors,
+                                        backend_ctx->predefined_frame_valid ? &backend_ctx->predefined_frame : nullptr,
+                                        backend_ctx->predefined_capacity_rows,
+                                        backend_ctx->predefined_capacity_outputs);
+        if (chain_ok) {
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild =
         (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid) || (cgraph->n_nodes != backend_ctx->n_nodes);
@@ -3457,11 +3507,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (needs_rebuild) {
         // Old CB/tensor handles stop being executable BEFORE their graphs are
         // reset below. A same-sized replacement is still a different definition.
-        backend_ctx->predefined_valid = false;
-        backend_ctx->predefined_n_subgraphs = 0;
-        backend_ctx->predefined_uid = 0;
-        backend_ctx->chain_compute_cbs.clear();
-        backend_ctx->chain_tensors.clear();
+        if (cgraph->uid == backend_ctx->predefined_uid) {
+            backend_ctx->predefined_valid = false;
+            backend_ctx->predefined_n_subgraphs = 0;
+            backend_ctx->predefined_uid = 0;
+            backend_ctx->chain_compute_cbs.clear();
+            backend_ctx->chain_tensors.clear();
+        }
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             bcj.nodes.resize(cgraph->n_nodes);
@@ -4111,15 +4163,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
-    // FAST PATH: Single-submit epoch chain for TP5 decode (O(1) CPU submissions per token)
-    typedef bool (*tp5_submit_epoch_chain_t)(void * comm_ctx,
-                                            const std::vector<std::vector<std::vector<void *>>> & stage_compute_cbs,
-                                            const std::vector<std::vector<ggml_tensor *>> & stage_tensors,
-                                            const ggml_predefined_frame * frame,
-                                            uint32_t capacity_rows, uint32_t capacity_outputs);
-    typedef bool (*tp5_get_cached_cmd_bufs_t)(ggml_backend_t backend, ggml_cgraph * cgraph, std::vector<void *> & out_cbs);
-    static tp5_submit_epoch_chain_t pfn_submit_chain = nullptr;
-    static tp5_get_cached_cmd_bufs_t pfn_get_cbs = nullptr;
     static bool pfn_chain_checked = false;
     static bool printed_route_once = false;
     if (!printed_route_once) {
@@ -4139,6 +4182,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // 纯 Predefine 路线（唯一真理）：一旦初次建立预定义图句柄后，直接 100% 绝对复用，跳过逐轮 validation 开销
         auto & stage_compute_cbs = backend_ctx->chain_compute_cbs;
         auto & stage_tensors     = backend_ctx->chain_tensors;
+        static int check_log = 0;
+        if (++check_log <= 10) {
+            fprintf(stderr, "[tp5-meta-check] valid=%d n_sub=%zu/%zu uid=%llu/%llu\n",
+                    (int)backend_ctx->predefined_valid, backend_ctx->predefined_n_subgraphs, backend_ctx->n_subgraphs,
+                    (unsigned long long)backend_ctx->predefined_uid, (unsigned long long)backend_ctx->uid);
+        }
 
         if (backend_ctx->predefined_valid &&
             backend_ctx->predefined_n_subgraphs == backend_ctx->n_subgraphs &&
@@ -4182,6 +4231,31 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         stage_compute_cbs.resize(backend_ctx->n_subgraphs);
         stage_tensors.resize(backend_ctx->n_subgraphs - 1);
 
+        // One-shot per-stage node census.  Distinguishes "this rank owns more ops"
+        // (staging/sharding) from "same ops, slower" (device/kernel) without touching
+        // any submission path.
+        static const bool dump_stage_nodes = [] {
+            const char * env = getenv("GGML_TP5_STAGE_NODES");
+            return env && atoi(env) != 0;
+        }();
+        static bool dumped_stage_nodes = false;
+        if (dump_stage_nodes && !dumped_stage_nodes) {
+            dumped_stage_nodes = true;
+            std::vector<size_t> totals(n_backends, 0);
+            for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
+                fprintf(stderr, "[tp5-stage-nodes] s=%zu", i);
+                for (size_t j = 0; j < n_backends; ++j) {
+                    ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+                    const int n = cg ? cg->n_nodes : -1;
+                    if (n > 0) totals[j] += (size_t) n;
+                    fprintf(stderr, " %d", n);
+                }
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "[tp5-stage-nodes] total");
+            for (size_t j = 0; j < n_backends; ++j) fprintf(stderr, " %zu", totals[j]);
+            fprintf(stderr, "\n");
+        }
         for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
             stage_compute_cbs[i].resize(n_backends);
             if (i < stage_tensors.size())
@@ -4197,7 +4271,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 if (!pfn_get_cbs(bcj.backend, cgraph_ij, stage_compute_cbs[i][j])) {
                     static int miss_log = 0;
-                    if (++miss_log <= 5) {
+                    if (++miss_log <= 20) {
                         fprintf(stderr, "[meta-chain-miss] stage=%zu rank=%zu nodes=%d uid=%llu\n", i, j,
                                 cgraph_ij->n_nodes, (unsigned long long) cgraph_ij->uid);
                     }
@@ -4282,6 +4356,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return GGML_STATUS_FAILED;
             }
         }
+    }
+
+    static int fallback_cnt = 0;
+    if (++fallback_cnt <= 20) {
+        fprintf(stderr, "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=%d n_sub=%zu uid=%llu\n", fallback_cnt, backend_ctx->n_subgraphs, (unsigned long long)backend_ctx->uid);
     }
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {

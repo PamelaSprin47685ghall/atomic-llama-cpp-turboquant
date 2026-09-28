@@ -29,6 +29,56 @@ vec2 cache_b_ds;
 #include "mul_mat_vecq_funcs.glsl"
 
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
+#if NUM_COLS > 1
+    // Optimized multi-column path: preload B activations for all columns into registers first
+    int32_t b_qs_multi[NUM_COLS][K_PER_ITER / 4];
+    vec2    b_ds_multi[NUM_COLS];
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#ifdef TP5_RELAY_ROWS
+        if (!mat_vec_col_active(j)) continue;
+#endif
+        const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
+        const uint b_block_idx_outer = b_block_idx / 4;
+        const uint b_block_idx_inner = b_block_idx % 4;
+        b_ds_multi[j] = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
+
+#if QUANT_R == 2
+        b_qs_multi[j][0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
+        b_qs_multi[j][1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
+#else
+#if K_PER_ITER == 8
+        b_qs_multi[j][0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 2];
+        b_qs_multi[j][1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 2 + 1];
+#elif K_PER_ITER == 16
+        b_qs_multi[j][0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4    ];
+        b_qs_multi[j][1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + 1];
+        b_qs_multi[j][2] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + 2];
+        b_qs_multi[j][3] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + 3];
+#endif
+#endif
+    }
+
+    uint ibi = first_row*p.ncols;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
+        ibi += p.ncols;
+#if defined(HAS_MMVQ_DOT_MULTI)
+        mmvq_dot_multi(a_block_idx, b_qs_idx, temp, n, b_qs_multi, b_ds_multi);
+#else
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#ifdef TP5_RELAY_ROWS
+            if (!mat_vec_col_active(j)) continue;
+#endif
+            cache_b_ds = b_ds_multi[j];
+            [[unroll]] for (uint k = 0; k < K_PER_ITER / 4; ++k) {
+                cache_b_qs[k] = b_qs_multi[j][k];
+            }
+            temp[j][n] += mmvq_dot_product(a_block_idx, b_qs_idx);
+        }
+#endif
+    }
+#else
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
 #ifdef TP5_RELAY_ROWS
         if (!mat_vec_col_active(j)) continue;
@@ -73,6 +123,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
             temp[j][n] += mmvq_dot_product(a_block_idx, b_qs_idx);
         }
     }
+#endif
 }
 
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {

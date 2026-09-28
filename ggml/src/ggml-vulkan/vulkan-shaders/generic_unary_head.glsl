@@ -25,6 +25,11 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 
 layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
 
+// K1c fused L2_NORM pair: second source/destination views (same shape as
+// group 0). Declared unconditionally; only l2_norm_pair.comp reads them.
+layout (binding = 2) readonly buffer APair {A_TYPE data_a_pair[];};
+layout (binding = 3) writeonly buffer DPair {D_TYPE data_d_pair[];};
+
 uint get_idx() {
     // Host packs work into Y/Z with a fixed X slab of 512 elements
     // (ggml_vk_op_f32). Do not hardcode Z-stride 262144 — use NumWorkGroups.y.

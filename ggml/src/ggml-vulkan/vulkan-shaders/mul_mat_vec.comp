@@ -215,7 +215,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
             dst1 = vec4(data_b_v4[(bbase) / 4 + 1]);
 #endif
 
-        if (NUM_COLS <= 4u) {
+        if (NUM_COLS <= 12u) {
             // Staged: activations for every column live in registers, so the row
             // walk touches memory only for its own weight block.
             vec4 bstage0[NUM_COLS];
