@@ -58,3 +58,14 @@
 
 四格 + h 扫描全部收敛：**MMVQ 在本机/本模型/本刀锋上无可检定收益**。
 最优配置仍是 aggressive-q8 h=1 + MMVQ disabled（TP5 recipe 现默认）。
+
+## 补充：A1（no-MTP, auto）命中证明（dbg2.log，RELAY_DEBUG=1）
+
+```
+family=gdn-projections fused=1 mmvq_mask=3   (x5 rank)
+family=qsa-projections  fused=1 mmvq_mask=1  (x5 rank)
+```
+
+**两臂（A1 与 B1）的融合投影 MMVQ 均真实命中**。A1 的 +238 dispatch
+（4327 vs 4089）= 参照刀锋上的 standalone Q8_1 量化 + 整数收缩。
+四格的"测到了"门在两臂均成立；判决维持。
