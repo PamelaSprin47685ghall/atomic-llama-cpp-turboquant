@@ -1,0 +1,12 @@
+A1	1	671ea4f7fab7	171	96	73	98	3065.7	31.283	55.78	261	20	mode=auto region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4327 barriers=3757 
+A1	2	671ea4f7fab7	171	96	73	98	3053.3	31.157	56.00	261	20	mode=auto region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4327 barriers=3757 
+A1	3	671ea4f7fab7	171	96	73	98	3050.2	31.124	56.06	261	20	mode=auto region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4327 barriers=3757 
+A0	1	add18ad37ff7	160	89	70	90	2659.1	29.546	60.17	241	19	mode=disabled region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4089 barriers=3519 
+A0	2	add18ad37ff7	160	89	70	90	2700.9	30.010	59.24	241	19	mode=disabled region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4089 barriers=3519 
+A0	3	add18ad37ff7	160	89	70	90	2595.0	28.833	61.66	241	19	mode=disabled region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4089 barriers=3519 
+A1b	1	671ea4f7fab7	171	96	73	98	3080.1	31.430	55.52	261	20	mode=auto region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4327 barriers=3757 
+A1b	2	671ea4f7fab7	171	96	73	98	2957.3	30.176	57.82	261	20	mode=auto region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4327 barriers=3757 
+A1b	3	671ea4f7fab7	171	96	73	98	3080.2	31.431	55.52	261	20	mode=auto region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4327 barriers=3757 
+A0b	1	add18ad37ff7	160	89	70	90	2572.9	28.588	62.19	241	19	mode=disabled region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4089 barriers=3519 
+A0b	2	add18ad37ff7	160	89	70	90	2673.4	29.705	59.85	241	19	mode=disabled region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4089 barriers=3519 
+A0b	3	add18ad37ff7	160	89	70	90	2621.8	29.131	61.03	241	19	mode=disabled region=0 mode=reference late=0 l2=0 q8_fast=0 dispatches=4089 barriers=3519 

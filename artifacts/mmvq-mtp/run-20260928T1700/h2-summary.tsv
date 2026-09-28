@@ -1,0 +1,12 @@
+B1	1	80063f09a259	171	159	90	81	3719.3	45.918	45.98	180	28	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3061 barriers=2641 
+B1	2	80063f09a259	171	159	90	81	3541.9	43.727	48.28	180	28	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3061 barriers=2641 
+B1	3	80063f09a259	171	159	90	81	3261.9	40.271	52.42	180	28	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3061 barriers=2641 
+B0	1	2bd9937ee497	171	152	94	77	3062.2	39.768	55.84	159	35	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2916 barriers=2496 
+B0	2	2bd9937ee497	171	152	94	77	2969.0	38.559	57.59	159	35	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2916 barriers=2496 
+B0	3	2bd9937ee497	171	152	94	77	2906.4	37.746	58.83	159	35	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2916 barriers=2496 
+B1b	1	80063f09a259	171	159	90	81	3510.2	43.335	48.72	180	28	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3061 barriers=2641 
+B1b	2	80063f09a259	171	159	90	81	3616.8	44.652	47.28	180	28	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3061 barriers=2641 
+B1b	3	80063f09a259	171	159	90	81	3186.7	39.342	53.66	180	28	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3061 barriers=2641 
+B0b	1	2bd9937ee497	171	152	94	77	2934.2	38.106	58.28	159	35	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2916 barriers=2496 
+B0b	2	2bd9937ee497	171	152	94	77	2866.5	37.227	59.66	159	35	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2916 barriers=2496 
+B0b	3	2bd9937ee497	171	152	94	77	2950.8	38.322	57.95	159	35	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2916 barriers=2496 

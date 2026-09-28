@@ -1,0 +1,12 @@
+B1	1	4a21e639425b	171	95	75	96	2837.9	29.562	60.26	202	25	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3024 barriers=2641 
+B1	2	4a21e639425b	171	95	75	96	2528.0	26.333	67.64	202	25	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3024 barriers=2641 
+B1	3	4a21e639425b	171	95	75	96	2759.5	28.745	61.97	202	25	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3024 barriers=2641 
+B0	1	ebf49ef9d1ca	171	96	74	97	2734.4	28.190	62.54	187	25	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2879 barriers=2496 
+B0	2	ebf49ef9d1ca	171	96	74	97	2763.9	28.494	61.87	187	25	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2879 barriers=2496 
+B0	3	ebf49ef9d1ca	171	96	74	97	2644.1	27.258	64.67	187	25	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2879 barriers=2496 
+B1b	1	4a21e639425b	171	95	75	96	2747.3	28.618	62.24	202	25	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3024 barriers=2641 
+B1b	2	4a21e639425b	171	95	75	96	2504.4	26.087	68.28	202	25	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3024 barriers=2641 
+B1b	3	4a21e639425b	171	95	75	96	2627.6	27.371	65.08	202	25	mode=auto region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=3024 barriers=2641 
+B0b	1	ebf49ef9d1ca	171	96	74	97	2763.9	28.494	61.87	187	25	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2879 barriers=2496 
+B0b	2	ebf49ef9d1ca	171	96	74	97	2785.4	28.716	61.39	187	25	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2879 barriers=2496 
+B0b	3	ebf49ef9d1ca	171	96	74	97	2573.1	26.527	66.46	187	25	mode=disabled region=0 mode=aggressive-q8 late=94 l2=0 q8_fast=94 dispatches=2879 barriers=2496 
