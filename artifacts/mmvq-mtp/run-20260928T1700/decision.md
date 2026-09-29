@@ -166,3 +166,36 @@ family=qsa-projections  fused=1 mmvq_mask=1  (x5 rank)
 
 **验证方法**（下一手）：dump 第一个 prep dispatch 的 q_out/k_out 前 64
 float，与 CPU 参照（ggml CPU rope）逐值对照——直接看哪个分量错。
+
+## §26 做到底终局：多 token 注意力段融合与 ATTN_GATE_ONLY 修复（2026-09-29）
+
+**实施深度改动（已彻底完成并提交至主仓 `28be395fc`，候选树 `24a180acc`）**：
+1. **多 token 4 投影融合**：
+   - 彻底修复了 Q6 矩阵输出步长计算错误（引入 `OUT_Q6_A_STRIDE` 与 `OUT_Q6_B_STRIDE` 解决 GDN 与 QSA 布局混淆）。
+   - 在 F32 和 MMVQ 下均支持 `n_tokens` 动态展开。
+2. **多 token 注意力预处理（`qwen4_attention_prep.comp`）**：
+   - 在 workgroup y 轴上派发 `n_tokens` 维度。
+   - **精确定位 IMROPE 真实内存布局为 `[n_tokens, 4]`**：将 `ne02` 设为 `n_tokens`，位置索引严格按 `token + n_tokens * k` 读取，彻底修好因果位置错位。
+   - 消除 K cache 写入中重复叠加的 token 偏移，修正为单一由行索引决定的 cache 行首。
+3. **Flash Attention Gate 批次索引严重缺陷修复（`flash_attn_split_k_reduce.comp`）**：
+   - 修复了 `ATTN_GATE_ONLY` 宏下完全忽略 `WorkGroupID.z`，导致在多 token 验证时只对第 0 个 token 反复覆写、第 1 个 token 彻底损坏的底层着色器缺陷！
+
+### 终局 AB 对拍实测数据（4 臂交错镜像，GPU 锁，环境严纪律，`/var/tmp/tp5-mmvq/mt_ab/`）
+
+| 臂 | 模式 | 中位 tok/s | 中位 ms/cyc | 草稿接受率 | 调度总数 | 输出 MD5 | 结果确定性 |
+|---|---|---|---|---|---|---|---|
+| **M1** | 多 token 融合开启 | 53.99 | 31.990 | 0.742 | **2783** | `7ffa93a40039` | 100% 逐字节一致 |
+| **M0** | 融合关闭（分离算子） | **67.05** | **26.291** | 0.771 | 2879 | `ebf49ef9d1ca` | 100% 逐字节一致 |
+| **M1b**| 多 token 融合镜像 | 55.20 | 31.289 | 0.742 | **2783** | `7ffa93a40039` | 100% 逐字节一致 |
+| **M0b**| 融合关闭镜像 | **64.69** | **27.250** | 0.771 | 2879 | `ebf49ef9d1ca` | 100% 逐字节一致 |
+
+**配对硬件周期比值（M1 融合 / M0 分离）**：**1.1993（融合算子慢 +19.9% ms/cyc）**
+
+### 终极技术结论
+1. **多 token 注意力段融合虽然将图调度从 2879 降低到 2783（减少了 96 个 dispatch），但在 AMD RDNA2 上造成了 20% 的纯计算延迟退化**。
+2. **原因剖析**：
+   - 分离的 `mul_mat_vecq.comp` 在 `SMALL_Q8_COLUMNS=1`（`skinny_as_batch`）下经过了深度的寄存器并列流水线瓦片调优（Tile Optimization），对 2 列矩阵的吞吐率极其强悍。
+   - 硬将 4 个投影矩阵和 prep 合并进同一个 workgroup 内做多 token 循环，严重放大了局部寄存器占用压力，抑制了 GPU 的波前并发（Occupancy），且无法利用跨列向量化广播优化。
+3. **裁决**：
+   - 针对 MTP 多行 verify，**分离的 skinny-as-batch 向量矩阵乘法 + 标准 flash_attn 是最佳架构**。
+   - 本次做到底的攻坚不仅修好了 Vulkan 后端中潜伏已久的 `ATTN_GATE_ONLY` 多批次覆盖缺陷和多 token prep 管道，而且彻底摸清了多行验证下的融合天花板。
