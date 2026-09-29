@@ -8,6 +8,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 
 #include "types.glsl"
 
@@ -168,9 +169,6 @@ p;
 #ifdef QWEN_MMVQ
 #include "qwen4_attention_mmvq.glsl"
 #endif
-
-shared float sccache_a[2][BLOCK_SIZE / 16][16];
-shared float sccache_b[2][BLOCK_SIZE / 16][16];
 
 void calc_superblock_q5_k(const uint  matrix_idx,
                           const uint  v_im,
@@ -428,7 +426,6 @@ void calc_superblock_q5_k(const uint  matrix_idx,
 }
 
 void calc_superblock_paired_q6_k(const uint  itid,
-                                 const uint  ix,
                                  const uint  ql_offset,
                                  const uint  qh_offset,
                                  const uint  s_offset,
@@ -437,24 +434,12 @@ void calc_superblock_paired_q6_k(const uint  itid,
                                  const uint  num_blocks_per_row,
                                  const uint  first_row,
                                  const uint  num_rows,
-                                 const bool  all_threads,
                                  inout float temp_a[MAX_TOKENS][NUM_ROWS_QUANT],
-                                 inout float temp_b[MAX_TOKENS][NUM_ROWS_QUANT],
-                                 inout uint  csel) {
+                                 inout float temp_b[MAX_TOKENS][NUM_ROWS_QUANT]) {
+    const uint base_lane = gl_SubgroupInvocationID & ~15u;
+
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint ib0 = (first_row + n) * num_blocks_per_row;
-        csel ^= 1u;
-
-        if (!all_threads) {
-            if (i < num_blocks_per_row) {
-                sccache_a[csel][ix][itid] = float(WEIGHTS_Q6_A[ib0 + i].scales[itid]);
-                sccache_b[csel][ix][itid] = float(WEIGHTS_Q6_B[ib0 + i].scales[itid]);
-            }
-            barrier();
-
-            if (i >= num_blocks_per_row)
-                continue;
-        }
 
         // Dequantize matrix A weights
         const uint32_t ql0_a_u32 = uint32_t(WEIGHTS_Q6_A_PACKED16[ib0 + i].ql[ql_offset / 2u]) |
@@ -484,12 +469,11 @@ void calc_superblock_paired_q6_k(const uint  itid,
         const vec4 q2_a = vec4(unpack8(q2_a_u32)) - 32.0;
         const vec4 q3_a = vec4(unpack8(q3_a_u32)) - 32.0;
 
-        if (all_threads) {
-            sccache_a[csel][ix][itid] = float(WEIGHTS_Q6_A[ib0 + i].scales[itid]);
-            sccache_b[csel][ix][itid] = float(WEIGHTS_Q6_B[ib0 + i].scales[itid]);
-            barrier();
-        }
-
+        const float my_scale_a = float(WEIGHTS_Q6_A[ib0 + i].scales[itid]);
+        const float sc0_a = subgroupShuffle(my_scale_a, base_lane + s_offset);
+        const float sc1_a = subgroupShuffle(my_scale_a, base_lane + s_offset + 2u);
+        const float sc2_a = subgroupShuffle(my_scale_a, base_lane + s_offset + 4u);
+        const float sc3_a = subgroupShuffle(my_scale_a, base_lane + s_offset + 6u);
         const float d_a = float(WEIGHTS_Q6_A[ib0 + i].d);
 
         // Paired Q6_K weights dequantized once per row; broadcast to all tokens
@@ -509,9 +493,9 @@ void calc_superblock_paired_q6_k(const uint  itid,
                 sum_a[3] = fma(by96[l], q3_a[l], sum_a[3]);
             }
             temp_a[0][n] = fma(
-                fma(sum_a[0], sccache_a[csel][ix][s_offset],
-                    fma(sum_a[1], sccache_a[csel][ix][s_offset + 2u],
-                        fma(sum_a[2], sccache_a[csel][ix][s_offset + 4u], sum_a[3] * sccache_a[csel][ix][s_offset + 6u]))),
+                fma(sum_a[0], sc0_a,
+                    fma(sum_a[1], sc1_a,
+                        fma(sum_a[2], sc2_a, sum_a[3] * sc3_a))),
                 d_a, temp_a[0][n]);
         }
 
@@ -530,9 +514,9 @@ void calc_superblock_paired_q6_k(const uint  itid,
                 sum_a[3] = fma(by96[l], q3_a[l], sum_a[3]);
             }
             temp_a[1][n] = fma(
-                fma(sum_a[0], sccache_a[csel][ix][s_offset],
-                    fma(sum_a[1], sccache_a[csel][ix][s_offset + 2u],
-                        fma(sum_a[2], sccache_a[csel][ix][s_offset + 4u], sum_a[3] * sccache_a[csel][ix][s_offset + 6u]))),
+                fma(sum_a[0], sc0_a,
+                    fma(sum_a[1], sc1_a,
+                        fma(sum_a[2], sc2_a, sum_a[3] * sc3_a))),
                 d_a, temp_a[1][n]);
 
             for (uint token = 2u; token < min(p.n_tokens, MAX_TOKENS); ++token) {
@@ -550,9 +534,9 @@ void calc_superblock_paired_q6_k(const uint  itid,
                     sum_at[3] = fma(by96t[l], q3_a[l], sum_at[3]);
                 }
                 temp_a[token][n] = fma(
-                    fma(sum_at[0], sccache_a[csel][ix][s_offset],
-                        fma(sum_at[1], sccache_a[csel][ix][s_offset + 2u],
-                            fma(sum_at[2], sccache_a[csel][ix][s_offset + 4u], sum_at[3] * sccache_a[csel][ix][s_offset + 6u]))),
+                    fma(sum_at[0], sc0_a,
+                        fma(sum_at[1], sc1_a,
+                            fma(sum_at[2], sc2_a, sum_at[3] * sc3_a))),
                     d_a, temp_a[token][n]);
             }
         }
@@ -583,6 +567,12 @@ void calc_superblock_paired_q6_k(const uint  itid,
         const vec4 q1_b = vec4(unpack8(q1_b_u32)) - 32.0;
         const vec4 q2_b = vec4(unpack8(q2_b_u32)) - 32.0;
         const vec4 q3_b = vec4(unpack8(q3_b_u32)) - 32.0;
+
+        const float my_scale_b = float(WEIGHTS_Q6_B[ib0 + i].scales[itid]);
+        const float sc0_b = subgroupShuffle(my_scale_b, base_lane + s_offset);
+        const float sc1_b = subgroupShuffle(my_scale_b, base_lane + s_offset + 2u);
+        const float sc2_b = subgroupShuffle(my_scale_b, base_lane + s_offset + 4u);
+        const float sc3_b = subgroupShuffle(my_scale_b, base_lane + s_offset + 6u);
         const float d_b = float(WEIGHTS_Q6_B[ib0 + i].d);
 
         {
@@ -599,9 +589,9 @@ void calc_superblock_paired_q6_k(const uint  itid,
                 sum_b[3] = fma(by96[l], q3_b[l], sum_b[3]);
             }
             temp_b[0][n] = fma(
-                fma(sum_b[0], sccache_b[csel][ix][s_offset],
-                    fma(sum_b[1], sccache_b[csel][ix][s_offset + 2u],
-                        fma(sum_b[2], sccache_b[csel][ix][s_offset + 4u], sum_b[3] * sccache_b[csel][ix][s_offset + 6u]))),
+                fma(sum_b[0], sc0_b,
+                    fma(sum_b[1], sc1_b,
+                        fma(sum_b[2], sc2_b, sum_b[3] * sc3_b))),
                 d_b, temp_b[0][n]);
         }
 
@@ -619,9 +609,9 @@ void calc_superblock_paired_q6_k(const uint  itid,
                 sum_b[3] = fma(by96[l], q3_b[l], sum_b[3]);
             }
             temp_b[1][n] = fma(
-                fma(sum_b[0], sccache_b[csel][ix][s_offset],
-                    fma(sum_b[1], sccache_b[csel][ix][s_offset + 2u],
-                        fma(sum_b[2], sccache_b[csel][ix][s_offset + 4u], sum_b[3] * sccache_b[csel][ix][s_offset + 6u]))),
+                fma(sum_b[0], sc0_b,
+                    fma(sum_b[1], sc1_b,
+                        fma(sum_b[2], sc2_b, sum_b[3] * sc3_b))),
                 d_b, temp_b[1][n]);
 
             for (uint token = 2u; token < min(p.n_tokens, MAX_TOKENS); ++token) {
@@ -638,9 +628,9 @@ void calc_superblock_paired_q6_k(const uint  itid,
                     sum_bt[3] = fma(by96t[l], q3_b[l], sum_bt[3]);
                 }
                 temp_b[token][n] = fma(
-                    fma(sum_bt[0], sccache_b[csel][ix][s_offset],
-                        fma(sum_bt[1], sccache_b[csel][ix][s_offset + 2u],
-                            fma(sum_bt[2], sccache_b[csel][ix][s_offset + 4u], sum_bt[3] * sccache_b[csel][ix][s_offset + 6u]))),
+                    fma(sum_bt[0], sc0_b,
+                        fma(sum_bt[1], sc1_b,
+                            fma(sum_bt[2], sc2_b, sum_bt[3] * sc3_b))),
                     d_b, temp_b[token][n]);
             }
         }
@@ -678,17 +668,10 @@ void compute_paired_q6_k(const uint first_row, const uint num_rows, const uint t
         }
     }
 
-        const uint nbr_par_th = num_blocks_per_row % it_size;
-        const uint nbr_all_th = num_blocks_per_row - nbr_par_th;
-
-        uint csel = 0u;
-        uint i0   = 0u;
-        [[unroll]] for (; i0 < nbr_all_th; i0 += it_size) {
-        calc_superblock_paired_q6_k(itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix,
-                                        num_blocks_per_row, first_row, num_rows, true, temp_a, temp_b, csel);
+    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+        calc_superblock_paired_q6_k(itid, ql_offset, qh_offset, s_offset, y_offset, i,
+                                    num_blocks_per_row, first_row, num_rows, temp_a, temp_b);
     }
-    calc_superblock_paired_q6_k(itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix,
-                                    num_blocks_per_row, first_row, num_rows, false, temp_a, temp_b, csel);
 
     [[unroll]] for (uint token = 0u; token < min(p.n_tokens, MAX_TOKENS); ++token) {
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
