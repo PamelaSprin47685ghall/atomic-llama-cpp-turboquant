@@ -16,10 +16,11 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 layout(constant_id = 0) const uint BLOCK_SIZE     = 64;
 layout(constant_id = 1) const uint NUM_ROWS_QUANT = 2;
 layout(constant_id = 2) const uint NUM_ROWS_DENSE = 2;
+layout(constant_id = 3) const uint MAX_TOKENS     = 4u;
 #ifdef QWEN_MMVQ
 // bit0: Q5[0], bit1: Q5[1] (GDN only), bit2: paired Q6. The selected
 // combination is immutable pipeline state, independent of the output route.
-layout(constant_id = 3) const uint QWEN_MMVQ_MASK = 0;
+layout(constant_id = 4) const uint QWEN_MMVQ_MASK = 0;
 #endif
 
 #if defined(GDN_PROJECTIONS)
@@ -180,7 +181,7 @@ void calc_superblock_q5_k(const uint  matrix_idx,
                           const uint  num_blocks_per_row,
                           const uint  first_row,
                           const uint  num_rows,
-                          inout float temp[4][NUM_ROWS_QUANT]) {
+                          inout float temp[MAX_TOKENS][NUM_ROWS_QUANT]) {
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint ib0 = (first_row + n) * num_blocks_per_row;
@@ -328,7 +329,7 @@ void calc_superblock_q5_k(const uint  matrix_idx,
             temp[0][n] = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm.y, smin, temp[0][n]));
         }
 
-        if (p.n_tokens > 1u) {
+        if (MAX_TOKENS > 1u && p.n_tokens > 1u) {
             const uint y1_idx1 = p.width + i * 256u + y_offset;
             const uint y2_idx1 = y1_idx1 + 128u;
             const vec2 by10  = common_input_v2[y1_idx1 / 2u];
@@ -350,7 +351,7 @@ void calc_superblock_q5_k(const uint  matrix_idx,
                         fma(by20.x + by20.y + by216.x + by216.y, sc6, (by232.x + by232.y + by248.x + by248.y) * sc7)));
             temp[1][n] = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm.y, smin, temp[1][n]));
 
-            for (uint token = 2u; token < p.n_tokens; ++token) {
+            for (uint token = 2u; token < min(p.n_tokens, MAX_TOKENS); ++token) {
                 const uint y1_idx = token * p.width + i * 256u + y_offset;
                 const uint y2_idx = y1_idx + 128u;
 
@@ -398,8 +399,8 @@ void calc_superblock_q5_k(const uint  matrix_idx,
     const uint q_offset = 32u * v_im + l0;
     const uint y_offset = 64u * v_im + l0;
 
-    float temp[4][NUM_ROWS_QUANT];
-    [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+    float temp[MAX_TOKENS][NUM_ROWS_QUANT];
+    [[unroll]] for (uint t = 0u; t < MAX_TOKENS; ++t) {
         [[unroll]] for (uint n = 0u; n < NUM_ROWS_QUANT; ++n) { temp[t][n] = 0.0; }
     }
 
@@ -408,7 +409,7 @@ void calc_superblock_q5_k(const uint  matrix_idx,
                                  num_rows, temp);
     }
 
-    [[unroll]] for (uint token = 0u; token < p.n_tokens; ++token) {
+    [[unroll]] for (uint token = 0u; token < min(p.n_tokens, MAX_TOKENS); ++token) {
         [[unroll]] for (uint n = 0; n < num_rows; ++n) { temp[token][n] = subgroupAdd(temp[token][n]); }
 
         if (tid == 0) {
@@ -437,8 +438,8 @@ void calc_superblock_paired_q6_k(const uint  itid,
                                  const uint  first_row,
                                  const uint  num_rows,
                                  const bool  all_threads,
-                                 inout float temp_a[4][NUM_ROWS_QUANT],
-                                 inout float temp_b[4][NUM_ROWS_QUANT],
+                                 inout float temp_a[MAX_TOKENS][NUM_ROWS_QUANT],
+                                 inout float temp_b[MAX_TOKENS][NUM_ROWS_QUANT],
                                  inout uint  csel) {
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint ib0 = (first_row + n) * num_blocks_per_row;
@@ -556,7 +557,7 @@ void calc_superblock_paired_q6_k(const uint  itid,
                 d_b, temp_b[0][n]);
         }
 
-        if (p.n_tokens > 1u) {
+        if (MAX_TOKENS > 1u && p.n_tokens > 1u) {
             const uint y_idx1 = p.width + i * 256u + y_offset;
             const vec4 by0  = common_input_v4[y_idx1 / 4u];
             const vec4 by32 = common_input_v4[y_idx1 / 4u + 8u];
@@ -589,7 +590,7 @@ void calc_superblock_paired_q6_k(const uint  itid,
                         fma(sum_b[2], sccache_b[csel][ix][s_offset + 4u], sum_b[3] * sccache_b[csel][ix][s_offset + 6u]))),
                 d_b, temp_b[1][n]);
 
-            for (uint token = 2u; token < p.n_tokens; ++token) {
+            for (uint token = 2u; token < min(p.n_tokens, MAX_TOKENS); ++token) {
                 const uint y_idx = token * p.width + i * 256u + y_offset;
                 const vec4 by0t  = common_input_v4[y_idx / 4u];
                 const vec4 by32t = common_input_v4[y_idx / 4u + 8u];
@@ -648,9 +649,9 @@ void compute_paired_q6_k(const uint first_row, const uint num_rows, const uint t
     const uint s_offset  = 8u * v_im + is_scale;
     const uint y_offset  = 128u * v_im + l0;
 
-    float temp_a[4][NUM_ROWS_QUANT];
-    float temp_b[4][NUM_ROWS_QUANT];
-    [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+    float temp_a[MAX_TOKENS][NUM_ROWS_QUANT];
+    float temp_b[MAX_TOKENS][NUM_ROWS_QUANT];
+    [[unroll]] for (uint t = 0u; t < MAX_TOKENS; ++t) {
         [[unroll]] for (uint n = 0; n < NUM_ROWS_QUANT; ++n) {
             temp_a[t][n] = 0.0;
             temp_b[t][n] = 0.0;
@@ -669,7 +670,7 @@ void compute_paired_q6_k(const uint first_row, const uint num_rows, const uint t
     calc_superblock_paired_q6_k(itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix,
                                     num_blocks_per_row, first_row, num_rows, false, temp_a, temp_b, csel);
 
-    [[unroll]] for (uint token = 0u; token < p.n_tokens; ++token) {
+    [[unroll]] for (uint token = 0u; token < min(p.n_tokens, MAX_TOKENS); ++token) {
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             temp_a[token][n] = subgroupAdd(temp_a[token][n]);
             temp_b[token][n] = subgroupAdd(temp_b[token][n]);
@@ -689,8 +690,8 @@ void compute_bf16(const uint first_row, const uint num_rows, const uint tid) {
     const uint step      = 4u * BLOCK_SIZE;
     const uint num_iters = (p.width + step - 1u) / step;
 
-    float temp[4][NUM_ROWS_DENSE];
-    [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+    float temp[MAX_TOKENS][NUM_ROWS_DENSE];
+    [[unroll]] for (uint t = 0u; t < MAX_TOKENS; ++t) {
         [[unroll]] for (uint n = 0u; n < NUM_ROWS_DENSE; ++n) { temp[t][n] = 0.0; }
     }
 
@@ -717,12 +718,12 @@ void compute_bf16(const uint first_row, const uint num_rows, const uint tid) {
             temp[0][n] += dot(weights_v[n], b0);
         }
 
-        if (p.n_tokens > 1u) {
+        if (MAX_TOKENS > 1u && p.n_tokens > 1u) {
             const vec4 b1 = common_input_v4[(p.width + col) / 4u];
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
                 temp[1][n] += dot(weights_v[n], b1);
             }
-            for (uint token = 2u; token < p.n_tokens; ++token) {
+            for (uint token = 2u; token < min(p.n_tokens, MAX_TOKENS); ++token) {
                 const vec4 b = common_input_v4[(token * p.width + col) / 4u];
                 [[unroll]] for (uint n = 0; n < num_rows; ++n) {
                     temp[token][n] += dot(weights_v[n], b);
@@ -731,7 +732,7 @@ void compute_bf16(const uint first_row, const uint num_rows, const uint tid) {
         }
     }
 
-    [[unroll]] for (uint token = 0u; token < p.n_tokens; ++token) {
+    [[unroll]] for (uint token = 0u; token < min(p.n_tokens, MAX_TOKENS); ++token) {
         [[unroll]] for (uint n = 0; n < num_rows; ++n) { temp[token][n] = subgroupAdd(temp[token][n]); }
 
     if (tid == 0) {

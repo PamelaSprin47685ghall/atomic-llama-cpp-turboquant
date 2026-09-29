@@ -264,3 +264,20 @@ float，与 CPU 参照（ggml CPU rope）逐值对照——直接看哪个分量
 - **四行逐值对拍**：同一组确定性 2560×32 权重、4×2560 激活，在 Vulkan0 构建四个连续投影节点；强制 MMVQ 分别执行融合与禁用融合的图。QSA 日志 `mmvq_mask=5`，GDN `mmvq_mask=7`，各比较 4×4×32=512 个 F32 输出，无 NaN/Inf；两种图族的 Q5_K 最大绝对误差均不超过 `1.52587890625e-5`，Q6_K 与 QSA BF16 输出逐值相同，512 值中没有误差超过 0.01。该探针只验证这些确定性输入，不等同于生产模型每层数值对拍。
 
 **界限**：F32/BF16 在二行和四行均与分离投影端到端逐字节一致；强制 MMVQ 二行可运行、四行生产请求完成且合成四行投影逐值对拍通过。没有新版本的 ABBA 吞吐、缓存带宽、VGPR 或 occupancy 证据，不能据此宣称达到硬件理论上限。
+
+## §31 指令资源证据与令牌容量专门化（2026-09-29）
+
+### 可重复的编译资源事实
+
+- Vulkan0/RX 6800，`RADV_DEBUG=shaderstats,nocache`，2560×32 四投影小图，`n_tokens=1` 与 4 旧版都复用同一管线 hash：QSA 强制 MMVQ `VGPRs=64`、`Subgroups per SIMD=16`，GDN 同为 64；QSA F32 为 `VGPRs=128`、`Subgroups per SIMD=8`。没有 VGPR spill。这是驱动编译统计，**不是**实际波前占用率或吞吐率。
+- 新增 `MAX_TOKENS` 专门化常量 ID3，MMVQ mask 移至 ID4；容量为 1/2/4，`ggml_vk_attention_projections` 为请求行数选择最小足够容量，缺管线仅能向更大容量回退。Q5/Q6/BF16 与 MMVQ 数组、token1 分支和 token2+ 回退以容量限定；push constants 和十个描述符不变。独立融合守卫也按实际行数验证管线容量。
+- RADV 编译结果：QSA/GDN **强制 MMVQ** 容量 1/2/4 的 VGPR 为 **40/56/64**，编译器上界 `Subgroups per SIMD` 为 **24/18/16**，均无 spill；QSA/GDN **F32** 为 **64/128/128**，对应 **16/8/8**。QSA N1 MMVQ 指令数 8422→7442，分支数 391→119；这些指令统计不等同于应用加速。
+- 默认 TP5 recipe 的五卡服务器打印 `mode=disabled`，所以不能把五卡“未强制”试验称为混合 auto MMVQ；单独 Vulkan 图在不设 FORCE/DISABLE 时，确实命中 QSA mask1/GDN mask3，其 N1/N2/N4 的 VGPR 为 **64/128/128**。N2 的 F32 Q6 成对解包仍占 128 VGPR；拆开 alpha/beta 可减小同时生存的权重，但会重读激活或加工作组，静态统计无法证明净吞吐收益，未冒险变更。
+
+### 容量映射数值回归
+
+- 同一合成输入，QSA/GDN × F32/强制 MMVQ × N=1/2/3/4，共 **16 张图**：新旧候选库逐输出字节相同；图覆盖 1、2、4 容量与 N3 选择容量4。四投影每图 4×N×32 个 F32，无 NaN/Inf；逐图均零个绝对误差超过 0.001。
+- 另对 QSA mask1/GDN mask3 自动混合图 N=1/2/4 比较启用与禁用投影融合：六图均无 NaN/Inf，最大绝对误差 `1.52587890625e-5`，无 GPU 同步或协议失败。
+- 完整五卡 aggressive-q8 `h=1`：默认禁用 MMVQ 的 MD5=`552cd459aa59`，强制 MMVQ（五卡 GDN mask7、QSA mask5）的 MD5=`2576e1cb1a2e`；与 §30 更改前同负载逐字节相同。`h=3`、禁用 MMVQ 的四行图 MD5=`68b2736fa4a9`，同样与 §30 一致。
+
+**结论边界**：静态资源压力在 N1 和强制 MMVQ N2 有可观下降，N2 自动混合/F32 的瓶颈尚在；未做计时 ABBA，不能称 24 subgroups 已实际驻留或断言端到端加速，更不能断言物理极限已测得。

@@ -1107,12 +1107,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_moe_down_k128_shared_relay_f32;
     vk_pipeline pipeline_moe_shared_up_swiglu;
     vk_pipeline pipeline_moe_projections[2];
-    vk_pipeline pipeline_attention_projections[2];
+    // Specialized by token capacity slots: [0] -> 1, [1] -> 2, [2] -> 4.
+    vk_pipeline pipeline_attention_projections[2][3];
     // Mask is a specialization constant so unused arithmetic branches can be
     // removed from the executable rather than kept behind a uniform runtime
     // branch. Registration is cheap; the normal lazy pipeline path compiles
     // only requested combinations. Mask 0 uses the existing native pipeline.
-    vk_pipeline pipeline_attention_projections_mmvq[2][8];
+    vk_pipeline pipeline_attention_projections_mmvq[2][3][8];
     // Same output epilogues with built-in Q5_K x Q8_1 integer contraction.
     vk_pipeline pipeline_output_q5k_mmvq_wire;
     vk_pipeline pipeline_output_q5k_mmvq_relay[2];
@@ -6533,31 +6534,37 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             force_subgroup_size16 == subgroup_size16 && force_subgroup_size == subgroup_size && rm_kq == 2) {
             const std::array<uint64_t, 2>              lengths{ qwen4_gdn_projections_len, qwen4_qsa_projections_len };
             const std::array<const unsigned char *, 2> data{ qwen4_gdn_projections_data, qwen4_qsa_projections_data };
+            constexpr uint32_t token_capacities[3] = { 1, 2, 4 };
             for (uint32_t variant = 0; variant < 2; ++variant) {
-                ggml_vk_create_pipeline(device, device->pipeline_attention_projections[variant],
-                                        variant == 0 ? "gdn_projections" : "qsa_projections", lengths[variant],
-                                        data[variant], "main", 9, sizeof(vk_attention_projections_push_constants),
-                                        { 1, 1, 1 }, { subgroup_size16, rm_kq, 2 }, 1, true, true,
-                                        force_subgroup_size16);
+                for (uint32_t slot = 0; slot < 3; ++slot) {
+                    const uint32_t capacity = token_capacities[slot];
+                    const std::string name = std::string(variant == 0 ? "gdn_projections_c" : "qsa_projections_c") +
+                                             std::to_string(capacity);
+                    ggml_vk_create_pipeline(device, device->pipeline_attention_projections[variant][slot],
+                                            name.c_str(), lengths[variant],
+                                            data[variant], "main", 9, sizeof(vk_attention_projections_push_constants),
+                                            { 1, 1, 1 }, { subgroup_size16, rm_kq, 2, capacity }, 1, true, true,
+                                            force_subgroup_size16);
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-                if (device->integer_dot_product) {
-                    const uint64_t mmvq_length = variant == 0 ? qwen4_gdn_projections_mmvq_len :
-                                                               qwen4_qsa_projections_mmvq_len;
-                    const unsigned char * mmvq_data = variant == 0 ? qwen4_gdn_projections_mmvq_data :
-                                                                     qwen4_qsa_projections_mmvq_data;
-                    for (uint32_t mask = 1; mask < 8; ++mask) {
-                        if (variant == 1 && (mask & 2u)) continue; // QSA has only one Q5 matrix
-                        const std::string name = std::string(variant == 0 ? "gdn_projections_mmvq_" :
-                                                                                       "qsa_projections_mmvq_") +
-                                                 std::to_string(mask);
-                        ggml_vk_create_pipeline(device, device->pipeline_attention_projections_mmvq[variant][mask],
-                                                name.c_str(), mmvq_length, mmvq_data, "main", 10,
-                                                sizeof(vk_attention_projections_push_constants),
-                                                { 1, 1, 1 }, { subgroup_size16, rm_kq, 2, mask }, 1, true, true,
-                                                force_subgroup_size16);
+                    if (device->integer_dot_product) {
+                        const uint64_t mmvq_length = variant == 0 ? qwen4_gdn_projections_mmvq_len :
+                                                                   qwen4_qsa_projections_mmvq_len;
+                        const unsigned char * mmvq_data = variant == 0 ? qwen4_gdn_projections_mmvq_data :
+                                                                         qwen4_qsa_projections_mmvq_data;
+                        for (uint32_t mask = 1; mask < 8; ++mask) {
+                            if (variant == 1 && (mask & 2u)) continue; // QSA has only one Q5 matrix
+                            const std::string mmvq_name = std::string(variant == 0 ? "gdn_projections_mmvq_c" :
+                                                                                           "qsa_projections_mmvq_c") +
+                                                     std::to_string(capacity) + "_" + std::to_string(mask);
+                            ggml_vk_create_pipeline(device, device->pipeline_attention_projections_mmvq[variant][slot][mask],
+                                                    mmvq_name.c_str(), mmvq_length, mmvq_data, "main", 10,
+                                                    sizeof(vk_attention_projections_push_constants),
+                                                    { 1, 1, 1 }, { subgroup_size16, rm_kq, 2, capacity, mask }, 1, true, true,
+                                                    force_subgroup_size16);
+                        }
                     }
-                }
 #endif
+                }
             }
         }
         for (uint32_t combine = 0; combine < 2; ++combine) {
@@ -16991,13 +16998,24 @@ static void ggml_vk_attention_projections(ggml_backend_vk_context * ctx,
     };
 
     const bool                                    qsa      = node(3)->src[0]->type == GGML_TYPE_BF16;
-    auto &                                        pipeline = ctx->device->pipeline_attention_projections[qsa ? 1 : 0];
     const vk_attention_projections_push_constants pc{ static_cast<uint32_t>(node(0)->src[1]->ne[0]),
                                                       static_cast<uint32_t>(node(0)->ne[0]),
                                                       static_cast<uint32_t>(node(1)->ne[0]),
                                                       static_cast<uint32_t>(node(qsa ? 3 : 2)->ne[0]),
                                                       static_cast<uint32_t>(node(0)->src[1]->ne[1]) };
     const uint32_t groups = CEIL_DIV(pc.rows0, 2) + CEIL_DIV(pc.rows1, 2) + CEIL_DIV(pc.rows2, 2);
+    // Select token capacity slot [0, 1, 2] corresponding to capacities [1, 2, 4].
+    // pc.n_tokens is guarded to 1..4 by can_fuse, which also verified that a pipeline
+    // with capacity >= pc.n_tokens exists. Choose requested slot or a larger available slot.
+    const uint32_t variant = qsa ? 1 : 0;
+    const uint32_t slot = pc.n_tokens <= 1 ? 0 : (pc.n_tokens <= 2 ? 1 : 2);
+    vk_pipeline pipeline = nullptr;
+    for (uint32_t s = slot; s < 3; ++s) {
+        if (ctx->device->pipeline_attention_projections[variant][s]) {
+            pipeline = ctx->device->pipeline_attention_projections[variant][s];
+            break;
+        }
+    }
     uint32_t mmvq_mask = 0;
     if (ctx->device->integer_dot_product) {
         if (ggml_vk_should_use_mmvq(ctx, pc.rows0, 1, pc.width, GGML_TYPE_Q5_K))
@@ -17021,7 +17039,15 @@ static void ggml_vk_attention_projections(ggml_backend_vk_context * ctx,
             seen |= bit;
         }
     };
-    auto & integer_pipeline = ctx->device->pipeline_attention_projections_mmvq[qsa ? 1 : 0][mmvq_mask];
+    vk_pipeline integer_pipeline = nullptr;
+    if (mmvq_mask != 0u) {
+        for (uint32_t s = slot; s < 3; ++s) {
+            if (ctx->device->pipeline_attention_projections_mmvq[variant][s][mmvq_mask]) {
+                integer_pipeline = ctx->device->pipeline_attention_projections_mmvq[variant][s][mmvq_mask];
+                break;
+            }
+        }
+    }
     vk_subbuffer quantized;
     if (mmvq_mask != 0u && integer_pipeline && ggml_vk_region_q8_input(ctx, subctx, node(0)->src[1], quantized)) {
         ggml_pipeline_request_descriptor_sets(ctx, integer_pipeline, 1);
@@ -23772,7 +23798,7 @@ static bool ggml_vk_can_fuse_attention_projections(ggml_backend_vk_context * ctx
     const int         variant  = ggml_vk_attention_projection_variant(graph, first);
     // Standalone projections, attention prep, and the cached GDN segment all
     // consume up to four token rows; validate their shapes in their own guards.
-    if (disabled || variant < 0 || !ctx->device->pipeline_attention_projections[variant] ||
+    if (disabled || variant < 0 ||
         !ggml_can_fuse_subgraph(graph, first, attention_projection_pattern, { first, first + 1, first + 2, first + 3 }))
         return false;
     const auto node = [&](int n) {
@@ -23789,6 +23815,17 @@ static bool ggml_vk_can_fuse_attention_projections(ggml_backend_vk_context * ctx
         return false;
     const uint32_t n_tokens = static_cast<uint32_t>(input->ne[1]);
     if (n_tokens < 1 || n_tokens > 4 || ggml_nelements(input) != input->ne[0] * n_tokens)
+        return false;
+    // Ensure a pipeline exists with token capacity >= n_tokens (slots [0,1,2] -> capacities [1,2,4])
+    const uint32_t min_slot = n_tokens <= 1 ? 0 : (n_tokens <= 2 ? 1 : 2);
+    bool has_capacity_pipeline = false;
+    for (uint32_t s = min_slot; s < 3; ++s) {
+        if (ctx->device->pipeline_attention_projections[variant][s]) {
+            has_capacity_pipeline = true;
+            break;
+        }
+    }
+    if (!has_capacity_pipeline)
         return false;
     if (node(variant == 0 ? 2 : 1)->ne[0] != node(variant == 0 ? 3 : 2)->ne[0])
         return false;
@@ -27858,8 +27895,8 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
             if (projections) *projections = ctx->region_q8_projection_records;
             if (gdn_mask) *gdn_mask = ctx->region_q8_used_masks[0];
             if (qsa_mask) *qsa_mask = ctx->region_q8_used_masks[1];
-            return ctx->device->integer_dot_product && ctx->device->pipeline_attention_projections_mmvq[0][3] &&
-                   ctx->device->pipeline_attention_projections_mmvq[1][1];
+            return ctx->device->integer_dot_product && ctx->device->pipeline_attention_projections_mmvq[0][0][3] &&
+                   ctx->device->pipeline_attention_projections_mmvq[1][0][1];
         };
     }
     if (strcmp(name, "ggml_backend_vk_get_sparse_dispatch_count") == 0) {

@@ -71,14 +71,14 @@ vec2 cache_b_ds;
 #undef DATA_A_Q6_K
 
 void qwen_mmvq_iter_multi(uint matrix, uint first_row, uint num_rows, uint col,
-                          inout float a[4][NUM_ROWS_QUANT], inout float b[4][NUM_ROWS_QUANT]) {
+                          inout float a[MAX_TOKENS][NUM_ROWS_QUANT], inout float b[MAX_TOKENS][NUM_ROWS_QUANT]) {
     const uint ib = col / 32u;
     const uint half_block = (col % 32u) / 16u;
 
     // 1. Preload multi-token activations into registers (single read pass, zero duplication)
-    int32_t act_qs[4][4];
-    vec2    act_ds[4];
-    [[unroll]] for (uint t = 0u; t < p.n_tokens; ++t) {
+    int32_t act_qs[MAX_TOKENS][4];
+    vec2    act_ds[MAX_TOKENS];
+    [[unroll]] for (uint t = 0u; t < min(p.n_tokens, MAX_TOKENS); ++t) {
         const uint tok_ib = t * (p.width / 32u) + ib;
         act_ds[t] = vec2(common_q8[tok_ib / 4u].ds[tok_ib % 4u]);
         [[unroll]] for (uint q = 0u; q < 4u; ++q) {
@@ -108,7 +108,7 @@ void qwen_mmvq_iter_multi(uint matrix, uint first_row, uint num_rows, uint col,
                              dotPacked4x8EXT(qs_b.w, act_qs[0][3]);
             b[0][r] += float(act_ds[0].x) * d_scale_b * float(sum_b0);
 
-            if (p.n_tokens > 1u) {
+            if (MAX_TOKENS > 1u && p.n_tokens > 1u) {
                 int32_t sum_a1 = dotPacked4x8EXT(qs_a.x, act_qs[1][0]) +
                                  dotPacked4x8EXT(qs_a.y, act_qs[1][1]) +
                                  dotPacked4x8EXT(qs_a.z, act_qs[1][2]) +
@@ -121,7 +121,7 @@ void qwen_mmvq_iter_multi(uint matrix, uint first_row, uint num_rows, uint col,
                                  dotPacked4x8EXT(qs_b.w, act_qs[1][3]);
                 b[1][r] += float(act_ds[1].x) * d_scale_b * float(sum_b1);
 
-                for (uint t = 2u; t < p.n_tokens; ++t) {
+                for (uint t = 2u; t < min(p.n_tokens, MAX_TOKENS); ++t) {
                     int32_t sum_at = dotPacked4x8EXT(qs_a.x, act_qs[t][0]) +
                                      dotPacked4x8EXT(qs_a.y, act_qs[t][1]) +
                                      dotPacked4x8EXT(qs_a.z, act_qs[t][2]) +
@@ -145,14 +145,14 @@ void qwen_mmvq_iter_multi(uint matrix, uint first_row, uint num_rows, uint col,
                              dotPacked4x8EXT(qs_0.w, act_qs[0][3]);
             a[0][r] += float(act_ds[0].x) * dm_scale.x * float(sum_00) - dm_scale.y * float(act_ds[0].y / 2.0);
 
-            if (p.n_tokens > 1u) {
+            if (MAX_TOKENS > 1u && p.n_tokens > 1u) {
                 int32_t sum_01 = dotPacked4x8EXT(qs_0.x, act_qs[1][0]) +
                                  dotPacked4x8EXT(qs_0.y, act_qs[1][1]) +
                                  dotPacked4x8EXT(qs_0.z, act_qs[1][2]) +
                                  dotPacked4x8EXT(qs_0.w, act_qs[1][3]);
                 a[1][r] += float(act_ds[1].x) * dm_scale.x * float(sum_01) - dm_scale.y * float(act_ds[1].y / 2.0);
 
-                for (uint t = 2u; t < p.n_tokens; ++t) {
+                for (uint t = 2u; t < min(p.n_tokens, MAX_TOKENS); ++t) {
                     int32_t sum_0t = dotPacked4x8EXT(qs_0.x, act_qs[t][0]) +
                                      dotPacked4x8EXT(qs_0.y, act_qs[t][1]) +
                                      dotPacked4x8EXT(qs_0.z, act_qs[t][2]) +
@@ -172,14 +172,14 @@ void qwen_mmvq_iter_multi(uint matrix, uint first_row, uint num_rows, uint col,
                              dotPacked4x8EXT(qs_1.w, act_qs[0][3]);
             a[0][r] += float(act_ds[0].x) * dm_scale.x * float(sum_10) - dm_scale.y * float(act_ds[0].y / 2.0);
 
-            if (p.n_tokens > 1u) {
+            if (MAX_TOKENS > 1u && p.n_tokens > 1u) {
                 int32_t sum_11 = dotPacked4x8EXT(qs_1.x, act_qs[1][0]) +
                                  dotPacked4x8EXT(qs_1.y, act_qs[1][1]) +
                                  dotPacked4x8EXT(qs_1.z, act_qs[1][2]) +
                                  dotPacked4x8EXT(qs_1.w, act_qs[1][3]);
                 a[1][r] += float(act_ds[1].x) * dm_scale.x * float(sum_11) - dm_scale.y * float(act_ds[1].y / 2.0);
 
-                for (uint t = 2u; t < p.n_tokens; ++t) {
+                for (uint t = 2u; t < min(p.n_tokens, MAX_TOKENS); ++t) {
                     int32_t sum_1t = dotPacked4x8EXT(qs_1.x, act_qs[t][0]) +
                                      dotPacked4x8EXT(qs_1.y, act_qs[t][1]) +
                                      dotPacked4x8EXT(qs_1.z, act_qs[t][2]) +
@@ -193,9 +193,9 @@ void qwen_mmvq_iter_multi(uint matrix, uint first_row, uint num_rows, uint col,
 }
 
 void qwen_compute_mmvq(uint matrix, uint first_row, uint num_rows, uint tid) {
-    float a[4][NUM_ROWS_QUANT];
-    float b[4][NUM_ROWS_QUANT];
-    [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+    float a[MAX_TOKENS][NUM_ROWS_QUANT];
+    float b[MAX_TOKENS][NUM_ROWS_QUANT];
+    [[unroll]] for (uint t = 0u; t < MAX_TOKENS; ++t) {
         [[unroll]] for (uint r = 0u; r < NUM_ROWS_QUANT; ++r) {
             a[t][r] = 0.0;
             b[t][r] = 0.0;
@@ -221,7 +221,7 @@ void qwen_compute_mmvq(uint matrix, uint first_row, uint num_rows, uint tid) {
     }
     if (remaining != 0u) qwen_mmvq_iter_multi(matrix, first_row, num_rows, col, a, b);
 
-    [[unroll]] for (uint t = 0u; t < p.n_tokens; ++t) {
+    [[unroll]] for (uint t = 0u; t < min(p.n_tokens, MAX_TOKENS); ++t) {
         [[unroll]] for (uint r = 0u; r < num_rows; ++r) {
             a[t][r] = subgroupAdd(a[t][r]);
             b[t][r] = subgroupAdd(b[t][r]);
