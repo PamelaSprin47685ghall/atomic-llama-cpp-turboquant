@@ -95,29 +95,70 @@ void qwen_mmvq_iter_multi(uint matrix, uint first_row, uint num_rows, uint col,
             const i32vec4 qs_b = qwen_q6_b_repack4(weight_block, half_block * 4u);
             const float d_scale_b = qwen_q6_b_d_scale(weight_block, half_block * 4u);
 
-            [[unroll]] for (uint t = 0u; t < p.n_tokens; ++t) {
-                int32_t sum_a = dotPacked4x8EXT(qs_a.x, act_qs[t][0]) +
-                                dotPacked4x8EXT(qs_a.y, act_qs[t][1]) +
-                                dotPacked4x8EXT(qs_a.z, act_qs[t][2]) +
-                                dotPacked4x8EXT(qs_a.w, act_qs[t][3]);
-                a[t][r] += float(act_ds[t].x) * d_scale_a * float(sum_a);
+            // Straight-line pipelined token accumulation: zero branch bubbles for N=1 and N=2
+            int32_t sum_a0 = dotPacked4x8EXT(qs_a.x, act_qs[0][0]) +
+                             dotPacked4x8EXT(qs_a.y, act_qs[0][1]) +
+                             dotPacked4x8EXT(qs_a.z, act_qs[0][2]) +
+                             dotPacked4x8EXT(qs_a.w, act_qs[0][3]);
+            a[0][r] += float(act_ds[0].x) * d_scale_a * float(sum_a0);
 
-                int32_t sum_b = dotPacked4x8EXT(qs_b.x, act_qs[t][0]) +
-                                dotPacked4x8EXT(qs_b.y, act_qs[t][1]) +
-                                dotPacked4x8EXT(qs_b.z, act_qs[t][2]) +
-                                dotPacked4x8EXT(qs_b.w, act_qs[t][3]);
-                b[t][r] += float(act_ds[t].x) * d_scale_b * float(sum_b);
+            int32_t sum_b0 = dotPacked4x8EXT(qs_b.x, act_qs[0][0]) +
+                             dotPacked4x8EXT(qs_b.y, act_qs[0][1]) +
+                             dotPacked4x8EXT(qs_b.z, act_qs[0][2]) +
+                             dotPacked4x8EXT(qs_b.w, act_qs[0][3]);
+            b[0][r] += float(act_ds[0].x) * d_scale_b * float(sum_b0);
+
+            if (p.n_tokens > 1u) {
+                int32_t sum_a1 = dotPacked4x8EXT(qs_a.x, act_qs[1][0]) +
+                                 dotPacked4x8EXT(qs_a.y, act_qs[1][1]) +
+                                 dotPacked4x8EXT(qs_a.z, act_qs[1][2]) +
+                                 dotPacked4x8EXT(qs_a.w, act_qs[1][3]);
+                a[1][r] += float(act_ds[1].x) * d_scale_a * float(sum_a1);
+
+                int32_t sum_b1 = dotPacked4x8EXT(qs_b.x, act_qs[1][0]) +
+                                 dotPacked4x8EXT(qs_b.y, act_qs[1][1]) +
+                                 dotPacked4x8EXT(qs_b.z, act_qs[1][2]) +
+                                 dotPacked4x8EXT(qs_b.w, act_qs[1][3]);
+                b[1][r] += float(act_ds[1].x) * d_scale_b * float(sum_b1);
+
+                for (uint t = 2u; t < p.n_tokens; ++t) {
+                    int32_t sum_at = dotPacked4x8EXT(qs_a.x, act_qs[t][0]) +
+                                     dotPacked4x8EXT(qs_a.y, act_qs[t][1]) +
+                                     dotPacked4x8EXT(qs_a.z, act_qs[t][2]) +
+                                     dotPacked4x8EXT(qs_a.w, act_qs[t][3]);
+                    a[t][r] += float(act_ds[t].x) * d_scale_a * float(sum_at);
+
+                    int32_t sum_bt = dotPacked4x8EXT(qs_b.x, act_qs[t][0]) +
+                                     dotPacked4x8EXT(qs_b.y, act_qs[t][1]) +
+                                     dotPacked4x8EXT(qs_b.z, act_qs[t][2]) +
+                                     dotPacked4x8EXT(qs_b.w, act_qs[t][3]);
+                    b[t][r] += float(act_ds[t].x) * d_scale_b * float(sum_bt);
+                }
             }
         } else if (matrix == 0u) {
             const i32vec4 qs_0 = qwen_q5_0_repack4(weight_block, half_block * 4u);
             const vec2 dm_scale = qwen_q5_0_dm_scale(weight_block, half_block * 4u);
 
-            [[unroll]] for (uint t = 0u; t < p.n_tokens; ++t) {
-                int32_t sum_0 = dotPacked4x8EXT(qs_0.x, act_qs[t][0]) +
-                                dotPacked4x8EXT(qs_0.y, act_qs[t][1]) +
-                                dotPacked4x8EXT(qs_0.z, act_qs[t][2]) +
-                                dotPacked4x8EXT(qs_0.w, act_qs[t][3]);
-                a[t][r] += float(act_ds[t].x) * dm_scale.x * float(sum_0) - dm_scale.y * float(act_ds[t].y / 2.0);
+            int32_t sum_00 = dotPacked4x8EXT(qs_0.x, act_qs[0][0]) +
+                             dotPacked4x8EXT(qs_0.y, act_qs[0][1]) +
+                             dotPacked4x8EXT(qs_0.z, act_qs[0][2]) +
+                             dotPacked4x8EXT(qs_0.w, act_qs[0][3]);
+            a[0][r] += float(act_ds[0].x) * dm_scale.x * float(sum_00) - dm_scale.y * float(act_ds[0].y / 2.0);
+
+            if (p.n_tokens > 1u) {
+                int32_t sum_01 = dotPacked4x8EXT(qs_0.x, act_qs[1][0]) +
+                                 dotPacked4x8EXT(qs_0.y, act_qs[1][1]) +
+                                 dotPacked4x8EXT(qs_0.z, act_qs[1][2]) +
+                                 dotPacked4x8EXT(qs_0.w, act_qs[1][3]);
+                a[1][r] += float(act_ds[1].x) * dm_scale.x * float(sum_01) - dm_scale.y * float(act_ds[1].y / 2.0);
+
+                for (uint t = 2u; t < p.n_tokens; ++t) {
+                    int32_t sum_0t = dotPacked4x8EXT(qs_0.x, act_qs[t][0]) +
+                                     dotPacked4x8EXT(qs_0.y, act_qs[t][1]) +
+                                     dotPacked4x8EXT(qs_0.z, act_qs[t][2]) +
+                                     dotPacked4x8EXT(qs_0.w, act_qs[t][3]);
+                    a[t][r] += float(act_ds[t].x) * dm_scale.x * float(sum_0t) - dm_scale.y * float(act_ds[t].y / 2.0);
+                }
             }
         }
 #ifdef GDN_PROJECTIONS
@@ -125,12 +166,26 @@ void qwen_mmvq_iter_multi(uint matrix, uint first_row, uint num_rows, uint col,
             const i32vec4 qs_1 = qwen_q5_1_repack4(weight_block, half_block * 4u);
             const vec2 dm_scale = qwen_q5_1_dm_scale(weight_block, half_block * 4u);
 
-            [[unroll]] for (uint t = 0u; t < p.n_tokens; ++t) {
-                int32_t sum_1 = dotPacked4x8EXT(qs_1.x, act_qs[t][0]) +
-                                dotPacked4x8EXT(qs_1.y, act_qs[t][1]) +
-                                dotPacked4x8EXT(qs_1.z, act_qs[t][2]) +
-                                dotPacked4x8EXT(qs_1.w, act_qs[t][3]);
-                a[t][r] += float(act_ds[t].x) * dm_scale.x * float(sum_1) - dm_scale.y * float(act_ds[t].y / 2.0);
+            int32_t sum_10 = dotPacked4x8EXT(qs_1.x, act_qs[0][0]) +
+                             dotPacked4x8EXT(qs_1.y, act_qs[0][1]) +
+                             dotPacked4x8EXT(qs_1.z, act_qs[0][2]) +
+                             dotPacked4x8EXT(qs_1.w, act_qs[0][3]);
+            a[0][r] += float(act_ds[0].x) * dm_scale.x * float(sum_10) - dm_scale.y * float(act_ds[0].y / 2.0);
+
+            if (p.n_tokens > 1u) {
+                int32_t sum_11 = dotPacked4x8EXT(qs_1.x, act_qs[1][0]) +
+                                 dotPacked4x8EXT(qs_1.y, act_qs[1][1]) +
+                                 dotPacked4x8EXT(qs_1.z, act_qs[1][2]) +
+                                 dotPacked4x8EXT(qs_1.w, act_qs[1][3]);
+                a[1][r] += float(act_ds[1].x) * dm_scale.x * float(sum_11) - dm_scale.y * float(act_ds[1].y / 2.0);
+
+                for (uint t = 2u; t < p.n_tokens; ++t) {
+                    int32_t sum_1t = dotPacked4x8EXT(qs_1.x, act_qs[t][0]) +
+                                     dotPacked4x8EXT(qs_1.y, act_qs[t][1]) +
+                                     dotPacked4x8EXT(qs_1.z, act_qs[t][2]) +
+                                     dotPacked4x8EXT(qs_1.w, act_qs[t][3]);
+                    a[t][r] += float(act_ds[t].x) * dm_scale.x * float(sum_1t) - dm_scale.y * float(act_ds[t].y / 2.0);
+                }
             }
         }
 #endif

@@ -12115,9 +12115,15 @@ static bool ggml_vk_should_use_mmvq(const ggml_backend_vk_context * ctx, uint32_
         return false;
     }
 
-    // MMVQ is generally good for batches
-    if (n > 1) {
+    // MMVQ is generally good for wide batches where quantization cost is fully amortized
+    if (n >= 8) {
         return true;
+    }
+    // For skinny batches (1 < n < 8, e.g. speculative MTP verification),
+    // quantization overhead is still non-trivial. Small k dimensions (< 2048)
+    // cannot amortize the Q8_1 quantization pass.
+    if (k < 2048) {
+        return false;
     }
 
     // Quantization overhead is not worth it for small k

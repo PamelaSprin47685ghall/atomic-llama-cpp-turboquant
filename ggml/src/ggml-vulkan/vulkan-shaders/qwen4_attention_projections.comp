@@ -304,18 +304,18 @@ void calc_superblock_q5_k(const uint  matrix_idx,
         const float q4_15 = qs64_80_hi4.w;
 
         // Weights unpacked once per matrix row; broadcast dot-product to all tokens
-        [[unroll]] for (uint token = 0u; token < p.n_tokens; ++token) {
-            const uint y1_idx = token * p.width + i * 256u + y_offset;
-            const uint y2_idx = y1_idx + 128u;
-
-            const vec2 by10  = common_input_v2[y1_idx / 2u];
-            const vec2 by116 = common_input_v2[y1_idx / 2u + 8u];
-            const vec2 by132 = common_input_v2[y1_idx / 2u + 16u];
-            const vec2 by148 = common_input_v2[y1_idx / 2u + 24u];
-            const vec2 by20  = common_input_v2[y2_idx / 2u];
-            const vec2 by216 = common_input_v2[y2_idx / 2u + 8u];
-            const vec2 by232 = common_input_v2[y2_idx / 2u + 16u];
-            const vec2 by248 = common_input_v2[y2_idx / 2u + 24u];
+        // Straight-line pipelined token accumulation: zero branch bubbles for N=1 and N=2
+        {
+            const uint y1_idx0 = i * 256u + y_offset;
+            const uint y2_idx0 = y1_idx0 + 128u;
+            const vec2 by10  = common_input_v2[y1_idx0 / 2u];
+            const vec2 by116 = common_input_v2[y1_idx0 / 2u + 8u];
+            const vec2 by132 = common_input_v2[y1_idx0 / 2u + 16u];
+            const vec2 by148 = common_input_v2[y1_idx0 / 2u + 24u];
+            const vec2 by20  = common_input_v2[y2_idx0 / 2u];
+            const vec2 by216 = common_input_v2[y2_idx0 / 2u + 8u];
+            const vec2 by232 = common_input_v2[y2_idx0 / 2u + 16u];
+            const vec2 by248 = common_input_v2[y2_idx0 / 2u + 24u];
 
             const float sx = fma(by10.x, q4_0, fma(by10.y, q4_1, fma(by116.x, q4_2, by116.y * q4_3)));
             const float sy = fma(by132.x, q4_4, fma(by132.y, q4_5, fma(by148.x, q4_6, by148.y * q4_7)));
@@ -325,12 +325,57 @@ void calc_superblock_q5_k(const uint  matrix_idx,
                 fma(by10.x + by10.y + by116.x + by116.y, sc2,
                     fma(by132.x + by132.y + by148.x + by148.y, sc3,
                         fma(by20.x + by20.y + by216.x + by216.y, sc6, (by232.x + by232.y + by248.x + by248.y) * sc7)));
-            temp[token][n] = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm.y, smin, temp[token][n]));
+            temp[0][n] = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm.y, smin, temp[0][n]));
+        }
+
+        if (p.n_tokens > 1u) {
+            const uint y1_idx1 = p.width + i * 256u + y_offset;
+            const uint y2_idx1 = y1_idx1 + 128u;
+            const vec2 by10  = common_input_v2[y1_idx1 / 2u];
+            const vec2 by116 = common_input_v2[y1_idx1 / 2u + 8u];
+            const vec2 by132 = common_input_v2[y1_idx1 / 2u + 16u];
+            const vec2 by148 = common_input_v2[y1_idx1 / 2u + 24u];
+            const vec2 by20  = common_input_v2[y2_idx1 / 2u];
+            const vec2 by216 = common_input_v2[y2_idx1 / 2u + 8u];
+            const vec2 by232 = common_input_v2[y2_idx1 / 2u + 16u];
+            const vec2 by248 = common_input_v2[y2_idx1 / 2u + 24u];
+
+            const float sx = fma(by10.x, q4_0, fma(by10.y, q4_1, fma(by116.x, q4_2, by116.y * q4_3)));
+            const float sy = fma(by132.x, q4_4, fma(by132.y, q4_5, fma(by148.x, q4_6, by148.y * q4_7)));
+            const float sz = fma(by20.x, q4_8, fma(by20.y, q4_9, fma(by216.x, q4_10, by216.y * q4_11)));
+            const float sw = fma(by232.x, q4_12, fma(by232.y, q4_13, fma(by248.x, q4_14, by248.y * q4_15)));
+            const float smin =
+                fma(by10.x + by10.y + by116.x + by116.y, sc2,
+                    fma(by132.x + by132.y + by148.x + by148.y, sc3,
+                        fma(by20.x + by20.y + by216.x + by216.y, sc6, (by232.x + by232.y + by248.x + by248.y) * sc7)));
+            temp[1][n] = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm.y, smin, temp[1][n]));
+
+            for (uint token = 2u; token < p.n_tokens; ++token) {
+                const uint y1_idx = token * p.width + i * 256u + y_offset;
+                const uint y2_idx = y1_idx + 128u;
+
+                const vec2 by10t  = common_input_v2[y1_idx / 2u];
+                const vec2 by116t = common_input_v2[y1_idx / 2u + 8u];
+                const vec2 by132t = common_input_v2[y1_idx / 2u + 16u];
+                const vec2 by148t = common_input_v2[y1_idx / 2u + 24u];
+                const vec2 by20t  = common_input_v2[y2_idx / 2u];
+                const vec2 by216t = common_input_v2[y2_idx / 2u + 8u];
+                const vec2 by232t = common_input_v2[y2_idx / 2u + 16u];
+                const vec2 by248t = common_input_v2[y2_idx / 2u + 24u];
+
+                const float sxt = fma(by10t.x, q4_0, fma(by10t.y, q4_1, fma(by116t.x, q4_2, by116t.y * q4_3)));
+                const float syt = fma(by132t.x, q4_4, fma(by132t.y, q4_5, fma(by148t.x, q4_6, by148t.y * q4_7)));
+                const float szt = fma(by20t.x, q4_8, fma(by20t.y, q4_9, fma(by216t.x, q4_10, by216t.y * q4_11)));
+                const float swt = fma(by232t.x, q4_12, fma(by232t.y, q4_13, fma(by248t.x, q4_14, by248t.y * q4_15)));
+                const float smint =
+                    fma(by10t.x + by10t.y + by116t.x + by116t.y, sc2,
+                        fma(by132t.x + by132t.y + by148t.x + by148t.y, sc3,
+                            fma(by20t.x + by20t.y + by216t.x + by216t.y, sc6, (by232t.x + by232t.y + by248t.x + by248t.y) * sc7)));
+                temp[token][n] = fma(dm.x, fma(sxt, sc0, fma(syt, sc1, fma(szt, sc4, swt * sc5))), fma(-dm.y, smint, temp[token][n]));
+            }
         }
     }
-}
-
-void compute_q5_k(const uint matrix_idx, const uint first_row, const uint num_rows, const uint tid) {
+}void compute_q5_k(const uint matrix_idx, const uint first_row, const uint num_rows, const uint tid) {
 #ifdef QWEN_MMVQ
     if ((QWEN_MMVQ_MASK & (1u << matrix_idx)) != 0u) {
         qwen_compute_mmvq(matrix_idx, first_row, num_rows, tid);
@@ -476,12 +521,13 @@ void calc_superblock_paired_q6_k(const uint  itid,
         const float d_b = float(WEIGHTS_Q6_B[ib0 + i].d);
 
         // Paired Q6_K weights dequantized once per row; broadcast to all tokens
-        [[unroll]] for (uint token = 0u; token < p.n_tokens; ++token) {
-            const uint y_idx = token * p.width + i * 256u + y_offset;
-            const vec4 by0  = common_input_v4[y_idx / 4u];
-            const vec4 by32 = common_input_v4[y_idx / 4u + 8u];
-            const vec4 by64 = common_input_v4[y_idx / 4u + 16u];
-            const vec4 by96 = common_input_v4[y_idx / 4u + 24u];
+        // Straight-line pipelined token accumulation for paired Q6_K
+        {
+            const uint y_idx0 = i * 256u + y_offset;
+            const vec4 by0  = common_input_v4[y_idx0 / 4u];
+            const vec4 by32 = common_input_v4[y_idx0 / 4u + 8u];
+            const vec4 by64 = common_input_v4[y_idx0 / 4u + 16u];
+            const vec4 by96 = common_input_v4[y_idx0 / 4u + 24u];
 
             float sum_a[4] = { 0.0, 0.0, 0.0, 0.0 };
             [[unroll]] for (uint l = 0u; l < 4u; ++l) {
@@ -490,11 +536,11 @@ void calc_superblock_paired_q6_k(const uint  itid,
                 sum_a[2] = fma(by64[l], q2_a[l], sum_a[2]);
                 sum_a[3] = fma(by96[l], q3_a[l], sum_a[3]);
             }
-            temp_a[token][n] = fma(
+            temp_a[0][n] = fma(
                 fma(sum_a[0], sccache_a[csel][ix][s_offset],
                     fma(sum_a[1], sccache_a[csel][ix][s_offset + 2u],
                         fma(sum_a[2], sccache_a[csel][ix][s_offset + 4u], sum_a[3] * sccache_a[csel][ix][s_offset + 6u]))),
-                d_a, temp_a[token][n]);
+                d_a, temp_a[0][n]);
 
             float sum_b[4] = { 0.0, 0.0, 0.0, 0.0 };
             [[unroll]] for (uint l = 0u; l < 4u; ++l) {
@@ -503,11 +549,79 @@ void calc_superblock_paired_q6_k(const uint  itid,
                 sum_b[2] = fma(by64[l], q2_b[l], sum_b[2]);
                 sum_b[3] = fma(by96[l], q3_b[l], sum_b[3]);
             }
-            temp_b[token][n] = fma(
+            temp_b[0][n] = fma(
                 fma(sum_b[0], sccache_b[csel][ix][s_offset],
                     fma(sum_b[1], sccache_b[csel][ix][s_offset + 2u],
                         fma(sum_b[2], sccache_b[csel][ix][s_offset + 4u], sum_b[3] * sccache_b[csel][ix][s_offset + 6u]))),
-                d_b, temp_b[token][n]);
+                d_b, temp_b[0][n]);
+        }
+
+        if (p.n_tokens > 1u) {
+            const uint y_idx1 = p.width + i * 256u + y_offset;
+            const vec4 by0  = common_input_v4[y_idx1 / 4u];
+            const vec4 by32 = common_input_v4[y_idx1 / 4u + 8u];
+            const vec4 by64 = common_input_v4[y_idx1 / 4u + 16u];
+            const vec4 by96 = common_input_v4[y_idx1 / 4u + 24u];
+
+            float sum_a[4] = { 0.0, 0.0, 0.0, 0.0 };
+            [[unroll]] for (uint l = 0u; l < 4u; ++l) {
+                sum_a[0] = fma(by0[l], q0_a[l], sum_a[0]);
+                sum_a[1] = fma(by32[l], q1_a[l], sum_a[1]);
+                sum_a[2] = fma(by64[l], q2_a[l], sum_a[2]);
+                sum_a[3] = fma(by96[l], q3_a[l], sum_a[3]);
+            }
+            temp_a[1][n] = fma(
+                fma(sum_a[0], sccache_a[csel][ix][s_offset],
+                    fma(sum_a[1], sccache_a[csel][ix][s_offset + 2u],
+                        fma(sum_a[2], sccache_a[csel][ix][s_offset + 4u], sum_a[3] * sccache_a[csel][ix][s_offset + 6u]))),
+                d_a, temp_a[1][n]);
+
+            float sum_b[4] = { 0.0, 0.0, 0.0, 0.0 };
+            [[unroll]] for (uint l = 0u; l < 4u; ++l) {
+                sum_b[0] = fma(by0[l], q0_b[l], sum_b[0]);
+                sum_b[1] = fma(by32[l], q1_b[l], sum_b[1]);
+                sum_b[2] = fma(by64[l], q2_b[l], sum_b[2]);
+                sum_b[3] = fma(by96[l], q3_b[l], sum_b[3]);
+            }
+            temp_b[1][n] = fma(
+                fma(sum_b[0], sccache_b[csel][ix][s_offset],
+                    fma(sum_b[1], sccache_b[csel][ix][s_offset + 2u],
+                        fma(sum_b[2], sccache_b[csel][ix][s_offset + 4u], sum_b[3] * sccache_b[csel][ix][s_offset + 6u]))),
+                d_b, temp_b[1][n]);
+
+            for (uint token = 2u; token < p.n_tokens; ++token) {
+                const uint y_idx = token * p.width + i * 256u + y_offset;
+                const vec4 by0t  = common_input_v4[y_idx / 4u];
+                const vec4 by32t = common_input_v4[y_idx / 4u + 8u];
+                const vec4 by64t = common_input_v4[y_idx / 4u + 16u];
+                const vec4 by96t = common_input_v4[y_idx / 4u + 24u];
+
+                float sum_at[4] = { 0.0, 0.0, 0.0, 0.0 };
+                [[unroll]] for (uint l = 0u; l < 4u; ++l) {
+                    sum_at[0] = fma(by0t[l], q0_a[l], sum_at[0]);
+                    sum_at[1] = fma(by32t[l], q1_a[l], sum_at[1]);
+                    sum_at[2] = fma(by64t[l], q2_a[l], sum_at[2]);
+                    sum_at[3] = fma(by96t[l], q3_a[l], sum_at[3]);
+                }
+                temp_a[token][n] = fma(
+                    fma(sum_at[0], sccache_a[csel][ix][s_offset],
+                        fma(sum_at[1], sccache_a[csel][ix][s_offset + 2u],
+                            fma(sum_at[2], sccache_a[csel][ix][s_offset + 4u], sum_at[3] * sccache_a[csel][ix][s_offset + 6u]))),
+                    d_a, temp_a[token][n]);
+
+                float sum_bt[4] = { 0.0, 0.0, 0.0, 0.0 };
+                [[unroll]] for (uint l = 0u; l < 4u; ++l) {
+                    sum_bt[0] = fma(by0t[l], q0_b[l], sum_bt[0]);
+                    sum_bt[1] = fma(by32t[l], q1_b[l], sum_bt[1]);
+                    sum_bt[2] = fma(by64t[l], q2_b[l], sum_bt[2]);
+                    sum_bt[3] = fma(by96t[l], q3_b[l], sum_bt[3]);
+                }
+                temp_b[token][n] = fma(
+                    fma(sum_bt[0], sccache_b[csel][ix][s_offset],
+                        fma(sum_bt[1], sccache_b[csel][ix][s_offset + 2u],
+                            fma(sum_bt[2], sccache_b[csel][ix][s_offset + 4u], sum_bt[3] * sccache_b[csel][ix][s_offset + 6u]))),
+                    d_b, temp_b[token][n]);
+            }
         }
     }
 }
