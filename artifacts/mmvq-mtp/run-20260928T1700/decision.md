@@ -490,3 +490,20 @@ Q8_0 共享解包 helper 仍对每列执行必要的整数点积。将现有 `mu
 同一 standalone 探针的 `k=256,m=16,n=1` RADV 静态统计：一行 / 两行 instructions **1773/3084**、VMEM **114/200**、VGPR **64/64**、Subgroups/SIMD **16/16**，均无 spill；动态计数的 VMEM load 和 waves 在两行时更少，但**实际 VRAM 读更多**。这一组 standalone 管线未声明生产 host 的 subgroup-size 控制，不能把它的 VGPR 数与 §45 的生产图 VGPR=32 直接比，也不能把流量回退归因到 VGPR 翻倍。安全结论仅为此探针的两种真实矩阵尺寸都未兑现物理读取收益：不引入新的 Q6 生产管线、阈值或五卡服务实验。源码与最终构建未改动；独立探针及全部原始计数归档 `q6-row-tile-rejected-20260929.tar.gz`。
 
 该反例不能证明另一个布局、真实 GGUF 字节或生产同步下也回退，更不能用于宣称理论/指令级最优。§46 的物理读取仍显著超过独立权重字节；需要有可解释的指令/事务改进并且通过匹配五卡负载资格才能推动默认 MMVQ 门控。
+
+## §49 当前源码的五卡 MTP forced/default 交错资格（2026-09-29；**不合格**）
+
+冻结 `/var/tmp/tp5-final-build/bin/llama-server` SHA256 `da35702a87e9918cea3101806a14476bf15b53a4a68bad43d72eab451f1e8fdb`、`libggml-vulkan.so.0.18.1` SHA256 `43b8d18401b5c82f08f16e5fa2a38a4de4b3d8bee95acd415438fec34ee3666b`；构建 `CMAKE_HOME_DIRECTORY=/var/tmp/tp5-candidate-k1a`，主仓当前决策基座提交 `9d05b44cc`。五张 RX 6800 初态忙碌率均为 0、VRAM 约 17 MB，无既存 `llama-server`；一次只让本轮进程在 `/var/tmp/tp5-gpu.lock` 下运行。使用相同主/草稿 GGUF、`--tp5 qwen4exp-af -md ... --spec-type draft-mtp`、relay/F32、LateBind off、greedy seed=12345、`n_predict=171`、同一中文提示；每臂先一次 8-token 热机，再一次 171-token 请求。只给基础 `RADV_DEBUG=nobolist`，forced 臂加 `GGML_VK_FORCE_MMVQ=1`；默认臂由合格 TP5/relay 路径设置 MMVQ disabled。每个子服务只停自己的 PID，四臂均正常退出。
+
+镜像顺序 forced–default–default–forced，同二进制同提示。下表 decode 时间**仅作原始观察，未获比较资格**；SHA 为响应正文 SHA256 前 16 位：
+
+|臂|pred_n / prompt_n|draft accepted/generated|decode ms|正文 SHA 前缀|测量期间 `CRITICAL-FALLBACK`|
+|---|---:|---:|---:|---|---:|
+|forced-1|171 / 39|129 / 233|5215.742|`84e0e2b8a08bd50c`|2|
+|default-1|171 / 39|130 / 235|4018.389|`eb0f6bb83a7a8213`|1|
+|default-2|171 / 39|130 / 235|3979.788|`eb0f6bb83a7a8213`|1|
+|forced-2|171 / 39|129 / 233|4297.115|`84e0e2b8a08bd50c`|2|
+
+四臂 HTTP 200、五 rank 每组账本内部一致且 `late=0`；forced 测量尾组为每 rank `dispatches=4522,barriers=4017,copies=192`，默认尾组为 `4242,3497,192`，对应模式不同的 dispatch 图，不能要求跨模式账本相同。每个模式内部重复输出和接受数稳定，但**跨模式正文不同，接受量 129/233 对 130/235，且测量期仍有 graph fallback**；所生成 171 token 仅包含 `<think>` 推理片段，没有最终文章。不能用表中毫秒数断言净加速/退化、连贯最终回答或全硬件最优；TP5 默认 MMVQ 禁用不变。原始四份 HTTP JSON、服务日志、资格提取表见 `mtp-current-binary-unqualified-abba-20260929.tar.gz`。
+
+下一步资格条件仍为相同 `pred_n`、实际正文、draft 接受率/数量、五 rank 账本内部一致，且定位解码 graph fallback；理论方面 §46 的 Q6 物理读取下界与 §47–48 的负例也未收敛。不能因多跑相同不合格请求或者单一 GPU ISA 指标宣称已达到极致。
