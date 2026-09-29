@@ -69,3 +69,35 @@ family=qsa-projections  fused=1 mmvq_mask=1  (x5 rank)
 **两臂（A1 与 B1）的融合投影 MMVQ 均真实命中**。A1 的 +238 dispatch
 （4327 vs 4089）= 参照刀锋上的 standalone Q8_1 量化 + 整数收缩。
 四格的"测到了"门在两臂均成立；判决维持。
+
+## §22 多 token 投影融合：第一次实现被否决，保守版回归通过（2026-09-29）
+
+**用户裁决**：四格测试是粗劣代码——MMVQ 与 MTP 的融合路径在 2 行 verify 上根本没接通
+（守卫 `ggml_nelements(input) != input->ne[0]` 拒绝多行输入 → 4×standalone GEMV）。
+不改代码就测，违背针尖原则。
+
+**实现**（`qwen4_attention_projections.comp` + `qwen4_attention_mmvq.glsl` + `ggml-vulkan.cpp`）：
+1. push constants 加 `n_tokens`（16→20 字节，SPIR-V 验证 5×uint 成员）。
+2. F32 路径：`calc_superblock_q5_k`/`calc_superblock_paired_q6_k`/`compute_bf16` 按
+   `token*p.width` 索引输入，输出 `[t*rowsN + row]`，每 WG 循环 token。
+3. MMVQ 变体：`tok_ib = token*(width/32)+ib` 索引共享 Q8_1。
+4. 守卫：接受 `ne[1] ∈ {1..4}`，输出 `ne[1]==n_tokens`。
+5. region 量化：`ne = width*n_tokens`。
+
+**第一次实测（dbg3/dbg4）**：输出退化（cjk=47/95、重复数字）、52/41 tok/s。
+**根因**（dbg5 单 token 也坏 → 排除多 token 逻辑本身；dbg7 全保守后逐字节恢复）：
+`can_fuse_attention_projections` 被 **segment 调用方**（`attention_segment`/`gdn_cached_segment`）
+复用——这些 segment 的下游 `qwen4_attention_prep.comp` **硬编码单 token**
+（`rope_norm(d, 0, 0, 0, rp)`、`rope_data_pos[0]`、dispatch `{heads,1,1}` 无 token 维）。
+守卫放宽让 2-token 图进了 segment 融合 → prep 只处理 token 0 → 数值破坏。
+
+**修复**：`segment_caller` 形参——attention_segment/gdn_cached/独立融合三个调用方全部传
+`true`（保守），多 token 接受条件 `n_tokens != 1 && !allow_multi_token → false`。
+
+**回归验证**（保守版，同二进制）：
+- R 臂：md5 `add18ad37ff7` 逐字节、dispatches=4089、58.45 tok/s ✓
+- A 臂：r2/r3 md5 `ebf49ef9d1ca` 逐字节、dispatches=2879、66.3/62.0 tok/s ✓
+  （dbg8 r1 的 51 tok/s 是会话首测请求的接受率波动，r2/r3 稳定）
+
+**遗留**：多 token 融合要真正启用，必须先让 attention_prep 支持 token 维
+（dispatch 加 token 轴或循环），这是下一个单因素。当前保守版 = 基础设施就位 + 行为零变化。
