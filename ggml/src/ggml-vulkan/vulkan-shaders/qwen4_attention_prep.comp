@@ -102,6 +102,13 @@ layout(push_constant) uniform parameter {
     uint        q_stride;
     uint        k_row_stride;
     uint        v_row_stride;
+    // Multi-token (MTP verify) extension: 1 = legacy single-token dispatch.
+    // The workgroup y-axis becomes the token index; every per-head read and
+    // write below is offset by token. Positions index rope_data_pos[token].
+    uint        n_tokens;
+    uint        q_token_stride;
+    uint        k_token_stride;
+    uint        v_token_stride;
     float       q_eps;
     float       k_eps;
 #if ATTENTION_PREP_COMPACT
@@ -154,6 +161,7 @@ shared float rope_data_a[1024];
 void main() {
     const uint tid   = gl_LocalInvocationID.x;
     const uint group = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
 
 #if ATTENTION_PREP_COMPACT
     const uint prep_groups = p.q_heads + 2 * p.kv_heads;
@@ -171,14 +179,16 @@ void main() {
     const uint width = p.rope.ne00;
     if (group >= p.q_heads + p.kv_heads) {
         const uint head = group - p.q_heads - p.kv_heads;
+        const uint v_base = token * p.v_token_stride;
         for (uint d = tid; d < width; d += 512) {
-            v_out[v_rows[0].x * p.v_row_stride + head * width + d] = float16_t(value[head * width + d]);
+            v_out[v_rows[token].x * p.v_row_stride + head * width + d] =
+                float16_t(value[v_base + head * width + d]);
         }
         return;
     }
     const bool is_q = group < p.q_heads;
     const uint head = is_q ? group : group - p.q_heads;
-    const uint base = head * (is_q ? p.q_stride : width);
+    const uint base = token * (is_q ? p.q_token_stride : p.k_token_stride) + head * (is_q ? p.q_stride : width);
     float      sum  = 0.0f;
     // Match rms_norm.comp's 512-lane, constant-unrolled accumulation and tree.
     if (width <= 512) {
@@ -212,26 +222,34 @@ void main() {
     }
     barrier();
     rope_params rp     = p.rope;
-    rp.nb11            = width;
-    rp.nb12            = width;
-    rp.nb13            = width;
     rp.set_rows_stride = 0;
-    rp.d_offset        = is_q ? head * width : k_rows[0].x * p.k_row_stride + head * width;
+    rp.ne02            = p.n_tokens;
+    rp.nb11            = width;
+    if (is_q) {
+        rp.nb12        = p.q_heads * width;
+        rp.nb13        = 0;
+        rp.d_offset    = 0;
+    } else {
+        rp.nb12        = 0;
+        rp.nb13        = 0;
+        rp.d_offset    = k_rows[token].x * p.k_row_stride + head * width;
+    }
+
     for (uint d = 2 * tid; d < width; d += 1024) {
         if (is_q) {
             if (rp.rope_mode == 0)
-                rope_norm(d, 0, 0, 0, rp);
+                rope_norm(d, head, token, 0, rp);
             else if (rp.rope_mode == 2)
-                rope_neox(d, 0, 0, 0, rp);
+                rope_neox(d, head, token, 0, rp);
             else
-                rope_multi(d, 0, 0, 0, rp);
+                rope_multi(d, head, token, 0, rp);
         } else {
             if (rp.rope_mode == 0)
-                rope_norm_f16(d, 0, 0, 0, rp);
+                rope_norm_f16(d, 0, token, 0, rp);
             else if (rp.rope_mode == 2)
-                rope_neox_f16(d, 0, 0, 0, rp);
+                rope_neox_f16(d, 0, token, 0, rp);
             else
-                rope_multi_f16(d, 0, 0, 0, rp);
+                rope_multi_f16(d, 0, token, 0, rp);
         }
     }
 }

@@ -67,6 +67,8 @@ layout(std430, binding = 3) readonly buffer Weights3Packed16 {
 #    define WEIGHTS_Q6_B_PACKED16 weights3_packed16
 #    define OUT_Q6_A              out2
 #    define OUT_Q6_B              out3
+#    define OUT_Q6_A_STRIDE       p.rows2
+#    define OUT_Q6_B_STRIDE       p.rows2
 
 #elif defined(QSA_PROJECTIONS)
 
@@ -113,6 +115,8 @@ layout(std430, binding = 3) readonly buffer Weights3Packed32 {
 #    define WEIGHTS_Q6_B_PACKED16 weights2_packed16
 #    define OUT_Q6_A              out1
 #    define OUT_Q6_B              out2
+#    define OUT_Q6_A_STRIDE       p.rows1
+#    define OUT_Q6_B_STRIDE       p.rows1
 
 #else
 #    error "Either GDN_PROJECTIONS or QSA_PROJECTIONS must be defined"
@@ -552,8 +556,8 @@ void compute_paired_q6_k(const uint first_row, const uint num_rows, const uint t
 
         if (tid == 0) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-                OUT_Q6_A[token * p.rows1 + first_row + n] = temp_a[n];
-                OUT_Q6_B[token * p.rows2 + first_row + n] = temp_b[n];
+                OUT_Q6_A[token * OUT_Q6_A_STRIDE + first_row + n] = temp_a[n];
+                OUT_Q6_B[token * OUT_Q6_B_STRIDE + first_row + n] = temp_b[n];
             }
         }
     }

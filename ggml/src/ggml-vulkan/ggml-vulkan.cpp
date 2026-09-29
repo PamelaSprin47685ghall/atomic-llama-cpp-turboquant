@@ -2065,6 +2065,12 @@ struct vk_attention_prep_push_constants {
     uint32_t                  q_stride;
     uint32_t                  k_row_stride;
     uint32_t                  v_row_stride;
+    // Multi-token (MTP verify) extension: the workgroup y-axis indexes tokens.
+    // 1/0/0/0 strides reproduce the legacy single-token dispatch exactly.
+    uint32_t                  n_tokens;
+    uint32_t                  q_token_stride;
+    uint32_t                  k_token_stride;
+    uint32_t                  v_token_stride;
     float                     q_eps;
     float                     k_eps;
 };
@@ -2446,7 +2452,8 @@ struct vk_attention_prep_compact_push_constants {
     vk_op_flash_attn_sparse_compact_push_constants compact;
 };
 
-static_assert(sizeof(vk_attention_prep_compact_push_constants) == 188);
+// Grew by 16 bytes (n_tokens + 3 token strides) with the multi-token prep.
+static_assert(sizeof(vk_attention_prep_compact_push_constants) == 204);
 
 struct vk_prepared_sparse_meta {
     vk_op_flash_attn_sparse_compact_push_constants params{};
@@ -16976,6 +16983,7 @@ static void ggml_vk_attention_projections(ggml_backend_vk_context * ctx,
     const auto binding = [&](const ggml_tensor * tensor) {
         return ggml_vk_tensor_subbuffer(ctx, tensor);
     };
+
     const bool                                    qsa      = node(3)->src[0]->type == GGML_TYPE_BF16;
     auto &                                        pipeline = ctx->device->pipeline_attention_projections[qsa ? 1 : 0];
     const vk_attention_projections_push_constants pc{ static_cast<uint32_t>(node(0)->src[1]->ne[0]),
@@ -18695,6 +18703,14 @@ static void ggml_vk_attention_segment(ggml_backend_vk_context * ctx,
                                                static_cast<uint32_t>(node(7)->nb[1] / sizeof(float)),
                                                static_cast<uint32_t>(node(17)->nb[1] / sizeof(ggml_fp16_t)),
                                                static_cast<uint32_t>(node(19)->nb[1] / sizeof(ggml_fp16_t)),
+                                               // Multi-token: y-axis token index; strides from the
+                                               // Q view / raw K / raw V tensors. Single-token graphs
+                                               // get n_tokens=1 and the same strides (harmless: the
+                                               // y loop runs once).
+                                               static_cast<uint32_t>(node(7)->ne[2]),
+                                               static_cast<uint32_t>(node(7)->nb[2] / sizeof(float)),
+                                               static_cast<uint32_t>(node(1)->nb[1] / sizeof(float)),
+                                               static_cast<uint32_t>(node(2)->nb[1] / sizeof(float)),
                                                ggml_get_op_params_f32(node(8), 0),
                                                ggml_get_op_params_f32(node(13), 0) };
     ggml_tensor *                          fa = node(26);
@@ -18702,7 +18718,10 @@ static void ggml_vk_attention_segment(ggml_backend_vk_context * ctx,
     const int32_t                          max_keys = ggml_get_op_params_i32(fa, 4);
     const vk_subbuffer                     q_gamma = binding(node(9)->src[1]), k_gamma = binding(node(14)->src[1]);
     vk_prepared_sparse_meta                prepared;
-    if (ctx->device->pipeline_attention_prep_compact && mask && mask->type == GGML_TYPE_F16 &&
+    // Sparse compact in attention_prep requires single-token dispatch (groups is 1D).
+    // For multi-token verify (n_tokens > 1), fall back to standard 2D prep and let
+    // flash_attn do its own compacting.
+    if (pc.n_tokens == 1 && ctx->device->pipeline_attention_prep_compact && mask && mask->type == GGML_TYPE_F16 &&
         mask->nb[0] == sizeof(ggml_fp16_t) && get_misalign_bytes(ctx, mask) == 0 && max_keys > 0 &&
         ctx->prealloc_sparse_meta && q_gamma.buffer->buffer == k_gamma.buffer->buffer) {
         const uint64_t start      = std::min(q_gamma.offset, k_gamma.offset);
@@ -18745,7 +18764,8 @@ static void ggml_vk_attention_segment(ggml_backend_vk_context * ctx,
                                   { binding(node(7)), binding(node(1)), binding(node(2)), q_gamma, k_gamma,
                                     binding(node(10)->src[1]), binding(node(17)->src[1]), binding(node(19)->src[1]),
                                     binding(node(10)), binding(node(17)), binding(node(19)) },
-                                  pc, { pc.q_heads + 2 * pc.kv_heads, 1, 1 });
+
+                                  pc, { pc.q_heads + 2 * pc.kv_heads, pc.n_tokens, 1 });
     }
     ggml_vk_segment_barrier(ctx, subctx);
     ggml_vk_flash_attn(ctx, subctx, fa->src[0], fa->src[1], fa->src[2], fa->src[3], fa->src[4], fa, node(28), node(31),
@@ -23797,7 +23817,11 @@ static bool ggml_vk_can_fuse_attention_segment(ggml_backend_vk_context * ctx, co
     constexpr size_t  count    = attention_segment_pattern.size();
     if (disabled || !ctx->device->pipeline_attention_prep || first + count > static_cast<size_t>(graph->n_nodes) ||
         ggml_vk_attention_projection_variant(graph, first) != 1 ||
-        !ggml_vk_can_fuse_attention_projections(ctx, graph, first, /*segment_caller=*/true))
+        // The prep kernel now carries a full token axis (dispatch y,
+        // rope_data_pos[token], per-token Q/K/V strides) and every downstream
+        // shape check in this guard accepts ne[2] in {1..4}; multi-token
+        // verify graphs may enter the segment.
+        !ggml_vk_can_fuse_attention_projections(ctx, graph, first, /*segment_caller=*/false))
         return false;
     const auto node = [&](int n) {
         return graph->nodes[first + n];
@@ -23868,60 +23892,88 @@ static bool ggml_vk_can_fuse_attention_segment(ggml_backend_vk_context * ctx, co
         }
     }
     const bool uniform_gqa = heads > 0 && kv_heads > 0 && heads % kv_heads == 0;
+    {
+        static std::atomic<int> as_dbg_n{0};
+        const int as_call = as_dbg_n.fetch_add(1, std::memory_order_relaxed);
+        if (as_call < 12) {
+            const auto * in7 = node(7);
+            fprintf(stderr, "[attn-seg-eval] call=%d q_ne2=%lld heads=%lld kv=%lld mapped=%d\n",
+                    as_call, in7 ? (long long) in7->ne[2] : -1LL,
+                    (long long) heads, (long long) kv_heads, (int) mapped_heads);
+        }
+    }
+    // Multi-token (MTP verify): the prep kernel now carries a token axis
+    // (dispatch y, rope_data_pos[token], per-token Q/K/V strides) and every
+    // downstream shape check in this guard accepts ne[2] in {1..4}.
+    const int64_t n_tokens = node(7)->ne[2];
     if (width < 2 || width > 1024 || width % 2 || heads <= 0 || kv_heads <= 0 ||
         (!mapped_heads && !uniform_gqa) ||
-        node(7)->ne[2] != 1 || node(7)->ne[3] != 1 || node(7)->nb[0] != sizeof(float) ||
+        n_tokens < 1 || n_tokens > 4 || node(7)->ne[3] != 1 || node(7)->nb[0] != sizeof(float) ||
         node(7)->nb[1] != 2 * width * sizeof(float) || node(7)->view_offs != 0 || !valid(node(7), GGML_TYPE_F32) ||
-        node(0)->ne[0] != 2 * width * heads || !vector(node(1), GGML_TYPE_F32, width * kv_heads) ||
-        !vector(node(2), GGML_TYPE_F32, width * kv_heads) || node(12)->ne[0] != width || node(12)->ne[2] != 1 ||
+        node(0)->ne[0] != 2 * width * heads || !vector(node(1), GGML_TYPE_F32, width * kv_heads * n_tokens) ||
+        !vector(node(2), GGML_TYPE_F32, width * kv_heads * n_tokens) || node(12)->ne[0] != width || node(12)->ne[2] != n_tokens ||
         node(12)->ne[3] != 1 || !ggml_are_same_shape(node(11), node(12)) || !ggml_is_contiguous(node(11)) ||
         !ggml_is_contiguous(node(12)) || !ggml_vk_can_fuse_rms_norm_mul_rope(ctx, graph, first + 8) ||
         !ggml_vk_can_fuse_rms_norm_mul_rope(ctx, graph, first + 13) || !vector(node(9)->src[1], GGML_TYPE_F32, width) ||
         !vector(node(14)->src[1], GGML_TYPE_F32, width) || node(10)->src[2] || node(15)->src[2] ||
         node(10)->src[1] != node(15)->src[1] ||
         memcmp(node(10)->op_params, node(15)->op_params, sizeof(node(10)->op_params)) != 0 ||
-        !vector(node(10), GGML_TYPE_F32, width * heads))
+        !valid(node(10), GGML_TYPE_F32) || node(10)->ne[0] != width || node(10)->ne[1] != heads ||
+        node(10)->ne[2] != n_tokens || node(10)->ne[3] != 1 || !ggml_is_contiguous(node(10)))
         return false;
+
     const int mode   = ggml_get_op_params_i32(node(10), 2);
     const int n_dims = ggml_get_op_params_i32(node(10), 1);
     if (n_dims < 2 || n_dims > width || n_dims % 2 ||
-        !vector(node(10)->src[1], GGML_TYPE_I32, (mode & GGML_ROPE_TYPE_MROPE) ? 4 : 1))
+        !vector(node(10)->src[1], GGML_TYPE_I32, (mode & GGML_ROPE_TYPE_MROPE) ? 4 * n_tokens : n_tokens))
         return false;
+
     for (int n : { 6, 17, 19 }) {
         const ggml_tensor * cache = node(n);
         if (!valid(cache, GGML_TYPE_F16) || !ggml_is_contiguous(cache) || cache->ne[2] != 1 || cache->ne[3] != 1 ||
-            !vector(cache->src[1], GGML_TYPE_I64, 1) || !ggml_is_contiguous(cache->src[0]) ||
-            ggml_nelements(cache->src[0]) != cache->ne[0])
+            !valid(cache->src[1], GGML_TYPE_I64) || !ggml_is_contiguous(cache->src[1]) ||
+            ggml_nelements(cache->src[1]) != n_tokens || !ggml_is_contiguous(cache->src[0]) ||
+            ggml_nelements(cache->src[0]) != cache->ne[0] * n_tokens)
             return false;
     }
     if (node(17)->ne[0] != width * kv_heads || node(19)->ne[0] != width * kv_heads)
         return false;
+
     for (int n : { 23, 25 }) {
         const ggml_tensor * t     = node(n);
         const ggml_tensor * cache = node(n == 23 ? 17 : 19);
         if (t->type != GGML_TYPE_F16 || t->ne[0] != width || t->ne[1] <= 0 || t->ne[1] > cache->ne[1] ||
-            t->ne[2] != kv_heads || t->ne[3] != 1 || t->nb[0] != sizeof(ggml_fp16_t) ||
+            t->ne[3] != 1 || t->nb[0] != sizeof(ggml_fp16_t) ||
             t->nb[1] != width * kv_heads * sizeof(ggml_fp16_t) || t->nb[2] != width * sizeof(ggml_fp16_t) ||
             t->data != cache->data)
             return false;
     }
-    const ggml_tensor * q = node(21);
-    if (q->type != GGML_TYPE_F32 || q->ne[0] != width || q->ne[1] != 1 || q->ne[2] != heads || q->ne[3] != 1 ||
-        q->nb[0] != sizeof(float) || q->nb[2] != width * sizeof(float) || q->data != node(10)->data)
-        return false;
+
+    {
+        const ggml_tensor * q = node(21);
+        if (q->type != GGML_TYPE_F32 || q->ne[0] != width || q->ne[1] != n_tokens || q->ne[2] != heads ||
+            q->ne[3] != 1 || q->nb[0] != sizeof(float) || q->nb[2] != width * sizeof(float) ||
+            q->data != node(10)->data)
+            return false;
+    }
+
     if (node(17)->buffer != node(22)->buffer || node(17)->data != node(22)->data ||
         ggml_nbytes(node(22)) > ggml_nbytes(node(17)) || node(19)->buffer != node(24)->buffer ||
         node(19)->data != node(24)->data || ggml_nbytes(node(24)) > ggml_nbytes(node(19)) ||
-        node(23)->ne[1] != node(25)->ne[1] || !valid(node(28), GGML_TYPE_F32) || node(28)->ne[0] != width ||
-        node(28)->ne[1] != heads || node(28)->ne[2] != 1 || node(28)->ne[3] != 1 || node(28)->nb[0] != sizeof(float) ||
+        node(23)->ne[1] != node(25)->ne[1] ||
+        !valid(node(28), GGML_TYPE_F32) || node(28)->ne[0] != width || node(28)->ne[1] != heads ||
+        node(28)->ne[2] != n_tokens || node(28)->ne[3] != 1 || node(28)->nb[0] != sizeof(float) ||
         node(28)->nb[1] != 2 * width * sizeof(float) || node(28)->view_offs != width * sizeof(float) ||
-        ggml_get_unary_op(node(30)) != GGML_UNARY_OP_SIGMOID || !vector(node(26), GGML_TYPE_F32, width * heads) ||
-        node(26)->ne[0] != width || node(26)->ne[1] != heads || node(26)->ne[2] != 1 || node(26)->ne[3] != 1 ||
-        !vector(node(31), GGML_TYPE_F32, width * heads) || !valid(node(32)->src[0], GGML_TYPE_Q5_K) ||
-        !ggml_is_contiguous(node(32)->src[0]) || node(32)->src[0]->ne[0] != width * heads || (width * heads) % 256 ||
+        ggml_get_unary_op(node(30)) != GGML_UNARY_OP_SIGMOID ||
+        node(26)->ne[0] != width || node(26)->ne[1] != heads || node(26)->ne[2] != n_tokens || node(26)->ne[3] != 1 ||
+        !valid(node(31), GGML_TYPE_F32) || node(31)->ne[1] != n_tokens || node(31)->ne[2] != 1 ||
+        !valid(node(32)->src[0], GGML_TYPE_Q5_K) || !ggml_is_contiguous(node(32)->src[0]) ||
+        node(32)->src[0]->ne[0] != width * heads || (width * heads) % 256 ||
         node(32)->src[0]->ne[1] != node(32)->ne[0] || node(32)->src[0]->ne[2] != 1 || node(32)->src[0]->ne[3] != 1 ||
-        !vector(node(32), GGML_TYPE_F32, node(32)->ne[0]))
+        !valid(node(32), GGML_TYPE_F32) || node(32)->ne[1] != n_tokens || !ggml_is_contiguous(node(32)) ||
+        ggml_nelements(node(32)) != node(32)->ne[0] * n_tokens)
         return false;
+
     // Actual materialized buffers must be disjoint. Cache reads are ordered after
     // their own writes; no generic elementwise alias exemption is needed here.
     const std::array<int, 11>                 writes{ 0, 1, 2, 3, 6, 10, 17, 19, 26, 31, 32 };
@@ -24168,8 +24220,26 @@ static bool ggml_vk_can_fuse_gdn_segment(ggml_backend_vk_context * ctx, const gg
 
 static bool ggml_vk_can_fuse_gdn_cached_segment(ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int first) {
     static const bool disabled = getenv("GGML_VK_DISABLE_GDN_CACHED_SEGMENT") != nullptr;
-    if (disabled || first + gdn_cached_segment_pattern.size() > static_cast<size_t>(graph->n_nodes))
+    // One-shot diagnostic (GGML_TP5_RELAY_DEBUG): why does the multi-token
+    // verify graph not take this segment? Prints the first failing stage.
+    static const bool gdn_dbg = [] {
+        const char * e = getenv("GGML_TP5_RELAY_DEBUG");
+        return e && atoi(e) != 0;
+    }();
+    static std::atomic<int> gdn_dbg_n{0};
+    const int gdn_dbg_call = gdn_dbg ? gdn_dbg_n.fetch_add(1) : 0;
+    const auto gdn_fail = [&](const char * why) {
+        if (gdn_dbg && gdn_dbg_call < 12) {
+            const auto * in0 = graph->nodes[first]->src[1];
+            fprintf(stderr, "[gdn-cached-reject] call=%d why=%s input_ne1=%lld\n",
+                    gdn_dbg_call, why, in0 ? (long long) in0->ne[1] : -1LL);
+        }
         return false;
+    };
+    if (disabled)
+        return gdn_fail("disabled");
+    if (first + gdn_cached_segment_pattern.size() > static_cast<size_t>(graph->n_nodes))
+        return gdn_fail("pattern-too-long");
     const bool   index_views = graph->nodes[first + 7]->op == GGML_OP_VIEW;
     const size_t count       = index_views ? gdn_cached_index_views_pattern.size() : gdn_cached_segment_pattern.size();
     const auto   pos         = [&](int index) {
@@ -24178,9 +24248,22 @@ static bool ggml_vk_can_fuse_gdn_cached_segment(ggml_backend_vk_context * ctx, c
     const auto node = [&](int index) {
         return graph->nodes[pos(index)];
     };
+    if (gdn_dbg && gdn_dbg_call < 12) {
+        const auto * in0 = graph->nodes[first]->src[1];
+        fprintf(stderr, "[gdn-cached-reject] call=%d stage=entered input_ne1=%lld variant=%d\n",
+                gdn_dbg_call, in0 ? (long long) in0->ne[1] : -1LL,
+                ggml_vk_attention_projection_variant(graph, first));
+    }
     if (first + count > static_cast<size_t>(graph->n_nodes) || !ctx->device->pipeline_gdn_cached_prep ||
         !ctx->device->pipeline_gdn_cached_delta || ggml_vk_attention_projection_variant(graph, first) != 0 ||
-        !ggml_vk_can_fuse_attention_projections(ctx, graph, first, /*segment_caller=*/true) ||
+        // The GDN core (multistep prep/delta/norm) is n_time-native: its guard
+        // requires ne[2] == n_time on every Q/K/V view and the kernels index
+        // data_raw_qkv[t * total_channels + channel]. Only the projections at
+        // the head of this segment were single-token; letting them take
+        // multi-token input keeps one weight traversal per workgroup for all
+        // verify rows. The attention_segment caller stays conservative: its
+        // downstream prep/rope is hardwired to one query row.
+        !ggml_vk_can_fuse_attention_projections(ctx, graph, first, /*segment_caller=*/false) ||
         !ggml_vk_can_fuse_gdn_segment(ctx, graph, pos(kGdnCachedCoreOffset)))
         return false;
     std::array<int, gdn_cached_index_views_pattern.size()> indices{};

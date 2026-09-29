@@ -134,8 +134,8 @@ void qwen_compute_mmvq(uint matrix, uint first_row, uint num_rows, uint tid) {
     if (tid == 0u) {
         [[unroll]] for (uint r = 0u; r < num_rows; ++r) {
             if (matrix == 2u) {
-                OUT_Q6_A[token * p.rows1 + first_row + r] = a[r];
-                OUT_Q6_B[token * p.rows2 + first_row + r] = b[r];
+                OUT_Q6_A[token * OUT_Q6_A_STRIDE + first_row + r] = a[r];
+                OUT_Q6_B[token * OUT_Q6_B_STRIDE + first_row + r] = b[r];
             } else if (matrix == 0u) {
                 out0[token * p.rows0 + first_row + r] = a[r];
             }

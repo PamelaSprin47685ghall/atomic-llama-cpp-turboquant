@@ -42,8 +42,11 @@ void main() {
 #ifdef ATTN_GATE_ONLY
     const uint d = tid + gl_WorkGroupID.y * BLOCK_SIZE;
     if (d < D) {
-        const float gate  = 1.0f / (1.0f + exp(-data_g[n * p.gate_stride + d]));
-        data_d[n * D + d] = data_a[n * D + d] * gate;
+        const uint batch_idx = i2 + p.ne2 * i3;
+        const uint a_offset  = D * p.ne1 * batch_idx + D * n + d;
+        const uint g_offset  = batch_idx * (p.ne1 * p.gate_stride) + n * p.gate_stride + d;
+        const float gate     = 1.0f / (1.0f + exp(-data_g[g_offset]));
+        data_d[a_offset]     = data_a[a_offset] * gate;
     }
 #else
     uint l_offset = D * p.ne1 * p.ne2 * p.ne3 * k_num + p.ne1 * 2 * (0/*split_k_index*/ + p.k_num * (i2 + p.ne2 * i3)) + n;
