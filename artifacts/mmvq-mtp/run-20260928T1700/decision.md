@@ -507,3 +507,11 @@ Q8_0 共享解包 helper 仍对每列执行必要的整数点积。将现有 `mu
 四臂 HTTP 200、五 rank 每组账本内部一致且 `late=0`；forced 测量尾组为每 rank `dispatches=4522,barriers=4017,copies=192`，默认尾组为 `4242,3497,192`，对应模式不同的 dispatch 图，不能要求跨模式账本相同。每个模式内部重复输出和接受数稳定，但**跨模式正文不同，接受量 129/233 对 130/235，且测量期仍有 graph fallback**；所生成 171 token 仅包含 `<think>` 推理片段，没有最终文章。不能用表中毫秒数断言净加速/退化、连贯最终回答或全硬件最优；TP5 默认 MMVQ 禁用不变。原始四份 HTTP JSON、服务日志、资格提取表见 `mtp-current-binary-unqualified-abba-20260929.tar.gz`。
 
 下一步资格条件仍为相同 `pred_n`、实际正文、draft 接受率/数量、五 rank 账本内部一致，且定位解码 graph fallback；理论方面 §46 的 Q6 物理读取下界与 §47–48 的负例也未收敛。不能因多跑相同不合格请求或者单一 GPU ISA 指标宣称已达到极致。
+
+## §50 五卡解码 replay miss 的证据边界（2026-09-29）
+
+只分析 §49 已归档的四份服务日志，不重跑已观测失败。所有 `CRITICAL-FALLBACK` 前第一个 `meta-chain-miss` 都在 **stage=0/rank=0/nodes=94**；startup 缓存 size=0，首次 draft 图已有缓存 size=97 时 fingerprint 报 `hc_init` 的 `ne[2]` 从 2 到 7、`nb[2]=40960` 未变，属于不能安全重用同一录制命令的**明确形状变化**。热机期间缓存 size 依次经过 99/196/293/330/427/524，测量时 default 两臂在 size=621 各有一次 miss，forced 两臂在 621 和 718 各有一次 miss；这些 miss 均记 `scratch_gen=0`，解码时没有 `cache-invalidate-all`，该消息只出现在服务退出清理。
+
+`ggml_vk_tp5_get_cached_cmd_bufs` 先按图指针查，再跨缓存条目查找；要求节点数、scratch generation、完整 tensor fingerprint 均匹配。fingerprint 比对 shape/stride、op 参数、根指针及 view 偏移、实际 VkBuffer handle、wire/relay 专门化；每个录制命令还持有它用过的 buffer owner。重新绑定一个未证实等价的命令缓冲，可能读错模型/激活地址，不能为消除告警松掉这些条件。首次 shape 变化已证实，但**测量期缺少逐项 fingerprint 证据**：各类 `[FP-TMISS]` 诊断在 startup 前十次被门控耗尽，因此只看 size 增长与固定 `scratch_gen`，无法区别未见 token 拓扑、分配地址变化或其它有效 miss。不能把 stage0 的新图指针本身当作根因，因为实现已跨指针搜等价 fingerprint。
+
+没有找到可安全修的 replay 错误，不改缓存 key、不隐藏 fallback，也不以额外预热掩盖首请求成本。若继续攻此项，先在命中该请求的**实际**日志中给测量期 miss 加可验证的字段级诊断，再对照该图的录制/当前 tensor 绑定；在此之前 §49 的 ABBA 仍不合格，默认 MMVQ 门控保持禁用。
