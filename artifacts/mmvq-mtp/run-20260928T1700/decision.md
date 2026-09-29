@@ -465,3 +465,13 @@ Q8_0 共享解包 helper 仍对每列执行必要的整数点积。将现有 `mu
 空查询的 L1/L2 比值为 nan（零事件）；真实图 L1 命中约 0–0.002%。双列 B 的实测 VRAM 读**只比同一 104 MB 矩阵的 N=1 大约 1.2–1.4 倍**，而非两倍；但 B 自身读量仍约 223–248 MB，A 更低约 211 MB。N=1 全词表实测读约 746–762 MB，是 521 MB 独立权重字节的约 1.43–1.46 倍。差值包含未分离的缓存行为/事务粒度，**不是已归因于某一条重复 GLSL load 的可消除字节**。这也解释了为何仅凭 B 的静态 VMEM/解包更少不能证明内存或时钟收益；§44 的匹配单图 A 略快，但不足以为 Q6 N=2 添加设备相关门控并证明五卡净收益，N=4 仍有独立取舍。源码恢复到主仓，重建 `bin/llama-server bin/test-backend-ops`，恢复后的 B 真实 query 再次输出逐项正确。探针、逐次计数与空查询原始输出见 `q6-radv-vocabulary-traffic-20260929.tar.gz`。
 
 **资格边界**：这是固定内容 Q6 矩阵的单 GPU、独立 dispatch；L2 比值不是 Infinity Cache 驻留证明，VRAM 数值不可外推为模型实权重或服务五卡流量。`VRAM read / 理论最少独立字节 > 1` 说明还有**上界空间**，不证明剩余字节全部可消除或已到指令级最优。仍缺确切源码同工作量、同接受率、同输出的五卡服务 ABBA，不声称全局理论极限或净吞吐获益。
+
+## §47 Q6_K 同块 QL/QH 的 subgroup 共享读取（2026-09-29；否决）
+
+针对 §46 高于逻辑下界的真实 VRAM 计数，先证明重复源：通用 Q6 `K_PER_ITER=16`，每 lane 的 `ib=floor(col/32)`、`iqs=4×(tid mod 2)`；`tid` 与 `tid xor 4` 的 `ib_k`、`ql_idx` 相同，仅 nibble shift 不同；`tid` 与 `tid xor 2/4/6` 的 `ib_k`、`qh_idx` 相同，仅 bit shift 不同。每个完整 16-lane Q6 block 中，QL 的 16-bit 源字至少被两 lane 读取、QH 被四 lane 读取。行起点与 Q6 block 对齐，最后不足 512 个 K 元素时有效 lane 按完整 16-lane block 参与迭代；32/64-lane subgroup 的源 lane 均处于同一活动组。候选在通用 MMVQ 对源 lane 有条件加载 QL/QH，再分别以 `subgroupShuffle` 分发。**候选改动的是公共 `mul_mat_vecq_funcs.glsl`，也由融合投影 include；本轮增量构建只生成通用 shader，没有证明候选的融合管线可从零编译。**它已否决，不能将通用图结果写作融合路径的兼容性证明。
+
+在候选树编译、Vulkan0 对照 `k=2560,m=128`，旧版 / QL+QH 候选静态 N=1 instructions **1793/2240**、VGPR **32/32**、VMEM **114/114**；N=2 为 **2162/2617**、VGPR **40/32**、VMEM **144/144**，均无 spill。QH-only N=2 为 **2380 instructions/40 VGPR/144 VMEM**，QL-only 为 **2389/40/144**；单独共享均无寄存器收益。这些是静态指令，带 lane 掩码的加载不能由静态 VMEM 数直接计数。N=1/2 的固定非零量化小图及 N=2 的 `m=49664,k=2560` 实际矩阵尺寸图，QL+QH 与旧版输出逐字节相同。
+
+在排他 RX 6800 上，后者每臂 65 次强制同步 GPU query 去首个：QL+QH 候选 N=2 中位 **646.98 µs**，恢复原版同图 **551.80 µs**（§44 原版两臂 552.22/552.40）；候选约慢 95 µs。另一方面，独立 Q6 perf query 的固定内容 `m=49664,k=2560,n=2` VRAM 读从 §46 原版约 **223–248 MB** 降到候选 **204.98/202.95 MB**（cold/warm），输出均为预期 `−38400`。**实际减少 VRAM 读取仍不足以抵消分支、shuffle 和其它动态成本**；所以不以流量下降宣称胜利，三个候选均撤回。主仓/候选 `mul_mat_vecq.comp`、`mul_mat_vecq_funcs.glsl` 已恢复逐字节一致，最终重建 `bin/llama-server bin/test-backend-ops`；恢复后的实际尺寸图再次通过逐字节核对。补丁、原始 stats、查询与输出归档在 `q6-subgroup-sharing-rejected-20260929.tar.gz`。
+
+仍未穷尽不增加每轮 subgroup 指令的访存布局方案；单卡固定输入及缓存驻留查询不足以说明实模型五卡 HBM、相同接受率下的服务净吞吐或全硬件理论极致。TP5 默认禁用 MMVQ，不改变任何生产 shader。
