@@ -141,3 +141,28 @@ family=qsa-projections  fused=1 mmvq_mask=1  (x5 rank)
 
 **边界**：本轮到此。融合打通是结构性进展（此前该路径在 2 行图上根本不存在）；
 数值修复是下一个单因素，嫌疑人已记录。
+
+## §25 数值 bisect 完成：守卫链无恙，bug 锁定在 prep token 数学（2026-09-29 深夜续）
+
+**bisect 结论**（`8bd3fb2fb`）：
+- 把 `attention_segment` 回退到 `segment_caller=true`（保守）后，
+  **R 臂 md5 `add18ad37ff7` 逐字节恢复**、proj-entry=0、56.4/60.6 tok/s。
+- **守卫链、dispatch、绑定全部无恙**——数值破坏完全在多 token prep 路径内。
+
+**本轮已修（仍不够）**：
+1. **IMROPE 位置**：`rope_multi` 索引 `pos[i2 + ne02*k]`。置 `ne02=1`、
+   `i2 = token*4` → `pos[token*4 + k]` = `[4,T]` 扁平布局 ✓
+   （单 token 时 token=0 → pos[0] 与旧版逐字节同）。
+2. **K cache 偏移**：行号已编码 token，删掉多余的 `token*kv_heads*width`。
+3. **rope 目的偏移**折入 `d_offset`（nb12/nb13=0，i2 只选位置）。
+
+**残余嫌疑人**（按嫌疑度）：
+1. **V 的 `head*width` 溢出**：V cache 行宽 = width，head 步长 = width。
+   kv_heads=2 层 head=1 时写进下一行（别人的行）。单 token 时同样存在
+   ——但单 token kv=2 层从未进过这个段（历史 seg 只在……待验证）。
+2. Q/K norm 的 shared memory 归约：per-(group,token) workgroup 独立
+   ——理论正确。
+3. FA 对多 token Q 的 permuted 布局假设。
+
+**验证方法**（下一手）：dump 第一个 prep dispatch 的 q_out/k_out 前 64
+float，与 CPU 参照（ggml CPU rope）逐值对照——直接看哪个分量错。
