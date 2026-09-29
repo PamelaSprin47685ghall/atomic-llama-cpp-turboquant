@@ -299,3 +299,11 @@ float，与 CPU 参照（ggml CPU rope）逐值对照——直接看哪个分量
 - 同服务“热机第二请求”即使传 `cache_prompt=false` 仍由 `pred_n=161`、MD5=`552cd459aa59` 变为 `pred_n=171`、MD5=`ebf49ef9d1ca`，该方案也不具有工作量资格。
 
 **决策**：保留当前融合代码和显式 `GGML_VK_DISABLE_ATTENTION_PROJECTIONS` 回退，不根据不合格或方向不稳的短跑改变默认选择。内核正确性已有合成逐值对拍和实际五卡 smoke；性能最优、缓存流量及硬件极限仍未被上述证据证明。
+
+## §34 五卡真正的 auto MMVQ（2026-09-29）
+
+- `common_tp5_apply_env` 在合格 RELAY 配方里只对**未设置**的 `GGML_VK_DISABLE_MMVQ` 设置 `1`；Vulkan 端把值 `0` 判为“不禁用”。因此 `GGML_VK_DISABLE_MMVQ=0` 能在原有五卡服务上得到 `mode=auto`，不需要改源码或使用全类型强制量化。`h=1` 的 GDN/QSA 日志确认为 `mmvq_mask=3/1`（Q5 用 Q8_1，AMD 上 Q6 仍用 F32），和合成图一致。
+- 五卡 `h=1`、同二进制、独占锁、独立四投影融合 A vs 关闭投影融合 B：A `pred_n=171`、接受61、MD5=`6dca351de601`、CJK=235、标点22、账本 `dispatches/barriers/copies=2729/2552/192`；B `pred_n=171`、接受60、MD5=`51a1f815072e`、CJK=219、标点22、账本 `2873/2504/192`。两路均连贯、无服务错误，但 token 与 speculative 工作量均不相同，**不能比较 tok/s 或改变默认**。
+- `h=3`、auto mask3/1 独立融合请求 `pred_n=171`、接受105、CJK=173、标点20、无服务错误；四行路径可运行。相比 §32 F32 的 MD5 不同，不能当作逐字节数值等价证明。
+
+**保守决策**：保留 TP5 配方默认 `DISABLE_MMVQ=1`，保留用户显式 `=0` 进入 auto 的完整路径；不凭不同输出、不同接受率的短跑把 auto 转为默认。静态 96-VGPR 混合路径及合成逐值对拍只给代码资源与局部数值证据，实际物理吞吐上限仍未有工作量一致的资格。
