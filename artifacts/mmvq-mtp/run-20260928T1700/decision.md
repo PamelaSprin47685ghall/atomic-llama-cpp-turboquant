@@ -327,8 +327,31 @@ Vulkan0、四连续投影、width=2560、Q5[0] rows=4096、GDN Q5[1] rows=4096�
 3. 完整着色器与服务 `ninja -j 4 bin/llama-server` 编译链接成功。QSA/GDN F32 Q6 的 SPIR-V 有 `OpGroupNonUniformShuffle` 且无 `OpControlBarrier`；同 RADV `shaderstats,nocache` QSA/GDN 两 token 容量 VGPR=88、无 spill、`Subgroups per SIMD=10`（§32 之前 F32 N2 VGPR=96、静态上界同为10）。通用四列 Q5_K/Q6_K 各 VGPR=56、无 spill、静态上界18。上述是编译资源，**不是**实际驻留波前或端到端吞吐。
 4. Vulkan0 合成图非零权重：先以宽2560（10个 Q6 超块）覆盖 QSA/GDN 的不同行数 33/35/35/49 与 33/35/35/35，N=1/2/3/4 八组，融合与关闭融合后逐字节相同；QSA N2 与原共享 cache 的快照也相同。**纠正尾块资格**：本机 subgroup32，管线 `BLOCK_SIZE=32`、`it_size=2`，10 能整除 2，故另以宽2816（11个 Q6 超块）、同样奇数行数和 N=1/2/3/4 再测八组，全部融合/分离逐字节相同、无 NaN/Inf，覆盖只有 `ix=0` 的 16-lane 片参加尾块而 `ix=1` 不参加的情况。通用强制 MMVQ 的 IQ1_S、IQ1_M、Q4_K、Q5_K、Q6_K、Q4_0 各以 N=1/2/3/4 对拍每个 token 的独立 N1 运行，全部逐值相同、非零且有限。五卡实际 `h=1` 强制 MMVQ GDN/QSA mask7/5 输出 MD5=`2576e1cb1a2e`、CJK246、标点22、接受63，与 §33 对应同负载一致；禁用 MMVQ 的 Q6 shuffle 请求 CJK205、标点21、无错误，输出并未与先前单请求逐字节相同，底层 TP 基线本身非确定，不能将其解释为回归或等价证明。
 
-**仍未判定**：§35 和 §33 的数值均是旧 shader；若要评价新通用多列/无 barrier 的净收益，须冻结新二进制并在相同 workload 下交错对照，记录 `pred_n`、接受率、输出与三重账本。即便测得性能优势，也只能证明该配置与负载的改进，而非数学上的全硬件上限。
+**当时未判定；Q6 小图已在 §38 补测**：§35 和 §33 的数值均是旧 shader；评价新通用多列/无 barrier 的五卡净收益仍须冻结二进制、同 workload 交错对照，并记录 `pred_n`、接受率、输出与三重账本。即便测得性能优势，也只能证明该配置与负载的改进，而非数学上的全硬件上限。
 
 **剩余访存与指令边界复审**：通用核每次 `iter` 为活动列各取一组 Q8_1 激活；2–4 列的 helper 对每个输出行解包一次权重，再分别执行每列点积，不能删掉随 token 改变的激活或点积。Q6 F32 配对核的 A/B 权重来自不同矩阵；顺序解包使激活在 B 侧再次从 `common_input_v4` 读取，但把两侧激活同时保存在寄存器中会延长生存期，与 §32 的 VGPR 降幅竞争。Q5、Q6 的 2–3 号 token 仍走动态循环；无证据表明展开会改善 RADV 生成码。`NUM_COLS<=4` 是 MTP 工作集的寄存器容量选择，不是硬件最优阈值证明；缓存命中、VMEM 请求合并、真实 occupancy 与五卡端到端收益仍需同负载实测。故没有依据再增加一个未对拍的访存改写或更改默认策略。
 
 补充 CPU 参照验证：重建 `bin/test-backend-ops`，`Vulkan0` 上以 `GGML_VK_FORCE_MMVQ=1` 对 `m=16,k=256,n=2/3/4`、单 batch 的 Q8_0/Q2_K/Q3_K（9/9）及 Q4_0/Q4_1/Q5_0/Q5_1/MXFP4/Q4_K/Q5_K/Q6_K/IQ1_S/IQ1_M（30/30）运行 `MUL_MAT` 后端测试，均通过其 CPU 对照的 NMSE 阈值 `5e-4`。这是小形状容差对拍，不能替代 §36 的逐字节多 token 比较，也不能证明所有形状、量化输入或服务吞吐等价。
+
+## §37 容量 4 token 尾循环的候选复审（2026-09-29）
+
+仅在候选树把 Q5、成对 Q6 的 token 2–3 循环改为 `[[unroll]]` 的容量固定循环，按活动 token 检查后执行；主仓未采用。GLSL 源码少一个动态循环上界，但 QSA SPIR-V 优化后 `OpLoopMerge` 仍在（只多了 `Unroll` 标记），容量 4 的静态 SPIR-V 从 59976 增到 60336 字节。在宽 2816、GDN/QSA 奇数行 33/35/35/35 与 33/35/35/49 的 Vulkan0 融合/分离图上，N=1..4 八组均逐字节一致。匹配的 RADV `shaderstats,nocache` 容量 4 F32 融合管线：原版和候选版 GDN 均为 VGPR=120、8 subgroups/SIMD、6069 instructions、179 branches、488 VMEM；QSA 均为 VGPR=120、8 subgroups/SIMD、4983 instructions、173 branches、352 VMEM，均无 spill。**这不证明机器指令序列完全相同或时间完全相同**，但未见可归因于此改写的静态成本下降；已撤回候选，未按单次 query 时间选胜负。该探针也暴露了当时容量 4 F32 的 120-VGPR 压力；§38 已按相同形状核对共享 scale 版，不能把 §36 容量 2 的 88 VGPR 外推到容量 4。
+
+## §38 Q6 scale 通信的反证与回退（2026-09-29）
+
+§36 将去 barrier/shuffle 当作指令级收益候选，但 **静态 VGPR 不随它单调改善**：在相同容量 4、宽 2816、QSA/GDN F32 探针上，shuffle 均为 VGPR=120、8 subgroups/SIMD，恢复双缓冲 `sccache_a/b` 的 LDS 版均为 VGPR=96、10 subgroups/SIMD，均无 spill。旧 LDS 有 barrier 和更多静态指令，真实占用不能单靠 `Subgroups per SIMD` 推断；先做同图时间戳交错。
+
+固定同一台 RX 6800、同一融合图与确定性非零输入，独占 GPU；两版分别编译、同 `env -i` + `RADV_DEBUG=nobolist`、禁用 MMVQ，`GGML_VK_PERF_LOGGER=1`。每臂每图 65 次提交，丢首个查询，以下为余下 64 次的 GPU query 中位数（µs；**LDS / shuffle**）：
+原始逐次 query 和五卡 smoke JSON 保存在 `q6-lds-shuffle-query-20260929.tar.gz`；表中所有中位数可由日志中 `ATTENTION_PROJECTIONS MUL_MAT_VEC q5_K` 行重算。
+
+|宽 / 行数 / token 数|GDN|QSA|
+|---|---:|---:|
+|2560 / Q5 4096、Q6 1024、BF16 1024 / N=4；交错 shuffle–LDS–LDS–shuffle|296.46、296.46 / 347.54、347.52|204.32、203.58 / 235.90、235.66|
+|相同形状 / N=2；各一臂|176.30 / 191.60|123.68 / 130.68|
+|相同形状 / N=1；各一臂|115.72 / 120.74|82.82 / 89.66|
+
+另在宽 2816（Q6 共 11 块，只有一个 16-lane 片处理尾块）的奇数行小图 N=1..4，LDS 版融合与分离逐字节相同、无死锁；宽 2560、上述大图 N=4 也逐字节相同。LDS 的未满块入口要求全工作组参加 barrier，仅在 barrier 后让无效片跳过；整块循环后只在确有余数时运行尾块，省去空 barrier。本轮在主仓与候选树恢复 LDS、删去不再使用的 subgroup shuffle 扩展，不做容量 4 特例：本图 N=1/2/4 方向一致且单一实现更可维护。
+
+**资格边界**：64 次重复使权重缓存驻留，查询器强制提交/等待、关闭 replay；数值仅证明这些图的 GPU 执行时间，不代表 97 层 TP5 队列、五卡同步、模型权重换页或服务 tok/s。§36 的 shuffle 数值/静态记录仍属历史实验，不能称当前实现或将 shuffle 编译开销减少直接写成端到端收益。通用多列 MMVQ 的五卡净收益仍未测定。
+
+恢复后重新构建 `bin/llama-server`、`bin/test-vulkan-command-replay`：后者 `--attention-projections-only` 通过 F32 逐字节和 MMVQ 容差对照；最终着色器在宽 2816、N=1..4 的 QSA/GDN 八组以及宽 2560、N=4 的大图两组与分离路径逐字节一致。五张 RX 6800 上以 `--tp5 qwen4exp-af -md ... --spec-type draft-mtp --tp5-latebind off` 单次请求 smoke：HTTP 200，`pred_n=160`、70/89 draft accepted，CJK=241、distinct ratio=0.701、标点=19；账本五 rank `late=0`，解码时 chain 锁定并复用 88 图。启动与 prefill 曾记录 `CRITICAL-FALLBACK`，不能写成全程无回退；这一次 53.80 tok/s 未交错、且 `pred_n`/接受率不匹配旧跑，不足以判断五卡净性能。
