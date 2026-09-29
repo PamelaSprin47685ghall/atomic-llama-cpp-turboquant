@@ -200,7 +200,7 @@ I>0 表示按该成本尺度，MMVQ 在 MTP 中省得更多；但 I>0 不保证 
 
 - off/auto 相同 shape，auto 意外拆融合：候选回退，先修合法的组合边界。
 - 一行融合、两行不融合：记录为形状/覆盖差异，不冒称 MMVQ 必然导致。
-- 权重复用要按路径区分：融合投影用 token 轴内循环；通用 `mul_mat_vecq.comp` 原 `#if NUM_COLS > 1` 对专门化常量始终为假，直到决策账 §36 修正后才真正启用 `HAS_MMVQ_DOT_MULTI` 的共享解包。当前普通 helper 用于 2–4 列，Q4_K 依 §40 的 RX 6800 对照只用于 4 列；IQ1 与多于四列仍用原路径，不把源码里存在 helper 误报成已执行的加速。
+- 权重复用要按路径区分：融合投影用 token 轴内循环；通用 `mul_mat_vecq.comp` 原 `#if NUM_COLS > 1` 对专门化常量始终为假，直到决策账 §36 修正后才真正启用 `HAS_MMVQ_DOT_MULTI` 的共享解包。当前有 helper 的类型（包括 Q4_K）用于 2–4 列；§40 的 Q4_K 特例在 §41 按实际 GGUF 矩阵尺寸复审后已撤回。IQ1 与多于四列仍用原路径，不把源码里存在 helper 误报成已执行的加速。
 - 配对 Q6_K 的 F32 scale 当前仍用双缓冲 LDS 与 barrier：§38 的容量 4 静态 VGPR、N=4 交错及 N=1/2 单臂 GPU query 对照表明，去 barrier 的 subgroup shuffle 虽缩短源码同步，却在所测图上更慢；这些缓存驻留小图结果不得外推到五卡服务 tok/s。
 
 ### 4.5 MMVQ 与 ARGMAX 是两件事
