@@ -23767,15 +23767,11 @@ static int ggml_vk_attention_projection_variant(const ggml_cgraph * graph, int f
 
 static bool ggml_vk_can_fuse_attention_projections(ggml_backend_vk_context * ctx,
                                                    const ggml_cgraph *       graph,
-                                                   int                       first,
-                                                   bool                      segment_caller = false) {
+                                                   int                       first) {
     static const bool disabled = getenv("GGML_VK_DISABLE_ATTENTION_PROJECTIONS") != nullptr;
     const int         variant  = ggml_vk_attention_projection_variant(graph, first);
-    // The projections-only region (no surrounding segment) can take multi
-    // token: its consumers are standalone ops that handle [rows][n_tokens].
-    // Every segment caller (attention_segment / gdn_segment / gdn_cached)
-    // embeds this fusion ahead of single-token-only prep/rope kernels.
-    const bool        allow_multi_token = !segment_caller;
+    // Standalone projections, attention prep, and the cached GDN segment all
+    // consume up to four token rows; validate their shapes in their own guards.
     if (disabled || variant < 0 || !ctx->device->pipeline_attention_projections[variant] ||
         !ggml_can_fuse_subgraph(graph, first, attention_projection_pattern, { first, first + 1, first + 2, first + 3 }))
         return false;
@@ -23792,8 +23788,6 @@ static bool ggml_vk_can_fuse_attention_projections(ggml_backend_vk_context * ctx
         (vk_tensor_offset(input) + input->view_offs) % 16 != 0)
         return false;
     const uint32_t n_tokens = static_cast<uint32_t>(input->ne[1]);
-    if (n_tokens != 1 && !allow_multi_token)
-        return false;
     if (n_tokens < 1 || n_tokens > 4 || ggml_nelements(input) != input->ne[0] * n_tokens)
         return false;
     if (node(variant == 0 ? 2 : 1)->ne[0] != node(variant == 0 ? 3 : 2)->ne[0])
@@ -23827,7 +23821,7 @@ static bool ggml_vk_can_fuse_attention_segment(ggml_backend_vk_context * ctx, co
         // rope_data_pos[token], per-token Q/K/V strides) and every downstream
         // shape check in this guard accepts ne[2] in {1..4}; multi-token
         // verify graphs may enter the segment.
-        !ggml_vk_can_fuse_attention_projections(ctx, graph, first, /*segment_caller=*/false))
+        !ggml_vk_can_fuse_attention_projections(ctx, graph, first))
         return false;
     const auto node = [&](int n) {
         return graph->nodes[first + n];
@@ -24267,9 +24261,8 @@ static bool ggml_vk_can_fuse_gdn_cached_segment(ggml_backend_vk_context * ctx, c
         // data_raw_qkv[t * total_channels + channel]. Only the projections at
         // the head of this segment were single-token; letting them take
         // multi-token input keeps one weight traversal per workgroup for all
-        // verify rows. The attention_segment caller stays conservative: its
-        // downstream prep/rope is hardwired to one query row.
-        !ggml_vk_can_fuse_attention_projections(ctx, graph, first, /*segment_caller=*/false) ||
+        // verify rows.
+        !ggml_vk_can_fuse_attention_projections(ctx, graph, first) ||
         !ggml_vk_can_fuse_gdn_segment(ctx, graph, pos(kGdnCachedCoreOffset)))
         return false;
     std::array<int, gdn_cached_index_views_pattern.size()> indices{};
@@ -24914,7 +24907,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // CPY owns this cache view; it does not consume its old data.
                 op_srcs_fused_elementwise[17] = true;
                 op_srcs_fused_elementwise[18] = true;
-            } else if (ggml_vk_can_fuse_attention_projections(ctx, cgraph, i, /*segment_caller=*/true)) {
+            } else if (ggml_vk_can_fuse_attention_projections(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops    = attention_projection_pattern.size() - 1;
                 ctx->fused_attention_projections = true;
                 ctx->fused_ops_write_mask        = 0xf;

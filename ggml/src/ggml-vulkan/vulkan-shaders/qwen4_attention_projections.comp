@@ -712,12 +712,22 @@ void compute_bf16(const uint first_row, const uint num_rows, const uint tid) {
                                 uintBitsToFloat((word1 & 0x0000ffffu) << 16), uintBitsToFloat(word1 & 0xffff0000u));
         }
 
-        // Multiply-accumulate across all tokens
-        [[unroll]] for (uint token = 0u; token < p.n_tokens; ++token) {
-        const vec4 b = common_input_v4[(token * p.width + col) / 4u];
+        const vec4 b0 = common_input_v4[col / 4u];
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-                temp[token][n] += dot(weights_v[n], b);
+            temp[0][n] += dot(weights_v[n], b0);
         }
+
+        if (p.n_tokens > 1u) {
+            const vec4 b1 = common_input_v4[(p.width + col) / 4u];
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                temp[1][n] += dot(weights_v[n], b1);
+            }
+            for (uint token = 2u; token < p.n_tokens; ++token) {
+                const vec4 b = common_input_v4[(token * p.width + col) / 4u];
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    temp[token][n] += dot(weights_v[n], b);
+                }
+            }
         }
     }
 
