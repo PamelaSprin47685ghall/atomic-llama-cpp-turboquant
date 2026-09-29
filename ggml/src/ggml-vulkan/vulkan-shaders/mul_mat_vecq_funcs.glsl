@@ -190,6 +190,32 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     // 2 quants per call => divide sums by 8/2 = 4
     return mul_q8_1(q_sum, get_dm(ib_a), cache_b_ds, 4);
 }
+#if defined(MMQ)
+void mmvq_dot_multi(const uint ib_a, const uint iqs, inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint n,
+                    const int32_t b_qs_multi[NUM_COLS][K_PER_ITER / 4], const vec2 b_ds_multi[NUM_COLS]) {
+#if QUANT_R == 2
+    const i32vec2 data_a_qs = repack(ib_a, iqs);
+#else
+    const int32_t data_a_qs0 = repack(ib_a, iqs * 2);
+    const int32_t data_a_qs1 = repack(ib_a, iqs * 2 + 1);
+#endif
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#ifdef TP5_RELAY_ROWS
+        if (!mat_vec_col_active(j)) continue;
+#endif
+#if QUANT_R == 2
+        int32_t q_sum = dotPacked4x8EXT(data_a_qs.x, b_qs_multi[j][0]) +
+                        dotPacked4x8EXT(data_a_qs.y, b_qs_multi[j][1]);
+#else
+        int32_t q_sum = dotPacked4x8EXT(data_a_qs0, b_qs_multi[j][0]) +
+                        dotPacked4x8EXT(data_a_qs1, b_qs_multi[j][1]);
+#endif
+        temp[j][n] += mul_q8_1(q_sum, get_dm(ib_a), b_ds_multi[j], 4);
+    }
+}
+#define HAS_MMVQ_DOT_MULTI 1
+#endif
 #endif
 
 #if defined(DATA_A_Q2_K)
