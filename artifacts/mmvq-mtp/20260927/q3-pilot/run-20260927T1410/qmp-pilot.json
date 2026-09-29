@@ -1,0 +1,248 @@
+{
+ "rounds": [
+  [
+   {
+    "tag": "A0",
+    "round": 1,
+    "results": [
+     {
+      "ms": 4421.611,
+      "tok": 177,
+      "fin": "stop",
+      "hash": "39f758251ec80d86"
+     },
+     {
+      "ms": 4396.861,
+      "tok": 177,
+      "fin": "stop",
+      "hash": "39f758251ec80d86"
+     },
+     {
+      "ms": 4401.014,
+      "tok": 177,
+      "fin": "stop",
+      "hash": "39f758251ec80d86"
+     },
+     {
+      "ms": 4413.434,
+      "tok": 177,
+      "fin": "stop",
+      "hash": "39f758251ec80d86"
+     }
+    ]
+   },
+   {
+    "tag": "A1",
+    "round": 1,
+    "results": [
+     {
+      "ms": 4483.95,
+      "tok": 179,
+      "fin": "stop",
+      "hash": "01bf34a9f5118f27"
+     },
+     {
+      "ms": 4447.174,
+      "tok": 179,
+      "fin": "stop",
+      "hash": "01bf34a9f5118f27"
+     },
+     {
+      "ms": 4462.629,
+      "tok": 179,
+      "fin": "stop",
+      "hash": "01bf34a9f5118f27"
+     },
+     {
+      "ms": 4462.826,
+      "tok": 179,
+      "fin": "stop",
+      "hash": "01bf34a9f5118f27"
+     }
+    ]
+   },
+   {
+    "tag": "B0",
+    "round": 1,
+    "results": [
+     {
+      "ms": 4389.662,
+      "tok": 178,
+      "fin": "stop",
+      "hash": "b4f44fd27f041ec7"
+     },
+     {
+      "ms": 3971.579,
+      "tok": 178,
+      "fin": "stop",
+      "hash": "b4f44fd27f041ec7"
+     },
+     {
+      "ms": 3963.03,
+      "tok": 178,
+      "fin": "stop",
+      "hash": "b4f44fd27f041ec7"
+     },
+     {
+      "ms": 4101.974,
+      "tok": 178,
+      "fin": "stop",
+      "hash": "b4f44fd27f041ec7"
+     }
+    ]
+   },
+   {
+    "tag": "B1",
+    "round": 1,
+    "results": [
+     {
+      "ms": 4221.187,
+      "tok": 165,
+      "fin": "stop",
+      "hash": "8210adcca8a332da"
+     },
+     {
+      "ms": 3816.325,
+      "tok": 165,
+      "fin": "stop",
+      "hash": "8210adcca8a332da"
+     },
+     {
+      "ms": 3808.181,
+      "tok": 165,
+      "fin": "stop",
+      "hash": "8210adcca8a332da"
+     },
+     {
+      "ms": 3877.921,
+      "tok": 165,
+      "fin": "stop",
+      "hash": "8210adcca8a332da"
+     }
+    ]
+   }
+  ],
+  [
+   {
+    "tag": "B1",
+    "round": 2,
+    "results": [
+     {
+      "ms": 4200.229,
+      "tok": 165,
+      "fin": "stop",
+      "hash": "8210adcca8a332da"
+     },
+     {
+      "ms": 3844.459,
+      "tok": 165,
+      "fin": "stop",
+      "hash": "8210adcca8a332da"
+     },
+     {
+      "ms": 3859.188,
+      "tok": 165,
+      "fin": "stop",
+      "hash": "8210adcca8a332da"
+     },
+     {
+      "ms": 4018.65,
+      "tok": 165,
+      "fin": "stop",
+      "hash": "8210adcca8a332da"
+     }
+    ]
+   },
+   {
+    "tag": "B0",
+    "round": 2,
+    "results": [
+     {
+      "ms": 4331.766,
+      "tok": 178,
+      "fin": "stop",
+      "hash": "b4f44fd27f041ec7"
+     },
+     {
+      "ms": 3995.103,
+      "tok": 178,
+      "fin": "stop",
+      "hash": "b4f44fd27f041ec7"
+     },
+     {
+      "ms": 3968.574,
+      "tok": 178,
+      "fin": "stop",
+      "hash": "b4f44fd27f041ec7"
+     },
+     {
+      "ms": 4068.514,
+      "tok": 178,
+      "fin": "stop",
+      "hash": "b4f44fd27f041ec7"
+     }
+    ]
+   },
+   {
+    "tag": "A1",
+    "round": 2,
+    "results": [
+     {
+      "ms": 4479.948,
+      "tok": 179,
+      "fin": "stop",
+      "hash": "01bf34a9f5118f27"
+     },
+     {
+      "ms": 4440.05,
+      "tok": 179,
+      "fin": "stop",
+      "hash": "01bf34a9f5118f27"
+     },
+     {
+      "ms": 4441.962,
+      "tok": 179,
+      "fin": "stop",
+      "hash": "01bf34a9f5118f27"
+     },
+     {
+      "ms": 4442.525,
+      "tok": 179,
+      "fin": "stop",
+      "hash": "01bf34a9f5118f27"
+     }
+    ]
+   },
+   {
+    "tag": "A0",
+    "round": 2,
+    "results": [
+     {
+      "ms": 4413.594,
+      "tok": 177,
+      "fin": "stop",
+      "hash": "39f758251ec80d86"
+     },
+     {
+      "ms": 4379.413,
+      "tok": 177,
+      "fin": "stop",
+      "hash": "39f758251ec80d86"
+     },
+     {
+      "ms": 4413.309,
+      "tok": 177,
+      "fin": "stop",
+      "hash": "39f758251ec80d86"
+     },
+     {
+      "ms": 4398.237,
+      "tok": 177,
+      "fin": "stop",
+      "hash": "39f758251ec80d86"
+     }
+    ]
+   }
+  ]
+ ]
+}

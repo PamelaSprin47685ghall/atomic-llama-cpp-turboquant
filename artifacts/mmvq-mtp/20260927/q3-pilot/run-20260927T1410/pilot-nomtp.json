@@ -1,0 +1,770 @@
+{
+  "variant_a": {
+    "name": "qmp-a0-nomtp-off",
+    "description": "QMP cell: mtp=False, h=None, mmvq=off",
+    "env": {
+      "RADV_DEBUG": "nobolist",
+      "GGML_VK_DISABLE_MMVQ": "1",
+      "GGML_VK_FORCE_MMVQ": "0"
+    },
+    "cli_args": [
+      "--tp5",
+      "qwen4exp-af",
+      "--tp5-latebind",
+      "off",
+      "--spec-type",
+      "none"
+    ],
+    "expected_sync": "relay",
+    "expected_wire": "f32",
+    "is_mtp": false,
+    "requires_linear": true,
+    "expected_mmvq": "disabled"
+  },
+  "variant_b": {
+    "name": "qmp-a1-nomtp-auto",
+    "description": "QMP cell: mtp=False, h=None, mmvq=auto",
+    "env": {
+      "RADV_DEBUG": "nobolist",
+      "GGML_VK_DISABLE_MMVQ": "0",
+      "GGML_VK_FORCE_MMVQ": "0"
+    },
+    "cli_args": [
+      "--tp5",
+      "qwen4exp-af",
+      "--tp5-latebind",
+      "off",
+      "--spec-type",
+      "none"
+    ],
+    "expected_sync": "relay",
+    "expected_wire": "f32",
+    "is_mtp": false,
+    "requires_linear": true,
+    "expected_mmvq": "auto"
+  },
+  "workload": "weightloss",
+  "server_binary": "/var/tmp/tp5-final-build/bin/llama-server",
+  "server_binary_sha256": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f",
+  "server_binary_b": "/var/tmp/tp5-final-build/bin/llama-server",
+  "server_binary_b_sha256": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f",
+  "legacy_mmvq_policy_unobservable": false,
+  "blocks_requested": 1,
+  "pilot": true,
+  "max_wall_seconds": 1200.0,
+  "count_to": 60,
+  "blocks_completed": 0,
+  "repeats_per_trial": 2,
+  "git_provenance": {
+    "head_commit": "4a30c7e9b3c61a02671c04e623e9c2fe7ccde288",
+    "is_dirty": true,
+    "diff_sha256": "7d4482bc235f4a78720f9f0ae4c042daf9509b4f482d9a7ca0101bc074f71ab9",
+    "script_sha256": "b8eb89e6c1a429541e283a5d2f0ebb08f561f9199d6fa287177ad76df1eedd16",
+    "porcelain_status": "M TP5.md\n M scripts/run-tp5-cross-matrix.py\n?? MMVQ+MTP.md\n?? artifacts/mmvq-mtp/\n?? artifacts/tp5-next-20260926/\n?? \"\\344\\272\\244\\346\\216\\245.md\""
+  },
+  "trials": [
+    {
+      "variant": "qmp-a0-nomtp-off",
+      "trial_tag": "blk1_A1",
+      "count_to": 60,
+      "workload": "weightloss",
+      "port": 8097,
+      "is_mtp": false,
+      "requires_linear": true,
+      "metrics": [
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 5.769578100997023,
+          "reported_predicted_tps": 40.28915320394369,
+          "decode_tps": 40.28915320394369,
+          "predicted_ms": 4393.242,
+          "prompt_n": 31,
+          "predicted_n": 177,
+          "completion_tokens": 177,
+          "committed_tps": 30.67815304717223,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u3002"
+                }
+              }
+            ],
+            "created": 1790516516,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2129-16e28b8ac",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 177,
+              "prompt_tokens": 31,
+              "total_tokens": 208,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-fKrS1NPMu5LCFYM0yHQOfsUo67nJMH5X",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 1178.644,
+              "prompt_per_token_ms": 38.020774193548384,
+              "prompt_per_second": 26.3014107737366,
+              "predicted_n": 177,
+              "predicted_ms": 4393.242,
+              "predicted_per_token_ms": 24.820576271186443,
+              "predicted_per_second": 40.28915320394369
+            }
+          },
+          "error_message": null
+        },
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 5.681357736000791,
+          "reported_predicted_tps": 40.06328641175552,
+          "decode_tps": 40.06328641175552,
+          "predicted_ms": 4418.01,
+          "prompt_n": 31,
+          "predicted_n": 177,
+          "completion_tokens": 177,
+          "committed_tps": 31.1545247148252,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u3002"
+                }
+              }
+            ],
+            "created": 1790516522,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2129-16e28b8ac",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 177,
+              "prompt_tokens": 31,
+              "total_tokens": 208,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-IBPiKk2B4vT4rj386TDyA36zTMN4sFc6",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 1259.989,
+              "prompt_per_token_ms": 40.6448064516129,
+              "prompt_per_second": 24.603389394669318,
+              "predicted_n": 177,
+              "predicted_ms": 4418.01,
+              "predicted_per_token_ms": 24.960508474576272,
+              "predicted_per_second": 40.06328641175552
+            }
+          },
+          "error_message": null
+        }
+      ],
+      "mapped_dso_hashes": {
+        "/home/kunweiz/.cache/radv_builtin_shaders/index": "e33aed84c876e17146c31c9e035983814d8f1c8817144ec34630bba6c53991f3",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac",
+        "/var/tmp/tp5-final-build/bin/libggml-base.so.0.18.1": "90bb3fcab6f2ed5e25f59a11b9f6c21bd840bd92a07f1a2289d9adc858d0e179",
+        "/var/tmp/tp5-final-build/bin/libggml-cpu.so.0.18.1": "091f7a79fd59ab01fc3b92e923d11bc3f6c144776bac31e0309fbc14ee195fde",
+        "/var/tmp/tp5-final-build/bin/libggml-vulkan.so.0.18.1": "b81cc51b9562653510ff1fd9dcece70be3db07d4a9149ecc85dedc029dcc16d4",
+        "/var/tmp/tp5-final-build/bin/libggml.so.0.18.1": "23893927e0d69732e4e598f6c5ad375e27c4f8d28bb88c88fa3b4a67abffa8df",
+        "/var/tmp/tp5-final-build/bin/libllama-common.so.0.0.2129": "5ff77574026a820ec6519d983a3506870111465cc7ca85abaff46060e85519a2",
+        "/var/tmp/tp5-final-build/bin/libllama-server-impl.so": "0192460708ad665c8a3585bacb8e2c1a60f0d32ee545a00c49b73f701f0847f9",
+        "/var/tmp/tp5-final-build/bin/libllama.so.0.0.2129": "b1fafa7dfd053f2b12d03a52f422a33b764b5efde8a26554c26bb780155035e5",
+        "/var/tmp/tp5-final-build/bin/llama-server": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f"
+      },
+      "gpu_snapshot_before": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 100806,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17203200,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 130179,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 106703,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 124310,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 118441,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        }
+      ],
+      "gpu_snapshot_after": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 100806,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2300Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 4074180608,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 130179,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 1200Mhz *"
+          ],
+          "vram_used": 7205838848,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 106703,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2310Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2008203264,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 124310,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2310Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2008203264,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 118441,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2350Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2009432064,
+          "gpu_busy_percent": 98
+        }
+      ],
+      "log_route_verification": {
+        "log_exists": true,
+        "linear_definition_hit": true,
+        "route_verified": true,
+        "mmvq_policy_seen": true,
+        "mmvq_policy_unobservable": false,
+        "error": null
+      },
+      "success": true,
+      "log_path": "artifacts/mmvq-mtp/20260927/q3-pilot/run-20260927T1410/pilot-nomtp_logs/server_qmp-a0-nomtp-off_blk1_A1.log",
+      "log_sha256": "a314f38bd99a69d2d822557a8c82a94ad3bf01a45869476d770083763e24763e",
+      "command": [
+        "/var/tmp/tp5-final-build/bin/llama-server",
+        "-m",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+        "-dev",
+        "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+        "--split-mode",
+        "tensor",
+        "--fit",
+        "off",
+        "-ngl",
+        "999",
+        "-c",
+        "256",
+        "-b",
+        "32",
+        "-ub",
+        "32",
+        "--no-mmap",
+        "--no-host",
+        "-np",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8097",
+        "--tp5",
+        "qwen4exp-af",
+        "--tp5-latebind",
+        "off",
+        "--spec-type",
+        "none"
+      ],
+      "env_snapshot": {
+        "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+        "HOME": "/home/kunweiz",
+        "USER": "kunweiz",
+        "SHELL": "/bin/bash",
+        "LANG": "en_US.UTF-8",
+        "LD_LIBRARY_PATH": "/var/tmp/tp5-final-build/bin",
+        "RADV_DEBUG": "nobolist",
+        "GGML_VK_DISABLE_MMVQ": "1",
+        "GGML_VK_FORCE_MMVQ": "0"
+      },
+      "warmup": {
+        "success": true,
+        "status_code": 200,
+        "client_wall_sec": 5.710001510044094,
+        "reported_predicted_tps": 40.03322078796234,
+        "decode_tps": 40.03322078796234,
+        "predicted_ms": 4421.328,
+        "prompt_n": 31,
+        "predicted_n": 177,
+        "completion_tokens": 177,
+        "committed_tps": 30.998240488842384,
+        "finish_reason": "stop",
+        "exact_content_match": true,
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+            }
+          ],
+          "temperature": 0,
+          "seed": 42,
+          "max_tokens": 192,
+          "cache_prompt": false,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        },
+        "raw_response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u3002"
+              }
+            }
+          ],
+          "created": 1790516510,
+          "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+          "system_fingerprint": "b2129-16e28b8ac",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 177,
+            "prompt_tokens": 31,
+            "total_tokens": 208,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-V1qZX1Om6MNCEmZl3ijwJbk9Swrs6N5a",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 31,
+            "prompt_ms": 1285.632,
+            "prompt_per_token_ms": 41.472,
+            "prompt_per_second": 24.11265432098765,
+            "predicted_n": 177,
+            "predicted_ms": 4421.328,
+            "predicted_per_token_ms": 24.97925423728814,
+            "predicted_per_second": 40.03322078796234
+          }
+        },
+        "error_message": null
+      }
+    },
+    {
+      "variant": "qmp-a1-nomtp-auto",
+      "trial_tag": "blk1_B1",
+      "count_to": 60,
+      "workload": "weightloss",
+      "port": 8097,
+      "is_mtp": false,
+      "requires_linear": true,
+      "metrics": [],
+      "mapped_dso_hashes": {
+        "/home/kunweiz/.cache/radv_builtin_shaders/index": "e33aed84c876e17146c31c9e035983814d8f1c8817144ec34630bba6c53991f3",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac",
+        "/var/tmp/tp5-final-build/bin/libggml-base.so.0.18.1": "90bb3fcab6f2ed5e25f59a11b9f6c21bd840bd92a07f1a2289d9adc858d0e179",
+        "/var/tmp/tp5-final-build/bin/libggml-cpu.so.0.18.1": "091f7a79fd59ab01fc3b92e923d11bc3f6c144776bac31e0309fbc14ee195fde",
+        "/var/tmp/tp5-final-build/bin/libggml-vulkan.so.0.18.1": "b81cc51b9562653510ff1fd9dcece70be3db07d4a9149ecc85dedc029dcc16d4",
+        "/var/tmp/tp5-final-build/bin/libggml.so.0.18.1": "23893927e0d69732e4e598f6c5ad375e27c4f8d28bb88c88fa3b4a67abffa8df",
+        "/var/tmp/tp5-final-build/bin/libllama-common.so.0.0.2129": "5ff77574026a820ec6519d983a3506870111465cc7ca85abaff46060e85519a2",
+        "/var/tmp/tp5-final-build/bin/libllama-server-impl.so": "0192460708ad665c8a3585bacb8e2c1a60f0d32ee545a00c49b73f701f0847f9",
+        "/var/tmp/tp5-final-build/bin/libllama.so.0.0.2129": "b1fafa7dfd053f2b12d03a52f422a33b764b5efde8a26554c26bb780155035e5",
+        "/var/tmp/tp5-final-build/bin/llama-server": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f"
+      },
+      "gpu_snapshot_before": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 100806,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2300Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 4074180608,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 130179,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 1200Mhz *"
+          ],
+          "vram_used": 7205838848,
+          "gpu_busy_percent": 97
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 106703,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2310Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2008203264,
+          "gpu_busy_percent": 97
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 124310,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2310Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2008203264,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 118441,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2350Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2009432064,
+          "gpu_busy_percent": 98
+        }
+      ],
+      "gpu_snapshot_after": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 100806,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2300Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2009247744,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 130179,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 1200Mhz *"
+          ],
+          "vram_used": 7206887424,
+          "gpu_busy_percent": 97
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 106703,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2310Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2009251840,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 124310,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2310Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2009251840,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 118441,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2350Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 2010480640,
+          "gpu_busy_percent": 98
+        }
+      ],
+      "log_route_verification": {},
+      "success": false,
+      "log_path": "artifacts/mmvq-mtp/20260927/q3-pilot/run-20260927T1410/pilot-nomtp_logs/server_qmp-a1-nomtp-auto_blk1_B1.log",
+      "log_sha256": "fc4c2c98b338acd755474fbbd82401aca2b7e1600e6ccfe0109237f218ccaae3",
+      "command": [
+        "/var/tmp/tp5-final-build/bin/llama-server",
+        "-m",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+        "-dev",
+        "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+        "--split-mode",
+        "tensor",
+        "--fit",
+        "off",
+        "-ngl",
+        "999",
+        "-c",
+        "256",
+        "-b",
+        "32",
+        "-ub",
+        "32",
+        "--no-mmap",
+        "--no-host",
+        "-np",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8097",
+        "--tp5",
+        "qwen4exp-af",
+        "--tp5-latebind",
+        "off",
+        "--spec-type",
+        "none"
+      ],
+      "env_snapshot": {
+        "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+        "HOME": "/home/kunweiz",
+        "USER": "kunweiz",
+        "SHELL": "/bin/bash",
+        "LANG": "en_US.UTF-8",
+        "LD_LIBRARY_PATH": "/var/tmp/tp5-final-build/bin",
+        "RADV_DEBUG": "nobolist",
+        "GGML_VK_DISABLE_MMVQ": "0",
+        "GGML_VK_FORCE_MMVQ": "0"
+      },
+      "warmup": {
+        "success": false,
+        "status_code": 200,
+        "client_wall_sec": 5.731597674952354,
+        "reported_predicted_tps": 40.144151142953326,
+        "decode_tps": 40.144151142953326,
+        "predicted_ms": 4458.931,
+        "prompt_n": 31,
+        "predicted_n": 179,
+        "completion_tokens": 179,
+        "committed_tps": 31.230384641658922,
+        "finish_reason": "stop",
+        "exact_content_match": false,
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+            }
+          ],
+          "temperature": 0,
+          "seed": 42,
+          "max_tokens": 192,
+          "cache_prompt": false,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        },
+        "raw_response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u5feb\u901f\u8131\u6c34\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u6216\u6e38\u6cf3\uff0c\u4ee5\u63d0\u5347\u5fc3\u80ba\u529f\u80fd\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u9ad8\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u5728\u996e\u98df\u65b9\u9762\uff0c\u5e94\u4f18\u5148\u9009\u62e9\u9ad8\u86cb\u767d\u3001\u9ad8\u7ea4\u7ef4\u4e14\u4f4e\u5347\u7cd6\u6307\u6570\u7684\u5929\u7136\u98df\u7269\uff0c\u51cf\u5c11\u52a0\u5de5\u98df\u54c1\u6444\u5165\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u7ef4\u6301\u4ee3\u8c22\u7a33\u5b9a\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5206\u6ccc\uff0c\u53cd\u800c\u5bfc\u81f4\u98df\u6b32\u5931\u63a7\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u201c\u4e0d\u5403\u665a\u9910\u201d\u80fd\u52a0\u901f\u51cf\u91cd\uff0c\u8fd9\u5f80\u5f80\u4f1a\u5bfc\u81f4\u6b21\u65e5\u65e9\u9910\u8fc7\u91cf\u8fdb\u98df\u6216\u4ee3\u8c22\u964d\u4f4e\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u53ef\u6301\u7eed\u7684\u5065\u5eb7\u4f53\u91cd\u7ba1\u7406\u3002"
+              }
+            }
+          ],
+          "created": 1790516579,
+          "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+          "system_fingerprint": "b2129-16e28b8ac",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 179,
+            "prompt_tokens": 31,
+            "total_tokens": 210,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-F4BruPoDJn6PruiRZDfGV5LShRqauuJ3",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 31,
+            "prompt_ms": 1269.558,
+            "prompt_per_token_ms": 40.953483870967744,
+            "prompt_per_second": 24.417947033534507,
+            "predicted_n": 179,
+            "predicted_ms": 4458.931,
+            "predicted_per_token_ms": 24.910229050279327,
+            "predicted_per_second": 40.144151142953326
+          }
+        },
+        "error_message": "Validation failed: exact_content_match=False (len=301 vs expected=variant_set), finish_reason=stop, prompt_n=31, pred_n=179 (valid=True, is_mtp=False), completion_tokens=179 (valid=True), predicted_ms=4458.931"
+      },
+      "error": "Warmup request failed: Validation failed: exact_content_match=False (len=301 vs expected=variant_set), finish_reason=stop, prompt_n=31, pred_n=179 (valid=True, is_mtp=False), completion_tokens=179 (valid=True), predicted_ms=4458.931"
+    }
+  ],
+  "paired_samples_a_committed": [],
+  "paired_samples_b_committed": [],
+  "paired_samples_a_decode": [],
+  "paired_samples_b_decode": [],
+  "stats_committed_tps": {},
+  "stats_decode_tps": {},
+  "status": "failed",
+  "baseline_gpu_identity": [
+    [
+      "card1",
+      "0000:0f:00.0",
+      100806
+    ],
+    [
+      "card2",
+      "0000:09:00.0",
+      130179
+    ],
+    [
+      "card3",
+      "0000:0c:00.0",
+      106703
+    ],
+    [
+      "card4",
+      "0000:06:00.0",
+      124310
+    ],
+    [
+      "card5",
+      "0000:03:00.0",
+      118441
+    ]
+  ],
+  "failure_reason": "Trial blk1_B1 (qmp-a1-nomtp-auto) failed closed: Warmup request failed: Validation failed: exact_content_match=False (len=301 vs expected=variant_set), finish_reason=stop, prompt_n=31, pred_n=179 (valid=True, is_mtp=False), completion_tokens=179 (valid=True), predicted_ms=4458.931"
+}

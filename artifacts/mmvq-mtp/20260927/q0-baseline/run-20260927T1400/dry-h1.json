@@ -1,0 +1,112 @@
+{
+  "variant_a": {
+    "name": "qmp-b0-h1-off",
+    "description": "QMP cell: mtp=True, h=1, mmvq=off",
+    "env": {
+      "RADV_DEBUG": "nobolist",
+      "GGML_TP5_SPEC_VERIFY_ARGMAX": "1",
+      "GGML_VK_DISABLE_MMVQ": "1",
+      "GGML_VK_FORCE_MMVQ": "0"
+    },
+    "cli_args": [
+      "--tp5",
+      "qwen4exp-af",
+      "-md",
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+      "--spec-type",
+      "draft-mtp",
+      "--spec-draft-n-max",
+      "1",
+      "--tp5-latebind",
+      "off"
+    ],
+    "expected_sync": "relay",
+    "expected_wire": "f32",
+    "expected_mmvq": "disabled",
+    "is_mtp": true,
+    "requires_linear": true
+  },
+  "variant_b": {
+    "name": "qmp-b1-h1-auto",
+    "description": "QMP cell: mtp=True, h=1, mmvq=auto",
+    "env": {
+      "RADV_DEBUG": "nobolist",
+      "GGML_TP5_SPEC_VERIFY_ARGMAX": "1",
+      "GGML_VK_DISABLE_MMVQ": "0",
+      "GGML_VK_FORCE_MMVQ": "0"
+    },
+    "cli_args": [
+      "--tp5",
+      "qwen4exp-af",
+      "-md",
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+      "--spec-type",
+      "draft-mtp",
+      "--spec-draft-n-max",
+      "1",
+      "--tp5-latebind",
+      "off"
+    ],
+    "expected_sync": "relay",
+    "expected_wire": "f32",
+    "expected_mmvq": "auto",
+    "is_mtp": true,
+    "requires_linear": true
+  },
+  "workload": "weightloss",
+  "server_binary": "/var/tmp/tp5-final-build/bin/llama-server",
+  "server_binary_sha256": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f",
+  "server_binary_b": "/var/tmp/tp5-final-build/bin/llama-server",
+  "server_binary_b_sha256": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f",
+  "legacy_mmvq_policy_unobservable": false,
+  "blocks_requested": 1,
+  "pilot": false,
+  "max_wall_seconds": 1800.0,
+  "count_to": 60,
+  "blocks_completed": 0,
+  "repeats_per_trial": 2,
+  "git_provenance": {
+    "head_commit": "4a30c7e9b3c61a02671c04e623e9c2fe7ccde288",
+    "is_dirty": true,
+    "diff_sha256": "7d4482bc235f4a78720f9f0ae4c042daf9509b4f482d9a7ca0101bc074f71ab9",
+    "script_sha256": "b8eb89e6c1a429541e283a5d2f0ebb08f561f9199d6fa287177ad76df1eedd16",
+    "porcelain_status": "M TP5.md\n M scripts/run-tp5-cross-matrix.py\n?? MMVQ+MTP.md\n?? artifacts/tp5-next-20260926/\n?? \"\\344\\272\\244\\346\\216\\245.md\""
+  },
+  "trials": [
+    {
+      "variant": "qmp-b0-h1-off",
+      "trial_tag": "blk1_A1",
+      "server_binary": "/var/tmp/tp5-final-build/bin/llama-server",
+      "status": "NOT_MEASURED",
+      "success": false
+    },
+    {
+      "variant": "qmp-b1-h1-auto",
+      "trial_tag": "blk1_B1",
+      "server_binary": "/var/tmp/tp5-final-build/bin/llama-server",
+      "status": "NOT_MEASURED",
+      "success": false
+    },
+    {
+      "variant": "qmp-b1-h1-auto",
+      "trial_tag": "blk1_B2",
+      "server_binary": "/var/tmp/tp5-final-build/bin/llama-server",
+      "status": "NOT_MEASURED",
+      "success": false
+    },
+    {
+      "variant": "qmp-b0-h1-off",
+      "trial_tag": "blk1_A2",
+      "server_binary": "/var/tmp/tp5-final-build/bin/llama-server",
+      "status": "NOT_MEASURED",
+      "success": false
+    }
+  ],
+  "paired_samples_a_committed": [],
+  "paired_samples_b_committed": [],
+  "paired_samples_a_decode": [],
+  "paired_samples_b_decode": [],
+  "stats_committed_tps": {},
+  "stats_decode_tps": {},
+  "status": "DRY_RUN_NOT_MEASURED"
+}

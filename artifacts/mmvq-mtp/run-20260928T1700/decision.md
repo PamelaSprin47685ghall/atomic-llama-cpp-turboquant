@@ -102,14 +102,42 @@ family=qsa-projections  fused=1 mmvq_mask=1  (x5 rank)
 **遗留**：多 token 融合要真正启用，必须先让 attention_prep 支持 token 维
 （dispatch 加 token 轴或循环），这是下一个单因素。当前保守版 = 基础设施就位 + 行为零变化。
 
-## §23 主仓同步（2026-09-29）
+## §24 prep token 轴：融合已打通，数值待修（2026-09-29 深夜，做到底）
 
-多 token 融合基础设施已同步主仓 `682236ec1`（三文件 diff=0 逐字节核对）。
-当前状态：
-- **保守激活**：所有 `can_fuse_attention_projections` 调用方传
-  `segment_caller=true`，行为与改动前逐字节一致（R/A 两臂 md5 验证）。
-- **启用条件**（下一单因素）：`qwen4_attention_prep.comp` 加 token 轴
-  （dispatch `{heads, n_tokens, 1}` 或着色器内 token 循环 +
-  `rope_data_pos[token]` + Q/K/V 按 token 索引）。这是让 2 行 verify
-  真正吃到 4-投影单次权重遍历的前提。
-- 候选树同步至 `9b01aabc8`。
+**用户指令**：做到底。深井推进到 attention_prep 的 token 轴——多 token 融合的真正拦路石。
+
+### 已完成（`4787762c2`，候选树）
+
+1. **prep token 轴**（`qwen4_attention_prep.comp`）：
+   - push constants 加 `n_tokens/q_token_stride/k_token_stride/v_token_stride`
+   - dispatch `{heads+2*kv, n_tokens, 1}`（y 轴 = token）
+   - Q/K/V 读取按 token 偏移；rope 位置 `rope_data_pos[token]`；K 行 `k_rows[token]`；V 行 `v_rows[token]`
+2. **守卫全链放开**（12 个形状族逐个修正）：
+   - Q view `[width, heads, T]`、K/V `[width*kv, T]`、rope 输出、cache 视图（ne[3] 恒 1）、
+     permuted Q `[width, T, heads, 1]`、gate `[width*heads, T]`（token 在 ne[1]）、
+     SET_ROWS 行索引 `n_tokens` 个、cache 写 `ne[0]*n_tokens`
+   - 逐句诊断（AS_GUARD 宏）定位每个错误假设——共 6 处单 token 硬编码
+3. **融合触发确认**：`[proj-entry] call=0..5 n_tokens=2` —— 2 行 verify 的
+   4 投影组首次进入融合 dispatch。
+
+### 当前缺陷（数值）
+
+输出退化（cjk=27/75、md5 不稳）：prep 的 token 数学有错。
+已知嫌疑人：
+- `q_token_stride` 用了 Q view 的 `nb[2]`（= 2*width*heads*4，q|gate 交错），
+  但 prep 读的是 `query[base+tid]`，base 用 `head*q_stride`（=nb[1]/4=2*width），
+  token 偏移应为 `token*heads*q_stride`（= nb[2]/4 ✓ 其实一致）——需逐项核对
+- K 的 `d_offset = k_rows[token].x * k_row_stride + head*width` 与
+  `idst = d + token*width + d_offset`：K rope 输出按 token 步长 width，
+  但 K cache 写入按行号——两者可能双重计数
+- v_rows/k_rows 绑定的 buffer 大小是否覆盖 token 维
+
+### 下一手（顺序）
+
+1. 用单 token 图对照：n_tokens=1 时新代码必须逐字节等价旧路径
+   （R 臂 md5 `add18ad37ff7` 回归门）。
+2. 2 token 数值定位：dump prep 输入/输出（Q rope 结果 vs CPU 参照）。
+3. 修好后跑四格 + ABBA。
+
+**边界**：本轮到此。融合打通是结构性进展（此前该路径在 2 行图上根本不存在）；
+数值修复是下一个单因素，嫌疑人已记录。
