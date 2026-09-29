@@ -71,12 +71,14 @@ vec2 cache_b_ds;
 #undef DATA_A_Q6_K
 
 void qwen_mmvq_iter(uint matrix, uint first_row, uint num_rows, uint col,
+                     const uint token,
                     inout float a[NUM_ROWS_QUANT], inout float b[NUM_ROWS_QUANT]) {
         const uint ib = col / 32u;
         const uint half_block = (col % 32u) / 16u;
-        cache_b_ds = vec2(common_q8[ib / 4u].ds[ib % 4u]);
+        const uint tok_ib = token * (p.width / 32u) + ib;
+        cache_b_ds = vec2(common_q8[tok_ib / 4u].ds[tok_ib % 4u]);
         [[unroll]] for (uint q = 0u; q < 4u; ++q) {
-            cache_b_qs[q] = common_q8[ib / 4u].qs[(ib % 4u) * 8u + half_block * 4u + q];
+            cache_b_qs[q] = common_q8[tok_ib / 4u].qs[(tok_ib % 4u) * 8u + half_block * 4u + q];
         }
         [[unroll]] for (uint r = 0u; r < num_rows; ++r) {
             const uint weight_block = ((first_row + r) * p.width + col) / 32u;
@@ -97,6 +99,7 @@ void qwen_mmvq_iter(uint matrix, uint first_row, uint num_rows, uint col,
 // matrix=0/1: one Q5 matrix; matrix=2: the paired Q6 matrices. The
 // workgroup/row distribution and all surrounding graph fusion stay unchanged.
 void qwen_compute_mmvq(uint matrix, uint first_row, uint num_rows, uint tid) {
+    for (uint token = 0u; token < p.n_tokens; ++token) {
     float a[NUM_ROWS_QUANT];
     float b[NUM_ROWS_QUANT];
     [[unroll]] for (uint r = 0u; r < NUM_ROWS_QUANT; ++r) {
@@ -111,18 +114,18 @@ void qwen_compute_mmvq(uint matrix, uint first_row, uint num_rows, uint tid) {
     if (remaining * stride + col < p.width) ++remaining;
     for (; remaining >= 4u; remaining -= 4u) {
         [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-            qwen_mmvq_iter(matrix, first_row, num_rows, col, a, b);
+            qwen_mmvq_iter(matrix, first_row, num_rows, col, token, a, b);
             col += stride;
         }
     }
     if (remaining >= 2u) {
-        qwen_mmvq_iter(matrix, first_row, num_rows, col, a, b);
+        qwen_mmvq_iter(matrix, first_row, num_rows, col, token, a, b);
         col += stride;
-        qwen_mmvq_iter(matrix, first_row, num_rows, col, a, b);
+        qwen_mmvq_iter(matrix, first_row, num_rows, col, token, a, b);
         col += stride;
         remaining -= 2u;
     }
-    if (remaining != 0u) qwen_mmvq_iter(matrix, first_row, num_rows, col, a, b);
+    if (remaining != 0u) qwen_mmvq_iter(matrix, first_row, num_rows, col, token, a, b);
     [[unroll]] for (uint r = 0u; r < num_rows; ++r) {
         a[r] = subgroupAdd(a[r]);
         b[r] = subgroupAdd(b[r]);
@@ -131,16 +134,17 @@ void qwen_compute_mmvq(uint matrix, uint first_row, uint num_rows, uint tid) {
     if (tid == 0u) {
         [[unroll]] for (uint r = 0u; r < num_rows; ++r) {
             if (matrix == 2u) {
-                OUT_Q6_A[first_row + r] = a[r];
-                OUT_Q6_B[first_row + r] = b[r];
+                OUT_Q6_A[token * p.rows1 + first_row + r] = a[r];
+                OUT_Q6_B[token * p.rows2 + first_row + r] = b[r];
             } else if (matrix == 0u) {
-                out0[first_row + r] = a[r];
+                out0[token * p.rows0 + first_row + r] = a[r];
             }
 #ifdef GDN_PROJECTIONS
             else {
-                out1[first_row + r] = a[r];
+                out1[token * p.rows1 + first_row + r] = a[r];
             }
 #endif
         }
+    }
     }
 }

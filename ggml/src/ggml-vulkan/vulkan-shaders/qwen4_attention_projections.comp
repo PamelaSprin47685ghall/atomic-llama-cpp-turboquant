@@ -151,6 +151,11 @@ layout(push_constant) uniform PushParams {
     uint rows0;
     uint rows1;
     uint rows2;
+    // Multi-token (MTP verify) extension: 1 = legacy single-token path.
+    // Input is [n_tokens][width], outputs are [n_tokens][rowsN]. Weights stay
+    // shared across tokens: one workgroup pass serves all tokens, so the
+    // four-projection fusion keeps its single weight traversal per group.
+    uint n_tokens;
 }
 
 p;
@@ -167,12 +172,13 @@ void calc_superblock_q5_k(const uint  matrix_idx,
                           const uint  l0,
                           const uint  q_offset,
                           const uint  y_offset,
+                          const uint  token,
                           const uint  i,
                           const uint  num_blocks_per_row,
                           const uint  first_row,
                           const uint  num_rows,
                           inout float temp[NUM_ROWS_QUANT]) {
-    const uint y1_idx = i * 256u + y_offset;
+    const uint y1_idx = token * p.width + i * 256u + y_offset;
     const uint y2_idx = y1_idx + 128u;
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -340,26 +346,28 @@ void compute_q5_k(const uint matrix_idx, const uint first_row, const uint num_ro
     const uint q_offset = 32u * v_im + l0;
     const uint y_offset = 64u * v_im + l0;
 
-    float temp[NUM_ROWS_QUANT];
-    [[unroll]] for (uint n = 0; n < NUM_ROWS_QUANT; ++n) { temp[n] = 0.0; }
+    for (uint token = 0u; token < p.n_tokens; ++token) {
+        float temp[NUM_ROWS_QUANT];
+        [[unroll]] for (uint n = 0; n < NUM_ROWS_QUANT; ++n) { temp[n] = 0.0; }
 
-    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += it_size) {
-        calc_superblock_q5_k(matrix_idx, v_im, l0, q_offset, y_offset, i, num_blocks_per_row, first_row, num_rows,
-                             temp);
-    }
+        [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+            calc_superblock_q5_k(matrix_idx, v_im, l0, q_offset, y_offset, token, i, num_blocks_per_row, first_row,
+                                 num_rows, temp);
+        }
 
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) { temp[n] = subgroupAdd(temp[n]); }
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) { temp[n] = subgroupAdd(temp[n]); }
 
-    if (tid == 0) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-            if (matrix_idx == 0u) {
-                out0[first_row + n] = temp[n];
-            }
+        if (tid == 0) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                if (matrix_idx == 0u) {
+                    out0[token * p.rows0 + first_row + n] = temp[n];
+                }
 #if defined(GDN_PROJECTIONS)
-            else {
-                out1[first_row + n] = temp[n];
-            }
+                else {
+                    out1[token * p.rows1 + first_row + n] = temp[n];
+                }
 #endif
+            }
         }
     }
 }
@@ -370,6 +378,7 @@ void calc_superblock_paired_q6_k(const uint  itid,
                                  const uint  qh_offset,
                                  const uint  s_offset,
                                  const uint  y_offset,
+                                 const uint  token,
                                  const uint  i,
                                  const uint  num_blocks_per_row,
                                  const uint  first_row,
@@ -378,7 +387,7 @@ void calc_superblock_paired_q6_k(const uint  itid,
                                  inout float temp_a[NUM_ROWS_QUANT],
                                  inout float temp_b[NUM_ROWS_QUANT],
                                  inout uint  csel) {
-    const uint y_idx = i * 256u + y_offset;
+    const uint y_idx = token * p.width + i * 256u + y_offset;
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint ib0 = (first_row + n) * num_blocks_per_row;
@@ -516,34 +525,36 @@ void compute_paired_q6_k(const uint first_row, const uint num_rows, const uint t
     const uint s_offset  = 8u * v_im + is_scale;
     const uint y_offset  = 128u * v_im + l0;
 
-    float temp_a[NUM_ROWS_QUANT];
-    float temp_b[NUM_ROWS_QUANT];
-    [[unroll]] for (uint n = 0; n < NUM_ROWS_QUANT; ++n) {
-        temp_a[n] = 0.0;
-        temp_b[n] = 0.0;
-    }
+    for (uint token = 0u; token < p.n_tokens; ++token) {
+        float temp_a[NUM_ROWS_QUANT];
+        float temp_b[NUM_ROWS_QUANT];
+        [[unroll]] for (uint n = 0; n < NUM_ROWS_QUANT; ++n) {
+            temp_a[n] = 0.0;
+            temp_b[n] = 0.0;
+        }
 
-    const uint nbr_par_th = num_blocks_per_row % it_size;
-    const uint nbr_all_th = num_blocks_per_row - nbr_par_th;
+        const uint nbr_par_th = num_blocks_per_row % it_size;
+        const uint nbr_all_th = num_blocks_per_row - nbr_par_th;
 
-    uint csel = 0u;
-    uint i0   = 0u;
-    [[unroll]] for (; i0 < nbr_all_th; i0 += it_size) {
-        calc_superblock_paired_q6_k(itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row,
-                                    first_row, num_rows, true, temp_a, temp_b, csel);
-    }
-    calc_superblock_paired_q6_k(itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row,
-                                first_row, num_rows, false, temp_a, temp_b, csel);
+        uint csel = 0u;
+        uint i0   = 0u;
+        [[unroll]] for (; i0 < nbr_all_th; i0 += it_size) {
+            calc_superblock_paired_q6_k(itid, ix, ql_offset, qh_offset, s_offset, y_offset, token, i0 + ix,
+                                        num_blocks_per_row, first_row, num_rows, true, temp_a, temp_b, csel);
+        }
+        calc_superblock_paired_q6_k(itid, ix, ql_offset, qh_offset, s_offset, y_offset, token, i0 + ix,
+                                    num_blocks_per_row, first_row, num_rows, false, temp_a, temp_b, csel);
 
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        temp_a[n] = subgroupAdd(temp_a[n]);
-        temp_b[n] = subgroupAdd(temp_b[n]);
-    }
-
-    if (tid == 0) {
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-            OUT_Q6_A[first_row + n] = temp_a[n];
-            OUT_Q6_B[first_row + n] = temp_b[n];
+            temp_a[n] = subgroupAdd(temp_a[n]);
+            temp_b[n] = subgroupAdd(temp_b[n]);
+        }
+
+        if (tid == 0) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                OUT_Q6_A[token * p.rows1 + first_row + n] = temp_a[n];
+                OUT_Q6_B[token * p.rows2 + first_row + n] = temp_b[n];
+            }
         }
     }
 }
@@ -553,6 +564,7 @@ void compute_bf16(const uint first_row, const uint num_rows, const uint tid) {
     const uint step      = 4u * BLOCK_SIZE;
     const uint num_iters = (p.width + step - 1u) / step;
 
+    for (uint token = 0u; token < p.n_tokens; ++token) {
     float temp[NUM_ROWS_DENSE];
     [[unroll]] for (uint n = 0; n < NUM_ROWS_DENSE; ++n) { temp[n] = 0.0; }
 
@@ -560,9 +572,9 @@ void compute_bf16(const uint first_row, const uint num_rows, const uint tid) {
         const uint col = i * step + 4u * tid;
         if (col >= p.width)
             continue;
-        const vec4 b = common_input_v4[col / 4u];
+        const vec4 b = common_input_v4[(token * p.width + col) / 4u];
 
-        [[unroll]] for (uint n = 0u; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             const uint global_row = first_row + n;
             const uint ib         = (global_row * p.width + col) / 2u;
 
@@ -579,7 +591,8 @@ void compute_bf16(const uint first_row, const uint num_rows, const uint tid) {
     [[unroll]] for (uint n = 0; n < num_rows; ++n) { temp[n] = subgroupAdd(temp[n]); }
 
     if (tid == 0) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) { out3[first_row + n] = temp[n]; }
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) { out3[token * p.rows2 + first_row + n] = temp[n]; }
+    }
     }
 }
 #endif

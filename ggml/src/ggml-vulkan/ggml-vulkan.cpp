@@ -1969,9 +1969,10 @@ struct vk_attention_projections_push_constants {
     uint32_t rows0;
     uint32_t rows1;
     uint32_t rows2;
+    uint32_t n_tokens;
 };
 
-static_assert(sizeof(vk_attention_projections_push_constants) == 16, "attention projection ABI");
+static_assert(sizeof(vk_attention_projections_push_constants) == 20, "attention projection ABI");
 
 struct vk_op_multi_add_push_constants {
     // shape for dst
@@ -16469,7 +16470,9 @@ static bool ggml_vk_region_q8_input(ggml_backend_vk_context * ctx, vk_context & 
         !ggml_is_contiguous(input))
         return false;
     const uint64_t ne = ggml_nelements(input);
-    if (ne == 0 || ne != uint64_t(input->ne[0]) || ne > UINT32_MAX || ne % 128 != 0 ||
+    // Multi-token: the fused attention projections quantize [width][n_tokens]
+    // in one pass; the block count is derived from the total element count.
+    if (ne == 0 || ne > UINT32_MAX || ne % 128 != 0 ||
         get_misalign_bytes(ctx, input) != 0)
         return false;
     auto quantizer = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
@@ -16978,7 +16981,8 @@ static void ggml_vk_attention_projections(ggml_backend_vk_context * ctx,
     const vk_attention_projections_push_constants pc{ static_cast<uint32_t>(node(0)->src[1]->ne[0]),
                                                       static_cast<uint32_t>(node(0)->ne[0]),
                                                       static_cast<uint32_t>(node(1)->ne[0]),
-                                                      static_cast<uint32_t>(node(qsa ? 3 : 2)->ne[0]) };
+                                                      static_cast<uint32_t>(node(qsa ? 3 : 2)->ne[0]),
+                                                      static_cast<uint32_t>(node(0)->src[1]->ne[1]) };
     const uint32_t groups = CEIL_DIV(pc.rows0, 2) + CEIL_DIV(pc.rows1, 2) + CEIL_DIV(pc.rows2, 2);
     uint32_t mmvq_mask = 0;
     if (ctx->device->integer_dot_product) {
@@ -23737,9 +23741,15 @@ static int ggml_vk_attention_projection_variant(const ggml_cgraph * graph, int f
 
 static bool ggml_vk_can_fuse_attention_projections(ggml_backend_vk_context * ctx,
                                                    const ggml_cgraph *       graph,
-                                                   int                       first) {
+                                                   int                       first,
+                                                   bool                      segment_caller = false) {
     static const bool disabled = getenv("GGML_VK_DISABLE_ATTENTION_PROJECTIONS") != nullptr;
     const int         variant  = ggml_vk_attention_projection_variant(graph, first);
+    // The projections-only region (no surrounding segment) can take multi
+    // token: its consumers are standalone ops that handle [rows][n_tokens].
+    // Every segment caller (attention_segment / gdn_segment / gdn_cached)
+    // embeds this fusion ahead of single-token-only prep/rope kernels.
+    const bool        allow_multi_token = !segment_caller;
     if (disabled || variant < 0 || !ctx->device->pipeline_attention_projections[variant] ||
         !ggml_can_fuse_subgraph(graph, first, attention_projection_pattern, { first, first + 1, first + 2, first + 3 }))
         return false;
@@ -23753,7 +23763,12 @@ static bool ggml_vk_can_fuse_attention_projections(ggml_backend_vk_context * ctx
     };
     const ggml_tensor * input = node(0)->src[1];
     if (!valid(input) || input->type != GGML_TYPE_F32 || input->ne[0] % 256 != 0 ||
-        ggml_nelements(input) != input->ne[0] || (vk_tensor_offset(input) + input->view_offs) % 16 != 0)
+        (vk_tensor_offset(input) + input->view_offs) % 16 != 0)
+        return false;
+    const uint32_t n_tokens = static_cast<uint32_t>(input->ne[1]);
+    if (n_tokens != 1 && !allow_multi_token)
+        return false;
+    if (n_tokens < 1 || n_tokens > 4 || ggml_nelements(input) != input->ne[0] * n_tokens)
         return false;
     if (node(variant == 0 ? 2 : 1)->ne[0] != node(variant == 0 ? 3 : 2)->ne[0])
         return false;
@@ -23761,7 +23776,8 @@ static bool ggml_vk_can_fuse_attention_projections(ggml_backend_vk_context * ctx
     for (int n = 0; n < 4; ++n) {
         const ggml_tensor * w = node(n)->src[0];
         if (!valid(w) || !valid(node(n)) || node(n)->type != GGML_TYPE_F32 || w->ne[0] != input->ne[0] ||
-            w->ne[1] != node(n)->ne[0] || w->ne[2] != 1 || w->ne[3] != 1 || ggml_nelements(node(n)) != node(n)->ne[0])
+            w->ne[1] != node(n)->ne[0] || w->ne[2] != 1 || w->ne[3] != 1 ||
+            node(n)->ne[1] != n_tokens || ggml_nelements(node(n)) != node(n)->ne[0] * n_tokens)
             return false;
         if (ggml_vk_tensors_overlap(node(n), input, false))
             return false;
@@ -23781,7 +23797,7 @@ static bool ggml_vk_can_fuse_attention_segment(ggml_backend_vk_context * ctx, co
     constexpr size_t  count    = attention_segment_pattern.size();
     if (disabled || !ctx->device->pipeline_attention_prep || first + count > static_cast<size_t>(graph->n_nodes) ||
         ggml_vk_attention_projection_variant(graph, first) != 1 ||
-        !ggml_vk_can_fuse_attention_projections(ctx, graph, first))
+        !ggml_vk_can_fuse_attention_projections(ctx, graph, first, /*segment_caller=*/true))
         return false;
     const auto node = [&](int n) {
         return graph->nodes[first + n];
@@ -24164,7 +24180,7 @@ static bool ggml_vk_can_fuse_gdn_cached_segment(ggml_backend_vk_context * ctx, c
     };
     if (first + count > static_cast<size_t>(graph->n_nodes) || !ctx->device->pipeline_gdn_cached_prep ||
         !ctx->device->pipeline_gdn_cached_delta || ggml_vk_attention_projection_variant(graph, first) != 0 ||
-        !ggml_vk_can_fuse_attention_projections(ctx, graph, first) ||
+        !ggml_vk_can_fuse_attention_projections(ctx, graph, first, /*segment_caller=*/true) ||
         !ggml_vk_can_fuse_gdn_segment(ctx, graph, pos(kGdnCachedCoreOffset)))
         return false;
     std::array<int, gdn_cached_index_views_pattern.size()> indices{};
@@ -24809,7 +24825,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // CPY owns this cache view; it does not consume its old data.
                 op_srcs_fused_elementwise[17] = true;
                 op_srcs_fused_elementwise[18] = true;
-            } else if (ggml_vk_can_fuse_attention_projections(ctx, cgraph, i)) {
+            } else if (ggml_vk_can_fuse_attention_projections(ctx, cgraph, i, /*segment_caller=*/true)) {
                 ctx->num_additional_fused_ops    = attention_projection_pattern.size() - 1;
                 ctx->fused_attention_projections = true;
                 ctx->fused_ops_write_mask        = 0xf;
