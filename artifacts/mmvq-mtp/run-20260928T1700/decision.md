@@ -422,3 +422,13 @@ Vulkan0、四连续投影、width=2560、Q5[0] rows=4096、GDN Q5[1] rows=4096�
 最终二进制另外以五张 RX 6800、`GGML_VK_FORCE_MMVQ=1`、Qwen4EXP TP5+MTP、`--tp5-latebind off` 运行一次服务请求：HTTP 200，`pred_n=171`、72/98 draft accepted、汉字243、中文标点21；五 rank 解码账本同为 `late=0,dispatches=4337,barriers=4019,copies=192`，图复用97。原始 HTTP 响应在同一归档内；服务启动/预录及 prefill 出现 `CRITICAL-FALLBACK`，不宣称全程无回退。这是当前**确切源码**的端到端连贯性 smoke，不是服务性能对照。
 
 限制：query 强制提交/等待、重复使用缓存驻留权重，不是显存实际流量或五卡 tok/s；Q5_K 在其他 GPU/大矩阵可能反向。默认 TP5 MMVQ 仍禁用；该最终源码尚无五卡同负载服务 ABBA，不能据此宣称五卡净收益或理论/指令级全硬件最优。
+
+## §43 Q8_0 高频图的下界与 Q8_1 激活冗余舍入（2026-09-29）
+
+先于运行时判断，从 §41 归档的五卡 `GGML_VK_PERF_LOGGER` 日志按核标签聚合：**通用** Q8_0 `m=10240,k=320,n=2` 与 `m=320,k=10240,n=2` 各出现 5315 次，`m=4,k=10240,n=2` 出现 5270 次。这是带同步 logger 的累计**核标签次数**，不能直接换算服务时间。`types.glsl` 的 Q8_0 每 32 权重为 2 字节 scale + 32 字节量化值；前两种矩阵各有 `10240×320/32×34 = 3,481,600` 字节，共 6,963,200 字节的**独立权重**，双 token 的 26,214,400 次浮点操作（按乘加各一）对一次逻辑权重读取的强度约 3.76 FLOP/byte。该值既不是物理显存流量也不是实测 roofline：缓存驻留、合并加载和五卡队列仍未知。不同矩阵无跨矩阵权重复用，第二矩阵的激活又依赖第一矩阵输出；不能通过在单一通用 shader 内预加载另一矩阵的权重消除其读取。
+
+Q8_0 共享解包 helper 仍对每列执行必要的整数点积。将现有 `mul_mat_vec_q8_0_q8_1_f32_subgroup_no_shmem.spv` 专门化为 `NUM_ROWS=1,NUM_COLS=2,BLOCK_SIZE=32` 并做 SPIR-V 优化后，可见同一权重 scale/已打包值分别供两个 token 的 dot 使用；没有发现该处另一个可消掉的跨列权重读取。§40 的 Q8 模型尺寸缓存驻留 query：`k=320,m=10240,n=2` helper/逐列约 63.10/63.21 µs；`k=10240,m=320,n=2` 约 39.18/39.57 µs，而 N=4 两种形状方向相反，故不再按 Q8_0 类型整体撤销 helper。这些仍不证明硬件或服务最优。
+
+**可证明的指令冗余在生产端**：`quantize_q8_1.comp` 先令 `vals = round(vals * d_inv)`，随后在写 `i8vec4` 时又算 `round(vals)`。一次舍入后的每个有限分量已为整数，第二次舍入是恒等变换。旧版 x4/subgroup SPIR-V（含 `spirv-opt -O`）实有两条向量 `Round`；只删除第二条，不改缩放、sum、输入/输出布局或同步。新旧 RADV Q8_1 量化管线静态 instructions **90→86**、VALU **56→52**、VGPR **32→32**、无 spill；同图 Q8_0 收缩管线 instructions/VALU **1198/687** 不变。这是编译指令数，不是已测的速度或真实功耗。
+
+强制 MMVQ 在实际形状 `k=320,m=10240,n=2` 与 `k=10240,m=320,n=4` 的新旧 Q8_0 输出逐字节相同；Q5_K 三组、Q6_K 一组与 §42 改动前归档的同输入输出逐字节相同。最终二进制的 Vulkan0 CPU 对照 Q8_0/Q4_K/Q5_K/Q6_K × N=2/3/4 为 12/12 通过，另有四条非受支持 batch case 未计入。五卡当前版本单请求返回 HTTP 200，`pred_n=171`、72/98 draft accepted，内容与 §42 旧版逐字节相同；解码五 rank `late=0,dispatches=4337,barriers=4019,copies=192`，启动和 prefill 仍有 `CRITICAL-FALLBACK`。原始新旧 GPU 数值、RADV 资源、SPIR-V 和最终 HTTP 响应见 `q8-quant-round-proof-20260929.tar.gz`。服务输出相同不是性能资格；未获得同工作量服务 ABBA、真实物理流量或全硬件理论极限证明，TP5 默认 MMVQ 禁用未改。
