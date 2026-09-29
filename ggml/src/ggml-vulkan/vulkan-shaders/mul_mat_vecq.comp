@@ -33,7 +33,12 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
     // NUM_COLS is a specialization constant, not a preprocessor definition.
     // Limit register-resident activation columns to the MTP-sized cases with
     // a dot helper that shares unpacked weights across columns.
+#if defined(DATA_A_Q4_K)
+    // RX 6800 Q4_K 2-3 column cases favor the lower-VGPR per-column path.
+    if (NUM_COLS == 4u) {
+#else
     if (NUM_COLS > 1u && NUM_COLS <= 4u) {
+#endif
     int32_t b_qs_multi[NUM_COLS][K_PER_ITER / 4];
     vec2    b_ds_multi[NUM_COLS];
 
