@@ -597,7 +597,8 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 // DATA_A_*_K macros without any of those parameters, so a guard keyed on the
 // quant type alone selects this code in a context where it cannot compile.
 // MMQ is the discriminator: mul_mat_vecq.comp defines it; the qwen4 path does not.
-#if defined(MMQ) && (defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K))
+// The model's Q5_K mat-vec shapes favor the lower-VGPR per-column path.
+#if defined(MMQ) && defined(DATA_A_Q4_K)
 void mmvq_dot_multi(const uint ib_a, const uint iqs, inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint n,
                     const int32_t b_qs_multi[NUM_COLS][K_PER_ITER / 4], const vec2 b_ds_multi[NUM_COLS]) {
     const i32vec4 qs_a = repack4(ib_a, iqs * 4);
