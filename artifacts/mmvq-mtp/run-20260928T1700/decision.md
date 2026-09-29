@@ -101,3 +101,15 @@ family=qsa-projections  fused=1 mmvq_mask=1  (x5 rank)
 
 **遗留**：多 token 融合要真正启用，必须先让 attention_prep 支持 token 维
 （dispatch 加 token 轴或循环），这是下一个单因素。当前保守版 = 基础设施就位 + 行为零变化。
+
+## §23 主仓同步（2026-09-29）
+
+多 token 融合基础设施已同步主仓 `682236ec1`（三文件 diff=0 逐字节核对）。
+当前状态：
+- **保守激活**：所有 `can_fuse_attention_projections` 调用方传
+  `segment_caller=true`，行为与改动前逐字节一致（R/A 两臂 md5 验证）。
+- **启用条件**（下一单因素）：`qwen4_attention_prep.comp` 加 token 轴
+  （dispatch `{heads, n_tokens, 1}` 或着色器内 token 循环 +
+  `rope_data_pos[token]` + Q/K/V 按 token 索引）。这是让 2 行 verify
+  真正吃到 4-投影单次权重遍历的前提。
+- 候选树同步至 `9b01aabc8`。
