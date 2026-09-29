@@ -280,7 +280,7 @@ float，与 CPU 参照（ggml CPU rope）逐值对照——直接看哪个分量
 - 另对 QSA mask1/GDN mask3 自动混合图 N=1/2/4 比较启用与禁用投影融合：六图均无 NaN/Inf，最大绝对误差 `1.52587890625e-5`，无 GPU 同步或协议失败。
 - 完整五卡 aggressive-q8 `h=1`：默认禁用 MMVQ 的 MD5=`552cd459aa59`，强制 MMVQ（五卡 GDN mask7、QSA mask5）的 MD5=`2576e1cb1a2e`；与 §30 更改前同负载逐字节相同。`h=3`、禁用 MMVQ 的四行图 MD5=`68b2736fa4a9`，同样与 §30 一致。
 
-**结论边界**：本节阶段静态资源压力在 N1 和强制 MMVQ N2 有可观下降，N2 自动混合/F32 的瓶颈转交 §32；未做计时 ABBA，不能称 24 subgroups 已实际驻留或断言端到端加速，更不能断言物理极限已测得。
+**结论边界**：本节阶段静态资源压力在 N1 和强制 MMVQ N2 有可观下降，N2 自动混合/F32 的瓶颈转交 §32；计时资格见 §33，不能称 24 subgroups 已实际驻留或断言物理极限已测得。
 
 ## §32 Q6_K 成对解包的 VGPR 生存期（2026-09-29）
 
@@ -288,4 +288,14 @@ float，与 CPU 参照（ggml CPU rope）逐值对照——直接看哪个分量
 - `RADV_DEBUG=shaderstats,nocache`，QSA/GDN **F32** 容量 1/2/4 的 VGPR 从 §31 的 **64/128/128** 变为 **64/96/96**，编译器 `Subgroups per SIMD` 从 **16/8/8** 到 **16/10/10**；QSA/GDN 混合 mask1/3 N2 从 128 到 96。强制 MMVQ mask5/7 绕开 F32 Q6，原 **40/56/64** 不变；均无 spill。QSA F32 N2 `Instructions` 3879→4019，额外重读激活和编译器调度是相对资源占用的显式代价，未按此数字推断时间。
 - 同一合成四投影输入，与 §31 的快照对拍：QSA/GDN × F32/强制 MMVQ × N=1/2/4，加上混合 mask1/3 × N2，共 14 图，所有输出**逐字节相同**、无 NaN/Inf。五卡 aggressive-q8 实际 MTP `h=1`（禁用 MMVQ）MD5 仍为 `552cd459aa59`，`h=3` 四行仍为 `68b2736fa4a9`，分别接受 59 与 96，未见服务错误。
 
-**取舍**：驱动静态 occupancy 上界提升 8→10 subgroups/SIMD，但激活读取与指令数增加；未做 ABBA 或硬件缓存/实际波前采样，不宣称端到端更快，也不将本方案称为绝对物理上限。
+**取舍**：驱动静态 occupancy 上界提升 8→10 subgroups/SIMD，但激活读取与指令数增加；§33 的 ABBA 不能单独隔离这处变化，且缺硬件缓存/实际波前采样，不宣称本方案端到端更快，也不将其称为绝对物理上限。
+
+## §33 理论审查后的交错镜像资格（2026-09-29）
+
+同一新二进制、五卡、独占 GPU 锁、`RADV_DEBUG=nobolist`、aggressive-q8、`h=1`、禁用上层 attention/gdn-cached segment；A=独立四投影融合，B=只禁用该投影融合。每臂新服务、相同 prompt/seed/温度，`/completion` 返回的 `predicted_per_token_ms`，不含模型加载；原始服务日志 `/var/tmp/tp5-mmvm-seq-*.log`。交错次序 **ABBA / BAAB / ABBA / BAAB**，不是将不同二进制或不同 workload 混算。
+
+- 禁用 MMVQ 的 F32 组：16 臂中第 6 臂 A 的 `pred_n=157`、MD5=`39e053d56624`，其四臂镜像**整组作废**，未拿 157 与 161 比速。剩余三组四臂均 `pred_n=161`、接受59、MD5=`552cd459aa59`、CJK=215、标点=23，且 `barriers=2456/copies=192` 两路一致；A/B 的 `dispatches=2681/2825`。每组 A/B 平均 ms/token：`18.531/18.083`、`19.819/18.159`、`18.266/18.359`，相对差（A 减 B）`+2.47%`、`+9.14%`、`-0.50%`。方向不一致、方差大，**不能从三组判定融合胜负**，更不能用 shaderstats 的静态 occupancy 代替实测加速。
+- 强制 MMVQ 的四臂 ABBA：A 的 MD5=`2576e1cb1a2e`、接受63；B 的 MD5=`dd2877d269ff`、接受64，虽均 `pred_n=171` 且连贯，但 spec 接受和 token 内容不同，**不是工作量一致的吞吐对照**。A/B dispatches=`2883/3027`，barriers=`2706/2658`，copies=192；均无服务错误。不能据其吞吐决定 Q8 融合是否优于分离。
+- 同服务“热机第二请求”即使传 `cache_prompt=false` 仍由 `pred_n=161`、MD5=`552cd459aa59` 变为 `pred_n=171`、MD5=`ebf49ef9d1ca`，该方案也不具有工作量资格。
+
+**决策**：保留当前融合代码和显式 `GGML_VK_DISABLE_ATTENTION_PROJECTIONS` 回退，不根据不合格或方向不稳的短跑改变默认选择。内核正确性已有合成逐值对拍和实际五卡 smoke；性能最优、缓存流量及硬件极限仍未被上述证据证明。
