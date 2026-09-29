@@ -70,81 +70,121 @@ vec2 cache_b_ds;
 #undef mmvq_dot_product
 #undef DATA_A_Q6_K
 
-void qwen_mmvq_iter(uint matrix, uint first_row, uint num_rows, uint col,
-                     const uint token,
-                    inout float a[NUM_ROWS_QUANT], inout float b[NUM_ROWS_QUANT]) {
-        const uint ib = col / 32u;
-        const uint half_block = (col % 32u) / 16u;
-        const uint tok_ib = token * (p.width / 32u) + ib;
-        cache_b_ds = vec2(common_q8[tok_ib / 4u].ds[tok_ib % 4u]);
+void qwen_mmvq_iter_multi(uint matrix, uint first_row, uint num_rows, uint col,
+                          inout float a[4][NUM_ROWS_QUANT], inout float b[4][NUM_ROWS_QUANT]) {
+    const uint ib = col / 32u;
+    const uint half_block = (col % 32u) / 16u;
+
+    // 1. Preload multi-token activations into registers (single read pass, zero duplication)
+    int32_t act_qs[4][4];
+    vec2    act_ds[4];
+    [[unroll]] for (uint t = 0u; t < p.n_tokens; ++t) {
+        const uint tok_ib = t * (p.width / 32u) + ib;
+        act_ds[t] = vec2(common_q8[tok_ib / 4u].ds[tok_ib % 4u]);
         [[unroll]] for (uint q = 0u; q < 4u; ++q) {
-            cache_b_qs[q] = common_q8[tok_ib / 4u].qs[(tok_ib % 4u) * 8u + half_block * 4u + q];
+            act_qs[t][q] = common_q8[tok_ib / 4u].qs[(tok_ib % 4u) * 8u + half_block * 4u + q];
         }
-        [[unroll]] for (uint r = 0u; r < num_rows; ++r) {
-            const uint weight_block = ((first_row + r) * p.width + col) / 32u;
-            if (matrix == 2u) {
-                a[r] += qwen_q6_a_dot(weight_block, half_block);
-                b[r] += qwen_q6_b_dot(weight_block, half_block);
-            } else if (matrix == 0u) {
-                a[r] += qwen_q5_0_dot(weight_block, half_block);
+    }
+
+    // 2. Weights unpacked ONCE per matrix row and broadcast across all tokens simultaneously
+    [[unroll]] for (uint r = 0u; r < num_rows; ++r) {
+        const uint weight_block = ((first_row + r) * p.width + col) / 32u;
+        if (matrix == 2u) {
+            const i32vec4 qs_a = qwen_q6_a_repack4(weight_block, half_block * 4u);
+            const float d_scale_a = qwen_q6_a_d_scale(weight_block, half_block * 4u);
+            const i32vec4 qs_b = qwen_q6_b_repack4(weight_block, half_block * 4u);
+            const float d_scale_b = qwen_q6_b_d_scale(weight_block, half_block * 4u);
+
+            [[unroll]] for (uint t = 0u; t < p.n_tokens; ++t) {
+                int32_t sum_a = dotPacked4x8EXT(qs_a.x, act_qs[t][0]) +
+                                dotPacked4x8EXT(qs_a.y, act_qs[t][1]) +
+                                dotPacked4x8EXT(qs_a.z, act_qs[t][2]) +
+                                dotPacked4x8EXT(qs_a.w, act_qs[t][3]);
+                a[t][r] += float(act_ds[t].x) * d_scale_a * float(sum_a);
+
+                int32_t sum_b = dotPacked4x8EXT(qs_b.x, act_qs[t][0]) +
+                                dotPacked4x8EXT(qs_b.y, act_qs[t][1]) +
+                                dotPacked4x8EXT(qs_b.z, act_qs[t][2]) +
+                                dotPacked4x8EXT(qs_b.w, act_qs[t][3]);
+                b[t][r] += float(act_ds[t].x) * d_scale_b * float(sum_b);
             }
+        } else if (matrix == 0u) {
+            const i32vec4 qs_0 = qwen_q5_0_repack4(weight_block, half_block * 4u);
+            const vec2 dm_scale = qwen_q5_0_dm_scale(weight_block, half_block * 4u);
+
+            [[unroll]] for (uint t = 0u; t < p.n_tokens; ++t) {
+                int32_t sum_0 = dotPacked4x8EXT(qs_0.x, act_qs[t][0]) +
+                                dotPacked4x8EXT(qs_0.y, act_qs[t][1]) +
+                                dotPacked4x8EXT(qs_0.z, act_qs[t][2]) +
+                                dotPacked4x8EXT(qs_0.w, act_qs[t][3]);
+                a[t][r] += float(act_ds[t].x) * dm_scale.x * float(sum_0) - dm_scale.y * float(act_ds[t].y / 2.0);
+            }
+        }
 #ifdef GDN_PROJECTIONS
-            else {
-                a[r] += qwen_q5_1_dot(weight_block, half_block);
+        else {
+            const i32vec4 qs_1 = qwen_q5_1_repack4(weight_block, half_block * 4u);
+            const vec2 dm_scale = qwen_q5_1_dm_scale(weight_block, half_block * 4u);
+
+            [[unroll]] for (uint t = 0u; t < p.n_tokens; ++t) {
+                int32_t sum_1 = dotPacked4x8EXT(qs_1.x, act_qs[t][0]) +
+                                dotPacked4x8EXT(qs_1.y, act_qs[t][1]) +
+                                dotPacked4x8EXT(qs_1.z, act_qs[t][2]) +
+                                dotPacked4x8EXT(qs_1.w, act_qs[t][3]);
+                a[t][r] += float(act_ds[t].x) * dm_scale.x * float(sum_1) - dm_scale.y * float(act_ds[t].y / 2.0);
             }
-#endif
         }
+#endif
+    }
 }
 
-// matrix=0/1: one Q5 matrix; matrix=2: the paired Q6 matrices. The
-// workgroup/row distribution and all surrounding graph fusion stay unchanged.
 void qwen_compute_mmvq(uint matrix, uint first_row, uint num_rows, uint tid) {
-    for (uint token = 0u; token < p.n_tokens; ++token) {
-    float a[NUM_ROWS_QUANT];
-    float b[NUM_ROWS_QUANT];
-    [[unroll]] for (uint r = 0u; r < NUM_ROWS_QUANT; ++r) {
-        a[r] = 0.0;
-        b[r] = 0.0;
+    float a[4][NUM_ROWS_QUANT];
+    float b[4][NUM_ROWS_QUANT];
+    [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+        [[unroll]] for (uint r = 0u; r < NUM_ROWS_QUANT; ++r) {
+            a[t][r] = 0.0;
+            b[t][r] = 0.0;
+        }
     }
-    // Match the built-in MMVQ 4/2/1 K-loop, including each lane's tail.
-    // This is finite arithmetic iteration, not a synchronization spin.
+
     const uint stride = 16u * BLOCK_SIZE;
     uint col = 16u * tid;
     uint remaining = p.width / stride;
     if (remaining * stride + col < p.width) ++remaining;
     for (; remaining >= 4u; remaining -= 4u) {
         [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-            qwen_mmvq_iter(matrix, first_row, num_rows, col, token, a, b);
+            qwen_mmvq_iter_multi(matrix, first_row, num_rows, col, a, b);
             col += stride;
         }
     }
     if (remaining >= 2u) {
-        qwen_mmvq_iter(matrix, first_row, num_rows, col, token, a, b);
+        qwen_mmvq_iter_multi(matrix, first_row, num_rows, col, a, b);
         col += stride;
-        qwen_mmvq_iter(matrix, first_row, num_rows, col, token, a, b);
+        qwen_mmvq_iter_multi(matrix, first_row, num_rows, col, a, b);
         col += stride;
         remaining -= 2u;
     }
-    if (remaining != 0u) qwen_mmvq_iter(matrix, first_row, num_rows, col, token, a, b);
-    [[unroll]] for (uint r = 0u; r < num_rows; ++r) {
-        a[r] = subgroupAdd(a[r]);
-        b[r] = subgroupAdd(b[r]);
-    }
-    // Pipeline creation requires one full subgroup per workgroup.
-    if (tid == 0u) {
+    if (remaining != 0u) qwen_mmvq_iter_multi(matrix, first_row, num_rows, col, a, b);
+
+    [[unroll]] for (uint t = 0u; t < p.n_tokens; ++t) {
         [[unroll]] for (uint r = 0u; r < num_rows; ++r) {
-            if (matrix == 2u) {
-                OUT_Q6_A[token * OUT_Q6_A_STRIDE + first_row + r] = a[r];
-                OUT_Q6_B[token * OUT_Q6_B_STRIDE + first_row + r] = b[r];
-            } else if (matrix == 0u) {
-                out0[token * p.rows0 + first_row + r] = a[r];
-            }
-#ifdef GDN_PROJECTIONS
-            else {
-                out1[token * p.rows1 + first_row + r] = a[r];
-            }
-#endif
+            a[t][r] = subgroupAdd(a[t][r]);
+            b[t][r] = subgroupAdd(b[t][r]);
         }
-    }
+        if (tid == 0u) {
+            [[unroll]] for (uint r = 0u; r < num_rows; ++r) {
+                if (matrix == 2u) {
+                    OUT_Q6_A[t * OUT_Q6_A_STRIDE + first_row + r] = a[t][r];
+                    OUT_Q6_B[t * OUT_Q6_B_STRIDE + first_row + r] = b[t][r];
+                } else if (matrix == 0u) {
+                    out0[t * p.rows0 + first_row + r] = a[t][r];
+                }
+#ifdef GDN_PROJECTIONS
+                else {
+                    out1[t * p.rows1 + first_row + r] = a[t][r];
+                }
+#endif
+            }
+        }
     }
 }
