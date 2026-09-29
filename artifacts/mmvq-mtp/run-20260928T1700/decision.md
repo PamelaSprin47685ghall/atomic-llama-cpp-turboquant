@@ -272,7 +272,7 @@ float，与 CPU 参照（ggml CPU rope）逐值对照——直接看哪个分量
 - Vulkan0/RX 6800，`RADV_DEBUG=shaderstats,nocache`，2560×32 四投影小图，`n_tokens=1` 与 4 旧版都复用同一管线 hash：QSA 强制 MMVQ `VGPRs=64`、`Subgroups per SIMD=16`，GDN 同为 64；QSA F32 为 `VGPRs=128`、`Subgroups per SIMD=8`。没有 VGPR spill。这是驱动编译统计，**不是**实际波前占用率或吞吐率。
 - 新增 `MAX_TOKENS` 专门化常量 ID3，MMVQ mask 移至 ID4；容量为 1/2/4，`ggml_vk_attention_projections` 为请求行数选择最小足够容量，缺管线仅能向更大容量回退。Q5/Q6/BF16 与 MMVQ 数组、token1 分支和 token2+ 回退以容量限定；push constants 和十个描述符不变。独立融合守卫也按实际行数验证管线容量。
 - RADV 编译结果：QSA/GDN **强制 MMVQ** 容量 1/2/4 的 VGPR 为 **40/56/64**，编译器上界 `Subgroups per SIMD` 为 **24/18/16**，均无 spill；QSA/GDN **F32** 为 **64/128/128**，对应 **16/8/8**。QSA N1 MMVQ 指令数 8422→7442，分支数 391→119；这些指令统计不等同于应用加速。
-- 默认 TP5 recipe 的五卡服务器打印 `mode=disabled`，所以不能把五卡“未强制”试验称为混合 auto MMVQ；单独 Vulkan 图在不设 FORCE/DISABLE 时，确实命中 QSA mask1/GDN mask3，其 N1/N2/N4 的 VGPR 为 **64/128/128**。N2 的 F32 Q6 成对解包仍占 128 VGPR；拆开 alpha/beta 可减小同时生存的权重，但会重读激活或加工作组，静态统计无法证明净吞吐收益，未冒险变更。
+- 默认 TP5 recipe 的五卡服务器打印 `mode=disabled`，所以不能把五卡“未强制”试验称为混合 auto MMVQ；单独 Vulkan 图在不设 FORCE/DISABLE 时，确实命中 QSA mask1/GDN mask3，**本节阶段**其 N1/N2/N4 的 VGPR 为 **64/128/128**。N2 F32 Q6 成对解包寄存器瓶颈在 §32 继续处理。
 
 ### 容量映射数值回归
 
@@ -280,4 +280,12 @@ float，与 CPU 参照（ggml CPU rope）逐值对照——直接看哪个分量
 - 另对 QSA mask1/GDN mask3 自动混合图 N=1/2/4 比较启用与禁用投影融合：六图均无 NaN/Inf，最大绝对误差 `1.52587890625e-5`，无 GPU 同步或协议失败。
 - 完整五卡 aggressive-q8 `h=1`：默认禁用 MMVQ 的 MD5=`552cd459aa59`，强制 MMVQ（五卡 GDN mask7、QSA mask5）的 MD5=`2576e1cb1a2e`；与 §30 更改前同负载逐字节相同。`h=3`、禁用 MMVQ 的四行图 MD5=`68b2736fa4a9`，同样与 §30 一致。
 
-**结论边界**：静态资源压力在 N1 和强制 MMVQ N2 有可观下降，N2 自动混合/F32 的瓶颈尚在；未做计时 ABBA，不能称 24 subgroups 已实际驻留或断言端到端加速，更不能断言物理极限已测得。
+**结论边界**：本节阶段静态资源压力在 N1 和强制 MMVQ N2 有可观下降，N2 自动混合/F32 的瓶颈转交 §32；未做计时 ABBA，不能称 24 subgroups 已实际驻留或断言端到端加速，更不能断言物理极限已测得。
+
+## §32 Q6_K 成对解包的 VGPR 生存期（2026-09-29）
+
+- 原 `calc_superblock_paired_q6_k` 同时持有 alpha/beta 两组 Q6 权重（每组四个 `vec4`），跨 Token 0/1/2–3 计算均存活。候选代码改为完成 A 对所有 token 的累加后才解包 B，再完成 B 的累加；两组权重仍各读取、解包一次，单一工作组、单一 dispatch，B 侧激活从缓冲区再次读取。每个输出矩阵的浮点累加顺序不变；L1/VRAM 流量增加多少不能仅从代码推断。
+- `RADV_DEBUG=shaderstats,nocache`，QSA/GDN **F32** 容量 1/2/4 的 VGPR 从 §31 的 **64/128/128** 变为 **64/96/96**，编译器 `Subgroups per SIMD` 从 **16/8/8** 到 **16/10/10**；QSA/GDN 混合 mask1/3 N2 从 128 到 96。强制 MMVQ mask5/7 绕开 F32 Q6，原 **40/56/64** 不变；均无 spill。QSA F32 N2 `Instructions` 3879→4019，额外重读激活和编译器调度是相对资源占用的显式代价，未按此数字推断时间。
+- 同一合成四投影输入，与 §31 的快照对拍：QSA/GDN × F32/强制 MMVQ × N=1/2/4，加上混合 mask1/3 × N2，共 14 图，所有输出**逐字节相同**、无 NaN/Inf。五卡 aggressive-q8 实际 MTP `h=1`（禁用 MMVQ）MD5 仍为 `552cd459aa59`，`h=3` 四行仍为 `68b2736fa4a9`，分别接受 59 与 96，未见服务错误。
+
+**取舍**：驱动静态 occupancy 上界提升 8→10 subgroups/SIMD，但激活读取与指令数增加；未做 ABBA 或硬件缓存/实际波前采样，不宣称端到端更快，也不将本方案称为绝对物理上限。

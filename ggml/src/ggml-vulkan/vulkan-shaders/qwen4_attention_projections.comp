@@ -484,34 +484,6 @@ void calc_superblock_paired_q6_k(const uint  itid,
         const vec4 q2_a = vec4(unpack8(q2_a_u32)) - 32.0;
         const vec4 q3_a = vec4(unpack8(q3_a_u32)) - 32.0;
 
-        // Dequantize matrix B weights
-        const uint32_t ql0_b_u32 = uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u]) |
-                                   (uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u + 1u]) << 16);
-        const uint32_t ql32_b_u32 = uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u + 16u]) |
-                                    (uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u + 17u]) << 16);
-
-        const uint32_t ql0_b_u32_lo4  = ql0_b_u32 & 0x0F0F0F0Fu;
-        const uint32_t ql0_b_u32_hi4  = (ql0_b_u32 >> 4) & 0x0F0F0F0Fu;
-        const uint32_t ql32_b_u32_lo4 = ql32_b_u32 & 0x0F0F0F0Fu;
-        const uint32_t ql32_b_u32_hi4 = (ql32_b_u32 >> 4) & 0x0F0F0F0Fu;
-
-        const uint32_t qh_b_u32 = uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].qh[qh_offset / 2u]) |
-                                  (uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].qh[qh_offset / 2u + 1u]) << 16);
-        const uint32_t qh0_b_u32 = (qh_b_u32 & 0x03030303u) << 4;
-        const uint32_t qh2_b_u32 = (qh_b_u32 & 0x0C0C0C0Cu) << 2;
-        const uint32_t qh4_b_u32 = (qh_b_u32 & 0x30303030u);
-        const uint32_t qh6_b_u32 = (qh_b_u32 & 0xC0C0C0C0u) >> 2;
-
-        const uint32_t q0_b_u32 = ql0_b_u32_lo4 | qh0_b_u32;
-        const uint32_t q1_b_u32 = ql32_b_u32_lo4 | qh2_b_u32;
-        const uint32_t q2_b_u32 = ql0_b_u32_hi4 | qh4_b_u32;
-        const uint32_t q3_b_u32 = ql32_b_u32_hi4 | qh6_b_u32;
-
-        const vec4 q0_b = vec4(unpack8(q0_b_u32)) - 32.0;
-        const vec4 q1_b = vec4(unpack8(q1_b_u32)) - 32.0;
-        const vec4 q2_b = vec4(unpack8(q2_b_u32)) - 32.0;
-        const vec4 q3_b = vec4(unpack8(q3_b_u32)) - 32.0;
-
         if (all_threads) {
             sccache_a[csel][ix][itid] = float(WEIGHTS_Q6_A[ib0 + i].scales[itid]);
             sccache_b[csel][ix][itid] = float(WEIGHTS_Q6_B[ib0 + i].scales[itid]);
@@ -519,7 +491,6 @@ void calc_superblock_paired_q6_k(const uint  itid,
         }
 
         const float d_a = float(WEIGHTS_Q6_A[ib0 + i].d);
-        const float d_b = float(WEIGHTS_Q6_B[ib0 + i].d);
 
         // Paired Q6_K weights dequantized once per row; broadcast to all tokens
         // Straight-line pipelined token accumulation for paired Q6_K
@@ -542,19 +513,6 @@ void calc_superblock_paired_q6_k(const uint  itid,
                     fma(sum_a[1], sccache_a[csel][ix][s_offset + 2u],
                         fma(sum_a[2], sccache_a[csel][ix][s_offset + 4u], sum_a[3] * sccache_a[csel][ix][s_offset + 6u]))),
                 d_a, temp_a[0][n]);
-
-            float sum_b[4] = { 0.0, 0.0, 0.0, 0.0 };
-            [[unroll]] for (uint l = 0u; l < 4u; ++l) {
-                sum_b[0] = fma(by0[l], q0_b[l], sum_b[0]);
-                sum_b[1] = fma(by32[l], q1_b[l], sum_b[1]);
-                sum_b[2] = fma(by64[l], q2_b[l], sum_b[2]);
-                sum_b[3] = fma(by96[l], q3_b[l], sum_b[3]);
-            }
-            temp_b[0][n] = fma(
-                fma(sum_b[0], sccache_b[csel][ix][s_offset],
-                    fma(sum_b[1], sccache_b[csel][ix][s_offset + 2u],
-                        fma(sum_b[2], sccache_b[csel][ix][s_offset + 4u], sum_b[3] * sccache_b[csel][ix][s_offset + 6u]))),
-                d_b, temp_b[0][n]);
         }
 
         if (MAX_TOKENS > 1u && p.n_tokens > 1u) {
@@ -577,19 +535,6 @@ void calc_superblock_paired_q6_k(const uint  itid,
                         fma(sum_a[2], sccache_a[csel][ix][s_offset + 4u], sum_a[3] * sccache_a[csel][ix][s_offset + 6u]))),
                 d_a, temp_a[1][n]);
 
-            float sum_b[4] = { 0.0, 0.0, 0.0, 0.0 };
-            [[unroll]] for (uint l = 0u; l < 4u; ++l) {
-                sum_b[0] = fma(by0[l], q0_b[l], sum_b[0]);
-                sum_b[1] = fma(by32[l], q1_b[l], sum_b[1]);
-                sum_b[2] = fma(by64[l], q2_b[l], sum_b[2]);
-                sum_b[3] = fma(by96[l], q3_b[l], sum_b[3]);
-            }
-            temp_b[1][n] = fma(
-                fma(sum_b[0], sccache_b[csel][ix][s_offset],
-                    fma(sum_b[1], sccache_b[csel][ix][s_offset + 2u],
-                        fma(sum_b[2], sccache_b[csel][ix][s_offset + 4u], sum_b[3] * sccache_b[csel][ix][s_offset + 6u]))),
-                d_b, temp_b[1][n]);
-
             for (uint token = 2u; token < min(p.n_tokens, MAX_TOKENS); ++token) {
                 const uint y_idx = token * p.width + i * 256u + y_offset;
                 const vec4 by0t  = common_input_v4[y_idx / 4u];
@@ -609,7 +554,82 @@ void calc_superblock_paired_q6_k(const uint  itid,
                         fma(sum_at[1], sccache_a[csel][ix][s_offset + 2u],
                             fma(sum_at[2], sccache_a[csel][ix][s_offset + 4u], sum_at[3] * sccache_a[csel][ix][s_offset + 6u]))),
                     d_a, temp_a[token][n]);
+            }
+        }
 
+        // Decode the second matrix only after the first matrix's weights are dead.
+        const uint32_t ql0_b_u32 = uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u]) |
+                                   (uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u + 1u]) << 16);
+        const uint32_t ql32_b_u32 = uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u + 16u]) |
+                                    (uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u + 17u]) << 16);
+        const uint32_t ql0_b_u32_lo4  = ql0_b_u32 & 0x0F0F0F0Fu;
+        const uint32_t ql0_b_u32_hi4  = (ql0_b_u32 >> 4) & 0x0F0F0F0Fu;
+        const uint32_t ql32_b_u32_lo4 = ql32_b_u32 & 0x0F0F0F0Fu;
+        const uint32_t ql32_b_u32_hi4 = (ql32_b_u32 >> 4) & 0x0F0F0F0Fu;
+
+        const uint32_t qh_b_u32 = uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].qh[qh_offset / 2u]) |
+                                  (uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].qh[qh_offset / 2u + 1u]) << 16);
+        const uint32_t qh0_b_u32 = (qh_b_u32 & 0x03030303u) << 4;
+        const uint32_t qh2_b_u32 = (qh_b_u32 & 0x0C0C0C0Cu) << 2;
+        const uint32_t qh4_b_u32 = (qh_b_u32 & 0x30303030u);
+        const uint32_t qh6_b_u32 = (qh_b_u32 & 0xC0C0C0C0u) >> 2;
+
+        const uint32_t q0_b_u32 = ql0_b_u32_lo4 | qh0_b_u32;
+        const uint32_t q1_b_u32 = ql32_b_u32_lo4 | qh2_b_u32;
+        const uint32_t q2_b_u32 = ql0_b_u32_hi4 | qh4_b_u32;
+        const uint32_t q3_b_u32 = ql32_b_u32_hi4 | qh6_b_u32;
+
+        const vec4 q0_b = vec4(unpack8(q0_b_u32)) - 32.0;
+        const vec4 q1_b = vec4(unpack8(q1_b_u32)) - 32.0;
+        const vec4 q2_b = vec4(unpack8(q2_b_u32)) - 32.0;
+        const vec4 q3_b = vec4(unpack8(q3_b_u32)) - 32.0;
+        const float d_b = float(WEIGHTS_Q6_B[ib0 + i].d);
+
+        {
+            const uint y_idx0 = i * 256u + y_offset;
+            const vec4 by0  = common_input_v4[y_idx0 / 4u];
+            const vec4 by32 = common_input_v4[y_idx0 / 4u + 8u];
+            const vec4 by64 = common_input_v4[y_idx0 / 4u + 16u];
+            const vec4 by96 = common_input_v4[y_idx0 / 4u + 24u];
+            float sum_b[4] = { 0.0, 0.0, 0.0, 0.0 };
+            [[unroll]] for (uint l = 0u; l < 4u; ++l) {
+                sum_b[0] = fma(by0[l], q0_b[l], sum_b[0]);
+                sum_b[1] = fma(by32[l], q1_b[l], sum_b[1]);
+                sum_b[2] = fma(by64[l], q2_b[l], sum_b[2]);
+                sum_b[3] = fma(by96[l], q3_b[l], sum_b[3]);
+            }
+            temp_b[0][n] = fma(
+                fma(sum_b[0], sccache_b[csel][ix][s_offset],
+                    fma(sum_b[1], sccache_b[csel][ix][s_offset + 2u],
+                        fma(sum_b[2], sccache_b[csel][ix][s_offset + 4u], sum_b[3] * sccache_b[csel][ix][s_offset + 6u]))),
+                d_b, temp_b[0][n]);
+        }
+
+        if (MAX_TOKENS > 1u && p.n_tokens > 1u) {
+            const uint y_idx1 = p.width + i * 256u + y_offset;
+            const vec4 by0  = common_input_v4[y_idx1 / 4u];
+            const vec4 by32 = common_input_v4[y_idx1 / 4u + 8u];
+            const vec4 by64 = common_input_v4[y_idx1 / 4u + 16u];
+            const vec4 by96 = common_input_v4[y_idx1 / 4u + 24u];
+            float sum_b[4] = { 0.0, 0.0, 0.0, 0.0 };
+            [[unroll]] for (uint l = 0u; l < 4u; ++l) {
+                sum_b[0] = fma(by0[l], q0_b[l], sum_b[0]);
+                sum_b[1] = fma(by32[l], q1_b[l], sum_b[1]);
+                sum_b[2] = fma(by64[l], q2_b[l], sum_b[2]);
+                sum_b[3] = fma(by96[l], q3_b[l], sum_b[3]);
+            }
+            temp_b[1][n] = fma(
+                fma(sum_b[0], sccache_b[csel][ix][s_offset],
+                    fma(sum_b[1], sccache_b[csel][ix][s_offset + 2u],
+                        fma(sum_b[2], sccache_b[csel][ix][s_offset + 4u], sum_b[3] * sccache_b[csel][ix][s_offset + 6u]))),
+                d_b, temp_b[1][n]);
+
+            for (uint token = 2u; token < min(p.n_tokens, MAX_TOKENS); ++token) {
+                const uint y_idx = token * p.width + i * 256u + y_offset;
+                const vec4 by0t  = common_input_v4[y_idx / 4u];
+                const vec4 by32t = common_input_v4[y_idx / 4u + 8u];
+                const vec4 by64t = common_input_v4[y_idx / 4u + 16u];
+                const vec4 by96t = common_input_v4[y_idx / 4u + 24u];
                 float sum_bt[4] = { 0.0, 0.0, 0.0, 0.0 };
                 [[unroll]] for (uint l = 0u; l < 4u; ++l) {
                     sum_bt[0] = fma(by0t[l], q0_b[l], sum_bt[0]);
