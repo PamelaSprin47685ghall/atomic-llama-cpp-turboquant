@@ -355,3 +355,17 @@ Vulkan0、四连续投影、width=2560、Q5[0] rows=4096、GDN Q5[1] rows=4096�
 **资格边界**：64 次重复使权重缓存驻留，查询器强制提交/等待、关闭 replay；数值仅证明这些图的 GPU 执行时间，不代表 97 层 TP5 队列、五卡同步、模型权重换页或服务 tok/s。§36 的 shuffle 数值/静态记录仍属历史实验，不能称当前实现或将 shuffle 编译开销减少直接写成端到端收益。通用多列 MMVQ 的五卡净收益仍未测定。
 
 恢复后重新构建 `bin/llama-server`、`bin/test-vulkan-command-replay`：后者 `--attention-projections-only` 通过 F32 逐字节和 MMVQ 容差对照；最终着色器在宽 2816、N=1..4 的 QSA/GDN 八组以及宽 2560、N=4 的大图两组与分离路径逐字节一致。五张 RX 6800 上以 `--tp5 qwen4exp-af -md ... --spec-type draft-mtp --tp5-latebind off` 单次请求 smoke：HTTP 200，`pred_n=160`、70/89 draft accepted，CJK=241、distinct ratio=0.701、标点=19；账本五 rank `late=0`，解码时 chain 锁定并复用 88 图。启动与 prefill 曾记录 `CRITICAL-FALLBACK`，不能写成全程无回退；这一次 53.80 tok/s 未交错、且 `pred_n`/接受率不匹配旧跑，不足以判断五卡净性能。
+
+## §39 通用 MMVQ 多列 helper 的静态与 query 对照（2026-09-29）
+
+在候选树临时禁用 `HAS_MMVQ_DOT_MULTI` 分支，以先前不可达的逐列路径作 A、当前 2–4 列共享权重路径作 B；已恢复候选源码与主仓一致。`GGML_VK_FORCE_MMVQ=1` 下的单个矩阵收缩，Q5_K/Q6_K、`m=4096,k=2560,n=2/3/4`，固定量化权重与 F32 激活，A/B 六组输出**逐字节一致**，且日志确实走 `MUL_MAT_VEC q5_K/q6_K`。容量 4 的 RADV 静态指标（**helper / 逐列**）分别为 Q5_K VGPR=56/40、instructions=2818/4305，Q6_K VGPR=56/40、instructions=2929/4716；均无 spill。helper 减少重复解包指令却延长跨列寄存器生存期，静态 subgroups/SIMD=18/24；二者都不直接证明实际占用或运行时间。
+
+同 GPU 独占、同图同数据及 `env -i` + `RADV_DEBUG=nobolist`，各臂 65 个 GPU query 丢首个；查询器强制同步、关闭 replay。余 64 次中位数 µs（**helper B / 逐列 A**）：
+
+|列数|Q5_K|Q6_K|
+|---|---:|---:|
+|N=4：B–A–A–B|86.82、86.84 / 88.60、88.56|87.68、87.74 / 89.10、88.46|
+|N=3：各单臂|78.08 / 77.98|78.68 / 77.92|
+|N=2：B–A–B|67.04、67.52 / 66.60|69.56、69.44 / 68.56|
+
+逐次原始 query 保存在 `generic-mmvq-multicol-query-20260929.tar.gz`。该重复小图的 N=4 改善约 0.7–1.8 µs，N=2/3 的方向相反或接近噪声；不能仅凭指令降幅断言更快，也不能拿 1 µs 的缓存驻留单卡差值推翻其他量化类型共用的 2–4 列门控。保持当前 helper 与阈值，TP5 默认仍禁用 MMVQ。未验证真实五卡 MMVQ 净吞吐、接受率/输出等价或理论全硬件最优；需要同 `pred_n`、接受率和账本条件的服务 ABBA 才能做相应结论。
