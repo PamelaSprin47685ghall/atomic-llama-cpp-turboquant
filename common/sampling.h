@@ -142,6 +142,9 @@ bool common_sampler_is_greedy_argmax_eligible(const struct common_sampler * gsmp
 // row; RNG stream kept bit-identical). Opt-in; never enable for ineligible
 // chains.
 void common_sampler_set_verify_argmax_host(struct common_sampler * gsmpl, bool enabled);
+// Caller must prove common_sampler_is_greedy_argmax_eligible and require no
+// probability output. Ties/non-finite rows still use the ordinary chain.
+bool common_sampler_set_greedy_unique_host(struct common_sampler * gsmpl, bool enabled);
 
 // helpers
 

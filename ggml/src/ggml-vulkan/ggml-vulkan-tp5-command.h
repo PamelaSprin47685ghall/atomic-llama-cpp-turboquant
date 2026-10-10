@@ -8,6 +8,7 @@
 #include "ggml-vulkan-tp5-coverage.h"
 #include <vulkan/vulkan_core.h>
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -19,6 +20,7 @@ struct vk_tp5_command_tape {
     struct instruction {
         kind type;
         std::function<void(VkCommandBuffer)> record;
+        bool compute_dependency=false;
     };
     std::vector<instruction> code;
     std::vector<VkCommandBuffer> sources;
@@ -66,6 +68,9 @@ struct vk_tp5_graph_program {
     std::vector<ggml_predefined_dispatch> predefined_dispatches;
     size_t predefined_classified_dispatches = 0;
     bool predefined_complete = false;
+    // When token/output capacities coincide, an unannotated row axis cannot
+    // distinguish unequal live extents. Reject that frame before submission.
+    bool predefined_equal_row_extents = false;
     // Semantic coverage record across 5 categories: fixed_compute, dynamic_compute,
     // data_movement, state_writes, and dependency_boundaries.
     // predefined_complete is true iff all 5 categories are fixed_safe or dynamic_safe
@@ -106,9 +111,15 @@ inline void vk_tp5_register_source(VkCommandBuffer cmd) {
             tape->sources.push_back(cmd);
     }
 }
+
 inline vk_tp5_command_tape * vk_tp5_capture_for(VkCommandBuffer cmd) {
     auto * tape = vk_tp5_active_tape();
     if (tape && std::find(tape->sources.begin(), tape->sources.end(), cmd) == tape->sources.end()) {
+        fprintf(stderr, "[tp5-tape-reject] cmd=%p sources=%zu first=%p\n",
+                (void *) cmd, tape->sources.size(),
+                tape->sources.empty() ? nullptr : (void *) tape->sources.front());
+        fprintf(stderr, "[tp5-tape-reject-caller] ret=%p\n",
+                __builtin_return_address(0));
         tape->reject("command on an unregistered/transfer CB during graph definition");
         return nullptr;
     }
@@ -171,7 +182,8 @@ inline void tp5_cmd_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src, VkPip
         t->code.push_back({vk_tp5_command_tape::kind::barrier, [=](VkCommandBuffer out) {
             vkCmdPipelineBarrier(out, src, dst, flags, (uint32_t) m.size(), m.data(),
                                  (uint32_t) b.size(), b.data(), (uint32_t) i.size(), i.data());
-        }});
+        }, bool((src&(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))&&
+                (dst&(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)))});
     }
 }
 inline void tp5_cmd_copy(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst,

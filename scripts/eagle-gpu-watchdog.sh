@@ -41,13 +41,20 @@ declare -A BDF_TO_CARD=(
 
 RESET_SCRIPT="/usr/local/bin/gpu-hard-unlock.sh"
 INCIDENT_DIR="/var/log/gpu-incidents"
+EARLY_REBOOT_FILE="/var/lib/eagle-gpu-watchdog/last-early-reboot"
 LOG_TAG="eagle-gpu-watchdog"
 POLL_INTERVAL=5
 COOLDOWN_SECONDS=60
 HELPER_TIMEOUT=120
 AUTO_RESET_GRACE=90
 FAILED_RESET_GRACE=30
+EARLY_REBOOT_COOLDOWN=86400
 CLOCK_RETRY_WINDOW=60
+
+# Clock policy reactions are driven by GPU log events only, and every write is rate limited:
+# a burst of driver messages must not turn into a burst of sysfs writes, and a card that is
+# already in the pinned state must not be written to at all (see clock_pin_is_correct).
+CLOCK_PIN_COOLDOWN="${CLOCK_PIN_COOLDOWN:-60}"
 
 # CLI flags
 ONCE=0
@@ -183,7 +190,10 @@ scan_kernel_errors() {
     local filtered_logs
     # "GPU reset succeeded, trying to resume" is intermediate, not a usable
     # device. Only the final "GPU reset(N) succeeded!" closes an incident.
-    filtered_logs=$(printf '%s\n' "$raw_logs" | grep -iE "amdgpu.*(ring.*timeout|\[drm:amdgpu_job_timedout\]|reset failed|GPU reset\([0-9]+\) succeeded|Failed to initialize parser)" || true)
+    # Keep unattributed error timestamps in the cursor without treating normal
+    # topology/initialization messages as hardware incidents. Never dispatch
+    # recovery or clock writes unless the line maps to exactly one known BDF.
+    filtered_logs=$(printf '%s\n' "$raw_logs" | grep -iE 'amdgpu' | grep -iE '([0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]|timeout|fail|error|fault|hang|lost from bus' || true)
     [ -z "$filtered_logs" ] && return 0
 
     while IFS= read -r line; do
@@ -227,11 +237,15 @@ scan_kernel_errors() {
         fi
 
         if [ -n "$matched_card" ]; then
-            local kind=timeout
-            if [[ "$line" =~ [Rr]eset[[:space:]]+failed ]]; then
+            local kind=gpu_log
+            if [[ "$line" == *"device lost from bus!"* ]]; then
+                kind=bus_lost
+            elif [[ "$line" =~ [Rr]eset[[:space:]]+failed|GPU[[:space:]]Recovery[[:space:]]Failed|GPU[[:space:]]reset[[:space:]]end[[:space:]]with[[:space:]]ret[[:space:]]=[[:space:]]*-[0-9]+ ]]; then
                 kind=failure
             elif [[ "$line" =~ GPU[[:space:]]reset\([0-9]+\)[[:space:]]+succeeded ]]; then
                 kind=success
+            elif [[ "$line" =~ ring.*timeout|[Rr]ing.*[Tt]imed[[:space:]]out|amdgpu_job_timedout|[Ww]edged|GPU[[:space:]]reset[[:space:]]begin|Failed[[:space:]]to[[:space:]]initialize[[:space:]]parser ]]; then
+                kind=timeout
             fi
             echo "$matched_card|$norm_bdf|$line_ts|$kind|$line"
         else
@@ -281,6 +295,7 @@ recover_card() {
     local bdf="$2"
     local evidence="$3"
 
+    CARD_HELPER_ATTEMPTED[$card]=0
     log "ALERT: Confirmed ring timeout / reset failure on $card ($bdf)."
     if ! save_incident_evidence "$card" "$bdf" "$evidence"; then
         log "ERROR: Could not durably save incident evidence for $card ($bdf). Skipping helper execution to avoid untracked mutation."
@@ -304,6 +319,7 @@ recover_card() {
         log "ERROR: 'timeout' binary unavailable. Refusing unbounded recovery execution; failing closed."
         return 127
     fi
+    CARD_HELPER_ATTEMPTED[$card]=1
     timeout "$HELPER_TIMEOUT" "$RESET_SCRIPT" "$card" || rc=$?
 
     if [ "$rc" -ne 0 ]; then
@@ -315,7 +331,75 @@ recover_card() {
     return 0
 }
 
+# A failing helper may race a late kernel recovery. Readability, not idle utilization,
+# shows whether a card is back; legitimate work on a recovered card must not cause a reboot.
+card_operational_at_path() {
+    local base="$1"
+    local clock_line busy
+    [ -d "$base/drm" ] && [ -r "$base/pp_dpm_sclk" ] && [ -r "$base/gpu_busy_percent" ] || return 1
+    IFS= read -r clock_line < "$base/pp_dpm_sclk" && [ -n "$clock_line" ] || return 1
+    IFS= read -r busy < "$base/gpu_busy_percent" && [[ "$busy" =~ ^[0-9]+$ ]] && [ "$busy" -le 100 ]
+}
+
+card_operational() {
+    card_operational_at_path "/sys/bus/pci/devices/${CARD_TO_BDF[$1]}"
+}
+
+# An unrecoverable, BDF-attributed bus loss warrants one orderly reboot before the IPMI
+# watchdog's ten-minute limit. Keep the hardware watchdog active as the last resort if
+# the kernel or shutdown hangs. A durable 24-hour guard prevents a persistent PCI fault
+# from turning into a reboot loop across boots.
+request_early_reboot() {
+    local card="$1" now previous marker tmp
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[DRY-RUN] Would request early orderly reboot after unrecovered bus loss on $card"
+        return 0
+    fi
+    now=$(date +%s)
+    if [ -e "$EARLY_REBOOT_FILE" ]; then
+        IFS=' ' read -r previous _ < "$EARLY_REBOOT_FILE" || true
+        if ! [[ "$previous" =~ ^[0-9]+$ ]]; then
+            log "ERROR: Invalid early-reboot guard; refusing automatic reboot: $EARLY_REBOOT_FILE"
+            return 1
+        fi
+        if [ "$now" -ge "$previous" ] && [ $(( now - previous )) -lt "$EARLY_REBOOT_COOLDOWN" ]; then
+            log "ERROR: Early reboot already requested within 24 hours; refusing a reboot loop for $card."
+            return 1
+        fi
+    fi
+    marker=$(dirname "$EARLY_REBOOT_FILE")
+    if ! install -d -m 0700 "$marker" || ! tmp=$(mktemp "${EARLY_REBOOT_FILE}.XXXXXX"); then
+        log "ERROR: Cannot save early-reboot guard; leaving IPMI watchdog as fallback."
+        return 1
+    fi
+    if ! printf '%s %s\n' "$now" "$card" > "$tmp" || ! sync -f "$tmp" || ! mv -f "$tmp" "$EARLY_REBOOT_FILE" || ! sync -f "$EARLY_REBOOT_FILE"; then
+        rm -f "$tmp"
+        log "ERROR: Cannot persist early-reboot guard; leaving IPMI watchdog as fallback."
+        return 1
+    fi
+    log "Unrecovered bus loss on $card: requesting orderly reboot; IPMI hardware watchdog remains enabled."
+    if ! systemctl reboot --no-wall; then
+        log "ERROR: Orderly reboot request failed; IPMI hardware watchdog remains the fallback."
+        return 1
+    fi
+}
+
 # A successful kernel reset needs clocks restored, never a second PCI reset.
+# True when the card already is in the state a pin would produce: 'manual' plus the highest
+# pp_dpm_sclk index marked selected.  Nothing is written when this returns true.
+clock_pin_is_correct() {
+    local base="/sys/bus/pci/devices/${CARD_TO_BDF[$1]}"
+    local perf top sel
+    [ -r "$base/power_dpm_force_performance_level" ] || return 1
+    IFS= read -r perf < "$base/power_dpm_force_performance_level"
+    [ "$perf" = manual ] || return 1
+    [ -r "$base/pp_dpm_sclk" ] || return 1
+    top=$(grep -oE '^[0-9]+' "$base/pp_dpm_sclk" | tail -1)
+    [ -n "$top" ] || return 1
+    sel=$(sed -n 's/^\([0-9]\+\):.*\*.*$/\1/p' "$base/pp_dpm_sclk" | tail -1)
+    [ "$sel" = "$top" ]
+}
+
 restore_clock_card() {
     local card="$1"
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -326,6 +410,19 @@ restore_clock_card() {
         log "ERROR: Recovery helper missing; cannot restore clocks on $card"
         return 1
     fi
+    local now last
+    now=$(date +%s)
+    last=${CARD_CLOCK_LAST[$card]:-0}
+    if [ "$last" -gt 0 ] && [ $(( now - last )) -lt "$CLOCK_PIN_COOLDOWN" ]; then
+        log "Cooldown: $card was pinned $(( now - last ))s ago (< ${CLOCK_PIN_COOLDOWN}s); skipping write."
+        return 0
+    fi
+    if clock_pin_is_correct "$card"; then
+        log "Clock pin already correct on $card (manual + highest index); no write needed."
+        CARD_CLOCK_LAST[$card]=$now
+        return 0
+    fi
+    CARD_CLOCK_LAST[$card]=$now
     timeout 30 "$RESET_SCRIPT" --clocks-only "$card"
 }
 
@@ -376,11 +473,23 @@ run_watchdog_step() {
                     continue
                     ;;
             esac
+            if [ "$kind" = gpu_log ]; then
+                # A device with a pending failure cannot safely serve DPM sysfs reads.
+                [ -n "${CARD_PENDING_SINCE[$card]:-}" ] && continue
+                CARD_CLOCK_SINCE[$card]=$now
+                log "GPU log event on $card ($bdf); pinning manual/highest DPM (no reset): $raw_line"
+                continue
+            fi
             if [ "$kind" = success ]; then
-                unset "CARD_PENDING_SINCE[$card]" "CARD_PENDING_KIND[$card]" "CARD_PENDING_EVIDENCE[$card]"
+                unset "CARD_PENDING_SINCE[$card]" "CARD_PENDING_KIND[$card]" "CARD_PENDING_EVIDENCE[$card]" "CARD_DRIVER_RESET_SINCE[$card]"
                 CARD_CLOCK_SINCE[$card]=$now
                 log "Kernel reset succeeded on $card ($bdf); no PCI reset, restoring only clocks."
                 continue
+            fi
+            if [ "$kind" = timeout ] && [[ "$raw_line" == *"GPU reset begin"* ]]; then
+                CARD_DRIVER_RESET_SINCE[$card]=$now
+            elif [ "$kind" = failure ]; then
+                unset "CARD_DRIVER_RESET_SINCE[$card]"
             fi
             if [ -z "${CARD_PENDING_SINCE[$card]:-}" ]; then
                 CARD_PENDING_SINCE[$card]=$now
@@ -392,7 +501,12 @@ run_watchdog_step() {
             else
                 CARD_PENDING_EVIDENCE[$card]+="$raw_line"$'\n'
             fi
-            CARD_PENDING_KIND[$card]=$kind
+            # Do not downgrade bus loss to a later generic timeout or a reset-progress line.
+            if [ "$kind" = bus_lost ] || [ -z "${CARD_PENDING_KIND[$card]:-}" ]; then
+                CARD_PENDING_KIND[$card]=$kind
+            elif [ "$kind" = failure ] && [ "${CARD_PENDING_KIND[$card]}" != bus_lost ]; then
+                CARD_PENDING_KIND[$card]=$kind
+            fi
             unset "CARD_CLOCK_SINCE[$card]"
         done <<< "$scan_output"
     fi
@@ -404,10 +518,25 @@ run_watchdog_step() {
     for card in card1 card2 card3 card4 card5; do
         [ -n "${CARD_PENDING_SINCE[$card]:-}" ] && continue
         [ -n "${CARD_CLOCK_SINCE[$card]:-}" ] && continue
-        local policy
-        if policy=$(read_clock_policy "$card") && [ "$policy" = auto ]; then
+        local policy policy_ok=1
+        # Healthy is 'high' (the vendor default) or 'manual' (pinned by the restore helper).  Both
+        # measure the same on this host (40.15-40.71 vs 40.02-40.23 tok/s on a paired MTP-off arm),
+        # so neither is treated as a fault.  The fault is the SMU governor dropping to a low-power
+        # policy: 'auto', 'low' or 'battery'.  Treating non-'high' as reverted made this watchdog
+        # fight its own restore helper (which pins 'manual'), and per the 2026-09-28 records the
+        # overdrive writes that came with that fight are the suspected trigger for card 0000:09:00.0
+        # collapsing to half ALU rate.  Restoring only ever pins a level now - never OD, never PCI.
+        if policy=$(read_clock_policy "$card"); then
+            case "$policy" in
+                high|manual) policy_ok=1 ;;
+                *) policy_ok=0 ;;
+            esac
+        else
+            continue
+        fi
+        if [ "$policy_ok" -eq 0 ]; then
             CARD_CLOCK_SINCE[$card]=$now
-            log "Clock policy reverted to auto on $card; restoring manual DPM without PCI reset."
+            log "Clock policy is '$policy' on $card (expected 'high' or 'manual'); restoring the DPM level without PCI reset and without overdrive writes."
         fi
     done
 
@@ -426,7 +555,14 @@ run_watchdog_step() {
     # after a bounded grace without a subsequent success event.
     for card in "${!CARD_PENDING_SINCE[@]}"; do
         local grace=$AUTO_RESET_GRACE
-        [ "${CARD_PENDING_KIND[$card]}" = failure ] && grace=$FAILED_RESET_GRACE
+        if [ "${CARD_PENDING_KIND[$card]}" = failure ] || [ "${CARD_PENDING_KIND[$card]}" = bus_lost ]; then
+            grace=$FAILED_RESET_GRACE
+        fi
+        # Measure driver grace from GPU reset begin, not the older first timeout:
+        # a reset that starts late must not be raced by our PCI helper.
+        if [ -n "${CARD_DRIVER_RESET_SINCE[$card]:-}" ]; then
+            [ $(( now - CARD_DRIVER_RESET_SINCE[$card] )) -lt "$AUTO_RESET_GRACE" ] && continue
+        fi
         [ $(( now - CARD_PENDING_SINCE[$card] )) -lt "$grace" ] && continue
         local bdf="${CARD_TO_BDF[$card]}"
         local evidence="${CARD_PENDING_EVIDENCE[$card]}"
@@ -441,8 +577,19 @@ run_watchdog_step() {
         CARD_LAST_RECOVERY["$card"]=$now
         if ! recover_card "$card" "$bdf" "$evidence"; then
             step_status=1
+            if [ "${CARD_PENDING_KIND[$card]}" = bus_lost ]; then
+                if [ "${CARD_HELPER_ATTEMPTED[$card]:-0}" != 1 ]; then
+                    log "ERROR: No card-specific recovery attempt on $card; refusing host reboot."
+                elif card_operational "$card"; then
+                    log "Card $card is readable again after failed helper; suppressing host reboot."
+                elif save_incident_evidence "$card" "$bdf" "Early reboot after failed single-card recovery: $evidence"; then
+                    request_early_reboot "$card" || step_status=1
+                else
+                    log "ERROR: Unrecoverable $card, but incident evidence could not be saved; leaving IPMI watchdog as fallback."
+                fi
+            fi
         fi
-        unset "CARD_PENDING_SINCE[$card]" "CARD_PENDING_KIND[$card]" "CARD_PENDING_EVIDENCE[$card]"
+        unset "CARD_PENDING_SINCE[$card]" "CARD_PENDING_KIND[$card]" "CARD_PENDING_EVIDENCE[$card]" "CARD_DRIVER_RESET_SINCE[$card]"
     done
 
     return "$step_status"
@@ -464,10 +611,13 @@ declare -A CARD_LAST_RECOVERY=(
     ["card4"]=0
     ["card5"]=0
 )
+declare -A CARD_HELPER_ATTEMPTED=()
 declare -A CARD_PENDING_SINCE=()
 declare -A CARD_PENDING_KIND=()
 declare -A CARD_PENDING_EVIDENCE=()
+declare -A CARD_DRIVER_RESET_SINCE=()
 declare -A CARD_CLOCK_SINCE=()
+declare -A CARD_CLOCK_LAST=()
 
 LAST_KERNEL_TIMESTAMP=""
 
@@ -475,10 +625,17 @@ LAST_KERNEL_TIMESTAMP=""
 watchdog_main() {
     # Initialize watermark with latest current timestamp so past history does not retrigger
     local init_logs
-    if [ "$ONCE" -eq 0 ] && init_logs=$(fetch_kernel_logs 2>/dev/null); then
-        local last_line
-        last_line=$(echo "$init_logs" | tail -n 1)
+    if [ "$ONCE" -eq 0 ]; then
+        if ! init_logs=$(fetch_kernel_logs 2>/dev/null); then
+            log "CRITICAL: Cannot watermark kernel history; refusing to act on stale GPU faults."
+            return 2
+        fi
+        local last_line="${init_logs##*$'\n'}"
         LAST_KERNEL_TIMESTAMP=$(extract_monotonic_timestamp "$last_line")
+        if [ -z "$LAST_KERNEL_TIMESTAMP" ]; then
+            log "CRITICAL: No monotonic kernel timestamp; refusing to act on stale GPU faults."
+            return 2
+        fi
     fi
 
     log "Eagle GPU Watchdog initialized. Baseline timestamp: [${LAST_KERNEL_TIMESTAMP:-0}]."

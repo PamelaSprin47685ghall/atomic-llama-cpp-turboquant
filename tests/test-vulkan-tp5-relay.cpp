@@ -49,6 +49,7 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--run") == 0) { run = true; continue; }
         if (strcmp(argv[i], "--stale-doorbell") == 0) { cfg.stale_doorbell = true; continue; }
+        if (strcmp(argv[i], "--service") == 0) { cfg.service_measure = true; continue; }
         uint32_t * field = nullptr;
         if (strcmp(argv[i], "--stages") == 0) field = &cfg.stages;
         if (strcmp(argv[i], "--replays") == 0) field = &cfg.replays;
@@ -67,10 +68,13 @@ int main(int argc, char ** argv) {
     if (!run) {
         fprintf(stderr, "Hardware experiment: test-vulkan-tp5-relay --run [--stages 1..96] [--replays 1..32]\n"
                         "  [--elements 1..4096] [--spin-max 1..1000000] [--delay-us 0..2000]\n"
-                        "  [--withhold-stage N] [--stale-doorbell] [--partial-submit-ranks 1..4]\n");
+                        "  [--withhold-stage N] [--stale-doorbell] [--partial-submit-ranks 1..4] [--service]\n");
         return 0;
     }
     if (!idle_gpus()) { fprintf(stderr, "relay: GPU safety audit refused run\n"); return 1; }
+    if (cfg.service_measure && (cfg.replays<3 || cfg.delay_us || cfg.withhold_stage || cfg.partial_submit_ranks)) {
+        fprintf(stderr,"relay: service calibration requires>=3 replays and no delay/fault injection\n");return 1;
+    }
     const size_t before = count_fds();
     std::vector<ggml_backend_t> backends;
     ggml_backend_reg_t reg = ggml_backend_vk_reg();

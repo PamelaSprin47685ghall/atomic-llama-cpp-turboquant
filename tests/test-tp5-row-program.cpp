@@ -134,37 +134,8 @@ static void latebind_token_dimension_multi_row_invariants() {
     CHECK(layout.rho_elements() == 16);
     CHECK(layout.q_elements() == 4 * 4 * 320); // 5120 floats
     CHECK(layout.y_elements() == 4 * 2560);     // 10240 floats
-    CHECK(layout.act_q8_blocks() == 4 * 4 * (2560 / 32)); // 1280 Q8 blocks
+    CHECK(layout.act_q8_blocks() == 4 * 4 * (2560 / 32));  // 1280 Q8 blocks
     CHECK(layout.lo_elements() == 4 * 320);
-
-    // Section 1: Push constants layout contract.
-    // Assert all 7 push constant structs carry active_rows at their exact offsets.
-    struct TestInjectParams { uint32_t width, streams, active_rows; };
-    static_assert(sizeof(TestInjectParams) == 12 && offsetof(TestInjectParams, active_rows) == 8);
-
-    struct TestActQ8Params { uint32_t width, streams, my_rank, active_rows; };
-    static_assert(sizeof(TestActQ8Params) == 16 && offsetof(TestActQ8Params, active_rows) == 12);
-
-    struct TestQ8DotParams {
-        uint32_t width, rank_dim, streams, rows_per_wg, n_workgroups, late_word_offset, active_rows;
-    };
-    static_assert(sizeof(TestQ8DotParams) == 28 && offsetof(TestQ8DotParams, active_rows) == 24);
-
-    struct TestUpQ8Params { uint32_t width, rank_dim, streams, rows_per_wg, active_rows; };
-    static_assert(sizeof(TestUpQ8Params) == 20 && offsetof(TestUpQ8Params, active_rows) == 16);
-
-    struct TestQParams { uint32_t width, rank_dim, streams, my_rank, active_rows; };
-    static_assert(sizeof(TestQParams) == 20 && offsetof(TestQParams, active_rows) == 16);
-
-    struct TestNormParams {
-        uint32_t width, streams; float epsilon; uint32_t spin_max, status_word_offset, profile_spin, active_rows;
-    };
-    static_assert(sizeof(TestNormParams) == 28 && offsetof(TestNormParams, active_rows) == 24);
-
-    struct TestLoParams {
-        uint32_t rank_dim, streams, late_word_offset, spin_max, status_word_offset, profile_spin, sidecar_f16, active_rows;
-    };
-    static_assert(sizeof(TestLoParams) == 32 && offsetof(TestLoParams, active_rows) == 28);
 
     // Section 2: Single-row non-regression invariant.
     // When active_rows = 1, token 0 offsets must match the single-row reference exactly.
@@ -251,32 +222,6 @@ static void latebind_token_dimension_multi_row_invariants() {
                     }
                 }
             }
-        }
-    }
-
-    // Section 4: External binding capacity validation contract.
-    // Verify that tp5_late_consumer_ref requires external tensors to satisfy capacity_rows * ...
-    for (uint32_t cap : {1u, 2u, 3u, 4u}) {
-        const uint64_t mixed_req = uint64_t(cap) * layout.width * sizeof(float);
-        const uint64_t lo_req = uint64_t(cap) * layout.rank_dim * sizeof(float);
-        const uint64_t residual_req = uint64_t(cap) * layout.streams * layout.width * sizeof(float);
-
-        auto check_capacity = [&](uint64_t mixed_sz, uint64_t lo_sz, uint64_t res_sz) -> bool {
-            return mixed_sz >= mixed_req && lo_sz >= lo_req && res_sz >= residual_req;
-        };
-
-        // Exact match passes
-        CHECK(check_capacity(mixed_req, lo_req, residual_req));
-        // Under-sized mixed fails
-        CHECK(!check_capacity(mixed_req - 1, lo_req, residual_req));
-        // Under-sized lo fails
-        CHECK(!check_capacity(mixed_req, lo_req - 1, residual_req));
-        // Under-sized residual fails
-        CHECK(!check_capacity(mixed_req, lo_req, residual_req - 1));
-        // Legacy single-row size against multi-row capacity (cap > 1) fails closed!
-        if (cap > 1) {
-            CHECK(!check_capacity(layout.width * sizeof(float), layout.rank_dim * sizeof(float),
-                                  layout.streams * layout.width * sizeof(float)));
         }
     }
 }

@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-decode-cost.h"
 #include "llama-predefined-hidden.h"
 #include "ggml-predefined.h"
 
@@ -2476,6 +2477,7 @@ llama_context::target_capacity_decision llama_context::evaluate_target_capacity_
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    llama_decode_cost cost("ubatch", this, ubatch.n_tokens, (int) cparams.ctx_type);
     // No output consumer exists in native masked catch-up. Keep this a
     // distinct graph identity; capacity execution and unmasked hidden output
     // retain their existing contracts rather than borrowing a zero-row graph.
@@ -2492,6 +2494,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     predefined_frame_current_valid = false;
     predefined_capacity_rows_current = 0;
     predefined_capacity_outputs_current = 0;
+    predefined_target_admitted = false;
     llama_device_hidden_input hidden_input;
     llama_ubatch input_ubatch;
     const llama_ubatch * input_batch = &ubatch;
@@ -2608,6 +2611,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     ubatch,
                     frame,
                     capacity->verify_tokens);
+            predefined_target_admitted = decision.entered;
             predefined_capacity_rows_current = decision.capacity_rows;
             predefined_capacity_outputs_current = decision.capacity_outputs;
             if (!decision.entered && decision.reason) {
@@ -2658,15 +2662,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // invalidation and the release in that order). Without it the larger phase's buffers stay
     // allocated for the whole session.
     //
-    // Predefined MTP exemption: Predefined MTP sessions share a single unified execution definition
-    // (capacity_rows = capacity->verify_tokens) across both 1-token draft and multi-token catch-up.
-    // Categorizing multi-token catch-up as phase 1 (prompt processing) broke graph reuse by
-    // triggering reset() and sched buffer release. Predefined MTP stays in phase 0.
+    // Predefined exemption: Predefined MTP sessions share a single unified execution definition
+    // (capacity_rows = capacity->verify_tokens) across both 1-token draft and multi-token catch-up,
+    // and admitted TARGET capacity definitions share their unified execution graph.
+    // Both stay stably in phase 0. Ordinary target prefill retains phase 1 to release temporary buffers.
     {
         const int phase = ubatch_execution_phase(
                 gtype,
-                predefined_capacity() != nullptr,
-                predefined_capacity_rows_current,
+                predefined_frame_current_valid,
+                predefined_frame_current.phase,
+                predefined_target_admitted,
                 ubatch.n_tokens,
                 ubatch.n_seqs);
         if (phase != last_graph_phase) {
@@ -2689,6 +2694,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    cost.mark(0);
 
     struct postcompute_guard {
         llama_memory_context_i * mctx;
@@ -2720,6 +2727,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         xkv_retry = false;
 
     if (!graph_reuse_disable && ggml_backend_sched_is_allocated(sched.get()) && res->can_reuse(gparams)) {
+        cost.reuse = 1;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2732,10 +2740,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
         if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
             const uint64_t uid = gf ? ggml_graph_get_uid(gf) : 0;
-            LLAMA_LOG_INFO("[tp5-mtp-graph] type=%d reuse=1 definition_uid=0x%" PRIx64 " n_reused=%d ubatch_tokens=%d\n",
-                           (int) gtype, uid, n_reused, ubatch.n_tokens);
+            LLAMA_LOG_INFO("[tp5-mtp-graph] type=%d reuse=1 definition_uid=0x%" PRIx64 " n_reused=%d ubatch_tokens=%d "
+                           "execution_phase=%d frame_valid=%d frame_role=%u target_capacity=%d\n",
+                           (int) gtype, uid, n_reused, ubatch.n_tokens, last_graph_phase,
+                           int(predefined_frame_current_valid), predefined_frame_current.phase,
+                           int(predefined_target_admitted));
         }
+        cost.mark(1);
     } else {
+        cost.reuse = 0;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -2757,12 +2770,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
             ggml_graph_set_uid(gf, definition_uid);
             if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
-                LLAMA_LOG_INFO("[tp5-mtp-graph] type=%d reuse=0 definition_uid=0x%" PRIx64 " ubatch_tokens=%d\n",
-                               (int) gtype, definition_uid, ubatch.n_tokens);
+                LLAMA_LOG_INFO("[tp5-mtp-graph] type=%d reuse=0 definition_uid=0x%" PRIx64 " ubatch_tokens=%d "
+                               "execution_phase=%d frame_valid=%d frame_role=%u target_capacity=%d\n",
+                               (int) gtype, definition_uid, ubatch.n_tokens, last_graph_phase,
+                               int(predefined_frame_current_valid), predefined_frame_current.phase,
+                               int(predefined_target_admitted));
             }
         }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+
+        cost.mark(1);
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -2792,6 +2810,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        cost.mark(2);
     }
 
     // set the input data for the input tensors
@@ -2810,9 +2829,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const int64_t t_inp_us = ggml_time_us() - t_inp_0;
         static int inp_log = 0; if (ubatch.n_tokens == 1 && ++inp_log <= 10) fprintf(stderr, "[NOMTP_DECOMPOSE] set_inputs=%5.2f ms\n", t_inp_us / 1000.0);
     }
+    cost.mark(3);
     const int64_t t_comp_0 = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     const int64_t t_comp_us = ggml_time_us() - t_comp_0;
+    cost.mark(4);
     static int comp_log = 0; if (ubatch.n_tokens == 1 && ++comp_log <= 10) fprintf(stderr, "[NOMTP_DECOMPOSE] graph_compute=%5.2f ms status=%d\n", t_comp_us / 1000.0, status);
 
     if (status != GGML_STATUS_SUCCESS) {
@@ -3883,6 +3904,7 @@ void llama_context::flashprefill_snapshot_gpu_phases() {
 }
 
 int llama_context::decode_impl(const llama_batch & batch_inp) {
+    llama_decode_cost cost("decode", this, batch_inp.n_tokens, (int) cparams.ctx_type);
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);

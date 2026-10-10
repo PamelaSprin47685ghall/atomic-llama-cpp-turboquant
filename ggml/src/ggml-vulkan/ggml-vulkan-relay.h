@@ -16,6 +16,11 @@ struct ggml_vk_relay_config {
     uint32_t withhold_stage = 0;
     uint32_t partial_submit_ranks = 0;
     bool stale_doorbell = false;
+    // Model-free service calibration only: two full reference-check replays,
+    // then timed replays retain all generation/error/retirement checks and
+    // exact final-state comparison, without per-element CPU recomputation in
+    // the timed handoff. Never changes the production collective.
+    bool service_measure = false;
 };
 
 // Returns zero only after every bounded stage completes and native draining

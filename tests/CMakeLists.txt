@@ -120,7 +120,7 @@ endfunction()
 # availability. Its tests use only the Python standard library.
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if (Python3_Interpreter_FOUND)
-    foreach(check nanbeige-audit nanbeige-report rerot-semantic-smoke)
+    foreach(check nanbeige-audit nanbeige-report rerot-semantic-smoke tp5-gap-tools tp5-perf-model tp5-match-model)
         add_test(NAME test-${check}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-${check}.py)
         set_tests_properties(test-${check} PROPERTIES LABELS "python" TIMEOUT 30)
@@ -133,6 +133,28 @@ if (Python3_Interpreter_FOUND)
     set_tests_properties(test-gpu-recovery-mock PROPERTIES LABELS "recovery;python" TIMEOUT 30)
 endif()
 
+# These tests need no model and never submit GPU work. Keep assertions enabled
+# in optimized builds: they check exact selected tokens and RNG continuation.
+add_executable(test-greedy-unique-host test-greedy-unique-host.cpp)
+target_include_directories(test-greedy-unique-host PRIVATE ${PROJECT_SOURCE_DIR}/common)
+target_link_libraries(test-greedy-unique-host PRIVATE llama ggml-base)
+target_compile_features(test-greedy-unique-host PRIVATE cxx_std_17)
+add_executable(test-decode-cost test-decode-cost.cpp)
+target_include_directories(test-decode-cost PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/include)
+target_compile_features(test-decode-cost PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(test-greedy-unique-host PRIVATE /UNDEBUG)
+    target_compile_options(test-decode-cost PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test-greedy-unique-host PRIVATE -UNDEBUG)
+    target_compile_options(test-decode-cost PRIVATE -UNDEBUG)
+endif()
+llama_test(test-greedy-unique-host LABEL "sampling;cpu")
+llama_test(test-decode-cost NAME test-decode-cost-off LABEL "performance;cpu")
+set_tests_properties(test-decode-cost-off PROPERTIES ENVIRONMENT "GGML_DECODE_COST=0")
+llama_test(test-decode-cost NAME test-decode-cost-on LABEL "performance;cpu" ARGS enabled)
+set_tests_properties(test-decode-cost-on PROPERTIES ENVIRONMENT "GGML_DECODE_COST=1")
+
 # build test-tokenizer-0 target once and add many tests
 add_executable(test-predefined-capacity test-predefined-capacity.cpp)
 target_link_libraries(test-predefined-capacity PRIVATE ggml-base)
@@ -144,6 +166,15 @@ llama_test(test-mtp-workspace LABEL "predefined;cpu")
 
 add_test(NAME test-gpu-recovery COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-gpu-recovery.sh)
 set_tests_properties(test-gpu-recovery PROPERTIES LABELS "recovery;cpu" TIMEOUT 15)
+
+if (UNIX AND LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER)
+    add_executable(test-server-signal test-server-signal.cpp)
+    target_include_directories(test-server-signal PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    target_link_libraries(test-server-signal PRIVATE server-context)
+    target_compile_features(test-server-signal PRIVATE cxx_std_17)
+    llama_test(test-server-signal LABEL "server;cpu")
+    set_tests_properties(test-server-signal PROPERTIES TIMEOUT 10)
+endif()
 
 add_executable(test-target-capacity test-target-capacity.cpp)
 target_include_directories(test-target-capacity PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -328,6 +359,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # fewer than two Vulkan devices are present.
     if (GGML_VULKAN)
         add_executable(test-vulkan-tp5-mesh test-vulkan-tp5-mesh.cpp)
+        target_include_directories(test-vulkan-tp5-mesh PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
         target_link_libraries(test-vulkan-tp5-mesh PRIVATE ggml)
         # Explicit --run and an idle-device audit are required; never run from ctest.
         add_executable(test-vulkan-tp5-relay test-vulkan-tp5-relay.cpp)

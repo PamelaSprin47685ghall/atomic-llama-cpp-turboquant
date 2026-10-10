@@ -1,4 +1,5 @@
 #include "sampling.h"
+#include "sampling-unique-argmax.h"
 
 #include "common.h"
 #include "fit.h"
@@ -11,6 +12,8 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -30,6 +33,26 @@ static inline llama_token fast_host_argmax(const float * logits, llama_token n) 
 }
 #endif
 
+struct common_sample_cost {
+    bool on;
+    const void * ctx;
+    int idx;
+    int64_t start;
+    int64_t synced = 0;
+    common_sample_cost(const void * c, int i) : on([] {
+        static const bool v = [] { const char * e = std::getenv("GGML_DECODE_COST");
+            return e && std::strcmp(e, "0") != 0 && std::strcmp(e, "off") != 0; }();
+        return v;
+    }()), ctx(c), idx(i), start(on ? ggml_time_us() : 0) {}
+    void after_sync() { if (on) synced = ggml_time_us() - start; }
+    ~common_sample_cost() {
+        if (on) {
+            const int64_t total = ggml_time_us() - start;
+            std::fprintf(stderr, "[sample-cost] ctx=%p idx=%d sync_us=%lld select_us=%lld total_us=%lld\n",
+                    ctx, idx, (long long) synced, (long long) (total - synced), (long long) total);
+        }
+    }
+};
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -145,6 +168,7 @@ struct common_sampler {
     // after common_sampler_is_greedy_argmax_eligible() proved the chain
     // result equals per-row argmax.
     bool verify_argmax_host = false;
+    bool greedy_unique_host = false;
 
     void reset() {
         prev.clear();
@@ -573,6 +597,7 @@ static common_sampler * common_sampler_clone_impl(const common_sampler * gsmpl, 
     // G4b: the verify-argmax eligibility is a property of the (cloned,
     // unchanged) chain, so the flag survives checkpoint rollback.
     result->verify_argmax_host = gsmpl->verify_argmax_host;
+    result->greedy_unique_host = gsmpl->greedy_unique_host;
 
     if (keep_candidates) {
         // `cur_p` always views `cur`; copying its raw pointer would leave the
@@ -661,9 +686,11 @@ llama_token common_sampler_sample(
         int idx,
         bool grammar_first,
         bool synchronize) {
+    common_sample_cost sample_cost(ctx, idx);
     if (synchronize) {
         llama_synchronize(ctx);
     }
+    sample_cost.after_sync();
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
@@ -693,6 +720,20 @@ llama_token common_sampler_sample(
         GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
         GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
         return id;
+    }
+
+    // Ordinary TP5 opt-in: only an eligible chain with no probability output
+    // and a unique finite maximum. Ambiguous rows fall through unchanged.
+    if (gsmpl->greedy_unique_host && !gsmpl->grmr && !gsmpl->rbudget && gsmpl->params.n_probs == 0) {
+        const llama_token n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        const float * row = llama_get_logits_ith(ctx, idx);
+        if (common_greedy_compact_top_k(row, n_vocab, gsmpl->params.top_k, gsmpl->cur)) {
+            gsmpl->cur_p = {gsmpl->cur.data(), gsmpl->cur.size(), -1, true};
+            // Do not approximate RNG advancement: dist draws nothing when
+            // preceding filters leave size==1, and draws once otherwise.
+            llama_sampler_apply(chain, &gsmpl->cur_p);
+            return gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
+        }
     }
 
     // G4b verify-argmax (host): eligible greedy chain — sample by raw argmax
@@ -889,6 +930,26 @@ void common_sampler_set_verify_argmax_host(struct common_sampler * gsmpl, bool e
     if (gsmpl) {
         gsmpl->verify_argmax_host = enabled;
     }
+}
+
+bool common_sampler_set_greedy_unique_host(struct common_sampler * gsmpl, bool enabled) {
+    if (!gsmpl) return false;
+    gsmpl->greedy_unique_host = false;
+    if (!enabled || gsmpl->params.top_k < 2 || gsmpl->params.top_k > 128 || gsmpl->params.n_probs != 0) return false;
+    // Existing eligibility proves these prefix elements inert. Reject any
+    // preceding active filter or temperature transform; don't reorder it.
+    for (int i = 0; i < llama_sampler_chain_n(gsmpl->chain); ++i) {
+        const char * name = llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, i));
+        if (!name) return false;
+        if (name[0] == '?') continue;
+        if (std::strcmp(name, "top-k") == 0 || std::strncmp(name, "+top-k", 6) == 0 || std::strncmp(name, "-top-k", 6) == 0) {
+            gsmpl->greedy_unique_host = true;
+            return true;
+        }
+        if (std::strstr(name, "penalties") || std::strstr(name, "dry") || std::strstr(name, "xtc")) continue;
+        return false;
+    }
+    return false;
 }
 
 bool common_sampler_is_greedy_argmax_eligible(const struct common_sampler * gsmpl, const struct llama_vocab * vocab) {

@@ -65,6 +65,24 @@ CANONICAL_COUNT_STR = ",".join(str(i) for i in range(1, 61))  # 170 characters e
 EXPECTED_PROMPT_N = 31
 EXPECTED_PREDICTED_N_TARGET = 171
 
+# G7 realistic workload (run-20260927T0300): natural-language weight-loss question.
+# prompt_n=31 matches the counting canonical; the answer is a natural stop at 174
+# tokens. Byte-exact match against the recorded ground truth is required (the
+# counting gate's 171-token oracle does not apply to natural answers; completion
+# length is validated in a band around the recorded answer instead).
+WEIGHTLOSS_PROMPT = "请用八句话简要介绍健康减重原则、每周运动安排、饮食建议和睡眠误区。"
+WEIGHTLOSS_VARIANTS_PATH = str(Path(__file__).parent.parent / "artifacts/tp5-next-20260926/g7-realistic-workload/weightloss-variants.json")
+WEIGHTLOSS_COMPLETION_MIN = 150
+WEIGHTLOSS_COMPLETION_MAX = 200
+# Natural text is not byte-stable under TP5 cross-rank argmax reduction: near-tie
+# logits flip single words between runs (observed 171/174-token variants of the
+# same answer). The gate for this workload is membership in the recorded variant
+# set, not a single ground truth. New variants fail closed until investigated and
+# added to the set with their own evidence.
+def _weightloss_variants() -> set:
+    data = json.loads(Path(WEIGHTLOSS_VARIANTS_PATH).read_text(encoding="utf-8"))
+    return set(data["variants"])
+
 PROMPT_PAYLOAD = {
     "messages": [{"role": "user", "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."}],
     "temperature": 0,
@@ -76,6 +94,84 @@ PROMPT_PAYLOAD = {
 }
 
 ENV_WHITELIST_KEYS = ["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "LD_LIBRARY_PATH"]
+
+
+
+
+def register_mmvq_mtp_variants(variants: Dict[str, Dict[str, Any]], horizons=(1, 2)) -> None:
+    """MMVQ+MTP four-cell product matrix (MMVQ+MTP.md §3.1/§8.2).
+
+    Cells: A0/A1 = no-MTP off/auto, B0/B1 = h-MTP off/auto. Within each
+    off/auto pair ONLY the MMVQ policy differs. F32/RELAY everywhere,
+    LateBind off, FORCE_MMVQ=0 (disable has priority anyway), and the env
+    base is the audited fused profile rather than an unaudited inheritance.
+    """
+    from copy import deepcopy
+
+    requested = tuple(horizons)
+    if not requested or len(set(requested)) != len(requested):
+        raise ValueError("horizons must be non-empty and unique")
+    if any(h not in (1, 2, 3) for h in requested):
+        raise ValueError("matrix only permits horizons 1, 2, 3")
+
+    pending: Dict[str, Dict[str, Any]] = {}
+
+    def set_arg(argv, key, value):
+        argv = list(argv)
+        positions = [i for i, item in enumerate(argv) if item == key]
+        if len(positions) > 1:
+            raise ValueError(f"duplicate CLI option: {key}")
+        if positions:
+            argv[positions[0] + 1] = str(value)
+        else:
+            argv.extend([key, str(value)])
+        return argv
+
+    def add(name, base_name, enabled, mtp, horizon=None):
+        if name in variants or name in pending:
+            raise ValueError(f"variant already exists: {name}")
+        if base_name not in variants:
+            raise KeyError(f"missing audited base variant: {base_name}")
+        item = deepcopy(variants[base_name])
+        env = dict(item.get("env", {}))
+        # Audited base env keys only (the fused profiles carry exactly these
+        # documented knobs; anything new fails closed here per plan §8.2).
+        allowed = {"RADV_DEBUG", "GGML_TP5_SPEC_VERIFY_ARGMAX"}
+        unexpected = set(env) - allowed
+        if unexpected:
+            raise ValueError(f"audit new base env keys first: {sorted(unexpected)}")
+        env["GGML_VK_DISABLE_MMVQ"] = "0" if enabled else "1"
+        env["GGML_VK_FORCE_MMVQ"] = "0"
+        argv = set_arg(item["cli_args"], "--tp5-latebind", "off")
+        if mtp:
+            argv = set_arg(argv, "--tp5-latebind", "off")  # idempotent
+            argv = set_arg(argv, "--spec-draft-n-max", horizon)
+        else:
+            if "-md" in argv or "--spec-draft-n-max" in argv:
+                raise ValueError("no-MTP base unexpectedly carries draft options")
+            argv = set_arg(argv, "--spec-type", "none")
+        item.update({
+            "name": name,
+            "description": f"QMP cell: mtp={mtp}, h={horizon}, mmvq={'auto' if enabled else 'off'}",
+            "env": env,
+            "cli_args": argv,
+            "expected_sync": "relay",
+            "expected_wire": "f32",
+            "expected_mmvq": "auto" if enabled else "disabled",
+            "is_mtp": mtp,
+            "requires_linear": True,
+        })
+        pending[name] = item
+
+    add("qmp-a0-nomtp-off", "native-default", False, False)
+    add("qmp-a1-nomtp-auto", "native-default", True, False)
+    for h in requested:
+        base = f"native-mtp-fused-n{h}-varargmax"
+        if base not in variants:
+            raise KeyError(f"missing MTP base variant for h={h}: {base}")
+        add(f"qmp-b0-h{h}-off", base, False, True, h)
+        add(f"qmp-b1-h{h}-auto", base, True, True, h)
+    variants.update(pending)
 
 
 def get_available_variants(model_path: str, mtp_model_path: str) -> Dict[str, Dict[str, Any]]:
@@ -308,6 +404,140 @@ def get_available_variants(model_path: str, mtp_model_path: str) -> Dict[str, Di
         "description": "Same MTP binary with rank-local pinned readback disabled; one-factor W1 control",
         "env": dict(variants["native-mtp-single-draft"]["env"], GGML_META_ASYNC_READBACK="0"),
     }
+
+    # K1c L2_NORM pair fusion control (run-20260926T1800): same fused-default
+    # profile with the q/k l2_norm pair fusion disabled via env. A-arm for the
+    # fusion ABBA; B-arm is native-mtp-fused-default (fusion on by default).
+    variants["native-mtp-fused-no-l2pair"] = {
+        **variants["native-mtp-fused-default"],
+        "name": "native-mtp-fused-no-l2pair",
+        "description": "Fused-default with GGML_VK_DISABLE_L2_PAIR=1 (l2 pair fusion off; K1c control arm)",
+        "env": dict(variants["native-mtp-fused-default"]["env"], GGML_VK_DISABLE_L2_PAIR="1"),
+    }
+
+    # K1d PLE router gate fusion control (run-20260926T1900): same fused-default
+    # profile with the router-gate chain fusion disabled via env. A-arm for the
+    # K1d ABBA; B-arm is native-mtp-fused-default (fusion on by default).
+    variants["native-mtp-fused-no-plegate"] = {
+        **variants["native-mtp-fused-default"],
+        "name": "native-mtp-fused-no-plegate",
+        "description": "Fused-default with GGML_VK_DISABLE_PLE_GATE=1 (PLE router gate fusion off; K1d control arm)",
+        "env": dict(variants["native-mtp-fused-default"]["env"], GGML_VK_DISABLE_PLE_GATE="1"),
+    }
+
+    # K1e paired-expert K=128 MoE down candidate (run-20260926T2000): the
+    # paired-expert kernel is opt-in via GGML_VK_MOE_DOWN_K128. A-arm is the
+    # fused-default with the flag explicitly off; B-arm is fused-default plus
+    # the flag on. Single factor: only the paired-expert down path differs.
+    variants["native-mtp-fused-no-k128"] = {
+        **variants["native-mtp-fused-default"],
+        "name": "native-mtp-fused-no-k128",
+        "description": "Fused-default with GGML_VK_MOE_DOWN_K128=0 (paired-expert K128 off; K1e control arm)",
+        "env": dict(variants["native-mtp-fused-default"]["env"], GGML_VK_MOE_DOWN_K128="0"),
+    }
+    variants["native-mtp-fused-k128"] = {
+        **variants["native-mtp-fused-default"],
+        "name": "native-mtp-fused-k128",
+        "description": "Fused-default with GGML_VK_MOE_DOWN_K128=1 (paired-expert K128 on; K1e candidate arm)",
+        "env": dict(variants["native-mtp-fused-default"]["env"], GGML_VK_MOE_DOWN_K128="1"),
+    }
+    # H1 horizon candidate (run-20260926T1700): fused-default with explicit
+    # --spec-draft-n-max 8. Single factor vs native-mtp-fused-default (n=6).
+    variants["native-mtp-fused-n8"] = {
+        **variants["native-mtp-fused-default"],
+        "name": "native-mtp-fused-n8",
+        "description": "Fused MTP profile with draft horizon raised from 6 to 8 (H1 single factor)",
+        "cli_args": list(variants["native-mtp-fused-default"]["cli_args"]) + ["--spec-draft-n-max", "8"],
+    }
+
+    # G4b verify-argmax host sampling (run-20260927T0015): fused-n8 with
+    # GGML_TP5_SPEC_VERIFY_ARGMAX=1 (greedy verify rows sampled by raw host
+    # argmax over the logits row; eligibility-gated, RNG-stream-identical).
+    # Single factor vs native-mtp-fused-n8.
+    variants["native-mtp-fused-n8-varargmax"] = {
+        **variants["native-mtp-fused-n8"],
+        "name": "native-mtp-fused-n8-varargmax",
+        "description": "n8 fused profile with G4b host verify-argmax sampling (GGML_TP5_SPEC_VERIFY_ARGMAX=1)",
+        "env": {**variants["native-mtp-fused-n8"]["env"], "GGML_TP5_SPEC_VERIFY_ARGMAX": "1"},
+    }
+
+    # G6 (run-20260927): n=10 re-qualification under G4b host verify-argmax.
+    # H1 closed n=10 pre-G4b (diff -0.46 CI [-0.91,-0.01]); G4b removed the
+    # 2.02 ms/row sampler cost from verify, so n=10 now pays 2 extra rows at
+    # 8.5 ms GPU each instead of 10.5 ms — the marginal-row economics that
+    # killed it changed. Single factor vs native-mtp-fused-n8-varargmax.
+    variants["native-mtp-fused-n10-varargmax"] = {
+        **variants["native-mtp-fused-n8-varargmax"],
+        "name": "native-mtp-fused-n10-varargmax",
+        "description": "n10 fused profile with G4b host verify-argmax (G6 horizon re-qualification under G4b)",
+        "cli_args": list(variants["native-mtp-fused-n8-varargmax"]["cli_args"])[:-1] + ["10"],
+    }
+
+    # G6 (run-20260927T0230): n=12 under G4b. n=10 won its ABBA (-18.7 ms);
+    # the empirical per-row marginal cost (7.1 ms) is below the amortized
+    # per-token cost (9.3 ms), so the amortization curve may not be exhausted.
+    # Projection 14 cycles x 116.5 + 242 = 1873 ms — within noise, measured
+    # curve has been more favorable than the component model. Single factor
+    # vs native-mtp-fused-n10-varargmax.
+    variants["native-mtp-fused-n12-varargmax"] = {
+        **variants["native-mtp-fused-n8-varargmax"],
+        "name": "native-mtp-fused-n12-varargmax",
+        "description": "n12 fused profile with G4b host verify-argmax (G6 horizon curve second point)",
+        "cli_args": list(variants["native-mtp-fused-n8-varargmax"]["cli_args"])[:-1] + ["12"],
+    }
+
+    # G7 (run-20260927T0300): horizon scan variants under G4b argmax for the
+    # realistic weightloss workload. Acceptance on natural text is < 1.0, so
+    # the counting-workload horizon ranking may not transfer.
+    variants["native-mtp-fused-n6-varargmax"] = {
+        **variants["native-mtp-fused-n8-varargmax"],
+        "name": "native-mtp-fused-n6-varargmax",
+        "description": "n6 fused profile with G4b host verify-argmax (G7 realistic-acceptance horizon scan)",
+        "cli_args": list(variants["native-mtp-fused-n8-varargmax"]["cli_args"])[:-1] + ["6"],
+    }
+
+    # G7 (run-20260927T0340): n=4 horizon under G4b argmax. Realistic acceptance
+    # concentrates in the first ~3 draft positions (mean len 2.6-2.7 regardless of
+    # horizon); if the optimum is below n6, this finds it.
+    variants["native-mtp-fused-n4-varargmax"] = {
+        **variants["native-mtp-fused-n8-varargmax"],
+        "name": "native-mtp-fused-n4-varargmax",
+        "description": "n4 fused profile with G4b host verify-argmax (G7 horizon-scan low end)",
+        "cli_args": list(variants["native-mtp-fused-n8-varargmax"]["cli_args"])[:-1] + ["4"],
+    }
+
+    # G7 (run-20260927T0345): n=2 horizon. If acceptance mass is concentrated in
+    # the first two draft positions, the optimum may sit below n4.
+    variants["native-mtp-fused-n2-varargmax"] = {
+        **variants["native-mtp-fused-n8-varargmax"],
+        "name": "native-mtp-fused-n2-varargmax",
+        "description": "n2 fused profile with G4b host verify-argmax (G7 horizon-scan floor)",
+        "cli_args": list(variants["native-mtp-fused-n8-varargmax"]["cli_args"])[:-1] + ["2"],
+    }
+
+    # G7 (run-20260927T0350): n=3 and n=1 horizons, completing the realistic-
+    # acceptance scan between the n2 floor and n4.
+    variants["native-mtp-fused-n3-varargmax"] = {
+        **variants["native-mtp-fused-n8-varargmax"],
+        "name": "native-mtp-fused-n3-varargmax",
+        "description": "n3 fused profile with G4b host verify-argmax (G7 horizon scan)",
+        "cli_args": list(variants["native-mtp-fused-n8-varargmax"]["cli_args"])[:-1] + ["3"],
+    }
+    variants["native-mtp-fused-n1-varargmax"] = {
+        **variants["native-mtp-fused-n8-varargmax"],
+        "name": "native-mtp-fused-n1-varargmax",
+        "description": "n1 fused profile with G4b host verify-argmax (G7 horizon scan floor)",
+        "cli_args": list(variants["native-mtp-fused-n8-varargmax"]["cli_args"])[:-1] + ["1"],
+    }
+
+    # H1 horizon candidate (run-20260926T1700): n=10 smoke beat n=8 slightly
+    # (1929.4 vs 1940.8 ms); needs its own ABBA before any promotion.
+    variants["native-mtp-fused-n10"] = {
+        **variants["native-mtp-fused-default"],
+        "name": "native-mtp-fused-n10",
+        "description": "Fused MTP profile with draft horizon raised from 6 to 10 (H1 single factor)",
+        "cli_args": list(variants["native-mtp-fused-default"]["cli_args"]) + ["--spec-draft-n-max", "10"],
+    }
     variants["native-mtp-reference"] = {
         **variants["native-mtp-single-draft"],
         "name": "native-mtp-reference",
@@ -375,6 +605,8 @@ def get_available_variants(model_path: str, mtp_model_path: str) -> Dict[str, Di
         "is_mtp": False,
         "requires_linear": False,
     }
+
+    register_mmvq_mtp_variants(variants, horizons=(1, 2))
 
     return variants
 
@@ -618,7 +850,8 @@ def verify_server_log_routes(log_path: Path, requires_linear: bool, expected_syn
 
 
 def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, is_mtp: bool,
-                          count_to: int, timeout_sec: float = 120.0) -> Dict[str, Any]:
+                          count_to: int, timeout_sec: float = 120.0,
+                          workload: str = "count") -> Dict[str, Any]:
     """Execute canonical count request with monotonic timing including read, and strict validation.
     
     For count-60, both MTP and pure Target must report exactly 171 predicted
@@ -635,11 +868,16 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
 
     url = f"http://{host}:{port}/v1/chat/completions"
     payload = dict(PROMPT_PAYLOAD)
-    if count_to != 60:
+    if workload == "weightloss":
+        payload["messages"] = [{"role": "user", "content": WEIGHTLOSS_PROMPT}]
+        expected_content = None  # validated against the recorded variant set below
+    elif count_to != 60:
         payload["messages"] = [{"role": "user", "content":
             f"Count from 1 to {count_to}. Use commas without spaces. Output only the numbers."}]
         payload["max_tokens"] = max(192, 4 * count_to)
-    expected_content = CANONICAL_COUNT_STR if count_to == 60 else ",".join(str(i) for i in range(1, count_to + 1))
+        expected_content = ",".join(str(i) for i in range(1, count_to + 1))
+    else:
+        expected_content = CANONICAL_COUNT_STR
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
 
@@ -693,13 +931,27 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
             message = choice.get("message", {})
             content = str(message.get("content", ""))
 
-            exact_content_match = (content == expected_content)
+            if workload == "weightloss":
+                exact_content_match = content in _weightloss_variants()
+            else:
+                exact_content_match = (content == expected_content)
 
             # The fixed prompt_n/predicted_n oracle is specific to count-60.
             # Longer shapes still require the entire exact response and stop.
-            pred_n_valid = pred_n == EXPECTED_PREDICTED_N_TARGET if count_to == 60 else pred_n > 0
-            completion_n_valid = completion_tokens == EXPECTED_PREDICTED_N_TARGET if count_to == 60 else completion_tokens > 0
-            prompt_n_valid = prompt_n == EXPECTED_PROMPT_N if count_to == 60 else prompt_n > 0
+            # The weightloss workload pins prompt_n=31 and a completion-length
+            # band around the recorded natural answer (174), never the gate's 171.
+            if workload == "weightloss":
+                pred_n_valid = pred_n == completion_tokens
+                completion_n_valid = WEIGHTLOSS_COMPLETION_MIN <= completion_tokens <= WEIGHTLOSS_COMPLETION_MAX
+                prompt_n_valid = prompt_n == EXPECTED_PROMPT_N
+            elif count_to == 60:
+                pred_n_valid = pred_n == EXPECTED_PREDICTED_N_TARGET
+                completion_n_valid = completion_tokens == EXPECTED_PREDICTED_N_TARGET
+                prompt_n_valid = prompt_n == EXPECTED_PROMPT_N
+            else:
+                pred_n_valid = pred_n > 0
+                completion_n_valid = completion_tokens > 0
+                prompt_n_valid = prompt_n > 0
 
             is_valid = (
                 exact_content_match
@@ -716,7 +968,7 @@ def execute_bench_request(host: str, port: int, owned_proc: OwnedServerProcess, 
             err = None
             if not is_valid:
                 err = (
-                    f"Validation failed: exact_content_match={exact_content_match} (len={len(content)} vs {len(expected_content)}), "
+                    f"Validation failed: exact_content_match={exact_content_match} (len={len(content)} vs expected={'variant_set' if expected_content is None else len(expected_content)}), "
                     f"finish_reason={finish_reason}, prompt_n={prompt_n}, pred_n={pred_n} (valid={pred_n_valid}, is_mtp={is_mtp}), "
                     f"completion_tokens={completion_tokens} (valid={completion_n_valid}), predicted_ms={pred_ms}"
                 )
@@ -831,11 +1083,13 @@ def run_single_variant_trial(
     count_to: int = 60,
     legacy_mmvq_policy_unobservable: bool = False,
     deadline: Optional[float] = None,
+    workload: str = "count",
 ) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "variant": variant["name"],
         "trial_tag": trial_tag,
         "count_to": count_to,
+        "workload": workload,
         "port": port,
         "is_mtp": variant.get("is_mtp", False),
         "requires_linear": variant.get("requires_linear", False),
@@ -912,7 +1166,8 @@ def run_single_variant_trial(
         # Warmup request
         print(f"[*] Running warmup request for {variant['name']} [{trial_tag}]...")
         warmup = execute_bench_request(host, port, owned_proc=server, is_mtp=variant.get("is_mtp", False),
-                                       count_to=count_to, timeout_sec=bounded_timeout(deadline, 120.0))
+                                       count_to=count_to, timeout_sec=bounded_timeout(deadline, 120.0),
+                                       workload=workload)
         result["warmup"] = warmup
         if deadline is not None and time.perf_counter() >= deadline:
             result["error"] = "Matrix wall-clock deadline exceeded during warmup"
@@ -930,7 +1185,8 @@ def run_single_variant_trial(
         for r in range(repeats):
             time.sleep(0.5)
             metric = execute_bench_request(host, port, owned_proc=server, is_mtp=variant.get("is_mtp", False),
-                                           count_to=count_to, timeout_sec=bounded_timeout(deadline, 120.0))
+                                           count_to=count_to, timeout_sec=bounded_timeout(deadline, 120.0),
+                                           workload=workload)
             if deadline is not None and time.perf_counter() >= deadline:
                 result["error"] = f"Matrix wall-clock deadline exceeded during repeat {r+1}"
                 return result
@@ -985,6 +1241,7 @@ def run_abba_cross_matrix(
     legacy_mmvq_policy_unobservable: bool = False,
     max_wall_seconds: float = 1800.0,
     pilot: bool = False,
+    workload: str = "count",
 ) -> Dict[str, Any]:
     if blocks < 5 and not (dry_run or pilot):
         raise ValueError(f"formal hardware comparison requires at least 5 complete ABBA blocks; use --pilot for {blocks} exploratory blocks")
@@ -994,6 +1251,8 @@ def run_abba_cross_matrix(
         raise ValueError(f"repeats must be >= 1, got {repeats}")
     if count_to not in (60, 100):
         raise ValueError(f"only audited count lengths 60 or 100 are accepted, got {count_to}")
+    if workload not in ("count", "weightloss"):
+        raise ValueError(f"unknown workload {workload!r}")
 
     all_variants = get_available_variants(model_path, mtp_model_path)
     if variant_a_name not in all_variants:
@@ -1014,6 +1273,7 @@ def run_abba_cross_matrix(
     results_data: Dict[str, Any] = {
         "variant_a": var_a,
         "variant_b": var_b,
+        "workload": workload,
         "server_binary": str(Path(bin_path).resolve()),
         "server_binary_sha256": compute_sha256(bin_path),
         "server_binary_b": str(Path(bin_path_b or bin_path).resolve()),
@@ -1099,6 +1359,7 @@ def run_abba_cross_matrix(
                 count_to=count_to,
                 legacy_mmvq_policy_unobservable=legacy_mmvq_policy_unobservable,
                 deadline=deadline,
+                workload=workload,
             )
             results_data["trials"].append(trial_res)
 
@@ -1215,6 +1476,8 @@ def main():
                         help="Maximum matrix wall time in seconds (default: 1800; each request is also capped at 120)")
     parser.add_argument("--count-to", type=int, choices=(60, 100), default=60,
                         help="Exact counting workload: 60 uses the fixed 171-token gate; 100 tests longer decode")
+    parser.add_argument("--workload", choices=("count", "weightloss"), default="count",
+                        help="Request workload: count (canonical 1..60) or weightloss (G7 natural question, prompt_n=31)")
     parser.add_argument("--bin", default=DEFAULT_BIN, help="Path to llama-server binary")
     parser.add_argument("--bin-b", help="Optional server binary for B trials (e.g. isolated historical factor)")
     parser.add_argument("--legacy-mmvq-policy-unobservable", action="store_true",
@@ -1257,12 +1520,14 @@ def main():
         log_dir.mkdir(parents=True, exist_ok=True)
         trial = run_single_variant_trial(variants[args.variant_a], args.bin, args.model, args.host,
                                          find_free_port(args.host, args.port), log_dir,
-                                         f"smoke_{args.count_to}", repeats=args.repeats, count_to=args.count_to,
+                                         f"smoke_{args.workload}_{args.count_to}", repeats=args.repeats, count_to=args.count_to,
                                          legacy_mmvq_policy_unobservable=args.legacy_mmvq_policy_unobservable,
-                                         deadline=time.perf_counter() + args.max_wall_seconds)
+                                         deadline=time.perf_counter() + args.max_wall_seconds,
+                                         workload=args.workload)
         results = {
             "status": "SMOKE_PASS" if trial["success"] else "failed",
             "failure_reason": trial.get("error"), "count_to": args.count_to,
+        "workload": args.workload,
             "git_provenance": get_git_provenance(str(Path(__file__).parent.parent.resolve())),
             "server_binary_sha256": compute_sha256(args.bin), "trials": [trial],
         }
@@ -1275,6 +1540,7 @@ def main():
             legacy_mmvq_policy_unobservable=args.legacy_mmvq_policy_unobservable,
             max_wall_seconds=args.max_wall_seconds,
             pilot=args.pilot,
+            workload=args.workload,
         )
 
     print_summary_table(results)

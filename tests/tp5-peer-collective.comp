@@ -1,0 +1,80 @@
+#version 450
+// Model-free five-device all-reduce. One host allocation is imported once by
+// each physical GPU using HOST_COHERENT|DEVICE_COHERENT memory. No host thread
+// polls, sums, or publishes stage data while this kernel is executing.
+layout(local_size_x=256) in;
+layout(std430,binding=0) coherent volatile buffer Shared { uint words[]; };
+layout(std430,binding=0) coherent volatile buffer Shared128 { uvec4 vectors[]; };
+layout(push_constant) uniform Parameters {
+    uint rank; uint elements; uint stages; uint first_epoch; uint run;
+    uint stride_words; uint output_words; uint spin_max;
+    uint withhold_rank; uint withhold_stage;
+} p;
+shared uint ready;
+const uint RANKS=5u;
+
+void main() {
+    const uint lane=gl_LocalInvocationID.x;
+    const uint count=p.elements/4u;
+    vec4 state[4];
+    for(uint k=0u;k<4u;++k) {
+        const uint v=lane+k*256u;
+        if(v<count){
+            state[k]=vec4(float(p.rank+1u)*0.25+float(p.run%8u)*0.0625);
+            for(uint c=0u;c<4u;++c)state[k][c]+=float((4u*v+c)%7u)*0.03125;
+        }
+    }
+    bool failed=false;
+    for(uint stage=0u;stage<p.stages;++stage) {
+        const uint epoch=p.first_epoch+stage;
+        const uint bank=stage&1u;
+        const uint own=(bank*RANKS+p.rank)*p.stride_words;
+        // Safety of bank reuse: reaching stage(s+2) requires all five ready(s+1),
+        // each of which follows completion of that rank's reads from bank(s).
+        // Hence no peer can still read the bank about to be overwritten.
+        for(uint k=0u;k<4u;++k){
+            const uint v=lane+k*256u;
+            if(v<count)vectors[(own+16u)/4u+v]=floatBitsToUint(state[k]);
+        }
+        memoryBarrierBuffer();barrier();
+        if(lane==0u){
+            words[own+3u]=epoch;
+            if(!(p.rank==p.withhold_rank&&stage==p.withhold_stage))words[own]=epoch;
+            ready=0u;
+            for(uint spin=0u;spin<p.spin_max;++spin){
+                bool all_ready=true;bool any_error=false;
+                for(uint r=0u;r<RANKS;++r){
+                    const uint head=(bank*RANKS+r)*p.stride_words;
+                    all_ready=all_ready&&(words[head]==epoch);
+                    any_error=any_error||(words[head+1u]!=0u);
+                }
+                if(any_error)break;
+                if(all_ready){ready=1u;break;}
+            }
+            if(ready==0u)words[own+1u]=epoch;
+        }
+        barrier();memoryBarrierBuffer();
+        if(ready==0u){failed=true;break;}
+        for(uint k=0u;k<4u;++k){
+            const uint v=lane+k*256u;
+            if(v<count){
+                precise vec4 sum=vec4(0.0);
+                for(uint r=0u;r<RANKS;++r){
+                    const uint base=(bank*RANKS+r)*p.stride_words+16u;
+                    sum+=uintBitsToFloat(vectors[base/4u+v]);
+                }
+                precise vec4 scaled=sum*0.125;
+                precise vec4 biased=scaled+vec4(float(p.rank+1u)*0.25);
+                for(uint c=0u;c<4u;++c)state[k][c]=biased[c]+float((4u*v+c)%7u)*0.03125;
+            }
+        }
+        memoryBarrierBuffer();barrier();
+        if(lane==0u)words[own+2u]=epoch;
+        barrier();
+    }
+    for(uint k=0u;k<4u;++k){
+        const uint v=lane+k*256u;
+        if(v<count)vectors[(p.output_words+p.rank*p.elements)/4u+v]=
+            failed?uvec4(0x7fc00000u):floatBitsToUint(state[k]);
+    }
+}

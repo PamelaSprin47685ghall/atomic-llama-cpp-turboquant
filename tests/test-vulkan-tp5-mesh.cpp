@@ -23,6 +23,9 @@
 #include "ggml-backend.h"
 #include "ggml-vulkan.h"
 #include "ggml-predefined.h"
+#include "../ggml/src/ggml-impl.h"
+#include "../ggml/src/ggml-vulkan/ggml-vulkan-internal.h"
+#include "../ggml/src/ggml-vulkan/ggml-vulkan-tp5-command.h"
 
 #include <cstdio>
 #include <cstring>
@@ -44,7 +47,7 @@ typedef bool (*submit_epoch_chain_t)(void *,
                                      const std::vector<std::vector<ggml_tensor *>> &,
                                      const struct ggml_predefined_frame *, uint32_t, uint32_t);
 typedef bool (*get_cached_cmd_bufs_t)(ggml_backend_t, ggml_cgraph *, std::vector<void *> &);
-typedef bool (*prepare_graph_t)(void *, size_t, ggml_cgraph *, bool);
+typedef bool (*prepare_graph_t)(void *, size_t, ggml_cgraph *, bool, size_t);
 
 static int g_failures = 0;
 #define TEST_ASSERT(cond) do { \
@@ -73,6 +76,8 @@ typedef bool (*set_predefined_rows_t)(ggml_backend_t, uint32_t, uint32_t);
 typedef void (*set_wire_output_t)(ggml_backend_t, ggml_tensor *, bool, size_t, bool);
 static set_predefined_rows_t g_set_predefined_rows = nullptr;
 static set_wire_output_t     g_set_wire_output     = nullptr;
+typedef bool (*get_relay_slot_t)(void *, size_t, size_t, const void **, size_t *, const volatile uint32_t **);
+static get_relay_slot_t      g_get_relay_slot      = nullptr;
 static submit_epoch_chain_t               g_submit_epoch_chain  = nullptr;
 static get_cached_cmd_bufs_t              g_get_cached_cmd_bufs = nullptr;
 static prepare_graph_t                    g_prepare_graph       = nullptr;
@@ -112,6 +117,8 @@ static void setup(const std::vector<int> & dev_ids) {
         ggml_backend_vk_reg(), "ggml_backend_set_predefined_rows");
     g_set_wire_output = (set_wire_output_t) ggml_backend_reg_get_proc_address(
         ggml_backend_vk_reg(), "ggml_backend_set_wire_output");
+    g_get_relay_slot = (get_relay_slot_t) ggml_backend_reg_get_proc_address(
+        ggml_backend_vk_reg(), "ggml_backend_comm_get_relay_slot");
     if (!g_comm_init || !g_comm_free || !g_allreduce) {
         fprintf(stderr, "Vulkan registry does not expose the comm interface\n");
         exit(2);
@@ -812,15 +819,16 @@ struct chain_stage_data {
 // - Pure collective chain with empty compute vectors across distinct per-stage tensors
 // - Checks ALL stage outputs against CPU oracle
 // - Guard bytes on offset views verified untouched
-// - Pre-submit safety failure verification for malformed input (>128 stages)
+// - Pre-submit safety failure verification beyond the native stage capacity
 static void run_epoch_chain_regression(void * comm, const std::vector<ggml_backend_t> & backends, bool is_f16_wire) {
     TEST_ASSERT(g_submit_epoch_chain);
     const size_t P = backends.size();
     fprintf(stderr, "  running epoch-chain regression (wire=%s, P=%zu)...\n", is_f16_wire ? "f16" : "f32", P);
 
-    // Pre-flight check: malformed/excessive stages (>128 stages) MUST safely fail closed (return false) before submission
+    // Excessive stages must fail before any native submission. Derive the
+    // boundary from the shared ABI rather than a superseded literal limit.
     {
-        const size_t                                  invalid_stage_count = 129;
+        const size_t                                  invalid_stage_count = VK_TP5_RELAY_ROUTE_MAX + 1;
         std::vector<std::vector<std::vector<void *>>> invalid_cbs(invalid_stage_count + 1,
                                                                   std::vector<std::vector<void *>>(P));
         std::vector<std::vector<ggml_tensor *>> invalid_tensors(invalid_stage_count, std::vector<ggml_tensor *>(P));
@@ -836,12 +844,12 @@ static void run_epoch_chain_regression(void * comm, const std::vector<ggml_backe
         }
         bool preflight_res = g_submit_epoch_chain(comm, invalid_cbs, invalid_tensors, nullptr, 0, 0);
         if (preflight_res) {
-            fprintf(stderr, "FAIL: submit_epoch_chain accepted >128 stages (%zu); expected pre-submit false!\n",
+            fprintf(stderr, "FAIL: submit_epoch_chain accepted excess stages (%zu); expected pre-submit false!\n",
                     invalid_stage_count);
             g_failures++;
             return;
         }
-        fprintf(stderr, "    preflight >128 stages rejection: OK\n");
+        fprintf(stderr, "    preflight excess stages rejection: OK\n");
     }
 
     // Prepare test calls exercising:
@@ -1281,7 +1289,7 @@ static void run_capacity_chain_regression(
             fill_tensor(src1, v1);
 
             g_set_wire_output(backends[j], dst, false, 0, is_f16_wire ? false : true);
-            TEST_ASSERT(g_prepare_graph(comm, j, gf, true));
+            TEST_ASSERT(g_prepare_graph(comm, j, gf, true, 0));
             TEST_ASSERT(g_get_cached_cmd_bufs(backends[j], gf, cbs[0][j]));
         }
 
@@ -1329,6 +1337,329 @@ static void run_capacity_chain_regression(
     }
 
     fprintf(stderr, "  capacity-chain regression complete: OK\n");
+}
+
+static void run_gather_capacity_proof(
+        void * comm,
+        const std::vector<ggml_backend_t> & backends,
+        const std::string & sync_str) {
+    TEST_ASSERT(g_submit_epoch_chain);
+    const size_t P = backends.size();
+    if (P != 5 || sync_str != "relay") {
+        fprintf(stderr, "  gather capacity proof requires 5 ranks and RELAY sync (P=%zu, sync=%s); skipping\n",
+                P, sync_str.c_str());
+        return;
+    }
+    TEST_ASSERT(g_get_relay_slot != nullptr);
+    TEST_ASSERT(g_set_predefined_rows != nullptr);
+    using set_frame_t = bool (*)(ggml_backend_t, const ggml_predefined_frame *, uint32_t, uint32_t);
+    const auto set_frame = reinterpret_cast<set_frame_t>(ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[0])), "ggml_backend_set_predefined_frame"));
+    TEST_ASSERT(set_frame);
+    fprintf(stderr, "  running native AllGather capacity proof (shards=[103,103,102,102,102], C=4)...\n");
+
+    const std::vector<uint32_t> shard_cols = { 103, 103, 102, 102, 102 };
+    const uint32_t total_cols = 512;
+    const uint32_t cap_rows = 4;
+    const std::vector<uint32_t> active_seq = { 4, 1, 3, 2, 1 };
+
+    // Allocate per-rank shard sources, producer graphs, and downstream consumer graphs
+    std::vector<ggml_context *> rank_ctxs(P, nullptr);
+    std::vector<ggml_backend_buffer_t> rank_bufs(P, nullptr);
+    std::vector<ggml_cgraph *> prod_graphs(P, nullptr);
+    std::vector<ggml_cgraph *> cons_graphs(P, nullptr);
+    std::vector<ggml_tensor *> shard_in_tensors(P, nullptr);
+    std::vector<ggml_tensor *> shard_bias_tensors(P, nullptr);
+    std::vector<ggml_tensor *> shard_out_tensors(P, nullptr);
+    std::vector<ggml_tensor *> dst_gathered(P, nullptr);
+    std::vector<ggml_tensor *> consumer_probs(P, nullptr);
+    std::vector<std::vector<std::vector<void *>>> cbs(2, std::vector<std::vector<void *>>(P));
+
+    for (size_t j = 0; j < P; ++j) {
+        auto * ctx = ggml_init({ 8 * 1024 * 1024, nullptr, true });
+        TEST_ASSERT(ctx);
+        rank_ctxs[j] = ctx;
+
+        // Producer COMPUTE graph: adds bias to shard_in to produce shard_out (real compute CB)
+        auto * shard_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, shard_cols[j], cap_rows);
+        auto * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, shard_cols[j], cap_rows);
+        auto * shard_out = ggml_add(ctx, shard_in, bias);
+        ggml_set_name(shard_out, "router_shard_out");
+
+        // AllGather destination tensor: properly allocated 2D tensor [512, 4] with op=CONT and src[0]=shard_out
+        auto * gathered = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, total_cols, cap_rows);
+        gathered->op = GGML_OP_CONT;
+        gathered->flags |= GGML_TENSOR_FLAG_ALLGATHER;
+        gathered->src[0] = shard_out;
+        ggml_set_name(gathered, "router_gathered_512");
+
+        // Downstream consumer COMPUTE graph: Softmax over reconstituted 512 scores
+        auto * probs = ggml_soft_max(ctx, gathered);
+        ggml_set_name(probs, "router_probs");
+
+        auto * gf_prod = ggml_new_graph_custom(ctx, 16, false);
+        ggml_build_forward_expand(gf_prod, shard_out);
+        prod_graphs[j] = gf_prod;
+
+        auto * gf_cons = ggml_new_graph_custom(ctx, 16, false);
+        ggml_build_forward_expand(gf_cons, probs);
+        *gf_cons = ggml_graph_view(gf_cons, gf_cons->n_nodes - 1, gf_cons->n_nodes);
+        cons_graphs[j] = gf_cons;
+
+        auto buf = ggml_backend_alloc_ctx_tensors(ctx, backends[j]);
+        TEST_ASSERT(buf);
+        rank_bufs[j] = buf;
+
+        shard_in_tensors[j] = shard_in;
+        shard_bias_tensors[j] = bias;
+        shard_out_tensors[j] = shard_out;
+        dst_gathered[j] = gathered;
+        consumer_probs[j] = probs;
+
+        fill_tensor(shard_in, std::vector<float>(shard_cols[j] * cap_rows, 0.0f));
+        fill_tensor(bias, std::vector<float>(shard_cols[j] * cap_rows, 0.0f));
+        fill_tensor(gathered, std::vector<float>(total_cols * cap_rows, 0.0f));
+        TEST_ASSERT(g_set_predefined_rows(backends[j], cap_rows, cap_rows));
+        // Record producer graph via real graph_compute, then populate cbs[0]
+        TEST_ASSERT(g_prepare_graph(comm, j, gf_prod, false, 0));
+        TEST_ASSERT(ggml_backend_graph_compute(backends[j], gf_prod) == GGML_STATUS_SUCCESS);
+        TEST_ASSERT(g_get_cached_cmd_bufs(backends[j], gf_prod, cbs[0][j]));
+
+        const auto producer_program = ggml_vk_tp5_graph_program(backends[j], cbs[0][j].front());
+        fprintf(stderr, "    producer rank=%zu program=%d stage=%zu rows=%u outputs=%u dispatches=%zu complete=%d\n",
+                j, bool(producer_program), producer_program ? producer_program->predefined_stage : SIZE_MAX,
+                producer_program ? producer_program->predefined_capacity_rows : 0u,
+                producer_program ? producer_program->predefined_capacity_outputs : 0u,
+                producer_program ? producer_program->predefined_dispatches.size() : 0u,
+                producer_program && producer_program->predefined_complete);
+
+        // DRAFT warmup creates the argument arena. A real TP5 TARGET graph
+        // must not be relabeled as a standalone draft graph at stage zero.
+        ggml_predefined_frame maximum{};
+        maximum.version = GGML_PREDEFINED_ABI_VERSION;
+        maximum.phase = GGML_PREDEFINED_TARGET;
+        maximum.epoch_lo = 1;
+        maximum.active_sequences = 1;
+        maximum.active_tokens = cap_rows;
+        maximum.active_outputs = cap_rows;
+        maximum.context_tokens = cap_rows;
+        TEST_ASSERT(set_frame(backends[j], &maximum, cap_rows, cap_rows));
+
+        // Record consumer graph via real graph_compute, then populate cbs[1]
+        TEST_ASSERT(g_prepare_graph(comm, j, gf_cons, false, 1));
+        TEST_ASSERT(ggml_backend_graph_compute(backends[j], gf_cons) == GGML_STATUS_SUCCESS);
+        TEST_ASSERT(g_get_cached_cmd_bufs(backends[j], gf_cons, cbs[1][j]));
+    }
+
+    std::vector<std::vector<ggml_tensor *>> stage_tensors(1, dst_gathered);
+
+    // Pre-flight check: malformed missing metadata / extent domain failure rejection
+    // Valid stage tensors and recorded CBs used; only domain field differs.
+    // Both asymmetries must be rejected:
+    // 1) active_outputs != active_tokens with equal capacity
+    // 2) capacity_outputs != capacity_rows with equal active counts
+    {
+        ggml_predefined_frame asym_active_frame{};
+        asym_active_frame.version = GGML_PREDEFINED_ABI_VERSION;
+        asym_active_frame.phase = GGML_PREDEFINED_TARGET;
+        asym_active_frame.active_sequences = 1;
+        asym_active_frame.active_tokens = 2;
+        asym_active_frame.active_outputs = 1; // active mismatch: outputs 1 != tokens 2
+
+        bool rej_active = g_submit_epoch_chain(comm, cbs, stage_tensors, &asym_active_frame, cap_rows, cap_rows);
+        TEST_ASSERT(!rej_active);
+        fprintf(stderr, "    preflight asymmetric active count rejection: OK\n");
+
+        ggml_predefined_frame asym_cap_frame{};
+        asym_cap_frame.version = GGML_PREDEFINED_ABI_VERSION;
+        asym_cap_frame.phase = GGML_PREDEFINED_TARGET;
+        asym_cap_frame.active_sequences = 1;
+        asym_cap_frame.active_tokens = 2;
+        asym_cap_frame.active_outputs = 2; // active counts match, but capacity_outputs (8) != capacity_rows (4)
+        bool rej_cap = g_submit_epoch_chain(comm, cbs, stage_tensors, &asym_cap_frame, cap_rows, 8);
+        TEST_ASSERT(!rej_cap);
+        fprintf(stderr, "    preflight asymmetric capacity rejection: OK\n");
+    }
+
+    constexpr uint32_t HOST_MAILBOX_SENTINEL = 0x5a5a5a5au;
+    constexpr uint32_t P1_SOURCE_POISON      = 0x7f7f7f7fu;
+    constexpr uint32_t OUTPUT_TAIL_SENTINEL  = 0x4e99aa55u;
+
+    // Transition through active rows: 4 -> 1 -> 3 -> 2 -> 1
+    for (size_t step = 0; step < active_seq.size(); ++step) {
+        const uint32_t act_rows = active_seq[step];
+        const size_t bank = (step & 1); // two-bank alternating
+        fprintf(stderr, "    step %zu: active_rows=%u (capacity=%u)...\n", step, act_rows, cap_rows);
+
+        // Seed actual host-import source bank slot with distinct HOST_MAILBOX_SENTINEL before P1 runs
+        for (size_t rk = 0; rk < P; ++rk) {
+            const void * slot_ptr = nullptr;
+            size_t rank_stride = 0;
+            const volatile uint32_t * status_words = nullptr;
+            TEST_ASSERT(g_get_relay_slot(comm, bank, rk, &slot_ptr, &rank_stride, &status_words));
+            TEST_ASSERT(slot_ptr != nullptr && rank_stride >= shard_cols[rk] * cap_rows * sizeof(float));
+            uint32_t * raw_slot = const_cast<uint32_t *>(static_cast<const uint32_t *>(slot_ptr));
+            for (size_t w = 0; w < shard_cols[rk] * cap_rows; ++w) {
+                raw_slot[w] = HOST_MAILBOX_SENTINEL;
+            }
+        }
+
+        // Change both score values and their normalized probabilities per
+        // epoch/row; repeated bank use must not retain a prior consumer result.
+        // Inactive rows [act_rows, cap_rows): shard_in filled with P1_SOURCE_POISON (0x7f7f7f7f)
+        for (size_t j = 0; j < P; ++j) {
+            std::vector<float> data_in(shard_cols[j] * cap_rows);
+            std::vector<float> data_bias(shard_cols[j] * cap_rows, 0.0f);
+            for (uint32_t r = 0; r < act_rows; ++r) {
+                for (uint32_t c = 0; c < shard_cols[j]; ++c) {
+                    data_in[r * shard_cols[j] + c] =
+                        float((step + 1) * ((j + 1) * 8 + (r + 1) * (c % 17))) / 32.0f - 1.0f;
+                    data_bias[r * shard_cols[j] + c] = 1.0f;
+                }
+            }
+            for (uint32_t r = act_rows; r < cap_rows; ++r) {
+                for (uint32_t c = 0; c < shard_cols[j]; ++c) {
+                    float poison_val = 0.0f;
+                    memcpy(&poison_val, &P1_SOURCE_POISON, sizeof(float));
+                    data_in[r * shard_cols[j] + c] = poison_val;
+                    data_bias[r * shard_cols[j] + c] = 0.0f;
+                }
+            }
+            fill_tensor(shard_in_tensors[j], data_in);
+            fill_tensor(shard_bias_tensors[j], data_bias);
+            const std::vector<uint32_t> producer_seed(shard_cols[j] * cap_rows, OUTPUT_TAIL_SENTINEL);
+            const std::vector<uint32_t> consumer_seed(total_cols * cap_rows, OUTPUT_TAIL_SENTINEL);
+            ggml_backend_tensor_set(shard_out_tensors[j], producer_seed.data(), 0, producer_seed.size() * sizeof(uint32_t));
+            ggml_backend_tensor_set(consumer_probs[j], consumer_seed.data(), 0, consumer_seed.size() * sizeof(uint32_t));
+            ggml_backend_synchronize(backends[j]);
+        }
+
+        ggml_predefined_frame frame{};
+        frame.version = GGML_PREDEFINED_ABI_VERSION;
+        frame.phase = GGML_PREDEFINED_TARGET;
+        frame.active_sequences = 1;
+        frame.active_tokens = act_rows;
+        frame.active_outputs = act_rows;
+
+        bool ok = g_submit_epoch_chain(comm, cbs, stage_tensors, &frame, cap_rows, cap_rows);
+        if (!ok) {
+            fprintf(stderr, "FAIL: submit_epoch_chain for AllGather step %zu (act=%u) returned false\n",
+                    step, act_rows);
+            g_failures++;
+            break;
+        }
+
+        for (size_t j = 0; j < P; ++j) {
+            ggml_backend_synchronize(backends[j]);
+        }
+
+        // Checking only P1/P2 tails can hide a producer or consumer that
+        // nevertheless executed all capacity rows. Inspect their real outputs.
+        for (size_t j = 0; j < P; ++j) {
+            std::vector<uint32_t> producer_words(shard_cols[j] * cap_rows);
+            std::vector<uint32_t> consumer_words(total_cols * cap_rows);
+            ggml_backend_tensor_get(shard_out_tensors[j], producer_words.data(), 0, producer_words.size() * sizeof(uint32_t));
+            ggml_backend_tensor_get(consumer_probs[j], consumer_words.data(), 0, consumer_words.size() * sizeof(uint32_t));
+            for (size_t w = act_rows * shard_cols[j]; w < producer_words.size(); ++w) {
+                TEST_ASSERT(producer_words[w] == OUTPUT_TAIL_SENTINEL);
+            }
+            for (size_t w = act_rows * total_cols; w < consumer_words.size(); ++w) {
+                TEST_ASSERT(consumer_words[w] == OUTPUT_TAIL_SENTINEL);
+            }
+        }
+
+        // 1) Direct verification of actual P1 host-import bank tail sentinels and status[9..12]:
+        // Verify status[9..12] published by tp5_gather_p1 shader
+        for (size_t rk = 0; rk < P; ++rk) {
+            const void * slot_ptr = nullptr;
+            size_t rank_stride = 0;
+            const volatile uint32_t * status_words = nullptr;
+            TEST_ASSERT(g_get_relay_slot(comm, bank, rk, &slot_ptr, &rank_stride, &status_words));
+            TEST_ASSERT(slot_ptr != nullptr && status_words != nullptr);
+
+            const uint32_t published_words = status_words[9];
+            const uint32_t expected_words  = act_rows * shard_cols[rk];
+            const uint32_t published_cols  = status_words[10];
+            const uint32_t published_rows  = status_words[11];
+            const uint32_t published_epoch = status_words[12];
+            TEST_ASSERT(published_words == expected_words);
+            TEST_ASSERT(published_cols  == shard_cols[rk]);
+            TEST_ASSERT(published_rows  == act_rows);
+            TEST_ASSERT(published_epoch == uint32_t(step + 1));
+
+            // Directly inspect host-import bank words:
+            // Active words [0, expected_words) must NOT equal HOST_MAILBOX_SENTINEL.
+            // Inactive tail words [expected_words, capacity_words) MUST remain untouched HOST_MAILBOX_SENTINEL!
+            const uint32_t * words = static_cast<const uint32_t *>(slot_ptr);
+            for (size_t w = 0; w < expected_words; ++w) {
+                TEST_ASSERT(words[w] != HOST_MAILBOX_SENTINEL);
+            }
+            const size_t capacity_words = shard_cols[rk] * cap_rows;
+            for (size_t w = expected_words; w < capacity_words; ++w) {
+                if (words[w] != HOST_MAILBOX_SENTINEL) {
+                    fprintf(stderr, "FAIL: P1 over-copied into inactive host-import tail! rank=%zu word=%zu got=0x%08x expect=0x%08x\n",
+                            rk, w, words[w], HOST_MAILBOX_SENTINEL);
+                    g_failures++;
+                    return;
+                }
+            }
+        }
+
+        // 2) Verify reconstituted destination tensor and downstream Softmax across active rows
+        for (size_t j = 0; j < P; ++j) {
+            std::vector<float> got(total_cols * cap_rows);
+            std::vector<float> got_probs(total_cols * cap_rows);
+            read_tensor(dst_gathered[j], got);
+            read_tensor(consumer_probs[j], got_probs);
+
+            for (uint32_t r = 0; r < act_rows; ++r) {
+                float max_val = -INFINITY;
+                size_t col_offs = 0;
+                for (size_t rk = 0; rk < P; ++rk) {
+                    for (uint32_t c = 0; c < shard_cols[rk]; ++c) {
+                        float expect = float((step + 1) * ((rk + 1) * 8 + (r + 1) * (c % 17))) / 32.0f;
+                        float actual = got[r * total_cols + col_offs + c];
+                        if (actual != expect) {
+                            fprintf(stderr, "FAIL: AllGather mismatch step %zu rank %zu row %u col %zu: got=%f expect=%f\n",
+                                    step, j, r, col_offs + c, actual, expect);
+                            g_failures++;
+                            return;
+                        }
+                        if (actual > max_val) max_val = actual;
+                    }
+                    col_offs += shard_cols[rk];
+                }
+
+                // The scalar double oracle is independent of the native
+                // consumer; finite output and every probability are checked.
+                double sum_exp = 0.0;
+                for (size_t c = 0; c < total_cols; ++c) {
+                    sum_exp += std::exp(double(got[r * total_cols + c] - max_val));
+                }
+                for (size_t c = 0; c < total_cols; ++c) {
+                    float expect_prob = float(std::exp(double(got[r * total_cols + c] - max_val)) / sum_exp);
+                    float actual_prob = got_probs[r * total_cols + c];
+                    if (!std::isfinite(actual_prob) || std::fabs(actual_prob - expect_prob) > 2e-6f) {
+                        fprintf(stderr, "FAIL: Softmax mismatch step %zu rank %zu row %u col %zu: got=%f expect=%f\n",
+                                step, j, r, c, actual_prob, expect_prob);
+                        g_failures++;
+                        return;
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "    step %zu (active_rows=%u): verified exact scores, source tail, epoch and softmax across all ranks: OK\n",
+                step, act_rows);
+    }
+
+    for (size_t j = 0; j < P; ++j) {
+        ggml_backend_synchronize(backends[j]);
+    }
+    for (size_t j = 0; j < P; ++j) {
+        if (rank_bufs[j]) ggml_backend_buffer_free(rank_bufs[j]);
+        if (rank_ctxs[j]) ggml_free(rank_ctxs[j]);
+    }
+    fprintf(stderr, "  native AllGather capacity proof complete: OK\n");
 }
 
 // Paired warm measurements. Both paths execute and validate the same work;
@@ -1515,7 +1846,7 @@ static void run_producer_wire_regression(void * comm) {
             for (size_t rank = 0; rank < ranks; ++rank) {
                 auto & p = producers[stage][rank];
                 inputs(p, round, rank, stage);
-                TEST_ASSERT(g_prepare_graph(comm, rank, p.graph, false));
+                TEST_ASSERT(g_prepare_graph(comm, rank, p.graph, false, stage));
                 TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], p.graph) == GGML_STATUS_SUCCESS);
                 std::vector<float> values(width);
                 read_tensor(p.output, values);
@@ -1537,7 +1868,7 @@ static void run_producer_wire_regression(void * comm) {
             for (size_t rank = 0; rank < ranks; ++rank) {
                 auto & p = producers[stage][rank];
                 inputs(p, round, rank, stage);
-                TEST_ASSERT(g_prepare_graph(comm, rank, p.graph, true));
+                TEST_ASSERT(g_prepare_graph(comm, rank, p.graph, true, stage));
                 if (round >= 2) {
                     TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], p.graph, cbs[stage][rank]));
                 } else {
@@ -1717,13 +2048,13 @@ static void run_hc_sum_regression(void * comm) {
         inputs(round);
         for (size_t rank = 0; rank < ranks; ++rank) {
             auto & p = consumers[rank];
-            TEST_ASSERT(g_prepare_graph(comm, rank, p.producer_graph, false));
+            TEST_ASSERT(g_prepare_graph(comm, rank, p.producer_graph, false, 0));
             TEST_ASSERT(ggml_backend_graph_compute_async(g_backends[rank], p.producer_graph) == GGML_STATUS_SUCCESS);
         }
         TEST_ASSERT(g_allreduce(comm, outputs[0].data()));
         for (size_t rank = 0; rank < ranks; ++rank) {
             auto & p = consumers[rank];
-            TEST_ASSERT(g_prepare_graph(comm, rank, p.graph, false));
+            TEST_ASSERT(g_prepare_graph(comm, rank, p.graph, false, 1));
             TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], p.graph) == GGML_STATUS_SUCCESS);
             auto & data = intermediate[round][rank];
             ggml_backend_tensor_get(p.combined, data.data(), 0, streams * width * sizeof(float));
@@ -1741,7 +2072,7 @@ static void run_hc_sum_regression(void * comm) {
         for (size_t stage = 0; stage < 2; ++stage) {
             for (size_t rank = 0; rank < ranks; ++rank) {
                 auto * graph = stage == 0 ? consumers[rank].producer_graph : consumers[rank].graph;
-                TEST_ASSERT(g_prepare_graph(comm, rank, graph, true));
+                TEST_ASSERT(g_prepare_graph(comm, rank, graph, true, stage));
                 if (cached && !g_get_cached_cmd_bufs(g_backends[rank], graph, cbs[stage][rank]))
                     cached = false;
             }
@@ -1752,7 +2083,7 @@ static void run_hc_sum_regression(void * comm) {
             for (size_t stage = 0; stage < 2; ++stage) {
                 for (size_t rank = 0; rank < ranks; ++rank) {
                     auto * graph = stage == 0 ? consumers[rank].producer_graph : consumers[rank].graph;
-                    TEST_ASSERT(g_prepare_graph(comm, rank, graph, true));
+                    TEST_ASSERT(g_prepare_graph(comm, rank, graph, true, stage));
                     TEST_ASSERT(ggml_backend_graph_compute_async(g_backends[rank], graph) == GGML_STATUS_SUCCESS);
                 }
                 TEST_ASSERT(g_allreduce(comm, outputs[stage].data()));
@@ -1785,14 +2116,14 @@ static void run_hc_sum_regression(void * comm) {
             inputs(10 + r);
             for (size_t rank = 0; rank < ranks; ++rank) {
                 auto & p = consumers[rank];
-                TEST_ASSERT(g_prepare_graph(comm, rank, p.producer_graph, false));
+                TEST_ASSERT(g_prepare_graph(comm, rank, p.producer_graph, false, 0));
                 TEST_ASSERT(ggml_backend_graph_compute_async(g_backends[rank], p.producer_graph) ==
                             GGML_STATUS_SUCCESS);
             }
             TEST_ASSERT(g_allreduce(comm, inel_outputs[0].data()));
             for (size_t rank = 0; rank < ranks; ++rank) {
                 auto & p = consumers[rank];
-                TEST_ASSERT(g_prepare_graph(comm, rank, p.ineligible_graph, false));
+                TEST_ASSERT(g_prepare_graph(comm, rank, p.ineligible_graph, false, 1));
                 TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], p.ineligible_graph) == GGML_STATUS_SUCCESS);
                 std::vector<float> values(width);
                 read_tensor(p.ineligible_output, values);
@@ -1807,7 +2138,7 @@ static void run_hc_sum_regression(void * comm) {
         for (int warmup = 0; warmup < 2; ++warmup) {
             for (size_t rank = 0; rank < ranks; ++rank) {
                 for (auto * graph : { consumers[rank].producer_graph, consumers[rank].ineligible_graph }) {
-                    TEST_ASSERT(g_prepare_graph(comm, rank, graph, true));
+                    TEST_ASSERT(g_prepare_graph(comm, rank, graph, true, graph == consumers[rank].producer_graph ? 0 : 1));
                     TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], graph) == GGML_STATUS_SUCCESS);
                 }
             }
@@ -1817,9 +2148,9 @@ static void run_hc_sum_regression(void * comm) {
             inputs(10 + r);
             std::vector<std::vector<std::vector<void *>>> cbs(3, std::vector<std::vector<void *>>(ranks));
             for (size_t rank = 0; rank < ranks; ++rank) {
-                TEST_ASSERT(g_prepare_graph(comm, rank, consumers[rank].producer_graph, true));
+                TEST_ASSERT(g_prepare_graph(comm, rank, consumers[rank].producer_graph, true, 0));
                 TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], consumers[rank].producer_graph, cbs[0][rank]));
-                TEST_ASSERT(g_prepare_graph(comm, rank, consumers[rank].ineligible_graph, true));
+                TEST_ASSERT(g_prepare_graph(comm, rank, consumers[rank].ineligible_graph, true, 1));
                 TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], consumers[rank].ineligible_graph, cbs[1][rank]));
             }
             TEST_ASSERT(g_submit_epoch_chain(comm, cbs, inel_outputs, nullptr, 0, 0));
@@ -1844,14 +2175,14 @@ static void run_hc_sum_regression(void * comm) {
             inputs(20 + r);
             for (size_t rank = 0; rank < ranks; ++rank) {
                 auto & p = consumers[rank];
-                TEST_ASSERT(g_prepare_graph(comm, rank, p.producer_graph, false));
+                TEST_ASSERT(g_prepare_graph(comm, rank, p.producer_graph, false, 0));
                 TEST_ASSERT(ggml_backend_graph_compute_async(g_backends[rank], p.producer_graph) ==
                             GGML_STATUS_SUCCESS);
             }
             TEST_ASSERT(g_allreduce(comm, outputs[0].data()));
             for (size_t rank = 0; rank < ranks; ++rank) {
                 auto & p = consumers[rank];
-                TEST_ASSERT(g_prepare_graph(comm, rank, p.graph, false));
+                TEST_ASSERT(g_prepare_graph(comm, rank, p.graph, false, 1));
                 TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], p.graph) == GGML_STATUS_SUCCESS);
                 auto & data = hc_intermediate[r][rank];
                 ggml_backend_tensor_get(p.combined, data.data(), 0, streams * width * sizeof(float));
@@ -1869,7 +2200,7 @@ static void run_hc_sum_regression(void * comm) {
         for (int warmup = 0; warmup < 2; ++warmup) {
             for (size_t rank = 0; rank < ranks; ++rank) {
                 for (auto * graph : { consumers[rank].producer_graph, consumers[rank].graph }) {
-                    TEST_ASSERT(g_prepare_graph(comm, rank, graph, true));
+                    TEST_ASSERT(g_prepare_graph(comm, rank, graph, true, graph == consumers[rank].producer_graph ? 0 : 1));
                     TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], graph) == GGML_STATUS_SUCCESS);
                 }
             }
@@ -1881,7 +2212,7 @@ static void run_hc_sum_regression(void * comm) {
             for (size_t stage = 0; stage < 2; ++stage) {
                 for (size_t rank = 0; rank < ranks; ++rank) {
                     auto * graph = stage == 0 ? consumers[rank].producer_graph : consumers[rank].graph;
-                    TEST_ASSERT(g_prepare_graph(comm, rank, graph, true));
+                    TEST_ASSERT(g_prepare_graph(comm, rank, graph, true, stage));
                     TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], graph, cbs[stage][rank]));
                 }
             }
@@ -1942,13 +2273,13 @@ static void run_hc_sum_regression(void * comm) {
         fill_churn_inputs(p_idx, eps, seed_offset);
         for (size_t rank = 0; rank < ranks; ++rank) {
             auto & p = consumers[rank];
-            TEST_ASSERT(g_prepare_graph(comm, rank, p.producer_graph, true));
+            TEST_ASSERT(g_prepare_graph(comm, rank, p.producer_graph, true, 0));
             TEST_ASSERT(ggml_backend_graph_compute_async(g_backends[rank], p.producer_graph) == GGML_STATUS_SUCCESS);
         }
         TEST_ASSERT(g_allreduce(comm, outputs[0].data()));
         for (size_t rank = 0; rank < ranks; ++rank) {
             auto & p = consumers[rank];
-            TEST_ASSERT(g_prepare_graph(comm, rank, p.graph, true));
+            TEST_ASSERT(g_prepare_graph(comm, rank, p.graph, true, 1));
             TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], p.graph) == GGML_STATUS_SUCCESS);
             auto & data = ref_intermediate[rank];
             ggml_backend_tensor_get(p.combined, data.data(), 0, streams * width * sizeof(float));
@@ -1966,7 +2297,7 @@ static void run_hc_sum_regression(void * comm) {
         for (size_t stage = 0; stage < 2; ++stage) {
             for (size_t rank = 0; rank < ranks; ++rank) {
                 auto * graph = stage == 0 ? consumers[rank].producer_graph : consumers[rank].graph;
-                TEST_ASSERT(g_prepare_graph(comm, rank, graph, true));
+                TEST_ASSERT(g_prepare_graph(comm, rank, graph, true, stage));
                 TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], graph, cbs[stage][rank]));
             }
         }
@@ -2026,6 +2357,7 @@ int main(int argc, char ** argv) {
     bool             run_chain_reg   = false;
     bool             benchmark_chain = false;
     bool             test_capacity_chain = false;
+    bool             test_gather_capacity = false;
     const char * env_wire = getenv("GGML_TP5_WIRE");
     std::string wire_str = env_wire ? env_wire : "f16";
     std::string sync_str = "timeline";
@@ -2075,6 +2407,8 @@ int main(int argc, char ** argv) {
             run_chain_reg = true;
         else if (a == "--test-capacity-chain")
             test_capacity_chain = true;
+        else if (a == "--test-gather-capacity")
+            test_gather_capacity = true;
         else if (a == "--benchmark-chain")
             benchmark_chain = true;
     }
@@ -2083,7 +2417,7 @@ int main(int argc, char ** argv) {
         return 2;
     }
     if ((sync_str == "timeline" || sync_str == "star" || sync_str == "relay") &&
-        (run_chain_reg || adversarial || test_capacity_chain)) {
+        (run_chain_reg || adversarial || test_capacity_chain || test_gather_capacity)) {
         // The cached-compute fixture explicitly exercises replay, which is
         // otherwise opt-in independently of collective-plan replay.
         setenv("GGML_VK_CMD_REPLAY", "1", 1);
@@ -2102,6 +2436,18 @@ int main(int argc, char ** argv) {
     if (!comm) {
         fprintf(stderr, "comm_init failed\n");
         return 2;
+    }
+
+    if (test_gather_capacity) {
+        if (P != 5 || sync_str != "relay" || is_f16_wire) {
+            fprintf(stderr, "gather capacity qualification requires five ranks, RELAY and F32\n");
+            g_failures++;
+        } else {
+            run_gather_capacity_proof(comm, g_backends, sync_str);
+        }
+        g_comm_free(comm);
+        for (auto backend : g_backends) ggml_backend_free(backend);
+        return g_failures ? 1 : 0;
     }
 
     std::vector<ggml_tensor *> tensors;
@@ -2272,11 +2618,20 @@ int main(int argc, char ** argv) {
     // 4.5) Epoch-chain regression & paired benchmark:
     // Run explicitly or as part of the adversarial suite.
     if ((sync_str == "timeline" || sync_str == "star" || sync_str == "drm" || sync_str == "relay") &&
-        (run_chain_reg || adversarial || test_capacity_chain)) {
+        (run_chain_reg || adversarial || test_capacity_chain || test_gather_capacity)) {
         fprintf(stderr, "\n--- Starting Epoch-Chain Regression Suite ---\n");
         run_epoch_chain_regression(comm, g_backends, is_f16_wire);
         if (g_failures == 0)
             run_capacity_chain_regression(comm, g_backends, is_f16_wire, sync_str);
+        if (g_failures == 0 && adversarial && sync_str == "relay" && !is_f16_wire) {
+            void * gather_comm = g_comm_init(g_backends.data(), g_backends.size());
+            if (!gather_comm) {
+                ++g_failures;
+            } else {
+                run_gather_capacity_proof(gather_comm, g_backends, sync_str);
+                g_comm_free(gather_comm);
+            }
+        }
         if (g_failures == 0)
             run_cached_compute_chain_regression(comm, is_f16_wire);
         // RELAY deliberately uses the CPU F32 handoff, not the timeline-only

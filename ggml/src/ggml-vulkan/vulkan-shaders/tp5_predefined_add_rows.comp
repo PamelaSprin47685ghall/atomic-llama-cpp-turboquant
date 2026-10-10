@@ -1,0 +1,27 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0, std430) readonly buffer A { float a[]; };
+layout(binding = 1, std430) readonly buffer B { float b[]; };
+layout(binding = 2, std430) writeonly buffer D { float d[]; };
+layout(binding = 3, std430) coherent readonly buffer Frame { uint frame[]; };
+layout(push_constant) uniform Params {
+    uint width;
+    uint capacity_rows;
+    uint bias_rows;
+    uint a_offset;
+    uint b_offset;
+    uint d_offset;
+    uint token_word;
+} p;
+
+void main() {
+    const uint rows = frame[p.token_word];
+    if (rows > p.capacity_rows) return;
+    const uint index = gl_GlobalInvocationID.x;
+    // Guard before both loads and the store; rounded dispatch lanes must not
+    // access a prior epoch's inactive rows or a ragged row's padding.
+    if (index >= rows * p.width) return;
+    const uint bias_index = p.bias_rows == 1 ? index % p.width : index;
+    d[p.d_offset + index] = a[p.a_offset + index] + b[p.b_offset + bias_index];
+}

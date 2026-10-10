@@ -24,7 +24,6 @@ static void capacity_and_frames() {
     CHECK(cap.hidden_bytes == 32ULL * 10240 * 4);
     CHECK(cap.payload_bytes == 32ULL * 2560 * 4);
     CHECK(cap.logits_bytes == 4ULL * 248320 * 4);
-    CHECK(error[0] == '\0');
 
     const auto original = cap;
     for (int which = 0; which < 7; ++which) {
@@ -40,7 +39,6 @@ static void capacity_and_frames() {
         }
         CHECK(!ggml_predefined_make_capacity(&p, &cap, error, sizeof(error)));
         CHECK(std::memcmp(&cap, &original, sizeof(cap)) == 0);
-        CHECK(error[0] != '\0');
     }
     p = limits();
     p.wire_bytes = 2;

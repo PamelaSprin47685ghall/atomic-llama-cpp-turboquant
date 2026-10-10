@@ -33,33 +33,49 @@ layout(std430, binding = 1) coherent writeonly buffer HostSidecar {
 layout(std430, binding = 2) coherent volatile buffer Status {
     uint status[];
 };
+layout(std430, binding = 3) coherent writeonly buffer Integrity {
+    uvec4 qsum[];
+};
+layout(std430, binding = 4) readonly buffer RowsHeader {
+    uint rows_header[];
+};
 #ifdef TP5_PUBLISH_STATS
 // LB2: the same publication also carries the RMS sufficient statistics
 // (a_b, d_b, s_b per token per stream: 12 words per token, raw layout)
 // so the CPU can finish rho during the Y reduction — no second doorbell
 // for the Q sidecar.
-layout(std430, binding = 3) readonly buffer LocalStats {
+layout(std430, binding = 5) readonly buffer LocalStats {
     uint stats_src[];
 };
-layout(std430, binding = 4) coherent writeonly buffer HostStats {
+layout(std430, binding = 6) coherent writeonly buffer HostStats {
     uint stats_dst[];
 };
 #endif
 
 layout(push_constant) uniform Params {
-    uint n_uvec4;
+    uint n_uvec4_per_row;
+    uint active_rows;
 #ifdef TP5_PUBLISH_STATS
     uint n_stats;   // raw word count (tokens * 12)
 #endif
 } p;
 
+shared uint payload_xor[64];
+
 void main() {
     const uint lane = gl_LocalInvocationID.x;
-    for (uint i = lane; i < p.n_uvec4; i += 64u) {
+    const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
+    const uint n_uvec4 = p.n_uvec4_per_row * active_rows;
+    uint x = 0u;
+    for (uint i = lane; i < n_uvec4; i += 64u) {
 #ifdef TP5_PUBLISH_F16
-        dst[i] = f16vec4(src[i]);
+        const vec4 value = src[i];
+        dst[i] = f16vec4(value);
+        x ^= packHalf2x16(value.xy) ^ packHalf2x16(value.zw);
 #else
-        dst[i] = src[i];
+        const uvec4 value = src[i];
+        dst[i] = value;
+        x ^= value.x ^ value.y ^ value.z ^ value.w;
 #endif
     }
 #ifdef TP5_PUBLISH_STATS
@@ -67,6 +83,19 @@ void main() {
         stats_dst[i] = stats_src[i];
     }
 #endif
+
+    payload_xor[lane] = x;
+    barrier();
+    if (lane == 0u && n_uvec4 != 0u) {
+        uint all_xor = 0u;
+        for (uint i = 0u; i < 64u; ++i) all_xor ^= payload_xor[i];
+#ifdef TP5_PUBLISH_F16
+        const uint payload_words = n_uvec4 * 2u;
+#else
+        const uint payload_words = n_uvec4 * 4u;
+#endif
+        qsum[0] = uvec4(all_xor, status[1], payload_words, 0u);
+    }
 
     // All sidecar stores come from this one workgroup. Order every lane's
     // payload stores before publishing the CPU-visible ready word.

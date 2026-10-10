@@ -482,6 +482,15 @@ void common_tp5_apply_env(common_params & params) {
         } else if (params.tp5.latebind == "aggressive") {
             setenv("GGML_TP5_LATEBIND", "hc-down", 1);
             setenv("GGML_TP5_LATEBIND_EXACT_Q", "0", 1);
+            if (!getenv("GGML_TP5_LATEBIND_ALLOW_APPROX")) {
+                setenv("GGML_TP5_LATEBIND_ALLOW_APPROX", "1", 1);
+            }
+            if (!getenv("GGML_TP5_LATE_TRANSPORT")) {
+                setenv("GGML_TP5_LATE_TRANSPORT", "gtt-push", 1);
+            }
+            if (!getenv("GGML_TP5_LATEBIND_OVERLAP")) {
+                setenv("GGML_TP5_LATEBIND_OVERLAP", "legacy", 1);
+            }
         }
     }
     const char * latebind = getenv("GGML_TP5_LATEBIND");
@@ -494,8 +503,10 @@ void common_tp5_apply_env(common_params & params) {
         const char * allow_approx_env = getenv("GGML_TP5_LATEBIND_ALLOW_APPROX");
         const bool   allow_approx     = allow_approx_env && atoi(allow_approx_env) != 0;
         const bool   exact_ok         = exact_q && std::strcmp(exact_q, "1") == 0;
-        if (!qualified || effective_sync != "relay" || effective_wire != "f32" ||
-            (!exact_ok && !allow_approx)) {
+        if (!qualified || effective_sync != "relay" || effective_wire != "f32") {
+            throw std::runtime_error("TP5+MTP LateBind requires five distinct RX 6800 ranks, RELAY/F32, and explicit exact Q");
+        }
+        if (!exact_ok && !allow_approx) {
             throw std::runtime_error("TP5+MTP LateBind requires five distinct RX 6800 ranks, RELAY/F32, and explicit exact Q");
         }
     }
@@ -505,7 +516,7 @@ void common_tp5_apply_env(common_params & params) {
         }
         for (const char * knob : { "GGML_VK_DISABLE_PRODUCER_WIRE", "GGML_VK_DISABLE_MMVQ",
                                    "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM", "GGML_VK_ALLOW_GRAPHICS_QUEUE" }) {
-            if (!getenv(knob)) {
+            if (!getenv(knob) && (std::strcmp(knob, "GGML_VK_DISABLE_MMVQ") != 0 || (!getenv("GGML_VK_FORCE_MMVQ") && !getenv("GGML_VK_DISABLE_MMVQ")))) {
                 setenv(knob, "1", 1);
             }
         }

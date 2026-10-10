@@ -1,0 +1,117 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Four logical 256-lane norm groups share one read of Y. Each logical group
+// retains the original lane mapping, ten-value accumulation, subgroupAdd and
+// eight-partial ordered fold. This is not an alternative RMS formula.
+layout(local_size_x=1024) in;
+layout(std430,binding=0) coherent volatile readonly buffer Inbox { uint inbox[]; };
+layout(std430,binding=0) coherent volatile readonly buffer Inbox128 { uvec4 inbox128[]; };
+layout(std430,binding=1) readonly buffer Residual { float residual[]; };
+layout(std430,binding=2) readonly buffer Gamma { float gamma[]; };
+layout(std430,binding=3) writeonly buffer Combined { float combined[]; };
+layout(std430,binding=4) writeonly buffer Normalized { float normalized[]; };
+layout(std430,binding=5) readonly buffer Scatter { float scatter[]; };
+layout(std430,binding=6) writeonly buffer Rho { float inverse_rho[]; };
+layout(std430,binding=7) coherent volatile buffer Status { uint status[]; };
+layout(std430,binding=8) writeonly buffer SumOutput { float sum_output[]; };
+layout(push_constant) uniform Params {
+    uint width; uint streams; float epsilon; uint spin_max;
+    uint status_word_offset; uint profile_spin; uint active_rows;
+} p;
+shared uint ready;
+shared uint expected;
+shared uint y_local[4096];
+shared float partials[32];
+
+bool await_y() {
+    if(gl_LocalInvocationID.x==0u) {
+        ready=0u; expected=status[p.status_word_offset+1u]; uint used=0u;
+        if(expected!=0u && status[p.status_word_offset+2u]==0u) {
+            for(uint spin=0u;spin<p.spin_max;++spin) {
+                used=spin;
+                if((spin&1023u)==0u && status[p.status_word_offset+2u]!=0u) break;
+                if(inbox[0]==expected) {ready=1u;break;}
+            }
+        }
+        if(ready==0u) {
+            atomicCompSwap(status[p.status_word_offset+2u],0u,expected!=0u?expected:0xffffffffu);
+            status[p.status_word_offset+4u]=inbox[0]; used=p.spin_max;
+        }
+        if(p.profile_spin!=0u)status[p.status_word_offset+5u]=used;
+    }
+    barrier(); memoryBarrierBuffer(); return ready!=0u;
+}
+
+void main() {
+    if(p.streams!=4u || p.width==0u || p.width>4096u || gl_WorkGroupID.x!=0u ||
+       gl_NumSubgroups!=32u || gl_SubgroupSize!=32u) {
+        if(gl_LocalInvocationID.x==0u)atomicCompSwap(status[p.status_word_offset+2u],0u,0xffffffffu);
+        return;
+    }
+    const uint stream=gl_SubgroupID/8u;
+    const uint lane=(gl_SubgroupID%8u)*32u+gl_SubgroupInvocationID;
+    const uint live_rows=inbox[5]!=0u?inbox[5]:p.active_rows;
+    const bool ok=await_y();
+    if(!ok) {
+        const float nanv=uintBitsToFloat(0x7fc00000u);
+        for(uint t=0u;t<TP5_LATE_CAPACITY_ROWS;++t) {
+            if(t>=live_rows)break;
+            const uint base=t*(4u*p.width)+stream*p.width;
+            for(uint col=lane;col<p.width;col+=256u) {
+                combined[base+col]=nanv;normalized[base+col]=nanv;
+                if(stream==0u)sum_output[t*p.width+col]=nanv;
+            }
+            if(lane==0u)inverse_rho[t*4u+stream]=nanv;
+        }
+        return; // Norm never marks the mailbox as consumed/retired.
+    }
+    for(uint t=0u;t<TP5_LATE_CAPACITY_ROWS;++t) {
+        if(t>=live_rows)break;
+        if((p.width&3u)==0u) {
+            for(uint v=gl_LocalInvocationID.x;v<p.width/4u;v+=1024u) {
+                const uvec4 a=inbox128[4u+t*(p.width/4u)+v];
+                y_local[4u*v]=a.x;y_local[4u*v+1u]=a.y;
+                y_local[4u*v+2u]=a.z;y_local[4u*v+3u]=a.w;
+            }
+        }else{
+            for(uint col=gl_LocalInvocationID.x;col<p.width;col+=1024u)
+                y_local[col]=inbox[16u+t*p.width+col];
+        }
+        barrier();
+        const uint base=t*(4u*p.width)+stream*p.width;
+        const float s=scatter[t*4u+stream];
+        float values[16];
+        for(uint i=0u;i<16u;++i) {
+            const uint col=lane+i*256u;
+            values[i]=col<p.width?residual[base+col]:0.0;
+        }
+        float ss=0.0;
+        for(uint i=0u;i<16u;++i) {
+            const uint col=lane+i*256u;
+            if(col<p.width) {
+                const float y=uintBitsToFloat(y_local[col]);
+                precise float product=y*s;
+                precise float value=values[i]+product;
+                values[i]=value;combined[base+col]=value;
+                if(stream==0u)sum_output[t*p.width+col]=y;
+            }
+            ss+=values[i]*values[i];
+        }
+        ss=subgroupAdd(ss);
+        if(gl_SubgroupInvocationID==0u)partials[gl_SubgroupID]=ss;
+        barrier();
+        float fold=0.0;
+        for(uint j=0u;j<8u;++j)fold+=partials[stream*8u+j];
+        const float scale=inversesqrt(fold/float(p.width)+p.epsilon);
+        if(lane==0u)inverse_rho[t*4u+stream]=scale;
+        if(lane==0u && (p.profile_spin&2u)!=0u && t<2u)
+            status[p.status_word_offset+8u+t*4u+stream]=floatBitsToUint(scale);
+        for(uint i=0u;i<16u;++i) {
+            const uint col=lane+i*256u;
+            if(col<p.width) {float norm=scale*values[i];normalized[base+col]=norm*gamma[stream*p.width+col];}
+        }
+        barrier(); // Every logical stream finished with this token's sharedY.
+    }
+}

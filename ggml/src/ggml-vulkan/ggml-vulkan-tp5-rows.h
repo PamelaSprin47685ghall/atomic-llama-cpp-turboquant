@@ -233,18 +233,15 @@ constexpr uint32_t tp5_late_l2_tag(uint32_t z0_bits, uint32_t z1_bits, uint32_t 
     h ^= h >> 15;
     return h | 1u;   // never 0: a zeroed entry can never validate
 }
-// Per-Q8DOT-workgroup Q checksum entries, right after the statistics record:
-// uvec4(xor of the F16 payload words the workgroup wrote, nonce = this epoch's
-// token-0 statistics tag, 0, 0), one 16-byte store before the workgroup's
-// completion increment. The relay waits for the nonce, recomputes the xor from
-// the payload it is about to reduce, and re-reads until they agree -- the Q
-// ready word alone did not guarantee the host saw the payload (measured: the
-// reduced Q differed between runs while the same payload re-read later was
-// identical).
-constexpr size_t TP5_LATE_QSUM_MAX_WGS = 32;   // rank_dim <= 512, 16 rows per WG
+// Q publication entries, after the statistics record in the source aperture:
+// uvec4(payload xor, armed epoch, active payload word count, 0). Exact F32
+// publishes one entry; Q8DOT publishes one per 16-row workgroup. Ready alone
+// does not make the payload CPU-visible. The relay validates the current
+// epoch, extent and bytes before retiring ready or reducing Q.
+constexpr size_t TP5_LATE_QSUM_MAX_WGS = 128;  // rank_dim <= 512, at least4 rows per WG
 constexpr size_t TP5_LATE_QSUM_BYTES   = TP5_LATE_QSUM_MAX_WGS * 16;
-constexpr uint32_t tp5_late_qsum_word_offset(size_t late_host_offset) {
-    return tp5_late_stats_word_offset(late_host_offset, true) +
+constexpr uint32_t tp5_late_qsum_word_offset(size_t late_host_offset, bool late_q8_fast) {
+    return tp5_late_stats_word_offset(late_host_offset, late_q8_fast) +
            uint32_t(VK_TP5_DIRECT_COLUMN_TILE * TP5_LATE_STATS_WORDS_PER_TOKEN);
 }
 static_assert(tp5_late_lo_q8_bytes(320) <= tp5_late_q_payload_capacity_bytes(true),

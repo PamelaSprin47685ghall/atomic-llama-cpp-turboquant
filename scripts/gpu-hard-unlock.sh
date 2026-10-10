@@ -35,6 +35,9 @@
 #            Reset bit is guaranteed to be released (cleared) within 200ms (trapped for safety).
 #            Then trigger PCI rescan and verify BDF + DRM nodes reappear.
 # 5. Clock & Performance Restoration:
+#            Overdrive writes are opt-in (TP5_ALLOW_OD_WRITE=1): restoring a clock policy never
+#            needs an OD commit, and on 2026-09-28 an accepted-but-ineffective OD commit left
+#            0000:09:00.0 with a degenerate DPM table at half ALU rate.  See 维修建议刷BIOS.md.
 #    After ANY reset (native or SBR), force manual performance level ('manual' in
 #    power_dpm_force_performance_level) and set the highest available pp_dpm_sclk index.
 #    Policy readback is verified; actual compute needs a separate loaded ALU probe.
@@ -63,6 +66,7 @@ SBR_TRAP_ACTIVE=0
 SBR_BRIDGE_BDF=""
 SBR_CLEAR_VAL=""
 SBR_CARD_ID=""
+REBIND_ONLY=0
 
 log() {
     printf '[%s] [gpu-hard-unlock] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
@@ -111,6 +115,10 @@ Options:
                Can be executed without root privileges.
   --clocks-only  Restore manual/highest DPM after the kernel has completed its own reset.
                  Never kill clients or write PCI configuration; requires one explicit card.
+  --rebind     Unbind and rebind the amdgpu driver for one card (driver-level re-init).
+                 Never writes PCI configuration and never touches flash or clocks. This is the
+                 action measured on 2026-09-28 to clear a half-rate SMU state on 0000:09:00.0
+                 (8.99 -> 16.52 TFLOPS on the 1 s ALU benchmark) that no sysfs value reflects.
   cardN        Target card identifier (card1, card2, card3, card4, card5).
   all          Explicitly target all 5 cards. Implicit 'all' is prohibited.
 EOF
@@ -124,6 +132,10 @@ while [ $# -gt 0 ]; do
             ;;
         --clocks-only)
             CLOCKS_ONLY=1
+            shift
+            ;;
+        --rebind)
+            REBIND_ONLY=1
             shift
             ;;
         card1|card2|card3|card4|card5|all)
@@ -154,6 +166,10 @@ if [ -z "$TARGET" ]; then
 fi
 if [ "$CLOCKS_ONLY" -eq 1 ] && { [ "$DRY_RUN" -eq 1 ] || [ "$TARGET" = all ]; }; then
     err "--clocks-only requires one card and cannot be combined with --dry-run."
+    exit 2
+fi
+if [ "$REBIND_ONLY" -eq 1 ] && [ "$TARGET" = all ]; then
+    err "--rebind requires one explicit card."
     exit 2
 fi
 
@@ -606,38 +622,91 @@ restore_target_dpm() {
         return 7
     fi
 
+    # Never busy-write.  A burst of GPU log events must not turn into a burst of sysfs writes, so:
+    #   1. if the card already is 'manual' with the highest index selected, write nothing at all;
+    #   2. otherwise honour a per-card cooldown so a write that does not take effect cannot loop.
+    local pin_state pin_selected
+    pin_state=$(cat "$perf_level" 2>/dev/null || true)
+    pin_selected=$(sed -n 's/^\([0-9]\+\):.*\*.*$/\1/p' "$sclk_file" 2>/dev/null | tail -1)
+    # At idle the driver marks the sleep row ("S: 0Mhz *") rather than the selected index, so an
+    # empty numeric selection in manual mode means "the pin is already in force"; there is nothing
+    # better to write and writing would be pure busy work.
+    if [ "$pin_state" = manual ] && { [ "$pin_selected" = "$highest_idx" ] || [ -z "$pin_selected" ]; }; then
+        log "  [$card_id] Already manual + highest index ($highest_idx); no write needed."
+        return 0
+    fi
+    local pin_stamp="/run/gpu-clock-pin-$card_id.stamp" pin_now pin_last
+    pin_now=$(date +%s)
+    pin_last=$(cat "$pin_stamp" 2>/dev/null || echo 0)
+    case "$pin_last" in ''|*[!0-9]*) pin_last=0 ;; esac
+    local pin_cooldown="${CLOCK_PIN_COOLDOWN:-60}"
+    if [ "$pin_last" -gt 0 ] && [ $(( pin_now - pin_last )) -lt "$pin_cooldown" ]; then
+        log "  [$card_id] Cooldown: pinned $(( pin_now - pin_last ))s ago (< ${pin_cooldown}s); skipping write."
+        return 0
+    fi
+    printf '%s\n' "$pin_now" > "$pin_stamp" 2>/dev/null || true
+
     log "  [$card_id] Setting power_dpm_force_performance_level to 'manual'..."
-    if ! echo "manual" > "$perf_level"; then
-        err "[$card_id] Failed to write 'manual' to $perf_level."
-        return 7
+    echo "manual" > "$perf_level" 2>/dev/null || true
+
+    # Overdrive writes are not part of restoring a clock policy and are off by default.
+    # Measured on this host 2026-09-28: card 0000:09:00.0 (ATOM BIOS 113-1N21XLMIN203W_210810)
+    # accepted `s 1 2475` + `c` with no error, but its SMU DPM table stayed at {500, 1200} MHz
+    # while pp_od_clk_voltage kept advertising 2475 - and the card then did exactly half the ALU
+    # work of its four peers (8.99 vs 17.1-18.6 TFLOPS; 33 vs 63-68 iterations in the same 1 s),
+    # gating 95 of 96 pipeline stages for ~27 % of total token time.  No OS-side knob could undo
+    # it (high / manual / auto, index writes 1-3, OD commit: all 8.99), and a reset does not hold.
+    # Restoring a policy needs 'manual' + an explicit index only; set TP5_ALLOW_OD_WRITE=1 to opt
+    # into an overdrive write when a board genuinely needs one.  See 维修建议刷BIOS.md.
+    if [ "${TP5_ALLOW_OD_WRITE:-0}" = "1" ]; then
+        local od_file="$(dirname "$sclk_file")/pp_od_clk_voltage"
+        if [ -w "$od_file" ]; then
+            log "  [$card_id] TP5_ALLOW_OD_WRITE=1: writing overdrive target 500/2475MHz and committing..."
+            echo "s 0 500"  > "$od_file" 2>/dev/null || true
+            echo "s 1 2475" > "$od_file" 2>/dev/null || true
+            echo "c"        > "$od_file" 2>/dev/null || true
+        fi
     fi
 
-    local readback_perf
-    readback_perf=$(cat "$perf_level" 2>/dev/null || true)
-    if [ "$readback_perf" != "manual" ]; then
-        err "[$card_id] power_dpm_force_performance_level verification failed (got '$readback_perf', expected 'manual')."
-        return 7
-    fi
-
-    log "  [$card_id] Setting highest pp_dpm_sclk index '$highest_idx'..."
-    if ! echo "$highest_idx" > "$sclk_file"; then
-        err "[$card_id] Failed to write index '$highest_idx' to $sclk_file."
-        return 7
+    # Pin the level explicitly.  Do NOT write 'high' after this: 'high' releases the manual level
+    # selection and hands control back to the SMU governor, so nothing here would be a promise any
+    # more.  Measured on this host 2026-09-28, the governor does NOT by itself cost throughput
+    # (high vs manual arm: 40.15-40.71 vs 40.02-40.23 tok/s, no measurable difference) - the reason
+    # to stay in 'manual' is that it makes the index a guarantee, which the readback below needs to
+    # mean anything.  The previous version wrote 'high' and then verified for 'manual', so it failed
+    # by construction on every call and reported the card as broken.
+    log "  [$card_id] Pinning highest sclk DPM index ($highest_idx) in manual mode..."
+    pin_err=$( { echo "$highest_idx" > "$sclk_file"; } 2>&1 )
+    if [ -n "$pin_err" ]; then
+        # Stay in 'manual' (the healthy policy this watchdog now expects) and leave the previous
+        # level selection untouched rather than handing control back to the governor.
+        log "  [$card_id] sclk index write rejected ($pin_err); policy stays 'manual', level unchanged."
+        return 0
     fi
 
     # Readback verifies policy, not effective loaded clocks or ALU throughput.
-    # Note: on Navi 21 with specific VBIOS / driver states, pp_dpm_sclk table may not display an active
-    # asterisk indicator on the highest index while idle; we verify successful write, manual mode persistence,
-    # and log the current DPM table state.
+    # Note: on Navi 21 with specific VBIOS / driver states, pp_dpm_sclk may not display an active
+    # asterisk while idle, and the frequency it advertises for the top index is not a guarantee
+    # either (card 0000:09:00.0 advertises 1200 while pp_od_clk_voltage advertises 2475, and the
+    # card really does run at half rate).  Verify policy here; verify capability with
+    # /var/tmp/tp5-alu1s when the machine is idle, never from a periodic service.
     readback_perf=$(cat "$perf_level" 2>/dev/null || true)
     if [ "$readback_perf" != "manual" ]; then
-        err "[$card_id] power_dpm_force_performance_level reverted from 'manual' after sclk write."
+        err "[$card_id] power_dpm_force_performance_level is '$readback_perf', expected 'manual' after the sclk pin."
         return 7
     fi
 
     local readback_sclk
     readback_sclk=$(cat "$sclk_file" 2>/dev/null || true)
-    log "  [$card_id] Manual DPM policy applied: index ($highest_idx) written. Loaded ALU throughput unverified. Table:\n$readback_sclk"
+    log "  [$card_id] DPM pinned: manual mode, index $highest_idx selected. Loaded clocks unverified. Table:\n$readback_sclk"
+    local table_top od_top
+    table_top=$(grep -oE '[0-9]+Mhz' "$sclk_file" 2>/dev/null | tr -dc '0-9\n' | sort -n | tail -1)
+    od_top=$(awk '/^OD_SCLK:/{f=1;next} /^[A-Za-z_]+:/{f=0} f&&/^1:/{gsub(/[^0-9]/,"",$2);print $2;exit}' \
+             "$(dirname "$sclk_file")/pp_od_clk_voltage" 2>/dev/null)
+    if [ -n "$table_top" ] && [ -n "$od_top" ] && [ "$table_top" -lt "$od_top" ]; then
+        err "[$card_id] DPM capability degraded: pp_dpm_sclk tops out at ${table_top}Mhz but the OD table advertises ${od_top}Mhz. This card cannot reach its rated clock and no OS-side knob restores it - see 维修建议刷BIOS.md. Resetting does not hold."
+        return 8
+    fi
     return 0
 }
 
@@ -882,9 +951,66 @@ recover_target() {
     return 0
 }
 
+    # Driver-level re-init for one card.  No PCI configuration write, no flash access, no clock or
+    # overdrive write: the amdgpu module is asked to drop and re-acquire the device, which re-reads
+    # the VBIOS/PPTable and rebuilds the SMU state.  Measured 2026-09-28: clears a half-rate state
+    # that shows up as 8.99 vs 17.1-18.6 TFLOPS in the 1 s ALU benchmark while pp_dpm_sclk,
+    # amdgpu_pm_info and every other sysfs value reads exactly as it does on a healthy card.
+    rebind_target() {
+        local card_id="$1"
+        local gpu_bdf="${CARD_GPU[$card_id]}"
+        local drv="/sys/bus/pci/drivers/amdgpu"
+        local t0 nodes=() pids
+
+        if [ ! -d "/sys/bus/pci/devices/$gpu_bdf" ]; then
+            err "[$card_id] $gpu_bdf is not present; cannot rebind."
+            return 7
+        fi
+        if [ ! -d "$drv" ]; then
+            err "[$card_id] amdgpu driver directory $drv is missing."
+            return 7
+        fi
+        mapfile -t nodes < <(get_target_drm_nodes "$gpu_bdf")
+        pids=$(get_pids_for_nodes "${nodes[@]}") || return 6
+        if [ -n "$pids" ]; then
+            err "[$card_id] clients still hold the device ($pids); refusing to rebind under a live client."
+            return 6
+        fi
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "  [DRY-RUN] [$card_id] Would unbind and rebind amdgpu for $gpu_bdf."
+            return 0
+        fi
+
+        t0=$(date +%s)
+        if ! echo "$gpu_bdf" > "$drv/unbind" 2>/dev/null; then
+            err "[$card_id] unbind of $gpu_bdf failed."
+            return 7
+        fi
+        sleep 2
+        if ! echo "$gpu_bdf" > "$drv/bind" 2>/dev/null; then
+            err "[$card_id] bind of $gpu_bdf failed."
+            return 7
+        fi
+        local i
+        for i in $(seq 1 20); do
+            [ -d "/sys/bus/pci/devices/$gpu_bdf/drm" ] && break
+            sleep 1
+        done
+        if [ ! -d "/sys/bus/pci/devices/$gpu_bdf/drm" ]; then
+            err "[$card_id] DRM nodes did not come back after rebind."
+            return 7
+        fi
+        log "  [$card_id] Rebound $gpu_bdf in $(( $(date +%s) - t0 ))s; DRM nodes present."
+        return 0
+    }
+
 # ---------------------------------------------------------
 # Main Execution Loop
 # ---------------------------------------------------------
+if [ "$REBIND_ONLY" -eq 1 ]; then
+    rebind_target "${TARGET_CARDS[0]}" || exit $?
+    exit 0
+fi
 if [ "$CLOCKS_ONLY" -eq 1 ]; then
     card_id="${TARGET_CARDS[0]}"
     gpu_bdf="${CARD_GPU[$card_id]}"

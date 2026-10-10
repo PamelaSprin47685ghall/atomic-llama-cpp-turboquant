@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "server-signal.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -17,6 +18,7 @@
 #include <clocale>
 #include <cstdlib>
 #include <exception>
+#include <optional>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 
@@ -25,7 +27,9 @@
 #endif
 
 static std::function<void(int)> shutdown_handler;
+#if defined(_WIN32)
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+#endif
 
 static int64_t token_hack_env_i64(const char * name, int64_t fallback) {
     const char * value = std::getenv(name);
@@ -38,6 +42,7 @@ static int64_t token_hack_env_i64(const char * name, int64_t fallback) {
     return end != value ? (int64_t) parsed : fallback;
 }
 
+#if defined(_WIN32)
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
         // A second signal may interrupt teardown: bypass stdio and global destructors.
@@ -46,6 +51,7 @@ static inline void signal_handler(int signal) {
 
     shutdown_handler(signal);
 }
+#endif
 
 // satisfies -Wmissing-declarations (used by llama command)
 int llama_server(int argc, char ** argv);
@@ -526,15 +532,14 @@ int llama_server(common_params & params, int argc, char ** argv) {
         };
     }
 
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+    std::optional<server_signal_dispatcher> signal_dispatcher;
+#endif
+
     // register signal handler if not running by CLI
     if (!is_run_by_cli) {
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
-        struct sigaction sigint_action;
-        sigint_action.sa_handler = signal_handler;
-        sigemptyset (&sigint_action.sa_mask);
-        sigint_action.sa_flags = 0;
-        sigaction(SIGINT, &sigint_action, NULL);
-        sigaction(SIGTERM, &sigint_action, NULL);
+        signal_dispatcher.emplace(shutdown_handler);
 #elif defined (_WIN32)
         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
             return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
@@ -562,6 +567,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
             ctx_http.thread.join(); // keep the main thread alive
         }
 
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+        if (signal_dispatcher) {
+            signal_dispatcher->stop();
+        }
+#endif
         // when the HTTP server stops, clean up and exit
         clean_up();
     } else {
@@ -575,6 +585,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
 
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+        if (signal_dispatcher) {
+            signal_dispatcher->stop();
+        }
+#endif
         auto * ll_ctx = ctx_server.get_llama_context();
         if (ll_ctx != nullptr) {
             common_memory_breakdown_print(ll_ctx);

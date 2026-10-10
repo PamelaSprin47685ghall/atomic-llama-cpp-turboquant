@@ -3781,6 +3781,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
+        // Materialize sharded router logits into full mirrored scores via bit-copy gather
+        if (gate_inp != nullptr && (gate_inp->flags & GGML_TENSOR_FLAG_ALLGATHER)) {
+            logits = ggml_cont(ctx0, logits);
+            logits->flags |= GGML_TENSOR_FLAG_ALLGATHER;
+            cb(logits, "ffn_moe_logits_gathered", il);
+        }
     } else {
         logits = probs_in;
     }

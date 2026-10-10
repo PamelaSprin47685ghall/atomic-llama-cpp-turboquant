@@ -3122,6 +3122,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--tp5-mmvq"}, "MODE",
+        "TP5 MMVQ policy: auto | forced | disabled (default: preserve GGML_VK_*_MMVQ env, or disabled under relay recipe)",
+        [](common_params & params, const std::string & value) {
+            params.tp5.enabled = true;
+            if (value == "auto") {
+                setenv("GGML_VK_FORCE_MMVQ", "0", 1);
+                setenv("GGML_VK_DISABLE_MMVQ", "0", 1);
+                setenv("GGML_VK_SMALL_Q8_COLUMNS", "1", 1);
+            } else if (value == "forced") {
+                setenv("GGML_VK_FORCE_MMVQ", "1", 1);
+                setenv("GGML_VK_DISABLE_MMVQ", "0", 1);
+                setenv("GGML_VK_SMALL_Q8_COLUMNS", "1", 1);
+            } else if (value == "disabled") {
+                setenv("GGML_VK_FORCE_MMVQ", "0", 1);
+                setenv("GGML_VK_DISABLE_MMVQ", "1", 1);
+            } else {
+                throw std::invalid_argument(string_format("error: invalid value for --tp5-mmvq: '%s' (allowed: auto, forced, disabled)\n", value.c_str()));
+            }
+        }
+    ));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"

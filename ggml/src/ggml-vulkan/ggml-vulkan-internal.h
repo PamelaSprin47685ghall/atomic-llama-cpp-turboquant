@@ -75,14 +75,20 @@ bool ggml_vk_tp5_tensor_dev_ref(struct ggml_tensor * t, struct VkBuffer_T ** buf
                                 uint64_t * off, uint64_t * size, vk_buffer * owner = nullptr);
 uint64_t ggml_vk_tp5_get_tensor_bda(struct ggml_tensor * t);
 
-static constexpr size_t VK_TP5_RELAY_ROUTE_MAX = 128;
-// 128 reduction stages have 129 model compute groups; the last one is the
+// Diagnostic view only. Callers must hold experiment ownership and retire
+// all native readers before modifying the imported payload.
+extern "C" bool ggml_backend_vk_tp5_comm_get_relay_slot(
+        void * comm, size_t bank, size_t rank, const void ** slot_ptr,
+        size_t * stride, const volatile uint32_t ** status_words);
+
+static constexpr size_t VK_TP5_RELAY_ROUTE_MAX = 256;
+// 256 collective stages have 257 model compute groups; the last one is the
 // non-reducing tail and still needs maximum-graph indirect arguments.
 static constexpr size_t VK_TP5_PREDEFINED_STAGE_MAX = VK_TP5_RELAY_ROUTE_MAX + 1;
 // Header is the transport ABI; the remainder is a per-stage host-coherent
 // indirect-argument arena for the one maximum graph definition. This is not a
 // graph cache and not per token. 4 KiB gives 336 Vulkan dispatch triplets while
-// keeping all 128 stages below 512 KiB per rank.
+// keeping all 256 collective stages within 1 MiB per rank, plus the tail.
 static constexpr size_t VK_TP5_RELAY_ROUTE_STRIDE = 4096;
 static constexpr size_t VK_TP5_PREDEFINED_ARGS_OFFSET = 64;
 static constexpr size_t VK_TP5_PREDEFINED_ARGS_STRIDE = 12;
@@ -98,7 +104,10 @@ struct vk_tp5_relay_route_entry {
     // count; bank capacity and a shader's column tile are never token counts.
     uint32_t active_elements = 0;
     uint32_t capacity_elements = 0;
-    uint32_t padding[2] = {0, 0};
+    // Logical frame extents for active-aware scratch producers. The shader's
+    // own immutable row width determines its elements, not transport width.
+    uint32_t active_tokens = 0;
+    uint32_t active_outputs = 0;
     // Host-produced indirect arguments. Only updated before the owning
     // submission; never while the GPU may read this stage's route slot.
     uint32_t dispatch_x = 0;
@@ -109,6 +118,8 @@ struct vk_tp5_relay_route_entry {
 static_assert(sizeof(vk_tp5_relay_route_entry) == 64);
 static_assert(offsetof(vk_tp5_relay_route_entry, ready) == 4);
 static_assert(offsetof(vk_tp5_relay_route_entry, active_elements) == 16);
+static_assert(offsetof(vk_tp5_relay_route_entry, active_tokens) == 24);
+static_assert(offsetof(vk_tp5_relay_route_entry, active_outputs) == 28);
 static_assert(offsetof(vk_tp5_relay_route_entry, dispatch_x) == 32);
 static_assert(offsetof(vk_tp5_relay_route_entry, dispatch_y) == 36);
 static_assert(offsetof(vk_tp5_relay_route_entry, dispatch_z) == 40);
@@ -154,7 +165,8 @@ bool ggml_vk_tp5_update_relay_route(ggml_backend_t backend, size_t stage, uint32
 // Patch all host-coherent indirect commands recorded by this graph definition.
 // No command buffer, descriptor or tensor metadata changes at runtime.
 bool ggml_vk_tp5_update_predefined_dispatches(ggml_backend_t backend, void * first_cb, size_t stage,
-                                               uint32_t active_rows, uint32_t capacity_rows);
+                                               uint32_t active_rows, uint32_t capacity_rows,
+                                               const ggml_predefined_frame * submitted_frame);
 void ggml_vk_tp5_clear_relay_payload_binding(ggml_backend_t backend);
 
 struct vk_tp5_hc_binding {

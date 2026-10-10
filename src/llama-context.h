@@ -629,17 +629,37 @@ public:
     static inline int ubatch_execution_phase(
             enum llm_graph_type gtype,
             bool has_predefined_capacity,
-            uint32_t predefined_capacity_rows,
+            uint32_t predefined_phase,
+            bool capacity_admitted,
             int n_tokens,
             int n_seqs) {
-        // A predefined MTP execution session shares a single maximum-capacity graph definition
-        // across both one-row draft and multi-row catch-up (capacity->verify_tokens).
-        // Old phase switching (n_tokens > n_seqs ? 1 : 0) was designed solely for target prompt
-        // prefill vs token generation to prevent large buffers staying allocated.
-        // Predefined MTP maintains identical execution identity regardless of active token count,
-        // and must not trigger gf_res_prev reset or sched buffer release.
-        if ((has_predefined_capacity || predefined_capacity_rows > 0) && (predefined_capacity_rows == 0 || n_tokens <= (int)predefined_capacity_rows)) {
-            return 0;
+        // Graph execution phase contract:
+        // - Phase 1: Ordinary prompt processing (prefill), which dynamically sizes and
+        //   holds large temporary activation buffers. On transition to phase 0,
+        //   these buffers are released (gf_res_prev->reset() and backend buffer release).
+        // - Phase 0: Token generation (decode) or unified predefined capacity definitions.
+        //
+        // 1. MTP DRAFT and CATCHUP:
+        //    Detached/predefined MTP execution shares a single maximum-capacity graph definition
+        //    (verify_tokens) across both 1-row draft and multi-row catch-up.
+        //    It maintains stable phase 0 across variable active rows to prevent spurious buffer resets.
+        //
+        // 2. Predefined TARGET capacity:
+        //    If a unified TARGET capacity definition is active and successfully admitted
+        //    (e.g. evaluate_target_capacity_admission entered), it stays stably in phase 0.
+        //
+        // 3. TARGET PREFILL:
+        //    Ordinary target prompt prefill (GGML_PREDEFINED_PREFILL or unadmitted multi-token
+        //    prompt processing) MUST retain phase 1 so large activation buffers are not kept
+        //    permanently allocated during subsequent generation.
+        if (has_predefined_capacity) {
+            if (gtype == LLM_GRAPH_TYPE_DECODER_MTP &&
+                (predefined_phase == GGML_PREDEFINED_DRAFT || predefined_phase == GGML_PREDEFINED_CATCHUP)) {
+                return 0;
+            }
+            if (predefined_phase == GGML_PREDEFINED_TARGET && capacity_admitted) {
+                return 0;
+            }
         }
         return n_tokens > n_seqs ? 1 : 0;
     }
@@ -739,6 +759,7 @@ private:
     uint32_t predefined_capacity_outputs_current = 0;
     bool predefined_frame_current_valid = false;
     bool predefined_target_enabled = false;
+    bool predefined_target_admitted = false;
     ggml_backend_sched_ptr sched;
     ggml_backend_t get_tensor_backend(const struct ggml_tensor * t) const {
         auto * node = const_cast<struct ggml_tensor *>(t);

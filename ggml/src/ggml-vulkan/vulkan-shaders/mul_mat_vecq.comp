@@ -11,6 +11,19 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
+// Zero keeps the generic push-constant width. A nonzero value requires an
+// exact-width host route; it preserves lane partials while pruning K loops.
+layout(constant_id = 3) const uint FIXED_NCOLS = 0;
+// An exact, row-tile-aligned output height can omit the partial-row body.
+// Keep the first-row guard even for the specialized pipeline.
+layout(constant_id = 4) const uint FIXED_NROWS = 0;
+
+#ifndef MUL_MAT_ID
+// Only for one Y workgroup with base_work_group_y == 0. Descriptor/view
+// offsets are independent; token columns still advance inside iter().
+layout(constant_id = 5) const bool SINGLE_Y_BATCH = false;
+#endif
+
 #if defined(DATA_A_Q2_0) || defined(DATA_A_QUANT_K)
 #define K_PER_ITER 16
 #elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
@@ -29,6 +42,7 @@ vec2 cache_b_ds;
 #include "mul_mat_vecq_funcs.glsl"
 
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
+    const uint ncols = FIXED_NCOLS != 0u ? FIXED_NCOLS : p.ncols;
 #ifdef HAS_MMVQ_DOT_MULTI
     // NUM_COLS is a specialization constant, not a preprocessor definition.
     // Limit register-resident activation columns to the MTP-sized cases with
@@ -64,10 +78,10 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 #endif
     }
 
-    uint ibi = first_row*p.ncols;
+    uint ibi = first_row*ncols;
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
-        ibi += p.ncols;
+        ibi += ncols;
         mmvq_dot_multi(a_block_idx, b_qs_idx, temp, n, b_qs_multi, b_ds_multi);
     }
     } else
@@ -109,10 +123,10 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 #error unimplemented
 #endif
 #endif
-        uint ibi = first_row*p.ncols;
+        uint ibi = first_row*ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
-            ibi += p.ncols;
+            ibi += ncols;
 
             temp[j][n] += mmvq_dot_product(a_block_idx, b_qs_idx);
         }
@@ -123,6 +137,13 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint tid = gl_LocalInvocationID.x;
 
+#ifndef MUL_MAT_ID
+    if (SINGLE_Y_BATCH) {
+        a_offset = 0u;
+        b_offset = 0u;
+        d_offset = 0u;
+    } else
+#endif
     get_offsets(a_offset, b_offset, d_offset);
     a_offset *= QUANT_K / QUANT_K_Q8_1;
     b_offset /= QUANT_K_Q8_1;
@@ -136,8 +157,32 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     }
 
     const uint col_stride = K_PER_ITER * BLOCK_SIZE;
-    uint num_iters = p.ncols / col_stride;
-    if (num_iters * col_stride + K_PER_ITER * tid < p.ncols) {
+    if (FIXED_NCOLS != 0u && FIXED_NCOLS <= col_stride) {
+        // Every lane has zero or one partial; retain the generic lane mapping
+        // and reduction, but do not compile the impossible multi-iter loops.
+        if (K_PER_ITER * tid < FIXED_NCOLS) {
+            iter(temp, first_row, num_rows, K_PER_ITER * tid, tid % (32 / K_PER_ITER));
+        }
+        reduce_result(temp, d_offset, first_row, num_rows, tid);
+        return;
+    }
+    if (FIXED_NCOLS != 0u && FIXED_NCOLS % (4u * col_stride) == 0u) {
+        // All lanes have whole four-slice groups. Keep the original slice
+        // order, without compiling the impossible two/one-slice remainder.
+        const uint b_qs_idx = tid % (32 / K_PER_ITER);
+        uint col = tid * K_PER_ITER;
+        [[dont_unroll]] for (uint group = 0u; group < FIXED_NCOLS / (4u * col_stride); ++group) {
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                iter(temp, first_row, num_rows, col, b_qs_idx);
+                col += col_stride;
+            }
+        }
+        reduce_result(temp, d_offset, first_row, num_rows, tid);
+        return;
+    }
+    const uint ncols = FIXED_NCOLS != 0u ? FIXED_NCOLS : p.ncols;
+    uint num_iters = ncols / col_stride;
+    if (num_iters * col_stride + K_PER_ITER * tid < ncols) {
         num_iters++;
     }
 
@@ -175,6 +220,13 @@ void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
 #endif
+
+    if (FIXED_NROWS != 0u && FIXED_NROWS % NUM_ROWS == 0u) {
+        if (first_row < FIXED_NROWS) {
+            compute_outputs(first_row, NUM_ROWS);
+        }
+        return;
+    }
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
     if (first_row + NUM_ROWS <= p.stride_d) {

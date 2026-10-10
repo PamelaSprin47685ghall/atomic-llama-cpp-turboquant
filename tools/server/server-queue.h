@@ -13,7 +13,8 @@
 struct server_queue {
 private:
     int id = 0;
-    bool running  = false;
+    // Termination is terminal, including before start_loop reaches its first wait.
+    bool running  = true;
     bool sleeping = false;
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;

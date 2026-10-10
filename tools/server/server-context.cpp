@@ -5922,31 +5922,48 @@ private:
             }
         }
 
-        // Predefine 纯路线：模型加载时预先完成单 token decode 的图定义，作为唯一真理锁定，彻底消除后续首轮及轮次间波动
-        if (ctx_tgt) {
-            if (spec) {
-                const int n_draft_max = params_base.speculative.draft.n_max;
-                if (n_draft_max > 0) {
-                    const int verify_tokens = n_draft_max + 1;
-                    SRV_INF("%s: Pre-recording verify graph at load time (%d tokens)...\n", __func__, verify_tokens);
-                    llama_batch vbatch = llama_batch_init(verify_tokens, 0, 1);
-                    vbatch.n_tokens = verify_tokens;
-                    for (int k = 0; k < verify_tokens; ++k) {
-                        vbatch.token[k] = 1;
-                        vbatch.pos[k] = k;
-                        vbatch.n_seq_id[k] = 1;
-                        vbatch.seq_id[k][0] = 0;
-                        vbatch.logits[k] = 1;
-                    }
-                    llama_decode(ctx_tgt, vbatch);
-                    llama_batch_free(vbatch);
+        // Execute decode and every legal MTP verification prefix before accepting
+        // requests. Two executions exercise cold recording and its warm path;
+        // success is not permission to bypass binding/coverage qualification.
+        if (ctx_tgt && params_base.tp5.enabled && params_base.warmup) {
+            const int   max_rows   = spec ? std::max(1, params_base.speculative.draft.n_max + 1) : 1;
+            llama_token warm_token = llama_vocab_bos(vocab);
+            if (warm_token == LLAMA_TOKEN_NULL) {
+                warm_token = llama_vocab_eos(vocab);
+            }
+            if (warm_token == LLAMA_TOKEN_NULL) {
+                warm_token = 0;
+            }
+            for (int rows = 1; rows <= max_rows; ++rows) {
+                SRV_INF("%s: Prewarming TP5 decode/verify graph (%d tokens)...\n", __func__, rows);
+                llama_batch batch = llama_batch_init(rows, 0, 1);
+                batch.n_tokens    = rows;
+                for (int k = 0; k < rows; ++k) {
+                    batch.token[k]     = warm_token;
+                    batch.pos[k]       = k;
+                    batch.n_seq_id[k]  = 1;
+                    batch.seq_id[k][0] = 0;
+                    batch.logits[k]    = 1;
+                }
+                for (int iter = 0; iter < 2; ++iter) {
+                    const int rc = llama_decode(ctx_tgt, batch);
+                    llama_synchronize(ctx_tgt);
                     if (auto * mem = llama_get_memory(ctx_tgt)) {
                         llama_memory_clear(mem, true);
                     }
                     llama_synchronize(ctx_tgt);
-                    SRV_INF("%s: Pre-recorded verify graph locked.\n", __func__);
+                    if (rc != 0) {
+                        llama_batch_free(batch);
+                        SRV_ERR("%s: TP5 prewarm failed: rows=%d iteration=%d rc=%d; aborting model load\n", __func__,
+                                rows, iter, rc);
+                        return false;
+                    }
                 }
+                llama_batch_free(batch);
             }
+            llama_init->reset_samplers();
+            llama_perf_context_reset(ctx_tgt);
+            SRV_INF("%s: TP5 decode/verify warmup completed.\n", __func__);
         }
 
         return true;
@@ -7121,6 +7138,15 @@ private:
         if (spec && slot.smpl && vocab && common_sampler_is_greedy_argmax_eligible(slot.smpl.get(), vocab)) {
             common_sampler_set_verify_argmax_host(slot.smpl.get(), true);
             SLT_INF(slot, "%s", "verify-argmax host sampling enabled (greedy chain)\n");
+        }
+        // Independent of MTP. Keep probability/grammar/penalty/RNG contracts;
+        // only the already-proven greedy chain and unique finite rows qualify.
+        const char * greedy_env = std::getenv("GGML_TP5_GREEDY_HOST");
+        if (!spec && params_base.tp5.enabled && greedy_env && std::strcmp(greedy_env, "1") == 0 &&
+                slot.smpl && slot.task->params.sampling.n_probs == 0 &&
+                common_sampler_is_greedy_argmax_eligible(slot.smpl.get(), vocab) &&
+                common_sampler_set_greedy_unique_host(slot.smpl.get(), true)) {
+            SLT_INF(slot, "%s", "ordinary-greedy host sampling enabled (unique finite maximum; opt-in)\n");
         }
 
         bind_cache_key_to_slot(slot.task->cache_key, slot.id);
@@ -9444,6 +9470,10 @@ private:
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+                        if (n_past == 0 && spec) {
+                            // No retained prefix means no preceding hidden-state carry.
+                            common_speculative_set_state(spec.get(), slot.id, {});
+                        }
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream && slot.n_decoded_start == 0) {

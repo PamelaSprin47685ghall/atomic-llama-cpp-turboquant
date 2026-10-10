@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install reviewed recovery scripts without changing the existing systemd unit.
+# Install reviewed recovery scripts without changing the systemd unit or IPMI watchdog.
 # Invoked by the sudo-authorized scripts/reset-gpu-pci.sh install-watchdog path.
 set -euo pipefail
 
@@ -48,3 +48,4 @@ systemctl is-active --quiet eagle-gpu-watchdog.service
 cmp -s "$source_helper" "$installed_helper"
 cmp -s "$source_watchdog" "$installed_watchdog"
 printf 'Eagle watchdog active; root-owned recovery scripts match source. Previous copies: %s\n' "$backup_dir"
+printf 'BDF-attributed bus loss uses bounded single-card recovery; a failed attempt can request one guarded orderly reboot. IPMI watchdog configuration is unchanged.\n'

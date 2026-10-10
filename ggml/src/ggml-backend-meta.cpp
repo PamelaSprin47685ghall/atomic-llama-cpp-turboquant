@@ -207,6 +207,13 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev);
 
+static bool ggml_backend_meta_is_allgather_boundary(const ggml_tensor * tensor) {
+    // Empty output heads are legal during chunked prefill. Like other empty
+    // ggml operations, they have no payload or collective to publish.
+    return (tensor->flags & GGML_TENSOR_FLAG_ALLGATHER) &&
+           (tensor->op == GGML_OP_CONT || tensor->op == GGML_OP_CPY) && !ggml_is_empty(tensor);
+}
+
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
@@ -1084,6 +1091,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_cpy = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (tensor->flags & GGML_TENSOR_FLAG_ALLGATHER) {
+            return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, false, {0} };
+        }
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
             return handle_reshape(src_ss);
         }
@@ -1391,7 +1401,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (ggml_nelements(tensor) == 0) {
             return { GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1, false, {0} };
         }
-        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
+        // Static allocation assigns usage after initializing tensor storage.
+        // Only leaves use the placement callback; computed shapes must already
+        // follow their operands before the buffer becomes USAGE_COMPUTE.
+        if (tensor->op == GGML_OP_NONE &&
+            ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
@@ -1515,6 +1529,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_cpy(src_ss);
             } break;
             case GGML_OP_CONT:
+                if (tensor->flags & GGML_TENSOR_FLAG_ALLGATHER) {
+                    split_state = { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, false, {0} };
+                    break;
+                }
+                // fallthrough
             case GGML_OP_RESHAPE: {
                 split_state = handle_reshape(src_ss);
             } break;
@@ -2722,12 +2741,14 @@ struct ggml_backend_meta_context {
     size_t                      max_tmp_size  = 0;
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
+    ggml_tensor * const *       node_base     = nullptr;
     int                         debug         = 0;
     uint32_t                    predefined_active_rows   = 0;
     uint32_t                    predefined_capacity_rows = 0;
     uint32_t                    predefined_capacity_outputs = 0;
     ggml_predefined_frame       predefined_frame{};
     bool                        predefined_frame_valid = false;
+    std::vector<uint8_t>        gather_staging;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -3479,38 +3500,43 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (!pfn_submit_chain && n_backends > 0) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(
             ggml_backend_get_device(backend_ctx->backend_configs[0].backend));
-        pfn_submit_chain = (tp5_submit_epoch_chain_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_submit_epoch_chain");
+        pfn_submit_chain =
+            (tp5_submit_epoch_chain_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_submit_epoch_chain");
     }
 
-    // DIRECT PREDEFINED VERIFY GRAPH FAST PATH (0ms rebuild, 0ms alloc, 63ms direct submit)
-    if (backend_ctx->predefined_valid &&
-        backend_ctx->predefined_uid != 0 &&
-        cgraph->uid == backend_ctx->predefined_uid &&
-        !backend_ctx->chain_compute_cbs.empty() &&
-        pfn_submit_chain != nullptr) {
-
-        auto & stage_compute_cbs = backend_ctx->chain_compute_cbs;
-        auto & stage_tensors     = backend_ctx->chain_tensors;
-        bool chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors,
-                                        backend_ctx->predefined_frame_valid ? &backend_ctx->predefined_frame : nullptr,
-                                        backend_ctx->predefined_capacity_rows,
-                                        backend_ctx->predefined_capacity_outputs);
+    // Predefined execution path: qualified against valid flag, UID, and node count consistency.
+    // If native submission is attempted and fails, fail-closed immediately to enforce the
+    // 'no fallback after native submission' contract.
+    if (backend_ctx->predefined_valid && backend_ctx->predefined_uid != 0 &&
+        cgraph->uid == backend_ctx->predefined_uid && cgraph->n_nodes == backend_ctx->n_nodes &&
+        cgraph->nodes == backend_ctx->node_base &&
+        !backend_ctx->chain_compute_cbs.empty() && pfn_submit_chain != nullptr) {
+        auto &     stage_compute_cbs = backend_ctx->chain_compute_cbs;
+        auto &     stage_tensors     = backend_ctx->chain_tensors;
+        const bool chain_ok =
+            pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors,
+                             backend_ctx->predefined_frame_valid ? &backend_ctx->predefined_frame : nullptr,
+                             backend_ctx->predefined_capacity_rows, backend_ctx->predefined_capacity_outputs);
         if (chain_ok) {
             return GGML_STATUS_SUCCESS;
         }
+        fprintf(stderr, "[tp5-meta] predefined execution failed; refusing fallback after native submission\n");
+        return GGML_STATUS_FAILED;
     }
 
-    // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
+    // Graph views share their parent's UID. Different slices with the same
+    // node count still require different child graphs and native definitions.
     const bool needs_rebuild =
-        (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid) || (cgraph->n_nodes != backend_ctx->n_nodes);
+        (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid) ||
+        (cgraph->n_nodes != backend_ctx->n_nodes) || (cgraph->nodes != backend_ctx->node_base);
 
     if (needs_rebuild) {
         // Old CB/tensor handles stop being executable BEFORE their graphs are
         // reset below. A same-sized replacement is still a different definition.
-        if (cgraph->uid == backend_ctx->predefined_uid) {
-            backend_ctx->predefined_valid = false;
+        if (backend_ctx->predefined_valid) {
+            backend_ctx->predefined_valid       = false;
             backend_ctx->predefined_n_subgraphs = 0;
-            backend_ctx->predefined_uid = 0;
+            backend_ctx->predefined_uid         = 0;
             backend_ctx->chain_compute_cbs.clear();
             backend_ctx->chain_tensors.clear();
         }
@@ -3541,6 +3567,61 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
+        size_t max_gather_row_bytes = 0;
+        if (n_backends > 1) {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                if (!ggml_backend_meta_is_allgather_boundary(node)) {
+                    continue;
+                }
+                const ggml_tensor * source = node->src[0];
+                if (!source) {
+                    fprintf(stderr, "ggml-backend-meta: AllGather has no score source\n");
+                    return GGML_STATUS_FAILED;
+                }
+                const auto ss = ggml_backend_meta_get_split_state(source, true);
+                if (node->type != GGML_TYPE_F32 || source->type != node->type ||
+                    source->ne[0] != node->ne[0] || source->ne[1] != node->ne[1] ||
+                    node->ne[2] != 1 || node->ne[3] != 1 || source->ne[2] != 1 || source->ne[3] != 1 ||
+                    ss.axis != GGML_BACKEND_SPLIT_AXIS_0 || ss.n_segments != 1 || ss.nr[0] != 1 || ss.mapped_span) {
+                    fprintf(stderr, "ggml-backend-meta: AllGather requires dense F32 score rows and one axis-0 span per rank: "
+                                    "dst=%s type=%s shape=%lld,%lld,%lld,%lld src=%s op=%s flags=0x%x type=%s "
+                                    "shape=%lld,%lld,%lld,%lld axis=%d segments=%u nr=%u mapped=%d\n",
+                            node->name, ggml_type_name(node->type),
+                            (long long) node->ne[0], (long long) node->ne[1],
+                            (long long) node->ne[2], (long long) node->ne[3],
+                            source->name, ggml_op_name(source->op), unsigned(source->flags), ggml_type_name(source->type),
+                            (long long) source->ne[0], (long long) source->ne[1],
+                            (long long) source->ne[2], (long long) source->ne[3],
+                            int(ss.axis), unsigned(ss.n_segments), ss.nr[0], int(ss.mapped_span));
+                    return GGML_STATUS_FAILED;
+                }
+                size_t columns = 0;
+                for (size_t rank = 0; rank < n_backends; ++rank) {
+                    const ggml_tensor * src = ggml_backend_meta_buffer_simple_tensor(source, rank);
+                    const ggml_tensor * dst = ggml_backend_meta_buffer_simple_tensor(node, rank);
+                    if (ss.ne[rank] < 0 || src->ne[0] != ss.ne[rank] || src->ne[1] != node->ne[1] ||
+                        src->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+                        dst->ne[0] != node->ne[0] || dst->ne[1] != node->ne[1]) {
+                        fprintf(stderr, "ggml-backend-meta: AllGather layout mismatch rank=%zu expected=%lld "
+                                        "src=%lld,%lld stride=%zu,%zu dst=%lld,%lld stride=%zu,%zu full=%lld,%lld\n",
+                                rank, (long long) ss.ne[rank], (long long) src->ne[0], (long long) src->ne[1],
+                                src->nb[0], src->nb[1], (long long) dst->ne[0], (long long) dst->ne[1],
+                                dst->nb[0], dst->nb[1], (long long) node->ne[0], (long long) node->ne[1]);
+                        return GGML_STATUS_FAILED;
+                    }
+                    columns += size_t(ss.ne[rank]);
+                }
+                if (columns != size_t(node->ne[0])) {
+                    fprintf(stderr, "ggml-backend-meta: AllGather source spans do not cover complete scores\n");
+                    return GGML_STATUS_FAILED;
+                }
+                max_gather_row_bytes = std::max(max_gather_row_bytes, size_t(node->ne[0]) * sizeof(float));
+            }
+        }
+        if (backend_ctx->gather_staging.size() < max_gather_row_bytes) {
+            backend_ctx->gather_staging.resize(max_gather_row_bytes);
+        }
 
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -3890,8 +3971,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool is_allgather = n_backends > 1 && ggml_backend_meta_is_allgather_boundary(node);
+                const bool new_subgraph = i + 1 == cgraph->n_nodes ||
+                                          split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
+                                          is_allgather;
                 if (!new_subgraph) {
+                    continue;
+                }
+
+                if (is_allgather) {
+                    // Explicit materialization boundary for AllGather:
+                    // Do NOT defer across linear chains or AllReduce deferrals; split here.
+                    for (size_t j = 0; j < n_backends; j++) {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        bcj.cgraphs.push_back({ nullptr, i_start });
+                    }
+                    n_subgraphs++;
+                    i_start = i + 1;
                     continue;
                 }
 
@@ -3938,6 +4034,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->uid         = cgraph->uid;
         backend_ctx->n_nodes     = cgraph->n_nodes;
         backend_ctx->n_subgraphs = n_subgraphs;
+        backend_ctx->node_base   = cgraph->nodes;
 
         if (needs_rebuild && backend_ctx->debug > 0) {
             fprintf(stderr, "[meta-tp5] subgraph boundaries: %zu\n",
@@ -4004,6 +4101,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
                     ggml_tensor * node_ij = bcj.nodes[i_node];
+                    // Skip executing the AllGather materialization boundary inside child backends
+                    if (n_backends > 1 && ggml_backend_meta_is_allgather_boundary(cgraph->nodes[i_node])) {
+                        node_ij->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+                    }
                     cgraph_ij->nodes[i_node - i_node_start] = node_ij;
                     const size_t hash_pos_orig = ggml_hash_find(&cgraph->visited_hash_set, cgraph->nodes[i_node]);
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
@@ -4178,11 +4279,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     if (pfn_submit_chain && pfn_get_cbs && backend_ctx->comm_ctx && n_backends == 5 && backend_ctx->n_subgraphs > 1 &&
-        (backend_ctx->n_subgraphs - 1) <= 128) {
-        // 纯 Predefine 路线（唯一真理）：一旦初次建立预定义图句柄后，直接 100% 绝对复用，跳过逐轮 validation 开销
-        auto & stage_compute_cbs = backend_ctx->chain_compute_cbs;
-        auto & stage_tensors     = backend_ctx->chain_tensors;
-        static int check_log = 0;
+        (backend_ctx->n_subgraphs - 1) <= 256) {
+        // Predefined chain execution path: validated against valid state, subgraph count, and UID.
+        auto &     stage_compute_cbs = backend_ctx->chain_compute_cbs;
+        auto &     stage_tensors     = backend_ctx->chain_tensors;
+        static int check_log         = 0;
         if (++check_log <= 10) {
             fprintf(stderr, "[tp5-meta-check] valid=%d n_sub=%zu/%zu uid=%llu/%llu\n",
                     (int)backend_ctx->predefined_valid, backend_ctx->predefined_n_subgraphs, backend_ctx->n_subgraphs,
@@ -4216,7 +4317,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             if (chain_ok) {
                 if (++chain_hit_log <= 5 || chain_hit_log % 100 == 0) {
-                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN (PREDEFINED TRUTH): hits=%d\n", chain_hit_log);
+                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN (PREDEFINED): hits=%d\n", chain_hit_log);
                 }
                 return GGML_STATUS_SUCCESS;
             }
@@ -4265,8 +4366,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                 if (i < stage_tensors.size())
                     stage_tensors[i][j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
+                const bool is_allgather = i < stage_tensors.size() &&
+                    ggml_backend_meta_is_allgather_boundary(stage_tensors[i][j]);
                 if (backend_ctx->comm_prepare &&
-                    !backend_ctx->comm_prepare(backend_ctx->comm_ctx, j, cgraph_ij, i < stage_tensors.size(), i)) {
+                    !backend_ctx->comm_prepare(backend_ctx->comm_ctx, j, cgraph_ij,
+                                               i < stage_tensors.size() && !is_allgather, i)) {
                     return GGML_STATUS_FAILED;
                 }
                 if (!pfn_get_cbs(bcj.backend, cgraph_ij, stage_compute_cbs[i][j])) {
@@ -4343,9 +4447,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (chain_ok) {
                 backend_ctx->predefined_valid = true;
                 backend_ctx->predefined_n_subgraphs = backend_ctx->n_subgraphs;
-                backend_ctx->predefined_uid = backend_ctx->uid;
+                backend_ctx->predefined_uid         = backend_ctx->uid;
                 if (++chain_hit_log <= 5 || chain_hit_log % 100 == 0) {
-                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN SUCCESS: predefined truth locked! (hits=%d)\n", chain_hit_log);
+                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN SUCCESS: prepared definition executed (hits=%d)\n",
+                            chain_hit_log);
                 }
                 return GGML_STATUS_SUCCESS;
             } else {
@@ -4364,11 +4469,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        ggml_tensor * boundary_node = cgraph->nodes[backend_ctx->backend_configs[0].cgraphs[i].offset + backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1];
+        const bool is_allgather = n_backends > 1 && ggml_backend_meta_is_allgather_boundary(boundary_node);
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             if (backend_ctx->comm_prepare &&
                 !backend_ctx->comm_prepare(backend_ctx->comm_ctx, j, bcj.cgraphs[i].cgraph_main,
-                                           i < backend_ctx->n_subgraphs - 1, i)) {
+                                           !is_allgather && i < backend_ctx->n_subgraphs - 1, i)) {
                 return GGML_STATUS_FAILED;
             }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
@@ -4377,7 +4484,49 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        if (is_allgather) {
+            // Synchronize producers across all participating backends before reading rank-local shards
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+            }
+            // Perform exact float-preserving bit-copy AllGather from each rank's shard
+            // into the full mirrored destination buffers of all ranks.
+            const ggml_tensor * shard_tensor = boundary_node->src[0];
+            const ggml_backend_meta_split_state shard_ss = ggml_backend_meta_get_split_state(shard_tensor, /*assume_sync =*/ true);
+            GGML_ASSERT(shard_ss.axis == GGML_BACKEND_SPLIT_AXIS_0);
+            GGML_ASSERT(shard_ss.n_segments == 1);
+            const size_t type_size = ggml_type_size(boundary_node->type);
+            const int64_t n_rows = boundary_node->ne[1];
+            const size_t row_bytes = (size_t) boundary_node->ne[0] * type_size;
+            GGML_ASSERT(backend_ctx->gather_staging.size() >= row_bytes);
+            for (int64_t row = 0; row < n_rows; ++row) {
+                size_t global_col_offset = 0;
+                for (size_t r = 0; r < n_backends; ++r) {
+                    const ggml_tensor * simple_shard = ggml_backend_meta_buffer_simple_tensor(shard_tensor, r);
+                    const int64_t shard_cols = shard_ss.ne[r];
+                    if (shard_cols <= 0) continue;
+                    const size_t chunk_bytes = (size_t) shard_cols * type_size;
+                    const size_t shard_byte_offset = (size_t) row * simple_shard->nb[1];
+                    uint8_t * staging_ptr = backend_ctx->gather_staging.data() + global_col_offset * type_size;
+                    ggml_backend_tensor_get(simple_shard, staging_ptr, shard_byte_offset, chunk_bytes);
+                    global_col_offset += shard_cols;
+                }
+                GGML_ASSERT(global_col_offset == (size_t) boundary_node->ne[0]);
+                // Replicate full row into mirrored output buffers across all ranks
+                for (size_t dst_rank = 0; dst_rank < n_backends; ++dst_rank) {
+                    ggml_tensor * simple_dst = ggml_backend_meta_buffer_simple_tensor(boundary_node, dst_rank);
+                    const size_t dst_byte_offset = (size_t) row * simple_dst->nb[1];
+                    ggml_backend_tensor_set(simple_dst, backend_ctx->gather_staging.data(), dst_byte_offset, row_bytes);
+                }
+            }
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+            }
+            continue; // Do NOT perform AllReduce on gathered scores!
+        }
+
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 // Radical optimization (TP5.md 13.3 / 13.6): Asynchronously flush all backend

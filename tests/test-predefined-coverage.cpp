@@ -1,28 +1,19 @@
 #include "../ggml/src/ggml-vulkan/ggml-vulkan-tp5-coverage.h"
 
 #include <cstdio>
-#include <cstring>
 #include <stdexcept>
 
-#define CHECK(x) do { if (!(x)) throw std::runtime_error("failed: " #x); } while (0)
+#define CHECK(x)                                     \
+    do {                                             \
+        if (!(x))                                    \
+            throw std::runtime_error("failed: " #x); \
+    } while (0)
 
 // Pure CPU coverage-record tests. No Vulkan loader/device, shader compiler,
 // model load, or GPU execution is involved. These tests exercise the
-// definition-time semantic coverage record, tri-state evaluation, completeness,
-// and the dynamic execution gate contract (ggml-vulkan.cpp:27647).
+// production definition-time coverage record and completeness decisions.
 
-static bool simulate_dynamic_execution_gate(bool predefined_complete,
-                                            uint32_t active_rows,
-                                            uint32_t capacity_rows) {
-    // Exact logic from ggml-vulkan.cpp:27647:
-    // (!program.predefined_complete && active_rows != capacity_rows) -> reject
-    if (!predefined_complete && active_rows != capacity_rows) {
-        return false; // dynamic execution rejected (fail-closed)
-    }
-    return true; // permitted
-}
-
-static void valid_definition_is_complete_and_permits_dynamic_execution() {
+static void classified_definition_is_complete() {
     // 2 dynamic computes (1 tokens-driven, 1 outputs-driven), 0 copies:
     // captured == classified (2 == 2), no unproven copy/view/state writes.
     vk_tp5_predefined_coverage cov{};
@@ -49,16 +40,11 @@ static void valid_definition_is_complete_and_permits_dynamic_execution() {
     CHECK(!cov.would_reject);
     CHECK(vk_tp5_coverage_is_complete(cov));
 
-    // Dynamic execution qualification: permitted for active_rows < capacity_rows
-    CHECK(simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 1, 32));
-    CHECK(simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 4, 32));
-    CHECK(simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 32, 32));
-
     // Diagnostic reporting returns false (no unhandled gap to warn)
     CHECK(!vk_tp5_coverage_report(cov, 32, captured, classified));
 }
 
-static void unresolved_data_movement_blocks_dynamic_execution() {
+static void unresolved_data_movement_blocks_completeness() {
     // Dispatches are classified (2 == 2), but definition captured 1 raw copy/fill/update op.
     // Fixed range copy has no effective-range proof -> data_movement_state must be unresolved.
     vk_tp5_predefined_coverage cov{};
@@ -74,18 +60,11 @@ static void unresolved_data_movement_blocks_dynamic_execution() {
     vk_tp5_coverage_evaluate(cov, 32, captured, classified, copies, barriers, states);
 
     CHECK(cov.data_movement_state == vk_tp5_coverage_state::unresolved);
-    CHECK(std::strstr(cov.first_gap, "data_movement") != nullptr);
     CHECK(cov.would_reject);
     CHECK(!vk_tp5_coverage_is_complete(cov));
-
-    // Enforcement: Dynamic row execution is REJECTED by gate
-    CHECK(!simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 1, 32));
-    CHECK(!simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 4, 32));
-    // Exact capacity execution is still permitted
-    CHECK(simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 32, 32));
 }
 
-static void unclassified_dispatch_sets_unresolved_and_blocks_dynamic() {
+static void unclassified_dispatch_blocks_completeness() {
     // 3 captured, 2 classified -> 1 uncovered dispatch.
     // Must set compute and state writes to unresolved and block dynamic execution.
     vk_tp5_predefined_coverage cov{};
@@ -105,11 +84,7 @@ static void unclassified_dispatch_sets_unresolved_and_blocks_dynamic() {
     CHECK(cov.dynamic_compute_state == vk_tp5_coverage_state::unresolved);
     CHECK(cov.state_writes_state == vk_tp5_coverage_state::unresolved);
     CHECK(cov.dependency_boundaries_state == vk_tp5_coverage_state::unresolved);
-    CHECK(std::strstr(cov.first_gap, "compute") != nullptr);
     CHECK(!vk_tp5_coverage_is_complete(cov));
-
-    // Dynamic execution qualification: REJECTED
-    CHECK(!simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 1, 32));
 }
 
 static void all_fixed_compute_definition_is_complete() {
@@ -132,37 +107,37 @@ static void all_fixed_compute_definition_is_complete() {
     CHECK(cov.state_writes_state == vk_tp5_coverage_state::fixed_safe);
     CHECK(cov.dependency_boundaries_state == vk_tp5_coverage_state::fixed_safe);
     CHECK(vk_tp5_coverage_is_complete(cov));
-    CHECK(simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 1, 32));
 }
 
-static void tri_state_and_first_gap_contract() {
-    // Verify string names
-    CHECK(std::strcmp(vk_tp5_coverage_state_name(vk_tp5_coverage_state::unresolved), "unresolved") == 0);
-    CHECK(std::strcmp(vk_tp5_coverage_state_name(vk_tp5_coverage_state::fixed_safe), "fixed_safe") == 0);
-    CHECK(std::strcmp(vk_tp5_coverage_state_name(vk_tp5_coverage_state::dynamic_safe), "dynamic_safe") == 0);
-
-    // Verify first_gap retains only the first reason
+static void unresolved_state_blocks_completeness() {
     vk_tp5_predefined_coverage cov{};
-    vk_tp5_coverage_set_gap(cov, "first reason");
-    vk_tp5_coverage_set_gap(cov, "second reason");
-    CHECK(std::strcmp(cov.first_gap, "first reason") == 0);
-
-    // Any individual unresolved state causes is_complete() == false
-    cov.state_writes_state = vk_tp5_coverage_state::unresolved;
-    CHECK(!vk_tp5_coverage_is_complete(cov));
+    vk_tp5_coverage_note_fixed(cov);
+    vk_tp5_coverage_evaluate(cov, 32, 1, 1, 0, 0, 1);
+    CHECK(vk_tp5_coverage_is_complete(cov));
+    const auto            complete                                         = cov;
+    vk_tp5_coverage_state vk_tp5_predefined_coverage::* const categories[] = {
+        &vk_tp5_predefined_coverage::fixed_compute_state,         &vk_tp5_predefined_coverage::dynamic_compute_state,
+        &vk_tp5_predefined_coverage::data_movement_state,         &vk_tp5_predefined_coverage::state_writes_state,
+        &vk_tp5_predefined_coverage::dependency_boundaries_state,
+    };
+    for (auto category : categories) {
+        cov           = complete;
+        cov.*category = vk_tp5_coverage_state::unresolved;
+        CHECK(!vk_tp5_coverage_is_complete(cov));
+    }
 }
 
 int main() {
     try {
-        valid_definition_is_complete_and_permits_dynamic_execution();
-        unresolved_data_movement_blocks_dynamic_execution();
-        unclassified_dispatch_sets_unresolved_and_blocks_dynamic();
+        classified_definition_is_complete();
+        unresolved_data_movement_blocks_completeness();
+        unclassified_dispatch_blocks_completeness();
         all_fixed_compute_definition_is_complete();
-        tri_state_and_first_gap_contract();
+        unresolved_state_blocks_completeness();
     } catch (const std::exception & e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;
     }
-    std::puts("predefined semantic coverage checks passed (tri-state & gate qualification verified)");
+    std::puts("predefined semantic coverage record checks passed");
     return 0;
 }

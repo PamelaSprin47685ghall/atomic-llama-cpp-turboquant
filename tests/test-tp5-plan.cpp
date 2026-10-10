@@ -1716,6 +1716,43 @@ static void test_tp5_packed_weight_layout() {
             (unsigned long long) act_bytes, (unsigned long long) lo_bytes, max_rows);
 }
 
+static void test_tp5_shard_router_plan_invariants() {
+    fprintf(stderr, "--- test_tp5_shard_router_plan_invariants ---\n");
+    // Opt-in: GGML_TP5_SHARD_ROUTER=1 shards output rows across 5 ranks
+    llama_hparams hp = make_hparams();
+    llama_tp5_error err;
+    bool ok = false;
+    int64_t ne[4] = {2560, 512, 1, 1};
+    setenv("GGML_TP5_SHARD_ROUTER", "1", 1);
+    llama_tp5_plan plan_sharded;
+    TEST_ASSERT(llama_tp5_plan_build(hp, 5, 248320, false, plan_sharded, err));
+    auto tp_shard = plan_sharded.plan_tensor("blk.0.ffn_gate_inp.weight", ne, 0 /*F32*/, 1, ok, err);
+    TEST_ASSERT(ok);
+    TEST_ASSERT(tp_shard.semantic == llama_tp5_semantic::MOE_ROUTER);
+    TEST_ASSERT(tp_shard.layout == llama_tp5_layout::SPLIT_AXIS1);
+    TEST_ASSERT(tp_shard.split_axis == 1);
+
+    int64_t total_rows = 0;
+    const int64_t expected_lengths[5] = {103, 103, 102, 102, 102};
+    for (uint32_t r = 0; r < 5; ++r) {
+        TEST_ASSERT(tp_shard.per_rank_len[r] == expected_lengths[r]);
+        total_rows += tp_shard.per_rank_len[r];
+    }
+    TEST_ASSERT(total_rows == 512);
+
+    // Check non-overlapping contiguous head_ranges covering [0, 512)
+    for (uint32_t r = 0; r < 5; ++r) {
+        TEST_ASSERT(tp_shard.head_ranges[r][1] - tp_shard.head_ranges[r][0] == expected_lengths[r]);
+        if (r > 0) {
+            TEST_ASSERT(tp_shard.head_ranges[r][0] == tp_shard.head_ranges[r-1][1]);
+        }
+    }
+    TEST_ASSERT(tp_shard.head_ranges[0][0] == 0);
+    TEST_ASSERT(tp_shard.head_ranges[4][1] == 512);
+
+    unsetenv("GGML_TP5_SHARD_ROUTER");
+}
+
 int main() {
     test_plan_rejects_bad_ranks();
     test_plan_rejects_indivisible_moe();
@@ -1749,6 +1786,7 @@ int main() {
     test_tp5_packed_weight_layout();
     test_tp5_numerical_mode_resolution();
     test_tp5_p1a_nosidecar_schedule_contract();
+    test_tp5_shard_router_plan_invariants();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d failures\n", g_failures);

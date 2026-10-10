@@ -182,6 +182,9 @@ int64_t llama_tp5_gdn_qk_global_head(const llama_tp5_plan & plan, int64_t global
 // exactly the balanced QWEN4EXP 5-rank Q24/KV2 assignment.
 bool llama_tp5_qsa_headmap_enabled(void);
 
+// True when router score row sharding is requested via GGML_TP5_SHARD_ROUTER=1.
+bool llama_tp5_shard_router_enabled(void);
+
 // Stamp the per-local-Q-head -> local-KV-head map of the given rank onto a
 // rank-local GGML_OP_FLASH_ATTN_EXT node using the shared ggml_tp5_headmap_set
 // ABI (op_params i32 slots 8/9/10). The global graph node is never stamped;

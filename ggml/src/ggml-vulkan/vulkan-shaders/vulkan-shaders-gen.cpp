@@ -987,6 +987,12 @@ void process_shaders() {
                   {
                       { "TP5_LATE_Q", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
     });
+    // Workorder A-native: BF16 W_down variant of the exact Q contraction for
+    // the original Q2_0 target (uint16 weights, no block scale).
+    string_to_spv("tp5_hc_late_q_bf16", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_Q", "1" }, { "TP5_LATE_Q_BF16", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
+    });
     string_to_spv("tp5_hc_late_stats", "tp5_hc_latebind.comp",
                   {
                       { "TP5_LATE_STATS", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
@@ -1003,9 +1009,15 @@ void process_shaders() {
                   {
                       { "TP5_LATE_PACK_WEIGHTS", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
     });
+    string_to_spv("tp5_hc_late_pack_single", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_PACK_WEIGHTS", "1" }, { "TP5_LATE_PACK_SINGLE", "1" },
+                      { "TP5_LATE_CAPACITY_ROWS", late_capacity }
+    });
     string_to_spv("tp5_hc_late_q_q8dot", "tp5_hc_latebind.comp",
                   {
-                      { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
+                      { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity },
+                      { "TP5_RELAY_EPOCH_WORD", std::to_string(TP5_RELAY_EPOCH_WORD) + "u" }
     });
     // LB2 on the aggressive blade. The q8dot-approx Q producer used to carry no
     // statistics at all (TP5_LATE_Q_STATS existed only inside the exact TP5_LATE_Q
@@ -1014,7 +1026,8 @@ void process_shaders() {
     // same producer, which is what makes RHO reachable on the aggressive path.
     string_to_spv("tp5_hc_late_q_q8dot_stats", "tp5_hc_latebind.comp",
                   {
-                      { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_Q_STATS", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
+                      { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_Q_STATS", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity },
+                      { "TP5_RELAY_EPOCH_WORD", std::to_string(TP5_RELAY_EPOCH_WORD) + "u" }
     });
     // L2 (tip): RMS sufficient-statistic partials formed in ACT_Q8 (the only point
     // where live R and z_p are both guaranteed), folded by Q8DOT workgroup 0 into
@@ -1027,7 +1040,8 @@ void process_shaders() {
     string_to_spv("tp5_hc_late_q_q8dot_l2", "tp5_hc_latebind.comp",
                   {
                       { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_L2", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity },
-                      { "TP5_LATE_STATS_WORDS", std::to_string(TP5_LATE_STATS_WORDS_PER_TOKEN) + "u" }
+                      { "TP5_LATE_STATS_WORDS", std::to_string(TP5_LATE_STATS_WORDS_PER_TOKEN) + "u" },
+                      { "TP5_RELAY_EPOCH_WORD", std::to_string(TP5_RELAY_EPOCH_WORD) + "u" }
     });
     string_to_spv("tp5_hc_late_up_q8dot_bcast", "tp5_hc_latebind.comp",
                   {
@@ -1035,6 +1049,7 @@ void process_shaders() {
                       { "TP5_RELAY_EPOCH_WORD", std::to_string(TP5_RELAY_EPOCH_WORD) + "u" }
     });
     string_to_spv("tp5_hc_resume_norm", "tp5_hc_resume.comp", {{ "TP5_RESUME_NORM", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
+    string_to_spv("tp5_hc_resume_norm_stage_y", "tp5_hc_resume.comp", {{ "TP5_RESUME_NORM", "1" }, { "TP5_RESUME_NORM_STAGE_Y", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
     string_to_spv("tp5_hc_resume_lo", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
     string_to_spv("tp5_hc_resume_lo_q8", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO_Q8", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
     string_to_spv("tp5_hc_resume_lo_u", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO_U", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }});
@@ -1101,6 +1116,26 @@ void process_shaders() {
         string_to_spv(variant.first, "mul_mat_vec.comp",
                       merge_maps(base_dict, {
                                                 { "DATA_A_Q8_0",               "1"     },
+                                                { "B_TYPE",                    "float" },
+                                                { "B_TYPEV2",                  "vec2"  },
+                                                { "B_TYPEV4",                  "vec4"  },
+                                                { "D_TYPE",                    "float" },
+                                                { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                                { variant.second,              "1"     }
+        }));
+    }
+    // BF16 HC variants (workorder A-native): the original Q2_0 keeps its HC
+    // down/up weights in BF16. These variants let the fused HC segment and
+    // the LateBind capture path run on the ORIGINAL target without a Q8
+    // conversion. QUANT_K=1/QUANT_R=1 via DATA_A_BF16; dequantize4 handles the
+    // bf16->fp32 expansion; get_dm returns (0,0) so no scale/min term applies.
+    for (const auto & variant : {
+             std::pair{ "qwen4_hc_down_silu_bf16",    "HC_DOWN_SILU" },
+             std::pair{ "qwen4_hc_project_fold_bf16", "HC_UP_FOLD"   }
+    }) {
+        string_to_spv(variant.first, "mul_mat_vec.comp",
+                      merge_maps(base_dict, {
+                                                { "DATA_A_BF16",               "1"     },
                                                 { "B_TYPE",                    "float" },
                                                 { "B_TYPEV2",                  "vec2"  },
                                                 { "B_TYPEV4",                  "vec4"  },
@@ -1392,6 +1427,7 @@ void process_shaders() {
     string_to_spv("tp5_gpuflag", "tp5_gpuflag.comp", {});
     string_to_spv("tp5_relay", "tp5_relay.comp", {});
     string_to_spv("tp5_relay_copy_f32", "tp5_relay_copy_f32.comp", {});
+    string_to_spv("tp5_gather_p1", "tp5_gather_p1.comp", {});
 
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
@@ -1671,6 +1707,7 @@ void process_shaders() {
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
     string_to_spv("topk_moe_staged_f32", "topk_moe_staged.comp", {});
+    string_to_spv("tp5_predefined_add_rows", "tp5_predefined_add_rows.comp", {});
     string_to_spv("topk_moe_staged_subgroup_f32", "topk_moe_staged.comp",
                   {
                       { "SUBGROUP_REDUCTIONS", "1" }

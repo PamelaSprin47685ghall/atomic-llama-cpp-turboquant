@@ -444,6 +444,18 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
     }
     if (base == "ffn_gate_inp.weight") {
         tp.semantic = llama_tp5_semantic::MOE_ROUTER;
+        if (llama_tp5_shard_router_enabled()) {
+            tp.layout = llama_tp5_layout::SPLIT_AXIS1;
+            tp.split_axis = 1;
+            int64_t first = 0;
+            for (uint32_t r = 0; r < ranks; ++r) {
+                const int64_t rows = E / ranks + ((int64_t) r < E % ranks ? 1 : 0);
+                tp.per_rank_len[r] = rows;
+                tp.head_ranges.push_back({first, first + rows});
+                first += rows;
+            }
+            return tp;
+        }
         tp.layout = llama_tp5_layout::MIRRORED;
         return tp;
     }
@@ -689,6 +701,11 @@ bool llama_tp5_gdn_headmap_stamp(const llama_tp5_plan & plan, uint32_t rank, str
 
 bool llama_tp5_qsa_headmap_enabled(void) {
     const char * env = getenv("GGML_TP5_QSA_HEADMAP");
+    return env && atoi(env) != 0;
+}
+
+bool llama_tp5_shard_router_enabled(void) {
+    const char * env = getenv("GGML_TP5_SHARD_ROUTER");
     return env && atoi(env) != 0;
 }
 

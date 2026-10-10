@@ -701,6 +701,11 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         {
             ok = ok && gr.read(info.t.type);
 
+            // Compatibility with upstream GGUFs where Q2_0 was type 42 before being renumbered to 47 in this fork
+            if (info.t.type == 42) {
+                info.t.type = GGML_TYPE_Q2_0;
+            }
+
             // check that tensor type is within defined range
             if (info.t.type < 0 || info.t.type >= GGML_TYPE_COUNT) {
                 GGML_LOG_ERROR("%s: tensor '%s' has invalid ggml type %d. should be in [0, %d)\n",

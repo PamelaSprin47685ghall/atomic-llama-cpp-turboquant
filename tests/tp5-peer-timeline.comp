@@ -1,0 +1,37 @@
+#version 450
+// Each dispatch is a stage in a five-device external timeline-semaphore chain.
+// Cache visibility comes from release/acquire semaphore dependencies, not from
+// guessing that ordinary HOST_COHERENT imports are device-coherent.
+layout(local_size_x=256) in;
+layout(std430,binding=0) buffer Shared { uint words[]; };
+layout(std430,binding=0) buffer Shared128 { uvec4 vectors[]; };
+layout(push_constant) uniform Parameters {
+    uint rank; uint elements; uint stage; uint stages; uint first_epoch; uint run;
+    uint stride_words; uint output_words; uint reserved0; uint reserved1;
+} p;
+void main(){
+    const uint lane=gl_LocalInvocationID.x;
+    const uint bank=p.stage&1u;
+    const uint own=(bank*5u+p.rank)*p.stride_words;
+    for(uint v=lane;v<p.elements/4u;v+=256u){
+        vec4 result;
+        if(p.stage==0u){
+            for(uint c=0u;c<4u;++c)
+                result[c]=float(p.rank+1u)*0.25+float((4u*v+c)%7u)*0.03125+float(p.run%8u)*0.0625;
+        }else{
+            precise vec4 sum=vec4(0.0);
+            const uint prior=(p.stage-1u)&1u;
+            for(uint r=0u;r<5u;++r){
+                const uint base=(prior*5u+r)*p.stride_words+16u;
+                sum+=uintBitsToFloat(vectors[base/4u+v]);
+            }
+            precise vec4 scaled=sum*0.125;
+            precise vec4 biased=scaled+vec4(float(p.rank+1u)*0.25);
+            for(uint c=0u;c<4u;++c)result[c]=biased[c]+float((4u*v+c)%7u)*0.03125;
+        }
+        vectors[(own+16u)/4u+v]=floatBitsToUint(result);
+        if(p.stage==p.stages)vectors[(p.output_words+p.rank*p.elements)/4u+v]=floatBitsToUint(result);
+    }
+    memoryBarrierBuffer();barrier();
+    if(lane==0u){words[own]=p.first_epoch+p.stage;words[own+2u]=p.first_epoch+p.stage;}
+}

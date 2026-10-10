@@ -2880,6 +2880,299 @@ static void test_attention_region_replay(test_env & env) {
         "fallback, gated output and downstream views.\n");
 }
 
+static void test_replay_shrinking_kv_attention(test_env & env) {
+    constexpr int head = 64, capacity = 64;
+    auto * ctx = ggml_init({65536, nullptr, true});
+    TEST_ASSERT(ctx);
+    auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head, 1, 1, 1);
+    auto * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head, capacity, 1, 1);
+    auto * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head, capacity, 1, 1);
+    auto * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    auto * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, out);
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, env.backend_gpu);
+    TEST_ASSERT(buffer);
+    std::vector<float> queries(head, 0.0f), result(head);
+    std::vector<ggml_fp16_t> keys(head * capacity, ggml_fp32_to_fp16(0.0f));
+    std::vector<ggml_fp16_t> values(head * capacity);
+    for (int t = 0; t < capacity; ++t) {
+        std::fill(values.begin() + t * head, values.begin() + (t + 1) * head,
+                  ggml_fp32_to_fp16(t < capacity / 2 ? 1.0f : 3.0f));
+    }
+    ggml_backend_tensor_set(q, queries.data(), 0, queries.size() * sizeof(float));
+    ggml_backend_tensor_set(k, keys.data(), 0, keys.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(v, values.data(), 0, values.size() * sizeof(ggml_fp16_t));
+    for (int live : {capacity, capacity / 2, capacity}) {
+        k->ne[1] = live;
+        v->ne[1] = live;
+        CHECK_STATUS(ggml_backend_graph_compute(env.backend_gpu, graph), "actual live-KV attention");
+        ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
+        const float expected = live == capacity ? 2.0f : 1.0f;
+        for (float val : result) {
+            CHECK_CLOSE(val, expected, 1e-6f);
+        }
+    }
+    ggml_backend_synchronize(env.backend_gpu);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    printf("test_replay_shrinking_kv_attention PASSED: strict shape mismatch prevents stale capacity replay\n");
+}
+
+static bool test_mmvq_scratch_reuse(test_env & env) {
+    const char * old_force = std::getenv("GGML_VK_FORCE_MMVQ");
+    const char * old_disable = std::getenv("GGML_VK_DISABLE_MMVQ");
+    const std::string force_value = old_force ? old_force : "";
+    const std::string disable_value = old_disable ? old_disable : "";
+    setenv("GGML_VK_FORCE_MMVQ", "1", 1);
+    unsetenv("GGML_VK_DISABLE_MMVQ");
+    auto * backend_gpu = ggml_backend_vk_init(0);
+    if (old_force) setenv("GGML_VK_FORCE_MMVQ", force_value.c_str(), 1);
+    else unsetenv("GGML_VK_FORCE_MMVQ");
+    if (old_disable) setenv("GGML_VK_DISABLE_MMVQ", disable_value.c_str(), 1);
+    else unsetenv("GGML_VK_DISABLE_MMVQ");
+    TEST_ASSERT(backend_gpu);
+    if (!env.get_region_mmvq_stats || !env.get_region_mmvq_stats(backend_gpu, nullptr, nullptr, nullptr, nullptr)) {
+        printf("SKIP test_mmvq_scratch_reuse: integer-dot MMVQ unavailable.\n");
+        ggml_backend_free(backend_gpu);
+        return false;
+    }
+
+    constexpr int k = 320;
+    constexpr int m = 128;
+    constexpr int kv_length = 8192;
+    for (const bool attention : {false, true}) {
+        auto * weights_ctx = ggml_init({1024 * 1024, nullptr, true});
+        TEST_ASSERT(weights_ctx);
+        auto * weight = ggml_new_tensor_2d(weights_ctx, GGML_TYPE_Q8_0, k, m);
+        auto * keys = attention ? ggml_new_tensor_4d(weights_ctx, GGML_TYPE_F16, m, kv_length, 1, 1) : nullptr;
+        auto * values = attention ? ggml_new_tensor_4d(weights_ctx, GGML_TYPE_F16, m, kv_length, 1, 1) : nullptr;
+        auto * mask = attention ? ggml_new_tensor_2d(weights_ctx, GGML_TYPE_F16, kv_length, k) : nullptr;
+        auto * weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, backend_gpu);
+        TEST_ASSERT(weights_buffer);
+        ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> weight_values(k * m);
+        for (int row = 0; row < m; ++row) {
+            for (int col = 0; col < k; ++col) {
+                const int q = col % 32 == 0 ? 127 : (row * 17 + col * 31) % 253 - 126;
+                weight_values[row * k + col] = std::ldexp(float(q), -5 - row % 3);
+            }
+        }
+        std::vector<uint8_t> packed(ggml_nbytes(weight));
+        TEST_ASSERT(ggml_quantize_chunk(weight->type, weight_values.data(), packed.data(), 0, m, k, nullptr) == packed.size());
+        ggml_backend_tensor_set(weight, packed.data(), 0, packed.size());
+        if (attention) {
+            std::vector<ggml_fp16_t> key_values(ggml_nelements(keys), ggml_fp32_to_fp16(0.0f));
+            std::vector<ggml_fp16_t> value_values(ggml_nelements(values));
+            std::vector<ggml_fp16_t> mask_values(ggml_nelements(mask), ggml_fp32_to_fp16(0.0f));
+            for (size_t i = 0; i < value_values.size(); ++i) {
+                value_values[i] = ggml_fp32_to_fp16(float(int(i % m) % 31 - 15) / 256.0f);
+            }
+            ggml_backend_tensor_set(keys, key_values.data(), 0, key_values.size() * sizeof(ggml_fp16_t));
+            ggml_backend_tensor_set(values, value_values.data(), 0, value_values.size() * sizeof(ggml_fp16_t));
+            ggml_backend_tensor_set(mask, mask_values.data(), 0, mask_values.size() * sizeof(ggml_fp16_t));
+        }
+
+        auto * ctx = ggml_init({1024 * 1024, nullptr, true});
+        TEST_ASSERT(ctx);
+        auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_set_input(input);
+        auto * first = ggml_mul_mat(ctx, weight, input);
+        ggml_set_output(first);
+        auto * repeated = ggml_repeat(ctx, first, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k * m));
+        auto * intermediate = attention ?
+            ggml_flash_attn_ext(ctx, ggml_reshape_4d(ctx, repeated, m, k, 1, 1), keys, values, mask,
+                                1.0f / std::sqrt(float(m)), 0.0f, 0.0f) : ggml_soft_max(ctx, repeated);
+        if (attention) ggml_flash_attn_ext_set_prec(intermediate, GGML_PREC_F32);
+        ggml_set_output(intermediate);
+        // Producing the second weight from the reduction prevents the graph
+        // optimizer from moving both independent matmuls before the scratch write.
+        auto * produced_weight = ggml_cast(ctx, ggml_reshape_2d(ctx, intermediate, k, m), GGML_TYPE_Q8_0);
+        ggml_set_output(produced_weight);
+        auto * last = ggml_mul_mat(ctx, produced_weight, input);
+        ggml_set_output(last);
+        auto * graph = ggml_new_graph_custom(ctx, 32, false);
+        ggml_build_forward_expand(graph, first);
+        ggml_build_forward_expand(graph, intermediate);
+        ggml_build_forward_expand(graph, last);
+        ggml_backend_t backends[] = {backend_gpu, env.backend_cpu};
+        auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 64, false, true);
+        TEST_ASSERT(sched);
+        ggml_backend_sched_set_tensor_backend(sched, input, backend_gpu);
+        for (auto * node : {first, repeated, intermediate, produced_weight, last}) {
+            TEST_ASSERT(ggml_backend_supports_op(backend_gpu, node));
+            ggml_backend_sched_set_tensor_backend(sched, node, backend_gpu);
+        }
+        TEST_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+        uint64_t hits_before = 0, misses_before = 0;
+        env.get_stats(backend_gpu, &hits_before, &misses_before);
+        for (int round = 0; round < 3; ++round) {
+            std::vector<float> input_values(k);
+            for (int col = 0; col < k; ++col) {
+                const int q = col % 32 == 0 ? 127 : (col * 13 + round * 19) % 253 - 126;
+                input_values[col] = std::ldexp(float(q), -4 - round);
+            }
+            ggml_backend_tensor_set(input, input_values.data(), 0, input_values.size() * sizeof(float));
+            TEST_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+            std::vector<float> before(m), after(m), intermediate_values(k * m), produced_values(k * m);
+            ggml_backend_tensor_get(first, before.data(), 0, before.size() * sizeof(float));
+            ggml_backend_tensor_get(last, after.data(), 0, after.size() * sizeof(float));
+            ggml_backend_tensor_get(intermediate, intermediate_values.data(), 0, intermediate_values.size() * sizeof(float));
+            std::vector<uint8_t> produced_bytes(ggml_nbytes(produced_weight));
+            ggml_backend_tensor_get(produced_weight, produced_bytes.data(), 0, produced_bytes.size());
+            ggml_get_type_traits(produced_weight->type)->to_float(produced_bytes.data(), produced_values.data(), k * m);
+            double probability_sum = 0;
+            for (size_t i = 0; i < intermediate_values.size(); ++i) {
+                if (attention) {
+                    CHECK_CLOSE(intermediate_values[i], float(int(i % m) % 31 - 15) / 256.0f, 1e-5f);
+                } else {
+                    TEST_ASSERT(std::isfinite(intermediate_values[i]) && intermediate_values[i] >= 0);
+                    probability_sum += intermediate_values[i];
+                }
+            }
+            if (!attention) TEST_ASSERT(std::abs(probability_sum - 1.0) < 1e-4);
+            for (int row = 0; row < m; ++row) {
+                double expected_first = 0, expected_last = 0;
+                for (int col = 0; col < k; ++col) {
+                    expected_first += double(weight_values[row * k + col]) * input_values[col];
+                    expected_last += double(produced_values[row * k + col]) * input_values[col];
+                }
+                CHECK_CLOSE(before[row], float(expected_first), 1e-5f);
+                CHECK_CLOSE(after[row], float(expected_last), 1e-5f);
+            }
+        }
+        uint64_t hits_after = 0, misses_after = 0;
+        env.get_stats(backend_gpu, &hits_after, &misses_after);
+        TEST_ASSERT(hits_after >= hits_before + 2);
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(weights_buffer);
+        ggml_free(weights_ctx);
+    }
+    ggml_backend_free(backend_gpu);
+    printf("test_mmvq_scratch_reuse PASSED: large softmax and FA mask scratch writes, independent CPU agreement, changing inputs and replay.\n");
+    return true;
+}
+
+static bool test_mmvq_input_mutation_replay(test_env & env) {
+    const char * old_force = std::getenv("GGML_VK_FORCE_MMVQ");
+    const char * old_disable = std::getenv("GGML_VK_DISABLE_MMVQ");
+    const std::string force_value = old_force ? old_force : "";
+    const std::string disable_value = old_disable ? old_disable : "";
+    setenv("GGML_VK_FORCE_MMVQ", "1", 1);
+    unsetenv("GGML_VK_DISABLE_MMVQ");
+    auto * backend_gpu = ggml_backend_vk_init(0);
+    if (old_force) setenv("GGML_VK_FORCE_MMVQ", force_value.c_str(), 1);
+    else unsetenv("GGML_VK_FORCE_MMVQ");
+    if (old_disable) setenv("GGML_VK_DISABLE_MMVQ", disable_value.c_str(), 1);
+    else unsetenv("GGML_VK_DISABLE_MMVQ");
+    TEST_ASSERT(backend_gpu);
+    if (!env.get_region_mmvq_stats || !env.get_region_mmvq_stats(backend_gpu, nullptr, nullptr, nullptr, nullptr)) {
+        printf("SKIP test_mmvq_input_mutation_replay: integer-dot MMVQ unavailable.\n");
+        ggml_backend_free(backend_gpu);
+        return false;
+    }
+
+    constexpr int k = 320;
+    auto * weights_ctx = ggml_init({1024 * 1024, nullptr, true});
+    TEST_ASSERT(weights_ctx);
+    auto * weight = ggml_new_tensor_2d(weights_ctx, GGML_TYPE_Q8_0, k, 1);
+    auto * weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, backend_gpu);
+    TEST_ASSERT(weights_buffer);
+    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    TEST_ASSERT(ggml_type_size(GGML_TYPE_Q8_0) == 34);
+    std::vector<uint8_t> packed(ggml_nbytes(weight), 0);
+    const ggml_fp16_t one = ggml_fp32_to_fp16(1.0f);
+    for (int block = 0; block < k / 32; ++block) {
+        std::memcpy(packed.data() + 34 * block, &one, sizeof(one));
+    }
+    // Exact first-coordinate projection; no rounded 1/127 weight scale.
+    packed[2] = 1;
+    ggml_backend_tensor_set(weight, packed.data(), 0, packed.size());
+
+    for (const bool partial : {false, true}) {
+        auto * ctx = ggml_init({1024 * 1024, nullptr, true});
+        TEST_ASSERT(ctx);
+        const int prefix = partial ? 8 : 0;
+        const int start = partial ? 32 : 0;
+        const int length = partial ? 64 : k;
+        auto * input_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k + prefix);
+        ggml_set_input(input_base);
+        auto * input = ggml_view_1d(ctx, input_base, k, prefix * sizeof(float));
+        auto * first = ggml_mul_mat(ctx, weight, input);
+        ggml_set_output(first);
+        auto * target = ggml_view_1d(ctx, input, length, start * sizeof(float));
+        auto * factors = ggml_repeat(ctx, first, target);
+        auto * mutated = ggml_mul_inplace(ctx, target, factors);
+        ggml_set_output(mutated);
+        auto * produced_values = partial ? ggml_repeat(ctx, mutated, input) : mutated;
+        auto * produced_weight = ggml_cast(ctx, ggml_reshape_2d(ctx, produced_values, k, 1), GGML_TYPE_Q8_0);
+        ggml_set_output(produced_weight);
+        // Weight production forces the final read of the SAME graph input
+        // after the source write, even if independent matmuls are reordered.
+        auto * last = ggml_mul_mat(ctx, produced_weight, input);
+        ggml_set_output(last);
+        auto * graph = ggml_new_graph_custom(ctx, 32, false);
+        ggml_build_forward_expand(graph, first);
+        ggml_build_forward_expand(graph, last);
+        ggml_backend_t backends[] = {backend_gpu, env.backend_cpu};
+        auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 64, false, true);
+        TEST_ASSERT(sched);
+        ggml_backend_sched_set_tensor_backend(sched, input_base, backend_gpu);
+        for (auto * node : {first, factors, mutated, produced_values, produced_weight, last}) {
+            TEST_ASSERT(ggml_backend_supports_op(backend_gpu, node));
+            ggml_backend_sched_set_tensor_backend(sched, node, backend_gpu);
+        }
+        TEST_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+        for (auto * node : {first, factors, mutated, produced_values, produced_weight, last}) {
+            TEST_ASSERT(ggml_backend_sched_get_tensor_backend(sched, node) == backend_gpu);
+        }
+        uint64_t hits_before = 0;
+        env.get_stats(backend_gpu, &hits_before, nullptr);
+        for (int round = 0; round < 3; ++round) {
+            std::vector<float> values(k + prefix, 0.0f), current(k), weight_values(k);
+            for (int col = 0; col < k; ++col) {
+                values[prefix + col] = col % 32 == 31 ? 127.0f : float((col + round) % 7 - 3);
+            }
+            const float factor = values[prefix] = float(2 + round);
+            double expected_last = 0;
+            for (int col = 0; col < k; ++col) {
+                const float x = values[prefix + col] * (col >= start && col < start + length ? factor : 1.0f);
+                const float w = factor * values[prefix + start + col % length];
+                expected_last += double(x) * w;
+            }
+            ggml_backend_tensor_set(input_base, values.data(), 0, values.size() * sizeof(float));
+            TEST_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+            float actual_first = 0, actual_last = 0;
+            ggml_backend_tensor_get(first, &actual_first, 0, sizeof(float));
+            ggml_backend_tensor_get(last, &actual_last, 0, sizeof(float));
+            ggml_backend_tensor_get(input, current.data(), 0, current.size() * sizeof(float));
+            std::vector<uint8_t> produced_bytes(ggml_nbytes(produced_weight));
+            ggml_backend_tensor_get(produced_weight, produced_bytes.data(), 0, produced_bytes.size());
+            ggml_get_type_traits(produced_weight->type)->to_float(produced_bytes.data(), weight_values.data(), k);
+            TEST_ASSERT(actual_first == factor);
+            for (int col = 0; col < k; ++col) {
+                const float x = values[prefix + col] * (col >= start && col < start + length ? factor : 1.0f);
+                TEST_ASSERT(current[col] == x);
+                TEST_ASSERT(weight_values[col] == factor * values[prefix + start + col % length]);
+            }
+            // All scales and products are exact dyadic values; these sums
+            // stay below 2^24, so accumulation tolerance cannot hide stale X.
+            TEST_ASSERT(std::isfinite(actual_last) && double(actual_last) == expected_last);
+        }
+        uint64_t hits_after = 0;
+        env.get_stats(backend_gpu, &hits_after, nullptr);
+        TEST_ASSERT(hits_after >= hits_before + 2);
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+    }
+    ggml_backend_buffer_free(weights_buffer);
+    ggml_free(weights_ctx);
+    ggml_backend_free(backend_gpu);
+    printf("test_mmvq_input_mutation_replay PASSED: full and partial aliased source writes, exact CPU oracle, changing inputs and replay.\n");
+    return true;
+}
+
 static void test_attention_projections_replay(test_env & env, bool require_mmvq = false, bool growth_only = false) {
     struct proj_case {
         bool   qsa;
@@ -2889,9 +3182,13 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq 
         int    rows2;
         int    rows3;
         size_t offset;
+        int    n_tokens = 1;
     };
 
     const proj_case cases[] = {
+        // Record a three-token graph before the nested four-token scratch
+        // growth, then replay it with new values through the capacity-four slot.
+        { false, 256,  7,  5,  3,  3,  64, 3 },
         // GDN: W0=Q5_K, W1=Q5_K, W2=Q6_K, W3=Q6_K; alpha/beta rows (rows2/rows3) equal
         { false, 256,  12, 8,  6,  6,  0  }, // quantized width tail (256 vs 1024 native block)
         { false, 2560, 48, 16, 8,  8,  32 }, // full width 2560, nonzero aligned offset (32 bytes)
@@ -2904,10 +3201,17 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq 
         { true,  1280, 7,  5,  5,  3,  64 }, // two iterations plus lane tails
         { false, 3072, 9,  7,  5,  5,  0  }, // 4+2 integer-dot K loop
         { true,  3584, 9,  5,  5,  7,  32 }, // 4+2+1 integer-dot K loop
-        { true,  8192, 16, 8,  8,  8,  32 }, // nested scratch-growth fixture only
+        { false, 2560, 48, 16, 8,  8,  32, 2 },
+        { true,  2560, 32, 12, 12, 16, 32, 2 },
+        { true,  1280, 7,  5,  5,  3,  64, 3 },
+        { false, 256,  7,  5,  3,  3,  64, 4 },
+        { true,  256,  5,  3,  3,  7,  64, 4 },
+        { true,  8192, 16, 8,  8,  8,  32, 4 }, // nested scratch-growth fixture only
         // Fallback cases: mismatched shapes that legitimately prevent fusion and execute as native operators
         { false, 256,  8,  8,  6,  4,  0  }, // GDN fallback: alpha rows != beta rows (6 != 4)
         { true,  256,  8,  6,  4,  8,  0  }, // QSA fallback: K rows != V rows (6 != 4)
+        { false, 256,  7,  5,  3,  3,  64, 5 }, // exceeds fused token capacity
+        { true,  256,  5,  3,  3,  7,  64, 5 },
     };
 
     ggml_backend_t backends[] = { env.backend_gpu, env.backend_cpu };
@@ -2962,10 +3266,11 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq 
             auto * ctx = contexts[reference] = ggml_init({ 512 * 1024, nullptr, true });
             TEST_ASSERT(ctx != nullptr);
 
-            auto * input_base = inputs[reference] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.width + 32);
+            auto * input_base = inputs[reference] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.width, c.n_tokens + 1);
             ggml_set_input(input_base);
 
-            auto * input = ggml_view_1d(ctx, ggml_scale(ctx, input_base, 1.0f), c.width, c.offset);
+            auto * input = ggml_view_2d(ctx, ggml_scale(ctx, input_base, 1.0f), c.width, c.n_tokens,
+                                       input_base->nb[1], c.offset);
 
             auto * graph = graphs[reference] = ggml_new_graph_custom(ctx, 32, false);
             ggml_build_forward_expand(graph, input);
@@ -3003,7 +3308,7 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq 
                 exercised_growth = true;
                 verify_old_recording = true;
             }
-            std::vector<float> input_vals(c.width + 32);
+            std::vector<float> input_vals(ggml_nelements(inputs[0]));
             for (size_t i = 0; i < input_vals.size(); ++i) {
                 input_vals[i] = std::sin(float(i % 251) * 0.071f + round * 0.23f) * 0.7f;
             }
@@ -3052,8 +3357,8 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq 
                     }
                 }
                 if (!equal) {
-                    std::fprintf(stderr, "Projection mismatch: qsa=%d width=%d output=%d round=%d\n", c.qsa, c.width,
-                                 out_idx, round);
+                    std::fprintf(stderr, "Projection mismatch: qsa=%d width=%d tokens=%d output=%d round=%d\n",
+                                 c.qsa, c.width, c.n_tokens, out_idx, round);
                 }
                 TEST_ASSERT(equal);
             }
@@ -3076,7 +3381,7 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq 
         TEST_ASSERT((gdn_mask & 7u) == 7u && (qsa_mask & 5u) == 5u); // Q5 and paired Q6, not a float fallback
         TEST_ASSERT(exercised_growth);
     }
-    printf("test_attention_projections_replay PASSED%s: native oracle, K tails, row tiles, views, changing inputs; "
+    printf("test_attention_projections_replay PASSED%s: native oracle, token counts 1-5, K tails, row tiles, views, changing inputs; "
            "F32 path bitwise, MMVQ path bounded accumulation tolerance.\n",
            growth_only ? " (scratch-growth fixture)" : require_mmvq ? " (MMVQ + fusion + replay)" : "");
 }
@@ -3505,6 +3810,59 @@ static void test_router_gate_paths(test_env & env) {
     ggml_free(ctx);
     printf("test_router_gate_paths PASSED: dedicated router kernel matches the double-precision "
            "reference, replays deterministically, and invalidates on weight writes.\n");
+}
+
+static void test_router_weight_strided_updates() {
+    const char * old_mode = getenv("GGML_VK_ROUTER_WEIGHTS");
+    const char * old_tiling = getenv("GGML_VK_ROUTER_TILING");
+    const std::string saved_mode = old_mode ? old_mode : "";
+    const std::string saved_tiling = old_tiling ? old_tiling : "";
+    for (const char * mode : { "f16", "bf16" }) {
+        setenv("GGML_VK_ROUTER_WEIGHTS", mode, 1);
+        setenv("GGML_VK_ROUTER_TILING", "1", 1);
+        auto * backend = ggml_backend_vk_init(0);
+        if (old_mode) setenv("GGML_VK_ROUTER_WEIGHTS", saved_mode.c_str(), 1);
+        else unsetenv("GGML_VK_ROUTER_WEIGHTS");
+        if (old_tiling) setenv("GGML_VK_ROUTER_TILING", saved_tiling.c_str(), 1);
+        else unsetenv("GGML_VK_ROUTER_TILING");
+        TEST_ASSERT(backend);
+        auto * ctx = ggml_init({ 1 << 20, nullptr, true });
+        TEST_ASSERT(ctx);
+        constexpr size_t k = 2560, experts = 512, prefix = 64;
+        auto * parent = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k * experts + prefix);
+        auto * weight = ggml_view_2d(ctx, parent, k, experts, k * sizeof(float), prefix * sizeof(float));
+        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        auto * output = ggml_mul_mat(ctx, weight, input);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        TEST_ASSERT(buffer);
+        std::vector<float> data(k * experts + prefix, 0.0f), x(k, 1.0f), got(experts);
+        data[prefix + 64] = 1.0f;
+        ggml_backend_tensor_set(parent, data.data(), 0, data.size() * sizeof(float));
+        ggml_backend_tensor_set(input, x.data(), 0, x.size() * sizeof(float));
+        auto check = [&](float expected) {
+            CHECK_STATUS(ggml_backend_graph_compute(backend, graph), "router weight update");
+            ggml_backend_tensor_get(output, got.data(), 0, got.size() * sizeof(float));
+            TEST_ASSERT(got[0] == expected);
+            for (size_t i = 1; i < experts; ++i) TEST_ASSERT(got[i] == 0.0f);
+        };
+        check(1.0f);
+        // The first write misses the cached view; the second touches its
+        // coefficient 64. A dense size*n_copies invalidation misses both.
+        const float sync_values[] = { 0.0f, 7.0f };
+        ggml_backend_tensor_set_2d(parent, sync_values, 0, sizeof(float), 2, 512, sizeof(float));
+        check(7.0f);
+        const float async_values[] = { 0.0f, -3.0f };
+        ggml_backend_tensor_set_2d_async(backend, parent, async_values, 0, sizeof(float), 2, 512, sizeof(float));
+        check(-3.0f);
+        check(-3.0f);
+        ggml_backend_synchronize(backend);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+    }
+    printf("test_router_weight_strided_updates PASSED: sync/async writes refresh converted views.\n");
 }
 
 static void test_staged_router_alias(test_env & env) {
@@ -4074,6 +4432,7 @@ int main(int argc, char ** argv) {
     const bool gdn_cache_only             = argc == 2 && std::strcmp(argv[1], "--gdn-cache-only") == 0;
     const bool staged_router_only         = argc == 2 && std::strcmp(argv[1], "--staged-router-only") == 0;
     const bool router_gate_only           = argc == 2 && std::strcmp(argv[1], "--router-gate-only") == 0;
+    const bool router_weight_lifetime_only = argc == 2 && std::strcmp(argv[1], "--router-weight-lifetime-only") == 0;
     const bool rope_only                  = argc == 2 && std::strcmp(argv[1], "--rope-only") == 0;
     const bool rows_only                  = argc == 2 && std::strcmp(argv[1], "--rows-only") == 0;
     const bool hc_fold_only               = argc == 2 && std::strcmp(argv[1], "--hc-fold-only") == 0;
@@ -4081,18 +4440,19 @@ int main(int argc, char ** argv) {
     const bool hc_variants_only            = argc == 2 && std::strcmp(argv[1], "--hc-variants-only") == 0;
     const bool attention_projections_only = argc == 2 && std::strcmp(argv[1], "--attention-projections-only") == 0;
     const bool attention_mmvq_only = argc == 2 && std::strcmp(argv[1], "--attention-mmvq-only") == 0;
+    const bool scratch_reuse_only = argc == 2 && std::strcmp(argv[1], "--scratch-reuse-only") == 0;
     const bool attention_region_only      = argc == 2 && std::strcmp(argv[1], "--attention-region-only") == 0;
     const bool skinny_only = argc == 2 && std::strcmp(argv[1], "--skinny-only") == 0;
     const bool argmax_only = argc == 2 && std::strcmp(argv[1], "--argmax-only") == 0;
     if (argc != 1 && !transfer_only && !snapshot_only && !moe_only && !moe_output_only && !gdn_only &&
-        !gdn_cache_only && !staged_router_only && !router_gate_only && !rope_only && !rows_only && !hc_fold_only && !hc_combine_only &&
+        !gdn_cache_only && !staged_router_only && !router_gate_only && !router_weight_lifetime_only && !rope_only && !rows_only && !hc_fold_only && !hc_combine_only &&
         !hc_variants_only &&
-        !attention_projections_only && !attention_mmvq_only && !attention_region_only && !skinny_only && !argmax_only) {
+        !attention_projections_only && !attention_mmvq_only && !scratch_reuse_only && !attention_region_only && !skinny_only && !argmax_only) {
         std::fprintf(stderr,
                      "Usage: %s "
                      "[--transfer-only|--snapshot-only|--moe-only|--moe-output-only|--gdn-only|--gdn-cache-only|--"
-                     "staged-router-only|--router-gate-only|--rope-only|--rows-only|--hc-fold-only|--hc-combine-only|--hc-variants-only|--attention-"
-                     "projections-only|--attention-mmvq-only|--attention-region-only|--skinny-only|--argmax-only]\n",
+                     "staged-router-only|--router-gate-only|--router-weight-lifetime-only|--rope-only|--rows-only|--hc-fold-only|--hc-combine-only|--hc-variants-only|--attention-"
+                     "projections-only|--attention-mmvq-only|--scratch-reuse-only|--attention-region-only|--skinny-only|--argmax-only]\n",
                      argv[0]);
         return 2;
     }
@@ -4156,6 +4516,10 @@ int main(int argc, char ** argv) {
         test_router_gate_paths(env);
         return 0;
     }
+    if (router_weight_lifetime_only) {
+        test_router_weight_strided_updates();
+        return 0;
+    }
     if (rows_only) {
         test_dynamic_row_replay(env);
         test_predefined_variable_rows_replay(env);
@@ -4176,6 +4540,11 @@ int main(int argc, char ** argv) {
     if (hc_variants_only) {
         test_hc_variant_numerics(env);
         return 0;
+    }
+    if (scratch_reuse_only) {
+        const bool scratch_ok = test_mmvq_scratch_reuse(env);
+        const bool mutation_ok = test_mmvq_input_mutation_replay(env);
+        return scratch_ok && mutation_ok ? 0 : 77;
     }
     if (attention_mmvq_only) {
         if (!env.get_region_mmvq_stats ||
@@ -4231,11 +4600,17 @@ int main(int argc, char ** argv) {
     ++tests_run;
     test_gdn_cached_region_replay(env);
     ++tests_run;
+    if (test_mmvq_scratch_reuse(env)) ++tests_run;
+    if (test_mmvq_input_mutation_replay(env)) ++tests_run;
     test_attention_projections_replay(env);
     ++tests_run;
     test_attention_region_replay(env);
     ++tests_run;
+    test_replay_shrinking_kv_attention(env);
+    ++tests_run;
     test_staged_router_alias(env);
+    ++tests_run;
+    test_router_weight_strided_updates();
     ++tests_run;
     test_add_rms_scratch_reuse(env);
     ++tests_run;

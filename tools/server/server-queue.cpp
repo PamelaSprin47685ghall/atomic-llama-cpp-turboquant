@@ -123,7 +123,6 @@ void server_queue::terminate() {
 }
 
 void server_queue::start_loop(int64_t idle_sleep_ms) {
-    running = true;
     time_last_task = ggml_time_ms();
 
     constexpr auto max_wait_time = std::chrono::seconds(1);

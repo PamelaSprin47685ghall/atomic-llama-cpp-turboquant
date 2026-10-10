@@ -373,6 +373,19 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
 void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i)
 {
+#if defined(DATA_A_F32)
+    // Only the measured capacities amortize the extra live weight vector.
+    if ((NUM_COLS == 4u || NUM_COLS == 15u) && NUM_ROWS == 1u) {
+        const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
+        const uint ib = (first_row*p.ncols + col)/QUANT_K;
+        const vec4 v = dequantize4_2aligned(ib, 0u, a_offset);
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + col) / 4];
+            temp[j][0] += dot(v, b);
+        }
+        return;
+    }
+#endif
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
         const uint iqs = 0; // quant index

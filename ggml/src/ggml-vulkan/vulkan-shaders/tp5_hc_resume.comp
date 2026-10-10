@@ -14,8 +14,21 @@
 // No successful completion is published by the norm pass. Only LO, the last
 // reader of both inbox regions, may retire this mailbox generation.
 #ifdef TP5_RESUME_NORM
-layout(local_size_x = 256) in;
+#ifndef TP5_RESUME_NORM_THREADS
+#define TP5_RESUME_NORM_THREADS 256
+#endif
+layout(local_size_x = TP5_RESUME_NORM_THREADS, local_size_x_id = 0) in;
+// Scheduling only. No Y/inbox data is consumed before await_input(); the
+// independently available local residual can be fetched while Y is in flight.
+layout(constant_id = 1) const uint NORM_PREFETCH_RESIDUAL = 0u;
 layout(std430, binding = 0) coherent volatile readonly buffer Inbox { uint inbox[]; };
+#ifdef TP5_RESUME_NORM_STAGE_Y
+// Descriptor alias of the very same inbox range, not another allocation.
+// Header polling remains scalar/volatile. Payload reads occur only after its
+// generation; explicit uvec4 loads reduce uncached memory instruction count.
+layout(std430, binding = 0) coherent volatile readonly buffer InboxVectors { uvec4 inbox_vectors[]; };
+shared uint staged_y[4096];
+#endif
 layout(std430, binding = 1) readonly buffer Residual { float residual[]; };
 layout(std430, binding = 2) readonly buffer Gamma { float gamma[]; };
 layout(std430, binding = 3) writeonly buffer Combined { float combined[]; };
@@ -41,7 +54,7 @@ const uint SPIN_WORD = 5u;
 // capacity only as a fail-safe fallback (M3 invariant 2: capacity is never the
 // effective row count of a maximum-capacity definition).
 const uint ACTIVE_ROWS_WORD = 5u;
-shared float partials[8];
+shared float partials[gl_WorkGroupSize.x / 32u];
 #endif
 
 #if defined(TP5_RESUME_LO) || defined(TP5_RESUME_LO_Q8)
@@ -148,21 +161,26 @@ bool await_input() {
 #endif
 
 #ifdef TP5_RESUME_NORM
+void poison_stream(const uint active_rows) {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint stream = gl_WorkGroupID.x;
+    const float nanv = uintBitsToFloat(0x7fc00000u);
+    for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
+        if (token >= active_rows) break;
+        const uint base = token * (p.streams * p.width) + stream * p.width;
+        for (uint col = lane; col < p.width; col += gl_WorkGroupSize.x) {
+            combined[base + col] = nanv;
+            normalized[base + col] = nanv;
+            if (stream == 0u) sum_output[token * p.width + col] = nanv;
+        }
+        if (lane == 0u) inverse_rho[token * p.streams + stream] = nanv;
+    }
+}
 void finalize_stream(const uint iterations, const uint active_rows) {
     const uint lane = gl_LocalInvocationID.x;
     const uint stream = gl_WorkGroupID.x;
-    if (!await_input()) {
-        const float nanv = uintBitsToFloat(0x7fc00000u);
-        for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
-            if (token >= active_rows) break;
-            const uint base = token * (p.streams * p.width) + stream * p.width;
-            for (uint col = lane; col < p.width; col += 256u) {
-                combined[base + col] = nanv;
-                normalized[base + col] = nanv;
-                if (stream == 0u) sum_output[token * p.width + col] = nanv;
-            }
-            if (lane == 0u) inverse_rho[token * p.streams + stream] = nanv;
-        }
+    if ((NORM_PREFETCH_RESIDUAL == 0u || active_rows == 0u) && !await_input()) {
+        poison_stream(active_rows);
         return;
     }
     [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
@@ -171,14 +189,39 @@ void finalize_stream(const uint iterations, const uint active_rows) {
         const float s = scatter[token * p.streams + stream];
         float values[16];
         [[unroll]] for (uint i = 0u; i < 16u; ++i) {
-            const uint col = lane + i * 256u;
+            const uint col = lane + i * gl_WorkGroupSize.x;
             values[i] = i < iterations && col < p.width ? residual[base + col] : 0.0;
         }
+        if (NORM_PREFETCH_RESIDUAL != 0u && token == 0u && !await_input()) {
+            poison_stream(active_rows);
+            return;
+        }
+#ifdef TP5_RESUME_NORM_STAGE_Y
+        if ((p.width & 3u) == 0u) {
+            const uint vectors = p.width / 4u;
+            for (uint v = lane; v < vectors; v += gl_WorkGroupSize.x) {
+                const uvec4 y4 = inbox_vectors[4u + token * vectors + v];
+                staged_y[4u*v+0u] = y4.x;
+                staged_y[4u*v+1u] = y4.y;
+                staged_y[4u*v+2u] = y4.z;
+                staged_y[4u*v+3u] = y4.w;
+            }
+        } else {
+            // Preserve the original bounded shape contract for odd widths.
+            for (uint col = lane; col < p.width; col += gl_WorkGroupSize.x)
+                staged_y[col] = inbox[16u + token*p.width + col];
+        }
+        barrier();
+#endif
         float ss = 0.0;
         [[unroll]] for (uint i = 0u; i < 16u; ++i) {
-            const uint col = lane + i * 256u;
+            const uint col = lane + i * gl_WorkGroupSize.x;
             if (i < iterations && col < p.width) {
+#ifdef TP5_RESUME_NORM_STAGE_Y
+                const float y = uintBitsToFloat(staged_y[col]);
+#else
                 const float y = uintBitsToFloat(inbox[16u + token * p.width + col]);
+#endif
                 precise float product = y * s;
                 precise float value = values[i] + product;
                 values[i] = value;
@@ -211,7 +254,7 @@ void finalize_stream(const uint iterations, const uint active_rows) {
         if (lane == 0u && (p.profile_spin & 2u) != 0u && token < 2u)
             status[p.status_word_offset + 8u + token * 4u + stream] = floatBitsToUint(scale);
         [[unroll]] for (uint i = 0u; i < 16u; ++i) {
-            const uint col = lane + i * 256u;
+            const uint col = lane + i * gl_WorkGroupSize.x;
             if (i < iterations && col < p.width) {
                 float norm = scale * values[i];
                 normalized[base + col] = norm * gamma[stream * p.width + col];
@@ -229,13 +272,14 @@ void main() {
             atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
         return; // also rejected by the host recipe before recording
     }
-    if (gl_NumSubgroups != 8u && gl_NumSubgroups != 4u) {
+    if (gl_NumSubgroups > 32u || gl_NumSubgroups < 4u ||
+        (gl_WorkGroupSize.x != 256u && gl_WorkGroupSize.x != 512u && gl_WorkGroupSize.x != 1024u)) {
         if (gl_LocalInvocationID.x == 0u)
             atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
         return; // also rejected by the host recipe before recording
     }
     const uint active_rows = inbox[ACTIVE_ROWS_WORD] != 0u ? inbox[ACTIVE_ROWS_WORD] : p.active_rows;
-    const uint blocks = min(16u, (p.width + 255u) / 256u);
+    const uint blocks = min(16u, (p.width + gl_WorkGroupSize.x - 1u) / gl_WorkGroupSize.x);
     finalize_stream(blocks, active_rows);
 }
 #endif

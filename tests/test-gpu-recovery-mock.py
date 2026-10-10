@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def exercise(source: str, *, native: bool, fail_clear: bool = False, missing_dpm: bool = False,
-             busy_before: str = "0", clocks_only: bool = False):
+             busy_before: str = "0", clocks_only: bool = False, restore_dpm_after_reset: bool = False):
     with tempfile.TemporaryDirectory(prefix="eagle-mock-") as tmp:
         root = Path(tmp)
         replacements = {
@@ -67,6 +67,8 @@ else:
         sys.exit(1)
     if value == "0000" and state.read_text().strip() == "0040":
         Path(os.environ["GPU_MOCK_BUSY_FILE"]).write_text("0\\n")
+    if os.environ["GPU_MOCK_RESTORE_DPM"] == "1":
+        Path(os.environ["GPU_MOCK_DPM_FILE"]).write_text("S: 0Mhz *\\n1: 500Mhz\\n2: 1200Mhz\\n")
     state.write_text(value)
 """)
         setpci.chmod(0o700)
@@ -81,6 +83,8 @@ else:
             "GPU_MOCK_CLEAR_FAILED": str(root / "clear-failed"),
             "GPU_MOCK_BUSY_FILE": str(busy_file),
             "GPU_MOCK_FAIL_CLEAR": "1" if fail_clear else "0",
+            "GPU_MOCK_DPM_FILE": str(sclk),
+            "GPU_MOCK_RESTORE_DPM": "1" if restore_dpm_after_reset else "0",
         }
         args = ["bash", str(script)] + (["--clocks-only"] if clocks_only else []) + ["card1"]
         result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=15)
@@ -122,6 +126,10 @@ def main():
     bus = exercise(source, native=False)
     check(bus, status=0, perf="manual", sclk="2")
     assert bus["removed"] == "1" and bus["rescanned"] == "1"
+
+    bus_lost = exercise(source, native=False, missing_dpm=True, restore_dpm_after_reset=True)
+    check(bus_lost, status=0, perf="manual", sclk="2")
+    assert bus_lost["removed"] == "1" and bus_lost["rescanned"] == "1"
 
     still_busy = exercise(source, native=True, busy_before="99")
     check(still_busy, status=0, perf="manual", sclk="2")

@@ -26,6 +26,8 @@
 //       then the row result is the BLOCK_SIZE-lane reduction.
 //   ROUTER_W_F16  (mul_mat_vec_f16_f32_f32): same loop with the F16 weights
 //       promoted to float per element.
+//   ROUTER_W_BF16 (mul_mat_vec_bf16_f32_f32): same loop with packed 16-bit
+//       BF16 weights decoded via uint bits to F32 (lossless exact representation).
 //   ROUTER_W_Q8_0 (mul_mat_vec_q8_0_f32_f32): K_PER_ITER=8, per lane
 //       rowtmp  = dot(vec4(x0), vec4(q0)); rowtmp += dot(vec4(x1), vec4(q1));
 //       rowtmp *= d; temp += rowtmp;

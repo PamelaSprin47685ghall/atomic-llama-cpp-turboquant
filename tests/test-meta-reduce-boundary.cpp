@@ -16,6 +16,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-quants.h"
 
@@ -2149,6 +2150,222 @@ static void test_meta_scheduler_keepalive_dependencies() {
     ggml_backend_free(meta);
 }
 
+// Test router score row-sharding with exact bit-copy AllGather across 5 ranks (512 scores, uneven tails [103,103,102,102,102], multirow)
+static void test_meta_router_shard_allgather_cpu() {
+    fprintf(stderr, "--- test_meta_router_shard_allgather_cpu ---\n");
+    const int n_ranks = 5;
+    auto * cpu_dev = get_cpu_dev();
+    TEST_ASSERT(cpu_dev != nullptr);
+
+    const int64_t K = 32;       // contracting dim (n_embd)
+    const int64_t n_expert = 512;
+    const int64_t n_rows = 2;   // multi-row tokens
+
+    auto split_fn = [](const struct ggml_tensor * t, void *) -> ggml_backend_meta_split_state {
+        if (t && strcmp(t->name, "gate_inp_weight") == 0) {
+            ggml_backend_meta_split_state ss = { GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1, false, {0} };
+            ss.ne[0] = 103; ss.ne[1] = 103; ss.ne[2] = 102; ss.ne[3] = 102; ss.ne[4] = 102;
+            return ss;
+        }
+        return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, false, {0} };
+    };
+
+    ggml_backend_dev_t devs[5] = { cpu_dev, cpu_dev, cpu_dev, cpu_dev, cpu_dev };
+    auto * meta_dev = ggml_backend_meta_device(devs, n_ranks, split_fn, nullptr);
+    TEST_ASSERT(meta_dev != nullptr);
+    auto * meta = ggml_backend_dev_init(meta_dev, nullptr);
+    TEST_ASSERT(meta != nullptr);
+    auto * buft = ggml_backend_dev_buffer_type(meta_dev);
+
+    struct ggml_init_params params_w = { 4 * 1024 * 1024, nullptr, true };
+    struct ggml_context * ctx_w = ggml_init(params_w);
+    struct ggml_init_params params_c = { 4 * 1024 * 1024, nullptr, true };
+    struct ggml_context * ctx_c = ggml_init(params_c);
+
+    ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, n_expert);
+    ggml_set_name(w, "gate_inp_weight");
+    w->flags |= GGML_TENSOR_FLAG_ALLGATHER;
+
+    ggml_tensor * cur = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, K, n_rows);
+    ggml_set_name(cur, "act_tokens");
+
+    auto * buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft);
+    TEST_ASSERT(buf_w != nullptr);
+    ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // Sharded matrix multiply produces rank-local score shards on axis 0
+    ggml_tensor * shards = ggml_mul_mat(ctx_c, w, cur);
+    ggml_set_name(shards, "router_shards");
+
+    // Bit-copy AllGather boundary
+    ggml_tensor * gathered = ggml_cont(ctx_c, shards);
+    gathered->flags |= GGML_TENSOR_FLAG_ALLGATHER;
+    ggml_set_name(gathered, "router_gathered");
+
+    // Downstream routing post-processing: Softmax over reconstituted 512 scores
+    ggml_tensor * probs = ggml_soft_max(ctx_c, gathered);
+    ggml_set_name(probs, "router_probs");
+
+    // Top-k expert selection (k=2)
+    ggml_tensor * topk = ggml_argsort_top_k(ctx_c, probs, 2);
+    ggml_set_name(topk, "router_topk");
+    // Contiguous copy of topk IDs so rank-local row striding is directly readable
+    ggml_tensor * topk_cont = ggml_cont(ctx_c, topk);
+    ggml_set_name(topk_cont, "router_topk_cont");
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx_c);
+    ggml_build_forward_expand(gf, topk_cont);
+
+    // Chunked prefill can retain live state-producing work while its output
+    // head has zero rows. An empty gather must not create a collective.
+    ggml_tensor * empty_scores = ggml_view_2d(ctx_c, shards, n_expert, 0, shards->nb[1], 0);
+    ggml_tensor * empty_gather = ggml_cont(ctx_c, empty_scores);
+    empty_gather->flags |= GGML_TENSOR_FLAG_ALLGATHER;
+    ggml_cgraph * gf_empty_head = ggml_new_graph(ctx_c);
+    ggml_build_forward_expand(gf_empty_head, topk_cont);
+    ggml_build_forward_expand(gf_empty_head, empty_gather);
+
+    auto * buf_c = ggml_backend_alloc_ctx_tensors_from_buft(ctx_c, buft);
+    TEST_ASSERT(buf_c != nullptr);
+    ggml_backend_buffer_set_usage(buf_c, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+
+    // Initialize weights and non-uniform token rows (+0.5 vs -0.5)
+    // Dyadic products and these short sums are exact in F32. This isolates
+    // gather/consumer correctness from shape-dependent CPU contraction trees;
+    // arbitrary model-weight numerical parity is qualified on the GPU separately.
+    std::vector<float> w_data(K * n_expert);
+    for (size_t i = 0; i < w_data.size(); ++i) {
+        w_data[i] = 0.03125f * float(i % 17) - 0.015625f * float(i % 13);
+    }
+    // Set leaders across ranks: expert 103 (rank 1 start boundary), expert 511 (rank 4 tail)
+    for (int64_t k = 0; k < K; ++k) {
+        w_data[103 * K + k] = (k % 2 == 0) ? 2.5f : -1.0f;
+        w_data[511 * K + k] = (k % 2 == 0) ? -2.5f : 1.5f;
+    }
+    std::vector<float> cur_data(K * n_rows);
+    for (int64_t k = 0; k < K; ++k) {
+        cur_data[0 * K + k] = 0.5f;   // row 0: positive activation
+        cur_data[1 * K + k] = -0.5f;  // row 1: negative activation
+    }
+
+    ggml_backend_tensor_set(w, w_data.data(), 0, w_data.size() * sizeof(float));
+    ggml_backend_tensor_set(cur, cur_data.data(), 0, cur_data.size() * sizeof(float));
+
+    // Use the same real kernels without partitioning; scalar dot loops have
+    // a different accumulation tree and cannot serve as a bitwise reference.
+    ggml_backend_t reference = ggml_backend_cpu_init();
+    TEST_ASSERT(reference != nullptr);
+    ggml_context * ctx_ref = ggml_init(params_c);
+    TEST_ASSERT(ctx_ref != nullptr);
+    ggml_tensor * ref_w = ggml_new_tensor_2d(ctx_ref, GGML_TYPE_F32, K, n_expert);
+    ggml_tensor * ref_cur = ggml_new_tensor_2d(ctx_ref, GGML_TYPE_F32, K, n_rows);
+    ggml_tensor * ref_logits = ggml_mul_mat(ctx_ref, ref_w, ref_cur);
+    ggml_tensor * ref_probs = ggml_soft_max(ctx_ref, ref_logits);
+    ggml_tensor * ref_ids = ggml_cont(ctx_ref, ggml_argsort_top_k(ctx_ref, ref_probs, 2));
+    ggml_cgraph * gf_ref = ggml_new_graph(ctx_ref);
+    ggml_build_forward_expand(gf_ref, ref_ids);
+    ggml_backend_buffer_t ref_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_ref, ggml_backend_cpu_buffer_type());
+    TEST_ASSERT(ref_buf != nullptr);
+    ggml_backend_tensor_set(ref_w, w_data.data(), 0, w_data.size() * sizeof(float));
+    std::vector<float> ref_scores(n_expert * n_rows, 0.0f);
+    std::vector<float> gathered_scores(n_expert * n_rows);
+    std::vector<float> actual_probs(n_expert * n_rows), expected_probs(n_expert * n_rows);
+    std::vector<int32_t> topk_ids(2 * n_rows);
+    std::vector<int32_t> expected_ids(2 * n_rows);
+    for (unsigned epoch = 0; epoch < 3; ++epoch) {
+        for (int64_t k = 0; k < K; ++k) {
+            cur_data[k] = epoch == 1 ? -0.25f : 0.5f;
+            cur_data[K + k] = epoch == 1 ? 0.75f : -0.5f;
+        }
+        ggml_backend_tensor_set(cur, cur_data.data(), 0, cur_data.size() * sizeof(float));
+        ggml_backend_tensor_set(ref_cur, cur_data.data(), 0, cur_data.size() * sizeof(float));
+        TEST_ASSERT(ggml_backend_graph_compute(reference, gf_ref) == GGML_STATUS_SUCCESS);
+        TEST_ASSERT(ggml_backend_graph_compute(meta, epoch == 1 ? gf_empty_head : gf) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(ref_logits, ref_scores.data(), 0, ref_scores.size() * sizeof(float));
+        ggml_backend_tensor_get(gathered, gathered_scores.data(), 0, gathered_scores.size() * sizeof(float));
+        for (size_t i = 0; i < ref_scores.size(); ++i) {
+            if (std::memcmp(&gathered_scores[i], &ref_scores[i], sizeof(float)) != 0) {
+                fprintf(stderr, "router score mismatch epoch=%u row=%zu expert=%zu actual=%a reference=%a\n",
+                        epoch, i / n_expert, i % n_expert, double(gathered_scores[i]), double(ref_scores[i]));
+                break;
+            }
+        }
+        TEST_ASSERT_MSG(std::memcmp(gathered_scores.data(), ref_scores.data(), ref_scores.size() * sizeof(float)) == 0,
+                        "AllGather changed full scores or retained a prior input");
+        ggml_backend_tensor_get(probs, actual_probs.data(), 0, actual_probs.size() * sizeof(float));
+        ggml_backend_tensor_get(ref_probs, expected_probs.data(), 0, expected_probs.size() * sizeof(float));
+        TEST_ASSERT_MSG(std::memcmp(actual_probs.data(), expected_probs.data(), expected_probs.size() * sizeof(float)) == 0,
+                        "full-score normalization changed routing weights");
+        ggml_backend_tensor_get(topk_cont, topk_ids.data(), 0, topk_ids.size() * sizeof(int32_t));
+        ggml_backend_tensor_get(ref_ids, expected_ids.data(), 0, expected_ids.size() * sizeof(int32_t));
+        TEST_ASSERT_MSG(topk_ids == expected_ids, "rank boundary or continuation changed expert selection");
+        TEST_ASSERT(topk_ids[0] == (epoch == 1 ? 511 : 103));
+        TEST_ASSERT(topk_ids[2] == (epoch == 1 ? 103 : 511));
+    }
+    ggml_backend_buffer_free(ref_buf);
+    ggml_free(ctx_ref);
+    ggml_backend_free(reference);
+    ggml_backend_buffer_free(buf_c);
+    ggml_backend_buffer_free(buf_w);
+    ggml_free(ctx_c);
+    ggml_free(ctx_w);
+    ggml_backend_free(meta);
+}
+
+static void test_meta_graph_views_share_parent_uid() {
+    auto * cpu = get_cpu_dev();
+    TEST_ASSERT(cpu != nullptr);
+    ggml_backend_dev_t devices[] = {cpu, cpu};
+    auto split = [](const ggml_tensor *, void *) -> ggml_backend_meta_split_state {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, false, {0}};
+    };
+    auto * dev = ggml_backend_meta_device(devices, 2, split, nullptr);
+    TEST_ASSERT(dev != nullptr);
+    auto * meta = ggml_backend_dev_init(dev, nullptr);
+    TEST_ASSERT(meta != nullptr);
+    auto * ctx = ggml_init({1 << 20, nullptr, true});
+    TEST_ASSERT(ctx != nullptr);
+    auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    auto * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    auto * squared = ggml_sqr(ctx, input);
+    auto * output = ggml_add(ctx, squared, bias);
+    auto * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    graph->uid = 0x123456789u;
+    auto * buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
+    TEST_ASSERT(buffer != nullptr);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    auto first = ggml_graph_view(graph, 0, 1);
+    auto second = ggml_graph_view(graph, 1, 2);
+    for (int round = 0; round < 2; ++round) {
+        float values[4], offsets[4], actual[4];
+        for (int i = 0; i < 4; ++i) {
+            values[i] = float(i + 1) * 0.25f + float(round);
+            offsets[i] = float(2 * i + round);
+        }
+        ggml_backend_tensor_set(input, values, 0, sizeof(values));
+        ggml_backend_tensor_set(bias, offsets, 0, sizeof(offsets));
+        TEST_ASSERT(ggml_backend_graph_compute(meta, &first) == GGML_STATUS_SUCCESS);
+        TEST_ASSERT(ggml_backend_graph_compute(meta, &second) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+        for (int i = 0; i < 4; ++i) {
+            TEST_ASSERT_MSG(actual[i] == values[i] * values[i] + offsets[i],
+                            "same-sized graph views reused the previous slice");
+        }
+        // Reusing this same slice is legal; it must see the new runtime bias.
+        for (float & value : offsets) value += 0.5f;
+        ggml_backend_tensor_set(bias, offsets, 0, sizeof(offsets));
+        TEST_ASSERT(ggml_backend_graph_compute(meta, &second) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+        for (int i = 0; i < 4; ++i) {
+            TEST_ASSERT(actual[i] == values[i] * values[i] + offsets[i]);
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(meta);
+}
+
 int main(int argc, char ** argv) {
     bool vulkan_state_copy_only = false;
     bool alloc_deps_only        = false;
@@ -2190,6 +2407,8 @@ int main(int argc, char ** argv) {
     test_meta_mapped_span_recurrent_cache();
     test_meta_mapped_span_partial_overlap_owner();
     test_meta_scheduler_keepalive_dependencies();
+    test_meta_router_shard_allgather_cpu();
+    test_meta_graph_views_share_parent_uid();
 
     if (g_failures > 0) {
         fprintf(stderr, "test-meta-reduce-boundary: %d failures\n", g_failures);

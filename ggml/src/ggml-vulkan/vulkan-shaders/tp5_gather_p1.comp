@@ -1,0 +1,81 @@
+#version 450
+
+// tp5_gather_p1.comp: Single-workgroup (64-lane) raw-u32 gather P1 publisher.
+// Copies active_rows * src_cols uint32 words from local VRAM to host-imported relay slot.
+// status[8] is the CPU-published producer_live_rows.
+// Validates status[2] (abort) and status[8] (live rows).
+// Strict fail-closed: rows==0, cols==0, live_rows > capacity_rows, epoch==0 -> fail-closed via status[2].
+// Publishes status[0] = 1 (ready) ONLY on valid, successful execution.
+// Writes status[9] = actual word count, status[10] = src_cols, status[11] = active_rows, status[12] = epoch.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuffer {
+    uint src_data[];
+};
+
+layout(std430, binding = 1) coherent writeonly buffer DstBuffer {
+    uint dst_data[];
+};
+
+layout(std430, binding = 2) coherent volatile buffer StatusBuffer {
+    uint status[];
+};
+
+layout(push_constant) uniform Params {
+    uint src_cols;
+    uint capacity_rows;
+    uint status_word_offset;
+} p;
+
+shared uint active_rows;
+shared uint total_words;
+shared uint abort_flag;
+shared uint cur_epoch;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint offset = p.status_word_offset;
+
+    if (lane == 0u) {
+        abort_flag = status[offset + 2u];
+        cur_epoch  = status[offset + 1u];
+        uint live_rows = status[offset + 8u];
+        // Strict fail-closed: rows==0, cols==0, epoch==0, or live_rows > capacity_rows is a terminal error.
+        // No zero-value fallback allowed.
+        if (abort_flag != 0u || live_rows == 0u || p.src_cols == 0u ||
+            p.capacity_rows == 0u || live_rows > p.capacity_rows || cur_epoch == 0u ||
+            live_rows > 0xffffffffu / p.src_cols) {
+            active_rows = 0u;
+            total_words = 0u;
+            if (abort_flag == 0u) {
+                status[offset + 2u] = 0xffffffffu; // fail-closed
+            }
+            status[offset] = 0u; // Never publish ready on error
+        } else {
+            active_rows = live_rows;
+            total_words = live_rows * p.src_cols;
+        }
+    }
+    barrier();
+
+    if (abort_flag != 0u || total_words == 0u) {
+        return;
+    }
+
+    for (uint idx = lane; idx < total_words; idx += 64u) {
+        dst_data[idx] = src_data[idx];
+    }
+
+    memoryBarrierBuffer();
+    barrier();
+
+    if (lane == 0u) {
+        status[offset + 9u]  = total_words;
+        status[offset + 10u] = p.src_cols;
+        status[offset + 11u] = active_rows;
+        status[offset + 12u] = cur_epoch;
+        memoryBarrierBuffer();
+        status[offset] = 1u; // publish ready only on success
+    }
+}
