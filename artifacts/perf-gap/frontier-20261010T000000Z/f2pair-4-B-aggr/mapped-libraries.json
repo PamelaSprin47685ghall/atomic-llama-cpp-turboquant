@@ -1,0 +1,13 @@
+{
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml-base.so.0.18.1": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml-cpu.so.0.18.1": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml-vulkan.so.0.18.1": "1373e69ead119e0c8ff501fbd8bee3b85f4ee9df95cc205c3b4d24fef23920c6",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml.so.0.18.1": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libllama-common.so.0.0.2188": "29bcbe656b7e8932ad8e399680873b5eddb442bd393b93ab5d638a548c3b9ff9",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libllama-server-impl.so": "cdc240a70ab00d35e5bae772e881d8701949ee626ed54fc38a02b51b5f25af09",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libllama.so.0.0.2188": "5d63fa93bfe35f7da895bbea3cb79953733e76c513d57e9485744651ede09d19",
+  "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+  "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+  "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+  "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac"
+}

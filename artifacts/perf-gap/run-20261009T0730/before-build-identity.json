@@ -1,0 +1,12 @@
+{
+  "libggml-base.so.0.18.1": "5ba47ae9690e271da5e3377d8bd51483cdb175f432b239ebf3cec2ffc93718b8",
+  "libggml-cpu.so.0.18.1": "267c3666818388fc85870bee6fba4c01bfd66e58140664f941536c17e7081c91",
+  "libtp5-hc-quant-helper.so": "2c2fe38e830be5bbfe58124e31b03a1f4deab57212cad6c9f2a6b8986d0c4ecc",
+  "libggml-vulkan.so.0.18.1": "66fc9ae6affd484d65fd72dec2f4f673745424d42db5c85503058926c8fc566c",
+  "libggml.so.0.18.1": "67cb338e4e6dfe914a9e1a8fa1e31f0ffdc91bd851616479f5c8a49d8456ec60",
+  "libllama.so.0.0.2188": "70535dab57117e72181914f5cf2fd9d95d6709a2b644b14317847f710691c02d",
+  "libmtmd.so.0.0.2188": "ae68c4d7c3e49aff6dc1a5785f9b7b5d410e73469fa02e1ce9380303d1defe12",
+  "libllama-common.so.0.0.2188": "90faab9f9f1f19e2f0cca02415efdbb7f507d626fba5ef53d6f2b62600ae2765",
+  "libllama-server-impl.so": "92ceb097a6188a61c27891a1da83199d3a622455994f8ed6f4ac13d3af565718",
+  "llama-server": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c"
+}

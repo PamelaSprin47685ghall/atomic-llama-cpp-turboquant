@@ -1,0 +1,73 @@
+{
+  "task": "TP5 ordinary single-user generation, Qwen4EXP-AF, 5x RX 6800",
+  "version": "v4",
+  "supersedes": "v3 (DEFECT-1 dense bytes 90.8->63.82 MB/layer; DEFECT-2 L2 credit pool->active denominator; DEFECT-3 MTP amortization invalidates R3 in the global bound)",
+  "allowed_set_A": [
+    "arbitrary lossless weight representation (incl. exact BF16)",
+    "unrestricted caching in VRAM/L2/LDS",
+    "arbitrary owner/coordinate partitioning across 5 GPUs",
+    "arbitrary async prefetch across causal stages",
+    "arbitrary kernel/operator fusion",
+    "MTP/speculative with any draft policy incl. perfect acceptance"
+  ],
+  "declared_conditional_class_A_nomtp": "implementations that process exactly one target row per public token (no speculative row batching); R3 is valid only here",
+  "resources": {
+    "R1_output_emission": {
+      "bytes_strong": 2048,
+      "bytes_weak": 4,
+      "ceiling_gb_s": 25.0,
+      "time_strong_s": 8.192e-08,
+      "time_weak_s": 1.6e-10,
+      "justification": "each committed token requires the host to observe either the token id (4B, weak) or the full 512-expert routing scores (2048B, strong, current sampler contract); survives MTP (per public token)",
+      "survives_mtp_relaxation": true
+    },
+    "R2_causal_cut_set": {
+      "bytes_per_boundary": 2048,
+      "boundaries_per_row": 48,
+      "total_bytes_per_row": 98304,
+      "ceiling_gb_s": 32.0,
+      "time_per_row_s": 3.0720000000000004e-06,
+      "justification": "48 sequential layer boundaries; router input (2560 F32) must be complete before layer l runs; with 5 disjoint coordinate shards at least 2048B crosses a rank cut per boundary per ROW; survives MTP (scales with rows)",
+      "survives_mtp_relaxation": true
+    },
+    "R3_active_weight_dram": {
+      "weight_pool_per_gpu_bytes": 11685643264.0,
+      "dense_bytes_per_layer": 63820906.666666664,
+      "expert_bytes_per_layer": 1153433600.0,
+      "active_expert_bytes_per_gpu": 828949504.0,
+      "active_per_gpu_per_token_bytes": 828949504.0,
+      "l2_credit_bytes": 128000000.0,
+      "dram_bytes_per_gpu_per_token": 700949504.0,
+      "ceiling_gb_s": 512.0,
+      "time_per_row_s": 0.001369042,
+      "justification": "10/512 experts + all dense weights active per token; max L2 credit = 128MB of the active set (any split); valid ONLY for A_nomtp: under MTP row batching the active weights are read once per cycle and amortize across committed rows",
+      "survives_mtp_relaxation": false
+    },
+    "R4_fp32_alu": {
+      "flops_per_token": 14266199040.0,
+      "per_layer_flops": 297212480.0,
+      "peak_flops_s": 80850000000000.02,
+      "time_per_row_s": 0.0001764526782931354,
+      "justification": "attention projections + router + 11 experts + PLE + HC per layer, 48 layers; FLOPs scale with verified rows so the per-public-token cost is MTP-invariant; RX 6800 has no FP32 matrix cores so vector ALU peak applies; lossless representation changes bytes, not FLOPs",
+      "survives_mtp_relaxation": true
+    }
+  },
+  "combination_rule": "per-token lower bound = max over resources: distinct physical resources may overlap in a legal implementation; same-resource work adds",
+  "mtp_relaxation_note": "perfect-acceptance relaxation (any draft policy, unlimited h). R3 weight traffic is per CYCLE, not per row, and amortizes across the h+1 committed rows; it is therefore excluded from L_global. R4 FLOPs and R2 cut bytes scale with rows and survive. R1 is per public token and survives.",
+  "bounds": {
+    "L_global": {
+      "per_token_lower_bound_s_weak": 0.0001764526782931354,
+      "per_token_lower_bound_s_strong": 0.0001764526782931354,
+      "tps_upper_bound_weak": 5667.24183318278,
+      "tps_upper_bound_strong": 5667.24183318278,
+      "valid_for": "full allowed set A"
+    },
+    "L_nomtp": {
+      "per_token_lower_bound_s_weak": 0.001369042,
+      "per_token_lower_bound_s_strong": 0.001369042,
+      "tps_upper_bound_weak": 730.4377805794124,
+      "tps_upper_bound_strong": 730.4377805794124,
+      "valid_for": "declared conditional class A_nomtp (no speculative row batching)"
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "用三句话解释哈希表与数组的主要区别。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "哈希表通过哈希函数将键映射到存储位置，支持基于键的快速查找，而数组则通过连续的内存索引直接访问元素。\n\n哈希表通常不保证元素的存储顺序，且允许使用任意类型的键，而数组要求索引为整数且元素在内存中紧密排列。\n\n在性能上，哈希表在平均情况下提供常数时间的查找、插入和删除操作，而数组在已知索引时访问极快，但在中间位置插入或删除元素时效率较低。"
+        }
+      }
+    ],
+    "created": 1791489626,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 101,
+      "prompt_tokens": 23,
+      "total_tokens": 124,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-RlSfDQ9sq6VU4zINDhZnregqa59uudWL",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 23,
+      "prompt_ms": 1082.647,
+      "prompt_per_token_ms": 47.07160869565217,
+      "prompt_per_second": 21.24422826646174,
+      "predicted_n": 101,
+      "predicted_ms": 2035.229,
+      "predicted_per_token_ms": 20.15078217821782,
+      "predicted_per_second": 49.62586519747901
+    }
+  },
+  "wall_ms": 3120.921187,
+  "log_begin": 55360,
+  "log_end": 62037,
+  "phase": "guard"
+}

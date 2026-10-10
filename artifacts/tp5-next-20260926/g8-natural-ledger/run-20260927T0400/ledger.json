@@ -1,0 +1,34 @@
+[
+ {
+  "i": 0,
+  "wall": 5.128,
+  "prompt_ms": 1622.149,
+  "predicted_ms": 3501.758,
+  "completion": 178,
+  "finish": "stop"
+ },
+ {
+  "i": 1,
+  "wall": 4.56,
+  "prompt_ms": 986.95,
+  "predicted_ms": 3073.637,
+  "completion": 178,
+  "finish": "stop"
+ },
+ {
+  "i": 2,
+  "wall": 4.284,
+  "prompt_ms": 1006.115,
+  "predicted_ms": 3274.295,
+  "completion": 178,
+  "finish": "stop"
+ },
+ {
+  "i": 3,
+  "wall": 4.173,
+  "prompt_ms": 1001.182,
+  "predicted_ms": 3168.475,
+  "completion": 178,
+  "finish": "stop"
+ }
+]

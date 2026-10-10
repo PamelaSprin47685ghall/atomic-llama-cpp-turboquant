@@ -1,0 +1,6 @@
+{"device":0,"blocks":102400,"trial":0,"reset_payload":true,"done":1,"bad_blocks":0,"first_bad":4294967295}
+{"device":0,"blocks":102400,"trial":1,"reset_payload":false,"done":1,"bad_blocks":0,"first_bad":4294967295}
+{"device":0,"blocks":102400,"trial":2,"reset_payload":true,"done":1,"bad_blocks":0,"first_bad":4294967295}
+{"device":0,"blocks":102400,"trial":3,"reset_payload":false,"done":1,"bad_blocks":0,"first_bad":4294967295}
+{"device":0,"blocks":102400,"trial":4,"reset_payload":true,"done":1,"bad_blocks":0,"first_bad":4294967295}
+{"device":0,"blocks":102400,"trial":5,"reset_payload":false,"done":1,"bad_blocks":0,"first_bad":4294967295}

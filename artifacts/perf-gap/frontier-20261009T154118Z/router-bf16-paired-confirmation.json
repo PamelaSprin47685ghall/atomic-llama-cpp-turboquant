@@ -1,0 +1,77 @@
+{
+  "design": "preregistered 8 paired blocks, ABBA alternation, 16 independent processes, same frozen router-bf16-native-bin snapshot, single env difference GGML_VK_ROUTER_WEIGHTS f32 vs bf16",
+  "blocks": [
+    {
+      "block": 1,
+      "f32_pooled": 67.04304735029497,
+      "bf16_pooled": 67.5472456523177,
+      "ratio": 1.007520515876737,
+      "outputs_identical": true,
+      "shutdowns_ok": true
+    },
+    {
+      "block": 2,
+      "f32_pooled": 66.56711017424068,
+      "bf16_pooled": 67.58346365763241,
+      "ratio": 1.0152681028323356,
+      "outputs_identical": true,
+      "shutdowns_ok": true
+    },
+    {
+      "block": 3,
+      "f32_pooled": 66.69128855148037,
+      "bf16_pooled": 67.85192499637931,
+      "ratio": 1.0174031192095354,
+      "outputs_identical": true,
+      "shutdowns_ok": true
+    },
+    {
+      "block": 4,
+      "f32_pooled": 66.78611430671144,
+      "bf16_pooled": 67.24203605319303,
+      "ratio": 1.006826594887491,
+      "outputs_identical": true,
+      "shutdowns_ok": true
+    },
+    {
+      "block": 5,
+      "f32_pooled": 66.89697979141066,
+      "bf16_pooled": 67.8903560463434,
+      "ratio": 1.0148493438422803,
+      "outputs_identical": true,
+      "shutdowns_ok": true
+    },
+    {
+      "block": 6,
+      "f32_pooled": 66.33515005375283,
+      "bf16_pooled": 67.21338646246018,
+      "ratio": 1.0132393822580592,
+      "outputs_identical": true,
+      "shutdowns_ok": true
+    },
+    {
+      "block": 7,
+      "f32_pooled": 67.03496965524981,
+      "bf16_pooled": 67.46039959554423,
+      "ratio": 1.0063463881983141,
+      "outputs_identical": true,
+      "shutdowns_ok": true
+    },
+    {
+      "block": 8,
+      "f32_pooled": 66.95979330729257,
+      "bf16_pooled": 67.58819587519994,
+      "ratio": 1.0093847746068076,
+      "outputs_identical": true,
+      "shutdowns_ok": true
+    }
+  ],
+  "geometric_mean_ratio": 1.0113466326732847,
+  "ci95": [
+    1.0078825794308823,
+    1.0148225917320106
+  ],
+  "all_outputs_identical": true,
+  "all_shutdowns_clean": true,
+  "decision": "PROMOTED as qualified candidate if CI lower bound > 1; remains default-off until production default change is separately qualified"
+}

@@ -1,0 +1,17 @@
+{
+  "status": "REGISTERED_BEFORE_CONFIRMATION",
+  "scope": "RERoT off, single normal generation stream; no single-CPU-thread restriction",
+  "question": "Does the explicit HC-Q8 derivative with actually executing aggressive LateBind improve original Q2_0 MTP1 throughput on the frozen canonical request?",
+  "comparison_kind": "Model precision plus implementation route; NOT a bit-exact implementation-only comparison",
+  "A": {"model": "original GSQ-RCO Q2_0", "horizon": 1, "latebind": "off", "mmvq": "disabled", "threads": 22, "ctx": 1024, "definition_cache": 0},
+  "B": {"model": "HC-only Q8 derivative, all 934 other tensor payloads byte-verified", "horizon": 1, "latebind": "aggressive", "mmvq": "disabled", "threads": 22, "ctx": 1024, "definition_cache": 0},
+  "independent_process_pairs": 4,
+  "order": [["A", "B"], ["B", "A"], ["A", "B"], ["B", "A"]],
+  "requests_per_process": {"canonical_warmup": 2, "canonical_measured": 3, "separate_guard_not_ranked": 1},
+  "primary_metric": "sum measured generation milliseconds / sum public completion tokens within each process",
+  "statistics": "paired log(B/A) latency ratio, geometric center and two-sided Student-t 95% CI, df=3",
+  "secondary_metric": "client wall milliseconds per public token; prompt timing separately",
+  "gates": ["same current executable and actual inference DSO hashes", "five real idle Navi21 GPUs and exclusive GPU lock", "no profiling or concurrent compilation/hash conversion", "canonical natural stop", "retain every raw response and normal owned shutdown", "review all unique output texts without claiming general quality equivalence"],
+  "success_rule": "Declare positive benchmark throughput evidence only if the speedup CI lower bound exceeds one and output/exit gates pass. Precision tradeoffs remain explicit.",
+  "stop_rule": "Protocol/load/exit failure stops the confirmation; no hidden replacement samples or timeout/quality relaxation."
+}

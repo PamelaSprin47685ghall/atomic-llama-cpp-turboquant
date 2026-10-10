@@ -1,0 +1,206 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 81ca12ebe..c80895277 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -704,6 +704,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+                 /*.n_seq_id =*/ nullptr,
+                 /*.seq_id   =*/ nullptr,
+                 /*.logits   =*/ nullptr,
++                /*.token_device_sourced =*/ false,
+             };
+             const int32_t rc = llama_encode(ctx_dft, enc_batch);
+             if (rc != 0) {
+@@ -1170,6 +1171,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     /*.n_seq_id =*/ nullptr,
+                     /*.seq_id   =*/ nullptr,
+                     /*.logits   =*/ nullptr,
++                    /*.token_device_sourced =*/ false,
+                 };
+ 
+                 int32_t rc = llama_encode(ctx_dft, enc_batch);
+@@ -1356,6 +1358,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::unique_ptr<common_mtp_workspace> workspace;
+     bool device_hidden = false;
+     uint64_t device_target_generation = 0;
++    // D1 two-step draft (opt-in GGML_TP5_MTP_DEVICE_TOKENS=1): step 0 runs the
++    // ordinary decode and captures its sampled token on-device; step 1 then
++    // decodes with device-sourced token+hidden and never re-enters
++    // common_sampler_sample for the step-0 candidate. The step-1 token is
++    // read back once, at cycle boundary, for result bookkeeping.
++    bool device_tokens = false;
++    llama_token device_token_step0 = LLAMA_TOKEN_NULL;
+ 
+     std::vector<int32_t> i_batch_beg;
+     std::vector<int32_t> i_batch_end;
+@@ -1477,6 +1486,58 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         device_hidden = true;
+     }
+ 
++    void enable_device_tokens() {
++        // D1 two-step draft gate: requires the device hidden channel (same
++        // single-sequence, single-head, non-shared-memory contract) plus a
++        // greedy backend chain on the draft context (p_min <= 0). Anything
++        // else keeps the historical per-step host round trip untouched.
++        if (!device_hidden) {
++            throw std::invalid_argument("device MTP tokens require device hidden enabled");
++        }
++        if (n_seq != 1 || chain_heads || is_mem_shared || backend_chains[0] == nullptr) {
++            throw std::invalid_argument("device MTP tokens require one sequence with a greedy backend chain");
++        }
++        if (params.n_max != 2) {
++            throw std::invalid_argument("device MTP tokens currently require the two-step horizon (n_max == 2)");
++        }
++        device_tokens = true;
++    }
++
++    // D1 two-step draft: run step 1 with the step-0 sampled token and hidden
++    // row sourced entirely on-device. Returns the decoded step-1 token via a
++    // single 4-byte cycle-boundary readback (semantic bookkeeping only).
++    int decode_device_step1(llama_pos pos) {
++        if (!llama_predefined_hidden_token_ready(params.ctx_dft)) {
++            return -1;
++        }
++        llama_batch step1 = batch; // borrowed view: token pointer unused below
++        step1.n_tokens = 1;
++        step1.token = nullptr;
++        step1.embd = nullptr;
++        step1.logits = nullptr;
++        step1.pos = &step1_pos;
++        step1_pos = pos;
++        step1.n_seq_id = &step1_nseq;
++        step1_nseq = 1;
++        step1.seq_id = &step1_seq_ptr;
++        step1_seq_ptr = &step1_seq;
++        step1_seq = 0;
++        step1.logits = &step1_logits;
++        step1_logits = 1;
++        step1.token_device_sourced = true;
++        const llama_predefined_hidden_range hidden{
++            params.ctx_dft, LLAMA_PREDEFINED_H_RESULT, LLAMA_PREDEFINED_H_INPUT, 0, 0, 1,
++            llama_predefined_hidden_generation(params.ctx_dft),
++        };
++        return llama_predefined_decode_hidden(params.ctx_dft, step1, &hidden, 1);
++    }
++
++    llama_pos step1_pos = 0;
++    int32_t step1_nseq = 1;
++    llama_seq_id * step1_seq_ptr = nullptr;
++    llama_seq_id step1_seq = 0;
++    int8_t step1_logits = 1;
++
+     int decode_device_target_rows(uint32_t first, uint32_t rows) {
+         if (rows == 0) return -1;
+         const llama_predefined_hidden_range inputs[] = {
+@@ -1562,6 +1623,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+ 
+             const llama_seq_id seq_id = batch_in.seq_id[k][0];
++            // RERoT internal sequences (probe/park/archive) live above the
++            // server's execution-slot id space. The server never drafts for
++            // them (handle_last_sampled_token routes them through
++            // rerot_append_planned_token); this hook must simply not stage
++            // their rows, not abort the process. Skip instead of assert so a
++            // unified-KV RERoT episode with MTP enabled stays functional.
++            if (seq_id >= (llama_seq_id) n_seq) {
++                continue;
++            }
+             GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
+             if (paused[(size_t) seq_id]) {
+                 continue;
+@@ -1855,6 +1925,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 i == 0 ? LLAMA_PREDEFINED_H_CARRY : LLAMA_PREDEFINED_H_RESULT,
+                 LLAMA_PREDEFINED_H_INPUT, 0, 0, 1,
+                 device_hidden && i != 0 ? llama_predefined_hidden_generation(ctx_dft) : 0};
++            // D1 two-step draft: on step 1 with device tokens, decode with the
++            // captured step-0 token + hidden entirely on-device. This is the
++            // mechanism-under-test: no llama_decode re-entry, no
++            // common_sampler_sample, no hidden host round trip for step 1's
++            // inputs. The step-1 candidate token is read back once inside the
++            // branch below (semantic bookkeeping, not an execution dependency).
++            if (device_tokens && i == 1) {
++                const int rc = decode_device_step1(dparams[0].n_past + 1);
++                if (rc != 0) {
++                    throw std::runtime_error("device MTP step-1 decode failed");
++                }
++                // Step 1 decoded on-device; its candidate token is read once
++                // here for result bookkeeping. The step-0 candidate was
++                // already recorded (device_token_step0); push both and finish
++                // the horizon. common_sampler_accept for step 0 already ran
++                // on the normal path above; accept step 1's token too so the
++                // draft chain state stays consistent with the reference loop.
++                const llama_token id1 = common_sampler_sample(smpls[0].get(), ctx_dft, 0, true);
++                if (id1 == LLAMA_TOKEN_NULL) {
++                    throw std::runtime_error("device MTP step-1 sampler returned no token");
++                }
++                common_sampler_accept(smpls[0].get(), id1, true);
++                dparams[0].result->push_back(id1);
++                drafting[0] = false;
++                n_drafting = 0;
++                break;
++            }
++
+             int ret = device_hidden ? llama_predefined_decode_hidden(ctx_dft, batch, &feedback, 1)
+                                     : llama_decode(ctx_dft, batch);
+             if (ret != 0) {
+@@ -1911,6 +2009,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 common_sampler_accept(smpl, id, true);
+ 
++                if (device_tokens && i == 0) {
++                    // D1 two-step draft: remember the step-0 candidate id for
++                    // result bookkeeping; the device slot already carries it
++                    // for step 1's embedding lookup (captured in decode_impl).
++                    device_token_step0 = id;
++                }
++
+                 auto & dp = dparams.at(seq_id);
+                 auto & result = *dp.result;
+ 
+@@ -2972,6 +3077,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+                 if (device_hidden && std::strcmp(device_hidden, "1") == 0) {
+                     impl->enable_device_hidden();
+                 }
++                const char * device_tokens = std::getenv("GGML_TP5_MTP_DEVICE_TOKENS");
++                if (device_tokens && std::strcmp(device_tokens, "0") != 0 && std::strcmp(device_tokens, "1") != 0) {
++                    throw std::invalid_argument("GGML_TP5_MTP_DEVICE_TOKENS must be 0 or 1");
++                }
++                if (device_tokens && std::strcmp(device_tokens, "1") == 0) {
++                    // D1 two-step draft opt-in. Throws on contract mismatch
++                    // (no greedy backend chain, horizon != 2, multi-sequence);
++                    // the historical path stays default when unset.
++                    impl->enable_device_tokens();
++                }
+                 impls.push_back(std::move(impl));
+                 break;
+             }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 7b613613e..77fbd8edc 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -325,6 +325,7 @@ struct server_batch {
+             batch.n_seq_id + off,
+             batch.seq_id   + off,
+             batch.logits   + off,
++            batch.token_device_sourced,
+         };
+ 
+         return view;
+@@ -8920,6 +8921,18 @@ private:
+             if (spec) {
+                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+ 
++                // RERoT internal slots (probe/park/archive/DAG lanes) never
++                // draft: their tokens are planned and teacher-forced by the
++                // episode runtime (rerot_append_planned_token builds their
++                // batch rows), and the MTP verify loop would otherwise see a
++                // non-empty spec_draft with no verification rows staged
++                // (handle_last_sampled_token is not called for them), breaking
++                // the spec_i_batch == n_draft + 1 invariant. Ordinary
++                // (non-RERoT) slots keep the full speculative path.
++                if (slot.rerot_internal) {
++                    return;
++                }
++
+                 if (!slot.token_append_chunk.empty()) {
+                     return;
+                 }

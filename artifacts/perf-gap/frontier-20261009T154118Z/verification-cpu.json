@@ -1,0 +1,7 @@
+{
+  "relay_arithmetic_standalone": "passed; c++ -std=c++17 -O2 -g -pthread -UNDEBUG -I ggml/src/ggml-vulkan tests/test-tp5-relay-tiles.cpp -o /var/tmp/test-tp5-relay-tiles && /var/tmp/test-tp5-relay-tiles",
+  "integrated_ctest": "7 selected,6 passed,1 known failure",
+  "failed": "test-mtp-workspace: prefill_phase == 1",
+  "evidence": "artifact://28",
+  "does_not_establish": "GPU performance, whole production suite, original target equivalence"
+}

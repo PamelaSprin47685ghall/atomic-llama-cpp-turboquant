@@ -1,0 +1,38 @@
+[
+ {
+  "rep": 0,
+  "wall": 3.103,
+  "predicted_ms": 2042.406,
+  "predicted_n": 171,
+  "prompt_n": 31,
+  "completion": 171,
+  "draft_n": 150,
+  "accepted": 149,
+  "finish": "stop",
+  "exact": true
+ },
+ {
+  "rep": 1,
+  "wall": 3.089,
+  "predicted_ms": 2046.089,
+  "predicted_n": 171,
+  "prompt_n": 31,
+  "completion": 171,
+  "draft_n": 150,
+  "accepted": 149,
+  "finish": "stop",
+  "exact": true
+ },
+ {
+  "rep": 2,
+  "wall": 3.132,
+  "predicted_ms": 2068.355,
+  "predicted_n": 171,
+  "prompt_n": 31,
+  "completion": 171,
+  "draft_n": 150,
+  "accepted": 149,
+  "finish": "stop",
+  "exact": true
+ }
+]

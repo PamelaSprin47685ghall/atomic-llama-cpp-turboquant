@@ -1,0 +1,13 @@
+{
+  "our_edited_source_files": {
+    "scripts/tp5-gap-bench.py": "d75216e21954d7a9068d8288d25d7a8eb396542b40b8be2d1876e8a0870eb849",
+    "scripts/tp5-hc-coordinate-prototype.py": "b5804655b83873ad26def838479bbd20596aa80a26cd8234d92126cc8019ff5c",
+    "tests/test-tp5-gap-tools.py": "6dea1859f2bd52705162b28a9e6125c9a7ee7e7ddf3cabe7a4d5f1849a3a0a64",
+    "tests/test-tp5-hc-coordinate.py": "9c5d3afc9f68047c8d155509f6fbec9dead3de1fe8f9977a0dec4008ac537860"
+  },
+  "owned_server_exited": true,
+  "production_cpp_shader_changed_by_this_turn": false,
+  "cpu_test_methods_passed": 49,
+  "gpu_candidate_arms_B_to_F": "NOT_EXECUTED",
+  "global_gap": "UNPROVEN"
+}

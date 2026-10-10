@@ -1,0 +1,275 @@
+{
+  "status": "MEASURED_NOT_QUALIFIED",
+  "qualification": "NOT_REVIEWED",
+  "profile": "none",
+  "gpu_before": [
+    {
+      "card": "card1",
+      "bdf": "0000:0f:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17203200",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card2",
+      "bdf": "0000:09:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+    },
+    {
+      "card": "card3",
+      "bdf": "0000:0c:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+    },
+    {
+      "card": "card4",
+      "bdf": "0000:06:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+    },
+    {
+      "card": "card5",
+      "bdf": "0000:03:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+    }
+  ],
+  "process_id": 2333590,
+  "loading_ms": 40650.758672,
+  "pooled_tps": 56.23096840677838,
+  "median_tps": 56.456901544215114,
+  "requests": [
+    {
+      "idx": 0,
+      "phase": "warmup",
+      "n": 190,
+      "predicted_ms": 3823.394,
+      "tps": 49.6940676268258,
+      "wall_ms": 8408.058649,
+      "finish": "stop",
+      "content_sha256": "fc7ed1877f5a20927147034e52c6f119b3ac11d1be0e02f9a1d3effb36a4841e",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 93,
+        "prompt_ms": 4580.282,
+        "prompt_per_token_ms": 49.25034408602151,
+        "prompt_per_second": 20.304426670672242,
+        "predicted_n": 190,
+        "predicted_ms": 3823.394,
+        "predicted_per_token_ms": 20.123126315789474,
+        "predicted_per_second": 49.694067626825806,
+        "draft_n": 104,
+        "draft_n_accepted": 85
+      },
+      "issues": [],
+      "fallback_lines": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=97 uid=36028797018971137",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=97 uid=36028797018971649",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=97 uid=36028797018972161",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=97 uid=36028797018972673",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=97 uid=36028797018973185",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=97 uid=36028797018973953",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=10 n_sub=97 uid=36028797019019777"
+      ]
+    },
+    {
+      "idx": 1,
+      "phase": "measured",
+      "n": 190,
+      "predicted_ms": 3365.399,
+      "tps": 56.456901544215114,
+      "wall_ms": 7172.733801,
+      "finish": "stop",
+      "content_sha256": "fc7ed1877f5a20927147034e52c6f119b3ac11d1be0e02f9a1d3effb36a4841e",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 93,
+        "prompt_ms": 3161.402,
+        "prompt_per_token_ms": 33.99356989247312,
+        "prompt_per_second": 29.41732813479589,
+        "predicted_n": 190,
+        "predicted_ms": 3365.399,
+        "predicted_per_token_ms": 17.712626315789475,
+        "predicted_per_second": 56.45690154421512,
+        "draft_n": 104,
+        "draft_n_accepted": 85
+      },
+      "issues": [],
+      "fallback_lines": []
+    },
+    {
+      "idx": 2,
+      "phase": "measured",
+      "n": 190,
+      "predicted_ms": 3350.746,
+      "tps": 56.70379073794313,
+      "wall_ms": 6456.695868,
+      "finish": "stop",
+      "content_sha256": "fc7ed1877f5a20927147034e52c6f119b3ac11d1be0e02f9a1d3effb36a4841e",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 93,
+        "prompt_ms": 3101.866,
+        "prompt_per_token_ms": 33.35339784946237,
+        "prompt_per_second": 29.9819527987347,
+        "predicted_n": 190,
+        "predicted_ms": 3350.746,
+        "predicted_per_token_ms": 17.635505263157896,
+        "predicted_per_second": 56.70379073794313,
+        "draft_n": 104,
+        "draft_n_accepted": 85
+      },
+      "issues": [],
+      "fallback_lines": []
+    },
+    {
+      "idx": 3,
+      "phase": "measured",
+      "n": 190,
+      "predicted_ms": 3420.618,
+      "tps": 55.545518382935484,
+      "wall_ms": 6546.270427,
+      "finish": "stop",
+      "content_sha256": "fc7ed1877f5a20927147034e52c6f119b3ac11d1be0e02f9a1d3effb36a4841e",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 93,
+        "prompt_ms": 3121.74,
+        "prompt_per_token_ms": 33.567096774193544,
+        "prompt_per_second": 29.7910780526245,
+        "predicted_n": 190,
+        "predicted_ms": 3420.618,
+        "predicted_per_token_ms": 18.003252631578945,
+        "predicted_per_second": 55.545518382935484,
+        "draft_n": 104,
+        "draft_n_accepted": 85
+      },
+      "issues": [],
+      "fallback_lines": []
+    },
+    {
+      "idx": 4,
+      "phase": "guard",
+      "n": 72,
+      "predicted_ms": 1416.868,
+      "tps": 50.816307517708076,
+      "wall_ms": 3055.325665,
+      "finish": "stop",
+      "content_sha256": "ead561f7cdce47b31ce7e0e48bceb7f6d17857880c2f92f65ebfede5779c0f78",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 23,
+        "prompt_ms": 1635.001,
+        "prompt_per_token_ms": 71.087,
+        "prompt_per_second": 14.067269683627105,
+        "predicted_n": 72,
+        "predicted_ms": 1416.868,
+        "predicted_per_token_ms": 19.67872222222222,
+        "predicted_per_second": 50.81630751770807,
+        "draft_n": 44,
+        "draft_n_accepted": 28
+      },
+      "issues": [],
+      "fallback_lines": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=11 n_sub=97 uid=36028797019196417"
+      ]
+    }
+  ],
+  "shutdown": {
+    "returncode": 0,
+    "forced": false,
+    "seconds": 0.9655717670102604
+  },
+  "gpu_after": [
+    {
+      "card": "card1",
+      "bdf": "0000:0f:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "2",
+      "mem_info_vram_used": "17203200",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card2",
+      "bdf": "0000:09:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "3",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+    },
+    {
+      "card": "card3",
+      "bdf": "0000:0c:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "3",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+    },
+    {
+      "card": "card4",
+      "bdf": "0000:06:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "5",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz *\n2: 673Mhz \n3: 1000Mhz"
+    },
+    {
+      "card": "card5",
+      "bdf": "0000:03:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "3",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+    }
+  ]
+}

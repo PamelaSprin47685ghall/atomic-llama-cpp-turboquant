@@ -1,0 +1,24 @@
+[
+ {
+  "repeat": 1,
+  "wall_sec": 3.6363084499898832,
+  "predicted_ms": 2098.626,
+  "predicted_n": 171,
+  "prompt_n": 31,
+  "completion_tokens": 171,
+  "finish": "stop",
+  "exact": true,
+  "decode_tps": 81.48188386115486
+ },
+ {
+  "repeat": 2,
+  "wall_sec": 3.185685411997838,
+  "predicted_ms": 2136.222,
+  "predicted_n": 171,
+  "prompt_n": 31,
+  "completion_tokens": 171,
+  "finish": "stop",
+  "exact": true,
+  "decode_tps": 80.04786019430564
+ }
+]

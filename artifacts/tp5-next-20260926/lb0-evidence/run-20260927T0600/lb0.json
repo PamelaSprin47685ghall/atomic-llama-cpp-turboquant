@@ -1,0 +1,42 @@
+{
+ "base": [
+  {
+   "i": 0,
+   "predicted_ms": 3651.633,
+   "completion": 177,
+   "finish": "stop"
+  },
+  {
+   "i": 1,
+   "predicted_ms": 3608.125,
+   "completion": 177,
+   "finish": "stop"
+  },
+  {
+   "i": 2,
+   "predicted_ms": 3615.696,
+   "completion": 177,
+   "finish": "stop"
+  }
+ ],
+ "exact": [
+  {
+   "i": 0,
+   "predicted_ms": 3469.112,
+   "completion": 156,
+   "finish": "stop"
+  },
+  {
+   "i": 1,
+   "predicted_ms": 3519.617,
+   "completion": 156,
+   "finish": "stop"
+  },
+  {
+   "i": 2,
+   "predicted_ms": 3545.863,
+   "completion": 156,
+   "finish": "stop"
+  }
+ ]
+}

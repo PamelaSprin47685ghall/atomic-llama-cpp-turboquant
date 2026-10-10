@@ -1,0 +1,62 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文回答普通成年人如何健康减重。回答包含四个部分，每部分标题单独一行：\n一、热量缺口原理（一句话）\n二、饮食建议（两条，每条一句话）\n三、每周运动安排（给出周一、周三、周五的安排）\n四、睡眠与常见误区（两句话）\n语言自然，正常结束。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "一、热量缺口原理\n减重的核心在于消耗的热量大于摄入的热量。\n\n二、饮食建议\n优先选择富含蛋白质和膳食纤维的食物以增加饱腹感。\n减少精制糖和加工食品摄入，保持饮食清淡均衡。\n\n三、每周运动安排\n周一进行30分钟快走或慢跑以激活代谢。\n周三安排力量训练以维持肌肉量并提升基础代谢。\n周五进行中等强度的有氧运动或瑜伽以放松身心并持续消耗能量。\n\n四、睡眠与常见误区\n保证每晚7至8小时的高质量睡眠有助于调节食欲激素。\n避免极端节食或依赖减肥药，因为这往往导致反弹且损害健康。"
+        }
+      }
+    ],
+    "created": 1791618801,
+    "model": "/home/kunweiz/atomic-llama-cpp-turboquant/models/perf-gap-q2-hcq8/Q2-HCQ8-00001-of-00002.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 139,
+      "prompt_tokens": 93,
+      "total_tokens": 232,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-eSSr7vkV9TUCVSGNnzOt3NGVgEy76rHI",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 93,
+      "prompt_ms": 3175.124,
+      "prompt_per_token_ms": 34.14111827956989,
+      "prompt_per_second": 29.29019465066561,
+      "predicted_n": 139,
+      "predicted_ms": 2322.142,
+      "predicted_per_token_ms": 16.706057553956832,
+      "predicted_per_second": 59.858527170173055
+    }
+  },
+  "wall_ms": 6144.53253,
+  "log_begin": 25746,
+  "log_end": 56222,
+  "phase": "measured"
+}

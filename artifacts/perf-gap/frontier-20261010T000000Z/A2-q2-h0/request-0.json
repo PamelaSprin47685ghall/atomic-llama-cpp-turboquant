@@ -1,0 +1,62 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文回答普通成年人如何健康减重。分点说明合理饮食、每周运动安排、睡眠与恢复、常见误区和长期执行方法；每点给一两句具体解释，语言自然，答案约250个模型token，正常结束，不要提前停止。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "健康减重需兼顾饮食、运动与休息。首先，合理饮食应遵循热量缺口原则，多吃蔬菜、优质蛋白，减少精制糖和加工食品，控制份量而非极端节食。其次，每周安排至少150分钟中等强度有氧运动，如快走或游泳，并结合两次力量训练以维持肌肉量。第三，保证每晚7-8小时高质量睡眠，因为睡眠不足会扰乱激素，增加食欲。常见误区包括过度依赖单一食物或快速减肥药，这往往导致反弹。长期执行需建立可持续习惯，如记录饮食、设定小目标，将运动融入日常生活，而非追求短期速效。"
+        }
+      }
+    ],
+    "created": 1791612735,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 135,
+      "prompt_tokens": 77,
+      "total_tokens": 212,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-0Ymo2nqEyVmlCvOq1vLJ4Op9Ez4VwjzC",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 77,
+      "prompt_ms": 5350.741,
+      "prompt_per_token_ms": 69.49014285714286,
+      "prompt_per_second": 14.390530208806593,
+      "predicted_n": 135,
+      "predicted_ms": 2957.205,
+      "predicted_per_token_ms": 21.90522222222222,
+      "predicted_per_second": 45.65121457592558
+    }
+  },
+  "wall_ms": 8312.367932,
+  "log_begin": 15407,
+  "log_end": 25193,
+  "phase": "warmup"
+}

@@ -1,0 +1,71 @@
+{
+  "pooled_tps": 50.806941244312796,
+  "mean_generation_ms": 2755.529,
+  "mean_prompt_ms": 2455.8135,
+  "mean_request_ms": 5531.3701195,
+  "measured_body_equal": true,
+  "warmup_matches_measured": true,
+  "length_160_240_pass": false,
+  "measured_fallback_line_count": 0,
+  "mapped_snapshot_hash_mismatches": [],
+  "shutdown": {
+    "returncode": 0,
+    "forced": false,
+    "seconds": 0.66477364700404
+  },
+  "rows": [
+    {
+      "idx": 0,
+      "phase": "warmup",
+      "n": 140,
+      "predicted_ms": 3138.17,
+      "prompt_ms": 6987.704,
+      "wall_ms": 10129.751185,
+      "finish": "stop",
+      "content_sha256": "4a79f855231f42c8e5446c5eda7a4ef99f458e63b738a6526abad861103917b5",
+      "fallback_lines": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=3 n_sub=96 uid=36028797018967041",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=96 uid=36028797018967297",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=96 uid=36028797018967553",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=97 uid=36028797018967809",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=97 uid=36028797018968065"
+      ]
+    },
+    {
+      "idx": 1,
+      "phase": "measured",
+      "n": 140,
+      "predicted_ms": 2742.777,
+      "prompt_ms": 2456.63,
+      "wall_ms": 5835.553923,
+      "finish": "stop",
+      "content_sha256": "4a79f855231f42c8e5446c5eda7a4ef99f458e63b738a6526abad861103917b5",
+      "fallback_lines": []
+    },
+    {
+      "idx": 2,
+      "phase": "measured",
+      "n": 140,
+      "predicted_ms": 2768.281,
+      "prompt_ms": 2454.997,
+      "wall_ms": 5227.186316,
+      "finish": "stop",
+      "content_sha256": "4a79f855231f42c8e5446c5eda7a4ef99f458e63b738a6526abad861103917b5",
+      "fallback_lines": []
+    },
+    {
+      "idx": 3,
+      "phase": "guard",
+      "n": 72,
+      "predicted_ms": 1632.695,
+      "prompt_ms": 1698.009,
+      "wall_ms": 3333.976003,
+      "finish": "stop",
+      "content_sha256": "ead561f7cdce47b31ce7e0e48bceb7f6d17857880c2f92f65ebfede5779c0f78",
+      "fallback_lines": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=96 uid=36028797018970881"
+      ]
+    }
+  ],
+  "qualification": "DIAGNOSTIC_ONLY_LENGTH_FAILURE; semantic review limited to these outputs; no global bound"
+}

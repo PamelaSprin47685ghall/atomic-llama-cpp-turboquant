@@ -1,0 +1,6 @@
+{
+  "experiment": "Same unmodified APEX weights, five GPUs and ordinary single-stream h0: test ordinary layer placement instead of TP5 tensor placement. Layer mode has no TP5 LateBind or TP5-only greedy shortcut.",
+  "reason": "The model data excluding two embedding tables is55.93GB, fitting80GB aggregate capacity without TP5 replica inflation. This is an actual alternative to frequent collective exchange, not an assertion it wins.",
+  "layer_env": "MMVQdisabled; graphics queue1; device-local allocations; Vulkan replay1; smallQ8columns1; threads22. No clock, driver, timeout or numerical tolerance changes.",
+  "gate": "2warm+3measured+guard; record output, counts, physical devices and allocation logs. Stop on load/protocol/abnormal exit; one process is exploration, not independent confirmation."
+}

@@ -1,0 +1,6 @@
+{
+  "hypothesis": "RMS norm has only four stream workgroups; 512/1024 threads may reduce the serial per-lane input loop and hide more memory latency than256.",
+  "scope": "Isolated actual norm shader only first. Preserve inputs,outputs,ready/epoch/error gates and bank retirement. Reduction order may change, so this is not automatically bit-equivalent even in aggressive mode.",
+  "gate": "Benchmark local and system mailbox256/512/1024 with all-output numerical checks; only a meaningful micro gain proceeds to opt-in production and independent numerical/text/teardown qualification. No default promotion from a microbenchmark.",
+  "boundaries": "Larger workgroups may increase LDS, registers and barrier cost. Raw independent service timings are not an architecture-independent lower bound. Do not fold profile perturbation into theory."
+}

@@ -1,0 +1,9 @@
+{
+  "hypothesis": "No-MTP ordinary CPU sampling needlessly materializes/transforms a 248320-token candidate array for an eligible deterministic greedy chain. Bypass only when the maximum is finite and unique; retain exact fallback for ties and NaNs/infinities.",
+  "mechanism": "Revised before any GPU candidate run: GGML_TP5_GREEDY_HOST=1, default off, TP5 and no MTP only; existing eligibility plus n_probs=0 and first active top-k 2..128; construct exact compact sorted top-k then apply the actual sampler chain. No simulated RNG advancement; accept hooks unchanged.",
+  "rejected_development_attempt": "Raw unique argmax plus one dist draw failed the subsequent RNG-state test. The production dist sampler draws nothing at candidate size1. That attempted implementation was not GPU-tested or promoted; compact top-k preserves the actual candidate count and real dist behavior.",
+  "unit_validation": "Random unique and tied rows versus the actual production sampler chain, followed by RNG-dependent samples; non-finite fallback tests; CPU micro calibration is separate from model speed.",
+  "pilot": "One off and one on process, same APEX weights and head-sharded aggressive configuration; two warm, three measured and one guard. Require warm measured content hashes to match, activation log in B only, no measured fallback and normal exit.",
+  "confirmation": "Only after passing pilot and output review, four fresh independent process pairs AB/BA/AB/BA using same binary; 95% paired Student t confidence interval.",
+  "limits": "This candidate does not claim to fix the earlier intermittent relay failure. Any protocol failure remains visible and stops that campaign. No default promotion on smoke results."
+}

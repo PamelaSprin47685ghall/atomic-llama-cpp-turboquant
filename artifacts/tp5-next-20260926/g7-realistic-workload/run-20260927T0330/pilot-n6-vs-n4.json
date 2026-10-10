@@ -1,0 +1,1738 @@
+{
+  "variant_a": {
+    "name": "native-mtp-fused-n6-varargmax",
+    "description": "n6 fused profile with G4b host verify-argmax (G7 realistic-acceptance horizon scan)",
+    "env": {
+      "RADV_DEBUG": "nobolist",
+      "GGML_TP5_SPEC_VERIFY_ARGMAX": "1"
+    },
+    "cli_args": [
+      "--tp5",
+      "qwen4exp-af",
+      "-md",
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+      "--spec-type",
+      "draft-mtp",
+      "--spec-draft-n-max",
+      "6"
+    ],
+    "expected_sync": "relay",
+    "expected_wire": "f32",
+    "expected_mmvq": "disabled",
+    "is_mtp": true,
+    "requires_linear": true
+  },
+  "variant_b": {
+    "name": "native-mtp-fused-n4-varargmax",
+    "description": "n4 fused profile with G4b host verify-argmax (G7 horizon-scan low end)",
+    "env": {
+      "RADV_DEBUG": "nobolist",
+      "GGML_TP5_SPEC_VERIFY_ARGMAX": "1"
+    },
+    "cli_args": [
+      "--tp5",
+      "qwen4exp-af",
+      "-md",
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+      "--spec-type",
+      "draft-mtp",
+      "--spec-draft-n-max",
+      "4"
+    ],
+    "expected_sync": "relay",
+    "expected_wire": "f32",
+    "expected_mmvq": "disabled",
+    "is_mtp": true,
+    "requires_linear": true
+  },
+  "workload": "weightloss",
+  "server_binary": "/var/tmp/tp5-final-build/bin/llama-server",
+  "server_binary_sha256": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f",
+  "server_binary_b": "/var/tmp/tp5-final-build/bin/llama-server",
+  "server_binary_b_sha256": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f",
+  "legacy_mmvq_policy_unobservable": false,
+  "blocks_requested": 1,
+  "pilot": true,
+  "max_wall_seconds": 900.0,
+  "count_to": 60,
+  "blocks_completed": 1,
+  "repeats_per_trial": 2,
+  "git_provenance": {
+    "head_commit": "4a30c7e9b3c61a02671c04e623e9c2fe7ccde288",
+    "is_dirty": true,
+    "diff_sha256": "eba75f43e875e6a145a32f50ff8e1db31a70c58e54e936ccd8d6f90fe964e4fa",
+    "script_sha256": "5fcef186e73f34b5fe96587d0ffc551b0f06fbf7003bf91246ebeee8076bb23c",
+    "porcelain_status": "M TP5.md\n M scripts/run-tp5-cross-matrix.py\n?? artifacts/tp5-next-20260926/"
+  },
+  "trials": [
+    {
+      "variant": "native-mtp-fused-n6-varargmax",
+      "trial_tag": "blk1_A1",
+      "count_to": 60,
+      "workload": "weightloss",
+      "port": 8097,
+      "is_mtp": true,
+      "requires_linear": true,
+      "metrics": [
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 6.860774157976266,
+          "reported_predicted_tps": 33.62464618560502,
+          "decode_tps": 33.62464618560502,
+          "predicted_ms": 5293.736,
+          "prompt_n": 31,
+          "predicted_n": 178,
+          "completion_tokens": 178,
+          "committed_tps": 25.944593992072893,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+                }
+              }
+            ],
+            "created": 1790478985,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2129-16e28b8ac",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 178,
+              "prompt_tokens": 31,
+              "total_tokens": 209,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-abRZOqmCuzUFx4c6miPWSwjFo2iikQ5r",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 1047.125,
+              "prompt_per_token_ms": 33.778225806451616,
+              "prompt_per_second": 29.604870478691655,
+              "predicted_n": 178,
+              "predicted_ms": 5293.736,
+              "predicted_per_token_ms": 29.740089887640448,
+              "predicted_per_second": 33.62464618560502,
+              "draft_n": 408,
+              "draft_n_accepted": 114
+            }
+          },
+          "error_message": null
+        },
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 6.333356346003711,
+          "reported_predicted_tps": 33.74893183682733,
+          "decode_tps": 33.748931836827325,
+          "predicted_ms": 5274.241,
+          "prompt_n": 31,
+          "predicted_n": 178,
+          "completion_tokens": 178,
+          "committed_tps": 28.105161035556815,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+                }
+              }
+            ],
+            "created": 1790478992,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2129-16e28b8ac",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 178,
+              "prompt_tokens": 31,
+              "total_tokens": 209,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-pWnEehpV9VZO2NtGiBFds76jug8m6Ak4",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 1055.723,
+              "prompt_per_token_ms": 34.05558064516129,
+              "prompt_per_second": 29.363763032537893,
+              "predicted_n": 178,
+              "predicted_ms": 5274.241,
+              "predicted_per_token_ms": 29.630567415730336,
+              "predicted_per_second": 33.74893183682733,
+              "draft_n": 408,
+              "draft_n_accepted": 114
+            }
+          },
+          "error_message": null
+        }
+      ],
+      "mapped_dso_hashes": {
+        "/home/kunweiz/.cache/radv_builtin_shaders/index": "e33aed84c876e17146c31c9e035983814d8f1c8817144ec34630bba6c53991f3",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac",
+        "/var/tmp/tp5-final-build/bin/libggml-base.so.0.18.1": "90bb3fcab6f2ed5e25f59a11b9f6c21bd840bd92a07f1a2289d9adc858d0e179",
+        "/var/tmp/tp5-final-build/bin/libggml-cpu.so.0.18.1": "091f7a79fd59ab01fc3b92e923d11bc3f6c144776bac31e0309fbc14ee195fde",
+        "/var/tmp/tp5-final-build/bin/libggml-vulkan.so.0.18.1": "1fb7aa7399d6f5cb726270eb82cd13f70242b7815f3c951dd2f6870494dbcfb0",
+        "/var/tmp/tp5-final-build/bin/libggml.so.0.18.1": "23893927e0d69732e4e598f6c5ad375e27c4f8d28bb88c88fa3b4a67abffa8df",
+        "/var/tmp/tp5-final-build/bin/libllama-common.so.0.0.2129": "5ff77574026a820ec6519d983a3506870111465cc7ca85abaff46060e85519a2",
+        "/var/tmp/tp5-final-build/bin/libllama-server-impl.so": "0192460708ad665c8a3585bacb8e2c1a60f0d32ee545a00c49b73f701f0847f9",
+        "/var/tmp/tp5-final-build/bin/libllama.so.0.0.2129": "b1fafa7dfd053f2b12d03a52f422a33b764b5efde8a26554c26bb780155035e5",
+        "/var/tmp/tp5-final-build/bin/llama-server": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f"
+      },
+      "gpu_snapshot_before": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17203200,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        }
+      ],
+      "gpu_snapshot_after": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 1549045760,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2115Mhz *",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 44
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 92
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2105Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 44
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2340Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 87
+        }
+      ],
+      "log_route_verification": {
+        "log_exists": true,
+        "linear_definition_hit": true,
+        "route_verified": true,
+        "mmvq_policy_seen": true,
+        "mmvq_policy_unobservable": false,
+        "error": null
+      },
+      "success": true,
+      "log_path": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/tp5-next-20260926/g7-realistic-workload/run-20260927T0330/pilot-n6-vs-n4_logs/server_native-mtp-fused-n6-varargmax_blk1_A1.log",
+      "log_sha256": "3d84a8b9b520fc6da48571c8f249af9e0fc7ac658d3b3f168688e7b4ad3375b2",
+      "command": [
+        "/var/tmp/tp5-final-build/bin/llama-server",
+        "-m",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+        "-dev",
+        "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+        "--split-mode",
+        "tensor",
+        "--fit",
+        "off",
+        "-ngl",
+        "999",
+        "-c",
+        "256",
+        "-b",
+        "32",
+        "-ub",
+        "32",
+        "--no-mmap",
+        "--no-host",
+        "-np",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8097",
+        "--tp5",
+        "qwen4exp-af",
+        "-md",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-n-max",
+        "6"
+      ],
+      "env_snapshot": {
+        "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+        "HOME": "/home/kunweiz",
+        "USER": "kunweiz",
+        "SHELL": "/bin/bash",
+        "LANG": "en_US.UTF-8",
+        "LD_LIBRARY_PATH": "/var/tmp/tp5-final-build/bin",
+        "RADV_DEBUG": "nobolist",
+        "GGML_TP5_SPEC_VERIFY_ARGMAX": "1"
+      },
+      "warmup": {
+        "success": true,
+        "status_code": 200,
+        "client_wall_sec": 7.301603086001705,
+        "reported_predicted_tps": 31.599037330002062,
+        "decode_tps": 31.599037330002062,
+        "predicted_ms": 5633.083,
+        "prompt_n": 31,
+        "predicted_n": 178,
+        "completion_tokens": 178,
+        "committed_tps": 24.378208169279063,
+        "finish_reason": "stop",
+        "exact_content_match": true,
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+            }
+          ],
+          "temperature": 0,
+          "seed": 42,
+          "max_tokens": 192,
+          "cache_prompt": false,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        },
+        "raw_response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+              }
+            }
+          ],
+          "created": 1790478978,
+          "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+          "system_fingerprint": "b2129-16e28b8ac",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 178,
+            "prompt_tokens": 31,
+            "total_tokens": 209,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-8LmjTOIh74XRkwlTzSvhtiZ0bQfqGWjf",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 31,
+            "prompt_ms": 1665.407,
+            "prompt_per_token_ms": 53.722806451612904,
+            "prompt_per_second": 18.61406851298211,
+            "predicted_n": 178,
+            "predicted_ms": 5633.083,
+            "predicted_per_token_ms": 31.646533707865167,
+            "predicted_per_second": 31.599037330002062,
+            "draft_n": 408,
+            "draft_n_accepted": 114
+          }
+        },
+        "error_message": null
+      }
+    },
+    {
+      "variant": "native-mtp-fused-n4-varargmax",
+      "trial_tag": "blk1_B1",
+      "count_to": 60,
+      "workload": "weightloss",
+      "port": 8097,
+      "is_mtp": true,
+      "requires_linear": true,
+      "metrics": [
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 5.925618898996618,
+          "reported_predicted_tps": 40.83228117567607,
+          "decode_tps": 40.83228117567607,
+          "predicted_ms": 4359.296,
+          "prompt_n": 31,
+          "predicted_n": 178,
+          "completion_tokens": 178,
+          "committed_tps": 30.039056347370003,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+                }
+              }
+            ],
+            "created": 1790479058,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2129-16e28b8ac",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 178,
+              "prompt_tokens": 31,
+              "total_tokens": 209,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-5ASdEPmpiTX9eRrf5KLRBnw7bMdZIPms",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 1048.975,
+              "prompt_per_token_ms": 33.83790322580645,
+              "prompt_per_second": 29.55265854762983,
+              "predicted_n": 178,
+              "predicted_ms": 4359.296,
+              "predicted_per_token_ms": 24.490426966292137,
+              "predicted_per_second": 40.83228117567607,
+              "draft_n": 284,
+              "draft_n_accepted": 109
+            }
+          },
+          "error_message": null
+        },
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 5.411631683993619,
+          "reported_predicted_tps": 41.09903435740736,
+          "decode_tps": 41.099034357407355,
+          "predicted_ms": 4331.002,
+          "prompt_n": 31,
+          "predicted_n": 178,
+          "completion_tokens": 178,
+          "committed_tps": 32.89211284028876,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+                }
+              }
+            ],
+            "created": 1790479064,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2129-16e28b8ac",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 178,
+              "prompt_tokens": 31,
+              "total_tokens": 209,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-lCpjggeHSxhjL93o4hMflrK5QDBMh7Gk",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 1077.283,
+              "prompt_per_token_ms": 34.75106451612903,
+              "prompt_per_second": 28.77609690304219,
+              "predicted_n": 178,
+              "predicted_ms": 4331.002,
+              "predicted_per_token_ms": 24.331471910112363,
+              "predicted_per_second": 41.09903435740736,
+              "draft_n": 284,
+              "draft_n_accepted": 109
+            }
+          },
+          "error_message": null
+        }
+      ],
+      "mapped_dso_hashes": {
+        "/home/kunweiz/.cache/radv_builtin_shaders/index": "e33aed84c876e17146c31c9e035983814d8f1c8817144ec34630bba6c53991f3",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac",
+        "/var/tmp/tp5-final-build/bin/libggml-base.so.0.18.1": "90bb3fcab6f2ed5e25f59a11b9f6c21bd840bd92a07f1a2289d9adc858d0e179",
+        "/var/tmp/tp5-final-build/bin/libggml-cpu.so.0.18.1": "091f7a79fd59ab01fc3b92e923d11bc3f6c144776bac31e0309fbc14ee195fde",
+        "/var/tmp/tp5-final-build/bin/libggml-vulkan.so.0.18.1": "1fb7aa7399d6f5cb726270eb82cd13f70242b7815f3c951dd2f6870494dbcfb0",
+        "/var/tmp/tp5-final-build/bin/libggml.so.0.18.1": "23893927e0d69732e4e598f6c5ad375e27c4f8d28bb88c88fa3b4a67abffa8df",
+        "/var/tmp/tp5-final-build/bin/libllama-common.so.0.0.2129": "5ff77574026a820ec6519d983a3506870111465cc7ca85abaff46060e85519a2",
+        "/var/tmp/tp5-final-build/bin/libllama-server-impl.so": "0192460708ad665c8a3585bacb8e2c1a60f0d32ee545a00c49b73f701f0847f9",
+        "/var/tmp/tp5-final-build/bin/libllama.so.0.0.2129": "b1fafa7dfd053f2b12d03a52f422a33b764b5efde8a26554c26bb780155035e5",
+        "/var/tmp/tp5-final-build/bin/llama-server": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f"
+      },
+      "gpu_snapshot_before": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 513769472,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 1200Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 29
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 61
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 29
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2340Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 57
+        }
+      ],
+      "gpu_snapshot_after": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2619957248,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 1564442624,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 1560039424,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 1567358976,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2340Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 1561088000,
+          "gpu_busy_percent": 98
+        }
+      ],
+      "log_route_verification": {
+        "log_exists": true,
+        "linear_definition_hit": true,
+        "route_verified": true,
+        "mmvq_policy_seen": true,
+        "mmvq_policy_unobservable": false,
+        "error": null
+      },
+      "success": true,
+      "log_path": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/tp5-next-20260926/g7-realistic-workload/run-20260927T0330/pilot-n6-vs-n4_logs/server_native-mtp-fused-n4-varargmax_blk1_B1.log",
+      "log_sha256": "8ed3802555ef96b11ef20201e656aa04049ec9e98a3397a69936e450f0cae46f",
+      "command": [
+        "/var/tmp/tp5-final-build/bin/llama-server",
+        "-m",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+        "-dev",
+        "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+        "--split-mode",
+        "tensor",
+        "--fit",
+        "off",
+        "-ngl",
+        "999",
+        "-c",
+        "256",
+        "-b",
+        "32",
+        "-ub",
+        "32",
+        "--no-mmap",
+        "--no-host",
+        "-np",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8097",
+        "--tp5",
+        "qwen4exp-af",
+        "-md",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-n-max",
+        "4"
+      ],
+      "env_snapshot": {
+        "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+        "HOME": "/home/kunweiz",
+        "USER": "kunweiz",
+        "SHELL": "/bin/bash",
+        "LANG": "en_US.UTF-8",
+        "LD_LIBRARY_PATH": "/var/tmp/tp5-final-build/bin",
+        "RADV_DEBUG": "nobolist",
+        "GGML_TP5_SPEC_VERIFY_ARGMAX": "1"
+      },
+      "warmup": {
+        "success": true,
+        "status_code": 200,
+        "client_wall_sec": 6.3225753890001215,
+        "reported_predicted_tps": 38.06232813148183,
+        "decode_tps": 38.06232813148182,
+        "predicted_ms": 4676.54,
+        "prompt_n": 31,
+        "predicted_n": 178,
+        "completion_tokens": 178,
+        "committed_tps": 28.153084629039064,
+        "finish_reason": "stop",
+        "exact_content_match": true,
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+            }
+          ],
+          "temperature": 0,
+          "seed": 42,
+          "max_tokens": 192,
+          "cache_prompt": false,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        },
+        "raw_response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+              }
+            }
+          ],
+          "created": 1790479052,
+          "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+          "system_fingerprint": "b2129-16e28b8ac",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 178,
+            "prompt_tokens": 31,
+            "total_tokens": 209,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-iiKZ0cc4mduJxzfcvE7k3nnLJ93bu4hw",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 31,
+            "prompt_ms": 1642.886,
+            "prompt_per_token_ms": 52.99632258064516,
+            "prompt_per_second": 18.869233775198037,
+            "predicted_n": 178,
+            "predicted_ms": 4676.54,
+            "predicted_per_token_ms": 26.272696629213485,
+            "predicted_per_second": 38.06232813148183,
+            "draft_n": 284,
+            "draft_n_accepted": 109
+          }
+        },
+        "error_message": null
+      }
+    },
+    {
+      "variant": "native-mtp-fused-n4-varargmax",
+      "trial_tag": "blk1_B2",
+      "count_to": 60,
+      "workload": "weightloss",
+      "port": 8097,
+      "is_mtp": true,
+      "requires_linear": true,
+      "metrics": [
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 5.8507423480041325,
+          "reported_predicted_tps": 41.45004361569196,
+          "decode_tps": 41.45004361569196,
+          "predicted_ms": 4294.326,
+          "prompt_n": 31,
+          "predicted_n": 178,
+          "completion_tokens": 178,
+          "committed_tps": 30.423489774886644,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+                }
+              }
+            ],
+            "created": 1790479131,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2129-16e28b8ac",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 178,
+              "prompt_tokens": 31,
+              "total_tokens": 209,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-Aq23lWUtfEt42WQhAV5atYEEnYoF3lkq",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 1029.705,
+              "prompt_per_token_ms": 33.21629032258064,
+              "prompt_per_second": 30.105709887783398,
+              "predicted_n": 178,
+              "predicted_ms": 4294.326,
+              "predicted_per_token_ms": 24.125426966292135,
+              "predicted_per_second": 41.45004361569196,
+              "draft_n": 284,
+              "draft_n_accepted": 109
+            }
+          },
+          "error_message": null
+        },
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 5.318909869005438,
+          "reported_predicted_tps": 41.62297812876185,
+          "decode_tps": 41.62297812876185,
+          "predicted_ms": 4276.484,
+          "prompt_n": 31,
+          "predicted_n": 178,
+          "completion_tokens": 178,
+          "committed_tps": 33.46550409459815,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+                }
+              }
+            ],
+            "created": 1790479137,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2129-16e28b8ac",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 178,
+              "prompt_tokens": 31,
+              "total_tokens": 209,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-CclB1wmDXRhFwT7DWyc50RwSGjhis88l",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 1039.013,
+              "prompt_per_token_ms": 33.51654838709677,
+              "prompt_per_second": 29.836007826658573,
+              "predicted_n": 178,
+              "predicted_ms": 4276.484,
+              "predicted_per_token_ms": 24.025191011235957,
+              "predicted_per_second": 41.62297812876185,
+              "draft_n": 284,
+              "draft_n_accepted": 109
+            }
+          },
+          "error_message": null
+        }
+      ],
+      "mapped_dso_hashes": {
+        "/home/kunweiz/.cache/radv_builtin_shaders/index": "e33aed84c876e17146c31c9e035983814d8f1c8817144ec34630bba6c53991f3",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac",
+        "/var/tmp/tp5-final-build/bin/libggml-base.so.0.18.1": "90bb3fcab6f2ed5e25f59a11b9f6c21bd840bd92a07f1a2289d9adc858d0e179",
+        "/var/tmp/tp5-final-build/bin/libggml-cpu.so.0.18.1": "091f7a79fd59ab01fc3b92e923d11bc3f6c144776bac31e0309fbc14ee195fde",
+        "/var/tmp/tp5-final-build/bin/libggml-vulkan.so.0.18.1": "1fb7aa7399d6f5cb726270eb82cd13f70242b7815f3c951dd2f6870494dbcfb0",
+        "/var/tmp/tp5-final-build/bin/libggml.so.0.18.1": "23893927e0d69732e4e598f6c5ad375e27c4f8d28bb88c88fa3b4a67abffa8df",
+        "/var/tmp/tp5-final-build/bin/libllama-common.so.0.0.2129": "5ff77574026a820ec6519d983a3506870111465cc7ca85abaff46060e85519a2",
+        "/var/tmp/tp5-final-build/bin/libllama-server-impl.so": "0192460708ad665c8a3585bacb8e2c1a60f0d32ee545a00c49b73f701f0847f9",
+        "/var/tmp/tp5-final-build/bin/libllama.so.0.0.2129": "b1fafa7dfd053f2b12d03a52f422a33b764b5efde8a26554c26bb780155035e5",
+        "/var/tmp/tp5-final-build/bin/llama-server": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f"
+      },
+      "gpu_snapshot_before": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2619957248,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 1564442624,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 514076672,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 1567358976,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2340Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 1561088000,
+          "gpu_busy_percent": 98
+        }
+      ],
+      "gpu_snapshot_after": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17203200,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 1200Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        }
+      ],
+      "log_route_verification": {
+        "log_exists": true,
+        "linear_definition_hit": true,
+        "route_verified": true,
+        "mmvq_policy_seen": true,
+        "mmvq_policy_unobservable": false,
+        "error": null
+      },
+      "success": true,
+      "log_path": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/tp5-next-20260926/g7-realistic-workload/run-20260927T0330/pilot-n6-vs-n4_logs/server_native-mtp-fused-n4-varargmax_blk1_B2.log",
+      "log_sha256": "7a125ac60f2571123a1755169ae52c8445c118ad9388f99a712a68de7c3f4d7f",
+      "command": [
+        "/var/tmp/tp5-final-build/bin/llama-server",
+        "-m",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+        "-dev",
+        "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+        "--split-mode",
+        "tensor",
+        "--fit",
+        "off",
+        "-ngl",
+        "999",
+        "-c",
+        "256",
+        "-b",
+        "32",
+        "-ub",
+        "32",
+        "--no-mmap",
+        "--no-host",
+        "-np",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8097",
+        "--tp5",
+        "qwen4exp-af",
+        "-md",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-n-max",
+        "4"
+      ],
+      "env_snapshot": {
+        "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+        "HOME": "/home/kunweiz",
+        "USER": "kunweiz",
+        "SHELL": "/bin/bash",
+        "LANG": "en_US.UTF-8",
+        "LD_LIBRARY_PATH": "/var/tmp/tp5-final-build/bin",
+        "RADV_DEBUG": "nobolist",
+        "GGML_TP5_SPEC_VERIFY_ARGMAX": "1"
+      },
+      "warmup": {
+        "success": true,
+        "status_code": 200,
+        "client_wall_sec": 6.3103895540116355,
+        "reported_predicted_tps": 38.257577955725665,
+        "decode_tps": 38.257577955725665,
+        "predicted_ms": 4652.673,
+        "prompt_n": 31,
+        "predicted_n": 178,
+        "completion_tokens": 178,
+        "committed_tps": 28.207450344621275,
+        "finish_reason": "stop",
+        "exact_content_match": true,
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+            }
+          ],
+          "temperature": 0,
+          "seed": 42,
+          "max_tokens": 192,
+          "cache_prompt": false,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        },
+        "raw_response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+              }
+            }
+          ],
+          "created": 1790479125,
+          "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+          "system_fingerprint": "b2129-16e28b8ac",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 178,
+            "prompt_tokens": 31,
+            "total_tokens": 209,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-aPnLfUvk47IUrdPk0K4v6bUDzUoxOXZO",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 31,
+            "prompt_ms": 1654.505,
+            "prompt_per_token_ms": 53.37112903225807,
+            "prompt_per_second": 18.7367218594081,
+            "predicted_n": 178,
+            "predicted_ms": 4652.673,
+            "predicted_per_token_ms": 26.13861235955056,
+            "predicted_per_second": 38.257577955725665,
+            "draft_n": 284,
+            "draft_n_accepted": 109
+          }
+        },
+        "error_message": null
+      }
+    },
+    {
+      "variant": "native-mtp-fused-n6-varargmax",
+      "trial_tag": "blk1_A2",
+      "count_to": 60,
+      "workload": "weightloss",
+      "port": 8097,
+      "is_mtp": true,
+      "requires_linear": true,
+      "metrics": [
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 6.911734288034495,
+          "reported_predicted_tps": 33.48069856537088,
+          "decode_tps": 33.48069856537087,
+          "predicted_ms": 5316.496,
+          "prompt_n": 31,
+          "predicted_n": 178,
+          "completion_tokens": 178,
+          "committed_tps": 25.753304826568826,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+                }
+              }
+            ],
+            "created": 1790479206,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2129-16e28b8ac",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 178,
+              "prompt_tokens": 31,
+              "total_tokens": 209,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-3FlaDuqDbZDakzufE12ctUwhmnenBJTy",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 1063.769,
+              "prompt_per_token_ms": 34.31512903225806,
+              "prompt_per_second": 29.141665154746942,
+              "predicted_n": 178,
+              "predicted_ms": 5316.496,
+              "predicted_per_token_ms": 29.867955056179778,
+              "predicted_per_second": 33.48069856537088,
+              "draft_n": 408,
+              "draft_n_accepted": 114
+            }
+          },
+          "error_message": null
+        },
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 6.367369047016837,
+          "reported_predicted_tps": 33.79875612982216,
+          "decode_tps": 33.79875612982216,
+          "predicted_ms": 5266.466,
+          "prompt_n": 31,
+          "predicted_n": 178,
+          "completion_tokens": 178,
+          "committed_tps": 27.955031141691784,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+                }
+              }
+            ],
+            "created": 1790479213,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2129-16e28b8ac",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 178,
+              "prompt_tokens": 31,
+              "total_tokens": 209,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-NEBjnjfo4gofZgI8ZRtOoJ2jP7gppA3w",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 1097.448,
+              "prompt_per_token_ms": 35.401548387096774,
+              "prompt_per_second": 28.24735203854761,
+              "predicted_n": 178,
+              "predicted_ms": 5266.466,
+              "predicted_per_token_ms": 29.58688764044944,
+              "predicted_per_second": 33.79875612982216,
+              "draft_n": 408,
+              "draft_n_accepted": 114
+            }
+          },
+          "error_message": null
+        }
+      ],
+      "mapped_dso_hashes": {
+        "/home/kunweiz/.cache/radv_builtin_shaders/index": "e33aed84c876e17146c31c9e035983814d8f1c8817144ec34630bba6c53991f3",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac",
+        "/var/tmp/tp5-final-build/bin/libggml-base.so.0.18.1": "90bb3fcab6f2ed5e25f59a11b9f6c21bd840bd92a07f1a2289d9adc858d0e179",
+        "/var/tmp/tp5-final-build/bin/libggml-cpu.so.0.18.1": "091f7a79fd59ab01fc3b92e923d11bc3f6c144776bac31e0309fbc14ee195fde",
+        "/var/tmp/tp5-final-build/bin/libggml-vulkan.so.0.18.1": "1fb7aa7399d6f5cb726270eb82cd13f70242b7815f3c951dd2f6870494dbcfb0",
+        "/var/tmp/tp5-final-build/bin/libggml.so.0.18.1": "23893927e0d69732e4e598f6c5ad375e27c4f8d28bb88c88fa3b4a67abffa8df",
+        "/var/tmp/tp5-final-build/bin/libllama-common.so.0.0.2129": "5ff77574026a820ec6519d983a3506870111465cc7ca85abaff46060e85519a2",
+        "/var/tmp/tp5-final-build/bin/libllama-server-impl.so": "0192460708ad665c8a3585bacb8e2c1a60f0d32ee545a00c49b73f701f0847f9",
+        "/var/tmp/tp5-final-build/bin/libllama.so.0.0.2129": "b1fafa7dfd053f2b12d03a52f422a33b764b5efde8a26554c26bb780155035e5",
+        "/var/tmp/tp5-final-build/bin/llama-server": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f"
+      },
+      "gpu_snapshot_before": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17203200,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 1200Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        }
+      ],
+      "gpu_snapshot_after": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 2621005824,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 1565491200,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 1561088000,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2475Mhz *"
+          ],
+          "vram_used": 1568407552,
+          "gpu_busy_percent": 98
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz",
+            "1: 2340Mhz *",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 1561088000,
+          "gpu_busy_percent": 98
+        }
+      ],
+      "log_route_verification": {
+        "log_exists": true,
+        "linear_definition_hit": true,
+        "route_verified": true,
+        "mmvq_policy_seen": true,
+        "mmvq_policy_unobservable": false,
+        "error": null
+      },
+      "success": true,
+      "log_path": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/tp5-next-20260926/g7-realistic-workload/run-20260927T0330/pilot-n6-vs-n4_logs/server_native-mtp-fused-n6-varargmax_blk1_A2.log",
+      "log_sha256": "a43b82196683a2b094b5c2c8ab4b80873cbf1ebcd7825311ad6cb5bf322a8334",
+      "command": [
+        "/var/tmp/tp5-final-build/bin/llama-server",
+        "-m",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+        "-dev",
+        "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+        "--split-mode",
+        "tensor",
+        "--fit",
+        "off",
+        "-ngl",
+        "999",
+        "-c",
+        "256",
+        "-b",
+        "32",
+        "-ub",
+        "32",
+        "--no-mmap",
+        "--no-host",
+        "-np",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8097",
+        "--tp5",
+        "qwen4exp-af",
+        "-md",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-n-max",
+        "6"
+      ],
+      "env_snapshot": {
+        "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+        "HOME": "/home/kunweiz",
+        "USER": "kunweiz",
+        "SHELL": "/bin/bash",
+        "LANG": "en_US.UTF-8",
+        "LD_LIBRARY_PATH": "/var/tmp/tp5-final-build/bin",
+        "RADV_DEBUG": "nobolist",
+        "GGML_TP5_SPEC_VERIFY_ARGMAX": "1"
+      },
+      "warmup": {
+        "success": true,
+        "status_code": 200,
+        "client_wall_sec": 7.206275927950628,
+        "reported_predicted_tps": 31.984164604167212,
+        "decode_tps": 31.984164604167212,
+        "predicted_ms": 5565.254,
+        "prompt_n": 31,
+        "predicted_n": 178,
+        "completion_tokens": 178,
+        "committed_tps": 24.700691699800192,
+        "finish_reason": "stop",
+        "exact_content_match": true,
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "\u8bf7\u7528\u516b\u53e5\u8bdd\u7b80\u8981\u4ecb\u7ecd\u5065\u5eb7\u51cf\u91cd\u539f\u5219\u3001\u6bcf\u5468\u8fd0\u52a8\u5b89\u6392\u3001\u996e\u98df\u5efa\u8bae\u548c\u7761\u7720\u8bef\u533a\u3002"
+            }
+          ],
+          "temperature": 0,
+          "seed": 42,
+          "max_tokens": 192,
+          "cache_prompt": false,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        },
+        "raw_response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "\u5065\u5eb7\u51cf\u91cd\u7684\u6838\u5fc3\u5728\u4e8e\u5236\u9020\u5408\u7406\u7684\u70ed\u91cf\u7f3a\u53e3\uff0c\u800c\u975e\u6781\u7aef\u8282\u98df\u6216\u4f9d\u8d56\u5355\u4e00\u98df\u7269\u3002\n\u5efa\u8bae\u6bcf\u5468\u8fdb\u884c\u81f3\u5c11150\u5206\u949f\u7684\u4e2d\u7b49\u5f3a\u5ea6\u6709\u6c27\u8fd0\u52a8\uff0c\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u6216\u9a91\u884c\u3002\n\u540c\u65f6\uff0c\u6bcf\u5468\u5e94\u5b89\u6392\u4e24\u6b21\u5168\u8eab\u6027\u7684\u529b\u91cf\u8bad\u7ec3\uff0c\u4ee5\u589e\u52a0\u808c\u8089\u91cf\u5e76\u63d0\u5347\u57fa\u7840\u4ee3\u8c22\u7387\u3002\n\u996e\u98df\u65b9\u9762\u9700\u4fdd\u8bc1\u4f18\u8d28\u86cb\u767d\u8d28\u6444\u5165\uff0c\u591a\u5403\u852c\u83dc\u4e0e\u5168\u8c37\u7269\uff0c\u5e76\u4e25\u683c\u63a7\u5236\u6dfb\u52a0\u7cd6\u548c\u7cbe\u5236\u78b3\u6c34\u3002\n\u4fdd\u6301\u5145\u8db3\u7684\u6c34\u5206\u6444\u5165\u6709\u52a9\u4e8e\u63d0\u9ad8\u4ee3\u8c22\u6548\u7387\uff0c\u5e76\u80fd\u5728\u9910\u524d\u9002\u5f53\u589e\u52a0\u9971\u8179\u611f\u3002\n\u5173\u4e8e\u7761\u7720\uff0c\u8bb8\u591a\u4eba\u8bef\u4ee5\u4e3a\u71ac\u591c\u80fd\u6d88\u8017\u66f4\u591a\u70ed\u91cf\uff0c\u5b9e\u5219\u7761\u7720\u4e0d\u8db3\u4f1a\u6270\u4e71\u6fc0\u7d20\u5e73\u8861\uff0c\u53cd\u800c\u4fc3\u8fdb\u8102\u80aa\u5806\u79ef\u3002\n\u53e6\u4e00\u4e2a\u5e38\u89c1\u8bef\u533a\u662f\u8ba4\u4e3a\u5468\u672b\u8865\u89c9\u53ef\u4ee5\u62b5\u6d88\u5de5\u4f5c\u65e5\u7684\u7761\u7720\u503a\uff0c\u4f46\u8fd9\u5f80\u5f80\u65e0\u6cd5\u6062\u590d\u6b63\u5e38\u7684\u4ee3\u8c22\u8282\u5f8b\u3002\n\u53ea\u6709\u5c06\u79d1\u5b66\u8fd0\u52a8\u3001\u5747\u8861\u996e\u98df\u4e0e\u89c4\u5f8b\u4f5c\u606f\u76f8\u7ed3\u5408\uff0c\u624d\u80fd\u5b9e\u73b0\u957f\u671f\u4e14\u7a33\u5b9a\u7684\u5065\u5eb7\u51cf\u91cd\u76ee\u6807\u3002"
+              }
+            }
+          ],
+          "created": 1790479198,
+          "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+          "system_fingerprint": "b2129-16e28b8ac",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 178,
+            "prompt_tokens": 31,
+            "total_tokens": 209,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-Z54zI2JxaWMqIF5s1AhAtc95pJCLbaFc",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 31,
+            "prompt_ms": 1637.522,
+            "prompt_per_token_ms": 52.82329032258064,
+            "prompt_per_second": 18.931043369188323,
+            "predicted_n": 178,
+            "predicted_ms": 5565.254,
+            "predicted_per_token_ms": 31.26547191011236,
+            "predicted_per_second": 31.984164604167212,
+            "draft_n": 408,
+            "draft_n_accepted": 114
+          }
+        },
+        "error_message": null
+      }
+    }
+  ],
+  "paired_samples_a_committed": [
+    26.93952274897258
+  ],
+  "paired_samples_b_committed": [
+    31.70504076428589
+  ],
+  "paired_samples_a_decode": [
+    33.66325817940634
+  ],
+  "paired_samples_b_decode": [
+    41.25108431938431
+  ],
+  "stats_committed_tps": {},
+  "stats_decode_tps": {},
+  "status": "PILOT_COMPLETE_NOT_ACCEPTANCE",
+  "baseline_gpu_identity": [
+    [
+      "card1",
+      "0000:0f:00.0",
+      22355
+    ],
+    [
+      "card2",
+      "0000:09:00.0",
+      22692
+    ],
+    [
+      "card3",
+      "0000:0c:00.0",
+      23029
+    ],
+    [
+      "card4",
+      "0000:06:00.0",
+      23366
+    ],
+    [
+      "card5",
+      "0000:03:00.0",
+      93678
+    ]
+  ]
+}

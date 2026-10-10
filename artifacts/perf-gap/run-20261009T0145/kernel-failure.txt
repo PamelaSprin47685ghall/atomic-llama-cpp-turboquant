@@ -1,0 +1,593 @@
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:0c:00.0: Dumping IP State
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:09:00.0: Dumping IP State
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:06:00.0: Dumping IP State
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:03:00.0: Dumping IP State
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:09:00.0: Dumping IP State Completed
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] AMDGPU device coredump file has been created
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] Check your /sys/class/drm/card2/device/devcoredump/data
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:09:00.0: ring gfx_0.0.0 timeout, signaled seq=2807076, emitted seq=2807077
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:06:00.0: Dumping IP State Completed
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:03:00.0: Dumping IP State Completed
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:09:00.0:  Process llama-server pid 4118924 thread llama-server pid 4118924
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:09:00.0: Starting gfx_0.0.0 ring reset
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] AMDGPU device coredump file has been created
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] Check your /sys/class/drm/card4/device/devcoredump/data
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring gfx_0.0.0 timeout, signaled seq=2807051, emitted seq=2807052
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] AMDGPU device coredump file has been created
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] Check your /sys/class/drm/card5/device/devcoredump/data
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:06:00.0:  Process llama-server pid 4118924 thread llama-server pid 4118924
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:06:00.0: Starting gfx_0.0.0 ring reset
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:03:00.0: ring gfx_0.0.0 timeout, signaled seq=5425023, emitted seq=5425024
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:03:00.0:  Process llama-server pid 4118924 thread llama-server pid 4118924
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:03:00.0: Starting gfx_0.0.0 ring reset
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:09:00.0: Ring gfx_0.0.0 reset succeeded
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] device wedged, but recovered through reset
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:0c:00.0: Dumping IP State Completed
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:06:00.0: Ring gfx_0.0.0 reset succeeded
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] device wedged, but recovered through reset
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] AMDGPU device coredump file has been created
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] Check your /sys/class/drm/card3/device/devcoredump/data
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:0c:00.0: ring gfx_0.0.0 timeout, signaled seq=2807158, emitted seq=2807159
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:03:00.0: Ring gfx_0.0.0 reset succeeded
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:0c:00.0:  Process llama-server pid 4118924 thread llama-server pid 4118924
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:0c:00.0: Starting gfx_0.0.0 ring reset
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:0c:00.0: Ring gfx_0.0.0 reset succeeded
+Oct 09 01:47:43 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] device wedged, but recovered through reset
+Oct 09 01:49:17 e5-2699a kernel: amdgpu 0000:0c:00.0: resetting
+Oct 09 01:49:17 e5-2699a kernel: amdgpu 0000:0c:00.0: reset done
+Oct 09 01:49:17 e5-2699a kernel: amdgpu 0000:0c:00.0: finishing device.
+Oct 09 01:49:17 e5-2699a kernel: amdgpu 0000:0c:00.0:  ttm finalized
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: [1002:73bf] type 00 class 0x030000 PCIe Legacy Endpoint
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: BAR 0 [mem 0x00000000-0x0fffffff 64bit pref]
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: BAR 2 [mem 0x00000000-0x001fffff 64bit pref]
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: BAR 4 [io  0x0000-0x00ff]
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: BAR 5 [mem 0x00000000-0x000fffff]
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: ROM [mem 0x00000000-0x0001ffff pref]
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: Max Payload Size set to 256 (was 128, max 256)
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: PME# supported from D1 D2 D3hot D3cold
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: 63.008 Gb/s available PCIe bandwidth, limited by 8.0 GT/s PCIe x8 link at 0000:00:02.2 (capable of 252.048 Gb/s with 16.0 GT/s PCIe x16 link)
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: Adding to iommu group 61
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: vgaarb: bridge control possible
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: vgaarb: VGA device added: decodes=io+mem,owns=none,locks=none
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.1: [1002:ab28] type 00 class 0x040300 PCIe Legacy Endpoint
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.1: BAR 0 [mem 0x00000000-0x00003fff]
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.1: Max Payload Size set to 256 (was 128, max 256)
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.1: PME# supported from D1 D2 D3hot D3cold
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.1: Adding to iommu group 62
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: BAR 0 [mem 0x381000000000-0x38100fffffff 64bit pref]: assigned
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: BAR 2 [mem 0x381010000000-0x3810101fffff 64bit pref]: assigned
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: BAR 5 [mem 0xfa400000-0xfa4fffff]: assigned
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: ROM [mem 0xfa500000-0xfa51ffff pref]: assigned
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.1: BAR 0 [mem 0xfa520000-0xfa523fff]: assigned
+Oct 09 01:49:20 e5-2699a kernel: pci 0000:0c:00.0: BAR 4 [io  0xb000-0xb0ff]: assigned
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: enabling device (0100 -> 0103)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: initializing kernel modesetting (SIENNA_CICHLID 0x1002:0x73BF 0x1EAE:0x6705 0xC3).
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: register mmio base: 0xFA400000
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: register mmio size: 1048576
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: detected ip block number 0 <common_v1_0_0> (nv_common)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: detected ip block number 1 <gmc_v10_0_0> (gmc_v10_0)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: detected ip block number 2 <ih_v5_0_0> (navi10_ih)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: detected ip block number 3 <psp_v11_0_0> (psp)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: detected ip block number 4 <smu_v11_0_0> (smu)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: detected ip block number 5 <dce_v1_0_0> (dm)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: detected ip block number 6 <gfx_v10_0_0> (gfx_v10_0)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: detected ip block number 7 <sdma_v5_2_0> (sdma_v5_2)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: detected ip block number 8 <vcn_v3_0_0> (vcn_v3_0)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: detected ip block number 9 <jpeg_v3_0_0> (jpeg_v3_0)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: Fetched VBIOS from VFCT
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] ATOM BIOS: 113-3N21XL227W16GD6MS_200801
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: Trusted Memory Zone (TMZ) feature disabled as experimental (default)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: GPU posting now...
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: MEM ECC is not presented.
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: SRAM ECC is not presented.
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: vm size is 262144 GB, 4 levels, block size is 9-bit, fragment size is 9-bit
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: BAR 0 [mem 0x381000000000-0x38100fffffff 64bit pref]: releasing
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: BAR 2 [mem 0x381010000000-0x3810101fffff 64bit pref]: releasing
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0b:00.0: bridge window [mem 0x381000000000-0x3814001fffff 64bit pref]: releasing
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0a:00.0: bridge window [mem 0x381000000000-0x3814001fffff 64bit pref]: releasing
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:00:02.2: bridge window [mem 0x381000000000-0x3814001fffff 64bit pref]: releasing
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:00:02.2: bridge window [mem 0x381000000000-0x3814001fffff 64bit pref]: assigned
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0a:00.0: bridge window [mem 0x381000000000-0x3814001fffff 64bit pref]: assigned
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0b:00.0: bridge window [mem 0x381000000000-0x3814001fffff 64bit pref]: assigned
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: BAR 0 [mem 0x381000000000-0x3813ffffffff 64bit pref]: assigned
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: BAR 2 [mem 0x381400000000-0x3814001fffff 64bit pref]: assigned
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:00:02.2: PCI bridge to [bus 0a-0c]
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:00:02.2:   bridge window [io  0xb000-0xbfff]
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:00:02.2:   bridge window [mem 0xfa400000-0xfa6fffff]
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:00:02.2:   bridge window [mem 0x381000000000-0x3814001fffff 64bit pref]
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0a:00.0: PCI bridge to [bus 0b-0c]
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0a:00.0:   bridge window [io  0xb000-0xbfff]
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0a:00.0:   bridge window [mem 0xfa400000-0xfa5fffff]
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0a:00.0:   bridge window [mem 0x381000000000-0x3814001fffff 64bit pref]
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0b:00.0: PCI bridge to [bus 0c]
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0b:00.0:   bridge window [io  0xb000-0xbfff]
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0b:00.0:   bridge window [mem 0xfa400000-0xfa5fffff]
+Oct 09 01:49:20 e5-2699a kernel: pcieport 0000:0b:00.0:   bridge window [mem 0x381000000000-0x3814001fffff 64bit pref]
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: VRAM: 16368M 0x0000008000000000 - 0x00000083FEFFFFFF (16368M used)
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: GART: 512M 0x0000000000000000 - 0x000000001FFFFFFF
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] Detected VRAM RAM=16368M, BAR=16384M
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] RAM width 256bits GDDR6
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0:  16368M of VRAM memory ready
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0:  62178M of GTT memory ready.
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] GART: num cpu pages 131072, num gpu pages 131072
+Oct 09 01:49:20 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] PCIE GART of 512M enabled (table at 0x00000083FEB00000).
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: STB initialized to 2048 entries
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] Loading DMUB firmware via PSP: version=0x02020021
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [VCN instance 0] Found VCN firmware Version ENC: 1.33 DEC: 4 VEP: 0 Revision: 14
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [VCN instance 1] Found VCN firmware Version ENC: 1.33 DEC: 4 VEP: 0 Revision: 14
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: reserve 0xa00000 from 0x83fd000000 for PSP TMR
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: smu driver if version = 0x00000040, smu fw if version = 0x00000041, smu fw program = 0, version = 0x003a5b00 (58.91.0)
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: use vbios provided pptable
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: SMU is initialized successfully!
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] Display Core v3.2.369 initialized on DCN 3.0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] DP-HDMI FRL PCON supported
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] DMUB hardware initialized: version=0x02020021
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: kiq ring mec 2 pipe 1 q 0
+Oct 09 01:49:22 e5-2699a kernel: kfd kfd: Allocated 3969056 bytes on gart
+Oct 09 01:49:22 e5-2699a kernel: kfd kfd: Total number of KFD nodes to be created: 1
+Oct 09 01:49:22 e5-2699a kernel: amdgpu: Virtual CRAT table created for GPU
+Oct 09 01:49:22 e5-2699a kernel: amdgpu: Topology: Add GPU node [0x1002:0x73bf]
+Oct 09 01:49:22 e5-2699a kernel: kfd kfd: added device 1002:73bf
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: SE 4, SH per SE 2, CU per SH 10, active_cu_number 60
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring gfx_0.1.0 uses VM inv eng 1 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring comp_1.0.0 uses VM inv eng 4 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring comp_1.1.0 uses VM inv eng 5 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring comp_1.2.0 uses VM inv eng 6 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring comp_1.3.0 uses VM inv eng 7 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring comp_1.0.1 uses VM inv eng 8 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring comp_1.1.1 uses VM inv eng 9 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring comp_1.2.1 uses VM inv eng 10 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring comp_1.3.1 uses VM inv eng 11 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring kiq_0.2.1.0 uses VM inv eng 12 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring sdma0 uses VM inv eng 13 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring sdma1 uses VM inv eng 14 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring sdma2 uses VM inv eng 15 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring sdma3 uses VM inv eng 16 on hub 0
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring vcn_dec_0 uses VM inv eng 0 on hub 8
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring vcn_enc_0.0 uses VM inv eng 1 on hub 8
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring vcn_enc_0.1 uses VM inv eng 4 on hub 8
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring vcn_dec_1 uses VM inv eng 5 on hub 8
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring vcn_enc_1.0 uses VM inv eng 6 on hub 8
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring vcn_enc_1.1 uses VM inv eng 7 on hub 8
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: ring jpeg_dec uses VM inv eng 8 on hub 8
+Oct 09 01:49:22 e5-2699a kernel: amdgpu: HMM registered 16368MB device memory
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: runtime pm is manually disabled
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: Runtime PM not available
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] Registered 6 planes with drm panic
+Oct 09 01:49:22 e5-2699a kernel: [drm] Initialized amdgpu 3.64.0 for 0000:0c:00.0 on minor 3
+Oct 09 01:49:22 e5-2699a kernel: amdgpu 0000:0c:00.0: [drm] Cannot find any crtc or sizes
+Oct 09 01:49:22 e5-2699a kernel: pci 0000:0c:00.1: D0 power state depends on 0000:0c:00.0
+Oct 09 01:49:22 e5-2699a kernel: snd_hda_intel 0000:0c:00.1: enabling device (0100 -> 0102)
+Oct 09 01:49:22 e5-2699a kernel: snd_hda_intel 0000:0c:00.1: Force to non-snoop mode
+Oct 09 01:49:22 e5-2699a kernel: snd_hda_intel 0000:0c:00.1: bound 0000:0c:00.0 (ops amdgpu_dm_audio_component_bind_ops [amdgpu])
+Oct 09 01:49:22 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=3 as /devices/pci0000:00/0000:00:02.2/0000:0a:00.0/0000:0b:00.0/0000:0c:00.1/sound/card3/input40
+Oct 09 01:49:22 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=7 as /devices/pci0000:00/0000:00:02.2/0000:0a:00.0/0000:0b:00.0/0000:0c:00.1/sound/card3/input41
+Oct 09 01:49:22 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=8 as /devices/pci0000:00/0000:00:02.2/0000:0a:00.0/0000:0b:00.0/0000:0c:00.1/sound/card3/input42
+Oct 09 01:49:22 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=9 as /devices/pci0000:00/0000:00:02.2/0000:0a:00.0/0000:0b:00.0/0000:0c:00.1/sound/card3/input43
+Oct 09 01:49:22 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=10 as /devices/pci0000:00/0000:00:02.2/0000:0a:00.0/0000:0b:00.0/0000:0c:00.1/sound/card3/input44
+Oct 09 01:49:22 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=11 as /devices/pci0000:00/0000:00:02.2/0000:0a:00.0/0000:0b:00.0/0000:0c:00.1/sound/card3/input45
+Oct 09 01:49:24 e5-2699a kernel: amdgpu 0000:09:00.0: resetting
+Oct 09 01:49:24 e5-2699a kernel: amdgpu 0000:09:00.0: reset done
+Oct 09 01:49:25 e5-2699a kernel: amdgpu 0000:09:00.0: finishing device.
+Oct 09 01:49:25 e5-2699a kernel: amdgpu 0000:09:00.0:  ttm finalized
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: [1002:73bf] type 00 class 0x030000 PCIe Legacy Endpoint
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: BAR 0 [mem 0x00000000-0x0fffffff 64bit pref]
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: BAR 2 [mem 0x00000000-0x001fffff 64bit pref]
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: BAR 4 [io  0x0000-0x00ff]
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: BAR 5 [mem 0x00000000-0x000fffff]
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: ROM [mem 0x00000000-0x0001ffff pref]
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: Max Payload Size set to 256 (was 128, max 256)
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: PME# supported from D1 D2 D3hot D3cold
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: 63.008 Gb/s available PCIe bandwidth, limited by 8.0 GT/s PCIe x8 link at 0000:00:02.0 (capable of 252.048 Gb/s with 16.0 GT/s PCIe x16 link)
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: Adding to iommu group 57
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: vgaarb: bridge control possible
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: vgaarb: VGA device added: decodes=io+mem,owns=none,locks=none
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.1: [1002:ab28] type 00 class 0x040300 PCIe Legacy Endpoint
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.1: BAR 0 [mem 0x00000000-0x00003fff]
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.1: Max Payload Size set to 256 (was 128, max 256)
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.1: PME# supported from D1 D2 D3hot D3cold
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.1: Adding to iommu group 58
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: BAR 0 [mem 0x380800000000-0x38080fffffff 64bit pref]: assigned
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: BAR 2 [mem 0x380810000000-0x3808101fffff 64bit pref]: assigned
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: BAR 5 [mem 0xfa700000-0xfa7fffff]: assigned
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: ROM [mem 0xfa800000-0xfa81ffff pref]: assigned
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.1: BAR 0 [mem 0xfa820000-0xfa823fff]: assigned
+Oct 09 01:49:27 e5-2699a kernel: pci 0000:09:00.0: BAR 4 [io  0xc000-0xc0ff]: assigned
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: enabling device (0100 -> 0103)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: initializing kernel modesetting (SIENNA_CICHLID 0x1002:0x73BF 0x1EAE:0x6705 0xC3).
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: register mmio base: 0xFA700000
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: register mmio size: 1048576
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: detected ip block number 0 <common_v1_0_0> (nv_common)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: detected ip block number 1 <gmc_v10_0_0> (gmc_v10_0)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: detected ip block number 2 <ih_v5_0_0> (navi10_ih)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: detected ip block number 3 <psp_v11_0_0> (psp)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: detected ip block number 4 <smu_v11_0_0> (smu)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: detected ip block number 5 <dce_v1_0_0> (dm)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: detected ip block number 6 <gfx_v10_0_0> (gfx_v10_0)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: detected ip block number 7 <sdma_v5_2_0> (sdma_v5_2)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: detected ip block number 8 <vcn_v3_0_0> (vcn_v3_0)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: detected ip block number 9 <jpeg_v3_0_0> (jpeg_v3_0)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: Fetched VBIOS from VFCT
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] ATOM BIOS: 113-1MS21XL203W_210810
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: Trusted Memory Zone (TMZ) feature disabled as experimental (default)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: GPU posting now...
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: MEM ECC is not presented.
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: SRAM ECC is not presented.
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: vm size is 262144 GB, 4 levels, block size is 9-bit, fragment size is 9-bit
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: BAR 0 [mem 0x380800000000-0x38080fffffff 64bit pref]: releasing
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: BAR 2 [mem 0x380810000000-0x3808101fffff 64bit pref]: releasing
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:08:00.0: bridge window [mem 0x380800000000-0x380c001fffff 64bit pref]: releasing
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:07:00.0: bridge window [mem 0x380800000000-0x380c001fffff 64bit pref]: releasing
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:00:02.0: bridge window [mem 0x380800000000-0x380c001fffff 64bit pref]: releasing
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:00:02.0: bridge window [mem 0x380800000000-0x380c001fffff 64bit pref]: assigned
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:07:00.0: bridge window [mem 0x380800000000-0x380c001fffff 64bit pref]: assigned
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:08:00.0: bridge window [mem 0x380800000000-0x380c001fffff 64bit pref]: assigned
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: BAR 0 [mem 0x380800000000-0x380bffffffff 64bit pref]: assigned
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: BAR 2 [mem 0x380c00000000-0x380c001fffff 64bit pref]: assigned
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:00:02.0: PCI bridge to [bus 07-09]
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:00:02.0:   bridge window [io  0xc000-0xcfff]
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:00:02.0:   bridge window [mem 0xfa700000-0xfa9fffff]
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:00:02.0:   bridge window [mem 0x380800000000-0x380c001fffff 64bit pref]
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:07:00.0: PCI bridge to [bus 08-09]
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:07:00.0:   bridge window [io  0xc000-0xcfff]
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:07:00.0:   bridge window [mem 0xfa700000-0xfa8fffff]
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:07:00.0:   bridge window [mem 0x380800000000-0x380c001fffff 64bit pref]
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:08:00.0: PCI bridge to [bus 09]
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:08:00.0:   bridge window [io  0xc000-0xcfff]
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:08:00.0:   bridge window [mem 0xfa700000-0xfa8fffff]
+Oct 09 01:49:27 e5-2699a kernel: pcieport 0000:08:00.0:   bridge window [mem 0x380800000000-0x380c001fffff 64bit pref]
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: VRAM: 16368M 0x0000008000000000 - 0x00000083FEFFFFFF (16368M used)
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: GART: 512M 0x0000000000000000 - 0x000000001FFFFFFF
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] Detected VRAM RAM=16368M, BAR=16384M
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] RAM width 256bits GDDR6
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0:  16368M of VRAM memory ready
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0:  62178M of GTT memory ready.
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] GART: num cpu pages 131072, num gpu pages 131072
+Oct 09 01:49:27 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] PCIE GART of 512M enabled (table at 0x00000083FEB00000).
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: STB initialized to 2048 entries
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] Loading DMUB firmware via PSP: version=0x02020021
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [VCN instance 0] Found VCN firmware Version ENC: 1.33 DEC: 4 VEP: 0 Revision: 14
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [VCN instance 1] Found VCN firmware Version ENC: 1.33 DEC: 4 VEP: 0 Revision: 14
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: reserve 0xa00000 from 0x83fd000000 for PSP TMR
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: smu driver if version = 0x00000040, smu fw if version = 0x00000041, smu fw program = 0, version = 0x003a5b00 (58.91.0)
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: use vbios provided pptable
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: SMU is initialized successfully!
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] Display Core v3.2.369 initialized on DCN 3.0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] DP-HDMI FRL PCON supported
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] DMUB hardware initialized: version=0x02020021
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: kiq ring mec 2 pipe 1 q 0
+Oct 09 01:49:29 e5-2699a kernel: kfd kfd: Allocated 3969056 bytes on gart
+Oct 09 01:49:29 e5-2699a kernel: kfd kfd: Total number of KFD nodes to be created: 1
+Oct 09 01:49:29 e5-2699a kernel: amdgpu: Virtual CRAT table created for GPU
+Oct 09 01:49:29 e5-2699a kernel: amdgpu: Topology: Add GPU node [0x1002:0x73bf]
+Oct 09 01:49:29 e5-2699a kernel: kfd kfd: added device 1002:73bf
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: SE 4, SH per SE 2, CU per SH 10, active_cu_number 60
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring gfx_0.1.0 uses VM inv eng 1 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring comp_1.0.0 uses VM inv eng 4 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring comp_1.1.0 uses VM inv eng 5 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring comp_1.2.0 uses VM inv eng 6 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring comp_1.3.0 uses VM inv eng 7 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring comp_1.0.1 uses VM inv eng 8 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring comp_1.1.1 uses VM inv eng 9 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring comp_1.2.1 uses VM inv eng 10 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring comp_1.3.1 uses VM inv eng 11 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring kiq_0.2.1.0 uses VM inv eng 12 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring sdma0 uses VM inv eng 13 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring sdma1 uses VM inv eng 14 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring sdma2 uses VM inv eng 15 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring sdma3 uses VM inv eng 16 on hub 0
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring vcn_dec_0 uses VM inv eng 0 on hub 8
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring vcn_enc_0.0 uses VM inv eng 1 on hub 8
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring vcn_enc_0.1 uses VM inv eng 4 on hub 8
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring vcn_dec_1 uses VM inv eng 5 on hub 8
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring vcn_enc_1.0 uses VM inv eng 6 on hub 8
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring vcn_enc_1.1 uses VM inv eng 7 on hub 8
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: ring jpeg_dec uses VM inv eng 8 on hub 8
+Oct 09 01:49:29 e5-2699a kernel: amdgpu: HMM registered 16368MB device memory
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: runtime pm is manually disabled
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: Runtime PM not available
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] Registered 6 planes with drm panic
+Oct 09 01:49:29 e5-2699a kernel: [drm] Initialized amdgpu 3.64.0 for 0000:09:00.0 on minor 2
+Oct 09 01:49:29 e5-2699a kernel: amdgpu 0000:09:00.0: [drm] Cannot find any crtc or sizes
+Oct 09 01:49:29 e5-2699a kernel: pci 0000:09:00.1: D0 power state depends on 0000:09:00.0
+Oct 09 01:49:29 e5-2699a kernel: snd_hda_intel 0000:09:00.1: enabling device (0100 -> 0102)
+Oct 09 01:49:29 e5-2699a kernel: snd_hda_intel 0000:09:00.1: Force to non-snoop mode
+Oct 09 01:49:29 e5-2699a kernel: snd_hda_intel 0000:09:00.1: bound 0000:09:00.0 (ops amdgpu_dm_audio_component_bind_ops [amdgpu])
+Oct 09 01:49:29 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=3 as /devices/pci0000:00/0000:00:02.0/0000:07:00.0/0000:08:00.0/0000:09:00.1/sound/card2/input46
+Oct 09 01:49:29 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=7 as /devices/pci0000:00/0000:00:02.0/0000:07:00.0/0000:08:00.0/0000:09:00.1/sound/card2/input47
+Oct 09 01:49:29 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=8 as /devices/pci0000:00/0000:00:02.0/0000:07:00.0/0000:08:00.0/0000:09:00.1/sound/card2/input48
+Oct 09 01:49:29 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=9 as /devices/pci0000:00/0000:00:02.0/0000:07:00.0/0000:08:00.0/0000:09:00.1/sound/card2/input49
+Oct 09 01:49:29 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=10 as /devices/pci0000:00/0000:00:02.0/0000:07:00.0/0000:08:00.0/0000:09:00.1/sound/card2/input50
+Oct 09 01:49:29 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=11 as /devices/pci0000:00/0000:00:02.0/0000:07:00.0/0000:08:00.0/0000:09:00.1/sound/card2/input51
+Oct 09 01:49:32 e5-2699a kernel: amdgpu 0000:03:00.0: resetting
+Oct 09 01:49:32 e5-2699a kernel: amdgpu 0000:03:00.0: reset done
+Oct 09 01:49:32 e5-2699a kernel: amdgpu 0000:03:00.0: finishing device.
+Oct 09 01:49:32 e5-2699a kernel: amdgpu 0000:03:00.0:  ttm finalized
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: [1002:73bf] type 00 class 0x030000 PCIe Legacy Endpoint
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: BAR 0 [mem 0x00000000-0x0fffffff 64bit pref]
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: BAR 2 [mem 0x00000000-0x001fffff 64bit pref]
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: BAR 4 [io  0x0000-0x00ff]
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: BAR 5 [mem 0x00000000-0x000fffff]
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: ROM [mem 0x00000000-0x0001ffff pref]
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: Max Payload Size set to 256 (was 128, max 256)
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: PME# supported from D1 D2 D3hot D3cold
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: 63.008 Gb/s available PCIe bandwidth, limited by 8.0 GT/s PCIe x8 link at 0000:00:03.2 (capable of 252.048 Gb/s with 16.0 GT/s PCIe x16 link)
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: Adding to iommu group 69
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: vgaarb: bridge control possible
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: vgaarb: VGA device added: decodes=io+mem,owns=none,locks=none
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.1: [1002:ab28] type 00 class 0x040300 PCIe Legacy Endpoint
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.1: BAR 0 [mem 0x00000000-0x00003fff]
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.1: Max Payload Size set to 256 (was 128, max 256)
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.1: PME# supported from D1 D2 D3hot D3cold
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.1: Adding to iommu group 70
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: BAR 0 [mem 0x382000000000-0x38200fffffff 64bit pref]: assigned
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: BAR 2 [mem 0x382010000000-0x3820101fffff 64bit pref]: assigned
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: BAR 5 [mem 0xfad00000-0xfadfffff]: assigned
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: ROM [mem 0xfae00000-0xfae1ffff pref]: assigned
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.1: BAR 0 [mem 0xfae20000-0xfae23fff]: assigned
+Oct 09 01:49:34 e5-2699a kernel: pci 0000:03:00.0: BAR 4 [io  0xe000-0xe0ff]: assigned
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: enabling device (0100 -> 0103)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: initializing kernel modesetting (SIENNA_CICHLID 0x1002:0x73BF 0x148C:0x2407 0xC3).
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: register mmio base: 0xFAD00000
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: register mmio size: 1048576
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: detected ip block number 0 <common_v1_0_0> (nv_common)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: detected ip block number 1 <gmc_v10_0_0> (gmc_v10_0)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: detected ip block number 2 <ih_v5_0_0> (navi10_ih)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: detected ip block number 3 <psp_v11_0_0> (psp)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: detected ip block number 4 <smu_v11_0_0> (smu)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: detected ip block number 5 <dce_v1_0_0> (dm)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: detected ip block number 6 <gfx_v10_0_0> (gfx_v10_0)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: detected ip block number 7 <sdma_v5_2_0> (sdma_v5_2)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: detected ip block number 8 <vcn_v3_0_0> (vcn_v3_0)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: detected ip block number 9 <jpeg_v3_0_0> (jpeg_v3_0)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: Fetched VBIOS from VFCT
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] ATOM BIOS: 113-D4140EXL-XL
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: Trusted Memory Zone (TMZ) feature disabled as experimental (default)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: GPU posting now...
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: MEM ECC is not presented.
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: SRAM ECC is not presented.
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: vm size is 262144 GB, 4 levels, block size is 9-bit, fragment size is 9-bit
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: BAR 0 [mem 0x382000000000-0x38200fffffff 64bit pref]: releasing
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: BAR 2 [mem 0x382010000000-0x3820101fffff 64bit pref]: releasing
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:02:00.0: bridge window [mem 0x382000000000-0x3824001fffff 64bit pref]: releasing
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:01:00.0: bridge window [mem 0x382000000000-0x3824001fffff 64bit pref]: releasing
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:00:03.2: bridge window [mem 0x382000000000-0x3824001fffff 64bit pref]: releasing
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:00:03.2: bridge window [mem 0x382000000000-0x3824001fffff 64bit pref]: assigned
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:01:00.0: bridge window [mem 0x382000000000-0x3824001fffff 64bit pref]: assigned
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:02:00.0: bridge window [mem 0x382000000000-0x3824001fffff 64bit pref]: assigned
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: BAR 0 [mem 0x382000000000-0x3823ffffffff 64bit pref]: assigned
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: BAR 2 [mem 0x382400000000-0x3824001fffff 64bit pref]: assigned
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:00:03.2: PCI bridge to [bus 01-03]
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:00:03.2:   bridge window [io  0xe000-0xefff]
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:00:03.2:   bridge window [mem 0xfad00000-0xfaffffff]
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:00:03.2:   bridge window [mem 0x382000000000-0x3824001fffff 64bit pref]
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:01:00.0: PCI bridge to [bus 02-03]
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:01:00.0:   bridge window [io  0xe000-0xefff]
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:01:00.0:   bridge window [mem 0xfad00000-0xfaefffff]
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:01:00.0:   bridge window [mem 0x382000000000-0x3824001fffff 64bit pref]
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:02:00.0: PCI bridge to [bus 03]
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:02:00.0:   bridge window [io  0xe000-0xefff]
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:02:00.0:   bridge window [mem 0xfad00000-0xfaefffff]
+Oct 09 01:49:34 e5-2699a kernel: pcieport 0000:02:00.0:   bridge window [mem 0x382000000000-0x3824001fffff 64bit pref]
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: VRAM: 16368M 0x0000008000000000 - 0x00000083FEFFFFFF (16368M used)
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: GART: 512M 0x0000000000000000 - 0x000000001FFFFFFF
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] Detected VRAM RAM=16368M, BAR=16384M
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] RAM width 256bits GDDR6
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0:  16368M of VRAM memory ready
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0:  62178M of GTT memory ready.
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] GART: num cpu pages 131072, num gpu pages 131072
+Oct 09 01:49:34 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] PCIE GART of 512M enabled (table at 0x00000083FEB00000).
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: STB initialized to 2048 entries
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] Loading DMUB firmware via PSP: version=0x02020021
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [VCN instance 0] Found VCN firmware Version ENC: 1.33 DEC: 4 VEP: 0 Revision: 14
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [VCN instance 1] Found VCN firmware Version ENC: 1.33 DEC: 4 VEP: 0 Revision: 14
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: reserve 0xa00000 from 0x83fd000000 for PSP TMR
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: smu driver if version = 0x00000040, smu fw if version = 0x00000041, smu fw program = 0, version = 0x003a5b00 (58.91.0)
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: use vbios provided pptable
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: SMU is initialized successfully!
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] Display Core v3.2.369 initialized on DCN 3.0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] DP-HDMI FRL PCON supported
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] DMUB hardware initialized: version=0x02020021
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: kiq ring mec 2 pipe 1 q 0
+Oct 09 01:49:36 e5-2699a kernel: kfd kfd: Allocated 3969056 bytes on gart
+Oct 09 01:49:36 e5-2699a kernel: kfd kfd: Total number of KFD nodes to be created: 1
+Oct 09 01:49:36 e5-2699a kernel: amdgpu: Virtual CRAT table created for GPU
+Oct 09 01:49:36 e5-2699a kernel: amdgpu: Topology: Add GPU node [0x1002:0x73bf]
+Oct 09 01:49:36 e5-2699a kernel: kfd kfd: added device 1002:73bf
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: SE 4, SH per SE 2, CU per SH 10, active_cu_number 60
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring gfx_0.1.0 uses VM inv eng 1 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring comp_1.0.0 uses VM inv eng 4 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring comp_1.1.0 uses VM inv eng 5 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring comp_1.2.0 uses VM inv eng 6 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring comp_1.3.0 uses VM inv eng 7 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring comp_1.0.1 uses VM inv eng 8 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring comp_1.1.1 uses VM inv eng 9 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring comp_1.2.1 uses VM inv eng 10 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring comp_1.3.1 uses VM inv eng 11 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring kiq_0.2.1.0 uses VM inv eng 12 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring sdma0 uses VM inv eng 13 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 14 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring sdma2 uses VM inv eng 15 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring sdma3 uses VM inv eng 16 on hub 0
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring vcn_dec_0 uses VM inv eng 0 on hub 8
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring vcn_enc_0.0 uses VM inv eng 1 on hub 8
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring vcn_enc_0.1 uses VM inv eng 4 on hub 8
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring vcn_dec_1 uses VM inv eng 5 on hub 8
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring vcn_enc_1.0 uses VM inv eng 6 on hub 8
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring vcn_enc_1.1 uses VM inv eng 7 on hub 8
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 8 on hub 8
+Oct 09 01:49:36 e5-2699a kernel: amdgpu: HMM registered 16368MB device memory
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: runtime pm is manually disabled
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: Runtime PM not available
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] Registered 6 planes with drm panic
+Oct 09 01:49:36 e5-2699a kernel: [drm] Initialized amdgpu 3.64.0 for 0000:03:00.0 on minor 5
+Oct 09 01:49:36 e5-2699a kernel: amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+Oct 09 01:49:36 e5-2699a kernel: pci 0000:03:00.1: D0 power state depends on 0000:03:00.0
+Oct 09 01:49:36 e5-2699a kernel: snd_hda_intel 0000:03:00.1: enabling device (0100 -> 0102)
+Oct 09 01:49:36 e5-2699a kernel: snd_hda_intel 0000:03:00.1: Force to non-snoop mode
+Oct 09 01:49:36 e5-2699a kernel: snd_hda_intel 0000:03:00.1: bound 0000:03:00.0 (ops amdgpu_dm_audio_component_bind_ops [amdgpu])
+Oct 09 01:49:36 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=3 as /devices/pci0000:00/0000:00:03.2/0000:01:00.0/0000:02:00.0/0000:03:00.1/sound/card5/input52
+Oct 09 01:49:36 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=7 as /devices/pci0000:00/0000:00:03.2/0000:01:00.0/0000:02:00.0/0000:03:00.1/sound/card5/input53
+Oct 09 01:49:36 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=8 as /devices/pci0000:00/0000:00:03.2/0000:01:00.0/0000:02:00.0/0000:03:00.1/sound/card5/input54
+Oct 09 01:49:36 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=9 as /devices/pci0000:00/0000:00:03.2/0000:01:00.0/0000:02:00.0/0000:03:00.1/sound/card5/input55
+Oct 09 01:49:36 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=10 as /devices/pci0000:00/0000:00:03.2/0000:01:00.0/0000:02:00.0/0000:03:00.1/sound/card5/input56
+Oct 09 01:49:36 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=11 as /devices/pci0000:00/0000:00:03.2/0000:01:00.0/0000:02:00.0/0000:03:00.1/sound/card5/input57
+Oct 09 01:49:39 e5-2699a kernel: amdgpu 0000:06:00.0: resetting
+Oct 09 01:49:39 e5-2699a kernel: amdgpu 0000:06:00.0: reset done
+Oct 09 01:49:39 e5-2699a kernel: amdgpu 0000:06:00.0: finishing device.
+Oct 09 01:49:39 e5-2699a kernel: amdgpu 0000:06:00.0:  ttm finalized
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: [1002:73bf] type 00 class 0x030000 PCIe Legacy Endpoint
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: BAR 0 [mem 0x00000000-0x0fffffff 64bit pref]
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: BAR 2 [mem 0x00000000-0x001fffff 64bit pref]
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: BAR 4 [io  0x0000-0x00ff]
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: BAR 5 [mem 0x00000000-0x000fffff]
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: ROM [mem 0x00000000-0x0001ffff pref]
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: Max Payload Size set to 256 (was 128, max 256)
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: PME# supported from D1 D2 D3hot D3cold
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: 63.008 Gb/s available PCIe bandwidth, limited by 8.0 GT/s PCIe x8 link at 0000:00:03.0 (capable of 252.048 Gb/s with 16.0 GT/s PCIe x16 link)
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: Adding to iommu group 65
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: vgaarb: bridge control possible
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: vgaarb: VGA device added: decodes=io+mem,owns=none,locks=none
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.1: [1002:ab28] type 00 class 0x040300 PCIe Legacy Endpoint
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.1: BAR 0 [mem 0x00000000-0x00003fff]
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.1: Max Payload Size set to 256 (was 128, max 256)
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.1: PME# supported from D1 D2 D3hot D3cold
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.1: Adding to iommu group 66
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: BAR 0 [mem 0x381800000000-0x38180fffffff 64bit pref]: assigned
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: BAR 2 [mem 0x381810000000-0x3818101fffff 64bit pref]: assigned
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: BAR 5 [mem 0xfaa00000-0xfaafffff]: assigned
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: ROM [mem 0xfab00000-0xfab1ffff pref]: assigned
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.1: BAR 0 [mem 0xfab20000-0xfab23fff]: assigned
+Oct 09 01:49:41 e5-2699a kernel: pci 0000:06:00.0: BAR 4 [io  0xd000-0xd0ff]: assigned
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: enabling device (0100 -> 0103)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: initializing kernel modesetting (SIENNA_CICHLID 0x1002:0x73BF 0x1EAE:0x6705 0xC3).
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: register mmio base: 0xFAA00000
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: register mmio size: 1048576
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: detected ip block number 0 <common_v1_0_0> (nv_common)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: detected ip block number 1 <gmc_v10_0_0> (gmc_v10_0)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: detected ip block number 2 <ih_v5_0_0> (navi10_ih)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: detected ip block number 3 <psp_v11_0_0> (psp)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: detected ip block number 4 <smu_v11_0_0> (smu)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: detected ip block number 5 <dce_v1_0_0> (dm)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: detected ip block number 6 <gfx_v10_0_0> (gfx_v10_0)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: detected ip block number 7 <sdma_v5_2_0> (sdma_v5_2)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: detected ip block number 8 <vcn_v3_0_0> (vcn_v3_0)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: detected ip block number 9 <jpeg_v3_0_0> (jpeg_v3_0)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: Fetched VBIOS from VFCT
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] ATOM BIOS: 113-1MS21XL203W_210810
+Oct 09 01:49:41 e5-2699a kernel: workqueue: local_pci_probe_callback hogged CPU for >10000us 11 times, consider switching to WQ_UNBOUND
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: Trusted Memory Zone (TMZ) feature disabled as experimental (default)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: GPU posting now...
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: MEM ECC is not presented.
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: SRAM ECC is not presented.
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: vm size is 262144 GB, 4 levels, block size is 9-bit, fragment size is 9-bit
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: BAR 0 [mem 0x381800000000-0x38180fffffff 64bit pref]: releasing
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: BAR 2 [mem 0x381810000000-0x3818101fffff 64bit pref]: releasing
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:05:00.0: bridge window [mem 0x381800000000-0x381c001fffff 64bit pref]: releasing
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:04:00.0: bridge window [mem 0x381800000000-0x381c001fffff 64bit pref]: releasing
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:00:03.0: bridge window [mem 0x381800000000-0x381c001fffff 64bit pref]: releasing
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:00:03.0: bridge window [mem 0x381800000000-0x381c001fffff 64bit pref]: assigned
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:04:00.0: bridge window [mem 0x381800000000-0x381c001fffff 64bit pref]: assigned
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:05:00.0: bridge window [mem 0x381800000000-0x381c001fffff 64bit pref]: assigned
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: BAR 0 [mem 0x381800000000-0x381bffffffff 64bit pref]: assigned
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: BAR 2 [mem 0x381c00000000-0x381c001fffff 64bit pref]: assigned
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:00:03.0: PCI bridge to [bus 04-06]
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:00:03.0:   bridge window [io  0xd000-0xdfff]
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:00:03.0:   bridge window [mem 0xfaa00000-0xfacfffff]
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:00:03.0:   bridge window [mem 0x381800000000-0x381c001fffff 64bit pref]
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:04:00.0: PCI bridge to [bus 05-06]
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:04:00.0:   bridge window [io  0xd000-0xdfff]
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:04:00.0:   bridge window [mem 0xfaa00000-0xfabfffff]
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:04:00.0:   bridge window [mem 0x381800000000-0x381c001fffff 64bit pref]
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:05:00.0: PCI bridge to [bus 06]
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:05:00.0:   bridge window [io  0xd000-0xdfff]
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:05:00.0:   bridge window [mem 0xfaa00000-0xfabfffff]
+Oct 09 01:49:41 e5-2699a kernel: pcieport 0000:05:00.0:   bridge window [mem 0x381800000000-0x381c001fffff 64bit pref]
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: VRAM: 16368M 0x0000008000000000 - 0x00000083FEFFFFFF (16368M used)
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: GART: 512M 0x0000000000000000 - 0x000000001FFFFFFF
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] Detected VRAM RAM=16368M, BAR=16384M
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] RAM width 256bits GDDR6
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0:  16368M of VRAM memory ready
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0:  62178M of GTT memory ready.
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] GART: num cpu pages 131072, num gpu pages 131072
+Oct 09 01:49:41 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] PCIE GART of 512M enabled (table at 0x00000083FEB00000).
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: STB initialized to 2048 entries
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] Loading DMUB firmware via PSP: version=0x02020021
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] use_doorbell being set to: [true]
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [VCN instance 0] Found VCN firmware Version ENC: 1.33 DEC: 4 VEP: 0 Revision: 14
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [VCN instance 1] Found VCN firmware Version ENC: 1.33 DEC: 4 VEP: 0 Revision: 14
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: reserve 0xa00000 from 0x83fd000000 for PSP TMR
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: smu driver if version = 0x00000040, smu fw if version = 0x00000041, smu fw program = 0, version = 0x003a5b00 (58.91.0)
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: use vbios provided pptable
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: SMU is initialized successfully!
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] Display Core v3.2.369 initialized on DCN 3.0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] DP-HDMI FRL PCON supported
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] DMUB hardware initialized: version=0x02020021
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: kiq ring mec 2 pipe 1 q 0
+Oct 09 01:49:43 e5-2699a kernel: kfd kfd: Allocated 3969056 bytes on gart
+Oct 09 01:49:43 e5-2699a kernel: kfd kfd: Total number of KFD nodes to be created: 1
+Oct 09 01:49:43 e5-2699a kernel: amdgpu: Virtual CRAT table created for GPU
+Oct 09 01:49:43 e5-2699a kernel: amdgpu: Topology: Add GPU node [0x1002:0x73bf]
+Oct 09 01:49:43 e5-2699a kernel: kfd kfd: added device 1002:73bf
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: SE 4, SH per SE 2, CU per SH 10, active_cu_number 60
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring gfx_0.1.0 uses VM inv eng 1 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring comp_1.0.0 uses VM inv eng 4 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring comp_1.1.0 uses VM inv eng 5 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring comp_1.2.0 uses VM inv eng 6 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring comp_1.3.0 uses VM inv eng 7 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring comp_1.0.1 uses VM inv eng 8 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring comp_1.1.1 uses VM inv eng 9 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring comp_1.2.1 uses VM inv eng 10 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring comp_1.3.1 uses VM inv eng 11 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring kiq_0.2.1.0 uses VM inv eng 12 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring sdma0 uses VM inv eng 13 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring sdma1 uses VM inv eng 14 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring sdma2 uses VM inv eng 15 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring sdma3 uses VM inv eng 16 on hub 0
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring vcn_dec_0 uses VM inv eng 0 on hub 8
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring vcn_enc_0.0 uses VM inv eng 1 on hub 8
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring vcn_enc_0.1 uses VM inv eng 4 on hub 8
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring vcn_dec_1 uses VM inv eng 5 on hub 8
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring vcn_enc_1.0 uses VM inv eng 6 on hub 8
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring vcn_enc_1.1 uses VM inv eng 7 on hub 8
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: ring jpeg_dec uses VM inv eng 8 on hub 8
+Oct 09 01:49:43 e5-2699a kernel: amdgpu: HMM registered 16368MB device memory
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: runtime pm is manually disabled
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: Runtime PM not available
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] Registered 6 planes with drm panic
+Oct 09 01:49:43 e5-2699a kernel: [drm] Initialized amdgpu 3.64.0 for 0000:06:00.0 on minor 4
+Oct 09 01:49:43 e5-2699a kernel: amdgpu 0000:06:00.0: [drm] Cannot find any crtc or sizes
+Oct 09 01:49:43 e5-2699a kernel: pci 0000:06:00.1: D0 power state depends on 0000:06:00.0
+Oct 09 01:49:43 e5-2699a kernel: snd_hda_intel 0000:06:00.1: enabling device (0100 -> 0102)
+Oct 09 01:49:43 e5-2699a kernel: snd_hda_intel 0000:06:00.1: Force to non-snoop mode
+Oct 09 01:49:43 e5-2699a kernel: snd_hda_intel 0000:06:00.1: bound 0000:06:00.0 (ops amdgpu_dm_audio_component_bind_ops [amdgpu])
+Oct 09 01:49:43 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=3 as /devices/pci0000:00/0000:00:03.0/0000:04:00.0/0000:05:00.0/0000:06:00.1/sound/card4/input58
+Oct 09 01:49:43 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=7 as /devices/pci0000:00/0000:00:03.0/0000:04:00.0/0000:05:00.0/0000:06:00.1/sound/card4/input59
+Oct 09 01:49:43 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=8 as /devices/pci0000:00/0000:00:03.0/0000:04:00.0/0000:05:00.0/0000:06:00.1/sound/card4/input60
+Oct 09 01:49:43 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=9 as /devices/pci0000:00/0000:00:03.0/0000:04:00.0/0000:05:00.0/0000:06:00.1/sound/card4/input61
+Oct 09 01:49:43 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=10 as /devices/pci0000:00/0000:00:03.0/0000:04:00.0/0000:05:00.0/0000:06:00.1/sound/card4/input62
+Oct 09 01:49:43 e5-2699a kernel: input: HDA ATI HDMI HDMI/DP,pcm=11 as /devices/pci0000:00/0000:00:03.0/0000:04:00.0/0000:05:00.0/0000:06:00.1/sound/card4/input63

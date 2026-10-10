@@ -1,0 +1,8 @@
+{
+  "purpose":"Independent calibration of the ACT_Q8/Q8DOT/UP_Q8DOT/INJECT production SPIR-V, not generic native HC matvec substituted for aggressive.",
+  "cases":["inject local","act local","q local","q system","up local"],
+  "device":"First physical RX6800, no model; exact production shape width2560/streams4/rank320/rows1 and wave32. Ordinary cached VRAM inputs; Q system test uses HOST_VISIBLE|HOST_COHERENT system RAM, not imported-host production allocation.",
+  "method":"Four batches of64 serialized GPU timestamped dispatches, first batch warm; report all192 timed dispatch distribution, no host graph time. Q readiness counters reset outside timestamp interval. Numeric fixtures are exactly representable; every output and Q checksum/epoch/extent checked each batch.",
+  "limits":"Isolated cached resident shader service, not a strict physical time floor. System RAM allocation is not the exact imported-host topology. Protocol wait and multi-device contention excluded. No throughput increase claimed from these diagnostics.",
+  "safety":"Five-card idle gate/exclusive lock, no concurrent compilation or driver changes;3secbounded native fence, stop on failure without replacement."
+}

@@ -1,0 +1,26 @@
+{
+  "utc": "2026-10-10T04:11:27Z",
+  "processes": [
+    {
+      "pid": "383319",
+      "comm": "cmake",
+      "cmd": "cmake --build build-perf-gap --target llama-server -j 12 ",
+      "cwd": "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap",
+      "stat": "383319 (cmake) S 2639231 383319 383319 0 -1 4194304 1339 0 0 0 0 5 0 0 20 0 1 0 25456051 45735936 4623 18446744073709551615 105238378582016 105238390346109 140736147550416 0 0 0 0 16777216 65536 1 0 0 17 5 0 0 0 0 0 105238392281264 105238392423200 105238617374720 140736147554604 140736147554661 140736147554661 140736147558377 0\n"
+    },
+    {
+      "pid": "383321",
+      "comm": "ninja",
+      "cmd": "/usr/bin/ninja -j 12 llama-server ",
+      "cwd": "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap",
+      "stat": "383321 (ninja) S 383319 383319 383319 0 -1 4194304 3145 347053 0 0 2 1 2843 97 20 0 1 0 25456058 17514496 3471 18446744073709551615 97080148340736 97080148604669 140736324713968 0 0 0 0 0 81923 1 0 0 17 5 0 0 0 0 0 97080148664712 97080148668456 97080404078592 140736324723011 140736324723045 140736324723045 140736324726761 0\n"
+    },
+    {
+      "pid": "383356",
+      "comm": "cc1plus",
+      "cmd": "/usr/libexec/gcc/x86_64-linux-gnu/15/cc1plus -quiet -I /home/kunweiz/atomic-llama-cpp-turboquant/ggml/src/ggml-vulkan/.. -I /home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/ggml/src/ggml-vulkan -I /usr/include/libdrm -I /home/kunweiz/atomic-llama-cpp-turboquant/ggml/src/../include -imultiarch x86_64-linux-gnu -MD ggml/src/ggml-vulkan/CMakeFiles/ggml-vulkan.dir/ggml-vulkan.cpp.d -MF ggml/src/ggml-vulkan/CMakeFiles/ggml-vulkan.dir/ggml-vulkan.cpp.o.d -MT ggml/src/ggml-vulkan/CMakeFiles/ggml-vulkan.dir/ggml-vulkan.cpp.o -D_GNU_SOURCE -D GGML_BACKEND_BUILD -D GGML_BACKEND_SHARED -D GGML_SCHED_MAX_COPIES=4 -D GGML_SHARED -D GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT -D GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT -D GGML_VULKAN_COOPMAT_GLSLC_SUPPORT -D GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT -D GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT -D _GNU_SOURCE -D _XOPEN_SOURCE=600 -D ggml_vulkan_EXPORTS -D NDEBUG -isystem /home/kunweiz/deps/prefix/include /home/kunweiz/atomic-llama-cpp-turboquant/ggml/src/ggml-vulkan/ggml-vulkan.cpp -D_FORTIFY_SOURCE=3 -quiet -dumpdir ggml/src/ggml-vulkan/CMakeFiles/ggml-vulkan.dir/ -dumpbase ggml-vulkan.cpp.cpp -dumpbase-ext .cpp -mtune=generic -march=x86-64 -g -O2 -Wmissing-declarations -Wsuggest-attribute=noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Warray-bounds=0 -Wextra-semi -std=gnu++17 -fdiagnostics-color=always -fPIC -fasynchronous-unwind-tables -fstack-protector-strong -Wformat-security -fstack-clash-protection -fcf-protection -fzero-init-padding-bits=all -Wbidi-chars=any -o /tmp/ccruE1m9.s ",
+      "cwd": "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap",
+      "stat": "383356 (cc1plus) R 383355 383340 383319 0 -1 4194304 656522 0 0 0 8474 133 0 0 20 0 1 0 25456168 2529398784 571911 18446744073709551615 7188480 33128413 140728571287744 0 0 0 0 4096 1256 0 0 0 17 22 0 0 0 0 0 43923544 43989376 841785344 140728571291036 140728571292587 140728571292587 140728571297739 0\n"
+    }
+  ]
+}

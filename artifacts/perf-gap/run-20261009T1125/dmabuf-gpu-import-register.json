@@ -1,0 +1,5 @@
+{
+  "narrow_correction": "GPU0 is the only CPU-mapped owner. Imported GPU1..4 bindings need DEVICE_LOCAL|DEVICE_COHERENT but do not need HOST_VISIBLE/HOST_COHERENT, because no CPU access uses those bindings. The original device-coherence requirement remains mandatory on all five GPUs.",
+  "gate": "Log both buffer/import-compatible masks and every eligible actual memory type. If no importedDEVICE_COHERENT type exists, stop without dispatch. Do not substitute ordinary device-local memory.",
+  "scope": "Standalone memory qualification only, not changing production allocation choices or prior failed evidence."
+}

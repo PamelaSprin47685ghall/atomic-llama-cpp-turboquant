@@ -1,0 +1,57 @@
+[
+  {
+    "idx": 0,
+    "phase": "warmup",
+    "n": 360,
+    "predicted_ms": 7467.228,
+    "tps": 48.21066130564113,
+    "wall_ms": 12230.858086,
+    "finish": "stop",
+    "content_sha256": "ce818dda56bb8ab7f7f582ea0d27710ebafcf88746873f1782da55c053e95302",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 110,
+      "prompt_ms": 4759.384,
+      "prompt_per_token_ms": 43.26712727272727,
+      "prompt_per_second": 23.112234692556854,
+      "predicted_n": 360,
+      "predicted_ms": 7467.228,
+      "predicted_per_token_ms": 20.7423,
+      "predicted_per_second": 48.21066130564113
+    },
+    "issues": [],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=3 n_sub=96 uid=36028797018967041",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=96 uid=36028797018967297",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=96 uid=36028797018967553",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=96 uid=36028797018967809",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=96 uid=36028797018968065",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=97 uid=36028797018968321",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=97 uid=36028797018968577",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=10 n_sub=97 uid=36028797018968833"
+    ]
+  },
+  {
+    "idx": 1,
+    "phase": "measured",
+    "n": 360,
+    "predicted_ms": 7032.058,
+    "tps": 51.194116999603814,
+    "wall_ms": 10850.014945,
+    "finish": "stop",
+    "content_sha256": "ce818dda56bb8ab7f7f582ea0d27710ebafcf88746873f1782da55c053e95302",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 110,
+      "prompt_ms": 3153.26,
+      "prompt_per_token_ms": 28.666,
+      "prompt_per_second": 34.884532198423216,
+      "predicted_n": 360,
+      "predicted_ms": 7032.058,
+      "predicted_per_token_ms": 19.533494444444443,
+      "predicted_per_second": 51.194116999603814
+    },
+    "issues": [],
+    "fallback_lines": []
+  }
+]

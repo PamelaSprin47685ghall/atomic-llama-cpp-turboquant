@@ -1,0 +1,649 @@
+{
+  "62e1979e5be6630b3a9060e7e7f1f7a3f0c0f9f73eb089dd135963108139343f": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非盲目节食或追求极速掉秤。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑行，以提升心肺功能。\n同时，每周应安排两次全身性的力量训练，通过增加肌肉量来提高基础代谢率。\n在饮食方面，应优先选择高蛋白、高纤维且低升糖指数的天然食物，确保营养均衡。\n严格控制添加糖、精制碳水化合物以及深加工食品的摄入，避免血糖剧烈波动引发脂肪堆积。\n保持充足的水分摄入不仅能促进新陈代谢，还能有效缓解因口渴产生的假性饥饿感。\n关于睡眠，许多人误以为熬夜能消耗更多热量，实则睡眠不足会扰乱激素分泌，显著增加食欲并降低代谢效率。\n因此，保证每晚7至9小时的高质量睡眠，是维持内分泌平衡、实现长期健康减重不可或缺的一环。",
+    "occurrences": [
+      "apex-latebind-hit/request-0.json",
+      "apex-screen-h1-disabled-aggressive/request-0.json",
+      "apex-threads4/request-0.json",
+      "apex-threads8/request-0.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      186
+    ]
+  },
+  "4f5e45bbf1acabd0441f5c1f61f32ec05eea5604d3f18b26ae8c8027888fdd16": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非极端节食或快速脱水。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑行。\n同时，每周应安排两次全身性的力量训练，以增加肌肉量并提升基础代谢率。\n饮食方面需保证优质蛋白质摄入，多吃蔬菜并控制精制碳水与添加糖的比例。\n保持规律的一日三餐，避免暴饮暴食，并养成细嚼慢咽的良好进食习惯。\n充足的睡眠对调节食欲激素至关重要，长期熬夜会显著增加肥胖风险。\n切勿轻信“睡前运动助眠”或“白天补觉可抵消熬夜危害”等常见误区。\n坚持科学的生活方式，循序渐进地调整习惯，才能实现长期稳定的体重管理。",
+    "occurrences": [
+      "apex-latebind-hit/request-1.json",
+      "apex-latebind-hit/request-2.json",
+      "apex-latebind-hit/request-3.json",
+      "apex-screen-h1-disabled-aggressive/request-1.json",
+      "apex-screen-h1-disabled-aggressive/request-2.json",
+      "apex-screen-h1-disabled-aggressive/request-3.json",
+      "apex-screen-h1-disabled-aggressive/request-4.json",
+      "apex-threads4/request-1.json",
+      "apex-threads4/request-2.json",
+      "apex-threads4/request-3.json",
+      "apex-threads4/request-4.json",
+      "apex-threads8/request-1.json",
+      "apex-threads8/request-2.json",
+      "apex-threads8/request-3.json",
+      "apex-threads8/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      158
+    ]
+  },
+  "f36273558a99e1a05e192a6b88524778859f54b3a4ddd6a912398caf1e341c4d": {
+    "text": "哈希表通过键值对存储数据，利用哈希函数将键映射到特定位置，从而实现平均常数时间复杂度的快速查找。\n\n数组则通过连续的内存空间存储元素，仅支持通过整数索引进行直接访问，无法直接根据非整数键值进行检索。\n\n因此，哈希表更适合需要基于任意键快速检索的场景，而数组更适合需要按顺序遍历或基于位置索引访问数据的场景。",
+    "occurrences": [
+      "apex-latebind-hit/request-4.json",
+      "apex-screen-h1-disabled-aggressive/request-5.json",
+      "apex-threads4/request-5.json",
+      "apex-threads8/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      87
+    ]
+  },
+  "8210adcca8a332daa1cb4c9a099576580110a54e142d94a445d401d97d4a58b3": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非极端节食或快速脱水。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑行。\n同时，每周应安排两次全身性的力量训练，以增加肌肉量并提升基础代谢率。\n饮食方面需保证优质蛋白质摄入，多吃蔬菜与全谷物，严格限制添加糖和精制碳水。\n保持充足的水分摄入有助于提高代谢效率，并能在餐前适当增加饱腹感。\n许多人误以为熬夜能消耗更多热量，实则睡眠不足会扰乱激素，导致食欲失控。\n另一个常见误区是认为运动后可以无节制进食，这会轻易抵消掉辛苦燃烧的热量。\n只有将科学运动、均衡饮食与规律作息相结合，才能实现长期稳定的健康减重。",
+    "occurrences": [
+      "apex-screen-h0-auto-aggressive/request-0.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      165
+    ]
+  },
+  "9e666d37dd45160b6d8619e23ca010d514d8b7989f131479b7613dfd0753b277": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非极端节食或快速脱水。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑行。\n同时，每周应安排两次全身性的力量训练，以增加肌肉量并提升基础代谢率。\n饮食方面需保证优质蛋白质摄入，多吃蔬菜和高纤维食物，严格控制添加糖与精制碳水。\n保持充足的水分摄入有助于提高代谢效率，并能在餐前适当增加饱腹感。\n关于睡眠，许多人误以为熬夜能消耗更多热量，实则睡眠不足会扰乱激素平衡，反而促进脂肪堆积。\n另一个常见误区是认为周末补觉可以抵消工作日的睡眠债，但这往往无法恢复正常的代谢节律。\n只有将科学运动、均衡饮食与规律作息相结合，才能实现长期且稳定的健康减重目标。",
+    "occurrences": [
+      "apex-screen-h0-auto-aggressive/request-1.json",
+      "apex-screen-h0-auto-aggressive/request-2.json",
+      "apex-screen-h0-auto-aggressive/request-3.json",
+      "apex-screen-h0-auto-aggressive/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      176
+    ]
+  },
+  "0e1407a0a75fde8ad0bd427a5218e6ecb86975691209564031fc1d5bd095d8a3": {
+    "text": "哈希表通过哈希函数将键映射到存储位置，支持基于键的快速查找，而数组则通过连续的内存索引直接访问元素。\n\n哈希表通常不保证元素的存储顺序，且允许使用任意类型的键，而数组要求索引为整数且元素在内存中紧密排列。\n\n在性能上，哈希表在平均情况下提供常数时间的查找、插入和删除操作，而数组在已知索引时访问极快，但在中间位置插入或删除元素时效率较低。",
+    "occurrences": [
+      "apex-screen-h0-auto-aggressive/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      101
+    ]
+  },
+  "fb84b7481c03e70e74f9748e46668530442fd8c03bc260c9ed3b11bf06012d1d": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非极端节食或依赖单一食物。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑行。\n同时，每周应安排两次全身性的力量训练，以增加肌肉量并提升基础代谢率。\n饮食方面需保证优质蛋白质摄入，多吃蔬菜与全谷物，并严格控制添加糖和精制碳水。\n保持充足的水分摄入有助于提高代谢效率，并能在餐前适当增加饱腹感。\n许多人误以为熬夜能消耗更多热量，实则睡眠不足会扰乱激素，显著增加食欲和脂肪堆积风险。\n另一个常见误区是认为运动后可以随意进食，这往往会导致热量摄入远超消耗，抵消运动成果。\n只有将科学饮食、规律运动与优质睡眠相结合，才能实现长期且稳定的健康减重。",
+    "occurrences": [
+      "apex-screen-h0-auto-off/request-0.json",
+      "apex-screen-h0-auto-off/request-1.json",
+      "apex-screen-h0-auto-off/request-2.json",
+      "apex-screen-h0-auto-off/request-3.json",
+      "apex-screen-h0-auto-off/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      174
+    ]
+  },
+  "ec8e2b77d6139f0a57d0e4dc538566f5a83bde43c1ebb1bbb3b7b4da6bd6c7e9": {
+    "text": "哈希表通过哈希函数将键映射到存储位置，支持基于键的快速查找，而数组则通过连续的内存空间和整数索引直接访问元素。\n\n哈希表通常不保证元素的存储顺序，且允许动态调整大小以维持性能，而数组在内存中保持固定的线性顺序，且大小通常固定或扩容成本较高。\n\n在时间复杂度上，哈希表在理想情况下提供平均 O(1) 的查找效率，而数组通过索引访问也是 O(1)，但若需按值查找则需 O(n) 的线性搜索。",
+    "occurrences": [
+      "apex-screen-h0-auto-off/request-5.json",
+      "apex-screen-h1-auto-off/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      117
+    ]
+  },
+  "f45e3142b6bbaca1dbfb62e14dcca65d0c79b9bcdf6a9682f22bdc647541495c": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非盲目追求快速掉秤。\n建议每周进行至少150分钟的中等强度有氧运动，如快走或游泳。\n同时搭配每周两次的力量训练，以增加肌肉量并提升基础代谢率。\n饮食方面应遵循均衡原则，增加蔬菜、优质蛋白和全谷物的摄入比例。\n严格控制添加糖、精制碳水及高加工食品的食用量，避免暴饮暴食。\n关于睡眠，许多人误以为熬夜能消耗更多热量，实则会导致代谢紊乱。\n睡眠不足会扰乱饥饿素与瘦素分泌，显著增加对高热量食物的渴望。\n因此，保证每晚7至9小时的高质量睡眠，是维持体重稳定的关键一环。",
+    "occurrences": [
+      "apex-screen-h0-disabled-aggressive/request-0.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      150
+    ]
+  },
+  "1a14945d7d8dd3bb5fa96656cdb2a829da7ef2167d32271786accd302d3ce71b": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非极端节食或快速脱水。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑行。\n同时，每周应安排两次全身性的力量训练，以增加肌肉量并提升基础代谢率。\n饮食方面需保证优质蛋白质摄入，多吃蔬菜和高纤维食物，严格控制添加糖与精制碳水。\n保持充足的水分摄入有助于提高代谢效率，并能在餐前适当增加饱腹感。\n关于睡眠，许多人误以为熬夜能消耗更多热量，实则睡眠不足会扰乱激素平衡，导致食欲失控。\n另一个常见误区是认为周末补觉可以抵消工作日的睡眠债，但这往往无法恢复正常的代谢节律。\n只有将科学运动、均衡饮食与规律作息相结合，才能实现长期且稳定的健康减重。",
+    "occurrences": [
+      "apex-screen-h0-disabled-aggressive/request-1.json",
+      "apex-screen-h0-disabled-aggressive/request-2.json",
+      "apex-screen-h0-disabled-aggressive/request-3.json",
+      "apex-screen-h0-disabled-aggressive/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      174
+    ]
+  },
+  "f319ba890a985415630a7ad946831bdf9a6b922a69be99833eb696612c5d6844": {
+    "text": "哈希表通过键值对存储数据，利用哈希函数将键映射到特定位置，从而实现基于键的快速查找。\n\n数组则通过连续的内存空间存储元素，仅支持通过整数索引进行直接访问，无法直接通过非数字键检索数据。\n\n因此，哈希表适合需要高效键值映射的场景，而数组更适合处理有序或固定索引的数据集合。",
+    "occurrences": [
+      "apex-screen-h0-disabled-aggressive/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      78
+    ]
+  },
+  "39f758251ec80d86e1ef173155970e7067f49a81825ed5f8470e1efc5ec6ba4b": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非极端节食或依赖单一食物。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑行。\n同时，每周应安排两次全身性的力量训练，以增加肌肉量并提升基础代谢率。\n饮食方面需保证优质蛋白质摄入，多吃蔬菜与全谷物，并严格控制添加糖和精制碳水。\n保持充足的水分摄入有助于提高代谢效率，并能在餐前适当增加饱腹感。\n关于睡眠，许多人误以为熬夜能消耗更多热量，实则睡眠不足会扰乱激素平衡，反而促进脂肪堆积。\n另一个常见误区是认为周末补觉可以抵消工作日的睡眠债，但这往往无法恢复正常的代谢节律。\n只有将科学运动、均衡饮食与规律作息相结合，才能实现长期且稳定的健康减重。",
+    "occurrences": [
+      "apex-screen-h0-disabled-off/request-0.json",
+      "apex-screen-h0-disabled-off/request-1.json",
+      "apex-screen-h0-disabled-off/request-2.json",
+      "apex-screen-h0-disabled-off/request-3.json",
+      "apex-screen-h0-disabled-off/request-4.json",
+      "apex-screen-h1-auto-off/request-0.json",
+      "apex-screen-h1-auto-off/request-1.json",
+      "apex-screen-h1-auto-off/request-2.json",
+      "apex-screen-h1-auto-off/request-3.json",
+      "apex-screen-h1-auto-off/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      177
+    ]
+  },
+  "27b7007691b72e286765e87c851a6252384da8b2b4920bba08f09ee9dc55820c": {
+    "text": "哈希表通过哈希函数将键映射到存储位置，支持基于键的快速查找，而数组则通过连续的内存空间和整数索引直接访问元素。\n\n哈希表通常用于处理非连续或复杂的键值对数据，其查找时间复杂度平均为 O(1)，但可能因哈希冲突导致性能波动；数组则适合存储有序或同类型数据，提供 O(1) 的随机访问速度且内存布局紧凑。\n\n简而言之，数组依赖位置索引，哈希表依赖键值映射，前者胜在顺序访问和内存效率，后者胜在灵活检索和动态扩展。",
+    "occurrences": [
+      "apex-screen-h0-disabled-off/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      125
+    ]
+  },
+  "0e10121520afaf69df31d6378817fbe27708064a3869f04de630e0e659e1bd35": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非盲目节食或追求极速掉秤。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑行，以提升心肺功能。\n同时，每周应安排两次全身性的力量训练，通过增加肌肉量来提高基础代谢率。\n在饮食方面，应优先摄入高蛋白、高纤维的食物，如瘦肉、鱼类、蔬菜和全谷物。\n严格控制精制糖、油炸食品及含糖饮料的摄入，保持三餐规律且营养均衡。\n许多人误以为熬夜能消耗更多热量，实则睡眠不足会扰乱激素分泌，反而导致食欲亢进和脂肪堆积。\n另一个常见误区是认为运动后可以无限制进食，这往往会导致热量摄入远超消耗，抵消运动成果。\n只有将科学饮食、规律运动与充足睡眠相结合，才能实现长期、稳定且健康的体重管理。",
+    "occurrences": [
+      "apex-screen-h1-auto-aggressive/request-0.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      183
+    ]
+  },
+  "ac40a8854e905bc91d9171448682952fbbc425485f4bb3339b39acf539bc41db": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非极端节食或快速脱水。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑自行车。\n同时，每周应安排两次全身性的力量训练，以增加肌肉量并提升基础代谢率。\n饮食方面需保证优质蛋白质摄入，多吃蔬菜和高纤维食物，严格控制添加糖与精制碳水。\n保持充足的水分摄入有助于提高代谢效率，并能在餐前适当增加饱腹感。\n关于睡眠，许多人误以为熬夜能消耗更多热量，实则睡眠不足会扰乱激素平衡，导致食欲失控。\n另一个常见误区是认为周末补觉可以抵消工作日的睡眠债，但这往往无法恢复正常的代谢节律。\n只有将科学运动、均衡饮食与规律作息相结合，才能实现长期且稳定的健康减重目标。",
+    "occurrences": [
+      "apex-screen-h1-auto-aggressive/request-1.json",
+      "apex-screen-h1-auto-aggressive/request-2.json",
+      "apex-screen-h1-auto-aggressive/request-3.json",
+      "apex-screen-h1-auto-aggressive/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      175
+    ]
+  },
+  "57e2e7a70f4e785f261f383360a66e8a5b47d2ae29734c4c6ca946b331a57c13": {
+    "text": "哈希表通过键值对存储数据，利用哈希函数将键映射到特定位置，从而实现平均常数时间复杂度的快速查找。\n\n数组则通过连续的内存空间存储元素，仅支持通过整数索引进行直接访问，无法直接通过非整数键值检索数据。\n\n因此，哈希表适合需要基于任意键快速检索的场景，而数组更适合需要按顺序遍历或基于位置索引访问数据的场景。",
+    "occurrences": [
+      "apex-screen-h1-auto-aggressive/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      87
+    ]
+  },
+  "afb9bd846811f3501db00c884582e44d2bf4984eafbfd93082365d33799c2b0c": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非盲目节食或追求极速掉秤。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑行，以提升心肺功能。\n同时，每周应安排两次全身性的力量训练，通过增加肌肉量来提高基础代谢率。\n在饮食方面，应优先摄入高蛋白、高纤维的食物，如瘦肉、鱼类、蔬菜和全谷物。\n严格控制精制糖、油炸食品及含糖饮料的摄入，保持三餐规律且营养均衡。\n关于睡眠，许多人误以为熬夜能消耗更多热量，实则睡眠不足会扰乱激素分泌，反而导致食欲增加。\n另一个常见误区是认为睡前喝水会水肿，实际上适量饮水有助于代谢，关键在于避免睡前大量进食。\n只有将科学运动、均衡饮食与优质睡眠相结合，才能实现长期、稳定且健康的体重管理。",
+    "occurrences": [
+      "apex-screen-h1-disabled-l2/request-0.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      181
+    ]
+  },
+  "701a6f6ffd7e271b6595f9ca547a64dc866c848b9b69e72a570701f3b675f7be": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非极端节食或快速脱水。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑行。\n同时，每周应安排两次全身性的力量训练，以增加肌肉量并提升基础代谢率。\n饮食方面需保证优质蛋白质摄入，多吃蔬菜和高纤维食物，严格控制添加糖与精制碳水。\n保持水分充足至关重要，每日饮水应达到1.5至2升，以辅助代谢并减少假性饥饿感。\n关于睡眠，许多人误以为熬夜能消耗更多热量，实则睡眠不足会扰乱激素，导致食欲失控。\n另一个常见误区是认为周末补觉可以抵消工作日的睡眠债，但这往往无法恢复代谢平衡。\n只有将科学运动、均衡饮食与规律作息相结合，才能实现长期且稳定的健康减重。",
+    "occurrences": [
+      "apex-screen-h1-disabled-l2/request-1.json",
+      "apex-screen-h1-disabled-l2/request-2.json",
+      "apex-screen-h1-disabled-l2/request-3.json",
+      "apex-screen-h1-disabled-l2/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      178
+    ]
+  },
+  "19851ba9df423466591499acff6bd49fad38043611f91533d22e4238b754a40e": {
+    "text": "哈希表通过键值对存储数据，利用哈希函数将键映射到特定位置，从而实现平均常数时间复杂度的快速查找。\n\n数组则通过连续的内存空间存储元素，仅支持通过整数索引进行直接访问，无法直接通过非整数键值进行检索。\n\n因此，哈希表更适合需要频繁按特定标识符查找数据的场景，而数组更适合需要按顺序遍历或通过数字下标高效访问元素的场景。",
+    "occurrences": [
+      "apex-screen-h1-disabled-l2/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      90
+    ]
+  },
+  "b4f44fd27f041ec7187539ac8cee32af1208163adf81c78e30c65d1ce3b0cdcd": {
+    "text": "健康减重的核心在于制造合理的热量缺口，而非极端节食或依赖单一食物。\n建议每周进行至少150分钟的中等强度有氧运动，如快走、游泳或骑行。\n同时，每周应安排两次全身性的力量训练，以增加肌肉量并提升基础代谢率。\n饮食方面需保证优质蛋白质摄入，多吃蔬菜与全谷物，并严格控制添加糖和精制碳水。\n保持充足的水分摄入有助于提高代谢效率，并能在餐前适当增加饱腹感。\n关于睡眠，许多人误以为熬夜能消耗更多热量，实则睡眠不足会扰乱激素平衡，反而促进脂肪堆积。\n另一个常见误区是认为周末补觉可以抵消工作日的睡眠债，但这往往无法恢复正常的代谢节律。\n只有将科学运动、均衡饮食与规律作息相结合，才能实现长期且稳定的健康减重目标。",
+    "occurrences": [
+      "apex-screen-h1-disabled-off/request-0.json",
+      "apex-screen-h1-disabled-off/request-1.json",
+      "apex-screen-h1-disabled-off/request-2.json",
+      "apex-screen-h1-disabled-off/request-3.json",
+      "apex-screen-h1-disabled-off/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      178
+    ]
+  },
+  "d760c6f61f0be347adef217e54bf5f69810e1077cced6e37f3c4f3118d859176": {
+    "text": "哈希表通过哈希函数将键映射到存储位置，支持基于键的快速查找，而数组则通过连续的内存空间和整数索引直接访问元素。\n\n哈希表通常具有动态扩容能力且元素无序存储，而数组的大小在创建时通常固定（或需手动调整）且元素按索引顺序紧密排列。\n\n在性能上，哈希表在平均情况下提供常数时间复杂度的查找、插入和删除操作，而数组在已知索引时访问极快，但在中间位置插入或删除元素时效率较低。",
+    "occurrences": [
+      "apex-screen-h1-disabled-off/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      109
+    ]
+  },
+  "f4c5d88304e53031b0ccf806315d8084056679064acbb585ef242695c7e041f9": {
+    "text": "健康减重的核心在于建立可持续的能量负平衡，而非追求极端节食。\n\n每周应安排至少150分钟的中等强度有氧运动，如快走或游泳，以增强心肺功能。\n\n结合每周两次力量训练，有助于维持肌肉量并提升基础代谢率。\n\n饮食方面需注重均衡营养，优先摄入高纤维蔬菜、优质蛋白和全谷物。\n\n减少精制糖、加工食品及高热量零食的摄入，是控制总热量的关键步骤。\n\n充足睡眠对减重至关重要，因为睡眠不足会扰乱激素水平并增加食欲。\n\n常见的误区是认为熬夜后补觉能抵消睡眠缺失的影响，实际上这并不能修复代谢损伤。\n\n坚持规律作息与适度运动相结合，才能实现长期稳定的体重管理。",
+    "occurrences": [
+      "hc-confirm-b1-A/request-0.json",
+      "hc-confirm-b1-A/request-1.json",
+      "hc-confirm-b1-A/request-2.json",
+      "hc-confirm-b1-A/request-3.json",
+      "hc-confirm-b1-A/request-4.json",
+      "hc-confirm-b2-A/request-0.json",
+      "hc-confirm-b2-A/request-1.json",
+      "hc-confirm-b2-A/request-2.json",
+      "hc-confirm-b2-A/request-3.json",
+      "hc-confirm-b2-A/request-4.json",
+      "hc-confirm-b3-A/request-0.json",
+      "hc-confirm-b3-A/request-1.json",
+      "hc-confirm-b3-A/request-2.json",
+      "hc-confirm-b3-A/request-3.json",
+      "hc-confirm-b3-A/request-4.json",
+      "hc-confirm-b4-A/request-0.json",
+      "hc-confirm-b4-A/request-1.json",
+      "hc-confirm-b4-A/request-2.json",
+      "hc-confirm-b4-A/request-3.json",
+      "hc-confirm-b4-A/request-4.json",
+      "q2-cache-pair-b1-A/request-0.json",
+      "q2-cache-pair-b1-A/request-1.json",
+      "q2-cache-pair-b1-A/request-2.json",
+      "q2-cache-pair-b1-A/request-3.json",
+      "q2-cache-pair-b1-A/request-4.json",
+      "q2-cache-pair-b1-B/request-0.json",
+      "q2-cache-pair-b1-B/request-1.json",
+      "q2-cache-pair-b1-B/request-2.json",
+      "q2-cache-pair-b1-B/request-3.json",
+      "q2-cache-pair-b1-B/request-4.json",
+      "q2-cache-pair-b2-A/request-0.json",
+      "q2-cache-pair-b2-A/request-1.json",
+      "q2-cache-pair-b2-A/request-2.json",
+      "q2-cache-pair-b2-A/request-3.json",
+      "q2-cache-pair-b2-A/request-4.json",
+      "q2-cache-pair-b2-B/request-0.json",
+      "q2-cache-pair-b2-B/request-1.json",
+      "q2-cache-pair-b2-B/request-2.json",
+      "q2-cache-pair-b2-B/request-3.json",
+      "q2-cache-pair-b2-B/request-4.json",
+      "q2-cache-pair-b3-A/request-0.json",
+      "q2-cache-pair-b3-A/request-1.json",
+      "q2-cache-pair-b3-A/request-2.json",
+      "q2-cache-pair-b3-A/request-3.json",
+      "q2-cache-pair-b3-A/request-4.json",
+      "q2-cache-pair-b3-B/request-0.json",
+      "q2-cache-pair-b3-B/request-1.json",
+      "q2-cache-pair-b3-B/request-2.json",
+      "q2-cache-pair-b3-B/request-3.json",
+      "q2-cache-pair-b3-B/request-4.json",
+      "q2-cache-pair-b4-A/request-0.json",
+      "q2-cache-pair-b4-A/request-1.json",
+      "q2-cache-pair-b4-A/request-2.json",
+      "q2-cache-pair-b4-A/request-3.json",
+      "q2-cache-pair-b4-A/request-4.json",
+      "q2-cache-pair-b4-B/request-0.json",
+      "q2-cache-pair-b4-B/request-1.json",
+      "q2-cache-pair-b4-B/request-2.json",
+      "q2-cache-pair-b4-B/request-3.json",
+      "q2-cache-pair-b4-B/request-4.json",
+      "q2-cache4-pilot/request-0.json",
+      "q2-cache4-pilot/request-1.json",
+      "q2-cache4-pilot/request-2.json",
+      "q2-cache4-pilot/request-3.json",
+      "q2-cache4-pilot/request-4.json",
+      "q2-full-profile/request-0.json",
+      "q2-full-profile/request-1.json",
+      "q2-full-profile/request-2.json",
+      "q2-route-aggressive/request-0.json",
+      "q2-route-aggressive/request-1.json",
+      "q2-screen-h0-disabled/request-0.json",
+      "q2-screen-h0-disabled/request-1.json",
+      "q2-screen-h0-disabled/request-2.json",
+      "q2-screen-h0-disabled/request-3.json",
+      "q2-screen-h0-disabled/request-4.json",
+      "q2-screen-h1-auto/request-0.json",
+      "q2-screen-h1-auto/request-1.json",
+      "q2-screen-h1-auto/request-2.json",
+      "q2-screen-h1-auto/request-3.json",
+      "q2-screen-h1-auto/request-4.json",
+      "q2-screen-h1-disabled/request-0.json",
+      "q2-screen-h1-disabled/request-1.json",
+      "q2-screen-h1-disabled/request-2.json",
+      "q2-screen-h1-disabled/request-3.json",
+      "q2-screen-h1-disabled/request-4.json",
+      "q2-screen-h2-disabled/request-0.json",
+      "q2-screen-h2-disabled/request-1.json",
+      "q2-screen-h2-disabled/request-2.json",
+      "q2-screen-h2-disabled/request-3.json",
+      "q2-screen-h2-disabled/request-4.json",
+      "q2-screen-h4-disabled/request-0.json",
+      "q2-screen-h4-disabled/request-1.json",
+      "q2-screen-h4-disabled/request-2.json",
+      "q2-screen-h4-disabled/request-3.json",
+      "q2-screen-h4-disabled/request-4.json",
+      "q2-steady-capture/request-0.json",
+      "q2-steady-capture/request-1.json",
+      "q2-steady-capture/request-2.json",
+      "q2-steady-capture/request-3.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      156
+    ]
+  },
+  "ead561f7cdce47b31ce7e0e48bceb7f6d17857880c2f92f65ebfede5779c0f78": {
+    "text": "数组通过连续内存中的索引直接访问元素，而哈希表通过计算键的哈希值映射到桶来查找数据。数组的访问速度取决于索引位置，而哈希表的平均访问速度取决于哈希函数的分布均匀性。数组适合有序或固定大小的数据，而哈希表适合快速查找、插入和删除的键值对场景。",
+    "occurrences": [
+      "hc-confirm-b1-A/request-5.json",
+      "hc-confirm-b2-A/request-5.json",
+      "hc-confirm-b3-A/request-5.json",
+      "hc-confirm-b4-A/request-5.json",
+      "q2-cache-pair-b1-A/request-5.json",
+      "q2-cache-pair-b1-B/request-5.json",
+      "q2-cache-pair-b2-A/request-5.json",
+      "q2-cache-pair-b2-B/request-5.json",
+      "q2-cache-pair-b3-A/request-5.json",
+      "q2-cache-pair-b3-B/request-5.json",
+      "q2-cache-pair-b4-A/request-5.json",
+      "q2-cache-pair-b4-B/request-5.json",
+      "q2-cache4-pilot/request-5.json",
+      "q2-route-aggressive/request-2.json",
+      "q2-screen-h0-disabled/request-5.json",
+      "q2-screen-h1-disabled/request-5.json",
+      "q2-screen-h2-disabled/request-5.json",
+      "q2-screen-h4-disabled/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      72
+    ]
+  },
+  "645d63e574975102670d4b67574fc8978ac051ab1f66696b35e504a68593eb4e": {
+    "text": "健康减重的核心在于建立长期的热量赤字，而非追求短期极速瘦身。\n\n每周运动安排应包含至少 150 分钟的中等强度有氧活动，辅以两次力量训练以维持肌肉量。\n\n饮食建议强调摄入高纤维蔬菜、优质蛋白和全谷物，同时严格限制添加糖与精制碳水化合物的比例。\n\n控制份量至关重要，使用较小的餐具或记录饮食日志有助于避免无意识的过量进食。\n\n睡眠误区之一是认为熬夜后补觉能抵消代谢损害，实际上睡眠不足会显著增加饥饿激素水平。\n\n另一个常见误区是认为睡前剧烈运动有助于减重，但这往往干扰褪黑素分泌并降低睡眠质量。\n\n规律作息与充足睡眠能稳定血糖水平，从而减少对高热量食物的渴望。\n\n坚持这些原则需要耐心与一致性，将健康习惯融入日常生活才是减重成功的关键。",
+    "occurrences": [
+      "hc-confirm-b1-B/request-0.json",
+      "hc-confirm-b2-B/request-0.json",
+      "hc-confirm-b3-B/request-0.json",
+      "hc-confirm-b4-B/request-0.json",
+      "hcq8-light-profile/request-0.json",
+      "hcq8-screen-h1-disabled-aggressive/request-0.json",
+      "hcq8-steady-capture/request-0.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      176
+    ]
+  },
+  "02710e49ebfeafd754ed1faec6a18ce226481d6aeabbf987b110a1b7e7ad4a43": {
+    "text": "健康减重的核心在于建立可持续的能量负平衡，而非追求极端节食。\n\n每周应安排至少150分钟的中等强度有氧运动，如快走或游泳，以增强心肺功能。\n\n结合每周两次力量训练，有助于维持肌肉量并提升基础代谢率。\n\n饮食方面需注重均衡营养，优先摄入蔬菜、优质蛋白和全谷物，减少精制糖与加工食品。\n\n控制总热量摄入时，应采用规律进餐模式，避免长时间饥饿导致的暴饮暴食。\n\n充足的睡眠是减重的重要基石，因为睡眠不足会扰乱激素水平并增加食欲。\n\n常见的误区认为“熬夜也能减肥”，实际上缺乏睡眠反而会导致体重增加和代谢紊乱。\n\n坚持长期主义，将运动、饮食与睡眠习惯融入日常生活，才能实现稳定且健康的体重管理。",
+    "occurrences": [
+      "hc-confirm-b1-B/request-1.json",
+      "hc-confirm-b1-B/request-2.json",
+      "hc-confirm-b1-B/request-3.json",
+      "hc-confirm-b1-B/request-4.json",
+      "hc-confirm-b2-B/request-1.json",
+      "hc-confirm-b2-B/request-2.json",
+      "hc-confirm-b2-B/request-3.json",
+      "hc-confirm-b2-B/request-4.json",
+      "hc-confirm-b3-B/request-1.json",
+      "hc-confirm-b3-B/request-2.json",
+      "hc-confirm-b3-B/request-3.json",
+      "hc-confirm-b3-B/request-4.json",
+      "hc-confirm-b4-B/request-1.json",
+      "hc-confirm-b4-B/request-2.json",
+      "hc-confirm-b4-B/request-3.json",
+      "hc-confirm-b4-B/request-4.json",
+      "hcq8-light-profile/request-1.json",
+      "hcq8-light-profile/request-2.json",
+      "hcq8-light-profile/request-3.json",
+      "hcq8-screen-h1-disabled-aggressive/request-1.json",
+      "hcq8-screen-h1-disabled-aggressive/request-2.json",
+      "hcq8-screen-h1-disabled-aggressive/request-3.json",
+      "hcq8-screen-h1-disabled-aggressive/request-4.json",
+      "hcq8-steady-capture/request-1.json",
+      "hcq8-steady-capture/request-2.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      167
+    ]
+  },
+  "d01cf220499c66ed08ce8a8fba043ca0c83250e1f12d95708401f8a0a5d77634": {
+    "text": "数组通过连续内存中的索引直接访问元素，而哈希表通过键值映射利用哈希函数定位数据。数组的查找通常依赖线性遍历或二分搜索，而哈希表在理想情况下能实现常数时间（O(1))的查找。数组适合有序或固定大小的数据，而哈希表更适合快速检索、去重或动态增删的场景。",
+    "occurrences": [
+      "hc-confirm-b1-B/request-5.json",
+      "hc-confirm-b2-B/request-5.json",
+      "hc-confirm-b3-B/request-5.json",
+      "hc-confirm-b4-B/request-5.json",
+      "hcq8-light-profile/request-4.json",
+      "hcq8-screen-h1-disabled-aggressive/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      76
+    ]
+  },
+  "559da67ec93fdf733e6a078fe1d906e408361d40b4a9f3adedcc80bf6915dcc5": {
+    "text": "健康减重的核心在于建立可持续的能量负平衡，而非追求极端节食。\n\n每周应安排至少150分钟的中等强度有氧运动，如快走或游泳，以增强心肺功能。\n\n结合每周两次力量训练，有助于维持肌肉量并提升基础代谢率。\n\n饮食方面需注重均衡营养，优先摄入高纤维蔬菜、优质蛋白和全谷物。\n\n减少精制糖、加工食品及高热量零食的摄入，是控制总热量的关键步骤。\n\n充足睡眠对减重至关重要，因为睡眠不足会扰乱激素水平并增加食欲。\n\n常见的误区包括认为熬夜不影响体重，或相信“睡前吃夜宵”能促进代谢。\n\n实际上，规律作息与适度运动相结合，才是实现长期健康减重的最佳策略。",
+    "occurrences": [
+      "hcq8-screen-h0-disabled-aggressive/request-0.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      159
+    ]
+  },
+  "f27916ffec9d9a7ca8f5fa480bcd7db8713b79fb2fd2d3da9fb8a5f99d437778": {
+    "text": "健康减重的核心在于建立可持续的能量负平衡，而非追求极端节食。\n\n每周运动安排应包含至少150分钟的中等强度有氧运动，如快走或游泳。\n\n此外，每周进行两次力量训练有助于提升基础代谢率并维持肌肉质量。\n\n饮食建议强调增加蔬菜、全谷物和优质蛋白的摄入，同时减少精制糖和加工食品。\n\n控制总热量摄入时，应注重食物密度而非单纯计算卡路里，以增强饱腹感。\n\n关于睡眠，许多人误认为熬夜后补觉能抵消睡眠不足的影响，但这并不成立。\n\n长期睡眠不足会导致激素失调，增加食欲并降低运动表现，阻碍减重效果。\n\n因此，保证每晚7至9小时的高质量睡眠是减重计划中不可或缺的一环。",
+    "occurrences": [
+      "hcq8-screen-h0-disabled-aggressive/request-1.json",
+      "hcq8-screen-h0-disabled-aggressive/request-2.json",
+      "hcq8-screen-h0-disabled-aggressive/request-3.json",
+      "hcq8-screen-h0-disabled-aggressive/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      162
+    ]
+  },
+  "33256a7c1c96a236110523bf26b44a7fe684dffbe29470f418b6a84a8bd7d119": {
+    "text": "数组通过连续内存中的索引直接访问元素，而哈希表通过计算键的哈希值映射到桶来查找数据。数组的访问速度取决于索引位置，而哈希表的平均访问速度取决于哈希函数的分布均匀性。数组适合有序或固定大小的数据，而哈希表适合快速查找、插入和删除操作。",
+    "occurrences": [
+      "hcq8-screen-h0-disabled-aggressive/request-5.json",
+      "hcq8-screen-h1-auto-aggressive/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      68
+    ]
+  },
+  "3f06cbafc45d278bb5a35afce112c5f6c701210601086079d8ce0262329c2e0b": {
+    "text": "健康减重的核心在于建立长期的热量赤字，而非追求短期极速瘦身。\n\n每周运动安排应包含至少 150 分钟的中等强度有氧活动，以增强心肺功能并消耗多余能量。\n\n同时，每周进行两次力量训练至关重要，这有助于维持肌肉量并提升基础代谢率。\n\n饮食建议强调均衡营养，优先摄入富含纤维的蔬菜、优质蛋白和全谷物，减少精制糖与加工食品。\n\n控制份量与规律进餐时间比单纯计算卡路里更为有效，能避免暴饮暴食带来的反弹。\n\n关于睡眠误区，许多人认为熬夜后补觉即可抵消睡眠不足，但这实际上会扰乱激素平衡并增加食欲。\n\n缺乏睡眠会导致皮质醇升高和瘦素水平下降，从而显著阻碍减重效果并增加脂肪堆积风险。\n\n因此，保证每晚 7 至 9 小时的高质量睡眠，是实现可持续健康减重不可或缺的一环。",
+    "occurrences": [
+      "hcq8-screen-h1-auto-aggressive/request-0.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      190
+    ]
+  },
+  "0c0400b3a75de715574d13d97eb5115868d74b180ef6efbaa893c32d38ff19d6": {
+    "text": "健康减重的核心在于建立可持续的能量负平衡，而非追求极端节食。\n\n每周应安排至少150分钟的中等强度有氧运动，如快走或游泳，以增强心肺功能。\n\n同时加入两次力量训练，有助于维持肌肉量并提升基础代谢率。\n\n饮食方面需注重均衡营养，优先摄入高纤维蔬菜、优质蛋白和全谷物。\n\n减少精制糖、高脂加工食品及含糖饮料的摄入，是控制热量的关键步骤。\n\n充足的睡眠对于调节食欲激素至关重要，长期睡眠不足会导致体重增加。\n\n常见的误区包括认为“晚睡也能减肥”或“睡前剧烈运动有助于消耗热量”，这往往适得其反。\n\n坚持规律作息与科学运动相结合，才能实现长期稳定的健康减重效果。",
+    "occurrences": [
+      "hcq8-screen-h1-auto-aggressive/request-1.json",
+      "hcq8-screen-h1-auto-aggressive/request-2.json",
+      "hcq8-screen-h1-auto-aggressive/request-3.json",
+      "hcq8-screen-h1-auto-aggressive/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      159
+    ]
+  },
+  "041e180558c3f43a4c319611dff3aaebe58ff66da0e636cb2b051d2cdb13ecd4": {
+    "text": "健康减重的核心在于建立可持续的能量负平衡，而非追求极端节食。\n\n每周应安排至少150分钟的中等强度有氧运动，如快走或游泳，以增强心肺功能。\n\n结合每周两次力量训练，有助于维持肌肉量并提升基础代谢率。\n\n饮食方面需注重均衡营养，优先摄入高纤维蔬菜、优质蛋白和全谷物。\n\n减少精制糖、加工食品及高热量零食的摄入，是控制总热量的关键步骤。\n\n充足睡眠对减重至关重要，因为睡眠不足会扰乱激素水平并增加食欲。\n\n常见的误区包括认为熬夜不影响体重，或相信“晚睡晚起”能弥补睡眠不足。\n\n实际上，规律作息与高质量睡眠能显著改善代谢效率，助力长期体重管理。",
+    "occurrences": [
+      "hcq8-screen-h1-disabled-off/request-0.json",
+      "hcq8-screen-h1-disabled-off/request-1.json",
+      "hcq8-screen-h1-disabled-off/request-2.json",
+      "hcq8-screen-h1-disabled-off/request-3.json",
+      "hcq8-screen-h1-disabled-off/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      160
+    ]
+  },
+  "50022999868d9f90bebaf914e80f757b6441aebf807651db0ebc117bba6312fe": {
+    "text": "数组通过连续内存中的索引直接访问元素，而哈希表通过计算键的哈希值映射到桶来查找数据。数组的访问速度取决于索引位置，而哈希表的平均访问速度取决于哈希函数的分布均匀性。数组适合有序或连续存储，而哈希表适合快速查找和去重。",
+    "occurrences": [
+      "hcq8-screen-h1-disabled-off/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      65
+    ]
+  },
+  "e5b9ccaa7b0fe50adf7d35390a1b3be5bdd7531960d2f15f0979f82a986129d3": {
+    "text": "数组通过连续内存中的索引直接访问元素，而哈希表通过计算键的哈希值映射到桶来查找数据。数组的访问速度取决于索引位置，而哈希表的平均访问速度取决于哈希函数的分布均匀性。数组适合有序或密集存储，而哈希表适合快速查找稀疏或动态变化的数据。",
+    "occurrences": [
+      "q2-screen-h1-auto/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      67
+    ]
+  },
+  "99f4b5f0fcf4834c17342454f07e1d8fb6d998a1c2e65372a91c2ee5bf618809": {
+    "text": "健康减重的核心在于建立可持续的能量负平衡，而非追求极端节食。\n\n每周应安排至少150分钟的中等强度有氧运动，如快走或游泳，以增强心肺功能。\n\n结合每周两次的力量训练，有助于维持肌肉量并提升基础代谢率。\n\n饮食方面需注重均衡营养，优先摄入高纤维蔬菜、优质蛋白和全谷物。\n\n减少精制糖、高脂加工食品及含糖饮料的摄入，是控制热量的关键步骤。\n\n充足的睡眠对于调节食欲激素至关重要，长期睡眠不足会导致体重增加。\n\n许多人误认为熬夜后补觉能抵消睡眠缺失的影响，但这并不能修复代谢损伤。\n\n因此，保持规律作息并避免睡前使用电子设备，是减重过程中常被忽视的重要环节。",
+    "occurrences": [
+      "q2-screen-h1-forced/request-0.json",
+      "q2-screen-h1-forced/request-1.json",
+      "q2-screen-h1-forced/request-2.json",
+      "q2-screen-h1-forced/request-3.json",
+      "q2-screen-h1-forced/request-4.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      157
+    ]
+  },
+  "483e8dc1799b2a681ef0a4f3098cc20a3cbe19d2c4ebedc0d9ebfaef4817cae6": {
+    "text": "数组通过连续内存中的索引直接访问元素，而哈希表通过计算键的哈希值映射到桶来查找数据。数组的访问速度取决于索引位置，而哈希表的平均访问速度取决于哈希函数的分布均匀性。数组适合有序或密集存储，而哈希表适合快速查找稀疏或非连续的数据。",
+    "occurrences": [
+      "q2-screen-h1-forced/request-5.json"
+    ],
+    "finish": [
+      "stop"
+    ],
+    "tokens": [
+      67
+    ]
+  }
+}

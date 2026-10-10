@@ -1,0 +1,8 @@
+{
+  "source": "before-build-bin/libggml-vulkan.so exported production pack SPIR-V",
+  "bytes_old": 3564,
+  "bytes_new": 3564,
+  "old_sha256": "e9932745e74e0c99b33fe01778ca1bcfb5f83348431b1e125a33ddfa4bf95ec6",
+  "new_sha256": "e9932745e74e0c99b33fe01778ca1bcfb5f83348431b1e125a33ddfa4bf95ec6",
+  "default_pack_spirv_byte_identical": true
+}

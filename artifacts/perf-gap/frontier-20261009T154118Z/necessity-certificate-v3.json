@@ -1,0 +1,55 @@
+{
+  "task": "TP5 ordinary single-user generation, Qwen4EXP-AF, 5x RX 6800",
+  "allowed_set_A": [
+    "arbitrary lossless weight representation (incl. exact BF16)",
+    "unrestricted caching in VRAM/L2/LDS",
+    "arbitrary owner/coordinate partitioning across 5 GPUs",
+    "arbitrary async prefetch across causal stages",
+    "arbitrary kernel/operator fusion",
+    "MTP/speculative with any draft policy incl. perfect acceptance"
+  ],
+  "resources": {
+    "R1_output_emission": {
+      "bytes_strong": 2048,
+      "bytes_weak": 4,
+      "ceiling_gb_s": 25.0,
+      "time_strong_s": 8.192e-08,
+      "time_weak_s": 1.6e-10,
+      "justification": "each committed token requires the host to observe either the token id (4B, weak) or the full 512-expert routing scores (2048B, strong, current sampler contract)"
+    },
+    "R2_causal_cut_set": {
+      "bytes_per_boundary": 2048,
+      "boundaries_per_row": 48,
+      "total_bytes_per_row": 98304,
+      "ceiling_gb_s": 32.0,
+      "time_per_row_s": 3.0720000000000004e-06,
+      "justification": "48 sequential layer boundaries; router input (2560 F32) must be complete before layer l runs; with 5 disjoint coordinate shards at least 2048B crosses a rank cut per boundary; cut-set capacity bounds completion time"
+    },
+    "R3_active_weight_dram": {
+      "weight_pool_per_gpu_bytes": 11944320000.0,
+      "dense_bytes_per_layer": 90800000.0,
+      "active_per_gpu_per_token_bytes": 1087942500.0,
+      "l2_bytes_per_gpu": 128000000.0,
+      "l2_hit_fraction": 0.010716390719605636,
+      "dram_bytes_per_gpu_per_token": 1076283683.0895355,
+      "ceiling_gb_s": 512.0,
+      "time_per_row_s": 0.002102116568534249,
+      "justification": "10/512 experts active per layer PLUS all dense weights (attention, PLE, HC, router, shared experts) active every token; all must be read once per token; L2 (128MB) covers at most 128MB of the 11.9GB per-GPU weight pool, so at least (1-128/11900) of the active set comes from DRAM; generous to implementations (assumes perfect L2 retention across randomly routed tokens)"
+    },
+    "R4_fp32_alu": {
+      "flops_per_token": 12052231680.0,
+      "per_layer_flops": 251088160.0,
+      "peak_flops_s": 80850000000000.02,
+      "time_per_row_s": 0.00014906903747680887,
+      "justification": "attention projections + router + 11 experts per layer, 48 layers; RX 6800 has no FP32 matrix cores so vector ALU peak applies; lossless representation changes bytes, not FLOPs"
+    }
+  },
+  "combination_rule": "per-row lower bound = max(R1, R2, R3, R4): distinct physical resources may overlap in a legal implementation; same-resource work adds",
+  "mtp_relaxation": "perfect acceptance (rows per public token >= 1); bound is per target row, so per-public-token bound equals it",
+  "bounds": {
+    "per_row_lower_bound_s_weak": 0.002102116568534249,
+    "per_row_lower_bound_s_strong": 0.002102116568534249,
+    "tps_upper_bound_weak": 475.71101192417404,
+    "tps_upper_bound_strong": 475.71101192417404
+  }
+}

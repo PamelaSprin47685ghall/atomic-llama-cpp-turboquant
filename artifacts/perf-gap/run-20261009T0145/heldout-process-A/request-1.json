@@ -1,0 +1,58 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "请用六句话比较线程和进程，分别说明地址空间、通信方式、调度开销、崩溃隔离、共享数据风险和适用场景。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "进程拥有独立的地址空间，而同一进程内的线程则共享该进程的内存空间。\n进程间通信通常依赖管道、消息队列或共享内存等复杂机制，线程间则可直接通过读写共享变量进行交互。\n由于上下文切换涉及内存映射表的更新，进程调度的开销通常远大于仅切换寄存器和栈的线程调度。\n单个进程的崩溃通常不会影响其他进程，但一个线程的异常往往会导致整个进程终止，隔离性较弱。\n线程共享数据虽然高效，但也极易引发竞态条件，需要开发者手动实施锁机制来保证数据一致性。\n因此，需要高稳定性和强隔离性的应用适合多进程架构，而追求高性能和低延迟的计算密集型任务更适合多线程模型。"
+        }
+      }
+    ],
+    "created": 1791513090,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 149,
+      "prompt_tokens": 40,
+      "total_tokens": 189,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-GUJTB4S8vx95OS7AWmOxfmEKYAP1Z9vQ",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 40,
+      "prompt_ms": 1934.103,
+      "prompt_per_token_ms": 48.352575,
+      "prompt_per_second": 20.681421827069187,
+      "predicted_n": 149,
+      "predicted_ms": 2242.6,
+      "predicted_per_token_ms": 15.051006711409395,
+      "predicted_per_second": 66.44073842860965
+    }
+  },
+  "wall_ms": 4718.502848,
+  "log_begin": 19023,
+  "log_end": 31176,
+  "phase": "warmup"
+}

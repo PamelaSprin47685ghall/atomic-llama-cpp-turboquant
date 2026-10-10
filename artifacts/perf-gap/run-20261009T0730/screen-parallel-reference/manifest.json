@@ -1,0 +1,125 @@
+{
+  "argv": [
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/llama-server",
+    "-m",
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+    "-dev",
+    "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+    "--split-mode",
+    "tensor",
+    "--fit",
+    "off",
+    "-ngl",
+    "999",
+    "-c",
+    "1024",
+    "-b",
+    "32",
+    "-ub",
+    "32",
+    "--no-mmap",
+    "--no-host",
+    "-np",
+    "1",
+    "-t",
+    "22",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18765",
+    "--tp5",
+    "qwen4exp-af",
+    "--tp5-latebind",
+    "aggressive",
+    "--spec-type",
+    "none"
+  ],
+  "env": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": "/home/kunweiz",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "LD_LIBRARY_PATH": "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin",
+    "RADV_DEBUG": "nobolist",
+    "GGML_VK_DISABLE_MMVQ": "1",
+    "GGML_VK_FORCE_MMVQ": "0",
+    "GGML_TP5_REPLICATE_ATTN": "0",
+    "GGML_TP5_QSA_HEADMAP": "1",
+    "GGML_TP5_GDN_HEADMAP": "1",
+    "GGML_VK_SMALL_Q8_COLUMNS": "1",
+    "GGML_TP5_GREEDY_HOST": "1",
+    "GGML_TP5_PARALLEL_SUBMIT": "1",
+    "GGML_TP5_Q_WORKGROUP": "256",
+    "GGML_TP5_NORM_WORKGROUP": "256"
+  },
+  "bin_sha256": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c",
+  "harness_sha256": "b64a1216f0dbe4b7e9f9f0a1f79c924587a33f2e381d4370256e7cb7e0c7e846",
+  "model_stat_identity": {
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf": {
+      "bytes": 539423008,
+      "mtime_ns": 1789096271661852679,
+      "inode": 177820
+    },
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00002-of-00006.gguf": {
+      "bytes": 28800138432,
+      "mtime_ns": 1789097468349781388,
+      "inode": 177819
+    },
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00003-of-00006.gguf": {
+      "bytes": 14626936832,
+      "mtime_ns": 1789096972326660333,
+      "inode": 177821
+    },
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00004-of-00006.gguf": {
+      "bytes": 14624775200,
+      "mtime_ns": 1789098595947503978,
+      "inode": 177826
+    },
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00005-of-00006.gguf": {
+      "bytes": 14624775200,
+      "mtime_ns": 1789098472402711746,
+      "inode": 177825
+    },
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00006-of-00006.gguf": {
+      "bytes": 11861758976,
+      "mtime_ns": 1789098569756184020,
+      "inode": 177824
+    }
+  },
+  "draft_stat_identity": {
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf": {
+      "bytes": 2790341728,
+      "mtime_ns": 1789318733863246483,
+      "inode": 1772663
+    }
+  },
+  "prompt_sha256": "9e574d45ac2f466ce83683f8a7a6c17066121e56a74a45d109e879327afb87b0",
+  "args": {
+    "bin": "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/llama-server",
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+    "draft": "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+    "out": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/run-20261009T0730/screen-parallel-reference",
+    "horizon": 0,
+    "latebind": "aggressive",
+    "mmvq": "disabled",
+    "threads": 22,
+    "ctx": 1024,
+    "warmup": 2,
+    "repeats": 2,
+    "port": 18765,
+    "profile": "none",
+    "env": [
+      "GGML_TP5_REPLICATE_ATTN=0",
+      "GGML_TP5_QSA_HEADMAP=1",
+      "GGML_TP5_GDN_HEADMAP=1",
+      "GGML_VK_SMALL_Q8_COLUMNS=1",
+      "GGML_TP5_GREEDY_HOST=1",
+      "GGML_TP5_PARALLEL_SUBMIT=1",
+      "GGML_TP5_Q_WORKGROUP=256",
+      "GGML_TP5_NORM_WORKGROUP=256"
+    ],
+    "skip_guard": false,
+    "prompt_file": null
+  },
+  "started_utc": "2026-10-09T07:31:49Z"
+}

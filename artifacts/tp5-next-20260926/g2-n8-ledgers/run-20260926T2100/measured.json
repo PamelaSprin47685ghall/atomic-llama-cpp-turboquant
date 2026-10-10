@@ -1,0 +1,34 @@
+[
+ {
+  "repeat": 0,
+  "wall_sec": 4.343127250671387,
+  "predicted_ms": 2580.431,
+  "completion_tokens": 171,
+  "finish": "stop",
+  "exact": true
+ },
+ {
+  "repeat": 1,
+  "wall_sec": 3.677450180053711,
+  "predicted_ms": 2094.519,
+  "completion_tokens": 171,
+  "finish": "stop",
+  "exact": true
+ },
+ {
+  "repeat": 2,
+  "wall_sec": 3.1234352588653564,
+  "predicted_ms": 2064.454,
+  "completion_tokens": 171,
+  "finish": "stop",
+  "exact": true
+ },
+ {
+  "repeat": 3,
+  "wall_sec": 3.123924732208252,
+  "predicted_ms": 2039.203,
+  "completion_tokens": 171,
+  "finish": "stop",
+  "exact": true
+ }
+]

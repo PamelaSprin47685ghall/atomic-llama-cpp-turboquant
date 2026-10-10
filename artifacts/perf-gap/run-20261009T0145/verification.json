@@ -1,0 +1,12 @@
+{
+  "focused_ctest_passed": 11,
+  "python_unit_tests": 46,
+  "sampler_token_pairs": 400,
+  "subsequent_rng_samples": 100,
+  "inference_binary_or_dso_changed_by_test_build": [],
+  "successful_raw_model_requests": 139,
+  "normal_exits": 25,
+  "failed_runs": 1,
+  "failed_initial_screen_preserved": true,
+  "not_run": "Full existing production suite, including previously failing test-mtp-workspace; no claim of resolved intermittent STAR timeout."
+}

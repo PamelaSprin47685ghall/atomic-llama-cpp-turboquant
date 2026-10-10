@@ -1,0 +1,6 @@
+{
+  "Q_correctness": "Recheck production-specialized Q64/Q128/Q256 with varied signed weights/activation at token,stream,row,block,word granularity; rows1/2/4; check every live and inactive output and each WG epoch/xor/extent. No change to arithmetic or checker tolerance.",
+  "norm_lo": "Production norm and LO_Q8 shaders with pre-ready generation, resident input and system-memory mailbox variants; verify all outputs and correct bank retirement. Isolated cost excludes host handoff latency and is not hardware lower bound.",
+  "resource_model": "Use separately measured shader intervals to replace inappropriate generic HC estimates; do not sum overlapping pipeline waits or add timestamp overhead to non-profile service as if intrinsic. Freeze any predictive envelope before using held-out end-to-end timings.",
+  "safety": "Run after model pilot completion and utility compilation; one exclusive GPU lock and five-card idle, no concurrent compilation. Stop on any numeric/protocol/fence error."
+}

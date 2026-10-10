@@ -1,0 +1,7 @@
+{
+  "goal": "Measure an independent96-stage protocol with the production F32 vector-copy P1 and existing5-way AVX2 sum/non-temporal fanout, replacing the older F16 conversion toy transport.",
+  "isolation": "TP5_PROBE_SERVICE_F32=1 is accepted only by the standalone relay service probe, with multiple normal replays and aligned F32 payload; no model uses this branch. Device-local coherent/uncached inbox matches actual allocation bits. Original generation, error, pending-submit and bounded drain checks remain.",
+  "checks": "First2 replays compare every uploaded F32 element, all measured replays preserve status/generation checks and exact finalstate. Consumer uses unchanged bounded tp5_relay shader. No fault injection in this calibration; inherited fault probes remain unchanged.",
+  "measurements": "96 stages,256/2560/4096 elements,16 replays,2 GPU timestamps per rank per wholechain, serial andparallel submission. Compare independent ready toy-consumer service rather than adding the whole toy chain on top of production norm.",
+  "limitations": "Main-Y transport only, not the full LateBind Q sidecar protocol or true model consumer. Component replacement and overlap assumptions must stay explicit. No whole-model residual may calibrate it and agreement would not prove silicon optimality."
+}

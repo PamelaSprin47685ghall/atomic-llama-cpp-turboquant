@@ -1,0 +1,7 @@
+{
+  "hypothesis": "Q8DOT's 20 groups of256 threads may underfill Navi21 versus 40x128 or80x64 while retaining exactly the same sixteen-lane row reduction.",
+  "single_change": "Split existing whole wave32 groups among smaller workgroups; do not change per-row lanes, block iteration, dot arithmetic, reduction tree, output packing, or epoch/extent/checksum protocol.",
+  "independent_gate": "Use production shader source and exact runtime sizes; test64/128/256 in local and coherent-system Q aperture; verify all output elements and each group's checksum, epoch and extent. Values are diagnostic, not model tok/s.",
+  "promotion": "Only a consistently faster geometry may proceed to an opt-in production pipeline; default unchanged. Real model A/B must retain output, actual group coverage and normal exit. Independent four-pair confirmation required for a speed claim.",
+  "boundary": "Microkernel service is an independently achievable implementation cost, not a universal hardware lower bound. More workgroups also increase checksum and publication work; end-to-end may reject a micro win."
+}

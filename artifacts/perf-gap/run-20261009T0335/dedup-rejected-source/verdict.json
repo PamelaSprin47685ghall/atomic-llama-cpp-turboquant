@@ -1,0 +1,14 @@
+{
+  "candidate": "identical barrier dedup",
+  "actual_eliminations": 0,
+  "pilot_A_tps": 66.50300378198047,
+  "pilot_B_tps": 66.48688763357111,
+  "status": "REJECTED_NO_ACTIONABLE_SITE",
+  "files": {
+    "ggml/src/ggml-vulkan/ggml-vulkan-tp5-command.h": "d049ff37b8bb7742ce7c60fb4bbd2c728d645c85ef7b680fd4f59f6859871fd8",
+    "ggml/src/ggml-vulkan/ggml-vulkan-tp5-barrier-key.h": "a9f9ec0f96d3e2ffb807113d03894df26966f6b9c3003b06360db8e2033b7ce3",
+    "tests/test-tp5-sparse-timing.cpp": "557a67bbfa0039e2d79c4b70cfaeb6ef930af5d10f262c5730967a5ecc134add",
+    "ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp": "96a57c0985924e757047070b3503c6dafe0ccc5a29591665177dd82b9e023023"
+  },
+  "source_note": "Snapshot taken after adding independent warm-window/qcheck diagnostic work; only barrier-key, instruction metadata and define-linear dedup loop are the rejected candidate."
+}

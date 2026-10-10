@@ -1,0 +1,129 @@
+{
+  "certificate": "necessity-certificate-v4.json (v3 superseded: DEFECT-1 dense bytes 90.8->63.82 MB/layer from audited inventory; DEFECT-2 L2 credit pool->active-set denominator; DEFECT-3 MTP row-batching amortizes R3 weight traffic, so v3's single 476 tok/s claim was not valid for the full allowed set)",
+  "bounds": {
+    "L_global": {
+      "per_token_lower_bound_s": 0.0001764527,
+      "tps_ceiling": 5666.9,
+      "valid_for": "full allowed set A (any draft policy, perfect acceptance)",
+      "binding_resource": "R4_fp32_alu: 14.3 GFLOP/token at 80.85 TFLOP/s aggregate spec peak"
+    },
+    "L_nomtp": {
+      "per_token_lower_bound_s": 0.001369042,
+      "tps_ceiling": 730.4,
+      "valid_for": "declared conditional class A_nomtp (one target row per public token)",
+      "binding_resource": "R3_active_weight_dram: 700.9 MB/GPU/token necessary DRAM (10/512 experts + 63.82 MB/layer dense, minus 128 MB max L2 credit) at 512 GB/s spec ceiling"
+    }
+  },
+  "S_lo_demonstrated_tps": 56.4681,
+  "S_lo_source": "f2pair pooled B-aggr (original Q2_0, horizon 1 + aggressive lowering, contract v5: 190 tokens natural stop, 8-process paired confirmation, body identical to h0 reference)",
+  "gap_vs_L_nomtp": 12.935405664072505,
+  "gap_vs_L_global": 111.5,
+  "convergence_status": "NOT CONVERGED. v4 replaces v3's single 476 tok/s number with an honest split: the 476 figure did not survive the MTP amortization audit (weights are read once per verify cycle, not once per row). L_nomtp=730 tok/s is the sound ceiling for no-MTP ranking; the demonstrated 50.8 tok/s Q2_0 reference sits 14.4x below it. Closing the gap requires (a) a faster qualified implementation (U side) and/or (b) provable non-amortizable latency coupling (KV-state reads, serial chain latency that does not hide under perfect-draft prefetch), neither of which is currently proved. No pseudo-ratio is computed beyond the two declared scopes.",
+  "serial_chain_r5_analysis": "Investigated and rejected for v4: a per-layer serial-latency term cannot be proved under the full allowed set. 'Arbitrary kernel fusion' permits a single fused dispatch for the whole 48-layer chain, making boundary dispatch latency an implementation choice; router-input reads hit just-produced data (registers/LDS/L2 under 'unrestricted caching'); past-token KV state is immutable and prefetchable. Every candidate latency coupling has a legal implementation that hides it. The honest convergence lever is the U side (faster qualified implementation), not further bound tightening under these premises.",
+  "v3_to_v4_changes": [
+    "DENSE_BYTES_PER_LAYER 90.8e6 -> 63.820906666666666e6 (audited 1222-tensor inventory)",
+    "L2 retention credit: min(128MB, active) instead of 128MB/11.9GB pool fraction",
+    "R3 excluded from the global bound (MTP amortization); L_global now binds on R4",
+    "kv rows corrected to 7168 (q 6144 + k 512 + v 512) for the 36 linear-attention layers; separate 12-layer full-attention term",
+    "PLE/attn_gate/ssm_out FLOPs counted as 2 per BF16 element (was byte-count coincidentally equal)"
+  ],
+  "tests": "tests/test-tp5-necessity-certificate.py (14 tests, passing)",
+  "h1_vs_h0_paired_v4": {
+    "geometric_mean_ratio": 1.09479,
+    "ci95": [
+      1.09008,
+      1.09952
+    ],
+    "blocks": 4,
+    "processes": 8,
+    "bodies_identical": true,
+    "acceptance": 0.731
+  },
+  "h1_vs_h0_paired": {
+    "contract": "v5 (190 tokens, length gate 160-240 passed)",
+    "geometric_mean_ratio": 1.13215,
+    "ci95": [
+      1.1232,
+      1.14118
+    ],
+    "blocks": 4,
+    "processes": 8,
+    "bodies_identical": true,
+    "pooled_h0_tps": 48.3687,
+    "pooled_h1_tps": 54.7607,
+    "acceptance": 0.731,
+    "verdict": "h1 promoted as best-known qualified arm (BEST_KNOWN_NOT_PROVEN_OPTIMAL)"
+  },
+  "mtp_depth_scan_v5": {
+    "h0": 48.3687,
+    "h1": 54.7607,
+    "h2": 51.1214,
+    "h3": 45.059,
+    "acceptance": {
+      "h1": 0.731,
+      "h2": 0.679,
+      "h3": 0.568
+    },
+    "mean_accepted_len": {
+      "h1": 1.73,
+      "h2": 2.36,
+      "h3": 2.7
+    },
+    "bodies_identical_to_h1": true,
+    "conclusion": "h1 optimal: cycle cost grows superlinearly with verify rows (h1->h2: rows 1.18x, cycle cost 1.38x); MTP amortization saturates"
+  },
+  "next_levers": [
+    "HC-site fusion shader (workorder A/B): merge ~74 elementwise nodes/stage into ~10 kernels; entry ggml-vulkan.cpp:21447 pattern + multi_add_rms.comp template",
+    "dispatch count 35/stage -> <20 requires C++/shader work order with parity harness"
+  ],
+  "latebind_mechanism_confirmation": {
+    "target": "HC-Q8 derived (different numeric path, approximate gate)",
+    "late_sites": 94,
+    "dispatches_reference": 3391,
+    "dispatches_aggressive": 2853,
+    "same_target_gain": "+9.7% (56.78 -> 62.32 tok/s, single process each)",
+    "meaning": "confirms launch-bound diagnosis and the LateBind lever; original Q2_0 needs BF16 LateBind (workorder A-native)"
+  },
+  "aggressive_lowering_paired": {
+    "comparison": "h1 latebind=off vs h1 latebind=aggressive (BF16 HC, late=0 sites; gain from gtt-push transport + -470 dispatches lowering)",
+    "geometric_mean_ratio": 1.02622,
+    "ci95": [
+      1.01703,
+      1.0355
+    ],
+    "blocks": 4,
+    "processes": 8,
+    "bodies_identical": true,
+    "pooled_off_tps": 55.0261,
+    "pooled_aggr_tps": 56.4681
+  },
+  "round_climb_original_target": {
+    "h0": 48.3687,
+    "h1": 54.7607,
+    "h1_aggr": 56.4681,
+    "total_gain": "+16.8% with body identical to h0 at every step"
+  },
+  "bf16_latebind_workorder": {
+    "status": "OPEN: implemented (capture hits late=94, dispatches 2702) but exact-path chain hangs at stage-0 Q sidecar handshake",
+    "controls": {
+      "G4_newbin_q2_off": "works 55.07 tok/s",
+      "G5_oldbin_hcq8_exact": "works",
+      "G7_newbin_hcq8_exact": "works 50.75",
+      "G6_force_q8_q_kernel": "still hangs (kernel excluded)"
+    },
+    "changes": "opt-in only; default and HC-Q8 paths regression-free (G4/G5/G7)",
+    "next": "GPU-side introspection of the late-split tape with BF16 down/up pipelines",
+    "bisection_final": {
+      "G9_bar_pull": "still hangs (transport excluded)",
+      "G10_q_debug": "940 Q+publisher recordings confirmed in chain tapes (bf16=1, pipe non-null)",
+      "timeline_reading": "tl=192 is the PREVIOUS (prewarm) chain's final signal; the current chain never completes",
+      "buffers": "sidecar/scatter/rho allocated unconditionally; sizes in bounds",
+      "conclusion": "GPU-side execution hang in the BF16-capture exact chain at the Q handshake; requires GPU introspection (next session)",
+      "zsnap_test": "still hangs (WAR aliasing excluded)",
+      "timeline_correction": "linear chain signals only at end (2*192=384); tl=192 is pre-chain; the chain never advances on GPU",
+      "no_error_flags": "err=0 everywhere: not a bounded-wait timeout; an execution deadlock between P1 copy and Q publication",
+      "next_session": "RADV-level GPU deadlock diagnosis (interactive tooling); candidate: BF16 down GEMV in the late-split tape position",
+      "G11_gemv_forced_q8": "still hangs - BF16 GEMV kernel also excluded; ALL components excluded (Q kernel, GEMV kernel, transport, WAR); remaining: norm producer pipeline difference (9-binding Q8 vs 8-binding plain) + descriptor sizes; needs interactive RADV GPU deadlock diagnosis"
+    }
+  }
+}

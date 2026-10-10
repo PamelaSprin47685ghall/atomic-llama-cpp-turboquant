@@ -1,0 +1,714 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index cfaaf1114..ede08861f 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2287,6 +2287,7 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const commo
+ 
+ void common_batch_clear(struct llama_batch & batch) {
+     batch.n_tokens = 0;
++    batch.token_device_sourced = false;
+ }
+ 
+ void common_batch_add(
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 81ca12ebe..0f8f9b735 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -704,6 +704,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+                 /*.n_seq_id =*/ nullptr,
+                 /*.seq_id   =*/ nullptr,
+                 /*.logits   =*/ nullptr,
++                /*.token_device_sourced =*/ false,
+             };
+             const int32_t rc = llama_encode(ctx_dft, enc_batch);
+             if (rc != 0) {
+@@ -1170,6 +1171,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     /*.n_seq_id =*/ nullptr,
+                     /*.seq_id   =*/ nullptr,
+                     /*.logits   =*/ nullptr,
++                    /*.token_device_sourced =*/ false,
+                 };
+ 
+                 int32_t rc = llama_encode(ctx_dft, enc_batch);
+@@ -1356,6 +1358,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::unique_ptr<common_mtp_workspace> workspace;
+     bool device_hidden = false;
+     uint64_t device_target_generation = 0;
++    // D1 two-step draft (opt-in GGML_TP5_MTP_DEVICE_TOKENS=1): step 0 runs the
++    // ordinary decode and captures its sampled token on-device; step 1 then
++    // decodes with device-sourced token+hidden and never re-enters
++    // common_sampler_sample for the step-0 candidate. The step-1 token is
++    // read back once, at cycle boundary, for result bookkeeping.
++    bool device_tokens = false;
++    llama_token device_token_step0 = LLAMA_TOKEN_NULL;
+ 
+     std::vector<int32_t> i_batch_beg;
+     std::vector<int32_t> i_batch_end;
+@@ -1477,6 +1486,58 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         device_hidden = true;
+     }
+ 
++    void enable_device_tokens() {
++        // D1 two-step draft gate: requires the device hidden channel (same
++        // single-sequence, single-head, non-shared-memory contract) plus a
++        // greedy backend chain on the draft context (p_min <= 0). Anything
++        // else keeps the historical per-step host round trip untouched.
++        if (!device_hidden) {
++            throw std::invalid_argument("device MTP tokens require device hidden enabled");
++        }
++        if (n_seq != 1 || chain_heads || is_mem_shared || backend_chains[0] == nullptr) {
++            throw std::invalid_argument("device MTP tokens require one sequence with a greedy backend chain");
++        }
++        if (params.n_max != 2) {
++            throw std::invalid_argument("device MTP tokens currently require the two-step horizon (n_max == 2)");
++        }
++        device_tokens = true;
++    }
++
++    // D1 two-step draft: run step 1 with the step-0 sampled token and hidden
++    // row sourced entirely on-device. Returns the decoded step-1 token via a
++    // single 4-byte cycle-boundary readback (semantic bookkeeping only).
++    int decode_device_step1(llama_pos pos) {
++        if (!llama_predefined_hidden_token_ready(params.ctx_dft)) {
++            return -1;
++        }
++        llama_batch step1 = batch; // borrowed view: token pointer unused below
++        step1.n_tokens = 1;
++        step1.token = nullptr;
++        step1.embd = nullptr;
++        step1.logits = nullptr;
++        step1.pos = &step1_pos;
++        step1_pos = pos;
++        step1.n_seq_id = &step1_nseq;
++        step1_nseq = 1;
++        step1.seq_id = &step1_seq_ptr;
++        step1_seq_ptr = &step1_seq;
++        step1_seq = 0;
++        step1.logits = &step1_logits;
++        step1_logits = 1;
++        step1.token_device_sourced = true;
++        const llama_predefined_hidden_range hidden{
++            params.ctx_dft, LLAMA_PREDEFINED_H_RESULT, LLAMA_PREDEFINED_H_INPUT, 0, 0, 1,
++            llama_predefined_hidden_generation(params.ctx_dft),
++        };
++        return llama_predefined_decode_hidden(params.ctx_dft, step1, &hidden, 1);
++    }
++
++    llama_pos step1_pos = 0;
++    int32_t step1_nseq = 1;
++    llama_seq_id * step1_seq_ptr = nullptr;
++    llama_seq_id step1_seq = 0;
++    int8_t step1_logits = 1;
++
+     int decode_device_target_rows(uint32_t first, uint32_t rows) {
+         if (rows == 0) return -1;
+         const llama_predefined_hidden_range inputs[] = {
+@@ -1855,6 +1916,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 i == 0 ? LLAMA_PREDEFINED_H_CARRY : LLAMA_PREDEFINED_H_RESULT,
+                 LLAMA_PREDEFINED_H_INPUT, 0, 0, 1,
+                 device_hidden && i != 0 ? llama_predefined_hidden_generation(ctx_dft) : 0};
++            // D1 two-step draft: on step 1 with device tokens, decode with the
++            // captured step-0 token + hidden entirely on-device. This is the
++            // mechanism-under-test: no llama_decode re-entry, no
++            // common_sampler_sample, no hidden host round trip for step 1's
++            // inputs. The step-1 candidate token is read back once inside the
++            // branch below (semantic bookkeeping, not an execution dependency).
++            if (device_tokens && i == 1) {
++                const int rc = decode_device_step1(dparams[0].n_past + 1);
++                if (rc != 0) {
++                    throw std::runtime_error("device MTP step-1 decode failed");
++                }
++                // Step 1 decoded on-device; its candidate token is read once
++                // here for result bookkeeping. The step-0 candidate was
++                // already recorded (device_token_step0); push both and finish
++                // the horizon. common_sampler_accept for step 0 already ran
++                // on the normal path above; accept step 1's token too so the
++                // draft chain state stays consistent with the reference loop.
++                const llama_token id1 = common_sampler_sample(smpls[0].get(), ctx_dft, 0, true);
++                if (id1 == LLAMA_TOKEN_NULL) {
++                    throw std::runtime_error("device MTP step-1 sampler returned no token");
++                }
++                common_sampler_accept(smpls[0].get(), id1, true);
++                dparams[0].result->push_back(id1);
++                drafting[0] = false;
++                n_drafting = 0;
++                break;
++            }
++
+             int ret = device_hidden ? llama_predefined_decode_hidden(ctx_dft, batch, &feedback, 1)
+                                     : llama_decode(ctx_dft, batch);
+             if (ret != 0) {
+@@ -1911,6 +2000,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 common_sampler_accept(smpl, id, true);
+ 
++                if (device_tokens && i == 0) {
++                    // D1 two-step draft: remember the step-0 candidate id for
++                    // result bookkeeping; the device slot already carries it
++                    // for step 1's embedding lookup (captured in decode_impl).
++                    device_token_step0 = id;
++                }
++
+                 auto & dp = dparams.at(seq_id);
+                 auto & result = *dp.result;
+ 
+@@ -2972,6 +3068,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+                 if (device_hidden && std::strcmp(device_hidden, "1") == 0) {
+                     impl->enable_device_hidden();
+                 }
++                const char * device_tokens = std::getenv("GGML_TP5_MTP_DEVICE_TOKENS");
++                if (device_tokens && std::strcmp(device_tokens, "0") != 0 && std::strcmp(device_tokens, "1") != 0) {
++                    throw std::invalid_argument("GGML_TP5_MTP_DEVICE_TOKENS must be 0 or 1");
++                }
++                if (device_tokens && std::strcmp(device_tokens, "1") == 0) {
++                    // D1 two-step draft opt-in. Throws on contract mismatch
++                    // (no greedy backend chain, horizon != 2, multi-sequence);
++                    // the historical path stays default when unset.
++                    impl->enable_device_tokens();
++                }
+                 impls.push_back(std::move(impl));
+                 break;
+             }
+diff --git a/examples/parallel/parallel.cpp b/examples/parallel/parallel.cpp
+index a46400c5b..e11f80441 100644
+--- a/examples/parallel/parallel.cpp
++++ b/examples/parallel/parallel.cpp
+@@ -400,6 +400,7 @@ int main(int argc, char ** argv) {
+                 batch.n_seq_id + i,
+                 batch.seq_id   + i,
+                 batch.logits   + i,
++                false,
+             };
+ 
+             const int ret = llama_decode(ctx, batch_view);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-tp5-rows.h b/ggml/src/ggml-vulkan/ggml-vulkan-tp5-rows.h
+index 4b61bdafd..5c1031b29 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-tp5-rows.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-tp5-rows.h
+@@ -2,6 +2,7 @@
+ 
+ #include <cstdint>
+ #include <limits>
++#include <cstddef>
+ 
+ // One column-tile program, not one shader/graph per token count. Keep the
+ // single-token contraction unchanged; batched direct output uses fixed tiles
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+index 4af486743..ea8817d8f 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+@@ -182,45 +182,110 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
+ // The q8dot variant redefines B as a quant block buffer; the shared
+ // float-vector fast path cannot read it and is never dispatched there.
+ #if K_PER_ITER == 8 && !defined(MUL_MAT_ID) && !defined(HC_DOWN_Q8_DOT)
+-    // Recurrent decode stores concurrent Lane vectors as columns sharing one
+-    // matrix. For the dominant one-row tile, dequantize that matrix block once
+-    // and reuse it for every Lane instead of repeating the weight load/work.
+-    if (num_rows == 1u && NUM_COLS > 1u) {
++    // Concurrent lanes are columns sharing one weight matrix. Compute all of them
++    // in one pass: fetch every column's activations into registers first, then walk
++    // the rows dequantizing each weight block exactly once and issuing all NUM_COLS
++    // products from registers. The generic loop below instead nests columns outside
++    // rows, which re-reads and re-dequantizes the same block once per (column,row)
++    // pair -- with six lanes that is six times the weight traffic, and it showed up
++    // as a ~7x cost per multi-row forward (235 ms at six rows versus 33 ms at one).
++    // The previous version of this fast path only covered num_rows == 1, which the
++    // quantized pipelines never reach because they are created with
++    // NUM_ROWS = 2*rm_stdq. Register budget: two vec4 per column, so the staged
++    // form is limited to NUM_COLS <= 8 and wider dispatches keep the per-row fetch.
++    if (NUM_COLS > 1u) {
+         const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
+         const uint iqs = (col%QUANT_K)/QUANT_R;
+         const uint iybs = col - col%QUANT_K;
+-        const uint ib = (first_row*p.ncols + col)/QUANT_K;
+-
+-        vec4 v = dequantize4(ib, iqs, a_offset);
+-        vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
+-        const vec2 dm = get_dm(ib, a_offset);
+-        if (dm.y != 0) {
+-            v = v * dm.x + dm.y;
+-            v2 = v2 * dm.x + dm.y;
+-        }
+ 
+-        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++#define MMV_LOAD_B(dst0, dst1, jj)                                                  \
++        {                                                                            \
++            const uint bbase = (jj)*p.batch_stride_b + b_offset + iybs + iqs;        \
++            MMV_LOAD_B_AT(dst0, dst1, bbase)                                         \
++        }
+ #if QUANT_R == 2
+-            const vec4 bv02 = vec4(data_b_v4[
+-                (j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
+-            const vec4 bv13 = vec4(data_b_v4[
+-                (j*p.batch_stride_b + b_offset + iybs + iqs + y_offset) / 4]);
+-            const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
+-            const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
++#define MMV_LOAD_B_AT(dst0, dst1, bbase)                                            \
++            const vec4 bv02 = vec4(data_b_v4[(bbase) / 4]);                           \
++            const vec4 bv13 = vec4(data_b_v4[((bbase) + y_offset) / 4]);              \
++            dst0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);                              \
++            dst1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
+ #else
+-            const vec4 bv0 = vec4(data_b_v4[
+-                (j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
+-            const vec4 bv1 = vec4(data_b_v4[
+-                (j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
++#define MMV_LOAD_B_AT(dst0, dst1, bbase)                                            \
++            dst0 = vec4(data_b_v4[(bbase) / 4]);                                      \
++            dst1 = vec4(data_b_v4[(bbase) / 4 + 1]);
+ #endif
+-            FLOAT_TYPE rowtmp = dot(bv0, v) + dot(bv1, v2);
+-            if (dm.y == 0) {
+-                rowtmp *= dm.x;
++
++        if (NUM_COLS <= 4u) {
++            // Staged: activations for every column live in registers, so the row
++            // walk touches memory only for its own weight block.
++            vec4 bstage0[NUM_COLS];
++            vec4 bstage1[NUM_COLS];
++            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++                MMV_LOAD_B(bstage0[j], bstage1[j], j)
++            }
++
++            uint ibi = first_row*p.ncols;
++            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
++#ifdef HC_UP_FOLD
++                const uint weight_row = (first_row % p.stride_d) + n * p.stride_d;
++                const uint ib = (weight_row * p.ncols + col)/QUANT_K;
++                ibi += p.ncols * p.stride_d;
++#else
++                const uint ib = (ibi + col)/QUANT_K;
++                ibi += p.ncols;
++#endif
++                vec4 v = dequantize4(ib, iqs, a_offset);
++                vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
++                const vec2 dm = get_dm(ib, a_offset);
++                if (dm.y != 0) {
++                    v = v * dm.x + dm.y;
++                    v2 = v2 * dm.x + dm.y;
++                }
++
++                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++                    FLOAT_TYPE rowtmp = dot(bstage0[j], v) + dot(bstage1[j], v2);
++                    if (dm.y == 0) {
++                        rowtmp *= dm.x;
++                    }
++                    temp[j][n] += rowtmp;
++                }
++            }
++            return;
++        }
++
++        uint ibi = first_row*p.ncols;
++        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
++#ifdef HC_UP_FOLD
++            const uint weight_row = (first_row % p.stride_d) + n * p.stride_d;
++            const uint ib = (weight_row * p.ncols + col)/QUANT_K;
++            ibi += p.ncols * p.stride_d;
++#else
++            const uint ib = (ibi + col)/QUANT_K;
++            ibi += p.ncols;
++#endif
++            vec4 v = dequantize4(ib, iqs, a_offset);
++            vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
++            const vec2 dm = get_dm(ib, a_offset);
++            if (dm.y != 0) {
++                v = v * dm.x + dm.y;
++                v2 = v2 * dm.x + dm.y;
++            }
++
++            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++                vec4 bv0;
++                vec4 bv1;
++                MMV_LOAD_B(bv0, bv1, j)
++                FLOAT_TYPE rowtmp = dot(bv0, v) + dot(bv1, v2);
++                if (dm.y == 0) {
++                    rowtmp *= dm.x;
++                }
++                temp[j][n] += rowtmp;
+             }
+-            temp[j][0] += rowtmp;
+         }
+         return;
+     }
++#undef MMV_LOAD_B
++#undef MMV_LOAD_B_AT
+ #endif
+ 
+     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+diff --git a/include/llama-predefined-hidden.h b/include/llama-predefined-hidden.h
+index 18e29aa2a..50cfde31b 100644
+--- a/include/llama-predefined-hidden.h
++++ b/include/llama-predefined-hidden.h
+@@ -36,6 +36,21 @@ LLAMA_API uint64_t llama_predefined_hidden_generation(const struct llama_context
+ LLAMA_API bool llama_predefined_hidden_copy(struct llama_context * dst,
+         const struct llama_predefined_hidden_range * ranges, size_t n_ranges);
+ 
++// D1 two-step draft: capture the draft context's sampled token tensor (one
++// I32 row produced by the backend greedy chain) into the persistent device
++// token slot, and consume it as the token source of the next decode_hidden
++// call. The slot is owned by the hidden store's buffer, never a graph arena.
++// capture_sampled_token must be called while `sampled` is still a live graph
++// output of `ctx` (same scheduler completion covers both). The next
++// decode_predefined_hidden call may then pass batch.token == NULL when
++// device_tokens_ready() returned true.
++LLAMA_API bool llama_predefined_hidden_capture_token(struct llama_context * ctx, struct ggml_tensor * sampled);
++LLAMA_API bool llama_predefined_hidden_token_ready(const struct llama_context * ctx);
++
++// Device-side token source for the next decode: exposes the persistent slot
++// tensor so the graph input setter can copy from it on-device.
++LLAMA_API const struct ggml_tensor * llama_predefined_hidden_token_slot(const struct llama_context * ctx);
++
+ // H_INPUT is virtual: the ranges cover [0,batch.n_tokens) without gaps/overlap
+ // and are copied directly into the graph input. No packed input arena exists.
+ // Consumes a token batch and device hidden rows; does not upload batch.embd.
+diff --git a/include/llama.h b/include/llama.h
+index 90a48e7cc..2e69c35bd 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -511,6 +511,10 @@ extern "C" {
+         int32_t      *  n_seq_id;
+         llama_seq_id ** seq_id;
+         int8_t       *  logits;   // TODO: rename this to "output"
++        // D1 two-step MTP draft: set by the implementation when token ids are
++        // sourced from a device slot; the token pointer then points at an
++        // opaque stub and its values must not be read or validated.
++        bool token_device_sourced;
+     } llama_batch;
+ 
+     enum llama_model_kv_override_type {
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 6d906dc59..e0bdde8a7 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -47,10 +47,15 @@ bool llama_batch_allocr::init(
+     }
+ 
+     if (batch.token) {
+-        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+-            if (batch.token[i] < 0 || (uint32_t) batch.token[i] >= vocab.n_tokens()) {
+-                LLAMA_LOG_ERROR("%s: invalid token[%d] = %d\n", __func__, i, batch.token[i]);
+-                return false;
++        // D1 two-step draft: device-sourced ids point at an opaque stub;
++        // validating stub bytes would reject the batch. The device slot was
++        // produced by the model's own argmax over the real vocab.
++        if (!batch.token_device_sourced) {
++            for (int32_t i = 0; i < batch.n_tokens; ++i) {
++                if (batch.token[i] < 0 || (uint32_t) batch.token[i] >= vocab.n_tokens()) {
++                    LLAMA_LOG_ERROR("%s: invalid token[%d] = %d\n", __func__, i, batch.token[i]);
++                    return false;
++                }
+             }
+         }
+     }
+@@ -972,6 +977,7 @@ struct llama_batch llama_batch_get_one(
+         /*n_seq_id =*/ nullptr,
+         /*seq_id   =*/ nullptr,
+         /*logits   =*/ nullptr,
++        /*token_device_sourced =*/ false,
+     };
+ }
+ 
+@@ -984,6 +990,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
+         /*n_seq_id =*/ nullptr,
+         /*seq_id   =*/ nullptr,
+         /*logits   =*/ nullptr,
++        /*token_device_sourced =*/ false,
+     };
+ 
+     if (embd) {
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+index f31503de7..97cd3759f 100644
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -91,6 +91,14 @@ struct llama_ubatch {
+     int32_t      *  source_row     = nullptr; // [n_tokens] original batch row, nullptr if unavailable
+     // Borrowed only during process_ubatch/set_inputs, never retained by a graph.
+     const llama_device_hidden_input * device_hidden = nullptr;
++    // D1 two-step draft, borrowed only during process_ubatch/set_inputs:
++    // device-side token ids for this ubatch. When set, the host token pointer
++    // is an opaque stub (never read) and the embd_h input uploads ids from
++    // this device source instead. Mirrors device_hidden ownership rules.
++    const ggml_tensor * device_tokens = nullptr;
++    // Executor that owns device_tokens (the hidden store's executor). Used
++    // by set_input to order the device-to-device copy; null with tokens null.
++    ggml_backend_t device_tokens_executor = nullptr;
+ };
+ 
+ // a helper for sanitizing, fulfilling and splitting a batch
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8043bf48f..8e60105b8 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4409,6 +4409,20 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
+             // async copy the sampling data from the backend to the host
+             copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());
+ 
++            // D1 two-step draft: mirror the sampled row into the persistent
++            // device token slot so the next draft step can consume the token
++            // without any host round trip. Same-queue order (this copy is
++            // enqueued right after the producing compute on the same
++            // scheduler) covers the dependency; the slot is store-owned.
++            if (predefined_hidden && predefined_hidden->token_slot) {
++                auto it = res->t_sampled.find(0);
++                if (it != res->t_sampled.end() && it->second &&
++                    !predefined_hidden_capture_token(it->second)) {
++                    LLAMA_LOG_ERROR("%s: device token capture failed\n", __func__);
++                    return -3;
++                }
++            }
++
+             copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
+             copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
+             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bb3f439a6..a5ab9df11 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -88,6 +88,12 @@ struct llama_context {
+     bool predefined_hidden_reset();
+     bool predefined_hidden_capture(ggml_backend_t producer, const ggml_tensor * tensor, uint32_t offset, uint32_t rows);
+     bool predefined_hidden_readback();
++    // D1 two-step draft: device-side token slot capture/consume. The capture
++    // copies one I32 sampled-token row into the persistent store slot; the
++    // next decode may then source token ids on-device (batch.token == NULL).
++    bool predefined_hidden_capture_token(ggml_tensor * sampled);
++    bool predefined_hidden_token_ready() const;
++    const ggml_tensor * predefined_hidden_token_slot() const;
+     bool predefined_hidden_bind_ubatch(llama_ubatch & ubatch, llama_device_hidden_input & input);
+     void set_predefined_target_enabled(bool enabled) { predefined_target_enabled = enabled; }
+     bool get_predefined_target_enabled() const { return predefined_target_enabled; }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 62e6a9135..f34526e9a 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,5 +1,6 @@
+ #include "llama-graph.h"
+ #include "llama-predefined-hidden.h"
++#include "ggml-device-copy.h"
+ #include "llama-rerot-profile.h"
+ 
+ #include "llama-impl.h"
+@@ -119,7 +120,21 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
+ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_tokens = ubatch->n_tokens;
+ 
+-    if (ubatch->token) {
++    if (ubatch->device_tokens) {
++        // D1 two-step draft: token ids live in the persistent device slot;
++        // copy device-to-device through the owning executor. The host token
++        // pointer is an opaque stub on this path and must never be read.
++        if (!tokens || n_tokens != 1 || ubatch->device_tokens->type != GGML_TYPE_I32 ||
++            !ubatch->device_tokens_executor || !tokens->buffer || !ubatch->device_tokens->buffer) {
++            throw std::runtime_error("device MTP token input shape mismatch");
++        }
++        const ggml_device_copy_range token_copy{ubatch->device_tokens, tokens,
++            0, 0, ggml_nbytes(ubatch->device_tokens)};
++        if (!ggml_backend_device_copy_ranges(ubatch->device_tokens_executor,
++                &token_copy, 1, false)) {
++            throw std::runtime_error("device MTP token upload has no native local copy");
++        }
++    } else if (ubatch->token) {
+         if (tokens && n_tokens > tokens->ne[0]) {
+             throw std::runtime_error("predefined token rows exceed fixed token capacity");
+         }
+diff --git a/src/llama-predefined-hidden.cpp b/src/llama-predefined-hidden.cpp
+index bf5617878..78ed97528 100644
+--- a/src/llama-predefined-hidden.cpp
++++ b/src/llama-predefined-hidden.cpp
+@@ -23,7 +23,7 @@ std::unique_ptr<llama_predefined_hidden_store> make_store(ggml_backend_t executo
+     out->result_capacity = result_rows;
+     out->width = width;
+     ggml_init_params params{};
+-    params.mem_size = out->tensors.size() * ggml_tensor_overhead();
++    params.mem_size = (out->tensors.size() + 1) * ggml_tensor_overhead(); // +1 token slot
+     params.no_alloc = true;
+     out->context.reset(ggml_init(params));
+     if (!out->context) {
+@@ -36,6 +36,9 @@ std::unique_ptr<llama_predefined_hidden_store> make_store(ggml_backend_t executo
+         ggml_set_name(out->tensors[i], names[i]);
+         ggml_set_input(out->tensors[i]);
+     }
++    out->token_slot = ggml_new_tensor_1d(out->context.get(), GGML_TYPE_I32, 1);
++    ggml_set_name(out->token_slot, "mtp_persistent_token");
++    ggml_set_input(out->token_slot);
+     out->buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(out->context.get(),
+         ggml_backend_get_default_buffer_type(executor)));
+     if (!out->buffer) {
+@@ -227,11 +230,35 @@ bool llama_context::predefined_hidden_copy(const llama_predefined_hidden_range *
+ }
+ 
+ int llama_context::decode_predefined_hidden(llama_batch batch, const llama_predefined_hidden_range * ranges, size_t n) {
++    // D1 two-step draft: when the persistent token slot holds a captured
++    // sampled row, batch.token may be null — token ids are sourced on-device
++    // (see predefined_hidden_bind_ubatch / llm_graph_input_embd_h::set_input).
++    // The 4-byte semantic alternative (host readback) stays the default when
++    // the slot is not valid, preserving the historical path bit-for-bit.
++    const bool device_tokens = !batch.token && predefined_hidden &&
++        predefined_hidden->token_valid && predefined_hidden->token_slot;
+     if (!predefined_hidden || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
+-        predefined_hidden->bound_input || !batch.token || batch.n_tokens <= 0 ||
++        predefined_hidden->bound_input || (!batch.token && !device_tokens) || batch.n_tokens <= 0 ||
+         uint32_t(batch.n_tokens) > predefined_hidden->capacity || !ranges || n == 0 || n > GGML_DEVICE_COPY_MAX_RANGES) {
+         return -1;
+     }
++    if (device_tokens && batch.n_tokens != 1) {
++        // The slot holds exactly one sampled row; multi-token device-sourced
++        // decode is not part of this contract.
++        return -1;
++    }
++
++    // With device tokens the batch still needs a non-null token pointer for
++    // the batch allocator's shape bookkeeping; point it at a zero stub whose
++    // value is never consumed (set_input takes the device slot instead, and
++    // decode_impl's vocab-range validation is skipped via token_device_sourced).
++    if (device_tokens) {
++        int32_t token_stub = 0;
++        batch.token = &token_stub;
++        // Mark that these ids are device-sourced: consumers must not trust
++        // the stub values. batch.embd stays null below as before.
++        batch.token_device_sourced = true;
++    }
+     uint64_t covered = 0;
+     std::array<llama_predefined_hidden_store::bound_range, GGML_DEVICE_COPY_MAX_RANGES> bound{};
+     for (size_t i = 0; i < n; ++i) {
+@@ -311,6 +338,13 @@ bool llama_context::predefined_hidden_bind_ubatch(llama_ubatch & ubatch, llama_d
+     if (!llama_predefined_hidden_slice(h.input.data(), h.input_count, h.input_rows, h.width,
+                                        ubatch.source_row, ubatch.n_tokens, h.executor, input)) return false;
+     ubatch.device_hidden = &input;
++    // D1 two-step draft: when this decode was admitted with a device token
++    // source (token_valid slot), expose it so llm_graph_input_embd_h uploads
++    // ids on-device instead of reading the opaque host stub.
++    if (h.token_valid && h.token_slot && ubatch.token) {
++        ubatch.device_tokens = h.token_slot;
++        ubatch.device_tokens_executor = h.executor;
++    }
+     return true;
+ }
+ 
+@@ -358,9 +392,46 @@ bool llama_context::predefined_hidden_reset() {
+     h.input_count = 0;
+     h.input = {};
+     h.host_current = false;
++    h.token_valid = false; // D1: a reset sequence state invalidates the captured draft token
++    return true;
++}
++
++bool llama_context::predefined_hidden_capture_token(ggml_tensor * sampled) {
++    // D1 two-step draft: copy the graph's sampled-token row (I32) into the
++    // persistent device slot. The caller invokes this inside the same
++    // scheduler window that produced `sampled`, so queue order covers the
++    // dependency; no host round trip and no scheduler-arena retention.
++    if (!predefined_hidden || !predefined_hidden->token_slot || !sampled) {
++        return false;
++    }
++    if (sampled->type != GGML_TYPE_I32 || ggml_nelements(sampled) != 1) {
++        LLAMA_LOG_ERROR("%s: sampled token source must be one I32 row\n", __func__);
++        return false;
++    }
++    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), sampled);
++    if (!backend) {
++        return false;
++    }
++    auto * slot = predefined_hidden->token_slot;
++    if (ggml_backend_buffer_is_host(slot->buffer) || ggml_backend_buffer_is_host(sampled->buffer)) {
++        // Same-device fast path is the design point; a host-visible slot
++        // would silently reintroduce the CPU bridge this mechanism removes.
++        return false;
++    }
++    ggml_backend_tensor_copy_async(backend, backend, sampled, slot);
++    predefined_hidden->pending = true;
++    predefined_hidden->token_valid = true;
+     return true;
+ }
+ 
++bool llama_context::predefined_hidden_token_ready() const {
++    return predefined_hidden && predefined_hidden->token_valid && predefined_hidden->token_slot;
++}
++
++const ggml_tensor * llama_context::predefined_hidden_token_slot() const {
++    return predefined_hidden && predefined_hidden->token_valid ? predefined_hidden->token_slot : nullptr;
++}
++
+ bool llama_predefined_hidden_enable(llama_context * target, llama_context * draft) {
+     return hidden_api(__func__, false, [&] { return target && draft && target->enable_predefined_hidden(*draft); });
+ }
+@@ -387,3 +458,15 @@ bool llama_predefined_hidden_carry_set(llama_context * ctx, const float * data,
+ bool llama_predefined_hidden_reset(llama_context * ctx) {
+     return hidden_api(__func__, false, [&] { return ctx && ctx->predefined_hidden_reset(); });
+ }
++
++bool llama_predefined_hidden_capture_token(llama_context * ctx, ggml_tensor * sampled) {
++    return hidden_api(__func__, false, [&] { return ctx && ctx->predefined_hidden_capture_token(sampled); });
++}
++
++bool llama_predefined_hidden_token_ready(const llama_context * ctx) {
++    return ctx && ctx->predefined_hidden_token_ready();
++}
++
++const ggml_tensor * llama_predefined_hidden_token_slot(const llama_context * ctx) {
++    return ctx ? ctx->predefined_hidden_token_slot() : nullptr;
++}
+diff --git a/src/llama-predefined-hidden.h b/src/llama-predefined-hidden.h
+index 0e919f2ac..d426d2f52 100644
+--- a/src/llama-predefined-hidden.h
++++ b/src/llama-predefined-hidden.h
+@@ -16,6 +16,11 @@ struct llama_predefined_hidden_store {
+     ggml_backend_t executor = nullptr;
+     ggml_context_ptr context;
+     ggml_backend_buffer_ptr buffer;
++    // Persistent device token slot (1 x I32). Written by the two-step draft
++    // loop from the previous step's sampled-token tensor; read as the
++    // device-side token source for the next decode. Owned like the hidden
++    // tensors by this store's buffer, never by a graph scheduler arena.
++    ggml_tensor * token_slot = nullptr;
+     // RESULT + two single-row states. INPUT is a logical destination range,
+     // not another maximum-sized matrix.
+     std::array<ggml_tensor *, 3> tensors{};
+@@ -41,6 +46,10 @@ struct llama_predefined_hidden_store {
+     bool bound_input = false;
+     bool pending = false;
+     bool host_current = false;
++    // D1 two-step draft: set once a sampled-token capture has been enqueued;
++    // cleared by reset. Read by token_ready()/token_slot() to gate the
++    // device-token decode path.
++    bool token_valid = false;
+ };
+ 
+ // Borrowed for one synchronous set_inputs() call. Only capacity backing is
+diff --git a/tools/batched-bench/batched-bench.cpp b/tools/batched-bench/batched-bench.cpp
+index e2dcd0b2e..f1a0f0193 100644
+--- a/tools/batched-bench/batched-bench.cpp
++++ b/tools/batched-bench/batched-bench.cpp
+@@ -91,6 +91,7 @@ int llama_batched_bench(int argc, char ** argv) {
+                 batch.n_seq_id + i,
+                 batch.seq_id   + i,
+                 batch.logits   + i,
++                false,
+             };
+ 
+             const int ret = llama_decode(ctx, batch_view);
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index f4105629e..453172453 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -679,6 +679,7 @@ static bool decode_helper(llama_context * ctx, llama_batch & batch, std::vector<
+             batch.n_seq_id + i,
+             batch.seq_id   + i,
+             batch.logits   + i,
++            false,
+         };
+ 
+         const int ret = llama_decode(ctx, batch_view);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 7b613613e..ae584cd85 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -325,6 +325,7 @@ struct server_batch {
+             batch.n_seq_id + off,
+             batch.seq_id   + off,
+             batch.logits   + off,
++            batch.token_device_sourced,
+         };
+ 
+         return view;

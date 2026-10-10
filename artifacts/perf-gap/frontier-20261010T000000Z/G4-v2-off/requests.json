@@ -1,0 +1,60 @@
+[
+  {
+    "idx": 0,
+    "phase": "warmup",
+    "n": 190,
+    "predicted_ms": 4139.517,
+    "tps": 45.89907469881148,
+    "wall_ms": 9435.270524,
+    "finish": "stop",
+    "content_sha256": "fc7ed1877f5a20927147034e52c6f119b3ac11d1be0e02f9a1d3effb36a4841e",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 93,
+      "prompt_ms": 5291.586,
+      "prompt_per_token_ms": 56.89877419354839,
+      "prompt_per_second": 17.57507106565026,
+      "predicted_n": 190,
+      "predicted_ms": 4139.517,
+      "predicted_per_token_ms": 21.786931578947367,
+      "predicted_per_second": 45.89907469881148,
+      "draft_n": 104,
+      "draft_n_accepted": 85
+    },
+    "issues": [],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=97 uid=36028797018971137",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=97 uid=36028797018971649",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=97 uid=36028797018972161",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=97 uid=36028797018972673",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=97 uid=36028797018973185",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=97 uid=36028797018973953",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=10 n_sub=97 uid=36028797019019777"
+    ]
+  },
+  {
+    "idx": 1,
+    "phase": "measured",
+    "n": 190,
+    "predicted_ms": 3450.052,
+    "tps": 55.0716337029123,
+    "wall_ms": 7289.955837,
+    "finish": "stop",
+    "content_sha256": "fc7ed1877f5a20927147034e52c6f119b3ac11d1be0e02f9a1d3effb36a4841e",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 93,
+      "prompt_ms": 3185.081,
+      "prompt_per_token_ms": 34.24818279569892,
+      "prompt_per_second": 29.19862948540398,
+      "predicted_n": 190,
+      "predicted_ms": 3450.052,
+      "predicted_per_token_ms": 18.158168421052633,
+      "predicted_per_second": 55.0716337029123,
+      "draft_n": 104,
+      "draft_n_accepted": 85
+    },
+    "issues": [],
+    "fallback_lines": []
+  }
+]

@@ -1,0 +1,42 @@
+{
+ "nosnap": [
+  {
+   "i": 0,
+   "predicted_ms": 3488.795,
+   "completion": 156,
+   "finish": "stop"
+  },
+  {
+   "i": 1,
+   "predicted_ms": 3507.007,
+   "completion": 156,
+   "finish": "stop"
+  },
+  {
+   "i": 2,
+   "predicted_ms": 3512.088,
+   "completion": 156,
+   "finish": "stop"
+  }
+ ],
+ "zsnap": [
+  {
+   "i": 0,
+   "predicted_ms": 3528.159,
+   "completion": 158,
+   "finish": "stop"
+  },
+  {
+   "i": 1,
+   "predicted_ms": 3558.519,
+   "completion": 158,
+   "finish": "stop"
+  },
+  {
+   "i": 2,
+   "predicted_ms": 3552.741,
+   "completion": 158,
+   "finish": "stop"
+  }
+ ]
+}

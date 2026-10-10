@@ -1,0 +1,6 @@
+{
+  "distinct_memory_path": "The host-pointer import cannot supply device-coherent memory. Instead allocate/export a device-local HOST_COHERENT|DEVICE_COHERENT DMA-BUF from GPU0 and import its actual allocation into the other four GPUs. Every imported type must independently satisfy the same required flags; no weakening of the failed host-import requirement.",
+  "protocol": "Original bounded persistent GPU polling, two mailbox banks, unique epochs. One shared allocation owner, same full F32 five-rank recurrence. No host per-stage work or imported semaphore waiting.",
+  "gates": "First1/2/3stage small cases; only after full bitwise outputs and clean status proceed96stage and withheld-publisher tests. All actual memory type flags recorded. A creation/import failure stops before workload.",
+  "limits": "An experimental standalone peer protocol, not production integration or model throughput. DMA-BUF export availability is not assumed; any allocation or visibility failure remains explicit evidence. No hardware reset, timeout or driver changes."
+}

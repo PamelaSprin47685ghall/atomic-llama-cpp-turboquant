@@ -1,0 +1,62 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文回答普通成年人如何健康减重。回答必须包含以下六个部分，每部分标题单独一行：\n一、热量缺口原理（两三句解释）\n二、饮食建议（列出四条具体建议，每条一句解释）\n三、每周运动安排（给出具体周计划）\n四、睡眠与恢复（两三句）\n五、常见误区（列出三个误区并各解释一句）\n六、长期执行方法（两三句）\n语言自然，正常结束，不要提前停止，不要总结后立即收尾。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "length",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "一、热量缺口原理\n减重的核心逻辑在于摄入的热量必须小于消耗的热量，从而迫使身体动用储存的脂肪作为能量来源。这种缺口不需要极端，通常每天减少300至500千卡即可实现安全且可持续的体重下降。\n\n二、饮食建议\n优先选择高纤维食物如蔬菜、全谷物和豆类，因为它们能增加饱腹感并稳定血糖水平。减少精制糖和超加工食品的摄入，避免隐形热量陷阱并降低炎症反应。控制每餐的蛋白质摄入量，确保每餐都有优质蛋白来源以维持肌肉量并提升代谢率。采用规律进食模式，避免长时间饥饿后暴饮暴食，保持稳定的能量供应。\n\n三、每周运动安排\n周一进行30分钟中等强度有氧运动如快走或慢跑，以提升心肺功能。周二进行力量训练，重点锻炼大肌群如腿、背和胸，以增强基础代谢。周三休息或进行轻度活动如散步，让身体恢复。周四再次进行有氧运动，可尝试间歇性高强度训练以提高效率。周五进行另一组力量训练，侧重核心稳定性与灵活性。周六进行户外活动或长距离步行，享受自然并增加日常活动量。周日完全休息，专注于放松和准备下周的饮食计划。\n\n四、睡眠与恢复\n充足的睡眠有助于调节饥饿激素和饱腹激素，防止因疲劳导致的过度进食。恢复期不仅包括身体休息，也涉及心理放松，减少压力对代谢的负面影响。\n\n五、常见误区\n认为不吃晚餐就能减肥，这往往导致夜间饥饿感增强，反而引发次日过量进食。过度依赖单一食物或极端节食，会导致营养失衡和代谢率下降，难以长期维持。只关注体重数字而忽略体脂率变化，可能误判减重效果，因为肌肉增加可能抵消脂肪减少带来的体重变化。\n\n六、长期执行方法\n将健康习惯融入日常生活而非视为短期任务，通过微小"
+        }
+      }
+    ],
+    "created": 1791612864,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 400,
+      "prompt_tokens": 130,
+      "total_tokens": 530,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-6dqrdp1YzrHSydiQRfMFVgOgJCeG9UFG",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 130,
+      "prompt_ms": 4839.285,
+      "prompt_per_token_ms": 37.22526923076923,
+      "prompt_per_second": 26.863472599774553,
+      "predicted_n": 400,
+      "predicted_ms": 9165.842,
+      "predicted_per_token_ms": 22.914605,
+      "predicted_per_second": 43.6402896755148
+    }
+  },
+  "wall_ms": 14009.468103,
+  "log_begin": 15407,
+  "log_end": 41343,
+  "phase": "warmup"
+}

@@ -1,0 +1,103 @@
+[
+  {
+    "run": "gpu-ledger",
+    "request": "request-2.json",
+    "public_tokens": 176,
+    "cycles": 0,
+    "public_tokens_per_observed_cycle": null,
+    "cycle_component_ms": null,
+    "generation_ms": 2950.709,
+    "prompt_ms": 1021.111,
+    "wall_ms": 4482.641701,
+    "generation_minus_cycle_components_ms": null,
+    "max_target_us": null,
+    "accepted_histogram": {},
+    "logged_final_tokens": null,
+    "gpu_capture_scope": "Captured chains only, not whole-request totals; ranks overlap; tail_compute is nested.",
+    "target_cycle_median_us": null,
+    "target_first_cycle_us": null,
+    "definition_lines_rank0": 10,
+    "gpu_by_rank_rows": {
+      "rank0_rows0": {
+        "samples": 1,
+        "span_us": 20761.95,
+        "p2_us": 3853.28,
+        "compute_us": 10515.79,
+        "p1_us": 1163.4,
+        "late_pre_us": 5176.16,
+        "gaps_us": 23.04,
+        "tail_compute_us": 215.08
+      },
+      "rank1_rows0": {
+        "samples": 1,
+        "span_us": 20603.71,
+        "p2_us": 3700.88,
+        "compute_us": 10740.24,
+        "p1_us": 1178.11,
+        "late_pre_us": 4930.48,
+        "gaps_us": 23.56,
+        "tail_compute_us": 216.56
+      },
+      "rank2_rows0": {
+        "samples": 1,
+        "span_us": 20469.49,
+        "p2_us": 3859.24,
+        "compute_us": 10744.48,
+        "p1_us": 1177.41,
+        "late_pre_us": 4636.24,
+        "gaps_us": 23.2,
+        "tail_compute_us": 218.96
+      },
+      "rank3_rows0": {
+        "samples": 1,
+        "span_us": 20324.53,
+        "p2_us": 3753.96,
+        "compute_us": 10847.56,
+        "p1_us": 1197.64,
+        "late_pre_us": 4471.45,
+        "gaps_us": 24.16,
+        "tail_compute_us": 216.28
+      },
+      "rank4_rows0": {
+        "samples": 1,
+        "span_us": 20190.74,
+        "p2_us": 3965.44,
+        "compute_us": 10674.62,
+        "p1_us": 1214.52,
+        "late_pre_us": 4279.88,
+        "gaps_us": 24.48,
+        "tail_compute_us": 217.24
+      }
+    },
+    "tp5-relay-profile": {
+      "count": 177,
+      "totals": {
+        "stages": 16991.0,
+        "ready_us": 1569418.0,
+        "skew_us": 142951.0,
+        "arm_us": 36395.0,
+        "cpu_data_us": 115778.0,
+        "generation_us": 903.0,
+        "handoff_us": 2036283.0,
+        "submit_us": 95064.0,
+        "sidecar_wait_us": 0,
+        "sidecar_data_us": 0
+      }
+    },
+    "tp5-latebind-profile": {
+      "count": 177,
+      "totals": {
+        "stages": 0,
+        "ready_us": 0,
+        "skew_us": 0,
+        "arm_us": 0,
+        "cpu_data_us": 0,
+        "generation_us": 0,
+        "handoff_us": 0,
+        "submit_us": 0,
+        "sidecar_wait_us": 307546.0,
+        "sidecar_data_us": 36316.0
+      }
+    }
+  }
+]

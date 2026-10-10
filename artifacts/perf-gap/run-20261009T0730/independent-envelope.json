@@ -1,0 +1,570 @@
+{
+  "kind": "INDEPENDENT_SOURCE_COUNTED_COMPONENT_BUDGET_NOT_HARDWARE_OPTIMUM",
+  "frozen_utc": "2026-10-09T09:00:46Z",
+  "no_whole_model_time_inputs": true,
+  "original_ideal_bytes": 1869594000.0,
+  "original_ideal_tps_512": 273.8562490037944,
+  "source_identity": {
+    "metadata_sha256": "a8f11f412019323c8e22586071c0b2f29ab0c5faa9919ca37b90e5ff9ea69143",
+    "layout_sha256": "8fdb4b5f2f63ef9ef1ccaed9849b866e55665ab5c74a6bb625ddfd54b6319f76"
+  },
+  "hc_sites": 94,
+  "assumed_fully_hidden_injects": 23,
+  "hc_removed_weight_bytes": 662481920,
+  "fused_moe_removed_weight_bytes": 142264320.0,
+  "native_proxy_removed_weight_bytes": 1005004800.0,
+  "remaining_proxy_weight_bytes": 59842960.0,
+  "native_proxies": [
+    {
+      "case": "router-f32",
+      "tensor_names": [
+        "ffn_gate_inp.weight"
+      ],
+      "count": 48,
+      "removed_bytes": 251658240.0,
+      "service_us": 16.519231,
+      "min_us": 15.942308,
+      "service_ms": 0.792923088,
+      "source": "artifacts/perf-gap/run-20261009T0730/native-warm-calibration/router-f32-stream.log",
+      "sha256": "73dc68a2eb74be80b8f1c3510ccbc623d8be9005edbaee1607294d8f411075c1",
+      "qualification": "Isolated native contraction, host graph/sync amortized; not a proof of fused-region latency"
+    },
+    {
+      "case": "q6-vocab",
+      "tensor_names": [
+        "output.weight"
+      ],
+      "count": 1,
+      "removed_bytes": 104294400.0,
+      "service_us": 249.25,
+      "min_us": 247.75,
+      "service_ms": 0.24925,
+      "source": "artifacts/perf-gap/run-20261009T0730/native-warm-calibration/q6-vocab-stream.log",
+      "sha256": "97ce4d2ae989f309546776e114725bc7cd917554c6ef0589dcf9031c49cdb33d",
+      "qualification": "Isolated native contraction, host graph/sync amortized; not a proof of fused-region latency"
+    },
+    {
+      "case": "gdn-q5-projection",
+      "tensor_names": [
+        "attn_qkv.weight"
+      ],
+      "count": 36,
+      "removed_bytes": 243302400.0,
+      "service_us": 19.9,
+      "min_us": 18.775,
+      "service_ms": 0.7163999999999999,
+      "source": "artifacts/perf-gap/run-20261009T0730/native-warm-calibration/gdn-q5-projection-stream.log",
+      "sha256": "84952a2192f1319bf251c0764721c56e825875e45a8668bcefa4283c23bf7bdf",
+      "qualification": "Isolated native contraction, host graph/sync amortized; not a proof of fused-region latency"
+    },
+    {
+      "case": "gdn-gate-q5",
+      "tensor_names": [
+        "attn_gate.weight"
+      ],
+      "count": 36,
+      "removed_bytes": 81100800.0,
+      "service_us": 8.291667,
+      "min_us": 7.741667,
+      "service_ms": 0.29850001200000004,
+      "source": "artifacts/perf-gap/run-20261009T0730/native-warm-calibration/gdn-gate-q5-stream.log",
+      "sha256": "b8b24ff82d99d9b9e1afe01b2d451fa5d699295a3abe57cc7eff4a4826bd1be2",
+      "qualification": "Isolated native contraction, host graph/sync amortized; not a proof of fused-region latency"
+    },
+    {
+      "case": "q5-output",
+      "tensor_names": [
+        "ssm_out.weight",
+        "attn_output.weight"
+      ],
+      "count": 48,
+      "removed_bytes": 108134400.0,
+      "service_us": 9.375,
+      "min_us": 9.033333,
+      "service_ms": 0.45,
+      "source": "artifacts/perf-gap/run-20261009T0730/native-warm-calibration/q5-output-stream.log",
+      "sha256": "420a2b960c29373ed014b7f9680751b84d1fe197746e8d047729ac619d6d4f9e",
+      "qualification": "Isolated native contraction, host graph/sync amortized; not a proof of fused-region latency"
+    },
+    {
+      "case": "qsa-q-q5",
+      "tensor_names": [
+        "attn_q.weight"
+      ],
+      "count": 12,
+      "removed_bytes": 54067200.0,
+      "service_us": 13.833333,
+      "min_us": 13.016667,
+      "service_ms": 0.165999996,
+      "source": "artifacts/perf-gap/run-20261009T0730/native-warm-calibration/qsa-q-q5-stream.log",
+      "sha256": "a49aa539a04b85643fe0912f47b98689362784727795cbb4bf166013357ee746",
+      "qualification": "Isolated native contraction, host graph/sync amortized; not a proof of fused-region latency"
+    },
+    {
+      "case": "qsa-kv-q6",
+      "tensor_names": [
+        "attn_k.weight",
+        "attn_v.weight"
+      ],
+      "count": 24,
+      "removed_bytes": 25804800.0,
+      "service_us": 6.204,
+      "min_us": 6.084,
+      "service_ms": 0.14889599999999997,
+      "source": "artifacts/perf-gap/run-20261009T0730/native-warm-calibration/qsa-kv-q6-stream.log",
+      "sha256": "500d43b3a09a8328f019b478ffcd4cd3df9023610aea6d7473af16d68694597c",
+      "qualification": "Isolated native contraction, host graph/sync amortized; not a proof of fused-region latency"
+    },
+    {
+      "case": "moe-down-iq4",
+      "tensor_names": [
+        "ffn_down_exps.weight"
+      ],
+      "count": 48,
+      "removed_bytes": 88473600.0,
+      "service_us": 12.90411,
+      "min_us": 11.952055,
+      "service_ms": 0.6193972799999999,
+      "source": "artifacts/perf-gap/run-20261009T0730/native-warm-calibration/moe-down-iq4-stream.log",
+      "sha256": "caa95f99efc9ac144f86bbe712ba916004d85ef2dbc17a5061e9f7ce04aea48b",
+      "qualification": "Isolated native contraction, host graph/sync amortized; not a proof of fused-region latency"
+    },
+    {
+      "case": "shared-down-q8",
+      "tensor_names": [
+        "ffn_down_shexp.weight"
+      ],
+      "count": 48,
+      "removed_bytes": 16711680.0,
+      "service_us": 3.534974,
+      "min_us": 3.510363,
+      "service_ms": 0.16967875200000002,
+      "source": "artifacts/perf-gap/run-20261009T0730/native-warm-calibration/shared-down-q8-stream.log",
+      "sha256": "b6fbf7f22c63721a014c704386ffe0ba323a206cae19b1e998f142431e63c2ff",
+      "qualification": "Isolated native contraction, host graph/sync amortized; not a proof of fused-region latency"
+    },
+    {
+      "case": "indexer-bf16",
+      "tensor_names": [
+        "indexer.q_proj.weight"
+      ],
+      "count": 12,
+      "removed_bytes": 31457280.0,
+      "service_us": 10.126214,
+      "min_us": 8.883495,
+      "service_ms": 0.121514568,
+      "source": "artifacts/perf-gap/run-20261009T0730/native-warm-calibration/indexer-bf16-stream.log",
+      "sha256": "af31712198f90e4f704136752659be4743ad2f1b65f7759837221432c763e664",
+      "qualification": "Isolated native contraction, host graph/sync amortized; not a proof of fused-region latency"
+    }
+  ],
+  "scenarios": [
+    {
+      "timestamp_scheme": "batch0",
+      "pack_single": false,
+      "bandwidth_GB_s": 512,
+      "hc_service_us": {
+        "inject": 2.96,
+        "act": 0.84,
+        "q": 5.92,
+        "norm": 28.6,
+        "lo": 2.52,
+        "up": 3.8,
+        "pack": 8.69875
+      },
+      "hc_service_ms": 5.206965,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 12.64
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.56
+        }
+      ],
+      "moe_service_ms": 0.5905199999999999,
+      "production_component_reference_ms": 7.87726578125,
+      "production_component_reference_tps": 126.9476018417796,
+      "native_proxy_budget_ms": 9.64692547725,
+      "native_proxy_budget_tps": 103.65996942323896,
+      "remaining_proxy_weight_ms": 0.11688078125
+    },
+    {
+      "timestamp_scheme": "batch0",
+      "pack_single": false,
+      "bandwidth_GB_s": 403,
+      "hc_service_us": {
+        "inject": 2.96,
+        "act": 0.84,
+        "q": 5.92,
+        "norm": 28.6,
+        "lo": 2.52,
+        "up": 3.8,
+        "pack": 8.69875
+      },
+      "hc_service_ms": 5.206965,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 12.64
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.56
+        }
+      ],
+      "moe_service_ms": 0.5905199999999999,
+      "production_component_reference_ms": 8.439787133995036,
+      "production_component_reference_tps": 118.48640067852547,
+      "native_proxy_budget_ms": 9.678538393270472,
+      "native_proxy_budget_tps": 103.32138587116668,
+      "remaining_proxy_weight_ms": 0.14849369727047146
+    },
+    {
+      "timestamp_scheme": "batch0",
+      "pack_single": false,
+      "bandwidth_GB_s": 390,
+      "hc_service_us": {
+        "inject": 2.96,
+        "act": 0.84,
+        "q": 5.92,
+        "norm": 28.6,
+        "lo": 2.52,
+        "up": 3.8,
+        "pack": 8.69875
+      },
+      "hc_service_ms": 5.206965,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 12.64
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.56
+        }
+      ],
+      "moe_service_ms": 0.5905199999999999,
+      "production_component_reference_ms": 8.527863871794871,
+      "production_component_reference_tps": 117.26265979777286,
+      "native_proxy_budget_ms": 9.683488183179488,
+      "native_proxy_budget_tps": 103.26857234534867,
+      "remaining_proxy_weight_ms": 0.1534434871794872
+    },
+    {
+      "timestamp_scheme": "batch0",
+      "pack_single": true,
+      "bandwidth_GB_s": 512,
+      "hc_service_us": {
+        "inject": 2.96,
+        "act": 0.84,
+        "q": 5.92,
+        "norm": 28.6,
+        "lo": 2.52,
+        "up": 3.8,
+        "pack": 2.735625
+      },
+      "hc_service_ms": 4.0858975,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 12.64
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.56
+        }
+      ],
+      "moe_service_ms": 0.5905199999999999,
+      "production_component_reference_ms": 6.75619828125,
+      "production_component_reference_tps": 148.01223385868195,
+      "native_proxy_budget_ms": 8.525857977249998,
+      "native_proxy_budget_tps": 117.29024840295878,
+      "remaining_proxy_weight_ms": 0.11688078125
+    },
+    {
+      "timestamp_scheme": "batch0",
+      "pack_single": true,
+      "bandwidth_GB_s": 403,
+      "hc_service_us": {
+        "inject": 2.96,
+        "act": 0.84,
+        "q": 5.92,
+        "norm": 28.6,
+        "lo": 2.52,
+        "up": 3.8,
+        "pack": 2.735625
+      },
+      "hc_service_ms": 4.0858975,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 12.64
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.56
+        }
+      ],
+      "moe_service_ms": 0.5905199999999999,
+      "production_component_reference_ms": 7.318719633995037,
+      "production_component_reference_tps": 136.63592130993197,
+      "native_proxy_budget_ms": 8.55747089327047,
+      "native_proxy_budget_tps": 116.8569560413454,
+      "remaining_proxy_weight_ms": 0.14849369727047146
+    },
+    {
+      "timestamp_scheme": "batch0",
+      "pack_single": true,
+      "bandwidth_GB_s": 390,
+      "hc_service_us": {
+        "inject": 2.96,
+        "act": 0.84,
+        "q": 5.92,
+        "norm": 28.6,
+        "lo": 2.52,
+        "up": 3.8,
+        "pack": 2.735625
+      },
+      "hc_service_ms": 4.0858975,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 12.64
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.56
+        }
+      ],
+      "moe_service_ms": 0.5905199999999999,
+      "production_component_reference_ms": 7.406796371794871,
+      "production_component_reference_tps": 135.01113704273098,
+      "native_proxy_budget_ms": 8.562420683179486,
+      "native_proxy_budget_tps": 116.78940302062685,
+      "remaining_proxy_weight_ms": 0.1534434871794872
+    },
+    {
+      "timestamp_scheme": "batch1",
+      "pack_single": false,
+      "bandwidth_GB_s": 512,
+      "hc_service_us": {
+        "inject": 3.35625,
+        "act": 1.23125,
+        "q": 7.88375,
+        "norm": 35.085,
+        "lo": 3.225625,
+        "up": 4.151875,
+        "pack": 8.69875
+      },
+      "hc_service_ms": 5.98087125,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 13.113125
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.9925
+        }
+      ],
+      "moe_service_ms": 0.612620625,
+      "production_component_reference_ms": 8.673272656249999,
+      "production_component_reference_tps": 115.29673280585679,
+      "native_proxy_budget_ms": 10.44293235225,
+      "native_proxy_budget_tps": 95.7585442736822,
+      "remaining_proxy_weight_ms": 0.11688078125
+    },
+    {
+      "timestamp_scheme": "batch1",
+      "pack_single": false,
+      "bandwidth_GB_s": 403,
+      "hc_service_us": {
+        "inject": 3.35625,
+        "act": 1.23125,
+        "q": 7.88375,
+        "norm": 35.085,
+        "lo": 3.225625,
+        "up": 4.151875,
+        "pack": 8.69875
+      },
+      "hc_service_ms": 5.98087125,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 13.113125
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.9925
+        }
+      ],
+      "moe_service_ms": 0.612620625,
+      "production_component_reference_ms": 9.235794008995036,
+      "production_component_reference_tps": 108.27439406141669,
+      "native_proxy_budget_ms": 10.474545268270472,
+      "native_proxy_budget_tps": 95.46953823658612,
+      "remaining_proxy_weight_ms": 0.14849369727047146
+    },
+    {
+      "timestamp_scheme": "batch1",
+      "pack_single": false,
+      "bandwidth_GB_s": 390,
+      "hc_service_us": {
+        "inject": 3.35625,
+        "act": 1.23125,
+        "q": 7.88375,
+        "norm": 35.085,
+        "lo": 3.225625,
+        "up": 4.151875,
+        "pack": 8.69875
+      },
+      "hc_service_ms": 5.98087125,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 13.113125
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.9925
+        }
+      ],
+      "moe_service_ms": 0.612620625,
+      "production_component_reference_ms": 9.32387074679487,
+      "production_component_reference_tps": 107.25159401676125,
+      "native_proxy_budget_ms": 10.479495058179488,
+      "native_proxy_budget_tps": 95.42444501841497,
+      "remaining_proxy_weight_ms": 0.1534434871794872
+    },
+    {
+      "timestamp_scheme": "batch1",
+      "pack_single": true,
+      "bandwidth_GB_s": 512,
+      "hc_service_us": {
+        "inject": 3.35625,
+        "act": 1.23125,
+        "q": 7.88375,
+        "norm": 35.085,
+        "lo": 3.225625,
+        "up": 4.151875,
+        "pack": 2.735625
+      },
+      "hc_service_ms": 4.85980375,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 13.113125
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.9925
+        }
+      ],
+      "moe_service_ms": 0.612620625,
+      "production_component_reference_ms": 7.55220515625,
+      "production_component_reference_tps": 132.4116571664406,
+      "native_proxy_budget_ms": 9.32186485225,
+      "native_proxy_budget_tps": 107.27467259500463,
+      "remaining_proxy_weight_ms": 0.11688078125
+    },
+    {
+      "timestamp_scheme": "batch1",
+      "pack_single": true,
+      "bandwidth_GB_s": 403,
+      "hc_service_us": {
+        "inject": 3.35625,
+        "act": 1.23125,
+        "q": 7.88375,
+        "norm": 35.085,
+        "lo": 3.225625,
+        "up": 4.151875,
+        "pack": 2.735625
+      },
+      "hc_service_ms": 4.85980375,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 13.113125
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.9925
+        }
+      ],
+      "moe_service_ms": 0.612620625,
+      "production_component_reference_ms": 8.114726508995037,
+      "production_component_reference_tps": 123.23274221152332,
+      "native_proxy_budget_ms": 9.353477768270471,
+      "native_proxy_budget_tps": 106.91210529117531,
+      "remaining_proxy_weight_ms": 0.14849369727047146
+    },
+    {
+      "timestamp_scheme": "batch1",
+      "pack_single": true,
+      "bandwidth_GB_s": 390,
+      "hc_service_us": {
+        "inject": 3.35625,
+        "act": 1.23125,
+        "q": 7.88375,
+        "norm": 35.085,
+        "lo": 3.225625,
+        "up": 4.151875,
+        "pack": 2.735625
+      },
+      "hc_service_ms": 4.85980375,
+      "moe_families": [
+        {
+          "family": "moe2",
+          "layers": 33,
+          "median_us": 13.113125
+        },
+        {
+          "family": "moe3",
+          "layers": 15,
+          "median_us": 11.9925
+        }
+      ],
+      "moe_service_ms": 0.612620625,
+      "production_component_reference_ms": 8.202803246794872,
+      "production_component_reference_tps": 121.90954359300714,
+      "native_proxy_budget_ms": 9.358427558179487,
+      "native_proxy_budget_tps": 106.85555813550924,
+      "remaining_proxy_weight_ms": 0.1534434871794872
+    }
+  ],
+  "limits": [
+    "This is a component reference, NOT a rigorous silicon ceiling, and not proof of Match.",
+    "All HC and fused MoE inputs are model-free GPU fixture measurements; known source shapes/counts replace prior bytes instead of double counting them.",
+    "HC assumes local ACT before max(Q,norm), then LO andUP; 23 injects fully hidden; two pack guards per site. These exposed-service assumptions are not a proof of overlap under the whole workload.",
+    "Host generation waits are disabled only in standalone fixtures; production wait/sync checks are unchanged. P1 upload and true CPU Y/Q handoff are omitted.",
+    "Native-proxy contractions may not match fused attention/down regions; this row is a budget comparison, not a validated lower bound.",
+    "Per-dispatch timestamps themselves can perturb scheduling; batch timing includes extra between-dispatch barriers and Q-reset transfer absent from normal CPU re-arm.",
+    "Medians across five devices describe calibration, not a proof of the slowest critical rank under whole-model contention.",
+    "Residual attention/GDN/PLE/state kernels, exact cache residency, command scheduling, sampling/readback, and first-request graph allocation are not fully accounted.",
+    "No arbitrary relay constant, global residual, measured model graph_compute or inverse speed scaling is fitted into this budget."
+  ]
+}

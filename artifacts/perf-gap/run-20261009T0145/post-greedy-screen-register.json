@@ -1,0 +1,9 @@
+{
+  "purpose": "After completing the independent greedy confirmation and held-out prompt pairs, check whether the raised no-MTP baseline can be further improved by LateBind/MMVQ/MTP interactions.",
+  "not_a_restart": "The original ten-point sweep remains FAILED at its first arm. This is a distinct campaign on the newly built compact-sampling candidate; it does not claim the old relay failure was fixed.",
+  "fixed": "Same APEX weights and five-card head-sharded layout; threads22; no RERoT; ordinary sampler optimization enabled for h0, not eligible for MTP.",
+  "points": ["aggressive-disabled-h0", "q8first-disabled-h0", "pack-once-disabled-h0", "ap-disabled-h0", "l2-disabled-h0", "aggressive-auto-h0", "aggressive-forced-h0", "aggressive-disabled-h1"],
+  "requests_per_process": {"warmup":2,"measured":2,"unranked_guard":1},
+  "promotion": "Screen scores alone never promote defaults. A quality-passing point more than 2% above the same-campaign baseline requires fresh independent paired confirmation. Record below-threshold and rejected points too.",
+  "stop": "Start only after the preceding process exits and five-card idle gate passes. Stop immediately on any load/protocol/abnormal-exit error, without substituting another sample or manual reset. No concurrent compile or GPU job."
+}

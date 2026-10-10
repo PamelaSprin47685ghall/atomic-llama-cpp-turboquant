@@ -1,0 +1,7 @@
+{
+  "hypothesis": "The observed stage0 rank skew and five serial vkQueueSubmit calls add critical chain fill time. Submit distinct physical queues concurrently using five persistent sleeping workers.",
+  "fixed": "Q workgroup256 retained. Same APEX/aggressive/noMTP/greedy-host configuration. Sole factor GGML_TP5_PARALLEL_SUBMIT=0/1, default off.",
+  "contracts": "Preflight every command list and allocate before submission. Worker callbacks only call native vkQueueSubmit on distinct queues. Main records EVERY accepted native timeline including partial failure, aborts on any error, no host timeline signal and no fallback. Timeout waits for worker references to retire before returning; no claim to cure arbitrary driver hangs.",
+  "validation": "CPU concurrency/partial results/exception/deadline lifetime tests first, then same-model pilot; four independent process pairs for any speed claim. Preserve preceding Q64 negative result and existing protocol failures.",
+  "safety": "No concurrent GPU work or compilation; physical idle gate; no clock/driver/watchdog changes."
+}

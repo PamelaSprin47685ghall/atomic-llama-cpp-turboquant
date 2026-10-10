@@ -1,0 +1,8 @@
+{
+  "reason": "The device-coherent polling prototype was rejected before GPU submission: imported host memory does not provide the required DEVICE_COHERENT type. That rejection stays recorded and its safety gate is not weakened.",
+  "different_protocol": "Use explicitly exported/imported timeline semaphores for each rank. Each stage waits for all five previous stages, so writes are released/acquired by Vulkan submission synchronization rather than relying on implicit device coherence of host memory.",
+  "memory": "Normal HOST_VISIBLE|HOST_COHERENT external host import, once per physical device; GPU reduction, no CPU per-stage data handling. One initial producer dispatch plus96 dependent reduction/update dispatches.",
+  "proof": "Waits at s+2 require completion of all s+1 commands; every s+1 command finishes reading bank s before signalling. Reused bank s is therefore no longer live. Timeline values are unique across replays.",
+  "validation": "Full bitwise F32 output against the same96-stage five-rank recurrence on all elements/ranks/replays.2warm+14measured replays, whole-chain GPU queries only. Fences drain with the unchanged5second bound; stop on any failure. No unsignalled-wait fault injection is attempted in this prototype.",
+  "limits": "Experimental standalone protocol, not yet production, not a model tok/s result. Record extra queue submissions, signal/wait scopes and all source identities. Native partial-submit recovery is still a production-integration prerequisite."
+}

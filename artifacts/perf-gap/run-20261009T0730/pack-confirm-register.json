@@ -1,0 +1,12 @@
+{
+  "revision": "Separate TP5_LATE_PACK_SINGLE SPIR-V; default pack bytes proven identical to before-build-bin (SHAe9932745e74e0c99b33fe01778ca1bcfb5f83348431b1e125a33ddfa4bf95ec6). Earlier shared-shader pilot is not confirmation.",
+  "A": "GGML_TP5_PACK_SINGLE_WG=0",
+  "B": "GGML_TP5_PACK_SINGLE_WG=1",
+  "fixed": "Current identical executable/DSOs, unchanged APEX weights, h0, aggressive, MMVQdisabled, threads22, parallel-submit1, Q256/norm256, norm-prefetch0, compact greedy1, head-sharded",
+  "pairs": [["A","B"],["B","A"],["A","B"],["B","A"]],
+  "requests_per_process": {"warmup":2,"measured":3,"unranked_guard":1},
+  "primary": "Per-process sum generation_ms / sum public completion tokens; paired log ratios, Student t df3, two-sided95%CI. Report whole-answer time and startup separately.",
+  "quality": "Every corresponding raw response including warmup and guard must have identical body bytes and public token count; all measured requests have zero fallback; actual chain logs show correct pack flag; all exits normal. Any mismatch stops campaign, no replacement points.",
+  "micro_prediction": "All5 cards independently reduce repeated pack guard service by about5.9us; 188 guards imply at most about1.11ms/chain recoverable if fully exposed. This is a critical-path opportunity bound, not an assertion every microsecond becomes end-to-end gain.",
+  "limits": "The inherited intermittent STAR timeout remains unresolved. No default changes, hardware clocks, recovery settings, numerical tolerances or sync checks changed. No compilation during GPU measurement."
+}

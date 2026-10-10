@@ -1,0 +1,121 @@
+{
+  "comparisons": [
+    {
+      "file": "prompt.ids",
+      "A_bytes": 24,
+      "B_bytes": 24,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "70fe38b40570bd77147d36f8b68d501463f6793bcd9d8e98c1b7cda0fd0a0d6d",
+      "B_sha256": "70fe38b40570bd77147d36f8b68d501463f6793bcd9d8e98c1b7cda0fd0a0d6d"
+    },
+    {
+      "file": "continuation.ids",
+      "A_bytes": 16,
+      "B_bytes": 16,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "0e9000e9db1cdf62219261fb712f883fd646af62a8cbe5116c40d8d5992a0f9d",
+      "B_sha256": "0e9000e9db1cdf62219261fb712f883fd646af62a8cbe5116c40d8d5992a0f9d"
+    },
+    {
+      "file": "0.logits",
+      "A_bytes": 993280,
+      "B_bytes": 993280,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "3b6711a1197b7e794692b0b3283cf3ce2e4f815852cd42070d0ff71f8bbd3ae5",
+      "B_sha256": "3b6711a1197b7e794692b0b3283cf3ce2e4f815852cd42070d0ff71f8bbd3ae5"
+    },
+    {
+      "file": "0.state",
+      "A_bytes": 118206272,
+      "B_bytes": 118206272,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "2a06ddc2437c53df26e390b04f6e14064407ab49ec983e1e15fe0050302fb326",
+      "B_sha256": "2a06ddc2437c53df26e390b04f6e14064407ab49ec983e1e15fe0050302fb326"
+    },
+    {
+      "file": "1.logits",
+      "A_bytes": 993280,
+      "B_bytes": 993280,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "0aa2e03ee085de3194ef66b9af3ce8c241041b11d7356384d2bedb41aa15b740",
+      "B_sha256": "0aa2e03ee085de3194ef66b9af3ce8c241041b11d7356384d2bedb41aa15b740"
+    },
+    {
+      "file": "1.state",
+      "A_bytes": 118233968,
+      "B_bytes": 118233968,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "516f5a31f98a0ecccbc0ea42ca84b0a7aee3d0e9e80af6576b1e3b2d6b60d3cb",
+      "B_sha256": "516f5a31f98a0ecccbc0ea42ca84b0a7aee3d0e9e80af6576b1e3b2d6b60d3cb"
+    },
+    {
+      "file": "2.logits",
+      "A_bytes": 993280,
+      "B_bytes": 993280,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "b0c7a1af95f5f8a50638f774730ace3a76fba16e6c49161b48a51bc5e3e0d16e",
+      "B_sha256": "b0c7a1af95f5f8a50638f774730ace3a76fba16e6c49161b48a51bc5e3e0d16e"
+    },
+    {
+      "file": "2.state",
+      "A_bytes": 118261664,
+      "B_bytes": 118261664,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "a99519d4596446af463d5efc84dc76fe9006e7c37fd4b53aca84ebb572680121",
+      "B_sha256": "a99519d4596446af463d5efc84dc76fe9006e7c37fd4b53aca84ebb572680121"
+    },
+    {
+      "file": "3.logits",
+      "A_bytes": 993280,
+      "B_bytes": 993280,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "6b5b20dace86fc10db82b607f4b3d2f01d6c988e5593547a42d90c293314f232",
+      "B_sha256": "6b5b20dace86fc10db82b607f4b3d2f01d6c988e5593547a42d90c293314f232"
+    },
+    {
+      "file": "3.state",
+      "A_bytes": 118289360,
+      "B_bytes": 118289360,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "20b2932b4b99661092f5900d888f05cbceb958c69932d60e57f05eca2e21cdbb",
+      "B_sha256": "20b2932b4b99661092f5900d888f05cbceb958c69932d60e57f05eca2e21cdbb"
+    },
+    {
+      "file": "4.logits",
+      "A_bytes": 993280,
+      "B_bytes": 993280,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "ef9ae6f8c9577153955905b791f35b6806339e5b0bb4922532e727b396369863",
+      "B_sha256": "ef9ae6f8c9577153955905b791f35b6806339e5b0bb4922532e727b396369863"
+    },
+    {
+      "file": "4.state",
+      "A_bytes": 118317056,
+      "B_bytes": 118317056,
+      "bitwise_equal": true,
+      "first_mismatching_byte": null,
+      "A_sha256": "e33fb2c044d4a0f3ec4984a11bb61b464e57ca16e8ab081a716477eb571da073",
+      "B_sha256": "e33fb2c044d4a0f3ec4984a11bb61b464e57ca16e8ab081a716477eb571da073"
+    }
+  ],
+  "all_equal": true,
+  "scope": "same frozen binary, prefill6 + four teacher-forced one-token calls; native warm gather executed with 144 stages/94 LateBind sites",
+  "limitations": [
+    "sampler/RNG not advanced",
+    "no complete router trace yet",
+    "capacity>active not exercised",
+    "not a natural-text performance measurement",
+    "A process PID not exposed by the initial shell tool"
+  ]
+}

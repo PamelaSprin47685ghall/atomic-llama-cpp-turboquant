@@ -1,0 +1,7 @@
+{
+  "trigger": "The actual fused MoE shader was about3x faster with64 disjoint weight sets than with1 resident set on every card; cold isolated timing cannot yet be taken as an unavoidable cost.",
+  "test": "Repeat unchanged shaders/data/shape with200ms of bounded actual GPU workload before measurements, no clock/power/driver modifications. Begin with GPU0 then verify all five if results warrant it. Same warmup policy for resident and streaming cases.",
+  "other_missing_work": "Measure the production pack shader after its persistent done flag is set, including all400 dispatched workgroups; two such guards per LateBind site still execute on each replay. Validate every destination byte remains unchanged.",
+  "interpretation": "A warmup-dependent change supports startup/state sensitivity, not a unique clock/cache mechanism. Record original cold results rather than replacing them. Do not selectively use inflated timings to obtain Match.",
+  "envelope": "Freeze a cost estimate from independently calibrated components and source-derived counts before new end-to-end validation; never subtract an unexplained model residual and add it back as theory."
+}

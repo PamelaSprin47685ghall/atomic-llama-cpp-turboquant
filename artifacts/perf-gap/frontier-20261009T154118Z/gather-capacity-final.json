@@ -1,0 +1,33 @@
+{
+  "command": [
+    "flock",
+    "/var/tmp/tp5-gpu.lock",
+    "env",
+    "LD_LIBRARY_PATH=/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin",
+    "GGML_VK_CMD_REPLAY=1",
+    "GGML_TP5_SYNC=relay",
+    "GGML_TP5_WIRE=f32",
+    "/var/tmp/test-vulkan-tp5-gather",
+    "--devices",
+    "0,1,2,3,4",
+    "--sync",
+    "relay",
+    "--wire",
+    "f32",
+    "--test-gather-capacity"
+  ],
+  "returncode": 0,
+  "log": "gather-capacity-final.log",
+  "fixes": [
+    "RELAY chain cache reuse restricted to the chain whose compile is resident in the per-rank scratch",
+    "scalar ragged-row predefined ADD shader with per-element active-row guard",
+    "submitted frame forwarded to dispatch patch as authoritative extents",
+    "gather dynamic active-row admission under RELAY"
+  ],
+  "DSO_sha256": {
+    "libggml-base.so.0.18.1": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46",
+    "libggml-cpu.so.0.18.1": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+    "libggml-vulkan.so.0.18.1": "9d9969b17e2f4b5419eea0f3175df4428aca4347179688e815077a8897e2cf60",
+    "libggml.so.0.18.1": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2"
+  }
+}

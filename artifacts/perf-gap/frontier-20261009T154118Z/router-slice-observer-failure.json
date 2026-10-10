@@ -1,0 +1,10 @@
+{
+  "original_trace_comparison": "router-trace-comparison.json",
+  "retained_failure": true,
+  "observed": "equal layer0 scores but candidate probabilities contained negative logits; later traces diverged",
+  "reproducer_before": "same parent UID and same-sized SQR/ADD graph views produced all-zero ADD output; command exited1",
+  "reproducer_after": "same command with fixed DSO produced exactly4.25,8,8.0625,25; artifact://93",
+  "classification": "observer execution failure; original callback traces cannot qualify router",
+  "independent_untraced_smoke": "router-state-comparison.json remains a separate finite-scope bitwise logits/state observation",
+  "no_promotion": true
+}

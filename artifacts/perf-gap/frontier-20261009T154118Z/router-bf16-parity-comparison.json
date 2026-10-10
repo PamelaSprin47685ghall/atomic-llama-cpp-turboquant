@@ -1,0 +1,18 @@
+{
+  "scope": "real APEX six-shard model, 5 ranks, aggressive LateBind, 6-token prefill + 4 teacher-forced decode steps; full 248320-vocab logits, serialized state per step, and all 3600 router trace tensors including per-rank physical inputs",
+  "arms": {
+    "f32": "router-bf16-parity-f32",
+    "bf16": "router-bf16-parity-bf16"
+  },
+  "files_compared": 3607,
+  "mismatches": [],
+  "fixes_applied": [
+    "conversion tape suspension covers readback validation and dispatch",
+    "conversion uses temporary context invisible to replay pending bufs",
+    "pending replay buf append deduped against mid-graph submits",
+    "recorded_dispatches restored around conversion",
+    "first-conversion path runs without mid-graph synchronize; only LRU eviction drains"
+  ],
+  "qualification": "fixed-token parity only; natural text, sampler/RNG, long-run and throughput pending",
+  "trace_bins_compared": 3600
+}

@@ -1,0 +1,11 @@
+{
+  "scope": "RERoT off, one ordinary generation stream; no CPU single-thread restriction",
+  "goal": "Raise measured throughput and replace the bandwidth-only reference by a independently calibrated cost prediction; never define an unexplained residual as an achieved match.",
+  "baseline": "APEX unchanged weights, five RX6800, attention head-sharded, no MTP, aggressive, MMVQ disabled, threads22",
+  "screen": ["baseline", "q8first", "pack-once", "ap", "l2", "mmvq-auto", "mmvq-forced", "threads8", "threads1", "definition-cache4"],
+  "screen_requests": {"warmup": 2, "measured": 2, "unranked_guard": 1},
+  "screen_rule": "Exploration only. Preserve output/quality failures. Protocol, load or abnormal exit stops the sweep, not silently replaced. Candidate must be independently confirmed against baseline.",
+  "confirmation": {"process_pairs": [["A","B"],["B","A"],["A","B"],["B","A"]], "measured_per_process": 3, "primary": "sum(predicted_ms)/sum(public completion tokens); paired log ratios, Student t CI df3"},
+  "theory": {"original": "weight-only ideal, 273.86 tps, unchanged historical definition", "new": "Separate hardware bound from calibrated implementation prediction; calibrate on disjoint timing/shape measurements then freeze before held-out requests.", "match_criterion": "Prediction within 5% on every predeclared held-out process; report signed errors and unchanged quality gates. This is a model-validation criterion, not hardware-optimality proof."},
+  "safety": "Retain VkBuffer identity, epochs/extents/payload checks, bank ownership, native drains and original timeouts. No clock/driver/watchdog/reset changes. One GPU owner, no concurrent compilation. No commits."
+}

@@ -1,0 +1,580 @@
+{
+  "scope": "RERoT off; one ordinary stream, threads22, unchanged APEX weights, 5xRX6800, head-sharded, noMTP, aggressive, MMVQdisabled",
+  "paired": {
+    "ms_per_token": {
+      "B_over_A_geometric": 0.9646805959560302,
+      "latency_ratio_95pct_CI": [
+        0.955196224033149,
+        0.9742591404777012
+      ],
+      "speedup_geometric": 1.0366125370324955,
+      "speedup_95pct_CI": [
+        1.0264209576824472,
+        1.0469053110131392
+      ],
+      "paired_log_ratios": [
+        -0.044435864303705955,
+        -0.030163296560954768,
+        -0.03279841658600736,
+        -0.0364353068636682
+      ]
+    },
+    "wall_ms_per_token": {
+      "B_over_A_geometric": 0.9758340517699998,
+      "latency_ratio_95pct_CI": [
+        0.9642487981686075,
+        0.9875584998420137
+      ],
+      "speedup_geometric": 1.0247644035234957,
+      "speedup_95pct_CI": [
+        1.0125982411775876,
+        1.0370767398406868
+      ],
+      "paired_log_ratios": [
+        -0.0330320447463162,
+        -0.014958348035739533,
+        -0.023380837423989474,
+        -0.026479713593080066
+      ]
+    },
+    "prompt_ms": {
+      "B_over_A_geometric": 0.9996788755558058,
+      "latency_ratio_95pct_CI": [
+        0.9813614917635328,
+        1.0183381583850897
+      ],
+      "speedup_geometric": 1.000321227598228,
+      "speedup_95pct_CI": [
+        0.9819920738174334,
+        1.0189925001061264
+      ],
+      "paired_log_ratios": [
+        -0.009337901415141707,
+        0.016175599449632507,
+        -0.0006120610784752436,
+        -0.007510341018773177
+      ]
+    },
+    "generation_ms": {
+      "B_over_A_geometric": 0.9646805959560302,
+      "latency_ratio_95pct_CI": [
+        0.955196224033149,
+        0.9742591404777013
+      ],
+      "speedup_geometric": 1.0366125370324952,
+      "speedup_95pct_CI": [
+        1.026420957682447,
+        1.0469053110131392
+      ],
+      "paired_log_ratios": [
+        -0.044435864303705955,
+        -0.030163296560954653,
+        -0.03279841658600736,
+        -0.0364353068636682
+      ]
+    },
+    "client_wall_ms": {
+      "B_over_A_geometric": 0.9758340517699999,
+      "latency_ratio_95pct_CI": [
+        0.9642487981686076,
+        0.9875584998420137
+      ],
+      "speedup_geometric": 1.0247644035234957,
+      "speedup_95pct_CI": [
+        1.0125982411775876,
+        1.0370767398406868
+      ],
+      "paired_log_ratios": [
+        -0.0330320447463162,
+        -0.014958348035739533,
+        -0.023380837423989245,
+        -0.02647971359307995
+      ]
+    },
+    "arm_process_tps": {
+      "A": [
+        64.50427487421666,
+        64.99417452782286,
+        64.63657230298394,
+        64.96711224508252
+      ],
+      "B": [
+        67.43521525691092,
+        66.9844792648149,
+        66.79169870264715,
+        67.37786040072983
+      ]
+    },
+    "arms_pooled": {
+      "A": {
+        "public_tokens": 2112,
+        "tps": 64.77484851518382,
+        "mean_generation_ms_per_request": 2717.104,
+        "mean_client_wall_ms_per_request": 3901.9958959166665,
+        "mean_prompt_ms_per_request": 1014.5124166666667,
+        "fallback_line_count": 0
+      },
+      "B": {
+        "public_tokens": 2112,
+        "tps": 67.14623661875969,
+        "mean_generation_ms_per_request": 2621.1446666666666,
+        "mean_client_wall_ms_per_request": 3807.7214163333333,
+        "mean_prompt_ms_per_request": 1014.1923333333334,
+        "fallback_line_count": 0
+      }
+    },
+    "blocks": [
+      {
+        "A": {
+          "ms_per_token": 15.502848484848485,
+          "wall_ms_per_token": 22.233238043560608,
+          "generation_ms": 2728.501333333333,
+          "client_wall_ms": 3913.0498956666665,
+          "prompt_ms": 1013.1506666666667,
+          "tokens": 528,
+          "hashes": [
+            "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+          ],
+          "draft_proposed": 0,
+          "draft_accepted": 0,
+          "fallback_lines": 0,
+          "definition_lines_rank0": [
+            6,
+            6,
+            6
+          ]
+        },
+        "B": {
+          "ms_per_token": 14.829047348484849,
+          "wall_ms_per_token": 21.51082579166667,
+          "generation_ms": 2609.912333333333,
+          "client_wall_ms": 3785.9053393333334,
+          "prompt_ms": 1003.734,
+          "tokens": 528,
+          "hashes": [
+            "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+          ],
+          "draft_proposed": 0,
+          "draft_accepted": 0,
+          "fallback_lines": 0,
+          "definition_lines_rank0": [
+            6,
+            6,
+            6
+          ]
+        }
+      },
+      {
+        "A": {
+          "ms_per_token": 15.385994318181819,
+          "wall_ms_per_token": 22.061846412878786,
+          "generation_ms": 2707.935,
+          "client_wall_ms": 3882.8849686666663,
+          "prompt_ms": 1004.3866666666667,
+          "tokens": 528,
+          "hashes": [
+            "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+          ],
+          "draft_proposed": 0,
+          "draft_accepted": 0,
+          "fallback_lines": 0,
+          "definition_lines_rank0": [
+            6,
+            6,
+            6
+          ]
+        },
+        "B": {
+          "ms_per_token": 14.92883143939394,
+          "wall_ms_per_token": 21.73429356818182,
+          "generation_ms": 2627.4743333333336,
+          "client_wall_ms": 3825.2356680000003,
+          "prompt_ms": 1020.7653333333334,
+          "tokens": 528,
+          "hashes": [
+            "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+          ],
+          "draft_proposed": 0,
+          "draft_accepted": 0,
+          "fallback_lines": 0,
+          "definition_lines_rank0": [
+            6,
+            6,
+            6
+          ]
+        }
+      },
+      {
+        "A": {
+          "ms_per_token": 15.471117424242424,
+          "wall_ms_per_token": 22.260430867424244,
+          "generation_ms": 2722.9166666666665,
+          "client_wall_ms": 3917.8358326666666,
+          "prompt_ms": 1022.542,
+          "tokens": 528,
+          "hashes": [
+            "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+          ],
+          "draft_proposed": 0,
+          "draft_accepted": 0,
+          "fallback_lines": 0,
+          "definition_lines_rank0": [
+            6,
+            6,
+            6
+          ]
+        },
+        "B": {
+          "ms_per_token": 14.971920454545455,
+          "wall_ms_per_token": 21.746000691287875,
+          "generation_ms": 2635.058,
+          "client_wall_ms": 3827.2961216666667,
+          "prompt_ms": 1021.9163333333333,
+          "tokens": 528,
+          "hashes": [
+            "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+          ],
+          "draft_proposed": 0,
+          "draft_accepted": 0,
+          "fallback_lines": 0,
+          "definition_lines_rank0": [
+            6,
+            6,
+            6
+          ]
+        }
+      },
+      {
+        "A": {
+          "ms_per_token": 15.39240340909091,
+          "wall_ms_per_token": 22.126209583333335,
+          "generation_ms": 2709.063,
+          "client_wall_ms": 3894.2128866666667,
+          "prompt_ms": 1017.9703333333333,
+          "tokens": 528,
+          "hashes": [
+            "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+          ],
+          "draft_proposed": 0,
+          "draft_accepted": 0,
+          "fallback_lines": 0,
+          "definition_lines_rank0": [
+            6,
+            6,
+            6
+          ]
+        },
+        "B": {
+          "ms_per_token": 14.841670454545454,
+          "wall_ms_per_token": 21.548003047348484,
+          "generation_ms": 2612.134,
+          "client_wall_ms": 3792.4485363333333,
+          "prompt_ms": 1010.3536666666666,
+          "tokens": 528,
+          "hashes": [
+            "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+          ],
+          "draft_proposed": 0,
+          "draft_accepted": 0,
+          "fallback_lines": 0,
+          "definition_lines_rank0": [
+            6,
+            6,
+            6
+          ]
+        }
+      }
+    ],
+    "method": "Four independent paired process blocks; per-process pooled request latency; two-sided Student-t on log ratio, df=3. Semantic quality is reviewed separately."
+  },
+  "model": {
+    "kind": "CALIBRATED_IMPLEMENTATION_PREDICTION_NOT_HARDWARE_BOUND",
+    "frozen_utc": "2026-10-09T02:15:23Z",
+    "first_ms": {
+      "setup": 0.138,
+      "graph": 2.025333333333333,
+      "alloc": 104.511,
+      "input": 0.023,
+      "submit": 126.33933333333333,
+      "finish": 0.006,
+      "decode_other": 0.24233333333333335,
+      "sample_sync": 0.27166666666666667,
+      "sample_select": 0.08633333333333333
+    },
+    "steady_ms": {
+      "setup": 0.002835249042145594,
+      "graph": 0.005831417624521073,
+      "alloc": 0.0,
+      "input": 0.01224521072796935,
+      "submit": 13.28746743295019,
+      "finish": 0.0026628352490421455,
+      "decode_other": 0.17979310344827587,
+      "sample_sync": 0.2599022988505747,
+      "sample_select": 0.08421647509578545
+    },
+    "formula": "T(N)=sum(first_ms)+(N-2)*sum(steady_ms), N>=3; first prefill token excluded from timer",
+    "match_relative_error_limit": 0.05,
+    "excluded_from_prediction": "Unexplained server remainder; no post-hoc scaling or fitted overhead",
+    "limitations": "One initial scalar rebuild, fixed configuration, warm request, conditional on output length. Not cold start, not hardware optimum, not quality qualification."
+  },
+  "validation": [
+    {
+      "run": "greedy-b1-B",
+      "tokens": 176,
+      "predicted_tps": 66.64331626229446,
+      "actual_tps": 67.43521525691092,
+      "relative_time_error": 0.011882646888394799,
+      "within_limit": true
+    },
+    {
+      "run": "greedy-b2-B",
+      "tokens": 176,
+      "predicted_tps": 66.64331626229446,
+      "actual_tps": 66.98447926481488,
+      "relative_time_error": 0.0051192380819957695,
+      "within_limit": true
+    },
+    {
+      "run": "greedy-b3-B",
+      "tokens": 176,
+      "predicted_tps": 66.64331626229446,
+      "actual_tps": 66.79169870264715,
+      "relative_time_error": 0.0022265164561843243,
+      "within_limit": true
+    },
+    {
+      "run": "greedy-b4-B",
+      "tokens": 176,
+      "predicted_tps": 66.64331626229446,
+      "actual_tps": 67.37786040072983,
+      "relative_time_error": 0.011022022606803406,
+      "within_limit": true
+    },
+    {
+      "run": "heldout-index-B",
+      "tokens": 93,
+      "predicted_tps": 62.30638892222438,
+      "actual_tps": 62.16986880486449,
+      "relative_time_error": -0.0021911094467422787,
+      "within_limit": true
+    },
+    {
+      "run": "heldout-process-B",
+      "tokens": 149,
+      "predicted_tps": 65.71457736386634,
+      "actual_tps": 67.17662289591208,
+      "relative_time_error": 0.02224842022418061,
+      "within_limit": true
+    },
+    {
+      "run": "heldout-debug-B",
+      "tokens": 172,
+      "predicted_tps": 66.52265841809411,
+      "actual_tps": 67.42668034539709,
+      "relative_time_error": 0.013589684309084804,
+      "within_limit": true
+    }
+  ],
+  "counterfactual_validation": [
+    {
+      "run": "heldout-index-B",
+      "predicted_tps": 62.197062972402755,
+      "actual_tps": 62.16986880486449,
+      "relative_time_error": -0.00043722591129946586
+    },
+    {
+      "run": "heldout-process-B",
+      "predicted_tps": 65.4798235302319,
+      "actual_tps": 67.17662289591208,
+      "relative_time_error": 0.025913316105636186
+    },
+    {
+      "run": "heldout-debug-B",
+      "predicted_tps": 66.2564131141475,
+      "actual_tps": 67.42668034539709,
+      "relative_time_error": 0.017662701257815216
+    }
+  ],
+  "interaction_screen": {
+    "points": [
+      {
+        "run": "interaction-aggressive-auto-h0",
+        "tps": 66.0885669407715,
+        "ratio_to_screen_baseline": 0.9932225423595795,
+        "measured_tokens": [
+          176,
+          176
+        ],
+        "measured_fallbacks": 0,
+        "draft_proposed": [
+          null,
+          null
+        ],
+        "draft_accepted": [
+          null,
+          null
+        ],
+        "above_2pct": false,
+        "status": "EXPLORATORY_NOT_CONFIRMATION"
+      },
+      {
+        "run": "interaction-aggressive-disabled-h0",
+        "tps": 66.53953582624713,
+        "ratio_to_screen_baseline": 1.0,
+        "measured_tokens": [
+          176,
+          176
+        ],
+        "measured_fallbacks": 0,
+        "draft_proposed": [
+          null,
+          null
+        ],
+        "draft_accepted": [
+          null,
+          null
+        ],
+        "above_2pct": false,
+        "status": "EXPLORATORY_NOT_CONFIRMATION"
+      },
+      {
+        "run": "interaction-aggressive-disabled-h1",
+        "tps": 61.299423630229455,
+        "ratio_to_screen_baseline": 0.9212481402079353,
+        "measured_tokens": [
+          158,
+          158
+        ],
+        "measured_fallbacks": 0,
+        "draft_proposed": [
+          89,
+          89
+        ],
+        "draft_accepted": [
+          68,
+          68
+        ],
+        "above_2pct": false,
+        "status": "EXPLORATORY_NOT_CONFIRMATION"
+      },
+      {
+        "run": "interaction-aggressive-forced-h0",
+        "tps": 65.89145618059051,
+        "ratio_to_screen_baseline": 0.9902602319416695,
+        "measured_tokens": [
+          176,
+          176
+        ],
+        "measured_fallbacks": 0,
+        "draft_proposed": [
+          null,
+          null
+        ],
+        "draft_accepted": [
+          null,
+          null
+        ],
+        "above_2pct": false,
+        "status": "EXPLORATORY_NOT_CONFIRMATION"
+      },
+      {
+        "run": "interaction-ap-disabled-h0",
+        "tps": 66.01745749141537,
+        "ratio_to_screen_baseline": 0.992153862687064,
+        "measured_tokens": [
+          176,
+          176
+        ],
+        "measured_fallbacks": 0,
+        "draft_proposed": [
+          null,
+          null
+        ],
+        "draft_accepted": [
+          null,
+          null
+        ],
+        "above_2pct": false,
+        "status": "EXPLORATORY_NOT_CONFIRMATION"
+      },
+      {
+        "run": "interaction-l2-disabled-h0",
+        "tps": 52.3194482002334,
+        "ratio_to_screen_baseline": 0.7862911508257849,
+        "measured_tokens": [
+          175,
+          175
+        ],
+        "measured_fallbacks": 0,
+        "draft_proposed": [
+          null,
+          null
+        ],
+        "draft_accepted": [
+          null,
+          null
+        ],
+        "above_2pct": false,
+        "status": "EXPLORATORY_NOT_CONFIRMATION"
+      },
+      {
+        "run": "interaction-pack-once-disabled-h0",
+        "tps": 65.95377876741756,
+        "ratio_to_screen_baseline": 0.9911968568527568,
+        "measured_tokens": [
+          176,
+          176
+        ],
+        "measured_fallbacks": 0,
+        "draft_proposed": [
+          null,
+          null
+        ],
+        "draft_accepted": [
+          null,
+          null
+        ],
+        "above_2pct": false,
+        "status": "EXPLORATORY_NOT_CONFIRMATION"
+      },
+      {
+        "run": "interaction-q8first-disabled-h0",
+        "tps": 67.16745858754086,
+        "ratio_to_screen_baseline": 1.0094368371149058,
+        "measured_tokens": [
+          176,
+          176
+        ],
+        "measured_fallbacks": 0,
+        "draft_proposed": [
+          null,
+          null
+        ],
+        "draft_accepted": [
+          null,
+          null
+        ],
+        "above_2pct": false,
+        "status": "EXPLORATORY_NOT_CONFIRMATION"
+      }
+    ],
+    "all_eight_completed": true,
+    "qualified_new_winners": [],
+    "new_points_above_screen_threshold": 0,
+    "limitations": "One process per configuration, two measured requests; no paired superiority or equivalence claims. Different numerical paths can change output."
+  },
+  "verification": {
+    "focused_ctest_passed": 11,
+    "python_unit_tests": 46,
+    "sampler_token_pairs": 400,
+    "subsequent_rng_samples": 100,
+    "inference_binary_or_dso_changed_by_test_build": [],
+    "successful_raw_model_requests": 139,
+    "normal_exits": 25,
+    "failed_runs": 1,
+    "failed_initial_screen_preserved": true,
+    "not_run": "Full existing production suite, including previously failing test-mtp-workspace; no claim of resolved intermittent STAR timeout."
+  },
+  "failure": "Initial baseline third request STAR payload timeout; four driver automatic resets; exit-6, no forced kill. Root cause not fixed. Later success is not proof of global reliability.",
+  "hardware_limit_not_matched": "273.86 tps remains a weight-only ideal. Frozen implementation prediction match is not a proof of hardware optimality."
+}

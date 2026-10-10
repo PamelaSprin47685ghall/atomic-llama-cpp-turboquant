@@ -1,0 +1,167 @@
+{
+  "kind": "INDEPENDENT_HC_EXPANDED_OPTIMISTIC_SERVICE_REFERENCE",
+  "frozen_utc": "2026-10-09T07:04:36.249325+00:00",
+  "whole_model_times_used": false,
+  "is_hardware_upper_bound_proof": false,
+  "original_weight_reference_tps": 273.8562490037944,
+  "old_logical_weight_bytes": 1869594000.0,
+  "replaced_HC_sites": 94,
+  "assumed_fully_hidden_injects": 23,
+  "removed_weight_bytes_per_site": 7047680,
+  "remaining_native_weight_bytes": 1207112080.0,
+  "equation": "(94-23)*inject +94*(ACT + max(Q,norm) +LO +UP), plus remaining native weight resource time",
+  "scenarios": [
+    {
+      "mailbox_fixture": "local",
+      "bandwidth_GB_s": 512,
+      "HC_service_ms": 5.65276,
+      "native_weight_only_ms": 2.35764078125,
+      "reference_ms": 8.01040078125,
+      "reference_tps": 124.83769880037798,
+      "component_median_us": {
+        "inject": 12.36,
+        "act": 3.12,
+        "up": 13.76,
+        "q": 20.2,
+        "norm": 26.68,
+        "lo": 7.24
+      }
+    },
+    {
+      "mailbox_fixture": "local",
+      "bandwidth_GB_s": 403,
+      "HC_service_ms": 5.65276,
+      "native_weight_only_ms": 2.995315334987593,
+      "reference_ms": 8.648075334987592,
+      "reference_tps": 115.63266521907961,
+      "component_median_us": {
+        "inject": 12.36,
+        "act": 3.12,
+        "up": 13.76,
+        "q": 20.2,
+        "norm": 26.68,
+        "lo": 7.24
+      }
+    },
+    {
+      "mailbox_fixture": "local",
+      "bandwidth_GB_s": 390,
+      "HC_service_ms": 5.65276,
+      "native_weight_only_ms": 3.0951591794871796,
+      "reference_ms": 8.74791917948718,
+      "reference_tps": 114.31289881425515,
+      "component_median_us": {
+        "inject": 12.36,
+        "act": 3.12,
+        "up": 13.76,
+        "q": 20.2,
+        "norm": 26.68,
+        "lo": 7.24
+      }
+    },
+    {
+      "mailbox_fixture": "system",
+      "bandwidth_GB_s": 512,
+      "HC_service_ms": 6.7394,
+      "native_weight_only_ms": 2.35764078125,
+      "reference_ms": 9.09704078125,
+      "reference_tps": 109.92585655558563,
+      "component_median_us": {
+        "inject": 12.36,
+        "act": 3.12,
+        "up": 13.76,
+        "q": 20.96,
+        "norm": 35.76,
+        "lo": 9.72
+      }
+    },
+    {
+      "mailbox_fixture": "system",
+      "bandwidth_GB_s": 403,
+      "HC_service_ms": 6.7394,
+      "native_weight_only_ms": 2.995315334987593,
+      "reference_ms": 9.734715334987593,
+      "reference_tps": 102.7251404471885,
+      "component_median_us": {
+        "inject": 12.36,
+        "act": 3.12,
+        "up": 13.76,
+        "q": 20.96,
+        "norm": 35.76,
+        "lo": 9.72
+      }
+    },
+    {
+      "mailbox_fixture": "system",
+      "bandwidth_GB_s": 390,
+      "HC_service_ms": 6.7394,
+      "native_weight_only_ms": 3.0951591794871796,
+      "reference_ms": 9.83455917948718,
+      "reference_tps": 101.68223931030784,
+      "component_median_us": {
+        "inject": 12.36,
+        "act": 3.12,
+        "up": 13.76,
+        "q": 20.96,
+        "norm": 35.76,
+        "lo": 9.72
+      }
+    }
+  ],
+  "local_optimistic_component_savings_ms": {
+    "Q64": 0.0,
+    "norm512": 0.6091200000000008
+  },
+  "omitted_costs": [
+    "unmatched native instruction/dequantization and small-op service",
+    "KV/recurrent/activation traffic not in isolated HC fixtures",
+    "cross-rank ready/payload/integrity latency and pipeline fill",
+    "CPU sampling/driver/request overhead and first graph allocation",
+    "extra barriers between independently timed shaders"
+  ],
+  "limitations": [
+    "Local/system fixtures are sensitivity cases, not proven brackets for production memory placement.",
+    "Independent medians are attainable component costs, not universal minimum latency constants.",
+    "Q/norm overlap and complete hiding of23 injects are optimistic assumptions, not observed full overlap.",
+    "Changing kernels, fusion, queues or memory policies requires recomputation.",
+    "This reference tightens the model by explicit missing work; it does not establish global optimality or Match."
+  ],
+  "sources": {
+    "inject": {
+      "path": "artifacts/perf-gap/run-20261009T0605/late-services/inject-local.log",
+      "sha256": "9ab3200b9a037e36e59e4f670a69fceace2e4e42db888fb936a6d721d18134f4"
+    },
+    "act": {
+      "path": "artifacts/perf-gap/run-20261009T0605/late-services/act-local.log",
+      "sha256": "1d74ea80edc99eceec3993415016497cf795cd1bdb3d44b3343a8909f198226c"
+    },
+    "up": {
+      "path": "artifacts/perf-gap/run-20261009T0605/late-services/up-local.log",
+      "sha256": "1b888173f166c15e7a7b572c1729d7cd806a0f960ad5a6ca1fb880b78ce4f8c5"
+    },
+    "q_local": {
+      "path": "artifacts/perf-gap/run-20261009T0605/late-services/q-local.log",
+      "sha256": "1e1c51f69195dfd1b94c72bc5e0f3f2eb76efc3bcf48ec87263f805f1c58604c"
+    },
+    "q_system": {
+      "path": "artifacts/perf-gap/run-20261009T0605/late-services/q-system.log",
+      "sha256": "9bb282e4961f3db5f342edb8afe5274e8b892ab5b9bccd13dcd687d73d8378a0"
+    },
+    "norm_local": {
+      "path": "artifacts/perf-gap/run-20261009T0605/norm-validated-wg256-rows1.log",
+      "sha256": "ad4bea9444128bc4d79624f7cddc43a94a005a6be67fa26380e22b625c4498af"
+    },
+    "norm_system": {
+      "path": "artifacts/perf-gap/run-20261009T0605/norm-geometry-wg256-system.log",
+      "sha256": "32fa6770ee47f21dbe5670c52777e367372d001bbc64601a83691446082b9409"
+    },
+    "lo_local": {
+      "path": "artifacts/perf-gap/run-20261009T0605/lo-local.log",
+      "sha256": "90297312798b020e70b4d8d1ae8ac0c12f098273e5c63694809f9113a23ca9f3"
+    },
+    "lo_system": {
+      "path": "artifacts/perf-gap/run-20261009T0605/lo-system.log",
+      "sha256": "efb27d66ae3043455d296b6e1f918daa2827d8ea547ff131e59eafb01238a4c4"
+    }
+  }
+}

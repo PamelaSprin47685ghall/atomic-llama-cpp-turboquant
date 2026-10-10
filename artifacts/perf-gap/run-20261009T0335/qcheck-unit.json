@@ -1,0 +1,1 @@
+{"kind":"CPU_QCHECK_MICRO_NOT_MODEL","mutation_checks":36819,"iterations":200000,"old_ns":360.264,"new_ns":305.377}

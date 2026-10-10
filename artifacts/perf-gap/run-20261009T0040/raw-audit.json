@@ -1,0 +1,17 @@
+{
+  "raw_requests_checked": 48,
+  "measured_requests_checked": 24,
+  "normal_exits": 8,
+  "measured_fallbacks": 0,
+  "model_stat_identities": 1,
+  "selected_source_fingerprints_unchanged": true,
+  "measured_body_hashes": {
+    "A": [
+      "b4f44fd27f041ec7187539ac8cee32af1208163adf81c78e30c65d1ce3b0cdcd"
+    ],
+    "B": [
+      "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+    ]
+  },
+  "scope": "Raw fields, hashes, stop reasons and recorded identities verified; not full logits or comprehensive quality qualification."
+}

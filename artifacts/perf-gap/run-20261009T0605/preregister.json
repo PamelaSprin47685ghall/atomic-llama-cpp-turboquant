@@ -1,0 +1,10 @@
+{
+  "goal": "Tighten resource/dependency bounds rather than refit full-model duration, and improve actual no-RERoT generation.",
+  "scope": "APEX unchanged weights; one ordinary stream; five RX6800; CPU unrestricted; current greedy-host candidate retained, all other changes separately registered.",
+  "three_distinct_numbers": ["architecture resource lower time bound", "fixed-implementation independent operator/service envelope", "held-out model throughput"],
+  "first_actions": ["Audit 0335 sparse GPU/traffic data and retain its failures", "Complete actual production LateBind isolated shader timings with all-output/metadata validation", "Validate native counter normalization before interpreting instruction counts", "Rebuild a layered resource/dependency ledger with explicit unknown components"],
+  "actual_optimization": "Select changes using the measured bottleneck, preserve mathematical/synchronization/lifetime contracts, test mechanism before independent paired end-to-end comparison.",
+  "confirmation": "Four independent process pairs AB/BA/AB/BA, two warm plus three measured and one guard per process; paired log cost Student t df3 95% CI; preserve all failed requests.",
+  "prohibited_shortcuts": "No fitting unexplained full-model residual into a hardware bound, no treating measured kernel duration as a strict physics limit, no using debug/profile scores for ranking, no adding overlapping waits/rank times, no relaxing error/timeout/output gates.",
+  "safety": "Exclusive existing GPU lock, five-card idle gate, no simultaneous compilation, no clock/driver/watchdog/reset changes. Error-only diagnostics remain. No commit/push."
+}

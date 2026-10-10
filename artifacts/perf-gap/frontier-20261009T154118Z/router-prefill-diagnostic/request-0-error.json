@@ -1,0 +1,24 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "请用八句话简要介绍健康减重原则、每周运动安排、饮食建议和睡眠误区。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "phase": "measured",
+  "http_status": 500,
+  "body": "{\"error\":{\"code\":500,\"message\":\"Compute error.\",\"type\":\"server_error\"}}",
+  "wall_ms": 135.501579,
+  "log_begin": 17702,
+  "log_end": 18921
+}

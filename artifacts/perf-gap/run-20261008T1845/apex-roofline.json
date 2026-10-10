@@ -1,0 +1,87 @@
+{
+  "status": "CONDITIONAL_THEORY_NOT_MEASUREMENT",
+  "bandwidth_GB_s_per_rank": 512,
+  "assumptions": [
+    "HC, routers and other mirrored weights are read independently by every rank.",
+    "QSA heads 5/5/5/5/4, KV 1/1/2/1/1, GDN V heads 10/10/10/10/8; Q/K duplication included.",
+    "Each required weight block crosses the assumed weight-streaming boundary once per cycle.",
+    "Two target rows reuse non-expert weights; expert union ranges from 10 to 20 distinct experts.",
+    "Indexed PLE table is not read in full; its CPU lookup cost is omitted.",
+    "Catch-up, KV/recurrent state, activation traffic, instruction throughput and synchronization are omitted.",
+    "This is not an absolute architecture-independent speed limit or a prediction that this code reaches it."
+  ],
+  "scenarios": [
+    {
+      "mode": "no-MTP replicated attention",
+      "verify_expert_union_multiplier": 1,
+      "target_logical_bytes_by_rank": [
+        3209079120.0,
+        3209079120.0,
+        3209079120.0,
+        3209079120.0,
+        3209079120.0
+      ],
+      "sum_stage_max_target_bytes": 3209079120.0,
+      "draft_logical_bytes": 0,
+      "ideal_target_ms": 6.26773265625,
+      "ideal_draft_ms": 0.0,
+      "ideal_cycle_ms": 6.26773265625,
+      "assumed_committed_per_cycle": 1.0,
+      "conditional_tokens_per_second": 159.547328331375
+    },
+    {
+      "mode": "no-MTP sharded attention",
+      "verify_expert_union_multiplier": 1,
+      "target_logical_bytes_by_rank": [
+        1856691600.0,
+        1856691600.0,
+        1869594000.0,
+        1856691600.0,
+        1758625872.0
+      ],
+      "sum_stage_max_target_bytes": 1869594000.0,
+      "draft_logical_bytes": 0,
+      "ideal_target_ms": 3.65155078125,
+      "ideal_draft_ms": 0.0,
+      "ideal_cycle_ms": 3.65155078125,
+      "assumed_committed_per_cycle": 1.0,
+      "conditional_tokens_per_second": 273.8562490037944
+    },
+    {
+      "mode": "MTP1 sharded attention",
+      "verify_expert_union_multiplier": 1,
+      "target_logical_bytes_by_rank": [
+        1856691600.0,
+        1856691600.0,
+        1869594000.0,
+        1856691600.0,
+        1758625872.0
+      ],
+      "sum_stage_max_target_bytes": 1869594000.0,
+      "draft_logical_bytes": 622647712.0,
+      "ideal_target_ms": 3.65155078125,
+      "ideal_draft_ms": 1.2161088125,
+      "ideal_cycle_ms": 4.86765959375,
+      "assumed_committed_per_cycle": 1.7752808988764044,
+      "conditional_tokens_per_second": 364.70933611623906
+    },
+    {
+      "mode": "MTP1 sharded attention",
+      "verify_expert_union_multiplier": 2,
+      "target_logical_bytes_by_rank": [
+        2061133200.0,
+        2061133200.0,
+        2074035600.0,
+        2061133200.0,
+        1963067472.0
+      ],
+      "sum_stage_max_target_bytes": 2074035600.0,
+      "draft_logical_bytes": 622647712.0,
+      "ideal_target_ms": 4.05085078125,
+      "ideal_draft_ms": 1.2161088125,
+      "ideal_cycle_ms": 5.26695959375,
+      "assumed_committed_per_cycle": 1.7752808988764044,
+      "conditional_tokens_per_second": 337.05990472815256
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "scope": "Vulkan0 only; full512 scores for N2 generic prefill and three N1 calls with changed/returned input; eligible exact-BF16 synthetic weights, not real target state",
+  "runs": [
+    {
+      "name": "generic",
+      "mode": "f32",
+      "tiling": "0",
+      "returncode": 0,
+      "log": "router-bit-generic.log",
+      "sha256": "8b93afd6face862ed7d244096a345064a494da23fd4a8a053358f26cd1c66519"
+    },
+    {
+      "name": "native-bf16",
+      "mode": "bf16",
+      "tiling": "0",
+      "returncode": 0,
+      "log": "router-bit-native-bf16.log",
+      "sha256": "8b93afd6face862ed7d244096a345064a494da23fd4a8a053358f26cd1c66519"
+    }
+  ],
+  "bytes_compared": 10240,
+  "generic_vs_native_bf16_equal": true,
+  "fix": "router BF16 dispatch reopens the compute submission after the one-time conversion synchronize ends it; native one-row F32-geometry BF16 pipeline",
+  "qualification": "kernel numerical smoke only; model/sampler/state/throughput pending"
+}

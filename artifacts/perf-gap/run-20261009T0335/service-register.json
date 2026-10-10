@@ -1,0 +1,7 @@
+{
+  "relay": "Model-free 96-stage F16 relay at 256,2560,4096 elements,16 replays. The synthetic kernel is not the production F32+LateBind chain and its measured minimum is not an architecture-independent lower bound.",
+  "kernels": "Nine explicit real-model-related dtype/shapes, paired same-address resident and >=256MiB independent-address stream working sets. Native matvec, MMVQ disabled; shared output address forces WAW serialization. Seven timed repetitions after two warmups, same binary and per-op samples retained.",
+  "correctness": "Selected output rows checked against dequantized CPU dot, relative error <=2e-4 scaled by max(1,abs(expected)); no model throughput or full-layer equivalence claim. Generic HC kernels differ from specialized aggressive HC; generic expert batch differs from fused routed MoE, so neither can be substituted into the final ledger silently.",
+  "timing": "Host graph compute plus completion per op, amortized over many serialized nodes. This is an independently achievable implementation service envelope, NOT peak hardware throughput and NOT fitted from the full model. One rank only; rank identity reported by backend log.",
+  "safety": "One exclusive GPU lock; existing five-card idle gate including VRAM; wait for naturally idle counters rather than suppressing gate; no simultaneous compilation. Any compute/numerical/exit failure stops the service campaign and remains preserved."
+}

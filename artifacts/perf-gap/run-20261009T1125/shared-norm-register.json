@@ -1,0 +1,7 @@
+{
+  "second_candidate": "Four logical256-lane streams share a single1024-thread workgroup and one vector-loaded Y tile. Identical per-stream element assignment and8-subgroup fold; all four streams share the same unchanged generation wait.",
+  "purpose": "Reduce actual Y payload reads from4x to1x without changing mathematical values, packet format or the TP graph. Does not claim fourfold end-to-end gain.",
+  "first_gate": "Standalone production-equivalent signed norm fixture at1/2/4 rows and withheld-generation cases; same1e-6 numerical and inactive-row gates. No production integration before passing.",
+  "comparison": "Measure A, vector-staged, shared-staged with identical workload warmup and memory domains. Keep the first production pilot independent; no failed point replacement.",
+  "limitations": "Workgroup1024 may lose occupancy; exact arithmetic order in source is checked against numerical outputs and real response bodies, not assumed to guarantee compiler identity."
+}

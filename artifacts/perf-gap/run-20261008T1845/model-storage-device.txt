@@ -1,0 +1,4 @@
+39 37623740192 /home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
+39 28800138432 /home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf
+39 37024085792 models/perf-gap-q2-hcq8/Q2-HCQ8-00001-of-00002.gguf
+39 28800138432 models/perf-gap-q2-hcq8/Q2-HCQ8-00002-of-00002.gguf

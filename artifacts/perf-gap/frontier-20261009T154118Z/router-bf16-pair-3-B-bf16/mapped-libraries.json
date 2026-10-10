@@ -1,0 +1,13 @@
+{
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-bf16-native-bin/libggml-base.so.0.18.1": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-bf16-native-bin/libggml-vulkan.so.0.18.1": "0df030a7d54c1eb89051e9acab8d6d068ce4be99916b8f7b48831760c9981b8e",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-bf16-native-bin/libggml.so.0.18.1": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-bf16-native-bin/libllama-common.so.0.0.2188": "29bcbe656b7e8932ad8e399680873b5eddb442bd393b93ab5d638a548c3b9ff9",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-bf16-native-bin/libllama-server-impl.so": "5c560e6abdef9833a7668e74780b55571f6700ceb969661811b45c7d82867669",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-bf16-native-bin/libllama.so.0.0.2188": "5d63fa93bfe35f7da895bbea3cb79953733e76c513d57e9485744651ede09d19",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libggml-cpu.so.0.18.1": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+  "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+  "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+  "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+  "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac"
+}

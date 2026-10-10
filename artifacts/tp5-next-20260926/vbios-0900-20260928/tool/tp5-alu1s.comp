@@ -1,0 +1,28 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Output { float values[]; } output_data;
+layout(push_constant) uniform Control { uint rounds; float seed; } control;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    vec4 base = vec4(float(id) * 0.000001 + control.seed);
+    vec4 a = base + vec4(0.01, 0.02, 0.03, 0.04);
+    vec4 b = base + vec4(0.05, 0.06, 0.07, 0.08);
+    vec4 c = base + vec4(0.09, 0.10, 0.11, 0.12);
+    vec4 d = base + vec4(0.13, 0.14, 0.15, 0.16);
+    vec4 e = base + vec4(0.17, 0.18, 0.19, 0.20);
+    vec4 f = base + vec4(0.21, 0.22, 0.23, 0.24);
+    vec4 g = base + vec4(0.25, 0.26, 0.27, 0.28);
+    vec4 h = base + vec4(0.29, 0.30, 0.31, 0.32);
+    for (uint i = 0; i < control.rounds; ++i) {
+        a = fma(a, vec4(0.99991), vec4(0.000091));
+        b = fma(b, vec4(0.99992), vec4(0.000092));
+        c = fma(c, vec4(0.99993), vec4(0.000093));
+        d = fma(d, vec4(0.99994), vec4(0.000094));
+        e = fma(e, vec4(0.99995), vec4(0.000095));
+        f = fma(f, vec4(0.99996), vec4(0.000096));
+        g = fma(g, vec4(0.99997), vec4(0.000097));
+        h = fma(h, vec4(0.99998), vec4(0.000098));
+    }
+    vec4 sum = a + b + c + d + e + f + g + h;
+    output_data.values[id] = sum.x + sum.y + sum.z + sum.w;
+}

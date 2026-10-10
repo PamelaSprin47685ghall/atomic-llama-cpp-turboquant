@@ -1,0 +1,12 @@
+{
+  "head": "9be06d5ab3f3595c10dd9ad2ab43971bad240688",
+  "sources": {
+    "common/common.cpp": "9ce942c05af4ed494b583b364cf242ff23e560d4d6918335e4defb2f2ad720eb",
+    "common/speculative.cpp": "66165c6c08ddf058b44be0ea20bcc5581ef77a95a99f2a6b481c21bbe41fd8f9",
+    "tools/server/server-context.cpp": "106ddd0ba659572a3c2e2c603b4439befaf27f473496ff687ca6826ae67ab650",
+    "ggml/src/ggml-vulkan/ggml-vulkan.cpp": "810389d075914f612b205d5fe4260df3d81fbc6cd257cca51347d9d2b981fe75",
+    "ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp": "37e068826cab55c7b60fe29186ad354f08ead0f82f4c1fe9489046d176ae50ab",
+    "ggml/src/ggml-vulkan/ggml-vulkan-tp5-rows.h": "ec64f07d1010d13061b8305c70ab5086696d3bf6a42ddce9d8e67790b0de64e8"
+  },
+  "purpose": "Source fingerprints before new measurements; per-arm executable and mapped library hashes are in manifests."
+}

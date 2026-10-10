@@ -1,0 +1,46 @@
+{
+  "status": "new binary diagnostic completed; frozen h1 failure remains unresolved",
+  "h0_tps": 67.45204868351614,
+  "h1_tps": 64.68983272355659,
+  "output_match": [
+    {
+      "phase": "warmup",
+      "h0_n": 182,
+      "h1_n": 186,
+      "same_body": false
+    },
+    {
+      "phase": "warmup",
+      "h0_n": 176,
+      "h1_n": 158,
+      "same_body": false
+    },
+    {
+      "phase": "measured",
+      "h0_n": 176,
+      "h1_n": 158,
+      "same_body": false
+    },
+    {
+      "phase": "measured",
+      "h0_n": 176,
+      "h1_n": 158,
+      "same_body": false
+    },
+    {
+      "phase": "measured",
+      "h0_n": 176,
+      "h1_n": 158,
+      "same_body": false
+    },
+    {
+      "phase": "guard",
+      "h0_n": 87,
+      "h1_n": 87,
+      "same_body": false
+    }
+  ],
+  "quality": "FAILED exact corresponding output gate; no promotion",
+  "native_failure_codes_observed": false,
+  "source_change": "failure-only native result diagnostics; no root cause fix"
+}

@@ -1,0 +1,1388 @@
+[
+  {
+    "name": "inject-local-d0-batch0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "inject",
+      "local",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "0",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_late_inject.spv",
+      "aperture": "local",
+      "device": 0,
+      "groups": 4,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 192,
+      "min_us": 2.88,
+      "median_us": 2.92,
+      "p95_us": 3.2,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "inject-local-d0-batch1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "inject",
+      "local",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "1",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_late_inject.spv",
+      "aperture": "local",
+      "device": 0,
+      "groups": 4,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 3,
+      "min_us": 3.323125,
+      "median_us": 3.324375,
+      "p95_us": 3.325,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "act-local-d0-batch0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "act",
+      "local",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "0",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_late_act_q8.spv",
+      "aperture": "local",
+      "device": 0,
+      "groups": 40,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 192,
+      "min_us": 0.8,
+      "median_us": 0.84,
+      "p95_us": 0.88,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "act-local-d0-batch1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "act",
+      "local",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "1",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_late_act_q8.spv",
+      "aperture": "local",
+      "device": 0,
+      "groups": 40,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 3,
+      "min_us": 1.219375,
+      "median_us": 1.22,
+      "p95_us": 1.22,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "q-production-d0-batch0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "q",
+      "production",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "0",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_late_q_q8dot.spv",
+      "aperture": "production",
+      "device": 0,
+      "groups": 20,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 192,
+      "min_us": 5.76,
+      "median_us": 5.92,
+      "p95_us": 5.96,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "q-production-d0-batch1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "q",
+      "production",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "1",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_late_q_q8dot.spv",
+      "aperture": "production",
+      "device": 0,
+      "groups": 20,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 3,
+      "min_us": 7.878125,
+      "median_us": 7.88375,
+      "p95_us": 7.893125,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "norm-production-d0-batch0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "norm",
+      "production",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "0",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_resume_norm.spv",
+      "aperture": "production",
+      "device": 0,
+      "groups": 4,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 192,
+      "min_us": 8.0,
+      "median_us": 28.6,
+      "p95_us": 30.76,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "norm-production-d0-batch1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "norm",
+      "production",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "1",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_resume_norm.spv",
+      "aperture": "production",
+      "device": 0,
+      "groups": 4,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 3,
+      "min_us": 35.070625,
+      "median_us": 35.085,
+      "p95_us": 40.19,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "lo-production-d0-batch0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "lo",
+      "production",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "0",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_resume_lo_q8.spv",
+      "aperture": "production",
+      "device": 0,
+      "groups": 1,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 192,
+      "min_us": 2.32,
+      "median_us": 2.52,
+      "p95_us": 3.0,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "lo-production-d0-batch1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "lo",
+      "production",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "1",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_resume_lo_q8.spv",
+      "aperture": "production",
+      "device": 0,
+      "groups": 1,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 3,
+      "min_us": 3.190625,
+      "median_us": 3.190625,
+      "p95_us": 3.199375,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "up-local-d0-batch0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "up",
+      "local",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "0",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_late_up_q8dot.spv",
+      "aperture": "local",
+      "device": 0,
+      "groups": 80,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 192,
+      "min_us": 3.56,
+      "median_us": 3.76,
+      "p95_us": 4.0,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "up-local-d0-batch1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "up",
+      "local",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "1",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_late_up_q8dot.spv",
+      "aperture": "local",
+      "device": 0,
+      "groups": 80,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 3,
+      "min_us": 4.099375,
+      "median_us": 4.10125,
+      "p95_us": 4.10125,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "packnoop-local-d0-batch0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "0",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_late_pack.spv",
+      "aperture": "local",
+      "device": 0,
+      "groups": 400,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 192,
+      "min_us": 6.92,
+      "median_us": 7.0,
+      "p95_us": 7.04,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  },
+  {
+    "name": "packnoop-local-d0-batch1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-warm-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_BATCH_TIMING": "1",
+      "TP5_TEST_WARM_MS": "200"
+    },
+    "before": [
+      {
+        "card": "card1",
+        "bdf": "0000:0f:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17203200",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+      },
+      {
+        "card": "card2",
+        "bdf": "0000:09:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card3",
+        "bdf": "0000:0c:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card4",
+        "bdf": "0000:06:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      },
+      {
+        "card": "card5",
+        "bdf": "0000:03:00.0",
+        "device": "0x73bf",
+        "gpu_busy_percent": "0",
+        "mem_info_vram_used": "17207296",
+        "mem_info_vram_total": "17163091968",
+        "current_link_speed": "8.0 GT/s PCIe",
+        "current_link_width": "16",
+        "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+        "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+      }
+    ],
+    "returncode": 0,
+    "binary_sha256": "23653119f1be5bf10c03948d188975a6a6aedbfea120935af0628a9102da2f29",
+    "result": {
+      "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+      "shader": "tp5_hc_late_pack.spv",
+      "aperture": "local",
+      "device": 0,
+      "groups": 400,
+      "threads": 256,
+      "width": 2560,
+      "rows": 1,
+      "samples": 3,
+      "min_us": 8.68625,
+      "median_us": 8.69,
+      "p95_us": 8.691875,
+      "all_outputs_checked": true,
+      "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+    }
+  }
+]

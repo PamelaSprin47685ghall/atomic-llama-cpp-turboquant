@@ -1,0 +1,350 @@
+{
+  "status": "SMOKE_PASS",
+  "failure_reason": null,
+  "count_to": 60,
+  "git_provenance": {
+    "head_commit": "16e28b8ac63c9fd5a54611070c6405f064f69a21",
+    "is_dirty": true,
+    "diff_sha256": "791aef6a4a35ad5fc18c50d89d5afaedbbe43c4812018acdb71a2067a634962a",
+    "script_sha256": "88c1340d2986c56ccc6b2b8559b7d5971adfaea277865b2a78deb6cd33621c44",
+    "porcelain_status": "M ggml/src/ggml-vulkan/ggml-vulkan-tp5-rows.h"
+  },
+  "server_binary_sha256": "bcbdff1633b0dba813b790c71a9968d53066ac9a7bdf5ff0fa0cd3dba04bbccf",
+  "trials": [
+    {
+      "variant": "native-mtp-fused-default",
+      "trial_tag": "smoke_60",
+      "count_to": 60,
+      "port": 8097,
+      "is_mtp": true,
+      "requires_linear": true,
+      "metrics": [
+        {
+          "success": true,
+          "status_code": 200,
+          "client_wall_sec": 3.5859292290115263,
+          "reported_predicted_tps": 83.82229673093043,
+          "decode_tps": 83.82229673093043,
+          "predicted_ms": 2040.03,
+          "prompt_n": 31,
+          "predicted_n": 171,
+          "completion_tokens": 171,
+          "committed_tps": 47.686384498764,
+          "finish_reason": "stop",
+          "exact_content_match": true,
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+              }
+            ],
+            "temperature": 0,
+            "seed": 42,
+            "max_tokens": 192,
+            "cache_prompt": false,
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            },
+            "stream": false
+          },
+          "raw_response": {
+            "choices": [
+              {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+                }
+              }
+            ],
+            "created": 1790419137,
+            "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+            "system_fingerprint": "b2132-9b3c33881",
+            "object": "chat.completion",
+            "usage": {
+              "completion_tokens": 171,
+              "prompt_tokens": 31,
+              "total_tokens": 202,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "id": "chatcmpl-ArnA872DtmL3EX5xBV2jshLSi1NKZ8fu",
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 31,
+              "prompt_ms": 1026.517,
+              "prompt_per_token_ms": 33.113451612903226,
+              "prompt_per_second": 30.199207611758986,
+              "predicted_n": 171,
+              "predicted_ms": 2040.03,
+              "predicted_per_token_ms": 11.93,
+              "predicted_per_second": 83.82229673093043,
+              "draft_n": 150,
+              "draft_n_accepted": 149
+            }
+          },
+          "error_message": null
+        }
+      ],
+      "mapped_dso_hashes": {
+        "/home/kunweiz/.cache/radv_builtin_shaders/index": "e33aed84c876e17146c31c9e035983814d8f1c8817144ec34630bba6c53991f3",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac",
+        "/var/tmp/tp5-integ-9b3c33/build-review/bin/libggml-base.so.0.18.1": "99e0d415de9751b5382deed91520b2645c68a740bcc4af6cf10844a754f21478",
+        "/var/tmp/tp5-integ-9b3c33/build-review/bin/libggml-cpu.so.0.18.1": "540cf0f86cd242f04c35a556d88fdae8303171b40eb2fa1b2b855a9d84c864f5",
+        "/var/tmp/tp5-integ-9b3c33/build-review/bin/libggml-vulkan.so.0.18.1": "800d85235bea4e2150c6d3ca19b5c1d2765028d3020f9d6412c480cec309edec",
+        "/var/tmp/tp5-integ-9b3c33/build-review/bin/libggml.so.0.18.1": "89efbcfdb26c92e0ffab819816bad3f740ee6458fc0e7a32b3fd0f6bca734748",
+        "/var/tmp/tp5-integ-9b3c33/build-review/bin/libllama-common.so.0.0.2132": "53d178de90a20f4c3ce171a2f53441c4809386f8e736648d1fb657fa19a261ac",
+        "/var/tmp/tp5-integ-9b3c33/build-review/bin/libllama-server-impl.so": "f1d378f896bbbc31e0fd467fdc84365992a6c6866a047bb42d4ada19c9669e5a",
+        "/var/tmp/tp5-integ-9b3c33/build-review/bin/libllama.so.0.0.2132": "3f9c53a899589a72e4eb2f58882c101b32b15a4d89421ac8febba6fadb8abd56",
+        "/var/tmp/tp5-integ-9b3c33/build-review/bin/llama-server": "bcbdff1633b0dba813b790c71a9968d53066ac9a7bdf5ff0fa0cd3dba04bbccf"
+      },
+      "gpu_snapshot_before": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17203200,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 1200Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "S: 0Mhz *",
+            "1: 500Mhz",
+            "2: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 0
+        }
+      ],
+      "gpu_snapshot_after": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0",
+          "pci_inode": 22355,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17203200,
+          "gpu_busy_percent": 24
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0",
+          "pci_inode": 22692,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 1200Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 4
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0",
+          "pci_inode": 23029,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 4
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0",
+          "pci_inode": 23366,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 3
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0",
+          "pci_inode": 93678,
+          "sclk_dpm": [
+            "0: 500Mhz *",
+            "1: 2475Mhz"
+          ],
+          "vram_used": 17207296,
+          "gpu_busy_percent": 6
+        }
+      ],
+      "log_route_verification": {
+        "log_exists": true,
+        "linear_definition_hit": true,
+        "route_verified": true,
+        "mmvq_policy_seen": true,
+        "mmvq_policy_unobservable": false,
+        "error": null
+      },
+      "success": true,
+      "log_path": "/var/tmp/tp5-integ-20260926/integ-fused-default-smoke_logs/server_native-mtp-fused-default_smoke_60.log",
+      "log_sha256": "258f9c2fbaad2d6f18f133726b76db8da007817c6cec1ad8e490dbe409f06486",
+      "command": [
+        "/var/tmp/tp5-integ-9b3c33/build-review/bin/llama-server",
+        "-m",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+        "-dev",
+        "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+        "--split-mode",
+        "tensor",
+        "--fit",
+        "off",
+        "-ngl",
+        "999",
+        "-c",
+        "256",
+        "-b",
+        "32",
+        "-ub",
+        "32",
+        "--no-mmap",
+        "--no-host",
+        "-np",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8097",
+        "--tp5",
+        "qwen4exp-af",
+        "-md",
+        "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+        "--spec-type",
+        "draft-mtp"
+      ],
+      "env_snapshot": {
+        "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+        "HOME": "/home/kunweiz",
+        "USER": "kunweiz",
+        "SHELL": "/bin/bash",
+        "LANG": "en_US.UTF-8",
+        "LD_LIBRARY_PATH": "/var/tmp/tp5-integ-9b3c33/build-review/bin",
+        "RADV_DEBUG": "nobolist"
+      },
+      "warmup": {
+        "success": true,
+        "status_code": 200,
+        "client_wall_sec": 4.371871259994805,
+        "reported_predicted_tps": 63.963851072703704,
+        "decode_tps": 63.963851072703704,
+        "predicted_ms": 2673.385,
+        "prompt_n": 31,
+        "predicted_n": 171,
+        "completion_tokens": 171,
+        "committed_tps": 39.1136860695672,
+        "finish_reason": "stop",
+        "exact_content_match": true,
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Count from 1 to 60. Use commas without spaces. Output only the numbers."
+            }
+          ],
+          "temperature": 0,
+          "seed": 42,
+          "max_tokens": 192,
+          "cache_prompt": false,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream": false
+        },
+        "raw_response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60"
+              }
+            }
+          ],
+          "created": 1790419133,
+          "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+          "system_fingerprint": "b2132-9b3c33881",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 171,
+            "prompt_tokens": 31,
+            "total_tokens": 202,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-WR0ZB2DaWhuRf7ZhaeO6UkTcQMpqc9yW",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 31,
+            "prompt_ms": 1695.365,
+            "prompt_per_token_ms": 54.689193548387095,
+            "prompt_per_second": 18.285148035968657,
+            "predicted_n": 171,
+            "predicted_ms": 2673.385,
+            "predicted_per_token_ms": 15.633830409356726,
+            "predicted_per_second": 63.963851072703704,
+            "draft_n": 150,
+            "draft_n_accepted": 149
+          }
+        },
+        "error_message": null
+      }
+    }
+  ]
+}

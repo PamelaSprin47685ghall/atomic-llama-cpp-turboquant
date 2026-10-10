@@ -1,0 +1,85 @@
+{
+  "scope": "same frozen router-empty-head binary, sequential B then A pilot; not preregistered 8-pair independent confirmation",
+  "A_pooled_tps": 66.6913727888589,
+  "B_pooled_tps": 61.87410330889345,
+  "relative_percent": -7.223227350884875,
+  "all_six_bodies_and_token_counts_equal": true,
+  "paired_requests": [
+    {
+      "idx": 0,
+      "phase": "warmup",
+      "tokens_equal": true,
+      "body_sha_equal": true,
+      "A_fallback": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=3 n_sub=96 uid=36028797018967041",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=97 uid=36028797018967297",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=97 uid=36028797018967553"
+      ],
+      "B_fallback": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=3 n_sub=143 uid=36028797018967041",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=145 uid=36028797018967297",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=145 uid=36028797018967553"
+      ]
+    },
+    {
+      "idx": 1,
+      "phase": "warmup",
+      "tokens_equal": true,
+      "body_sha_equal": true,
+      "A_fallback": [],
+      "B_fallback": []
+    },
+    {
+      "idx": 2,
+      "phase": "measured",
+      "tokens_equal": true,
+      "body_sha_equal": true,
+      "A_fallback": [],
+      "B_fallback": []
+    },
+    {
+      "idx": 3,
+      "phase": "measured",
+      "tokens_equal": true,
+      "body_sha_equal": true,
+      "A_fallback": [],
+      "B_fallback": []
+    },
+    {
+      "idx": 4,
+      "phase": "measured",
+      "tokens_equal": true,
+      "body_sha_equal": true,
+      "A_fallback": [],
+      "B_fallback": []
+    },
+    {
+      "idx": 5,
+      "phase": "guard",
+      "tokens_equal": true,
+      "body_sha_equal": true,
+      "A_fallback": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=96 uid=36028797018970881"
+      ],
+      "B_fallback": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=143 uid=36028797018970881"
+      ]
+    }
+  ],
+  "shutdown": {
+    "A": {
+      "returncode": 0,
+      "forced": false,
+      "seconds": 1.2158983800036367
+    },
+    "B": {
+      "returncode": 0,
+      "forced": false,
+      "seconds": 1.365771025972208
+    }
+  },
+  "qualification": "NOT_PROMOTED: negative pilot; narrow parity does not cover sampler/RNG, dynamic capacity or long reliability",
+  "binary_sha256": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c",
+  "frozen_identity": "router-empty-head-identity.json",
+  "global_theoretical_bound": "UNRESOLVED"
+}

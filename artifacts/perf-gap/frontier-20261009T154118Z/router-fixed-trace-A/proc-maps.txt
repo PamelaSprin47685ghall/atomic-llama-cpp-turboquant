@@ -1,0 +1,445 @@
+5f9e5e805000-5f9e5e808000 r--p 00000000 00:26 5739051                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/tp5-router-trace
+5f9e5e808000-5f9e5e811000 r-xp 00003000 00:26 5739051                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/tp5-router-trace
+5f9e5e811000-5f9e5e813000 r--p 0000c000 00:26 5739051                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/tp5-router-trace
+5f9e5e813000-5f9e5e814000 r--p 0000d000 00:26 5739051                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/tp5-router-trace
+5f9e5e814000-5f9e5e815000 rw-p 0000e000 00:26 5739051                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/tp5-router-trace
+5f9e8df77000-5f9e9de6c000 rw-p 00000000 00:00 0                          [heap]
+7099da622000-709b72549000 rw-p 00000000 00:00 0 
+709b72549000-709b788c0000 rw-s 3c8e76000 00:07 595                       /dev/dri/renderD128
+709b788c0000-709b7ec37000 rw-s 3cccc2000 00:07 1492                      /dev/dri/renderD130
+709b7ec37000-709b84fae000 rw-s 3cd90f000 00:07 1556                      /dev/dri/renderD129
+709b84fae000-709b8b325000 rw-s 3cebfa000 00:07 1684                      /dev/dri/renderD131
+709b8b325000-709b9169c000 rw-s 3cccc2000 00:07 1620                      /dev/dri/renderD132
+709b924b7000-709bc4a00000 rw-p 00000000 00:00 0 
+709bc4a00000-709e87a42000 r--s 00000000 00:26 177824                     /home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00006-of-00006.gguf
+709e87c00000-70a1ef746000 r--s 00000000 00:26 177825                     /home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00005-of-00006.gguf
+70a1ef800000-70a557346000 r--s 00000000 00:26 177826                     /home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00004-of-00006.gguf
+70a557400000-70a8bf156000 r--s 00000000 00:26 177821                     /home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00003-of-00006.gguf
+70a8bf200000-70af73bf4000 r--s 00000000 00:26 177819                     /home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00002-of-00006.gguf
+70af73c00000-70af93e70000 r--s 00000000 00:26 177820                     /home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf
+70af94000000-70af94021000 rw-p 00000000 00:00 0 
+70af94021000-70af98000000 ---p 00000000 00:00 0 
+70af99999000-70af9c021000 rw-p 00000000 00:00 0 
+70af9c021000-70afa0000000 ---p 00000000 00:00 0 
+70afa0000000-70afa0021000 rw-p 00000000 00:00 0 
+70afa0021000-70afa4000000 ---p 00000000 00:00 0 
+70afa4000000-70afa4021000 rw-p 00000000 00:00 0 
+70afa4021000-70afa8000000 ---p 00000000 00:00 0 
+70afa8000000-70afa8021000 rw-p 00000000 00:00 0 
+70afa8021000-70afac000000 ---p 00000000 00:00 0 
+70afac000000-70afac021000 rw-p 00000000 00:00 0 
+70afac021000-70afb0000000 ---p 00000000 00:00 0 
+70afb07ff000-70afb1000000 rw-p 00000000 00:00 0 
+70afb1000000-70afb1201000 rw-s 00000000 00:26 204846                     /home/kunweiz/.cache/radv_builtin_shaders/index
+70afb13ff000-70afb1c00000 rw-p 00000000 00:00 0 
+70afb1c00000-70afb1e01000 rw-s 00000000 00:26 188868                     /home/kunweiz/.cache/mesa_shader_cache/index
+70afb1fff000-70afb2800000 rw-p 00000000 00:00 0 
+70afb2800000-70afb2a01000 rw-s 00000000 00:26 204846                     /home/kunweiz/.cache/radv_builtin_shaders/index
+70afb2bff000-70afb3400000 rw-p 00000000 00:00 0 
+70afb3400000-70afb3601000 rw-s 00000000 00:26 188868                     /home/kunweiz/.cache/mesa_shader_cache/index
+70afb37ff000-70afb4000000 rw-p 00000000 00:00 0 
+70afb4000000-70afb4021000 rw-p 00000000 00:00 0 
+70afb4021000-70afb8000000 ---p 00000000 00:00 0 
+70afb8000000-70afb8021000 rw-p 00000000 00:00 0 
+70afb8021000-70afbc000000 ---p 00000000 00:00 0 
+70afbc000000-70afbc021000 rw-p 00000000 00:00 0 
+70afbc021000-70afc0000000 ---p 00000000 00:00 0 
+70afc0200000-70afc0401000 rw-s 00000000 00:26 204846                     /home/kunweiz/.cache/radv_builtin_shaders/index
+70afc05ff000-70afc0e00000 rw-p 00000000 00:00 0 
+70afc0e00000-70afc1001000 rw-s 00000000 00:26 188868                     /home/kunweiz/.cache/mesa_shader_cache/index
+70afc11ff000-70afc1a00000 rw-p 00000000 00:00 0 
+70afc1a00000-70afc1c01000 rw-s 00000000 00:26 204846                     /home/kunweiz/.cache/radv_builtin_shaders/index
+70afc1dff000-70afc2600000 rw-p 00000000 00:00 0 
+70afc2600000-70afc2801000 rw-s 00000000 00:26 188868                     /home/kunweiz/.cache/mesa_shader_cache/index
+70afc29ff000-70afc3200000 rw-p 00000000 00:00 0 
+70afc3200000-70afc3401000 rw-s 00000000 00:26 204846                     /home/kunweiz/.cache/radv_builtin_shaders/index
+70afc35ff000-70afc3e00000 rw-p 00000000 00:00 0 
+70afc3e00000-70afc3e4a000 r--p 00000000 00:26 188233                     /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so
+70afc3e4a000-70afc44f0000 r-xp 0004a000 00:26 188233                     /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so
+70afc44f0000-70afc4ee6000 r--p 006f0000 00:26 188233                     /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so
+70afc4ee6000-70afc4f37000 r--p 010e5000 00:26 188233                     /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so
+70afc4f37000-70afc4f54000 rw-p 01136000 00:26 188233                     /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so
+70afc4f54000-70afc4f5a000 rw-p 00000000 00:00 0 
+70afc6200000-70afca570000 r--p 00000000 00:26 37017                      /usr/lib/x86_64-linux-gnu/libLLVM.so.21.1
+70afca570000-70afce3c3000 r-xp 0436f000 00:26 37017                      /usr/lib/x86_64-linux-gnu/libLLVM.so.21.1
+70afce3c3000-70afce5e2000 r--p 081c1000 00:26 37017                      /usr/lib/x86_64-linux-gnu/libLLVM.so.21.1
+70afce5e2000-70afce629000 rw-p 083df000 00:26 37017                      /usr/lib/x86_64-linux-gnu/libLLVM.so.21.1
+70afce629000-70afce6d6000 rw-p 00000000 00:00 0 
+70afcebf2000-70afcf13c000 rw-s 3cf1ed000 00:07 595                       /dev/dri/renderD128
+70afcf13c000-70afcf686000 rw-s 3d3039000 00:07 1492                      /dev/dri/renderD130
+70afcf686000-70afd0021000 rw-p 00000000 00:00 0 
+70afd0021000-70afd4000000 ---p 00000000 00:00 0 
+70afd40e2000-70afd4167000 rw-s 3c8d5b000 00:07 595                       /dev/dri/renderD128
+70afd4167000-70afd41ec000 rw-s 3ccba7000 00:07 1492                      /dev/dri/renderD130
+70afd41ec000-70afd4271000 rw-s 3cd7f4000 00:07 1556                      /dev/dri/renderD129
+70afd4271000-70afd42f6000 rw-s 3ceadf000 00:07 1684                      /dev/dri/renderD131
+70afd42f6000-70afd437b000 rw-s 3ccba7000 00:07 1620                      /dev/dri/renderD132
+70afd437b000-70afd4400000 rw-s 3c8c51000 00:07 595                       /dev/dri/renderD128
+70afd4400000-70afd4601000 rw-s 00000000 00:26 188868                     /home/kunweiz/.cache/mesa_shader_cache/index
+70afd4671000-70afd46f6000 rw-s 3cca9d000 00:07 1492                      /dev/dri/renderD130
+70afd46f6000-70afd477b000 rw-s 3cd6ea000 00:07 1556                      /dev/dri/renderD129
+70afd477b000-70afd4800000 rw-s 3ce9d5000 00:07 1684                      /dev/dri/renderD131
+70afd4800000-70afd4849000 r--p 00000000 00:26 188231                     /usr/lib/x86_64-linux-gnu/libvulkan_lvp.so
+70afd4849000-70afd4d21000 r-xp 00049000 00:26 188231                     /usr/lib/x86_64-linux-gnu/libvulkan_lvp.so
+70afd4d21000-70afd5558000 r--p 00521000 00:26 188231                     /usr/lib/x86_64-linux-gnu/libvulkan_lvp.so
+70afd5558000-70afd55a7000 r--p 00d57000 00:26 188231                     /usr/lib/x86_64-linux-gnu/libvulkan_lvp.so
+70afd55a7000-70afd55ac000 rw-p 00da6000 00:26 188231                     /usr/lib/x86_64-linux-gnu/libvulkan_lvp.so
+70afd55ac000-70afd55d8000 rw-p 00000000 00:00 0 
+70afd55f8000-70afd567d000 rw-s 3cca9d000 00:07 1620                      /dev/dri/renderD132
+70afd567d000-70afd56bd000 rw-s 3c8b8c000 00:07 595                       /dev/dri/renderD128
+70afd56bd000-70afd56fd000 rw-s 3cc9d8000 00:07 1492                      /dev/dri/renderD130
+70afd56fd000-70afd5c47000 rw-s 3d3c86000 00:07 1556                      /dev/dri/renderD129
+70afd5c47000-70afd5c87000 rw-s 3cd625000 00:07 1556                      /dev/dri/renderD129
+70afd5c87000-70afd61d1000 rw-s 3d4f71000 00:07 1684                      /dev/dri/renderD131
+70afd61d1000-70afd6211000 rw-s 3ce910000 00:07 1684                      /dev/dri/renderD131
+70afd6211000-70afd675b000 rw-s 3d3039000 00:07 1620                      /dev/dri/renderD132
+70afd675b000-70afd679b000 rw-s 3cc9d8000 00:07 1620                      /dev/dri/renderD132
+70afd679b000-70afd67af000 rw-s 3cccae000 00:07 1620                      /dev/dri/renderD132
+70afd67af000-70afd67c3000 rw-s 3c8e4e000 00:07 595                       /dev/dri/renderD128
+70afd67c3000-70afd67d7000 rw-s 3ccc9a000 00:07 1492                      /dev/dri/renderD130
+70afd67d7000-70afd67eb000 rw-s 3cd8e7000 00:07 1556                      /dev/dri/renderD129
+70afd67eb000-70afd67ff000 rw-s 3cebd2000 00:07 1684                      /dev/dri/renderD131
+70afd67ff000-70afd6813000 rw-s 3ccc9a000 00:07 1620                      /dev/dri/renderD132
+70afd6813000-70afd6827000 rw-s 3c8ae4000 00:07 595                       /dev/dri/renderD128
+70afd6827000-70afd683b000 rw-s 3cc930000 00:07 1492                      /dev/dri/renderD130
+70afd683b000-70afd684f000 rw-s 3cd57d000 00:07 1556                      /dev/dri/renderD129
+70afd684f000-70afd6863000 rw-s 3ce868000 00:07 1684                      /dev/dri/renderD131
+70afd6885000-70afd6889000 rw-s 3c8b88000 00:07 595                       /dev/dri/renderD128
+70afd6889000-70afd689d000 rw-s 3c8b74000 00:07 595                       /dev/dri/renderD128
+70afd689d000-70afd68a1000 rw-s 3cc9d4000 00:07 1492                      /dev/dri/renderD130
+70afd68a1000-70afd68b5000 rw-s 3cc9c0000 00:07 1492                      /dev/dri/renderD130
+70afd68b5000-70afd68b9000 rw-s 3cd621000 00:07 1556                      /dev/dri/renderD129
+70afd68b9000-70afd68cd000 rw-s 3cd60d000 00:07 1556                      /dev/dri/renderD129
+70afd68cd000-70afd68d1000 rw-s 3ce90c000 00:07 1684                      /dev/dri/renderD131
+70afd68d1000-70afd68e5000 rw-s 3ce8f8000 00:07 1684                      /dev/dri/renderD131
+70afd68e5000-70afd68e9000 rw-s 3cc9d4000 00:07 1620                      /dev/dri/renderD132
+70afd68e9000-70afd68fd000 rw-s 3cc9c0000 00:07 1620                      /dev/dri/renderD132
+70afd68fd000-70afd6901000 rw-s 3c8b70000 00:07 595                       /dev/dri/renderD128
+70afd6901000-70afd6915000 rw-s 3c8b5c000 00:07 595                       /dev/dri/renderD128
+70afd6915000-70afd6919000 rw-s 3cc9bc000 00:07 1492                      /dev/dri/renderD130
+70afd6919000-70afd692d000 rw-s 3cc9a8000 00:07 1492                      /dev/dri/renderD130
+70afd692d000-70afd6931000 rw-s 3cd609000 00:07 1556                      /dev/dri/renderD129
+70afd6931000-70afd6945000 rw-s 3cd5f5000 00:07 1556                      /dev/dri/renderD129
+70afd6945000-70afd6949000 rw-s 3ce8f4000 00:07 1684                      /dev/dri/renderD131
+70afd6949000-70afd695d000 rw-s 3ce8e0000 00:07 1684                      /dev/dri/renderD131
+70afd695d000-70afd6961000 rw-s 3cc9bc000 00:07 1620                      /dev/dri/renderD132
+70afd6961000-70afd6975000 rw-s 3cc9a8000 00:07 1620                      /dev/dri/renderD132
+70afd6975000-70afd6979000 rw-s 3c8b58000 00:07 595                       /dev/dri/renderD128
+70afd6979000-70afd698d000 rw-s 3c8b44000 00:07 595                       /dev/dri/renderD128
+70afd698d000-70afd6991000 rw-s 3cc9a4000 00:07 1492                      /dev/dri/renderD130
+70afd6991000-70afd69a5000 rw-s 3cc990000 00:07 1492                      /dev/dri/renderD130
+70afd69a5000-70afd69a9000 rw-s 3cd5f1000 00:07 1556                      /dev/dri/renderD129
+70afd69a9000-70afd69bd000 rw-s 3cd5dd000 00:07 1556                      /dev/dri/renderD129
+70afd69bd000-70afd69c1000 rw-s 3ce8dc000 00:07 1684                      /dev/dri/renderD131
+70afd69c1000-70afd69d5000 rw-s 3ce8c8000 00:07 1684                      /dev/dri/renderD131
+70afd69d5000-70afd69d9000 rw-s 3cc9a4000 00:07 1620                      /dev/dri/renderD132
+70afd69d9000-70afd69ed000 rw-s 3cc990000 00:07 1620                      /dev/dri/renderD132
+70afd69ed000-70afd69f1000 rw-s 3c8b40000 00:07 595                       /dev/dri/renderD128
+70afd69f1000-70afd6a05000 rw-s 3c8b2c000 00:07 595                       /dev/dri/renderD128
+70afd6a05000-70afd6a09000 rw-s 3cc98c000 00:07 1492                      /dev/dri/renderD130
+70afd6a09000-70afd6a1d000 rw-s 3cc978000 00:07 1492                      /dev/dri/renderD130
+70afd6a1d000-70afd6a21000 rw-s 3cd5d9000 00:07 1556                      /dev/dri/renderD129
+70afd6a21000-70afd6a35000 rw-s 3cd5c5000 00:07 1556                      /dev/dri/renderD129
+70afd6a35000-70afd6a39000 rw-s 3ce8c4000 00:07 1684                      /dev/dri/renderD131
+70afd6a39000-70afd6a4d000 rw-s 3ce8b0000 00:07 1684                      /dev/dri/renderD131
+70afd6a4d000-70afd6a51000 rw-s 3cc98c000 00:07 1620                      /dev/dri/renderD132
+70afd6a51000-70afd6a65000 rw-s 3cc978000 00:07 1620                      /dev/dri/renderD132
+70afd6a65000-70afd6a69000 rw-s 3c8b28000 00:07 595                       /dev/dri/renderD128
+70afd6a69000-70afd6a7d000 rw-s 3c8b14000 00:07 595                       /dev/dri/renderD128
+70afd6a7d000-70afd6a81000 rw-s 3cc974000 00:07 1492                      /dev/dri/renderD130
+70afd6a81000-70afd6a95000 rw-s 3cc960000 00:07 1492                      /dev/dri/renderD130
+70afd6a95000-70afd6a99000 rw-s 3cd5c1000 00:07 1556                      /dev/dri/renderD129
+70afd6a99000-70afd6aad000 rw-s 3cd5ad000 00:07 1556                      /dev/dri/renderD129
+70afd6aad000-70afd6ab1000 rw-s 3ce8ac000 00:07 1684                      /dev/dri/renderD131
+70afd6ab1000-70afd6ac5000 rw-s 3ce898000 00:07 1684                      /dev/dri/renderD131
+70afd6ac5000-70afd6ac9000 rw-s 3cc974000 00:07 1620                      /dev/dri/renderD132
+70afd6ac9000-70afd6add000 rw-s 3cc960000 00:07 1620                      /dev/dri/renderD132
+70afd6add000-70afd6ae1000 rw-s 3c8b10000 00:07 595                       /dev/dri/renderD128
+70afd6ae1000-70afd6af5000 rw-s 3c8afc000 00:07 595                       /dev/dri/renderD128
+70afd6af5000-70afd6af9000 rw-s 3cc95c000 00:07 1492                      /dev/dri/renderD130
+70afd6af9000-70afd6b0d000 rw-s 3cc948000 00:07 1492                      /dev/dri/renderD130
+70afd6b0d000-70afd6b11000 rw-s 3cd5a9000 00:07 1556                      /dev/dri/renderD129
+70afd6b11000-70afd6b25000 rw-s 3cd595000 00:07 1556                      /dev/dri/renderD129
+70afd6b25000-70afd6b29000 rw-s 3ce894000 00:07 1684                      /dev/dri/renderD131
+70afd6b29000-70afd6b3d000 rw-s 3ce880000 00:07 1684                      /dev/dri/renderD131
+70afd6b3d000-70afd6b41000 rw-s 3cc95c000 00:07 1620                      /dev/dri/renderD132
+70afd6b41000-70afd6b55000 rw-s 3cc948000 00:07 1620                      /dev/dri/renderD132
+70afd6b55000-70afd6b59000 rw-s 3c8aa2000 00:07 595                       /dev/dri/renderD128
+70afd6b59000-70afd6b6d000 rw-s 3c8e62000 00:07 595                       /dev/dri/renderD128
+70afd6b6d000-70afd6b71000 rw-s 3cc8ee000 00:07 1492                      /dev/dri/renderD130
+70afd6b71000-70afd6b85000 rw-s 3cccae000 00:07 1492                      /dev/dri/renderD130
+70afd6b85000-70afd6b89000 rw-s 3cd53b000 00:07 1556                      /dev/dri/renderD129
+70afd6b89000-70afd6b9d000 rw-s 3cd8fb000 00:07 1556                      /dev/dri/renderD129
+70afd6b9d000-70afd6ba1000 rw-s 3ce826000 00:07 1684                      /dev/dri/renderD131
+70afd6ba1000-70afd6bb5000 rw-s 3cebe6000 00:07 1684                      /dev/dri/renderD131
+70afd6bb5000-70afd6bb9000 rw-s 3cc944000 00:07 1620                      /dev/dri/renderD132
+70afd6bb9000-70afd6bcd000 rw-s 3cc930000 00:07 1620                      /dev/dri/renderD132
+70afd6bcd000-70afd6be1000 rw-s 3c8ad0000 00:07 595                       /dev/dri/renderD128
+70afd6be1000-70afd6bf5000 rw-s 3c8abc000 00:07 595                       /dev/dri/renderD128
+70afd6bf5000-70afd6c09000 rw-s 3c8aa8000 00:07 595                       /dev/dri/renderD128
+70afd6c0b000-70afd6c0f000 rw-s 3cc8ee000 00:07 1620                      /dev/dri/renderD132
+70afd6c0f000-70afd6c13000 rw-s 3c8a9e000 00:07 595                       /dev/dri/renderD128
+70afd6c13000-70afd6c17000 rw-s 3c8a9a000 00:07 595                       /dev/dri/renderD128
+70afd6c17000-70afd6c2b000 rw-s 100042000 00:07 595                       /dev/dri/renderD128
+70afd6c2b000-70afd6c3f000 rw-s 3cc91c000 00:07 1492                      /dev/dri/renderD130
+70afd6c3f000-70afd6c53000 rw-s 3cc908000 00:07 1492                      /dev/dri/renderD130
+70afd6c53000-70afd6c67000 rw-s 3cc8f4000 00:07 1492                      /dev/dri/renderD130
+70afd6c69000-70afd6c6d000 rw-s 3cc8ea000 00:07 1492                      /dev/dri/renderD130
+70afd6c6d000-70afd6c71000 rw-s 3cd537000 00:07 1556                      /dev/dri/renderD129
+70afd6c71000-70afd6c75000 rw-s 3cc8e6000 00:07 1492                      /dev/dri/renderD130
+70afd6c75000-70afd6c89000 rw-s 100042000 00:07 1492                      /dev/dri/renderD130
+70afd6c89000-70afd6c9d000 rw-s 3cd569000 00:07 1556                      /dev/dri/renderD129
+70afd6c9d000-70afd6cbe000 r--p 00000000 00:26 5705378                    /usr/lib/x86_64-linux-gnu/libxml2.so.16.1.2
+70afd6cbe000-70afd6db9000 r-xp 00021000 00:26 5705378                    /usr/lib/x86_64-linux-gnu/libxml2.so.16.1.2
+70afd6db9000-70afd6df6000 r--p 0011c000 00:26 5705378                    /usr/lib/x86_64-linux-gnu/libxml2.so.16.1.2
+70afd6df6000-70afd6dfe000 r--p 00159000 00:26 5705378                    /usr/lib/x86_64-linux-gnu/libxml2.so.16.1.2
+70afd6dfe000-70afd6dff000 rw-p 00161000 00:26 5705378                    /usr/lib/x86_64-linux-gnu/libxml2.so.16.1.2
+70afd6dff000-70afd6e00000 rw-p 00000000 00:00 0 
+70afd6e00000-70afd6e44000 r--p 00000000 00:26 188227                     /usr/lib/x86_64-linux-gnu/libvulkan_asahi.so
+70afd6e44000-70afd7288000 r-xp 00044000 00:26 188227                     /usr/lib/x86_64-linux-gnu/libvulkan_asahi.so
+70afd7288000-70afd7b23000 r--p 00488000 00:26 188227                     /usr/lib/x86_64-linux-gnu/libvulkan_asahi.so
+70afd7b23000-70afd7b93000 r--p 00d22000 00:26 188227                     /usr/lib/x86_64-linux-gnu/libvulkan_asahi.so
+70afd7b93000-70afd7b9b000 rw-p 00d92000 00:26 188227                     /usr/lib/x86_64-linux-gnu/libvulkan_asahi.so
+70afd7b9b000-70afd7ba2000 rw-p 00000000 00:00 0 
+70afd7ba5000-70afd7bb9000 rw-s 3cd555000 00:07 1556                      /dev/dri/renderD129
+70afd7bb9000-70afd7bcd000 rw-s 3cd541000 00:07 1556                      /dev/dri/renderD129
+70afd7bcf000-70afd7bd3000 rw-s 3ce822000 00:07 1684                      /dev/dri/renderD131
+70afd7bd3000-70afd7bd7000 rw-s 3cc8ea000 00:07 1620                      /dev/dri/renderD132
+70afd7bd7000-70afd7beb000 rw-s 100042000 00:07 1556                      /dev/dri/renderD129
+70afd7beb000-70afd7bff000 rw-s 3ce854000 00:07 1684                      /dev/dri/renderD131
+70afd7bff000-70afd8400000 rw-p 00000000 00:00 0 
+70afd8400000-70afd847b000 r--p 00000000 00:26 5739034                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-vulkan.so.0.18.1
+70afd847b000-70afd8849000 r-xp 0007b000 00:26 5739034                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-vulkan.so.0.18.1
+70afd8849000-70afdc1dd000 r--p 00449000 00:26 5739034                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-vulkan.so.0.18.1
+70afdc1dd000-70afdc1e5000 r--p 03ddd000 00:26 5739034                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-vulkan.so.0.18.1
+70afdc1e5000-70afdc1e8000 rw-p 03de5000 00:26 5739034                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-vulkan.so.0.18.1
+70afdc1e8000-70afdc1ea000 rw-p 00000000 00:00 0 
+70afdc1eb000-70afdc1ff000 rw-s 3ce840000 00:07 1684                      /dev/dri/renderD131
+70afdc1ff000-70afdc213000 rw-s 3ce82c000 00:07 1684                      /dev/dri/renderD131
+70afdc213000-70afdc227000 rw-s 100042000 00:07 1684                      /dev/dri/renderD131
+70afdc227000-70afdc23b000 rw-s 3cc91c000 00:07 1620                      /dev/dri/renderD132
+70afdc23b000-70afdc24f000 rw-s 3cc908000 00:07 1620                      /dev/dri/renderD132
+70afdc24f000-70afdc263000 rw-s 3cc8f4000 00:07 1620                      /dev/dri/renderD132
+70afdc263000-70afdc277000 rw-s 100042000 00:07 1620                      /dev/dri/renderD132
+70afdc277000-70afdc27a000 r--p 00000000 00:26 188224                     /usr/lib/x86_64-linux-gnu/libVkLayer_MESA_device_select.so
+70afdc27a000-70afdc289000 r-xp 00003000 00:26 188224                     /usr/lib/x86_64-linux-gnu/libVkLayer_MESA_device_select.so
+70afdc289000-70afdc28e000 r--p 00012000 00:26 188224                     /usr/lib/x86_64-linux-gnu/libVkLayer_MESA_device_select.so
+70afdc28e000-70afdc28f000 r--p 00016000 00:26 188224                     /usr/lib/x86_64-linux-gnu/libVkLayer_MESA_device_select.so
+70afdc28f000-70afdc290000 rw-p 00017000 00:26 188224                     /usr/lib/x86_64-linux-gnu/libVkLayer_MESA_device_select.so
+70afdc290000-70afdc292000 rw-p 00000000 00:00 0 
+70afdc292000-70afdc2a6000 r--p 00000000 00:26 5739031                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-cpu.so.0.18.1
+70afdc2a6000-70afdc356000 r-xp 00014000 00:26 5739031                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-cpu.so.0.18.1
+70afdc356000-70afdc378000 r--p 000c4000 00:26 5739031                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-cpu.so.0.18.1
+70afdc378000-70afdc37a000 r--p 000e5000 00:26 5739031                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-cpu.so.0.18.1
+70afdc37a000-70afdc37c000 rw-p 000e7000 00:26 5739031                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-cpu.so.0.18.1
+70afdc37c000-70afdc400000 rw-p 00000000 00:00 0 
+70afdc400000-70afdc4e4000 r--p 00000000 00:26 5618477                    /usr/lib/x86_64-linux-gnu/libcrypto.so.3
+70afdc4e4000-70afdc878000 r-xp 000e4000 00:26 5618477                    /usr/lib/x86_64-linux-gnu/libcrypto.so.3
+70afdc878000-70afdc997000 r--p 00478000 00:26 5618477                    /usr/lib/x86_64-linux-gnu/libcrypto.so.3
+70afdc997000-70afdca14000 r--p 00597000 00:26 5618477                    /usr/lib/x86_64-linux-gnu/libcrypto.so.3
+70afdca14000-70afdca17000 rw-p 00614000 00:26 5618477                    /usr/lib/x86_64-linux-gnu/libcrypto.so.3
+70afdca17000-70afdca1a000 rw-p 00000000 00:00 0 
+70afdca1c000-70afdca20000 rw-s 3cd533000 00:07 1556                      /dev/dri/renderD129
+70afdca22000-70afdca26000 rw-s 3c8af8000 00:07 595                       /dev/dri/renderD128
+70afdca26000-70afdca2a000 rw-s 3cc944000 00:07 1492                      /dev/dri/renderD130
+70afdca2a000-70afdca2e000 r--p 00000000 00:26 37171                      /usr/lib/x86_64-linux-gnu/libelf-0.194.so
+70afdca2e000-70afdca45000 r-xp 00004000 00:26 37171                      /usr/lib/x86_64-linux-gnu/libelf-0.194.so
+70afdca45000-70afdca49000 r--p 0001b000 00:26 37171                      /usr/lib/x86_64-linux-gnu/libelf-0.194.so
+70afdca49000-70afdca4a000 r--p 0001f000 00:26 37171                      /usr/lib/x86_64-linux-gnu/libelf-0.194.so
+70afdca4a000-70afdca4b000 rw-p 00020000 00:26 37171                      /usr/lib/x86_64-linux-gnu/libelf-0.194.so
+70afdca4b000-70afdca4e000 r--p 00000000 00:26 37161                      /usr/lib/x86_64-linux-gnu/libdrm_amdgpu.so.1.131.0
+70afdca4e000-70afdca54000 r-xp 00003000 00:26 37161                      /usr/lib/x86_64-linux-gnu/libdrm_amdgpu.so.1.131.0
+70afdca54000-70afdca56000 r--p 00009000 00:26 37161                      /usr/lib/x86_64-linux-gnu/libdrm_amdgpu.so.1.131.0
+70afdca56000-70afdca57000 r--p 0000a000 00:26 37161                      /usr/lib/x86_64-linux-gnu/libdrm_amdgpu.so.1.131.0
+70afdca57000-70afdca58000 rw-p 0000b000 00:26 37161                      /usr/lib/x86_64-linux-gnu/libdrm_amdgpu.so.1.131.0
+70afdca58000-70afdca5a000 r--p 00000000 00:26 37275                      /usr/lib/x86_64-linux-gnu/libmd.so.0.1.0
+70afdca5a000-70afdca63000 r-xp 00002000 00:26 37275                      /usr/lib/x86_64-linux-gnu/libmd.so.0.1.0
+70afdca63000-70afdca65000 r--p 0000b000 00:26 37275                      /usr/lib/x86_64-linux-gnu/libmd.so.0.1.0
+70afdca65000-70afdca66000 r--p 0000c000 00:26 37275                      /usr/lib/x86_64-linux-gnu/libmd.so.0.1.0
+70afdca66000-70afdca67000 rw-p 0000d000 00:26 37275                      /usr/lib/x86_64-linux-gnu/libmd.so.0.1.0
+70afdca67000-70afdca75000 r--p 00000000 00:26 37389                      /usr/lib/x86_64-linux-gnu/libtinfo.so.6.6
+70afdca75000-70afdca89000 r-xp 0000e000 00:26 37389                      /usr/lib/x86_64-linux-gnu/libtinfo.so.6.6
+70afdca89000-70afdca97000 r--p 00022000 00:26 37389                      /usr/lib/x86_64-linux-gnu/libtinfo.so.6.6
+70afdca97000-70afdca9b000 r--p 0002f000 00:26 37389                      /usr/lib/x86_64-linux-gnu/libtinfo.so.6.6
+70afdca9b000-70afdca9c000 rw-p 00033000 00:26 37389                      /usr/lib/x86_64-linux-gnu/libtinfo.so.6.6
+70afdca9c000-70afdcaa4000 r--p 00000000 00:26 37167                      /usr/lib/x86_64-linux-gnu/libedit.so.2.0.76
+70afdcaa4000-70afdcac3000 r-xp 00008000 00:26 37167                      /usr/lib/x86_64-linux-gnu/libedit.so.2.0.76
+70afdcac3000-70afdcacf000 r--p 00027000 00:26 37167                      /usr/lib/x86_64-linux-gnu/libedit.so.2.0.76
+70afdcacf000-70afdcad1000 r--p 00033000 00:26 37167                      /usr/lib/x86_64-linux-gnu/libedit.so.2.0.76
+70afdcad1000-70afdcad2000 rw-p 00035000 00:26 37167                      /usr/lib/x86_64-linux-gnu/libedit.so.2.0.76
+70afdcad2000-70afdcad6000 rw-p 00000000 00:00 0 
+70afdcad6000-70afdcada000 r--p 00000000 00:26 3899068                    /usr/lib/x86_64-linux-gnu/libexpat.so.1.11.2
+70afdcada000-70afdcaf9000 r-xp 00004000 00:26 3899068                    /usr/lib/x86_64-linux-gnu/libexpat.so.1.11.2
+70afdcaf9000-70afdcb01000 r--p 00023000 00:26 3899068                    /usr/lib/x86_64-linux-gnu/libexpat.so.1.11.2
+70afdcb01000-70afdcb03000 r--p 0002b000 00:26 3899068                    /usr/lib/x86_64-linux-gnu/libexpat.so.1.11.2
+70afdcb03000-70afdcb04000 rw-p 0002d000 00:26 3899068                    /usr/lib/x86_64-linux-gnu/libexpat.so.1.11.2
+70afdcb04000-70afdcb07000 r--p 00000000 00:26 186659                     /usr/lib/x86_64-linux-gnu/libdisplay-info.so.0.3.0
+70afdcb07000-70afdcb1f000 r-xp 00003000 00:26 186659                     /usr/lib/x86_64-linux-gnu/libdisplay-info.so.0.3.0
+70afdcb1f000-70afdcb3b000 r--p 0001b000 00:26 186659                     /usr/lib/x86_64-linux-gnu/libdisplay-info.so.0.3.0
+70afdcb3b000-70afdcb3c000 r--p 00036000 00:26 186659                     /usr/lib/x86_64-linux-gnu/libdisplay-info.so.0.3.0
+70afdcb3c000-70afdcb3d000 rw-p 00037000 00:26 186659                     /usr/lib/x86_64-linux-gnu/libdisplay-info.so.0.3.0
+70afdcb3d000-70afdcb41000 r--p 00000000 00:26 37436                      /usr/lib/x86_64-linux-gnu/libzstd.so.1.5.7
+70afdcb41000-70afdcbf1000 r-xp 00004000 00:26 37436                      /usr/lib/x86_64-linux-gnu/libzstd.so.1.5.7
+70afdcbf1000-70afdcbfe000 r--p 000b4000 00:26 37436                      /usr/lib/x86_64-linux-gnu/libzstd.so.1.5.7
+70afdcbfe000-70afdcbff000 r--p 000c1000 00:26 37436                      /usr/lib/x86_64-linux-gnu/libzstd.so.1.5.7
+70afdcbff000-70afdcc00000 rw-p 000c2000 00:26 37436                      /usr/lib/x86_64-linux-gnu/libzstd.so.1.5.7
+70afdcc00000-70afdcc28000 r--p 00000000 00:26 164934                     /usr/lib/x86_64-linux-gnu/libc.so.6
+70afdcc28000-70afdcdc0000 r-xp 00028000 00:26 164934                     /usr/lib/x86_64-linux-gnu/libc.so.6
+70afdcdc0000-70afdce0e000 r--p 001c0000 00:26 164934                     /usr/lib/x86_64-linux-gnu/libc.so.6
+70afdce0e000-70afdce12000 r--p 0020e000 00:26 164934                     /usr/lib/x86_64-linux-gnu/libc.so.6
+70afdce12000-70afdce14000 rw-p 00212000 00:26 164934                     /usr/lib/x86_64-linux-gnu/libc.so.6
+70afdce14000-70afdce21000 rw-p 00000000 00:00 0 
+70afdce23000-70afdce27000 r--p 00000000 00:26 37129                      /usr/lib/x86_64-linux-gnu/libbsd.so.0.12.2
+70afdce27000-70afdce33000 r-xp 00004000 00:26 37129                      /usr/lib/x86_64-linux-gnu/libbsd.so.0.12.2
+70afdce33000-70afdce36000 r--p 00010000 00:26 37129                      /usr/lib/x86_64-linux-gnu/libbsd.so.0.12.2
+70afdce36000-70afdce37000 r--p 00012000 00:26 37129                      /usr/lib/x86_64-linux-gnu/libbsd.so.0.12.2
+70afdce37000-70afdce38000 rw-p 00013000 00:26 37129                      /usr/lib/x86_64-linux-gnu/libbsd.so.0.12.2
+70afdce38000-70afdce39000 rw-p 00000000 00:00 0 
+70afdce39000-70afdce3b000 r--p 00000000 00:26 37181                      /usr/lib/x86_64-linux-gnu/libffi.so.8.2.0
+70afdce3b000-70afdce46000 r-xp 00002000 00:26 37181                      /usr/lib/x86_64-linux-gnu/libffi.so.8.2.0
+70afdce46000-70afdce48000 r--p 0000d000 00:26 37181                      /usr/lib/x86_64-linux-gnu/libffi.so.8.2.0
+70afdce48000-70afdce49000 r--p 0000e000 00:26 37181                      /usr/lib/x86_64-linux-gnu/libffi.so.8.2.0
+70afdce49000-70afdce4a000 rw-p 0000f000 00:26 37181                      /usr/lib/x86_64-linux-gnu/libffi.so.8.2.0
+70afdce4a000-70afdce50000 r--p 00000000 00:26 187027                     /usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341
+70afdce50000-70afdcea7000 r-xp 00006000 00:26 187027                     /usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341
+70afdcea7000-70afdced8000 r--p 0005d000 00:26 187027                     /usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341
+70afdced8000-70afdced9000 r--p 0008e000 00:26 187027                     /usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341
+70afdced9000-70afdceda000 rw-p 0008f000 00:26 187027                     /usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341
+70afdceda000-70afdceec000 r--p 00000000 00:26 164937                     /usr/lib/x86_64-linux-gnu/libm.so.6
+70afdceec000-70afdcf8c000 r-xp 00012000 00:26 164937                     /usr/lib/x86_64-linux-gnu/libm.so.6
+70afdcf8c000-70afdcffe000 r--p 000b2000 00:26 164937                     /usr/lib/x86_64-linux-gnu/libm.so.6
+70afdcffe000-70afdcfff000 r--p 00123000 00:26 164937                     /usr/lib/x86_64-linux-gnu/libm.so.6
+70afdcfff000-70afdd000000 rw-p 00124000 00:26 164937                     /usr/lib/x86_64-linux-gnu/libm.so.6
+70afdd000000-70afdd0a3000 r--p 00000000 00:26 37382                      /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.35
+70afdd0a3000-70afdd1fe000 r-xp 000a3000 00:26 37382                      /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.35
+70afdd1fe000-70afdd28a000 r--p 001fe000 00:26 37382                      /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.35
+70afdd28a000-70afdd299000 r--p 0028a000 00:26 37382                      /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.35
+70afdd299000-70afdd29c000 rw-p 00299000 00:26 37382                      /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.35
+70afdd29c000-70afdd2a0000 rw-p 00000000 00:00 0 
+70afdd2a2000-70afdd2a6000 rw-s 3cd591000 00:07 1556                      /dev/dri/renderD129
+70afdd2a6000-70afdd2aa000 rw-s 3ce87c000 00:07 1684                      /dev/dri/renderD131
+70afdd2aa000-70afdd2ac000 r--p 00000000 00:26 37095                      /usr/lib/x86_64-linux-gnu/libXdmcp.so.6.0.0
+70afdd2ac000-70afdd2ae000 r-xp 00002000 00:26 37095                      /usr/lib/x86_64-linux-gnu/libXdmcp.so.6.0.0
+70afdd2ae000-70afdd2b0000 r--p 00004000 00:26 37095                      /usr/lib/x86_64-linux-gnu/libXdmcp.so.6.0.0
+70afdd2b0000-70afdd2b1000 r--p 00005000 00:26 37095                      /usr/lib/x86_64-linux-gnu/libXdmcp.so.6.0.0
+70afdd2b1000-70afdd2b2000 rw-p 00006000 00:26 37095                      /usr/lib/x86_64-linux-gnu/libXdmcp.so.6.0.0
+70afdd2b2000-70afdd2b3000 r--p 00000000 00:26 37094                      /usr/lib/x86_64-linux-gnu/libXau.so.6.0.0
+70afdd2b3000-70afdd2b5000 r-xp 00001000 00:26 37094                      /usr/lib/x86_64-linux-gnu/libXau.so.6.0.0
+70afdd2b5000-70afdd2b6000 r--p 00003000 00:26 37094                      /usr/lib/x86_64-linux-gnu/libXau.so.6.0.0
+70afdd2b6000-70afdd2b7000 r--p 00003000 00:26 37094                      /usr/lib/x86_64-linux-gnu/libXau.so.6.0.0
+70afdd2b7000-70afdd2b8000 rw-p 00004000 00:26 37094                      /usr/lib/x86_64-linux-gnu/libXau.so.6.0.0
+70afdd2b8000-70afdd2be000 r--p 00000000 00:26 187677                     /usr/lib/x86_64-linux-gnu/libwayland-client.so.0.24.0
+70afdd2be000-70afdd2c5000 r-xp 00006000 00:26 187677                     /usr/lib/x86_64-linux-gnu/libwayland-client.so.0.24.0
+70afdd2c5000-70afdd2c8000 r--p 0000d000 00:26 187677                     /usr/lib/x86_64-linux-gnu/libwayland-client.so.0.24.0
+70afdd2c8000-70afdd2ca000 r--p 0000f000 00:26 187677                     /usr/lib/x86_64-linux-gnu/libwayland-client.so.0.24.0
+70afdd2ca000-70afdd2cb000 rw-p 00011000 00:26 187677                     /usr/lib/x86_64-linux-gnu/libwayland-client.so.0.24.0
+70afdd2cb000-70afdd2cc000 r--p 00000000 00:26 186945                     /usr/lib/x86_64-linux-gnu/libxshmfence.so.1.0.0
+70afdd2cc000-70afdd2cd000 r-xp 00001000 00:26 186945                     /usr/lib/x86_64-linux-gnu/libxshmfence.so.1.0.0
+70afdd2cd000-70afdd2ce000 r--p 00002000 00:26 186945                     /usr/lib/x86_64-linux-gnu/libxshmfence.so.1.0.0
+70afdd2ce000-70afdd2cf000 r--p 00002000 00:26 186945                     /usr/lib/x86_64-linux-gnu/libxshmfence.so.1.0.0
+70afdd2cf000-70afdd2d0000 rw-p 00003000 00:26 186945                     /usr/lib/x86_64-linux-gnu/libxshmfence.so.1.0.0
+70afdd2d0000-70afdd2d1000 r--p 00000000 00:26 187128                     /usr/lib/x86_64-linux-gnu/libxcb-shm.so.0.0.0
+70afdd2d1000-70afdd2d2000 r-xp 00001000 00:26 187128                     /usr/lib/x86_64-linux-gnu/libxcb-shm.so.0.0.0
+70afdd2d2000-70afdd2d3000 r--p 00002000 00:26 187128                     /usr/lib/x86_64-linux-gnu/libxcb-shm.so.0.0.0
+70afdd2d3000-70afdd2d4000 r--p 00002000 00:26 187128                     /usr/lib/x86_64-linux-gnu/libxcb-shm.so.0.0.0
+70afdd2d4000-70afdd2d5000 rw-p 00003000 00:26 187128                     /usr/lib/x86_64-linux-gnu/libxcb-shm.so.0.0.0
+70afdd2d5000-70afdd2dc000 r--p 00000000 00:26 186900                     /usr/lib/x86_64-linux-gnu/libxcb-randr.so.0.1.0
+70afdd2dc000-70afdd2e1000 r-xp 00007000 00:26 186900                     /usr/lib/x86_64-linux-gnu/libxcb-randr.so.0.1.0
+70afdd2e1000-70afdd2e4000 r--p 0000c000 00:26 186900                     /usr/lib/x86_64-linux-gnu/libxcb-randr.so.0.1.0
+70afdd2e4000-70afdd2e5000 r--p 0000f000 00:26 186900                     /usr/lib/x86_64-linux-gnu/libxcb-randr.so.0.1.0
+70afdd2e5000-70afdd2e6000 rw-p 00010000 00:26 186900                     /usr/lib/x86_64-linux-gnu/libxcb-randr.so.0.1.0
+70afdd2e6000-70afdd2e9000 r--p 00000000 00:26 186915                     /usr/lib/x86_64-linux-gnu/libxcb-sync.so.1.0.0
+70afdd2e9000-70afdd2ec000 r-xp 00003000 00:26 186915                     /usr/lib/x86_64-linux-gnu/libxcb-sync.so.1.0.0
+70afdd2ec000-70afdd2ed000 r--p 00006000 00:26 186915                     /usr/lib/x86_64-linux-gnu/libxcb-sync.so.1.0.0
+70afdd2ed000-70afdd2ee000 r--p 00007000 00:26 186915                     /usr/lib/x86_64-linux-gnu/libxcb-sync.so.1.0.0
+70afdd2ee000-70afdd2ef000 rw-p 00008000 00:26 186915                     /usr/lib/x86_64-linux-gnu/libxcb-sync.so.1.0.0
+70afdd2ef000-70afdd311000 r--p 00000000 00:26 5618478                    /usr/lib/x86_64-linux-gnu/libssl.so.3
+70afdd311000-70afdd3c4000 r-xp 00022000 00:26 5618478                    /usr/lib/x86_64-linux-gnu/libssl.so.3
+70afdd3c4000-70afdd3f2000 r--p 000d5000 00:26 5618478                    /usr/lib/x86_64-linux-gnu/libssl.so.3
+70afdd3f2000-70afdd3fc000 r--p 00102000 00:26 5618478                    /usr/lib/x86_64-linux-gnu/libssl.so.3
+70afdd3fc000-70afdd400000 rw-p 0010c000 00:26 5618478                    /usr/lib/x86_64-linux-gnu/libssl.so.3
+70afdd400000-70afdd4f4000 r--p 00000000 00:26 5739044                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libllama.so.0.0.2188
+70afdd4f4000-70afdd9d5000 r-xp 000f4000 00:26 5739044                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libllama.so.0.0.2188
+70afdd9d5000-70afddb11000 r--p 005d5000 00:26 5739044                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libllama.so.0.0.2188
+70afddb11000-70afddb20000 r--p 00710000 00:26 5739044                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libllama.so.0.0.2188
+70afddb20000-70afddb28000 rw-p 0071f000 00:26 5739044                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libllama.so.0.0.2188
+70afddb28000-70afddb2b000 rw-p 00000000 00:00 0 
+70afddb2b000-70afddb2e000 r--p 00000000 00:26 186930                     /usr/lib/x86_64-linux-gnu/libxcb-xfixes.so.0.0.0
+70afddb2e000-70afddb31000 r-xp 00003000 00:26 186930                     /usr/lib/x86_64-linux-gnu/libxcb-xfixes.so.0.0.0
+70afddb31000-70afddb33000 r--p 00006000 00:26 186930                     /usr/lib/x86_64-linux-gnu/libxcb-xfixes.so.0.0.0
+70afddb33000-70afddb34000 r--p 00007000 00:26 186930                     /usr/lib/x86_64-linux-gnu/libxcb-xfixes.so.0.0.0
+70afddb34000-70afddb35000 rw-p 00008000 00:26 186930                     /usr/lib/x86_64-linux-gnu/libxcb-xfixes.so.0.0.0
+70afddb35000-70afddb36000 r--p 00000000 00:26 186885                     /usr/lib/x86_64-linux-gnu/libxcb-present.so.0.0.0
+70afddb36000-70afddb37000 r-xp 00001000 00:26 186885                     /usr/lib/x86_64-linux-gnu/libxcb-present.so.0.0.0
+70afddb37000-70afddb38000 r--p 00002000 00:26 186885                     /usr/lib/x86_64-linux-gnu/libxcb-present.so.0.0.0
+70afddb38000-70afddb39000 r--p 00002000 00:26 186885                     /usr/lib/x86_64-linux-gnu/libxcb-present.so.0.0.0
+70afddb39000-70afddb3a000 rw-p 00003000 00:26 186885                     /usr/lib/x86_64-linux-gnu/libxcb-present.so.0.0.0
+70afddb3a000-70afddb3c000 r--p 00000000 00:26 186870                     /usr/lib/x86_64-linux-gnu/libxcb-dri3.so.0.1.0
+70afddb3c000-70afddb3e000 r-xp 00002000 00:26 186870                     /usr/lib/x86_64-linux-gnu/libxcb-dri3.so.0.1.0
+70afddb3e000-70afddb3f000 r--p 00004000 00:26 186870                     /usr/lib/x86_64-linux-gnu/libxcb-dri3.so.0.1.0
+70afddb3f000-70afddb40000 r--p 00004000 00:26 186870                     /usr/lib/x86_64-linux-gnu/libxcb-dri3.so.0.1.0
+70afddb40000-70afddb41000 rw-p 00005000 00:26 186870                     /usr/lib/x86_64-linux-gnu/libxcb-dri3.so.0.1.0
+70afddb41000-70afddb4d000 r--p 00000000 00:26 37425                      /usr/lib/x86_64-linux-gnu/libxcb.so.1.1.0
+70afddb4d000-70afddb61000 r-xp 0000c000 00:26 37425                      /usr/lib/x86_64-linux-gnu/libxcb.so.1.1.0
+70afddb61000-70afddb6a000 r--p 00020000 00:26 37425                      /usr/lib/x86_64-linux-gnu/libxcb.so.1.1.0
+70afddb6a000-70afddb6b000 r--p 00028000 00:26 37425                      /usr/lib/x86_64-linux-gnu/libxcb.so.1.1.0
+70afddb6b000-70afddb6c000 rw-p 00029000 00:26 37425                      /usr/lib/x86_64-linux-gnu/libxcb.so.1.1.0
+70afddb6c000-70afddb71000 r--p 00000000 00:26 37160                      /usr/lib/x86_64-linux-gnu/libdrm.so.2.131.0
+70afddb71000-70afddb7d000 r-xp 00005000 00:26 37160                      /usr/lib/x86_64-linux-gnu/libdrm.so.2.131.0
+70afddb7d000-70afddb81000 r--p 00011000 00:26 37160                      /usr/lib/x86_64-linux-gnu/libdrm.so.2.131.0
+70afddb81000-70afddb82000 r--p 00015000 00:26 37160                      /usr/lib/x86_64-linux-gnu/libdrm.so.2.131.0
+70afddb82000-70afddb83000 rw-p 00016000 00:26 37160                      /usr/lib/x86_64-linux-gnu/libdrm.so.2.131.0
+70afddb83000-70afddb86000 r--p 00000000 00:26 165011                     /usr/lib/x86_64-linux-gnu/libz.so.1.3.1
+70afddb86000-70afddb99000 r-xp 00003000 00:26 165011                     /usr/lib/x86_64-linux-gnu/libz.so.1.3.1
+70afddb99000-70afddb9f000 r--p 00016000 00:26 165011                     /usr/lib/x86_64-linux-gnu/libz.so.1.3.1
+70afddb9f000-70afddba0000 r--p 0001c000 00:26 165011                     /usr/lib/x86_64-linux-gnu/libz.so.1.3.1
+70afddba0000-70afddba1000 rw-p 0001d000 00:26 165011                     /usr/lib/x86_64-linux-gnu/libz.so.1.3.1
+70afddba1000-70afddbac000 r--p 00000000 00:26 178726                     /usr/lib/x86_64-linux-gnu/libgomp.so.1.0.0
+70afddbac000-70afddbee000 r-xp 0000b000 00:26 178726                     /usr/lib/x86_64-linux-gnu/libgomp.so.1.0.0
+70afddbee000-70afddbfe000 r--p 0004d000 00:26 178726                     /usr/lib/x86_64-linux-gnu/libgomp.so.1.0.0
+70afddbfe000-70afddbff000 r--p 0005c000 00:26 178726                     /usr/lib/x86_64-linux-gnu/libgomp.so.1.0.0
+70afddbff000-70afddc00000 rw-p 0005d000 00:26 178726                     /usr/lib/x86_64-linux-gnu/libgomp.so.1.0.0
+70afddc00000-70afddcbb000 r--p 00000000 00:26 5739040                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libllama-common.so.0.0.2188
+70afddcbb000-70afde003000 r-xp 000bb000 00:26 5739040                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libllama-common.so.0.0.2188
+70afde003000-70afde0be000 r--p 00403000 00:26 5739040                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libllama-common.so.0.0.2188
+70afde0be000-70afde0c7000 r--p 004bd000 00:26 5739040                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libllama-common.so.0.0.2188
+70afde0c7000-70afde0cd000 rw-p 004c6000 00:26 5739040                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libllama-common.so.0.0.2188
+70afde0cd000-70afde0ed000 rw-p 00000000 00:00 0 
+70afde0ef000-70afde0f0000 r--p 00000000 00:26 186855                     /usr/lib/x86_64-linux-gnu/libX11-xcb.so.1.0.0
+70afde0f0000-70afde0f1000 r-xp 00001000 00:26 186855                     /usr/lib/x86_64-linux-gnu/libX11-xcb.so.1.0.0
+70afde0f1000-70afde0f2000 r--p 00002000 00:26 186855                     /usr/lib/x86_64-linux-gnu/libX11-xcb.so.1.0.0
+70afde0f2000-70afde0f3000 r--p 00002000 00:26 186855                     /usr/lib/x86_64-linux-gnu/libX11-xcb.so.1.0.0
+70afde0f3000-70afde0f4000 rw-p 00003000 00:26 186855                     /usr/lib/x86_64-linux-gnu/libX11-xcb.so.1.0.0
+70afde0f4000-70afde107000 rw-p 00000000 00:00 0 
+70afde107000-70afde10a000 r--p 00000000 00:26 5739037                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml.so.0.18.1
+70afde10a000-70afde10f000 r-xp 00003000 00:26 5739037                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml.so.0.18.1
+70afde10f000-70afde111000 r--p 00008000 00:26 5739037                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml.so.0.18.1
+70afde111000-70afde112000 r--p 00009000 00:26 5739037                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml.so.0.18.1
+70afde112000-70afde113000 rw-p 0000a000 00:26 5739037                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml.so.0.18.1
+70afde113000-70afde115000 rw-p 00000000 00:00 0 
+70afde115000-70afde119000 r--p 00000000 00:26 37197                      /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+70afde119000-70afde13d000 r-xp 00004000 00:26 37197                      /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+70afde13d000-70afde141000 r--p 00028000 00:26 37197                      /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+70afde141000-70afde142000 r--p 0002c000 00:26 37197                      /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+70afde142000-70afde143000 rw-p 0002d000 00:26 37197                      /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+70afde145000-70afde149000 rw-s 3ce81e000 00:07 1684                      /dev/dri/renderD131
+70afde149000-70afde14d000 rw-s 3cc8e6000 00:07 1620                      /dev/dri/renderD132
+70afde14d000-70afde14e000 rw-p 00000000 00:00 0 
+70afde14e000-70afde14f000 rw-p 00000000 00:00 0 
+70afde14f000-70afde168000 r--p 00000000 00:26 5739028                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-base.so.0.18.1
+70afde168000-70afde207000 r-xp 00019000 00:26 5739028                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-base.so.0.18.1
+70afde207000-70afde237000 r--p 000b8000 00:26 5739028                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-base.so.0.18.1
+70afde237000-70afde23a000 r--p 000e8000 00:26 5739028                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-base.so.0.18.1
+70afde23a000-70afde23c000 rw-p 000eb000 00:26 5739028                    /home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-slice-fixed-bin/libggml-base.so.0.18.1
+70afde23c000-70afde25e000 rw-p 00000000 00:00 0 
+70afde25e000-70afde262000 r--p 00000000 00:00 0                          [vvar]
+70afde262000-70afde264000 r--p 00000000 00:00 0                          [vvar_vclock]
+70afde264000-70afde266000 r-xp 00000000 00:00 0                          [vdso]
+70afde266000-70afde267000 r--p 00000000 00:26 164931                     /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+70afde267000-70afde296000 r-xp 00001000 00:26 164931                     /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+70afde296000-70afde2a1000 r--p 00030000 00:26 164931                     /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+70afde2a1000-70afde2a3000 r--p 0003b000 00:26 164931                     /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+70afde2a3000-70afde2a4000 rw-p 0003d000 00:26 164931                     /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+70afde2a4000-70afde2a5000 rw-p 00000000 00:00 0 
+7fff56a7e000-7fff56adb000 rw-p 00000000 00:00 0                          [stack]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]

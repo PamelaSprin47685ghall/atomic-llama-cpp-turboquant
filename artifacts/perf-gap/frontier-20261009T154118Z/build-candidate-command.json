@@ -1,0 +1,19 @@
+{
+  "argv": [
+    "cmake",
+    "--build",
+    "build-perf-gap",
+    "--target",
+    "llama-server",
+    "test-tp5-relay-tiles",
+    "test-predefined-capacity",
+    "test-predefined-coverage",
+    "test-target-capacity",
+    "test-tp5-row-program",
+    "test-mtp-workspace",
+    "test-server-signal",
+    "test-vulkan-tp5-relay",
+    "-j",
+    "12"
+  ]
+}

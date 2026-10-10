@@ -1,0 +1,12 @@
+{
+  "task": "RERoT-off ordinary single user generation; no CPU single-thread restriction",
+  "quality_contract": "no loosening of existing tolerances; exact natural output and all downstream state relative to same numeric reference arm; aggressive reference is NOT original-target equivalence",
+  "workload": "tp5-gap-bench canonical + guard, cache_prompt=false, temperature=0, seed=42",
+  "timing": "H: sum completion_tokens / sum predicted_ms; full wall_ms separate",
+  "reference": "frozen 0730 executable plus its frozen DSOs; original identity retained",
+  "AA_gate": "abs ratio-1 <= 0.01 before ranking",
+  "paired_blocks": 8,
+  "pilot_not_confirmation": true,
+  "implementation_set": "partition,owner,representation,caching,prefetch,fusion,communication,MTP,MMVQ retained; unresolved bounds remain unresolved",
+  "exact_match": "requires valid covering lower-bound certificate and equal attained cost; fitted prediction is not certificate"
+}

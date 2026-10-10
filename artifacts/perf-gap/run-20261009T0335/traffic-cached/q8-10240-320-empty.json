@@ -1,0 +1,19 @@
+{
+  "argv": [
+    "artifacts/perf-gap/run-20261009T0335/tp5-native-traffic-cached",
+    "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/mul_mat_vec_q8_0_f32_f32_subgroup_no_shmem.spv",
+    "q8",
+    "10240",
+    "320",
+    "empty"
+  ],
+  "shader_sha256": "240e180a2e84df2e365eac9631f407b83e7436a94a6cc199b07be73be1ce3a20",
+  "env": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": "/home/kunweiz",
+    "USER": "kunweiz",
+    "LANG": "en_US.UTF-8",
+    "RADV_DEBUG": "nobolist"
+  },
+  "returncode": 0
+}

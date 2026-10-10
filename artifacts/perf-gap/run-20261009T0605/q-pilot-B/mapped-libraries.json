@@ -1,0 +1,13 @@
+{
+  "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libggml-base.so.0.18.1": "5ba47ae9690e271da5e3377d8bd51483cdb175f432b239ebf3cec2ffc93718b8",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libggml-cpu.so.0.18.1": "267c3666818388fc85870bee6fba4c01bfd66e58140664f941536c17e7081c91",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libggml-vulkan.so.0.18.1": "525031863848549803b357275c666dff11fc60bfd275cf3c22343333e1e9c078",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libggml.so.0.18.1": "67cb338e4e6dfe914a9e1a8fa1e31f0ffdc91bd851616479f5c8a49d8456ec60",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libllama-common.so.0.0.2188": "90faab9f9f1f19e2f0cca02415efdbb7f507d626fba5ef53d6f2b62600ae2765",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libllama-server-impl.so": "92ceb097a6188a61c27891a1da83199d3a622455994f8ed6f4ac13d3af565718",
+  "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libllama.so.0.0.2188": "70535dab57117e72181914f5cf2fd9d95d6709a2b644b14317847f710691c02d",
+  "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+  "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+  "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+  "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac"
+}

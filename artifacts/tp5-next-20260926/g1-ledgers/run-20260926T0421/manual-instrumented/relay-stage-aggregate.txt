@@ -1,0 +1,51 @@
+exec=76: stages=96 elems=17920 ready_all_sum=46.5ms first_sum=35.4ms skew_sum=11.2ms cpu_data_sum=3.3ms
+  top-15 stages by ready_all_us:
+    stage=  1 first=   705.6 all=  2072.1 skew=  1366.4 cpu=  34.2 total=  2106.7
+    stage=  2 first=   637.9 all=  1671.3 skew=  1033.3 cpu=  33.3 total=  1705.0
+    stage=  5 first=   542.0 all=  1511.4 skew=   969.4 cpu=  34.6 total=  1546.3
+    stage=  3 first=   617.1 all=  1508.3 skew=   891.2 cpu=  33.9 total=  1542.6
+    stage=  7 first=   448.8 all=  1498.8 skew=  1050.0 cpu=  34.6 total=  1533.8
+    stage=  9 first=   418.7 all=  1292.2 skew=   873.4 cpu=  38.4 total=  1330.8
+    stage=  6 first=   415.7 all=  1221.6 skew=   805.9 cpu=  32.6 total=  1254.5
+    stage=  8 first=   335.1 all=  1180.2 skew=   845.1 cpu=  34.2 total=  1214.7
+    stage=  4 first=   455.3 all=  1159.1 skew=   703.8 cpu=  34.1 total=  1193.5
+    stage=  0 first=     0.1 all=   769.8 skew=   769.6 cpu=  34.1 total=   804.7
+    stage= 11 first=   419.8 all=   454.1 skew=    34.3 cpu=  35.2 total=   489.5
+    stage= 13 first=   422.4 all=   448.6 skew=    26.2 cpu=  34.4 total=   483.2
+    stage= 15 first=   415.3 all=   435.7 skew=    20.3 cpu=  35.1 total=   471.0
+    stage= 81 first=   420.0 all=   429.3 skew=     9.3 cpu=  38.4 total=   467.9
+    stage= 71 first=   399.0 all=   427.9 skew=    28.8 cpu=  33.2 total=   461.4
+exec=82: stages=96 elems=17920 ready_all_sum=46.2ms first_sum=34.8ms skew_sum=11.4ms cpu_data_sum=3.3ms
+  top-15 stages by ready_all_us:
+    stage=  1 first=   669.9 all=  2069.0 skew=  1399.0 cpu=  33.3 total=  2102.7
+    stage=  2 first=   560.9 all=  1669.1 skew=  1108.1 cpu=  32.4 total=  1701.8
+    stage=  5 first=   455.0 all=  1504.7 skew=  1049.7 cpu=  34.4 total=  1539.5
+    stage=  7 first=   418.5 all=  1501.8 skew=  1083.2 cpu=  35.8 total=  1537.9
+    stage=  3 first=   510.1 all=  1494.5 skew=   984.4 cpu=  33.7 total=  1528.6
+    stage=  6 first=   349.1 all=  1218.9 skew=   869.7 cpu=  39.7 total=  1258.9
+    stage=  4 first=   378.0 all=  1171.1 skew=   793.0 cpu=  34.1 total=  1205.5
+    stage=  8 first=   335.1 all=  1131.2 skew=   796.1 cpu=  34.8 total=  1166.3
+    stage=  9 first=   420.6 all=   992.6 skew=   572.0 cpu=  35.1 total=  1028.0
+    stage=  0 first=     0.1 all=   769.0 skew=   768.8 cpu=  52.8 total=   822.5
+    stage= 11 first=   423.4 all=   460.3 skew=    36.8 cpu=  39.6 total=   500.1
+    stage= 13 first=   422.6 all=   453.4 skew=    30.8 cpu=  33.5 total=   487.2
+    stage= 15 first=   413.5 all=   440.9 skew=    27.4 cpu=  34.5 total=   475.6
+    stage= 57 first=   400.4 all=   425.4 skew=    25.0 cpu=  34.7 total=   460.4
+    stage= 87 first=   403.2 all=   421.6 skew=    18.4 cpu=  34.0 total=   455.9
+exec=83: stages=96 elems=17920 ready_all_sum=46.3ms first_sum=34.8ms skew_sum=11.6ms cpu_data_sum=3.3ms
+  top-15 stages by ready_all_us:
+    stage=  1 first=   636.8 all=  2077.7 skew=  1440.9 cpu=  35.8 total=  2113.9
+    stage=  2 first=   521.3 all=  1666.1 skew=  1144.7 cpu=  34.5 total=  1701.0
+    stage=  5 first=   425.7 all=  1523.6 skew=  1097.8 cpu=  37.3 total=  1561.3
+    stage=  3 first=   477.1 all=  1505.6 skew=  1028.4 cpu=  34.9 total=  1540.9
+    stage=  7 first=   418.1 all=  1505.1 skew=  1086.9 cpu=  33.8 total=  1539.2
+    stage=  6 first=   348.7 all=  1218.6 skew=   869.9 cpu=  33.1 total=  1252.0
+    stage=  4 first=   353.0 all=  1180.1 skew=   827.1 cpu=  33.8 total=  1214.3
+    stage=  8 first=   333.8 all=  1142.9 skew=   809.1 cpu=  33.5 total=  1176.8
+    stage=  9 first=   418.8 all=  1036.3 skew=   617.5 cpu=  35.9 total=  1072.5
+    stage=  0 first=     0.1 all=   784.2 skew=   784.0 cpu=  39.5 total=   824.5
+    stage= 11 first=   419.5 all=   454.7 skew=    35.2 cpu=  38.6 total=   493.6
+    stage= 13 first=   420.6 all=   450.9 skew=    30.2 cpu=  34.0 total=   485.1
+    stage= 15 first=   415.9 all=   437.1 skew=    21.2 cpu=  32.8 total=   470.1
+    stage= 95 first=   401.9 all=   423.3 skew=    21.4 cpu=  34.3 total=   457.9
+    stage= 87 first=   405.2 all=   423.0 skew=    17.8 cpu=  35.1 total=   458.4

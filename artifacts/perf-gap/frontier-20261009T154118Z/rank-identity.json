@@ -1,0 +1,41 @@
+{
+  "rank_to_BDF": [
+    {
+      "rank": 0,
+      "name": "Vulkan0",
+      "BDF": "0000:03:00.0",
+      "description": "AMD Radeon RX 6800 (RADV NAVI21)",
+      "memory_total": 17163091968
+    },
+    {
+      "rank": 1,
+      "name": "Vulkan1",
+      "BDF": "0000:06:00.0",
+      "description": "AMD Radeon RX 6800 (RADV NAVI21)",
+      "memory_total": 17163091968
+    },
+    {
+      "rank": 2,
+      "name": "Vulkan2",
+      "BDF": "0000:09:00.0",
+      "description": "AMD Radeon RX 6800 (RADV NAVI21)",
+      "memory_total": 17163091968
+    },
+    {
+      "rank": 3,
+      "name": "Vulkan3",
+      "BDF": "0000:0c:00.0",
+      "description": "AMD Radeon RX 6800 (RADV NAVI21)",
+      "memory_total": 17163091968
+    },
+    {
+      "rank": 4,
+      "name": "Vulkan4",
+      "BDF": "0000:0f:00.0",
+      "description": "AMD Radeon RX 6800 (RADV NAVI21)",
+      "memory_total": 17163091968
+    }
+  ],
+  "actual_vulkan_DSO_sha256": "99c90eb62778b73b84f34baa799373ad1d5879654c7af450a2e6537cf5796038",
+  "selected_devices": "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4"
+}

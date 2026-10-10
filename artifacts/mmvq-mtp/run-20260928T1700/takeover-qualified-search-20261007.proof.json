@@ -1,0 +1,10 @@
+{
+  "archive": "takeover-qualified-search-20261007.tar.gz",
+  "sha256": "3ecef3c88a6b1985116d288b4a04344c6864f35a5aa03bd2f80935a055479738",
+  "bytes": 197595141,
+  "verified_source_and_binary_members": 351,
+  "verified_decision": true,
+  "decision_member": "qualification/final-decision.json",
+  "confirmation_member": "qualification/joint-reviewed-opt/confirmation-report.json",
+  "scope": "Source/DSO members byte-verified and archived decision compared exactly. Model weights/external dependency trees are not copied. Earlier screen observations retain provenance; only four independent current-server blocks supply final speed evidence."
+}

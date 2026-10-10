@@ -1,0 +1,7 @@
+{
+  "factor": "Allocated context capacity1024 versus256, same APEX weights, same ordinary single-stream prompt and actual history length; neither arm may truncate the prompt or output.",
+  "fixed": "TP5 head-sharded, h0, aggressive, MMVQdisabled, greedy1, parallel-submit1, Q256/norm256, norm-stage0, prefetch0, pack-single0; CPU22",
+  "pilot": "A1024 thenB256,2warm+3measured+guard. Same max_tokens400 request, natural stop required, actual total prompt+completion length remains below256. Require raw body/count equality before performance confirmation.",
+  "confirmation": "If pilot gain>=2% with identical output, fresh four independent pairs AB/BA/AB/BA, same executable/DSOs. No historical baseline subtraction; no rejected-point replacement.",
+  "scope": "Short-context latency optimization only, not long-context throughput. Changing unused capacity is permitted, but shortening the executed history or answer is not. No GPU clocks, driver settings or tolerance changes."
+}

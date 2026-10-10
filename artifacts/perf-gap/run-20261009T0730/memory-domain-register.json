@@ -1,0 +1,7 @@
+{
+  "finding": "Required flags are inclusive; a request described as cached device-coherent VRAM can actually match a DEVICE_UNCACHED type. Earlier logs printed the preference, not selected flags. Correct logging without changing the allocator or synchronization contract.",
+  "measurement": "Production read-only memory ledger plus norm/LO isolated production-shader fixtures whose inbox requires exactly the same device-local/host-visible/host-coherent/device-coherent bits; status remains ordinary coherent system memory. Q gtt-push payload remains system memory.",
+  "timing_control": "Repeat independent shader tests with two timestamps per whole64-dispatch chain versus two timestamps per dispatch. Report actual between-dispatch barriers/reset costs included by chain timing; do not reinterpret them as hardware constants.",
+  "reference_policy": "Do not sum two timing schemes, do not report cached/system fixtures as proven production brackets, and do not scale totals to observed model tok/s. Every change in the independent envelope must come from named measured components or source-derived counts.",
+  "safety": "Only diagnostic metadata and standalone Vulkan test device features change; production selected memory type, visibility, barriers, epoch checks and timeouts remain unchanged."
+}

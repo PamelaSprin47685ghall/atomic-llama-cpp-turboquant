@@ -1,0 +1,18 @@
+{
+  "certificate": "necessity-certificate-v3.json (v2 superseded: v3 adds dense-weight DRAM traffic and dense FLOPs)",
+  "S_lo_demonstrated_tps": 66.33515005375283,
+  "S_hi_certified_tps": 475.71101192417404,
+  "ratio_S_hi_over_S_lo": 7.1713263863682375,
+  "match_percent": 13.944421800419939,
+  "binding_resource": "R3_active_weight_dram: 1076.3 MB/GPU/token necessary DRAM (10/512 experts + ALL dense weights: attention, PLE, HC, router, shared experts) at 512 GB/s spec ceiling",
+  "v2_to_v3_change": "S_hi tightened 2395 -> 476 tok/s by counting dense weights (90.8 MB/layer) that are necessarily read every token, not just active experts",
+  "looseness_sources": [
+    "peak ceilings assumed (spec DRAM 512GB/s, spec FP32 16.17 TFLOP/s)",
+    "maximal overlap across resources and layers",
+    "perfect MTP acceptance (rows per public token >= 1)",
+    "perfect L2 retention of randomly routed working set (128MB of 11.9GB pool = 1.07% hit, applied to dense AND expert weights alike)",
+    "no KV-state read necessity counted",
+    "no per-layer sequential chain latency counted (scattered expert reads modeled as pure bandwidth)"
+  ],
+  "convergence_status": "NOT CONVERGED: gap 7.2x (was 36x in v2). Tightening v3 replaced null -> 2395 -> 476 tok/s. Remaining gap needs provable latency coupling (DRAM row-buffer efficiency for scattered 2.25MB expert blocks, 48-layer serial chain, KV reads) beyond spec-only premises."
+}

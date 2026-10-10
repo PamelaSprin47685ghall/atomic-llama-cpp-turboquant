@@ -1,0 +1,58 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "请用八句话简要介绍健康减重原则、每周运动安排、饮食建议和睡眠误区。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "健康减重的核心在于建立可持续的能量负平衡，而非追求极端节食。\n\n每周运动安排应包含至少150分钟的中等强度有氧运动，如快走或游泳。\n\n此外，每周进行两次力量训练有助于提升基础代谢率并维持肌肉质量。\n\n饮食建议强调增加蔬菜、全谷物和优质蛋白的摄入，同时减少精制糖和加工食品。\n\n控制总热量摄入时，应注重食物密度而非单纯计算卡路里，以增强饱腹感。\n\n关于睡眠，许多人误认为熬夜后补觉能抵消睡眠不足的影响，但这并不成立。\n\n长期睡眠不足会导致激素失调，增加食欲并降低运动表现，阻碍减重效果。\n\n因此，保证每晚7至9小时的高质量睡眠是减重计划中不可或缺的一环。"
+        }
+      }
+    ],
+    "created": 1791489467,
+    "model": "/home/kunweiz/atomic-llama-cpp-turboquant/models/perf-gap-q2-hcq8/Q2-HCQ8-00001-of-00002.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 162,
+      "prompt_tokens": 31,
+      "total_tokens": 193,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-npJWYYFigtylnDQ7vvek1fHkZ98wlIWR",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 31,
+      "prompt_ms": 709.07,
+      "prompt_per_token_ms": 22.873225806451615,
+      "prompt_per_second": 43.71923787496298,
+      "predicted_n": 162,
+      "predicted_ms": 2891.62,
+      "predicted_per_token_ms": 17.849506172839504,
+      "predicted_per_second": 56.023958888097326
+    }
+  },
+  "wall_ms": 3603.710839,
+  "log_begin": 36050,
+  "log_end": 45219,
+  "phase": "measured"
+}

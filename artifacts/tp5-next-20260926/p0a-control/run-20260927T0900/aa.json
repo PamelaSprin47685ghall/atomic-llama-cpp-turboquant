@@ -1,0 +1,215 @@
+{
+ "identity": {
+  "binary_sha": "b92fda12915ab595441443912cd002944c24f694de371af4699f5438184be17f",
+  "libggml_sha": "23893927e0d69732e4e598f6c5ad375e27c4f8d28bb88c88fa3b4a67abffa8df",
+  "env_experiment": {
+   "RADV_DEBUG": "nobolist"
+  },
+  "env_inherited": [
+   "HOME",
+   "LANG",
+   "PATH",
+   "RADV_DEBUG"
+  ]
+ },
+ "rounds": [
+  [
+   {
+    "tag": "ctlA",
+    "round": 1,
+    "gpu_before": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   13 W   44 \u00b0C   46 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  1    0   12 W   45 \u00b0C   44 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  2    0   10 W   30 \u00b0C   28 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  3    0   12 W   33 \u00b0C   34 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  4    0   12 W   45 \u00b0C   46 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n",
+    "gpu_after": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   55 W   54 \u00b0C   54 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  1    0   47 W   58 \u00b0C   48 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  2    0   37 W   35 \u00b0C   34 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  3    0   40 W   42 \u00b0C   42 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  4    0   49 W   62 \u00b0C   50 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n",
+    "results": [
+     {
+      "ms": 4235.842,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4284.735,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4276.151,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4316.997,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     }
+    ]
+   },
+   {
+    "tag": "ctlB",
+    "round": 1,
+    "gpu_before": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   16 W   47 \u00b0C   48 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  1    0   13 W   50 \u00b0C   46 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  2    0   11 W   32 \u00b0C   30 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  3    0   15 W   36 \u00b0C   38 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  4    0   14 W   48 \u00b0C   48 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n",
+    "gpu_after": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   56 W   56 \u00b0C   54 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  1    0   46 W   60 \u00b0C   50 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  2    0   36 W   36 \u00b0C   36 \u00b0C   505 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  3    0   40 W   43 \u00b0C   44 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  4    0   48 W   63 \u00b0C   52 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n",
+    "results": [
+     {
+      "ms": 4255.803,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4270.712,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4289.81,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4283.452,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     }
+    ]
+   }
+  ],
+  [
+   {
+    "tag": "ctlA",
+    "round": 2,
+    "gpu_before": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   14 W   49 \u00b0C   52 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  1    0   12 W   52 \u00b0C   48 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  2    0   10 W   33 \u00b0C   32 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  3    0   15 W   37 \u00b0C   38 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  4    0   14 W   50 \u00b0C   50 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n",
+    "gpu_after": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   52 W   58 \u00b0C   60 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  1    0   43 W   61 \u00b0C   52 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  2    0   34 W   36 \u00b0C   38 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  3    0   37 W   44 \u00b0C   46 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  4    0   45 W   64 \u00b0C   54 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n",
+    "results": [
+     {
+      "ms": 4261.494,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4272.144,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4292.405,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4303.509,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     }
+    ]
+   },
+   {
+    "tag": "ctlB",
+    "round": 2,
+    "gpu_before": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   14 W   51 \u00b0C   54 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  1    0   11 W   52 \u00b0C   50 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  2    0   10 W   34 \u00b0C   32 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  3    0   14 W   39 \u00b0C   40 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  4    0   13 W   51 \u00b0C   50 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n",
+    "gpu_after": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   56 W   60 \u00b0C   60 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  1    0   46 W   61 \u00b0C   52 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  2    0   36 W   38 \u00b0C   38 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  3    0   39 W   45 \u00b0C   46 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  4    0   50 W   65 \u00b0C   54 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n",
+    "results": [
+     {
+      "ms": 4254.18,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4274.565,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4288.731,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4287.341,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     }
+    ]
+   }
+  ],
+  [
+   {
+    "tag": "ctlA",
+    "round": 3,
+    "gpu_before": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   14 W   53 \u00b0C   54 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  1    0   12 W   53 \u00b0C   50 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  2    0   10 W   35 \u00b0C   34 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  3    0   15 W   40 \u00b0C   42 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  4    0   13 W   51 \u00b0C   52 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n",
+    "gpu_after": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   54 W   61 \u00b0C   62 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  1    0   45 W   61 \u00b0C   54 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  2    0   35 W   38 \u00b0C   40 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  3    0   39 W   46 \u00b0C   48 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  4    0   46 W   65 \u00b0C   54 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n",
+    "results": [
+     {
+      "ms": 4237.88,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4282.921,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4308.557,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4305.985,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     }
+    ]
+   },
+   {
+    "tag": "ctlB",
+    "round": 3,
+    "gpu_before": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   14 W   54 \u00b0C   58 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  1    0   12 W   53 \u00b0C   50 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  2    0   10 W   35 \u00b0C   36 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  3    0   15 W   41 \u00b0C   42 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n  4    0   13 W   52 \u00b0C   52 \u00b0C   500 MHz    0 %    0 %    N/A    0 %    0.0/ 16.0 GB\n",
+    "gpu_after": "GPU  XCP  POWER   GPU_T   MEM_T   GFX_CLK   GFX%   MEM%   ENC%   DEC%      VRAM_USAGE\n  0    0   56 W   62 \u00b0C   64 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  1    0   46 W   60 \u00b0C   54 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  2    0   36 W   39 \u00b0C   40 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  3    0   39 W   47 \u00b0C   48 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n  4    0   48 W   65 \u00b0C   56 \u00b0C   500 MHz    0 %    0 %    N/A    0 %   12.9/ 16.0 GB\n",
+    "results": [
+     {
+      "ms": 4223.269,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4253.079,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4268.883,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     },
+     {
+      "ms": 4269.947,
+      "tok": 156,
+      "fin": "stop",
+      "content_hash": "9e6838546c6a072e"
+     }
+    ]
+   }
+  ]
+ ]
+}

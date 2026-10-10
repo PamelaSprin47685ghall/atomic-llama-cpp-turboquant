@@ -1,0 +1,58 @@
+[
+  {
+    "run": "greedy-b1-A",
+    "returncode": 0
+  },
+  {
+    "run": "greedy-b1-B",
+    "returncode": 0
+  },
+  {
+    "run": "greedy-b2-B",
+    "returncode": 0
+  },
+  {
+    "run": "greedy-b2-A",
+    "returncode": 0
+  },
+  {
+    "run": "greedy-b3-A",
+    "returncode": 0
+  },
+  {
+    "run": "greedy-b3-B",
+    "returncode": 0
+  },
+  {
+    "run": "greedy-b4-B",
+    "returncode": 0
+  },
+  {
+    "run": "greedy-b4-A",
+    "returncode": 0
+  },
+  {
+    "run": "heldout-index-A",
+    "returncode": 0
+  },
+  {
+    "run": "heldout-index-B",
+    "returncode": 0
+  },
+  {
+    "run": "heldout-process-B",
+    "returncode": 0
+  },
+  {
+    "run": "heldout-process-A",
+    "returncode": 0
+  },
+  {
+    "run": "heldout-debug-A",
+    "returncode": 0
+  },
+  {
+    "run": "heldout-debug-B",
+    "returncode": 0
+  }
+]

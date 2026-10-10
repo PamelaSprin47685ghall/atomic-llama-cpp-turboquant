@@ -1,0 +1,6 @@
+{
+  "selected": "norm512 after independent local26.68->19.36us, system35.76->26.68us; norm1024 not automatically preferred from a similar small micro score",
+  "factor": "GGML_TP5_NORM_WORKGROUP=256/512; Q256 fixed; serial submission fixed for norm pilot. If both candidate gates pass, final package comparison may explicitly change norm+parallel together, with no false single-factor attribution.",
+  "numeric_gate": "Varied signed R,Y,gamma and stream-specific inject, token1/2/4, all combined/norm/rho/Y outputs against CPU-double rho, original1e-6 relative rule and inactive sentinel preservation; generation and retirement checks retained.",
+  "model_gate": "Two warm,three measured,one guard per arm; raw outputs and normal exit checked. Any changed text is retained for semantic review and prohibits bit-equivalence claims. Only independent four-pair confirmation may establish net speed."
+}

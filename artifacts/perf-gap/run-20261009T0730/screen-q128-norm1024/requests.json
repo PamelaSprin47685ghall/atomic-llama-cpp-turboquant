@@ -1,0 +1,123 @@
+[
+  {
+    "idx": 0,
+    "phase": "warmup",
+    "n": 185,
+    "predicted_ms": 2886.677,
+    "tps": 64.08753040260478,
+    "wall_ms": 4498.344307,
+    "finish": "stop",
+    "content_sha256": "21eaff98f8d2d391897f1184cfe95d597c5e77ed6aa2e2d088fbd83fefd9c58f",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 31,
+      "prompt_ms": 1608.21,
+      "prompt_per_token_ms": 51.877741935483876,
+      "prompt_per_second": 19.27608956541745,
+      "predicted_n": 185,
+      "predicted_ms": 2886.677,
+      "predicted_per_token_ms": 15.60365945945946,
+      "predicted_per_second": 64.08753040260478
+    },
+    "issues": [],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=3 n_sub=96 uid=36028797018967041",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=97 uid=36028797018967297",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=97 uid=36028797018967553"
+    ]
+  },
+  {
+    "idx": 1,
+    "phase": "warmup",
+    "n": 175,
+    "predicted_ms": 2617.988,
+    "tps": 66.84522618132704,
+    "wall_ms": 4464.124584,
+    "finish": "stop",
+    "content_sha256": "1cf5ac29a46ce01b9e87eec8bbb03973e5c70f6075e836f9e7d191229610211e",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 31,
+      "prompt_ms": 1303.962,
+      "prompt_per_token_ms": 42.06329032258064,
+      "prompt_per_second": 23.773698926809217,
+      "predicted_n": 175,
+      "predicted_ms": 2617.988,
+      "predicted_per_token_ms": 14.959931428571428,
+      "predicted_per_second": 66.84522618132704
+    },
+    "issues": [],
+    "fallback_lines": []
+  },
+  {
+    "idx": 2,
+    "phase": "measured",
+    "n": 175,
+    "predicted_ms": 2589.786,
+    "tps": 67.57315083176756,
+    "wall_ms": 4122.947327,
+    "finish": "stop",
+    "content_sha256": "1cf5ac29a46ce01b9e87eec8bbb03973e5c70f6075e836f9e7d191229610211e",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 31,
+      "prompt_ms": 1018.606,
+      "prompt_per_token_ms": 32.85825806451613,
+      "prompt_per_second": 30.433749653938815,
+      "predicted_n": 175,
+      "predicted_ms": 2589.786,
+      "predicted_per_token_ms": 14.798777142857142,
+      "predicted_per_second": 67.57315083176756
+    },
+    "issues": [],
+    "fallback_lines": []
+  },
+  {
+    "idx": 3,
+    "phase": "measured",
+    "n": 175,
+    "predicted_ms": 2576.595,
+    "tps": 67.91909477430485,
+    "wall_ms": 3574.143466,
+    "finish": "stop",
+    "content_sha256": "1cf5ac29a46ce01b9e87eec8bbb03973e5c70f6075e836f9e7d191229610211e",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 31,
+      "prompt_ms": 994.352,
+      "prompt_per_token_ms": 32.075870967741935,
+      "prompt_per_second": 31.176082514039294,
+      "predicted_n": 175,
+      "predicted_ms": 2576.595,
+      "predicted_per_token_ms": 14.723399999999998,
+      "predicted_per_second": 67.91909477430485
+    },
+    "issues": [],
+    "fallback_lines": []
+  },
+  {
+    "idx": 4,
+    "phase": "guard",
+    "n": 91,
+    "predicted_ms": 1446.904,
+    "tps": 62.892907891608566,
+    "wall_ms": 2791.191786,
+    "finish": "stop",
+    "content_sha256": "ec0f6fec10ce68d7ba0fae7e59489b9df7e79fb6214babb9830117f04a6ce11f",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 23,
+      "prompt_ms": 1341.151,
+      "prompt_per_token_ms": 58.310913043478266,
+      "prompt_per_second": 17.149448496105208,
+      "predicted_n": 91,
+      "predicted_ms": 1446.904,
+      "predicted_per_token_ms": 15.900043956043955,
+      "predicted_per_second": 62.892907891608566
+    },
+    "issues": [],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=96 uid=36028797018970113"
+    ]
+  }
+]

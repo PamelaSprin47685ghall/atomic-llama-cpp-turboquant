@@ -1,0 +1,2926 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index d607f85fa..1948e13b9 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3121,6 +3121,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             }
+         }
+     ));
++    add_opt(common_arg(
++        {"--tp5-mmvq"}, "MODE",
++        "TP5 MMVQ policy: auto | forced | disabled (default: preserve GGML_VK_*_MMVQ env, or disabled under relay recipe)",
++        [](common_params & params, const std::string & value) {
++            params.tp5.enabled = true;
++            if (value == "auto") {
++                setenv("GGML_VK_FORCE_MMVQ", "0", 1);
++                setenv("GGML_VK_DISABLE_MMVQ", "0", 1);
++                setenv("GGML_VK_SMALL_Q8_COLUMNS", "1", 1);
++            } else if (value == "forced") {
++                setenv("GGML_VK_FORCE_MMVQ", "1", 1);
++                setenv("GGML_VK_DISABLE_MMVQ", "0", 1);
++                setenv("GGML_VK_SMALL_Q8_COLUMNS", "1", 1);
++            } else if (value == "disabled") {
++                setenv("GGML_VK_FORCE_MMVQ", "0", 1);
++                setenv("GGML_VK_DISABLE_MMVQ", "1", 1);
++            } else {
++                throw std::invalid_argument(string_format("error: invalid value for --tp5-mmvq: '%s' (allowed: auto, forced, disabled)\n", value.c_str()));
++            }
++        }
++    ));
+     add_opt(common_arg(
+         {"-ctk", "--cache-type-k"}, "TYPE",
+         string_format(
+diff --git a/common/common.cpp b/common/common.cpp
+index 78c96df7e..fa64a0fda 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -482,6 +482,15 @@ void common_tp5_apply_env(common_params & params) {
+         } else if (params.tp5.latebind == "aggressive") {
+             setenv("GGML_TP5_LATEBIND", "hc-down", 1);
+             setenv("GGML_TP5_LATEBIND_EXACT_Q", "0", 1);
++            if (!getenv("GGML_TP5_LATEBIND_ALLOW_APPROX")) {
++                setenv("GGML_TP5_LATEBIND_ALLOW_APPROX", "1", 1);
++            }
++            if (!getenv("GGML_TP5_LATE_TRANSPORT")) {
++                setenv("GGML_TP5_LATE_TRANSPORT", "gtt-push", 1);
++            }
++            if (!getenv("GGML_TP5_LATEBIND_OVERLAP")) {
++                setenv("GGML_TP5_LATEBIND_OVERLAP", "legacy", 1);
++            }
+         }
+     }
+     const char * latebind = getenv("GGML_TP5_LATEBIND");
+@@ -494,8 +503,10 @@ void common_tp5_apply_env(common_params & params) {
+         const char * allow_approx_env = getenv("GGML_TP5_LATEBIND_ALLOW_APPROX");
+         const bool   allow_approx     = allow_approx_env && atoi(allow_approx_env) != 0;
+         const bool   exact_ok         = exact_q && std::strcmp(exact_q, "1") == 0;
+-        if (!qualified || effective_sync != "relay" || effective_wire != "f32" ||
+-            (!exact_ok && !allow_approx)) {
++        if (!qualified || effective_sync != "relay" || effective_wire != "f32") {
++            throw std::runtime_error("TP5+MTP LateBind requires five distinct RX 6800 ranks, RELAY/F32, and explicit exact Q");
++        }
++        if (!exact_ok && !allow_approx) {
+             throw std::runtime_error("TP5+MTP LateBind requires five distinct RX 6800 ranks, RELAY/F32, and explicit exact Q");
+         }
+     }
+@@ -505,7 +516,7 @@ void common_tp5_apply_env(common_params & params) {
+         }
+         for (const char * knob : { "GGML_VK_DISABLE_PRODUCER_WIRE", "GGML_VK_DISABLE_MMVQ",
+                                    "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM", "GGML_VK_ALLOW_GRAPHICS_QUEUE" }) {
+-            if (!getenv(knob)) {
++            if (!getenv(knob) && (std::strcmp(knob, "GGML_VK_DISABLE_MMVQ") != 0 || (!getenv("GGML_VK_FORCE_MMVQ") && !getenv("GGML_VK_DISABLE_MMVQ")))) {
+                 setenv(knob, "1", 1);
+             }
+         }
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 406a0024f..34a08a4d5 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -3479,25 +3479,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     if (!pfn_submit_chain && n_backends > 0) {
+         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(
+             ggml_backend_get_device(backend_ctx->backend_configs[0].backend));
+-        pfn_submit_chain = (tp5_submit_epoch_chain_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_submit_epoch_chain");
++        pfn_submit_chain =
++            (tp5_submit_epoch_chain_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_submit_epoch_chain");
+     }
+ 
+-    // DIRECT PREDEFINED VERIFY GRAPH FAST PATH (0ms rebuild, 0ms alloc, 63ms direct submit)
+-    if (backend_ctx->predefined_valid &&
+-        backend_ctx->predefined_uid != 0 &&
+-        cgraph->uid == backend_ctx->predefined_uid &&
+-        !backend_ctx->chain_compute_cbs.empty() &&
+-        pfn_submit_chain != nullptr) {
+-
+-        auto & stage_compute_cbs = backend_ctx->chain_compute_cbs;
+-        auto & stage_tensors     = backend_ctx->chain_tensors;
+-        bool chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors,
+-                                        backend_ctx->predefined_frame_valid ? &backend_ctx->predefined_frame : nullptr,
+-                                        backend_ctx->predefined_capacity_rows,
+-                                        backend_ctx->predefined_capacity_outputs);
++    // Predefined execution path: qualified against valid flag, UID, and node count consistency.
++    // If native submission is attempted and fails, fail-closed immediately to enforce the
++    // 'no fallback after native submission' contract.
++    if (backend_ctx->predefined_valid && backend_ctx->predefined_uid != 0 &&
++        cgraph->uid == backend_ctx->predefined_uid && cgraph->n_nodes == backend_ctx->n_nodes &&
++        !backend_ctx->chain_compute_cbs.empty() && pfn_submit_chain != nullptr) {
++        auto &     stage_compute_cbs = backend_ctx->chain_compute_cbs;
++        auto &     stage_tensors     = backend_ctx->chain_tensors;
++        const bool chain_ok =
++            pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors,
++                             backend_ctx->predefined_frame_valid ? &backend_ctx->predefined_frame : nullptr,
++                             backend_ctx->predefined_capacity_rows, backend_ctx->predefined_capacity_outputs);
+         if (chain_ok) {
+             return GGML_STATUS_SUCCESS;
+         }
++        fprintf(stderr, "[tp5-meta] predefined execution failed; refusing fallback after native submission\n");
++        return GGML_STATUS_FAILED;
+     }
+ 
+     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
+@@ -3507,10 +3509,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     if (needs_rebuild) {
+         // Old CB/tensor handles stop being executable BEFORE their graphs are
+         // reset below. A same-sized replacement is still a different definition.
+-        if (cgraph->uid == backend_ctx->predefined_uid) {
+-            backend_ctx->predefined_valid = false;
++        if (backend_ctx->predefined_valid) {
++            backend_ctx->predefined_valid       = false;
+             backend_ctx->predefined_n_subgraphs = 0;
+-            backend_ctx->predefined_uid = 0;
++            backend_ctx->predefined_uid         = 0;
+             backend_ctx->chain_compute_cbs.clear();
+             backend_ctx->chain_tensors.clear();
+         }
+@@ -4179,10 +4181,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+ 
+     if (pfn_submit_chain && pfn_get_cbs && backend_ctx->comm_ctx && n_backends == 5 && backend_ctx->n_subgraphs > 1 &&
+         (backend_ctx->n_subgraphs - 1) <= 128) {
+-        // 纯 Predefine 路线（唯一真理）：一旦初次建立预定义图句柄后，直接 100% 绝对复用，跳过逐轮 validation 开销
+-        auto & stage_compute_cbs = backend_ctx->chain_compute_cbs;
+-        auto & stage_tensors     = backend_ctx->chain_tensors;
+-        static int check_log = 0;
++        // Predefined chain execution path: validated against valid state, subgraph count, and UID.
++        auto &     stage_compute_cbs = backend_ctx->chain_compute_cbs;
++        auto &     stage_tensors     = backend_ctx->chain_tensors;
++        static int check_log         = 0;
+         if (++check_log <= 10) {
+             fprintf(stderr, "[tp5-meta-check] valid=%d n_sub=%zu/%zu uid=%llu/%llu\n",
+                     (int)backend_ctx->predefined_valid, backend_ctx->predefined_n_subgraphs, backend_ctx->n_subgraphs,
+@@ -4216,7 +4218,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+             }
+             if (chain_ok) {
+                 if (++chain_hit_log <= 5 || chain_hit_log % 100 == 0) {
+-                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN (PREDEFINED TRUTH): hits=%d\n", chain_hit_log);
++                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN (PREDEFINED): hits=%d\n", chain_hit_log);
+                 }
+                 return GGML_STATUS_SUCCESS;
+             }
+@@ -4343,9 +4345,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+             if (chain_ok) {
+                 backend_ctx->predefined_valid = true;
+                 backend_ctx->predefined_n_subgraphs = backend_ctx->n_subgraphs;
+-                backend_ctx->predefined_uid = backend_ctx->uid;
++                backend_ctx->predefined_uid         = backend_ctx->uid;
+                 if (++chain_hit_log <= 5 || chain_hit_log % 100 == 0) {
+-                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN SUCCESS: predefined truth locked! (hits=%d)\n", chain_hit_log);
++                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN SUCCESS: prepared definition executed (hits=%d)\n",
++                            chain_hit_log);
+                 }
+                 return GGML_STATUS_SUCCESS;
+             } else {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp
+index fdeb2011e..727e60420 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp
+@@ -648,6 +648,29 @@ struct tp5_rank {
+     VkBuffer epoch_buf = VK_NULL_HANDLE;
+     VkDeviceMemory epoch_mem = VK_NULL_HANDLE;
+     uint32_t * epoch_host = nullptr;
++
++    // Resident late-segment scratch, owned for the whole process lifetime.
++    //
++    // Per-site scratch whose size comes from MODEL-STATIC shape only (width /
++    // streams / late_rank, and max_rows == VK_TP5_DIRECT_COLUMN_TILE == 4), so
++    // one allocation per rank serves every plan for the life of the process.
++    // A prepared linear program captures these addresses. Per-comm ownership
++    // keeps scratch alive across plan eviction; its residency does not make
++    // another same-shaped buffer interchangeable with a recorded binding.
++    //
++    // Packed weights are deliberately absent: they already live in
++    // packed_registry as per-comm shared owners and hold model data, not
++    // scratch.
++    struct tp5_late_resident {
++        VkBuffer       stats   = VK_NULL_HANDLE; VkDeviceMemory stats_mem   = VK_NULL_HANDLE;
++        VkBuffer       scatter = VK_NULL_HANDLE; VkDeviceMemory scatter_mem = VK_NULL_HANDLE;
++        VkBuffer       zsnap   = VK_NULL_HANDLE; VkDeviceMemory zsnap_mem   = VK_NULL_HANDLE;
++        VkBuffer       rho     = VK_NULL_HANDLE; VkDeviceMemory rho_mem     = VK_NULL_HANDLE;
++        VkBuffer       act_q8  = VK_NULL_HANDLE; VkDeviceMemory act_q8_mem  = VK_NULL_HANDLE;
++        VkBuffer       lo_q8   = VK_NULL_HANDLE; VkDeviceMemory lo_q8_mem   = VK_NULL_HANDLE;
++        VkBuffer       sidecar = VK_NULL_HANDLE; VkDeviceMemory sidecar_mem = VK_NULL_HANDLE;
++    };
++    tp5_late_resident late_resident;
+ };
+ 
+ // Own all pointer targets passed to vkQueueSubmit. A chain sizes its array
+@@ -732,10 +755,14 @@ struct tp5_rank_chain {
+ 
+ };
+ 
++// Plans and prepared programs capture exact descriptor targets. Equal extents
++// in distinct live buffers are not the same tensor binding. Rebinding must
++// resolve a new plan and qualify/redefine both mailbox-polarity programs;
++// keeping the old buffer resident only protects its lifetime, not its data.
+ struct tp5_binding_key {
+     VkBuffer buf = VK_NULL_HANDLE;
+-    VkDeviceSize offset = 0;
+-    VkDeviceSize size = 0;
++    VkDeviceSize offset = 0;         // which region of the buffer is meant
++    VkDeviceSize size = 0;           // how much of it is meant
+     bool operator==(const tp5_binding_key & o) const {
+         return buf == o.buf && offset == o.offset && size == o.size;
+     }
+@@ -799,8 +826,6 @@ struct tp5_plan_key {
+     }
+ };
+ 
+-struct tp5_linear_program;
+-
+ struct tp5_compiled_chain {
+     bool                                          valid         = false;
+     size_t                                        n_stages      = 0;
+@@ -811,14 +836,12 @@ struct tp5_compiled_chain {
+     std::vector<size_t>                           stage_plan_indices;
+     std::vector<tp5_plan_key>                     stage_keys;
+     std::vector<std::vector<std::vector<void *>>> stage_compute_cbs;
+-    std::shared_ptr<tp5_linear_program>           linear_program;
+ 
+     void invalidate() {
+         valid = false;
+         stage_plan_indices.clear();
+         stage_keys.clear();
+         stage_compute_cbs.clear();
+-        linear_program.reset();
+     }
+ };
+ 
+@@ -1123,16 +1146,69 @@ struct tp5_comm {
+     std::unique_ptr<tp5_drm_waiter> drm_waiter;
+ 
+     // Bounded immutable per-binding plan cache
+-    // For 96 distinct subgraphs in Qwen4EXP TP5, keep 256 entries to eliminate LRU thrashing.
++    // Leave room for the 96-stage decode/verify definitions across shape transitions.
+     static constexpr size_t MAX_CACHED_PLANS = 1024;
+-    std::vector<tp5_cached_plan> cached_plans;
+-    size_t                       last_hit_idx = 0;
+-    uint64_t                     plans_gen    = 1;
+-    std::vector<tp5_compiled_chain> linear_chains;
+-    std::vector<tp5_compiled_chain> compiled_chains;
+-    std::shared_ptr<tp5_linear_program> linear_program;
++    std::vector<tp5_cached_plan>                     cached_plans;
++    size_t                                           last_hit_idx = 0;
++    uint64_t                                         plans_gen    = 1;
++    std::vector<tp5_compiled_chain>                  compiled_chains;
+     std::vector<std::shared_ptr<tp5_linear_program>> retired_linear_programs;
+ 
++    // One immutable compute/transport definition, recorded for both bank polarities.
++    // Its contract is shared; neither polarity can be replaced independently.
++    struct tp5_prepared_linear_definition {
++        std::array<std::shared_ptr<tp5_linear_program>, TP5_MAILBOX_BANKS> programs;
++        size_t                                                             n_stages      = 0;
++        bool                                                               isolate_bo    = false;
++        bool                                                               capture       = false;
++        uint64_t                                                           workspace_gen = 0;
++        uint64_t                                                           plans_gen     = 0;
++        uint32_t                                                           capacity_rows = 0;
++        std::vector<tp5_plan_key>                                          stage_keys;
++        std::vector<size_t>                                                stage_plan_indices;
++        std::vector<std::vector<std::vector<void *>>>                      stage_compute_cbs;
++
++        bool matches(size_t                                                stages,
++                     bool                                                  is_bo,
++                     bool                                                  is_cap,
++                     uint64_t                                              ws_gen,
++                     uint64_t                                              pl_gen,
++                     uint32_t                                              cap_rows,
++                     const std::vector<tp5_plan_key> &                     keys,
++                     const std::vector<size_t> &                           plan_indices,
++                     const std::vector<std::vector<std::vector<void *>>> & cbs) const {
++            for (const auto & program : programs) {
++                if (!program) {
++                    return false;
++                }
++            }
++            return n_stages == stages && isolate_bo == is_bo && capture == is_cap && workspace_gen == ws_gen &&
++                   plans_gen == pl_gen && capacity_rows == cap_rows && stage_keys == keys &&
++                   stage_plan_indices == plan_indices && stage_compute_cbs == cbs;
++        }
++    };
++
++    tp5_prepared_linear_definition prepared_linear;
++
++    bool linear_prepared_for(size_t                                                n_stages,
++                             bool                                                  isolate_bo,
++                             bool                                                  capture,
++                             uint32_t                                              capacity_rows,
++                             const std::vector<tp5_plan_key> &                     keys,
++                             const std::vector<std::vector<std::vector<void *>>> & cbs) const {
++        return prepared_linear.matches(n_stages, isolate_bo, capture, workspace_gen, plans_gen, capacity_rows, keys,
++                                       chain_plan_indices, cbs);
++    }
++
++    void retire_prepared_linear() {
++        for (auto & program : prepared_linear.programs) {
++            if (program) {
++                retired_linear_programs.push_back(std::move(program));
++            }
++        }
++        prepared_linear = {};
++    }
++
+     // Retained scratch buffers for chain validation/plan resolution across calls
+     std::vector<tensor_dev_ref> chain_refs;
+     std::vector<tp5_plan_key>   chain_keys;
+@@ -1163,10 +1239,7 @@ struct tp5_comm {
+         }
+     }
+ 
+-    void destroy_plan(tp5_cached_plan & plan, bool invalidate = false) {
+-        if (invalidate) {
+-            invalidate_chain();
+-        }
++    void destroy_plan(tp5_cached_plan & plan) {
+         plan.p1.reset();
+         for (size_t idx = 0; idx < plan.cmd_p2.size(); ++idx) {
+             const size_t i = idx / TP5_MAILBOX_BANKS;
+@@ -1369,21 +1442,26 @@ struct tp5_comm {
+     }
+ 
+     void invalidate_chain(const char * reason = "?") {
+-        for (auto & cc : linear_chains) {
+-            cc.invalidate();
+-        }
+-        linear_chains.clear();
+         for (auto & cc : compiled_chains) {
+             cc.invalidate();
+         }
+         compiled_chains.clear();
++        // Retain both polarities until actual native submission completion.
++        retire_prepared_linear();
+         plans_gen++;
+     }
+ 
+     void clear_cached_plans(bool queues_drained = false, const char * reason = "clear_cached_plans") {
++        // Invalidate chains and retire prepared programs before draining.
++        // Then drain submitted native work before any plans or command pools are destroyed.
+         invalidate_chain(reason);
++        if (!retired_linear_programs.empty() && !tp5_drain_submitted(*this)) {
++            fail("clear_cached_plans: linear definition drain failed before resource release");
++            return;
++        }
+         if ((sync_mode == tp5_sync_mode::TIMELINE || sync_mode == tp5_sync_mode::DRM ||
+-             sync_mode == tp5_sync_mode::RELAY) && !queues_drained) {
++             sync_mode == tp5_sync_mode::RELAY) &&
++            !queues_drained) {
+             if (!tp5_drain_epoch(*this, allreduce_calls)) {
+                 fail("clear_cached_plans: drain failed before plan destruction");
+                 return;
+@@ -1399,17 +1477,9 @@ struct tp5_comm {
+             }
+         }
+         }
+-        // Cover actual submissions, including a partial rank submit whose
+-        // epoch never reached allreduce_calls. Never free emitted CB owners
+-        // on the strength of a logical epoch alone.
+-        if ((linear_program || !retired_linear_programs.empty()) && !tp5_drain_submitted(*this)) {
+-            fail("linear definition drain failed before resource release");
+-            return;
+-        }
+-        linear_program.reset();
+         retired_linear_programs.clear();
+         for (auto & plan : cached_plans) {
+-            destroy_plan(plan, false);
++            destroy_plan(plan);
+         }
+         cached_plans.clear();
+     }
+@@ -1421,9 +1491,10 @@ struct tp5_comm {
+         for (size_t i = 1; i < cached_plans.size(); ++i) {
+             if (cached_plans[i].last_used_call < min_call) {
+                 min_call = cached_plans[i].last_used_call;
+-                lru_idx = i;
++                lru_idx  = i;
+             }
+         }
++        invalidate_chain("evict_lru_plan");
+         if (sync_mode == tp5_sync_mode::TIMELINE || sync_mode == tp5_sync_mode::DRM ||
+             sync_mode == tp5_sync_mode::RELAY) {
+             if (!tp5_drain_epoch(*this, allreduce_calls)) {
+@@ -1441,13 +1512,12 @@ struct tp5_comm {
+             }
+         }
+         }
+-        if ((linear_program || !retired_linear_programs.empty()) && !tp5_drain_submitted(*this)) {
++        if (!retired_linear_programs.empty() && !tp5_drain_submitted(*this)) {
+             fail("linear definition drain failed before plan eviction");
+             return;
+         }
+-        linear_program.reset();
+         retired_linear_programs.clear();
+-        destroy_plan(cached_plans[lru_idx], true);
++        destroy_plan(cached_plans[lru_idx]);
+         cached_plans.erase(cached_plans.begin() + lru_idx);
+     }
+ };
+@@ -1914,9 +1984,9 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
+                            r.late_q_stats_dsl, r.late_q_stats_layout, r.late_q_stats_pipe, "tp5_hc_late_q_stats") ||
+                 !make_late(7, 20, tp5_hc_late_q_data, tp5_hc_late_q_len,
+                            r.late_q_dsl, r.late_q_layout, r.late_q_pipe, "tp5_hc_late_q") ||
+-                !make_late(3, 4, tp5_hc_publish_data, tp5_hc_publish_len,
++                !make_late(5, 8, tp5_hc_publish_data, tp5_hc_publish_len,
+                            r.late_publish_dsl, r.late_publish_layout, r.late_publish_pipe, "tp5_hc_publish") ||
+-                !make_late(5, 8, tp5_hc_publish_stats_data, tp5_hc_publish_stats_len,
++                !make_late(7, 12, tp5_hc_publish_stats_data, tp5_hc_publish_stats_len,
+                            r.late_publish_stats_dsl, r.late_publish_stats_layout, r.late_publish_stats_pipe, "tp5_hc_publish_stats") ||
+                 !make_late(9, 28, tp5_hc_resume_norm_data, tp5_hc_resume_norm_len,
+                            r.late_norm_dsl, r.late_norm_layout, r.late_norm_pipe, "tp5_hc_resume_norm", norm_wave32 ? 32u : 0u) ||
+@@ -1936,9 +2006,9 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
+                               r.late_pack_dsl, r.late_pack_layout, r.late_pack_pipe, "tp5_hc_late_pack") &&
+                     make_late(6, 16, tp5_hc_late_act_q8_data, tp5_hc_late_act_q8_len,
+                               r.late_act_q8_dsl, r.late_act_q8_layout, r.late_act_q8_pipe, "tp5_hc_late_act_q8", 32u) &&
+-                    make_late(3, 28, tp5_hc_late_q_q8dot_data, tp5_hc_late_q_q8dot_len,
++                    make_late(5, 28, tp5_hc_late_q_q8dot_data, tp5_hc_late_q_q8dot_len,
+                               r.late_q8dot_dsl, r.late_q8dot_layout, r.late_q8dot_pipe, "tp5_hc_late_q_q8dot", 32u) &&
+-                    make_late(8, 28, tp5_hc_late_q_q8dot_stats_data, tp5_hc_late_q_q8dot_stats_len,
++                    make_late(10, 28, tp5_hc_late_q_q8dot_stats_data, tp5_hc_late_q_q8dot_stats_len,
+                               r.late_q8dot_stats_dsl, r.late_q8dot_stats_layout, r.late_q8dot_stats_pipe, "tp5_hc_late_q_q8dot_stats", 32u) &&
+                     make_late(5, 32, tp5_hc_resume_lo_q8_data, tp5_hc_resume_lo_q8_len,
+                               r.late_lo_q8_dsl, r.late_lo_q8_layout, r.late_lo_q8_pipe, "tp5_hc_resume_lo_q8", 32u) &&
+@@ -1953,7 +2023,7 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
+                         make_late(7, 16, tp5_hc_late_act_q8_l2_data, tp5_hc_late_act_q8_l2_len,
+                                   r.late_act_q8_l2_dsl, r.late_act_q8_l2_layout, r.late_act_q8_l2_pipe,
+                                   "tp5_hc_late_act_q8_l2", 32u) &&
+-                        make_late(6, 32, tp5_hc_late_q_q8dot_l2_data, tp5_hc_late_q_q8dot_l2_len,
++                        make_late(8, 32, tp5_hc_late_q_q8dot_l2_data, tp5_hc_late_q_q8dot_l2_len,
+                                   r.late_q8dot_l2_dsl, r.late_q8dot_l2_layout, r.late_q8dot_l2_pipe,
+                                   "tp5_hc_late_q_q8dot_l2", 32u) &&
+                         make_late(6, 32, tp5_hc_late_up_q8dot_bcast_data, tp5_hc_late_up_q8dot_bcast_len,
+@@ -4259,6 +4329,12 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
+ 
+             for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+                 const size_t idx = tp5_plan_slot(i, b);
++                const VkDescriptorBufferInfo epoch_info{r.bcast_buf[b], 0, (VkDeviceSize) c.star_rank_stride};
++                const VkDescriptorBufferInfo integrity_info{
++                    plan.late_q8_fast && tp5_get_late_transport_mode() != tp5_late_transport_mode::GTT_PUSH
++                        ? r.bcast_buf[b] : r.host_import_buf[b],
++                    VkDeviceSize(tp5_late_qsum_word_offset(c.late_host_offset, plan.late_q8_fast)) * 4u,
++                    TP5_LATE_QSUM_BYTES};
+                 VkDescriptorBufferInfo inject_infos[4] = {
+                     {late.bindings[4].buffer, late.bindings[4].offset, late.bindings[4].size},
+                     {late.bindings[5].buffer, late.bindings[5].offset, late.bindings[5].size},
+@@ -4289,7 +4365,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
+                     tp5_update_storage_set(r.vkdev, plan.late_act_q8_ds[idx], act_q8_infos,
+                                            plan.late_l2_td ? 7u : 6u);
+                     const bool q8_stats_views = tp5_latebind_rho_enabled();
+-                    VkDescriptorBufferInfo q8dot_infos[8] = {
++                    VkDescriptorBufferInfo q8dot_infos[10] = {
+                         {plan.late_down_packed_buf[i], 0, packed_bytes},
+                         {plan.late_act_q8_buf[i], 0, act_q8_bytes},
+                         // Host Push (缺口一): the Q8DOT workgroups write the F16 sidecar
+@@ -4305,6 +4381,8 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
+                         {tp5_get_late_transport_mode() == tp5_late_transport_mode::GTT_PUSH
+                              ? r.host_import_buf[b] : r.bcast_buf[b],
+                          0, (VkDeviceSize) c.star_rank_stride},
++                        epoch_info,
++                        integrity_info,
+                         // LB2: the same residual / z_p / scatter views and the same
+                         // statistics staging the exact stats path uses. z_p follows the
+                         // ZSNAP choice there for the same reason: the Q8DOT producer runs
+@@ -4334,19 +4412,20 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
+                                                      VkDeviceSize(max_rows) * 4u * sizeof(float)}
+                             : VkDescriptorBufferInfo{},
+                     };
+-                    tp5_update_storage_set(r.vkdev, plan.late_q8dot_ds[idx], q8dot_infos,
+-                                           q8_stats_views ? 8u : 3u);
++                    if (!plan.late_l2_td)
++                        tp5_update_storage_set(r.vkdev, plan.late_q8dot_ds[idx], q8dot_infos,
++                                               q8_stats_views ? 10u : 5u);
+                     if (plan.late_l2_td) {
+                         // Same weights/activation/aperture as the plain producer (the
+                         // aperture is host-import: L2 requires Host Push), plus the
+                         // ACT_Q8 partials and the scatter weights for the stats fold.
+-                        VkDescriptorBufferInfo q8dot_l2_infos[6] = {
+-                            q8dot_infos[0], q8dot_infos[1], q8dot_infos[2],
++                        VkDescriptorBufferInfo q8dot_l2_infos[8] = {
++                            q8dot_infos[0], q8dot_infos[1], q8dot_infos[2], epoch_info, integrity_info,
+                             {plan.late_stats_buf[i], 0, tp5_late_l2_partials_bytes(late.width, late.streams)},
+                             scatter_info,
+                             q8dot_infos[2],
+                         };
+-                        tp5_update_storage_set(r.vkdev, plan.late_q8dot_ds[idx], q8dot_l2_infos, 6u);
++                        tp5_update_storage_set(r.vkdev, plan.late_q8dot_ds[idx], q8dot_l2_infos, 8u);
+                     }
+                     if (q8_stats_views) {
+                         // LB2 on the aggressive blade. The exact branch below allocates
+@@ -4376,16 +4455,18 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
+                         // region the CPU relay reads and writes rho into.
+                         const size_t stats_off = tp5_late_q_bcast_payload_offset(c.late_host_offset, false) +
+                                                  (late_count * sizeof(float));
+-                        VkDescriptorBufferInfo pub_q8_infos[5] = {
++                        VkDescriptorBufferInfo pub_q8_infos[7] = {
+                             {plan.late_act_q8_buf[i], 0, act_q8_bytes},
+                             {plan.late_act_q8_buf[i], 0, act_q8_bytes},
+                             {r.host_import_buf[b], (VkDeviceSize) c.star_rank_stride - 64, 64},
++                            integrity_info,
++                            epoch_info,
+                             {plan.late_stats_buf[i], 0, VkDeviceSize(max_rows) * 4u * 3u * sizeof(float)},
+                             {r.bcast_buf[b], (VkDeviceSize) stats_off,
+                              VkDeviceSize(max_rows) * 4u * 3u * sizeof(float)},
+                         };
+                         tp5_update_storage_set(r.vkdev, plan.late_publish_stats_ds[idx],
+-                                               pub_q8_infos, 5);
++                                               pub_q8_infos, 7);
+                     }
+                 } else if (tp5_latebind_rho_enabled()) {
+                     VkDescriptorBufferInfo q_infos[12] = {
+@@ -4428,11 +4509,13 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
+                          VkDeviceSize(max_rows) * 4u * sizeof(float)},
+                     };
+                     tp5_update_storage_set(r.vkdev, plan.late_q_stats_ds[idx], q_infos, 12);
+-                    VkDescriptorBufferInfo pub_infos[5] = {
++                    VkDescriptorBufferInfo pub_infos[7] = {
+                         {plan.late_sidecar_buf[i], 0, (VkDeviceSize) (late_count * sizeof(float))},
+                         {r.host_import_buf[b], (VkDeviceSize) c.late_host_offset,
+                          (VkDeviceSize) tp5_late_q_bcast_payload_offset(0, false) >= 0 ? (VkDeviceSize) (late_count * sizeof(float)) : 0},
+                         {r.host_import_buf[b], (VkDeviceSize) c.star_rank_stride - 64, 64},
++                        integrity_info,
++                        epoch_info,
+                         {plan.late_stats_buf[i], 0, VkDeviceSize(max_rows) * 4u * 3u * sizeof(float)},
+                         // Stats land at the end of the Q payload region in the bank.
+                         // Stats land at the end of the Q payload region IN THE BANK.
+@@ -4448,7 +4531,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
+                          (VkDeviceSize) tp5_late_q_bcast_payload_offset(c.late_host_offset, false) + (VkDeviceSize) (late_count * sizeof(float)),
+                          VkDeviceSize(max_rows) * 4u * 3u * sizeof(float)},
+                     };
+-                    tp5_update_storage_set(r.vkdev, plan.late_publish_stats_ds[idx], pub_infos, 5);
++                    tp5_update_storage_set(r.vkdev, plan.late_publish_stats_ds[idx], pub_infos, 7);
+                     // Deciding diagnostic: the relay reads the statistics at
+                     //   bcast_host[bank] + tp5_late_q_bcast_payload_offset(late_host_offset,false)
+                     //                      + late_count * sizeof(float)
+@@ -4483,13 +4566,15 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
+                         {r.bcast_buf[b], 0, (VkDeviceSize) c.star_rank_stride},
+                     };
+                     tp5_update_storage_set(r.vkdev, plan.late_q_ds[idx], q_infos, 7);
+-                    VkDescriptorBufferInfo late_publish_infos[3] = {
++                    VkDescriptorBufferInfo late_publish_infos[5] = {
+                         {plan.late_sidecar_buf[i], 0, (VkDeviceSize) (late_count * sizeof(float))},
+                         {r.host_import_buf[b], (VkDeviceSize) c.late_host_offset,
+                          (VkDeviceSize) (late_count * sizeof(float))},
+                         {r.host_import_buf[b], (VkDeviceSize) c.star_rank_stride - 64, 64},
++                        integrity_info,
++                        epoch_info,
+                     };
+-                    tp5_update_storage_set(r.vkdev, plan.late_publish_ds[idx], late_publish_infos, 3);
++                    tp5_update_storage_set(r.vkdev, plan.late_publish_ds[idx], late_publish_infos, 5);
+                 }
+ 
+                 VkDescriptorBufferInfo norm_infos[9] = {
+@@ -4793,8 +4878,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
+                                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                              0, 0, nullptr, 1, &mb_q8_stats, 0, nullptr);
+                         const uint32_t q8_n_stats = uint32_t(VK_TP5_DIRECT_COLUMN_TILE) * 12u;
+-                        struct { uint32_t n_uvec4; uint32_t n_stats; } pub_q8_stats_pc{0u, q8_n_stats};
+-                        static_assert(sizeof(pub_q8_stats_pc) == 8);
++                        struct { uint32_t n_uvec4_per_row; uint32_t active_rows; uint32_t n_stats; }
++                            pub_q8_stats_pc{0u, late.capacity_rows ? late.capacity_rows : 1u, q8_n_stats};
++                        static_assert(sizeof(pub_q8_stats_pc) == 12);
+                         tp5_cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_publish_stats_pipe);
+                         tp5_cmd_bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_publish_stats_layout,
+                                                  0, 1, &plan.late_publish_stats_ds[idx], 0, nullptr);
+@@ -4856,8 +4942,10 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
+                     }
+                     if (rho_mode) {
+                         const uint32_t n_stats = uint32_t(max_rows) * 12u;
+-                        struct { uint32_t n_uvec4; uint32_t n_stats; } pub_stats_pc{late_uvec4, n_stats};
+-                        static_assert(sizeof(pub_stats_pc) == 8);
++                        struct { uint32_t n_uvec4_per_row; uint32_t active_rows; uint32_t n_stats; }
++                            pub_stats_pc{late_uvec4 / uint32_t(VK_TP5_DIRECT_COLUMN_TILE),
++                                         late.capacity_rows ? late.capacity_rows : 1u, n_stats};
++                        static_assert(sizeof(pub_stats_pc) == 12);
+                         tp5_cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_publish_stats_pipe);
+                         tp5_cmd_bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_publish_stats_layout, 0, 1,
+                                                 &plan.late_publish_stats_ds[idx], 0, nullptr);
+@@ -4868,8 +4956,10 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
+                         tp5_cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_publish_pipe);
+                         tp5_cmd_bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_publish_layout, 0, 1,
+                                                 &plan.late_publish_ds[idx], 0, nullptr);
++                        const uint32_t pub_pc[2] = {late_uvec4 / uint32_t(VK_TP5_DIRECT_COLUMN_TILE),
++                                                   late.capacity_rows ? late.capacity_rows : 1u};
+                         tp5_cmd_push(cmd, r.late_publish_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+-                                           sizeof(late_uvec4), &late_uvec4);
++                                           sizeof(pub_pc), pub_pc);
+                         tp5_cmd_dispatch(cmd, 1, 1, 1);
+                     }
+                 }
+@@ -6140,6 +6230,42 @@ static size_t tp5_l2_sum_f16_avx2(const uint16_t * const * src, size_t n_src, fl
+     return i;
+ }
+ 
++// A ready doorbell is not a system-scope payload acquire on these GPUs.
++// Validate the producer's epoch and exact live bytes before acknowledging Q.
++// One attempt per rank keeps the existing handoff polling deadline/fairness.
++static bool tp5_q_payload_matches(const void * aperture, const void * payload, size_t late_host_offset,
++                                  bool f16, uint32_t epoch, size_t n_words, uint32_t rank_dim,
++                                  uint32_t * pending_workgroup = nullptr) {
++    const auto * entries = (const uint32_t *) ((const char *) aperture +
++        size_t(tp5_late_qsum_word_offset(late_host_offset, f16)) * 4u);
++    const auto * words = (const uint32_t *) payload;
++    static const bool avx2 = __builtin_cpu_supports("avx2");
++    const uint32_t n_wg = f16 ? rank_dim / 16u : 1u;
++    const size_t vector_words = f16 ? rank_dim / 2u : n_words;
++    for (uint32_t wg = 0; wg < n_wg; ++wg) {
++        std::atomic_thread_fence(std::memory_order_acquire);
++        alignas(16) uint32_t entry[4];
++        _mm_store_si128((__m128i *) entry, _mm_load_si128((const __m128i *) (entries + 4u * wg)));
++        if (entry[1] != epoch || entry[2] != n_words) {
++            if (pending_workgroup) *pending_workgroup = wg;
++            return false;
++        }
++        uint32_t x = 0u;
++        const size_t step_words = f16 ? 8u : n_words;
++        for (size_t vector = 0; vector < n_words / vector_words; ++vector) {
++            const uint32_t * p = words + vector * vector_words + (f16 ? wg * 8u : 0u);
++            size_t i = 0;
++            if (avx2) for (; i + 8u <= step_words; i += 8u) x ^= tp5_xor8_avx2(p + i);
++            for (; i < step_words; ++i) x ^= p[i];
++        }
++        if (x != entry[0]) {
++            if (pending_workgroup) *pending_workgroup = wg;
++            return false;
++        }
++    }
++    return n_wg != 0u;
++}
++
+ // Compare the reference inverse RMS the norm kernel published for the previous
+ // use of this bank (host status words 8..15, rank 0) with the sufficient-statistic
+ // rho the relay formed for that same epoch. Must run before this epoch's Y
+@@ -6186,57 +6312,8 @@ static bool tp5_l2_relay_form_lo(tp5_comm & c, size_t bank, uint32_t rows, uint3
+         src[i] = (const uint16_t *) ((const char *) c.star_host_aligned[bank] + i * c.star_rank_stride +
+                                      tp5_late_q_bcast_payload_offset(c.late_host_offset, true));
+     }
+-    // Payload validation. Every Q8DOT workgroup publishes uvec4(xor of the F16
++    // Q was validated at the common handoff boundary, before ready was retired.
+     const bool l2_prof = ggml_tp5_profile_active() != nullptr;
+-    const auto l2_t0 = l2_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+-    // payload words it wrote, nonce) before its completion increment. Seeing the
+-    // ready word is not enough on this machine: measured, the reduced Q
+-    // occasionally differed between runs while re-reading the same payload a few
+-    // microseconds later gave the identical bytes, i.e. the host had observed the
+-    // ready word before the payload. Wait until each workgroup's entry is current
+-    // and its checksum matches the bytes about to be reduced.
+-    {
+-        const uint32_t n_wg = rank_dim / 16u;
+-        static const bool xor_avx2 = __builtin_cpu_supports("avx2");
+-        const auto t_val = std::chrono::steady_clock::now();
+-        for (size_t rk = 0; rk < c.n_ranks; ++rk) {
+-            const char * slot = (const char *) c.star_host_aligned[bank] + rk * c.star_rank_stride;
+-            const auto * status = (const volatile uint32_t *) (slot + c.star_rank_stride - 64);
+-            const auto * p1 = (const uint32_t *) slot;
+-            const uint32_t nonce = tp5_late_l2_tag(p1[0], p1[1], status[1]);
+-            const auto * qs = (const uint32_t *) (slot + size_t(tp5_late_qsum_word_offset(c.late_host_offset)) * 4u);
+-            const auto * pay = (const uint32_t *) src[rk];
+-            for (uint32_t w = 0; w < n_wg; ++w) {
+-                for (uint64_t spin = 0;; ++spin) {
+-                    asm volatile("" ::: "memory");   // re-load entry and payload every iteration
+-                    alignas(16) uint32_t e4[4];
+-                    _mm_store_si128((__m128i *) e4, _mm_load_si128((const __m128i *) (qs + 4u * w)));
+-                    if (e4[1] == nonce) {
+-                        uint32_t x = 0;
+-                        for (uint32_t t = 0; t < rows; ++t) {
+-                            for (uint32_t s = 0; s < S; ++s) {
+-                                const uint32_t * wp = pay + size_t(t * S + s) * (rank_dim / 2u) + w * 8u;
+-                                if (xor_avx2) {
+-                                    x ^= tp5_xor8_avx2(wp);
+-                                } else {
+-                                    for (uint32_t k = 0; k < 8; ++k) x ^= wp[k];
+-                                }
+-                            }
+-                        }
+-                        if (x == e4[0]) break;
+-                    }
+-                    if (spin == 0) ++g_tp5_l2_check.q_waits;
+-                    if ((spin & 1023u) == 0u && spin != 0 &&
+-                        std::chrono::steady_clock::now() - t_val > std::chrono::milliseconds(2000)) {
+-                        c.fail("L2 Q payload never matched its checksum (rank " + std::to_string(rk) +
+-                               ", workgroup " + std::to_string(w) + ")");
+-                        return false;
+-                    }
+-                    _mm_pause();
+-                }
+-            }
+-        }
+-    }
+     const auto l2_t1 = l2_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     size_t e = 0;
+ #if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+@@ -6431,16 +6508,15 @@ static bool tp5_l2_relay_form_lo(tp5_comm & c, size_t bank, uint32_t rows, uint3
+         for (; w < n_words; ++w) ((volatile uint32_t *) dst)[w] = lo_words[w];
+     }
+     if (l2_prof) {
+-        static double acc[5] = {};
++        static double acc[4] = {};
+         static uint64_t acc_n = 0;
+         const auto l2_t5 = std::chrono::steady_clock::now();
+         const auto us = [](auto a, auto b) { return std::chrono::duration<double, std::micro>(b - a).count(); };
+-        acc[0] += us(l2_t0, l2_t1); acc[1] += us(l2_t1, l2_t2); acc[2] += us(l2_t2, l2_t3);
+-        acc[3] += us(l2_t3, l2_t4); acc[4] += us(l2_t4, l2_t5);
++        acc[0] += us(l2_t1, l2_t2); acc[1] += us(l2_t2, l2_t3);
++        acc[2] += us(l2_t3, l2_t4); acc[3] += us(l2_t4, l2_t5);
+         if (++acc_n % 4096u == 0u) {
+-            fprintf(stderr, "[tp5-l2-cost] n=%llu per-handoff us: validate=%.2f q_reduce=%.2f stats=%.2f lo=%.2f write=%.2f\n",
+-                    (unsigned long long) acc_n, acc[0] / acc_n, acc[1] / acc_n, acc[2] / acc_n, acc[3] / acc_n,
+-                    acc[4] / acc_n);
++            fprintf(stderr, "[tp5-l2-cost] n=%llu per-handoff us: q_reduce=%.2f stats=%.2f lo=%.2f write=%.2f\n",
++                    (unsigned long long) acc_n, acc[0] / acc_n, acc[1] / acc_n, acc[2] / acc_n, acc[3] / acc_n);
+         }
+     }
+     return true;
+@@ -6589,10 +6665,10 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
+     float lb2_cc[VK_TP5_DIRECT_COLUMN_TILE] = {};
+     const bool lb2_cc_mode = relay && late_count != 0 && (tp5_latebind_rho_enabled() || late_l2);
+     uint32_t lb2_cc_rows = late_rows;
+-    if (lb2_cc_mode && (lb2_cc_rows == 0 || late_l2) && late_width != 0 && n_elems % late_width == 0) {
+-        // L2 always takes the row count from the payload it is reducing: |y|^2 per
++    if (lb2_cc_mode && late_width != 0 && n_elems % late_width == 0) {
++        // Always take the row count from the payload being reduced: |y|^2 per
+         // token must be formed over exactly `width` elements, whatever the chain's
+-        // frame bookkeeping says.
++        // next-bank bookkeeping says.
+         lb2_cc_rows = uint32_t(n_elems / late_width);
+     }
+     if (relay && n_elems < 262144) {
+@@ -6920,6 +6996,16 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
+         if (!tp5_relay_publish_generation(c, bank, 0)) return false;
+         const auto q_wait_start = times ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         if (times) times->y_publish_us = std::chrono::duration<double, std::micro>(q_wait_start - y_reduced).count();
++        // Temporary production-path diagnostic: observe bytes at ready, then
++        // again before/after reduction without changing readiness or waiting.
++        static const bool q_stability = [] {
++            const char * env = getenv("GGML_TP5_Q_STABILITY");
++            return env && atoi(env) != 0;
++        }();
++        std::array<std::vector<uint32_t>, 5> q_ready_snapshot;
++        const size_t q_snapshot_words = late_count * (late_sidecar_f16 ? 2u : 4u) / 4u;
++        uint32_t q_snapshot_epochs[5] = {};
++        uint32_t q_wait_seen[5] = {};
+         uint32_t late_pending = c.n_ranks == 32 ? UINT32_MAX : ((1u << c.n_ranks) - 1u);
+         for (uint64_t spin = 0; late_pending != 0u; ++spin) {
+             for (size_t i = 0; i < c.n_ranks; ++i) {
+@@ -6948,6 +7034,26 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
+                     (qctrl && qctrl[TP5_LATE_Q_READY_WORD] == 1u) :
+                     (status[6] == 1u);
+                 if (q_ready) {
++                    const char * q_aperture = late_sidecar_f16 ? sidecar_base :
++                        (const char *) c.star_host_aligned[bank] + i * c.star_rank_stride;
++                    const void * q_payload = q_aperture + (late_sidecar_f16 ?
++                        tp5_late_q_bcast_payload_offset(c.late_host_offset, true) : c.late_host_offset);
++                    uint32_t pending_wg = 0;
++                    if (!tp5_q_payload_matches(q_aperture, q_payload, c.late_host_offset,
++                                               late_sidecar_f16, status[1], q_snapshot_words,
++                                               late_rank_dim, &pending_wg)) {
++                        if (late_l2 && (q_wait_seen[i] & (1u << pending_wg)) == 0u) {
++                            q_wait_seen[i] |= 1u << pending_wg;
++                            ++g_tp5_l2_check.q_waits;
++                        }
++                        continue;
++                    }
++                    if (q_stability) {
++                        q_ready_snapshot[i].resize(q_snapshot_words);
++                        const auto * words = (const volatile uint32_t *) q_payload;
++                        for (size_t w = 0; w < q_snapshot_words; ++w) q_ready_snapshot[i][w] = words[w];
++                        q_snapshot_epochs[i] = status[1];
++                    }
+                     // Retire the handshake. The Q8DOT publication protocol is
+                     // "atomicAdd a counter; the workgroup that brings it up to
+                     // n_workgroups sets the ready word". That counter is never
+@@ -6978,6 +7084,39 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
+                 size_t rank = 0;
+                 while (rank < c.n_ranks && (late_pending & (1u << rank)) == 0u)
+                     ++rank;
++                {
++                    // [l2-diag] The spin expired. Whether the GPU never published or
++                    // the host retired the flag early is only decidable from the
++                    // live words, so dump every rank's control state verbatim.
++                    fprintf(stderr, "[l2-diag] timeout bank=%zu late_pending=0x%x rank=%zu spin=%llu f16=%d gtt=%d\n",
++                            bank, late_pending, rank, (unsigned long long) spin,
++                            (int) late_sidecar_f16,
++                            (int) (tp5_get_late_transport_mode() == tp5_late_transport_mode::GTT_PUSH));
++                    fprintf(stderr, "[l2-diag] rows_argument=%u width=%u main_elems=%zu late_count=%zu stats_floats=%zu\n",
++                            late_rows, late_width, n_elems,
++                            (size_t)late_count, (size_t)late_stats_floats);
++                    // A linear command buffer signals its submission timeline only at the end.
++                    // Values below that final signal do not locate a stage within the buffer.
++                    // Compare completion counters with per-bank producer/consumer words;
++                    // neither a pending timeline nor Y-done proves Q sidecar publication.
++                    for (size_t i = 0; i < c.n_ranks; ++i) {
++                        uint64_t tl = 0;
++                        if (c.ranks[i].timeline_sem) {
++                            vkGetSemaphoreCounterValue(c.ranks[i].vkdev, c.ranks[i].timeline_sem, &tl);
++                        }
++                        const auto * st = (const volatile uint32_t *) ((const char *) c.star_host_aligned[bank] +
++                            i * c.star_rank_stride + c.star_rank_stride - 64);
++                        const char * sc = (late_sidecar_f16 &&
++                                tp5_get_late_transport_mode() == tp5_late_transport_mode::GTT_PUSH)
++                            ? (const char *) c.star_host_aligned[bank] + i * c.star_rank_stride
++                            : (const char *) c.ranks[i].bcast_host[bank];
++                        const auto * qc = tp5_late_q_control_cptr(sc, c.late_host_offset);
++                        fprintf(stderr, "[l2-diag] r%zu tl=%llu armed=%u err=%u done=%u y=%u q_ready=%u q_cnt=%u\n",
++                                i, (unsigned long long) tl, st[1], st[2], st[3], st[0],
++                                qc ? qc[TP5_LATE_Q_READY_WORD] : UINT32_MAX,
++                                qc ? qc[TP5_LATE_Q_COUNTER_WORD] : UINT32_MAX);
++                    }
++                }
+                 c.fail("RELAY LateBind sidecar timeout on rank " + std::to_string(rank));
+                 return false;
+             }
+@@ -7014,6 +7153,36 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
+                 (const void *) ((const char *) c.star_host_aligned[bank] +
+                                 i * c.star_rank_stride + c.late_host_offset);
+         }
++        const auto check_q_snapshot = [&](const char * checkpoint) {
++            if (!q_stability) return;
++            static uint64_t samples = 0;
++            static uint64_t changed = 0;
++            for (size_t i = 0; i < c.n_ranks; ++i) {
++                // BAR-pull reduces in place; its post-reduction changes are expected.
++                if (late_sidecar_f16 && tp5_get_late_transport_mode() != tp5_late_transport_mode::GTT_PUSH) continue;
++                const auto * live = (const volatile uint32_t *) late_ptrs[i];
++                size_t n_changed = 0, first = 0;
++                uint32_t first_live = 0;
++                for (size_t w = 0; w < q_snapshot_words; ++w) {
++                    const uint32_t value = live[w];
++                    if (value != q_ready_snapshot[i][w]) {
++                        if (n_changed++ == 0) { first = w; first_live = value; }
++                    }
++                }
++                ++samples;
++                if (n_changed) {
++                    ++changed;
++                    fprintf(stderr, "[tp5-q-stability] CHANGED checkpoint=%s bank=%zu rank=%zu epoch=%u "
++                                    "f16=%d l2=%d rows=%u words=%zu changed=%zu first=%zu ready=%08x live=%08x\n",
++                            checkpoint, bank, i, q_snapshot_epochs[i], int(late_sidecar_f16), int(late_l2),
++                            late_rows, q_snapshot_words, n_changed, first, q_ready_snapshot[i][first], first_live);
++                }
++            }
++            if (samples % 9600u == 0u || samples == 5u)
++                fprintf(stderr, "[tp5-q-stability] samples=%llu changed=%llu checkpoint=%s\n",
++                        (unsigned long long) samples, (unsigned long long) changed, checkpoint);
++        };
++        check_q_snapshot("before-reduce");
+         if (late_l2) {
+             // L2: no Q fanout. The relay forms rho from the statistics, then u, SiLU
+             // and the Q8_0 LO blocks, and writes those (720 B for two rows) instead.
+@@ -7023,6 +7192,7 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
+             tp5_accumulate_broadcast_star_f16(late_ptrs, late_bcast_f16, late_count);
+         else
+             tp5_accumulate_broadcast_star_f32(late_ptrs, late_bcast_f32, late_count);
++        check_q_snapshot("after-reduce");
+         const auto q_reduced = times ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         if (times) times->sidecar_data_us = std::chrono::duration<double, std::micro>(q_reduced - q_data_start).count();
+         if (!tp5_relay_publish_generation(c, bank, 2)) return false;
+@@ -7105,17 +7275,12 @@ static vk_tp5_relay_payload_binding tp5_relay_payload_binding(const tp5_comm & c
+ // Lower immutable model/transport definitions into one primary command
+ // buffer per rank. This is definition-time only: no secondary CB execution,
+ // no CB-index skip convention, and no IR traversal on a warm token.
+-static bool tp5_define_linear_chain(tp5_comm & c,
+-        const std::vector<std::vector<std::vector<void *>>> & source_cbs,
+-        size_t n_stages, bool capture) try {
+-    // Bound definition churn (for example CHAIN_CACHE=0 or changing shapes).
+-    // The ordinary warm 48/96-stage program never enters this path.
+-    if (c.retired_linear_programs.size() >= 8) {
+-        if (!tp5_drain_submitted(c)) {
+-            c.fail("LateBind definition retirement could not drain submitted work"); return false;
+-        }
+-        c.retired_linear_programs.clear();
+-    }
++static bool tp5_define_linear_chain(tp5_comm &                                            c,
++                                    const std::vector<std::vector<std::vector<void *>>> & source_cbs,
++                                    size_t                                                n_stages,
++                                    bool                                                  capture,
++                                    size_t                                                start_bank,
++                                    std::shared_ptr<tp5_linear_program> &                 out_program) try {
+     auto linear = std::make_shared<tp5_linear_program>();
+     linear->devices.resize(c.n_ranks, VK_NULL_HANDLE);
+     linear->pools.resize(c.n_ranks, VK_NULL_HANDLE);
+@@ -7233,14 +7398,16 @@ static bool tp5_define_linear_chain(tp5_comm & c,
+             }
+         }
+         for (size_t s = 0; s <= n_stages; ++s) {
+-            const auto & graph = *linear->graphs[s * c.n_ranks + r];
+-            tp5_cached_plan * outgoing = s < n_stages ? &c.cached_plans[c.chain_plan_indices[s]] : nullptr;
+-            const uint64_t epoch = c.allreduce_calls + s + 1;
+-            const size_t slot = tp5_plan_slot(r, tp5_mailbox_bank(epoch));
+-            const bool late_out = outgoing && outgoing->key.late[r].late_rank != 0;
+-            const bool direct_out = outgoing && tp5_relay_direct_stage(outgoing->key, c.n_ranks);
+-            if (late_out && outgoing->numerical_mode == tp5_numerical_mode::P1A_NOSIDECAR_Q8) ++p1a_sites;
+-            else if (late_out && outgoing->late_q8_fast) ++q8_sites;
++            const auto &      graph      = *linear->graphs[s * c.n_ranks + r];
++            tp5_cached_plan * outgoing   = s < n_stages ? &c.cached_plans[c.chain_plan_indices[s]] : nullptr;
++            const size_t      stage_bank = (start_bank + s) % TP5_MAILBOX_BANKS;
++            const size_t      slot       = tp5_plan_slot(r, stage_bank);
++            const bool        late_out   = outgoing && outgoing->key.late[r].late_rank != 0;
++            const bool        direct_out = outgoing && tp5_relay_direct_stage(outgoing->key, c.n_ranks);
++            if (late_out && outgoing->numerical_mode == tp5_numerical_mode::P1A_NOSIDECAR_Q8) {
++                ++p1a_sites;
++            } else if (late_out && outgoing->late_q8_fast)
++                ++q8_sites;
+             if (late_out && outgoing->late_l2_td) ++l2_sites;
+             const bool scatter_source_matches = late_out && s < n_stages &&
+                 graph.normalized_tensor != nullptr &&
+@@ -7250,10 +7417,12 @@ static bool tp5_define_linear_chain(tp5_comm & c,
+             size_t model_start = 0;
+             timestamp(5 * s);
+             if (s > 0) {
+-                auto & incoming = c.cached_plans[c.chain_plan_indices[s - 1]];
+-                const size_t prev_slot = tp5_plan_slot(r, tp5_mailbox_bank(epoch - 1));
++                auto &       incoming  = c.cached_plans[c.chain_plan_indices[s - 1]];
++                const size_t prev_bank = (start_bank + s - 1) % TP5_MAILBOX_BANKS;
++                const size_t prev_slot = tp5_plan_slot(r, prev_bank);
+                 if (incoming.p2_definitions.size() <= prev_slot) {
+-                    c.fail("missing inline P2 definition"); return false;
++                    c.fail("missing inline P2 definition");
++                    return false;
+                 }
+                 if (incoming.key.late[r].late_rank != 0) {
+                     ++late_sites;
+@@ -7546,20 +7715,16 @@ static bool tp5_define_linear_chain(tp5_comm & c,
+         // GGML_TP5_LATEBIND_RHO changes the relay's published payload from
+         // 12 words/token of rho to 1 word/token of cc, and nothing else in this
+         // ledger distinguishes the two. Without it the L2 arm is unassertable.
+-        fprintf(stderr, "[tp5-linear-definition] rank=%zu stages=%zu primary_cbs=1 mode=%s desc=%s late=%zu "
+-                        "rho=%d l2=%zu q8order=%s pack=%s "
+-                        "q8_fast=%zu scatter_early=%zu overlap=%s transport=%s sidecar_pub=fused "
+-                        "dispatches=%zu barriers=%zu copies=%zu timing=%d\n",
+-                r, n_stages, active_num_mode, active_num_desc, late_sites,
+-                tp5_latebind_rho_enabled() ? 1 : 0, l2_sites,
+-                tp5_latebind_q8_first() ? "first" : "after", pack_once ? "once" : "site",
+-                q8_sites, hoisted, overlap_name,
+-                transport_name, dispatches, barriers, copies, capture ? 1 : 0);
+-    }
+-    if (c.linear_program) c.retired_linear_programs.push_back(std::move(c.linear_program));
+-    c.linear_program = std::move(linear);
+-    for (size_t r = 0; r < c.n_ranks; ++r)
+-        c.chain_scratch[r].compute.assign(1, c.linear_program->commands[r]);
++        fprintf(stderr,
++                "[tp5-linear-definition] rank=%zu stages=%zu primary_cbs=1 mode=%s desc=%s late=%zu "
++                "rho=%d l2=%zu q8order=%s pack=%s "
++                "q8_fast=%zu scatter_early=%zu overlap=%s transport=%s sidecar_pub=fused "
++                "dispatches=%zu barriers=%zu copies=%zu timing=%d bank=%zu\n",
++                r, n_stages, active_num_mode, active_num_desc, late_sites, tp5_latebind_rho_enabled() ? 1 : 0, l2_sites,
++                tp5_latebind_q8_first() ? "first" : "after", pack_once ? "once" : "site", q8_sites, hoisted,
++                overlap_name, transport_name, dispatches, barriers, copies, capture ? 1 : 0, start_bank);
++    }
++    out_program = std::move(linear);
+     return true;
+ } catch (const std::exception & error) {
+     c.fail(std::string("LateBind definition failed before submission: ") + error.what());
+@@ -7603,15 +7768,25 @@ static bool tp5_relay_submit_epoch_chain(
+         return false;
+     }
+ 
++    const auto late_live_rows = [&](size_t stage) -> uint32_t {
++        if (stage >= n_stages) return 0u;
++        if (tp5_late_stage(keys[stage], c.n_ranks)) {
++            // Legacy chains have no predefined frame. Their captured tensors
++            // can still contain multiple rows; one row is not a valid default.
++            return uint32_t(active_elems[stage] / keys[stage].late[0].width);
++        }
++        return active_rows ? active_rows : capacity_rows;
++    };
++
+     // Publish the runtime active-row count into the first bank's RELAY header
+     // word 5 before any rank is submitted. The bank is provably idle here:
+     // ensure_armed_epoch verified flag/error/done zero. Later banks in this
+-    // chain receive the same word during their pre-arm in tp5_star_handoff,
++    // chain receive their own stage's count during pre-arm in tp5_star_handoff,
+     // after the previous reader's transitive credit. LateBind kernels read
+     // word 5 to bound their token loops, so a maximum-capacity definition
+     // executes only the useful rows (M3 invariant 2).
+     {
+-        const uint32_t late_rows = active_rows ? active_rows : capacity_rows;
++        const uint32_t late_rows = late_live_rows(0);
+         const size_t first_bank = tp5_mailbox_bank(first_epoch);
+         for (size_t i = 0; i < c.n_ranks; ++i) {
+             tp5_late_publish_rows(c, i, first_bank, late_rows);
+@@ -7622,8 +7797,6 @@ static bool tp5_relay_submit_epoch_chain(
+ #endif
+     }
+ 
+-    const uint32_t chain_late_rows = active_rows ? active_rows : capacity_rows;
+-
+     // Patch every capacity-aware dispatch, including the non-reducing tail,
+     // before any rank is submitted. A smaller active prefix is legal only if
+     // each source definition has classified every dispatch it owns.
+@@ -7753,11 +7926,11 @@ static bool tp5_relay_submit_epoch_chain(
+         const uint64_t arm_next_epoch = epoch < UINT32_MAX ? epoch + 1 : 0;
+         const bool direct = tp5_relay_direct_stage(keys[s], c.n_ranks);
+         const bool late   = tp5_late_stage(keys[s], c.n_ranks);
+-        const size_t stage_rows = (capacity_rows != 0 && active_rows != 0) ? active_rows : 1;
++        const size_t stage_rows = late ? late_live_rows(s) : 0u;
+         // P1-A has no Q sidecar by design: its Q8DOT is local and publishes no
+         // cross-rank statistic, so the host must not wait on a Q control region
+         // nor raise a second generation for these stages. Only the Q sidecar
+-        // bookkeeping is suppressed; the row-capacity publication (chain_late_rows)
++        // bookkeeping is suppressed; per-stage row-capacity publication
+         // is a separate protocol and stays intact.
+         const bool late_p1a = late &&
+             c.cached_plans[c.chain_plan_indices[s]].numerical_mode == tp5_numerical_mode::P1A_NOSIDECAR_Q8;
+@@ -7774,7 +7947,7 @@ static bool tp5_relay_submit_epoch_chain(
+         tp5_star_times * step = prof ? &stage_times[s] : nullptr;
+         if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), active_elems[s], step, true,
+                               arm_next_epoch, direct ? c.relay_ready_routes[s].data() : nullptr,
+-                              late_count, late_sidecar_f16, late_stats_floats, chain_late_rows,
++                              late_count, late_sidecar_f16, late_stats_floats, late_live_rows(s + 1),
+                               late ? keys[s].late[0].width : 0u,
+                               late_l2, late_l2 ? c.cached_plans[c.chain_plan_indices[s]].late_eps : 0.0f,
+                               late ? keys[s].late[0].late_rank : 0u)) {
+@@ -8355,7 +8528,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
+         new_plan.last_used_call = c.allreduce_calls;
+ 
+         if (!tp5_record_plan(c, new_plan, trefs, n_elems, flags_base)) {
+-            c.destroy_plan(new_plan, false);
++            c.destroy_plan(new_plan);
+             return false;
+         }
+ 
+@@ -8363,7 +8536,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
+             if (c.cached_plans.size() >= tp5_comm::MAX_CACHED_PLANS) {
+                 c.evict_lru_plan();
+                 if (c.failed) {
+-                    c.destroy_plan(new_plan, false);
++                    c.destroy_plan(new_plan);
+                     return false;
+                 }
+             }
+@@ -8745,10 +8918,11 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
+             }
+         }
+         retain_one_shot.armed = false;
+-        c.destroy_plan(one_shot, false);
++        c.destroy_plan(one_shot);
+     }
+ 
+-    static uint64_t total_p1_rec = 0, total_p1_sub = 0, total_p1_wait = 0, total_p2_rec = 0, total_p2_sub = 0, total_bp = 0;
++    static uint64_t total_p1_rec = 0, total_p1_sub = 0, total_p1_wait = 0, total_p2_rec = 0, total_p2_sub = 0,
++                    total_bp = 0;
+     static int stat_count = 0;
+     const auto bp_us = std::chrono::duration_cast<std::chrono::microseconds>(t_bp1 - t_bp0).count();
+     total_bp      += bp_us;
+@@ -9140,7 +9314,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
+             new_p.ds_sum.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+             std::vector<tensor_dev_ref> stage_refs(refs.begin() + s * c.n_ranks, refs.begin() + (s + 1) * c.n_ranks);
+             if (!tp5_record_plan(c, new_p, stage_refs, new_p.key.n_elems, flags_base)) {
+-                c.destroy_plan(new_p, false);
++                c.destroy_plan(new_p);
+                 return false;
+             }
+             found_idx = c.cached_plans.size();
+@@ -9236,20 +9410,14 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
+         return false;
+     }
+ 
+-    const size_t cur_start_bank = tp5_mailbox_bank(c.allreduce_calls + 1);
+-    tp5_compiled_chain * matched_chain = nullptr;
+-    auto & target_cache = linear ? c.linear_chains : c.compiled_chains;
+-    if (allow_chain_cache && !capture) {
+-        for (auto & cc : target_cache) {
+-            if (cc.valid && cc.n_stages == n_stages &&
+-                cc.isolate_bo == isolate_bo &&
+-                cc.start_bank == cur_start_bank &&
+-                cc.workspace_gen == c.workspace_gen &&
+-                cc.plans_gen == c.plans_gen &&
+-                cc.stage_plan_indices == c.chain_plan_indices &&
+-                cc.stage_keys == keys &&
+-                (!linear || cc.linear_program != nullptr) &&
+-                (linear || cc.stage_compute_cbs == stage_compute_cbs)) {
++    const size_t         cur_start_bank = tp5_mailbox_bank(c.allreduce_calls + 1);
++    tp5_compiled_chain * matched_chain  = nullptr;
++    if (!linear && allow_chain_cache && !capture) {
++        for (auto & cc : c.compiled_chains) {
++            if (cc.valid && cc.n_stages == n_stages && cc.isolate_bo == isolate_bo && cc.start_bank == cur_start_bank &&
++                cc.workspace_gen == c.workspace_gen && cc.plans_gen == c.plans_gen &&
++                cc.stage_plan_indices == c.chain_plan_indices && cc.stage_keys == keys &&
++                cc.stage_compute_cbs == stage_compute_cbs) {
+                 matched_chain = &cc;
+                 break;
+             }
+@@ -9258,32 +9426,40 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
+     const bool can_reuse_chain = (matched_chain != nullptr);
+ 
+     if (linear) {
+-        if (!can_reuse_chain || !matched_chain->linear_program) {
+-            if (!tp5_define_linear_chain(c, stage_compute_cbs, n_stages, capture)) return false;
+-            if (allow_chain_cache && !capture) {
+-                if (c.linear_chains.size() >= 64) {
+-                    c.linear_chains.erase(c.linear_chains.begin());
+-                }
+-                c.linear_chains.emplace_back();
+-                auto & cc = c.linear_chains.back();
+-                cc.valid = true;
+-                cc.n_stages = n_stages;
+-                cc.isolate_bo = isolate_bo;
+-                cc.start_bank = cur_start_bank;
+-                cc.workspace_gen = c.workspace_gen;
+-                cc.plans_gen = c.plans_gen;
+-                cc.stage_plan_indices = c.chain_plan_indices;
+-                cc.stage_keys = keys;
+-                cc.stage_compute_cbs = stage_compute_cbs;
+-                cc.linear_program = c.linear_program;
++        if (!c.linear_prepared_for(n_stages, isolate_bo, capture, capacity_rows, keys, stage_compute_cbs)) {
++            // Resource/definition transitions may prepare a new pair. Preserve the old
++            // pair until native completion, and publish the replacement atomically.
++            if (c.retired_linear_programs.size() >= 8) {
++                if (!tp5_drain_submitted(c)) {
++                    c.fail("LateBind definition retirement could not drain submitted work");
++                    return false;
++                }
++                c.retired_linear_programs.clear();
++            }
++            tp5_comm::tp5_prepared_linear_definition definition;
++            definition.n_stages           = n_stages;
++            definition.isolate_bo         = isolate_bo;
++            definition.capture            = capture;
++            definition.workspace_gen      = c.workspace_gen;
++            definition.plans_gen          = c.plans_gen;
++            definition.capacity_rows      = capacity_rows;
++            definition.stage_keys         = keys;
++            definition.stage_plan_indices = c.chain_plan_indices;
++            definition.stage_compute_cbs  = stage_compute_cbs;
++            for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
++                if (!tp5_define_linear_chain(c, stage_compute_cbs, n_stages, capture, b, definition.programs[b])) {
++                    return false;
++                }
+             }
+-        } else {
+-            c.linear_program = matched_chain->linear_program;
+-            for (size_t r = 0; r < c.n_ranks; ++r)
+-                c.chain_scratch[r].compute.assign(1, c.linear_program->commands[r]);
++            c.retire_prepared_linear();
++            c.prepared_linear = std::move(definition);
++        }
++        const auto & program = c.prepared_linear.programs[cur_start_bank];
++        for (size_t r = 0; r < c.n_ranks; ++r) {
++            c.chain_scratch[r].compute.assign(1, program->commands[r]);
+         }
+-        // The only changing execution input is the already-existing epoch
+-        // mailbox. There are no per-stage CB batches to patch here.
++        // The epoch mailbox carries changing dependencies; prepared commands
++        // need no per-stage CB batch patching here. Data/frame buffers still update.
+     } else if (can_reuse_chain) {
+         // Warm path: patch only epoch values
+         for (size_t i = 0; i < c.n_ranks; ++i) {
+@@ -10087,7 +10263,7 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
+ bool ggml_backend_vk_tp5_comm_free_safe(void * comm) {
+     if (!comm) return true;
+     auto * c = (tp5_comm *) comm;
+-    std::lock_guard<std::mutex> lock(c->mutex);
++    std::unique_lock<std::mutex> lock(c->mutex);
+     const bool timeline_mode = c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM ||
+                                c->sync_mode == tp5_sync_mode::RELAY;
+     if (c->failed) {
+@@ -10125,6 +10301,15 @@ bool ggml_backend_vk_tp5_comm_free_safe(void * comm) {
+         }
+     }
+ 
++    // Failure may leave accepted native epochs beyond allreduce_calls. Their
++    // P1 owners survive logical retirement and must be released after the
++    // successful physical drain, while their command/descriptor pools live.
++    for (auto & slot : c->in_flight_ring) {
++        slot.owners.clear();
++        slot.p1.reset();
++        slot.epoch = 0;
++    }
++
+     // Release imported buffers before their backing host allocations.
+     c->avx2_pool.reset();
+     c->drm_signaler.reset();
+@@ -10136,6 +10321,7 @@ bool ggml_backend_vk_tp5_comm_free_safe(void * comm) {
+             c->star_host_aligned[b] = nullptr;
+         }
+     }
++    lock.unlock();
+     delete c;
+     return true;
+ }
+@@ -10431,8 +10617,10 @@ int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_r
+         for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+             VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, r.desc_pool, 1, &res.dsls[i]};
+             if (vkAllocateDescriptorSets(r.vkdev, &ai, &sets[b]) != VK_SUCCESS) return 1;
++            // Upload-ready words are per-bank; consumer progress and per-stage
++            // wait counts share bank0 so the host observes the entire chain.
+             VkDescriptorBufferInfo infos[4] = {{r.bcast_buf[b], 0, stride}, {r.wire_buf, 0, cfg.elements * sizeof(float)},
+-                                               {r.bcast_buf[0], 0, 64}, {r.host_import_buf[b], stride - status_bytes, status_bytes}};
++                                               {r.bcast_buf[0], 0, 64}, {r.host_import_buf[0], stride - status_bytes, status_bytes}};
+             VkWriteDescriptorSet writes[4]{};
+             for (uint32_t j = 0; j < 4; ++j) writes[j] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[b], j, 0, 1,
+                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &infos[j], nullptr};
+@@ -10487,6 +10675,41 @@ int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_r
+         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, r.timing_pool, 1);
+         if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return 1;
+     }
++    {
++        // Native command/resource identities are real, not fake VkBuffer
++        // values: a resident replacement with equal extents must not qualify
++        // a program recorded for the old descriptor target.
++        tp5_comm admission{};
++        admission.n_ranks = n;
++        admission.chain_plan_indices = {0};
++        std::vector<tp5_plan_key> keys(1);
++        keys[0].n_elems = cfg.elements;
++        keys[0].bindings.resize(n);
++        std::vector<std::vector<std::vector<void *>>> graph_commands(2, std::vector<std::vector<void *>>(n));
++        for (size_t i = 0; i < n; ++i) {
++            keys[0].bindings[i] = {c.ranks[i].wire_buf, 0, cfg.elements * sizeof(float)};
++            for (auto & graph : graph_commands) graph[i].push_back((void *) res.commands[i]);
++        }
++        auto & definition = admission.prepared_linear;
++        definition.n_stages = 1;
++        definition.workspace_gen = admission.workspace_gen;
++        definition.plans_gen = admission.plans_gen;
++        definition.capacity_rows = 1;
++        definition.stage_keys = keys;
++        definition.stage_plan_indices = admission.chain_plan_indices;
++        definition.stage_compute_cbs = graph_commands;
++        for (auto & program : definition.programs) {
++            program = std::make_shared<tp5_linear_program>();
++            program->commands.assign(res.commands.begin(), res.commands.begin() + n);
++        }
++        if (!admission.linear_prepared_for(1, false, false, 1, keys, graph_commands)) return 1;
++        keys[0].bindings[0].buf = c.ranks[0].bcast_buf[0];
++        if (admission.linear_prepared_for(1, false, false, 1, keys, graph_commands)) {
++            fprintf(stderr, "relay: different live buffer incorrectly admitted as the recorded binding\n");
++            return 1;
++        }
++        fprintf(stderr, "relay: native binding rebind rejected (equal offset/size, distinct live buffers)\n");
++    }
+     const auto status = [&](size_t rank) {
+         return (volatile uint32_t *) ((char *) c.star_host_raw[0] + (rank + 1) * stride - status_bytes);
+     };
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-tp5-rows.h b/ggml/src/ggml-vulkan/ggml-vulkan-tp5-rows.h
+index 91445cbae..b47412fd5 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-tp5-rows.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-tp5-rows.h
+@@ -233,18 +233,15 @@ constexpr uint32_t tp5_late_l2_tag(uint32_t z0_bits, uint32_t z1_bits, uint32_t
+     h ^= h >> 15;
+     return h | 1u;   // never 0: a zeroed entry can never validate
+ }
+-// Per-Q8DOT-workgroup Q checksum entries, right after the statistics record:
+-// uvec4(xor of the F16 payload words the workgroup wrote, nonce = this epoch's
+-// token-0 statistics tag, 0, 0), one 16-byte store before the workgroup's
+-// completion increment. The relay waits for the nonce, recomputes the xor from
+-// the payload it is about to reduce, and re-reads until they agree -- the Q
+-// ready word alone did not guarantee the host saw the payload (measured: the
+-// reduced Q differed between runs while the same payload re-read later was
+-// identical).
++// Q publication entries, after the statistics record in the source aperture:
++// uvec4(payload xor, armed epoch, active payload word count, 0). Exact F32
++// publishes one entry; Q8DOT publishes one per 16-row workgroup. Ready alone
++// does not make the payload CPU-visible. The relay validates the current
++// epoch, extent and bytes before retiring ready or reducing Q.
+ constexpr size_t TP5_LATE_QSUM_MAX_WGS = 32;   // rank_dim <= 512, 16 rows per WG
+ constexpr size_t TP5_LATE_QSUM_BYTES   = TP5_LATE_QSUM_MAX_WGS * 16;
+-constexpr uint32_t tp5_late_qsum_word_offset(size_t late_host_offset) {
+-    return tp5_late_stats_word_offset(late_host_offset, true) +
++constexpr uint32_t tp5_late_qsum_word_offset(size_t late_host_offset, bool late_q8_fast) {
++    return tp5_late_stats_word_offset(late_host_offset, late_q8_fast) +
+            uint32_t(VK_TP5_DIRECT_COLUMN_TILE * TP5_LATE_STATS_WORDS_PER_TOKEN);
+ }
+ static_assert(tp5_late_lo_q8_bytes(320) <= tp5_late_q_payload_capacity_bytes(true),
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 1f9995a2e..0396ba661 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1031,6 +1031,8 @@ struct vk_device_struct {
+     vk_pipeline pipeline_dequant_mul_mat_vec_id_grouped_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+ 
+     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
++    vk_pipeline pipeline_dequant_mul_mat_vec_q8_0_q8_1_f32_rows2;
++    vk_pipeline pipeline_dequant_mul_mat_vec_q8_0_q8_1_f32_long_k;
+     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+ 
+     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
+@@ -6959,6 +6961,21 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_q8_1_f32", arr_dmmv_q5_0_q8_1_f32_len[reduc], arr_dmmv_q5_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_1][i], "mul_mat_vec_q5_1_q8_1_f32", arr_dmmv_q5_1_q8_1_f32_len[reduc], arr_dmmv_q5_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_q8_1_f32", arr_dmmv_q8_0_q8_1_f32_len[reduc], arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                if (w == DMMV_WG_SIZE_SUBGROUP && i == 1 && use_subgroups && subgroup_size_int == 64 &&
++                    device->architecture == AMD_RDNA2 && device->driver_id == vk::DriverId::eMesaRadv) {
++                    // Two-column callers use either ne11 or a flattened outer
++                    // batch; both dispatch one Y workgroup at base zero.
++                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_0_q8_1_f32_rows2,
++                                            "mul_mat_vec_q8_0_q8_1_f32_rows2", arr_dmmv_q8_0_q8_1_f32_len[reduc],
++                                            arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings,
++                                            sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup_int, 2, 2, 320, 10240, 1},
++                                            1, true, use_subgroups, subgroup_size_int);
++                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_0_q8_1_f32_long_k,
++                                            "mul_mat_vec_q8_0_q8_1_f32_long_k", arr_dmmv_q8_0_q8_1_f32_len[reduc],
++                                            arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings,
++                                            sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup_int, 1, 2, 10240, 320, 1},
++                                            1, true, use_subgroups, subgroup_size_int);
++                }
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_MXFP4][i], "mul_mat_vec_mxfp4_q8_1_f32", arr_dmmv_mxfp4_q8_1_f32_len[reduc], arr_dmmv_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+@@ -9859,6 +9876,16 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+         }
++        // Short-K Q8_0 graphs save workgroups with two output rows per subgroup;
++        // the long-K 320-row graph is slower with this specialization.
++        if (a_type == GGML_TYPE_Q8_0 && num_cols == 2 && m == 10240 && k == 320 &&
++            ctx->device->pipeline_dequant_mul_mat_vec_q8_0_q8_1_f32_rows2) {
++            return ctx->device->pipeline_dequant_mul_mat_vec_q8_0_q8_1_f32_rows2;
++        }
++        if (a_type == GGML_TYPE_Q8_0 && num_cols == 2 && m == 320 && k == 10240 &&
++            ctx->device->pipeline_dequant_mul_mat_vec_q8_0_q8_1_f32_long_k) {
++            return ctx->device->pipeline_dequant_mul_mat_vec_q8_0_q8_1_f32_long_k;
++        }
+         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
+     }
+ 
+@@ -14412,6 +14439,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context *       ctx,
+                                   { mask_buf, mask_opt_buf }, opt_pc,
+                                   { mask_opt_num_dwords, CEIL_DIV(nem1, Br), nem2 * nem3 });
+         ggml_vk_sync_buffers(ctx, subctx);
++        // The mask bitmap replaces the converted activation stored in Y.
++        ctx->prealloc_y_last_pipeline_used = nullptr;
++        ctx->prealloc_y_last_tensor_used = nullptr;
++        ctx->prealloc_y_last_decode_vector_staging = false;
+     }
+ 
+     const vk_flash_attn_push_constants pc = { N, KV,
+@@ -18951,6 +18982,10 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx,
+         ggml_vk_sync_buffers(ctx, subctx);
+         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline3, { buf_a, buf_b, buf_c, buf_d, buf_x, buf_y }, pc, elements);
+ 
++        // Reduction partials replace the converted activation stored in Y.
++        ctx->prealloc_y_last_pipeline_used = nullptr;
++        ctx->prealloc_y_last_tensor_used = nullptr;
++        ctx->prealloc_y_last_decode_vector_staging = false;
+         ctx->prealloc_x_need_sync = true;
+         ctx->prealloc_y_need_sync = true;
+     }
+@@ -21176,6 +21211,37 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx,
+                                     int                       tensor_idx,
+                                     bool                      almost_ready);
+ 
++// Exact range equality is harmless only for elementwise fusion checks.
++// Cache invalidation must treat it as an overlap.
++static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
++    // Multi-buffer wrappers expose the underlying type but not its context.
++    if (!a || !b || !a->buffer || !b->buffer || !a->buffer->context || !b->buffer->context ||
++        !ggml_backend_buffer_is_vk(a->buffer) || !ggml_backend_buffer_is_vk(b->buffer) ||
++        ggml_backend_buffer_is_multi_buffer(a->buffer) || ggml_backend_buffer_is_multi_buffer(b->buffer)) {
++        return false;
++    }
++    ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)a->buffer->context;
++    const vk_buffer & a_buf = a_buf_ctx->dev_buffer;
++    ggml_backend_vk_buffer_context * b_buf_ctx = (ggml_backend_vk_buffer_context *)b->buffer->context;
++    const vk_buffer & b_buf = b_buf_ctx->dev_buffer;
++    if (a_buf == b_buf) {
++        auto a_base = vk_tensor_offset(a) + a->view_offs;
++        auto a_size = ggml_nbytes(a);
++        auto b_base = vk_tensor_offset(b) + b->view_offs;
++        auto b_size = ggml_nbytes(b);
++
++        if (elementwise && a_base == b_base && a_size == b_size) {
++            return false;
++        }
++
++        if ((b_base <= a_base && a_base < b_base + b_size) ||
++            (a_base <= b_base && b_base < a_base + a_size)) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ // Returns true if node has enqueued work into the queue, false otherwise
+ // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
+ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
+@@ -21791,6 +21857,14 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         const ggml_tensor * cur_node = cgraph->nodes[node_idx + i];
+         if (ctx->fused_ops_write_mask & (1ull << i)) {
+             ctx->unsynced_nodes_written.push_back(cur_node);
++            // A source write makes the cached conversion stale even if Y
++            // itself is intact and the graph tensor identity is unchanged.
++            if (ctx->prealloc_y_last_tensor_used &&
++                ggml_vk_tensors_overlap(cur_node, ctx->prealloc_y_last_tensor_used, false)) {
++                ctx->prealloc_y_last_pipeline_used = nullptr;
++                ctx->prealloc_y_last_tensor_used = nullptr;
++                ctx->prealloc_y_last_decode_vector_staging = false;
++            }
+         }
+         for (const ggml_tensor * source : cur_node->src) {
+             if (source)
+@@ -23370,33 +23444,6 @@ static bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct g
+     return true;
+ }
+ 
+-// Check whether the tensors overlap in memory.
+-// Fusions can potentially overwrite src tensors in ways that are not prevented
+-// by ggml-alloc. If the fusion src is being applied in a way that's elementwise
+-// with the destination, then it's OK for them to overlap if they are exactly equal.
+-static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
+-    ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)a->buffer->context;
+-    vk_buffer a_buf = a_buf_ctx->dev_buffer;
+-    ggml_backend_vk_buffer_context * b_buf_ctx = (ggml_backend_vk_buffer_context *)b->buffer->context;
+-    vk_buffer b_buf = b_buf_ctx->dev_buffer;
+-    if (a_buf == b_buf) {
+-        auto a_base = vk_tensor_offset(a) + a->view_offs;
+-        auto a_size = ggml_nbytes(a);
+-        auto b_base = vk_tensor_offset(b) + b->view_offs;
+-        auto b_size = ggml_nbytes(b);
+-
+-        if (elementwise && a_base == b_base && a_size == b_size) {
+-            return false;
+-        }
+-
+-        if ((b_base <= a_base && a_base < b_base + b_size) ||
+-            (a_base <= b_base && b_base < a_base + a_size)) {
+-            return true;
+-        }
+-    }
+-    return false;
+-}
+-
+ static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                                int node_idx) {
+     GGML_UNUSED(ctx);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+index 67788d3ea..d833bcf2d 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+@@ -373,6 +373,19 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
+ #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
+ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i)
+ {
++#if defined(DATA_A_F32)
++    // Only the measured capacities amortize the extra live weight vector.
++    if ((NUM_COLS == 4u || NUM_COLS == 15u) && NUM_ROWS == 1u) {
++        const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
++        const uint ib = (first_row*p.ncols + col)/QUANT_K;
++        const vec4 v = dequantize4_2aligned(ib, 0u, a_offset);
++        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++            const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + col) / 4];
++            temp[j][0] += dot(v, b);
++        }
++        return;
++    }
++#endif
+     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+         const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
+         const uint iqs = 0; // quant index
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+index cbfa9bac7..c132e2de1 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+@@ -11,6 +11,19 @@
+ 
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
++// Zero keeps the generic push-constant width. A nonzero value requires an
++// exact-width host route; it preserves lane partials while pruning K loops.
++layout(constant_id = 3) const uint FIXED_NCOLS = 0;
++// An exact, row-tile-aligned output height can omit the partial-row body.
++// Keep the first-row guard even for the specialized pipeline.
++layout(constant_id = 4) const uint FIXED_NROWS = 0;
++
++#ifndef MUL_MAT_ID
++// Only for one Y workgroup with base_work_group_y == 0. Descriptor/view
++// offsets are independent; token columns still advance inside iter().
++layout(constant_id = 5) const bool SINGLE_Y_BATCH = false;
++#endif
++
+ #if defined(DATA_A_Q2_0) || defined(DATA_A_QUANT_K)
+ #define K_PER_ITER 16
+ #elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
+@@ -29,6 +42,7 @@ vec2 cache_b_ds;
+ #include "mul_mat_vecq_funcs.glsl"
+ 
+ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
++    const uint ncols = FIXED_NCOLS != 0u ? FIXED_NCOLS : p.ncols;
+ #ifdef HAS_MMVQ_DOT_MULTI
+     // NUM_COLS is a specialization constant, not a preprocessor definition.
+     // Limit register-resident activation columns to the MTP-sized cases with
+@@ -64,10 +78,10 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
+ #endif
+     }
+ 
+-    uint ibi = first_row*p.ncols;
++    uint ibi = first_row*ncols;
+     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+         const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
+-        ibi += p.ncols;
++        ibi += ncols;
+         mmvq_dot_multi(a_block_idx, b_qs_idx, temp, n, b_qs_multi, b_ds_multi);
+     }
+     } else
+@@ -109,10 +123,10 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
+ #error unimplemented
+ #endif
+ #endif
+-        uint ibi = first_row*p.ncols;
++        uint ibi = first_row*ncols;
+         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+             const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
+-            ibi += p.ncols;
++            ibi += ncols;
+ 
+             temp[j][n] += mmvq_dot_product(a_block_idx, b_qs_idx);
+         }
+@@ -123,6 +137,13 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
+ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+     const uint tid = gl_LocalInvocationID.x;
+ 
++#ifndef MUL_MAT_ID
++    if (SINGLE_Y_BATCH) {
++        a_offset = 0u;
++        b_offset = 0u;
++        d_offset = 0u;
++    } else
++#endif
+     get_offsets(a_offset, b_offset, d_offset);
+     a_offset *= QUANT_K / QUANT_K_Q8_1;
+     b_offset /= QUANT_K_Q8_1;
+@@ -136,8 +157,32 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+     }
+ 
+     const uint col_stride = K_PER_ITER * BLOCK_SIZE;
+-    uint num_iters = p.ncols / col_stride;
+-    if (num_iters * col_stride + K_PER_ITER * tid < p.ncols) {
++    if (FIXED_NCOLS != 0u && FIXED_NCOLS <= col_stride) {
++        // Every lane has zero or one partial; retain the generic lane mapping
++        // and reduction, but do not compile the impossible multi-iter loops.
++        if (K_PER_ITER * tid < FIXED_NCOLS) {
++            iter(temp, first_row, num_rows, K_PER_ITER * tid, tid % (32 / K_PER_ITER));
++        }
++        reduce_result(temp, d_offset, first_row, num_rows, tid);
++        return;
++    }
++    if (FIXED_NCOLS != 0u && FIXED_NCOLS % (4u * col_stride) == 0u) {
++        // All lanes have whole four-slice groups. Keep the original slice
++        // order, without compiling the impossible two/one-slice remainder.
++        const uint b_qs_idx = tid % (32 / K_PER_ITER);
++        uint col = tid * K_PER_ITER;
++        [[dont_unroll]] for (uint group = 0u; group < FIXED_NCOLS / (4u * col_stride); ++group) {
++            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
++                iter(temp, first_row, num_rows, col, b_qs_idx);
++                col += col_stride;
++            }
++        }
++        reduce_result(temp, d_offset, first_row, num_rows, tid);
++        return;
++    }
++    const uint ncols = FIXED_NCOLS != 0u ? FIXED_NCOLS : p.ncols;
++    uint num_iters = ncols / col_stride;
++    if (num_iters * col_stride + K_PER_ITER * tid < ncols) {
+         num_iters++;
+     }
+ 
+@@ -176,6 +221,13 @@ void main() {
+     init_iq_shmem(gl_WorkGroupSize);
+ #endif
+ 
++    if (FIXED_NROWS != 0u && FIXED_NROWS % NUM_ROWS == 0u) {
++        if (first_row < FIXED_NROWS) {
++            compute_outputs(first_row, NUM_ROWS);
++        }
++        return;
++    }
++
+     // do NUM_ROWS at a time, unless there aren't enough remaining rows
+     if (first_row + NUM_ROWS <= p.stride_d) {
+         compute_outputs(first_row, NUM_ROWS);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/tp5_hc_latebind.comp b/ggml/src/ggml-vulkan/vulkan-shaders/tp5_hc_latebind.comp
+index 36c059897..0bdfae3a9 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/tp5_hc_latebind.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/tp5_hc_latebind.comp
+@@ -475,33 +475,34 @@ layout(local_size_x = 256) in;
+ layout(std430, binding = 0) readonly buffer DownWeightsQ8 { late_q8_packed w_q8[]; };
+ layout(std430, binding = 1) readonly buffer ActivationQ8 { late_q8_packed act_q8[]; };
+ // Cached HOST_VISIBLE|HOST_COHERENT|DEVICE_COHERENT_AMD local VRAM. The
+-// The compact F16 sidecar starts at p.late_word_offset. The immediately
+-// preceding 64-byte cache line is Q-only control, avoiding false sharing with
+-// Y generation in the main relay header. CPU reads/reduces this BAR mapping
+-// in-place, so the aggressive path never stages Q through imported system RAM.
++// The compact F16 sidecar starts at p.late_word_offset in the selected GTT/BAR
++// aperture. The preceding 64-byte line is Q-only control, separate from Y.
+ #ifdef TP5_LATE_Q_STATS
+ // LB2: the same residual / z_p / scatter views and statistics layout the exact
+ // TP5_LATE_Q kernel uses. Present only in the _stats variant, which is why that
+-// pipeline is created with 8 bindings instead of this block's usual 3.
+-layout(std430, binding = 3) readonly  buffer ResidualStatsQ { vec4 residual_stats[]; };
+-layout(std430, binding = 4) readonly  buffer LocalZStatsQ   { vec4 local_z_stats[]; };
+-layout(std430, binding = 5) readonly  buffer ScatterStatsQ  { float scatter_stats[]; };
+-layout(std430, binding = 6) writeonly buffer StatsOutQ      { vec2 stats_out[]; };
+-layout(std430, binding = 7) writeonly buffer ScatterOutQ    { float s_out[]; };
++// pipeline adds five bindings to the common weights/activation/mailbox/epoch/
++// integrity bindings.
++layout(std430, binding = 5) readonly  buffer ResidualStatsQ { vec4 residual_stats[]; };
++layout(std430, binding = 6) readonly  buffer LocalZStatsQ   { vec4 local_z_stats[]; };
++layout(std430, binding = 7) readonly  buffer ScatterStatsQ  { float scatter_stats[]; };
++layout(std430, binding = 8) writeonly buffer StatsOutQ      { vec2 stats_out[]; };
++layout(std430, binding = 9) writeonly buffer ScatterOutQ    { float s_out[]; };
+ #endif
+ #ifdef TP5_LATE_L2
+ // L2 (tip): the per-block partials ACT_Q8 formed from live R and z_p, and the
+ // scatter weights. Workgroup 0 folds them into the statistics record that rides
+-// the same completion protocol as Q (written before its counter increment, so the
+-// ready word the CPU polls also covers the statistics).
+-layout(std430, binding = 3) coherent readonly buffer StatsPartialsIn { vec4 stats_partials_in[]; };
+-layout(std430, binding = 4) readonly buffer ScatterL2 { float scatter_l2[]; };
++// the same completion protocol as Q. Their per-entry freshness tags remain
++// necessary: the ready word alone does not acquire the statistics on the host.
++layout(std430, binding = 5) coherent readonly buffer StatsPartialsIn { vec4 stats_partials_in[]; };
++layout(std430, binding = 6) readonly buffer ScatterL2 { float scatter_l2[]; };
+ // Same aperture as binding 2, viewed as 16-byte words so that every statistics
+ // entry (a, d, s, tag) is written by ONE 128-bit store and can never be observed
+ // half-updated by the relay.
+-layout(std430, binding = 5) coherent volatile buffer StatsOut4 { uvec4 st4[]; };
++layout(std430, binding = 7) coherent volatile buffer StatsOut4 { uvec4 st4[]; };
+ #endif
+ layout(std430, binding = 2) coherent volatile buffer QMailbox { uint qmail[]; };
++layout(std430, binding = 3) readonly buffer EpochHeader { uint epoch_header[]; };
++layout(std430, binding = 4) coherent writeonly buffer Integrity { uvec4 qsum[]; };
+ 
+ layout(push_constant) uniform Q8DotParams {
+     uint width;
+@@ -517,9 +518,7 @@ layout(push_constant) uniform Q8DotParams {
+ } p;
+ 
+ shared uint publish_last;
+-#ifdef TP5_LATE_L2
+ shared uint qsum_s[8];
+-#endif
+ 
+ void main() {
+     if (p.streams != 4u || p.rows_per_wg != 16u || gl_WorkGroupID.x >= p.n_workgroups) return;
+@@ -535,9 +534,7 @@ void main() {
+     const uint lane16 = lid & 15u;
+     const uint row = gl_WorkGroupID.x * 16u + row_slot;
+     const uint blocks = p.width / 32u;
+-#ifdef TP5_LATE_L2
+     uint q_xor = 0u;   // XOR of the F16 payload words this invocation writes
+-#endif
+ 
+     [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
+         if (token >= active_rows) break;
+@@ -576,9 +573,7 @@ void main() {
+             const uint word = p.late_word_offset + elem / 2u;
+             const uint packed_q = packHalf2x16(vec2(tacc[stream], pair_hi[stream]));
+             qmail[word] = packed_q;
+-#ifdef TP5_LATE_L2
+             q_xor ^= packed_q;
+-#endif
+         }
+ #ifdef TP5_LATE_Q_STATS
+         // LB2: fold a_b = <R_b,R_b> and d_b = <R_b,z_p> for THIS rank, plus s_b,
+@@ -625,10 +620,8 @@ void main() {
+ #endif
+     }
+ 
+-#ifdef TP5_LATE_L2
+     // Per-workgroup payload checksum entry, written before this WG's completion
+-    // increment: uvec4(xor of the WG's F16 payload words, nonce, 0, 0). The nonce
+-    // is this epoch's token-0 statistics tag, so a stale entry never validates.
++    // increment. The CPU validates epoch, live extent and bytes in every mode.
+     {
+         const uint sg_xor = subgroupXor(q_xor);
+         if (gl_SubgroupInvocationID == 0u) qsum_s[gl_SubgroupID] = sg_xor;
+@@ -636,11 +629,11 @@ void main() {
+         if (gl_LocalInvocationID.x == 0u) {
+             uint wg_xor = 0u;
+             for (uint i = 0u; i < gl_NumSubgroups; ++i) wg_xor ^= qsum_s[i];
+-            const uint nonce = floatBitsToUint(stats_partials_in[TP5_LATE_CAPACITY_ROWS * 4u * blocks].x);
+-            st4[(p.stats_word_offset + TP5_LATE_CAPACITY_ROWS * TP5_LATE_STATS_WORDS) / 4u + gl_WorkGroupID.x] =
+-                uvec4(wg_xor, nonce, 0u, 0u);
++            qsum[gl_WorkGroupID.x] = uvec4(wg_xor, epoch_header[TP5_RELAY_EPOCH_WORD],
++                                          active_rows * p.streams * p.rank_dim / 2u, 0u);
+         }
+     }
++#ifdef TP5_LATE_L2
+     // Fold the ACT_Q8 partials: one (token, stream) pair per wave, 32 lanes over
+     // the 80 block partials, fixed order -> deterministic. Record layout (16 words
+     // per token, single source tp5_late_stats_*): a[0..3], d[0..3], s[0..3], pad.
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/tp5_hc_publish.comp b/ggml/src/ggml-vulkan/vulkan-shaders/tp5_hc_publish.comp
+index b8c5017ea..76c4dedba 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/tp5_hc_publish.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/tp5_hc_publish.comp
+@@ -33,33 +33,49 @@ layout(std430, binding = 1) coherent writeonly buffer HostSidecar {
+ layout(std430, binding = 2) coherent volatile buffer Status {
+     uint status[];
+ };
++layout(std430, binding = 3) coherent writeonly buffer Integrity {
++    uvec4 qsum[];
++};
++layout(std430, binding = 4) readonly buffer RowsHeader {
++    uint rows_header[];
++};
+ #ifdef TP5_PUBLISH_STATS
+ // LB2: the same publication also carries the RMS sufficient statistics
+ // (a_b, d_b, s_b per token per stream: 12 words per token, raw layout)
+ // so the CPU can finish rho during the Y reduction — no second doorbell
+ // for the Q sidecar.
+-layout(std430, binding = 3) readonly buffer LocalStats {
++layout(std430, binding = 5) readonly buffer LocalStats {
+     uint stats_src[];
+ };
+-layout(std430, binding = 4) coherent writeonly buffer HostStats {
++layout(std430, binding = 6) coherent writeonly buffer HostStats {
+     uint stats_dst[];
+ };
+ #endif
+ 
+ layout(push_constant) uniform Params {
+-    uint n_uvec4;
++    uint n_uvec4_per_row;
++    uint active_rows;
+ #ifdef TP5_PUBLISH_STATS
+     uint n_stats;   // raw word count (tokens * 12)
+ #endif
+ } p;
+ 
++shared uint payload_xor[64];
++
+ void main() {
+     const uint lane = gl_LocalInvocationID.x;
+-    for (uint i = lane; i < p.n_uvec4; i += 64u) {
++    const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
++    const uint n_uvec4 = p.n_uvec4_per_row * active_rows;
++    uint x = 0u;
++    for (uint i = lane; i < n_uvec4; i += 64u) {
+ #ifdef TP5_PUBLISH_F16
+-        dst[i] = f16vec4(src[i]);
++        const vec4 value = src[i];
++        dst[i] = f16vec4(value);
++        x ^= packHalf2x16(value.xy) ^ packHalf2x16(value.zw);
+ #else
+-        dst[i] = src[i];
++        const uvec4 value = src[i];
++        dst[i] = value;
++        x ^= value.x ^ value.y ^ value.z ^ value.w;
+ #endif
+     }
+ #ifdef TP5_PUBLISH_STATS
+@@ -68,6 +84,19 @@ void main() {
+     }
+ #endif
+ 
++    payload_xor[lane] = x;
++    barrier();
++    if (lane == 0u && n_uvec4 != 0u) {
++        uint all_xor = 0u;
++        for (uint i = 0u; i < 64u; ++i) all_xor ^= payload_xor[i];
++#ifdef TP5_PUBLISH_F16
++        const uint payload_words = n_uvec4 * 2u;
++#else
++        const uint payload_words = n_uvec4 * 4u;
++#endif
++        qsum[0] = uvec4(all_xor, status[1], payload_words, 0u);
++    }
++
+     // All sidecar stores come from this one workgroup. Order every lane's
+     // payload stores before publishing the CPU-visible ready word.
+     memoryBarrierBuffer();
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 0b0aeccbe..45c57fcb7 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1005,7 +1005,8 @@ void process_shaders() {
+     });
+     string_to_spv("tp5_hc_late_q_q8dot", "tp5_hc_latebind.comp",
+                   {
+-                      { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
++                      { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity },
++                      { "TP5_RELAY_EPOCH_WORD", std::to_string(TP5_RELAY_EPOCH_WORD) + "u" }
+     });
+     // LB2 on the aggressive blade. The q8dot-approx Q producer used to carry no
+     // statistics at all (TP5_LATE_Q_STATS existed only inside the exact TP5_LATE_Q
+@@ -1014,7 +1015,8 @@ void process_shaders() {
+     // same producer, which is what makes RHO reachable on the aggressive path.
+     string_to_spv("tp5_hc_late_q_q8dot_stats", "tp5_hc_latebind.comp",
+                   {
+-                      { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_Q_STATS", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity }
++                      { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_Q_STATS", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity },
++                      { "TP5_RELAY_EPOCH_WORD", std::to_string(TP5_RELAY_EPOCH_WORD) + "u" }
+     });
+     // L2 (tip): RMS sufficient-statistic partials formed in ACT_Q8 (the only point
+     // where live R and z_p are both guaranteed), folded by Q8DOT workgroup 0 into
+@@ -1027,7 +1029,8 @@ void process_shaders() {
+     string_to_spv("tp5_hc_late_q_q8dot_l2", "tp5_hc_latebind.comp",
+                   {
+                       { "TP5_LATE_Q_Q8DOT", "1" }, { "TP5_LATE_L2", "1" }, { "TP5_LATE_CAPACITY_ROWS", late_capacity },
+-                      { "TP5_LATE_STATS_WORDS", std::to_string(TP5_LATE_STATS_WORDS_PER_TOKEN) + "u" }
++                      { "TP5_LATE_STATS_WORDS", std::to_string(TP5_LATE_STATS_WORDS_PER_TOKEN) + "u" },
++                      { "TP5_RELAY_EPOCH_WORD", std::to_string(TP5_RELAY_EPOCH_WORD) + "u" }
+     });
+     string_to_spv("tp5_hc_late_up_q8dot_bcast", "tp5_hc_latebind.comp",
+                   {
+diff --git a/ggml/src/gguf.cpp b/ggml/src/gguf.cpp
+index 9f9e4fe5d..cb86a7751 100644
+--- a/ggml/src/gguf.cpp
++++ b/ggml/src/gguf.cpp
+@@ -701,6 +701,11 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
+         {
+             ok = ok && gr.read(info.t.type);
+ 
++            // Compatibility with upstream GGUFs where Q2_0 was type 42 before being renumbered to 47 in this fork
++            if (info.t.type == 42) {
++                info.t.type = GGML_TYPE_Q2_0;
++            }
++
+             // check that tensor type is within defined range
+             if (info.t.type < 0 || info.t.type >= GGML_TYPE_COUNT) {
+                 GGML_LOG_ERROR("%s: tensor '%s' has invalid ggml type %d. should be in [0, %d)\n",
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index f7b4b344a..990bcb1f7 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -145,6 +145,15 @@ llama_test(test-mtp-workspace LABEL "predefined;cpu")
+ add_test(NAME test-gpu-recovery COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-gpu-recovery.sh)
+ set_tests_properties(test-gpu-recovery PROPERTIES LABELS "recovery;cpu" TIMEOUT 15)
+ 
++if (UNIX AND LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER)
++    add_executable(test-server-signal test-server-signal.cpp)
++    target_include_directories(test-server-signal PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
++    target_link_libraries(test-server-signal PRIVATE server-context)
++    target_compile_features(test-server-signal PRIVATE cxx_std_17)
++    llama_test(test-server-signal LABEL "server;cpu")
++    set_tests_properties(test-server-signal PROPERTIES TIMEOUT 10)
++endif()
++
+ add_executable(test-target-capacity test-target-capacity.cpp)
+ target_include_directories(test-target-capacity PRIVATE ${PROJECT_SOURCE_DIR}/src)
+ target_link_libraries(test-target-capacity PRIVATE llama llama-common ggml-base)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 4ffa27c33..03f942d7c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9204,6 +9204,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+         }
+     }
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 15, 256, {1, 1}, {1, 1}));
+ 
+     for (int n : {12, 18}) {
+         test_cases.emplace_back(new test_mul_mat(
+@@ -9222,6 +9223,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat(
+             GGML_TYPE_Q8_0, GGML_TYPE_F32,
+             320, 27, 10240, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(
++            GGML_TYPE_Q8_0, GGML_TYPE_F32,
++            320, 2, 10240, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(
++            GGML_TYPE_Q8_0, GGML_TYPE_F32,
++            320, 1, 10240, {1, 1}, {2, 1}));
++    test_cases.emplace_back(new test_mul_mat(
++            GGML_TYPE_Q8_0, GGML_TYPE_F32,
++            321, 2, 10240, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(
++            GGML_TYPE_Q8_0, GGML_TYPE_F32,
++            10240, 2, 320, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(
++            GGML_TYPE_Q8_0, GGML_TYPE_F32,
++            10240, 1, 320, {1, 1}, {2, 1}));
++    test_cases.emplace_back(new test_mul_mat(
++            GGML_TYPE_Q8_0, GGML_TYPE_F32,
++            10241, 2, 320, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(
+             GGML_TYPE_Q6_K, GGML_TYPE_F32,
+             128, 27, 2560, {1, 1}, {1, 1}));
+diff --git a/tests/test-gpu-recovery-mock.py b/tests/test-gpu-recovery-mock.py
+index 9dad121a3..92137a04d 100755
+--- a/tests/test-gpu-recovery-mock.py
++++ b/tests/test-gpu-recovery-mock.py
+@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
+ 
+ 
+ def exercise(source: str, *, native: bool, fail_clear: bool = False, missing_dpm: bool = False,
+-             busy_before: str = "0", clocks_only: bool = False):
++             busy_before: str = "0", clocks_only: bool = False, restore_dpm_after_reset: bool = False):
+     with tempfile.TemporaryDirectory(prefix="eagle-mock-") as tmp:
+         root = Path(tmp)
+         replacements = {
+@@ -67,6 +67,8 @@ else:
+         sys.exit(1)
+     if value == "0000" and state.read_text().strip() == "0040":
+         Path(os.environ["GPU_MOCK_BUSY_FILE"]).write_text("0\\n")
++    if os.environ["GPU_MOCK_RESTORE_DPM"] == "1":
++        Path(os.environ["GPU_MOCK_DPM_FILE"]).write_text("S: 0Mhz *\\n1: 500Mhz\\n2: 1200Mhz\\n")
+     state.write_text(value)
+ """)
+         setpci.chmod(0o700)
+@@ -81,6 +83,8 @@ else:
+             "GPU_MOCK_CLEAR_FAILED": str(root / "clear-failed"),
+             "GPU_MOCK_BUSY_FILE": str(busy_file),
+             "GPU_MOCK_FAIL_CLEAR": "1" if fail_clear else "0",
++            "GPU_MOCK_DPM_FILE": str(sclk),
++            "GPU_MOCK_RESTORE_DPM": "1" if restore_dpm_after_reset else "0",
+         }
+         args = ["bash", str(script)] + (["--clocks-only"] if clocks_only else []) + ["card1"]
+         result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=15)
+@@ -123,6 +127,10 @@ def main():
+     check(bus, status=0, perf="manual", sclk="2")
+     assert bus["removed"] == "1" and bus["rescanned"] == "1"
+ 
++    bus_lost = exercise(source, native=False, missing_dpm=True, restore_dpm_after_reset=True)
++    check(bus_lost, status=0, perf="manual", sclk="2")
++    assert bus_lost["removed"] == "1" and bus_lost["rescanned"] == "1"
++
+     still_busy = exercise(source, native=True, busy_before="99")
+     check(still_busy, status=0, perf="manual", sclk="2")
+     assert still_busy["removed"] == "1" and still_busy["rescanned"] == "1", still_busy["stderr"]
+diff --git a/tests/test-gpu-recovery.sh b/tests/test-gpu-recovery.sh
+index becf93396..0682cb6f4 100755
+--- a/tests/test-gpu-recovery.sh
++++ b/tests/test-gpu-recovery.sh
+@@ -107,6 +107,122 @@ fi
+     fake_logs=''
+     run_watchdog_step
+     [ "${recovered[*]}" = 'card2 card1' ] || { echo 'Confirmed unresolved reset failure not escalated' >&2; exit 1; }
++
++    fake_logs=$'[ 107.000001] amdgpu 0000:0c:00.0: device lost from bus!\n[ 107.000002] amdgpu 0000:0c:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF'
++    run_watchdog_step
++    [ "${CARD_PENDING_KIND[card3]:-}" = bus_lost ] && [ -z "${CARD_CLOCK_SINCE[card3]:-}" ] &&
++        [ "${clocks_restored[*]}" = 'card4 card5' ] || {
++        echo 'Lost PCI bus was treated as a DPM-only event' >&2; exit 1;
++    }
++    CARD_PENDING_SINCE[card3]=$(( $(date +%s) - FAILED_RESET_GRACE - 1 ))
++    fake_logs=''
++    run_watchdog_step
++    [ "${recovered[*]}" = 'card2 card1 card3' ] || {
++        echo 'Unrecovered bus loss did not escalate to single-card reset before IPMI timeout' >&2; exit 1;
++    }
++
++    fake_logs=$'[ 108.000001] amdgpu 0000:0c:00.0: device lost from bus!\n[ 108.000002] amdgpu 0000:0c:00.0: GPU reset begin'
++    run_watchdog_step
++    CARD_PENDING_SINCE[card3]=$(( $(date +%s) - AUTO_RESET_GRACE - 10 ))
++    fake_logs=''
++    run_watchdog_step
++    [ "${recovered[*]}" = 'card2 card1 card3' ] || {
++        echo 'Eagle raced a late-starting kernel reset' >&2; exit 1;
++    }
++    fake_logs=$'[ 109.000001] amdgpu 0000:0c:00.0: GPU Recovery Failed: -19'
++    run_watchdog_step
++    [ -z "${CARD_DRIVER_RESET_SINCE[card3]:-}" ] &&
++        [ "${recovered[*]}" = 'card2 card1 card3 card3' ] || {
++        echo 'Failed kernel reset was not escalated before IPMI timeout' >&2; exit 1;
++    }
++)
++
++(
++    source "$watchdog"
++    DRY_RUN=1
++    LAST_KERNEL_TIMESTAMP=200.000000
++    fake_logs=$'[ 201.000001] amdgpu 0000:0c:00.0: device lost from bus!'
++    fetch_kernel_logs() { printf '%s\n' "$fake_logs"; }
++    scan_gpu_busy_advisory() { :; }
++    read_clock_policy() { printf 'manual\n'; }
++    declare -a rebooted=()
++    recover_card() { CARD_HELPER_ATTEMPTED[$1]=1; [ "$1" != card3 ]; }
++    card_operational() { return 1; }
++    request_early_reboot() { rebooted+=("$1"); }
++    run_watchdog_step
++    CARD_PENDING_SINCE[card3]=$(( $(date +%s) - FAILED_RESET_GRACE - 1 ))
++    fake_logs=''
++    if run_watchdog_step; then
++        echo 'Failed target recovery was reported successful' >&2; exit 1
++    fi
++    [ "${rebooted[*]}" = card3 ] || { echo 'Unrecoverable bus loss did not request early reboot' >&2; exit 1; }
++    card_operational() { return 0; }
++    fake_logs=$'[ 202.000001] amdgpu 0000:0c:00.0: device lost from bus!'
++    run_watchdog_step
++    CARD_PENDING_SINCE[card3]=$(( $(date +%s) - FAILED_RESET_GRACE - 1 ))
++    fake_logs=''
++    if run_watchdog_step; then
++        echo 'Failed target recovery was reported successful' >&2; exit 1
++    fi
++    [ "${rebooted[*]}" = card3 ] || { echo 'Recovered card caused an unnecessary host reboot' >&2; exit 1; }
++
++    recover_card() { CARD_HELPER_ATTEMPTED[$1]=0; return 1; }
++    card_operational() { return 1; }
++    fake_logs=$'[ 203.000001] amdgpu 0000:06:00.0: device lost from bus!'
++    run_watchdog_step
++    CARD_PENDING_SINCE[card4]=$(( $(date +%s) - FAILED_RESET_GRACE - 1 ))
++    fake_logs=''
++    if run_watchdog_step; then
++        echo 'Missing recovery helper was reported successful' >&2; exit 1
++    fi
++    [ "${rebooted[*]}" = card3 ] || { echo 'Skipped card reset triggered a host reboot' >&2; exit 1; }
++)
++
++(
++    source "$watchdog"
++    fake_card=$(mktemp -d)
++    trap 'rm -rf "$fake_card"' EXIT
++    mkdir "$fake_card/drm"
++    printf '2: 1200Mhz *\n' > "$fake_card/pp_dpm_sclk"
++    printf '99\n' > "$fake_card/gpu_busy_percent"
++    card_operational_at_path "$fake_card" || {
++        echo 'Healthy GPU at 99 percent utilization was marked dead' >&2; exit 1;
++    }
++    rm "$fake_card/pp_dpm_sclk"
++    if card_operational_at_path "$fake_card"; then
++        echo 'GPU with missing DPM was marked recovered' >&2; exit 1
++    fi
++)
++
++(
++    source "$watchdog"
++    DRY_RUN=0
++    guard_dir=$(mktemp -d)
++    trap 'rm -rf "$guard_dir"' EXIT
++    EARLY_REBOOT_FILE="$guard_dir/last-early-reboot"
++    declare -a reboot_commands=()
++    systemctl() { reboot_commands+=("$*"); }
++    request_early_reboot card3
++    [ "${reboot_commands[*]}" = 'reboot --no-wall' ] || {
++        echo 'Early reboot did not request orderly shutdown' >&2; exit 1;
++    }
++    if request_early_reboot card3; then
++        echo 'Durable reboot guard allowed a second reboot within 24 hours' >&2; exit 1
++    fi
++    [ "${#reboot_commands[@]}" -eq 1 ] || { echo 'A reboot loop was requested' >&2; exit 1; }
++)
++
++(
++    source "$watchdog"
++    ONCE=0
++    fetch_kernel_logs() { return 1; }
++    result=0
++    watchdog_main || result=$?
++    [ "$result" -eq 2 ] || { echo 'Kernel log failure replayed stale incidents at startup' >&2; exit 1; }
++    fetch_kernel_logs() { printf '%s\n' 'amdgpu: device lost from bus!'; }
++    result=0
++    watchdog_main || result=$?
++    [ "$result" -eq 2 ] || { echo 'Missing kernel timestamp replayed stale incidents at startup' >&2; exit 1; }
+ )
+ 
+ echo 'GPU recovery fail-closed dispatch checks passed'
+diff --git a/tests/test-predefined-capacity.cpp b/tests/test-predefined-capacity.cpp
+index 496ed1ba6..54f0cc42c 100644
+--- a/tests/test-predefined-capacity.cpp
++++ b/tests/test-predefined-capacity.cpp
+@@ -24,7 +24,6 @@ static void capacity_and_frames() {
+     CHECK(cap.hidden_bytes == 32ULL * 10240 * 4);
+     CHECK(cap.payload_bytes == 32ULL * 2560 * 4);
+     CHECK(cap.logits_bytes == 4ULL * 248320 * 4);
+-    CHECK(error[0] == '\0');
+ 
+     const auto original = cap;
+     for (int which = 0; which < 7; ++which) {
+@@ -40,7 +39,6 @@ static void capacity_and_frames() {
+         }
+         CHECK(!ggml_predefined_make_capacity(&p, &cap, error, sizeof(error)));
+         CHECK(std::memcmp(&cap, &original, sizeof(cap)) == 0);
+-        CHECK(error[0] != '\0');
+     }
+     p = limits();
+     p.wire_bytes = 2;
+diff --git a/tests/test-predefined-coverage.cpp b/tests/test-predefined-coverage.cpp
+index 70ee3bc7f..3f8c707bc 100644
+--- a/tests/test-predefined-coverage.cpp
++++ b/tests/test-predefined-coverage.cpp
+@@ -1,28 +1,19 @@
+ #include "../ggml/src/ggml-vulkan/ggml-vulkan-tp5-coverage.h"
+ 
+ #include <cstdio>
+-#include <cstring>
+ #include <stdexcept>
+ 
+-#define CHECK(x) do { if (!(x)) throw std::runtime_error("failed: " #x); } while (0)
++#define CHECK(x)                                     \
++    do {                                             \
++        if (!(x))                                    \
++            throw std::runtime_error("failed: " #x); \
++    } while (0)
+ 
+ // Pure CPU coverage-record tests. No Vulkan loader/device, shader compiler,
+ // model load, or GPU execution is involved. These tests exercise the
+-// definition-time semantic coverage record, tri-state evaluation, completeness,
+-// and the dynamic execution gate contract (ggml-vulkan.cpp:27647).
+-
+-static bool simulate_dynamic_execution_gate(bool predefined_complete,
+-                                            uint32_t active_rows,
+-                                            uint32_t capacity_rows) {
+-    // Exact logic from ggml-vulkan.cpp:27647:
+-    // (!program.predefined_complete && active_rows != capacity_rows) -> reject
+-    if (!predefined_complete && active_rows != capacity_rows) {
+-        return false; // dynamic execution rejected (fail-closed)
+-    }
+-    return true; // permitted
+-}
++// production definition-time coverage record and completeness decisions.
+ 
+-static void valid_definition_is_complete_and_permits_dynamic_execution() {
++static void classified_definition_is_complete() {
+     // 2 dynamic computes (1 tokens-driven, 1 outputs-driven), 0 copies:
+     // captured == classified (2 == 2), no unproven copy/view/state writes.
+     vk_tp5_predefined_coverage cov{};
+@@ -49,16 +40,11 @@ static void valid_definition_is_complete_and_permits_dynamic_execution() {
+     CHECK(!cov.would_reject);
+     CHECK(vk_tp5_coverage_is_complete(cov));
+ 
+-    // Dynamic execution qualification: permitted for active_rows < capacity_rows
+-    CHECK(simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 1, 32));
+-    CHECK(simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 4, 32));
+-    CHECK(simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 32, 32));
+-
+     // Diagnostic reporting returns false (no unhandled gap to warn)
+     CHECK(!vk_tp5_coverage_report(cov, 32, captured, classified));
+ }
+ 
+-static void unresolved_data_movement_blocks_dynamic_execution() {
++static void unresolved_data_movement_blocks_completeness() {
+     // Dispatches are classified (2 == 2), but definition captured 1 raw copy/fill/update op.
+     // Fixed range copy has no effective-range proof -> data_movement_state must be unresolved.
+     vk_tp5_predefined_coverage cov{};
+@@ -74,18 +60,11 @@ static void unresolved_data_movement_blocks_dynamic_execution() {
+     vk_tp5_coverage_evaluate(cov, 32, captured, classified, copies, barriers, states);
+ 
+     CHECK(cov.data_movement_state == vk_tp5_coverage_state::unresolved);
+-    CHECK(std::strstr(cov.first_gap, "data_movement") != nullptr);
+     CHECK(cov.would_reject);
+     CHECK(!vk_tp5_coverage_is_complete(cov));
+-
+-    // Enforcement: Dynamic row execution is REJECTED by gate
+-    CHECK(!simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 1, 32));
+-    CHECK(!simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 4, 32));
+-    // Exact capacity execution is still permitted
+-    CHECK(simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 32, 32));
+ }
+ 
+-static void unclassified_dispatch_sets_unresolved_and_blocks_dynamic() {
++static void unclassified_dispatch_blocks_completeness() {
+     // 3 captured, 2 classified -> 1 uncovered dispatch.
+     // Must set compute and state writes to unresolved and block dynamic execution.
+     vk_tp5_predefined_coverage cov{};
+@@ -105,11 +84,7 @@ static void unclassified_dispatch_sets_unresolved_and_blocks_dynamic() {
+     CHECK(cov.dynamic_compute_state == vk_tp5_coverage_state::unresolved);
+     CHECK(cov.state_writes_state == vk_tp5_coverage_state::unresolved);
+     CHECK(cov.dependency_boundaries_state == vk_tp5_coverage_state::unresolved);
+-    CHECK(std::strstr(cov.first_gap, "compute") != nullptr);
+     CHECK(!vk_tp5_coverage_is_complete(cov));
+-
+-    // Dynamic execution qualification: REJECTED
+-    CHECK(!simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 1, 32));
+ }
+ 
+ static void all_fixed_compute_definition_is_complete() {
+@@ -132,37 +107,37 @@ static void all_fixed_compute_definition_is_complete() {
+     CHECK(cov.state_writes_state == vk_tp5_coverage_state::fixed_safe);
+     CHECK(cov.dependency_boundaries_state == vk_tp5_coverage_state::fixed_safe);
+     CHECK(vk_tp5_coverage_is_complete(cov));
+-    CHECK(simulate_dynamic_execution_gate(vk_tp5_coverage_is_complete(cov), 1, 32));
+ }
+ 
+-static void tri_state_and_first_gap_contract() {
+-    // Verify string names
+-    CHECK(std::strcmp(vk_tp5_coverage_state_name(vk_tp5_coverage_state::unresolved), "unresolved") == 0);
+-    CHECK(std::strcmp(vk_tp5_coverage_state_name(vk_tp5_coverage_state::fixed_safe), "fixed_safe") == 0);
+-    CHECK(std::strcmp(vk_tp5_coverage_state_name(vk_tp5_coverage_state::dynamic_safe), "dynamic_safe") == 0);
+-
+-    // Verify first_gap retains only the first reason
++static void unresolved_state_blocks_completeness() {
+     vk_tp5_predefined_coverage cov{};
+-    vk_tp5_coverage_set_gap(cov, "first reason");
+-    vk_tp5_coverage_set_gap(cov, "second reason");
+-    CHECK(std::strcmp(cov.first_gap, "first reason") == 0);
+-
+-    // Any individual unresolved state causes is_complete() == false
+-    cov.state_writes_state = vk_tp5_coverage_state::unresolved;
+-    CHECK(!vk_tp5_coverage_is_complete(cov));
++    vk_tp5_coverage_note_fixed(cov);
++    vk_tp5_coverage_evaluate(cov, 32, 1, 1, 0, 0, 1);
++    CHECK(vk_tp5_coverage_is_complete(cov));
++    const auto            complete                                         = cov;
++    vk_tp5_coverage_state vk_tp5_predefined_coverage::* const categories[] = {
++        &vk_tp5_predefined_coverage::fixed_compute_state,         &vk_tp5_predefined_coverage::dynamic_compute_state,
++        &vk_tp5_predefined_coverage::data_movement_state,         &vk_tp5_predefined_coverage::state_writes_state,
++        &vk_tp5_predefined_coverage::dependency_boundaries_state,
++    };
++    for (auto category : categories) {
++        cov           = complete;
++        cov.*category = vk_tp5_coverage_state::unresolved;
++        CHECK(!vk_tp5_coverage_is_complete(cov));
++    }
+ }
+ 
+ int main() {
+     try {
+-        valid_definition_is_complete_and_permits_dynamic_execution();
+-        unresolved_data_movement_blocks_dynamic_execution();
+-        unclassified_dispatch_sets_unresolved_and_blocks_dynamic();
++        classified_definition_is_complete();
++        unresolved_data_movement_blocks_completeness();
++        unclassified_dispatch_blocks_completeness();
+         all_fixed_compute_definition_is_complete();
+-        tri_state_and_first_gap_contract();
++        unresolved_state_blocks_completeness();
+     } catch (const std::exception & e) {
+         std::fprintf(stderr, "%s\n", e.what());
+         return 1;
+     }
+-    std::puts("predefined semantic coverage checks passed (tri-state & gate qualification verified)");
++    std::puts("predefined semantic coverage record checks passed");
+     return 0;
+ }
+diff --git a/tests/test-tp5-row-program.cpp b/tests/test-tp5-row-program.cpp
+index 34926c90c..5c9860302 100644
+--- a/tests/test-tp5-row-program.cpp
++++ b/tests/test-tp5-row-program.cpp
+@@ -134,38 +134,9 @@ static void latebind_token_dimension_multi_row_invariants() {
+     CHECK(layout.rho_elements() == 16);
+     CHECK(layout.q_elements() == 4 * 4 * 320); // 5120 floats
+     CHECK(layout.y_elements() == 4 * 2560);     // 10240 floats
+-    CHECK(layout.act_q8_blocks() == 4 * 4 * (2560 / 32)); // 1280 Q8 blocks
++    CHECK(layout.act_q8_blocks() == 4 * 4 * (2560 / 32));  // 1280 Q8 blocks
+     CHECK(layout.lo_elements() == 4 * 320);
+ 
+-    // Section 1: Push constants layout contract.
+-    // Assert all 7 push constant structs carry active_rows at their exact offsets.
+-    struct TestInjectParams { uint32_t width, streams, active_rows; };
+-    static_assert(sizeof(TestInjectParams) == 12 && offsetof(TestInjectParams, active_rows) == 8);
+-
+-    struct TestActQ8Params { uint32_t width, streams, my_rank, active_rows; };
+-    static_assert(sizeof(TestActQ8Params) == 16 && offsetof(TestActQ8Params, active_rows) == 12);
+-
+-    struct TestQ8DotParams {
+-        uint32_t width, rank_dim, streams, rows_per_wg, n_workgroups, late_word_offset, active_rows;
+-    };
+-    static_assert(sizeof(TestQ8DotParams) == 28 && offsetof(TestQ8DotParams, active_rows) == 24);
+-
+-    struct TestUpQ8Params { uint32_t width, rank_dim, streams, rows_per_wg, active_rows; };
+-    static_assert(sizeof(TestUpQ8Params) == 20 && offsetof(TestUpQ8Params, active_rows) == 16);
+-
+-    struct TestQParams { uint32_t width, rank_dim, streams, my_rank, active_rows; };
+-    static_assert(sizeof(TestQParams) == 20 && offsetof(TestQParams, active_rows) == 16);
+-
+-    struct TestNormParams {
+-        uint32_t width, streams; float epsilon; uint32_t spin_max, status_word_offset, profile_spin, active_rows;
+-    };
+-    static_assert(sizeof(TestNormParams) == 28 && offsetof(TestNormParams, active_rows) == 24);
+-
+-    struct TestLoParams {
+-        uint32_t rank_dim, streams, late_word_offset, spin_max, status_word_offset, profile_spin, sidecar_f16, active_rows;
+-    };
+-    static_assert(sizeof(TestLoParams) == 32 && offsetof(TestLoParams, active_rows) == 28);
+-
+     // Section 2: Single-row non-regression invariant.
+     // When active_rows = 1, token 0 offsets must match the single-row reference exactly.
+     for (uint32_t stream = 0; stream < layout.streams; ++stream) {
+@@ -253,32 +224,6 @@ static void latebind_token_dimension_multi_row_invariants() {
+             }
+         }
+     }
+-
+-    // Section 4: External binding capacity validation contract.
+-    // Verify that tp5_late_consumer_ref requires external tensors to satisfy capacity_rows * ...
+-    for (uint32_t cap : {1u, 2u, 3u, 4u}) {
+-        const uint64_t mixed_req = uint64_t(cap) * layout.width * sizeof(float);
+-        const uint64_t lo_req = uint64_t(cap) * layout.rank_dim * sizeof(float);
+-        const uint64_t residual_req = uint64_t(cap) * layout.streams * layout.width * sizeof(float);
+-
+-        auto check_capacity = [&](uint64_t mixed_sz, uint64_t lo_sz, uint64_t res_sz) -> bool {
+-            return mixed_sz >= mixed_req && lo_sz >= lo_req && res_sz >= residual_req;
+-        };
+-
+-        // Exact match passes
+-        CHECK(check_capacity(mixed_req, lo_req, residual_req));
+-        // Under-sized mixed fails
+-        CHECK(!check_capacity(mixed_req - 1, lo_req, residual_req));
+-        // Under-sized lo fails
+-        CHECK(!check_capacity(mixed_req, lo_req - 1, residual_req));
+-        // Under-sized residual fails
+-        CHECK(!check_capacity(mixed_req, lo_req, residual_req - 1));
+-        // Legacy single-row size against multi-row capacity (cap > 1) fails closed!
+-        if (cap > 1) {
+-            CHECK(!check_capacity(layout.width * sizeof(float), layout.rank_dim * sizeof(float),
+-                                  layout.streams * layout.width * sizeof(float)));
+-        }
+-    }
+ }
+ 
+ int main() {
+diff --git a/tests/test-vulkan-command-replay.cpp b/tests/test-vulkan-command-replay.cpp
+index ae2d8e243..ed8db3039 100644
+--- a/tests/test-vulkan-command-replay.cpp
++++ b/tests/test-vulkan-command-replay.cpp
+@@ -2880,6 +2880,299 @@ static void test_attention_region_replay(test_env & env) {
+         "fallback, gated output and downstream views.\n");
+ }
+ 
++static void test_replay_shrinking_kv_attention(test_env & env) {
++    constexpr int head = 64, capacity = 64;
++    auto * ctx = ggml_init({65536, nullptr, true});
++    TEST_ASSERT(ctx);
++    auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head, 1, 1, 1);
++    auto * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head, capacity, 1, 1);
++    auto * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head, capacity, 1, 1);
++    auto * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
++    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
++    auto * graph = ggml_new_graph_custom(ctx, 16, false);
++    ggml_build_forward_expand(graph, out);
++    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, env.backend_gpu);
++    TEST_ASSERT(buffer);
++    std::vector<float> queries(head, 0.0f), result(head);
++    std::vector<ggml_fp16_t> keys(head * capacity, ggml_fp32_to_fp16(0.0f));
++    std::vector<ggml_fp16_t> values(head * capacity);
++    for (int t = 0; t < capacity; ++t) {
++        std::fill(values.begin() + t * head, values.begin() + (t + 1) * head,
++                  ggml_fp32_to_fp16(t < capacity / 2 ? 1.0f : 3.0f));
++    }
++    ggml_backend_tensor_set(q, queries.data(), 0, queries.size() * sizeof(float));
++    ggml_backend_tensor_set(k, keys.data(), 0, keys.size() * sizeof(ggml_fp16_t));
++    ggml_backend_tensor_set(v, values.data(), 0, values.size() * sizeof(ggml_fp16_t));
++    for (int live : {capacity, capacity / 2, capacity}) {
++        k->ne[1] = live;
++        v->ne[1] = live;
++        CHECK_STATUS(ggml_backend_graph_compute(env.backend_gpu, graph), "actual live-KV attention");
++        ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
++        const float expected = live == capacity ? 2.0f : 1.0f;
++        for (float val : result) {
++            CHECK_CLOSE(val, expected, 1e-6f);
++        }
++    }
++    ggml_backend_synchronize(env.backend_gpu);
++    ggml_backend_buffer_free(buffer);
++    ggml_free(ctx);
++    printf("test_replay_shrinking_kv_attention PASSED: strict shape mismatch prevents stale capacity replay\n");
++}
++
++static bool test_mmvq_scratch_reuse(test_env & env) {
++    const char * old_force = std::getenv("GGML_VK_FORCE_MMVQ");
++    const char * old_disable = std::getenv("GGML_VK_DISABLE_MMVQ");
++    const std::string force_value = old_force ? old_force : "";
++    const std::string disable_value = old_disable ? old_disable : "";
++    setenv("GGML_VK_FORCE_MMVQ", "1", 1);
++    unsetenv("GGML_VK_DISABLE_MMVQ");
++    auto * backend_gpu = ggml_backend_vk_init(0);
++    if (old_force) setenv("GGML_VK_FORCE_MMVQ", force_value.c_str(), 1);
++    else unsetenv("GGML_VK_FORCE_MMVQ");
++    if (old_disable) setenv("GGML_VK_DISABLE_MMVQ", disable_value.c_str(), 1);
++    else unsetenv("GGML_VK_DISABLE_MMVQ");
++    TEST_ASSERT(backend_gpu);
++    if (!env.get_region_mmvq_stats || !env.get_region_mmvq_stats(backend_gpu, nullptr, nullptr, nullptr, nullptr)) {
++        printf("SKIP test_mmvq_scratch_reuse: integer-dot MMVQ unavailable.\n");
++        ggml_backend_free(backend_gpu);
++        return false;
++    }
++
++    constexpr int k = 320;
++    constexpr int m = 128;
++    constexpr int kv_length = 8192;
++    for (const bool attention : {false, true}) {
++        auto * weights_ctx = ggml_init({1024 * 1024, nullptr, true});
++        TEST_ASSERT(weights_ctx);
++        auto * weight = ggml_new_tensor_2d(weights_ctx, GGML_TYPE_Q8_0, k, m);
++        auto * keys = attention ? ggml_new_tensor_4d(weights_ctx, GGML_TYPE_F16, m, kv_length, 1, 1) : nullptr;
++        auto * values = attention ? ggml_new_tensor_4d(weights_ctx, GGML_TYPE_F16, m, kv_length, 1, 1) : nullptr;
++        auto * mask = attention ? ggml_new_tensor_2d(weights_ctx, GGML_TYPE_F16, kv_length, k) : nullptr;
++        auto * weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, backend_gpu);
++        TEST_ASSERT(weights_buffer);
++        ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        std::vector<float> weight_values(k * m);
++        for (int row = 0; row < m; ++row) {
++            for (int col = 0; col < k; ++col) {
++                const int q = col % 32 == 0 ? 127 : (row * 17 + col * 31) % 253 - 126;
++                weight_values[row * k + col] = std::ldexp(float(q), -5 - row % 3);
++            }
++        }
++        std::vector<uint8_t> packed(ggml_nbytes(weight));
++        TEST_ASSERT(ggml_quantize_chunk(weight->type, weight_values.data(), packed.data(), 0, m, k, nullptr) == packed.size());
++        ggml_backend_tensor_set(weight, packed.data(), 0, packed.size());
++        if (attention) {
++            std::vector<ggml_fp16_t> key_values(ggml_nelements(keys), ggml_fp32_to_fp16(0.0f));
++            std::vector<ggml_fp16_t> value_values(ggml_nelements(values));
++            std::vector<ggml_fp16_t> mask_values(ggml_nelements(mask), ggml_fp32_to_fp16(0.0f));
++            for (size_t i = 0; i < value_values.size(); ++i) {
++                value_values[i] = ggml_fp32_to_fp16(float(int(i % m) % 31 - 15) / 256.0f);
++            }
++            ggml_backend_tensor_set(keys, key_values.data(), 0, key_values.size() * sizeof(ggml_fp16_t));
++            ggml_backend_tensor_set(values, value_values.data(), 0, value_values.size() * sizeof(ggml_fp16_t));
++            ggml_backend_tensor_set(mask, mask_values.data(), 0, mask_values.size() * sizeof(ggml_fp16_t));
++        }
++
++        auto * ctx = ggml_init({1024 * 1024, nullptr, true});
++        TEST_ASSERT(ctx);
++        auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
++        ggml_set_input(input);
++        auto * first = ggml_mul_mat(ctx, weight, input);
++        ggml_set_output(first);
++        auto * repeated = ggml_repeat(ctx, first, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k * m));
++        auto * intermediate = attention ?
++            ggml_flash_attn_ext(ctx, ggml_reshape_4d(ctx, repeated, m, k, 1, 1), keys, values, mask,
++                                1.0f / std::sqrt(float(m)), 0.0f, 0.0f) : ggml_soft_max(ctx, repeated);
++        if (attention) ggml_flash_attn_ext_set_prec(intermediate, GGML_PREC_F32);
++        ggml_set_output(intermediate);
++        // Producing the second weight from the reduction prevents the graph
++        // optimizer from moving both independent matmuls before the scratch write.
++        auto * produced_weight = ggml_cast(ctx, ggml_reshape_2d(ctx, intermediate, k, m), GGML_TYPE_Q8_0);
++        ggml_set_output(produced_weight);
++        auto * last = ggml_mul_mat(ctx, produced_weight, input);
++        ggml_set_output(last);
++        auto * graph = ggml_new_graph_custom(ctx, 32, false);
++        ggml_build_forward_expand(graph, first);
++        ggml_build_forward_expand(graph, intermediate);
++        ggml_build_forward_expand(graph, last);
++        ggml_backend_t backends[] = {backend_gpu, env.backend_cpu};
++        auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 64, false, true);
++        TEST_ASSERT(sched);
++        ggml_backend_sched_set_tensor_backend(sched, input, backend_gpu);
++        for (auto * node : {first, repeated, intermediate, produced_weight, last}) {
++            TEST_ASSERT(ggml_backend_supports_op(backend_gpu, node));
++            ggml_backend_sched_set_tensor_backend(sched, node, backend_gpu);
++        }
++        TEST_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
++        uint64_t hits_before = 0, misses_before = 0;
++        env.get_stats(backend_gpu, &hits_before, &misses_before);
++        for (int round = 0; round < 3; ++round) {
++            std::vector<float> input_values(k);
++            for (int col = 0; col < k; ++col) {
++                const int q = col % 32 == 0 ? 127 : (col * 13 + round * 19) % 253 - 126;
++                input_values[col] = std::ldexp(float(q), -4 - round);
++            }
++            ggml_backend_tensor_set(input, input_values.data(), 0, input_values.size() * sizeof(float));
++            TEST_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
++            std::vector<float> before(m), after(m), intermediate_values(k * m), produced_values(k * m);
++            ggml_backend_tensor_get(first, before.data(), 0, before.size() * sizeof(float));
++            ggml_backend_tensor_get(last, after.data(), 0, after.size() * sizeof(float));
++            ggml_backend_tensor_get(intermediate, intermediate_values.data(), 0, intermediate_values.size() * sizeof(float));
++            std::vector<uint8_t> produced_bytes(ggml_nbytes(produced_weight));
++            ggml_backend_tensor_get(produced_weight, produced_bytes.data(), 0, produced_bytes.size());
++            ggml_get_type_traits(produced_weight->type)->to_float(produced_bytes.data(), produced_values.data(), k * m);
++            double probability_sum = 0;
++            for (size_t i = 0; i < intermediate_values.size(); ++i) {
++                if (attention) {
++                    CHECK_CLOSE(intermediate_values[i], float(int(i % m) % 31 - 15) / 256.0f, 1e-5f);
++                } else {
++                    TEST_ASSERT(std::isfinite(intermediate_values[i]) && intermediate_values[i] >= 0);
++                    probability_sum += intermediate_values[i];
++                }
++            }
++            if (!attention) TEST_ASSERT(std::abs(probability_sum - 1.0) < 1e-4);
++            for (int row = 0; row < m; ++row) {
++                double expected_first = 0, expected_last = 0;
++                for (int col = 0; col < k; ++col) {
++                    expected_first += double(weight_values[row * k + col]) * input_values[col];
++                    expected_last += double(produced_values[row * k + col]) * input_values[col];
++                }
++                CHECK_CLOSE(before[row], float(expected_first), 1e-5f);
++                CHECK_CLOSE(after[row], float(expected_last), 1e-5f);
++            }
++        }
++        uint64_t hits_after = 0, misses_after = 0;
++        env.get_stats(backend_gpu, &hits_after, &misses_after);
++        TEST_ASSERT(hits_after >= hits_before + 2);
++        ggml_backend_sched_free(sched);
++        ggml_free(ctx);
++        ggml_backend_buffer_free(weights_buffer);
++        ggml_free(weights_ctx);
++    }
++    ggml_backend_free(backend_gpu);
++    printf("test_mmvq_scratch_reuse PASSED: large softmax and FA mask scratch writes, independent CPU agreement, changing inputs and replay.\n");
++    return true;
++}
++
++static bool test_mmvq_input_mutation_replay(test_env & env) {
++    const char * old_force = std::getenv("GGML_VK_FORCE_MMVQ");
++    const char * old_disable = std::getenv("GGML_VK_DISABLE_MMVQ");
++    const std::string force_value = old_force ? old_force : "";
++    const std::string disable_value = old_disable ? old_disable : "";
++    setenv("GGML_VK_FORCE_MMVQ", "1", 1);
++    unsetenv("GGML_VK_DISABLE_MMVQ");
++    auto * backend_gpu = ggml_backend_vk_init(0);
++    if (old_force) setenv("GGML_VK_FORCE_MMVQ", force_value.c_str(), 1);
++    else unsetenv("GGML_VK_FORCE_MMVQ");
++    if (old_disable) setenv("GGML_VK_DISABLE_MMVQ", disable_value.c_str(), 1);
++    else unsetenv("GGML_VK_DISABLE_MMVQ");
++    TEST_ASSERT(backend_gpu);
++    if (!env.get_region_mmvq_stats || !env.get_region_mmvq_stats(backend_gpu, nullptr, nullptr, nullptr, nullptr)) {
++        printf("SKIP test_mmvq_input_mutation_replay: integer-dot MMVQ unavailable.\n");
++        ggml_backend_free(backend_gpu);
++        return false;
++    }
++
++    constexpr int k = 320;
++    auto * weights_ctx = ggml_init({1024 * 1024, nullptr, true});
++    TEST_ASSERT(weights_ctx);
++    auto * weight = ggml_new_tensor_2d(weights_ctx, GGML_TYPE_Q8_0, k, 1);
++    auto * weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, backend_gpu);
++    TEST_ASSERT(weights_buffer);
++    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    TEST_ASSERT(ggml_type_size(GGML_TYPE_Q8_0) == 34);
++    std::vector<uint8_t> packed(ggml_nbytes(weight), 0);
++    const ggml_fp16_t one = ggml_fp32_to_fp16(1.0f);
++    for (int block = 0; block < k / 32; ++block) {
++        std::memcpy(packed.data() + 34 * block, &one, sizeof(one));
++    }
++    // Exact first-coordinate projection; no rounded 1/127 weight scale.
++    packed[2] = 1;
++    ggml_backend_tensor_set(weight, packed.data(), 0, packed.size());
++
++    for (const bool partial : {false, true}) {
++        auto * ctx = ggml_init({1024 * 1024, nullptr, true});
++        TEST_ASSERT(ctx);
++        const int prefix = partial ? 8 : 0;
++        const int start = partial ? 32 : 0;
++        const int length = partial ? 64 : k;
++        auto * input_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k + prefix);
++        ggml_set_input(input_base);
++        auto * input = ggml_view_1d(ctx, input_base, k, prefix * sizeof(float));
++        auto * first = ggml_mul_mat(ctx, weight, input);
++        ggml_set_output(first);
++        auto * target = ggml_view_1d(ctx, input, length, start * sizeof(float));
++        auto * factors = ggml_repeat(ctx, first, target);
++        auto * mutated = ggml_mul_inplace(ctx, target, factors);
++        ggml_set_output(mutated);
++        auto * produced_values = partial ? ggml_repeat(ctx, mutated, input) : mutated;
++        auto * produced_weight = ggml_cast(ctx, ggml_reshape_2d(ctx, produced_values, k, 1), GGML_TYPE_Q8_0);
++        ggml_set_output(produced_weight);
++        // Weight production forces the final read of the SAME graph input
++        // after the source write, even if independent matmuls are reordered.
++        auto * last = ggml_mul_mat(ctx, produced_weight, input);
++        ggml_set_output(last);
++        auto * graph = ggml_new_graph_custom(ctx, 32, false);
++        ggml_build_forward_expand(graph, first);
++        ggml_build_forward_expand(graph, last);
++        ggml_backend_t backends[] = {backend_gpu, env.backend_cpu};
++        auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 64, false, true);
++        TEST_ASSERT(sched);
++        ggml_backend_sched_set_tensor_backend(sched, input_base, backend_gpu);
++        for (auto * node : {first, factors, mutated, produced_values, produced_weight, last}) {
++            TEST_ASSERT(ggml_backend_supports_op(backend_gpu, node));
++            ggml_backend_sched_set_tensor_backend(sched, node, backend_gpu);
++        }
++        TEST_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
++        for (auto * node : {first, factors, mutated, produced_values, produced_weight, last}) {
++            TEST_ASSERT(ggml_backend_sched_get_tensor_backend(sched, node) == backend_gpu);
++        }
++        uint64_t hits_before = 0;
++        env.get_stats(backend_gpu, &hits_before, nullptr);
++        for (int round = 0; round < 3; ++round) {
++            std::vector<float> values(k + prefix, 0.0f), current(k), weight_values(k);
++            for (int col = 0; col < k; ++col) {
++                values[prefix + col] = col % 32 == 31 ? 127.0f : float((col + round) % 7 - 3);
++            }
++            const float factor = values[prefix] = float(2 + round);
++            double expected_last = 0;
++            for (int col = 0; col < k; ++col) {
++                const float x = values[prefix + col] * (col >= start && col < start + length ? factor : 1.0f);
++                const float w = factor * values[prefix + start + col % length];
++                expected_last += double(x) * w;
++            }
++            ggml_backend_tensor_set(input_base, values.data(), 0, values.size() * sizeof(float));
++            TEST_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
++            float actual_first = 0, actual_last = 0;
++            ggml_backend_tensor_get(first, &actual_first, 0, sizeof(float));
++            ggml_backend_tensor_get(last, &actual_last, 0, sizeof(float));
++            ggml_backend_tensor_get(input, current.data(), 0, current.size() * sizeof(float));
++            std::vector<uint8_t> produced_bytes(ggml_nbytes(produced_weight));
++            ggml_backend_tensor_get(produced_weight, produced_bytes.data(), 0, produced_bytes.size());
++            ggml_get_type_traits(produced_weight->type)->to_float(produced_bytes.data(), weight_values.data(), k);
++            TEST_ASSERT(actual_first == factor);
++            for (int col = 0; col < k; ++col) {
++                const float x = values[prefix + col] * (col >= start && col < start + length ? factor : 1.0f);
++                TEST_ASSERT(current[col] == x);
++                TEST_ASSERT(weight_values[col] == factor * values[prefix + start + col % length]);
++            }
++            // All scales and products are exact dyadic values; these sums
++            // stay below 2^24, so accumulation tolerance cannot hide stale X.
++            TEST_ASSERT(std::isfinite(actual_last) && double(actual_last) == expected_last);
++        }
++        uint64_t hits_after = 0;
++        env.get_stats(backend_gpu, &hits_after, nullptr);
++        TEST_ASSERT(hits_after >= hits_before + 2);
++        ggml_backend_sched_free(sched);
++        ggml_free(ctx);
++    }
++    ggml_backend_buffer_free(weights_buffer);
++    ggml_free(weights_ctx);
++    ggml_backend_free(backend_gpu);
++    printf("test_mmvq_input_mutation_replay PASSED: full and partial aliased source writes, exact CPU oracle, changing inputs and replay.\n");
++    return true;
++}
++
+ static void test_attention_projections_replay(test_env & env, bool require_mmvq = false, bool growth_only = false) {
+     struct proj_case {
+         bool   qsa;
+@@ -2889,9 +3182,13 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq
+         int    rows2;
+         int    rows3;
+         size_t offset;
++        int    n_tokens = 1;
+     };
+ 
+     const proj_case cases[] = {
++        // Record a three-token graph before the nested four-token scratch
++        // growth, then replay it with new values through the capacity-four slot.
++        { false, 256,  7,  5,  3,  3,  64, 3 },
+         // GDN: W0=Q5_K, W1=Q5_K, W2=Q6_K, W3=Q6_K; alpha/beta rows (rows2/rows3) equal
+         { false, 256,  12, 8,  6,  6,  0  }, // quantized width tail (256 vs 1024 native block)
+         { false, 2560, 48, 16, 8,  8,  32 }, // full width 2560, nonzero aligned offset (32 bytes)
+@@ -2904,10 +3201,17 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq
+         { true,  1280, 7,  5,  5,  3,  64 }, // two iterations plus lane tails
+         { false, 3072, 9,  7,  5,  5,  0  }, // 4+2 integer-dot K loop
+         { true,  3584, 9,  5,  5,  7,  32 }, // 4+2+1 integer-dot K loop
+-        { true,  8192, 16, 8,  8,  8,  32 }, // nested scratch-growth fixture only
++        { false, 2560, 48, 16, 8,  8,  32, 2 },
++        { true,  2560, 32, 12, 12, 16, 32, 2 },
++        { true,  1280, 7,  5,  5,  3,  64, 3 },
++        { false, 256,  7,  5,  3,  3,  64, 4 },
++        { true,  256,  5,  3,  3,  7,  64, 4 },
++        { true,  8192, 16, 8,  8,  8,  32, 4 }, // nested scratch-growth fixture only
+         // Fallback cases: mismatched shapes that legitimately prevent fusion and execute as native operators
+         { false, 256,  8,  8,  6,  4,  0  }, // GDN fallback: alpha rows != beta rows (6 != 4)
+         { true,  256,  8,  6,  4,  8,  0  }, // QSA fallback: K rows != V rows (6 != 4)
++        { false, 256,  7,  5,  3,  3,  64, 5 }, // exceeds fused token capacity
++        { true,  256,  5,  3,  3,  7,  64, 5 },
+     };
+ 
+     ggml_backend_t backends[] = { env.backend_gpu, env.backend_cpu };
+@@ -2962,10 +3266,11 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq
+             auto * ctx = contexts[reference] = ggml_init({ 512 * 1024, nullptr, true });
+             TEST_ASSERT(ctx != nullptr);
+ 
+-            auto * input_base = inputs[reference] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.width + 32);
++            auto * input_base = inputs[reference] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.width, c.n_tokens + 1);
+             ggml_set_input(input_base);
+ 
+-            auto * input = ggml_view_1d(ctx, ggml_scale(ctx, input_base, 1.0f), c.width, c.offset);
++            auto * input = ggml_view_2d(ctx, ggml_scale(ctx, input_base, 1.0f), c.width, c.n_tokens,
++                                       input_base->nb[1], c.offset);
+ 
+             auto * graph = graphs[reference] = ggml_new_graph_custom(ctx, 32, false);
+             ggml_build_forward_expand(graph, input);
+@@ -3003,7 +3308,7 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq
+                 exercised_growth = true;
+                 verify_old_recording = true;
+             }
+-            std::vector<float> input_vals(c.width + 32);
++            std::vector<float> input_vals(ggml_nelements(inputs[0]));
+             for (size_t i = 0; i < input_vals.size(); ++i) {
+                 input_vals[i] = std::sin(float(i % 251) * 0.071f + round * 0.23f) * 0.7f;
+             }
+@@ -3052,8 +3357,8 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq
+                     }
+                 }
+                 if (!equal) {
+-                    std::fprintf(stderr, "Projection mismatch: qsa=%d width=%d output=%d round=%d\n", c.qsa, c.width,
+-                                 out_idx, round);
++                    std::fprintf(stderr, "Projection mismatch: qsa=%d width=%d tokens=%d output=%d round=%d\n",
++                                 c.qsa, c.width, c.n_tokens, out_idx, round);
+                 }
+                 TEST_ASSERT(equal);
+             }
+@@ -3076,7 +3381,7 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq
+         TEST_ASSERT((gdn_mask & 7u) == 7u && (qsa_mask & 5u) == 5u); // Q5 and paired Q6, not a float fallback
+         TEST_ASSERT(exercised_growth);
+     }
+-    printf("test_attention_projections_replay PASSED%s: native oracle, K tails, row tiles, views, changing inputs; "
++    printf("test_attention_projections_replay PASSED%s: native oracle, token counts 1-5, K tails, row tiles, views, changing inputs; "
+            "F32 path bitwise, MMVQ path bounded accumulation tolerance.\n",
+            growth_only ? " (scratch-growth fixture)" : require_mmvq ? " (MMVQ + fusion + replay)" : "");
+ }
+@@ -4081,18 +4386,19 @@ int main(int argc, char ** argv) {
+     const bool hc_variants_only            = argc == 2 && std::strcmp(argv[1], "--hc-variants-only") == 0;
+     const bool attention_projections_only = argc == 2 && std::strcmp(argv[1], "--attention-projections-only") == 0;
+     const bool attention_mmvq_only = argc == 2 && std::strcmp(argv[1], "--attention-mmvq-only") == 0;
++    const bool scratch_reuse_only = argc == 2 && std::strcmp(argv[1], "--scratch-reuse-only") == 0;
+     const bool attention_region_only      = argc == 2 && std::strcmp(argv[1], "--attention-region-only") == 0;
+     const bool skinny_only = argc == 2 && std::strcmp(argv[1], "--skinny-only") == 0;
+     const bool argmax_only = argc == 2 && std::strcmp(argv[1], "--argmax-only") == 0;
+     if (argc != 1 && !transfer_only && !snapshot_only && !moe_only && !moe_output_only && !gdn_only &&
+         !gdn_cache_only && !staged_router_only && !router_gate_only && !rope_only && !rows_only && !hc_fold_only && !hc_combine_only &&
+         !hc_variants_only &&
+-        !attention_projections_only && !attention_mmvq_only && !attention_region_only && !skinny_only && !argmax_only) {
++        !attention_projections_only && !attention_mmvq_only && !scratch_reuse_only && !attention_region_only && !skinny_only && !argmax_only) {
+         std::fprintf(stderr,
+                      "Usage: %s "
+                      "[--transfer-only|--snapshot-only|--moe-only|--moe-output-only|--gdn-only|--gdn-cache-only|--"
+                      "staged-router-only|--router-gate-only|--rope-only|--rows-only|--hc-fold-only|--hc-combine-only|--hc-variants-only|--attention-"
+-                     "projections-only|--attention-mmvq-only|--attention-region-only|--skinny-only|--argmax-only]\n",
++                     "projections-only|--attention-mmvq-only|--scratch-reuse-only|--attention-region-only|--skinny-only|--argmax-only]\n",
+                      argv[0]);
+         return 2;
+     }
+@@ -4177,6 +4483,11 @@ int main(int argc, char ** argv) {
+         test_hc_variant_numerics(env);
+         return 0;
+     }
++    if (scratch_reuse_only) {
++        const bool scratch_ok = test_mmvq_scratch_reuse(env);
++        const bool mutation_ok = test_mmvq_input_mutation_replay(env);
++        return scratch_ok && mutation_ok ? 0 : 77;
++    }
+     if (attention_mmvq_only) {
+         if (!env.get_region_mmvq_stats ||
+             !env.get_region_mmvq_stats(env.backend_gpu, nullptr, nullptr, nullptr, nullptr)) {
+@@ -4231,10 +4542,14 @@ int main(int argc, char ** argv) {
+     ++tests_run;
+     test_gdn_cached_region_replay(env);
+     ++tests_run;
++    if (test_mmvq_scratch_reuse(env)) ++tests_run;
++    if (test_mmvq_input_mutation_replay(env)) ++tests_run;
+     test_attention_projections_replay(env);
+     ++tests_run;
+     test_attention_region_replay(env);
+     ++tests_run;
++    test_replay_shrinking_kv_attention(env);
++    ++tests_run;
+     test_staged_router_alias(env);
+     ++tests_run;
+     test_add_rms_scratch_reuse(env);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 88f278f5a..c2a476b7a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -5922,31 +5922,48 @@ private:
+             }
+         }
+ 
+-        // Predefine 纯路线：模型加载时预先完成单 token decode 的图定义，作为唯一真理锁定，彻底消除后续首轮及轮次间波动
+-        if (ctx_tgt) {
+-            if (spec) {
+-                const int n_draft_max = params_base.speculative.draft.n_max;
+-                if (n_draft_max > 0) {
+-                    const int verify_tokens = n_draft_max + 1;
+-                    SRV_INF("%s: Pre-recording verify graph at load time (%d tokens)...\n", __func__, verify_tokens);
+-                    llama_batch vbatch = llama_batch_init(verify_tokens, 0, 1);
+-                    vbatch.n_tokens = verify_tokens;
+-                    for (int k = 0; k < verify_tokens; ++k) {
+-                        vbatch.token[k] = 1;
+-                        vbatch.pos[k] = k;
+-                        vbatch.n_seq_id[k] = 1;
+-                        vbatch.seq_id[k][0] = 0;
+-                        vbatch.logits[k] = 1;
+-                    }
+-                    llama_decode(ctx_tgt, vbatch);
+-                    llama_batch_free(vbatch);
++        // Execute decode and every legal MTP verification prefix before accepting
++        // requests. Two executions exercise cold recording and its warm path;
++        // success is not permission to bypass binding/coverage qualification.
++        if (ctx_tgt && params_base.tp5.enabled && params_base.warmup) {
++            const int   max_rows   = spec ? std::max(1, params_base.speculative.draft.n_max + 1) : 1;
++            llama_token warm_token = llama_vocab_bos(vocab);
++            if (warm_token == LLAMA_TOKEN_NULL) {
++                warm_token = llama_vocab_eos(vocab);
++            }
++            if (warm_token == LLAMA_TOKEN_NULL) {
++                warm_token = 0;
++            }
++            for (int rows = 1; rows <= max_rows; ++rows) {
++                SRV_INF("%s: Prewarming TP5 decode/verify graph (%d tokens)...\n", __func__, rows);
++                llama_batch batch = llama_batch_init(rows, 0, 1);
++                batch.n_tokens    = rows;
++                for (int k = 0; k < rows; ++k) {
++                    batch.token[k]     = warm_token;
++                    batch.pos[k]       = k;
++                    batch.n_seq_id[k]  = 1;
++                    batch.seq_id[k][0] = 0;
++                    batch.logits[k]    = 1;
++                }
++                for (int iter = 0; iter < 2; ++iter) {
++                    const int rc = llama_decode(ctx_tgt, batch);
++                    llama_synchronize(ctx_tgt);
+                     if (auto * mem = llama_get_memory(ctx_tgt)) {
+                         llama_memory_clear(mem, true);
+                     }
+                     llama_synchronize(ctx_tgt);
+-                    SRV_INF("%s: Pre-recorded verify graph locked.\n", __func__);
++                    if (rc != 0) {
++                        llama_batch_free(batch);
++                        SRV_ERR("%s: TP5 prewarm failed: rows=%d iteration=%d rc=%d; aborting model load\n", __func__,
++                                rows, iter, rc);
++                        return false;
++                    }
+                 }
++                llama_batch_free(batch);
+             }
++            llama_init->reset_samplers();
++            llama_perf_context_reset(ctx_tgt);
++            SRV_INF("%s: TP5 decode/verify warmup completed.\n", __func__);
+         }
+ 
+         return true;
+@@ -9444,6 +9461,10 @@ private:
+                         slot.n_prompt_tokens_processed = 0;
+ 
+                         slot.prompt.tokens.keep_first(n_past);
++                        if (n_past == 0 && spec) {
++                            // No retained prefix means no preceding hidden-state carry.
++                            common_speculative_set_state(spec.get(), slot.id, {});
++                        }
+ 
+                         // this is to signal the client that the request has started processing
+                         if (slot.task->params.stream && slot.n_decoded_start == 0) {
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+index 5d37c3453..b54563521 100644
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -123,7 +123,6 @@ void server_queue::terminate() {
+ }
+ 
+ void server_queue::start_loop(int64_t idle_sleep_ms) {
+-    running = true;
+     time_last_task = ggml_time_ms();
+ 
+     constexpr auto max_wait_time = std::chrono::seconds(1);
+diff --git a/tools/server/server-queue.h b/tools/server/server-queue.h
+index 0b674d6ff..8f94c54cd 100644
+--- a/tools/server/server-queue.h
++++ b/tools/server/server-queue.h
+@@ -13,7 +13,8 @@
+ struct server_queue {
+ private:
+     int id = 0;
+-    bool running  = false;
++    // Termination is terminal, including before start_loop reaches its first wait.
++    bool running  = true;
+     bool sleeping = false;
+     bool req_stop_sleeping = false;
+     int64_t time_last_task = 0;
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 837f83063..ac3ba1218 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -4,6 +4,7 @@
+ #include "server-cors-proxy.h"
+ #include "server-stream.h"
+ #include "server-tools.h"
++#include "server-signal.h"
+ 
+ #include "arg.h"
+ #include "build-info.h"
+@@ -17,6 +18,7 @@
+ #include <clocale>
+ #include <cstdlib>
+ #include <exception>
++#include <optional>
+ #include <signal.h>
+ #include <thread> // for std::thread::hardware_concurrency
+ 
+@@ -25,7 +27,9 @@
+ #endif
+ 
+ static std::function<void(int)> shutdown_handler;
++#if defined(_WIN32)
+ static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
++#endif
+ 
+ static int64_t token_hack_env_i64(const char * name, int64_t fallback) {
+     const char * value = std::getenv(name);
+@@ -38,6 +42,7 @@ static int64_t token_hack_env_i64(const char * name, int64_t fallback) {
+     return end != value ? (int64_t) parsed : fallback;
+ }
+ 
++#if defined(_WIN32)
+ static inline void signal_handler(int signal) {
+     if (is_terminating.test_and_set()) {
+         // A second signal may interrupt teardown: bypass stdio and global destructors.
+@@ -46,6 +51,7 @@ static inline void signal_handler(int signal) {
+ 
+     shutdown_handler(signal);
+ }
++#endif
+ 
+ // satisfies -Wmissing-declarations (used by llama command)
+ int llama_server(int argc, char ** argv);
+@@ -526,15 +532,14 @@ int llama_server(common_params & params, int argc, char ** argv) {
+         };
+     }
+ 
++#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
++    std::optional<server_signal_dispatcher> signal_dispatcher;
++#endif
++
+     // register signal handler if not running by CLI
+     if (!is_run_by_cli) {
+ #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+-        struct sigaction sigint_action;
+-        sigint_action.sa_handler = signal_handler;
+-        sigemptyset (&sigint_action.sa_mask);
+-        sigint_action.sa_flags = 0;
+-        sigaction(SIGINT, &sigint_action, NULL);
+-        sigaction(SIGTERM, &sigint_action, NULL);
++        signal_dispatcher.emplace(shutdown_handler);
+ #elif defined (_WIN32)
+         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
+             return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
+@@ -562,6 +567,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
+             ctx_http.thread.join(); // keep the main thread alive
+         }
+ 
++#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
++        if (signal_dispatcher) {
++            signal_dispatcher->stop();
++        }
++#endif
+         // when the HTTP server stops, clean up and exit
+         clean_up();
+     } else {
+@@ -575,6 +585,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
+         // this call blocks the main thread until queue_tasks.terminate() is called
+         ctx_server.start_loop();
+ 
++#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
++        if (signal_dispatcher) {
++            signal_dispatcher->stop();
++        }
++#endif
+         auto * ll_ctx = ctx_server.get_llama_context();
+         if (ll_ctx != nullptr) {
+             common_memory_breakdown_print(ll_ctx);

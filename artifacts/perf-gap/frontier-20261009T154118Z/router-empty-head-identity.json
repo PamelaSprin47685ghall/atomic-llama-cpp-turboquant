@@ -1,0 +1,24 @@
+{
+  "parent_identity": "router-slice-fixed-identity.json",
+  "source_manifest_sha256": "9c65a535d44afe0488d0cb4ca5cce874a733baea87f7b936998207c2a3dee260",
+  "overlay_source": {
+    "ggml/src/ggml-backend-meta.cpp": "75769f14aa67d6bead8f5da5d884601678838a2548a3753bc124cb44002093ae"
+  },
+  "binary_hashes": {
+    "llama-server": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c",
+    "tp5-router-parity": "f05cc295d40dab06a922694c3cb4139e179d6da9373007332f40df081579e8b5",
+    "libggml-base.so.0.18.1": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46",
+    "libggml.so.0.18.1": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2",
+    "libggml-cpu.so.0.18.1": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+    "libggml-vulkan.so.0.18.1": "596084f91b4471a99470bb32c9b897f0fc23c9ed57c66172b3f3529094e6576d",
+    "libllama.so.0.0.2188": "09e65f0968dbf5a5d48b3a10507088a36c4b394830d09f98665fa79f9cfac1a8",
+    "libllama-common.so.0.0.2188": "29bcbe656b7e8932ad8e399680873b5eddb442bd393b93ab5d638a548c3b9ff9",
+    "libllama-server-impl.so": "5c560e6abdef9833a7668e74780b55571f6700ceb969661811b45c7d82867669",
+    "libmtmd.so.0.0.2188": "a0b4c3eb6eec8c35d07b1303d77493cef60b225f2e39e8423ce9ebaad277be88",
+    "tp5-router-trace": "a6a6704d6ec537eae56cfd5d8eaf81a8a00bf9be43930197ca01b99c993f4823"
+  },
+  "scope": "only meta empty-collective semantics and failure diagnostics updated; source MTP phase/capacity/BF16 preparation not in this snapshot",
+  "before_proof": "natural h0HTTP500 layer47 scores512x0; CPU regression failed against slice-fixed frozen core",
+  "after_cpu_proof": "same live/empty/live regression passed on fixed base DSO; artifact://115",
+  "qualification": "natural generation after fix pending"
+}

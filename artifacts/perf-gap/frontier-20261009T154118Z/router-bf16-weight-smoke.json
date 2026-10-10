@@ -1,0 +1,15 @@
+{
+  "command": [
+    "flock",
+    "/var/tmp/tp5-gpu.lock",
+    "env",
+    "LD_LIBRARY_PATH=/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin",
+    "GGML_VK_ROUTER_WEIGHTS=bf16",
+    "GGML_VK_ROUTER_TILING=0",
+    "/var/tmp/tp5-router-weight-smoke"
+  ],
+  "returncode": 0,
+  "log": "router-bf16-weight-smoke.log",
+  "scope": "single Vulkan0; exact-BF16 synthetic weights; sync+async strided writes and warm reuse all reflect updated values",
+  "qualification": "numerical smoke only; real-model parity/throughput pending"
+}

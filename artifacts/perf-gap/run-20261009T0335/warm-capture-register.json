@@ -1,0 +1,7 @@
+{
+  "finding": "Even two-query span-only first capture is about21ms while sustained model per-token is about15ms. The first captured chain required a distinct recorded definition; it must not automatically stand for steady replay.",
+  "method": "GGML_TP5_GPU_TIMING_WINDOW=16 holds the capture layout for16 consecutive scalar chains. Reuse the same completed query pool and captured command definitions. Query availability must be observed before reset/reuse, stage count must match; otherwise capture is unavailable, original execution retained. No additional host wait, fake completion or relaxed sync.",
+  "selection": "Record every captured sample including first. Report first versus remaining median. Use the same predeclared span and 8:residue partitions; do not splice dense first-capture components into an uninstrumented total.",
+  "dedup": "Candidate did not remove any barrier (1703 emitted,0 identical_removed) and pilotA66.503/B66.487 is flat. No performance qualification campaign or speed claim for it; retire the opt-in candidate code after retaining exact patch/evidence.",
+  "remaining": "The warm-window diagnostic is not a hardware lower bound and does not change the independent kernel/relay evidence scope."
+}

@@ -1,0 +1,10 @@
+[0000:0f:00.0  drm=/sys/bus/pci/devices/0000:0f:00.0/drm/card1  cap=227000000  cap_max=249000000]
+  pp_dpm_sclk: S: 0Mhz * 1: 500Mhz  2: 2475Mhz  
+[0000:09:00.0  drm=/sys/bus/pci/devices/0000:09:00.0/drm/card2  cap=203000000  cap_max=223000000]
+  pp_dpm_sclk: S: 0Mhz * 1: 500Mhz  2: 1200Mhz  
+[0000:0c:00.0  drm=/sys/bus/pci/devices/0000:0c:00.0/drm/card3  cap=227000000  cap_max=249000000]
+  pp_dpm_sclk: S: 0Mhz * 1: 500Mhz  2: 2475Mhz  
+[0000:06:00.0  drm=/sys/bus/pci/devices/0000:06:00.0/drm/card4  cap=203000000  cap_max=223000000]
+  pp_dpm_sclk: S: 0Mhz * 1: 500Mhz  2: 2475Mhz  
+[0000:03:00.0  drm=/sys/bus/pci/devices/0000:03:00.0/drm/card5  cap=203000000  cap_max=223000000]
+  pp_dpm_sclk: S: 0Mhz * 1: 500Mhz  2: 2475Mhz  

@@ -1,0 +1,4771 @@
+{
+  "kind": "SPARSE_STEADY_GPU_ATTRIBUTION_NOT_RESOURCE_BOUND",
+  "span_windows": [
+    {
+      "run": "warm-8-0",
+      "rank": 0,
+      "first_us": 21495.32,
+      "steady_median_us": 11188.16,
+      "steady_min_us": 11106.04,
+      "steady_max_us": 11298.4
+    },
+    {
+      "run": "warm-8-0",
+      "rank": 1,
+      "first_us": 21345.86,
+      "steady_median_us": 11052.8,
+      "steady_min_us": 10973.32,
+      "steady_max_us": 11144.0
+    },
+    {
+      "run": "warm-8-0",
+      "rank": 2,
+      "first_us": 21170.71,
+      "steady_median_us": 10903.24,
+      "steady_min_us": 10849.88,
+      "steady_max_us": 11061.48
+    },
+    {
+      "run": "warm-8-0",
+      "rank": 3,
+      "first_us": 21046.15,
+      "steady_median_us": 10821.56,
+      "steady_min_us": 10749.28,
+      "steady_max_us": 10913.52
+    },
+    {
+      "run": "warm-8-0",
+      "rank": 4,
+      "first_us": 20922.85,
+      "steady_median_us": 10742.36,
+      "steady_min_us": 10677.48,
+      "steady_max_us": 10840.92
+    },
+    {
+      "run": "warm-8-1",
+      "rank": 0,
+      "first_us": 21266.46,
+      "steady_median_us": 11192.56,
+      "steady_min_us": 11107.56,
+      "steady_max_us": 11343.84
+    },
+    {
+      "run": "warm-8-1",
+      "rank": 1,
+      "first_us": 21124.4,
+      "steady_median_us": 11058.44,
+      "steady_min_us": 10930.64,
+      "steady_max_us": 11163.92
+    },
+    {
+      "run": "warm-8-1",
+      "rank": 2,
+      "first_us": 20950.64,
+      "steady_median_us": 10936.44,
+      "steady_min_us": 10869.68,
+      "steady_max_us": 11102.08
+    },
+    {
+      "run": "warm-8-1",
+      "rank": 3,
+      "first_us": 20822.88,
+      "steady_median_us": 10825.52,
+      "steady_min_us": 10750.48,
+      "steady_max_us": 10982.8
+    },
+    {
+      "run": "warm-8-1",
+      "rank": 4,
+      "first_us": 20705.44,
+      "steady_median_us": 10751.24,
+      "steady_min_us": 10674.96,
+      "steady_max_us": 10901.88
+    },
+    {
+      "run": "warm-8-2",
+      "rank": 0,
+      "first_us": 21493.62,
+      "steady_median_us": 11219.4,
+      "steady_min_us": 11160.2,
+      "steady_max_us": 11358.4
+    },
+    {
+      "run": "warm-8-2",
+      "rank": 1,
+      "first_us": 21277.6,
+      "steady_median_us": 11073.88,
+      "steady_min_us": 10986.32,
+      "steady_max_us": 11181.72
+    },
+    {
+      "run": "warm-8-2",
+      "rank": 2,
+      "first_us": 21132.43,
+      "steady_median_us": 10953.36,
+      "steady_min_us": 10909.88,
+      "steady_max_us": 11108.08
+    },
+    {
+      "run": "warm-8-2",
+      "rank": 3,
+      "first_us": 20900.59,
+      "steady_median_us": 10839.16,
+      "steady_min_us": 10798.76,
+      "steady_max_us": 10976.72
+    },
+    {
+      "run": "warm-8-2",
+      "rank": 4,
+      "first_us": 20810.68,
+      "steady_median_us": 10761.96,
+      "steady_min_us": 10714.92,
+      "steady_max_us": 10882.76
+    },
+    {
+      "run": "warm-8-3",
+      "rank": 0,
+      "first_us": 21241.35,
+      "steady_median_us": 11205.64,
+      "steady_min_us": 11105.36,
+      "steady_max_us": 11323.6
+    },
+    {
+      "run": "warm-8-3",
+      "rank": 1,
+      "first_us": 21054.33,
+      "steady_median_us": 11078.32,
+      "steady_min_us": 10949.4,
+      "steady_max_us": 11196.48
+    },
+    {
+      "run": "warm-8-3",
+      "rank": 2,
+      "first_us": 20917.13,
+      "steady_median_us": 10958.92,
+      "steady_min_us": 10879.08,
+      "steady_max_us": 11090.56
+    },
+    {
+      "run": "warm-8-3",
+      "rank": 3,
+      "first_us": 20753.54,
+      "steady_median_us": 10837.64,
+      "steady_min_us": 10747.6,
+      "steady_max_us": 10940.6
+    },
+    {
+      "run": "warm-8-3",
+      "rank": 4,
+      "first_us": 20635.52,
+      "steady_median_us": 10762.12,
+      "steady_min_us": 10661.6,
+      "steady_max_us": 10863.48
+    },
+    {
+      "run": "warm-8-4",
+      "rank": 0,
+      "first_us": 21032.92,
+      "steady_median_us": 11200.76,
+      "steady_min_us": 11146.36,
+      "steady_max_us": 11514.04
+    },
+    {
+      "run": "warm-8-4",
+      "rank": 1,
+      "first_us": 20886.44,
+      "steady_median_us": 11110.12,
+      "steady_min_us": 10993.88,
+      "steady_max_us": 11431.52
+    },
+    {
+      "run": "warm-8-4",
+      "rank": 2,
+      "first_us": 20728.88,
+      "steady_median_us": 10964.28,
+      "steady_min_us": 10905.32,
+      "steady_max_us": 11288.24
+    },
+    {
+      "run": "warm-8-4",
+      "rank": 3,
+      "first_us": 20601.37,
+      "steady_median_us": 10840.64,
+      "steady_min_us": 10774.92,
+      "steady_max_us": 11135.76
+    },
+    {
+      "run": "warm-8-4",
+      "rank": 4,
+      "first_us": 20460.62,
+      "steady_median_us": 10769.52,
+      "steady_min_us": 10703.4,
+      "steady_max_us": 11061.64
+    },
+    {
+      "run": "warm-8-5",
+      "rank": 0,
+      "first_us": 21291.77,
+      "steady_median_us": 11204.28,
+      "steady_min_us": 11148.32,
+      "steady_max_us": 11338.72
+    },
+    {
+      "run": "warm-8-5",
+      "rank": 1,
+      "first_us": 21133.06,
+      "steady_median_us": 11059.52,
+      "steady_min_us": 10991.44,
+      "steady_max_us": 11211.56
+    },
+    {
+      "run": "warm-8-5",
+      "rank": 2,
+      "first_us": 20941.56,
+      "steady_median_us": 10954.88,
+      "steady_min_us": 10906.12,
+      "steady_max_us": 11085.0
+    },
+    {
+      "run": "warm-8-5",
+      "rank": 3,
+      "first_us": 20801.25,
+      "steady_median_us": 10837.2,
+      "steady_min_us": 10783.28,
+      "steady_max_us": 10962.12
+    },
+    {
+      "run": "warm-8-5",
+      "rank": 4,
+      "first_us": 20660.3,
+      "steady_median_us": 10764.04,
+      "steady_min_us": 10704.56,
+      "steady_max_us": 10886.84
+    },
+    {
+      "run": "warm-8-6",
+      "rank": 0,
+      "first_us": 21441.64,
+      "steady_median_us": 11249.84,
+      "steady_min_us": 11098.48,
+      "steady_max_us": 11480.2
+    },
+    {
+      "run": "warm-8-6",
+      "rank": 1,
+      "first_us": 21248.9,
+      "steady_median_us": 11099.36,
+      "steady_min_us": 10950.24,
+      "steady_max_us": 11307.28
+    },
+    {
+      "run": "warm-8-6",
+      "rank": 2,
+      "first_us": 21051.16,
+      "steady_median_us": 10987.16,
+      "steady_min_us": 10838.24,
+      "steady_max_us": 11232.8
+    },
+    {
+      "run": "warm-8-6",
+      "rank": 3,
+      "first_us": 20869.51,
+      "steady_median_us": 10870.76,
+      "steady_min_us": 10738.16,
+      "steady_max_us": 11109.32
+    },
+    {
+      "run": "warm-8-6",
+      "rank": 4,
+      "first_us": 20751.45,
+      "steady_median_us": 10794.8,
+      "steady_min_us": 10662.32,
+      "steady_max_us": 11031.8
+    },
+    {
+      "run": "warm-8-7",
+      "rank": 0,
+      "first_us": 21511.84,
+      "steady_median_us": 11217.6,
+      "steady_min_us": 11149.4,
+      "steady_max_us": 11398.44
+    },
+    {
+      "run": "warm-8-7",
+      "rank": 1,
+      "first_us": 21327.89,
+      "steady_median_us": 11119.2,
+      "steady_min_us": 11008.24,
+      "steady_max_us": 11232.52
+    },
+    {
+      "run": "warm-8-7",
+      "rank": 2,
+      "first_us": 21180.86,
+      "steady_median_us": 10978.56,
+      "steady_min_us": 10901.92,
+      "steady_max_us": 11141.12
+    },
+    {
+      "run": "warm-8-7",
+      "rank": 3,
+      "first_us": 21052.42,
+      "steady_median_us": 10861.6,
+      "steady_min_us": 10788.32,
+      "steady_max_us": 11025.28
+    },
+    {
+      "run": "warm-8-7",
+      "rank": 4,
+      "first_us": 20935.09,
+      "steady_median_us": 10785.4,
+      "steady_min_us": 10716.0,
+      "steady_max_us": 10948.76
+    },
+    {
+      "run": "warm-span",
+      "rank": 0,
+      "first_us": 21204.37,
+      "steady_median_us": 11171.56,
+      "steady_min_us": 11086.4,
+      "steady_max_us": 12249.28
+    },
+    {
+      "run": "warm-span",
+      "rank": 1,
+      "first_us": 20995.88,
+      "steady_median_us": 11082.72,
+      "steady_min_us": 10994.64,
+      "steady_max_us": 12165.64
+    },
+    {
+      "run": "warm-span",
+      "rank": 2,
+      "first_us": 20867.83,
+      "steady_median_us": 10932.4,
+      "steady_min_us": 10840.76,
+      "steady_max_us": 12016.68
+    },
+    {
+      "run": "warm-span",
+      "rank": 3,
+      "first_us": 20739.04,
+      "steady_median_us": 10807.12,
+      "steady_min_us": 10714.24,
+      "steady_max_us": 11882.56
+    },
+    {
+      "run": "warm-span",
+      "rank": 4,
+      "first_us": 20591.94,
+      "steady_median_us": 10733.28,
+      "steady_min_us": 10637.92,
+      "steady_max_us": 11806.4
+    }
+  ],
+  "stage_medians": [
+    {
+      "stage": 0,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 0.12,
+      "compute_us": 84.0,
+      "p1_us": 8.56,
+      "late_pre_us": 478.96
+    },
+    {
+      "stage": 0,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 0.12,
+      "compute_us": 87.0,
+      "p1_us": 9.04,
+      "late_pre_us": 310.72
+    },
+    {
+      "stage": 0,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 0.12,
+      "compute_us": 86.36,
+      "p1_us": 8.76,
+      "late_pre_us": 192.44
+    },
+    {
+      "stage": 0,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 0.08,
+      "compute_us": 85.16,
+      "p1_us": 8.72,
+      "late_pre_us": 93.04
+    },
+    {
+      "stage": 0,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 0.08,
+      "compute_us": 77.96,
+      "p1_us": 8.76,
+      "late_pre_us": 23.12
+    },
+    {
+      "stage": 1,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 28.44,
+      "compute_us": 132.24,
+      "p1_us": 0.08,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 1,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 28.64,
+      "compute_us": 132.84,
+      "p1_us": 0.12,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 1,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 28.6,
+      "compute_us": 135.16,
+      "p1_us": 0.12,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 1,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 28.44,
+      "compute_us": 133.28,
+      "p1_us": 0.12,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 1,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 23.0,
+      "compute_us": 129.12,
+      "p1_us": 0.12,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 2,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 31.0,
+      "compute_us": 190.88,
+      "p1_us": 8.48,
+      "late_pre_us": 26.64
+    },
+    {
+      "stage": 2,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 29.72,
+      "compute_us": 194.48,
+      "p1_us": 8.52,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 2,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 30.52,
+      "compute_us": 196.52,
+      "p1_us": 8.6,
+      "late_pre_us": 24.32
+    },
+    {
+      "stage": 2,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 30.56,
+      "compute_us": 194.76,
+      "p1_us": 8.68,
+      "late_pre_us": 24.2
+    },
+    {
+      "stage": 2,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.36,
+      "compute_us": 181.6,
+      "p1_us": 8.4,
+      "late_pre_us": 34.76
+    },
+    {
+      "stage": 3,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 27.72,
+      "compute_us": 60.76,
+      "p1_us": 8.52,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 3,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 26.92,
+      "compute_us": 60.68,
+      "p1_us": 8.64,
+      "late_pre_us": 23.16
+    },
+    {
+      "stage": 3,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.6,
+      "compute_us": 62.32,
+      "p1_us": 8.76,
+      "late_pre_us": 23.88
+    },
+    {
+      "stage": 3,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 26.36,
+      "compute_us": 61.32,
+      "p1_us": 8.72,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 3,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.64,
+      "compute_us": 58.72,
+      "p1_us": 8.4,
+      "late_pre_us": 22.56
+    },
+    {
+      "stage": 4,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.68,
+      "compute_us": 40.8,
+      "p1_us": 8.64,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 4,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.52,
+      "compute_us": 43.2,
+      "p1_us": 8.6,
+      "late_pre_us": 22.84
+    },
+    {
+      "stage": 4,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.8,
+      "compute_us": 42.0,
+      "p1_us": 9.04,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 4,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.72,
+      "compute_us": 41.52,
+      "p1_us": 8.84,
+      "late_pre_us": 23.32
+    },
+    {
+      "stage": 4,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 25.68,
+      "compute_us": 35.92,
+      "p1_us": 8.56,
+      "late_pre_us": 24.44
+    },
+    {
+      "stage": 5,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.12,
+      "compute_us": 60.8,
+      "p1_us": 8.56,
+      "late_pre_us": 18.56
+    },
+    {
+      "stage": 5,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.68,
+      "compute_us": 60.64,
+      "p1_us": 8.68,
+      "late_pre_us": 18.44
+    },
+    {
+      "stage": 5,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.52,
+      "compute_us": 62.28,
+      "p1_us": 8.84,
+      "late_pre_us": 17.88
+    },
+    {
+      "stage": 5,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.52,
+      "compute_us": 61.36,
+      "p1_us": 8.8,
+      "late_pre_us": 17.92
+    },
+    {
+      "stage": 5,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 26.56,
+      "compute_us": 58.76,
+      "p1_us": 8.6,
+      "late_pre_us": 20.56
+    },
+    {
+      "stage": 6,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.48,
+      "compute_us": 43.6,
+      "p1_us": 8.44,
+      "late_pre_us": 20.4
+    },
+    {
+      "stage": 6,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 43.6,
+      "p1_us": 8.72,
+      "late_pre_us": 20.24
+    },
+    {
+      "stage": 6,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.68,
+      "compute_us": 46.68,
+      "p1_us": 8.64,
+      "late_pre_us": 18.0
+    },
+    {
+      "stage": 6,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.52,
+      "compute_us": 43.76,
+      "p1_us": 8.56,
+      "late_pre_us": 19.52
+    },
+    {
+      "stage": 6,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.4,
+      "compute_us": 39.84,
+      "p1_us": 8.44,
+      "late_pre_us": 22.92
+    },
+    {
+      "stage": 7,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.68,
+      "compute_us": 60.64,
+      "p1_us": 8.48,
+      "late_pre_us": 23.52
+    },
+    {
+      "stage": 7,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.76,
+      "compute_us": 60.68,
+      "p1_us": 8.6,
+      "late_pre_us": 23.4
+    },
+    {
+      "stage": 7,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.92,
+      "compute_us": 61.88,
+      "p1_us": 9.12,
+      "late_pre_us": 24.2
+    },
+    {
+      "stage": 7,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.76,
+      "compute_us": 61.12,
+      "p1_us": 8.96,
+      "late_pre_us": 23.68
+    },
+    {
+      "stage": 7,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.52,
+      "compute_us": 59.4,
+      "p1_us": 8.6,
+      "late_pre_us": 23.04
+    },
+    {
+      "stage": 8,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.0,
+      "compute_us": 40.88,
+      "p1_us": 8.44,
+      "late_pre_us": 23.24
+    },
+    {
+      "stage": 8,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.56,
+      "compute_us": 43.6,
+      "p1_us": 8.76,
+      "late_pre_us": 22.72
+    },
+    {
+      "stage": 8,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.6,
+      "compute_us": 41.88,
+      "p1_us": 8.6,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 8,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.68,
+      "compute_us": 41.8,
+      "p1_us": 8.72,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 8,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.92,
+      "compute_us": 36.2,
+      "p1_us": 8.44,
+      "late_pre_us": 23.04
+    },
+    {
+      "stage": 9,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.64,
+      "compute_us": 60.2,
+      "p1_us": 8.48,
+      "late_pre_us": 23.72
+    },
+    {
+      "stage": 9,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.32,
+      "compute_us": 60.4,
+      "p1_us": 8.6,
+      "late_pre_us": 23.2
+    },
+    {
+      "stage": 9,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.72,
+      "compute_us": 61.8,
+      "p1_us": 8.56,
+      "late_pre_us": 24.04
+    },
+    {
+      "stage": 9,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 60.64,
+      "p1_us": 8.68,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 9,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 25.4,
+      "compute_us": 58.44,
+      "p1_us": 8.4,
+      "late_pre_us": 22.64
+    },
+    {
+      "stage": 10,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.8,
+      "compute_us": 41.12,
+      "p1_us": 8.76,
+      "late_pre_us": 23.12
+    },
+    {
+      "stage": 10,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.88,
+      "compute_us": 43.16,
+      "p1_us": 8.64,
+      "late_pre_us": 22.84
+    },
+    {
+      "stage": 10,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.08,
+      "compute_us": 41.92,
+      "p1_us": 8.6,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 10,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.8,
+      "compute_us": 41.52,
+      "p1_us": 8.96,
+      "late_pre_us": 23.4
+    },
+    {
+      "stage": 10,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.0,
+      "compute_us": 35.88,
+      "p1_us": 8.44,
+      "late_pre_us": 24.6
+    },
+    {
+      "stage": 11,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.28,
+      "compute_us": 60.96,
+      "p1_us": 8.4,
+      "late_pre_us": 23.36
+    },
+    {
+      "stage": 11,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.52,
+      "compute_us": 60.72,
+      "p1_us": 8.72,
+      "late_pre_us": 23.08
+    },
+    {
+      "stage": 11,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.84,
+      "compute_us": 62.44,
+      "p1_us": 8.52,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 11,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.2,
+      "compute_us": 61.28,
+      "p1_us": 8.64,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 11,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 23.0,
+      "compute_us": 59.0,
+      "p1_us": 8.2,
+      "late_pre_us": 22.36
+    },
+    {
+      "stage": 12,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.32,
+      "compute_us": 41.36,
+      "p1_us": 8.36,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 12,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.28,
+      "compute_us": 43.12,
+      "p1_us": 8.48,
+      "late_pre_us": 23.32
+    },
+    {
+      "stage": 12,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.88,
+      "compute_us": 41.76,
+      "p1_us": 8.72,
+      "late_pre_us": 23.4
+    },
+    {
+      "stage": 12,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.56,
+      "compute_us": 41.64,
+      "p1_us": 8.6,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 12,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 22.0,
+      "compute_us": 36.8,
+      "p1_us": 8.48,
+      "late_pre_us": 23.92
+    },
+    {
+      "stage": 13,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.32,
+      "compute_us": 60.44,
+      "p1_us": 8.6,
+      "late_pre_us": 19.04
+    },
+    {
+      "stage": 13,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.88,
+      "compute_us": 60.8,
+      "p1_us": 8.48,
+      "late_pre_us": 18.72
+    },
+    {
+      "stage": 13,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 24.0,
+      "compute_us": 62.12,
+      "p1_us": 8.72,
+      "late_pre_us": 17.8
+    },
+    {
+      "stage": 13,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.4,
+      "compute_us": 61.08,
+      "p1_us": 8.76,
+      "late_pre_us": 18.0
+    },
+    {
+      "stage": 13,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 26.92,
+      "compute_us": 58.88,
+      "p1_us": 8.4,
+      "late_pre_us": 19.92
+    },
+    {
+      "stage": 14,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 26.2,
+      "compute_us": 43.08,
+      "p1_us": 8.36,
+      "late_pre_us": 19.4
+    },
+    {
+      "stage": 14,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.84,
+      "compute_us": 43.2,
+      "p1_us": 8.76,
+      "late_pre_us": 19.68
+    },
+    {
+      "stage": 14,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 25.32,
+      "compute_us": 45.96,
+      "p1_us": 8.52,
+      "late_pre_us": 18.12
+    },
+    {
+      "stage": 14,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 26.24,
+      "compute_us": 43.24,
+      "p1_us": 8.56,
+      "late_pre_us": 19.24
+    },
+    {
+      "stage": 14,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 26.72,
+      "compute_us": 39.84,
+      "p1_us": 8.52,
+      "late_pre_us": 22.16
+    },
+    {
+      "stage": 15,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.6,
+      "compute_us": 60.8,
+      "p1_us": 8.6,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 15,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.76,
+      "compute_us": 60.16,
+      "p1_us": 8.68,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 15,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.2,
+      "compute_us": 61.68,
+      "p1_us": 8.88,
+      "late_pre_us": 24.24
+    },
+    {
+      "stage": 15,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.64,
+      "compute_us": 61.12,
+      "p1_us": 8.8,
+      "late_pre_us": 23.92
+    },
+    {
+      "stage": 15,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.84,
+      "compute_us": 60.24,
+      "p1_us": 8.48,
+      "late_pre_us": 23.4
+    },
+    {
+      "stage": 16,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 41.48,
+      "p1_us": 8.36,
+      "late_pre_us": 23.88
+    },
+    {
+      "stage": 16,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.08,
+      "compute_us": 44.12,
+      "p1_us": 8.76,
+      "late_pre_us": 24.04
+    },
+    {
+      "stage": 16,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.68,
+      "compute_us": 42.68,
+      "p1_us": 8.68,
+      "late_pre_us": 24.76
+    },
+    {
+      "stage": 16,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.72,
+      "compute_us": 42.44,
+      "p1_us": 8.52,
+      "late_pre_us": 24.08
+    },
+    {
+      "stage": 16,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 25.4,
+      "compute_us": 37.16,
+      "p1_us": 8.32,
+      "late_pre_us": 25.88
+    },
+    {
+      "stage": 17,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.68,
+      "compute_us": 63.08,
+      "p1_us": 8.36,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 17,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 21.8,
+      "compute_us": 62.88,
+      "p1_us": 8.48,
+      "late_pre_us": 23.24
+    },
+    {
+      "stage": 17,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.28,
+      "compute_us": 64.92,
+      "p1_us": 8.52,
+      "late_pre_us": 24.12
+    },
+    {
+      "stage": 17,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.56,
+      "compute_us": 63.68,
+      "p1_us": 8.6,
+      "late_pre_us": 23.88
+    },
+    {
+      "stage": 17,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.64,
+      "compute_us": 61.0,
+      "p1_us": 8.36,
+      "late_pre_us": 22.76
+    },
+    {
+      "stage": 18,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.32,
+      "compute_us": 40.56,
+      "p1_us": 8.56,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 18,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.68,
+      "compute_us": 43.12,
+      "p1_us": 8.52,
+      "late_pre_us": 23.0
+    },
+    {
+      "stage": 18,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.4,
+      "compute_us": 41.76,
+      "p1_us": 8.52,
+      "late_pre_us": 24.08
+    },
+    {
+      "stage": 18,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.08,
+      "compute_us": 41.64,
+      "p1_us": 8.76,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 18,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 21.56,
+      "compute_us": 35.84,
+      "p1_us": 8.36,
+      "late_pre_us": 25.16
+    },
+    {
+      "stage": 19,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.96,
+      "compute_us": 62.4,
+      "p1_us": 8.32,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 19,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.08,
+      "compute_us": 62.08,
+      "p1_us": 8.68,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 19,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.24,
+      "compute_us": 64.0,
+      "p1_us": 8.44,
+      "late_pre_us": 23.92
+    },
+    {
+      "stage": 19,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.44,
+      "compute_us": 62.8,
+      "p1_us": 8.56,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 19,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.64,
+      "compute_us": 60.2,
+      "p1_us": 8.12,
+      "late_pre_us": 22.72
+    },
+    {
+      "stage": 20,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.04,
+      "compute_us": 41.44,
+      "p1_us": 8.52,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 20,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.0,
+      "compute_us": 43.56,
+      "p1_us": 8.52,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 20,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.2,
+      "compute_us": 42.44,
+      "p1_us": 8.72,
+      "late_pre_us": 23.68
+    },
+    {
+      "stage": 20,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.36,
+      "compute_us": 42.0,
+      "p1_us": 8.76,
+      "late_pre_us": 23.68
+    },
+    {
+      "stage": 20,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.28,
+      "compute_us": 36.2,
+      "p1_us": 8.44,
+      "late_pre_us": 23.12
+    },
+    {
+      "stage": 21,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.08,
+      "compute_us": 61.56,
+      "p1_us": 8.44,
+      "late_pre_us": 19.72
+    },
+    {
+      "stage": 21,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.24,
+      "compute_us": 61.52,
+      "p1_us": 8.44,
+      "late_pre_us": 19.76
+    },
+    {
+      "stage": 21,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.16,
+      "compute_us": 63.68,
+      "p1_us": 8.84,
+      "late_pre_us": 18.08
+    },
+    {
+      "stage": 21,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.12,
+      "compute_us": 62.16,
+      "p1_us": 8.72,
+      "late_pre_us": 19.44
+    },
+    {
+      "stage": 21,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 26.6,
+      "compute_us": 60.32,
+      "p1_us": 8.36,
+      "late_pre_us": 20.12
+    },
+    {
+      "stage": 22,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.68,
+      "compute_us": 43.52,
+      "p1_us": 8.32,
+      "late_pre_us": 19.8
+    },
+    {
+      "stage": 22,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.96,
+      "compute_us": 43.36,
+      "p1_us": 8.72,
+      "late_pre_us": 19.0
+    },
+    {
+      "stage": 22,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.12,
+      "compute_us": 46.48,
+      "p1_us": 8.6,
+      "late_pre_us": 17.92
+    },
+    {
+      "stage": 22,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.28,
+      "compute_us": 44.0,
+      "p1_us": 8.6,
+      "late_pre_us": 18.88
+    },
+    {
+      "stage": 22,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.84,
+      "compute_us": 39.4,
+      "p1_us": 8.32,
+      "late_pre_us": 22.36
+    },
+    {
+      "stage": 23,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.88,
+      "compute_us": 62.6,
+      "p1_us": 8.48,
+      "late_pre_us": 23.36
+    },
+    {
+      "stage": 23,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.72,
+      "compute_us": 62.72,
+      "p1_us": 8.44,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 23,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.28,
+      "compute_us": 64.04,
+      "p1_us": 8.84,
+      "late_pre_us": 23.76
+    },
+    {
+      "stage": 23,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.16,
+      "compute_us": 63.36,
+      "p1_us": 8.8,
+      "late_pre_us": 23.92
+    },
+    {
+      "stage": 23,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 23.92,
+      "compute_us": 60.96,
+      "p1_us": 8.6,
+      "late_pre_us": 23.12
+    },
+    {
+      "stage": 24,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.12,
+      "compute_us": 41.56,
+      "p1_us": 8.32,
+      "late_pre_us": 23.52
+    },
+    {
+      "stage": 24,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.2,
+      "compute_us": 43.84,
+      "p1_us": 8.8,
+      "late_pre_us": 23.04
+    },
+    {
+      "stage": 24,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.6,
+      "compute_us": 42.36,
+      "p1_us": 8.52,
+      "late_pre_us": 23.88
+    },
+    {
+      "stage": 24,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.88,
+      "compute_us": 42.2,
+      "p1_us": 8.6,
+      "late_pre_us": 23.76
+    },
+    {
+      "stage": 24,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.4,
+      "compute_us": 36.84,
+      "p1_us": 8.32,
+      "late_pre_us": 22.64
+    },
+    {
+      "stage": 25,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.0,
+      "compute_us": 61.88,
+      "p1_us": 8.32,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 25,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.68,
+      "compute_us": 61.56,
+      "p1_us": 8.48,
+      "late_pre_us": 23.16
+    },
+    {
+      "stage": 25,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.64,
+      "compute_us": 63.6,
+      "p1_us": 8.52,
+      "late_pre_us": 24.36
+    },
+    {
+      "stage": 25,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.8,
+      "compute_us": 62.52,
+      "p1_us": 8.56,
+      "late_pre_us": 23.76
+    },
+    {
+      "stage": 25,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 22.12,
+      "compute_us": 59.72,
+      "p1_us": 8.32,
+      "late_pre_us": 22.64
+    },
+    {
+      "stage": 26,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.4,
+      "compute_us": 40.44,
+      "p1_us": 8.8,
+      "late_pre_us": 23.4
+    },
+    {
+      "stage": 26,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.84,
+      "compute_us": 43.16,
+      "p1_us": 8.52,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 26,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.24,
+      "compute_us": 41.72,
+      "p1_us": 8.48,
+      "late_pre_us": 23.68
+    },
+    {
+      "stage": 26,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 41.16,
+      "p1_us": 9.0,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 26,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.12,
+      "compute_us": 36.28,
+      "p1_us": 8.16,
+      "late_pre_us": 23.0
+    },
+    {
+      "stage": 27,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.16,
+      "compute_us": 62.0,
+      "p1_us": 8.32,
+      "late_pre_us": 23.92
+    },
+    {
+      "stage": 27,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.48,
+      "compute_us": 61.44,
+      "p1_us": 8.48,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 27,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 24.08,
+      "compute_us": 63.8,
+      "p1_us": 8.52,
+      "late_pre_us": 23.88
+    },
+    {
+      "stage": 27,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.56,
+      "compute_us": 62.24,
+      "p1_us": 8.52,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 27,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 23.52,
+      "compute_us": 60.0,
+      "p1_us": 8.16,
+      "late_pre_us": 22.8
+    },
+    {
+      "stage": 28,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.64,
+      "compute_us": 41.0,
+      "p1_us": 8.36,
+      "late_pre_us": 23.32
+    },
+    {
+      "stage": 28,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.56,
+      "compute_us": 43.56,
+      "p1_us": 8.48,
+      "late_pre_us": 22.88
+    },
+    {
+      "stage": 28,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.68,
+      "compute_us": 41.96,
+      "p1_us": 8.68,
+      "late_pre_us": 24.24
+    },
+    {
+      "stage": 28,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.68,
+      "compute_us": 41.72,
+      "p1_us": 8.6,
+      "late_pre_us": 23.24
+    },
+    {
+      "stage": 28,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 26.28,
+      "compute_us": 36.28,
+      "p1_us": 8.36,
+      "late_pre_us": 24.76
+    },
+    {
+      "stage": 29,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 26.04,
+      "compute_us": 62.36,
+      "p1_us": 8.64,
+      "late_pre_us": 18.48
+    },
+    {
+      "stage": 29,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.8,
+      "compute_us": 62.2,
+      "p1_us": 8.48,
+      "late_pre_us": 19.16
+    },
+    {
+      "stage": 29,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 64.08,
+      "p1_us": 8.68,
+      "late_pre_us": 17.76
+    },
+    {
+      "stage": 29,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.72,
+      "compute_us": 62.64,
+      "p1_us": 8.76,
+      "late_pre_us": 18.2
+    },
+    {
+      "stage": 29,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 27.0,
+      "compute_us": 60.2,
+      "p1_us": 8.4,
+      "late_pre_us": 20.04
+    },
+    {
+      "stage": 30,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.6,
+      "compute_us": 43.24,
+      "p1_us": 8.36,
+      "late_pre_us": 20.04
+    },
+    {
+      "stage": 30,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.76,
+      "compute_us": 43.64,
+      "p1_us": 8.6,
+      "late_pre_us": 19.48
+    },
+    {
+      "stage": 30,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.64,
+      "compute_us": 46.0,
+      "p1_us": 8.8,
+      "late_pre_us": 18.24
+    },
+    {
+      "stage": 30,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.04,
+      "compute_us": 43.28,
+      "p1_us": 8.52,
+      "late_pre_us": 20.12
+    },
+    {
+      "stage": 30,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.6,
+      "compute_us": 39.64,
+      "p1_us": 8.52,
+      "late_pre_us": 22.2
+    },
+    {
+      "stage": 31,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 62.76,
+      "p1_us": 8.52,
+      "late_pre_us": 23.4
+    },
+    {
+      "stage": 31,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.44,
+      "compute_us": 62.12,
+      "p1_us": 8.4,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 31,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.48,
+      "compute_us": 63.96,
+      "p1_us": 8.84,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 31,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.68,
+      "compute_us": 63.2,
+      "p1_us": 8.8,
+      "late_pre_us": 23.72
+    },
+    {
+      "stage": 31,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.24,
+      "compute_us": 61.52,
+      "p1_us": 8.64,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 32,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.6,
+      "compute_us": 41.48,
+      "p1_us": 8.4,
+      "late_pre_us": 23.52
+    },
+    {
+      "stage": 32,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.4,
+      "compute_us": 43.84,
+      "p1_us": 8.64,
+      "late_pre_us": 22.96
+    },
+    {
+      "stage": 32,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.8,
+      "compute_us": 42.2,
+      "p1_us": 8.56,
+      "late_pre_us": 24.12
+    },
+    {
+      "stage": 32,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.12,
+      "compute_us": 42.52,
+      "p1_us": 8.6,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 32,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.96,
+      "compute_us": 36.96,
+      "p1_us": 8.36,
+      "late_pre_us": 22.96
+    },
+    {
+      "stage": 33,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.88,
+      "compute_us": 62.36,
+      "p1_us": 8.48,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 33,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.92,
+      "compute_us": 61.6,
+      "p1_us": 8.48,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 33,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.08,
+      "compute_us": 63.52,
+      "p1_us": 8.56,
+      "late_pre_us": 23.8
+    },
+    {
+      "stage": 33,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.24,
+      "compute_us": 62.84,
+      "p1_us": 8.72,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 33,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.88,
+      "compute_us": 60.28,
+      "p1_us": 8.12,
+      "late_pre_us": 22.76
+    },
+    {
+      "stage": 34,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 41.08,
+      "p1_us": 8.6,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 34,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.04,
+      "compute_us": 43.44,
+      "p1_us": 8.48,
+      "late_pre_us": 23.04
+    },
+    {
+      "stage": 34,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.92,
+      "compute_us": 42.2,
+      "p1_us": 8.52,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 34,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.72,
+      "compute_us": 41.92,
+      "p1_us": 8.96,
+      "late_pre_us": 24.2
+    },
+    {
+      "stage": 34,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.92,
+      "compute_us": 36.56,
+      "p1_us": 8.2,
+      "late_pre_us": 23.12
+    },
+    {
+      "stage": 35,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.12,
+      "compute_us": 61.68,
+      "p1_us": 8.32,
+      "late_pre_us": 23.72
+    },
+    {
+      "stage": 35,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.52,
+      "compute_us": 61.8,
+      "p1_us": 8.68,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 35,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.56,
+      "compute_us": 63.16,
+      "p1_us": 8.48,
+      "late_pre_us": 24.04
+    },
+    {
+      "stage": 35,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.84,
+      "compute_us": 62.24,
+      "p1_us": 8.6,
+      "late_pre_us": 24.08
+    },
+    {
+      "stage": 35,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.72,
+      "compute_us": 60.08,
+      "p1_us": 8.16,
+      "late_pre_us": 22.76
+    },
+    {
+      "stage": 36,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.68,
+      "compute_us": 40.84,
+      "p1_us": 8.4,
+      "late_pre_us": 23.76
+    },
+    {
+      "stage": 36,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.08,
+      "compute_us": 43.08,
+      "p1_us": 8.64,
+      "late_pre_us": 22.8
+    },
+    {
+      "stage": 36,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.68,
+      "compute_us": 41.96,
+      "p1_us": 8.76,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 36,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.12,
+      "compute_us": 41.72,
+      "p1_us": 8.6,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 36,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 21.24,
+      "compute_us": 36.16,
+      "p1_us": 8.36,
+      "late_pre_us": 25.32
+    },
+    {
+      "stage": 37,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.08,
+      "compute_us": 62.52,
+      "p1_us": 8.56,
+      "late_pre_us": 18.52
+    },
+    {
+      "stage": 37,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.36,
+      "compute_us": 62.16,
+      "p1_us": 8.52,
+      "late_pre_us": 18.72
+    },
+    {
+      "stage": 37,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.96,
+      "compute_us": 63.88,
+      "p1_us": 8.84,
+      "late_pre_us": 17.76
+    },
+    {
+      "stage": 37,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.96,
+      "compute_us": 63.08,
+      "p1_us": 8.72,
+      "late_pre_us": 18.08
+    },
+    {
+      "stage": 37,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 27.52,
+      "compute_us": 60.44,
+      "p1_us": 8.32,
+      "late_pre_us": 19.88
+    },
+    {
+      "stage": 38,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.0,
+      "compute_us": 44.24,
+      "p1_us": 8.36,
+      "late_pre_us": 19.6
+    },
+    {
+      "stage": 38,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.0,
+      "compute_us": 43.64,
+      "p1_us": 8.68,
+      "late_pre_us": 20.36
+    },
+    {
+      "stage": 38,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.48,
+      "compute_us": 47.08,
+      "p1_us": 8.64,
+      "late_pre_us": 17.96
+    },
+    {
+      "stage": 38,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.96,
+      "compute_us": 44.16,
+      "p1_us": 8.64,
+      "late_pre_us": 19.92
+    },
+    {
+      "stage": 38,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 23.96,
+      "compute_us": 39.6,
+      "p1_us": 8.28,
+      "late_pre_us": 23.52
+    },
+    {
+      "stage": 39,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.4,
+      "compute_us": 62.28,
+      "p1_us": 8.44,
+      "late_pre_us": 23.52
+    },
+    {
+      "stage": 39,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.76,
+      "compute_us": 62.32,
+      "p1_us": 8.48,
+      "late_pre_us": 23.04
+    },
+    {
+      "stage": 39,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.88,
+      "compute_us": 64.12,
+      "p1_us": 8.56,
+      "late_pre_us": 24.12
+    },
+    {
+      "stage": 39,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.52,
+      "compute_us": 62.8,
+      "p1_us": 8.72,
+      "late_pre_us": 23.68
+    },
+    {
+      "stage": 39,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 25.16,
+      "compute_us": 60.56,
+      "p1_us": 8.48,
+      "late_pre_us": 23.0
+    },
+    {
+      "stage": 40,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.92,
+      "compute_us": 41.36,
+      "p1_us": 8.36,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 40,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.44,
+      "compute_us": 43.8,
+      "p1_us": 8.84,
+      "late_pre_us": 22.88
+    },
+    {
+      "stage": 40,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.76,
+      "compute_us": 42.28,
+      "p1_us": 8.56,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 40,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.48,
+      "compute_us": 42.28,
+      "p1_us": 8.6,
+      "late_pre_us": 23.68
+    },
+    {
+      "stage": 40,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.04,
+      "compute_us": 36.56,
+      "p1_us": 8.4,
+      "late_pre_us": 22.64
+    },
+    {
+      "stage": 41,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.6,
+      "compute_us": 61.92,
+      "p1_us": 8.36,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 41,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.44,
+      "compute_us": 61.76,
+      "p1_us": 8.52,
+      "late_pre_us": 22.96
+    },
+    {
+      "stage": 41,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.24,
+      "compute_us": 63.64,
+      "p1_us": 8.48,
+      "late_pre_us": 24.16
+    },
+    {
+      "stage": 41,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.8,
+      "compute_us": 62.88,
+      "p1_us": 8.6,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 41,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 23.16,
+      "compute_us": 59.88,
+      "p1_us": 8.32,
+      "late_pre_us": 22.64
+    },
+    {
+      "stage": 42,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.36,
+      "compute_us": 40.92,
+      "p1_us": 8.72,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 42,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 43.0,
+      "p1_us": 8.52,
+      "late_pre_us": 23.36
+    },
+    {
+      "stage": 42,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.72,
+      "compute_us": 41.8,
+      "p1_us": 8.52,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 42,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.16,
+      "compute_us": 41.72,
+      "p1_us": 8.96,
+      "late_pre_us": 23.32
+    },
+    {
+      "stage": 42,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.0,
+      "compute_us": 36.24,
+      "p1_us": 8.28,
+      "late_pre_us": 22.8
+    },
+    {
+      "stage": 43,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.52,
+      "compute_us": 62.16,
+      "p1_us": 8.32,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 43,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.72,
+      "compute_us": 61.92,
+      "p1_us": 8.72,
+      "late_pre_us": 23.16
+    },
+    {
+      "stage": 43,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.8,
+      "compute_us": 63.76,
+      "p1_us": 8.52,
+      "late_pre_us": 24.08
+    },
+    {
+      "stage": 43,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.64,
+      "compute_us": 62.88,
+      "p1_us": 8.56,
+      "late_pre_us": 23.4
+    },
+    {
+      "stage": 43,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.12,
+      "compute_us": 60.64,
+      "p1_us": 8.16,
+      "late_pre_us": 22.68
+    },
+    {
+      "stage": 44,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.72,
+      "compute_us": 41.12,
+      "p1_us": 8.36,
+      "late_pre_us": 23.24
+    },
+    {
+      "stage": 44,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.16,
+      "compute_us": 43.68,
+      "p1_us": 8.52,
+      "late_pre_us": 23.24
+    },
+    {
+      "stage": 44,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.28,
+      "compute_us": 42.28,
+      "p1_us": 8.56,
+      "late_pre_us": 23.96
+    },
+    {
+      "stage": 44,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.32,
+      "compute_us": 41.84,
+      "p1_us": 8.64,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 44,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 25.56,
+      "compute_us": 36.68,
+      "p1_us": 8.32,
+      "late_pre_us": 24.88
+    },
+    {
+      "stage": 45,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.24,
+      "compute_us": 61.6,
+      "p1_us": 8.68,
+      "late_pre_us": 18.16
+    },
+    {
+      "stage": 45,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.04,
+      "compute_us": 61.56,
+      "p1_us": 8.56,
+      "late_pre_us": 18.6
+    },
+    {
+      "stage": 45,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.44,
+      "compute_us": 63.2,
+      "p1_us": 8.76,
+      "late_pre_us": 17.84
+    },
+    {
+      "stage": 45,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 62.12,
+      "p1_us": 8.96,
+      "late_pre_us": 17.92
+    },
+    {
+      "stage": 45,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 26.44,
+      "compute_us": 60.6,
+      "p1_us": 8.4,
+      "late_pre_us": 19.56
+    },
+    {
+      "stage": 46,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.12,
+      "compute_us": 42.96,
+      "p1_us": 8.36,
+      "late_pre_us": 20.24
+    },
+    {
+      "stage": 46,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.0,
+      "compute_us": 43.2,
+      "p1_us": 8.68,
+      "late_pre_us": 19.2
+    },
+    {
+      "stage": 46,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.88,
+      "compute_us": 45.72,
+      "p1_us": 8.96,
+      "late_pre_us": 18.0
+    },
+    {
+      "stage": 46,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.92,
+      "compute_us": 43.2,
+      "p1_us": 8.56,
+      "late_pre_us": 19.52
+    },
+    {
+      "stage": 46,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.56,
+      "compute_us": 40.12,
+      "p1_us": 8.28,
+      "late_pre_us": 22.04
+    },
+    {
+      "stage": 47,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.76,
+      "compute_us": 62.68,
+      "p1_us": 8.68,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 47,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 62.8,
+      "p1_us": 8.52,
+      "late_pre_us": 23.12
+    },
+    {
+      "stage": 47,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.88,
+      "compute_us": 64.4,
+      "p1_us": 8.8,
+      "late_pre_us": 24.16
+    },
+    {
+      "stage": 47,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.96,
+      "compute_us": 63.32,
+      "p1_us": 8.88,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 47,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.48,
+      "compute_us": 60.64,
+      "p1_us": 8.44,
+      "late_pre_us": 22.68
+    },
+    {
+      "stage": 48,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.6,
+      "compute_us": 41.52,
+      "p1_us": 8.36,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 48,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.32,
+      "compute_us": 43.6,
+      "p1_us": 8.68,
+      "late_pre_us": 23.36
+    },
+    {
+      "stage": 48,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.8,
+      "compute_us": 42.64,
+      "p1_us": 8.68,
+      "late_pre_us": 23.68
+    },
+    {
+      "stage": 48,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.32,
+      "compute_us": 42.76,
+      "p1_us": 8.6,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 48,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.32,
+      "compute_us": 36.24,
+      "p1_us": 8.4,
+      "late_pre_us": 22.64
+    },
+    {
+      "stage": 49,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.84,
+      "compute_us": 61.56,
+      "p1_us": 8.4,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 49,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.68,
+      "compute_us": 61.24,
+      "p1_us": 8.52,
+      "late_pre_us": 23.08
+    },
+    {
+      "stage": 49,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 24.16,
+      "compute_us": 63.16,
+      "p1_us": 8.68,
+      "late_pre_us": 24.28
+    },
+    {
+      "stage": 49,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.96,
+      "compute_us": 62.08,
+      "p1_us": 8.64,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 49,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 60.28,
+      "p1_us": 8.28,
+      "late_pre_us": 22.92
+    },
+    {
+      "stage": 50,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.04,
+      "compute_us": 40.48,
+      "p1_us": 8.56,
+      "late_pre_us": 23.88
+    },
+    {
+      "stage": 50,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.72,
+      "compute_us": 42.92,
+      "p1_us": 8.68,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 50,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.32,
+      "compute_us": 41.76,
+      "p1_us": 8.64,
+      "late_pre_us": 23.68
+    },
+    {
+      "stage": 50,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.44,
+      "compute_us": 41.52,
+      "p1_us": 8.76,
+      "late_pre_us": 23.96
+    },
+    {
+      "stage": 50,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.12,
+      "compute_us": 35.8,
+      "p1_us": 8.2,
+      "late_pre_us": 22.96
+    },
+    {
+      "stage": 51,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.56,
+      "compute_us": 62.32,
+      "p1_us": 8.32,
+      "late_pre_us": 23.8
+    },
+    {
+      "stage": 51,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.92,
+      "compute_us": 62.16,
+      "p1_us": 8.64,
+      "late_pre_us": 23.52
+    },
+    {
+      "stage": 51,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 24.2,
+      "compute_us": 63.72,
+      "p1_us": 8.52,
+      "late_pre_us": 24.08
+    },
+    {
+      "stage": 51,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.48,
+      "compute_us": 62.88,
+      "p1_us": 8.52,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 51,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 23.76,
+      "compute_us": 60.24,
+      "p1_us": 8.12,
+      "late_pre_us": 23.0
+    },
+    {
+      "stage": 52,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.76,
+      "compute_us": 41.28,
+      "p1_us": 8.44,
+      "late_pre_us": 23.36
+    },
+    {
+      "stage": 52,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.28,
+      "compute_us": 43.44,
+      "p1_us": 8.48,
+      "late_pre_us": 23.16
+    },
+    {
+      "stage": 52,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.6,
+      "compute_us": 42.08,
+      "p1_us": 8.64,
+      "late_pre_us": 23.92
+    },
+    {
+      "stage": 52,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.72,
+      "compute_us": 41.92,
+      "p1_us": 8.56,
+      "late_pre_us": 23.32
+    },
+    {
+      "stage": 52,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 22.72,
+      "compute_us": 36.0,
+      "p1_us": 8.32,
+      "late_pre_us": 24.52
+    },
+    {
+      "stage": 53,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.24,
+      "compute_us": 61.52,
+      "p1_us": 8.44,
+      "late_pre_us": 18.24
+    },
+    {
+      "stage": 53,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.0,
+      "compute_us": 61.2,
+      "p1_us": 8.48,
+      "late_pre_us": 18.76
+    },
+    {
+      "stage": 53,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.56,
+      "compute_us": 63.08,
+      "p1_us": 8.72,
+      "late_pre_us": 17.96
+    },
+    {
+      "stage": 53,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.04,
+      "compute_us": 62.04,
+      "p1_us": 8.56,
+      "late_pre_us": 18.0
+    },
+    {
+      "stage": 53,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 28.16,
+      "compute_us": 60.04,
+      "p1_us": 8.32,
+      "late_pre_us": 19.32
+    },
+    {
+      "stage": 54,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.0,
+      "compute_us": 43.2,
+      "p1_us": 8.36,
+      "late_pre_us": 19.84
+    },
+    {
+      "stage": 54,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.24,
+      "compute_us": 43.44,
+      "p1_us": 8.64,
+      "late_pre_us": 19.4
+    },
+    {
+      "stage": 54,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.56,
+      "compute_us": 46.08,
+      "p1_us": 8.68,
+      "late_pre_us": 17.84
+    },
+    {
+      "stage": 54,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.12,
+      "compute_us": 43.48,
+      "p1_us": 8.52,
+      "late_pre_us": 19.24
+    },
+    {
+      "stage": 54,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.08,
+      "compute_us": 39.52,
+      "p1_us": 8.32,
+      "late_pre_us": 22.84
+    },
+    {
+      "stage": 55,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.52,
+      "compute_us": 62.2,
+      "p1_us": 8.52,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 55,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.76,
+      "compute_us": 62.36,
+      "p1_us": 8.44,
+      "late_pre_us": 23.32
+    },
+    {
+      "stage": 55,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.68,
+      "compute_us": 64.2,
+      "p1_us": 8.56,
+      "late_pre_us": 23.92
+    },
+    {
+      "stage": 55,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.44,
+      "compute_us": 62.88,
+      "p1_us": 8.6,
+      "late_pre_us": 23.92
+    },
+    {
+      "stage": 55,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.2,
+      "compute_us": 60.0,
+      "p1_us": 8.36,
+      "late_pre_us": 22.88
+    },
+    {
+      "stage": 56,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.64,
+      "compute_us": 41.2,
+      "p1_us": 8.36,
+      "late_pre_us": 23.36
+    },
+    {
+      "stage": 56,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.52,
+      "compute_us": 43.84,
+      "p1_us": 8.64,
+      "late_pre_us": 22.76
+    },
+    {
+      "stage": 56,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.4,
+      "compute_us": 42.08,
+      "p1_us": 8.52,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 56,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.28,
+      "compute_us": 41.88,
+      "p1_us": 8.6,
+      "late_pre_us": 23.68
+    },
+    {
+      "stage": 56,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.0,
+      "compute_us": 36.48,
+      "p1_us": 8.32,
+      "late_pre_us": 22.68
+    },
+    {
+      "stage": 57,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.56,
+      "compute_us": 61.76,
+      "p1_us": 8.36,
+      "late_pre_us": 23.36
+    },
+    {
+      "stage": 57,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.76,
+      "compute_us": 62.08,
+      "p1_us": 8.44,
+      "late_pre_us": 23.24
+    },
+    {
+      "stage": 57,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.64,
+      "compute_us": 63.44,
+      "p1_us": 8.48,
+      "late_pre_us": 23.92
+    },
+    {
+      "stage": 57,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.72,
+      "compute_us": 62.32,
+      "p1_us": 8.56,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 57,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 22.92,
+      "compute_us": 60.12,
+      "p1_us": 8.28,
+      "late_pre_us": 22.56
+    },
+    {
+      "stage": 58,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.4,
+      "compute_us": 40.72,
+      "p1_us": 8.56,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 58,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.48,
+      "compute_us": 43.4,
+      "p1_us": 8.52,
+      "late_pre_us": 23.12
+    },
+    {
+      "stage": 58,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.52,
+      "compute_us": 41.88,
+      "p1_us": 8.56,
+      "late_pre_us": 23.92
+    },
+    {
+      "stage": 58,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.2,
+      "compute_us": 41.88,
+      "p1_us": 8.76,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 58,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.08,
+      "compute_us": 36.04,
+      "p1_us": 8.44,
+      "late_pre_us": 23.16
+    },
+    {
+      "stage": 59,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.48,
+      "compute_us": 61.32,
+      "p1_us": 8.32,
+      "late_pre_us": 23.36
+    },
+    {
+      "stage": 59,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.68,
+      "compute_us": 62.6,
+      "p1_us": 8.92,
+      "late_pre_us": 22.92
+    },
+    {
+      "stage": 59,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.32,
+      "compute_us": 63.32,
+      "p1_us": 8.52,
+      "late_pre_us": 24.24
+    },
+    {
+      "stage": 59,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.8,
+      "compute_us": 62.36,
+      "p1_us": 8.6,
+      "late_pre_us": 23.72
+    },
+    {
+      "stage": 59,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.68,
+      "compute_us": 60.24,
+      "p1_us": 8.2,
+      "late_pre_us": 22.64
+    },
+    {
+      "stage": 60,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.24,
+      "compute_us": 41.24,
+      "p1_us": 8.36,
+      "late_pre_us": 23.24
+    },
+    {
+      "stage": 60,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.96,
+      "compute_us": 43.64,
+      "p1_us": 8.72,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 60,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.68,
+      "compute_us": 42.12,
+      "p1_us": 8.96,
+      "late_pre_us": 24.12
+    },
+    {
+      "stage": 60,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.92,
+      "compute_us": 41.96,
+      "p1_us": 8.6,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 60,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 25.6,
+      "compute_us": 36.32,
+      "p1_us": 8.36,
+      "late_pre_us": 25.08
+    },
+    {
+      "stage": 61,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.64,
+      "compute_us": 61.92,
+      "p1_us": 8.52,
+      "late_pre_us": 19.0
+    },
+    {
+      "stage": 61,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.28,
+      "compute_us": 61.72,
+      "p1_us": 8.48,
+      "late_pre_us": 19.48
+    },
+    {
+      "stage": 61,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.64,
+      "compute_us": 63.92,
+      "p1_us": 8.92,
+      "late_pre_us": 17.68
+    },
+    {
+      "stage": 61,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.68,
+      "compute_us": 62.56,
+      "p1_us": 8.84,
+      "late_pre_us": 18.56
+    },
+    {
+      "stage": 61,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 26.52,
+      "compute_us": 59.6,
+      "p1_us": 8.28,
+      "late_pre_us": 20.6
+    },
+    {
+      "stage": 62,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.08,
+      "compute_us": 43.48,
+      "p1_us": 8.36,
+      "late_pre_us": 19.84
+    },
+    {
+      "stage": 62,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.28,
+      "compute_us": 43.64,
+      "p1_us": 8.72,
+      "late_pre_us": 19.6
+    },
+    {
+      "stage": 62,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.2,
+      "compute_us": 46.92,
+      "p1_us": 8.68,
+      "late_pre_us": 18.2
+    },
+    {
+      "stage": 62,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 43.96,
+      "p1_us": 8.6,
+      "late_pre_us": 19.8
+    },
+    {
+      "stage": 62,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 25.08,
+      "compute_us": 39.24,
+      "p1_us": 8.48,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 63,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.08,
+      "compute_us": 62.28,
+      "p1_us": 8.52,
+      "late_pre_us": 23.88
+    },
+    {
+      "stage": 63,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.36,
+      "compute_us": 61.92,
+      "p1_us": 8.48,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 63,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.56,
+      "compute_us": 64.04,
+      "p1_us": 8.88,
+      "late_pre_us": 24.08
+    },
+    {
+      "stage": 63,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.32,
+      "compute_us": 62.84,
+      "p1_us": 8.76,
+      "late_pre_us": 24.04
+    },
+    {
+      "stage": 63,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 25.08,
+      "compute_us": 60.72,
+      "p1_us": 8.28,
+      "late_pre_us": 22.56
+    },
+    {
+      "stage": 64,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.24,
+      "compute_us": 41.2,
+      "p1_us": 8.52,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 64,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.32,
+      "compute_us": 43.8,
+      "p1_us": 8.64,
+      "late_pre_us": 23.12
+    },
+    {
+      "stage": 64,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.6,
+      "compute_us": 42.24,
+      "p1_us": 8.52,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 64,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.4,
+      "compute_us": 42.2,
+      "p1_us": 8.68,
+      "late_pre_us": 23.8
+    },
+    {
+      "stage": 64,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.76,
+      "compute_us": 36.92,
+      "p1_us": 8.36,
+      "late_pre_us": 22.76
+    },
+    {
+      "stage": 65,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.76,
+      "compute_us": 62.56,
+      "p1_us": 8.32,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 65,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.8,
+      "compute_us": 61.76,
+      "p1_us": 8.56,
+      "late_pre_us": 23.04
+    },
+    {
+      "stage": 65,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.96,
+      "compute_us": 63.84,
+      "p1_us": 8.48,
+      "late_pre_us": 24.08
+    },
+    {
+      "stage": 65,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 62.92,
+      "p1_us": 8.56,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 65,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 22.24,
+      "compute_us": 60.08,
+      "p1_us": 8.32,
+      "late_pre_us": 22.92
+    },
+    {
+      "stage": 66,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.76,
+      "compute_us": 41.48,
+      "p1_us": 8.8,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 66,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.92,
+      "compute_us": 43.28,
+      "p1_us": 8.44,
+      "late_pre_us": 23.72
+    },
+    {
+      "stage": 66,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.6,
+      "compute_us": 42.32,
+      "p1_us": 8.52,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 66,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 41.8,
+      "p1_us": 8.92,
+      "late_pre_us": 23.72
+    },
+    {
+      "stage": 66,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.12,
+      "compute_us": 36.32,
+      "p1_us": 8.2,
+      "late_pre_us": 22.92
+    },
+    {
+      "stage": 67,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.6,
+      "compute_us": 61.32,
+      "p1_us": 8.32,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 67,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.16,
+      "compute_us": 61.56,
+      "p1_us": 8.64,
+      "late_pre_us": 23.32
+    },
+    {
+      "stage": 67,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.72,
+      "compute_us": 63.0,
+      "p1_us": 8.48,
+      "late_pre_us": 23.96
+    },
+    {
+      "stage": 67,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.12,
+      "compute_us": 61.92,
+      "p1_us": 8.6,
+      "late_pre_us": 23.96
+    },
+    {
+      "stage": 67,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 23.2,
+      "compute_us": 60.16,
+      "p1_us": 8.2,
+      "late_pre_us": 22.88
+    },
+    {
+      "stage": 68,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.92,
+      "compute_us": 41.04,
+      "p1_us": 8.36,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 68,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.08,
+      "compute_us": 43.08,
+      "p1_us": 8.48,
+      "late_pre_us": 22.8
+    },
+    {
+      "stage": 68,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.32,
+      "compute_us": 42.32,
+      "p1_us": 8.68,
+      "late_pre_us": 23.76
+    },
+    {
+      "stage": 68,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.24,
+      "compute_us": 41.68,
+      "p1_us": 8.64,
+      "late_pre_us": 23.24
+    },
+    {
+      "stage": 68,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 21.84,
+      "compute_us": 36.2,
+      "p1_us": 8.4,
+      "late_pre_us": 24.24
+    },
+    {
+      "stage": 69,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.16,
+      "compute_us": 61.68,
+      "p1_us": 8.4,
+      "late_pre_us": 17.92
+    },
+    {
+      "stage": 69,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.44,
+      "compute_us": 61.48,
+      "p1_us": 8.48,
+      "late_pre_us": 19.32
+    },
+    {
+      "stage": 69,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.08,
+      "compute_us": 62.96,
+      "p1_us": 8.72,
+      "late_pre_us": 17.76
+    },
+    {
+      "stage": 69,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.64,
+      "compute_us": 62.28,
+      "p1_us": 8.64,
+      "late_pre_us": 17.92
+    },
+    {
+      "stage": 69,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 27.16,
+      "compute_us": 60.32,
+      "p1_us": 8.32,
+      "late_pre_us": 19.68
+    },
+    {
+      "stage": 70,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.4,
+      "compute_us": 42.96,
+      "p1_us": 8.4,
+      "late_pre_us": 19.52
+    },
+    {
+      "stage": 70,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.16,
+      "compute_us": 42.68,
+      "p1_us": 8.8,
+      "late_pre_us": 20.0
+    },
+    {
+      "stage": 70,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 24.28,
+      "compute_us": 45.6,
+      "p1_us": 8.68,
+      "late_pre_us": 17.88
+    },
+    {
+      "stage": 70,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 42.92,
+      "p1_us": 8.6,
+      "late_pre_us": 19.8
+    },
+    {
+      "stage": 70,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.48,
+      "compute_us": 39.56,
+      "p1_us": 8.4,
+      "late_pre_us": 22.4
+    },
+    {
+      "stage": 71,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.32,
+      "compute_us": 62.8,
+      "p1_us": 8.52,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 71,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 62.2,
+      "p1_us": 8.44,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 71,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.64,
+      "compute_us": 63.84,
+      "p1_us": 8.84,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 71,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.36,
+      "compute_us": 63.48,
+      "p1_us": 8.8,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 71,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.12,
+      "compute_us": 59.92,
+      "p1_us": 8.36,
+      "late_pre_us": 23.0
+    },
+    {
+      "stage": 72,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 41.52,
+      "p1_us": 8.36,
+      "late_pre_us": 23.36
+    },
+    {
+      "stage": 72,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 44.36,
+      "p1_us": 8.72,
+      "late_pre_us": 23.12
+    },
+    {
+      "stage": 72,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.52,
+      "compute_us": 42.68,
+      "p1_us": 8.52,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 72,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 21.56,
+      "compute_us": 42.76,
+      "p1_us": 8.6,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 72,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.08,
+      "compute_us": 36.96,
+      "p1_us": 8.48,
+      "late_pre_us": 22.76
+    },
+    {
+      "stage": 73,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.96,
+      "compute_us": 61.68,
+      "p1_us": 8.36,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 73,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.64,
+      "compute_us": 61.64,
+      "p1_us": 8.48,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 73,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 62.96,
+      "p1_us": 8.6,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 73,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.44,
+      "compute_us": 62.24,
+      "p1_us": 8.6,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 73,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 22.48,
+      "compute_us": 60.2,
+      "p1_us": 8.36,
+      "late_pre_us": 22.88
+    },
+    {
+      "stage": 74,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 22.8,
+      "compute_us": 41.0,
+      "p1_us": 8.52,
+      "late_pre_us": 23.36
+    },
+    {
+      "stage": 74,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.56,
+      "compute_us": 43.36,
+      "p1_us": 8.48,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 74,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.52,
+      "compute_us": 42.04,
+      "p1_us": 8.52,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 74,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.32,
+      "compute_us": 41.44,
+      "p1_us": 8.8,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 74,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 25.8,
+      "compute_us": 36.4,
+      "p1_us": 8.2,
+      "late_pre_us": 24.16
+    },
+    {
+      "stage": 75,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.12,
+      "compute_us": 61.92,
+      "p1_us": 8.56,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 75,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 21.48,
+      "compute_us": 62.44,
+      "p1_us": 8.68,
+      "late_pre_us": 23.2
+    },
+    {
+      "stage": 75,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.96,
+      "compute_us": 63.8,
+      "p1_us": 8.48,
+      "late_pre_us": 24.12
+    },
+    {
+      "stage": 75,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.44,
+      "compute_us": 62.64,
+      "p1_us": 8.84,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 75,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.76,
+      "compute_us": 59.64,
+      "p1_us": 8.24,
+      "late_pre_us": 22.88
+    },
+    {
+      "stage": 76,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.2,
+      "compute_us": 41.36,
+      "p1_us": 8.36,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 76,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.8,
+      "compute_us": 43.8,
+      "p1_us": 8.48,
+      "late_pre_us": 23.12
+    },
+    {
+      "stage": 76,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.72,
+      "compute_us": 42.76,
+      "p1_us": 8.76,
+      "late_pre_us": 23.8
+    },
+    {
+      "stage": 76,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.64,
+      "compute_us": 42.2,
+      "p1_us": 8.56,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 76,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 21.16,
+      "compute_us": 36.8,
+      "p1_us": 8.4,
+      "late_pre_us": 24.16
+    },
+    {
+      "stage": 77,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.4,
+      "compute_us": 61.6,
+      "p1_us": 8.72,
+      "late_pre_us": 18.92
+    },
+    {
+      "stage": 77,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.64,
+      "compute_us": 61.4,
+      "p1_us": 8.68,
+      "late_pre_us": 18.48
+    },
+    {
+      "stage": 77,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.32,
+      "compute_us": 63.56,
+      "p1_us": 8.8,
+      "late_pre_us": 18.2
+    },
+    {
+      "stage": 77,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 62.24,
+      "p1_us": 8.92,
+      "late_pre_us": 17.76
+    },
+    {
+      "stage": 77,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 27.2,
+      "compute_us": 60.28,
+      "p1_us": 8.44,
+      "late_pre_us": 19.76
+    },
+    {
+      "stage": 78,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.92,
+      "compute_us": 42.92,
+      "p1_us": 8.36,
+      "late_pre_us": 19.2
+    },
+    {
+      "stage": 78,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.64,
+      "compute_us": 43.2,
+      "p1_us": 8.64,
+      "late_pre_us": 19.24
+    },
+    {
+      "stage": 78,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 25.04,
+      "compute_us": 46.0,
+      "p1_us": 8.6,
+      "late_pre_us": 17.96
+    },
+    {
+      "stage": 78,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 25.16,
+      "compute_us": 43.44,
+      "p1_us": 8.64,
+      "late_pre_us": 19.08
+    },
+    {
+      "stage": 78,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 26.2,
+      "compute_us": 39.48,
+      "p1_us": 8.44,
+      "late_pre_us": 22.4
+    },
+    {
+      "stage": 79,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.32,
+      "compute_us": 62.32,
+      "p1_us": 8.52,
+      "late_pre_us": 23.88
+    },
+    {
+      "stage": 79,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.68,
+      "compute_us": 61.96,
+      "p1_us": 8.48,
+      "late_pre_us": 23.24
+    },
+    {
+      "stage": 79,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.68,
+      "compute_us": 64.16,
+      "p1_us": 8.76,
+      "late_pre_us": 24.36
+    },
+    {
+      "stage": 79,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.28,
+      "compute_us": 63.12,
+      "p1_us": 9.0,
+      "late_pre_us": 23.8
+    },
+    {
+      "stage": 79,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.64,
+      "compute_us": 60.56,
+      "p1_us": 8.36,
+      "late_pre_us": 22.72
+    },
+    {
+      "stage": 80,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.56,
+      "compute_us": 41.24,
+      "p1_us": 8.36,
+      "late_pre_us": 23.64
+    },
+    {
+      "stage": 80,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.6,
+      "compute_us": 43.72,
+      "p1_us": 8.68,
+      "late_pre_us": 23.2
+    },
+    {
+      "stage": 80,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.36,
+      "compute_us": 42.64,
+      "p1_us": 8.8,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 80,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.8,
+      "compute_us": 42.28,
+      "p1_us": 8.56,
+      "late_pre_us": 23.48
+    },
+    {
+      "stage": 80,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.96,
+      "compute_us": 36.52,
+      "p1_us": 8.52,
+      "late_pre_us": 22.96
+    },
+    {
+      "stage": 81,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.2,
+      "compute_us": 61.92,
+      "p1_us": 8.36,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 81,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.36,
+      "compute_us": 61.24,
+      "p1_us": 8.48,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 81,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.28,
+      "compute_us": 63.24,
+      "p1_us": 8.8,
+      "late_pre_us": 24.44
+    },
+    {
+      "stage": 81,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.48,
+      "compute_us": 62.52,
+      "p1_us": 8.6,
+      "late_pre_us": 23.68
+    },
+    {
+      "stage": 81,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 23.32,
+      "compute_us": 60.04,
+      "p1_us": 8.24,
+      "late_pre_us": 22.52
+    },
+    {
+      "stage": 82,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.36,
+      "compute_us": 41.0,
+      "p1_us": 8.56,
+      "late_pre_us": 24.08
+    },
+    {
+      "stage": 82,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.24,
+      "compute_us": 43.04,
+      "p1_us": 8.48,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 82,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.64,
+      "compute_us": 42.0,
+      "p1_us": 8.68,
+      "late_pre_us": 23.76
+    },
+    {
+      "stage": 82,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.88,
+      "compute_us": 41.68,
+      "p1_us": 8.8,
+      "late_pre_us": 24.28
+    },
+    {
+      "stage": 82,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.88,
+      "compute_us": 36.44,
+      "p1_us": 8.28,
+      "late_pre_us": 24.72
+    },
+    {
+      "stage": 83,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.32,
+      "compute_us": 60.8,
+      "p1_us": 8.36,
+      "late_pre_us": 23.88
+    },
+    {
+      "stage": 83,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 61.6,
+      "p1_us": 8.72,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 83,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 24.36,
+      "compute_us": 62.76,
+      "p1_us": 8.68,
+      "late_pre_us": 24.4
+    },
+    {
+      "stage": 83,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 61.6,
+      "p1_us": 8.6,
+      "late_pre_us": 23.76
+    },
+    {
+      "stage": 83,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.08,
+      "compute_us": 59.28,
+      "p1_us": 8.36,
+      "late_pre_us": 22.84
+    },
+    {
+      "stage": 84,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.64,
+      "compute_us": 41.64,
+      "p1_us": 8.48,
+      "late_pre_us": 23.88
+    },
+    {
+      "stage": 84,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.12,
+      "compute_us": 44.6,
+      "p1_us": 8.6,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 84,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.76,
+      "compute_us": 42.64,
+      "p1_us": 9.0,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 84,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.6,
+      "compute_us": 42.56,
+      "p1_us": 8.8,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 84,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.32,
+      "compute_us": 36.12,
+      "p1_us": 8.48,
+      "late_pre_us": 23.16
+    },
+    {
+      "stage": 85,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.28,
+      "compute_us": 61.24,
+      "p1_us": 8.6,
+      "late_pre_us": 18.88
+    },
+    {
+      "stage": 85,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 22.28,
+      "compute_us": 60.64,
+      "p1_us": 8.48,
+      "late_pre_us": 19.52
+    },
+    {
+      "stage": 85,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 24.28,
+      "compute_us": 62.16,
+      "p1_us": 8.84,
+      "late_pre_us": 17.96
+    },
+    {
+      "stage": 85,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.72,
+      "compute_us": 62.2,
+      "p1_us": 8.8,
+      "late_pre_us": 18.04
+    },
+    {
+      "stage": 85,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 25.0,
+      "compute_us": 59.28,
+      "p1_us": 8.52,
+      "late_pre_us": 19.76
+    },
+    {
+      "stage": 86,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.76,
+      "compute_us": 43.12,
+      "p1_us": 8.36,
+      "late_pre_us": 19.92
+    },
+    {
+      "stage": 86,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 25.28,
+      "compute_us": 43.12,
+      "p1_us": 8.64,
+      "late_pre_us": 20.32
+    },
+    {
+      "stage": 86,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 24.96,
+      "compute_us": 46.6,
+      "p1_us": 8.88,
+      "late_pre_us": 18.0
+    },
+    {
+      "stage": 86,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 25.72,
+      "compute_us": 43.52,
+      "p1_us": 8.6,
+      "late_pre_us": 19.84
+    },
+    {
+      "stage": 86,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 26.72,
+      "compute_us": 39.32,
+      "p1_us": 8.48,
+      "late_pre_us": 23.16
+    },
+    {
+      "stage": 87,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.36,
+      "compute_us": 60.72,
+      "p1_us": 8.56,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 87,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.0,
+      "compute_us": 61.64,
+      "p1_us": 8.52,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 87,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 24.04,
+      "compute_us": 63.08,
+      "p1_us": 8.88,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 87,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 24.36,
+      "compute_us": 61.24,
+      "p1_us": 9.12,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 87,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 24.8,
+      "compute_us": 58.88,
+      "p1_us": 8.52,
+      "late_pre_us": 23.08
+    },
+    {
+      "stage": 88,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.4,
+      "compute_us": 42.28,
+      "p1_us": 8.4,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 88,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.96,
+      "compute_us": 43.84,
+      "p1_us": 8.72,
+      "late_pre_us": 23.24
+    },
+    {
+      "stage": 88,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.6,
+      "compute_us": 43.36,
+      "p1_us": 8.64,
+      "late_pre_us": 24.16
+    },
+    {
+      "stage": 88,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.2,
+      "compute_us": 43.04,
+      "p1_us": 8.6,
+      "late_pre_us": 23.52
+    },
+    {
+      "stage": 88,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.92,
+      "compute_us": 37.4,
+      "p1_us": 8.48,
+      "late_pre_us": 23.2
+    },
+    {
+      "stage": 89,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.12,
+      "compute_us": 60.88,
+      "p1_us": 8.4,
+      "late_pre_us": 23.68
+    },
+    {
+      "stage": 89,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.0,
+      "compute_us": 60.88,
+      "p1_us": 8.48,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 89,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.96,
+      "compute_us": 62.92,
+      "p1_us": 8.88,
+      "late_pre_us": 24.4
+    },
+    {
+      "stage": 89,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.92,
+      "compute_us": 61.72,
+      "p1_us": 8.6,
+      "late_pre_us": 23.84
+    },
+    {
+      "stage": 89,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 22.12,
+      "compute_us": 58.84,
+      "p1_us": 8.48,
+      "late_pre_us": 22.76
+    },
+    {
+      "stage": 90,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.16,
+      "compute_us": 42.0,
+      "p1_us": 8.56,
+      "late_pre_us": 23.56
+    },
+    {
+      "stage": 90,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.68,
+      "compute_us": 44.08,
+      "p1_us": 8.48,
+      "late_pre_us": 22.96
+    },
+    {
+      "stage": 90,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.56,
+      "compute_us": 43.4,
+      "p1_us": 8.68,
+      "late_pre_us": 24.04
+    },
+    {
+      "stage": 90,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.32,
+      "compute_us": 42.64,
+      "p1_us": 8.84,
+      "late_pre_us": 23.44
+    },
+    {
+      "stage": 90,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.36,
+      "compute_us": 37.28,
+      "p1_us": 8.32,
+      "late_pre_us": 22.88
+    },
+    {
+      "stage": 91,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.08,
+      "compute_us": 60.96,
+      "p1_us": 8.36,
+      "late_pre_us": 24.0
+    },
+    {
+      "stage": 91,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.08,
+      "compute_us": 60.92,
+      "p1_us": 8.72,
+      "late_pre_us": 23.28
+    },
+    {
+      "stage": 91,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.48,
+      "compute_us": 62.6,
+      "p1_us": 8.68,
+      "late_pre_us": 23.96
+    },
+    {
+      "stage": 91,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 61.48,
+      "p1_us": 8.6,
+      "late_pre_us": 24.08
+    },
+    {
+      "stage": 91,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 33.44,
+      "compute_us": 58.8,
+      "p1_us": 8.24,
+      "late_pre_us": 22.76
+    },
+    {
+      "stage": 92,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 23.76,
+      "compute_us": 42.24,
+      "p1_us": 8.36,
+      "late_pre_us": 23.16
+    },
+    {
+      "stage": 92,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 24.8,
+      "compute_us": 43.88,
+      "p1_us": 8.52,
+      "late_pre_us": 23.24
+    },
+    {
+      "stage": 92,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 22.0,
+      "compute_us": 43.36,
+      "p1_us": 8.64,
+      "late_pre_us": 23.6
+    },
+    {
+      "stage": 92,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 22.48,
+      "compute_us": 43.36,
+      "p1_us": 8.6,
+      "late_pre_us": 23.76
+    },
+    {
+      "stage": 92,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.44,
+      "compute_us": 37.52,
+      "p1_us": 8.68,
+      "late_pre_us": 22.64
+    },
+    {
+      "stage": 93,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.72,
+      "compute_us": 61.16,
+      "p1_us": 8.56,
+      "late_pre_us": 18.2
+    },
+    {
+      "stage": 93,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.48,
+      "compute_us": 60.6,
+      "p1_us": 8.52,
+      "late_pre_us": 18.52
+    },
+    {
+      "stage": 93,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 61.96,
+      "p1_us": 8.88,
+      "late_pre_us": 18.08
+    },
+    {
+      "stage": 93,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.84,
+      "compute_us": 62.0,
+      "p1_us": 8.8,
+      "late_pre_us": 17.68
+    },
+    {
+      "stage": 93,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 27.2,
+      "compute_us": 58.96,
+      "p1_us": 8.64,
+      "late_pre_us": 20.04
+    },
+    {
+      "stage": 94,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 24.28,
+      "compute_us": 43.76,
+      "p1_us": 0.12,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 94,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 23.4,
+      "compute_us": 43.52,
+      "p1_us": 0.12,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 94,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 23.96,
+      "compute_us": 46.6,
+      "p1_us": 0.08,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 94,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 23.12,
+      "compute_us": 44.04,
+      "p1_us": 0.12,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 94,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 23.88,
+      "compute_us": 39.88,
+      "p1_us": 0.12,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 95,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 30.44,
+      "compute_us": 127.68,
+      "p1_us": 8.48,
+      "late_pre_us": 24.32
+    },
+    {
+      "stage": 95,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 30.96,
+      "compute_us": 127.8,
+      "p1_us": 8.52,
+      "late_pre_us": 24.24
+    },
+    {
+      "stage": 95,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 30.52,
+      "compute_us": 131.0,
+      "p1_us": 8.8,
+      "late_pre_us": 24.2
+    },
+    {
+      "stage": 95,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 30.64,
+      "compute_us": 129.44,
+      "p1_us": 8.72,
+      "late_pre_us": 24.16
+    },
+    {
+      "stage": 95,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.32,
+      "compute_us": 124.12,
+      "p1_us": 8.52,
+      "late_pre_us": 26.84
+    },
+    {
+      "stage": 96,
+      "rank": 0,
+      "samples": 15,
+      "p2_us": 25.96,
+      "compute_us": 217.64,
+      "p1_us": 0.0,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 96,
+      "rank": 1,
+      "samples": 15,
+      "p2_us": 26.28,
+      "compute_us": 217.12,
+      "p1_us": 0.0,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 96,
+      "rank": 2,
+      "samples": 15,
+      "p2_us": 21.24,
+      "compute_us": 218.8,
+      "p1_us": 0.0,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 96,
+      "rank": 3,
+      "samples": 15,
+      "p2_us": 25.56,
+      "compute_us": 216.96,
+      "p1_us": 0.0,
+      "late_pre_us": 0.0
+    },
+    {
+      "stage": 96,
+      "rank": 4,
+      "samples": 15,
+      "p2_us": 34.44,
+      "compute_us": 217.64,
+      "p1_us": 0.0,
+      "late_pre_us": 0.0
+    }
+  ],
+  "component_sums_by_rank": {
+    "0": {
+      "p2_us": 2362.88,
+      "compute_us": 5513.28,
+      "p1_us": 795.1999999999999,
+      "late_pre_us": 2573.4
+    },
+    "1": {
+      "p2_us": 2304.8400000000006,
+      "compute_us": 5594.200000000001,
+      "p1_us": 807.6,
+      "late_pre_us": 2382.359999999999
+    },
+    "2": {
+      "p2_us": 2216.4799999999996,
+      "compute_us": 5673.080000000002,
+      "p1_us": 815.7199999999995,
+      "late_pre_us": 2283.3599999999997
+    },
+    "3": {
+      "p2_us": 2286.2000000000003,
+      "compute_us": 5578.040000000001,
+      "p1_us": 817.3599999999999,
+      "late_pre_us": 2184.4800000000005
+    },
+    "4": {
+      "p2_us": 2691.5199999999995,
+      "compute_us": 5203.159999999998,
+      "p1_us": 787.2000000000002,
+      "late_pre_us": 2152.9200000000014
+    }
+  },
+  "limitations": [
+    "Selected timestamp boundaries can perturb local scheduling.",
+    "Summed medians across separately measured partitions are not one simultaneously measured path.",
+    "Ranks overlap; do not add their times. P2 includes waits and consumers, not just transport.",
+    "The first captured replay is reported separately, not silently discarded.",
+    "No normalization to force the sum to the server or graph_compute time."
+  ]
+}

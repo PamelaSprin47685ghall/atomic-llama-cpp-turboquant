@@ -1,0 +1,27 @@
+{
+  "status": "REGISTERED_BEFORE_NEW_MEASUREMENTS",
+  "scope": "RERoT excluded; one ordinary generation stream; CPU threads unrestricted (22 explicitly used here).",
+  "question": "On unchanged APEX weights and identical head-sharded no-MTP layout, does aggressive LateBind reduce public-token generation cost?",
+  "fixed": {
+    "binary": "build-perf-gap/bin/llama-server",
+    "model": "existing unmodified APEX-I-Compact six-shard model",
+    "horizon": 0,
+    "mmvq": "disabled",
+    "threads": 22,
+    "ctx": 1024,
+    "slots": 1,
+    "GGML_TP5_REPLICATE_ATTN": "0",
+    "GGML_TP5_QSA_HEADMAP": "1",
+    "GGML_TP5_GDN_HEADMAP": "1",
+    "GGML_VK_SMALL_Q8_COLUMNS": "1"
+  },
+  "A": {"latebind": "off"},
+  "B": {"latebind": "aggressive"},
+  "pairs": [["A", "B"], ["B", "A"], ["A", "B"], ["B", "A"]],
+  "requests_per_process": {"warmup": 2, "measured": 3, "unranked_guard": 1},
+  "primary": "per-process sum(predicted_ms)/sum(public completion_tokens); paired log-ratio Student t 95% CI, df=3",
+  "secondary": ["whole-answer generation time", "client wall time", "output length and hashes", "actual LateBind sites", "fallbacks", "normal teardown"],
+  "stop_rule": "Any protocol, model load or abnormal teardown error stops this confirmation; retain all failed evidence; no replacement points.",
+  "prior_failure": "The older mtp-strong confirmation stopped at b2-B with RELAY previous GPU wait failed during loading. It is incomplete, not a completed four-block MTP comparison. Current five-card idle gate must pass before this new experiment.",
+  "limitations": "Aggressive changes target arithmetic; a speed gain is not proof of full numerical/quality equivalence. Natural output trajectories may differ. No clock, driver, watchdog, reset or tolerance change."
+}

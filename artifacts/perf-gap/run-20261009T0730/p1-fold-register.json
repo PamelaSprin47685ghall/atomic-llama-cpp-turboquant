@@ -1,0 +1,8 @@
+{
+  "factor": "Existing production GGML_TP5_RELAY_VEC_COPY_FOLD=0/1; no new synchronization implementation",
+  "fixed": "Current isolated-pack binary, pack-single0, norm-prefetch0, Q256/norm256, parallel-submit1, greedy1, unchanged APEX weights, h0, aggressive, MMVQdisabled, threads22, head-sharded",
+  "hypothesis": "Default P1 uses10 workgroups of F32 vector copy plus a separate ready fill/transfer barrier. Existing fold variant uses1 workgroup and publishes ready after a full workgroup memory barrier; check whether reducing the split publication affects the real critical path.",
+  "pilot": "Two warm, three measured, one guard per arm. Symmetric definition-only memory ledger enabled in both to prove selected actual memory flags; no per-token profiling. Preserve all outputs, report changed trajectories instead of claiming equivalence.",
+  "qualification": "No promotion on a single pilot. Consider fresh4pair confirmation only for>=2% gain with correct unchanged outputs, zero measured fallback and normal teardown. Any protocol/load/teardown failure stops the campaign with original evidence retained.",
+  "scope": "Earlier historical experiments are not erased. This is a separately registered current-stack interaction, not permission to remove visibility or timeout guards."
+}

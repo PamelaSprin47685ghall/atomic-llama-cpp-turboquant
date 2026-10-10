@@ -1,0 +1,7 @@
+{
+  "core_source_manifest_sha256": "6d64a32a85e076a4fdce07b3aae36a35e5ecfd3eb3596f77a50325ec026b476f",
+  "core_identity": "router-candidate-identity.json",
+  "frontend_sha256": "a6a6704d6ec537eae56cfd5d8eaf81a8a00bf9be43930197ca01b99c993f4823",
+  "frontend_source_sha256": "b371bf6373ffd9d9aaf77e27097d51439595dedb954d0a959b3af296e037eaf1",
+  "scope": "observer diagnostic; callbacks can split/alter lowering, not performance or native-state proof"
+}

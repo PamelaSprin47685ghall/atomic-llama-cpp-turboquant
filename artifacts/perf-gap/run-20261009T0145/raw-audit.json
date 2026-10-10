@@ -1,0 +1,74 @@
+{
+  "status": "RAW_AUDIT_PASS",
+  "raw_requests": 78,
+  "measured_requests": 36,
+  "normal_process_exits": 14,
+  "measured_fallbacks": 0,
+  "identity_count": 1,
+  "pairs": [
+    {
+      "A": "greedy-b1-A",
+      "B": "greedy-b1-B",
+      "raw_body_and_request_match": true,
+      "requests_per_arm": 6,
+      "measured_hashes": [
+        "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+      ]
+    },
+    {
+      "A": "greedy-b2-A",
+      "B": "greedy-b2-B",
+      "raw_body_and_request_match": true,
+      "requests_per_arm": 6,
+      "measured_hashes": [
+        "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+      ]
+    },
+    {
+      "A": "greedy-b3-A",
+      "B": "greedy-b3-B",
+      "raw_body_and_request_match": true,
+      "requests_per_arm": 6,
+      "measured_hashes": [
+        "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+      ]
+    },
+    {
+      "A": "greedy-b4-A",
+      "B": "greedy-b4-B",
+      "raw_body_and_request_match": true,
+      "requests_per_arm": 6,
+      "measured_hashes": [
+        "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e"
+      ]
+    },
+    {
+      "A": "heldout-index-A",
+      "B": "heldout-index-B",
+      "raw_body_and_request_match": true,
+      "requests_per_arm": 5,
+      "measured_hashes": [
+        "03617851b770f5af8b40dd7cc42a67a742e7c396cf7a385eab87206f9ba2e51f"
+      ]
+    },
+    {
+      "A": "heldout-process-A",
+      "B": "heldout-process-B",
+      "raw_body_and_request_match": true,
+      "requests_per_arm": 5,
+      "measured_hashes": [
+        "2d1d8ec749be6d21185a9e95763ef72dd75c077bb3a71529f13ce1d87f5a7d9d"
+      ]
+    },
+    {
+      "A": "heldout-debug-A",
+      "B": "heldout-debug-B",
+      "raw_body_and_request_match": true,
+      "requests_per_arm": 5,
+      "measured_hashes": [
+        "8391827d41cd854797db5c3a97fd329d42380de4b96547ac65095d4cf7917b4b"
+      ]
+    }
+  ],
+  "limits": "Exact equality to the contemporaneous baseline, not independent comprehensive model-quality certification. Original failed screen is not erased."
+}

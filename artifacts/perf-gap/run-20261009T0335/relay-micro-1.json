@@ -1,0 +1,21 @@
+{
+  "argv": [
+    "build-perf-gap/bin/test-vulkan-tp5-relay",
+    "--run",
+    "--stages",
+    "96",
+    "--replays",
+    "16",
+    "--elements",
+    "1"
+  ],
+  "env": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": "/home/kunweiz",
+    "USER": "kunweiz",
+    "LANG": "en_US.UTF-8",
+    "RADV_DEBUG": "nobolist"
+  },
+  "returncode": 1,
+  "kind": "INDEPENDENT_SYNTHETIC_F16_RELAY_NOT_MODEL_TPS"
+}

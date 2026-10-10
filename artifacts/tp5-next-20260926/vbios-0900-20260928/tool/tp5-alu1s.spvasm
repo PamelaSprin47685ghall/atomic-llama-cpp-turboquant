@@ -1,0 +1,184 @@
+; SPIR-V
+; Version: 1.0
+; Generator: Google Shaderc over Glslang; 11
+; Bound: 214
+; Schema: 0
+               OpCapability Shader
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %4 "main" %gl_GlobalInvocationID
+               OpExecutionMode %4 LocalSize 256 1 1
+               OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId
+               OpDecorate %_struct_24 Block
+               OpMemberDecorate %_struct_24 0 Offset 0
+               OpMemberDecorate %_struct_24 1 Offset 4
+               OpDecorate %_runtimearr_float ArrayStride 4
+               OpDecorate %_struct_178 BufferBlock
+               OpMemberDecorate %_struct_178 0 Offset 0
+               OpDecorate %180 Binding 0
+               OpDecorate %180 DescriptorSet 0
+               OpDecorate %gl_WorkGroupSize BuiltIn WorkgroupSize
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+     %v3uint = OpTypeVector %uint 3
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+%gl_GlobalInvocationID = OpVariable %_ptr_Input_v3uint Input
+     %uint_0 = OpConstant %uint 0
+%_ptr_Input_uint = OpTypePointer Input %uint
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+%float_9_99999997en07 = OpConstant %float 9.99999997e-07
+ %_struct_24 = OpTypeStruct %uint %float
+%_ptr_PushConstant__struct_24 = OpTypePointer PushConstant %_struct_24
+         %26 = OpVariable %_ptr_PushConstant__struct_24 PushConstant
+        %int = OpTypeInt 32 1
+      %int_1 = OpConstant %int 1
+%_ptr_PushConstant_float = OpTypePointer PushConstant %float
+%float_0_00999999978 = OpConstant %float 0.00999999978
+%float_0_0199999996 = OpConstant %float 0.0199999996
+%float_0_0299999993 = OpConstant %float 0.0299999993
+%float_0_0399999991 = OpConstant %float 0.0399999991
+         %40 = OpConstantComposite %v4float %float_0_00999999978 %float_0_0199999996 %float_0_0299999993 %float_0_0399999991
+%float_0_0500000007 = OpConstant %float 0.0500000007
+%float_0_0599999987 = OpConstant %float 0.0599999987
+%float_0_0700000003 = OpConstant %float 0.0700000003
+%float_0_0799999982 = OpConstant %float 0.0799999982
+         %48 = OpConstantComposite %v4float %float_0_0500000007 %float_0_0599999987 %float_0_0700000003 %float_0_0799999982
+%float_0_0900000036 = OpConstant %float 0.0900000036
+%float_0_100000001 = OpConstant %float 0.100000001
+%float_0_109999999 = OpConstant %float 0.109999999
+%float_0_119999997 = OpConstant %float 0.119999997
+         %56 = OpConstantComposite %v4float %float_0_0900000036 %float_0_100000001 %float_0_109999999 %float_0_119999997
+%float_0_129999995 = OpConstant %float 0.129999995
+%float_0_140000001 = OpConstant %float 0.140000001
+%float_0_150000006 = OpConstant %float 0.150000006
+%float_0_159999996 = OpConstant %float 0.159999996
+         %64 = OpConstantComposite %v4float %float_0_129999995 %float_0_140000001 %float_0_150000006 %float_0_159999996
+%float_0_170000002 = OpConstant %float 0.170000002
+%float_0_180000007 = OpConstant %float 0.180000007
+%float_0_189999998 = OpConstant %float 0.189999998
+%float_0_200000003 = OpConstant %float 0.200000003
+         %72 = OpConstantComposite %v4float %float_0_170000002 %float_0_180000007 %float_0_189999998 %float_0_200000003
+%float_0_209999993 = OpConstant %float 0.209999993
+%float_0_219999999 = OpConstant %float 0.219999999
+%float_0_230000004 = OpConstant %float 0.230000004
+%float_0_239999995 = OpConstant %float 0.239999995
+         %80 = OpConstantComposite %v4float %float_0_209999993 %float_0_219999999 %float_0_230000004 %float_0_239999995
+ %float_0_25 = OpConstant %float 0.25
+%float_0_25999999 = OpConstant %float 0.25999999
+%float_0_270000011 = OpConstant %float 0.270000011
+%float_0_280000001 = OpConstant %float 0.280000001
+         %88 = OpConstantComposite %v4float %float_0_25 %float_0_25999999 %float_0_270000011 %float_0_280000001
+%float_0_289999992 = OpConstant %float 0.289999992
+%float_0_300000012 = OpConstant %float 0.300000012
+%float_0_310000002 = OpConstant %float 0.310000002
+%float_0_319999993 = OpConstant %float 0.319999993
+         %96 = OpConstantComposite %v4float %float_0_289999992 %float_0_300000012 %float_0_310000002 %float_0_319999993
+      %int_0 = OpConstant %int 0
+%_ptr_PushConstant_uint = OpTypePointer PushConstant %uint
+       %bool = OpTypeBool
+%float_0_999909997 = OpConstant %float 0.999909997
+        %113 = OpConstantComposite %v4float %float_0_999909997 %float_0_999909997 %float_0_999909997 %float_0_999909997
+%float_9_10000017en05 = OpConstant %float 9.10000017e-05
+        %115 = OpConstantComposite %v4float %float_9_10000017en05 %float_9_10000017en05 %float_9_10000017en05 %float_9_10000017en05
+%float_0_999920011 = OpConstant %float 0.999920011
+        %119 = OpConstantComposite %v4float %float_0_999920011 %float_0_999920011 %float_0_999920011 %float_0_999920011
+%float_9_2000002en05 = OpConstant %float 9.2000002e-05
+        %121 = OpConstantComposite %v4float %float_9_2000002en05 %float_9_2000002en05 %float_9_2000002en05 %float_9_2000002en05
+%float_0_999930024 = OpConstant %float 0.999930024
+        %125 = OpConstantComposite %v4float %float_0_999930024 %float_0_999930024 %float_0_999930024 %float_0_999930024
+%float_9_30000024en05 = OpConstant %float 9.30000024e-05
+        %127 = OpConstantComposite %v4float %float_9_30000024en05 %float_9_30000024en05 %float_9_30000024en05 %float_9_30000024en05
+%float_0_999939978 = OpConstant %float 0.999939978
+        %131 = OpConstantComposite %v4float %float_0_999939978 %float_0_999939978 %float_0_999939978 %float_0_999939978
+%float_9_40000027en05 = OpConstant %float 9.40000027e-05
+        %133 = OpConstantComposite %v4float %float_9_40000027en05 %float_9_40000027en05 %float_9_40000027en05 %float_9_40000027en05
+%float_0_999949992 = OpConstant %float 0.999949992
+        %137 = OpConstantComposite %v4float %float_0_999949992 %float_0_999949992 %float_0_999949992 %float_0_999949992
+%float_9_50000031en05 = OpConstant %float 9.50000031e-05
+        %139 = OpConstantComposite %v4float %float_9_50000031en05 %float_9_50000031en05 %float_9_50000031en05 %float_9_50000031en05
+%float_0_999960005 = OpConstant %float 0.999960005
+        %143 = OpConstantComposite %v4float %float_0_999960005 %float_0_999960005 %float_0_999960005 %float_0_999960005
+%float_9_60000034en05 = OpConstant %float 9.60000034e-05
+        %145 = OpConstantComposite %v4float %float_9_60000034en05 %float_9_60000034en05 %float_9_60000034en05 %float_9_60000034en05
+%float_0_999970019 = OpConstant %float 0.999970019
+        %149 = OpConstantComposite %v4float %float_0_999970019 %float_0_999970019 %float_0_999970019 %float_0_999970019
+%float_9_69999965en05 = OpConstant %float 9.69999965e-05
+        %151 = OpConstantComposite %v4float %float_9_69999965en05 %float_9_69999965en05 %float_9_69999965en05 %float_9_69999965en05
+%float_0_999979973 = OpConstant %float 0.999979973
+        %155 = OpConstantComposite %v4float %float_0_999979973 %float_0_999979973 %float_0_999979973 %float_0_999979973
+%float_9_79999968en05 = OpConstant %float 9.79999968e-05
+        %157 = OpConstantComposite %v4float %float_9_79999968en05 %float_9_79999968en05 %float_9_79999968en05 %float_9_79999968en05
+%_runtimearr_float = OpTypeRuntimeArray %float
+%_struct_178 = OpTypeStruct %_runtimearr_float
+%_ptr_Uniform__struct_178 = OpTypePointer Uniform %_struct_178
+        %180 = OpVariable %_ptr_Uniform__struct_178 Uniform
+     %uint_1 = OpConstant %uint 1
+%_ptr_Uniform_float = OpTypePointer Uniform %float
+   %uint_256 = OpConstant %uint 256
+%gl_WorkGroupSize = OpConstantComposite %v3uint %uint_256 %uint_1 %uint_1
+          %4 = OpFunction %void None %3
+          %5 = OpLabel
+         %14 = OpAccessChain %_ptr_Input_uint %gl_GlobalInvocationID %uint_0
+         %15 = OpLoad %uint %14
+         %21 = OpConvertUToF %float %15
+         %23 = OpFMul %float %21 %float_9_99999997en07
+         %30 = OpAccessChain %_ptr_PushConstant_float %26 %int_1
+         %31 = OpLoad %float %30
+         %32 = OpFAdd %float %23 %31
+         %33 = OpCompositeConstruct %v4float %32 %32 %32 %32
+         %41 = OpFAdd %v4float %33 %40
+         %49 = OpFAdd %v4float %33 %48
+         %57 = OpFAdd %v4float %33 %56
+         %65 = OpFAdd %v4float %33 %64
+         %73 = OpFAdd %v4float %33 %72
+         %81 = OpFAdd %v4float %33 %80
+         %89 = OpFAdd %v4float %33 %88
+         %97 = OpFAdd %v4float %33 %96
+               OpBranch %99
+         %99 = OpLabel
+        %213 = OpPhi %v4float %97 %5 %158 %100
+        %212 = OpPhi %v4float %89 %5 %152 %100
+        %211 = OpPhi %v4float %81 %5 %146 %100
+        %210 = OpPhi %v4float %73 %5 %140 %100
+        %209 = OpPhi %v4float %65 %5 %134 %100
+        %208 = OpPhi %v4float %57 %5 %128 %100
+        %207 = OpPhi %v4float %49 %5 %122 %100
+        %206 = OpPhi %v4float %41 %5 %116 %100
+        %205 = OpPhi %uint %uint_0 %5 %160 %100
+        %107 = OpAccessChain %_ptr_PushConstant_uint %26 %int_0
+        %108 = OpLoad %uint %107
+        %110 = OpULessThan %bool %205 %108
+               OpLoopMerge %101 %100 None
+               OpBranchConditional %110 %100 %101
+        %100 = OpLabel
+        %116 = OpExtInst %v4float %1 Fma %206 %113 %115
+        %122 = OpExtInst %v4float %1 Fma %207 %119 %121
+        %128 = OpExtInst %v4float %1 Fma %208 %125 %127
+        %134 = OpExtInst %v4float %1 Fma %209 %131 %133
+        %140 = OpExtInst %v4float %1 Fma %210 %137 %139
+        %146 = OpExtInst %v4float %1 Fma %211 %143 %145
+        %152 = OpExtInst %v4float %1 Fma %212 %149 %151
+        %158 = OpExtInst %v4float %1 Fma %213 %155 %157
+        %160 = OpIAdd %uint %205 %int_1
+               OpBranch %99
+        %101 = OpLabel
+        %164 = OpFAdd %v4float %206 %207
+        %166 = OpFAdd %v4float %164 %208
+        %168 = OpFAdd %v4float %166 %209
+        %170 = OpFAdd %v4float %168 %210
+        %172 = OpFAdd %v4float %170 %211
+        %174 = OpFAdd %v4float %172 %212
+        %176 = OpFAdd %v4float %174 %213
+        %184 = OpCompositeExtract %float %176 0
+        %187 = OpCompositeExtract %float %176 1
+        %188 = OpFAdd %float %184 %187
+        %191 = OpCompositeExtract %float %176 2
+        %192 = OpFAdd %float %188 %191
+        %195 = OpCompositeExtract %float %176 3
+        %196 = OpFAdd %float %192 %195
+        %198 = OpAccessChain %_ptr_Uniform_float %180 %int_0 %15
+               OpStore %198 %196
+               OpReturn
+               OpFunctionEnd

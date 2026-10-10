@@ -1,0 +1,32 @@
+{
+  "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf": {
+    "bytes": 2790341728,
+    "mtime_ns": 1789318733863246483,
+    "inode": 1772663,
+    "sha256": "8db8b4207bbe40286db910fae89928a8cc59b1f7c197aad0a1ebf1b12d5082ad"
+  },
+  "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf": {
+    "bytes": 37623740192,
+    "mtime_ns": 1791450959705249368,
+    "inode": 5680149,
+    "sha256": "69820c02ec7d0b45ef2ebb19d6620299db749fe2aded7f39f93c6b88b199b720"
+  },
+  "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf": {
+    "bytes": 28800138432,
+    "mtime_ns": 1791452761519136250,
+    "inode": 5680221,
+    "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"
+  },
+  "/home/kunweiz/atomic-llama-cpp-turboquant/models/perf-gap-q2-hcq8/Q2-HCQ8-00002-of-00002.gguf": {
+    "bytes": 28800138432,
+    "mtime_ns": 1791488792926749814,
+    "inode": 5699368,
+    "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"
+  },
+  "/home/kunweiz/atomic-llama-cpp-turboquant/models/perf-gap-q2-hcq8/Q2-HCQ8-00001-of-00002.gguf": {
+    "bytes": 37024085792,
+    "mtime_ns": 1791488534679447885,
+    "inode": 5699364,
+    "sha256": "93505494783f6036e5f7880dbf1a6c632ae0e6c2c2b7909b245d7efebdd06094"
+  }
+}

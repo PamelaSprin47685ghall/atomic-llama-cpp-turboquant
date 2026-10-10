@@ -1,0 +1,28 @@
+{
+  "pilot_only": true,
+  "control_tps": 67.45204868351614,
+  "tiles2_tps": 67.07841975439135,
+  "ratio": 0.9944608216293348,
+  "corresponding_output_match": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+  ],
+  "measured_fallbacks": 0,
+  "full_state_comparison": "not yet exercised",
+  "qualification": "not promoted",
+  "tiles4_tps": 66.21133001256761,
+  "tiles4_ratio": 0.981605915681376,
+  "tiles4_corresponding_output_match": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+  ],
+  "tiles4_measured_fallbacks": 0
+}

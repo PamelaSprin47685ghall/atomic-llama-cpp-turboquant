@@ -1,0 +1,16 @@
+== qwen4exp projection call sites (Wq/Wk/Wv/Wo/HC/MoE/LM head) ==
+
+七行 target verify (n_tokens=7, single seq) 的 matvec 命中面（skinny-as-batch / 普通 batch）:
+- 路由: dst->ne[1]=7 <= 18 (mul_mat_vec_max_cols), src1->ne[2]*ne[3]==1
+  -> ggml_vk_mul_mat_vec_q_f16(skinny_as_batch=false), batch_n=true, mat_vec_cols=7
+- 每层命中权重（Qwen4EXP-AF, 48 层, TP5 五分片）:
+  * attention: Wq/Wk/Wv (Q5_K, rm_kq=2 → NUM_ROWS=2), Wo (Q5_K)
+  * HC 四流: down/up fold (Q8_0/Q5_K mix)
+  * MoE: 门控与专家投影走 MUL_MAT_ID（不命中本快路, guard 排除 MUL_MAT_ID）
+  * QSA/GDN projections: 专用 pipeline（gdn_projections/qsa_projections, NUM_ROWS=rm_kq=2）
+  * LM head: Q5_K wire pipeline（output_q5k_relay_rows, 专用）
+- guard: K_PER_ITER==8 (非 F32/F16/BF16 权重满足), !MUL_MAT_ID, !HC_DOWN_Q8_DOT
+- 基座行为: NUM_COLS=7 > 4 → 走 per-row fetch 分支, 每 (列,行) 对重读权重块
+- K1a 行为: NUM_COLS=7 > 4 → 同样新 per-row 循环, 但权块解量化一次、7 列从寄存器发射
+  （NUM_COLS<=4 的 staged 分支对 7 列不触发——与整合版一致）
+

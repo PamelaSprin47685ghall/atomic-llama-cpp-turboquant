@@ -1,0 +1,58 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "用三句话解释哈希表与数组的主要区别。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "哈希表通过键值对存储数据，利用哈希函数将键映射到特定位置，从而实现平均常数时间复杂度的快速查找。\n\n数组则通过连续的内存空间存储元素，仅支持通过整数索引进行直接访问，无法直接通过非整数键值检索数据。\n\n因此，哈希表更适合需要基于任意键快速检索的场景，而数组更适合需要按顺序遍历或基于位置索引访问数据的场景。"
+        }
+      }
+    ],
+    "created": 1791547522,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 87,
+      "prompt_tokens": 23,
+      "total_tokens": 110,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-01SQ5zGnx97MvyesmZDBOT7Vcp4If7bI",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 23,
+      "prompt_ms": 1358.684,
+      "prompt_per_token_ms": 59.07321739130435,
+      "prompt_per_second": 16.92814517577303,
+      "predicted_n": 87,
+      "predicted_ms": 1376.545,
+      "predicted_per_token_ms": 15.82235632183908,
+      "predicted_per_second": 63.20171153140653
+    }
+  },
+  "wall_ms": 2738.31904,
+  "log_begin": 88122,
+  "log_end": 99417,
+  "phase": "guard"
+}

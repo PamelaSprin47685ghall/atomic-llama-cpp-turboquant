@@ -1,0 +1,12 @@
+{
+  "artifacts/perf-gap/run-20261009T0145/reference-bin/libggml-base.so.0.18.1": "5ba47ae9690e271da5e3377d8bd51483cdb175f432b239ebf3cec2ffc93718b8",
+  "artifacts/perf-gap/run-20261009T0145/reference-bin/libggml-cpu.so.0.18.1": "267c3666818388fc85870bee6fba4c01bfd66e58140664f941536c17e7081c91",
+  "artifacts/perf-gap/run-20261009T0145/reference-bin/libggml-vulkan.so.0.18.1": "2bb6c9daca46242efe9c949ef6ad40d6abf9269d7dcbcd6d7496670e7ba0ef43",
+  "artifacts/perf-gap/run-20261009T0145/reference-bin/libggml.so.0.18.1": "67cb338e4e6dfe914a9e1a8fa1e31f0ffdc91bd851616479f5c8a49d8456ec60",
+  "artifacts/perf-gap/run-20261009T0145/reference-bin/libllama.so.0.0.2188": "4ec824361399b23a838f21309679058938ff5cf3f3c57636463cfe452a48f9d8",
+  "artifacts/perf-gap/run-20261009T0145/reference-bin/libmtmd.so.0.0.2188": "ae68c4d7c3e49aff6dc1a5785f9b7b5d410e73469fa02e1ce9380303d1defe12",
+  "artifacts/perf-gap/run-20261009T0145/reference-bin/libllama-common.so.0.0.2188": "40f69e82e5b94cbeedc16a81fe06d943805c531bb5e47a51db2909db718c33d6",
+  "artifacts/perf-gap/run-20261009T0145/reference-bin/libllama-server-impl.so": "30c2963cf04eb1b728974a741ba290d6d99ea5a3cfb70fd52bed9e3e172c53b5",
+  "artifacts/perf-gap/run-20261009T0145/reference-bin/llama-server": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c",
+  "artifacts/perf-gap/run-20261009T0145/reference-bin/libtp5-hc-quant-helper.so": "2c2fe38e830be5bbfe58124e31b03a1f4deab57212cad6c9f2a6b8986d0c4ecc"
+}

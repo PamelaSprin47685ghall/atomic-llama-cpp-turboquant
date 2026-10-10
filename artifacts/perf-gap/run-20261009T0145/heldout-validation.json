@@ -1,0 +1,233 @@
+{
+  "kind": "HELD_OUT_MODEL_VALIDATION",
+  "frozen_utc": "2026-10-09T02:15:23Z",
+  "runs": [
+    {
+      "run": "artifacts/perf-gap/run-20261009T0145/greedy-b1-B",
+      "requests": [
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2608.176,
+          "actual_tps": 67.48010870432057,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.012556284545214735
+        },
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2617.438,
+          "actual_tps": 67.24132529595734,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.008973278450148392
+        },
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2604.123,
+          "actual_tps": 67.58513326751464,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.014132204968812845
+        }
+      ],
+      "predicted_tps": 66.64331626229446,
+      "actual_tps": 67.43521525691092,
+      "relative_time_error": 0.011882646888394799,
+      "within_limit": true
+    },
+    {
+      "run": "artifacts/perf-gap/run-20261009T0145/greedy-b2-B",
+      "requests": [
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2631.759,
+          "actual_tps": 66.87542438346368,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.0034828417039705073
+        },
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2621.862,
+          "actual_tps": 67.12786561611557,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.007270786944545415
+        },
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2628.802,
+          "actual_tps": 66.95064900285377,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.004611606351486275
+        }
+      ],
+      "predicted_tps": 66.64331626229446,
+      "actual_tps": 66.98447926481488,
+      "relative_time_error": 0.0051192380819957695,
+      "within_limit": true
+    },
+    {
+      "run": "artifacts/perf-gap/run-20261009T0145/greedy-b3-B",
+      "requests": [
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2628.887,
+          "actual_tps": 66.94848428251194,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.0045791241692776374
+        },
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2638.122,
+          "actual_tps": 66.71412466898802,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.0010624982468590005
+        },
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2638.165,
+          "actual_tps": 66.71303728159535,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.0010461817210067892
+        }
+      ],
+      "predicted_tps": 66.64331626229446,
+      "actual_tps": 66.79169870264715,
+      "relative_time_error": 0.0022265164561843243,
+      "within_limit": true
+    },
+    {
+      "run": "artifacts/perf-gap/run-20261009T0145/greedy-b4-B",
+      "requests": [
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2609.83,
+          "actual_tps": 67.43734266216573,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.011914569148181897
+        },
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2611.291,
+          "actual_tps": 67.3996119160982,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.01134840965637296
+        },
+        {
+          "tokens": 176,
+          "predicted_ms": 2640.9249999999997,
+          "predicted_tps": 66.64331626229446,
+          "actual_ms": 2615.281,
+          "actual_tps": 67.2967837872871,
+          "content_sha256": "52db628ed3cb3949c62459f4c56da8b6b4ae1295070b11700e44b36f9c75f07e",
+          "relative_time_error": 0.009805447292279501
+        }
+      ],
+      "predicted_tps": 66.64331626229446,
+      "actual_tps": 67.37786040072983,
+      "relative_time_error": 0.011022022606803406,
+      "within_limit": true
+    },
+    {
+      "run": "artifacts/perf-gap/run-20261009T0145/heldout-index-B",
+      "requests": [
+        {
+          "tokens": 93,
+          "predicted_ms": 1492.623816091954,
+          "predicted_tps": 62.30638892222438,
+          "actual_ms": 1493.19,
+          "actual_tps": 62.282763747413256,
+          "content_sha256": "03617851b770f5af8b40dd7cc42a67a742e7c396cf7a385eab87206f9ba2e51f",
+          "relative_time_error": -0.0003791774041119744
+        },
+        {
+          "tokens": 93,
+          "predicted_ms": 1492.623816091954,
+          "predicted_tps": 62.30638892222438,
+          "actual_ms": 1498.613,
+          "actual_tps": 62.057382392919315,
+          "content_sha256": "03617851b770f5af8b40dd7cc42a67a742e7c396cf7a385eab87206f9ba2e51f",
+          "relative_time_error": -0.0039964846882056815
+        }
+      ],
+      "predicted_tps": 62.30638892222438,
+      "actual_tps": 62.16986880486449,
+      "relative_time_error": -0.0021911094467422787,
+      "within_limit": true
+    },
+    {
+      "run": "artifacts/perf-gap/run-20261009T0145/heldout-process-B",
+      "requests": [
+        {
+          "tokens": 149,
+          "predicted_ms": 2267.3812413793103,
+          "predicted_tps": 65.71457736386634,
+          "actual_ms": 2215.8,
+          "actual_tps": 67.2443361314198,
+          "content_sha256": "2d1d8ec749be6d21185a9e95763ef72dd75c077bb3a71529f13ce1d87f5a7d9d",
+          "relative_time_error": 0.023278834452256536
+        },
+        {
+          "tokens": 149,
+          "predicted_ms": 2267.3812413793103,
+          "predicted_tps": 65.71457736386634,
+          "actual_ms": 2220.267,
+          "actual_tps": 67.10904589402986,
+          "content_sha256": "2d1d8ec749be6d21185a9e95763ef72dd75c077bb3a71529f13ce1d87f5a7d9d",
+          "relative_time_error": 0.02122007910729229
+        }
+      ],
+      "predicted_tps": 65.71457736386634,
+      "actual_tps": 67.17662289591208,
+      "relative_time_error": 0.02224842022418061,
+      "within_limit": true
+    },
+    {
+      "run": "artifacts/perf-gap/run-20261009T0145/heldout-debug-B",
+      "requests": [
+        {
+          "tokens": 172,
+          "predicted_ms": 2585.585183908046,
+          "predicted_tps": 66.52265841809411,
+          "actual_ms": 2560.42,
+          "actual_tps": 67.1764788589372,
+          "content_sha256": "8391827d41cd854797db5c3a97fd329d42380de4b96547ac65095d4cf7917b4b",
+          "relative_time_error": 0.009828537469651843
+        },
+        {
+          "tokens": 172,
+          "predicted_ms": 2585.585183908046,
+          "predicted_tps": 66.52265841809411,
+          "actual_ms": 2541.418,
+          "actual_tps": 67.67875257041541,
+          "content_sha256": "8391827d41cd854797db5c3a97fd329d42380de4b96547ac65095d4cf7917b4b",
+          "relative_time_error": 0.01737895297351555
+        }
+      ],
+      "predicted_tps": 66.52265841809411,
+      "actual_tps": 67.42668034539709,
+      "relative_time_error": 0.013589684309084804,
+      "within_limit": true
+    }
+  ],
+  "all_within_limit": true,
+  "not_a_claim": "Matching a calibrated model does not prove hardware optimality or resolve prior protocol failures."
+}

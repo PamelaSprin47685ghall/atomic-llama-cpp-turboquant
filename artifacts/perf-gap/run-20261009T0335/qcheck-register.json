@@ -1,0 +1,7 @@
+{
+  "candidate": "GGML_TP5_QCHECK_VECTOR=1, default off: combine AVX2 payload vectors before one horizontal xor per workgroup; avoid separate AVX2-call/horizontal-reduction per8 words.",
+  "contract": "Exactly same epoch/live-word-count/per-workgroup xor and first-failing-workgroup result, acquire fence per workgroup, same payload extent and rank polling. No omitted checks, weaker checksum, new retries, altered timeout or premature retirement.",
+  "qualification": "CPU bit-mutation tests across f16/f32 payloads,1/2/4 rows,rank32/320/512; include every payload word and metadata field. Then same-binary A/B pilot and four independent paired processes only if pilot is correct and plausible. Full measured/guard output hashes and actual opt-in identity required.",
+  "micro_limit": "Cached CPU microbenchmark estimates checker arithmetic only, not GPU-visible memory polling latency. No model speed claim from micro alone.",
+  "prior_candidate": "Identical barrier dedup found0 eliminations and no speed difference; not counted as a gain."
+}

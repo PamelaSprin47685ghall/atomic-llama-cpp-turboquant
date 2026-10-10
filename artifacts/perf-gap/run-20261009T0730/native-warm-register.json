@@ -1,0 +1,7 @@
+{
+  "reason": "Earlier native GEMV microbenchmarks inherited the default dedicated compute queue, whereas qualified TP5 uses the graphics-capable compute family. Cold-vs-stream anomalies also require sustained workload warmup.",
+  "control": "Same actual native Vulkan backend code, fixed200ms workload warmup, GGML_VK_ALLOW_GRAPHICS_QUEUE=1 matching production, MMVQdisabled, resident and>128MiB streaming addresses, no clock writes.",
+  "cases": ["q6-vocab","router-f32","gdn-q5-projection","gdn-gate-q5","qsa-q-q5","qsa-kv-q6","q5-output","moe-down-iq4","shared-down-q8","indexer-bf16"],
+  "limits": "These are isolated native contractions, not necessarily the fused production region. Timings include host graph submission/synchronization amortized over repeated operations; do not rename them pure GPU hardware lower bounds or add a second dispatch overhead. Use actual fused MoE service for the gate/up region instead of these generic proxies.",
+  "independence": "No model-request time or fitted residual enters this calibration. Every cost replacing a matrix or region must also remove that region's prior logical-weight estimate."
+}

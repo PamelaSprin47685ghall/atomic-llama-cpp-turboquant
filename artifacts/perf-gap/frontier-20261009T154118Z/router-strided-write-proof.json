@@ -1,0 +1,40 @@
+{
+  "scope": "single Vulkan0, frozen router-empty-head-bin, exact dyadic F16 converted weight with nonzero-offset view",
+  "command": "flock /var/tmp/tp5-gpu.lock env GGML_VK_ROUTER_WEIGHTS=f16 GGML_VK_ROUTER_TILING=1 LD_LIBRARY_PATH=<router-empty-head-bin> /var/tmp/tp5-router-weight-smoke",
+  "observed_before": {
+    "returncode": 1,
+    "initial": {
+      "actual": 1.0,
+      "expected": 1.0
+    },
+    "strided_update": {
+      "actual": 1.0,
+      "expected": 7.0
+    },
+    "warm_reuse": {
+      "actual": 1.0,
+      "expected": 7.0
+    }
+  },
+  "cause": "Two 4-byte writes at parent offsets 0 and 512: cached weight begins at offset256. Dense 8-byte invalidation misses the second overlapping write.",
+  "fix": "synchronous and async 2D upload invalidate the overflow-checked bounding span (n_copies-1)*stride_tensor+size; zero copies returns without underflow",
+  "regression": "tests/test-vulkan-command-replay.cpp::test_router_weight_strided_updates; validates all 512 scores after synchronous and asynchronous writes for f16/bf16",
+  "frontend_sha256": "f9eeff6d138d7f15d05ec8626d5b6e38cc3917dc684ee571d76c740b9273a43c",
+  "after": "PASS: F16 and lossless BF16 all512 scores reflect sync/async strided updates and warm reuse",
+  "permanent_regression_runs": [
+    {
+      "phase": "before",
+      "returncode": 1,
+      "log": "router-weight-lifetime-before.log",
+      "actual_DSO_directory": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-empty-head-bin",
+      "expected_success": false
+    },
+    {
+      "phase": "after",
+      "returncode": 0,
+      "log": "router-weight-lifetime-after.log",
+      "actual_DSO_directory": "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin",
+      "expected_success": true
+    }
+  ]
+}

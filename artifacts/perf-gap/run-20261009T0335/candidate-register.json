@@ -1,0 +1,7 @@
+{
+  "candidate": "GGML_TP5_DEDUP_BARRIERS=1: remove only a literally identical repeated buffer/global barrier with no intervening dispatch, copy, query or raw barrier; descriptor/pipeline/push-constant binding commands do not execute memory work. Images, pNext and queue ownership excluded. Default off.",
+  "validation": "Exact memory/buffer/range/access/stage/flags equality tests; original and candidate use same actual source/DSO; actual removed count must be nonzero before attributing a gain. Preserve all binding/epoch/extent/payload and drain rules.",
+  "diagnostic": "GGML_TP5_GPU_TIMING_SPARSE=span emits two timestamp endpoints per rank; 8:residue emits endpoints plus 1/8 of stages. Query only selected IDs; never read absent query values as zero. Fixed capture ordinal400, no per-stage host printing or forced CPU profile-spin changes.",
+  "prior_preflight": "First synthetic relay attempt never initialized GPUs: idle gate saw residual busy counters after server teardown and refused. Retain it as preflight failure, not a model/protocol failure or timing point. New standalone probes start only with naturally idle five-card gate.",
+  "promotion": "Smoke/test passes do not promote. Candidate needs four fresh paired processes and raw output equality. If no duplicates or no paired net gain, retain a rejected result, not a claimed speedup."
+}

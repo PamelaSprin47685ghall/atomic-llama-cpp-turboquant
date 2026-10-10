@@ -1,0 +1,195 @@
+{
+  "kind": "CALIBRATED_IMPLEMENTATION_PREDICTION_NOT_HARDWARE_BOUND",
+  "frozen_utc": "2026-10-09T02:15:23Z",
+  "identity": {
+    "bin_sha256": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c",
+    "libraries": {
+      "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libggml-base.so.0.18.1": "5ba47ae9690e271da5e3377d8bd51483cdb175f432b239ebf3cec2ffc93718b8",
+      "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libggml-cpu.so.0.18.1": "267c3666818388fc85870bee6fba4c01bfd66e58140664f941536c17e7081c91",
+      "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libggml-vulkan.so.0.18.1": "ab417ee456997acdfd4def505bdcffbde8ddc194ad88f14d66858ba5c8cce91d",
+      "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libggml.so.0.18.1": "67cb338e4e6dfe914a9e1a8fa1e31f0ffdc91bd851616479f5c8a49d8456ec60",
+      "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libllama-common.so.0.0.2188": "90faab9f9f1f19e2f0cca02415efdbb7f507d626fba5ef53d6f2b62600ae2765",
+      "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libllama-server-impl.so": "9043818c57ba30d38398fca6c7ac6f4a73c0165842b76931cd4323fafb720a52",
+      "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/libllama.so.0.0.2188": "70535dab57117e72181914f5cf2fd9d95d6709a2b644b14317847f710691c02d",
+      "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+      "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+      "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+      "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac"
+    },
+    "model": {
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf": {
+        "bytes": 539423008,
+        "mtime_ns": 1789096271661852679,
+        "inode": 177820
+      },
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00002-of-00006.gguf": {
+        "bytes": 28800138432,
+        "mtime_ns": 1789097468349781388,
+        "inode": 177819
+      },
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00003-of-00006.gguf": {
+        "bytes": 14626936832,
+        "mtime_ns": 1789096972326660333,
+        "inode": 177821
+      },
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00004-of-00006.gguf": {
+        "bytes": 14624775200,
+        "mtime_ns": 1789098595947503978,
+        "inode": 177826
+      },
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00005-of-00006.gguf": {
+        "bytes": 14624775200,
+        "mtime_ns": 1789098472402711746,
+        "inode": 177825
+      },
+      "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00006-of-00006.gguf": {
+        "bytes": 11861758976,
+        "mtime_ns": 1789098569756184020,
+        "inode": 177824
+      }
+    },
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "LANG": "en_US.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "LD_LIBRARY_PATH": "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin",
+      "RADV_DEBUG": "nobolist",
+      "GGML_VK_DISABLE_MMVQ": "1",
+      "GGML_VK_FORCE_MMVQ": "0",
+      "GGML_TP5_REPLICATE_ATTN": "0",
+      "GGML_TP5_QSA_HEADMAP": "1",
+      "GGML_TP5_GDN_HEADMAP": "1",
+      "GGML_VK_SMALL_Q8_COLUMNS": "1",
+      "GGML_TP5_GREEDY_HOST": "1"
+    },
+    "args": {
+      "horizon": 0,
+      "latebind": "aggressive",
+      "mmvq": "disabled",
+      "threads": 22,
+      "ctx": 1024
+    }
+  },
+  "calibration": [
+    {
+      "path": "artifacts/perf-gap/run-20261009T0145/calibration-B/request-2.json",
+      "raw_sha256": "711b4eb581f224069bfe9a4239798639e46b516b44eb7c05d583de3e21a015a0",
+      "trace_sha256": "dba2a4dc8b033978ed067f4a96cd5ae44df0e481f7f5db5e6295466bb4db0751",
+      "tokens": 176,
+      "generation_ms": 2680.263,
+      "first_ms": {
+        "setup": 0.151,
+        "graph": 2.296,
+        "alloc": 116.67,
+        "input": 0.025,
+        "submit": 138.914,
+        "finish": 0.007,
+        "decode_other": 0.28,
+        "sample_sync": 0.228,
+        "sample_select": 0.092
+      },
+      "steady_ms": {
+        "setup": 0.0026666666666666666,
+        "graph": 0.005959770114942529,
+        "alloc": 0.0,
+        "input": 0.012672413793103448,
+        "submit": 13.335241379310345,
+        "finish": 0.0021666666666666666,
+        "decode_other": 0.18091379310344827,
+        "sample_sync": 0.2565402298850575,
+        "sample_select": 0.0846896551724138
+      },
+      "unexplained_server_ms": 6.33199999999988,
+      "unexplained_fraction": 0.0023624547292560023
+    },
+    {
+      "path": "artifacts/perf-gap/run-20261009T0145/calibration-B/request-3.json",
+      "raw_sha256": "5d52195336323f34c395f8095a5d407d8bdddaf6bb55fd243ac491a2fd304e0a",
+      "trace_sha256": "abeedb3c4e065f98d0c2c209130223a9f5ef244dd6f94b0d75650b513d73206f",
+      "tokens": 176,
+      "generation_ms": 2654.203,
+      "first_ms": {
+        "setup": 0.138,
+        "graph": 1.831,
+        "alloc": 100.517,
+        "input": 0.022,
+        "submit": 120.575,
+        "finish": 0.006,
+        "decode_other": 0.22,
+        "sample_sync": 0.311,
+        "sample_select": 0.083
+      },
+      "steady_ms": {
+        "setup": 0.0029942528735632185,
+        "graph": 0.006126436781609196,
+        "alloc": 0.0,
+        "input": 0.01253448275862069,
+        "submit": 13.368258620689655,
+        "finish": 0.003839080459770115,
+        "decode_other": 0.18748850574712644,
+        "sample_sync": 0.26114367816091955,
+        "sample_select": 0.08745977011494253
+      },
+      "unexplained_server_ms": 6.70699999999988,
+      "unexplained_fraction": 0.0025269355810387827
+    },
+    {
+      "path": "artifacts/perf-gap/run-20261009T0145/calibration-B/request-4.json",
+      "raw_sha256": "a580eba2ee4c2e774b0c23bbb65cbe69414588058f367952df0592a2ec95a388",
+      "trace_sha256": "2776cd4c6411f01d944348f247153a00861b9021a530882d1f90c86f6cbdf55a",
+      "tokens": 176,
+      "generation_ms": 2607.532,
+      "first_ms": {
+        "setup": 0.125,
+        "graph": 1.949,
+        "alloc": 96.346,
+        "input": 0.022,
+        "submit": 119.529,
+        "finish": 0.005,
+        "decode_other": 0.227,
+        "sample_sync": 0.276,
+        "sample_select": 0.084
+      },
+      "steady_ms": {
+        "setup": 0.0028448275862068967,
+        "graph": 0.0054080459770114945,
+        "alloc": 0.0,
+        "input": 0.011528735632183908,
+        "submit": 13.158902298850574,
+        "finish": 0.0019827586206896553,
+        "decode_other": 0.17097701149425287,
+        "sample_sync": 0.2620229885057471,
+        "sample_select": 0.0805
+      },
+      "unexplained_server_ms": 6.1840000000001965,
+      "unexplained_fraction": 0.0023715912211241114
+    }
+  ],
+  "first_ms": {
+    "setup": 0.138,
+    "graph": 2.025333333333333,
+    "alloc": 104.511,
+    "input": 0.023,
+    "submit": 126.33933333333333,
+    "finish": 0.006,
+    "decode_other": 0.24233333333333335,
+    "sample_sync": 0.27166666666666667,
+    "sample_select": 0.08633333333333333
+  },
+  "steady_ms": {
+    "setup": 0.002835249042145594,
+    "graph": 0.005831417624521073,
+    "alloc": 0.0,
+    "input": 0.01224521072796935,
+    "submit": 13.28746743295019,
+    "finish": 0.0026628352490421455,
+    "decode_other": 0.17979310344827587,
+    "sample_sync": 0.2599022988505747,
+    "sample_select": 0.08421647509578545
+  },
+  "formula": "T(N)=sum(first_ms)+(N-2)*sum(steady_ms), N>=3; first prefill token excluded from timer",
+  "match_relative_error_limit": 0.05,
+  "excluded_from_prediction": "Unexplained server remainder; no post-hoc scaling or fitted overhead",
+  "limitations": "One initial scalar rebuild, fixed configuration, warm request, conditional on output length. Not cold start, not hardware optimum, not quality qualification."
+}

@@ -1,0 +1,58 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "请用八句话说明如何排查一个突然变慢的程序，涵盖复现问题、建立基线、CPU、内存、磁盘、网络、验证修改和回归测试。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "首先，尝试在相同环境下稳定复现程序变慢的现象，以排除偶发性干扰。\n其次，收集程序在正常状态下的性能数据，建立清晰的基准线以便对比分析。\n接着，使用性能分析工具监控 CPU 使用率，定位是否存在计算密集型瓶颈或死循环。\n同时，检查内存占用情况，排查内存泄漏、频繁垃圾回收或交换分区使用过高的问题。\n此外，分析磁盘 I/O 指标，确认是否存在读写延迟过高或并发锁竞争导致的阻塞。\n再者，审查网络请求日志与带宽使用情况，识别外部接口响应缓慢或网络拥塞的影响。\n然后，针对定位到的具体瓶颈实施优化修改，并立即在测试环境中验证性能是否恢复。\n最后，执行全面的回归测试，确保修复措施未引入新的功能缺陷或性能退化。"
+        }
+      }
+    ],
+    "created": 1791513255,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 172,
+      "prompt_tokens": 47,
+      "total_tokens": 219,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-Pc9NjHbpB2OhX8E5wTdEs573GXFVhMAR",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 47,
+      "prompt_ms": 1753.051,
+      "prompt_per_token_ms": 37.29895744680851,
+      "prompt_per_second": 26.810400838309896,
+      "predicted_n": 172,
+      "predicted_ms": 2541.418,
+      "predicted_per_token_ms": 14.775686046511629,
+      "predicted_per_second": 67.67875257041541
+    }
+  },
+  "wall_ms": 4297.650426,
+  "log_begin": 43484,
+  "log_end": 55546,
+  "phase": "measured"
+}

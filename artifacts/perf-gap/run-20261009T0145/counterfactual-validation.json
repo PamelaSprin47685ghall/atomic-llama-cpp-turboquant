@@ -1,0 +1,89 @@
+{
+  "kind": "HELD_OUT_MODEL_VALIDATION",
+  "frozen_utc": "2026-10-09T02:23:54Z",
+  "runs": [
+    {
+      "run": "artifacts/perf-gap/run-20261009T0145/heldout-index-B",
+      "requests": [
+        {
+          "tokens": 93,
+          "predicted_ms": 1495.2474531034482,
+          "predicted_tps": 62.197062972402755,
+          "actual_ms": 1493.19,
+          "actual_tps": 62.282763747413256,
+          "content_sha256": "03617851b770f5af8b40dd7cc42a67a742e7c396cf7a385eab87206f9ba2e51f",
+          "relative_time_error": 0.0013778910275639156
+        },
+        {
+          "tokens": 93,
+          "predicted_ms": 1495.2474531034482,
+          "predicted_tps": 62.197062972402755,
+          "actual_ms": 1498.613,
+          "actual_tps": 62.057382392919315,
+          "content_sha256": "03617851b770f5af8b40dd7cc42a67a742e7c396cf7a385eab87206f9ba2e51f",
+          "relative_time_error": -0.0022457745238776416
+        }
+      ],
+      "predicted_tps": 62.197062972402755,
+      "actual_tps": 62.16986880486449,
+      "relative_time_error": -0.00043722591129946586,
+      "within_limit": true
+    },
+    {
+      "run": "artifacts/perf-gap/run-20261009T0145/heldout-process-B",
+      "requests": [
+        {
+          "tokens": 149,
+          "predicted_ms": 2275.5101032183907,
+          "predicted_tps": 65.4798235302319,
+          "actual_ms": 2215.8,
+          "actual_tps": 67.2443361314198,
+          "content_sha256": "2d1d8ec749be6d21185a9e95763ef72dd75c077bb3a71529f13ce1d87f5a7d9d",
+          "relative_time_error": 0.026947424505095352
+        },
+        {
+          "tokens": 149,
+          "predicted_ms": 2275.5101032183907,
+          "predicted_tps": 65.4798235302319,
+          "actual_ms": 2220.267,
+          "actual_tps": 67.10904589402986,
+          "content_sha256": "2d1d8ec749be6d21185a9e95763ef72dd75c077bb3a71529f13ce1d87f5a7d9d",
+          "relative_time_error": 0.02488128824974245
+        }
+      ],
+      "predicted_tps": 65.4798235302319,
+      "actual_tps": 67.17662289591208,
+      "relative_time_error": 0.025913316105636186,
+      "within_limit": true
+    },
+    {
+      "run": "artifacts/perf-gap/run-20261009T0145/heldout-debug-B",
+      "requests": [
+        {
+          "tokens": 172,
+          "predicted_ms": 2595.975120229885,
+          "predicted_tps": 66.2564131141475,
+          "actual_ms": 2560.42,
+          "actual_tps": 67.1764788589372,
+          "content_sha256": "8391827d41cd854797db5c3a97fd329d42380de4b96547ac65095d4cf7917b4b",
+          "relative_time_error": 0.013886440595638483
+        },
+        {
+          "tokens": 172,
+          "predicted_ms": 2595.975120229885,
+          "predicted_tps": 66.2564131141475,
+          "actual_ms": 2541.418,
+          "actual_tps": 67.67875257041541,
+          "content_sha256": "8391827d41cd854797db5c3a97fd329d42380de4b96547ac65095d4cf7917b4b",
+          "relative_time_error": 0.021467196749958006
+        }
+      ],
+      "predicted_tps": 66.2564131141475,
+      "actual_tps": 67.42668034539709,
+      "relative_time_error": 0.017662701257815216,
+      "within_limit": true
+    }
+  ],
+  "all_within_limit": true,
+  "not_a_claim": "Matching a calibrated model does not prove hardware optimality or resolve prior protocol failures."
+}

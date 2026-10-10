@@ -1,0 +1,8 @@
+{
+  "model": "frozen-model-B.json, frozen at 2026-10-09T02:15:23Z; no subsequent refitting",
+  "confirmation": "greedy-b1-A/B, b2-B/A, b3-A/B, b4-B/A; two warm, three measured and one guard per process; uninstrumented; same binary; sole factor GGML_TP5_GREEDY_HOST=0/1",
+  "heldout": ["heldout-index.txt", "heldout-process.txt", "heldout-debug.txt"],
+  "heldout_execution": "Each new prompt also gets an A/B comparison with two warm, two measured and one guard per process; A/B order alternates. These are model-generalization/semantic checks, not additional independent canonical performance blocks.",
+  "criteria": "All held-out B process cost predictions within frozen 5% tolerance. Same measured/guard raw body hashes between A and B for each prompt. No measured fallback or protocol failure; normal owned teardown. Failure aborts this campaign and is not replaced.",
+  "precision": "Prediction conditional on observed output length N, not a prediction of generated content or N itself. No fitted unexplained server residual. A calibrated implementation match is not proof of a tight hardware upper bound."
+}

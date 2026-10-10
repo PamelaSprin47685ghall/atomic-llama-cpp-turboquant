@@ -1,0 +1,48 @@
+{
+ "A": [
+  {
+   "i": 1,
+   "wall": 3.534,
+   "exact": true,
+   "tokens": 171,
+   "finish": "stop"
+  },
+  {
+   "i": 2,
+   "wall": 2.974,
+   "exact": true,
+   "tokens": 171,
+   "finish": "stop"
+  },
+  {
+   "i": 3,
+   "wall": 2.984,
+   "exact": true,
+   "tokens": 171,
+   "finish": "stop"
+  }
+ ],
+ "B": [
+  {
+   "i": 1,
+   "wall": 3.486,
+   "exact": true,
+   "tokens": 171,
+   "finish": "stop"
+  },
+  {
+   "i": 2,
+   "wall": 2.957,
+   "exact": true,
+   "tokens": 171,
+   "finish": "stop"
+  },
+  {
+   "i": 3,
+   "wall": 2.991,
+   "exact": true,
+   "tokens": 171,
+   "finish": "stop"
+  }
+ ]
+}

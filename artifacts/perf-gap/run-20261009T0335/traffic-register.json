@@ -1,0 +1,8 @@
+{
+  "purpose": "Measure real native F32-activation Q6/Q8 matvec memory transactions rather than importing old forced-MMVQ traffic factors.",
+  "shapes": [["Q6_K",2560,49664],["Q8_0",10240,320],["Q8_0",320,10240]],
+  "pipelines": "Use current generated subgroup_no_shmem native f32_f32 SPIR-V, wave32,1 column, Q6 rows_per_wg2 and Q8 rows_per_wg1, matching current RADV native selector. Direct standalone VkDevice, not a full model run.",
+  "counters": "Enumerate names, units/storage/scope from current device; select named waves, VMEM loads and VRAM read bytes. No fixed index. Three full multi-pass measurements per case, plus empty dispatch control; buffers initialized outside queried command buffer.",
+  "correctness": "Simple exactly-representable quantized weights and all-one F32 activation; check EVERY output against exact expected value. Same addresses across counter trials; not declared cold VRAM after first trial. Counter activity does not give a clock-independent hardware floor.",
+  "safety": "Profiling lock acquired through Vulkan API, bounded fence wait3s, single GPU lock and idle checks. No driver/clock/watchdog changes. Query/correctness failure stops the campaign and is retained."
+}

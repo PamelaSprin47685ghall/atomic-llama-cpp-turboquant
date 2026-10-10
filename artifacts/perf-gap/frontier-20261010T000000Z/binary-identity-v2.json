@@ -1,0 +1,29 @@
+{
+  "directory": "artifacts/perf-gap/frontier-20261010T000000Z/measured-bin-v2",
+  "files_sha256": {
+    "libggml-base.so": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46",
+    "libggml-base.so.0": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46",
+    "libggml-base.so.0.18.1": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46",
+    "libggml-cpu.so": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+    "libggml-cpu.so.0": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+    "libggml-cpu.so.0.18.1": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+    "libggml-vulkan.so": "807d3e9362b42162780e0c20be0b8e3d2b4264b46b9578142554876eb4bffb68",
+    "libggml-vulkan.so.0": "807d3e9362b42162780e0c20be0b8e3d2b4264b46b9578142554876eb4bffb68",
+    "libggml-vulkan.so.0.18.1": "807d3e9362b42162780e0c20be0b8e3d2b4264b46b9578142554876eb4bffb68",
+    "libggml.so": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2",
+    "libggml.so.0": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2",
+    "libggml.so.0.18.1": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2",
+    "libllama-common.so": "29bcbe656b7e8932ad8e399680873b5eddb442bd393b93ab5d638a548c3b9ff9",
+    "libllama-common.so.0": "29bcbe656b7e8932ad8e399680873b5eddb442bd393b93ab5d638a548c3b9ff9",
+    "libllama-common.so.0.0.2188": "29bcbe656b7e8932ad8e399680873b5eddb442bd393b93ab5d638a548c3b9ff9",
+    "libllama-server-impl.so": "bfb576ec8bcc22db074c75f3b38d0f6443e24c8c9e7a9dee10696a8e85746744",
+    "libllama.so": "5d63fa93bfe35f7da895bbea3cb79953733e76c513d57e9485744651ede09d19",
+    "libllama.so.0": "5d63fa93bfe35f7da895bbea3cb79953733e76c513d57e9485744651ede09d19",
+    "libllama.so.0.0.2188": "5d63fa93bfe35f7da895bbea3cb79953733e76c513d57e9485744651ede09d19",
+    "libmtmd.so": "a0b4c3eb6eec8c35d07b1303d77493cef60b225f2e39e8423ce9ebaad277be88",
+    "libmtmd.so.0": "a0b4c3eb6eec8c35d07b1303d77493cef60b225f2e39e8423ce9ebaad277be88",
+    "libmtmd.so.0.0.2188": "a0b4c3eb6eec8c35d07b1303d77493cef60b225f2e39e8423ce9ebaad277be88",
+    "libtp5-hc-quant-helper.so": "2c2fe38e830be5bbfe58124e31b03a1f4deab57212cad6c9f2a6b8986d0c4ecc",
+    "llama-server": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c"
+  }
+}

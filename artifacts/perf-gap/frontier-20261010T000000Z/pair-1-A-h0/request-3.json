@@ -1,0 +1,62 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文回答普通成年人如何健康减重。回答包含五个部分，每部分标题单独一行：\n一、热量缺口原理（两句话）\n二、饮食建议（三条，每条一句话解释）\n三、每周运动安排（给出周一至周五的安排）\n四、睡眠与恢复（两句话）\n五、常见误区与长期执行（三个误区各一句，最后两句讲长期方法）\n语言自然，正常结束。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "一、热量缺口原理\n减重的核心在于消耗的热量大于摄入的热量，从而迫使身体动用储存的脂肪作为能量来源。只要保持适度的热量缺口，体重就会稳步下降，无需极端节食或剧烈运动。\n\n二、饮食建议\n优先选择富含蛋白质和膳食纤维的食物，如瘦肉、蔬菜和全谷物，以增强饱腹感并稳定血糖。减少精制糖和深加工食品的摄入，避免隐形热量导致热量超标。控制每餐的份量，使用较小的餐具或记录饮食日志，有助于建立合理的进食习惯。\n\n三、每周运动安排\n周一进行30分钟快走或慢跑，激活心肺功能并提升基础代谢。周二安排力量训练，重点锻炼大肌群，以维持肌肉量并提高静息代谢率。周三进行中等强度的有氧运动，如游泳或骑行，持续燃烧脂肪。周四进行柔韧性训练或瑜伽，缓解肌肉紧张并促进身体恢复。周五进行高强度间歇训练（HIIT），短时间内高效消耗热量并提升体能。\n\n四、睡眠与恢复\n保证每晚7至8小时的高质量睡眠，有助于调节食欲激素并降低压力水平。充足的休息能防止因疲劳导致的过度进食，并支持肌肉修复与代谢平衡。\n\n五、常见误区与长期执行\n误区一：认为不吃晚餐或跳过早餐能快速减重，这往往导致后续暴食或代谢紊乱。误区二：过度依赖单一食物或极端饮食法，难以坚持且可能引发营养失衡。误区三：只关注体重数字变化，忽视体脂率、腰围等更健康的指标。长期减重应注重建立可持续的生活方式，而非追求短期速效。通过逐步调整饮食结构和运动习惯，让健康行为成为日常的一部分，才能实现稳定且持久的体重管理。"
+        }
+      }
+    ],
+    "created": 1791615302,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 360,
+      "prompt_tokens": 110,
+      "total_tokens": 470,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-DEExcapWRJyE7FMLTquIqBpowiJRbqqG",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 110,
+      "prompt_ms": 3180.497,
+      "prompt_per_token_ms": 28.91360909090909,
+      "prompt_per_second": 34.58578957942737,
+      "predicted_n": 360,
+      "predicted_ms": 7050.763,
+      "predicted_per_token_ms": 19.58545277777778,
+      "predicted_per_second": 51.058303902712375
+    }
+  },
+  "wall_ms": 10235.567774,
+  "log_begin": 111320,
+  "log_end": 151419,
+  "phase": "measured"
+}

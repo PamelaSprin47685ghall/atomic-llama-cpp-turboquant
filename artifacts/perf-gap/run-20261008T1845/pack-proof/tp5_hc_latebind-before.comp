@@ -1,0 +1,895 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// Only INJECT and the exact Q contraction fold across subgroups via
+// tp5_hc_sum32; the Q8 kernels do their own wave-local reductions. Keeping
+// the include off the Q8 variants avoids compiling a dead 128-byte shared
+// array (and its barrier pair) into ACT_Q8 / Q8DOT / UP_Q8DOT.
+#if defined(TP5_LATE_INJECT) || defined(TP5_LATE_Q) || defined(TP5_LATE_STATS)
+#include "tp5_hc_subgroup.glsl"
+#endif
+#if defined(TP5_LATE_Q_Q8DOT) || defined(TP5_LATE_UP_Q8DOT) || defined(TP5_LATE_PACK_WEIGHTS)
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+// Exact LateBind-TP for Qwen4EXP HC.
+//
+// INJECT: compute the four exact scatter weights from the already-known HC
+// inject inputs.
+// Q:      precompute W_down,b * gamma_b * (rank0 ? R_b : 0 + s_b*z_p)
+//         before the full TP sum is available.
+// Y/Q point-of-use waits and the exact residual/RMS/LO consumers live in
+// tp5_hc_resume.comp; sidecar publication lives in tp5_hc_publish.comp.
+
+struct late_q8_0 {
+    float16_t d;
+    int16_t   qs[16];
+};
+
+#ifdef TP5_LATE_L2
+// Bit-for-bit mirror of tp5_late_l2_tag() in ggml-vulkan-tp5-rows.h.
+uint tp5_late_l2_tag(uint z0_bits, uint z1_bits, uint epoch) {
+    uint h = ((z0_bits ^ (epoch * 0x27D4EB2Fu)) * 0x9E3779B1u) ^ ((z1_bits + 0x7F4A7C15u) * 0x85EBCA77u);
+    h ^= h >> 15u;
+    return h | 1u;
+}
+#endif
+
+// Definition-time packed weight layout (P1-B). The dot-product inner loop
+// consumes uint32 words directly, so no per-iteration i16->i32 packing ALU
+// remains in the hot path. Same block count and indexing as late_q8_0; only
+// the element size differs (36B vs 34B). Conversion is bit-exact.
+struct late_q8_packed {
+    float   d;
+    uint    qs_words[8];
+};
+
+#ifdef TP5_LATE_PACK_WEIGHTS
+// One-shot weight repack: late_q8_0 -> late_q8_packed, recorded once at plan
+// definition into cmd_late_pre. The first uint of the destination is a
+// persistent done flag: after the first execution every later replay of this
+// command buffer exits immediately (weights are immutable model data; the
+// plan owns the destination buffer for its whole lifetime).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer SrcWeights { late_q8_0 src[]; };
+layout(std430, binding = 1) coherent buffer DstPacked { late_q8_packed dst[]; };
+
+layout(push_constant) uniform PackParams {
+    uint blocks;
+} p;
+
+void main() {
+    if (floatBitsToUint(dst[0].d) == 1u) return;
+    const uint block = gl_GlobalInvocationID.x;
+    if (block >= p.blocks) return;
+    const late_q8_0 s = src[block];
+    late_q8_packed out_block;
+    out_block.d = float(s.d);
+    [[unroll]] for (uint w = 0u; w < 8u; ++w) {
+        const uint lo = uint(uint16_t(s.qs[2u * w]));
+        const uint hi = uint(uint16_t(s.qs[2u * w + 1u]));
+        out_block.qs_words[w] = (lo & 0xffffu) | ((hi & 0xffffu) << 16u);
+    }
+    dst[block + 1u] = out_block;
+    memoryBarrierBuffer();
+    barrier();
+    if (gl_GlobalInvocationID.x == 0u) {
+        if (floatBitsToUint(dst[0].d) != 1u) dst[0].d = uintBitsToFloat(1u);
+    }
+}
+#endif
+
+#ifdef TP5_LATE_INJECT
+// Aggressive long-K inject: four stream workgroups remain independent, but
+// each uses 256 lanes so the 10K projection is spread across multiple
+// subgroups instead of one deep wave. tp5_hc_sum32 performs the final
+// cross-subgroup fold; reassociation is explicitly permitted for fast mode.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer InjectWeights {
+    late_q8_0 w[];
+};
+layout(std430, binding = 1) readonly buffer InjectInput {
+    float x[];
+};
+layout(std430, binding = 2) writeonly buffer Scatter {
+    float scatter[];
+};
+// Runtime active-row count published by the CPU in the RELAY broadcast header
+// (word 5) before this precompute command buffer is submitted. The push
+// constant keeps the capacity only as a fail-safe fallback; a maximum-capacity
+// definition must not execute padded-row work (M3 invariant 2).
+layout(std430, binding = 3) readonly buffer RowsHeader {
+    uint rows_header[];
+};
+
+layout(push_constant) uniform InjectParams {
+    uint width;
+    uint streams;
+    uint active_rows;
+} p;
+
+void main() {
+    const uint stream = gl_WorkGroupID.x;
+    const uint lane   = gl_LocalInvocationID.x;
+    if (stream >= p.streams) {
+        return;
+    }
+    const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
+    const uint k_dim = p.width * p.streams;
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
+        if (token >= active_rows) break;
+        float acc = 0.0;
+        const uint token_x_offset = token * k_dim;
+        for (uint col = 8u * lane; col < k_dim; col += 8u * 256u) {
+            const uint valid = min(8u, k_dim - col);
+            float xv[8];
+            [[unroll]] for (uint e = 0u; e < 8u; ++e) {
+                xv[e] = e < valid ? x[token_x_offset + col + e] : 0.0;
+            }
+            const uint ib  = (stream * k_dim + col) / 32u;
+            const uint iqs = col % 32u;
+            const i8vec2 q0 = unpack8(int32_t(w[ib].qs[iqs / 2u])).xy;
+            const i8vec2 q1 = unpack8(int32_t(w[ib].qs[iqs / 2u + 1u])).xy;
+            const i8vec2 q2 = unpack8(int32_t(w[ib].qs[iqs / 2u + 2u])).xy;
+            const i8vec2 q3 = unpack8(int32_t(w[ib].qs[iqs / 2u + 3u])).xy;
+            const vec4 v0 = vec4(q0.x, q0.y, q1.x, q1.y);
+            const vec4 v1 = vec4(q2.x, q2.y, q3.x, q3.y);
+            const vec4 b0 = vec4(xv[0], xv[1], xv[2], xv[3]);
+            const vec4 b1 = vec4(xv[4], xv[5], xv[6], xv[7]);
+            // Match the established HC inject Q8 two-dot/FMA contraction order.
+            float rowtmp = dot(b1, v1);
+            rowtmp       = fma(b0.w, v0.w, rowtmp);
+            rowtmp       = fma(b0.z, v0.z, rowtmp);
+            rowtmp       = fma(b0.y, v0.y, rowtmp);
+            rowtmp       = fma(b0.x, v0.x, rowtmp);
+            acc          = fma(rowtmp, float(w[ib].d), acc);
+        }
+        acc = tp5_hc_sum32(acc);
+        if (lane == 0u) {
+            precise float scaled = acc * 0.25 + 0.0;
+            precise float sig    = 1.0 / (1.0 + exp(-scaled));
+            scatter[token * p.streams + stream] = sig * 2.0 + 0.0;
+        }
+    }
+}
+#endif
+
+#ifdef TP5_LATE_UP_Q8DOT
+// Aggressive approximate HC up/fold. LO is quantized once by resume_lo_q8.
+// §4.1 geometry: four rows per wave, eight lanes each (32 lanes, zero idle;
+// 32 rows per 256-thread WG vs 24 before). Lanes 0-1 consume two of R320's
+// ten Q8 blocks each, lanes 2-7 one; the row fold is a pure power-of-two
+// butterfly (masks 1/2/4) inside the aligned 8-lane group, so the old
+// up_partial[240] LDS round-trip (two barriers + 24 serial fold threads)
+// disappears entirely.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer UpWeightsQ8 { late_q8_packed up_w[]; };
+#ifdef TP5_LATE_UP_BCAST
+// L2 (tip): LO is formed by the relay -- rho from the RMS sufficient statistics,
+// u = 0.25 * sum_b rho_b Q_b, SiLU and Q8_0 quantisation all happen on the CPU
+// during the Q handoff -- and is published into this bank's Q payload region as
+// packed late_q8_packed words: [token][block]{ d, qs_words[8] } (9 words each).
+// The LO kernel, its barrier and the 4x-larger F16 Q fanout all disappear.
+layout(std430, binding = 1) coherent volatile readonly buffer LoQ8Bcast { uint lo_words[]; };
+#else
+layout(std430, binding = 1) readonly buffer LoQ8Input { late_q8_packed lo_q8_in[]; };
+#endif
+layout(std430, binding = 2) readonly buffer NormalizedInput { float norm_in[]; };
+layout(std430, binding = 3) writeonly buffer MixedOutput { float mixed_out[]; };
+#ifdef TP5_LATE_UP_BCAST
+// The whole bank (header words: 1 = WG completion counter, 2 = Q generation,
+// 5 = active rows) and the host-import status line (1 = epoch, 2 = sticky error,
+// 3 = last-reader completion credit).
+layout(std430, binding = 4) coherent volatile buffer Inbox { uint inbox[]; };
+layout(std430, binding = 5) coherent volatile buffer Status { uint status[]; };
+#else
+// Runtime active rows from the RELAY broadcast header (word 5).
+layout(std430, binding = 4) readonly buffer RowsHeader {
+    uint rows_header[];
+};
+#endif
+
+layout(push_constant) uniform UpQ8Params {
+    uint width;
+    uint rank_dim;
+    uint streams;
+    uint rows_per_wg;
+    uint active_rows;
+#ifdef TP5_LATE_UP_BCAST
+    uint spin_max;
+    uint status_word_offset;
+    uint n_workgroups;
+#endif
+} p;
+
+#ifdef TP5_LATE_UP_BCAST
+shared uint lo_s[TP5_LATE_CAPACITY_ROWS * 90u];
+shared uint up_ready;
+shared uint up_expected;
+#endif
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    if (p.rank_dim != 320u || p.streams != 4u || p.rows_per_wg != 32u || gl_NumSubgroups != 8u) {
+#ifdef TP5_LATE_UP_BCAST
+        // Fail closed: this workgroup would never count in, so flag the bank.
+        if (gl_LocalInvocationID.x == 0u)
+            atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
+#endif
+        return;
+    }
+#ifdef TP5_LATE_UP_BCAST
+    const uint lid = gl_LocalInvocationID.x;
+    if (lid == 0u) {
+        up_ready = 0u;
+        // The armed epoch is also in bank header word 6 (device-local VRAM), so
+        // the 80 workgroups need no host-import (PCIe) reads to learn what to
+        // wait for; only a timed-out spin touches the host status line.
+        up_expected = inbox[TP5_RELAY_EPOCH_WORD];
+        if (up_expected != 0u) {
+            for (uint spin = 0u; spin < p.spin_max; ++spin) {
+                if (inbox[2u] == up_expected) {
+                    up_ready = 1u;
+                    break;
+                }
+            }
+        }
+        if (up_ready == 0u)
+            atomicCompSwap(status[p.status_word_offset + 2u], 0u,
+                           up_expected != 0u ? up_expected : 0xffffffffu);
+    }
+    barrier();
+    memoryBarrierBuffer();
+    const uint active_rows = min(inbox[5u] != 0u ? inbox[5u] : p.active_rows, TP5_LATE_CAPACITY_ROWS);
+    if (up_ready == 0u) {
+        const uint prow = gl_WorkGroupID.x * 32u + gl_SubgroupID * 4u + (lane >> 3u);
+        if ((lane & 7u) == 0u && prow < p.width) {
+            for (uint token = 0u; token < active_rows; ++token)
+                mixed_out[token * p.width + prow] = uintBitsToFloat(0x7fc00000u);
+        }
+        return;
+    }
+    // Stage the (tiny) CPU-published LO blocks once per workgroup: the bank is
+    // device-coherent (uncached) memory, so 640 waves reading it directly would
+    // each pay an uncached VRAM round trip per block.
+    for (uint i = lid; i < active_rows * 90u; i += 256u) lo_s[i] = lo_words[i];
+    barrier();
+#else
+    const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
+#endif
+    const uint blocks = 10u;
+    const uint wave = gl_SubgroupID;
+    const uint row_in_wave = lane >> 3u;   // 4 rows per wave32
+    const uint k_lane = lane & 7u;         // 8 K-lanes per row
+    const uint row = gl_WorkGroupID.x * 32u + wave * 4u + row_in_wave;
+
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
+        if (token >= active_rows) break;
+        vec4 partial = vec4(0.0);
+        if (row < p.width) {
+            [[unroll]] for (uint b = k_lane; b < blocks; b += 8u) {
+#ifdef TP5_LATE_UP_BCAST
+                const uint lb = (token * blocks + b) * 9u;
+                const float a_d = uintBitsToFloat(lo_s[lb]);
+#else
+                const late_q8_packed a = lo_q8_in[token * blocks + b];
+                const float a_d = a.d;
+#endif
+                [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
+                    const uint weight_row = stream * p.width + row;
+                    // Packed weights (P1-B): block i lives at index i + 1;
+                    // index 0 is the persistent pack done flag.
+                    const late_q8_packed w = up_w[weight_row * blocks + b + 1u];
+                    int32_t isum = 0;
+                    [[unroll]] for (uint k = 0u; k < 8u; ++k) {
+#ifdef TP5_LATE_UP_BCAST
+                        isum += dotPacked4x8EXT(int32_t(w.qs_words[k]), int32_t(lo_s[lb + 1u + k]));
+#else
+                        isum += dotPacked4x8EXT(int32_t(w.qs_words[k]), int32_t(a.qs_words[k]));
+#endif
+                    }
+                    partial[stream] += float(isum) * (w.d * a_d);
+                }
+            }
+        }
+        // Power-of-two butterfly inside the aligned 8-lane group: masks 1/2/4
+        // never leave the row. After three steps every lane of the group
+        // holds the full 10-block row sum; lane 0 commits the epilogue.
+        vec4 acc = partial;
+        acc += subgroupShuffleXor(acc, 1u);
+        acc += subgroupShuffleXor(acc, 2u);
+        acc += subgroupShuffleXor(acc, 4u);
+        if (k_lane == 0u && row < p.width) {
+            const vec4 gate = vec4(1.0) / (vec4(1.0) + exp(-acc));
+            const uint norm_token_offset = token * (4u * p.width);
+            const vec4 n = vec4(norm_in[norm_token_offset + row],
+                                norm_in[norm_token_offset + p.width + row],
+                                norm_in[norm_token_offset + 2u * p.width + row],
+                                norm_in[norm_token_offset + 3u * p.width + row]);
+            mixed_out[token * p.width + row] = dot(n, gate) * 0.25;
+        }
+    }
+#ifdef TP5_LATE_UP_BCAST
+    // Last reader of this bank generation: every workgroup counts in after its
+    // bank reads (the LO blocks were staged before the barrier above); the last
+    // one retires the generation exactly as the LO kernel used to (status[3]).
+    // Header word 1 is reset by the relay at the start of every handoff.
+    barrier();
+    if (lid == 0u) {
+        const uint prior = atomicAdd(inbox[1u], 1u);
+        // No status[2] read here: a failed wait already raised the sticky error,
+        // and the relay checks it before it trusts this credit (tp5_relay_arm_bank).
+        if (prior + 1u == p.n_workgroups) {
+            status[p.status_word_offset + 3u] = up_expected;
+            memoryBarrierBuffer();
+        }
+    }
+#endif
+}
+#endif
+
+#ifdef TP5_LATE_ACT_Q8
+// Aggressive path: form each 32-element local sufficient-statistic activation
+// once, quantize it to Q8_0, then reuse that block across every output row.
+// One 256-thread WG contains eight wave32 subgroups: two blocks for each of
+// four streams. This halves WG scheduling while preserving one wave32
+// reduction per Q8 block.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Gamma { float gamma[]; };
+layout(std430, binding = 1) readonly buffer Residual { float residual[]; };
+layout(std430, binding = 2) readonly buffer LocalZ { float local_z[]; };
+layout(std430, binding = 3) readonly buffer Scatter { float scatter[]; };
+layout(std430, binding = 4) writeonly buffer ActivationQ8 { late_q8_packed act_q8[]; };
+// Runtime active rows from the RELAY broadcast header (word 5).
+layout(std430, binding = 5) readonly buffer RowsHeader {
+    uint rows_header[];
+};
+
+#ifdef TP5_LATE_L2
+// L2 (tip): RMS sufficient-statistic partials, one per (token, stream, 32-element
+// block): x = a_part = sum R_b^2, y = d_part = sum R_b * z_p over the block. This
+// kernel already reads R and z_p for every element BEFORE norm may overwrite trefs
+// (z_p) and combined (which galloc may alias with R) -- the only point in the
+// schedule where both inputs are guaranteed live. Q8DOT folds these partials.
+layout(std430, binding = 6) coherent writeonly buffer StatsPartials { vec4 stats_partials[]; };
+#endif
+
+layout(push_constant) uniform ActQ8Params {
+    uint width;
+    uint streams;
+    uint my_rank;
+    uint active_rows;
+} p;
+
+// §4.1 step 3: both LDS round-trips are gone. Every stream reads the same
+// z_p block directly from global memory (the eight subgroups of a workgroup
+// share one CU, so the redundant per-stream loads hit L1), and the Q8 pack
+// uses the same aligned-4-lane shuffle rebuild as resume_lo_q8.
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint subgroup = gl_SubgroupID;
+    const uint stream = subgroup & 3u;
+    const uint block_slot = subgroup >> 2u;
+    const uint block = gl_WorkGroupID.x * 2u + block_slot;
+    const uint blocks = p.width / 32u;
+    if (p.streams != 4u || gl_NumSubgroups != 8u || (blocks & 1u) != 0u || block >= blocks) return;
+    const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
+
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
+        if (token >= active_rows) break;
+        const uint col = block * 32u + lane;
+        const uint global_col = stream * p.width + col;
+#ifdef TP5_LATE_L2
+        // Same arithmetic as the plain variant (bit-identical activation); R is
+        // loaded on every rank because every rank's d_{p,b} needs it.
+        const float zv = local_z[token * p.width + col];
+        const float rv = residual[token * (p.streams * p.width) + global_col];
+        precise float value = zv * scatter[token * p.streams + stream];
+        if (p.my_rank == 0u) value = value + rv;
+#else
+        precise float value = local_z[token * p.width + col] * scatter[token * p.streams + stream];
+        if (p.my_rank == 0u) value = value + residual[token * (p.streams * p.width) + global_col];
+#endif
+        value = value * gamma[global_col];
+#ifdef TP5_LATE_L2
+        {
+            const float a_part = subgroupAdd(rv * rv);
+            const float d_part = subgroupAdd(rv * zv);
+            // Plain sums of the two inputs: identity checks for R and z_p (the relay
+            // can compare sum z_p with its own P1 copy of the same partial).
+            const float r_part = subgroupAdd(rv);
+            const float z_part = subgroupAdd(zv);
+            if (lane == 0u) {
+                stats_partials[(token * p.streams + stream) * blocks + block] = vec4(a_part, d_part, r_part, z_part);
+            }
+            // Freshness tag of this token's statistics entry (see tp5_late_l2_tag):
+            // formed from z_p[t][0], z_p[t][1] -- the two lanes of block 0 -- and
+            // the armed epoch the relay published into header word 6.
+            if (block == 0u && stream == 0u) {
+                const uint z1_bits = subgroupShuffle(floatBitsToUint(zv), 1u);
+                if (lane == 0u) {
+                    const uint tag = tp5_late_l2_tag(floatBitsToUint(zv), z1_bits,
+                                                     rows_header[TP5_RELAY_EPOCH_WORD]);
+                    stats_partials[TP5_LATE_CAPACITY_ROWS * p.streams * blocks + token] =
+                        vec4(uintBitsToFloat(tag), 0.0, 0.0, 0.0);
+                }
+            }
+        }
+#endif
+
+        const float amax = subgroupMax(abs(value));
+        const float d = amax * (1.0 / 127.0);
+        const float inv_d = d != 0.0 ? 1.0 / d : 0.0;
+        const int q = clamp(int(round(value * inv_d)), -127, 127);
+        // Wave-local pack: lanes 4j..4j+3 combine into qs_words[j]. Every
+        // lane rebuilds its aligned 4-value group with three shuffles; lanes
+        // 0,4,8,...,28 commit the words. No LDS, no barrier.
+        const uint g0 = lane & ~3u;
+        const int q0 = subgroupShuffle(q, g0);
+        const int q1 = subgroupShuffle(q, g0 + 1u);
+        const int q2 = subgroupShuffle(q, g0 + 2u);
+        const int q3 = subgroupShuffle(q, g0 + 3u);
+        const uint word = (uint(q0) & 0xffu) | (uint(q1) & 0xffu) << 8u |
+                          (uint(q2) & 0xffu) << 16u | (uint(q3) & 0xffu) << 24u;
+
+        const uint out_block = token * (p.streams * blocks) + stream * blocks + block;
+        if (lane == 0u) act_q8[out_block].d = d;
+        // §7.9 layout contract: qs_words[j] is a 4x8 little-endian word holding
+        // elements 4j..4j+3, matching PACK_WEIGHTS and the Q8DOT consumers.
+        //
+        // Lane and word index are NOT the same number. Lane L's word was rebuilt
+        // from the group starting at g0 = L & ~3, so lane L carries the group whose
+        // word index is L / 4. Writing it to qs_words[L] instead duplicated group 0
+        // into words 1..3 and group 4 into words 4..7, leaving words 1..3 without
+        // elements 4..15 at all and words 5..7 without 20..31: only 8 of the 32
+        // quantised values survived, each repeated four times. The Q8DOT contraction
+        // then consumed a mangled activation, which is why the aggressive blade
+        // emitted degenerate repetition regardless of the sidecar handshake.
+        if ((lane & 3u) == 0u) {
+            act_q8[out_block].qs_words[lane >> 2u] = word;
+        }
+    }
+}
+#endif
+
+#ifdef TP5_LATE_Q_Q8DOT
+// Aggressive approximate sufficient-statistic contraction. R=320 output rows
+// are packed two per wave32: 16 lanes cooperate on one row, each lane consumes
+// five of the production width=2560's 80 Q8 blocks. A 256-thread WG therefore
+// produces 16 rows with half the waves of one-row-per-wave scheduling.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer DownWeightsQ8 { late_q8_packed w_q8[]; };
+layout(std430, binding = 1) readonly buffer ActivationQ8 { late_q8_packed act_q8[]; };
+// Cached HOST_VISIBLE|HOST_COHERENT|DEVICE_COHERENT_AMD local VRAM. The
+// The compact F16 sidecar starts at p.late_word_offset in the selected GTT/BAR
+// aperture. The preceding 64-byte line is Q-only control, separate from Y.
+#ifdef TP5_LATE_Q_STATS
+// LB2: the same residual / z_p / scatter views and statistics layout the exact
+// TP5_LATE_Q kernel uses. Present only in the _stats variant, which is why that
+// pipeline adds five bindings to the common weights/activation/mailbox/epoch/
+// integrity bindings.
+layout(std430, binding = 5) readonly  buffer ResidualStatsQ { vec4 residual_stats[]; };
+layout(std430, binding = 6) readonly  buffer LocalZStatsQ   { vec4 local_z_stats[]; };
+layout(std430, binding = 7) readonly  buffer ScatterStatsQ  { float scatter_stats[]; };
+layout(std430, binding = 8) writeonly buffer StatsOutQ      { vec2 stats_out[]; };
+layout(std430, binding = 9) writeonly buffer ScatterOutQ    { float s_out[]; };
+#endif
+#ifdef TP5_LATE_L2
+// L2 (tip): the per-block partials ACT_Q8 formed from live R and z_p, and the
+// scatter weights. Workgroup 0 folds them into the statistics record that rides
+// the same completion protocol as Q. Their per-entry freshness tags remain
+// necessary: the ready word alone does not acquire the statistics on the host.
+layout(std430, binding = 5) coherent readonly buffer StatsPartialsIn { vec4 stats_partials_in[]; };
+layout(std430, binding = 6) readonly buffer ScatterL2 { float scatter_l2[]; };
+// Same aperture as binding 2, viewed as 16-byte words so that every statistics
+// entry (a, d, s, tag) is written by ONE 128-bit store and can never be observed
+// half-updated by the relay.
+layout(std430, binding = 7) coherent volatile buffer StatsOut4 { uvec4 st4[]; };
+#endif
+layout(std430, binding = 2) coherent volatile buffer QMailbox { uint qmail[]; };
+layout(std430, binding = 3) readonly buffer EpochHeader { uint epoch_header[]; };
+layout(std430, binding = 4) coherent writeonly buffer Integrity { uvec4 qsum[]; };
+
+layout(push_constant) uniform Q8DotParams {
+    uint width;
+    uint rank_dim;
+    uint streams;
+    uint rows_per_wg;
+    uint n_workgroups;
+    uint late_word_offset;
+    uint active_rows;
+#ifdef TP5_LATE_L2
+    uint stats_word_offset;  // tp5_late_stats_word_offset(): 16 words per token
+#endif
+} p;
+
+shared uint publish_last;
+shared uint qsum_s[8];
+
+void main() {
+    if (p.streams != 4u || p.rows_per_wg != 16u || gl_WorkGroupID.x >= p.n_workgroups) return;
+    // Active rows live in the Q control line (word 2, TP5_LATE_Q_ROWS_WORD). The
+    // former source, qmail[5], is RELAY header word 5 only under BAR Pull; under
+    // Host Push the aperture is the host-import rank slot whose word 5 belongs to
+    // the P1 Y payload, so every P1 copy overwrote it and Q8DOT fell back to the
+    // capacity (e.g. 4 rows) on every stage.
+    const uint q_rows = qmail[p.late_word_offset - 16u + 2u];
+    const uint active_rows = min(q_rows != 0u ? q_rows : p.active_rows, TP5_LATE_CAPACITY_ROWS);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint row_slot = lid >> 4u;
+    const uint lane16 = lid & 15u;
+    const uint row = gl_WorkGroupID.x * 16u + row_slot;
+    const uint blocks = p.width / 32u;
+    uint q_xor = 0u;   // XOR of the F16 payload words this invocation writes
+
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
+        if (token >= active_rows) break;
+        vec4 tacc = vec4(0.0);
+        const uint token_act_offset = token * (p.streams * blocks);
+        for (uint block = lane16; block < blocks; block += 16u) {
+            [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
+                // Packed weights (P1-B): block i lives at index i + 1;
+                // index 0 is the persistent pack done flag.
+                const uint wi = (row * 4u + stream) * blocks + block + 1u;
+                const uint ai = token_act_offset + stream * blocks + block;
+                int32_t isum = 0;
+                [[unroll]] for (uint k = 0u; k < 8u; ++k) {
+                    isum += dotPacked4x8EXT(int32_t(w_q8[wi].qs_words[k]),
+                                            int32_t(act_q8[ai].qs_words[k]));
+                }
+                tacc[stream] = fma(float(isum), w_q8[wi].d * act_q8[ai].d, tacc[stream]);
+            }
+        }
+        // §4.1 geometry: each row's 16 reduction lanes are exactly half of a
+        // wave32 (rows_per_wg=16 over 256 threads => 2 rows per subgroup).
+        // A shuffle tree inside that half-wave replaces the LDS round-trip.
+        // After the tree, every lane of subgroup s holds row (2s)'s sum in its
+        // lower half and row (2s+1)'s in the upper half.
+        [[unroll]] for (uint mask = 1u; mask < 16u; mask <<= 1u) {
+            tacc += subgroupShuffleXor(tacc, mask);
+        }
+        // Cross-half exchange must run converged in the whole wave; only the
+        // first 4 lanes of each subgroup then publish (one per stream).
+        const vec4 pair_hi = subgroupShuffleXor(tacc, 16u);
+        if (gl_SubgroupInvocationID < 4u) {
+            const uint stream = gl_SubgroupInvocationID;
+            const uint row0 = 2u * gl_SubgroupID;
+            const uint elem = (token * p.streams + stream) * p.rank_dim +
+                              gl_WorkGroupID.x * 16u + row0;
+            const uint word = p.late_word_offset + elem / 2u;
+            const uint packed_q = packHalf2x16(vec2(tacc[stream], pair_hi[stream]));
+            qmail[word] = packed_q;
+            q_xor ^= packed_q;
+        }
+#ifdef TP5_LATE_Q_STATS
+        // LB2: fold a_b = <R_b,R_b> and d_b = <R_b,z_p> for THIS rank, plus s_b,
+        // exactly as the exact kernel does. Workgroup 0 alone computes them (one
+        // per stream per token), so no cross-workgroup reduction and no atomic
+        // float is needed. residual and z_p are read unconditionally: each rank's
+        // statistics are its own partial sums, and the relay adds d over ranks.
+        if (gl_WorkGroupID.x == 0u && lid < 32u) {
+            for (uint stream = 0u; stream < p.streams; ++stream) {
+                float a_b = 0.0;
+                float d_b = 0.0;
+                const uint res_base = token * (p.width * p.streams / 4u) + stream * (p.width / 4u);
+                for (uint col4 = lid; col4 < p.width / 4u; col4 += 32u) {
+                    const vec4 rv = residual_stats[res_base + col4];
+                    const vec4 zv = local_z_stats[token * (p.width / 4u) + col4];
+                    a_b += dot(rv, rv);
+                    d_b += dot(rv, zv);
+                }
+                // Wave-local reduction, not tp5_hc_sum32: the Q8 variants
+                // deliberately do not include tp5_hc_subgroup.glsl (see the
+                // file header), because that would pull a 128-byte shared
+                // array and a barrier pair into ACT_Q8 / Q8DOT / UP_Q8DOT
+                // which never fold across subgroups. Here `lid < 32` is
+                // exactly one converged wave32, so subgroupAdd is both
+                // sufficient and the shape the design calls for.
+                a_b = subgroupAdd(a_b);
+                d_b = subgroupAdd(d_b);
+                if (lid == 0u) {
+                    // Layout contract (the one the CPU relay and the LO_U consumer read):
+                    // per token, 12 words = 4 streams x (a_b, d_b) at 2b, 2b+1
+                    // followed by 4 floats of s_b at 8..11. stats_out is a vec2 array,
+                    // so a word offset w lives at element w/2: token*6 + b for (a,d)
+                    // and token*6 + 4 + b for s. Writing at token*streams + stream left
+                    // token>=1 at the wrong stride and put s in a separate region the
+                    // consumer never reads, which is exactly what the raw dump showed:
+                    // a/d interleaved at 2b with no 8..11 tail.
+                    stats_out[token * (p.streams * 3u) / 2u + stream] = vec2(a_b, d_b);
+                    stats_out[token * (p.streams * 3u) / 2u + p.streams + stream] =
+                        vec2(scatter_stats[token * p.streams + stream], 0.0);
+                    s_out[token * p.streams + stream] = scatter_stats[token * p.streams + stream];
+                }
+            }
+        }
+#endif
+    }
+
+    // Per-workgroup payload checksum entry, written before this WG's completion
+    // increment. The CPU validates epoch, live extent and bytes in every mode.
+    {
+        const uint sg_xor = subgroupXor(q_xor);
+        if (gl_SubgroupInvocationID == 0u) qsum_s[gl_SubgroupID] = sg_xor;
+        barrier();
+        if (gl_LocalInvocationID.x == 0u) {
+            uint wg_xor = 0u;
+            for (uint i = 0u; i < gl_NumSubgroups; ++i) wg_xor ^= qsum_s[i];
+            qsum[gl_WorkGroupID.x] = uvec4(wg_xor, epoch_header[TP5_RELAY_EPOCH_WORD],
+                                          active_rows * p.streams * p.rank_dim / 2u, 0u);
+        }
+    }
+#ifdef TP5_LATE_L2
+    // Fold the ACT_Q8 partials: one (token, stream) pair per wave, 32 lanes over
+    // the 80 block partials, fixed order -> deterministic. Record layout (16 words
+    // per token, single source tp5_late_stats_*): a[0..3], d[0..3], s[0..3], pad.
+    // a_b is this rank's |R_b|^2 (R is replicated, identical on every rank);
+    // d_b is this rank's partial <R_b, z_p>; the relay sums d over ranks.
+    if (gl_WorkGroupID.x == 0u) {
+        const uint pairs = active_rows * 4u;
+        for (uint pr = gl_SubgroupID; pr < pairs; pr += gl_NumSubgroups) {
+            const uint token = pr >> 2u;
+            const uint stream = pr & 3u;
+            vec4 s4 = vec4(0.0);
+            for (uint b = gl_SubgroupInvocationID; b < blocks; b += gl_SubgroupSize) {
+                s4 += stats_partials_in[(token * 4u + stream) * blocks + b];
+            }
+            s4.x = subgroupAdd(s4.x);
+            s4.y = subgroupAdd(s4.y);
+            s4.z = subgroupAdd(s4.z);
+            s4.w = subgroupAdd(s4.w);
+            if (gl_SubgroupInvocationID == 0u) {
+                const uint base = p.stats_word_offset + token * TP5_LATE_STATS_WORDS;
+                const uint tag = floatBitsToUint(stats_partials_in[TP5_LATE_CAPACITY_ROWS * 4u * blocks + token].x);
+                st4[base / 4u + stream] = uvec4(floatBitsToUint(s4.x), floatBitsToUint(s4.y),
+                                                floatBitsToUint(scatter_l2[token * 4u + stream]), tag);
+                qmail[base + 16u + stream] = floatBitsToUint(s4.z);
+                qmail[base + 20u + stream] = floatBitsToUint(s4.w);
+            }
+        }
+    }
+#endif
+
+    // Device-wide completion protocol, matching the established fused HC
+    // pattern: every WG publishes its sidecar stores before incrementing the
+    // local-VRAM counter. The Q-only control line lives 16 uints immediately
+    // before p.late_word_offset: control[0]=ready, control[1]=WG counter.
+    memoryBarrierBuffer();
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        const uint prior = atomicAdd(qmail[p.late_word_offset - 15u], 1u);
+        publish_last = (prior + 1u == p.n_workgroups) ? 1u : 0u;
+    }
+    barrier();
+    if (publish_last != 0u) {
+        if (gl_LocalInvocationID.x == 0u) {
+            memoryBarrierBuffer();
+            qmail[p.late_word_offset - 16u] = 1u;
+            memoryBarrierBuffer();
+        }
+    }
+}
+#endif
+#ifdef TP5_LATE_Q
+// Match the native HC W_down single-subgroup topology. Using 64 lanes here
+// with only one subgroupAdd drops the second subgroup on RDNA2/wave32.
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer DownWeights {
+    late_q8_0 w[];
+};
+layout(std430, binding = 1) readonly buffer Gamma4 {
+    vec4 gamma4[];
+};
+layout(std430, binding = 2) readonly buffer Residual4 {
+    vec4 residual4[];
+};
+layout(std430, binding = 3) readonly buffer LocalZ4 {
+    vec4 local_z4[];
+};
+layout(std430, binding = 4) readonly buffer Scatter {
+    float scatter[];
+};
+layout(std430, binding = 5) writeonly buffer LateOut {
+    float q_out[];
+};
+// Runtime active rows from the RELAY broadcast header (word 5).
+layout(std430, binding = 6) readonly buffer RowsHeader {
+    uint rows_header[];
+};
+#ifdef TP5_LATE_Q_STATS
+// LB2: same residual/z_p views rebound for the stats fold (row-0 WG only).
+layout(std430, binding = 7) readonly buffer ResidualStats {
+    vec4 residual_stats[];
+};
+layout(std430, binding = 8) readonly buffer LocalZStats {
+    vec4 local_z_stats[];
+};
+// Layout per token: 4x vec2 (a_b, d_b) then 4 floats (s_b) = 12 words.
+layout(std430, binding = 9) writeonly buffer StatsOut {
+    vec2 stats_out[];
+};
+layout(std430, binding = 10) readonly buffer ScatterStats {
+    float scatter_stats[];
+};
+layout(std430, binding = 11) writeonly buffer ScatterOut {
+    float s_out[];      // [token][stream]
+};
+#endif
+
+layout(push_constant) uniform QParams {
+    uint width;
+    uint rank_dim;
+    uint streams;
+    uint my_rank;
+    uint active_rows;
+} p;
+
+void main() {
+    const uint row  = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    if (row >= p.rank_dim || p.streams != 4u || (p.width & 255u) != 0u) {
+        return;
+    }
+    const uint k_dim = p.width * p.streams;
+    const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
+
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
+        if (token >= active_rows) break;
+        float acc[4] = { 0.0, 0.0, 0.0, 0.0 };
+        const vec4 scatter4 = vec4(
+            scatter[token * p.streams + 0u],
+            scatter[token * p.streams + 1u],
+            scatter[token * p.streams + 2u],
+            scatter[token * p.streams + 3u]);
+        const uint token_z_offset = token * (p.width / 4u);
+        const uint token_res_offset = token * (k_dim / 4u);
+        for (uint col = 8u * lane; col < p.width; col += 8u * 32u) {
+            const vec4 z0 = local_z4[token_z_offset + col / 4u];
+            const vec4 z1 = local_z4[token_z_offset + col / 4u + 1u];
+            [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
+                const uint base       = stream * p.width;
+                const float s         = scatter4[stream];
+                const uint global_col = base + col;
+                const uint ib  = (row * k_dim + global_col) / 32u;
+                const uint iqs = global_col % 32u;
+
+                vec4 rz0 = z0 * s;
+                vec4 rz1 = z1 * s;
+                if (p.my_rank == 0u) {
+                    rz0 += residual4[token_res_offset + global_col / 4u];
+                    rz1 += residual4[token_res_offset + global_col / 4u + 1u];
+                }
+                const vec4 b0 = gamma4[global_col / 4u] * rz0;
+                const vec4 b1 = gamma4[global_col / 4u + 1u] * rz1;
+
+                const i8vec2 q0 = unpack8(int32_t(w[ib].qs[iqs / 2u])).xy;
+                const i8vec2 q1 = unpack8(int32_t(w[ib].qs[iqs / 2u + 1u])).xy;
+                const i8vec2 q2 = unpack8(int32_t(w[ib].qs[iqs / 2u + 2u])).xy;
+                const i8vec2 q3 = unpack8(int32_t(w[ib].qs[iqs / 2u + 3u])).xy;
+                const vec4 v0 = vec4(q0.x, q0.y, q1.x, q1.y);
+                const vec4 v1 = vec4(q2.x, q2.y, q3.x, q3.y);
+
+                float rowtmp = dot(b0, v0);
+                rowtmp      += dot(b1, v1);
+                rowtmp      *= float(w[ib].d);
+                acc[stream] += rowtmp;
+            }
+        }
+
+        [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
+            acc[stream] = tp5_hc_sum32(acc[stream]);
+            if (lane == 0u) {
+                const uint out_idx = (token * p.streams + stream) * p.rank_dim + row;
+                q_out[out_idx] = acc[stream];
+#ifdef TP5_LATE_Q_STATS
+                // LB2: fold the RMS sufficient statistics into the same
+                // dispatch — a_b = <R_b,R_b>, d_b = <R_b,z_p> for this rank.
+                // Only the row-0 workgroup computes stats (one per stream).
+                if (row == 0u) {
+                    float a_b = 0.0;
+                    float d_b = 0.0;
+                    const uint res_base = token * (p.width * p.streams / 4u) + stream * (p.width / 4u);
+                    for (uint col4 = lane; col4 < p.width / 4u; col4 += 32u) {
+                        const vec4 rv = residual_stats[res_base + col4];
+                        const vec4 zv = local_z_stats[token * (p.width / 4u) + col4];
+                        a_b += dot(rv, rv);
+                        d_b += dot(rv, zv);
+                    }
+                    a_b = tp5_hc_sum32(a_b);
+                    d_b = tp5_hc_sum32(d_b);
+                    // Layout contract (the one the CPU relay and the LO_U consumer read):
+                    // per token, 12 words = 4 streams x (a_b, d_b) at 2b, 2b+1
+                    // followed by 4 floats of s_b at 8..11. stats_out is a vec2 array,
+                    // so a word offset w lives at element w/2: token*6 + b for (a,d)
+                    // and token*6 + 4 + b for s. Writing at token*streams + stream left
+                    // token>=1 at the wrong stride and put s in a separate region the
+                    // consumer never reads, which is exactly what the raw dump showed:
+                    // a/d interleaved at 2b with no 8..11 tail.
+                    stats_out[token * (p.streams * 3u) / 2u + stream] = vec2(a_b, d_b);
+                    stats_out[token * (p.streams * 3u) / 2u + p.streams + stream] =
+                        vec2(scatter_stats[token * p.streams + stream], 0.0);
+                    s_out[token * p.streams + stream] = scatter_stats[token * p.streams + stream];
+                }
+#endif
+            }
+        }
+    }
+}
+#endif
+
+#ifdef TP5_LATE_STATS
+// LB2: per-rank RMS sufficient statistics. Computes a_b = <R_b, R_b> and
+// d_b = <R_b, z_p> for the four residual streams (rho = (a_b + 2 s_b sum_p
+// d_{p,b} + s_b^2 c)^-1/2 * sqrt(d) reduces on the CPU alongside y). Output:
+// 8 floats per active row, written to the sidecar staging buffer head so it
+// rides the same publication path as Q.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Residual4 {
+    vec4 residual4[];
+};
+layout(std430, binding = 1) readonly buffer LocalZ4 {
+    vec4 local_z4[];
+};
+layout(std430, binding = 2) readonly buffer Scatter {
+    float scatter[];
+};
+layout(std430, binding = 3) writeonly buffer StatsOut {
+    vec2 stats_out[];   // [b] -> (a_b, d_b) per token: 4 vec2 per row
+};
+layout(std430, binding = 4) readonly buffer RowsHeader {
+    uint rows_header[];
+};
+
+layout(push_constant) uniform StatsParams {
+    uint width;
+    uint streams;
+    uint active_rows;
+} p;
+
+void main() {
+    const uint stream = gl_WorkGroupID.x;
+    const uint lane   = gl_LocalInvocationID.x;
+    if (stream >= p.streams || p.streams != 4u || (p.width & 255u) != 0u) {
+        return;
+    }
+    const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
+    const uint k_dim = p.width * p.streams;
+
+    [[unroll]] for (uint token = 0u; token < TP5_LATE_CAPACITY_ROWS; ++token) {
+        if (token >= active_rows) break;
+        const uint token_z_offset  = token * (p.width / 4u);
+        const uint token_res_offset = token * (k_dim / 4u);
+        float a = 0.0;
+        float d = 0.0;
+        for (uint col4 = lane; col4 < p.width / 4u; col4 += 256u) {
+            const uint res_idx = token_res_offset + stream * (p.width / 4u) + col4;
+            const vec4 r = residual4[res_idx];
+            const vec4 z = local_z4[token_z_offset + col4];
+            a += dot(r, r);
+            d += dot(r, z);
+        }
+        // cross-subgroup fold (same geometry contract as resume norm)
+        a = tp5_hc_sum32(a);
+        d = tp5_hc_sum32(d);
+        if (lane == 0u) {
+            stats_out[token * p.streams + stream] = vec2(a, d);
+        }
+    }
+}
+#endif

@@ -1,0 +1,10 @@
+{
+  "candidate": "parallel submit only, norm256/Q256 retained; unchanged model and arithmetic",
+  "reason": "Q64 independent shader win lost in whole-model pilot; norm512 pilot changed output/length and had no clean same-trajectory evidence. Neither is included in this confirmation.",
+  "arms": {"A":"GGML_TP5_PARALLEL_SUBMIT=0", "B":"GGML_TP5_PARALLEL_SUBMIT=1"},
+  "process_pairs": [["A","B"],["B","A"],["A","B"],["B","A"]],
+  "per_process": {"warmup":2,"measured":3,"unranked_guard":1},
+  "primary": "paired per-process pooled generation ms/public token, log ratios Student t df3 95%CI",
+  "gates": "Same final executable and actual mapped DSOs; raw measured and guard bodies equal acrossarms; measurement fallback0, actual submit mode and norm/Q sizes confirmed, no forced exit. Native5/4-rank pending submissions and teardown checks before confirmation. Stop at any protocol failure and preserve it.",
+  "default_policy": "No default promotion just from pilot; failures and unresolved global reliability remain in report. No clocks/driver/watchdog/timeout changes."
+}

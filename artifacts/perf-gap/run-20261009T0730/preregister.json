@@ -1,0 +1,20 @@
+{
+  "scope": "RERoT off, ordinary single-stream decode; CPU threads not restricted; same APEX weights, five RX6800, head-sharded, h0, MMVQ disabled, compact greedy sampling enabled",
+  "goal": "Tighten the weight-only reference using independently timed operators and source-derived dependency/resource accounting; no whole-model duration or fitted residual may enter the independent reference. Improve actual runtime in independently confirmed comparisons.",
+  "inherited_evidence": "Unreported run0335/run0605 operator measurements, sparse ledgers and parallel-submit confirmation must be audited and identified as inherited, not rerun claims.",
+  "screen": [
+    {"name":"serial-reference", "parallel":0, "q":256, "norm":256},
+    {"name":"parallel-reference", "parallel":1, "q":256, "norm":256},
+    {"name":"q128", "parallel":1, "q":128, "norm":256},
+    {"name":"norm512", "parallel":1, "q":256, "norm":512},
+    {"name":"norm1024", "parallel":1, "q":256, "norm":1024},
+    {"name":"q128-norm512", "parallel":1, "q":128, "norm":512},
+    {"name":"q128-norm1024", "parallel":1, "q":128, "norm":1024},
+    {"name":"q64-norm512", "parallel":1, "q":64, "norm":512}
+  ],
+  "per_screen_process": {"warmup":2, "measured":2, "unranked_guard":1},
+  "selection": "Exploratory only; among semantically valid finite outputs consider any point >=2% faster than the same-campaign parallel-reference for fresh four independent process-pair confirmation. Do not replace a failed point or silently drop fallback requests.",
+  "confirmation": "A/B, B/A, A/B, B/A; 2 warm +3 measured +1 guard per process; primary pooled ms per public completion token; paired log ratio Student t df3 95%CI; report changed numerical trajectories rather than asserting byte equivalence.",
+  "safety": "No driver/clock/power/watchdog/reset changes. Existing epoch/extent/integrity/ownership checks and timeouts retained. No concurrent GPU jobs or compilation. Stop a campaign on protocol/load/abnormal-exit failure and preserve evidence.",
+  "independent_reference": "Replace accounted work rather than adding its service time to its old byte estimate. Count replicated and sharded tensors separately. Resource lower bounds use max, critical serial segments use sum; do not double count dispatch latency already inside operator measurements. Frozen models precede new model validation and retain explicit omitted costs. Component medians are an empirical implementation envelope, never a theorem of global hardware optimality."
+}

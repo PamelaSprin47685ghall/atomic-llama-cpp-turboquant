@@ -1,0 +1,10 @@
+{
+  "frozen_utc": "2026-10-09T02:23:54Z",
+  "inputs": ["calibration-A", "greedy-unit.txt"],
+  "candidate_timings_used_as_inputs": false,
+  "formula": "Copy baseline A's disjoint first/steady components; subtract (487.665-80.645) microseconds from sampling per scalar step; leave every other component unchanged. Actual dist/cardinality behavior is preserved by applying the full sampler chain to exact top-k candidates.",
+  "validation_runs": ["heldout-index-B", "heldout-process-B", "heldout-debug-B"],
+  "exposure": "The first two canonical B processes were already observed when this additional causal model was registered. They are not included in this model's validation. The independent CPU measurements predate all canonical confirmation processes.",
+  "threshold": "Same 5% per-process relative time error, fixed before held-out prompt measurements. No clamping, refitting, or changed workloads to obtain a pass.",
+  "meaning": "A causal, independently micro-calibrated prediction of this code change, not proof that the rest of the implementation is optimal."
+}

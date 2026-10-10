@@ -1,0 +1,11 @@
+{
+  "scope": "RERoT excluded; unrestricted CPU thread tuning; same unmodified APEX model, five RX6800 and head-sharded layout; current qualified sampler on.",
+  "question": "Explain the gap below graph_compute using independently measured operations and communication, then remove demonstrated implementation cost. Do not relabel a fitted whole-call duration as a theoretical upper bound.",
+  "baseline": "aggressive, MMVQ disabled, no MTP, 22 threads, GGML_TP5_GREEDY_HOST=1",
+  "phase1": "Reference requests, host relay ledger, independent model-free 96-stage relay latency at multiple payload extents; preserve F16 synthetic versus production F32 distinction.",
+  "phase2": "Audit actual dispatch work and register any candidate before paired tests. Use sparse GPU timestamp diagnostics to avoid the earlier dense-marker perturbation. Independent kernel/traffic data must name cache boundary, dtype, shape, and overlap assumptions.",
+  "confirmation": "Four independent process pairs AB,BA,AB,BA, same binary/DSO/model identities; two warmups and three measured plus guard per process. Correctness and normal exit before speed ranking. No discarded failures or fresh retries to replace failures.",
+  "bounds": "Report ideal resource lower bounds on time separately from measured achievable kernel envelopes and whole-model predictions. Unknown mandatory costs remain unknown rather than residual fudge factors.",
+  "safety": "Single GPU lock and no simultaneous compilation. No clock, watchdog, driver, reset or numerical/timeout changes; no replay of partially submitted work, no weakening of identity, extent, epoch, bank ownership or payload checks. Initial failure stops that campaign and is retained.",
+  "previous_unresolved": "Intermittent STAR payload timeout and base aggressive cold/warm output differences remain unresolved. Later passing requests cannot erase them."
+}

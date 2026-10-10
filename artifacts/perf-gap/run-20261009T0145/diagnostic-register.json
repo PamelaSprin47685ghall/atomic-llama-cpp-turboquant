@@ -1,0 +1,7 @@
+{
+  "after": "Initial baseline campaign stopped on its original error; no failed point is replaced.",
+  "changes": "Diagnostic-only GGML_DECODE_COST host intervals and error-only both-bank snapshot; no new waits, commands, tolerances or algorithm changes.",
+  "first_run": "APEX aggressive, h0, same head-sharded layout, two warm and four measured requests plus guard, host cost enabled; no speed promotion from this diagnostic.",
+  "stop": "Any protocol or load failure stops model tests for diagnosis. Original kernel recovery state boundary retained.",
+  "calibration": "Separate ubatch and decode nested scopes. Use scalar steady cost and actual graph-rebuild count; any prediction based on observed token length is explicitly conditional. Freeze model before held-out workload runs, never fit unexplained latency to the held-out result."
+}

@@ -1,0 +1,8 @@
+{
+  "hypothesis": "Norm currently waits for the Y generation before loading its independent local residual. Load the first active residual row before the point-of-use wait, retaining the exact arithmetic and every status/barrier/failure output contract.",
+  "factor": "GGML_TP5_NORM_PREFETCH=0/1, default0; no changes to Q/norm workgroup sizes, model weights, numerics, timeouts, ownership or bank retirement. Subsequent rows remain in the existing order.",
+  "eligibility": "Residual is an existing local shader binding whose availability is established by the existing pre-norm command dependencies. No inbox payload or canonical Y is read before its generation wait; no output is written on the success path before that wait.",
+  "validation": "Production shader: all signed numerical fixture outputs against existing1e-6 gate for1/2/4 rows, plus withheld-generation NaN/sticky-failure/inactive-row tests. Compare real model cold/warm/measured/guard outputs and normal teardown. Use current reference context and exact DSO identities.",
+  "qualification": "One symmetric pilot then, only if evidence justifies it, four fresh process pairs. Never call a no-wait isolated fixture improvement proof of hidden production wait.",
+  "theory": "This optimization attacks exposed latency, not weight bytes. Do not lower bandwidth demand or claim new tensor precision from it."
+}

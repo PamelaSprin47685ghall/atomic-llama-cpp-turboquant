@@ -1,0 +1,62 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文简洁回答，约200个token。直接给出必要建议，不展开长篇解释。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "减肥的核心在于制造热量缺口，即消耗大于摄入。建议如下：\n\n1. **饮食控制**：减少精制碳水和糖，增加蛋白质、蔬菜及膳食纤维。控制总热量，避免夜宵和含糖饮料。\n2. **运动结合**：每周至少150分钟中等强度有氧运动（如快走、游泳），配合力量训练以维持肌肉量，提高基础代谢。\n3. **生活习惯**：保证充足睡眠（7-8小时），管理压力，多喝水。\n4. **循序渐进**：目标每周减0.5-1公斤，避免极端节食导致反弹。坚持长期健康生活方式比短期快速减重更有效。"
+        }
+      }
+    ],
+    "created": 1791605866,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 140,
+      "prompt_tokens": 41,
+      "total_tokens": 181,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-jXGlZ3JG9ykmymWHAF6We6ijVTLrXEx0",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 41,
+      "prompt_ms": 2454.997,
+      "prompt_per_token_ms": 59.87797560975609,
+      "prompt_per_second": 16.700631406066893,
+      "predicted_n": 140,
+      "predicted_ms": 2768.281,
+      "predicted_per_token_ms": 19.773435714285714,
+      "predicted_per_second": 50.57290065567766
+    }
+  },
+  "wall_ms": 5227.186316,
+  "log_begin": 50251,
+  "log_end": 75523,
+  "phase": "measured"
+}

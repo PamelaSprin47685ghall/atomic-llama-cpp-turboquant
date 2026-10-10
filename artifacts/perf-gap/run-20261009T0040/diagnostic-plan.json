@@ -1,0 +1,12 @@
+{
+  "purpose": "Separate one captured steady no-MTP target chain into GPU intervals after completing the uninstrumented confirmation.",
+  "same_as_confirmation_arm": "B",
+  "profile": "cycle",
+  "extra_env": {"GGML_TP5_PROFILE": "1", "GGML_TP5_GPU_TIMING": "400"},
+  "warmup_requests": 2,
+  "measured_requests": 1,
+  "guard": true,
+  "ranked": false,
+  "interpretation": "One captured chain is not a request total. Different ranks overlap. P2 includes consumption and waiting, not pure PCIe copy. Native compute includes non-ALU work. Nested tail_compute must not be added again. A missing steady capture is reported rather than inferred.",
+  "stop_rule": "Run only after the preceding confirmation exits normally, with the same five-card idle and exclusive GPU lock gates. No reset or tolerance change."
+}

@@ -1,0 +1,1476 @@
+[
+  {
+    "name": "bytes-d0-b1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "1",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 0,
+        "blocks": 1,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 1,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 1,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 1,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 1,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 1,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "bytes-d0-b255",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "255",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 0,
+        "blocks": 255,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 255,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 255,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 255,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 255,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 255,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "bytes-d0-b256",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "256",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 0,
+        "blocks": 256,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 256,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 256,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 256,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 256,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 256,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "bytes-d0-b257",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "257",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 0,
+        "blocks": 257,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 257,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 257,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 257,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 257,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 257,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "bytes-d0-b102400",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "102400",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 0,
+        "blocks": 102400,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 102400,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 102400,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 102400,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 102400,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 102400,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "bytes-d0-b102403",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "102403",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 0,
+        "blocks": 102403,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 102403,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 102403,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 102403,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 102403,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 0,
+        "blocks": 102403,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "guard-d0-single0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "0",
+      "TP5_TEST_WARM_MS": "200",
+      "TP5_TEST_BATCH_TIMING": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "8da9482aed4ee907b1e49b1c053f76a676e62df5297168205959c5f43034684e",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+        "shader": "tp5_hc_late_pack.spv",
+        "aperture": "local",
+        "device": 0,
+        "groups": 400,
+        "threads": 256,
+        "width": 2560,
+        "rows": 1,
+        "samples": 3,
+        "min_us": 8.699375,
+        "median_us": 8.705,
+        "p95_us": 8.705,
+        "all_outputs_checked": true,
+        "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+      }
+    ]
+  },
+  {
+    "name": "guard-d0-single1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "0"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1",
+      "TP5_TEST_WARM_MS": "200",
+      "TP5_TEST_BATCH_TIMING": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "8da9482aed4ee907b1e49b1c053f76a676e62df5297168205959c5f43034684e",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+        "shader": "tp5_hc_late_pack.spv",
+        "aperture": "local",
+        "device": 0,
+        "groups": 1,
+        "threads": 256,
+        "width": 2560,
+        "rows": 1,
+        "samples": 3,
+        "min_us": 2.761875,
+        "median_us": 2.765,
+        "p95_us": 2.768125,
+        "all_outputs_checked": true,
+        "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+      }
+    ]
+  },
+  {
+    "name": "bytes-d1-b102400",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "102400",
+      "1"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 1,
+        "blocks": 102400,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 1,
+        "blocks": 102400,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 1,
+        "blocks": 102400,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 1,
+        "blocks": 102400,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 1,
+        "blocks": 102400,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 1,
+        "blocks": 102400,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "bytes-d1-b102403",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "102403",
+      "1"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 1,
+        "blocks": 102403,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 1,
+        "blocks": 102403,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 1,
+        "blocks": 102403,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 1,
+        "blocks": 102403,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 1,
+        "blocks": 102403,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 1,
+        "blocks": 102403,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "guard-d1-single0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "1"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "0",
+      "TP5_TEST_WARM_MS": "200",
+      "TP5_TEST_BATCH_TIMING": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "8da9482aed4ee907b1e49b1c053f76a676e62df5297168205959c5f43034684e",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+        "shader": "tp5_hc_late_pack.spv",
+        "aperture": "local",
+        "device": 1,
+        "groups": 400,
+        "threads": 256,
+        "width": 2560,
+        "rows": 1,
+        "samples": 3,
+        "min_us": 3.896875,
+        "median_us": 8.76625,
+        "p95_us": 8.770625,
+        "all_outputs_checked": true,
+        "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+      }
+    ]
+  },
+  {
+    "name": "guard-d1-single1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "1"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1",
+      "TP5_TEST_WARM_MS": "200",
+      "TP5_TEST_BATCH_TIMING": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "8da9482aed4ee907b1e49b1c053f76a676e62df5297168205959c5f43034684e",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+        "shader": "tp5_hc_late_pack.spv",
+        "aperture": "local",
+        "device": 1,
+        "groups": 1,
+        "threads": 256,
+        "width": 2560,
+        "rows": 1,
+        "samples": 3,
+        "min_us": 2.750625,
+        "median_us": 2.755,
+        "p95_us": 2.76,
+        "all_outputs_checked": true,
+        "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+      }
+    ]
+  },
+  {
+    "name": "bytes-d2-b102400",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "102400",
+      "2"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 2,
+        "blocks": 102400,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 2,
+        "blocks": 102400,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 2,
+        "blocks": 102400,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 2,
+        "blocks": 102400,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 2,
+        "blocks": 102400,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 2,
+        "blocks": 102400,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "bytes-d2-b102403",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "102403",
+      "2"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 2,
+        "blocks": 102403,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 2,
+        "blocks": 102403,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 2,
+        "blocks": 102403,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 2,
+        "blocks": 102403,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 2,
+        "blocks": 102403,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 2,
+        "blocks": 102403,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "guard-d2-single0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "2"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "0",
+      "TP5_TEST_WARM_MS": "200",
+      "TP5_TEST_BATCH_TIMING": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "8da9482aed4ee907b1e49b1c053f76a676e62df5297168205959c5f43034684e",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+        "shader": "tp5_hc_late_pack.spv",
+        "aperture": "local",
+        "device": 2,
+        "groups": 400,
+        "threads": 256,
+        "width": 2560,
+        "rows": 1,
+        "samples": 3,
+        "min_us": 8.71,
+        "median_us": 8.711875,
+        "p95_us": 8.711875,
+        "all_outputs_checked": true,
+        "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+      }
+    ]
+  },
+  {
+    "name": "guard-d2-single1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "2"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1",
+      "TP5_TEST_WARM_MS": "200",
+      "TP5_TEST_BATCH_TIMING": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "8da9482aed4ee907b1e49b1c053f76a676e62df5297168205959c5f43034684e",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+        "shader": "tp5_hc_late_pack.spv",
+        "aperture": "local",
+        "device": 2,
+        "groups": 1,
+        "threads": 256,
+        "width": 2560,
+        "rows": 1,
+        "samples": 3,
+        "min_us": 2.755,
+        "median_us": 2.755625,
+        "p95_us": 2.75625,
+        "all_outputs_checked": true,
+        "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+      }
+    ]
+  },
+  {
+    "name": "bytes-d3-b102400",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "102400",
+      "3"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 3,
+        "blocks": 102400,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 3,
+        "blocks": 102400,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 3,
+        "blocks": 102400,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 3,
+        "blocks": 102400,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 3,
+        "blocks": 102400,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 3,
+        "blocks": 102400,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "bytes-d3-b102403",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "102403",
+      "3"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 3,
+        "blocks": 102403,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 3,
+        "blocks": 102403,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 3,
+        "blocks": 102403,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 3,
+        "blocks": 102403,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 3,
+        "blocks": 102403,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 3,
+        "blocks": 102403,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "guard-d3-single0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "3"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "0",
+      "TP5_TEST_WARM_MS": "200",
+      "TP5_TEST_BATCH_TIMING": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "8da9482aed4ee907b1e49b1c053f76a676e62df5297168205959c5f43034684e",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+        "shader": "tp5_hc_late_pack.spv",
+        "aperture": "local",
+        "device": 3,
+        "groups": 400,
+        "threads": 256,
+        "width": 2560,
+        "rows": 1,
+        "samples": 3,
+        "min_us": 8.709375,
+        "median_us": 8.71375,
+        "p95_us": 8.715625,
+        "all_outputs_checked": true,
+        "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+      }
+    ]
+  },
+  {
+    "name": "guard-d3-single1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "3"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1",
+      "TP5_TEST_WARM_MS": "200",
+      "TP5_TEST_BATCH_TIMING": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "8da9482aed4ee907b1e49b1c053f76a676e62df5297168205959c5f43034684e",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+        "shader": "tp5_hc_late_pack.spv",
+        "aperture": "local",
+        "device": 3,
+        "groups": 1,
+        "threads": 256,
+        "width": 2560,
+        "rows": 1,
+        "samples": 3,
+        "min_us": 2.779375,
+        "median_us": 2.780625,
+        "p95_us": 2.784375,
+        "all_outputs_checked": true,
+        "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+      }
+    ]
+  },
+  {
+    "name": "bytes-d4-b102400",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "102400",
+      "4"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 4,
+        "blocks": 102400,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 4,
+        "blocks": 102400,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 4,
+        "blocks": 102400,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 4,
+        "blocks": 102400,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 4,
+        "blocks": 102400,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 4,
+        "blocks": 102400,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "bytes-d4-b102403",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-single-probe",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv/tp5_hc_late_pack.spv",
+      "102403",
+      "4"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "d1ba893ddce5721ffa762e2a72af83abdf61b071c4256fe156ab7abfcdf74072",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "device": 4,
+        "blocks": 102403,
+        "trial": 0,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 4,
+        "blocks": 102403,
+        "trial": 1,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 4,
+        "blocks": 102403,
+        "trial": 2,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 4,
+        "blocks": 102403,
+        "trial": 3,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 4,
+        "blocks": 102403,
+        "trial": 4,
+        "reset_payload": true,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      },
+      {
+        "device": 4,
+        "blocks": 102403,
+        "trial": 5,
+        "reset_payload": false,
+        "done": 1,
+        "bad_blocks": 0,
+        "first_bad": 4294967295
+      }
+    ]
+  },
+  {
+    "name": "guard-d4-single0",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "4"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "0",
+      "TP5_TEST_WARM_MS": "200",
+      "TP5_TEST_BATCH_TIMING": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "8da9482aed4ee907b1e49b1c053f76a676e62df5297168205959c5f43034684e",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+        "shader": "tp5_hc_late_pack.spv",
+        "aperture": "local",
+        "device": 4,
+        "groups": 400,
+        "threads": 256,
+        "width": 2560,
+        "rows": 1,
+        "samples": 3,
+        "min_us": 5.120625,
+        "median_us": 8.565625,
+        "p95_us": 8.56625,
+        "all_outputs_checked": true,
+        "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+      }
+    ]
+  },
+  {
+    "name": "guard-d4-single1",
+    "argv": [
+      "artifacts/perf-gap/run-20261009T0730/tp5-pack-service",
+      "build-perf-gap/ggml/src/ggml-vulkan/vulkan-shaders.spv",
+      "packnoop",
+      "local",
+      "4"
+    ],
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/home/kunweiz",
+      "USER": "kunweiz",
+      "LANG": "en_US.UTF-8",
+      "RADV_DEBUG": "nobolist",
+      "TP5_TEST_PACK_SINGLE_WG": "1",
+      "TP5_TEST_WARM_MS": "200",
+      "TP5_TEST_BATCH_TIMING": "1"
+    },
+    "returncode": 0,
+    "binary_sha256": "8da9482aed4ee907b1e49b1c053f76a676e62df5297168205959c5f43034684e",
+    "shader_sha256": "d0558e1d193e8ec6a288247fb62ef3da811e68239d3880f5877e3dbf45d98702",
+    "results": [
+      {
+        "kind": "INDEPENDENT_PRODUCTION_LATE_SHADER_SERVICE",
+        "shader": "tp5_hc_late_pack.spv",
+        "aperture": "local",
+        "device": 4,
+        "groups": 1,
+        "threads": 256,
+        "width": 2560,
+        "rows": 1,
+        "samples": 3,
+        "min_us": 2.735,
+        "median_us": 2.740625,
+        "p95_us": 2.740625,
+        "all_outputs_checked": true,
+        "scope": "isolated GPU timestamp duration; cached resident weights; no inter-device dependency or polling; not hardware lower bound"
+      }
+    ]
+  }
+]

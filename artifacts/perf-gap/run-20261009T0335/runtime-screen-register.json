@@ -1,0 +1,7 @@
+{
+  "fixed": "Current same-source APEX noMTP aggressive head-sharded baseline, MMVQ disabled, ordinary greedy-host optimization on; RERoT excluded.",
+  "points": ["baseline threads22 qcheck0", "qcheck-vector threads22", "direct producer host threads22 qcheck0", "threads8 qcheck0", "threads1 qcheck0", "definition-cache4 threads22 qcheck0"],
+  "direct": "Both existing GGML_VK_DISABLE_PRODUCER_WIRE=0 and GGML_TP5_DIRECT_PRODUCER_HOST=1 required. It must actually hit direct stages. Keep all existing correctness and native-submission guards; if model/protocol failure, stop campaign.",
+  "method": "Each one process with2warm/2measured/1guard, exploration only. Select only a quality-passing >2% candidate for new four-pair confirmation, without deleting slower/rejected points. Reuse no old timing samples as new confirmation.",
+  "scope": "Threads unrestricted as requested; cache affects phase transitions and must be separately assessed for Decode versus prefill. None of these settings is a promised gain."
+}

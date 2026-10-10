@@ -1,0 +1,16 @@
+{
+  "status": "REGISTERED_BEFORE_CONFIRMATION",
+  "question": "Does MTP1 improve APEX over an explicitly head-sharded no-MTP configuration, rather than the weaker default replicated-attention control?",
+  "model": "Unmodified APEX-I-Compact, same six files for both arms",
+  "fixed": {"RERoT": "off", "latebind": "aggressive", "mmvq": "disabled", "threads": 22, "ctx": 1024, "slots": 1, "definition_cache": 0, "GGML_TP5_REPLICATE_ATTN": "0", "GGML_TP5_QSA_HEADMAP": "1", "GGML_TP5_GDN_HEADMAP": "1", "GGML_VK_SMALL_Q8_COLUMNS": "1"},
+  "A": {"horizon": 0, "spec_type": "none"},
+  "B": {"horizon": 1, "spec_type": "draft-mtp", "p_min": 0},
+  "independent_process_pairs": 4,
+  "order": [["A", "B"], ["B", "A"], ["A", "B"], ["B", "A"]],
+  "requests_per_process": {"canonical_warmup": 2, "canonical_measured": 3, "separate_guard_not_ranked": 1},
+  "primary_metric": "pooled generation milliseconds per public completion token in each process",
+  "statistics": "paired log latency ratio with two-sided Student-t 95% confidence interval, df=3",
+  "secondary": ["raw generation milliseconds per whole answer", "raw client wall milliseconds per whole answer", "output hashes and lengths", "normal teardown", "measured fallback count"],
+  "qualification_limits": "Same model files do not imply identical floating reduction path/token trajectory under different target row shapes. Cold/warm semantic differences remain separately reported; this is not a full quality-equivalence certificate.",
+  "stop_rule": "Any protocol or abnormal teardown failure stops the run. No replacement points or lowered gates. No further winner search is performed with the confirmation data."
+}

@@ -1,0 +1,72 @@
+{
+  "scope": "same frozen router-bf16-native-bin snapshot; sequential A(f32) then B(bf16) pilot; NOT the preregistered 8-block independent confirmation",
+  "A_pooled_tps": 67.25608301336804,
+  "B_pooled_tps": 67.90247455650554,
+  "relative_percent": 0.961090081634719,
+  "all_six_bodies_and_tokens_equal": true,
+  "paired_requests": [
+    {
+      "idx": 0,
+      "phase": "warmup",
+      "n_equal": true,
+      "sha_equal": true,
+      "A_tps": 50.191707502584734,
+      "B_tps": 65.00968179903936
+    },
+    {
+      "idx": 1,
+      "phase": "warmup",
+      "n_equal": true,
+      "sha_equal": true,
+      "A_tps": 59.04259084256125,
+      "B_tps": 66.3628054574358
+    },
+    {
+      "idx": 2,
+      "phase": "measured",
+      "n_equal": true,
+      "sha_equal": true,
+      "A_tps": 67.77196581828488,
+      "B_tps": 67.49760306807286
+    },
+    {
+      "idx": 3,
+      "phase": "measured",
+      "n_equal": true,
+      "sha_equal": true,
+      "A_tps": 67.52160787363331,
+      "B_tps": 67.84707731367207
+    },
+    {
+      "idx": 4,
+      "phase": "measured",
+      "n_equal": true,
+      "sha_equal": true,
+      "A_tps": 66.48850768811147,
+      "B_tps": 68.36839220460485
+    },
+    {
+      "idx": 5,
+      "phase": "guard",
+      "n_equal": true,
+      "sha_equal": true,
+      "A_tps": 52.60930035677571,
+      "B_tps": 61.590304128674184
+    }
+  ],
+  "binary_sha256": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c",
+  "shutdown": {
+    "A": {
+      "returncode": 0,
+      "forced": false,
+      "seconds": 1.2160518010205124
+    },
+    "B": {
+      "returncode": 0,
+      "forced": false,
+      "seconds": 1.2154559299815446
+    }
+  },
+  "qualification": "PILOT ONLY: +0.96% observed, below the 2% preregistered promotion gate; exact outputs match; sampler/RNG, capacity>active, long-run not covered; no promotion without 8-block paired confirmation",
+  "note": "bf16 arm also shows higher guard tps (52.6->61.6), consistent with reduced router weight traffic; single-process noise not excluded"
+}

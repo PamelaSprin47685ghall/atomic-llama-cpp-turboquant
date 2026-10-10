@@ -1,0 +1,10 @@
+{
+  "scope": "RERoT off; ordinary single-stream decode; unchanged APEX target and numeric contract; five RX6800; head-sharded; h0; MMVQ disabled; compact greedy1; parallel submit1; Q256/norm256; prior pack/prefetch opt-ins off",
+  "implementation": "GGML_TP5_NORM_STAGE_Y=1 compiles a separate production norm shader: after the unchanged generation wait, cooperatively vector-load Y into workgroup LDS, then execute the original lane-to-element arithmetic and RMS fold. Same element values and operation order; no new cross-device protocol or relaxed timeout.",
+  "hypothesis": "Reduce serial uncached scalar memory instructions, not semantic work. Success requires full-output numerical tests and end-to-end independent pairs; isolated micro gains are not automatically exposed.",
+  "tests": "Existing signed production norm fixture at active rows1/2/4 in local,system,actual production memory domains; withheld-generation NaN/sticky/error/inactive-row/retirement checks. Record shader/DSO hashes; validate default shader identity.",
+  "pilot": "One A0 and B1 process, each2warm+3measured+guard. Actual matching raw body/counts, zero measured fallback, normal exits. No promotion on pilot.",
+  "confirmation": "On successful pilot and >=2% point gain, four new independent pairs AB,BA,AB,BA with2warm+3measured+guard. Per-process pooled generation milliseconds per public token; paired log-ratio Student t95%CI df3. Preserve failures; do not substitute points.",
+  "theory": "In parallel, solve a quantitative resource relaxation from mandatory work in an explicit contraction class and documented capacities, allowing optimizable placement/cache; no current kernel latency or host-relay duration may be a necessary bound. Every bound states its coverage, including MTP limitations.",
+  "safety": "One owned GPU job under existing lock and idle gate, no concurrent compilation, no clock/driver/watchdog/timeout/numeric tolerance changes. Preserve VkBuffer identity, active rows, payload generations, ownership and actual drain semantics."
+}

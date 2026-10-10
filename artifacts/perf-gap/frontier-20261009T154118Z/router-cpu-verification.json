@@ -1,0 +1,7 @@
+{
+  "build": "passed after correcting void* epoch writes and anonymous-namespace shader extern declarations",
+  "ctest": "7 selected tests passed",
+  "evidence": "artifact://78",
+  "known_failure_not_rerun": "test-mtp-workspace: prefill_phase == 1",
+  "does_not_establish": "native GPU gather, real-model numerical/state qualification, MTP reliability, performance or global optimality"
+}

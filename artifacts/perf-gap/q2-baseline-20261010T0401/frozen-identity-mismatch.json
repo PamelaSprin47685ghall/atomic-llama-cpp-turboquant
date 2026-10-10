@@ -1,0 +1,105 @@
+{
+  "snapshot": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/frontier-20261009T154118Z/router-bf16-native-bin",
+  "status": "REJECTED_IDENTITY_MISMATCH",
+  "files": [
+    {
+      "name": "llama-server",
+      "expected": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c",
+      "actual": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c",
+      "matches": true,
+      "inode": 5758076,
+      "links": 1,
+      "mtime_ns": 1791604520171098147,
+      "symlink": null,
+      "build_hash": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c"
+    },
+    {
+      "name": "libggml-base.so.0.18.1",
+      "expected": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46",
+      "actual": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46",
+      "matches": true,
+      "inode": 5758077,
+      "links": 1,
+      "mtime_ns": 1791602883975952640,
+      "symlink": null,
+      "build_hash": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46"
+    },
+    {
+      "name": "libggml.so.0.18.1",
+      "expected": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2",
+      "actual": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2",
+      "matches": true,
+      "inode": 5758078,
+      "links": 1,
+      "mtime_ns": 1791602883977952618,
+      "symlink": null,
+      "build_hash": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2"
+    },
+    {
+      "name": "libggml-cpu.so.0.18.1",
+      "expected": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+      "actual": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+      "matches": true,
+      "inode": 5758079,
+      "links": 1,
+      "mtime_ns": 1791589815807536711,
+      "symlink": null,
+      "build_hash": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e"
+    },
+    {
+      "name": "libggml-vulkan.so.0.18.1",
+      "expected": "9d9969b17e2f4b5419eea0f3175df4428aca4347179688e815077a8897e2cf60",
+      "actual": "1373e69ead119e0c8ff501fbd8bee3b85f4ee9df95cc205c3b4d24fef23920c6",
+      "matches": false,
+      "inode": 5758080,
+      "links": 1,
+      "mtime_ns": 1791604520316096967,
+      "symlink": null,
+      "build_hash": "1373e69ead119e0c8ff501fbd8bee3b85f4ee9df95cc205c3b4d24fef23920c6"
+    },
+    {
+      "name": "libllama.so.0.0.2188",
+      "expected": "5d63fa93bfe35f7da895bbea3cb79953733e76c513d57e9485744651ede09d19",
+      "actual": "5d63fa93bfe35f7da895bbea3cb79953733e76c513d57e9485744651ede09d19",
+      "matches": true,
+      "inode": 5758081,
+      "links": 1,
+      "mtime_ns": 1791602884233949808,
+      "symlink": null,
+      "build_hash": "5d63fa93bfe35f7da895bbea3cb79953733e76c513d57e9485744651ede09d19"
+    },
+    {
+      "name": "libllama-common.so.0.0.2188",
+      "expected": "29bcbe656b7e8932ad8e399680873b5eddb442bd393b93ab5d638a548c3b9ff9",
+      "actual": "29bcbe656b7e8932ad8e399680873b5eddb442bd393b93ab5d638a548c3b9ff9",
+      "matches": true,
+      "inode": 5758082,
+      "links": 1,
+      "mtime_ns": 1791599921177799866,
+      "symlink": null,
+      "build_hash": "29bcbe656b7e8932ad8e399680873b5eddb442bd393b93ab5d638a548c3b9ff9"
+    },
+    {
+      "name": "libllama-server-impl.so",
+      "expected": "5c560e6abdef9833a7668e74780b55571f6700ceb969661811b45c7d82867669",
+      "actual": "5c560e6abdef9833a7668e74780b55571f6700ceb969661811b45c7d82867669",
+      "matches": true,
+      "inode": 5758083,
+      "links": 1,
+      "mtime_ns": 1791598772231493752,
+      "symlink": null,
+      "build_hash": "cdc240a70ab00d35e5bae772e881d8701949ee626ed54fc38a02b51b5f25af09"
+    },
+    {
+      "name": "libmtmd.so.0.0.2188",
+      "expected": "a0b4c3eb6eec8c35d07b1303d77493cef60b225f2e39e8423ce9ebaad277be88",
+      "actual": "a0b4c3eb6eec8c35d07b1303d77493cef60b225f2e39e8423ce9ebaad277be88",
+      "matches": true,
+      "inode": 5758084,
+      "links": 1,
+      "mtime_ns": 1791598770642511729,
+      "symlink": null,
+      "build_hash": "a0b4c3eb6eec8c35d07b1303d77493cef60b225f2e39e8423ce9ebaad277be88"
+    }
+  ]
+}

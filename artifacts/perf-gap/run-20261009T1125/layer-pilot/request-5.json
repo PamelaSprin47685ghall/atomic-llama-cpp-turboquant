@@ -1,0 +1,58 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "用三句话解释哈希表与数组的主要区别。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "哈希表通过哈希函数将键映射到存储位置，支持基于键的快速查找，而数组则通过连续的内存空间和整数索引直接访问元素。\n\n哈希表通常具有动态扩容能力且元素无序存储，而数组的大小在创建时通常固定（或需手动调整）且元素按索引顺序紧密排列。\n\n在性能上，哈希表在平均情况下提供接近 O(1) 的查找效率，适合键值对场景，而数组在已知索引时提供 O(1) 的直接访问，但在未知位置查找时需遍历，效率较低。"
+        }
+      }
+    ],
+    "created": 1791546097,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 119,
+      "prompt_tokens": 23,
+      "total_tokens": 142,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-EPfnfJOm7c48UazptJQCfHOaaEKFI5Du",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 23,
+      "prompt_ms": 527.695,
+      "prompt_per_token_ms": 22.94326086956522,
+      "prompt_per_second": 43.585783454457584,
+      "predicted_n": 119,
+      "predicted_ms": 8045.983,
+      "predicted_per_token_ms": 67.6133025210084,
+      "predicted_per_second": 14.789988992022478
+    }
+  },
+  "wall_ms": 8577.343967,
+  "log_begin": 10404,
+  "log_end": 11322,
+  "phase": "guard"
+}

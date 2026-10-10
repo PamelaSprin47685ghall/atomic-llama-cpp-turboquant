@@ -1,0 +1,20 @@
+322c322
+<         log "[DRY-RUN] Would restore manual/highest DPM on $card without PCI mutation"
+---
+>         log "[DRY-RUN] Would restore manual/highest DPM + OD rewrite on $card without PCI mutation"
+325,327c325,336
+<     if [ ! -x "$RESET_SCRIPT" ]; then
+<         log "ERROR: Recovery helper missing; cannot restore clocks on $card"
+<         return 1
+---
+>     # Plan C (2026-09-27): after a kernel reset / driver rebind, a card can
+>     # come back with a degraded or display-desynced DPM/OD table (observed:
+>     # card2 shows 1200MHz in sysfs regardless of actual speed). The proven
+>     # remedy is the restore-gpu-highspeed.sh OverDrive rewrite sequence:
+>     #   manual level -> OD s1 2475 -> commit -> pin highest DPM -> level high.
+>     # This path is strictly EVENT-TRIGGERED (reset success / policy revert);
+>     # the watchdog never polls sclk state as a health signal.
+>     local bdf="${CARD_TO_BDF[$card]}"
+>     local dev="/sys/bus/pci/devices/$bdf"
+>     local rc=0
+>     if [ -w "$dev/power_dpm_force_performance_level" ]; then

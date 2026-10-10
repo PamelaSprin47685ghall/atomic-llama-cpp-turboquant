@@ -1,0 +1,168 @@
+{
+  "points": [
+    {
+      "run": "interaction-aggressive-auto-h0",
+      "tps": 66.0885669407715,
+      "ratio_to_screen_baseline": 0.9932225423595795,
+      "measured_tokens": [
+        176,
+        176
+      ],
+      "measured_fallbacks": 0,
+      "draft_proposed": [
+        null,
+        null
+      ],
+      "draft_accepted": [
+        null,
+        null
+      ],
+      "above_2pct": false,
+      "status": "EXPLORATORY_NOT_CONFIRMATION"
+    },
+    {
+      "run": "interaction-aggressive-disabled-h0",
+      "tps": 66.53953582624713,
+      "ratio_to_screen_baseline": 1.0,
+      "measured_tokens": [
+        176,
+        176
+      ],
+      "measured_fallbacks": 0,
+      "draft_proposed": [
+        null,
+        null
+      ],
+      "draft_accepted": [
+        null,
+        null
+      ],
+      "above_2pct": false,
+      "status": "EXPLORATORY_NOT_CONFIRMATION"
+    },
+    {
+      "run": "interaction-aggressive-disabled-h1",
+      "tps": 61.299423630229455,
+      "ratio_to_screen_baseline": 0.9212481402079353,
+      "measured_tokens": [
+        158,
+        158
+      ],
+      "measured_fallbacks": 0,
+      "draft_proposed": [
+        89,
+        89
+      ],
+      "draft_accepted": [
+        68,
+        68
+      ],
+      "above_2pct": false,
+      "status": "EXPLORATORY_NOT_CONFIRMATION"
+    },
+    {
+      "run": "interaction-aggressive-forced-h0",
+      "tps": 65.89145618059051,
+      "ratio_to_screen_baseline": 0.9902602319416695,
+      "measured_tokens": [
+        176,
+        176
+      ],
+      "measured_fallbacks": 0,
+      "draft_proposed": [
+        null,
+        null
+      ],
+      "draft_accepted": [
+        null,
+        null
+      ],
+      "above_2pct": false,
+      "status": "EXPLORATORY_NOT_CONFIRMATION"
+    },
+    {
+      "run": "interaction-ap-disabled-h0",
+      "tps": 66.01745749141537,
+      "ratio_to_screen_baseline": 0.992153862687064,
+      "measured_tokens": [
+        176,
+        176
+      ],
+      "measured_fallbacks": 0,
+      "draft_proposed": [
+        null,
+        null
+      ],
+      "draft_accepted": [
+        null,
+        null
+      ],
+      "above_2pct": false,
+      "status": "EXPLORATORY_NOT_CONFIRMATION"
+    },
+    {
+      "run": "interaction-l2-disabled-h0",
+      "tps": 52.3194482002334,
+      "ratio_to_screen_baseline": 0.7862911508257849,
+      "measured_tokens": [
+        175,
+        175
+      ],
+      "measured_fallbacks": 0,
+      "draft_proposed": [
+        null,
+        null
+      ],
+      "draft_accepted": [
+        null,
+        null
+      ],
+      "above_2pct": false,
+      "status": "EXPLORATORY_NOT_CONFIRMATION"
+    },
+    {
+      "run": "interaction-pack-once-disabled-h0",
+      "tps": 65.95377876741756,
+      "ratio_to_screen_baseline": 0.9911968568527568,
+      "measured_tokens": [
+        176,
+        176
+      ],
+      "measured_fallbacks": 0,
+      "draft_proposed": [
+        null,
+        null
+      ],
+      "draft_accepted": [
+        null,
+        null
+      ],
+      "above_2pct": false,
+      "status": "EXPLORATORY_NOT_CONFIRMATION"
+    },
+    {
+      "run": "interaction-q8first-disabled-h0",
+      "tps": 67.16745858754086,
+      "ratio_to_screen_baseline": 1.0094368371149058,
+      "measured_tokens": [
+        176,
+        176
+      ],
+      "measured_fallbacks": 0,
+      "draft_proposed": [
+        null,
+        null
+      ],
+      "draft_accepted": [
+        null,
+        null
+      ],
+      "above_2pct": false,
+      "status": "EXPLORATORY_NOT_CONFIRMATION"
+    }
+  ],
+  "all_eight_completed": true,
+  "qualified_new_winners": [],
+  "new_points_above_screen_threshold": 0,
+  "limitations": "One process per configuration, two measured requests; no paired superiority or equivalence claims. Different numerical paths can change output."
+}

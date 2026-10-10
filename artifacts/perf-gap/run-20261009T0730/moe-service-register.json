@@ -1,0 +1,9 @@
+{
+  "goal": "Replace generic isolated GEMVs by the actual fused production MoE projections shader, with real quantization formats and production critical-rank geometry.",
+  "families": {"moe2":{"layers":33,"gate":"IQ2_S","up":"IQ3_XXS"},"moe3":{"layers":15,"gate":"IQ3_XXS","up":"IQ3_S"}},
+  "shape": {"width":2560,"expert_k":128,"shared_k":128,"selected":10,"shared_gate_up":"Q6_K","scalar_gate":"F32","workgroup":32,"routed_rows":4,"shared_rows":2,"workgroups":385},
+  "reference": "Deterministic signed float inputs and quantized weights, reversed expert IDs, CPU double dequantized dot/SiLU reference over every routed/shared/scalar output; preregistered2e-4 absolute-relative rule from the existing native-matvec micro. This does not change the production norm1e-6 gate.",
+  "cache": "One resident weight set versus64 distinct >128MiB sets; same mathematical contents, disjoint actual addresses, one descriptor set per copy. Record working bytes. Serial output hazards prevent unearned dispatch overlap.",
+  "timing": "Both two timestamps per dispatch and two timestamps per64-dispatch chain. Chain includes true per-dispatch barriers and descriptor binding, not per-dispatch timestamps.",
+  "exclusions": "Does not include expert routing/top-k, downstream expert down projection, interdevice transport, host graph setup, model overall time or a fitted remainder. Never add back the replaced weight bytes or duplicate native dispatch latency."
+}

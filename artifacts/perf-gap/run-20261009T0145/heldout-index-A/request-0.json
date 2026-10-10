@@ -1,0 +1,58 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "请用三句话解释数据库索引的作用、维护代价，以及一个适合建立索引的查询场景。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "数据库索引通过构建类似书籍目录的数据结构，能够显著加速数据的检索与排序操作，从而大幅提升查询性能。\n\n然而，索引并非没有成本，它会占用额外的存储空间，并且在执行插入、更新或删除操作时，数据库必须同步维护索引结构，这会增加写入开销。\n\n因此，最适合建立索引的场景是那些频繁执行且具有高选择性的查询，例如在拥有大量数据的用户表中，根据唯一的用户ID或邮箱地址进行精确查找。"
+        }
+      }
+    ],
+    "created": 1791512869,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 95,
+      "prompt_tokens": 32,
+      "total_tokens": 127,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-2cNrUiK3y97yk6ytpgyPQm1KbnA0hBms",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 32,
+      "prompt_ms": 1670.454,
+      "prompt_per_token_ms": 52.2016875,
+      "prompt_per_second": 19.156468840207513,
+      "predicted_n": 95,
+      "predicted_ms": 1939.914,
+      "predicted_per_token_ms": 20.420147368421052,
+      "predicted_per_second": 48.9712430551045
+    }
+  },
+  "wall_ms": 3613.833713,
+  "log_begin": 12703,
+  "log_end": 18489,
+  "phase": "warmup"
+}

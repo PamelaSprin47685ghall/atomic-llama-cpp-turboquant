@@ -1,0 +1,8 @@
+{
+  "constructive_test": "A separate model-free five-GPU allreduce implementation, with the same96 dependent recurrence steps as the earlier F32 relay toy. GPU producers and consumers exchange F32 payload through one host allocation imported ONCE into each device; no CPU handoff, summation or fanout inside the chain.",
+  "requirements": "VK_EXT_external_memory_host plus actual imported HOST_COHERENT and DEVICE_COHERENT memory; fail closed if unavailable. Coherent volatile accesses and workgroup publication barriers. No weaker memory fallback.",
+  "bank_proof": "Before a rank overwrites bank for stage s+2, it observed all ranks' ready at s+1; those publishes occur only after each rank completed all bank s reads. Thus all prior readers finished before reuse. Replay epochs are unique; no ready flag reuse as success.",
+  "gate": "Exact all-element F32 recurrence equality on every rank/replay;1/2/3/96 stage and256/2560/4096 element cases; withheld producer causes bounded sticky failure and NaN output on every rank. Five-card idle/lock gate; no concurrent compilation; fixed five-second native drain; no manual reset.",
+  "timing": "Two GPU timestamps per rank per entirechain and host submit-to-drain wall time; first2 of16 replays not ranked. CPU reference calculation outside the timer. Serial host submissions recorded as part of wall and earliest-rank wait.",
+  "scope": "This is a constructive protocol alternative, not yet a llama.cpp execution path, a model tok/s result, or a hardware necessary bound. A faster result would refute necessity of the old CPU relay duration, not certify global optimality."
+}

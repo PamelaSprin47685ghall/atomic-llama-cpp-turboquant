@@ -1,0 +1,30 @@
+[
+ {
+  "i": 0,
+  "wall": 3.936,
+  "exact": true,
+  "tokens": 171,
+  "finish": "stop"
+ },
+ {
+  "i": 1,
+  "wall": 3.452,
+  "exact": true,
+  "tokens": 171,
+  "finish": "stop"
+ },
+ {
+  "i": 2,
+  "wall": 2.909,
+  "exact": true,
+  "tokens": 171,
+  "finish": "stop"
+ },
+ {
+  "i": 3,
+  "wall": 2.927,
+  "exact": true,
+  "tokens": 171,
+  "finish": "stop"
+ }
+]

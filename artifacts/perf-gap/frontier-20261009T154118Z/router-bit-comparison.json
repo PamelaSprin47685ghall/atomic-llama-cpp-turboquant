@@ -1,0 +1,33 @@
+{
+  "scope": "Vulkan0 only; full512 scores for N2 generic prefill and three N1 calls with changed/returned input; eligible exact-BF16 synthetic weights, not real target state",
+  "runs": [
+    {
+      "name": "generic",
+      "mode": "f32",
+      "tiling": "0",
+      "returncode": 0,
+      "log": "router-bit-generic.log",
+      "sha256": "8b93afd6face862ed7d244096a345064a494da23fd4a8a053358f26cd1c66519"
+    },
+    {
+      "name": "tiled-f32",
+      "mode": "f32",
+      "tiling": "1",
+      "returncode": 0,
+      "log": "router-bit-tiled-f32.log",
+      "sha256": "198685fc92251cc5312b840f4473f248e417b070ae622c10f93e15901ca8582c"
+    },
+    {
+      "name": "tiled-bf16",
+      "mode": "bf16",
+      "tiling": "1",
+      "returncode": 0,
+      "log": "router-bit-tiled-bf16.log",
+      "sha256": "198685fc92251cc5312b840f4473f248e417b070ae622c10f93e15901ca8582c"
+    }
+  ],
+  "bytes_compared": 10240,
+  "generic_vs_tiled_f32_equal": false,
+  "generic_vs_tiled_bf16_equal": false,
+  "qualification": "kernel numerical smoke only; model/sampler/state/throughput pending"
+}

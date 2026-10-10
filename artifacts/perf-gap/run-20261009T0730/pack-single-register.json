@@ -1,0 +1,8 @@
+{
+  "finding": "Each completed HC weight pack still dispatches400 workgroups merely to read a persistent done flag and return; two packs x94 sites =75200 guard workgroups per rank per chain. Independent warmed production pack-noop measurement is about7us each.",
+  "candidate": "GGML_TP5_PACK_SINGLE_WG=1, default0. One workgroup packs all blocks by striding only on first use; subsequent replays launch only one guard workgroup. Preserve the same packed format, descriptor ranges, shared ownership, bank programs, done flag, barriers and error bounds. No self-modifying indirect arguments.",
+  "tradeoff": "Initial packing becomes less parallel and may increase load/prefill/cold definition time. Measure and report cold requests separately; never hide startup regression inside warm-only claims.",
+  "numerical": "Production shader full-byte comparison over1/255/256/257/102400/102403 blocks, repeated initialized and replay cases, all five cards for production size. Same arithmetic representation, no lossy quantization change.",
+  "mechanism": "For the single-workgroup path only, the done flag is published after all lanes finish all assigned blocks and a workgroup barrier. This removes the cross-workgroup completion issue for that path but does not assert the existing model timeout was caused by packing.",
+  "promotion": "Symmetric pilot off/on using the current parallel-submit baseline, then four independent paired blocks if raw outputs and performance justify. Record actual packed-group policy in the chain definition. Stop on any protocol or teardown error; no replacement samples."
+}

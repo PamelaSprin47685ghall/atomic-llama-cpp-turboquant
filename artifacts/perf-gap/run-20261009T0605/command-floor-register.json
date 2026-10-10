@@ -1,0 +1,7 @@
+{
+  "purpose": "Quantify omitted launch/dependency service independently, without model runtimes. Single-lane integer increment dispatches separated by the same full compute-write/read dependency; only two timestamps per whole chain.",
+  "sizes": [64,256,1510],
+  "verification": "Exact accumulated counter proves each dispatch executed. Warm first chain excluded. Report per-command and whole-chain GPU service; no CPU submit included.",
+  "interpretation": "Empirical optimistic floor candidate for this command/dependency family, not mathematical universal lower bound. Do not multiply all barrier counts by this value or add it to full timed kernels which already include launch costs. Use per-op max(resource work, calibrated command service) and actual dependency paths.",
+  "not_allowed": "No fitting to target whole-model time, no clock changes, no concurrent GPU/compile."
+}

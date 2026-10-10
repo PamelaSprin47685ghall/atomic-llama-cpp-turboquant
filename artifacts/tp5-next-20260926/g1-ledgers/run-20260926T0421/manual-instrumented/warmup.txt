@@ -1,0 +1,9 @@
+{
+ "wall_sec": 4.211117758997716,
+ "predicted_ms": 2612.284,
+ "predicted_n": 171,
+ "prompt_n": 31,
+ "completion_tokens": 171,
+ "finish": "stop",
+ "exact": true
+}

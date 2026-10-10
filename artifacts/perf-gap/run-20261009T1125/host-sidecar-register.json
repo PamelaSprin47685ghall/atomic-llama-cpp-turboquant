@@ -1,0 +1,14 @@
+{
+  "fixed": "Same APEX weights, fiveGPU head-sharded TP5, h0, ctx1024, MMVQdisabled, aggressive, Q256/norm256, norm-stage0, prefetch0, pack-single0, parallel-submit1, compactgreedy1",
+  "screen": [
+    {"name":"baseline", "threads":22, "extra":[]},
+    {"name":"threads8", "threads":8, "extra":[]},
+    {"name":"threads4", "threads":4, "extra":[]},
+    {"name":"threads1", "threads":1, "extra":[]},
+    {"name":"p1a-nosidecar", "threads":22, "extra":["GGML_TP5_P1A_NOSIDECAR_Q8=1"]},
+    {"name":"definition-cache", "threads":22, "extra":["GGML_TP5_DEFINITION_CACHE=4"]}
+  ],
+  "purpose": "Actually test CPU scheduling load and elimination of the Q-sidecar using maintained implementation switches on the current stack. P1A changes the placement of approximate arithmetic; its output cannot be assumed bit-exact.",
+  "gate": "2warm+2measured+guard each. No default promotion from screening. Candidate needs>=2%gain then fresh4paired processes with correctness review. Every initial/failure/negativepoint retained; stop entire screen on protocol/load/teardownfailure; no forced reset.",
+  "scope": "Ordinary single-stream performance only, not a theorem restricting other placements or MTP. No concurrent GPU/compile work; unchanged idle/ownership/timeout/numeric gates."
+}

@@ -1,0 +1,56 @@
+[
+  {
+    "idx": 0,
+    "phase": "warmup",
+    "n": 185,
+    "predicted_ms": 5076.307,
+    "tps": 36.44381634128905,
+    "wall_ms": 10441.7778,
+    "finish": "stop",
+    "content_sha256": "ad42cadf56c40dd776b01727fc6923b3338b21e3f95df1e577ba89c4f8370024",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 93,
+      "prompt_ms": 5361.107,
+      "prompt_per_token_ms": 57.646311827956985,
+      "prompt_per_second": 17.347163561555476,
+      "predicted_n": 185,
+      "predicted_ms": 5076.307,
+      "predicted_per_token_ms": 27.439497297297297,
+      "predicted_per_second": 36.44381634128905
+    },
+    "issues": [],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=3 n_sub=96 uid=36028797018967041",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=96 uid=36028797018967297",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=96 uid=36028797018967553",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=96 uid=36028797018967809",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=97 uid=36028797018968065",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=97 uid=36028797018968321",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=97 uid=36028797018968577"
+    ]
+  },
+  {
+    "idx": 1,
+    "phase": "measured",
+    "n": 185,
+    "predicted_ms": 3645.142,
+    "tps": 50.75248097330639,
+    "wall_ms": 7669.076387,
+    "finish": "stop",
+    "content_sha256": "ad42cadf56c40dd776b01727fc6923b3338b21e3f95df1e577ba89c4f8370024",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 93,
+      "prompt_ms": 3382.404,
+      "prompt_per_token_ms": 36.36993548387097,
+      "prompt_per_second": 27.49523711537711,
+      "predicted_n": 185,
+      "predicted_ms": 3645.142,
+      "predicted_per_token_ms": 19.70347027027027,
+      "predicted_per_second": 50.75248097330639
+    },
+    "issues": [],
+    "fallback_lines": []
+  }
+]

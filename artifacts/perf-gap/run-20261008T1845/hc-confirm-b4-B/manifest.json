@@ -1,0 +1,95 @@
+{
+  "argv": [
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/llama-server",
+    "-m",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/models/perf-gap-q2-hcq8/Q2-HCQ8-00001-of-00002.gguf",
+    "-dev",
+    "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+    "--split-mode",
+    "tensor",
+    "--fit",
+    "off",
+    "-ngl",
+    "999",
+    "-c",
+    "1024",
+    "-b",
+    "32",
+    "-ub",
+    "32",
+    "--no-mmap",
+    "--no-host",
+    "-np",
+    "1",
+    "-t",
+    "22",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18765",
+    "--tp5",
+    "qwen4exp-af",
+    "--tp5-latebind",
+    "aggressive",
+    "-md",
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+    "--spec-type",
+    "draft-mtp",
+    "--spec-draft-n-max",
+    "1",
+    "--spec-draft-p-min",
+    "0"
+  ],
+  "env": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": "/home/kunweiz",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "LD_LIBRARY_PATH": "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin",
+    "RADV_DEBUG": "nobolist",
+    "GGML_VK_DISABLE_MMVQ": "1",
+    "GGML_VK_FORCE_MMVQ": "0",
+    "GGML_TP5_DEFINITION_CACHE": "0"
+  },
+  "bin_sha256": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c",
+  "harness_sha256": "d60be12b9cc1b74fd064c5124155f1aebe80758cdf69dd9ae4b1f5460b5dc1fb",
+  "model_stat_identity": {
+    "/home/kunweiz/atomic-llama-cpp-turboquant/models/perf-gap-q2-hcq8/Q2-HCQ8-00001-of-00002.gguf": {
+      "bytes": 37024085792,
+      "mtime_ns": 1791488534679447885,
+      "inode": 5699364
+    },
+    "/home/kunweiz/atomic-llama-cpp-turboquant/models/perf-gap-q2-hcq8/Q2-HCQ8-00002-of-00002.gguf": {
+      "bytes": 28800138432,
+      "mtime_ns": 1791488792926749814,
+      "inode": 5699368
+    }
+  },
+  "draft_stat_identity": {
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf": {
+      "bytes": 2790341728,
+      "mtime_ns": 1789318733863246483,
+      "inode": 1772663
+    }
+  },
+  "args": {
+    "bin": "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin/llama-server",
+    "model": "/home/kunweiz/atomic-llama-cpp-turboquant/models/perf-gap-q2-hcq8/Q2-HCQ8-00001-of-00002.gguf",
+    "draft": "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+    "out": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/run-20261008T1845/hc-confirm-b4-B",
+    "horizon": 1,
+    "latebind": "aggressive",
+    "mmvq": "disabled",
+    "threads": 22,
+    "ctx": 1024,
+    "warmup": 2,
+    "repeats": 3,
+    "port": 18765,
+    "profile": "none",
+    "env": [
+      "GGML_TP5_DEFINITION_CACHE=0"
+    ],
+    "skip_guard": false
+  },
+  "started_utc": "2026-10-08T20:13:36Z"
+}

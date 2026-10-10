@@ -1,0 +1,2 @@
+400 mixed unique/tie rows matched; 100 subsequent RNG-dependent samples matched; non-finite guards passed
+{"scope":"CPU_SAMPLING_MICRO_NOT_MODEL","vocabulary":248320,"repeats":200,"ordinary_us":487.665,"unique_us":80.645}
