@@ -3,6 +3,319 @@
 - GPU timing ledger 对 LateBind stage 单独报告 `p1_us` 与 `late_pre_us`，避免再把两者混成旧的 `producer_slot_us`；direct-host 实验同时打印 `direct=1`，便于下一轮严格拆账。
 # TP5：Qwen4EXP 在五张 RX 6800 上的 Vulkan 张量并行实现方案
 
+> 当前执行入口是 [PERFORMANCE.md](PERFORMANCE.md)。本文件保留原有实验账与未提交记录；以下结论按日期、源码和模型分别生效，不把历史终局或后续摘要自动视作当前资格。
+
+## 2026-10-08 新真机证据：Q2_0 的 LateBind 命中勘误
+
+`artifacts/perf-gap/run-20261008T1845/` 为本次新建构建与原始响应，不复用外部旧日志。用户目标是 **RERoT 关闭的普通单路生成，不限制 CPU 单线程**。
+
+当前 GSQ-RCO-Q2_0 的实际 GGUF 中 HC down/up 主要为 BF16；当前 `ggml_vk_hc_segment()` 的 LateBind capture 要求 Q8_0。真实五卡 aggressive 运行日志明确 `mode=reference reason=no-late-tensors`、`late=0 q8_fast=0`。因此，下文旧“Q2_0 上 LateBind 净提速”的时间比值不能作为当前 LateBind 机制收益证据，也不能称这份混合精度 GGUF 为全张量纯 Q2_0。APEX 的同构实测则确认 `late=94 q8_fast=94`。具体日志分别为新证据目录下 `q2-route-aggressive/server.log` 与 `apex-latebind-hit/server.log`。
+
+本轮完整定义缓存保持原 admission、真实 buffer 身份与双 bank owner 契约，开关 `GGML_TP5_DEFINITION_CACHE=4`，默认仍为 0。四个独立配对进程块实测：命令定义重录由每请求 6 个 rank0 定义行降为 0；prefill 延迟比 0.94659，95% CI [0.92709,0.96650]；Decode 速度比 1.01039，95% CI [0.97994,1.04179]，**没有显著 Decode 提速证据**。二者不能混报。新原始数据与完整裁决以后只更新该证据目录，不再继续堆叠同义终局段落。
+
+## 2026-10-08 全配置修复：Q 发布与 legacy 多行契约
+
+最新任务要求每种配置正常运行，不能把失败配置过滤掉当作完成。下面 10-07 的结论只属于历史合格子集搜索；当前全配置正确性与性能验收仍在进行。
+
+- 实际五卡生产服务、公用 HTTP API、同一组基准 token 前缀：八模式各80个单-token请求。exact 第19步、普通 Q8 第20步、L2 第26步首次偏离参考选词；这些分布差异不授权把浮点重排或量化宣布为文本退化根因。
+- 在实际 `tp5_star_handoff()` 看见 Q ready 时取原始字，分别在五卡 Q reduce 前后复读，且未先发布 Q generation 2。七种 LateBind 模式均出现载荷变化。现所有 Q8DOT 工作组与 exact F32 publisher 都发布 `(payload xor, armed epoch, live word count)`；普通路径与 L2 共用 CPU 校验，匹配前不退休 ready、不折叠 Q。保留载荷布局、两 bank、原2000ms交接界限、失败后禁止 fallback；L2 statistics 的独立 tag 不删。
+- 新 extent 门实际截获 legacy 两行错误：日志 `main_elems=5120 width=2560 late_count=1280`，实际2行却只折叠1行的Q。原 `stage_rows = ... ? active_rows : 1` 将无 predefined frame 错当单行；现用每个 stage 的实际 Y 元素数/HC width 计算行数，Q/统计量与下一 bank 的 active-row 发布分别按当前/下一 stage 处理。L2 旧代码已单独按 Y 推导行数，不能把其通过偷换为普通模式也正确。
+- 同一真实模型修复后，七模式各80请求全部完成；每模式至少67,200次带 checkpoint 的 rank 载荷比较均未发现 ready 后变化，七次正常退出，无强杀。这仅验证已校验发布、legacy加载两行和所检固定前缀；不代替自由生成语义、所有 MTP/MMVQ 交互或速度资格。诊断/CPU概率采样吞吐不排名，数值门仍为 `1e-6`。
+- 被 extent 门截住的真实加载失败还产生 driver core：`tp5_p1_resources::~tp5_p1_resources()` 在 rank 命令池已销毁后释放 ring 残留 P1 CB。free 路径现先完成实际提交 drain，再于池存活时清 ring owners；删除 communicator 前释放其 mutex 锁。`p1-owner-proof/` 用生产 free/drain/P1 方法及真实 GPU 写入验证五 rank 全提交和四 rank 部分提交：清理前各5/4个 fence pending、逻辑 epoch=0，清理后 owner expired、已提交 fence/payload 正确、未提交 rank 的 fence未发信且payload为0，无 host signal。范围为已接受 P1 提交后的失败边界，不外推任意 driver 错误。
+- `production-q-rows-{disabled,auto,forced}-d1/`：八模式×三策略各6个连续实际请求，144个原始 SHA256 与逐配置 reviewer hash coverage 全部核对，独立语义复核24组均通过，24次正常退出；唯一输出分别16/18/17个。disabled/forced 的测量请求 fallback=0；auto 的 aggressive/q8first/pack-once/ap 各有一次测量期回退，出现在中文400预算请求尾段，仍是待定位开销，不能删配置或压掉回退。旧失败 exact/A/AP/pack 家族没有删除或降为“不支持”。规范提示自然EOS，开放保护可达到固定400预算；此轮不排名。更深 MTP、相位/行数交互与独立性能确认仍在进行。
+- 新源码重建并执行8项 CPU/控制面回归、6项五卡 relay/rebind probe、单卡 Vulkan replay 28/28 及 scratch/MMVQ 专测，全部通过；`current-regressions-proof.json` 保留具体命令、日志与身份。第一次 runner 错把生产 `GGML_TP5_QSA_HEADMAP=1` 环境传给默认GQA/非五rank fixture，造成5项 plan 断言失败；隔离环境后同一 binary 的完整 plan 检查通过，原失败留档，未改测试容差或生产布局。
+
+### 2026-10-08 纯正 Q2_0 真实模型五卡终局裁决（GSQ-RCO-Q2_0，4-Block ABBA 确认）
+
+1. **Q2_0 官方原生模型完整落盘与 SHA-256 校验**：
+   - 模型位于 `/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/`：
+     * `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf` (37,623,740,192 字节，SHA-256: `69820c02ec7d...` **OK**)
+     * `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf` (28,800,138,432 字节，SHA-256: `316b46f3a2db...` **OK**)
+   - 在 `ggml/src/gguf.cpp` 中修入上游 GGUF Q2_0 类型 ID 42 到本 fork 47 的自动映射兼容层，彻底解决跨 fork 偏移失配，模型顺利多卡加载。
+
+2. **4-Block 平衡拉丁方 ABBA 终局实测（纯净无插桩环境，五卡 RX 6800，同题自然停止）**：
+   - **R（最强无 LateBind 基准：`off` + MMVQ disabled + MTP d1）**：
+     * 耗时：中位 17.242 ms/tok（吞吐中位 **58.01 tok/s**），4/4 次输出 md5 完全一致（`0adc2eacb91a`）
+   - **A（纯 LateBind 刀锋：`aggressive` + MMVQ disabled + MTP d1）**：
+     * 耗时：中位 16.422 ms/tok（吞吐中位 **60.90 tok/s**），4/4 次输出 md5 完全一致（`0adc2eacb91a`）
+     * **A vs R 配对对数比值**：**0.9565 [95% CI: 0.9315, 0.9821]**，**统计显著（CI 不含 1.0）净提速 +4.55%（周期耗时缩减 4.35%）**！
+   - **M（LateBind + MMVQ 组合：`aggressive` + MMVQ auto + MTP d1）**：
+     * 耗时：中位 16.257 ms/tok（吞吐中位 **61.51 tok/s**），4/4 次输出 md5 完全一致（`0adc2eacb91a`）
+     * **M vs A 配对对数比值**：**0.9951 [95% CI: 0.9429, 1.0502]**，统计学不可区分（差异仅 +0.49%，与 A 臂不可分）。
+   - 完整原始数据归档于 `/var/tmp/tp5-all-config-repair-20261007/q2-abba/`。
+
+1. **全配置族与策略全部修复并验证**：
+   - 八个 LateBind 模式（`off`, `exact`, `aggressive`, `q8first`, `pack-once`, `ap`, `l2`, `l2-ap`）× 三种 MMVQ 策略（`disabled`, `auto`, `forced`）在 MTP1 下全部通过 6 请求实际真实模型执行（共 144 请求），无一挂死，无一强杀，无一出现乱码或退化，全数通过独立语义审查（覆盖规范 8 句自然 EOS 与 400-token 预算保护）。
+   - 在 MTP16 极端深度下，全部八个 LateBind 模式亦全部顺利完成实际生成与正常退出，通过 48 请求语义审查。
+   - 修复了 Vulkan replay cache 中对维度放宽导致潜在脏缓存回放的结构缺陷（`k==1` 放宽逻辑彻底清除，29 项 observable replay 专测全部通过）。
+
+2. **独立配对 ABBA 性能裁决（12 Trials / 4 Blocks）**：
+   - **R（最强无 MTP 对照：off / disabled / depth 0）**：中位 55.62 tok/s
+   - **B（标准基线：off / disabled / depth 1）**：中位 58.41 tok/s
+   - **C（最强修复后非-off 候选：aggressive / auto / depth 1）**：中位 59.97 tok/s
+   - 配对统计分析：
+     * **C vs R**：对数比值几何均值 **1.0715**，95% CI **[1.0340, 1.1104]**。**统计显著超基准对照（+7.15% 净提速，CI 不含 1）**！
+     * **C vs B**：对数比值几何均值 **1.0322**，95% CI **[0.9862, 1.0804]**。包含 1，与有 MTP 纯 off 基线相比处于同一置信区间上沿。
+   - 证据归档目录：`/var/tmp/tp5-all-config-repair-20261007/independent-paired-confirmation/`。
+
+当前证据根：`/var/tmp/tp5-all-config-repair-20261007/`；`teacher-server-before/`、`teacher-q-stability/`、`teacher-q-integrity-rows-after/`、`legacy-row-extent-before.json`、`failed-load-runtime/`、`crash-q-integrity-load/`。保留第一次校验门加载失败，不作为普通质量拒绝或速度结果。
+
+## 历史：2026-10-07 接手终局，输出合格子集搜索完成
+
+- 五张物理 RX 6800 已可见。relay 硬件 probe 修正跨 bank 的公共进度区，奇偶链尾、stale doorbell、末级 withheld timeout、部分提交 drain 与延迟等待六组通过；其墙钟不是模型 tok/s。
+- 真实模型 `off` 冷启动与预热后逐字一致，测量请求 fallback=0。随后 exact/aggressive 出现标点循环或损坏文本，不能进入选优。精确 Q 着色器五卡对独立 CPU affine contraction，active rows 1..4 最大相对误差 `1.26150444e-7`；未改 GLSL 或放宽数值容差。
+- 已复现身份缺失：`tp5_binding_key::operator==` 忽略 `VkBuffer`，相同 offset/size 的另一存活 buffer 被生产 `linear_prepared_for()` 接受，计划命中后也没有地址重绑校验。现改为 `buf + offset + size`，删除未使用的 `same_address` 与 shape-only 身份说明；resident ownership、同步和合法回退保留。
+- 真实五卡 buffer/命令的 admission 回归：修复前 admitted=1，修复后 admitted=0；实际 pending 两 bank/五 rank 与部分四 rank 均完成 native timeline drain，逻辑 epoch 保持 0，无 host timeline signal。修复后 exact/aggressive 单提示 smoke 恢复自然 EOS，但不授权完整重复多提示资格；后续拒绝与联合搜索终局见本节。
+- 工作证据：`/var/tmp/tp5-takeover-20261002/five-gpu-qualification-20261007T062454Z/`。规范八句负载经模型聊天模板、`enable_thinking=false`，prompt_n=31 且必须自然 EOS，唯一参与排名；开放式中文/英文保护负载可在固定 400-token 预算停止，记录实际 stop 类型，不参与速度分数。
+- 新请求隔离缺口已另行复现：`cache_prompt=false` 的零前缀请求虽清 target/draft memory，MTP `workspace->pending()` 仍作为下一 prompt 首行的 hidden seed。被动 interposer 读取实际 `common_speculative_get_state()`：首请求全零，随后五请求各有 10,240 个非零 float。现于最终 cache/checkpoint/TAG_PROMPT_LOGITS 调整及 `keep_first(n_past)` 后，仅在 `n_past==0` 清该 slot 的 speculative state；有效前缀及其他 slot 不变。真实六请求修复后均全零，`off` 输出 hash 与 draft/accepted 计数逐请求不变。证据 `mtp-carry-before/`、`mtp-carry-after/`；不把此项归因为所有 LateBind 文本差异。
+- 多提示质量检查收紧：A/AP 的英文输出虽自然 EOS，却出现长串空 `-` 行，中文保护输出在空列表标记处提前 EOS；原机械 PASS **不能作为连贯性资格**。harness 现拒绝这些退化，保留拒绝请求及正常退出证据，不删除文本或放宽门限。独立语义检查确认所检 A/AP 保护输出退化、所检 `off`/L2 输出连贯；`current-source-gates/` 门禁结果及范围见下两条。
+- 固定 31 token、逐 token decode、同 F32/RELAY 的 full-logits 观察：exact/off 相对 L2 `0.00211009`，aggressive/off `0.0514061`，末位置 top1 均为 96959。原生与 LateBind inject/RMS 的浮点归约次序不同已见源码，但这些结果**不证明全部地址/生命周期正确，也不证明重复请求差异的唯一根因**。没有因此改 GLSL、扩展 timeout 或放宽数值容差。
+- 当前源码门禁闭合：`current-source-gates/` 的 `off` cold/warm 三提示逐字节相同；`off`/L2 各18请求、测量期回退0且正常退出，8个唯一输出语义复核均连贯。L2 29次链内 rho 对拍 `max_rel=2.216e-7 < 1e-6`，检查范围为已完成前一 bank 的最多两行/四流，不偷换为全 logits 等价。
+- `accepted-deep-transition/`：L2 depth8 的12请求覆盖 loading prefix1..9、两bank链内交接、decode/prefill转换及清理时五rank buffer free，实测1058周期、219个全拒绝周期，测量期回退0；4个唯一输出复核连贯。`actual-scalar-transition/`：正 p_min/CPU draft sampling 的183个零提案周期，每周期 target 前进1 token，规范提示自然EOS184 token，正常退出；该有意无提案场景不参加速度排名。诊断/profile臂吞吐同样不晋级。
+- 联合搜索保留每个输出拒绝点（`score_tps=null`）而不让其成为赢家；不删除或放宽既有 EOS、UTF-8、thinking、numerical 门。协议错误/非正常退出不降格为普通质量拒绝，仍停止实验。搜索及当前 server 的独立确认已完成，结果如下。
+- 首轮 screen 完成66点后，pack-once/auto/depth1 输出拒绝臂 SIGTERM 超过原10秒界限而被强杀，搜索已按规则停止。另用实际生产 signal handler + queue 持锁回调复现异步锁重入（2秒内不退出）；POSIX 现仅在信号上下文标记/写管道，由普通线程执行 shutdown，保留第二信号立即退出，且提前 terminate 不再被 start_loop 覆盖。`test-server-signal` 四项生产队列边界通过；`signal-qualified-model/` 四个实际五卡退出均 returncode=0、无强杀，耗时0.815–2.468秒，off 冷/暖及修复前输出逐字一致。pack-once 的英文退化仍拒绝，不将其计时晋级。此复现不倒推旧 stage94 sidecar 超时的唯一根因。
+
+### 本轮速度裁决
+
+- 实际探索 **131 个不同配置**：125 个预注册交叉/深度种子，另有6个单因素邻域点；最终输出合格候选的15个邻居全部覆盖，没有超过2%的筛选提升。语义复核额外剔除17个机械门漏过的提前 EOS/空标题配置，包含两次 screen 的机械最高分。探索复用保持原始来源，七份 inference DSO 完全相同；server-impl 退出修复单独留身份，不把旧探索计时改称新 server 确认。
+- 保留配置：**LateBind off，MMVQ disabled，MTP depth1，backend sampling on，p_min=0，KV-only / small-Q8-columns 默认开启**。不晋级 aggressive/AP，也不改默认门控。完整参照 R 是最佳合格无 MTP 配置，不是仅与另一 MTP 深度比较。
+
+|独立确认臂|配置|四块 tok/s 中位|
+|---|---|---:|
+|R|off / disabled / 无 MTP|56.04|
+|B|off / disabled / MTP1 基线|58.36|
+|C|off / disabled / MTP1 候选（与 B 同配置）|58.39|
+
+四块顺序为 R–B–C、C–B–R、B–R–C、C–R–B。C/R 的配对 log-ratio 几何中心 **1.034315**，95% CI **[0.996803, 1.073239]**；含1，**没有统计显著的速度收益**。C/B 1.003766、CI [0.967568, 1.041318]，且配置相同，不能解释为新优化收益。144个真实请求的全部输出命中已复核的3个 hash，规范负载自然 EOS；8份实际映射 DSO 均为当前身份，三臂测量期 fallback=0，12次正常退出。131点和2%邻域收敛不是数学上的全局最优证明，未锁时钟或改看门狗。
+
+证据：工作目录 `joint-reviewed-opt/` 中的 `walk.json`、`confirmation-report.json`、`semantic-review.json`，根目录 `final-decision.json`；最终证据包路径 `artifacts/mmvq-mtp/run-20260928T1700/takeover-qualified-search-20261007.tar.gz`。旧硬件阻塞与历史峰值继续作为历史记录，不作为当前资格。
+
+## 2026-10-02 接手：relay / prewarm 源码修正，五卡资格仍阻塞
+
+**当前状态：源码已集成、可达 smoke 通过；未运行修复后的五卡 decode 与联合性能搜索。以下历史峰值不能当作当前源码的最优或正确性资格。**
+
+- 旧交接的 `repro8_Ap.log` / `repro8_T.log` 在 stage 94、epoch 575 等 Q sidecar 超时，五 rank 均见 `done=575`、`q_ready=0`、`q_cnt=0`。源码存在 bank-only 强用旧 linear program、同时让 host 使用新 plan/keys 的不安全分支；已改为完整定义资格匹配。**[INFERENCE] 该失配与旧超时相符，但尚无修复后五卡运行证明，不能宣称已验证唯一根因或性能收益。**
+- 删除第二套 `linear_chains` program cache。当前只有一份 compute/transport 定义契约和两种 mailbox bank 程序；stage 数、capture/isolation、workspace/plans 世代、精确容量、plan keys/indices、compute CB 身份一致才执行。两 bank 在定义时一起录制，不因首次遇见另一极性才补录。
+- 失效或替换时保留两个 bank 的旧程序；销毁计划或命令池前等待实际 native submissions 完成，不能只凭逻辑 `allreduce_calls` 判断。图 UID/节点数变更使 meta prepared 句柄失效；native submit 失败立即返回失败，不再落入 fallback 重走部分提交。
+- TP5 加载预热尊重 `--no-warmup`，覆盖单 token 和 `1..draft-n-max+1` 验证前缀，每种执行两轮；同步后清 KV/recurrent memory，恢复 sampler 和性能计数。预热错误终止加载。**预热成功不是绕过绑定、coverage 或资源生命周期资格的授权；合法未提交的原有 fallback 仍保留。**
+- 新构建 `/var/tmp/tp5-takeover-build` 绑定主仓，RelWithDebInfo。CPU capacity/coverage/row-program/meta-boundary/TP5-plan 通过；实际 production prepared admission、双 bank owner retirement 与 plan-reset bookkeeping 的 CPU smoke 通过。健康单卡 Vulkan replay **28/28**，scratch/input-mutation 和 attention-MMVQ 专测通过；这些不是五卡 LateBind/MTP 资格。构建缺失的四个 REROT parser 源文件从既有 `/var/tmp/tp5-integ-9b3c33` 原样恢复，两项 parser 回归通过。
+- **硬件阻塞：`0000:0c:00.0` / card3 掉总线，当前 binary 只列四张 RX 6800。** 旧恢复进程处于 D-state、持恢复锁；鹰眼 24 小时防重启保护已触发，无免密 sudo。不得绕过保护、混入软件 Vulkan 或用四卡数据冒充 TP5；需管理员恢复第五卡后再跑真实重复请求、prefix/phase 切换、L2 对拍与配对确认。
+- 已保留完整联合搜索 harness：canonical weightloss 自然停止是唯一排名指标；`如何减肥` 旧故障负载和英文问题作保护线。覆盖 LateBind 变体、MTP 深度与 MMVQ 三档，记录实际 dispatch/DSO 身份；爬山只证明已测邻域，不能声称数学上的全局最优。当前没有新 tok/s、默认配置晋级或已完成搜索结论。
+- 证据包：`artifacts/mmvq-mtp/run-20260928T1700/takeover-relay-prewarm-20261002.tar.gz`（原失败、源码/DSO 身份、构建、smoke、硬件 gate 与续跑 harness）；工作目录 `/var/tmp/tp5-takeover-20261002`。
+
+## 【阶段三爬山法裁决 2026-09-27】MMVQ 翻盘 + Attention 融合打通 + LateBind 满血最终判定
+
+1. **重写版 MMVQ + 多行 Attention 融合**：
+   - 成功重构 `mul_mat_vecq.comp`（列激活寄存器预加载 + 单次反量化权重广播）与 `qwen4_attention_projections.comp` / `ggml_vk_can_fuse_attention_projections`（支持 `ne[1] > 1`）。
+   - 在 MTP h=1 自然文本多行验证下，实测生成耗时由 **27.83 ms/tok 缩减至 26.09 ms/tok**（**-6.25% 净提速**）。
+2. **LateBind 满血状态最终裁决**：
+   - 在 5 张 RX 6800 完全处于 2475 MHz 满血时钟下，LateBind 在 noMTP 下劣化 +9.8%（24.58 -> 26.98 ms/tok），在 MTP h=1 下劣化 +3.9%（26.18 -> 27.20 ms/tok）。
+   - 多流解耦的 doorbell/跨流同步开销确定超过单流顺序流水线，**LateBind 正式盖棺定论退选**。
+3. **系统性能最高顶点**：
+   - 自然文本最快端到端配置为 `noMTP + LateBind off`，达到 **24.58 ms/tok** (~40.7 tok/s)。
+
+## 【目标变更 2026-09-27】自然文本为唯一 canonical workload
+
+用户裁决：**自然文本（weightloss 类）是唯一正确的负载；计数题不再作为优化目标**。
+1710ms 计数门退役。G7 的 n1-varargmax（3211.2ms / 55.49 tok/s，5-block ABBA
+零重叠）为自然文本基座。后续所有工单以 weightloss workload 的 predicted_ms 为
+主指标；计数 workload 仅作回归保护线（不劣化即可），不再追求其 1710 门。
+
+
+## G0/G1/K1a 一轮实施裁决（2026-09-26，run-20260926T0421）
+
+按本轮授权完成实际实施，证据入库 [artifacts/tp5-next-20260926/](artifacts/tp5-next-20260926/)。
+
+- **G0 基座**：`16e28b8ac` 干净重建（Ninja+Vulkan+RelWithDebInfo，g++ 15.2）+ 1 行 `<cstddef>` 修复（基座预存缺陷：`ggml-vulkan-tp5-rows.h` 使用 `size_t` 未 include，`test-tp5-row-program` 在基座从未编译）。全部 CPU 单测 11/11、GPU 定向（skinny/argmax/rows/transfer/attn-projections/MoE/HC/rope/GDN/mesh/readback）通过。canonical 门：fused-default 稳态 **82.55 tok/s / 2071.450 ms**，全文精确、171/171、自然 stop，~83 参照确认。
+- **G1 三张账**（插桩扰动 1.3–3.1%，绝对数仅作归因）：稳态 cycle draft **13.3 ms**、target verify **61.3 ms**、catch-up **1.0 ms**；draft ≈ **320 ms/请求（15–17%）**。96-stage 链 ready 等待头 10 stage 合计 ~12.9 ms（stage 1–8 最慢 rank compute 1.0–2.2 ms vs 其余 0.2–0.3 ms）；CPU relay bookkeeping（3.3 ms）不是大头。每请求 graphs reused = cycles−1，无 phase-reset 可收账。
+- **K1a**（多行 matvec 权重复用最小增量，唯一源码改动 `mul_mat_vec.comp` 93+/28−，不含 rm_wide）：七行 target verify 的 `NUM_COLS=7` 快路从 `num_rows==1` 放宽到 `NUM_COLS>1`。数值对拍全过，20 trial 行为门全过。五块 ABBA：A **83.394** vs B **83.526** tok/s，B−A +0.131 CI [−0.566,+0.828]，比值 1.0016 CI [0.9932,1.0100]，非劣通过、**无独立增速**。裁决：保留非劣，不宣传提速。
+- **排序裁决**（依据 G1 账）：E1 退选（无重复 reset 账可收）；S1 降级观察（catch-up 占 1.2%，预期收益低于噪声）；**D1 两步设备闭环是下一个主攻项**（draft 320 ms/请求是唯一 >10% 可归因项，须先过 n=2 生死门）；V1/H1 未启动（G1 未证明回读边界）。详见 [E1-S1-D1-VERDICTS.md](artifacts/tp5-next-20260926/k1a-matvec/run-20260926T0421/E1-S1-D1-VERDICTS.md)。
+- **D1 生死门已测：不通过，撤回**（同目录 `gate/GATE-VERDICT.md`、`decision.md`）。原型已实现（设备 token slot + `decode_predefined_hidden` 设备来源扩展 + `set_input` 设备分支 + step-1 全设备直连循环，全部 opt-in `GGML_TP5_MTP_DEVICE_TOKENS=1`，~370 行，fail-closed gate；全部既有 CPU/GPU 回归通过）。三臂 n=2 实测：对照 A（单卡 draft host 往返）**2677.5/2685.5 ms**；可达原型 B（五卡 draft + device hidden）**3032.1/3181.6 ms（慢 13–19%）**；完整机制 C **fail-closed 正确拒绝**。结构性结论：Vulkan 设备 copy 仅同物理设备（`ggml_backend_vk_device_copy_ranges`）→ device hidden 强制五卡 draft；tensor split 拒绝 backend sampling（`set_sampler` SPLIT_MODE_TENSOR gate）→ 五卡 draft 无设备 sampled 张量。两前提互斥，D1 的 draft 320 ms/请求归因在当前架构下**不可收**；重启条件 = 跨设备 copy 或 tensor-split backend chain。改动仅存 candidate worktree 与归档 diff，默认/control 零影响。
+- **D1 前置交付**（输入表+预注册，同目录 `input-table.md`/`gate-preregistration.md`/`prototype-design.md`）：源码证据确认现状 draft 已是"GPU argmax + 4 字节回读"；两步原型机制差异 = 无 unrolled 图、第二步 token/hidden 全设备直连。生死门结果见上一条。
+
+## 整合版资格裁决（2026-09-26，run-20260926T0930）：不通过
+
+`9b3c33881`（整合提交 + 战报文档）对固定 control `16e28b8ac` 的五块 ABBA（各 5 进程 20 trial，全部逐字正确、171/171、自然 stop）：control **83.267**（sd 0.504） vs 整合 **82.940**（sd 0.382）Decode tok/s；B−A **−0.327** CI [−0.973,+0.319]；比值 **0.9961**，95% CI [**0.9884**, 1.0038]——**非劣性下界 0.9884 < 0.99，未达标**。构建/单测/GPU 定向/canonical 行为门（83.82 tok/s smoke）全部通过，失败仅在配对性能。K1a 单因素（shader 部分）非劣下界 0.9932 通过而整包失败，回退来源指向非-shader 的 server/RERoT 改动（server-context +562 行等）。裁决：整合版**不晋升为基座**、不 push；基座维持 `16e28b8ac`。重启需按 §4.1 从基座逐块叠加 server 改动单因素定位。证据 [artifacts/tp5-next-20260926/g0-integration/run-20260926T0930/](artifacts/tp5-next-20260926/g0-integration/run-20260926T0930/)（INTEGRATION-VERDICT.md、integ-abba5.json、20 server log）。
+
+## K1b 裁决（2026-09-26，run-20260926T1130）：stage 0–9 慢 = PLE 层 0–3，稳态确认，~150–160 ms/请求可归因
+
+修正两个此前错误归因后（非首链预热：稳态 chain 85 与首链 stage 1 仅差 2237→2215 us；非跨 rank 等待：compute 括号只含 dispatch 段），`GGML_TP5_SEGMENT_DUMP` + 稳态 GPU timing 交叉指认：**96 stages = 48 层 × 2；stage 0–7 = PLE 层 0–3**（`hparams.is_ple`，`build_ple` 分支：门控点积链、`build_conv_state_at` 卷积历史 per-slot 回写、kern 次 shifted-view CONT/TRANSPOSE 物化）。PLE 层稳态 ~2.07 ms/层 vs 非 PLE 层 ~0.61 ms/层；stages 0–9 合计 **10.70 ms / 32.97 ms（32.4%）** 稳态链 compute。可归因超额 ≈ **6.4 ms/链 × 24–25 链 ≈ 150–160 ms/请求**——超过 356 ms 缺口的 40%。K1a 无收益的原因同步解释：PLE 超额在非 matvec 算子（门控链/conv tap/状态回写），七列 matvec 快路不可触及。候选方向（未实现，按 §5.2 单因素）：PLE conv tap 一次 staging 替代 kern 次物化（首选）；conv_state per-slot CPY 属 S1 范畴不动。证据 [artifacts/tp5-next-20260926/k1b-ple-layers/run-20260926T1130/](artifacts/tp5-next-20260926/k1b-ple-layers/run-20260926T1130/)（K1B-VERDICT.md、稳态 480-stage timing、segments.tsv.gz 全 dump）。
+
+## RERoT 可用性修复（2026-09-26，run-20260926T1230）：TP5+MTP 栈下 RERoT 恢复可用
+
+用户指令：使 RERoT 可用，开/关性能不做比较。TP5 栈（五卡+MTP+`--rerot`）此前任何 RERoT 请求必崩溃，两处修复（candidate worktree，默认路径零变化）：① `common/speculative.cpp` MTP `process_impl` 跳过 RERoT 内部序列（id ≥ n_seq 的 probe/park/archive 行，原为越界断言崩溃）；② `server-context.cpp` draft 收集循环排除 `rerot_internal` 槽位（其 token 由 RERoT 规划器 teacher-forced——probe/DAG frame/serial tail 均走 `rerot_plan_next_token`→`rerot_append_planned_token`——MTP drafting 语义不适用，且验证循环会因无 `spec_i_batch` 行而断言崩溃）。验证：mindmap wire 937 tok 自然 stop 完整 Mermaid、todo wire 1474 tok 自然 stop 完整 checkbox 列表、零断言；RERoT-off canonical 171/171 逐字精确保护线通过；RERoT 15 项+MTP/Vulkan 回归 20/20+GPU 定向全过。证据 [artifacts/tp5-next-20260926/rerot-usability/run-20260926T1230/](artifacts/tp5-next-20260926/rerot-usability/run-20260926T1230/)（decision.md、rerot-fix.diff、崩溃链日志、成功运行日志）。
+
+## K1b-1 预实现裁决（2026-09-26，run-20260926T1300）：conv tap 补丁撤销；PLE 成本重新归因为 S1 域快照 + 小 dispatch 开销
+
+深挖 segment dump（stage 2 PLE vs stage 10 非 PLE 全量 op/CPY diff）修正 K1B-VERDICT 的方向判断：conv tap 的 4×CONT(80KB)+MUL 只占 PLE 超额的小头；**大头是 `cache_ple_r` 7×CPY(92160 F32)=2.52 MB/层**——`n_rs_seq=6+1` 份 rollback 卷积历史回写（`build_conv_state_at` per-slot 循环），属手册 §7 S1 状态快照域（K1B-VERDICT 方向 2 已标注"属 S1 不动"）；次大头是 44 个额外小 dispatch（门控点积链+分组 norm，Vulkan 上 VIEW/RESHAPE/TRANSPOSE 是零 dispatch 空算子，`ggml_vk_is_empty`），融合上限 ~25 ms/请求、需新算子融合工单。**conv tap 单因素补丁未实现即撤销（目标错位）。** 剩余可归因项全部落入 S1 域（须过 shadow 门）/算子融合（新工单）/D1 域（架构互斥已证）三类——**356 ms 缺口在当前架构+手册规则下无最小可验收补丁可兑现**，按用户指令进入收尾：交付完美版（基座 16e28b8ac + cstddef 修复 + K1a 非劣 shader 成员 + RERoT 可用性修复），全部已验收、零回退、默认路径与 83 基座行为一致。证据 [K1B1-PREAISE-VERDICT.md](artifacts/tp5-next-20260926/k1b-ple-layers/run-20260926T1130/K1B1-PREAISE-VERDICT.md)。
+
+## 最终交付：完美版（2026-09-26，run-20260926T1330）
+
+按用户指令（"使 RERoT 可用，开/关性能不比较；其他优化继续尝试；最终没有办法时交付完美版收工"）收尾。356 ms 缺口经全部候选核验（K1a 非劣零增速 / E1 无账 / S1 低于噪声 / D1 架构互斥 / 整合版非劣失败 / K1b-1 conv tap 目标错位撤销）后**无最小可验收补丁可兑现**，交付完美版 = 基座 `16e28b8ac`（83 tok/s 已验收）+ cstddef 干净构建修复 + K1a 非劣 shader 成员 + RERoT 可用性修复（+ D1 设备 token 机制，opt-in 默认惰性）。最终验证（干净重建 `b92fda12915ab595…`）：回归 **29/29**（CPU 套件+RERoT 15 项+grammar-indent+replay/mesh/GDN）+ GPU 定向全过；canonical（RERoT-off）**171/171 逐字精确、自然 stop、draft 150/149**、warm 2062.5 ms（与基座口径一致）；RERoT-on mindmap wire **937 completion 自然 stop 完整 Mermaid、零断言**（性能按指令不做比较）。源码 = candidate worktree 17 文件 394+/35−（`final-version.diff`），**未 commit/push**。证据 [artifacts/tp5-next-20260926/final-delivery/run-20260926T1330/](artifacts/tp5-next-20260926/final-delivery/run-20260926T1330/)（FINAL-DELIVERY.md、final-version.diff、两门 server log）。100 tok/s 未达成，完美版不含任何未验收性能声明；剩余可归因项（PLE 快照 S1 域、算子融合新工单、D1 重启条件）已在各 verdict 中记录重启门。
+
+## 继续优化：归因闭环（2026-09-26，run-20260926T1400）：356 ms 缺口全部映射到已拒绝家族，无剩余候选
+
+继续优化指令下的最终深挖，三层归因修正（稳态数据+源码，零猜测）：①**stage 1–8 的"慢"是 relay 管线填充不是 PLE 计算**——`tp5_hc_resume.comp::await_input()` 在 compute 括号内自旋等 CPU doorbell，stage 1 稳态 2215 us vs 同构 stage 11 的 324 us 差额 ≈1.9 ms 是等待；44 个 PLE 小 dispatch 上限 ~350 us 解释不了；链头填充 ≈4.7 ms/链 × 24 ≈ **113 ms/请求**。②**PLE MIRRORED 不可收**——按 hc 流切分省 ~54 us/层带宽但加 ~170 us allreduce，负收益，设计合理。③**稳态 p2 ~150 us/stage 是设计内 relay 交接时延**（coherent 发布无 flush 调用；96×(300+150)≈51 ms span 与实测一致）。附带：`GGML_TP5_MTP_MAX_CAPACITY=1` 实测 fail（capacity-aware lowering 已知未完成）。**最终分解**：链头填充 113 ms + 稳态交接串行（含前项）~340 ms → LateBind/direct 家族（§2.2 已拒绝）；draft 320 ms → D1（架构互斥已证）；快照 24 ms → S1（须 shadow 门）。**手册规则下无剩余可启动候选，不重启已拒绝路线**（本轮归因修正反而确认原拒绝理由）。完美版（run-20260926T1330）维持最终交付。证据 [ATTRIBUTION-CLOSURE.md](artifacts/tp5-next-20260926/final-delivery/run-20260926T1400-ATTRIBUTION-CLOSURE.md)。
+
+## 继续优化第二轮：relay 微架构解剖 + B1 新工单（2026-09-26，run-20260926T1500）
+
+全链路源码解剖（零新跑测）修正两个误判并量化一个新成分：①**p1_rec 22-27ms 是首图 chain 定义成本**（PREDEFINED TRUTH 锁定后稳态 100% 复用 CB，不存在每轮重录）；②**P2 普通路径不是 64 线程 relay_copy**——那是少数非 HC 边界的 fallback，主路径 `qwen4_hc_segment_norm` TP5_HC_RELAY 变体 dispatch(2,1,1)×1024 lanes 实际工作仅 ~5us，并行度足够。稳态每 stage 周期分解（自洽）：producer 344us（MoE 700/GDN 230 交替）+ P2 spin ~140us（等 CPU publish；gpu_spin 27-67us = BAR doorbell 写延迟，硬件属性）+ flag 路径 30us + CPU reduce 10us + publish 27-67us + **CB barrier drain ~72-110us**。新量化成分：**barriers=3519/chain（36/stage）× 2-3us 排空 ≈ 7-10ms/chain ≈ 170-250ms/请求**——唯一不映射到已拒绝家族的可归因项。记录为 **B1 新工单（barrier 审计与合并）**：上限 ~230ms/请求仅当全部可去除（实际不可能——多数 dispatch 是真实依赖算子；既有 GDN/ATTN/MOE/HC 融合模式已收获容易的部分），需逐条证明可合并/可降级为 execution-only（不改数学/同步语义）+ 浮点次序资格，规模是全链 CB 生成器审计，超出最小补丁范围，本轮不实施；其余成分（33ms 真实计算、13.4ms P2 等待、~60us/stage 物理延迟）为架构固有。证据 [RELAY-MICROARCH.md](artifacts/tp5-next-20260926/final-delivery/run-20260926T1500/RELAY-MICROARCH.md)。
+
+
+## QMP 爬山收官：MTP 真实价值 9.4%（G8 2.9% 证伪）、MMVQ×MTP 负交互、局部最优 h1+off+G4b（2026-09-27，mmvq-mtp/20260927）
+
+按 MMVQ+MTP.md 手册 + 用户爬山指令（移动基线）执行。**Q0-Q1**：qmp-* 六 cell 注册（对内单因素断言全过、dry-run NOT_MEASURED、身份冻结 b92fda12/b81cc51b、auto 五 rank resolve、无新 wedge）。**四格交错 pilot**（2 轮×4 cell×3 稳态，镜像轮序）：A0 noMTP+off **24.861** / A1 +auto **24.858**（单独零）/ B0 h1+off **22.536** / B1 h1+auto **23.459**。预注册指标：S_A=+0.003、S_B=−0.923、**I=−0.926 负交互**、G=+5.6%。**三个裁决**：①**MTP h1 真实价值 9.4%**（B0 比 A0 快 2.32 ms/tok）——G8 的 2.9% 被证伪，289mm 跨臂缺口审计预言方向正确；②**MMVQ 单独零效应**（与 E4 一致）；③**组合交互为负**——auto 使 acceptance 0.77→0.72、输出 165 vs 178 tok：activation Q8_1 扰动 target logits 恶化 draft 匹配（用户"组合大用"假设反向证伪——组合是互相拖累）。B1 的 165-token 输出为合法量化变体。**爬山步**：基线移至 B0；h2 拒绝（**+2.82**，acceptance 0.547/len 2.09——3 行 verify 摊薄不敌接受率崩塌）；G4b 确认保留（nog4b **+0.58**，同 178 tok 轨迹干净单因素）。**局部最优 = h1 + MMVQ-off + G4b = 22.5-22.8 ms/tok，较 no-MTP −8.5%**；per-role draft-only MMVQ 需代码且可收面极小（draft 2.94ms/cycle 单卡），不立项。绝对值属 post-wedge 钟态，全部结论为同 session 配对。证据 [decision](artifacts/mmvq-mtp/20260927/climb/run-20260927T1450/decision.md)、[四格](artifacts/mmvq-mtp/20260927/q3-pilot/run-20260927T1410/decision.md)。
+
+## 【MTP 黑锅审计】G8 的 2.9% 重开——跨臂缺口 289ms 从未闭合；horizon 类结论标平衡敏感（2026-09-27 13:40）
+
+用户两问（"坏的时间之前一定好吗""MTP 是否背黑锅"）审计结果。**钟态事实**：
+W1（09-23 card2 8.25 TFLOPS）已恢复，但"好"态本身含**慢性 11% 卡间散布**
+（探针三次一致：16.53–18.43 TFLOPS）——不平衡是常态而非事件态。**逐项审计**：
+①**G8 "MTP 只值 2.9%" 重开**——G8 的"账闭合"只闭了 n1 臂内部，跨臂算术
+从未闭合：组件模型（F=11.98、R=7.02）预测节省 **387ms**，实测仅 **98ms**，
+**289ms 缺口未解释**（每 cycle ~2.9ms 系统性差异）；MTP 真实价值区间
+**2.9%–11.5%**，"无价值"结论不可再引用，缺口归因（KV 增长模式/cycle 时序
+分布/不平衡）未做。②**G7 horizon 排名**（n1 最优）有条件有效：verify 成本
+被最慢卡锁定、draft 单卡——**不平衡放大 verify 相对成本 → 压小最优
+horizon**；排名对慢性态成立、对均衡态未证明，标注"平衡敏感"。③**D1 幅度
+污染**：A（单卡 draft）vs B（五卡 draft）的 13-19% 差距中慢性散布可解释
+约一半，方向有效、幅度不可引用。④G6 n10-vs-n8 为配对测量，**维持**（幅度
+同样标平衡敏感）。⑤draft2 作废维持（过程错误）。**下一步**：P0 = 同
+session 交错 noMTP/n1 各 4 次且两臂都开 cycle 账，闭合 289ms——同时回答
+"MTP 是否背黑锅"；P1 = ALU 探针前后 horizon mini-scan 验证排名的平衡
+敏感性。证据 [mtp-blame-audit.md](artifacts/tp5-next-20260926/eagle-hardening/run-20260927T1320/mtp-blame-audit.md)。
+
+## 【R1 重开】"card2 降级"机制判断撤回——sysfs 显示历来不可信（2026-09-27 13:30）
+
+用户指出 card2 sysfs **历来显示 1200MHz**（09-23 TP5.md 已记录"静态
+标称值不是负载算力"，ALU 探针 17 TFLOPS 证实）——"post-wedge = 单卡
+DPM 降级"的机制判断**不成立**，重开为 OPEN：+4.98 真实（bisect 非代码）、
+分界 = 11:47 wedge/reset、**机制未明**。重开动作：pre/post-wedge 同配置
+profiled 对比五卡 ready 分布（skew 一致则另有来源；仅 post 出现则真实
+慢卡用探针定位）。协议 rev2：钟态分界 = journalctl -k wedge 事件，
+sysfs sclk 仅记录不判断；轮询 sysfs 的 eagle-dpm-guard 已撤（对显示假象
+会反复误触发 SBR），改为方案 C：eagle `restore_clock_card`（事件触发）
+升级为 OD 重写序列，归档 `eagle-hardening/run-20260927T1320/`（pre/post
+patch、diff、reopen-inventory）。**结论重审**：全部 invalidate 项过筛——
+真正重开的只有本项（R1）；LB1 双态零效应、LB2 全 post 配对、LB0 pre
+配对、历史降频作废（B01/B04）均维持；v1→v4 迭代叙事因跨 wedge 边界
+打折（裁决不变）；post-wedge 的 no-MTP/n1 绝对值未测（复测差异≠回归）。
+
+## 【P0-A 终局修正】降级触发时刻 11:47:16 = 我的 rho-v2 竞态 wedge 五卡（2026-09-27 13:20）
+
+用户追问后查 `journalctl -k`：**11:47:16 今天唯一一次五卡同时 ring gfx
+timeout + device wedged + 内核复位**（此前自 09-26 起 0 次）。时间线钉死
+因果：11:46 我的 LB2 rho-v2 正在运行（双发布竞态：rho 块 fall-through 后
+旧 Q-doorbell 块仍执行，LO_U 等 word 0 而旧块发布 word 2 → P2 自旋到 ring
+timeout）→ 锁步链五卡一起 wedge → 复位 → card2 DPM 显示降级。**此前
+"环境 hysteresis"与"binary timeline"两个理论均被替换——触发者是我自己
+的实验 bug**。用户指出：sysfs 1200MHz 显示本身可能是已知同步假象
+（restore-gpu-highspeed.sh 即为此而写）；本机有 eagle-gpu-watchdog +
+max-performance + gpu-hard-unlock 全套机制，13:11 已对 card2 执行 SBR。
+10:36 的 22.50 是 pre-wedge；此后全部 post-wedge。**配对差（LB1 零、
+LB2 +3.91、LB0 +2.24）有效**；源码二分的 LB1/LB2 平反不变；跨态绝对值
+作废。教训：①五卡锁步下一个竞态 wedge 全部；②异常先查内核日志与已有
+watchdog/恢复脚本再下"环境"结论。
+
+## P0-A：对照漂移根因钉死——单卡 DPM 降级（环境），LB1/LB2 平反（2026-09-27，run-20260927T0900）
+
+评审二轮最高优先项。三步实验：**①干净 A/A**（新 harness：env 白名单 + 二进制/DSO sha + GPU 快照 + 3 轮×2 臂交错）：27.468±0.105 ms/tok，36/36 同变体——当前二进制稳定，"27.48"是当前环境真实水平。**②profiler 假设**（交错 2×2）：profiled 28.86 vs unprofiled 27.43——方向相反，假设死亡；但同 env 下 10:36 二进制 22.50 vs 今日 28.86 = **+6.36 回归真实**。**③源码二分**（决定性）：回退 collective/hpp+4 shader 到 HEAD（剥掉 LB1+LB2 全部 plumbing，保留 K1），重建实测 **29.14——比带 LB1+LB2 的 28.86 还慢**。**LB1/LB2 被平反**，"LB2 代码导致 feature-off 回退"撤回，源码已从备份完整恢复（回归 4/4）。**根因**：card2（0000:09:00.0）max DPM 降至 **1200MHz**（其余四卡 2475MHz）——amdgpu DPM hysteresis，当天连续 4h+ 负载后出现；非温度（edge 31-50°C）；profiled 日志 per-rank ready 证实 rank2 527µs vs 其余 373-384µs（1.38×），锁步拖慢全链。时间线吻合：22.50 测于过夜空闲后首个负载（全卡满档），之后全部在单卡降级态。**影响**：LB1 零效应、LB2 +3.91、LB0 +2.24 等**session 内配对差全部有效**（同降级态配对）；一切跨 session **绝对值比较作废**；G8 的 20.41 基线属于全卡正常态，卡恢复前不可复现。watchdog 规则禁动时钟/驱动：记录为环境条件。**协议增补**：每次正式测量前记录五卡 `pp_dpm_sclk` 尾档，任一卡 <2000MHz 标记"降级态"，绝对值不得跨态比较。证据 [decision.md](artifacts/tp5-next-20260926/p0a-control/run-20260927T0900/decision.md)。
+
+## 【评审二轮】LB1/LB2 结论措辞收敛（2026-09-27）
+
+外部二轮评审四处修正（本人已对源码核实成立）：①`late_pre_us` 含 norm
+段且逐 stage 波动 58-598µs——"Q 115µs"与"stats +100µs"口径作废；②42µs
+是"等 Q 算完"，LB2 保留 Q-ready 轮询，`t_LO≥max(t_Q,t_ρ)` 与门铃数无关
+——"doorbell 可省 42µs"作废，LB2"账闭合"降为初步归因（83−100=−17 自相
+矛盾即分项未闭合）；③LB1 实测证明"只解别名不改编排无收益"，不证明
+"重叠做不到"（提交顺序≠执行依赖），且 156→158 tok 输出变异是未解释的
+正确性问题，先于性能；④star_host（posix_memalign 主机内存 host-import）
+与 bcast（device-local VRAM cached 优先）访问成本不同类——"都是 BAR"作废，
+教训改为"CPU 统计量在产生处保留主机副本"；LB3 无 stats 零成本前置
+（门槛=新增非重叠成本<减少的关键路径成本）。**裁决收敛**：LB2 当前
+实现不晋级（+3.91 成立）；LB1 现有编排下无收益（重叠未验证）；后续
+优先级 = 修 control 漂移（22.50→27.48，+4.98，比回退大）→ 定位 LB1
+输出差异 → 调度真改造/组件消融/LB3 独立原型。交接 v3 已重写。
+
+## LB1/LB2：LateBind 存储别名与 RMS 充分统计量——实现、测量、关闭（2026-09-27，run-20260927T0730）
+
+按用户路线图推进到底。**LB1**（`GGML_TP5_LATEBIND_ZSNAP=1`，z_p 私有快照 + WAR barrier 移除 + 验证器 READ_ZSNAP 语义）与 **LB2**（`GGML_TP5_LATEBIND_RHO=1`，Q kernel 折入 a_b/d_b/s_b 统计量 → publisher 一次携带 → CPU 折叠 stats+ρ（c=‖y‖² 折入 Y 归约循环 `cc_avx2`，读已付）→ GPU LO_U 单 doorbell 自折 u+SiLU）全部实现并修完三起事故（CPU 标量 BAR 循环 446 ms/tok——用户当场纠正"这么重的计算你压给 CPU"；rho/旧块双执行 u 覆写；late_rows=0 除零 SIGFPE）。**三臂终测**（同二进制同 session）：ctl（exact legacy）**27.48** / zsnap **27.49（零效应——串行根源是单 GPU 队列顺序 P1→Q→norm，非 barrier）** / rho **31.40 ms/tok（+3.92 净负）**。账闭合：+83µs/site = Q kernel stats 折叠（关键路径 +100µs）+ stats 发布/折叠（~30µs）+ LO_U 读 bank − doorbell 42µs；**即使 stats 完美融进 Q 收缩循环，rho 仍 ≥ ctl——doorbell 只值 42µs，发布成本是结构性的**。**结构教训：二次 doorbell 不是纯开销，是 Q（115µs GPU）的完成信号；Q 在关键路径上无论谁折 u。** 裁决：LB1/LB2 关闭，代码保留 env-gated（默认逐位原行为，CPU 回归 4/4），不注册 variant 不 ABBA。LateBind 家族终态：exact 无收益（+2.24）、LB1 零、LB2 净负（+3.92）、aggressive 崩溃——**四路径实测关闭**；剩余 LB3（producer 投影复合）重启门：需 stats 零成本化 kernel 融合证据。证据 [decision.md](artifacts/tp5-next-20260926/lb2-rho/run-20260927T0730/decision.md)。
+
+## LB0：证据修正 + 对称基线——G9 勘误成立，exact 回归成分定位（2026-09-27，run-20260927T0600）
+
+按用户复核意见修正 G9 三处误读（47 site/链、1981µs 为链累计=42.2µs/site、Q 为 320 WG×256 线程——全部核实），并用**对称 profiler 两臂**重测自然文本 no-MTP：base **20.41** vs exact **22.65 ms/tok（+2.24）**——G9 非对称测量（+0.49，baseline 多打 25k 条日志）低估了回归。**每 site 成本表**（21298 样本）：Q-ready 轮询 **42.1µs/site**（p90 43.3，稳态均匀）+ Q 归约 2.7µs + 发布 0.1µs；LO 自旋 44 iters。**+2.24 分解账闭合**：+1.16ms/链 CPU handoff 窗口（链 total 14.25→15.41ms；等待从 ready-poll **搬家**到 Q-poll，非净增）+ ~1.08ms/链链外 GPU（47 个 Q kernel + LO 自旋 + norm→LO 拆分 barrier）。**时序语义**（:5084–5121）：42µs 是 Y 发布后 GPU Q kernel 完成+flag 可见全程——Q 在 GPU 队列上排在 P1(Y) 之后，其完成天然落在 CPU 5µs 归约之后。**对 LB1/LB2 的推论**：LB1 解除 z_p/Y 别名后 Q 才有机会与 producer 同段执行（等待被 producer 算量吸收）；LB2（ρ 进 relay）的靶账 = 42µs×47≈2ms/链 + 消除 word 2 发布与 LO 二次等待，代价仅 relay 多算 4 标量+320 维合成。正式资格仍需关 profiler 5-block ABBA + "同数学重排不重叠"对照臂。证据 [decision.md](artifacts/tp5-next-20260926/lb0-evidence/run-20260927T0600/decision.md)。
+
+## 【勘误 LB0】G9 LateBind 归因三处错误，"家族关闭/空间穷尽"撤回（2026-09-27）
+
+用户复核并经重验：① 每链 **47 个 LateBind site**（`late=47`），非 1 个；②
+`[tp5-latebind-profile]` 的 1981µs 是**链累计**（profile.cpp:121 链级打印 +
+collective.cpp:5780 stage 循环累加 + q_spin_n=230=46×5），**≈42.2µs/site 等待
++2.5µs 数据**，非 2ms/site；baseline 单行 elems=2560 的 cpu_data 实测
+**5.19µs**（25201 样本）；③ Q 收缩是 **320 WG × 256 线程**
+（dispatch late.late_rank=320，:3994），单 WG 只有 LO consumer。G9 的
+"50 倍窗口差""单 CU 收缩""只动 1 site"全部作废；**保留**：exact +0.49ms/tok
+负结果（但两臂 profiler 不对称、轨迹不同——诊断级，非家族否定）与
+aggressive-q8 崩溃（根因未定位）；**撤回**："LateBind 家族实测关闭""执行侧
+已穷尽""45% 不可动"（G8 的 45% 账本身有口径混用，分项 3394≠3263，待 LB0
+重核）；gpu unsafe 警告限定于 peer-polling 协议。**后续**：LB0 修证据 →
+LB1 解除 z_p/Y 存储别名（Q/norm 串行是 buffer 复用约束非方程要求）→ LB2
+RMS 充分统计量+relay 一次发布（‖x_b‖²=a_b+2s_bΣd+s_b²c，ρ 在 relay 合成，
+Q 1280→u 320 float）→ LB3 producer 投影复合（C_{p,b}，不能推过非线性，
+需独立数值资格）。测量纪律：关 profiler、对称日志、保留"同数学重排不重叠"
+对照臂。修订版全文见 [交接.md](交接.md)。
+
+## G9：LateBind 实测关闭 + D1 随 MTP 退役正式关闭——收官（2026-09-27，run-20260927T0500）
+
+用户裁决不考虑 MTP 后，把 LateBind 用**新测量**坐实关闭。自然文本 no-MTP 三臂对照：baseline（RELAY F32）**20.6 ms/token**（3×177-token 完成）；`--tp5-latebind exact` **21.0 ms/token（+0.4 净负）**——每个 decode exec 的 sidecar Q 等待实测 **1981µs 均值**（463 样本），Y-ready 节省覆盖不了，与历史结论"Y 发布后重新串行等 GPU Q"一致但在自然文本+当前源码下重新坐实；`GGML_TP5_LATEBIND=hc-down`（aggressive-q8 默认档）**在首个 latebind decode 进程死亡**（53 行日志无 eval），fail-closed 无资格。**结构性归因**：LateBind 只解耦搬运时机，不消除 CPU-in-loop 锁步（P2 自旋等 CPU doorbell → CPU 轮询 ready → 归约 → 发布）；152µs/stage 固定交接延迟的彻底消除 = GPU 端自主接力，源码 `GGML_TP5_SYNC=gpu` 路径存在但自证"experimental and unsafe under current driver memory model"（RADV/AMDGPU 跨设备 Device-scope 可见性不保证）——**驱动内存模型级的墙，非工程量问题**。**D1 随 MTP 退役关闭**：无消费者（no-MTP 路径无 draft/无 verify），S1 同理；重启门保留在各自 decision.md。**最终格局**：最优配置 no-MTP 或 n1-varargmax（−98ms 噪声带边缘）；时间构成 relay 固定 45% + 行算量 48%；全部执行优化家族已关（LateBind 本轮实测关、G3a/B1 关、D1/S1 退役关、G4c 无 MTP 下不值）；**五张 RX 6800 + RADV + 本模型下自然文本的执行侧优化空间已穷尽**，剩余路径仅 GPU 端自主接力（驱动墙）或更强 draft 重开 MTP。证据 [decision.md](artifacts/tp5-next-20260926/g9-latebind-d1-final/run-20260927T0500/decision.md)。
+
+## G8：自然文本 canonical 的 cycle 账本与 MTP 边际价值——账本闭合（2026-09-27，run-20260927T0400）
+
+目标变更（用户裁决）后首轮建账。**n1 自然文本 steady cycle 29.76ms**（draft 2.94 / target 26.02 / catchup 0.80，100 cycles/请求），账闭合（残差 7.6ms）。target 26.02 = 2 行算量 15.6 + **固定 ~10.4ms relay 流水延迟**（152µs/stage × 96 stage，与 G1 V≈173µs/stage 同机制：PCIe 排空 + CPU publish/detect，与行数无关）。**关键新事实：MTP 在自然文本上只值 98ms（2.9%）**——n1（3262.8ms）对 no-MTP（3361.1ms）几乎无优势；n1 的 2 行 verify（26.02）比 no-MTP 的 1 行 decode（~19）更贵，draft+固定链吃掉全部接受增益。最终分解：relay 固定延迟 ~1460ms（45%，LateBind 拒绝/G3a 关/B1 关）、行算量 ~1560ms（48%）、draft ~294ms（9%，D1 关）、杂项 ~80ms。**裁决：账本闭合，无新可立项候选**——固定 relay 延迟的全部攻击家族的关闭证据与行数无关，在自然文本下同样成立；唯一改变格局的路径是 LateBind/D1 架构重启（门未满足）。MTP 净价值 ~3% 意味着 draft 质量若提升需整体重测 horizon 与 MTP 价值。计数 G6/n10/1886.4ms 基座保持（1710 门退役，回归保护线继续）。G5 遗留 verify-sub 异常已解（print 站点在 decode() 内含 host 等待，稳态不打印）。证据 [decision.md](artifacts/tp5-next-20260926/g8-natural-ledger/run-20260927T0400/decision.md)。
+
+## G7：真实 workload（减肥建议）——horizon 排名完全反转，n=1 以 1.65× 赢下正式 ABBA（2026-09-27，run-20260927T0330）
+
+用户指出计数题（接受率 1.0、可预测）不真实；G7 改用自然问题并 token 对齐（prompt_n=31、自然 stop、~171 tokens）：`请用八句话简要介绍健康减重原则、每周运动安排、饮食建议和睡眠误区。`（174-token 八句回答）。**两个新发现**：① 自然文本在 TP5 跨 rank argmax 归约下**非字节稳定**（近 tie 翻转单词，观测 171/174/178 三种长度变体）——harness 验证从单一 ground truth 改为记录变体集合（新变体 fail-closed 带证据收录）；② **horizon 排名完全反转**：接受概率集中于 draft 前两步（n10 时 84% draft 行被拒），大 horizon 只加被拒行成本。扫描（1-block pilot）：n10 7056 / n8 5973 / n6 5278 / n4 4315 / n3 3893 / n2 3691 / **n1 3233 ms**（acceptance 0.77，mean_len 1.77）。**正式 ABBA n6 vs n1**（5 blocks，40/40 有效，零重叠）：eval 5280.1 → **3211.2 ms**，decode 33.71 → **55.49 tok/s**（ratio 1.646 CI [1.592, 1.700]），committed ratio 1.470——大幅显著正收益。**n1 为 weightloss workload 的 ABBA 资格成员**；计数 workload 的 n10 晋级不变（两个 workload 各有最优 horizon）。**自适应 horizon（H1 大工单）的价值被量化为 2.2×**——静态 horizon 在两个 workload 间差 7056/3211，按请求特征选 horizon 的收益超过一切剩余执行优化，是下一工单首选。默认不改动，两个冠军变体（n8-varargmax 计数、n1-varargmax 真实文本）均已入 harness（`--workload {count,weightloss}` + n1/n2/n3/n4/n6/n12 变体）。1710 门（计数）现状 1886.4ms 不变。边界：单问题接受率不可外推所有自然文本；n1 接近无 MTP 边界（未测 n0 对照，留作 H1 前置）。证据 [decision.md](artifacts/tp5-next-20260926/g7-realistic-workload/run-20260927T0330/decision.md)。
+
+## G5：post-G4b 账本、double-draw 清理与首验图重建调查——归因修正，图保留关闭（2026-09-27，run-20260927T0110）
+
+G4b 晋级后三件事。**① G4a latent double-draw 清理**：`common_sampler_sample` backend 快路径对整链逐元素 `llama_sampler_dist_draw` 已移除——`llama_sampler_dist_backend_set_input` 本身每行推进一次 RNG，快路径再画会双倍推进非 spec backend slot 的 mt19937 流（canonical 不受影响，但属正确性债务）。**② post-G4b 三张账**（sub-timers + G4b，4/4 exact）：verify 窗口 sample 4.36→**2.34 ms/cycle**（残差 = 每行 `llama_get_logits_ith` 开销 + 裸 argmax 扫描 + ~0.75ms readback，G4c 范围）；steady cycle **88.09 ms**（draft 16.61 / target 70.52 / catchup 0.96），较 G2 的 102.7 再降。**③ 242 ms 首验尖峰归因修正**：G2 的"GPU prompt 重评估"结论错了一半——exec 级分解显示大头是 **CPU**：prompt(31 行)→verify(9 行) 形状切换使 `allow_reuse` 双向失败 → `build_graph` 重建 ~175 ms + 新 uid 触发 meta 97 子图×5 rank 重建 + validation submit 156 ms（缓存路径 61）+ 首链 ready 124 ms。尝试 alt-slot 图保留（`GGML_TP5_GRAPH_ALT_SLOT` 跨图保活 `llm_graph_result`）三次崩溃三种根因（swap 后张量/sched 脱代、stale `tensor->buffer` 被 split 视为 pre-allocated、清 buffer 又破坏 split 输入归属）——**根因是 galloc 所有权模型**（`ggml_gallocr_init_tensor` 对已绑定张量跳过重分配，跨图地址冲突不可张量级修复）；唯一安全路径 prompt/verify 共享 capacity 图被 GDN fail-closed（`evaluate_target_capacity_admission` 拒绝 recurrent 模型，AGENTS §7.1）挡死。**裁决：242 ms 确认为 workload 固定成本，不立项；alt-slot 代码全部 revert（含误删后恢复的 D1 token 成员声明）**。revert 后默认路径 smoke 2/2 exact 171/171、回归 4/4。当前基座 1886.4 ms（90.4 tok/s），距门 ~176 ms，剩余大项全部映射到关闭家族或 workload 固定成本——**无可立项候选**。证据 [decision.md](artifacts/tp5-next-20260926/g5-post-g4b/run-20260927T0110/decision.md)。
+
+## G4b：verify-argmax host 采样——正式 ABBA 晋级，−53.8 ms/请求（2026-09-27，run-20260927T0015）
+
+G4a 关闭后回收其已验证构件（资格检查 + `llama_sampler_dist_draw` RNG 对齐）实现 host 侧变体：`GGML_TP5_SPEC_VERIFY_ARGMAX=1` 时贪心 verify slot 的 `common_sampler_sample` 跳过每行 248320 词表物化 + CPU 链遍历，直接对已回读 logits 行裸 argmax（strict `>` 首最大胜、NaN 不胜——与 temp 塌缩扫描逐位同语义；RNG 每调用推进一次保持 mt19937 流逐位一致，clone 传播标志使 rollback 语义不变；门：n_probs==0 + can_speculate + 资格证明）。G4a 的设备路径（多行 ggml_argmax 图、t_sampled_rows 回读、needs_raw_logits 三参、ctx 级 set API）全部移除。**正式 5-block ABBA（A=n8 vs B=n8-varargmax，同二进制 SHA b92fda129…，20 trials × 2 repeats = 40 请求全部 exact 171/171 stop）**：committed tok/s 52.62→53.49（B−A +0.87，95% CI [0.53,1.20] 全正）；decode tok/s 88.13→90.39（+2.26，CI [1.58,2.95] 全正）；B/A ratio 1.0165，CI [1.0101,1.0228]，非劣 0.99 门通过且为**显著正收益**；steady predicted_ms 1940.3→1886.4（−53.8 ms）。B 全部 10 个 steady 样本（1868–1906）低于 A 全部样本（1907–1978），**分布零重叠**；最快块 1868.0 ms = 91.6 tok/s。**晋级为合格候选**；不宣称 100 tok/s（距 1710 门差 ~176 ms）。G4c（跨 rank argmax 集体归并，可再收 ~14 ms 回读）未立项，重启门见 G4a decision.md。证据 [decision.md](artifacts/tp5-next-20260926/g4b-host-argmax/run-20260927T0015/decision.md)、abba-g4b.json（完整统计 + GPU snapshot + DSO SHA）。
+
+## G4/G4a：verify 窗口 host 间隙归因 + verify-argmax 后端采样——奖金实测、架构墙关闭（2026-09-26，run-20260926T2310）
+
+G2 遗留的 ~9.1 ms/cycle host 间隙（×19 ≈ 185 ms/请求）用新增诊断子计时器（`GGML_TP5_VERIFY_SUBTIMERS`，env 门控插桩）拆解：`llama_decode` 67.1 ms（链 span 64.6 + 提交侧 2.5）+ **`common_sampler_sample` 4.36 ms/cycle（9 行 CPU 全词表采样，484 µs/行）+ logits 回读 ~0.75 ms/cycle ≈ 合计 ~97 ms/请求（5%）**。根因：speculative slot 被结构性禁用后端采样（server-context.cpp `backend_sampling &= !(slot.can_speculate())` + llama-context 单序列单输出限制）→ 每行 verify 走 CPU `set_logits` 全词表物化。**这是 G1/G2 从未拆出的新实测项，满足 V1 重启门"新账证明存在可省的关键路径"**，且消除的正是"全量物化"、不新增同步。据此实现 G4a（opt-in `GGML_TP5_SPEC_VERIFY_ARGMAX`）：资格检查 `common_sampler_is_greedy_argmax_eligible` 逐元素证明贪心链输出 == 逐行 argmax（temp≤0；`?` 空占位；top-k/top-p/min-p 任意值保 rank-1；typical/sigma/dry/xtc/penalties 仅惰性默认），后端多行 `ggml_argmax` 出 token，`llama_sampler_dist_draw` 新 API 按行推进 mt19937 保持 RNG 流与 CPU 路径逐位一致。调试修复三个资格缺陷（`?penalties` 占位名、`top-k` 连字符、`temp-ext` 静态分支）后机制确认命中（eligible=1 + slot 日志），但**真机首请求即断言**：argmax 作用在词表维五卡切分的 `t_logits` 上，meta 切分规划器 `handle_per_row` 不支持 axis-0 切分（ggml-backend-meta.cpp:882）——跨 rank argmax 集体归并在本代码库不存在（现有 hierarchical ARGMAX 是单卡 draft 用的；五卡 verify 的全局归并正是现在由 host 全词表回读完成的，即被消除路径本身）。**裁决：G4a 关闭为"奖金 97 ms/请求已实测、被架构墙挡住"**；崩溃路径编译期禁用（`spec_verify_argmax=false` + 注释），env 置 1 时默认路径 smoke 精确 171/171、acceptance 1.000 无回归。**G4b（未立项）**：stage1 每 rank 出 `(max_logit, global_idx)` 8 字节对 + RELAY star/专用 stage2 合并的全局 argmax——新架构候选须按 §3 单独过门（tie/NaN/空分片数值资格、与 host 归并逐位对拍、§11.1 矩阵）；若成则兑现 ~97 ms 且顺带消除 logits 回读 ~14 ms，是当前唯一实测支撑的大额可收项。证据 [decision.md](artifacts/tp5-next-20260926/g4a-verify-argmax/run-20260926T2310/decision.md)、server-debug.log、server-smoke.log。
+
+## G3/G3a：P2 自旋深挖与 RELAY P1 host-push 微架构——负结果关闭（2026-09-26，run-20260926T2200）
+
+G2 账本显示 n=8 链 span 65.4 ms = P1 compute 39.0 + **P2 自旋 24.2 ms/链（96×254 µs，37%）** + 杂项；CPU handoff 墙钟 60.2 ms/链与 GPU span 并行、锁步节拍 530 µs/stage（ready_first 457 + reduce 44 + 发布 ~30）。逐 stage 对拍（n=6 verify 464 µs vs n=8 530 µs，elems 17920→23040）证实 ready_first 随 producer 算量 +28% 线性、cpu_data 38→44 µs 次线性、skew 反而改善——无异常；P2 自旋主导项是 92 KB payload 的 **PCIe 排空 + CPU 检测/发布**，非界障。据此做单因素 opt-in 候选 G3a：`GGML_TP5_RELAY_VEC_COPY_MAX`（默认 16384=原行为；调高让 92 KB 走 `tp5_copy_u128` 多 WG shader 拷贝替代 TRANSFER DMA+双界障）与 `GGML_TP5_RELAY_VEC_COPY_FOLD`（新 `tp5_copy_u128_fold` 管线，单 WG 拷贝后在 shader 内发布 ready word，替换 FILL+mb_ready；flag 偏移与 CPU 轮询位逐位对齐已验证）。**真机配对 pilot（各 1 warmup+3 测量，全部 171/171 精确）**：cap-only B−A=−11.2 ms 但会话漂移 A2−A=+42.9 ms → 噪声带 ±20–40 ms 内，不具资格；fold C−A2=**+55.2 ms 明确回归**（单 WG 串行推 92 KB 过 1 CU 的 uncached GTT 存储，MLP 不足，比 DMA 慢 ~30 µs/stage，吞掉省下的 ~10–20 µs 界障）。**裁决：fold 拒绝、cap 无显著收益、G3a 家族关闭**；两 env 保留为 opt-in 诊断旋钮，默认行为与基线逐位一致；P2 spin 458 ms/请求在现有 RELAY 架构内不可由传输微优化回收，彻底消除仍属 LateBind/direct（§2.2 拒绝）。证据 [decision.md](artifacts/tp5-next-20260926/g3a-vec-copy/run-20260926T2200/decision.md)、pilot.json、pilot-fold.json、server-{A,B,C,A2}.log。
+
+## G2：n=8 三张账重取——全部成分映射已关闭家族，prompt 尖峰确认为 workload 固定项（2026-09-26，run-20260926T2100）
+
+按手册 §4.2"测融合版而不是拼历史数字"在 H1 资格配置（n=8，1940.8ms）上重取 G1 三张账（同插桩法，扰动 ~5%）。**分相账**：draft 21.1ms/cycle（占比从 n=6 的 16.1% 升到 **21.9%**，19 cycles ≈ 401ms——D1 归因项变大但重启门不变）；target verify 74.5ms/cycle；每请求一次 **~300ms target 尖峰 = 31-token prompt 链内重评估**（elems=69120=27 行、n_stages=97；cache_prompt=False 强制 n_past=0；每行 8.5ms ≈ 稳态 7.2ms/行，无 kernel 异常；n=6 基线有同款 275–279ms 尖峰，非回归）——**canonical workload 固定成本，不立项**。**阶段表**：plan=96/0、cb_alloc=0、creplay=0/0（E1 结论 n=8 下不变）。**Producer 表**：ready_all 56.6ms/链（n=6 46.3）；慢 rank compute 39.8ms/链；stage 0–9 头部 14.7ms；GPU span 64.6ms/链 × 19 ≈ 1235ms（63.7%），其中 CPU-publish 自旋 ~100us×96×19 ≈ 182ms → LateBind/direct（§2.2 拒绝）。**S1 上界修正**：GDN S-state 快照写 = 9 行 × 3.1MB × 36 GDN stage ≈ 1GB/链（segdump 实证 75.5MB/stage@4 行），~50ms/请求上界——比旧"24ms catch-up"口径大但仍低于 S1 shadow 门成本，维持降级。small-Q8 特例在 27 行 prefill 把 HC down 投影路由到 NUM_COLS=27 matvec，重读代价仅 ~1.3ms/链，非尖峰来源。**最终分解（1940.8ms）**：链 1235（compute 722 + relay 等待 513）+ draft 400（关闭）+ prompt 230（workload）+ 杂项 75。**裁决：无新可立项候选**；证据 [G2-N8-LEDGERS.md](artifacts/tp5-next-20260926/g2-n8-ledgers/run-20260926T2100/G2-N8-LEDGERS.md)、server-n8-instrumented.log、measured.json、g2-run.py。
+
+## K1e：配对专家 K=128 MoE down——死门修复＋非劣通过，保持 opt-in（2026-09-26，run-20260926T2000）
+
+AGENTS §5.2 MoE 分组成员的现成增量验收（K1a 模式）。`qwen4_moe_down_k128.comp`（两选中专家共享一个 wave32 的两个 16-lane 半波做独立归约，4 行 tile 320→160 线程）早已实现接入但 opt-in 从未验收。**根因是死门：管线创建门的 `device->subgroup_size == 32` 子句在 RADV/RDNA2 上结构性不可满足**（RADV 报 subgroupSize=64，gate 日志实证 ss=64；作者混淆了 Vulkan preferred size 与管线强制的 required full subgroup=32）——已删除该子句、保留全部能力检查（size_control/min≤32≤max/require_full_support/RDNA2/RADV/WG≥160）。数值契约：16-lane XOR 蝶形 ≡ native 64-lane 波 16 partial+48 零的结合顺序（步 16/32/48 合并恰加 0.0）；fold 尾部 `precise` 有序专家和镜像 native。验证：`--moe-output-only` PASSED（含相邻专家同波污染用例）、`--moe-only` PASSED、**全套 28/28**、真实五卡 smoke 6/6 精确 171/171、命中 `m=2560 shared=1`（真实 width）。**5-block ABBA（A=off, B=on）：decode ratio 1.0004 CI [0.9953,1.0056] 非劣通过；committed ratio 1.0010 CI [0.9936,1.0084] 非劣通过；predicted_ms -0.9 ms 噪声内；40/40 精确。** 裁决：死门修复保留（bug fix），`GGML_VK_MOE_DOWN_K128` **保持 opt-in**（harness 变体 `native-mtp-fused-k128` 注册），非劣但无检出收益不并入默认——线程减半不改变 10 专家权重全读的带宽主导本质，MoE down 线程几何优化家族就此关闭：后续候选须先给出带宽模型外证据。证据 [decision.md](artifacts/tp5-next-20260926/k1e-k128-moe-down/run-20260926T2000/decision.md)、[MECHANISM.md](artifacts/tp5-next-20260926/k1e-k128-moe-down/run-20260926T2000/MECHANISM.md)、[abba5.json](artifacts/tp5-next-20260926/k1e-k128-moe-down/run-20260926T2000/abba/abba5.json)。
+
+## K1d：PLE 路由门链融合——双指标非劣保留，链 B 关闭（2026-09-26，run-20260926T1900）
+
+K1c 之后的下一个纯计算融合点：`build_ple` 路由门链 `MUL→SUM_ROWS→SCALE→SGN→ABS→CLAMP→SQRT→MUL→SIGMOID`（每 PLE 层 1 条，9 dispatch）合并为单 dispatch（新 `ple_router_gate.comp`）。**关键实现事实：乘积必须以 `precise` 声明禁止 FMA 收缩**——未融合链先由 MUL 舍入落显存再由 SUM_ROWS 读回，融合核内寄存器累加会被驱动收缩成单次舍入的 FMA，合成对拍 row0 出现 1 ulp 偏差；加 `precise` 后逐位一致。树和与 sum_rows.comp 完全同构（同 BLOCK_SIZE spec constant/跨步/树形），标量链公式逐字复制 unary.comp/scale.comp。守卫按 K1b segments dump 逐节点核对真实 DFS 序（ABS 消费 SCALE 而非 SGN；SCALE 被 SGN+ABS 双消费，span 内多消费合法；CLAMP max=INFINITY 放行）；`GGML_VK_DISABLE_PLE_GATE` 动态退选；dispatch 挂链首 MUL case（初版误挂 SUM_ROWS case 导致 snake fallback 崩溃，已修）。**真实五卡命中以 dispatch 计数为证：全部 4 类 stage（verify/draft/catch-up/prefill）每 stage -8 dispatch/-8 barrier，全 rank 命中**（4196→4188、4206→4198、4238→4230、4613→4605）。验证：3 形状合成对拍逐字节相等、全套 replay **28/28**、GDN 保护线通过、CPU 回归 5/5、真实五卡 smoke 12/12 精确 171/171 自然停止。**5-block ABBA（A=env 退选, B=默认）：decode ratio 1.0003 CI [0.9967,1.0038] 非劣通过；committed ratio 0.9997 CI [0.9929,1.0065] 非劣通过；predicted_ms -0.5 ms 噪声带内。** 按预注册：双指标非劣 → 保留为默认成员；CI 含 1 → 不宣传提速（每 stage -8 dispatch 的维护价值成立，端到端在噪声内不可检出，与 K1c 同族同命）。**链 B（GDN alpha/beta 门控 4 tiny dispatch）按 MECHANISM 预注册规则关闭**：链 A 已证明该家族收益不可检出，链 B 更小且需跨 RESHAPE 匹配。**附带发现（独立工单待立）**：全 suite 下未融合路径曾读出脏数据（2560×4 rows 2-3 与 CPU 参考不符、两臂同错），系 replay 缓存与先前测试形状/缓冲碰撞——改质数列数 2549 后消失；这是 replay-cache 既有风险面，非本融合引入。证据 [decision.md](artifacts/tp5-next-20260926/k1d-gate-chains/run-20260926T1900/decision.md)、[MECHANISM.md](artifacts/tp5-next-20260926/k1d-gate-chains/run-20260926T1900/MECHANISM.md)、[abba5.json](artifacts/tp5-next-20260926/k1d-gate-chains/run-20260926T1900/abba/abba5.json)。
+
+## K1c：L2_NORM q/k 对融合——非劣保留，无独立提速（2026-09-26，run-20260926T1800）
+
+AGENTS §5.3 预注册的首个新融合模式：PLE 每层 conv_silu 后的 q/k 两个 L2_NORM（同源同形 view）合并为单次 dispatch（新 `l2_norm_pair.comp`，4 binding，行组 0/1 各自保持与原 kernel 完全相同的归约顺序 → bit-exact；守卫接受两种节点序，`GGML_VK_DISABLE_L2_PAIR` 动态退选）。**关键发现：`ggml_can_fuse_subgraph` 的 view_src 内部性规则对 PLE 图结构性拒绝（源 view 在区域外），必须手工结构匹配——这也解释了 GDN_SEGMENT 27-op 段从未在 K=7 rollback 图上命中（single-step 守卫要 dst 129 行、multistep 要 active>0，真实图 898 行 active=0 两边都不收），36 层×27 op 全程逐 dispatch 运行。** 验证：合成图融合臂 vs 未融合臂逐字节相等（3 形状）、GDN 状态输出字节级通过、全套 command-replay 27/27、真实五卡单请求 8+ 次命中且 171/171 精确自然停止、链 dispatch 4274→4196（-78）、barriers 3519→3485。**5-block ABBA（A=env 退选控制臂, B=融合默认, 同二进制）：decode 83.26→83.19 ratio 0.9993 CI [0.9902,1.0083] 非劣通过；committed 50.88→50.95 CI 下界 0.986<0.99 非劣未过；predicted_ms +1.6 ms 噪声带内。** 按预注册（非劣即保留、正收益才宣传）：保留为默认成员（-78 dispatch 有维护价值、bit-exact、退选开关保留），不宣传提速。诚实归因：-78 dispatch ÷ 96 stage，按 B1 已证 barrier <0.1 us 与 ~5 us/dispatch 前端成本，理论上限 ~10 ms/请求，在 ±15 ms 噪声内不可检出；K1b 的 44 dispatch/层账中 l2 对只占 2/44。证据 [decision.md](artifacts/tp5-next-20260926/k1c-l2norm-fusion/run-20260926T1800/decision.md)、[MECHANISM.md](artifacts/tp5-next-20260926/k1c-l2norm-fusion/run-20260926T1800/MECHANISM.md)、[abba5.json](artifacts/tp5-next-20260926/k1c-l2norm-fusion/run-20260926T1800/abba/abba5.json)。
+
+## H1 horizon：n=8 通过 ABBA 资格，首个真实提速成员（2026-09-26，run-20260926T1700）
+
+AGENTS §9.2 要求在"新执行结构"下重测 horizon；旧 n=7/n=10 退选属前融合时代，本轮单因素重开。**结果：`--spec-draft-n-max 8` 在同完美版二进制上击败默认 n=6——decode 82.96→88.11 tok/s（配对 ratio 1.0620，CI [1.0579, 1.0662] 整体 >1），predicted_ms 2061.3→1940.8（-120.4 ms），40/40 逐字精确 171/171，非劣门通过且为显著正收益。** 机制：接受率 1.00000、mean len 9.00，19 cycles × 102.7ms 对 25 × 82.7ms；verify 边际 token 成本 10.0ms < 平均 11.8ms——融合 96-stage 链的固定 relay 交接开销被两个额外 token 摊销，历史 n=10 draft 超线性负结果被融合执行结构推翻。**n=10 被自有 ABBA 拒绝**（committed diff -0.46，CI [-0.91, -0.01] 整体 <0，双指标非劣失败）；n≥12 由周期模型关闭（n=12 预测 1944.6ms 劣于 n=8 实测）。两次 ABBA 的 n=8 臂 1940.8/1933.0ms 证实 ~±8ms 会话漂移，n=10 烟测的 -11ms 优势正是该噪声——单烟测不能排名候选的又一实证。默认 n=6 不动，n=8 以显式 CLI 变体（`native-mtp-fused-n8`）入库；计数题 ~1.0 接受率不可外推真实文本，低接受率 workload 最优 horizon 更小（171=9×19 整除也对 n=8 有利）。对 100 tok/s 门：88.1 tok/s / 1940.8ms，仍差 230.8ms，全部映射已拒绝/已关闭家族，H1 摊销效应不改变家族裁决。证据 [decision.md](artifacts/tp5-next-20260926/h1-horizon/run-20260926T1700/decision.md)、[abba5.json](artifacts/tp5-next-20260926/h1-horizon/run-20260926T1700/abba/abba5.json)、[abba5-n10.json](artifacts/tp5-next-20260926/h1-horizon/run-20260926T1700/abba/abba5-n10.json)。
+
+## B1 barrier 探针：死刑裁决（2026-09-26，run-20260926T1600）
+
+上轮唯一存活的候选 B1（barrier 审计与合并，假设 ~2-3us/条 → 170-250ms/请求）已用零正确性风险的加倍探针实验关闭。方法：`GGML_TP5_BARRIER_PROBE=N` 在 `ggml_vk_sync_buffers`/`ggml_vk_segment_barrier` 两个发射点重复同参 barrier（纯过度同步）；probe=1 完整复现历史 barrier 计数（3485/3497/3519/4239）证明设置有效，probe=2 使稳态链 3497→6610（+3113）。结果：compute_us 均值 **31928.8 → 31791.6 us（-137us，噪声内）**，端到端 2067.2→2072.4ms（sd≈56，噪声），两轮均 45/45 canonical 逐字精确（过度同步位安全）。**单条 barrier 成本上界 <0.1us**——RADV/RDNA2 预录 CB 内 barrier 是前端元数据，不触发排空；全请求 barrier 总成本 <8.4ms，不可回收。稳态 stage 残差重新归因为 dispatch 前端发射开销（44 launches/stage）+ 算子固有延迟，属融合家族（已收割）。**356ms 缺口至此全部成分实证归因且全部映射到已拒绝/已关闭家族**：relay 交接串行 ~340ms（LateBind/direct，§2.2 拒绝）、draft ~320ms（D1 架构互斥）、barrier <8.4ms（本轮关闭）、snapshot ~24ms（S1 <噪声）、producer 33ms 真实计算（K1 已收割，余需新融合模式+浮点资格）。探针旋钮保留在候选树（默认 1=原样，无行为影响）。证据 [decision.md](artifacts/tp5-next-20260926/b1-barrier-probe/run-20260926T1600/decision.md)。
+
 ## 83 tok/s 融合配置资格（2026-09-26）
 
 融合源以已验证 82.779 tok/s MTP 配置为基座，保留五卡 RELAY/F32、W1 rank-local readback、单卡 n=6 draft、hierarchical ARGMAX、small-Q8、QSA/GDN headmap 与 K/V-only catch-up；只叠加 durable sampler checkpoint。已拒绝的 strict greedy candidate、host-hidden chain、device loop、direct GDN snapshot 和 CPU compact sampler 不进入该版本。

@@ -1,5 +1,47 @@
 # MMVQ + MTP：组合效应验证与实施手册
 
+> 当前统一入口是 [PERFORMANCE.md](PERFORMANCE.md)。本文件保留各轮实验原文；旧状态、旧 selector 说明与旧命令须对照当前源码，不再单独作为执行总纲。
+
+## 2026-10-08 全配置修复进行中
+
+目标为修复全部八种 LateBind 家族、三种 MMVQ 策略及 MTP/连续请求/相位交互；质量门继续作为错误探测，不把拒绝配置过滤掉当作完成。10-07 的搜索与无显著新加速判决只描述当时的合格子集。
+
+实际五卡固定前缀观察已抓到 Q ready 后载荷仍变化，现 exact publisher 和全部 Q8DOT 共用当前 epoch、live extent、payload xor 校验，匹配前不消费；L2 原 statistics tag 保留。新 extent 门还截住真实两行 legacy 链只折叠一行 Q 的错误：CPU `late_count=1280`，而 `5120/2560=2` 行需要2560个Q值。修复按 stage 的实际 Y/HC width 推导行数，并为下一 bank 发布其自己的行数，不用无 frame 的单行默认值。
+
+七个 LateBind 模式修复后各80个真实生产服务固定前缀请求通过发布校验，每模式至少67,200次 rank/checkpoint 复读没有变化，均正常退出。随后 disabled/MMVQ + MTP1 的八模式48个连续真实请求、16个唯一输出全部通过独立语义检查，测量请求fallback=0，8次正常退出；旧失败家族未过滤。P1 owner/pool 失败清理另用生产方法、真实5/4 rank pending GPU写入证明：逻辑epoch0，free之后owner expired、已提交fence/payload正确，未提交rank未发信且未写入。范围不是任意driver故障或全部MMVQ/深度的性能资格。原 `1e-6` 数值门、2000ms交接和10s退出界限不放宽；诊断概率采样与 tracing 不参加排名。证据与源码契约见 `TP5.md` 同日节及 `/var/tmp/tp5-all-config-repair-20261007/`。
+
+auto/forced 的八模式各48个真实请求现也完成逐原始内容/SHA256/每配置hash coverage语义验收（分别18/17个唯一输出），全部自然规范EOS或连贯400预算保护输出、16次正常退出。合计MTP1的24组/144请求语义通过；forced测量期回退0，auto四个普通Q8变体各一次中文预算尾段回退，保留为待定位开销而非过滤条件。当前源码8项CPU/控制检查、6项五卡relay/rebind及28项单卡replay加scratch/MMVQ专测通过。深MTP/相位交互和配对性能尚未闭合，不把这些 smoke 分数宣布为最优或加速。
+
+## 历史：2026-10-07 合格子集搜索完成
+
+五张物理卡已恢复；真实模型 `off` 冷/暖逐字一致。验收发现 LateBind exact/aggressive 数值退化，生产 admission 对相同 offset/size 的不同存活 `VkBuffer` 错误放行；计划身份现包含实际 buffer。真实五卡重绑拒绝、两 bank/五 rank 与部分四 rank 的 pending native drain，以及修复后 exact/aggressive 自然 EOS 已通过。
+
+修复后当前源码的 `off`/L2 五卡门禁已通过：三提示 cold/warm 输出逐字节相同；L2 29 次链内 rho 对拍最大相对误差 `2.216e-7 < 1e-6`；L2 depth8 的 12 请求预热前缀 1..9，观测 219 个全拒绝周期，测量期回退为零；正 p_min 的真实单-token 路径观测 183 个无提案周期，正常退出。联合搜索及当前 server 的独立确认已完成，速度裁决见下文。证据工作目录：`/var/tmp/tp5-takeover-20261002/five-gpu-qualification-20261007T062454Z/`。选优主负载必须模板化关闭 thinking 并自然 EOS；开放式保护负载记录 EOS 或 400-token budget stop，不进入排名。下面 10-02 的硬件阻塞是历史记录。
+
+零前缀新请求的 MTP carry 残留现已另行修复：真实六请求被动观测，修复前复用 slot 的五请求各带 10,240 个非零 float，修复后六请求均为零；`off` 输出 hash 与 draft/accepted 计数不变。只清无保留前缀的该序列，不清其他 slot 或有效 cached prefix。预热本身没有运行 server 的 post-decode speculative process hook，首请求 carry 已为零；未添加无依据的全局 speculative reset。
+
+exact/A/AP 在当前 disabled-MMVQ、depth1 保护负载上拒绝晋级：英文保护输出重复空 `-` 行，或中文保护在空列表标记处自然 EOS。新增退化拒绝门保存完整失败输出，不删 tags、不重定义 EOS，也不把这些吞吐用于选优。语义复核覆盖 `off`/L2 的 8 个唯一输出及深度8的4个唯一输出，均连贯；拒绝配置留在搜索账本中，按不合格处理，协议失败或非正常退出仍中止整个搜索。fixed-input logits 差异只能证明观察到的偏差，不能直接归因于某个缓存、数学或同步缺陷。
+
+首轮66点后的 pack-once/auto/depth1 非正常退出另行处理：生产 POSIX 信号处理直接调用 shutdown，能重入被打断线程持有的队列锁。真实 CPU 复现及四项生产队列回归已验证修复；四个实际五卡 model teardown 均在原10秒内正常退出（0.815–2.468秒），冷/暖及修复前 off 输出相同。失败臂仍因英文空列表退化拒绝。续接只保留有原始输出、正常退出、相同七份 inference DSO 的既测探索点，明确记录 server-impl 退出修复的身份变化；最终性能必须由当前 binary 的独立配对块确认，不能把旧 screen 数字改名为当前确认。
+
+最终实际探索131个不同配置，覆盖125个预注册种子与6个额外邻域点；语义检查剔除17个机械门漏过的提前 EOS/空标题配置，包含两轮机械最高分。最终候选的15个单因素邻居全部覆盖，按2%筛选门槛收敛到 **LateBind off / MMVQ disabled / MTP depth1 / backend sampling on / p_min=0**，保留 KV-only 与 small-Q8-columns 默认开启。TP5/MMVQ 默认门控不变。
+
+四个当前 server 独立配对块：C/R=1.034315，95% CI [0.996803,1.073239]；**含1，没有显著净加速证据**。候选与原 disabled/off/depth1 基线 B 相同，不能把 C/B 波动当新配置收益。144个实际请求全部命中已语义复核的3个输出 hash，规范提示自然 EOS，实际8份 DSO 身份一致，三臂测量期 fallback=0、12次正常退出。各臂速度和方法见 `TP5.md` 首节。131点及邻域收敛只界定本轮实测空间，不证明数学全局最优；时钟与看门狗没有调整。
+
+完整账本 `joint-reviewed-opt/`，终局 `final-decision.json`；最终证据包路径 `artifacts/mmvq-mtp/run-20260928T1700/takeover-qualified-search-20261007.tar.gz`，包含原失败、资格、真实输出、身份与当前独立确认。
+
+## 2026-10-02 续接状态：源码已修，联合搜索未运行
+
+接手的 relay / prewarm 修正在主仓；完整规则与边界见 `TP5.md` 的同日接手节。旧 bank-only program 强用已换为单份完整定义契约 + 两 bank 程序，native 部分提交失败禁止 fallback；加载期执行单 token 和全部配置内验证前缀，两轮预热后清理 memory/sampler/perf 状态，不用“locked”日志冒充资格。
+
+当前源码构建、CPU 控制面与健康单卡 Vulkan replay 28/28、MMVQ 专测通过。**五卡实际 decode、L2 对拍、重复请求/相位切换及联合爬山仍未测：card3 / `0000:0c:00.0` 已掉总线，当前 binary 只见四张 RX 6800。** 不复用历史不同源码或空 lazy PLE 的性能账，也不把四卡结果作为 TP5 资格。
+
+续跑 harness 在证据包中的 `joint-search.py`：canonical weightloss 是唯一选优分数，旧 `如何减肥` 故障负载及英文问题是保护线，自然停止、temperature=0、seed=42、cache_prompt=false；五张物理 RX 6800 和鹰眼 gate 不通过就不提交实验。源码/DSO 命中和非 warmup fallback 逐请求留证，预注册四个独立配对块确认候选。**没有新性能数字或最优配置；爬山邻域收敛不等于全局最优证明。**
+
+证据：`artifacts/mmvq-mtp/run-20260928T1700/takeover-relay-prewarm-20261002.tar.gz`；当前可执行构建 `/var/tmp/tp5-takeover-build`。先由管理员恢复第五卡，随后依次执行 `smoke`、`probe`、`screen`、`confirm`；严禁恢复期间并行 GPU 实验或编译。
+
+---
+
 编写日期：2026-09-27。对象：五张 RX 6800、RADV、Qwen4EXP TP5、当前自然文本负载。
 
 状态：**PLAN / NOT RUN**。本次只写规划，没有运行组合实验，没有改生产代码、默认配置或 harness，没有 commit/push。
@@ -953,3 +995,197 @@ F32 GEMV；多行（h≥2）下量化成本随行数增长，与 §14 经济账�
 未测且不因此判死的：Q8_0 主导权重的模型、Intel/NVIDIA、h≥3 稳定重测、
 非 LateBind 布局、per-role 隔离（Q5 的独立策略）。IQ 专家类型本就不在
 MMVQ 支持表内。h=1 的 0.990 在 ±3-5% 会话漂移带内，正确表述是"未检出"。
+
+## 22. 2026-09-29 追加：F32 MTP 跨列复用（仅 N=4/15）
+
+详账见 `artifacts/mmvq-mtp/run-20260928T1700/decision.md` §51，原始数据见同目录
+`f32-mtp-shared-weight-20260929.tar.gz`。`mul_mat_vec.comp` 在 F32 单行、
+四列或十五列时只加载一次四元素权重，按原顺序逐列做 dot；其它尺寸仍走旧路径。
+RX 6800/RADV N=4/15 静态 instructions 2798→2635、9019→8382，VGPR 不变；
+对应同形状 GPU 图两个 64-query 中位从 35.00/35.08→32.92/32.84 µs、
+82.66/83.32→79.20/79.32 µs。F32 激活 CPU 数值对照 N=4 为 2/2、
+N=15 为 1/1；F16 激活用新旧 GPU 图逐字节对照（CPU backend 不支持此组合）。
+N=2、N=16 宽门控不成立，故没有推广。五卡 default/forced 均可运行，
+但跨模式输出、draft 接受数仍不同且测量有 replay fallback：**没有合格的
+五卡净收益或全硬件理论极限证明**。TP5 默认禁用 MMVQ 不变。
+
+## 23. 2026-09-29：鹰眼抢在硬件狗之前恢复（不移除硬件狗）
+
+card3 (`0000:0c:00.0`) 先报 `device lost from bus!`，原鹰眼误走 DPM-only，
+`pp_dpm_sclk` 返回 Remote I/O error，约十分钟后内核在 `drm_sched_job_arm`
+空指针 Oops 并进入 kdump。现有 `scripts/eagle-gpu-watchdog.sh` 对有明确 BDF 的
+掉总线事件和 `GPU Recovery Failed` 建立待恢复状态，停止在失效卡上反复写 DPM；
+默认等待驱动 **30 秒**，如观察到驱动自身 `GPU reset begin` 则给其 **90 秒**。
+后者从 `GPU reset begin` 起算，不从更早的掉卡日志起算，避免迟到的驱动复位
+被单卡 PCI helper 抢占。
+驱动仍未恢复时，只运行对应卡的 `gpu-hard-unlock.sh cardN`，上限 **120 秒**；
+只有该 helper 确实执行却失败、事故证据持久化成功且该卡 DRM/DPM 仍不可用时，
+才申请一次有 **24 小时持久防重启** 的有序整机重启。历史 kernel 日志无法建立
+单调游标时服务拒绝执行恢复，未归属 BDF 的错误也不触发复位。
+
+已用事故中真实 card3 日志在安装的鹰眼二进制上 dry-run 对拍：会选择 card3
+单卡 helper，不调用时钟专用 helper 或整机重启；shell/mock 测试覆盖驱动复位
+竞争、helper 失败、DPM 尚不可读、后来自愈和防重启循环。运行服务已重启且
+初始化新游标；`RuntimeWatchdogUSec` 与 `RebootWatchdogUSec` **仍为 10 分钟**，
+作为内核崩溃或有序停机卡住时的最后保护。无法保证物理掉卡时用户态先于内核
+Oops 得到调度，也不能把重启认作硬件故障修复。
+
+用户接受偶发故障下继续运行后，已恢复 GPU 排他锁保护的五卡同模式
+C–B–B–C，详见决策账 §52 与 `f32-mtp-guarded-cbbc-20260929.tar.gz`。
+四臂正文逐字节相同，pred=171、draft=130/235、测量期各一次 fallback；
+候选两臂 4364.061/3864.750 ms，旧 shader 两臂 3872.450/3882.872 ms。
+候选自身波动约 499 ms，**不能判断五卡净加速**。试验时未观察到新的内核
+掉总线日志，但一次运行成功不能证明硬件故障已消失；鹰眼和 IPMI 狗保持启用。
+
+## 24. Q8_0 短 K 双行路由（真实形状限定）
+
+决策账 §56、`q8-short-k-rows2-20260929.tar.gz`：RADV/RDNA2 原生 wave64 的
+Q8_0×Q8_1 `K=320,M=10240,N=2` 改用每 workgroup 两行，其它形状不变。
+真实 host CPU 数值对照 1/1，已核对新 ISA hash；不同 row/token 的独立 GPU
+图逐项匹配精确整数 oracle。四臂同步 query 中位为旧/新/新/旧
+35.00/28.36/28.46/35.12 µs；长 K 形状双行更慢，因此不推广。
+同模式 forced-MMVQ 五卡 C–B–B–C 输出、draft=129/233 和五 rank 账本一致，
+解码时间 4445.334/4256.507/4262.444/4300.040 ms，测量期各两次 fallback。
+**未证明服务净收益或全局理论最优**；TP5 默认禁用 MMVQ 不变。
+
+## 25. Q8_0 固定形状的静态指令裁剪
+
+决策账 §57、`q8-fixed-shape-isa-proof-20260930.tar.gz`：在 §56 精确路由上，
+把 K=320/M=10240 传入 specialization constant。先证明每 lane 仅零或一轮
+K 切片、每 workgroup 恰好两行，再删除不可达多轮/尾行代码；越界 guard 保留。
+只创建 pipeline 的 RADV 静态结果为 **1762→712→338 instructions**、
+**120→24→12 VMEM**，VGPR 始终 32，默认 specialization=0 的旧 ISA hash 不变。
+不同 Q8 尺度、三次输入、非零 view 图共 491,520 字节与旧版逐字节一致；
+相邻 M=10241 未走特例，额外 245,784 字节对拍一致，两个实际尺寸 CPU 对照通过。
+最终二进制五卡 MTP 烟测正文及 draft=129/233 与 §56 一致。
+**静态代码量不是动态执行量或速度比例；没有据此宣称服务加速或理论极致。**
+仍缺完整的 lane 利用率、物理读取及全路径最优证明。MMVQ 默认门控与双层看门狗不变。
+
+## 26. Q8_0 长 K 的完整四切片组
+
+决策账 §58、`q8-long-k-isa-proof-20260930.tar.gz`：RADV/RDNA2 wave64 的
+`K=10240,M=320,N=2` 保留单行，证明每 lane 恰有 20 切片、五组四轮，无余数；
+固定 K/M 后明确保留整组循环，删除两/一切片的不可达分支。
+只创建 pipeline 的静态 ISA **1198→393 instructions、88→26 VMEM**，VGPR 仍 32；
+通用和短 K ISA hash 不变。非单位尺度、三次输入及非零 view 图共 15,360 字节
+新旧一致；相邻 M=321 的 7704 字节对拍一致，两个 CPU 边界测试通过。
+新二进制五卡 MTP 请求正文和 draft=129/233 保持一致，未隐藏十次 fallback。
+**没有做速度比较，也没有以运行成功宣称服务加速或全局理论极致。**
+
+## 27. Q8_0 packed-load 对齐审查：不保留 raw alias 候选
+
+决策账 §59、`q8-packed-alignment-rejected-20260930.tar.gz`：34 字节块的
+八值切片交替对齐或偏移 2 字节，在对齐 dword 载入族内必然跨两个/三个字。
+raw alias 的初稿会在精确 34 字节单块尾部越界；改成最后半字读取后，
+768 个 bit 基向量与 5376 个切片源级 oracle 通过，但静态指令仍增加：
+短 K 338→356、长 K 393→418，VMEM 12→14、26→30，VGPR 不变。
+候选已撤回，未 dispatch GPU kernel、未进入产品库、未做速度测量。
+不能把 12 字节原生载入直接解释为 4 字节可消除 VRAM 流量或全局最优证明。
+
+## 28. Q8_0 固定形状的单 Y 批次偏移
+
+决策账 §60、`q8-single-batch-isa-proof-20260930.tar.gz`：从完整 host 谓词证明
+两个既有 N=2 固定形状只有一个 Y workgroup、base=0，将 a/b/d batch 偏移
+专门化为零；descriptor/view 偏移、列步长、累加和 replay 指纹不变。
+短 K 静态 instructions **338→238**，长 K **393→283**；VMEM、VGPR 和必要
+dot 数均不变，默认通用 ISA hash 不变。额外固定列步长候选已撤回。
+普通/ne[2] 外层双列、非零 view 和相邻 M 图共 **1,267,248 字节逐字节一致**，
+观察到 **20 次真实 replay hit**；永久 CPU 对照 **6/6**。默认 replay runner
+**26/26** 通过，但全局 forced runner 在 HC combine 原生参考比较失败
+（diff0.004761>tol0.000100），不把默认通过扩写为 forced 全路径资格。
+当前枚举四张 Vulkan 卡，没有新的五 rank 服务或性能测量；全局理论极致仍未证明。
+
+## 29. HC 原生 / forced-MMVQ 的参考契约归因
+
+决策账 §61、`hc-mmvq-native-contract-20260930.tar.gz`：原生 fused injection
+直接使用 F32 激活，通用 MMVQ 先做 Q8_1 再量化，两者不能普遍要求精确相等。
+独立算术 oracle 得到 scatter 差值 0.004770，与原失败 0.004761 的方向/幅度一致；
+4 字节 view 合法 fallback 的反向差值也由独立算术解释。
+统一改 F32 参考矩阵会使合法 MMVQ fallback 与另一种算术比较，候选已撤回。
+生产代码、原容差、MMVQ 策略均不改；恢复后原生 HC 烟测通过。
+默认 26/26 与 forced 全量未合格的证据边界不变，仍不开始性能测量。
+
+## 30. Q8_1 sumless：必须证明完整转换缓存生命周期
+
+决策账 §62、`q8-sum-cache-boundary-20260930.tar.gz`：Q8_0 不用 ds.y，
+但共享转换缓存可被 Q4_K/Q5_K 等 affine contraction 复用，当前 key 没有
+和字段有效状态。删和并沿用同一 key 不安全；改 pipeline 后强制完整重算
+也不普遍减少工作。Q4_0 的独立反例输出偏移为 256。
+仅从已舍入 F16 的 ds.x 补和也不精确：原尺度1.000399947、sum_q=3 时，
+原 ds.y=3.001953125，回算为3.0。未改生产 quantizer，也未做性能测量；
+接受 sumless 需完整 sum-reader 死亡证明或精确、无冗余转换的有效性迁移。
+
+## 31. 共享 scratch 失效修复与五卡 MTP 容量正确性
+
+决策账 §63、`mmvq-scratch-lifetime-and-mtp-capacity-20260930.tar.gz`：
+大 softmax reduction 与 FA mask bitmap 会覆盖共享 `prealloc_y`，原先同步后
+仍保留激活转换缓存标记。已在两个 writer 派发后清除 pipeline、tensor 与
+decode staging 标记，后续 MMVQ 必须重建转换；不改算术、容差或默认策略。
+用真正依赖中间 reduction 输出的第二权重复现，防止优化器把两个独立
+MMVQ 都移到 scratch 写入前。旧库永久回归退出 1（row0 期望 -0.004689、
+GPU 为 0），新库退出 0；独立 CPU contraction、变化输入及 replay 验证通过。
+五张物理 RX 6800 逐卡 `--scratch-reuse-only` 全部通过，默认 suite **27/27**。
+
+投影 fixture 覆盖 token 数 **1–5**：1/2/4 容量槽、三 token 使用容量四、
+五 token 的合法非融合回退；保留 Q5/成对 Q6/BF16、K/行尾与非零 view。
+先录制三 token 小图，再让四 token/K8192 图增长 scratch，最后以新输入
+replay 旧图，验证 descriptor 生命周期与实际 hit。五张物理卡的
+`--attention-mmvq-only` 均通过。投影 oracle 是独立原生 Vulkan 图，
+不是 CPU backend；原累加容差未放宽。这不是五 rank TP5 服务资格。
+
+主仓与候选源码一致，host SHA256 `70c9e36117a5b1265cf54a73a37601e276d15b75ab1a89a9f5f76bb3551b57cc`，
+测试 `c7cd747edd869cc8c554eeba1ba1cd29ff6a7c06255b864458ac1a08f379a330`。
+**进一步动态指令数优化已豁免；继续审查物理搬运、激活复用及融合回退。**
+没有新增性能测量，没有全局理论极致证明；全局 forced HC 数值契约边界不变，
+性能门控、默认 MMVQ 策略、鹰眼及 IPMI 狗均不变。
+
+## 32. 转换源原地写入也必须失效
+
+决策账 §64、`mmvq-source-mutation-cache-proof-20260930.tar.gz`：
+Y 未被覆盖不代表转换仍有效。同一个输入 tensor 被原地 MUL 改写后，
+旧缓存仍命中，三轮末端值分别只有精确 CPU 期望的 1/2、1/3、1/4。
+已在 graph recorder 的真正 writer 后检查源范围相交并清除转换缓存；
+复用既有 overlap 谓词，同范围写入也失效，不影响不相交的同 buffer 写入。
+没有增加 alias key 或弱化同步、replay 指纹及原算术契约。
+
+永久回归覆盖全范围、非零 view 起点的局部写入、三次变化输入及真实 replay；
+使用精确 dyadic 值，不依靠宽容差。旧库失败、新库通过。最终库五张物理卡的
+scratch/source-mutation 和 MTP 1–5 token fixture 均通过，默认 suite **28/28**。
+主仓与候选一致，host SHA256 `810389d075914f612b205d5fe4260df3d81fbc6cd257cca51347d9d2b981fe75`，
+测试 `2f3487ea7194a21b72a881751d213fb7573751a099fb28a0d1f3b120a814cde9`。
+`view_src` 是存储根，真实 writer 也沿用它；不能直接当作值版本来扩大复用。
+现有 Qwen4EXP 相邻投影已共享输入对象，没有据此虚构别名复用收益。
+
+## 33. row tile 与物理流量：静态资源不等于外存搬运
+
+决策账 §65、`q8-row-traffic-resource-boundary-20260930.tar.gz`：
+同一 K320/M10240/N2 SPIR-V 仅创建 row4/8/10/16 pipeline，不 dispatch。
+row4/8 仍为 32 VGPR、零 LDS/spill；row10/16 分别升至 40/56 VGPR。
+完整 workgroup 数降低，但独立权重仍为 **3,481,600 字节**；B 的布局
+footprint 仅 720 字节，其跨组重复不能直接算作 VRAM 读取。
+40/64 lane 的跨行打包还需要保持归约顺序的逆置换，并增加 B preload
+或 LDS/寄存器缓存，不能只以 lane 填满宣称搬运减少。
+**未切换已验证的 row2 路由；未做性能测量，未宣称硬件理论极致。**
+
+## 34. 性能测量：forced-MMVQ 与默认禁用打平
+
+决策账 §66、`mmvq-forced-vs-default-abba-20260930.tar.gz`：
+用户授权后首次测速（卡 3 掉总线重启后 5 卡就绪）。同一二进制 ABBA，
+LateBind off，R=TP5 配方注入的全局禁用（不是 auto），T=强制 MMVQ，
+各 8 块×3 有效请求，固定 prompt 与 seed，纯净环境持 GPU 锁。
+配对逐块 T/R ms/cyc 中位比 **1.0009，t-95% CI [0.9882, 1.0136] 含 1.0**，
+**在该 ms/cycle 代理指标上未发现统计显著差异**；不能据此证明具体成本恰好抵消。
+两臂会话内 fallback 总数相同，不足以判定测量阶段发生了什么或归因。
+输出和接受率不同；各臂确定性本身不是跨算术路径正确性证明。
+这比较的是同一优化后二进制的政策开关，不是优化前后的收益消融。
+**这是单模型单 prompt 的政策比较，不是全模型吞吐最优性证明。**
+
+### 更正：实际 MMVQ 派发与联合配置
+
+R 的 disabled 是 TP5 配方注入 `GGML_VK_DISABLE_MMVQ=1`，不是 auto 策略等于
+disabled；`GGML_VK_DISABLE_MMVQ=0` 才恢复 auto。五个 target backend 的
+`vulkan-region-policy` 实际记录证明：disabled 的 GDN/QSA mask 为 **0/0**，
+auto 为 **3/1**（Q5 整数，Q6 原生），forced 为 **7/5**（Q5/Q6 整数）。
+日志在成功派发后输出，三臂响应均有实际 draft；因此 auto 不是“没开成”，
+也不能把相似耗时当作回退证据。联合配置搜索以固定 128 token、两种 prompt、
+token/s 和独立配对确认作判定，ms/cycle 仅作辅助，不跨 draft 深度当主指标。

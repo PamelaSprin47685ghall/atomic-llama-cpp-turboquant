@@ -1,0 +1,88 @@
+{
+  "task": {
+    "description": "Autoregressive token generation for fixed Qwen3.8 Flash Next model (qwen4exp_tp5_af)",
+    "shards": 6,
+    "ranks": 5,
+    "hparams": {
+      "H": 2560,
+      "L": 48,
+      "R": 320,
+      "E": 512,
+      "K": 10
+    },
+    "timing_scope": "Steady-state decode phase per delivered public token; excludes prefill and cold setup",
+    "start_state": "Fixed prompt context H and KV/GDN cache state S at token boundary; stateful causal evolution without pre-solved answers"
+  },
+  "timing": {
+    "hardware_boundary": "Wall-clock time between the commitment of token n-1 and token n across all 5 RX 6800 ranks",
+    "latency_definition": "T(a) = infimum wall-clock elapsed time required by implementation a to produce the valid token distribution"
+  },
+  "start_state_causality": {
+    "prohibition_of_answer_caching": "Evaluation is over arbitrary prompt completions; caching precomputed output tokens trivially violates semantic generalization.",
+    "precomputation_displacement": "Moving prompt/state precomputation to S requires S to be strictly derived from the causal prefix. Offline weight transformations are allowed if within storage/initial fast capacity constraints, but cannot pre-evaluate inputs."
+  },
+  "quantifiers_and_families": {
+    "inf_over_allowed": "T* = inf { T(a) : a in A }, where A is the set of all mathematically correct implementations preserving quality/semantic contract.",
+    "branch_aggregation": {
+      "same_branch_resource_overlap": "T(a) >= max_k (W_k(a) / C_k) unless non-overlap is rigorously proved, in which case sum_k is permitted.",
+      "cross_branch_relaxation": "Global lower bound L_global = inf_{a in A} T(a) <= min_{family F} inf_{a in F} T(a). To prove L_global > c, one must prove T(a) > c for EVERY valid family F."
+    }
+  },
+  "implementation_families": {
+    "standard_tp_dense_read": {
+      "work_lower_bound": "W_mem >= distinct_required_weights. Stated as 4,614,087,680 bytes of unique encoded tensor data across the active path.",
+      "work_proof_status": "UNRESOLVED (as a universal lower bound; proved only for explicit tabular dense weight access without algorithmic compression/reconstruction).",
+      "capacity_source": "AMD Radeon RX 6800 peak theoretical bandwidth: 5 * 512 GB/s = 2560 GB/s (https://www.amd.com/en/products/graphics/desktops/radeon/6000-series/amd-radeon-rx-6800.html).",
+      "capacity_proof_status": "PROVED as theoretical peak envelope (not sustained measured ~390 GB/s).",
+      "status": "CONDITIONAL"
+    },
+    "fused_and_repartitioned_compute": {
+      "work_lower_bound": "Work depends on arithmetic complexity of attention/GDN/MoE projections. Replicated vs partitioned execution.",
+      "work_proof_status": "UNRESOLVED. E.g. f(x;W) replicated across 5 ranks requires 5x work; computing once and broadcasting changes work/comm trade-off.",
+      "capacity_source": "RX 6800 FP32 peak compute: 16.17 TFLOP/s per card = 80.85 TFLOP/s aggregate.",
+      "status": "UNRESOLVED"
+    },
+    "coordinate_partition_latebind_hc": {
+      "work_lower_bound": "In current LateBind, Q_b and rho_b are partitioned along coordinate axis R=320, requiring 4 streams * 320 floats communication.",
+      "work_proof_status": "UNRESOLVED as an information-theoretic necessity; it is an artifact of the specific coordinate-split low-rank residual projection.",
+      "capacity_source": "PCIe / Host relay / DMA-buf transfer bandwidth.",
+      "status": "UNRESOLVED"
+    },
+    "speculative_mtp": {
+      "work_lower_bound": "Amortized cost per public token: cycle_ms / k_accepted_tokens.",
+      "work_proof_status": "UNRESOLVED. Cannot bound below non-speculative step if speculative acceptance rate k > 1 amortizes cycle cost.",
+      "capacity_source": "Same underlying hardware resources.",
+      "status": "UNRESOLVED"
+    }
+  },
+  "unresolved_claims_and_missing_proofs": {
+    "claim_4x320_communication": {
+      "description": "Claim that 4x320 communication (or equivalent byte volume) is mandatory for LateBind HC fold.",
+      "counterexample_and_refutation": "The 4x320 payload is strictly tied to coordinate-wise partitioning of the low-rank intermediate (width R=320, 4 residual streams). An alternative implementation could compute the low-rank projection centrally on one rank after gathering intermediate scalar state, or project using an alternate orthogonal basis, or fuse the down-projection with the up-projection if weights/memory allow, requiring 0 cross-rank Q_b transmission.",
+      "status": "UNRESOLVED (Construction artifact, not information-theoretic cut-set lower bound)"
+    },
+    "claim_mandatory_weight_io": {
+      "description": "Claim that 4.614 GB (or 1.869 GB per-rank) must cross DRAM boundary every token.",
+      "counterexample_and_refutation": "Pigeonhole lemma only establishes max(0, U - C) bytes where C is initial fast capacity (SRAM/LDS/L1/L2/Infinity Cache). Furthermore, no proof exists that the trained matrix representations are incompressibly minimal in the information-theoretic sense.",
+      "status": "UNRESOLVED (Universal mandatory I/O is unproved)"
+    }
+  },
+  "certified_bounds": {
+    "trivial_global_lower_bound": {
+      "value_ms": 0.0,
+      "scope": "Universal across all possible valid algorithms A without restriction on precomputation/representation",
+      "limitations": "Trivial lower bound L=0. In the absence of an information-theoretic certificate proving that the output cannot be computed with sub-linear representation or speculative skip, no positive non-trivial global bound is certified."
+    },
+    "conditional_io_lower_bound": {
+      "value_ms": 1.802378,
+      "tps_upper_bound": 554.82,
+      "scope": "CONDITIONAL ONLY: Assumes exactly 4,614,087,680 incompressible original weight bytes must be streamed from DRAM with 0 initial fast cache state across 5 * 512 GB/s channels.",
+      "limitations": "Fails if weights are cached in fast SRAM/Infinity Cache, pruned/compressed losslessly, or if multi-token speculative reuse amortizes reads."
+    }
+  },
+  "largest_unexcluded_branch": {
+    "family": "Speculative multi-token decoding (MTP) with fused zero-communication coordinate representations and fast-cache weight retention",
+    "upper_bound_tps": null,
+    "note": "Null. No finite universal upper bound on TPS (or non-zero lower bound on latency) can be certified without closing the MTP acceptance and representation compression branches."
+  }
+}

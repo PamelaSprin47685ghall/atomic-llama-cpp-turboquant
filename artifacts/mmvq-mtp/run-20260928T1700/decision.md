@@ -515,3 +515,268 @@ Q8_0 共享解包 helper 仍对每列执行必要的整数点积。将现有 `mu
 `ggml_vk_tp5_get_cached_cmd_bufs` 先按图指针查，再跨缓存条目查找；要求节点数、scratch generation、完整 tensor fingerprint 均匹配。fingerprint 比对 shape/stride、op 参数、根指针及 view 偏移、实际 VkBuffer handle、wire/relay 专门化；每个录制命令还持有它用过的 buffer owner。重新绑定一个未证实等价的命令缓冲，可能读错模型/激活地址，不能为消除告警松掉这些条件。首次 shape 变化已证实，但**测量期缺少逐项 fingerprint 证据**：各类 `[FP-TMISS]` 诊断在 startup 前十次被门控耗尽，因此只看 size 增长与固定 `scratch_gen`，无法区别未见 token 拓扑、分配地址变化或其它有效 miss。不能把 stage0 的新图指针本身当作根因，因为实现已跨指针搜等价 fingerprint。
 
 没有找到可安全修的 replay 错误，不改缓存 key、不隐藏 fallback，也不以额外预热掩盖首请求成本。若继续攻此项，先在命中该请求的**实际**日志中给测量期 miss 加可验证的字段级诊断，再对照该图的录制/当前 tensor 绑定；在此之前 §49 的 ABBA 仍不合格，默认 MMVQ 门控保持禁用。
+
+## §51 F32 MTP 小矩阵的跨列权重复用（2026-09-29；限定容量）
+
+§43 的 16-token 日志中，F32 标签累计 17,695,201,280 **逻辑源权重字节**，不是 HBM 读取或总运行时间；其中 `k=2560,m=512` 的 N=2/1/4/15 标签分别 2630/259/240/240 次。通用 `mul_mat_vec.comp::iter_aligned_nonquant` 原先按列重复 `dequantize4_2aligned`；对 F32、`NUM_ROWS==1`、**恰好 N=4 或 N=15**，新分支每轮只加载一次权重 `vec4`，逐列读取激活并按原 K 顺序对各列分别 `dot`。其它类型、行数和容量保留原路径；没有更改 Q8_1 激活量化、融合投影或 TP5 默认 MMVQ 门控。这里的共享是源码/静态指令层面的，不将源 load 数当作物理 VRAM 字节。
+
+RX 6800/RADV 固定输入图 `k=2560,m=512` 的 `shaderstats,nocache`：N=4 原版/新分支 instructions **2798/2635**、VMEM **229/208**、VGPR **32/32**；N=15 为 **9019/8382**、**812/714**、**40/40**；均无 spill。65 次独占设备同步 GPU query 丢首个、两轮交错 B–C–B–C，余 64 次中位 µs：N=4 **35.00/32.92/35.08/32.84**，N=15 **82.66/79.20/83.32/79.32**。同图 F32 输出新旧逐字节相同；`m=1` 两容量及 K=257/260 尾部形状也做了对拍。更宽的门控没有资格：N=2 候选的两个中位 **31.04/31.32 µs**，对照 **30.84/30.68**；把 N=16 纳入候选时 **90.94 µs**，原版 **87.54**。因此不能用 N=4/15 的方向推断所有 N 或所有输入。图 query 并不代表五卡服务吞吐。
+
+另查 F32 权重、F16 激活的 Vulkan 图：N=4/15 新旧输出分别 **8192/30720 字节逐字节相同**，64-query 中位 µs 原版/新分支 **33.20/31.32**、**64.28/63.92**。现有 CPU backend 不支持该 F32×F16 测例，故不将其写成永远跳过的永久测试；保存临时图对拍。最终候选构建 `bin/llama-server bin/test-backend-ops`，F32×F32 N=4 两个支持的 CPU 对照 **2/2**、新增 N=15 **1/1**；主仓与构建源 shader SHA256 都为 `a6e31656a0858a05a52028f8acb71ad7ef269d5ee8761d9286bb38bf4b3cd092`，测试源均为 `29e10cda4854783ac5a78718b6412c5e5a3fcbae86151e8e22b301e7588a0137`，最终 Vulkan 库为 `f6739f980913e530c8f4b19e0a42cc216dcdae074b7314ab593df7a1f4ff646b`。
+
+早于最终 F16 对拍、但采用同一选定 shader 的五卡 default/forced 服务烟测均 HTTP 200、`pred_n=171`、各自五 rank 账本一致；default draft accepted/generated **130/235**，forced **129/233**，正文也不同且测量期仍有 `CRITICAL-FALLBACK`。这只证明两路能运行，**不证明 F32 改动的服务净收益，也不解除 §49–50 的 ABBA 资格问题**。原始图 stats、65-query 日志、逐字节输出、被拒绝的宽门控补丁、F16 对拍、服务请求/日志及临时探针存于 `f32-mtp-shared-weight-20260929.tar.gz`。全硬件理论/指令级最优与合格五卡收益仍未证明。
+
+后续试图做**同一 default 模式**的 C–B–B–C 五卡服务资格比较时，首臂未留下 JSON/服务日志，不能当成已测。事后 kdump `/var/crash/202609291802/dmesg.202609291802` 记录 `card3=0000:0c:00.0` 在 17:51 左右先 `device lost from bus`，内核恢复失败，约 18:02 在 `drm_sched_job_arm` 空指针 Oops；18:13 再启动。Eagle 服务日志记录了告警，但卡已丢总线，其 `--clocks-only` 预检读取 DPM 返回 Remote I/O error。不能将卡掉线归因于此 shader 或本次尚未完成的比较；**停做五卡 GPU 实验**，待 PCIe/供电/显卡及内核恢复路径排查并确认稳定后再重新预注册同工作量对照。
+
+## §52 加固鹰眼后的同模式五卡 C–B–B–C（2026-09-29）
+
+用户接受偶发硬件故障下继续运转，故在部署新的单卡恢复及原 **10 分钟 IPMI 硬件狗**保留后，受 `/var/tmp/tp5-gpu.lock` 保护再执行一次同模式实验。四臂同 GGUF、default MMVQ、`--tp5-latebind off`、同提示/seed/greedy、8-token 热机和 171-token 测量。C=§51 的 F32 N=4/15 特例（Vulkan 库 SHA256 `f6739f980913e530c8f4b19e0a42cc216dcdae074b7314ab593df7a1f4ff646b`），B=旧 shader（`43b8d18401b5c82f08f16e5fa2a38a4de4b3d8bee95acd415438fec34ee3666b`）；`llama-server` SHA 固定 `da35702a87e9918cea3101806a14476bf15b53a4a68bad43d72eab451f1e8fdb`。每臂独立启停服务，重建只发生在服务进程之间。
+
+|臂|C1|B1|B2|C2|
+|---|---:|---:|---:|---:|
+|predicted_ms|4364.061|3872.450|3882.872|3864.750|
+|accepted/generated draft|130/235|130/235|130/235|130/235|
+|测量请求时 fallback 次数|1|1|1|1|
+
+四臂 HTTP 200，`pred_n=171`，正文 SHA256 均为 `eb0f6bb83a7a8213024f422b7ada2d29cf65f6dc0916bdae99f90e68849a5477`；每臂累计 `CRITICAL-FALLBACK=9`（其中 8 次热机/初始化、1 次测量），`tp5-meta-check` 的 97/97 和 UID 序列一致。**C1 与 C2 自身差 499.311 ms，约 12.9%（按 C2）；C2 与 B2 接近而 C1 明显更慢**。尽管工作量与输出资格一致，现有会话漂移/测量期 fallback 仍使这组不具净性能胜负资格，不能据中位宣称 F32 服务加速或回退；§51 的单卡图静态与数值结论保留。四份原始 JSON、服务日志存 `f32-mtp-guarded-cbbc-20260929.tar.gz`。最终候选 shader/库已恢复到 C 的上述 SHA，实验期间未见新的内核掉总线日志；这次跑通也**不是硬件正常的证明**。
+
+四臂 8-token 热机的 predicted_ms 依次 **2555.368/2150.327/2128.041/2123.269**，首臂的偏慢在测量之前已存在；提示部分热机 prompt_ms 也是 **2139.190/1867.904/1777.022/1863.840**。这支持首臂处于不同会话状态，但**不是** GPU 时钟已被测得或 F32 特例净收益的证明。
+
+## §53 测量期 replay miss 字段级归因（2026-09-29；补足 §50 未证项）
+
+在候选构建的 `ggml_vk_tp5_get_cached_cmd_bufs` 未命中分支临时加只读诊断，仅当缓存 size≥621 且显式环境门控时汇总**同节点数和 scratch 代**的候选条目，不修改 fingerprint 匹配或 replay 判定。使用 §52 同模型、default MMVQ、相同 8-token 热机和 171-token 测量；两次独立服务请求 FP1/FP2 均 HTTP 200，`pred_n=171`，draft=130/235。FP1 在测量期 size=621 的八个同资格条目，均在**第一个绑定**的 `hc_init` shape 不符，route/type/data/buffer 项 0；FP2 逐项印出缓存的 `hc_init ne=[2560,4,2/4/6/7/35,1]`、实时 `ne=[2560,4,3,1]`（`nb[2]=40960` 均同，`nb[3]` 随容量变化），八项无一含 N=3。测量期这个特定 `stage=0/rank=0/nodes=94` miss 是**真实尚未录制的容量 3 形状**，不是图指针改变、缓冲搬迁或无效缓存键；强制复用旧录制图不安全。该证据不证明 §49 forced 模式 size=718 的 miss 也有相同根因，也不证明所有历史 fallback。
+
+临时诊断已从候选源码撤掉；FP1/FP2 原始 JSON 和日志存 `mtp-replay-hc-init-measurement-20260929.tar.gz`。不为隐藏测量期开销主动扩充热机或松掉指纹；若要消除一次 N=3 fallback，应单独设计完整形状专属图预录并核对全部 tensor buffer 身份和五 rank 输出，同时把预录成本算入服务，而不是错误命中旧命令。
+
+## §54 Q8_0 双列 `get_dm` 重复源调用（2026-09-29；编译器已消除）
+
+真实模型源字节排名中 Q8_0 双列的 `k=320,m=10240` 和 `k=10240,m=320` 各 5315 标签，逻辑权重字节各约 18.5 GB；仍是优先审查的 dispatch，不是实测 HBM/耗时。通用 MMVQ 多列 helper 在 `j` 内重复源码 `get_dm(ib_a)`。临时候选在 Q8_0 非 TP5 relay 多列路径把该标量显式 hoist 到 `j` 前，当前只检验了 `NUM_COLS=2`；`GGML_VK_FORCE_MMVQ=1`、Vulkan0 的 Q8_0×F32 CPU 数值对照旧/新各 **1/1**，RADV `shaderstats,nocache` 主要 matvec 着色器两者 **instructions=1198、VGPR=32、VMEM=88、code size=6540、静态 ISA hash=4140834875**。管线 hash 因 SPIR-V 源不同而变，ISA hash 完全相同；不能据源码去重宣称指令净收益。这个候选已撤回，主仓与候选 include SHA256 均为 `a11b9a8846f526c8289dde4b0721a295ed901efc82ca31c9d4687d78a5d1e11c`，重建的 Vulkan 库仍为 `f6739f980913e530c8f4b19e0a42cc216dcdae074b7314ab593df7a1f4ff646b`。原始对照见 `q8-scale-hoist-no-isa-gain-20260929.tar.gz`。无法把这一局部优化失败外推为 Q8_0 或 MMVQ+MTP 全局理论极致。
+
+## §55 融合成对 Q6_K 的激活二次读取（2026-09-29；编译器已消除）
+
+`qwen4_attention_projections.comp::calc_superblock_paired_q6_k` 在 A/B 两段分别写有同一 token-0 激活的四次 `common_input_v4` 载入，看似每个矩阵重复读相同激活。候选只在构建树将这四个 `vec4` 变量提升至两个矩阵块的公共作用域，没有改乘法/累加次序。固定 Q5/Q6/BF16、宽 256–3584、非零 view 偏移和奇数行数的单 token 融合投影 Vulkan/CPU 原生对照旧/新均通过 `test-vulkan-command-replay --attention-projections-only`（8192 scratch-growth fixture 未执行）。RADV `shaderstats,nocache` 此测试生成的 **10 个** shader，在新旧之间逐个 `Hash`、instructions、VMEM、VGPR、LDS 全相同；其中一例为 **7061 instructions/344 VMEM/64 VGPR/1024 LDS**，另一例为 **3277/224/64/1024**。编译器已对源级公共载入做到等效处理，不能以 GLSL 变量共享声称 HBM 或服务收益；候选已撤回，主仓与候选 shader SHA256 均为 `db347e80b0f18a33bfa93911fa3c4e6eaa403d92af3188b512b62d27391651e5`，恢复后 Vulkan 库为 `f6739f980913e530c8f4b19e0a42cc216dcdae074b7314ab593df7a1f4ff646b`。原始两臂日志存 `fused-q6-activation-reuse-no-isa-gain-20260929.tar.gz`。此数值测试是单 token，不证明暂时候选的多 token 正确性；已经撤回也无此必要。
+
+## §56 Q8_0 短 K 双行派发（限定真实形状；非五卡收益证明）
+
+保留 host 特例：仅 RADV/RDNA2、原生 subgroup=64、Q8_0×Q8_1、`K=320,M=10240,N=2`，使用 `NUM_ROWS=2`，每 workgroup 算两行、派发数 10240→5120；其它形状与 TP5 默认 MMVQ 门控不变。每行每列的 K 切片、整数 dot、浮点缩放和 reduction 次序未改，激活在同 workgroup 两行间复用。逻辑独立权重下界仍为 **3,481,600 字节**，双行不减少必需权重或 dot 次数。初始 wave32 门控实际没有选中：真实 host 日志明确 `subgroup=64,variant=nil`，数值通过不代表候选被执行；已改成 wave64 并核对真实 CPU 对照图生成 ISA hash **1074734933**，不再把早期旧路径通过算作新路径证据。
+
+实际 host 的 subgroup-no-shmem SPIR-V、native wave64 静态旧/新为 **1198/1762 instructions、88/120 VMEM、32/32 VGPR、0/0 LDS**；新 shader 工作量是两行，静态总数增长不等于每输出代价增长。独立 Vulkan profiler 用不同 row/token 的有符号 Q8 值、单位尺度，每个输出逐项与精确整数 CPU oracle 相等。四臂 1–2–2–1，各 65 次同步 GPU timestamp、丢首个后 64 次中位：短 K **35.00/28.36/28.46/35.12 µs**，独立 VRAM read counter **4,325,888/3,985,152/3,984,128/4,358,016 字节**。对照长 K `K=10240,M=320,N=2` 中位 **26.24/32.72/32.70/26.22 µs**，双行更慢；不能推广到全 Q8_0。主仓新增真实短 K 的 `test_mul_mat`，强制 MMVQ 的 Vulkan0/CPU 数值对照 **1/1**，生成新 ISA hash 的日志已保存。
+
+同模式 forced-MMVQ 五卡 C–B–B–C（171-token、8-token 热机、LateBind off）全部 HTTP 200，正文 SHA256 均为 `84e0e2b8a08bd50c4c111fc6336632b4969f3ed727642edf8baa70bfac0f5e5d`，draft=129/233，五 rank 的各形状 dispatch/barrier/copy 账本一致。predicted_ms **4445.334/4256.507/4262.444/4300.040**；每臂累计十次 fallback（测量期两次）。此组没有显示五卡收益，候选两臂本身漂移 **145.294 ms**，不能以独立 kernel 的改善声称服务净加速，也不是全硬件理论极致。保留的是有直接静态/数值/同形状 GPU 证据的局部路由，不开启 TP5 全局 MMVQ。
+
+原始 profiler 源、选定 SPIR-V、native wave64 ISA/64-query 日志、host 路由诊断及四份服务 JSON/日志存 `q8-short-k-rows2-20260929.tar.gz`。主仓/候选 `ggml-vulkan.cpp` SHA256 均为 `700eaef47928f1a5ff4403c8f99cc70ef55d8884aa8a4cfb4cabac2e8f27aa02`，测试源均为 `08c812267c4f5e06c35bd16de958aca08db986fc8351596c48a527065dfdd007`，当前 Vulkan 库为 `e4c5f8800217199848d44f561be3921142a5c66baa0b9ed675471626221c0791`。鹰眼和 IPMI 狗保留；不能由这次运行证明物理故障消失。
+
+## §57 短 K 固定形状的不可达指令裁剪（2026-09-30）
+
+### 先证不变量，再看指令
+
+§56 的精确路由只接受 RADV/RDNA2、wave64、Q8_0×Q8_1、`K=320,M=10240,N=2`。`K_PER_ITER=8`、`BLOCK_SIZE=64`，故 col_stride=512，原式 `num_iters=floor(320/512)+(8*tid<320)` 恰为 **tid<40 时 1，否则 0**。没有任何 lane 能执行第二轮或四轮展开。每组两行，5120 个 workgroup 的 first_row=0,2,…,10238，不会出现单行尾块。新增 specialization ID=3/4 分别绑定 **320/10240**；默认均为 0，保留通用 push-constant 路径。固定形状编译一次 iter/full-row body；仍保留 `first_row<FIXED_NROWS` 的越界 guard。host 的类型、架构、驱动、subgroup、M/K/N 精确 gate 未放宽。每个有效 lane 的 col、a_offset/view 地址、两个 packed dot、浮点缩放和 subgroup reduction 次序均保持原状。
+
+在每输出独立执行 packed-dot4 的算法族内，所需有效 lane-dot 数为 `10240*2*320/4=1,638,400`；最终反汇编每组 **8 条 v_dot4_i32_i8/v_dot4c_i32_i8**，40 个有效 lane ×5120 组正好是这个计数。独立逻辑权重下界仍为 `10240*(320/32)*34=3,481,600` 字节。**这不是全局算法/指令最优证明**：40/64 lane 利用率、缩放/地址/归约指令及实际 VRAM 超额读取仍没有最优证明，也没有证明另一种算法不能更优。
+
+### 静态结果（只创建 pipeline，不 dispatch）
+
+|编译形状|instructions|VMEM|VGPR|ISA hash|
+|---|---:|---:|---:|---:|
+|通用 K/M，§56 双行|1762|120|32|1074734933|
+|固定 K，仍保留尾行路径|712|24|32|3641141614|
+|固定 K/M，最终保留|**338**|**12**|**32**|1947047069|
+
+三者 LDS=0、无 VGPR spill。用 `TP5_PIPELINE_ONLY=1` 和 `RADV_DEBUG=shaderstats,nocache` 收集；另保存最终 `RADV_DEBUG=shaders,nocache` 的机器反汇编。两个 specialization 均 0 的最终 shader ISA hash 与旧双行 **1074734933 相同**。只把 K 写成常量、仍依赖编译器从条件推断 num_iters≤1 的初稿只到 1733 条；显式单轮支路才删除不可达循环。**338 是整个静态程序大小，不是每请求执行 338 条或吞吐提升比例**；此前不可达循环本就不会动态执行，本次未做速度比较。
+
+### 数值与实际服务证据
+
+- 临时图使用不同 row/block 的非单位 Q8 尺度、含零权重行、三次不同 F32 输入。最终固定形状对照旧 §56 双行：普通图和权重/激活非零 view 图各 **245,760 字节逐字节相同**，生成的 host ISA hash 都为 **1947047069**。
+- 相邻 `M=10241` 明确没有选中此特例；三次输入的 **245,784 字节**与通用旧路径逐字节相同，ISA hash **4140834875**。新增永久 CPU 对照用例保护这条形状边界；最终 `M=10240/10241` 各 **1/1** 通过。
+- 固定 K 阶段的共享 shader 数值回归 Q8_0/Q4_K/Q5_K/Q6_K（含 Q8 单列、三列、四列）共 **15/15**；最终阶段未重复这些已通过用例，最终两个默认 specialization 为 0 的静态/边界证据不能被扩写成所有量化类型的全覆盖。
+- 最终二进制五卡 forced-MMVQ、LateBind off 的 8-token 热机+171-token 请求均 HTTP 200，正文与 §56 Q8C2 **逐字节一致**（SHA256 `84e0e2b8a08bd50c4c111fc6336632b4969f3ed727642edf8baa70bfac0f5e5d`），draft accepted/generated **129/233**。该烟测不是速度比较，不能据此宣称服务净收益；fallback 没有被隐藏或放松缓存指纹。
+
+主仓与候选 shader SHA256 都为 `7459dd0436daf1a93282c38c641f5607aae26dfe9cece7a8def662c15bba48de`，`ggml-vulkan.cpp` 都为 `ac29617732ba9353eb68ec280603f83a77036a7800480e2c784ecd57fb50b9ca`，测试源都为 `6ec0c4ea1bddb8232d86008c35962197268abdb6792527a20aef276446cf376b`，最终 Vulkan 库为 `7c41741adfb34628962bed0bf1e4ba38e3bc22bf4171dac74b57e6a5a6d434f3`。构建源绑定仍是候选树，已构建 `llama-server/test-backend-ops/test-vulkan-command-replay`，本项未运行完整 command-replay suite。源码、SPIR-V、两阶段静态 ISA、15/15 与边界日志、逐字节输出和服务记录归档 `q8-fixed-shape-isa-proof-20260930.tar.gz`。TP5 默认 MMVQ 门控、鹰眼和 10 分钟 IPMI 狗不变；全 MMVQ+MTP 理论极致仍未证明。
+
+## §58 Q8_0 长 K 的完整四切片组（2026-09-30）
+
+真实日志中的 `K=10240,M=320,N=2` 有 5315 标签，与短 K 图独立权重字节同为 **3,481,600**，但 §56 已证明不能套用双行。保留每 workgroup **一行**，仅 RADV/RDNA2 wave64 的这个精确形状增加固定 K/M 的 pipeline；N=4/15 和相邻 M 都不推广。`col_stride=8*64=512`，各 lane 的 num_iters 恒为 **20**（余数条件对所有 tid 为假），恰为 **5 组×4 切片**。新增显式整组支路保留 outer loop，不展开全部 20 轮，切片仍按 `tid*8+512*s, s=0..19` 累加，删除不可能的两/一切片尾数。固定 M 保留 first_row<320 guard，320 个 workgroup 不改变输出行映射。
+
+只创建 pipeline 的 RADV `shaderstats,nocache`：
+
+|阶段|instructions|VMEM|VGPR|ISA hash|
+|---|---:|---:|---:|---:|
+|通用 K/M，原一行|1198|88|32|4140834875|
+|只固定 K|1161|88|32|314723678|
+|固定 K/M，但通用余数循环|564|44|32|1381497054|
+|显式完整四切片组（保留）|**393**|**26**|**32**|3497470871|
+
+均 LDS=0、无 spill；最终 shader 的默认 K/M=0 仍为 **4140834875**，短 K 固定图仍为 **1947047069 / 338 instructions**。最终反汇编 loop body 有 **16 条 packed-dot4**，5 组×64 有效 lane×320 workgroup，仍为 `1,638,400` 有效 lane-dot。这个算法族的必要 dot 与逻辑源权重没有减少；减少的是无效静态路径及控制/地址冗余，**不等于服务吞吐比例或全局最优证明**。本项未做 GPU query/counter 速度比较。
+
+不同 row/block 的非单位 Q8 尺度、含零行、三次不同输入，正常和非零权重/激活 view 图新旧各 **7680 字节逐字节一致**，且 host 确实生成 **3497470871**。相邻 `M=321` 仍走通用 **4140834875**，**7704 字节**对拍一致；新增永久 `K=10240,M=320/321,N=2` 的 CPU 对照各 **1/1**。新二进制五卡 forced-MMVQ + LateBind off 的热机/171-token 请求均 HTTP 200，正文与 §57 逐字节一致（SHA256 `84e0e2b8a08bd50c4c111fc6336632b4969f3ed727642edf8baa70bfac0f5e5d`），draft=129/233。五 rank 每个形状的 dispatch/barrier/copy 账本一致，累计 fallback=10；不隐藏 fallback，不以单次烟测得出净收益结论。
+
+主仓/候选 shader SHA256 均为 `f998a0ea506cfe48bec48798f2eb775a036c1ffd6e795d7daecf169fa20e3848`，host 均为 `8affff5b1262a293e7970eca2682a3f6ffcdd6196124c2df78e6512e175fb386`，测试源均为 `883517b3ad0389f1bb49d4bc623f2c3a16c6a68b3604c4b044e3b8b6a89f3d1e`，Vulkan 库为 `ebe20af22f09873bc4520881e7e6bb63be9ef602c077a79c7fa2fc0363c4b101`。重建了 `llama-server/test-backend-ops/test-vulkan-command-replay`，未运行完整 replay suite。前后 SPIR-V、静态 ISA、非单位尺度图、CPU 边界测试、源代码和五卡请求/日志归档 `q8-long-k-isa-proof-20260930.tar.gz`。默认 MMVQ 门控、鹰眼/IPMI 保持；动态地址/缩放/归约、VRAM 读取及整个 MMVQ+MTP 的最优性仍无证明。
+
+## §59 Q8_0 八值 packed-load 对齐下界（2026-09-30；候选撤回）
+
+Q8_0 块为 34 字节，八值切片起点 `p=34*ib+2+8*iqs`，`iqs=0..3`。`ib` 包含既有 batch/view 地址关系；偶数块起点模 4 为 2，奇数块为 0。限定原有逐 lane 八值 packed-dot4 算法及对齐 dword 载入族，8 字节区间分别跨 **三个/两个 dword**；因此观察到 12 字节原生载入不能直接认作可消除的 4 字节 VRAM 流量，lane 间重叠与缓存行事务仍需独立论证。
+
+临时 raw alias 候选对齐时读两个 dword，偏移 2 时读第三个并用 shift/or 重排。初稿存在不成立的尾部填充假设：34 字节单块的 `ib=0,iqs=3` 第三个 dword 读字节 32..35，超出逻辑范围，旧 packed16 只读 32..33。修正为最后半字载入后，按四个半字 `h0..h3` 证明两个结果仍为 `h0|(h1<<16)`、`h2|(h3<<16)`；源级 bit/address oracle 的 **768 个基向量、5376 个伪随机切片**通过，并覆盖精确 34 字节尾部及非零块前缀。这不是 GPU 数值验证。
+
+只创建 pipeline，未 dispatch、未 query/counter、未服务运行：
+
+|wave64/N=2 路径|旧 instructions/VMEM|raw32 初稿|安全末半字版|
+|---|---:|---:|---:|
+|短 K 固定双行|338/12|353/14|356/14|
+|长 K 固定单行|393/26|414/30|418/30|
+|通用单行|1198/88|1314/102|1328/102|
+
+三路 VGPR=32、LDS=0、无 spill。安全版仍增加分支和 VMEM 指令，没有严格资源优势，故两版均撤回，未做任何性能测量，也不以编译器 latency/throughput 估算作运行证据。手工编译 SPIR-V 未进入产品构建；撤回后主仓/候选 shader/include 与 §58 及 `a11b9a8846f526c8289dde4b0721a295ed901efc82ca31c9d4687d78a5d1e11c` 一致，产品库仍为 §58 哈希。原始源 delta、SPIR-V、静态 ISA、基向量脚本及结果见 `q8-packed-alignment-rejected-20260930.tar.gz`。**只证明这个载入族的对齐约束及候选不值得保留，不证明全 MMVQ+MTP 理论极致。**
+
+## §60 Q8_0 固定形状的单 Y 批次寻址（2026-09-30；保留）
+
+### 完整调用契约
+
+`ggml_vk_mul_mat_vec_q_f16` 先断言 `ne11==1 || ne12*ne13==1`。两个既有精确形状选到 `mat_vec_cols=2` 时只有两种表示：`ne11=2` 导致 outer_batches=1，或 `batch_outer=true` 将两个连续外层列折成列维并明确令 dispatch_batches=1。Vulkan support gate 还要求 A/B 的 ne[3] 相等；flatten 谓词要求 A.ne[3]=1，故实际广播表示只来自 ne[2]。非连续输入、按 batch 保存的矩阵、skinny-as-batch 和 expert 图不会由此选到这两个 N=2 特例。
+
+因此 `base_work_group_y=0`、groups_y=1，shader batch_idx 恒 0；原 `get_offsets` 的 a/b/d 三个 batch 偏移皆为 0。新增 specialization ID5 `SINGLE_Y_BATCH=false`，只在既有 RADV/RDNA2 wave64 的短 K 双行与长 K 单行 pipeline 传 true。descriptor/view 字节偏移仍由原绑定保留；列内 j*stride、K 切片、整数 dot、尺度和浮点累加顺序、归约、首行越界 guard、fusion flags 与 replay fingerprint 均不动。MUL_MAT_ID 没有此分支，默认 ID5=false 保持通用路径。普通派发记录的是固定 direct dispatch，不是动态行数 indirect。
+
+### 静态 ISA，不是动态速度
+
+|实际 host 形状|旧 instructions/VMEM|只裁 batch 偏移|ISA hash|
+|---|---:|---:|---:|
+|K320/M10240/N2，两行|338/12|**238/12**|2010903019|
+|K10240/M320/N2，单行|393/26|**283/26**|3541243255|
+
+VGPR=32、LDS=0、无 spill，通用单行 ID3/4/5=0 仍为 1198/88、hash4140834875；ID5=false 的两个固定图仍为旧 hash1947047069/3497470871。短图机器码仍八条 dot×40 有效 lane×5120 组，长图循环体仍十六条 dot×五轮×64 lane×320 组，各 **1,638,400** 有效 lane-dot。另试固定 B/D 列步长：短图239条、长图282条，没有同时严格支配 batch-only，且扩大公共 include 契约，已撤回。代码尺寸减少包含原来不可达的 batch 广播算术，不能外推动态执行减少比例，更不能宣称吞吐收益。
+
+### 当前数值/replay 证据及未通过项
+
+- 两个形状 × 普通 ne11/外层 ne12 双列 × 普通/非零权重与激活 view，共八个图，三次变化输入、非单位 Q8 尺度与零权重行：**1,013,760 字节**与 §57/58 归档旧输出逐字节一致；实际 host 分别生成上述新 hash。每图一次录制 miss、两次真实 command replay hit。
+- 相邻 M10241/M321 两图仍生成通用 hash4140834875，进一步 **253,488 字节**一致、四次真实 replay hit。合计 **1,267,248 字节、20 次 replay hit**。永久 CPU 对照两种目标表示及两条 M 边界共 **6/6** 通过。
+- 试图广播 ne[3] 的临时图因既有 support gate 回退 CPU，未生成 MMVQ shader，bitwise 旧 GPU 比较失败；不计作 GPU 数值验证，也未更改 support gate。后续临时图增加实际 Vulkan support 断言，未重复这个不支持的检查。
+- 默认策略完整 `test-vulkan-command-replay` **26/26** 通过。全局 `GGML_VK_FORCE_MMVQ=1` 完整 runner **未通过**：HC combine 原生参考比较 `diff=0.004761 > 0.000100`（gpu1003.169495、reference1003.174255，:1939）。该参考 injection 是 K10240/M4/N1，未选本项 N2 特例；[INFERENCE] 强制 MMVQ 的激活再量化与 fused HC 原生浮点 contraction 是不同数值契约。不以默认通过替代 forced 全量资格、不削弱容差，仍需进一步归因。
+- 当前检查枚举 **四张** Vulkan RX6800，不是五 rank 服务验证；未做新的服务 smoke、query/counter/ABBA 或吞吐比较。runner 自动打印的时间不作性能证据。硬件保护没有改动。
+
+主仓/候选最终 shader SHA256=`71b7a6e764eebabba0cc598aae4f7c2b8e33633ae68899f231fbea319e1f4877`、host=`a7ad8322711c55d9b674386fb6afa5f5bb1a3c71e21142abcc94cf440cb0a184`、测试源=`369e593fe78d7ca8aa7c1501d3e3cc28f76fb1f10798599085249fa646141096` 一致。构建仍绑定候选树，已构建 server/backend/replay runner；Vulkan 库=`3c85291b4726a62f955ac52d292ac9c3064053e1b0bd0b46847af8ed434d4edc`，最终 SPIR-V=`30fc2b3e6b9d1a9ea55404386b9cb42e7677aa14203255921a8f60005a8d4f76`。源码、静态阶段、最终 ISA、变化输入/view/replay 输出、CPU 日志和 suite 观察结果摘录存 `q8-single-batch-isa-proof-20260930.tar.gz`。**整体理论极致和 forced 全路径资格仍未证明，性能测量门控仍关闭。**
+
+## §61 HC 原生 contraction 与 forced-MMVQ 的数值契约（2026-09-30；不改生产、不改容差）
+
+§60 的具体失败可由源码算术区别解释：`qwen4_hc_segment_norm.comp::normalize` 的 fused injection 直接读取 F32 激活，按八值 floating dot、权重尺度 FMA 与 subgroupAdd 累加；通用 Q8_0 MMVQ 则先按 `d=max(abs(x))/127`、`q=round(x/d)` 量化激活，尺度转 F16，计算 `d_w*d_x*dot(q_w,q_x)`。一般 `x != F16(d)*round(x/d)`，故两个 contraction 本身就不同；这不是把地址或 replay 契约放宽后得到的解释。
+
+独立 CPU double 算术脚本复用 fixture 的精确 dyadic 权重和 F32 输入生成，但独立实现上述激活量化与 sigmoid scatter：
+
+|输入前缀 / row0|原生 scatter|再量化 scatter|差值|GPU 观察|
+|---|---:|---:|---:|---|
+|0|1003.169514240042|1003.174284463860|0.004770223817|原始1003.169495 / 参考1003.174255|
+|1（4 字节 view）|1002.716417983574|1002.724690320878|0.008272337304|F32 oracle 候选：实际1002.724670 / 参考1002.716431|
+
+脚本没有 GPU dispatch 或计时；这些数值解释了两个失败的方向与幅度，不等于逐指令 GPU emulation、全部 MMVQ 误差边界或五卡输出资格。`ggml_vk_can_fuse_hc_segment` 的 f32 谓词要求 16 字节对齐；4 字节 view 合法地走通用 fallback，多 token 非 capture 图也有明确 fallback 条件。因而“全局 forced”并不把每个合法 fused injection 都改成同一种算术。
+
+曾只把测试的原生参考 Q8 权重换成精确等值 F32 矩阵，保持原容差：前者可避免合法 fused case 的参考被再量化，但非对齐 fallback 的实际值仍用 MMVQ，随后在 `diff0.008240>tol0.000100` 失败。这个只修一侧的 oracle 候选已撤回，未镜像主仓；**不关闭 MMVQ、不删除失败、不加宽容差来伪造全量 forced 资格**。生产源码/库与 §60 相同。主仓/候选 replay 测试源恢复为 SHA256 `f522c14e1004802a0f0d9ce99f6629bb84f2d61066f8ca28e54ae29d37e7b008`，重建 runner SHA256 `67a883be2ec4e8a68102262e83e35579df371475acebef3c5e99421b66e7a7e4`；恢复后二进制 `--hc-combine-only` 默认策略通过。§60 相同原始源码及 backend 的默认 26/26 证据仍成立，forced 全量仍不声称通过。
+
+算术脚本、两组输出、被拒 oracle 源及失败原始日志、恢复后的 HC 烟测归档 `hc-mmvq-native-contract-20260930.tar.gz`。该调查解决的是两种算术误作同一精确 oracle 的归因；**没有产生生产优化或服务性能结论，整个 MMVQ+MTP 理论极致依然未证明。**
+
+## §62 Q8_1 sumless 路径的缓存及尺度舍入约束（2026-09-30；理论反例，不改 quantizer）
+
+Q8_0 的 `mul_q8_1` 不读 ds.y，但 Q4_0/Q4_1/Q5_0/Q5_1、Q4_K/Q5_K 等 helper 明确用它抵消量化偏置。`ggml_vk_get_quantize_pipeline` 统一返回 `pipeline_quantize_q8_1_x4`；prealloc_y 的复用只按转换 pipeline、输入 tensor 身份和 decode staging layout 判定，没有“和字段有效”的额外状态。故“当前消费者是 Q8_0”不是整个转换结果生命周期内 ds.y 死亡的证明。
+
+静态合法混合消费者反例：Q8_0(X) 若沿相同 pipeline 身份生成缺少和的 X，后续 Q4_0/Q4_K/Q5_K(X) 可命中这个不完整结果；Q4_0 每八值切片的公式为 `da*(q_sum*ds.x-2*ds.y)`。da=1、ds.y=32、四切片时，将 ds.y 清零使整块输出增加 **256**，不是可被浮点误差容差覆盖的微扰。这是缓存契约的独立反例，不声称当前模型日志已观察到这组精确消费者次序。换成不同转换 pipeline 身份虽可迫使后续完整重算，但在此序列中变成 sumless+full 两次转换，旧路径只需一次 full；不能据单个 quantizer 的指令减少主张普遍静态工作量优势。
+
+另一个舍入反例否定了简单 lazy backfill：原 shader 的 `ds.x=F16(d)` 与 `ds.y=F16(F32(sum_q*d))` **独立舍入**。用 IEEE struct F32/F16 转换验证，d=`1.0003999471664429`、sum_q=3 时，ds.x=1；原 ds.y=`3.001953125`，从 ds.x 回算则为 `3.0`，差 `0.001953125`。仅缓存整数 qs 和 F16 尺度不能保证恢复原字段；从原输入重建尺度及和还需计入额外读取/同步/转换，不能默认为免费。
+
+安全接受条件是完整转换生命周期的 sum-reader 死亡证明，或精确且无额外可避免转换的有效性迁移；还必须保留 Q8 值、ds.x 舍入、x4 布局、输入 tensor 身份、非零 view、缓存/replay 生命周期和全部 affine 消费者。当前源码没有提供这项证明，**不实现仅按当前权重类型删和的第二套缓存契约**。本项无源码改动、无 shader 编译/dispatch、无性能测量。两份独立算术反例及对应源码存 `q8-sum-cache-boundary-20260930.tar.gz`；这收束的是朴素 sumless 方案的安全边界，不是全 MMVQ+MTP 最优性证明。
+
+## §63 共享 Y scratch 生命周期与 MTP token 容量（2026-09-30；修复、正确性验证）
+
+### 缓存有效性不是内存同步
+
+`prealloc_y` 同时承载转换后的激活、大 softmax 的 reduction partials、Flash Attention 的 mask bitmap。转换缓存原先按 pipeline、输入 tensor 身份和 decode-vector staging 布局命中；大 softmax 与 FA mask 写入 scratch 后虽完成同步，却没有清除这三个标记。同步保证写入顺序，不能使被覆盖的激活重新有效。
+
+最初用两个静态权重 MMVQ 夹住 softmax 的图没有复现：graph optimizer 合法地把两个独立 MMVQ 都移到 softmax 前。调试器确认派发顺序，旧库数值对照和 replay 均通过。这份 ordering control 保留，不把函数局部推理当作复现。真正复现图为 `MMVQ(X) -> REPEAT -> large SOFT_MAX/FA -> cast(Q8_0 second weight) -> MMVQ(second weight, X)`；第二个权重依赖 scratch writer，不能再把末端 MMVQ 移到它之前。
+
+旧库 softmax 图三次变化输入的末端 128 行均损坏，第一次 row0 独立 CPU 期望 `-0.00468948483`、GPU 为 0；已有两次真实 replay hit，说明命中 replay 不保证其录制时的缓存假设正确。相同永久回归 runner 搭旧库退出 1：`diff=0.004689 > tol=0.000010`。新库同 runner 退出 0。修复仅在两个 scratch writer 派发后清除 `prealloc_y_last_pipeline_used`、`prealloc_y_last_tensor_used`、`prealloc_y_last_decode_vector_staging`；保留原同步、算术、缓存身份及回退契约，不为缓存命中创建第二套有效性规则。
+
+### 实际正确性覆盖
+
+- `test_mmvq_scratch_reuse` 独立 double CPU contraction 对照两端 MMVQ；dyadic 激活确保 Q8_1 尺度及数值可精确表示。对中间 softmax 检查概率归一化，对零 key 的 FA 检查已知 value 输出；所有关键节点要求 Vulkan support 并显式指定 Vulkan，防止 CPU fallback 掩盖缺陷。每种 writer 三次变化输入，确认至少两次 replay hit。
+- 独立复现程序修复后 large softmax 与 FA mask 两图均通过；各一次 miss、两次 hit。softmax 末端误差为 0，FA 末端最大误差不超过 `3.57627869e-7`。这些是数值/重放证据，不是计时证据。
+- 通过 `GGML_VK_VISIBLE_DEVICES=0..4` 分别执行永久 scratch 回归，五张物理 RX 6800 均退出 0，均非 skip。逐卡序列执行、持 GPU 排他锁；**不是五 rank TP5 服务图的验证**。
+- 默认完整 replay runner **27/27** 通过。未重跑已知不合格的全局 forced HC 比较，也不把默认通过解释为 forced 全路径资格。
+
+### MTP 多 token、容量增长及合法回退
+
+扩展已有 GDN/QSA 投影 fixture 到 token 数 **1、2、3、4、5**，不改原容差。1/2/4 容量槽及 N=3 使用容量四的图均按每个输出/token 比较；N=5 超出 fused 容量，覆盖原生合法回退。覆盖 Q5_K、成对 Q6_K、BF16 gate、非零 view、K 尾部和奇数行。reference 是独立原生 Vulkan 图（四个各自 scale 的输入防止投影融合），**不是 CPU backend 对照**；整数路径只允许既有累加顺序误差，F32 路径及 BF16 gate 要求逐字节一致。
+
+先录制 N=3/K=256 图，嵌套 N=4/K=8192 图迫使 region scratch 增长，再以新输入 replay 原来的三 token 图；要求 replay hit 增加而不重新录制 fused region。整个 fixture 还要求每个四投影 integer region 恰好一次量化，并确认 Q5/成对 Q6 分支实际记录。五张物理卡的 `--attention-mmvq-only` 均通过，包括 scratch-growth fixture；仍不能据此宣称真实模型所有 token 图均融合或没有回退。
+
+### 归档及资格边界
+
+源码已镜像主仓/候选树，SHA256 均一致：host `70c9e36117a5b1265cf54a73a37601e276d15b75ab1a89a9f5f76bb3551b57cc`，replay 测试 `c7cd747edd869cc8c554eeba1ba1cd29ff6a7c06255b864458ac1a08f379a330`。新 Vulkan 库 `6a87ca7726241b9eaea98979281f1daf86f823306d5eee237f3a16c42ea69326`，runner `ced0d6eeff442057139c973d1395c3784c67ac677372bb5844d0fcd6ac89d2a4`；前后库身份和原始失败保留。构建仍绑定候选树。
+
+源码、集成 diff、前后库、原生复现程序、ordering control、六组初始验证记录及逐卡日志存 `mmvq-scratch-lifetime-and-mtp-capacity-20260930.tar.gz`。用户已豁免进一步动态指令数优化；后续只推进物理数据搬运、激活复用、MTP 容量及融合回退。**本项没有 query/counter/ABBA、吞吐比较或五卡服务请求，没有全局理论极致证明；性能门控仍关闭。**
+
+## §64 转换源被原地写入后的失效（2026-09-30；第二个确定性缓存缺陷）
+
+### `view_src` 是存储身份，不是值版本
+
+`ggml_new_tensor_impl` 将 view 的存储根和绝对偏移折叠；`ggml_mul_inplace`、`ggml_scale_inplace` 等真实 writer 也通过 view 构造结果。只按 `view_src`、相同 buffer/offset 或相同元素数扩大复用，会把写入前后两个 producer 的值混为一谈。透明 VIEW/RESHAPE 的 `src[0]` 链仍保留真正 producer；合法复用还必须证明顺序、转换 pipeline/布局和元素序相同、源未改写、Y 未覆盖及容量生命周期有效。当前 Qwen4EXP Q/K/V、GDN 与 PLE 相邻投影本来就共享同一个 `cur/input/emb` 对象，不能假定增加存储根别名 key 就有真实模型搬运收益。本项不扩大缓存 key。
+
+进一步复现发现原有精确 tensor 身份 key 本身也缺少源写入失效：`first=MMVQ(e0,X)` 产生 scalar factor，`MUL_INPLACE(X, REPEAT(first))` 改写 X，改写结果生成第二个 Q8_0 权重，末端 `MMVQ(produced_weight, X)` 再用同一个 graph input。权重依赖 writer，不能把末端 matmul 提前。Y 本身保持完整，但它仍是旧 X 的转换；内存同步和 tensor 身份相等都不能修复这个值版本错误。
+
+|输入轮次 / factor|独立精确 CPU 期望|旧 GPU|修复后 GPU|
+|---|---:|---:|---:|
+|0 / 2|650088|325044|650088|
+|1 / 3|1462752|487584|1462752|
+|2 / 4|2600608|650152|2600608|
+
+复现程序同时验证初次投影、原地写入内容和实际生成权重，均精确正确；错误只在末端读旧转换。旧/新图均一次 replay miss、两次 hit，旧退出 1、新退出 0。整数/dyadic 数值与 FP16 尺度可精确表示，所有最终和小于 2^24，**不依赖误差容差来区分新旧值**。
+
+### 保留的修复与回归
+
+在 `ggml_vk_build_graph` 记录每个真正 writer 后，用既有 tensor-range overlap 谓词检查缓存转换源。只要写入与源相交，就清除 pipeline/tensor/decode-staging 三个标记；同范围写入也必须失效，故这里使用 `elementwise=false`。不相交的同 buffer 写入不失效。既有同步和 replay 指纹不动；录制后的重放会实际执行 writer 后新增的重新转换。复用已有 overlap 实现，前移定义供 recorder 调用，沿用已有 graph-hazard 的非 Vulkan/multi-buffer context 防护，不另设 alias 表、generation 对象或第二套缓存。
+
+永久 `test_mmvq_input_mutation_replay` 覆盖整段与局部 alias writer，后者从非零输入 view 起点再写入内部两个 Q8 block。每图三次变化输入，逐项检查变更后的输入、生成权重、末端精确 CPU 值及至少两次真实 replay hit；关键节点要求 Vulkan support 和实际 Vulkan assignment。扩展原 `--scratch-reuse-only`，不新设兼容入口、不放宽旧容差。新 runner 搭 §63 旧库时 scratch 两个 writer 测试通过、随后的 source-mutation 精确断言失败（退出 1）；新库两组测试全通过。
+
+最终库在五张物理卡上逐卡 scratch/source-mutation 与 `--attention-mmvq-only` 全通过；MTP fixture 的 1–5 token、容量增长和回退边界继续有效。默认完整 replay **28/28** 通过。已构建 `llama-server` 和 replay runner，但本项没有新五 rank 服务图、吞吐、query/counter 或 ABBA，也没有重跑已归因的 forced HC 比较。
+
+主仓/候选 host SHA256 均 `810389d075914f612b205d5fe4260df3d81fbc6cd257cca51347d9d2b981fe75`，测试均 `2f3487ea7194a21b72a881751d213fb7573751a099fb28a0d1f3b120a814cde9`。Vulkan 库 `bd79cb77e55db03b37faf5290b36838d1180a390a14ccbf8e53777c1a8779a02`，runner `376d1a87ec7f69ed9a4a25a318dcff8f79d2e589cc7fdbb853d2f281854f6cee`；旧库为 §63 的 `6a87ca7726241b9eaea98979281f1daf86f823306d5eee237f3a16c42ea69326`。源码、前后库、复现程序、永久失败/通过日志及逐卡结果存 `mmvq-source-mutation-cache-proof-20260930.tar.gz`。**这是激活复用正确性的必要修复，不是服务性能资格或全局极致证明。**
+
+## §65 Q8_0 扩大 row tile 的物理读取边界（2026-09-30；仅 pipeline 创建，不切换生产）
+
+在 §60 同一 SPIR-V 上只改变 `NUM_ROWS`，固定 K320/M10240/N2、singleY=true；沿用归档的 pipeline-only inspector，不创建 command buffer、不 dispatch、不创建 query 或提交 queue。这里仅审查寄存器、LDS、spill 与源数据覆盖，**不追动态指令数，不用编译器 latency/throughput 字段当速度**。
+
+|row tile|完整 workgroup 数|VGPR|LDS / scratch|SGPR / VGPR spill|编译器 subgroups/SIMD 估计|
+|---|---:|---:|---:|---:|---:|
+|2（已有 §60）|5120|32|0 / 0|0 / 0|32|
+|4|2560|32|0 / 0|0 / 0|32|
+|8|1280|32|0 / 0|0 / 0|32|
+|10|1024|40|0 / 0|0 / 0|24|
+|16|640|56|0 / 0|0 / 0|18|
+
+四种新 tile 都整除 M。限定既有格式、任意非退化输入和独立权重，逻辑源权重仍为 `10240*10*34=3,481,600` 字节；量化 B 的唯一 footprint 为 720 字节，非 elided 原生 F32 输出为 81,920 字节。按每 workgroup 的 B footprint 求和，tile2/4/8 分别为 3,686,400/1,843,200/921,600 字节，但**这个重复 footprint 不是 VRAM 读取**：720 字节 B 可以在 cache 中重用，改变 workgroup 数不等于改变独立源权重下界或实际外存事务。row4/8 没有额外 VGPR/LDS，但仍缺实际 cache-line/coalescing/residency 和数值资格；row10/16 还有寄存器压力代价。未以这张静态表替换已资格验证的 row2 路由。
+
+另对跨行打包 40/64 lane 尾部建立有限映射：R 行的 40R 个八值切片可按 task=row*40+slice 铺到 wave64；R4/R8 分别需三/五轮，而每行 partial 的 lane 位置变成循环平移。CPU 映射检查证明覆盖且无重复；保持原浮点 reduction 顺序需逐行逆置换。直接打包还把既有一次 B preload 改成三/五次，或需额外 LDS/寄存器缓存，不能只凭“填满 lane”宣称物理搬运严格减少。未改 shader、未 dispatch 此方案。
+
+资源日志、当前 SPIR-V、pipeline-only 源/二进制、traffic 理论表及 lane 映射检查存 `q8-row-traffic-resource-boundary-20260930.tar.gz`。这收束了直接扩大 row tile/打包 lane 的资源与流量推理边界；**没有证明全硬件最优，性能门控仍关闭。**
+
+## §66 性能测量：forced-MMVQ vs TP5 默认禁用（2026-09-30；用户授权后首次测量）
+
+### 前提
+
+用户指示：与 MMVQ+MTP 无关的优化不做；两者到极致后可开始测量。动态指令数已豁免。卡 3 在 2026-09-30 09:11 UTC 再次掉总线（`device lost from bus!`，SMU `TransferTableSmu2Dram` 返回 `0xFFFFFFFF`）。当时 `gpu-hard-unlock.sh card3` 卡在 `amdgpu_device_fini_hw -> drain_workqueue` 的不可中断 D 状态，三个 `kworker/u177:*+ttm` 卡在 `dma_fence_default_wait`，`pci rescan` 卡在 `pci_lock_rescan_remove`；根端口 `00:02.2` 链路宽度降为 `x0`、全 8 lane 报错，卡配置空间全 `0xff`。这类物理链路失步 + 内核全局 PCIe 锁死无法在运行中解救（D 状态忽略 `kill -9`，rescan 会再产生新的 D 进程），只能有序重启。重启后 5 张卡全部恢复，Eagle 与 IPMI 硬狗正常。
+
+### 方案与结果
+
+用同一 `llama-server`（`da35702a…`）跑 ABBA，`--tp5-latebind off` 隔离 LateBind：R=TP5 配方注入的全局禁用，T=`GGML_VK_FORCE_MMVQ=1`。R 不是 auto；显式 `GGML_VK_DISABLE_MMVQ=0` 才恢复 auto。每臂 4 请求（首个热身丢），8 个块交替 `R T`/`T R`，共 24+24 个样本。固定 prompt、`temperature=0`、`seed=42`，`env -i` 仅 `RADV_DEBUG=nobolist`，每臂持 `/var/tmp/tp5-gpu.lock`。
+
+|臂|ms/cyc 中位|ms/cyc 均值|tok/s 中位|md5|fallback/session|
+|---|---:|---:|---:|---|---|
+|R（默认禁用）|28.865|28.934|61.59|`add18ad37ff7` ×24|[5]×8|
+|T（强制 MMVQ）|28.930|28.979|59.70|`2696790a8525` ×24|[5]×8|
+
+配对逐块 `T/R` 中位比：均值 **1.0009**，t-95% CI **[0.9882, 1.0136]**，逐块 `[0.9808, 1.0078, 0.9903, 0.9886, 0.9906, 1.0205, 1.0193, 1.0093]`。**区间含 1.0，无统计显著差异。**
+
+### 解读与资格边界
+
+- 在此 `ms/cycle=(predicted_ms)/(predicted_n-draft_n_accepted)` 代理指标上未发现显著差异；没有独立成本分解，不能声称量化/解包开销“恰好抵消” dot4 收益。
+- 两臂会话内 `CRITICAL-FALLBACK` 总数相同（`Graph fallback to 480 subgraphs, n_sub=97`）。总数不能区分初始化、热身和测量阶段，也不足以排除 MMVQ 交互；联合配置测量必须记录每请求日志边界。
+- R/T 输出长度分别为 160/171，各自 24/24 同 md5；算术和接受模式改变可能导致不同文本，但确定性不能证明不存在数值缺陷。正确性证据仍以 §61/§63/§64 的明确定义 oracle 为准。
+- 此实验比较同一优化后二进制的 MMVQ 政策，不是优化前后消融；不能把政策比较结论推广为“本轮所有改动没有服务吞吐价值”。跨 MTP draft 深度应以固定 token 工作量的 token/s、ms/token 和端到端时间为主。
+
+16 份服务端日志、48 份请求 JSON、配对报告及环境记录存 `mmvq-forced-vs-default-abba-20260930.tar.gz`。**这是单模型、单 prompt、五卡单请求的配对测量，不是全模型全路径吞吐最优性证明；全硬件理论极致仍未证明。**

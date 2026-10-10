@@ -1,5 +1,7 @@
 # Atomic llama.cpp
 
+五卡单路 Decode 性能工作从 [性能调优总纲：TP5 × LateBind × MMVQ × MTP](PERFORMANCE.md) 开始。配置、理论模型、实验顺序和证据边界统一在该页；旧战报不再作为默认执行指南。
+
 ![atomic llama](https://github.com/AtomicBot-ai/.github/raw/main/assets/atomic%20llama.png)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)

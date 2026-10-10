@@ -12,6 +12,150 @@ Releases before `b10269-1.5.0` predate this file; see the git history.
 
 ## Unreleased
 
+**Necessity certificate v4: soundness fixes and a split bound**
+  `scripts/tp5-necessity-certificate.py` v4 supersedes v3 after audit
+  found three defects: dense bytes per layer were 90.8 MB in v3 but the
+  audited 1222-tensor inventory gives 63.82 MB; the L2 retention credit
+  divided by the full 11.9 GB weight pool instead of the per-token active
+  set (under-crediting caching, invalid as a lower bound); and v3's
+  single 476 tok/s number claimed per-row validity under the
+  perfect-acceptance MTP relaxation, but weight DRAM traffic is read once
+  per verify CYCLE and amortizes across committed rows, so R3 cannot
+  bound the full allowed set. v4 reports a split certificate:
+  L_global = 5667 tok/s (FP32 ALU bound, valid for the full allowed set)
+  and L_nomtp = 730 tok/s (active-weight DRAM bound, valid only for the
+  no-speculative-batching class). A serial-latency term was investigated
+  and rejected: every candidate coupling has a legal implementation that
+  hides it under the relaxed allowed set. 14 tests in
+  `tests/test-tp5-necessity-certificate.py` pin the defect fixes.
+
+- **First nontrivial global necessity certificate for the TP5 task.**
+  `scripts/tp5-necessity-certificate.py` derives a per-token time lower
+  bound valid across the full allowed strategy set (lossless
+  representation, caching, partitioning, prefetch, fusion, perfect-acceptance
+  MTP) from four unavoidable resources: output emission, causal cut-set,
+  active-weight DRAM traffic, and FP32 ALU work. v3 counts both the
+  10/512 active experts AND every dense weight (attention, PLE, HC,
+  router, shared experts) that must be read each token: 1076.3
+  MB/GPU/token of necessary DRAM at the 512 GB/s spec ceiling, plus
+  12.1 GFLOP/token of FP32 work. The binding resource certifies
+  S_hi = 476 tok/s; demonstrated S_lo is 66.34 tok/s (gap 7.2x, up from
+  null -> 2395 -> 476 through honest tightening).
+
+- **Native AllGather executes dynamic active rows on real five-rank hardware.**
+  A scalar ragged-row ADD producer guards every element against the frame's
+  live token count, the submitted frame is the authoritative extent source for
+  indirect-dispatch patching, and RELAY chain-cache reuse is restricted to the
+  chain whose compiled commands are actually resident in the per-rank
+  scratch. A five-rank fixture verifies 4→1→3→2→1 active rows across two
+  mailbox banks: exact scores, untouched inactive source tails, published
+  status metadata, and downstream softmax, with asymmetric frames rejected
+  before submission.
+
+- **Lossless BF16 router weights run through the native F32 GEMV pipeline.**
+  The converted packed-BF16 buffer dispatches with the generic one-row F32
+  workgroup geometry, so accumulation and reduction order match the F32 path
+  bit-for-bit (verified on synthetic full-vocabulary scores). The dispatch
+  reopens the compute submission after the one-time conversion synchronize.
+
+- **One-time router weight conversions no longer corrupt TP5 replay definitions.**
+  The conversion's temporary transfer/compute command buffers are suspended
+  from definition-tape capture, kept out of the replay pending-buffer list,
+  and excluded from the definition dispatch count; the first-conversion path
+  no longer synchronizes mid-graph, so the five ranks' shared submission is
+  never split during recording. Verified by real-model fixed-token parity:
+  3607 files (logits, state, all 3600 router trace tensors including per-rank
+  inputs) byte-identical between F32 and lossless-BF16 router weights.
+
+- **Vulkan converted router weights refresh after strided uploads.**
+  Synchronous and asynchronous 2D writes now invalidate the full checked byte
+  span, including updates to nonzero-offset weight views. A native regression
+  verifies every score after both write paths and warm replay; previously the
+  converted cache could retain the old weight despite a successful upload.
+
+- **Lossless BF16 router weights qualified with a measured throughput win.**
+  Preregistered eight paired blocks (ABBA, 16 independent processes, frozen
+  binary, single env-var difference) show +1.14% pooled tok/s, 95% CI
+  [0.79%, 1.48%], with byte-identical outputs in every block. The mode stays
+  opt-in (`GGML_VK_ROUTER_WEIGHTS=bf16`); production default changes need
+  separate qualification.
+
+- **Meta graph views no longer reuse a different slice with the same parent UID.**
+  Cached child graphs and prepared native definitions now include the node-array
+  base alongside UID and node count. Evaluation callbacks can visit equal-sized
+  slices without silently replaying the preceding operation. A two-backend CPU
+  reproducer now executes ADD after SQR correctly; regression coverage also
+  preserves same-slice reuse with updated runtime inputs. This fixes observer
+  correctness, not a claimed GPU speedup or router qualification.
+
+- **LateBind validates current-epoch Q payloads and reduces all live HC rows.**
+  Exact F32 publication and every Q8DOT variant now publish payload checksums,
+  epochs and active extents; normal relay and L2 validate these before retiring
+  ready or reducing Q. Real five-GPU production observations caught bytes still
+  changing after ready. The extent gate also exposed legacy two-row chains
+  reducing only one row; row counts now follow each stage's actual HC payload,
+  including the next mailbox bank. Seven modes each completed eighty real
+  fixed-prefix requests afterward with no observed post-validation payload
+  changes or abnormal exits. Existing timeout/numerical gates remain; these
+  diagnostics do not establish universal generation quality or new throughput.
+  All eight LateBind modes across disabled/auto/forced MMVQ subsequently passed
+  independent semantic review of 144 real consecutive MTP1 requests, with normal
+  exits. Deeper interactions and paired production performance remain separate
+  qualification requirements; occasional auto-policy budget-tail rerecording
+  is retained as an optimization target, not grounds to remove configurations.
+
+- **Failed TP5 cleanup releases pending P1 owners before their Vulkan pools.**
+  A real sidecar-rejected model load crashed while freeing a retained P1 command
+  buffer after its command pool was destroyed. Teardown now releases drained
+  in-flight owners while pools are live and unlocks the communicator mutex
+  before deleting it. Real five-rank and partial-four-rank GPU submissions at
+  logical epoch zero complete their fences and payload writes before owners
+  expire; an unsubmitted rank remains unsignaled and untouched.
+
+- **POSIX server shutdown no longer reenters the queue mutex from a signal handler.**
+  SIGINT/SIGTERM now notify a normal shutdown thread through a pipe; the
+  second-signal immediate-exit escape remains. An early termination cannot be
+  overwritten when the queue loop starts. Production queue regressions cover
+  lock interruption, early stop, second-signal escape and handler restoration;
+  four real five-GPU model exits completed within the unchanged ten-second
+  limit, including the previously force-killed output-rejected configuration.
+  Its degenerate output remains rejected, not promoted as a speed candidate.
+
+- **New zero-prefix requests discard the preceding MTP hidden-state carry.**
+  After cache/checkpoint adjustments, a request with no retained prompt prefix
+  resets only its sequence's speculative state before prefill. Cached prefixes
+  and other slots are unchanged. A passive observer of six real five-GPU
+  requests found nonzero carry on all five reused requests before the fix and
+  zero carry on all six afterward; reference outputs and draft counts remain
+  unchanged. This fixes request-state isolation, not a claimed speedup or a
+  numerical explanation for every LateBind output difference.
+
+- **TP5 plan identity includes the actual Vulkan buffer, not just its extent.**
+  Same-offset/size views into distinct live buffers no longer qualify the old
+  native definition or reuse its captured descriptors. Real five-device
+  admission rejects the rebound target, with before/after evidence; pending
+  two-bank and partial-rank native owner draining also passes at logical epoch
+  zero. Single-prompt exact/aggressive completions recover natural EOS, but
+  repeated multiprompt quality is not established by that smoke. The opt-in
+  relay probe checks real rebound bindings and shares consumer progress across
+  mailbox banks, avoiding a false previous-bank completion on even chains.
+
+- **TP5 prepared decode uses a qualified two-bank definition, not a bank-only topology lock.**
+  Linear lowering checks compute command identity, plan keys/indices, capacity,
+  capture/isolation and resource generations against one definition recorded for
+  both mailbox polarities. Replaced definitions retain both command-pool owners
+  until actual native submissions complete. Graph rebuilds invalidate prepared
+  handles; a failed native submission cannot fall through to fallback execution.
+  TP5 warmup covers decode and configured MTP verification prefixes, restores
+  memory/sampler/performance state and aborts model loading on failure;
+  `--no-warmup` remains an explicit opt-out. CPU control-plane and single-device
+  replay/MMVQ smoke checks passed. Five-GPU binding/drain, repeated-request
+  prewarm equivalence, L2 and deep/single-row transition checks now pass.
+  The output-qualified 131-configuration search retained off/disabled/MTP1;
+  four independent current-server blocks did not establish a significant
+  speed advantage over the best qualified no-MTP reference. No new speedup
+  or mathematical global optimum is claimed.
+
 Earlier TP5 measurements using `--no-mmap` ran with an empty lazy PLE table.
 Those historical throughput and GPU-to-GPU equivalence results are not
 full-model correctness acceptance; repaired-model measurements are required.
