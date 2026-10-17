@@ -5518,11 +5518,11 @@ private:
 
         // Qualified MTP defaults determine draft horizon and placement; apply
         // them before deriving the target output-row capacity.
-        common_tp5_apply_env(params);
-        params_base = params;
+        params_base = params_load;
+        common_tp5_apply_env(params_base);
         params_base.n_ctx_kv_reserve.clear();
         params_base.n_parallel_pp = 1;
-        params_base = params_load;        params_base.n_outputs_max = server_n_outputs_max(params_base);
+        params_base.n_outputs_max = server_n_outputs_max(params_base);
         inference_mode = SERVER_INFERENCE_MODE_DECODE;
         id_slot_prefill = -1;
 
@@ -5532,10 +5532,6 @@ private:
 
         const bool has_mmproj = !params_base.mmproj.path.empty();
         const bool has_draft = params_base.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        if (params_base.rerot_enabled && spec_mtp) {
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end() ||
@@ -5621,8 +5617,8 @@ private:
                 GGML_ASSERT(!params_base.fit_params_target.empty());
                 const std::vector<ggml_backend_dev_t> target_fit_devices = server_target_fit_devices(params_base);
                 for (auto & [dev, size] : mmproj_mem) {
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        if (ggml_backend_dev_get(i) == dev) {
+                    for (size_t i = 0; i < target_fit_devices.size(); i++) {
+                        if (target_fit_devices[i] == dev) {
                             if (i < params_base.fit_params_target.size()) {
                                 SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
                                 params_base.fit_params_target[i] += size;
@@ -5965,7 +5961,7 @@ private:
 
             if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
                 try {
-                    spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                    spec.reset(common_speculative_init(params_base.speculative, n_exec_slots));
                 } catch (const std::exception & e) {
                     SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
                 }            }
@@ -6091,8 +6087,8 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             const size_t cache_token_limit = params_base.kv_unified && params_base.n_ctx_kv > 0 ? 0 : n_ctx;
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, cache_token_limit);
-            prompt_cache = std::make_unique<server_prompt_cache>(cache_ram_mib, n_ctx);        } else {
+            prompt_cache = std::make_unique<server_prompt_cache>(cache_ram_mib, cache_token_limit);
+        } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
@@ -6132,7 +6128,6 @@ private:
         }
 
         return true;
-    }
     }
 
     // unlike load_model(), this is only called once during initialization

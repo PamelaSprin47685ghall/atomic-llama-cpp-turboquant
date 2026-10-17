@@ -1569,10 +1569,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         batch = batch_storage->view();
         batch_capacity = (int32_t) llama_n_batch(ctx_dft);
         ubatch_capacity = (int32_t) llama_n_ubatch(ctx_dft);
-        batch = llama_batch_init(/*n_tokens=*/ batch_capacity, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
-        // llama_batch_init allocates only one of token/embd; MTP needs both.
-        // TODO: fix, how to call without malloc
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * batch_capacity);
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
@@ -1597,9 +1593,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // offload draft sampling to the backend (chained drafting outputs several
-        // rows per sequence, which backend sampling does not support)
+        // rows per sequence, which backend sampling does not support; a positive
+        // p_min requires the CPU path, which carries the full candidate vector)
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !chain_graph) {
+        if (this->params.backend_sampling && this->params.p_min <= 0.0f && !chain_graph) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_greedy());
@@ -1942,21 +1939,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             defer.seq.resize(k0 + n_tokens);
             defer.embd.resize((k0 + n_tokens) * (size_t) n_embd);
 
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-            for (int k = 0; k < n_tokens; ++k) {
-                defer.tok[k0 + k] = batch_in.token[k];
-                defer.pos[k0 + k] = batch_in.pos[k];
-                defer.seq[k0 + k] = batch_in.seq_id[k][0];
-                // shift the tgt embeddings to the right by one position (see the non-deferred path)
-                if (k > 0) {
-                    std::memcpy(defer.embd.data() + (k0 + k) * (size_t) n_embd, h_tgt + (size_t) (k - 1) * n_embd, row_bytes);
+            // Deferred catch-up rows carry the target hidden state. The device
+            // path owns those bytes on the device (host workspace is metadata
+            // only), so deferral is disabled there: the deferred branch below
+            // would memcpy from a null host pointer. chain_graph (the deferral
+            // producer) is only reachable on the !is_mem_shared host path, but
+            // guard explicitly so a future device+chain combination cannot
+            // dereference null.
+            if (!device_hidden) {
+                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                for (int k = 0; k < n_tokens; ++k) {
+                    defer.tok[k0 + k] = batch_in.token[k];
+                    defer.pos[k0 + k] = batch_in.pos[k];
+                    defer.seq[k0 + k] = batch_in.seq_id[k][0];
+                    // shift the tgt embeddings to the right by one position (see the non-deferred path)
+                    if (k > 0) {
+                        std::memcpy(defer.embd.data() + (k0 + k) * (size_t) n_embd, h_tgt + (size_t) (k - 1) * n_embd, row_bytes);
+                    }
                 }
-            }
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+                    std::memcpy(defer.embd.data() + (k0 + i_batch_beg[seq_id]) * (size_t) n_embd, workspace->pending(seq_id), row_bytes);
                 }
-                std::memcpy(defer.embd.data() + (k0 + i_batch_beg[seq_id]) * (size_t) n_embd, workspace->pending(seq_id), row_bytes);
             }
         } else if (!is_mem_shared) {
             if (!flush_deferred()) {
@@ -2538,6 +2544,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        // update the adaptive controller only when this implementation produced the
+        // accepted draft; on is_other the stats belong to a different speculator
+        if (adaptive && !is_other) {
+            const int depth_before = adaptive_ctrl[seq_id].n_cur;
+            adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, params.n_min_adaptive);
+            if (adaptive_ctrl[seq_id].n_cur != depth_before) {
+                SPC_DBG("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
+                        (int) seq_id, depth_before, adaptive_ctrl[seq_id].n_cur, n_last[seq_id], n_accepted);
+            }
+        }
+
         cur_cycle_accepted_tokens += n_accepted;
 
         if (workspace->accept(seq_id, n_accepted) && device_hidden) {
@@ -3101,6 +3118,12 @@ void common_speculative_impl_draft_mtp::reset() {
     std::fill(i_last.begin(), i_last.end(), -1);
     std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
     std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+    defer.tok.clear();
+    defer.pos.clear();
+    defer.seq.clear();
+    defer.embd.clear();
+    std::fill(n_cap.begin(), n_cap.end(), 0);
+    std::fill(n_last.begin(), n_last.end(), 0);
     for (auto & h : chain_h) {
         h.clear();
     }
@@ -3581,11 +3604,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                     impl->enable_device_hidden();
                 }
                 impls.push_back(std::move(impl));
-                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq, /*adaptive=*/ false));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq, /*adaptive=*/ true));                break;
+                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq, /*adaptive=*/ true));
+                break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(config.params, n_seq));

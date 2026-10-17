@@ -1444,7 +1444,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    llama_context_params cparams_copy = *cparams;
+    if (ctx_parent != nullptr) {
+        cparams_copy.ctx_other = ctx_parent;
+    }
+    llama_context * ctx = llama_init_from_model(model, cparams_copy);
     if (ctx == nullptr) {
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
@@ -1586,6 +1590,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu_dev == nullptr) {
+            llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
             throw std::runtime_error("no CPU backend found");
         }
         size_t free;
@@ -1649,6 +1654,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_ngl         = llama_model_n_layer(model) + llama_model_n_layer_nextn(model);
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
+
+    if (moe_tensors) {
+        const size_t count = llama_model_get_moe_tensor_info(model, nullptr, 0);
+        moe_tensors->resize(count);
+        const size_t written = llama_model_get_moe_tensor_info(model, moe_tensors->data(), moe_tensors->size());
+        GGML_ASSERT(written == count);
+    }
 
 
     common_memory_breakdown_print(ctx);
@@ -1756,7 +1768,7 @@ static void common_params_fit_impl(
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     const dmds_t dmds_full = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex,
-            log_level, &moe_tensors);
+            log_level, /*no_alloc=*/ true, &moe_tensors);
     const size_t nd = devs.size(); // number of devices
 
     auto log_stock_fit = [&] {

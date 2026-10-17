@@ -16,6 +16,15 @@ def test_server_start_simple():
     server.start()
     res = server.make_request("GET", "/health")
     assert res.status_code == 200
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "n_predict": 8,
+        "temperature": 0.0,
+        "ignore_eos": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["predicted_n"] == 8
+    assert res.body["stop_type"] == "limit"
 
 
 def test_server_props():
