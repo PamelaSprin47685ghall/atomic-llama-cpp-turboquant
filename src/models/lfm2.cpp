@@ -245,6 +245,7 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
         const bool is_moe_layer = il >= static_cast<int>(hparams.n_layer_dense_lead);
 
         auto * prev_cur = cur;
+        res->t_layer_inp[il] = prev_cur;
         cur             = build_norm(cur, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "model.layers.{}.operator_norm", il);
 

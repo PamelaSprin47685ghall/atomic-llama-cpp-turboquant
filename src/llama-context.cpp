@@ -6363,8 +6363,7 @@ class llama_io_write_device : public llama_io_write_i {
 
             mbuf.org.push_back(org);
             mbuf.cpy.push_back(cpy);
-            mbuf.org.push_back(ggml_view_1d(mbuf.ctx.get(), winfo.tensor, n, winfo.offset));
-            mbuf.cpy.push_back(ggml_new_tensor_1d(mbuf.ctx.get(), winfo.tensor->type, n));        }
+        }
 
         for (auto & [buft, mbuf] : mbufs_new) {
             auto & mbuf_cur = mbufs[buft];
