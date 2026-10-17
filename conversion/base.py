@@ -58,6 +58,11 @@ logger = logging.getLogger("hf-to-gguf")
 AnyModel = TypeVar("AnyModel", bound="type[ModelBase]")
 
 
+# for checkpoints that ship no config.json, we will try to provide a synthetic one
+HparamsMatcher = Callable[[Path], bool]
+HparamsLoader = Callable[[Path], dict[str, Any]]
+
+
 class SentencePieceTokenTypes(IntEnum):
     NORMAL = 1
     UNKNOWN = 2
@@ -77,6 +82,7 @@ class ModelBase:
         ModelType.TEXT: {},
         ModelType.MMPROJ: {},
     }
+    _hparams_loaders: list[tuple[HparamsMatcher, HparamsLoader]] = []
 
     dir_model: Path
     ftype: gguf.LlamaFileType
@@ -1112,10 +1118,41 @@ class ModelBase:
         return part_names
 
     @staticmethod
-    def load_hparams(dir_model: Path, is_mistral_format: bool):
+    def load_hparams_guess(dir_model: Path) -> dict[str, Any] | None:
+        # some models ship no config.json, will try to guess them
+        from conversion import load_all_models
+        load_all_models()
+
+        for matcher, loader in ModelBase._hparams_loaders:
+            if matcher(dir_model):
+                return loader(dir_model)
+        return None
+
+    @classmethod
+    def register_hparams_loader(cls, matcher: HparamsMatcher) -> Callable[[HparamsLoader], HparamsLoader]:
+        def inner(loader: HparamsLoader) -> HparamsLoader:
+            cls._hparams_loaders.append((matcher, loader))
+            return loader
+        return inner
+
+    @staticmethod
+    def load_hparams(dir_model: Path, is_mistral_format: bool, guess: bool = True):
         if is_mistral_format:
             with open(dir_model / "params.json", "r", encoding="utf-8") as f:
                 config = json.load(f)
+            return config
+
+        # a laya checkpoint (rl_agent_config.json + encoder/config.json) can carry a root config.json that
+        # is not its model config (HF wrapper configs, copies of rl_agent_config.json): the laya reference
+        # never reads it, so the laya loader claims the directory before AutoConfig
+        if (dir_model / "rl_agent_config.json").is_file() and (dir_model / "encoder" / "config.json").is_file():
+            from conversion.laya import _load_laya_hparams
+            return _load_laya_hparams(dir_model)
+
+        # checkpoints with a non-HF layout are matched by their own loader
+        # models with a HF layout can also register a hparams loader to switch to a custom class
+        config = ModelBase.load_hparams_guess(dir_model) if guess and dir_model.is_dir() else None
+        if config is not None:
             return config
 
         try:
@@ -1152,6 +1189,14 @@ class ModelBase:
             model_type = ModelType.MMPROJ if modelcls.model_arch == gguf.MODEL_ARCH.MMPROJ else ModelType.TEXT
             for name in names:
                 cls._model_classes[model_type][name] = modelcls
+            return modelcls
+        return func
+
+    @classmethod
+    def example(cls, *hf_repos: str) -> Callable[[AnyModel], AnyModel]:
+        del hf_repos  # unused
+
+        def func(modelcls: AnyModel) -> AnyModel:
             return modelcls
         return func
 

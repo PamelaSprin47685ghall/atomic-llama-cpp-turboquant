@@ -897,7 +897,6 @@ struct server_task {
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
-    std::string cache_key;
 
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
@@ -1034,7 +1033,6 @@ struct server_task {
         copy.rerot_episode_id = 0;
         copy.rerot_generation = rerot_generation;
         copy.rerot_original_user_text = rerot_original_user_text;
-
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723
         if (copy.params.sampling.seed != LLAMA_DEFAULT_SEED) {
@@ -1470,7 +1468,10 @@ struct server_task_result_metrics : server_task_result {
     // to_json omits every xkv_* key, so OFF responses keep the exact
     // pre-XKV schema.
     server_xkv_metrics xkv;
-
+    uint64_t n_draft_tokens_total      = 0;
+    uint64_t n_draft_accepted_total    = 0;
+    uint64_t n_draft_verif_steps_total = 0;
+    std::vector<uint64_t> n_accepted_per_pos_total;
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();

@@ -176,6 +176,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, // MTP with adaptive draft depth
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
@@ -239,14 +240,14 @@ struct common_params_sampling {
     float   temp               = 0.80f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities
     float   dynatemp_range     = 0.00f;  // 0.0 = disabled
     float   dynatemp_exponent  = 1.00f;  // controls how entropy maps to temperature in dynamic temperature sampler
-    int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty, -1 = context size)
+    int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty)
     float   penalty_repeat     = 1.00f;  // 1.0 = disabled
     float   penalty_freq       = 0.00f;  // 0.0 = disabled
     float   penalty_present    = 0.00f;  // 0.0 = disabled
     float   dry_multiplier     = 0.0f;   // 0.0 = disabled;      DRY repetition penalty for tokens extending repetition:
     float   dry_base           = 1.75f;  // 0.0 = disabled;      multiplier * base ^ (length of sequence before token - allowed length)
     int32_t dry_allowed_length = 2;      // tokens extending repetitions beyond this receive penalty
-    int32_t dry_penalty_last_n = -1;     // how many tokens to scan for repetitions (0 = disable penalty, -1 = context size)
+    int32_t dry_penalty_last_n = 64;     // how many tokens to scan for repetitions (0 = disable penalty)
     float   adaptive_target    = -1.0f;  // select tokens near this probability (valid range 0.0 to 1.0; negative = disabled)
     float   adaptive_decay     = 0.90f;  // EMA decay for adaptation; history ≈ 1/(1-decay) tokens (0.0 - 0.99)
     int32_t mirostat           = 0;      // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
@@ -329,10 +330,11 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
     bool    n_max_explicit = false; // preserve an explicit --spec-draft-n-max override
-
+    int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (also the starting depth)
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    bool chain = false; // chained drafting: all n_max tokens in one GPU decode (MTP only)
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;
@@ -351,6 +353,12 @@ struct common_params_speculative_draft {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    bool    eagle3                = false; // use EAGLE3 speculative decoding
+    bool    dflash                = false; // use DFlash speculative decoding
+    bool    dflash_defer_injection = true;  // defer encoder KV injection to draft time (set false for higher acceptance on some models)
+    int32_t n_ctx                 = 0;     // draft context size
+
 };
 
 struct common_params_speculative_ngram_mod {
@@ -390,19 +398,13 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
     }
-};
-
-struct common_params_vocoder {
-    struct common_params_model model;
-
-    std::string speaker_file; // speaker file path
-
-    bool use_guide_tokens = false; // enable guide tokens to improve TTS accuracy
 };
 
 struct common_params_diffusion {
@@ -417,6 +419,25 @@ struct common_params_diffusion {
 
     float   cfg_scale     = 0;        // classifier-free guidance scale
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
+};
+
+// llama-server --decision (see DECISION.md)
+struct common_params_decision {
+    bool        enabled            = false;
+    std::string spec_path          = "";    // sidecar decision.spec, replaces the one in the GGUF // NOLINT
+    std::string plan               = "";    // empty: plan from the spec                            // NOLINT
+    int32_t     queue              = 4;     // waiting requests before 429
+    int32_t     max_items          = 16;    // questions per systemone request, candidates per router request
+    bool        allow_uncalibrated = false; // router scores without a router calibration
+    bool        debug              = false; // raw logits, render endpoint, load delay for tests
+    std::string kernels            = "";    // laya matmul kernels; empty: from the spec, then "auto" // NOLINT
+    std::string precision          = "default"; // matmul precision request: default, strict      // NOLINT
+    std::string device             = "cpu"; // compute device: cpu, gpu, auto                        // NOLINT
+    int32_t     gpu                = 0;     // which GPU / iGPU device for gpu / auto (0 = the first)
+    bool        strict_placement   = false; // fail at load when a graph node falls back to the CPU
+    bool        threads_set        = false; // -t given: otherwise the engine runs on the performance cores
+    std::string convert_cache      = "";    // -m DIR: GGUF cache; empty: the user cache (llama.cpp/laya/gguf-cache) // NOLINT
+    std::string convert_type       = "f16"; // -m DIR: f16 or f32                                                  // NOLINT
 };
 
 // reasoning API response format (not to be confused as chat template's reasoning format)
@@ -450,8 +471,21 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
-struct common_params : wanxiangqi_common_params {
-    int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
+enum common_moe_cache_mode {
+    COMMON_MOE_CACHE_MODE_OFF,
+    COMMON_MOE_CACHE_MODE_AUTO,
+    COMMON_MOE_CACHE_MODE_ON,
+    COMMON_MOE_CACHE_MODE_SOFT,
+};
+
+struct common_moe_cache_params {
+    common_moe_cache_mode mode = COMMON_MOE_CACHE_MODE_AUTO;
+    size_t budget_mib          = 0;
+    bool mode_explicit         = false;
+    bool fit_selected          = false;
+};
+
+struct common_params : wanxiangqi_common_params {    int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     uint32_t n_ctx_kv              =     0; // unified KV capacity, 0 == n_ctx
     bool n_ctx_kv_auto             = false; // use all available device memory for the unified KV cache
@@ -462,9 +496,9 @@ struct common_params : wanxiangqi_common_params {
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     bool    n_parallel_explicit   = false; // whether -np / --parallel was explicitly provided by caller
-    int32_t n_parallel_pp         =     0; // number of parallel sequences reserved for prompt processing, 0 = n_parallel
-    int32_t n_sequences           =     1; // number of sequences to decode
+    int32_t n_parallel_pp         =     0; // number of parallel sequences reserved for prompt processing, 0 = n_parallel    int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
+    bool    gdn_replay            = false; // DRC: ingredient-replay rollback for GDN models instead of full K-snapshots [EXPERIMENTAL]
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
@@ -493,6 +527,8 @@ struct common_params : wanxiangqi_common_params {
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model
     enum llama_lazy_mode  lazy_mode  = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
 
+    enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; // on-demand reading of tensors marked by the arch
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
@@ -508,8 +544,8 @@ struct common_params : wanxiangqi_common_params {
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
-    struct common_params_vocoder     vocoder;
     struct common_params_diffusion   diffusion;
+    struct common_params_decision    decision;
 
     struct common_params_model model;
 
@@ -647,6 +683,7 @@ struct common_params : wanxiangqi_common_params {
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
+    common_moe_cache_params moe_cache;
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
     // TP5 (Qwen4EXP five-GPU tensor parallel); maps to GGML_TP5_* when enabled.
@@ -666,6 +703,7 @@ struct common_params : wanxiangqi_common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    uint32_t kv_stream_arena_mib = 0;        // shared CUDA KV + compute arena, 0 = disabled [EXPERIMENTAL]
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -823,6 +861,10 @@ struct common_params : wanxiangqi_common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+
+    // TTS params
+    std::string tts_lang = "";
+    std::string tts_speaker_file = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
@@ -1448,6 +1490,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+
+bool common_params_should_fit_device_memory(const common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 // returns true when applied (or already identical, a no-op); false when the

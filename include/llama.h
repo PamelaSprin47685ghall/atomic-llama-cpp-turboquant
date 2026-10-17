@@ -165,11 +165,13 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q8_CR         = 42, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ3_1S        = 43, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ4_1S        = 44, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_PQ2_0         = 141, // except 1d tensors (Prism-private group-128 Q2_0; kept < 0x400 to avoid the LLAMA_FTYPE_GUESSED bit)
         LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY  = 142, // legacy ftype id in some published ggufs
-
+        LLAMA_FTYPE_MOSTLY_Q5_CR         = 45, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q6_CR         = 46, // except 1d tensors
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
 
@@ -216,7 +218,8 @@ extern "C" {
     };
 
     enum llama_load_mode {
-        LLAMA_LOAD_MODE_NONE       = 0, // no special loading mode
+        LLAMA_LOAD_MODE_AUTO       = -1, // auto-detect based on device capabilities
+        LLAMA_LOAD_MODE_NONE       =  0, // no special loading mode
         LLAMA_LOAD_MODE_MMAP       = 1, // memory map the model
         LLAMA_LOAD_MODE_MLOCK      = 2, // force system to keep model in RAM rather than swapping or compressing
         LLAMA_LOAD_MODE_MMAP_MLOCK = 3, // mmap + force system to keep model in RAM rather than swapping or compressing
@@ -231,7 +234,10 @@ extern "C" {
         LLAMA_LAZY_MODE_AUTO   = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
         LLAMA_LAZY_MODE_ON     = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
         LLAMA_LAZY_MODE_DIRECT = 3, // like ON, but the arch reads the rows with explicit pread()s instead of demand paging the mmap
-    };
+    enum llama_tensor_read_lazy {
+        LLAMA_TENSOR_READ_LAZY_OFF  = 0, // always read the whole tensor up front
+        LLAMA_TENSOR_READ_LAZY_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+        LLAMA_TENSOR_READ_LAZY_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)    };
 
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
@@ -468,6 +474,12 @@ extern "C" {
         return result;
     }
 
+    enum llama_moe_cache_mode {
+        LLAMA_MOE_CACHE_MODE_UNSPECIFIED = -1,
+        LLAMA_MOE_CACHE_MODE_OFF = 0,
+        LLAMA_MOE_CACHE_MODE_AUTO = 1,
+        LLAMA_MOE_CACHE_MODE_ON = 2,
+    };
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -565,6 +577,8 @@ extern "C" {
         enum llama_load_mode  load_mode;  // how to load the model
         enum llama_lazy_mode  lazy_mode;  // on-demand reading of tensors marked by the arch
 
+        enum llama_tensor_read_lazy tensor_read_lazy; // on-demand reading of tensors marked by the arch
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
@@ -608,6 +622,7 @@ extern "C" {
         uint32_t n_seq_max_pp;      // max number of sequences used to reserve prompt-processing graphs, 0 = n_seq_max
         uint32_t n_seq_recurrent;   // physical recurrent-state slots, 0 = n_seq_max [EXPERIMENTAL]
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        bool     gdn_replay;        // ingredient-replay rollback instead of full K-snapshots when n_rs_seq > 0 [EXPERIMENTAL]
         uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
@@ -633,6 +648,9 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+
+        enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
+        size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -703,7 +721,13 @@ extern "C" {
         double                         xkv_min_saving;
         double                         xkv_min_factor_coverage;
         enum llama_xkv_factorizer      xkv_factorizer;
-    };
+        // [EXPERIMENTAL] block-granular KV cache streaming: total shared CUDA
+        // arena (compute workspace + resident KV pages + transfer ring), in
+        // MiB. 0 disables streaming.
+        // Appended here (not with the other [EXPERIMENTAL] fields above) so
+        // a caller built against a pre-streaming header keeps the same
+        // offsets for every field before it.
+        uint32_t kv_stream_arena_mib;    };
 
     struct llama_model_tensor_override {
         const char * pattern;
@@ -867,6 +891,19 @@ extern "C" {
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
+
+    // Return the *effective* K/V cache tensor type currently used by the context's memory.
+    // This can differ from the type_k/type_v requested via llama_context_params: some memory
+    // implementations silently rewrite the requested type at construction time (e.g. TurboQuant
+    // "auto-asymmetric" upgrades K to q8_0 for models with GQA ratio >= 6 when a symmetric turbo
+    // K+V cache was requested, to avoid catastrophic quality loss - see llama_kv_cache's ctor and
+    // its "auto-asymmetric" LLAMA_LOG_WARN).
+    //
+    // Returns GGML_TYPE_COUNT if ctx is NULL, if the memory has no K/V cache at all (e.g. pure
+    // recurrent/Mamba-style memory), or if the memory is a composite of multiple sub-caches that
+    // can legitimately hold different effective types (e.g. DSV4's raw/CSA/HCA/indexer caches).
+    LLAMA_API enum ggml_type llama_get_kv_cache_type_k(const struct llama_context * ctx);
+    LLAMA_API enum ggml_type llama_get_kv_cache_type_v(const struct llama_context * ctx);
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
@@ -1917,7 +1954,18 @@ extern "C" {
     LLAMA_API int32_t llama_flashprefill_metrics_drain(
             struct llama_context * ctx,
             llama_flashprefill_metrics_slice * out);
+    // Describes the role of subsequent llama_decode() batches for
+    // phase-specialized memory allocators. It does not change model math.
+    enum llama_decode_phase {
+        LLAMA_DECODE_PHASE_AUTOMATIC  = 0,
+        LLAMA_DECODE_PHASE_PROMPT     = 1,
+        LLAMA_DECODE_PHASE_GENERATION = 2,
+    };
 
+    // The selected phase remains active until changed. AUTOMATIC preserves
+    // the traditional token-count heuristic for callers without phase state.
+    LLAMA_API void llama_set_decode_phase(
+        struct llama_context * ctx, enum llama_decode_phase phase);
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
@@ -2370,7 +2418,7 @@ extern "C" {
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(
                              int32_t   n_vocab,
-                             int32_t   penalty_last_n,   // last n tokens to penalize (0 = disable penalty, -1 = context size)
+                             int32_t   penalty_last_n,   // last n tokens to penalize (0 = disable penalty)
                                float   penalty_repeat,   // must be > 0.0, 1.0 = disabled
                                float   penalty_freq,     // must be finite, 0.0 = disabled
                                float   penalty_present); // must be finite, 0.0 = disabled
@@ -2378,11 +2426,10 @@ extern "C" {
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(
             const struct llama_vocab *  vocab,
-                             int32_t    n_ctx_train,
                                float    dry_multiplier,
                                float    dry_base,
                              int32_t    dry_allowed_length,
-                             int32_t    dry_penalty_last_n,
+                             int32_t    dry_penalty_last_n, // last n tokens to penalize (0 = disable penalty)
                           const char ** seq_breakers,
                               size_t    num_breakers);
 

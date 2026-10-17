@@ -1455,18 +1455,59 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_seq_recurrent = 1;
     }
 
-    if (params.fit_params) {
+    if (params.fit_params && !common_params_should_fit_device_memory(params)) {
+        COM_INF("%s", "skipping device-memory auto-fit because a shared KV/compute arena is explicitly configured\n");
+    }
+    if (common_params_should_fit_device_memory(params)) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
-        const uint32_t n_ctx_min = (params.n_ctx_kv_auto || params.n_ctx_kv > 0)
-            ? UINT32_MAX
-            : params.fit_params_min_ctx;
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
+        // Snapshot the pre-fit state so a failed fit can be rolled back to a
+        // documented fallback instead of continuing with an unproven placement.
+        const llama_model_params mparams_before = mparams;
+        const llama_context_params cparams_before = cparams;
+        const std::vector<float> tensor_split_before(
+                params.tensor_split, params.tensor_split + llama_max_devices());
+        const std::vector<llama_model_tensor_buft_override> tbo_before =
+            params.tensor_buft_overrides;
+        const common_moe_cache_params moe_cache_before = params.moe_cache;
+
+        const common_params_fit_status fit_status = common_fit_params(
+            params.model.path.c_str(), &mparams, &cparams,            params.tensor_split,
             params.tensor_buft_overrides.data(),
+            &params.moe_cache,
             params.fit_params_target.data(),
             n_ctx_min,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
+            throw std::runtime_error(
+                "failed to fit parameters to device memory (hard error); retry with -fit off");
+        }
+        if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            COM_ERR("%s", "fit could not prove a viable placement; restoring the pre-fit parameters\n");
+            mparams = mparams_before;
+            cparams = cparams_before;
+            std::copy(tensor_split_before.begin(), tensor_split_before.end(), params.tensor_split);
+            params.tensor_buft_overrides = tbo_before;
+            params.moe_cache = moe_cache_before;
+            // Re-point at the restored arrays (the override vector may have moved).
+            mparams.tensor_split = params.tensor_split;
+            mparams.tensor_buft_overrides = params.tensor_buft_overrides.empty()
+                ? nullptr : params.tensor_buft_overrides.data();
+        }
+    }
+
+    if (params.moe_cache.mode_explicit || params.moe_cache.fit_selected) {
+        const char * mode = params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF ? "off" :
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO ? "auto" :
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_SOFT ? "soft" : "on";
+        const char * placement = params.moe_cache.fit_selected ? " placement=cache-aware-fit" : "";
+        if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF) {
+            COM_INF("%s", "MoE cache: mode=off\n");
+        } else if (params.moe_cache.budget_mib > 0) {
+            COM_INF("MoE cache: mode=%s budget=%zu MiB/device%s; use -lv 4 for resolved backend state, actual pools, and statistics\n", mode, params.moe_cache.budget_mib, placement);
+        } else {
+            COM_INF("MoE cache: mode=%s budget=free-minus-reserve%s; use -lv 4 for resolved backend state, actual pools, and statistics\n", mode, placement);
+        }
     }
 
     llama_context_params cparams_mtp = {};
@@ -1843,23 +1884,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
 
-    //if (params.sampling.penalty_last_n == -1) {
-    //    LOG_TRC("%s: setting penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
-    //    params.sampling.penalty_last_n = llama_n_ctx(lctx);
-    //}
-
-    //if (params.sampling.dry_penalty_last_n == -1) {
-    //    LOG_TRC("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
-    //    params.sampling.dry_penalty_last_n = llama_n_ctx(lctx);
-    //}
-
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
 
-    const int32_t n_ctx = cparams.n_ctx > 0 ? (int32_t) cparams.n_ctx : llama_model_n_ctx_train(model);
     for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
-        pimpl->samplers[i].reset(common_sampler_init(model, params.sampling, n_ctx));
+        pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
         pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
     }
 
@@ -2168,7 +2198,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode       = params.lazy_mode;
-    mparams.tensor_split    = params.tensor_split;
+    mparams.tensor_read_lazy = params.tensor_read_lazy;    mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
@@ -2190,7 +2220,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end() ||
+                                          std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
 
     return mparams;
 }
@@ -2210,10 +2241,20 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     const uint32_t n_parallel_eff = params.n_parallel > 0 ? (uint32_t) params.n_parallel : 1u;
     const uint32_t pen_cap        = params.rerot_pen_max > 0 ? (uint32_t) params.rerot_pen_max : n_parallel_eff;
     cparams.n_seq_recurrent       = params.rerot_enabled ? std::max({ n_parallel_eff, pen_cap, 2u }) : 0;
-    cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+    cparams.n_seq_max         = params.n_parallel;
+    cparams.n_outputs_max     = params.n_outputs_max;
+    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    cparams.gdn_replay        = params.gdn_replay;    cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
+
+    if (cparams.n_rs_seq > 0) {
+        const uint32_t n_batch_min = cparams.n_rs_seq + 2;
+        cparams.n_batch  = std::max(cparams.n_batch,  n_batch_min);
+        cparams.n_ubatch = std::max(cparams.n_ubatch, n_batch_min);
+    }
+
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
@@ -2278,8 +2319,29 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.kv_stream_arena_mib = params.kv_stream_arena_mib;
+
+    if (params.moe_cache.mode_explicit) {
+        switch (params.moe_cache.mode) {
+            case COMMON_MOE_CACHE_MODE_OFF:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_OFF;
+                break;
+            case COMMON_MOE_CACHE_MODE_AUTO:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_AUTO;
+                break;
+            case COMMON_MOE_CACHE_MODE_ON:
+            case COMMON_MOE_CACHE_MODE_SOFT:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_ON;
+                break;
+        }
+    }
+    cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
 
     return cparams;
+}
+
+bool common_params_should_fit_device_memory(const common_params & params) {
+    return params.fit_params && params.kv_stream_arena_mib == 0;
 }
 
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params) {

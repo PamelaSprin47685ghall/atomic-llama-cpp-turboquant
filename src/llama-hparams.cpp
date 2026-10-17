@@ -209,8 +209,7 @@ uint32_t llama_hparams::n_embd_r() const {
     const uint32_t n_conv = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
 
     // PLE conv history needs its own row: Meta splits cache_r_l by head, so a history packed behind the first is unaddressable
-    // it lives in cache_ple_r_l instead, mirrored like the rest of the PLE module
-    return n_conv;
+    // it lives in cache_ple_r_l instead, mirrored like the rest of the PLE module    return n_conv;
 }
 
 uint32_t llama_hparams::n_embd_s() const {
@@ -228,6 +227,26 @@ uint32_t llama_hparams::n_embd_s() const {
 
     // corresponds to Mamba's ssm_states size
     return ssm_d_state * ssm_d_inner;
+}
+
+uint32_t llama_hparams::n_embd_s_ingredient() const {
+    // 4 per-token ingredient rows (k, v, g, beta) instead of a full [S_v, S_v, H_v] state --
+    // see ggml_gated_delta_net's emit_mode==1 output contract (ggml.h). Mirrors n_embd_s()'s
+    // branches, but returns 0 for wkv (RWKV's recurrence is not a delta-net rank-1 update, so
+    // ingredient-replay doesn't apply).
+    if (wkv_head_size != 0) {
+        return 0;
+    }
+
+    if (n_embd_head_kda != 0) {
+        // Kimi KDA layers: 4 * head_dim * n_head (see n_embd_s()'s KDA branch above).
+        return 4 * n_embd_head_kda * n_head();
+    }
+
+    // qwen35/qwen3next-style GDN (llm_build_delta_net_base): head_v_dim * num_v_heads ==
+    // ssm_d_inner by construction (see build_layer_attn_linear), and S_k == S_v is already
+    // required by ggml_gated_delta_net, so 4 * S_v * H_v simplifies to 4 * ssm_d_inner.
+    return 4 * ssm_d_inner;
 }
 
 bool llama_hparams::is_recr(uint32_t il) const {
@@ -291,10 +310,6 @@ uint32_t llama_hparams::n_embd_head_v_mla() const {
 }
 
 bool llama_hparams::has_kv(uint32_t il) const {
-    if (kv_only_nextn) {
-        return n_layer_nextn > 0 && il >= (n_layer() - n_layer_nextn);
-    }
-
     if (n_layer_kv_from_start >= 0) {
         if (il < (uint32_t) n_layer_kv_from_start) {
             return true;

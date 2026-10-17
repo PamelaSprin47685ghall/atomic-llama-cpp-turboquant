@@ -63,7 +63,7 @@ if (Vulkan_FOUND)
                              ggml-vulkan.cpp
                              ggml-vulkan-collective.cpp
                              ggml-vulkan-internal.h
-                             ../../include/ggml-vulkan.h
+                             ggml-vulkan-moe-cache.cpp                             ../../include/ggml-vulkan.h
                             )
 
     set(VULKAN_SHADER_GEN_CMAKE_ARGS "")

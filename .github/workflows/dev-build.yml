@@ -11,6 +11,11 @@ name: Dev Build (all platforms)
 
 on:
   workflow_dispatch:
+    inputs:
+      sign:
+        description: "Authenticode-sign the Windows runtime binaries (costs KeyLocker signatures)"
+        type: boolean
+        default: false
   push:
     branches:
       - dev
@@ -28,6 +33,7 @@ on:
       - '**/*.comp'
       - '**/*.glsl'
       - '**/*.metal'
+      - 'tests/laya/parity/**'
   # No paths filter: these jobs are required status checks on dev, and a
   # required check that never reports leaves the PR stuck in "Expected"
   # forever (e.g. a docs-only PR). Runs on PRs into master too so the
@@ -64,6 +70,7 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.21
         with:
           key: turboquant-linux-x64-vulkan
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           evict-old-files: 1d
 
       - name: Dependencies
@@ -134,6 +141,7 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.21
         with:
           key: turboquant-linux-x64-cuda-13.3
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           evict-old-files: 1d
 
       - name: Install CUDA Toolkit
@@ -222,6 +230,7 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.21
         with:
           key: turboquant-linux-arm64-cuda-13.3
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           evict-old-files: 1d
 
       # GCC 14: GGML_CPU_ALL_VARIANTS builds armv9.2+sme CPU variants, which
@@ -326,6 +335,7 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.21
         with:
           key: turboquant-linux-x64-cpu
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           evict-old-files: 1d
 
       - name: Dependencies
@@ -394,6 +404,7 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.21
         with:
           key: turboquant-linux-x64-cuda-12.4
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           evict-old-files: 1d
 
       - name: Install CUDA Toolkit
@@ -462,6 +473,58 @@ jobs:
             llama-turboquant-linux-x64-cuda-12.4.tar.gz
           retention-days: 14
 
+  # The CUDA archives ship PTX ("-virtual") for old and server GPUs, which the
+  # driver compiles on the user's machine. Compile those archs as real SASS here
+  # so a kernel that does not build for them (shared memory limits, missing arch
+  # guards) fails CI instead of failing at load time. Compile only, no archive.
+  linux-cuda-real-arch-check:
+    name: linux-cuda-${{ matrix.cuda }}-real-arch-check
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: '12.4'
+            pkg: '12-4'
+            archs: '50-real;61-real;70-real'
+          - cuda: '13.3'
+            pkg: '13-3'
+            archs: '75-real;80-real;90-real'
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-linux-cuda-${{ matrix.cuda }}-real-arch-check
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          evict-old-files: 1d
+
+      - name: Install CUDA Toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential \
+            cuda-nvcc-${{ matrix.pkg }} cuda-cccl-${{ matrix.pkg }} cuda-cudart-dev-${{ matrix.pkg }} libcublas-dev-${{ matrix.pkg }}
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+
+      - name: Compile ggml-cuda
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.archs }}" \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release --target ggml-cuda -j $(nproc)
+
   linux-x64-rocm:
     runs-on: ubuntu-22.04
     env:
@@ -483,6 +546,7 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.21
         with:
           key: turboquant-linux-x64-rocm
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           evict-old-files: 1d
 
       - name: Install ROCm
@@ -604,6 +668,7 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.21
         with:
           key: turboquant-windows-x64-${{ matrix.variant }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           # 500M (the action default) cannot hold a CUDA build, so the cache
           # thrashed and every run was effectively cold.
           max-size: ${{ startsWith(matrix.variant, 'cuda') && '2G' || '500M' }}
@@ -690,14 +755,19 @@ jobs:
               Copy-Item $_.FullName -Destination $dst -Force
             }
 
-      # Signed before staging, so the archive carries the signatures. Signing
-      # runs only on push: PR runs may lack the secrets, and dev binaries are
-      # for internal testing anyway.
+      # Dev binaries are for internal testing: unsigned by default. Every signed
+      # file costs one KeyLocker signature (about 200 per push when everything
+      # was signed). Sign on demand: a manual run with "sign", or the repository
+      # variable SIGN_DEV_BUILDS=true; then only the runtime the app runs, and a
+      # signing failure (quota, DigiCert outage) does not stop the archives from
+      # being published. Signed before staging, so the archive carries them.
       - name: Sign Windows binaries
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ github.event_name != 'pull_request' && (inputs.sign || vars.SIGN_DEV_BUILDS == 'true') }}
+        continue-on-error: true
         uses: ./.github/actions/windows-code-sign
         with:
           path: build\bin\Release
+          scope: runtime
           sm-api-key: ${{ secrets.SM_API_KEY }}
           sm-client-cert-b64: ${{ secrets.SM_CLIENT_CERT_FILE_B64 }}
           sm-client-cert-password: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
@@ -751,6 +821,7 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.21
         with:
           key: turboquant-windows-x64-rocm
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           # 9 gfx targets x every fattn/mmq template instance: a CUDA-sized build.
           max-size: 2G
           evict-old-files: 7d
@@ -895,10 +966,12 @@ jobs:
           $total = (Get-ChildItem -Path hip-out -File | Measure-Object -Property Length -Sum).Sum
           Write-Host ("  HIP backend payload total: {0:N1} MiB" -f ($total / 1MB))
 
-      # Same rule as the CUDA archives: everything in the payload carries a
-      # signature. The action skips files that already have a valid one, so
-      # AMD-signed DLLs keep AMD's signature and unsigned ones get ours.
+      # Same rule as the other Windows archives: signed on demand only (see
+      # "Sign Windows binaries"). The whole payload is runtime; the action skips
+      # files that already have a valid signature, so AMD-signed DLLs keep AMD's.
       - name: Sign HIP backend
+        if: ${{ github.event_name != 'pull_request' && (inputs.sign || vars.SIGN_DEV_BUILDS == 'true') }}
+        continue-on-error: true
         uses: ./.github/actions/windows-code-sign
         with:
           path: hip-out
@@ -926,6 +999,7 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.21
         with:
           key: turboquant-macos-arm64
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           evict-old-files: 1d
 
       # Signing runs only on push: PR runs may lack the secrets, and dev
@@ -1023,6 +1097,104 @@ jobs:
             llama-turboquant-macos-arm64.zip
             llama-turboquant-macos-arm64.tar.gz
           retention-days: 14
+
+  # Decision mode (DECISION.md): C++ unit tests and the offline server contract
+  # tests. Warnings are errors on the Linux leg only. Builds only what the
+  # tests need and no archive, so publish-dev-latest does not wait for it.
+  decision-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-decision-tests-${{ matrix.os }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          evict-old-files: 1d
+
+      # before the builds: CMake registers the tiny-GGUF fixture of test-laya-backend-parity only when
+      # its interpreter has numpy and pyyaml
+      - name: Python setup
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          pip-install: -r tools/server/tests/requirements.txt
+
+      - name: Build (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DPython3_EXECUTABLE="$(command -v python)"
+          cmake --build build --config Release -j $(nproc) \
+            --target test-decision-json test-decision-request test-decision-calib test-decision-router test-decision-reference test-decision-clef test-laya-convert llama-server llama-laya-cli llama-laya-convert test-laya-backend-precision test-laya-backend-parity
+
+      # same toolchain as the server.yml Windows job
+      - name: Build (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: cmd
+        run: |
+          cmake -B build -G "Ninja Multi-Config" ^
+            -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DGGML_NATIVE=OFF ^
+            -DLLAMA_CURL=OFF ^
+            -DLLAMA_OPENSSL=OFF ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_TESTS=ON ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DPython3_EXECUTABLE=%pythonLocation%\python.exe
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% ^
+            --target test-decision-json test-decision-request test-decision-calib test-decision-router test-decision-reference test-decision-clef test-laya-convert llama-server llama-laya-cli llama-laya-convert test-laya-backend-precision test-laya-backend-parity
+
+      # decision + the checkpoint converter (test-laya-convert, test-decision-checkpoint-cli); the Python
+      # cross-check (label python) needs torch + transformers 5.17 and runs locally (make_tiny_hf_laya.py --check)
+      - name: Unit tests
+        run: ctest --test-dir build -C Release -R "decision|laya-convert" -LE python --output-on-failure
+
+      # laya backend tests: exit code 77 (no GPU / iGPU device on the runner) counts as skipped
+      - name: Laya backend tests
+        run: ctest --test-dir build -C Release -L laya --output-on-failure
+
+      # the Python reference of the router rendering and the calibration tools; the golden file
+      # that test-decision-reference reads must match a fresh run of its generator
+      - name: Reference tests
+        shell: bash
+        env:
+          PYTHONIOENCODING: 'utf-8'
+        run: |
+          python -m pip install jsonschema
+          python tests/decision/gen_router_golden.py --check
+          python -m pytest -v tests/decision/test_reference.py
+
+      # offline: the tests generate a tiny random laya GGUF and a tiny random Clef GGUF
+      - name: Server tests
+        shell: bash
+        env:
+          PYTHONIOENCODING: ':replace'
+        run: |
+          cd tools/server/tests
+          python -m pytest -v unit/test_decision.py unit/test_decision_clef.py
+
+      # offline: backend parity gate, identity records, corpus regenerates to the recorded sha256
+      - name: Parity tooling tests
+        shell: bash
+        run: python -m pytest -v tests/laya/parity
 
   # Republishes the rolling `dev-latest` prerelease with whatever archives the
   # build jobs produced. Runs even when some jobs fail (if: always()) so a

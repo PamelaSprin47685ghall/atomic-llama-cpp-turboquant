@@ -28,6 +28,33 @@ struct xkv_state_fingerprints;
 struct llama_model;
 struct llama_context;
 
+// Auto-asymmetric turbo-K upgrade decision (see llama-kv-cache.cpp for the
+// full rationale: high-GQA-ratio models amplify turbo K's quantization
+// error, so symmetric turbo K+V gets K upgraded to q8_0). Exposed so
+// llama-context.cpp's block KV streaming page-geometry pre-scan can size
+// its bootstrap allocation off the same effective K type the llama_kv_cache
+// constructor will actually use, instead of the raw requested type - the
+// two must never diverge or the streaming runtime's bootstrap pool ends up
+// sized for the wrong page geometry.
+ggml_type llama_kv_cache_resolve_stream_type_k(
+        const llama_model & model, const llama_hparams & hparams,
+        ggml_type type_k, ggml_type type_v);
+
+// Layer-adaptive per-layer KV precision override (TURBO_LAYER_ADAPTIVE env
+// var - see llama-kv-cache.cpp for the mode legend). Exposed, like the
+// resolver above, so llama-context.cpp's block KV streaming pre-scan can
+// detect ahead of time whether a model will actually get non-uniform
+// per-layer KV types: the streamed page pool has one page size and one
+// buffer type for the whole arena, so mixed q8_0/turbo2/turbo4 layers would
+// otherwise pack differently-shaped rows into pages sized for a layer that
+// isn't theirs.
+int llama_kv_cache_turbo_layer_adaptive_mode(ggml_type type_v, uint32_t n_layer);
+
+ggml_type llama_kv_cache_turbo_layer_adaptive_type_k(
+        int mode, ggml_type type_k, ggml_type type_v, uint32_t il, uint32_t n_layer);
+ggml_type llama_kv_cache_turbo_layer_adaptive_type_v(
+        int mode, ggml_type type_k, ggml_type type_v, uint32_t il, uint32_t n_layer);
+
 //
 // llama_kv_cache
 //
@@ -193,8 +220,11 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-        const llama_cparams   * cparams = nullptr);
-
+        const llama_cparams   * cparams,
+                 const char *   name_tag = "",
+                          size_t kv_stream_stage_bytes,
+                          void * kv_stream_phase_arena,
+                          size_t kv_stream_maximum_pool_bytes)
     ~llama_kv_cache();
 
     //
@@ -248,6 +278,9 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    bool has_kv_stream_targets() const override;
+    std::vector<llama_kv_stream_target> get_kv_stream_targets() const override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -273,269 +306,25 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    std::vector<uint32_t> get_layer_ids() const;
+    ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
+    bool get_v_transposed() const;
+
+    bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
+    bool kv_stream_resize_pool(
+        size_t pool_bytes, uint32_t active_tokens, uint32_t ring_slots);
 
     bool get_has_shift() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
 
-    // Actual storage types by logical model layer (including boundary-V
-    // overrides and reused layers), without allocating tensor views.
-    ggml_type layer_type_k(int32_t il) const;
-    ggml_type layer_type_v(int32_t il) const;
-
-    std::vector<uint32_t> get_layer_ids() const;
-    ggml_tensor * get_k_storage(int32_t il) const;
-    ggml_tensor * get_v_storage(int32_t il) const;
-
-    const llama_model   & get_model()   const { return model; }
-    const llama_hparams & get_hparams() const { return hparams; }
-    bool                  get_v_trans() const { return v_trans; }
-    bool                  get_attn_rot_k() const { return attn_rot_k; }
-    bool                  get_attn_rot_v() const { return attn_rot_v; }
-    const std::unordered_map<int64_t, std::vector<float>> & get_attn_rot_hadamard() const { return attn_rot_hadamard; }
-    int32_t               get_attn_rot_k_nrot() const;
-    int32_t               get_attn_rot_v_nrot() const;
-    const std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> & get_ctxs_bufs() const { return ctxs_bufs; }
-
-    // Back every cache buffer in device memory (see llama_memory_i::materialize).
-    void materialize() const override;
-    std::vector<ggml_context *> get_buffer_contexts() const;
-    uint32_t              get_stream_for_seq(llama_seq_id seq_id) const;
-    bool                  validate_seq_id(llama_seq_id seq_id) const;
-
-    // Layer alias resolution
-    uint32_t              get_owning_layer(uint32_t model_layer) const;
-
-    // Hot cache capacity and capabilities
-    uint32_t              get_hot_size() const;
-    uint32_t              get_kv_hot_capacity() const override;
-    bool                  can_use_legacy_attention() const override;
-    bool                  is_xkv_bounded_hot() const override;
-    std::shared_ptr<llama_xkv::xkv_hot_slot_pool> get_hot_slot_pool() const;
-
-    // Apply a validated hot release plan after segment publish
-    bool apply_hot_release_plan(
-        const llama_xkv::xkv_hot_release_plan & plan,
-        std::string * err = nullptr);
-
-    // Atomic precommit for the seal path (replaces post-publish release).
-    // Preflight: the plan triple is validated read-only against pool and
-    // store (presence, generation, seal-lock). Commit: the pool triple is
-    // validated + released inside one pool lock. After success, the store
-    // publish of the same payloads is guaranteed no-fail with respect to the
-    // hot rows, so no separate fallible post-publish pool step may run.
-    // The runtime must call this BEFORE seal/publish while the rows are still
-    // pool-bound; tensor data stays resident until reused, and maintain runs
-    // with no interleaving reservation. SHADOW and unbounded caches never
-    // release: they return true immediately without touching pool or store.
-    bool precommit_hot_release(
-        const llama_xkv::xkv_hot_release_plan & plan,
-        std::string * err = nullptr);
-
-    // Seal-gate variant of precommit_hot_release for invocation while the
-    // store holds its own lock (or a reserved seal nonce): performs ZERO
-    // store calls and only takes the pool lock, so it cannot deadlock on the
-    // non-recursive store mutex. Lock order is store -> pool; no path in this
-    // file ever takes the pool lock while holding the store lock and then
-    // calls back into the store. The store must prevalidate under its own
-    // lock, reserve the seal nonce (blocking concurrent mutation of these
-    // payloads), invoke this, then relock/verify the nonce and commit
-    // allocation-free. SHADOW/unbounded early-true as above.
-    bool precommit_hot_release_nostore(
-        const llama_xkv::xkv_hot_release_plan & plan,
-        std::string * err = nullptr);
-
-    // Seal-protocol split halves (see precommit docs). validate_hot_release is
-    // the read-only pre-seal stage: triple shape, pool binding+generation,
-    // store presence+generation, and unlocked pre-seal rows. Zero mutation;
-    // never call it while holding the store lock (it locks internally).
-    // commit_hot_release is the gate callback: SHADOW/unbounded early-true,
-    // otherwise pool release only with zero store calls, safe under the
-    // store lock. Invoke at most once per seal, only after a successful
-    // validate with unbroken quiescence; gate-false/throw leaves every
-    // subsystem unmutated (pool release is single-lock atomic).
-    bool validate_hot_release(
-        const llama_xkv::xkv_hot_release_plan & plan,
-        std::string * err = nullptr);
-    bool commit_hot_release(
-        const llama_xkv::xkv_hot_release_plan & plan,
-        std::string * err = nullptr);
-
-    // XKV shared store accessor
-    std::shared_ptr<llama_xkv::llama_xkv_cache_store> get_xkv_store() const;
-    void init_xkv_store(const llama_cparams & cparams);
-    const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
-
-    bool has_cell_ext() const;
-
-    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
-
-    // XKV runtime coordinator (nullptr for OFF/MTP or rejected configs).
-    // Owns safe-boundary sealing, admission planning, and snapshot joins.
-    llama_xkv::llama_xkv_runtime * get_xkv_runtime();
-    const llama_xkv::llama_xkv_runtime * get_xkv_runtime() const;
-
-    // Persistent shared backend executor per device/buft (cached, delegating to other if view)
-    std::shared_ptr<struct ggml_backend> get_xkv_executor(ggml_backend_buffer_type_t buft = nullptr) const;
-
-    // RERoT write tags are sequence-scoped control state. apply_ubatch() copies
-    // the active tag into each newly allocated physical cell. Ordinary
-    // sequences have a cleared tag and therefore retain stock behavior.
-    bool rerot_set_write_tag(llama_seq_id seq_id, const llama_kv_rerot_meta & tag) override;
-    void rerot_clear_write_tag(llama_seq_id seq_id) override;
-
-    bool rerot_can_publish_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        size_t * count) const override;
-
-    bool rerot_can_reclassify_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_rerot_visibility expected,
-        llama_rerot_visibility replacement,
-        uint64_t publish_epoch,
-        size_t * count) const override;
-
-    // Atomically publish every resident cell of a pending logical run. Returns
-    // the number of cells transitioned; zero means no matching pending cells.
-    size_t rerot_publish_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        uint64_t publish_epoch) override;
-
-    size_t rerot_reclassify_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_rerot_visibility expected,
-        llama_rerot_visibility replacement,
-        uint64_t publish_epoch) override;
-
-    bool rerot_can_add_run_ref(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_seq_id seq_id,
-        size_t * count) const override;
-
-    size_t rerot_add_run_ref(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_seq_id seq_id) override;
-
-    // Physical lookup of one logical run across all streams. Appends
-    // (stream, cell) pairs in (stream, cell) order and returns the count.
-    // KV-internal: the server scheduler stores run ids only and must never
-    // cache physical indices across compaction, eviction, or restore.
-    size_t rerot_find_run_cells(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        std::vector<std::pair<uint32_t, uint32_t>> * out) const;
-
-    // Attention-only archive freeze (§7.2) for one execution sequence: every
-    // PUBLIC_LIVE resident cell of episode_id referenced by exec_seq gains
-    // archive_seq as keeper, then exec_seq is fully released. No K/V data
-    // moves and visibility metadata is untouched. The returned kept count
-    // may be zero (e.g. purely private history) while exec_seq is still
-    // released. Returns 0 without touching anything when the ids are
-    // invalid, cross different streams, or address a view cache.
-    bool rerot_can_freeze_to_archive(
-        uint64_t episode_id,
-        llama_seq_id exec_seq,
-        llama_seq_id archive_seq,
-        size_t * count) const;
-
-    size_t rerot_freeze_to_archive(
-        uint64_t episode_id,
-        llama_seq_id exec_seq,
-        llama_seq_id archive_seq);
-
-    // v1 persistence guard (§5.5/§25): true when saving seq_id (or the whole
-    // cache for -1) would silently drop RERoT classification, in which case
-    // state_write() refuses with an explicit error instead. Ordinary,
-    // untagged state never triggers this.
-    bool rerot_blocks_state_save(llama_seq_id seq_id) const;
-
-    bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
-    void rerot_clear_reader_view(llama_seq_id seq_id) override;
-
-    // Build the indexed, query-grouped layout consumed by the backend-neutral
-    // RERoT attention op. The returned key indices address the K/V view for the
-    // current unified stream.
-    llama_rerot_attn_layout rerot_build_attn_layout(
-        const llama_ubatch & ubatch,
-        uint32_t n_kv,
-        llama_rerot_attn_layout * assembly_scratch = nullptr) const;
-
-    // World maintenance (twelfth round). ensure_rerot_world() brings the
-    // persistent shared world to the current cells state: valid + generation
-    // match -> reuse; anything else -> one full structural rebuild over the
-    // resident cells (the eleventh-round cost, paid only at structural
-    // events and untracked mutations). Returns a reference to the world
-    // with keys_ref() positions matching the CURRENT cells state.
-    const llama_rerot_shared_world & ensure_rerot_world() const;
-
-    bool rerot_batch_active(const llama_ubatch & ubatch) const;
-
-    // Resolve a logical PAC-DFS view after any TriAttention eviction or cache
-    // compaction. Resident cells are ordered by the logical run sequence and
-    // densely repacked in virtual address space.
-    rerot_resolved_view rerot_resolve_view(const llama_rerot_reader_view & view) const;
-
-    // ========================================================================
-    // Bounded staging capture API for committed seal ranges (§5.3)
-    // ========================================================================
-    bool can_capture_prerope_range(
-        llama_seq_id seq_id,
-        uint32_t cell_start,
-        uint32_t cell_count,
-        std::string * reason = nullptr) const;
-
-    //
-    // FlashPrefill legal-fragment planning (CacheFragments)
-    //
-    // Owner-derived short-lived layout: legal fragments, query phase groups
-    // (same structure as the existing graph RoPE input; K is never re-phased)
-    // and deduped exact rows. The old indexed rerot_build_attn_layout() above
-    // is preserved untouched as the dense/oracle OFF path; building this
-    // layout never forces old entries generation.
-    //
-    // role uses the frozen llama_flashprefill_role values; only PREFILL
-    // (ordinary) and REROT_TEACHER_FORCED are ever eligible, everything else
-    // yields an ineligible layout carrying its dense reason (never sparse on
-    // doubt). block_k/BN, causal, and capacities come from params (caller
-    // maps policy/wire config); SWA/alibi/2-D capability gates are evaluated
-    // here from owner state. out is always assigned (cleared first).
-    // Returns true iff the layout is eligible. Hard errors set error and
-    // return false; policy ineligibility is not an error.
-    bool flashprefill_build_layout(
-        const llama_ubatch & ubatch,
-        int32_t role,
-        const llama_flashprefill_layout_params & params,
-        llama_flashprefill_layout & out,
-        std::string * error = nullptr) const;
-
-    // Owner cache-side mutation epoch. Bumped on every metadata mutation
-    // (append, seq_rm/cp/keep/add/div, reclaim, compact, shift update,
-    // restore, publish/reclassify/ref/freeze, view/tag writes) once the flash
-    // path is active; OFF performs no counter writes at all. Layouts stamp
-    // this value plus the per-stream CellGeneration pairs; any mismatch means
-    // stale (fail-closed).
-    uint64_t flashprefill_epoch() const { return fp_epoch; }
-
-    // Lazily opt into CellGeneration tracking on every stream. Called from the
-    // flash path only (first build); OFF never calls it, so OFF keeps zero
-    // generation overhead. Idempotent.
-    void flashprefill_enable_tracking() const;
-
-    bool flashprefill_tracking_enabled() const;
-
-    // Per-stream CellGeneration (stamp, generation) pairs for freshness keys.
-    // Never exact-+1 compares; saturated (MAX) either means always-invalid.
-    void flashprefill_cell_stamps(std::vector<llama_flashprefill_cell_stamp> & out) const;
-
-    uint32_t flashprefill_n_streams() const;
-
+        const llama_cparams   * cparams,
+                 const char *   name_tag = "",
+                          size_t kv_stream_stage_bytes,
+                          void * kv_stream_phase_arena,
+                          size_t kv_stream_maximum_pool_bytes)
     //
     // graph_build API
     //
@@ -597,9 +386,6 @@ public:
     // if cont == true, then the slot must be continuous
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
-
-    // Gemma4 MTP: one-token slot_info pointing at the last populated cell for seq_id (read-only graphs).
-    slot_info mtp_slot_info(llama_seq_id seq_id) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     // When victims_out != nullptr and dry_run == false, overwrite victims are
@@ -898,6 +684,47 @@ private:
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
+    struct kv_stream_runtime_owner {
+        using feedback_fn_t = bool (*)(
+            void *, uint64_t *, uint64_t *, double *, uint32_t *,
+            uint32_t *, uint32_t *, uint32_t *);
+        using span_feedback_fn_t = bool (*)(void *, double);
+        using reconfigure_fn_t = bool (*)(void *, uint32_t, uint32_t);
+        using repartition_fn_t = bool (*)(void *, uint32_t);
+        using decode_layout_fn_t = bool (*)(void *, uint32_t);
+        using mark_dirty_rows_fn_t = bool (*)(void *, const int64_t *, size_t);
+        using resize_pool_fn_t = bool (*)(void *, size_t, uint32_t, uint32_t);
+
+        void * runtime = nullptr;
+        void (*free_fn)(void *) = nullptr;
+        feedback_fn_t feedback_fn = nullptr;
+        span_feedback_fn_t span_feedback_fn = nullptr;
+        reconfigure_fn_t reconfigure_fn = nullptr;
+        repartition_fn_t repartition_fn = nullptr;
+        decode_layout_fn_t decode_layout_fn = nullptr;
+        mark_dirty_rows_fn_t mark_dirty_rows_fn = nullptr;
+        resize_pool_fn_t resize_pool_fn = nullptr;
+        uint32_t layer_count = 0;
+        uint32_t minimum_ring_slots = 0;
+        uint32_t decode_layout_pages = 0;
+        uint32_t starved_evaluations = 0;
+        uint32_t overprovisioned_evaluations = 0;
+        uint32_t evaluations_since_repartition = UINT32_MAX;
+        uint64_t previous_deadline_samples = 0;
+        uint64_t previous_deadline_misses = 0;
+        int64_t previous_adapt_us = 0;
+        uint32_t previous_query_tokens = UINT32_MAX;
+
+        ~kv_stream_runtime_owner() {
+            if (runtime != nullptr) {
+                free_fn(runtime);
+            }
+        }
+    };
+
+    // Declared before ctxs_bufs so the custom buffers release their runtime
+    // references before this owner releases the initial reference.
+    kv_stream_runtime_owner kv_stream_runtime;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
@@ -1008,7 +835,8 @@ private:
         const llama_xkv::xkv_state_config & cfg) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
-    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+    // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -1057,6 +885,9 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    bool has_kv_stream_targets() const override;
+    std::vector<llama_kv_stream_active_target> get_kv_stream_active_targets() const override;
 
     //
     // llama_kv_cache_context specific API

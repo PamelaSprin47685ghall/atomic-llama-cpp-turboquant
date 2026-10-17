@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-decision.h"
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -52,6 +53,22 @@ static inline void signal_handler(int signal) {
     shutdown_handler(signal);
 }
 #endif
+
+static void register_signal_handlers() {
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+    struct sigaction sigint_action;
+    sigint_action.sa_handler = signal_handler;
+    sigemptyset (&sigint_action.sa_mask);
+    sigint_action.sa_flags = 0;
+    sigaction(SIGINT, &sigint_action, NULL);
+    sigaction(SIGTERM, &sigint_action, NULL);
+#elif defined (_WIN32)
+    auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
+        return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
+    };
+    SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
+#endif
+}
 
 // satisfies -Wmissing-declarations (used by llama command)
 int llama_server(int argc, char ** argv);
@@ -126,13 +143,35 @@ int llama_server(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    return llama_server(params, argc, argv);
+    const int ret = llama_server(params, argc, argv);
+    // drain the log worker before the process exits: the common_log singleton is never destroyed
+    // (see common_log_main), and on Windows exit terminates the worker thread with entries still
+    // queued, which lost the last lines, e.g. why a --decision or laya start failed
+    common_log_pause(common_log_main());
+    return ret;
 }
 
 int llama_server(common_params & params, int argc, char ** argv) {
     bool is_run_by_cli = (argv == nullptr);
 
     common_models_handler models_handler;
+
+    // decision mode needs a local model, see server-decision.h
+    if (params.decision.enabled) {
+        if (!server_decision_prepare(params)) {
+            return 1;
+        }
+    } else if (!params.model.path.empty() && server_decision_gguf_arch(params.model.path) == "laya") {
+        SRV_ERR("%s is a laya decision model; start it with --decision (see DECISION.md)\n", params.model.path.c_str());
+        return 1;
+    } else if (!params.model.path.empty() && server_decision_foreign_laya_hint(params.model.path) != "") {
+        // ggmlc / laya-head files: llama.cpp cannot load them; a modern-bert encoder is a valid embedding model
+        SRV_ERR("%s: %s\n", params.model.path.c_str(), server_decision_foreign_laya_hint(params.model.path).c_str());
+        return 1;
+    } else if (!params.model.path.empty() && server_decision_is_checkpoint_dir(params.model.path)) {
+        SRV_ERR("%s is a laya checkpoint directory; start it with --decision (see DECISION.md)\n", params.model.path.c_str());
+        return 1;
+    }
 
     // note: router mode also accepts -hf remote-preset, so we need to check that first
     if (!is_run_by_cli && !params.model.hf_repo.empty()) {
@@ -153,27 +192,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
                                && params.model.hf_repo.empty();
 
     // skip device enumeration so the CUDA primary context stays uncreated
-    common_params_print_info(params, !is_router_server);
+    common_params_print_info(params, !is_router_server && !params.decision.enabled);
 
     if (!is_router_server) {
-        // Set an abort callback that prints a structured error message to
-        // stdout before abort() kills the process.  The parent's log thread
-        // (in router mode) reads stdout via a pipe and parses
-        // CMD_CHILD_TO_ROUTER_ERROR to capture the error for /v1/models.
-        // fflush(stdout) is essential: abort() does not flush stdio buffers.
-        ggml_set_abort_callback([](const char * msg) {
-            // Flatten multi-line messages so the fgets parser captures
-            // the full error, not just the first line.
-            char flat[4096];
-            size_t i;
-            for (i = 0; i < sizeof(flat) - 1 && msg[i]; i++) {
-                flat[i] = (msg[i] == '\n') ? ' ' : msg[i];
-            }
-            flat[i] = '\0';
-            fprintf(stdout, "%s%s\n", CMD_CHILD_TO_ROUTER_ERROR, flat);
-            fflush(stdout);
-        });
-
         // validate batch size for embeddings
         // embeddings require all tokens to be processed in a single ubatch
         // see https://github.com/ggml-org/llama.cpp/issues/12836
@@ -236,6 +257,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
     if (!ctx_http.init(params)) {
         SRV_ERR("%s", "failed to initialize HTTP server\n");
         return 1;
+    }
+
+    if (params.decision.enabled) {
+        const int ret = server_decision_main(params, ctx_http, shutdown_handler, is_run_by_cli ? std::function<void()>() : register_signal_handlers);
+        server_stream_session_manager_stop();
+        llama_backend_free();
+        return ret;
     }
 
     //
@@ -540,13 +568,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
     if (!is_run_by_cli) {
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
         signal_dispatcher.emplace(shutdown_handler);
-#elif defined (_WIN32)
-        auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
-            return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
-        };
-        SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
-#endif
-    }
+#else
+        register_signal_handlers();
+#endif    }
 
     SRV_INF("listening on %s\n", ctx_http.listening_address.c_str());
 

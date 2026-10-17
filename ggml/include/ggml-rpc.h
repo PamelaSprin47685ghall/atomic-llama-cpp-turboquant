@@ -24,8 +24,7 @@ extern "C" {
 // GGML_OP_XKV_LANDMARK/BUILD/ROWS/MERGE.
 // Bumped patch version because adding an op shifts the GGML_OP enum used in the RPC
 // wire protocol.
-static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
-#endif
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");#endif
 
 #define GGML_RPC_MAX_SERVERS       16
 

@@ -256,7 +256,6 @@ public:
         }
         // Disabling preserves stamp+generation (no reset to collision value).
     }
-
     void reset() {
         if (payload_id.size() < pos.size()) {
             payload_id.resize(pos.size(), 0);
@@ -1265,7 +1264,6 @@ private:
     //   }
     //
     std::vector<llama_pos> shift;
-
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;

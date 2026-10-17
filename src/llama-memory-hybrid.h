@@ -37,13 +37,16 @@ public:
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                     bool   gdn_replay_req,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
-    const llama_cparams   * cparams = nullptr);
-
+    const llama_cparams   * cparams,
+                     size_t kv_stream_stage_bytes,
+                     void * kv_stream_phase_arena,
+                     size_t kv_stream_maximum_pool_bytes
     ~llama_memory_hybrid() = default;
 
     //
@@ -149,7 +152,8 @@ public:
     llama_memory_kv_reclaim_result reclaim_kv(const llama_memory_kv_reclaim_request & request) override;
 
     bool positions_are_sparse() const override;
-
+    bool has_kv_stream_targets() const override;
+    std::vector<llama_kv_stream_target> get_kv_stream_targets() const override;
     //
     // llama_memory_hybrid specific API
     //
@@ -208,6 +212,9 @@ public:
     ggml_tensor * get_turbo_rot_forward() const override;
     ggml_tensor * get_turbo_rot_inverse() const override;
     ggml_tensor * get_turbo_innerq_scale_inv() const override;
+
+    bool has_kv_stream_targets() const override;
+    std::vector<llama_kv_stream_active_target> get_kv_stream_active_targets() const override;
 
     //
     // llama_memory_hybrid_context

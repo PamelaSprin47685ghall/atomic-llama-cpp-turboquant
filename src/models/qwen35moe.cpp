@@ -184,6 +184,8 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
+        res->t_layer_inp[il] = inpL;
+
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
@@ -524,10 +526,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
 
+
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);

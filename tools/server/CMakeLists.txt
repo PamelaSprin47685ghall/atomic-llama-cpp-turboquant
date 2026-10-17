@@ -44,6 +44,8 @@ set(TARGET llama-server-impl)
 
 add_library(${TARGET}
     server.cpp
+    server-decision.cpp
+    server-decision.h
     server-http.cpp
     server-http.h
     server-models.cpp
@@ -54,6 +56,7 @@ set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ../mtmd ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE decision)
 
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)

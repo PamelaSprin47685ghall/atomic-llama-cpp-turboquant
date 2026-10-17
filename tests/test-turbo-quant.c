@@ -1,5 +1,8 @@
+#include "ggml.h"
+
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -55,6 +58,75 @@ static void bounds_for(enum ggml_type type, float var,
     if (type == GGML_TYPE_TURBO3_0) floor = 0.90f;
     if (type == GGML_TYPE_TURBO4_0) floor = 0.93f;
     if (*cos_min < floor) *cos_min = floor;
+}
+
+/* Must match GGML_TQ_DOT_CHUNK in ggml/src/ggml-cpu/ggml-cpu.c. */
+#define TQ_DOT_CHUNK 256
+
+/* Block-boundary invariant behind the chunked TurboQuant vec_dot kernels.
+ *
+ * ggml_vec_dot_{turbo,tq}_* stage their dequant through a fixed-size chunk
+ * instead of a malloc'd whole-row buffer. That is only correct because every
+ * TurboQuant row dequant is a pure per-block loop with no cross-block state:
+ * dequantizing [0, k) in one call must be bit-identical to dequantizing it in
+ * block-aligned pieces with the source pointer advanced by
+ * (piece / blck_size) * type_size.
+ *
+ * This asserts exactly that, at row lengths that straddle the chunk size, so a
+ * future row dequant that carries state across blocks -- or a wrong stride in
+ * the vec_dot pointer advance -- fails here rather than silently corrupting a
+ * CPU-offloaded matmul. */
+static int check_chunked_dequant(enum ggml_type type, const char * name, int64_t k) {
+    const struct ggml_type_traits * tr = ggml_get_type_traits(type);
+
+    const int64_t blck = tr->blck_size;
+    if (k % blck != 0) {
+        printf("  %-9s k=%-5lld SKIP (not a whole number of blocks)\n", name, (long long) k);
+        return 0;
+    }
+
+    float * src   = malloc((size_t) k * sizeof(float));
+    void  * q     = malloc(ggml_row_size(type, k));
+    float * whole = malloc((size_t) k * sizeof(float));
+    float * piece = malloc((size_t) k * sizeof(float));
+
+    for (int64_t i = 0; i < k; i++) {
+        src[i] = sinf((float) i * 0.037f) * 3.0f;
+    }
+    ggml_quantize_chunk(type, src, q, 0, 1, k, NULL);
+
+    tr->to_float(q, whole, k);
+
+    const int64_t chunk = (TQ_DOT_CHUNK / blck) * blck;
+    const char * p = (const char *) q;
+    for (int64_t i = 0; i < k; i += chunk) {
+        const int64_t nc = (chunk < k - i) ? chunk : (k - i);
+        tr->to_float(p, piece + i, nc);
+        p += (nc / blck) * tr->type_size;
+    }
+
+    int64_t bad = -1;
+    for (int64_t i = 0; i < k; i++) {
+        if (memcmp(&whole[i], &piece[i], sizeof(float)) != 0) {
+            bad = i;
+            break;
+        }
+    }
+
+    if (bad >= 0) {
+        printf("  %-9s k=%-5lld FAIL at [%lld]: whole=%.9g chunked=%.9g\n",
+               name, (long long) k, (long long) bad,
+               (double) whole[bad], (double) piece[bad]);
+    } else {
+        printf("  %-9s k=%-5lld ok (blck=%lld, chunk=%lld)\n",
+               name, (long long) k, (long long) blck, (long long) chunk);
+    }
+
+    free(src);
+    free(q);
+    free(whole);
+    free(piece);
+    return bad >= 0 ? 1 : 0;
 }
 
 int main(void) {
@@ -113,7 +185,6 @@ int main(void) {
             uint8_t * enc_a = (uint8_t *)malloc(row_bytes);
             uint8_t * enc_b = (uint8_t *)malloc(row_bytes);
             CHECK_TRUE(enc_a && enc_b, "malloc enc");
-
             // Pattern 1: unit basis vector (WHT-domain checks + finiteness)
             memset(input, 0, sizeof(input));
             input[0] = 1.0f;

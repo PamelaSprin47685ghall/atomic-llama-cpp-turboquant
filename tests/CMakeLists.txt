@@ -238,6 +238,8 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 
+llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
@@ -561,6 +563,79 @@ llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-log.cpp)
+
+if (LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
+    # decision API library (tools/decision); kept outside the WIN32 shared block on purpose
+    llama_build_and_test(test-decision-json.cpp ARGS ${PROJECT_SOURCE_DIR}/tests/decision/golden)
+    llama_build_and_test(test-decision-request.cpp)
+    llama_build_and_test(test-decision-calib.cpp ARGS ${PROJECT_SOURCE_DIR}/tests/decision)
+    llama_build_and_test(test-decision-router.cpp)
+    llama_build_and_test(test-decision-reference.cpp ARGS ${PROJECT_SOURCE_DIR}/tests/decision/golden/router_cases.jsonl)
+    # clef prompt against encode_record of the model repo (tests/clef/gen_golden.py), with the vocabulary of
+    # Cloudflare/clef-flash (convert_hf_to_gguf.py --vocab-only; models/ggml-vocab-qwen35.gguf has the Qwen3 vocabulary)
+    add_test(NAME test-decision-clef-vocab
+             COMMAND ${CMAKE_COMMAND} -E tar xzf ${PROJECT_SOURCE_DIR}/tests/clef/ggml-vocab-clef.tar.gz
+             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(test-decision-clef-vocab PROPERTIES FIXTURES_SETUP clef-vocab LABELS main)
+    llama_build_and_test(test-decision-clef.cpp ARGS ${CMAKE_CURRENT_BINARY_DIR}/ggml-vocab-clef.gguf ${PROJECT_SOURCE_DIR}/tests/clef/golden/prompts.jsonl)
+    set_tests_properties(test-decision-clef PROPERTIES FIXTURES_REQUIRED clef-vocab)
+    foreach (test_target test-decision-json test-decision-request test-decision-calib test-decision-router test-decision-reference test-decision-clef)
+        target_link_libraries(${test_target} PRIVATE decision)
+    endforeach()
+
+    # llama-laya-cli -m <checkpoint dir>: GGUF cache (converted, then cache hit), Python bytes, same output as -m GGUF
+    add_test(NAME test-decision-checkpoint-cli
+             COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:llama-laya-cli> -DFIXTURES=${PROJECT_SOURCE_DIR}/tests/laya/convert
+                     "-DINPUTS=${PROJECT_SOURCE_DIR}/tests/laya/demo_input.json|${PROJECT_SOURCE_DIR}/tests/laya/golden/score_en.json"
+                     -DWORK=${CMAKE_CURRENT_BINARY_DIR}/decision-checkpoint-cli
+                     -P ${PROJECT_SOURCE_DIR}/tests/decision/checkpoint-cli.cmake)
+    set_tests_properties(test-decision-checkpoint-cli PROPERTIES LABELS main)
+
+    # laya HF checkpoint -> GGUF converter (tools/laya/laya-convert): tiny fixtures vs Python golden sha256
+    llama_build_and_test(test-laya-convert.cpp ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c
+                         ARGS ${PROJECT_SOURCE_DIR}/tests/laya/convert ${CMAKE_CURRENT_BINARY_DIR}/laya-convert-scratch)
+    target_link_libraries     (test-laya-convert PRIVATE laya-convert)
+    target_include_directories(test-laya-convert PRIVATE ${PROJECT_SOURCE_DIR}/vendor ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps)
+
+    # the same cases against a fresh Python conversion (exit 77 = skip without torch / transformers; LAYA_REF_PYTHON picks the interpreter)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-laya-convert-py
+                 COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/laya/make_tiny_hf_laya.py --check $<TARGET_FILE:llama-laya-convert>)
+        set_tests_properties(test-laya-convert-py PROPERTIES LABELS python SKIP_RETURN_CODE 77)
+    endif()
+
+    # laya GPU backends (Phase 4b): exit code 77 = no GPU / iGPU device in the build (skipped)
+    llama_build_and_test(test-laya-backend-precision.cpp LABEL laya)
+    target_link_libraries(test-laya-backend-precision PRIVATE laya)
+    set_tests_properties(test-laya-backend-precision PROPERTIES SKIP_RETURN_CODE 77)
+
+    # the replay test needs the tiny random laya GGUF, which a Python fixture generates (numpy, pyyaml:
+    # tools/server/tests/requirements.txt); -DPython3_EXECUTABLE=<venv>/bin/python picks the interpreter
+    llama_build(test-laya-backend-parity.cpp)
+    target_link_libraries(test-laya-backend-parity PRIVATE laya)
+    set(LAYA_TINY_PY_OK OFF)
+    if (Python3_Interpreter_FOUND)
+        # the fixture imports numpy and gguf-py (which needs pyyaml): without them the test is not registered
+        execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy, yaml"
+                        RESULT_VARIABLE LAYA_TINY_PY_RC OUTPUT_QUIET ERROR_QUIET)
+        if (LAYA_TINY_PY_RC EQUAL 0)
+            set(LAYA_TINY_PY_OK ON)
+        else()
+            message(STATUS "test-laya-backend-parity: ${Python3_EXECUTABLE} has no numpy / pyyaml, not registered")
+        endif()
+    endif()
+    if (LAYA_TINY_PY_OK)
+        set(LAYA_TINY_GGUF "${CMAKE_CURRENT_BINARY_DIR}/laya-tiny-backend.gguf")
+        add_test(NAME test-laya-tiny-gguf
+                 COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/decision/make_tiny_laya.py ${LAYA_TINY_GGUF})
+        set_tests_properties(test-laya-tiny-gguf PROPERTIES FIXTURES_SETUP laya-tiny LABELS laya)
+        llama_test(test-laya-backend-parity LABEL laya
+                   ARGS ${LAYA_TINY_GGUF} ${PROJECT_SOURCE_DIR}/tests/laya/parity/tiers.json)
+        set_tests_properties(test-laya-backend-parity PROPERTIES SKIP_RETURN_CODE 77 FIXTURES_REQUIRED laya-tiny)
+    endif()
+endif()
+
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
@@ -597,15 +672,61 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-grammar-indent.cpp)
 target_include_directories(test-grammar-indent PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-arg-parser.cpp)
+if (NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-kv-stream-plan.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-plan.cpp)
+    target_include_directories(test-kv-stream-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-kv-stream-config.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-config.cpp)
+    target_include_directories(test-kv-stream-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
+llama_build_and_test(test-kv-stream-softmax.cpp llama-kv-stream-softmax.cpp)
+if (GGML_CUDA)
+    llama_build_and_test(
+        test-kv-stream-bench-config.cpp
+        ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench/kv-stream-bench-config.cpp)
+    target_include_directories(test-kv-stream-bench-config PRIVATE ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench)
+    llama_build_and_test(test-kv-stream-cuda-buffer.cpp LABEL cuda)
+    target_include_directories(test-kv-stream-cuda-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    # The test exits 77 when no CUDA device is present (e.g. a CUDA build run
+    # on a GPU-less CI runner). ctest only treats that as a skip when
+    # SKIP_RETURN_CODE says so; without it the skip is recorded as a failure.
+    set_tests_properties(test-kv-stream-cuda-buffer PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build_and_test(test-kv-stream-cuda-attn.cpp LABEL cuda)
+    target_include_directories(test-kv-stream-cuda-attn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    llama_build_and_test(test-kv-stream-cuda-set-rows.cpp LABEL cuda)
+    target_include_directories(test-kv-stream-cuda-set-rows PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
+llama_build_and_test(test-speculative-adaptive.cpp)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    llama_build(test-moe-cache.cpp)
+    if (GGML_CUDA)
+        # The test compares the cache's budget grants against cudaMemGetInfo,
+        # the same query the cache uses. On UMA devices (GB10, Jetson) the
+        # backend device memory API reports /proc/meminfo instead, so the
+        # reserve calculation must match the cache's own view.
+        find_package(CUDAToolkit QUIET)
+        if (CUDAToolkit_FOUND)
+            target_compile_definitions(test-moe-cache PRIVATE GGML_CUDA=1)
+            target_include_directories(test-moe-cache PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+            target_link_libraries(test-moe-cache PRIVATE CUDA::cudart)
+        endif()
+    endif()
+    llama_test(test-moe-cache LABEL "main;backend")
+    # The test exits 77 when no CUDA device is present. ctest only treats that
+    # as a skip when SKIP_RETURN_CODE says so; without it, every CPU-only
+    # runner records the skip as a failure.
+    set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+endif()
+
+llama_build_and_test(test-moe-cache-fit.cpp)
 
 add_executable(test-flash-attn-bias test-flash-attn-bias.cpp)
 target_link_libraries(test-flash-attn-bias PRIVATE ggml)
@@ -673,6 +794,9 @@ endif()
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
+
+# TurboQuant WHT round-trip test (links ggml turbo codec symbols via llama)
+llama_build_and_test(test-turbo-quant.c LABEL "turbo")
 
 if (NOT LLAMA_USE_SYSTEM_GGML)
     # Needs non-public ggml-impl.h

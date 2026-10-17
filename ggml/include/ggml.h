@@ -181,7 +181,7 @@
 #            define GGML_API __declspec(dllimport) extern
 #        endif
 #    else
-#        define GGML_API __attribute__ ((visibility ("default")))
+#        define GGML_API __attribute__ ((visibility ("default"))) extern
 #    endif
 #else
 #    define GGML_API extern
@@ -429,15 +429,17 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_TURBO2_0 = 42, // TurboQuant 2-bit KV cache: WHT + 2-bit PolarQuant
-        GGML_TYPE_TURBO3_0 = 43, // TurboQuant 3-bit KV cache: WHT + 3-bit PolarQuant
-        GGML_TYPE_TURBO4_0 = 44, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant
+        GGML_TYPE_Q2_0    = 42,
+        GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: WHT + 2-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TURBO3_0 = 44, // TurboQuant 3-bit KV cache: WHT + 3-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
-        GGML_TYPE_Q2_0    = 47, // upstream id 42; renumbered on this fork (42-46 are TurboQuant), GGUFs quantized with upstream Q2_0 are incompatible
+        GGML_TYPE_TURBO4_0 = 47, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_Q8_CR   = 48, // Q8_0 blocks of a ConvRot-rotated tensor
+        GGML_TYPE_Q5_CR   = 49, // Q5_0 blocks of a ConvRot-rotated tensor
+        GGML_TYPE_Q6_CR   = 50, // Q6_K blocks of a ConvRot-rotated tensor
         GGML_TYPE_PQ2_0   = 142, // Prism-private Q2_0 at group size 128 (Q2_0 is group 64)
-        GGML_TYPE_COUNT   = 143,
-    };
+        GGML_TYPE_COUNT   = 143,    };
 
     // precision
     enum ggml_prec {
@@ -483,7 +485,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_PQ2_0   = 128, // except 1d tensors (Prism-private group-128 Q2_0)
-    };
+        GGML_FTYPE_MOSTLY_Q8_CR   = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q5_CR   = 30, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q6_CR   = 31, // except 1d tensors    };
 
     // available tensor operations:
     enum ggml_op {
@@ -2597,6 +2601,12 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2740,9 +2750,29 @@ extern "C" {
     //   beta  : [1, H_v, n_tokens, n_seqs]
     //   state : [S_v, S_v, H_v, n_seqs] -- initial recurrent state s0
     //
-    // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
+    // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K trailing
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    //
+    // emit_mode selects what a snapshot slot holds:
+    //   0 (default) - a full recurrent state [S_v, S_v, H_v] per slot, as above.
+    //   1 (ingredients) - the small per-token (k, v, g, beta) that produced that step's state,
+    //     each broadcast/padded to width S_v, packed as 4 rows of [S_v, H_v] per slot (k, v, g,
+    //     beta in that order), followed by ONE extra full [S_v, S_v, H_v] block (same layout as
+    //     emit_mode == 0's slot 0) holding the true final state after all n_tokens -- a fixed
+    //     once-per-call cost, not scaled by K. Replaying the K ingredients through another call to
+    //     this op with K == 1, using the checkpoint state s tokens back as `state`, reconstructs
+    //     the same state as that trailing final-state block (or as slot 0 of the emit_mode == 0
+    //     output) -- at O(S_v) storage per retained step instead of O(S_v^2), since q is not
+    //     needed to reconstruct state (only to produce attention output, which the replay caller
+    //     is expected to discard). When n_tokens > K, ONE further extra full [S_v, S_v, H_v] block
+    //     follows the final-state block: the state after processing the first (n_tokens - K)
+    //     tokens, i.e. immediately before the K-token retained window starts -- also a fixed,
+    //     once-per-call cost. This lets a caller replaying a partial-accept rollback start from
+    //     "the state before the whole uncertain window" without a second op call to recompute it:
+    //     the recurrence already passes through that exact intermediate value on its way to the
+    //     final state, so capturing it here is free relative to a separate K=1 call over the same
+    //     prefix. Omitted (and not counted in the output size) when n_tokens <= K.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2751,7 +2781,8 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
-            int64_t               K);
+            int64_t               K,
+            int32_t               emit_mode);
 
     GGML_API struct ggml_tensor * ggml_gated_delta_net_ext(
             struct ggml_context * ctx,
@@ -2842,8 +2873,7 @@ extern "C" {
     //
     // broadcast:
     //   ne3 % ne33 == 0
-    //
-    GGML_API struct ggml_tensor * ggml_lightning_indexer(
+    //    GGML_API struct ggml_tensor * ggml_lightning_indexer(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -2851,8 +2881,6 @@ extern "C" {
         struct ggml_tensor  * mask);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
-    // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
-    // using a richer representation through streams.
     //
     // hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
     //          -> [dst_hc, src_hc, n_tokens]
@@ -2876,11 +2904,9 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
 
-    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
-    //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
+    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens], post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
     //          -> [n_embd, hc, n_tokens]
-    //   result[i, dst, t] = x[i, t]*post[dst, t]
-    //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //   result[i, h, t] = x[i, t] * post[h, t] + sum_src residual[i, src, t] * comb[h, src, t]
     //
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,
@@ -3034,6 +3060,12 @@ extern "C" {
             int                   idx);
 
     GGML_API void ggml_build_forward_expand(
+            struct ggml_cgraph * cgraph,
+            struct ggml_tensor * tensor);
+
+    // add the tensor and its parents to the graph without marking them for compute
+    // the flag is set later, when the tensor is reached from a node that computes
+    GGML_API void ggml_build_forward_order(
             struct ggml_cgraph * cgraph,
             struct ggml_tensor * tensor);
 
