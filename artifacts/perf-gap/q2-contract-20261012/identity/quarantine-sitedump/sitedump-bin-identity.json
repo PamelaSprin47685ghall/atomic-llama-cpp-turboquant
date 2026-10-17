@@ -1,0 +1,15 @@
+{
+  "frozen_utc": "2026-10-12T20:51:05Z",
+  "purpose": "GAP1 step 2 site-dump pair: FUSED (entry open, upfold fixes, force-iter switch, site dump instrumentation) and REF (same + 3a entry revert to Q8_0-only)",
+  "fused": {
+    "source_tree": "/var/tmp/tp5-verify-rebuild-src (rebuild tree + site dump instrumentation)",
+    "build_dir": "/var/tmp/tp5-verify-rebuild-build (incremental, staleness disproven by GAP-1 step 0)",
+    "libggml_vulkan_so_sha256": "857ce9dde7457f098bf48419509f6e2d70a601cc1e0d7aa7f6373e01860fdf56"
+  },
+  "ref": {
+    "source_tree": "/var/tmp/tp5-sitedump-src-ref (copy of fused tree + entry revert)",
+    "build_dir": "/var/tmp/tp5-sitedump-build-ref (fresh full build)",
+    "libggml_vulkan_so_sha256": "be4946abcfaf81f5a5697891c2ecdaba1171e6768513f03a6a084bb0371d2a2a"
+  },
+  "instrumentation": "site-dumper 6 hunks (cstdio, hc_dump_site_count, helper, env block, 3 dump points) applied via exact edits from worktree; worktree untouched"
+}

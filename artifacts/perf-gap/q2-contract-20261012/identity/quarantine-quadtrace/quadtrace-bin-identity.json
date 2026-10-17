@@ -1,0 +1,6 @@
+{
+  "frozen_utc": "2026-10-13T00:51:00Z",
+  "purpose": "GAP-1 r12 fork adjudication: unified GAP1-QUAD (write side set_tensor + dump side site-weights), GAP1-FENCE post-fence readback (GGML_VK_GAP1_READBACK=1), GAP1-DUMPID tensor identity",
+  "tree": "/var/tmp/tp5-verify-rebuild-src (incremental, r11 wrtrace state + r12 instrumentation)",
+  "libggml_vulkan_so_sha256": "f6eaf122f8199cacd407c99f88e2513318cdfcf30206b11c3dc4b7d46c6207de"
+}

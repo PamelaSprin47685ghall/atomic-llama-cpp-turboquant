@@ -1,0 +1,10 @@
+{
+  "frozen_utc": "2026-10-12T17:07:46Z",
+  "purpose": "UPFOLD-FIX verification: clean 3e28b121a tree + ONLY the two upfold-fixer hunks (mul_mat_vec.comp HC_UP_FOLD aligned-path fold + ggml-vulkan.cpp dispatch_rows bf16 branch); no other dirty changes; HC_UP_FOLD macro already registered in HEAD shaders-gen",
+  "source_tree": "/var/tmp/tp5-verify-upfold-src (git archive 3e28b121a + 2 hunks)",
+  "build_dir": "/var/tmp/tp5-verify-upfold-build",
+  "diff_saved": "identity/quarantine-upfoldFix/upfold-fix.diff",
+  "libggml_vulkan_so_sha256": "9452b39a258c4a1089106bcf2358d799ff3fda8cee1250f5ebc0ad5e16a4c0f4",
+  "llama_server_sha256": "ab4e9260f382dc8cc967efd78cfa6c342030b95536a6c4e4e5f7b152e71ebef0",
+  "reference_clean_head_vk": "2e79d99e1dc52d6b787ad7227679240cf8222e5454f8a7c89b831eb5e7300991"
+}

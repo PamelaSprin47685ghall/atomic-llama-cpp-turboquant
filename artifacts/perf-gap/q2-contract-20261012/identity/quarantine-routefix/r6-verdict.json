@@ -1,0 +1,34 @@
+{
+  "frozen_utc": "2026-10-12T22:37:16Z",
+  "experiment": "GAP-1 route-fix verification (r6)",
+  "cpu_precheck": {
+    "test_count": 34,
+    "result": "OK (all 34 pass, incl. ContainerRoutingAuditTests 3 + UploadChainAuditTests)",
+    "note": "one import fix applied (missing `import os` in tests file — non-architectural, test-file-only)"
+  },
+  "route_fix": {
+    "diff": "identity/quarantine-routefix/route-fix.diff (48 lines, 2 guards: rebind-loop continue + GGML_ABORT for unregistered weight tensors on lazy init)",
+    "applied": "clean (hunk #2 offset 16 lines due to prior loadtrace instrumentation)",
+    "libggml_vulkan": "2d1fdb2371f3f97f… (unchanged — fix is in libggml-base not vulkan)",
+    "libllama": "0f9ec93a13e6f66b… (unchanged)"
+  },
+  "r6_loadtrace": {
+    "loadtrace_lines": 2688,
+    "guard1_continue_triggered": "NO (0 lines with \"ownership already established\" — no print was added for the continue path, so absence of print is NOT evidence of absence of trigger)",
+    "ggml_abort_triggered": "NO (0 matches for \"container routing fork\" — the lazy-init path either was not hit or the tensor WAS found registered)",
+    "mirrored_fanout": "384 calls, all 5 ranks valid simple tensors, full-size writes (unchanged from r5)",
+    "w_down_dispatch_binding": "subbuffer{buf=0x5eb7346fd930, off=1049041280}",
+    "w_down_loadtime_target": "rank0 simple{buf=0x5eb7346fc2c0, data=0x6c8f000}",
+    "binding_identity_match": "NO — 0x5eb7346fd930 (dispatch) != 0x5eb7346fc2c0 (load-time rank0) and not in the 5-rank set {fc2c0, fe400, …} (offset ~0x16a0 apart from rank0, consistent with a separate allocation)",
+    "w_dump": "ALL ZERO (5 ranks × 0/64)",
+    "lo_dump": "ALL ZERO (5 ranks × 0/320)",
+    "mixed_dump": "ALL ZERO (5 ranks × 0/2560)"
+  },
+  "verdict": "ROUTE_FIX_INSUFFICIENT — the two guards did not change the dispatch-side binding identity. The dispatch W_down still resolves to a buffer (0x5eb7346fd930) that is NOT the load-time simple tensor buffer (0x5eb7346fc2c0 family). Neither guard fired: guard 2 (GGML_ABORT) not triggered means the lazy-init path either is not taken for these tensors, or the tensor IS registered in the stc_static being checked (meaning the fork happens through a DIFFERENT mechanism than lazy-init). The identity mismatch persists exactly as in r5.",
+  "off_arm": "NOT_RUN (loadtrace check failed — step 4 blocked by step 3 gate)",
+  "next_candidates": [
+    "the fork may occur in the graph-build/tallocr path (ggml-alloc assigning new buffers for graph tensors), not in the meta simple_tensor lazy-init path the guards protect",
+    "the dispatch-side tensor may be a VIEW or clone of the weight tensor whose buffer binding was set during graph construction, bypassing the meta buffer entirely",
+    "instrument ggml_vk_tensor_subbuffer or the dispatch-side tensor->buffer assignment to trace WHERE the dispatch tensor gets buffer 0x5eb7346fd930"
+  ]
+}

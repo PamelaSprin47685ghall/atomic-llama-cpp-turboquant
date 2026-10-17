@@ -1,0 +1,4168 @@
+{
+  "status": "DIAGNOSTIC_NOT_RANKED",
+  "qualification": "NOT_REVIEWED",
+  "profile": "cycle",
+  "gpu_before": [
+    {
+      "card": "card1",
+      "bdf": "0000:0f:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17203200",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card2",
+      "bdf": "0000:09:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card3",
+      "bdf": "0000:0c:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card4",
+      "bdf": "0000:06:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card5",
+      "bdf": "0000:03:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    }
+  ],
+  "process_id": 1631160,
+  "loading_ms": 42408.599056,
+  "pooled_tps": 50.386638723076615,
+  "median_tps": 50.430761007199834,
+  "requests": [
+    {
+      "idx": 0,
+      "phase": "warmup",
+      "n": 160,
+      "predicted_ms": 3745.376,
+      "tps": 42.71934246388079,
+      "wall_ms": 8684.156212,
+      "finish": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 102,
+        "prompt_ms": 4933.887,
+        "prompt_per_token_ms": 48.37144117647058,
+        "prompt_per_second": 20.67335551057412,
+        "predicted_n": 160,
+        "predicted_ms": 3745.376,
+        "predicted_per_token_ms": 23.4086,
+        "predicted_per_second": 42.71934246388079,
+        "draft_n": 92,
+        "draft_n_accepted": 67
+      },
+      "issues": [],
+      "fallback_lines": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=97 uid=36028797018971137",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=97 uid=36028797018971649",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=97 uid=36028797018971905",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=97 uid=36028797018972417",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=97 uid=36028797018972929",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=97 uid=36028797018973441",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=10 n_sub=97 uid=36028797018974209",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=11 n_sub=97 uid=36028797019020033"
+      ],
+      "mtp_cycle_lines": [
+        "[tp5-mtp-cycle] cycle=1 draft_us=6320 target_us=361991 catchup_us=2118 handoff_us=0 total_us=370429 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=2 draft_us=4648 target_us=79131 catchup_us=813 handoff_us=0 total_us=84592 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=3 draft_us=2261 target_us=29605 catchup_us=400 handoff_us=0 total_us=32266 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=4 draft_us=2390 target_us=29296 catchup_us=347 handoff_us=0 total_us=32033 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=5 draft_us=2332 target_us=25061 catchup_us=501 handoff_us=0 total_us=27894 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=6 draft_us=2419 target_us=28028 catchup_us=534 handoff_us=0 total_us=30981 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=7 draft_us=2484 target_us=32892 catchup_us=334 handoff_us=0 total_us=35710 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=8 draft_us=2344 target_us=25856 catchup_us=512 handoff_us=0 total_us=28712 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=9 draft_us=2488 target_us=27000 catchup_us=457 handoff_us=0 total_us=29945 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=10 draft_us=2470 target_us=25313 catchup_us=452 handoff_us=0 total_us=28235 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=11 draft_us=2433 target_us=26899 catchup_us=507 handoff_us=0 total_us=29839 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=12 draft_us=2475 target_us=28066 catchup_us=507 handoff_us=0 total_us=31048 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=13 draft_us=2427 target_us=33076 catchup_us=359 handoff_us=0 total_us=35862 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=14 draft_us=2272 target_us=25327 catchup_us=461 handoff_us=0 total_us=28060 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=15 draft_us=2495 target_us=27427 catchup_us=495 handoff_us=0 total_us=30417 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=16 draft_us=2459 target_us=26930 catchup_us=510 handoff_us=0 total_us=29899 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=17 draft_us=2531 target_us=27492 catchup_us=556 handoff_us=0 total_us=30579 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=18 draft_us=2453 target_us=27130 catchup_us=484 handoff_us=0 total_us=30067 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=19 draft_us=2440 target_us=27217 catchup_us=502 handoff_us=0 total_us=30159 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=20 draft_us=2482 target_us=26486 catchup_us=437 handoff_us=0 total_us=29405 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=21 draft_us=2542 target_us=30434 catchup_us=254 handoff_us=0 total_us=33230 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=22 draft_us=2385 target_us=25177 catchup_us=543 handoff_us=0 total_us=28105 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=23 draft_us=2491 target_us=33417 catchup_us=350 handoff_us=0 total_us=36258 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=24 draft_us=2373 target_us=25911 catchup_us=504 handoff_us=0 total_us=28788 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=25 draft_us=2467 target_us=32478 catchup_us=245 handoff_us=0 total_us=35190 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=26 draft_us=2308 target_us=25178 catchup_us=557 handoff_us=0 total_us=28043 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=27 draft_us=2426 target_us=30724 catchup_us=271 handoff_us=0 total_us=33421 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=28 draft_us=2316 target_us=28457 catchup_us=245 handoff_us=0 total_us=31018 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=29 draft_us=2326 target_us=25734 catchup_us=557 handoff_us=0 total_us=28617 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=30 draft_us=2555 target_us=29519 catchup_us=579 handoff_us=0 total_us=32653 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=31 draft_us=2484 target_us=32744 catchup_us=314 handoff_us=0 total_us=35542 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=32 draft_us=2348 target_us=25435 catchup_us=514 handoff_us=0 total_us=28297 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=33 draft_us=2518 target_us=32412 catchup_us=253 handoff_us=0 total_us=35183 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=34 draft_us=2284 target_us=24865 catchup_us=487 handoff_us=0 total_us=27636 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=35 draft_us=2411 target_us=31611 catchup_us=288 handoff_us=0 total_us=34310 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=36 draft_us=2322 target_us=28461 catchup_us=307 handoff_us=0 total_us=31090 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=37 draft_us=2382 target_us=26588 catchup_us=496 handoff_us=0 total_us=29466 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=38 draft_us=2501 target_us=27433 catchup_us=461 handoff_us=0 total_us=30395 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=39 draft_us=2457 target_us=27450 catchup_us=488 handoff_us=0 total_us=30395 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=40 draft_us=2465 target_us=27346 catchup_us=471 handoff_us=0 total_us=30282 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=41 draft_us=2469 target_us=28068 catchup_us=461 handoff_us=0 total_us=30998 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=42 draft_us=2476 target_us=27820 catchup_us=507 handoff_us=0 total_us=30803 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=43 draft_us=2459 target_us=27266 catchup_us=459 handoff_us=0 total_us=30184 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=44 draft_us=2421 target_us=27019 catchup_us=502 handoff_us=0 total_us=29942 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=45 draft_us=2363 target_us=30525 catchup_us=330 handoff_us=0 total_us=33218 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=46 draft_us=2276 target_us=25236 catchup_us=522 handoff_us=0 total_us=28034 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=47 draft_us=2451 target_us=28024 catchup_us=463 handoff_us=0 total_us=30938 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=48 draft_us=2509 target_us=26147 catchup_us=467 handoff_us=0 total_us=29123 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=49 draft_us=2463 target_us=27879 catchup_us=455 handoff_us=0 total_us=30797 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=50 draft_us=2518 target_us=26819 catchup_us=487 handoff_us=0 total_us=29824 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=51 draft_us=2511 target_us=32050 catchup_us=265 handoff_us=0 total_us=34826 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=52 draft_us=2287 target_us=26239 catchup_us=497 handoff_us=0 total_us=29023 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=53 draft_us=2465 target_us=27278 catchup_us=523 handoff_us=0 total_us=30266 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=54 draft_us=2428 target_us=27985 catchup_us=518 handoff_us=0 total_us=30931 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=55 draft_us=2467 target_us=27616 catchup_us=534 handoff_us=0 total_us=30617 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=56 draft_us=2392 target_us=28326 catchup_us=527 handoff_us=0 total_us=31245 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=57 draft_us=2450 target_us=27298 catchup_us=522 handoff_us=0 total_us=30270 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=58 draft_us=2483 target_us=27501 catchup_us=540 handoff_us=0 total_us=30524 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=59 draft_us=2496 target_us=33231 catchup_us=307 handoff_us=0 total_us=36034 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=60 draft_us=2271 target_us=25429 catchup_us=527 handoff_us=0 total_us=28227 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=61 draft_us=2484 target_us=28106 catchup_us=556 handoff_us=0 total_us=31146 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=62 draft_us=2420 target_us=27467 catchup_us=485 handoff_us=0 total_us=30372 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=63 draft_us=2421 target_us=26893 catchup_us=531 handoff_us=0 total_us=29845 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=64 draft_us=2507 target_us=27288 catchup_us=495 handoff_us=0 total_us=30290 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=65 draft_us=2505 target_us=26850 catchup_us=460 handoff_us=0 total_us=29815 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=66 draft_us=2461 target_us=29882 catchup_us=301 handoff_us=0 total_us=32644 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=67 draft_us=2330 target_us=28367 catchup_us=341 handoff_us=0 total_us=31038 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=68 draft_us=2286 target_us=25513 catchup_us=488 handoff_us=0 total_us=28287 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=69 draft_us=2442 target_us=26375 catchup_us=435 handoff_us=0 total_us=29252 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=70 draft_us=2410 target_us=27378 catchup_us=470 handoff_us=0 total_us=30258 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=71 draft_us=2452 target_us=26451 catchup_us=494 handoff_us=0 total_us=29397 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=72 draft_us=2455 target_us=28060 catchup_us=499 handoff_us=0 total_us=31014 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=73 draft_us=2456 target_us=27452 catchup_us=463 handoff_us=0 total_us=30371 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=74 draft_us=2548 target_us=30820 catchup_us=322 handoff_us=0 total_us=33690 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=75 draft_us=2328 target_us=27959 catchup_us=225 handoff_us=0 total_us=30512 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=76 draft_us=2269 target_us=25442 catchup_us=459 handoff_us=0 total_us=28170 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=77 draft_us=2433 target_us=26326 catchup_us=465 handoff_us=0 total_us=29224 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=78 draft_us=2453 target_us=26032 catchup_us=456 handoff_us=0 total_us=28941 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=79 draft_us=2484 target_us=25761 catchup_us=434 handoff_us=0 total_us=28679 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=80 draft_us=2434 target_us=26587 catchup_us=418 handoff_us=0 total_us=29439 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=81 draft_us=2484 target_us=28239 catchup_us=289 handoff_us=0 total_us=31012 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=82 draft_us=2341 target_us=24854 catchup_us=425 handoff_us=0 total_us=27620 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=83 draft_us=2494 target_us=31055 catchup_us=252 handoff_us=0 total_us=33801 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=84 draft_us=2318 target_us=26526 catchup_us=268 handoff_us=0 total_us=29112 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=85 draft_us=2299 target_us=25152 catchup_us=536 handoff_us=0 total_us=27987 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=86 draft_us=2506 target_us=30887 catchup_us=298 handoff_us=0 total_us=33691 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=87 draft_us=2319 target_us=25100 catchup_us=469 handoff_us=0 total_us=27888 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=88 draft_us=2409 target_us=26463 catchup_us=427 handoff_us=0 total_us=29299 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=89 draft_us=2437 target_us=25015 catchup_us=451 handoff_us=0 total_us=27903 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=90 draft_us=2400 target_us=508436 catchup_us=577 handoff_us=0 total_us=511413 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=91 draft_us=6573 target_us=64632 catchup_us=500 handoff_us=0 total_us=71705 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=92 draft_us=2431 target_us=29250 catchup_us=529 handoff_us=0 total_us=32210 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0"
+      ]
+    },
+    {
+      "idx": 1,
+      "phase": "measured",
+      "n": 160,
+      "predicted_ms": 3081.519,
+      "tps": 51.92244474234948,
+      "wall_ms": 6846.466069,
+      "finish": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 102,
+        "prompt_ms": 3138.286,
+        "prompt_per_token_ms": 30.76750980392157,
+        "prompt_per_second": 32.501817871283876,
+        "predicted_n": 160,
+        "predicted_ms": 3081.519,
+        "predicted_per_token_ms": 19.259493749999997,
+        "predicted_per_second": 51.92244474234948,
+        "draft_n": 92,
+        "draft_n_accepted": 67
+      },
+      "issues": [],
+      "fallback_lines": [],
+      "mtp_cycle_lines": [
+        "[tp5-mtp-cycle] cycle=93 draft_us=3030 target_us=272248 catchup_us=1212 handoff_us=0 total_us=276490 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=94 draft_us=2356 target_us=27529 catchup_us=774 handoff_us=0 total_us=30659 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=95 draft_us=2308 target_us=24442 catchup_us=274 handoff_us=0 total_us=27024 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=96 draft_us=2247 target_us=24407 catchup_us=289 handoff_us=0 total_us=26943 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=97 draft_us=2344 target_us=24555 catchup_us=419 handoff_us=0 total_us=27318 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=98 draft_us=2370 target_us=25153 catchup_us=506 handoff_us=0 total_us=28029 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=99 draft_us=2486 target_us=26011 catchup_us=372 handoff_us=0 total_us=28869 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=100 draft_us=2420 target_us=24981 catchup_us=464 handoff_us=0 total_us=27865 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=101 draft_us=2409 target_us=25527 catchup_us=599 handoff_us=0 total_us=28535 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=102 draft_us=2503 target_us=25664 catchup_us=465 handoff_us=0 total_us=28632 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=103 draft_us=2476 target_us=24799 catchup_us=481 handoff_us=0 total_us=27756 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=104 draft_us=2435 target_us=25510 catchup_us=496 handoff_us=0 total_us=28441 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=105 draft_us=2443 target_us=25224 catchup_us=336 handoff_us=0 total_us=28003 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=106 draft_us=2321 target_us=24637 catchup_us=459 handoff_us=0 total_us=27417 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=107 draft_us=2392 target_us=25033 catchup_us=482 handoff_us=0 total_us=27907 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=108 draft_us=2506 target_us=25082 catchup_us=497 handoff_us=0 total_us=28085 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=109 draft_us=2441 target_us=25255 catchup_us=521 handoff_us=0 total_us=28217 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=110 draft_us=2442 target_us=25523 catchup_us=449 handoff_us=0 total_us=28414 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=111 draft_us=2485 target_us=25152 catchup_us=529 handoff_us=0 total_us=28166 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=112 draft_us=2491 target_us=25713 catchup_us=449 handoff_us=0 total_us=28653 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=113 draft_us=2458 target_us=24870 catchup_us=320 handoff_us=0 total_us=27648 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=114 draft_us=2332 target_us=24816 catchup_us=422 handoff_us=0 total_us=27570 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=115 draft_us=2385 target_us=24843 catchup_us=298 handoff_us=0 total_us=27526 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=116 draft_us=2333 target_us=25878 catchup_us=611 handoff_us=0 total_us=28822 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=117 draft_us=2451 target_us=24723 catchup_us=291 handoff_us=0 total_us=27465 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=118 draft_us=2352 target_us=24652 catchup_us=443 handoff_us=0 total_us=27447 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=119 draft_us=2421 target_us=24799 catchup_us=352 handoff_us=0 total_us=27572 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=120 draft_us=2309 target_us=24388 catchup_us=315 handoff_us=0 total_us=27012 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=121 draft_us=2342 target_us=24539 catchup_us=415 handoff_us=0 total_us=27296 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=122 draft_us=2324 target_us=25095 catchup_us=444 handoff_us=0 total_us=27863 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=123 draft_us=2561 target_us=24971 catchup_us=285 handoff_us=0 total_us=27817 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=124 draft_us=2336 target_us=24607 catchup_us=518 handoff_us=0 total_us=27461 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=125 draft_us=2510 target_us=26087 catchup_us=318 handoff_us=0 total_us=28915 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=126 draft_us=2372 target_us=24882 catchup_us=403 handoff_us=0 total_us=27657 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=127 draft_us=2333 target_us=24447 catchup_us=306 handoff_us=0 total_us=27086 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=128 draft_us=2272 target_us=24273 catchup_us=303 handoff_us=0 total_us=26848 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=129 draft_us=2355 target_us=24637 catchup_us=456 handoff_us=0 total_us=27448 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=130 draft_us=2330 target_us=24888 catchup_us=471 handoff_us=0 total_us=27689 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=131 draft_us=2428 target_us=25433 catchup_us=550 handoff_us=0 total_us=28411 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=132 draft_us=2427 target_us=26018 catchup_us=532 handoff_us=0 total_us=28977 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=133 draft_us=2485 target_us=26344 catchup_us=520 handoff_us=0 total_us=29349 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=134 draft_us=2402 target_us=25107 catchup_us=514 handoff_us=0 total_us=28023 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=135 draft_us=2592 target_us=25608 catchup_us=452 handoff_us=0 total_us=28652 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=136 draft_us=2403 target_us=24787 catchup_us=532 handoff_us=0 total_us=27722 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=137 draft_us=2479 target_us=25119 catchup_us=339 handoff_us=0 total_us=27937 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=138 draft_us=2283 target_us=26719 catchup_us=508 handoff_us=0 total_us=29510 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=139 draft_us=2385 target_us=24820 catchup_us=441 handoff_us=0 total_us=27646 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=140 draft_us=2446 target_us=24992 catchup_us=450 handoff_us=0 total_us=27888 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=141 draft_us=2401 target_us=25054 catchup_us=501 handoff_us=0 total_us=27956 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=142 draft_us=2551 target_us=25907 catchup_us=513 handoff_us=0 total_us=28971 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=143 draft_us=2465 target_us=25214 catchup_us=298 handoff_us=0 total_us=27977 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=144 draft_us=2319 target_us=24266 catchup_us=423 handoff_us=0 total_us=27008 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=145 draft_us=2439 target_us=24836 catchup_us=436 handoff_us=0 total_us=27711 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=146 draft_us=2429 target_us=24642 catchup_us=483 handoff_us=0 total_us=27554 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=147 draft_us=2464 target_us=24869 catchup_us=498 handoff_us=0 total_us=27831 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=148 draft_us=2402 target_us=25351 catchup_us=567 handoff_us=0 total_us=28320 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=149 draft_us=2313 target_us=24828 catchup_us=398 handoff_us=0 total_us=27539 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=150 draft_us=2340 target_us=24753 catchup_us=446 handoff_us=0 total_us=27539 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=151 draft_us=2446 target_us=24849 catchup_us=337 handoff_us=0 total_us=27632 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=152 draft_us=2347 target_us=24992 catchup_us=471 handoff_us=0 total_us=27810 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=153 draft_us=2404 target_us=24603 catchup_us=432 handoff_us=0 total_us=27439 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=154 draft_us=2433 target_us=25280 catchup_us=394 handoff_us=0 total_us=28107 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=155 draft_us=2329 target_us=24702 catchup_us=429 handoff_us=0 total_us=27460 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=156 draft_us=2334 target_us=24562 catchup_us=462 handoff_us=0 total_us=27358 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=157 draft_us=2430 target_us=25632 catchup_us=523 handoff_us=0 total_us=28585 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=158 draft_us=2509 target_us=25302 catchup_us=338 handoff_us=0 total_us=28149 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=159 draft_us=2309 target_us=24249 catchup_us=235 handoff_us=0 total_us=26793 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=160 draft_us=2375 target_us=24490 catchup_us=474 handoff_us=0 total_us=27339 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=161 draft_us=2334 target_us=24529 catchup_us=480 handoff_us=0 total_us=27343 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=162 draft_us=2478 target_us=24757 catchup_us=450 handoff_us=0 total_us=27685 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=163 draft_us=2505 target_us=25231 catchup_us=409 handoff_us=0 total_us=28145 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=164 draft_us=2475 target_us=25206 catchup_us=460 handoff_us=0 total_us=28141 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=165 draft_us=2424 target_us=24869 catchup_us=419 handoff_us=0 total_us=27712 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=166 draft_us=2462 target_us=24696 catchup_us=288 handoff_us=0 total_us=27446 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=167 draft_us=2341 target_us=24602 catchup_us=344 handoff_us=0 total_us=27287 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=168 draft_us=2351 target_us=25544 catchup_us=528 handoff_us=0 total_us=28423 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=169 draft_us=2439 target_us=25664 catchup_us=537 handoff_us=0 total_us=28640 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=170 draft_us=2495 target_us=26112 catchup_us=513 handoff_us=0 total_us=29120 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=171 draft_us=2370 target_us=25401 catchup_us=521 handoff_us=0 total_us=28292 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=172 draft_us=2524 target_us=25474 catchup_us=483 handoff_us=0 total_us=28481 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=173 draft_us=2445 target_us=25175 catchup_us=408 handoff_us=0 total_us=28028 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=174 draft_us=2338 target_us=24978 catchup_us=521 handoff_us=0 total_us=27837 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=175 draft_us=2576 target_us=26330 catchup_us=357 handoff_us=0 total_us=29263 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=176 draft_us=2289 target_us=25207 catchup_us=325 handoff_us=0 total_us=27821 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=177 draft_us=2239 target_us=24960 catchup_us=529 handoff_us=0 total_us=27728 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=178 draft_us=2314 target_us=25187 catchup_us=383 handoff_us=0 total_us=27884 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=179 draft_us=2258 target_us=24999 catchup_us=446 handoff_us=0 total_us=27703 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=180 draft_us=2381 target_us=26039 catchup_us=493 handoff_us=0 total_us=28913 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=181 draft_us=2333 target_us=26094 catchup_us=470 handoff_us=0 total_us=28897 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=182 draft_us=2371 target_us=264765 catchup_us=558 handoff_us=0 total_us=267694 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=183 draft_us=3320 target_us=32719 catchup_us=499 handoff_us=0 total_us=36538 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=184 draft_us=2428 target_us=26576 catchup_us=504 handoff_us=0 total_us=29508 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0"
+      ]
+    },
+    {
+      "idx": 2,
+      "phase": "measured",
+      "n": 160,
+      "predicted_ms": 3269.371,
+      "tps": 48.93907727205019,
+      "wall_ms": 6490.517186,
+      "finish": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 102,
+        "prompt_ms": 3216.669,
+        "prompt_per_token_ms": 31.535970588235294,
+        "prompt_per_second": 31.709821557642393,
+        "predicted_n": 160,
+        "predicted_ms": 3269.371,
+        "predicted_per_token_ms": 20.43356875,
+        "predicted_per_second": 48.939077272050184,
+        "draft_n": 92,
+        "draft_n_accepted": 67
+      },
+      "issues": [],
+      "fallback_lines": [],
+      "mtp_cycle_lines": [
+        "[tp5-mtp-cycle] cycle=185 draft_us=2928 target_us=285754 catchup_us=1269 handoff_us=0 total_us=289951 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=186 draft_us=2368 target_us=31408 catchup_us=810 handoff_us=0 total_us=34586 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=187 draft_us=2324 target_us=26017 catchup_us=245 handoff_us=0 total_us=28586 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=188 draft_us=2369 target_us=25565 catchup_us=273 handoff_us=0 total_us=28207 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=189 draft_us=2237 target_us=25034 catchup_us=504 handoff_us=0 total_us=27775 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=190 draft_us=2441 target_us=26262 catchup_us=489 handoff_us=0 total_us=29192 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=191 draft_us=2415 target_us=27735 catchup_us=386 handoff_us=0 total_us=30536 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=192 draft_us=2387 target_us=25927 catchup_us=468 handoff_us=0 total_us=28782 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=193 draft_us=2383 target_us=28270 catchup_us=446 handoff_us=0 total_us=31099 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=194 draft_us=2527 target_us=28361 catchup_us=467 handoff_us=0 total_us=31355 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=195 draft_us=2458 target_us=27246 catchup_us=463 handoff_us=0 total_us=30167 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=196 draft_us=2396 target_us=25382 catchup_us=507 handoff_us=0 total_us=28285 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=197 draft_us=2432 target_us=28328 catchup_us=331 handoff_us=0 total_us=31091 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=198 draft_us=2306 target_us=25350 catchup_us=514 handoff_us=0 total_us=28170 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=199 draft_us=2489 target_us=27162 catchup_us=433 handoff_us=0 total_us=30084 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=200 draft_us=2410 target_us=27762 catchup_us=555 handoff_us=0 total_us=30727 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=201 draft_us=2448 target_us=27282 catchup_us=439 handoff_us=0 total_us=30169 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=202 draft_us=2478 target_us=28523 catchup_us=525 handoff_us=0 total_us=31526 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=203 draft_us=2559 target_us=28456 catchup_us=502 handoff_us=0 total_us=31517 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=204 draft_us=2472 target_us=28261 catchup_us=562 handoff_us=0 total_us=31295 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=205 draft_us=2509 target_us=27562 catchup_us=347 handoff_us=0 total_us=30418 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=206 draft_us=2360 target_us=25943 catchup_us=529 handoff_us=0 total_us=28832 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=207 draft_us=2501 target_us=26446 catchup_us=304 handoff_us=0 total_us=29251 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=208 draft_us=2311 target_us=25961 catchup_us=485 handoff_us=0 total_us=28757 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=209 draft_us=2444 target_us=28065 catchup_us=338 handoff_us=0 total_us=30847 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=210 draft_us=2382 target_us=26714 catchup_us=564 handoff_us=0 total_us=29660 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=211 draft_us=2507 target_us=29157 catchup_us=323 handoff_us=0 total_us=31987 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=212 draft_us=2357 target_us=25530 catchup_us=340 handoff_us=0 total_us=28227 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=213 draft_us=2357 target_us=26173 catchup_us=451 handoff_us=0 total_us=28981 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=214 draft_us=2452 target_us=27417 catchup_us=468 handoff_us=0 total_us=30337 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=215 draft_us=2476 target_us=27756 catchup_us=323 handoff_us=0 total_us=30555 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=216 draft_us=2373 target_us=25880 catchup_us=495 handoff_us=0 total_us=28748 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=217 draft_us=2376 target_us=27226 catchup_us=338 handoff_us=0 total_us=29940 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=218 draft_us=2304 target_us=26604 catchup_us=555 handoff_us=0 total_us=29463 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=219 draft_us=2535 target_us=26039 catchup_us=301 handoff_us=0 total_us=28875 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=220 draft_us=2341 target_us=25450 catchup_us=322 handoff_us=0 total_us=28113 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=221 draft_us=2327 target_us=25959 catchup_us=482 handoff_us=0 total_us=28768 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=222 draft_us=2404 target_us=26209 catchup_us=551 handoff_us=0 total_us=29164 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=223 draft_us=2489 target_us=28257 catchup_us=395 handoff_us=0 total_us=31141 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=224 draft_us=2384 target_us=26230 catchup_us=526 handoff_us=0 total_us=29140 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=225 draft_us=2426 target_us=26418 catchup_us=505 handoff_us=0 total_us=29349 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=226 draft_us=2465 target_us=27153 catchup_us=529 handoff_us=0 total_us=30147 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=227 draft_us=2470 target_us=28198 catchup_us=502 handoff_us=0 total_us=31170 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=228 draft_us=2470 target_us=26802 catchup_us=489 handoff_us=0 total_us=29761 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=229 draft_us=2467 target_us=26650 catchup_us=283 handoff_us=0 total_us=29400 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=230 draft_us=2319 target_us=25123 catchup_us=473 handoff_us=0 total_us=27915 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=231 draft_us=2393 target_us=26171 catchup_us=535 handoff_us=0 total_us=29099 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=232 draft_us=2486 target_us=28801 catchup_us=511 handoff_us=0 total_us=31798 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=233 draft_us=2466 target_us=28148 catchup_us=518 handoff_us=0 total_us=31132 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=234 draft_us=2545 target_us=28583 catchup_us=522 handoff_us=0 total_us=31650 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=235 draft_us=2527 target_us=28120 catchup_us=340 handoff_us=0 total_us=30987 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=236 draft_us=2311 target_us=26542 catchup_us=504 handoff_us=0 total_us=29357 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=237 draft_us=2333 target_us=27135 catchup_us=551 handoff_us=0 total_us=30019 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=238 draft_us=2404 target_us=27687 catchup_us=511 handoff_us=0 total_us=30602 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=239 draft_us=2432 target_us=29433 catchup_us=537 handoff_us=0 total_us=32402 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=240 draft_us=2387 target_us=25940 catchup_us=550 handoff_us=0 total_us=28877 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=241 draft_us=2374 target_us=27729 catchup_us=514 handoff_us=0 total_us=30617 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=242 draft_us=2350 target_us=26981 catchup_us=597 handoff_us=0 total_us=29928 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=243 draft_us=2360 target_us=26978 catchup_us=378 handoff_us=0 total_us=29716 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=244 draft_us=2338 target_us=25731 catchup_us=541 handoff_us=0 total_us=28610 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=245 draft_us=2370 target_us=27504 catchup_us=462 handoff_us=0 total_us=30336 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=246 draft_us=2353 target_us=26726 catchup_us=527 handoff_us=0 total_us=29606 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=247 draft_us=2334 target_us=28410 catchup_us=543 handoff_us=0 total_us=31287 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=248 draft_us=2406 target_us=27062 catchup_us=542 handoff_us=0 total_us=30010 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=249 draft_us=2378 target_us=27064 catchup_us=532 handoff_us=0 total_us=29974 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=250 draft_us=2429 target_us=27050 catchup_us=379 handoff_us=0 total_us=29858 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=251 draft_us=2421 target_us=26264 catchup_us=324 handoff_us=0 total_us=29009 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=252 draft_us=2303 target_us=25693 catchup_us=549 handoff_us=0 total_us=28545 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=253 draft_us=2413 target_us=28383 catchup_us=527 handoff_us=0 total_us=31323 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=254 draft_us=2459 target_us=26418 catchup_us=528 handoff_us=0 total_us=29405 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=255 draft_us=2471 target_us=27730 catchup_us=578 handoff_us=0 total_us=30779 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=256 draft_us=2384 target_us=28195 catchup_us=481 handoff_us=0 total_us=31060 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=257 draft_us=2433 target_us=26860 catchup_us=550 handoff_us=0 total_us=29843 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=258 draft_us=2427 target_us=28053 catchup_us=348 handoff_us=0 total_us=30828 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=259 draft_us=2236 target_us=25711 catchup_us=322 handoff_us=0 total_us=28269 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=260 draft_us=2399 target_us=26498 catchup_us=506 handoff_us=0 total_us=29403 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=261 draft_us=2399 target_us=28814 catchup_us=572 handoff_us=0 total_us=31785 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=262 draft_us=2497 target_us=28483 catchup_us=504 handoff_us=0 total_us=31484 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=263 draft_us=2354 target_us=26827 catchup_us=583 handoff_us=0 total_us=29764 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=264 draft_us=2511 target_us=27512 catchup_us=571 handoff_us=0 total_us=30594 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=265 draft_us=2494 target_us=27839 catchup_us=355 handoff_us=0 total_us=30688 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=266 draft_us=2372 target_us=26391 catchup_us=528 handoff_us=0 total_us=29291 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=267 draft_us=2434 target_us=28207 catchup_us=352 handoff_us=0 total_us=30993 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=268 draft_us=2295 target_us=25364 catchup_us=325 handoff_us=0 total_us=27984 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=269 draft_us=2276 target_us=25830 catchup_us=535 handoff_us=0 total_us=28641 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=270 draft_us=2412 target_us=27343 catchup_us=383 handoff_us=0 total_us=30138 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=271 draft_us=2365 target_us=25861 catchup_us=559 handoff_us=0 total_us=28785 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=272 draft_us=2458 target_us=28674 catchup_us=523 handoff_us=0 total_us=31655 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=273 draft_us=2421 target_us=26488 catchup_us=459 handoff_us=0 total_us=29368 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=274 draft_us=2359 target_us=265444 catchup_us=612 handoff_us=0 total_us=268415 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=275 draft_us=3130 target_us=30885 catchup_us=489 handoff_us=0 total_us=34504 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=276 draft_us=2407 target_us=26314 catchup_us=496 handoff_us=0 total_us=29217 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0"
+      ]
+    },
+    {
+      "idx": 3,
+      "phase": "guard",
+      "n": 72,
+      "predicted_ms": 1546.275,
+      "tps": 46.56351554542368,
+      "wall_ms": 3402.416344,
+      "finish": "stop",
+      "content_sha256": "ead561f7cdce47b31ce7e0e48bceb7f6d17857880c2f92f65ebfede5779c0f78",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 23,
+        "prompt_ms": 1852.385,
+        "prompt_per_token_ms": 80.53847826086957,
+        "prompt_per_second": 12.416425311152919,
+        "predicted_n": 72,
+        "predicted_ms": 1546.275,
+        "predicted_per_token_ms": 21.476041666666667,
+        "predicted_per_second": 46.56351554542368,
+        "draft_n": 44,
+        "draft_n_accepted": 28
+      },
+      "issues": [],
+      "fallback_lines": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=12 n_sub=97 uid=36028797019122433"
+      ],
+      "mtp_cycle_lines": [
+        "[tp5-mtp-cycle] cycle=277 draft_us=3338 target_us=288405 catchup_us=886 handoff_us=0 total_us=292629 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=278 draft_us=2354 target_us=31242 catchup_us=296 handoff_us=0 total_us=33892 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=279 draft_us=2327 target_us=26531 catchup_us=268 handoff_us=0 total_us=29126 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=280 draft_us=2268 target_us=25651 catchup_us=1142 handoff_us=0 total_us=29061 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=281 draft_us=2408 target_us=28045 catchup_us=304 handoff_us=0 total_us=30757 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=282 draft_us=2424 target_us=25704 catchup_us=499 handoff_us=0 total_us=28627 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=283 draft_us=2416 target_us=26239 catchup_us=439 handoff_us=0 total_us=29094 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=284 draft_us=2451 target_us=25322 catchup_us=507 handoff_us=0 total_us=28280 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=285 draft_us=2426 target_us=25602 catchup_us=476 handoff_us=0 total_us=28504 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=286 draft_us=2489 target_us=25473 catchup_us=524 handoff_us=0 total_us=28486 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=287 draft_us=2453 target_us=26191 catchup_us=510 handoff_us=0 total_us=29154 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=288 draft_us=2391 target_us=28358 catchup_us=335 handoff_us=0 total_us=31084 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=289 draft_us=2334 target_us=25158 catchup_us=496 handoff_us=0 total_us=27988 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=290 draft_us=2492 target_us=28665 catchup_us=341 handoff_us=0 total_us=31498 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=291 draft_us=2330 target_us=26381 catchup_us=235 handoff_us=0 total_us=28946 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=292 draft_us=2257 target_us=24942 catchup_us=493 handoff_us=0 total_us=27692 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=293 draft_us=2357 target_us=29731 catchup_us=295 handoff_us=0 total_us=32383 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=294 draft_us=2333 target_us=27019 catchup_us=288 handoff_us=0 total_us=29640 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=295 draft_us=2287 target_us=24812 catchup_us=478 handoff_us=0 total_us=27577 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=296 draft_us=2423 target_us=25424 catchup_us=508 handoff_us=0 total_us=28355 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=297 draft_us=2420 target_us=26600 catchup_us=461 handoff_us=0 total_us=29481 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=298 draft_us=2400 target_us=25136 catchup_us=449 handoff_us=0 total_us=27985 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=299 draft_us=2444 target_us=25569 catchup_us=452 handoff_us=0 total_us=28465 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=300 draft_us=2391 target_us=28148 catchup_us=275 handoff_us=0 total_us=30814 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=301 draft_us=2353 target_us=24812 catchup_us=527 handoff_us=0 total_us=27692 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=302 draft_us=2448 target_us=29142 catchup_us=318 handoff_us=0 total_us=31908 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=303 draft_us=2363 target_us=24967 catchup_us=473 handoff_us=0 total_us=27803 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=304 draft_us=2382 target_us=25579 catchup_us=475 handoff_us=0 total_us=28436 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=305 draft_us=2512 target_us=25258 catchup_us=467 handoff_us=0 total_us=28237 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=306 draft_us=2389 target_us=24673 catchup_us=285 handoff_us=0 total_us=27347 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=307 draft_us=2279 target_us=25944 catchup_us=268 handoff_us=0 total_us=28491 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=308 draft_us=2314 target_us=26347 catchup_us=309 handoff_us=0 total_us=28970 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=309 draft_us=2241 target_us=25932 catchup_us=291 handoff_us=0 total_us=28464 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=310 draft_us=2321 target_us=25045 catchup_us=506 handoff_us=0 total_us=27872 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=311 draft_us=2493 target_us=25479 catchup_us=448 handoff_us=0 total_us=28420 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=312 draft_us=2389 target_us=25505 catchup_us=477 handoff_us=0 total_us=28371 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=313 draft_us=2500 target_us=25524 catchup_us=528 handoff_us=0 total_us=28552 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=314 draft_us=2432 target_us=25551 catchup_us=486 handoff_us=0 total_us=28469 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=315 draft_us=2467 target_us=27385 catchup_us=269 handoff_us=0 total_us=30121 draft_tokens=1 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=316 draft_us=2278 target_us=25428 catchup_us=542 handoff_us=0 total_us=28248 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=317 draft_us=2422 target_us=26097 catchup_us=436 handoff_us=0 total_us=28955 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=318 draft_us=2456 target_us=25985 catchup_us=443 handoff_us=0 total_us=28884 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=319 draft_us=2449 target_us=25575 catchup_us=458 handoff_us=0 total_us=28482 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0",
+        "[tp5-mtp-cycle] cycle=320 draft_us=2495 target_us=25901 catchup_us=461 handoff_us=0 total_us=28857 draft_tokens=1 accepted_tokens=1 final_tokens=2 eff=1.000 dev_hidden=0"
+      ]
+    }
+  ],
+  "length_gate": {
+    "length_min": 160,
+    "length_max": 240,
+    "phase_scope": "measured",
+    "passed": true,
+    "requests": [
+      {
+        "idx": 1,
+        "n": 160,
+        "in_range": true
+      },
+      {
+        "idx": 2,
+        "n": 160,
+        "in_range": true
+      }
+    ]
+  },
+  "mtp_horizon": 1,
+  "accepted_prefix_distribution": {
+    "K_per_cycle": [
+      1,
+      0,
+      0,
+      0,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      0,
+      1,
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      0,
+      0,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      0,
+      1,
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      0,
+      0,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "histogram": {
+      "1": 134,
+      "0": 50
+    }
+  },
+  "cycle_D_V_S_H_K": {
+    "cycles_observed": 184,
+    "per_cycle": [
+      {
+        "D_ms": 3.03,
+        "V_ms": 272.248,
+        "S_ms": 1.212,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.356,
+        "V_ms": 27.529,
+        "S_ms": 0.774,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.308,
+        "V_ms": 24.442,
+        "S_ms": 0.274,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.247,
+        "V_ms": 24.407,
+        "S_ms": 0.289,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.344,
+        "V_ms": 24.555,
+        "S_ms": 0.419,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.37,
+        "V_ms": 25.153,
+        "S_ms": 0.506,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.486,
+        "V_ms": 26.011,
+        "S_ms": 0.372,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.42,
+        "V_ms": 24.981,
+        "S_ms": 0.464,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.409,
+        "V_ms": 25.527,
+        "S_ms": 0.599,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.503,
+        "V_ms": 25.664,
+        "S_ms": 0.465,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.476,
+        "V_ms": 24.799,
+        "S_ms": 0.481,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.435,
+        "V_ms": 25.51,
+        "S_ms": 0.496,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.443,
+        "V_ms": 25.224,
+        "S_ms": 0.336,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.321,
+        "V_ms": 24.637,
+        "S_ms": 0.459,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.392,
+        "V_ms": 25.033,
+        "S_ms": 0.482,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.506,
+        "V_ms": 25.082,
+        "S_ms": 0.497,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.441,
+        "V_ms": 25.255,
+        "S_ms": 0.521,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.442,
+        "V_ms": 25.523,
+        "S_ms": 0.449,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.485,
+        "V_ms": 25.152,
+        "S_ms": 0.529,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.491,
+        "V_ms": 25.713,
+        "S_ms": 0.449,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.458,
+        "V_ms": 24.87,
+        "S_ms": 0.32,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.332,
+        "V_ms": 24.816,
+        "S_ms": 0.422,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.385,
+        "V_ms": 24.843,
+        "S_ms": 0.298,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.333,
+        "V_ms": 25.878,
+        "S_ms": 0.611,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.451,
+        "V_ms": 24.723,
+        "S_ms": 0.291,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.352,
+        "V_ms": 24.652,
+        "S_ms": 0.443,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.421,
+        "V_ms": 24.799,
+        "S_ms": 0.352,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.309,
+        "V_ms": 24.388,
+        "S_ms": 0.315,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.342,
+        "V_ms": 24.539,
+        "S_ms": 0.415,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.324,
+        "V_ms": 25.095,
+        "S_ms": 0.444,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.561,
+        "V_ms": 24.971,
+        "S_ms": 0.285,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.336,
+        "V_ms": 24.607,
+        "S_ms": 0.518,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.51,
+        "V_ms": 26.087,
+        "S_ms": 0.318,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.372,
+        "V_ms": 24.882,
+        "S_ms": 0.403,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.333,
+        "V_ms": 24.447,
+        "S_ms": 0.306,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.272,
+        "V_ms": 24.273,
+        "S_ms": 0.303,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.355,
+        "V_ms": 24.637,
+        "S_ms": 0.456,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.33,
+        "V_ms": 24.888,
+        "S_ms": 0.471,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.428,
+        "V_ms": 25.433,
+        "S_ms": 0.55,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.427,
+        "V_ms": 26.018,
+        "S_ms": 0.532,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.485,
+        "V_ms": 26.344,
+        "S_ms": 0.52,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.402,
+        "V_ms": 25.107,
+        "S_ms": 0.514,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.592,
+        "V_ms": 25.608,
+        "S_ms": 0.452,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.403,
+        "V_ms": 24.787,
+        "S_ms": 0.532,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.479,
+        "V_ms": 25.119,
+        "S_ms": 0.339,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.283,
+        "V_ms": 26.719,
+        "S_ms": 0.508,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.385,
+        "V_ms": 24.82,
+        "S_ms": 0.441,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.446,
+        "V_ms": 24.992,
+        "S_ms": 0.45,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.401,
+        "V_ms": 25.054,
+        "S_ms": 0.501,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.551,
+        "V_ms": 25.907,
+        "S_ms": 0.513,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.465,
+        "V_ms": 25.214,
+        "S_ms": 0.298,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.319,
+        "V_ms": 24.266,
+        "S_ms": 0.423,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.439,
+        "V_ms": 24.836,
+        "S_ms": 0.436,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.429,
+        "V_ms": 24.642,
+        "S_ms": 0.483,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.464,
+        "V_ms": 24.869,
+        "S_ms": 0.498,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.402,
+        "V_ms": 25.351,
+        "S_ms": 0.567,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.313,
+        "V_ms": 24.828,
+        "S_ms": 0.398,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.34,
+        "V_ms": 24.753,
+        "S_ms": 0.446,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.446,
+        "V_ms": 24.849,
+        "S_ms": 0.337,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.347,
+        "V_ms": 24.992,
+        "S_ms": 0.471,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.404,
+        "V_ms": 24.603,
+        "S_ms": 0.432,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.433,
+        "V_ms": 25.28,
+        "S_ms": 0.394,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.329,
+        "V_ms": 24.702,
+        "S_ms": 0.429,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.334,
+        "V_ms": 24.562,
+        "S_ms": 0.462,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.43,
+        "V_ms": 25.632,
+        "S_ms": 0.523,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.509,
+        "V_ms": 25.302,
+        "S_ms": 0.338,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.309,
+        "V_ms": 24.249,
+        "S_ms": 0.235,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.375,
+        "V_ms": 24.49,
+        "S_ms": 0.474,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.334,
+        "V_ms": 24.529,
+        "S_ms": 0.48,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.478,
+        "V_ms": 24.757,
+        "S_ms": 0.45,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.505,
+        "V_ms": 25.231,
+        "S_ms": 0.409,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.475,
+        "V_ms": 25.206,
+        "S_ms": 0.46,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.424,
+        "V_ms": 24.869,
+        "S_ms": 0.419,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.462,
+        "V_ms": 24.696,
+        "S_ms": 0.288,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.341,
+        "V_ms": 24.602,
+        "S_ms": 0.344,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.351,
+        "V_ms": 25.544,
+        "S_ms": 0.528,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.439,
+        "V_ms": 25.664,
+        "S_ms": 0.537,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.495,
+        "V_ms": 26.112,
+        "S_ms": 0.513,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.37,
+        "V_ms": 25.401,
+        "S_ms": 0.521,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.524,
+        "V_ms": 25.474,
+        "S_ms": 0.483,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.445,
+        "V_ms": 25.175,
+        "S_ms": 0.408,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.338,
+        "V_ms": 24.978,
+        "S_ms": 0.521,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.576,
+        "V_ms": 26.33,
+        "S_ms": 0.357,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.289,
+        "V_ms": 25.207,
+        "S_ms": 0.325,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.239,
+        "V_ms": 24.96,
+        "S_ms": 0.529,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.314,
+        "V_ms": 25.187,
+        "S_ms": 0.383,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.258,
+        "V_ms": 24.999,
+        "S_ms": 0.446,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.381,
+        "V_ms": 26.039,
+        "S_ms": 0.493,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.333,
+        "V_ms": 26.094,
+        "S_ms": 0.47,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.371,
+        "V_ms": 264.765,
+        "S_ms": 0.558,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 3.32,
+        "V_ms": 32.719,
+        "S_ms": 0.499,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.428,
+        "V_ms": 26.576,
+        "S_ms": 0.504,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.928,
+        "V_ms": 285.754,
+        "S_ms": 1.269,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.368,
+        "V_ms": 31.408,
+        "S_ms": 0.81,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.324,
+        "V_ms": 26.017,
+        "S_ms": 0.245,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.369,
+        "V_ms": 25.565,
+        "S_ms": 0.273,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.237,
+        "V_ms": 25.034,
+        "S_ms": 0.504,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.441,
+        "V_ms": 26.262,
+        "S_ms": 0.489,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.415,
+        "V_ms": 27.735,
+        "S_ms": 0.386,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.387,
+        "V_ms": 25.927,
+        "S_ms": 0.468,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.383,
+        "V_ms": 28.27,
+        "S_ms": 0.446,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.527,
+        "V_ms": 28.361,
+        "S_ms": 0.467,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.458,
+        "V_ms": 27.246,
+        "S_ms": 0.463,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.396,
+        "V_ms": 25.382,
+        "S_ms": 0.507,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.432,
+        "V_ms": 28.328,
+        "S_ms": 0.331,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.306,
+        "V_ms": 25.35,
+        "S_ms": 0.514,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.489,
+        "V_ms": 27.162,
+        "S_ms": 0.433,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.41,
+        "V_ms": 27.762,
+        "S_ms": 0.555,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.448,
+        "V_ms": 27.282,
+        "S_ms": 0.439,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.478,
+        "V_ms": 28.523,
+        "S_ms": 0.525,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.559,
+        "V_ms": 28.456,
+        "S_ms": 0.502,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.472,
+        "V_ms": 28.261,
+        "S_ms": 0.562,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.509,
+        "V_ms": 27.562,
+        "S_ms": 0.347,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.36,
+        "V_ms": 25.943,
+        "S_ms": 0.529,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.501,
+        "V_ms": 26.446,
+        "S_ms": 0.304,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.311,
+        "V_ms": 25.961,
+        "S_ms": 0.485,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.444,
+        "V_ms": 28.065,
+        "S_ms": 0.338,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.382,
+        "V_ms": 26.714,
+        "S_ms": 0.564,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.507,
+        "V_ms": 29.157,
+        "S_ms": 0.323,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.357,
+        "V_ms": 25.53,
+        "S_ms": 0.34,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.357,
+        "V_ms": 26.173,
+        "S_ms": 0.451,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.452,
+        "V_ms": 27.417,
+        "S_ms": 0.468,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.476,
+        "V_ms": 27.756,
+        "S_ms": 0.323,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.373,
+        "V_ms": 25.88,
+        "S_ms": 0.495,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.376,
+        "V_ms": 27.226,
+        "S_ms": 0.338,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.304,
+        "V_ms": 26.604,
+        "S_ms": 0.555,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.535,
+        "V_ms": 26.039,
+        "S_ms": 0.301,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.341,
+        "V_ms": 25.45,
+        "S_ms": 0.322,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.327,
+        "V_ms": 25.959,
+        "S_ms": 0.482,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.404,
+        "V_ms": 26.209,
+        "S_ms": 0.551,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.489,
+        "V_ms": 28.257,
+        "S_ms": 0.395,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.384,
+        "V_ms": 26.23,
+        "S_ms": 0.526,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.426,
+        "V_ms": 26.418,
+        "S_ms": 0.505,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.465,
+        "V_ms": 27.153,
+        "S_ms": 0.529,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.47,
+        "V_ms": 28.198,
+        "S_ms": 0.502,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.47,
+        "V_ms": 26.802,
+        "S_ms": 0.489,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.467,
+        "V_ms": 26.65,
+        "S_ms": 0.283,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.319,
+        "V_ms": 25.123,
+        "S_ms": 0.473,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.393,
+        "V_ms": 26.171,
+        "S_ms": 0.535,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.486,
+        "V_ms": 28.801,
+        "S_ms": 0.511,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.466,
+        "V_ms": 28.148,
+        "S_ms": 0.518,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.545,
+        "V_ms": 28.583,
+        "S_ms": 0.522,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.527,
+        "V_ms": 28.12,
+        "S_ms": 0.34,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.311,
+        "V_ms": 26.542,
+        "S_ms": 0.504,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.333,
+        "V_ms": 27.135,
+        "S_ms": 0.551,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.404,
+        "V_ms": 27.687,
+        "S_ms": 0.511,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.432,
+        "V_ms": 29.433,
+        "S_ms": 0.537,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.387,
+        "V_ms": 25.94,
+        "S_ms": 0.55,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.374,
+        "V_ms": 27.729,
+        "S_ms": 0.514,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.35,
+        "V_ms": 26.981,
+        "S_ms": 0.597,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.36,
+        "V_ms": 26.978,
+        "S_ms": 0.378,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.338,
+        "V_ms": 25.731,
+        "S_ms": 0.541,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.37,
+        "V_ms": 27.504,
+        "S_ms": 0.462,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.353,
+        "V_ms": 26.726,
+        "S_ms": 0.527,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.334,
+        "V_ms": 28.41,
+        "S_ms": 0.543,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.406,
+        "V_ms": 27.062,
+        "S_ms": 0.542,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.378,
+        "V_ms": 27.064,
+        "S_ms": 0.532,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.429,
+        "V_ms": 27.05,
+        "S_ms": 0.379,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.421,
+        "V_ms": 26.264,
+        "S_ms": 0.324,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.303,
+        "V_ms": 25.693,
+        "S_ms": 0.549,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.413,
+        "V_ms": 28.383,
+        "S_ms": 0.527,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.459,
+        "V_ms": 26.418,
+        "S_ms": 0.528,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.471,
+        "V_ms": 27.73,
+        "S_ms": 0.578,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.384,
+        "V_ms": 28.195,
+        "S_ms": 0.481,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.433,
+        "V_ms": 26.86,
+        "S_ms": 0.55,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.427,
+        "V_ms": 28.053,
+        "S_ms": 0.348,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.236,
+        "V_ms": 25.711,
+        "S_ms": 0.322,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.399,
+        "V_ms": 26.498,
+        "S_ms": 0.506,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.399,
+        "V_ms": 28.814,
+        "S_ms": 0.572,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.497,
+        "V_ms": 28.483,
+        "S_ms": 0.504,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.354,
+        "V_ms": 26.827,
+        "S_ms": 0.583,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.511,
+        "V_ms": 27.512,
+        "S_ms": 0.571,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.494,
+        "V_ms": 27.839,
+        "S_ms": 0.355,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.372,
+        "V_ms": 26.391,
+        "S_ms": 0.528,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.434,
+        "V_ms": 28.207,
+        "S_ms": 0.352,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.295,
+        "V_ms": 25.364,
+        "S_ms": 0.325,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.276,
+        "V_ms": 25.83,
+        "S_ms": 0.535,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.412,
+        "V_ms": 27.343,
+        "S_ms": 0.383,
+        "H_ms": 0.0,
+        "K": 0,
+        "final_tokens": 1
+      },
+      {
+        "D_ms": 2.365,
+        "V_ms": 25.861,
+        "S_ms": 0.559,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.458,
+        "V_ms": 28.674,
+        "S_ms": 0.523,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.421,
+        "V_ms": 26.488,
+        "S_ms": 0.459,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.359,
+        "V_ms": 265.444,
+        "S_ms": 0.612,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 3.13,
+        "V_ms": 30.885,
+        "S_ms": 0.489,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      },
+      {
+        "D_ms": 2.407,
+        "V_ms": 26.314,
+        "S_ms": 0.496,
+        "H_ms": 0.0,
+        "K": 1,
+        "final_tokens": 2
+      }
+    ]
+  },
+  "shutdown": {
+    "returncode": 0,
+    "forced": false,
+    "seconds": 1.0158640119916527
+  },
+  "gpu_after": [
+    {
+      "card": "card1",
+      "bdf": "0000:0f:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "95",
+      "mem_info_vram_used": "108019712",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz \n1: 2475Mhz *",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card2",
+      "bdf": "0000:09:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "1",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card3",
+      "bdf": "0000:0c:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "2",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card4",
+      "bdf": "0000:06:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "2",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card5",
+      "bdf": "0000:03:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "2",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    }
+  ],
+  "rank_stage_ledger": "NOT_COLLECTED",
+  "minimum_fields": {
+    "checklist": [
+      "contract_version",
+      "workload_hash",
+      "quality_gate_version",
+      "timing_boundary",
+      "all_model_shard_SHA256",
+      "draft_SHA256",
+      "source_dirty_identity",
+      "binary_SHA256",
+      "actual_loaded_DSO_SHA256",
+      "rank_to_BDF",
+      "resolved_env_and_CLI",
+      "process_id",
+      "paired_block",
+      "phase",
+      "public_completion_tokens",
+      "finish_reason",
+      "complete_text_hash_and_raw_body",
+      "generation_ms",
+      "prompt_ms",
+      "first_token_ms",
+      "request_wall_ms",
+      "startup_ms",
+      "mtp_horizon",
+      "accepted_prefix_distribution",
+      "cycle_D_V_S_H_K",
+      "actual_pipeline_hits",
+      "active_rows",
+      "capacity_rows",
+      "bank_epoch",
+      "fallback",
+      "timeout",
+      "GPU_fault",
+      "HTTP_error",
+      "teardown",
+      "quality_verdict"
+    ],
+    "fields": {
+      "contract_version": "NOT_COLLECTED",
+      "workload_hash": "20c0ddaa0a45a3f54de39039158bec7111f9e2496b145531541df0713a4c9c2a",
+      "quality_gate_version": "NOT_COLLECTED",
+      "timing_boundary": "NOT_COLLECTED",
+      "all_model_shard_SHA256": "NOT_COLLECTED",
+      "draft_SHA256": "NOT_COLLECTED",
+      "source_dirty_identity": "NOT_COLLECTED",
+      "binary_SHA256": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c",
+      "actual_loaded_DSO_SHA256": {
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml-base.so.0.18.1": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml-cpu.so.0.18.1": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml-vulkan.so.0.18.1": "1373e69ead119e0c8ff501fbd8bee3b85f4ee9df95cc205c3b4d24fef23920c6",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml.so.0.18.1": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libllama-common.so.0.0.2188": "29bcbe656b7e8932ad8e399680873b5eddb442bd393b93ab5d638a548c3b9ff9",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libllama-server-impl.so": "cdc240a70ab00d35e5bae772e881d8701949ee626ed54fc38a02b51b5f25af09",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libllama.so.0.0.2188": "5d63fa93bfe35f7da895bbea3cb79953733e76c513d57e9485744651ede09d19",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac"
+      },
+      "rank_to_BDF": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0"
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0"
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0"
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0"
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0"
+        }
+      ],
+      "resolved_env_and_CLI": {
+        "argv": [
+          "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/llama-server",
+          "-m",
+          "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+          "-dev",
+          "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+          "--split-mode",
+          "tensor",
+          "--fit",
+          "off",
+          "-ngl",
+          "999",
+          "-c",
+          "1024",
+          "-b",
+          "32",
+          "-ub",
+          "32",
+          "--no-mmap",
+          "--no-host",
+          "-np",
+          "1",
+          "-t",
+          "22",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18765",
+          "--tp5",
+          "qwen4exp-af",
+          "--tp5-latebind",
+          "off",
+          "-md",
+          "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+          "--spec-type",
+          "draft-mtp",
+          "--spec-draft-n-max",
+          "1",
+          "--spec-draft-p-min",
+          "0"
+        ],
+        "env": {
+          "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.bun/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.bun/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+          "HOME": "/home/kunweiz",
+          "LANG": "en_US.UTF-8",
+          "LD_LIBRARY_PATH": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin",
+          "RADV_DEBUG": "nobolist",
+          "GGML_VK_DISABLE_MMVQ": "1",
+          "GGML_VK_FORCE_MMVQ": "0",
+          "GGML_TP5_MTP_PROFILE": "1",
+          "GGML_TP5_REPLICATE_ATTN": "0",
+          "GGML_TP5_QSA_HEADMAP": "1",
+          "GGML_TP5_GDN_HEADMAP": "1",
+          "GGML_VK_SMALL_Q8_COLUMNS": "1",
+          "GGML_TP5_GREEDY_HOST": "1",
+          "GGML_TP5_PARALLEL_SUBMIT": "1",
+          "GGML_TP5_Q_WORKGROUP": "256",
+          "GGML_TP5_NORM_WORKGROUP": "256",
+          "GGML_TP5_NORM_PREFETCH": "0",
+          "GGML_TP5_PACK_SINGLE_WG": "0",
+          "GGML_TP5_SHARD_ROUTER": "0"
+        }
+      },
+      "process_id": 1631160,
+      "paired_block": "NOT_COLLECTED",
+      "phase": [
+        "measured",
+        "measured"
+      ],
+      "public_completion_tokens": [
+        160,
+        160
+      ],
+      "finish_reason": [
+        "stop",
+        "stop"
+      ],
+      "complete_text_hash_and_raw_body": {
+        "per_request_content_sha256": [
+          "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+          "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c"
+        ],
+        "raw_body_files": [
+          "request-1.json",
+          "request-2.json"
+        ]
+      },
+      "generation_ms": [
+        3081.519,
+        3269.371
+      ],
+      "prompt_ms": [
+        3138.286,
+        3216.669
+      ],
+      "first_token_ms": "NOT_COLLECTED",
+      "request_wall_ms": [
+        6846.466069,
+        6490.517186
+      ],
+      "startup_ms": 42408.599056,
+      "mtp_horizon": 1,
+      "accepted_prefix_distribution": {
+        "K_per_cycle": [
+          1,
+          0,
+          0,
+          0,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          0,
+          1,
+          0,
+          1,
+          0,
+          0,
+          1,
+          1,
+          0,
+          1,
+          0,
+          1,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          0,
+          0,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          0,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          0,
+          1,
+          0,
+          1,
+          0,
+          0,
+          1,
+          1,
+          0,
+          1,
+          0,
+          1,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          0,
+          0,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "histogram": {
+          "1": 134,
+          "0": 50
+        }
+      },
+      "cycle_D_V_S_H_K": {
+        "cycles_observed": 184,
+        "per_cycle": [
+          {
+            "D_ms": 3.03,
+            "V_ms": 272.248,
+            "S_ms": 1.212,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.356,
+            "V_ms": 27.529,
+            "S_ms": 0.774,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.308,
+            "V_ms": 24.442,
+            "S_ms": 0.274,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.247,
+            "V_ms": 24.407,
+            "S_ms": 0.289,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.344,
+            "V_ms": 24.555,
+            "S_ms": 0.419,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.37,
+            "V_ms": 25.153,
+            "S_ms": 0.506,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.486,
+            "V_ms": 26.011,
+            "S_ms": 0.372,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.42,
+            "V_ms": 24.981,
+            "S_ms": 0.464,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.409,
+            "V_ms": 25.527,
+            "S_ms": 0.599,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.503,
+            "V_ms": 25.664,
+            "S_ms": 0.465,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.476,
+            "V_ms": 24.799,
+            "S_ms": 0.481,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.435,
+            "V_ms": 25.51,
+            "S_ms": 0.496,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.443,
+            "V_ms": 25.224,
+            "S_ms": 0.336,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.321,
+            "V_ms": 24.637,
+            "S_ms": 0.459,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.392,
+            "V_ms": 25.033,
+            "S_ms": 0.482,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.506,
+            "V_ms": 25.082,
+            "S_ms": 0.497,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.441,
+            "V_ms": 25.255,
+            "S_ms": 0.521,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.442,
+            "V_ms": 25.523,
+            "S_ms": 0.449,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.485,
+            "V_ms": 25.152,
+            "S_ms": 0.529,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.491,
+            "V_ms": 25.713,
+            "S_ms": 0.449,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.458,
+            "V_ms": 24.87,
+            "S_ms": 0.32,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.332,
+            "V_ms": 24.816,
+            "S_ms": 0.422,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.385,
+            "V_ms": 24.843,
+            "S_ms": 0.298,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.333,
+            "V_ms": 25.878,
+            "S_ms": 0.611,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.451,
+            "V_ms": 24.723,
+            "S_ms": 0.291,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.352,
+            "V_ms": 24.652,
+            "S_ms": 0.443,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.421,
+            "V_ms": 24.799,
+            "S_ms": 0.352,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.309,
+            "V_ms": 24.388,
+            "S_ms": 0.315,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.342,
+            "V_ms": 24.539,
+            "S_ms": 0.415,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.324,
+            "V_ms": 25.095,
+            "S_ms": 0.444,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.561,
+            "V_ms": 24.971,
+            "S_ms": 0.285,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.336,
+            "V_ms": 24.607,
+            "S_ms": 0.518,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.51,
+            "V_ms": 26.087,
+            "S_ms": 0.318,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.372,
+            "V_ms": 24.882,
+            "S_ms": 0.403,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.333,
+            "V_ms": 24.447,
+            "S_ms": 0.306,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.272,
+            "V_ms": 24.273,
+            "S_ms": 0.303,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.355,
+            "V_ms": 24.637,
+            "S_ms": 0.456,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.33,
+            "V_ms": 24.888,
+            "S_ms": 0.471,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.428,
+            "V_ms": 25.433,
+            "S_ms": 0.55,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.427,
+            "V_ms": 26.018,
+            "S_ms": 0.532,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.485,
+            "V_ms": 26.344,
+            "S_ms": 0.52,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.402,
+            "V_ms": 25.107,
+            "S_ms": 0.514,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.592,
+            "V_ms": 25.608,
+            "S_ms": 0.452,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.403,
+            "V_ms": 24.787,
+            "S_ms": 0.532,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.479,
+            "V_ms": 25.119,
+            "S_ms": 0.339,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.283,
+            "V_ms": 26.719,
+            "S_ms": 0.508,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.385,
+            "V_ms": 24.82,
+            "S_ms": 0.441,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.446,
+            "V_ms": 24.992,
+            "S_ms": 0.45,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.401,
+            "V_ms": 25.054,
+            "S_ms": 0.501,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.551,
+            "V_ms": 25.907,
+            "S_ms": 0.513,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.465,
+            "V_ms": 25.214,
+            "S_ms": 0.298,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.319,
+            "V_ms": 24.266,
+            "S_ms": 0.423,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.439,
+            "V_ms": 24.836,
+            "S_ms": 0.436,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.429,
+            "V_ms": 24.642,
+            "S_ms": 0.483,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.464,
+            "V_ms": 24.869,
+            "S_ms": 0.498,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.402,
+            "V_ms": 25.351,
+            "S_ms": 0.567,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.313,
+            "V_ms": 24.828,
+            "S_ms": 0.398,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.34,
+            "V_ms": 24.753,
+            "S_ms": 0.446,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.446,
+            "V_ms": 24.849,
+            "S_ms": 0.337,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.347,
+            "V_ms": 24.992,
+            "S_ms": 0.471,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.404,
+            "V_ms": 24.603,
+            "S_ms": 0.432,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.433,
+            "V_ms": 25.28,
+            "S_ms": 0.394,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.329,
+            "V_ms": 24.702,
+            "S_ms": 0.429,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.334,
+            "V_ms": 24.562,
+            "S_ms": 0.462,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.43,
+            "V_ms": 25.632,
+            "S_ms": 0.523,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.509,
+            "V_ms": 25.302,
+            "S_ms": 0.338,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.309,
+            "V_ms": 24.249,
+            "S_ms": 0.235,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.375,
+            "V_ms": 24.49,
+            "S_ms": 0.474,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.334,
+            "V_ms": 24.529,
+            "S_ms": 0.48,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.478,
+            "V_ms": 24.757,
+            "S_ms": 0.45,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.505,
+            "V_ms": 25.231,
+            "S_ms": 0.409,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.475,
+            "V_ms": 25.206,
+            "S_ms": 0.46,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.424,
+            "V_ms": 24.869,
+            "S_ms": 0.419,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.462,
+            "V_ms": 24.696,
+            "S_ms": 0.288,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.341,
+            "V_ms": 24.602,
+            "S_ms": 0.344,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.351,
+            "V_ms": 25.544,
+            "S_ms": 0.528,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.439,
+            "V_ms": 25.664,
+            "S_ms": 0.537,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.495,
+            "V_ms": 26.112,
+            "S_ms": 0.513,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.37,
+            "V_ms": 25.401,
+            "S_ms": 0.521,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.524,
+            "V_ms": 25.474,
+            "S_ms": 0.483,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.445,
+            "V_ms": 25.175,
+            "S_ms": 0.408,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.338,
+            "V_ms": 24.978,
+            "S_ms": 0.521,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.576,
+            "V_ms": 26.33,
+            "S_ms": 0.357,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.289,
+            "V_ms": 25.207,
+            "S_ms": 0.325,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.239,
+            "V_ms": 24.96,
+            "S_ms": 0.529,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.314,
+            "V_ms": 25.187,
+            "S_ms": 0.383,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.258,
+            "V_ms": 24.999,
+            "S_ms": 0.446,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.381,
+            "V_ms": 26.039,
+            "S_ms": 0.493,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.333,
+            "V_ms": 26.094,
+            "S_ms": 0.47,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.371,
+            "V_ms": 264.765,
+            "S_ms": 0.558,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 3.32,
+            "V_ms": 32.719,
+            "S_ms": 0.499,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.428,
+            "V_ms": 26.576,
+            "S_ms": 0.504,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.928,
+            "V_ms": 285.754,
+            "S_ms": 1.269,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.368,
+            "V_ms": 31.408,
+            "S_ms": 0.81,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.324,
+            "V_ms": 26.017,
+            "S_ms": 0.245,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.369,
+            "V_ms": 25.565,
+            "S_ms": 0.273,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.237,
+            "V_ms": 25.034,
+            "S_ms": 0.504,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.441,
+            "V_ms": 26.262,
+            "S_ms": 0.489,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.415,
+            "V_ms": 27.735,
+            "S_ms": 0.386,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.387,
+            "V_ms": 25.927,
+            "S_ms": 0.468,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.383,
+            "V_ms": 28.27,
+            "S_ms": 0.446,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.527,
+            "V_ms": 28.361,
+            "S_ms": 0.467,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.458,
+            "V_ms": 27.246,
+            "S_ms": 0.463,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.396,
+            "V_ms": 25.382,
+            "S_ms": 0.507,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.432,
+            "V_ms": 28.328,
+            "S_ms": 0.331,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.306,
+            "V_ms": 25.35,
+            "S_ms": 0.514,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.489,
+            "V_ms": 27.162,
+            "S_ms": 0.433,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.41,
+            "V_ms": 27.762,
+            "S_ms": 0.555,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.448,
+            "V_ms": 27.282,
+            "S_ms": 0.439,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.478,
+            "V_ms": 28.523,
+            "S_ms": 0.525,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.559,
+            "V_ms": 28.456,
+            "S_ms": 0.502,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.472,
+            "V_ms": 28.261,
+            "S_ms": 0.562,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.509,
+            "V_ms": 27.562,
+            "S_ms": 0.347,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.36,
+            "V_ms": 25.943,
+            "S_ms": 0.529,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.501,
+            "V_ms": 26.446,
+            "S_ms": 0.304,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.311,
+            "V_ms": 25.961,
+            "S_ms": 0.485,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.444,
+            "V_ms": 28.065,
+            "S_ms": 0.338,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.382,
+            "V_ms": 26.714,
+            "S_ms": 0.564,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.507,
+            "V_ms": 29.157,
+            "S_ms": 0.323,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.357,
+            "V_ms": 25.53,
+            "S_ms": 0.34,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.357,
+            "V_ms": 26.173,
+            "S_ms": 0.451,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.452,
+            "V_ms": 27.417,
+            "S_ms": 0.468,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.476,
+            "V_ms": 27.756,
+            "S_ms": 0.323,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.373,
+            "V_ms": 25.88,
+            "S_ms": 0.495,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.376,
+            "V_ms": 27.226,
+            "S_ms": 0.338,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.304,
+            "V_ms": 26.604,
+            "S_ms": 0.555,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.535,
+            "V_ms": 26.039,
+            "S_ms": 0.301,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.341,
+            "V_ms": 25.45,
+            "S_ms": 0.322,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.327,
+            "V_ms": 25.959,
+            "S_ms": 0.482,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.404,
+            "V_ms": 26.209,
+            "S_ms": 0.551,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.489,
+            "V_ms": 28.257,
+            "S_ms": 0.395,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.384,
+            "V_ms": 26.23,
+            "S_ms": 0.526,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.426,
+            "V_ms": 26.418,
+            "S_ms": 0.505,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.465,
+            "V_ms": 27.153,
+            "S_ms": 0.529,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.47,
+            "V_ms": 28.198,
+            "S_ms": 0.502,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.47,
+            "V_ms": 26.802,
+            "S_ms": 0.489,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.467,
+            "V_ms": 26.65,
+            "S_ms": 0.283,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.319,
+            "V_ms": 25.123,
+            "S_ms": 0.473,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.393,
+            "V_ms": 26.171,
+            "S_ms": 0.535,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.486,
+            "V_ms": 28.801,
+            "S_ms": 0.511,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.466,
+            "V_ms": 28.148,
+            "S_ms": 0.518,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.545,
+            "V_ms": 28.583,
+            "S_ms": 0.522,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.527,
+            "V_ms": 28.12,
+            "S_ms": 0.34,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.311,
+            "V_ms": 26.542,
+            "S_ms": 0.504,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.333,
+            "V_ms": 27.135,
+            "S_ms": 0.551,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.404,
+            "V_ms": 27.687,
+            "S_ms": 0.511,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.432,
+            "V_ms": 29.433,
+            "S_ms": 0.537,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.387,
+            "V_ms": 25.94,
+            "S_ms": 0.55,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.374,
+            "V_ms": 27.729,
+            "S_ms": 0.514,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.35,
+            "V_ms": 26.981,
+            "S_ms": 0.597,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.36,
+            "V_ms": 26.978,
+            "S_ms": 0.378,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.338,
+            "V_ms": 25.731,
+            "S_ms": 0.541,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.37,
+            "V_ms": 27.504,
+            "S_ms": 0.462,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.353,
+            "V_ms": 26.726,
+            "S_ms": 0.527,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.334,
+            "V_ms": 28.41,
+            "S_ms": 0.543,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.406,
+            "V_ms": 27.062,
+            "S_ms": 0.542,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.378,
+            "V_ms": 27.064,
+            "S_ms": 0.532,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.429,
+            "V_ms": 27.05,
+            "S_ms": 0.379,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.421,
+            "V_ms": 26.264,
+            "S_ms": 0.324,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.303,
+            "V_ms": 25.693,
+            "S_ms": 0.549,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.413,
+            "V_ms": 28.383,
+            "S_ms": 0.527,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.459,
+            "V_ms": 26.418,
+            "S_ms": 0.528,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.471,
+            "V_ms": 27.73,
+            "S_ms": 0.578,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.384,
+            "V_ms": 28.195,
+            "S_ms": 0.481,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.433,
+            "V_ms": 26.86,
+            "S_ms": 0.55,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.427,
+            "V_ms": 28.053,
+            "S_ms": 0.348,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.236,
+            "V_ms": 25.711,
+            "S_ms": 0.322,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.399,
+            "V_ms": 26.498,
+            "S_ms": 0.506,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.399,
+            "V_ms": 28.814,
+            "S_ms": 0.572,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.497,
+            "V_ms": 28.483,
+            "S_ms": 0.504,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.354,
+            "V_ms": 26.827,
+            "S_ms": 0.583,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.511,
+            "V_ms": 27.512,
+            "S_ms": 0.571,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.494,
+            "V_ms": 27.839,
+            "S_ms": 0.355,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.372,
+            "V_ms": 26.391,
+            "S_ms": 0.528,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.434,
+            "V_ms": 28.207,
+            "S_ms": 0.352,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.295,
+            "V_ms": 25.364,
+            "S_ms": 0.325,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.276,
+            "V_ms": 25.83,
+            "S_ms": 0.535,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.412,
+            "V_ms": 27.343,
+            "S_ms": 0.383,
+            "H_ms": 0.0,
+            "K": 0,
+            "final_tokens": 1
+          },
+          {
+            "D_ms": 2.365,
+            "V_ms": 25.861,
+            "S_ms": 0.559,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.458,
+            "V_ms": 28.674,
+            "S_ms": 0.523,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.421,
+            "V_ms": 26.488,
+            "S_ms": 0.459,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.359,
+            "V_ms": 265.444,
+            "S_ms": 0.612,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 3.13,
+            "V_ms": 30.885,
+            "S_ms": 0.489,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          },
+          {
+            "D_ms": 2.407,
+            "V_ms": 26.314,
+            "S_ms": 0.496,
+            "H_ms": 0.0,
+            "K": 1,
+            "final_tokens": 2
+          }
+        ]
+      },
+      "actual_pipeline_hits": "NOT_COLLECTED",
+      "active_rows": "NOT_COLLECTED",
+      "capacity_rows": "NOT_COLLECTED",
+      "bank_epoch": "NOT_COLLECTED",
+      "fallback": [
+        [],
+        []
+      ],
+      "timeout": "NOT_COLLECTED",
+      "GPU_fault": "NOT_COLLECTED",
+      "HTTP_error": "NOT_COLLECTED",
+      "teardown": {
+        "returncode": 0,
+        "forced": false,
+        "seconds": 1.0158640119916527
+      },
+      "quality_verdict": "NOT_COLLECTED"
+    },
+    "not_collected": [
+      "contract_version",
+      "quality_gate_version",
+      "timing_boundary",
+      "all_model_shard_SHA256",
+      "draft_SHA256",
+      "source_dirty_identity",
+      "paired_block",
+      "first_token_ms",
+      "actual_pipeline_hits",
+      "active_rows",
+      "capacity_rows",
+      "bank_epoch",
+      "timeout",
+      "GPU_fault",
+      "HTTP_error",
+      "quality_verdict"
+    ],
+    "checklist_covered": true,
+    "notes": {
+      "all_model_shard_SHA256": "manifest.json carries stat identity; full shard SHA256 is computed offline by DevOps before GPU runs (AGENTS.md §4.2)",
+      "draft_SHA256": "same offline policy as model shards",
+      "actual_pipeline_hits": "future entry: pipeline hit counters from GGML_TP5_PROFILE logs",
+      "active_rows": "AGENTS.md §7.3 rank/stage ledger; collector does not exist yet",
+      "capacity_rows": "AGENTS.md §7.3 rank/stage ledger; collector does not exist yet",
+      "bank_epoch": "AGENTS.md §7.3 rank/stage ledger; collector does not exist yet"
+    }
+  }
+}

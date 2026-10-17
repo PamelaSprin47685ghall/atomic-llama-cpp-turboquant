@@ -1,0 +1,16 @@
+{
+  "id": "05_math_logic",
+  "category": "math_multi_step_logic",
+  "gate_level": "MUST_PASS",
+  "prompt": "小李每周一、周三、周五各跑步 5 公里，周六跑步 10 公里，其余日子（周二、周四、周日）完全休息。如果某个月一共有 30 天，且该月的 1 号恰好是周日，请计算：小李在这个月一共跑步了多少公里？请写出简明计算步骤，并在最后明确写出总公里数。",
+  "system_prompt": "你是一个具备严谨逻辑与准确数学计算能力的助手。请仔细推导日期与星期对应关系，确保算术绝对无误。",
+  "deterministic_target": {
+    "final_answer_number": 105,
+    "unit": "公里/km",
+    "derivation": "Day 1 (Sun)=0; Days 2..29 are 4 full weeks (each Mon..Sun=25km, 4*25=100km); Day 30 is Mon (5km); Total=105km"
+  },
+  "constraints": {
+    "max_tokens": 300,
+    "min_tokens": 50
+  }
+}

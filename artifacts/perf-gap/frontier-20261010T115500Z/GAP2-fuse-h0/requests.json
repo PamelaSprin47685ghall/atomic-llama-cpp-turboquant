@@ -1,0 +1,57 @@
+[
+  {
+    "idx": 0,
+    "phase": "warmup",
+    "n": 52,
+    "predicted_ms": 1218.763,
+    "tps": 42.66621156041003,
+    "wall_ms": 5672.830411,
+    "finish": "stop",
+    "content_sha256": "1ffac1abdd04681bcb479988fb210151aad5231f3fef0c04791ea0216b436ba0",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 93,
+      "prompt_ms": 4449.843,
+      "prompt_per_token_ms": 47.84777419354838,
+      "prompt_per_second": 20.899613761654063,
+      "predicted_n": 52,
+      "predicted_ms": 1218.763,
+      "predicted_per_token_ms": 23.437749999999998,
+      "predicted_per_second": 42.66621156041003
+    },
+    "issues": [],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=3 n_sub=96 uid=36028797018967041",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=96 uid=36028797018967297",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=96 uid=36028797018967553",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=96 uid=36028797018967809",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=97 uid=36028797018968065",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=97 uid=36028797018968321"
+    ]
+  },
+  {
+    "idx": 1,
+    "phase": "measured",
+    "n": 176,
+    "predicted_ms": 3677.58,
+    "tps": 47.857558503146095,
+    "wall_ms": 6763.462278,
+    "finish": "stop",
+    "content_sha256": "adb9221697a7d7c36d3e62005c4a8851709f231206d8615767f7f29649039234",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 93,
+      "prompt_ms": 3081.558,
+      "prompt_per_token_ms": 33.13503225806451,
+      "prompt_per_second": 30.179539051349998,
+      "predicted_n": 176,
+      "predicted_ms": 3677.58,
+      "predicted_per_token_ms": 20.89534090909091,
+      "predicted_per_second": 47.857558503146095
+    },
+    "issues": [],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=97 uid=36028797018970113"
+    ]
+  }
+]

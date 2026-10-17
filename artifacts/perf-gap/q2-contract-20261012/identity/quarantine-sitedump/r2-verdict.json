@@ -1,0 +1,15 @@
+{
+  "frozen_utc": "2026-10-12T21:25:30Z",
+  "experiment": "GAP-1 final bisection R2: rank-discriminated + A-binding dumps",
+  "instrumentation_enhancement": {
+    "rank_discrimination": "filename now carries r{N} derived from ctx->device.get() pointer ordinal (bijective within process, 5 ranks = 5 distinct vk_device shared_ptr targets); limitation recorded: device-pointer ordinal, not Vulkan rank number",
+    "weightsA_dump": "new helper ggml_vk_hc_dump_site_weights: copies first 64 u16 from the W subbuffer the contraction actually binds (via ggml_vk_tensor_subbuffer on graph->nodes[base+3]->src[0] for down, base+6->src[0] for up); raw u16 bit pattern + bf16->f32 interpretation on stderr; subbuffer {buf,off,size} logged",
+    "compile_fix": "ctx->device is shared_ptr — cast via ctx->device.get() (2 sites)"
+  },
+  "verdict_table": "ALL 10 (site,rank) combinations: normalized 10240/10240 nonzero; lo 0/320; mixed 0/2560; W_down 0/64 u16; W_up 0/64 u16",
+  "branch": "D — A dump ALL ZERO on ALL ranks",
+  "interpretation": "The BF16 HC weights are NOT present at the subbuffer addresses the contraction binds. The down and up contractions read zero pages: lo = W_down·normalized = 0, and mixed = fold over up(silu(lo)) — with W_up also zero and lo zero, mixed is zero. The subbuffers exist (size 6553600 = 3.27M BF16 elements, plausible for W shards), are distinct per rank (different VkBuffer handles and offsets), but their CONTENT at dispatch time is all-zero.",
+  "refined_root_cause": "TP5 weight distribution/mirroring chain: BF16 HC weights (down/up) are never uploaded (or are uploaded to a different location than where the A binding points) on ANY of the 5 ranks. The SPIR-V execution layer is exonerated — the kernels faithfully multiply zero weights. This also explains why FORCE_ITER (V-A) changed nothing: both decode paths read the same all-zero weights. And it explains why HC-Q8 (3c) worked: Q8_0 weights go through a different upload path that works.",
+  "key_subbuffer_evidence": "r0: W_down {buf=0x6419d207ea30, off=1049041280, size=6553600}, W_up {buf=same, off=1055594880} — offsets ~1GB apart in a shared weight buffer, sizes plausible; r1: different buffer handle — per-rank sharding is structurally present, only the CONTENT is zero.",
+  "next_candidate_for_engineer": "the TP5 tensor-split weight upload path for BF16 HC tensors: where ggml splits W_down/W_up across ranks (--split-mode tensor) and uploads shards; likely the upload is skipped, targets a stale buffer, or the binding offset does not match the upload offset for BF16 (Q8_0 path works)."
+}

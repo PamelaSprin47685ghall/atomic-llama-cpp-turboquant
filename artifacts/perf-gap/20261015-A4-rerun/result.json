@@ -1,0 +1,578 @@
+{
+  "status": "MEASURED_NOT_QUALIFIED",
+  "qualification": "NOT_REVIEWED",
+  "profile": "none",
+  "gpu_before": [
+    {
+      "card": "card1",
+      "bdf": "0000:0f:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17203200",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card2",
+      "bdf": "0000:09:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+    },
+    {
+      "card": "card3",
+      "bdf": "0000:0c:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card4",
+      "bdf": "0000:06:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card5",
+      "bdf": "0000:03:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz *\n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz"
+    }
+  ],
+  "process_id": 410207,
+  "loading_ms": 79282.54216,
+  "pooled_tps": 51.17161680987613,
+  "median_tps": 51.171684678254024,
+  "requests": [
+    {
+      "idx": 0,
+      "phase": "warmup",
+      "n": 360,
+      "predicted_ms": 8101.971,
+      "tps": 44.43363226059437,
+      "wall_ms": 12399.069881,
+      "finish": "stop",
+      "content_sha256": "ce818dda56bb8ab7f7f582ea0d27710ebafcf88746873f1782da55c053e95302",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 110,
+        "prompt_ms": 4292.77,
+        "prompt_per_token_ms": 39.02518181818182,
+        "prompt_per_second": 25.6244802307135,
+        "predicted_n": 360,
+        "predicted_ms": 8101.971,
+        "predicted_per_token_ms": 22.505474999999997,
+        "predicted_per_second": 44.433632260594365
+      },
+      "issues": [],
+      "fallback_lines": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=3 n_sub=96 uid=36028797018967041",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=96 uid=36028797018967297",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=96 uid=36028797018967553",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=96 uid=36028797018967809",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=96 uid=36028797018968065",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=97 uid=36028797018968321",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=97 uid=36028797018968577",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=10 n_sub=97 uid=36028797018968833"
+      ],
+      "mtp_cycle_lines": []
+    },
+    {
+      "idx": 1,
+      "phase": "measured",
+      "n": 360,
+      "predicted_ms": 7043.252,
+      "tps": 51.112753029424475,
+      "wall_ms": 10620.381228,
+      "finish": "stop",
+      "content_sha256": "ce818dda56bb8ab7f7f582ea0d27710ebafcf88746873f1782da55c053e95302",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 110,
+        "prompt_ms": 2970.166,
+        "prompt_per_token_ms": 27.001509090909092,
+        "prompt_per_second": 37.03496706918064,
+        "predicted_n": 360,
+        "predicted_ms": 7043.252,
+        "predicted_per_token_ms": 19.56458888888889,
+        "predicted_per_second": 51.11275302942447
+      },
+      "issues": [],
+      "fallback_lines": [],
+      "mtp_cycle_lines": []
+    },
+    {
+      "idx": 2,
+      "phase": "measured",
+      "n": 360,
+      "predicted_ms": 7027.048,
+      "tps": 51.23061632708358,
+      "wall_ms": 10117.492562,
+      "finish": "stop",
+      "content_sha256": "ce818dda56bb8ab7f7f582ea0d27710ebafcf88746873f1782da55c053e95302",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 110,
+        "prompt_ms": 3086.397,
+        "prompt_per_token_ms": 28.058154545454546,
+        "prompt_per_second": 35.64026274001692,
+        "predicted_n": 360,
+        "predicted_ms": 7027.048,
+        "predicted_per_token_ms": 19.519577777777776,
+        "predicted_per_second": 51.230616327083574
+      },
+      "issues": [],
+      "fallback_lines": [],
+      "mtp_cycle_lines": []
+    },
+    {
+      "idx": 3,
+      "phase": "guard",
+      "n": 72,
+      "predicted_ms": 1647.518,
+      "tps": 43.70210219251019,
+      "wall_ms": 2942.989786,
+      "finish": "stop",
+      "content_sha256": "ead561f7cdce47b31ce7e0e48bceb7f6d17857880c2f92f65ebfede5779c0f78",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 23,
+        "prompt_ms": 1292.243,
+        "prompt_per_token_ms": 56.18447826086956,
+        "prompt_per_second": 17.798510032555797,
+        "predicted_n": 72,
+        "predicted_ms": 1647.518,
+        "predicted_per_token_ms": 22.882194444444444,
+        "predicted_per_second": 43.70210219251018
+      },
+      "issues": [],
+      "fallback_lines": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=11 n_sub=96 uid=36028797018973185"
+      ],
+      "mtp_cycle_lines": []
+    }
+  ],
+  "length_gate": {
+    "length_min": 160,
+    "length_max": 240,
+    "phase_scope": "measured",
+    "passed": false,
+    "requests": [
+      {
+        "idx": 1,
+        "n": 360,
+        "in_range": false
+      },
+      {
+        "idx": 2,
+        "n": 360,
+        "in_range": false
+      }
+    ]
+  },
+  "mtp_horizon": 0,
+  "accepted_prefix_distribution": "NOT_APPLICABLE",
+  "cycle_D_V_S_H_K": "NOT_APPLICABLE",
+  "rank_stage_ledger": {
+    "status": "COLLECTED",
+    "source": "GGML_TP5_PROFILE-family lines parsed from request log segments (request-{idx}.log)",
+    "scope": "request segments only (warmup/measured/guard); lines outside request segments are counted separately by the runner against the full server.log",
+    "lines_total": 408,
+    "lines_parsed": 400,
+    "lines_malformed": 8,
+    "per_request": {
+      "0": {
+        "[tp5-linear-definition]": 20,
+        "[tp5-dependency-ledger]": 20,
+        "phase": "warmup"
+      },
+      "1": {
+        "[tp5-linear-definition]": 80,
+        "[tp5-dependency-ledger]": 80,
+        "phase": "measured"
+      },
+      "2": {
+        "[tp5-linear-definition]": 80,
+        "[tp5-dependency-ledger]": 80,
+        "phase": "measured"
+      },
+      "3": {
+        "[tp5-linear-definition]": 20,
+        "[tp5-dependency-ledger]": 20,
+        "phase": "guard"
+      }
+    },
+    "counts": {
+      "exec_summary": 0,
+      "relay_stage": 0,
+      "latebind_stage": 0,
+      "definition": 200,
+      "dependency": 200,
+      "graph": 0
+    },
+    "relay_stage_stats": {},
+    "slowest_rank": null,
+    "malformed_samples": [
+      {
+        "request_idx": 0,
+        "tag": "[tp5-profile]",
+        "line": "[tp5-profile] 96 allreduces cost: p1_rec=19.61 ms, p1_sub=15.86 ms, p1_wait=78.68 ms, p2_rec=0.00 ms, p2_sub=0.00 ms | COLLECTIVE TOTAL=115.71 ms"
+      },
+      {
+        "request_idx": 0,
+        "tag": "[tp5-profile]",
+        "line": "[tp5-profile] 96 allreduces cost: p1_rec=2.95 ms, p1_sub=16.85 ms, p1_wait=95.99 ms, p2_rec=0.00 ms, p2_sub=0.00 ms | COLLECTIVE TOTAL=116.84 ms"
+      },
+      {
+        "request_idx": 0,
+        "tag": "[tp5-profile]",
+        "line": "[tp5-profile] 96 allreduces cost: p1_rec=20.20 ms, p1_sub=16.67 ms, p1_wait=40.04 ms, p2_rec=0.00 ms, p2_sub=0.00 ms | COLLECTIVE TOTAL=78.29 ms"
+      },
+      {
+        "request_idx": 0,
+        "tag": "[tp5-profile]",
+        "line": "[tp5-profile] 96 allreduces cost: p1_rec=19.19 ms, p1_sub=17.35 ms, p1_wait=58.04 ms, p2_rec=0.00 ms, p2_sub=0.00 ms | COLLECTIVE TOTAL=95.94 ms"
+      },
+      {
+        "request_idx": 0,
+        "tag": "[tp5-profile]",
+        "line": "[tp5-profile] 96 allreduces cost: p1_rec=17.41 ms, p1_sub=16.62 ms, p1_wait=30.17 ms, p2_rec=0.00 ms, p2_sub=0.00 ms | COLLECTIVE TOTAL=65.54 ms"
+      }
+    ],
+    "derived": {},
+    "field_boundaries": {
+      "role": "per-stage role NOT_PRINTED; [tp5-mtp-graph] frame_role exists at graph level only",
+      "phase": "request phase (warmup/measured/guard) attributed by the collector; [tp5-mtp-graph] execution_phase printed at graph level",
+      "rank": "[tp5-linear-definition]/[tp5-dependency-ledger] print rank=; [tp5-relay-stage] prints a per-rank ready_rank_us list",
+      "stage": "[tp5-relay-stage]/[tp5-latebind-stage] print stage=",
+      "active_rows": "NOT_PRINTED per stage (relay submit takes active_rows but never logs it); [tp5-mtp-graph] ubatch_tokens is graph-level token rows, different granularity",
+      "capacity_rows": "NOT_PRINTED per stage; [tp5-mtp-graph] target_capacity is predefined target admission, different semantics",
+      "M_N_K": "NOT_PRINTED in profile lines",
+      "weight_type": "NOT_PRINTED in profile lines",
+      "pipeline": "per-stage native pipeline NOT_PRINTED; [tp5-profile] creplay/plan are per-exec aggregate counters; relay direct=1/0 is route selection, not pipeline",
+      "moe_experts": "NOT_PRINTED: expert selection is not in profile lines",
+      "bank_epoch": "[tp5-relay-stage] epoch printed (bank=epoch&1 derivable); reader-done completion relationship NOT_PRINTED"
+    },
+    "full_detail_file": "rank-stage.json",
+    "server_log_tag_lines_total": 450,
+    "outside_request_segments": 42
+  },
+  "shutdown": {
+    "returncode": 0,
+    "forced": false,
+    "seconds": 0.7652320049819537
+  },
+  "gpu_after": [
+    {
+      "card": "card1",
+      "bdf": "0000:0f:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "11",
+      "mem_info_vram_used": "17203200",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz \n1: 2475Mhz *",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card2",
+      "bdf": "0000:09:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "29",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz \n1: 2280Mhz *\n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz *\n3: 1000Mhz"
+    },
+    {
+      "card": "card3",
+      "bdf": "0000:0c:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "10",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz \n1: 2475Mhz *",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card4",
+      "bdf": "0000:06:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "8",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz \n1: 2475Mhz *",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card5",
+      "bdf": "0000:03:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "20",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz \n1: 2345Mhz *\n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz *\n2: 673Mhz \n3: 1000Mhz"
+    }
+  ],
+  "minimum_fields": {
+    "checklist": [
+      "contract_version",
+      "workload_hash",
+      "quality_gate_version",
+      "timing_boundary",
+      "all_model_shard_SHA256",
+      "draft_SHA256",
+      "source_dirty_identity",
+      "binary_SHA256",
+      "actual_loaded_DSO_SHA256",
+      "rank_to_BDF",
+      "resolved_env_and_CLI",
+      "process_id",
+      "paired_block",
+      "phase",
+      "public_completion_tokens",
+      "finish_reason",
+      "complete_text_hash_and_raw_body",
+      "generation_ms",
+      "prompt_ms",
+      "first_token_ms",
+      "request_wall_ms",
+      "startup_ms",
+      "mtp_horizon",
+      "accepted_prefix_distribution",
+      "cycle_D_V_S_H_K",
+      "actual_pipeline_hits",
+      "active_rows",
+      "capacity_rows",
+      "bank_epoch",
+      "fallback",
+      "timeout",
+      "GPU_fault",
+      "HTTP_error",
+      "teardown",
+      "quality_verdict"
+    ],
+    "fields": {
+      "contract_version": "NOT_COLLECTED",
+      "workload_hash": "20c0ddaa0a45a3f54de39039158bec7111f9e2496b145531541df0713a4c9c2a",
+      "quality_gate_version": "NOT_COLLECTED",
+      "timing_boundary": "NOT_COLLECTED",
+      "all_model_shard_SHA256": "NOT_COLLECTED",
+      "draft_SHA256": "NOT_COLLECTED",
+      "source_dirty_identity": "NOT_COLLECTED",
+      "binary_SHA256": "e9aca36509cbd2d6a4d448dc08d49f21907b9d5f37084d4c94929328ae019c6c",
+      "actual_loaded_DSO_SHA256": {
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml-base.so.0.18.1": "688640982b4382dad9842d8c9695653b6ff943c8df0aa4e49d0350283962dc46",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml-cpu.so.0.18.1": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml-vulkan.so.0.18.1": "1373e69ead119e0c8ff501fbd8bee3b85f4ee9df95cc205c3b4d24fef23920c6",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libggml.so.0.18.1": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libllama-common.so.0.0.2188": "29bcbe656b7e8932ad8e399680873b5eddb442bd393b93ab5d638a548c3b9ff9",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libllama-server-impl.so": "cdc240a70ab00d35e5bae772e881d8701949ee626ed54fc38a02b51b5f25af09",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/libllama.so.0.0.2188": "5d63fa93bfe35f7da895bbea3cb79953733e76c513d57e9485744651ede09d19",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac"
+      },
+      "rank_to_BDF": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0"
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0"
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0"
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0"
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0"
+        }
+      ],
+      "resolved_env_and_CLI": {
+        "argv": [
+          "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin/llama-server",
+          "-m",
+          "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+          "-dev",
+          "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+          "--split-mode",
+          "tensor",
+          "--fit",
+          "off",
+          "-ngl",
+          "999",
+          "-c",
+          "1024",
+          "-b",
+          "32",
+          "-ub",
+          "32",
+          "--no-mmap",
+          "--no-host",
+          "-np",
+          "1",
+          "-t",
+          "22",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18765",
+          "--tp5",
+          "qwen4exp-af",
+          "--tp5-latebind",
+          "off",
+          "--spec-type",
+          "none"
+        ],
+        "env": {
+          "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.bun/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.bun/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+          "HOME": "/home/kunweiz",
+          "LANG": "en_US.UTF-8",
+          "LD_LIBRARY_PATH": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-baseline-20261010T0401/measured-bin",
+          "RADV_DEBUG": "nobolist",
+          "GGML_VK_DISABLE_MMVQ": "1",
+          "GGML_VK_FORCE_MMVQ": "0",
+          "GGML_TP5_REPLICATE_ATTN": "0",
+          "GGML_TP5_QSA_HEADMAP": "1",
+          "GGML_TP5_GDN_HEADMAP": "1",
+          "GGML_VK_SMALL_Q8_COLUMNS": "1",
+          "GGML_TP5_GREEDY_HOST": "1",
+          "GGML_TP5_PARALLEL_SUBMIT": "1",
+          "GGML_TP5_Q_WORKGROUP": "256",
+          "GGML_TP5_NORM_WORKGROUP": "256",
+          "GGML_TP5_NORM_PREFETCH": "0",
+          "GGML_TP5_PACK_SINGLE_WG": "0",
+          "GGML_TP5_SHARD_ROUTER": "0"
+        }
+      },
+      "process_id": 410207,
+      "paired_block": "NOT_COLLECTED",
+      "phase": [
+        "measured",
+        "measured"
+      ],
+      "public_completion_tokens": [
+        360,
+        360
+      ],
+      "finish_reason": [
+        "stop",
+        "stop"
+      ],
+      "complete_text_hash_and_raw_body": {
+        "per_request_content_sha256": [
+          "ce818dda56bb8ab7f7f582ea0d27710ebafcf88746873f1782da55c053e95302",
+          "ce818dda56bb8ab7f7f582ea0d27710ebafcf88746873f1782da55c053e95302"
+        ],
+        "raw_body_files": [
+          "request-1.json",
+          "request-2.json"
+        ]
+      },
+      "generation_ms": [
+        7043.252,
+        7027.048
+      ],
+      "prompt_ms": [
+        2970.166,
+        3086.397
+      ],
+      "first_token_ms": "NOT_COLLECTED",
+      "request_wall_ms": [
+        10620.381228,
+        10117.492562
+      ],
+      "startup_ms": 79282.54216,
+      "mtp_horizon": 0,
+      "accepted_prefix_distribution": "NOT_APPLICABLE",
+      "cycle_D_V_S_H_K": "NOT_APPLICABLE",
+      "actual_pipeline_hits": "NOT_COLLECTED",
+      "active_rows": "NOT_COLLECTED",
+      "capacity_rows": "NOT_COLLECTED",
+      "bank_epoch": "NOT_COLLECTED",
+      "fallback": [
+        [],
+        []
+      ],
+      "timeout": "NOT_COLLECTED",
+      "GPU_fault": "NOT_COLLECTED",
+      "HTTP_error": "NOT_COLLECTED",
+      "teardown": {
+        "returncode": 0,
+        "forced": false,
+        "seconds": 0.7652320049819537
+      },
+      "quality_verdict": "NOT_COLLECTED"
+    },
+    "not_collected": [
+      "contract_version",
+      "quality_gate_version",
+      "timing_boundary",
+      "all_model_shard_SHA256",
+      "draft_SHA256",
+      "source_dirty_identity",
+      "paired_block",
+      "first_token_ms",
+      "actual_pipeline_hits",
+      "active_rows",
+      "capacity_rows",
+      "bank_epoch",
+      "timeout",
+      "GPU_fault",
+      "HTTP_error",
+      "quality_verdict"
+    ],
+    "checklist_covered": true,
+    "notes": {
+      "all_model_shard_SHA256": "manifest.json carries stat identity; full shard SHA256 is computed offline by DevOps before GPU runs (AGENTS.md §4.2)",
+      "draft_SHA256": "same offline policy as model shards",
+      "actual_pipeline_hits": "per-exec creplay/plan counters parsed from [tp5-profile] lines (needs GGML_TP5_PROFILE=1, --profile full); no per-stage print site",
+      "active_rows": "graph-level ubatch_tokens from [tp5-mtp-graph]; per-stage active_rows has no print site in current source",
+      "capacity_rows": "graph-level target_capacity from [tp5-mtp-graph]; per-stage capacity_rows has no print site in current source",
+      "bank_epoch": "relay epoch printed per [tp5-relay-stage] row (bank=epoch&1 derivable); reader-done completion has no print site"
+    }
+  }
+}

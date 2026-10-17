@@ -555,6 +555,26 @@ struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_te
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
     auto it = stc.simple_tensors.find(tensor);
     if (it == stc.simple_tensors.end()) {
+        // GAP-1 container routing invariant (historical defensive guard): a model
+        // weight (op == NONE, not a view) is owned by the stc_static of the meta
+        // buffer it was load-registered on, and must always resolve through that
+        // stc_static lookup — never through the lazy-init path below. The
+        // "routing fork" scenario this guard was originally built against was
+        // disproven by later evidence: r6 ran the full load+dispatch flow with
+        // zero aborts, and r7's same-run comparison showed load-time and
+        // dispatch-time tensor identities matching exactly (r5's "second
+        // allocation" addresses came from different runs — a cross-run
+        // comparison artifact). Kept as fail-closed depth defense: if a future
+        // change ever lets a weight-type tensor reach lazy init, abort here
+        // instead of silently handing dispatch an allocation no loader write
+        // ever touched. (See the matching ownership guard in
+        // ggml_backend_meta_alloc_ctx_tensors_from_buft.)
+        if (tensor->op == GGML_OP_NONE && tensor->view_src == nullptr &&
+                buf_ctx->stc_static.simple_tensors.find(tensor) == buf_ctx->stc_static.simple_tensors.end()) {
+            GGML_ABORT("ggml-backend-meta: weight tensor '%s' (op=NONE, not a view) is not registered in its "
+                       "meta buffer's stc_static; refusing to lazily create a compute-container shadow "
+                       "(GAP-1 container routing fork)", tensor->name);
+        }
         ggml_backend_meta_buffer_init_tensor_impl(stc, const_cast<struct ggml_tensor *>(tensor));
         it = stc.simple_tensors.find(tensor);
         if (it == stc.simple_tensors.end()) {
@@ -2632,6 +2652,25 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        // GAP-1 container routing invariant (historical defensive guard): a tensor
+        // that already completed load-time registration in another meta buffer's
+        // stc_static keeps that ownership instead of being rebound here. The
+        // "second meta allocation forks the weight identity" scenario this guard
+        // was originally built against was disproven by later evidence: r6 ran
+        // the full load+dispatch flow with this guard never firing, and r7's
+        // same-run comparison showed load-time and dispatch-time tensor
+        // identities matching exactly (r5's two buffer addresses came from
+        // different runs — a cross-run comparison artifact). Kept as fail-closed
+        // depth defense, mirroring the standard
+        // ggml_backend_alloc_ctx_tensors_from_buft semantics of skipping tensors
+        // that are already allocated.
+        if (t->buffer != nullptr && t->buffer != meta_buf && ggml_backend_buffer_is_meta(t->buffer)) {
+            ggml_backend_meta_buffer_context * prev_ctx =
+                (ggml_backend_meta_buffer_context *) t->buffer->context;
+            if (prev_ctx->stc_static.simple_tensors.find(t) != prev_ctx->stc_static.simple_tensors.end()) {
+                continue; // ownership already established; do not fork the identity
+            }
+        }
         t->buffer = meta_buf;
         ggml_backend_meta_buffer_init_tensor_impl(meta_buf_ctx->stc_static, t);
         t->data = (void *) 0x2000000000000000; // FIXME

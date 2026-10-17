@@ -1,0 +1,14 @@
+{
+  "frozen_utc": "2026-10-12T20:21:14Z",
+  "purpose": "GAP-1 adjudication step 0: FULL FRESH build (new cmake configure, no incremental reuse) of archive 3e28b121a + upfold-fix.diff + force-iter switch — eliminates any SPIRV staleness channel in the prior incremental builds",
+  "source_tree": "/var/tmp/tp5-verify-rebuild-src",
+  "build_type": "full fresh configure + build (cmake configure from scratch)",
+  "applied_diffs_verify": "identity/quarantine-rebuild/applied-diffs-verify.txt",
+  "spirv_evidence": {
+    "note": "standalone .hpp headers not found; shaders embedded via vulkan-shaders-gen arrays — SPIRV regeneration evidenced by libggml-vulkan.so hash difference from upfoldFix build (fresh full configure+build, no shared cache)"
+  },
+  "libggml_vulkan_so_sha256": "db1f28efd4fdd44311a5f5d577599f5836ce532e2cb95888edaa40429276c1ef",
+  "reference_upfoldFix_vk": "9452b39a258c4a10…",
+  "reference_forceIter_vk": "9e6f0a54cefe9339…",
+  "llama_server_sha256": "dacb1336530997e94f55f272a0b144763e5cfbc42af50417851f30a5dc9f3cc2"
+}

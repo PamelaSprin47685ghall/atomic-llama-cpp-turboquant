@@ -1,0 +1,10 @@
+{
+  "frozen_utc": "2026-10-12T16:40:23Z",
+  "purpose": "MAILBOX-REVERT experiment 2b: tp5_define_linear_chain bank addressing restored to pre-2379e1253 epoch/allreduce_calls derivation; new signature retained (start_bank still used by log line, out_program by output); gate+fused+phase reverts retained",
+  "source_tree": "/var/tmp/tp5-clean-head-src (repo worktree untouched)",
+  "diff_saved": "identity/quarantine-mailboxRevert/mailbox-revert.diff",
+  "libggml_vulkan_so_sha256": "b6eb2c247d468d11fa77adcccca56b1ec3a6866c37b9800e07cf9c990a8f9c9b",
+  "libllama_so_sha256_expected_phaseRevert": "426f00050a689f24626dede19de0d2d0164d54cba7f187e08353ee8420463619",
+  "llama_server_sha256": "d047c4a67f4d6c77d34ce4ea32f40ac9328133d2e5778757735a4463b4b5c542",
+  "static_analysis_note": "tp5_mailbox_bank(e)=(e-1)&1, TP5_MAILBOX_BANKS=2, caller passes start_bank=tp5_mailbox_bank(ac+1) -> new addressing (start_bank+s)%2 is mathematically identical to old (ac+s)&1 at definition time; experiment tests for overlooked caller/edge divergence"
+}

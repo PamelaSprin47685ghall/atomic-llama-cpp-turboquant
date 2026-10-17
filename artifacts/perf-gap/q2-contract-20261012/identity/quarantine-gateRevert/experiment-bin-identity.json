@@ -1,0 +1,11 @@
+{
+  "frozen_utc": "2026-10-12T14:18:59Z",
+  "purpose": "GATE-REVERT experiment: capture gate BF16 acceptance clauses removed in clean 3e28b121a export tree (single-factor revert of 2379e1253 gate widening)",
+  "source_tree": "/var/tmp/tp5-clean-head-src (modified; repo worktree untouched)",
+  "source_ggml_vulkan_cpp_sha256_modified": "4ad322f4a2cb5638fc66554e538c3c69190ae0c90ae22ba4a1d2e0c1269a3df0",
+  "source_ggml_vulkan_cpp_sha256_before": "af8f870e69c0bdf3d3eb720ac107a9ed47e005dfbcce44eb4572f911f035b1f5",
+  "diff_saved": "identity/quarantine-gateRevert/gate-revert.diff",
+  "libggml_vulkan_so_sha256": "d27b1b2ff18d13726a6edfcf899d01a73fc35192e6038fe4ed892b6cf6693ea2",
+  "libggml_vulkan_so_sha256_before_clean": "2e79d99e1dc52d6b787ad7227679240cf8222e5454f8a7c89b831eb5e7300991",
+  "llama_server_sha256": "d047c4a67f4d6c77d34ce4ea32f40ac9328133d2e5778757735a4463b4b5c542"
+}

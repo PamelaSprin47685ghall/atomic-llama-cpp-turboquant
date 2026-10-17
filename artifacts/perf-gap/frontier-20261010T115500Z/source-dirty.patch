@@ -1,0 +1,451 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 79e69b7e0..098c552e4 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1058,6 +1058,9 @@ struct vk_device_struct {
+     // indexed by num_additional_fused_ops == num_adds - 1
+     vk_pipeline pipeline_multi_add[MAX_FUSED_ADDS];
+     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
++    vk_pipeline pipeline_multi_add_hc_combine;
++    vk_pipeline pipeline_multi_add_hc_mix_act;
++    vk_pipeline pipeline_multi_add_hc_mix_gate_fold;
+     vk_pipeline pipeline_hc_fold4;
+     vk_pipeline pipeline_hc_segment_norm[2];
+     vk_pipeline pipeline_hc_inject_norm;
+@@ -2923,6 +2926,9 @@ struct ggml_backend_vk_context {
+     std::vector<float> router_diag_host;      // snapshot from the most recent explicit read
+     uint32_t router_diag_slots_used = 0;      // max actual layer id captured + 1
+     bool fused_hc_fold4{};
++    bool fused_hc_combine{};
++    bool fused_hc_mix_act{};
++    bool fused_hc_mix_gate_fold{};
+     vk_hc_segment fused_hc_segment = vk_hc_segment::NONE;
+     bool          fused_moe_output_segment{};
+     bool          fused_moe_projections{};
+@@ -7345,6 +7351,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline2(device, device->pipeline_multi_add[i],     "multi_add_f32_"     + std::to_string(i+1), multi_add_f32_len,     multi_add_f32_data,     "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
+             ggml_vk_create_pipeline2(device, device->pipeline_multi_add_rms[i], "multi_add_rms_f32_" + std::to_string(i+1), multi_add_rms_f32_len, multi_add_rms_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
+         }
++        ggml_vk_create_pipeline2(device, device->pipeline_multi_add_hc_combine, "multi_add_hc_combine_f32", multi_add_hc_combine_f32_len, multi_add_hc_combine_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {3}, 1);
++        ggml_vk_create_pipeline2(device, device->pipeline_multi_add_hc_mix_act, "multi_add_hc_mix_act_f32", multi_add_hc_mix_act_f32_len, multi_add_hc_mix_act_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {1}, 1);
++        ggml_vk_create_pipeline2(device, device->pipeline_multi_add_hc_mix_gate_fold, "multi_add_hc_mix_gate_fold_f32", multi_add_hc_mix_gate_fold_f32_len, multi_add_hc_mix_gate_fold_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {2}, 1);
+     }
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_add_id_f32, "add_id_f32", add_id_f32_len, add_id_f32_data, "main", 4, sizeof(vk_op_add_id_push_constants), {1, 1, 1}, {}, 1);
+@@ -16854,15 +16863,26 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
+     // of a null vk_buffer would crash before the dispatch even runs.
+     const vk_subbuffer hc_quant_sub = hc_quant_producer ? vk_subbuffer{ ctx->hc_quant_scratch, 0, hc_quant_bytes }
+                                                        : vk_subbuffer{ ctx->hc_quant_scratch, 0, 0 };
+-    ggml_vk_dispatch_pipeline(
+-        ctx, subctx, norm_pipeline,
+-        { ggml_vk_tensor_subbuffer(ctx, residual), ggml_vk_tensor_subbuffer(ctx, block),
+-          ggml_vk_tensor_subbuffer(ctx, inject), ggml_vk_tensor_subbuffer(ctx, normalized->src[1]),
+-          ggml_vk_tensor_subbuffer(ctx, combined), ggml_vk_tensor_subbuffer(ctx, normalized),
+-          ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[0] : residual),
+-          ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[1] : residual),
+-          hc_quant_sub },
+-        pc, { 4, static_cast<uint32_t>(norm->ne[2]), 1 });
++    if (hc_quant_producer) {
++        ggml_vk_dispatch_pipeline(
++            ctx, subctx, norm_pipeline,
++            { ggml_vk_tensor_subbuffer(ctx, residual), ggml_vk_tensor_subbuffer(ctx, block),
++              ggml_vk_tensor_subbuffer(ctx, inject), ggml_vk_tensor_subbuffer(ctx, normalized->src[1]),
++              ggml_vk_tensor_subbuffer(ctx, combined), ggml_vk_tensor_subbuffer(ctx, normalized),
++              ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[0] : residual),
++              ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[1] : residual),
++              hc_quant_sub },
++            pc, { 4, static_cast<uint32_t>(norm->ne[2]), 1 });
++    } else {
++        ggml_vk_dispatch_pipeline(
++            ctx, subctx, norm_pipeline,
++            { ggml_vk_tensor_subbuffer(ctx, residual), ggml_vk_tensor_subbuffer(ctx, block),
++              ggml_vk_tensor_subbuffer(ctx, inject), ggml_vk_tensor_subbuffer(ctx, normalized->src[1]),
++              ggml_vk_tensor_subbuffer(ctx, combined), ggml_vk_tensor_subbuffer(ctx, normalized),
++              ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[0] : residual),
++              ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[1] : residual) },
++            pc, { 4, static_cast<uint32_t>(norm->ne[2]), 1 });
++    }
+     ggml_vk_segment_barrier(ctx, subctx);
+     if (capture_prefix) {
+         auto binding = [&](const ggml_tensor * tensor) {
+@@ -21448,6 +21468,213 @@ static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b
+     return false;
+ }
+ 
++// HC Elementwise Fusion (opt-in via GGML_VK_FUSE_HC_ELEMENTWISE)
++static bool ggml_vk_fuse_hc_elementwise_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("GGML_VK_FUSE_HC_ELEMENTWISE");
++        return env && (strcmp(env, "1") == 0 || strcmp(env, "on") == 0 || strcmp(env, "true") == 0);
++    }();
++    return enabled;
++}
++
++static bool ggml_vk_can_fuse_hc_combine(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
++    if (!ggml_vk_fuse_hc_elementwise_enabled() || !ctx->device->pipeline_multi_add_hc_combine) {
++        return false;
++    }
++    static constexpr std::initializer_list<ggml_op> hc_combine_pattern {
++        GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_ADD
++    };
++    const int output_idx = node_idx + 5;
++    if (output_idx >= cgraph->n_nodes || !ggml_can_fuse_subgraph(cgraph, node_idx, hc_combine_pattern, { output_idx })) {
++        return false;
++    }
++    const ggml_tensor * n0 = cgraph->nodes[node_idx];
++    const ggml_tensor * n1 = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * n4 = cgraph->nodes[node_idx + 4];
++    const ggml_tensor * n5 = cgraph->nodes[node_idx + 5];
++
++    if (ggml_get_unary_op(n1) != GGML_UNARY_OP_SIGMOID) return false;
++    if (n0->type != GGML_TYPE_F32 || n4->type != GGML_TYPE_F32 || n5->type != GGML_TYPE_F32) return false;
++
++    const ggml_tensor * inject    = n0->src[0];
++    const ggml_tensor * block_out = (n4->src[0] == cgraph->nodes[node_idx + 3]) ? n4->src[1] : n4->src[0];
++    const ggml_tensor * residual  = (n5->src[0] == n4) ? n5->src[1] : n5->src[0];
++    if (!inject || !block_out || !residual) return false;
++
++    if (block_out->ne[0] != 2560 || block_out->ne[1] != 4 ||
++        residual->ne[0] != 2560 || residual->ne[1] != 4 ||
++        inject->ne[0] != 4) {
++        return false;
++    }
++    return true;
++}
++
++static bool ggml_vk_can_fuse_hc_mix_act(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
++    if (!ggml_vk_fuse_hc_elementwise_enabled() || !ctx->device->pipeline_multi_add_hc_mix_act) {
++        return false;
++    }
++    static constexpr std::initializer_list<ggml_op> hc_mix_act_pattern {
++        GGML_OP_SCALE, GGML_OP_UNARY
++    };
++    const int output_idx = node_idx + 1;
++    if (output_idx >= cgraph->n_nodes || !ggml_can_fuse_subgraph(cgraph, node_idx, hc_mix_act_pattern, { output_idx })) {
++        return false;
++    }
++    const ggml_tensor * n0 = cgraph->nodes[node_idx];
++    const ggml_tensor * n1 = cgraph->nodes[node_idx + 1];
++    if (ggml_get_unary_op(n1) != GGML_UNARY_OP_SILU) return false;
++    if (n0->type != GGML_TYPE_F32 || n1->type != GGML_TYPE_F32) return false;
++    return n0->src[0]->ne[0] == 320;
++}
++
++static bool ggml_vk_can_fuse_hc_mix_gate_fold(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
++    if (!ggml_vk_fuse_hc_elementwise_enabled() || !ctx->device->pipeline_multi_add_hc_mix_gate_fold) {
++        return false;
++    }
++    static constexpr std::initializer_list<ggml_op> hc_mix_gate_fold_pattern {
++        GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_CONT,
++        GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_SCALE
++    };
++    const int output_idx = node_idx + 11;
++    if (output_idx >= cgraph->n_nodes || !ggml_can_fuse_subgraph(cgraph, node_idx, hc_mix_gate_fold_pattern, { output_idx })) {
++        return false;
++    }
++    const ggml_tensor * n0  = cgraph->nodes[node_idx];
++    const ggml_tensor * n1  = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * dst = cgraph->nodes[output_idx];
++    if (ggml_get_unary_op(n0) != GGML_UNARY_OP_SIGMOID) return false;
++    if (dst->ne[0] != 2560 || n1->ne[0] != 10240) return false;
++    return true;
++}
++
++static void ggml_vk_multi_add_hc_combine(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_cgraph * cgraph, int node_idx) {
++    const ggml_tensor * n_scale0  = cgraph->nodes[node_idx];
++    const ggml_tensor * n_reshape = cgraph->nodes[node_idx + 3];
++    const ggml_tensor * n_mul     = cgraph->nodes[node_idx + 4];
++    const ggml_tensor * dst       = cgraph->nodes[node_idx + 5];
++
++    const ggml_tensor * inject    = n_scale0->src[0];
++    const ggml_tensor * block_out = (n_mul->src[0] == n_reshape) ? n_mul->src[1] : n_mul->src[0];
++    const ggml_tensor * residual  = (dst->src[0] == n_mul) ? dst->src[1] : dst->src[0];
++
++    vk_op_multi_add_push_constants pc{};
++    pc.ne20 = (uint32_t)dst->ne[0];
++    pc.ne21 = (uint32_t)dst->ne[1];
++    pc.ne22 = (uint32_t)dst->ne[2];
++    pc.ne23 = (uint32_t)dst->ne[3];
++
++    const ggml_tensor * tensors[4] = { residual, block_out, inject, dst };
++    for (uint32_t i = 0; i < 4; ++i) {
++        pc.nb[i][0] = (uint32_t)tensors[i]->nb[0] / sizeof(float);
++        pc.nb[i][1] = (uint32_t)tensors[i]->nb[1] / sizeof(float);
++        pc.nb[i][2] = (uint32_t)tensors[i]->nb[2] / sizeof(float);
++        pc.nb[i][3] = (uint32_t)tensors[i]->nb[3] / sizeof(float);
++    }
++    pc.rms_partials = 0;
++
++    vk_pipeline pipeline = ctx->device->pipeline_multi_add_hc_combine;
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    std::array<uint32_t, 3> elements;
++    uint32_t ne = ggml_nelements(dst);
++    if (ne > 262144) {
++        elements = { 512, 512, CEIL_DIV(ne, 262144) };
++    } else if (ne > 512) {
++        elements = { 512, CEIL_DIV(ne, 512), 1 };
++    } else {
++        elements = { ne, 1, 1 };
++    }
++
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++        { ggml_vk_tensor_subbuffer(ctx, residual),
++          ggml_vk_tensor_subbuffer(ctx, block_out),
++          ggml_vk_tensor_subbuffer(ctx, inject),
++          ggml_vk_tensor_subbuffer(ctx, dst) },
++        pc, elements);
++}
++
++static void ggml_vk_multi_add_hc_mix_act(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_cgraph * cgraph, int node_idx) {
++    const ggml_tensor * n_scale = cgraph->nodes[node_idx];
++    const ggml_tensor * dst     = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * lo      = n_scale->src[0];
++
++    vk_op_multi_add_push_constants pc{};
++    pc.ne20 = (uint32_t)dst->ne[0];
++    pc.ne21 = (uint32_t)dst->ne[1];
++    pc.ne22 = (uint32_t)dst->ne[2];
++    pc.ne23 = (uint32_t)dst->ne[3];
++
++    const ggml_tensor * tensors[2] = { lo, dst };
++    for (uint32_t i = 0; i < 2; ++i) {
++        pc.nb[i][0] = (uint32_t)tensors[i]->nb[0] / sizeof(float);
++        pc.nb[i][1] = (uint32_t)tensors[i]->nb[1] / sizeof(float);
++        pc.nb[i][2] = (uint32_t)tensors[i]->nb[2] / sizeof(float);
++        pc.nb[i][3] = (uint32_t)tensors[i]->nb[3] / sizeof(float);
++    }
++    pc.rms_partials = 0;
++
++    vk_pipeline pipeline = ctx->device->pipeline_multi_add_hc_mix_act;
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    std::array<uint32_t, 3> elements;
++    uint32_t ne = ggml_nelements(dst);
++    if (ne > 262144) {
++        elements = { 512, 512, CEIL_DIV(ne, 262144) };
++    } else if (ne > 512) {
++        elements = { 512, CEIL_DIV(ne, 512), 1 };
++    } else {
++        elements = { ne, 1, 1 };
++    }
++
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++        { ggml_vk_tensor_subbuffer(ctx, lo),
++          ggml_vk_tensor_subbuffer(ctx, dst) },
++        pc, elements);
++}
++
++static void ggml_vk_multi_add_hc_mix_gate_fold(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_cgraph * cgraph, int node_idx) {
++    const ggml_tensor * n_sig = cgraph->nodes[node_idx];
++    const ggml_tensor * n_mul = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * dst   = cgraph->nodes[node_idx + 11];
++
++    const ggml_tensor * up = n_sig->src[0];
++    const ggml_tensor * xn = (n_mul->src[0] == n_sig) ? n_mul->src[1] : n_mul->src[0];
++
++    vk_op_multi_add_push_constants pc{};
++    pc.ne20 = (uint32_t)dst->ne[0];
++    pc.ne21 = (uint32_t)dst->ne[1];
++    pc.ne22 = (uint32_t)dst->ne[2];
++    pc.ne23 = (uint32_t)dst->ne[3];
++
++    const ggml_tensor * tensors[3] = { xn, up, dst };
++    for (uint32_t i = 0; i < 3; ++i) {
++        pc.nb[i][0] = (uint32_t)tensors[i]->nb[0] / sizeof(float);
++        pc.nb[i][1] = (uint32_t)tensors[i]->nb[1] / sizeof(float);
++        pc.nb[i][2] = (uint32_t)tensors[i]->nb[2] / sizeof(float);
++        pc.nb[i][3] = (uint32_t)tensors[i]->nb[3] / sizeof(float);
++    }
++    pc.rms_partials = 0;
++
++    vk_pipeline pipeline = ctx->device->pipeline_multi_add_hc_mix_gate_fold;
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    std::array<uint32_t, 3> elements;
++    uint32_t ne = ggml_nelements(dst);
++    if (ne > 262144) {
++        elements = { 512, 512, CEIL_DIV(ne, 262144) };
++    } else if (ne > 512) {
++        elements = { 512, CEIL_DIV(ne, 512), 1 };
++    } else {
++        elements = { ne, 1, 1 };
++    }
++
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++        { ggml_vk_tensor_subbuffer(ctx, xn),
++          ggml_vk_tensor_subbuffer(ctx, up),
++          ggml_vk_tensor_subbuffer(ctx, dst) },
++        pc, elements);
++}
++
+ // Returns true if node has enqueued work into the queue, false otherwise
+ // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
+ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
+@@ -21672,7 +21899,13 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+         break;
+     case GGML_OP_SCALE:
+-        ggml_vk_scale(ctx, compute_ctx, src0, node);
++        if (ctx->num_additional_fused_ops && ctx->fused_hc_combine) {
++            ggml_vk_multi_add_hc_combine(ctx, compute_ctx, cgraph, node_idx);
++        } else if (ctx->num_additional_fused_ops && ctx->fused_hc_mix_act) {
++            ggml_vk_multi_add_hc_mix_act(ctx, compute_ctx, cgraph, node_idx);
++        } else {
++            ggml_vk_scale(ctx, compute_ctx, src0, node);
++        }
+ 
+         break;
+     case GGML_OP_SQR:
+@@ -21794,6 +22027,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+         break;
+     case GGML_OP_UNARY:
++        if (ctx->num_additional_fused_ops && ctx->fused_hc_mix_gate_fold) {
++            ggml_vk_multi_add_hc_mix_gate_fold(ctx, compute_ctx, cgraph, node_idx);
++            break;
++        }
+         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
+             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
+             break;
+@@ -25241,6 +25478,24 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_hc_fold4           = true;
+                 fusion_string                 = "HC_FOLD4";
+                 std::fill_n(op_srcs_fused_elementwise, kHcFold4NodeCount, false);
++            } else if (ggml_vk_fuse_hc_elementwise_enabled() && ggml_vk_can_fuse_hc_combine(ctx, cgraph, i)) {
++                ctx->num_additional_fused_ops = 5;
++                ctx->fused_hc_combine = true;
++                ctx->fused_ops_write_mask = 1ull << 5;
++                fusion_string = "HC_COMBINE";
++                std::fill_n(op_srcs_fused_elementwise, 6, true);
++            } else if (ggml_vk_fuse_hc_elementwise_enabled() && ggml_vk_can_fuse_hc_mix_act(ctx, cgraph, i)) {
++                ctx->num_additional_fused_ops = 1;
++                ctx->fused_hc_mix_act = true;
++                ctx->fused_ops_write_mask = 1ull << 1;
++                fusion_string = "HC_MIX_ACT";
++                std::fill_n(op_srcs_fused_elementwise, 2, true);
++            } else if (ggml_vk_fuse_hc_elementwise_enabled() && ggml_vk_can_fuse_hc_mix_gate_fold(ctx, cgraph, i)) {
++                ctx->num_additional_fused_ops = 11;
++                ctx->fused_hc_mix_gate_fold = true;
++                ctx->fused_ops_write_mask = 1ull << 11;
++                fusion_string = "HC_MIX_GATE_FOLD";
++                std::fill_n(op_srcs_fused_elementwise, 12, false);
+             } else if (num_adds) {
+                 ctx->num_additional_fused_ops = num_adds - 1;
+                 fusion_string = "MULTI_ADD";
+@@ -25483,6 +25738,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_topk_moe_scale = false;
+                 ctx->fused_topk_moe_staged       = false;
+                 ctx->fused_hc_fold4              = false;
++                ctx->fused_hc_combine            = false;
++                ctx->fused_hc_mix_act            = false;
++                ctx->fused_hc_mix_gate_fold      = false;
+                 ctx->fused_hc_segment            = vk_hc_segment::NONE;
+                 ctx->fused_moe_output_segment    = false;
+                 ctx->fused_moe_projections       = false;
+@@ -25542,6 +25800,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         i += ctx->num_additional_fused_ops;
+         ctx->num_additional_fused_ops = 0;
+         ctx->fused_hc_fold4              = false;
++        ctx->fused_hc_combine            = false;
++        ctx->fused_hc_mix_act            = false;
++        ctx->fused_hc_mix_gate_fold      = false;
+         ctx->fused_hc_segment            = vk_hc_segment::NONE;
+         ctx->fused_moe_output_segment    = false;
+         ctx->fused_moe_projections       = false;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/multi_add.comp b/ggml/src/ggml-vulkan/vulkan-shaders/multi_add.comp
+index d3791fc23..7e2678b3e 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/multi_add.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/multi_add.comp
+@@ -154,6 +154,69 @@ void main() {
+     // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
+     const uint num_iter = 2;
+ 
++#if HC_COMBINE
++    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
++        if (idx >= ne) {
++            continue;
++        }
++        uint i00, i01, i02, i03;
++        get_indices(idx, i00, i01, i02, i03, p.ne20, p.ne21, p.ne22, p.ne23);
++
++        FLOAT_TYPE res = load_a(0, src_idx(0, i00, i01, i02, i03));
++        FLOAT_TYPE blk = load_a(1, src_idx(1, i00, i01, i02, i03));
++        // inject tensor has shape [4, nt, 1, 1]: dim0 is stream (i01), dim1 is token (i02)
++        uint inj_idx = i02 * p.nb[2][1] + i01 * p.nb[2][0];
++        FLOAT_TYPE inj = load_a(2, inj_idx);
++        FLOAT_TYPE sig = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-inj * FLOAT_TYPE(0.25)));
++        FLOAT_TYPE w   = FLOAT_TYPE(2.0) * sig;
++
++        store_d(0, dst_idx(i00, i01, i02, i03), res + blk * w);
++
++        idx += num_threads;
++    }
++#elif HC_MIX_ACT
++    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
++        if (idx >= ne) {
++            continue;
++        }
++        uint i00, i01, i02, i03;
++        get_indices(idx, i00, i01, i02, i03, p.ne20, p.ne21, p.ne22, p.ne23);
++
++        FLOAT_TYPE val = load_a(0, src_idx(0, i00, i01, i02, i03)) * FLOAT_TYPE(0.25);
++        FLOAT_TYPE silu_val = val / (FLOAT_TYPE(1.0) + exp(-val));
++
++        store_d(0, dst_idx(i00, i01, i02, i03), silu_val);
++
++        idx += num_threads;
++    }
++#elif HC_MIX_GATE_FOLD
++    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
++        if (idx >= ne) {
++            continue;
++        }
++        uint i00, i01, i02, i03;
++        get_indices(idx, i00, i01, i02, i03, p.ne20, p.ne21, p.ne22, p.ne23);
++
++        // dst is [2560, nt, 1, 1], i00 is elem [0..2559], i01 is token [0..nt-1]
++        // xn (binding 0) and up (binding 1) have shape [10240, nt]
++        // stream stride in xn/up is 2560 elements
++        FLOAT_TYPE u0 = load_a(1, i01 * p.nb[1][1] + (0u * p.ne20 + i00) * p.nb[1][0]);
++        FLOAT_TYPE x0 = load_a(0, i01 * p.nb[0][1] + (0u * p.ne20 + i00) * p.nb[0][0]);
++        FLOAT_TYPE g0 = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-u0));
++        FLOAT_TYPE acc = x0 * g0;
++
++        [[unroll]] for (uint s = 1u; s < 4u; ++s) {
++            FLOAT_TYPE us = load_a(1, i01 * p.nb[1][1] + (s * p.ne20 + i00) * p.nb[1][0]);
++            FLOAT_TYPE xs = load_a(0, i01 * p.nb[0][1] + (s * p.ne20 + i00) * p.nb[0][0]);
++            FLOAT_TYPE gs = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-us));
++            acc += xs * gs;
++        }
++
++        store_d(0, dst_idx(i00, i01, i02, i03), acc * FLOAT_TYPE(0.25));
++
++        idx += num_threads;
++    }
++#else
+     FLOAT_TYPE sum_sq = 0;
+ 
+     [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+@@ -172,6 +235,7 @@ void main() {
+ 
+         idx += num_threads;
+     }
++#endif
+ 
+ #if ADD_RMS
+     if (p.rms_partials != 0) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index c7c480ff2..e29ca3244 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1699,6 +1699,9 @@ void process_shaders() {
+ 
+     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "0"}});
+     string_to_spv("multi_add_rms_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "1"}});
++    string_to_spv("multi_add_hc_combine_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS", "0"}, {"HC_COMBINE", "1"}});
++    string_to_spv("multi_add_hc_mix_act_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS", "0"}, {"HC_MIX_ACT", "1"}});
++    string_to_spv("multi_add_hc_mix_gate_fold_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS", "0"}, {"HC_MIX_GATE_FOLD", "1"}});
+ 
+     string_to_spv("ssm_scan_f32",          "ssm_scan.comp", {{"A_TYPE", "float"}});
+     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});

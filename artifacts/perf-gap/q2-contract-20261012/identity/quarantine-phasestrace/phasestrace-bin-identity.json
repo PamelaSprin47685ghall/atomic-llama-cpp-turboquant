@@ -1,0 +1,6 @@
+{
+  "frozen_utc": "2026-10-12T23:28:07Z",
+  "purpose": "GAP-1 phase trace r9: 3-timepoint W readback (T1 post-load, T2 first-graph-compute, T3 dispatch W dump) — host path non-zero at T1+T2, GPU path zero at T3",
+  "libggml_vulkan_so_sha256": "c2454e39f7c559a31f9cb70c0bb37435eb279833f71e07513a6b177edacbc0cb",
+  "libggml_base_so_sha256": "08a3b98a0f96345bf242a9d07b75ef00831382dae65e3aaaeede7a5cf778dfcf"
+}

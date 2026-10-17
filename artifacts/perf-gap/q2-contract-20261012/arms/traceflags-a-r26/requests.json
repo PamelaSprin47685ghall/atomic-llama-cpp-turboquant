@@ -1,0 +1,45 @@
+[
+  {
+    "idx": 0,
+    "phase": "measured",
+    "n": 32,
+    "predicted_ms": 4138.129,
+    "tps": 7.732963375477178,
+    "wall_ms": 6885.600284,
+    "finish": "length",
+    "content_sha256": "eb2ee0486cce8dcf2eed664056b6ef2ea10344c2a5b33de78ff385bdf3dba70e",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 102,
+      "prompt_ms": 2742.565,
+      "prompt_per_token_ms": 26.887892156862744,
+      "prompt_per_second": 37.19146127803717,
+      "predicted_n": 32,
+      "predicted_ms": 4138.129,
+      "predicted_per_token_ms": 129.31653125,
+      "predicted_per_second": 7.732963375477178
+    },
+    "issues": [
+      "NOT_NATURAL_STOP"
+    ],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=48 uid=36028797018967041",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=48 uid=36028797018967297",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=48 uid=36028797018967553",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=48 uid=36028797018967809",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=48 uid=36028797018968065",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=10 n_sub=49 uid=36028797018968321",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=11 n_sub=49 uid=36028797018968577",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=12 n_sub=49 uid=36028797018968577",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=13 n_sub=49 uid=36028797018968577",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=14 n_sub=49 uid=36028797018968577",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=15 n_sub=49 uid=36028797018968577",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=16 n_sub=49 uid=36028797018968577",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=17 n_sub=49 uid=36028797018968577",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=18 n_sub=49 uid=36028797018968577",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=19 n_sub=49 uid=36028797018968577",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=20 n_sub=49 uid=36028797018968577"
+    ],
+    "mtp_cycle_lines": []
+  }
+]

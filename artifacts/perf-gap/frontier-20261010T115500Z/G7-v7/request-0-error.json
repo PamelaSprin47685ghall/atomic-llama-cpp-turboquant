@@ -1,0 +1,28 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文回答普通成年人如何健康减重。回答包含四个部分，每部分标题单独一行：\n一、热量缺口原理（一句话）\n二、饮食建议（两条，每条一句话）\n三、每周运动安排（给出周一、周三、周五的安排）\n四、睡眠与常见误区（两句话）\n语言自然，正常结束。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "phase": "warmup",
+  "http_status": 500,
+  "body": "{\"error\":{\"code\":500,\"message\":\"Compute error.\",\"type\":\"server_error\"}}",
+  "wall_ms": 30044.60285,
+  "log_begin": 15770,
+  "log_end": 31339
+}

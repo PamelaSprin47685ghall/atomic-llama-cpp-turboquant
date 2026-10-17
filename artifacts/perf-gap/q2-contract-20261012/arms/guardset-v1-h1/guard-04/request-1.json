@@ -1,0 +1,64 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an insightful personal development writer. Provide a structured, engaging, and practical guide around 180-220 tokens. Finish naturally."
+      },
+      {
+        "role": "user",
+        "content": "Write a practical guide for a beginner looking to build a consistent daily reading habit. Cover book selection, schedule management, active note-taking, and long-term motivation."
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 350,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "Building a consistent reading habit starts with choosing books that genuinely excite you, not just what you think you \"should\" read. Start small: aim for 15 minutes daily, perhaps during your morning coffee or before bed. Consistency matters more than volume.\n\nTo stay engaged, practice active note-taking. Keep a small journal or digital app to jot down key insights, quotes, or questions. This transforms passive consumption into active learning, deepening your understanding and retention.\n\nFor long-term motivation, track your progress visually. Use a simple calendar to mark each day you read. Celebrate small milestones, like finishing a chapter or a book. Remember, it’s okay to miss a day; just restart the next. The goal is to make reading a natural, enjoyable part of your routine, not a chore. Over time, this small daily practice will compound into a profound shift in your knowledge and perspective."
+        }
+      }
+    ],
+    "created": 1791819663,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 185,
+      "prompt_tokens": 80,
+      "total_tokens": 265,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-zhdblESoaQZIFPIAY1FC1UcxAqttsQPl",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 80,
+      "prompt_ms": 3038.916,
+      "prompt_per_token_ms": 37.986450000000005,
+      "prompt_per_second": 26.32517647740181,
+      "predicted_n": 185,
+      "predicted_ms": 3549.109,
+      "predicted_per_token_ms": 19.184372972972973,
+      "predicted_per_second": 52.12575888765322,
+      "draft_n": 106,
+      "draft_n_accepted": 79
+    }
+  },
+  "wall_ms": 7230.481113,
+  "log_begin": 36661,
+  "log_end": 71906,
+  "phase": "measured"
+}

@@ -3,6 +3,7 @@
 #include "ggml-tp5-profile.h"
 #include "ggml-device-copy.h"
 #include "ggml-vulkan-tp5-rows.h"
+#include <cstdio>
 #include <vulkan/vulkan_core.h>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -1058,6 +1059,9 @@ struct vk_device_struct {
     // indexed by num_additional_fused_ops == num_adds - 1
     vk_pipeline pipeline_multi_add[MAX_FUSED_ADDS];
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
+    vk_pipeline pipeline_multi_add_hc_combine;
+    vk_pipeline pipeline_multi_add_hc_mix_act;
+    vk_pipeline pipeline_multi_add_hc_mix_gate_fold;
     vk_pipeline pipeline_hc_fold4;
     vk_pipeline pipeline_hc_segment_norm[2];
     vk_pipeline pipeline_hc_inject_norm;
@@ -2923,6 +2927,9 @@ struct ggml_backend_vk_context {
     std::vector<float> router_diag_host;      // snapshot from the most recent explicit read
     uint32_t router_diag_slots_used = 0;      // max actual layer id captured + 1
     bool fused_hc_fold4{};
+    bool fused_hc_combine{};
+    bool fused_hc_mix_act{};
+    bool fused_hc_mix_gate_fold{};
     vk_hc_segment fused_hc_segment = vk_hc_segment::NONE;
     bool          fused_moe_output_segment{};
     bool          fused_moe_projections{};
@@ -3037,6 +3044,10 @@ struct ggml_backend_vk_context {
     // recordings' owners are pinned in recording_quant_owners so the old
     // buffer outlives them; the cache entries themselves are freed below.
     vk_buffer                                               hc_quant_scratch;
+    // HC site dump (site-dumper, GAP1 step 2): ordinal counter for
+    // GGML_VK_HC_DUMP_SITES (first N HC sites, graph order). Incremented
+    // only when that env is set; the unset case never touches it.
+    uint32_t                                               hc_dump_site_count = 0;
     // Fused QSA/GDN contractions use the built-in Q8_1 quantizer but not its
     // generic prealloc_y lease: that lease may be overwritten by a standalone
     // matvec between regions, and growing it with an active subctx submits it.
@@ -7345,6 +7356,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add[i],     "multi_add_f32_"     + std::to_string(i+1), multi_add_f32_len,     multi_add_f32_data,     "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add_rms[i], "multi_add_rms_f32_" + std::to_string(i+1), multi_add_rms_f32_len, multi_add_rms_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
         }
+        ggml_vk_create_pipeline2(device, device->pipeline_multi_add_hc_combine, "multi_add_hc_combine_f32", multi_add_hc_combine_f32_len, multi_add_hc_combine_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {3}, 1);
+        ggml_vk_create_pipeline2(device, device->pipeline_multi_add_hc_mix_act, "multi_add_hc_mix_act_f32", multi_add_hc_mix_act_f32_len, multi_add_hc_mix_act_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {1}, 1);
+        ggml_vk_create_pipeline2(device, device->pipeline_multi_add_hc_mix_gate_fold, "multi_add_hc_mix_gate_fold_f32", multi_add_hc_mix_gate_fold_f32_len, multi_add_hc_mix_gate_fold_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {2}, 1);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_add_id_f32, "add_id_f32", add_id_f32_len, add_id_f32_data, "main", 4, sizeof(vk_op_add_id_push_constants), {1, 1, 1}, {}, 1);
@@ -16689,8 +16703,30 @@ static void ggml_vk_segment_project(ggml_backend_vk_context * ctx,
     const uint32_t                  k       = static_cast<uint32_t>(weights->ne[0]);
     const uint32_t                  m       = static_cast<uint32_t>(output->ne[0]);
     const uint32_t                  n_rows  = static_cast<uint32_t>(output->ne[1]);
-    const uint32_t output_flags = output == ctx->wire_producer && ctx->wire_local_elision_safe ?
-                                      MAT_VEC_FUSION_FLAGS_TP5_ELIDE_LOCAL : 0u;
+    // Diagnostic switch (bf16-segment-fixer): GGML_VK_HC_BF16_FORCE_ITER=1
+    // routes the two HC BF16 contraction variants through iter() (scalar
+    // load_b + dequantize4/bf16_to_fp32 decode) instead of
+    // iter_aligned_nonquant() (data_b_v4 vec4 loads + dequantize4_2aligned
+    // bit expansion). The HC BF16 variants are the only
+    // mul_mat_vec+DATA_A_BF16 instances in the tree, so the aligned path has
+    // no independent execution witness; this bit bisects the remaining
+    // BF16-segment garbling between the two decode paths in a single DevOps
+    // run (teacher-forced single-site lo/mixed comparison first, then the
+    // natural-EOS pilot). Strict parse: only exactly "1" enables it.
+    // Default (env unset) sets no bit: zero behavior change for every
+    // variant, HC or not. Must match MAT_VEC_FUSION_FLAGS_FORCE_ITER in
+    // mul_mat_vec.comp.
+    static const bool hc_bf16_force_iter = [] {
+        const char * env = getenv("GGML_VK_HC_BF16_FORCE_ITER");
+        return env && strcmp(env, "1") == 0;
+    }();
+    static constexpr uint32_t MAT_VEC_FUSION_FLAGS_FORCE_ITER = 0x200;
+    const bool force_iter_bf16 = hc_bf16_force_iter &&
+        (pipeline == ctx->device->pipeline_hc_down_silu_bf16 ||
+         pipeline == ctx->device->pipeline_hc_project_fold_bf16);
+    const uint32_t output_flags = (output == ctx->wire_producer && ctx->wire_local_elision_safe ?
+                                      MAT_VEC_FUSION_FLAGS_TP5_ELIDE_LOCAL : 0u) |
+                                  (force_iter_bf16 ? MAT_VEC_FUSION_FLAGS_FORCE_ITER : 0u);
     const vk_mat_vec_push_constants pc{ k, k, k, m, static_cast<uint32_t>(ggml_nelements(weights)), k, m,
                                         output_flags, 0,
                                         1, n_rows, n_rows, 1 };
@@ -16720,14 +16756,94 @@ static void ggml_vk_segment_project(ggml_backend_vk_context * ctx,
     const std::initializer_list<vk::DescriptorBufferInfo> descriptors{
         ggml_vk_tensor_subbuffer(ctx, weights), b_sub, out,
         extra ? ggml_vk_tensor_subbuffer(ctx, extra) : out, out };
+    // NativeHC up fold: all three fold variants (Q8_0, BF16, R320) are the
+    // same mul_mat_vec.comp macro family with one shader geometry (NUM_ROWS=4
+    // stream fold per workgroup, token_row = gl_WorkGroupID.y) and must share
+    // one dispatch convention. pipeline_hc_project_fold_bf16 previously fell
+    // through to n_rows, shrinking grid-y 4x versus its Q8_0 twin — a
+    // dispatch-level divergence on top of the aligned-path indexing defect
+    // (see docs/TP5-BF16-UPFOLD-FIX.md).
     const uint32_t dispatch_rows =
         contraction == ctx->device->pipeline_hc_project_fold ||
+        contraction == ctx->device->pipeline_hc_project_fold_bf16 ||
         contraction == ctx->device->pipeline_hc_project_fold_r320 ? 4 * n_rows : n_rows;
     if (output_tail) {
         ggml_vk_dispatch_output_tail(ctx, subctx, contraction, descriptors, pc, { m, dispatch_rows, 1 });
     } else {
         ggml_vk_dispatch_pipeline(ctx, subctx, contraction, descriptors, pc, { m, dispatch_rows, 1 });
     }
+}
+
+// HC site dump (site-dumper, GAP1 step 2): capture one F32 intermediate of
+// the fused HC segment and write it to /tmp for the teacher-forced
+// two-binary comparison (docs/TP5-HC-SITE-DUMP.md). Opt-in via
+// GGML_VK_HC_DUMP_SITES=N; the caller gates on that env, so this helper is
+// unreachable in the unset case (zero behavior change: no barrier, no
+// staging copy, no mid-graph submit, no IO).
+//
+// Timing basis: the vkCmdCopyBuffer is recorded into the SAME command
+// buffer as the producing dispatch and placed after it, so same-queue
+// submission order plus the shader-write -> transfer-read execution
+// barrier recorded by ggml_vk_sync_buffers guarantees the dispatch's
+// writes are complete before the copy reads them. ggml_vk_synchronize
+// then ends the recording, submits, signals ctx->fence with an empty
+// submit and waits on it, and lands subctx->out_memcpys; sync_staging is
+// HOST_VISIBLE|HOST_COHERENT (ggml_vk_ensure_sync_staging_buffer), so
+// after the fence the mapped pointer holds the exact post-dispatch
+// snapshot. ggml_vk_ctx_begin re-opens the command buffer so the rest of
+// the graph records normally -- a mid-graph synchronize is an established
+// pattern in this file (see the replay_pending_bufs dedup comment in
+// ggml_vk_submit; seqs are cleared on submit, so the graph's final submit
+// never re-submits this prefix).
+static void ggml_vk_hc_dump_site_tensor(ggml_backend_vk_context * ctx, vk_context & subctx,
+                                          const ggml_tensor * tensor, const char * tensor_name,
+                                          const char * layer_name, uint32_t site) {
+    const size_t bytes = ggml_nbytes(tensor);
+    // The comparison contract only covers the three F32 intermediates
+    // (normalized/lo/mixed); anything else is a caller bug, not a dump.
+    if (tensor->type != GGML_TYPE_F32 || bytes == 0 || bytes % sizeof(float) != 0) {
+        std::cerr << "[hc-dump] site " << site << " tensor " << tensor_name
+                  << " skipped: not a non-empty F32 tensor" << std::endl;
+        return;
+    }
+    ggml_vk_ensure_sync_staging_buffer(ctx, bytes);
+    // nullptr ctx (like the existing readback paths): do not retire the
+    // graph-level unsynced-node tracking mid-recording.
+    ggml_vk_sync_buffers(nullptr, subctx);
+    const vk_subbuffer src = ggml_vk_tensor_subbuffer(ctx, tensor);
+    std::vector<vk::BufferCopy> slices(1);
+    slices[0].srcOffset = src.offset;
+    slices[0].dstOffset = 0;
+    slices[0].size = bytes;
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).copyBuffer(
+        src.buffer->buffer, ctx->sync_staging->buffer, slices);
+    subctx->s->buffer->has_pending_mem_work = true;
+    std::vector<uint8_t> host(bytes);
+    // Landed by ggml_vk_synchronize below, after the fence wait, while
+    // this vector is still alive on the stack.
+    deferred_memcpy(host.data(), ctx->sync_staging->ptr, bytes, &subctx->out_memcpys);
+    ggml_vk_synchronize(ctx);
+    ggml_vk_ctx_begin(ctx->device, subctx);
+
+    char path[96];
+    snprintf(path, sizeof(path), "/tmp/tp5-hc-dump-site%u-%s.bin", site, tensor_name);
+    FILE * out = fopen(path, "wb");
+    if (out) {
+        fwrite(host.data(), 1, bytes, out);
+        fclose(out);
+    } else {
+        std::cerr << "[hc-dump] failed to open " << path << std::endl;
+    }
+    const uint32_t n_floats = (uint32_t) (bytes / sizeof(float));
+    const float * values = (const float *) host.data();
+    std::cerr << "[hc-dump] site " << site << " tensor " << tensor_name << " layer "
+              << layer_name << " ne=[" << tensor->ne[0] << "," << tensor->ne[1] << ","
+              << tensor->ne[2] << "," << tensor->ne[3] << "] floats " << n_floats
+              << " -> " << path << " first64:";
+    for (uint32_t i = 0; i < n_floats && i < 64; ++i) {
+        std::cerr << " " << values[i];
+    }
+    std::cerr << std::endl;
 }
 
 static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_cgraph * graph, int first) {
@@ -16754,8 +16870,10 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
                                 ctx->device->pipeline_hc_sum_f16 && ctx->recorded_dispatches == 0 &&
                                 !ctx->do_add_rms_partials && !ctx->add_rms_partials_initialized &&
                                 subctx->seqs.size() == 1 && subctx->seqs.front().size() == 1;
+    const bool late_rows_safe = (!ctx->predefined_active_rows || ctx->predefined_active_rows <= VK_TP5_DIRECT_COLUMN_TILE) &&
+                                (!ctx->predefined_capacity_rows || ctx->predefined_capacity_rows <= VK_TP5_DIRECT_COLUMN_TILE);
     const bool capture_late =
-        capture_common && latebind_capture_requested && latebind_hc_down &&
+        capture_common && latebind_capture_requested && latebind_hc_down && late_rows_safe &&
         down_node && down_node->op == GGML_OP_MUL_MAT &&
         down_node->src[0] && (down_node->src[0]->type == GGML_TYPE_Q8_0 ||
                               (down_node->src[0]->type == GGML_TYPE_BF16 &&
@@ -16764,6 +16882,19 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
         up_node->src[0] && (up_node->src[0]->type == GGML_TYPE_Q8_0 ||
                             (up_node->src[0]->type == GGML_TYPE_BF16 &&
                              ctx->device->pipeline_hc_project_fold_bf16)) &&
+        // Workorder A: two family guards. (1) down and up must be the SAME
+        // element type: the fused-segment pipeline selection below keys a
+        // single hc_bf16_weights flag off the down weight, so a mixed
+        // down/up family would bind a BF16 up kernel to Q8_0 bytes (or vice
+        // versa) and mis-parse every block. A mixed family stays uncaptured
+        // (NO_HIT) instead. (2) the hoisted late INJECT contraction
+        // (tp5_hc_late_inject) and the fused FUSE_INJECT norm kernel both
+        // parse the inject weight as Q8_0 blocks only; the original Q2_0
+        // keeps its inject weights in Q8_0 (only down/up are BF16), but any
+        // other inject type must not be captured under that assumption.
+        // A BF16 INJECT variant is a separate follow-up workorder.
+        down_node->src[0]->type == up_node->src[0]->type &&
+        inject->src[0] && inject->src[0]->type == GGML_TYPE_Q8_0 &&
         lo->type == GGML_TYPE_F32 && normalized->type == GGML_TYPE_F32 &&
         mixed->type == GGML_TYPE_F32 && mixed->ne[0] == norm->ne[0] &&
         norm->ne[2] >= 1 && norm->ne[2] <= 4 && normalized->ne[1] == norm->ne[2] &&
@@ -16796,6 +16927,33 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
     vk_pipeline & up_pipeline = hc_bf16_weights && ctx->device->pipeline_hc_project_fold_bf16 ? ctx->device->pipeline_hc_project_fold_bf16 :
                                ctx->device->pipeline_hc_project_fold_r320 ? ctx->device->pipeline_hc_project_fold_r320 :
                                ctx->device->pipeline_hc_project_fold;
+    // HC site dump (site-dumper, GAP1 step 2): opt-in intermediate capture
+    // for the fused-vs-entry-restored two-binary comparison
+    // (docs/TP5-HC-SITE-DUMP.md). GGML_VK_HC_DUMP_SITES=N dumps the three
+    // F32 intermediates of the first N HC sites (graph order). Unset or 0
+    // parses to 0 and every call site below is dead: no extra barrier, no
+    // staging copy, no mid-graph submit, no IO. Skipped with one stderr
+    // notice under replay recording / tp5 program recording: the tape's
+    // hc_norm_end/hc_down_end/hc_up_end annotations are byte offsets into
+    // one command stream and a mid-graph CB split under recording has no
+    // execution witness -- run the comparison on the non-recording cold
+    // path instead.
+    static const uint32_t hc_dump_sites_max = [] {
+        const char * env = getenv("GGML_VK_HC_DUMP_SITES");
+        return env && atoi(env) > 0 ? (uint32_t) atoi(env) : 0u;
+    }();
+    static bool hc_dump_skip_notice_shown = false;
+    const bool hc_dump_requested = hc_dump_sites_max > 0 &&
+                                   !ctx->replay_recording && !ctx->tp5_recording_program;
+    if (hc_dump_sites_max > 0) {
+        ++ctx->hc_dump_site_count;
+        if (!hc_dump_requested && !hc_dump_skip_notice_shown) {
+            hc_dump_skip_notice_shown = true;
+            std::cerr << "[hc-dump] GGML_VK_HC_DUMP_SITES set but replay/program recording "
+                         "is active: skipping site dumps (use the non-recording cold path "
+                         "for the comparison run)" << std::endl;
+        }
+    }
 
     if (combine && !fuse_inject) {
         ggml_vk_segment_project(
@@ -16854,15 +17012,26 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
     // of a null vk_buffer would crash before the dispatch even runs.
     const vk_subbuffer hc_quant_sub = hc_quant_producer ? vk_subbuffer{ ctx->hc_quant_scratch, 0, hc_quant_bytes }
                                                        : vk_subbuffer{ ctx->hc_quant_scratch, 0, 0 };
-    ggml_vk_dispatch_pipeline(
-        ctx, subctx, norm_pipeline,
-        { ggml_vk_tensor_subbuffer(ctx, residual), ggml_vk_tensor_subbuffer(ctx, block),
-          ggml_vk_tensor_subbuffer(ctx, inject), ggml_vk_tensor_subbuffer(ctx, normalized->src[1]),
-          ggml_vk_tensor_subbuffer(ctx, combined), ggml_vk_tensor_subbuffer(ctx, normalized),
-          ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[0] : residual),
-          ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[1] : residual),
-          hc_quant_sub },
-        pc, { 4, static_cast<uint32_t>(norm->ne[2]), 1 });
+    if (hc_quant_producer) {
+        ggml_vk_dispatch_pipeline(
+            ctx, subctx, norm_pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, residual), ggml_vk_tensor_subbuffer(ctx, block),
+              ggml_vk_tensor_subbuffer(ctx, inject), ggml_vk_tensor_subbuffer(ctx, normalized->src[1]),
+              ggml_vk_tensor_subbuffer(ctx, combined), ggml_vk_tensor_subbuffer(ctx, normalized),
+              ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[0] : residual),
+              ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[1] : residual),
+              hc_quant_sub },
+            pc, { 4, static_cast<uint32_t>(norm->ne[2]), 1 });
+    } else {
+        ggml_vk_dispatch_pipeline(
+            ctx, subctx, norm_pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, residual), ggml_vk_tensor_subbuffer(ctx, block),
+              ggml_vk_tensor_subbuffer(ctx, inject), ggml_vk_tensor_subbuffer(ctx, normalized->src[1]),
+              ggml_vk_tensor_subbuffer(ctx, combined), ggml_vk_tensor_subbuffer(ctx, normalized),
+              ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[0] : residual),
+              ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[1] : residual) },
+            pc, { 4, static_cast<uint32_t>(norm->ne[2]), 1 });
+    }
     ggml_vk_segment_barrier(ctx, subctx);
     if (capture_prefix) {
         auto binding = [&](const ggml_tensor * tensor) {
@@ -16900,15 +17069,35 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
                               norm_buffer.size, norm_buffer.buffer};
         program.normalized_tensor = normalized;
     }
+    // HC site dump point 1/3: normalized, after the norm dispatch (and its
+    // barrier + tape annotation) and before the down contraction reads it.
+    if (hc_dump_requested && ctx->hc_dump_site_count <= hc_dump_sites_max) {
+        ggml_vk_hc_dump_site_tensor(ctx, subctx, normalized, "normalized",
+                                    norm->name, ctx->hc_dump_site_count);
+    }
     const bool hc_quant_consumer = down_pipeline == ctx->device->pipeline_hc_down_silu_q8dot;
     ggml_vk_segment_project(ctx, subctx, graph->nodes[base + 3], normalized, lo, down_pipeline,
                             nullptr, hc_quant_consumer ? &hc_quant_sub : nullptr);
     ggml_vk_segment_barrier(ctx, subctx);
     if (ctx->tp5_recording_program && first == 0)
         ctx->tp5_recording_program->hc_down_end = ctx->tp5_recording_program->commands.code.size();
+    // HC site dump point 2/3: lo, after the down dispatch (and its barrier
+    // + tape annotation) and before the up/fold contraction reads it. lo
+    // is only read downstream, never rewritten in between, so this copy
+    // observes the down output exactly.
+    if (hc_dump_requested && ctx->hc_dump_site_count <= hc_dump_sites_max) {
+        ggml_vk_hc_dump_site_tensor(ctx, subctx, lo, "lo",
+                                    norm->name, ctx->hc_dump_site_count);
+    }
     ggml_vk_segment_project(ctx, subctx, graph->nodes[base + 6], lo, mixed, up_pipeline, normalized);
     if (ctx->tp5_recording_program && first == 0)
         ctx->tp5_recording_program->hc_up_end = ctx->tp5_recording_program->commands.code.size();
+    // HC site dump point 3/3: mixed, after the up/fold dispatch and its
+    // tape annotation, before any consumer of the next region records.
+    if (hc_dump_requested && ctx->hc_dump_site_count <= hc_dump_sites_max) {
+        ggml_vk_hc_dump_site_tensor(ctx, subctx, mixed, "mixed",
+                                    norm->name, ctx->hc_dump_site_count);
+    }
 }
 
 static void ggml_vk_moe_output_segment(ggml_backend_vk_context * ctx,
@@ -21448,6 +21637,240 @@ static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b
     return false;
 }
 
+// HC Elementwise Fusion (opt-in via GGML_VK_FUSE_HC_ELEMENTWISE)
+static bool ggml_vk_fuse_hc_elementwise_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_VK_FUSE_HC_ELEMENTWISE");
+        return env && (strcmp(env, "1") == 0 || strcmp(env, "on") == 0 || strcmp(env, "true") == 0);
+    }();
+    return enabled;
+}
+
+static bool ggml_vk_can_fuse_hc_combine(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_fuse_hc_elementwise_enabled() || !ctx->device->pipeline_multi_add_hc_combine) {
+        return false;
+    }
+    static constexpr std::initializer_list<ggml_op> hc_combine_pattern {
+        GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_ADD
+    };
+    const int output_idx = node_idx + 5;
+    if (output_idx >= cgraph->n_nodes || !ggml_can_fuse_subgraph(cgraph, node_idx, hc_combine_pattern, { output_idx })) {
+        return false;
+    }
+    const ggml_tensor * n0 = cgraph->nodes[node_idx];
+    const ggml_tensor * n1 = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * n2 = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * n4 = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * n5 = cgraph->nodes[node_idx + 5];
+
+    if (ggml_get_unary_op(n1) != GGML_UNARY_OP_SIGMOID) return false;
+    if (n0->type != GGML_TYPE_F32 || n4->type != GGML_TYPE_F32 || n5->type != GGML_TYPE_F32) return false;
+
+    float scale0;
+    memcpy(&scale0, n0->op_params, sizeof(scale0));
+    if (scale0 != 0.25f) return false;
+
+    float scale2;
+    memcpy(&scale2, n2->op_params, sizeof(scale2));
+    if (scale2 != 2.0f) return false;
+
+    const ggml_tensor * inject    = n0->src[0];
+    const ggml_tensor * block_out = (n4->src[0] == cgraph->nodes[node_idx + 3]) ? n4->src[1] : n4->src[0];
+    const ggml_tensor * residual  = (n5->src[0] == n4) ? n5->src[1] : n5->src[0];
+    if (!inject || !block_out || !residual) return false;
+
+    if (block_out->ne[0] != 2560 || block_out->ne[1] != 4 ||
+        residual->ne[0] != 2560 || residual->ne[1] != 4 ||
+        inject->ne[0] != 4 ||
+        block_out->ne[2] != residual->ne[2] ||
+        inject->ne[1] != residual->ne[2]) {
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_vk_can_fuse_hc_mix_act(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_fuse_hc_elementwise_enabled() || !ctx->device->pipeline_multi_add_hc_mix_act) {
+        return false;
+    }
+    static constexpr std::initializer_list<ggml_op> hc_mix_act_pattern {
+        GGML_OP_SCALE, GGML_OP_UNARY
+    };
+    const int output_idx = node_idx + 1;
+    if (output_idx >= cgraph->n_nodes || !ggml_can_fuse_subgraph(cgraph, node_idx, hc_mix_act_pattern, { output_idx })) {
+        return false;
+    }
+    const ggml_tensor * n0 = cgraph->nodes[node_idx];
+    const ggml_tensor * n1 = cgraph->nodes[node_idx + 1];
+    if (ggml_get_unary_op(n1) != GGML_UNARY_OP_SILU) return false;
+    if (n0->type != GGML_TYPE_F32 || n1->type != GGML_TYPE_F32) return false;
+
+    float scale;
+    memcpy(&scale, n0->op_params, sizeof(scale));
+    if (scale != 0.25f) return false;
+
+    return n0->src[0]->ne[0] == 320;
+}
+
+static bool ggml_vk_can_fuse_hc_mix_gate_fold(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_fuse_hc_elementwise_enabled() || !ctx->device->pipeline_multi_add_hc_mix_gate_fold) {
+        return false;
+    }
+    static constexpr std::initializer_list<ggml_op> hc_mix_gate_fold_pattern {
+        GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_CONT,
+        GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_SCALE
+    };
+    const int output_idx = node_idx + 11;
+    if (output_idx >= cgraph->n_nodes || !ggml_can_fuse_subgraph(cgraph, node_idx, hc_mix_gate_fold_pattern, { output_idx })) {
+        return false;
+    }
+    const ggml_tensor * n0  = cgraph->nodes[node_idx];
+    const ggml_tensor * n1  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * dst = cgraph->nodes[output_idx];
+    if (ggml_get_unary_op(n0) != GGML_UNARY_OP_SIGMOID) return false;
+    if (dst->ne[0] != 2560 || n1->ne[0] != 10240) return false;
+
+    const ggml_tensor * up = n0->src[0];
+    const ggml_tensor * xn = (n1->src[0] == n0) ? n1->src[1] : n1->src[0];
+    if (!up || !xn) return false;
+    if (up->ne[0] != 10240 || xn->ne[0] != 10240) return false;
+    if (up->ne[1] != dst->ne[1] || xn->ne[1] != dst->ne[1]) return false;
+
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(scale));
+    if (scale != 0.25f) return false;
+
+    return true;
+}
+
+static void ggml_vk_multi_add_hc_combine(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * n_scale0  = cgraph->nodes[node_idx];
+    const ggml_tensor * n_reshape = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * n_mul     = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * dst       = cgraph->nodes[node_idx + 5];
+
+    const ggml_tensor * inject    = n_scale0->src[0];
+    const ggml_tensor * block_out = (n_mul->src[0] == n_reshape) ? n_mul->src[1] : n_mul->src[0];
+    const ggml_tensor * residual  = (dst->src[0] == n_mul) ? dst->src[1] : dst->src[0];
+
+    vk_op_multi_add_push_constants pc{};
+    pc.ne20 = (uint32_t)dst->ne[0];
+    pc.ne21 = (uint32_t)dst->ne[1];
+    pc.ne22 = (uint32_t)dst->ne[2];
+    pc.ne23 = (uint32_t)dst->ne[3];
+
+    const ggml_tensor * tensors[4] = { residual, block_out, inject, dst };
+    for (uint32_t i = 0; i < 4; ++i) {
+        pc.nb[i][0] = (uint32_t)tensors[i]->nb[0] / sizeof(float);
+        pc.nb[i][1] = (uint32_t)tensors[i]->nb[1] / sizeof(float);
+        pc.nb[i][2] = (uint32_t)tensors[i]->nb[2] / sizeof(float);
+        pc.nb[i][3] = (uint32_t)tensors[i]->nb[3] / sizeof(float);
+    }
+    pc.rms_partials = 0;
+
+    vk_pipeline pipeline = ctx->device->pipeline_multi_add_hc_combine;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    std::array<uint32_t, 3> elements;
+    uint32_t ne = ggml_nelements(dst);
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, residual),
+          ggml_vk_tensor_subbuffer(ctx, block_out),
+          ggml_vk_tensor_subbuffer(ctx, inject),
+          ggml_vk_tensor_subbuffer(ctx, dst) },
+        pc, elements);
+}
+
+static void ggml_vk_multi_add_hc_mix_act(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * n_scale = cgraph->nodes[node_idx];
+    const ggml_tensor * dst     = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * lo      = n_scale->src[0];
+
+    vk_op_multi_add_push_constants pc{};
+    pc.ne20 = (uint32_t)dst->ne[0];
+    pc.ne21 = (uint32_t)dst->ne[1];
+    pc.ne22 = (uint32_t)dst->ne[2];
+    pc.ne23 = (uint32_t)dst->ne[3];
+
+    const ggml_tensor * tensors[2] = { lo, dst };
+    for (uint32_t i = 0; i < 2; ++i) {
+        pc.nb[i][0] = (uint32_t)tensors[i]->nb[0] / sizeof(float);
+        pc.nb[i][1] = (uint32_t)tensors[i]->nb[1] / sizeof(float);
+        pc.nb[i][2] = (uint32_t)tensors[i]->nb[2] / sizeof(float);
+        pc.nb[i][3] = (uint32_t)tensors[i]->nb[3] / sizeof(float);
+    }
+    pc.rms_partials = 0;
+
+    vk_pipeline pipeline = ctx->device->pipeline_multi_add_hc_mix_act;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    std::array<uint32_t, 3> elements;
+    uint32_t ne = ggml_nelements(dst);
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, lo),
+          ggml_vk_tensor_subbuffer(ctx, dst) },
+        pc, elements);
+}
+
+static void ggml_vk_multi_add_hc_mix_gate_fold(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * n_sig = cgraph->nodes[node_idx];
+    const ggml_tensor * n_mul = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * dst   = cgraph->nodes[node_idx + 11];
+
+    const ggml_tensor * up = n_sig->src[0];
+    const ggml_tensor * xn = (n_mul->src[0] == n_sig) ? n_mul->src[1] : n_mul->src[0];
+
+    vk_op_multi_add_push_constants pc{};
+    pc.ne20 = (uint32_t)dst->ne[0];
+    pc.ne21 = (uint32_t)dst->ne[1];
+    pc.ne22 = (uint32_t)dst->ne[2];
+    pc.ne23 = (uint32_t)dst->ne[3];
+
+    const ggml_tensor * tensors[3] = { xn, up, dst };
+    for (uint32_t i = 0; i < 3; ++i) {
+        pc.nb[i][0] = (uint32_t)tensors[i]->nb[0] / sizeof(float);
+        pc.nb[i][1] = (uint32_t)tensors[i]->nb[1] / sizeof(float);
+        pc.nb[i][2] = (uint32_t)tensors[i]->nb[2] / sizeof(float);
+        pc.nb[i][3] = (uint32_t)tensors[i]->nb[3] / sizeof(float);
+    }
+    pc.rms_partials = 0;
+
+    vk_pipeline pipeline = ctx->device->pipeline_multi_add_hc_mix_gate_fold;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    std::array<uint32_t, 3> elements;
+    uint32_t ne = ggml_nelements(dst);
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, xn),
+          ggml_vk_tensor_subbuffer(ctx, up),
+          ggml_vk_tensor_subbuffer(ctx, dst) },
+        pc, elements);
+}
+
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
 static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
@@ -21672,7 +22095,13 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_SCALE:
-        ggml_vk_scale(ctx, compute_ctx, src0, node);
+        if (ctx->num_additional_fused_ops && ctx->fused_hc_combine) {
+            ggml_vk_multi_add_hc_combine(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->num_additional_fused_ops && ctx->fused_hc_mix_act) {
+            ggml_vk_multi_add_hc_mix_act(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_scale(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_SQR:
@@ -21794,6 +22223,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_UNARY:
+        if (ctx->num_additional_fused_ops && ctx->fused_hc_mix_gate_fold) {
+            ggml_vk_multi_add_hc_mix_gate_fold(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
             break;
@@ -25241,6 +25674,24 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_fold4           = true;
                 fusion_string                 = "HC_FOLD4";
                 std::fill_n(op_srcs_fused_elementwise, kHcFold4NodeCount, false);
+            } else if (ggml_vk_fuse_hc_elementwise_enabled() && ggml_vk_can_fuse_hc_combine(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 5;
+                ctx->fused_hc_combine = true;
+                ctx->fused_ops_write_mask = 1ull << 5;
+                fusion_string = "HC_COMBINE";
+                std::fill_n(op_srcs_fused_elementwise, 6, true);
+            } else if (ggml_vk_fuse_hc_elementwise_enabled() && ggml_vk_can_fuse_hc_mix_act(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_hc_mix_act = true;
+                ctx->fused_ops_write_mask = 1ull << 1;
+                fusion_string = "HC_MIX_ACT";
+                std::fill_n(op_srcs_fused_elementwise, 2, true);
+            } else if (ggml_vk_fuse_hc_elementwise_enabled() && ggml_vk_can_fuse_hc_mix_gate_fold(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 11;
+                ctx->fused_hc_mix_gate_fold = true;
+                ctx->fused_ops_write_mask = 1ull << 11;
+                fusion_string = "HC_MIX_GATE_FOLD";
+                std::fill_n(op_srcs_fused_elementwise, 12, false);
             } else if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
@@ -25483,6 +25934,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_moe_staged       = false;
                 ctx->fused_hc_fold4              = false;
+                ctx->fused_hc_combine            = false;
+                ctx->fused_hc_mix_act            = false;
+                ctx->fused_hc_mix_gate_fold      = false;
                 ctx->fused_hc_segment            = vk_hc_segment::NONE;
                 ctx->fused_moe_output_segment    = false;
                 ctx->fused_moe_projections       = false;
@@ -25542,6 +25996,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         i += ctx->num_additional_fused_ops;
         ctx->num_additional_fused_ops = 0;
         ctx->fused_hc_fold4              = false;
+        ctx->fused_hc_combine            = false;
+        ctx->fused_hc_mix_act            = false;
+        ctx->fused_hc_mix_gate_fold      = false;
         ctx->fused_hc_segment            = vk_hc_segment::NONE;
         ctx->fused_moe_output_segment    = false;
         ctx->fused_moe_projections       = false;

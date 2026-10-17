@@ -1,0 +1,24 @@
+--- artifacts/perf-gap/q2-contract-20261012/identity/quarantine-fusedRevert/ggml-vulkan.cpp.pre-fused.bak	2026-10-12 14:26:12.788448984 +0000
++++ /var/tmp/tp5-clean-head-src/ggml/src/ggml-vulkan/ggml-vulkan.cpp	2026-10-12 14:26:27.649067978 +0000
+@@ -16778,19 +16778,12 @@
+     // default; a variant is used only when its pipeline was created (opt-in env
+     // plus RADV/capability gates in ggml_vk_load_shaders). Only one wg variant
+     // is ever created, so the first non-null entry is the selected one.
+-    // Workorder A-native: BF16 HC weights (the original Q2_0 target) select
+-    // the BF16 variants so the fused segment and LateBind capture run without
+-    // a Q8 conversion of the source weights.
+-    const bool hc_bf16_weights = down_node && down_node->src[0] &&
+-                                 down_node->src[0]->type == GGML_TYPE_BF16;
+-    vk_pipeline & down_pipeline = hc_bf16_weights && ctx->device->pipeline_hc_down_silu_bf16 ? ctx->device->pipeline_hc_down_silu_bf16 :
+-                                ctx->device->pipeline_hc_down_silu_q8dot ? ctx->device->pipeline_hc_down_silu_q8dot :
++    vk_pipeline & down_pipeline = ctx->device->pipeline_hc_down_silu_q8dot ? ctx->device->pipeline_hc_down_silu_q8dot :
+                                 ctx->device->pipeline_hc_down_silu_wg[0] ? ctx->device->pipeline_hc_down_silu_wg[0] :
+                                 ctx->device->pipeline_hc_down_silu_wg[1] ? ctx->device->pipeline_hc_down_silu_wg[1] :
+                                 ctx->device->pipeline_hc_down_silu_wg[2] ? ctx->device->pipeline_hc_down_silu_wg[2] :
+                                 ctx->device->pipeline_hc_down_silu;
+-    vk_pipeline & up_pipeline = hc_bf16_weights && ctx->device->pipeline_hc_project_fold_bf16 ? ctx->device->pipeline_hc_project_fold_bf16 :
+-                               ctx->device->pipeline_hc_project_fold_r320 ? ctx->device->pipeline_hc_project_fold_r320 :
++    vk_pipeline & up_pipeline = ctx->device->pipeline_hc_project_fold_r320 ? ctx->device->pipeline_hc_project_fold_r320 :
+                                ctx->device->pipeline_hc_project_fold;
+ 
+     if (combine && !fuse_inject) {

@@ -1,0 +1,20 @@
+{
+  "frozen_utc": "2026-10-12T12:19:55Z",
+  "purpose": "QUARANTINE-EXPERIMENT binary: BF16 fused-segment pipeline creations commented out in ggml-vulkan.cpp ~6672-6677",
+  "source_ggml_vulkan_cpp_sha256_quarantined": "ffc04c071c1c4f7158ae394172103ee70b848393681147cee5a64bd9bb008d30",
+  "source_ggml_vulkan_cpp_sha256_backup_original": "9bbbfd5136547e6a6675260778b02f8adcb46d0ac270e6c500cde1ed612471c0",
+  "bin_dir": "/home/kunweiz/atomic-llama-cpp-turboquant/build-perf-gap/bin",
+  "files_sha256": {
+    "llama-server": "a14d5c69d7334ead5d22afc82ea397336b21646ffe5a2087e592c89fc4fabfc9",
+    "libggml-base.so.0.18.1": "55d54d89b61a747baeacd6b56bb04b9f35a49d92fd15371f8d0d1fce643d2a62",
+    "libggml-cpu.so.0.18.1": "f6a14e497960372b74897e185b624ebaec371eaae1da5870069e8d4baa21418e",
+    "libggml-vulkan.so.0.18.1": "d4ff0591a95a373cbd9fae9e0dbbb4fb5b1ed02be5876b9b7a147fd40e25a5be",
+    "libggml.so.0.18.1": "f3a58153941a08be176e79af29dbb85d7180f207933935319e8a97f1f76f87b2",
+    "libllama-common.so.0.0.2194": "811e34d6699e850ce64e65273be9a803255cc6ddec5cb5aadc220de9dcf6edc4",
+    "libllama-server-impl.so": "a0f50752592d969c66e7afd2dac6f6bd9e8f4b75f9825b6eda2cc7a07976a904",
+    "libllama.so.0.0.2194": "5d63fa93bfe35f7da895bbea3cb79953733e76c513d57e9485744651ede09d19",
+    "libmtmd.so.0.0.2194": "a0b4c3eb6eec8c35d07b1303d77493cef60b225f2e39e8423ce9ebaad277be88",
+    "libtp5-hc-quant-helper.so": "2c2fe38e830be5bbfe58124e31b03a1f4deab57212cad6c9f2a6b8986d0c4ecc"
+  },
+  "restore_plan": "cp identity/quarantine-bf16pipe/ggml-vulkan.cpp.bak over ggml-vulkan.cpp, verify sha256 == backup hash, rebuild llama-server"
+}

@@ -1,0 +1,64 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "你是一个具备严谨逻辑与准确数学计算能力的助手。请仔细推导日期与星期对应关系，确保算术绝对无误。"
+      },
+      {
+        "role": "user",
+        "content": "小李每周一、周三、周五各跑步 5 公里，周六跑步 10 公里，其余日子（周二、周四、周日）完全休息。如果某个月一共有 30 天，且该月的 1 号恰好是周日，请计算：小李在这个月一共跑步了多少公里？请写出简明计算步骤，并在最后明确写出总公里数。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 300,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "length",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "这是一个典型的日历与算术结合的问题。我们需要确定该月中哪些日期是周一、周三、周五和周六，然后计算对应的跑步距离。\n\n### 1. 确定该月的日期与星期对应关系\n\n已知：\n- 该月共有 **30 天**。\n- **1 号是周日**。\n\n我们可以推导该月所有日期的星期：\n\n| 日期 | 星期 | 备注 |\n| :--- | :--- | :--- |\n| 1 | 周日 | 休息 |\n| 2 | 周一 | **跑步 5 km** |\n| 3 | 周二 | 休息 |\n| 4 | 周三 | **跑步 5 km** |\n| 5 | 周四 | 休息 |\n| 6 | 周五 | **跑步 5 km** |\n| 7 | 周六 | **跑步 10 km** |\n| 8 | 周日 | 休息 |\n| 9 | 周一 | **跑步 5 km** |\n| 10 | 周二 | 休息 |\n| 11 | 周三 | **跑步 5 km** |\n| 12 | 周四 | 休息 |\n| 13 | 周五 | **跑步 5 km** |\n| 14 | 周六 | **跑步 10 km** |\n| 15 | "
+        }
+      }
+    ],
+    "created": 1791819721,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 300,
+      "prompt_tokens": 122,
+      "total_tokens": 422,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-m3LEjX7FAZ7bTjct8Aer9LwdGdvdFZXJ",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 122,
+      "prompt_ms": 4316.446,
+      "prompt_per_token_ms": 35.380704918032784,
+      "prompt_per_second": 28.26399310914581,
+      "predicted_n": 300,
+      "predicted_ms": 5489.642,
+      "predicted_per_token_ms": 18.298806666666668,
+      "predicted_per_second": 54.64837233466226,
+      "draft_n": 156,
+      "draft_n_accepted": 143
+    }
+  },
+  "wall_ms": 9810.416083,
+  "log_begin": 21201,
+  "log_end": 40909,
+  "phase": "warmup"
+}

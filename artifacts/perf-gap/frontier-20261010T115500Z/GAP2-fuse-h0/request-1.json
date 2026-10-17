@@ -1,0 +1,62 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文回答普通成年人如何健康减重。回答包含四个部分，每部分标题单独一行：\n一、热量缺口原理（一句话）\n二、饮食建议（两条，每条一句话）\n三、每周运动安排（给出周一、周三、周五的安排）\n四、睡眠与常见误区（两句话）\n语言自然，正常结束。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "inTal(ok-ng Job page Day hour.en d.date Day run Day hourigas word Day condition asset ueбен=end Day  node spot    urd town run samod host rule d Day  spot source/tos run  node   level rule account  author part level page to part place top item to part-rule page **  host ** ** ** level status page  top re  part start spot site status part  to part unit \" start ' part -end source place ' start levelued start rule standard part end ** start standard page source ** unit top page part page \"uent page ** \" part ** ' part-level ' ' place z ' to son standard level standard spot to to level\n\n standard spot level part level ** part part level word \" part source part author source ** ** unit standard spot level\n\n level page ** ' page ** part part-level **"
+        }
+      }
+    ],
+    "created": 1791634029,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b2194-3e28b121a",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 176,
+      "prompt_tokens": 93,
+      "total_tokens": 269,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-SNkGNN6ZBFyxi5zgrXXhX5Lvi4Dp1sNf",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 93,
+      "prompt_ms": 3081.558,
+      "prompt_per_token_ms": 33.13503225806451,
+      "prompt_per_second": 30.179539051349998,
+      "predicted_n": 176,
+      "predicted_ms": 3677.58,
+      "predicted_per_token_ms": 20.89534090909091,
+      "predicted_per_second": 47.857558503146095
+    }
+  },
+  "wall_ms": 6763.462278,
+  "log_begin": 25046,
+  "log_end": 60776,
+  "phase": "measured"
+}

@@ -1,0 +1,28 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文回答普通成年人如何健康减重，语言自然平实，避免冗长铺垫。回答需覆盖四个方面：合理饮食、每周运动安排、充足睡眠、长期执行方法。每个方面给出两到三条具体可行的要点，自然衔接成文。结尾正常收束，不添加重复总结。整体篇幅以约两百个模型 token 为目标，内容充实、不展开无关细节。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "phase": "warmup",
+  "http_status": 500,
+  "body": "{\"error\":{\"code\":500,\"message\":\"The model produced output that does not match the expected peg-native format\",\"type\":\"server_error\"}}",
+  "wall_ms": 7375.995831,
+  "log_begin": 15407,
+  "log_end": 26217
+}

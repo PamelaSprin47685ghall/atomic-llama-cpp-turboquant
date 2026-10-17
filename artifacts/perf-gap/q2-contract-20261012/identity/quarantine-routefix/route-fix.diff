@@ -1,0 +1,48 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index cdf860e5c..fb2576c1f 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -555,6 +555,19 @@ struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_te
+     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
+     auto it = stc.simple_tensors.find(tensor);
+     if (it == stc.simple_tensors.end()) {
++        // GAP-1 container routing guard (r5 loadtrace evidence): a model weight
++        // (op == NONE, not a view) is owned by the stc_static of the meta buffer it
++        // was load-registered on; the loader's MIRRORED fan-out wrote its per-rank
++        // simple tensors there. Lazily creating a fresh entry in a compute container
++        // would hand dispatch a never-written allocation. Fail closed instead of
++        // silently forking the weight identity (see the ownership guard in
++        // ggml_backend_meta_alloc_ctx_tensors_from_buft for the primary fix).
++        if (tensor->op == GGML_OP_NONE && tensor->view_src == nullptr &&
++                buf_ctx->stc_static.simple_tensors.find(tensor) == buf_ctx->stc_static.simple_tensors.end()) {
++            GGML_ABORT("ggml-backend-meta: weight tensor '%s' (op=NONE, not a view) is not registered in its "
++                       "meta buffer's stc_static; refusing to lazily create a compute-container shadow "
++                       "(GAP-1 container routing fork)", tensor->name);
++        }
+         ggml_backend_meta_buffer_init_tensor_impl(stc, const_cast<struct ggml_tensor *>(tensor));
+         it = stc.simple_tensors.find(tensor);
+         if (it == stc.simple_tensors.end()) {
+@@ -2632,6 +2645,23 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
+ 
+     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
+     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++        // GAP-1 container routing fix (r5 loadtrace evidence): a weight tensor that
++        // already completed load-time registration in another meta buffer's
++        // stc_static (first alloc_ctx_tensors_from_buft + MIRRORED fan-out writes;
++        // rank0 simple{buf=0x570564428160, data=0x6c8f000}) must keep that ownership.
++        // Unconditionally rebinding it here to this second meta buffer forked the
++        // weight identity: the loader's writes stayed on the first buffer while
++        // graph-side dispatch resolved the never-written second allocation
++        // (subbuffer{buf=0x5705644297d0, off=1049041280, size=6553600} — W dump
++        // 5 rank x 0/64 all zero). Keep t->buffer on the registered meta buffer so
++        // dispatch resolves exactly the load-written simple tensors.
++        if (t->buffer != nullptr && t->buffer != meta_buf && ggml_backend_buffer_is_meta(t->buffer)) {
++            ggml_backend_meta_buffer_context * prev_ctx =
++                (ggml_backend_meta_buffer_context *) t->buffer->context;
++            if (prev_ctx->stc_static.simple_tensors.find(t) != prev_ctx->stc_static.simple_tensors.end()) {
++                continue; // ownership already established; do not fork the identity
++            }
++        }
+         t->buffer = meta_buf;
+         ggml_backend_meta_buffer_init_tensor_impl(meta_buf_ctx->stc_static, t);
+         t->data = (void *) 0x2000000000000000; // FIXME

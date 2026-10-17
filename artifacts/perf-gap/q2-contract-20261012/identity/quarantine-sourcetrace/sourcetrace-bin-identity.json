@@ -1,0 +1,7 @@
+{
+  "frozen_utc": "2026-10-12T23:06:23Z",
+  "purpose": "GAP-1 source trace: MIRRORED fan-out source hex + write-then-readback + loader offs/mapping",
+  "libggml_vulkan_so_sha256": "96264d9d4c771a6e33ea153da23d5ba8fa97fa62fc3d4d39769d6414fe3ab73e",
+  "libggml_base_so_sha256": "5b950c33c26b68cb7b0bc8396dbefaad57aedffaf82f35f4fd9bb60f0d09246d",
+  "libllama_so_sha256": "105a660f6a8e6f7dffc0f24e7021e24808cd005467c3762cf6a60da382b880ee"
+}

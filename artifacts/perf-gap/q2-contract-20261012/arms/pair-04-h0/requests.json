@@ -1,0 +1,157 @@
+[
+  {
+    "idx": 0,
+    "phase": "warmup",
+    "n": 160,
+    "predicted_ms": 3630.913,
+    "tps": 44.06605170655425,
+    "wall_ms": 8237.060528,
+    "finish": "stop",
+    "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 102,
+      "prompt_ms": 4601.867,
+      "prompt_per_token_ms": 45.1163431372549,
+      "prompt_per_second": 22.164916978261214,
+      "predicted_n": 160,
+      "predicted_ms": 3630.913,
+      "predicted_per_token_ms": 22.69320625,
+      "predicted_per_second": 44.06605170655425
+    },
+    "issues": [],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=3 n_sub=96 uid=36028797018967041",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=96 uid=36028797018967297",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=96 uid=36028797018967553",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=96 uid=36028797018967809",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=96 uid=36028797018968065",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=97 uid=36028797018968321",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=97 uid=36028797018968577",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=10 n_sub=97 uid=36028797018968833"
+    ],
+    "mtp_cycle_lines": []
+  },
+  {
+    "idx": 1,
+    "phase": "warmup",
+    "n": 160,
+    "predicted_ms": 3262.182,
+    "tps": 49.04692625978563,
+    "wall_ms": 6987.894398,
+    "finish": "stop",
+    "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 102,
+      "prompt_ms": 3085.25,
+      "prompt_per_token_ms": 30.247549019607842,
+      "prompt_per_second": 33.06052994084758,
+      "predicted_n": 160,
+      "predicted_ms": 3262.182,
+      "predicted_per_token_ms": 20.388637499999998,
+      "predicted_per_second": 49.04692625978563
+    },
+    "issues": [],
+    "fallback_lines": [],
+    "mtp_cycle_lines": []
+  },
+  {
+    "idx": 2,
+    "phase": "measured",
+    "n": 160,
+    "predicted_ms": 3267.976,
+    "tps": 48.95996788226107,
+    "wall_ms": 6431.948309,
+    "finish": "stop",
+    "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 102,
+      "prompt_ms": 3159.782,
+      "prompt_per_token_ms": 30.978254901960785,
+      "prompt_per_second": 32.2807079728918,
+      "predicted_n": 160,
+      "predicted_ms": 3267.976,
+      "predicted_per_token_ms": 20.42485,
+      "predicted_per_second": 48.95996788226107
+    },
+    "issues": [],
+    "fallback_lines": [],
+    "mtp_cycle_lines": []
+  },
+  {
+    "idx": 3,
+    "phase": "measured",
+    "n": 160,
+    "predicted_ms": 3236.934,
+    "tps": 49.429490993637806,
+    "wall_ms": 6387.571233,
+    "finish": "stop",
+    "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 102,
+      "prompt_ms": 3146.732,
+      "prompt_per_token_ms": 30.850313725490196,
+      "prompt_per_second": 32.414581222678,
+      "predicted_n": 160,
+      "predicted_ms": 3236.934,
+      "predicted_per_token_ms": 20.2308375,
+      "predicted_per_second": 49.429490993637806
+    },
+    "issues": [],
+    "fallback_lines": [],
+    "mtp_cycle_lines": []
+  },
+  {
+    "idx": 4,
+    "phase": "measured",
+    "n": 160,
+    "predicted_ms": 3297.354,
+    "tps": 48.52375571443042,
+    "wall_ms": 6398.963102,
+    "finish": "stop",
+    "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 102,
+      "prompt_ms": 3097.331,
+      "prompt_per_token_ms": 30.36599019607843,
+      "prompt_per_second": 32.93157883351828,
+      "predicted_n": 160,
+      "predicted_ms": 3297.354,
+      "predicted_per_token_ms": 20.608462499999998,
+      "predicted_per_second": 48.52375571443042
+    },
+    "issues": [],
+    "fallback_lines": [],
+    "mtp_cycle_lines": []
+  },
+  {
+    "idx": 5,
+    "phase": "guard",
+    "n": 72,
+    "predicted_ms": 1511.665,
+    "tps": 47.629600473649916,
+    "wall_ms": 3302.316065,
+    "finish": "stop",
+    "content_sha256": "ead561f7cdce47b31ce7e0e48bceb7f6d17857880c2f92f65ebfede5779c0f78",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 23,
+      "prompt_ms": 1785.136,
+      "prompt_per_token_ms": 77.61460869565217,
+      "prompt_per_second": 12.884172410393381,
+      "predicted_n": 72,
+      "predicted_ms": 1511.665,
+      "predicted_per_token_ms": 20.99534722222222,
+      "predicted_per_second": 47.62960047364992
+    },
+    "issues": [],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=11 n_sub=96 uid=36028797018977281"
+    ],
+    "mtp_cycle_lines": []
+  }
+]

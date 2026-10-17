@@ -1,0 +1,18 @@
+{
+  "mode": "abort",
+  "horizon": 0,
+  "out": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-contract-20261012/arms/guardset-v1-h0/guard-09",
+  "server_pid": 497540,
+  "abort_phase": {
+    "aborted_after_first_token": true
+  },
+  "follow_up_request": {
+    "finish_reason": "stop",
+    "n_tokens": 21,
+    "content": "秋天是气温转凉、树叶变黄或落叶、果实成熟并带来丰收喜悦的季节。"
+  },
+  "server_exit": {
+    "returncode": 0,
+    "forced": false
+  }
+}

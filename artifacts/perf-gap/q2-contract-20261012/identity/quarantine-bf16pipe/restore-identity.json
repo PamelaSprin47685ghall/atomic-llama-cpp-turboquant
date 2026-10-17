@@ -1,0 +1,9 @@
+{
+  "frozen_utc": "2026-10-12T12:23:30Z",
+  "purpose": "post-experiment restore: source reverted to backup (verified identical), llama-server rebuilt",
+  "source_ggml_vulkan_cpp_sha256": "9bbbfd5136547e6a6675260778b02f8adcb46d0ac270e6c500cde1ed612471c0",
+  "expected_backup_sha256": "9bbbfd5136547e6a6675260778b02f8adcb46d0ac270e6c500cde1ed612471c0",
+  "libggml_vulkan_so_sha256_restored": "7abe67c58fa4b03667a12ba462d2e992b984ed617f765f7bd7b30d2f065124ae",
+  "llama_server_sha256_restored": "a14d5c69d7334ead5d22afc82ea397336b21646ffe5a2087e592c89fc4fabfc9",
+  "experiment_result": "QUARANTINE ARM STILL FAILED (HTTP 500, garbled output) — attribution to BF16 fused pipeline REJECTED; suspect shifts to undeclared worktree changes (ggml-vulkan.cpp has 326 insertions/14 hunks, ~260 lines beyond workorder A declaration, incl. +234-line block near ggml_vk_build_graph and graph_compute hunks)"
+}

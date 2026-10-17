@@ -1,0 +1,30 @@
+{
+  "contract_version": "v2",
+  "frozen_utc": "2026-10-12T11:15:32Z",
+  "frozen_by": "devops (pre-GPU, offline)",
+  "files": {
+    "question.txt": {
+      "size_bytes": 13,
+      "sha256": "d6203155d5acf671d1a71bd4298fafb19c29fa74d519d557a0a92352a82bb9b4"
+    },
+    "system.txt": {
+      "size_bytes": 410,
+      "sha256": "38a1cf8d702142d9687720438983dae819a60a783003341d0e5ec86a22e3dc44"
+    }
+  },
+  "question_verbatim": "如何减肥\n",
+  "length_gate": {
+    "completion_tokens_min": 160,
+    "completion_tokens_max": 240,
+    "applies_to": "measured-phase public completion tokens only; warmup/guard not judged",
+    "source": "scripts/tp5-gap-bench.py --length-min/--length-max defaults (preregistered)"
+  },
+  "sampling": {
+    "temperature": 0,
+    "seed": 42,
+    "enable_thinking": false,
+    "cache_prompt": false
+  },
+  "authority": "Manager approved v2 candidate text; Engineer contract-gate authored files",
+  "notes": "Changing prompt text or gates means a new contract round; 140-token v1 round stays DIAGNOSTIC_ONLY."
+}

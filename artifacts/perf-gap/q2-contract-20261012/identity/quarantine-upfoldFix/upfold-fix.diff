@@ -1,0 +1,47 @@
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+index d833bcf2d..7ffd89925 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+@@ -395,8 +395,23 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
+ 
+         uint ibi = first_row*p.ncols;
+         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
++#ifdef HC_UP_FOLD
++            // NativeHC up fold (qwen4_hc_project_fold_bf16): first_row encodes
++            // token_row*stride_d + col, so the W_up row for stream n is
++            // col + n*stride_d (row space 4*stride_d) — the exact fold iter()
++            // applies on its non-aligned path. Without it this aligned loop
++            // read the linear rows first_row + n, which point at wrong weight
++            // rows for token_row >= 1 and past the tensor for token_row >= 3,
++            // corrupting every gate value and the 0.25 stream fold in
++            // reduce_result. Variants without HC_UP_FOLD compile the #else
++            // arm and stay byte-identical to the previous code.
++            const uint weight_row = (first_row % p.stride_d) + n * p.stride_d;
++            const uint ib = (weight_row * p.ncols + col)/QUANT_K; // block index
++            ibi += p.ncols * p.stride_d;
++#else
+             const uint ib = (ibi + col)/QUANT_K; // block index
+             ibi += p.ncols;
++#endif
+ 
+             const vec4 v = dequantize4_2aligned(ib, iqs, a_offset);
+ 
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -16720,8 +16729,16 @@ static void ggml_vk_segment_project(ggml_backend_vk_context * ctx,
+     const std::initializer_list<vk::DescriptorBufferInfo> descriptors{
+         ggml_vk_tensor_subbuffer(ctx, weights), b_sub, out,
+         extra ? ggml_vk_tensor_subbuffer(ctx, extra) : out, out };
++    // NativeHC up fold: all three fold variants (Q8_0, BF16, R320) are the
++    // same mul_mat_vec.comp macro family with one shader geometry (NUM_ROWS=4
++    // stream fold per workgroup, token_row = gl_WorkGroupID.y) and must share
++    // one dispatch convention. pipeline_hc_project_fold_bf16 previously fell
++    // through to n_rows, shrinking grid-y 4x versus its Q8_0 twin — a
++    // dispatch-level divergence on top of the aligned-path indexing defect
++    // (see docs/TP5-BF16-UPFOLD-FIX.md).
+     const uint32_t dispatch_rows =
+         contraction == ctx->device->pipeline_hc_project_fold ||
++        contraction == ctx->device->pipeline_hc_project_fold_bf16 ||
+         contraction == ctx->device->pipeline_hc_project_fold_r320 ? 4 * n_rows : n_rows;
+     if (output_tail) {
+         ggml_vk_dispatch_output_tail(ctx, subctx, contraction, descriptors, pc, { m, dispatch_rows, 1 });

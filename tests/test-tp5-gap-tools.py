@@ -85,6 +85,108 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     bench.request_payload(prompt, system, cap)
 
+    def test_length_gate_rejects_short_measured_completion(self):
+        requests = [{'idx': 0, 'phase': 'measured', 'n': 140}]
+        gate = bench.evaluate_length_gate(requests, 160, 240)
+        self.assertFalse(gate['passed'])
+        self.assertEqual(gate['length_min'], 160)
+        self.assertEqual(gate['length_max'], 240)
+        self.assertEqual(gate['requests'], [{'idx': 0, 'n': 140, 'in_range': False}])
+
+    def test_length_gate_accepts_in_range_completion(self):
+        requests = [{'idx': 0, 'phase': 'measured', 'n': 160},
+                    {'idx': 1, 'phase': 'measured', 'n': 240}]
+        self.assertTrue(bench.evaluate_length_gate(requests, 160, 240)['passed'])
+
+    def test_length_gate_bounds_are_inclusive(self):
+        for n, ok in ((159, False), (160, True), (240, True), (241, False)):
+            with self.subTest(n=n):
+                requests = [{'idx': 0, 'phase': 'measured', 'n': n}]
+                gate = bench.evaluate_length_gate(requests, 160, 240)
+                self.assertEqual(gate['passed'], ok)
+
+    def test_length_gate_judges_measured_phase_only(self):
+        requests = [{'idx': 0, 'phase': 'warmup', 'n': 140},
+                    {'idx': 2, 'phase': 'measured', 'n': 200},
+                    {'idx': 3, 'phase': 'guard', 'n': 140}]
+        gate = bench.evaluate_length_gate(requests, 160, 240)
+        self.assertTrue(gate['passed'])
+        self.assertEqual([r['n'] for r in gate['requests']], [200])
+        requests[1]['n'] = 140
+        self.assertFalse(bench.evaluate_length_gate(requests, 160, 240)['passed'])
+
+    def test_cycle_ledger_reports_not_collected_without_log_evidence(self):
+        requests = [{'idx': 0, 'phase': 'measured', 'n': 200,
+                     'mtp_cycle_lines': [], 'timings': {}}]
+        ledger = bench.extract_cycle_ledger(requests, 1)
+        self.assertIn('accepted_prefix_distribution', ledger)
+        self.assertIn('cycle_D_V_S_H_K', ledger)
+        self.assertEqual(ledger['accepted_prefix_distribution'], 'NOT_COLLECTED')
+        self.assertEqual(ledger['cycle_D_V_S_H_K'], 'NOT_COLLECTED')
+
+    def test_cycle_ledger_is_not_applicable_without_mtp(self):
+        ledger = bench.extract_cycle_ledger([], 0)
+        self.assertEqual(ledger['accepted_prefix_distribution'], 'NOT_APPLICABLE')
+        self.assertEqual(ledger['cycle_D_V_S_H_K'], 'NOT_APPLICABLE')
+
+    def test_cycle_ledger_extracts_logged_cycle_lines(self):
+        requests = [{'idx': 0, 'phase': 'measured', 'n': 2,
+                     'mtp_cycle_lines': [
+                         '[tp5-mtp-cycle] draft_us=3000 target_us=25000 catchup_us=1000 handoff_us=0 total_us=29000 accepted_tokens=1 final_tokens=2',
+                         '[tp5-mtp-cycle] draft_us=6000 target_us=25000 catchup_us=1000 handoff_us=0 total_us=32000 accepted_tokens=2 final_tokens=4'],
+                     'timings': {}}]
+        ledger = bench.extract_cycle_ledger(requests, 1)
+        cycles = ledger['cycle_D_V_S_H_K']
+        self.assertEqual(cycles['cycles_observed'], 2)
+        self.assertEqual(cycles['per_cycle'][0]['K'], 1)
+        self.assertAlmostEqual(cycles['per_cycle'][1]['D_ms'], 6.0)
+        self.assertEqual(ledger['accepted_prefix_distribution']['K_per_cycle'], [1, 2])
+        self.assertEqual(ledger['accepted_prefix_distribution']['histogram'], {'1': 1, '2': 1})
+
+    def test_cycle_ledger_falls_back_to_timings_counters(self):
+        requests = [{'idx': 0, 'phase': 'measured', 'n': 4,
+                     'mtp_cycle_lines': [],
+                     'timings': {'draft_n': 6, 'draft_n_accepted': 4}}]
+        ledger = bench.extract_cycle_ledger(requests, 1)
+        self.assertEqual(ledger['accepted_prefix_distribution']['source'],
+                         'timings.draft_n_accepted_per_request')
+        self.assertEqual(ledger['accepted_prefix_distribution']['values'], [4])
+        self.assertEqual(ledger['cycle_D_V_S_H_K'], 'NOT_COLLECTED')
+
+    def test_audit_minimum_fields_marks_unmechanizable_fields_not_collected(self):
+        audited = bench.audit_minimum_fields({'requests': []}, None, None)
+        self.assertEqual(audited['fields']['workload_hash'], 'NOT_COLLECTED')
+        self.assertEqual(audited['fields']['quality_verdict'], 'NOT_COLLECTED')
+        self.assertEqual(audited['fields']['binary_SHA256'], 'NOT_COLLECTED')
+        self.assertEqual(audited['fields']['active_rows'], 'NOT_COLLECTED')
+        self.assertEqual(audited['fields']['bank_epoch'], 'NOT_COLLECTED')
+        self.assertTrue(audited['checklist_covered'])
+        self.assertIn('mtp_horizon', audited['fields'])
+        self.assertIn('teardown', audited['fields'])
+
+    def test_failed_run_result_carries_ledger_placeholders(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            root = Path(tmp)
+            fake = root / 'input.bin'
+            fake.write_bytes(b'fixture')
+            out = root / 'result'
+            argv = ['tp5-gap-bench', '--bin', str(fake), '--model', str(fake),
+                    '--draft', str(fake), '--out', str(out)]
+            with patch('sys.argv', argv), \
+                 patch.object(bench, 'open', return_value=io.StringIO(), create=True), \
+                 patch.object(bench.fcntl, 'flock', side_effect=BlockingIOError('busy fixture')), \
+                 patch.object(bench, 'idle_gate'), \
+                 patch.object(bench, 'gpu_state', return_value=[]), \
+                 patch('builtins.print'):
+                self.assertEqual(bench.main(), 1)
+            result = json.loads((out / 'result.json').read_text())
+            self.assertEqual(result['rank_stage_ledger']['status'], 'NOT_COLLECTED')
+            self.assertIn('reason', result['rank_stage_ledger'])
+            self.assertIn('length_gate', result)
+            self.assertEqual(result['length_gate']['requests'], 'NOT_COLLECTED')
+            self.assertEqual(result['minimum_fields']['fields']['binary_SHA256'], 'NOT_COLLECTED')
+            self.assertTrue(result['minimum_fields']['checklist_covered'])
+
     def paired_fixture(self, root):
         for block in range(1, 5):
             for arm, ms in (('A', 100.0), ('B', 80.0)):
@@ -228,6 +330,164 @@ class EvidenceTests(unittest.TestCase):
             p.write_bytes(b'NOPE')
             with self.assertRaises(ValueError):
                 gguf.directory(p)
+
+
+class RankStageLedgerTests(unittest.TestCase):
+    """GGML_TP5_PROFILE-family line parsing: real formats, malformed inputs, ledger aggregation."""
+
+    RELAY_LINE = ("[tp5-relay-stage] exec=141 stage=10 epoch=55 direct=1 wire=f32 elems=1024 "
+                  "ready_first_us=12.5 ready_all_us=56.25 skew_us=3.5 arm_us=1.2 cpu_data_us=0.8 "
+                  "generation_us=40.0 total_us=61.0 polls=12 gpu_spin_avg=3.5 gpu_spin_max=9 "
+                  "gpu_spin_n=5 ready_rank_us=10.0,20.0,30.0,40.0,56.25")
+
+    def test_relay_stage_line_parses_all_printed_fields(self):
+        category, rec = bench.parse_rank_stage_line(self.RELAY_LINE)
+        self.assertEqual(category, 'relay_stage')
+        self.assertEqual(rec['exec'], 141)
+        self.assertEqual(rec['stage'], 10)
+        self.assertEqual(rec['epoch'], 55)
+        self.assertEqual(rec['direct'], 1)
+        self.assertEqual(rec['wire'], 'f32')
+        self.assertEqual(rec['total_us'], 61.0)
+        self.assertEqual(rec['ready_rank_us'], [10.0, 20.0, 30.0, 40.0, 56.25])
+
+    def test_field_order_does_not_confuse_keys(self):
+        category, rec = bench.parse_rank_stage_line(
+            '[tp5-relay-stage] stage=10 exec=141 epoch=55 ready_rank_us=1.0,2.0,3.0,4.0,5.0')
+        self.assertEqual(category, 'relay_stage')
+        self.assertEqual(rec['exec'], 141)
+        self.assertEqual(rec['stage'], 10)
+        self.assertEqual(rec['ready_rank_us'], [1.0, 2.0, 3.0, 4.0, 5.0])
+
+    def test_latebind_stage_line_parses_negative_averages(self):
+        category, rec = bench.parse_rank_stage_line(
+            '[tp5-latebind-stage] exec=141 stage=10 sidecar_wait_us=85.0 sidecar_data_us=1.1 '
+            'y_publish_us=2.2 q_publish_us=0.5 q_spin_avg=-1.0 q_spin_max=0 q_spin_n=0')
+        self.assertEqual(category, 'latebind_stage')
+        self.assertEqual(rec['sidecar_wait_us'], 85.0)
+        self.assertEqual(rec['q_spin_avg'], -1.0)
+
+    def test_exec_summary_keeps_slash_counters_verbatim(self):
+        category, rec = bench.parse_rank_stage_line(
+            '[tp5-profile] exec=141 decode=1 submits=96 wait_us=1000 wait_n=5 collective=48 '
+            'drm_wait=48 creplay=12/3 plan=45/3')
+        self.assertEqual(category, 'exec_summary')
+        self.assertEqual(rec['creplay'], '12/3')
+        self.assertEqual(rec['plan'], '45/3')
+        self.assertEqual(rec['decode'], 1)
+
+    def test_definition_and_dependency_lines_parse(self):
+        _, d = bench.parse_rank_stage_line(
+            '[tp5-linear-definition] rank=2 stages=48 primary_cbs=1 late=94 bank=1 dispatches=50 timing=1')
+        self.assertEqual(d['rank'], 2)
+        self.assertEqual(d['stages'], 48)
+        _, dep = bench.parse_rank_stage_line(
+            '[tp5-dependency-ledger] rank=2 stages=48 dispatches=50 compute_epochs=48 '
+            'native_dispatches=48 native_epochs=48 ignored_manual_boundaries=1')
+        self.assertEqual(dep['rank'], 2)
+        self.assertEqual(dep['native_epochs'], 48)
+
+    def test_graph_line_parses_behind_log_prefix(self):
+        category, rec = bench.parse_rank_stage_line(
+            'info: [tp5-mtp-graph] type=3 reuse=1 definition_uid=0x1a2b3c4d n_reused=5 '
+            'ubatch_tokens=2 execution_phase=2 frame_valid=1 frame_role=1 target_capacity=6')
+        self.assertEqual(category, 'graph')
+        self.assertEqual(rec['type'], 3)
+        self.assertEqual(rec['reuse'], 1)
+        self.assertEqual(rec['ubatch_tokens'], 2)
+        self.assertEqual(rec['target_capacity'], 6)
+        self.assertIsInstance(rec['definition_uid'], str)
+
+    def test_missing_or_non_numeric_required_keys_are_malformed(self):
+        self.assertIsNone(bench.parse_rank_stage_line('[tp5-relay-stage] epoch=55 direct=1'))
+        self.assertIsNone(bench.parse_rank_stage_line('[tp5-relay-stage] exec=abc stage=10'))
+        self.assertIsNone(bench.parse_rank_stage_line('[tp5-mtp-graph] type=3'))
+        self.assertIsNone(bench.parse_rank_stage_line('[tp5-linear-definition] stages=48'))
+        self.assertIsNone(bench.parse_rank_stage_line('unrelated line without tag'))
+
+    def test_bad_rank_list_is_malformed(self):
+        self.assertIsNone(bench.parse_rank_stage_line(
+            '[tp5-relay-stage] exec=1 stage=2 epoch=3 ready_rank_us=1.0,abc,3.0'))
+        self.assertIsNone(bench.parse_rank_stage_line(
+            '[tp5-relay-stage] exec=1 stage=2 epoch=3 ready_rank_us=1.0,'))
+
+    def test_truncated_line_keeps_partial_record_without_fabrication(self):
+        category, rec = bench.parse_rank_stage_line(
+            '[tp5-relay-stage] exec=141 stage=10 epoch=55 direct=1 wire=f32 elems=1024')
+        self.assertEqual(category, 'relay_stage')
+        self.assertNotIn('ready_rank_us', rec)
+        self.assertNotIn('total_us', rec)
+
+    def test_extract_not_collected_reasons_are_mode_specific(self):
+        for mode, needle in (('none', '--profile none'), ('cycle', 'GGML_TP5_MTP_PROFILE'),
+                             ('kernels', 'GGML_VK_PERF_LOGGER'), ('full', '--profile full')):
+            with self.subTest(mode=mode):
+                ledger = bench.extract_rank_stage_ledger([], mode)
+                self.assertEqual(ledger['status'], 'NOT_COLLECTED')
+                self.assertIn(needle, ledger['reason'])
+                self.assertIn('active_rows', ledger['field_boundaries'])
+
+    def test_extract_collects_aggregates_and_localizes_slowest_rank(self):
+        segments = [
+            (0, 'measured', [self.RELAY_LINE,
+                             '[tp5-relay-stage] exec=142 stage=11 epoch=56 direct=0 wire=f32 '
+                             'total_us=80.0 ready_rank_us=5.0,90.0,6.0,7.0,8.0',
+                             '[tp5-relay-stage] epoch=57 direct=1']),
+            (1, 'guard', ['[tp5-profile] exec=143 decode=1 creplay=2/1 plan=9/0']),
+        ]
+        ledger = bench.extract_rank_stage_ledger(segments, 'full')
+        self.assertEqual(ledger['status'], 'COLLECTED')
+        self.assertEqual(ledger['lines_total'], 4)
+        self.assertEqual(ledger['lines_parsed'], 3)
+        self.assertEqual(ledger['lines_malformed'], 1)
+        self.assertEqual(ledger['counts']['relay_stage'], 2)
+        self.assertEqual(ledger['counts']['exec_summary'], 1)
+        self.assertEqual(ledger['per_request']['0']['[tp5-relay-stage]'], 2)
+        self.assertEqual(ledger['per_request']['0']['phase'], 'measured')
+        self.assertEqual(ledger['relay_stage_stats']['total_us']['max'], 80.0)
+        self.assertEqual(ledger['slowest_rank']['slowest_rank'], 1)
+        self.assertEqual(ledger['slowest_rank']['max_ready_rank_us'][1], 90.0)
+        self.assertEqual(ledger['derived']['actual_pipeline_hits']['compute_replay'], ['2/1'])
+        self.assertEqual(ledger['malformed_samples'][0]['tag'], '[tp5-relay-stage]')
+        self.assertIn('epoch=57', ledger['malformed_samples'][0]['line'])
+
+    def test_full_detail_file_written_only_when_rows_exist(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            out = Path(tmp)
+            ledger = bench.extract_rank_stage_ledger([], 'full', out)
+            self.assertEqual(ledger['status'], 'NOT_COLLECTED')
+            self.assertFalse((out / 'rank-stage.json').exists())
+            ledger = bench.extract_rank_stage_ledger(
+                [(0, 'measured', [self.RELAY_LINE])], 'full', out)
+            self.assertEqual(ledger['full_detail_file'], 'rank-stage.json')
+            detail = json.loads((out / 'rank-stage.json').read_text())
+            self.assertEqual(len(detail['relay_stage']), 1)
+            self.assertEqual(detail['relay_stage'][0]['request_idx'], 0)
+            self.assertEqual(detail['relay_stage'][0]['phase'], 'measured')
+            self.assertEqual(detail['relay_stage'][0]['ready_rank_us'][4], 56.25)
+
+    def test_audit_derives_minimum_fields_from_collected_ledger(self):
+        ledger = bench.extract_rank_stage_ledger(
+            [(0, 'measured', [self.RELAY_LINE,
+                              'info: [tp5-mtp-graph] type=3 reuse=1 ubatch_tokens=2 target_capacity=6',
+                              '[tp5-profile] exec=141 decode=1 creplay=12/3 plan=45/3'])], 'full')
+        audited = bench.audit_minimum_fields({'requests': [], 'rank_stage_ledger': ledger}, None, None)
+        self.assertEqual(audited['fields']['actual_pipeline_hits']['compute_replay'], ['12/3'])
+        self.assertEqual(audited['fields']['active_rows']['values'], [2])
+        self.assertIn('ubatch_tokens', audited['fields']['active_rows']['source'])
+        self.assertIn('no print site', audited['fields']['active_rows']['source'])
+        self.assertEqual(audited['fields']['capacity_rows']['values'], [6])
+        self.assertEqual(audited['fields']['bank_epoch'], 'NOT_COLLECTED')
+        self.assertIn('bank_epoch', audited['not_collected'])
+        self.assertNotIn('active_rows', audited['not_collected'])
+
+    def test_audit_stays_not_collected_without_collected_ledger(self):
+        audited = bench.audit_minimum_fields({'requests': []}, None, None)
+        for field in ('actual_pipeline_hits', 'active_rows', 'capacity_rows', 'bank_epoch'):
+            self.assertEqual(audited['fields'][field], 'NOT_COLLECTED')
+        ledger = bench.audit_minimum_fields(
+            {'requests': [], 'rank_stage_ledger': {'status': 'NOT_COLLECTED', 'reason': 'x'}}, None, None)
+        self.assertEqual(ledger['fields']['active_rows'], 'NOT_COLLECTED')
 
 
 if __name__ == '__main__':

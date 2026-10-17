@@ -1,0 +1,8 @@
+{
+  "frozen_utc": "2026-10-12T19:27:39Z",
+  "purpose": "V-A FORCE_ITER experiment: upfoldFix tree (entry OPEN, upfold fixes) + discriminating switch (GGML_VK_HC_BF16_FORCE_ITER=1 routes HC BF16 contractions through iter() instead of iter_aligned_nonquant)",
+  "source_tree": "/var/tmp/tp5-verify-upfold-src (git archive 3e28b121a + upfold fixes + force-iter switch)",
+  "diff_saved": "identity/quarantine-forceIter/force-iter-switch.diff",
+  "libggml_vulkan_so_sha256": "9e6f0a54cefe933937776d070bac5aa97981b5f7b6fb446a395270447f878ea3",
+  "llama_server_sha256": "ab4e9260f382dc8cc967efd78cfa6c342030b95536a6c4e4e5f7b152e71ebef0"
+}

@@ -1,0 +1,6 @@
+{
+  "frozen_utc": "2026-10-12T22:35:38Z",
+  "purpose": "GAP-1 route-fix: two guards in ggml-backend-meta.cpp (rebind-loop continue for tensors already in another stc_static + GGML_ABORT for unregistered weight tensors on lazy init path)",
+  "libggml_vulkan_so_sha256": "2d1fdb2371f3f97f7a53322ba69d7c1bc73d8e970ac73ebc5f30af545f54e240",
+  "libllama_so_sha256": "0f9ec93a13e6f66bb0c651eb7bff8e95622200ba0b091950bba8b0eb8677bd27"
+}

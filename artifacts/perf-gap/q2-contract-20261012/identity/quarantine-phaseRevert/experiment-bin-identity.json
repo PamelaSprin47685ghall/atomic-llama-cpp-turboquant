@@ -1,0 +1,15 @@
+{
+  "frozen_utc": "2026-10-12T14:53:54Z",
+  "purpose": "PHASE-REVERT experiment 2a: ubatch_execution_phase criteria reverted to pre-2379e1253 form (llama-context.h signature+body + llama-context.cpp call site); gate+fused reverts retained on tree",
+  "source_tree": "/var/tmp/tp5-clean-head-src (repo worktree untouched)",
+  "diffs": [
+    "identity/quarantine-phaseRevert/phase-revert-cpp.diff",
+    "identity/quarantine-phaseRevert/phase-revert-h.diff"
+  ],
+  "libllama_so_sha256": "426f00050a689f24626dede19de0d2d0164d54cba7f187e08353ee8420463619",
+  "libllama_so_sha256_before": "7a0907e8b0146a3fa57fe19fab862b274b9d1f120806ba51a2d1d83c7dcba7cf",
+  "libggml_vulkan_so_sha256": "b7578d0479bd5d1c338b3eb53f69f0e9600917235524696e09ba78ba3d7dd747",
+  "libggml_vulkan_so_expected_fusedRevert": "b7578d0479bd5d1c338b3eb53f69f0e9600917235524696e09ba78ba3d7dd747",
+  "llama_server_sha256": "d047c4a67f4d6c77d34ce4ea32f40ac9328133d2e5778757735a4463b4b5c542",
+  "note": "tests/test-mtp-workspace.cpp still uses the new 6-arg signature and would fail to build, but only llama-server target is built this round"
+}

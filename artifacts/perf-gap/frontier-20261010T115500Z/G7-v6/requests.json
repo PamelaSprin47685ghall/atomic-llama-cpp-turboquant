@@ -1,0 +1,56 @@
+[
+  {
+    "idx": 0,
+    "phase": "warmup",
+    "n": 185,
+    "predicted_ms": 23694.435,
+    "tps": 7.807740509533145,
+    "wall_ms": 28451.997876,
+    "finish": "stop",
+    "content_sha256": "ad42cadf56c40dd776b01727fc6923b3338b21e3f95df1e577ba89c4f8370024",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 93,
+      "prompt_ms": 4753.137,
+      "prompt_per_token_ms": 51.108999999999995,
+      "prompt_per_second": 19.566025553229373,
+      "predicted_n": 185,
+      "predicted_ms": 23694.435,
+      "predicted_per_token_ms": 128.07802702702705,
+      "predicted_per_second": 7.8077405095331445
+    },
+    "issues": [],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=3 n_sub=96 uid=36028797018967041",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=96 uid=36028797018967297",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=96 uid=36028797018967553",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=96 uid=36028797018967809",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=97 uid=36028797018968065",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=97 uid=36028797018968321",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=97 uid=36028797018968577"
+    ]
+  },
+  {
+    "idx": 1,
+    "phase": "measured",
+    "n": 185,
+    "predicted_ms": 23049.066,
+    "tps": 8.026355601567543,
+    "wall_ms": 27585.675208,
+    "finish": "stop",
+    "content_sha256": "ad42cadf56c40dd776b01727fc6923b3338b21e3f95df1e577ba89c4f8370024",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 93,
+      "prompt_ms": 3901.021,
+      "prompt_per_token_ms": 41.9464623655914,
+      "prompt_per_second": 23.839912679270373,
+      "predicted_n": 185,
+      "predicted_ms": 23049.066,
+      "predicted_per_token_ms": 124.58954594594594,
+      "predicted_per_second": 8.026355601567543
+    },
+    "issues": [],
+    "fallback_lines": []
+  }
+]

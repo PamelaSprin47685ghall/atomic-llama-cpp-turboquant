@@ -1,0 +1,36 @@
+{
+  "frozen_utc": "2026-10-12T13:07:46Z",
+  "git_head": "3e28b121a38bc425dada175e54a1cef6d5ad1f8d",
+  "git_head_note": "task brief said 79e69b7e0 but that object is a BLOB, not a commit; garbled binary was built at HEAD 3e28b121a (recorded in source-identity-latebind.json at build time); this clean build uses that same HEAD, zero dirty",
+  "source_export": "/var/tmp/tp5-clean-head-src (git archive HEAD, tracked files only, no .git)",
+  "build_dir": "/var/tmp/tp5-clean-head-build",
+  "cmake_config": "RelWithDebInfo, GGML_VULKAN=ON, BUILD_SHARED_LIBS=ON, GGML_LLAMAFILE/NATIVE/OPENMP=ON, GGML_CUDA=OFF, LLAMA_BUILD_SERVER=ON, GGML_BACKEND_DL=OFF, SPIRV-Headers_DIR=/home/kunweiz/deps/prefix/share/cmake/SPIRV-Headers",
+  "library_version_note": "clean HEAD builds libllama/libllama-common/libmtmd as 0.0.0 (HEAD version); build-perf-gap dirty build used 0.0.2194 — version injection itself is a dirty-vs-HEAD difference",
+  "files_sha256": {
+    "libggml-base.so.0.18.1": "d60bf8d1cae9693960969a30c961d36c7b611973fc064c5a2bcf5d964ee5615e",
+    "libggml-cpu.so.0.18.1": "8cb3f08acaca5030a22019a7cd89a9e6358f8eb0019a4b5b9e099ea5f21f1228",
+    "libggml-vulkan.so.0.18.1": "2e79d99e1dc52d6b787ad7227679240cf8222e5454f8a7c89b831eb5e7300991",
+    "libggml.so.0.18.1": "8e4e34d6d71a9d3dcc3471c8bc0702e2513e7aa14ff82b2e5f1e9e57cf5adfc3",
+    "libllama-common.so.0.0.0": "729d17cd93170a649f7e28380ad80883d2a51b3af510795266dac4e3f2c266e4",
+    "libllama-server-impl.so": "12d93843601b255044191fb6fa427227d60912afae0762f8966bfc79467fcb39",
+    "libllama.so.0.0.0": "7a0907e8b0146a3fa57fe19fab862b274b9d1f120806ba51a2d1d83c7dcba7cf",
+    "libmtmd.so.0.0.0": "7e56a4909642d50eb72727a029854f7ba0b5f3331f07f074754203da4865a455",
+    "llama-server": "d047c4a67f4d6c77d34ce4ea32f40ac9328133d2e5778757735a4463b4b5c542"
+  },
+  "symlinks": {
+    "libggml-base.so": "libggml-base.so.0",
+    "libggml-base.so.0": "libggml-base.so.0.18.1",
+    "libggml-cpu.so": "libggml-cpu.so.0",
+    "libggml-cpu.so.0": "libggml-cpu.so.0.18.1",
+    "libggml-vulkan.so": "libggml-vulkan.so.0",
+    "libggml-vulkan.so.0": "libggml-vulkan.so.0.18.1",
+    "libggml.so": "libggml.so.0",
+    "libggml.so.0": "libggml.so.0.18.1",
+    "libllama-common.so": "libllama-common.so.0",
+    "libllama-common.so.0": "libllama-common.so.0.0.0",
+    "libllama.so": "libllama.so.0",
+    "libllama.so.0": "libllama.so.0.0.0",
+    "libmtmd.so": "libmtmd.so.0",
+    "libmtmd.so.0": "libmtmd.so.0.0.0"
+  }
+}

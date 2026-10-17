@@ -1,0 +1,9 @@
+{
+  "frozen_utc": "2026-10-12T18:31:42Z",
+  "purpose": "ENTRY-REVERT experiment 3a: q8_projection gate restored to Q8_0-only (BF16 HC weights excluded from fused segment, fall to ordinary operator chain); tree = verify-upfold-src (contains upfold fixes, retained); upfoldFix lib was 9452b39a…",
+  "source_tree": "/var/tmp/tp5-verify-upfold-src (git archive 3e28b121a + upfold fixes + entry revert)",
+  "diff_saved": "identity/quarantine-entryRevert/entry-revert.diff",
+  "libggml_vulkan_so_sha256": "eaa94f05981413f0fb81cb9c916cd9fccac5fe4f22cee8dc33ef1d090bf9a2c6",
+  "llama_server_sha256": "ab4e9260f382dc8cc967efd78cfa6c342030b95536a6c4e4e5f7b152e71ebef0",
+  "reference_upfoldFix_vk": "9452b39a258c4a10…"
+}

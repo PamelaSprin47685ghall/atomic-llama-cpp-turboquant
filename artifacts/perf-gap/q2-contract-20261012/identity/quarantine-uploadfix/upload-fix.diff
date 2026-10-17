@@ -1,0 +1,30 @@
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index a89911262..e2aa8731b 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1669,6 +1669,25 @@ bool llama_model_loader::load_all_data(
+             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
+             if (buf_mmap && cur->data == nullptr) {
+                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
++                if (ggml_backend_buffer_is_meta(buf_mmap)) {
++                    // GAP1 upload-chain fix (r2-verdict branch D): a meta
++                    // buffer's real storage is the per-rank device buffers
++                    // behind it. ggml_backend_tensor_alloc only binds
++                    // cur->data to the host mmap address — correct for CPU
++                    // buffers (mmap direct read), but for a TP5 meta buffer
++                    // it silently bypasses the MIRRORED fan-out in
++                    // ggml_backend_meta_buffer_set_tensor, so no rank's
++                    // VkBuffer ever receives the weight bytes. Dump evidence
++                    // (r2-parity-analysis.json, 50 dumps): W_down/W_up
++                    // subbuffers exist on all 5 ranks (full BF16 size
++                    // 6553600 = 320*10240*2, adjacent offsets, distinct
++                    // per-rank handles) yet ALL ZERO at dispatch while
++                    // normalized is live; the Q8_0 twin (HC-Q8, 3c)
++                    // uploads fine because its tensors enter with
++                    // data != nullptr and take the tensor_set fan-out.
++                    // Explicitly fan the bytes out to every rank now.
++                    ggml_backend_tensor_set(cur, data, 0, n_size);
++                }
+                 if (lmlocks) {
+                     const auto & lmlock = lmlocks->at(weight->idx);
+                     lmlock->grow_to(weight->offs + n_size);

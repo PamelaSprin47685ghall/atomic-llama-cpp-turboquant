@@ -1,0 +1,21 @@
+{
+  "id": "06_code_gen",
+  "category": "code_generation_syntax",
+  "gate_level": "MUST_PASS",
+  "prompt": "请用 Python 编写一个函数 find_single_number(nums)，输入为一个非空整数列表，其中除了一个数字只出现了一次之外，其余每个数字均恰好出现两次。函数必须返回那个只出现一次的数字。要求：写出函数实现，并附带一行简短的使用示例代码。",
+  "system_prompt": "你是一个资深 Python 算法工程师。编写语法严谨、结构优雅、无任何 SyntaxError 的 Python 3 代码。",
+  "deterministic_target": {
+    "function_name": "find_single_number",
+    "expected_behavior": "Returns the element with count 1 in a list where all other elements appear twice.",
+    "test_cases": [
+      {"input": [2, 2, 1], "expected": 1},
+      {"input": [4, 1, 2, 1, 2], "expected": 4},
+      {"input": [9], "expected": 9}
+    ],
+    "ast_validation_required": true
+  },
+  "constraints": {
+    "max_tokens": 300,
+    "min_tokens": 50
+  }
+}

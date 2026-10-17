@@ -1,0 +1,6 @@
+3e28b121a Merge remote-tracking branch 'origin/master'
+0707ea187 evidence: perf-gap and TP5 run ledgers, MMVQ/MTP proof packages
+7686fbf8f docs: rewrite AGENTS.md as TP5 steelman baseline protocol; add necessity theory and evidence records
+2379e1253 feat: TP5 correctness hardening, necessity tooling, and perf-gap harness
+25ea60642 chore: remove superseded handover docs and orphaned climb runner
+646a41d36 wip

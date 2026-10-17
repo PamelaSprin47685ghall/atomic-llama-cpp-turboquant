@@ -1,0 +1,6 @@
+r14 instrumentation build (watchtrace2)
+tree: /var/tmp/tp5-verify-rebuild-src (r13 tree + r14-instrumenter 3 fixes, +136 lines)
+build: incremental cmake, BUILD_EXIT=0
+3261fc4545f61553a6a009777bb882dca0df8b334ace12047dd4345cb9ab0fbb  /var/tmp/tp5-verify-rebuild-build/bin/libggml-vulkan.so.0.18.1
+dacb1336530997e94f55f272a0b144763e5cfbc42af50417851f30a5dc9f3cc2  /var/tmp/tp5-verify-rebuild-build/bin/llama-server
+fixes: (1) W2DA self-write skip (same buf+off+size) + graph-start time gate g_gap1_graph_started; (2) DISPATCH oversized binding >64MiB filter (g_gap1_dispatch_oversized, first 8 SKIP lines); (3) bisect 3-probe P1=output_hc(40960) P2=blk.47.hc_ffn(61012480) P3=blk.0.hc_attn(100597760)

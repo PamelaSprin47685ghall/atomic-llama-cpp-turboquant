@@ -1,0 +1,120 @@
+{
+  "guard_set_version": "v2-guard-1",
+  "contract_ref": "../contract/contract-id.json",
+  "contract_version": "v2",
+  "path_basis": "file paths are relative to this manifest's directory",
+  "created_utc_date": "2026-10-12",
+  "freeze_status": "FROZEN_BY_DEVOPS",
+  "freeze_note": "sha256 由 DevOps 在正式冻结时计算并登记；起草阶段不预写哈希值。char_count 为起草时手工统计，冻结时应以实际文件复核。",
+  "neutral_system_prompt": "neutral-system.txt",
+  "char_count_basis": "UTF-16 code units（内容均为 BMP 字符，与码点数一致），含文件末尾换行。",
+  "question_count": 10,
+  "questions": [
+    {
+      "id": "guard-01",
+      "file": "guard-01.txt",
+      "quality_criteria": "guard-01-quality.md",
+      "category": "zh-qa",
+      "language": "zh",
+      "expected_length": "medium",
+      "char_count": 41,
+      "sha256": "e0572bfbcf03e08a65654fa230b4491d3e07bd7bf2d02e7dd9ba7556251fa6ec"
+    },
+    {
+      "id": "guard-02",
+      "file": "guard-02.txt",
+      "quality_criteria": "guard-02-quality.md",
+      "category": "zh-qa",
+      "language": "zh",
+      "expected_length": "medium",
+      "char_count": 46,
+      "sha256": "a320564c1d5368a6c93ca4db0c6156870a36268bd6f902f9ee9e11aec189560c"
+    },
+    {
+      "id": "guard-03",
+      "file": "guard-03.txt",
+      "quality_criteria": "guard-03-quality.md",
+      "category": "en-qa",
+      "language": "en",
+      "expected_length": "medium",
+      "char_count": 140,
+      "sha256": "7b5108910977c4bfb4396df88f8c283cad8406aae7e12197ccd23bdc0553bc29"
+    },
+    {
+      "id": "guard-04",
+      "file": "guard-04.txt",
+      "quality_criteria": "guard-04-quality.md",
+      "category": "en-qa",
+      "language": "en",
+      "expected_length": "short",
+      "char_count": 50,
+      "sha256": "cbbf2d5f81619102502ba6833f980ad254c63c2ba513fd9473975c0d55d83d5c"
+    },
+    {
+      "id": "guard-05",
+      "file": "guard-05.txt",
+      "quality_criteria": "guard-05-quality.md",
+      "category": "short-answer",
+      "language": "zh",
+      "expected_length": "short",
+      "char_count": 26,
+      "sha256": "2084fa97063571c201a2d38bb9fc6f74e8861d0a414ead0976c377f2410b50b1"
+    },
+    {
+      "id": "guard-06",
+      "file": "guard-06.txt",
+      "quality_criteria": "guard-06-quality.md",
+      "category": "code",
+      "language": "zh",
+      "expected_length": "long",
+      "char_count": 82,
+      "sha256": "6e5e1e04584670a5140418fa43785fa52af9297de4ca5ca8d93d3774dd91aada"
+    },
+    {
+      "id": "guard-07",
+      "file": "guard-07.txt",
+      "quality_criteria": "guard-07-quality.md",
+      "category": "algorithm-explanation",
+      "language": "zh",
+      "expected_length": "medium",
+      "char_count": 58,
+      "sha256": "5206333f3214e096f64e6e2bb9382bce37da99752a4581c28ace9f768dce31a6"
+    },
+    {
+      "id": "guard-08",
+      "file": "guard-08.txt",
+      "quality_criteria": "guard-08-quality.md",
+      "category": "arithmetic",
+      "language": "zh",
+      "expected_length": "short",
+      "char_count": 83,
+      "sha256": "93e3cbc26eb022b08a64e377973e99bb53d0fc679ae13458e3cad08741ac399f"
+    },
+    {
+      "id": "guard-09",
+      "file": "guard-09.txt",
+      "quality_criteria": "guard-09-quality.md",
+      "category": "logic",
+      "language": "zh",
+      "expected_length": "medium",
+      "char_count": 91,
+      "sha256": "99421b65c7a048a27b2de60071d81df8f651f65dd85d5d12f14ecf0e5a10028a"
+    },
+    {
+      "id": "guard-10",
+      "file": "guard-10.txt",
+      "quality_criteria": "guard-10-quality.md",
+      "category": "context-comprehension",
+      "language": "zh",
+      "expected_length": "short",
+      "char_count": 197,
+      "sha256": "02958df93eea41f02d22efd398e867fe0294a4a4172dbc651de9cf7a5c1d7c41"
+    }
+  ],
+  "not_covered_categories": [
+    "cross-request-state",
+    "exception-recovery"
+  ],
+  "not_covered_note": "runner 尚无请求序列编排与故障注入机制；规格见 README.md future-work 节。",
+  "frozen_utc": "2026-10-12T15:58:26Z"
+}

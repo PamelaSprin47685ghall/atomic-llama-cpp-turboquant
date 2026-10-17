@@ -1,0 +1,64 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文回答普通成年人如何健康减重。回答包含四个部分，每部分标题单独一行：\n一、热量缺口原理（一句话）\n二、饮食建议（两条，每条一句话）\n三、每周运动安排（给出周一、周三、周五的安排）\n四、睡眠与常见误区（两句话）\n语言自然，正常结束。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "一、热量缺口原理\n减重的核心在于确保每日摄入的总热量低于身体消耗的总热量。\n\n二、饮食建议\n优先选择富含蛋白质和膳食纤维的天然食物，以增强饱腹感并稳定血糖。\n减少精制糖和深加工食品的摄入，避免因高热量密度导致的过量进食。\n\n三、每周运动安排\n周一进行30分钟中等强度的有氧运动，如快走或慢跑，以提升心肺功能。\n周三进行力量训练，重点锻炼大肌群，以维持肌肉量并提高基础代谢率。\n周五进行柔韧性训练或低强度活动，如瑜伽或拉伸，帮助身体恢复并缓解压力。\n\n四、睡眠与常见误区\n保证每晚7至8小时的高质量睡眠，因为睡眠不足会扰乱激素水平并增加食欲。\n避免盲目追求快速减重或极端节食，这往往导致肌肉流失和代谢下降，难以长期维持。"
+        }
+      }
+    ],
+    "created": 1791639788,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b2194-3e28b121a",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 190,
+      "prompt_tokens": 93,
+      "total_tokens": 283,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-HSSTGiiKd4CLxir44UI0xbC7DNYc715s",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 93,
+      "prompt_ms": 3131.547,
+      "prompt_per_token_ms": 33.672548387096775,
+      "prompt_per_second": 29.69778195888486,
+      "predicted_n": 190,
+      "predicted_ms": 3331.907,
+      "predicted_per_token_ms": 17.536352631578946,
+      "predicted_per_second": 57.0244007410771,
+      "draft_n": 104,
+      "draft_n_accepted": 85
+    }
+  },
+  "wall_ms": 6467.816,
+  "log_begin": 71761,
+  "log_end": 107006,
+  "phase": "measured"
+}

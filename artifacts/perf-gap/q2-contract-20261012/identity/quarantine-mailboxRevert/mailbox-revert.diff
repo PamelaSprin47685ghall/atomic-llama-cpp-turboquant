@@ -1,0 +1,29 @@
+--- artifacts/perf-gap/q2-contract-20261012/identity/quarantine-mailboxRevert/collective.cpp.pre-mailbox.bak	2026-10-12 16:39:13.085120460 +0000
++++ /var/tmp/tp5-clean-head-src/ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp	2026-10-12 16:39:36.864511620 +0000
+@@ -7829,8 +7829,13 @@
+         for (size_t s = 0; s <= n_stages; ++s) {
+             const auto &      graph      = *linear->graphs[s * c.n_ranks + r];
+             tp5_cached_plan * outgoing   = s < n_stages ? &c.cached_plans[c.chain_plan_indices[s]] : nullptr;
+-            const size_t      stage_bank = (start_bank + s) % TP5_MAILBOX_BANKS;
+-            const size_t      slot       = tp5_plan_slot(r, stage_bank);
++            // MAILBOX-REVERT (experiment 2b): pre-2379e1253 addressing restored —
++            // slot authority is the execution-time allreduce_calls count, not the
++            // recorded start_bank parameter (mathematically equivalent when
++            // TP5_MAILBOX_BANKS==2 and start_bank==tp5_mailbox_bank(ac+1); this
++            // experiment tests for any overlooked caller/edge divergence).
++            const uint64_t    epoch      = c.allreduce_calls + s + 1;
++            const size_t      slot       = tp5_plan_slot(r, tp5_mailbox_bank(epoch));
+             const bool        late_out   = outgoing && outgoing->key.late[r].late_rank != 0;
+             const bool        direct_out = outgoing && tp5_relay_direct_stage(outgoing->key, c.n_ranks);
+             if (late_out && outgoing->numerical_mode == tp5_numerical_mode::P1A_NOSIDECAR_Q8) {
+@@ -7847,8 +7852,8 @@
+             timestamp(5 * s);
+             if (s > 0) {
+                 auto &       incoming  = c.cached_plans[c.chain_plan_indices[s - 1]];
+-                const size_t prev_bank = (start_bank + s - 1) % TP5_MAILBOX_BANKS;
+-                const size_t prev_slot = tp5_plan_slot(r, prev_bank);
++                // MAILBOX-REVERT (experiment 2b): pre-2379e1253 prev-stage addressing.
++                const size_t prev_slot = tp5_plan_slot(r, tp5_mailbox_bank(epoch - 1));
+                 if (incoming.p2_definitions.size() <= prev_slot) {
+                     c.fail("missing inline P2 definition");
+                     return false;

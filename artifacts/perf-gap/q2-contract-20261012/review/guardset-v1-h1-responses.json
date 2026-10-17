@@ -1,0 +1,160 @@
+{
+  "h1_responses": {
+    "01": {
+      "category": "zh_natural_science",
+      "n_tokens": 235,
+      "finish_reason": "stop",
+      "content": "天空颜色的变化主要源于阳光与大气中微小颗粒的相互作用，我们可以用以下两点通俗地解释：\n\n**1. 白天：蓝光更容易被“散射”到四面八方**\n阳光包含所有颜色的光（红、橙、黄、绿、蓝、紫等）。当阳光进入大气层时，会撞击空气中的微小分子。根据物理学中的“瑞利散射”原理，波长较短的光（如蓝色和紫色）比波长较长的光（如红色和黄色）更容易被这些微小分子向各个方向散射。因此，当我们抬头看天空时，看到的是被散射到各个方向的蓝光，所以天空呈现蓝色。\n\n**2. 日落时：蓝光被“过滤”掉，红光穿透大气层**\n日落时，太阳位于地平线附近，阳光穿过大气层的路径比正午时更长。在这漫长的路径中，波长较短的蓝光和紫光在到达我们的眼睛之前，已经被大气层中的分子和尘埃散射掉或吸收掉了。而波长较长的红光和橙光穿透能力更强，能够穿过厚厚的大气层直达我们的眼睛，因此日落时天空呈现红色或橙色。",
+      "content_sha256": "87bd059977f174143ed5d54f41b43389ad361a0c1871f039d0af81fac56d6365",
+      "fallback": [
+        []
+      ],
+      "runner_status": "MEASURED_NOT_QUALIFIED",
+      "mechanical_gate": "PASS",
+      "raw_body_path": "artifacts/perf-gap/q2-contract-20261012/arms/guardset-v1-h1/guard-01/request-1.json"
+    },
+    "02": {
+      "category": "en_natural_general",
+      "n_tokens": 452,
+      "finish_reason": "stop",
+      "content": "The fundamental difference between renewable and non-renewable energy sources lies in their **availability and replenishment rate**.\n\n### 1. Renewable Energy Sources\n**Definition:** Renewable energy is derived from natural processes that are replenished at a faster rate than they are consumed. These sources are sustainable and generally have a lower environmental impact, particularly regarding greenhouse gas emissions.\n\n**Practical Examples:**\n*   **Solar Energy:** This harnesses sunlight using photovoltaic cells (solar panels) to convert light directly into electricity. It is abundant, clean, and can be deployed on rooftops or in large solar farms.\n*   **Wind Energy:** This uses wind turbines to capture the kinetic energy of moving air and convert it into electrical power. Wind farms are often located in coastal areas or open plains where wind speeds are consistent.\n\n### 2. Non-Renewable Energy Sources\n**Definition:** Non-renewable energy comes from finite resources that take millions of years to form and cannot be replaced within a human timeframe. Once extracted and used, these resources are depleted. They often involve combustion, which releases carbon dioxide and other pollutants.\n\n**Practical Examples:**\n*   **Coal:** A fossil fuel formed from ancient plant matter. It is burned in power plants to generate electricity. While it is currently a major source of global energy, it is highly polluting and contributes significantly to climate change.\n*   **Natural Gas:** A fossil fuel primarily composed of methane. It is used for heating homes, generating electricity, and as a fuel for vehicles. Although it burns cleaner than coal, it is still a finite resource and releases greenhouse gases when extracted and burned.\n\n### Key Comparison Summary\n\n| Feature | Renewable | Non-Renewable |\n| :--- | :--- | :--- |\n| **Source** | Sun, wind, water, geothermal heat | Fossil fuels (coal, oil, gas), nuclear fuel |\n| **Replenishment** | Naturally replenished quickly | Takes millions of years to form |\n| **Environmental Impact** | Low carbon emissions | High carbon emissions & pollution |\n| **Sustainability** | Sustainable long-term | Finite and depleting |",
+      "content_sha256": "710f55c6b63384eb940d14394763eb5700d469e592d0201cb7aad1e4bdf79229",
+      "fallback": [
+        []
+      ],
+      "runner_status": "MEASURED_NOT_QUALIFIED",
+      "mechanical_gate": "PASS",
+      "raw_body_path": "artifacts/perf-gap/q2-contract-20261012/arms/guardset-v1-h1/guard-02-maxtok500/request-1.json"
+    },
+    "03": {
+      "category": "zh_short_fact",
+      "n_tokens": 21,
+      "finish_reason": "stop",
+      "content": "“纸上谈兵”源自战国时期的长平之战，涉及的赵国将领是赵括。",
+      "content_sha256": "64f2e78c3261a1eafa0e2bdfeb8a0e5f6d00b347103bf5233e42ae66d418631b",
+      "fallback": [
+        []
+      ],
+      "runner_status": "MEASURED_NOT_QUALIFIED",
+      "mechanical_gate": "PASS",
+      "raw_body_path": "artifacts/perf-gap/q2-contract-20261012/arms/guardset-v1-h1/guard-03/request-1.json"
+    },
+    "04": {
+      "category": "en_long_writing",
+      "n_tokens": 185,
+      "finish_reason": "stop",
+      "content": "Building a consistent reading habit starts with choosing books that genuinely excite you, not just what you think you \"should\" read. Start small: aim for 15 minutes daily, perhaps during your morning coffee or before bed. Consistency matters more than volume.\n\nTo stay engaged, practice active note-taking. Keep a small journal or digital app to jot down key insights, quotes, or questions. This transforms passive consumption into active learning, deepening your understanding and retention.\n\nFor long-term motivation, track your progress visually. Use a simple calendar to mark each day you read. Celebrate small milestones, like finishing a chapter or a book. Remember, it’s okay to miss a day; just restart the next. The goal is to make reading a natural, enjoyable part of your routine, not a chore. Over time, this small daily practice will compound into a profound shift in your knowledge and perspective.",
+      "content_sha256": "af002ed92547ea344d0f61c5e06cc8b6c48e30aa14553dfc65f021a020558a9c",
+      "fallback": [
+        []
+      ],
+      "runner_status": "MEASURED_NOT_QUALIFIED",
+      "mechanical_gate": "PASS",
+      "raw_body_path": "artifacts/perf-gap/q2-contract-20261012/arms/guardset-v1-h1/guard-04/request-1.json"
+    },
+    "05": {
+      "category": "math_multi_step_logic",
+      "n_tokens": 908,
+      "finish_reason": "stop",
+      "content": "这是一个典型的日历与算术结合的问题。我们需要确定该月中哪些日期是周一、周三、周五和周六，然后计算对应的跑步距离。\n\n### 1. 确定该月的日期与星期对应关系\n\n已知：\n- 该月共有 **30 天**。\n- **1 号是周日**。\n\n我们可以推导该月所有日期的星期：\n\n| 日期 | 星期 | 备注 |\n| :--- | :--- | :--- |\n| 1 | 周日 | 休息 |\n| 2 | 周一 | **跑步 5 km** |\n| 3 | 周二 | 休息 |\n| 4 | 周三 | **跑步 5 km** |\n| 5 | 周四 | 休息 |\n| 6 | 周五 | **跑步 5 km** |\n| 7 | 周六 | **跑步 10 km** |\n| 8 | 周日 | 休息 |\n| 9 | 周一 | **跑步 5 km** |\n| 10 | 周二 | 休息 |\n| 11 | 周三 | **跑步 5 km** |\n| 12 | 周四 | 休息 |\n| 13 | 周五 | **跑步 5 km** |\n| 14 | 周六 | **跑步 10 km** |\n| 15 | 周日 | 休息 |\n| 16 | 周一 | **跑步 5 km** |\n| 17 | 周二 | 休息 |\n| 18 | 周三 | **跑步 5 km** |\n| 19 | 周四 | 休息 |\n| 20 | 周五 | **跑步 5 km** |\n| 21 | 周六 | **跑步 10 km** |\n| 22 | 周日 | 休息 |\n| 23 | 周一 | **跑步 5 km** |\n| 24 | 周二 | 休息 |\n| 25 | 周三 | **跑步 5 km** |\n| 26 | 周四 | 休息 |\n| 27 | 周五 | **跑步 5 km** |\n| 28 | 周六 | **跑步 10 km** |\n| 29 | 周日 | 休息 |\n| 30 | 周一 | **跑步 5 km** |\n\n### 2. 统计各类型跑步次数\n\n根据上表，我们可以统计出该月中各星期出现的次数：\n\n- **周一**：2, 9, 16, 23, 30 → 共 **5 次**\n- **周三**：4, 11, 18, 25 → 共 **4 次**\n- **周五**：6, 13, 20, 27 → 共 **4 次**\n- **周六**：7, 14, 21, 28 → 共 **4 次**\n\n### 3. 计算总公里数\n\n根据小李的跑步规则：\n- 周一、周三、周五：每次 5 公里\n- 周六：每次 10 公里\n\n计算如下：\n\n1. **周一跑步距离**：\n   $5 \\text{ 次} \\times 5 \\text{ km} = 25 \\text{ km}$\n\n2. **周三跑步距离**：\n   $4 \\text{ 次} \\times 5 \\text{ km} = 20 \\text{ km}$\n\n3. **周五跑步距离**：\n   $4 \\text{ 次} \\times 5 \\text{ km} = 20 \\text{ km}$\n\n4. **周六跑步距离**：\n   $4 \\text{ 次} \\times 10 \\text{ km} = 40 \\text{ km}$\n\n**总计**：\n$$25 + 20 + 20 + 40 = 105 \\text{ km}$$\n\n### 结论\n\n小李在这个月一共跑步了 **105** 公里。",
+      "content_sha256": "fa2d76f953995c8f913094945ff4c08374d28671a3c7bfb0212555f11865be26",
+      "fallback": [
+        []
+      ],
+      "runner_status": "MEASURED_NOT_QUALIFIED",
+      "mechanical_gate": "PASS",
+      "raw_body_path": "artifacts/perf-gap/q2-contract-20261012/arms/guardset-v1-h1/guard-05-ctx2048/request-1.json"
+    },
+    "06": {
+      "category": "code_generation_syntax",
+      "n_tokens": 128,
+      "finish_reason": "stop",
+      "content": "```python\ndef find_single_number(nums):\n    \"\"\"\n    Find the single number that appears exactly once in a list where\n    all other numbers appear exactly twice.\n    \n    Uses XOR operation: a ^ a = 0, so all paired numbers cancel out,\n    leaving only the single number.\n    \"\"\"\n    result = 0\n    for num in nums:\n        result ^= num\n    return result\n\n\n# Example usage\nprint(find_single_number([2, 3, 2, 4, 4, 3, 5]))  # Output: 5\n```",
+      "content_sha256": "7afe931f736e4ed6c1c7aa484940e0266d55d257c5667670cc3cab14da83bc58",
+      "fallback": [
+        []
+      ],
+      "runner_status": "MEASURED_NOT_QUALIFIED",
+      "mechanical_gate": "PASS",
+      "raw_body_path": "artifacts/perf-gap/q2-contract-20261012/arms/guardset-v1-h1/guard-06/request-1.json"
+    },
+    "07": {
+      "category": "context_dependency_multi_turn",
+      "n_tokens": 51,
+      "finish_reason": "stop",
+      "content": "灵隐寺\n\n注意事项：\n1. 建议提前通过官方渠道预约门票，避免现场排队或因限流无法进入。\n2. 游览时穿着舒适的鞋子，因为景区内步行较多，且部分区域台阶较多。",
+      "content_sha256": "a968e547a6903398e76626d68be5d11b43ee80fe0fe82d45b3f8b306cbca9121",
+      "fallback": [
+        []
+      ],
+      "runner_status": "MEASURED_NOT_QUALIFIED",
+      "mechanical_gate": "PASS",
+      "raw_body_path": "artifacts/perf-gap/q2-contract-20261012/arms/guardset-v1-h1/guard-07/request-1.json"
+    },
+    "08": {
+      "category": "state_safety_cross_request",
+      "mode": "isolation-protocol",
+      "request_a": {
+        "n": 3,
+        "finish": "stop",
+        "content": "已记下"
+      },
+      "request_b": {
+        "n": 5,
+        "finish": "stop",
+        "content": "未接收到任何口令"
+      },
+      "leak_check": {
+        "琥珀-8839": false,
+        "8839": false
+      },
+      "server_exit": {
+        "returncode": 0,
+        "forced": false
+      },
+      "mechanical_gate": "PASS"
+    },
+    "09": {
+      "category": "state_safety_abort_recovery",
+      "mode": "abort-protocol",
+      "abort_phase": {
+        "aborted_after_first_token": true
+      },
+      "follow_up": {
+        "n": 21,
+        "finish": "stop",
+        "content": "秋天是气温转凉、树叶变黄或落叶、果实成熟并带来丰收喜悦的季节。"
+      },
+      "server_exit": {
+        "returncode": 0,
+        "forced": false
+      },
+      "mechanical_gate": "PASS"
+    }
+  },
+  "h0_parity_check": {
+    "01": {
+      "h0_n": 235,
+      "h0_finish": "stop",
+      "h1_h0_identical": true,
+      "h0_content_sha256": "87bd059977f174143ed5d54f41b43389ad361a0c1871f039d0af81fac56d6365"
+    },
+    "05": {
+      "h0_n": 908,
+      "h0_finish": "stop",
+      "h1_h0_identical": true,
+      "h0_content_sha256": "fa2d76f953995c8f913094945ff4c08374d28671a3c7bfb0212555f11865be26"
+    },
+    "09": {
+      "h0_follow_up_content": "秋天是气温转凉、树叶变黄或落叶、果实成熟并带来丰收喜悦的季节。",
+      "h1_h0_identical": true,
+      "note": "abort-phase follow-up response comparison"
+    }
+  },
+  "notes": [
+    "guard-02: original constraints max_tokens=300 truncated (finish=length); re-run at 500 -> natural stop n=452; original failure dir retained",
+    "guard-05: constraints max_tokens=300 truncated; 500 and 800 also truncated (ctx=1024 cannot fit table-style full answer); re-run at ctx=2048/max_tokens=1000 -> natural stop n=908 with final answer 105 km matching deterministic_target",
+    "guard-07: multi-turn dialogue flattened into single-turn prompt with full history (adaptation recorded)",
+    "guard-08/09: runner single-prompt mode cannot express the protocols; custom script with identical server argv/env used (GPU lock via flock)"
+  ]
+}

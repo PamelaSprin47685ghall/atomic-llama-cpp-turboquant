@@ -4175,6 +4175,17 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
     num_spec.bf16_late_weights = late_plan && !trefs.empty() &&
         trefs[0].late.down_weight.size ==
             uint64_t(trefs[0].late.late_rank) * trefs[0].late.streams * trefs[0].late.width * 2u;
+    // Workorder A: fail closed on BF16 late weights + LB2/RHO. The rho-mode Q
+    // dispatch binds late_q_stats_pipe (Q8_0 block parsing) and the LO_U
+    // consumer reads packed Q8 blocks, so BF16 weights would be mis-parsed
+    // into silent numerical garbage. Refusing the plan keeps the failure
+    // observable instead of hidden; a BF16 LB2 variant is a separate
+    // workorder.
+    if (num_spec.bf16_late_weights && tp5_latebind_rho_enabled()) {
+        c.fail("BF16 late weights (original Q2_0) do not support GGML_TP5_LATEBIND_RHO (LB2): "
+               "the Q-stats and LO_U kernels parse Q8_0 blocks");
+        return false;
+    }
     num_spec.hw_int_dot           = true;
     num_spec.hw_wave32            = true;
     num_spec.shape_aligned        = true;
@@ -11089,7 +11100,8 @@ bool ggml_backend_vk_tp5_prepare_graph(void * comm, size_t rank, ggml_cgraph * g
         c->fail("GGML_TP5_LATEBIND_FUSED_FINALIZE is incompatible with independent y/Q generations; unset it");
         return false;
     }
-    const bool latebind_capture = tp5_latebind_hc_enabled() && define_program && stage > 0;
+    const bool late_rows_supported = !predefined_definition || (predefined_active <= VK_TP5_DIRECT_COLUMN_TILE);
+    const bool latebind_capture = tp5_latebind_hc_enabled() && define_program && stage > 0 && late_rows_supported;
     ggml_vk_tp5_set_latebind_capture(c->backends[rank], graph, latebind_capture, define_program, stage);
     // Producer-local wire and direct-host transport are separate optimizations:
     //  * F16 may profit from producing a device-local F16 companion, then P1

@@ -1,0 +1,17 @@
+{
+  "id": "02_en_general",
+  "category": "en_natural_general",
+  "gate_level": "MUST_PASS",
+  "prompt": "Explain the difference between renewable and non-renewable energy sources, giving two practical examples for each.",
+  "system_prompt": "You are a helpful and knowledgeable science assistant. Provide clear definitions and accurate examples.",
+  "expected_aspects": [
+    "Definition of renewable energy (replenished naturally on a human timescale / infinite availability)",
+    "Definition of non-renewable energy (finite resource, depleted by use, takes millions of years to form)",
+    "At least 2 valid renewable examples (e.g. solar, wind, hydro, geothermal)",
+    "At least 2 valid non-renewable examples (e.g. coal, oil/petroleum, natural gas, uranium)"
+  ],
+  "constraints": {
+    "max_tokens": 300,
+    "min_tokens": 100
+  }
+}

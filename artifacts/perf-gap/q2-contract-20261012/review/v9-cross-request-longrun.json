@@ -1,0 +1,220 @@
+{
+  "design": "single h1 process, 20 sequential requests: main x6 -> guard-01 x3 -> guard-03 x3 -> guard-06 x3 -> guard-07 x2 -> main x3 (tail repetition probes late-sequence state drift); each guard question uses identical prompt/system/max_tokens as V8 independent-process run for byte-comparable baselines",
+  "server_pid": 521174,
+  "server_exit": {
+    "returncode": 0,
+    "forced": false
+  },
+  "requests": [
+    {
+      "seq": 1,
+      "question": "main",
+      "n_tokens": 160,
+      "finish_reason": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "matches_baseline": true,
+      "baseline": "c2d7bdd3… (main contract)",
+      "elapsed_ms": 8368.8
+    },
+    {
+      "seq": 2,
+      "question": "main",
+      "n_tokens": 160,
+      "finish_reason": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "matches_baseline": true,
+      "baseline": "c2d7bdd3… (main contract)",
+      "elapsed_ms": 6888.6
+    },
+    {
+      "seq": 3,
+      "question": "main",
+      "n_tokens": 160,
+      "finish_reason": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "matches_baseline": true,
+      "baseline": "c2d7bdd3… (main contract)",
+      "elapsed_ms": 6251.3
+    },
+    {
+      "seq": 4,
+      "question": "main",
+      "n_tokens": 160,
+      "finish_reason": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "matches_baseline": true,
+      "baseline": "c2d7bdd3… (main contract)",
+      "elapsed_ms": 6252.7
+    },
+    {
+      "seq": 5,
+      "question": "main",
+      "n_tokens": 160,
+      "finish_reason": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "matches_baseline": true,
+      "baseline": "c2d7bdd3… (main contract)",
+      "elapsed_ms": 6298.4
+    },
+    {
+      "seq": 6,
+      "question": "main",
+      "n_tokens": 160,
+      "finish_reason": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "matches_baseline": true,
+      "baseline": "c2d7bdd3… (main contract)",
+      "elapsed_ms": 6275.7
+    },
+    {
+      "seq": 7,
+      "question": "guard-01",
+      "n_tokens": 235,
+      "finish_reason": "stop",
+      "content_sha256": "87bd059977f174143ed5d54f41b43389ad361a0c1871f039d0af81fac56d6365",
+      "matches_baseline": true,
+      "baseline": "87bd059977f17414…",
+      "elapsed_ms": 8361.5
+    },
+    {
+      "seq": 8,
+      "question": "guard-01",
+      "n_tokens": 235,
+      "finish_reason": "stop",
+      "content_sha256": "87bd059977f174143ed5d54f41b43389ad361a0c1871f039d0af81fac56d6365",
+      "matches_baseline": true,
+      "baseline": "87bd059977f17414…",
+      "elapsed_ms": 7839.1
+    },
+    {
+      "seq": 9,
+      "question": "guard-01",
+      "n_tokens": 235,
+      "finish_reason": "stop",
+      "content_sha256": "87bd059977f174143ed5d54f41b43389ad361a0c1871f039d0af81fac56d6365",
+      "matches_baseline": true,
+      "baseline": "87bd059977f17414…",
+      "elapsed_ms": 7101.8
+    },
+    {
+      "seq": 10,
+      "question": "guard-03",
+      "n_tokens": 21,
+      "finish_reason": "stop",
+      "content_sha256": "64f2e78c3261a1eafa0e2bdfeb8a0e5f6d00b347103bf5233e42ae66d418631b",
+      "matches_baseline": true,
+      "baseline": "64f2e78c3261a1ea…",
+      "elapsed_ms": 5336.5
+    },
+    {
+      "seq": 11,
+      "question": "guard-03",
+      "n_tokens": 21,
+      "finish_reason": "stop",
+      "content_sha256": "64f2e78c3261a1eafa0e2bdfeb8a0e5f6d00b347103bf5233e42ae66d418631b",
+      "matches_baseline": true,
+      "baseline": "64f2e78c3261a1ea…",
+      "elapsed_ms": 3413.8
+    },
+    {
+      "seq": 12,
+      "question": "guard-03",
+      "n_tokens": 21,
+      "finish_reason": "stop",
+      "content_sha256": "64f2e78c3261a1eafa0e2bdfeb8a0e5f6d00b347103bf5233e42ae66d418631b",
+      "matches_baseline": true,
+      "baseline": "64f2e78c3261a1ea…",
+      "elapsed_ms": 3468.0
+    },
+    {
+      "seq": 13,
+      "question": "guard-06",
+      "n_tokens": 128,
+      "finish_reason": "stop",
+      "content_sha256": "7afe931f736e4ed6c1c7aa484940e0266d55d257c5667670cc3cab14da83bc58",
+      "matches_baseline": true,
+      "baseline": "7afe931f736e4ed6…",
+      "elapsed_ms": 6865.8
+    },
+    {
+      "seq": 14,
+      "question": "guard-06",
+      "n_tokens": 128,
+      "finish_reason": "stop",
+      "content_sha256": "7afe931f736e4ed6c1c7aa484940e0266d55d257c5667670cc3cab14da83bc58",
+      "matches_baseline": true,
+      "baseline": "7afe931f736e4ed6…",
+      "elapsed_ms": 6040.2
+    },
+    {
+      "seq": 15,
+      "question": "guard-06",
+      "n_tokens": 128,
+      "finish_reason": "stop",
+      "content_sha256": "7afe931f736e4ed6c1c7aa484940e0266d55d257c5667670cc3cab14da83bc58",
+      "matches_baseline": true,
+      "baseline": "7afe931f736e4ed6…",
+      "elapsed_ms": 5406.3
+    },
+    {
+      "seq": 16,
+      "question": "guard-07",
+      "n_tokens": 51,
+      "finish_reason": "stop",
+      "content_sha256": "a968e547a6903398e76626d68be5d11b43ee80fe0fe82d45b3f8b306cbca9121",
+      "matches_baseline": true,
+      "baseline": "a968e547a6903398…",
+      "elapsed_ms": 5425.3
+    },
+    {
+      "seq": 17,
+      "question": "guard-07",
+      "n_tokens": 51,
+      "finish_reason": "stop",
+      "content_sha256": "a968e547a6903398e76626d68be5d11b43ee80fe0fe82d45b3f8b306cbca9121",
+      "matches_baseline": true,
+      "baseline": "a968e547a6903398…",
+      "elapsed_ms": 4460.3
+    },
+    {
+      "seq": 18,
+      "question": "main",
+      "n_tokens": 160,
+      "finish_reason": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "matches_baseline": true,
+      "baseline": "c2d7bdd3… (main contract)",
+      "elapsed_ms": 7389.2
+    },
+    {
+      "seq": 19,
+      "question": "main",
+      "n_tokens": 160,
+      "finish_reason": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "matches_baseline": true,
+      "baseline": "c2d7bdd3… (main contract)",
+      "elapsed_ms": 7103.8
+    },
+    {
+      "seq": 20,
+      "question": "main",
+      "n_tokens": 160,
+      "finish_reason": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "matches_baseline": true,
+      "baseline": "c2d7bdd3… (main contract)",
+      "elapsed_ms": 6505.5
+    }
+  ],
+  "verdict": {
+    "all_20_match_baseline": true,
+    "all_natural_stop": true,
+    "process_clean_exit": true,
+    "V9_PASS": true
+  },
+  "baselines": {
+    "main": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+    "guard-01/03/06/07": "from review/guardset-v1-h1-responses.json (V8 independent-process hashes)"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "frozen_utc": "2026-10-13T00:06:18Z",
+  "purpose": "GAP-1 write/read chain trace: [GAP1-W] set_tensor + [GAP1-R] subbuffer, BF16 only",
+  "libggml_vulkan_so_sha256": "c2454e39f7c559a31f9cb70c0bb37435eb279833f71e07513a6b177edacbc0cb"
+}

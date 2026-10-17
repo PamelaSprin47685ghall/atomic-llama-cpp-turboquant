@@ -1,0 +1,118 @@
+{
+  "argv": [
+    "/var/tmp/tp5-verify-rebuild-build/bin/llama-server",
+    "-m",
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "-dev",
+    "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+    "--split-mode",
+    "tensor",
+    "--fit",
+    "off",
+    "-ngl",
+    "999",
+    "-c",
+    "1024",
+    "-b",
+    "32",
+    "-ub",
+    "32",
+    "--no-mmap",
+    "--no-host",
+    "-np",
+    "1",
+    "-t",
+    "22",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18765",
+    "--tp5",
+    "qwen4exp-af",
+    "--tp5-latebind",
+    "off",
+    "--spec-type",
+    "none"
+  ],
+  "env": {
+    "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.bun/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.bun/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+    "HOME": "/home/kunweiz",
+    "LANG": "en_US.UTF-8",
+    "LD_LIBRARY_PATH": "/var/tmp/tp5-verify-rebuild-build/bin",
+    "RADV_DEBUG": "nobolist",
+    "GGML_VK_DISABLE_MMVQ": "1",
+    "GGML_VK_FORCE_MMVQ": "0",
+    "GGML_VK_CMD_REPLAY": "0",
+    "GGML_VK_HC_DUMP_SITES": "2"
+  },
+  "bin_sha256": "dacb1336530997e94f55f272a0b144763e5cfbc42af50417851f30a5dc9f3cc2",
+  "harness_sha256": "35debc7e30ccad5af7934eee06d613518cdb507a23607228f0101eb588fe1759",
+  "model_stat_identity": {
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf": {
+      "bytes": 37623740192,
+      "mtime_ns": 1791450959705249368,
+      "inode": 5680149
+    },
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf": {
+      "bytes": 28800138432,
+      "mtime_ns": 1791452761519136250,
+      "inode": 5680221
+    }
+  },
+  "draft_stat_identity": {
+    "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf": {
+      "bytes": 2790341728,
+      "mtime_ns": 1789318733863246483,
+      "inode": 1772663
+    }
+  },
+  "prompt_sha256": "20c0ddaa0a45a3f54de39039158bec7111f9e2496b145531541df0713a4c9c2a",
+  "system_prompt_sha256": "9caaca642cde3a798cd2c5674b9ade5b5b70108296e3a4d6588712033caf1de1",
+  "primary_payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文回答普通成年人如何健康减重，语言自然平实，避免冗长铺垫。回答需覆盖四个方面：合理饮食、每周运动安排、充足睡眠、长期执行方法。每个方面给出两到三条具体可行的要点，自然衔接成文。结尾正常收束，不添加重复总结。整体篇幅以约两百个模型 token 为目标，内容充实、不展开无关细节。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 32,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "args": {
+    "bin": "/var/tmp/tp5-verify-rebuild-build/bin/llama-server",
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "draft": "/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+    "out": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-contract-20261012/arms/sitedump-fused-r16",
+    "horizon": 0,
+    "latebind": "off",
+    "mmvq": "disabled",
+    "threads": 22,
+    "placement": "tp5",
+    "ctx": 1024,
+    "warmup": 0,
+    "repeats": 1,
+    "port": 18765,
+    "profile": "none",
+    "env": [
+      "GGML_VK_CMD_REPLAY=0",
+      "GGML_VK_HC_DUMP_SITES=2"
+    ],
+    "skip_guard": false,
+    "prompt_file": "artifacts/perf-gap/q2-contract-20261012/contract/question.txt",
+    "system_prompt_file": "artifacts/perf-gap/q2-contract-20261012/contract/system.txt",
+    "max_tokens": 32,
+    "length_min": 160,
+    "length_max": 240
+  },
+  "started_utc": "2026-10-13T04:59:45Z"
+}

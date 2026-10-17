@@ -154,6 +154,80 @@ void main() {
     // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
     const uint num_iter = 2;
 
+#if HC_COMBINE
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= ne) {
+            continue;
+        }
+        uint i00, i01, i02, i03;
+        get_indices(idx, i00, i01, i02, i03, p.ne20, p.ne21, p.ne22, p.ne23);
+
+        FLOAT_TYPE res = load_a(0, src_idx(0, i00, i01, i02, i03));
+        FLOAT_TYPE blk = load_a(1, src_idx(1, i00, i01, i02, i03));
+        // inject tensor has shape [4, nt, 1, 1]: dim0 is stream (i01), dim1 is token (i02)
+        uint inj_idx = i02 * p.nb[2][1] + i01 * p.nb[2][0];
+        FLOAT_TYPE inj = load_a(2, inj_idx);
+        // Match unfused SCALE -> SIGMOID -> SCALE -> MUL -> ADD sequence.
+        // Explicitly use precise to prevent contracting prod into out_val (FMA).
+        precise FLOAT_TYPE scaled_inj = inj * FLOAT_TYPE(0.25);
+        precise FLOAT_TYPE sig        = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-scaled_inj));
+        precise FLOAT_TYPE w          = sig * FLOAT_TYPE(2.0);
+        precise FLOAT_TYPE prod       = blk * w;
+        precise FLOAT_TYPE out_val    = res + prod;
+
+        store_d(num_srcs, dst_idx(i00, i01, i02, i03), out_val);
+
+        idx += num_threads;
+    }
+#elif HC_MIX_ACT
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= ne) {
+            continue;
+        }
+        uint i00, i01, i02, i03;
+        get_indices(idx, i00, i01, i02, i03, p.ne20, p.ne21, p.ne22, p.ne23);
+
+        precise FLOAT_TYPE x = load_a(0, src_idx(0, i00, i01, i02, i03));
+        precise FLOAT_TYPE val = x * FLOAT_TYPE(0.25);
+        precise FLOAT_TYPE silu_val = val / (FLOAT_TYPE(1.0) + exp(-val));
+
+        store_d(num_srcs, dst_idx(i00, i01, i02, i03), silu_val);
+
+        idx += num_threads;
+    }
+#elif HC_MIX_GATE_FOLD
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= ne) {
+            continue;
+        }
+        uint i00, i01, i02, i03;
+        get_indices(idx, i00, i01, i02, i03, p.ne20, p.ne21, p.ne22, p.ne23);
+
+        // dst is [2560, nt, 1, 1], i00 is elem [0..2559], i01 is token [0..nt-1]
+        // xn (binding 0) and up (binding 1) have shape [10240, nt]
+        // stream stride in xn/up is 2560 elements
+        // Match unfused SIGMOID, MUL, and sequential ADD, ADD, ADD, SCALE order.
+        // In particular, do not contract a multiply into an add (FMA) or reorder the chain.
+        FLOAT_TYPE u0 = load_a(1, i01 * p.nb[1][1] + (0u * p.ne20 + i00) * p.nb[1][0]);
+        FLOAT_TYPE x0 = load_a(0, i01 * p.nb[0][1] + (0u * p.ne20 + i00) * p.nb[0][0]);
+        precise FLOAT_TYPE g0  = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-u0));
+        precise FLOAT_TYPE p0  = x0 * g0;
+        precise FLOAT_TYPE acc = p0;
+
+        [[unroll]] for (uint s = 1u; s < 4u; ++s) {
+            FLOAT_TYPE us = load_a(1, i01 * p.nb[1][1] + (s * p.ne20 + i00) * p.nb[1][0]);
+            FLOAT_TYPE xs = load_a(0, i01 * p.nb[0][1] + (s * p.ne20 + i00) * p.nb[0][0]);
+            precise FLOAT_TYPE gs = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-us));
+            precise FLOAT_TYPE ps = xs * gs;
+            acc = acc + ps;
+        }
+
+        precise FLOAT_TYPE result = acc * FLOAT_TYPE(0.25);
+        store_d(num_srcs, dst_idx(i00, i01, i02, i03), result);
+
+        idx += num_threads;
+    }
+#else
     FLOAT_TYPE sum_sq = 0;
 
     [[unroll]] for (uint i = 0; i < num_iter; ++i) {
@@ -172,6 +246,7 @@ void main() {
 
         idx += num_threads;
     }
+#endif
 
 #if ADD_RMS
     if (p.rms_partials != 0) {

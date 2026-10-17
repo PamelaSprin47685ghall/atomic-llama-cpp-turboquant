@@ -1,0 +1,6 @@
+{
+  "frozen_utc": "2026-10-12T22:18:19Z",
+  "purpose": "GAP-1 step-2 loadtrace: 3-point load-time instrumentation + r3 dead-branch annotation; verdict = hypothesis (iii) identity/layout mismatch",
+  "libggml_vulkan_so_sha256": "2d1fdb2371f3f97f7a53322ba69d7c1bc73d8e970ac73ebc5f30af545f54e240",
+  "libllama_so_sha256": "0f9ec93a13e6f66bb0c651eb7bff8e95622200ba0b091950bba8b0eb8677bd27"
+}

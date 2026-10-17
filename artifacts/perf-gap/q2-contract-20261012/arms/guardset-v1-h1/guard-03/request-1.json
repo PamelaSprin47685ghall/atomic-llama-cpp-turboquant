@@ -1,0 +1,64 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "你是一个精准的历史问答助手。回答必须严格遵循字数和句数限制，直接给出核心事实。"
+      },
+      {
+        "role": "user",
+        "content": "中国战国时期“纸上谈兵”这一成语源自哪一场著名战役？涉及的赵国将领是谁？请用两句话以内直接回答，避免多余陈述。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 80,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "“纸上谈兵”源自战国时期的长平之战，涉及的赵国将领是赵括。"
+        }
+      }
+    ],
+    "created": 1791819597,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 21,
+      "prompt_tokens": 71,
+      "total_tokens": 92,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-pLDaP4ndj7XLnqF3IXg6HMO5wTgO2T7d",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 71,
+      "prompt_ms": 2846.471,
+      "prompt_per_token_ms": 40.09114084507042,
+      "prompt_per_second": 24.943166468233827,
+      "predicted_n": 21,
+      "predicted_ms": 530.251,
+      "predicted_per_token_ms": 25.250047619047617,
+      "predicted_per_second": 39.60388570695765,
+      "draft_n": 10,
+      "draft_n_accepted": 10
+    }
+  },
+  "wall_ms": 3380.705007,
+  "log_begin": 30508,
+  "log_end": 55972,
+  "phase": "measured"
+}

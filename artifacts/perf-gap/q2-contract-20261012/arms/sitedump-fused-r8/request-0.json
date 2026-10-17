@@ -1,0 +1,62 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文回答普通成年人如何健康减重，语言自然平实，避免冗长铺垫。回答需覆盖四个方面：合理饮食、每周运动安排、充足睡眠、长期执行方法。每个方面给出两到三条具体可行的要点，自然衔接成文。结尾正常收束，不添加重复总结。整体篇幅以约两百个模型 token 为目标，内容充实、不展开无关细节。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 32,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "length",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "健康做，，，，，，，，且，，，在rata，让我，rata，，，，，，，，，，，，"
+        }
+      }
+    ],
+    "created": 1791846436,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b0-unknown",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 32,
+      "prompt_tokens": 102,
+      "total_tokens": 134,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-ZjYK6RCkUVAMxntebrmvK7n1sxlpvySQ",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 102,
+      "prompt_ms": 4785.028,
+      "prompt_per_token_ms": 46.91203921568628,
+      "prompt_per_second": 21.316489684072906,
+      "predicted_n": 32,
+      "predicted_ms": 5242.437,
+      "predicted_per_token_ms": 163.82615625,
+      "predicted_per_second": 6.104031388455407
+    }
+  },
+  "wall_ms": 10032.27354,
+  "log_begin": 587534,
+  "log_end": 601022,
+  "phase": "measured"
+}

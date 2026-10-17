@@ -1,0 +1,6 @@
+{
+  "frozen_utc": "2026-10-12T22:45:02Z",
+  "purpose": "GAP-1 dispatch identity trace: W_down tensor full identity (tensor/buffer/data/view_src chain/op) at dispatch + loadtrace alloc tensor pointer",
+  "libggml_vulkan_so_sha256": "96264d9d4c771a6e33ea153da23d5ba8fa97fa62fc3d4d39769d6414fe3ab73e",
+  "libggml_base_so_sha256": "46894f15b83f9d6819040fd282be33b1618c0c55f31c501c245c3af59829491f"
+}

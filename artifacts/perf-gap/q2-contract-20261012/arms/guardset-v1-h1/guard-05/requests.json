@@ -1,0 +1,37 @@
+[
+  {
+    "idx": 0,
+    "phase": "warmup",
+    "n": 300,
+    "predicted_ms": 5489.642,
+    "tps": 54.64837233466226,
+    "wall_ms": 9810.416083,
+    "finish": "length",
+    "content_sha256": "e8e68885c2bb461a35289e4d941e6728846dba04b82588325e148e21a52acc8b",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 122,
+      "prompt_ms": 4316.446,
+      "prompt_per_token_ms": 35.380704918032784,
+      "prompt_per_second": 28.26399310914581,
+      "predicted_n": 300,
+      "predicted_ms": 5489.642,
+      "predicted_per_token_ms": 18.298806666666668,
+      "predicted_per_second": 54.64837233466226,
+      "draft_n": 156,
+      "draft_n_accepted": 143
+    },
+    "issues": [
+      "NOT_NATURAL_STOP"
+    ],
+    "fallback_lines": [
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=97 uid=36028797018971137",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=97 uid=36028797018971649",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=97 uid=36028797018972161",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=97 uid=36028797018972673",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=97 uid=36028797018973441",
+      "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=97 uid=36028797019011073"
+    ],
+    "mtp_cycle_lines": []
+  }
+]

@@ -1,0 +1,557 @@
+{
+  "status": "MEASURED_NOT_QUALIFIED",
+  "qualification": "NOT_REVIEWED",
+  "profile": "none",
+  "gpu_before": [
+    {
+      "card": "card1",
+      "bdf": "0000:0f:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17203200",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card2",
+      "bdf": "0000:09:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card3",
+      "bdf": "0000:0c:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card4",
+      "bdf": "0000:06:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card5",
+      "bdf": "0000:03:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "0",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    }
+  ],
+  "process_id": 1235835,
+  "loading_ms": 39650.19207,
+  "pooled_tps": 49.00319337476825,
+  "median_tps": 48.98900472407096,
+  "requests": [
+    {
+      "idx": 0,
+      "phase": "warmup",
+      "n": 160,
+      "predicted_ms": 3873.569,
+      "tps": 41.30557633025254,
+      "wall_ms": 8681.788115,
+      "finish": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 102,
+        "prompt_ms": 4803.824,
+        "prompt_per_token_ms": 47.09631372549019,
+        "prompt_per_second": 21.2330843095001,
+        "predicted_n": 160,
+        "predicted_ms": 3873.569,
+        "predicted_per_token_ms": 24.20980625,
+        "predicted_per_second": 41.30557633025254
+      },
+      "issues": [],
+      "fallback_lines": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=3 n_sub=96 uid=36028797018967041",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=4 n_sub=96 uid=36028797018967297",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=5 n_sub=96 uid=36028797018967553",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=6 n_sub=96 uid=36028797018967809",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=7 n_sub=96 uid=36028797018968065",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=8 n_sub=97 uid=36028797018968321",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=9 n_sub=97 uid=36028797018968577",
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=10 n_sub=97 uid=36028797018968833"
+      ],
+      "mtp_cycle_lines": []
+    },
+    {
+      "idx": 1,
+      "phase": "warmup",
+      "n": 160,
+      "predicted_ms": 3252.292,
+      "tps": 49.196074645204064,
+      "wall_ms": 7061.320075,
+      "finish": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 102,
+        "prompt_ms": 3165.207,
+        "prompt_per_token_ms": 31.031441176470587,
+        "prompt_per_second": 32.2253805201366,
+        "predicted_n": 160,
+        "predicted_ms": 3252.292,
+        "predicted_per_token_ms": 20.326825,
+        "predicted_per_second": 49.196074645204064
+      },
+      "issues": [],
+      "fallback_lines": [],
+      "mtp_cycle_lines": []
+    },
+    {
+      "idx": 2,
+      "phase": "measured",
+      "n": 160,
+      "predicted_ms": 3266.039,
+      "tps": 48.98900472407096,
+      "wall_ms": 6420.427171,
+      "finish": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 102,
+        "prompt_ms": 3150.134,
+        "prompt_per_token_ms": 30.883666666666667,
+        "prompt_per_second": 32.37957496411264,
+        "predicted_n": 160,
+        "predicted_ms": 3266.039,
+        "predicted_per_token_ms": 20.41274375,
+        "predicted_per_second": 48.98900472407096
+      },
+      "issues": [],
+      "fallback_lines": [],
+      "mtp_cycle_lines": []
+    },
+    {
+      "idx": 3,
+      "phase": "measured",
+      "n": 160,
+      "predicted_ms": 3273.157,
+      "tps": 48.88247034896279,
+      "wall_ms": 6482.836376,
+      "finish": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 102,
+        "prompt_ms": 3205.258,
+        "prompt_per_token_ms": 31.424098039215686,
+        "prompt_per_second": 31.822711307482894,
+        "predicted_n": 160,
+        "predicted_ms": 3273.157,
+        "predicted_per_token_ms": 20.45723125,
+        "predicted_per_second": 48.882470348962784
+      },
+      "issues": [],
+      "fallback_lines": [],
+      "mtp_cycle_lines": []
+    },
+    {
+      "idx": 4,
+      "phase": "measured",
+      "n": 160,
+      "predicted_ms": 3256.084,
+      "tps": 49.13878143192866,
+      "wall_ms": 6404.036921,
+      "finish": "stop",
+      "content_sha256": "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 102,
+        "prompt_ms": 3143.918,
+        "prompt_per_token_ms": 30.82272549019608,
+        "prompt_per_second": 32.44359426677159,
+        "predicted_n": 160,
+        "predicted_ms": 3256.084,
+        "predicted_per_token_ms": 20.350524999999998,
+        "predicted_per_second": 49.13878143192866
+      },
+      "issues": [],
+      "fallback_lines": [],
+      "mtp_cycle_lines": []
+    },
+    {
+      "idx": 5,
+      "phase": "guard",
+      "n": 72,
+      "predicted_ms": 1566.792,
+      "tps": 45.95377050687009,
+      "wall_ms": 3179.776249,
+      "finish": "stop",
+      "content_sha256": "ead561f7cdce47b31ce7e0e48bceb7f6d17857880c2f92f65ebfede5779c0f78",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 23,
+        "prompt_ms": 1607.661,
+        "prompt_per_token_ms": 69.89830434782608,
+        "prompt_per_second": 14.306498695931543,
+        "predicted_n": 72,
+        "predicted_ms": 1566.792,
+        "predicted_per_token_ms": 21.761,
+        "predicted_per_second": 45.95377050687009
+      },
+      "issues": [],
+      "fallback_lines": [
+        "[CRITICAL-FALLBACK] Graph fallback to 480 subgraphs! cnt=11 n_sub=96 uid=36028797018977281"
+      ],
+      "mtp_cycle_lines": []
+    }
+  ],
+  "length_gate": {
+    "length_min": 160,
+    "length_max": 240,
+    "phase_scope": "measured",
+    "passed": true,
+    "requests": [
+      {
+        "idx": 2,
+        "n": 160,
+        "in_range": true
+      },
+      {
+        "idx": 3,
+        "n": 160,
+        "in_range": true
+      },
+      {
+        "idx": 4,
+        "n": 160,
+        "in_range": true
+      }
+    ]
+  },
+  "mtp_horizon": 0,
+  "accepted_prefix_distribution": "NOT_APPLICABLE",
+  "cycle_D_V_S_H_K": "NOT_APPLICABLE",
+  "shutdown": {
+    "returncode": 0,
+    "forced": false,
+    "seconds": 0.8650077100028284
+  },
+  "gpu_after": [
+    {
+      "card": "card1",
+      "bdf": "0000:0f:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "98",
+      "mem_info_vram_used": "1322414080",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz \n1: 2475Mhz *",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card2",
+      "bdf": "0000:09:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "7",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card3",
+      "bdf": "0000:0c:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "11",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card4",
+      "bdf": "0000:06:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "11",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    },
+    {
+      "card": "card5",
+      "bdf": "0000:03:00.0",
+      "device": "0x73bf",
+      "gpu_busy_percent": "13",
+      "mem_info_vram_used": "17207296",
+      "mem_info_vram_total": "17163091968",
+      "current_link_speed": "8.0 GT/s PCIe",
+      "current_link_width": "16",
+      "pp_dpm_sclk": "0: 500Mhz *\n1: 2475Mhz",
+      "pp_dpm_mclk": "0: 96Mhz \n1: 456Mhz \n2: 673Mhz \n3: 1000Mhz *"
+    }
+  ],
+  "rank_stage_ledger": "NOT_COLLECTED",
+  "minimum_fields": {
+    "checklist": [
+      "contract_version",
+      "workload_hash",
+      "quality_gate_version",
+      "timing_boundary",
+      "all_model_shard_SHA256",
+      "draft_SHA256",
+      "source_dirty_identity",
+      "binary_SHA256",
+      "actual_loaded_DSO_SHA256",
+      "rank_to_BDF",
+      "resolved_env_and_CLI",
+      "process_id",
+      "paired_block",
+      "phase",
+      "public_completion_tokens",
+      "finish_reason",
+      "complete_text_hash_and_raw_body",
+      "generation_ms",
+      "prompt_ms",
+      "first_token_ms",
+      "request_wall_ms",
+      "startup_ms",
+      "mtp_horizon",
+      "accepted_prefix_distribution",
+      "cycle_D_V_S_H_K",
+      "actual_pipeline_hits",
+      "active_rows",
+      "capacity_rows",
+      "bank_epoch",
+      "fallback",
+      "timeout",
+      "GPU_fault",
+      "HTTP_error",
+      "teardown",
+      "quality_verdict"
+    ],
+    "fields": {
+      "contract_version": "NOT_COLLECTED",
+      "workload_hash": "20c0ddaa0a45a3f54de39039158bec7111f9e2496b145531541df0713a4c9c2a",
+      "quality_gate_version": "NOT_COLLECTED",
+      "timing_boundary": "NOT_COLLECTED",
+      "all_model_shard_SHA256": "NOT_COLLECTED",
+      "draft_SHA256": "NOT_COLLECTED",
+      "source_dirty_identity": "NOT_COLLECTED",
+      "binary_SHA256": "ab4e9260f382dc8cc967efd78cfa6c342030b95536a6c4e4e5f7b152e71ebef0",
+      "actual_loaded_DSO_SHA256": {
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_asahi.so": "324902f0b19f8e0770e07a48273ac6cce8d22fbbc473ff2b2dd1e720f541b2be",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so": "d9a8bc5d4b3ec0e065562d362541c2a4cb3f3d6208ac715f7ff1dcf01289d164",
+        "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so": "5f30ae2f9e7fbcb381d75b39983126b65c06fb32d7f4cbb7e49e70a750996cac",
+        "/var/tmp/tp5-verify-upfold-build/bin/libggml-base.so.0.18.1": "3698132a5f9895c70c08b19fafee28e3f6888fa53f6174d2cce71abe602b14b6",
+        "/var/tmp/tp5-verify-upfold-build/bin/libggml-cpu.so.0.18.1": "74542f1bce0870960483567ef7fe6efaab4d9d92af5f1e346fc275e909429a95",
+        "/var/tmp/tp5-verify-upfold-build/bin/libggml-vulkan.so.0.18.1": "eaa94f05981413f0fb81cb9c916cd9fccac5fe4f22cee8dc33ef1d090bf9a2c6",
+        "/var/tmp/tp5-verify-upfold-build/bin/libggml.so.0.18.1": "08b68ea2c6e09d91e63250a76363c01e63c29cf0345506d44f6d3b23362013de",
+        "/var/tmp/tp5-verify-upfold-build/bin/libllama-common.so.0.0.0": "e140a0d75c717aa84cbe868a841d82ee55ff75d760bcfcd6e8e0b20ada4744c8",
+        "/var/tmp/tp5-verify-upfold-build/bin/libllama-server-impl.so": "a1e9878f92156f3bb0eda51ad99b85886e39a01b14de085f12c8bbb71c81e7dd",
+        "/var/tmp/tp5-verify-upfold-build/bin/libllama.so.0.0.0": "f469e53c17656b2be4c7139783ce0febf464c2e5189b14f0484b6d51f8ffef5e"
+      },
+      "rank_to_BDF": [
+        {
+          "card": "card1",
+          "bdf": "0000:0f:00.0"
+        },
+        {
+          "card": "card2",
+          "bdf": "0000:09:00.0"
+        },
+        {
+          "card": "card3",
+          "bdf": "0000:0c:00.0"
+        },
+        {
+          "card": "card4",
+          "bdf": "0000:06:00.0"
+        },
+        {
+          "card": "card5",
+          "bdf": "0000:03:00.0"
+        }
+      ],
+      "resolved_env_and_CLI": {
+        "argv": [
+          "/var/tmp/tp5-verify-upfold-build/bin/llama-server",
+          "-m",
+          "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+          "-dev",
+          "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
+          "--split-mode",
+          "tensor",
+          "--fit",
+          "off",
+          "-ngl",
+          "999",
+          "-c",
+          "1024",
+          "-b",
+          "32",
+          "-ub",
+          "32",
+          "--no-mmap",
+          "--no-host",
+          "-np",
+          "1",
+          "-t",
+          "22",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18765",
+          "--tp5",
+          "qwen4exp-af",
+          "--tp5-latebind",
+          "off",
+          "--spec-type",
+          "none"
+        ],
+        "env": {
+          "PATH": "/home/kunweiz/.local/bin:/home/kunweiz/.local/bin:/home/kunweiz/.bun/bin:/home/kunweiz/.opencode/bin:/home/kunweiz/.local/bin:/home/kunweiz/.bun/bin:/home/kunweiz/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/kunweiz/.dotnet/tools",
+          "HOME": "/home/kunweiz",
+          "LANG": "en_US.UTF-8",
+          "LD_LIBRARY_PATH": "/var/tmp/tp5-verify-upfold-build/bin",
+          "RADV_DEBUG": "nobolist",
+          "GGML_VK_DISABLE_MMVQ": "1",
+          "GGML_VK_FORCE_MMVQ": "0",
+          "GGML_TP5_REPLICATE_ATTN": "0",
+          "GGML_TP5_QSA_HEADMAP": "1",
+          "GGML_TP5_GDN_HEADMAP": "1",
+          "GGML_VK_SMALL_Q8_COLUMNS": "1",
+          "GGML_TP5_GREEDY_HOST": "1",
+          "GGML_TP5_PARALLEL_SUBMIT": "1",
+          "GGML_TP5_Q_WORKGROUP": "256",
+          "GGML_TP5_NORM_WORKGROUP": "256",
+          "GGML_TP5_NORM_PREFETCH": "0",
+          "GGML_TP5_PACK_SINGLE_WG": "0",
+          "GGML_TP5_SHARD_ROUTER": "0"
+        }
+      },
+      "process_id": 1235835,
+      "paired_block": "NOT_COLLECTED",
+      "phase": [
+        "measured",
+        "measured",
+        "measured"
+      ],
+      "public_completion_tokens": [
+        160,
+        160,
+        160
+      ],
+      "finish_reason": [
+        "stop",
+        "stop",
+        "stop"
+      ],
+      "complete_text_hash_and_raw_body": {
+        "per_request_content_sha256": [
+          "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+          "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c",
+          "c2d7bdd3f18f0d9a496087157c8773f26296076c0f979c60bce3ef509effe62c"
+        ],
+        "raw_body_files": [
+          "request-2.json",
+          "request-3.json",
+          "request-4.json"
+        ]
+      },
+      "generation_ms": [
+        3266.039,
+        3273.157,
+        3256.084
+      ],
+      "prompt_ms": [
+        3150.134,
+        3205.258,
+        3143.918
+      ],
+      "first_token_ms": "NOT_COLLECTED",
+      "request_wall_ms": [
+        6420.427171,
+        6482.836376,
+        6404.036921
+      ],
+      "startup_ms": 39650.19207,
+      "mtp_horizon": 0,
+      "accepted_prefix_distribution": "NOT_APPLICABLE",
+      "cycle_D_V_S_H_K": "NOT_APPLICABLE",
+      "actual_pipeline_hits": "NOT_COLLECTED",
+      "active_rows": "NOT_COLLECTED",
+      "capacity_rows": "NOT_COLLECTED",
+      "bank_epoch": "NOT_COLLECTED",
+      "fallback": [
+        [],
+        [],
+        []
+      ],
+      "timeout": "NOT_COLLECTED",
+      "GPU_fault": "NOT_COLLECTED",
+      "HTTP_error": "NOT_COLLECTED",
+      "teardown": {
+        "returncode": 0,
+        "forced": false,
+        "seconds": 0.8650077100028284
+      },
+      "quality_verdict": "NOT_COLLECTED"
+    },
+    "not_collected": [
+      "contract_version",
+      "quality_gate_version",
+      "timing_boundary",
+      "all_model_shard_SHA256",
+      "draft_SHA256",
+      "source_dirty_identity",
+      "paired_block",
+      "first_token_ms",
+      "actual_pipeline_hits",
+      "active_rows",
+      "capacity_rows",
+      "bank_epoch",
+      "timeout",
+      "GPU_fault",
+      "HTTP_error",
+      "quality_verdict"
+    ],
+    "checklist_covered": true,
+    "notes": {
+      "all_model_shard_SHA256": "manifest.json carries stat identity; full shard SHA256 is computed offline by DevOps before GPU runs (AGENTS.md §4.2)",
+      "draft_SHA256": "same offline policy as model shards",
+      "actual_pipeline_hits": "future entry: pipeline hit counters from GGML_TP5_PROFILE logs",
+      "active_rows": "AGENTS.md §7.3 rank/stage ledger; collector does not exist yet",
+      "capacity_rows": "AGENTS.md §7.3 rank/stage ledger; collector does not exist yet",
+      "bank_epoch": "AGENTS.md §7.3 rank/stage ledger; collector does not exist yet"
+    }
+  }
+}

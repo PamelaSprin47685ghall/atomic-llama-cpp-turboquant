@@ -1,0 +1,4 @@
+GAP-1 rebuild experiment: applied changes on /var/tmp/tp5-verify-rebuild-src (git archive 3e28b121a base)
+1. identity/quarantine-upfoldFix/upfold-fix.diff — applied via patch -p1 (dry-run verified first): mul_mat_vec.comp HC_UP_FOLD aligned fold + ggml-vulkan.cpp dispatch_rows bf16 branch. Verified: HC_UP_FOLD/weight_row present in comp (lines 229-231, 258-259), dispatch_rows branch present (line ~16726).
+2. identity/quarantine-forceIter/force-iter-switch.diff — vk portion applied via exact edit (output_flags block with env parse + 0x200 bit); comp portion applied via exact edits (macro after a_offset decls + bypass conjunct in is_aligned_nonquant). Verified: MAT_VEC_FUSION_FLAGS_FORCE_ITER present in both files.
+No other worktree dirty changes carried over.

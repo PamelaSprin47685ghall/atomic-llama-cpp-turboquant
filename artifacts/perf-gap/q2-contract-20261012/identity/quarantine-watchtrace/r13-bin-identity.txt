@@ -1,0 +1,2 @@
+7e45f0224dd79231d2ff58fb3faecbe6fee4e2571f17eab22d6b873c44e4f9c2  /var/tmp/tp5-verify-rebuild-build/bin/libggml-vulkan.so.0.18.1
+dacb1336530997e94f55f272a0b144763e5cfbc42af50417851f30a5dc9f3cc2  /var/tmp/tp5-verify-rebuild-build/bin/llama-server

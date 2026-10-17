@@ -1,0 +1,6 @@
+{
+  "frozen_utc": "2026-10-12T:52:19Z",
+  "purpose": "GAP-1 fork fix: weight simple tensor registry (global map populated at MIRRORED fan-out; weight resolution always returns registered entries)",
+  "libggml_vulkan_so_sha256": "c2454e39f7c559a31f9cb70c0bb37435eb279833f71e07513a6b177edacbc0cb",
+  "libggml_base_so_sha256": "0ca5f460ed05cc0a567c23521c2915d29ca83ebfa349745d4036e3759adbcf19"
+}

@@ -1,0 +1,10 @@
+{
+  "frozen_utc": "2026-10-12T14:31:56Z",
+  "purpose": "FUSED-REVERT experiment 1-prime: hc_bf16_weights fused-segment BF16 pipeline selection removed in clean 3e28b121a export tree (true single-factor test of hypothesis 1); gate revert from experiment 1 retained (inactive in off arm)",
+  "source_tree": "/var/tmp/tp5-clean-head-src (repo worktree untouched)",
+  "source_ggml_vulkan_cpp_sha256_modified": "94c4b8638a4f4111f096f434f6b7655eb47b2e5b9fcd2099ab0f702ef90108e8",
+  "source_before_this_edit": "4ad322f4a2cb5638fc66554e538c3c69190ae0c90ae22ba4a1d2e0c1269a3df0",
+  "diff_saved": "identity/quarantine-fusedRevert/fused-revert.diff",
+  "libggml_vulkan_so_sha256": "b7578d0479bd5d1c338b3eb53f69f0e9600917235524696e09ba78ba3d7dd747",
+  "llama_server_sha256": "d047c4a67f4d6c77d34ce4ea32f40ac9328133d2e5778757735a4463b4b5c542"
+}

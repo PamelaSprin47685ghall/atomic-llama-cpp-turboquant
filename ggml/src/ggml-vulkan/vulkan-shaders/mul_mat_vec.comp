@@ -17,6 +17,20 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 uint a_offset, b_offset, d_offset, y_offset;
 
+// Diagnostic switch (bf16-segment-fixer): when the host sets this
+// push-constant bit, a K_PER_ITER==4 nonquant contraction bypasses
+// iter_aligned_nonquant() (vec4 data_b_v4 B loads + dequantize4_2aligned
+// BF16 bit expansion) and runs iter() instead (scalar load_b + dequantize4
+// decoding through bf16_to_fp32). The two decode paths are bit-level
+// equivalent on paper, but the two HC BF16 variants are the ONLY
+// mul_mat_vec + DATA_A_BF16 instances in the tree (no non-HC variant
+// exists), so the aligned path has never had an independent execution
+// witness. This bit lets one DevOps A/B run bisect the remaining
+// "correct prefix, then drift" BF16-segment garbling between the two
+// decode paths. Must match MAT_VEC_FUSION_FLAGS_FORCE_ITER in
+// ggml-vulkan.cpp. Bit 0x200 collides with no existing fusion flag.
+#define MAT_VEC_FUSION_FLAGS_FORCE_ITER 0x200
+
 #if defined(HC_DOWN_SILU) && !defined(HC_DOWN_NATIVE_REDUCTION)
 // Opt-in reassociated long-K HC down variant (GGML_VK_HC_DOWN_WG=32|64|128).
 // A workgroup of BLOCK_SIZE lanes cooperatively reduces one output row:
@@ -395,8 +409,23 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
 
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+#ifdef HC_UP_FOLD
+            // NativeHC up fold (qwen4_hc_project_fold_bf16): first_row encodes
+            // token_row*stride_d + col, so the W_up row for stream n is
+            // col + n*stride_d (row space 4*stride_d) — the exact fold iter()
+            // applies on its non-aligned path. Without it this aligned loop
+            // read the linear rows first_row + n, which point at wrong weight
+            // rows for token_row >= 1 and past the tensor for token_row >= 3,
+            // corrupting every gate value and the 0.25 stream fold in
+            // reduce_result. Variants without HC_UP_FOLD compile the #else
+            // arm and stay byte-identical to the previous code.
+            const uint weight_row = (first_row % p.stride_d) + n * p.stride_d;
+            const uint ib = (weight_row * p.ncols + col)/QUANT_K; // block index
+            ibi += p.ncols * p.stride_d;
+#else
             const uint ib = (ibi + col)/QUANT_K; // block index
             ibi += p.ncols;
+#endif
 
             const vec4 v = dequantize4_2aligned(ib, iqs, a_offset);
 
@@ -474,7 +503,13 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 #endif
 
     get_offsets(a_offset, b_offset, d_offset);
+    // FORCE_ITER (diagnostic, see the macro above): the flag only ever
+    // routes the loop selection; iter() carries the same HC_UP_FOLD /
+    // linear-row arms and the same per-lane num_iters tail coverage, so
+    // correctness of the contraction is preserved — only the decode and
+    // B-load granularity changes.
     const bool is_aligned_nonquant =
+        (p.fusion_flags & MAT_VEC_FUSION_FLAGS_FORCE_ITER) == 0 &&
         p.batch_stride_b % 4 == 0 && b_offset % 4 == 0 &&
         p.ncols % 4 == 0 && BLOCK_SIZE % 4 == 0 &&
         K_PER_ITER == 4;

@@ -1,0 +1,62 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "请用中文回答普通成年人如何健康减重，语言自然平实，避免冗长铺垫。回答需覆盖四个方面：合理饮食、每周运动安排、充足睡眠、长期执行方法。每个方面给出两到三条具体可行的要点，自然衔接成文。结尾正常收束，不添加重复总结。整体篇幅以约两百个模型 token 为目标，内容充实、不展开无关细节。"
+      },
+      {
+        "role": "user",
+        "content": "如何减肥"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 400,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "健康减重核心在于平衡饮食与运动。饮食上，优先选择高蛋白、高纤维食物，减少精制糖和加工食品摄入，控制每餐份量，避免过度节食导致代谢下降。运动方面，每周坚持至少150分钟中等强度有氧运动，如快走或游泳，并结合两次力量训练以维持肌肉量，提升基础代谢率。睡眠至关重要，每晚保证7至8小时高质量睡眠，因为睡眠不足会扰乱激素水平，增加饥饿感并阻碍脂肪燃烧。长期执行需建立可持续习惯，例如记录饮食与运动数据，设定阶段性小目标，允许偶尔的放松，将减重融入日常生活而非短期冲刺，从而保持体重稳定。"
+        }
+      }
+    ],
+    "created": 1791829493,
+    "model": "/home/kunweiz/atomic-llama-cpp-turboquant/models/perf-gap-q2-hcq8/Q2-HCQ8-00001-of-00002.gguf",
+    "system_fingerprint": "b0-unknown",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 143,
+      "prompt_tokens": 102,
+      "total_tokens": 245,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-cwBZ4DXiWjFYfm53xKBIJKJy16Lt7v5W",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 102,
+      "prompt_ms": 3065.812,
+      "prompt_per_token_ms": 30.056980392156863,
+      "prompt_per_second": 33.270141809086795,
+      "predicted_n": 143,
+      "predicted_ms": 2419.06,
+      "predicted_per_token_ms": 16.916503496503495,
+      "predicted_per_second": 59.11387067703985
+    }
+  },
+  "wall_ms": 6133.502255,
+  "log_begin": 25421,
+  "log_end": 60587,
+  "phase": "warmup"
+}

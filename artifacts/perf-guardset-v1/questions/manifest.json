@@ -1,0 +1,83 @@
+{
+  "guardset_version": "guardset-v1-20261010",
+  "total_questions": 9,
+  "target_workload_isolation": {
+    "tuning_workload": "如何减肥 (Chinese natural text generation)",
+    "guard_scope": "Multi-category evaluation excluding weight-loss topics",
+    "enforce_freeze": true
+  },
+  "items": [
+    {
+      "id": "01_zh_science",
+      "category": "zh_natural_science",
+      "title": "中文自然科学常识（天空与日落颜色）",
+      "file": "01_zh_science.json",
+      "gate_level": "MUST_PASS",
+      "deterministic": false
+    },
+    {
+      "id": "02_en_general",
+      "category": "en_natural_general",
+      "title": "英文通识问答（能源分类与实例）",
+      "file": "02_en_general.json",
+      "gate_level": "MUST_PASS",
+      "deterministic": false
+    },
+    {
+      "id": "03_zh_short_fact",
+      "category": "zh_short_fact",
+      "title": "中文短事实问答（长平之战历史常识）",
+      "file": "03_zh_short_fact.json",
+      "gate_level": "MUST_PASS",
+      "deterministic": true
+    },
+    {
+      "id": "04_en_long_writing",
+      "category": "en_long_writing",
+      "title": "英文结构化长回答（阅读习惯养成）",
+      "file": "04_en_long_writing.json",
+      "gate_level": "LOG_AND_AUDIT",
+      "deterministic": false
+    },
+    {
+      "id": "05_math_logic",
+      "category": "math_multi_step_logic",
+      "title": "多步算术与日期排程逻辑（跑步里程）",
+      "file": "05_math_logic.json",
+      "gate_level": "MUST_PASS",
+      "deterministic": true
+    },
+    {
+      "id": "06_code_gen",
+      "category": "code_generation_syntax",
+      "title": "代码生成与语法可执行性（只出现一次的数字）",
+      "file": "06_code_gen.json",
+      "gate_level": "MUST_PASS",
+      "deterministic": true
+    },
+    {
+      "id": "07_context_multi_turn",
+      "category": "context_dependency_multi_turn",
+      "title": "上下文依赖多轮实体检索（杭州旅行计划）",
+      "file": "07_context_multi_turn.json",
+      "gate_level": "MUST_PASS",
+      "deterministic": true
+    },
+    {
+      "id": "08_cross_request_isolation",
+      "category": "state_safety_cross_request",
+      "title": "跨请求状态隔离与信息防泄漏",
+      "file": "08_cross_request_isolation.json",
+      "gate_level": "MUST_PASS",
+      "deterministic": true
+    },
+    {
+      "id": "09_abort_recovery",
+      "category": "state_safety_abort_recovery",
+      "title": "客户端异常中断与服务端状态排空恢复",
+      "file": "09_abort_recovery.json",
+      "gate_level": "MUST_PASS",
+      "deterministic": true
+    }
+  ]
+}

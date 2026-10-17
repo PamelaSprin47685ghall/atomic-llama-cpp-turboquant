@@ -1,0 +1,28 @@
+{
+  "frozen_utc": "2026-10-12T15:31:18Z",
+  "confirmed_by": "devops (clean host, zero GPU activity during hash computation)",
+  "guardset_path": "artifacts/perf-guardset-v1",
+  "guardset_version": "guardset-v1-20261010",
+  "verification": {
+    "files_registered": 13,
+    "recomputed_sha256_all_match": true,
+    "unregistered_extra_files": [],
+    "char_count_note": "question files declare no char_count field; task-brief wording (guard-set/, 23 files, manifest PENDING_DEVOPS_FREEZE) does not match actual layout; actual freeze carrier is HASHES.json which already holds correct hashes — no modification needed"
+  },
+  "files_sha256_recomputed": {
+    "guardset.md": "fe12b0c0c6c97587fb3adc55895f3ac5fb5e26f3f7a715d2c556000552123d8f",
+    "rubric.md": "86fc0e8f10cd3e218811609edbe742b06ee9281aa72b8d491cacf546fc9ddb9f",
+    "identity.md": "5b23bddac4ace8d2c9430ea3040c13b8c84c0de4462745def7133bad3ad835f9",
+    "questions/manifest.json": "5a0b6e65c5ffae72ab542e873f6f23937209fbf98e480614728e16d0b9057591",
+    "questions/01_zh_science.json": "0d2f76f0650c09172dba9b37b226921c91ae7fccea4e6d9e6954a0e1e8c82c2d",
+    "questions/02_en_general.json": "4892c069496f5c89ea561e3e34a3b36461d6048eab267b82861406828b700c53",
+    "questions/03_zh_short_fact.json": "d5c2d56fc990787206f10b01f8762fc2542ecb6050e25db1a9607f26312185ac",
+    "questions/04_en_long_writing.json": "9bcc2c3b35d31a4698fcb4bc4338b61e0bfc8e28edf03ef7e87d0ec2d0d1e458",
+    "questions/05_math_logic.json": "73dab77bbeb7f74d48254b0dbd16e6ff47c6fae8f31dfaa40693e9e936216021",
+    "questions/06_code_gen.json": "785b8bc910d575f9a03d62003e89a7db6a80686ef0caed75fd1be0e2b30e98ea",
+    "questions/07_context_multi_turn.json": "a51244ad37775c1709a6e4e7ddc55b51e49c8b92d42a5d73da79e145b3bfd1fc",
+    "questions/08_cross_request_isolation.json": "e517ea2f53bd38eb4d0fe95b6ffe72e6f5967cf213b4a508688f3a2e1dcb634a",
+    "questions/09_abort_recovery.json": "8744378e734da639adf379dc60988678037acbe0846c6d80557c6e8875dc8942"
+  },
+  "contract_note": "guardset.md declares freeze semantics; identity.md defines the DevOps hash-sealing procedure; this confirmation completes the DevOps side verification without altering any guard-set file"
+}

@@ -1,0 +1,36 @@
+{
+  "frozen_utc": "2026-10-12T13:32:42Z",
+  "git_commit": "9be06d5ab (q2-baseline build HEAD)",
+  "purpose": "attribution discriminating experiment: clean 9be06d5ab baseline to separate \"introduced by 2379e1253\" vs \"pre-existing + dirty-fixed\"",
+  "source_export": "/var/tmp/tp5-base9be-src (git archive 9be06d5ab, tracked files only)",
+  "build_dir": "/var/tmp/tp5-base9be-build",
+  "cmake_config": "RelWithDebInfo, GGML_VULKAN=ON, BUILD_SHARED_LIBS=ON, GGML_LLAMAFILE/NATIVE/OPENMP=ON, GGML_CUDA=OFF, LLAMA_BUILD_SERVER=ON, GGML_BACKEND_DL=OFF, SPIRV-Headers_DIR=/home/kunweiz/deps/prefix/share/cmake/SPIRV-Headers",
+  "cmake_adaptation": "LLAMA_BUILD_TESTS=OFF — 9be06d5ab tracked tests/CMakeLists references server-rerot-todo.cpp/server-rerot-thinking.cpp which are NOT tracked at that commit (they existed only as worktree files during q2-baseline build); disabling tests bypasses missing sources without touching vk numeric paths",
+  "files_sha256": {
+    "libggml-base.so.0.18.1": "6eb40a1027252b7702eb74598b966dea7438e7bb7f5e5e1c7adae5a6c2c0b49b",
+    "libggml-cpu.so.0.18.1": "6a5f211d1e2533975ae9930769ca4df56f841ae8cc90c0dc04aaa569c55fb2f8",
+    "libggml-vulkan.so.0.18.1": "17b019ce6b9ec354a8d5615a8a252a7131576b30497a5ee37822c1f42b261413",
+    "libggml.so.0.18.1": "bf9a47cf185055e7f8cb6da7b2b73488b02da5dc9ff5b6809a33ba692adf1842",
+    "libllama-common.so.0.0.0": "db98fca2dbd24abc7e1feb4b56aacd6ce9d1881d70b75e9b95a30e4eca1ed9e8",
+    "libllama-server-impl.so": "56becdd33f194c8bb0d9b1bf24247d87c0b2ab5af2f8152f5d659d93199bdb28",
+    "libllama.so.0.0.0": "d4f661150a1a556ec359ae5260536ccdca0d263153604a569db4fb094c89fc98",
+    "libmtmd.so.0.0.0": "6a5a156fec6fbdbfb5512393ad954fc272c283314f6e5287d857b188d4ba89cd",
+    "llama-server": "d1600f14dd7ba630c6ae9456402bd7c7e8baedfd004ede5e5ad5021a929ade6f"
+  },
+  "symlinks": {
+    "libggml-base.so": "libggml-base.so.0",
+    "libggml-base.so.0": "libggml-base.so.0.18.1",
+    "libggml-cpu.so": "libggml-cpu.so.0",
+    "libggml-cpu.so.0": "libggml-cpu.so.0.18.1",
+    "libggml-vulkan.so": "libggml-vulkan.so.0",
+    "libggml-vulkan.so.0": "libggml-vulkan.so.0.18.1",
+    "libggml.so": "libggml.so.0",
+    "libggml.so.0": "libggml.so.0.18.1",
+    "libllama-common.so": "libllama-common.so.0",
+    "libllama-common.so.0": "libllama-common.so.0.0.0",
+    "libllama.so": "libllama.so.0",
+    "libllama.so.0": "libllama.so.0.0.0",
+    "libmtmd.so": "libmtmd.so.0",
+    "libmtmd.so.0": "libmtmd.so.0.0.0"
+  }
+}

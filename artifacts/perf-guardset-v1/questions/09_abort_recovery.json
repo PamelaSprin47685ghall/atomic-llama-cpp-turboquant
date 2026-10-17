@@ -1,0 +1,18 @@
+{
+  "id": "09_abort_recovery",
+  "category": "state_safety_abort_recovery",
+  "gate_level": "MUST_PASS",
+  "description": "模拟客户端生成首 token 后主动断开连接，随后立即发起新请求，验证服务端 slot 锁、epoch 计数器与 Vulkan 资源排空机制正常恢复。",
+  "protocol_steps": [
+    "1. Client initiates HTTP POST /completion with prompt '写一首关于秋天丰收的五言绝句'",
+    "2. Client waits for first token or stream chunk, then immediately closes socket (TCP RST/FIN)",
+    "3. Monitor server log: ensure no VK_ERROR_DEVICE_LOST or SIGSEGV occurs, slot is gracefully returned",
+    "4. Client sends clean second request: '解释什么是牛顿第一运动定律'",
+    "5. Client verifies second request returns HTTP 200, valid text, and finish_reason='stop'"
+  ],
+  "deterministic_target": {
+    "server_exit_required": false,
+    "second_request_success_required": true,
+    "no_gpu_fault": true
+  }
+}

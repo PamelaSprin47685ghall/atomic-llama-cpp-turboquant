@@ -1,0 +1,64 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "你是一个资深 Python 算法工程师。编写语法严谨、结构优雅、无任何 SyntaxError 的 Python 3 代码。"
+      },
+      {
+        "role": "user",
+        "content": "请用 Python 编写一个函数 find_single_number(nums)，输入为一个非空整数列表，其中除了一个数字只出现了一次之外，其余每个数字均恰好出现两次。函数必须返回那个只出现一次的数字。要求：写出函数实现，并附带一行简短的使用示例代码。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 300,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "```python\ndef find_single_number(nums):\n    \"\"\"\n    Find the single number that appears exactly once in a list where\n    all other numbers appear exactly twice.\n    \n    Uses XOR operation: a ^ a = 0, so all paired numbers cancel out,\n    leaving only the single number.\n    \"\"\"\n    result = 0\n    for num in nums:\n        result ^= num\n    return result\n\n\n# Example usage\nprint(find_single_number([2, 3, 2, 4, 4, 3, 5]))  # Output: 5\n```"
+        }
+      }
+    ],
+    "created": 1791819773,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 128,
+      "prompt_tokens": 100,
+      "total_tokens": 228,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-7UEqh5TUtMUZRkYnaggyWu0ZepQXscno",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 100,
+      "prompt_ms": 5055.692,
+      "prompt_per_token_ms": 50.55692,
+      "prompt_per_second": 19.77968594605842,
+      "predicted_n": 128,
+      "predicted_ms": 2327.405,
+      "predicted_per_token_ms": 18.1828515625,
+      "predicted_per_second": 54.99687420109521,
+      "draft_n": 65,
+      "draft_n_accepted": 62
+    }
+  },
+  "wall_ms": 7387.654357,
+  "log_begin": 21201,
+  "log_end": 30984,
+  "phase": "warmup"
+}

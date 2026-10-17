@@ -1,0 +1,24 @@
+{
+  "mode": "isolation",
+  "horizon": 1,
+  "out": "/home/kunweiz/atomic-llama-cpp-turboquant/artifacts/perf-gap/q2-contract-20261012/arms/guardset-v1-h1/guard-08",
+  "server_pid": 475836,
+  "request_a": {
+    "finish_reason": "stop",
+    "n_tokens": 3,
+    "content": "已记下"
+  },
+  "request_b": {
+    "finish_reason": "stop",
+    "n_tokens": 5,
+    "content": "未接收到任何口令"
+  },
+  "leak_check": {
+    "琥珀-8839": false,
+    "8839": false
+  },
+  "server_exit": {
+    "returncode": 0,
+    "forced": false
+  }
+}

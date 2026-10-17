@@ -1,0 +1,14 @@
+--- artifacts/perf-gap/q2-contract-20261012/identity/quarantine-entryRevert/ggml-vulkan.cpp.pre-entry.bak	2026-10-12 18:25:50.584140604 +0000
++++ /var/tmp/tp5-verify-upfold-src/ggml/src/ggml-vulkan/ggml-vulkan.cpp	2026-10-12 18:26:24.313119908 +0000
+@@ -23794,7 +23794,10 @@
+     const auto q8_projection = [&](const ggml_tensor * tensor) {
+         const ggml_tensor * weights = tensor->src[0];
+         const ggml_tensor * input   = tensor->src[1];
+-        return weights && (weights->type == GGML_TYPE_Q8_0 || weights->type == GGML_TYPE_BF16) && ggml_is_contiguous(weights) && weights->ne[0] > 0 &&
++        // ENTRY-REVERT (experiment 3a): pre-2379e1253 gate — fused-segment
++        // entry accepts Q8_0 weights only; BF16 HC weights fall back to the
++        // ordinary operator chain. Single-point revert isolating the entry.
++        return weights && weights->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(weights) && weights->ne[0] > 0 &&
+                weights->ne[0] % 32 == 0 && weights->ne[1] > 0 && weights->ne[2] == 1 && weights->ne[3] == 1 &&
+                ggml_nbytes(weights) <= ctx->device->properties.limits.maxStorageBufferRange &&
+                get_misalign_bytes(ctx, weights) == 0 && f32(input) && input->ne[0] == weights->ne[0] &&

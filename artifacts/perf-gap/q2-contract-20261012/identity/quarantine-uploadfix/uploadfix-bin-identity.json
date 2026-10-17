@@ -1,0 +1,7 @@
+{
+  "frozen_utc": "2026-10-12T21:39:39Z",
+  "purpose": "GAP-1 final closure: upload-chain fix (meta buffer tensor_set fan-out) on rebuild tree",
+  "libllama_so_sha256": "34e4112916198383f03e89820873d66b7733dafc80de76caca20f7adb2a9563d",
+  "libggml_vulkan_so_sha256": "2d1fdb2371f3f97f7a53322ba69d7c1bc73d8e970ac73ebc5f30af545f54e240",
+  "llama_server_sha256": "dacb1336530997e94f55f272a0b144763e5cfbc42af50417851f30a5dc9f3cc2"
+}

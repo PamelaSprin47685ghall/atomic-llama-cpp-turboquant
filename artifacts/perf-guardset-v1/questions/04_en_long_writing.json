@@ -1,0 +1,17 @@
+{
+  "id": "04_en_long_writing",
+  "category": "en_long_writing",
+  "gate_level": "LOG_AND_AUDIT",
+  "prompt": "Write a practical guide for a beginner looking to build a consistent daily reading habit. Cover book selection, schedule management, active note-taking, and long-term motivation.",
+  "system_prompt": "You are an insightful personal development writer. Provide a structured, engaging, and practical guide around 180-220 tokens. Finish naturally.",
+  "expected_aspects": [
+    "Book selection strategy (start with interest or easy reads)",
+    "Schedule management (dedicated daily time window, e.g., 15-20 mins)",
+    "Active note-taking / reflection tip",
+    "Sustaining momentum and long-term motivation"
+  ],
+  "constraints": {
+    "target_tokens_range": [160, 240],
+    "max_tokens": 350
+  }
+}

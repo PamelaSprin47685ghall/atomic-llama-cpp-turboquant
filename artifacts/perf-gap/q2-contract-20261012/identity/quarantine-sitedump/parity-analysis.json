@@ -1,0 +1,40 @@
+{
+  "frozen_utc": "2026-10-12T20:57:59Z",
+  "experiment": "GAP1 step 2 site-dump pair (fused vs ref)",
+  "execution_notes": [
+    "CPU precheck: test-tp5-upfold-indexing.py 22 tests OK (incl. HcSiteDumpSentinelTests)",
+    "Instrumentation: 6 hunks applied via exact edits from worktree (cstdio, counter field, helper fn, env block, 3 dump points); worktree untouched; anchor grep 14 hits",
+    "Fused build: incremental on /var/tmp/tp5-verify-rebuild-build (staleness disproven by GAP-1 step 0), vk=857ce9dd…",
+    "Ref build: fresh full build /var/tmp/tp5-sitedump-build-ref from tree copy + 3a entry revert (Q8_0-only), vk=be4946ab…",
+    "CRITICAL execution detail: first run attempt hit the documented skip — replay/program recording is ALWAYS active under TP5 (common.cpp sets GGML_VK_CMD_REPLAY default 1); resolved by --env GGML_VK_CMD_REPLAY=0 which routes execution through the non-recording cold path; also warmup 0 so the single request is the cold first request",
+    "Both arms runner exit 1: max_tokens=32 truncation (NOT_NATURAL_STOP) — expected for a diagnostic dump round, not an anomaly; fused body garbled (健康做…), ref body correct (健康减重并非靠极端节食…)"
+  ],
+  "fused_arm": {
+    "status": "DIAGNOSTIC (garbled, as predicted for entry-open)",
+    "body_prefix": "健康做，，，，，，，，且，，，在rata，让我，rata…",
+    "dumps": [
+      "9 files: site{1,2,3}-{normalized,lo,mixed}.bin"
+    ],
+    "dump_morphology": {
+      "site1-normalized": "n=10240 ALL NONZERO, values look like real activations (0.23, -0.42, 1.20…)",
+      "site1-lo": "n=320 ALL ZERO",
+      "site1-mixed": "n=2560 ALL ZERO",
+      "(site2/site3 identical pattern)": "normalized all nonzero, lo/mixed all zero"
+    }
+  },
+  "ref_arm": {
+    "status": "DIAGNOSTIC (correct output: 健康减重并非靠极端节食，而是建立可持续的生活习惯…)",
+    "dumps": "NONE — entry revert excludes BF16 from the fused segment, HC segment never activates, dump points never fire (exactly the 3a prediction)"
+  },
+  "parity_analysis": "NOT_PERFORMABLE_AS_DESIGNED: the ref arm produces no dumps because the HC fused segment does not activate under the entry revert — the two-binary comparison contract in docs/TP5-HC-SITE-DUMP.md requires both arms to traverse the HC segment, but the only known-good configuration (entry closed) never enters it",
+  "key_finding": {
+    "observation": "In the fused arm, normalized is fully populated with plausible activation values, but lo (the DOWN contraction output) is ALL ZERO at every dumped site, and mixed (the UP/FOLD output) is ALL ZERO downstream of it",
+    "interpretation": "The down contraction (qwen4_hc_down_silu_bf16) writes nothing (or writes zeros) to its output — the defect is at or before the down dispatch, not in the decode paths (consistent with V-A: both iter() and iter_aligned_nonquant() produce the same all-zero lo). The zero lo propagates: mixed = fold(up(silu(zero))) = 0. This is a total-output failure, not a partial drift.",
+    "candidate_mechanisms": [
+      "down dispatch writes to the wrong buffer/offset (output descriptor miswiring for the bf16 variant)",
+      "down dispatch never executes (grid size 0 — e.g. dispatch_rows/rows math yields 0 for the bf16 path despite the upfold dispatch_rows fix)",
+      "down output barrier missing so the dump copy reads pre-write state (but dump is after barrier per instrumentation)"
+    ]
+  },
+  "verdict_table": "normalized populated + lo ALL ZERO -> defect is in the DOWN contraction stage (between normalized and lo) of the BF16 fused segment — this refines the V-A shared-layer finding from \"shared layer\" to \"the down contraction itself (its dispatch or output wiring), before any decode-path difference could matter"
+}

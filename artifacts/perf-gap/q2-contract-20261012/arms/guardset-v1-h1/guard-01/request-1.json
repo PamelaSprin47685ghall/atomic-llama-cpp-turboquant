@@ -1,0 +1,64 @@
+{
+  "payload": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "你是一个严谨且通俗易懂的科学百科助手。请条理分明地回答用户的物理科学问题，避免堆砌晦涩名词。"
+      },
+      {
+        "role": "user",
+        "content": "请解释为什么天空在晴朗的白天通常呈现蓝色，而在日落时会呈现红色或橙色。请用通俗语言分两点说明。"
+      }
+    ],
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 300,
+    "cache_prompt": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "stream": false
+  },
+  "response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "天空颜色的变化主要源于阳光与大气中微小颗粒的相互作用，我们可以用以下两点通俗地解释：\n\n**1. 白天：蓝光更容易被“散射”到四面八方**\n阳光包含所有颜色的光（红、橙、黄、绿、蓝、紫等）。当阳光进入大气层时，会撞击空气中的微小分子。根据物理学中的“瑞利散射”原理，波长较短的光（如蓝色和紫色）比波长较长的光（如红色和黄色）更容易被这些微小分子向各个方向散射。因此，当我们抬头看天空时，看到的是被散射到各个方向的蓝光，所以天空呈现蓝色。\n\n**2. 日落时：蓝光被“过滤”掉，红光穿透大气层**\n日落时，太阳位于地平线附近，阳光穿过大气层的路径比正午时更长。在这漫长的路径中，波长较短的蓝光和紫光在到达我们的眼睛之前，已经被大气层中的分子和尘埃散射掉或吸收掉了。而波长较长的红光和橙光穿透能力更强，能够穿过厚厚的大气层直达我们的眼睛，因此日落时天空呈现红色或橙色。"
+        }
+      }
+    ],
+    "created": 1791819485,
+    "model": "/home/kunweiz/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "system_fingerprint": "b2188-9be06d5ab",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 235,
+      "prompt_tokens": 69,
+      "total_tokens": 304,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-8T14jIAk9L03bzHGVkmxlEoo4WEDvVaz",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 69,
+      "prompt_ms": 2817.681,
+      "prompt_per_token_ms": 40.83595652173913,
+      "prompt_per_second": 24.48822276190953,
+      "predicted_n": 235,
+      "predicted_ms": 4249.977,
+      "predicted_per_token_ms": 18.085008510638296,
+      "predicted_per_second": 55.29441688743257,
+      "draft_n": 133,
+      "draft_n_accepted": 101
+    }
+  },
+  "wall_ms": 7709.656703,
+  "log_begin": 36039,
+  "log_end": 66414,
+  "phase": "measured"
+}

@@ -1,0 +1,28 @@
+{
+  "id": "07_context_multi_turn",
+  "category": "context_dependency_multi_turn",
+  "gate_level": "MUST_PASS",
+  "dialogue": [
+    {
+      "role": "user",
+      "content": "我计划今年去杭州旅游三天，初步路线是：第一天游览西湖，第二天游览灵隐寺，第三天去西溪湿地。"
+    },
+    {
+      "role": "assistant",
+      "content": "这个三日游行程安排很合理，涵盖了杭州的自然山水、历史寺庙和湿地生态。"
+    },
+    {
+      "role": "user",
+      "content": "在刚才的计划中，我第二天要去哪里？请直接说出地点，并为那一天的游览推荐两个实用的注意事项。"
+    }
+  ],
+  "deterministic_target": {
+    "target_location": "灵隐寺",
+    "forbidden_locations_as_answer": ["西湖", "西溪湿地"],
+    "must_contain_recommendations": true
+  },
+  "constraints": {
+    "max_tokens": 250,
+    "min_tokens": 40
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "frozen_utc": "2026-10-12T15:58:26Z",
+  "guard_set": "artifacts/perf-gap/q2-contract-20261012/guard-set",
+  "version": "v2-guard-1",
+  "files_total": 23,
+  "files_sha256": {
+    "README.md": "ad1e179b279124c207acb2eeacba7ba5e9c02dcb45ea58e0fcc3e86ef88b4176",
+    "guard-01-quality.md": "e5c348aebf47cf44f4231b5783771882dc1188579809b6d9192abd617ba6cc8b",
+    "guard-01.txt": "e0572bfbcf03e08a65654fa230b4491d3e07bd7bf2d02e7dd9ba7556251fa6ec",
+    "guard-02-quality.md": "f621bf717e3be136d7685ec66eff4a73ad6c47a1788572cecaac2d4e17a99441",
+    "guard-02.txt": "a320564c1d5368a6c93ca4db0c6156870a36268bd6f902f9ee9e11aec189560c",
+    "guard-03-quality.md": "fd0102d220efe5529de7214cc2679efbe3df3edda2ff6d688e27b35accf3c96f",
+    "guard-03.txt": "7b5108910977c4bfb4396df88f8c283cad8406aae7e12197ccd23bdc0553bc29",
+    "guard-04-quality.md": "fcb44b80b833141c378a9d61f03c1a2a7d5d3be6e1fdd61f51d68bf5a9b83784",
+    "guard-04.txt": "cbbf2d5f81619102502ba6833f980ad254c63c2ba513fd9473975c0d55d83d5c",
+    "guard-05-quality.md": "bbea72e5ef30bcd4bc9c4f92aec553f7f49900ae29027583bf957ffe43957f83",
+    "guard-05.txt": "2084fa97063571c201a2d38bb9fc6f74e8861d0a414ead0976c377f2410b50b1",
+    "guard-06-quality.md": "483db2b14868e72c0c8261aae8926f323ff7d9c80373c9cec933749927ab6402",
+    "guard-06.txt": "6e5e1e04584670a5140418fa43785fa52af9297de4ca5ca8d93d3774dd91aada",
+    "guard-07-quality.md": "adb9660c9b46dc9731c4724ed9007efc492ff7d9e6338be131f39578dfdee284",
+    "guard-07.txt": "5206333f3214e096f64e6e2bb9382bce37da99752a4581c28ace9f768dce31a6",
+    "guard-08-quality.md": "f732a64584aa6a4fd12d0dec549005dc8d64ff9b799757b6a66184b7ab038af4",
+    "guard-08.txt": "93e3cbc26eb022b08a64e377973e99bb53d0fc679ae13458e3cad08741ac399f",
+    "guard-09-quality.md": "07170f62998d36bbd315aa9156c01e631321abf65b3f28770e7bbc24080a640e",
+    "guard-09.txt": "99421b65c7a048a27b2de60071d81df8f651f65dd85d5d12f14ecf0e5a10028a",
+    "guard-10-quality.md": "58ed492583d6474d45171c1b055960d02e8af7682fc5a2fefc4aa29be6b5281c",
+    "guard-10.txt": "02958df93eea41f02d22efd398e867fe0294a4a4172dbc651de9cf7a5c1d7c41",
+    "manifest.json": "58c9fe48324e096b0b5dd84fa28076ea0fe0d0954c6b498903268bd0f5ecfd72",
+    "neutral-system.txt": "27b17dd84c9101b3f2ab353516613b0a889b22538b846c96baa108d1385f9ea4"
+  },
+  "manifest_updated_fields": [
+    "questions[].sha256 (10)",
+    "freeze_status -> FROZEN_BY_DEVOPS",
+    "frozen_utc added",
+    "char_count corrected where mismatched"
+  ],
+  "char_count_review": {
+    "mismatches": [
+      {
+        "id": "guard-03",
+        "declared": 139,
+        "actual": 140
+      }
+    ],
+    "basis": "UTF-16 code units（内容均为 BMP 字符，与码点数一致），含文件末尾换行。"
+  },
+  "note": "manifest itself cannot self-register its own hash; README.md, neutral-system.txt, 10 quality-criteria md files are registered here in the confirmation record (manifest has no fields for them); question .txt files are registered in manifest.questions[].sha256"
+}

@@ -1,0 +1,16 @@
+{
+  "id": "03_zh_short_fact",
+  "category": "zh_short_fact",
+  "gate_level": "MUST_PASS",
+  "prompt": "中国战国时期“纸上谈兵”这一成语源自哪一场著名战役？涉及的赵国将领是谁？请用两句话以内直接回答，避免多余陈述。",
+  "system_prompt": "你是一个精准的历史问答助手。回答必须严格遵循字数和句数限制，直接给出核心事实。",
+  "deterministic_target": {
+    "battle": "长平之战",
+    "general": "赵括",
+    "max_sentences": 2
+  },
+  "constraints": {
+    "max_tokens": 80,
+    "min_tokens": 10
+  }
+}

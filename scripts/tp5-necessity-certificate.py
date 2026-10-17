@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Necessity certificate v4 for the fixed TP5 single-user generation task.
+"""Necessity certificate v5 for the fixed TP5 single-user generation task.
 
 v4 supersedes v3 and fixes three soundness defects found by audit:
 
@@ -56,10 +56,43 @@ number.
 
 Usage:
   python3 tp5-necessity-certificate.py --json out.json
+  python3 tp5-necessity-certificate.py --json out.json --u-seconds 0.0148 --u-source "run-YYYYMMDD arm" --u-qualification "conservative statistic of a qualified arm"
+
+v5 adds the AGENTS.md §15 algorithm-P branch-family ledger on top of v4:
+
+  P1  structured enumeration of legal branches: layout family
+      {mirrored, owner, coordinate, layer, hybrid} x communication family
+      {host-relay, peer-copy, device-side} x representation family
+      {original, qualified-quant} x MTP depth {0,1,2,3} -> 120 records.
+  P2  each branch must explicitly declare four premise slots (mandatory
+      weight/state information, physical cut-set, fast-storage capacity
+      credit, overlap declaration); any undeclared slot makes the branch
+      UNRESOLVED automatically.
+  P3/P4  Lj is emitted only when every premise slot is declared AND every
+      bound claim carries verifiable certificate material: a resource
+      counting lemma (proved-work basis / capacity-upper basis) with its
+      counting-argument justification, or an LP dual-feasible solution with
+      the relaxation-mapping argument. Solver incumbents are refused.
+  P5  global L = min_j Lj over ALL branches; any UNRESOLVED or REJECTED
+      branch keeps global_L UNRESOLVED (never the min of a proven subset).
+  P6/P7  Gap = U/L - 1 is computed only when global_L is PROVEN and a
+      qualified U (value + source + qualification statement) is supplied;
+      otherwise the gap is reported UNPROVEN and no ratio is emitted.
+
+Current honest state: no branch has its four premise slots declared, so all
+120 branches are UNRESOLVED, global_L is UNRESOLVED and the gap is UNPROVEN.
+The v4 L_global/L_nomtp bounds below are retained as declared conditional
+arguments over the whole allowed set; they are NOT per-branch premise
+declarations under algorithm P and are deliberately not promoted into the
+ledger (see branch_ledger.relation_to_v4_bounds).
 """
 import argparse
+import importlib.util
 import json
 import math
+import sys
+from dataclasses import dataclass
+from pathlib import Path
 
 # Fixed model contract (Qwen4EXP-AF, verified from GGUF metadata).
 N_LAYERS = 48
@@ -97,6 +130,437 @@ R2_BYTES_PER_BOUNDARY = (HIDDEN // N_RANKS) * 4   # 2048 bytes
 R2_BOUNDARIES = N_LAYERS                            # 48 sequential layers
 
 
+# ============================================================================
+# AGENTS.md §15 algorithm P: branch-family ledger (P1-P7)
+# ============================================================================
+
+# Shared, already-audited proof primitives. The audited label checks are NOT
+# automatic theorem proving: they refuse known-bad bases (work measured on a
+# current implementation, capacity taken from an observed throughput, empty
+# premises) but never verify that a declared premise is true.
+_AUDIT_PATH = Path(__file__).resolve().parent / 'tp5-necessity-audit.py'
+
+
+def _load_audit_module():
+    spec = importlib.util.spec_from_file_location('tp5_necessity_audit_shared', _AUDIT_PATH)
+    if not spec or not spec.loader:
+        raise ValueError(f'Unable to load audited necessity module: {_AUDIT_PATH}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_audit = _load_audit_module()
+NecessaryResource = _audit.NecessaryResource
+joint_lower = _audit.joint_lower
+
+# P1: structured enumeration of the legal implementation-branch families.
+LAYOUT_FAMILIES = ('mirrored', 'owner', 'coordinate', 'layer', 'hybrid')
+COMMUNICATION_FAMILIES = ('host-relay', 'peer-copy', 'device-side')
+REPRESENTATION_FAMILIES = ('original', 'qualified-quant')
+MTP_DEPTHS = (0, 1, 2, 3)
+
+# P2: the four premise slots every branch must declare explicitly.
+PREMISE_SLOTS = (
+    'required_weight_state_information',
+    'physical_cut_set',
+    'storage_capacity_assumption',
+    'overlap_declaration',
+)
+
+PREMISE_SLOT_DESCRIPTIONS = {
+    'required_weight_state_information': (
+        'Which weight/state bytes are provably mandatory for EVERY legal '
+        'implementation of this branch (the W_min basis), and how the count '
+        'excludes current-layout amplification.'),
+    'physical_cut_set': (
+        'Which information provably crosses which physical boundary in this '
+        'branch (the cut-set basis), including why no smaller sufficient '
+        'statistic or local recomputation avoids the crossing.'),
+    'storage_capacity_assumption': (
+        'The fast-storage capacity credit C for this branch: which levels '
+        '(registers/LDS/L2/Infinity Cache/prefetch buffers) count and the '
+        'assumed bound; stated conservatively for the implementer.'),
+    'overlap_declaration': (
+        'Which mandatory resources are declared overlapping (max rule) and '
+        'which non-overlap couplings are actually proven; summing bounds is '
+        'forbidden without this.'),
+}
+
+_WORK_BASIS_PROVED = 'proved_for_declared_class'
+_CAPACITY_BASIS_UPPER = 'upper_bound_for_declared_class'
+
+
+@dataclass(frozen=True)
+class ResourceLemmaClaim:
+    """One resource-lemma bound claim: T >= required_work / capacity_upper.
+
+    The bases go through the audited label checks: work measured on a
+    current implementation and capacity taken from an observed throughput
+    are both refused.
+    """
+    required_work: float
+    capacity_upper: float
+    work_basis: str = _WORK_BASIS_PROVED
+    capacity_basis: str = _CAPACITY_BASIS_UPPER
+    justification: str = ''
+
+
+@dataclass(frozen=True)
+class LpRelaxationClaim:
+    """One relaxation bound claim for  min c.x  s.t.  A x >= b, x >= 0.
+
+    kind='dual': 'vector' is a dual-feasible y >= 0 with A^T y <= c. Weak
+    duality makes the verified dual objective b.y a checkable lower-bound
+    certificate. kind='incumbent': 'vector' is only a primal-feasible x; an
+    incumbent proves nothing about the minimum and is always refused.
+    'relaxation_description' must argue why every legal implementation of
+    the branch maps to a feasible point of the relaxation (algorithm P3);
+    without that mapping the number is not a bound for this branch.
+    """
+    kind: str
+    A: tuple
+    b: tuple
+    c: tuple
+    vector: tuple
+    relaxation_description: str = ''
+
+
+@dataclass(frozen=True)
+class BranchRecord:
+    """P1: one legal branch of the allowed implementation set."""
+    branch_id: str
+    layout: str
+    communication: str
+    representation: str
+    mtp_depth: int
+    premises: dict
+    bound_claims: tuple
+
+
+def make_branch_id(layout, communication, representation, mtp_depth):
+    return f'{layout}+{communication}+{representation}+h{mtp_depth}'
+
+
+def enumerate_branches():
+    """P1: one record per legal branch; premises start undeclared."""
+    records = []
+    for layout in LAYOUT_FAMILIES:
+        for communication in COMMUNICATION_FAMILIES:
+            for representation in REPRESENTATION_FAMILIES:
+                for depth in MTP_DEPTHS:
+                    records.append(BranchRecord(
+                        branch_id=make_branch_id(layout, communication, representation, depth),
+                        layout=layout,
+                        communication=communication,
+                        representation=representation,
+                        mtp_depth=depth,
+                        premises={slot: None for slot in PREMISE_SLOTS},
+                        bound_claims=()))
+    return records
+
+
+def branch_premise_class(record):
+    """The single implementation class all of a branch's claims must address."""
+    return f'branch:{record.branch_id}'
+
+
+def _lp_dimensions_ok(A, b, c_vec, v):
+    if not A or not b or not c_vec or not v:
+        return False
+    n = len(A[0])
+    if any(len(row) != n for row in A):
+        return False
+    return len(b) == len(A) and len(c_vec) == n and len(v) == len(A)
+
+
+def verify_lp_dual(A, b, c_vec, y, tol=1e-9):
+    """Verify a dual-feasible certificate; return its dual objective value.
+
+    LP form:  min c.x  s.t.  A x >= b, x >= 0.
+    Dual:     max b.y  s.t.  A^T y <= c, y >= 0.
+    Weak duality makes b.y a lower bound on the primal optimum, so a
+    dual-feasible y is a checkable lower-bound certificate. Incumbent
+    primal points are never accepted (see LpRelaxationClaim.kind).
+    """
+    if not _lp_dimensions_ok(A, b, c_vec, y):
+        raise ValueError('LP certificate dimensions inconsistent')
+    m = len(A)
+    n = len(c_vec)
+    for row in A:
+        for a_ij in row:
+            _audit.finite(a_ij)
+    for vec in (b, c_vec, y):
+        for value in vec:
+            _audit.finite(value)
+    for y_i in y:
+        if y_i < 0:
+            raise ValueError('Dual certificate must satisfy y >= 0')
+    for j in range(n):
+        col_sum = sum(A[i][j] * y[i] for i in range(m))
+        if col_sum > c_vec[j] + tol:
+            raise ValueError(f'Dual certificate violates A^T y <= c at column {j}')
+    return float(sum(b[i] * y[i] for i in range(m)))
+
+
+def _positive_finite(x):
+    return (not isinstance(x, bool) and isinstance(x, (int, float))
+            and math.isfinite(x) and x > 0)
+
+
+def _verify_claim(claim, premise_class):
+    """Verify one bound claim; return its lower-bound value or raise."""
+    if isinstance(claim, ResourceLemmaClaim):
+        if not claim.justification.strip():
+            raise ValueError('Resource-lemma claim carries no counting-argument '
+                             'justification; that text is the certificate material')
+        resource = NecessaryResource(claim.required_work, claim.work_basis,
+                                     claim.capacity_upper, claim.capacity_basis,
+                                     premise_class)
+        return resource.latency_lower()
+    if isinstance(claim, LpRelaxationClaim):
+        if not claim.relaxation_description.strip():
+            raise ValueError('LP relaxation claim carries no mapping argument '
+                             '(why every legal implementation of the branch maps '
+                             'to a feasible point of the relaxation)')
+        if claim.kind == 'incumbent':
+            raise ValueError('Incumbent/primal feasible solutions are not '
+                             'lower-bound certificates; only dual-feasible '
+                             'solutions or equivalent proofs are accepted')
+        if claim.kind != 'dual':
+            raise ValueError(f'Unknown LP claim kind: {claim.kind!r}')
+        return verify_lp_dual(claim.A, claim.b, claim.c, claim.vector)
+    raise ValueError(f'Unknown bound claim type: {type(claim).__name__}')
+
+
+def _claim_summary(claim, value):
+    if isinstance(claim, ResourceLemmaClaim):
+        return {
+            'claim_kind': 'resource_lemma',
+            'verified_lower_bound_seconds': value,
+            'work_basis': claim.work_basis,
+            'capacity_basis': claim.capacity_basis,
+            'justification': claim.justification,
+        }
+    return {
+        'claim_kind': 'lp_dual',
+        'verified_lower_bound_seconds': value,
+        'relaxation_description': claim.relaxation_description,
+    }
+
+
+def _branch_base(record):
+    return {
+        'branch_id': record.branch_id,
+        'layout': record.layout,
+        'communication': record.communication,
+        'representation': record.representation,
+        'mtp_depth': record.mtp_depth,
+    }
+
+
+def evaluate_branch(record):
+    """P3/P4: emit Lj only with full premises and verified certificates.
+
+    Undeclared premise slots -> UNRESOLVED (automatic, per P2). Fabricated
+    or unverifiable claim material -> REJECTED. Only fully declared and
+    fully verified branches get an Lj.
+    """
+    result = _branch_base(record)
+    missing = [slot for slot in PREMISE_SLOTS
+               if not str(record.premises.get(slot) or '').strip()]
+    if missing:
+        result.update({
+            'status': 'UNRESOLVED',
+            'Lj_seconds': None,
+            'missing_premise_slots': missing,
+            'rejection_reasons': [],
+            'certificates': None,
+        })
+        return result
+    if not record.bound_claims:
+        result.update({
+            'status': 'UNRESOLVED',
+            'Lj_seconds': None,
+            'missing_premise_slots': [],
+            'rejection_reasons': ['premises declared but no bound claims or '
+                                  'proof material supplied'],
+            'certificates': None,
+        })
+        return result
+    premise_class = branch_premise_class(record)
+    certificates = []
+    rejections = []
+    resource_claims = []
+    lp_values = []
+    for claim in record.bound_claims:
+        try:
+            value = _verify_claim(claim, premise_class)
+        except ValueError as exc:
+            rejections.append(str(exc))
+            continue
+        certificates.append(_claim_summary(claim, value))
+        if isinstance(claim, ResourceLemmaClaim):
+            resource_claims.append(claim)
+        else:
+            lp_values.append(value)
+    if rejections:
+        # Fabricated or unverifiable material invalidates the whole branch
+        # claim: the branch is rejected, never partially credited.
+        result.update({
+            'status': 'REJECTED',
+            'Lj_seconds': None,
+            'missing_premise_slots': [],
+            'rejection_reasons': rejections,
+            'certificates': certificates,
+        })
+        return result
+    values = []
+    if resource_claims:
+        # joint_lower re-checks the same-premise-class requirement and
+        # applies the max rule (docs/performance-necessity.md §4.2).
+        values.append(joint_lower([
+            NecessaryResource(cl.required_work, cl.work_basis,
+                              cl.capacity_upper, cl.capacity_basis, premise_class)
+            for cl in resource_claims]))
+    values.extend(lp_values)
+    result.update({
+        'status': 'PROVEN',
+        'Lj_seconds': max(values),
+        'missing_premise_slots': [],
+        'rejection_reasons': [],
+        'certificates': certificates,
+    })
+    return result
+
+
+def merge_lower_bounds(results):
+    """P5: global L = min_j Lj over ALL branches, or UNRESOLVED.
+
+    Any UNRESOLVED or REJECTED branch keeps the global lower bound
+    UNRESOLVED. The minimum over a proven subset is never promoted as the
+    global L: T* is the infimum over the UNION of all branches.
+    """
+    if not results:
+        raise ValueError('No branch results to merge')
+    allowed = {'PROVEN', 'UNRESOLVED', 'REJECTED'}
+    for r in results:
+        if r.get('status') not in allowed:
+            raise ValueError(f"Unknown branch status: {r.get('status')!r}")
+        if r['status'] == 'PROVEN':
+            if not r.get('certificates'):
+                raise ValueError(f"PROVEN branch {r['branch_id']} carries no "
+                                 'certificate material')
+            if not _positive_finite(r.get('Lj_seconds')):
+                raise ValueError(f"PROVEN branch {r['branch_id']} has no valid Lj")
+    unresolved = [r['branch_id'] for r in results if r['status'] == 'UNRESOLVED']
+    rejected = [r['branch_id'] for r in results if r['status'] == 'REJECTED']
+    proven = [r for r in results if r['status'] == 'PROVEN']
+    if unresolved or rejected or not proven:
+        return {
+            'status': 'UNRESOLVED',
+            'global_L_seconds': None,
+            'rule': ('L = min_j Lj over ALL branches of the allowed set; any '
+                     'UNRESOLVED or REJECTED branch forces global_L UNRESOLVED; '
+                     'the minimum over a proven subset is never promoted as the '
+                     'global L'),
+            'proven_branch_count': len(proven),
+            'unresolved_branches': unresolved,
+            'rejected_branches': rejected,
+        }
+    return {
+        'status': 'PROVEN',
+        'global_L_seconds': min(r['Lj_seconds'] for r in proven),
+        'rule': ('L = min_j Lj: T* is the infimum of T(a) over the union of '
+                 'all branch classes'),
+        'proven_branch_count': len(proven),
+        'unresolved_branches': [],
+        'rejected_branches': [],
+    }
+
+
+def gap_assessment(global_lower, u_seconds=None, u_source=None,
+                   u_qualification=None):
+    """P6/P7: U/L is computed only when L and a qualified U are both valid.
+
+    A fabricated ratio is worse than none: with an invalid global L or an
+    unqualified/missing U the gap stays UNPROVEN and no numeric ratio is
+    emitted.
+    """
+    out = {
+        'status': 'UNPROVEN',
+        'U_seconds': None,
+        'U_source': None,
+        'U_qualification': None,
+        'U_over_L': None,
+        'gap_minus_1': None,
+        'reason': None,
+    }
+    if (not isinstance(global_lower, dict)
+            or global_lower.get('status') != 'PROVEN'
+            or not _positive_finite(global_lower.get('global_L_seconds'))):
+        out['reason'] = 'global L is not PROVEN; no U/L ratio may be computed'
+        return out
+    if (u_seconds is None or isinstance(u_seconds, bool)
+            or not isinstance(u_seconds, (int, float))
+            or not math.isfinite(u_seconds) or u_seconds <= 0
+            or not str(u_source or '').strip()
+            or not str(u_qualification or '').strip()):
+        out['reason'] = ('U is absent, non-finite or lacks a source/qualification '
+                         'statement; no U/L ratio may be computed')
+        return out
+    L = global_lower['global_L_seconds']
+    ratio = float(u_seconds) / L
+    out.update({
+        'status': 'PROVEN_RATIO',
+        'U_seconds': float(u_seconds),
+        'U_source': str(u_source),
+        'U_qualification': str(u_qualification),
+        'U_over_L': ratio,
+        'gap_minus_1': ratio - 1.0,
+    })
+    return out
+
+
+def build_branch_ledger(u_seconds=None, u_source=None, u_qualification=None):
+    """Assemble the full algorithm-P branch ledger for the allowed set."""
+    records = enumerate_branches()
+    results = [evaluate_branch(record) for record in records]
+    merged = merge_lower_bounds(results)
+    gap = gap_assessment(merged, u_seconds, u_source, u_qualification)
+    return {
+        'kind': 'BRANCH_FAMILY_LEDGER_PER_AGENTS_ALGORITHM_P',
+        'families': {
+            'layout': list(LAYOUT_FAMILIES),
+            'communication': list(COMMUNICATION_FAMILIES),
+            'representation': list(REPRESENTATION_FAMILIES),
+            'mtp_depths': list(MTP_DEPTHS),
+        },
+        'premise_slots': dict(PREMISE_SLOT_DESCRIPTIONS),
+        'combination_rules': {
+            'within_branch': ('Lj = max over verified claims; distinct resources '
+                              'may overlap in one elapsed interval, and a sum '
+                              'needs a proven non-overlap coupling'),
+            'across_branches': ('L = min_j Lj (T* is the infimum over the union '
+                                'of all branches)'),
+            'global_guard': ('any UNRESOLVED or REJECTED branch keeps global_L '
+                             'UNRESOLVED; never min over a proven subset'),
+        },
+        'total_branches': len(records),
+        'branch_results': results,
+        'global_L': merged,
+        'gap': gap,
+        'relation_to_v4_bounds': (
+            'The v4 L_global/L_nomtp numbers are declared conditional '
+            'arguments over the whole allowed set; they are NOT per-branch '
+            'premise declarations under algorithm P and are deliberately not '
+            'promoted into this ledger. Under the P2 per-branch standard no '
+            'branch currently declares all four premise slots, so global_L '
+            'stays UNRESOLVED and the gap stays UNPROVEN.'),
+    }
+
+
 def interface_time(bytes_, ceiling_gb_s):
     if bytes_ < 0 or ceiling_gb_s <= 0:
         raise ValueError("Invalid resource input")
@@ -118,7 +582,7 @@ def active_dense_bytes_per_gpu():
     return DENSE_BYTES_PER_LAYER * N_LAYERS / N_RANKS
 
 
-def derive():
+def derive(u_seconds=None, u_source=None, u_qualification=None):
     # Per target row = per public token for no-MTP implementations.
     r1_strong = interface_time(R1_BYTES_STRONG, HOST_READBACK_GB_S)
     r1_weak = interface_time(R1_BYTES_WEAK, HOST_READBACK_GB_S)
@@ -178,9 +642,11 @@ def derive():
     per_token_lo_global = max(r1_weak, r2_total, r4_time)
     per_token_lo_global_strong = max(r1_strong, r2_total, r4_time)
 
+    ledger = build_branch_ledger(u_seconds, u_source, u_qualification)
+
     return {
         "task": "TP5 ordinary single-user generation, Qwen4EXP-AF, 5x RX 6800",
-        "version": "v4",
+        "version": "v5",
         "supersedes": "v3 (DEFECT-1 dense bytes 90.8->63.82 MB/layer; DEFECT-2 L2 credit "
                       "pool->active denominator; DEFECT-3 MTP amortization invalidates R3 "
                       "in the global bound)",
@@ -259,14 +725,21 @@ def derive():
                 "valid_for": "declared conditional class A_nomtp (no speculative row batching)",
             },
         },
+        "branch_ledger": ledger,
     }
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--json', required=True)
+    ap.add_argument('--u-seconds', type=float, default=None,
+                    help='optional achievable U per public token in seconds')
+    ap.add_argument('--u-source', default=None,
+                    help='provenance statement required for a valid U')
+    ap.add_argument('--u-qualification', default=None,
+                    help='qualification statement (conservative statistic) for a valid U')
     args = ap.parse_args()
-    cert = derive()
+    cert = derive(args.u_seconds, args.u_source, args.u_qualification)
     with open(args.json, 'w') as f:
         json.dump(cert, f, indent=2)
     b = cert["bounds"]
@@ -282,6 +755,12 @@ def main():
           "keeps R3 for the no-MTP conditional class with corrected dense bytes (63.82 "
           "MB/layer) and max L2 credit (128MB of the active set). Both bounds remain "
           "loose: spec ceilings, maximal overlap, no KV-state or latency-chain terms.")
+    ledger = cert["branch_ledger"]
+    print(f"Branch ledger (algorithm P): {ledger['total_branches']} branches, "
+          f"proven={ledger['global_L']['proven_branch_count']}")
+    print(f"global_L: {ledger['global_L']['status']}")
+    reason = ledger['gap'].get('reason')
+    print(f"Gap:      {ledger['gap']['status']}" + (f" ({reason})" if reason else ""))
 
 
 if __name__ == '__main__':
