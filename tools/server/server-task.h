@@ -952,6 +952,8 @@ struct server_task {
     // causal source. Empty for non-chat/multimedia-only requests.
     std::string rerot_original_user_text;
 
+    std::string cache_key;
+
     server_rerot_episode_key rerot_key() const;
     bool rerot_key_matches(int task, uint64_t episode, uint64_t gen) const;
     void rerot_bump_generation();

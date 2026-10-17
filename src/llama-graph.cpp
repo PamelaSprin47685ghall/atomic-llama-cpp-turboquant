@@ -3138,9 +3138,13 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         }
     }
 
+    for (auto & input : inputs) {
+        res = res && input->can_reuse(params);
+    }
+
     if (debug > 0) {
         LLAMA_LOG_DEBUG("%s: can reuse graph = %d\n", __func__, res);
-        res = res && input->can_reuse(params);    }
+    }
 
     return res;
 }
@@ -4460,8 +4464,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il,
-             int64_t   n_kv_max) const {
+                 int   il) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -5159,8 +5162,8 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
     }
 
-    cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);    cb(cur, "kqv_out", il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, the output has padded dimensions.
     // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).

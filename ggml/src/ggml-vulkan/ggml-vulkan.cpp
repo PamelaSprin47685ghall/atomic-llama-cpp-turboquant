@@ -7,7 +7,8 @@
 #include <vulkan/vulkan_core.h>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
-#endif#if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
+#endif
+#if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
 #include "ggml-cpu.h"
 
@@ -2363,7 +2364,8 @@ struct vk_op_gated_delta_net_push_constants {
     // Zero when absent; bit 31 set when a map is present.
     uint32_t headmap;
     uint32_t active_tokens;
-    uint32_t emit_mode;};
+    uint32_t emit_mode;
+};
 
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
@@ -3774,7 +3776,7 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     // Replay chains have no near-completion marker. Polling their entire
     // execution burns a CPU core and thousands of ioctls per token.
     if (!ctx->almost_ready_fence_pending) {
-        VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "graph_fence");
+        VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "graph_fence", ctx->device);
         ctx->device->device.resetFences({ ctx->fence });
         return;
     }
@@ -12099,12 +12101,6 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_IQ4_NL:
             return ctx->device->pipeline_cpy_quant_f32[src->type];
-        case GGML_TYPE_TURBO2_0:
-        case GGML_TYPE_TURBO3_0:
-        case GGML_TYPE_TURBO4_0:
-            // Bounded hot-row rephasing read path only; all other Turbo
-            // consumers keep their dedicated kernels.
-            return ctx->device->pipeline_cpy_quant_f32[src->type];
         default:
             break;
         }
@@ -18354,9 +18350,7 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
                         "TP5 GDN head map index out of range");
         }
     }
-    // K (snapshot slot count) is op param 0; emit_mode is op param 1. State holds s0 only
-    // [S_v, S_v, H, n_seqs].
-    const uint32_t K         = (uint32_t)ggml_get_op_params_i32(dst, 0);
+    // emit_mode is op param 1 (0 = full snapshots, 1 = replay ingredients).
     const uint32_t emit_mode = (uint32_t)ggml_get_op_params_i32(dst, 1);
     const uint32_t s_off = S_v * H * n_tokens * n_seqs;
 
@@ -18396,7 +18390,7 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         scale,
         K,
         headmap_pc,
-        (uint32_t) active_tokens
+        (uint32_t) active_tokens,
         emit_mode    };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -23534,7 +23528,7 @@ static bool ggml_backend_vk_buffer_memmove_tensor(
 
     ggml_vk_ctx_end(subctx);
     ggml_vk_submit(subctx, device->fence);
-    VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "vk_buffer_memmove_tensor waitForFences");
+    VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "vk_buffer_memmove_tensor waitForFences", device);
     device->device.resetFences({ device->fence });
     ggml_vk_queue_command_pools_cleanup(device);
 
@@ -26054,7 +26048,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ggml_vk_ctx_end(flush_ctx);
                 flush_ctx->exit_tensor_idx = -1;
                 ctx->compute_ctx.reset();
-                ggml_vk_compute_forward(ctx, cgraph, cgraph->nodes[submit_node_idx], submit_node_idx, false);
+                ggml_vk_compute_forward(ctx, flush_ctx, cgraph, cgraph->nodes[submit_node_idx], submit_node_idx, false);
                 submit_after(submit_node_idx, i - 1);
                 submit_node_idx = i;
             }
@@ -27248,7 +27242,8 @@ bool ggml_backend_is_vk(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
 }
 
-VkDevice ggml_backend_vk_get_device_handle(ggml_backend_t backend) {
+extern "C" {
+GGML_BACKEND_API VkDevice ggml_backend_vk_get_device_handle(ggml_backend_t backend) {
     if (!ggml_backend_is_vk(backend)) {
         return VK_NULL_HANDLE;
     }
@@ -27259,7 +27254,7 @@ VkDevice ggml_backend_vk_get_device_handle(ggml_backend_t backend) {
     return (VkDevice)ctx->device->device;
 }
 
-VkQueue ggml_backend_vk_get_queue_handle(ggml_backend_t backend) {
+GGML_BACKEND_API VkQueue ggml_backend_vk_get_queue_handle(ggml_backend_t backend) {
     if (!ggml_backend_is_vk(backend)) {
         return VK_NULL_HANDLE;
     }
@@ -27271,7 +27266,7 @@ VkQueue ggml_backend_vk_get_queue_handle(ggml_backend_t backend) {
     return (VkQueue)ctx->device->compute_queue->handle->queue;
 }
 
-void ggml_backend_vk_lock_queue(ggml_backend_t backend) {
+GGML_BACKEND_API void ggml_backend_vk_lock_queue(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_vk(backend));
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     GGML_ASSERT(ctx->device && ctx->device->compute_queue &&
@@ -27279,7 +27274,7 @@ void ggml_backend_vk_lock_queue(ggml_backend_t backend) {
     ctx->device->compute_queue->handle->lock();
 }
 
-void ggml_backend_vk_unlock_queue(ggml_backend_t backend) {
+GGML_BACKEND_API void ggml_backend_vk_unlock_queue(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_vk(backend));
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     GGML_ASSERT(ctx->device && ctx->device->compute_queue &&
@@ -27287,7 +27282,7 @@ void ggml_backend_vk_unlock_queue(ggml_backend_t backend) {
     ctx->device->compute_queue->handle->unlock();
 }
 
-VkPhysicalDevice ggml_backend_vk_get_physical_device(ggml_backend_t backend) {
+GGML_BACKEND_API VkPhysicalDevice ggml_backend_vk_get_physical_device(ggml_backend_t backend) {
     if (!ggml_backend_is_vk(backend)) {
         return VK_NULL_HANDLE;
     }
@@ -27298,7 +27293,7 @@ VkPhysicalDevice ggml_backend_vk_get_physical_device(ggml_backend_t backend) {
     return (VkPhysicalDevice)ctx->device->physical_device;
 }
 
-uint32_t ggml_backend_vk_get_queue_family(ggml_backend_t backend) {
+GGML_BACKEND_API uint32_t ggml_backend_vk_get_queue_family(ggml_backend_t backend) {
     if (!ggml_backend_is_vk(backend)) {
         return 0;
     }
@@ -27307,6 +27302,7 @@ uint32_t ggml_backend_vk_get_queue_family(ggml_backend_t backend) {
         return 0;
     }
     return ctx->device->compute_queue->queue_family_index;
+}
 }
 
 int ggml_backend_vk_get_device_count() {
@@ -28101,25 +28097,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                             ggml_type_name(op->type));
                     return false;
                 }
-                // fork: turbo shaders use a 128-element block (head_dim must be
+                // turbo shaders use a 128-element block (head_dim must be
                 // divisible by 128) and only the f32-source variant is compiled
                 if (op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0) {
                     if (op->src[0]->ne[0] % 128 != 0 || op->src[0]->type != GGML_TYPE_F32) {
-                        fprintf(stderr, "[vk-set_rows] REJECT turbo %s ne0=%lld src0=%s dst=%s\n",
-                                device->name.c_str(),
-                                (long long)op->src[0]->ne[0],
-                                ggml_type_name(op->src[0]->type),
-                                ggml_type_name(op->type));
                         return false;
                     }
-                // turbo shaders use a 128-element block: head_dim must be divisible by 128
-                if ((op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0)
-                    && (op->src[0]->ne[0] % 128 != 0)) {
-                    return false;
                 }
                 // TQ4_1S uses 32-element blocks
                 if (op->type == GGML_TYPE_TQ4_1S && (op->src[0]->ne[0] % 32 != 0)) {
-                    return false;                }
+                    return false;
+                }
                 switch (op->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:

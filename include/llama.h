@@ -234,10 +234,13 @@ extern "C" {
         LLAMA_LAZY_MODE_AUTO   = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
         LLAMA_LAZY_MODE_ON     = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
         LLAMA_LAZY_MODE_DIRECT = 3, // like ON, but the arch reads the rows with explicit pread()s instead of demand paging the mmap
+    };
+
     enum llama_tensor_read_lazy {
         LLAMA_TENSOR_READ_LAZY_OFF  = 0, // always read the whole tensor up front
         LLAMA_TENSOR_READ_LAZY_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
-        LLAMA_TENSOR_READ_LAZY_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)    };
+        LLAMA_TENSOR_READ_LAZY_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+    };
 
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
@@ -727,7 +730,8 @@ extern "C" {
         // Appended here (not with the other [EXPERIMENTAL] fields above) so
         // a caller built against a pre-streaming header keeps the same
         // offsets for every field before it.
-        uint32_t kv_stream_arena_mib;    };
+        uint32_t kv_stream_arena_mib;
+    };
 
     struct llama_model_tensor_override {
         const char * pattern;

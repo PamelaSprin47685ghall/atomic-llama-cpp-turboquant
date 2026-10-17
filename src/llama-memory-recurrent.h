@@ -190,7 +190,6 @@ public:
     std::vector<ggml_tensor *> p_l; // optional PLE conv state
     std::vector<ggml_tensor *> d_l; // compact per-hand delta from the shared brain
     std::vector<uint8_t> s_shared_l;
-    std::vector<ggml_tensor *> p_l;
 
     // per layer, only allocated when gdn_replay is true: [n_embd_s_ingredient(), mem_size * n_rs_seq]
     std::vector<ggml_tensor *> ingr_l;
@@ -283,7 +282,7 @@ public:
     bool is_s_shared(int32_t il) const;
     ggml_tensor * get_ingr_l(int32_t il) const;    // nullptr unless mem->gdn_replay
     ggml_tensor * get_s_ckpt_l(int32_t il) const;  // nullptr unless mem->gdn_replay
-    ggml_tensor * get_p_l(int32_t il) const;
+    
     int32_t s_copy(int i) const;
     int32_t brain_copy(int i) const;
     bool is_public_write(int i) const;

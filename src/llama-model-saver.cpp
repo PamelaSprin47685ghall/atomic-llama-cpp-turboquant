@@ -64,10 +64,6 @@ void llama_model_saver::add_kv(const enum llm_kv key, const int32_t value) {
     gguf_set_val_i32(gguf_ctx, llm_kv(key).c_str(), value);
 }
 
-void llama_model_saver::add_kv(const enum llm_kv key, const uint64_t value) {
-    gguf_set_val_u64(gguf_ctx, llm_kv(key).c_str(), value);
-}
-
 void llama_model_saver::add_kv(const enum llm_kv key, const float value) {
     gguf_set_val_f32(gguf_ctx, llm_kv(key).c_str(), value);
 }
@@ -514,8 +510,6 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->hc_head_norm);
     add_tensor(model->hc_head_down);
     add_tensor(model->hc_head_up);
-
-    add_tensor(model->hc_head_norm);
     add_tensor(model->hc_head_down);
     add_tensor(model->hc_head_up);
     add_tensor(model->per_layer_tok_embd);

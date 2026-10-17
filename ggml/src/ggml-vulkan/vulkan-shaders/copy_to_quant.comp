@@ -346,7 +346,7 @@ uint tq4_choose_index(float val) {
 
 #endif // defined(DATA_A_TQ4_1S)
 
-#if defined(DATA_A_Q2_0) || defined(DATA_A_PQ2_0)
+#if defined(DATA_A_PQ2_0)
 uint quantize_q2_0(float x)
 {
     const int q = int(x >= 0.0f ? floor(x + 0.5f) : ceil(x - 0.5f)) + 1;

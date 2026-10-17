@@ -28,9 +28,7 @@
 #endif
 
 static std::function<void(int)> shutdown_handler;
-#if defined(_WIN32)
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
-#endif
 
 static int64_t token_hack_env_i64(const char * name, int64_t fallback) {
     const char * value = std::getenv(name);
@@ -43,7 +41,6 @@ static int64_t token_hack_env_i64(const char * name, int64_t fallback) {
     return end != value ? (int64_t) parsed : fallback;
 }
 
-#if defined(_WIN32)
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
         // A second signal may interrupt teardown: bypass stdio and global destructors.
@@ -52,7 +49,6 @@ static inline void signal_handler(int signal) {
 
     shutdown_handler(signal);
 }
-#endif
 
 static void register_signal_handlers() {
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
@@ -570,7 +566,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
         signal_dispatcher.emplace(shutdown_handler);
 #else
         register_signal_handlers();
-#endif    }
+#endif
+    }
 
     SRV_INF("listening on %s\n", ctx_http.listening_address.c_str());
 

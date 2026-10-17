@@ -29,10 +29,11 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-        const llama_cparams   * cparams,
-                          size_t kv_stream_stage_bytes,
-                          void * kv_stream_phase_arena,
-                          size_t kv_stream_maximum_pool_bytes)
+        const llama_cparams   * cparams = nullptr,
+                          size_t kv_stream_stage_bytes = 0,
+                          void * kv_stream_phase_arena = nullptr,
+                          size_t kv_stream_maximum_pool_bytes = 0);
+
     llama_kv_cache_iswa(
             const llama_model & model,
             const llama_hparams & hparams,
@@ -50,10 +51,11 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-        const llama_cparams   * cparams,
-                          size_t kv_stream_stage_bytes,
-                          void * kv_stream_phase_arena,
-                          size_t kv_stream_maximum_pool_bytes)
+        const llama_cparams   * cparams = nullptr,
+                          size_t kv_stream_stage_bytes = 0,
+                          void * kv_stream_phase_arena = nullptr,
+                          size_t kv_stream_maximum_pool_bytes = 0);
+
     ~llama_kv_cache_iswa() = default;
 
     //

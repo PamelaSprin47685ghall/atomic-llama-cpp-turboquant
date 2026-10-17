@@ -16,51 +16,7 @@
 // llama_memory_hybrid_idx
 //
 
-llama_memory_hybrid_idx::llama_memory_hybrid_idx(const llama_model &     model,
-                                                 /* attn */
-                                                 ggml_type               type_k,
-                                                 ggml_type               type_v,
-                                                 bool                    v_trans,
-                                                 uint32_t                kv_size,
-                                                 uint32_t                n_pad,
-                                                 uint32_t                n_swa,
-                                                 llama_swa_type          swa_type,
-                                                 /* recurrent */
-                                                 ggml_type               type_r,
-                                                 ggml_type               type_s,
-                                                 uint32_t                rs_size,
-                                                 uint32_t                n_brain_max,
-                                                 uint32_t                n_hand_max,
-                                                 /* common */
-                                                 uint32_t                n_seq_max,
-                                                 uint32_t                n_rs_seq,
-                                                 bool                    offload,
-                                                 bool                    unified,
-                                                 /* layer filters */
-                                                 const layer_filter_cb & filter_attn,
-                                                 const layer_filter_cb & filter_recr,
-                                                 const layer_filter_cb & filter_idx) :
-    llama_memory_hybrid(model,
-                        type_k,
-                        type_v,
-                        v_trans,
-                        kv_size,
-                        n_pad,
-                        n_swa,
-                        swa_type,
-                        type_r,
-                        type_s,
-                        rs_size,
-                        n_brain_max,
-                        n_hand_max,
-                        n_seq_max,
-                        n_rs_seq,
-                        offload,
-                        unified,
-                        filter_attn,
-                        filter_recr,
-                        nullptr),
-            llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
                             /* attn */
                 ggml_type   type_k,
@@ -74,6 +30,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(const llama_model &     model,
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
+                 uint32_t   n_brain_max,
+                 uint32_t   n_hand_max,
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
@@ -88,8 +46,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(const llama_model &     model,
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
+        n_brain_max, n_hand_max,
         n_seq_max, n_rs_seq, gdn_replay_req, offload, unified,
-        filter_attn, filter_recr),    hparams_idx(model.hparams),
+        filter_attn, filter_recr),
+    hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
@@ -210,26 +170,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(const llama_model &     model,
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
-    // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
-        hparams_idx.n_embd_head_v_full = model.hparams.indexer_head_size;
-
-        // the indexer never reads V; mark this cache MLA/K-only (same mechanism as
-        // dsv4_make_k_only in llama-kv-cache-dsv4.cpp's hparams_lid) so llama_kv_cache's
-        // has_v = !is_mla skips allocating the unused V-cache tensors entirely.
-        hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
-        hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
-
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
-
-        return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
-            kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
-
-llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: this repeats llama_memory_hybrid::init_batch because the indexer cache needs the
-    //       slot infos of the attention cache, which the base context does not expose    do {
+    //       slot infos of the attention cache, which the base context does not expose
+    do {
         balloc.split_reset();
 
         // follow the recurrent pattern for creating the ubatch splits
@@ -279,9 +222,9 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        // the indexer uses the attention cache's slot layout; a separate one can drift from it
         // the indexer cache is addressed by the cells of the attention cache, so it takes that
-        // slot layout instead of finding its own; a separate layout can drift from it        llama_kv_cache::slot_info_vec_t heads_idx;
+        // slot layout instead of finding its own; a separate layout can drift from it
+        llama_kv_cache::slot_info_vec_t heads_idx;
         if (mem_idx) {
             heads_idx = heads_attn;
         }
@@ -313,14 +256,9 @@ void llama_memory_hybrid_idx::clear(bool data) {
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
-    // [TAG_PLE_HISTORY] every sequence is gone, so no window is trusted any more
-    ple_hist.clear();
-}
-
-bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it
-    // first and leave the other caches untouched if it does    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
+    // first and leave the other caches untouched if it does
+    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
     }
 
@@ -399,6 +337,9 @@ void llama_memory_hybrid_idx::materialize() const {
     llama_memory_hybrid::materialize();
     if (mem_idx) {
         mem_idx->materialize();
+    }
+}
+
 //
 // [TAG_PLE_HISTORY] per-sequence PLE n-gram history
 //
@@ -646,26 +587,14 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 
     // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
     // [TAG_HYBRID_IDX_STATE] the indexer section is written last, so it is a pure suffix of the
-    // attn+recr layout: a reader that does not expect it stops early instead of misparsing it.    // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
+    // attn+recr layout: a reader that does not expect it stops early instead of misparsing it.
+    // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         if (mem_idx) {
             mem_idx->state_write(io, seq_id, flags);
         }
     }
 
-}
-
-void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    // note: repeats llama_memory_hybrid::state_read
-    // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
-
-    // [TAG_HYBRID_IDX_SINFO]
-    // the indexer restore adopts the attention cache's layout instead of searching for cells of its own
-    // two find_slot calls agree only while both caches see the same occupancy, which a restore cannot promise
-    // [TAG_PLE_HISTORY] last again, so this section is also a pure suffix.
-    // It is not under the PARTIAL_ONLY gate: the window is recurrent state, the input the PLE
-    // conv state comes from, and the recurrent cache is written for partial checkpoints too.
-    ple_hist_state_write(io, seq_id);
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -677,7 +606,8 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     // The indexer cache is addressed by the cells of the attention cache, so its restore adopts
     // that layout instead of searching for cells of its own. Two independent find_slot calls
     // agree only while nothing makes the two caches see different occupancy, and a restore is
-    // exactly the operation that can no longer promise that.    llama_kv_cache::slot_info_vec_t sinfos_attn;
+    // exactly the operation that can no longer promise that.
+    llama_kv_cache::slot_info_vec_t sinfos_attn;
 
     try {
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
@@ -694,13 +624,11 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         }
 
     } catch (...) {
-        // a half-restored context is the one state the indexer cannot fix by itself: attention holds new cells, the indexer old ones
-        // [TAG_PLE_HISTORY] must mirror the write order above
-        ple_hist_state_read(io, seq_id);
-    } catch (...) {
         // a half-restored context is the one state the indexer cache cannot be brought back from
-        // by itself: the attention cache holds the restored cells and the indexer the old ones.        // drop what was being restored from all of them, which is a state they do agree on.
+        // by itself: the attention cache holds the restored cells and the indexer the old ones.
+        // drop what was being restored from all of them, which is a state they do agree on.
         state_drop(seq_id);
+        ple_hist_state_read(io, seq_id);
 
         throw;
     }
@@ -732,12 +660,9 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
-    // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
-}
-
-void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     // dropped directly rather than through seq_rm, which the recurrent cache is allowed to
-    // refuse and which would then clear the other two caches and not it    if (seq_id < 0) {
+    // refuse and which would then clear the other two caches and not it
+    if (seq_id < 0) {
         clear(true);
 
         return;
@@ -794,88 +719,7 @@ void llama_memory_hybrid_idx::pooled_reset(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::set_input_qsa(
-//
-// llama_memory_hybrid_idx_context
-//
-
-// streams in each ubatch's slot info, matching get_k/get_v's `ns`
-static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::slot_info_vec_t & sinfos) {
-    std::vector<uint32_t> res;
-    res.reserve(sinfos.size());
-
-    for (const auto & sinfo : sinfos) {
-        res.push_back(sinfo.s1 - sinfo.s0 + 1);
-    }
-
-    return res;
-}
-
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
-    llama_memory_hybrid_context(status) {}
-
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
-    llama_memory_hybrid_context(mem),
-    mem(mem) {}
-
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
-        llama_memory_hybrid_idx * mem,
-                  llama_context * lctx,
-                           bool   optimize) :
-    llama_memory_hybrid_context(mem, lctx, optimize),
-    mem(mem),
-    // update() applies a pending cross-stream seq_cp, else the copy keeps stale indexer keys
-    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        mem->get_mem_idx()->init_update(lctx, optimize)) {}
-
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
-        llama_memory_hybrid_idx * mem,
-                slot_info_vec_t   sinfos_attn,
-                slot_info_vec_t   sinfos_idx,
-      std::vector<llama_ubatch>   ubatches) :
-    // note: the base copies the ubatches; ctx_idx gets a copy of its own
-    llama_memory_hybrid_context(mem, std::move(sinfos_attn), ubatches),
-    mem(mem),
-    ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
-    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
-
-bool llama_memory_hybrid_idx_context::next() {
-    if (ctx_idx) {
-        ctx_idx->next();
-    }
-
-    ++i_cur;
-
-    return llama_memory_hybrid_context::next();
-}
-
-bool llama_memory_hybrid_idx_context::apply() {
-    bool res = llama_memory_hybrid_context::apply();
-
-    if (ctx_idx) {
-        res = res & ctx_idx->apply();
-    }
-
-    return res;
-}
-
-const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {
-    return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
-}
-
-uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
-    GGML_ASSERT(i_cur < ns_ubatch.size());
-
-    return ns_ubatch[i_cur];
-}
-
-llama_memory_hybrid_idx::ple_history & llama_memory_hybrid_idx_context::get_ple_hist(llama_seq_id seq_id) const {
-    GGML_ASSERT(mem != nullptr);
-
-    return mem->ple_hist_get(seq_id);
-}
-
-void llama_memory_hybrid_idx_context::set_input_qsa(        ggml_tensor * cell_blk,
+        ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
@@ -887,9 +731,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(        ggml_tensor * cell_b
         ggml_tensor * dirty_rows) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
-        bool blk_bias) const {
-    GGML_ASSERT(ratio > 0);
-    GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
+
     GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
 
     const int64_t n_kv     = cell_blk->ne[0];
@@ -898,9 +740,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(        ggml_tensor * cell_b
     const int64_t r        = ratio;
     // same formula as the graph; blk_pos may be null on the pooled path
     const int64_t n_blocks = (n_kv + r - 1)/r;
-    const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
-    const int64_t n_tokens = ubatch->n_tokens;
-    const int64_t r        = ratio;
+
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
@@ -916,9 +756,6 @@ void llama_memory_hybrid_idx_context::set_input_qsa(        ggml_tensor * cell_b
     std::vector<int32_t> loc_blk_cells(r*n_blocks);
     std::vector<int32_t> loc_blk_pos(4*n_blocks);
 
-    int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
-    int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
-    float   * dst_bias      = (float   *) bias->data;
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
     GGML_ASSERT(r <= 64);
@@ -950,17 +787,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(        ggml_tensor * cell_b
 
         std::fill(loc_blk_cells.begin(), loc_blk_cells.end(), 0);
         std::fill(loc_blk_pos.begin(),   loc_blk_pos.end(),   0);
-    std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
 
-    for (int64_t s = 0; s < n_ns; ++s) {
-        // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
-        const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
-        const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
-
-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
-        int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
-
-        std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
         bid_idx  .clear();
         bid_cell .clear();
         bid_slot0.clear();
@@ -1119,7 +946,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(        ggml_tensor * cell_b
 
             for (int64_t sec = 0; sec < 4; ++sec) {
                 loc_blk_pos[sec*n_blocks + b] = sec_pos[sec];
-                dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = sec_pos[sec];            }
+            }
         }
 
         // unpooled cells all point at one spare block. a spare block exists only when some
@@ -1136,7 +963,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(        ggml_tensor * cell_b
                 const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
 
                 loc_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
-                cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;            }
+            }
 
             cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
         }
@@ -1203,6 +1030,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(        ggml_tensor * cell_b
 
             w = n_complete;
         }
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];

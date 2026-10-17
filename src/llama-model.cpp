@@ -422,7 +422,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // overlay for the same layer with the identical row layout. Both must follow the same
     // head slicing, otherwise the group-layer combine (state_base + hand_echo) sees two
     // different split states for the same shape and the meta backend refuses to place it.
-    static const std::regex pattern_s_cache         ("cache_(s|d)_l\\d*");    static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
+    static const std::regex pattern_s_cache         ("cache_(s|d)_l\\d*"); 
+    static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
+   static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
     static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?.weight");
@@ -438,9 +440,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_indexer_weight       ("blk\\.\\d*\\.indexer\\..*\\.weight");
     static const std::regex pattern_ffn_down_bias     ("blk\\.\\d*\\.ffn_down.bias");
     static const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
-    static const std::regex pattern_ffn_up_shexp_weight   ("blk\\.\\d*\\.ffn_up_shexp.weight");
-    static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
-    static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
 
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
@@ -648,8 +647,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
-        if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_CLEF ||
-        if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||                ud->model->arch == LLM_ARCH_QWEN4EXP) {
+        if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
+            ud->model->arch == LLM_ARCH_QWEN4EXP) {
             const int64_t head_k_dim = hparams.ssm_d_state;
             const int64_t head_v_dim = hparams.ssm_d_state;
             const int64_t n_k_heads  = hparams.ssm_n_group;
@@ -1084,7 +1083,6 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_35B_A3B:       return "35B.A3B";
         case LLM_TYPE_48B_A3B:       return "48B.A3B";
         case LLM_TYPE_80B_A3B:       return "80B.A3B";
-        case LLM_TYPE_A3B:           return "A3B";
         case LLM_TYPE_100B_A6B:      return "100B.A6B";
         case LLM_TYPE_102B_A12B:     return "102B.A12B";
         case LLM_TYPE_106B_A12B:     return "106B.A12B";
@@ -2790,7 +2788,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter_mtp,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                 } else {
                     if (cparams.kv_unified && cparams.kv_size_explicit) {
                         throw std::runtime_error("DeepSeek4 does not support dynamic shared unified KV capacity");
@@ -2837,7 +2836,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                     break;
                 }
             }
@@ -2850,11 +2850,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // The MTP head is dense-attention only on hybrid Qwen3-Next/3.5/3.6, so use a plain
                 // attention KV cache for the MTP context instead of the hybrid wrapper.
                 const bool mtp_on_hybrid_qwen =
-                    (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP || (arch == LLM_ARCH_QWEN4EXP && static_cast<const llama_model_qwen4exp *>(this)->is_mtp_only)) &&
+                    (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
+                     (arch == LLM_ARCH_QWEN4EXP && static_cast<const llama_model_qwen4exp *>(this)->is_mtp_only)) &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP);
-                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-                    (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_QWEN4EXP);
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
                             *this,
@@ -2927,16 +2925,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* cparams           */ (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
-                            /* kv_stream_stage_bytes */ params.kv_stream_stage_bytes,
-                            /* kv_stream_phase_arena */ params.kv_stream_phase_arena,
-                            /* kv_stream_maximum_pool_bytes */ params.kv_stream_maximum_pool_bytes);                    } else if (needs_mem_idx) {
+                    } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_kv,                            /* attn_n_pad        */ 1,
+                            /* attn_kv_size      */ cparams.n_ctx_kv,
+                            /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
@@ -2946,10 +2943,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_hands  */ cparams.n_pen_max,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
-    /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-                            /* n_seq_max         */ cparams.n_seq_max,
-                            /* n_rs_seq          */ cparams.n_rs_seq,
-                            /* gdn_replay_req    */ cparams.gdn_replay,                            /* offload           */ cparams.offload_kqv,
+                            /* gdn_replay_req    */ cparams.gdn_replay,
+                            /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
@@ -2977,9 +2972,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* cparams           */ (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
-                            /* kv stream stage   */ params.kv_stream_stage_bytes,
-                            /* kv stream arena   */ params.kv_stream_phase_arena,
-                            /* kv stream maximum */ params.kv_stream_maximum_pool_bytes);                    }
+                    }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
@@ -3043,9 +3036,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     reuse,
                                     share,
                                     (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
-                            params.kv_stream_stage_bytes,
-                                    params.kv_stream_phase_arena,
-                                    params.kv_stream_maximum_pool_bytes);                        } else {
+                        } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
                                     params.type_k,
@@ -3063,9 +3054,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     reuse,
                                     share,
                                     (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
-                            params.kv_stream_stage_bytes,
-                                    params.kv_stream_phase_arena,
-                                    params.kv_stream_maximum_pool_bytes);                        }
+                        }
                     } else {
                         res = new llama_kv_cache(
                                 *this,
@@ -3085,10 +3074,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 nullptr,
                                 (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
-                            "",
-                                params.kv_stream_stage_bytes,
-                                params.kv_stream_phase_arena,
-                                params.kv_stream_maximum_pool_bytes);                    }
+                    }
                 }
             }
     }
@@ -3434,7 +3420,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_CLEF:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_QWEN3TTS:
-        case LLM_ARCH_QWEN4EXP:            return LLAMA_ROPE_TYPE_IMROPE;
+            return LLAMA_ROPE_TYPE_IMROPE;
 
         case LLM_ARCH_GLM4:
             return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NORM;
@@ -3663,8 +3649,9 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
     TENSOR_GET_ROWS       (llama_model_loader::TENSOR_GET_ROWS) {}
+
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
     return create_tensor(*ml, tn, ne, flags);

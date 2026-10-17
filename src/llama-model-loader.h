@@ -230,6 +230,8 @@ struct llama_model_loader {
 
     void done_getting_tensors(bool partial = false) const;
 
+    bool partial_load = false;
+
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
     // Bind lazy payloads before eager context allocation; returned owners must

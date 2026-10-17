@@ -33,9 +33,11 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
+    const llama_cparams   * cparams,
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
-                     size_t kv_stream_maximum_pool_bytes) :    hparams(model.hparams),
+                     size_t kv_stream_maximum_pool_bytes) :
+    hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
         type_k,
@@ -54,6 +56,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             : filter_attn,
         nullptr,
         nullptr,
+        cparams,
         kv_stream_stage_bytes,
         kv_stream_phase_arena,
         kv_stream_maximum_pool_bytes    )),
@@ -67,7 +70,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         n_rs_seq,
         n_brain_max,
         n_hand_max,
-            gdn_replay_req,        filter_recr == nullptr ?
+        gdn_replay_req,
+        filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
     )) {}

@@ -11105,7 +11105,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(K >= 1);
     // emit_mode: 0 = full state snapshots (default), 1 = per-token replay ingredients (k,v,g,beta).
     const int64_t emit_mode = ggml_get_op_params_i32(dst, 1);
-    GGML_ASSERT(emit_mode == 0 || emit_mode == 1);    // per-seq stride in floats (seq s starts at state + s * seq_stride)
+    GGML_ASSERT(emit_mode == 0 || emit_mode == 1);
+
+    // fork capacity mode: active_tokens via op_params[2]; 0 means all n_tokens.
+    // (slot 1 is strictly reserved for emit_mode on this line; slot 2 carries active rows.)
+    const int64_t active_param = ggml_get_op_params_i32(dst, 2);
+    const int64_t effective_active = (active_param > 0 && active_param <= n_tokens) ? active_param : n_tokens;
+
+    // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
     // ingredient mode always needs per-token capture (even at K==1, it captures the last

@@ -536,10 +536,6 @@ public:
     // (e.g. after TriAttention eviction). Callers must not assume all positions
     // in the range exist. Default is false (dense positions).
     virtual bool positions_are_sparse() const { return false; }
-    virtual void state_write(llama_io_write_i &    io,
-                             llama_seq_id          seq_id = -1,
-                             llama_state_seq_flags flags  = 0) const                                          = 0;
-    virtual void state_read(llama_io_read_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
 
     // Block KV streaming: the sub-cache(s) of this memory object, if any,
     // that a CUDA phase-arena streaming runtime should be attached to.

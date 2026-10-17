@@ -122,8 +122,6 @@ static uint32_t server_n_outputs_max(const common_params & params) {
         return std::max(n_batch, n_active_seq);
     }
 
-    const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
-    const uint64_t n_outputs = (uint64_t) n_active_seq * n_outputs_per_seq;
     // Account for draft modes enabled by convenience flags before their types are added.
     uint32_t n_max = (uint32_t) common_speculative_n_max(&params.speculative);
     if (params.speculative.draft.dflash || params.speculative.draft.eagle3) {
@@ -131,6 +129,7 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     }
 
     const uint32_t n_outputs_per_seq = 1 + n_max;
+    const uint64_t n_outputs = (uint64_t) n_active_seq * n_outputs_per_seq;
     return std::max<uint32_t>(n_active_seq, std::min<uint64_t>(n_batch, n_outputs));
 }
 
@@ -678,8 +677,6 @@ struct server_slot {
             state_save_unsupported = true;
             return false;
         }
-
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
@@ -5414,6 +5411,8 @@ private:
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
+    float  slot_cache_key_similarity = 0.0f;
+    size_t slot_cache_key_min_prefix = 0;
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -5537,15 +5536,17 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         if (params_base.rerot_enabled && spec_mtp) {
-            params_base.speculative.draft.cache_type_k =
-                params_base.cache_type_k;
-            params_base.speculative.draft.cache_type_v =
-                params_base.cache_type_v;
-        }
+        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
+                                        params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end() ||
                               std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params_base.speculative.types.end();        const bool has_spec = has_draft || spec_mtp;
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params_base.speculative.types.end();
+        if (params_base.rerot_enabled && spec_mtp) {
+            params_base.speculative.draft.cache_type_k = params_base.cache_type_k;
+            params_base.speculative.draft.cache_type_v = params_base.cache_type_v;
+        }
+        const bool has_spec = has_draft || spec_mtp;
         const server_shared_draft_device_config shared_draft_devices = server_prepare_shared_draft_devices(params_base);
 
         auto make_params_dft = [&]() {
@@ -5627,11 +5628,7 @@ private:
                                 params_base.fit_params_target[i] += size;
                                 params_base.n_ctx_kv_reserve.emplace_back(dev, size);
                             }
-                    for (size_t i = 0; i < target_fit_devices.size(); i++) {
-                        if (target_fit_devices[i] == dev) {
-                            GGML_ASSERT(i < params_base.fit_params_target.size());
-                            SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
-                            params_base.fit_params_target[i] += size;                            break;
+                            break;
                         }
                     }
                 }
@@ -5906,6 +5903,8 @@ private:
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
+        slot_cache_key_similarity = params_base.slot_cache_key_similarity;
+        slot_cache_key_min_prefix = std::max<int32_t>(0, params_base.slot_cache_key_min_prefix);
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
@@ -5947,13 +5946,6 @@ private:
             slots.emplace_back();
         }
 
-        // try speculative decoding
-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-            try {
-                spec.reset(common_speculative_init(params_base.speculative, n_exec_slots));
-            } catch (const std::exception & e) {
-                SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
-                return false;
         // Initialize speculative decoding only when a type or convenience flag is set.
         const bool is_speculative_enabled =
             params_base.speculative.draft.dflash ||
@@ -6140,6 +6132,7 @@ private:
         }
 
         return true;
+    }
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -6357,8 +6350,77 @@ private:
             people.size() < std::max<size_t>(1, params_base.rerot_person_max);
     }
 
+    server_slot * get_slot_by_cache_key(const std::string & cache_key) {
+        if (cache_key.empty()) {
+            return nullptr;
+        }
+
+        auto it = cache_key_slots.find(cache_key);
+        if (it == cache_key_slots.end()) {
+            return nullptr;
+        }
+
+        server_slot * slot = get_slot_by_id(it->second);
+        if (slot == nullptr) {
+            cache_key_slots.erase(it);
+            return nullptr;
+        }
+
+        if (slot->prompt.tokens.empty()) {
+            SLT_INF(*slot, "ignoring cache_key slot with empty prompt, key = %s\n", cache_key.c_str());
+            cache_key_slots.erase(it);
+            return nullptr;
+        }
+
+        if (slot->is_processing()) {
+            SLT_INF(*slot, "ignoring busy cache_key slot, key = %s\n", cache_key.c_str());
+            return nullptr;
+        }
+
+        return slot;
+    }
+
+    bool cache_key_slot_has_enough_similarity(const server_slot & slot, const server_task & task) const {
+        if (slot.prompt.tokens.empty() || task.tokens.empty()) {
+            SLT_INF(slot, "ignoring cache_key slot with empty prompt or task, key = %s\n", task.cache_key.c_str());
+            return false;
+        }
+
+        const size_t n_common = slot.prompt.tokens.get_common_prefix(task.tokens);
+        const float  sim_cur  = float(n_common) / task.tokens.size();
+        const bool enough_prefix = n_common >= slot_cache_key_min_prefix;
+        const bool enough_similarity = slot_cache_key_similarity <= 0.0f || sim_cur >= slot_cache_key_similarity;
+        if (enough_prefix && enough_similarity) {
+            SLT_INF(slot, "selected slot by cache_key, sim = %.3f (>= %.3f thold), common = %zu (>= %zu), key = %s\n",
+                    sim_cur, slot_cache_key_similarity, n_common, slot_cache_key_min_prefix, task.cache_key.c_str());
+            return true;
+        }
+
+        SLT_INF(slot, "ignoring cache_key slot, sim = %.3f (< %.3f thold) or common = %zu (< %zu), key = %s\n",
+                sim_cur, slot_cache_key_similarity, n_common, slot_cache_key_min_prefix, task.cache_key.c_str());
+        return false;
+    }
+
+    void clear_cache_keys_for_slot(int id_slot) {
+        for (auto it = cache_key_slots.begin(); it != cache_key_slots.end(); ) {
+            if (it->second == id_slot) {
+                it = cache_key_slots.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void bind_cache_key_to_slot(const std::string & cache_key, int id_slot) {
+        clear_cache_keys_for_slot(id_slot);
+
+        if (!cache_key.empty()) {
+            cache_key_slots[cache_key] = id_slot;
+        }
+    }
+
     server_slot * get_available_slot(const server_task & task, bool allow_prompt_similarity = true) {
-    server_slot * get_available_slot(const server_task & task) {        server_slot * ret = nullptr;
+        server_slot * ret = nullptr;
 
         bool update_cache = false;
 
@@ -8118,6 +8180,7 @@ private:
                         task.rerot_bump_generation();
                     }
 
+                    const int id_slot = task.id_slot;
                     const int id_task = task.id;
 
                     if (!rerot_person_admission_available(task)) {
@@ -8138,7 +8201,6 @@ private:
                     if (slot == nullptr) {
                         slot = get_available_slot(task, task.cache_key.empty());
                     }
-                    server_slot * slot = get_available_slot(task);
                     //
                     // slot scheduling logic
                     //
@@ -11495,6 +11557,7 @@ void server_routes::init_routes() {
                     {"name",  "tri_pack_seconds"},
                     {"help",  "Wall time spent compacting TriAttention K/V data."},
                     {"value",  res_task->tri_pack_us_total / 1.e6}
+            }, {
                     {"name",  "spec_decode_num_draft_tokens_total"},
                     {"help",  "Total draft tokens generated"},
                     {"value",  res_task->n_draft_tokens_total}
@@ -11771,6 +11834,9 @@ void server_routes::init_routes() {
                 prometheus << "# HELP llamacpp:flashprefill_policy_fingerprint_info Active FlashPrefill policy fingerprint (single series).\n"
                            << "# TYPE llamacpp:flashprefill_policy_fingerprint_info gauge\n"
                            << "llamacpp:flashprefill_policy_fingerprint_info{fingerprint=\"" << fphex << "\"} 1\n";
+            }
+        }
+
         // labeled counter: one time series per draft position
         if (!res_task->n_accepted_per_pos_total.empty()) {
             prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"

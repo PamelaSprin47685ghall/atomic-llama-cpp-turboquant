@@ -325,7 +325,11 @@ static std::vector<llama_token> common_generation_prompt_tokens(
 
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
-        struct common_params_sampling & params) {
+        struct common_params_sampling & params,
+        int32_t n_ctx) {
+    if (params.penalty_last_n == -1) {
+        params.penalty_last_n = n_ctx > 0 ? n_ctx : llama_model_n_ctx_train(model);
+    }
     if (!std::isfinite(params.penalty_repeat) ||
         params.penalty_repeat <= 0.0f ||
         !std::isfinite(1.0f/params.penalty_repeat)) {

@@ -1118,7 +1118,7 @@ json oaicompat_chat_params_parse(
     } else if (!reasoning_effort.empty()) {
         inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         inputs.enable_thinking = reasoning_effort != "none";
-    }    }
+    }
 
     inputs.force_pure_content = opt.force_pure_content;
 

@@ -17,7 +17,8 @@
 // forwards to the public include/llama-flashprefill.h; only the public C
 // structs/helpers are used here (no internal routing dependency in this slice).
 #include "llama-flashprefill.h"
-#include "llama-flashprefill-state.h"#include "llama-io.h"
+#include "llama-flashprefill-state.h"
+#include "llama-io.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-iswa.h"
@@ -45,7 +46,8 @@
 
 #include <atomic>
 #include <chrono>
-#include <algorithm>#include <cinttypes>
+#include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -721,8 +723,7 @@ static void llama_xkv_validate_cparams(const llama_cparams & cparams) {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
-llama_context::llama_context(const llama_model & model, llama_context_params params) :    model(model),
+              llama_context_params params) :    model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -1486,26 +1487,22 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
 
         llama_memory_params params_mem = {
-            /*.type_k               =*/ params.type_k,
-            /*.type_v               =*/ params.type_v,
-            /*.swa_full             =*/ params.swa_full,
-            /*.ctx_type             =*/ cparams.ctx_type,
-            /*.mem_other            =*/ llama_get_memory(cparams.ctx_other),
-            /*.triattention_enabled =*/ params.triattention,
-            /*.triattention_stats   =*/ params.triattention_stats,
-            /*.xkv_mode             =*/ cparams.xkv_mode,
-            /*.xkv_segment_tokens   =*/ cparams.xkv_segment_tokens,
-            /*.xkv_chunk_tokens     =*/ cparams.xkv_chunk_tokens,
-            /*.n_ubatch             =*/ cparams.n_ubatch,
-            /*.n_batch              =*/ cparams.n_batch,
-            /*.type_k                =*/params.type_k,
-            /*.type_v                =*/params.type_v,
-            /*.kv_stream_stage_bytes =*/kv_stream_stage_bytes,
-            /*.kv_stream_phase_arena =*/kv_stream_phase_arena.arena,
-            /*.kv_stream_maximum_pool_bytes =*/kv_stream_arena_bytes,
-            /*.swa_full              =*/params.swa_full,
-            /*.ctx_type              =*/cparams.ctx_type,
-            /*.mem_other             =*/llama_get_memory(cparams.ctx_other),        };
+            /*.type_k                       =*/ params.type_k,
+            /*.type_v                       =*/ params.type_v,
+            /*.kv_stream_stage_bytes        =*/ kv_stream_stage_bytes,
+            /*.kv_stream_phase_arena        =*/ kv_stream_phase_arena.arena,
+            /*.kv_stream_maximum_pool_bytes =*/ kv_stream_arena_bytes,
+            /*.swa_full                     =*/ params.swa_full,
+            /*.ctx_type                     =*/ cparams.ctx_type,
+            /*.mem_other                    =*/ llama_get_memory(cparams.ctx_other),
+            /*.triattention_enabled         =*/ params.triattention,
+            /*.triattention_stats           =*/ params.triattention_stats,
+            /*.xkv_mode                     =*/ cparams.xkv_mode,
+            /*.xkv_segment_tokens           =*/ cparams.xkv_segment_tokens,
+            /*.xkv_chunk_tokens             =*/ cparams.xkv_chunk_tokens,
+            /*.n_ubatch                     =*/ cparams.n_ubatch,
+            /*.n_batch                      =*/ cparams.n_batch,
+        };
 
         memory.reset(model.create_memory(params_mem, cparams));
 
@@ -1733,16 +1730,10 @@ llama_context::~llama_context() {
             } else {
                 LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB is below requirement of %8.4f MiB\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
-            if (size_exp == size_act) {
-                LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
-                                __func__, ggml_backend_buft_name(buft), size_act / (1024.0 * 1024.0),
-                                size_exp / (1024.0 * 1024.0));
-            } else {
-                LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
-                               __func__, ggml_backend_buft_name(buft), size_act / (1024.0 * 1024.0),
-                               size_exp / (1024.0 * 1024.0));            }
+            }
         }
     }
+
     if (opt_ctx) {
         ggml_opt_free(opt_ctx);
         opt_ctx = nullptr;
@@ -2318,8 +2309,7 @@ void llama_context::sched_reserve() {
     {
         auto * gf = graph_reserve(n_tokens_pp, n_seqs_pp, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc,
-                                  model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);        if (!gf) {
+        if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n",
                                __func__);
@@ -3545,10 +3535,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch,
-                                                 llm_graph_type           gtype,
-                                                 llama_memory_context_i * mctx,
-                                                 ggml_status &            ret) {    if (mctx && !mctx->apply()) {
+    if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -3868,7 +3855,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     ggml_status status;
     llama_compute_guard compute_guard(sched.get());
-    ggml_status  status;    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
 
     cparams.causal_attn = causal_attn_org;
 
@@ -5614,9 +5601,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count +
          attention_q_pre_rope_float_count + backend_float_count) * sizeof(float) +
         (                                        backend_token_count) * sizeof(llama_token);
-    const size_t new_size =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
-        (backend_token_count) * sizeof(llama_token);
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
     if (!buf_output || prev_size < new_size) {
@@ -6079,26 +6063,7 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.flashprefill_reserve_sizing =*/ fp_reserve_sizing_active,
-llm_graph_params llama_context::graph_params(llm_graph_result *             res,
-                                             const llama_ubatch &           ubatch,
-                                             const llama_memory_context_i * mctx,
-                                             llm_graph_type                 gtype) const {
-    return {
-        /*.arch        =*/model.arch,
-        /*.hparams     =*/model.hparams,
-        /*.cparams     =*/cparams,
-        /*.ubatch      =*/ubatch,
-        /*.gtype       =*/gtype,
-        /*.sched       =*/sched.get(),
-        /*.backend_cpu =*/backend_cpu,
-        /*.cvec        =*/cvec.get(),
-        /*.loras       =*/loras.get(),
-        /*.mctx        =*/mctx,
-        /*.cross       =*/&cross,
-        /*.samplers    =*/sampling.samplers,
-        /*.n_outputs   =*/n_outputs,
-        /*.cb          =*/graph_get_cb(),
-        /*.res         =*/res,    };
+    };
 }
 
 ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
@@ -6874,9 +6839,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id  seq_id,
             }
         } else if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
             LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
-        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
-            LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic,
-                            version);            return 0;
+            return 0;
         }
     }
 
@@ -7510,6 +7473,7 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max_pp                =*/ 0,
         /*.n_seq_recurrent             =*/ 0,
         /*.n_rs_seq                    =*/ 0,
+        /*.gdn_replay                  =*/ false,
         /*.n_outputs_max               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
@@ -7530,6 +7494,8 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
+        /*.moe_cache_budget_mib        =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -7574,46 +7540,8 @@ llama_context_params llama_context_default_params() {
         /*.xkv_min_saving              =*/ xkv_defaults.min_saving,
         /*.xkv_min_factor_coverage     =*/ xkv_defaults.min_factor_coverage,
         /*.xkv_factorizer              =*/ xkv_defaults.factorizer,
-        /*.n_ctx                       =*/512,
-        /*.n_batch                     =*/2048,
-        /*.n_ubatch                    =*/512,
-        /*.n_seq_max                   =*/1,
-        /*.n_rs_seq                    =*/0,
-        /*.gdn_replay                  =*/false,
-        /*.n_outputs_max               =*/0,
-        /*.n_threads                   =*/GGML_DEFAULT_N_THREADS,  // TODO: better default
-        /*.n_threads_batch             =*/GGML_DEFAULT_N_THREADS,
-        /*.ctx_type                    =*/LLAMA_CONTEXT_TYPE_DEFAULT,
-        /*.rope_scaling_type           =*/LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
-        /*.pooling_type                =*/LLAMA_POOLING_TYPE_UNSPECIFIED,
-        /*.attention_type              =*/LLAMA_ATTENTION_TYPE_UNSPECIFIED,
-        /*.flash_attn_type             =*/LLAMA_FLASH_ATTN_TYPE_AUTO,
-        /*.rope_freq_base              =*/0.0f,
-        /*.rope_freq_scale             =*/0.0f,
-        /*.yarn_ext_factor             =*/-1.0f,
-        /*.yarn_attn_factor            =*/-1.0f,
-        /*.yarn_beta_fast              =*/-1.0f,
-        /*.yarn_beta_slow              =*/-1.0f,
-        /*.yarn_orig_ctx               =*/0,
-        /*.defrag_thold                =*/-1.0f,
-        /*.cb_eval                     =*/nullptr,
-        /*.cb_eval_user_data           =*/nullptr,
-        /*.type_k                      =*/GGML_TYPE_F16,
-        /*.type_v                      =*/GGML_TYPE_F16,
-        /*.moe_cache_mode              =*/LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
-        /*.moe_cache_budget_mib        =*/0,
-        /*.abort_callback              =*/nullptr,
-        /*.abort_callback_data         =*/nullptr,
-        /*.embeddings                  =*/false,
-        /*.offload_kqv                 =*/true,
-        /*.no_perf                     =*/true,
-        /*.op_offload                  =*/true,
-        /*.swa_full                    =*/true,
-        /*.kv_unified                  =*/false,
-        /*.sampler                     =*/nullptr,
-        /*.n_sampler                   =*/0,
-        /*.ctx_other                   =*/nullptr,
-        /*.kv_stream_arena_mib         =*/0,    };
+        /*.kv_stream_arena_mib         =*/ 0,
+    };
 
     return result;
 }
@@ -8893,7 +8821,8 @@ bool llama_rerot_context_apply_shift(
 void llama_memory_seq_keep(
         llama_memory_t mem,
           llama_seq_id seq_id) {
-#include <algorithm>    if (!mem) {
+#include <algorithm>
+    if (!mem) {
         return;
     }
 

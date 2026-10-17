@@ -1401,7 +1401,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
         ggml_log_level log_level,
-        bool no_alloc = true) {
+        bool no_alloc = true,
+        std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
+        llama_context * ctx_parent = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -1421,9 +1423,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             ? level : GGML_LOG_LEVEL_DEBUG;
         ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
     }, &ud);
-        std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
-        llama_context * ctx_parent = nullptr) {
-    common_fit_logger_guard logger_guard(log_level);
+
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = no_alloc;
     // Dry probe (no_alloc == false): every buffer is allocated exactly as a real load allocates
@@ -1439,22 +1439,18 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     // buffers alive, and it is the only probe that allocates at all.
     llama_model * model = mparams_copy.no_alloc ? common_fit_probe_model(path_model, mparams_copy)
                                                 : llama_model_load_from_file(path_model, mparams_copy);
-    llama_model_ptr model(llama_model_load_from_file(path_model, mparams_copy));    if (model == nullptr) {
+    if (model == nullptr) {
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context_params cparams_copy = *cparams;
-    if (ctx_parent != nullptr) {
-        cparams_copy.ctx_other = ctx_parent;
-    }
-
-    llama_context_ptr ctx(llama_init_from_model(model.get(), cparams_copy));
+    llama_context * ctx = llama_init_from_model(model, *cparams);
     if (ctx == nullptr) {
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
     }
 
-    const size_t nd = llama_model_n_devices(model.get());
+    const size_t nd = llama_model_n_devices(model);
     std::vector<llama_device_memory_data> ret(nd + 1);
 
     // When the probe allocates the model buffers (no_alloc == false, and load mode NONE means
@@ -1516,7 +1512,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
-    llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx.get());
+
     for (const auto & [buft, mb] : memory_breakdown) {
         if (ggml_backend_buft_is_host(buft)) {
             ret.back().mb.model   += mb.model;
@@ -1530,7 +1526,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             continue;
         }
         for (size_t i = 0; i < nd; i++) {
-            if (dev == llama_model_get_device(model.get(), i)) {
+            if (dev == llama_model_get_device(model, i)) {
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
@@ -1599,7 +1595,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ret.back().total = total;
     }
     for (size_t i = 0; i < nd; i++) {
-        ggml_backend_dev_t dev = llama_model_get_device(model.get(), i);
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
 
         size_t free;
         size_t total;
@@ -1646,16 +1642,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
 
     devs.clear();
-    for (int i = 0; i < llama_model_n_devices(model.get()); i++) {
-        devs.push_back(llama_model_get_device(model.get(), i));
+    for (int i = 0; i < llama_model_n_devices(model); i++) {
+        devs.push_back(llama_model_get_device(model, i));
     }
 
-    hp_ngl         = llama_model_n_layer(model.get());
-    if (mparams->load_mtp) {
-        hp_ngl    += llama_model_n_layer_nextn(model.get());
-    }
-    hp_n_ctx_train = llama_model_n_ctx_train(model.get());
-    hp_n_expert    = llama_model_n_expert(model.get());
+    hp_ngl         = llama_model_n_layer(model) + llama_model_n_layer_nextn(model);
+    hp_n_ctx_train = llama_model_n_ctx_train(model);
+    hp_n_expert    = llama_model_n_expert(model);
 
 
     common_memory_breakdown_print(ctx);
@@ -1665,14 +1658,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         llama_model_free(model);
     }
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-    if (moe_tensors) {
-        const size_t count = llama_model_get_moe_tensor_info(model.get(), nullptr, 0);
-        moe_tensors->resize(count);
-        const size_t written = llama_model_get_moe_tensor_info(model.get(), moe_tensors->data(), moe_tensors->size());
-        GGML_ASSERT(written == count);
-    }
 
-    common_memory_breakdown_print(ctx.get());
     return ret;
 }
 
@@ -1731,7 +1717,7 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
 
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
-            log_level, nullptr, ctx_parent.get());
+            log_level, /*no_alloc=*/ true, nullptr, ctx_parent.get());
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {

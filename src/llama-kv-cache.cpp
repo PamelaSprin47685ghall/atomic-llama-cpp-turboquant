@@ -940,18 +940,7 @@ bool llama_kv_cache::try_clear(bool data, std::string * err) {
         if (xkv_store) {
             if (!xkv_store->can_clear(err)) {
                 return false;
-
-        // Re-initialize turbo rotation matrices after buffer clear (clear zeroes everything)
-        if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr && !model.hparams.no_alloc) {
-            #include "turbo-rotation-data.h"
-            ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
-            ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
-
-            // Re-initialize InnerQ scale_inv to all 1.0
-            if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
-                float ones[INNERQ_MAX_CHANNELS];
-                for (int i = 0; i < INNERQ_MAX_CHANNELS; i++) ones[i] = 1.0f;
-                ggml_backend_tensor_set(turbo_innerq_scale_inv, ones, 0, INNERQ_MAX_CHANNELS * sizeof(float));            }
+            }
         }
         // Pool snapshot first (copies; throws only on OOM, caught below
         // with nothing mutated yet).
@@ -974,7 +963,7 @@ bool llama_kv_cache::try_clear(bool data, std::string * err) {
             if (!xkv_store->clear(err)) {
                 if (have_pool_snap) {
                     xkv_hot_pool->restore_state(pool_snap);
-        }
+                }
                 return false;
             }
         }
@@ -1555,6 +1544,8 @@ bool llama_kv_cache::reserve_hot_slots(slot_info_vec_t & sinfos,
     }
     out_reservations = std::move(staged);
     return true;
+}
+
 bool llama_kv_cache::has_kv_stream_targets() const {
     return kv_stream_runtime.runtime != nullptr;
 }
@@ -1563,7 +1554,8 @@ std::vector<llama_kv_stream_target> llama_kv_cache::get_kv_stream_targets() cons
     if (kv_stream_runtime.runtime == nullptr) {
         return {};
     }
-    return { { const_cast<llama_kv_cache *>(this) } };}
+    return { { const_cast<llama_kv_cache *>(this) } };
+}
 
 llama_memory_context_ptr llama_kv_cache::init_batch(
             llama_batch_allocr & balloc,
@@ -6390,8 +6382,11 @@ bool llama_kv_cache::can_capture_prerope_range(
     }
 
     return true;
+}
+
 bool llama_kv_cache::get_v_transposed() const {
-    return v_trans;}
+    return v_trans;
+}
 
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
@@ -8312,37 +8307,6 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     }
 }
 
-void llama_kv_cache::state_read_sinfo(
-        llama_io_read_i & io,
-           llama_seq_id   seq_id,
-  llama_state_seq_flags   flags,
-      slot_info_vec_t *   sinfos_out,
-const slot_info_vec_t *   sinfos_in) {
-    // Minimal port: restore via the existing state_read path.
-    // Mirrored layouts (sinfos_in) are best-effort for qwen4exp idx/attn pairing.
-    GGML_UNUSED(flags);
-
-    if (other) {
-        return;
-    }
-
-    if (sinfos_out) {
-        sinfos_out->assign(n_stream, slot_info{});
-    }
-
-    if (sinfos_in && sinfos_in->size() != n_stream) {
-        throw std::runtime_error("failed to restore kv cache: mirrored slot layout has the wrong stream count");
-    }
-
-    // Reuse the classic restore; capturing exact slot infos is only required for
-    // perfect idx/attn mirroring on state load, not for regular inference.
-    state_read(io, seq_id, flags);
-
-    if (sinfos_in) {
-        // Ensure the caller-provided layout is at least acknowledged.
-        GGML_UNUSED(sinfos_in);
-    }
-}
 
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
@@ -8466,13 +8430,13 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
         kv_self->set_input_k_shift_rows(k_shift_rows);
     }
 
-    if (k_rot) {
     // k_rot is null (not just unallocated) whenever attn_rot_k is false: build_input_k_rot
     // only allocates a real tensor for quantized K-caches with rotation enabled, or for
     // DeepSeek32/DeepSeek4's lightning-indexer cache (see attn_rot_k's setup). So a skip
     // here is either "this cache doesn't rotate" (k_rot == nullptr) or "graph-reserve pass"
     // (k_rot->buffer == nullptr) -- never a case that should silently drop a real input.
-    if (k_rot && k_rot->buffer) {        kv_self->set_input_k_rot(k_rot);
+    if (k_rot && k_rot->buffer) {
+        kv_self->set_input_k_rot(k_rot);
     }
 }
 
@@ -10189,8 +10153,8 @@ void llama_kv_cache::xkv_state_read_trailer(llama_io_read_i & io, llama_seq_id s
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {    auto & cells = v_cells[strm];
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+    auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
     if (dest_seq_id != -1) {
@@ -10212,9 +10176,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         std::vector<llama_kv_cell_ext> exts;
         if (has_cell_ext()) {
-        // the ext as it was saved, to put back after apply_ubatch()
-        std::vector<llama_kv_cell_ext> exts;
-        if (hparams.n_pos_per_embd() > 1) {            exts.resize(cell_count);
+            // the ext as it was saved, to put back after apply_ubatch()
+            if (hparams.n_pos_per_embd() > 1) {
+                exts.resize(cell_count);
+            }
         }
 
         for (uint32_t i = 0; i < cell_count; ++i) {
@@ -10238,10 +10203,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                     ubatch.pos[i + ubatch.n_tokens]   = ext.y;
                     ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
                 }
-                ubatch.pos[i + ubatch.n_tokens]   = ext.y;
-                ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
-
-                exts[i] = ext;            }
+            }
 
             // read the sequence id, but directly discard it - we will use dest_seq_id instead
             {
@@ -10294,16 +10256,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         apply_ubatch(sinfo, ubatch);
 
         if (has_cell_ext()) {
-            for (uint32_t i = 0; i < cell_count; ++i) {
-                const uint32_t idx = sinfo.idxs[0][i];
-                cells.ext_set(idx, exts[i]);
+            // apply_ubatch() takes the 2D position from the ubatch, and that ubatch is built with
+            // this cache's own n_pos_per_embd. a cache that does not use M-RoPE itself but mirrors
+            // one that does (the qwen4exp QSA indexer) would drop x and y. put the saved ext back
+            // instead, which is what the whole-context path below already does.
+            for (uint32_t i = 0; i < (uint32_t) exts.size(); ++i) {
+                cells.ext_set(sinfo.idxs[0][i], exts[i]);
             }
-        // apply_ubatch() takes the 2D position from the ubatch, and that ubatch is built with this
-        // cache's own n_pos_per_embd. a cache that does not use M-RoPE itself but mirrors one that
-        // does (the qwen4exp QSA indexer) would drop x and y. put the saved ext back instead, which
-        // is what the whole-context path below already does.
-        for (uint32_t i = 0; i < (uint32_t) exts.size(); ++i) {
-            cells.ext_set(sinfo.idxs[0][i], exts[i]);        }
+        }
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
 
@@ -10603,7 +10563,7 @@ llama_kv_cache_context::llama_kv_cache_context(
     } else {
         n_kv = 0;
     }
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {}
+}
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
 

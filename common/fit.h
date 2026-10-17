@@ -252,7 +252,6 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level,
                                 bool   no_alloc = true);
-                     ggml_log_level   log_level);
 
 // Load a parent model + context with no_alloc, then return the per-device memory breakdown of a child model + context.
 common_device_memory_data_vec common_get_device_memory_data_with_parent(

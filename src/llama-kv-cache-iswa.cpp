@@ -27,16 +27,13 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-        const llama_cparams   * cparams) :
-    llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
-            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share, cparams) {
-    const  layer_share_cb & share,
+        const llama_cparams   * cparams,
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
                      size_t kv_stream_maximum_pool_bytes) :
     llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
             kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share,
-            kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes) {}
+            cparams, kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes) {}
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
@@ -55,7 +52,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-    const llama_cparams   * cparams) : unified(unified) {
+    const llama_cparams   * cparams,
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
                      size_t kv_stream_maximum_pool_bytes) : unified(unified) {
@@ -115,20 +112,19 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share, cparams);
             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,
-            "", kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes);
+            cparams, "", kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes);
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     const bool swa_is_full_length = size_swa == size_base;
     kv_swa = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
-            hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share, nullptr);
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share,
-            "", swa_is_full_length ? kv_stream_stage_bytes : 0,
+            nullptr, "", swa_is_full_length ? kv_stream_stage_bytes : 0,
             swa_is_full_length ? kv_stream_phase_arena : nullptr,
-            swa_is_full_length ? kv_stream_maximum_pool_bytes : 0);}
+            swa_is_full_length ? kv_stream_maximum_pool_bytes : 0);
+}
 
 void llama_kv_cache_iswa::clear(bool data) {
     kv_base->clear(data);

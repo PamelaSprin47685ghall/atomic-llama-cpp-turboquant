@@ -1197,27 +1197,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = target_layer_ids[k] == n_layer_tgt
                         ? llama_get_embeddings_nextn(ctx_tgt)
-                        : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[0]);
+                        : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    if (!layer) {
+                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
-                    enc_embd_ptr = layer + (size_t) (i_batch_beg[seq_id] + offset) * n_embd_tgt;
-                } else {
-                    // Multi-layer extraction: interleave into features_buf
-                    if (features_buf.size() < (size_t) n_chunk * n_embd_enc) {
-                        features_buf.resize((size_t) n_chunk * n_embd_enc);
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
-                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                        const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                        if (!layer) {
-                            GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                        }
-                        for (int32_t i = 0; i < n_chunk; ++i) {
-                            float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                            const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                            std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
-                        }
-                    }
-                    enc_embd_ptr = features_buf.data();
                 }
 
                 // sanitize non-finite feature values before fusing. on Metal, the
@@ -1532,8 +1520,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_speculative * parent_spec    = nullptr;
     uint64_t kv_audit_id                = 0;
 
-    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
     // Adaptive draft depth (draft-mtp-adaptive), see common_speculative_adaptive
     bool adaptive = false;
     std::vector<int> n_cap;   // [n_seq] effective draft cap for the current draft() call
@@ -1613,8 +1599,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // offload draft sampling to the backend (chained drafting outputs several
         // rows per sequence, which backend sampling does not support)
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && this->params.p_min <= 0.0f) {
-        if (this->params.backend_sampling && !chain_graph) {            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+        if (this->params.backend_sampling && !chain_graph) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_greedy());
 
@@ -1659,7 +1645,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             SPC_TRC("%s", "adaptive draft depth enabled (draft-mtp-adaptive)\n");
         }
 
-        pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
@@ -1837,7 +1822,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         workspace->clear_staged();
     }
 
-    bool process_impl(const llama_batch & batch_in, const std::vector<bool> * defer) {
+    bool process_impl(const llama_batch & batch_in, const std::vector<bool> * defer_flags) {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1848,14 +1833,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
-        const bool stage = defer != nullptr && !is_mem_shared && !chain_heads;
+        const bool stage = defer_flags != nullptr && !is_mem_shared && !chain_heads;
         if (n_tokens > n_batch_alloc) {
             SPC_ERR("MTP input exceeds predefined capacity: rows=%d capacity=%d\n", n_tokens, n_batch_alloc);
             return false;
         }
 
         if (stage) {
-            GGML_ASSERT(defer->size() == n_seq);
+            GGML_ASSERT(defer_flags->size() == n_seq);
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (workspace->has_staged(seq_id)) {
                     SPC_ERR("uncommitted MTP rows for seq_id=%d\n", (int) seq_id);
@@ -1971,14 +1956,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (i_batch_beg[seq_id] < 0) {
                     continue;
                 }
-                std::memcpy(defer.embd.data() + (k0 + i_batch_beg[seq_id]) * (size_t) n_embd, pending_h[seq_id].data(), row_bytes);
+                std::memcpy(defer.embd.data() + (k0 + i_batch_beg[seq_id]) * (size_t) n_embd, workspace->pending(seq_id), row_bytes);
             }
         } else if (!is_mem_shared) {
             if (!flush_deferred()) {
                 return false;
             }
+        }
 
-            common_batch_clear(batch);
         if (device_hidden) {
             device_target_generation = llama_predefined_hidden_generation(ctx_tgt);
             if (device_target_generation == 0) return false;
@@ -2020,7 +2005,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t i_beg = i_batch_beg[seq_id];
             const int32_t n_rows = i_batch_end[seq_id] - i_beg + 1;
 
-            if (!workspace->sequence(seq_id, i_beg, n_rows, stage, stage && (*defer)[seq_id])) {
+            if (!workspace->sequence(seq_id, i_beg, n_rows, stage, stage && (*defer_flags)[seq_id])) {
                 SPC_ERR("invalid MTP verification range for seq_id=%d\n", (int) seq_id);
                 return false;
             }
@@ -2252,7 +2237,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 for (int j = 0; j < n_chain; ++j) {
                     common_batch_add(batch, j == 0 ? dp.id_last : 0, dp.n_past + j, { seq_one }, true);
                     if (j == 0) {
-                        std::memcpy(batch.embd + (size_t) n_catchup * n_embd, pending_h[seq_one].data(), row_bytes);
+                        std::memcpy(batch.embd + (size_t) n_catchup * n_embd, workspace->pending(seq_one), row_bytes);
                     } else {
                         std::memset(batch.embd + (size_t) (n_catchup + j) * n_embd, 0, row_bytes);
                     }
@@ -2582,19 +2567,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-        // update the adaptive controller only when this implementation produced the
-        // accepted draft; on is_other the stats belong to a different speculator
-        if (adaptive && !is_other) {
-            const int depth_before = adaptive_ctrl[seq_id].n_cur;
-            adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, params.n_min_adaptive);
-            if (adaptive_ctrl[seq_id].n_cur != depth_before) {
-                SPC_DBG("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
-                        (int) seq_id, depth_before, adaptive_ctrl[seq_id].n_cur, n_last[seq_id], n_accepted);
-            }
-        }
-
-        const int32_t n_rows = verify_h_rows[seq_id];
-        if (n_rows <= 0) {            return;
+            return;
         }
 
         workspace->reset_sequence(seq_id);

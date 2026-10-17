@@ -1459,6 +1459,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_INF("%s", "skipping device-memory auto-fit because a shared KV/compute arena is explicitly configured\n");
     }
     if (common_params_should_fit_device_memory(params)) {
+        const uint32_t n_ctx_min = (params.n_ctx_kv_auto || params.n_ctx_kv > 0)
+            ? UINT32_MAX
+            : params.fit_params_min_ctx;
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         // Snapshot the pre-fit state so a failed fit can be rolled back to a

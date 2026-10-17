@@ -487,7 +487,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_PQ2_0   = 128, // except 1d tensors (Prism-private group-128 Q2_0)
         GGML_FTYPE_MOSTLY_Q8_CR   = 29, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q5_CR   = 30, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q6_CR   = 31, // except 1d tensors    };
+        GGML_FTYPE_MOSTLY_Q6_CR   = 31, // except 1d tensors
+    };
 
     // available tensor operations:
     enum ggml_op {
@@ -2873,7 +2874,7 @@ extern "C" {
     //
     // broadcast:
     //   ne3 % ne33 == 0
-    //    GGML_API struct ggml_tensor * ggml_lightning_indexer(
+        GGML_API struct ggml_tensor * ggml_lightning_indexer(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,

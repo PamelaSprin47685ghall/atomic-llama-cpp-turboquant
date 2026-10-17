@@ -134,7 +134,6 @@ enum llm_type {
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
     LLM_TYPE_80B_A3B, // Qwen3 Next
-    LLM_TYPE_A3B,     // Qwen3.8 Flash Next
     LLM_TYPE_100B_A6B,
     LLM_TYPE_102B_A12B, // Solar-Open
     LLM_TYPE_106B_A12B, // GLM-4.5-Air
@@ -556,7 +555,8 @@ struct llama_layer {
     struct ggml_tensor * index_q_norm = nullptr;
     struct ggml_tensor * index_k_norm = nullptr;
 
-    // qwen4exp hyper-connection + PLE    struct ggml_tensor * hc_attn_norm   = nullptr;
+    // qwen4exp hyper-connection + PLE
+    struct ggml_tensor * hc_attn_norm   = nullptr;
     struct ggml_tensor * hc_attn_down   = nullptr;
     struct ggml_tensor * hc_attn_up     = nullptr;
     struct ggml_tensor * hc_attn_inject = nullptr;
@@ -663,7 +663,8 @@ struct llama_model {
     struct ggml_tensor * hc_head_base  = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
 
-    // qwen4exp final hyper-connection mixer    struct ggml_tensor * hc_head_norm = nullptr;
+    // qwen4exp final hyper-connection mixer
+    struct ggml_tensor * hc_head_norm = nullptr;
     struct ggml_tensor * hc_head_down = nullptr;
     struct ggml_tensor * hc_head_up   = nullptr;
 
