@@ -2,6 +2,7 @@
 #include "speculative-mtp-workspace.h"
 #include "llama-predefined.h"
 #include "llama-predefined-hidden.h"
+#include "ggml-device-copy.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -16,6 +17,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1017,6 +1019,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
 
+    // GGML_SPEC_DIRECT_HIDDEN: keep the target features and the encoder output
+    // on the device and copy them straight into the next graph input.
+    bool direct_hidden = false;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
@@ -1113,11 +1119,69 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             llama_set_causal_attn(ctx_dft, causal);
         }
+
+        enable_direct_hidden();
     }
 
     ~common_speculative_impl_draft_dflash() override {
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
+    }
+
+    // Direct hidden requires one sequence stream and both models on the same
+    // non-CPU device. Everything else keeps the host readback path.
+    void enable_direct_hidden() {
+        const char * env = std::getenv("GGML_SPEC_DIRECT_HIDDEN");
+        if (env && std::strcmp(env, "0") == 0) {
+            LOG_INF("%s: direct hidden disabled by GGML_SPEC_DIRECT_HIDDEN=0\n", __func__);
+            return;
+        }
+        if (n_seq != 1 || target_layer_ids_n == 0 || target_layer_ids_n > GGML_DEVICE_COPY_MAX_RANGES) {
+            LOG_INF("%s: direct hidden unavailable (n_seq=%u, n_extract=%u)\n",
+                    __func__, (unsigned) n_seq, target_layer_ids_n);
+            return;
+        }
+        const llama_model * model_tgt = llama_get_model(params.ctx_tgt);
+        const llama_model * model_dft = llama_get_model(params.ctx_dft);
+        ggml_backend_dev_t dev_tgt = llama_model_get_device(model_tgt, 0);
+        ggml_backend_dev_t dev_dft = llama_model_get_device(model_dft, 0);
+        if (!dev_tgt || dev_tgt != dev_dft ||
+            llama_model_get_device(model_tgt, 1) != nullptr ||
+            llama_model_get_device(model_dft, 1) != nullptr ||
+            ggml_backend_dev_type(dev_tgt) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            LOG_INF("%s: direct hidden unavailable (target and draft need one shared non-CPU device)\n", __func__);
+            return;
+        }
+        llama_set_embeddings_layer_inp_device(params.ctx_tgt, true);
+        llama_set_embeddings_nextn_device(params.ctx_tgt, /*decoder*/ true, /*encoder*/ false);
+        llama_set_embeddings_nextn_device(params.ctx_dft, /*decoder*/ false, /*encoder*/ true);
+        direct_hidden = true;
+        LOG_INF("%s: direct hidden enabled on %s\n", __func__, ggml_backend_dev_name(dev_tgt));
+    }
+
+    // The device buffers are allocated before the first decode. Keep the host
+    // path only when every requested feature really has one.
+    bool direct_hidden_ready() {
+        if (!direct_hidden) {
+            return false;
+        }
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            ggml_tensor * t = target_layer_ids[k] == n_layer_tgt
+                ? llama_get_embeddings_nextn_tensor(params.ctx_tgt)
+                : llama_get_embeddings_layer_inp_tensor(params.ctx_tgt, (uint32_t) target_layer_ids[k]);
+            if (!t || t->type != GGML_TYPE_F32 || t->ne[0] != n_embd_tgt) {
+                LOG_WRN("%s: direct hidden disabled (target feature %d unavailable)\n", __func__, target_layer_ids[k]);
+                direct_hidden = false;
+                return false;
+            }
+        }
+        ggml_tensor * g = llama_get_embeddings_nextn_tensor(params.ctx_dft);
+        if (!g || g->type != GGML_TYPE_F32 || g->ne[0] != n_embd_dec) {
+            LOG_WRN("%s: direct hidden disabled (draft encoder output unavailable)\n", __func__);
+            direct_hidden = false;
+            return false;
+        }
+        return true;
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1181,6 +1245,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
+        // One decision per request: the device and host paths are never mixed
+        // within a batch, because only one of them fills the feature buffers.
+        const bool direct = direct_hidden && direct_hidden_ready();
+
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1192,46 +1260,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather this chunk's target features, interleaved by extract layer
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = target_layer_ids[k] == n_layer_tgt
-                        ? llama_get_embeddings_nextn(ctx_tgt)
-                        : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                    }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
-                    }
-                }
-
-                // sanitize non-finite feature values before fusing. on Metal, the
-                // mat-mat kernels stage f32 activations as f16 for the simdgroup
-                // multiply; Laguna's massive-activation rows (attention-sink tokens,
-                // |x| ~ 1e6 in the pre-final-norm residual) overflow f16 -> inf/nan.
-                // one poisoned row would otherwise NaN the whole drafter KV cache.
-                {
-                    size_t n_bad = 0;
-                    for (auto & v : features_buf) {
-                        if (!std::isfinite(v)) {
-                            v = v != v ? 0.0f : (v > 0.0f ? 65504.0f : -65504.0f);
-                            n_bad++;
-                        }
-                    }
-                    if (n_bad > 0) {
-                        static bool warned = false;
-                        if (!warned) {
-                            LOG_WRN("%s: sanitized %zu non-finite target feature values (f16 overflow on massive activations); "
-                                    "draft quality may degrade slightly on affected rows\n", __func__, n_bad);
-                            warned = true;
-                        }
-                    }
-                }
-
-                // fuse extracted features through DFlash encoder
                 // M-RoPE drafts read 4 position rows per token from embd batches, so pass them explicitly
                 std::vector<llama_pos> enc_pos;
                 if (is_mrope) {
@@ -1245,29 +1273,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ is_mrope ? enc_pos.data() : nullptr,                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
-
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
-
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-
                 // inject the DFlash decoder K/V cache at the tokens' target positions
-                // Avoid redundant memcpy when inp_g is already contiguous valid floats
                 float * orig_batch_embd = batch_inject.embd;
-                batch_inject.embd       = const_cast<float *>(inp_g);
                 batch_inject.n_tokens   = n_chunk;
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
@@ -1282,11 +1289,114 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
-                rc = llama_decode(ctx_dft, batch_inject);
-                batch_inject.embd = orig_batch_embd; // restore original buffer pointer
+
+                int32_t rc = 0;
+
+                if (direct) {
+                    // one contiguous plane per feature, copied on the device
+                    const size_t tgt_row = (size_t) n_embd_tgt * sizeof(float);
+                    const size_t dec_row = (size_t) n_embd_dec * sizeof(float);
+                    const size_t src_row = (size_t) (i_batch_beg[seq_id] + offset);
+
+                    std::array<llama_device_input_range, GGML_DEVICE_COPY_MAX_RANGES> enc_ranges{};
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        ggml_tensor * t = target_layer_ids[k] == n_layer_tgt
+                            ? llama_get_embeddings_nextn_tensor(ctx_tgt)
+                            : llama_get_embeddings_layer_inp_tensor(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                        if (!t || !ggml_is_contiguous(t) ||
+                            ggml_nbytes(t) < (src_row + n_chunk) * tgt_row) {
+                            LOG_ERR("%s: direct hidden feature %d unavailable (n_tokens=%d, offset=%d)\n",
+                                    __func__, target_layer_ids[k], (int) n_chunk, (int) offset);
+                            batch_inject.embd = orig_batch_embd;
+                            return false;
+                        }
+                        enc_ranges[k] = {t, src_row * tgt_row, size_t(k) * n_chunk * tgt_row,
+                                         size_t(n_chunk) * tgt_row};
+                    }
+
+                    llama_batch enc_batch = {
+                        /*.n_tokens =*/ n_chunk,
+                        /*.token    =*/ nullptr,
+                        /*.embd     =*/ nullptr,
+                        /*.pos      =*/ is_mrope ? enc_pos.data() : nullptr,
+                        /*.n_seq_id =*/ nullptr,
+                        /*.seq_id   =*/ nullptr,
+                        /*.logits   =*/ nullptr,
+                    };
+
+                    rc = llama_encode_device_input(ctx_dft, enc_batch, enc_ranges.data(), target_layer_ids_n);
+                    ggml_tensor * inp_g = rc == 0 ? llama_get_embeddings_nextn_tensor(ctx_dft) : nullptr;
+                    if (!inp_g || ggml_nbytes(inp_g) < (size_t) n_chunk * dec_row) {
+                        LOG_ERR("%s: direct hidden encoder output unavailable (rc=%d)\n", __func__, rc);
+                        batch_inject.embd = orig_batch_embd;
+                        return false;
+                    }
+                    const llama_device_input_range dec_range{inp_g, 0, 0, (size_t) n_chunk * dec_row};
+                    batch_inject.embd = nullptr;
+                    rc = llama_decode_device_input(ctx_dft, batch_inject, &dec_range, 1);
+                    batch_inject.embd = orig_batch_embd;
+                } else {
+                    // gather this chunk's target features, interleaved by extract layer
+                    features_buf.resize((size_t) n_chunk * n_embd_enc);
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        const float * layer = target_layer_ids[k] == n_layer_tgt
+                            ? llama_get_embeddings_nextn(ctx_tgt)
+                            : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                        if (!layer) {
+                            GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        }
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                            const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                            std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        }
+                    }
+
+                    // sanitize non-finite feature values before fusing. on Metal, the
+                    // mat-mat kernels stage f32 activations as f16 for the simdgroup
+                    // multiply; Laguna's massive-activation rows (attention-sink tokens,
+                    // |x| ~ 1e6 in the pre-final-norm residual) overflow f16 -> inf/nan.
+                    // one poisoned row would otherwise NaN the whole drafter KV cache.
+                    {
+                        size_t n_bad = 0;
+                        for (auto & v : features_buf) {
+                            if (!std::isfinite(v)) {
+                                v = v != v ? 0.0f : (v > 0.0f ? 65504.0f : -65504.0f);
+                                n_bad++;
+                            }
+                        }
+                        if (n_bad > 0) {
+                            static bool warned = false;
+                            if (!warned) {
+                                LOG_WRN("%s: sanitized %zu non-finite target feature values (f16 overflow on massive activations); "
+                                        "draft quality may degrade slightly on affected rows\n", __func__, n_bad);
+                                warned = true;
+                            }
+                        }
+                    }
+
+                    llama_batch enc_batch = {
+                        /*.n_tokens =*/ n_chunk,
+                        /*.token    =*/ nullptr,
+                        /*.embd     =*/ features_buf.data(),
+                        /*.pos      =*/ is_mrope ? enc_pos.data() : nullptr,
+                        /*.n_seq_id =*/ nullptr,
+                        /*.seq_id   =*/ nullptr,
+                        /*.logits   =*/ nullptr,
+                    };
+
+                    rc = llama_encode(ctx_dft, enc_batch);
+                    if (rc == 0) {
+                        const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+                        batch_inject.embd = const_cast<float *>(inp_g);
+                        rc = inp_g ? llama_decode(ctx_dft, batch_inject) : -1;
+                        batch_inject.embd = orig_batch_embd; // restore original buffer pointer
+                    }
+                }
+
                 if (rc != 0) {
-                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
+                    LOG_ERR("%s: %s failed rc=%d (n_tokens=%d, offset=%d)\n",
+                            __func__, direct ? "direct hidden" : "llama decode/encode", rc, (int) n_chunk, (int) offset);
                     return false;
                 }
             }

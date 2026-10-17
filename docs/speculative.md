@@ -141,6 +141,21 @@ See:
 
 - #25173
 
+#### Device-resident hidden handoff
+
+By default the target's extracted layer inputs and the encoder output travel through host
+memory: two downloads, a host-side interleave, and two uploads per drafted block. When the
+target and the draft sit on the same non-CPU device, `GGML_SPEC_DIRECT_HIDDEN=1` (the
+default) keeps them in persistent device buffers instead. The next graph input is then
+filled by a native device-to-device copy, with no host bytes and no CPU interleave.
+
+The handoff requires a single sequence stream, one shared device for both models, and a
+backend that implements `ggml_backend_device_copy_ranges` (Vulkan). Otherwise the driver
+logs why and keeps the host path; `GGML_SPEC_DIRECT_HIDDEN=0` forces the host path for A/B
+comparison. Both paths produce identical tokens. The device buffers are allocated at
+startup and hold the most recent batch, so the visible cost is memory, not time: one
+`n_embd x n_batch` F32 buffer per extracted target layer, plus one for the nextn output.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.

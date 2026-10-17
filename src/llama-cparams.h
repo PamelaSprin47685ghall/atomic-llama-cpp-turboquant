@@ -49,6 +49,12 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+    // Keep the output on the device instead of copying it to host memory.
+    // The nextn flags are split by graph type: a draft reads its encoder
+    // output on device, but samples its decoder output on the host.
+    bool embeddings_layer_inp_device = false; // layer inputs stay in device buffers
+    bool embeddings_nextn_device_dec = false; // decode/DEFAULT graphs
+    bool embeddings_nextn_device_enc = false; // ENCODER graphs
     bool mtp_chain;               // DECODER_MTP: chain rows in-graph from the first row's inputs
     bool causal_attn;
     bool offload_kqv;

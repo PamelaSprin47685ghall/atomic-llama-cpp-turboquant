@@ -130,6 +130,27 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    if (ubatch->device_hidden) {
+        const auto & source = *ubatch->device_hidden;
+        if (!embd || source.count == 0 || source.count > source.ranges.size() ||
+            source.rows != uint32_t(ubatch->n_tokens)) {
+            throw std::runtime_error("device embedding input shape mismatch");
+        }
+        auto copies = source.ranges;
+        const size_t size = ggml_nbytes(embd);
+        for (size_t i = 0; i < source.count; ++i) {
+            copies[i].dst = embd;
+            if (copies[i].dst_offset > size || copies[i].bytes > size - copies[i].dst_offset) {
+                throw std::runtime_error("device embedding input range exceeds the input tensor");
+            }
+        }
+        // No host fallback: a failed native copy is fatal to this handoff.
+        if (!ggml_backend_device_copy_ranges(source.executor, copies.data(), source.count, false)) {
+            throw std::runtime_error("device embedding input has no native local copy");
+        }
+        return;
+    }
+
     if (ubatch->embd) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 

@@ -93,6 +93,9 @@ struct llama_ubatch {
     int32_t      *  source_row     = nullptr; // [n_tokens] original batch row, nullptr if unavailable
     // Borrowed only during process_ubatch/set_inputs, never retained by a graph.
     const llama_device_hidden_input * device_hidden = nullptr;
+    // True when device_hidden feeds an embedding input, so graphs select the
+    // embedding path even though ubatch.embd is null (no host bytes exist).
+    bool device_embd = false;
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch

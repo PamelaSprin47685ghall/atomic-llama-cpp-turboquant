@@ -161,6 +161,49 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+//
+// device-resident spec-decode features
+//
+// With the device flags below, the driver handoff never touches host memory:
+// layer inputs and nextn outputs stay in persistent device buffers, and the
+// next decode/encode copies them straight into its embedding input.
+// Allocation is startup-only. Setters must be called before the first decode.
+
+// Keep layer inputs in device buffers (no host copy of embd_layer_inp).
+LLAMA_API void llama_set_embeddings_layer_inp_device(struct llama_context * ctx, bool value);
+// Keep nextn outputs on device per graph type. A DFlash/DSpark draft needs
+// encoder = true (its encoder output feeds the KV injection) and decoder =
+// false (it samples the decoder output on the host). A DFlash target uses
+// decoder = true.
+LLAMA_API void llama_set_embeddings_nextn_device(struct llama_context * ctx, bool decoder, bool encoder);
+
+// Persistent F32 [width, n_batch] buffers, or null when the feature is off.
+// Contents belong to the most recent decode/encode of ctx and are overwritten
+// by the next one. Callers must not keep the pointer across calls.
+LLAMA_API struct ggml_tensor * llama_get_embeddings_layer_inp_tensor(struct llama_context * ctx, uint32_t lid);
+LLAMA_API struct ggml_tensor * llama_get_embeddings_nextn_tensor(struct llama_context * ctx);
+
+// One F32 row range of a graph embedding input, filled by a native device copy.
+// src must be a tensor returned by the getters above. Offsets are byte offsets
+// inside src and the destination input tensor.
+struct llama_device_input_range {
+    struct ggml_tensor * src;
+    size_t src_offset;
+    size_t dst_offset;
+    size_t bytes;
+};
+
+// Run one batch whose embedding input comes entirely from device tensors.
+// batch.token and batch.embd must be null; n_tokens must fit one ubatch. The
+// ranges must cover the input without gaps or overlap. Every range, including
+// a native-copy dry run, is validated before any command is submitted: a
+// rejection returns non-zero with the context unchanged, while a later graph
+// failure is fatal to this handoff (never retried as a host copy).
+LLAMA_API int llama_decode_device_input(struct llama_context * ctx, struct llama_batch batch,
+        const struct llama_device_input_range * ranges, size_t n_ranges);
+LLAMA_API int llama_encode_device_input(struct llama_context * ctx, struct llama_batch batch,
+        const struct llama_device_input_range * ranges, size_t n_ranges);
+
 // Extract normalized attention Q immediately before RoPE for calibration.
 // Enabled layers are copied asynchronously and synchronized once on the first getter.
 LLAMA_API void    llama_set_attention_q_pre_rope(struct llama_context * ctx, uint32_t lid, bool value);

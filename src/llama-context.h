@@ -11,6 +11,7 @@
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
+#include "ggml-device-copy.h"
 
 #include <array>
 #include <deque>
@@ -89,6 +90,15 @@ struct llama_context {
     bool predefined_hidden_capture(ggml_backend_t producer, const ggml_tensor * tensor, uint32_t offset, uint32_t rows);
     bool predefined_hidden_readback();
     bool predefined_hidden_bind_ubatch(llama_ubatch & ubatch, llama_device_hidden_input & input);
+    // Device-resident spec-decode features: allocation is startup-only, capture
+    // is one device-to-device copy per ubatch, and the getters expose the
+    // persistent buffer. Rows are overwritten by the next decode/encode.
+    void set_embeddings_layer_inp_device(bool value);
+    void set_embeddings_nextn_device(bool decoder, bool encoder);
+    ggml_tensor * get_embeddings_layer_inp_tensor(uint32_t lid);
+    ggml_tensor * get_embeddings_nextn_tensor();
+    bool decode_device_input(llama_batch batch, const llama_device_input_range * ranges, size_t n_ranges);
+    bool encode_device_input(llama_batch batch, const llama_device_input_range * ranges, size_t n_ranges);
     void set_predefined_target_enabled(bool enabled) { predefined_target_enabled = enabled; }
     bool get_predefined_target_enabled() const { return predefined_target_enabled; }
 
@@ -367,6 +377,24 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+    // Persistent device-side feature buffer for spec-decode handoffs.
+    struct device_feature {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buffer;
+        ggml_tensor           * tensor   = nullptr;
+        ggml_backend_t          executor = nullptr;
+        uint32_t                width    = 0;
+    };
+
+    // Per-call device input plan, borrowed by process_ubatch only.
+    struct device_input_plan {
+        std::array<ggml_device_copy_range, GGML_DEVICE_COPY_MAX_RANGES> ranges{};
+        size_t          count    = 0;
+        uint32_t        rows     = 0;
+        ggml_backend_t  executor = nullptr;
+        bool            active   = false;
+    } device_input;
+
     //
     // output
     //
@@ -381,8 +409,13 @@ private:
     int64_t output_resolve_row(int32_t i) const;
 
     // async-copy enabled layer-input tensors (per cparams.embeddings_layer_inp)
-    // from backend into host-side embd_layer_inp buffers
+    // into host buffers, or device buffers when embeddings_layer_inp_device is set
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
+    bool ensure_device_feature(device_feature & feature, uint32_t width);
+    ggml_backend_t executor_for_output_device() const;
+    bool device_input_bind_ubatch(llama_ubatch & ubatch, llama_device_hidden_input & input) const;
+    bool run_device_input(bool encode, llama_batch batch, const llama_device_input_range * ranges, size_t n_ranges);
 
     // async-copy enabled normalized pre-RoPE Q tensors into host buffers
     void extract_attention_q_pre_rope(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
@@ -598,6 +631,9 @@ private:
     // host buffers for normalized attention Q before RoPE, per layer
     // populated when cparams.attention_q_pre_rope[il] is true
     std::vector<buffer_view<float>> attention_q_pre_rope;
+
+    std::vector<device_feature> embd_layer_inp_dev; // [n_layer() + 1]
+    device_feature              embd_nextn_dev;
 
     // decision order of the next batch, see llama_set_decision_order()
     std::vector<int32_t> decision_order_next;

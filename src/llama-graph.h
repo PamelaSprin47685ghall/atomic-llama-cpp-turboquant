@@ -1517,6 +1517,7 @@ struct llm_graph_params {
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
+            ubatch.device_embd  == other.ubatch.device_embd &&
             (predefined_mtp_dynamic || predefined_target_dynamic || ubatch.n_tokens == other.ubatch.n_tokens) &&
             (predefined_mtp_dynamic || predefined_target_dynamic || ubatch.n_seq_tokens == other.ubatch.n_seq_tokens) &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&

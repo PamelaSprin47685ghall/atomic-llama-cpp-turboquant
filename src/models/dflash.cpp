@@ -262,7 +262,16 @@ template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
     auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
 
-    inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);
+    if (ubatch.device_embd) {
+        // Device handoff copies one contiguous per-layer plane per feature, so
+        // the input is [n_feat, n_tokens, n_aux] and the graph interleaves it.
+        const int64_t n_aux = (int64_t) hparams.n_embd_inp_enc() / hparams.n_embd;
+        GGML_ASSERT(n_aux > 0 && hparams.n_embd_inp_enc() % hparams.n_embd == 0);
+        inp_target->embd = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32,
+                hparams.n_embd_inp_enc() / n_aux, n_tokens, n_aux);
+    } else {
+        inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);
+    }
     ggml_set_input(inp_target->embd);
 
     ggml_tensor * cur = inp_target->embd;
@@ -279,6 +288,13 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     const auto & model_df = static_cast<const llama_model_dflash &>(model);
 
     ggml_tensor * cur = build_inp_embd_enc();
+
+    if (ubatch.device_embd) {
+        // [n_feat, n_tokens, n_aux] -> [n_feat, n_aux, n_tokens], same element
+        // order as the host features_buf interleave
+        cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3));
+        cur = ggml_reshape_2d(ctx0, cur, hparams.n_embd_inp_enc(), n_tokens);
+    }
 
     // Laguna drafters RMS-norm each captured feature before concat + fc.
     // View the concatenated input as [n_feat, n_aux, n_tokens], norm over
@@ -593,7 +609,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     };
 
     // KV cache injection
-    if (ubatch.embd) {
+    if (ubatch.embd || ubatch.device_embd) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
@@ -861,7 +877,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     llm_graph_input_attn_k_iswa * inp_attn = build_attn_inp_k_iswa();
 
     // KV cache injection: fused target features from the encoder
-    if (ubatch.embd) {
+    if (ubatch.embd || ubatch.device_embd) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
