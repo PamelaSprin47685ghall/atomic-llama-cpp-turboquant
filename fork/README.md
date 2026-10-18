@@ -1,67 +1,90 @@
 # 干净的 TurboQuant fork
 
-本目录是维护入口。仓库其余部分保持所选 upstream master 原样；自有代码全部在 fork/。
+这里是自有功能的维护入口。A 固定在 AtomicBot-ai 上游 master 的 `cda0f9256665845cd9d6f3a0176880883f653a3d`；自有库 B 和编排程序 C 放在 `fork/`。少数必须由 A 自己完成的内存操作，以及已经有失败用例的正确性修复，以显式小补丁保留。
 
-当前保留两项独立能力：
+本轮按小行为重新排查，补回了 **Prefill / Decode 阶段计算工作区、独立物理 KV 容量、Prefill 优先调度**，并修复旧生产 corpus 格式兼容、CPU 精度、Vulkan WHT 等问题。A 目前只有 **16 个变更文件，324 行新增、39 行删除**，由 [upstream-exceptions.json](upstream-exceptions.json) 固定每个文件的完整内容、消费者、理由和退出条件。
 
-- 精确的有限 top-k 候选提取，以及调用真实 llama 模型和采样链的生成程序。
-- Wanxiangqi 请求 token trie 的 V1 格式读写，以及调用真实 llama 序列状态接口的前缀复用评分程序。
+完整清单与取舍见 [AUDIT.md](AUDIT.md)、[MIGRATION.md](MIGRATION.md)，实际运行记录见 [VALIDATION.md](VALIDATION.md)。未迁入的有用能力仍是保留候选；旧实现与证据保存在 `archive/pre-clean-20261018`。
 
-完整取舍、证据来源和未迁移范围见 [MIGRATION.md](MIGRATION.md)。这不是旧 fork 的全部功能等价替换。TP5、RERoT、FlashPrefill、XKV-SR、direct-hidden 等扩展仍在归档分支；上游自身已有的能力继续由上游提供。
+## A / B / C 的职责
 
-## 结构
-
-| 参与者 | 完整职责 | 依赖 |
+| 参与者 | 完整职责 | 声明依赖 |
 |---|---|---|
-| A：仓库上游部分 | 模型加载、tokenizer、推理、采样、序列状态 | 原上游依赖 |
-| B：sampling | 从数值数组返回拥有自身数据的有限 top-k 候选 | C++17 标准库 |
-| B：corpus | 维护、验证和保存请求 token trie | C++17 标准库 |
-| C：compose | 调用 B 选择候选，再运行 A 的真实采样链；执行模型生成 | 已安装 llama、TQSampling |
-| C：corpus-compose | 调用 B 读取请求，安排 A 的 decode、状态保存和恢复 | 已安装 llama、TQCorpus |
+| A：固定上游与登记的小补丁 | 模型、tokenizer、推理、采样、KV、后端和原版应用 | 原上游依赖 |
+| B：TQSampling | 从数值数组返回拥有自身数据的有限 top-k 候选 | C++17 标准库 |
+| B：TQCorpus | 请求 token trie、生产 V1 格式、请求种类及时间戳 | C++17 标准库 |
+| B：TQScheduling | 保持当前 Prefill，按槽位顺序选择下一个请求；没有待处理 Prefill 时恢复 Decode | C++17 标准库 |
+| C：compose | 用 B 选候选，调用 A 的真实采样链和模型生成 | 已安装 llama、TQSampling |
+| C：corpus-compose | 用 B 读写请求，编排 A 的 tokenizer、decode 和序列快照 | 已安装 llama、TQCorpus |
+| C：batch-compose | 拥有请求及位置，按 B 的选择提交 A 的真实批次，控制阶段释放 | 已安装 llama、TQScheduling |
 
-A 不认识 B 或 C。B 不包含 llama、ggml 或其他兄弟库的头文件。C 使用已安装的公开 API；没有构建时改写 A 源码、链接符号拦截或私有头文件桥接。维护规则见 [AGENTS.md](AGENTS.md)。
+A 与 B 不包含、调用或注入彼此的服务；各 B 也不依赖兄弟库。C 只消费安装后的公开接口。没有构建时改写源码、链接符号拦截或私有头文件桥接。原版 `llama-server` 的小范围调度修改是明确的 A 例外，尚未拆成完整独立 HTTP 编排层；详见 [UPSTREAM-EXCEPTIONS.md](UPSTREAM-EXCEPTIONS.md)。
 
 ## 构建
 
-需要 Git、Python 3.12 或更新版本、CMake、C++17 编译器，以及所选上游后端需要的工具链。隔离测试使用 Python 的 tar 数据过滤器。
+需要 Git、Python 3.12 或更新版本、CMake、C++17 编译器，以及所选 A 后端需要的工具链。从仓库根执行：
 
-从仓库根执行：
-
-~~~sh
+```sh
 python3 fork/build.py --backend cpu --build-dir build-clean-fork --jobs 4
-~~~
+python3 fork/build.py --backend vulkan --tools --build-dir build-clean-vulkan --jobs 4
+```
 
-脚本先单独构建和安装 A，再从其安装包构建 B、C，执行测试并安装。产物在 build-clean-fork/install。没有模型文件也能运行这组组件测试。
+脚本先检查 A，再单独构建和安装 A；随后分别构建、测试和安装三个 B，再分别构建三个 C。产物位于相应构建目录的 `install/`。默认组件测试不需要模型；Vulkan WHT 测试需要真实 Vulkan 设备。
 
-选择 Vulkan：
+`--tools` 额外构建 `llama-server` 和 `llama-bench`，可执行文件位于 `upstream/bin/`。脚本接受 `cuda`、`hip`，本次实际资格为 CPU 与 Vulkan。`--no-test` 只用于明确跳过测试的构建，不构成验证记录。
 
-~~~sh
-python3 fork/build.py --backend vulkan --build-dir build-clean-vulkan --jobs 4
-~~~
+## 多请求与阶段内存
 
-脚本也接受 cuda、hip；实际验证范围见 [VALIDATION.md](VALIDATION.md)。用 --tools 额外构建原上游 llama-server 和 llama-bench，产物在构建目录的 upstream/bin；它们保持原上游行为，未自动接入本目录的采样优化。
+准备 UTF-8 文本 `prompts.txt`，每行一个原始模型提示。需要聊天模板时，由调用者先形成正确的提示文本。
 
-## 生成
+```sh
+build-clean-vulkan/install/bin/tq-batch-compose \
+  --model /path/to/model.gguf --prompts prompts.txt \
+  --ctx-size 2048 --total-kv 8192 --predict 64 \
+  --inject-after 2 --gpu-layers 99 --json
+```
 
-~~~sh
+`--inject-after 2` 让前两个请求先执行两批 Decode，再接纳后续提示。B 选择一个 Prefill 并保持它到完成；这期间 C 暂停其他请求生成，然后从原位置继续。JSON Lines 记录真正提交的 token、位置、批次、阶段变化和结果，不能用一次参数设置冒充已经发生的调度。
+
+| 控制 | 实际含义 | 默认与限制 |
+|---|---|---|
+| `--ctx-size` | 每请求逻辑窗口 | 不因扩大物理 KV 自动扩大逻辑窗口 |
+| `--total-kv` | 同一 context 的统一物理 KV token 容量 | 由 A 按 256 对齐；必须覆盖一个逻辑窗口；不等于设备自动容量探测 |
+| `--phase-memory` | Prefill→Decode 时同步、丢弃可重建图并释放计算分配器；下一批按实际图重新分配 | C 默认开启；保留模型、KV / recurrent、输出和 sampler 状态 |
+| `--no-phase-memory` | 使用相同调度，但保留原计算工作区 | 用于真实输出与分配量对照 |
+
+C 未指定物理容量时，使用逻辑窗口与已知请求最大 token 需求总和中的较大值。这个计算不探测显存，也不执行驱逐或容量不足重试。纯 recurrent、DeepSeek4、共享 CUDA KV-stream arena 等不兼容配置明确拒绝；独立 recurrent 容量尚未抽取。
+
+释放后的 `llama_memory_compute_bytes()` 是该 context 当前计算分配器拥有的字节数，不是进程峰值显存或设备可用显存。扩大物理 KV 也可能扩大注意力工作区。阶段释放会带来重新分配成本，吞吐收益需要具体负载评估。完整合同和真实对照见 [batch-compose/README.md](batch-compose/README.md)。
+
+### 原版 HTTP server
+
+```sh
+build-clean-vulkan/upstream/bin/llama-server \
+  --model /path/to/model.gguf -ngl 99 \
+  --ctx-size 2048 --total-kv 8192 -np 4 \
+  --prefill-priority --phase-memory
+```
+
+server 的 Prefill 优先默认开启，阶段内存释放默认关闭。`--no-prefill-priority` 恢复上游混合调度；阶段释放要求优先策略开启，并拒绝共享 CUDA phase arena。优先顺序是当前提示保持加槽位顺序，持续新提示可能使 Decode 饥饿；没有偷偷加入 FIFO 或公平性保证。
+
+server 继续使用自己的采样入口；compact sampling 的入口是下面的 `llama-compose`。本次真实 HTTP 测试覆盖三路 SSE、插入 Prefill、完整 token 预算和阶段切换；MTP、语法及随机采样的暂停恢复仍需要专门验证。
+
+## 精确 compact 采样
+
+```sh
 build-clean-fork/install/bin/llama-compose \
   -m /path/to/model.gguf -p 'The capital of France is' \
-  -n 64 -c 2048 --temp 0
-~~~
+  -n 64 -c 2048 --temp 0 --json
+```
 
--p 接受原始模型输入；需要聊天模板的模型应传入格式正确的提示。默认 CPU、4 线程。Vulkan 等后端可用 -ngl 99 请求卸载层；实际设备选择由 A 决定。
+固定采样链为 top-k → top-p → min-p → temperature → dist。仅在 `temperature ≤ 0`、`2 ≤ top-k ≤ 128`、存在唯一有限最大值时启用 compact。并列、正温或不支持的 k 使用完整候选行；NaN、正无穷和没有有限候选明确报错，负无穷 mask 合法。
 
-采样顺序固定为 top-k → top-p → min-p → temperature → dist。仅在 temperature ≤ 0、2 ≤ top-k ≤ 128、logits 中存在唯一有限最大值时启用 compact。最大值并列、k 不支持或正温时走完整候选行。NaN、正无穷和没有有限候选的输入明确报错；负无穷屏蔽值允许存在。
+C 保留 A 的 distribution sampler 和随机状态。`--no-compact` 用于完整行对照；JSON 返回精确 token IDs、文本、停止原因和实际路由计数。程序不提供原版 server 的所有语法、惩罚、模板、并发或投机参数。
 
-C 保留 A 的真实 distribution sampler 和随机状态。它不是只返回 argmax 的替代采样器。--no-compact 可显式选择完整行，对拍输出。--json 返回 token IDs、生成文本、停止原因和实际路由计数；若 token 上限截断 UTF-8 字符，文本使用 U+FFFD，token IDs 保持精确。
+## 请求 corpus 与前缀评分
 
-这个程序不宣称实现上游 server 的全部参数、语法、惩罚、聊天模板、并发服务或投机解码。需要这些功能时，使用原上游程序或新增拥有相应协作职责的 C。
-
-## 录制和评分 token 请求
-
-准备 UTF-8 文本，每行一个原始提示：
-
-~~~sh
+```sh
 build-clean-fork/install/bin/llama-corpus build \
   -m /path/to/model.gguf --input prompts.txt --corpus request-corpus
 
@@ -70,45 +93,43 @@ build-clean-fork/install/bin/llama-corpus score \
 
 build-clean-fork/install/bin/llama-corpus score \
   -m /path/to/model.gguf --corpus request-corpus -c 2048 --reference
-~~~
+```
 
-build 用 A 的 tokenizer 生成 token IDs，再交给 B。目标目录必须不存在，避免覆盖已录制请求。score 直接读取 token IDs，不重新 tokenize；它计算每个请求从第二个 token 开始的负对数似然，重复请求保留原有权重。
+B 兼容旧生产 `nodes-000000.bin`、`requests-000000.bin` V1 格式：nodes 起始 ID 为 1、requests 为 0；保留请求 kind、64 位 timestamp、空请求、重复、前缀终点和原有顺序。已用归档中未修改的生产 writer / reader 完成真实字节往返验证。第一版迁移及旧 `nanbeige-audit.py` 手写的不规范 start ID / kind 数据应重建；不会静默解释成有效生产数据。
 
-默认评分在分叉点保存 A 提供的 opaque 序列状态，每个唯一节点只 decode 一次。所有后继 token 的边评分在进入子分支前计算，因为 A 的序列快照不保证恢复 logits。--reference 对每个请求清空状态并独立重放，作为正确性对照。报告中的 decoded_tokens 是实际调用 decode 的 token 数，不是推算速度。程序逐 token 运行，未作吞吐批处理优化。
+`build` 用 A 的 tokenizer，目标目录必须不存在。`score` 使用录制的 token IDs，从第二个 token 开始计算条件负对数似然，保留重复请求的权重。默认保存分叉点的 A 序列状态，每个唯一节点 decode 一次；`--reference` 独立重放每个请求。边评分在进入子分支前完成，因为快照不保证恢复 logits。全部请求都没有可计分边时明确失败。
 
-兼容旧 Wanxiangqi 的 nodes-000000.bin、requests-000000.bin V1 两文件格式。V1 不包含 tokenizer 身份，必须使用与录制相同的 tokenizer；词表大小检查只能验证 token 范围。旧 reserved 捕获元数据在读取时忽略，保存时写零；token 路径、节点 ID、请求顺序和重复次数保留。它不等于旧 MoE 激活校准器，也不等于 RERoT 的共享 KV。
+V1 没有 tokenizer 身份，须使用相同 tokenizer；当前只支持规范单分片。两文件保存要求独占同步访问，未提供并发写入或崩溃事务。前缀评分没有承诺 MoE 激活校准、RERoT 多 reader 共享可见性或批量吞吐优化。
 
-## 验证与安装包消费
+## 独立诊断工具
 
-~~~sh
+[tools/compare-logits.py](tools/compare-logits.py) 使用 Python 标准库比较兼容 `TP5LOG2` 的 logits 文件，无私有运行时依赖。它分别报告 bitwise、数值容差与 argmax，一并检查输入 token 身份、尺寸、截断、非有限值和输出覆盖风险。保留格式不代表引入 TP5；参见 [tools/README.md](tools/README.md)。
+
+## 验证与独立交付
+
+```sh
 python3 fork/check-upstream.py
-python3 fork/tests/isolation.py --output build-isolation --jobs 4
-python3 fork/tests/real-model.py \
-  --model /path/to/model.gguf \
-  --bin-dir build-clean-fork/install/bin \
-  --output build-model-check
-~~~
+python3 fork/tests/test-upstream-boundary.py
+python3 fork/tests/isolation.py \
+  --output build-isolation --jobs 4 --model /absolute/path/to/model.gguf
+```
 
-isolation.py 从固定 Git 提交导出没有 B、C 的 A，构建并运行 A 自己的采样测试。随后独立构建每个 B、C，移走源码副本，将安装产物搬到新前缀，再编译和运行实际消费程序。--a-prefix 可复用已验证的 A 安装包；这种运行不会重新证明 A 的独立源码构建。
+默认隔离流程从固定 A 提交导出源码，只应用验证通过的登记文件；A 构建时不含 B/C。三个 B 与三个 C 分别从各自源码副本构建，C 只找安装包。移除源码和构建副本、搬迁安装前缀后，重新编译消费者，并运行已安装程序和可选真实模型测试。最近一次完整流程为 41 个命令全部通过。
 
-各模块可以单独发布和消费：
+各模块也可独立构建，例如：
 
-~~~sh
-cmake -S fork/sampling -B build-sampling -DCMAKE_INSTALL_PREFIX=/path/to/prefix
-cmake --build build-sampling
-ctest --test-dir build-sampling --output-on-failure
-cmake --install build-sampling
+```sh
+cmake -S fork/scheduling -B build-scheduling \
+  -DCMAKE_INSTALL_PREFIX=/path/to/prefix
+cmake --build build-scheduling
+ctest --test-dir build-scheduling --output-on-failure
+cmake --install build-scheduling
+```
 
-cmake -S fork/compose -B build-compose -DCMAKE_PREFIX_PATH=/path/to/prefix
-cmake --build build-compose
-~~~
+独立 B 包为 `TQSampling`、`TQCorpus`、`TQScheduling`，目标分别为 `TQSampling::sampling`、`TQCorpus::corpus`、`TQScheduling::scheduling`。采样 C 另导出 `TQCompose::compose`；其他两个 C 交付程序。上游公开结构体扩展不承诺二进制 ABI 稳定，更新 A 时须一起重建消费者。
 
-包名为 TQSampling、TQCorpus、TQCompose；导出目标为 TQSampling::sampling、TQCorpus::corpus、TQCompose::compose。corpus-compose 是程序交付，不伪装成另一个职责库。
+## 更新与回查
 
-## 更新上游
+`upstream.json` 固定本次刚合并的 master。该仓库默认 HEAD 另指 dev，本次没有改换基线。更新时在新上游上重放本分支的独立提交，核对各 A 小补丁的需要、更新 pin 与审查过的摘要，再运行边界和真实验证。
 
-upstream.json 固定 master 提交。上游默认 HEAD 当前另指 dev；本次没有把用户刚合并的 master 换成 dev。
-
-更新时先创建新 worktree，在新上游 master 上按顺序 cherry-pick 本分支的少量提交，更新 pin，然后运行上述验证。若公开 API 改变，调整 C；若不能用公开契约实现，先登记所缺语义和证据，再决定是否接受一个明确的 A 补丁。不要悄悄把私有依赖放进 B。
-
-旧的 527 个 fork 提交没有作为祖先重新带入干净分支。它们由 archive/pre-clean-20261018 保留，原 master 工作区及用户未跟踪文件保持原状。
+旧 527 个 fork 提交没有重新作为祖先带入干净分支；原 `master` 工作区和 `archive/pre-clean-20261018` 保留旧实现与实验资料。详细差异范围、代码阅读深度、候选和未验证项均可从 [AUDIT.md](AUDIT.md) 追溯。
