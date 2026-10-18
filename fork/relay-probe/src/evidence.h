@@ -38,6 +38,7 @@ enum class case_id {
     five_stream_relay_cycle,
     offset_addressing,
     multi_group_ordering,
+    native_sync_deadline,
 };
 
 const char * case_name(case_id value) noexcept;

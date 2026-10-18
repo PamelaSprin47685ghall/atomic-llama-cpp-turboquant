@@ -32,12 +32,13 @@
 
 1. [LEMMA 1、3、4] 双向发布、2000 代热复用、精确票据、生产延迟排序、多工作组
    最后到达、确定性反序完成、abort、逐操作 RMW、五消费者 credit、延迟最后读者、
-   双 bank 轮换、可变有效长度、非零偏移内部槽、五流 RELAY 环与五卡用例分别
-   实现并有独立结果。
+   双 bank 轮换、可变有效长度、非零偏移内部槽、五流 RELAY 环、有界同步超时路径
+   与五卡用例分别实现并有独立结果。
    Proof: `src/main.cpp` 的各 case 函数；本机全量运行报告 SHA-256
-   75dbd439ab9bc04a00fbc7f4dbb6a9da8e10f3f95e9918cf70d06c4c87ddec4c
-   （RX 6800 / gfx1030，ROCm 7.2.4，2026-10-19，18 用例注册表）。16 用例报告
-   0cdd86bd…9cb8a 与 12 用例报告 9d1d1429…684112 保留为被取代的历史身份。
+   c0a21839a6bb1a3c338e1b228e77798acc756df9d066bcc0f13a8053b0762e1f
+   （RX 6800 / gfx1030，ROCm 7.2.4，2026-10-19，19 用例注册表）。18 用例报告
+   75dbd439…dec4c、16 用例报告 0cdd86bd…9cb8a 与 12 用例报告 9d1d1429…684112
+   保留为被取代的历史身份。
 2. [AXIOM 3] 证据报告是严格 JSON、排他创建；设备数不等于 5 时五卡用例保持
    not_run；单机强制用例全部通过时 qualification=pass，且报告注明范围。
    Proof: `src/evidence.cpp` 与 `tests/config-test.cpp`；实际报告可由任意
@@ -49,7 +50,7 @@
    测量结果写入独立的 `tp5.relay.bench.v1` 文件，不进入 qualification。
    Proof: `run_bench` 与 `summarize`；bench JSON 的严格序列化在
    `tests/config-test.cpp` 中覆盖；本机 bench 文件 SHA-256
-   29efb0c18a388e3a551435627d4649e2191b636542b9a46df05e4a83cc78e80d。
+   04473ee14ab5ea1490da1424e826cd0a53d5905ded18f5886895cd76f8cc375b。
 
 5. [LEMMA 3] 设备等待是累计预算：clock64 实测 ~2.3 GHz（gfx1030，2026-10-19），
    预算 24e9 ticks ≈ 8 s，必须超过最长 host 截止期（5 s）；每轮只做短暂停后
@@ -67,8 +68,12 @@
 7. [AXIOM 1、3] 单个 rank 或设备的 HIP 失败不抹掉已收集证据：HIP 错误是异常，
    逐用例捕获并记为对应 case 的 fail，setup 失败的设备以
    `device_identity=fail` 留在报告里，五卡用例在任何 HIP 失败下仍按 rank 归因
-   并写出报告；只有设备枚举失败才可能无报告。
-   Proof: `hip_error` / `run_case` / `run_probe` / `run_five_rank`；
+   并写出报告；所有原生同步经 `sync_with_deadline` 有界化（event 轮询 +
+   60 s 截止期），挂死的队列变成有界、可归因的失败而不是永不返回的运行，
+   超时分支由 `native_sync_deadline` 用例在活设备上触发并验证（stall kernel +
+   2 s 短截止期 + 停止字恢复）；只有设备枚举失败才可能无报告。
+   Proof: `hip_error` / `sync_with_deadline` / `run_case` / `run_probe` /
+   `run_five_rank` / `case_native_sync_deadline`；
    2026-10-19 单卡 2000 轮运行退出 0，故障路径由逐项代码评审保证，五卡机
    首次运行前不声称已实测。
 8. [AXIOM 3] 证据文件经同目录临时文件写入、fsync、硬链接原子发布：目标路径

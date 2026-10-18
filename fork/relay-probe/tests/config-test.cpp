@@ -31,7 +31,7 @@ void check(bool condition, const char * message) {
 }
 
 void check_case_registry() {
-    check(case_count() == 18, "case registry size drifted");
+    check(case_count() == 19, "case registry size drifted");
     const case_id all[] = {
         case_id::device_identity,           case_id::mapped_host_access,
         case_id::cpu_to_gpu_publish,        case_id::gpu_to_cpu_publish,
@@ -42,6 +42,7 @@ void check_case_registry() {
         case_id::delayed_consumer_ordering, case_id::two_bank_rotation,
         case_id::varying_live_bytes,        case_id::five_stream_relay_cycle,
         case_id::offset_addressing,         case_id::multi_group_ordering,
+        case_id::native_sync_deadline,
     };
     for (std::size_t i = 0; i < case_count(); ++i) {
         check(case_name(all[i]) != nullptr && case_name(all[i])[0] != '\0', "case name must exist");

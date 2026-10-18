@@ -281,6 +281,22 @@ __global__ void ticket_wait_kernel(control_block * cb, std::uint64_t expected) {
     release_store(&cb->exit_code, EXIT_TIMEOUT_EXPECTED);
 }
 
+// Deliberately stalls the queue far longer than the host's short sync
+// deadline, so the bounded-sync timeout path runs on the live device instead
+// of shipping unexecuted to the operator. Exits only on the stop word or its
+// own long budget; the waiter must recover so the following drain completes.
+__global__ void stall_kernel(control_block * cb) {
+    const std::uint64_t begin = clock64();
+    while (acquire_load(&cb->abort) == 0) {
+        device_pause();
+        if (clock64() - begin >= WAIT_BUDGET_TICKS) {
+            release_store(&cb->exit_code, EXIT_TIMEOUT_EXPECTED);
+            return;
+        }
+    }
+    release_store(&cb->exit_code, EXIT_ABORT_OBSERVED);
+}
+
 // Each participating workgroup writes its own payload word, orders it with a
 // system fence, then bumps the device counter; the last participant publishes
 // ready. live_groups may be smaller than the launched grid (guide 39.5 P03).
@@ -519,6 +535,49 @@ template <class Ready> bool spin_until(Ready ready, double deadline_ms, double &
     }
 }
 
+// -------- bounded native synchronization ----------------------------------
+
+// Bare hipDeviceSynchronize / hipStreamSynchronize never return when a
+// device stops completing work, and a run that never returns is the worst
+// failure an operator can hit: no report, no attribution (SPEC 7). All
+// native syncs therefore poll an event recorded after the submitted work,
+// bounded by a host deadline far beyond any healthy sync; a healthy queue
+// completes in microseconds, so the deadline only bounds stalls on an
+// unhealthy device (guide 35.8 drain deadline). The timeout is raised as a
+// regular hip_error so the existing per-case handling records it as that
+// case's failure and moves on. The event is destroyed on every path and is
+// never reused after expiry.
+constexpr double SYNC_DEADLINE_MS        = 60000.0;
+constexpr double STALL_PROBE_DEADLINE_MS = 2000.0;
+
+void sync_with_deadline(hipStream_t stream, double deadline_ms, const char * what) {
+    hipEvent_t event = nullptr;
+    check_hip(hipEventCreate(&event), what);
+    const hipError_t recorded = hipEventRecord(event, stream);
+    if (recorded != hipSuccess) {
+        (void) hipEventDestroy(event);
+        throw hip_error(format_error(what, recorded));
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double, std::milli>(deadline_ms);
+    while (true) {
+        const hipError_t queried = hipEventQuery(event);
+        if (queried == hipSuccess) {
+            (void) hipEventDestroy(event);
+            return;
+        }
+        if (queried != hipErrorNotReady) {
+            (void) hipEventDestroy(event);
+            throw hip_error(format_error(what, queried));
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            (void) hipEventDestroy(event);
+            throw hip_error(std::string(what) + ": native sync deadline exceeded after " + std::to_string(deadline_ms) +
+                            " ms; the device did not complete the submitted work");
+        }
+        host_pause();
+    }
+}
+
 std::uint64_t derived_word(std::uint64_t generation, std::uint32_t seed) {
     std::uint64_t acc = 0;
     for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
@@ -567,6 +626,7 @@ constexpr case_id handshake_cases[] = {
     case_id::host_system_rmw_u64_add,   case_id::host_system_rmw_u64_cas, case_id::multi_consumer_output_credit,
     case_id::delayed_consumer_ordering, case_id::two_bank_rotation,       case_id::varying_live_bytes,
     case_id::five_stream_relay_cycle,   case_id::offset_addressing,       case_id::multi_group_ordering,
+    case_id::native_sync_deadline,
 };
 
 outcome result_of(const device_context & ctx, case_id id) {
@@ -603,7 +663,12 @@ void run_case(device_context & ctx, case_id id, void (*run)(device_context &)) {
         }
         if (ctx.record.ordinal >= 0) {
             (void) hipSetDevice(ctx.record.ordinal);
-            (void) hipDeviceSynchronize();
+            try {
+                sync_with_deadline(0, SYNC_DEADLINE_MS, "drain after case failure");
+            } catch (const std::exception &) {
+                // The failure is already recorded; a stalled drain must not
+                // prevent the next case from being attempted.
+            }
         }
     }
 }
@@ -616,10 +681,11 @@ void run_case(device_context & ctx, case_id id, void (*run)(device_context &)) {
 // evidence, and a dead device must not prevent the report from being written.
 void fail_case(device_context & ctx, case_id id, outcome result, std::string detail) {
     release_store(&ctx.cb->abort, 1);
-    const hipError_t sync_result = hipDeviceSynchronize();
-    if (sync_result != hipSuccess) {
+    try {
+        sync_with_deadline(0, SYNC_DEADLINE_MS, "drain after failure");
+    } catch (const std::exception & error) {
         detail += " (drain failed: ";
-        detail += hipGetErrorString(sync_result);
+        detail += error.what();
         detail += ")";
     }
     set_case(ctx, id, result, std::move(detail));
@@ -640,7 +706,7 @@ void case_mapped_access(device_context & ctx) {
     init_guards(*ctx.slot_ptr);
     std::memset(ctx.slot_ptr->payload, 0, sizeof(ctx.slot_ptr->payload));
     write_pattern_kernel<<<1, 64>>>(ctx.slot_ptr, 42, ctx.seed);
-    check_hip(hipDeviceSynchronize(), "mapped access sync");
+    sync_with_deadline(0, SYNC_DEADLINE_MS, "mapped access sync");
     bool ok = true;
     for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
         ok = ok && ctx.slot_ptr->payload[i] == pattern_word(42, i, ctx.seed);
@@ -704,7 +770,7 @@ void case_gpu_to_cpu(device_context & ctx) {
         host_fence_release();
         release_store(&ctx.cb->ack, generation);
     }
-    check_hip(hipDeviceSynchronize(), "produce loop sync");
+    sync_with_deadline(0, SYNC_DEADLINE_MS, "produce loop sync");
     if (acquire_load(&ctx.cb->exit_code) != EXIT_OK || !guards_intact(*ctx.slot_ptr)) {
         fail_case(ctx, case_id::gpu_to_cpu_publish, outcome::fail, "producer exit or guards");
         return;
@@ -760,7 +826,7 @@ void case_ticket_semantics(device_context & ctx) {
     ticket_wait_kernel<<<1, 64>>>(ctx.cb, 1);
     double unused = 0;
     spin_until([&] { return acquire_load(&ctx.cb->exit_code) != 0; }, 5000.0, unused);
-    check_hip(hipDeviceSynchronize(), "stale ticket sync");
+    sync_with_deadline(0, SYNC_DEADLINE_MS, "stale ticket sync");
     const double waited_ms = timer.milliseconds();
     if (acquire_load(&ctx.cb->exit_code) != EXIT_TIMEOUT_EXPECTED || waited_ms < 10.0) {
         set_case(ctx, case_id::ticket_semantics, outcome::fail, "stale ticket was consumed or the wait did not hold");
@@ -771,7 +837,7 @@ void case_ticket_semantics(device_context & ctx) {
     release_store(&ctx.cb->ticket, 5);
     ticket_wait_kernel<<<1, 64>>>(ctx.cb, 1);
     spin_until([&] { return acquire_load(&ctx.cb->exit_code) != 0; }, 5000.0, unused);
-    check_hip(hipDeviceSynchronize(), "future ticket sync");
+    sync_with_deadline(0, SYNC_DEADLINE_MS, "future ticket sync");
     if (acquire_load(&ctx.cb->exit_code) != EXIT_MISMATCH) {
         set_case(ctx, case_id::ticket_semantics, outcome::fail,
                  "future ticket was not diagnosed as an identity violation");
@@ -792,7 +858,7 @@ void case_multi_group(device_context & ctx) {
         group_writer_kernel<<<8, 64>>>(ctx.slot_ptr->payload, ctx.counter, ctx.cb, live, ctx.seed);
         double     unused = 0;
         const bool done   = spin_until([&] { return acquire_load(&ctx.cb->ready) == live; }, 5000.0, unused);
-        check_hip(hipDeviceSynchronize(), "group writer sync");
+        sync_with_deadline(0, SYNC_DEADLINE_MS, "group writer sync");
         if (!done) {
             set_case(ctx, case_id::multi_group_completion, outcome::fail,
                      "ready did not fire for " + std::to_string(live) + " live groups");
@@ -842,7 +908,7 @@ void case_multi_group_ordering(device_context & ctx) {
             trap_observed = true;
         }
         const bool all_done = spin_until([&] { return acquire_load(&ctx.cb->ready) == 8; }, 5000.0, unused);
-        check_hip(hipDeviceSynchronize(), "ordering sync");
+        sync_with_deadline(0, SYNC_DEADLINE_MS, "ordering sync");
         if (!all_done) {
             fail_case(ctx, case_id::multi_group_ordering, outcome::fail,
                       "ready did not fire after the delayed last arrival");
@@ -876,7 +942,7 @@ void case_abort(device_context & ctx) {
     stopwatch  timer;
     double     unused = 0;
     const bool exited = spin_until([&] { return acquire_load(&ctx.cb->exit_code) != 0; }, 5000.0, unused);
-    check_hip(hipDeviceSynchronize(), "abort sync");
+    sync_with_deadline(0, SYNC_DEADLINE_MS, "abort sync");
     if (!exited || acquire_load(&ctx.cb->exit_code) != EXIT_ABORT_OBSERVED) {
         set_case(ctx, case_id::abort_stop, outcome::fail, "waiter did not honor the stop word");
         return;
@@ -885,15 +951,50 @@ void case_abort(device_context & ctx) {
              "waiter exited on the stop word in " + std::to_string(timer.milliseconds()) + " ms");
 }
 
+// The operator's worst outcome is a run that never returns, so the bounded
+// sync itself must be proven on the live device: a stalled queue raises the
+// deadline error while the waiter is still spinning, and the stop word then
+// recovers the waiter so the drain completes (guide 35.8; SPEC 7).
+void case_native_sync_deadline(device_context & ctx) {
+    reset_control(*ctx.cb);
+    stall_kernel<<<1, 64>>>(ctx.cb);
+    bool timed_out = false;
+    try {
+        sync_with_deadline(0, STALL_PROBE_DEADLINE_MS, "stalled-queue observation");
+    } catch (const hip_error & error) {
+        timed_out = std::string(error.what()).find("deadline exceeded") != std::string::npos;
+    }
+    if (!timed_out) {
+        // The queue completed or failed inside the window, so the timeout
+        // branch cannot be observed on this run; fail_case still aborts and
+        // drains, so the case itself stays bounded.
+        fail_case(ctx, case_id::native_sync_deadline, outcome::fail,
+                  "stalled queue finished before the " + std::to_string(STALL_PROBE_DEADLINE_MS) +
+                      " ms deadline, so the bounded-sync timeout path was not observed");
+        return;
+    }
+    release_store(&ctx.cb->abort, 1);
+    sync_with_deadline(0, SYNC_DEADLINE_MS, "stalled-queue drain");
+    if (acquire_load(&ctx.cb->exit_code) != EXIT_ABORT_OBSERVED) {
+        set_case(ctx, case_id::native_sync_deadline, outcome::fail,
+                 "waiter did not honor the stop word after the sync deadline");
+        return;
+    }
+    set_case(ctx, case_id::native_sync_deadline, outcome::pass,
+             "stalled queue raised the bounded-sync deadline at " + std::to_string(STALL_PROBE_DEADLINE_MS) +
+                 " ms; the stop word recovered the waiter and the drain completed");
+}
+
 void case_host_rmw(device_context & ctx) {
     release_store(ctx.rmw_add, 0);
     release_store(ctx.rmw_cas, 0);
     rmw_probe_kernel<<<1, 64>>>(ctx.rmw_add, ctx.rmw_cas);
-    const hipError_t sync = hipDeviceSynchronize();
-    if (sync != hipSuccess) {
+    try {
+        sync_with_deadline(0, SYNC_DEADLINE_MS, "rmw sync");
+    } catch (const std::exception & error) {
         // One launch feeds both capability bits: a HIP failure fails both
         // of them, so neither record silently stays not_run.
-        const std::string detail = format_error("rmw sync", sync);
+        const std::string detail = error.what();
         set_case(ctx, case_id::host_system_rmw_u64_add, outcome::fail, detail);
         set_case(ctx, case_id::host_system_rmw_u64_cas, outcome::fail, detail);
         return;
@@ -1132,7 +1233,7 @@ void case_two_bank(device_context & ctx) {
         host_fence_release();
         release_store(&ctx.cb->ack, generation);
     }
-    check_hip(hipDeviceSynchronize(), "bank rotation sync");
+    sync_with_deadline(0, SYNC_DEADLINE_MS, "bank rotation sync");
     if (acquire_load(&ctx.cb->exit_code) != EXIT_OK || !guards_intact(*ctx.slot_ptr) ||
         !guards_intact(*ctx.slot2_ptr)) {
         fail_case(ctx, case_id::two_bank_rotation, outcome::fail, "producer exit or guards");
@@ -1178,7 +1279,7 @@ void case_varying_live(device_context & ctx) {
         host_fence_release();
         release_store(&ctx.cb->ack, generation);
     }
-    check_hip(hipDeviceSynchronize(), "varying live sync");
+    sync_with_deadline(0, SYNC_DEADLINE_MS, "varying live sync");
     if (acquire_load(&ctx.cb->exit_code) != EXIT_OK || !guards_intact(*ctx.slot_ptr)) {
         fail_case(ctx, case_id::varying_live_bytes, outcome::fail, "producer exit or guards");
         return;
@@ -1290,10 +1391,15 @@ void case_offset_addressing(device_context & ctx) {
         host_fence_release();
         release_store(&ctx.cb->ack, generation);
     }
-    const hipError_t sync = hipDeviceSynchronize();
+    std::string sync_failure;
+    try {
+        sync_with_deadline(0, SYNC_DEADLINE_MS, "offset sync");
+    } catch (const std::exception & error) {
+        sync_failure = error.what();
+    }
     cleanup();
-    if (sync != hipSuccess) {
-        set_case(ctx, case_id::offset_addressing, outcome::fail, format_error("offset sync", sync));
+    if (!sync_failure.empty()) {
+        set_case(ctx, case_id::offset_addressing, outcome::fail, std::move(sync_failure));
         return;
     }
     if (acquire_load(&ctx.cb->exit_code) != EXIT_OK) {
@@ -1517,10 +1623,13 @@ outcome run_five_rank(std::vector<device_context> & contexts, probe_report & rep
             for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
                 current_rank = rank;
                 check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank sync device");
-                const hipError_t sync = hipStreamSynchronize(streams[rank]);
-                if (sync != hipSuccess && failure.empty()) {
-                    failed_rank = rank;
-                    failure     = "rank " + std::to_string(rank) + " drain failed: " + hipGetErrorString(sync);
+                try {
+                    sync_with_deadline(streams[rank], SYNC_DEADLINE_MS, "rank drain");
+                } catch (const std::exception & error) {
+                    if (failure.empty()) {
+                        failed_rank = rank;
+                        failure     = "rank " + std::to_string(rank) + " drain failed: " + error.what();
+                    }
                 }
             }
             if (failure.empty()) {
@@ -1555,7 +1664,12 @@ outcome run_five_rank(std::vector<device_context> & contexts, probe_report & rep
     // so a broken rank must not prevent freeing what can be freed.
     for (std::uint32_t rank = 0; rank < streams_created; ++rank) {
         (void) hipSetDevice(contexts[rank].record.ordinal);
-        (void) hipStreamSynchronize(streams[rank]);
+        try {
+            sync_with_deadline(streams[rank], SYNC_DEADLINE_MS, "teardown drain");
+        } catch (const std::exception &) {
+            // Evidence collection is over; a stalled rank must not block
+            // freeing what can still be freed.
+        }
         (void) hipStreamDestroy(streams[rank]);
     }
     if (mem != nullptr) {
@@ -1650,7 +1764,7 @@ int run_bench(device_context &    ctx,
         if (!acked || ctx.rank_result[0] != derived_word(generation, ctx.seed)) {
             std::fprintf(stderr, "bench failure: publish round %llu\n", static_cast<unsigned long long>(generation));
             release_store(&ctx.cb->abort, 1);
-            check_hip(hipDeviceSynchronize(), "bench drain after failure");
+            sync_with_deadline(0, SYNC_DEADLINE_MS, "bench drain after failure");
             return 1;
         }
         publish.push_back(now_ns() - begin);
@@ -1668,7 +1782,7 @@ int run_bench(device_context &    ctx,
         if (!ready) {
             std::fprintf(stderr, "bench failure: produce round %llu\n", static_cast<unsigned long long>(generation));
             release_store(&ctx.cb->abort, 1);
-            check_hip(hipDeviceSynchronize(), "bench drain after failure");
+            sync_with_deadline(0, SYNC_DEADLINE_MS, "bench drain after failure");
             return 1;
         }
         produce.push_back(now_ns() - begin);
@@ -1689,7 +1803,7 @@ int run_bench(device_context &    ctx,
             std::fprintf(stderr, "bench failure: relay cycle %llu: %s\n", static_cast<unsigned long long>(generation),
                          problem->c_str());
             release_store(&ctx.cb->abort, 1);
-            check_hip(hipDeviceSynchronize(), "bench drain after failure");
+            sync_with_deadline(0, SYNC_DEADLINE_MS, "bench drain after failure");
             return 1;
         }
         cycle.push_back(now_ns() - begin);
@@ -1841,6 +1955,8 @@ int run_probe(const std::string & output_path, const std::string & bench_path, s
         "host_system_rmw is an independent capability; the relay design must not require it.",
         multi_stream_note,
         "delayed_consumer_ordering gates on a >=40 ms device pause, like producer_delay_ordering.",
+        "native synchronizations are bounded at 60 s each; native_sync_deadline exercises the timeout path at 2 s on "
+        "the live device.",
     };
 
     int device_count = 0;
@@ -1916,6 +2032,7 @@ int run_probe(const std::string & output_path, const std::string & bench_path, s
             run_case(ctx, case_id::varying_live_bytes, case_varying_live);
             run_case(ctx, case_id::offset_addressing, case_offset_addressing);
             run_case(ctx, case_id::five_stream_relay_cycle, case_five_stream);
+            run_case(ctx, case_id::native_sync_deadline, case_native_sync_deadline);
         }
         std::printf("rank %d (%s, %s): ", ordinal, ctx.record.gcn_arch.c_str(), ctx.record.name.c_str());
         for (const auto & item : ctx.record.cases) {

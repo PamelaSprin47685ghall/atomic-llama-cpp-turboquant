@@ -47,6 +47,7 @@ REGISTRY = [
     "five_stream_relay_cycle",
     "offset_addressing",
     "multi_group_ordering",
+    "native_sync_deadline",
 ]
 
 # Every healthy device record carries every case except the five-rank one,

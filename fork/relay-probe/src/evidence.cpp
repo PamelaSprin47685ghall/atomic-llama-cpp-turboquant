@@ -20,7 +20,7 @@ const char * case_names[] = {
     "producer_delay_ordering",   "ticket_semantics",        "multi_group_completion", "abort_stop",
     "host_system_rmw_u64_add",   "host_system_rmw_u64_cas", "five_rank_cross_device", "multi_consumer_output_credit",
     "delayed_consumer_ordering", "two_bank_rotation",       "varying_live_bytes",     "five_stream_relay_cycle",
-    "offset_addressing",         "multi_group_ordering",
+    "offset_addressing",         "multi_group_ordering",    "native_sync_deadline",
 };
 
 const char * name_of(const char * const * names, std::size_t count, std::size_t index) noexcept {
