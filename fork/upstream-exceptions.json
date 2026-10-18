@@ -139,6 +139,16 @@
       ],
       "reason": "Pass physical size only to attention KV constructors; preserve logical context and recurrent sizing.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "tools/server/server-task.h",
+      "sha256": "1505c19411c4dc0d5a498ff5dab554bee01e9324ab542f6e2740106c38679a7e",
+      "mode": "100644",
+      "consumers": [
+        "stock llama-server task values"
+      ],
+      "reason": "Initialize slot action ID to -1 so ordinary task moves do not copy an indeterminate integer.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     }
   ]
 }

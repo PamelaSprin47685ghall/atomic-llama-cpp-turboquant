@@ -163,7 +163,7 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
     struct slot_action {
-        int id_slot;
+        int id_slot = -1;
         std::string filename;
         std::string filepath;
     };
