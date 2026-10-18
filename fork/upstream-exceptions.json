@@ -53,6 +53,17 @@
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
+      "path": "ggml/src/ggml-cpu/ops.cpp",
+      "sha256": "e5b6affc76f02ec3456ace39b626a2175fd70b2c2da3599af4df71e9f06ad00a",
+      "mode": "100644",
+      "consumers": [
+        "CPU inference",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Honor explicit F32 FlashAttention V accumulation; the regression fails on the pinned upstream.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
       "path": "include/llama.h",
       "sha256": "d9916907175a664f4ea79f0302b96c33fc3e9e62c6ea88a494e010ba45f4feb2",
       "mode": "100644",
