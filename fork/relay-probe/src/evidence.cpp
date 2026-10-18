@@ -16,11 +16,27 @@ namespace {
 const char * outcome_names[] = { "pass", "fail", "unsupported", "not_run" };
 
 const char * case_names[] = {
-    "device_identity",           "mapped_host_access",      "cpu_to_gpu_publish",     "gpu_to_cpu_publish",
-    "producer_delay_ordering",   "ticket_semantics",        "multi_group_completion", "abort_stop",
-    "host_system_rmw_u64_add",   "host_system_rmw_u64_cas", "five_rank_cross_device", "multi_consumer_output_credit",
-    "delayed_consumer_ordering", "two_bank_rotation",       "varying_live_bytes",     "five_stream_relay_cycle",
-    "offset_addressing",         "multi_group_ordering",    "native_sync_deadline",
+    "device_identity",
+    "mapped_host_access",
+    "cpu_to_gpu_publish",
+    "gpu_to_cpu_publish",
+    "producer_delay_ordering",
+    "ticket_semantics",
+    "multi_group_completion",
+    "abort_stop",
+    "host_system_rmw_u64_add",
+    "host_system_rmw_u64_cas",
+    "five_rank_cross_device",
+    "multi_consumer_output_credit",
+    "delayed_consumer_ordering",
+    "two_bank_rotation",
+    "varying_live_bytes",
+    "five_stream_relay_cycle",
+    "offset_addressing",
+    "multi_group_ordering",
+    "native_sync_deadline",
+    "same_stream_inverse_dependency",
+    "dual_window_independent_progress",
 };
 
 const char * name_of(const char * const * names, std::size_t count, std::size_t index) noexcept {

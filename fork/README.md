@@ -38,7 +38,7 @@ python3 fork/build.py --backend vulkan --tools --build-dir build-clean-vulkan --
 
 `--tools` 额外构建 `llama-server`、`llama-bench` 及 A 在 tools 模式下必须安装的 `mtmd`；工具可执行文件位于 `upstream/bin/`。脚本也接受 `cuda`、`hip`，可选后端不等于已经取得运行资格。本轮 CPU 独立交付和 CPU / Vulkan 同形状流式模型对照已完成；专项回归与完整后端门槛的范围分别列在 [VALIDATION.md](VALIDATION.md)。`--no-test` 只用于明确跳过测试的构建，不构成验证记录。
 
-TP5 mapped-relay 的平台资格另有独立探针 [relay-probe](relay-probe/README.md)，其无 GPU 的 config-test 与证据校验器 `--self-test` 已进入上述默认流水线；探针可执行文件需要 ROCm HIP 工具链，只在 HIP 存在时构建，不属于安装包（isolation 验收排除）。它在每张现有设备上验证双向运行期可见、热复用、精确票据、多工作组完成与 abort，并按操作记录 host 内存系统 RMW 能力位；本机 RX 6800 实测 host fetch_add 产生错误值而 CAS 可用，恰好要求协议只用单写者 load/store 字。五卡用例只在恰好五张设备时运行，运维人员在目标机上重跑同一程序即可取得新报告，归档前用校验器做机器检查。
+TP5 mapped-relay 的平台资格另有独立探针 [relay-probe](relay-probe/README.md)，其无 GPU 的 config-test 与证据校验器 `--self-test` 已进入上述默认流水线；探针可执行文件需要 ROCm HIP 工具链，只在 HIP 存在时构建，不属于安装包（isolation 验收排除）。它在每张现有设备上验证双向运行期可见、热复用、精确票据、多工作组完成与 abort、同流逆序依赖识别与双窗口独立前进，并按操作记录 host 内存系统 RMW 能力位；本机 RX 6800 实测 host fetch_add 产生错误值而 CAS 可用，恰好要求协议只用单写者 load/store 字。五卡用例只在恰好五张设备时运行，运维人员在目标机上重跑同一程序即可取得新报告，归档前用校验器做机器检查。
 
 ## 多请求与阶段内存
 

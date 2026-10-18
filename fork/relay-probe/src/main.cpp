@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <ratio>
@@ -295,6 +296,21 @@ __global__ void stall_kernel(control_block * cb) {
         }
     }
     release_store(&cb->exit_code, EXIT_ABORT_OBSERVED);
+}
+
+// Resident waiter with no payload access: it only proves that wait waves of
+// one window hold occupancy while another window's work must still advance
+// (guide 39.6 P05). The cumulative budget keeps the block honest without the
+// short fixed budget of ticket_wait_kernel; every block writes the same
+// EXIT_OK word on a match, so any non-match path is visible to the host.
+__global__ void bare_waiter_kernel(control_block * cb, std::uint64_t expected) {
+    switch (wait_for_ticket(cb, expected)) {
+        case wait_outcome::matched:
+            release_store(&cb->exit_code, EXIT_OK);
+            return;
+        default:
+            return;
+    }
 }
 
 // Each participating workgroup writes its own payload word, orders it with a
@@ -600,7 +616,9 @@ void init_guards(slot & s) {
 struct device_context {
     device_record   record;
     control_block * cb            = nullptr;
+    control_block * cb2           = nullptr;  // second independent channel (dual-window case)
     slot *          slot_ptr      = nullptr;
+    slot *          slot_b        = nullptr;  // second channel payload
     slot *          slot2_ptr     = nullptr;  // second bank for two_bank_rotation
     std::uint64_t * out_word      = nullptr;
     std::uint32_t * counter       = nullptr;
@@ -621,12 +639,24 @@ constexpr std::uint32_t RANKS = 5;
 // Handshake cases that require mapped host memory, minus mapped_host_access
 // itself, which carries the availability detail in its own record.
 constexpr case_id handshake_cases[] = {
-    case_id::cpu_to_gpu_publish,        case_id::gpu_to_cpu_publish,      case_id::producer_delay_ordering,
-    case_id::ticket_semantics,          case_id::multi_group_completion,  case_id::abort_stop,
-    case_id::host_system_rmw_u64_add,   case_id::host_system_rmw_u64_cas, case_id::multi_consumer_output_credit,
-    case_id::delayed_consumer_ordering, case_id::two_bank_rotation,       case_id::varying_live_bytes,
-    case_id::five_stream_relay_cycle,   case_id::offset_addressing,       case_id::multi_group_ordering,
+    case_id::cpu_to_gpu_publish,
+    case_id::gpu_to_cpu_publish,
+    case_id::producer_delay_ordering,
+    case_id::ticket_semantics,
+    case_id::multi_group_completion,
+    case_id::abort_stop,
+    case_id::host_system_rmw_u64_add,
+    case_id::host_system_rmw_u64_cas,
+    case_id::multi_consumer_output_credit,
+    case_id::delayed_consumer_ordering,
+    case_id::two_bank_rotation,
+    case_id::varying_live_bytes,
+    case_id::five_stream_relay_cycle,
+    case_id::offset_addressing,
+    case_id::multi_group_ordering,
     case_id::native_sync_deadline,
+    case_id::same_stream_inverse_dependency,
+    case_id::dual_window_independent_progress,
 };
 
 outcome result_of(const device_context & ctx, case_id id) {
@@ -1434,6 +1464,271 @@ void case_five_stream(device_context & ctx) {
                  "(stream emulation, not five-rank qualification)");
 }
 
+// Guide 39.6 P04: a consumer queued ahead of its payload producer on the
+// same stream reads the pre-write payload. The inverse ordering is the
+// device-side hazard class of guide 33.7 for this architecture (the ticket
+// comes from the host, so the producer that can be ordered behind a waiter
+// is the payload writer, not the ticket publisher). The consumer's
+// acquire-then-verify read must catch the premature read deterministically
+// instead of silently consuming garbage, and the run must stay bounded. A
+// platform that reordered the two kernels (or a consumer that consumed the
+// stale payload without noticing) would leave the detection path
+// unobservable, and the case fails exactly like the sync-deadline case
+// fails when its branch cannot be exercised.
+void case_same_stream_inverse(device_context & ctx) {
+    if (derived_word(1, ctx.seed) == 0xDEADBEEFDEADBEEFULL) {
+        fail_case(ctx, case_id::same_stream_inverse_dependency, outcome::fail,
+                  "the payload pattern collides with the verification marker for this seed");
+        return;
+    }
+    reset_control(*ctx.cb);
+    init_guards(*ctx.slot_ptr);
+    std::memset(ctx.slot_ptr->payload, 0, sizeof(ctx.slot_ptr->payload));
+    stream_set streams(1);
+    // Consumer first, producer second, on the same stream: stream order
+    // guarantees the consumer executes before the payload write exists.
+    consume_kernel<<<1, 64, 0, streams.streams[0]>>>(ctx.cb, ctx.slot_ptr, ctx.out_word, 1, ctx.seed);
+    produce_once_kernel<<<1, 64, 0, streams.streams[0]>>>(ctx.cb, ctx.slot_ptr, 1, ctx.seed);
+    host_fence_release();
+    release_store(&ctx.cb->ticket, 1);
+    double     unused = 0;
+    const bool acked  = spin_until([&] { return acquire_load(&ctx.cb->ack) == 1; }, 5000.0, unused);
+    if (!acked) {
+        fail_case(ctx, case_id::same_stream_inverse_dependency, outcome::fail,
+                  "the consumer never acknowledged the prematurely published ticket");
+        return;
+    }
+    sync_with_deadline(streams.streams[0], SYNC_DEADLINE_MS, "inverse dependency sync");
+    if (*ctx.out_word != 0xDEADBEEFDEADBEEFULL) {
+        fail_case(ctx, case_id::same_stream_inverse_dependency, outcome::fail,
+                  "the consumer read a payload whose producer is queued behind it and the verification did not "
+                  "catch the premature read");
+        return;
+    }
+    if (acquire_load(&ctx.cb->ready) != 1 || !guards_intact(*ctx.slot_ptr)) {
+        fail_case(ctx, case_id::same_stream_inverse_dependency, outcome::fail,
+                  "the producer queued behind the consumer did not complete correctly");
+        return;
+    }
+    for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+        if (ctx.slot_ptr->payload[i] != pattern_word(1, i, ctx.seed)) {
+            fail_case(ctx, case_id::same_stream_inverse_dependency, outcome::fail,
+                      "the producer's eventual write is torn or wrong");
+            return;
+        }
+    }
+    set_case(ctx, case_id::same_stream_inverse_dependency, outcome::pass,
+             "a consumer queued ahead of its payload producer read the pre-write payload and the verification "
+             "caught it deterministically; the producer's later write was exact, so the corruption was ordering "
+             "alone and the run stayed bounded");
+}
+
+// Guide 31.1 (two-window device timelines) and 39.6 P05/P06/P08 at the
+// single-device software layer (probe LEMMA 4): two independent channels on
+// one device, each with its own control block, payload slot and seed.
+// Window B runs a host-driven consume loop the whole time. Window A is
+// stalled three ways: a withheld ticket (missing producer), a delayed last
+// reader, and 64 resident waiter workgroups that hold occupancy while B
+// keeps advancing. The case proves B advances independently, A's slot is
+// never touched by B's traffic, A completes exactly once released, and A's
+// channel is reusable after the stall. Cross-device qualification still
+// belongs to the five-rank case.
+void case_dual_window(device_context & ctx) {
+    constexpr std::uint32_t B_FIRST_ROUNDS  = 256;  // while A waits on a withheld ticket
+    constexpr std::uint32_t B_SECOND_ROUNDS = 256;  // while A's last reader is mid-read
+    constexpr std::uint32_t B_FINAL_ROUNDS  = 16;   // after A reused its channel
+    constexpr std::uint32_t WAITER_BLOCKS   = 64;
+    const std::uint32_t     seed_a          = ctx.seed;
+    const std::uint32_t     seed_b          = ctx.seed ^ 0x55AAu;
+
+    reset_control(*ctx.cb);
+    reset_control(*ctx.cb2);
+    init_guards(*ctx.slot_ptr);
+    init_guards(*ctx.slot_b);
+    std::memset(ctx.slot_ptr->payload, 0, sizeof(ctx.slot_ptr->payload));
+    std::memset(ctx.slot_b->payload, 0, sizeof(ctx.slot_b->payload));
+    std::memset(ctx.rank_ack, 0, RANKS * sizeof(std::uint64_t));
+
+    stream_set        streams(2);
+    const hipStream_t stream_a     = streams.streams[0];
+    const hipStream_t stream_b     = streams.streams[1];
+    std::uint64_t     b_generation = 0;
+
+    // Window B: host-driven consume loop with an optional per-generation
+    // cross-channel canary. Returns a diagnostic or nullopt.
+    const auto run_b_gens = [&](std::uint32_t count, const char * phase,
+                                const std::function<std::optional<std::string>(std::uint64_t)> & per_gen) {
+        for (std::uint32_t step = 0; step < count; ++step) {
+            ++b_generation;
+            for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+                ctx.slot_b->payload[i] = pattern_word(b_generation, i, seed_b);
+            }
+            host_fence_release();
+            release_store(&ctx.cb2->ticket, b_generation);
+            consume_read_kernel<<<1, 64, 0, stream_b>>>(ctx.cb2, ctx.slot_b, ctx.rank_ack, ctx.rank_result, 1,
+                                                        b_generation, seed_b);
+            double     unused = 0;
+            const bool acked =
+                spin_until([&] { return acquire_load(&ctx.rank_ack[1]) == b_generation; }, 5000.0, unused);
+            if (!acked) {
+                return std::optional<std::string>(std::string(phase) + ": window B generation " +
+                                                  std::to_string(b_generation) +
+                                                  " did not complete while window A was stalled");
+            }
+            if (ctx.rank_result[1] != derived_word(b_generation, seed_b)) {
+                return std::optional<std::string>(std::string(phase) + ": window B generation " +
+                                                  std::to_string(b_generation) + " derived the wrong result");
+            }
+            if (per_gen) {
+                const auto problem = per_gen(b_generation);
+                if (problem.has_value()) {
+                    return problem;
+                }
+            }
+        }
+        return std::optional<std::string>{};
+    };
+    const auto fail_dual = [&](const std::string & detail) {
+        fail_case(ctx, case_id::dual_window_independent_progress, outcome::fail, detail);
+    };
+
+    // Phase 1: A's ticket is withheld (missing producer); 64 waiter
+    // workgroups plus A's consumer sit resident on stream A while B runs a
+    // full batch. Afterwards A must still be untouched.
+    bare_waiter_kernel<<<WAITER_BLOCKS, 64, 0, stream_a>>>(ctx.cb, 1);
+    consume_read_kernel<<<1, 64, 0, stream_a>>>(ctx.cb, ctx.slot_ptr, ctx.rank_ack, ctx.rank_result, 0, 1, seed_a);
+    {
+        const auto problem = run_b_gens(B_FIRST_ROUNDS, "phase 1", {});
+        if (problem.has_value()) {
+            fail_dual(*problem);
+            return;
+        }
+    }
+    {
+        bool stalled = acquire_load(&ctx.cb->ticket) == 0 && acquire_load(&ctx.rank_ack[0]) == 0 &&
+                       acquire_load(&ctx.cb->exit_code) == 0;
+        for (std::uint32_t i = 0; stalled && i < PAYLOAD_WORDS; ++i) {
+            stalled = ctx.slot_ptr->payload[i] == 0;
+        }
+        if (!stalled) {
+            fail_dual("window A advanced or was written while its producer was missing");
+            return;
+        }
+    }
+
+    // Phase 2: release window A; its waiters and consumer must complete
+    // with exact values, proving B's traffic never aliased A's channel.
+    for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+        ctx.slot_ptr->payload[i] = pattern_word(1, i, seed_a);
+    }
+    host_fence_release();
+    release_store(&ctx.cb->ticket, 1);
+    double unused = 0;
+    if (!spin_until([&] { return acquire_load(&ctx.rank_ack[0]) == 1; }, 5000.0, unused)) {
+        fail_dual("window A never acknowledged after its producer was released");
+        return;
+    }
+    sync_with_deadline(stream_a, SYNC_DEADLINE_MS, "dual window A release sync");
+    if (ctx.rank_result[0] != derived_word(1, seed_a) || acquire_load(&ctx.cb->exit_code) != EXIT_OK) {
+        fail_dual("window A read a corrupted payload or a resident waiter exited on the wrong path");
+        return;
+    }
+
+    // Phase 3: window A's last reader for generation 2 is delayed mid-read
+    // while window B runs another full batch; the acknowledgment must be
+    // withheld and A's slot must stay byte-identical throughout.
+    reset_control(*ctx.cb);
+    release_store(&ctx.rank_ack[0], 0);  // phase 2's acknowledgment must not read as a mid-read finish
+    for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+        ctx.slot_ptr->payload[i] = pattern_word(2, i, seed_a);
+    }
+    host_fence_release();
+    release_store(&ctx.cb->ticket, 2);
+    delayed_reader_kernel<<<1, 64, 0, stream_a>>>(ctx.cb, ctx.slot_ptr, ctx.rank_ack, ctx.rank_result, 0, 2, seed_a);
+    stopwatch timer;
+    if (!spin_until([&] { return acquire_load(&ctx.cb->half_done) == 1; }, 5000.0, unused)) {
+        fail_dual("window A's delayed reader never reported progress");
+        return;
+    }
+    const double half_ms = timer.milliseconds();
+    if (acquire_load(&ctx.rank_ack[0]) != 0) {
+        fail_dual("window A's delayed reader acknowledged before its read completed");
+        return;
+    }
+    {
+        const auto problem =
+            run_b_gens(B_SECOND_ROUNDS, "phase 3", [&](std::uint64_t generation) -> std::optional<std::string> {
+                for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+                    if (ctx.slot_ptr->payload[i] != pattern_word(2, i, seed_a)) {
+                        return std::optional<std::string>("phase 3: window B generation " + std::to_string(generation) +
+                                                          " wrote window A's slot");
+                    }
+                }
+                if (acquire_load(&ctx.rank_ack[0]) != 0) {
+                    return std::optional<std::string>(
+                        "phase 3: window A's reader acknowledged mid-read at B "
+                        "generation " +
+                        std::to_string(generation));
+                }
+                return std::optional<std::string>{};
+            });
+        if (problem.has_value()) {
+            fail_dual(*problem);
+            return;
+        }
+    }
+    if (!spin_until([&] { return acquire_load(&ctx.rank_ack[0]) == 2; }, 5000.0, unused)) {
+        fail_dual("window A's delayed reader never finished");
+        return;
+    }
+    const double ack_ms = timer.milliseconds();
+    if (ack_ms - half_ms < 40.0) {
+        fail_dual("window A's delayed reader finished too soon after progress (" + std::to_string(ack_ms - half_ms) +
+                  " ms)");
+        return;
+    }
+    if (ctx.rank_result[0] != derived_word(2, seed_a) || !guards_intact(*ctx.slot_ptr)) {
+        fail_dual("window A's delayed reader verification failed");
+        return;
+    }
+
+    // Phase 4: window A's channel is reusable after the stall; window B
+    // keeps advancing, so both windows interleave through the whole case.
+    reset_control(*ctx.cb);
+    for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+        ctx.slot_ptr->payload[i] = pattern_word(3, i, seed_a);
+    }
+    host_fence_release();
+    release_store(&ctx.cb->ticket, 3);
+    consume_read_kernel<<<1, 64, 0, stream_a>>>(ctx.cb, ctx.slot_ptr, ctx.rank_ack, ctx.rank_result, 0, 3, seed_a);
+    if (!spin_until([&] { return acquire_load(&ctx.rank_ack[0]) == 3; }, 5000.0, unused)) {
+        fail_dual("window A never acknowledged after its post-stall reuse");
+        return;
+    }
+    if (ctx.rank_result[0] != derived_word(3, seed_a)) {
+        fail_dual("window A's post-stall reuse read a corrupted payload");
+        return;
+    }
+    {
+        const auto problem = run_b_gens(B_FINAL_ROUNDS, "phase 4", {});
+        if (problem.has_value()) {
+            fail_dual(*problem);
+            return;
+        }
+    }
+    sync_with_deadline(stream_a, SYNC_DEADLINE_MS, "dual window A final sync");
+    sync_with_deadline(stream_b, SYNC_DEADLINE_MS, "dual window B final sync");
+    if (!guards_intact(*ctx.slot_ptr) || !guards_intact(*ctx.slot_b)) {
+        fail_dual("guards clobbered");
+        return;
+    }
+    set_case(ctx, case_id::dual_window_independent_progress, outcome::pass,
+             "window B completed " + std::to_string(b_generation) +
+                 " generations while window A was stalled by a withheld ticket, " + std::to_string(WAITER_BLOCKS) +
+                 " resident waiter workgroups and a delayed last reader; A's slot was never touched by B's "
+                 "traffic, A completed exactly on release and reused its channel after the stall");
+}
+
 void allocate_device_context(device_context & ctx, std::int32_t ordinal, std::uint32_t rounds) {
     check_hip(hipSetDevice(ordinal), "set device");
     hipDeviceProp_t properties{};
@@ -1459,11 +1754,19 @@ void allocate_device_context(device_context & ctx, std::int32_t ordinal, std::ui
               "out host alloc");
     unsigned int flags = 0;
     check_hip(hipHostGetFlags(&flags, control_raw), "host flags");
-    ctx.mapped       = (flags & hipHostMallocMapped) != 0;
-    ctx.mapped_flags = "0x" + std::to_string(flags);
-    ctx.cb           = static_cast<control_block *>(control_raw);
-    ctx.slot_ptr     = static_cast<slot *>(slot_raw);
-    ctx.out_word     = static_cast<std::uint64_t *>(out_raw);
+    ctx.mapped          = (flags & hipHostMallocMapped) != 0;
+    ctx.mapped_flags    = "0x" + std::to_string(flags);
+    ctx.cb              = static_cast<control_block *>(control_raw);
+    ctx.slot_ptr        = static_cast<slot *>(slot_raw);
+    ctx.out_word        = static_cast<std::uint64_t *>(out_raw);
+    void * control2_raw = nullptr;
+    void * slot_b_raw   = nullptr;
+    check_hip(hipHostMalloc(&control2_raw, sizeof(control_block), hipHostMallocMapped | hipHostMallocPortable),
+              "second control host alloc");
+    check_hip(hipHostMalloc(&slot_b_raw, sizeof(slot), hipHostMallocMapped | hipHostMallocPortable),
+              "second slot host alloc");
+    ctx.cb2    = static_cast<control_block *>(control2_raw);
+    ctx.slot_b = static_cast<slot *>(slot_b_raw);
     check_hip(hipMalloc(&ctx.counter, sizeof(std::uint32_t)), "counter device alloc");
     void * rmw_add_raw = nullptr;
     void * rmw_cas_raw = nullptr;
@@ -1494,7 +1797,9 @@ void allocate_device_context(device_context & ctx, std::int32_t ordinal, std::ui
     ctx.rank_ready    = static_cast<std::uint64_t *>(ready_raw);
     ctx.rank_partials = static_cast<std::uint64_t *>(partials_raw);
     init_guards(*ctx.slot2_ptr);
+    init_guards(*ctx.slot_b);
     std::memset(ctx.cb, 0, sizeof(control_block));
+    std::memset(ctx.cb2, 0, sizeof(control_block));
 }
 
 void free_device_context(device_context & ctx) {
@@ -1509,8 +1814,14 @@ void free_device_context(device_context & ctx) {
     if (ctx.cb != nullptr) {
         check_hip(hipHostFree(ctx.cb), "control host free");
     }
+    if (ctx.cb2 != nullptr) {
+        check_hip(hipHostFree(ctx.cb2), "second control host free");
+    }
     if (ctx.slot_ptr != nullptr) {
         check_hip(hipHostFree(ctx.slot_ptr), "slot host free");
+    }
+    if (ctx.slot_b != nullptr) {
+        check_hip(hipHostFree(ctx.slot_b), "second slot host free");
     }
     if (ctx.out_word != nullptr) {
         check_hip(hipHostFree(ctx.out_word), "out host free");
@@ -1946,8 +2257,9 @@ int run_probe(const std::string & output_path, const std::string & bench_path, s
         "recorded per run";
     report.hot_reuse_rounds = rounds;
     const std::string multi_stream_note =
-        "multi_consumer, delayed_consumer, two_bank, varying_live and five_stream use one device with "
-        "concurrent streams; they verify protocol software, not five-device qualification.";
+        "multi_consumer, delayed_consumer, two_bank, varying_live, five_stream, same_stream_inverse_dependency "
+        "and dual_window_independent_progress use one device with concurrent streams; they verify protocol "
+        "software, not five-device qualification.";
     report.limits = {
         "This is a platform probe, not a model or relay qualification (guide 31.7).",
         "Single-device results do not qualify five-rank cross-device behavior.",
@@ -2033,6 +2345,8 @@ int run_probe(const std::string & output_path, const std::string & bench_path, s
             run_case(ctx, case_id::offset_addressing, case_offset_addressing);
             run_case(ctx, case_id::five_stream_relay_cycle, case_five_stream);
             run_case(ctx, case_id::native_sync_deadline, case_native_sync_deadline);
+            run_case(ctx, case_id::same_stream_inverse_dependency, case_same_stream_inverse);
+            run_case(ctx, case_id::dual_window_independent_progress, case_dual_window);
         }
         std::printf("rank %d (%s, %s): ", ordinal, ctx.record.gcn_arch.c_str(), ctx.record.name.c_str());
         for (const auto & item : ctx.record.cases) {

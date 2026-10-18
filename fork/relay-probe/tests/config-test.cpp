@@ -31,18 +31,29 @@ void check(bool condition, const char * message) {
 }
 
 void check_case_registry() {
-    check(case_count() == 19, "case registry size drifted");
+    check(case_count() == 21, "case registry size drifted");
     const case_id all[] = {
-        case_id::device_identity,           case_id::mapped_host_access,
-        case_id::cpu_to_gpu_publish,        case_id::gpu_to_cpu_publish,
-        case_id::producer_delay_ordering,   case_id::ticket_semantics,
-        case_id::multi_group_completion,    case_id::abort_stop,
-        case_id::host_system_rmw_u64_add,   case_id::host_system_rmw_u64_cas,
-        case_id::five_rank_cross_device,    case_id::multi_consumer_output_credit,
-        case_id::delayed_consumer_ordering, case_id::two_bank_rotation,
-        case_id::varying_live_bytes,        case_id::five_stream_relay_cycle,
-        case_id::offset_addressing,         case_id::multi_group_ordering,
+        case_id::device_identity,
+        case_id::mapped_host_access,
+        case_id::cpu_to_gpu_publish,
+        case_id::gpu_to_cpu_publish,
+        case_id::producer_delay_ordering,
+        case_id::ticket_semantics,
+        case_id::multi_group_completion,
+        case_id::abort_stop,
+        case_id::host_system_rmw_u64_add,
+        case_id::host_system_rmw_u64_cas,
+        case_id::five_rank_cross_device,
+        case_id::multi_consumer_output_credit,
+        case_id::delayed_consumer_ordering,
+        case_id::two_bank_rotation,
+        case_id::varying_live_bytes,
+        case_id::five_stream_relay_cycle,
+        case_id::offset_addressing,
+        case_id::multi_group_ordering,
         case_id::native_sync_deadline,
+        case_id::same_stream_inverse_dependency,
+        case_id::dual_window_independent_progress,
     };
     for (std::size_t i = 0; i < case_count(); ++i) {
         check(case_name(all[i]) != nullptr && case_name(all[i])[0] != '\0', "case name must exist");

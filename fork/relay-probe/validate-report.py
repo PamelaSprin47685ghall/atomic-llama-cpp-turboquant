@@ -48,6 +48,8 @@ REGISTRY = [
     "offset_addressing",
     "multi_group_ordering",
     "native_sync_deadline",
+    "same_stream_inverse_dependency",
+    "dual_window_independent_progress",
 ]
 
 # Every healthy device record carries every case except the five-rank one,
