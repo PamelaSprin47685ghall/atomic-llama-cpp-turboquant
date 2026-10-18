@@ -1614,6 +1614,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
+        {"--total-kv"}, "N",
+        "physical unified KV pool in tokens; --ctx-size remains the per-request window (0 = upstream sizing)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--total-kv must be nonnegative");
+            }
+            params.n_ctx_kv = static_cast<uint32_t>(value);
+            if (value != 0) params.kv_unified = true;
+        }
+    ).set_env("LLAMA_ARG_TOTAL_KV"));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

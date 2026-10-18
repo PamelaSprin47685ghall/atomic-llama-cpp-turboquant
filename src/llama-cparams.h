@@ -10,6 +10,7 @@
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
+    uint32_t n_ctx_kv = 0;    // physical tokens per KV stream; 0 uses n_ctx_seq
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;

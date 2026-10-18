@@ -339,6 +339,27 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
     }
 
+    cparams.n_ctx_kv = cparams.n_ctx_seq;
+    if (params.n_ctx_kv != 0) {
+        if (!cparams.kv_unified) {
+            throw std::runtime_error("n_ctx_kv requires a unified KV cache");
+        }
+        if (params.n_ctx_kv > uint32_t(INT32_MAX) - 255) {
+            throw std::runtime_error("n_ctx_kv exceeds the supported physical KV range");
+        }
+        if (model.arch == LLM_ARCH_DEEPSEEK4 || llm_arch_is_recurrent(model.arch)) {
+            throw std::runtime_error("this model does not support a separate physical KV capacity");
+        }
+        if (params.kv_stream_arena_mib != 0) {
+            throw std::runtime_error("separate physical KV capacity is not supported with a shared CUDA phase arena");
+        }
+        cparams.n_ctx_kv = GGML_PAD(params.n_ctx_kv, 256);
+        if (cparams.n_ctx_kv < cparams.n_ctx_seq) {
+            throw std::runtime_error("physical KV capacity must cover one complete logical window");
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: n_ctx_kv      = %u\n", __func__, cparams.n_ctx_kv);
     LLAMA_LOG_INFO("%s: n_seq_max     = %u\n", __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx         = %u\n", __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n", __func__, cparams.n_ctx_seq);
@@ -1488,6 +1509,10 @@ uint32_t llama_context::n_ctx() const {
 
 uint32_t llama_context::n_ctx_seq() const {
     return cparams.n_ctx_seq;
+}
+
+uint32_t llama_context::n_ctx_kv() const {
+    return cparams.n_ctx_kv;
 }
 
 uint32_t llama_context::n_batch() const {
@@ -4490,6 +4515,7 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/0,
         /*.ctx_other                   =*/nullptr,
         /*.kv_stream_arena_mib         =*/0,
+        /*.n_ctx_kv                    =*/0,
     };
 
     return result;
@@ -4626,6 +4652,10 @@ uint32_t llama_n_ctx(const llama_context * ctx) {
 
 uint32_t llama_n_ctx_seq(const llama_context * ctx) {
     return ctx->n_ctx_seq();
+}
+
+uint32_t llama_n_ctx_kv(const llama_context * ctx) {
+    return ctx->n_ctx_kv();
 }
 
 uint32_t llama_n_batch(const llama_context * ctx) {

@@ -439,6 +439,11 @@ extern "C" {
         // a caller built against a pre-streaming header keeps the same
         // offsets for every field before it.
         uint32_t kv_stream_arena_mib;
+
+        // Physical tokens in the unified KV pool. 0 keeps upstream sizing.
+        // The logical per-sequence window remains n_ctx. Rebuild callers when
+        // changing this versioned struct; a stable binary ABI is not promised.
+        uint32_t n_ctx_kv;
     };
 
     struct llama_model_tensor_override {
@@ -586,6 +591,7 @@ extern "C" {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_n_ctx_kv   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);

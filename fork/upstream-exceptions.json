@@ -1,5 +1,91 @@
 {
   "version": 1,
   "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
-  "files": []
+  "files": [
+    {
+      "path": "common/arg.cpp",
+      "sha256": "730c8c845a43b24be4bb4656ff7765ba1f5ae5fc6f315db792666268e0011ec9",
+      "mode": "100644",
+      "consumers": [
+        "tools/server"
+      ],
+      "reason": "Expose and store explicit physical unified KV capacity independently of the logical context window.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "common/common.cpp",
+      "sha256": "b8ea8bf3ca5832e5256249654c76fec864962174cc61d620ac715231ece5060a",
+      "mode": "100644",
+      "consumers": [
+        "tools/server"
+      ],
+      "reason": "Forward owned physical KV configuration to the versioned public llama context parameter.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "common/common.h",
+      "sha256": "2a79faf24dcfb823f16d8d071075b46a068c1d85e706424105ccac0375db4410",
+      "mode": "100644",
+      "consumers": [
+        "tools/server"
+      ],
+      "reason": "Expose and store explicit physical unified KV capacity independently of the logical context window.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "include/llama.h",
+      "sha256": "81632b80dc4c70569252a7776ba55c784dbb0b37300259f3487d87a34206edcf",
+      "mode": "100644",
+      "consumers": [
+        "fork/batch-compose",
+        "tools/server"
+      ],
+      "reason": "Declare, validate and observe physical KV capacity independently of the logical context window.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "src/llama-context.cpp",
+      "sha256": "3f66c1e452fe9ad7eb312355155a80236f088f06606a9900bb17dfa7c325bbf6",
+      "mode": "100644",
+      "consumers": [
+        "fork/batch-compose",
+        "tools/server"
+      ],
+      "reason": "Declare, validate and observe physical KV capacity independently of the logical context window.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "src/llama-context.h",
+      "sha256": "b65015a61d25e5a926479e1f0d76599b41a1ecb1f52fe6e5a5e04dff77bca0ac",
+      "mode": "100644",
+      "consumers": [
+        "fork/batch-compose",
+        "tools/server"
+      ],
+      "reason": "Declare, validate and observe physical KV capacity independently of the logical context window.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "src/llama-cparams.h",
+      "sha256": "750f7ced89a9a4b79c111028508da5f524d70c08be810d4c48c5ba0d45e60237",
+      "mode": "100644",
+      "consumers": [
+        "fork/batch-compose",
+        "tools/server"
+      ],
+      "reason": "Carry explicit physical KV allocation size separately from logical sequence context.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "src/llama-model.cpp",
+      "sha256": "cfd7e05bf7f2f3dda9fd814187c30af8800fa4bbc1f9b26326991ab31a3d350b",
+      "mode": "100644",
+      "consumers": [
+        "fork/batch-compose",
+        "tools/server"
+      ],
+      "reason": "Pass physical size only to attention KV constructors; preserve logical context and recurrent sizing.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    }
+  ]
 }
