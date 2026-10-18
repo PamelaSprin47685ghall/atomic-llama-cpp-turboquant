@@ -11153,6 +11153,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_mask_opt,
                                   { mask_buf, mask_opt_buf }, opt_pc,
                                   { mask_opt_num_dwords, CEIL_DIV(nem1, Br), nem2 * nem3 });
+        // The mask bitmap overwrites cached activations in prealloc_y.
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
+        ctx->prealloc_y_last_decode_vector_staging = false;
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
@@ -11205,6 +11209,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                                     {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
+        if (use_mask_opt) {
+            // Order bitmap reads before the next scratch overwrite.
+            ctx->prealloc_y_need_sync = true;
+        }
     }
 }
 
@@ -13655,6 +13663,10 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, 
         ggml_vk_sync_buffers(ctx, subctx);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline3, { buf_a, buf_b, buf_c, buf_d, buf_x, buf_y }, pc, elements);
 
+        // Softmax reductions overwrite cached activations in prealloc_y.
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
+        ctx->prealloc_y_last_decode_vector_staging = false;
         ctx->prealloc_x_need_sync = true;
         ctx->prealloc_y_need_sync = true;
     }
@@ -15388,6 +15400,8 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
 }
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
+static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer);
+static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise);
 
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
@@ -15896,6 +15910,21 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     default:
         return false;
+    }
+
+    // Writes through an alias invalidate the converted activation.
+    for (int32_t i = 0; ctx->prealloc_y_last_tensor_used && i < ctx->num_additional_fused_ops + 1; ++i) {
+        const ggml_tensor * written = cgraph->nodes[node_idx + i];
+        const ggml_tensor * cached = ctx->prealloc_y_last_tensor_used;
+        if ((ctx->fused_ops_write_mask & (1 << i)) &&
+            (!written->buffer || !cached->buffer ||
+             ggml_backend_buffer_is_multi_buffer(written->buffer) || ggml_backend_buffer_is_multi_buffer(cached->buffer) ||
+             !ggml_backend_buffer_is_vk(written->buffer) || !ggml_backend_buffer_is_vk(cached->buffer) ||
+             ggml_vk_tensors_overlap(written, cached, false))) {
+            ctx->prealloc_y_last_pipeline_used = nullptr;
+            ctx->prealloc_y_last_tensor_used = nullptr;
+            ctx->prealloc_y_last_decode_vector_staging = false;
+        }
     }
 
     ctx->tensor_ctxs[node_idx] = compute_ctx;

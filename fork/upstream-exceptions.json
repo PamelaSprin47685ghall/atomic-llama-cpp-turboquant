@@ -86,14 +86,16 @@
     },
     {
       "path": "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
-      "sha256": "dd3e36403f112ef3c1050bd900afbe072f4f3021fdaf9f6a35c6f4ec81d94924",
+      "sha256": "6453d62fe781b6452406476f88ba4145fc55af7c7207b68357b1d8032a128c6a",
       "mode": "100644",
       "consumers": [
         "Vulkan Turbo WHT",
+        "Vulkan scratch buffer reuse",
+        "public GGML graphs with in-place activation writes",
         "fork/tests/a-seams"
       ],
-      "reason": "Correct legal 32/64 WHT dispatch and the existing optional scale operand with explicit supported shapes.",
-      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+      "reason": "Correct legal 32/64 WHT dispatch and its optional scale operand; invalidate converted activation identity after mask bitmap or large Softmax writes, order bitmap reads before scratch reuse, and discard cached conversions after overlapping graph writes.",
+      "removal_condition": "Remove each hunk when the selected upstream passes the public WHT, scratch reuse, and source mutation regressions without it; retain full output comparisons, unrelated-write controls, and nonzero view offsets."
     },
     {
       "path": "ggml/src/ggml-vulkan/vulkan-shaders/turbo_wht.comp",
