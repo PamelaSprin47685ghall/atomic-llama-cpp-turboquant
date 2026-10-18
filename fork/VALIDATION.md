@@ -20,6 +20,7 @@
 | ASan + UBSan | `build-relay-san-20261018`，4/4 ctest 通过 | 本库已执行用例无地址/未定义行为报告；不扩写到线程、GPU 或模型 |
 | 完整构建流水线 | `build-clean-fork-relay-20261019`：A 固定 archive + 六个 B + 五个 C + a-seams，exit 0，末道边界复查通过 | 新库进入 `fork/build.py` 常规入口后整条流水线成立 |
 | 完整来源隔离 | `build-isolation-relay-20261019`：63/63 条命令通过，`isolated_modules` 含 `relay`，relay 从自身源码副本构建、测试（含 Python 交叉对照）、安装并进入搬迁后交付集合 | 独立库边界与安装消费成立；不构成操作系统沙箱 |
+| M0c 单卡平台探针 | `fork/relay-probe`（HIP 构建，`build-relay-probe-20261019`）在本机 RX 6800（gfx1030，ROCm 7.2.4）实际运行：双向 2000 代热复用、生产延迟排序、精确票据、多工作组最后到达、abort 全部 pass；host fetch_add 产生错误值（448 而非 7）记 fail，host CAS pass；五卡用例 not_run（本机 1 张）。证据报告 SHA-256 9d1d1429…684112 | 单卡平台事实成立：单写者 load/store 协议可用且无需 host RMW；不构成五卡或整链资格，换工具链/拓扑后需重跑 |
 | 实时跨语言对照 | `tq_relay.python_crosscheck` 通过：C++ 移植与已验证的 `tp5_local_plan.py`（SHA-256 59129982…59e657）在四个固定 fixture 上 decision、错误码、totals、逐 rank 字节/MAC、middle/output 区间全部一致 | C++ 端口与固定比较对象一致；不是 GPU 或真实量化资格 |
 | Python 参考基线 | `tp5_protocol_spec.py` PASS 8 checks；`output_credit_model.py` broken 32 状态 16 条不安全边 / fixed 17 状态 0 条；`tp5_local_plan.py --self-test` 16 组通过 | 提取产物可运行且与指南记录输出一致 |
 | 安装与搬迁消费 | 安装到 `/tmp/tqrelay-prefix-*`，从空目录 `find_package(TQRelay)` 构建消费者，搬迁前缀后重建再运行 `consumer ok` | 安装包自足，无绝对路径泄漏；不证明操作系统沙箱 |
