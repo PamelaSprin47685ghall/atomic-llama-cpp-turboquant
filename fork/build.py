@@ -66,9 +66,9 @@ def main():
         if install:
             run(["cmake", "--install", module_build])
 
-    for name in ("sampling", "corpus", "scheduling", "text"):
+    for name in ("sampling", "corpus", "scheduling", "text", "calibration"):
         module(name)
-    for name in ("compose", "corpus-compose", "batch-compose", "logits-compose"):
+    for name in ("compose", "corpus-compose", "batch-compose", "logits-compose", "imatrix-compose"):
         module(name, installed_dependencies=True)
     if not args.no_test:
         module("tests/a-seams", installed_dependencies=True, install=False)

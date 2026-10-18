@@ -1,0 +1,31 @@
+cmake_minimum_required(VERSION 3.16)
+project(TQImatrixCompose VERSION 0.1.0 LANGUAGES CXX)
+
+if(NOT UNIX)
+    message(FATAL_ERROR "TQImatrixCompose requires POSIX openat/linkat for output publication.")
+endif()
+include(GNUInstallDirs)
+find_package(ggml CONFIG REQUIRED)
+if(NOT TARGET TQCalibration::calibration)
+    find_package(TQCalibration CONFIG REQUIRED)
+endif()
+
+add_executable(tq_imatrix_compose src/main.cpp)
+set_target_properties(tq_imatrix_compose PROPERTIES OUTPUT_NAME tq-imatrix-compose)
+if(UNIX AND NOT APPLE)
+    set_target_properties(tq_imatrix_compose PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+endif()
+target_compile_features(tq_imatrix_compose PRIVATE cxx_std_17)
+target_include_directories(tq_imatrix_compose SYSTEM PRIVATE "${GGML_INCLUDE_DIR}")
+target_link_libraries(tq_imatrix_compose PRIVATE ggml::ggml-base TQCalibration::calibration)
+install(TARGETS tq_imatrix_compose RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/TQImatrixCompose")
+install(FILES README.md DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/TQImatrixCompose")
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME tq_imatrix_compose.files
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_conversion.py"
+            --binary "$<TARGET_FILE:tq_imatrix_compose>")
+endif()

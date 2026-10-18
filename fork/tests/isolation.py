@@ -104,10 +104,14 @@ def main():
     corpus = module("corpus", ())
     scheduling = module("scheduling", ())
     text_package = module("text", ())
+    calibration = module("calibration", ())
     compose = module("compose", (prefix_a, sampling))
     corpus_compose = module("corpus-compose", (prefix_a, corpus))
     batch_compose = module("batch-compose", (prefix_a, scheduling, text_package))
     logits_compose = module("logits-compose", (prefix_a,))
+    imatrix_compose = module("imatrix-compose", (prefix_a, calibration))
+    conversion_test = output / "imatrix-conversion.py"
+    shutil.copyfile(root / "fork/imatrix-compose/tests/test_conversion.py", conversion_test)
     real_test = output / "real-batch.py"
     real_logits_test = output / "real-logits.py"
     real_stream_test = output / "test_streaming.py"
@@ -119,7 +123,8 @@ def main():
         shutil.copyfile(root / "fork/tools/compare-logits.py", logits_comparator)
 
     delivered = output / "delivered"
-    for prefix in (prefix_a, sampling, corpus, scheduling, text_package, compose, corpus_compose, batch_compose, logits_compose):
+    for prefix in (prefix_a, sampling, corpus, scheduling, text_package, calibration,
+                   compose, corpus_compose, batch_compose, logits_compose, imatrix_compose):
         shutil.copytree(prefix, delivered, dirs_exist_ok=True)
         shutil.rmtree(prefix)
     for path in source_copies + build_copies:
@@ -163,8 +168,11 @@ int main() {
     run("scheduling-consumer-build", ["cmake", "--build", output / "build-scheduling-consumer", "--parallel", args.jobs])
     run("scheduling-consumer-test", ["ctest", "--test-dir", output / "build-scheduling-consumer", "--output-on-failure", "--no-tests=error"])
     for label, binary in (("compose", "llama-compose"), ("corpus", "llama-corpus"),
-                          ("batch", "tq-batch-compose"), ("logits", "tq-logits-compose")):
+                          ("batch", "tq-batch-compose"), ("logits", "tq-logits-compose"),
+                          ("imatrix", "tq-imatrix-compose")):
         run("installed-" + label, [delivered / "bin" / binary, "--help"])
+    run("relocated-imatrix-conversion", [sys.executable, conversion_test,
+                                         "--binary", delivered / "bin/tq-imatrix-compose"])
     if args.model:
         run("relocated-real-batch", [sys.executable, real_test, "--binary", delivered / "bin/tq-batch-compose",
                                     "--model", args.model.resolve(), "--gpu-layers", args.gpu_layers,
@@ -181,13 +189,16 @@ int main() {
               "a_reviewed_overlays_applied": None if args.a_prefix else snapshot["summary"]["reviewed_overlays"],
               "a_reuse_limit": "Installed A source, pin, overlays, and build provenance are not verified." if args.a_prefix else None,
               "a_public_seams_tests_passed": True,
-              "isolated_modules": ["sampling", "corpus", "scheduling", "text", "compose", "corpus-compose", "batch-compose", "logits-compose"],
+              "isolated_modules": ["sampling", "corpus", "scheduling", "text", "calibration",
+                                   "compose", "corpus-compose", "batch-compose", "logits-compose", "imatrix-compose"],
               "source_and_build_copies_removed_before_consumption": True,
               "relocated_installed_consumers_passed": True,
+              "relocated_imatrix_conversion": "passed",
               "relocated_real_batch": "passed" if args.model else "skipped_no_model",
               "relocated_real_logits": "passed" if args.model else "skipped_no_model",
               "relocated_real_stream": "passed" if args.model else "skipped_no_model",
               "limits": ["Help/package checks alone do not establish model execution or throughput.",
+                         "Imatrix conversion uses synthetic format fixtures, not model calibration or quantization quality measurements.",
                          "Separate source copies and installed consumption do not constitute an OS sandbox."],
               "commands": len(records)}
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
