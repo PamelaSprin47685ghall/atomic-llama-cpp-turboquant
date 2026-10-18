@@ -42,7 +42,8 @@ def main():
         "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_BUILD_EXAMPLES=OFF",
         "-DLLAMA_BUILD_APP=OFF", "-DLLAMA_TOOLS_INSTALL=OFF", "-DLLAMA_TESTS_INSTALL=OFF",
     ])
-    targets = ["llama"] + (["llama-server", "llama-bench"] if args.tools else [])
+    # A installs mtmd whenever its tools directory is enabled.
+    targets = ["llama"] + (["llama-server", "llama-bench", "mtmd"] if args.tools else [])
     run(["cmake", "--build", upstream, "--parallel", args.jobs, "--target", *targets])
     run(guard)
     run(["cmake", "--install", upstream])
