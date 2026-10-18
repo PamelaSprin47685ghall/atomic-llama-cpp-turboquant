@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,44 @@ constexpr std::uint64_t pattern_word(std::uint64_t generation, std::uint32_t ind
     value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
     return value ^ (value >> 31);
 }
+
+// The emulated relay fold geometry: RANKS rows of PAYLOAD_WORDS words per
+// generation. The rank weights below are pairwise distinct and sum to
+// exactly 1 mod 2^64, so a correct five-way fold reproduces the shared
+// pattern word for word, while a missing, duplicated, torn, or corrupted
+// partial breaks the identity deterministically (guide 35.5, 39.7 F04,
+// 41.6). For these synthetic words a quiet-NaN bit pattern is just another
+// wrong word and is caught the same way.
+constexpr std::uint32_t relay_ranks         = 5;
+constexpr std::uint32_t relay_payload_words = 8;
+
+// Pairwise distinct ODD weights that sum to 1 mod 2^64. Each property earns
+// its place: oddness makes the per-rank multiplication a bijection on
+// 64-bit words, so flipping ANY bit of any producer partial — a power-of-two
+// weight would shift high bits out of the word and hide them — changes the
+// fold; distinctness makes a duplicated row (a missing contribution) change
+// the fold for every rank pair. Row ORDER is not part of the gate: a SUM
+// fold is commutative, and the per-rank binding is proven separately by the
+// per-rank ready words before the fold runs.
+constexpr std::uint64_t rank_fold_weight(std::uint32_t rank) noexcept {
+    if (rank == 0) {
+        return 1;
+    }
+    if (rank < 4) {
+        return 1 + 2 * rank;  // 3, 5, 7
+    }
+    return 0ULL - 15ULL;      // -(1 + 3 + 5 + 7) mod 2^64; keeps the sum at 1
+}
+
+// Host five-way fold with the publication gate. `rank_partials` holds
+// relay_ranks rows of relay_payload_words words; a correct fold writes the
+// shared pattern into `out` and returns nullopt. Any word that fails the
+// exact identity returns a diagnostic naming the word and generation, and
+// nothing may be published from it.
+std::optional<std::string> fold_partials(const std::uint64_t * rank_partials,
+                                         std::uint64_t         generation,
+                                         std::uint32_t         seed,
+                                         std::uint64_t *       out);
 
 struct case_record {
     case_id     id     = case_id::device_identity;

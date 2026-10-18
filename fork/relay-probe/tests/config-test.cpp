@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -181,6 +182,93 @@ void check_patterns() {
     check(pattern_word(1, 0, 7) != pattern_word(1, 0, 8), "seed must change the pattern");
 }
 
+void check_fold_gate() {
+    // The gate rests on two invariants: the five weights are pairwise
+    // distinct (a swapped rank row still breaks the identity) and their sum
+    // is exactly 1 mod 2^64 (a clean fold reproduces the shared pattern).
+    std::uint64_t weight_sum = 0;
+    for (std::uint32_t rank = 0; rank < relay_ranks; ++rank) {
+        const std::uint64_t weight = rank_fold_weight(rank);
+        weight_sum += weight;
+        for (std::uint32_t other = 0; other < rank; ++other) {
+            check(weight != rank_fold_weight(other), "rank weights must be pairwise distinct");
+        }
+    }
+    check(weight_sum == 1, "rank weights must sum to exactly 1 mod 2^64");
+
+    // A clean fold reproduces the shared pattern at every word and reports
+    // no problem.
+    const std::uint64_t identities[][2] = {
+        { 1,    7  },
+        { 2,    0  },
+        { 2000, 13 }
+    };
+    for (const auto & identity : identities) {
+        const std::uint64_t        generation = identity[0];
+        const std::uint32_t        seed       = static_cast<std::uint32_t>(identity[1]);
+        std::vector<std::uint64_t> partials(relay_ranks * relay_payload_words);
+        for (std::uint32_t rank = 0; rank < relay_ranks; ++rank) {
+            for (std::uint32_t i = 0; i < relay_payload_words; ++i) {
+                partials[rank * relay_payload_words + i] = pattern_word(generation, i, seed) * rank_fold_weight(rank);
+            }
+        }
+        std::vector<std::uint64_t> out(relay_payload_words);
+        check(!fold_partials(partials.data(), generation, seed, out.data()).has_value(),
+              "a clean fold must pass the gate");
+        for (std::uint32_t i = 0; i < relay_payload_words; ++i) {
+            check(out[i] == pattern_word(generation, i, seed), "a clean fold must reproduce the shared pattern");
+        }
+    }
+
+    // Corruption must be rejected before publication. Build one clean set
+    // and mutate it through every shape of damage the gate exists to catch:
+    // a high-bit flip (the odd weights are a bijection, where a power-of-two
+    // weight would have shifted this bit out of the word), a quiet-NaN bit
+    // pattern (for synthetic words just another wrong word), and one rank
+    // row copied over another (a missing contribution; the distinct weights
+    // make every rank pair detectable). Each mutation must name the word and
+    // generation, and none may write through to the output.
+    constexpr std::uint64_t generation = 1;
+    constexpr std::uint32_t seed       = 7;
+    const auto              clean      = [&]() {
+        std::vector<std::uint64_t> partials(relay_ranks * relay_payload_words);
+        for (std::uint32_t rank = 0; rank < relay_ranks; ++rank) {
+            for (std::uint32_t i = 0; i < relay_payload_words; ++i) {
+                partials[rank * relay_payload_words + i] = pattern_word(generation, i, seed) * rank_fold_weight(rank);
+            }
+        }
+        return partials;
+    };
+    std::vector<std::uint64_t> out(relay_payload_words);
+    const auto                 expect_rejection = [&](std::vector<std::uint64_t> & partials) {
+        std::fill(out.begin(), out.end(), 0);
+        const auto problem = fold_partials(partials.data(), generation, seed, out.data());
+        check(problem.has_value(), "a corrupted fold must be rejected");
+        check(problem->find("reduction rejected word") != std::string::npos, "the rejection must name the fold gate");
+        check(problem->find("generation 1") != std::string::npos, "the rejection must name the generation");
+        for (std::uint64_t word : out) {
+            check(word == 0, "a rejected fold must not write through to the output");
+        }
+    };
+    {
+        std::vector<std::uint64_t> partials = clean();
+        partials[2 * relay_payload_words + 5] ^= 1ULL << 63;
+        expect_rejection(partials);
+    }
+    {
+        std::vector<std::uint64_t> partials   = clean();
+        partials[3 * relay_payload_words + 1] = 0x7FF8000000000000ULL;  // quiet NaN
+        expect_rejection(partials);
+    }
+    {
+        std::vector<std::uint64_t> partials = clean();
+        for (std::uint32_t i = 0; i < relay_payload_words; ++i) {
+            partials[1 * relay_payload_words + i] = partials[0 * relay_payload_words + i];
+        }
+        expect_rejection(partials);
+    }
+}
+
 void check_five_rank_records() {
     // Success: five pass records with the per-rank wording.
     const auto passed = five_rank_case_records("", 5);
@@ -266,6 +354,7 @@ int main() {
     try {
         check_case_registry();
         check_patterns();
+        check_fold_gate();
         check_five_rank_records();
         check_json();
         check_bench_json();

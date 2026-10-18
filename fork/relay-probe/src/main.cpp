@@ -49,14 +49,19 @@ namespace {
 using tq::relay::probe::case_id;
 using tq::relay::probe::device_record;
 using tq::relay::probe::five_rank_case_records;
+using tq::relay::probe::fold_partials;
 using tq::relay::probe::outcome;
 using tq::relay::probe::pattern_word;
 using tq::relay::probe::probe_report;
+using tq::relay::probe::rank_fold_weight;
 using tq::relay::probe::to_json;
 using tq::relay::probe::write_file_exclusive;
 using tq::relay::probe::write_result;
 
-constexpr std::uint32_t PAYLOAD_WORDS  = 8;
+// Geometry shared with the evidence layer so the config tests (no HIP) can
+// pin the fold gate on the same constants the kernels use.
+constexpr std::uint32_t PAYLOAD_WORDS  = tq::relay::probe::relay_payload_words;
+constexpr std::uint32_t RANKS          = tq::relay::probe::relay_ranks;
 constexpr std::uint64_t GUARD_VALUE    = 0x1F1E1D1C1B1A1918ULL;
 constexpr std::uint64_t TICKET_STALE   = 0;  // below any issued ticket
 constexpr std::uint32_t DEFAULT_ROUNDS = 2000;
@@ -139,11 +144,13 @@ __device__ inline void spin_budget(std::uint64_t clock_ticks) {
 }
 
 // Cumulative device wait budget. clock64() on gfx1030 ticks at the shader
-// clock, measured at ~2.3 GHz on this machine (2026-10-19). 24e9 ticks spans
-// ~8.3 s at 2.9 GHz and more when the clock runs slower, so the device always
-// outlasts the longest host-side deadline (5 s) for these waits: a genuine
-// stall fails on the host, never as a device-side false timeout. The budget
-// only bounds real stalls; hot rounds re-check every pause and stay fast.
+// clock, measured at ~2.3 GHz on this machine (2026-10-19); re-measure on
+// the target machine with the tq-clock-rate tool before relying on the
+// margins. 24e9 ticks spans ~8.3 s at 2.9 GHz and more when the clock runs
+// slower, so the device always outlasts the longest host-side deadline (5 s)
+// for these waits: a genuine stall fails on the host, never as a
+// device-side false timeout. The budget only bounds real stalls; hot rounds
+// re-check every pause and stay fast.
 constexpr std::uint64_t WAIT_BUDGET_TICKS = 24000000000ULL;
 
 enum class wait_outcome : std::uint32_t { matched, mismatch, aborted, timed_out };
@@ -254,7 +261,7 @@ __global__ void delayed_producer_kernel(control_block * cb, slot * s, std::uint3
     }
     device_fence_system();
     release_store(&cb->half_done, 1);
-    spin_budget(400000000ULL);  // ~174 ms at the measured 2.3 GHz clock64; margin for the 40 ms gate
+    spin_budget(400000000ULL);  // ~174 ms at the measured 2.3 GHz clock64 (tq-clock-rate); margin for the 40 ms gate
     for (std::uint32_t i = PAYLOAD_WORDS / 2; i < PAYLOAD_WORDS; ++i) {
         s->payload[i] = pattern_word(generation, i, seed);
     }
@@ -472,7 +479,7 @@ __global__ void delayed_reader_kernel(control_block * cb,
     }
     device_fence_system();
     release_store(&cb->half_done, 1);
-    spin_budget(400000000ULL);  // ~174 ms at the measured 2.3 GHz clock64; margin for the 40 ms gate
+    spin_budget(400000000ULL);  // ~174 ms at the measured 2.3 GHz clock64 (tq-clock-rate); margin for the 40 ms gate
     for (std::uint32_t i = PAYLOAD_WORDS / 2; i < PAYLOAD_WORDS; ++i) {
         valid = valid && (s->payload[i] == pattern_word(expected, i, seed));
         acc ^= s->payload[i];
@@ -526,29 +533,17 @@ __global__ void produce_variable_kernel(control_block * cb, slot * s, std::uint3
     release_store(&cb->exit_code, EXIT_OK);
 }
 
-// One rank's partial contribution for the emulated relay cycle. The rank
-// weights sum to 1 mod 2^64, so the five-way fold reproduces the shared
-// pattern exactly; a missing, duplicated, or torn partial changes the sum
-// and is caught by the consumer's payload verification. Each rank writes its
-// own row and publishes its own ready word; no host-memory RMW is used
-// anywhere (guide 31.3, the design only needs single-writer words).
-__device__ inline std::uint64_t rank_weight(std::uint32_t rank) {
-    if (rank == 0) {
-        return 1;
-    }
-    if (rank < 4) {
-        return 1ULL << 32;
-    }
-    return 0ULL - 3ULL * (1ULL << 32);  // -3 * 2^32 mod 2^64
-}
-
+// One rank's partial contribution for the emulated relay cycle (guide 31.3:
+// each rank writes its own row and publishes its own ready word; no
+// host-memory RMW is used anywhere). The weight identity lives in the
+// evidence layer so the no-HIP config tests pin the same constants.
 __global__ void partial_producer_kernel(std::uint64_t * partials,
                                         std::uint64_t * ready,
                                         std::uint32_t   rank,
                                         std::uint64_t   generation,
                                         std::uint32_t   seed) {
     std::uint64_t * const row    = partials + rank * PAYLOAD_WORDS;
-    const std::uint64_t   weight = rank_weight(rank);
+    const std::uint64_t   weight = rank_fold_weight(rank);
     for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
         row[i] = pattern_word(generation, i, seed) * weight;
     }
@@ -671,8 +666,6 @@ struct device_context {
     bool            mapped        = false;
     std::string     mapped_flags;
 };
-
-constexpr std::uint32_t RANKS = 5;
 
 // Handshake cases that require mapped host memory, minus mapped_host_access
 // itself, which carries the availability detail in its own record.
@@ -959,7 +952,7 @@ void case_multi_group(device_context & ctx) {
 // round instead of depending on incidental scheduling order.
 void case_multi_group_ordering(device_context & ctx) {
     constexpr std::uint32_t ORDER_ROUNDS  = 8;
-    // ~22 ms per step at the measured 2.3 GHz clock64: block 0 spins about
+    // ~22 ms per step at the measured 2.3 GHz clock64 (tq-clock-rate): block 0 spins about
     // 154 ms, leaving a large deterministic trap window for the host.
     constexpr std::uint64_t DELAY_STEP    = 50000000ULL;
     bool                    trap_observed = false;
@@ -1121,30 +1114,6 @@ class stream_set {
 
     std::vector<hipStream_t> streams;
 };
-
-// Host five-way fold with the publication gate (guide 35.5, 39.7 F04, 41.6):
-// the rank weights sum to 1 mod 2^64, so a correct fold reproduces the shared
-// pattern exactly. Any corrupted partial — a NaN bit pattern included, which
-// for these synthetic words is just another wrong word — breaks the identity
-// deterministically, and the reduction must refuse to publish instead of
-// handing garbage to the consumers.
-std::optional<std::string> fold_partials(const std::uint64_t * rank_partials,
-                                         std::uint64_t         generation,
-                                         std::uint32_t         seed,
-                                         std::uint64_t *       out) {
-    for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
-        std::uint64_t sum = 0;
-        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-            sum += rank_partials[rank * PAYLOAD_WORDS + i];
-        }
-        if (sum != pattern_word(generation, i, seed)) {
-            return "reduction rejected word " + std::to_string(i) + " of generation " + std::to_string(generation) +
-                   ": the five-rank fold does not reproduce the shared pattern (a producer partial is corrupted)";
-        }
-        out[i] = sum;
-    }
-    return std::nullopt;
-}
 
 // One emulated relay round: five producer streams write disjoint partials,
 // the host folds them into the output slot, publishes the ticket, and five
@@ -2115,8 +2084,25 @@ void case_fold_gate(device_context & ctx) {
             return;
         }
     }
-    const std::uint64_t saved         = ctx.rank_partials[INJECT_RANK * PAYLOAD_WORDS + INJECT_WORD];
-    const std::uint64_t corruptions[] = { saved ^ 1ULL, 0x7FF8000000000000ULL };
+    const std::uint64_t saved           = ctx.rank_partials[INJECT_RANK * PAYLOAD_WORDS + INJECT_WORD];
+    // The high-bit flip is the one a power-of-two weight would hide: the odd
+    // weights are a bijection, so the gate must see it like any other bit.
+    const std::uint64_t corruptions[]   = { saved ^ (1ULL << 63), 0x7FF8000000000000ULL };
+    const auto          assert_rejected = [&]() {
+        if (acquire_load(&ctx.cb->ticket) != 0) {
+            fail_case(ctx, case_id::nonfinite_reduction_gate, outcome::fail,
+                      "a generation was published despite the rejected fold");
+            return false;
+        }
+        for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+            if (ctx.slot_ptr->payload[i] != 0) {
+                fail_case(ctx, case_id::nonfinite_reduction_gate, outcome::fail,
+                          "the output slot was written despite the rejected fold");
+                return false;
+            }
+        }
+        return true;
+    };
     for (const std::uint64_t corruption : corruptions) {
         ctx.rank_partials[INJECT_RANK * PAYLOAD_WORDS + INJECT_WORD] = corruption;
         const auto problem = fold_partials(ctx.rank_partials, GENERATION, ctx.seed, fold);
@@ -2125,17 +2111,8 @@ void case_fold_gate(device_context & ctx) {
                       "a corrupted partial was folded and accepted instead of being rejected");
             return;
         }
-        if (acquire_load(&ctx.cb->ticket) != 0) {
-            fail_case(ctx, case_id::nonfinite_reduction_gate, outcome::fail,
-                      "a generation was published despite the rejected fold");
+        if (!assert_rejected()) {
             return;
-        }
-        for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
-            if (ctx.slot_ptr->payload[i] != 0) {
-                fail_case(ctx, case_id::nonfinite_reduction_gate, outcome::fail,
-                          "the output slot was written despite the rejected fold");
-                return;
-            }
         }
     }
     ctx.rank_partials[INJECT_RANK * PAYLOAD_WORDS + INJECT_WORD] = saved;
@@ -2143,7 +2120,7 @@ void case_fold_gate(device_context & ctx) {
         sync_with_deadline(streams.streams[rank], SYNC_DEADLINE_MS, "fold gate producer sync");
     }
     set_case(ctx, case_id::nonfinite_reduction_gate, outcome::pass,
-             "the clean five-way fold reproduces the shared pattern exactly; a flipped bit and a quiet-NaN bit "
+             "the clean five-way fold reproduces the shared pattern exactly; a high-bit flip and a quiet-NaN bit "
              "pattern in one producer partial were both rejected before publication with nothing written to the "
              "output slot");
 }
@@ -2631,13 +2608,21 @@ int run_bench(device_context &    ctx,
         }
         return now_ns() - begin;
     };
-    const std::uint64_t best_ns          = std::min(fold_pass(), fold_pass());
-    const std::uint64_t bytes            = static_cast<std::uint64_t>(RANKS) * FOLD_WORDS * sizeof(std::uint64_t);
-    const std::uint64_t bytes_per_second = best_ns == 0 ? 0 : (bytes * 1000000000ULL) / best_ns;
+    const std::uint64_t        bytes       = static_cast<std::uint64_t>(RANKS) * FOLD_WORDS * sizeof(std::uint64_t);
+    // One pass reads ~40 MiB in a few milliseconds: a single sample (or a
+    // best-of-two) is dominated by scheduling noise. Summarize a batch of
+    // passes like every other measurement instead, so min/median/p90/max
+    // mean what the bench schema says they mean.
+    constexpr std::uint32_t    FOLD_PASSES = 32;
+    std::vector<std::uint64_t> fold_bandwidth;
+    fold_bandwidth.reserve(FOLD_PASSES);
+    for (std::uint32_t pass = 0; pass < FOLD_PASSES; ++pass) {
+        const std::uint64_t pass_ns = fold_pass();
+        fold_bandwidth.push_back(pass_ns == 0 ? 0 : (bytes * 1000000000ULL) / pass_ns);
+    }
     report.limits.push_back("host_five_way_fold checksum " + std::to_string(fold_checksum) +
                             " anchors the fold against dead-code elimination");
-    add_measurement(report, "host_five_way_fold", "bytes_per_second",
-                    { 1, bytes_per_second, bytes_per_second, bytes_per_second, bytes_per_second });
+    add_measurement(report, "host_five_way_fold", "bytes_per_second", summarize(std::move(fold_bandwidth)));
 
     const write_result result = write_file_exclusive(path, to_json(report) + "\n");
     if (result.code != 0) {

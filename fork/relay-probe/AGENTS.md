@@ -29,6 +29,13 @@
    `hipFree` 与 kernel launch 都作用于当前设备，五卡用例结束后当前设备停在
    最后一个 rank，free 与 bench 若不各自固定就会在五卡机上解错设备、跑错
    设备；单卡机上这些路径肉眼不可见，只能靠入口纪律保证。
+6. [AXIOM 1] 折减发布门是 host 侧可独立验证的纯算术合同：rank 权重是两两
+   互异且和为 1 mod 2^64 的奇数——奇乘是 64 位双射，任意位损坏（含幂权重会
+   移出字的高位）必然改变折减；互异使任何 rank 行的复制（缺失贡献）对任意
+   rank 对可见。行顺序不属于该门（SUM 可交换，绑定由逐 rank ready 字证明），
+   门是全有或全无：先验证全部词再写 out，拒绝的折减不在输出缓冲留下部分结果。
+   Reason: 该门与 HIP 无关，无 HIP 的 config-test 必须能钉住全部反例；发布
+   前校验是 F04 的核心，部分写穿透会把"已拒绝"变成可误读的中间态。
 
 # SPEC
 
@@ -38,30 +45,36 @@
    同流逆序依赖识别、双窗口独立前进、CPU 服务循环、非有限归约门、host 有界等待
    无复用与五卡用例分别实现并有独立结果。
    Proof: `src/main.cpp` 的各 case 函数；本机全量运行报告 SHA-256
-   01533600f04fbf73795beb7ebecf8fbf35f7e1bccf11a70b7e46465e58bffc73
-   （RX 6800 / gfx1030，ROCm 7.2.4，2026-10-19，24 用例注册表）。21 用例报告
-   b6baeb81…f5be、19 用例报告 c0a21839…2e1f、18 用例报告 75dbd439…dec4c、
-   16 用例报告 0cdd86bd…9cb8a 与 12 用例报告 9d1d1429…684112 保留为被取代的
-   历史身份。
+   b40dd9407791a9c3bd6719407b1c6197c75caf10827da52980fdc726a9586b26
+   （RX 6800 / gfx1030，ROCm 7.2.4，2026-10-19，24 用例注册表）。24 用例报告
+   01533600…fc73、21 用例报告 b6baeb81…f5be、19 用例报告 c0a21839…2e1f、
+   18 用例报告 75dbd439…dec4c、16 用例报告 0cdd86bd…9cb8a 与 12 用例报告
+   9d1d1429…684112 保留为被取代的历史身份。
 2. [AXIOM 3] 证据报告是严格 JSON、排他创建；设备数不等于 5 时五卡用例保持
    not_run；单机强制用例全部通过时 qualification=pass，且报告注明范围。
    Proof: `src/evidence.cpp` 与 `tests/config-test.cpp`；实际报告可由任意
    JSON 解析器读取。
 3. [LEMMA 2] 证据配置、模式与序列化不需要 GPU 即可测试。
-   Proof: `tests/config-test.cpp` 在无 GPU 机器上可构建运行。
+   Proof: `tests/config-test.cpp` 在无 GPU 机器上可构建运行，其中
+   `check_fold_gate` 钉住折减门的全部反例（权重和、互异、干净折减、高位
+   翻转、quiet-NaN 位型、行复制与全有或全无写穿透）。
 4. [AXIOM 3] bench 测量（`--bench`）是成本模型观察值：延迟用 host steady
-   clock 且含 launch 时间，折减带宽由可观察校验和锚定防止死代码消除；
+   clock 且含 launch 时间，折减带宽由可观察校验和锚定防止死代码消除并以
+   32 样本的 min/median/p90/max 汇总（单样本被调度噪声支配）；
    测量结果写入独立的 `tp5.relay.bench.v1` 文件，不进入 qualification。
    Proof: `run_bench` 与 `summarize`；bench JSON 的严格序列化在
    `tests/config-test.cpp` 中覆盖；本机 bench 文件 SHA-256
-   04473ee14ab5ea1490da1424e826cd0a53d5905ded18f5886895cd76f8cc375b。
+   a1505a8c524f2fc29e2ff430f663e8e5f593cb8b5a2f017ec85dc6c7e08c7b2c。
 
 5. [LEMMA 3] 设备等待是累计预算：clock64 实测 ~2.3 GHz（gfx1030，2026-10-19），
    预算 24e9 ticks ≈ 8 s，必须超过最长 host 截止期（5 s）；每轮只做短暂停后
    重查，不能把整段预算一次睡满。失败路径 abort+排空，防止超预算等待的
-   kernel 在下一个用例复位后晚写共享控制块。
+   kernel 在下一个用例复位后晚写共享控制块。定标方法入库：`tq-clock-rate`
+   工具在每张可见设备上实测 clock64 速率（固定 tick 自旋 + event 轮询墙钟
+   截止期），上真机后先跑一次复核预算假设。
    Proof: `wait_for_ack` / `wait_for_ticket` / `fail_case`；修复前 2000 轮
-   预计数小时，修复后全量约 20 秒。
+   预计数小时，修复后全量约 5 秒；`tools/tq-clock-rate.cpp` 本机实测
+   median 2320.2 MHz（三次独立运行 2320.1–2320.4 MHz）。
 6. [LEMMA 5、6] 五卡跨设备用例在单卡机上不可能运行：它由 guard 三明治 + 每轮
    变化的 payload + 逐 rank 失败归因构成，第一次执行只能在真实五卡机器上
    发生；单卡回归只能证明该路径不改变单设备行为（five_rank 保持 not_run），

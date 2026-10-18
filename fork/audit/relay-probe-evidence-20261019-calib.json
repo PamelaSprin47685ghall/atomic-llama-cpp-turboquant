@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-19",
+  "status": "Calibration-and-fold-gate batch complete: three single-device closings land together. (1) The host fold gate moved into the evidence layer so the no-HIP config test pins it on the same constants the kernels use; the audit found and fixed a real weakness first — the old weights {1, 2^32, 2^32, 2^32, -3*2^32} shared one value across ranks 1-3, so a duplicated row between two same-weight ranks was invisible to the fold identity. The new weights are pairwise distinct ODD numbers {1, 3, 5, 7, 2^64-15} summing to 1 mod 2^64: odd multiplication is a bijection on 64-bit words, so flipping ANY bit of any partial (a power-of-two weight would shift high bits out of the word) changes the fold, and distinctness makes a duplicated row visible for every rank pair. The gate is all-or-nothing: every word is verified before the first write, so a rejected fold leaves no partial result. The live nonfinite_reduction_gate case now injects a high-bit flip alongside the quiet-NaN pattern. (2) The clock64 calibration method, previously a throwaway in /tmp, is now the in-repo HIP-gated tool tq-clock-rate: per visible device, five fixed-tick spin passes timed by the host steady clock with an event-poll wall deadline; three independent runs on this machine measure median 2320.1-2320.4 MHz, re-deriving the 2.3 GHz anchor behind WAIT_BUDGET_TICKS. The operator runs it first on the five-card machine to re-check the margin assumption (slower clocks only add margin). (3) The bench fold bandwidth was a best-of-two single sample dominated by scheduling noise; it is now summarized over 32 passes with min/median/p90/max like every other measurement (measured min/median spread ~1.6x shows the old single number was not stable).",
+  "all_release_gates_passed": false,
+  "identity": {
+    "repository": "atomic-llama-cpp-turboquant",
+    "branch": "clean/fork-20261018",
+    "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "superseded_batch_commit": "ef80c849d",
+    "superseded_batch_index": "audit/relay-probe-evidence-20261019-serviceloop.json",
+    "provenance_note": "The service-loop-batch report (01533600) and bench (05c3f207) stay byte-identical history. This batch changes the probe binary (fold gate moved into the evidence layer with new weights, high-bit injection in the live case, and the multi-sample fold bench), so the evidence was rerun from the final source in a fresh tree and the new SHAs below supersede it. The 23 pre-existing per-device single-card results are identical in meaning; the case registry is unchanged (24 cases, append-only)."
+  },
+  "source": {
+    "probe_root": "fork/relay-probe",
+    "digests_at_head_before_commit": {
+      "main.cpp": "e3ad95f74e539ba25ab9ef03f7ddab7ccc47c2a90781c1d591a6ec25c3969c87",
+      "evidence.cpp": "59c03da280ae8d3b0ebf928154aa47759184672e6ff8e029595aa1396b6d4cda",
+      "evidence.h": "86b7222920c6e57e9081207d8f4fdb51ca05e82fd61e7d8a5c4583945b160f56",
+      "config-test.cpp": "631abeedbe9df8b9178b48c232084900e231636aeea4b0ad4e5fda885f794014",
+      "validate-report.py": "3de8f8a3388bd124b3a8bf62e05e1a6298a0a8b0cdab45b64265136322549d32",
+      "tq-clock-rate.cpp": "f67d3211d925794f3cb268b4ae65bf97f639e946feaf2c31cb908fd7082b17c4",
+      "CMakeLists.txt": "a4017d7457a58af99a79a1612025d1cbe6c4799a754db58c33648e461f263f53"
+    },
+    "validator": {
+      "purpose": "Strict evidence validation for the operator on the real machine (guide 53.4).",
+      "self_test": "PASS",
+      "checked_real_evidence": "both files below validate with exit 0"
+    },
+    "config_test": {
+      "purpose": "No-HIP pinning of the evidence layer, now including the whole fold gate.",
+      "check_fold_gate": "pins weight-sum==1 mod 2^64, pairwise distinctness, clean folds reproducing the shared pattern, high-bit flip rejection, quiet-NaN rejection, duplicated-row rejection, and all-or-nothing (a rejected fold must not write through to the output buffer)"
+    }
+  },
+  "runtime": {
+    "system": "Linux x86_64",
+    "host_compiler": "GCC 16.2.1",
+    "probe_tu_compiler": "HIP clang (ROCm 7.2.4)",
+    "hip_runtime": "7.2.4",
+    "gpu": "AMD Radeon RX 6800",
+    "gcn_arch": "gfx1030",
+    "device_count": 1,
+    "rounds": 2000,
+    "build_tree": "build-relay-probe-20261019f",
+    "clock64_calibration": {
+      "tool": "tq-clock-rate (5 passes of 1e9 ticks per device, event-poll wall deadline)",
+      "runs": [
+        "median 2320.4 MHz (min 2247.0)",
+        "median 2320.2 MHz (min 2244.4)",
+        "median 2320.1 MHz (min 2258.2)"
+      ],
+      "conclusion": "the 2.3 GHz anchor behind WAIT_BUDGET_TICKS and the per-case spin budgets is re-derived by an in-repo tool; slower clocks only add margin, faster-than-2.9 GHz is beyond the plausible range"
+    }
+  },
+  "changes": [
+    "fold gate moved from main.cpp's anonymous namespace into the evidence layer (rank_fold_weight + relay_ranks/relay_payload_words in evidence.h, fold_partials in evidence.cpp); main.cpp keeps local PAYLOAD_WORDS/RANKS as aliases so every kernel still compiles against the same constants",
+    "rank weights changed from {1, 2^32, 2^32, 2^32, -3*2^32} to pairwise distinct odd {1, 3, 5, 7, 2^64-15}: audit found the old same-weight ranks 1-3 made a duplicated row invisible; oddness additionally makes any bit flip (including high bits that a power-of-two weight would shift out) change the fold",
+    "fold_partials made all-or-nothing: verify every word before the first write, so a rejected fold leaves no partial result in the output buffer",
+    "live case nonfinite_reduction_gate now injects a high-bit flip (saved ^ 1<<63) alongside the quiet-NaN pattern; pass detail updated",
+    "new no-HIP config test check_fold_gate pins weight-sum, distinctness, clean folds, high-bit flip, NaN pattern, duplicated row, and no-write-through",
+    "new HIP-gated diagnostic tool tq-clock-rate (tools/tq-clock-rate.cpp + CMake target + install rule): per-device clock64 rate measurement with bounded event-poll waits; wired into the README operator section as the first step on the real machine",
+    "bench host_five_way_fold changed from best-of-two single sample to 32 passes summarized min/median/p90/max",
+    "README operator/bench/facts sections, probe AGENTS (LEMMA 6, SPEC 1/3/4/5 proofs), fork README and VALIDATION.md updated in lockstep"
+  ],
+  "evidence": {
+    "report": {
+      "path": "build-relay-probe-20261019f/probe-report-final-20261019g.json",
+      "sha256": "b40dd9407791a9c3bd6719407b1c6197c75caf10827da52980fdc726a9586b26",
+      "qualification": "pass",
+      "validated": "exit 0",
+      "summary": "24-case registry; 23 cases per device: all pass except the expected platform fact host_system_rmw_u64_add=fail; nonfinite_reduction_gate=pass (clean fold exact; high-bit flip and quiet-NaN pattern both rejected before publication, output slot untouched); five_rank_status=not_run (one device present)."
+    },
+    "bench": {
+      "path": "build-relay-probe-20261019f/probe-bench-final-20261019g.json",
+      "sha256": "a1505a8c524f2fc29e2ff430f663e8e5f593cb8b5a2f017ec85dc6c7e08c7b2c",
+      "validated": "exit 0",
+      "medians": {
+        "host_publish_to_device_ack_ns": 9540,
+        "device_produce_to_host_ready_ns": 7350,
+        "five_stream_relay_cycle_ns": 29610,
+        "host_five_way_fold_bytes_per_second": 74184130981,
+        "host_five_way_fold_samples": 32,
+        "host_five_way_fold_min_max": [46702199003, 77874192350]
+      }
+    },
+    "superseded": {
+      "report_sha256": "01533600f04fbf73795beb7ebecf8fbf35f7e1bccf11a70b7e46465e58bffc73",
+      "bench_sha256": "05c3f2071b817acfe5d8d49d2319b72e407b7254ac2714a75b3549530106f75e",
+      "note": "Both stay byte-identical in build-relay-probe-20261019e/ as the service-loop-batch artifacts."
+    }
+  },
+  "single_card_residual": [
+    "F01 (allocation failure before the first submit), F03 (launch accepted, event record failure), F06 (output extent over capacity), F08 (drain unprovable), F09 (double close), F11 (cancel one request of a window), F12 (retry after error) are not injectable on a healthy single device; their software paths exist (setup-failure record path, bounded sync, per-case error capture) and are code-reviewed, not device-proven",
+    "P03 is closed by multi_group_completion's 2-live-groups-of-8 run; F05 is closed by ticket_semantics' device-side budget expiry; F02 is five-card-only",
+    "row ORDER is not part of the fold gate (a SUM fold is commutative); per-rank binding in the real system is proven by the per-rank ready words, exactly as guide 53.11 requires the binding to be checked where it exists"
+  ],
+  "pending_for_five_card_machine": [
+    "run tq-clock-rate first and record the per-device clock64 table (re-checks the WAIT_BUDGET_TICKS margin on the real cards)",
+    "run the probe with HIP_VISIBLE_DEVICES selecting exactly five devices (README operator section)",
+    "expect exit 0, five_rank_status=pass, 24 cases per device; archive stdout/stderr/exit/SHAs",
+    "run validate-report.py on the produced files before shipping them back",
+    "update this index family with the cross-device evidence"
+  ]
+}

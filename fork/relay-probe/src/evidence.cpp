@@ -96,6 +96,30 @@ std::size_t case_count() noexcept {
     return sizeof(case_names) / sizeof(case_names[0]);
 }
 
+std::optional<std::string> fold_partials(const std::uint64_t * rank_partials,
+                                         std::uint64_t         generation,
+                                         std::uint32_t         seed,
+                                         std::uint64_t *       out) {
+    std::uint64_t sums[relay_payload_words] = {};
+    for (std::uint32_t i = 0; i < relay_payload_words; ++i) {
+        for (std::uint32_t rank = 0; rank < relay_ranks; ++rank) {
+            sums[i] += rank_partials[rank * relay_payload_words + i];
+        }
+    }
+    // All-or-nothing: verify every word before the first write, so a
+    // rejected fold never leaves a partial result in the output buffer.
+    for (std::uint32_t i = 0; i < relay_payload_words; ++i) {
+        if (sums[i] != pattern_word(generation, i, seed)) {
+            return "reduction rejected word " + std::to_string(i) + " of generation " + std::to_string(generation) +
+                   ": the five-rank fold does not reproduce the shared pattern (a producer partial is corrupted)";
+        }
+    }
+    for (std::uint32_t i = 0; i < relay_payload_words; ++i) {
+        out[i] = sums[i];
+    }
+    return std::nullopt;
+}
+
 std::vector<case_record> five_rank_case_records(const std::string & detail, std::uint32_t failed_rank) {
     std::vector<case_record> records;
     records.reserve(5);

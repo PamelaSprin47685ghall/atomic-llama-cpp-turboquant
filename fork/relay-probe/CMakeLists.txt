@@ -48,6 +48,20 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(tq-relay-probe PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# Clock-rate calibration utility for the operator: re-derives the clock64()
+# rate the probe's spin budgets are anchored to, on the machine it will
+# actually run on. Diagnostic only; produces no evidence files.
+add_executable(tq-clock-rate tools/tq-clock-rate.cpp)
+set_source_files_properties(tools/tq-clock-rate.cpp PROPERTIES LANGUAGE HIP)
+target_link_libraries(tq-clock-rate PRIVATE hip::device)
+set_target_properties(tq-clock-rate PROPERTIES
+    HIP_ARCHITECTURES "${TQ_RELAY_PROBE_ARCHS}")
+target_compile_features(tq-clock-rate PRIVATE cxx_std_17)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(tq-clock-rate PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 install(TARGETS tq-relay-probe RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(TARGETS tq-clock-rate RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/TQRelayProbe")
 install(FILES README.md DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/TQRelayProbe")
