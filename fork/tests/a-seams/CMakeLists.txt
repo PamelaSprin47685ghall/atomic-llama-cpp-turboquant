@@ -21,6 +21,17 @@ target_compile_features(test-meta-transfers PRIVATE cxx_std_17)
 target_link_libraries(test-meta-transfers PRIVATE ggml::ggml ggml::ggml-cpu)
 add_test(NAME meta-transfers COMMAND test-meta-transfers)
 
+add_executable(test-recurrent-lifecycle recurrent-lifecycle-test.cpp)
+target_compile_features(test-recurrent-lifecycle PRIVATE cxx_std_17)
+target_link_libraries(test-recurrent-lifecycle PRIVATE llama)
+set(TQ_RECURRENT_TEST_MODEL "" CACHE FILEPATH "Real recurrent or hybrid model for optional lifecycle tests")
+set(TQ_RECURRENT_TEST_GPU_LAYERS "0" CACHE STRING "GPU layers for the optional recurrent lifecycle test")
+if(TQ_RECURRENT_TEST_MODEL)
+    add_test(NAME recurrent-lifecycle COMMAND test-recurrent-lifecycle
+        --model "${TQ_RECURRENT_TEST_MODEL}" --gpu-layers "${TQ_RECURRENT_TEST_GPU_LAYERS}")
+    set_tests_properties(recurrent-lifecycle PROPERTIES TIMEOUT 600)
+endif()
+
 if(TARGET ggml::ggml-vulkan)
     add_executable(test-vulkan-wht vulkan-wht.cpp)
     target_compile_features(test-vulkan-wht PRIVATE cxx_std_17)
