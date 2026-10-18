@@ -17,7 +17,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-#ifdef GGML_USE_CUDA
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include "ggml-cuda.h"
 #include <cuda_runtime.h>
 #include <map>
@@ -842,7 +842,7 @@ struct triattention_scorer::impl {
 
     bool      is_valid = false;
 
-#ifdef GGML_USE_CUDA
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // GPU state cache: one triattention_gpu_state per (device_id, k_type) pair.
     // Key: device_id * 1000 + (int)k_type
     // This handles layer-adaptive K types and multi-GPU placement.
@@ -1203,7 +1203,7 @@ void triattention_scorer::score_sampled_head(
     const ggml_type k_type = k_tensor->type;
     const bool need_wht_inv = triattention_needs_inverse_wht(k_type);
 
-#ifdef GGML_USE_CUDA
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // GPU fast path: if K tensor is on a CUDA device, score directly on GPU
     // without copying K data to host. Only the score array is transferred back.
     ggml_backend_buffer_type_t k_buft = k_tensor->buffer ? ggml_backend_buffer_get_type(k_tensor->buffer) : nullptr;
@@ -1394,7 +1394,7 @@ void triattention_scorer::score_combined(
             continue;
         }
 
-#ifdef GGML_USE_CUDA
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         bool is_cuda_buffer = false;
         ggml_backend_buffer_type_t k_buft_layer = k_tensor->buffer ? ggml_backend_buffer_get_type(k_tensor->buffer) : nullptr;
         if (k_buft_layer) {

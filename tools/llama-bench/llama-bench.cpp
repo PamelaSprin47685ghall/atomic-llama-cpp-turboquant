@@ -1696,9 +1696,7 @@ struct test {
     std::string              moe_cache;
     bool                     moe_cache_fit;
     bool                     repack;
-    llama_split_mode         split_mode;
-    llama_load_mode          load_mode;
-    int                      main_gpu;    bool                     no_kv_offload;
+    bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
