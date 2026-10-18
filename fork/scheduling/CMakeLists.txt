@@ -4,9 +4,9 @@ project(TQScheduling VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-option(TQ_SCHEDULING_BUILD_TESTS "Build the standalone selector tests." ON)
+option(TQ_SCHEDULING_BUILD_TESTS "Build the standalone scheduling tests." ON)
 
-add_library(tq_scheduling STATIC src/prefill.cpp)
+add_library(tq_scheduling STATIC src/prefill.cpp src/admission.cpp)
 add_library(TQScheduling::scheduling ALIAS tq_scheduling)
 set_target_properties(tq_scheduling PROPERTIES
     EXPORT_NAME scheduling
@@ -22,6 +22,9 @@ if(TQ_SCHEDULING_BUILD_TESTS)
     add_executable(tq_scheduling_tests tests/prefill-test.cpp)
     target_link_libraries(tq_scheduling_tests PRIVATE TQScheduling::scheduling)
     add_test(NAME tq_scheduling.boundaries COMMAND tq_scheduling_tests)
+    add_executable(tq_admission_tests tests/admission-test.cpp)
+    target_link_libraries(tq_admission_tests PRIVATE TQScheduling::scheduling)
+    add_test(NAME tq_scheduling.admission COMMAND tq_admission_tests)
 endif()
 
 set(TQ_SCHEDULING_PACKAGE_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/TQScheduling")

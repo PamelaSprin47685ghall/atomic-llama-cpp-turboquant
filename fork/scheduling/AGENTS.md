@@ -5,6 +5,7 @@
    server, kernels, or experimental reasoning system.
 2. Developers must build and use the selector without a model engine.
    Reason: scheduling policy has a complete value contract of its own.
+3. Consumers need fixed token and resident-slot budgets. Reason: a waiting request must not begin model work before its full known demand is reserved.
 
 # LEMMA
 
@@ -13,6 +14,7 @@
    fairness timer would change the requested behavior.
 2. From AXIOM 2: receive ids and stages, return owned ids, and keep no callbacks
    or references to a model, composition object, input, or result.
+3. From AXIOM 2-3: admission owns accounting and issues immutable reservation identities. C owns model memory and releases it before returning a reservation. Admission and selection are independent objects.
 
 # SPEC
 
@@ -28,6 +30,7 @@
    Proof: independent configure/build/test/install and a relocated installed
    consumer passed; see `../VALIDATION.md`.
    Runtime model integration is a separate consumer's proof, not this library's.
+4. From LEMMA 3: stale or foreign reservations cannot release a new slot occupant. Invalid requests and capacity rejection preserve accounting. Proof: `tests/admission-test.cpp` covers separate owners, reuse, moved-from values, duplicate release, exact capacity, and arithmetic at UINT64_MAX.
 
 # Exceptions
 
