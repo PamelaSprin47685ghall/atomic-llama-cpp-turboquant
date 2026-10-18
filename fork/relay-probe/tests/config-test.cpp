@@ -4,6 +4,7 @@
 #include "evidence.h"
 
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -19,14 +20,16 @@ void check(bool condition, const char * message) {
 }
 
 void check_case_registry() {
-    check(case_count() == 11, "case registry size drifted");
+    check(case_count() == 16, "case registry size drifted");
     const case_id all[] = {
-        case_id::device_identity,         case_id::mapped_host_access,
-        case_id::cpu_to_gpu_publish,      case_id::gpu_to_cpu_publish,
-        case_id::producer_delay_ordering, case_id::ticket_semantics,
-        case_id::multi_group_completion,  case_id::abort_stop,
-        case_id::host_system_rmw_u64_add, case_id::host_system_rmw_u64_cas,
-        case_id::five_rank_cross_device,
+        case_id::device_identity,           case_id::mapped_host_access,
+        case_id::cpu_to_gpu_publish,        case_id::gpu_to_cpu_publish,
+        case_id::producer_delay_ordering,   case_id::ticket_semantics,
+        case_id::multi_group_completion,    case_id::abort_stop,
+        case_id::host_system_rmw_u64_add,   case_id::host_system_rmw_u64_cas,
+        case_id::five_rank_cross_device,    case_id::multi_consumer_output_credit,
+        case_id::delayed_consumer_ordering, case_id::two_bank_rotation,
+        case_id::varying_live_bytes,        case_id::five_stream_relay_cycle,
     };
     for (std::size_t i = 0; i < case_count(); ++i) {
         check(case_name(all[i]) != nullptr && case_name(all[i])[0] != '\0', "case name must exist");
@@ -36,8 +39,39 @@ void check_case_registry() {
     }
 }
 
+void check_bench_json() {
+    bench_report report;
+    report.schema                     = 1;
+    report.build_id                   = "test";
+    report.hip_runtime_version_string = "7.2.4";
+    report.device_ordinal             = 0;
+    report.device_name                = "bench \"device\"";
+    report.gcn_arch_name              = "gfx1030";
+    report.rounds                     = 3;
+    report.measurements.push_back({ "host_publish_to_device_ack", "ns", 3, 100, 200, 300, 400 });
+    report.measurements.push_back({ "host_five_way_fold", "bytes_per_second", 1, 5, 5, 5, 5 });
+    report.limits.push_back("limit \\ backslash");
+    const std::string json = to_json(report);
+    check(!json.empty() && json.front() == '{' && json.back() == '}', "bench report must be a JSON object");
+    check(json.find("\"schema\":1,\"target\":\"tp5-relay-bench\"") != std::string::npos,
+          "bench top-level pairs must be comma separated");
+    check(json.find("\"name\":\"host_publish_to_device_ack\",\"unit\":\"ns\",\"samples\":3,\"min\":100,"
+                    "\"median\":200,\"p90\":300,\"max\":400") != std::string::npos,
+          "measurement pairs must be comma separated");
+    check(json.find("\\\"device\\\"") != std::string::npos, "bench name escaping broken");
+    check(json.find("\\\\ backslash") != std::string::npos, "bench limit escaping broken");
+    std::size_t open = 0;
+    for (const char ch : json) {
+        open += ch == '{' ? 1 : 0;
+        open -= ch == '}' ? 1 : 0;
+    }
+    check(open == 0, "bench braces must balance");
+}
+
 void check_patterns() {
-    check(pattern_word(1, 0, 7) == pattern_word(1, 0, 7), "pattern must be deterministic");
+    const std::uint64_t first  = pattern_word(1, 0, 7);
+    const std::uint64_t second = pattern_word(1, 0, 7);
+    check(first == second, "pattern must be deterministic");
     check(pattern_word(1, 0, 7) != pattern_word(1, 1, 7), "index must change the pattern");
     check(pattern_word(1, 0, 7) != pattern_word(2, 0, 7), "generation must change the pattern");
     check(pattern_word(1, 0, 7) != pattern_word(1, 0, 8), "seed must change the pattern");
@@ -79,9 +113,15 @@ void check_json() {
 }  // namespace
 
 int main() {
-    check_case_registry();
-    check_patterns();
-    check_json();
+    try {
+        check_case_registry();
+        check_patterns();
+        check_json();
+        check_bench_json();
+    } catch (const std::exception & error) {
+        std::cerr << "FAIL: " << error.what() << "\n";
+        return 1;
+    }
     std::cout << "PASS: probe evidence plumbing checks\n";
     return 0;
 }

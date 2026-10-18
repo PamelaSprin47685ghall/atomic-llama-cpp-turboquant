@@ -9,9 +9,10 @@ namespace {
 const char * outcome_names[] = { "pass", "fail", "unsupported", "not_run" };
 
 const char * case_names[] = {
-    "device_identity",         "mapped_host_access",      "cpu_to_gpu_publish",     "gpu_to_cpu_publish",
-    "producer_delay_ordering", "ticket_semantics",        "multi_group_completion", "abort_stop",
-    "host_system_rmw_u64_add", "host_system_rmw_u64_cas", "five_rank_cross_device",
+    "device_identity",           "mapped_host_access",      "cpu_to_gpu_publish",     "gpu_to_cpu_publish",
+    "producer_delay_ordering",   "ticket_semantics",        "multi_group_completion", "abort_stop",
+    "host_system_rmw_u64_add",   "host_system_rmw_u64_cas", "five_rank_cross_device", "multi_consumer_output_credit",
+    "delayed_consumer_ordering", "two_bank_rotation",       "varying_live_bytes",     "five_stream_relay_cycle",
 };
 
 const char * name_of(const char * const * names, std::size_t count, std::size_t index) noexcept {
@@ -155,6 +156,85 @@ std::string to_json(const probe_report & report) {
     text("five_rank_detail", report.five_rank_detail);
     text("qualification", to_string(report.qualification));
     text("qualification_detail", report.qualification_detail);
+    separator();
+    write_key(out, "limits");
+    out += ":[";
+    for (std::size_t i = 0; i < report.limits.size(); ++i) {
+        if (i != 0) {
+            out += ',';
+        }
+        write_string(out, report.limits[i]);
+    }
+    out += "]}";
+    return out;
+}
+
+std::string to_json(const bench_report & report) {
+    std::string out;
+    out += '{';
+    bool first     = true;
+    auto separator = [&]() {
+        if (!first) {
+            out += ',';
+        }
+        first = false;
+    };
+    auto integer = [&](const char * key, std::uint64_t value) {
+        separator();
+        write_key(out, key);
+        out += ':' + std::to_string(value);
+    };
+    auto text = [&](const char * key, const std::string & value) {
+        separator();
+        write_key(out, key);
+        out += ':';
+        write_string(out, value);
+    };
+    integer("schema", report.schema);
+    text("target", report.target);
+    text("build_id", report.build_id);
+    text("hip_runtime_version_string", report.hip_runtime_version_string);
+    integer("device_ordinal", static_cast<std::uint64_t>(report.device_ordinal));
+    text("device_name", report.device_name);
+    text("gcn_arch_name", report.gcn_arch_name);
+    integer("rounds", report.rounds);
+    separator();
+    write_key(out, "measurements");
+    out += ":[";
+    for (std::size_t i = 0; i < report.measurements.size(); ++i) {
+        if (i != 0) {
+            out += ',';
+        }
+        const auto & m = report.measurements[i];
+        out += '{';
+        bool m_first     = true;
+        auto m_separator = [&]() {
+            if (!m_first) {
+                out += ',';
+            }
+            m_first = false;
+        };
+        auto m_integer = [&](const char * key, std::uint64_t value) {
+            m_separator();
+            write_key(out, key);
+            out += ':' + std::to_string(value);
+        };
+        auto m_text = [&](const char * key, const std::string & value) {
+            m_separator();
+            write_key(out, key);
+            out += ':';
+            write_string(out, value);
+        };
+        m_text("name", m.name);
+        m_text("unit", m.unit);
+        m_integer("samples", m.samples);
+        m_integer("min", m.min);
+        m_integer("median", m.median);
+        m_integer("p90", m.p90);
+        m_integer("max", m.max);
+        out += '}';
+    }
+    out += ']';
     separator();
     write_key(out, "limits");
     out += ":[";

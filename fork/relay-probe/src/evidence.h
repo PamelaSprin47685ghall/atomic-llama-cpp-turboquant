@@ -31,6 +31,11 @@ enum class case_id {
     host_system_rmw_u64_add,
     host_system_rmw_u64_cas,
     five_rank_cross_device,
+    multi_consumer_output_credit,
+    delayed_consumer_ordering,
+    two_bank_rotation,
+    varying_live_bytes,
+    five_stream_relay_cycle,
 };
 
 const char * case_name(case_id value) noexcept;
@@ -89,5 +94,32 @@ struct probe_report {
 
 // Serialize the report as strict JSON (finite values only; strings escaped).
 std::string to_json(const probe_report & report);
+
+// Bench: measurements are observations for the cost model (guide 14), never
+// qualification gates. Latencies use the host steady clock.
+struct bench_measurement {
+    std::string   name;
+    std::string   unit;  // "ns" or "bytes_per_second"
+    std::uint64_t samples = 0;
+    std::uint64_t min     = 0;
+    std::uint64_t median  = 0;
+    std::uint64_t p90     = 0;
+    std::uint64_t max     = 0;
+};
+
+struct bench_report {
+    std::uint32_t                  schema = 1;
+    std::string                    target = "tp5-relay-bench";
+    std::string                    build_id;
+    std::string                    hip_runtime_version_string;
+    std::int32_t                   device_ordinal = -1;
+    std::string                    device_name;
+    std::string                    gcn_arch_name;
+    std::uint32_t                  rounds = 0;
+    std::vector<bench_measurement> measurements;
+    std::vector<std::string>       limits;
+};
+
+std::string to_json(const bench_report & report);
 
 }  // namespace tq::relay::probe

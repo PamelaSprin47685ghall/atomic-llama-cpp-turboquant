@@ -20,7 +20,12 @@
 | ASan + UBSan | `build-relay-san-20261018`，4/4 ctest 通过 | 本库已执行用例无地址/未定义行为报告；不扩写到线程、GPU 或模型 |
 | 完整构建流水线 | `build-clean-fork-relay-20261019`：A 固定 archive + 六个 B + 五个 C + a-seams，exit 0，末道边界复查通过 | 新库进入 `fork/build.py` 常规入口后整条流水线成立 |
 | 完整来源隔离 | `build-isolation-relay-20261019`：63/63 条命令通过，`isolated_modules` 含 `relay`，relay 从自身源码副本构建、测试（含 Python 交叉对照）、安装并进入搬迁后交付集合 | 独立库边界与安装消费成立；不构成操作系统沙箱 |
-| M0c 单卡平台探针 | `fork/relay-probe`（HIP 构建，`build-relay-probe-20261019`）在本机 RX 6800（gfx1030，ROCm 7.2.4）实际运行：双向 2000 代热复用、生产延迟排序、精确票据、多工作组最后到达、abort 全部 pass；host fetch_add 产生错误值（448 而非 7）记 fail，host CAS pass；五卡用例 not_run（本机 1 张）。证据报告 SHA-256 9d1d1429…684112 | 单卡平台事实成立：单写者 load/store 协议可用且无需 host RMW；不构成五卡或整链资格，换工具链/拓扑后需重跑 |
+| M0c 单卡平台探针（16 用例扩展版） | `fork/relay-probe`（HIP 构建，`build-relay-probe-20261019`）在本机 RX 6800（gfx1030，ROCm 7.2.4）实际运行 2000 轮：双向热复用、生产延迟排序、精确票据、多工作组最后到达、abort、五消费者输出 credit、延迟最后读者（H08）、双 bank 轮换、可变有效长度（H05）、单卡五流 RELAY 环全部 pass；host fetch_add 产生错误值（448 而非 7）记 fail，host CAS pass；五卡用例 not_run（本机 1 张）。证据报告 SHA-256 0cdd86bd…9cb8a | 单卡平台事实成立：单写者 load/store 协议可用且无需 host RMW；五消费者 credit 与双 bank 是软件协议层验证，不构成五卡或整链资格，换工具链/拓扑后需重跑 |
+| 探针 bench 测量（`--bench`） | 独立 `tp5.relay.bench.v1` 文件（SHA-256 062c2806…a9de0ad），2000 轮 median：host 发布→设备 ack 9,690 ns、设备生产→host ready 7,770 ns、五流整圈 29,930 ns、host 五路折减 65.7 GB/s | 单设备含 launch 时间的观察值，供指南 14 成本模型使用；不是资格门，五卡数字待真机 |
+| 设备等待预算修正 | 全量运行实测发现旧代码每次 ack 未命中把 2e9 ticks 预算一次性睡满（每轮 ~0.9 s，2000 轮预计数小时，600 s 上限内无产出）；改为累计预算等待（clock64 实测 ~2.3 GHz，预算 24e9 ticks ≈ 8 s，超过最长 5 s host 截止期），失败路径 abort+排空防晚写污染 | 全量 2000 轮从数小时级降到约 20 秒；防抖语义保留（设备等待超过 host 截止期，瞬时负载尖峰不再造成设备侧假超时） |
+
+较早的单卡探针报告（SHA-256 9d1d1429…684112，12 用例版）按证据身份保留为被取代的历史记录；
+新报告覆盖并取代其资格结论，不修改其字节。
 | 实时跨语言对照 | `tq_relay.python_crosscheck` 通过：C++ 移植与已验证的 `tp5_local_plan.py`（SHA-256 59129982…59e657）在四个固定 fixture 上 decision、错误码、totals、逐 rank 字节/MAC、middle/output 区间全部一致 | C++ 端口与固定比较对象一致；不是 GPU 或真实量化资格 |
 | Python 参考基线 | `tp5_protocol_spec.py` PASS 8 checks；`output_credit_model.py` broken 32 状态 16 条不安全边 / fixed 17 状态 0 条；`tp5_local_plan.py --self-test` 16 组通过 | 提取产物可运行且与指南记录输出一致 |
 | 安装与搬迁消费 | 安装到 `/tmp/tqrelay-prefix-*`，从空目录 `find_package(TQRelay)` 构建消费者，搬迁前缀后重建再运行 `consumer ok` | 安装包自足，无绝对路径泄漏；不证明操作系统沙箱 |
