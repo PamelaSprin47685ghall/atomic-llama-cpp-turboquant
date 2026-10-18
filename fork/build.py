@@ -67,7 +67,7 @@ def main():
 
     for name in ("sampling", "corpus", "scheduling"):
         module(name)
-    for name in ("compose", "corpus-compose", "batch-compose"):
+    for name in ("compose", "corpus-compose", "batch-compose", "logits-compose"):
         module(name, installed_dependencies=True)
     if not args.no_test:
         module("tests/a-seams", installed_dependencies=True, install=False)

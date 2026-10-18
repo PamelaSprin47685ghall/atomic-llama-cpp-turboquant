@@ -106,12 +106,17 @@ def main():
     compose = module("compose", (prefix_a, sampling))
     corpus_compose = module("corpus-compose", (prefix_a, corpus))
     batch_compose = module("batch-compose", (prefix_a, scheduling))
+    logits_compose = module("logits-compose", (prefix_a,))
     real_test = output / "real-batch.py"
+    real_logits_test = output / "real-logits.py"
+    logits_comparator = output / "compare-logits.py"
     if args.model:
         shutil.copyfile(root / "fork/batch-compose/tests/real-batch.py", real_test)
+        shutil.copyfile(root / "fork/logits-compose/tests/test_real_logits.py", real_logits_test)
+        shutil.copyfile(root / "fork/tools/compare-logits.py", logits_comparator)
 
     delivered = output / "delivered"
-    for prefix in (prefix_a, sampling, corpus, scheduling, compose, corpus_compose, batch_compose):
+    for prefix in (prefix_a, sampling, corpus, scheduling, compose, corpus_compose, batch_compose, logits_compose):
         shutil.copytree(prefix, delivered, dirs_exist_ok=True)
         shutil.rmtree(prefix)
     for path in source_copies + build_copies:
@@ -136,9 +141,14 @@ add_executable(consumer main.cpp)
 target_link_libraries(consumer PRIVATE TQScheduling::scheduling)
 add_test(NAME relocated-scheduling COMMAND consumer)
 ''')
-    (scheduling_consumer / "main.cpp").write_text('''#include <tq/scheduling/prefill.h>
+    (scheduling_consumer / "main.cpp").write_text('''#include <tq/scheduling/admission.h>
+#include <tq/scheduling/prefill.h>
 int main() {
     using namespace tq::scheduling;
+    admission_budget budget(512, 1);
+    const auto held = budget.try_acquire(7, 256);
+    if (!held || budget.reserved_tokens() != 256 || budget.try_acquire(9, 256)) return 3;
+    if (!budget.release(*held) || budget.release(*held) || budget.available_tokens() != 512) return 4;
     prefill_selector selector;
     auto prompt = selector.choose({{7, stage::generation}, {9, stage::prompt}});
     if (prompt.next != stage::prompt || prompt.prompt_slot != 9 || !prompt.generation_slots.empty()) return 1;
@@ -149,21 +159,27 @@ int main() {
     configure("scheduling-consumer", scheduling_consumer, output / "build-scheduling-consumer", output / "unused", (delivered,))
     run("scheduling-consumer-build", ["cmake", "--build", output / "build-scheduling-consumer", "--parallel", args.jobs])
     run("scheduling-consumer-test", ["ctest", "--test-dir", output / "build-scheduling-consumer", "--output-on-failure", "--no-tests=error"])
-    for label, binary in (("compose", "llama-compose"), ("corpus", "llama-corpus"), ("batch", "tq-batch-compose")):
+    for label, binary in (("compose", "llama-compose"), ("corpus", "llama-corpus"),
+                          ("batch", "tq-batch-compose"), ("logits", "tq-logits-compose")):
         run("installed-" + label, [delivered / "bin" / binary, "--help"])
     if args.model:
         run("relocated-real-batch", [sys.executable, real_test, "--binary", delivered / "bin/tq-batch-compose",
                                     "--model", args.model.resolve(), "--gpu-layers", args.gpu_layers,
                                     "--output-dir", output / "relocated-real-model"])
+        run("relocated-real-logits", [sys.executable, real_logits_test, "--binary", delivered / "bin/tq-logits-compose",
+                                     "--model", args.model.resolve(), "--gpu-layers", args.gpu_layers,
+                                     "--comparator", logits_comparator, "--batch-binary", delivered / "bin/tq-batch-compose",
+                                     "--output-dir", output / "relocated-real-logits"])
     result = {"upstream": snapshot["base"], "a_source_provenance": provenance,
               "a_archive_has_no_b_or_c": None if args.a_prefix else True,
               "a_reviewed_overlays_applied": None if args.a_prefix else snapshot["summary"]["reviewed_overlays"],
               "a_reuse_limit": "Installed A source, pin, overlays, and build provenance are not verified." if args.a_prefix else None,
               "a_public_seams_tests_passed": True,
-              "isolated_modules": ["sampling", "corpus", "scheduling", "compose", "corpus-compose", "batch-compose"],
+              "isolated_modules": ["sampling", "corpus", "scheduling", "compose", "corpus-compose", "batch-compose", "logits-compose"],
               "source_and_build_copies_removed_before_consumption": True,
               "relocated_installed_consumers_passed": True,
               "relocated_real_batch": "passed" if args.model else "skipped_no_model",
+              "relocated_real_logits": "passed" if args.model else "skipped_no_model",
               "limits": ["Help/package checks alone do not establish model execution or throughput.",
                          "Separate source copies and installed consumption do not constitute an OS sandbox."],
               "commands": len(records)}
