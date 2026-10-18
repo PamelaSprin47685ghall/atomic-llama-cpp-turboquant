@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-19",
+  "status": "Delivery-hardening batch complete. A fresh-eyes audit of the probe's delivery surfaces found and fixed three contract defects and pinned every previously unpinned claim. (1) The README promised --rounds accepts only pure decimal integers, but strtoul silently accepted 02000, +2000 and a whitespace-prefixed value; the parser now requires the first character to be a digit 1-9 and all six shapes (0, 02000, +2000, leading whitespace, -1, overflow) exit 2, measured one by one on the live binary. (2) tq-clock-rate let the kernel write a word allocated with hipHostMallocDefault, which this machine returns with flags=0 (NOT device-mapped) while the write still lands - a platform accident of exactly the class the probe exists to refuse (AXIOM 1); the tool now requests mapped host memory, verifies the Mapped flag per device, and reads the word with an acquire load; the measured rates are unchanged (2255.6-2320.4 MHz across the reruns, median 2319.8-2320.2 MHz). (3) cmake --install shipped the two binaries, README and LICENSE but not validate-report.py, the validator the README's operator contract requires before archiving; it is now installed and a scratch-prefix smoke proved the installed tree stands alone (installed binary ran 50 rounds qualification=pass; the installed validator accepted the installed binary's report). Additionally: write_file_exclusive's documented symlink refusal and missing-directory refusal were never pinned - config-test now covers both (link and victim survive byte-identical); the validator's robustness against malformed trees was never pinned - a 6000-mutation fuzz over both documents produced zero unexpected exceptions, and a bounded 2x500 fixed-seed version now lives inside --self-test; HIP_VISIBLE_DEVICES out-of-range indices (1, 5, 99) were measured to take the same enumeration-failure path as whitespace/empty, while a list containing non-existent indices (0,1,2,3,5 on this one-device machine) is silently filtered - the operator can only catch that typo via the device count and per-card BDF in the report, which the README now says. The registry stays at 25 cases; the authoritative evidence was rerun from the final formatted source in a fresh tree.",
+  "all_release_gates_passed": false,
+  "identity": {
+    "repository": "atomic-llama-cpp-turboquant",
+    "branch": "clean/fork-20261018",
+    "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "superseded_batch_commit": "76bae8d95",
+    "superseded_batch_index": "audit/relay-probe-evidence-20261019-fivecard.json",
+    "provenance_note": "The five-card batch report (65146f98) and bench (70400732) stay byte-identical history. This batch changed the probe binary (--rounds parser), the clock-rate tool and the validator, so the evidence was rerun from the final clang-formatted source in a fresh tree (build-relay-probe-20261019h); the SHAs below supersede them. The case registry is unchanged (25 cases)."
+  },
+  "source": {
+    "probe_root": "fork/relay-probe",
+    "digests_at_head_before_commit": {
+      "main.cpp": "e96f8232e20a0daf3ebc2df807cdd57a776a5ca32eada2541a1f5584a0eaf698",
+      "evidence.cpp": "c3d14d4ba8d9fe2e95a2319d976b39165c0ece0825a9bc7b215c1c281cd096d9",
+      "evidence.h": "8299f32ad871b0da780e75d4cfea2b6d9e13c952e506352d09119d6dfe7e05db",
+      "config-test.cpp": "2f8d7a8460f059774938be9d366cbbe0dc6f62ef3d01a3e019c11a7fc2839824",
+      "validate-report.py": "318e20e6ce7cc653d5dbce3a375e49c09be19c4ad36404bbc1ed9f1595625063",
+      "CMakeLists.txt": "0e65f62b0bdb09825555fc90693ffd00a46922d7b69ec534afa450ca22ab947e",
+      "tq-clock-rate.cpp": "0e18f03bc6d98bc2bd0c7d048b49540d1da337e407eb956cfe3170c50a28ca5c"
+    }
+  },
+  "defects": [
+    {
+      "id": "D4",
+      "where": "main.cpp --rounds parsing",
+      "what": "strtoul silently accepted 02000, +2000 and a whitespace-prefixed value while the README promised pure-decimal-only",
+      "effect": "a typo would run a different shape than the operator asked for while looking like a normal run",
+      "evidence": "live binary measurements: 02000/+2000/' 2000'/-1/0/4294967296 all exit 2 with the documented message; 2000 exits 0",
+      "fix": "first character must be a digit 1-9 before strtoul; existing range and trailing-garbage checks kept"
+    },
+    {
+      "id": "D5",
+      "where": "tools/tq-clock-rate.cpp host allocation",
+      "what": "the kernel wrote a word allocated with hipHostMallocDefault, which is pinned but not device-mapped by contract",
+      "effect": "the calibration number rested on a platform accident; on another driver/topology the write could be illegal or fail",
+      "evidence": "throwaway probe on the live device: hipHostMallocDefault returns flags=0 (Mapped=0 Portable=0) and the kernel write still lands; hipHostMallocMapped|Portable returns flags=3",
+      "fix": "mapped+portable allocation, per-device Mapped flag verification, acquire load of the published tick count, --help now exits 0; rates unchanged"
+    },
+    {
+      "id": "D6",
+      "where": "CMakeLists.txt install rules",
+      "what": "cmake --install shipped binaries, README and LICENSE but not validate-report.py, the validator the operator contract requires before archiving evidence",
+      "effect": "an installed tree could not finish the pre-ship contract",
+      "fix": "install(PROGRAMS validate-report.py ...); scratch-prefix smoke: installed binary 50 rounds qualification=pass, installed validator exit 0 on the installed binary's report"
+    }
+  ],
+  "pins": [
+    "write_file_exclusive symlink refusal: target symlink refused, symlink and its victim file survive byte-identical (config-test, no GPU)",
+    "write_file_exclusive missing directory: clean refusal naming the temporary-file creation failure (config-test, no GPU)",
+    "validator malformed-tree robustness: 6000 seeded mutations of a valid report and a valid bench (3000 each) -> zero unexpected exceptions; bounded 2x500 fixed-seed fuzz now part of --self-test",
+    "--rounds CLI edges: six rejecting shapes and one accepting shape measured on the live binary",
+    "HIP_VISIBLE_DEVICES=1/5/99: enumeration error -> report written (qualification=fail, detail names the cause), exit 1, and the produced report passes the validator (broken-machine evidence stays valid)",
+    "HIP_VISIBLE_DEVICES=0,1,2,3,5 (list with non-existent indices): silently filtered on this machine - operator must verify device count and per-card BDF in the report",
+    "tq-clock-rate --help exit 0; no visible device exit 2; five-card run unchanged"
+  ],
+  "runtime": {
+    "system": "Linux x86_64",
+    "host_compiler": "GCC 16.2.1",
+    "probe_tu_compiler": "HIP clang (ROCm 7.2.4)",
+    "gpu": "AMD Radeon RX 6800",
+    "gcn_arch": "gfx1030",
+    "device_count": 1,
+    "rounds": 2000,
+    "build_tree": "build-relay-probe-20261019h",
+    "clock64_recheck": "final binary: min 2259.2, median 2319.8, max 2319.9 MHz; earlier rerun of the same build min 2255.6, median 2320.0, max 2320.2 MHz - the 2.3 GHz budget anchor holds"
+  },
+  "evidence": {
+    "report": {
+      "path": "build-relay-probe-20261019h/probe-report-final-20261019i.json",
+      "sha256": "d3a6255b3e2938876edcfad1397c4d0362d340c339b783a94ba677924780a26f",
+      "qualification": "pass",
+      "validated": "exit 0",
+      "summary": "25-case registry; 24 cases on the device: all pass except the expected platform fact host_system_rmw_u64_add=fail; five_rank_indexing=pass; five_rank_status=not_run."
+    },
+    "bench": {
+      "path": "build-relay-probe-20261019h/probe-bench-final-20261019i.json",
+      "sha256": "fe78fee2e6686c58bc1251e827ceb5d40c82eef82bf2bb5f1d5b0ed5a73a49e2",
+      "validated": "exit 0",
+      "medians": {
+        "host_publish_to_device_ack_ns": 9520,
+        "device_produce_to_host_ready_ns": 7250,
+        "five_stream_relay_cycle_ns": 30110,
+        "host_five_way_fold_bytes_per_second": 67243458506,
+        "host_five_way_fold_samples": 32
+      }
+    },
+    "superseded": {
+      "report_sha256": "65146f98ff167bc475d93d8a84fe17208b75ea491affb8e055c3caa13b2e4533",
+      "bench_sha256": "704007326e9f03bd6e704cd8a186fd008e4cd8a3b593977f942e5398b24203c3",
+      "note": "Byte-identical history in build-relay-probe-20261019g/."
+    }
+  },
+  "verification": [
+    "no-HIP tree ctest 2/2; HIP tree (fresh) ctest 2/2",
+    "relay release and sanitizer ctests 4/4 each",
+    "validator --self-test PASS (now including the bounded mutation fuzz); py_compile clean",
+    "fork/check-upstream.py exit 0",
+    "clang-format clean on all five C++ files (main.cpp and config-test.cpp were reformatted by the final pass; the authoritative run was redone AFTER the format so the evidence corresponds to the delivered source bytes)",
+    "clang-tidy (default set, exact compile command via compile_commands.json): zero findings outside the registered exception classes",
+    "install smoke from a scratch prefix: installed tq-relay-probe 50 rounds exit 0 qualification=pass; installed validate-report.py exit 0 on its report; shipped file set complete",
+    "authoritative 2000-round run from the fresh tree: exit 0, qualification=pass, five_rank=not_run, five_rank_indexing=pass; validator exit 0 on both files"
+  ],
+  "single_card_residual": [
+    "cross-device visibility and per-rank attribution across five physical devices: first execution remains on the five-card machine (five_rank_cross_device)",
+    "run_five_rank's fixed setup pre-check can only be exercised end-to-end when a real device fails setup on the five-card machine",
+    "F01/F03/F06/F08/F09/F11/F12 stay non-injectable on a healthy single device",
+    "tidy findings outside the registered exceptions are zero"
+  ],
+  "pending_for_five_card_machine": [
+    "run tq-clock-rate first and record the per-device clock64 table",
+    "run the probe with HIP_VISIBLE_DEVICES=0,1,2,3,4 (exact form, no spaces) selecting exactly five devices",
+    "expect exit 0, five_rank_status=pass, 25 cases per device (24 single-device + five_rank_cross_device), stdout lines ending with five_rank_indexing=pass",
+    "verify the report's device count is 5 and the per-card BDFs match the physical cards (a silently filtered typo like 0,1,2,3,5 shows up here, not in the exit code)",
+    "archive stdout, stderr, exit code, report and bench SHAs; run validate-report.py before shipping back",
+    "update this index family with the cross-device evidence"
+  ]
+}

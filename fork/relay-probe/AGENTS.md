@@ -71,10 +71,14 @@
    重查，不能把整段预算一次睡满。失败路径 abort+排空，防止超预算等待的
    kernel 在下一个用例复位后晚写共享控制块。定标方法入库：`tq-clock-rate`
    工具在每张可见设备上实测 clock64 速率（固定 tick 自旋 + event 轮询墙钟
-   截止期），上真机后先跑一次复核预算假设。
+   截止期），上真机后先跑一次复核预算假设。核写出的 tick 数字落在映射 host
+   内存且逐卡校验 Mapped 标志：本机实测 `hipHostMallocDefault` 返回 flags=0
+   （不含 Mapped）时核写入照样落地——平台意外，不可依赖（AXIOM 1），工具因此
+   与探针使用同一份映射内存合同。
    Proof: `wait_for_ack` / `wait_for_ticket` / `fail_case`；修复前 2000 轮
    预计数小时，修复后全量约 5 秒；`tools/tq-clock-rate.cpp` 本机实测
-   median 2320.2 MHz（三次独立运行 2320.1–2320.4 MHz）。
+   median 2320.2 MHz（三次独立运行 2320.1–2320.4 MHz，映射内存修复后复测
+   2257.1–2320.4 MHz，速率不变）。
 6. [LEMMA 5、6] 五卡跨设备可见性在单卡机上不可能运行：它的第一次执行只能在
    真实五卡机器上发生（five_rank 保持 not_run）。但它的逐 rank 索引不是：新增
    单卡钉住用例 `five_rank_indexing` 用五条流跑与五卡用例完全相同的
@@ -110,6 +114,7 @@
    清除，链接成功后残留临时名不使证据失效。
    Proof: `evidence.cpp` 的 `write_file_exclusive`；
    `tests/config-test.cpp` 的 `check_exclusive_write` 覆盖首写成功、二次
+   拒绝、**符号链接拒绝且链接与被指文件都原样保留**、目标目录不存在的干净
    拒绝、内容不变与无残留（无 GPU 即可运行）。stdout 证据行同样按此精神
    保全：无缓冲输出 + config-test 的 fork/SIGKILL 存活测试，重定向运行被
    杀不丢已打印行。
@@ -118,7 +123,10 @@
    非有限数、未知字段与尾随数据）并重算全部交叉不变量——注册表覆盖、
    rank 与下标一致、five_rank 状态与设备数一致、qualification 与逐用例
    结果一致、bench 序统计单调。未来字段变化必须升 schema 或改校验器，
-   不允许静默漂移。
+   不允许静默漂移。`--self-test` 另含固定种子的结构化变异模糊：对合法报告
+   与 bench 各 500 次逐层变异，任何结果都必须落在"仍合法"或校验器自己的
+   EvidenceError 之内，意外异常（TypeError/KeyError/递归）会立即失败——
+   校验器自身抗畸形树，坏证据不能被拒成崩溃。
    Proof: `validate-report.py` 的 `--self-test` 与两份本机权威证据实测
    通过；真机证据归档前必须通过校验。
 

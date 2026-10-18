@@ -427,6 +427,50 @@ def load_strict_text(text):
         fail("invalid JSON: %s" % error)
 
 
+def mutation_fuzz():
+    """Deterministic structural fuzz over the report and bench validators.
+
+    Every mutation of a valid document must end in a clean outcome: accepted
+    as still valid, or rejected with the validator's own EvidenceError
+    (never an accidental TypeError/KeyError/RecursionError from a malformed
+    tree). The seed is fixed so a failure is reproducible; the count is
+    bounded so --self-test stays a fast check.
+    """
+    import random
+    rng = random.Random(20261019)
+
+    def mutate(value):
+        kind = type(value)
+        if kind is dict and value:
+            key = rng.choice(list(value))
+            return {k: (mutate(v) if k == key else v) for k, v in value.items()}
+        if kind is list and value:
+            index = rng.randrange(len(value))
+            result = list(value)
+            result[index] = mutate(result[index])
+            return result
+        if kind is bool:
+            return rng.choice([True, False])
+        if kind is int:
+            return rng.choice([0, 1, -1, 2**31 - 1, 2**63 - 1, 2**64, rng.randrange(10**6)])
+        if kind is str:
+            return rng.choice(["", "x", "\x00", "\ud800", "a" * 200, str(rng.randrange(10**12))])
+        return rng.choice([None, 0, "", [], {}])
+
+    documents = (
+        ("report", good_report(1), validate_report),
+        ("bench", good_bench(), validate_bench),
+    )
+    for label, document, check in documents:
+        for _ in range(500):
+            candidate = mutate(document)
+            try:
+                check(candidate)
+            except EvidenceError:
+                pass  # clean rejection is the expected outcome
+            # Any other exception propagates and fails the self-test.
+
+
 def self_test():
     validate_report(good_report(1))
     validate_report(good_report(5))
@@ -551,6 +595,7 @@ def self_test():
                                            ' [{"name": "host_publish_to_device_ack", "unit": "ns",'
                                            ' "samples": 1, "min": 1, "median": 1, "p90": 1, "max": 1}]'),
                         "bench")
+    mutation_fuzz()
     print("PASS: validator self-test")
 
 

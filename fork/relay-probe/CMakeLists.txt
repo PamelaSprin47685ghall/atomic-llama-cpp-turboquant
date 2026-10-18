@@ -63,5 +63,10 @@ endif()
 
 install(TARGETS tq-relay-probe RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(TARGETS tq-clock-rate RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+# The evidence validator is part of the operator's pre-ship contract
+# (README: archive evidence only after it validates); ship it with the
+# binaries so an installed tree can stand alone. It is already executable
+# in the repository; PROGRAMS preserves that mode.
+install(PROGRAMS validate-report.py DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/TQRelayProbe")
 install(FILES README.md DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/TQRelayProbe")

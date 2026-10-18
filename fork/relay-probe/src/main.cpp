@@ -2772,12 +2772,20 @@ int main(int argc, char ** argv) {
         } else if (arg == "--bench" && i + 1 < argc) {
             bench_path = argv[++i];
         } else if (arg == "--rounds" && i + 1 < argc) {
-            const char * text          = argv[++i];
-            char *       end           = nullptr;
+            const char * text = argv[++i];
+            // The README contract is "pure decimal integer": no sign, no
+            // leading zero, no surrounding whitespace. strtoul alone would
+            // silently accept "+2000", " 2000" and "02000", turning a typo
+            // into a run of a different shape than the operator asked for.
+            if (text[0] < '1' || text[0] > '9') {
+                std::fprintf(stderr, "--rounds must be a positive integer up to %u, got: %s\n",
+                             std::numeric_limits<std::uint32_t>::max(), text);
+                return 2;
+            }
+            char * end                 = nullptr;
             errno                      = 0;
             const unsigned long parsed = std::strtoul(text, &end, 10);
-            if (errno != 0 || *text == '\0' || *end != '\0' || parsed == 0 ||
-                parsed > std::numeric_limits<std::uint32_t>::max()) {
+            if (errno != 0 || *end != '\0' || parsed == 0 || parsed > std::numeric_limits<std::uint32_t>::max()) {
                 std::fprintf(stderr, "--rounds must be a positive integer up to %u, got: %s\n",
                              std::numeric_limits<std::uint32_t>::max(), text);
                 return 2;

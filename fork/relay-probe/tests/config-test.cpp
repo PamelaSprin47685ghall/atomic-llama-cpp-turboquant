@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -91,6 +92,33 @@ void check_exclusive_write() {
     input.seekg(0);
     on_disk.assign((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     check(on_disk == content, "the original evidence must stay intact");
+
+    // A symlink at the target is refused too and stays a symlink: the
+    // documented contract is "an existing file or symlink is never
+    // replaced", not "an existing regular file".
+    const std::string  victim         = std::string(dir) + "/victim.json";
+    const std::string  alias          = std::string(dir) + "/alias.json";
+    const write_result victim_written = write_file_exclusive(victim, "{\"victim\":true}\n");
+    check(victim_written.code == 0, "victim write must succeed");
+    check(::symlink("victim.json", alias.c_str()) == 0, "symlink setup failed");
+    const write_result through_link = write_file_exclusive(alias, "{\"replaced\":true}\n");
+    check(through_link.code != 0, "a symlink target must not be replaced");
+    check(through_link.message.find("refusing") != std::string::npos, "the symlink refusal must be explained");
+    struct stat link_info{};
+    check(::lstat(alias.c_str(), &link_info) == 0 && S_ISLNK(link_info.st_mode), "the symlink must survive");
+    input.close();
+    input.open(victim);
+    on_disk.assign((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    check(on_disk == "{\"victim\":true}\n", "the victim file must stay intact");
+    check(::unlink(alias.c_str()) == 0 && ::unlink(victim.c_str()) == 0, "symlink test cleanup failed");
+
+    // A path whose directory does not exist refuses cleanly with a message
+    // naming the temporary file creation failure, not a crash or a stray
+    // file somewhere else.
+    const write_result missing_dir = write_file_exclusive(std::string(dir) + "/no/such/evidence.json", content);
+    check(missing_dir.code != 0, "a missing directory must be refused");
+    check(missing_dir.message.find("cannot exclusively create") != std::string::npos,
+          "the missing-directory refusal must be explained");
 
     // No temporary names may remain, and the directory must contain exactly
     // the one published file.

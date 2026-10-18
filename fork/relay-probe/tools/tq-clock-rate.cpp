@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -63,9 +64,20 @@ bool wait_bounded(hipEvent_t event) {
     }
 }
 
+// The kernel publishes its spent tick count through this word; the host
+// reads it only after the stream event completes, and the acquire keeps the
+// read ordered exactly like the probe's own control words (LEMMA 1).
+std::uint64_t acquire_load(const std::uint64_t * word) {
+    return __atomic_load_n(word, __ATOMIC_ACQUIRE);
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0)) {
+        std::printf("usage: %s\n", argv[0]);
+        return 0;
+    }
     if (argc > 1) {
         std::fprintf(stderr, "usage: %s\n", argv[0]);
         return 2;
@@ -91,8 +103,21 @@ int main(int argc, char ** argv) {
             continue;
         }
         std::uint64_t * out = nullptr;
-        if (hipHostMalloc(&out, sizeof(std::uint64_t), hipHostMallocDefault) != hipSuccess) {
+        // The device writes this word, so it must be mapped host memory by
+        // contract. hipHostMallocDefault is pinned but not device-mappable;
+        // this machine happens to let the write land anyway (flags=0), which
+        // is exactly the platform-accident class the probe exists to refuse
+        // (AXIOM 1). Request mapped memory and verify the flag per device.
+        if (hipHostMalloc(&out, sizeof(std::uint64_t), hipHostMallocMapped | hipHostMallocPortable) != hipSuccess) {
             std::fprintf(stderr, "device %d (%s): host allocation failed\n", ordinal, props.name);
+            ++failures;
+            continue;
+        }
+        unsigned int flags = 0;
+        if (hipHostGetFlags(&flags, out) != hipSuccess || (flags & hipHostMallocMapped) == 0) {
+            std::fprintf(stderr, "device %d (%s): host allocation is not device-mapped (flags 0x%x)\n", ordinal,
+                         props.name, flags);
+            (void) hipHostFree(out);
             ++failures;
             continue;
         }
@@ -106,7 +131,7 @@ int main(int argc, char ** argv) {
         std::vector<double> rates;
         rates.reserve(PASSES);
         for (int pass = 0; pass < PASSES; ++pass) {
-            *out             = 0;
+            __atomic_store_n(out, 0, __ATOMIC_RELAXED);
             const auto begin = std::chrono::steady_clock::now();
             spin_then_write<<<1, 64>>>(TICKS_PER_PASS, out);
             const bool   done = wait_bounded(event);
@@ -118,14 +143,15 @@ int main(int argc, char ** argv) {
                 rates.clear();
                 break;
             }
-            if (*out < TICKS_PER_PASS) {
+            const std::uint64_t ticks = acquire_load(out);
+            if (ticks < TICKS_PER_PASS) {
                 std::fprintf(stderr, "device %d (%s): kernel reported fewer ticks than requested\n", ordinal,
                              props.name);
                 ++failures;
                 rates.clear();
                 break;
             }
-            rates.push_back(wall_ms > 0.0 ? static_cast<double>(*out) / wall_ms / 1000.0 : 0.0);
+            rates.push_back(wall_ms > 0.0 ? static_cast<double>(ticks) / wall_ms / 1000.0 : 0.0);
         }
         (void) hipEventDestroy(event);
         (void) hipHostFree(out);
