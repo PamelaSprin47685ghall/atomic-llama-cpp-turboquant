@@ -4,12 +4,12 @@
   "files": [
     {
       "path": "common/arg.cpp",
-      "sha256": "730c8c845a43b24be4bb4656ff7765ba1f5ae5fc6f315db792666268e0011ec9",
+      "sha256": "d395a1d926266275ec5df0c6d7e9e72bed221a5e9e7c4b74d84475470c19377f",
       "mode": "100644",
       "consumers": [
         "tools/server"
       ],
-      "reason": "Expose and store explicit physical unified KV capacity independently of the logical context window.",
+      "reason": "Expose explicit physical KV and prefill/phase switches; old auto-fit is deliberately not imported.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
@@ -24,12 +24,12 @@
     },
     {
       "path": "common/common.h",
-      "sha256": "2a79faf24dcfb823f16d8d071075b46a068c1d85e706424105ccac0375db4410",
+      "sha256": "0572a4e92cd211a5ac2ce22c1430bd23998e2e1b347a2f3af4e3e04e6a4be7f2",
       "mode": "100644",
       "consumers": [
         "tools/server"
       ],
-      "reason": "Expose and store explicit physical unified KV capacity independently of the logical context window.",
+      "reason": "Store explicit physical KV, sticky prefill policy and optional phase release configuration.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
@@ -141,6 +141,16 @@
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
+      "path": "tools/server/server-context.cpp",
+      "sha256": "a5892b7e9101f08a05769387758e736c038bc22fd70afad43d9b07f013041e2d",
+      "mode": "100644",
+      "consumers": [
+        "stock llama-server"
+      ],
+      "reason": "Keep sticky prefill selection and phase fences in the existing private server loop; this is an explicit orchestration exception.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
       "path": "tools/server/server-task.h",
       "sha256": "1505c19411c4dc0d5a498ff5dab554bee01e9324ab542f6e2740106c38679a7e",
       "mode": "100644",
@@ -148,6 +158,16 @@
         "stock llama-server task values"
       ],
       "reason": "Initialize slot action ID to -1 so ordinary task moves do not copy an indeterminate integer.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "tools/server/server.cpp",
+      "sha256": "603018e5ae36a41ca4abbf45bdf0efebb73027a1f7e6a4ce338aa2a53c0c35a3",
+      "mode": "100644",
+      "consumers": [
+        "stock llama-server"
+      ],
+      "reason": "Reject phase release with disabled prefill priority or the incompatible shared CUDA phase arena.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     }
   ]

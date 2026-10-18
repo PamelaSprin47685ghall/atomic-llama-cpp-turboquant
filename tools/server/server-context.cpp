@@ -3339,11 +3339,52 @@ private:
         }
     }
 
+    // This small policy remains in the original server loop. The independent
+    // batch composer implements the same contract through TQScheduling.
+    int32_t prefill_slot_id = -1;
+    bool inference_is_prefill = false;
+
+    void select_inference_phase() {
+        if (!params_base.prefill_priority) return;
+        const auto needs_prefill = [](const server_slot & slot) {
+            return slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
+        };
+        bool current_is_live = false;
+        for (const auto & slot : slots) {
+            if (slot.id == prefill_slot_id && needs_prefill(slot)) current_is_live = true;
+        }
+        if (!current_is_live) {
+            prefill_slot_id = -1;
+            for (const auto & slot : slots) {
+                if (needs_prefill(slot)) {
+                    prefill_slot_id = slot.id;
+                    break;
+                }
+            }
+        }
+        const bool next_is_prefill = prefill_slot_id >= 0;
+        if (next_is_prefill != inference_is_prefill) {
+            llama_synchronize(ctx_tgt);
+            if (ctx_dft) llama_synchronize(ctx_dft);
+            if (params_base.phase_memory) {
+                if (!llama_memory_release_compute(ctx_tgt) ||
+                    (ctx_dft && !llama_memory_release_compute(ctx_dft))) {
+                    throw std::runtime_error("cannot release compute workspace for this context");
+                }
+            }
+            inference_is_prefill = next_is_prefill;
+            SRV_INF("inference phase = %s, prompt slot = %d\n",
+                    inference_is_prefill ? "prefill" : "generation", prefill_slot_id);
+        }
+    }
+
     void pre_decode() {
+        select_inference_phase();
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+                if (params_base.prefill_priority && inference_is_prefill) return;
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -3419,6 +3460,7 @@ private:
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
+            if (params_base.prefill_priority && inference_is_prefill) return;
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
@@ -3483,7 +3525,9 @@ private:
 
         // generate the actual drafts (if any)
         {
-            common_speculative_draft(spec.get());
+            if (!params_base.prefill_priority || !inference_is_prefill) {
+                common_speculative_draft(spec.get());
+            }
         }
 
         // make checkpoints if needed
@@ -3551,6 +3595,8 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
+                if (params_base.prefill_priority &&
+                    (!inference_is_prefill || slot.id != prefill_slot_id)) return;
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }

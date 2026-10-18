@@ -193,6 +193,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_parallel = 4;
             params.kv_unified = true;
         }
+        if (params.phase_memory && (!params.prefill_priority || params.kv_stream_arena_mib != 0)) {
+            SRV_ERR("%s", "--phase-memory requires --prefill-priority and no shared CUDA phase arena\n");
+            return 1;
+        }
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias

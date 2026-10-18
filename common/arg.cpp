@@ -1625,6 +1625,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TOTAL_KV"));
     add_opt(common_arg(
+        {"--prefill-priority"}, {"--no-prefill-priority"},
+        "finish one prompt before advancing generation (default: enabled)",
+        [](common_params & params, bool value) {
+            params.prefill_priority = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--phase-memory"}, {"--no-phase-memory"},
+        "release compute workspace between prefill and generation (default: disabled; requires prefill priority)",
+        [](common_params & params, bool value) {
+            params.phase_memory = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION
