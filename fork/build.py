@@ -68,6 +68,11 @@ def main():
 
     for name in ("sampling", "corpus", "scheduling", "text", "calibration", "relay"):
         module(name)
+    # The relay platform probe has no installable package: its evidence lives
+    # in the build directory by policy, and its HIP executable exists only
+    # when a HIP toolchain is present. The GPU-free config tests build and
+    # run everywhere, so the probe's plumbing is covered by this pipeline.
+    module("relay-probe", install=False)
     for name in ("compose", "corpus-compose", "batch-compose", "logits-compose", "imatrix-compose"):
         module(name, installed_dependencies=True)
     if not args.no_test:

@@ -65,6 +65,13 @@ struct case_record {
     std::string detail;
 };
 
+// Per-rank records for the five-rank case (guide 47.1): the failed rank
+// carries the attribution detail; the others record that they participated
+// but the case failed. `failed_rank == 5` is the "not a specific rank"
+// sentinel used when the failure cannot be pinned to one device (e.g. the
+// shared host allocation itself failed). Ranks are always 0..4.
+std::vector<case_record> five_rank_case_records(const std::string & detail, std::uint32_t failed_rank);
+
 struct device_record {
     std::int32_t             ordinal = -1;
     std::string              name;

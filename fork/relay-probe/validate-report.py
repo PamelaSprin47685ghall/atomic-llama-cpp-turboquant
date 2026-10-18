@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""Strict evidence validator for TQRelayProbe reports and bench files.
+
+Guide 53.4: a qualification result is trustworthy only if its terminal state
+is internally consistent. This script is the machine-checkable version of
+that contract, meant for the operator on the real machine: after a run,
+validate the report (and bench file, if produced) before shipping them back.
+It checks structure, types, and every cross-field invariant the probe writer
+guarantees; it does not interpret platform facts.
+
+Usage:
+  validate-report.py REPORT [BENCH]     exit 0: both valid; 1: invalid; 2: usage
+  validate-report.py --self-test        verify the validator itself, no files
+
+The validator is strict on purpose: it knows the exact field set of
+schema=1 as written by src/evidence.cpp, rejects duplicate keys, non-finite
+or non-integer numbers, trailing data, and unknown fields. A future writer
+that adds fields must bump the schema or extend this validator; that
+drift must be loud, because evidence identity is part of the deliverable.
+"""
+
+import json
+import sys
+
+REPORT_TARGET = "tp5-mapped-relay"
+BENCH_TARGET = "tp5-relay-bench"
+
+# Case registry order of src/evidence.cpp. Names are part of the evidence
+# record: renumbering or renaming changes what an old report can claim, so
+# this list only grows at the end.
+REGISTRY = [
+    "device_identity",
+    "mapped_host_access",
+    "cpu_to_gpu_publish",
+    "gpu_to_cpu_publish",
+    "producer_delay_ordering",
+    "ticket_semantics",
+    "multi_group_completion",
+    "abort_stop",
+    "host_system_rmw_u64_add",
+    "host_system_rmw_u64_cas",
+    "five_rank_cross_device",
+    "multi_consumer_output_credit",
+    "delayed_consumer_ordering",
+    "two_bank_rotation",
+    "varying_live_bytes",
+    "five_stream_relay_cycle",
+    "offset_addressing",
+    "multi_group_ordering",
+]
+
+# Every healthy device record carries every case except the five-rank one,
+# which exists only when exactly five devices ran it (guide 31.7).
+BASE_CASES = [name for name in REGISTRY if name != "five_rank_cross_device"]
+
+# The two system-RMW bits are independent capability observations, not
+# qualification gates (probe AGENTS.md LEMMA 2); every other case must pass
+# on every device for qualification=pass. This mirrors run_probe's gate.
+MANDATORY_CASES = [
+    name for name in BASE_CASES
+    if name not in ("host_system_rmw_u64_add", "host_system_rmw_u64_cas")
+]
+
+OUTCOMES = {"pass", "fail", "unsupported", "not_run"}
+
+
+class EvidenceError(ValueError):
+    pass
+
+
+def fail(message):
+    raise EvidenceError(message)
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail("duplicate key %r" % key)
+        value[key] = item
+    return value
+
+
+def reject_constant(text):
+    fail("non-finite JSON number %r" % text)
+
+
+def load_strict(path):
+    with open(path, "rb") as source:
+        data = source.read()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("not UTF-8")
+    try:
+        value = json.loads(text, object_pairs_hook=unique_object,
+                           parse_constant=reject_constant)
+    except EvidenceError:
+        raise
+    except json.JSONDecodeError as error:
+        fail("invalid JSON: %s" % error)
+    return value
+
+
+def require_dict(value, where):
+    if type(value) is not dict:
+        fail("%s must be an object" % where)
+    for key in value:
+        if type(key) is not str:
+            fail("%s has a non-string field name" % where)
+
+
+def require_int(value, where):
+    if type(value) is not int or type(value) is bool:
+        fail("%s must be an integer, not a bool or float" % where)
+    if not 0 <= value <= (1 << 64) - 1:
+        fail("%s must be a uint64" % where)
+
+
+def require_str(value, where, nonempty=False):
+    if type(value) is not str:
+        fail("%s must be a string" % where)
+    if nonempty and not value:
+        fail("%s must not be empty" % where)
+
+
+def require_keys(value, expected, where):
+    actual = set(value.keys())
+    if actual != set(expected):
+        missing = sorted(set(expected) - actual)
+        extra = sorted(actual - set(expected))
+        message = "%s has the wrong field set" % where
+        if missing:
+            message += " (missing %s)" % ", ".join(missing)
+        if extra:
+            message += " (unknown %s)" % ", ".join(extra)
+        fail(message)
+
+
+def validate_device(device, index, device_count):
+    require_dict(device, "devices[%d]" % index)
+    require_keys(device, [
+        "rank", "pci_bdf", "reported_name", "gcn_arch_name",
+        "total_vram_bytes", "can_map_host_memory", "cases",
+    ], "devices[%d]" % index)
+    require_int(device["rank"], "devices[%d].rank" % index)
+    if device["rank"] != index:
+        fail("devices[%d].rank=%r must equal its index" % (index, device["rank"]))
+    require_str(device["pci_bdf"], "devices[%d].pci_bdf" % index)
+    require_str(device["reported_name"], "devices[%d].reported_name" % index)
+    require_str(device["gcn_arch_name"], "devices[%d].gcn_arch_name" % index)
+    require_int(device["total_vram_bytes"], "devices[%d].total_vram_bytes" % index)
+    if type(device["can_map_host_memory"]) is not bool:
+        fail("devices[%d].can_map_host_memory must be a bool" % index)
+    cases = device["cases"]
+    require_dict(cases, "devices[%d].cases" % index)
+    expected = set(BASE_CASES)
+    if device_count == 5:
+        expected.add("five_rank_cross_device")
+    actual = set(cases.keys())
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        message = "devices[%d].cases has the wrong case set" % index
+        if missing:
+            message += " (missing %s)" % ", ".join(missing)
+        if extra:
+            message += " (unknown %s)" % ", ".join(extra)
+        fail(message)
+    for name, entry in cases.items():
+        require_dict(entry, "devices[%d].cases.%s" % (index, name))
+        require_keys(entry, ["result", "detail"], "devices[%d].cases.%s" % (index, name))
+        require_str(entry["result"], "devices[%d].cases.%s.result" % (index, name))
+        if entry["result"] not in OUTCOMES:
+            fail("devices[%d].cases.%s has an invalid result %r" % (index, name, entry["result"]))
+        require_str(entry["detail"], "devices[%d].cases.%s.detail" % (index, name), nonempty=True)
+    identity = cases["device_identity"]["result"]
+    if identity == "pass":
+        if not device["pci_bdf"] or not device["reported_name"] or not device["gcn_arch_name"]:
+            fail("devices[%d] passed device_identity but lacks identity fields" % index)
+        if device["total_vram_bytes"] == 0:
+            fail("devices[%d].total_vram_bytes must be nonzero for a healthy device" % index)
+    return cases
+
+
+def expected_qualification(devices, five_rank_status):
+    if not devices:
+        return "fail"
+    for index, device in enumerate(devices):
+        for name in MANDATORY_CASES:
+            if device["cases"][name]["result"] != "pass":
+                return "fail"
+    if len(devices) == 5 and five_rank_status != "pass":
+        return "fail"
+    return "pass"
+
+
+def validate_report(value):
+    require_dict(value, "report")
+    require_keys(value, [
+        "schema", "target", "build_id", "hip_runtime_version",
+        "hip_runtime_version_string", "compiler_version", "host_arch",
+        "control_word_bits", "memory_flags_requested", "hot_reuse_rounds",
+        "devices", "five_rank_status", "five_rank_detail", "qualification",
+        "qualification_detail", "limits",
+    ], "report")
+    require_int(value["schema"], "schema")
+    if value["schema"] != 1:
+        fail("schema must be 1")
+    require_str(value["target"], "target", nonempty=True)
+    if value["target"] != REPORT_TARGET:
+        fail("target must be %r" % REPORT_TARGET)
+    require_str(value["build_id"], "build_id", nonempty=True)
+    require_int(value["hip_runtime_version"], "hip_runtime_version")
+    require_str(value["hip_runtime_version_string"], "hip_runtime_version_string", nonempty=True)
+    require_str(value["compiler_version"], "compiler_version", nonempty=True)
+    require_str(value["host_arch"], "host_arch", nonempty=True)
+    require_int(value["control_word_bits"], "control_word_bits")
+    if value["control_word_bits"] != 64:
+        fail("control_word_bits must be 64")
+    require_str(value["memory_flags_requested"], "memory_flags_requested", nonempty=True)
+    require_int(value["hot_reuse_rounds"], "hot_reuse_rounds")
+    if value["hot_reuse_rounds"] == 0:
+        fail("hot_reuse_rounds must be positive")
+    devices = value["devices"]
+    if type(devices) is not list:
+        fail("devices must be an array")
+    device_count = len(devices)
+    parsed = [validate_device(device, index, device_count)
+              for index, device in enumerate(devices)]
+
+    status = value["five_rank_status"]
+    require_str(status, "five_rank_status", nonempty=True)
+    require_str(value["five_rank_detail"], "five_rank_detail")
+    if device_count > 0 and not value["five_rank_detail"]:
+        fail("five_rank_detail must not be empty when devices ran")
+    if device_count == 5:
+        if status not in ("pass", "fail"):
+            fail("five_rank_status must be pass or fail when five devices ran")
+        for index, cases in enumerate(parsed):
+            result = cases["five_rank_cross_device"]["result"]
+            wanted = "pass" if status == "pass" else "fail"
+            if result != wanted:
+                fail("devices[%d].five_rank_cross_device=%r disagrees with five_rank_status=%r"
+                     % (index, result, status))
+    else:
+        if status != "not_run":
+            fail("five_rank_status must be not_run when %d devices ran" % device_count)
+
+    qualification = value["qualification"]
+    require_str(qualification, "qualification", nonempty=True)
+    if qualification not in OUTCOMES:
+        fail("qualification has an invalid result %r" % qualification)
+    require_str(value["qualification_detail"], "qualification_detail", nonempty=True)
+    expected = expected_qualification(devices, status)
+    if qualification != expected:
+        fail("qualification=%r but the case results require %r" % (qualification, expected))
+
+    limits = value["limits"]
+    if type(limits) is not list:
+        fail("limits must be an array")
+    for index, limit in enumerate(limits):
+        require_str(limit, "limits[%d]" % index, nonempty=True)
+
+
+def validate_bench(value):
+    require_dict(value, "bench")
+    require_keys(value, [
+        "schema", "target", "build_id", "hip_runtime_version_string",
+        "device_ordinal", "device_name", "gcn_arch_name", "rounds",
+        "measurements", "limits",
+    ], "bench")
+    require_int(value["schema"], "schema")
+    if value["schema"] != 1:
+        fail("schema must be 1")
+    require_str(value["target"], "target", nonempty=True)
+    if value["target"] != BENCH_TARGET:
+        fail("target must be %r" % BENCH_TARGET)
+    require_str(value["build_id"], "build_id", nonempty=True)
+    require_str(value["hip_runtime_version_string"], "hip_runtime_version_string", nonempty=True)
+    require_int(value["device_ordinal"], "device_ordinal")
+    require_str(value["device_name"], "device_name", nonempty=True)
+    require_str(value["gcn_arch_name"], "gcn_arch_name", nonempty=True)
+    require_int(value["rounds"], "rounds")
+    if value["rounds"] == 0:
+        fail("rounds must be positive")
+    measurements = value["measurements"]
+    if type(measurements) is not list or not measurements:
+        fail("measurements must be a nonempty array")
+    seen = set()
+    for index, measurement in enumerate(measurements):
+        where = "measurements[%d]" % index
+        require_dict(measurement, where)
+        require_keys(measurement, ["name", "unit", "samples", "min", "median", "p90", "max"], where)
+        require_str(measurement["name"], where + ".name", nonempty=True)
+        if measurement["name"] in seen:
+            fail("%s repeats measurement name %r" % (where, measurement["name"]))
+        seen.add(measurement["name"])
+        require_str(measurement["unit"], where + ".unit", nonempty=True)
+        if measurement["unit"] not in ("ns", "bytes_per_second"):
+            fail("%s.unit must be ns or bytes_per_second" % where)
+        for field in ("samples", "min", "median", "p90", "max"):
+            require_int(measurement[field], where + "." + field)
+        if measurement["samples"] == 0:
+            fail("%s.samples must be positive" % where)
+        if not (measurement["min"] <= measurement["median"] <= measurement["p90"] <= measurement["max"]):
+            fail("%s must satisfy min <= median <= p90 <= max" % where)
+    limits = value["limits"]
+    if type(limits) is not list:
+        fail("limits must be an array")
+    for index, limit in enumerate(limits):
+        require_str(limit, "limits[%d]" % index, nonempty=True)
+
+
+# -------- self-test ---------------------------------------------------------
+
+def good_report(device_count=1, qualification=None):
+    if device_count == 5:
+        status, status_detail = "pass", "five devices each wrote a disjoint word"
+    elif device_count == 0:
+        status, status_detail = "not_run", ""
+    else:
+        status, status_detail = "not_run", "requires exactly five devices; %d present" % device_count
+    report = {
+        "schema": 1,
+        "target": REPORT_TARGET,
+        "build_id": "tq-relay-probe",
+        "hip_runtime_version": 70000204,
+        "hip_runtime_version_string": "7.2.4",
+        "compiler_version": "amd clang",
+        "host_arch": "x86_64",
+        "control_word_bits": 64,
+        "memory_flags_requested": "mapped portable",
+        "hot_reuse_rounds": 2000,
+        "devices": [],
+        "five_rank_status": status,
+        "five_rank_detail": status_detail,
+        "qualification": "pass",
+        "qualification_detail": "all mandatory cases passed",
+        "limits": ["probe scope"],
+    }
+    for index in range(device_count):
+        cases = {}
+        for name in BASE_CASES:
+            if name == "device_identity":
+                result, detail = "pass", "mapped_host_memory_supported=1"
+            elif name == "host_system_rmw_u64_add":
+                result, detail = "fail", "produced a wrong value (448 instead of 7)"
+            else:
+                result, detail = "pass", "detail"
+            cases[name] = {"result": result, "detail": detail}
+        if device_count == 5:
+            cases["five_rank_cross_device"] = {"result": "pass", "detail": "rank %d of 5 wrote" % index}
+        report["devices"].append({
+            "rank": index,
+            "pci_bdf": "0000:0%d:00.0" % index,
+            "reported_name": "AMD Radeon RX 6800",
+            "gcn_arch_name": "gfx1030",
+            "total_vram_bytes": 1 << 34,
+            "can_map_host_memory": True,
+            "cases": cases,
+        })
+    if qualification is not None:
+        report["qualification"] = qualification
+    return report
+
+
+def good_bench():
+    return {
+        "schema": 1,
+        "target": BENCH_TARGET,
+        "build_id": "tq-relay-probe-bench",
+        "hip_runtime_version_string": "7.2.4",
+        "device_ordinal": 0,
+        "device_name": "AMD Radeon RX 6800",
+        "gcn_arch_name": "gfx1030",
+        "rounds": 2000,
+        "measurements": [
+            {"name": "host_publish_to_device_ack", "unit": "ns",
+             "samples": 2000, "min": 100, "median": 200, "p90": 300, "max": 400},
+        ],
+        "limits": ["observations, not gates"],
+    }
+
+
+def expect_invalid(label, mutate):
+    value = mutate()
+    try:
+        if label.startswith("bench:"):
+            validate_bench(value)
+        else:
+            validate_report(value)
+    except EvidenceError:
+        return
+    raise SystemExit("self-test failed: %s was accepted" % label)
+
+
+def expect_invalid_text(label, text, kind):
+    try:
+        value = load_strict_text(text)
+    except EvidenceError:
+        return
+    try:
+        if kind == "bench":
+            validate_bench(value)
+        else:
+            validate_report(value)
+    except EvidenceError:
+        return
+    raise SystemExit("self-test failed: %s was accepted" % label)
+
+
+def load_strict_text(text):
+    try:
+        return json.loads(text, object_pairs_hook=unique_object,
+                          parse_constant=reject_constant)
+    except EvidenceError:
+        raise
+    except json.JSONDecodeError as error:
+        fail("invalid JSON: %s" % error)
+
+
+def self_test():
+    validate_report(good_report(1))
+    validate_report(good_report(5))
+    validate_bench(good_bench())
+    # No-device report (device count 0 or enumeration failure) is a real
+    # writer output and must validate.
+    validate_report(good_report(0, qualification="fail"))
+
+    def with_case_change(index, name, mutation):
+        def mutate():
+            report = good_report(1)
+            cases = report["devices"][index]["cases"]
+            entry = cases[name]
+            mutated = dict(entry)
+            mutation(mutated)
+            cases[name] = mutated
+            return report
+        return mutate
+
+    expect_invalid("mandatory case fail without qualification fail",
+                   with_case_change(0, "cpu_to_gpu_publish", lambda e: e.update({"result": "fail"})))
+
+    def unknown_case():
+        report = good_report(1)
+        report["devices"][0]["cases"]["invented_case"] = {"result": "pass", "detail": "x"}
+        return report
+    expect_invalid("unknown case id", unknown_case)
+
+    def wrong_qualification_field():
+        return good_report(1, qualification="fail")
+    expect_invalid("qualification field disagreeing with case results", wrong_qualification_field)
+
+    def five_without_rank_case():
+        report = good_report(5)
+        del report["devices"][0]["cases"]["five_rank_cross_device"]
+        return report
+    expect_invalid("five devices missing the five-rank case", five_without_rank_case)
+
+    def five_rank_not_run():
+        report = good_report(5)
+        report["five_rank_status"] = "not_run"
+        return report
+    expect_invalid("five devices with five_rank not_run", five_rank_not_run)
+
+    def empty_detail_with_devices():
+        report = good_report(1)
+        report["five_rank_detail"] = ""
+        return report
+    expect_invalid("five_rank_detail empty while devices ran", empty_detail_with_devices)
+
+    def no_device_pass():
+        return good_report(0, qualification="pass")
+    expect_invalid("qualification pass with no devices", no_device_pass)
+
+    def single_device_rank_case():
+        report = good_report(1)
+        report["devices"][0]["cases"]["five_rank_cross_device"] = {"result": "pass", "detail": "x"}
+        return report
+    expect_invalid("five-rank case present with one device", single_device_rank_case)
+
+    def wrong_rank():
+        report = good_report(1)
+        report["devices"][0]["rank"] = 3
+        return report
+    expect_invalid("device rank not equal to index", wrong_rank)
+
+    def missing_pci():
+        report = good_report(1)
+        report["devices"][0]["pci_bdf"] = ""
+        return report
+    expect_invalid("healthy device without pci_bdf", missing_pci)
+
+    def bad_qualification_enum():
+        report = good_report(1)
+        report["qualification"] = "maybe"
+        return report
+    expect_invalid("qualification outside the outcome enum", bad_qualification_enum)
+
+    # Raw-text mutations exercise the strict loader itself.
+    base_text = json.dumps(good_report(1), indent=1)
+    expect_invalid_text("duplicate JSON key",
+                        base_text.replace('"schema": 1', '"schema": 1,\n "schema": 1'),
+                        "report")
+    expect_invalid_text("non-finite number",
+                        base_text.replace('"total_vram_bytes": 17179869184',
+                                          '"total_vram_bytes": NaN'),
+                        "report")
+    expect_invalid_text("bool where an integer belongs",
+                        base_text.replace('"hot_reuse_rounds": 2000',
+                                          '"hot_reuse_rounds": true'),
+                        "report")
+    expect_invalid_text("trailing data", base_text + " {}", "report")
+    bench_text = json.dumps(good_bench())
+    expect_invalid_text("bench min above median",
+                        bench_text.replace('"min": 100', '"min": 250'),
+                        "bench")
+    expect_invalid_text("bench unknown unit",
+                        bench_text.replace('"unit": "ns"', '"unit": "furlongs"'),
+                        "bench")
+    expect_invalid_text("bench duplicate measurement name",
+                        bench_text.replace('"limits": ["observations, not gates"]',
+                                           '"limits": ["observations, not gates"], "measurements":'
+                                           ' [{"name": "host_publish_to_device_ack", "unit": "ns",'
+                                           ' "samples": 1, "min": 1, "median": 1, "p90": 1, "max": 1}]'),
+                        "bench")
+    print("PASS: validator self-test")
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--self-test"]:
+        self_test()
+        return 0
+    if not 1 <= len(args) <= 2:
+        print("usage: validate-report.py REPORT [BENCH]", file=sys.stderr)
+        print("       validate-report.py --self-test", file=sys.stderr)
+        return 2
+    try:
+        report = load_strict(args[0])
+        validate_report(report)
+        print("valid: %s" % args[0])
+    except EvidenceError as error:
+        print("invalid: %s: %s" % (args[0], error))
+        return 1
+    if len(args) == 2:
+        try:
+            bench = load_strict(args[1])
+            validate_bench(bench)
+            print("valid: %s" % args[1])
+        except EvidenceError as error:
+            print("invalid: %s: %s" % (args[1], error))
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

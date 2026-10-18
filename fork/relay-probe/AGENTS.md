@@ -35,7 +35,7 @@
    双 bank 轮换、可变有效长度、非零偏移内部槽、五流 RELAY 环与五卡用例分别
    实现并有独立结果。
    Proof: `src/main.cpp` 的各 case 函数；本机全量运行报告 SHA-256
-   3ff3a3b62dcb6c668d1792484189ff009aa24ed024180148393581816c5f03a6
+   75dbd439ab9bc04a00fbc7f4dbb6a9da8e10f3f95e9918cf70d06c4c87ddec4c
    （RX 6800 / gfx1030，ROCm 7.2.4，2026-10-19，18 用例注册表）。16 用例报告
    0cdd86bd…9cb8a 与 12 用例报告 9d1d1429…684112 保留为被取代的历史身份。
 2. [AXIOM 3] 证据报告是严格 JSON、排他创建；设备数不等于 5 时五卡用例保持
@@ -49,7 +49,7 @@
    测量结果写入独立的 `tp5.relay.bench.v1` 文件，不进入 qualification。
    Proof: `run_bench` 与 `summarize`；bench JSON 的严格序列化在
    `tests/config-test.cpp` 中覆盖；本机 bench 文件 SHA-256
-   062c28060bb8d31a930f0c954a2aa3069ad3045f2f887618cec3e3713a9de0ad。
+   29efb0c18a388e3a551435627d4649e2191b636542b9a46df05e4a83cc78e80d。
 
 5. [LEMMA 3] 设备等待是累计预算：clock64 实测 ~2.3 GHz（gfx1030，2026-10-19），
    预算 24e9 ticks ≈ 8 s，必须超过最长 host 截止期（5 s）；每轮只做短暂停后
@@ -76,13 +76,25 @@
    清除，链接成功后残留临时名不使证据失效。
    Proof: `evidence.cpp` 的 `write_file_exclusive`；
    `tests/config-test.cpp` 的 `check_exclusive_write` 覆盖首写成功、二次
-   拒绝、内容不变与无残留（无 GPU 即可运行）。
+   拒绝、内容不变与无残留（无 GPU 即可运行）。stdout 证据行同样按此精神
+   保全：无缓冲输出 + config-test 的 fork/SIGKILL 存活测试，重定向运行被
+   杀不丢已打印行。
+9. [AXIOM 3] 证据文件的终态一致性由独立校验器机器检查（指南 53.4）：
+   `validate-report.py` 对报告与 bench 执行严格 JSON 解析（拒绝重复键、
+   非有限数、未知字段与尾随数据）并重算全部交叉不变量——注册表覆盖、
+   rank 与下标一致、five_rank 状态与设备数一致、qualification 与逐用例
+   结果一致、bench 序统计单调。未来字段变化必须升 schema 或改校验器，
+   不允许静默漂移。
+   Proof: `validate-report.py` 的 `--self-test` 与两份本机权威证据实测
+   通过；真机证据归档前必须通过校验。
 
 # Exceptions
 
 - 本目录不是独立 B 库：它声明依赖 HIP 运行时与 ROCm 工具链，只在 GPU 机器上
-  构建探针可执行文件；证据配置测试无此依赖。解除条件：无——平台资格探针天然
-  依赖平台工具链；它不进入 fork/build.py 与 isolation.py 的默认流水线。
+  构建探针可执行文件；证据配置测试无此依赖。`fork/build.py` 默认流水线已构建
+  并运行无 GPU 的 config-test（有 ROCm 工具链时顺带构建探针可执行文件）；
+  isolation.py 仍排除本目录，因为无 HIP 时没有可安装 target，重装级隔离验收
+  不覆盖平台工具。解除条件：无——平台资格探针天然依赖平台工具链。
 - gfx1030 host fetch_add 的错误值行为按本机观察记录，不代表其他 ROCm 版本或
   拓扑；每次换工具链或拓扑后重跑，旧报告不延续。
 - clang-tidy 在 HIP 代码上存在已知误报，不逐一 NOLINT：`misc-include-cleaner`

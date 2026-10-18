@@ -4,11 +4,14 @@
 #include "evidence.h"
 
 #include <dirent.h>
+#include <signal.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -90,6 +93,41 @@ void check_exclusive_write() {
     check(rmdir(dir) == 0, "test cleanup rmdir failed");
 }
 
+// The README tells the operator that stdout can restore evidence when the
+// process is killed mid-run. That claim rests on the probe's stdout mode:
+// with _IONBF the C standard requires each write to be transmitted to the
+// destination as soon as possible, so a SIGKILL after a completed line
+// cannot lose it. This test kills a child exactly like that and checks the
+// file, pinning the contract to the libc this project runs on.
+void check_stdout_kill_survival() {
+    char   dir_template[] = "/tmp/tq-relay-probe-stdout-XXXXXX";
+    char * dir            = mkdtemp(dir_template);
+    check(dir != nullptr, "mkdtemp failed");
+    const std::string path  = std::string(dir) + "/out.txt";
+    const pid_t       child = fork();
+    check(child >= 0, "fork failed");
+    if (child == 0) {
+        FILE * out = std::freopen(path.c_str(), "w", stdout);
+        if (out == nullptr) {
+            _exit(2);
+        }
+        (void) setvbuf(stdout, nullptr, _IONBF, 0);
+        std::printf("survives-kill line\n");
+        // Die before exit-time flushing or any buffer fill could help.
+        (void) raise(SIGKILL);
+        _exit(1);
+    }
+    int status = 0;
+    check(waitpid(child, &status, 0) == child, "waitpid failed");
+    check(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "child must die by SIGKILL");
+    std::ifstream     input(path);
+    const std::string content((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    check(content.find("survives-kill line") != std::string::npos,
+          "stdout written before the kill must survive SIGKILL");
+    check(unlink(path.c_str()) == 0, "stdout test unlink failed");
+    check(rmdir(dir) == 0, "stdout test rmdir failed");
+}
+
 void check_bench_json() {
     bench_report report;
     report.schema                     = 1;
@@ -126,6 +164,44 @@ void check_patterns() {
     check(pattern_word(1, 0, 7) != pattern_word(1, 1, 7), "index must change the pattern");
     check(pattern_word(1, 0, 7) != pattern_word(2, 0, 7), "generation must change the pattern");
     check(pattern_word(1, 0, 7) != pattern_word(1, 0, 8), "seed must change the pattern");
+}
+
+void check_five_rank_records() {
+    // Success: five pass records with the per-rank wording.
+    const auto passed = five_rank_case_records("", 5);
+    check(passed.size() == 5, "success must produce five records");
+    for (std::size_t rank = 0; rank < passed.size(); ++rank) {
+        check(passed[rank].id == case_id::five_rank_cross_device, "record id must be the five-rank case");
+        check(passed[rank].result == outcome::pass, "success records must pass");
+        check(passed[rank].detail.find("rank " + std::to_string(rank) + " of 5") != std::string::npos,
+              "success detail must name the rank");
+    }
+
+    // Failure pinned to rank 2: that record carries the raw attribution,
+    // the others the participated wording.
+    const std::string failure = "rank 2 drain failed: an error";
+    const auto        failed  = five_rank_case_records(failure, 2);
+    check(failed.size() == 5, "failure must produce five records");
+    for (std::size_t rank = 0; rank < failed.size(); ++rank) {
+        check(failed[rank].result == outcome::fail, "failure records must fail");
+        if (rank == 2) {
+            check(failed[rank].detail == failure, "the failed rank must carry the raw attribution");
+        } else {
+            check(failed[rank].detail ==
+                      "rank " + std::to_string(rank) + " of 5 participated; case failed (see five_rank_detail)",
+                  "non-failed ranks must carry the participated wording");
+        }
+    }
+
+    // Sentinel: the failure is not pinned to a specific rank, so every
+    // record uses the participated wording and none claims the attribution.
+    const auto unpinned = five_rank_case_records("guard word changed in round 3", 5);
+    check(unpinned.size() == 5, "unpinned failure must produce five records");
+    for (const auto & record : unpinned) {
+        check(record.result == outcome::fail, "unpinned failure records must fail");
+        check(record.detail.find("participated; case failed") != std::string::npos,
+              "unpinned failure must not be attributed to a rank");
+    }
 }
 
 void check_json() {
@@ -175,9 +251,11 @@ int main() {
     try {
         check_case_registry();
         check_patterns();
+        check_five_rank_records();
         check_json();
         check_bench_json();
         check_exclusive_write();
+        check_stdout_kill_survival();
     } catch (const std::exception & error) {
         std::cerr << "FAIL: " << error.what() << "\n";
         return 1;

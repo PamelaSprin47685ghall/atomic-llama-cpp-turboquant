@@ -77,6 +77,23 @@ std::size_t case_count() noexcept {
     return sizeof(case_names) / sizeof(case_names[0]);
 }
 
+std::vector<case_record> five_rank_case_records(const std::string & detail, std::uint32_t failed_rank) {
+    std::vector<case_record> records;
+    records.reserve(5);
+    for (std::uint32_t rank = 0; rank < 5; ++rank) {
+        if (detail.empty()) {
+            records.push_back({ case_id::five_rank_cross_device, outcome::pass,
+                                "rank " + std::to_string(rank) + " of 5 wrote a disjoint word; guards intact" });
+        } else {
+            records.push_back({ case_id::five_rank_cross_device, outcome::fail,
+                                rank == failed_rank ? detail :
+                                                      "rank " + std::to_string(rank) +
+                                                          " of 5 participated; case failed (see five_rank_detail)" });
+        }
+    }
+    return records;
+}
+
 std::string to_json(const probe_report & report) {
     std::string out;
     out += '{';

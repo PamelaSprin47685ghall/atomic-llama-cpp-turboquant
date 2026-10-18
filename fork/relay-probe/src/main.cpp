@@ -45,6 +45,7 @@ namespace {
 
 using tq::relay::probe::case_id;
 using tq::relay::probe::device_record;
+using tq::relay::probe::five_rank_case_records;
 using tq::relay::probe::outcome;
 using tq::relay::probe::pattern_word;
 using tq::relay::probe::probe_report;
@@ -1561,23 +1562,13 @@ outcome run_five_rank(std::vector<device_context> & contexts, probe_report & rep
         (void) hipHostFree(mem);
     }
 
-    if (failure.empty()) {
-        report.five_rank_detail = "five devices each wrote a disjoint word of one guarded host allocation for " +
-                                  std::to_string(rounds) + " rounds";
-        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-            report.devices[rank].cases.push_back(
-                { case_id::five_rank_cross_device, outcome::pass,
-                  "rank " + std::to_string(rank) + " of 5 wrote a disjoint word; guards intact" });
-        }
-    } else {
-        report.five_rank_detail = failure;
-        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-            report.devices[rank].cases.push_back(
-                { case_id::five_rank_cross_device, outcome::fail,
-                  rank == failed_rank ?
-                      failure :
-                      "rank " + std::to_string(rank) + " of 5 participated; case failed (see five_rank_detail)" });
-        }
+    report.five_rank_detail = failure.empty() ? "five devices each wrote a disjoint word of one guarded host "
+                                                "allocation for " +
+                                                    std::to_string(rounds) + " rounds" :
+                                                failure;
+    const auto records      = five_rank_case_records(failure, failed_rank);
+    for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+        report.devices[rank].cases.push_back(records[rank]);
     }
     return failure.empty() ? outcome::pass : outcome::fail;
 }
@@ -1762,6 +1753,15 @@ int write_report(const std::string & path, const probe_report & report) {
 static int run_probe(const std::string & output_path, const std::string & bench_path, std::uint32_t rounds);
 
 int main(int argc, char ** argv) {
+    // The run stdout is part of the operator's evidence path: if the process
+    // is killed mid-run, everything already printed must survive. A
+    // redirected stream is fully buffered by default and a kill would drop
+    // whatever is still in the buffer. _IONBF gives the C-standard "as soon
+    // as possible" guarantee for every stream, redirected or not, and the
+    // probe prints a handful of lines, so the syscall cost is irrelevant.
+    // The guarantee itself is pinned by the GPU-free config test
+    // check_stdout_kill_survival.
+    (void) setvbuf(stdout, nullptr, _IONBF, 0);
     std::string   output_path = "tq-relay-probe-report.json";
     std::string   bench_path;
     std::uint32_t rounds = DEFAULT_ROUNDS;
