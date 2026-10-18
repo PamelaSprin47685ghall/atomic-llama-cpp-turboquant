@@ -63,7 +63,8 @@
 | Prefill 优先、当前提示保持、槽位顺序 | **已迁入**独立 B 和真实 C；stock server 另有小补丁 | 不是 FIFO；连续提示可能令 Decode 饥饿，不能附带公平性承诺 |
 | PP 并发上限、初始 reserve 单序列图 | 独立候选 | 调度上的暂停不自动改变预分配峰值 |
 | `auto` fit、每设备 slack、预算求解 | 保留目的，旧 solver 不照搬 | 需要实际分配探测与失败结果；metadata-only 不能代替显存容量证明 |
-| idle LRU、admission、recurrent 物理槽、抢占恢复 | 独立候选 | 涉及真实所有权、引用、RNG 与部分输出，不能假装由一个 `--total-kv` 参数全部完成 |
+| 已知 token / 驻留槽位 admission | **已迁入**独立 B 预算和真实 C 队列 / 槽位复用 | owner domain / generation、先删除真实状态再回收；不能把容量值当作显存探测 |
+| idle LRU、recurrent 物理槽、抢占恢复 | 独立候选 | 涉及真实所有权、引用、RNG 与部分输出，不能假装由一个 `--total-kv` 参数全部完成 |
 | target / draft 跨 context 共池 | 暂不迁入完整旧实现 | 先闭合共享所有权和 fence 协议；当前 release 仅处理单 context 自有 compute |
 
 旧实现中还存在共享 allocator 被随后普通初始化覆盖、KEEP_CHUNKS 跳过 trim、输出 reserve 参数被覆盖等具体问题。应保留功能目的并重做必要合同，而不是因为旧代码有错就丢弃内存模型。
@@ -75,20 +76,20 @@
 | 小能力 | 当前状态与适合的职责 |
 |---|---|
 | corpus kind、timestamp、空请求、根节点、重复 / 前缀终点 | 已由 B 保留，并与未修改的旧生产 writer / reader 互操作；在线请求结束录制仍是 C 候选 |
-| 有界 logits reader、token 身份、完整行与 argmax 分开比较 | 已迁为独立标准库工具；同名 TP5 格式不要求私有运行时 |
+| 有界 logits reader、token 身份、完整行与 argmax 分开比较 | 已迁为独立标准库工具；新 C 通过公开 A 采集完整行。重复与行选择比较全部值，独立 C 只对照最终 greedy token / 最大 logit；同名 TP5 格式不要求私有运行时 |
 | task 可选槽位的默认值 | 已用一行 A 修复保留，避免移动普通 task 时读取未初始化整数 |
 | F16 V 下的显式 F32 累加 | 已用小型 CPU 修复保留，原 A 的真实用例失败、修复后通过 |
 | Turbo WHT 的小 group、scale、跨 workgroup 形状 | 已用两个文件修复，CPU / Vulkan 直接算子对照通过 |
 | 64 KiB scratch roundup、checked 容量 / 间接 dispatch、阶段 scratch 最大值 | 可独立成为拥有数值的 B；C / A 执行真实分配，容量算式不改变 dispatch 几何 |
-| 热槽 reserve / commit / release、generation 与 payload 身份 | 标准库元数据池是 B 候选；不等于 B 已接管 A tensor，外来 snapshot 还需校验 |
+| 热槽 reserve / commit / release、generation 与 payload 身份 | token / 槽位 reservation 已迁 B，带 domain / generation；热 KV payload 与 snapshot 身份仍是候选，不等于 B 已接管 A tensor |
 | 固定 state envelope、100-byte LE codec 描述、nonce / adapter / scope | 字节封装 B 与 A opaque state 的 C 包装候选；端序、空指针、持久身份与失败后输出合同须补齐 |
 | 每实例 Turbo 默认策略、统计格式化、严格 seed 解析 | 可与私有 runtime 分离；统计需要区分尝试、失败和成功产出 |
 | UTF-8 / stop 扫描、按 lane 拼完整行、增量 parser | 可作为标准字符串与字节流 B；多请求、多 choice、取消和完整 SSE 必须由真实 C 验证 |
 | 首次失败原因、输入 / 输出游标、请求预算和 usage | 保留状态合同；重试时 token 总数一致不能代替 RNG 与已经发送输出的恢复证明 |
 | 无符号 Hadamard / RoPE、RERoT 可见性 / GQA / DDVR 参考 | 独立数学 B 候选；与已修复的 signed Turbo WHT 有不同输入域和含义 |
 | mean / energy、online softmax M/L/O、稳定有限 mask compaction | 数学或局部 kernel 候选；局部正确性不能替代整模型稀疏 attention 质量 |
-| 单 cell recurrent buffer 清零、一般 strided 清零与前后 fence | M33 与旧性能文档均有独立记录；局部重置延迟改进有价值，当前尚需原 A 与多 cell 生命周期回归 |
-| 非对齐字节 memmove、meta 分片非零偏移、异步 readback 生命周期 | 应各自保留目的并构造真实后端用例；重叠、shared buffer、device fence 不能被包装器隐藏 |
+| 单 cell recurrent buffer 清零、一般 strided 清零与前后 fence | M33 减少的是旧 fork 的 eager clearing；当前 A 已整 buffer / lazy init，故不迁旧清零。新增 LFM2.5 hybrid、n_rs_seq=0 的真实生命周期回归；一般 GDN、strided 清零仍未取得资格 |
+| 非对齐字节 memmove、meta 分片非零偏移、异步 readback 生命周期 | Meta async 偏移已用 A +4/-4 与48个双 CPU child 用例迁入。memmove 与 GPU readback 仍独立；当前 A 没有旧 UID cache / pending retire 的优化前提，详见新 Meta 协议 |
 | 模型名称兼容、PLE uint64 hash、imatrix sum2 / expert counts | 独立模型 / 格式候选，须对齐 A 的实际元数据消费者；不整包复制图改动 |
 | 构建 / DSO 内容身份、完整请求、失败分级、离线容量与性能工具 | 保留证据工具职责；修正统计分母、非有限值、提前 PASS 和伪并发后才可作为验收 |
 
@@ -114,7 +115,7 @@
 
 TP5 / LateBind 有历史实质收益；RERoT、FlashPrefill、TriAttention、XKV 各有可拆的小能力。当前不引入其整条私有运行时，但不会把它们归成“无用”或借其他测试的通过宣称完成。旧实现及实验资料仍在归档提交中。
 
-当前工作分支提供三个独立 B、三个 C 与 16 个明确 A 文件例外，全部实际资格由 [VALIDATION.md](VALIDATION.md) 逐项给出。新增小行为按职责拆成提交；每个包含 A 变动的提交携带对应当时源码的完整文件摘要，不把未来状态的摘要提前塞入旧提交。
+当前工作分支提供三个独立 B、四个 C 与18个明确例外（17个 A 代码文件和1个自有 CI 文件），全部实际资格由 [VALIDATION.md](VALIDATION.md) 逐项给出。本轮新增证据另见 [发布候选说明](RELEASE-NOTES.md)，不改写上面的历史源码阅读深度。新增小行为按职责拆成提交；每个包含 A 变动的提交携带对应当时源码的完整文件摘要，不把未来状态的摘要提前塞入旧提交。
 
 ## 如何回查
 

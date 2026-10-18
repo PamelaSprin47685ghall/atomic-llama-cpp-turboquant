@@ -3,6 +3,16 @@
   "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
   "files": [
     {
+      "path": ".github/workflows/fork-extensions.yml",
+      "sha256": "e975f3af5399a42613670a8d810de7d76f9367316a3a64bb49b31a40afc9888c",
+      "mode": "100644",
+      "consumers": [
+        "fork package maintainers"
+      ],
+      "reason": "Run the fork boundary, reader, and installed-package qualification in a separate CI workflow without changing upstream build workflows.",
+      "removal_condition": "Remove when equivalent fork package checks are hosted outside the A repository or supplied by the selected upstream workflow."
+    },
+    {
       "path": "common/arg.cpp",
       "sha256": "d395a1d926266275ec5df0c6d7e9e72bed221a5e9e7c4b74d84475470c19377f",
       "mode": "100644",

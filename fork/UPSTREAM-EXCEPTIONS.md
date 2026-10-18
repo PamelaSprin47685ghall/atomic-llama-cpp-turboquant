@@ -46,11 +46,22 @@ not a sandbox for hostile build scripts.
   `tests/test-upstream-boundary.py` exercises real temporary Git repositories.
 - **SPEC:** default `tests/isolation.py` archives the pinned upstream commit,
   applies only the bytes captured by successful verification, builds A and its
-  public seam tests, then builds three B and three C projects independently using
+  public seam tests, then builds three B and four C projects independently using
   installed package exports. Intermediate source/build copies and original
   install prefixes are removed before relocated consumers run. Package/help
   checks prove build and loading boundaries; use `--model /absolute/model.gguf`
-  to additionally run the real batch and phase comparison after relocation.
+  to additionally run the real batch/phase comparison and teacher-forced logits
+  collection after relocation. The logits check also consumes the installed
+  batch program to check the same submitted prompt tokens, final maximum logit,
+  and selected token within 1e-5. This independent check does not obtain a second
+  full-vocabulary row; repeat tapes and scalar prefix/suffix controls compare all
+  vocabulary values.
+
+The current 18 entries comprise 17 upstream code files and one fork CI workflow.
+The workflow lives under `.github/workflows/` because GitHub requires that path;
+it is fork build infrastructure, not an inference-engine dependency. The Meta
+async offset fix adds no API and is justified by independent failing get/set
+regressions. Recurrent lifecycle qualification adds tests without changing A.
 
 `--a-prefix` is a convenience for repeated package work. The receipt labels it
 `reused_unverified`: the reused A package's source commit, overlay content, and
