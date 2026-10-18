@@ -52,7 +52,11 @@ std::uint64_t product(std::string field, std::uint64_t a, std::uint64_t b) {
 }
 
 std::uint64_t product(std::string field, std::uint64_t a, std::uint64_t b, std::uint64_t c) {
-    return product(std::move(field), product(field, a, b), c);
+    // Compute the inner product from a copy first: function argument
+    // evaluation order is unspecified, so moving field into the outer call
+    // must not race the inner read.
+    const std::uint64_t ab = product(field, a, b);
+    return product(std::move(field), ab, c);
 }
 
 std::uint64_t product(std::string field, std::uint64_t a, std::uint64_t b, std::uint64_t c, std::uint64_t d) {

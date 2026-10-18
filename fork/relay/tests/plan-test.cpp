@@ -163,6 +163,18 @@ void check_uint64_overflow() {
               out == std::numeric_limits<std::uint64_t>::max(),
           "boundary multiply rejected");
     check(tq::relay::detail::checked_add(0, 0, out) && out == 0, "zero add rejected");
+
+    // Regression for the three-factor checked product: the error field must
+    // survive the internal move. gate_up_weight_bytes = 2 * width * hrow
+    // overflows first here, before any other derived count.
+    auto three_factor           = baseline_spec();
+    three_factor.hidden         = static_cast<std::uint64_t>(1) << 32;
+    three_factor.intermediate   = 5ULL << 32;
+    three_factor.active_rows    = 1;
+    three_factor.block_elements = static_cast<std::uint64_t>(1) << 32;
+    three_factor.block_bytes    = static_cast<std::uint64_t>(1) << 32;
+    expect_rejection(three_factor, plan_decision::invalid, plan_error::size_overflow, "gate_up_weight_bytes",
+                     "three-factor overflow must name the intact error field");
 }
 
 void check_invalid_counts() {
