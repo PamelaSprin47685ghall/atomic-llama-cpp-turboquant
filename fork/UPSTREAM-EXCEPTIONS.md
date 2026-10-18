@@ -36,3 +36,24 @@ script nor isolation runner regenerates or accepts a hash for you. Run
 `python3 fork/check-upstream.py` before committing. The Git repository itself and
 its configuration are trusted inputs; this guard is a development boundary gate,
 not a sandbox for hostile build scripts.
+
+## Claims and executable evidence
+
+- **AXIOM:** the full upstream commit and the manifest entries have been reviewed.
+  A digest proves identity with those recorded bytes, not functional correctness.
+- **LEMMA:** the gate rejects undeclared changes and mismatched file content or
+  modes, including an unreviewed staged version hidden by a reviewed worktree.
+  `tests/test-upstream-boundary.py` exercises real temporary Git repositories.
+- **SPEC:** default `tests/isolation.py` archives the pinned upstream commit,
+  applies only the bytes captured by successful verification, builds A and its
+  public seam tests, then builds three B and three C projects independently using
+  installed package exports. Intermediate source/build copies and original
+  install prefixes are removed before relocated consumers run. Package/help
+  checks prove build and loading boundaries; use `--model /absolute/model.gguf`
+  to additionally run the real batch and phase comparison after relocation.
+
+`--a-prefix` is a convenience for repeated package work. The receipt labels it
+`reused_unverified`: the reused A package's source commit, overlay content, and
+build provenance have not been established by that run. Its public seam and
+consumer tests still run. Only the default archive/build path proves the stated
+source construction. Separate source copies are not an operating system sandbox.
