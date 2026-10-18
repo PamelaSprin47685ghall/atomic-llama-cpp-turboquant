@@ -43,13 +43,13 @@
    最后到达、确定性反序完成、abort、逐操作 RMW、五消费者 credit、延迟最后读者、
    双 bank 轮换、可变有效长度、非零偏移内部槽、五流 RELAY 环、有界同步超时路径、
    同流逆序依赖识别、双窗口独立前进、CPU 服务循环、非有限归约门、host 有界等待
-   无复用与五卡用例分别实现并有独立结果。
+   无复用、五卡核索引钉住与五卡用例分别实现并有独立结果。
    Proof: `src/main.cpp` 的各 case 函数；本机全量运行报告 SHA-256
-   b40dd9407791a9c3bd6719407b1c6197c75caf10827da52980fdc726a9586b26
-   （RX 6800 / gfx1030，ROCm 7.2.4，2026-10-19，24 用例注册表）。24 用例报告
-   01533600…fc73、21 用例报告 b6baeb81…f5be、19 用例报告 c0a21839…2e1f、
-   18 用例报告 75dbd439…dec4c、16 用例报告 0cdd86bd…9cb8a 与 12 用例报告
-   9d1d1429…684112 保留为被取代的历史身份。
+   65146f98ff167bc475d93d8a84fe17208b75ea491affb8e055c3caa13b2e4533
+   （RX 6800 / gfx1030，ROCm 7.2.4，2026-10-19，25 用例注册表）。24 用例报告
+   b40dd940…6b26 与 01533600…fc73、21 用例报告 b6baeb81…f5be、19 用例报告
+   c0a21839…2e1f、18 用例报告 75dbd439…dec4c、16 用例报告 0cdd86bd…9cb8a 与
+   12 用例报告 9d1d1429…684112 保留为被取代的历史身份。
 2. [AXIOM 3] 证据报告是严格 JSON、排他创建；设备数不等于 5 时五卡用例保持
    not_run；单机强制用例全部通过时 qualification=pass，且报告注明范围。
    Proof: `src/evidence.cpp` 与 `tests/config-test.cpp`；实际报告可由任意
@@ -75,13 +75,25 @@
    Proof: `wait_for_ack` / `wait_for_ticket` / `fail_case`；修复前 2000 轮
    预计数小时，修复后全量约 5 秒；`tools/tq-clock-rate.cpp` 本机实测
    median 2320.2 MHz（三次独立运行 2320.1–2320.4 MHz）。
-6. [LEMMA 5、6] 五卡跨设备用例在单卡机上不可能运行：它由 guard 三明治 + 每轮
-   变化的 payload + 逐 rank 失败归因构成，第一次执行只能在真实五卡机器上
-   发生；单卡回归只能证明该路径不改变单设备行为（five_rank 保持 not_run），
-   不能证明跨设备可见性。每个 rank 的成功或失败都登记进对应设备记录，
-   `five_rank_cross_device` 注册项因此可达。
-   Proof: `run_five_rank` / `rank_write_kernel`；2026-10-19 单卡 2000 轮
-   smoke qualification=pass、five_rank=not_run，不构成跨设备证据。
+6. [LEMMA 5、6] 五卡跨设备可见性在单卡机上不可能运行：它的第一次执行只能在
+   真实五卡机器上发生（five_rank 保持 not_run）。但它的逐 rank 索引不是：新增
+   单卡钉住用例 `five_rank_indexing` 用五条流跑与五卡用例完全相同的
+   `rank_write_kernel` 与 guard 布局，逐轮验证每个 rank 的 payload 与自己的
+   ready 字——两个用例共享同一套轮次协议 `run_rank_rounds`，五卡机上跑的循环
+   正是单卡钉住的那份代码。本批次审计先抓到真缺陷并修复：
+   `rank_write_kernel` 原先向基址发布 ready（全员踩写 ready[0]，rank 1–4 的
+   ready 永不到达，五卡机第一轮就会以 5 s 虚假 stall 归因失败）；修复为
+   `release_store(&ready[rank], generation)` 后，回注缺陷版被该用例在活设备上
+   确定性拒绝（"rank 1 did not publish ready in round 1 within 5 s"，退出 1）。
+   同时修掉两个相邻缺陷：run_five_rank 的 setup 失败预检查的是 setup 失败后
+   必被写正的 `record.ordinal < 0`（死条件），改为按 `device_identity` 结果与
+   `mapped` 能力位判定，坏卡在核启动前就被精确归因而不是跑出虚假超时；零设备
+   分支的退出码改为与枚举失败分支一致的 1。每个 rank 的成功或失败都登记进对应
+   设备记录，`five_rank_cross_device` 注册项因此可达。
+   Proof: `run_five_rank` / `run_rank_rounds` / `case_five_rank_indexing` /
+   `rank_write_kernel`；2026-10-19 单卡 2000 轮 qualification=pass、
+   five_rank=not_run、five_rank_indexing=pass，回注缺陷版的确定性拒绝已实测，
+   跨设备可见性仍不构成证据。
 7. [AXIOM 1、3] 单个 rank 或设备的 HIP 失败不抹掉已收集证据：HIP 错误是异常，
    逐用例捕获并记为对应 case 的 fail，setup 失败的设备以
    `device_identity=fail` 留在报告里，五卡用例在任何 HIP 失败下仍按 rank 归因
@@ -125,5 +137,10 @@
   `__atomic_*` 内建对参数写的写（release_store/rmw_probe_kernel）；
   `readability-static-accessed-through-instance` 把 HIP 的 `blockIdx` 兼容
   实体当实例；`portability-avoid-pragma-once` 与本仓 `#pragma once` 惯例
-  冲突（兄弟 B 库头同用）。真实告警（缺 include、未用 using、CLI 越界）已
-  修完；换 LLVM 版本后按此清单复查。
+  冲突（兄弟 B 库头同用）。此外有少量先于本目录存在、有明确理由的 C++ 风格
+  结论按同样方式登记：`misc-misplaced-const`（`const auto` 措辞是刻意选择）；
+  `bugprone-empty-catch`（两处 catch 主体是注释——注释即处理，检查器不看注释）；
+  `performance-no-automatic-move`（run_relay_round 的 8 词 optional 返回路径，
+  拷贝代价为零且 const 防误改）；`bugprone-suspicious-missing-comma`
+  （limits 里一处两行字符串字面量，连接文本已核对无误）。真实告警（缺 include、
+  未用 using、CLI 越界）已修完；换 LLVM 版本后按此清单复查。

@@ -45,6 +45,7 @@ enum class case_id {
     service_loop_independent_progress,
     nonfinite_reduction_gate,
     host_wait_deadline_no_reuse,
+    five_rank_indexing,
 };
 
 const char * case_name(case_id value) noexcept;

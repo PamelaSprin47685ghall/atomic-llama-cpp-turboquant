@@ -422,7 +422,13 @@ __global__ void rank_write_kernel(std::uint64_t * payload,
                                   std::uint64_t   generation) {
     payload[rank] = pattern_word(generation, rank, seed);
     device_fence_system();
-    release_store(ready, generation);
+    // Every rank owns its own ready word (guide 31.3 single-writer rule).
+    // Writing the base pointer would make all five ranks stomp ready[0] and
+    // leave ready[1..4] unpublished: the host would wait out the whole 5 s
+    // deadline every round and attribute a phantom stall to rank 1. The
+    // five_rank_indexing case runs this exact kernel on one device, so the
+    // indexing stays proven on every dev machine.
+    release_store(&ready[rank], generation);
 }
 
 // Acquire the exact ticket, read the whole slot, publish a per-consumer
@@ -691,6 +697,7 @@ constexpr case_id handshake_cases[] = {
     case_id::service_loop_independent_progress,
     case_id::nonfinite_reduction_gate,
     case_id::host_wait_deadline_no_reuse,
+    case_id::five_rank_indexing,
 };
 
 outcome result_of(const device_context & ctx, case_id id) {
@@ -2328,56 +2335,43 @@ struct five_rank_mem {
     std::uint64_t ready[RANKS];
 };
 
-// Caller guarantees exactly five devices. Each round: all five devices write
-// their disjoint words and release per-rank ready, the host observes ready
-// through acquire loads (running visibility), drains every stream, verifies
-// fragment provenance and guards, then resets for the next round. A dead or
-// misbehaving rank is attributed by rank and round; streams are always
-// drained before the allocation is touched again or freed.
-outcome run_five_rank(std::vector<device_context> & contexts, probe_report & report, std::uint32_t rounds) {
-    std::string              failure;
-    std::uint32_t            failed_rank     = RANKS;  // sentinel: not a specific rank
-    std::uint32_t            current_rank    = RANKS;
-    five_rank_mem *          mem             = nullptr;
-    std::vector<hipStream_t> streams         = std::vector<hipStream_t>(RANKS, nullptr);
-    std::uint32_t            streams_created = 0;
+// Per-rank execution binding for the shared five-rank rounds protocol.
+struct rank_stream {
+    hipStream_t   stream;   // owned by the caller
+    std::int32_t  ordinal;  // device ordinal for this rank (equal for all ranks in the single-device case)
+    std::uint32_t seed;     // per-rank payload seed
+};
 
-    // A HIP failure anywhere in this case is attributed and reported; it
-    // never aborts the process, because the five-rank evidence is exactly
-    // what the operator came to collect.
+// Shared five-rank rounds protocol (guide 39.5 H01): every generation, each
+// rank writes its disjoint payload word and its OWN ready word, the host
+// observes all five ready words through acquire loads (running visibility),
+// drains every stream, verifies fragment provenance and guards, then resets
+// for the next round. The five-device case runs it with one device per
+// rank; the per-device five_rank_indexing case runs it with five streams on
+// one device, so the exact kernel, layout and per-rank ready indexing are
+// exercised on every dev machine instead of shipping untested to the
+// operator. A dead or misbehaving rank is attributed by rank and round;
+// streams are always drained before the allocation is touched again or
+// freed.
+std::pair<std::string, std::uint32_t> run_rank_rounds(five_rank_mem & mem,
+                                                      rank_stream (&ranks)[RANKS],
+                                                      std::uint32_t rounds) {
+    std::string   failure;
+    std::uint32_t failed_rank  = RANKS;  // sentinel: not a specific rank
+    std::uint32_t current_rank = RANKS;
     try {
-        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-            if (contexts[rank].record.ordinal < 0) {
-                failed_rank = rank;
-                failure     = "rank " + std::to_string(rank) + " was not set up (see its device_identity case)";
-                break;
-            }
-        }
-        if (failure.empty()) {
-            check_hip(hipHostMalloc(&mem, sizeof(five_rank_mem), hipHostMallocMapped | hipHostMallocPortable),
-                      "five-rank host alloc");
-            std::memset(mem, 0, sizeof(five_rank_mem));
-            mem->guard_lo[0] = mem->guard_lo[1] = mem->guard_hi[0] = mem->guard_hi[1] = GUARD_VALUE;
-            for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-                current_rank = rank;
-                check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank set device");
-                check_hip(hipStreamCreate(&streams[rank]), "stream create");
-                streams_created = rank + 1;
-            }
-        }
-
         for (std::uint64_t generation = 1; generation <= rounds && failure.empty(); ++generation) {
             for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
                 current_rank = rank;
-                check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank set device");
-                rank_write_kernel<<<1, 64, 0, streams[rank]>>>(mem->payload, mem->ready, rank, contexts[rank].seed,
-                                                               generation);
+                check_hip(hipSetDevice(ranks[rank].ordinal), "rank set device");
+                rank_write_kernel<<<1, 64, 0, ranks[rank].stream>>>(mem.payload, mem.ready, rank, ranks[rank].seed,
+                                                                    generation);
             }
             double     elapsed   = 0;
             const bool all_ready = spin_until(
                 [&] {
                     for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-                        if (acquire_load(&mem->ready[rank]) != generation) {
+                        if (acquire_load(&mem.ready[rank]) != generation) {
                             return false;
                         }
                     }
@@ -2386,7 +2380,7 @@ outcome run_five_rank(std::vector<device_context> & contexts, probe_report & rep
                 5000.0, elapsed);
             if (!all_ready) {
                 for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-                    if (acquire_load(&mem->ready[rank]) != generation) {
+                    if (acquire_load(&mem.ready[rank]) != generation) {
                         failed_rank = rank;
                         failure     = "rank " + std::to_string(rank) + " did not publish ready in round " +
                                       std::to_string(generation) + " within 5 s";
@@ -2398,9 +2392,9 @@ outcome run_five_rank(std::vector<device_context> & contexts, probe_report & rep
             // allocation; this also stops a late store after the next reset.
             for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
                 current_rank = rank;
-                check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank sync device");
+                check_hip(hipSetDevice(ranks[rank].ordinal), "rank sync device");
                 try {
-                    sync_with_deadline(streams[rank], SYNC_DEADLINE_MS, "rank drain");
+                    sync_with_deadline(ranks[rank].stream, SYNC_DEADLINE_MS, "rank drain");
                 } catch (const std::exception & error) {
                     if (failure.empty()) {
                         failed_rank = rank;
@@ -2410,21 +2404,125 @@ outcome run_five_rank(std::vector<device_context> & contexts, probe_report & rep
             }
             if (failure.empty()) {
                 for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-                    const std::uint64_t expected = pattern_word(generation, rank, contexts[rank].seed);
-                    if (mem->payload[rank] != expected) {
+                    const std::uint64_t expected = pattern_word(generation, rank, ranks[rank].seed);
+                    if (mem.payload[rank] != expected) {
                         failed_rank = rank;
-                        failure = "rank " + std::to_string(rank) + " wrote " + std::to_string(mem->payload[rank]) +
+                        failure = "rank " + std::to_string(rank) + " wrote " + std::to_string(mem.payload[rank]) +
                                   " instead of " + std::to_string(expected) + " in round " + std::to_string(generation);
                         break;
                     }
                 }
             }
-            if (failure.empty() && (mem->guard_lo[0] != GUARD_VALUE || mem->guard_lo[1] != GUARD_VALUE ||
-                                    mem->guard_hi[0] != GUARD_VALUE || mem->guard_hi[1] != GUARD_VALUE)) {
+            if (failure.empty() && (mem.guard_lo[0] != GUARD_VALUE || mem.guard_lo[1] != GUARD_VALUE ||
+                                    mem.guard_hi[0] != GUARD_VALUE || mem.guard_hi[1] != GUARD_VALUE)) {
                 failure = "guard word changed in round " + std::to_string(generation);
             }
-            std::memset(mem->payload, 0, sizeof(mem->payload));
-            std::memset(mem->ready, 0, sizeof(mem->ready));
+            std::memset(mem.payload, 0, sizeof(mem.payload));
+            std::memset(mem.ready, 0, sizeof(mem.ready));
+        }
+    } catch (const std::exception & error) {
+        if (failure.empty()) {
+            failure = std::string("hip failure: ") + error.what();
+            if (current_rank < RANKS) {
+                failed_rank = current_rank;
+                failure += " (rank " + std::to_string(current_rank) + ")";
+            }
+        }
+    }
+    return { failure, failed_rank };
+}
+
+// Guide 39.5 H01's per-rank half on one device: five streams stand in for
+// five ranks and run the exact cross-device kernel against one guarded
+// allocation; the host verifies every rank's payload word AND its own ready
+// word for the whole round count. This pins the five-rank kernel indexing
+// on the live device of every machine that runs the probe — it is the
+// regression net that caught the all-ranks-stomp-ready[0] bug before it
+// could reach the five-card run — but it is NOT cross-device qualification:
+// multi-device visibility stays with five_rank_cross_device.
+void case_five_rank_indexing(device_context & ctx) {
+    five_rank_mem * mem = nullptr;
+    try {
+        check_hip(hipHostMalloc(&mem, sizeof(five_rank_mem), hipHostMallocMapped | hipHostMallocPortable),
+                  "five-rank indexing host alloc");
+        std::memset(mem, 0, sizeof(five_rank_mem));
+        mem->guard_lo[0] = mem->guard_lo[1] = mem->guard_hi[0] = mem->guard_hi[1] = GUARD_VALUE;
+        stream_set  streams(RANKS);
+        rank_stream ranks[RANKS];
+        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+            ranks[rank] = { streams.streams[rank], ctx.record.ordinal, ctx.seed + 131u * (rank + 1u) };
+        }
+        const auto result = run_rank_rounds(*mem, ranks, ctx.rounds);
+        (void) hipHostFree(mem);
+        if (!result.first.empty()) {
+            fail_case(ctx, case_id::five_rank_indexing, outcome::fail, result.first);
+            return;
+        }
+    } catch (const std::exception & error) {
+        if (mem != nullptr) {
+            (void) hipHostFree(mem);
+        }
+        fail_case(ctx, case_id::five_rank_indexing, outcome::fail, std::string("hip failure: ") + error.what());
+        return;
+    }
+    set_case(ctx, case_id::five_rank_indexing, outcome::pass,
+             "one device stood in for five ranks: every rank wrote its disjoint word and its own ready word for " +
+                 std::to_string(ctx.rounds) +
+                 " rounds with guards intact (proves per-rank kernel indexing, not "
+                 "cross-device visibility)");
+}
+
+// Caller guarantees exactly five devices. Runs the shared rounds protocol
+// with one device per rank. Before the first launch every rank must have
+// passed setup AND mapped host memory: a rank that failed setup carries
+// device_identity=fail on its record (its ordinal is not a setup fact), and
+// a rank whose host allocation came back without the mapped flag cannot
+// touch the shared payload. Both are attributed precisely instead of
+// launching kernels on a broken context and misreporting the result as a
+// stall (guide 47.2).
+outcome run_five_rank(std::vector<device_context> & contexts, probe_report & report, std::uint32_t rounds) {
+    std::string     failure;
+    std::uint32_t   failed_rank  = RANKS;  // sentinel: not a specific rank
+    std::uint32_t   current_rank = RANKS;
+    five_rank_mem * mem          = nullptr;
+    rank_stream     ranks[RANKS];
+    std::uint32_t   streams_created = 0;
+
+    // A HIP failure anywhere in this case is attributed and reported; it
+    // never aborts the process, because the five-rank evidence is exactly
+    // what the operator came to collect.
+    try {
+        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+            if (result_of(contexts[rank], case_id::device_identity) != outcome::pass) {
+                failed_rank = rank;
+                failure     = "rank " + std::to_string(rank) + " was not set up (see its device_identity case)";
+                break;
+            }
+            if (!contexts[rank].mapped) {
+                failed_rank = rank;
+                failure = "rank " + std::to_string(rank) + " cannot map host memory (" + contexts[rank].mapped_flags +
+                          "); the five-rank case needs mapped host memory on "
+                          "every rank";
+                break;
+            }
+        }
+        if (failure.empty()) {
+            check_hip(hipHostMalloc(&mem, sizeof(five_rank_mem), hipHostMallocMapped | hipHostMallocPortable),
+                      "five-rank host alloc");
+            std::memset(mem, 0, sizeof(five_rank_mem));
+            mem->guard_lo[0] = mem->guard_lo[1] = mem->guard_hi[0] = mem->guard_hi[1] = GUARD_VALUE;
+            for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+                current_rank = rank;
+                ranks[rank]  = { nullptr, contexts[rank].record.ordinal, contexts[rank].seed };
+                check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank set device");
+                check_hip(hipStreamCreate(&ranks[rank].stream), "stream create");
+                streams_created = rank + 1;
+            }
+            const auto result = run_rank_rounds(*mem, ranks, rounds);
+            if (!result.first.empty()) {
+                failure     = result.first;
+                failed_rank = result.second;
+            }
         }
     } catch (const std::exception & error) {
         if (failure.empty()) {
@@ -2439,14 +2537,14 @@ outcome run_five_rank(std::vector<device_context> & contexts, probe_report & rep
     // Best-effort drain and teardown: evidence collection is already over,
     // so a broken rank must not prevent freeing what can be freed.
     for (std::uint32_t rank = 0; rank < streams_created; ++rank) {
-        (void) hipSetDevice(contexts[rank].record.ordinal);
+        (void) hipSetDevice(ranks[rank].ordinal);
         try {
-            sync_with_deadline(streams[rank], SYNC_DEADLINE_MS, "teardown drain");
+            sync_with_deadline(ranks[rank].stream, SYNC_DEADLINE_MS, "teardown drain");
         } catch (const std::exception &) {
             // Evidence collection is over; a stalled rank must not block
             // freeing what can still be freed.
         }
-        (void) hipStreamDestroy(streams[rank]);
+        (void) hipStreamDestroy(ranks[rank].stream);
     }
     if (mem != nullptr) {
         (void) hipHostFree(mem);
@@ -2731,8 +2829,9 @@ int run_probe(const std::string & output_path, const std::string & bench_path, s
     report.hot_reuse_rounds = rounds;
     const std::string multi_stream_note =
         "multi_consumer, delayed_consumer, two_bank, varying_live, five_stream, same_stream_inverse_dependency, "
-        "dual_window_independent_progress, service_loop_independent_progress and nonfinite_reduction_gate use one "
-        "device with concurrent streams; they verify protocol software, not five-device qualification.";
+        "dual_window_independent_progress, service_loop_independent_progress, nonfinite_reduction_gate, "
+        "and five_rank_indexing use one device with concurrent streams; they verify protocol software and five-rank "
+        "kernel indexing, not five-device qualification.";
     report.limits = {
         "This is a platform probe, not a model or relay qualification (guide 31.7).",
         "Single-device results do not qualify five-rank cross-device behavior.",
@@ -2758,7 +2857,13 @@ int run_probe(const std::string & output_path, const std::string & bench_path, s
         report.qualification        = outcome::fail;
         report.qualification_detail = "no HIP devices present";
         std::fprintf(stderr, "%s\n", report.qualification_detail.c_str());
-        return write_report(output_path, report);
+        const int written = write_report(output_path, report);
+        // Zero devices is a failed qualification, never exit 0, matching
+        // the enumeration-failure branch above. (ROCm 7.2.4 errors inside
+        // hipGetDeviceCount when nothing is visible, so this branch is
+        // unreachable on this machine; it stays consistent for runtimes
+        // that report zero instead of erroring.)
+        return written != 0 ? written : 1;
     }
 
     std::vector<device_context> contexts(static_cast<std::size_t>(device_count));
@@ -2823,6 +2928,7 @@ int run_probe(const std::string & output_path, const std::string & bench_path, s
             run_case(ctx, case_id::service_loop_independent_progress, case_service_loop);
             run_case(ctx, case_id::nonfinite_reduction_gate, case_fold_gate);
             run_case(ctx, case_id::host_wait_deadline_no_reuse, case_host_wait_deadline);
+            run_case(ctx, case_id::five_rank_indexing, case_five_rank_indexing);
         }
         std::printf("rank %d (%s, %s): ", ordinal, ctx.record.gcn_arch.c_str(), ctx.record.name.c_str());
         for (const auto & item : ctx.record.cases) {
@@ -2854,6 +2960,9 @@ int run_probe(const std::string & output_path, const std::string & bench_path, s
     if (!bench_path.empty()) {
         if (contexts[0].cb == nullptr) {
             std::fprintf(stderr, "bench skipped: device 0 was not set up\n");
+            bench_result = 1;
+        } else if (!contexts[0].mapped) {
+            std::fprintf(stderr, "bench skipped: device 0 cannot map host memory\n");
             bench_result = 1;
         } else {
             try {

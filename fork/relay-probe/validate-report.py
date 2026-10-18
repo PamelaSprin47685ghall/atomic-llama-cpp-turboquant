@@ -53,6 +53,7 @@ REGISTRY = [
     "service_loop_independent_progress",
     "nonfinite_reduction_gate",
     "host_wait_deadline_no_reuse",
+    "five_rank_indexing",
 ]
 
 # Every healthy device record carries every case except the five-rank one,

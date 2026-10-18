@@ -40,6 +40,7 @@ const char * case_names[] = {
     "service_loop_independent_progress",
     "nonfinite_reduction_gate",
     "host_wait_deadline_no_reuse",
+    "five_rank_indexing",
 };
 
 const char * name_of(const char * const * names, std::size_t count, std::size_t index) noexcept {
