@@ -130,7 +130,7 @@ The surrounding Vulkan suite also exercises its own existing GPU tests. That doe
 
 The source review also checked the premises of the old graph-cache and pinned-readback changes from [the backend audit](../../audit/audit-final-backend-findings.md).
 
-- **Graph view cache identity (FBE15):** this A initializes `backend_ctx->uid` to zero and never assigns it later. Its subgraph rebuild condition therefore stays true. Importing the old cache-key refinement alone would not fix an active cache path. A future cache feature must define and test parent/view identity together with its actual reuse behavior.
+- **Graph view cache identity (FBE15):** A stores `backend_ctx->uid = cgraph->uid` after rebuilding and can reuse a nonzero graph UID. However, A's `ggml_graph_view()` assigns zero to a view UID, so these views trigger rebuilding. The old fork changed that premise by inheriting the parent UID. Its view cache-key repair belongs with that optimization, not as an isolated fix to the current view path. A future view-cache feature must define and test parent/view identity and lifetime together with actual reuse.
 - **Pinned readback retirement (FBE12):** this A has no pending pinned-readback transaction. The old retirement code assumes the separate fast path and its retained buffers already exist. That feature needs its own measured benefit and complete ownership contract before migration.
 
 The async offset correction (FBE11) applies to an existing public operation and has a direct failing regression. It does not require either of those additional mechanisms.

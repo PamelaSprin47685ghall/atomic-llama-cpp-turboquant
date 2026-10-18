@@ -111,13 +111,13 @@ The final combined candidate has `ggml/src/ggml-vulkan/ggml-vulkan.cpp` SHA256:
 6453d62fe781b6452406476f88ba4145fc55af7c7207b68357b1d8032a128c6a
 ```
 
-The final `vulkan-scratch-reuse.cpp` source SHA256 is:
+The recorded baseline and the combined-candidate run before the final EOF cleanup used this `vulkan-scratch-reuse.cpp` source SHA256:
 
 ```text
 ff348961b324c76b1bc3bf4e5d5928ec1935e9112d3224ca7dc40a71e3068e34
 ```
 
-The baseline receipt records the same test-source SHA256 shown above. The baseline and final executable identities are recorded separately. The final candidate was actually rebuilt, installed, and run on the RX 6800. All seven seam CTests passed. The recorded stdout is:
+The baseline receipt records the same test-source SHA256 shown above. The baseline and pre-cleanup combined-candidate executable identities are recorded separately. That candidate was actually rebuilt, installed, and run on the RX 6800. All seven seam CTests passed. The recorded stdout is:
 
 ```text
 build-clean-vulkan/details-final-gpu-pii1wep9/a-seams-test.stdout
@@ -151,3 +151,7 @@ The initial RX 6800 run passed all 16 packed scatter comparisons across eight de
 ## Limits
 
 These are backend correctness tests. They do not establish model quality, affected real-model graph frequency, throughput gains, CUDA/Metal behavior, or universal Vulkan-device support. The same-GPU reference avoids attributing normal CPU/GPU numerical differences to this cache defect. Public buffers and contexts remain alive through synchronization and readback; the test does not depend on asynchronous host-memory lifetime assumptions.
+
+### Final source formatting check
+
+The final cleanup removed one empty line at EOF from this test and `vulkan-set-rows-types.cpp`. A byte comparison verified that these were the only changes. The delivered scratch source SHA256 is `27a1166a6f0ad7cac443a4a8461d4bfc4404b5493e1af18a1eb98c916fe3cc1c`. Both test targets were rebuilt and all seven seam CTests passed again; see `build-clean-vulkan/details-eof-seams-20261018.log` and the `eof_only_normalization` record in [the qualification report](../../audit/details-qualification-20261018.json). The rebuilt scratch executable and loaded Vulkan library retain the digests recorded above. Earlier baseline, isolation and full-backend runs retain their original identities.

@@ -84,14 +84,35 @@
 | 热槽 reserve / commit / release、generation 与 payload 身份 | token / 槽位 reservation 已迁 B，带 domain / generation；热 KV payload 与 snapshot 身份仍是候选，不等于 B 已接管 A tensor |
 | 固定 state envelope、100-byte LE codec 描述、nonce / adapter / scope | 字节封装 B 与 A opaque state 的 C 包装候选；端序、空指针、持久身份与失败后输出合同须补齐 |
 | 每实例 Turbo 默认策略、统计格式化、严格 seed 解析 | 可与私有 runtime 分离；统计需要区分尝试、失败和成功产出 |
-| UTF-8 / stop 扫描、按 lane 拼完整行、增量 parser | 可作为标准字符串与字节流 B；多请求、多 choice、取消和完整 SSE 必须由真实 C 验证 |
+| 增量 UTF-8 与跨块 stop | 已由独立 TQText 与 batch C 重新实现；字节游标、一次终止事件、停止 token 计数和输出失败有明确合同。没有宣称旧非流式扫描 fastpath 的速度收益 |
+| 按 lane 拼完整行、增量 parser、多 choice 与 SSE | 仍是独立候选；TQText 不提供 thinking parser、usage 聚合、网络送达、取消或重试恢复 |
 | 首次失败原因、输入 / 输出游标、请求预算和 usage | 保留状态合同；重试时 token 总数一致不能代替 RNG 与已经发送输出的恢复证明 |
 | 无符号 Hadamard / RoPE、RERoT 可见性 / GQA / DDVR 参考 | 独立数学 B 候选；与已修复的 signed Turbo WHT 有不同输入域和含义 |
 | mean / energy、online softmax M/L/O、稳定有限 mask compaction | 数学或局部 kernel 候选；局部正确性不能替代整模型稀疏 attention 质量 |
 | 单 cell recurrent buffer 清零、一般 strided 清零与前后 fence | M33 减少的是旧 fork 的 eager clearing；当前 A 已整 buffer / lazy init，故不迁旧清零。新增 LFM2.5 hybrid、n_rs_seq=0 的真实生命周期回归；一般 GDN、strided 清零仍未取得资格 |
-| 非对齐字节 memmove、meta 分片非零偏移、异步 readback 生命周期 | Meta async 偏移已用 A +4/-4 与48个双 CPU child 用例迁入。memmove 与 GPU readback 仍独立；当前 A 没有旧 UID cache / pending retire 的优化前提，详见新 Meta 协议 |
-| 模型名称兼容、PLE uint64 hash、imatrix sum2 / expert counts | 独立模型 / 格式候选，须对齐 A 的实际元数据消费者；不整包复制图改动 |
+| 非对齐字节 memmove、meta 分片非零偏移、异步 readback 生命周期 | Meta async 偏移已用 A +4/-4 与48个双 CPU child 用例迁入。memmove 与 GPU readback 仍独立；当前 A 的 graph view UID 为零，且没有旧 pending retire 路径，详见新 Meta 协议 |
+| WXQCAL03 格式与 imatrix sum2 / expert counts | 已迁为 TQCalibration 与 imatrix C；原 writer 生产格式互操作及实际 A loader 消费通过，完整性和填补策略显式记录 |
+| callback 激活采集、trie 校准复用与 checkpoint | 保留为独立 C 候选；格式转换没有重建采集人口、模型 callback 名称 / 布局、分支统计或异常保存生命周期 |
+| 模型名称兼容、PLE uint64 hash | 仍是独立模型 / 格式候选，须对齐 A 的实际元数据消费者；不整包复制图改动 |
+| FA / large Softmax 共用 scratch 与 converted-activation 缓存（G09） | 最小 A 修复与 5 个实际 GPU 场景通过；保留小 Softmax、无 mask 和独立算子控制，不据此宣称完整后端通过 |
+| 输入经别名原地修改后复用旧 activation | 本轮新反例与最小 A 修复；带 4 字节偏移的图从最后 MM 64/64 错误变为完整输出一致，不重叠写入控制也通过 |
+| Turbo SET_ROWS F16 capability（G44） | 复核固定 A 的 shader 生成后保留其 F16 支持，不迁旧拒绝条件；不把这一决定包装成新增后端能力 |
 | 构建 / DSO 内容身份、完整请求、失败分级、离线容量与性能工具 | 保留证据工具职责；修正统计分母、非有限值、提前 PASS 和伪并发后才可作为验收 |
+
+### 本轮重新判断的具体范围
+
+finding ID 与来源分册一起引用；例如下表的 `small:S04` 是校准转换，`server:S04` 则是 Prefill reserve。总账中的原始 `source_stage`、范围和当时的 `runtime_verified` 保持原样，本轮结果在 [MIGRATION.md](MIGRATION.md) 和 [VALIDATION.md](VALIDATION.md) 中另行记录。
+
+| 旧 finding | 本轮处理 | 没有一并完成的事项 |
+|---|---|---|
+| [server:Q14](audit/audit-server-findings.md) | 用 TQText 和真实 batch C 重建文本消费；B 不访问 A，C 拥有采样、detokenize、输出和序列释放 | 原 non-stream fastpath 的性能等价、Q15/Q16/Q17 的首块 / usage / SSE 生命周期 |
+| [server:T09](audit/audit-server-findings.md) | 跨 chunk 终止符是可分离的机制；新 stop 规则有自己的独立合同 | thinking parser、lane 文本协议与特定 grammar，不随通用 stop 匹配迁入 |
+| [small:S04](audit/audit-small-findings.md) | C++17 B 解析 WXQCAL03；C 使用安装后的公共 gguf/ggml metadata API 输出 imatrix，无 NumPy 运行依赖 | small:S05 的 callback / DFS 采集、周期 checkpoint、真实模型量化及质量 |
+| [backend:G09](audit/audit-backend-findings.md) | 从 `ggml-vulkan.cpp#h183` 的缓存身份问题扩展审查 scratch 写入与读后写顺序；最终 5 个专项场景通过 | 最初 fractional V 探针自身的 0.0146484 闭式偏差仍保留，不能算成已修；最终 binary-step fixture 有独立 before/after 和 524288 个闭式比较 |
+| 本轮输入别名反例 | 复用 A 的范围重叠判断，在算子记录后检查所有 fused writes；非零 view offset 的 before/after 通过 | 未声称 UMA、全部 fusion / 跨图 cache coherence 或真实模型吞吐已验证；见 [具体记录](audit/details-findings-20261018.md) |
+| [backend:G44](audit/audit-backend-findings.md) | `ggml-vulkan.cpp#h290/#h292` 的旧 F16 拒绝不迁；固定 A 已生成 F32/F16 到 Turbo 的 I32/I64 SET_ROWS 变体 | 旧“只编译 F32 shader”前提在本轮复核中被纠正，不是 A 基线更新，也不附带迁入 G19 日志 |
+
+本轮完整 CPU archive/isolation 的 62 条命令通过，新增 TQText / TQCalibration 独立测试通过 ASan 与 UBSan。原校准 writer 的 `.cpp/.h` 与固定旧提交完全相同，真实写出 fixture 后，新 C 的 12 个 GGUF tensors 被 A quantizer loader 读为 6 个 importance entries、9 chunks；随后故意缺失模型的阶段以 exit 1 结束。该证据只关闭格式互操作与实际 loader 消费，不能称作完整模型量化成功。最终 Vulkan 同形状流式模型对照和 7 项 A 接缝 CTest 通过；完整算子门的失败记录与归因边界单列在 [VALIDATION.md](VALIDATION.md)。此前模型与 HTTP 结果保留此前身份。本轮可追溯结果集中在 [details-findings-20261018.md](audit/details-findings-20261018.md) 与 [机器回执](audit/details-qualification-20261018.json)。
 
 ## 哪些旧证据不能直接使用
 
@@ -115,7 +136,7 @@
 
 TP5 / LateBind 有历史实质收益；RERoT、FlashPrefill、TriAttention、XKV 各有可拆的小能力。当前不引入其整条私有运行时，但不会把它们归成“无用”或借其他测试的通过宣称完成。旧实现及实验资料仍在归档提交中。
 
-当前工作分支提供三个独立 B、四个 C 与18个明确例外（17个 A 代码文件和1个自有 CI 文件），全部实际资格由 [VALIDATION.md](VALIDATION.md) 逐项给出。本轮新增证据另见 [发布候选说明](RELEASE-NOTES.md)，不改写上面的历史源码阅读深度。新增小行为按职责拆成提交；每个包含 A 变动的提交携带对应当时源码的完整文件摘要，不把未来状态的摘要提前塞入旧提交。
+当前工作分支提供五个独立 B 与五个 C；A 的实际变动由 [upstream-exceptions.json](upstream-exceptions.json) 固定文件、内容、消费者与退出条件，运行资格由 [VALIDATION.md](VALIDATION.md) 逐项给出。本轮新增证据另见 [发布候选说明](RELEASE-NOTES.md)，不改写上面的历史源码阅读深度。新增小行为按职责拆成提交；每个包含 A 变动的提交携带对应当时源码的完整文件摘要，不把未来状态的摘要提前塞入旧提交。
 
 ## 如何回查
 

@@ -10,9 +10,11 @@ A 为 AtomicBot-ai/atomic-llama-cpp-turboquant 的 master，`cda0f9256665845cd9d
 
 ## 已迁入并有真实消费者的能力
 
+表中的此前 CPU / Vulkan、HTTP、corpus 与 logits 数值沿用各自原运行身份；没有因新增库而把旧结果记为本轮重跑。本轮已完成五个 B、五个 C 的 CPU archive/isolation、两个新增 B 的 sanitizer 测试和校准格式互操作；最终 Vulkan 同形状流式模型对照与 scratch / 输入别名专项回归也已通过；完整算子门的失败记录另列，不合并成全后端通过。具体命令与范围见 [VALIDATION.md](VALIDATION.md)。
+
 | 行为 | 当前实现 | 保留的合同与证据 |
 |---|---|---|
-| 精确 compact top-k | B `TQSampling`；C `compose` | B 拥有数值结果；C 用真实 A 采样链，保留 distribution sampler 的状态。新构建 CPU / Vulkan 的 greedy、正温 token 对照通过。 |
+| 精确 compact top-k | B `TQSampling`；C `compose` | B 拥有数值结果；C 用真实 A 采样链，保留 distribution sampler 的状态。此前 CPU / Vulkan 的 greedy、正温 token 对照通过。 |
 | 请求 token trie | B `TQCorpus`；C `corpus-compose` | 共享前缀、重复权重、请求顺序和前缀终点；真实 prefix / full replay 的逐请求 NLL 对照通过。 |
 | 旧生产 corpus 小合同 | 同上，另有归档 writer / reader 互操作测试 | nodes ID 从 1 开始；kind、64 位 timestamp、空请求和缺失空流正确处理；真实旧 writer → 新 B → 旧 reader 字节往返通过。 |
 | Prefill 优先 | 独立 B `TQScheduling`；C `batch-compose` | 保持当前提示、按调用者提供的候选顺序选择；B 不隐含 FIFO。C 另行拥有 FIFO 准入。有待处理已准入提示时暂停 Decode，完成后恢复。 |
@@ -24,13 +26,26 @@ A 为 AtomicBot-ai/atomic-llama-cpp-turboquant 的 master，`cda0f9256665845cd9d
 | 普通 server task 默认槽位 | `server-task.h` 一行 | `id_slot=-1`，普通 task 移动不读取未初始化整数。与原版 server 请求路径共同验证。 |
 | CPU 显式 F32 attention | `ggml-cpu/ops.cpp` 小修复 | F16 V 也尊重请求的 F32 累加。真实公开操作用例在原 A 失败，修复后通过。 |
 | Vulkan 公开 Turbo WHT | host / shader 两个文件 | 既有 group32 / 64 / 128、正反 scale 与实际 grid；原 A 12 例失败 10 例，修复后 12 例全过。 |
+| Vulkan scratch 身份与顺序 | A 现有后端内的 12 行修复；公开 GGML 回归 | FA bitmap / large Softmax 写入后清除 activation 身份；no-split bitmap 读取后登记同步需要。最终 5 场景通过，独立与组合全量比较，binary-step no-split 的 524288 个闭式值一致。 |
+| Vulkan 输入原地修改 | 同一 A 文件的 17 行修复；公开 GGML 回归 | 在算子记录后检查全部 fused writes，复用已有范围判断并保守处理未知 buffer 类型；4 字节 view offset 的最后 MM 从 64/64 错误变为全部一致，不重叠写入控制通过。 |
 | Meta 异步非零偏移 | A 一个文件 +4/-4；公开 GGML 回归 | 从逻辑 chunk 起点换算子张量偏移，axes0/1/2 与 mirrored；原零偏移16控制通过，非零 get/set 分别断言，修复后48真实双 CPU child 用例通过。 |
 | recurrent 清除 / 共享 / 复用 | 直接使用当前 A；新增公开接口资格测试 | 当前 A 已整 buffer 清零与图内延迟初始化。CPU/Vulkan 在 LFM2.5 hybrid convolution/KV、n_rs_seq=0 上均通过24邻居、8共享快照比较和同形状恢复；不携带旧 eager-clear 补丁，不承诺损坏状态恢复的事务性。 |
 | 公开 logits 采集 | C `logits-compose` | 不采样的真实 token 输入、TP5LOG2 全词表行、有界写入、完整后无覆盖发布；CPU/Vulkan 重复 tape 按位一致，同标量形状行选择的全词表比较通过；独立 C 只对照相同提示输入、最终 greedy token / 最大 logit（1e-5），没有第二份全词表参考。 |
 | 独立 logits 比较器 | `fork/tools/compare-logits.py` | 保留 TP5LOG2 文件兼容，stdlib、逐行有界读取、token 身份和完整性校验，数值 / bitwise / argmax 分开；20 个真实 CLI 测试通过。 |
-| 源码与安装包边界 | build、manifest guard、isolation、独立 CI | 精确登记18个例外；三个 B、四个 C 分别构建并消费安装包，包含删除源码与前缀搬迁后的真实运行。当前资格见 VALIDATION.md；CI 尚待推送后实际执行。 |
+| 增量 UTF-8 / stop | B `TQText`；C `batch-compose --stream --stop` | B 拥有跨块状态和文本结果；C 保留原 token 记账，在匹配确定后停止后续 decode、发出一次终止事件并回收请求。重建用途，不声称旧非流式 fastpath 或吞吐收益。 |
+| WXQCAL03 校准格式 | B `TQCalibration` | 显式 LE、逐层有界读取、统计人口与有限值校验、精确 EOF、拥有自身数据的结果。B 不调用 A；与 TQText 的独立测试均通过 ASan / UBSan。 |
+| 校准统计导出 imatrix | C `imatrix-compose`，使用已安装 B 和 A `ggml::ggml-base` | raw sum2 / exact F32 counts、显式 partial / unseen 策略、元数据记录估计与范围、无覆盖发布。原 writer fixture 经新 C 产生 12 tensors，实际 A loader 读为 6 entries / 9 chunks；不证明模型量化质量。 |
+| 源码与安装包边界 | build、manifest guard、isolation、独立 CI | 五个 B、五个 C 分别构建并消费安装包；本轮完整 CPU archive/isolation 62 条命令通过，包含删除源码与前缀搬迁后的消费。A 内容以 manifest 为准；CI 尚待推送后实际执行。 |
 
-所有当前 A 例外累计 **18 文件，+377 / -43 行**，其中17个源码文件为 +328/-43，独立 CI 为49行，精确内容与退出条件见 [upstream-exceptions.json](upstream-exceptions.json)。原版 HTTP server 的私有调度循环仍属于 A 例外，不能把它包装成“已经独立的 B”。三个 B 均只依赖 C++17 标准库。
+当前 A 例外的精确文件、内容、消费者与退出条件见 [upstream-exceptions.json](upstream-exceptions.json)。原版 HTTP server 的私有调度循环仍属于 A 例外，不能把它包装成“已经独立的 B”。五个 B 均只依赖 C++17 标准库，各自能独立构建和消费；C 显式组合它们与 A。
+
+### 文本与校准：关闭的是具体子项
+
+`server:Q14` 原来是非流式、无 stop 时跳过逐 token 扫描的 fastpath。现在的 TQText / batch C 定义了切块不变的 UTF-8 修复、stop 选择、字节游标和输出失败合同；没有把旧性能目的变成未经测量的收益。`server:T09` 只有跨块终止符这一机制可作为参考，完整 thinking / lane parser、Q15/Q16/Q17 的首块与 usage、HTTP 取消和重试仍需独立迁移。用法见 [TQText](text/README.md) 和 [batch C](batch-compose/README.md)。
+
+`small:S04` 的格式读取和 imatrix 导出已迁，`small:S05` 的模型 callback、DFS 采集人口、周期 checkpoint 与 partial-save 尚未迁。默认导出要求 `complete`、正 total 和 `decoded == total`，拒绝未见专家；显式 `--allow-partial` 保留全部范围原因，`--unseen global-mean` 记录估计行及专家 ID。旧 writer 最后一批可能 overshoot total，新实现不截断统计或伪造完整标志。有限值、精确 F32 计数和 A 归一化后非零值保留仍是硬约束，选项不绕过它们。
+
+本轮互操作使用与 `2777543b2358c88cd1c2000f7fa342b764a0e213` 完全相同的旧 writer `.cpp/.h` 生成生产格式 fixture。实际 A quantizer 完成 loader 消费后，在故意缺失模型的阶段以 exit 1 结束；该结果不等于完整模型量化成功，也不是历史模型校准数据的质量验证。转换不需要 NumPy 或推理 context，完整边界见 [TQCalibration](calibration/README.md)、[imatrix C](imatrix-compose/README.md) 和 [VALIDATION.md](VALIDATION.md)。
 
 ### 内存能力必须分开看
 
@@ -59,27 +74,31 @@ A 为 AtomicBot-ai/atomic-llama-cpp-turboquant 的 master，`cda0f9256665845cd9d
 | 槽位与池 | idle LRU、cache-key 亲和、物理 recurrent 槽、payload 身份；预算 reservation 的 domain / generation 已迁 | 先定义分配、释放、共享引用与失败回滚；旧 `llama-xkv-hot` 的槽位元数据责任可独立提取，不等于接管 A 的 tensor |
 | recurrent 清零 | M33 已重新判断：复用当前 A，不迁旧 eager clear | 历史907–935 ms →12.8–16.8 ms减少的是旧 fork 自己加入的清零。当前 A 已有整 buffer / lazy init；加入旧路径会增加写与 fence。公开生命周期测试通过；HTTP取消、GDN / MTP仍需自己的验证 |
 | 重试与输出 | 已输出文本游标、预算 / usage 聚合、首块语义、重试恢复 | C 拥有 HTTP 请求与 sampler；必须验证随机状态、取消和部分输出，不能只比较最后 token 总数 |
-| 请求 / 文本 | UTF-8 与 stop 扫描 fastpath、cache affinity、按 lane 拼完整行、usage 只计算一次 prompt | 标准字符串 / 值策略适合 B；HTTP 协作归 C，须以实际多 choice 与流式消费者验收 |
+| 请求 / 文本协议 | cache affinity、按 lane 拼完整行、thinking parser、usage 只计算一次 prompt | UTF-8 / stop 用途已由 TQText 和 batch C 重建；完整多 choice / SSE / 取消仍由真实 HTTP C 验收，旧非流式 fastpath 的性能需另测 |
 | 在线 corpus 录制 | 请求结束时录制真实 token 路径、种类、时间戳，供后续校准与回放 | B 的生产格式已经恢复；在线请求生命周期仍需 C 消费，离线 `llama-corpus build` 不等于原 server 录制钩子 |
 | 退出与失败 | signal 自管道、正常线程清理、第二信号、LoRA 失败传播 | C 生命周期职责；错误必须传给真实调用者，不能靠测试环境替代实际队列 |
 | grammar / sampler | grammar 替换、clone 后结果所有权、实例级 Turbo 配置、额外 RNG draw 语义 | 使用公开 A sampler 原语；消除对私有 distribution 对象的强转，专测后续随机状态 |
 | 模型 / GGUF | BailingMoE3 名称及缺省兼容、缺失 MTP 权重、uint64 PLE hash | 上游实际消费者和 GGUF 元数据校验；每个兼容点独立提交，不整包恢复所有图修改 |
-| 校准与 imatrix | WXQCAL03 → A GGUF imatrix、公共回调激活采集、trie 复用 | 原始 sum2 + expert counts 可被 A 消费；补类型、形状、有限值、计数和不完整校准拒绝，再由 C 编排 A |
+| 校准采集与复用 | small:S05 的公共回调激活采集、DFS 统计人口、trie 复用、周期 checkpoint 和异常保存 | small:S04 格式读取 / imatrix 导出已迁；采集 C 仍须验证实际模型 callback 的名称、shape、dtype、分支顺序与计数，不以转换器代替采集 |
 | 独立证据工具 | GGUF 头读取、离线性能报告、请求 / 构建身份 | 比较器与公开采集器已迁；格式仍无完整模型 / 构建身份，必须保存旁侧运行证据。其他工具需各自验收统计分母、有限值和失败输出 |
 | 工作区计划 | 64 KiB 容量向上取整、阶段 scratch 最大值、间接 dispatch 算术 | 纯值 B；容量取整不能改变 dispatch 几何；实际 buffer 与设备生命周期由 C / A 拥有 |
 | 状态封装 | 有界 state envelope、scope / policy / adapter / nonce 校验 | B 可封装字节，C 包装 A 的 opaque state；需明确端序，同进程身份不能冒充持久跨进程模型身份 |
 | 数学参考 | 无符号 Hadamard、RoPE 平移、RERoT mask / 可见性、GQA / DDVR 参考 | 可成为独立 B / 对照实现；不声称已改变生产 KV 可见性，也不与 signed Turbo WHT 混为一项 |
 | 稀疏 / 合并参考 | mean / energy 选择、online softmax 三元组归并、有限 mask 保留 | 单独证明数学合同和异常回退；局部参考不自动获得稀疏 attention 整模型质量资格 |
-| Vulkan 小功能 | FA Y 缓存失效、SET_ROWS 类型能力、device 对应 pinned host allocator | 先构造真实 before / after，分别处理能力声明、缓存身份和共享设备所有权 |
+| Vulkan pinned host 所有权（G14） | 使用 buft 对应设备分配、释放与查询，而不是硬编码 device 0 | 保留独立候选；alloc/free/getter 必须由同一设备 owner 闭合，不能借 G09 或已有 WHT 回归代替 |
 | 后端算子 / 生命周期 | SCALE F16、MROPE / IMROPE 融合、字节 memmove、readback pin / 可见性、device staging 清理；meta 分片非零偏移已迁 | 公开既有算子可小补丁；overlap、stream / fence 和多 context 生命周期需对应证明 |
 | CPU / CUDA 小优化 | 既有 Q2_0 VNNI、Turbo 小查询优先 native VEC | 与私有 PQ2_0 / TP5 分开评估；本轮没有 CUDA 或该 CPU kernel 的性能测量 |
 | 评测与参考 | DAG 参考、reader 顺序、性能预算、评测 split 与协议 fixtures | 保留测试目的，修正错答案、泄漏分组、NaN 假通过和提前 PASS 后才能作证据 |
 
 ### 已检查、但当前 A 不具备旧优化前提
 
-Meta graph-view cache-key（FBE15）的旧修复假设 UID cache 正在复用图；当前 A 的 backend UID 初始化后未赋值，实际每次重建，单独加缓存键没有当前消费者。旧 pinned-readback retire（FBE12）依赖的 pending transaction 在当前 Meta 路径也不存在。两者保留功能目的，未来要将新 fast path、所有权、验证和收益一并设计；不孤立搬入旧修补语句。具体依据见 [meta-transfers-protocol.md](tests/a-seams/meta-transfers-protocol.md)。
+Meta graph-view cache-key（FBE15）的前提是旧 fork 让 graph view 继承父图 UID。当前 A 会保存并复用非零图 UID，但其 `ggml_graph_view()` 将 view UID 设为零，view 因而触发重建。仅搬旧 view key 修复不能改善这个路径；未来若引入 view UID 复用，必须同时定义父图 / 切片身份与生命周期。旧 pinned-readback retire（FBE12）依赖的 pending transaction 在当前 Meta 路径也不存在。两者保留功能目的，未来要将新 fast path、所有权、验证和收益一并设计；不孤立搬入旧修补语句。具体依据见 [meta-transfers-protocol.md](tests/a-seams/meta-transfers-protocol.md)。
 
-本轮没有把714文件的登记当成全部语义已证明，也没有重新声称所有候选已迁完。更新只关闭了有真实消费与证据的准入、采集、偏移和 recurrent 生命周期子项。
+### 重新核对后保留 A 的支持范围
+
+G44 原候选建议 Turbo SET_ROWS 拒绝 F16 source，前提是只编译 F32 shader。固定 A 的 `vulkan-shaders-gen.cpp` 实际同时生成 F32/F16 source 到 Turbo 输出的 I32/I64 索引变体，因此不迁旧拒绝条件。这是纠正先前静态判断的前提，没有改换 A 基线，也不把其已有能力算成新 fork 功能；相邻 G19 日志不随它迁入。本轮另加入 16 项完整 packed-byte 回归验证 F32/F16 和 I32/I64 的组合，保留未写入的 guard 行。G09 的共享 scratch 身份与新发现的输入别名修改按各自的反例与修复回执验收。
+
+本轮没有把714文件的登记当成全部语义已证明，也没有重新声称所有候选已迁完。新增结果关闭文本合同、校准格式与导出、CPU 独立交付，以及有明确反例的 Vulkan scratch / 输入别名子项；同形状 CPU / Vulkan streaming 单独验证。此前准入、logits 采集、偏移和 recurrent 生命周期仍保留各自原证据。完整 Vulkan 新结果以 [VALIDATION.md](VALIDATION.md) 为准。
 
 ## 舍弃的具体实验补丁
 
@@ -91,7 +110,7 @@ Meta graph-view cache-key（FBE15）的旧修复假设 UID cache 正在复用图
 | BF16 router | 8 配对块 / 16 进程，约 +1.14%，原记95% CI [0.79%,1.48%]，低于原2%门槛 | 不为它保留跨模型 / 后端耦合 |
 | MMVQ + MTP 联合实验选择器 | 131 配置，最终候选等于原基线；C/R=1.034315，原记95% CI [0.996803,1.073239] 包含1 | 不携带该联合选择器、强制模式和控制复杂度；不否定整个 MMVQ / MTP 家族 |
 
-旧诊断工具不再一概归为“无用并舍弃”。比较器已恢复，离线报告、校准转换和小参考实现各自进入候选表。硬件档案、历史报告与实验输出保留在旧分支，作为来源证据，不进默认构建。
+旧诊断工具不再一概归为“无用并舍弃”。比较器、公开 logits 采集和校准转换已按各自范围交付，离线报告、真实校准采集和小参考实现继续保留候选。硬件档案、历史报告与实验输出保留在旧分支，作为来源证据，不进默认构建。
 
 ## 不复制的旧错误实现
 

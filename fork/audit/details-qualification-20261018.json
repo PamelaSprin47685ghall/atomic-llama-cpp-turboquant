@@ -1,0 +1,1181 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-18",
+  "status": "Component qualifications passed; full backend release gates remain open.",
+  "all_release_gates_passed": false,
+  "identity": {
+    "repository": "atomic-llama-cpp-turboquant",
+    "branch": "clean/fork-20261018",
+    "turn_base_commit": "6de088714f35f84427d9952d713f9d6cdffc668b",
+    "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "archived_fork_commit": "2777543b2358c88cd1c2000f7fa342b764a0e213",
+    "source_scope": "Final delivered working-tree code after the turn base. Exact selected source digests identify this candidate without a self-referential final commit. Earlier executions retain their recorded source identities; the final two-file EOF cleanup and seam rebuild are recorded separately.",
+    "exception_manifest_sha256": "830a973a4e373d122d54f236984785de2d1b9cfeb3a8a67716a998c74b9f63dc",
+    "vulkan_source_path": "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+    "vulkan_source_sha256": "6453d62fe781b6452406476f88ba4145fc55af7c7207b68357b1d8032a128c6a",
+    "model": {
+      "path": "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+      "sha256": "a1921216ded964e5c4f787226729e8c2c32bd587ac7b897742e0b7a7cc7eff6a"
+    },
+    "runtime": {
+      "system": "Linux x86_64",
+      "compiler": "GCC 16.2.1",
+      "gpu": "AMD Radeon RX 6800, RADV NAVI21",
+      "observed_gpu_layers": 25,
+      "cuda_device_available": false
+    }
+  },
+  "boundary": {
+    "b_modules": [
+      "sampling",
+      "corpus",
+      "scheduling",
+      "text",
+      "calibration"
+    ],
+    "c_modules": [
+      "compose",
+      "corpus-compose",
+      "batch-compose",
+      "logits-compose",
+      "imatrix-compose"
+    ],
+    "a_code_diff_from_pin": {
+      "files": 17,
+      "additions": 357,
+      "deletions": 43
+    },
+    "outside_fork_diff_including_ci": {
+      "files": 18,
+      "additions": 406,
+      "deletions": 43
+    },
+    "this_turn_a_code_diff": {
+      "files": 1,
+      "additions": 29,
+      "deletions": 0
+    },
+    "mechanism": "Explicit digest-guarded A changes. B depends only on C++17. C consumes installed public A/B packages; no source rewrite or private header bridge.",
+    "isolation": {
+      "command": [
+        "python3",
+        "fork/tests/isolation.py",
+        "--output",
+        "build-isolated-details-qualified-20261018",
+        "--jobs",
+        "4",
+        "--model",
+        "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf"
+      ],
+      "result": "passed",
+      "commands": 62,
+      "all_commands_exit_zero": true,
+      "a_source_provenance": "built_from_pinned_archive_and_verified_overlay_bytes",
+      "a_archive_has_no_b_or_c": true,
+      "source_and_build_copies_removed_before_consumption": true,
+      "installed_consumers_rebuilt_after_prefix_relocation": true,
+      "relocated_imatrix_conversion": "passed",
+      "relocated_real_batch": "passed",
+      "relocated_real_logits": "passed",
+      "relocated_real_stream": "passed",
+      "scope_limit": "Separate source copies and installed consumption do not constitute an OS sandbox.",
+      "result_path": "build-isolated-details-qualified-20261018/result.json",
+      "commands_path": "build-isolated-details-qualified-20261018/commands.json"
+    },
+    "build_entry": [
+      {
+        "command": [
+          "python3",
+          "fork/build.py",
+          "--backend",
+          "cpu",
+          "--tools",
+          "--build-dir",
+          "build-clean-fork",
+          "--jobs",
+          "4"
+        ],
+        "returncode": 0,
+        "seconds": 67.83659552200697,
+        "result_path": "build-clean-fork/details-build-entry-mob1rldf/result.json"
+      },
+      {
+        "command": [
+          "python3",
+          "fork/build.py",
+          "--backend",
+          "vulkan",
+          "--tools",
+          "--build-dir",
+          "build-clean-vulkan",
+          "--jobs",
+          "4"
+        ],
+        "returncode": 0,
+        "seconds": 7.313101394800469,
+        "result_path": "build-clean-vulkan/details-build-entry-4byg2csx/result.json"
+      }
+    ]
+  },
+  "qualifications": {
+    "independent_b": {
+      "text": {
+        "status": "pass",
+        "partition_and_adversarial_runs": 2617,
+        "generated_inputs": 300,
+        "long_prefix_input_bytes": 131073,
+        "ownership_and_terminal_contract": "Owned stop configuration and result bytes; bounded active state; partition-independent rendering and stop selection."
+      },
+      "calibration": {
+        "status": "passed",
+        "ownership_and_terminal_contract": "Borrowed exclusive stream, owned layers, checked allocation limits, exact EOF before final layer, terminal read failure."
+      },
+      "sanitizers": {
+        "address": true,
+        "undefined_behavior": true,
+        "result": "passed",
+        "commands": [
+          {
+            "name": "text",
+            "compile_command": [
+              "c++",
+              "-std=c++17",
+              "-O1",
+              "-g",
+              "-Wall",
+              "-Wextra",
+              "-Wpedantic",
+              "-Werror",
+              "-fsanitize=address,undefined",
+              "-fno-omit-frame-pointer",
+              "-I/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/fork/text/include",
+              "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/fork/text/src/stream.cpp",
+              "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/fork/text/tests/stream-test.cpp",
+              "-o",
+              "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/details-standalone-sanitizers-chnkgw98/text"
+            ],
+            "command": [
+              "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/details-standalone-sanitizers-chnkgw98/text"
+            ],
+            "returncode": 0
+          },
+          {
+            "name": "calibration",
+            "compile_command": [
+              "c++",
+              "-std=c++17",
+              "-O1",
+              "-g",
+              "-Wall",
+              "-Wextra",
+              "-Wpedantic",
+              "-Werror",
+              "-fsanitize=address,undefined",
+              "-fno-omit-frame-pointer",
+              "-I/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/fork/calibration/include",
+              "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/fork/calibration/src/reader.cpp",
+              "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/fork/calibration/tests/test-reader.cpp",
+              "-o",
+              "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/details-standalone-sanitizers-chnkgw98/calibration"
+            ],
+            "command": [
+              "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/details-standalone-sanitizers-chnkgw98/calibration"
+            ],
+            "returncode": 0
+          }
+        ],
+        "receipt": "build-clean-fork/details-standalone-sanitizers-chnkgw98/result.json"
+      }
+    },
+    "real_streaming": {
+      "per_backend_model_configurations": 6,
+      "requests_per_configuration": 3,
+      "request_executions_per_backend": 18,
+      "parser_failure_commands_per_backend": 4,
+      "scopes": [
+        "Same-geometry buffered/stream equality for rows, samples, reservations, tokens and final text.",
+        "Dynamic overlapping stop patterns and completion before sequence release.",
+        "Contiguous rendered-byte offsets and one terminal event per successful request.",
+        "First text observed while the child process still runs."
+      ],
+      "results": [
+        {
+          "path": "build-clean-fork/details-streaming/run-9yu0hjwe/summary.json",
+          "sha256": "d88bb5cae2f54e8a41164a9da884a55e5ad9a884835e895f902cc24d27452242",
+          "status": "passed",
+          "model": "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+          "output_dir": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/details-streaming/run-9yu0hjwe",
+          "binary_sha256": "e7195e4d2f683e03f53917798ec743cff0908772d2dc11e0a1c63596bac0150d",
+          "stop_patterns": [
+            " o",
+            "The o"
+          ],
+          "selection": {
+            "request_id": 0,
+            "crossed_character_boundary": 4,
+            "long_stop_begin": 1,
+            "stop_end": 6
+          },
+          "matched": [
+            {
+              "request_id": 0,
+              "stop_index": 1,
+              "generated_tokens": 2
+            },
+            {
+              "request_id": 1,
+              "stop_index": 0,
+              "generated_tokens": 21
+            }
+          ],
+          "same_geometry_stream_switch_equal": [
+            "serial",
+            "stop",
+            "parallel"
+          ],
+          "text_deltas_equal_results": true,
+          "stop_token_accounted_without_further_decode": true,
+          "limits": [
+            "Stop controls use one resident request so early completion does not change concurrent batch geometry.",
+            "Greedy tokens are not compared between serial and parallel batch shapes.",
+            "This suite uses ignore-eog; B tests cover finish-time UTF-8 replacement and stop matching.",
+            "The CLI output contract does not qualify HTTP cancellation, transport backpressure, or model quality."
+          ],
+          "command_count": 10,
+          "runs": {
+            "serial-buffered": {
+              "returncode": 0,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": null
+            },
+            "serial-stream": {
+              "returncode": 0,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": true
+            },
+            "stop-buffered": {
+              "returncode": 0,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": null
+            },
+            "stop-stream": {
+              "returncode": 0,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": true
+            },
+            "parallel-buffered": {
+              "returncode": 0,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": null
+            },
+            "parallel-stream": {
+              "returncode": 0,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": true
+            },
+            "empty-stop": {
+              "returncode": 1,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": null
+            },
+            "oversize-stop": {
+              "returncode": 1,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": null
+            },
+            "too-many-stops": {
+              "returncode": 1,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": null
+            },
+            "help-as-stop-value": {
+              "returncode": 1,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": null
+            }
+          }
+        },
+        {
+          "path": "build-clean-vulkan/details-final-gpu-pii1wep9/real-stream/run-yk891txz/summary.json",
+          "sha256": "cdb58a3af83c2d335d15eadef41fc02ec3c5a82c832d79d83f249f2331741264",
+          "status": "passed",
+          "model": "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+          "output_dir": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/details-final-gpu-pii1wep9/real-stream/run-yk891txz",
+          "binary_sha256": "8e5876d6ceaae23602f243a6f94cc35490b12a139350621cdc2e9fbabf1d92c3",
+          "stop_patterns": [
+            " o",
+            "The o"
+          ],
+          "selection": {
+            "request_id": 0,
+            "crossed_character_boundary": 4,
+            "long_stop_begin": 1,
+            "stop_end": 6
+          },
+          "matched": [
+            {
+              "request_id": 0,
+              "stop_index": 1,
+              "generated_tokens": 2
+            },
+            {
+              "request_id": 1,
+              "stop_index": 0,
+              "generated_tokens": 6
+            },
+            {
+              "request_id": 2,
+              "stop_index": 0,
+              "generated_tokens": 21
+            }
+          ],
+          "same_geometry_stream_switch_equal": [
+            "serial",
+            "stop",
+            "parallel"
+          ],
+          "text_deltas_equal_results": true,
+          "stop_token_accounted_without_further_decode": true,
+          "limits": [
+            "Stop controls use one resident request so early completion does not change concurrent batch geometry.",
+            "Greedy tokens are not compared between serial and parallel batch shapes.",
+            "This suite uses ignore-eog; B tests cover finish-time UTF-8 replacement and stop matching.",
+            "The CLI output contract does not qualify HTTP cancellation, transport backpressure, or model quality."
+          ],
+          "command_count": 10,
+          "runs": {
+            "serial-buffered": {
+              "returncode": 0,
+              "gpu_layers_observed": 25,
+              "first_text_observed_before_process_exit": null
+            },
+            "serial-stream": {
+              "returncode": 0,
+              "gpu_layers_observed": 25,
+              "first_text_observed_before_process_exit": true
+            },
+            "stop-buffered": {
+              "returncode": 0,
+              "gpu_layers_observed": 25,
+              "first_text_observed_before_process_exit": null
+            },
+            "stop-stream": {
+              "returncode": 0,
+              "gpu_layers_observed": 25,
+              "first_text_observed_before_process_exit": true
+            },
+            "parallel-buffered": {
+              "returncode": 0,
+              "gpu_layers_observed": 25,
+              "first_text_observed_before_process_exit": null
+            },
+            "parallel-stream": {
+              "returncode": 0,
+              "gpu_layers_observed": 25,
+              "first_text_observed_before_process_exit": true
+            },
+            "empty-stop": {
+              "returncode": 1,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": null
+            },
+            "oversize-stop": {
+              "returncode": 1,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": null
+            },
+            "too-many-stops": {
+              "returncode": 1,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": null
+            },
+            "help-as-stop-value": {
+              "returncode": 1,
+              "gpu_layers_observed": 0,
+              "first_text_observed_before_process_exit": null
+            }
+          }
+        }
+      ],
+      "limits": [
+        "Model runs use --ignore-eog and --no-phase-memory. They do not qualify a natural model EOG boundary or streaming together with phase release.",
+        "B unit tests qualify finish-time UTF-8 repair and stop completion.",
+        "Different serial/parallel batch geometries are not required to produce identical tokens.",
+        "No HTTP/SSE delivery acknowledgement, cancellation, retry or usage aggregation claim."
+      ]
+    },
+    "calibration_interoperability": {
+      "result": "passed",
+      "build_provenance": {
+        "revision": "2777543b2358c88cd1c2000f7fa342b764a0e213",
+        "compile_command": [
+          "c++",
+          "-std=c++17",
+          "-O2",
+          "-I/home/kunweiz/Desktop/atomic-llama-cpp-turboquant/wanxiangqi/lib",
+          "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/fork/imatrix-compose/tests/old-writer-fixture.cpp",
+          "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant/wanxiangqi/lib/calib-dump.cpp",
+          "-o",
+          "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/details-old-writer-2m_qvdko/old-writer-fixture"
+        ],
+        "source_sha256": "322b808660bdf1e64301061bd7f0a89c2900ecd42e5b3b46f4e2185011078486",
+        "header_sha256": "6cb2e58f73b2889c4e75d67d8c01de72ca7421237ec8af84e785bd2c53a80315",
+        "fixture_driver_sha256": "9ba97cfbacaeb16013af07d381f263a98ba76a8bd009834b7b0afc12cd130cbb",
+        "unchanged_committed_writer": true
+      },
+      "writer_executable_sha256": "c3064d3b40bd520a946025409cc93b9fbfc83414b3d8de697a00e5c904670788",
+      "converter_executable_sha256": "f29ab1c781d62613fba17853a7f0cf7de7cb7305e6defa7fb71b9dba0b867056",
+      "input_dump_sha256": "a828473dc6ef9317df6fb61a03fac18586ea1fefe163c69f6e81db251276c402",
+      "output_gguf_sha256": "f30eadba9ffaf1483d2dab8054429bd7662b8d9e86e32c1ae963c4907472fa07",
+      "output_summary": {
+        "format": "GGUF-imatrix",
+        "layers": 2,
+        "tensors": 12,
+        "decoded": 9,
+        "declared_total": 9,
+        "source_bytes": 560,
+        "output_bytes": 2688,
+        "partial_accepted": false,
+        "imputed_input_experts": 0,
+        "imputed_hidden_experts": 0,
+        "imputed_rows_are_measurements": false,
+        "model_identity_verified": false
+      },
+      "quantizer_loader": {
+        "pass": true,
+        "scope": "actual A quantizer imatrix loading and normalization path; expected later missing-model failure, no model quantization or quality claim",
+        "command": [
+          "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/upstream/bin/llama-quantize",
+          "--imatrix",
+          "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/details-old-writer-2m_qvdko/conversion/imatrix.gguf",
+          "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/details-old-writer-2m_qvdko/missing-model.gguf",
+          "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/details-old-writer-2m_qvdko/unused-output.gguf",
+          "Q4_K_M",
+          "2"
+        ],
+        "environment": {
+          "LLAMA_TRACE": "1"
+        },
+        "returncode": 1,
+        "binary_sha256": "2a943f693452e090786766933ddbee9844b840417fe8eca1098ec07d7bc77cf4",
+        "entries": {
+          "blk.3.ffn_down_exps.weight": [
+            6,
+            2,
+            2
+          ],
+          "blk.3.ffn_gate_exps.weight": [
+            4,
+            2,
+            2
+          ],
+          "blk.3.ffn_up_exps.weight": [
+            4,
+            2,
+            2
+          ],
+          "blk.7.ffn_down_exps.weight": [
+            6,
+            2,
+            2
+          ],
+          "blk.7.ffn_gate_exps.weight": [
+            4,
+            2,
+            2
+          ],
+          "blk.7.ffn_up_exps.weight": [
+            4,
+            2,
+            2
+          ]
+        },
+        "chunk_count": 9,
+        "input_sha256": "f30eadba9ffaf1483d2dab8054429bd7662b8d9e86e32c1ae963c4907472fa07"
+      },
+      "limits": [
+        "The fixture is generated by unchanged production writer code; it is not historical model calibration data.",
+        "The actual A imatrix loader passed, followed by an intentional missing-model exit 1.",
+        "No successful full-model quantization, calibration quality or tokenizer/model identity claim."
+      ]
+    },
+    "public_a_seams": {
+      "result": "passed",
+      "ctest_suites": 7,
+      "log": "build-clean-vulkan/details-final-gpu-pii1wep9/a-seams-test.stdout",
+      "identities": {
+        "started_at": "2026-10-18T11:53:48.037654+00:00",
+        "source_sha256": "6453d62fe781b6452406476f88ba4145fc55af7c7207b68357b1d8032a128c6a",
+        "manifest_sha256": "830a973a4e373d122d54f236984785de2d1b9cfeb3a8a67716a998c74b9f63dc",
+        "scope": "final scratch and source-mutation correction",
+        "vulkan_library_sha256": "5529dd36ee499771c7b93c56c0aca1d16baf28bb8beb5c07f623914a038a0453",
+        "backend_test_sha256": "6f2f94470e7709f1575813175c5cba07985f73c319e7ca28b9777692d3a74540",
+        "activation_test_sha256": "a74790c17850097ac38d41a67ed02ed3248a9a1fc0e4142f644e4dbec91792f1",
+        "scratch_test_sha256": "d2e0cad9220416a5d0a9b69ed4250782be58dded2ff52f67d3ff14e2ae270e01",
+        "batch_binary_sha256": "8e5876d6ceaae23602f243a6f94cc35490b12a139350621cdc2e9fbabf1d92c3"
+      },
+      "existing_checks": {
+        "compute_memory": "passed",
+        "cpu_f32_attention": "passed",
+        "meta_async_transfer_cases": 48,
+        "vulkan_wht_cases": 12
+      },
+      "scratch": {
+        "final_cases": 5,
+        "all_same_gpu_full_output_comparisons_exact": true,
+        "no_split_attention_values": 524288,
+        "no_split_closed_form_max_abs": 0,
+        "attention_closed_form_tolerance": 0.0002,
+        "one_head_attention_max_abs": 0.0000873804,
+        "baseline_later_mm": {
+          "softmax_32768": {
+            "mismatches": 32,
+            "values": 64,
+            "max_abs_rounded": 3380.01
+          },
+          "masked_fa": {
+            "mismatches": 32,
+            "values": 64,
+            "max_abs_rounded": 27029700000000
+          }
+        },
+        "no_split_baseline_receipt": "build-clean-vulkan/details-no-split-binary-before-t1gqpmbg/receipt.json",
+        "no_split_baseline_binary_sha256": "6bc2694ded21d8e8aff4001a61de2d660eb7c1f7068caddd927d4a1b7b0257e4",
+        "no_split_before_and_after_test_source_sha256": "ff348961b324c76b1bc3bf4e5d5928ec1935e9112d3224ca7dc40a71e3068e34",
+        "limits": "Cache invalidation has numerical counterexamples. The read-before-overwrite ordering also follows the source dependency review; no runtime validation-layer or race reproduction claim.",
+        "initial_fractional_probe": {
+          "closed_form_max_abs": 0.0146484,
+          "closed_form_mismatches": 475136,
+          "values": 524288,
+          "combined_equals_isolated": true,
+          "interpretation": "An independent attention numerical limitation, not a defect fixed by this patch."
+        }
+      },
+      "source_mutation": {
+        "final_cases": 2,
+        "view_offset_bytes": 4,
+        "mm_values_per_comparison": 64,
+        "storage_values_per_comparison": 514,
+        "baseline": {
+          "control_returncode": 0,
+          "inplace_returncode": 1,
+          "later_mm_mismatches": 64,
+          "later_mm_max_abs_rounded": 15.4662,
+          "scale_and_storage_correct": true,
+          "receipt": "build-clean-vulkan/details-activation-offset-before-d3kmq975/receipt.json"
+        },
+        "final": {
+          "all_comparisons_exact": true,
+          "max_abs": 0
+        },
+        "limits": [
+          "No proof of a production model trigger, all fusion combinations, host writes during execution or all cross-graph cache coherence.",
+          "Unknown and aggregate buffer types conservatively invalidate. UMA and aggregate-wrapper execution were not runtime-qualified."
+        ]
+      },
+      "set_rows": {
+        "destination_types": [
+          "q8_0",
+          "turbo2",
+          "turbo3",
+          "turbo4"
+        ],
+        "source_types": [
+          "f32",
+          "f16"
+        ],
+        "index_types": [
+          "i32",
+          "i64"
+        ],
+        "complete_packed_byte_comparisons": 16,
+        "preserved_guard_rows": 4,
+        "result": "all exact",
+        "decision": "Keep A's existing F16 capability; do not port the obsolete rejection.",
+        "limit": "Same-GPU packed-row addressing/type comparison, not an independent quantizer-quality reference."
+      },
+      "eof_only_normalization": {
+        "change": "Remove one extra final LF from each listed test source. A byte comparison verified before == after + LF for both files.",
+        "files": [
+          {
+            "path": "fork/tests/a-seams/vulkan-scratch-reuse.cpp",
+            "before_sha256": "ff348961b324c76b1bc3bf4e5d5928ec1935e9112d3224ca7dc40a71e3068e34",
+            "after_sha256": "27a1166a6f0ad7cac443a4a8461d4bfc4404b5493e1af18a1eb98c916fe3cc1c"
+          },
+          {
+            "path": "fork/tests/a-seams/vulkan-set-rows-types.cpp",
+            "before_sha256": "2ac6f3658fedbc525be4b132c0a2eb435600d51f576d1211716ebebe0f86456f",
+            "after_sha256": "7cff61e5824c503cafc658b3782bc1ca81fa4c76156e0f1926cb7c556b10d7fb"
+          }
+        ],
+        "production_code_and_exception_manifest": "unchanged",
+        "build": {
+          "command": "cmake --build build-clean-vulkan/modules/tests/a-seams --parallel 4",
+          "returncode": 0,
+          "started_at": "2026-10-18T12:38:12.214Z",
+          "completed_at": "2026-10-18T12:38:13.453Z"
+        },
+        "ctest": {
+          "command": "ctest --test-dir build-clean-vulkan/modules/tests/a-seams --output-on-failure --no-tests=error --output-log /home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/details-eof-seams-20261018.log",
+          "returncode": 0,
+          "passed": 7,
+          "total": 7,
+          "started_at": "2026-10-18T12:38:26.262Z",
+          "completed_at": "2026-10-18T12:38:28.827Z",
+          "log": "build-clean-vulkan/details-eof-seams-20261018.log"
+        },
+        "binary_sha256": {
+          "test-vulkan-scratch-reuse": "d2e0cad9220416a5d0a9b69ed4250782be58dded2ff52f67d3ff14e2ae270e01",
+          "test-vulkan-set-rows-types": "f5fc8892c51d33e34f08d009c5ec6f823035157645e8aefb4e81b1a57be07f77",
+          "test-vulkan-activation-cache": "a74790c17850097ac38d41a67ed02ed3248a9a1fc0e4142f644e4dbec91792f1",
+          "loaded-libggml-vulkan.so.0": "5529dd36ee499771c7b93c56c0aca1d16baf28bb8beb5c07f623914a038a0453"
+        },
+        "scope": "The rebuilt scratch executable and loaded Vulkan library match the earlier combined-candidate digests. The earlier 62-command isolation, full GPU sweep and baseline counterexamples retain their original source and execution identities; they were not rerun for an EOF-only test-source change."
+      }
+    }
+  },
+  "backend_gates": {
+    "before_vulkan_change": {
+      "commands": [
+        {
+          "name": "turbo-codec",
+          "command": [
+            "build-clean-fork/upstream/bin/test-turbo-quant"
+          ],
+          "returncode": 0,
+          "seconds": 0.015421323012560606
+        },
+        {
+          "name": "quantize-functions",
+          "command": [
+            "build-clean-fork/upstream/bin/test-quantize-fns"
+          ],
+          "returncode": 0,
+          "seconds": 1.3654534700326622
+        },
+        {
+          "name": "cpu-backend-sweep",
+          "command": [
+            "build-clean-fork/upstream/bin/test-backend-ops",
+            "test",
+            "-b",
+            "CPU",
+            "-j",
+            "2"
+          ],
+          "returncode": 0,
+          "seconds": 465.1854050909169
+        },
+        {
+          "name": "devices",
+          "command": [
+            "build-clean-vulkan/upstream/bin/llama-bench",
+            "--list-devices"
+          ],
+          "returncode": 0,
+          "seconds": 0.5144076561555266
+        },
+        {
+          "name": "turbo-bench",
+          "command": [
+            "build-clean-vulkan/upstream/bin/llama-bench",
+            "-m",
+            "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+            "-p",
+            "8",
+            "-n",
+            "4",
+            "-b",
+            "8",
+            "-ub",
+            "8",
+            "-r",
+            "1",
+            "-t",
+            "2",
+            "-ngl",
+            "99",
+            "-ctk",
+            "turbo2,turbo3,turbo4",
+            "-ctv",
+            "turbo2,turbo3,turbo4",
+            "-fa",
+            "on",
+            "-o",
+            "json"
+          ],
+          "returncode": 0,
+          "seconds": 3.4192634751088917
+        }
+      ],
+      "cpu_sweep": {
+        "passed": 27639,
+        "total": 27639
+      },
+      "receipt": "build-clean-vulkan/details-gates-before-vz06thm3/commands.json"
+    },
+    "scratch_only_full_vulkan": {
+      "source_sha256": "c566f2bd31c0061c100bffaf9a8add6c43959e2945487687e8b5ff2d0839411c",
+      "passed": 25931,
+      "total": 25933,
+      "returncode": 1,
+      "failed_cases": [
+        "FLASH_ATTN_EXT mask+sinks Q8 KV h256",
+        "TOPK_MOE ne=[31,22,1,1], top8, normalized, gating_func=3, scale_w=2"
+      ],
+      "receipt": "build-clean-vulkan/details-vulkan-gate-57in_i53/result.json"
+    },
+    "exact_case_replays": {
+      "results": [
+        {
+          "label": "before",
+          "name": "flash",
+          "command": [
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin/test-backend-ops",
+            "test",
+            "-b",
+            "Vulkan0",
+            "-j",
+            "1",
+            "-o",
+            "FLASH_ATTN_EXT(hsk=256,hsv=256,nh=2,nr23=[16,2],kv=1025,nb=1,mask=1,sinks=1,max_bias=8.000000,logit_softcap=30.000000,prec=f32,type_K=q8_0,type_V=q8_0,permute=[0,1,2,3],kv_view=1,v_is_view_of_k=0,n_kv_max=0)"
+          ],
+          "environment": {
+            "LD_LIBRARY_PATH": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/details-before-vulkan-library:/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin"
+          },
+          "vulkan_library": "libggml-vulkan.so.0 => /home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/details-before-vulkan-library/libggml-vulkan.so.0 (0x00007f2dba830000)",
+          "returncode": 1,
+          "summary": [
+            [
+              "0",
+              "1"
+            ]
+          ],
+          "error_lines": [
+            "[FLASH_ATTN_EXT] ERR = 0.011015945 > 0.000500000   FLASH_ATTN_EXT(hsk=256,hsv=256,nh=2,nr23=[16,2],kv=1025,nb=1,mask=1,sinks=1,max_bias=8.000000,logit_softcap=30.000000,prec=f32,type_K=q8_0,type_V=q8_0,permute=[0,1,2,3],kv_view=1,v_is_view_of_k=0,n_kv_max=0): FAIL [test failed]"
+          ]
+        },
+        {
+          "label": "before",
+          "name": "topk",
+          "command": [
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin/test-backend-ops",
+            "test",
+            "-b",
+            "Vulkan0",
+            "-j",
+            "1",
+            "-o",
+            "TOPK_MOE(ne=[31,22,1,1],n_expert_used=8,with_norm=1,bias_probs=0,gating_func=3,scale_w=2.000000)"
+          ],
+          "environment": {
+            "LD_LIBRARY_PATH": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/details-before-vulkan-library:/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin"
+          },
+          "vulkan_library": "libggml-vulkan.so.0 => /home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/details-before-vulkan-library/libggml-vulkan.so.0 (0x00007f2dba830000)",
+          "returncode": 0,
+          "summary": [
+            [
+              "1",
+              "1"
+            ]
+          ],
+          "error_lines": []
+        },
+        {
+          "label": "scratch_fix",
+          "name": "flash",
+          "command": [
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin/test-backend-ops",
+            "test",
+            "-b",
+            "Vulkan0",
+            "-j",
+            "1",
+            "-o",
+            "FLASH_ATTN_EXT(hsk=256,hsv=256,nh=2,nr23=[16,2],kv=1025,nb=1,mask=1,sinks=1,max_bias=8.000000,logit_softcap=30.000000,prec=f32,type_K=q8_0,type_V=q8_0,permute=[0,1,2,3],kv_view=1,v_is_view_of_k=0,n_kv_max=0)"
+          ],
+          "environment": {
+            "LD_LIBRARY_PATH": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin:/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin"
+          },
+          "vulkan_library": "libggml-vulkan.so.0 => /home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin/libggml-vulkan.so.0 (0x00007f5c89db1000)",
+          "returncode": 1,
+          "summary": [
+            [
+              "0",
+              "1"
+            ]
+          ],
+          "error_lines": [
+            "[FLASH_ATTN_EXT] ERR = 0.009943477 > 0.000500000   FLASH_ATTN_EXT(hsk=256,hsv=256,nh=2,nr23=[16,2],kv=1025,nb=1,mask=1,sinks=1,max_bias=8.000000,logit_softcap=30.000000,prec=f32,type_K=q8_0,type_V=q8_0,permute=[0,1,2,3],kv_view=1,v_is_view_of_k=0,n_kv_max=0): FAIL [test failed]"
+          ]
+        },
+        {
+          "label": "scratch_fix",
+          "name": "topk",
+          "command": [
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin/test-backend-ops",
+            "test",
+            "-b",
+            "Vulkan0",
+            "-j",
+            "1",
+            "-o",
+            "TOPK_MOE(ne=[31,22,1,1],n_expert_used=8,with_norm=1,bias_probs=0,gating_func=3,scale_w=2.000000)"
+          ],
+          "environment": {
+            "LD_LIBRARY_PATH": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin:/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin"
+          },
+          "vulkan_library": "libggml-vulkan.so.0 => /home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream/bin/libggml-vulkan.so.0 (0x00007f5c89db1000)",
+          "returncode": 0,
+          "summary": [
+            [
+              "1",
+              "1"
+            ]
+          ],
+          "error_lines": []
+        }
+      ],
+      "baseline_vulkan_library_sha256": "cceef820f5a4c527c35dc4046074de81b005976562efb13680b226fa6189ebb9",
+      "interpretation": "Attention failed with both the before-turn and scratch-only libraries. TOPK passed in both focused replays. Test input generation is randomized; these are matching case definitions, not fixed-seed paired tensors.",
+      "receipt": "build-clean-vulkan/details-gate-controls-yq2c068_/result.json"
+    },
+    "final_vulkan": {
+      "source_sha256": "6453d62fe781b6452406476f88ba4145fc55af7c7207b68357b1d8032a128c6a",
+      "passed": 25932,
+      "total": 25933,
+      "returncode": 1,
+      "failed_case": "FLASH_ATTN_EXT(hsk=256,hsv=256,nh=2,nr23=[16,2],kv=1025,nb=1,mask=1,sinks=1,max_bias=8.000000,logit_softcap=30.000000,prec=f32,type_K=q8_0,type_V=q8_0,permute=[0,1,2,3],kv_view=1,v_is_view_of_k=0,n_kv_max=0)",
+      "error": 0.009055835,
+      "tolerance": 0.0005,
+      "topk_status": "Not reproduced in the final full sweep; the preceding failure remains unresolved and is not attributed or marked fixed.",
+      "commands": [
+        {
+          "name": "a-build",
+          "command": [
+            "cmake",
+            "--build",
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream",
+            "--parallel",
+            "4",
+            "--target",
+            "test-backend-ops",
+            "test-turbo-quant",
+            "test-quantize-fns",
+            "llama-bench",
+            "llama-quantize",
+            "mtmd"
+          ],
+          "returncode": 0,
+          "seconds": 123.7883707319852
+        },
+        {
+          "name": "a-install",
+          "command": [
+            "cmake",
+            "--install",
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/upstream"
+          ],
+          "returncode": 0,
+          "seconds": 0.062126720091328025
+        },
+        {
+          "name": "a-seams-configure",
+          "command": [
+            "cmake",
+            "-S",
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/fork/tests/a-seams",
+            "-B",
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/modules/tests/a-seams",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_PREFIX_PATH=/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/install",
+            "-DCMAKE_CXX_FLAGS=-Wall -Wextra -Wpedantic -Werror"
+          ],
+          "returncode": 0,
+          "seconds": 0.02108079311437905
+        },
+        {
+          "name": "a-seams-build",
+          "command": [
+            "cmake",
+            "--build",
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/modules/tests/a-seams",
+            "--parallel",
+            "4"
+          ],
+          "returncode": 0,
+          "seconds": 0.7677600339520723
+        },
+        {
+          "name": "a-seams-test",
+          "command": [
+            "ctest",
+            "--test-dir",
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/modules/tests/a-seams",
+            "-V",
+            "--no-tests=error"
+          ],
+          "returncode": 0,
+          "seconds": 2.1317221738863736
+        },
+        {
+          "name": "real-stream",
+          "command": [
+            "python3",
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/fork/batch-compose/tests/test_streaming.py",
+            "--binary",
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/install/bin/tq-batch-compose",
+            "--model",
+            "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+            "--gpu-layers",
+            "99",
+            "--output-dir",
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/details-final-gpu-pii1wep9/real-stream"
+          ],
+          "returncode": 0,
+          "seconds": 14.517152771120891
+        },
+        {
+          "name": "backend-full",
+          "command": [
+            "./build-clean-vulkan/upstream/bin/test-backend-ops",
+            "test",
+            "-b",
+            "Vulkan0",
+            "-j",
+            "2"
+          ],
+          "returncode": 1,
+          "seconds": 454.3386072209105
+        },
+        {
+          "name": "turbo-bench",
+          "command": [
+            "./build-clean-vulkan/upstream/bin/llama-bench",
+            "-m",
+            "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+            "-p",
+            "8",
+            "-n",
+            "4",
+            "-b",
+            "8",
+            "-ub",
+            "8",
+            "-r",
+            "1",
+            "-t",
+            "2",
+            "-ngl",
+            "99",
+            "-ctk",
+            "turbo2,turbo3,turbo4",
+            "-ctv",
+            "turbo2,turbo3,turbo4",
+            "-fa",
+            "on",
+            "-o",
+            "json"
+          ],
+          "returncode": 0,
+          "seconds": 2.7697256959509104
+        }
+      ],
+      "result": {
+        "commands": 8,
+        "failed": [
+          "backend-full"
+        ],
+        "completed_at": "2026-10-18T12:03:46.473976+00:00",
+        "limits": [
+          "No CUDA device was available.",
+          "A full backend gate failure remains a failure even when focused regression tests pass.",
+          "The one-repeat benchmark is an execution smoke test, not a speed comparison."
+        ]
+      }
+    },
+    "final_turbo_bench": {
+      "returncode": 0,
+      "k_v_combinations": 9,
+      "prompt_and_decode_rows": 18,
+      "repeats": 1,
+      "scope": "Actual model execution smoke; no throughput improvement or output-correctness claim."
+    },
+    "cuda": {
+      "status": "not run",
+      "reason": "No CUDA device was available."
+    }
+  },
+  "migration_decisions": {
+    "reworked": [
+      "server:Q14 text-consumption purpose, without the old non-stream performance claim",
+      "small:S04 WXQCAL03 reader and imatrix export"
+    ],
+    "corrected": [
+      "backend:G09 scratch identity and read/write ordering",
+      "New public source-alias cache defect",
+      "backend:G44 old F16 rejection premise; preserve A's existing support",
+      "Meta FBE15: nonzero graph UID can be cached, but A graph views use UID zero."
+    ],
+    "still_separate": [
+      "small:S05 real activation collection, DFS population and checkpoints",
+      "server:Q15/Q16/Q17 and T09 full thinking/lane/SSE behavior",
+      "backend:G14 per-device pinned-host ownership",
+      "Capacity auto-fit, idle KV LRU, recurrent physical slots and cross-context arenas"
+    ],
+    "audit_denominator": {
+      "paths": 714,
+      "full_added_or_supplied_changed_content": 546,
+      "selected_actual_ranges": 168,
+      "scope": "Historical ledger evidence levels remain unchanged. This report does not upgrade every path to runtime-verified."
+    }
+  },
+  "selected_code_sha256": {
+    "fork/batch-compose/CMakeLists.txt": "5e36aa916c26c0e3ecc5b537a2946657b18e3023ad152ad098469359db68d31d",
+    "fork/batch-compose/src/main.cpp": "232781ed4daa6d6d8168cc01ec86dbb3c0f970f5c06fcab12823c1191dea909c",
+    "fork/batch-compose/tests/diagnose_shapes.py": "0a5d284e9d8486527b2c4f8d84eecbe3cd83ce0613f04aef806a7f5b631cf86e",
+    "fork/batch-compose/tests/real-batch.py": "a10104649c0ff4b8e679161eb86f42f033a57d6efd1ce220bbd4b309f42eda56",
+    "fork/batch-compose/tests/test_admission.py": "79e02ffb89175683e439a24ea9b886b58af0125cf3ff12278598f11cc69d1252",
+    "fork/batch-compose/tests/test_streaming.py": "5860a8b520e5d38d018f5957b69d648a1d5ec33936627204e5a23866ed06407c",
+    "fork/build.py": "1ca526954560945eb17b32a04beb243313cd8d15f8685ced7e735ef236fac4a1",
+    "fork/calibration/CMakeLists.txt": "b99a0f5b1709db1f7b17b70fd9ef12eecd191d7c48e823ef1c960304ce4ea109",
+    "fork/calibration/cmake/TQCalibrationConfig.cmake.in": "6334e2d03016d3651d1374caf7e80a1f4f555fe15861e8884aecf3965e6d3c12",
+    "fork/calibration/include/tq/calibration/reader.h": "c5be0ed3fe924193058fdb19ffb91cfabc2e62876c5cf1d718c1ac755efd6501",
+    "fork/calibration/src/reader.cpp": "88fb17530cd8a20000f3a38785e9b1183519664d26291ce267d076d2140bf073",
+    "fork/calibration/tests/test-reader.cpp": "c0436611378f67d1e4f77285344a855e225dfc153e578f98f8134b6e9d01098f",
+    "fork/imatrix-compose/CMakeLists.txt": "93b8921e8650e28bff21607a2b99732807683a8d8d0eecf5e41cfc164e6e0434",
+    "fork/imatrix-compose/src/main.cpp": "49e807043fd89f8127c67b81b24f5c61b416efe7e0758f245f0c9e9a26248d64",
+    "fork/imatrix-compose/src/output-files.h": "709263ed41d14052c42142c084c7b2fb14462d672518e035d8980bb83e7ecdd5",
+    "fork/imatrix-compose/tests/check_old_writer.py": "722b4d959609010a038029db5418e0b97f552ce5bb91bbbea92274855ec113e1",
+    "fork/imatrix-compose/tests/old-writer-fixture.cpp": "9ba97cfbacaeb16013af07d381f263a98ba76a8bd009834b7b0afc12cd130cbb",
+    "fork/imatrix-compose/tests/test_conversion.py": "cdb308a3376214794a060c02aadb51d2690174fa4feee9cc6c65d8b0e68c2cc3",
+    "fork/tests/a-seams/CMakeLists.txt": "0d9eb1fc4e403777c4481a78f5504d6f9795425af974d876b0df4ee20b251745",
+    "fork/tests/a-seams/vulkan-activation-cache.cpp": "5d64a8a5eab81562ae07827fe959240591c277f80ec6ff316b316192a9ade020",
+    "fork/tests/a-seams/vulkan-scratch-reuse.cpp": "27a1166a6f0ad7cac443a4a8461d4bfc4404b5493e1af18a1eb98c916fe3cc1c",
+    "fork/tests/a-seams/vulkan-set-rows-types.cpp": "7cff61e5824c503cafc658b3782bc1ca81fa4c76156e0f1926cb7c556b10d7fb",
+    "fork/tests/isolation.py": "387d8b41d7644a72878cdf1aa1bc1be789d53f7d44330e389331072c378b710c",
+    "fork/tests/package-consumer/CMakeLists.txt": "46c960e9c1f260ccc9c2d05b2436bc06e2dfe652ea777637a8ff4f8e0159f5b2",
+    "fork/tests/package-consumer/main.cpp": "46cd63840ad559326d2e4a03f7a57c1c658f9647ca30361196563041df6ca258",
+    "fork/text/CMakeLists.txt": "f63748c40271724b87f59a3dbff642175f761fce324284cc8b1b28decd3f28ee",
+    "fork/text/cmake/TQTextConfig.cmake.in": "b89b043a27e986c0921368f72342013acc80e5995d1f7f76333924fb58614e1a",
+    "fork/text/include/tq/text/stream.h": "9253d2bbb39520b1f458c5f046d4fdd31cbdac7bc305420476c9153434184f95",
+    "fork/text/src/stream.cpp": "24471064c40b6a156f889284fcd479f5b0e1dcd0f0f2f6a7ae48b0a4201f954d",
+    "fork/text/tests/stream-test.cpp": "8ecfb770e9745c04fdf790254e37e5d8c58a100622c4bb662516155615f21da5",
+    "fork/upstream-exceptions.json": "830a973a4e373d122d54f236984785de2d1b9cfeb3a8a67716a998c74b9f63dc",
+    "ggml/src/ggml-vulkan/ggml-vulkan.cpp": "6453d62fe781b6452406476f88ba4145fc55af7c7207b68357b1d8032a128c6a"
+  },
+  "raw_artifacts": {
+    "build-isolated-details-qualified-20261018/result.json": {
+      "bytes": 11497,
+      "sha256": "ff04e1d31f3810f8482bf9b6c824e78b6297dcf9926204af5105de7134994a15"
+    },
+    "build-isolated-details-qualified-20261018/commands.json": {
+      "bytes": 27869,
+      "sha256": "025fcf32411e327f709fc950edf019e7cccc948bf618c33402671ead1940bf5b"
+    },
+    "build-isolated-details-qualified-20261018/verified-boundary.json": {
+      "bytes": 10666,
+      "sha256": "25e8210cf75b3c8682af4a3972d52a10ed0945caef449b952a30ec8bfcac6213"
+    },
+    "build-clean-fork/details-standalone-sanitizers-chnkgw98/result.json": {
+      "bytes": 1809,
+      "sha256": "2905b4dcf6be0f0eadb6ac41541c6220fa1ce1b9b8b8450f364cd49d67598c5c"
+    },
+    "build-clean-fork/details-standalone-sanitizers-chnkgw98/text.stdout": {
+      "bytes": 112,
+      "sha256": "b386130975ec1c28fde0b02b1bf4d4613b261f456f52ebd613a7133ab108cdd8"
+    },
+    "build-clean-fork/details-standalone-sanitizers-chnkgw98/calibration.stdout": {
+      "bytes": 38,
+      "sha256": "45acaa7ba7661e3b094781add692fdcc40f61f389e6c64075abecbadc62f4e87"
+    },
+    "build-clean-fork/details-old-writer-2m_qvdko/build-provenance.json": {
+      "bytes": 864,
+      "sha256": "5b52575bc3b75929cc371e371dd89fb6169a0d2c8aff8706eb233087a0427697"
+    },
+    "build-clean-fork/details-old-writer-2m_qvdko/writer-check.json": {
+      "bytes": 2242,
+      "sha256": "0c8e4bf771dd586737a3a3e5f19617a73bd9bafc8a544796f354b7ceb8e50c5c"
+    },
+    "build-clean-fork/details-old-writer-2m_qvdko/quantizer-loader.json": {
+      "bytes": 1446,
+      "sha256": "d30d1a5d56a9b07736c5f4f929868dfe862e37719c676180cde5970c7e8d0805"
+    },
+    "build-clean-vulkan/details-gates-before-vz06thm3/commands.json": {
+      "bytes": 1325,
+      "sha256": "85eb93da9c02c7f4d99e67289eb12561ab47bb8578f45b7e40e8d3e978eef3e6"
+    },
+    "build-clean-vulkan/details-gates-before-vz06thm3/cpu-backend-sweep.stdout": {
+      "bytes": 5200124,
+      "sha256": "fc97309a3fc5d42bbce0acd788d763dc778fce31b022d3758786612761303f2f"
+    },
+    "build-clean-vulkan/details-gates-before-vz06thm3/turbo-codec.stdout": {
+      "bytes": 1696,
+      "sha256": "73943d52981905705c2da9241c0af29ad161063475c9ce8c8625fbf985495f09"
+    },
+    "build-clean-vulkan/details-gates-before-vz06thm3/quantize-functions.stdout": {
+      "bytes": 689,
+      "sha256": "16b0cc9038282046c2c075323186697cb9dfdfd4c08132aa256d977a2137a977"
+    },
+    "build-clean-vulkan/details-gate-controls-yq2c068_/result.json": {
+      "bytes": 4589,
+      "sha256": "2acafbdab9ef7782290e32314a2bf5295aa36c4bc3c38488d922e28d5b06f38d"
+    },
+    "build-clean-vulkan/details-vulkan-gate-57in_i53/command.json": {
+      "bytes": 380,
+      "sha256": "6a4a287e2abae437cfc27dd9e7f56a8def3f2709b13dc639b51dfc48c96c82ac"
+    },
+    "build-clean-vulkan/details-vulkan-gate-57in_i53/result.json": {
+      "bytes": 431,
+      "sha256": "1d1a16c6976bfcf5b459075b0dabca7a1b7678d5c13849c1e2b44494720eb039"
+    },
+    "build-clean-vulkan/details-no-split-binary-before-t1gqpmbg/receipt.json": {
+      "bytes": 1290,
+      "sha256": "cde91a9685dcc154ccc9bc0e7f78ad962ebf308741d9a4d00fee444d7fcc0a05"
+    },
+    "build-clean-vulkan/details-activation-offset-before-d3kmq975/receipt.json": {
+      "bytes": 1689,
+      "sha256": "fdc48398b4722345443c78e4bbf05e61e33f6d5b520dc2c9a329aa821f64d332"
+    },
+    "build-clean-vulkan/details-activation-offset-before-d3kmq975/inplace.stdout": {
+      "bytes": 701,
+      "sha256": "10f4a6d14e861bc04850c675515a7b7501452a8f1fd2e59dc9d9162840f93333"
+    },
+    "build-clean-vulkan/details-final-gpu-pii1wep9/identity.json": {
+      "bytes": 760,
+      "sha256": "530c311b92341a12ccab620f7cd36e5794850c3fe3fc2c79709f594e7c140efa"
+    },
+    "build-clean-vulkan/details-final-gpu-pii1wep9/commands.json": {
+      "bytes": 3313,
+      "sha256": "7eba871f9a8dd6694ed35ae722e1d8808e75639ec3f31d8a52540f54180ec0b3"
+    },
+    "build-clean-vulkan/details-final-gpu-pii1wep9/result.json": {
+      "bytes": 345,
+      "sha256": "0ddaff9c9d4f4175a205d2825b261782e79d7d3a9f4a4e994e69aaa761bc3ab6"
+    },
+    "build-clean-vulkan/details-final-gpu-pii1wep9/backend-full.stdout": {
+      "bytes": 5228284,
+      "sha256": "c94f44d5f2dffa9e49b0ae388989583e7c33d1f9b26963a5925bc30876fc78c3"
+    },
+    "build-clean-vulkan/details-final-gpu-pii1wep9/a-seams-test.stdout": {
+      "bytes": 12190,
+      "sha256": "fefd2bf566984dcb147c59129190a48454433f2a5c3a3f328b4b278a385b9f82"
+    },
+    "build-clean-vulkan/details-final-gpu-pii1wep9/turbo-bench.stdout": {
+      "bytes": 23076,
+      "sha256": "25494ee8bcdaf3a7616dd3042a5387c67a6c728bf153d1280cf544927e74f3eb"
+    },
+    "build-clean-fork/details-build-entry-mob1rldf/result.json": {
+      "bytes": 218,
+      "sha256": "22d2e0bfdb55b68a8d253160bfe4daf799cf62fc1b326ac4c8492455d86f930a"
+    },
+    "build-clean-vulkan/details-build-entry-4byg2csx/result.json": {
+      "bytes": 223,
+      "sha256": "5f60a01073ba0baffd37f1c0a01bff1c70f8cbb27210105c31b0cff9c71efc33"
+    },
+    "build-clean-vulkan/details-eof-seams-20261018.log": {
+      "bytes": 887,
+      "sha256": "b7db830371469658657779816dce404306dc854e5fa191ece0ab58fc2fb12392"
+    }
+  }
+}
