@@ -1,7 +1,12 @@
 #include "evidence.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace tq::relay::probe {
@@ -15,6 +20,7 @@ const char * case_names[] = {
     "producer_delay_ordering",   "ticket_semantics",        "multi_group_completion", "abort_stop",
     "host_system_rmw_u64_add",   "host_system_rmw_u64_cas", "five_rank_cross_device", "multi_consumer_output_credit",
     "delayed_consumer_ordering", "two_bank_rotation",       "varying_live_bytes",     "five_stream_relay_cycle",
+    "offset_addressing",         "multi_group_ordering",
 };
 
 const char * name_of(const char * const * names, std::size_t count, std::size_t index) noexcept {
@@ -248,6 +254,41 @@ std::string to_json(const bench_report & report) {
     }
     out += "]}";
     return out;
+}
+
+write_result write_file_exclusive(const std::string & path, const std::string & content) {
+    const std::string temp_path = path + ".tmp." + std::to_string(::getpid());
+    const int         fd        = ::open(temp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        return { 2, "cannot exclusively create " + temp_path + ": " + std::strerror(errno) };
+    }
+    const ssize_t written = ::write(fd, content.data(), content.size());
+    if (written != static_cast<ssize_t>(content.size())) {
+        const std::string message =
+            "writing " + temp_path + " failed: " + (written < 0 ? std::strerror(errno) : "short write");
+        (void) ::close(fd);
+        (void) ::unlink(temp_path.c_str());
+        return { 2, message };
+    }
+    if (::fsync(fd) != 0) {
+        const std::string message = "syncing " + temp_path + " failed: " + std::strerror(errno);
+        (void) ::close(fd);
+        (void) ::unlink(temp_path.c_str());
+        return { 2, message };
+    }
+    if (::close(fd) != 0) {
+        const std::string message = "closing " + temp_path + " failed: " + std::strerror(errno);
+        (void) ::unlink(temp_path.c_str());
+        return { 2, message };
+    }
+    if (::link(temp_path.c_str(), path.c_str()) != 0) {
+        const std::string message = std::string("cannot publish ") + path + ": " + std::strerror(errno) +
+                                    (errno == EEXIST ? " (refusing to replace existing evidence)" : "");
+        (void) ::unlink(temp_path.c_str());
+        return { 2, message };
+    }
+    (void) ::unlink(temp_path.c_str());
+    return { 0, "" };
 }
 
 }  // namespace tq::relay::probe

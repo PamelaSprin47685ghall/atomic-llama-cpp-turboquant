@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-19",
+  "status": "Handoff batch complete: two guide-required cases added, evidence path made failure-tolerant, atomic publish implemented. Five-rank cross-device qualification remains pending the real five-GPU machine.",
+  "all_release_gates_passed": false,
+  "identity": {
+    "repository": "atomic-llama-cpp-turboquant",
+    "branch": "clean/fork-20261018",
+    "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "superseded_batch_commit": "35d41c8fc",
+    "superseded_batch_index": "audit/relay-probe-evidence-20261019.json",
+    "provenance_note": "The 16-case report (0cdd86bd) stays byte-identical history; this batch supersedes its qualification conclusions with the 18-case registry report below."
+  },
+  "source": {
+    "probe_root": "fork/relay-probe",
+    "digests_at_head_before_commit": {
+      "main.cpp": "c549e8412c02ab76f6c177f953bff0bf23b14280e90167c5739ff4f6f2d37ccd",
+      "evidence.cpp": "a2d198dad3e900099097befad35eb9cb51620c578bef236e02ca252c30434bb7",
+      "evidence.h": "daca0d174aedf69c5d39bfe78d304d07a9ca2fe2d1c00919c22aac505c75b5dc",
+      "config-test.cpp": "63cd4be2d454f10129cca83a6e49791eaac8bb7ed8eab0c5fb37357c9e805017"
+    }
+  },
+  "runtime": {
+    "system": "Linux x86_64",
+    "host_compiler": "GCC 16.2.1",
+    "probe_tu_compiler": "HIP clang (ROCm 7.2.4)",
+    "hip_runtime": "7.2.4",
+    "gpu": "AMD Radeon RX 6800",
+    "gcn_arch": "gfx1030",
+    "device_count": 1,
+    "rounds": 2000
+  },
+  "changes": [
+    "case offset_addressing (guide 39.5 H06): interior slot at byte 72, 8-byte aligned but cache-line straddling, both directions, prefix/suffix arena guards",
+    "case multi_group_ordering (guide 39.6 P01/P02): deterministic reverse-order delays, max-index group finishes first, trap observation requires ready unpublished, 8 rounds",
+    "check_hip throws hip_error instead of exit(1); run_case records per-case failures and drains best effort",
+    "device setup failure keeps a device record with device_identity=fail and not_run handshake cases; teardown is null-tolerant",
+    "run_five_rank never aborts the process: HIP failures attributed by rank, best-effort drain and teardown, report always written",
+    "bench failure no longer loses the report; bench skipped with a nonzero result if device 0 setup failed",
+    "evidence publish via same-directory temp file + fsync + hard link; existing files and symlinks refused; no temp residue on any path",
+    "CLI rejects --output and --bench naming the same file before any GPU work"
+  ],
+  "evidence": {
+    "report": {
+      "path": "build-relay-probe-20261019b/probe-report-final-20261019b.json",
+      "sha256": "3ff3a3b62dcb6c668d1792484189ff009aa24ed024180148393581816c5f03a6",
+      "qualification": "pass",
+      "summary": "18-case registry; 17 cases per device: all pass except the expected platform fact host_system_rmw_u64_add=fail; five_rank_status=not_run (one device present)."
+    },
+    "bench": {
+      "path": "build-relay-probe-20261019b/probe-bench-final-20261019b.json",
+      "sha256": "e2a66eec76735a0a36ddb71631a35ae12da97467aadad202baab3d5f83a33de0",
+      "medians": {
+        "host_publish_to_device_ack_ns": 9510,
+        "device_produce_to_host_ready_ns": 7270,
+        "five_stream_relay_cycle_ns": 29960,
+        "host_five_way_fold_bytes_per_second": 39326712472
+      }
+    },
+    "superseded": {
+      "sha256": "0cdd86bd4e2af7b6a2042fcdf64ba376e944b305539d791d8363a5f7c379cb8a",
+      "disposition": "preserved byte-for-byte as superseded history"
+    }
+  },
+  "verification": {
+    "builds": [
+      "HIP release build-relay-probe-20261019b with gfx1030; config test 1/1",
+      "no-HIP build build-relay-probe-nohip-20261019b; config test 1/1",
+      "relay release build-relay-20261018 4/4; relay sanitizer build-relay-san-20261018 4/4",
+      "fork/check-upstream.py exit 0"
+    ],
+    "cli_negative_checks": [
+      "--rounds 10x rejected exit 2",
+      "--rounds 0 rejected exit 2",
+      "--output same --bench same rejected exit 2, no file created",
+      "existing evidence file refused: exit 2, original bytes intact"
+    ],
+    "config_test_coverage": "18-case registry, pattern determinism, strict JSON serialization, exclusive-write success/refusal/content-intact/no-residue"
+  },
+  "limits": [
+    "Single-device results do not qualify five-rank cross-device behavior; run_five_rank has never executed on any machine.",
+    "Failure-tolerance paths are verified by code review, config tests and CLI negative checks, not by injecting HIP faults on real hardware.",
+    "Atomic publish does not claim crash durability of the directory entry; it guarantees a complete-or-absent file for a normally completing process.",
+    "Bench values are single-device observations and are not qualification gates."
+  ]
+}

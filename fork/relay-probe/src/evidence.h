@@ -36,6 +36,8 @@ enum class case_id {
     two_bank_rotation,
     varying_live_bytes,
     five_stream_relay_cycle,
+    offset_addressing,
+    multi_group_ordering,
 };
 
 const char * case_name(case_id value) noexcept;
@@ -121,5 +123,19 @@ struct bench_report {
 };
 
 std::string to_json(const bench_report & report);
+
+// Exclusive complete-file publish (guide 16.3, 42.5): write `content` to a
+// same-directory temporary file, fsync it, then hard-link it into place, so
+// `path` either appears complete or does not appear at all. An existing file
+// or symlink is never replaced. The temporary name is removed on every path;
+// its removal after a successful link is best effort and does not invalidate
+// the published evidence. Durability of the directory entry across a crash
+// is not claimed.
+struct write_result {
+    int         code = 0;  // 0 published; 2 refusal or I/O failure
+    std::string message;
+};
+
+write_result write_file_exclusive(const std::string & path, const std::string & content);
 
 }  // namespace tq::relay::probe

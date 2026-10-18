@@ -31,12 +31,13 @@
 # SPEC
 
 1. [LEMMA 1、3、4] 双向发布、2000 代热复用、精确票据、生产延迟排序、多工作组
-   最后到达、abort、逐操作 RMW、五消费者 credit、延迟最后读者、双 bank 轮换、
-   可变有效长度、五流 RELAY 环与五卡用例分别实现并有独立结果。
+   最后到达、确定性反序完成、abort、逐操作 RMW、五消费者 credit、延迟最后读者、
+   双 bank 轮换、可变有效长度、非零偏移内部槽、五流 RELAY 环与五卡用例分别
+   实现并有独立结果。
    Proof: `src/main.cpp` 的各 case 函数；本机全量运行报告 SHA-256
-   0cdd86bd4e2af7b6a2042fcdf64ba376e944b305539d791d8363a5f7c379cb8a
-   （RX 6800 / gfx1030，ROCm 7.2.4，2026-10-19）。12 用例旧报告
-   9d1d1429…684112 保留为被取代的历史身份。
+   3ff3a3b62dcb6c668d1792484189ff009aa24ed024180148393581816c5f03a6
+   （RX 6800 / gfx1030，ROCm 7.2.4，2026-10-19，18 用例注册表）。16 用例报告
+   0cdd86bd…9cb8a 与 12 用例报告 9d1d1429…684112 保留为被取代的历史身份。
 2. [AXIOM 3] 证据报告是严格 JSON、排他创建；设备数不等于 5 时五卡用例保持
    not_run；单机强制用例全部通过时 qualification=pass，且报告注明范围。
    Proof: `src/evidence.cpp` 与 `tests/config-test.cpp`；实际报告可由任意
@@ -63,6 +64,19 @@
    `five_rank_cross_device` 注册项因此可达。
    Proof: `run_five_rank` / `rank_write_kernel`；2026-10-19 单卡 2000 轮
    smoke qualification=pass、five_rank=not_run，不构成跨设备证据。
+7. [AXIOM 1、3] 单个 rank 或设备的 HIP 失败不抹掉已收集证据：HIP 错误是异常，
+   逐用例捕获并记为对应 case 的 fail，setup 失败的设备以
+   `device_identity=fail` 留在报告里，五卡用例在任何 HIP 失败下仍按 rank 归因
+   并写出报告；只有设备枚举失败才可能无报告。
+   Proof: `hip_error` / `run_case` / `run_probe` / `run_five_rank`；
+   2026-10-19 单卡 2000 轮运行退出 0，故障路径由逐项代码评审保证，五卡机
+   首次运行前不声称已实测。
+8. [AXIOM 3] 证据文件经同目录临时文件写入、fsync、硬链接原子发布：目标路径
+   要么完整出现要么不出现，已有文件与符号链接拒绝覆盖；临时名在任何路径下
+   清除，链接成功后残留临时名不使证据失效。
+   Proof: `evidence.cpp` 的 `write_file_exclusive`；
+   `tests/config-test.cpp` 的 `check_exclusive_write` 覆盖首写成功、二次
+   拒绝、内容不变与无残留（无 GPU 即可运行）。
 
 # Exceptions
 

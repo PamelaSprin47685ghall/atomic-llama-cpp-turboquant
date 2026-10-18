@@ -3,12 +3,19 @@
 
 #include "evidence.h"
 
+#include <dirent.h>
+#include <stdlib.h>
+#include <unistd.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace tq::relay::probe;
 
@@ -21,7 +28,7 @@ void check(bool condition, const char * message) {
 }
 
 void check_case_registry() {
-    check(case_count() == 16, "case registry size drifted");
+    check(case_count() == 18, "case registry size drifted");
     const case_id all[] = {
         case_id::device_identity,           case_id::mapped_host_access,
         case_id::cpu_to_gpu_publish,        case_id::gpu_to_cpu_publish,
@@ -31,6 +38,7 @@ void check_case_registry() {
         case_id::five_rank_cross_device,    case_id::multi_consumer_output_credit,
         case_id::delayed_consumer_ordering, case_id::two_bank_rotation,
         case_id::varying_live_bytes,        case_id::five_stream_relay_cycle,
+        case_id::offset_addressing,         case_id::multi_group_ordering,
     };
     for (std::size_t i = 0; i < case_count(); ++i) {
         check(case_name(all[i]) != nullptr && case_name(all[i])[0] != '\0', "case name must exist");
@@ -38,6 +46,48 @@ void check_case_registry() {
             check(std::string(case_name(all[i])) != case_name(all[j]), "case names must be unique");
         }
     }
+}
+
+void check_exclusive_write() {
+    char   dir_template[] = "/tmp/tq-relay-probe-write-XXXXXX";
+    char * dir            = mkdtemp(dir_template);
+    check(dir != nullptr, "mkdtemp failed");
+    const std::string base    = std::string(dir) + "/evidence.json";
+    const std::string content = "{\"evidence\":true}\n";
+
+    // First publish succeeds and the file content is complete on disk.
+    const write_result first = write_file_exclusive(base, content);
+    check(first.code == 0, "first exclusive write must succeed");
+    std::ifstream input(base);
+    std::string   on_disk((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    check(on_disk == content, "published content must match what was written");
+
+    // A second publish refuses to replace the existing file and leaves the
+    // original content untouched.
+    const write_result second = write_file_exclusive(base, "{\"replaced\":true}\n");
+    check(second.code != 0, "existing evidence must not be replaced");
+    check(second.message.find("exist") != std::string::npos, "refusal must explain the existing file");
+    input.clear();
+    input.seekg(0);
+    on_disk.assign((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    check(on_disk == content, "the original evidence must stay intact");
+
+    // No temporary names may remain, and the directory must contain exactly
+    // the one published file.
+    DIR * listing = opendir(dir);
+    check(listing != nullptr, "opendir failed");
+    std::vector<std::string> entries;
+    while (dirent * entry = readdir(listing)) {
+        const std::string name = entry->d_name;
+        if (name != "." && name != "..") {
+            entries.push_back(name);
+        }
+    }
+    closedir(listing);
+    check(entries.size() == 1 && entries[0] == "evidence.json", "temporary names must not remain");
+
+    check(unlink(base.c_str()) == 0, "test cleanup unlink failed");
+    check(rmdir(dir) == 0, "test cleanup rmdir failed");
 }
 
 void check_bench_json() {
@@ -127,6 +177,7 @@ int main() {
         check_patterns();
         check_json();
         check_bench_json();
+        check_exclusive_write();
     } catch (const std::exception & error) {
         std::cerr << "FAIL: " << error.what() << "\n";
         return 1;

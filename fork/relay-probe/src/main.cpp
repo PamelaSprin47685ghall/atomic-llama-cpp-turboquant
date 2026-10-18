@@ -12,10 +12,14 @@
 // same __atomic builtins, never through std::atomic reinterpretation
 // (guide 31.6). This program reports platform facts: it does not qualify a
 // model, a scheduler, or an end-to-end relay (guide 31.7).
+//
+// HIP failures never erase collected evidence: a per-case HIP error marks
+// that case failed and moves on, a device that fails setup still appears in
+// the report, and the five-rank case attributes errors by rank. Only a
+// failure before any device can be enumerated aborts without a report.
 
 #include "evidence.h"
 
-#include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_version.h>
 #include <sys/types.h>
@@ -24,10 +28,12 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <ratio>
@@ -43,6 +49,8 @@ using tq::relay::probe::outcome;
 using tq::relay::probe::pattern_word;
 using tq::relay::probe::probe_report;
 using tq::relay::probe::to_json;
+using tq::relay::probe::write_file_exclusive;
+using tq::relay::probe::write_result;
 
 constexpr std::uint32_t PAYLOAD_WORDS  = 8;
 constexpr std::uint64_t GUARD_VALUE    = 0x1F1E1D1C1B1A1918ULL;
@@ -58,12 +66,13 @@ enum device_exit : std::uint32_t {
 };
 
 struct control_block {
-    std::uint64_t ticket;     // CPU -> GPU generation word
-    std::uint64_t ready;      // GPU -> CPU generation word
-    std::uint64_t ack;        // CPU -> GPU round acknowledgment
-    std::uint64_t abort;      // stop word, owner CPU
-    std::uint64_t half_done;  // delayed producer first-half marker
-    std::uint64_t exit_code;  // kernel exit code
+    std::uint64_t ticket;      // CPU -> GPU generation word
+    std::uint64_t ready;       // GPU -> CPU generation word
+    std::uint64_t ack;         // CPU -> GPU round acknowledgment
+    std::uint64_t abort;       // stop word, owner CPU
+    std::uint64_t half_done;   // delayed producer first-half marker
+    std::uint64_t first_done;  // ordering trap marker: max-index group finished
+    std::uint64_t exit_code;   // kernel exit code
 };
 
 struct slot {
@@ -76,10 +85,19 @@ std::string format_error(const char * what, hipError_t error) {
     return std::string(what) + ": " + hipGetErrorString(error);
 }
 
+class hip_error : public std::exception {
+  public:
+    explicit hip_error(std::string message) : message_(std::move(message)) {}
+
+    const char * what() const noexcept override { return message_.c_str(); }
+
+  private:
+    std::string message_;
+};
+
 void check_hip(hipError_t error, const char * what) {
     if (error != hipSuccess) {
-        std::fprintf(stderr, "probe failure: %s\n", format_error(what, error).c_str());
-        std::exit(1);
+        throw hip_error(format_error(what, error));
     }
 }
 
@@ -278,6 +296,33 @@ __global__ void group_writer_kernel(std::uint64_t * payload,
     const std::uint32_t old = atomicAdd(counter, 1u);
     if (old == live_groups - 1) {
         release_store(&cb->ready, live_groups);
+    }
+}
+
+// Forced-out-of-order completion (guide 39.6 P01, P02): every workgroup
+// spins a deterministic delay that shrinks with its index, so the
+// maximum-index group provably finishes first and the minimum-index group
+// last. A publisher that fires from the maximum index instead of the true
+// last arrival is caught deterministically, not by scheduling luck. The
+// first finisher publishes first_done, which gives the host a proper
+// release/acquire pair for observing the trap window.
+__global__ void ordered_group_writer_kernel(std::uint64_t * payload,
+                                            std::uint32_t * counter,
+                                            control_block * cb,
+                                            std::uint32_t   seed,
+                                            std::uint64_t   delay_step) {
+    if (blockIdx.x >= 8) {
+        return;
+    }
+    spin_budget((7 - blockIdx.x) * delay_step);
+    payload[blockIdx.x] = pattern_word(8, blockIdx.x, seed);
+    device_fence_system();
+    const std::uint32_t old = atomicAdd(counter, 1u);
+    if (blockIdx.x == 7) {
+        release_store(&cb->first_done, 8);
+    }
+    if (old == 7) {
+        release_store(&cb->ready, 8);
     }
 }
 
@@ -513,6 +558,16 @@ struct device_context {
 
 constexpr std::uint32_t RANKS = 5;
 
+// Handshake cases that require mapped host memory, minus mapped_host_access
+// itself, which carries the availability detail in its own record.
+constexpr case_id handshake_cases[] = {
+    case_id::cpu_to_gpu_publish,        case_id::gpu_to_cpu_publish,      case_id::producer_delay_ordering,
+    case_id::ticket_semantics,          case_id::multi_group_completion,  case_id::abort_stop,
+    case_id::host_system_rmw_u64_add,   case_id::host_system_rmw_u64_cas, case_id::multi_consumer_output_credit,
+    case_id::delayed_consumer_ordering, case_id::two_bank_rotation,       case_id::varying_live_bytes,
+    case_id::five_stream_relay_cycle,   case_id::offset_addressing,       case_id::multi_group_ordering,
+};
+
 outcome result_of(const device_context & ctx, case_id id) {
     for (const auto & item : ctx.record.cases) {
         if (item.id == id) {
@@ -531,6 +586,25 @@ void set_case(device_context & ctx, case_id id, outcome result, std::string deta
         }
     }
     ctx.record.cases.push_back({ id, result, std::move(detail) });
+}
+
+// Run one case. A HIP failure inside the case must not erase the evidence
+// collected so far: it is recorded as this case's failure, the stop word is
+// set for any still-waiting device work, and a best-effort drain keeps the
+// next case starting from a quiescent device (guide 47.2, 53.5).
+void run_case(device_context & ctx, case_id id, void (*run)(device_context &)) {
+    try {
+        run(ctx);
+    } catch (const std::exception & error) {
+        set_case(ctx, id, outcome::fail, std::string("unexpected failure: ") + error.what());
+        if (ctx.cb != nullptr) {
+            release_store(&ctx.cb->abort, 1);
+        }
+        if (ctx.record.ordinal >= 0) {
+            (void) hipSetDevice(ctx.record.ordinal);
+            (void) hipDeviceSynchronize();
+        }
+    }
 }
 
 // Record a failure, abort still-waiting device work and drain it before the
@@ -556,6 +630,7 @@ void reset_control(control_block & cb) {
     release_store(&cb.ack, 0);
     release_store(&cb.abort, 0);
     release_store(&cb.half_done, 0);
+    release_store(&cb.first_done, 0);
     release_store(&cb.exit_code, 0);
 }
 
@@ -739,6 +814,59 @@ void case_multi_group(device_context & ctx) {
              "last-arrival publishing works with 8 and with 2 live groups of an 8-group grid");
 }
 
+// Guide 39.6 P01/P02: the maximum-index workgroup provably finishes first
+// and the minimum-index one last. The trap observation requires the ready
+// word to stay unpublished while the max-index group is done; a publisher
+// keyed on the largest block index would fire early and is caught every
+// round instead of depending on incidental scheduling order.
+void case_multi_group_ordering(device_context & ctx) {
+    constexpr std::uint32_t ORDER_ROUNDS  = 8;
+    // ~22 ms per step at the measured 2.3 GHz clock64: block 0 spins about
+    // 154 ms, leaving a large deterministic trap window for the host.
+    constexpr std::uint64_t DELAY_STEP    = 50000000ULL;
+    bool                    trap_observed = false;
+    for (std::uint32_t round = 0; round < ORDER_ROUNDS; ++round) {
+        reset_control(*ctx.cb);
+        init_guards(*ctx.slot_ptr);
+        std::memset(ctx.slot_ptr->payload, 0, sizeof(ctx.slot_ptr->payload));
+        check_hip(hipMemset(ctx.counter, 0, sizeof(std::uint32_t)), "ordering counter memset");
+        ordered_group_writer_kernel<<<8, 64>>>(ctx.slot_ptr->payload, ctx.counter, ctx.cb, ctx.seed, DELAY_STEP);
+        double     unused     = 0;
+        const bool first_done = spin_until([&] { return acquire_load(&ctx.cb->first_done) == 8; }, 5000.0, unused);
+        if (!first_done) {
+            fail_case(ctx, case_id::multi_group_ordering, outcome::fail, "max-index group never finished");
+            return;
+        }
+        if (acquire_load(&ctx.cb->ready) == 0) {
+            trap_observed = true;
+        }
+        const bool all_done = spin_until([&] { return acquire_load(&ctx.cb->ready) == 8; }, 5000.0, unused);
+        check_hip(hipDeviceSynchronize(), "ordering sync");
+        if (!all_done) {
+            fail_case(ctx, case_id::multi_group_ordering, outcome::fail,
+                      "ready did not fire after the delayed last arrival");
+            return;
+        }
+        bool ok = true;
+        for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+            ok = ok && ctx.slot_ptr->payload[i] == pattern_word(8, i, ctx.seed);
+        }
+        if (!ok || !guards_intact(*ctx.slot_ptr)) {
+            fail_case(ctx, case_id::multi_group_ordering, outcome::fail,
+                      "payload incomplete when ready fired (premature publish)");
+            return;
+        }
+    }
+    if (!trap_observed) {
+        fail_case(ctx, case_id::multi_group_ordering, outcome::fail,
+                  "the max-index-done-before-ready window was never observed");
+        return;
+    }
+    set_case(ctx, case_id::multi_group_ordering, outcome::pass,
+             "max-index group finished first while ready stayed unpublished in " + std::to_string(ORDER_ROUNDS) +
+                 " rounds; payload complete when ready fired");
+}
+
 void case_abort(device_context & ctx) {
     reset_control(*ctx.cb);
     ticket_wait_kernel<<<1, 64>>>(ctx.cb, 1);
@@ -760,7 +888,15 @@ void case_host_rmw(device_context & ctx) {
     release_store(ctx.rmw_add, 0);
     release_store(ctx.rmw_cas, 0);
     rmw_probe_kernel<<<1, 64>>>(ctx.rmw_add, ctx.rmw_cas);
-    check_hip(hipDeviceSynchronize(), "rmw sync");
+    const hipError_t sync = hipDeviceSynchronize();
+    if (sync != hipSuccess) {
+        // One launch feeds both capability bits: a HIP failure fails both
+        // of them, so neither record silently stays not_run.
+        const std::string detail = format_error("rmw sync", sync);
+        set_case(ctx, case_id::host_system_rmw_u64_add, outcome::fail, detail);
+        set_case(ctx, case_id::host_system_rmw_u64_cas, outcome::fail, detail);
+        return;
+    }
     const std::uint64_t add_value = acquire_load(ctx.rmw_add);
     const std::uint64_t cas_value = acquire_load(ctx.rmw_cas);
     // Per-operation capability bits (guide 31.3): a wrong value is worse
@@ -1051,6 +1187,123 @@ void case_varying_live(device_context & ctx) {
                  " generations; the tail was never written");
 }
 
+// Guide 39.5 H06: the relay design places payloads at non-zero offsets
+// inside shared arenas (guide 51.7), so address arithmetic is a first-class
+// failure mode. The arena below places a full slot at byte 72: 8-byte
+// aligned but not 64-byte line aligned, straddling two cache lines. Guard
+// words around the arena catch a write aimed at the base or past the end;
+// the slot's own guards catch payload overruns.
+constexpr std::uint32_t OFFSET_PREFIX_WORDS = 9;  // 72 bytes
+constexpr std::uint32_t OFFSET_SUFFIX_WORDS = 9;
+
+struct offset_arena {
+    std::uint64_t prefix[OFFSET_PREFIX_WORDS];
+    slot          interior;
+    std::uint64_t suffix[OFFSET_SUFFIX_WORDS];
+};
+
+static_assert(offsetof(offset_arena, interior) % sizeof(std::uint64_t) == 0,
+              "the interior slot must stay 8-byte aligned");
+static_assert(offsetof(offset_arena, interior) % 64 != 0, "the interior slot must straddle cache lines");
+
+void case_offset_addressing(device_context & ctx) {
+    constexpr std::uint32_t OFFSET_ROUNDS = 8;
+    check_hip(hipSetDevice(ctx.record.ordinal), "offset set device");
+    offset_arena * arena = nullptr;
+    check_hip(hipHostMalloc(&arena, sizeof(offset_arena), hipHostMallocMapped | hipHostMallocPortable),
+              "offset arena alloc");
+    // Free the arena on every exit path, including thrown HIP errors.
+    const auto cleanup = [&] {
+        (void) hipSetDevice(ctx.record.ordinal);
+        (void) hipHostFree(arena);
+    };
+
+    std::memset(arena, 0, sizeof(offset_arena));
+    for (auto & word : arena->prefix) {
+        word = GUARD_VALUE;
+    }
+    for (auto & word : arena->suffix) {
+        word = GUARD_VALUE;
+    }
+    init_guards(arena->interior);
+    const auto guards_ok = [&] {
+        bool ok = guards_intact(arena->interior);
+        for (const std::uint64_t word : arena->prefix) {
+            ok = ok && word == GUARD_VALUE;
+        }
+        for (const std::uint64_t word : arena->suffix) {
+            ok = ok && word == GUARD_VALUE;
+        }
+        return ok;
+    };
+
+    // Phase A: the host publishes at the interior offset and the device
+    // consumes through the same interior address.
+    reset_control(*ctx.cb);
+    for (std::uint64_t generation = 1; generation <= OFFSET_ROUNDS; ++generation) {
+        for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+            arena->interior.payload[i] = pattern_word(generation, i, ctx.seed);
+        }
+        release_store(&ctx.cb->exit_code, EXIT_OK);
+        host_fence_release();
+        release_store(&ctx.cb->ticket, generation);
+        consume_kernel<<<1, 64>>>(ctx.cb, &arena->interior, ctx.out_word, generation, ctx.seed);
+        double     unused = 0;
+        const bool acked  = spin_until([&] { return acquire_load(&ctx.cb->ack) == generation; }, 2000.0, unused);
+        if (!acked || *ctx.out_word != derived_word(generation, ctx.seed) ||
+            acquire_load(&ctx.cb->exit_code) != EXIT_OK || !guards_ok()) {
+            cleanup();
+            fail_case(ctx, case_id::offset_addressing, outcome::fail,
+                      "interior consume round " + std::to_string(generation) + " failed or guards damaged");
+            return;
+        }
+    }
+
+    // Phase B: the device produces at the interior offset and the host reads
+    // it back, one generation at a time.
+    reset_control(*ctx.cb);
+    produce_loop_kernel<<<1, 64>>>(ctx.cb, &arena->interior, OFFSET_ROUNDS, ctx.seed);
+    for (std::uint64_t generation = 1; generation <= OFFSET_ROUNDS; ++generation) {
+        double     unused   = 0;
+        const bool produced = spin_until([&] { return acquire_load(&ctx.cb->ready) == generation; }, 2000.0, unused);
+        if (!produced) {
+            cleanup();
+            fail_case(ctx, case_id::offset_addressing, outcome::fail,
+                      "interior produce generation " + std::to_string(generation) + " was not published");
+            return;
+        }
+        for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+            if (arena->interior.payload[i] != pattern_word(generation, i, ctx.seed)) {
+                cleanup();
+                fail_case(ctx, case_id::offset_addressing, outcome::fail,
+                          "interior produce generation " + std::to_string(generation) + " is torn or stale");
+                return;
+            }
+        }
+        if (!guards_ok()) {
+            cleanup();
+            fail_case(ctx, case_id::offset_addressing, outcome::fail,
+                      "arena guards damaged at generation " + std::to_string(generation));
+            return;
+        }
+        host_fence_release();
+        release_store(&ctx.cb->ack, generation);
+    }
+    const hipError_t sync = hipDeviceSynchronize();
+    cleanup();
+    if (sync != hipSuccess) {
+        set_case(ctx, case_id::offset_addressing, outcome::fail, format_error("offset sync", sync));
+        return;
+    }
+    if (acquire_load(&ctx.cb->exit_code) != EXIT_OK) {
+        fail_case(ctx, case_id::offset_addressing, outcome::fail, "interior producer exit");
+        return;
+    }
+    set_case(ctx, case_id::offset_addressing, outcome::pass,
+             "interior slot at byte " + std::to_string(offsetof(offset_arena, interior)) +
+                 " (8-byte aligned, cache-line straddling) round-tripped in both directions; arena guards intact");
+}
+
 void case_five_stream(device_context & ctx) {
     reset_control(*ctx.cb);
     init_guards(*ctx.slot_ptr);
@@ -1138,20 +1391,47 @@ void allocate_device_context(device_context & ctx, std::int32_t ordinal, std::ui
 }
 
 void free_device_context(device_context & ctx) {
+    // A context whose setup threw partway owns only some of these pointers;
+    // release what exists so the report can still be written.
+    if (ctx.record.ordinal < 0) {
+        return;
+    }
     // hipFree acts on the current device; after the five-rank case the
     // current device is whatever rank ran last, so pin the owner here.
     check_hip(hipSetDevice(ctx.record.ordinal), "free set device");
-    check_hip(hipHostFree(ctx.cb), "control host free");
-    check_hip(hipHostFree(ctx.slot_ptr), "slot host free");
-    check_hip(hipHostFree(ctx.out_word), "out host free");
-    check_hip(hipHostFree(ctx.rmw_add), "rmw add free");
-    check_hip(hipHostFree(ctx.rmw_cas), "rmw cas free");
-    check_hip(hipHostFree(ctx.slot2_ptr), "slot2 host free");
-    check_hip(hipHostFree(ctx.rank_ack), "rank ack free");
-    check_hip(hipHostFree(ctx.rank_result), "rank result free");
-    check_hip(hipHostFree(ctx.rank_ready), "rank ready free");
-    check_hip(hipHostFree(ctx.rank_partials), "rank partials free");
-    check_hip(hipFree(ctx.counter), "counter free");
+    if (ctx.cb != nullptr) {
+        check_hip(hipHostFree(ctx.cb), "control host free");
+    }
+    if (ctx.slot_ptr != nullptr) {
+        check_hip(hipHostFree(ctx.slot_ptr), "slot host free");
+    }
+    if (ctx.out_word != nullptr) {
+        check_hip(hipHostFree(ctx.out_word), "out host free");
+    }
+    if (ctx.rmw_add != nullptr) {
+        check_hip(hipHostFree(ctx.rmw_add), "rmw add free");
+    }
+    if (ctx.rmw_cas != nullptr) {
+        check_hip(hipHostFree(ctx.rmw_cas), "rmw cas free");
+    }
+    if (ctx.slot2_ptr != nullptr) {
+        check_hip(hipHostFree(ctx.slot2_ptr), "slot2 host free");
+    }
+    if (ctx.rank_ack != nullptr) {
+        check_hip(hipHostFree(ctx.rank_ack), "rank ack free");
+    }
+    if (ctx.rank_result != nullptr) {
+        check_hip(hipHostFree(ctx.rank_result), "rank result free");
+    }
+    if (ctx.rank_ready != nullptr) {
+        check_hip(hipHostFree(ctx.rank_ready), "rank ready free");
+    }
+    if (ctx.rank_partials != nullptr) {
+        check_hip(hipHostFree(ctx.rank_partials), "rank partials free");
+    }
+    if (ctx.counter != nullptr) {
+        check_hip(hipFree(ctx.counter), "counter free");
+    }
 }
 
 // One guarded host allocation for the five-rank case (guide 39.5 H01): two
@@ -1171,76 +1451,114 @@ struct five_rank_mem {
 // fragment provenance and guards, then resets for the next round. A dead or
 // misbehaving rank is attributed by rank and round; streams are always
 // drained before the allocation is touched again or freed.
-outcome run_five_rank(std::vector<device_context> & contexts, probe_report & report) {
-    const std::uint32_t rounds = contexts[0].rounds;
-    five_rank_mem *     mem    = nullptr;
-    check_hip(hipHostMalloc(&mem, sizeof(five_rank_mem), hipHostMallocMapped | hipHostMallocPortable),
-              "five-rank host alloc");
-    std::memset(mem, 0, sizeof(five_rank_mem));
-    mem->guard_lo[0] = mem->guard_lo[1] = mem->guard_hi[0] = mem->guard_hi[1] = GUARD_VALUE;
+outcome run_five_rank(std::vector<device_context> & contexts, probe_report & report, std::uint32_t rounds) {
+    std::string              failure;
+    std::uint32_t            failed_rank     = RANKS;  // sentinel: not a specific rank
+    std::uint32_t            current_rank    = RANKS;
+    five_rank_mem *          mem             = nullptr;
+    std::vector<hipStream_t> streams         = std::vector<hipStream_t>(RANKS, nullptr);
+    std::uint32_t            streams_created = 0;
 
-    std::vector<hipStream_t> streams(RANKS);
-    for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-        check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank set device");
-        check_hip(hipStreamCreate(&streams[rank]), "stream create");
-    }
-
-    std::string   failure;
-    std::uint32_t failed_rank = RANKS;  // sentinel: not a specific rank
-    for (std::uint64_t generation = 1; generation <= rounds && failure.empty(); ++generation) {
+    // A HIP failure anywhere in this case is attributed and reported; it
+    // never aborts the process, because the five-rank evidence is exactly
+    // what the operator came to collect.
+    try {
         for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-            check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank set device");
-            rank_write_kernel<<<1, 64, 0, streams[rank]>>>(mem->payload, mem->ready, rank, contexts[rank].seed,
-                                                           generation);
-        }
-        double     elapsed   = 0;
-        const bool all_ready = spin_until(
-            [&] {
-                for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-                    if (acquire_load(&mem->ready[rank]) != generation) {
-                        return false;
-                    }
-                }
-                return true;
-            },
-            5000.0, elapsed);
-        if (!all_ready) {
-            for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-                if (acquire_load(&mem->ready[rank]) != generation) {
-                    failed_rank = rank;
-                    failure     = "rank " + std::to_string(rank) + " did not publish ready in round " +
-                                  std::to_string(generation) + " within 5 s";
-                    break;
-                }
-            }
-        }
-        // Drain every stream before reading payload or resetting the
-        // allocation; this also stops a late store after the next reset.
-        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-            check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank sync device");
-            const hipError_t sync = hipStreamSynchronize(streams[rank]);
-            if (sync != hipSuccess && failure.empty()) {
+            if (contexts[rank].record.ordinal < 0) {
                 failed_rank = rank;
-                failure     = "rank " + std::to_string(rank) + " drain failed: " + hipGetErrorString(sync);
+                failure     = "rank " + std::to_string(rank) + " was not set up (see its device_identity case)";
+                break;
             }
         }
         if (failure.empty()) {
+            check_hip(hipHostMalloc(&mem, sizeof(five_rank_mem), hipHostMallocMapped | hipHostMallocPortable),
+                      "five-rank host alloc");
+            std::memset(mem, 0, sizeof(five_rank_mem));
+            mem->guard_lo[0] = mem->guard_lo[1] = mem->guard_hi[0] = mem->guard_hi[1] = GUARD_VALUE;
             for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-                const std::uint64_t expected = pattern_word(generation, rank, contexts[rank].seed);
-                if (mem->payload[rank] != expected) {
-                    failed_rank = rank;
-                    failure     = "rank " + std::to_string(rank) + " wrote " + std::to_string(mem->payload[rank]) +
-                                  " instead of " + std::to_string(expected) + " in round " + std::to_string(generation);
-                    break;
-                }
+                current_rank = rank;
+                check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank set device");
+                check_hip(hipStreamCreate(&streams[rank]), "stream create");
+                streams_created = rank + 1;
             }
         }
-        if (failure.empty() && (mem->guard_lo[0] != GUARD_VALUE || mem->guard_lo[1] != GUARD_VALUE ||
-                                mem->guard_hi[0] != GUARD_VALUE || mem->guard_hi[1] != GUARD_VALUE)) {
-            failure = "guard word changed in round " + std::to_string(generation);
+
+        for (std::uint64_t generation = 1; generation <= rounds && failure.empty(); ++generation) {
+            for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+                current_rank = rank;
+                check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank set device");
+                rank_write_kernel<<<1, 64, 0, streams[rank]>>>(mem->payload, mem->ready, rank, contexts[rank].seed,
+                                                               generation);
+            }
+            double     elapsed   = 0;
+            const bool all_ready = spin_until(
+                [&] {
+                    for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+                        if (acquire_load(&mem->ready[rank]) != generation) {
+                            return false;
+                        }
+                    }
+                    return true;
+                },
+                5000.0, elapsed);
+            if (!all_ready) {
+                for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+                    if (acquire_load(&mem->ready[rank]) != generation) {
+                        failed_rank = rank;
+                        failure     = "rank " + std::to_string(rank) + " did not publish ready in round " +
+                                      std::to_string(generation) + " within 5 s";
+                        break;
+                    }
+                }
+            }
+            // Drain every stream before reading payload or resetting the
+            // allocation; this also stops a late store after the next reset.
+            for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+                current_rank = rank;
+                check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank sync device");
+                const hipError_t sync = hipStreamSynchronize(streams[rank]);
+                if (sync != hipSuccess && failure.empty()) {
+                    failed_rank = rank;
+                    failure     = "rank " + std::to_string(rank) + " drain failed: " + hipGetErrorString(sync);
+                }
+            }
+            if (failure.empty()) {
+                for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+                    const std::uint64_t expected = pattern_word(generation, rank, contexts[rank].seed);
+                    if (mem->payload[rank] != expected) {
+                        failed_rank = rank;
+                        failure = "rank " + std::to_string(rank) + " wrote " + std::to_string(mem->payload[rank]) +
+                                  " instead of " + std::to_string(expected) + " in round " + std::to_string(generation);
+                        break;
+                    }
+                }
+            }
+            if (failure.empty() && (mem->guard_lo[0] != GUARD_VALUE || mem->guard_lo[1] != GUARD_VALUE ||
+                                    mem->guard_hi[0] != GUARD_VALUE || mem->guard_hi[1] != GUARD_VALUE)) {
+                failure = "guard word changed in round " + std::to_string(generation);
+            }
+            std::memset(mem->payload, 0, sizeof(mem->payload));
+            std::memset(mem->ready, 0, sizeof(mem->ready));
         }
-        std::memset(mem->payload, 0, sizeof(mem->payload));
-        std::memset(mem->ready, 0, sizeof(mem->ready));
+    } catch (const std::exception & error) {
+        if (failure.empty()) {
+            failure = std::string("hip failure: ") + error.what();
+            if (current_rank < RANKS) {
+                failed_rank = current_rank;
+                failure += " (rank " + std::to_string(current_rank) + ")";
+            }
+        }
+    }
+
+    // Best-effort drain and teardown: evidence collection is already over,
+    // so a broken rank must not prevent freeing what can be freed.
+    for (std::uint32_t rank = 0; rank < streams_created; ++rank) {
+        (void) hipSetDevice(contexts[rank].record.ordinal);
+        (void) hipStreamSynchronize(streams[rank]);
+        (void) hipStreamDestroy(streams[rank]);
+    }
+    if (mem != nullptr) {
+        (void) hipHostFree(mem);
     }
 
     if (failure.empty()) {
@@ -1261,18 +1579,10 @@ outcome run_five_rank(std::vector<device_context> & contexts, probe_report & rep
                       "rank " + std::to_string(rank) + " of 5 participated; case failed (see five_rank_detail)" });
         }
     }
-
-    for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-        check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank destroy device");
-        check_hip(hipStreamDestroy(streams[rank]), "stream destroy");
-    }
-    check_hip(hipHostFree(mem), "five-rank host free");
     return failure.empty() ? outcome::pass : outcome::fail;
 }
 
 // -------- measurements for the cost model (guide 14), never gates ----------
-
-int write_json_file(const std::string & path, const std::string & content);
 
 struct timing_stats {
     std::uint64_t samples = 0;
@@ -1425,7 +1735,11 @@ int run_bench(device_context &    ctx,
     add_measurement(report, "host_five_way_fold", "bytes_per_second",
                     { 1, bytes_per_second, bytes_per_second, bytes_per_second, bytes_per_second });
 
-    return write_json_file(path, to_json(report) + "\n");
+    const write_result result = write_file_exclusive(path, to_json(report) + "\n");
+    if (result.code != 0) {
+        std::fprintf(stderr, "probe failure: %s\n", result.message.c_str());
+    }
+    return result.code;
 }
 
 void print_usage(const char * name) {
@@ -1435,26 +1749,17 @@ void print_usage(const char * name) {
     std::printf("  --bench FILE   also run latency/bandwidth measurements into this exclusive-create JSON\n");
 }
 
-int write_json_file(const std::string & path, const std::string & content) {
-    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (fd < 0) {
-        std::fprintf(stderr, "probe failure: cannot exclusively create %s: %s\n", path.c_str(), std::strerror(errno));
-        return 2;
-    }
-    const ssize_t written      = write(fd, content.data(), content.size());
-    const int     close_result = close(fd);
-    if (written != static_cast<ssize_t>(content.size()) || close_result != 0) {
-        std::fprintf(stderr, "probe failure: writing %s failed\n", path.c_str());
-        return 2;
-    }
-    return 0;
-}
-
 int write_report(const std::string & path, const probe_report & report) {
-    return write_json_file(path, to_json(report) + "\n");
+    const write_result result = write_file_exclusive(path, to_json(report) + "\n");
+    if (result.code != 0) {
+        std::fprintf(stderr, "probe failure: %s\n", result.message.c_str());
+    }
+    return result.code;
 }
 
 }  // namespace
+
+static int run_probe(const std::string & output_path, const std::string & bench_path, std::uint32_t rounds);
 
 int main(int argc, char ** argv) {
     std::string   output_path = "tq-relay-probe-report.json";
@@ -1492,7 +1797,19 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "--rounds must be positive\n");
         return 2;
     }
+    if (!bench_path.empty() && output_path == bench_path) {
+        std::fprintf(stderr, "--output and --bench must name different files\n");
+        return 2;
+    }
+    try {
+        return run_probe(output_path, bench_path, rounds);
+    } catch (const std::exception & error) {
+        std::fprintf(stderr, "probe failure: %s\n", error.what());
+        return 1;
+    }
+}
 
+int run_probe(const std::string & output_path, const std::string & bench_path, std::uint32_t rounds) {
     probe_report report;
     report.build_id = "tq-relay-probe";
     check_hip(hipRuntimeGetVersion(&report.hip_runtime_version), "runtime version");
@@ -1527,7 +1844,15 @@ int main(int argc, char ** argv) {
     };
 
     int device_count = 0;
-    check_hip(hipGetDeviceCount(&device_count), "device count");
+    try {
+        check_hip(hipGetDeviceCount(&device_count), "device count");
+    } catch (const std::exception & error) {
+        report.qualification        = outcome::fail;
+        report.qualification_detail = std::string("cannot enumerate devices: ") + error.what();
+        std::fprintf(stderr, "%s\n", report.qualification_detail.c_str());
+        const int written = write_report(output_path, report);
+        return written != 0 ? written : 1;
+    }
     if (device_count == 0) {
         report.qualification        = outcome::fail;
         report.qualification_detail = "no HIP devices present";
@@ -1538,38 +1863,59 @@ int main(int argc, char ** argv) {
     std::vector<device_context> contexts(static_cast<std::size_t>(device_count));
     for (int ordinal = 0; ordinal < device_count; ++ordinal) {
         device_context & ctx = contexts[static_cast<std::size_t>(ordinal)];
-        allocate_device_context(ctx, ordinal, rounds);
+        try {
+            allocate_device_context(ctx, ordinal, rounds);
+        } catch (const std::exception & error) {
+            // A device that fails setup still gets a record: the operator
+            // needs to see which rank broke and why, not lose the run.
+            std::fprintf(stderr, "device %d setup failed: %s\n", ordinal, error.what());
+            if (ctx.record.ordinal < 0) {
+                ctx.record.ordinal = ordinal;
+            }
+            if (ctx.record.name.empty()) {
+                ctx.record.name = "unavailable";
+            }
+            set_case(ctx, case_id::device_identity, outcome::fail, std::string("setup failed: ") + error.what());
+            set_case(ctx, case_id::mapped_host_access, outcome::not_run, "device setup failed before this case ran");
+            for (const case_id id : handshake_cases) {
+                set_case(ctx, id, outcome::not_run, "device setup failed before this case ran");
+            }
+            try {
+                free_device_context(ctx);
+            } catch (const std::exception & teardown_error) {
+                std::fprintf(stderr, "warning: device %d teardown failed: %s\n", ordinal, teardown_error.what());
+            }
+            continue;
+        }
         set_case(ctx, case_id::device_identity, outcome::pass,
                  "mapped_host_memory_supported=" + std::to_string(ctx.record.can_map_host_memory));
         if (!ctx.mapped) {
             set_case(ctx, case_id::mapped_host_access, outcome::unsupported,
                      "hipHostMallocDefault did not return mapped memory (" + ctx.mapped_flags + ")");
-            for (const auto id :
-                 { case_id::cpu_to_gpu_publish, case_id::gpu_to_cpu_publish, case_id::producer_delay_ordering,
-                   case_id::ticket_semantics, case_id::multi_group_completion, case_id::abort_stop,
-                   case_id::host_system_rmw_u64_add, case_id::host_system_rmw_u64_cas,
-                   case_id::multi_consumer_output_credit, case_id::delayed_consumer_ordering,
-                   case_id::two_bank_rotation, case_id::varying_live_bytes, case_id::five_stream_relay_cycle }) {
+            for (const case_id id : handshake_cases) {
                 set_case(ctx, id, outcome::unsupported,
                          "handshake requires mapped host memory (" + ctx.mapped_flags + ")");
             }
             std::printf("rank %d: mapped host memory unavailable (%s)\n", ordinal, ctx.mapped_flags.c_str());
             continue;
         }
-        case_mapped_access(ctx);
+        run_case(ctx, case_id::mapped_host_access, case_mapped_access);
         if (result_of(ctx, case_id::mapped_host_access) == outcome::pass) {
-            case_cpu_to_gpu(ctx);
-            case_gpu_to_cpu(ctx);
-            case_producer_delay(ctx);
-            case_ticket_semantics(ctx);
-            case_multi_group(ctx);
-            case_abort(ctx);
-            case_host_rmw(ctx);
-            case_multi_consumer(ctx);
-            case_delayed_consumer(ctx);
-            case_two_bank(ctx);
-            case_varying_live(ctx);
-            case_five_stream(ctx);
+            run_case(ctx, case_id::cpu_to_gpu_publish, case_cpu_to_gpu);
+            run_case(ctx, case_id::gpu_to_cpu_publish, case_gpu_to_cpu);
+            run_case(ctx, case_id::producer_delay_ordering, case_producer_delay);
+            run_case(ctx, case_id::ticket_semantics, case_ticket_semantics);
+            run_case(ctx, case_id::multi_group_completion, case_multi_group);
+            run_case(ctx, case_id::multi_group_ordering, case_multi_group_ordering);
+            run_case(ctx, case_id::abort_stop, case_abort);
+            // One launch produces both capability bits (guide 31.3).
+            run_case(ctx, case_id::host_system_rmw_u64_add, case_host_rmw);
+            run_case(ctx, case_id::multi_consumer_output_credit, case_multi_consumer);
+            run_case(ctx, case_id::delayed_consumer_ordering, case_delayed_consumer);
+            run_case(ctx, case_id::two_bank_rotation, case_two_bank);
+            run_case(ctx, case_id::varying_live_bytes, case_varying_live);
+            run_case(ctx, case_id::offset_addressing, case_offset_addressing);
+            run_case(ctx, case_id::five_stream_relay_cycle, case_five_stream);
         }
         std::printf("rank %d (%s, %s): ", ordinal, ctx.record.gcn_arch.c_str(), ctx.record.name.c_str());
         for (const auto & item : ctx.record.cases) {
@@ -1589,7 +1935,7 @@ int main(int argc, char ** argv) {
         }
     }
     if (device_count == 5) {
-        report.five_rank_status = run_five_rank(contexts, report);
+        report.five_rank_status = run_five_rank(contexts, report, rounds);
         if (report.five_rank_status != outcome::pass) {
             all_pass = false;
         }
@@ -1599,10 +1945,24 @@ int main(int argc, char ** argv) {
     }
     int bench_result = 0;
     if (!bench_path.empty()) {
-        bench_result = run_bench(contexts[0], bench_path, rounds, report.hip_runtime_version_string);
+        if (contexts[0].cb == nullptr) {
+            std::fprintf(stderr, "bench skipped: device 0 was not set up\n");
+            bench_result = 1;
+        } else {
+            try {
+                bench_result = run_bench(contexts[0], bench_path, rounds, report.hip_runtime_version_string);
+            } catch (const std::exception & error) {
+                std::fprintf(stderr, "bench failure: %s\n", error.what());
+                bench_result = 1;
+            }
+        }
     }
     for (auto & ctx : contexts) {
-        free_device_context(ctx);
+        try {
+            free_device_context(ctx);
+        } catch (const std::exception & error) {
+            std::fprintf(stderr, "warning: device %d teardown failed: %s\n", ctx.record.ordinal, error.what());
+        }
     }
     report.qualification        = all_pass ? outcome::pass : outcome::fail;
     report.qualification_detail = all_pass ? "all mandatory single-device cases passed on every present device" :
