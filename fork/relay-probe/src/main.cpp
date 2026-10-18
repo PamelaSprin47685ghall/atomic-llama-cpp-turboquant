@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -39,6 +40,7 @@
 #include <optional>
 #include <ratio>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -311,6 +313,42 @@ __global__ void bare_waiter_kernel(control_block * cb, std::uint64_t expected) {
         default:
             return;
     }
+}
+
+// Finishes the whole verified read, publishes the per-consumer result word,
+// then withholds the acknowledgment until the stop word or its cumulative
+// budget (guide 39.7 F07): the host must rely on its bounded wait, and the
+// slot must not be reused while this reader is un-acknowledged.
+__global__ void read_hold_kernel(control_block * cb,
+                                 slot *          s,
+                                 std::uint64_t * result,
+                                 std::uint32_t   consumer,
+                                 std::uint64_t   expected,
+                                 std::uint32_t   seed) {
+    switch (wait_for_ticket(cb, expected)) {
+        case wait_outcome::matched:
+            break;
+        default:
+            return;
+    }
+    bool valid = s->guard_lo[0] == GUARD_VALUE && s->guard_lo[1] == GUARD_VALUE && s->guard_hi[0] == GUARD_VALUE &&
+                 s->guard_hi[1] == GUARD_VALUE;
+    std::uint64_t acc = 0;
+    for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+        valid = valid && (s->payload[i] == pattern_word(expected, i, seed));
+        acc ^= s->payload[i];
+    }
+    result[consumer] = valid ? acc : 0xDEADBEEFDEADBEEFULL;
+    device_fence_system();
+    const std::uint64_t begin = clock64();
+    while (acquire_load(&cb->abort) == 0) {
+        device_pause();
+        if (clock64() - begin >= WAIT_BUDGET_TICKS) {
+            release_store(&cb->exit_code, EXIT_TIMEOUT_EXPECTED);
+            return;
+        }
+    }
+    release_store(&cb->exit_code, EXIT_ABORT_OBSERVED);
 }
 
 // Each participating workgroup writes its own payload word, orders it with a
@@ -657,6 +695,9 @@ constexpr case_id handshake_cases[] = {
     case_id::native_sync_deadline,
     case_id::same_stream_inverse_dependency,
     case_id::dual_window_independent_progress,
+    case_id::service_loop_independent_progress,
+    case_id::nonfinite_reduction_gate,
+    case_id::host_wait_deadline_no_reuse,
 };
 
 outcome result_of(const device_context & ctx, case_id id) {
@@ -1081,6 +1122,30 @@ class stream_set {
     std::vector<hipStream_t> streams;
 };
 
+// Host five-way fold with the publication gate (guide 35.5, 39.7 F04, 41.6):
+// the rank weights sum to 1 mod 2^64, so a correct fold reproduces the shared
+// pattern exactly. Any corrupted partial — a NaN bit pattern included, which
+// for these synthetic words is just another wrong word — breaks the identity
+// deterministically, and the reduction must refuse to publish instead of
+// handing garbage to the consumers.
+std::optional<std::string> fold_partials(const std::uint64_t * rank_partials,
+                                         std::uint64_t         generation,
+                                         std::uint32_t         seed,
+                                         std::uint64_t *       out) {
+    for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+        std::uint64_t sum = 0;
+        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+            sum += rank_partials[rank * PAYLOAD_WORDS + i];
+        }
+        if (sum != pattern_word(generation, i, seed)) {
+            return "reduction rejected word " + std::to_string(i) + " of generation " + std::to_string(generation) +
+                   ": the five-rank fold does not reproduce the shared pattern (a producer partial is corrupted)";
+        }
+        out[i] = sum;
+    }
+    return std::nullopt;
+}
+
 // One emulated relay round: five producer streams write disjoint partials,
 // the host folds them into the output slot, publishes the ticket, and five
 // consumer streams read the result back and acknowledge. Returns nullopt on
@@ -1103,14 +1168,13 @@ std::optional<std::string> run_relay_round(device_context &                 ctx,
         }
     }
     std::uint64_t fold[PAYLOAD_WORDS] = {};
-    for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
-        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
-            fold[i] += ctx.rank_partials[rank * PAYLOAD_WORDS + i];
-        }
-        ctx.slot_ptr->payload[i] = fold[i];
+    const auto    fold_problem        = fold_partials(ctx.rank_partials, generation, ctx.seed, fold);
+    if (fold_problem.has_value()) {
+        return fold_problem;
     }
     std::uint64_t expected = 0;
     for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+        ctx.slot_ptr->payload[i] = fold[i];
         expected ^= fold[i];
     }
     host_fence_release();
@@ -1729,6 +1793,430 @@ void case_dual_window(device_context & ctx) {
                  "traffic, A completed exactly on release and reused its channel after the stall");
 }
 
+// Guide 34.1/34.2 and 39.6 P07/P09/P10 at the single-device software layer
+// (probe LEMMA 4): the CPU service-loop contract. P07: a detached worker
+// thread drives channel B's whole generation loop while the main thread only
+// observes a progress flag — progress must not depend on the observer's
+// participation (the begin/ready/finish deadlock of guide 34.1). P09: two
+// channels are ready simultaneously, one reader deterministically slow; the
+// bounded service publishes both tickets back to back and the fast channel
+// completes its verified read while the slow one is still mid-read, in both
+// orientations. P10: shutdown arrives while a waiter is resident on channel
+// A and the worker is mid-loop on B; the worker publishes the stop words and
+// drains both streams inside itself before it exits, so the observer's join
+// never strands live device work. Cross-device qualification still belongs
+// to five_rank_cross_device.
+void case_service_loop(device_context & ctx) {
+    constexpr std::uint32_t P07_GENERATIONS  = 256;
+    constexpr std::uint32_t P09_ORIENTATIONS = 2;
+    constexpr std::uint32_t P10_PROGRESS     = 64;
+    const std::uint32_t     seed_a           = ctx.seed;
+    const std::uint32_t     seed_b           = ctx.seed ^ 0x55AAu;
+
+    reset_control(*ctx.cb);
+    reset_control(*ctx.cb2);
+    init_guards(*ctx.slot_ptr);
+    init_guards(*ctx.slot_b);
+    std::memset(ctx.slot_ptr->payload, 0, sizeof(ctx.slot_ptr->payload));
+    std::memset(ctx.slot_b->payload, 0, sizeof(ctx.slot_b->payload));
+    std::memset(ctx.rank_ack, 0, RANKS * sizeof(std::uint64_t));
+    std::memset(ctx.rank_result, 0, RANKS * sizeof(std::uint64_t));
+
+    stream_set        streams(2);
+    const hipStream_t stream_a = streams.streams[0];
+    const hipStream_t stream_b = streams.streams[1];
+
+    // One bounded service step shared by the worker phases: publish the
+    // generation, wait for the consumer's complete verified read. The ack
+    // wait is itself bounded, so a stuck consumer fails the worker instead
+    // of hanging the run.
+    const auto run_generation = [&](control_block * cb, slot * s, std::uint32_t consumer, std::uint32_t seed,
+                                    hipStream_t stream, std::uint64_t generation) -> std::optional<std::string> {
+        for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+            s->payload[i] = pattern_word(generation, i, seed);
+        }
+        host_fence_release();
+        release_store(&cb->ticket, generation);
+        consume_read_kernel<<<1, 64, 0, stream>>>(cb, s, ctx.rank_ack, ctx.rank_result, consumer, generation, seed);
+        double     unused = 0;
+        const bool acked =
+            spin_until([&] { return acquire_load(&ctx.rank_ack[consumer]) == generation; }, 5000.0, unused);
+        if (!acked) {
+            return std::optional<std::string>("generation " + std::to_string(generation) + " did not complete");
+        }
+        if (ctx.rank_result[consumer] != derived_word(generation, seed)) {
+            return std::optional<std::string>("generation " + std::to_string(generation) +
+                                              " derived the wrong result word");
+        }
+        return std::optional<std::string>{};
+    };
+    const auto fail_service = [&](const std::string & detail) {
+        fail_case(ctx, case_id::service_loop_independent_progress, outcome::fail, detail);
+    };
+
+    struct worker_result {
+        std::atomic<bool>          done{ false };
+        std::atomic<bool>          drained{ false };
+        std::atomic<std::uint64_t> generations{ 0 };
+        std::string                detail;
+    };
+
+    // Phase 1 (P07): the worker owns every publish; the observer makes no
+    // HIP call and no store to either channel until the worker is done.
+    {
+        worker_result phase1;
+        std::thread   worker([&] {
+            try {
+                check_hip(hipSetDevice(ctx.record.ordinal), "service worker set device");
+                for (std::uint64_t generation = 1; generation <= P07_GENERATIONS; ++generation) {
+                    const auto problem = run_generation(ctx.cb2, ctx.slot_b, 1, seed_b, stream_b, generation);
+                    if (problem.has_value()) {
+                        phase1.detail = *problem;
+                        break;
+                    }
+                    phase1.generations.store(generation, std::memory_order_relaxed);
+                }
+            } catch (const std::exception & error) {
+                phase1.detail = error.what();
+            }
+            phase1.done.store(true, std::memory_order_release);
+        });
+        double        unused = 0;
+        const bool finished  = spin_until([&] { return phase1.done.load(std::memory_order_acquire); }, 15000.0, unused);
+        if (!finished) {
+            release_store(&ctx.cb2->abort, 1);
+            worker.join();
+            fail_service("the worker did not finish its generation loop within the observer's deadline");
+            return;
+        }
+        worker.join();
+        if (!phase1.detail.empty()) {
+            fail_service("phase 1 worker: " + phase1.detail);
+            return;
+        }
+        sync_with_deadline(stream_b, SYNC_DEADLINE_MS, "phase 1 worker sync");
+        if (phase1.generations.load(std::memory_order_acquire) != P07_GENERATIONS ||
+            ctx.rank_result[1] != derived_word(P07_GENERATIONS, seed_b) || !guards_intact(*ctx.slot_b)) {
+            fail_service("the worker-driven channel did not finish with exact values");
+            return;
+        }
+    }
+
+    // Phase 2 (P09): both channels ready at once; one reader deterministically
+    // slow (delayed_reader withholds its acknowledgment for its whole read),
+    // the other fast. The service publishes the two tickets back to back;
+    // the slow channel's unfinished round must never gate the fast channel,
+    // in either orientation.
+    for (std::uint32_t orientation = 0; orientation < P09_ORIENTATIONS; ++orientation) {
+        reset_control(*ctx.cb);
+        reset_control(*ctx.cb2);
+        release_store(&ctx.rank_ack[0], 0);
+        release_store(&ctx.rank_ack[1], 0);
+        release_store(&ctx.rank_result[0], 0);
+        release_store(&ctx.rank_result[1], 0);
+        for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+            ctx.slot_ptr->payload[i] = pattern_word(1, i, seed_a);
+            ctx.slot_b->payload[i]   = pattern_word(1, i, seed_b);
+        }
+        const std::uint32_t slow_channel = orientation == 0 ? 0u : 1u;
+        const std::uint32_t fast_channel = orientation == 0 ? 1u : 0u;
+        control_block *     slow_cb      = slow_channel == 0 ? ctx.cb : ctx.cb2;
+        control_block *     fast_cb      = fast_channel == 0 ? ctx.cb : ctx.cb2;
+        slot *              slow_slot    = slow_channel == 0 ? ctx.slot_ptr : ctx.slot_b;
+        slot *              fast_slot    = fast_channel == 0 ? ctx.slot_ptr : ctx.slot_b;
+        const std::uint32_t slow_seed    = slow_channel == 0 ? seed_a : seed_b;
+        const std::uint32_t fast_seed    = fast_channel == 0 ? seed_a : seed_b;
+        const hipStream_t   slow_stream  = slow_channel == 0 ? stream_a : stream_b;
+        const hipStream_t   fast_stream  = fast_channel == 0 ? stream_a : stream_b;
+        delayed_reader_kernel<<<1, 64, 0, slow_stream>>>(slow_cb, slow_slot, ctx.rank_ack, ctx.rank_result,
+                                                         slow_channel, 1, slow_seed);
+        consume_read_kernel<<<1, 64, 0, fast_stream>>>(fast_cb, fast_slot, ctx.rank_ack, ctx.rank_result, fast_channel,
+                                                       1, fast_seed);
+        host_fence_release();
+        // The bounded service: publish the slow channel's ticket, then the
+        // fast channel's, without waiting for the slow round to complete.
+        release_store(&slow_cb->ticket, 1);
+        release_store(&fast_cb->ticket, 1);
+        double     unused = 0;
+        const bool fast_acked =
+            spin_until([&] { return acquire_load(&ctx.rank_ack[fast_channel]) == 1; }, 5000.0, unused);
+        if (!fast_acked) {
+            fail_service("orientation " + std::to_string(orientation) + ": the fast channel never completed");
+            return;
+        }
+        if (acquire_load(&ctx.rank_ack[slow_channel]) != 0) {
+            fail_service("orientation " + std::to_string(orientation) +
+                         ": the slow reader finished before the fast channel, so head-of-line serialization "
+                         "cannot be falsified");
+            return;
+        }
+        // The fast channel finished its full verified read while the slow
+        // reader was still mid-read: serving it did not wait for the slow
+        // round. Now wait out the slow reader.
+        const bool slow_acked =
+            spin_until([&] { return acquire_load(&ctx.rank_ack[slow_channel]) == 1; }, 5000.0, unused);
+        if (!slow_acked) {
+            fail_service("orientation " + std::to_string(orientation) + ": the slow reader never completed");
+            return;
+        }
+        sync_with_deadline(slow_stream, SYNC_DEADLINE_MS, "phase 2 slow sync");
+        sync_with_deadline(fast_stream, SYNC_DEADLINE_MS, "phase 2 fast sync");
+        if (ctx.rank_result[slow_channel] != derived_word(1, slow_seed) ||
+            ctx.rank_result[fast_channel] != derived_word(1, fast_seed)) {
+            fail_service("orientation " + std::to_string(orientation) + ": a reader verified a wrong payload");
+            return;
+        }
+    }
+    if (!guards_intact(*ctx.slot_ptr) || !guards_intact(*ctx.slot_b)) {
+        fail_service("guards clobbered");
+        return;
+    }
+
+    // Phase 3 (P10): shutdown while a waiter is resident on channel A and
+    // the worker is mid-loop on channel B. The worker — the only progress
+    // owner — publishes the stop words and drains both streams before it
+    // exits; the observer only joins afterwards, so the join can never
+    // strand live device work.
+    {
+        reset_control(*ctx.cb);
+        reset_control(*ctx.cb2);
+        release_store(&ctx.rank_ack[0], 0);
+        release_store(&ctx.rank_ack[1], 0);
+        release_store(&ctx.rank_result[1], 0);
+        bare_waiter_kernel<<<1, 64, 0, stream_a>>>(ctx.cb, 1);
+        worker_result     phase3;
+        std::atomic<bool> shutdown{ false };
+        std::thread       worker([&] {
+            try {
+                check_hip(hipSetDevice(ctx.record.ordinal), "shutdown worker set device");
+                while (!shutdown.load(std::memory_order_acquire)) {
+                    const std::uint64_t generation = phase3.generations.load(std::memory_order_relaxed) + 1;
+                    const auto          problem = run_generation(ctx.cb2, ctx.slot_b, 1, seed_b, stream_b, generation);
+                    if (problem.has_value()) {
+                        phase3.detail = *problem;
+                        break;
+                    }
+                    phase3.generations.store(generation, std::memory_order_relaxed);
+                }
+                if (phase3.detail.empty()) {
+                    release_store(&ctx.cb->abort, 1);
+                    release_store(&ctx.cb2->abort, 1);
+                    sync_with_deadline(stream_a, SYNC_DEADLINE_MS, "shutdown drain A");
+                    sync_with_deadline(stream_b, SYNC_DEADLINE_MS, "shutdown drain B");
+                    if (acquire_load(&ctx.cb->exit_code) != EXIT_ABORT_OBSERVED) {
+                        phase3.detail = "the resident waiter did not honor the stop word during shutdown";
+                    }
+                    phase3.drained.store(true, std::memory_order_release);
+                }
+            } catch (const std::exception & error) {
+                phase3.detail = error.what();
+            }
+            phase3.done.store(true, std::memory_order_release);
+        });
+        double            unused     = 0;
+        const bool        progressed = spin_until(
+            [&] {
+                return phase3.generations.load(std::memory_order_acquire) >= P10_PROGRESS ||
+                       phase3.done.load(std::memory_order_acquire);
+            },
+            10000.0, unused);
+        if (!progressed) {
+            shutdown.store(true, std::memory_order_release);
+            release_store(&ctx.cb->abort, 1);
+            release_store(&ctx.cb2->abort, 1);
+            worker.join();
+            fail_service("the worker made no observable progress before shutdown");
+            return;
+        }
+        if (phase3.done.load(std::memory_order_acquire)) {
+            worker.join();
+            fail_service("phase 3 worker: " + phase3.detail);
+            return;
+        }
+        shutdown.store(true, std::memory_order_release);
+        double     unused2  = 0;
+        const bool finished = spin_until([&] { return phase3.done.load(std::memory_order_acquire); }, 15000.0, unused2);
+        if (!finished) {
+            release_store(&ctx.cb->abort, 1);
+            release_store(&ctx.cb2->abort, 1);
+            worker.join();
+            fail_service("the worker did not finish its shutdown drain within the observer's deadline");
+            return;
+        }
+        worker.join();
+        if (!phase3.detail.empty()) {
+            fail_service("phase 3 worker: " + phase3.detail);
+            return;
+        }
+        if (!phase3.drained.load(std::memory_order_acquire) ||
+            acquire_load(&ctx.cb->exit_code) != EXIT_ABORT_OBSERVED) {
+            fail_service("the worker exited without draining the resident waiter");
+            return;
+        }
+        if (ctx.rank_result[1] != derived_word(phase3.generations.load(std::memory_order_acquire), seed_b)) {
+            fail_service("the worker's last generation did not finish with the exact result");
+            return;
+        }
+        sync_with_deadline(stream_a, SYNC_DEADLINE_MS, "phase 3 final sync A");
+        sync_with_deadline(stream_b, SYNC_DEADLINE_MS, "phase 3 final sync B");
+        if (!guards_intact(*ctx.slot_ptr) || !guards_intact(*ctx.slot_b)) {
+            fail_service("guards clobbered");
+            return;
+        }
+    }
+
+    set_case(ctx, case_id::service_loop_independent_progress, outcome::pass,
+             "a worker thread drove channel B through " + std::to_string(P07_GENERATIONS) +
+                 " generations while the observer only read status; two simultaneously-ready channels were both "
+                 "served with the fast one finishing mid-read of the slow one in both orientations; and shutdown "
+                 "with a resident waiter drained inside the worker before it exited");
+}
+
+// Guide 39.7 F04 / 35.5 / 41.6: the CPU reduction must refuse to publish a
+// corrupted fold instead of handing it to the consumers. The probe's
+// synthetic words carry no float semantics, so the gate is the exact fold
+// identity (the rank weights sum to 1 mod 2^64): any corrupted word breaks
+// it deterministically, and a quiet-NaN bit pattern is one such corruption.
+// The clean fold passes; a flipped bit and a NaN pattern are both rejected
+// before publication and nothing is written to the output slot.
+void case_fold_gate(device_context & ctx) {
+    constexpr std::uint64_t GENERATION  = 1;
+    constexpr std::uint32_t INJECT_RANK = 2;
+    constexpr std::uint32_t INJECT_WORD = 3;
+    reset_control(*ctx.cb);
+    init_guards(*ctx.slot_ptr);
+    std::memset(ctx.slot_ptr->payload, 0, sizeof(ctx.slot_ptr->payload));
+    std::memset(ctx.rank_ready, 0, RANKS * sizeof(std::uint64_t));
+    std::memset(ctx.rank_partials, 0, RANKS * PAYLOAD_WORDS * sizeof(std::uint64_t));
+    stream_set streams(RANKS);
+    for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+        partial_producer_kernel<<<1, 64, 0, streams.streams[rank]>>>(ctx.rank_partials, ctx.rank_ready, rank,
+                                                                     GENERATION, ctx.seed);
+    }
+    double unused = 0;
+    for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+        const bool produced =
+            spin_until([&] { return acquire_load(&ctx.rank_ready[rank]) == GENERATION; }, 5000.0, unused);
+        if (!produced) {
+            fail_case(ctx, case_id::nonfinite_reduction_gate, outcome::fail,
+                      "producer rank " + std::to_string(rank) + " did not publish its partial");
+            return;
+        }
+    }
+    std::uint64_t fold[PAYLOAD_WORDS] = {};
+    if (fold_partials(ctx.rank_partials, GENERATION, ctx.seed, fold).has_value()) {
+        fail_case(ctx, case_id::nonfinite_reduction_gate, outcome::fail, "the clean fold was rejected");
+        return;
+    }
+    for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+        if (fold[i] != pattern_word(GENERATION, i, ctx.seed)) {
+            fail_case(ctx, case_id::nonfinite_reduction_gate, outcome::fail,
+                      "the clean fold does not reproduce the shared pattern at word " + std::to_string(i));
+            return;
+        }
+    }
+    const std::uint64_t saved         = ctx.rank_partials[INJECT_RANK * PAYLOAD_WORDS + INJECT_WORD];
+    const std::uint64_t corruptions[] = { saved ^ 1ULL, 0x7FF8000000000000ULL };
+    for (const std::uint64_t corruption : corruptions) {
+        ctx.rank_partials[INJECT_RANK * PAYLOAD_WORDS + INJECT_WORD] = corruption;
+        const auto problem = fold_partials(ctx.rank_partials, GENERATION, ctx.seed, fold);
+        if (!problem.has_value()) {
+            fail_case(ctx, case_id::nonfinite_reduction_gate, outcome::fail,
+                      "a corrupted partial was folded and accepted instead of being rejected");
+            return;
+        }
+        if (acquire_load(&ctx.cb->ticket) != 0) {
+            fail_case(ctx, case_id::nonfinite_reduction_gate, outcome::fail,
+                      "a generation was published despite the rejected fold");
+            return;
+        }
+        for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+            if (ctx.slot_ptr->payload[i] != 0) {
+                fail_case(ctx, case_id::nonfinite_reduction_gate, outcome::fail,
+                          "the output slot was written despite the rejected fold");
+                return;
+            }
+        }
+    }
+    ctx.rank_partials[INJECT_RANK * PAYLOAD_WORDS + INJECT_WORD] = saved;
+    for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+        sync_with_deadline(streams.streams[rank], SYNC_DEADLINE_MS, "fold gate producer sync");
+    }
+    set_case(ctx, case_id::nonfinite_reduction_gate, outcome::pass,
+             "the clean five-way fold reproduces the shared pattern exactly; a flipped bit and a quiet-NaN bit "
+             "pattern in one producer partial were both rejected before publication with nothing written to the "
+             "output slot");
+}
+
+// Guide 39.7 F07 / 35.8 handoff deadline: a consumer finishes its whole
+// verified read but withholds the acknowledgment. The host's bounded wait
+// must fire instead of waiting forever, the slot must stay untouched (no
+// reuse while a reader is un-acknowledged), and the stop word then recovers
+// the waiter for the drain. This exercises the spin_until timeout branch,
+// which a healthy device never reaches in the other cases.
+void case_host_wait_deadline(device_context & ctx) {
+    constexpr double SHORT_DEADLINE_MS = 400.0;
+    reset_control(*ctx.cb);
+    init_guards(*ctx.slot_ptr);
+    release_store(&ctx.rank_ack[0], 0);
+    release_store(&ctx.rank_result[0], 0);
+    for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+        ctx.slot_ptr->payload[i] = pattern_word(1, i, ctx.seed);
+    }
+    host_fence_release();
+    release_store(&ctx.cb->ticket, 1);
+    read_hold_kernel<<<1, 64>>>(ctx.cb, ctx.slot_ptr, ctx.rank_result, 0, 1, ctx.seed);
+    double     elapsed = 0;
+    stopwatch  timer;
+    const bool acked     = spin_until([&] { return acquire_load(&ctx.rank_ack[0]) == 1; }, SHORT_DEADLINE_MS, elapsed);
+    const bool read_done = spin_until([&] { return acquire_load(&ctx.rank_result[0]) != 0; }, 2000.0, elapsed);
+    if (!read_done) {
+        fail_case(ctx, case_id::host_wait_deadline_no_reuse, outcome::fail,
+                  "the consumer never completed its read before the deadline");
+        return;
+    }
+    if (ctx.rank_result[0] != derived_word(1, ctx.seed)) {
+        fail_case(ctx, case_id::host_wait_deadline_no_reuse, outcome::fail,
+                  "the consumer verified a wrong payload while withholding its acknowledgment");
+        return;
+    }
+    if (acked) {
+        fail_case(ctx, case_id::host_wait_deadline_no_reuse, outcome::fail,
+                  "an acknowledgment that the consumer never publishes appeared");
+        return;
+    }
+    if (elapsed >= 0 || timer.milliseconds() < SHORT_DEADLINE_MS * 0.9) {
+        fail_case(ctx, case_id::host_wait_deadline_no_reuse, outcome::fail,
+                  "the bounded wait returned before its deadline without the acknowledgment");
+        return;
+    }
+    // No reuse while the reader is un-acknowledged: the published payload
+    // must still be byte-identical and the guards untouched.
+    for (std::uint32_t i = 0; i < PAYLOAD_WORDS; ++i) {
+        if (ctx.slot_ptr->payload[i] != pattern_word(1, i, ctx.seed)) {
+            fail_case(ctx, case_id::host_wait_deadline_no_reuse, outcome::fail,
+                      "the slot was rewritten while the consumer's read was un-acknowledged");
+            return;
+        }
+    }
+    if (!guards_intact(*ctx.slot_ptr)) {
+        fail_case(ctx, case_id::host_wait_deadline_no_reuse, outcome::fail, "guards clobbered");
+        return;
+    }
+    release_store(&ctx.cb->abort, 1);
+    sync_with_deadline(0, SYNC_DEADLINE_MS, "read-hold drain");
+    if (acquire_load(&ctx.cb->exit_code) != EXIT_ABORT_OBSERVED) {
+        fail_case(ctx, case_id::host_wait_deadline_no_reuse, outcome::fail,
+                  "the waiter did not honor the stop word after the deadline");
+        return;
+    }
+    set_case(ctx, case_id::host_wait_deadline_no_reuse, outcome::pass,
+             "a consumer that finished its verified read but withheld the acknowledgment fired the host's bounded "
+             "wait at " +
+                 std::to_string(SHORT_DEADLINE_MS) +
+                 " ms; the slot stayed byte-identical (no reuse) and the stop word recovered the waiter");
+}
+
 void allocate_device_context(device_context & ctx, std::int32_t ordinal, std::uint32_t rounds) {
     check_hip(hipSetDevice(ordinal), "set device");
     hipDeviceProp_t properties{};
@@ -2257,9 +2745,9 @@ int run_probe(const std::string & output_path, const std::string & bench_path, s
         "recorded per run";
     report.hot_reuse_rounds = rounds;
     const std::string multi_stream_note =
-        "multi_consumer, delayed_consumer, two_bank, varying_live, five_stream, same_stream_inverse_dependency "
-        "and dual_window_independent_progress use one device with concurrent streams; they verify protocol "
-        "software, not five-device qualification.";
+        "multi_consumer, delayed_consumer, two_bank, varying_live, five_stream, same_stream_inverse_dependency, "
+        "dual_window_independent_progress, service_loop_independent_progress and nonfinite_reduction_gate use one "
+        "device with concurrent streams; they verify protocol software, not five-device qualification.";
     report.limits = {
         "This is a platform probe, not a model or relay qualification (guide 31.7).",
         "Single-device results do not qualify five-rank cross-device behavior.",
@@ -2347,6 +2835,9 @@ int run_probe(const std::string & output_path, const std::string & bench_path, s
             run_case(ctx, case_id::native_sync_deadline, case_native_sync_deadline);
             run_case(ctx, case_id::same_stream_inverse_dependency, case_same_stream_inverse);
             run_case(ctx, case_id::dual_window_independent_progress, case_dual_window);
+            run_case(ctx, case_id::service_loop_independent_progress, case_service_loop);
+            run_case(ctx, case_id::nonfinite_reduction_gate, case_fold_gate);
+            run_case(ctx, case_id::host_wait_deadline_no_reuse, case_host_wait_deadline);
         }
         std::printf("rank %d (%s, %s): ", ordinal, ctx.record.gcn_arch.c_str(), ctx.record.name.c_str());
         for (const auto & item : ctx.record.cases) {

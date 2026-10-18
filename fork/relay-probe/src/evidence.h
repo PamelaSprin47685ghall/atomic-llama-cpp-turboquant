@@ -41,6 +41,9 @@ enum class case_id {
     native_sync_deadline,
     same_stream_inverse_dependency,
     dual_window_independent_progress,
+    service_loop_independent_progress,
+    nonfinite_reduction_gate,
+    host_wait_deadline_no_reuse,
 };
 
 const char * case_name(case_id value) noexcept;

@@ -50,6 +50,9 @@ REGISTRY = [
     "native_sync_deadline",
     "same_stream_inverse_dependency",
     "dual_window_independent_progress",
+    "service_loop_independent_progress",
+    "nonfinite_reduction_gate",
+    "host_wait_deadline_no_reuse",
 ]
 
 # Every healthy device record carries every case except the five-rank one,
