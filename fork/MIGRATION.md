@@ -126,7 +126,7 @@ G44 原候选建议 Turbo SET_ROWS 拒绝 F16 source，前提是只编译 F32 sh
 
 | 能力 | 当前判断 | 重新进入的条件 |
 |---|---|---|
-| TP5 / LateBind / relay / device loop | 历史有59.66 →65.17 tok/s的实质收益，不能称无用；整条私有 runtime 暂留归档 | 提取纯计划 / 数学 / 元数据职责，明确 A 必需的最小执行与生命周期接口，再用真实目标多卡负载验证 |
+| TP5 / LateBind / relay / device loop | 历史有59.66 →65.17 tok/s的实质收益，不能称无用；整条私有 runtime 暂留归档。纯计划 / 数学 / 账本职责已提取为 `fork/relay`（TQRelay，指南 30–39、50、52、54 的设备无关合同），纯 CPU 构建、测试、ASan/UBSan 与安装后搬迁消费已通过 | 平台探针（指南 M0c）与 A 必需的最小执行 / 生命周期接口尚未落地；明确后接真实算子与五卡负载验证 |
 | RERoT | 普通多请求、corpus 前缀重放或独立 parser 不具备其多 reader 共享 KV / 可见性语义 | 明确同 context、同 owner、动态可见性、recurrent / RNG 隔离协议，验证真实 reader 行为 |
 | FlashPrefill / TriAttention | 独立数学、格式和状态封装有价值；历史 online value accumulation 的局部 prefill 约 +31%，但 greedy 输出变化、部分检索失败，整体验收未闭合 | 固定模型 / 上下文 / 质量门，公开消费者和最小接缝，避免把局部 kernel 测试当整模型证明 |
 | XKV-SR | 槽位元数据、codec、预算和验证可拆；完整量化存储 / 图 / 事务运行时暂未迁 | payload、实际驻留、质量、吞吐与共享状态失败回滚同时验收 |

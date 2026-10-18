@@ -1,8 +1,34 @@
-# 验证记录：2026-10-18 小功能发布补全
+# 验证记录
 
-本批次起点为 `6de088714f35f84427d9952d713f9d6cdffc668b`；固定 A 为 `cda0f9256665845cd9d6f3a0176880883f653a3d`。本批次新增 TQText、TQCalibration 和 imatrix C，扩展真实 batch C 的文本消费，并对 Vulkan 缓存的两个不同失效来源分别建立回归。五个 B 与五个 C 的职责见 [README.md](README.md)，旧 feature ID 与证据细分见 [audit/details-findings-20261018.md](audit/details-findings-20261018.md)。
+2026-10-18 批次起点为 `6de088714f35f84427d9952d713f9d6cdffc668b`；固定 A 为 `cda0f9256665845cd9d6f3a0176880883f653a3d`。该批次新增 TQText、TQCalibration 和 imatrix C，扩展真实 batch C 的文本消费，并对 Vulkan 缓存的两个不同失效来源分别建立回归。六个 B 与五个 C 的职责见 [README.md](README.md)，旧 feature ID 与证据细分见 [audit/details-findings-20261018.md](audit/details-findings-20261018.md)。
 
-本页先列本批次已取得的结果，再集中登记最终仍待闭合的门槛。较早的 `3746ebf82585` 批次及更早历史完整保留在后半部分；其中原模型摘要、HTTP、corpus、logits 与数值记录没有被改成本批次身份。
+本页先列 2026-10-19 TQRelay 批次已取得的结果，随后保留 2026-10-18 批次的 Final release gates 与更早历史；其中原模型摘要、HTTP、corpus、logits 与数值记录保持各自批次身份，没有被改写成本批次结果。
+
+## 2026-10-19 批次：TQRelay（TP5 纯 CPU 合同）
+
+本批次新增第六个 B 库 `fork/relay`（安装目标 `TQRelay::relay`），把《TP5-最新设计
+保姆级指南》第 30–39、50、52、54 章中与设备无关的合同实现为 C++17：`channel_ledger`
+（通道 bank 生命周期、精确票据、两种 credit、fail-stop 与排空事实）、
+`run_submissions`（逐 rank 原生提交登记、封口与排空推导）、`compile_glu_plan`
+（五 rank 合成 GLU 分片计划）。没有 A 文件变化，`fork/upstream-exceptions.json` 不变。
+指南第 50、54 章内嵌的四个 Python 程序与四个 JSON 输入按记录 SHA-256 原样提取到
+`fork/relay/tests/python-reference/`，全部匹配。
+
+| 检查 | 实际结果 | 可以支持的结论 |
+|---|---|---|
+| Release 构建与测试 | `build-relay-20261018`，GCC 16.2.1，`-Wall -Wextra -Wpedantic -Werror`，4/4 ctest 通过 | ledger 所有权反例、提交登记边界、局部计划数字与 dense GLU 独立参考按代码路径通过 |
+| ASan + UBSan | `build-relay-san-20261018`，4/4 ctest 通过 | 本库已执行用例无地址/未定义行为报告；不扩写到线程、GPU 或模型 |
+| 完整构建流水线 | `build-clean-fork-relay-20261019`：A 固定 archive + 六个 B + 五个 C + a-seams，exit 0，末道边界复查通过 | 新库进入 `fork/build.py` 常规入口后整条流水线成立 |
+| 完整来源隔离 | `build-isolation-relay-20261019`：63/63 条命令通过，`isolated_modules` 含 `relay`，relay 从自身源码副本构建、测试（含 Python 交叉对照）、安装并进入搬迁后交付集合 | 独立库边界与安装消费成立；不构成操作系统沙箱 |
+| 实时跨语言对照 | `tq_relay.python_crosscheck` 通过：C++ 移植与已验证的 `tp5_local_plan.py`（SHA-256 59129982…59e657）在四个固定 fixture 上 decision、错误码、totals、逐 rank 字节/MAC、middle/output 区间全部一致 | C++ 端口与固定比较对象一致；不是 GPU 或真实量化资格 |
+| Python 参考基线 | `tp5_protocol_spec.py` PASS 8 checks；`output_credit_model.py` broken 32 状态 16 条不安全边 / fixed 17 状态 0 条；`tp5_local_plan.py --self-test` 16 组通过 | 提取产物可运行且与指南记录输出一致 |
+| 安装与搬迁消费 | 安装到 `/tmp/tqrelay-prefix-*`，从空目录 `find_package(TQRelay)` 构建消费者，搬迁前缀后重建再运行 `consumer ok` | 安装包自足，无绝对路径泄漏；不证明操作系统沙箱 |
+| A 边界 | `fork/check-upstream.py` 通过，无未登记 A 变化 | 本批次未改 A |
+
+本批次的通过范围是单线程可信调用方的 CPU 所有权模型与合成存储几何。它不构成
+HIP 内存序、五卡前进性、模型数值或性能资格；指南 M0c 平台探针与 A 的最小执行
+接口仍是下一步。通道账本的预算合同沿用 `TQScheduling::admission_budget`（指南
+第 50 章场景组 5、6 的既有实现），不在 TQRelay 内重复。
 
 ## Final release gates
 

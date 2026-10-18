@@ -105,6 +105,7 @@ def main():
     scheduling = module("scheduling", ())
     text_package = module("text", ())
     calibration = module("calibration", ())
+    relay = module("relay", ())
     compose = module("compose", (prefix_a, sampling))
     corpus_compose = module("corpus-compose", (prefix_a, corpus))
     batch_compose = module("batch-compose", (prefix_a, scheduling, text_package))
@@ -123,7 +124,7 @@ def main():
         shutil.copyfile(root / "fork/tools/compare-logits.py", logits_comparator)
 
     delivered = output / "delivered"
-    for prefix in (prefix_a, sampling, corpus, scheduling, text_package, calibration,
+    for prefix in (prefix_a, sampling, corpus, scheduling, text_package, calibration, relay,
                    compose, corpus_compose, batch_compose, logits_compose, imatrix_compose):
         shutil.copytree(prefix, delivered, dirs_exist_ok=True)
         shutil.rmtree(prefix)
@@ -189,7 +190,7 @@ int main() {
               "a_reviewed_overlays_applied": None if args.a_prefix else snapshot["summary"]["reviewed_overlays"],
               "a_reuse_limit": "Installed A source, pin, overlays, and build provenance are not verified." if args.a_prefix else None,
               "a_public_seams_tests_passed": True,
-              "isolated_modules": ["sampling", "corpus", "scheduling", "text", "calibration",
+              "isolated_modules": ["sampling", "corpus", "scheduling", "text", "calibration", "relay",
                                    "compose", "corpus-compose", "batch-compose", "logits-compose", "imatrix-compose"],
               "source_and_build_copies_removed_before_consumption": True,
               "relocated_installed_consumers_passed": True,

@@ -16,6 +16,7 @@
 | B：TQScheduling | 独立的 token / 槽位预算，以及保持当前 Prefill 的候选选择；两对象由 C 组合 | C++17 标准库 |
 | B：TQText | 增量 UTF-8、跨块 stop 匹配、拥有自身文本和字节游标的结果 | C++17 标准库 |
 | B：TQCalibration | 有界读取 WXQCAL03，验证格式、统计人口和数值，逐层返回拥有自身数据的结果 | C++17 标准库 |
+| B：TQRelay | TP5 五卡 RELAY 的纯 CPU 合同：通道 bank 生命周期、精确票据、两种 credit、fail-stop 与排空事实、逐 rank 原生提交登记、五 rank 合成 GLU 分片计划 | C++17 标准库 |
 | C：compose | 用 B 选候选，调用 A 的真实采样链和模型生成 | 已安装 llama、TQSampling |
 | C：corpus-compose | 用 B 读写请求，编排 A 的 tokenizer、decode 和序列快照 | 已安装 llama、TQCorpus |
 | C：batch-compose | FIFO 准入、真实序列槽位、模型批次、阶段释放及 stop / 流式输出生命周期 | 已安装 llama、TQScheduling、TQText |
@@ -33,7 +34,7 @@ python3 fork/build.py --backend cpu --build-dir build-clean-fork --jobs 4
 python3 fork/build.py --backend vulkan --tools --build-dir build-clean-vulkan --jobs 4
 ```
 
-脚本先检查 A，再单独构建和安装 A；随后分别构建、测试和安装五个 B，再分别构建五个 C。产物位于相应构建目录的 `install/`。默认组件测试不需要模型；启用的 Vulkan 接缝测试需要真实 Vulkan 设备。
+脚本先检查 A，再单独构建和安装 A；随后分别构建、测试和安装六个 B，再分别构建五个 C。产物位于相应构建目录的 `install/`。默认组件测试不需要模型；启用的 Vulkan 接缝测试需要真实 Vulkan 设备。
 
 `--tools` 额外构建 `llama-server`、`llama-bench` 及 A 在 tools 模式下必须安装的 `mtmd`；工具可执行文件位于 `upstream/bin/`。脚本也接受 `cuda`、`hip`，可选后端不等于已经取得运行资格。本轮 CPU 独立交付和 CPU / Vulkan 同形状流式模型对照已完成；专项回归与完整后端门槛的范围分别列在 [VALIDATION.md](VALIDATION.md)。`--no-test` 只用于明确跳过测试的构建，不构成验证记录。
 
@@ -170,7 +171,7 @@ python3 fork/tests/isolation.py \
   --output build-isolation --jobs 4 --model /absolute/path/to/model.gguf
 ```
 
-默认隔离流程从固定 A 提交导出源码，只应用验证通过的登记文件；A 构建时不含 B/C。五个 B 与五个 C 分别从各自源码副本构建，C 只找安装包。移除源码和构建副本、搬迁安装前缀后，重新编译消费者并运行已安装程序。`--model` 另外启用真实 batch、streaming 和 logits 测试；独立消费者的 logits 对照限定为最终 greedy token / 最大 logit。
+默认隔离流程从固定 A 提交导出源码，只应用验证通过的登记文件；A 构建时不含 B/C。六个 B 与五个 C 分别从各自源码副本构建，C 只找安装包。移除源码和构建副本、搬迁安装前缀后，重新编译消费者并运行已安装程序。`--model` 另外启用真实 batch、streaming 和 logits 测试；独立消费者的 logits 对照限定为最终 greedy token / 最大 logit。
 
 本轮完整 CPU archive/isolation 的 62 条命令通过，TQText 与 TQCalibration 的独立测试也通过 ASan 和 UBSan。新 imatrix 的原 writer 互操作与实际 A loader 消费另外验证。最终 Vulkan 源码上的同形状流式模型对照与 7 项公开 A 接缝 CTest 通过，其中包含 5 个 scratch 场景、2 个输入别名场景和 16 项 SET_ROWS 字节比较。完整 Vulkan 算子门仍有失败记录，不能由这些专项通过推出整个后端全绿。确切命令、源码身份和结果见 [VALIDATION.md](VALIDATION.md)。自有 CI 已配置，尚未推送或在 GitHub 执行。
 
@@ -184,7 +185,7 @@ ctest --test-dir build-scheduling --output-on-failure
 cmake --install build-scheduling
 ```
 
-独立 B 的安装目标为 `TQSampling::sampling`、`TQCorpus::corpus`、`TQScheduling::scheduling`、`TQText::text` 和 `TQCalibration::calibration`。采样 C 另导出 `TQCompose::compose`；其他四个 C 交付程序。imatrix C 只链接 A 的 `ggml::ggml-base`，配置时仍需要完整 A 安装，因为其 `ggml` package 会查找已启用的 backend。上游公开接口不承诺跨固定版本的二进制 ABI 稳定，更新 A 时须一起重建消费者。
+独立 B 的安装目标为 `TQSampling::sampling`、`TQCorpus::corpus`、`TQScheduling::scheduling`、`TQText::text`、`TQCalibration::calibration` 和 `TQRelay::relay`。采样 C 另导出 `TQCompose::compose`；其他四个 C 交付程序。imatrix C 只链接 A 的 `ggml::ggml-base`，配置时仍需要完整 A 安装，因为其 `ggml` package 会查找已启用的 backend。上游公开接口不承诺跨固定版本的二进制 ABI 稳定，更新 A 时须一起重建消费者。
 
 ### 数值对照的必要条件
 

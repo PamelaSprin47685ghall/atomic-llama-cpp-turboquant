@@ -66,7 +66,7 @@ def main():
         if install:
             run(["cmake", "--install", module_build])
 
-    for name in ("sampling", "corpus", "scheduling", "text", "calibration"):
+    for name in ("sampling", "corpus", "scheduling", "text", "calibration", "relay"):
         module(name)
     for name in ("compose", "corpus-compose", "batch-compose", "logits-compose", "imatrix-compose"):
         module(name, installed_dependencies=True)

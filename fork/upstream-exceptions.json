@@ -13,6 +13,17 @@
       "removal_condition": "Remove when equivalent fork package checks are hosted outside the A repository or supplied by the selected upstream workflow."
     },
     {
+      "path": "AGENTS.md",
+      "sha256": "f6aa3e9b65cc9d9da54fc8b477789547036e7b25d4c33dc363b8f445647e1304",
+      "mode": "100644",
+      "consumers": [
+        "fork package maintainers",
+        "all C composition modules"
+      ],
+      "reason": "Replace the upstream internal instruction sheet with the project's AXIOM/LEMMA/SPEC governance and the full TP5 design guide, plus the user's stated architecture direction (upstream A, self-written B libraries, composing C).",
+      "removal_condition": "Remove when the project stops maintaining its own governance and TP5 design documents and returns to the upstream AGENTS.md, or when the guidance moves entirely under fork/."
+    },
+    {
       "path": "common/arg.cpp",
       "sha256": "d395a1d926266275ec5df0c6d7e9e72bed221a5e9e7c4b74d84475470c19377f",
       "mode": "100644",
@@ -53,16 +64,6 @@
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
-      "path": "ggml/src/ggml-backend.cpp",
-      "sha256": "b42ea28e0461055af8fe743acbea282615d6454fc34e403fabb2556d171a5211",
-      "mode": "100644",
-      "consumers": [
-        "fork/batch-compose"
-      ],
-      "reason": "Rebuild the scheduler allocation owner after synchronization while preserving backends and scheduler identity.",
-      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
-    },
-    {
       "path": "ggml/src/ggml-backend-meta.cpp",
       "sha256": "c141bb450b11ad5dc1a654d94b5188d14829c41dc9c28910bee544bbb728cfa7",
       "mode": "100644",
@@ -72,6 +73,16 @@
       ],
       "reason": "Translate chunk-aligned logical async offsets into child tensor offsets for split axes 0/1/2, and permit existing mirrored partial transfers.",
       "removal_condition": "Remove when the pinned upstream passes the real public meta transfer regression without this patch; update the pin and rerun get and set controls independently."
+    },
+    {
+      "path": "ggml/src/ggml-backend.cpp",
+      "sha256": "b42ea28e0461055af8fe743acbea282615d6454fc34e403fabb2556d171a5211",
+      "mode": "100644",
+      "consumers": [
+        "fork/batch-compose"
+      ],
+      "reason": "Rebuild the scheduler allocation owner after synchronization while preserving backends and scheduler identity.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
       "path": "ggml/src/ggml-cpu/ops.cpp",
