@@ -34,4 +34,10 @@ if(TQ_BATCH_COMPOSE_TEST_MODEL)
             --model "${TQ_BATCH_COMPOSE_TEST_MODEL}"
             --gpu-layers "${TQ_BATCH_COMPOSE_TEST_GPU_LAYERS}"
             --output-dir "${CMAKE_CURRENT_BINARY_DIR}/real-model-test")
+    add_test(NAME tq_batch_compose.admission
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_admission.py"
+            --binary "$<TARGET_FILE:tq_batch_compose>"
+            --model "${TQ_BATCH_COMPOSE_TEST_MODEL}"
+            --gpu-layers "${TQ_BATCH_COMPOSE_TEST_GPU_LAYERS}"
+            --output-dir "${CMAKE_CURRENT_BINARY_DIR}/admission-test")
 endif()

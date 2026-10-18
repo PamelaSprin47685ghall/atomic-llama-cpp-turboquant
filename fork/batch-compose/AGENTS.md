@@ -7,6 +7,7 @@
    scheduling libraries. Reason: A and B must remain independently usable.
 3. Users need truthful memory controls. Reason: a release switch or physical KV
    option is useful only when A actually consumes it and reports failure.
+4. A fixed set of resident slots must serve a longer request queue. Reason: request count must not force equivalent GPU residency.
 
 # LEMMA
 
@@ -20,6 +21,7 @@
 3. From AXIOM 3: phase changes synchronize A; prompt-to-generation release calls
    the real public seam. Explicit physical capacity is passed unchanged; the
    resulting logical and physical sizes come from A's getters.
+4. From AXIOM 4: C keeps request identities separate from A sequence slots. B reserves a complete token bound before C starts work. C consumes every batch output and successfully removes the finished A sequence before it returns the reservation. A failure is fatal and does not trigger an unverified retry.
 
 # SPEC
 
