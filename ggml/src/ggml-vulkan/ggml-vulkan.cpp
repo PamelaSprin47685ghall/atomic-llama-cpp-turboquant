@@ -5895,7 +5895,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
 
     // TurboQuant WHT (forward / inverse rotation, 128-element block)
-    ggml_vk_create_pipeline(device, device->pipeline_turbo_wht, "turbo_wht", turbo_wht_len, turbo_wht_data, "main", 2, 3 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_turbo_wht, "turbo_wht", turbo_wht_len, turbo_wht_data, "main", 3, 4 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
 
@@ -13256,31 +13256,41 @@ static void ggml_vk_set_rows(ggml_backend_vk_context * ctx, vk_context& subctx, 
     });
 }
 
-static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     int direction, group_size;
     memcpy(&direction, dst->op_params + 0, sizeof(int));
     memcpy(&group_size, dst->op_params + sizeof(int), sizeof(int));
-    struct { uint32_t ne; uint32_t direction; uint32_t group_size; } pc = {
+    struct { uint32_t ne; uint32_t direction; uint32_t group_size; uint32_t use_scale; } pc = {
         (uint32_t)ggml_nelements(src0), (uint32_t)direction, (uint32_t)group_size,
+        src1 != nullptr ? 1u : 0u,
     };
     vk_pipeline pipeline = ctx->device->pipeline_turbo_wht;
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src0, false);
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, false);
-    // Spread workgroups across Y/Z to stay within maxComputeWorkGroupCount[0].
-    const uint32_t n_groups = pc.ne / (uint32_t)group_size;
+    // InnerQ scale_inv (src[1]) is optional: bind src0 as a dummy when NULL.
+    // The shader never reads binding 2 unless use_scale is set.
+    vk_subbuffer scale_buf = src1 != nullptr ? ggml_vk_tensor_subbuffer(ctx, src1, false) : src_buf;
+    // Each workgroup handles exactly 128 elements (pipeline->wg_denoms[0] == 128,
+    // matching local_size_x). The shader linearizes via gl_NumWorkGroups, so the
+    // host only needs a dense 3D reshape that stays inside maxComputeWorkGroupCount.
+    // CRITICAL: elements[0] must be a multiple of 128 yielding the intended X
+    // workgroup count — NEVER scale by WHT group_size (32/64/128). The old
+    // `512 * group_size` formula produced wg_x=256 when group_size=64 while the
+    // shader still assumed stride 512, leaving valid output workgroups unwritten.
+    const uint32_t total_wg = CEIL_DIV(pc.ne, 128u);
     std::array<uint32_t, 3> elements;
-    if (n_groups > 262144) {
-        elements = { 512 * (uint32_t)group_size, 512, CEIL_DIV(n_groups, 262144) };
-    } else if (n_groups > 512) {
-        elements = { 512 * (uint32_t)group_size, CEIL_DIV(n_groups, 512), 1 };
+    if (total_wg > 262144u) {
+        elements = { 512u * 128u, 512u, CEIL_DIV(total_wg, 262144u) };
+    } else if (total_wg > 512u) {
+        elements = { 512u * 128u, CEIL_DIV(total_wg, 512u), 1u };
     } else {
         elements = { pc.ne, 1, 1 };
     }
     // Compute-to-compute RAW/WAW ordering must be explicit on Vulkan.
     ggml_vk_sync_buffers(ctx, subctx);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, elements);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, scale_buf }, pc, elements);
     ggml_vk_sync_buffers(ctx, subctx);
 }
 
@@ -15645,7 +15655,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_TURBO_WHT:
-        ggml_vk_turbo_wht(ctx, compute_ctx, src0, node);
+        ggml_vk_turbo_wht(ctx, compute_ctx, src0, src1, node);
 
         break;
     case GGML_OP_SILU_BACK:
@@ -18737,7 +18747,24 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_POOL_2D:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_TURBO_WHT:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 128 == 0;
+            {
+                int group_size;
+                memcpy(&group_size, op->op_params + sizeof(int), sizeof(int));
+                // Keep the existing whole-128-element-workgroup contract.
+                // The public op accepts smaller transform groups within a row.
+                if (op->src[0]->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(op->src[0]) ||
+                    op->src[0]->ne[0] % 128 != 0 ||
+                    ggml_nelements(op->src[0]) > UINT32_MAX ||
+                    (group_size != 32 && group_size != 64 && group_size != 128)) {
+                    return false;
+                }
+                // The shader indexes scale by the within-group coordinate.
+                return op->src[1] == nullptr ||
+                    (op->src[1]->type == GGML_TYPE_F32 &&
+                     ggml_is_contiguous(op->src[1]) &&
+                     ggml_nelements(op->src[1]) >= group_size);
+            }
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true; // all inputs are contiguous, see ggml.c

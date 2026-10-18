@@ -64,6 +64,28 @@
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
+      "path": "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+      "sha256": "dd3e36403f112ef3c1050bd900afbe072f4f3021fdaf9f6a35c6f4ec81d94924",
+      "mode": "100644",
+      "consumers": [
+        "Vulkan Turbo WHT",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Correct legal 32/64 WHT dispatch and the existing optional scale operand with explicit supported shapes.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "ggml/src/ggml-vulkan/vulkan-shaders/turbo_wht.comp",
+      "sha256": "f20b9dde57cfa34461daac288688dc8892fb6fad2303a07a17df188967970827",
+      "mode": "100644",
+      "consumers": [
+        "Vulkan Turbo WHT",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Execute 32/64/128 groups and forward/inverse scaling according to the existing public operation.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
       "path": "include/llama.h",
       "sha256": "d9916907175a664f4ea79f0302b96c33fc3e9e62c6ea88a494e010ba45f4feb2",
       "mode": "100644",
