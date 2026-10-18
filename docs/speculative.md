@@ -150,10 +150,13 @@ default) keeps them in persistent device buffers instead. The next graph input i
 filled by a native device-to-device copy, with no host bytes and no CPU interleave.
 
 The handoff requires a single sequence stream, one shared device for both models, and a
-backend that implements `ggml_backend_device_copy_ranges` (Vulkan). Otherwise the driver
-logs why and keeps the host path; `GGML_SPEC_DIRECT_HIDDEN=0` forces the host path for A/B
-comparison. Both paths produce identical tokens. The device buffers are allocated at
-startup and hold the most recent batch, so the visible cost is memory, not time: one
+backend that can copy device ranges and replace non-finite values in place (Vulkan, CUDA,
+and HIP). The driver probes that before the first decode. If the probe fails it leaves the
+host extraction flags off and keeps the host path; `GGML_SPEC_DIRECT_HIDDEN=0` forces the
+host path for A/B comparison. Both paths produce identical tokens: NaN becomes 0 and
+infinities become ±65504, while finite values, including those outside the f16 range, are
+left unchanged. The device buffers are allocated at startup and hold the most recent batch,
+so the visible cost is memory, not time: one
 `n_embd x n_batch` F32 buffer per extracted target layer, plus one for the nextn output.
 
 ### n-gram Cache (`ngram-cache`)

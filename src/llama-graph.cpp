@@ -169,7 +169,15 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 
     const int64_t rows = params.predefined_enabled ? params.predefined_capacity_rows : params.ubatch.n_tokens;
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == rows);
-    res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == rows);
+    // Device handoff builds [n_feat, n_tokens, n_aux]. A host graph is
+    // [n_embd, n_tokens] and must not be reused for that layout, or the
+    // permute would interleave already-interleaved rows.
+    if (params.ubatch.device_embd) {
+        res &= embd && embd->ne[1] == rows && embd->ne[0] > 0 &&
+               n_embd % embd->ne[0] == 0 && embd->ne[2] == n_embd / embd->ne[0];
+    } else {
+        res &= (!params.ubatch.embd) || (embd && embd->ne[1] == rows && embd->ne[0] == n_embd);
+    }
 
     return res;
 }

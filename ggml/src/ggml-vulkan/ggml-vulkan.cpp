@@ -1197,6 +1197,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_clamp[2];
     vk_pipeline pipeline_pad_f32;
     vk_pipeline pipeline_memmove_bytes;
+    vk_pipeline pipeline_sanitize_nonfinite;
     vk_pipeline pipeline_roll_f32;
     vk_pipeline pipeline_repeat_i32, pipeline_repeat_back_f32;
     vk_pipeline pipeline_repeat_i16;
@@ -7685,6 +7686,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_pad_f32, "pad_f32", pad_f32_len, pad_f32_data, "main", 2, sizeof(vk_op_pad_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_memmove_bytes, "memmove_bytes", memmove_bytes_len, memmove_bytes_data, "main", 2, 3 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_sanitize_nonfinite, "sanitize_nonfinite", sanitize_nonfinite_len, sanitize_nonfinite_data, "main", 1, 2 * sizeof(uint32_t), {256, 1, 1}, {}, 4);
 
     ggml_vk_create_pipeline(device, device->pipeline_roll_f32, "roll_f32", roll_f32_len, roll_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
@@ -23943,6 +23945,50 @@ static bool ggml_backend_vk_device_copy_ranges(ggml_backend_t backend,
     return true;
 }
 
+static bool ggml_backend_vk_device_sanitize_nonfinite(ggml_backend_t backend, ggml_tensor * tensor,
+        size_t offset, size_t bytes, bool dry_run) {
+    if (!ggml_backend_is_vk(backend) || !tensor || !tensor->buffer || tensor->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(tensor) || ((offset | bytes) % sizeof(float)) != 0 || bytes == 0) {
+        return false;
+    }
+    const size_t size = ggml_nbytes(tensor);
+    if (offset > size || bytes > size - offset || !ggml_backend_buffer_is_vk(tensor->buffer) ||
+        ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    auto * buf_ctx = static_cast<ggml_backend_vk_buffer_context *>(tensor->buffer->context);
+    vk_buffer buffer = buf_ctx->dev_buffer;
+    if (!buffer || buffer->device != ctx->device || !ctx->device->pipeline_sanitize_nonfinite) {
+        return false;
+    }
+    if (buffer->size > ctx->device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+    const uint64_t base = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+    const uint64_t n_floats = bytes / sizeof(float);
+    if (base > buffer->size || bytes > buffer->size - base || base > UINT32_MAX || n_floats > UINT32_MAX) {
+        return false;
+    }
+    if (dry_run) {
+        return true;
+    }
+    // Record on the compute stream the following graph copy uses, so the
+    // replacement cannot be overtaken and no host fence is required.
+    struct {
+        uint32_t offset_bytes;
+        uint32_t n_floats;
+    } pc{ (uint32_t) base, (uint32_t) n_floats };
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_sanitize_nonfinite, 1);
+    ggml_vk_dispatch_pipeline(ctx, compute_ctx, ctx->device->pipeline_sanitize_nonfinite,
+        { vk::DescriptorBufferInfo{ buffer->buffer, 0, buffer->size } }, pc,
+        { pc.n_floats, 1, 1 });
+    compute_ctx->s->buffer->has_pending_mem_work = true;
+    ggml_vk_sync_buffers(nullptr, compute_ctx);
+    return true;
+}
+
 static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async(" << src << " -> " << dst << ", size=" << ggml_nbytes(src) << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend_dst->context;
@@ -29062,6 +29108,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_device_copy_ranges") == 0) {
         return (void *) ggml_backend_vk_device_copy_ranges;
+    }
+    if (strcmp(name, "ggml_backend_device_sanitize_nonfinite") == 0) {
+        return (void *) ggml_backend_vk_device_sanitize_nonfinite;
     }
     if (strcmp(name, "ggml_backend_set_predefined_rows") == 0) {
         return (void *) +[](ggml_backend_t backend, uint32_t active, uint32_t capacity) -> bool {

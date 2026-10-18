@@ -1,0 +1,24 @@
+#version 450
+
+// In-place match of ggml_sanitize_nonfinite_f32: NaN -> 0, +Inf -> 65504,
+// -Inf -> -65504. Finite values, including those outside the f16 range, stay.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) buffer Data { float values[]; };
+layout(push_constant) uniform Parameters {
+    uint offset_bytes;
+    uint n_floats;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_floats) {
+        return;
+    }
+    uint idx = pc.offset_bytes / 4u + i;
+    float v = values[idx];
+    if (isnan(v)) {
+        values[idx] = 0.0;
+    } else if (isinf(v)) {
+        values[idx] = v > 0.0 ? 65504.0 : -65504.0;
+    }
+}

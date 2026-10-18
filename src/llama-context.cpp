@@ -3,6 +3,7 @@
 #include "llama-predefined-hidden.h"
 #include "ggml-alloc.h"
 #include "ggml-predefined.h"
+#include "ggml-device-copy.h"
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
 #include "ggml.h"
@@ -3221,6 +3222,23 @@ bool llama_context::decode_device_input(llama_batch batch, const llama_device_in
 
 bool llama_context::encode_device_input(llama_batch batch, const llama_device_input_range * ranges, size_t n_ranges) {
     return run_device_input(true, batch, ranges, n_ranges);
+}
+
+bool llama_context::device_feature_supported(const ggml_tensor * tensor) const {
+    auto * executor = executor_for_output_device();
+    if (!executor || !tensor || !tensor->buffer || tensor->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(tensor) || ggml_nbytes(tensor) < sizeof(float)) {
+        return false;
+    }
+    ggml_tensor * mutable_tensor = const_cast<ggml_tensor *>(tensor);
+    const ggml_device_copy_range probe{tensor, mutable_tensor, 0, 0, sizeof(float)};
+    return ggml_backend_device_copy_ranges(executor, &probe, 1, true) &&
+           ggml_backend_device_sanitize_nonfinite(executor, mutable_tensor, 0, sizeof(float), true);
+}
+
+bool llama_context::device_feature_sanitize(ggml_tensor * tensor, size_t offset, size_t bytes) const {
+    auto * executor = executor_for_output_device();
+    return executor && ggml_backend_device_sanitize_nonfinite(executor, tensor, offset, bytes, false);
 }
 
 void llama_context::set_attention_q_pre_rope(uint32_t lid, bool enable) {
@@ -8160,6 +8178,14 @@ int llama_decode_device_input(llama_context * ctx, llama_batch batch, const llam
 
 int llama_encode_device_input(llama_context * ctx, llama_batch batch, const llama_device_input_range * ranges, size_t n_ranges) {
     return ctx && ctx->encode_device_input(batch, ranges, n_ranges) ? 0 : -1;
+}
+
+bool llama_device_feature_supported(llama_context * ctx, ggml_tensor * tensor) {
+    return ctx && ctx->device_feature_supported(tensor);
+}
+
+bool llama_device_feature_sanitize(llama_context * ctx, ggml_tensor * tensor, size_t offset, size_t bytes) {
+    return ctx && ctx->device_feature_sanitize(tensor, offset, bytes);
 }
 
 float * llama_get_attention_q_pre_rope(llama_context * ctx, uint32_t lid) {

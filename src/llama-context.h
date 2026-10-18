@@ -99,6 +99,8 @@ struct llama_context {
     ggml_tensor * get_embeddings_nextn_tensor();
     bool decode_device_input(llama_batch batch, const llama_device_input_range * ranges, size_t n_ranges);
     bool encode_device_input(llama_batch batch, const llama_device_input_range * ranges, size_t n_ranges);
+    bool device_feature_supported(const ggml_tensor * tensor) const;
+    bool device_feature_sanitize(ggml_tensor * tensor, size_t offset, size_t bytes) const;
     void set_predefined_target_enabled(bool enabled) { predefined_target_enabled = enabled; }
     bool get_predefined_target_enabled() const { return predefined_target_enabled; }
 

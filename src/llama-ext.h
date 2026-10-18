@@ -204,6 +204,19 @@ LLAMA_API int llama_decode_device_input(struct llama_context * ctx, struct llama
 LLAMA_API int llama_encode_device_input(struct llama_context * ctx, struct llama_batch batch,
         const struct llama_device_input_range * ranges, size_t n_ranges);
 
+// True when executor_ctx's output device can copy this tensor and replace
+// non-finite F32 values in place. tensor is a buffer returned by the getters
+// above, or null. A false result means the caller must stay on the host path;
+// do not enable device extraction and then fall back after the first decode.
+LLAMA_API bool llama_device_feature_supported(struct llama_context * executor_ctx, struct ggml_tensor * tensor);
+
+// Queue ggml_sanitize_nonfinite_f32 on executor_ctx's compute stream for
+// [offset, offset+bytes) of tensor. No host readback. Returns false when the
+// backend cannot do it; the range is unchanged and no command is recorded.
+// offset and bytes are float-aligned. The tensor must outlive the queued work.
+LLAMA_API bool llama_device_feature_sanitize(struct llama_context * executor_ctx, struct ggml_tensor * tensor,
+        size_t offset, size_t bytes);
+
 // Extract normalized attention Q immediately before RoPE for calibration.
 // Enabled layers are copied asynchronously and synchronized once on the first getter.
 LLAMA_API void    llama_set_attention_q_pre_rope(struct llama_context * ctx, uint32_t lid, bool value);

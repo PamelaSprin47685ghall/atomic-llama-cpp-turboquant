@@ -13,6 +13,26 @@ extern "C" {
 // fatal to the handoff: retain/retire its owners, never retry as a host copy.
 #define GGML_DEVICE_COPY_MAX_RANGES 8
 
+// Host DFlash/DSpark feature sanitization uses this exact replacement:
+// NaN -> 0, +Inf -> 65504, -Inf -> -65504, every finite value unchanged.
+// 65504 is the largest finite f16 value. Do not clamp finite values above it:
+// the host path leaves those massive activations intact.
+#define GGML_SANITIZE_NONFINITE_F16_MAX 65504.0f
+
+static inline float ggml_sanitize_nonfinite_f32(float v) {
+    if (v != v) {
+        return 0.0f;
+    }
+    // Inf compares equal to itself after halving. A finite value does not.
+    if (v > 0.0f && v * 0.5f == v) {
+        return GGML_SANITIZE_NONFINITE_F16_MAX;
+    }
+    if (v < 0.0f && v * 0.5f == v) {
+        return -GGML_SANITIZE_NONFINITE_F16_MAX;
+    }
+    return v;
+}
+
 struct ggml_device_copy_range {
     const struct ggml_tensor * src;
     struct ggml_tensor * dst;
@@ -37,6 +57,18 @@ GGML_API bool ggml_device_copy_ranges_valid(
 
 typedef bool (*ggml_backend_device_copy_ranges_t)(
         ggml_backend_t, const struct ggml_device_copy_range *, size_t, bool);
+
+// In-place replacement of non-finite F32 values, matching
+// ggml_sanitize_nonfinite_f32. offset and bytes are float-aligned and must
+// lie inside the contiguous tensor. Work is queued on the executor compute
+// stream; there is no host readback. dry_run validates and records nothing.
+// A missing backend implementation returns false.
+GGML_API bool ggml_backend_device_sanitize_nonfinite(
+        ggml_backend_t executor, struct ggml_tensor * tensor,
+        size_t offset, size_t bytes, bool dry_run);
+
+typedef bool (*ggml_backend_device_sanitize_nonfinite_t)(
+        ggml_backend_t, struct ggml_tensor *, size_t, size_t, bool);
 
 #ifdef __cplusplus
 }

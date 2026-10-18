@@ -15,6 +15,7 @@
 #include "speculative-adaptive.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#include "ggml-device-copy.h"
 
 #include <algorithm>
 #include <array>
@@ -1155,33 +1156,36 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_set_embeddings_layer_inp_device(params.ctx_tgt, true);
         llama_set_embeddings_nextn_device(params.ctx_tgt, /*decoder*/ true, /*encoder*/ false);
         llama_set_embeddings_nextn_device(params.ctx_dft, /*decoder*/ false, /*encoder*/ true);
-        direct_hidden = true;
-        LOG_INF("%s: direct hidden enabled on %s\n", __func__, ggml_backend_dev_name(dev_tgt));
-    }
 
-    // The device buffers are allocated before the first decode. Keep the host
-    // path only when every requested feature really has one.
-    bool direct_hidden_ready() {
-        if (!direct_hidden) {
-            return false;
-        }
+        auto revert = [&]() {
+            // Before the first decode, clearing the flags keeps host extraction.
+            // Doing it later would leave the host buffers unallocated.
+            llama_set_embeddings_layer_inp_device(params.ctx_tgt, false);
+            llama_set_embeddings_nextn_device(params.ctx_tgt, false, false);
+            llama_set_embeddings_nextn_device(params.ctx_dft, false, false);
+        };
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             ggml_tensor * t = target_layer_ids[k] == n_layer_tgt
                 ? llama_get_embeddings_nextn_tensor(params.ctx_tgt)
                 : llama_get_embeddings_layer_inp_tensor(params.ctx_tgt, (uint32_t) target_layer_ids[k]);
-            if (!t || t->type != GGML_TYPE_F32 || t->ne[0] != n_embd_tgt) {
-                LOG_WRN("%s: direct hidden disabled (target feature %d unavailable)\n", __func__, target_layer_ids[k]);
-                direct_hidden = false;
-                return false;
+            if (!t || t->type != GGML_TYPE_F32 || t->ne[0] != n_embd_tgt ||
+                !llama_device_feature_supported(params.ctx_tgt, t) ||
+                !llama_device_feature_supported(params.ctx_dft, t)) {
+                LOG_INF("%s: direct hidden unavailable (feature %d has no device copy)\n",
+                        __func__, target_layer_ids[k]);
+                revert();
+                return;
             }
         }
         ggml_tensor * g = llama_get_embeddings_nextn_tensor(params.ctx_dft);
-        if (!g || g->type != GGML_TYPE_F32 || g->ne[0] != n_embd_dec) {
-            LOG_WRN("%s: direct hidden disabled (draft encoder output unavailable)\n", __func__);
-            direct_hidden = false;
-            return false;
+        if (!g || g->type != GGML_TYPE_F32 || g->ne[0] != n_embd_dec ||
+            !llama_device_feature_supported(params.ctx_dft, g)) {
+            LOG_INF("%s: direct hidden unavailable (draft encoder output has no device copy)\n", __func__);
+            revert();
+            return;
         }
-        return true;
+        direct_hidden = true;
+        LOG_INF("%s: direct hidden enabled on %s\n", __func__, ggml_backend_dev_name(dev_tgt));
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1247,7 +1251,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // One decision per request: the device and host paths are never mixed
         // within a batch, because only one of them fills the feature buffers.
-        const bool direct = direct_hidden && direct_hidden_ready();
+        const bool direct = direct_hidden;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
@@ -1310,6 +1314,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             batch_inject.embd = orig_batch_embd;
                             return false;
                         }
+                        // Same replacement as the host path, on the draft stream
+                        // so the following copy cannot overtake it.
+                        if (!llama_device_feature_sanitize(ctx_dft, t, src_row * tgt_row, (size_t) n_chunk * tgt_row)) {
+                            LOG_ERR("%s: direct hidden sanitize failed for feature %d\n", __func__, target_layer_ids[k]);
+                            batch_inject.embd = orig_batch_embd;
+                            return false;
+                        }
                         enc_ranges[k] = {t, src_row * tgt_row, size_t(k) * n_chunk * tgt_row,
                                          size_t(n_chunk) * tgt_row};
                     }
@@ -1361,7 +1372,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         size_t n_bad = 0;
                         for (auto & v : features_buf) {
                             if (!std::isfinite(v)) {
-                                v = v != v ? 0.0f : (v > 0.0f ? 65504.0f : -65504.0f);
+                                v = ggml_sanitize_nonfinite_f32(v);
                                 n_bad++;
                             }
                         }

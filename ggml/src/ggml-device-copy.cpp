@@ -61,3 +61,28 @@ bool ggml_backend_device_copy_ranges(ggml_backend_t executor, const ggml_device_
         return false;
     }
 }
+
+bool ggml_backend_device_sanitize_nonfinite(ggml_backend_t executor, ggml_tensor * tensor,
+                                             size_t offset, size_t bytes, bool dry_run) {
+    if (!executor || !tensor || !tensor->buffer || tensor->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(tensor) || ((offset | bytes) % sizeof(float)) != 0 || bytes == 0) {
+        return false;
+    }
+    const size_t size = ggml_nbytes(tensor);
+    if (offset > size || bytes > size - offset) {
+        return false;
+    }
+    auto * device = ggml_backend_get_device(executor);
+    auto * reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    if (!reg) {
+        return false;
+    }
+    auto fn = reinterpret_cast<ggml_backend_device_sanitize_nonfinite_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_device_sanitize_nonfinite"));
+    try {
+        return fn && fn(executor, tensor, offset, bytes, dry_run);
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("%s: native sanitize failed: %s\n", __func__, e.what());
+        return false;
+    }
+}

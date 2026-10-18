@@ -3,6 +3,7 @@
 #include "moe-devsort.cuh"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-device-copy.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -7527,8 +7528,141 @@ static void * ggml_backend_cuda_kv_stream_runtime_new_for_device_impl(
             phase_arena, maximum_pool_bytes, params);
 }
 
+// Views already store data at view_src->data + view_offs once the buffer is
+// bound. Add view_offs only when that adjustment has not happened yet.
+static char * ggml_cuda_tensor_ptr(const ggml_tensor * tensor, size_t offset) {
+    char * base = static_cast<char *>(tensor->data);
+    if (!base) {
+        return nullptr;
+    }
+    if (tensor->view_src && tensor->view_src->data && base == static_cast<char *>(tensor->view_src->data)) {
+        base += tensor->view_offs;
+    }
+    return base + offset;
+}
+
+static bool ggml_cuda_ptr_in_buffer(ggml_backend_buffer_t buffer, const char * ptr, size_t bytes) {
+    auto * bctx = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
+    const char * begin = static_cast<const char *>(bctx->dev_ptr);
+    if (!begin || !ptr || ptr < begin) {
+        return false;
+    }
+    const size_t off = size_t(ptr - begin);
+    return off <= buffer->size && bytes <= buffer->size - off;
+}
+
+static bool ggml_cuda_ranges_overlap(const char * a, size_t an, const char * b, size_t bn) {
+    return an && bn && a < b + bn && b < a + an;
+}
+
+static bool ggml_backend_cuda_device_copy_ranges(ggml_backend_t backend,
+        const ggml_device_copy_range * ranges, size_t n, bool dry_run) {
+    if (!ggml_backend_is_cuda(backend) || !ggml_device_copy_ranges_valid(ranges, n)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    struct copy_op {
+        char * src = nullptr;
+        char * dst = nullptr;
+        size_t bytes = 0;
+    } copies[GGML_DEVICE_COPY_MAX_RANGES];
+    for (size_t i = 0; i < n; ++i) {
+        const auto & r = ranges[i];
+        if (!ggml_backend_buffer_is_cuda(r.src->buffer) || !ggml_backend_buffer_is_cuda(r.dst->buffer) ||
+            ggml_backend_buffer_get_usage(r.dst->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return false;
+        }
+        auto * src_buf = static_cast<ggml_backend_cuda_buffer_context *>(r.src->buffer->context);
+        auto * dst_buf = static_cast<ggml_backend_cuda_buffer_context *>(r.dst->buffer->context);
+        if (src_buf->device != ctx->device || dst_buf->device != ctx->device) {
+            return false;
+        }
+        copies[i].src = ggml_cuda_tensor_ptr(r.src, r.src_offset);
+        copies[i].dst = ggml_cuda_tensor_ptr(r.dst, r.dst_offset);
+        copies[i].bytes = r.bytes;
+        if (!ggml_cuda_ptr_in_buffer(r.src->buffer, copies[i].src, r.bytes) ||
+            !ggml_cuda_ptr_in_buffer(r.dst->buffer, copies[i].dst, r.bytes)) {
+            return false;
+        }
+        if (copies[i].src == copies[i].dst) {
+            copies[i].bytes = 0;
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            if ((ggml_cuda_ranges_overlap(copies[i].dst, copies[i].bytes, copies[j].src, copies[j].bytes)) ||
+                (i != j && ggml_cuda_ranges_overlap(copies[i].dst, copies[i].bytes, copies[j].dst, copies[j].bytes))) {
+                return false;
+            }
+        }
+    }
+    if (dry_run) {
+        return true;
+    }
+    ggml_cuda_set_device(ctx->device);
+    for (size_t i = 0; i < n; ++i) {
+        if (copies[i].bytes) {
+            CUDA_CHECK(cudaMemcpyAsync(copies[i].dst, copies[i].src, copies[i].bytes,
+                                       cudaMemcpyDeviceToDevice, ctx->stream()));
+        }
+    }
+    return true;
+}
+
+static __global__ void ggml_cuda_sanitize_nonfinite_kernel(float * data, size_t n) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float v = data[i];
+    if (isnan(v)) {
+        data[i] = 0.0f;
+    } else if (isinf(v)) {
+        data[i] = v > 0.0f ? GGML_SANITIZE_NONFINITE_F16_MAX : -GGML_SANITIZE_NONFINITE_F16_MAX;
+    }
+}
+
+static bool ggml_backend_cuda_device_sanitize_nonfinite(ggml_backend_t backend, ggml_tensor * tensor,
+        size_t offset, size_t bytes, bool dry_run) {
+    if (!ggml_backend_is_cuda(backend) || !tensor || !tensor->buffer || tensor->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(tensor) || ((offset | bytes) % sizeof(float)) != 0 || bytes == 0) {
+        return false;
+    }
+    const size_t size = ggml_nbytes(tensor);
+    if (offset > size || bytes > size - offset || !ggml_backend_buffer_is_cuda(tensor->buffer) ||
+        ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    auto * buf = static_cast<ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
+    if (buf->device != ctx->device) {
+        return false;
+    }
+    char * ptr = ggml_cuda_tensor_ptr(tensor, offset);
+    if (!ggml_cuda_ptr_in_buffer(tensor->buffer, ptr, bytes)) {
+        return false;
+    }
+    if (dry_run) {
+        return true;
+    }
+    const size_t n = bytes / sizeof(float);
+    const int threads = 256;
+    const int blocks = int((n + threads - 1) / threads);
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_sanitize_nonfinite_kernel<<<blocks, threads, 0, ctx->stream()>>>(
+        reinterpret_cast<float *>(ptr), n);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_device_copy_ranges") == 0) {
+        return (void *) ggml_backend_cuda_device_copy_ranges;
+    }
+    if (strcmp(name, "ggml_backend_device_sanitize_nonfinite") == 0) {
+        return (void *) ggml_backend_cuda_device_sanitize_nonfinite;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
