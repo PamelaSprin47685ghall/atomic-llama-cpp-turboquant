@@ -33,36 +33,56 @@
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
+      "path": "ggml/include/ggml-backend.h",
+      "sha256": "bfe0c8ed6c5a648de5a9da79fad23ec17010760644801fb245d0649853b79fd9",
+      "mode": "100644",
+      "consumers": [
+        "fork/batch-compose"
+      ],
+      "reason": "Declare a synchronized public scheduler workspace release; only A can own this allocator lifecycle.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "ggml/src/ggml-backend.cpp",
+      "sha256": "b42ea28e0461055af8fe743acbea282615d6454fc34e403fabb2556d171a5211",
+      "mode": "100644",
+      "consumers": [
+        "fork/batch-compose"
+      ],
+      "reason": "Rebuild the scheduler allocation owner after synchronization while preserving backends and scheduler identity.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
       "path": "include/llama.h",
-      "sha256": "81632b80dc4c70569252a7776ba55c784dbb0b37300259f3487d87a34206edcf",
+      "sha256": "d9916907175a664f4ea79f0302b96c33fc3e9e62c6ea88a494e010ba45f4feb2",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
         "tools/server"
       ],
-      "reason": "Declare, validate and observe physical KV capacity independently of the logical context window.",
+      "reason": "Expose versioned physical KV sizing, compute allocation observation and synchronized release.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
       "path": "src/llama-context.cpp",
-      "sha256": "3f66c1e452fe9ad7eb312355155a80236f088f06606a9900bb17dfa7c325bbf6",
+      "sha256": "c9d9f2a508cbe0efcf91a3a5a937fbfeec1e55447d8cb972ff5895c43ed72559",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
         "tools/server"
       ],
-      "reason": "Declare, validate and observe physical KV capacity independently of the logical context window.",
+      "reason": "Validate physical KV independently from the logical window and invalidate graph state before workspace release.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
       "path": "src/llama-context.h",
-      "sha256": "b65015a61d25e5a926479e1f0d76599b41a1ecb1f52fe6e5a5e04dff77bca0ac",
+      "sha256": "4fe6d3171b59968e22bc01caa72952d49a80702101d2226b7bb0989dcf50bba3",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
         "tools/server"
       ],
-      "reason": "Declare, validate and observe physical KV capacity independently of the logical context window.",
+      "reason": "A owns physical size observation and private graph/allocator release implementation.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {

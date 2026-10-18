@@ -57,6 +57,9 @@ struct llama_context {
 
     void synchronize();
 
+    bool release_compute();
+    uint64_t compute_bytes() const;
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 

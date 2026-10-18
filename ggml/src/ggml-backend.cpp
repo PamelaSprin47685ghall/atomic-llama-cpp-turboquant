@@ -2143,6 +2143,29 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
 }
 
+void ggml_backend_sched_release_buffers(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    ggml_backend_sched_synchronize(sched);
+
+    // Keep the scheduler and its provider session; only the allocator owns
+    // the transient compute buffers whose high-water mark is being released.
+    ggml_gallocr_t replacement = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    ggml_backend_sched_reset(sched);
+    ggml_gallocr_free(sched->galloc);
+    sched->galloc = replacement;
+
+    sched->n_splits = 0;
+    sched->n_graph_inputs = 0;
+    sched->graph.n_nodes = 0;
+    sched->graph.n_leafs = 0;
+    sched->cur_copy = 0;
+    sched->next_copy = 0;
+    // The next graph is a deliberate cold allocation, not an unexpected
+    // same-shape reallocation for GGML_SCHED_DEBUG_REALLOC diagnostics.
+    sched->debug_graph_size = 0;
+    sched->debug_prev_graph_size = 0;
+}
+
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);

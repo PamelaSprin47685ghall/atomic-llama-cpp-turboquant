@@ -348,6 +348,16 @@ extern "C" {
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // Synchronize all scheduler backends, discard the current allocation plan,
+    // and release the buffers owned by the graph allocator. The scheduler,
+    // backend instances, evaluation callback, and MoE cache session survive.
+    // All previously allocated graph tensors become invalid: discard their
+    // metadata and build a fresh graph before the next allocation/computation.
+    // Externally allocated tensors (for example model weights) are unaffected.
+    // The caller must serialize access to this scheduler. Backend buffer types
+    // that lease an external arena keep that arena's separate ownership rules.
+    GGML_API void                 ggml_backend_sched_release_buffers(ggml_backend_sched_t sched);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 

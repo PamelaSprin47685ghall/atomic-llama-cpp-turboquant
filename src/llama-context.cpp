@@ -1491,6 +1491,53 @@ void llama_context::synchronize() {
     t_compute_start_us = 0;
 }
 
+bool llama_context::release_compute() {
+    // A phase arena owns a joint KV/compute layout; releasing its allocator
+    // without the arena protocol would invalidate that layout. Optimizer
+    // graphs also have a separate lifetime. Reject both before any mutation.
+    if (!sched || model.hparams.no_alloc || opt_ctx != nullptr ||
+            kv_stream_phase_arena.arena != nullptr || kv_stream_phase_arena.configured) {
+        return false;
+    }
+
+    synchronize();
+    // These own the only inference graph metadata that may reuse allocator
+    // addresses. Reset both before the allocator is freed, retaining their
+    // graph-result objects for the normal next graph build.
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+    if (gf_res_reserve) {
+        gf_res_reserve->reset();
+    }
+    ggml_backend_sched_release_buffers(sched.get());
+    return true;
+}
+
+uint64_t llama_context::compute_bytes() const {
+    if (!sched) {
+        return 0;
+    }
+    uint64_t total = 0;
+    const int n_backends = ggml_backend_sched_get_n_backends(sched.get());
+    for (int i = 0; i < n_backends; ++i) {
+        const auto backend = ggml_backend_sched_get_backend(sched.get(), i);
+        const auto buft = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+        bool already_counted = false;
+        for (int j = 0; j < i; ++j) {
+            const auto previous = ggml_backend_sched_get_backend(sched.get(), j);
+            if (ggml_backend_sched_get_buffer_type(sched.get(), previous) == buft) {
+                already_counted = true;
+                break;
+            }
+        }
+        if (!already_counted) {
+            total += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        }
+    }
+    return total;
+}
+
 const llama_model & llama_context::get_model() const {
     return model;
 }
@@ -4724,6 +4771,14 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+bool llama_memory_release_compute(llama_context * ctx) {
+    return ctx != nullptr && ctx->release_compute();
+}
+
+uint64_t llama_memory_compute_bytes(const llama_context * ctx) {
+    return ctx != nullptr ? ctx->compute_bytes() : 0;
 }
 
 float * llama_get_logits(llama_context * ctx) {

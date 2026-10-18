@@ -608,6 +608,24 @@ extern "C" {
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
+    // Release this context's transient compute workspace at a caller-selected
+    // phase boundary. Synchronizes pending computation and invalidates reusable
+    // graphs; the next decode/encode allocates its actual graph shape again.
+    // Model weights, KV/recurrent state, output buffers, and the scheduler's
+    // MoE cache session are preserved. Does not change llama_set_decode_phase.
+    // Returns false without changing state for NULL, metadata-only contexts,
+    // an active training optimizer, or a shared CUDA KV-stream phase arena.
+    // Otherwise returns true (including when no compute buffers are owned).
+    // The caller must serialize access to the context. Do not call from an
+    // evaluation callback or while another thread is using the same context.
+    LLAMA_API bool llama_memory_release_compute(struct llama_context * ctx);
+
+    // Current bytes owned by this context's graph allocator, counted once per
+    // shared buffer type. This is not peak/reserved-size estimation or device
+    // free/resident memory. Model/KV/output/provider-cache buffers are excluded.
+    // Does not synchronize; requires serialized context access. NULL returns 0.
+    LLAMA_API uint64_t llama_memory_compute_bytes(const struct llama_context * ctx);
+
     // Return the *effective* K/V cache tensor type currently used by the context's memory.
     // This can differ from the type_k/type_v requested via llama_context_params: some memory
     // implementations silently rewrite the requested type at construction time (e.g. TurboQuant
