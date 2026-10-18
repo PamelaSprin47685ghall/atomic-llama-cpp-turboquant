@@ -2,6 +2,7 @@
 #include <ggml-backend.h>
 #include <tq/scheduling/prefill.h>
 #include <tq/scheduling/admission.h>
+#include <tq/text/stream.h>
 
 #include <algorithm>
 #include <charconv>
@@ -35,9 +36,12 @@ struct options {
     std::uint32_t gpu_layers = 0;
     std::uint32_t parallel = 0;
     std::optional<std::uint32_t> inject_after;
+    std::vector<std::string> stops;
     bool phase_memory = true;
     bool ignore_eog = false;
     bool json = false;
+    bool stream = false;
+    bool help = false;
 };
 
 std::uint32_t number(std::string_view text, const std::string & name, bool allow_zero = false) {
@@ -70,26 +74,31 @@ void usage() {
         "  --phase-memory        Release compute memory at prompt-to-generation\n"
         "                        transitions (default); errors are fatal.\n"
         "  --no-phase-memory     Keep compute memory for a real comparison.\n"
-        "  --ignore-eog          Generate the full requested length, including EOG.\n"
+        "  --ignore-eog          Ignore model EOG tokens; stop strings still apply.\n"
+        "  --stop TEXT           Stop at the first completed string; repeatable.\n"
+        "  --stream              Flush UTF-8 text deltas; requires --json.\n"
         "  --json                Write JSON Lines for real batches and results.\n";
 }
 
-options parse(int argc, char ** argv) {
+options parse(int argc, char ** argv, bool & json_errors) {
     options result;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--json") { result.json = true; continue; }
+        if (arg == "--json") { result.json = true; json_errors = true; continue; }
+        if (arg == "--help") { result.help = true; continue; }
+        if (arg == "--stream") { result.stream = true; continue; }
         if (arg == "--phase-memory") { result.phase_memory = true; continue; }
         if (arg == "--no-phase-memory") { result.phase_memory = false; continue; }
         if (arg == "--ignore-eog") { result.ignore_eog = true; continue; }
         if (arg != "--model" && arg != "--prompts" && arg != "--predict" && arg != "--ctx-size" &&
             arg != "--total-kv" && arg != "--batch-size" && arg != "--ubatch-size" &&
-            arg != "--threads" && arg != "--gpu-layers" && arg != "--inject-after" && arg != "--parallel") {
+            arg != "--threads" && arg != "--gpu-layers" && arg != "--inject-after" && arg != "--parallel" && arg != "--stop") {
             throw std::invalid_argument("unknown option: " + arg);
         }
         if (++i == argc) { throw std::invalid_argument("missing value for " + arg); }
         const std::string value = argv[i];
         if (arg == "--model") { result.model = value; }
+        else if (arg == "--stop") { result.stops.push_back(value); }
         else if (arg == "--prompts") { result.prompts = value; }
         else if (arg == "--predict") { result.predict = number(value, arg); }
         else if (arg == "--ctx-size") { result.context = number(value, arg); }
@@ -101,7 +110,10 @@ options parse(int argc, char ** argv) {
         else if (arg == "--parallel") { result.parallel = number(value, arg); }
         else { result.inject_after = number(value, arg); }
     }
+    if (result.help) { return result; }
     if (result.model.empty()) { throw std::invalid_argument("--model is required"); }
+    if (result.stream && !result.json) { throw std::invalid_argument("--stream requires --json"); }
+    const tq::text::generation_stream validated_stops(result.stops);
     if (result.ubatch > result.batch) { throw std::invalid_argument("--ubatch-size exceeds --batch-size"); }
     if (result.parallel > result.batch) { throw std::invalid_argument("--parallel exceeds --batch-size"); }
     if (result.inject_after && result.parallel == 1) { throw std::invalid_argument("--inject-after requires at least two resident requests"); }
@@ -171,6 +183,8 @@ struct request {
     std::vector<llama_token> prompt;
     std::vector<llama_token> generated;
     std::string text;
+    std::optional<tq::text::generation_stream> text_stream;
+    std::optional<std::size_t> stop_index;
     sampler_ptr sampler{nullptr, llama_sampler_free};
     std::optional<tq::scheduling::reservation> reservation;
     std::optional<llama_token> pending;
@@ -197,6 +211,7 @@ struct sampled {
     float logit_best;
     float logit_next;
     llama_token candidate_next;
+    tq::text::stream_delta output;
 };
 
 class composition {
@@ -264,7 +279,14 @@ public:
                       << ",\"batch_actual\":" << llama_n_batch(context_.get())
                       << ",\"parallel_actual\":" << active_limit_
                       << ",\"gpu_layers_requested\":" << config_.gpu_layers
-                      << ",\"phase_memory\":" << (config_.phase_memory ? "true" : "false") << "}\n";
+                      << ",\"phase_memory\":" << (config_.phase_memory ? "true" : "false")
+                      << ",\"stream\":" << (config_.stream ? "true" : "false") << ",\"stops\":[";
+            for (std::size_t i = 0; i < config_.stops.size(); ++i) {
+                if (i) { std::cout << ','; }
+                std::cout << quote(config_.stops[i]);
+            }
+            std::cout << "]}\n";
+            if (config_.stream) { flush_output(); }
         }
     }
 
@@ -319,7 +341,10 @@ public:
                     if (i) { std::cout << ','; }
                     std::cout << item.generated[i];
                 }
-                std::cout << "],\"text\":" << quote(item.text) << "}\n";
+                std::cout << "],\"text\":" << quote(item.text) << ",\"stop_index\":";
+                if (item.stop_index) { std::cout << *item.stop_index; }
+                else { std::cout << "null"; }
+                std::cout << "}\n";
             } else {
                 std::cout << "[request " << id << "]\n" << item.text << "\n\n";
             }
@@ -346,10 +371,15 @@ private:
                 }
                 break;
             }
-            item.sampler.reset(llama_sampler_init_greedy());
-            if (!item.sampler) {
+            try {
+                item.text_stream.emplace(config_.stops);
+                item.sampler.reset(llama_sampler_init_greedy());
+                if (!item.sampler) { throw std::runtime_error("A could not create a greedy sampler"); }
+            } catch (...) {
+                item.text_stream.reset();
+                item.sampler.reset();
                 admission_->release(*held);
-                throw std::runtime_error("A could not create a greedy sampler");
+                throw;
             }
             item.reservation = std::move(held);
             item.state = stage::prompt;
@@ -448,6 +478,7 @@ private:
 
     sampled sample(std::uint32_t id, std::int32_t batch_row) {
         auto & item = requests_.at(id);
+        if (!item.text_stream) { throw std::logic_error("resident request has no text stream"); }
         const auto * logits = llama_get_logits_ith(context_.get(), batch_row);
         if (!logits) { throw std::runtime_error("A returned no logits for a requested output row"); }
         float best = -std::numeric_limits<float>::infinity();
@@ -478,21 +509,52 @@ private:
         const auto token = view.data[view.selected].id;
         llama_sampler_accept(item.sampler.get(), token);
         const bool eog = llama_vocab_is_eog(vocab_, token);
+        tq::text::stream_delta output;
         if (eog && !config_.ignore_eog) {
-            item.finish_reason = "eog";
+            output = item.text_stream->finish();
+            item.finish_reason = output.stop_index ? "stop" : "eog";
             item.finished = true;
         } else {
             item.generated.push_back(token);
-            item.text += piece(token);
-            if (item.generated.size() >= config_.predict) {
-                item.finish_reason = "length";
+            output = item.text_stream->push(piece(token));
+            if (!output.finished && item.generated.size() >= config_.predict) {
+                auto tail = item.text_stream->finish();
+                output.text += tail.text;
+                output.finished = tail.finished;
+                output.stop_index = tail.stop_index;
+            }
+            if (output.finished) {
+                item.finish_reason = output.stop_index ? "stop" : "length";
                 item.finished = true;
             } else {
                 item.pending = token;
             }
         }
+        item.text += output.text;
+        item.stop_index = output.stop_index;
         item.state = item.finished ? stage::idle : stage::generation;
-        return {id, token, eog, item.finished, best, next, next_id};
+        return {id, token, eog, item.finished, best, next, next_id, std::move(output)};
+    }
+
+    static void flush_output() {
+        std::cout.flush();
+        if (!std::cout) { throw std::runtime_error("could not write output"); }
+    }
+
+    void publish_text(const sampled & sample) const {
+        if (!config_.stream || (sample.output.text.empty() && !sample.output.finished)) { return; }
+        const auto & item = requests_.at(sample.request_id);
+        std::cout << "{\"event\":\"text\",\"request_id\":" << sample.request_id
+                  << ",\"offset_bytes\":" << sample.output.offset
+                  << ",\"text\":" << quote(sample.output.text)
+                  << ",\"generated_tokens\":" << item.generated.size()
+                  << ",\"finished\":" << (sample.output.finished ? "true" : "false")
+                  << ",\"finish_reason\":" << (sample.output.finished ? quote(item.finish_reason) : "null")
+                  << ",\"stop_index\":";
+        if (sample.output.stop_index) { std::cout << *sample.output.stop_index; }
+        else { std::cout << "null"; }
+        std::cout << "}\n";
+        flush_output();
     }
 
     void trace_batch(stage phase, const std::vector<row> & rows, int returned, const std::vector<sampled> & samples) const {
@@ -557,6 +619,7 @@ private:
             throw;
         }
         trace_batch(phase, rows, returned, samples);
+        for (const auto & sample : samples) { publish_text(sample); }
         ++step_;
         // All output rows have been consumed before any memory mutation.
         for (const auto & sample : samples) {
@@ -569,6 +632,7 @@ private:
             if (!admission_->release(held)) { throw std::logic_error("completed reservation was not active"); }
             item.reservation.reset();
             item.sampler.reset();
+            item.text_stream.reset();
             if (config_.json) {
                 std::cout << "{\"event\":\"release\",\"request_id\":" << sample.request_id
                           << ",\"sequence_id\":" << held.slot() << ",\"generation\":" << held.generation()
@@ -599,12 +663,10 @@ private:
 
 int main(int argc, char ** argv) {
     bool json = false;
-    for (int i = 1; i < argc; ++i) {
-        if (std::string_view(argv[i]) == "--help") { usage(); return 0; }
-        if (std::string_view(argv[i]) == "--json") { json = true; }
-    }
     try {
-        composition app(parse(argc, argv));
+        auto config = parse(argc, argv, json);
+        if (config.help) { usage(); return std::cout ? 0 : 1; }
+        composition app(std::move(config));
         app.run();
         return 0;
     } catch (const std::exception & error) {

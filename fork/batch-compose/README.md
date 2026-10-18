@@ -1,7 +1,7 @@
 # TQBatchCompose
 
 This is a real causal text-generation consumer of an installed llama library
-(A) and installed TQScheduling (B). It owns the request tokens, positions,
+(A) and installed TQScheduling and TQText (B). It owns the request tokens, positions,
 sequence ids, greedy samplers, and their interaction. Neither A nor B holds or
 calls the other.
 
@@ -12,7 +12,7 @@ It does not provide an HTTP server or carry the old RERoT, MTP, or KV-retry code
 
 ```sh
 cmake -S fork/batch-compose -B build-batch-compose \
-  -DCMAKE_PREFIX_PATH="/path/to/installed-A;/path/to/installed-TQScheduling" \
+  -DCMAKE_PREFIX_PATH="/path/to/installed-A;/path/to/installed-TQScheduling;/path/to/installed-TQText" \
   -DCMAKE_INSTALL_PREFIX="$PWD/install-batch-compose"
 cmake --build build-batch-compose
 cmake --install build-batch-compose
@@ -85,15 +85,44 @@ JSON Lines include:
 
 Every request has its own greedy sampler. A batch's output rows are consumed
 before any completed sequence is removed from memory. Token ids are exact;
-JSON display text replaces an incomplete or invalid UTF-8 tail with U+FFFD.
+Generated text uses TQText's per-invalid-byte U+FFFD rule. Every published text delta is valid UTF-8, including at the final token boundary.
 
 Sampling rejects NaN, positive infinity, and rows with no finite candidate before mutating the sampler. Negative infinity remains a valid exclusion. A sample records its best and second finite logits; the second value is null when absent. These values are diagnostics, not evidence that different batch shapes must produce identical tokens.
+
+## Incremental text and stop strings
+
+```sh
+install-batch-compose/bin/tq-batch-compose \
+  --model /path/to/model.gguf --prompts prompts.txt --parallel 2 \
+  --predict 64 --stop '<end>' --stop '###' --json --stream
+```
+
+`--stop TEXT` is repeatable. It takes a literal nonempty UTF-8 string, including a value such as `--help`; values are not reinterpreted as options. Matching is case-sensitive on rendered UTF-8 bytes. The first string to complete wins. If several complete at the same byte position, the longest wins; equal strings use configuration order. This avoids changing the selected stop when a tokenizer or caller divides text into different pieces. No Unicode normalization is applied.
+
+The configured stop and any later bytes from its token are suppressed. An undecided stop prefix stays inside B until it completes or stops being a prefix. At EOG or the token limit, C finishes B, which emits any remaining nonmatching prefix and replaces each incomplete UTF-8 byte. A replacement can itself complete a configured stop. The stop count and byte limits come from TQText: 32 strings, 4096 bytes each, and 65536 bytes in total.
+
+The `tokens` result retains every sampled non-EOG token, including tokens whose text is suppressed by a stop. `--ignore-eog` retains EOG tokens too; configured stops still apply. A stopped request reports `finish_reason: "stop"` and its zero-based `stop_index`. Once the match is known, C submits no more decode work for that request. A stop completed by final UTF-8 repair may include bytes from a token that was already decoded. C consumes all outputs of the current batch before it frees any completed sequence. Early completion also returns its admission reservation, allowing a queued request to use that slot.
+
+`--stream` requires `--json` and adds `text` events after the corresponding successful `batch` event. It does not alter model scheduling or sampling. Each event includes:
+
+| Field | Meaning |
+|---|---|
+| `request_id` | Stable input request identity |
+| `offset_bytes` | Number of rendered UTF-8 bytes emitted before this delta |
+| `text` | New valid UTF-8 text; it may be empty at completion |
+| `generated_tokens` | Actual sampled tokens counted by this request so far |
+| `finished` | Whether no more text or model work will follow for this request |
+| `finish_reason`, `stop_index` | Terminal reason and matched pattern index, otherwise null |
+
+There is exactly one terminal text event per successful request, before its sequence is released. Concatenating a request's deltas gives its final `result.text`, with contiguous byte offsets. C flushes each text event and treats an output-stream error as fatal. A successful flush does not prove that another process or network peer received the text. The final `result` events remain in input order after all requests complete.
+
+Only resident requests allocate text matching state. Completed and queued requests retain their ordinary input/result data, without a copied stop table for every queue entry. This CLI does not implement HTTP cancellation, an asynchronous output queue, or transport retry semantics.
 
 ## Real integration verification
 
 ```sh
 cmake -S fork/batch-compose -B build-batch-compose \
-  -DCMAKE_PREFIX_PATH="/path/to/installed-A;/path/to/installed-TQScheduling" \
+  -DCMAKE_PREFIX_PATH="/path/to/installed-A;/path/to/installed-TQScheduling;/path/to/installed-TQText" \
   -DTQ_BATCH_COMPOSE_TEST_MODEL=/path/to/model.gguf
 cmake --build build-batch-compose
 ctest --test-dir build-batch-compose --output-on-failure

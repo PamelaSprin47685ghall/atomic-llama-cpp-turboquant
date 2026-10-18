@@ -103,20 +103,23 @@ def main():
     sampling = module("sampling", ())
     corpus = module("corpus", ())
     scheduling = module("scheduling", ())
+    text_package = module("text", ())
     compose = module("compose", (prefix_a, sampling))
     corpus_compose = module("corpus-compose", (prefix_a, corpus))
-    batch_compose = module("batch-compose", (prefix_a, scheduling))
+    batch_compose = module("batch-compose", (prefix_a, scheduling, text_package))
     logits_compose = module("logits-compose", (prefix_a,))
     real_test = output / "real-batch.py"
     real_logits_test = output / "real-logits.py"
+    real_stream_test = output / "test_streaming.py"
     logits_comparator = output / "compare-logits.py"
     if args.model:
         shutil.copyfile(root / "fork/batch-compose/tests/real-batch.py", real_test)
         shutil.copyfile(root / "fork/logits-compose/tests/test_real_logits.py", real_logits_test)
+        shutil.copyfile(root / "fork/batch-compose/tests/test_streaming.py", real_stream_test)
         shutil.copyfile(root / "fork/tools/compare-logits.py", logits_comparator)
 
     delivered = output / "delivered"
-    for prefix in (prefix_a, sampling, corpus, scheduling, compose, corpus_compose, batch_compose, logits_compose):
+    for prefix in (prefix_a, sampling, corpus, scheduling, text_package, compose, corpus_compose, batch_compose, logits_compose):
         shutil.copytree(prefix, delivered, dirs_exist_ok=True)
         shutil.rmtree(prefix)
     for path in source_copies + build_copies:
@@ -170,16 +173,20 @@ int main() {
                                      "--model", args.model.resolve(), "--gpu-layers", args.gpu_layers,
                                      "--comparator", logits_comparator, "--batch-binary", delivered / "bin/tq-batch-compose",
                                      "--output-dir", output / "relocated-real-logits"])
+        run("relocated-real-stream", [sys.executable, real_stream_test, "--binary", delivered / "bin/tq-batch-compose",
+                                     "--model", args.model.resolve(), "--gpu-layers", args.gpu_layers,
+                                     "--output-dir", output / "relocated-real-stream"])
     result = {"upstream": snapshot["base"], "a_source_provenance": provenance,
               "a_archive_has_no_b_or_c": None if args.a_prefix else True,
               "a_reviewed_overlays_applied": None if args.a_prefix else snapshot["summary"]["reviewed_overlays"],
               "a_reuse_limit": "Installed A source, pin, overlays, and build provenance are not verified." if args.a_prefix else None,
               "a_public_seams_tests_passed": True,
-              "isolated_modules": ["sampling", "corpus", "scheduling", "compose", "corpus-compose", "batch-compose", "logits-compose"],
+              "isolated_modules": ["sampling", "corpus", "scheduling", "text", "compose", "corpus-compose", "batch-compose", "logits-compose"],
               "source_and_build_copies_removed_before_consumption": True,
               "relocated_installed_consumers_passed": True,
               "relocated_real_batch": "passed" if args.model else "skipped_no_model",
               "relocated_real_logits": "passed" if args.model else "skipped_no_model",
+              "relocated_real_stream": "passed" if args.model else "skipped_no_model",
               "limits": ["Help/package checks alone do not establish model execution or throughput.",
                          "Separate source copies and installed consumption do not constitute an OS sandbox."],
               "commands": len(records)}

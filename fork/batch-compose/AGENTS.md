@@ -8,6 +8,7 @@
 3. Users need truthful memory controls. Reason: a release switch or physical KV
    option is useful only when A actually consumes it and reports failure.
 4. A fixed set of resident slots must serve a longer request queue. Reason: request count must not force equivalent GPU residency.
+5. A request needs valid incremental text and precise stopping without losing sampled token accounting. Reason: token boundaries can split a character or a stop string.
 
 # LEMMA
 
@@ -22,14 +23,14 @@
    the real public seam. Explicit physical capacity is passed unchanged; the
    resulting logical and physical sizes come from A's getters.
 4. From AXIOM 4: C keeps request identities separate from A sequence slots. B reserves a complete token bound before C starts work. C consumes every batch output and successfully removes the finished A sequence before it returns the reservation. A failure is fatal and does not trigger an unverified retry.
+5. From AXIOM 4 and 5: each admitted request owns a TQText stream. C creates it at admission and releases it at completion, so matching state follows resident capacity. C keeps the sampled stopping token, consumes terminal text, and submits no later token for that request.
 
 # SPEC
 
-1. From LEMMA 1: build uses only installed `llama` and `TQScheduling` CMake
+1. From LEMMA 1: build uses only installed `llama`, `TQScheduling`, and `TQText` CMake
    packages. Source includes are public A/B headers; neither source tree is an
-   implicit dependency. Proof: the 41-command archive/build/install/relocation run in
-   `../VALIDATION.md` passed with installed A and B; source/build copies were
-   removed before the final consumer ran.
+   implicit dependency. Proof: the archive/build/install/relocation runs in
+   `../VALIDATION.md`; source/build copies are removed before the final consumer runs.
 2. From LEMMA 1–2: `composition::run`, `consume`, and `sample` own all in-flight
    state. `tests/real-batch.py` validates actual interleaving, resume positions,
    fed-back token ids, and successful results with real A and B.
@@ -48,6 +49,7 @@
    Proof scope: source ownership plus B's instance/input/result tests; the
    integration test uses separate processes for on/off. Concurrent C instances
    in one process are not a public contract of this CLI.
+5. From LEMMA 5: `tests/test_streaming.py` uses actual A generation to check same-geometry stream on/off runs, cross-delta stops, stopping-token retention, no decode after completion, byte offsets, terminal events, and slot reuse. It observes output while the process runs. B separately proves arbitrary UTF-8 partition and end-of-input behavior. See `../VALIDATION.md` for executed hardware and limits.
 
 # Exceptions
 
