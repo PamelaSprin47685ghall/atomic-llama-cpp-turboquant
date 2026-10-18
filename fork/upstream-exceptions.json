@@ -53,6 +53,17 @@
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
+      "path": "ggml/src/ggml-backend-meta.cpp",
+      "sha256": "c141bb450b11ad5dc1a654d94b5188d14829c41dc9c28910bee544bbb728cfa7",
+      "mode": "100644",
+      "consumers": [
+        "public meta backend tensor transfers",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Translate chunk-aligned logical async offsets into child tensor offsets for split axes 0/1/2, and permit existing mirrored partial transfers.",
+      "removal_condition": "Remove when the pinned upstream passes the real public meta transfer regression without this patch; update the pin and rerun get and set controls independently."
+    },
+    {
       "path": "ggml/src/ggml-cpu/ops.cpp",
       "sha256": "e5b6affc76f02ec3456ace39b626a2175fd70b2c2da3599af4df71e9f06ad00a",
       "mode": "100644",
