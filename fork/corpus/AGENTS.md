@@ -19,5 +19,5 @@
 # Exceptions
 
 - V1 contains no tokenizer fingerprint. Consumers: existing Wanxiangqi token corpora. Vocabulary size checks token bounds only. Remove when a versioned identity format and migration tool replace V1.
-- V1 reserved capture metadata is not part of this library's token-path contract. Consumer: prefix replay. Load ignores it and save writes zero; it is not a byte-for-byte capture archive. Remove when a real metadata consumer requires a specified ownership and round-trip contract.
+- V1 has no timezone or clock provenance for capture timestamps. Consumer: original server corpus reader/writer. B preserves the exact request kind and 64-bit timestamp as owned values; a default append records completion with timestamp zero (unknown). Canonical single-shard streams, including empty requests, round-trip byte for byte. Later shards are explicitly rejected. Remove this limitation when a specified multi-shard reader is implemented.
 - Saving two files is synchronous and assumes exclusive access to the new target directory. Consumers: command-line corpus builders. Existing directories are rejected and partial writes are cleaned up; process crashes are not a durable transaction. Remove when concurrent writers or crash durability become a real requirement.

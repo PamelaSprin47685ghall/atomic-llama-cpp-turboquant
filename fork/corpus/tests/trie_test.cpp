@@ -60,6 +60,163 @@ struct test_directory {
     }
 };
 
+
+void test_production_format() {
+    using tq::corpus::request_kind;
+    using tq::corpus::request_metadata;
+    // Full version-1 records, transcribed from the production server format.
+    // Header offsets: version 8, stride 12, global start_id 16 (NOT reserved).
+    const bytes production_nodes{
+        0x43,0x4c,0x54,0x4e,0x4f,0x44,0x30,0x31,
+        1,0,0,0, 16,0,0,0, 1,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0, 0x34,0x12,0,0, 0,0,0,0,
+        1,0,0,0,0,0,0,0, 0x45,0x23,0,0, 0,0,0,0,
+    };
+    // Request offsets: leaf 0, token count 8, kind 12, timestamp_ms 16.
+    // Duplicate requests and an internal-node endpoint have distinct metadata.
+    const bytes production_requests{
+        0x43,0x4c,0x54,0x52,0x45,0x51,0x30,0x31,
+        1,0,0,0, 24,0,0,0, 0,0,0,0,0,0,0,0,
+        2,0,0,0,0,0,0,0, 2,0,0,0, 1,0,0,0, 0xef,0xcd,0xab,0x89,0x67,0x45,0x23,0x01,
+        2,0,0,0,0,0,0,0, 2,0,0,0, 2,0,0,0, 0x10,0x32,0x54,0x76,0x98,0xba,0xdc,0xfe,
+        2,0,0,0,0,0,0,0, 2,0,0,0, 3,0,0,0, 0x88,0x88,0x88,0x88,0x8a,0x01,0,0,
+        1,0,0,0,0,0,0,0, 1,0,0,0, 4,0,0,0, 0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0, 0,0,0,0, 3,0,0,0, 0x21,0x43,0x65,0x87,0xa9,0xcb,0xed,0x0f,
+    };
+    const std::vector<request_metadata> metadata{
+        {request_kind::completion, UINT64_C(0x0123456789abcdef)},
+        {request_kind::infill, UINT64_C(0xfedcba9876543210)},
+        {request_kind::embedding, UINT64_C(0x0000018a88888888)},
+        {request_kind::rerank, 0},
+        {request_kind::embedding, UINT64_C(0x0fedcba987654321)},
+    };
+    test_directory temporary;
+    const auto production = temporary.path / "production";
+    fs::create_directory(production);
+    write_file(production / "nodes-000000.bin", production_nodes);
+    write_file(production / "requests-000000.bin", production_requests);
+    auto loaded = token_trie::load(production, 10000);
+    check(loaded.node_count() == 2 && loaded.request_count() == 5 &&
+          loaded.leaf_positions() == 7, "production request structure changed");
+    check(loaded.request_leaves().back() == 0 && loaded.path_to(0).empty(),
+          "production empty request was lost");
+    for (std::uint64_t i = 0; i < metadata.size(); ++i) {
+        const auto got = loaded.request_metadata_at(i);
+        check(got.kind == metadata[i].kind && got.timestamp_ms == metadata[i].timestamp_ms,
+              "production request metadata changed");
+    }
+    auto owned = loaded.request_metadata_at(0);
+    owned.kind = request_kind::rerank;
+    owned.timestamp_ms = 1;
+    check(owned.timestamp_ms == 1 &&
+          loaded.request_metadata_at(0).kind == request_kind::completion &&
+          loaded.request_metadata_at(0).timestamp_ms == metadata[0].timestamp_ms,
+          "request metadata is not an owned value");
+    const auto detached = [] {
+        token_trie owner(2);
+        owner.append({1}, {request_kind::infill, 99});
+        return owner.request_metadata_at(0);
+    }();
+    check(detached.kind == request_kind::infill && detached.timestamp_ms == 99,
+          "metadata needs a live owner");
+
+    const auto resaved = temporary.path / "resaved";
+    loaded.save(resaved);
+    check(read_file(resaved / "nodes-000000.bin") == production_nodes &&
+          read_file(resaved / "requests-000000.bin") == production_requests,
+          "production format was not preserved byte for byte");
+    token_trie built(10000);
+    for (std::size_t i = 0; i < metadata.size(); ++i) {
+        auto input_metadata = metadata[i];
+        built.append(i == 4 ? std::vector<std::int32_t>{} :
+                     i == 3 ? std::vector<std::int32_t>{0x1234} :
+                              std::vector<std::int32_t>{0x1234, 0x2345}, input_metadata);
+        input_metadata.timestamp_ms = 0;
+    }
+    const auto generated = temporary.path / "generated";
+    built.save(generated);
+    check(read_file(generated / "nodes-000000.bin") == production_nodes &&
+          read_file(generated / "requests-000000.bin") == production_requests,
+          "append did not produce the production format");
+    token_trie copy = built;
+    copy.append({0x2345});
+    loaded.append({0x1234});
+    check(copy.request_metadata_at(5).kind == request_kind::completion &&
+          copy.request_metadata_at(5).timestamp_ms == 0 && built.request_count() == 5 &&
+          loaded.request_metadata_at(3).kind == request_kind::rerank,
+          "metadata copy, instance isolation or default completion semantics failed");
+    must_fail([&] { built.request_metadata_at(5); }, "invalid request id was accepted");
+    must_fail([&] { built.append({1}, {static_cast<request_kind>(0), 0}); },
+              "zero request kind was accepted");
+    must_fail([&] { built.append({1}, {static_cast<request_kind>(5), 0}); },
+              "unknown request kind was accepted");
+    check(built.request_count() == 5 && built.node_count() == 2,
+          "bad metadata changed the trie");
+
+    std::size_t bad_id = 0;
+    const auto rejects = [&](bytes nodes, bytes requests, const char * message) {
+        const auto bad = temporary.path / ("invalid-production-" + std::to_string(bad_id++));
+        fs::create_directory(bad);
+        write_file(bad / "nodes-000000.bin", nodes);
+        write_file(bad / "requests-000000.bin", requests);
+        must_fail([&] { token_trie::load(bad, 10000); }, message);
+    };
+    auto bad_nodes = production_nodes;
+    bad_nodes[16] = 0;
+    rejects(bad_nodes, production_requests, "early zero-start-id snapshot was accepted");
+    bad_nodes = production_nodes;
+    bad_nodes[23] = 1;
+    rejects(bad_nodes, production_requests, "high start-id byte was ignored");
+    bad_nodes = production_nodes;
+    bad_nodes[24 + 12] = 1;
+    rejects(bad_nodes, production_requests, "nonzero reserved node bits were accepted");
+    bad_nodes = production_nodes;
+    bad_nodes[24 + 16] = 0;
+    bad_nodes[24 + 16 + 8] = 0x34;
+    bad_nodes[24 + 16 + 9] = 0x12;
+    rejects(bad_nodes, production_requests, "duplicate trie edge was accepted");
+    auto bad_requests = production_requests;
+    bad_requests[16] = 1;
+    rejects(production_nodes, bad_requests, "nonzero request start-id was accepted");
+    bad_requests = production_requests;
+    bad_requests[24 + 12] = 0;
+    rejects(production_nodes, bad_requests, "zero serialized kind was accepted");
+    bad_requests = production_requests;
+    bad_requests[24 + 15] = 1;
+    rejects(production_nodes, bad_requests, "high serialized kind bits were ignored");
+    for (const std::string name : {"nodes-000001.bin", "requests-000005.bin",
+                                  "nodes-1000000.bin", "requests-0.bin",
+                                  "nodes-18446744073709551616.bin"}) {
+        const auto shard = production / name;
+        write_file(shard, {});
+        must_fail([&] { token_trie::load(production, 10000); },
+                  "extra shard was silently ignored");
+        fs::remove(shard);
+    }
+    check(token_trie::load(production, 10000).request_count() == 5,
+          "canonical corpus became unreadable after malformed-file checks");
+    const auto empty_only = temporary.path / "production-empty-only";
+    fs::create_directory(empty_only);
+    bytes empty_request_stream(production_requests.begin(), production_requests.begin() + 24);
+    empty_request_stream.insert(empty_request_stream.end(), production_requests.end() - 24,
+                                production_requests.end());
+    write_file(empty_only / "requests-000000.bin", empty_request_stream);
+    const auto empty_loaded = token_trie::load(empty_only, 10000);
+    check(empty_loaded.node_count() == 0 && empty_loaded.request_count() == 1 &&
+          empty_loaded.request_leaves() == std::vector<std::uint64_t>{0} &&
+          empty_loaded.request_metadata_at(0).timestamp_ms == metadata.back().timestamp_ms,
+          "production empty-only corpus without a nodes stream was rejected");
+    empty_loaded.save(temporary.path / "production-empty-only-resaved");
+    const auto new_corpus = temporary.path / "unused-production";
+    fs::create_directory(new_corpus);
+    const auto unused = token_trie::load(new_corpus, 10000);
+    check(unused.node_count() == 0 && unused.request_count() == 0,
+          "unused production corpus was rejected");
+    fs::remove(production / "nodes-000000.bin");
+    must_fail([&] { token_trie::load(production, 10000); },
+              "nonempty requests without their nodes were accepted");
+}
+
 void run_tests() {
     must_fail([] { token_trie invalid(0); }, "zero vocabulary was accepted");
     must_fail([] { token_trie invalid(-1); }, "negative vocabulary was accepted");
@@ -118,7 +275,10 @@ void run_tests() {
 
     must_fail([&] { trie.append({1, 2, 8}); }, "high token was accepted");
     must_fail([&] { trie.append({1, -1}); }, "negative token was accepted");
-    must_fail([&] { trie.append({}); }, "empty request was accepted");
+    token_trie empty_requests(8);
+    check(empty_requests.append({}) == 0 && empty_requests.node_count() == 0 &&
+          empty_requests.request_count() == 1 && empty_requests.leaf_positions() == 0,
+          "empty request did not preserve the production root endpoint");
     check(trie.node_count() == 5 && trie.request_count() == 4, "failed append changed data");
     must_fail([&] { trie.node(0); }, "root returned a token");
     must_fail([&] { trie.node(6); }, "missing node was accepted");
@@ -126,6 +286,11 @@ void run_tests() {
     must_fail([&] { trie.path_to(6); }, "missing path was accepted");
 
     test_directory temporary;
+    empty_requests.save(temporary.path / "empty-request");
+    const auto empty_request_loaded = token_trie::load(temporary.path / "empty-request", 8);
+    check(empty_request_loaded.request_leaves() == std::vector<std::uint64_t>{0} &&
+          empty_request_loaded.request_metadata_at(0).kind == tq::corpus::request_kind::completion,
+          "empty-only production corpus did not round trip");
     input_owner.save(temporary.path / "prefix-request");
     const auto prefix_loaded = token_trie::load(temporary.path / "prefix-request", 8);
     check(prefix_loaded.request_leaves() == std::vector<std::uint64_t>({3, 2}) &&
@@ -247,6 +412,7 @@ void run_tests() {
 int main() {
     try {
         run_tests();
+        test_production_format();
         std::cout << "corpus tests passed\n";
         return 0;
     } catch (const std::exception & error) {
