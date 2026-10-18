@@ -23,6 +23,7 @@
 | M0c 单卡平台探针（16 用例扩展版） | `fork/relay-probe`（HIP 构建，`build-relay-probe-20261019`）在本机 RX 6800（gfx1030，ROCm 7.2.4）实际运行 2000 轮：双向热复用、生产延迟排序、精确票据、多工作组最后到达、abort、五消费者输出 credit、延迟最后读者（H08）、双 bank 轮换、可变有效长度（H05）、单卡五流 RELAY 环全部 pass；host fetch_add 产生错误值（448 而非 7）记 fail，host CAS pass；五卡用例 not_run（本机 1 张）。证据报告 SHA-256 0cdd86bd…9cb8a | 单卡平台事实成立：单写者 load/store 协议可用且无需 host RMW；五消费者 credit 与双 bank 是软件协议层验证，不构成五卡或整链资格，换工具链/拓扑后需重跑 |
 | 探针 bench 测量（`--bench`） | 独立 `tp5.relay.bench.v1` 文件（SHA-256 062c2806…a9de0ad），2000 轮 median：host 发布→设备 ack 9,690 ns、设备生产→host ready 7,770 ns、五流整圈 29,930 ns、host 五路折减 65.7 GB/s | 单设备含 launch 时间的观察值，供指南 14 成本模型使用；不是资格门，五卡数字待真机 |
 | 设备等待预算修正 | 全量运行实测发现旧代码每次 ack 未命中把 2e9 ticks 预算一次性睡满（每轮 ~0.9 s，2000 轮预计数小时，600 s 上限内无产出）；改为累计预算等待（clock64 实测 ~2.3 GHz，预算 24e9 ticks ≈ 8 s，超过最长 5 s host 截止期），失败路径 abort+排空防晚写污染 | 全量 2000 轮从数小时级降到约 20 秒；防抖语义保留（设备等待超过 host 截止期，瞬时负载尖峰不再造成设备侧假超时） |
+| 五卡跨设备用例实现加固（无新硬件证据） | 提交 35d41c8fc 之后的加固：`run_five_rank` 从单轮裸写升级为 guard 三明治 + 按 `--rounds` 多轮热复用（每轮 payload 随代次变化）+ 逐 rank/轮次失败归因 + 每轮同步后复位；`five_rank_cross_device` 现在登记进每张设备的证据记录（注册项可达）；`free_device_context` 与 `run_bench` 补上入口 `hipSetDevice`（五卡机上 `hipFree`/launch 作用于当前设备，缺失会解错设备）；`--rounds` 拒绝尾随垃圾与溢出。单卡 2000 轮 smoke 复跑 qualification=pass、five_rank=not_run、16 用例分布不变 | 单设备路径无回归；跨设备路径第一次执行只能在真实五卡机器上发生，本行不含跨设备可见性证据。报告 SHA-256 0cdd86bd…9cb8a 是加固前的产物，其 five_rank_status=not_run 依然准确，不改写旧报告字节 |
 
 较早的单卡探针报告（SHA-256 9d1d1429…684112，12 用例版）按证据身份保留为被取代的历史记录；
 新报告覆盖并取代其资格结论，不修改其字节。

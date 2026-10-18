@@ -3,6 +3,7 @@
 
 #include "evidence.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -90,8 +91,11 @@ void check_json() {
     device.name       = device_name;
     device.pci_bus_id = "0000:03:00.0";
     device.cases.push_back({ case_id::device_identity, outcome::pass, "detail \"escaped\"" });
+    device.cases.push_back({ case_id::five_rank_cross_device, outcome::pass, "rank 0 of 5" });
     report.devices.push_back(device);
-    report.qualification = outcome::fail;
+    report.five_rank_status = outcome::not_run;
+    report.five_rank_detail = "requires \"five\" devices\n";
+    report.qualification    = outcome::fail;
     report.limits.push_back("limit \t tab");
     const std::string json = to_json(report);
     check(!json.empty() && json.front() == '{' && json.back() == '}', "report must be a JSON object");
@@ -108,6 +112,11 @@ void check_json() {
     check(json.find("\\t") != std::string::npos, "tab escaping broken");
     check(json.find("\\u0000") != std::string::npos, "control escaping broken");
     check(json.find("\"qualification\":\"fail\"") != std::string::npos, "qualification serialization broken");
+    check(json.find("\"five_rank_status\":\"not_run\"") != std::string::npos, "five-rank status serialization broken");
+    check(json.find("\"five_rank_detail\":\"requires \\\"five\\\" devices\\n\"") != std::string::npos,
+          "five-rank detail escaping broken");
+    check(json.find("\"five_rank_cross_device\":{\"result\":\"pass\",\"detail\":\"rank 0 of 5\"}") != std::string::npos,
+          "five-rank per-device case serialization broken");
 }
 
 }  // namespace

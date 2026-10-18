@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_version.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -27,14 +28,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
+#include <ratio>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using tq::relay::probe::case_id;
-using tq::relay::probe::case_record;
 using tq::relay::probe::device_record;
 using tq::relay::probe::outcome;
 using tq::relay::probe::pattern_word;
@@ -287,14 +290,16 @@ __global__ void rmw_probe_kernel(std::uint64_t * fetch_add_word, std::uint64_t *
 }
 
 // Five-rank case: each device writes one distinct word of the shared payload
-// and releases its own ready word.
+// for the current generation and releases its own ready word. The value
+// varies per round, so a stale write from an earlier round mismatches.
 __global__ void rank_write_kernel(std::uint64_t * payload,
                                   std::uint64_t * ready,
                                   std::uint32_t   rank,
-                                  std::uint32_t   seed) {
-    payload[rank] = pattern_word(0xB0BAULL + rank, 0, seed);
+                                  std::uint32_t   seed,
+                                  std::uint64_t   generation) {
+    payload[rank] = pattern_word(generation, rank, seed);
     device_fence_system();
-    release_store(ready, rank + 1);
+    release_store(ready, generation);
 }
 
 // Acquire the exact ticket, read the whole slot, publish a per-consumer
@@ -1133,6 +1138,9 @@ void allocate_device_context(device_context & ctx, std::int32_t ordinal, std::ui
 }
 
 void free_device_context(device_context & ctx) {
+    // hipFree acts on the current device; after the five-rank case the
+    // current device is whatever rank ran last, so pin the owner here.
+    check_hip(hipSetDevice(ctx.record.ordinal), "free set device");
     check_hip(hipHostFree(ctx.cb), "control host free");
     check_hip(hipHostFree(ctx.slot_ptr), "slot host free");
     check_hip(hipHostFree(ctx.out_word), "out host free");
@@ -1146,52 +1154,120 @@ void free_device_context(device_context & ctx) {
     check_hip(hipFree(ctx.counter), "counter free");
 }
 
+// One guarded host allocation for the five-rank case (guide 39.5 H01): two
+// guard words on each side of the five disjoint rank words, then one ready
+// word per rank. A rank writing past its word hits a guard instead of
+// silently corrupting a sibling's region.
+struct five_rank_mem {
+    std::uint64_t guard_lo[2];
+    std::uint64_t payload[RANKS];
+    std::uint64_t guard_hi[2];
+    std::uint64_t ready[RANKS];
+};
+
+// Caller guarantees exactly five devices. Each round: all five devices write
+// their disjoint words and release per-rank ready, the host observes ready
+// through acquire loads (running visibility), drains every stream, verifies
+// fragment provenance and guards, then resets for the next round. A dead or
+// misbehaving rank is attributed by rank and round; streams are always
+// drained before the allocation is touched again or freed.
 outcome run_five_rank(std::vector<device_context> & contexts, probe_report & report) {
-    const std::uint32_t rank_count  = static_cast<std::uint32_t>(contexts.size());
-    void *              payload_raw = nullptr;
-    void *              ready_raw   = nullptr;
-    check_hip(
-        hipHostMalloc(&payload_raw, rank_count * sizeof(std::uint64_t), hipHostMallocMapped | hipHostMallocPortable),
-        "five-rank payload alloc");
-    check_hip(
-        hipHostMalloc(&ready_raw, rank_count * sizeof(std::uint64_t), hipHostMallocMapped | hipHostMallocPortable),
-        "five-rank ready alloc");
-    auto * payload = static_cast<std::uint64_t *>(payload_raw);
-    auto * ready   = static_cast<std::uint64_t *>(ready_raw);
-    std::memset(payload, 0, rank_count * sizeof(std::uint64_t));
-    std::memset(ready, 0, rank_count * sizeof(std::uint64_t));
-    std::vector<hipStream_t> streams(rank_count);
-    for (std::uint32_t rank = 0; rank < rank_count; ++rank) {
+    const std::uint32_t rounds = contexts[0].rounds;
+    five_rank_mem *     mem    = nullptr;
+    check_hip(hipHostMalloc(&mem, sizeof(five_rank_mem), hipHostMallocMapped | hipHostMallocPortable),
+              "five-rank host alloc");
+    std::memset(mem, 0, sizeof(five_rank_mem));
+    mem->guard_lo[0] = mem->guard_lo[1] = mem->guard_hi[0] = mem->guard_hi[1] = GUARD_VALUE;
+
+    std::vector<hipStream_t> streams(RANKS);
+    for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
         check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank set device");
         check_hip(hipStreamCreate(&streams[rank]), "stream create");
-        rank_write_kernel<<<1, 64, 0, streams[rank]>>>(payload, &ready[rank], rank, contexts[rank].seed);
     }
-    const auto deadline  = std::chrono::steady_clock::now() + std::chrono::duration<double, std::milli>(5000.0);
-    bool       all_ready = false;
-    while (!all_ready && std::chrono::steady_clock::now() < deadline) {
-        all_ready = true;
-        for (std::uint32_t rank = 0; rank < rank_count; ++rank) {
-            all_ready = all_ready && acquire_load(&ready[rank]) == rank + 1;
+
+    std::string   failure;
+    std::uint32_t failed_rank = RANKS;  // sentinel: not a specific rank
+    for (std::uint64_t generation = 1; generation <= rounds && failure.empty(); ++generation) {
+        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+            check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank set device");
+            rank_write_kernel<<<1, 64, 0, streams[rank]>>>(mem->payload, mem->ready, rank, contexts[rank].seed,
+                                                           generation);
         }
+        double     elapsed   = 0;
+        const bool all_ready = spin_until(
+            [&] {
+                for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+                    if (acquire_load(&mem->ready[rank]) != generation) {
+                        return false;
+                    }
+                }
+                return true;
+            },
+            5000.0, elapsed);
         if (!all_ready) {
-            host_pause();
+            for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+                if (acquire_load(&mem->ready[rank]) != generation) {
+                    failed_rank = rank;
+                    failure     = "rank " + std::to_string(rank) + " did not publish ready in round " +
+                                  std::to_string(generation) + " within 5 s";
+                    break;
+                }
+            }
+        }
+        // Drain every stream before reading payload or resetting the
+        // allocation; this also stops a late store after the next reset.
+        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+            check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank sync device");
+            const hipError_t sync = hipStreamSynchronize(streams[rank]);
+            if (sync != hipSuccess && failure.empty()) {
+                failed_rank = rank;
+                failure     = "rank " + std::to_string(rank) + " drain failed: " + hipGetErrorString(sync);
+            }
+        }
+        if (failure.empty()) {
+            for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+                const std::uint64_t expected = pattern_word(generation, rank, contexts[rank].seed);
+                if (mem->payload[rank] != expected) {
+                    failed_rank = rank;
+                    failure     = "rank " + std::to_string(rank) + " wrote " + std::to_string(mem->payload[rank]) +
+                                  " instead of " + std::to_string(expected) + " in round " + std::to_string(generation);
+                    break;
+                }
+            }
+        }
+        if (failure.empty() && (mem->guard_lo[0] != GUARD_VALUE || mem->guard_lo[1] != GUARD_VALUE ||
+                                mem->guard_hi[0] != GUARD_VALUE || mem->guard_hi[1] != GUARD_VALUE)) {
+            failure = "guard word changed in round " + std::to_string(generation);
+        }
+        std::memset(mem->payload, 0, sizeof(mem->payload));
+        std::memset(mem->ready, 0, sizeof(mem->ready));
+    }
+
+    if (failure.empty()) {
+        report.five_rank_detail = "five devices each wrote a disjoint word of one guarded host allocation for " +
+                                  std::to_string(rounds) + " rounds";
+        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+            report.devices[rank].cases.push_back(
+                { case_id::five_rank_cross_device, outcome::pass,
+                  "rank " + std::to_string(rank) + " of 5 wrote a disjoint word; guards intact" });
+        }
+    } else {
+        report.five_rank_detail = failure;
+        for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+            report.devices[rank].cases.push_back(
+                { case_id::five_rank_cross_device, outcome::fail,
+                  rank == failed_rank ?
+                      failure :
+                      "rank " + std::to_string(rank) + " of 5 participated; case failed (see five_rank_detail)" });
         }
     }
-    for (std::uint32_t rank = 0; rank < rank_count; ++rank) {
-        check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank sync device");
-        check_hip(hipStreamSynchronize(streams[rank]), "five-rank sync");
+
+    for (std::uint32_t rank = 0; rank < RANKS; ++rank) {
+        check_hip(hipSetDevice(contexts[rank].record.ordinal), "five-rank destroy device");
         check_hip(hipStreamDestroy(streams[rank]), "stream destroy");
     }
-    bool ok = all_ready;
-    for (std::uint32_t rank = 0; rank < rank_count; ++rank) {
-        ok = ok && payload[rank] == pattern_word(0xB0BAULL + rank, 0, contexts[rank].seed);
-    }
-    check_hip(hipHostFree(payload_raw), "five-rank payload free");
-    check_hip(hipHostFree(ready_raw), "five-rank ready free");
-    if (ok) {
-        report.five_rank_detail = "five devices wrote disjoint words of one host allocation";
-    }
-    return ok ? outcome::pass : outcome::fail;
+    check_hip(hipHostFree(mem), "five-rank host free");
+    return failure.empty() ? outcome::pass : outcome::fail;
 }
 
 // -------- measurements for the cost model (guide 14), never gates ----------
@@ -1236,6 +1312,10 @@ int run_bench(device_context &    ctx,
               const std::string & path,
               std::uint32_t       rounds,
               const std::string & runtime_version) {
+    // The bench runs after the five-rank case leaves the current device on
+    // the last rank; every HIP entry point pins its own device (guide 52
+    // single-owner discipline).
+    check_hip(hipSetDevice(ctx.record.ordinal), "bench set device");
     tq::relay::probe::bench_report report;
     report.build_id                   = "tq-relay-probe-bench";
     report.hip_runtime_version_string = runtime_version;
@@ -1391,7 +1471,17 @@ int main(int argc, char ** argv) {
         } else if (arg == "--bench" && i + 1 < argc) {
             bench_path = argv[++i];
         } else if (arg == "--rounds" && i + 1 < argc) {
-            rounds = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+            const char * text          = argv[++i];
+            char *       end           = nullptr;
+            errno                      = 0;
+            const unsigned long parsed = std::strtoul(text, &end, 10);
+            if (errno != 0 || *text == '\0' || *end != '\0' || parsed == 0 ||
+                parsed > std::numeric_limits<std::uint32_t>::max()) {
+                std::fprintf(stderr, "--rounds must be a positive integer up to %u, got: %s\n",
+                             std::numeric_limits<std::uint32_t>::max(), text);
+                return 2;
+            }
+            rounds = static_cast<std::uint32_t>(parsed);
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
             print_usage(argv[0]);
@@ -1408,14 +1498,14 @@ int main(int argc, char ** argv) {
     check_hip(hipRuntimeGetVersion(&report.hip_runtime_version), "runtime version");
     report.hip_runtime_version_string = std::to_string(HIP_VERSION_MAJOR) + "." + std::to_string(HIP_VERSION_MINOR) +
                                         "." + std::to_string(HIP_VERSION_PATCH);
-#if defined(__clang__)
+#ifdef __clang__
     report.compiler_version = "amd clang " __clang_version__;
-#elif defined(__GNUC__)
+#elif __GNUC__
     report.compiler_version = "gcc " __VERSION__;
 #else
     report.compiler_version = "unknown";
 #endif
-#if defined(__x86_64__)
+#ifdef __x86_64__
     report.host_arch = "x86_64";
 #else
     report.host_arch = "unknown";
@@ -1424,13 +1514,15 @@ int main(int argc, char ** argv) {
         "hipHostMallocMapped|hipHostMallocPortable for control and payload; effective flags "
         "recorded per run";
     report.hot_reuse_rounds = rounds;
-    report.limits           = {
+    const std::string multi_stream_note =
+        "multi_consumer, delayed_consumer, two_bank, varying_live and five_stream use one device with "
+        "concurrent streams; they verify protocol software, not five-device qualification.";
+    report.limits = {
         "This is a platform probe, not a model or relay qualification (guide 31.7).",
         "Single-device results do not qualify five-rank cross-device behavior.",
         "Wall-clock ordering observations use the host steady clock.",
         "host_system_rmw is an independent capability; the relay design must not require it.",
-        "multi_consumer, delayed_consumer, two_bank, varying_live and five_stream use one device with "
-        "concurrent streams; they verify protocol software, not five-device qualification.",
+        multi_stream_note,
         "delayed_consumer_ordering gates on a >=40 ms device pause, like producer_delay_ordering.",
     };
 

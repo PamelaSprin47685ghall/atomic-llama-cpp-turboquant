@@ -23,6 +23,10 @@
    消费者的 credit 全收齐、延迟最后读者、双 bank 轮换、可变有效长度与五流
    RELAY 环，都只在证明“给定可见性语义成立时，软件协议正确”；跨设备资格
    仍只由恰好五张设备时运行的 five_rank_cross_device 给出。
+5. [AXIOM 1] 每个 HIP 入口函数在入口处 `hipSetDevice` 固定自己的设备：
+   `hipFree` 与 kernel launch 都作用于当前设备，五卡用例结束后当前设备停在
+   最后一个 rank，free 与 bench 若不各自固定就会在五卡机上解错设备、跑错
+   设备；单卡机上这些路径肉眼不可见，只能靠入口纪律保证。
 
 # SPEC
 
@@ -52,6 +56,13 @@
    kernel 在下一个用例复位后晚写共享控制块。
    Proof: `wait_for_ack` / `wait_for_ticket` / `fail_case`；修复前 2000 轮
    预计数小时，修复后全量约 20 秒。
+6. [LEMMA 5、6] 五卡跨设备用例在单卡机上不可能运行：它由 guard 三明治 + 每轮
+   变化的 payload + 逐 rank 失败归因构成，第一次执行只能在真实五卡机器上
+   发生；单卡回归只能证明该路径不改变单设备行为（five_rank 保持 not_run），
+   不能证明跨设备可见性。每个 rank 的成功或失败都登记进对应设备记录，
+   `five_rank_cross_device` 注册项因此可达。
+   Proof: `run_five_rank` / `rank_write_kernel`；2026-10-19 单卡 2000 轮
+   smoke qualification=pass、five_rank=not_run，不构成跨设备证据。
 
 # Exceptions
 
@@ -60,3 +71,11 @@
   依赖平台工具链；它不进入 fork/build.py 与 isolation.py 的默认流水线。
 - gfx1030 host fetch_add 的错误值行为按本机观察记录，不代表其他 ROCm 版本或
   拓扑；每次换工具链或拓扑后重跑，旧报告不延续。
+- clang-tidy 在 HIP 代码上存在已知误报，不逐一 NOLINT：`misc-include-cleaner`
+  穿不透 `<hip/hip_runtime.h>` 的 portable 头模型（“no header providing
+  hip*/blockIdx/clock64”）；`readability-non-const-parameter` 看不见
+  `__atomic_*` 内建对参数写的写（release_store/rmw_probe_kernel）；
+  `readability-static-accessed-through-instance` 把 HIP 的 `blockIdx` 兼容
+  实体当实例；`portability-avoid-pragma-once` 与本仓 `#pragma once` 惯例
+  冲突（兄弟 B 库头同用）。真实告警（缺 include、未用 using、CLI 越界）已
+  修完；换 LLVM 版本后按此清单复查。

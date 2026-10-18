@@ -1,6 +1,8 @@
 #include "evidence.h"
 
+#include <cstdint>
 #include <cstdio>
+#include <string>
 
 namespace tq::relay::probe {
 

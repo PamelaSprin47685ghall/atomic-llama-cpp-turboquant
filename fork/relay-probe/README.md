@@ -6,7 +6,9 @@ RELAY 依赖的映射主机内存能力：双向运行期可见握手、同一�
 host 内存系统 RMW 能力位。在此之上再验证协议软件层：五个并发消费者的输出 credit
 全收齐（H08 的延迟最后读者单列）、双 bank 轮换的热复用、可变有效长度的热复用，以及
 单卡五流仿真的一整圈“五生产者部分和 → host 折减 → 发布 → 五消费者读回”。恰好五张
-设备时另跑五卡跨设备用例；否则记录 NOT_RUN。`--bench` 另出一份纯测量 JSON（时延与
+设备时另跑五卡跨设备用例：五个 rank 在同一块带 guard 三明治的 host 分配中各写一个
+互不重叠的词，按 `--rounds` 多轮热复用（每轮 payload 随代次变化，陈旧写必然失配），
+失败按 rank 与轮次归因；否则记录 NOT_RUN。`--bench` 另出一份纯测量 JSON（时延与
 host 折减带宽），只供成本模型参考（指南 14），不是资格门。
 
 这不是模型、调度器或整链 RELAY 的资格（指南 31.7）；它只回答“这个平台答应了什么”。
@@ -28,7 +30,8 @@ ctest --test-dir build-relay-probe --output-on-failure
 
 `--output` 使用排他创建，不会覆盖已有证据；重跑需换路径或先明确删除旧报告。退出码
 0 表示本机范围内的强制用例全部通过，1 表示有失败，2 是用法或发布错误。五卡用例在
-设备数不等于 5 时保持 `not_run`，不折算成通过。
+设备数不等于 5 时保持 `not_run`，不折算成通过。`--rounds` 只接受 1 到 UINT32_MAX
+的纯十进制整数；尾随垃圾、前导零之外的空串和溢出都在提交前拒绝（退出 2）。
 
 ## 关键设计
 
@@ -39,6 +42,9 @@ ctest --test-dir build-relay-probe --output-on-failure
 - 每个等待 kernel 有有界预算与 abort 字，host 侧有 deadline；超时不释放任何
   payload。
 - payload 模式由 (generation, index, seed) 决定，撕裂、陈旧或别名读取必然失配。
+- 每个 HIP 入口函数在入口处 `hipSetDevice` 固定自己的设备（分配、逐 rank 五卡
+  用例、bench、释放都各自固定）：`hipFree` 与 kernel launch 作用于当前设备，
+  五卡机上跨 rank 复用执行器时不能依赖调用方留下的设备状态。
 
 ## 本机已观察事实（2026-10-19，RX 6800 / gfx1030，ROCm 7.2.4）
 
