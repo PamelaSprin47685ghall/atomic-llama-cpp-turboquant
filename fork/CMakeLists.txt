@@ -1,0 +1,9 @@
+cmake_minimum_required(VERSION 3.16)
+project(TQFork VERSION 0.1.0 LANGUAGES CXX)
+
+include(CTest)
+find_package(llama CONFIG REQUIRED)
+add_subdirectory(sampling)
+add_subdirectory(compose)
+add_subdirectory(corpus)
+add_subdirectory(corpus-compose)
