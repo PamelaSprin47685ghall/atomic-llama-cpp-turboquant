@@ -464,6 +464,25 @@ def self_test():
         return report
     expect_invalid("five devices with five_rank not_run", five_rank_not_run)
 
+    def five_rank_fail():
+        report = good_report(5)
+        report["five_rank_status"] = "fail"
+        report["qualification"] = "fail"
+        report["qualification_detail"] = "a rank failed"
+        for device in report["devices"]:
+            device["cases"]["five_rank_cross_device"] = {
+                "result": "fail",
+                "detail": "rank 2 drain failed: an error",
+            }
+        return report
+    validate_report(five_rank_fail())
+
+    def five_rank_disagree():
+        report = five_rank_fail()
+        report["devices"][1]["cases"]["five_rank_cross_device"]["result"] = "pass"
+        return report
+    expect_invalid("five-rank per-device record disagreeing with five_rank_status", five_rank_disagree)
+
     def empty_detail_with_devices():
         report = good_report(1)
         report["five_rank_detail"] = ""

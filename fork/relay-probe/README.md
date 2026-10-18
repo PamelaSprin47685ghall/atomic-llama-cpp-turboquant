@@ -55,7 +55,7 @@ exit 0 表示结构、类型与全部交叉不变量成立；exit 1 给出第一
 是用法错误。校验器拒绝重复键、非有限数、未知字段与尾随数据，未来字段变化必须升
 schema 或改校验器。`--self-test` 在无 GPU、无证据文件的机器上验证校验器自身。
 本目录的 config-test 已进入 `fork/build.py` 默认流水线：无 HIP 机器只构建并运行
-config-test，有 ROCm 工具链时顺带构建探针可执行文件。
+config-test 与校验器 `--self-test`，有 ROCm 工具链时顺带构建探针可执行文件。
 
 ## 关键设计
 

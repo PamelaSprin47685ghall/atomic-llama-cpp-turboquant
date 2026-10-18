@@ -18,7 +18,7 @@
       "evidence.cpp": "f460b24b49ba136f4268473a3bc8cc6f58502b66ef0c18c215029526376a0312",
       "evidence.h": "7d80c699c69bc079a350bbad57e765faf007fa36791c93f9b152085823b66d4e",
       "config-test.cpp": "e68160281a997aa6f4b68767283225079e34531df433548ed6c0be71369545f4",
-      "validate-report.py": "0f835cec2ef13a53db1865cea3653d83344e6d2624925396dfd500b2ddc29666",
+      "validate-report.py": "f78b5823950ba6916e60673a8527a01c34c7e4795131d8d171c98b14b65853a8",
       "build.py": "a877a9f16388964dd99d090c0d92790788a8b44aa5ef06af53d12655bdf3196b"
     },
     "validator": {
@@ -43,7 +43,8 @@
     "validate-report.py: strict JSON plus guide 53.4 terminal-state consistency for reports and bench files; --self-test; exit 0/1/2",
     "fork/build.py default pipeline builds and tests the probe config-test (install=False); HIP executable built alongside when a HIP toolchain is present; isolation.py still excludes the probe",
     "README operator section: HIP_VISIBLE_DEVICES guidance for machines with more than five HIP devices, validator step, BDF cross-check",
-    "stdout switched to _IONBF (C-standard as-soon-as-possible guarantee); the GPU-free config test now forks a child, redirects stdout to a file, prints, and dies by SIGKILL, asserting the line survived - pinning the documented killed-run recovery claim to this libc"
+    "stdout switched to _IONBF (C-standard as-soon-as-possible guarantee); the GPU-free config test now forks a child, redirects stdout to a file, prints, and dies by SIGKILL, asserting the line survived - pinning the documented killed-run recovery claim to this libc",
+    "validate-report.py --self-test joined ctest as tq_relay_probe.validator, so the pipeline and the operator's own ctest run prove the validator before use; self-test now also covers the five-rank failure report shape (status=fail with per-device fail records) and its disagreement mutation"
   ],
   "evidence": {
     "report": {

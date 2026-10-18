@@ -20,6 +20,15 @@ if(TQ_RELAY_PROBE_BUILD_TESTS)
     add_executable(tq_relay_probe_config_tests tests/config-test.cpp)
     target_link_libraries(tq_relay_probe_config_tests PRIVATE tq_relay_probe_common)
     add_test(NAME tq_relay_probe.config COMMAND tq_relay_probe_config_tests)
+    # The evidence validator is the operator's pre-ship check; its self-test
+    # runs here too so the pipeline proves the tool before anyone relies on
+    # it. Python is already a fork-tooling dependency (build.py, guards).
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME tq_relay_probe.validator
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validate-report.py --self-test)
+    endif()
 endif()
 
 find_package(hip QUIET)
