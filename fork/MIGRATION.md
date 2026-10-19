@@ -18,17 +18,27 @@ A 为 AtomicBot-ai/atomic-llama-cpp-turboquant 的 master，`cda0f9256665845cd9d
 
 用户明确要求的是插入点之间逐 token 可见的共享白板。当前重写由独立 [TQRerot](rerot/README.md)、A 的公开 reader / recurrent 接缝和 [rerot-compose](rerot-compose/README.md) 承接，没有直接迁入旧 `llama-rerot.*` 或 server 运行时。E11 / E23 的有用合同已进入新实现；旧自动 planner、reasoning-end / tool profile 等相邻功能仍保留文本候选。
 
+本轮 hardening 的最终结果以 [新机器索引](audit/rerot-hardening-qualification-20261019.json) 和 [VALIDATION.md 顶部记录](VALIDATION.md) 绑定的源码、安装库与消费者身份为准。当前 A 为固定上游加 **34-path overlay**；本轮实现提交为 A `81276fa6c`、B `23e1460af`、C `e60d999cb`，完整提交与产物 hash 由新索引记录。下面的“最终”只指这些实际执行的候选，早期失败与数据保留原身份。
+
 | 部分 | 已实现的职责 | 已有证据与剩余范围 |
-|---|---|---|
-| B：DAG / episode / reader view | 独立 C++17 库；有界 pen、稳定 stage / run 身份、immutable public 前缀、own causal / private / source-end、checked arithmetic、陈旧票据拒绝、cohort 原子 commit / abort | Release、UBSan、ASan 各 4/4 CTest 通过；四 worker DAG 的 543 个图、3,007 个合法状态、3,904 个 reader，以及事务反例；独立 F64 oracle 3,200 个 reader/head 比较，最大绝对误差 `7.77156e-16` |
-| A：真实 reader attention | 一个 context / KV owner；公开 view 分开存储位置与虚拟位置。identity span 复用原生 batched KQ，其余 span 重建 reader Q；可见分数 scatter 到物理 KV 槽，隐藏槽置负无穷，作一个全局 softmax 后消费原生 batched V，不再 gather V。本次 reader 仅支持 resident F32 K / F32 V | 最新 helper 的 16 例 CPU 独立 F64 logits oracle 通过：单层合法 GGUF、零 FFN、Llama NORMAL / Qwen2 NEOX、4 Q / 2 KV heads、amplitude 1 / 1.375、行顺序与同一 frozen cohort 的串行对照。先前 8 例、最大绝对误差 `7.72386e-7` 保留历史身份；GPU oracle 的 ordinary 校准仍未通过，也没有 A partial rotary / GPTNeoX 资格 |
-| A：独立 recurrent 物理池 | 逻辑 sequence tails 与 `n_rs_slots` 物理容量分离，实际 COW / 容量预检由 A 拥有；公开 recurrent-only retirement 保留已封存阶段的 attention keys | RERoT C 使用 `W + 2` 个逻辑 ID、`P + 1` 个 recurrent 槽，其中一槽保存 immutable base。LFM2.5 的最终 F32 reader 状态门覆盖 pool、无效输入、hidden / pending、重排和恢复：31 个全 logits 等价组与 2 个 peer 因果效应组全部通过；纳入 reversed-serial / visible-serial 同形状对照后，等价组最大绝对 logits 差为 CPU 0、Vulkan `0.0000133514404296875`。最终分组和输入域见 [VALIDATION.md](VALIDATION.md)，不借用旧 clear/reuse 结果扩大资格 |
-| C：真实生成与发布 | 显式 DAG、`assistant-eot` 原生模板、FRAME token waves、每阶段独立 sampler / recurrent lineage、每 BODY token 同步后共同发布、阶段工作区释放 | 实际消费安装后的 A、TQRerot、TQRelay、TQText。完整 C 生成仍在验证；installed-only 与真实模型最终回执以 [VALIDATION.md](VALIDATION.md) 为准 |
-| C：提交与设备边界 | 每次 submit 用局部 `run_submissions(call, 1)` 登记一个真实 A 域，在实际 `llama_synchronize` 后完成并释放票据；唯一 call ID 与失败状态跨调用保留。取消在同步 chunk / wave 边界及 B commit 前检查 | 复用 A 原生单设备 / layer / row placement 接线；多 GPU PP 尚未实际运行。whole-model TP5 provider、LateBind、MTP 和 Turbo / 量化 KV reader 尚未接入，也没有 RERoT / MMVQ 性能收益结论 |
+| --- | --- | --- |
+| B：DAG / episode / reader view | 独立 C++17 库；有界 pen、稳定 stage / run 身份、immutable public 前缀、own causal / private / source-end、checked arithmetic、陈旧票据拒绝、cohort 原子 commit / abort；BODY 必须 public | 本轮 B 随新源码隔离构建并由搬迁后的 C 消费。早期 Release、UBSan、ASan 各 4/4 CTest，以及四 worker DAG 的 543 个图、3,007 个合法状态、3,904 个 reader 和 F64 oracle 的 3,200 个 reader/head 比较、最大绝对误差 `7.77156e-16`，继续属于其原批次，不改称本轮全部重跑 |
+| A：真实 reader attention | 一个 context / KV owner；公开 view 分开存储位置与虚拟位置。identity span 复用原生 batched KQ，其余 span 重建 reader Q；可见分数 scatter 到物理 KV 槽，隐藏槽置负无穷，作一个全局 softmax 后消费原生 batched V。本次 reader 仅支持 resident F32 K / F32 V；公开 reason API 说明实际拒绝条件 | 最终 CPU 与实际 offload 的 GPU 独立 F64 logits oracle 各 16 例 PASS，含 ordinary 校准。单层合法 GGUF、零 FFN、Llama NORMAL / Qwen2 NEOX、GQA、幅度及 query 顺序的范围不变；CPU 另有 7 项 unsupported checks，GPU 该次为 0。完整 Qwen2 NEOX fixture 不提供 A partial rotary / GPTNeoX 架构资格 |
+| A：量化批形状数值策略 | 新公开 context 请求 `batch_invariant_matmul` 默认 false。C 从创建 context、共同 Prefill 之前请求 true；`GGML_PREC_BATCH_INVARIANT=20` 覆盖量化 dense 与 expert-indexed products，以同后端原生 DEFAULT N1 dot 为参考，可能仍用 Q8 activations；F32 PEDANTIC 是另一合同 | GPU dense 597 graphs / 90 bitwise comparisons / 18 bias graphs PASS；CPU 与 GPU ID 各 1,114 graphs / 431 bitwise comparisons PASS，参考为未设置候选 precision 的 native DEFAULT N1。Vulkan 的列与 selected slots 留在 GPU 批量执行，仅在硬件 grid 上限处分块；DEFAULT 保留大 N 优化矩阵路径。context getter 只报告请求，当前结果不扩为所有后端、模型、布局或 provider 的保证 |
+| A：独立 recurrent 物理池 | 逻辑 sequence tails 与 `n_rs_slots` 物理容量分离，实际 COW / 容量预检由 A 拥有；公开 recurrent-only retirement 保留已封存阶段的 attention keys | C 使用 `W + 2` 个逻辑 ID、`P + 1` 个 recurrent 槽，其中一槽保存 immutable base。最终 CPU / GPU reader 各通过 31 个全 logits 等价组、2 个 peer 因果效应组及 12 个跨形状对照；两个 max_abs 均为 CPU 0、GPU `1.52587890625e-5`。CPU 结果来自新隔离安装，72 次 decode / 169 行；不借旧 clear/reuse 扩大资格 |
+| C：真实生成与发布 | 显式 DAG、`assistant-eot` 原生模板、FRAME token waves、每阶段独立 native sampler / recurrent lineage、每 BODY token 同步后共同发布、阶段工作区释放；实际消费安装后的 A、TQRerot、TQRelay、TQText、TQSampling | 最终 CPU / GPU 各 8/8 完整 episode 通过合同、phase、重复与跨形状四项资格；四 worker / 两 pen、`ubatch=128,1 × release,retain × repeat=2`，原生 EOG 完成 worker 与 synthesis。CPU 每例 764 frontiers / 208 live peer reads，GPU 每例 748 / 208；严格门是各自后端内的对照，不要求两端轨迹相同 |
+| C：提交、退出与设备边界 | 每次 submit 用局部 `run_submissions(call, 1)` 登记一个真实 A 域，在实际 `llama_synchronize` 后完成并释放票据；已接受调用先排空再清理 reader，失败状态跨调用保留。取消在同步 chunk / wave 边界及 B commit 前检查 | 原生 C CTest 5/5 PASS，其中 native cancellation 实际在 CPU 执行；真实 CPU / GPU 的 SIGINT 与 broken pipe 均通过，无 timeout / forced cleanup。复用 A 单设备 / layer / row placement 接线，多 GPU PP 尚未实跑；单卡 `layer` 与信号退出不能代替五卡 provider、GPU kernel 内取消或多设备 drain 证明 |
+| A / B / C：源码与安装消费 | 固定 upstream archive 加 verified overlay 重新编译纯 CPU A；各库与 C 独立构建，随后删除 A/B/C 源码和 build 副本，再搬迁安装并消费 | 新 `isolation-expert/delivered` 未复用 `--a-prefix`：A seams 11/11、C 5/5 与搬迁后 4 例真实 RERoT PASS。隔离四例 receipt 只有合同和 phase 资格，repeat / cross-shape 仍为 `NOT_QUALIFIED`；最终严格八例有单独 receipt。源码隔离不等于操作系统沙箱 |
 
 共享白板的发布单位是本轮每个运行阶段已经完成 forward 的一个 BODY token。所有 member 读相同的 peer revision，完成后一次 commit，下一轮立即看到 peer 刚提交的 token。刚采样但还没有计算 KV 的后继 token 不提前发布。多 token FRAME 以波次完成并保持同一冻结 peer 快照；这不延迟正常 BODY 的逐 token 共享。DAG 只控制阶段启动，public 可见性还包含已结束的非祖先阶段。
 
-当前 C 是全驻留、无持久恢复的显式任务消费者。共同 base 只 Prefill 一次，新 worker 从该 base 建立 lineage，synthesis 在全部 worker 结束后独立启动；private source-end 不进入 peer 的白板。失败可能已经写过原生 microbatch，C 排空后终止 episode，没有发布半个 cohort，也没有声称可原地重试。旧协议和更快的设备路径只有满足同一 token frontier 合同后才能另行接入。
+当前 C 是全驻留、无持久恢复的显式任务消费者。共同 base 只 Prefill 一次，新 worker 从该 base 建立 lineage，synthesis 在全部 worker 结束后独立启动；private source-end 不进入 peer 的白板。失败可能已经写过原生 microbatch，C 排空后终止 episode，没有发布半个 cohort，也没有声称可原地重试。逻辑 reader 容量、物理 KV、逻辑 sequence ID 与 recurrent 槽位分别校验。旧协议和更快的设备路径只有满足同一 token frontier 合同后才能另行接入。
+
+数值修复针对已经找到的形状边界：图中 F32 dense/router 与 attention products 使用显式 PEDANTIC；MoE 保持相同 expert 求和顺序及实际 expert 数；CPU mode20 的量化 dense 路径绕过两次 SGEMM 并固定 single-output dot，转换与 chunk 并行保留。当前 x86 结果不扩大到其他 CPU 架构、extra-compute provider 或 MoE cache。GPU dense / ID 的点积参考、padding、融合 bias/scale 与硬件 Y 边界分别有公开算子和实际 DEBUG 分派证据；没有把请求配置当作 kernel 命中证明。
+
+正常 Release 的 resident graph 测量也已完成。IQ4_NL / Q8_0 / Q4_K、K=2048、M=1025 的 invariant/default warm median 比值范围，在 N9 为 `0.469399–0.499107`，N32 为 `1.092569–1.311400`，N128 为 `1.857106–2.019109`。这记录了显式策略在较大 N 的成本，A 默认优化矩阵路径继续保留。MMVQ 的 auto/disable ABBA 对照在 Q4_K N8 观察到较低用时，Q4_0 N8 相近，部分小 N 与 IQ4_NL 负控制有主机或时钟波动；不推导普遍提速或完整 RERoT 吞吐收益。形状、cold/warm、控制顺序、samples 与产物身份集中见 [VALIDATION.md](VALIDATION.md) 和新索引，DEBUG 时长不作性能数值。
+
+早期 8 例 CPU oracle 的 `7.72386e-7`、原 GPU ordinary 校准失败及 reader 同形状 `0.0000133514404296875`，仍归属 [旧索引](audit/rerot-qualification-20261019.json)。本轮先后失败的跨形状、F32 head-padding、dense-only Prefill 与 expert-ID 候选也保留原回执；最终 PASS 来自实际修复和原有严格门，没有放宽 numeric/greedy 阈值。F16/mixed 或量化 KV、FA reader、SWA、partial RoPE、GPTNeoX 架构、CUDA/HIP RERoT、多模型质量、HTTP 集成、自动 planner、reasoning/tool、whole-model TP5、LateBind、MTP 与多 GPU PP 继续各自验收；当前 F32 / 单机结果不补齐这些边界。
 
 ## 已迁入并有真实消费者的能力
 
@@ -36,7 +46,7 @@ A 为 AtomicBot-ai/atomic-llama-cpp-turboquant 的 master，`cda0f9256665845cd9d
 
 | 行为 | 当前实现 | 保留的合同与证据 |
 |---|---|---|
-| 精确 compact top-k | B `TQSampling`；C `compose` | B 拥有数值结果；C 用真实 A 采样链，保留 distribution sampler 的状态。此前 CPU / Vulkan 的 greedy、正温 token 对照通过。 |
+| 精确 compact top-k | B `TQSampling`；C `compose` 与 `rerot-compose` | B 拥有数值结果；C 用真实 A 采样链，保留 native sampler 的 accept / RNG 状态。本轮 RERoT 的 compact shortlist 与完整输入回退消费原生链，配对回归见新索引；此前 CPU / Vulkan 的 greedy、正温 token 对照保留原运行身份。 |
 | 请求 token trie | B `TQCorpus`；C `corpus-compose` | 共享前缀、重复权重、请求顺序和前缀终点；真实 prefix / full replay 的逐请求 NLL 对照通过。 |
 | 旧生产 corpus 小合同 | 同上，另有归档 writer / reader 互操作测试 | nodes ID 从 1 开始；kind、64 位 timestamp、空请求和缺失空流正确处理；真实旧 writer → 新 B → 旧 reader 字节往返通过。 |
 | Prefill 优先 | 独立 B `TQScheduling`；C `batch-compose` | 保持当前提示、按调用者提供的候选顺序选择；B 不隐含 FIFO。C 另行拥有 FIFO 准入。有待处理已准入提示时暂停 Decode，完成后恢复。 |
@@ -57,7 +67,7 @@ A 为 AtomicBot-ai/atomic-llama-cpp-turboquant 的 master，`cda0f9256665845cd9d
 | 增量 UTF-8 / stop | B `TQText`；C `batch-compose --stream --stop` | B 拥有跨块状态和文本结果；C 保留原 token 记账，在匹配确定后停止后续 decode、发出一次终止事件并回收请求。重建用途，不声称旧非流式 fastpath 或吞吐收益。 |
 | WXQCAL03 校准格式 | B `TQCalibration` | 显式 LE、逐层有界读取、统计人口与有限值校验、精确 EOF、拥有自身数据的结果。B 不调用 A；与 TQText 的独立测试均通过 ASan / UBSan。 |
 | 校准统计导出 imatrix | C `imatrix-compose`，使用已安装 B 和 A `ggml::ggml-base` | raw sum2 / exact F32 counts、显式 partial / unseen 策略、元数据记录估计与范围、无覆盖发布。原 writer fixture 经新 C 产生 12 tensors，实际 A loader 读为 6 entries / 9 chunks；不证明模型量化质量。 |
-| 源码与安装包边界 | build、manifest guard、isolation、独立 CI | 2026-10-18 的五个 B、五个 C 分别构建并消费安装包；该批完整 CPU archive/isolation 62 条命令通过，包含删除源码与前缀搬迁后的消费。当前流水线扩为七 B / 六 C，须以新的完整回执验收；A 内容以 manifest 为准，CI 尚待推送后实际执行。 |
+| 源码与安装包边界 | build、manifest guard、isolation、独立 CI | 2026-10-18 的五个 B、五个 C 及 CPU archive/isolation 62 条命令保持原身份。本次新隔离 receipt 为 77 条命令、7 B / 6 C；不包含 relay-probe，a-seams 另作安装消费者检查，不是全仓程序分母。从固定上游加 34-path overlay 新编译纯 CPU A，完成源码删除、安装搬迁和真实 RERoT 消费，未复用 `--a-prefix`。新 receipt 的四例合同/phase 与最终八例严格生成范围分开；A 内容以 manifest 为准，CI 尚待推送后实际执行。 |
 
 当前 A 例外的精确文件、内容、消费者与退出条件见 [upstream-exceptions.json](upstream-exceptions.json)。原版 HTTP server 的私有调度循环仍属于 A 例外，不能把它包装成“已经独立的 B”。当前七个 B 均只依赖 C++17 标准库，各自能独立构建和消费；C 显式组合它们与 A。TQRerot 不包含 A 或 TQRelay 依赖，跨库协作发生在 C。
 
@@ -98,14 +108,14 @@ A 为 AtomicBot-ai/atomic-llama-cpp-turboquant 的 master，`cda0f9256665845cd9d
 | 重试与输出 | 已输出文本游标、预算 / usage 聚合、首块语义、重试恢复 | C 拥有 HTTP 请求与 sampler；必须验证随机状态、取消和部分输出，不能只比较最后 token 总数 |
 | 请求 / 文本协议 | cache affinity、按 lane 拼完整行、thinking parser、usage 只计算一次 prompt | UTF-8 / stop 用途已由 TQText 和 batch C 重建；完整多 choice / SSE / 取消仍由真实 HTTP C 验收，旧非流式 fastpath 的性能需另测 |
 | 在线 corpus 录制 | 入队前记录模板/tokenization 后的请求输入、种类与时间戳，供校准与回放；不是请求成功结束后的生成输出 | B 的生产格式已经恢复；在线事件身份、失败/重试和重启完整性仍需 C。离线构建不等于旧 server 钩子，见 [E04](REWRITE-CANDIDATES.md#e04--在线输入-corpus事件身份与重启完整性) |
-| 退出与失败 | signal 自管道、正常线程清理、第二信号、LoRA 失败传播 | C 生命周期职责；错误必须传给真实调用者，不能靠测试环境替代实际队列 |
-| grammar / sampler | grammar 替换、clone 后结果所有权、实例级 Turbo 配置、额外 RNG draw 语义 | 使用公开 A sampler 原语；消除对私有 distribution 对象的强转，专测后续随机状态 |
+| 退出与失败 | signal 自管道、正常线程清理、第二信号、LoRA 失败传播 | RERoT C 的真实 CPU / GPU SIGINT 与 broken pipe、实际 CPU native cancellation 已取得本轮局部资格；第二信号、HTTP 队列及 LoRA 失败传播等仍须各自验收，不能以进程正常退出代替全部生命周期证明 |
+| grammar / sampler | grammar 替换、clone 后结果所有权、实例级 Turbo 配置、额外 RNG draw 语义 | RERoT 的 compact / full 路径已由 C 消费公开 A native sampler 并验证配对行为；相邻 grammar 替换、通用 clone 所有权与实例配置仍保留各自合同，不能以一组采样链对照关闭所有候选 |
 | 模型 / GGUF | BailingMoE3 名称及缺省兼容、缺失 MTP 权重、uint64 PLE hash | 上游实际消费者和 GGUF 元数据校验；每个兼容点独立提交，不整包恢复所有图修改 |
 | 校准采集与复用 | small:S05 的公共回调激活采集、DFS 统计人口、trie 复用、周期 checkpoint 和异常保存 | small:S04 格式读取 / imatrix 导出已迁；采集 C 仍须验证实际模型 callback 的名称、shape、dtype、分支顺序与计数，不以转换器代替采集 |
 | 独立证据工具 | GGUF 头读取、离线性能报告、请求 / 构建身份 | 比较器与公开采集器已迁；格式仍无完整模型 / 构建身份，必须保存旁侧运行证据。其他工具需各自验收统计分母、有限值和失败输出 |
 | 工作区计划 | 64 KiB 容量向上取整、阶段 scratch 最大值、间接 dispatch 算术 | 纯值 B；容量取整不能改变 dispatch 几何；实际 buffer 与设备生命周期由 C / A 拥有 |
 | 状态封装 | 有界 state envelope、scope / policy / adapter / nonce 校验 | B 可封装字节，C 包装 A 的 opaque state；需明确端序，同进程身份不能冒充持久跨进程模型身份 |
-| 数学参考与 reader 精度 | 无符号 Hadamard、其他 GQA / DDVR 参考与高效 reader 路径；RERoT 可见性和 F32 reader 相位已有独立 B 与实际 A 消费者 | F16 reader 的 CPU 重排/restore `0.11799526`、Vulkan permutation `0.0003576` 未过严格门，暂不发布。物理排列与原生单序列恢复后重分配的精度策略按 E23 重写；A partial rotary、Turbo KV 与其他设备组合仍单独验证 |
+| 数学参考与 reader 精度 | 无符号 Hadamard、其他 GQA / DDVR 参考与高效 reader 路径；RERoT 可见性和 F32 reader 相位已有独立 B 与实际 A 消费者 | 本轮最终 F32 CPU / GPU oracle、同形状及跨形状 reader 门按上节范围通过。早期 F16 reader 的 CPU 重排/restore `0.11799526`、Vulkan permutation `0.0003576` 未过严格门，仍保留失败，当前不发布 F16/mixed reader。A partial rotary、Turbo KV 与其他设备组合仍单独验证 |
 | 稀疏 / 合并参考 | mean / energy 选择、online softmax 三元组归并、有限 mask 保留 | 单独证明数学合同和异常回退；局部参考不自动获得稀疏 attention 整模型质量资格 |
 | Vulkan pinned host 所有权（G14） | 使用 buft 对应设备分配、释放与查询，而不是硬编码 device 0 | 保留独立候选；alloc/free/getter 必须由同一设备 owner 闭合，不能借 G09 或已有 WHT 回归代替 |
 | 后端算子 / 生命周期 | SCALE F16、MROPE / IMROPE 融合、字节 memmove、readback pin / 可见性、device staging 清理；meta 分片非零偏移已迁 | 公开既有算子可小补丁；overlap、stream / fence 和多 context 生命周期需对应证明 |
@@ -149,7 +159,7 @@ G44 原候选建议 Turbo SET_ROWS 拒绝 F16 source，前提是只编译 F32 sh
 | 能力 | 当前判断 | 重新进入的条件 |
 |---|---|---|
 | TP5 / LateBind / relay / device loop | 已进入用户重写路线：独立 [TQRelay](relay/README.md) 与 [relay-probe](relay-probe/README.md)。旧私有 runtime 保留归档，不再作为待迁移项；59.66 →65.17 tok/s 仍仅属旧运行身份 | 平台探针已经落地。单设备协议、五 rank 索引 fixture、真实五设备 probe 和整模型五卡负载分别记录资格；以当前模块文档与 [VALIDATION.md](VALIDATION.md) 为准，不用历史收益或局部 probe 替代新路线的完整运行证据 |
-| RERoT | 已重写独立 B、原生 A reader / recurrent 接缝和显式 DAG 的 `assistant-eot` C；一 context / owner、逐 BODY token 共享、全局 softmax、独立 recurrent / RNG 与原子发布均有真实消费者；本次 reader 限定 F32 K/V | B 的三种构建各 4/4 通过；最新 helper 的 16 例 CPU oracle 与 LFM2.5 F32 严格状态门通过，先前 8 例保留历史身份。GPU 独立数学、完整 C 生成、最终独立交付各保留自己的门。多 GPU PP 尚未运行；F16 reader、旧自动规划、reasoning / tool、LateBind、MTP、整模型 TP5 provider、Turbo KV 仍单列 |
+| RERoT | 已重写独立 B、原生 A reader / recurrent 接缝和显式 DAG 的 `assistant-eot` C；一 context / owner、逐 BODY token 共享、全局 softmax、独立 recurrent / RNG 与原子发布有真实消费者；本次 reader 限定 F32 K/V。C 在 Prefill 前请求量化 dense / ID 的批形状不变策略，A 默认 false | 最终 CPU / GPU 各 16 例 F64 oracle、33 组 + 12 个跨形状 reader 对照、8 例完整 C 严格矩阵通过；固定上游加 34-path overlay 的新纯 CPU 隔离交付和搬迁消费通过，四例隔离 receipt 不升级为重复/跨形状资格。当前范围、Release 局部成本与原始负例见新索引；多 GPU PP、F16 reader、自动 planner、reasoning/tool、HTTP、LateBind、MTP、整模型 TP5 provider、Turbo KV 仍单列 |
 | FlashPrefill / TriAttention | 独立数学、格式和状态封装有价值；历史 online value accumulation 的局部 prefill 约 +31%，但 greedy 输出变化、部分检索失败，整体验收未闭合 | 固定模型 / 上下文 / 质量门，公开消费者和最小接缝，避免把局部 kernel 测试当整模型证明 |
 | XKV-SR | 槽位元数据、codec、预算和验证可拆；完整量化存储 / 图 / 事务运行时暂未迁 | payload、实际驻留、质量、吞吐与共享状态失败回滚同时验收 |
 | DFlash / DSpark direct-hidden | 旧记录有内部交接与 probe；15–40%是目标，缺乏本次可用的独立整模型配对证明 | 真正 target hidden → draft 设备消费、数值与生命周期验证，再测相对合格基线的收益 |

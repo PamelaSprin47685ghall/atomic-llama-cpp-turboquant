@@ -1,5 +1,161 @@
 # 验证记录
 
+## 2026-10-19：RERoT hardening 与最终候选验收
+
+本节记录本轮冻结源码对应的当前候选；后文早期 RERoT、TQRelay 与其他批次的 PASS、FAIL、
+命令和数字继续属于各自原候选。当前机器索引为
+[audit/rerot-hardening-qualification-20261019.json](audit/rerot-hardening-qualification-20261019.json)，
+旧索引 [audit/rerot-qualification-20261019.json](audit/rerot-qualification-20261019.json)
+保留原始身份。下列结果必须与新索引中的源码、安装库、消费者二进制、驱动、环境和原始输出
+hash 一起使用，不能只凭相同目录名或测试名称提升另一构建的资格。
+
+固定 A 仍为 `cda0f9256665845cd9d6f3a0176880883f653a3d`。
+当前 [upstream-exceptions.json](upstream-exceptions.json) 为 **34 个路径**，SHA-256 为
+`d52ab562be8ac3fcc331fdc731267fd18341539f980f72a6f80257855b3ae715`。
+本轮实现提交为 A `81276fa6c`、B `23e1460af`、C `e60d999cb`；完整提交与产物身份由
+新索引记录。GPU 数值和完整生成门使用新安装候选 `install-vulkan-expert`；
+较早的 `install-vulkan-invariant` 及其负例继续保留。
+
+模型仍为 LFM2.5-8B-A1B-UD-IQ4_NL，4,358,844,000 bytes，SHA-256
+`a1921216ded964e5c4f787226729e8c2c32bd587ac7b897742e0b7a7cc7eff6a`。
+本机为 AMD Ryzen 5 7500F 与单张 RX 6800（RADV NAVI21）。GPU 资格使用实际 Vulkan
+offload 和模型 buffer 记录；枚举到设备、请求 `layer` 或打印 context 配置均不等于多设备执行。
+
+### 数值策略、发布与失败合同
+
+本轮继续使用一份 resident F32 K / F32 V 和 A 原生 recurrent owner。BODY 每 frontier
+让每个运行中的插入点推进一个 token，读同一已提交 peer revision，整组同步完成后共同发布。
+BODY 强制公开；private source-end 不进入其他 reader 的白板。多 token FRAME 仍在一个冻结
+peer 世界内分 wave 执行并整组提交；中途失败不会发布半个 FRAME 或 cohort。
+
+C 在创建 context、执行共同 base Prefill 之前设置
+`batch_invariant_matmul=true`，并通过公开 getter 确认请求。**A 默认值仍为 false。**
+`GGML_PREC_BATCH_INVARIANT=20` 为量化 dense `MUL_MAT` 和 expert-indexed
+`MUL_MAT_ID` 请求原生 DEFAULT N1 的 dot 合同：保留相同后端的 activation 量化选择、
+单输出点积及归约策略，其中可能使用 Q8 activations。它与 true-F32 的
+`GGML_PREC_F32_PEDANTIC` 分开，不表示跨后端、跨模型或所有 provider 按位一致。
+
+在已验收的 Vulkan 布局中，显式模式把 dense 查询列和 ID 的 token/selected-slot 对映射为
+并行 GPU workgroups，只在硬件 grid 上限处分块；ID row padding、共享或逐 slot 输入和
+融合 bias/scale 各有公开回归。它不展开逐 token 的 host 提交循环。未请求该模式时保留
+原生大 N 量化矩阵路径；通用小 N MMVQ 修正单独保留 vendor/type/K 判断和 force/disable
+优先级。getter 只报告 context 请求，实际 kernel 命中和性能分别验收。
+
+图中标记的 F32 dense projection/router、F32 KQ/V 与 reader products 使用显式 PEDANTIC 合同；
+CPU 排除相应 SGEMM 捷径，Vulkan 保留 F32 操作数并固定对应归约策略，包含仅 head 间有
+padding 的输入。MoE 输出统一 expert 轴求和顺序，正常推理使用实际传入的 expert 数，
+warmup 仍保留完整 expert 分配图。CPU mode20 的量化 dense 路径同时绕过两次 SGEMM，
+固定 single-output dot，并保留转换与线程 chunk 调度；当前 x86 结果不扩写到其他 CPU
+架构、extra-compute provider 或 MoE cache。
+
+C 分开校验逻辑 reader 容量、物理 KV、逻辑 sequence ID 与 recurrent 物理槽位。
+已接受的原生调用先同步排空，再释放 reader 和提交票据；发生过部分原生写入的失败会终止
+episode。公开 unsupported-reason API 与 capability/setter 使用同一拒绝谓词，报告实际
+不支持的模型、cache 或 context 条件。native sampler chain 继续拥有选择、accept 和 RNG；
+compact shortlist 的使用不把 B 变成原生 sampler 的替代实现。
+
+### 已完成的最终候选门
+
+本表各行是不同分母，不应相加成一个“总测试数”。对应命令与产物 hash 由上面的新索引绑定。
+
+| 检查 | 已确认结果 | 实际范围 |
+| --- | --- | --- |
+| 新 Vulkan 安装的 A public seams | **20/20 CTest PASS** | 测试集合包含 CPU 与 Vulkan 测项；不能把安装前缀名字解释为每一项都在 GPU 上运行 |
+| GPU dense 量化跨形状 | **597 graphs / 90 bitwise comparisons / 18 bias graphs PASS** | native DEFAULT 单列独立参考；覆盖实际 fixture 的类型、batch、行重排和 head broadcasting；不以候选模式自身生成参考 |
+| CPU / GPU expert-indexed 量化跨形状 | **每端 1,114 graphs / 431 bitwise comparisons PASS** | IQ3_S、IQ4_NL、Q8_0、Q4_K；共享/逐 slot 输入、padded ID rows、重复与变化的 expert IDs、正反序、ADD_ID 与逐 slot scale；含 65,540 个 flattened slots 的硬件 grid 边界 |
+| 最终 GPU F32 reader | **33 个严格组 + 12 个跨形状对照 PASS** | 31 个全词表等价组、2 个 peer 因果效应组；`equivalence_max_abs` 和 `cross_shape_max_abs` 均为 `1.52587890625e-5`，原数值阈值未放宽 |
+| 最终 CPU 独立 F64 attention oracle | **16 例 PASS，7 项 unsupported checks PASS** | reader 最大绝对误差 `6.75223405188774e-7`，ordinary 最大绝对误差 `3.7782220707605063e-7` |
+| 最终 GPU 独立 F64 attention oracle | **16 例 PASS** | reader 最大绝对误差 `6.539480768563699e-7`，ordinary 最大绝对误差 `6.109807473286821e-7`；实际 offload。该次 GPU receipt 的 unsupported checks 为 0，不能写成 GPU 拒绝路径已跑 |
+| GPU Prefill trace 控制 | **32 行 greedy mismatch 为 0** | 同一 token 输入的 ubatch128/1；保留 traced/untraced 控制和微小 F32 残差。greedy 一致不等于全部中间 tensor 按位一致，也不将残差的具体算子根因写成已独立闭合 |
+| 原生 C tests | **5/5 CTest PASS** | 包含模型相关 native cancellation；该取消测试实际使用 CPU，覆盖真实 native 中断与已接受调用的清理，不能归因成 GPU kernel 内取消实测 |
+| 最终 CPU 完整 C 严格矩阵 | **8/8 完整 episode PASS**；每例 **764 frontiers / 208 live peer reads** | 合同、phase、重复与跨形状四项 qualification 均 PASS；08:20:27 完成，driver 用时 `264.06855 s` |
+| 最终 GPU 完整 C 严格矩阵 | **8/8 完整 episode PASS**；每例 **748 frontiers / 208 live peer reads** | 与 CPU 各自运行四 worker / 两 pen、`ubatch=128,1 × release,retain × repeat=2`，各自通过严格 greedy 门，并由原生 EOG 完成 worker 和 synthesis；不要求 CPU 与 GPU 的生成轨迹相同 |
+| 实际 CPU / GPU SIGINT 与 broken pipe | **四项 PASS** | SIGINT 均 exit 130，pipe 均 exit 1；无 timeout / forced cleanup。对应时延单列于下文，不据此断言信号位于某个 GPU kernel 内或证明多设备 drain |
+| 最终源码的纯 CPU 隔离 A / C | **A seams 11/11、C 5/5 PASS** | 来自新的 `isolation-expert/delivered`；C 的 native cancellation 实际在 CPU 执行 |
+| 隔离安装的真实 CPU reader | **33 组 + 12 跨形状 PASS**；两个 max_abs 均 **0** | 同一新 delivered 安装的 72 次 decode / 169 行输入，单独绑定其安装产物身份 |
+| 新源码隔离、搬迁与真实消费 | **08:10:50 完成，PASS；搬迁后 4 例真实 RERoT PASS** | A 从固定 upstream archive 加 34-path verified overlay 重新编译为纯 CPU；未复用 `--a-prefix`。删除 A/B/C 源码与 build 副本后，重定位安装消费者并实际运行 |
+
+CPU / GPU 的 F64 attention oracle 都使用合法单层、零 FFN fixture，含 ordinary 校准与
+reader logits，覆盖 fixture 中的 Llama NORMAL、Qwen2 NEOX、GQA、幅度及 query 顺序。
+它们是独立数学参考，不能替代 8B 全模型的 F64 参考。以上误差来自最终候选，不复用旧 GPU
+oracle 数值。
+
+新隔离的四例 receipt 取得的是合同与 phase 资格。其 repeat 与 cross-shape 字段仍为
+`NOT_QUALIFIED`，即使观察到相同轨迹也不提升这份 receipt 的声明；最终 CPU 严格八例
+使用自己的完整 receipt 取得四项资格。source/build 隔离与安装搬迁证明包边界，不构成
+操作系统沙箱或新的模型质量结论。
+
+本次 isolation receipt 共 77 条命令、13 个隔离模块：B 为 sampling、corpus、scheduling、
+text、calibration、relay、rerot；C 为 compose、corpus-compose、batch-compose、logits-compose、
+imatrix-compose、rerot-compose。这里的 7 B / 6 C 只描述该 receipt；relay-probe 没有计入，
+a-seams 是另列的安装消费者检查，不构成第八个 B 或第七个 C。
+
+### 实际退出、kernel 命中与 Release 成本
+
+进程测试在真实运行后注入信号或关闭 pipe。下表的 `seconds_after_injection` 以秒计并
+四舍五入至六位小数；完整原始数值见新索引。四项都自行退出，无 timeout 或强制清理。
+这些是进程生命周期证据，独立于 CTest 中实际在 CPU 执行的 native cancellation 测试。
+
+| 后端 | SIGINT exit / seconds_after_injection | broken pipe exit / seconds_after_injection |
+| --- | --- | --- |
+| CPU | `130 / 0.160301` | `1 / 0.215547` |
+| Vulkan | `130 / 0.099831` | `1 / 0.100161` |
+
+DEBUG 另作实际 kernel 命中验收。MMVQ 的 auto / force / disable / both 四组 fixture 与
+checker 均 PASS：auto/force 的 Q4_K / Q4_0 在 N1/2/8 实际命中 MMVQ，IQ4_NL 使用原生 F32 fallback，
+both 时 disable 优先。ID 整 fixture 的 1,114 图也通过；原始 DEBUG 记录严格解析出
+**8 对相邻分派**，每对均为 `mul_mat_vec_id_q8_0_f32`，workgroups 先为
+`(3,65535,1)`、后为 `(3,5,1)`。这直接覆盖 65,540 个 selected slots 超过设备 Y 上限、
+且 chunk 落在 token 内部的边界。DEBUG 日志只证明执行路径，不用于下面的性能数值。
+
+正常 Release 性能另运行六个进程，DEBUG 关闭，测量期间没有本任务的其他重构或实模型
+负载，没有锁频。原始 samples、cold/warm、IQR、库与命令身份在
+`performance-vulkan-expert`，由新索引绑定。性能执行成功并不预设优化普遍获益。
+
+dense 对照为 IQ4_NL、Q8_0、Q4_K，K=2048、M=1025、N=9/32/128，输入为设备驻留的
+`SCALE → MUL_MAT` graph；计时包含 compute 与 synchronize。两次运行采用相反首模式，
+每次 9 个 case / 18 个 mode / 288 次 graph compute，每 mode 连续执行 1 cold + 15 warm。
+下表是两次运行内各类型的 **invariant/default warm median 比值范围**；比值大于 1 表示
+显式批形状不变策略用时更多。
+
+| N | invariant/default median 范围 | 对这些 graph 的观察 |
+| --- | --- | --- |
+| 9 | `0.469399–0.499107` | 显式模式用时较低 |
+| 32 | `1.092569–1.311400` | 为相同原生单列 dot 合同付出额外用时 |
+| 128 | `1.857106–2.019109` | 显式模式约为 DEFAULT 用时的 1.86–2.02 倍 |
+
+小 N MMVQ 对照按 auto / disable 的 ABBA 顺序运行四个正常 Release 进程。
+Q4_K N8 的 auto 为 `63.05–63.54 µs`，disable 为 `77.14–77.38 µs`；
+Q4_0 N8 两者均约 `77 µs`。一些小 N 与 IQ4_NL 负控制存在明显的主机或时钟波动，
+因此不作普遍提速结论。这里测的是 resident graph 的局部计算成本，不是完整模型吞吐、
+end-to-end RERoT 用时或多设备收益，也不以 DEBUG 日志中的时长替代 Release 测量。
+
+### 旧失败、当前限制与复现
+
+原 F32 CPU/Vulkan 跨形状失败、GPU tiny ordinary 校准失败、F32 head-padding 反例、
+早期 CPU observer 预算失败、Vulkan shape-policy 完整生成失败及 dense-only Prefill 的
+expert-ID 差异都保留原候选与原回执。本轮通过来自新的数值路径、实际公共算子对照和严格完整
+生成门，没有放宽 numeric/greedy 阈值、伪造 EOG 或把失败分组改称通过。
+
+当前 reader 仍限定支持列表内的 resident F32 K/V。F16/mixed、Turbo/量化 KV、FA reader、
+SWA、partial RoPE 与 GPTNeoX 模型架构等不因完整 Qwen2 NEOX fixture 通过而取得新资格。
+多设备 PP、整模型 TP5、LateBind、MTP、自动 planner、reasoning-end/tool、HTTP 集成、
+CUDA/HIP RERoT 及多模型质量继续保留各自的实现和硬件门。单卡 `layer` 成功不等于
+多设备 PP；既有 Vulkan `row` 的原生 split-buffer 拒绝也保持原身份。当前结果不是整个
+Vulkan 算子库重验，后文全量 FA/TOPK 的历史失败不因这组专项 PASS 被抹去。
+
+复现入口及当前参数合同见
+[rerot-compose/QUALIFICATION.md](rerot-compose/QUALIFICATION.md)。
+每个候选使用新的输出目录，保存原始 stdout/stderr、执行命令、完整模型 shard hash、
+消费者和安装库 hash；启用严格跨形状门。需要模型的测试须真实提供模型，不能把 skipped
+记成通过。重新安装公开 context 参数发生变化的 A 后，应以相匹配的头文件和库重建消费者。
+
+## 历史批次的记录身份
+
+以下各节按原文保留。其中“本批次”“最终”“当前”、28-path manifest、旧数值和未闭合门
+均指相应历史候选。当前 hardening 的资格以上一节及新机器索引为准；新 PASS 不改写旧 FAIL，
+旧 PASS 也不能替代当前候选的独立记录。
+
 ## 2026-10-19：RERoT 逐 token 共享白板
 
 本批次起点为 `4ef817eecff5bb512a65d91bacd2d6b028b40ed5`，固定上游仍为
