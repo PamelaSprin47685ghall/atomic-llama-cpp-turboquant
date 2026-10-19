@@ -59,6 +59,8 @@ def main():
             command.append(f"-DCMAKE_PREFIX_PATH={prefix}")
         if name == "scheduling":
             command.append(f"-DTQ_SCHEDULING_BUILD_TESTS={'OFF' if args.no_test else 'ON'}")
+        elif name == "rerot":
+            command.append(f"-DTQ_REROT_BUILD_TESTS={'OFF' if args.no_test else 'ON'}")
         run(command)
         run(["cmake", "--build", module_build, "--parallel", args.jobs])
         if not args.no_test:
@@ -66,7 +68,7 @@ def main():
         if install:
             run(["cmake", "--install", module_build])
 
-    for name in ("sampling", "corpus", "scheduling", "text", "calibration", "relay"):
+    for name in ("sampling", "corpus", "scheduling", "text", "calibration", "relay", "rerot"):
         module(name)
     # The relay platform probe's evidence lives in the build directory by
     # policy, and its HIP executables exist only when a HIP toolchain is
@@ -76,7 +78,8 @@ def main():
     # config tests build and run everywhere, so the probe's plumbing is
     # covered by this pipeline.
     module("relay-probe", install=False)
-    for name in ("compose", "corpus-compose", "batch-compose", "logits-compose", "imatrix-compose"):
+    for name in ("compose", "corpus-compose", "batch-compose", "logits-compose", "imatrix-compose",
+                 "rerot-compose"):
         module(name, installed_dependencies=True)
     if not args.no_test:
         module("tests/a-seams", installed_dependencies=True, install=False)
