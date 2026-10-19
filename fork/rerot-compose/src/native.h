@@ -31,8 +31,10 @@ struct output_row {
 // that one native call gives it access to A's internal per-device streams.
 class native_execution {
 public:
-    // The caller queries cancellation at synchronized native boundaries. The
-    // function is never registered with A or invoked by a signal handler.
+    // Native loading and supported compute backends query cancellation, as do
+    // synchronized C boundaries. The callback must be safe on A's calling
+    // thread. Cancellation is sticky. Exceptions are returned to C only after
+    // the native call has returned and its submitted work has drained.
     explicit native_execution(const options & config, std::uint32_t stages, std::uint32_t pens,
                               std::function<bool()> stopped = {});
     ~native_execution();
@@ -46,7 +48,9 @@ public:
     std::uint32_t sequence_capacity() const noexcept;
     std::uint64_t compute_bytes() const noexcept;
     bool drained() const noexcept;
+    bool pipeline_parallel_enabled() const noexcept;
     std::string device_summary() const;
+    std::string context_summary() const;
 
     void prefill(const std::vector<llama_token> & tokens);
     void start(tq::rerot::StageId stage);

@@ -28,7 +28,7 @@
 # SPEC
 
 1. From LEMMA 1: this directory builds against installed public llama,
-   TQRerot, TQRelay, and TQText packages. No private A headers or sibling source
+   TQRerot, TQRelay, TQText, and TQSampling packages. No private A headers or sibling source
    directories are build inputs. Proof is recorded in ../VALIDATION.md after
    the isolated install and relocated-consumer runs.
 2. From LEMMA 2: real model tests check incremental visibility, cohort row
@@ -39,6 +39,11 @@
    prevents later whiteboard publication or state reuse.
 4. From LEMMA 4: tests reject unsupported modes explicitly, and the installed
    help and README state the same capabilities as the executable.
+5. From LEMMA 3: compact sampling must preserve the native token order and RNG
+   sequence. A tied greedy maximum, a stochastic retained/cutoff tie, or an
+   unsupported shortlist size uses the original full row. Non-finite rows fail
+   before the sampler changes. Proof: `tests/test-sampling.cpp` compares the
+   actual A chains and B selection through mixed compact and fallback calls.
 
 # Exceptions
 

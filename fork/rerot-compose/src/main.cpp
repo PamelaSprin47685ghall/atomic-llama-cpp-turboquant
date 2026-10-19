@@ -1,3 +1,4 @@
+#include "capacity.h"
 #include "native.h"
 #include "options.h"
 #include "sampling.h"
@@ -77,18 +78,15 @@ public:
           framing_(native_.model(), config_.chat_template, config_.prompt),
           sessions_(plan_.worker_count() + 2) {
         const auto & base = framing_.base();
-        std::uint64_t maximum = base.size();
+        episode_capacity capacity(base.size());
         for (StageId stage = 1; stage <= plan_.synthesis_stage(); ++stage) {
             auto & session = sessions_.at(stage);
             session.frame = framing_.frame(stage == plan_.synthesis_stage() ?
                 config_.synthesis : plan_.node(stage).intent);
-            maximum += session.frame.size();
-            maximum += stage == plan_.synthesis_stage() ? config_.final_tokens : config_.worker_tokens;
-            ++maximum; // One source-end key per stage remains physically owned.
+            capacity.add_stage(session.frame.size(),
+                stage == plan_.synthesis_stage() ? config_.final_tokens : config_.worker_tokens);
         }
-        if (maximum > native_.kv_capacity() || maximum > native_.context_size()) {
-            throw std::invalid_argument("the full task graph exceeds --ctx-size or --total-kv; increase capacity or lower token limits");
-        }
+        capacity.require(native_.kv_capacity(), native_.context_size());
         tq::rerot::Config episode_config;
         episode_config.episode = 1;
         episode_config.pens = pens_;
@@ -101,10 +99,14 @@ public:
                       << ",\"base_tokens\":" << base.size()
                       << ",\"logical_context\":" << native_.context_size()
                       << ",\"physical_kv\":" << native_.kv_capacity()
+                      << ",\"required_physical_kv\":" << capacity.physical_tokens()
+                      << ",\"required_reader_context\":" << capacity.reader_tokens()
                       << ",\"logical_sequences\":" << native_.sequence_capacity()
                       << ",\"physical_recurrent_slots_requested\":" << pens_ + 1
                       << ",\"split_mode_requested\":" << json_string(config_.split)
+                      << ",\"devices_requested\":" << json_string(config_.devices)
                       << ",\"devices\":" << native_.device_summary()
+                      << ",\"native_context\":" << native_.context_summary()
                       << ",\"gpu_layers_requested\":" << config_.gpu_layers
                       << ",\"phase_memory\":" << (config_.phase_memory ? "true" : "false")
                       << ",\"seed\":" << config_.seed << ",\"temperature\":" << config_.temperature
@@ -134,6 +136,7 @@ public:
         const auto & final = sessions_.at(plan_.synthesis_stage());
         if (config_.json) {
             std::cout << "{\"event\":\"result\",\"complete\":true,\"revision\":" << episode_->revision()
+                      << ",\"pipeline_parallel_enabled\":" << (native_.pipeline_parallel_enabled() ? "true" : "false")
                       << ",\"body_tokens\":" << final.body_tokens
                       << ",\"text\":" << json_string(final.text) << "}\n";
         } else { std::cout << '\n'; }
@@ -245,6 +248,7 @@ private:
         if (config_.json) {
             std::cout << "{\"event\":\"frontier\",\"frontier\":" << step.frontier()
                       << ",\"read_revision\":" << step.read_revision() << ",\"revision\":" << committed.revision
+                      << ",\"pipeline_parallel_enabled\":" << (native_.pipeline_parallel_enabled() ? "true" : "false")
                       << ",\"rows\":" << rows.size() << ",\"readers\":[";
             bool first = true;
             for (const auto & member : step.members()) {
@@ -286,8 +290,13 @@ private:
             auto & session = sessions_.at(stage);
             native_.seal(stage);
             display(stage, session.stream->finish());
+            const auto sampling = session.sampler->stats();
             session.sampler.reset();
-            if (config_.json) { std::cout << "{\"event\":\"sealed\",\"stage\":" << stage << "}\n"; }
+            if (config_.json) {
+                std::cout << "{\"event\":\"sealed\",\"stage\":" << stage
+                          << ",\"sampling\":{\"compact_rows\":" << sampling.compact_rows
+                          << ",\"full_rows\":" << sampling.full_rows << "}}\n";
+            }
         }
         flush();
     }

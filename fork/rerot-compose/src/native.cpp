@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -36,10 +37,11 @@ llama_pos position(std::int64_t value) {
 struct native_execution::impl {
     explicit impl(const options & selected, std::uint32_t stages, std::uint32_t pens,
                   std::function<bool()> stop_query)
-        : config(selected), stopped(std::move(stop_query)), active(stages, false) {
-        if (stages > llama_max_parallel_sequences() || pens == 0 || pens + 1 > stages) {
+        : config(selected), stopped(std::move(stop_query)) {
+        if (stages > llama_max_parallel_sequences() || pens == 0 || pens >= stages) {
             throw std::invalid_argument("task graph exceeds A's logical sequence capacity");
         }
+        active.assign(stages, false);
         check_cancelled("before model loading");
         if (!config.devices.empty()) {
             std::size_t begin = 0;
@@ -64,7 +66,12 @@ struct native_execution::impl {
         model_params.split_mode = config.split == "none" ? LLAMA_SPLIT_MODE_NONE :
                                   config.split == "row" ? LLAMA_SPLIT_MODE_ROW : LLAMA_SPLIT_MODE_LAYER;
         if (!devices.empty()) { model_params.devices = devices.data(); }
+        model_params.progress_callback = [](float, void * data) noexcept {
+            return !static_cast<impl *>(data)->cancelled();
+        };
+        model_params.progress_callback_user_data = this;
         model.reset(llama_model_load_from_file(config.model.c_str(), model_params));
+        check_cancelled("during model loading");
         if (!model) { throw std::runtime_error("A could not load the model"); }
         check_cancelled("after model loading");
         vocabulary = llama_model_get_vocab(model.get());
@@ -80,7 +87,12 @@ struct native_execution::impl {
         params.n_outputs_max = std::min(config.batch, stages);
         params.n_threads = std::int32_t(config.threads);
         params.n_threads_batch = std::int32_t(config.threads);
+        params.abort_callback = [](void * data) noexcept {
+            return static_cast<impl *>(data)->cancelled();
+        };
+        params.abort_callback_data = this;
         params.kv_unified = true;
+        params.batch_invariant_matmul = true;
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         // The installed reader interface qualifies F32 KV. F16 reordering
         // can change native rounding enough to cross quantized-model boundaries.
@@ -88,9 +100,12 @@ struct native_execution::impl {
         params.type_v = GGML_TYPE_F32;
         context.reset(llama_init_from_model(model.get(), params));
         if (!context) { throw std::runtime_error("A rejected the context configuration"); }
+        if (!llama_get_batch_invariant_matmul(context.get())) {
+            throw std::runtime_error("A did not retain the requested matrix policy");
+        }
         check_cancelled("after context initialization");
-        if (!llama_attention_views_supported(context.get())) {
-            throw std::invalid_argument("this model or memory mode does not support the installed reader-view attention interface");
+        if (const char * reason = llama_attention_views_unsupported_reason(context.get())) {
+            throw std::invalid_argument(std::string("reader-view attention is unavailable: ") + reason);
         }
         if (llama_n_seq_max(context.get()) < stages) { throw std::runtime_error("A reduced the required logical sequence capacity"); }
         memory = llama_get_memory(context.get());
@@ -102,9 +117,20 @@ struct native_execution::impl {
         if (context) { llama_synchronize(context.get()); }
     }
 
+    bool cancelled() noexcept {
+        if (stop_seen) { return true; }
+        try { stop_seen = stopped && stopped(); }
+        catch (...) {
+            stop_error = std::current_exception();
+            stop_seen = true;
+        }
+        return stop_seen;
+    }
+
     void check_cancelled(const char * boundary) {
-        if (stopped && stopped()) {
+        if (cancelled()) {
             failed = true;
+            if (stop_error) { std::rethrow_exception(stop_error); }
             throw std::runtime_error(std::string("cancelled ") + boundary);
         }
     }
@@ -136,6 +162,7 @@ struct native_execution::impl {
                 throw std::logic_error("TQRelay did not retire completed native work");
             }
             llama_attention_clear_views(context.get());
+            if (status == 2) { check_cancelled("during native execution"); }
             if (status != 0) {
                 throw std::runtime_error("A decode failed at frontier " + std::to_string(frontier) +
                                          " with status " + std::to_string(status) + "; episode cannot continue");
@@ -163,6 +190,8 @@ struct native_execution::impl {
 
     options config;
     std::function<bool()> stopped;
+    std::exception_ptr stop_error;
+    bool stop_seen = false;
     std::vector<ggml_backend_dev_t> devices;
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model{nullptr, llama_model_free};
     const llama_vocab * vocabulary = nullptr;
@@ -187,6 +216,9 @@ std::uint32_t native_execution::kv_capacity() const noexcept { return llama_n_ct
 std::uint32_t native_execution::sequence_capacity() const noexcept { return llama_n_seq_max(state_->context.get()); }
 std::uint64_t native_execution::compute_bytes() const noexcept { return llama_memory_compute_bytes(state_->context.get()); }
 bool native_execution::drained() const noexcept { return state_->is_drained; }
+bool native_execution::pipeline_parallel_enabled() const noexcept {
+    return llama_get_pipeline_parallel(state_->context.get());
+}
 
 std::string native_execution::device_summary() const {
     std::string output = "[";
@@ -202,29 +234,67 @@ std::string native_execution::device_summary() const {
     return output;
 }
 
+std::string native_execution::context_summary() const {
+    const auto * context = state_->context.get();
+    const auto type_name = [](ggml_type type) {
+        return type == GGML_TYPE_COUNT ? "unavailable" : ggml_type_name(type);
+    };
+    std::ostringstream output;
+    output << "{\"pipeline_parallel_enabled\":" << (pipeline_parallel_enabled() ? "true" : "false")
+           << ",\"flash_attention_configured\":" << (llama_get_flash_attention(context) ? "true" : "false")
+           << ",\"batch_invariant_matmul_requested\":" << (llama_get_batch_invariant_matmul(context) ? "true" : "false")
+           << ",\"batch_size\":" << llama_n_batch(context)
+           << ",\"ubatch_size\":" << llama_n_ubatch(context)
+           << ",\"kv_type_k\":" << json_string(type_name(llama_get_kv_cache_type_k(context)))
+           << ",\"kv_type_v\":" << json_string(type_name(llama_get_kv_cache_type_v(context)))
+           << ",\"reader_kv_policy\":\"resident-f32\""
+           << ",\"reader_kv_policy_reason\":" << json_string(
+               "This reader implementation accepts only resident F32 K and V; other types need a verified reader precision path.")
+           << ",\"model_devices\":[";
+    const auto count = llama_model_n_devices(state_->model.get());
+    for (int index = 0; index < count; ++index) {
+        const auto device = llama_model_get_device(state_->model.get(), index);
+        if (index != 0) { output << ','; }
+        output << "{\"name\":" << json_string(ggml_backend_dev_name(device))
+               << ",\"description\":" << json_string(ggml_backend_dev_description(device))
+               << ",\"scope\":\"model-selected\"}";
+    }
+    output << "]}";
+    return output.str();
+}
+
 void native_execution::prefill(const std::vector<llama_token> & tokens) {
     auto & state = *state_;
     state.check_cancelled("before base prefill");
     if (state.base_ready || tokens.empty() || tokens.size() > context_size()) {
         throw std::invalid_argument("invalid or duplicate C_base prefill");
     }
-    for (std::size_t begin = 0; begin < tokens.size();) {
-        const auto count = std::min(tokens.size() - begin, std::size_t(llama_n_batch(state.context.get())));
-        auto & batch = state.batch->value;
-        batch.n_tokens = std::int32_t(count);
-        for (std::size_t index = 0; index < count; ++index) {
-            batch.token[index] = tokens[begin + index];
-            batch.pos[index] = llama_pos(begin + index);
-            batch.n_seq_id[index] = 1;
-            batch.seq_id[index][0] = 0;
-            batch.logits[index] = begin + index + 1 == tokens.size();
+    bool advanced = false;
+    try {
+        for (std::size_t begin = 0; begin < tokens.size();) {
+            const auto count = std::min(tokens.size() - begin, std::size_t(llama_n_batch(state.context.get())));
+            auto & batch = state.batch->value;
+            batch.n_tokens = std::int32_t(count);
+            for (std::size_t index = 0; index < count; ++index) {
+                batch.token[index] = tokens[begin + index];
+                batch.pos[index] = llama_pos(begin + index);
+                batch.n_seq_id[index] = 1;
+                batch.seq_id[index][0] = 0;
+                batch.logits[index] = begin + index + 1 == tokens.size();
+            }
+            state.submit(0);
+            advanced = true;
+            begin += count;
         }
-        state.submit(0);
-        begin += count;
+        state.check_cancelled("after base prefill");
+        state.active[0] = true;
+        state.base_ready = true;
+    } catch (...) {
+        // submit owns the actual drain. A completed earlier batch still
+        // prevents retry if preparing a later batch throws before submit.
+        if (advanced) { state.failed = true; }
+        throw;
     }
-    state.check_cancelled("after base prefill");
-    state.active[0] = true;
-    state.base_ready = true;
 }
 
 void native_execution::start(tq::rerot::StageId stage) {
@@ -284,53 +354,62 @@ std::vector<output_row> native_execution::forward(std::uint64_t frontier, const 
         depth = std::max(depth, indices.size());
     }
     std::vector<output_row> outputs;
-    for (std::size_t token = 0; token < depth; ++token) {
-        std::vector<std::size_t> wave;
-        for (const auto stage : stage_order) {
-            if (token < by_stage[stage].size()) { wave.push_back(by_stage[stage][token]); }
-        }
-        for (std::size_t begin = 0; begin < wave.size();) {
-            state.check_cancelled("before native wave preparation");
-            const auto count = std::min(wave.size() - begin, std::size_t(llama_n_batch(state.context.get())));
-            std::vector<std::vector<llama_attention_entry>> entries(count);
-            std::vector<llama_attention_view> views;
-            views.reserve(count);
-            auto & batch = state.batch->value;
-            batch.n_tokens = std::int32_t(count);
-            for (std::size_t index = 0; index < count; ++index) {
-                const auto & row = rows[wave[begin + index]];
-                const auto expanded = tq::rerot::expand(row.view, kv_capacity());
-                entries[index].reserve(expanded.size());
-                for (const auto & entry : expanded) {
-                    if (entry.stage >= state.active.size()) { throw std::logic_error("reader names an unknown key owner"); }
-                    entries[index].push_back({llama_seq_id(entry.stage), position(entry.storage_pos), position(entry.virtual_pos)});
+    bool advanced = false;
+    try {
+        for (std::size_t token = 0; token < depth; ++token) {
+            std::vector<std::size_t> wave;
+            for (const auto stage : stage_order) {
+                if (token < by_stage[stage].size()) { wave.push_back(by_stage[stage][token]); }
+            }
+            for (std::size_t begin = 0; begin < wave.size();) {
+                state.check_cancelled("before native wave preparation");
+                const auto count = std::min(wave.size() - begin, std::size_t(llama_n_batch(state.context.get())));
+                std::vector<std::vector<llama_attention_entry>> entries(count);
+                std::vector<llama_attention_view> views;
+                views.reserve(count);
+                auto & batch = state.batch->value;
+                batch.n_tokens = std::int32_t(count);
+                for (std::size_t index = 0; index < count; ++index) {
+                    const auto & row = rows[wave[begin + index]];
+                    const auto expanded = tq::rerot::expand(row.view, kv_capacity());
+                    entries[index].reserve(expanded.size());
+                    for (const auto & entry : expanded) {
+                        if (entry.stage >= state.active.size()) { throw std::logic_error("reader names an unknown key owner"); }
+                        entries[index].push_back({llama_seq_id(entry.stage), position(entry.storage_pos), position(entry.virtual_pos)});
+                    }
+                    views.push_back({llama_seq_id(row.stage), row.position, position(row.view.query_virtual_pos()),
+                                     entries[index].size(), entries[index].data()});
+                    batch.token[index] = row.token;
+                    batch.pos[index] = row.position;
+                    batch.n_seq_id[index] = 1;
+                    batch.seq_id[index][0] = llama_seq_id(row.stage);
+                    batch.logits[index] = row.logits;
                 }
-                views.push_back({llama_seq_id(row.stage), row.position, position(row.view.query_virtual_pos()),
-                                 entries[index].size(), entries[index].data()});
-                batch.token[index] = row.token;
-                batch.pos[index] = row.position;
-                batch.n_seq_id[index] = 1;
-                batch.seq_id[index][0] = llama_seq_id(row.stage);
-                batch.logits[index] = row.logits;
+                if (!llama_attention_set_views(state.context.get(), views.data(), views.size())) {
+                    state.failed = true;
+                    throw std::runtime_error("A rejected the prepared reader views before native execution");
+                }
+                state.submit(frontier);
+                advanced = true;
+                for (std::size_t index = 0; index < count; ++index) {
+                    const auto & row = rows[wave[begin + index]];
+                    if (!row.logits) { continue; }
+                    const auto data = llama_get_logits_ith(state.context.get(), std::int32_t(index));
+                    if (!data) { state.failed = true; throw std::runtime_error("A returned no logits for a requested stage row"); }
+                    const auto size = std::size_t(llama_vocab_n_tokens(state.vocabulary));
+                    outputs.push_back({row.stage, std::vector<float>(data, data + size)});
+                }
+                state.check_cancelled("after native wave");
+                begin += count;
             }
-            if (!llama_attention_set_views(state.context.get(), views.data(), views.size())) {
-                state.failed = true;
-                throw std::runtime_error("A rejected the prepared reader views before native execution");
-            }
-            state.submit(frontier);
-            for (std::size_t index = 0; index < count; ++index) {
-                const auto & row = rows[wave[begin + index]];
-                if (!row.logits) { continue; }
-                const auto data = llama_get_logits_ith(state.context.get(), std::int32_t(index));
-                if (!data) { state.failed = true; throw std::runtime_error("A returned no logits for a requested stage row"); }
-                const auto size = std::size_t(llama_vocab_n_tokens(state.vocabulary));
-                outputs.push_back({row.stage, std::vector<float>(data, data + size)});
-            }
-            state.check_cancelled("after native wave");
-            begin += count;
         }
+        return outputs;
+    } catch (...) {
+        // The completed waves cannot be rolled back. This also covers output
+        // allocation and later view preparation, outside submit's own catch.
+        if (advanced) { state.failed = true; }
+        throw;
     }
-    return outputs;
 }
 
 } // namespace tq::rerot_compose

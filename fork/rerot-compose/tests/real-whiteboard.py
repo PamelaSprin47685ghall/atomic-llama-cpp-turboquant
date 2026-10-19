@@ -151,7 +151,28 @@ def expand(reader, context):
     return dict(groups), order
 
 
-def validate_trace(events, workers, parallel, edges, min_growth):
+def predecessor_sets(workers, edges):
+    """Find all ancestors, including indirect dependencies, without using B."""
+    before = defaultdict(list)
+    for parent, child in edges:
+        before[child].append(parent)
+    ancestors = {}
+    for stage in range(1, workers + 1):
+        seen = set()
+        pending = list(before[stage])
+        while pending:
+            parent = pending.pop()
+            if parent not in seen:
+                seen.add(parent)
+                pending.extend(before[parent])
+        ancestors[stage] = seen
+    # Synthesis has an implicit dependency on every worker.
+    ancestors[workers + 1] = set(range(1, workers + 1))
+    return ancestors
+
+
+def validate_trace(events, workers, parallel, edges, min_growth, phase_mode=None,
+                   require_completed_nonancestor=False):
     """Check publication with prior committed keys, never with current peers."""
     need(bool(events) and events[0]["event"] == "config", "missing initial config")
     config = events[0]
@@ -166,23 +187,35 @@ def validate_trace(events, workers, parallel, edges, min_growth):
     need(number(config.get("base_tokens"), 1), "empty base prefix")
     need(number(config.get("logical_sequences"), synthesis + 1),
          "logical sequence identities cannot hold the requested stages")
+    need(type(config.get("phase_memory")) is bool, "configured phase-memory mode is missing")
+    if phase_mode is not None:
+        need(phase_mode in ("release", "retain"), "invalid requested phase-memory mode")
+        need(config["phase_memory"] == (phase_mode == "release"),
+             "configured phase-memory mode differs from the request")
 
     groups = []
     result = None
+    pending_release = None
     for index, event in enumerate(events[1:], 1):
         kind = event["event"]
         need(result is None, "an event was emitted after the completed result")
         if kind == "frontier":
-            groups.append((event, []))
+            groups.append((event, [], pending_release))
+            pending_release = None
         elif kind == "result":
             need(index == len(events) - 1 and event.get("complete") is True,
                  "result is incomplete or not terminal")
+            need(pending_release is None, "compute release has no following frontier")
             result = event
         elif kind == "error":
             raise ContractError("native run failed: " + str(event.get("message")))
         elif kind == "compute_release":
             need(number(event.get("before")) and number(event.get("after")),
                  "invalid compute release observation")
+            need(config["phase_memory"], "retain mode emitted a compute release")
+            need(pending_release is None, "one transition emitted duplicate compute releases")
+            need(event["after"] == 0, "compute release retained transient allocation")
+            pending_release = event
         else:
             need(kind in ("token", "text", "sealed", "logits") and bool(groups),
                  f"unexpected or premature event: {kind}")
@@ -207,8 +240,13 @@ def validate_trace(events, workers, parallel, edges, min_growth):
     maximum_rows = 0
     trace_tokens = []
     stage_frames = {}
+    previous_frame = False
+    releases = []
+    ancestors = predecessor_sets(workers, edges)
+    sealed_at = {}
+    nonancestor_witnesses = {}
 
-    for expected_frontier, (frontier, after) in enumerate(groups, 1):
+    for expected_frontier, (frontier, after, release) in enumerate(groups, 1):
         stamp = f"frontier {expected_frontier}"
         need(frontier.get("frontier") == expected_frontier, stamp + ": skipped or duplicate commit")
         read_revision = frontier.get("read_revision")
@@ -226,6 +264,14 @@ def validate_trace(events, workers, parallel, edges, min_growth):
         need(all(number(pen) and pen < config["parallel"] for pen in pens), stamp + ": invalid pen")
         need(len(set(pens)) == len(pens), stamp + ": two readers share a resident pen")
         need(set(alive).issubset(ids), stamp + ": a live insertion point was omitted")
+        has_frame = any(reader.get("starting") is True for reader in readers)
+        expected_release = config["phase_memory"] and previous_frame and not has_frame
+        need((release is not None) == expected_release,
+             stamp + ": compute release is missing or outside a FRAME-to-BODY transition")
+        if release is not None:
+            releases.append({"before_frontier": expected_frontier,
+                             "before": release["before"], "after": release["after"]})
+        previous_frame = has_frame
         tokens = {}
         ends = set()
         for event in after:
@@ -280,6 +326,12 @@ def validate_trace(events, workers, parallel, edges, min_growth):
                      stamp + f": reader {stage} did not see exactly the prior committed public keys of {peer}")
                 pair = (stage, peer)
                 count = len(public[peer])
+                if peer in sealed and peer not in ancestors[stage] and bodies[peer] > 0:
+                    nonancestor_witnesses.setdefault(pair, {
+                        "reader": stage, "peer": peer, "frontier": expected_frontier,
+                        "peer_sealed_at_frontier": sealed_at[peer],
+                        "public_keys": count, "body_tokens": bodies[peer],
+                    })
                 previous = previously_visible.get(pair)
                 if peer in alive and bodies[peer] > 0:
                     body_reads += 1
@@ -332,12 +384,17 @@ def validate_trace(events, workers, parallel, edges, min_growth):
         need(step_sealed == ends, stamp + ": source-end token was not retired exactly once")
         for stage in ends:
             sealed.add(stage)
+            sealed_at[stage] = expected_frontier
             del alive[stage]
 
     need(not alive and sealed == set(range(1, synthesis + 1)), "not every source retired")
     need(result.get("revision") == revision, "result revision differs from the last commit")
     need(result.get("text") == texts[synthesis], "result does not equal the committed text stream")
     need(result.get("body_tokens") == bodies[synthesis], "result token count includes uncommitted tokens")
+    need(not config["phase_memory"] or bool(releases),
+         "release mode never exercised a FRAME-to-BODY compute release")
+    need(not require_completed_nonancestor or bool(nonancestor_witnesses),
+         "insufficient coverage: no reader observed BODY work from a completed non-ancestor")
     if min_growth:
         need(max(growth.values(), default=0) >= min_growth,
              "insufficient coverage: no concurrent reader observed the required peer token increments")
@@ -346,6 +403,13 @@ def validate_trace(events, workers, parallel, edges, min_growth):
         "frontiers": len(groups), "maximum_readers": maximum_readers,
         "maximum_rows": maximum_rows, "body_tokens_by_stage": dict(bodies),
         "frame_tokens_by_stage": stage_frames, "peer_body_reads_while_running": body_reads,
+        "phase_memory": {"status": "PASS", "mode": "release" if config["phase_memory"] else "retain",
+                         "releases": releases},
+        "completed_nonancestor_visibility": {
+            "status": "PASS" if nonancestor_witnesses else "NOT_QUALIFIED",
+            "required": require_completed_nonancestor,
+            "witnesses": [value for _, value in sorted(nonancestor_witnesses.items())],
+        },
         "peer_growth_witnesses": [
             {"reader": pair[0], "peer": pair[1], "increments": count}
             for pair, count in sorted(growth.items())
@@ -490,11 +554,12 @@ def arguments():
         "Both writers may give the same answer; agreement is expected. "
         "Give the requested brief reply and finish your turn."))
     parser.add_argument("--stage", action="append",
-                        help="Replace the default three-worker fixture; repeat NAME=INSTRUCTION")
+                        help="Replace the default four-worker fixture; repeat NAME=INSTRUCTION")
     parser.add_argument("--after", action="append", default=[], help="CHILD=PARENT; repeat")
     parser.add_argument("--synthesis", default="Reply with the single word complete.")
     parser.add_argument("--chat-template")
-    parser.add_argument("--parallel", type=positive, default=2)
+    parser.add_argument("--parallel", type=positive, default=2,
+                        help="Resident pens; two pens guarantee the default non-ancestor witness")
     parser.add_argument("--ctx-size", type=positive, default=4096)
     parser.add_argument("--total-kv", type=positive)
     parser.add_argument("--batch-size", type=positive, default=512)
@@ -550,6 +615,7 @@ def main():
 
     save()
     try:
+        receipt["driver"] = fingerprint(Path(__file__))
         receipt["binary"] = fingerprint(binary)
         receipt["model_shards"] = [fingerprint(path) for path in model_files(model)]
         receipt["additional_artifacts"] = [fingerprint(path) for path in args.artifact]
@@ -571,16 +637,26 @@ def main():
         stages = args.stage or [
             "writer_a=Reply with only this sentence: Shared work brings us to the same answer.",
             "writer_b=Reply with only this sentence: Shared work brings us to the same answer.",
+            "observer=This turn is the observer's task. The earlier copying instructions belong to the writers. "
+            "Read their shared work. Reply with exactly the literal lowercase word \"observed\" "
+            "(without quotation marks), then finish your turn.",
             "ready=Reply with the single word ready.",
         ]
-        after = args.after if args.stage else ["ready=writer_a", "ready=writer_b", *args.after]
+        # With two occupied pens, the independent observer cannot start until
+        # a writer seals. That completed writer is its non-ancestor, regardless
+        # of which writer ends first. The final worker separately checks joins.
+        after = args.after if args.stage else [
+            "ready=writer_a", "ready=writer_b", "ready=observer", *args.after,
+        ]
         receipt["fixture"] = {
+            "profile": "caller-supplied" if args.stage else "cooperative-nonancestor-join-v1",
             "instructions": "caller supplied" if args.stage else "cooperative shared whiteboard",
             "worker_token_budget": args.worker_tokens,
             "synthesis_token_budget": args.final_tokens,
             "end_condition": "native model EOG; token-budget exhaustion is an error",
             "reasoning_tokens_count_toward_budget": True,
             "different_worker_wording_required": False,
+            "completed_nonancestor_witness_required": not args.stage,
         }
         stage_names = [item.split("=", 1)[0] for item in stages]
         need(len(set(stage_names)) == len(stages), "duplicate fixture stage")
@@ -649,7 +725,8 @@ def main():
                                       if item["event"] == "error"), "no structured error")
                         raise ContractError(f"{name}: inference exited {run['returncode']}: {error}")
                     run["contract"] = validate_trace(events, len(stages), args.parallel, edges,
-                                                     args.min_peer_growth)
+                                                     args.min_peer_growth, phase,
+                                                     require_completed_nonancestor=not args.stage)
                     run["contract_status"] = "PASS"
                     stderr = Path(run["stderr"]["path"]).read_text(encoding="utf-8", errors="replace")
                     run["placement"] = placement(stderr)

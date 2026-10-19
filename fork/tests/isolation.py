@@ -151,7 +151,7 @@ def main():
     batch_compose = module("batch-compose", (prefix_a, scheduling, text_package))
     logits_compose = module("logits-compose", (prefix_a,))
     imatrix_compose = module("imatrix-compose", (prefix_a, calibration))
-    rerot_compose = module("rerot-compose", (prefix_a, rerot, relay, text_package))
+    rerot_compose = module("rerot-compose", (prefix_a, rerot, relay, text_package, sampling))
     conversion_test = output / "imatrix-conversion.py"
     shutil.copyfile(root / "fork/imatrix-compose/tests/test_conversion.py", conversion_test)
     rerot_cli_test = output / "rerot-cli.py"
