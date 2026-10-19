@@ -8,9 +8,15 @@ A 为 AtomicBot-ai/atomic-llama-cpp-turboquant 的 master，`cda0f9256665845cd9d
 
 迁移按具体行为作决定。一个大模块暂未迁入，不构成丢弃其小工具、数学函数、协议或内存策略的理由；发现旧实现错误，也不构成功能目的无价值的证明。无内容证据的项目保持待审或保留候选。
 
+## 2026-10-19：TP5 重写后的文本候选
+
+用户已重新实现 TP5，当前路线以 [relay](relay/README.md)、[relay-probe](relay-probe/README.md) 和各自运行记录为准。其余有价值的细节已整理为 [REWRITE-CANDIDATES.md](REWRITE-CANDIDATES.md)：33 组详细条目、20 条后端小项、10 条模型/调度补充，以及原论文与最低验收条件。
+
+本次所有新增候选均只作文本记录，不迁入未证实工作的旧代码，不新增模型/设备资格。新文档另纠正在线 corpus 的事件时机、重复 uint64 saver、M29 状态恢复归因及普通输出容量的已有 A 能力；原总账和历史运行身份保持不变。
+
 ## 已迁入并有真实消费者的能力
 
-表中的此前 CPU / Vulkan、HTTP、corpus 与 logits 数值沿用各自原运行身份；没有因新增库而把旧结果记为本轮重跑。本轮已完成五个 B、五个 C 的 CPU archive/isolation、两个新增 B 的 sanitizer 测试和校准格式互操作；最终 Vulkan 同形状流式模型对照与 scratch / 输入别名专项回归也已通过；完整算子门的失败记录另列，不合并成全后端通过。具体命令与范围见 [VALIDATION.md](VALIDATION.md)。
+表中的此前 CPU / Vulkan、HTTP、corpus 与 logits 数值沿用各自原运行身份；没有因新增库而把旧结果记为本轮重跑。2026-10-18 细节迁移批次已完成五个 B、五个 C 的 CPU archive/isolation、两个新增 B 的 sanitizer 测试和校准格式互操作；最终 Vulkan 同形状流式模型对照与 scratch / 输入别名专项回归也已通过；完整算子门的失败记录另列，不合并成全后端通过。具体命令与范围见 [VALIDATION.md](VALIDATION.md)。
 
 | 行为 | 当前实现 | 保留的合同与证据 |
 |---|---|---|
@@ -75,7 +81,7 @@ A 为 AtomicBot-ai/atomic-llama-cpp-turboquant 的 master，`cda0f9256665845cd9d
 | recurrent 清零 | M33 已重新判断：复用当前 A，不迁旧 eager clear | 历史907–935 ms →12.8–16.8 ms减少的是旧 fork 自己加入的清零。当前 A 已有整 buffer / lazy init；加入旧路径会增加写与 fence。公开生命周期测试通过；HTTP取消、GDN / MTP仍需自己的验证 |
 | 重试与输出 | 已输出文本游标、预算 / usage 聚合、首块语义、重试恢复 | C 拥有 HTTP 请求与 sampler；必须验证随机状态、取消和部分输出，不能只比较最后 token 总数 |
 | 请求 / 文本协议 | cache affinity、按 lane 拼完整行、thinking parser、usage 只计算一次 prompt | UTF-8 / stop 用途已由 TQText 和 batch C 重建；完整多 choice / SSE / 取消仍由真实 HTTP C 验收，旧非流式 fastpath 的性能需另测 |
-| 在线 corpus 录制 | 请求结束时录制真实 token 路径、种类、时间戳，供后续校准与回放 | B 的生产格式已经恢复；在线请求生命周期仍需 C 消费，离线 `llama-corpus build` 不等于原 server 录制钩子 |
+| 在线 corpus 录制 | 入队前记录模板/tokenization 后的请求输入、种类与时间戳，供校准与回放；不是请求成功结束后的生成输出 | B 的生产格式已经恢复；在线事件身份、失败/重试和重启完整性仍需 C。离线构建不等于旧 server 钩子，见 [E04](REWRITE-CANDIDATES.md#e04--在线输入-corpus事件身份与重启完整性) |
 | 退出与失败 | signal 自管道、正常线程清理、第二信号、LoRA 失败传播 | C 生命周期职责；错误必须传给真实调用者，不能靠测试环境替代实际队列 |
 | grammar / sampler | grammar 替换、clone 后结果所有权、实例级 Turbo 配置、额外 RNG draw 语义 | 使用公开 A sampler 原语；消除对私有 distribution 对象的强转，专测后续随机状态 |
 | 模型 / GGUF | BailingMoE3 名称及缺省兼容、缺失 MTP 权重、uint64 PLE hash | 上游实际消费者和 GGUF 元数据校验；每个兼容点独立提交，不整包恢复所有图修改 |
@@ -126,7 +132,7 @@ G44 原候选建议 Turbo SET_ROWS 拒绝 F16 source，前提是只编译 F32 sh
 
 | 能力 | 当前判断 | 重新进入的条件 |
 |---|---|---|
-| TP5 / LateBind / relay / device loop | 历史有59.66 →65.17 tok/s的实质收益，不能称无用；整条私有 runtime 暂留归档。纯计划 / 数学 / 账本职责已提取为 `fork/relay`（TQRelay，指南 30–39、50、52、54 的设备无关合同），纯 CPU 构建、测试、ASan/UBSan 与安装后搬迁消费已通过 | 平台探针（指南 M0c）与 A 必需的最小执行 / 生命周期接口尚未落地；明确后接真实算子与五卡负载验证 |
+| TP5 / LateBind / relay / device loop | 已进入用户重写路线：独立 [TQRelay](relay/README.md) 与 [relay-probe](relay-probe/README.md)。旧私有 runtime 保留归档，不再作为待迁移项；59.66 →65.17 tok/s 仍仅属旧运行身份 | 平台探针已经落地。单设备协议、五 rank 索引 fixture、真实五设备 probe 和整模型五卡负载分别记录资格；以当前模块文档与 [VALIDATION.md](VALIDATION.md) 为准，不用历史收益或局部 probe 替代新路线的完整运行证据 |
 | RERoT | 普通多请求、corpus 前缀重放或独立 parser 不具备其多 reader 共享 KV / 可见性语义 | 明确同 context、同 owner、动态可见性、recurrent / RNG 隔离协议，验证真实 reader 行为 |
 | FlashPrefill / TriAttention | 独立数学、格式和状态封装有价值；历史 online value accumulation 的局部 prefill 约 +31%，但 greedy 输出变化、部分检索失败，整体验收未闭合 | 固定模型 / 上下文 / 质量门，公开消费者和最小接缝，避免把局部 kernel 测试当整模型证明 |
 | XKV-SR | 槽位元数据、codec、预算和验证可拆；完整量化存储 / 图 / 事务运行时暂未迁 | payload、实际驻留、质量、吞吐与共享状态失败回滚同时验收 |

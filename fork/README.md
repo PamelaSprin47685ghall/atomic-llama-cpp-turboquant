@@ -6,6 +6,8 @@
 
 完整清单与取舍见 [AUDIT.md](AUDIT.md)、[MIGRATION.md](MIGRATION.md)，实际运行记录见 [VALIDATION.md](VALIDATION.md)。未迁入的有用能力仍是保留候选；旧实现与证据保存在 `archive/pre-clean-20261018`。
 
+TP5 重写后的剩余细节与原始论文索引见 [REWRITE-CANDIDATES.md](REWRITE-CANDIDATES.md)。本次只记录文本候选及验收条件；已经属于 A 的能力和缺少证据的旧实现不会因列入清单而迁入。
+
 ## A / B / C 的职责
 
 | 参与者 | 完整职责 | 声明依赖 |

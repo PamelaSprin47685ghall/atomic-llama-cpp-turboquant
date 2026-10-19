@@ -4,6 +4,8 @@
 
 当前迁入状态见 [MIGRATION.md](MIGRATION.md)，实际运行资格见 [VALIDATION.md](VALIDATION.md)。本页和分册用于回答“在哪里看过什么、还有什么价值、哪些证据不能使用”，不替代构建或运行验证。
 
+2026-10-19 的 [剩余重写候选](REWRITE-CANDIDATES.md) 基于用户新 TP5 路线重新去重，记录具体用途、旧入口、证据缺口、原始来源和未来验收。所有新增候选仅为文本。本次还纠正 S03 的重复 uint64 分支、M29 的原有 QSA ext 恢复和普通输出容量归因；历史分册保留原阅读记录，以该文的纠正说明回查。
+
 ## 来源和分母
 
 | 对象 | 固定身份或范围 |
@@ -136,7 +138,7 @@ finding ID 与来源分册一起引用；例如下表的 `small:S04` 是校准�
 
 TP5 / LateBind 有历史实质收益；RERoT、FlashPrefill、TriAttention、XKV 各有可拆的小能力。当前不引入其整条私有运行时，但不会把它们归成“无用”或借其他测试的通过宣称完成。旧实现及实验资料仍在归档提交中。
 
-当前工作分支提供五个独立 B 与五个 C；A 的实际变动由 [upstream-exceptions.json](upstream-exceptions.json) 固定文件、内容、消费者与退出条件，运行资格由 [VALIDATION.md](VALIDATION.md) 逐项给出。本轮新增证据另见 [发布候选说明](RELEASE-NOTES.md)，不改写上面的历史源码阅读深度。新增小行为按职责拆成提交；每个包含 A 变动的提交携带对应当时源码的完整文件摘要，不把未来状态的摘要提前塞入旧提交。
+2026-10-18 细节迁移批次交付五个独立 B 与五个 C；用户随后增加第六个 B `TQRelay` 和独立平台探针 `relay-probe`，当前入口与各自范围见 [README.md](README.md)。A 的实际变动由 [upstream-exceptions.json](upstream-exceptions.json) 固定文件、内容、消费者与退出条件，运行资格由 [VALIDATION.md](VALIDATION.md) 逐项给出。该细节批次新增证据另见 [发布候选说明](RELEASE-NOTES.md)，不改写上面的历史源码阅读深度。新增小行为按职责拆成提交；每个包含 A 变动的提交携带对应当时源码的完整文件摘要，不把未来状态的摘要提前塞入旧提交。
 
 ## 如何回查
 
