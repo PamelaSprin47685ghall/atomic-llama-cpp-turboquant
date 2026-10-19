@@ -175,9 +175,12 @@ public:
         context.yarn_ext_factor = 0.0f;
         context.yarn_attn_factor = amplitude_;
         context.no_perf = true;
+        context_params_ = context;
         context_.reset(llama_init_from_model(model_.get(), context));
         require(context_ != nullptr && llama_attention_views_supported(context_.get()),
                 "actual A does not support this fixture's reader views");
+        require(llama_attention_views_unsupported_reason(context_.get()) == nullptr,
+                "supported reader profile has an unsupported reason");
         require(!placement.failed, "could not retain actual placement evidence");
         gpu_layers_observed_ = placement.gpu_layers;
         placement_evidence_ = std::move(placement.lines);
@@ -186,6 +189,62 @@ public:
     }
 
     ~fixture() { if (context_) { llama_synchronize(context_.get()); } }
+
+    std::size_t verify_unsupported_profiles() {
+        const llama_attention_entry entry{0, 0, 0};
+        const llama_attention_view view{0, 0, 0, 1, &entry};
+        require(llama_attention_set_views(context_.get(), &view, 1),
+                "supported profile rejected the capability test's valid view");
+        llama_attention_clear_views(context_.get());
+
+        std::size_t rejected = 0;
+        const auto check = [&](llama_context * context, const char * detail) {
+            const char * reason = llama_attention_views_unsupported_reason(context);
+            require(reason != nullptr && std::strstr(reason, detail) != nullptr,
+                    std::string("wrong unsupported-profile reason for ") + detail + ": " +
+                    (reason ? reason : "<supported>"));
+            require(!llama_attention_views_supported(context),
+                    "boolean capability query disagrees with the public reason");
+            require(!llama_attention_set_views(context, &view, 1),
+                    "unsupported profile accepted a reader view");
+            ++rejected;
+        };
+        const auto restored = [&]() {
+            require(llama_attention_views_supported(context_.get()) &&
+                    llama_attention_views_unsupported_reason(context_.get()) == nullptr,
+                    "restoring a supported mode did not restore reader capability");
+        };
+        check(nullptr, "context is null");
+        llama_set_embeddings(context_.get(), true);
+        check(context_.get(), "embedding output");
+        llama_set_embeddings(context_.get(), false);
+        restored();
+        llama_set_causal_attn(context_.get(), false);
+        check(context_.get(), "causal attention");
+        llama_set_causal_attn(context_.get(), true);
+        restored();
+
+        const auto profile = [&](llama_context_params params, const char * detail) {
+            std::unique_ptr<llama_context, decltype(&llama_free)> context(
+                llama_init_from_model(model_.get(), params), llama_free);
+            require(context != nullptr, std::string("could not create actual profile: ") + detail);
+            check(context.get(), detail);
+        };
+        auto params = context_params_;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        profile(params, "Flash Attention");
+        params = context_params_;
+        params.type_k = GGML_TYPE_F16;
+        profile(params, "K cache");
+        params = context_params_;
+        params.type_v = GGML_TYPE_F16;
+        profile(params, "V cache");
+        params = context_params_;
+        params.kv_unified = false;
+        params.n_ctx_kv = 0;
+        profile(params, "unified KV cache");
+        return rejected;
+    }
 
     struct row {
         llama_seq_id seq;
@@ -410,6 +469,7 @@ private:
     float amplitude_;
     int gpu_layers_requested_ = 0;
     int gpu_layers_observed_ = 0;
+    llama_context_params context_params_{};
     std::vector<std::string> placement_evidence_;
     bool serial_cohort_ = false;
     bool reversed_ = false;
@@ -442,11 +502,15 @@ int main(int argc, char ** argv) {
         std::ostringstream receipt;
         receipt << std::setprecision(17) << "{\"status\":\"PASS\",\"scope\":\"actual A graph vs independent F64 logits\",\"cases\":[";
         bool first = true;
+        std::size_t unsupported_profiles = 0;
         for (const auto & arch : {std::string("llama"), std::string("qwen2")}) {
             for (const float amplitude : {1.0f, 1.375f}) {
                 for (const bool reverse : {false, true}) {
                     for (const bool serial : {false, true}) {
                         fixture test(arch, head_width, arch == "qwen2", amplitude, gpu_layers);
+                        if (first && gpu_layers == 0) {
+                            unsupported_profiles = test.verify_unsupported_profiles();
+                        }
                         test.run(reverse, serial);
                         if (!first) { receipt << ','; } first = false;
                         test.print(receipt);
@@ -454,7 +518,7 @@ int main(int argc, char ** argv) {
                 }
             }
         }
-        receipt << "]}\n";
+        receipt << "],\"unsupported_profile_checks\":" << unsupported_profiles << "}\n";
         std::cout << receipt.str();
         return 0;
     } catch (const std::exception & error) {

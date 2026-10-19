@@ -124,6 +124,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         cparams.n_rs_seq = 0;
     }
     cparams.gdn_replay = params.gdn_replay;
+    cparams.batch_invariant_matmul = params.batch_invariant_matmul;
 
     cparams.n_threads            = params.n_threads;
     cparams.n_threads_batch      = params.n_threads_batch;
@@ -1593,14 +1594,46 @@ llama_kv_cache * llama_context::attention_view_cache() const {
     return nullptr;
 }
 
-bool llama_context::attention_views_supported() const {
+const char * llama_context::attention_views_unsupported_reason() const {
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        return "reader views require the default context role";
+    }
+    if (!cparams.causal_attn) {
+        return "reader views require causal attention";
+    }
+    if (cparams.embeddings) {
+        return "reader views are unavailable while embedding output is enabled";
+    }
+    if (!cparams.kv_unified) {
+        return "reader views require a unified KV cache";
+    }
+    if (cparams.kv_stream_arena_mib != 0) {
+        return "reader views do not support the shared KV streaming arena";
+    }
+    if (cparams.flash_attn) {
+        return "Flash Attention must be disabled for reader-view attention";
+    }
+    if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        return "reader views do not support sliding-window attention";
+    }
+    if (model.hparams.f_max_alibi_bias != 0) {
+        return "reader views do not support ALiBi attention bias";
+    }
+    if (model.hparams.n_pos_per_embd() != 1) {
+        return "reader views require one text RoPE position per token";
+    }
+    if (model.hparams.use_kq_norm) {
+        return "reader views do not support post-RoPE K/Q normalization";
+    }
     const auto * cache = attention_view_cache();
-    if (!cache || !cparams.kv_unified || !cparams.causal_attn || cparams.embeddings ||
-        cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.kv_stream_arena_mib != 0 ||
-        model.hparams.swa_type != LLAMA_SWA_TYPE_NONE || model.hparams.f_max_alibi_bias != 0 ||
-        model.hparams.n_pos_per_embd() != 1 || model.hparams.use_kq_norm ||
-        cache->type_k() != GGML_TYPE_F32 || cache->type_v() != GGML_TYPE_F32) {
-        return false;
+    if (!cache) {
+        return "context has no supported resident attention cache";
+    }
+    if (cache->type_k() != GGML_TYPE_F32) {
+        return "reader-view K cache must use GGML_TYPE_F32";
+    }
+    if (cache->type_v() != GGML_TYPE_F32) {
+        return "reader-view V cache must use GGML_TYPE_F32";
     }
     switch (model.arch) {
         case LLM_ARCH_LLAMA:
@@ -1611,10 +1644,14 @@ bool llama_context::attention_views_supported() const {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
-            return true;
+            return nullptr;
         default:
-            return false;
+            return "model architecture is not supported by reader-view attention";
     }
+}
+
+bool llama_context::attention_views_supported() const {
+    return attention_views_unsupported_reason() == nullptr;
 }
 
 bool llama_context::set_attention_views(const llama_attention_view * views, size_t count) {
@@ -4666,6 +4703,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_stream_arena_mib         =*/0,
         /*.n_ctx_kv                    =*/0,
         /*.n_rs_slots                  =*/0,
+        /*.batch_invariant_matmul      =*/false,
     };
 
     return result;
@@ -4822,6 +4860,18 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
+}
+
+bool llama_get_batch_invariant_matmul(const llama_context * ctx) {
+    return ctx && ctx->get_cparams().batch_invariant_matmul;
+}
+
+bool llama_get_pipeline_parallel(const llama_context * ctx) {
+    return ctx && ctx->get_cparams().pipeline_parallel;
+}
+
+bool llama_get_flash_attention(const llama_context * ctx) {
+    return ctx && ctx->get_cparams().flash_attn;
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {
@@ -5080,8 +5130,12 @@ int32_t llama_set_adapter_cvec(llama_context * ctx,
 // memory
 //
 
+const char * llama_attention_views_unsupported_reason(const llama_context * ctx) {
+    return ctx ? ctx->attention_views_unsupported_reason() : "context is null";
+}
+
 bool llama_attention_views_supported(const llama_context * ctx) {
-    return ctx && ctx->attention_views_supported();
+    return llama_attention_views_unsupported_reason(ctx) == nullptr;
 }
 
 bool llama_attention_set_views(llama_context * ctx, const llama_attention_view * views, size_t count) {

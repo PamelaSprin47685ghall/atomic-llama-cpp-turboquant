@@ -79,6 +79,7 @@ struct llama_context {
     llama_memory_t get_memory() const;
 
     llama_kv_cache * attention_view_cache() const;
+    const char * attention_views_unsupported_reason() const;
     bool attention_views_supported() const;
     bool set_attention_views(const llama_attention_view * views, size_t count);
     void clear_attention_views();

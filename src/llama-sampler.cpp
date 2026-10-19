@@ -151,8 +151,10 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
     bucket_idx.reserve(cur.size);
 
     for (int i = 0; i < (int)cur.size; ++i) {
-        const float val = cur.data[i].logit;
-        int ib = int(bucket_scale * val + bucket_inter); //nbuckets * (val - bucket_low) / (bucket_high - bucket_low);
+        // Clamp before scaling and conversion. Finite logits can exceed the
+        // integer range or overflow the scale, but still belong in an end bucket.
+        const float val = std::max(bucket_low, std::min(bucket_high, cur.data[i].logit));
+        int ib = int(bucket_scale * val + bucket_inter);
         ib = std::max(0, std::min(nbuckets - 1, ib));
         bucket_idx.push_back(ib);
         ++histo[ib];

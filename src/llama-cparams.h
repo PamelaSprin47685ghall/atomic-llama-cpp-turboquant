@@ -59,6 +59,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool batch_invariant_matmul = false;
 
     uint32_t kv_stream_arena_mib;
 

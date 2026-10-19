@@ -448,6 +448,19 @@ extern "C" {
         // Physical recurrent states. 0 uses n_seq_max. Logical sequence IDs
         // keep their n_seq_max range. A new live state fails if this pool is full.
         uint32_t n_rs_slots;
+
+        // Request native single-query arithmetic for direct and expert-indexed
+        // quantized matrix projections across query batch sizes. CPU/Vulkan
+        // qualification is limited to tested profiles. Vulkan requires contiguous
+        // quantized weights and F32 activations; its native Q8 activation policy
+        // still applies. Expert-indexed profiles allow shared or per-slot input
+        // rows and padded I32 ID rows, with descriptor-aligned storage.
+        // While enabled, this policy takes precedence over a projection builder's
+        // requested accumulator precision. This does not request true-F32
+        // arithmetic or qualify every model operation/backend/layout.
+        // Set before creating the context, including any prefix prefill.
+        // false keeps the optimized native quantized matrix dispatch.
+        bool batch_invariant_matmul;
     };
 
     struct llama_model_tensor_override {
@@ -601,6 +614,18 @@ extern "C" {
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
+    // Reports the requested projection policy, not model-wide qualification
+    // or proof that every backend kernel honored it. NULL returns false.
+    LLAMA_API bool llama_get_batch_invariant_matmul(const struct llama_context * ctx);
+
+    // Read the current scheduler and attention configuration. These values can
+    // differ from the requested model/context parameters. Graph reservation
+    // can disable pipeline parallelism after a compute allocation failure.
+    // They do not prove kernel use, device overlap, or a performance gain.
+    // The caller must serialize context access. NULL returns false.
+    LLAMA_API bool llama_get_pipeline_parallel(const struct llama_context * ctx);
+    LLAMA_API bool llama_get_flash_attention  (const struct llama_context * ctx);
+
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");
@@ -645,6 +670,13 @@ extern "C" {
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
+
+    // Devices selected by the model loader. This list does not describe which
+    // kernels ran, or prove that every listed device holds model layers.
+    // The caller must keep the model and backend registry alive. The index
+    // must be in [0, llama_model_n_devices(model)).
+    LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
+    LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
@@ -814,8 +846,13 @@ extern "C" {
     // This reference route uses stored K at writer positions and rotates Q for
     // each reader span. All visible entries share one softmax per query/head.
     // It requires a supported text RoPE model and a unified, resident KV cache.
-    // Both K and V must use GGML_TYPE_F32; other cache types are rejected.
-    // It does not use the ordinary flash-attention kernel for these queries.
+    // Both K and V must use GGML_TYPE_F32, and Flash Attention must be disabled.
+    // Current supported architectures use n_rs_seq=0; rollback/replay is unqualified.
+    // Returns nullptr when supported, or the first unsupported requirement.
+    // The reason is a static string; the caller must not modify or free it.
+    // A null context returns a reason. Query again after changing context modes.
+    LLAMA_API const char * llama_attention_views_unsupported_reason(const struct llama_context * ctx);
+
     LLAMA_API bool llama_attention_views_supported(const struct llama_context * ctx);
 
     // Copies the views. Failure preserves the previous views and all model state.

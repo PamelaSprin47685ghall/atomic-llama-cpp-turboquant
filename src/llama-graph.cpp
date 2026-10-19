@@ -1563,12 +1563,21 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s,
         enum ggml_prec   prec) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
-
-    if (prec != GGML_PREC_DEFAULT) {
-        // Set precision on the base MUL_MAT before an optional scale/LoRA attachment changes the root op.
-        ggml_mul_mat_set_prec(res, prec);
-    }
+    const auto multiply = [this](ggml_tensor * left, ggml_tensor * right,
+                                enum ggml_prec requested = GGML_PREC_DEFAULT) {
+        auto * product = ggml_mul_mat(ctx0, left, right);
+        // Keep F32 projections on one dot contract across batch shapes.
+        // A small router change can select a different set of experts.
+        const auto precision = left->type == GGML_TYPE_F32 && right->type == GGML_TYPE_F32 ?
+            GGML_PREC_F32_PEDANTIC :
+            cparams.batch_invariant_matmul && ggml_is_quantized(left->type) && right->type == GGML_TYPE_F32 ?
+                GGML_PREC_BATCH_INVARIANT : requested;
+        if (precision != GGML_PREC_DEFAULT) {
+            ggml_mul_mat_set_prec(product, precision);
+        }
+        return product;
+    };
+    ggml_tensor * res = multiply(w, cur, prec);
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1583,10 +1592,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
-        ggml_tensor * ab_cur = ggml_mul_mat(
-                ctx0, lw->b,
-                ggml_mul_mat(ctx0, lw->a, cur)
-                );
+        ggml_tensor * ab_cur = multiply(lw->b, multiply(lw->a, cur));
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
@@ -1600,7 +1606,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    const auto multiply = [this, ids](ggml_tensor * left, ggml_tensor * right) {
+        auto * product = ggml_mul_mat_id(ctx0, left, right, ids);
+        if (cparams.batch_invariant_matmul && ggml_is_quantized(left->type) && right->type == GGML_TYPE_F32) {
+            ggml_mul_mat_set_prec(product, GGML_PREC_BATCH_INVARIANT);
+        }
+        return product;
+    };
+    ggml_tensor * res = multiply(w, cur);
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -1621,11 +1634,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const float rank  = (float) lw->b->ne[0];
         const float scale = alpha ? lora.second * alpha / rank : lora.second;
 
-        ggml_tensor * ab_cur = ggml_mul_mat_id(
-                ctx0, lw->b,
-                ggml_mul_mat_id(ctx0, lw->a, cur, ids),
-                ids
-                );
+        ggml_tensor * ab_cur = multiply(lw->b, multiply(lw->a, cur));
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
@@ -2060,10 +2069,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
-        logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
-        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
-            ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
-        }
+        logits = build_lora_mm(gate_inp, cur, nullptr,
+            gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS ? GGML_PREC_F32 : GGML_PREC_DEFAULT);
         cb(logits, "ffn_moe_logits", il);
     } else {
         logits = probs_in;
@@ -2379,29 +2386,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     assert(n_expert_used > 0);
 
     // experts layout: [n_embd, n_expert_used, n_tokens]
-    // Decode (n_tokens==1): permute+sum_rows beats 10 views + 9 adds.
-    // Prefill: the cont/permute of a large expert slab is slower than the
-    // classic view/add tree — keep that path for multi-token.
+    // Use the same expert reduction for every token count. Switching between
+    // SUM_ROWS and a left-to-right ADD chain changes the accumulated value and
+    // can change a later router decision when a frontier is microbatched.
+    // A grouped MoE block can select fewer experts than the model default.
+    // Only warmup bounds this output; its full expert products remain above.
+    const int64_t n_reduce = cparams.warmup ?
+        std::min<int64_t>(hparams.n_expert_used, n_expert_used) : n_expert_used;
+    GGML_ASSERT(n_reduce > 0 && n_reduce <= experts->ne[1]);
     ggml_tensor * moe_out;
-    if (hparams.n_expert_used == 1) {
+    if (n_reduce == 1) {
         moe_out = ggml_cont(ctx0, ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], 0));
-    } else if (n_tokens == 1) {
-        ggml_tensor * experts_pe = ggml_cont(ctx0, ggml_permute(ctx0, experts, 1, 0, 2, 3));
-        ggml_tensor * summed     = ggml_sum_rows(ctx0, experts_pe); // [1, n_embd, 1]
-        moe_out = ggml_reshape_2d(ctx0, summed, n_embd, n_tokens);
     } else {
-        // note: use hparams.n_expert_used (not n_expert_used) so warmup stays small
-        // ref: https://github.com/ggml-org/llama.cpp/pull/14753
-        ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
-        for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
-            cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
-            ggml_build_forward_expand(gf, cur_experts[i]);
+        ggml_tensor * reduced_experts = experts;
+        if (n_reduce < experts->ne[1]) {
+            reduced_experts = ggml_view_3d(ctx0, experts, n_embd, n_reduce, n_tokens,
+                                           experts->nb[1], experts->nb[2], 0);
         }
-        moe_out = cur_experts[0];
-        for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
-            moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
-            ggml_build_forward_expand(gf, moe_out);
-        }
+        ggml_tensor * experts_pe = ggml_cont(ctx0, ggml_permute(ctx0, reduced_experts, 1, 0, 2, 3));
+        ggml_tensor * summed     = ggml_sum_rows(ctx0, experts_pe); // [1, n_embd, n_tokens]
+        moe_out = ggml_reshape_2d(ctx0, summed, n_embd, n_tokens);
     }
 
     cb(moe_out, "ffn_moe_out", il);
@@ -2735,7 +2739,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // note: this op tends to require high floating point range
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_mul_mat_set_prec(kq, k->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 ?
+            GGML_PREC_F32_PEDANTIC : GGML_PREC_F32);
 
         if (arch == LLM_ARCH_GROK) {
             // need to do the following:
@@ -2775,6 +2780,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        if (v->type == GGML_TYPE_F32 && kq->type == GGML_TYPE_F32) {
+            ggml_mul_mat_set_prec(kqv, GGML_PREC_F32_PEDANTIC);
+        }
         cb(kqv, "kqv", il);
 
         // TurboQuant: inverse WHT on attention output (non-FA path)
@@ -2967,7 +2975,7 @@ ggml_tensor * llm_graph_context::build_attn_reader(
     // view includes its current key, so these scores always have a consumer.
     auto * base_scores = ggml_mul_mat(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3),
                                            ggml_permute(ctx0, q_native, 0, 2, 1, 3));
-    ggml_mul_mat_set_prec(base_scores, GGML_PREC_F32);
+    ggml_mul_mat_set_prec(base_scores, GGML_PREC_F32_PEDANTIC);
 
     // The resident KV pool is shared. Only a reader's scores are assembled;
     // neither K nor V is rephased or copied into a private persistent cache.
@@ -3003,7 +3011,7 @@ ggml_tensor * llm_graph_context::build_attn_reader(
                 keys = ggml_reshape_3d(ctx0, keys, k->ne[0], k->ne[1], span.values.indices.size());
                 keys = ggml_permute(ctx0, keys, 0, 2, 1, 3);
                 partial = ggml_mul_mat(ctx0, keys, query);
-                ggml_mul_mat_set_prec(partial, GGML_PREC_F32);
+                ggml_mul_mat_set_prec(partial, GGML_PREC_F32_PEDANTIC);
             }
             scores = scores ? ggml_concat(ctx0, scores, partial, 0) : partial;
         }
@@ -3034,6 +3042,7 @@ ggml_tensor * llm_graph_context::build_attn_reader(
         v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
     }
     auto * output = ggml_mul_mat(ctx0, v, all_scores);
+    ggml_mul_mat_set_prec(output, GGML_PREC_F32_PEDANTIC);
     output = ggml_permute(ctx0, output, 0, 2, 1, 3);
     output = ggml_cont_2d(ctx0, output, output->ne[0] * output->ne[1], output->ne[2] * output->ne[3]);
     if (!cparams.offload_kqv) {

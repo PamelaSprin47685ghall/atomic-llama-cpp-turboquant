@@ -3366,7 +3366,9 @@ struct ggml_tensor * ggml_mul_mat(
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
-    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT || a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(a->op != GGML_OP_MUL_MAT_ID ||
+                prec == GGML_PREC_DEFAULT || prec == GGML_PREC_BATCH_INVARIANT);
 
     const int32_t prec_i32 = (int32_t) prec;
 

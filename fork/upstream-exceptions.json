@@ -64,6 +64,19 @@
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
+      "path": "ggml/include/ggml.h",
+      "sha256": "3a5f74e8d196bb3d284a92b2ae862a51095225b6922a2c939bedd01db8b7ab5b",
+      "mode": "100644",
+      "consumers": [
+        "src/llama-graph.cpp",
+        "fork/rerot-compose",
+        "fork/tests/a-seams/vulkan-quantized-shape-invariance.cpp",
+        "fork/tests/a-seams/mul-mat-id-shape-invariance.cpp"
+      ],
+      "reason": "Declare the distinct GGML_PREC_BATCH_INVARIANT operator request and document its native single-column quantized arithmetic contract across query batches. Keep this request separate from GGML_PREC_F32 and GGML_PREC_F32_PEDANTIC: native activation quantization may still be selected. State the tested quantized MUL_MAT/MUL_MAT_ID, backend, and layout limits without claiming model-wide numerical qualification. Document the explicit BATCH_INVARIANT request for tested quantized MUL_MAT and MUL_MAT_ID profiles, retain its distinction from true-F32 precision and other-backend qualification, and state that the existing public precision setter accepts only DEFAULT or BATCH_INVARIANT for ID operators.",
+      "removal_condition": "Replace this enum and its documentation when the pinned upstream exposes an equivalent explicit direct and expert-indexed quantized batch-arithmetic request, with matching support/refusal behavior and installed-public serial, batched, broadcast, permutation, bias, and real reader qualification for each claimed backend. Rebuild consumers with the matching public headers and libraries. Replace these declarations and comments only with equivalent upstream public request/precision semantics and matching installed-header/library consumers. Retain independent-reference direct and expert arithmetic gates, unsupported-profile checks, and real-model qualification for each claimed backend."
+    },
+    {
       "path": "ggml/src/ggml-backend-meta.cpp",
       "sha256": "c141bb450b11ad5dc1a654d94b5188d14829c41dc9c28910bee544bbb728cfa7",
       "mode": "100644",
@@ -85,6 +98,18 @@
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
+      "path": "ggml/src/ggml-cpu/ggml-cpu.c",
+      "sha256": "8cfe7ee653073919ff5d2d8785633bca565a8c7c136157fbaa85980f5c9adfcc",
+      "mode": "100644",
+      "consumers": [
+        "fork/rerot-compose",
+        "fork/tests/a-seams/cpu-f32-precision.cpp",
+        "fork/tests/a-seams/vulkan-quantized-shape-invariance.cpp"
+      ],
+      "reason": "Honor an explicit GGML_PREC_F32_PEDANTIC matrix-product request on CPU by excluding both llamafile SGEMM shortcuts and retaining the native vector-dot reduction. F32 attention and router/projection consumers need a stable dot contract across serial, batched, strided, and threaded execution; changed router scores can select different experts. The graph requests this policy for F32-by-F32 products. The PEDANTIC gate and the explicit quantized policy below are separate; this file does not add a new native MUL_MAT_ID implementation. Default-precision products retain their existing dispatch policy. For native MUL_MAT with BATCH_INVARIANT, quantized left weights and F32 right activations, bypass both llamafile SGEMM attempts with the same gate and set num_rows_per_vec_dot to one output. Retain the native activation conversion type, conversion reuse, row/query chunk scheduling and thread parallelism; DEFAULT keeps the existing optimized dispatch. The installed-public native x86/AVX regression is the qualified execution target for this addition. Its successful comparisons do not qualify other CPU architectures, optional extra-compute providers or MoE-cache implementations. The ordinary native CPU MUL_MAT_ID core already uses one-output vector dots without SGEMM; this patch does not introduce or qualify a separate ID provider.",
+      "removal_condition": "Remove this CPU exception when the pinned upstream honors GGML_PREC_F32_PEDANTIC with the required F32 dot contract, and the independent precision sentinel, serial/batch/stride/thread comparisons, and real reader gates pass through the installed public package. Remove the explicit quantized CPU hunks only when upstream preserves the same native single-token dot contract across the claimed quantized query shapes and the independent DEFAULT-N1 batch/permutation/broadcast/bias regression plus the complete claimed CPU model gates pass without them. Requalify each additional architecture or provider separately rather than inferring it from the common enum or native-core source."
+    },
+    {
       "path": "ggml/src/ggml-cpu/ops.cpp",
       "sha256": "e5b6affc76f02ec3456ace39b626a2175fd70b2c2da3599af4df71e9f06ad00a",
       "mode": "100644",
@@ -97,16 +122,48 @@
     },
     {
       "path": "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
-      "sha256": "6453d62fe781b6452406476f88ba4145fc55af7c7207b68357b1d8032a128c6a",
+      "sha256": "5302e9a13c7da678d59f5f9308dac4743f0c99e428f72ef1df5c11775fa989ee",
       "mode": "100644",
       "consumers": [
         "Vulkan Turbo WHT",
         "Vulkan scratch buffer reuse",
         "public GGML graphs with in-place activation writes",
-        "fork/tests/a-seams"
+        "fork/tests/a-seams",
+        "fork/rerot-compose",
+        "fork/tests/a-seams/f32-matmul-layout.cpp",
+        "fork/tests/a-seams/f32-shape-invariance.cpp",
+        "fork/tests/a-seams/rerot-attention-oracle.cpp",
+        "fork/tests/a-seams/vulkan-mmvq.cpp",
+        "fork/tests/a-seams/vulkan-quantized-shape-invariance.cpp",
+        "fork/tests/a-seams/mul-mat-id-shape-invariance.cpp",
+        "fork/tests/a-seams/rerot-native-trace.cpp"
       ],
-      "reason": "Correct legal 32/64 WHT dispatch and its optional scale operand; invalidate converted activation identity after mask bitmap or large Softmax writes, order bitmap reads before scratch reuse, and discard cached conversions after overlapping graph writes.",
-      "removal_condition": "Remove each hunk when the selected upstream passes the public WHT, scratch reuse, and source mutation regressions without it; retain full output comparisons, unrelated-write controls, and nonzero view offsets."
+      "reason": "Correct legal 32/64 WHT dispatch and its optional scale operand; invalidate converted activation identity after mask bitmap or large Softmax writes, order bitmap reads before scratch reuse, and discard cached conversions after overlapping graph writes. Preserve both F32 operands in Vulkan F32-by-F32 products for every requested precision, including staging tensors whose noncontiguity occurs only between head planes; select pure-F32 shader variants and scalar tiles within device limits instead of silently converting operands to F16. For F32 PEDANTIC, use one fixed scalar matrix tile and dot order for vector, matrix, and head-batched shapes, disable split-K/aligned-tile variation, and keep ADD nodes unfused when that route cannot consume vector-fused biases. For the existing small-N quantized vector path, remove the blanket N>1 activation-quantization decision and retain device/type/K eligibility, supported-type fallback, and force/disable precedence across cohorts. Separately, gate the native single-column quantized mode on the explicit GGML_PREC_BATCH_INVARIANT request: fold dense query columns into parallel GPU workgroup batches while preserving head broadcasting, native activation policy, and dot order. The support predicate rejects unsupported operators, noncontiguous operands, hints, and buffer/grid addressing limits instead of silently changing the requested arithmetic; the dense support predicate retains its own limits, while expert-indexed products use the separate explicit ID profile described below. With that request absent, dense quantized products keep their optimized native dispatch, subject to the separately recorded small-N policy correction. Preserve the existing WHT, scratch-lifetime, and activation-cache responsibilities when merging this clause. Extend the explicitly requested native quantized batch-arithmetic mode to eligible MUL_MAT_ID nodes. Validate the ID-specific contiguous weight/activation, shared-or-per-slot input, padded ID-row, descriptor-alignment, pipeline, buffer, grid and 32-bit indexing requirements before routing; reject unsupported requests rather than falling back silently to the old tiled ID arithmetic. The vector route does not require the tiled ID path's row_ids shared-memory allocation. Flatten all selected-slot/token pairs into GPU Y workgroups and allocate only the descriptor sets needed for hardware Y-limit chunks; no host loop submits individual tokens in the explicit profile. Preserve the original input tensor identity and full activation conversion cache, native vendor/type/K MMVQ eligibility, weight/expert lookup, bias/scale fusion, and per-output vector pipeline. With the request absent, the native large-N tiled ID route remains unchanged.",
+      "removal_condition": "Remove each hunk when the selected upstream passes the public WHT, scratch reuse, and source mutation regressions without it; retain full output comparisons, unrelated-write controls, and nonzero view offsets. Remove each added responsibility when the pinned upstream preserves F32 operands and head strides, honors the fixed PEDANTIC reduction and bias contract, and supplies the equivalent explicitly requested direct and expert-indexed quantized single-column arithmetic with truthful capability bounds. Retain installed-public F64/layout/tile and shape/bias comparisons, actual MMVQ dispatch controls, and full-model reader and complete C generation gates for every claimed backend. Keep all original WHT, scratch reuse, source-mutation, and removal conditions until their own regressions pass without those hunks; operator correctness or a local graph timing does not close a full-model or performance gate. Remove the added ID responsibilities only when equivalent upstream support provides the same explicit numerical policy, truthful support/refusal limits, GPU workgroup batching, cached activation policy and fusion behavior. Retain independent DEFAULT-N1 ID comparisons, row/slot/permutation and hardware-grid boundaries, actual selected-device/weight-placement observations, and complete generation equivalence for each claimed backend. Preserve the earlier dense, F32, WHT, scratch-lifetime and cache-mutation removal conditions independently."
+    },
+    {
+      "path": "ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl",
+      "sha256": "8fee3a291996b45db71ddb3203f0a5c37b60b2acea1eab422e60983ed642fa01",
+      "mode": "100644",
+      "consumers": [
+        "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        "fork/rerot-compose",
+        "fork/tests/a-seams/mul-mat-id-shape-invariance.cpp"
+      ],
+      "reason": "Under the explicit ID-batch flag, derive the selected slot and token from the flattened GPU Y workgroup plus its chunk base, retain the padded ID row stride, and use those logical coordinates for expert selection, shared/per-slot activation addressing, and output placement. Apply the logical selected-slot index at all six fused-scale sites across the three native reduction variants; ADD_ID bias continues to use the selected expert ID. Preserve the native weight-block addressing, per-output dot products, reduction arithmetic, and all DEFAULT and non-ID coordinate semantics. This shared base reaches every compiled native ID vector family without adding host token scheduling.",
+      "removal_condition": "Remove this mapping when upstream provides equivalent GPU-batched ID addressing and fusion semantics. Retain installed-public native-DEFAULT-N1 comparisons for varying/repeated/permuted IDs, shared/per-slot activations, row-padded IDs, ADD_ID bias and shared-slot scale, plus a Y-limit boundary whose chunk splits inside a token. Qualification remains limited to the actually executed types/devices and complete-model receipts."
+    },
+    {
+      "path": "ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl",
+      "sha256": "c7f7dc96d64bda77dbe893ea115585b824064922c0601249a04d8ca52ac98cc5",
+      "mode": "100644",
+      "consumers": [
+        "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        "fork/rerot-compose",
+        "fork/tests/a-seams/mul-mat-id-shape-invariance.cpp"
+      ],
+      "reason": "Declare the shared MAT_VEC_FLAGS_BATCH_ID bit used by the native Vulkan ID-vector shader families. The flag reuses the existing fusion_flags push-constant field and preserves the ID push-constant layout; when absent, expert_i1 keeps its existing single-token meaning. The bit distinguishes an explicitly requested flattened token/selected-slot GPU grid from DEFAULT dispatch without changing the native quantized arithmetic.",
+      "removal_condition": "Remove this flag when the pinned upstream exposes an equivalent compatible ID-vector GPU batch mapping. Keep the host/shader flag definitions and push-constant interpretation synchronized, and retain the public independent-reference ID and fusion-boundary regressions."
     },
     {
       "path": "ggml/src/ggml-vulkan/vulkan-shaders/turbo_wht.comp",
@@ -120,17 +177,30 @@
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
+      "path": "ggml/src/ggml.c",
+      "sha256": "5f49b8219ad0604067d84ef3953cfc0485b0cd1a4b375dc2f34f8ac28eb740ad",
+      "mode": "100644",
+      "consumers": [
+        "src/llama-graph.cpp",
+        "fork/rerot-compose",
+        "fork/tests/a-seams/mul-mat-id-shape-invariance.cpp"
+      ],
+      "reason": "Extend the existing installed-public ggml_mul_mat_set_prec entry point to accept MUL_MAT_ID with DEFAULT or BATCH_INVARIANT and store that request in the existing op_params[0] field. This permits native graph construction and an external public-header regression to request the expert arithmetic policy without modifying private tensor state. Reject other ID precision requests so this addition does not advertise an unimplemented PEDANTIC expert kernel. Preserve the ordinary MUL_MAT precision setter and the separate MUL_MAT-only hint setter.",
+      "removal_condition": "Remove this extension when the pinned upstream provides an equivalent public expert-matmul arithmetic request with the same accepted precision/reset semantics, and installed-public native-DEFAULT-single-token comparisons, batch/permutation/bias/scale/stride boundaries, and claimed CPU/Vulkan full-model gates pass without it."
+    },
+    {
       "path": "include/llama.h",
-      "sha256": "eaeac8f0e3b680e2ee2f337e967850c08e5adcbbda27b18d16219e10fad47125",
+      "sha256": "03968ac85560c02adb063f4f30d4d5ff968dd5d43bb7de102d74f1e0f39b37c4",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
         "tools/server",
         "fork/rerot-compose",
-        "fork/tests/a-seams"
+        "fork/tests/a-seams",
+        "fork/tests/a-seams/mul-mat-id-shape-invariance.cpp"
       ],
-      "reason": "Expose versioned physical KV sizing, compute allocation observation and synchronized release. Expose owned logical reader views, capability checks, physical recurrent-state capacity and recurrent-only retirement through public A APIs.",
-      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+      "reason": "Expose versioned physical KV sizing, compute allocation observation and synchronized release. Expose owned logical reader views, capability checks, physical recurrent-state capacity and recurrent-only retirement through public A APIs. Expose installed-public read-only queries for resolved pipeline-parallel and Flash Attention settings, the model loader's selected devices, and the first unsupported reader-view requirement. Keep the capability boolean and setter aligned with the same native predicate, including the FA-off requirement of the current non-FA reader. Add the opt-in batch_invariant_matmul context parameter and its null-safe getter; require the choice before context creation and prefix prefill, document its default-false behavior and precedence over a dense quantized projection builder's accumulator request, and distinguish native activation quantization from true-F32 arithmetic. C uses the installed API without reading private A state. These queries report configuration and capability reasons, not actual kernel dispatch, device overlap, model-wide invariance, or performance. Describe the creation-time opt-in projection request as covering qualified direct and expert-indexed quantized products, with contiguous F32 activations, native activation quantization, shared/per-slot expert inputs, row-padded IDs and descriptor-aligned storage where required by Vulkan. Include its precedence over a projection builder's requested accumulator precision. Preserve default-false behavior, creation-before-prefill semantics, and the getter's meaning as a request rather than proof of model-wide/backend execution.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Replace these additions with upstream equivalents when the pinned API exposes the same read-only configuration, selected-device and reader-rejection information plus the explicit direct and expert-indexed quantized projection policy and getter semantics. Rebuild all consumers with matching headers and libraries, and retain capability, policy/default, device-reporting, and real numerical gates. Preserve the original physical-KV, workspace, reader-view, recurrent-capacity, and retirement removal conditions. Replace these comments and interfaces when upstream provides the same explicit direct/expert projection request, default and getter semantics, with matching installed consumers and complete-model gates. Keep all unrelated reader capability, physical capacity, scheduler/device observation and lifetime removal conditions."
     },
     {
       "path": "src/llama-attention-view.h",
@@ -145,7 +215,7 @@
     },
     {
       "path": "src/llama-context.cpp",
-      "sha256": "9878b3ff9fb3402be5478a434164e3ee269ac7ffe924a7731156e79f019e8f47",
+      "sha256": "ee718866901c4b3b7cf2ebc557fd289f91bb1ef219fd96fc697de913a474fdeb",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -153,12 +223,12 @@
         "fork/rerot-compose",
         "fork/tests/a-seams"
       ],
-      "reason": "Validate physical KV independently from the logical window and invalidate graph state before workspace release. Validate reader capability and batches, drain before changing views, budget reader graphs and size physical recurrent reserve independently from logical identities.",
-      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+      "reason": "Validate physical KV independently from the logical window and invalidate graph state before workspace release. Validate reader capability and batches, drain before changing views, budget reader graphs and size physical recurrent reserve independently from logical identities. Implement the context-owned first unsupported reader requirement and read-only resolved PP/FA and selected-model-device observations. Return static reasons for null or unsupported contexts, derive the support boolean from the same predicate used before installing views, and reject FA-enabled contexts for the current non-FA reader. C can query the current pipeline flag after native graph-allocation fallback without exposing mutable context state. Copy the public batch_invariant_matmul request into context-owned cparams at construction, initialize the public default to false, and return the stored request through llama_get_batch_invariant_matmul with false for a null context. The getter reports a requested policy, not proof of backend execution. Preserve all existing physical-KV validation, reader batch validation, synchronized view replacement, graph budgeting, and physical recurrent-reserve responsibilities.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Remove these added implementations when equivalent upstream APIs provide the same null handling, static reason lifetime, shared reader acceptance predicate, current scheduler/device observations, and creation-time projection-policy/default/getter behavior. Retain installed capability, default/policy, runtime reporting, and real reader tests, together with the original physical-capacity and synchronized-lifetime gates."
     },
     {
       "path": "src/llama-context.h",
-      "sha256": "c7602a76e551761428d428a876b86484608b62d788a8226e2f9c722bd3100e0e",
+      "sha256": "bb1eef721541edc9f04ead15782a7f2fff5171656490f9d0a195c5d187aa4db3",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -166,12 +236,12 @@
         "fork/rerot-compose",
         "fork/tests/a-seams"
       ],
-      "reason": "A owns physical size observation and private graph/allocator release implementation. Store the native reader-graph budget and declare A-owned view and active-state helpers.",
-      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+      "reason": "A owns physical size observation and private graph/allocator release implementation. Store the native reader-graph budget and declare A-owned view and active-state helpers. Declare the context-owned unsupported-reader-reason query used by the installed public capability interface. Keep the capability boolean and view setter tied to one predicate so diagnostics cannot announce a profile that the native reader rejects. Preserve the existing physical-size, graph-budget, active-state, and allocator-release declarations; the new batch policy is carried by the context's cparams rather than a second mutable policy owner.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Remove this internal declaration when the pinned upstream supplies an equivalent installed-public reader capability query backed by the native context's own predicate."
     },
     {
       "path": "src/llama-cparams.h",
-      "sha256": "3180023354d306a3c62f87e6c708b518f4cd501918743b62749cffd8eb05ebf7",
+      "sha256": "4718f6c8ffacad57e7ed24f8ac0d3dd33b20485bff063c55c9146eb0fc37b0be",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -179,19 +249,22 @@
         "fork/rerot-compose",
         "fork/tests/a-seams"
       ],
-      "reason": "Carry explicit physical KV allocation size separately from logical sequence context. Carry physical recurrent-state capacity independently of the logical sequence namespace.",
-      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+      "reason": "Carry explicit physical KV allocation size separately from logical sequence context. Carry physical recurrent-state capacity independently of the logical sequence namespace. Carry the creation-time batch_invariant_matmul request as a default-false, context-owned graph policy so prefix prefill and later direct dense quantized projections use the same explicit request. Preserve the existing separation of physical KV size, logical context size, physical recurrent slots, and logical sequence identities; this field adds no independent owner or runtime policy switch. The existing context-owned batch_invariant_matmul field now also drives eligible quantized expert-indexed graph products. The ID extension adds no second policy owner, mutable runtime switch or public context-struct field.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Remove this policy field when the pinned upstream carries an equivalent context-owned explicit direct and expert-indexed quantized projection request through graph construction and the public getter, with matching default behavior and real reader gates. Keep the original physical-KV and recurrent-capacity removal conditions until their own consumers no longer need those fields. The existing removal condition for the context-owned projection request must cover both direct and expert-indexed graph construction. There is no additional source hunk in this file for the ID extension."
     },
     {
       "path": "src/llama-graph.cpp",
-      "sha256": "2af150f8779e3ad9ecc6b537202c9b6c979d2fb16655dcc0f6809a5f3c579ac7",
+      "sha256": "1de64639ecd6f00e701509f2b047e59bd74f00b4a96ce3e08e26b32b1299c78d",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
-        "fork/tests/a-seams"
+        "fork/tests/a-seams",
+        "fork/tests/a-seams/rerot-native-trace.cpp",
+        "fork/tests/a-seams/rerot-reader-views.cpp",
+        "fork/tests/a-seams/mul-mat-id-shape-invariance.cpp"
       ],
-      "reason": "Assemble immutable reader scores at shared physical KV positions, rotate raw Q only for changed phases, and reuse native batched softmax/V reduction; preserve ordinary dispatch and input precision.",
-      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+      "reason": "Assemble immutable reader scores at shared physical KV positions, rotate raw Q only for changed phases, and reuse native batched softmax/V reduction; preserve ordinary dispatch and input precision. The precision requests below are the specifically recorded changes to dispatch policy; native graph ownership, resident attention composition and input storage types remain intact. Apply the PEDANTIC contract to F32-by-F32 projection and LoRA products, ordinary resident F32 attention products, and reader-view score/value products before optional wrappers change the root operation. When cparams.batch_invariant_matmul is enabled, mark direct dense quantized-weight/F32-activation projection products with GGML_PREC_BATCH_INVARIANT; for those products the explicit context policy takes precedence over the builder's requested accumulator precision. The request covers only eligible quantized products and does not claim every model operation. Use one expert-axis permute/contiguous/sum_rows reduction for one-token and multi-token MoE output. During normal inference honor the actual per-call expert count, including GROVEMOE runtime selection, instead of substituting the model's configured count. During warmup keep all expert products in the forward graph for allocation and narrow only the final reduction view to the configured active count. Preserve the original immutable reader-view, Q-rotation, and native attention composition responsibilities. When the creation-time batch_invariant_matmul request is enabled, mark quantized-weight/F32-activation products built by both build_lora_mm and build_lora_mm_id with BATCH_INVARIANT before optional weight scales or LoRA wrappers replace the result node. Apply the same guarded ID multiply helper to the LoRA products without changing expert selection or addition/scaling semantics. The explicit context policy takes precedence over the direct projection builder's accumulator request. F32 expert products are not newly marked PEDANTIC, and the flag does not claim coverage of every graph operator.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates. Remove these added graph responsibilities when the pinned upstream supplies equivalent F32 precision requests, explicit direct and expert-indexed quantized batch arithmetic, consistent MoE reduction for the actual runtime expert count, and complete warmup expert allocation. Require the unchanged strict installed-public precision, reader, runtime-count, and complete C generation gates. Keep the original reader-view and recurrent-lifetime removal conditions until those responsibilities also have an equivalent public upstream route. Remove the expert graph wiring when upstream carries the equivalent explicit policy through direct and ID quantized projection construction, including wrappers, with matching default behavior and unchanged strict public and complete-model gates. Preserve the existing reader-view, F32 attention/projection, MoE sum order, actual runtime expert count, warmup and recurrent-lifetime responsibilities."
     },
     {
       "path": "src/llama-graph.h",
@@ -282,6 +355,18 @@
       ],
       "reason": "Pass physical size only to attention KV constructors; preserve logical context and recurrent sizing. Construct native recurrent pools with physical state capacity while retaining the full logical sequence namespace.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+    },
+    {
+      "path": "src/llama-sampler.cpp",
+      "sha256": "f138e86df8ea5e288fa46f719e4d8b614bf0a14fb1906dda4a0330f39aa71538",
+      "mode": "100644",
+      "consumers": [
+        "native sampler users",
+        "fork/rerot-compose",
+        "fork/tests/a-seams/sampler-top-k-extremes.cpp"
+      ],
+      "reason": "For the native top-k bucket path used above k=128, clamp finite logits to the bucket's floating-point range before scaling and converting to an integer bucket index. Applying only an integer clamp after the cast permits undefined out-of-range conversion for huge finite logits and can exclude the true largest tokens. Retain the native comparison/sort within each bucket and the existing native sampler-chain ownership of token selection, accept state, and RNG; this fix does not replace native sampling with the compact shortlist.",
+      "removal_condition": "Remove this clamp when the pinned upstream bounds the floating-point value before integer conversion and the installed-public extreme-finite top-k set/order and greedy-token counterexample passes without the hunk. Keep the paired native sampling tests for selected tokens and subsequent RNG behavior when changing the surrounding consumer path."
     },
     {
       "path": "tools/server/server-context.cpp",

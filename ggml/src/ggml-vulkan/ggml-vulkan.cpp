@@ -1286,6 +1286,8 @@ struct vk_mat_mat_push_constants {
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// Interpret expert_i1 as the base of a flattened token/selected-slot GPU grid.
+#define MAT_VEC_FLAGS_BATCH_ID 0x10
 
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
@@ -2247,7 +2249,13 @@ class vk_perf_logger {
             const uint64_t k     = node->src[1]->ne[0];
             const uint64_t batch = node->ne[2] * node->ne[3];
             std::string    name  = ggml_op_name(node->op);
-            if ((node->op == GGML_OP_MUL_MAT && n <= mul_mat_vec_max_cols) ||
+            const bool pedantic_f32 = node->src[0]->type == GGML_TYPE_F32 &&
+                                      node->src[1]->type == GGML_TYPE_F32 &&
+                                      node->op_params[0] == GGML_PREC_F32_PEDANTIC;
+            const bool parallel_quant_columns = node->op_params[0] == GGML_PREC_BATCH_INVARIANT;
+            if ((node->op == GGML_OP_MUL_MAT && !pedantic_f32 &&
+                 (parallel_quant_columns || n == 1 ||
+                  (n <= mul_mat_vec_max_cols && node->src[1]->ne[2] * node->src[1]->ne[3] == 1))) ||
                 (node->op == GGML_OP_MUL_MAT_ID && node->src[2]->ne[1] == 1)) {
                 name += "_VEC";
             }
@@ -4594,6 +4602,31 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         return spec;
     };
 
+    // F32 inputs need F32 operands as well as an F32 accumulator. The ordinary
+    // fp16 and cooperative variants stage these inputs in half precision.
+    // Use the existing scalar F32 shader for this product on every device;
+    // quantized, F16, BF16 and MMVQ products keep their native pipelines.
+    const auto create_f32 = [&](vk_pipeline & pipeline, const char * name,
+                                const std::vector<uint32_t> & tile, bool aligned) {
+        const uint32_t shared_bytes = (tile[1] + tile[2]) * 17u * 2u * sizeof(float);
+        if (shared_bytes > device->properties.limits.maxComputeSharedMemorySize) {
+            return;
+        }
+        ggml_vk_create_pipeline(device, pipeline, name, matmul_f32_f32_fp32_len,
+                                matmul_f32_f32_fp32_data, "main", 3,
+                                sizeof(vk_mat_mat_push_constants), {tile[1], tile[2], 1},
+                                ggml_vk_mul_mm_spec(tile, aligned), aligned ? tile[1] : 1);
+    };
+    const std::vector<uint32_t> f32_large{128, 128, 128, 16, 64, 64, 2, 4, 4, 1, 32};
+    const std::vector<uint32_t> f32_medium{128, 64, 64, 16, 32, 32, 2, 4, 2, 1, 32};
+    const std::vector<uint32_t> f32_small{32, 32, 32, 16, 32, 32, 2, 2, 2, 1, 32};
+    create_f32(device->pipeline_matmul_f32->l, "matmul_f32_f32_fp32_l", f32_large, false);
+    create_f32(device->pipeline_matmul_f32->m, "matmul_f32_f32_fp32_m", f32_medium, false);
+    create_f32(device->pipeline_matmul_f32->s, "matmul_f32_f32_fp32_s", f32_small, false);
+    create_f32(device->pipeline_matmul_f32->a_l, "matmul_f32_f32_fp32_aligned_l", f32_large, true);
+    create_f32(device->pipeline_matmul_f32->a_m, "matmul_f32_f32_fp32_aligned_m", f32_medium, true);
+    create_f32(device->pipeline_matmul_f32->a_s, "matmul_f32_f32_fp32_aligned_s", f32_small, true);
+
     const int mul_mat_id_param_count = 5;
 
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
@@ -4731,7 +4764,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_MM(TYPE, PIPELINE_NAME . f32acc, NAMELC, , WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
         } \
 
-        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
@@ -4874,7 +4906,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM(TYPE, PIPELINE_NAME . f16acc, NAMELC, _f16acc, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
         CREATE_MM(TYPE, PIPELINE_NAME . f32acc, NAMELC, , WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
 
-        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
@@ -5057,7 +5088,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (device->mul_mat ## ID ## _s_int[TYPE]) \
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC "_s", NAMELC ## _fp32_len, NAMELC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1);   \
 
-        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_F16, pipeline_matmul_f16.f32acc, matmul_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_F16, pipeline_matmul_f16_f32.f32acc, matmul_f16_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
@@ -8870,11 +8900,12 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     // The q8_1 (integer dot) mmq path uses a different shader with its own
     // shared-memory layout, so use the int-specific availability flags.
     const bool is_q8_1 = (src1_type == GGML_TYPE_Q8_1);
-    const bool mm_l = is_q8_1 ? ctx->device->mul_mat_l_int[src0_type] : ctx->device->mul_mat_l[src0_type];
-    const bool mm_m = is_q8_1 ? ctx->device->mul_mat_m_int[src0_type] : ctx->device->mul_mat_m[src0_type];
-    const bool mm_s = is_q8_1 ? ctx->device->mul_mat_s_int[src0_type] : ctx->device->mul_mat_s[src0_type];
+    const bool is_f32 = src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32;
+    const bool mm_l = is_f32 ? bool(mmp->l) : is_q8_1 ? ctx->device->mul_mat_l_int[src0_type] : ctx->device->mul_mat_l[src0_type];
+    const bool mm_m = is_f32 ? bool(mmp->m) : is_q8_1 ? ctx->device->mul_mat_m_int[src0_type] : ctx->device->mul_mat_m[src0_type];
+    const bool mm_s = is_f32 ? bool(mmp->s) : is_q8_1 ? ctx->device->mul_mat_s_int[src0_type] : ctx->device->mul_mat_s[src0_type];
 
-    if (ctx->device->coopmat2) {
+    if (ctx->device->coopmat2 && !is_f32) {
         const uint32_t shader_core_count = ctx->device->shader_core_count;
         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
         const uint32_t tiles_m = CEIL_DIV(m, mmp->a_m->wg_denoms[0]) * CEIL_DIV(n, mmp->a_m->wg_denoms[1]);
@@ -9300,17 +9331,27 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         src1_uma = d_Qy != nullptr;
     }
 
-    // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
-    const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
-                              !ggml_vk_dim01_contiguous(src0);
-    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+    // A strided F32 operand must retain its input precision when staged.
+    // Otherwise a batched KQ or V product silently differs from its vector
+    // route, even when the caller explicitly selects F32 accumulation.
+    const bool preserve_f32 = src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
+    const bool pedantic_f32 = preserve_f32 && dst->op_params[0] == GGML_PREC_F32_PEDANTIC;
+    // The matrix shader uses packed head strides and buffer ranges. Inner-row
+    // contiguity alone does not rule out padding between head planes.
+    const bool x_non_contig = (!preserve_f32 && ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
+                              !ggml_vk_dim01_contiguous(src0) ||
+                              (preserve_f32 && !ggml_is_contiguous(src0));
+    const bool y_non_contig = (!preserve_f32 && ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
-                              !ggml_vk_dim01_contiguous(src1);
+                              !ggml_vk_dim01_contiguous(src1) ||
+                              (preserve_f32 && !ggml_is_contiguous(src1));
 
-    // If src0 is BF16, try to use a BF16 x BF16 multiply
-    ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    // Quantized weights keep the existing F16/BF16 fallback. Pure F32
+    // products use F32 staging for both operands and the F32 pipeline.
+    ggml_type f16_type = preserve_f32 ? GGML_TYPE_F32 :
+                         src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
-    const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
+    const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && (preserve_f32 || !y_non_contig);
 
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
@@ -9337,9 +9378,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
+    const bool aligned = !pedantic_f32 && !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    // A fixed scalar tile preserves each F32 dot's reduction order across
+    // query counts, row permutations and head broadcasting. All rows remain
+    // in one batched matrix dispatch.
+    vk_pipeline pipeline = pedantic_f32 ? mmp->s :
+        ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -9352,11 +9397,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
 
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
+    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || pedantic_f32, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
-    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
+    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : ggml_type_size(f16_type) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     const uint64_t d_sz = sizeof(float) * d_ne;
 
@@ -9525,6 +9570,87 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 }
 
 // Device tuning
+static bool ggml_vk_supports_batch_invariant_quant_matmul(const vk_device & device, const ggml_tensor * op) {
+    if (op->op != GGML_OP_MUL_MAT ||
+        !ggml_is_quantized(op->src[0]->type) || op->src[1]->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op->src[1]) ||
+        op->op_params[1] != GGML_HINT_NONE || ggml_is_empty(op)) {
+        return false;
+    }
+
+    // This profile uses one native vector dispatch, without tiled-M splitting.
+    // Reject layouts and sizes it cannot address rather than silently changing
+    // the requested arithmetic. The default precision has its original paths.
+    const auto * a = op->src[0];
+    const auto * b = op->src[1];
+    const uint64_t k = a->ne[0];
+    const uint64_t m = a->ne[1];
+    const uint64_t columns = ggml_nrows(b);
+    const uint64_t max_range = device->properties.limits.maxStorageBufferRange;
+    if (k == 0 || m == 0 || columns == 0 || m > UINT32_MAX / k || columns > UINT32_MAX ||
+        m > uint64_t(device->properties.limits.maxComputeWorkGroupCount[0]) * 64 ||
+        ggml_nbytes(a) > max_range || ggml_nbytes(b) > max_range || ggml_nbytes(op) > max_range) {
+        return false;
+    }
+
+    // The type must have the native F32-activation fallback, even when a
+    // particular device/type/K policy chooses MMVQ for the current execution.
+    return device->pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_SUBGROUP][a->type][0] != nullptr;
+}
+
+
+static bool ggml_vk_supports_batch_invariant_quant_matmul_id(const vk_device & device, const ggml_tensor * op) {
+    if (op->op != GGML_OP_MUL_MAT_ID ||
+        !ggml_is_quantized(op->src[0]->type) || op->src[1]->type != GGML_TYPE_F32 ||
+        op->src[2]->type != GGML_TYPE_I32 || !ggml_is_contiguous(op->src[0]) ||
+        !ggml_is_contiguous(op->src[1]) || !ggml_is_contiguous(op) ||
+        op->op_params[1] != GGML_HINT_NONE || ggml_is_empty(op)) {
+        return false;
+    }
+
+    const auto * a = op->src[0];
+    const auto * b = op->src[1];
+    const auto * ids = op->src[2];
+    const uint64_t k = a->ne[0];
+    const uint64_t m = a->ne[1];
+    const uint64_t slots = ids->ne[0];
+    const uint64_t tokens = ids->ne[1];
+    const uint64_t id_stride = ids->nb[1] / sizeof(int32_t);
+    const uint64_t max_range = device->properties.limits.maxStorageBufferRange;
+    if (a->ne[3] != 1 || b->ne[3] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        b->ne[0] != a->ne[0] || b->ne[2] != ids->ne[1] ||
+        (b->ne[1] != 1 && b->ne[1] != ids->ne[0]) ||
+        ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0 || id_stride < slots) {
+        return false;
+    }
+
+    // Preserve the native one-token layout and dot arithmetic. The selected
+    // slot and token axes become independent GPU workgroups, without a host
+    // token loop. The ID row stride may include the unselected top-k entries.
+    if (k == 0 || m == 0 || slots == 0 || tokens == 0 || m > UINT32_MAX / k ||
+        slots > UINT32_MAX / m || tokens > UINT32_MAX / slots ||
+        uint64_t(b->ne[1]) > UINT32_MAX / k || id_stride > UINT32_MAX ||
+        tokens - 1 > (UINT32_MAX - slots) / id_stride ||
+        m > uint64_t(device->properties.limits.maxComputeWorkGroupCount[0]) * 64 ||
+        ggml_nbytes(a) > max_range || ggml_nbytes(b) > max_range ||
+        ggml_nbytes(ids) > max_range || ggml_nbytes(op) > max_range) {
+        return false;
+    }
+
+    // Vulkan tensor allocations supply aligned bases; every view must preserve
+    // that descriptor alignment. Fused bias/scale offsets have their own gate.
+    const uint64_t alignment = device->properties.limits.minStorageBufferOffsetAlignment;
+    if (a->view_offs % alignment != 0 || b->view_offs % alignment != 0 ||
+        ids->view_offs % alignment != 0 || op->view_offs % alignment != 0) {
+        return false;
+    }
+
+    // This fallback must exist even when the vendor/type/K policy chooses Q8
+    // activations. Do not silently send a mode20 node to a tiled ID matrix path.
+    return device->pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_SUBGROUP][a->type] != nullptr;
+}
+
+
 static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_t n, uint32_t k, ggml_type src0_type) {
     if (device->mmvq_mode == 1) {
         return true;
@@ -9539,12 +9665,10 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         return false;
     }
 
-    // MMVQ is generally good for batches
-    if (n > 1) {
-        return true;
-    }
-
-    // Quantization overhead is not worth it for small k
+    // Activation precision must not change when the same queries are split
+    // into smaller cohorts. Keep the vendor, weight-type and K policy for
+    // every supported matrix-vector batch size.
+    // Quantization overhead is not worth it for small k.
     switch (device->vendor_id) {
     case VK_VENDOR_ID_NVIDIA:
         if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_IQ1_S || src0_type == GGML_TYPE_IQ1_M) {
@@ -9604,6 +9728,7 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     }
 
     GGML_UNUSED(m);
+    GGML_UNUSED(n);
 }
 
 static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -9636,10 +9761,20 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const uint64_t r2 = ne12 / ne02;
     const uint64_t r3 = ne13 / ne03;
 
-    // batch_n indicates that we need to compute a few vector results, and this assumes
-    // ne12 and ne13 are 1. It overloads the batch_strides to hold the row strides.
-    GGML_ASSERT(ne11 == 1 || ne12 * ne13 == 1);
-    bool batch_n = ne11 > 1;
+    // Keep the native single-column quantized arithmetic at every query count.
+    // Each column is an independent GPU workgroup batch; no query is submitted
+    // separately. Folding N into dimension 2 preserves head broadcasting.
+    const bool parallel_quant_columns = dst->op_params[0] == GGML_PREC_BATCH_INVARIANT;
+    GGML_ASSERT(!parallel_quant_columns || ggml_vk_supports_batch_invariant_quant_matmul(ctx->device, dst));
+    const uint32_t num_cols = parallel_quant_columns ? 1 : ne11;
+    const uint64_t vector_batches = parallel_quant_columns ? ne11 * ne12 * ne13 : ne12 * ne13;
+    const uint64_t vector_ne12 = parallel_quant_columns ? ne11 * ne12 : ne12;
+    const uint64_t vector_r2 = parallel_quant_columns ? ne11 * r2 : r2;
+    GGML_ASSERT(vector_batches <= UINT32_MAX && vector_ne12 <= UINT32_MAX && vector_r2 <= UINT32_MAX);
+
+    // Other vector profiles retain their existing small-N shader batching.
+    GGML_ASSERT(parallel_quant_columns || ne11 == 1 || ne12 * ne13 == 1);
+    const bool batch_n = !parallel_quant_columns && ne11 > 1;
 
     const bool x_non_contig = !ggml_vk_dim01_contiguous(src0);
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
@@ -9659,12 +9794,12 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     // Check for mmq first
-    vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, ne11, ne20, ne00) : nullptr;
+    vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, num_cols, ne20, ne00) : nullptr;
     vk_pipeline to_q8_1 = nullptr;
 
     if (dmmv == nullptr) {
         // Fall back to f16 dequant mul mat
-        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, src1->type, ne11, ne20, ne00);
+        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, src1->type, num_cols, ne20, ne00);
         quantize_y = false;
     }
 
@@ -9774,10 +9909,12 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         }
     }
 
-    // For batch_n, the A matrix is the same for each batch, and B/D use the row stride as the batch stride
+    // Parallel columns use a normal A head stride. The broadcast mapping keeps
+    // that head fixed across N adjacent columns, while B/D advance one column.
+    // The legacy batch_n shader instead keeps N columns inside each workgroup.
     uint32_t stride_batch_x = batch_n ? 0 : ne00*ne01;
-    uint32_t stride_batch_y = batch_n ? ne10 : (ne10*ne11);
-    uint32_t stride_batch_d = batch_n ? ne20 : (ne20*ne21);
+    uint32_t stride_batch_y = (batch_n || parallel_quant_columns) ? ne10 : (ne10*ne11);
+    uint32_t stride_batch_d = (batch_n || parallel_quant_columns) ? ne20 : (ne20*ne21);
 
     if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
         stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
@@ -9817,17 +9954,17 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
     }
 
-    ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
+    ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(vector_batches, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
 
     uint32_t base_work_group_y = 0;
-    while (base_work_group_y < ne12 * ne13) {
+    while (base_work_group_y < vector_batches) {
 
-        uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+        uint32_t groups_y = std::min((uint32_t)vector_batches - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
         const vk_mat_vec_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
             stride_batch_x, stride_batch_y, stride_batch_d,
             fusion_flags, base_work_group_y,
-            (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+            (uint32_t)ne02, (uint32_t)vector_ne12, (uint32_t)vector_r2, (uint32_t)r3,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                                   {
@@ -10109,7 +10246,12 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     // This only supports batchsize == 1.
     const size_t nbytes = ggml_nbytes(src0);
     const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
-    if (needs_split) {
+    if (dst->op_params[0] == GGML_PREC_BATCH_INVARIANT) {
+        GGML_ASSERT(ggml_vk_supports_batch_invariant_quant_matmul(ctx->device, dst));
+        // Each query column is a parallel GPU workgroup batch. Preserve the
+        // native single-column vendor/type/K activation policy and dot order.
+        ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+    } else if (needs_split) {
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
         const uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * src0->nb[1]);
         uint32_t m_offset = 0;
@@ -10132,6 +10274,11 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         }
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
         ggml_vk_fwht(ctx, subctx, src1, dst);
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+               dst->op_params[0] == GGML_PREC_F32_PEDANTIC) {
+        // Use the same scalar F32 product for vectors and matrices, including
+        // head batches. A separate vector reduction would change rounding.
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, true);
     } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
         src0->nb[0] <= src0->nb[2] &&
@@ -10569,6 +10716,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     GGML_ASSERT(ggml_vk_dim01_contiguous(src0) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);  // NOLINT
     GGML_ASSERT(ggml_vk_dim01_contiguous(src1) || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);  // NOLINT
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    const bool parallel_ids = dst->op_params[0] == GGML_PREC_BATCH_INVARIANT;
+    GGML_ASSERT(!parallel_ids || ggml_vk_supports_batch_invariant_quant_matmul_id(ctx->device, dst));
 
     const uint64_t ne00 = src0->ne[0];
     const uint64_t ne01 = src0->ne[1];
@@ -10583,6 +10732,9 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const uint64_t nei0 = ids->ne[0];
     const uint64_t nei1 = ids->ne[1];
     const uint32_t nbi1 = (uint32_t)(ids->nb[1] / sizeof(int));
+    const uint32_t max_groups_y = ctx->device->properties.limits.maxComputeWorkGroupCount[1];
+    const uint64_t id_batches = parallel_ids ? nei0 * nei1 : nei1;
+    GGML_ASSERT(!parallel_ids || id_batches <= UINT32_MAX);
 
     const uint64_t ne20 = dst->ne[0];
     const uint64_t ne21 = dst->ne[1];
@@ -10666,7 +10818,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
-        ggml_pipeline_request_descriptor_sets(ctx, dmmv, nei1);
+        ggml_pipeline_request_descriptor_sets(ctx, dmmv,
+                parallel_ids ? CEIL_DIV(id_batches, max_groups_y) : nei1);
     }
 
     vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
@@ -10741,7 +10894,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         groups_x = CEIL_DIV(groups_x, groups_z);
     }
 
-    uint32_t fusion_flags = 0;
+    uint32_t fusion_flags = parallel_ids ? MAT_VEC_FLAGS_BATCH_ID : 0;
 
     if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * bias = cgraph->nodes[node_idx + 1]->src[1];
@@ -10764,13 +10917,18 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
     }
 
-    // Loop over the batch dimension
-    for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
+    // The explicit profile dispatches all token/slot workgroups together,
+    // splitting only at the device's Y-grid limit. DEFAULT retains its native
+    // token dispatches and the same push-constant interpretation as before.
+    uint32_t expert_batch = 0;
+    while (expert_batch < id_batches) {
+        const uint32_t groups_y = parallel_ids ?
+                std::min((uint32_t)id_batches - expert_batch, max_groups_y) : (uint32_t)nei0;
         const vk_mat_vec_id_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
             (uint32_t)(ne00 * ne01), stride_batch_y, (uint32_t)(ne20 * ne21),
             fusion_flags,
-            (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1
+            (uint32_t)nei0, (uint32_t)ne11, expert_batch, nbi1
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
             {
@@ -10781,7 +10939,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
                 d_F1,
                 d_ids,
             },
-            pc, { groups_x, (uint32_t)nei0, groups_z });
+            pc, { groups_x, groups_y, groups_z });
+        expert_batch += parallel_ids ? groups_y : 1;
     }
 
     if (x_non_contig) {
@@ -10796,7 +10955,8 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src2 = dst->src[2];
-    return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+    return (dst->op_params[0] == GGML_PREC_BATCH_INVARIANT || src2->ne[1] <= 8) &&
+           (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -16706,6 +16866,12 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
         const ggml_tensor *mul = cgraph->nodes[node_idx];
         const ggml_tensor *add = cgraph->nodes[node_idx + 1];
 
+        // PEDANTIC F32 uses the fixed matrix pipeline, which does not consume
+        // vector-fused biases. Leave these ADD nodes in the computed graph.
+        if (mul->src[0]->type == GGML_TYPE_F32 && mul->src[1]->type == GGML_TYPE_F32 &&
+            mul->op_params[0] == GGML_PREC_F32_PEDANTIC) {
+            return false;
+        }
         if (!mm_add_ok(mul, add)) {
             return false;
         }
@@ -18319,6 +18485,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 ggml_type src0_type = op->src[0]->type;
                 if (src0_type == GGML_TYPE_Q8_CR || src0_type == GGML_TYPE_Q5_CR || src0_type == GGML_TYPE_Q6_CR) {
                     return false;
+                }
+                if (op->op_params[0] == GGML_PREC_BATCH_INVARIANT) {
+                    if (op->op == GGML_OP_MUL_MAT_ID) {
+                        // This profile uses the native vector shader and does
+                        // not need the tiled ID path's row_ids shared memory.
+                        return ggml_vk_supports_batch_invariant_quant_matmul_id(device, op);
+                    }
+                    if (!ggml_vk_supports_batch_invariant_quant_matmul(device, op)) {
+                        return false;
+                    }
                 }
                 if (op->op == GGML_OP_MUL_MAT_ID) {
                     // The TurboQuant weight types now have mul_mat_vec_id pipelines, so MoE

@@ -72,8 +72,11 @@ public:
         params.type_k = cache_type;
         params.type_v = cache_type;
         params.no_perf = true;
+        params.batch_invariant_matmul = true;
         context_.reset(llama_init_from_model(model, params));
         require(context_ != nullptr, "could not create the real test context");
+        require(llama_get_batch_invariant_matmul(context_.get()),
+                "the explicit batch-invariant matmul policy was not retained");
         const bool supported = llama_attention_views_supported(context_.get());
         require(supported != expect_unsupported, expect_unsupported ?
                 "the deliberately unsupported reader profile was reported as supported" :
@@ -501,6 +504,7 @@ int main(int argc, char ** argv) {
             require(!values.empty() && run.calls == 2, "ordinary A did not execute both sides of the capability probe");
             std::cout << "{\"status\":\"PASS\",\"scope\":\"explicit unsupported F16 reader capability boundary\""
                       << ",\"kv_type\":\"f16\",\"views_supported\":false,\"valid_view_rejected\":true"
+                      << ",\"batch_invariant_matmul\":true"
                       << ",\"ordinary_continuation_logits\":" << values.size()
                       << ",\"actual_decode_calls\":" << run.calls << ",\"actual_input_rows\":" << run.input_rows
                       << ",\"reader_numerical_qualification\":\"NOT_QUALIFIED\"}\n";
@@ -627,6 +631,7 @@ int main(int argc, char ** argv) {
                   << ",\"failed_comparisons\":" << numeric.failures()
                   << ",\"hybrid_model\":" << (llama_model_is_hybrid(model.get()) ? "true" : "false")
                   << ",\"kv_type\":\"" << ggml_type_name(cache_type) << '"'
+                  << ",\"batch_invariant_matmul\":true"
                   << ",\"logical_sequences_requested\":8,\"physical_recurrent_slots_requested\":3"
                   << ",\"q_heads\":" << llama_model_n_head(model.get())
                   << ",\"kv_heads\":" << llama_model_n_head_kv(model.get())

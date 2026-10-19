@@ -446,6 +446,13 @@ extern "C" {
         GGML_PREC_DEFAULT      =  0, // stored as ggml_tensor.op_params, 0 by default
         GGML_PREC_F32          = 10,
         GGML_PREC_F32_PEDANTIC = 11,
+        // Preserve native single-query quantized arithmetic across query
+        // batches, including the backend's activation quantization policy.
+        // This is distinct from true-F32 arithmetic. CPU/Vulkan qualification
+        // is limited to tested quantized MUL_MAT and MUL_MAT_ID profiles; other
+        // backends may reject this request. Vulkan requires contiguous
+        // quantized weights and F32 activations.
+        GGML_PREC_BATCH_INVARIANT = 20,
     };
 
     // op hint
@@ -1445,8 +1452,12 @@ extern "C" {
             struct ggml_tensor  * b);
 
     // change the precision of a matrix multiplication
+    // MUL_MAT_ID accepts only GGML_PREC_DEFAULT and GGML_PREC_BATCH_INVARIANT
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     // or GGML_PREC_F32_PEDANTIC to require true F32 arithmetic
+    // or GGML_PREC_BATCH_INVARIANT for native single-query quantized arithmetic
+    // across query batches on qualified CPU/Vulkan quantized profiles; other
+    // backends and layouts are not covered by this request's qualification
     GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
