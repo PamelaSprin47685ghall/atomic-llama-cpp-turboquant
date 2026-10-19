@@ -92,6 +92,7 @@ public:
 
     // A starting member supplies its complete FRAME. A running member supplies
     // exactly one input token. Peers see that token at the next frontier.
+    // FRAME and BODY are public. Control and source-end rows are private.
     // A run can grow only at the end of its owning stage's tape.
     std::vector<WriteSpan> prepare(const Step & step, StageId stage, std::vector<Append> appends);
 

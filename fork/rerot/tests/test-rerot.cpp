@@ -357,6 +357,9 @@ void test_bounds() {
     rejects<std::invalid_argument>([&] {
         (void) a.prepare(ta, 1, {{1, static_cast<SegmentKind>(100), Visibility::public_kv, 0, 1}});
     });
+    rejects<std::invalid_argument>([&] {
+        (void) a.prepare(ta, 1, {{1, SegmentKind::frame, static_cast<Visibility>(100), 0, 1}});
+    });
     a.prepare(ta, 1, {frame(1, 0, 2)});
     rejects<std::invalid_argument>([&] { (void) a.prepare(ta, 2, {frame(1, 0)}); });
     a.prepare(ta, 2, {frame(2, 0)});
@@ -365,6 +368,7 @@ void test_bounds() {
     rejects<std::invalid_argument>([&] { (void) a.view(ta, 1, {1, 2}); });
     rejects<std::logic_error>([&] { a.complete(ta, 1, {1, EndOrigin::none}); });
     rejects<std::invalid_argument>([&] { a.complete(ta, 1, {2, EndOrigin::worker_source}); });
+    rejects<std::invalid_argument>([&] { a.complete(ta, 1, {2, static_cast<EndOrigin>(100)}); });
     a.complete(ta, 1, {2, EndOrigin::none});
     rejects<std::logic_error>([&] { a.complete(ta, 1, {2, EndOrigin::none}); });
     a.complete(ta, 2, {1, EndOrigin::none});
@@ -373,6 +377,9 @@ void test_bounds() {
     rejects<std::invalid_argument>([&] { (void) a.prepare(next, 1, {frame(3, 2)}); });
     rejects<std::invalid_argument>([&] {
         (void) a.prepare(next, 1, {{3, SegmentKind::body, Visibility::public_kv, 2, 2}});
+    });
+    rejects<std::invalid_argument>([&] {
+        (void) a.prepare(next, 1, {{3, SegmentKind::body, Visibility::private_kv, 2, 1}});
     });
     a.prepare(next, 1, {body(3, 2)});
     a.prepare(next, 2, {body(4, 1)});
@@ -402,6 +409,59 @@ void test_bounds() {
     rejects<std::logic_error>([&] { (void) limit.commit(scarce); });
     limit.abort(scarce);
     limit.confirm_drained(scarce);
+
+    // Count distinct runs across members, including the base prefix. A failed
+    // proposal must not keep a run ID or consume the remaining token budget.
+    Episode exact(make_plan(2), {4, 2, 5, 3}, {{1, 0, 1}});
+    auto reserved = exact.begin_step();
+    exact.prepare(reserved, 1, {frame(2, 1), frame(2, 2)});
+    rejects<std::length_error>([&] {
+        (void) exact.prepare(reserved, 2, {frame(3, 1), frame(4, 2)});
+    });
+    rejects<std::length_error>([&] { (void) exact.prepare(reserved, 2, {frame(3, 1, 3)}); });
+    CHECK(exact.revision() == 1 && exact.committed_tokens() == 1);
+    exact.prepare(reserved, 2, {frame(4, 1, 2)});
+    complete_all(exact, reserved, 2);
+    exact.commit(reserved);
+    CHECK(exact.committed_tokens() == 5 && exact.run_length(3) == 0);
+    CHECK(exact.run_length(2) == 2 && exact.run_length(4) == 2);
+
+    // Inputs and result values must not provide a second writer. Keep a view
+    // after its episode is gone so a copied pointer cannot pass this check.
+    ReadView retained;
+    {
+        Plan source_plan = make_plan(1);
+        Config source_config{5, 1, 20, 8};
+        std::vector<BaseRun> source_prefix{{1, 3, 2}};
+        Episode owned(source_plan, source_config, source_prefix);
+        source_plan = make_plan(2);
+        source_config.max_tokens = 1;
+        source_prefix[0].count = 10;
+        CHECK(owned.plan().worker_count() == 1 && owned.committed_tokens() == 2);
+        auto setup = owned.begin_step();
+        std::vector<Append> source_appends{frame(2, 5, 2)};
+        auto writes = owned.prepare(setup, 1, source_appends);
+        source_appends[0].count = 100;
+        writes[0].run = 99;
+        writes[0].count = 100;
+        retained = owned.view(setup, 1, {2, 1});
+        CHECK(retained.key_count() == 4 && contains(retained, 2, 1));
+        CHECK(!contains(retained, 99, 0));
+        owned.complete(setup, 1, {2, EndOrigin::none});
+        owned.commit(setup);
+        auto end = owned.begin_step();
+        owned.prepare(end, 1, {source_end(3, 7)});
+        owned.complete(end, 1, {1, EndOrigin::worker_source});
+        auto result = owned.commit(end);
+        CHECK(result.sealed == std::vector<StageId>{1});
+        result.sealed.clear();
+        CHECK(owned.stage_state(1) == StageState::sealed);
+        CHECK(owned.run_length(1) == 2 && owned.run_length(2) == 2);
+    }
+    auto copied_entries = expand(retained, 4);
+    CHECK(copied_entries.size() == 4 && copied_entries.back().run == 2);
+    copied_entries.back().run = 99;
+    CHECK(expand(retained, 4).back().run == 2);
 
     // Large writer positions must not wrap when another reader puts the run
     // near the start of its virtual document.

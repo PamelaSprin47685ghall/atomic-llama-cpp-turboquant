@@ -283,6 +283,9 @@ std::vector<WriteSpan> Episode::prepare(const Step & step, StageId stage, std::v
         } else if (append.kind == SegmentKind::frame) {
             throw std::invalid_argument("RERoT FRAME cannot be forwarded twice");
         }
+        if (append.kind == SegmentKind::body && append.visibility != Visibility::public_kv) {
+            throw std::invalid_argument("RERoT BODY must be public");
+        }
         if ((append.kind == SegmentKind::control || append.kind == SegmentKind::source_end) &&
             append.visibility != Visibility::private_kv) {
             throw std::invalid_argument("RERoT control and source end must remain private");
