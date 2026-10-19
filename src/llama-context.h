@@ -71,11 +71,17 @@ struct llama_context {
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max() const;
+    uint32_t n_seq_max_active() const;
 
     uint32_t n_threads()       const;
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+
+    llama_kv_cache * attention_view_cache() const;
+    bool attention_views_supported() const;
+    bool set_attention_views(const llama_attention_view * views, size_t count);
+    void clear_attention_views();
 
     // return the *effective* K/V cache tensor types currently in use by the memory object.
     // this can differ from what was requested via llama_context_params.type_k/type_v because
@@ -349,6 +355,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    uint32_t attention_node_budget = 0;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

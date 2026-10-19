@@ -6,6 +6,23 @@ if(NOT TARGET llama)
     find_package(llama CONFIG REQUIRED)
 endif()
 
+add_executable(test-rerot-attention-oracle rerot-attention-oracle.cpp)
+target_compile_features(test-rerot-attention-oracle PRIVATE cxx_std_17)
+target_link_libraries(test-rerot-attention-oracle PRIVATE llama)
+add_test(NAME rerot-attention-oracle COMMAND test-rerot-attention-oracle)
+set_tests_properties(rerot-attention-oracle PROPERTIES TIMEOUT 120)
+
+add_executable(test-rerot-reader-views rerot-reader-views.cpp)
+target_compile_features(test-rerot-reader-views PRIVATE cxx_std_17)
+target_link_libraries(test-rerot-reader-views PRIVATE llama)
+set(TQ_REROT_TEST_MODEL "" CACHE FILEPATH "Real model for reader visibility and native state tests")
+set(TQ_REROT_TEST_GPU_LAYERS "0" CACHE STRING "GPU layers for the optional reader view test")
+if(TQ_REROT_TEST_MODEL)
+    add_test(NAME rerot-reader-views COMMAND test-rerot-reader-views
+        --model "${TQ_REROT_TEST_MODEL}" --gpu-layers "${TQ_REROT_TEST_GPU_LAYERS}")
+    set_tests_properties(rerot-reader-views PROPERTIES TIMEOUT 900)
+endif()
+
 add_executable(test-compute-memory compute-memory.cpp)
 target_compile_features(test-compute-memory PRIVATE cxx_std_17)
 target_link_libraries(test-compute-memory PRIVATE ggml::ggml ggml::ggml-cpu)

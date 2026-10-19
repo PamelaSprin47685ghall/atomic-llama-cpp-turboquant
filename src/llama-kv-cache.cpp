@@ -1898,6 +1898,144 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+using attention_cell_map = std::map<std::pair<llama_seq_id, llama_pos>, int32_t>;
+
+static attention_cell_map attention_cells(const llama_kv_cells & cells) {
+    attention_cell_map out;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        const auto & owners = cells.seq_get_all(i);
+        for (llama_seq_id seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
+            if (owners.test(seq)) {
+                auto result = out.emplace(std::make_pair(seq, cells.pos_get(i)), int32_t(i));
+                if (!result.second) {
+                    result.first->second = -1; // An ambiguous logical identity is invalid.
+                }
+            }
+        }
+    }
+    return out;
+}
+
+bool llama_kv_cache::prepare_attention_views(const llama_attention_view * views, size_t count,
+        std::vector<llama_attention_view_owned> & out) const {
+    if (get_n_stream() != 1 || !views || count == 0 || count > LLAMA_MAX_SEQ || get_has_shift()) {
+        return false;
+    }
+    const auto cells = attention_cells(v_cells[0]);
+    std::set<std::pair<llama_seq_id, llama_pos>> pending;
+    std::set<llama_seq_id> readers;
+    for (size_t i = 0; i < count; ++i) {
+        const auto & view = views[i];
+        if (view.query_seq < 0 || size_t(view.query_seq) >= seq_to_stream.size() ||
+            view.query_pos < 0 || view.query_virtual_pos < 0 || !view.entries ||
+            view.n_entries == 0 || view.n_entries > get_size() ||
+            !readers.insert(view.query_seq).second ||
+            !pending.emplace(view.query_seq, view.query_pos).second ||
+            cells.count({ view.query_seq, view.query_pos }) != 0) {
+            return false;
+        }
+    }
+    std::vector<llama_attention_view_owned> result;
+    result.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const auto & view = views[i];
+        std::set<int32_t> physical;
+        bool own = false;
+        llama_pos previous_virtual = -1;
+        for (size_t j = 0; j < view.n_entries; ++j) {
+            const auto & entry = view.entries[j];
+            const auto identity = std::make_pair(entry.key_seq, entry.key_pos);
+            const bool current = identity == std::make_pair(view.query_seq, view.query_pos);
+            const int64_t effective = int64_t(view.query_virtual_pos) + entry.key_pos - entry.virtual_pos;
+            if (entry.key_seq < 0 || size_t(entry.key_seq) >= seq_to_stream.size() || entry.key_pos < 0 ||
+                (entry.key_seq == view.query_seq && entry.key_pos > view.query_pos) ||
+                entry.virtual_pos <= previous_virtual || entry.virtual_pos > view.query_virtual_pos ||
+                effective < 0 || effective > INT32_MAX) {
+                return false;
+            }
+            previous_virtual = entry.virtual_pos;
+            if (current) {
+                if (own || entry.virtual_pos != view.query_virtual_pos) {
+                    return false;
+                }
+                own = true;
+            } else {
+                const auto found = cells.find(identity);
+                if (pending.count(identity) || found == cells.end() || found->second < 0 ||
+                    !physical.insert(found->second).second) {
+                    return false;
+                }
+            }
+        }
+        if (!own) {
+            return false;
+        }
+        result.push_back({ view.query_seq, view.query_pos, view.query_virtual_pos,
+                           { view.entries, view.entries + view.n_entries } });
+    }
+    out = std::move(result);
+    return true;
+}
+
+bool llama_kv_cache::validate_attention_batch(const llama_batch & batch) const {
+    if (attention_views.empty()) {
+        return true;
+    }
+    if (batch.n_tokens != int32_t(attention_views.size()) || !batch.pos || !batch.n_seq_id || !batch.seq_id ||
+        !batch.token || batch.embd) {
+        return false;
+    }
+    std::set<llama_seq_id> readers;
+    std::vector<llama_attention_view> views;
+    for (const auto & view : attention_views) {
+        views.push_back({ view.query_seq, view.query_pos, view.query_virtual_pos,
+                          view.entries.size(), view.entries.data() });
+    }
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || !batch.seq_id[i] || !readers.insert(batch.seq_id[i][0]).second) {
+            return false;
+        }
+        const auto found = std::find_if(views.begin(), views.end(), [&](const auto & view) {
+            return view.query_seq == batch.seq_id[i][0] && view.query_pos == batch.pos[i];
+        });
+        if (found == views.end()) {
+            return false;
+        }
+    }
+    std::vector<llama_attention_view_owned> checked;
+    return prepare_attention_views(views.data(), views.size(), checked);
+}
+
+bool llama_kv_cache::resolve_attention_view(llama_seq_id seq, llama_pos pos,
+        llama_attention_view_resolved & out) const {
+    const auto found = std::find_if(attention_views.begin(), attention_views.end(), [&](const auto & view) {
+        return view.query_seq == seq && view.query_pos == pos;
+    });
+    if (found == attention_views.end() || get_has_shift()) {
+        return false;
+    }
+    const auto cells = attention_cells(v_cells[0]);
+    llama_attention_view_resolved result;
+    std::set<int32_t> physical;
+    for (const auto & entry : found->entries) {
+        const auto cell = cells.find({ entry.key_seq, entry.key_pos });
+        if (cell == cells.end() || cell->second < 0 || !physical.insert(cell->second).second) {
+            return false;
+        }
+        const auto effective = llama_pos(int64_t(found->query_virtual_pos) + entry.key_pos - entry.virtual_pos);
+        if (result.spans.empty() || result.spans.back().effective_pos != effective) {
+            result.spans.push_back({ effective, {} });
+        }
+        result.spans.back().indices.push_back(cell->second);
+        result.indices.push_back(cell->second);
+    }
+    out = std::move(result);
+    return true;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -3531,6 +3669,18 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+bool llama_kv_cache_context::has_attention_views() const {
+    return !ubatches.empty() && !kv->attention_views.empty();
+}
+
+llama_attention_view_resolved llama_kv_cache_context::attention_view(llama_seq_id seq, llama_pos pos) const {
+    llama_attention_view_resolved result;
+    if (!has_attention_views() || !kv->resolve_attention_view(seq, pos, result)) {
+        throw std::runtime_error("reader view no longer resolves to its stored KV cells");
+    }
+    return result;
 }
 
 bool llama_kv_cache_context::has_kv_stream_targets() const {

@@ -444,6 +444,10 @@ extern "C" {
         // The logical per-sequence window remains n_ctx. Rebuild callers when
         // changing this versioned struct; a stable binary ABI is not promised.
         uint32_t n_ctx_kv;
+
+        // Physical recurrent states. 0 uses n_seq_max. Logical sequence IDs
+        // keep their n_seq_max range. A new live state fails if this pool is full.
+        uint32_t n_rs_slots;
     };
 
     struct llama_model_tensor_override {
@@ -790,6 +794,47 @@ extern "C" {
     //
     // Memory
     //
+
+    // An explicit reader view of the same context's stored attention keys.
+    // Positions are text RoPE positions, not byte or physical KV offsets.
+    struct llama_attention_entry {
+        llama_seq_id key_seq;
+        llama_pos key_pos;
+        llama_pos virtual_pos;
+    };
+
+    struct llama_attention_view {
+        llama_seq_id query_seq;
+        llama_pos query_pos;
+        llama_pos query_virtual_pos;
+        size_t n_entries;
+        const struct llama_attention_entry * entries;
+    };
+
+    // This reference route uses stored K at writer positions and rotates Q for
+    // each reader span. All visible entries share one softmax per query/head.
+    // It requires a supported text RoPE model and a unified, resident KV cache.
+    // Both K and V must use GGML_TYPE_F32; other cache types are rejected.
+    // It does not use the ordinary flash-attention kernel for these queries.
+    LLAMA_API bool llama_attention_views_supported(const struct llama_context * ctx);
+
+    // Copies the views. Failure preserves the previous views and all model state.
+    // Each view must include its own current key exactly once. Foreign entries
+    // must already exist; another query's pending key is not visible. The next
+    // decode must have exactly these one-token, one-sequence query rows. These
+    // APIs share the context's single-caller contract with llama_decode.
+    LLAMA_API bool llama_attention_set_views(
+            struct llama_context * ctx,
+            const struct llama_attention_view * views,
+            size_t n_views);
+
+    // Clear the view before returning to ordinary decoding. Synchronizes work
+    // that reads the current view before releasing its owned metadata.
+    LLAMA_API void llama_attention_clear_views(struct llama_context * ctx);
+
+    // Release only the native recurrent state. Stored attention keys keep their
+    // logical sequence owner and remain visible through explicit reader views.
+    LLAMA_API bool llama_memory_seq_rm_recurrent(llama_memory_t mem, llama_seq_id seq_id);
 
     // Clear the memory contents
     // If data == true, the data buffers will also be cleared together with the metadata

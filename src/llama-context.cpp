@@ -111,6 +111,10 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
+    cparams.n_rs_slots = params.n_rs_slots == 0 ? cparams.n_seq_max : params.n_rs_slots;
+    if (cparams.n_rs_slots > cparams.n_seq_max) {
+        throw std::runtime_error("n_rs_slots must be <= n_seq_max");
+    }
 
     cparams.n_rs_seq = params.n_rs_seq;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
@@ -1117,7 +1121,7 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
         return false;
     }
 
-    const uint32_t n_seqs    = cparams.n_seq_max;
+    const uint32_t n_seqs    = n_seq_max_active();
     const uint32_t n_tokens  = decode ? n_seqs : std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_outputs = decode ? n_seqs : std::min(n_tokens, cparams.n_outputs_max);
     auto *         gf        = graph_reserve(n_tokens, n_seqs, n_outputs, reserve_mctx.get());
@@ -1154,7 +1158,7 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs   = cparams.n_seq_max;
+    const uint32_t n_seqs   = n_seq_max_active();
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
@@ -1574,6 +1578,93 @@ uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
 
+uint32_t llama_context::n_seq_max_active() const {
+    return llm_arch_is_recurrent(model.arch) || llm_arch_is_hybrid(model.arch) ?
+        cparams.n_rs_slots : cparams.n_seq_max;
+}
+
+llama_kv_cache * llama_context::attention_view_cache() const {
+    if (auto * cache = dynamic_cast<llama_kv_cache *>(memory.get())) {
+        return cache;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        return hybrid->get_mem_attn();
+    }
+    return nullptr;
+}
+
+bool llama_context::attention_views_supported() const {
+    const auto * cache = attention_view_cache();
+    if (!cache || !cparams.kv_unified || !cparams.causal_attn || cparams.embeddings ||
+        cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.kv_stream_arena_mib != 0 ||
+        model.hparams.swa_type != LLAMA_SWA_TYPE_NONE || model.hparams.f_max_alibi_bias != 0 ||
+        model.hparams.n_pos_per_embd() != 1 || model.hparams.use_kq_norm ||
+        cache->type_k() != GGML_TYPE_F32 || cache->type_v() != GGML_TYPE_F32) {
+        return false;
+    }
+    switch (model.arch) {
+        case LLM_ARCH_LLAMA:
+        case LLM_ARCH_QWEN2:
+        case LLM_ARCH_QWEN2MOE:
+        case LLM_ARCH_QWEN3:
+        case LLM_ARCH_QWEN3MOE:
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_LFM2:
+        case LLM_ARCH_LFM2MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool llama_context::set_attention_views(const llama_attention_view * views, size_t count) {
+    if (!attention_views_supported() || !views || count == 0 || count > cparams.n_batch ||
+        count > n_seq_max_active()) {
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (views[i].query_seq < 0 || uint32_t(views[i].query_seq) >= cparams.n_seq_max) {
+            return false;
+        }
+    }
+    auto * cache = attention_view_cache();
+    std::vector<llama_attention_view_owned> owned;
+    if (!cache->prepare_attention_views(views, count, owned)) {
+        return false;
+    }
+    uint64_t extra = 0;
+    for (const auto & view : owned) {
+        int64_t previous = -1;
+        extra += 24;
+        for (const auto & entry : view.entries) {
+            const int64_t effective = int64_t(view.query_virtual_pos) + entry.key_pos - entry.virtual_pos;
+            if (effective != previous) {
+                extra += 16;
+                previous = effective;
+            }
+        }
+    }
+    const uint64_t budget = extra * model.hparams.n_layer() + 64ull * model.n_tensors() +
+                            160ull * std::min(cparams.n_ctx, cparams.n_ubatch);
+    if (budget > UINT32_MAX) {
+        return false;
+    }
+    synchronize();
+    cache->attention_views = std::move(owned);
+    if (budget > attention_node_budget) {
+        attention_node_budget = uint32_t(budget);
+        sched_need_reserve = true;
+    }
+    return true;
+}
+
+void llama_context::clear_attention_views() {
+    if (auto * cache = attention_view_cache()) {
+        synchronize();
+        cache->attention_views.clear();
+    }
+}
+
 uint32_t llama_context::n_threads() const {
     return cparams.n_threads;
 }
@@ -1716,7 +1807,7 @@ bool llama_context::memory_update(bool optimize) {
             throw std::runtime_error("failed to initialize memory context");
         }
 
-        const uint32_t n_seqs   = cparams.n_seq_max;
+        const uint32_t n_seqs   = n_seq_max_active();
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
@@ -2685,6 +2776,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    if (const auto * cache = attention_view_cache()) {
+        if ((!cache->attention_views.empty() && !attention_views_supported()) ||
+            !cache->validate_attention_batch(batch_inp)) {
+            LLAMA_LOG_ERROR("%s: batch does not match the installed reader views\n", __func__);
+            return -1;
+        }
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -3357,6 +3456,9 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    if (attention_node_budget != 0) {
+        return attention_node_budget;
+    }
     if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
         // so they cost about 8.6 nodes per tensor against 5.9 for plain DFlash.
@@ -4563,6 +4665,7 @@ llama_context_params llama_context_default_params() {
         /*.ctx_other                   =*/nullptr,
         /*.kv_stream_arena_mib         =*/0,
         /*.n_ctx_kv                    =*/0,
+        /*.n_rs_slots                  =*/0,
     };
 
     return result;
@@ -4976,6 +5079,32 @@ int32_t llama_set_adapter_cvec(llama_context * ctx,
 //
 // memory
 //
+
+bool llama_attention_views_supported(const llama_context * ctx) {
+    return ctx && ctx->attention_views_supported();
+}
+
+bool llama_attention_set_views(llama_context * ctx, const llama_attention_view * views, size_t count) {
+    if (!ctx) {
+        return false;
+    }
+    try {
+        return ctx->set_attention_views(views, count);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return false;
+    }
+}
+
+void llama_attention_clear_views(llama_context * ctx) {
+    if (ctx) {
+        ctx->clear_attention_views();
+    }
+}
+
+bool llama_memory_seq_rm_recurrent(llama_memory_t mem, llama_seq_id seq_id) {
+    return mem && seq_id >= 0 && mem->seq_rm_recurrent(seq_id);
+}
 
 void llama_memory_clear(llama_memory_t mem, bool data) {
     if (!mem) {

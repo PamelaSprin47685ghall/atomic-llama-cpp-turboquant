@@ -524,10 +524,30 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
     }
+    set_reader_input();
+}
+
+void llm_graph_input_attn_kv::set_reader_input() {
+    for (const auto & reader : readers) {
+        ggml_backend_tensor_set(reader.indices, reader.values.data(), 0, reader.values.size() * sizeof(int32_t));
+        for (const auto & span : reader.spans) {
+            ggml_backend_tensor_set(span.indices, span.values.indices.data(), 0,
+                                    span.values.indices.size() * sizeof(int32_t));
+            if (span.position) {
+                ggml_backend_tensor_set(span.position, &span.values.effective_pos, 0, sizeof(llama_pos));
+            }
+        }
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+
+    // Reader positions and membership belong to this immutable frontier. A
+    // different frontier can have the same shape and a different visible set.
+    if (!readers.empty() || mctx->has_attention_views()) {
+        return false;
+    }
 
     this->mctx = mctx;
 
@@ -1110,7 +1130,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
+    inp_attn->set_reader_input();
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1137,6 +1160,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+
+    if (!inp_attn->readers.empty() || mctx->get_attn()->has_attention_views()) {
+        return false;
+    }
 
     this->mctx = mctx;
 
@@ -2878,8 +2905,29 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        if (mctx_cur->has_attention_views()) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                auto resolved = mctx_cur->attention_view(ubatch.seq_id[i][0], ubatch.pos[i]);
+                llm_graph_input_attn_kv::reader_input reader;
+                reader.values = std::move(resolved.indices);
+                reader.indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, reader.values.size());
+                ggml_set_input(reader.indices);
+                for (auto & span : resolved.spans) {
+                    auto * indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, span.indices.size());
+                    auto * position = span.effective_pos == ubatch.pos[i] ? nullptr :
+                                      ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+                    ggml_set_input(indices);
+                    if (position) {
+                        ggml_set_input(position);
+                    }
+                    reader.spans.push_back({ indices, position, std::move(span) });
+                }
+                inp->readers.push_back(std::move(reader));
+            }
+        } else {
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            inp->self_kq_mask_cnv = inp->self_kq_mask;
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2896,6 +2944,105 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
+ggml_tensor * llm_graph_context::build_attn_reader(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * q_rope,
+        ggml_tensor * q_native,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * sinks,
+        float kq_scale,
+        int il) const {
+    // K stays at its writer position. Recreate Q from the exact pre-RoPE
+    // source and original parameters. Applying RoPE a second time to an
+    // already scaled Q would change YaRN's attention factor.
+    GGML_ASSERT(q_rope->op == GGML_OP_ROPE && q_rope->src[0]);
+    GGML_ASSERT(k->ne[3] == 1 && v->ne[3] == 1);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    auto * q_raw = q_rope->src[0];
+    GGML_ASSERT(inp->readers.size() == size_t(q_raw->ne[2]));
+
+    // Keep the native batch and cache strides for the writer-position scores.
+    // Some backends change their input precision for different strides. Every
+    // view includes its current key, so these scores always have a consumer.
+    auto * base_scores = ggml_mul_mat(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3),
+                                           ggml_permute(ctx0, q_native, 0, 2, 1, 3));
+    ggml_mul_mat_set_prec(base_scores, GGML_PREC_F32);
+
+    // The resident KV pool is shared. Only a reader's scores are assembled;
+    // neither K nor V is rephased or copied into a private persistent cache.
+    auto * k_flat = ggml_reshape_2d(ctx0, ggml_is_contiguous(k) ? k : ggml_cont(ctx0, k),
+                                  k->ne[0] * k->ne[1], k->ne[2]);
+    ggml_tensor * all_scores = nullptr;
+    for (size_t i = 0; i < inp->readers.size(); ++i) {
+        const auto & reader = inp->readers[i];
+        auto * q_one = ggml_view_3d(ctx0, q_raw, q_raw->ne[0], q_raw->ne[1], 1,
+                                    q_raw->nb[1], q_raw->nb[2], i * q_raw->nb[2]);
+        auto * base_one = ggml_view_3d(ctx0, base_scores, base_scores->ne[0], 1, base_scores->ne[2],
+                                      base_scores->nb[1], base_scores->nb[2], i * base_scores->nb[1]);
+        auto * base_heads = ggml_cont_2d(ctx0, ggml_permute(ctx0, base_one, 1, 2, 0, 3),
+                                        q_raw->ne[1], k->ne[2]);
+        ggml_tensor * scores = nullptr;
+        for (const auto & span : reader.spans) {
+            ggml_tensor * partial;
+            if (span.values.effective_pos == ubatch.pos[i]) {
+                partial = ggml_get_rows(ctx0, base_heads, span.indices);
+                partial = ggml_cont(ctx0, ggml_transpose(ctx0, partial));
+                partial = ggml_reshape_3d(ctx0, partial, span.values.indices.size(), 1, q_raw->ne[1]);
+            } else {
+                GGML_ASSERT(span.position);
+                auto * query = ggml_rope_ext(ctx0, q_one, span.position, q_rope->src[2], n_rot, rope_type,
+                                            n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
+                                            beta_fast, beta_slow);
+                std::memcpy(query->op_params, q_rope->op_params, sizeof(query->op_params));
+                if (inp->self_k_rot) {
+                    query = llama_mul_mat_hadamard(ctx0, query, inp->self_k_rot);
+                }
+                query = ggml_permute(ctx0, query, 0, 2, 1, 3);
+                auto * keys = ggml_get_rows(ctx0, k_flat, span.indices);
+                keys = ggml_reshape_3d(ctx0, keys, k->ne[0], k->ne[1], span.values.indices.size());
+                keys = ggml_permute(ctx0, keys, 0, 2, 1, 3);
+                partial = ggml_mul_mat(ctx0, keys, query);
+                ggml_mul_mat_set_prec(partial, GGML_PREC_F32);
+            }
+            scores = scores ? ggml_concat(ctx0, scores, partial, 0) : partial;
+        }
+        GGML_ASSERT(scores);
+        if (hparams.attn_soft_cap) {
+            scores = ggml_scale(ctx0, scores, 1.0f / hparams.f_attn_logit_softcapping);
+            scores = ggml_tanh(ctx0, scores);
+            scores = ggml_scale(ctx0, scores, hparams.f_attn_logit_softcapping);
+        }
+        // Preserve the native physical reduction order and padding. A tiny
+        // change in a compact sum can cross a later quantization boundary.
+        auto * physical = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, k->ne[2], q_raw->ne[1]);
+        physical = ggml_fill(ctx0, physical, -INFINITY);
+        auto * rows = ggml_reshape_3d(ctx0, scores, 1, reader.values.size(), q_raw->ne[1]);
+        physical = ggml_set_rows(ctx0, physical, rows, reader.indices);
+        physical = ggml_reshape_3d(ctx0, physical, k->ne[2], 1, q_raw->ne[1]);
+        all_scores = all_scores ? ggml_concat(ctx0, all_scores, physical, 1) : physical;
+    }
+
+    // One global normalization across all visible fragments, followed by the
+    // native batched V operation. Hidden cells have a zero softmax weight.
+    all_scores = ggml_soft_max_ext(ctx0, all_scores, nullptr, kq_scale, 0.0f);
+    ggml_soft_max_add_sinks(all_scores, sinks);
+    cb(all_scores, "reader_global_softmax", il);
+    const bool v_trans = v->nb[1] > v->nb[2];
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    if (!v_trans) {
+        v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+    }
+    auto * output = ggml_mul_mat(ctx0, v, all_scores);
+    output = ggml_permute(ctx0, output, 0, 2, 1, 3);
+    output = ggml_cont_2d(ctx0, output, output->ne[0] * output->ne[1], output->ne[2] * output->ne[3]);
+    if (!cparams.offload_kqv) {
+        ggml_backend_sched_set_tensor_backend(sched, output, backend_cpu);
+    }
+    ggml_build_forward_expand(gf, output);
+    return output;
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -2910,6 +3057,8 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
+
+    auto * q_rope = q_cur;
 
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
@@ -2958,7 +3107,10 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    GGML_ASSERT(inp->readers.empty() || kq_b == nullptr);
+    ggml_tensor * cur = inp->readers.empty() ?
+        build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il) :
+        build_attn_reader(inp, q_rope, q, k, v, sinks, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, the output has padded dimensions.

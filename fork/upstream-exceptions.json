@@ -121,57 +121,166 @@
     },
     {
       "path": "include/llama.h",
-      "sha256": "d9916907175a664f4ea79f0302b96c33fc3e9e62c6ea88a494e010ba45f4feb2",
+      "sha256": "eaeac8f0e3b680e2ee2f337e967850c08e5adcbbda27b18d16219e10fad47125",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
-        "tools/server"
+        "tools/server",
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
       ],
-      "reason": "Expose versioned physical KV sizing, compute allocation observation and synchronized release.",
+      "reason": "Expose versioned physical KV sizing, compute allocation observation and synchronized release. Expose owned logical reader views, capability checks, physical recurrent-state capacity and recurrent-only retirement through public A APIs.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
+      "path": "src/llama-attention-view.h",
+      "sha256": "fe8b08c29d18d099ffdaba2c3ba416175bdc76fd8081ecb61f5fe816005860d3",
+      "mode": "100644",
+      "consumers": [
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Own reader metadata and per-call resolved KV indices inside A; no physical cache address crosses the public boundary.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+    },
+    {
       "path": "src/llama-context.cpp",
-      "sha256": "c9d9f2a508cbe0efcf91a3a5a937fbfeec1e55447d8cb972ff5895c43ed72559",
+      "sha256": "9878b3ff9fb3402be5478a434164e3ee269ac7ffe924a7731156e79f019e8f47",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
-        "tools/server"
+        "tools/server",
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
       ],
-      "reason": "Validate physical KV independently from the logical window and invalidate graph state before workspace release.",
+      "reason": "Validate physical KV independently from the logical window and invalidate graph state before workspace release. Validate reader capability and batches, drain before changing views, budget reader graphs and size physical recurrent reserve independently from logical identities.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
       "path": "src/llama-context.h",
-      "sha256": "4fe6d3171b59968e22bc01caa72952d49a80702101d2226b7bb0989dcf50bba3",
+      "sha256": "c7602a76e551761428d428a876b86484608b62d788a8226e2f9c722bd3100e0e",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
-        "tools/server"
+        "tools/server",
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
       ],
-      "reason": "A owns physical size observation and private graph/allocator release implementation.",
+      "reason": "A owns physical size observation and private graph/allocator release implementation. Store the native reader-graph budget and declare A-owned view and active-state helpers.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
       "path": "src/llama-cparams.h",
-      "sha256": "750f7ced89a9a4b79c111028508da5f524d70c08be810d4c48c5ba0d45e60237",
+      "sha256": "3180023354d306a3c62f87e6c708b518f4cd501918743b62749cffd8eb05ebf7",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
-        "tools/server"
+        "tools/server",
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
       ],
-      "reason": "Carry explicit physical KV allocation size separately from logical sequence context.",
+      "reason": "Carry explicit physical KV allocation size separately from logical sequence context. Carry physical recurrent-state capacity independently of the logical sequence namespace.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {
+      "path": "src/llama-graph.cpp",
+      "sha256": "2af150f8779e3ad9ecc6b537202c9b6c979d2fb16655dcc0f6809a5f3c579ac7",
+      "mode": "100644",
+      "consumers": [
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Assemble immutable reader scores at shared physical KV positions, rotate raw Q only for changed phases, and reuse native batched softmax/V reduction; preserve ordinary dispatch and input precision.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+    },
+    {
+      "path": "src/llama-graph.h",
+      "sha256": "087693cb84344308b74dc7505c82f707124ff7d701c54b8d50ecf2408bdeaf17",
+      "mode": "100644",
+      "consumers": [
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Declare owned reader graph inputs and the native attention composition helper.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+    },
+    {
+      "path": "src/llama-kv-cache.cpp",
+      "sha256": "839df30582f517eec4715ff46b323fb57a773500675b9e84fbd5f6f04b7c4da5",
+      "mode": "100644",
+      "consumers": [
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Resolve logical keys only inside A after allocation; reject missing, shifted, duplicate, ambiguous or pending peer identities.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+    },
+    {
+      "path": "src/llama-kv-cache.h",
+      "sha256": "e230833526353e57beb9113162f002122bf8c63eb6de8d7e310abaaac50a04fa",
+      "mode": "100644",
+      "consumers": [
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Keep explicit reader views and expose internal preparation and resolution to the native graph builder.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+    },
+    {
+      "path": "src/llama-memory-hybrid.h",
+      "sha256": "53229d1857b624ad9f4bfeceb7a2ba922c1a231b1044acd3d210dc223ef8e61f",
+      "mode": "100644",
+      "consumers": [
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Retire native recurrent state without deleting a sealed stage's resident attention keys.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+    },
+    {
+      "path": "src/llama-memory-recurrent.cpp",
+      "sha256": "cd13ab45e4d44346210f5320917bb00300a8897708fa90328a5a5dbf9af77c5e",
+      "mode": "100644",
+      "consumers": [
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Separate logical tails from physical cells, check live capacity before mutation and preserve tails in preparation and native state restore.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+    },
+    {
+      "path": "src/llama-memory-recurrent.h",
+      "sha256": "8f79b71f2935ee2a8ec81f7ea8550e37ba6c3dce9ca31a5a24e1c811689a3eea",
+      "mode": "100644",
+      "consumers": [
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Store logical sequence tails independently and implement recurrent-only retirement.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+    },
+    {
+      "path": "src/llama-memory.h",
+      "sha256": "c027893445c4d663b1a9d83048919afd9d14dff27166bfaa0b6380f71e24c5a2",
+      "mode": "100644",
+      "consumers": [
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
+      ],
+      "reason": "Define the native memory retirement operation without exporting private state.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+    },
+    {
       "path": "src/llama-model.cpp",
-      "sha256": "cfd7e05bf7f2f3dda9fd814187c30af8800fa4bbc1f9b26326991ab31a3d350b",
+      "sha256": "57902ddda0b63b9ea285259a1dd0bfc41639c8b7c2d20ca768315681c649c687",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
-        "tools/server"
+        "tools/server",
+        "fork/rerot-compose",
+        "fork/tests/a-seams"
       ],
-      "reason": "Pass physical size only to attention KV constructors; preserve logical context and recurrent sizing.",
+      "reason": "Pass physical size only to attention KV constructors; preserve logical context and recurrent sizing. Construct native recurrent pools with physical state capacity while retaining the full logical sequence namespace.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
     },
     {

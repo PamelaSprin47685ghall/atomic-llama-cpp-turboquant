@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-attention-view.h"
 
 #include <cstdint>
 #include <vector>
@@ -325,6 +326,16 @@ public:
 
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
+    struct reader_span_input {
+        ggml_tensor * indices;
+        ggml_tensor * position;
+        llama_attention_span_resolved values;
+    };
+    struct reader_input {
+        ggml_tensor * indices;
+        std::vector<int32_t> values;
+        std::vector<reader_span_input> spans;
+    };
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -338,6 +349,9 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    void set_reader_input();
+    std::vector<reader_input> readers;
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
@@ -1143,6 +1157,16 @@ struct llm_graph_context {
                 int64_t   n_kv_max,
                   float   kq_scale,
                     int   il) const;
+
+    ggml_tensor * build_attn_reader(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * q_rope,
+        ggml_tensor * q_native,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * sinks,
+        float kq_scale,
+        int il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

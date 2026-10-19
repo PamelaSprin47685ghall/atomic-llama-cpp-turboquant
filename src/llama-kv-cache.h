@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-batch.h"
+#include "llama-attention-view.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
@@ -165,6 +166,7 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rm_recurrent(llama_seq_id) override { return true; }
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -204,6 +206,13 @@ public:
     ggml_type type_v() const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
+    bool prepare_attention_views(const llama_attention_view * views, size_t count,
+                                std::vector<llama_attention_view_owned> & out) const;
+    bool validate_attention_batch(const llama_batch & batch) const;
+    bool resolve_attention_view(llama_seq_id seq, llama_pos pos,
+                                llama_attention_view_resolved & out) const;
+    std::vector<llama_attention_view_owned> attention_views;
 
     // state_read, plus the cells the restored tokens were placed in.
     // a cache that mirrors another one cell for cell (the qwen4exp indexer) cannot search for
@@ -488,6 +497,9 @@ public:
 
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_pos_contiguous() const;
+
+    bool has_attention_views() const;
+    llama_attention_view_resolved attention_view(llama_seq_id seq, llama_pos pos) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

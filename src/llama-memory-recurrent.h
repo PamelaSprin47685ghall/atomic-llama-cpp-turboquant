@@ -45,6 +45,7 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rm_recurrent(llama_seq_id seq_id) override { return seq_rm(seq_id, -1, -1); }
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -101,7 +102,6 @@ public:
         llama_pos pos  = -1;
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
-        int32_t   tail = -1;
 
         std::set<llama_seq_id> seq_id;
 
@@ -119,6 +119,10 @@ public:
     };
 
     std::vector<mem_cell> cells;
+
+    // One logical tail per sequence. A sealed sequence can retain attention KV
+    // without occupying a physical recurrent state.
+    std::vector<int32_t> tails;
 
     // per layer
     std::vector<ggml_tensor *> r_l;
