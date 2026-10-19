@@ -1,23 +1,23 @@
 # TP5 重写后的剩余候选：按证据决定重写
 
-审阅日期：2026-10-19（Asia/Shanghai）。本文是需求与重写依据的文本记录。
-**本文全部候选均为 TEXT_ONLY / NOT_ADMITTED；没有迁移旧实现，也没有取得新的模型或设备运行资格。**
+最初审阅日期：2026-10-19（Asia/Shanghai）。本文保留需求、归档入口、原始来源和最低验收条件，并在 E11 / E23 追加后续 RERoT 重写的实现状态。
+**最初文本审计时全部候选均为 TEXT_ONLY / NOT_ADMITTED；该轮没有迁移旧实现，也没有取得新的模型或设备运行资格。后续 E11 / E23 的新实现和独立测试另行记录，其余未证实的旧代码仍不迁入。**
 
 ## 1. 审阅身份与使用方法
 
 | 对象 | 固定身份 |
 |---|---|
-| 当前 clean 分支 | `clean/fork-20261018` |
-| 本次审阅起点 | `7ccaa898451270e395ab1cf150b2c62e9fb1f2a5` |
+| 最初审阅的 clean 分支 | `clean/fork-20261018` |
+| 最初文本审阅起点 | `7ccaa898451270e395ab1cf150b2c62e9fb1f2a5` |
 | A：固定上游 | `cda0f9256665845cd9d6f3a0176880883f653a3d` |
 | 旧 fork / 归档来源 | `2777543b2358c88cd1c2000f7fa342b764a0e213`，`archive/pre-clean-20261018` |
 | 逐文件总账 | [audit/files.json](audit/files.json)，714 个非 artifacts/reports 路径 |
 | 总账 SHA-256 | `1356aa167c1ebf247e55ab2b8dab9b14aba8c8514367c27bf18c4d549df26368` |
 | 起点的 A 例外清单 SHA-256 | `79c426aee09fa4395bb7b1685d8dc083a75238c6bca62a31ebbf64b8bc96e9be` |
 
-本次把当前 README、迁移表、relay/probe 交付说明和新增路径，与已有逐文件总账、差异及重点原函数交叉核对，并阅读下列原论文。总账原有的 546 项完整所供差异/文件阅读、168 项选定范围阅读是历史阅读深度，**不是本次逐行重审或 714 项运行通过**。归档性能、注释、fixture、脚本返回 PASS、可编译、论文结果均不自动证明旧实现可迁。未见充分证据不等于已证明无用或必然错误。
+最初审计把当时的 README、迁移表、relay/probe 交付说明和新增路径，与已有逐文件总账、差异及重点原函数交叉核对，并阅读下列原论文。总账原有的 546 项完整所供差异/文件阅读、168 项选定范围阅读是历史阅读深度，**不是该轮逐行重审或 714 项运行通过**。归档性能、注释、fixture、脚本返回 PASS、可编译、论文结果均不自动证明旧实现可迁。未见充分证据不等于已证明无用或必然错误。上表的起点、总账摘要及起点 A manifest 摘要保持原值；它们不是后续 RERoT 实现的源码身份。
 
-每个条目保留四件事：具体消费者；固定归档中的入口；已经知道的证据缺口；重新实现后应满足的最低条件。旧 ID 如 `small:S05`、`server:K01`、`G14` 用于回查对应[审计分册](AUDIT.md)，不是新测试编号。下文列出的是未来验收条件，本次未执行这些实验。
+每个条目保留四件事：具体消费者；固定归档中的入口；已经知道的证据缺口；重新实现后应满足的最低条件。旧 ID 如 `small:S05`、`server:K01`、`G14` 用于回查对应[审计分册](AUDIT.md)，不是新测试编号。最初文本审计没有执行这些未来实验。E11 / E23 现在分别标明已实现的子项、实际完成的 oracle 和尚未取得的模型/设备资格；其余最低条件继续表示待完成要求。最终运行身份与发布决定见 [VALIDATION.md](VALIDATION.md)。
 
 **用户已经重新实现 TP5。** 当前路线以 [TQRelay](relay/README.md)、[relay-probe](relay-probe/README.md) 和 [VALIDATION.md](VALIDATION.md) 为准；不把旧 TP5 runtime 再列为迁移任务。平台探针已经落地，旧迁移表“探针尚未落地”的描述应更新。单设备 probe、五 rank 索引 fixture、真正五设备探针和整模型五卡运行各有自己的证据范围，互不替代；本次不重新审定用户这条路线的完整运行资格。
 
@@ -26,20 +26,21 @@
 | 已有能力 | 此次只保留的相邻缺口 |
 |---|---|
 | Prefill 优先、token/驻留槽位 admission、真实 batch C | 压力观测、idle 回收、真正抢占/恢复、并发上限与 reserve 形状 |
-| 逻辑窗口与 attention 物理 KV 分离、已有统一分配器 | recurrent 物理容量/COW、碎片压紧、真实共享占用与容量测量 |
+| 逻辑窗口与 attention 物理 KV 分离、已有统一分配器；E11 后续加入独立 recurrent 物理容量/COW 与 LFM2.5 F32 状态门 | 其他模型/配置的 recurrent 资格、一般缓存的碎片压紧、真实共享占用与容量测量 |
 | 每 context 的 Prefill/Decode compute workspace 释放与字节观察 | 跨 context 的共享所有权、device staging 的最终回收；不重复包装已交付 API |
 | TQCorpus V1、离线构建与 prefix replay | 在线事件的身份/时机、崩溃或重启后的完整性 |
 | TQCalibration reader、imatrix 导出 | 真正模型 callback 采集、明确统计人口、checkpoint 和原始样本 |
 | 全词表 logits 采集与严格比较器 | 身份对齐后的概率指标、任务质量与统计报告 |
 | TQText、batch C 的 UTF-8/stop/流式输出 | 多 choice HTTP/SSE、取消、重试和一次终结语义 |
 | 已验证的 CPU F32 attention、Vulkan WHT/scratch/输入别名、Meta 非零 offset | 本文另列的设备所有权、普通异步路径和有具体消费者的小项 |
-| 当前 A 的 recurrent clear/reuse 与已有 speculative 选项 | recurrent 独立容量与 COW；direct-hidden 实际交接及正确测量 |
+| 当前 A 的 recurrent clear/reuse、E11 后续实现的槽位接口及 F32 reader 状态门、已有 speculative 选项 | 对新消费者逐项验证容量失败/恢复；direct-hidden 实际交接及正确测量 |
+| E23 后续重写的 TQRerot、原生 reader 接缝与显式 DAG / assistant-eot C | 真实模型和多设备资格；旧自动 planner、reasoning/tool profile，以及 LateBind / MTP / Turbo KV 等组合 |
 
 ### 建议次序
 
 1. **先补可复用基础：** E01–E08 的请求与采集证据链，以及 E09–E16 的容量、所有权和失败行为。它们可服务 TP5、普通推理和后续研究。
 2. **再做有目标负载的论文重写：** Prefill 瓶颈看 P01；长 Decode 的 KV 压力看 P02；跨层冗余看 P03。先分别建立基线，组合方法另验。
-3. **有具体消费者再做：** E17–E23 的抢占、隐藏行交接与多 reader，P07–P09 的新编码/训练实验，以及第 5 节的小 kernel。
+3. **有具体消费者再做：** E17–E22 的抢占、隐藏行交接等剩余行为，E23 中尚未迁入的协议/优化组合，P07–P09 的新编码/训练实验，以及第 5 节的小 kernel。E23 的 token-frontier 共享白板已有独立消费者，不再重复列为完全未实现。
 4. 新代码只有在目标消费者、当前 A 的公开接口、反例与端到端价值明确后，才进入单独提交。B 拥有独立数值/计划/状态，C 调用 A+B；A 内部资源问题由最小、登记清楚的 A 修复承担。把私有结构移到 `fork/` 或增加 callback 不会自动消除耦合。
 
 这里的先后是维护成本、证据依赖与可用性的工程判断，不是未经测量的性能排名。
@@ -156,7 +157,11 @@
 
 **已知限制：** 这是独立于 attention `n_ctx_kv` 的物理资源模型；之前 clear/reuse 与 snapshot 回归并未证明可改变其容量或安全处理所有 COW。也不能借 RERoT “brain” 容量混用普通 recurrent 槽位。
 
-**重写边界与最低条件：** A 拥有实际 buffer/尾状态/COW；C 负责驻留和排队；B 可持容量与计划。用真实 hybrid 模型验证逻辑 ID 超过物理槽、共享 parent 后分别写、正好容量与超出一槽、prepare 失败后状态、恢复后 continuation。当前 A 无最小公开能力时再提出有消费者的 A 接缝。
+**后续实现状态：IMPLEMENTED / F32_READER_STATE_VERIFIED。** A 以 `n_rs_slots` 配置实际 recurrent 物理容量，逻辑 sequence tails 与物理 cells 分开，保留 native COW，并在 prepare 中预检容量。公开的 recurrent-only retirement 允许 C 释放已经封存阶段的 recurrent / convolution 状态而保留其 attention keys。实际消费者是 [rerot-compose](rerot-compose/README.md)：`W` 个 worker 使用 `W + 2` 个逻辑身份、最多 `P` 个活跃 pen 使用 `P + 1` 个 recurrent 槽，额外一槽持有不再推进的共同 base；每个新 stage 从 base 建立独立 lineage。没有把旧 fork 的 recurrent 代码作为未经验证的整包实现迁入。
+
+**已守住的职责：** A 拥有实际 buffer、tail、COW 和设备完成；B 只持 stage / run / pen 与发布状态；C 负责真实序列、驻留、采样器和 retirement。B 不认识 A 或 TQRelay。C 是全驻留、失败即排空并终止的消费者，不承诺持久恢复或 decode 失败后的设备回滚。
+
+**验证范围与后续条件：** LFM2.5 的最终 F32 reader 状态门覆盖 pool、无效输入、hidden / pending、行重排和恢复，31 个全 logits 等价组及 2 个 peer 因果效应组全部通过。纳入 reversed-serial / visible-serial 同形状对照后，等价组最大绝对 logits 差为 CPU 0、Vulkan `0.0000133514404296875`。最终分组、具体容量与生命周期输入保留在 [VALIDATION.md](VALIDATION.md) 的回执中。其他 hybrid 模型和新的使用方式仍须验证逻辑 ID 超过物理槽、共享 parent 后分别写、正好容量与超出一槽、prepare 失败后状态、retire 后复用及恢复后的 continuation。recurrent retirement 后应以真实 reader attention 证明 sealed peer 的 KV 仍可读，hybrid 的 `seq_pos_max` 不能单独证明这一点。旧 24 邻居 / 8 共享快照与 E23 的纯 attention GGUF oracle 均不替代这组新状态资格，也不授予完整 C 生成资格。
 
 ### E12 — Pinned host buffer 的设备身份
 
@@ -270,17 +275,45 @@
 
 ### E23 — RERoT 的协议小件与多 reader 研究分别留档
 
-**消费者与价值：** 多路任务输出、人可读调试、结构化计划和真正的共享上下文推理有不同消费者，不能混为一个已工作“大功能”。
+**消费者与价值：** 多路任务输出、人可读调试、结构化计划和真正的共享上下文推理有不同消费者。用户进一步明确的核心需求是每个插入点之间逐个 token 互相可见的共享白板。
+
+**后续实现状态：IMPLEMENTED_SCOPE / QUALIFICATION_SCOPED。** 独立 [TQRerot](rerot/README.md)、原生 A 的公开 reader / recurrent 接缝、[rerot-compose](rerot-compose/README.md) 已实现显式任务 DAG 的 `assistant-eot` profile。下面的归档入口继续用于回查；它们不是复制旧实现或承认旧运行资格的声明。
+
+#### 已重写的共享白板合同
+
+B 拥有 DAG、稳定 stage / run 身份、P-bound episode、immutable 可见前缀和 publication 状态。每个运行阶段在一个 frontier 准备恰好一个 BODY token，全部 member 读相同的 peer revision，自己的当前 token 保持因果可见。C 完成全部真实 forward 并同步后，B 一次提交整个 cohort；下一次 forward 立即读到刚提交的 peer token。待采样结果形成实际 KV 后才发布，不等 whole BODY、worker seal 或额外一轮延迟。旧 view 保持原有前缀长度。
+
+启动阶段的 FRAME 可以包含多个 token。C 用每 native sequence 每次最多一个 query 的波次解码，先前 own FRAME keys 对后续 own query 可见，peer 仍固定在同一旧 revision；全部 FRAME 波次是一笔发布事务。DAG 的边只约束启动，reader 的白板包含所有已经开始阶段的 public 前缀，包括已封存的非祖先阶段；private 和 source-end 不向 peer 暴露。
+
+A 只持一份 context / resident KV owner。B 的 span 分开描述 writer 存储位置与 reader 虚拟位置，C 转成公开 query/key view。最终 attention helper 对 identity span 复用原生 batched KQ，对其余 span 从 pre-RoPE Q 和原始 RoPE 参数重建 reader 查询；仅把可见分数 scatter 到对应的物理 KV 槽，隐藏槽置负无穷。每个 query/head 经过一个全局 softmax 后，继续使用原生 batched V 乘法，保留原生物理布局和归约顺序，不再按 reader gather V。没有按 span 分别归一化、为 reader 持久复制 prompt/KV，或用独立普通请求模拟动态可见性。新的 stage 从只 Prefill 一次的 base 建立独立 recurrent lineage 和 sampler；P-bound 物理槽的职责见 E11。本次 reader profile 只发布 resident F32 K / F32 V，F16 或混合类型由 capability 拒绝；普通 A 的 F16 支持不变。
+
+C 的 profile 是完整原生 assistant 阶段，以 native EOG 作为 source end；FRAME 由原生 assistant-close、user-handoff、assistant-open 组成，模板不保留共同 token 前缀时拒绝。达到 token 上限而没有 source end 是未完成错误。每次 submit 的局部 `run_submissions(call, 1)` 记录一个真实 A 域，实际 `llama_synchronize` 后完成并释放票据；唯一 call ID 和失败状态跨调用保留。P 个 pen 不是 P 个 TP rank。取消在已同步 chunk / wave 边界及 B commit 前检查；失败时排空实际工作、abort 未发布 frontier 并终止 context，不发布半个 cohort，也不伪造设备 rollback。
+
+#### 当前证据与剩余执行资格
+
+| 范围 | 已完成或尚缺的证据 |
+|---|---|
+| B 的 DAG / 状态 / 事务 | Release、UBSan、ASan 各 4/4 CTest 通过。穷举 543 个四 worker DAG、3,007 个合法状态、3,904 个 reader，并检查输入顺序、原子发布/abort、stale/cross-episode、source-end 与范围反例 |
+| B 的独立 F64 数学 oracle | 3,200 个 reader/head 对照，含 GQA、两种 RoPE 布局、partial rotary 和独立存储量化参考，最大绝对误差 `7.77156e-16`；错误 writer phase 与局部 softmax 反例会失败。它不调用 A，也不证明 A 的量化 reader 可用 |
+| A 的独立小模型 oracle | 最新 helper 的 16 例 CPU 对照通过：单层合法 GGUF、零 FFN、F32 权重/KV，独立 F64 完整前向 logits；覆盖 Llama NORMAL、Qwen2 NEOX、4 Q / 2 KV heads、amplitude 1 / 1.375、行重排与同一 frozen cohort 的串行执行。此前 8 例、最大误差 `7.72386e-7` 保留原实现身份。GPU oracle 的 ordinary 校准仍未过门，没有 GPU 独立数学或 A partial rotary / GPTNeoX 资格 |
+| A 的真实 F32 reader 状态 | LFM2.5 的最终 33 项严格门通过（31 个全 logits 等价组、2 个 peer 因果效应组）；纳入 reversed-serial / visible-serial 同形状对照后，等价组最大绝对 logits 差为 CPU 0、Vulkan `0.0000133514404296875`。较早缺少这两组的 `7.63e-6` 保留为原覆盖范围的历史回执，不是最终总最大值。最终分组见 [VALIDATION.md](VALIDATION.md)；关系与状态门不能替代独立数学或完整生成 |
+| C 的真实端到端资格 | 已有安装包消费者、真实 CLI 检查和保存模型/binary/命令/日志身份的 whiteboard harness；完整 C 生成仍在验证。最终安装隔离和模型结果由 [VALIDATION.md](VALIDATION.md) 单列，不以事件日志或旧 batch 测试替代 logits / 状态验证 |
+| 设备与优化 | 当前走 A 原生调度和 resident F32 K / F32 V reader，C 关闭 FA；F16 / 混合 reader 不发布，多 GPU PP 尚未运行，没有 RERoT 或 MMVQ 收益结论。Turbo / 量化 KV、LateBind、MTP 与 whole-model TP5 provider 尚未接入 |
+
+#### 继续保留的协议与优化候选
 
 | 可保留目的 | 归档入口及限制 | 重新实现后的最低条件 |
 |---|---|---|
-| 按 lane 拼完整行、隔离 pending 文本 | `FC009`；`tools/server/server-rerot.h` 的 lane mux；换行/terminal residual 需按 lane 归属 | B 拥有各 lane 状态；任意 chunk partition、交错 lane、终结残留、UTF-8 与有界缓存；一个 lane 不吞另一个的残片 |
-| 增量 JSON、稳定 node ID、DAG 检查 | `server:T14/T15`；`server-rerot.cpp`；旧 raw key 检测可漏掉 `strategy` 与 `\u0073trategy` 的等价写法，语法错误也不能全报“未完成” | B 明确 complete/extendable/invalid 三态，decode 后判 key，检查循环、深度/节点/字节限额，C 消费 owned 计划 |
+| 按 lane 拼完整行、隔离 pending 文本 | `FC009`；`tools/server/server-rerot.h` 的 lane mux；换行/terminal residual 需按 lane 归属。新 C 已按 stage 使用 TQText / NDJSON，但不恢复旧终端 mux | 若需要终端 lane，B 拥有各 lane 状态；任意 chunk partition、交错 lane、终结残留、UTF-8 与有界缓存；一个 lane 不吞另一个的残片 |
+| 自动 planner 与增量 JSON | `server:T14/T15`；`server-rerot.cpp`；旧 raw key 检测可漏掉 `strategy` 与 `\u0073trategy` 的等价写法，语法错误也不能全报“未完成”。稳定 node ID / DAG 检查已由新 B 承担，当前 C 接收显式 DAG | 增量 parser 明确 complete/extendable/invalid 三态，decode 后判 key，检查深度/节点/字节限额；真实 planner 输出形成 owned 计划后才启动，不拿 CLI DAG 测试授予 planner 资格 |
 | Thinking/mindmap/todo 文本协议 | `server:T04–T12`；旧 HTML/PAC-DFS 后续生产路径可 hard abort | 先选一个真实消费者与稳定输入格式；完整分块、失败和显示语义通过后才考虑功能，不恢复所有旧协议 |
 | Chronicle → canonical 的精确历史映射 | `FC012`；`tools/server/server-rerot.h::{server_rerot_register_chronicle_mapping,server_rerot_resolve_canonical_reasoning,server_rerot_clear_chronicle_registry}`；未知/篡改/编辑返回 nullopt，`server-common.cpp` 调用侧保留原文 | 若有真实消费者，验证精确已知映射、未知/编辑输入保持原文、注册/清理生命周期；通用可编辑协议不是这段旧代码已提供的功能 |
-| 共享 KV 的 reader 可见性 | `RMC43、FC010`；`src/llama-rerot.*`、`RERoT.md` | 先用小型精确 oracle 验证同 context/owner、PUBLIC 只看已提交 peer frontier、private 隔离、GQA/partial RoPE、单一全局 softmax、recurrent/RNG 独立；再做真实模型与性能 |
+| 原 reasoning-end / tool profile | `RMC43、FC010`；`RERoT.md`、旧 server framing 与 routing；当前 `assistant-eot` 仅代表完整 assistant turn | 单独定义终止符、工具调用、private/public 边界与后续 frame；以真实模板和完整生命周期验收，不能将当前 EOG 合同默认为旧 reasoning-end 等价 |
+| 更快的 reader / MMVQ 路线 | `RMC43、FC010` 与旧 backend 路由；当前 A seam 使用既有 GGML 算子，无新 GPU kernel | 先保持单 context / owner、reader 相位、GQA、单一全局 softmax 和逐 token frontier；记录实际 batch/ubatch、kernel 命中、完整数值与净收益。量化 Turbo KV 和 partial rotary 的设备支持分别验证 |
+| F16 reader 精度策略 | 本次新实现的失败回执：CPU 重排 / 单序列 restore 对照最大误差 `0.11799526`，Vulkan permutation 最大误差 `0.0003576`；当前 capability 明确拒绝 F16 / 混合 reader，普通 A 的 F16 解码不变 | 独立验证物理排列、原生单序列 restore 后的重分配、KQ / softmax / V 的 dtype 与归约策略，先通过完整状态和数值门再重新开放。解释浮点差异的来源不构成放宽门槛的豁免；保留失败日志和最终加载库身份 |
+| LateBind / MTP / 整模型 TP5 provider | 旧私有 runtime 与 speculative 路线保留归档；新 TQRelay 提供独立合同与探针，当前 C 的执行 provider 仍是 A | 缓存/草稿有效性至少绑定 stage、reader revision、key layout 与 live-state generation。peer 仍在发布时，逐个 accepted token 验证新 frontier；不得一次接受一串基于旧 peer view 的 token。保持真实提交、完成、排空及 recurrent/RNG 所有权，再测端到端收益 |
 
-本次没有核实到可作为这整套 RERoT 算法来源的公开原论文；记录为项目研究设计。RoFormer [R05] 仅能给其中 RoPE 数学提供参考。普通 batch、prefix replay 或 parser 测试不能授予动态共享 reader 的运行资格。
+最初来源审计没有核实到可作为这整套 RERoT 算法来源的公开原论文；仍记录为项目研究设计。RoFormer [R05] 仅为其中 RoPE 数学提供参考，新实现不伪造整套算法的论文来源。普通 batch、prefix replay、parser、B 数学或平台 probe 的通过，各自保留范围，不能互相替代动态共享 reader 的模型/设备资格。
 
 ## 4. 值得按原论文或明确数学合同重写的方向
 
@@ -536,4 +569,4 @@ git diff --no-renames cda0f9256665845cd9d6f3a0176880883f653a3d \
 
 以后选择一个条目时，先记录目标用户负载、当前 A 是否已具备该行为、所用论文版本/自研假说、具体输入域和未支持范围。参考数值、实际消费者和可证伪的验收闭合后，再提交独立 B/C 或最小 A 例外；A 例外继续记录内容摘要、消费者与去除条件。不以源码行数、私有运行时恢复程度或候选数量作为完成指标。
 
-本次交付为文档审阅与纠错。没有新模型/GPU/性能运行结果，没有改写 [VALIDATION.md](VALIDATION.md) 的历史资格，也没有把尚未执行的验收要求转成 PASS。
+最初交付仅为文档审阅与纠错，没有新模型/GPU/性能运行结果。后续 E11 / E23 已按本文明确范围重写，B、CPU 独立 oracle 与 LFM2.5 F32 状态门的实际结果单列；没有改写历史资格，也没有把 GPU 独立数学、完整 C 生成、多 GPU PP、性能或其他尚未闭合的要求转成 PASS。最终源码身份、运行回执与发布决定以 [VALIDATION.md](VALIDATION.md) 为准。

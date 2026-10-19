@@ -1,5 +1,117 @@
 # 验证记录
 
+## 2026-10-19：RERoT 逐 token 共享白板
+
+本批次起点为 `4ef817eecff5bb512a65d91bacd2d6b028b40ed5`，固定上游仍为
+`cda0f9256665845cd9d6f3a0176880883f653a3d`。本节记录新的 RERoT 实现，
+后文较早批次的数字、失败与资格保持原身份。机器索引见
+[audit/rerot-qualification-20261019.json](audit/rerot-qualification-20261019.json)。
+
+**交付范围：独立 TQRerot B、使用安装包的原生 C，以及 resident F32 K / F32 V 的 A reader 接口。**
+真实模型为 LFM2.5-8B-A1B-UD-IQ4_NL，模型文件 4,358,844,000 bytes，
+SHA-256 `a1921216ded964e5c4f787226729e8c2c32bd587ac7b897742e0b7a7cc7eff6a`。
+实际设备为 AMD Ryzen 5 7500F CPU 与一张 AMD Radeon RX 6800（RADV NAVI21）；
+Vulkan C 的模型日志记录实际 offload 25 层及 Vulkan0 模型 buffer。设备枚举本身不计为运行。
+
+### 白板语义及实现边界
+
+每个 BODY frontier 让每个正在运行的插入点推进一个 token。所有 reader 持有上一轮已提交
+世界的不可变视图，当前自己的 token 参加因果计算，其他 reader 当前尚未提交的 token 不可见。
+整组原生调用完成并同步后共同发布；下一 frontier 立即看到其他插入点刚提交的 token。
+已采样、尚未 decode 的 token 不会提前出现在白板。实际多 token FRAME 按每序列每调用一行的
+wave 执行，所有 wave 使用同一个冻结 peer 世界；FRAME 完成后才共同发布。
+
+B 拥有 DAG、reader 相对顺序、public/private 行、token publication 和事务身份，不依赖 A、
+GGML 或其他 B。C 通过安装后的 llama、TQRerot、TQRelay、TQText 公共接口运行；每次真实
+A 提交使用局部 `tq::relay::run_submissions(call, 1)`，票据覆盖接受、同步、完成登记和
+reader 清理，随后释放，不随 token 数累积历史记录。这里的 1 是一个不透明的 A 提交域，
+不伪装成五个已完成的 GPU rank。
+
+A 保存一份实际 resident KV。identity span 复用原生 batched KQ，真正改变相位的 span
+从 pre-RoPE Q 与原始 RoPE 参数重建 reader-relative Q，再与 writer-phase K 计算分数；
+分数放回原物理 KV 槽，隐藏槽为负无穷，
+再做一次全局 softmax 和原生 batched V。reader 视图深拷贝、无效 setter 保留旧视图、
+图不跨 reader frontier 复用。recurrent 的逻辑序列身份与物理状态池分开；sealed worker
+回收 recurrent 状态而保留其他 reader 仍需读取的 attention KV。
+
+### 已执行的严格门
+
+| 检查 | 最终实际结果 | 范围 |
+|---|---|---|
+| 独立 B | Release 警告作为错误、独立 Debug ASan + UBSan + 标准库断言均 4/4 通过 | 543 个四节点 DAG、3,007 个合法状态、3,904 个 reader；3,200 个独立 F64 reader/head 比较最大误差 `7.77156e-16`，错误相位反例误差 `1.70309` |
+| 实际 A 对独立 F64 | 16 个 CPU 案例通过，reader 最大绝对 logits 差 `7.238989769842163e-7`，ordinary 校准最大差 `4.1964194408272704e-7` | 单层、FFN 权重置零、F32 权重 / KV 的 GGUF fixture，通过实际 A 图执行；Llama NORMAL / Qwen2 NEOX、4 Q / 2 KV heads、幅度 1 / 1.375、正反序、batch / serial；原门 `3e-5 + 1e-5 * abs(reference)`。不是 8B 全模型 F64 对照；Vulkan 安装包中的默认 oracle 也实际在 CPU 执行 |
+| 真实 F32 reader | CPU / Vulkan 各 33 个严格门通过：31 个全词表等价组与 2 个 peer 因果效应组 | 每组 128,000 logits；等价组最大差 CPU 0、Vulkan `0.0000133514404296875`；包含新增 reversed-serial 对 visible-serial 同形状对照 |
+| reader 生命周期 | 两端各 72 次真实 decode、169 行输入、6 个 invalid view 拒绝、1 个满 recurrent 池拒绝及随后复用 | 包含隐藏 peer、ordinary identity、未提交 / 当前 peer 隔离、下一轮生效、行重排、retire / replacement、restore 前后与独立 control；原门 `2e-4 + 1e-5 * max(abs(a), abs(b))` 未改 |
+| 已有 ordinary recurrent 回归 | 两端各 24 个邻居快照、8 个共享快照检查通过；续算最大差均 0 | 各 24 次 decode、189 行输入；验证默认 recurrent 配置，不使用新 reader 模式 |
+| 原生公开接缝 | CPU 4/4、Vulkan 8/8 CTest 通过 | 含本次 CPU oracle 及既有 compute-memory、FA precision、meta transfer、Vulkan 专项；不是全量 GPU 算子重跑 |
+| C CLI | 两端各 28 个输入、选项及输出合同检查通过 | 一项 CTest 驱动这些检查；不把 CLI 测试计为模型执行 |
+| 实际 C 完整生成 | CPU 8/8、Vulkan 8/8 通过 | 每端 `ubatch=128,1 × release,retain × repeat=2`；两个并发 writer、依赖阶段和 synthesis 都以原生 EOG 完成，无预算超限强行补终止符 |
+| 相互逐 token 可见 | 每次运行均观察到两个活跃 worker 之间连续增长 | CPU 每方向 103 次增长、206 次 live peer 读取；Vulkan 每方向 103 或 104 次、206 或 208 次读取。事件合同不代替上述 A 数学与因果 logits 检查 |
+| 阶段内存与重复性 | 每端固定 microbatch 下，release / retain 的完整 greedy token 轨迹相同；两次重复轨迹相同 | 每次 release 运行出现 3 次实际 compute release，after 均为 0。ubatch 128 的首次 CPU / Vulkan before 分别为 75,561,120 / 89,946,060 bytes；这是公开接口的计算 buffer 字节，不是峰值 VRAM 或 KV 大小 |
+| 实际 SIGINT / broken pipe | CPU / Vulkan 各两例通过 | 观察到两轮真实双 worker BODY 后注入；SIGINT 退出 130 并输出 incomplete cancellation error；关闭唯一 stdout 读端后退出 1，走 output-write-failed 路径；无超时或强杀兜底 |
+| 完整来源与搬迁隔离 | `build-isolation-rerot-20261019` 的 77/77 条命令通过 | A 从固定 pin archive 加 verified overlay 重建；七 B、六 C 独立构建安装，移除 source / build 副本和原前缀后搬迁，B 公共消费者、C CLI 与四例真实 RERoT 生成通过 |
+| 原生 split 选项 | RX 6800 单卡 `none` 与 `layer` 实际生成通过 | 额外 layer 用例为 512 frontiers、208 次 live peer 读取；不是多设备 PP 资格 |
+
+阶段内存对照只比较相同调用形状。完整 C 的默认每阶段预算是 256；验收驱动显式使用
+worker / synthesis 各 512，将该模型实际生成的 reasoning token 也计入预算。
+测试没有通过伪造 EOG、替换为已完成答案或跳过未完成阶段取得通过。
+
+取消检查覆盖提交前、已同步 chunk / wave 后、commit 前及最终完成前；已接受调用先由原生
+同步收束再释放 owned reader 状态。外部进程测试的退出码和事件不证明信号恰好落在某个
+GPU kernel 内，也不独立证明每个设备的 drain。原生同步合同与 C 代码审查、进程测试分别保留。
+
+### 仍未取得资格的范围
+
+| 项目 | 实际状态与处理 |
+|---|---|
+| F16 / mixed KV reader | capability 与 setter 明确拒绝，CPU / Vulkan 的负向门又实际验证普通 F16 prefill 和续算仍可工作。较早 F16 CPU permutation / restore 最大差 `0.1179952621459961`、Vulkan permutation `0.00035762786865234375` 未过门，保留原 FAIL 回执；精度策略与物理位置重排 / restore 后重分配列入 E23 重写候选 |
+| 跨 batch / serial 数值等价 | 最终两端各 12 个原阈值对照全部观察为 FAIL，最大差 CPU `2.1814355850219727`、Vulkan `4.442938804626465`；完整 C 跨 ubatch 的 greedy 轨迹也不同。默认显式 `NOT_QUALIFIED`，`--require-cross-shape-equivalence` 可恢复严格退出门；同形状门不受此分组影响 |
+| GPU 独立 F64 oracle | 实际 offload 的 tiny oracle 在 ordinary attention 校准即失败；显式 `GGML_VK_DISABLE_F16=1` 后仍失败。原有两次 exit 1 和日志保留，不用 CPU 16 例或 Vulkan 关系门代替 GPU 独立数学资格 |
+| Vulkan row split | 真实加载失败：`device Vulkan0 does not support split buffers`。保持失败及底层原因，不做隐式模式回退 |
+| 多设备 PP、整模型 TP5 | 当前 C 复用已有 TQRelay 提交寿命协议，并把原生设备放置交给 A；没有已安装的整模型 TP5 provider，也没有多 GPU 实测。`--tp5` 明确拒绝，不能把单卡 ledger 或 layer 模式运行扩写成五卡模型资格 |
+| MMVQ | QKV / FFN 保留 A 的量化权重与多行调用分派；本次不改通用 GPU kernel。没有针对该组合的实际 kernel 命中或性能收益资格，microbatch 改变还会改变分派形状 |
+| LateBind / MTP | 当前安装接口缺少完整 provider，C 明确拒绝 `--latebind` / `--mtp`。共享世界每轮变化后，旧 revision 的 draft / logits 不再能直接提交；后续需真实刷新、验证、作废与 drain 协议，相关设计只保留文本候选 |
+| 其他范围 | Turbo / 量化 KV reader、streamed KV、SWA、partial rotary / GPTNeoX A 路径、自动 planner、reasoning-end / tool 路由、HTTP 集成、CUDA / HIP RERoT、多模型质量与吞吐收益均未由本批次取得资格 |
+
+A 的当前例外 manifest 共 28 路径，其 SHA-256 为
+`b980037891817e8fc82b1c31bd92af33805c02c24ca185089d4fcf2f21717a65`。
+本次相对起点修改 14 个 A 源码路径，合计 +642 / -52；没有新的通用 GPU kernel 文件修改。
+每项 hash、消费者、理由与移除条件随 manifest 维护。下面较早的全量 Vulkan FA 失败、
+TOPK 未闭合调查及未运行平台状态不因本次专项通过而改变。
+
+### 回查与复现
+
+最终 native 构建、reader、F16 拒绝、ordinary recurrent 与 CTest 的命令和日志位于
+`build-rerot-runtime-20261019/`。完整生成的两份 receipt 位于
+`build-rerot-whiteboard-{cpu,vulkan}-f32-20261019/receipt.json`，中断记录位于
+`build-rerot-interrupt-{cpu,vulkan}-f32-20261019/receipt.json`；其模型、二进制、附加库和
+原始输出 hash 随回执保存。单卡 layer / row 记录与旧失败回执也在机器索引中分别标识。
+搬迁隔离的 `result.json`、`commands.json`、`verified-boundary.json` 与实际模型 receipt
+位于 `build-isolation-rerot-20261019/`；本次没有运行可选的旧 batch / logits / stream 模型矩阵，
+它们在该回执中明确为 skipped。
+
+下列命令是复现入口，输出目录必须是新的目录。真实模型需由运行者提供，不自动下载：
+
+```sh
+python3 fork/build.py --backend vulkan --build-dir build-rerot --jobs 8
+
+python3 fork/rerot-compose/tests/real-whiteboard.py \
+  --binary build-rerot/install/bin/tq-rerot-compose \
+  --model /path/to/compatible-model.gguf --gpu-layers 99 \
+  --ubatch-sizes 128,1 --phase-modes release,retain --repeat 2 \
+  --output build-rerot-whiteboard-proof
+
+python3 fork/rerot-compose/tests/real-interrupt.py \
+  --binary build-rerot/install/bin/tq-rerot-compose \
+  --model /path/to/compatible-model.gguf --gpu-layers 99 \
+  --output build-rerot-interrupt-proof
+
+python3 fork/tests/isolation.py --output build-rerot-isolated --jobs 8 \
+  --rerot-model /path/to/compatible-model.gguf
+```
+
+
+
 2026-10-18 批次起点为 `6de088714f35f84427d9952d713f9d6cdffc668b`；固定 A 为 `cda0f9256665845cd9d6f3a0176880883f653a3d`。该批次新增 TQText、TQCalibration 和 imatrix C，扩展真实 batch C 的文本消费，并对 Vulkan 缓存的两个不同失效来源分别建立回归。六个 B 与五个 C 的职责见 [README.md](README.md)，旧 feature ID 与证据细分见 [audit/details-findings-20261018.md](audit/details-findings-20261018.md)。
 
 本页先列 2026-10-19 TQRelay 批次已取得的结果，随后保留 2026-10-18 批次的 Final release gates 与更早历史；其中原模型摘要、HTTP、corpus、logits 与数值记录保持各自批次身份，没有被改写成本批次结果。

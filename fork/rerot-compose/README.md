@@ -49,7 +49,7 @@ build-rerot/install/bin/tq-rerot-compose \
   --after review=multiply --after review=check \
   --synthesis 'Answer the original question with the integer only.' \
   --parallel 2 --ctx-size 8192 --total-kv 8192 \
-  --worker-tokens 96 --final-tokens 96 \
+  --worker-tokens 512 --final-tokens 512 \
   --batch-size 512 --ubatch-size 128 \
   --gpu-layers 99 --devices Vulkan0 --split-mode layer \
   --seed 0 --temperature 0 --json

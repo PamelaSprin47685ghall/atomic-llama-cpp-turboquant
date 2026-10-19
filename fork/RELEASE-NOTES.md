@@ -1,4 +1,73 @@
-# 2026-10-18 发布候选变更说明
+# 发布候选变更说明
+
+## 2026-10-19：RERoT 共享白板与独立执行包
+
+这次加入可实际运行的 `TQRerot::rerot` 和 `tq-rerot-compose`。每个正在运行的插入点
+每轮推进一个 BODY token，同轮统一使用冻结的已提交 peer 视图；原生计算全部完成后
+共同发布，下一轮立即互相看见新增 token。多个插入点可以在各自结束前持续交流，
+DAG 的边只规定开始条件，最终 synthesis 消费全部已提交工作。
+
+### 职责与维护成本
+
+| 层 | 本次交付 |
+|---|---|
+| B：`fork/rerot` | 仅依赖 C++17 标准库的 DAG、不可变 reader 视图、public/private 行、每 token 事务与失败 / 取消身份校验；可独立安装消费 |
+| C：`fork/rerot-compose` | 链接已安装的 llama、TQRerot、TQRelay、TQText；原生 tokenization、模板、模型采样、通过 A 使用统一 resident KV、按波执行 FRAME、实际同步后 BODY 发布、阶段计算内存释放与 JSON 事件 |
+| A：明确登记的例外 | 公共 reader attention views、实际 KV 位置绑定、reader-relative RoPE / 全局 attention、逻辑序列与物理 recurrent 池分离及 recurrent-only retirement；本次 14 路径 +642 / -52，无新增通用 GPU kernel 文件 |
+
+A 的 identity span 保留 native batched KQ，可见分数按物理 KV 位置排列，所有 span 共享
+一次全局 softmax 和 native batched V。C 每个 A 调用使用局部 TQRelay 提交账本，实际完成
+并清理 reader 后销毁；不积累随生成长度增长的历史票据。固定 A pin 未变，当前 28 个
+例外路径的 hash、消费者、理由和移除条件在 [manifest](upstream-exceptions.json) 中登记。
+
+首次发布限定为 **resident F32 K / F32 V、C 关闭 FA 的 assistant-eot profile**。
+权重量化仍由 A 执行。F16 reader 的剩余重排 / restore 失败没有获得容差豁免，而是关闭该
+profile 并写入重写候选；普通 A 的 F16 解码继续可用。这会增加 reader KV 存储成本，
+没有新的峰值 VRAM 或吞吐收益声明。
+
+### 实际通过的检查
+
+- B 的独立构建、四组测试及 ASan + UBSan 通过，覆盖 543 个 DAG、3,007 个状态和
+  3,904 个 reader；独立 F64 oracle 比较 3,200 个 reader/head。
+- 实际 A 图的 16 个 CPU 独立 F64 案例通过，使用单层、零 FFN 的 F32 GGUF fixture；
+  真实 LFM2.5 的 CPU / RX 6800 F32 reader
+  各 33 项严格检查通过，等价组最大差分别为 0 和 `0.0000133514404296875`。
+  GPU 的独立 F64 oracle 尚未取得资格。
+- CPU / 单卡 Vulkan 各八次完整生成通过。每次两个活跃 worker 都观察到对方至少
+  103 次前缀增长；固定 microbatch 下，阶段内存开关及重复运行保持同一完整 token 轨迹。
+- 两端的真实 SIGINT / broken pipe 检查通过，分别受控退出 130 / 1；ordinary recurrent
+  生命周期回归续算差均为 0。CPU 4/4、Vulkan 8/8 公开接缝 CTest 通过。
+- 完整来源隔离 77/77 条命令通过：固定 A archive + verified overlays、七 B / 六 C
+  独立安装，删除构建副本并搬迁前缀后，B 消费者、CLI 和四次实际 RERoT 生成通过。
+
+精确命令、模型 / 库身份、数值门与保留的失败见
+[验证记录](VALIDATION.md#2026-10-19rerot-逐-token-共享白板) 和
+[机器索引](audit/rerot-qualification-20261019.json)。这些结果不代表所有后端、模型或
+此前全量 GPU 遗留问题均已通过。
+
+### 与 TP5、PP 和优化组合的关系
+
+复用的是现有 TP5/TQRelay 架构中已能由真实 A 调用消费的提交、完成和 drain 生命周期。
+当前只有一个 A 提交域；整模型 TP5 provider 尚未暴露为可安装消费者。
+`--tp5`、`--latebind`、`--mtp` 明确拒绝，相关后续协议保留在
+[重写候选](REWRITE-CANDIDATES.md)。世界 revision 更新后，旧世界的 draft / logits
+必须重新验证或作废，不能跨提交边界直接复用。
+
+原生设备放置与调度交给 A。RX 6800 的 `none` 和 `layer` 实际生成通过；
+`row` 因该 Vulkan 后端不支持 split buffers 在加载时失败。多设备 PP 未实测。
+QKV / FFN 保留上游量化权重和多行分派，但没有本次 RERoT 的 MMVQ kernel 命中或加速证明。
+跨 microbatch 的 logits 与 greedy 轨迹实际不同，明确未取得跨形状等价资格。
+
+构建和运行方式见 [RERoT C README](rerot-compose/README.md)。这一版本使用明确的
+`--stage` / `--after` DAG 和模型原生 assistant-EOT 模板；自动 planner、tool /
+reasoning-end 路由、HTTP 接入与量化 KV reader 没有混入该 profile。
+
+## 2026-10-18：历史候选记录
+
+以下保留上一批次的范围和证据；其中“当前”“本批次”、五 B / 五 C 与旧 manifest 数字
+仅指该历史批次。其失败与未完成调查继续有效，不被本次 RERoT 专项覆盖。
+
+
 
 ## 本批次：增量文本、校准互操作与后端缓存正确性
 

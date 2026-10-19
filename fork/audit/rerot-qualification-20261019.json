@@ -1,0 +1,2350 @@
+{
+  "schema": "atomic-turboquant-rerot-qualification/1",
+  "date_utc": "2026-10-19",
+  "status": "PASS_FOR_DECLARED_PROFILE",
+  "task_base_commit": "4ef817eecff5bb512a65d91bacd2d6b028b40ed5",
+  "upstream_pin": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+  "legacy_reference_commit": "2777543b2358c88cd1c2000f7fa342b764a0e213",
+  "identity_rule": "This receipt identifies the tested source bytes below, built after the task base. Commit metadata and documentation-only edits do not replace those byte identities. Referenced build receipts retain their original run status and identity.",
+  "profile": {
+    "b_package": "TQRerot::rerot",
+    "c_binary": "tq-rerot-compose",
+    "model": [
+      {
+        "path": "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "bytes": 4358844000,
+        "sha256": "a1921216ded964e5c4f787226729e8c2c32bd587ac7b897742e0b7a7cc7eff6a"
+      }
+    ],
+    "devices": [
+      "AMD Ryzen 5 7500F 6-Core Processor (CPU)",
+      "AMD Radeon RX 6800 (RADV NAVI21), Vulkan0"
+    ],
+    "resident_kv": {
+      "k": "F32",
+      "v": "F32",
+      "unified": true,
+      "flash_attention": false
+    },
+    "model_weight_quantization": "IQ4_NL model weights; native A quantized dispatch",
+    "chat_profile": "assistant-eot; explicit DAG; native EOG required",
+    "publication": "Exactly one BODY input token per running insertion point per cohort. Freeze committed peer prefixes, include own current token only, synchronize every accepted native call, then publish the whole cohort. Next cohort sees new peer tokens.",
+    "frame": "One query per sequence per native call in waves; all waves use one frozen peer world and publish once.",
+    "submission_provider": "One opaque native A context submission domain, using per-call TQRelay run_submissions(call, 1); no invented per-device completions.",
+    "recurrent_storage": "Logical sequence namespace separate from a bounded physical recurrent pool. Sealed workers retire recurrent state without deleting resident attention KV.",
+    "release_support": "CPU and the executed one-GPU Vulkan none/layer configurations. F16, quantized KV, unavailable providers, and unqualified devices are not implied."
+  },
+  "source_identity": {
+    "manifest": {
+      "path": "fork/upstream-exceptions.json",
+      "bytes": 17774,
+      "sha256": "b980037891817e8fc82b1c31bd92af33805c02c24ca185089d4fcf2f21717a65"
+    },
+    "reviewed_upstream_paths": 28,
+    "rerot_a_delta": {
+      "files": 14,
+      "insertions": 642,
+      "deletions": 52,
+      "generic_gpu_kernel_files_changed": 0
+    },
+    "files": [
+      {
+        "path": "fork/CMakeLists.txt",
+        "bytes": 590,
+        "sha256": "985e6e0f0962347c2ede193b33f6ca296af74343db1603df9947a041163ad1d5"
+      },
+      {
+        "path": "fork/build.py",
+        "bytes": 4399,
+        "sha256": "5cd3895e827b542f1f9ffe8fd41a91fad324f1bfbba4dda68e3aaad34b52ba7c"
+      },
+      {
+        "path": "fork/rerot-compose/CMakeLists.txt",
+        "bytes": 1236,
+        "sha256": "5af601cf514963f0c35ea4678675dd0483efdb547dca3c9e7a2ee49ef5dbd241"
+      },
+      {
+        "path": "fork/rerot-compose/src/main.cpp",
+        "bytes": 16792,
+        "sha256": "baeeb27c1ee03ddd8650978beee08e89270d9ccf894472e91924047f7245e0ac"
+      },
+      {
+        "path": "fork/rerot-compose/src/native.cpp",
+        "bytes": 17115,
+        "sha256": "ed97b616ad6a15b5484b3bf3410f55b160289f6698e929a6fbcb1106c2e8bb88"
+      },
+      {
+        "path": "fork/rerot-compose/src/native.h",
+        "bytes": 1914,
+        "sha256": "a4d03026bb53ad893dd91b7844beaeee802c944b5e62d631b78a4f3e9e275abb"
+      },
+      {
+        "path": "fork/rerot-compose/src/options.h",
+        "bytes": 7505,
+        "sha256": "23765bdc29bac7a5446c9d6d13922b45a2b529f115395b31a44cd58ef724ef95"
+      },
+      {
+        "path": "fork/rerot-compose/src/sampling.h",
+        "bytes": 2586,
+        "sha256": "6b11ebd843288783a39f3b3fcf04a5aca7761453f18298f00f6dea12c1fae28b"
+      },
+      {
+        "path": "fork/rerot-compose/src/text.h",
+        "bytes": 5818,
+        "sha256": "0387403d9bcdc060d7326b862f82f2b826f9c62ca389a4c0169782e49e1202a7"
+      },
+      {
+        "path": "fork/rerot-compose/src/usage.h",
+        "bytes": 3244,
+        "sha256": "643ccb2ef27ff9e624e355d24f5762d64ba9588154dc9b298e538107c5755d0c"
+      },
+      {
+        "path": "fork/rerot-compose/tests/real-interrupt.py",
+        "bytes": 20474,
+        "sha256": "906af29ed5797c59701f2fcf0c40e70319d41e8a5297027a2a5ab7268d04f999"
+      },
+      {
+        "path": "fork/rerot-compose/tests/real-whiteboard.py",
+        "bytes": 37035,
+        "sha256": "fbda774c22e1f43e9299f7cf1bc5bc83cace0ee27ad2f6d8b81f5a4fb1015cac"
+      },
+      {
+        "path": "fork/rerot-compose/tests/test_cli.py",
+        "bytes": 4199,
+        "sha256": "3b3c430738e635af8e3072768075c760f1b7662f3cc85a00a91936c13a2d884a"
+      },
+      {
+        "path": "fork/rerot/CMakeLists.txt",
+        "bytes": 2109,
+        "sha256": "07c0ec10d994d929316594b23a2260ff56c279d3e53e4b293d12b6b935382b28"
+      },
+      {
+        "path": "fork/rerot/cmake/TQRerotConfig.cmake.in",
+        "bytes": 108,
+        "sha256": "98704396d81e557f3d64e8dba539573e6e348be229c5124a035b44137be71b36"
+      },
+      {
+        "path": "fork/rerot/include/tq/rerot/episode.h",
+        "bytes": 3710,
+        "sha256": "d65549f6b9a7071b52cc377ff84c147adfc2c3e2b6b1887fbe502e205ae41f9d"
+      },
+      {
+        "path": "fork/rerot/include/tq/rerot/plan.h",
+        "bytes": 1414,
+        "sha256": "921d9fbe1452d028492ae7f7ef3b4c60bb515b21dc9c1361ba8caede96a56245"
+      },
+      {
+        "path": "fork/rerot/include/tq/rerot/view.h",
+        "bytes": 1740,
+        "sha256": "752100e851939a882730b0c3bb8a13a0b3a2e4734029760b3e37711a28bb3a4e"
+      },
+      {
+        "path": "fork/rerot/src/episode.cpp",
+        "bytes": 21101,
+        "sha256": "6c7de6fe8fa5932072ddf8604fb31495b3a00cd700a54b735e81ffb4aef9de92"
+      },
+      {
+        "path": "fork/rerot/src/plan.cpp",
+        "bytes": 5726,
+        "sha256": "bc84311f234c1c874b28c38c71d656ab3b32a00ce6a6d9cca8472566d7017937"
+      },
+      {
+        "path": "fork/rerot/src/view.cpp",
+        "bytes": 1655,
+        "sha256": "7eee9936ceab200e14f02bc5bdaf534365fb2ccf055aa54924232d9dda6ed57d"
+      },
+      {
+        "path": "fork/rerot/tests/installed-consumer/CMakeLists.txt",
+        "bytes": 427,
+        "sha256": "ae8e23b8e206a071623a00ca48dc106a66a99056d82467d47e4d2520f188688f"
+      },
+      {
+        "path": "fork/rerot/tests/installed-consumer/main.cpp",
+        "bytes": 3487,
+        "sha256": "37a9fff83e718fdd0c69983995367f1e14879a509db8efb995abbf5bc329ee23"
+      },
+      {
+        "path": "fork/rerot/tests/test-rerot.cpp",
+        "bytes": 29579,
+        "sha256": "a3318ee4d7ce23f4be8f38e1e41ed2d4fffeba4b84948dba6c073cd84244410c"
+      },
+      {
+        "path": "fork/tests/a-seams/CMakeLists.txt",
+        "bytes": 3894,
+        "sha256": "6ddafdb9e6c27816f00e3271397f53a2774b7e19758a89e7e588e0d2a9d6f617"
+      },
+      {
+        "path": "fork/tests/a-seams/rerot-attention-oracle.cpp",
+        "bytes": 22639,
+        "sha256": "aafe51818eff4e0e03eb66519df36b65853d310bac6880e2c6558a07c4916557"
+      },
+      {
+        "path": "fork/tests/a-seams/rerot-reader-views.cpp",
+        "bytes": 33866,
+        "sha256": "be6cdb870efcd5b802f90652713fe6829e3f4a81c53ddea196a62d70b96af761"
+      },
+      {
+        "path": "fork/tests/isolation.py",
+        "bytes": 17832,
+        "sha256": "a94c256b494511ad4e0478dd1b851e6af8c13b660378782ab6337f4954f942a4"
+      },
+      {
+        "path": "include/llama.h",
+        "bytes": 90093,
+        "sha256": "eaeac8f0e3b680e2ee2f337e967850c08e5adcbbda27b18d16219e10fad47125"
+      },
+      {
+        "path": "src/llama-attention-view.h",
+        "bytes": 617,
+        "sha256": "fe8b08c29d18d099ffdaba2c3ba416175bdc76fd8081ecb61f5fe816005860d3"
+      },
+      {
+        "path": "src/llama-context.cpp",
+        "bytes": 212462,
+        "sha256": "9878b3ff9fb3402be5478a434164e3ee269ac7ffe924a7731156e79f019e8f47"
+      },
+      {
+        "path": "src/llama-context.h",
+        "bytes": 15891,
+        "sha256": "c7602a76e551761428d428a876b86484608b62d788a8226e2f9c722bd3100e0e"
+      },
+      {
+        "path": "src/llama-cparams.h",
+        "bytes": 2560,
+        "sha256": "3180023354d306a3c62f87e6c708b518f4cd501918743b62749cffd8eb05ebf7"
+      },
+      {
+        "path": "src/llama-graph.cpp",
+        "bytes": 157078,
+        "sha256": "2af150f8779e3ad9ecc6b537202c9b6c979d2fb16655dcc0f6809a5f3c579ac7"
+      },
+      {
+        "path": "src/llama-graph.h",
+        "bytes": 47566,
+        "sha256": "087693cb84344308b74dc7505c82f707124ff7d701c54b8d50ecf2408bdeaf17"
+      },
+      {
+        "path": "src/llama-kv-cache.cpp",
+        "bytes": 144382,
+        "sha256": "839df30582f517eec4715ff46b323fb57a773500675b9e84fbd5f6f04b7c4da5"
+      },
+      {
+        "path": "src/llama-kv-cache.h",
+        "bytes": 22496,
+        "sha256": "e230833526353e57beb9113162f002122bf8c63eb6de8d7e310abaaac50a04fa"
+      },
+      {
+        "path": "src/llama-memory-hybrid.h",
+        "bytes": 5211,
+        "sha256": "53229d1857b624ad9f4bfeceb7a2ba922c1a231b1044acd3d210dc223ef8e61f"
+      },
+      {
+        "path": "src/llama-memory-recurrent.cpp",
+        "bytes": 49622,
+        "sha256": "cd13ab45e4d44346210f5320917bb00300a8897708fa90328a5a5dbf9af77c5e"
+      },
+      {
+        "path": "src/llama-memory-recurrent.h",
+        "bytes": 8823,
+        "sha256": "8f79b71f2935ee2a8ec81f7ea8550e37ba6c3dce9ca31a5a24e1c811689a3eea"
+      },
+      {
+        "path": "src/llama-memory.h",
+        "bytes": 7771,
+        "sha256": "c027893445c4d663b1a9d83048919afd9d14dff27166bfaa0b6380f71e24c5a2"
+      },
+      {
+        "path": "src/llama-model.cpp",
+        "bytes": 151354,
+        "sha256": "57902ddda0b63b9ea285259a1dd0bfc41639c8b7c2d20ca768315681c649c687"
+      }
+    ]
+  },
+  "qualifications": {
+    "standalone_b": {
+      "status": "PASS",
+      "ctest_tests": 4,
+      "build_profiles": [
+        "Release with warnings as errors",
+        "Debug ASan + UBSan + _GLIBCXX_ASSERTIONS"
+      ],
+      "four_worker_dags": 543,
+      "legal_states": 3007,
+      "reader_views": 3904,
+      "f64_reader_head_comparisons": 3200,
+      "f64_max_error_reported": 7.77156e-16,
+      "wrong_phase_counterexample_error_reported": 1.70309,
+      "sanitizers": {
+        "commands": {
+          "path": "build-rerot-b-sanitizers-20261019/commands.json",
+          "bytes": 876,
+          "sha256": "270539c6341a12c054525d321b9b56bbfedfe9b3900d4c8dfbfe273daa5750bb"
+        },
+        "records": [
+          {
+            "command": [
+              "cmake",
+              "-S",
+              "build-rerot-b-sanitizers-20261019/source",
+              "-B",
+              "build-rerot-b-sanitizers-20261019/build",
+              "-DCMAKE_BUILD_TYPE=Debug",
+              "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all -D_GLIBCXX_ASSERTIONS",
+              "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined"
+            ],
+            "returncode": 0,
+            "seconds": 0.1900956630706787
+          },
+          {
+            "command": [
+              "cmake",
+              "--build",
+              "build-rerot-b-sanitizers-20261019/build",
+              "--parallel",
+              "2"
+            ],
+            "returncode": 0,
+            "seconds": 3.862022638320923
+          },
+          {
+            "command": [
+              "ctest",
+              "--test-dir",
+              "build-rerot-b-sanitizers-20261019/build",
+              "--output-on-failure",
+              "--no-tests=error"
+            ],
+            "returncode": 0,
+            "seconds": 1.016240119934082
+          }
+        ],
+        "lasttest": {
+          "path": "build-rerot-b-sanitizers-20261019/build/Testing/Temporary/LastTest.log",
+          "bytes": 3088,
+          "sha256": "64f754852c0083012a9c6866e398d198bd604fe1e987c4fd221e9d004f3c27a5"
+        },
+        "evidence": [
+          "DAGs=543 states=3007 readers=3904"
+        ]
+      }
+    },
+    "independent_native_a_cpu_oracle": {
+      "status": "PASS",
+      "fixture": "One-layer generated GGUF with F32 weights/KV, FFN weights zero; not an independent F64 reference for the real 8B model.",
+      "cases": 16,
+      "architectures": [
+        "llama / NORMAL",
+        "qwen2 / NEOX"
+      ],
+      "geometry": {
+        "q_heads": 4,
+        "kv_heads": 2,
+        "head_width": 8,
+        "rotary_width": 8
+      },
+      "amplitudes": [
+        1,
+        1.375
+      ],
+      "query_order": [
+        "forward",
+        "reversed"
+      ],
+      "submission_shape": [
+        "batch",
+        "serial"
+      ],
+      "absolute_tolerance": 3e-05,
+      "relative_tolerance": 1e-05,
+      "ordinary_f64_max_abs": 4.1964194408272704e-07,
+      "reader_f64_max_abs": 7.238989769842163e-07,
+      "actual_gpu_offload": 0,
+      "logs": [
+        {
+          "path": "build-rerot-runtime-20261019/qualified-a-seams-cpu-20261019.log",
+          "bytes": 170810,
+          "sha256": "93c32894caf18d76c070e1313103e8028bde75a2af641b14c3c7cf178528c285"
+        },
+        {
+          "path": "build-rerot-runtime-20261019/qualified-a-seams-vulkan-20261019.log",
+          "bytes": 185017,
+          "sha256": "75efc32ed864e176d865c69d494799654e6db1172e258c7f384a52e7a8007377"
+        }
+      ],
+      "binaries": [
+        {
+          "path": "build-rerot-runtime-20261019/seams-cpu/test-rerot-attention-oracle",
+          "bytes": 117848,
+          "sha256": "30bb41dd99eba98ba8fc7a71b12e93753d3a072dd5657001c2565e693e164ae9"
+        },
+        {
+          "path": "build-rerot-runtime-20261019/seams-vulkan/test-rerot-attention-oracle",
+          "bytes": 117848,
+          "sha256": "5663e675138df0829d78c362fe551f9d103044c89000b8cec81c22c87bfec086"
+        }
+      ],
+      "vulkan_installation_scope": "The default oracle in the Vulkan-linked test tree executed on CPU. It is not GPU oracle qualification.",
+      "log_identity_note": "Successful CPU/Vulkan-linked CTest revalidation was copied to immutable files. Both oracle executions were on CPU, and all reported numeric maxima match the earlier final checks. Mutable LastTest.log paths are not evidence identities."
+    },
+    "real_native_reader": {
+      "cpu": {
+        "receipt": {
+          "path": "build-rerot-runtime-20261019/final-reader-f32-cpu.stdout",
+          "bytes": 11032,
+          "sha256": "1ad4434e379cde2ee5384ba968f47183301d91860245362e4012604c0e9df898"
+        },
+        "stderr": {
+          "path": "build-rerot-runtime-20261019/final-reader-f32-cpu.stderr",
+          "bytes": 165158,
+          "sha256": "5ba704b4eb3d1dd3ec7164d87e2c40cbd362c0235e60d9e40e22818e6ee04918"
+        },
+        "summary": {
+          "status": "PASS",
+          "scope": "real full-model teacher-forced logits",
+          "keep_going_diagnostics": true,
+          "failed_comparisons": 0,
+          "hybrid_model": true,
+          "kv_type": "f32",
+          "logical_sequences_requested": 8,
+          "physical_recurrent_slots_requested": 3,
+          "logit_comparisons": 31,
+          "equivalence_max_abs": 0,
+          "cross_shape_logit_comparisons": 12,
+          "cross_shape_max_abs": 2.1814355850219727,
+          "first_peer_effect_max_abs": 4.130826950073242,
+          "next_peer_effect_max_abs": 2.3145885467529297,
+          "invalid_views_rejected": 6,
+          "full_recurrent_pool_rejections": 1,
+          "actual_decode_calls": 72,
+          "actual_input_rows": 169,
+          "qualifications": {
+            "same_shape_attention_and_lifecycle": {
+              "status": "PASS",
+              "comparisons": 33,
+              "failed_comparisons": 0
+            },
+            "cross_shape_equivalence": {
+              "status": "NOT_QUALIFIED",
+              "explicitly_required": false,
+              "observed_comparisons": 12,
+              "observed_failed_comparisons": 12,
+              "scope": "executed batch and serial shapes only; no general native batch-invariance claim"
+            }
+          }
+        },
+        "unsupported_f16": {
+          "receipt": {
+            "path": "build-rerot-runtime-20261019/final-reader-f16-rejected-cpu.stdout",
+            "bytes": 280,
+            "sha256": "333a83ab9f6cd2f485ede7908c1678110b4d241ca40a03e1fa8613181ac265f0"
+          },
+          "summary": {
+            "status": "PASS",
+            "scope": "explicit unsupported F16 reader capability boundary",
+            "kv_type": "f16",
+            "views_supported": false,
+            "valid_view_rejected": true,
+            "ordinary_continuation_logits": 128000,
+            "actual_decode_calls": 2,
+            "actual_input_rows": 7,
+            "reader_numerical_qualification": "NOT_QUALIFIED"
+          }
+        },
+        "test_binary": {
+          "path": "build-rerot-runtime-20261019/seams-cpu/test-rerot-reader-views",
+          "bytes": 109632,
+          "sha256": "baf7fbb39cba79a530320ac31b0b82b23ef5f231412af340026b4143d122cab0"
+        }
+      },
+      "vulkan": {
+        "receipt": {
+          "path": "build-rerot-runtime-20261019/final-reader-f32-vulkan.stdout",
+          "bytes": 11355,
+          "sha256": "5b96fdf632d3fb54dd9a9cf45b7d2e266f052328c563a4fb823bc6e693fdad1c"
+        },
+        "stderr": {
+          "path": "build-rerot-runtime-20261019/final-reader-f32-vulkan.stderr",
+          "bytes": 169456,
+          "sha256": "b6c6dd91ebc034b22666d13deb092c1070905abc566ba4b6ec0d7e494b0e2644"
+        },
+        "summary": {
+          "status": "PASS",
+          "scope": "real full-model teacher-forced logits",
+          "keep_going_diagnostics": true,
+          "failed_comparisons": 0,
+          "hybrid_model": true,
+          "kv_type": "f32",
+          "logical_sequences_requested": 8,
+          "physical_recurrent_slots_requested": 3,
+          "logit_comparisons": 31,
+          "equivalence_max_abs": 1.33514404296875e-05,
+          "cross_shape_logit_comparisons": 12,
+          "cross_shape_max_abs": 4.442938804626465,
+          "first_peer_effect_max_abs": 4.028903961181641,
+          "next_peer_effect_max_abs": 2.358013153076172,
+          "invalid_views_rejected": 6,
+          "full_recurrent_pool_rejections": 1,
+          "actual_decode_calls": 72,
+          "actual_input_rows": 169,
+          "qualifications": {
+            "same_shape_attention_and_lifecycle": {
+              "status": "PASS",
+              "comparisons": 33,
+              "failed_comparisons": 0
+            },
+            "cross_shape_equivalence": {
+              "status": "NOT_QUALIFIED",
+              "explicitly_required": false,
+              "observed_comparisons": 12,
+              "observed_failed_comparisons": 12,
+              "scope": "executed batch and serial shapes only; no general native batch-invariance claim"
+            }
+          }
+        },
+        "unsupported_f16": {
+          "receipt": {
+            "path": "build-rerot-runtime-20261019/final-reader-f16-rejected-vulkan.stdout",
+            "bytes": 280,
+            "sha256": "333a83ab9f6cd2f485ede7908c1678110b4d241ca40a03e1fa8613181ac265f0"
+          },
+          "summary": {
+            "status": "PASS",
+            "scope": "explicit unsupported F16 reader capability boundary",
+            "kv_type": "f16",
+            "views_supported": false,
+            "valid_view_rejected": true,
+            "ordinary_continuation_logits": 128000,
+            "actual_decode_calls": 2,
+            "actual_input_rows": 7,
+            "reader_numerical_qualification": "NOT_QUALIFIED"
+          }
+        },
+        "test_binary": {
+          "path": "build-rerot-runtime-20261019/seams-vulkan/test-rerot-reader-views",
+          "bytes": 109632,
+          "sha256": "23c725aeaef8060819e3240583fb7e78f2cd48ecd6a1189a170fe23cd4353b36"
+        }
+      }
+    },
+    "ordinary_recurrent_regression": {
+      "cpu": {
+        "command_receipt": {
+          "path": "build-rerot-runtime-20261019/final-ordinary-recurrent-cpu.json",
+          "bytes": 325,
+          "sha256": "03de01ae2ee77b62f6327ac7633270497571592041abeb316e864c20f3346ca1"
+        },
+        "command": {
+          "command": [
+            "build-rerot-runtime-20261019/seams-cpu/test-recurrent-lifecycle",
+            "--model",
+            "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+            "--gpu-layers",
+            "0"
+          ],
+          "returncode": 0,
+          "seconds": 8.115829021204263,
+          "log": "build-rerot-runtime-20261019/final-ordinary-recurrent-cpu.log"
+        },
+        "log": {
+          "path": "build-rerot-runtime-20261019/final-ordinary-recurrent-cpu.log",
+          "bytes": 55330,
+          "sha256": "b67aaa36e6f7f679d897164ca3b85071b38bcaa430b0fa03e440eb91cad90fa8"
+        },
+        "summary": {
+          "status": "pass",
+          "neighbor_snapshot_checks": 24,
+          "shared_snapshot_checks": 8,
+          "continuation_max_abs": 0,
+          "decode_calls": 24,
+          "input_rows": 189
+        }
+      },
+      "vulkan": {
+        "command_receipt": {
+          "path": "build-rerot-runtime-20261019/final-ordinary-recurrent-vulkan.json",
+          "bytes": 333,
+          "sha256": "b4bae1d4023bd1a3dd03e8a140da0a4c0456efc2132ceaae0acac544f8a04c3b"
+        },
+        "command": {
+          "command": [
+            "build-rerot-runtime-20261019/seams-vulkan/test-recurrent-lifecycle",
+            "--model",
+            "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+            "--gpu-layers",
+            "99"
+          ],
+          "returncode": 0,
+          "seconds": 2.9941935217939317,
+          "log": "build-rerot-runtime-20261019/final-ordinary-recurrent-vulkan.log"
+        },
+        "log": {
+          "path": "build-rerot-runtime-20261019/final-ordinary-recurrent-vulkan.log",
+          "bytes": 52105,
+          "sha256": "5949aaca3fa21d55842902f611eda502c3ad3067c88549760af7efa8cbaecfb6"
+        },
+        "summary": {
+          "status": "pass",
+          "neighbor_snapshot_checks": 24,
+          "shared_snapshot_checks": 8,
+          "continuation_max_abs": 0,
+          "decode_calls": 24,
+          "input_rows": 189
+        }
+      }
+    },
+    "native_c": {
+      "cpu": {
+        "receipt": {
+          "path": "build-rerot-whiteboard-cpu-f32-20261019/receipt.json",
+          "bytes": 376391,
+          "sha256": "eba985b26b11c0ca68d018cd7c62ef227eaf3e526e4e80d344b193424bab6f6f"
+        },
+        "status": "PASS",
+        "qualifications": {
+          "phase_memory_invariance": {
+            "status": "PASS",
+            "expected_comparisons": 2,
+            "comparisons": [
+              {
+                "group": "1be30c1de3a9ea4d-ubatch-128",
+                "reference_run": "01-ubatch-128-release-1",
+                "run": "05-ubatch-128-retain-1",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              },
+              {
+                "group": "1be30c1de3a9ea4d-ubatch-1",
+                "reference_run": "03-ubatch-1-release-1",
+                "run": "07-ubatch-1-retain-1",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              }
+            ]
+          },
+          "same_shape_reproducibility": {
+            "status": "PASS",
+            "expected_comparisons": 4,
+            "comparisons": [
+              {
+                "group": "1be30c1de3a9ea4d-ubatch-128",
+                "reference_run": "01-ubatch-128-release-1",
+                "run": "02-ubatch-128-release-2",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              },
+              {
+                "group": "1be30c1de3a9ea4d-ubatch-1",
+                "reference_run": "03-ubatch-1-release-1",
+                "run": "04-ubatch-1-release-2",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              },
+              {
+                "group": "1be30c1de3a9ea4d-ubatch-128",
+                "reference_run": "05-ubatch-128-retain-1",
+                "run": "06-ubatch-128-retain-2",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              },
+              {
+                "group": "1be30c1de3a9ea4d-ubatch-1",
+                "reference_run": "07-ubatch-1-retain-1",
+                "run": "08-ubatch-1-retain-2",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              }
+            ]
+          },
+          "cross_shape_greedy_equivalence": {
+            "status": "NOT_QUALIFIED",
+            "explicitly_required": false,
+            "expected_comparisons": 1,
+            "observations": [
+              {
+                "reference_group": "1be30c1de3a9ea4d-ubatch-128",
+                "group": "1be30c1de3a9ea4d-ubatch-1",
+                "reference_run": "01-ubatch-128-release-1",
+                "run": "03-ubatch-1-release-1",
+                "greedy_trajectory_equal": false
+              }
+            ],
+            "scope": "observed executed shapes only; no general native batch-invariance claim"
+          },
+          "incremental_whiteboard_contract": {
+            "status": "PASS",
+            "expected_runs": 8,
+            "passed_runs": 8
+          }
+        },
+        "binary": {
+          "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-cpu/bin/tq-rerot-compose",
+          "bytes": 237384,
+          "sha256": "9868d48e3d5ab8b2f7040589ce50b8f54656ce09948a2b2523f51ff8f07befbb"
+        },
+        "libraries": [
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-cpu/lib/libggml-base.so.0.18.1",
+            "bytes": 1010472,
+            "sha256": "2334e4268b473e27016be814707f6a7fc01a2e6b16e6669aacde5e2e7a687eb3"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-cpu/lib/libggml-cpu.so.0.18.1",
+            "bytes": 1381088,
+            "sha256": "48d9534cd9f3e1cb9dbfd89e76fb0fe87ae3347344d59371e65e22c68d123e6c"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-cpu/lib/libggml.so.0.18.1",
+            "bytes": 55472,
+            "sha256": "03a0bf710ca258b97d14bd440614ae9f2c20ede1b0728e8e08393af4603aca05"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-cpu/lib/libllama.so.0.0.2059",
+            "bytes": 4999584,
+            "sha256": "338bc81875b0a469a037f0d8fca56d7e4a990e3afb859c647e41ea74088b0958"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-cpu/lib/libtq-relay.a",
+            "bytes": 82492,
+            "sha256": "8583eb18d1ed273b15dfc3fc7143f772629f1130ab8c771706a8965a500163bd"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-cpu/lib/libtq-text.a",
+            "bytes": 24698,
+            "sha256": "2aa0f7676adfec351e6f3d334ae16e8db9f5f56b5876732c8978559bab1b136f"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-cpu/lib/libtq_rerot.a",
+            "bytes": 121164,
+            "sha256": "a73d068bcd84c17e512223ab5fce4f5eed1dfc787dcbed10b6eb030761247acf"
+          }
+        ],
+        "runs": [
+          {
+            "name": "01-ubatch-128-release-1",
+            "status": "PASS",
+            "seconds": 21.250794103369117,
+            "frontiers": 455,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 187,
+              "4": 159
+            },
+            "token_trajectory_sha256": "fe7163a12326d0c0f2bba61bd83f0e0d6a10e343255cd789277c5cd54244e5bb",
+            "placement": {
+              "offloaded_layers": 0,
+              "model_buffer_devices": [],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 128
+            },
+            "compute_release": [
+              {
+                "event": "compute_release",
+                "before": 75561120,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 75561120,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 1373952,
+                "after": 0
+              }
+            ]
+          },
+          {
+            "name": "02-ubatch-128-release-2",
+            "status": "PASS",
+            "seconds": 21.42551558976993,
+            "frontiers": 455,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 187,
+              "4": 159
+            },
+            "token_trajectory_sha256": "fe7163a12326d0c0f2bba61bd83f0e0d6a10e343255cd789277c5cd54244e5bb",
+            "placement": {
+              "offloaded_layers": 0,
+              "model_buffer_devices": [],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 128
+            },
+            "compute_release": [
+              {
+                "event": "compute_release",
+                "before": 75561120,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 75561120,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 1373952,
+                "after": 0
+              }
+            ]
+          },
+          {
+            "name": "03-ubatch-1-release-1",
+            "status": "PASS",
+            "seconds": 20.21293343603611,
+            "frontiers": 402,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 165,
+              "4": 128
+            },
+            "token_trajectory_sha256": "a3e3f85990568d23b8c3fe184e69b51f2ec4d67b05ffec6ee4cdc41aa874873b",
+            "placement": {
+              "offloaded_layers": 0,
+              "model_buffer_devices": [],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 1
+            },
+            "compute_release": [
+              {
+                "event": "compute_release",
+                "before": 1757344,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 1757344,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 1132128,
+                "after": 0
+              }
+            ]
+          },
+          {
+            "name": "04-ubatch-1-release-2",
+            "status": "PASS",
+            "seconds": 19.68131122784689,
+            "frontiers": 402,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 165,
+              "4": 128
+            },
+            "token_trajectory_sha256": "a3e3f85990568d23b8c3fe184e69b51f2ec4d67b05ffec6ee4cdc41aa874873b",
+            "placement": {
+              "offloaded_layers": 0,
+              "model_buffer_devices": [],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 1
+            },
+            "compute_release": [
+              {
+                "event": "compute_release",
+                "before": 1757344,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 1757344,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 1132128,
+                "after": 0
+              }
+            ]
+          },
+          {
+            "name": "05-ubatch-128-retain-1",
+            "status": "PASS",
+            "seconds": 20.98694290081039,
+            "frontiers": 455,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 187,
+              "4": 159
+            },
+            "token_trajectory_sha256": "fe7163a12326d0c0f2bba61bd83f0e0d6a10e343255cd789277c5cd54244e5bb",
+            "placement": {
+              "offloaded_layers": 0,
+              "model_buffer_devices": [],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 128
+            },
+            "compute_release": []
+          },
+          {
+            "name": "06-ubatch-128-retain-2",
+            "status": "PASS",
+            "seconds": 22.65790587803349,
+            "frontiers": 455,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 187,
+              "4": 159
+            },
+            "token_trajectory_sha256": "fe7163a12326d0c0f2bba61bd83f0e0d6a10e343255cd789277c5cd54244e5bb",
+            "placement": {
+              "offloaded_layers": 0,
+              "model_buffer_devices": [],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 128
+            },
+            "compute_release": []
+          },
+          {
+            "name": "07-ubatch-1-retain-1",
+            "status": "PASS",
+            "seconds": 21.4830580400303,
+            "frontiers": 402,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 165,
+              "4": 128
+            },
+            "token_trajectory_sha256": "a3e3f85990568d23b8c3fe184e69b51f2ec4d67b05ffec6ee4cdc41aa874873b",
+            "placement": {
+              "offloaded_layers": 0,
+              "model_buffer_devices": [],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 1
+            },
+            "compute_release": []
+          },
+          {
+            "name": "08-ubatch-1-retain-2",
+            "status": "PASS",
+            "seconds": 19.568879972212017,
+            "frontiers": 402,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 165,
+              "4": 128
+            },
+            "token_trajectory_sha256": "a3e3f85990568d23b8c3fe184e69b51f2ec4d67b05ffec6ee4cdc41aa874873b",
+            "placement": {
+              "offloaded_layers": 0,
+              "model_buffer_devices": [],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 1
+            },
+            "compute_release": []
+          }
+        ],
+        "process_failures": {
+          "receipt": {
+            "path": "build-rerot-interrupt-cpu-f32-20261019/receipt.json",
+            "bytes": 10740,
+            "sha256": "5d00076c0453de79c7cf4fb8be95137e6d383b29be3ab7ffe125e24ccac97419"
+          },
+          "status": "PASS",
+          "runs": [
+            {
+              "name": "01-sigint-1",
+              "kind": "sigint",
+              "status": "PASS",
+              "returncode": 130,
+              "seconds_after_injection": 0.3073482858017087,
+              "injection": {
+                "kind": "sigint",
+                "at_seconds": 4.014367016963661,
+                "after_observed_events": 13,
+                "after_committed_frontier": 3,
+                "after_committed_revision": 4,
+                "after_live_body_cohorts": 2,
+                "signal": "SIGINT"
+              },
+              "timed_out": false,
+              "forced_cleanup": [],
+              "violations": [],
+              "model_placement_observed": {
+                "offloaded_layers": 0,
+                "non_cpu_model_buffer_devices": [],
+                "evidence": "actual positive model load buffer/offload logs; enumeration alone is excluded"
+              }
+            },
+            {
+              "name": "02-broken-pipe-1",
+              "kind": "broken-pipe",
+              "status": "PASS",
+              "returncode": 1,
+              "seconds_after_injection": 0.31580070685595274,
+              "injection": {
+                "kind": "broken-pipe",
+                "at_seconds": 4.4726232890971005,
+                "after_observed_events": 13,
+                "after_committed_frontier": 3,
+                "after_committed_revision": 4,
+                "after_live_body_cohorts": 2,
+                "operation": "close sole stdout read end"
+              },
+              "timed_out": false,
+              "forced_cleanup": [],
+              "violations": [],
+              "model_placement_observed": {
+                "offloaded_layers": 0,
+                "non_cpu_model_buffer_devices": [],
+                "evidence": "actual positive model load buffer/offload logs; enumeration alone is excluded"
+              }
+            }
+          ]
+        }
+      },
+      "vulkan": {
+        "receipt": {
+          "path": "build-rerot-whiteboard-vulkan-f32-20261019/receipt.json",
+          "bytes": 407870,
+          "sha256": "7b43eb539e32a3e21381005adae591fa8bcfa434594c98fbd764b0a559b83b0b"
+        },
+        "status": "PASS",
+        "qualifications": {
+          "phase_memory_invariance": {
+            "status": "PASS",
+            "expected_comparisons": 2,
+            "comparisons": [
+              {
+                "group": "5625022b47654567-ubatch-128",
+                "reference_run": "01-ubatch-128-release-1",
+                "run": "05-ubatch-128-retain-1",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              },
+              {
+                "group": "5625022b47654567-ubatch-1",
+                "reference_run": "03-ubatch-1-release-1",
+                "run": "07-ubatch-1-retain-1",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              }
+            ]
+          },
+          "same_shape_reproducibility": {
+            "status": "PASS",
+            "expected_comparisons": 4,
+            "comparisons": [
+              {
+                "group": "5625022b47654567-ubatch-128",
+                "reference_run": "01-ubatch-128-release-1",
+                "run": "02-ubatch-128-release-2",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              },
+              {
+                "group": "5625022b47654567-ubatch-1",
+                "reference_run": "03-ubatch-1-release-1",
+                "run": "04-ubatch-1-release-2",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              },
+              {
+                "group": "5625022b47654567-ubatch-128",
+                "reference_run": "05-ubatch-128-retain-1",
+                "run": "06-ubatch-128-retain-2",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              },
+              {
+                "group": "5625022b47654567-ubatch-1",
+                "reference_run": "07-ubatch-1-retain-1",
+                "run": "08-ubatch-1-retain-2",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              }
+            ]
+          },
+          "cross_shape_greedy_equivalence": {
+            "status": "NOT_QUALIFIED",
+            "explicitly_required": false,
+            "expected_comparisons": 1,
+            "observations": [
+              {
+                "reference_group": "5625022b47654567-ubatch-128",
+                "group": "5625022b47654567-ubatch-1",
+                "reference_run": "01-ubatch-128-release-1",
+                "run": "03-ubatch-1-release-1",
+                "greedy_trajectory_equal": false
+              }
+            ],
+            "scope": "observed executed shapes only; no general native batch-invariance claim"
+          },
+          "incremental_whiteboard_contract": {
+            "status": "PASS",
+            "expected_runs": 8,
+            "passed_runs": 8
+          }
+        },
+        "binary": {
+          "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/bin/tq-rerot-compose",
+          "bytes": 237384,
+          "sha256": "478cda1d04c3f8e5ba56faa02fa65a0dd1dfc15460b4fba67a800e909e188122"
+        },
+        "libraries": [
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/lib/libggml-base.so.0.18.1",
+            "bytes": 1010472,
+            "sha256": "483222b393f2f744509afcec5a038bfa6a1404ba5ffacfd611a079b725084bc1"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/lib/libggml-cpu.so.0.18.1",
+            "bytes": 1381088,
+            "sha256": "6b00a3453c091031332efd87b0836faec5b39ebe1aa7eea1ae5619384dd62901"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/lib/libggml-vulkan.so.0.18.1",
+            "bytes": 56618312,
+            "sha256": "5529dd36ee499771c7b93c56c0aca1d16baf28bb8beb5c07f623914a038a0453"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/lib/libggml.so.0.18.1",
+            "bytes": 55264,
+            "sha256": "0d2cc08042253896e47d70a7915e595fdd12bc8358b9171ba2c957422551fe58"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/lib/libllama-common.so.0.0.2076",
+            "bytes": 6665480,
+            "sha256": "03c086ebb9fcdc0f18cf2abc5f717555b4c69e6d2d0e50eb335227ddb5f32ab0"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/lib/libllama.so.0.0.2076",
+            "bytes": 4999584,
+            "sha256": "5c202c2519d77c537fc35c46313294dce0199544e2ac1d820f8235e94e90921a"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/lib/libmtmd.so.0.0.2076",
+            "bytes": 1920208,
+            "sha256": "ab878dba8c0df969a503e980895b33006aa80a40bb73c753f06a72caeb4a508b"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/lib/libtq-relay.a",
+            "bytes": 82492,
+            "sha256": "8583eb18d1ed273b15dfc3fc7143f772629f1130ab8c771706a8965a500163bd"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/lib/libtq-text.a",
+            "bytes": 24698,
+            "sha256": "2aa0f7676adfec351e6f3d334ae16e8db9f5f56b5876732c8978559bab1b136f"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/lib/libtq_rerot.a",
+            "bytes": 121164,
+            "sha256": "a73d068bcd84c17e512223ab5fce4f5eed1dfc787dcbed10b6eb030761247acf"
+          }
+        ],
+        "runs": [
+          {
+            "name": "01-ubatch-128-release-1",
+            "status": "PASS",
+            "seconds": 6.9068189319223166,
+            "frontiers": 512,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 208,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 104
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 104
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 104,
+              "2": 104,
+              "3": 177,
+              "4": 225
+            },
+            "token_trajectory_sha256": "06bf8b3dfd52f90fada53c027ef5d4abd78480ed76e7d65e6e28ab38d9cb6089",
+            "placement": {
+              "offloaded_layers": 25,
+              "model_buffer_devices": [
+                "Vulkan0"
+              ],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 128
+            },
+            "compute_release": [
+              {
+                "event": "compute_release",
+                "before": 89946060,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 89946060,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 1756736,
+                "after": 0
+              }
+            ]
+          },
+          {
+            "name": "02-ubatch-128-release-2",
+            "status": "PASS",
+            "seconds": 7.139725900255144,
+            "frontiers": 512,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 208,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 104
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 104
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 104,
+              "2": 104,
+              "3": 177,
+              "4": 225
+            },
+            "token_trajectory_sha256": "06bf8b3dfd52f90fada53c027ef5d4abd78480ed76e7d65e6e28ab38d9cb6089",
+            "placement": {
+              "offloaded_layers": 25,
+              "model_buffer_devices": [
+                "Vulkan0"
+              ],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 128
+            },
+            "compute_release": [
+              {
+                "event": "compute_release",
+                "before": 89946060,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 89946060,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 1756736,
+                "after": 0
+              }
+            ]
+          },
+          {
+            "name": "03-ubatch-1-release-1",
+            "status": "PASS",
+            "seconds": 6.856986919883639,
+            "frontiers": 439,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 158,
+              "4": 172
+            },
+            "token_trajectory_sha256": "faa732e31a0ed5d64fbb4a3b3adab77854381d107777fcf7d37ffd40b3d99ce4",
+            "placement": {
+              "offloaded_layers": 25,
+              "model_buffer_devices": [
+                "Vulkan0"
+              ],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 1
+            },
+            "compute_release": [
+              {
+                "event": "compute_release",
+                "before": 2110684,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 2110684,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 1516824,
+                "after": 0
+              }
+            ]
+          },
+          {
+            "name": "04-ubatch-1-release-2",
+            "status": "PASS",
+            "seconds": 6.500999569892883,
+            "frontiers": 439,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 158,
+              "4": 172
+            },
+            "token_trajectory_sha256": "faa732e31a0ed5d64fbb4a3b3adab77854381d107777fcf7d37ffd40b3d99ce4",
+            "placement": {
+              "offloaded_layers": 25,
+              "model_buffer_devices": [
+                "Vulkan0"
+              ],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 1
+            },
+            "compute_release": [
+              {
+                "event": "compute_release",
+                "before": 2110684,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 2110684,
+                "after": 0
+              },
+              {
+                "event": "compute_release",
+                "before": 1516824,
+                "after": 0
+              }
+            ]
+          },
+          {
+            "name": "05-ubatch-128-retain-1",
+            "status": "PASS",
+            "seconds": 7.0935257552191615,
+            "frontiers": 512,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 208,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 104
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 104
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 104,
+              "2": 104,
+              "3": 177,
+              "4": 225
+            },
+            "token_trajectory_sha256": "06bf8b3dfd52f90fada53c027ef5d4abd78480ed76e7d65e6e28ab38d9cb6089",
+            "placement": {
+              "offloaded_layers": 25,
+              "model_buffer_devices": [
+                "Vulkan0"
+              ],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 128
+            },
+            "compute_release": []
+          },
+          {
+            "name": "06-ubatch-128-retain-2",
+            "status": "PASS",
+            "seconds": 7.446591512300074,
+            "frontiers": 512,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 208,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 104
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 104
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 104,
+              "2": 104,
+              "3": 177,
+              "4": 225
+            },
+            "token_trajectory_sha256": "06bf8b3dfd52f90fada53c027ef5d4abd78480ed76e7d65e6e28ab38d9cb6089",
+            "placement": {
+              "offloaded_layers": 25,
+              "model_buffer_devices": [
+                "Vulkan0"
+              ],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 128
+            },
+            "compute_release": []
+          },
+          {
+            "name": "07-ubatch-1-retain-1",
+            "status": "PASS",
+            "seconds": 6.870435202028602,
+            "frontiers": 439,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 158,
+              "4": 172
+            },
+            "token_trajectory_sha256": "faa732e31a0ed5d64fbb4a3b3adab77854381d107777fcf7d37ffd40b3d99ce4",
+            "placement": {
+              "offloaded_layers": 25,
+              "model_buffer_devices": [
+                "Vulkan0"
+              ],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 1
+            },
+            "compute_release": []
+          },
+          {
+            "name": "08-ubatch-1-retain-2",
+            "status": "PASS",
+            "seconds": 6.720527936704457,
+            "frontiers": 439,
+            "maximum_readers": 2,
+            "peer_body_reads_while_running": 206,
+            "peer_growth_witnesses": [
+              {
+                "reader": 1,
+                "peer": 2,
+                "increments": 103
+              },
+              {
+                "reader": 2,
+                "peer": 1,
+                "increments": 103
+              }
+            ],
+            "body_tokens_by_stage": {
+              "1": 103,
+              "2": 103,
+              "3": 158,
+              "4": 172
+            },
+            "token_trajectory_sha256": "faa732e31a0ed5d64fbb4a3b3adab77854381d107777fcf7d37ffd40b3d99ce4",
+            "placement": {
+              "offloaded_layers": 25,
+              "model_buffer_devices": [
+                "Vulkan0"
+              ],
+              "evidence": "actual model load log; device enumeration alone is excluded"
+            },
+            "native_context_shape": {
+              "n_batch": 512,
+              "n_ubatch": 1
+            },
+            "compute_release": []
+          }
+        ],
+        "process_failures": {
+          "receipt": {
+            "path": "build-rerot-interrupt-vulkan-f32-20261019/receipt.json",
+            "bytes": 11672,
+            "sha256": "fedb335e80fead922786262c72d019ca4332d668f12fc90a68f37362fea53633"
+          },
+          "status": "PASS",
+          "runs": [
+            {
+              "name": "01-sigint-1",
+              "kind": "sigint",
+              "status": "PASS",
+              "returncode": 130,
+              "seconds_after_injection": 0.12393552623689175,
+              "injection": {
+                "kind": "sigint",
+                "at_seconds": 2.6822763918899,
+                "after_observed_events": 13,
+                "after_committed_frontier": 3,
+                "after_committed_revision": 4,
+                "after_live_body_cohorts": 2,
+                "signal": "SIGINT"
+              },
+              "timed_out": false,
+              "forced_cleanup": [],
+              "violations": [],
+              "model_placement_observed": {
+                "offloaded_layers": 25,
+                "non_cpu_model_buffer_devices": [
+                  "Vulkan0"
+                ],
+                "evidence": "actual positive model load buffer/offload logs; enumeration alone is excluded"
+              }
+            },
+            {
+              "name": "02-broken-pipe-1",
+              "kind": "broken-pipe",
+              "status": "PASS",
+              "returncode": 1,
+              "seconds_after_injection": 0.13168087601661682,
+              "injection": {
+                "kind": "broken-pipe",
+                "at_seconds": 2.649747759103775,
+                "after_observed_events": 13,
+                "after_committed_frontier": 3,
+                "after_committed_revision": 4,
+                "after_live_body_cohorts": 2,
+                "operation": "close sole stdout read end"
+              },
+              "timed_out": false,
+              "forced_cleanup": [],
+              "violations": [],
+              "model_placement_observed": {
+                "offloaded_layers": 25,
+                "non_cpu_model_buffer_devices": [
+                  "Vulkan0"
+                ],
+                "evidence": "actual positive model load buffer/offload logs; enumeration alone is excluded"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "a_seams_ctest": {
+      "cpu": {
+        "status": "PASS",
+        "tests": 4
+      },
+      "vulkan": {
+        "status": "PASS",
+        "tests": 8
+      },
+      "scope": "Selected public seams; the tiny attention oracle runs on CPU. Not a full GPU backend sweep."
+    },
+    "c_cli": {
+      "status": "PASS",
+      "checks_per_backend": 28,
+      "ctest_drivers_per_backend": 1
+    },
+    "isolated_installation": {
+      "result": {
+        "path": "build-isolation-rerot-20261019/result.json",
+        "bytes": 19163,
+        "sha256": "c6b7495916fdcf6414bd2a8e2f0848826e4208eac57478bae6c30b3aa760d7e2"
+      },
+      "commands": {
+        "path": "build-isolation-rerot-20261019/commands.json",
+        "bytes": 32247,
+        "sha256": "282d45d6798f8c4d233bb70d89f912638f2450708dc8b4ae87837c7acd805f90"
+      },
+      "boundary": {
+        "path": "build-isolation-rerot-20261019/verified-boundary.json",
+        "bytes": 17920,
+        "sha256": "ae604b5ce9279ca0f548cfef497a82c2ccf0ae42e3111748912ef39a80d8b93a"
+      },
+      "summary": {
+        "upstream": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+        "a_source_provenance": "built_from_pinned_archive_and_verified_overlay_bytes",
+        "a_archive_has_no_b_or_c": true,
+        "a_reuse_limit": null,
+        "a_public_seams_tests_passed": true,
+        "isolated_modules": [
+          "sampling",
+          "corpus",
+          "scheduling",
+          "text",
+          "calibration",
+          "relay",
+          "rerot",
+          "compose",
+          "corpus-compose",
+          "batch-compose",
+          "logits-compose",
+          "imatrix-compose",
+          "rerot-compose"
+        ],
+        "source_and_build_copies_removed_before_consumption": true,
+        "relocated_installed_consumers_passed": true,
+        "relocated_imatrix_conversion": "passed",
+        "relocated_rerot_consumer": "passed",
+        "relocated_rerot_cli": "passed",
+        "relocated_real_rerot": "passed",
+        "relocated_real_rerot_receipt": "relocated-real-rerot/receipt.json",
+        "relocated_real_batch": "skipped_no_model",
+        "relocated_real_logits": "skipped_no_model",
+        "relocated_real_stream": "skipped_no_model",
+        "limits": [
+          "Help/package checks alone do not establish model execution or throughput.",
+          "Imatrix conversion uses synthetic format fixtures, not model calibration or quantization quality measurements.",
+          "RERoT event-contract qualification does not establish attention numerical equivalence, TP5, MMVQ dispatch, LateBind, MTP, or performance benefit.",
+          "Separate source copies and installed consumption do not constitute an OS sandbox."
+        ],
+        "commands": 77
+      },
+      "real_rerot": {
+        "receipt": {
+          "path": "build-isolation-rerot-20261019/relocated-real-rerot/receipt.json",
+          "bytes": 189011,
+          "sha256": "36e0be5b49d16c2e1d4991d51c46ff81b53501be829dab34d9d96ef0533551bf"
+        },
+        "status": "PASS",
+        "qualifications": {
+          "phase_memory_invariance": {
+            "status": "PASS",
+            "expected_comparisons": 2,
+            "comparisons": [
+              {
+                "group": "82b8249e6db4c118-ubatch-128",
+                "reference_run": "01-ubatch-128-release-1",
+                "run": "03-ubatch-128-retain-1",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              },
+              {
+                "group": "82b8249e6db4c118-ubatch-1",
+                "reference_run": "02-ubatch-1-release-1",
+                "run": "04-ubatch-1-retain-1",
+                "status": "PASS",
+                "greedy_trajectory_equal": true
+              }
+            ]
+          },
+          "same_shape_reproducibility": {
+            "status": "NOT_QUALIFIED",
+            "expected_comparisons": 0,
+            "comparisons": []
+          },
+          "cross_shape_greedy_equivalence": {
+            "status": "NOT_QUALIFIED",
+            "explicitly_required": false,
+            "expected_comparisons": 1,
+            "observations": [
+              {
+                "reference_group": "82b8249e6db4c118-ubatch-128",
+                "group": "82b8249e6db4c118-ubatch-1",
+                "reference_run": "01-ubatch-128-release-1",
+                "run": "02-ubatch-1-release-1",
+                "greedy_trajectory_equal": false
+              }
+            ],
+            "scope": "observed executed shapes only; no general native batch-invariance claim"
+          },
+          "incremental_whiteboard_contract": {
+            "status": "PASS",
+            "expected_runs": 4,
+            "passed_runs": 4
+          }
+        },
+        "runs": [
+          {
+            "name": "01-ubatch-128-release-1",
+            "frontiers": 402,
+            "peer_reads": 206,
+            "binary_hash": "b4deb401df39d4e5d1fcbce4a439df65833b0c8ed82fa945be890a5b7fbbd5a7"
+          },
+          {
+            "name": "02-ubatch-1-release-1",
+            "frontiers": 456,
+            "peer_reads": 206,
+            "binary_hash": "b4deb401df39d4e5d1fcbce4a439df65833b0c8ed82fa945be890a5b7fbbd5a7"
+          },
+          {
+            "name": "03-ubatch-128-retain-1",
+            "frontiers": 402,
+            "peer_reads": 206,
+            "binary_hash": "b4deb401df39d4e5d1fcbce4a439df65833b0c8ed82fa945be890a5b7fbbd5a7"
+          },
+          {
+            "name": "04-ubatch-1-retain-1",
+            "frontiers": 456,
+            "peer_reads": 206,
+            "binary_hash": "b4deb401df39d4e5d1fcbce4a439df65833b0c8ed82fa945be890a5b7fbbd5a7"
+          }
+        ]
+      }
+    },
+    "single_gpu_layer": {
+      "receipt": {
+        "path": "build-rerot-single-gpu-layer-20261019/receipt.json",
+        "bytes": 62594,
+        "sha256": "8d35a5961f81d7a3d1a258d18f94d7a8a44b50df14e54371c9dc4bdef656bdc1"
+      },
+      "status": "PASS",
+      "qualifications": {
+        "phase_memory_invariance": {
+          "status": "NOT_QUALIFIED",
+          "expected_comparisons": 0,
+          "comparisons": []
+        },
+        "same_shape_reproducibility": {
+          "status": "NOT_QUALIFIED",
+          "expected_comparisons": 0,
+          "comparisons": []
+        },
+        "cross_shape_greedy_equivalence": {
+          "status": "NOT_QUALIFIED",
+          "explicitly_required": false,
+          "expected_comparisons": 0,
+          "observations": [],
+          "scope": "observed executed shapes only; no general native batch-invariance claim"
+        },
+        "incremental_whiteboard_contract": {
+          "status": "PASS",
+          "expected_runs": 1,
+          "passed_runs": 1
+        }
+      },
+      "failure": null,
+      "run": {
+        "argv": [
+          "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/bin/tq-rerot-compose",
+          "--model",
+          "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+          "--prompt",
+          "This is a short copying exercise on a shared whiteboard. Both writers may give the same answer; agreement is expected. Give the requested brief reply and finish your turn.",
+          "--synthesis",
+          "Reply with the single word complete.",
+          "--parallel",
+          "2",
+          "--ctx-size",
+          "4096",
+          "--batch-size",
+          "512",
+          "--threads",
+          "4",
+          "--gpu-layers",
+          "99",
+          "--split-mode",
+          "layer",
+          "--worker-tokens",
+          "512",
+          "--final-tokens",
+          "512",
+          "--seed",
+          "0",
+          "--temperature",
+          "0",
+          "--json",
+          "--stage",
+          "writer_a=Reply with only this sentence: Shared work brings us to the same answer.",
+          "--stage",
+          "writer_b=Reply with only this sentence: Shared work brings us to the same answer.",
+          "--stage",
+          "ready=Reply with the single word ready.",
+          "--after",
+          "ready=writer_a",
+          "--after",
+          "ready=writer_b",
+          "--ubatch-size",
+          "128",
+          "--phase-memory"
+        ],
+        "seconds": 6.435425318777561,
+        "returncode": 0,
+        "stdout": {
+          "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-single-gpu-layer-20261019/01-ubatch-128-release-1.stdout.jsonl",
+          "bytes": 495252,
+          "sha256": "6ce9be27d2f9c7d407c0085d0689992a7b6022ada4c2cce80d37a345b49f177b"
+        },
+        "stderr": {
+          "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-single-gpu-layer-20261019/01-ubatch-128-release-1.stderr.log",
+          "bytes": 54114,
+          "sha256": "a2b422ddba1e398584db777be6b822516a6dde25cd2b7f0efbfb32ad31147c30"
+        },
+        "contract": {
+          "status": "PASS",
+          "scope": "real model execution and emitted whiteboard contract",
+          "frontiers": 512,
+          "maximum_readers": 2,
+          "maximum_rows": 50,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 177,
+            "4": 225
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 17,
+            "4": 17
+          },
+          "peer_body_reads_while_running": 208,
+          "peer_growth_witnesses": [
+            {
+              "reader": 1,
+              "peer": 2,
+              "increments": 104
+            },
+            {
+              "reader": 2,
+              "peer": 1,
+              "increments": 104
+            }
+          ],
+          "config": {
+            "event": "config",
+            "provider": "native-a",
+            "submission_domains": 1,
+            "profile": "assistant-eot",
+            "workers": 3,
+            "parallel": 2,
+            "base_tokens": 43,
+            "logical_context": 4096,
+            "physical_kv": 4096,
+            "logical_sequences": 5,
+            "physical_recurrent_slots_requested": 3,
+            "split_mode_requested": "layer",
+            "devices": [
+              {
+                "name": "Vulkan0",
+                "description": "AMD Radeon RX 6800 (RADV NAVI21)",
+                "scope": "available"
+              },
+              {
+                "name": "CPU",
+                "description": "AMD Ryzen 5 7500F 6-Core Processor",
+                "scope": "available"
+              }
+            ],
+            "gpu_layers_requested": 99,
+            "phase_memory": true,
+            "seed": 0,
+            "temperature": 0,
+            "synthesis_stage": 4
+          },
+          "attention_numerical_equivalence": "NOT_EVALUATED_BY_EVENT_TRACE"
+        },
+        "placement": {
+          "offloaded_layers": 25,
+          "model_buffer_devices": [
+            "Vulkan0"
+          ],
+          "evidence": "actual model load log; device enumeration alone is excluded"
+        },
+        "token_trajectory_sha256": "06bf8b3dfd52f90fada53c027ef5d4abd78480ed76e7d65e6e28ab38d9cb6089"
+      },
+      "scope": "One actual RX 6800; one extra full execution. Not multi-device PP or repeatability qualification."
+    }
+  },
+  "support_boundaries": {
+    "multi_device_pp": "NOT_RUN",
+    "whole_model_tp5": "NO_INSTALLED_PROVIDER; --tp5 is explicitly rejected. Existing TQRelay ownership/submission protocol is reused for real A calls.",
+    "latebind": "NO_INSTALLED_PROVIDER; --latebind is explicitly rejected.",
+    "mtp": "NO_INSTALLED_PROVIDER; --mtp is explicitly rejected. Future drafts must bind world revision and reader view, and be revalidated or discarded after publication.",
+    "mmvq": "NATIVE_DISPATCH_PRESERVED; actual selected kernel and RERoT-specific speedup not qualified. Changing ubatch changes execution shape.",
+    "gpu_independent_f64_oracle": "NOT_QUALIFIED; prior actual GPU ordinary calibration failed and its records remain below.",
+    "cross_shape_equivalence": "NOT_QUALIFIED; both final reader controls observed 12/12 failures at the original threshold, and complete C greedy trajectories differ across ubatch. --require-cross-shape-equivalence restores a strict exit gate.",
+    "f16_reader": "EXPLICITLY_REJECTED; F16 ordinary prefill and continuation passed separate negative reader-capability tests.",
+    "vulkan_row_split": "UNSUPPORTED_BY_EXECUTED_BACKEND; native loader reports Vulkan0 does not support split buffers; no fallback.",
+    "additional_unqualified": [
+      "quantized or streamed KV reader",
+      "SWA",
+      "partial rotary or GPTNeoX native reader",
+      "RERoT on CUDA/HIP",
+      "automatic planner",
+      "reasoning-end and tool routing",
+      "HTTP integration",
+      "throughput or peak VRAM benefit",
+      "multi-model quality"
+    ],
+    "repository_release_scope": "Existing historical whole-GPU FA failure and unresolved TOPK investigation keep their recorded status. This RERoT qualification does not certify every upstream path."
+  },
+  "retained_failures": {
+    "f16_reader": {
+      "cpu": {
+        "receipt": {
+          "path": "build-rerot-runtime-20261019/reader-physical-cpu-f16.stdout",
+          "bytes": 6062,
+          "sha256": "4662a1ca0532c62038ac9fc2a99e8bf74b5a062db2ba1dace3142f116bb8d2e8"
+        },
+        "status": "FAIL",
+        "strict_same_shape_failures": [
+          {
+            "comparison": "batch row permutation round 2",
+            "status": "FAIL",
+            "max_abs": 0.1179952621459961,
+            "checked_logits": 128000,
+            "failed_logits": 126371,
+            "max_tolerance_ratio": 367.1755226131209
+          },
+          {
+            "comparison": "restored continuation round 2",
+            "status": "FAIL",
+            "max_abs": 0.1179952621459961,
+            "checked_logits": 128000,
+            "failed_logits": 126371,
+            "max_tolerance_ratio": 367.1755226131209
+          }
+        ]
+      },
+      "vulkan": {
+        "receipt": {
+          "path": "build-rerot-runtime-20261019/reader-physical-vulkan-f16.stdout",
+          "bytes": 6132,
+          "sha256": "ba1513ca4afa5ba6cd42a25509c288c09be200381d92855fd43cd93df3f90bce"
+        },
+        "status": "FAIL",
+        "strict_same_shape_failures": [
+          {
+            "comparison": "batch row permutation round 2",
+            "status": "FAIL",
+            "max_abs": 0.00035762786865234375,
+            "checked_logits": 128000,
+            "failed_logits": 31,
+            "max_tolerance_ratio": 1.2629415369146397
+          }
+        ]
+      },
+      "oracle-v5.json": {
+        "path": "build-rerot-runtime-20261019/oracle-v5.json",
+        "bytes": 1028,
+        "sha256": "d274059785d67fa6ab367cbb7a278004f88f5d4c70dd15b0c6fc90e027f57004",
+        "contents": [
+          {
+            "command": [
+              "cmake",
+              "--build",
+              "build-rerot-runtime-20261019/seams-cpu",
+              "-j",
+              "8"
+            ],
+            "exit": 0,
+            "log": "build-rerot-runtime-20261019/oracle-v5-cpu-build.log",
+            "seconds": 1.8821809152141213
+          },
+          {
+            "command": [
+              "build-rerot-runtime-20261019/seams-cpu/test-rerot-attention-oracle",
+              "--gpu-layers",
+              "0"
+            ],
+            "exit": 0,
+            "log": "build-rerot-runtime-20261019/oracle-v5-cpu-run.log",
+            "seconds": 0.0488630598410964
+          },
+          {
+            "command": [
+              "cmake",
+              "--build",
+              "build-rerot-runtime-20261019/seams-vulkan",
+              "-j",
+              "8"
+            ],
+            "exit": 0,
+            "log": "build-rerot-runtime-20261019/oracle-v5-vulkan-build.log",
+            "seconds": 1.9599951272830367
+          },
+          {
+            "command": [
+              "build-rerot-runtime-20261019/seams-vulkan/test-rerot-attention-oracle",
+              "--gpu-layers",
+              "99"
+            ],
+            "exit": 1,
+            "log": "build-rerot-runtime-20261019/oracle-v5-vulkan-run.log",
+            "seconds": 0.5119491461664438
+          }
+        ]
+      },
+      "oracle-vulkan-f32-profile-v1.json": {
+        "path": "build-rerot-runtime-20261019/oracle-vulkan-f32-profile-v1.json",
+        "bytes": 306,
+        "sha256": "1e2c79368605a67710be0f27a85d493cdf5cbbffb109fdf9a357829869a18497",
+        "contents": {
+          "command": [
+            "build-rerot-runtime-20261019/seams-vulkan/test-rerot-attention-oracle",
+            "--gpu-layers",
+            "99"
+          ],
+          "env_overrides": {
+            "GGML_VK_DISABLE_F16": "1"
+          },
+          "exit": 1,
+          "seconds": 0.5852955081500113,
+          "log": "build-rerot-runtime-20261019/oracle-vulkan-f32-profile-v1.log"
+        }
+      },
+      "oracle-v5-vulkan-run.log": {
+        "path": "build-rerot-runtime-20261019/oracle-v5-vulkan-run.log",
+        "bytes": 9792,
+        "sha256": "b35d1859237420a1089fb5319cfb235d9da7e6372b9712755c0150ee787f2c9d"
+      },
+      "oracle-vulkan-f32-profile-v1.log": {
+        "path": "build-rerot-runtime-20261019/oracle-vulkan-f32-profile-v1.log",
+        "bytes": 9791,
+        "sha256": "9ca5eaa5ac4a4d0a9cea50a768a5c2cd664c4e2e0f66f1ec85e02a08f405615d"
+      }
+    },
+    "vulkan_row_split": {
+      "receipt": {
+        "path": "build-rerot-single-gpu-row-20261019/receipt.json",
+        "bytes": 12166,
+        "sha256": "0b3fc924ebf014fb7d491fb8c859911de7aa6f3193ff6640d6ef6cdbebff80ef"
+      },
+      "status": "FAIL",
+      "qualifications": {
+        "phase_memory_invariance": {
+          "status": "NOT_QUALIFIED",
+          "expected_comparisons": 0,
+          "comparisons": []
+        },
+        "same_shape_reproducibility": {
+          "status": "NOT_QUALIFIED",
+          "expected_comparisons": 0,
+          "comparisons": []
+        },
+        "cross_shape_greedy_equivalence": {
+          "status": "NOT_QUALIFIED",
+          "explicitly_required": false,
+          "expected_comparisons": 0,
+          "observations": [],
+          "scope": "observed executed shapes only; no general native batch-invariance claim"
+        },
+        "incremental_whiteboard_contract": {
+          "status": "FAIL",
+          "expected_runs": 1,
+          "passed_runs": 0
+        }
+      },
+      "failure": "01-ubatch-128-release-1: inference exited 1: A could not load the model",
+      "run": {
+        "argv": [
+          "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-runtime-20261019/install-vulkan/bin/tq-rerot-compose",
+          "--model",
+          "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+          "--prompt",
+          "This is a short copying exercise on a shared whiteboard. Both writers may give the same answer; agreement is expected. Give the requested brief reply and finish your turn.",
+          "--synthesis",
+          "Reply with the single word complete.",
+          "--parallel",
+          "2",
+          "--ctx-size",
+          "4096",
+          "--batch-size",
+          "512",
+          "--threads",
+          "4",
+          "--gpu-layers",
+          "99",
+          "--split-mode",
+          "row",
+          "--worker-tokens",
+          "512",
+          "--final-tokens",
+          "512",
+          "--seed",
+          "0",
+          "--temperature",
+          "0",
+          "--json",
+          "--stage",
+          "writer_a=Reply with only this sentence: Shared work brings us to the same answer.",
+          "--stage",
+          "writer_b=Reply with only this sentence: Shared work brings us to the same answer.",
+          "--stage",
+          "ready=Reply with the single word ready.",
+          "--after",
+          "ready=writer_a",
+          "--after",
+          "ready=writer_b",
+          "--ubatch-size",
+          "128",
+          "--phase-memory"
+        ],
+        "seconds": 0.7047026860527694,
+        "returncode": 1,
+        "stdout": {
+          "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-single-gpu-row-20261019/01-ubatch-128-release-1.stdout.jsonl",
+          "bytes": 74,
+          "sha256": "f5e74a934bc9f924ffe724decebad2122b529bd41af695f259f040862d7aec65"
+        },
+        "stderr": {
+          "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-single-gpu-row-20261019/01-ubatch-128-release-1.stderr.log",
+          "bytes": 17483,
+          "sha256": "1aac953881c84564ed70eca1359837311a8f0d94a2a1337a7f040cd27b42d7b5"
+        }
+      },
+      "native_failure": [
+        "llama_model_load: error loading model: device Vulkan0 does not support split buffers"
+      ]
+    },
+    "early_complete_c_receipt": "build-rerot-whiteboard-cpu-v2-20261019/receipt.json retains its overall FAIL for cross-ubatch trajectory equality. The new fixed-shape qualifications do not edit that receipt.",
+    "early_compact_reader": "Prior v4 CPU/Vulkan reader differences remain under build-rerot-runtime-20261019. Physical-score layout replaced compact V gathering; final hidden/ordinary same-shape identity and lifecycle results have separate run identity.",
+    "policy": "No original numerical tolerance was loosened. Unsupported F16 precision remains a textual rewrite candidate, and cross-shape observations remain explicit failures rather than being counted as fixed-shape successes."
+  },
+  "reproducibility": {
+    "exact_commands": "Native build/qualification JSON, generated-model C receipts, process-failure receipts, and isolated commands.json retain exact argv, statuses, logs and artifact hashes.",
+    "build_receipts": {
+      "cpu": [
+        {
+          "path": "build-rerot-runtime-20261019/f32-profile-cpu.json",
+          "bytes": 900,
+          "sha256": "9b99e15dd0cad2e1b3b39a85c55daa11cfb783dc527ab91f5f1ecbfb5f755975"
+        },
+        {
+          "path": "build-rerot-runtime-20261019/final-reader-build-cpu.json",
+          "bytes": 229,
+          "sha256": "02d3763f2b891b46a4f6cb82b199112eabbe92f172779b2df317f46d33f93f79"
+        },
+        {
+          "path": "build-rerot-runtime-20261019/final-qualification-cpu.json",
+          "bytes": 3711,
+          "sha256": "0147f341c0c0edeac6cb6bf80f19c38f0e01bbff10c98781dc10d4d5daca8fe2"
+        },
+        {
+          "path": "build-rerot-runtime-20261019/compose-f32-build.json",
+          "bytes": 1025,
+          "sha256": "88682c9ac02726e5ff6c4988f96d8918354776f0fcd3395dbae123bd412d61a0"
+        }
+      ],
+      "vulkan": [
+        {
+          "path": "build-rerot-runtime-20261019/f32-profile-vulkan.json",
+          "bytes": 889,
+          "sha256": "b4c4978fd8772bbbf89ca6815b6ab2c5306823206b19087495eddf61db57ff95"
+        },
+        {
+          "path": "build-rerot-runtime-20261019/final-reader-build-vulkan.json",
+          "bytes": 235,
+          "sha256": "6e5285973b0cd0339560fbca82f212ee786485c16a1b654ed9a6479f2b94a1ef"
+        },
+        {
+          "path": "build-rerot-runtime-20261019/final-qualification-vulkan.json",
+          "bytes": 4284,
+          "sha256": "90590df2a446fe07da0efc0a96a4950249b5942597b29bc8ffbc03d4ece2f1d5"
+        },
+        {
+          "path": "build-rerot-runtime-20261019/compose-f32-build.json",
+          "bytes": 1025,
+          "sha256": "88682c9ac02726e5ff6c4988f96d8918354776f0fcd3395dbae123bd412d61a0"
+        }
+      ]
+    },
+    "original_whiteboard_receipts_have_model_binary_library_and_raw_output_hashes": true,
+    "process_failure_scope": "Injected after two observed concurrent BODY cohorts. Exit/error checks do not independently prove exact native in-flight state or device drain.",
+    "memory_scope": "compute_release before/after are llama_memory_compute_bytes values; not model weights, KV usage, or peak GPU-memory measurements.",
+    "isolated_documentation_note": "Final source/case-description documentation was clarified after installation qualification. Tested production source bytes and runtime artifacts were unchanged.",
+    "tests_not_repeated_in_isolation": [
+      "optional old real-batch matrix",
+      "optional old real-logits matrix",
+      "optional old real-stream matrix"
+    ]
+  },
+  "implementation_commits": {
+    "a": "6e1501a6098f21254e834183aaf217a92bfc1cb4",
+    "b": "ac322daebf554fe48b3502bbe2a905453a77b34b",
+    "c": "5d17d44f7e43094f0903d78d4ca4cac81e6cb2fa"
+  }
+}
