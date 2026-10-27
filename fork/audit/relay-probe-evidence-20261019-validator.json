@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-19",
+  "status": "Validator batch complete: machine-checkable terminal-state validation (guide 53.4), five-rank attribution logic closed by CPU tests, stdout line buffering, and probe config-test integration into the fork/build.py default pipeline. Five-rank cross-device qualification remains pending the real five-GPU machine.",
+  "all_release_gates_passed": false,
+  "identity": {
+    "repository": "atomic-llama-cpp-turboquant",
+    "branch": "clean/fork-20261018",
+    "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "superseded_batch_commit": "03463445d",
+    "superseded_batch_index": "audit/relay-probe-evidence-20261019-handoff.json",
+    "provenance_note": "The handoff-batch report (3ff3a3b6) stays byte-identical history; this batch supersedes its qualification conclusions with the final-source rerun below. The only binary-facing changes since then are stdout line buffering and the five-rank record shaping extraction, so the 17 per-device single-card results are identical in meaning."
+  },
+  "source": {
+    "probe_root": "fork/relay-probe",
+    "digests_at_head_before_commit": {
+      "main.cpp": "ea4617a4689f762e13e4fcbc942de5dbefd9c07fc3849ccd4fe6078abb6aee23",
+      "evidence.cpp": "f460b24b49ba136f4268473a3bc8cc6f58502b66ef0c18c215029526376a0312",
+      "evidence.h": "7d80c699c69bc079a350bbad57e765faf007fa36791c93f9b152085823b66d4e",
+      "config-test.cpp": "e68160281a997aa6f4b68767283225079e34531df433548ed6c0be71369545f4",
+      "validate-report.py": "f78b5823950ba6916e60673a8527a01c34c7e4795131d8d171c98b14b65853a8",
+      "build.py": "a877a9f16388964dd99d090c0d92790788a8b44aa5ef06af53d12655bdf3196b"
+    },
+    "validator": {
+      "purpose": "Strict evidence validation for the operator on the real machine (guide 53.4).",
+      "self_test": "PASS (rejects duplicate keys, non-finite numbers, unknown fields, trailing data, bool-as-integer, wrong case sets, rank/index drift, five-rank/device-count inconsistency, qualification disagreement, bench ordering violations).",
+      "checked_real_evidence": "both files below validate with exit 0"
+    }
+  },
+  "runtime": {
+    "system": "Linux x86_64",
+    "host_compiler": "GCC 16.2.1",
+    "probe_tu_compiler": "HIP clang (ROCm 7.2.4)",
+    "hip_runtime": "7.2.4",
+    "gpu": "AMD Radeon RX 6800",
+    "gcn_arch": "gfx1030",
+    "device_count": 1,
+    "rounds": 2000
+  },
+  "changes": [
+    "five_rank_case_records: per-rank pass/fail record shaping extracted into evidence (pure, GPU-free); failed_rank==5 sentinel covers failures that cannot be pinned to one device; config-test covers success, rank-2 attribution and sentinel shapes",
+    "stdout line buffering: a killed redirected run keeps everything already printed, making the documented stdout-recovery claim true",
+    "validate-report.py: strict JSON plus guide 53.4 terminal-state consistency for reports and bench files; --self-test; exit 0/1/2",
+    "fork/build.py default pipeline builds and tests the probe config-test (install=False); HIP executable built alongside when a HIP toolchain is present; isolation.py still excludes the probe",
+    "README operator section: HIP_VISIBLE_DEVICES guidance for machines with more than five HIP devices, validator step, BDF cross-check",
+    "stdout switched to _IONBF (C-standard as-soon-as-possible guarantee); the GPU-free config test now forks a child, redirects stdout to a file, prints, and dies by SIGKILL, asserting the line survived - pinning the documented killed-run recovery claim to this libc",
+    "validate-report.py --self-test joined ctest as tq_relay_probe.validator, so the pipeline and the operator's own ctest run prove the validator before use; self-test now also covers the five-rank failure report shape (status=fail with per-device fail records) and its disagreement mutation"
+  ],
+  "evidence": {
+    "report": {
+      "path": "build-relay-probe-20261019c/probe-report-final-20261019c.json",
+      "sha256": "75dbd439ab9bc04a00fbc7f4dbb6a9da8e10f3f95e9918cf70d06c4c87ddec4c",
+      "qualification": "pass",
+      "validated": "exit 0",
+      "summary": "18-case registry; 17 cases per device: all pass except the expected platform fact host_system_rmw_u64_add=fail; five_rank_status=not_run (one device present)."
+    },
+    "bench": {
+      "path": "build-relay-probe-20261019c/probe-bench-final-20261019c.json",
+      "sha256": "29efb0c18a388e3a551435627d4649e2191b636542b9a46df05e4a83cc78e80d",
+      "validated": "exit 0",
+      "medians": {
+        "host_publish_to_device_ack_ns": 10300,
+        "device_produce_to_host_ready_ns": 7880,
+        "five_stream_relay_cycle_ns": 32580,
+        "host_five_way_fold_bytes_per_second": 36897297649
+      }
+    },
+    "superseded": {
+      "report_sha256": "3ff3a3b62dcb6c668d1792484189ff009aa24ed024180148393581816c5f03a6",
+      "bench_sha256": "e2a66eec76735a0a36ddb71631a35ae12da97467aadad202baab3d5f83a33de0",
+      "note": "Both stay byte-identical in build-relay-probe-20261019b/."
+    }
+  },
+  "pending_for_five_card_machine": [
+    "run the probe with HIP_VISIBLE_DEVICES selecting exactly five devices (README operator section)",
+    "expect exit 0, five_rank_status=pass, 18 cases per device; archive stdout/stderr/exit/SHAs",
+    "run validate-report.py on the produced files before shipping them back",
+    "update this index family with the cross-device evidence"
+  ]
+}

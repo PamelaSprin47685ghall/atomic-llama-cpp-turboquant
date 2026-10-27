@@ -1,0 +1,972 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-18",
+  "branch": "clean/fork-20261018",
+  "upstream": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+  "base_before_this_round": "3746ebf82585f47c88fb48097f6ae45cb972b031",
+  "archive": "2777543b2358c88cd1c2000f7fa342b764a0e213",
+  "machine": {
+    "os": "Linux x86-64",
+    "compiler": "GCC 16.2.1",
+    "python_main": "3.14",
+    "python_cmake_cli_tests": "3.12.13",
+    "gpu": "AMD Radeon RX 6800",
+    "driver": "RADV / Mesa 26.2.2"
+  },
+  "model": {
+    "path": "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+    "sha256": "a1921216ded964e5c4f787226729e8c2c32bd587ac7b897742e0b7a7cc7eff6a"
+  },
+  "source_hashes": {
+    "fork/upstream-exceptions.json": "1397e27f04f06b0e015bc783e63904fa371eeb2da2506f7b84f85be48d25152b",
+    "ggml/src/ggml-backend-meta.cpp": "c141bb450b11ad5dc1a654d94b5188d14829c41dc9c28910bee544bbb728cfa7",
+    "fork/scheduling/include/tq/scheduling/admission.h": "9907ad6a435a2c1b6519d8450725cbeab80c00634ebe74d1bc449e78e73aae77",
+    "fork/scheduling/src/admission.cpp": "b53b3214b09ad927b9ff0a15ea2a2a3fd279b74ab9564b8b53c1665954d13a90",
+    "fork/batch-compose/src/main.cpp": "0fdb08decd1170c7d43b504fa6218690217d194e5aa0f546c756821aa9e36058",
+    "fork/logits-compose/src/main.cpp": "cb20d7c58f3f9519a659ccc008b2d50bfa1b0ce5913bcd94356011563ff25f76",
+    "fork/logits-compose/src/tape-writer.h": "4db53bfb7ae8b7c1dbfbe1a5d3a18b74737c48e2ed7cff0da24ba6aac70cfc14",
+    "fork/batch-compose/tests/test_admission.py": "79e02ffb89175683e439a24ea9b886b58af0125cf3ff12278598f11cc69d1252",
+    "fork/logits-compose/tests/test_real_logits.py": "88135d707b44d5c984cb88c1ebd9f8c073bd451105ac3783f0fbdf80de6e2de5",
+    "fork/build.py": "cd0d6239412c05a86b7e3427838437491e7247bf9162aa48f78f603e195f9dc8",
+    "fork/tests/isolation.py": "b58743918989a52d6d4428d18ee4005d13dd334082a1267aeb13c4276bf99575"
+  },
+  "upstream_footprint": {
+    "code_files": 17,
+    "code_added": 328,
+    "code_removed": 43,
+    "own_ci_files": 1,
+    "own_ci_added": 49,
+    "manifest_entries": 18,
+    "new_production_a_patch": {
+      "path": "ggml/src/ggml-backend-meta.cpp",
+      "added": 4,
+      "removed": 4
+    }
+  },
+  "admission": {
+    "successful_requests_per_backend": 60,
+    "cpu": {
+      "status": "passed",
+      "runs": {
+        "three-wide-phase-off": {
+          "peak_resident_requests": 3,
+          "token_waits": 0,
+          "slot_waits": 132,
+          "reused_slots": [
+            0,
+            1,
+            2
+          ],
+          "requests": 9,
+          "compute_releases": 0,
+          "gpu_layers_observed": 0
+        },
+        "three-wide-phase-on": {
+          "peak_resident_requests": 3,
+          "token_waits": 0,
+          "slot_waits": 132,
+          "reused_slots": [
+            0,
+            1,
+            2
+          ],
+          "requests": 9,
+          "compute_releases": 3,
+          "gpu_layers_observed": 0
+        },
+        "token-pressure-phase-off": {
+          "peak_resident_requests": 1,
+          "token_waits": 256,
+          "slot_waits": 0,
+          "reused_slots": [
+            0
+          ],
+          "requests": 9,
+          "compute_releases": 0,
+          "gpu_layers_observed": 0
+        },
+        "token-pressure-phase-on": {
+          "peak_resident_requests": 1,
+          "token_waits": 256,
+          "slot_waits": 0,
+          "reused_slots": [
+            0
+          ],
+          "requests": 9,
+          "compute_releases": 9,
+          "gpu_layers_observed": 0
+        },
+        "slot-pressure-phase-off": {
+          "peak_resident_requests": 1,
+          "token_waits": 0,
+          "slot_waits": 256,
+          "reused_slots": [
+            0
+          ],
+          "requests": 9,
+          "compute_releases": 0,
+          "gpu_layers_observed": 0
+        },
+        "slot-pressure-phase-on": {
+          "peak_resident_requests": 1,
+          "token_waits": 0,
+          "slot_waits": 256,
+          "reused_slots": [
+            0
+          ],
+          "requests": 9,
+          "compute_releases": 9,
+          "gpu_layers_observed": 0
+        },
+        "repeat-wave": {
+          "peak_resident_requests": 3,
+          "token_waits": 0,
+          "slot_waits": 66,
+          "reused_slots": [
+            0,
+            1,
+            2
+          ],
+          "requests": 6,
+          "compute_releases": 2,
+          "gpu_layers_observed": 0
+        }
+      },
+      "same_configuration_phase_pairs_equal": [
+        "three-wide",
+        "token-pressure",
+        "slot-pressure"
+      ],
+      "serial_capacity_pairs_equal": [
+        "phase-off",
+        "phase-on"
+      ],
+      "repeat_wave_equal": {
+        "fresh_requests": [
+          0,
+          1,
+          2
+        ],
+        "reused_requests": [
+          3,
+          4,
+          5
+        ]
+      },
+      "cross_shape_diagnostics": {
+        "off": {
+          "tokens_equal": false,
+          "different_requests": [
+            {
+              "request_id": 4,
+              "first_token_index": 4,
+              "left_token": 9979,
+              "right_token": 8122
+            }
+          ],
+          "actual_row_shapes_equal": false,
+          "qualification": "diagnostic only; this comparison changes the submitted batch shape"
+        },
+        "on": {
+          "tokens_equal": false,
+          "different_requests": [
+            {
+              "request_id": 4,
+              "first_token_index": 4,
+              "left_token": 9979,
+              "right_token": 8122
+            }
+          ],
+          "actual_row_shapes_equal": false,
+          "qualification": "diagnostic only; this comparison changes the submitted batch shape"
+        }
+      },
+      "output_dir": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-release-admission-qualified-cpu/run-qgz3q4zc",
+      "limits": [
+        "Token reservations cover known request bounds; they do not measure VRAM.",
+        "Changing the submitted batch shape can change greedy tokens in the pinned upstream runtime.",
+        "The diagnostic does not establish the numerical cause of a cross-shape difference.",
+        "The runner owns greedy text requests; this does not qualify HTTP cancellation or MTP."
+      ]
+    },
+    "vulkan": {
+      "status": "passed",
+      "runs": {
+        "three-wide-phase-off": {
+          "peak_resident_requests": 3,
+          "token_waits": 0,
+          "slot_waits": 132,
+          "reused_slots": [
+            0,
+            1,
+            2
+          ],
+          "requests": 9,
+          "compute_releases": 0,
+          "gpu_layers_observed": 25
+        },
+        "three-wide-phase-on": {
+          "peak_resident_requests": 3,
+          "token_waits": 0,
+          "slot_waits": 132,
+          "reused_slots": [
+            0,
+            1,
+            2
+          ],
+          "requests": 9,
+          "compute_releases": 3,
+          "gpu_layers_observed": 25
+        },
+        "token-pressure-phase-off": {
+          "peak_resident_requests": 1,
+          "token_waits": 256,
+          "slot_waits": 0,
+          "reused_slots": [
+            0
+          ],
+          "requests": 9,
+          "compute_releases": 0,
+          "gpu_layers_observed": 25
+        },
+        "token-pressure-phase-on": {
+          "peak_resident_requests": 1,
+          "token_waits": 256,
+          "slot_waits": 0,
+          "reused_slots": [
+            0
+          ],
+          "requests": 9,
+          "compute_releases": 9,
+          "gpu_layers_observed": 25
+        },
+        "slot-pressure-phase-off": {
+          "peak_resident_requests": 1,
+          "token_waits": 0,
+          "slot_waits": 256,
+          "reused_slots": [
+            0
+          ],
+          "requests": 9,
+          "compute_releases": 0,
+          "gpu_layers_observed": 25
+        },
+        "slot-pressure-phase-on": {
+          "peak_resident_requests": 1,
+          "token_waits": 0,
+          "slot_waits": 256,
+          "reused_slots": [
+            0
+          ],
+          "requests": 9,
+          "compute_releases": 9,
+          "gpu_layers_observed": 25
+        },
+        "repeat-wave": {
+          "peak_resident_requests": 3,
+          "token_waits": 0,
+          "slot_waits": 66,
+          "reused_slots": [
+            0,
+            1,
+            2
+          ],
+          "requests": 6,
+          "compute_releases": 2,
+          "gpu_layers_observed": 25
+        }
+      },
+      "same_configuration_phase_pairs_equal": [
+        "three-wide",
+        "token-pressure",
+        "slot-pressure"
+      ],
+      "serial_capacity_pairs_equal": [
+        "phase-off",
+        "phase-on"
+      ],
+      "repeat_wave_equal": {
+        "fresh_requests": [
+          0,
+          1,
+          2
+        ],
+        "reused_requests": [
+          3,
+          4,
+          5
+        ]
+      },
+      "cross_shape_diagnostics": {
+        "off": {
+          "tokens_equal": false,
+          "different_requests": [
+            {
+              "request_id": 1,
+              "first_token_index": 3,
+              "left_token": 267,
+              "right_token": 9979
+            },
+            {
+              "request_id": 4,
+              "first_token_index": 5,
+              "left_token": 23027,
+              "right_token": 2022
+            },
+            {
+              "request_id": 7,
+              "first_token_index": 4,
+              "left_token": 9979,
+              "right_token": 8122
+            }
+          ],
+          "actual_row_shapes_equal": false,
+          "qualification": "diagnostic only; this comparison changes the submitted batch shape"
+        },
+        "on": {
+          "tokens_equal": false,
+          "different_requests": [
+            {
+              "request_id": 1,
+              "first_token_index": 3,
+              "left_token": 267,
+              "right_token": 9979
+            },
+            {
+              "request_id": 4,
+              "first_token_index": 5,
+              "left_token": 23027,
+              "right_token": 2022
+            },
+            {
+              "request_id": 7,
+              "first_token_index": 4,
+              "left_token": 9979,
+              "right_token": 8122
+            }
+          ],
+          "actual_row_shapes_equal": false,
+          "qualification": "diagnostic only; this comparison changes the submitted batch shape"
+        }
+      },
+      "output_dir": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-release-admission-qualified-vulkan/run-tuhygayn",
+      "limits": [
+        "Token reservations cover known request bounds; they do not measure VRAM.",
+        "Changing the submitted batch shape can change greedy tokens in the pinned upstream runtime.",
+        "The diagnostic does not establish the numerical cause of a cross-shape difference.",
+        "The runner owns greedy text requests; this does not qualify HTTP cancellation or MTP."
+      ]
+    }
+  },
+  "shape_counterexample_before_admission": {
+    "cpu": {
+      "source_receipt": "build-release-shape-baseline-cpu-group3/run-1exs54yu/summary.json",
+      "binary_sha256": "ef5becb77578ed0d406f2f937a079c98d4f52a874326cf653c465b76d70b81d7",
+      "alone_wide_vs_tight_equal": true,
+      "three_vs_alone_equal": false,
+      "runs": {
+        "three": {
+          "config": {
+            "event": "config",
+            "requests": 3,
+            "logical_context_requested": 256,
+            "logical_context_actual": 256,
+            "total_kv_requested": 2048,
+            "total_kv_actual": 2048,
+            "batch_actual": 8,
+            "gpu_layers_requested": 0,
+            "phase_memory": false
+          },
+          "result": {
+            "event": "result",
+            "request_id": 1,
+            "prompt_tokens": 135,
+            "decoded_rows": 150,
+            "finish_reason": "length",
+            "tokens": [
+              440,
+              9712,
+              355,
+              267,
+              9979,
+              2022,
+              302,
+              8469,
+              6621,
+              22,
+              229,
+              26,
+              22,
+              440,
+              9712,
+              355
+            ],
+            "text": " The ocean is a vast body of saltwater. 2. The ocean is"
+          },
+          "command": [
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/install/bin/tq-batch-compose",
+            "--model",
+            "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+            "--prompts",
+            "-",
+            "--predict",
+            "16",
+            "--ctx-size",
+            "256",
+            "--batch-size",
+            "8",
+            "--ubatch-size",
+            "8",
+            "--threads",
+            "2",
+            "--gpu-layers",
+            "0",
+            "--ignore-eog",
+            "--no-phase-memory",
+            "--json",
+            "--total-kv",
+            "2048"
+          ],
+          "stdin_utf8": "Case 3. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Continue with one fact about the ocean. 1.\nCase 4. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Continue with one fact about the ocean. 1.\nCase 5. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Continue with one fact about the ocean. 1.\n"
+        },
+        "alone-wide": {
+          "config": {
+            "event": "config",
+            "requests": 1,
+            "logical_context_requested": 256,
+            "logical_context_actual": 256,
+            "total_kv_requested": 2048,
+            "total_kv_actual": 2048,
+            "batch_actual": 8,
+            "gpu_layers_requested": 0,
+            "phase_memory": false
+          },
+          "result": {
+            "event": "result",
+            "request_id": 0,
+            "prompt_tokens": 135,
+            "decoded_rows": 150,
+            "finish_reason": "length",
+            "tokens": [
+              440,
+              9712,
+              355,
+              267,
+              8122,
+              2022,
+              302,
+              8469,
+              1382,
+              22,
+              229,
+              26,
+              22,
+              440,
+              9712,
+              355
+            ],
+            "text": " The ocean is a huge body of salt water. 2. The ocean is"
+          },
+          "command": [
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/install/bin/tq-batch-compose",
+            "--model",
+            "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+            "--prompts",
+            "-",
+            "--predict",
+            "16",
+            "--ctx-size",
+            "256",
+            "--batch-size",
+            "8",
+            "--ubatch-size",
+            "8",
+            "--threads",
+            "2",
+            "--gpu-layers",
+            "0",
+            "--ignore-eog",
+            "--no-phase-memory",
+            "--json",
+            "--total-kv",
+            "2048"
+          ],
+          "stdin_utf8": "Case 4. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Continue with one fact about the ocean. 1.\n"
+        },
+        "alone-tight": {
+          "config": {
+            "event": "config",
+            "requests": 1,
+            "logical_context_requested": 256,
+            "logical_context_actual": 256,
+            "total_kv_requested": 256,
+            "total_kv_actual": 256,
+            "batch_actual": 8,
+            "gpu_layers_requested": 0,
+            "phase_memory": false
+          },
+          "result": {
+            "event": "result",
+            "request_id": 0,
+            "prompt_tokens": 135,
+            "decoded_rows": 150,
+            "finish_reason": "length",
+            "tokens": [
+              440,
+              9712,
+              355,
+              267,
+              8122,
+              2022,
+              302,
+              8469,
+              1382,
+              22,
+              229,
+              26,
+              22,
+              440,
+              9712,
+              355
+            ],
+            "text": " The ocean is a huge body of salt water. 2. The ocean is"
+          },
+          "command": [
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-fork/install/bin/tq-batch-compose",
+            "--model",
+            "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+            "--prompts",
+            "-",
+            "--predict",
+            "16",
+            "--ctx-size",
+            "256",
+            "--batch-size",
+            "8",
+            "--ubatch-size",
+            "8",
+            "--threads",
+            "2",
+            "--gpu-layers",
+            "0",
+            "--ignore-eog",
+            "--no-phase-memory",
+            "--json",
+            "--total-kv",
+            "256"
+          ],
+          "stdin_utf8": "Case 4. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Continue with one fact about the ocean. 1.\n"
+        }
+      },
+      "limits": [
+        "A shape comparison can expose pre-existing differences; this does not explain their numerical cause."
+      ],
+      "input_provenance": {
+        "encoding": "UTF-8",
+        "group_start_zero_based": 3,
+        "original_fixture_indices": [
+          3,
+          4,
+          5
+        ],
+        "confirmed_against": "Exact prompt token rows in original admission reference.jsonl; all three grouped and isolated traces matched uniquely.",
+        "fixture_source": "build-release-admission-cpu/run-cga4dqjq/prompts.txt"
+      }
+    },
+    "vulkan": {
+      "source_receipt": "build-release-shape-baseline-vulkan/run-y_94o2xh/summary.json",
+      "binary_sha256": "71f6444d45808dfedbe3fd7693120200fd58f6c4d861e975306594ff7a33b765",
+      "alone_wide_vs_tight_equal": true,
+      "three_vs_alone_equal": false,
+      "runs": {
+        "three": {
+          "config": {
+            "event": "config",
+            "requests": 3,
+            "logical_context_requested": 256,
+            "logical_context_actual": 256,
+            "total_kv_requested": 2048,
+            "total_kv_actual": 2048,
+            "batch_actual": 8,
+            "gpu_layers_requested": 99,
+            "phase_memory": false
+          },
+          "result": {
+            "event": "result",
+            "request_id": 1,
+            "prompt_tokens": 135,
+            "decoded_rows": 150,
+            "finish_reason": "length",
+            "tokens": [
+              440,
+              9712,
+              355,
+              267,
+              8122,
+              23027,
+              302,
+              1382,
+              22,
+              229,
+              26,
+              22,
+              440,
+              9712,
+              355,
+              267
+            ],
+            "text": " The ocean is a huge reservoir of water. 2. The ocean is a"
+          },
+          "command": [
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/install/bin/tq-batch-compose",
+            "--model",
+            "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+            "--prompts",
+            "-",
+            "--predict",
+            "16",
+            "--ctx-size",
+            "256",
+            "--batch-size",
+            "8",
+            "--ubatch-size",
+            "8",
+            "--threads",
+            "2",
+            "--gpu-layers",
+            "99",
+            "--ignore-eog",
+            "--no-phase-memory",
+            "--json",
+            "--total-kv",
+            "2048"
+          ],
+          "stdin_utf8": "Case 0. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Continue with one fact about the ocean. 1.\nCase 1. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Continue with one fact about the ocean. 1.\nCase 2. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Continue with one fact about the ocean. 1.\n"
+        },
+        "alone-wide": {
+          "config": {
+            "event": "config",
+            "requests": 1,
+            "logical_context_requested": 256,
+            "logical_context_actual": 256,
+            "total_kv_requested": 2048,
+            "total_kv_actual": 2048,
+            "batch_actual": 8,
+            "gpu_layers_requested": 99,
+            "phase_memory": false
+          },
+          "result": {
+            "event": "result",
+            "request_id": 0,
+            "prompt_tokens": 135,
+            "decoded_rows": 150,
+            "finish_reason": "length",
+            "tokens": [
+              440,
+              9712,
+              355,
+              9979,
+              22,
+              229,
+              26,
+              22,
+              440,
+              9712,
+              355,
+              4708,
+              22,
+              229,
+              27,
+              22
+            ],
+            "text": " The ocean is vast. 2. The ocean is deep. 3."
+          },
+          "command": [
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/install/bin/tq-batch-compose",
+            "--model",
+            "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+            "--prompts",
+            "-",
+            "--predict",
+            "16",
+            "--ctx-size",
+            "256",
+            "--batch-size",
+            "8",
+            "--ubatch-size",
+            "8",
+            "--threads",
+            "2",
+            "--gpu-layers",
+            "99",
+            "--ignore-eog",
+            "--no-phase-memory",
+            "--json",
+            "--total-kv",
+            "2048"
+          ],
+          "stdin_utf8": "Case 1. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Continue with one fact about the ocean. 1.\n"
+        },
+        "alone-tight": {
+          "config": {
+            "event": "config",
+            "requests": 1,
+            "logical_context_requested": 256,
+            "logical_context_actual": 256,
+            "total_kv_requested": 256,
+            "total_kv_actual": 256,
+            "batch_actual": 8,
+            "gpu_layers_requested": 99,
+            "phase_memory": false
+          },
+          "result": {
+            "event": "result",
+            "request_id": 0,
+            "prompt_tokens": 135,
+            "decoded_rows": 150,
+            "finish_reason": "length",
+            "tokens": [
+              440,
+              9712,
+              355,
+              9979,
+              22,
+              229,
+              26,
+              22,
+              440,
+              9712,
+              355,
+              4708,
+              22,
+              229,
+              27,
+              22
+            ],
+            "text": " The ocean is vast. 2. The ocean is deep. 3."
+          },
+          "command": [
+            "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-clean-vulkan/install/bin/tq-batch-compose",
+            "--model",
+            "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+            "--prompts",
+            "-",
+            "--predict",
+            "16",
+            "--ctx-size",
+            "256",
+            "--batch-size",
+            "8",
+            "--ubatch-size",
+            "8",
+            "--threads",
+            "2",
+            "--gpu-layers",
+            "99",
+            "--ignore-eog",
+            "--no-phase-memory",
+            "--json",
+            "--total-kv",
+            "256"
+          ],
+          "stdin_utf8": "Case 1. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Water covers much of Earth. Waves travel across the surface. Fish live underwater. Continue with one fact about the ocean. 1.\n"
+        }
+      },
+      "limits": [
+        "A shape comparison can expose pre-existing differences; this does not explain their numerical cause."
+      ],
+      "input_provenance": {
+        "encoding": "UTF-8",
+        "group_start_zero_based": 0,
+        "original_fixture_indices": [
+          0,
+          1,
+          2
+        ],
+        "confirmed_against": "Exact prompt token rows in original admission reference.jsonl; all three grouped and isolated traces matched uniquely.",
+        "fixture_source": "build-release-admission-vulkan/run-cc0q5fad/prompts.txt"
+      }
+    },
+    "classification": "Pre-existing batch-geometry sensitivity; numerical cause not established."
+  },
+  "meta": {
+    "baseline_receipt": "build-release-meta-before/summary.json",
+    "baseline_returncodes": {
+      "zero-control": 0,
+      "get-offset": -6,
+      "set-offset": -6
+    },
+    "zero_controls": 16,
+    "fixed_transfer_cases": 48,
+    "actual_children": "two CPU backend instances",
+    "cpu_full_seams": "4/4 passed with supplied recurrent model",
+    "vulkan_linked_full_seams": "5/5 passed; Meta transfer cases still use CPU children",
+    "gpu_async_or_multigpu_claim": false
+  },
+  "recurrent": {
+    "a_source_changed": false,
+    "model_scope": "LFM2.5 hybrid convolution/KV; n_rs_seq=0",
+    "cpu": {
+      "neighbor_snapshot_checks": 24,
+      "shared_snapshot_checks": 8,
+      "continuation_max_abs": 0,
+      "decode_calls": 24,
+      "input_rows": 189
+    },
+    "vulkan": {
+      "neighbor_snapshot_checks": 24,
+      "shared_snapshot_checks": 8,
+      "continuation_max_abs": 0,
+      "decode_calls": 24,
+      "input_rows": 189,
+      "offloaded_layers": 25
+    },
+    "log_paths": [
+      "build-release-seams-cpu/Testing/Temporary/LastTest.log",
+      "build-release-seams-vulkan/Testing/Temporary/LastTest.log"
+    ],
+    "malformed_restore_atomicity": "Not claimed; source review finds destination mutation before complete validation."
+  },
+  "logits": {
+    "cpu": {
+      "status": "passed",
+      "output_dir": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-release-logits-real-cpu/run-9vl2emj9",
+      "input_tokens": 15,
+      "vocabulary": 128000,
+      "repeat_bitwise_equal": true,
+      "same_geometry_suffix_max_abs": 0,
+      "same_geometry_prefix_max_abs": 0,
+      "chunked_vs_scalar_max_abs_diagnostic": 2.6373519897460938,
+      "batch_oracle": {
+        "status": "passed",
+        "token": 440,
+        "best_logit": 32.5566635
+      },
+      "comparator": {
+        "reference": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-release-logits-real-cpu/run-9vl2emj9/all-rows.bin",
+        "candidate": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-release-logits-real-cpu/run-9vl2emj9/repeat.bin",
+        "atol": 0,
+        "rtol": 0,
+        "bitwise": true,
+        "different_values": 0,
+        "outside_tolerance": 0,
+        "argmax_mismatches": 0,
+        "argmax_unavailable_rows": 0,
+        "max_abs": 0,
+        "max_rel": 0,
+        "nonfinite": 0,
+        "first_different_row": null,
+        "rows": 15,
+        "vocabulary": 128000,
+        "prefill": 1,
+        "normalized_mse": 0,
+        "pass": true
+      },
+      "stdout_failure": "failed_visibly_complete_tape_preserved",
+      "prompt_sha256": "ccd049daefeddbf170495f58616a257398d6e05fa5fe1780cad324b56bc52c26",
+      "binary_sha256": "505302d1553763fa316df16b8a77b7e697c776b5360732bc3268578f07dbdc53",
+      "limits": [
+        "Chunked versus scalar row differences are diagnostics; no cross-shape equality is assumed.",
+        "The tape contains no model or build identity; preserve the run receipts separately.",
+        "This verifies teacher-forced collection, not model quality, sampling, or throughput."
+      ],
+      "command_receipt": "build-release-logits-real-cpu/run-9vl2emj9/summary.json",
+      "commands_count": 11
+    },
+    "vulkan": {
+      "status": "passed",
+      "output_dir": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-release-logits-real-vulkan/run-tc97587h",
+      "input_tokens": 15,
+      "vocabulary": 128000,
+      "repeat_bitwise_equal": true,
+      "same_geometry_suffix_max_abs": 0,
+      "same_geometry_prefix_max_abs": 0,
+      "chunked_vs_scalar_max_abs_diagnostic": 0.9928340911865234,
+      "batch_oracle": {
+        "status": "passed",
+        "token": 440,
+        "best_logit": 31.722229
+      },
+      "comparator": {
+        "reference": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-release-logits-real-vulkan/run-tc97587h/all-rows.bin",
+        "candidate": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-release-logits-real-vulkan/run-tc97587h/repeat.bin",
+        "atol": 0,
+        "rtol": 0,
+        "bitwise": true,
+        "different_values": 0,
+        "outside_tolerance": 0,
+        "argmax_mismatches": 0,
+        "argmax_unavailable_rows": 0,
+        "max_abs": 0,
+        "max_rel": 0,
+        "nonfinite": 0,
+        "first_different_row": null,
+        "rows": 15,
+        "vocabulary": 128000,
+        "prefill": 1,
+        "normalized_mse": 0,
+        "pass": true
+      },
+      "stdout_failure": "failed_visibly_complete_tape_preserved",
+      "prompt_sha256": "ccd049daefeddbf170495f58616a257398d6e05fa5fe1780cad324b56bc52c26",
+      "binary_sha256": "cb4e116b146313f9189bc176d380d871f4410870e87a611d33bebadf85a26c48",
+      "limits": [
+        "Chunked versus scalar row differences are diagnostics; no cross-shape equality is assumed.",
+        "The tape contains no model or build identity; preserve the run receipts separately.",
+        "This verifies teacher-forced collection, not model quality, sampling, or throughput."
+      ],
+      "command_receipt": "build-release-logits-real-vulkan/run-tc97587h/summary.json",
+      "commands_count": 11
+    },
+    "strict_cpp17_writer_cli_tests": "2/2 on CPU and Vulkan-linked installs with -Wall -Wextra -Wpedantic -Werror",
+    "independent_ubsan_writer": "Passed in scratch; no ASan qualification claimed.",
+    "independent_batch_oracle_scope": "Same submitted prompt token IDs; final maximum logit within 1e-5; the selected token's logit is within 1e-5 of the collector maximum. No independent full-vocabulary row is obtained. Repeated tapes and scalar suffix/prefix controls compare all values."
+  },
+  "installation": {
+    "receipt": "build-isolation-release-20261018/result.json",
+    "a_source_provenance": "built_from_pinned_archive_and_verified_overlay_bytes",
+    "a_archive_has_no_b_or_c": true,
+    "reviewed_overlay_count": 18,
+    "isolated_modules": [
+      "sampling",
+      "corpus",
+      "scheduling",
+      "compose",
+      "corpus-compose",
+      "batch-compose",
+      "logits-compose"
+    ],
+    "commands": 47,
+    "source_and_build_copies_removed_before_consumption": true,
+    "relocated_installed_consumers_passed": true,
+    "relocated_real_batch": "passed",
+    "relocated_real_logits": "passed"
+  },
+  "build_entrypoints": {
+    "cpu": {
+      "command": "python3 fork/build.py --backend cpu --build-dir build-clean-fork --jobs 4",
+      "returncode": 0,
+      "log": "build-release-cpu.log"
+    },
+    "vulkan": {
+      "command": "python3 fork/build.py --backend vulkan --tools --build-dir build-clean-vulkan --jobs 4",
+      "returncode": 0,
+      "log": "build-release-vulkan.log"
+    }
+  },
+  "boundary_tests": 12,
+  "comparison_cli_tests": 20,
+  "github_ci": {
+    "added": true,
+    "executed": false,
+    "pushed": false
+  },
+  "limits": [
+    "No model throughput, reset speedup, peak VRAM, or device auto-fit claim.",
+    "No cross-batch-geometry or cross-backend numerical equality claim.",
+    "No per-request HTTP cancellation/retry, preemption, LRU eviction, GDN rollback, MTP, or PLE qualification.",
+    "No CUDA, HIP, Metal, Windows, macOS, multi-GPU, or heterogeneous Meta runtime qualification.",
+    "Logits publication requires POSIX hard links in a caller-controlled directory; no crash durability or signal-time cleanup.",
+    "The 714-path legacy audit denominator and previously recorded semantic reading depth are unchanged."
+  ]
+}

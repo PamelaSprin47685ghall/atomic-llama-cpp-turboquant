@@ -1,0 +1,49 @@
+name: Fork packages
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - 'clean/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-packages-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installed-packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CC: gcc-14
+      CXX: g++-14
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install compiler and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-14 g++-14 cmake ccache libssl-dev
+      - name: Verify A boundaries and diagnostic readers
+        run: |
+          python3 fork/check-upstream.py
+          python3 fork/tests/test-upstream-boundary.py
+          python3 fork/tools/tests/test-compare-logits.py
+      - name: Build from pinned A and consume relocated packages
+        run: python3 fork/tests/isolation.py --output build-fork-isolation --jobs 4
+      - name: Save qualification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-package-receipts
+          if-no-files-found: ignore
+          path: |
+            build-fork-isolation/*.json
+            build-fork-isolation/*.log

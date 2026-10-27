@@ -1,0 +1,1087 @@
+{
+  "schema": "tq-devops-acceptance/1",
+  "status": "PASS_WITH_EXPLICIT_SCOPE",
+  "source_head": "90aa90e2a7d12aeb181dd11c9c04e367034dc2a8",
+  "working_tree_changes": true,
+  "upstream_pin": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+  "reviewed_a_paths": 35,
+  "environment": {
+    "os": "Linux 7.0.14 x86_64",
+    "gcc": "15.2.0",
+    "cmake": "4.2.3",
+    "python": "3.14.4",
+    "hip_runtime": "7.15.26333",
+    "hip_compiler": "amd clang 23.0.0git (https://github.com/ROCm/llvm-project.git 8f497e0992fb7513f7f78a6f6b6f1056c375e961)",
+    "vulkan_driver": "Mesa 26.0.8 RADV NAVI21",
+    "model_vulkan_environment": {
+      "GGML_VK_VISIBLE_DEVICES": "0"
+    },
+    "devices": [
+      {
+        "rank": 0,
+        "pci_bdf": "0000:0f:00.0",
+        "reported_name": "AMD Radeon RX 6800",
+        "gcn_arch_name": "gfx1030"
+      },
+      {
+        "rank": 1,
+        "pci_bdf": "0000:0c:00.0",
+        "reported_name": "AMD Radeon RX 6800",
+        "gcn_arch_name": "gfx1030"
+      },
+      {
+        "rank": 2,
+        "pci_bdf": "0000:06:00.0",
+        "reported_name": "AMD Radeon RX 6800",
+        "gcn_arch_name": "gfx1030"
+      },
+      {
+        "rank": 3,
+        "pci_bdf": "0000:09:00.0",
+        "reported_name": "AMD Radeon RX 6800",
+        "gcn_arch_name": "gfx1030"
+      },
+      {
+        "rank": 4,
+        "pci_bdf": "0000:03:00.0",
+        "reported_name": "AMD Radeon RX 6800",
+        "gcn_arch_name": "gfx1030"
+      }
+    ]
+  },
+  "scope": "Existing CPU/Vulkan independent B/C delivery and runtime acceptance; standalone five-card HIP platform probe. Not whole-model TP5 release.",
+  "model": {
+    "repository": "unsloth/LFM2.5-8B-A1B-GGUF",
+    "revision": "37563684c4a625e9958906fd924e15095cf9c896",
+    "path": "build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+    "bytes": 4358844000,
+    "sha256": "a1921216ded964e5c4f787226729e8c2c32bd587ac7b897742e0b7a7cc7eff6a",
+    "verification": "sha256sum on the downloaded file matched the fixed repository LFS SHA-256"
+  },
+  "source_files": [
+    {
+      "path": "ggml/src/ggml-vulkan/CMakeLists.txt",
+      "bytes": 9976,
+      "sha256": "c847306ea27c9cabefd29c5cf0df6bc8fca9916a9a9c780f623359f25b377d65"
+    },
+    {
+      "path": "fork/upstream-exceptions.json",
+      "bytes": 40562,
+      "sha256": "65fcaba32592cfe259c5515535fd21faf6347710e5a817864979656a60a778f4"
+    },
+    {
+      "path": "fork/build.py",
+      "bytes": 4300,
+      "sha256": "e366ead5c8f95b4278fa7b3e6275548b92fa94514b0d9c84637580366e5ad1d2"
+    },
+    {
+      "path": "fork/check-upstream.py",
+      "bytes": 8809,
+      "sha256": "c9ccbfc01cac82c2334fae67dbf61ace6b0c149ad4bd6d8d3617aaf7c58855c6"
+    },
+    {
+      "path": "fork/tests/isolation.py",
+      "bytes": 19106,
+      "sha256": "713810dfed967aa0d0a12bdb4624f8b927c50b9dbf389d70a74a5369cb8931a5"
+    },
+    {
+      "path": "fork/tests/package-consumer/CMakeLists.txt",
+      "bytes": 2253,
+      "sha256": "a5458eecd3335681ffe0bcd53ddc436e5b4e33ba99e6bb0f447be0cfaa9138f2"
+    },
+    {
+      "path": "fork/tests/package-consumer/main.cpp",
+      "bytes": 2057,
+      "sha256": "9fc42d316916c95b255ef1364456dfbde3b59a6c7634fc641c0b7043fa75992a"
+    },
+    {
+      "path": "fork/tests/package-consumer/compose.cpp",
+      "bytes": 378,
+      "sha256": "18dcba6c41544c6ef99ae35c3b0a6a03dca29f4722e77f18c8b56576714e655e"
+    },
+    {
+      "path": "fork/tests/package-consumer/relay.cpp",
+      "bytes": 883,
+      "sha256": "ca370a3bfd4e1462ed896f58be35c34d62e4ee73c87eae6cde3b3ad88c9b4b81"
+    },
+    {
+      "path": "fork/relay-probe/CMakeLists.txt",
+      "bytes": 4572,
+      "sha256": "b390bb6feecdcb93cd09334e9ee4162163c25fe7f4085789fd6ec01a120ec816"
+    },
+    {
+      "path": "fork/relay-probe/validate-report.py",
+      "bytes": 28716,
+      "sha256": "6400d074b60ee588fc79c894a85ea17fefcb71d1cb3215e3fc6444b3a16ffe37"
+    },
+    {
+      "path": "fork/relay-probe/src/main.cpp",
+      "bytes": 143517,
+      "sha256": "a9c5bde378422312c517f9ebf53e7e3be5f744e1eec664ca0afce1821fd2d8a4"
+    },
+    {
+      "path": "fork/relay-probe/tools/tq-clock-rate.cpp",
+      "bytes": 7962,
+      "sha256": "27c7611379925a1f8b77f443b848dac3d33c448ad741d073c67a093a468fdff8"
+    },
+    {
+      "path": "fork/relay-probe/tests/test_cli.py",
+      "bytes": 1917,
+      "sha256": "57e7d46f823e8ae72e2579048b59e626c15a415bac759cac6269c8ec3bd6d517"
+    },
+    {
+      "path": "fork/rerot-compose/tests/real-whiteboard.py",
+      "bytes": 41444,
+      "sha256": "e05fba401a2019ab2f42e58047544d04f04acaf3cae3cc73ba26b19c5053b69c"
+    },
+    {
+      "path": "fork/rerot-compose/tests/real-interrupt.py",
+      "bytes": 20474,
+      "sha256": "906af29ed5797c59701f2fcf0c40e70319d41e8a5297027a2a5ab7268d04f999"
+    }
+  ],
+  "installed_artifacts": [
+    {
+      "path": "build-devops-20261019/cpu/install/bin/llama-compose",
+      "bytes": 61792,
+      "sha256": "f3e9f771b8571e818cd062d723d618e507719a22d6255372f37b06fbeb69e90d"
+    },
+    {
+      "path": "build-devops-20261019/cpu/install/bin/llama-corpus",
+      "bytes": 96424,
+      "sha256": "23472df8df8c6663a95d951ba69626d4164ac9f24d38afb1bed84792ca461561"
+    },
+    {
+      "path": "build-devops-20261019/cpu/install/bin/tq-batch-compose",
+      "bytes": 114696,
+      "sha256": "10249106701bd0db17c25a9f97a30138f6fd199e551266d7fc7a812963007b73"
+    },
+    {
+      "path": "build-devops-20261019/cpu/install/bin/tq-logits-compose",
+      "bytes": 61072,
+      "sha256": "446a52535ae67081918918c399a63163e3d5b88658bc68e80439a4b10075faf7"
+    },
+    {
+      "path": "build-devops-20261019/cpu/install/bin/tq-imatrix-compose",
+      "bytes": 93552,
+      "sha256": "189b7797d3aed66618d77f157a04a8e98bd59481139652c98e48f4d0d3eef019"
+    },
+    {
+      "path": "build-devops-20261019/cpu/install/bin/tq-rerot-compose",
+      "bytes": 254416,
+      "sha256": "f950869bd0788b849b3babaa59f9184db96cac3ef20c95efee3bda80eedef90b"
+    },
+    {
+      "path": "build-devops-20261019/cpu/install/lib/libllama.so",
+      "bytes": 5009944,
+      "sha256": "48fbee463d0ab7201732c3543f85ee9d277ed44d0d750ffe66ecbbed240cb73a"
+    },
+    {
+      "path": "build-devops-20261019/cpu/install/lib/libggml.so",
+      "bytes": 59704,
+      "sha256": "e307044a1ad4a20bdd7d8e63d34da1f5e2205f065cabff0d175b094e34f7e37b"
+    },
+    {
+      "path": "build-devops-20261019/cpu/install/lib/libggml-base.so",
+      "bytes": 993320,
+      "sha256": "f0b4651c4cc47a73e20cfa1067115693a09a9152c56796b9e7368c84a28750fb"
+    },
+    {
+      "path": "build-devops-20261019/cpu/install/lib/libggml-cpu.so",
+      "bytes": 1187168,
+      "sha256": "434841ad17a33c468f6c6ebeffda83101d2eb9cb7b6bc772f51a54e86735372f"
+    },
+    {
+      "path": "build-devops-20261019/cpu/upstream/bin/llama-server",
+      "bytes": 18008,
+      "sha256": "852d0c63e2da358cf0638ae9ebb3520aad88b57c8e89d9e2b0b6da3b077d11e4"
+    },
+    {
+      "path": "build-devops-20261019/cpu/upstream/bin/llama-bench",
+      "bytes": 18000,
+      "sha256": "0015e43b20515b539f9131060299c2276ef8a75abcc8b398ca668ac39283e5e5"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/install/bin/llama-compose",
+      "bytes": 61792,
+      "sha256": "26d4c0a93063bd8e42ad55df7a4a33e84bb8c59d34e1635ce8d90fdb359b6031"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/install/bin/llama-corpus",
+      "bytes": 96424,
+      "sha256": "160736b2ac44b1d2455f483d562f7eedef37461268a1f1f3a80a214a0270edf6"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/install/bin/tq-batch-compose",
+      "bytes": 114696,
+      "sha256": "ab6cd8a4b628424934cd9e0d36311b0bbdeccfbe4d97849784736a3cba81196b"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/install/bin/tq-logits-compose",
+      "bytes": 61072,
+      "sha256": "0f71a89b7c3c8b9139a24300568b97f35803b6ef5072b8a14990e613041bc54b"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/install/bin/tq-imatrix-compose",
+      "bytes": 93552,
+      "sha256": "97e6804b81be2a37291124ace505968a339fb6aa90d614a0f6d65f05636af0df"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/install/bin/tq-rerot-compose",
+      "bytes": 254416,
+      "sha256": "589d52ecf1ec2152e8260697f49649c2d6f499746a7d495e13fbdf6868ef1f15"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/install/lib/libllama.so",
+      "bytes": 5009944,
+      "sha256": "40a74c903039cc60c04388deeab788b4317fdbc6e670c7b4cb5db2a3a9c2cb4e"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/install/lib/libggml.so",
+      "bytes": 59496,
+      "sha256": "77640feb4545c617eb80935ccff76fb7e56af3850a069d6d742f2cdce92e5663"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/install/lib/libggml-base.so",
+      "bytes": 993320,
+      "sha256": "f0b4651c4cc47a73e20cfa1067115693a09a9152c56796b9e7368c84a28750fb"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/install/lib/libggml-cpu.so",
+      "bytes": 1187168,
+      "sha256": "781585acfe91c4162c6366a790e89c23adcd3a60783790b7579aa2622e286573"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/upstream/bin/llama-server",
+      "bytes": 18008,
+      "sha256": "8629e9c30d04bc493d4e5305d63935f059a03fe128b5ff797b41ff9078c3a2eb"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/upstream/bin/llama-bench",
+      "bytes": 18000,
+      "sha256": "3f623010c114681faeaeecaf51b6c463a5d2eb8b229b2274a6d76ca6c1c11cdf"
+    },
+    {
+      "path": "build-devops-20261019/vulkan/install/lib/libggml-vulkan.so",
+      "bytes": 55224968,
+      "sha256": "d4aec3b305e3c4da5ff702226fc4351a4fe4d6cf978af9556251de757d66d733"
+    },
+    {
+      "path": "build-devops-20261019/hip-relocated/bin/tq-relay-probe",
+      "bytes": 327040,
+      "sha256": "051fdbd7876eded8f9638cc46d0e6801626d36271651f86ebff78dab27a722c4"
+    },
+    {
+      "path": "build-devops-20261019/hip-relocated/bin/tq-clock-rate",
+      "bytes": 28488,
+      "sha256": "3d9b7393971a2f7ad8f7f9001fed71e3316f6ddb3336e9ea5fb08c2f869fdb04"
+    },
+    {
+      "path": "build-devops-20261019/hip-relocated/bin/validate-report.py",
+      "bytes": 28716,
+      "sha256": "6400d074b60ee588fc79c894a85ea17fefcb71d1cb3215e3fc6444b3a16ffe37"
+    }
+  ],
+  "commands": [
+    {
+      "name": "cpu-build-accepted",
+      "command": [
+        "python3",
+        "fork/build.py",
+        "--backend",
+        "cpu",
+        "--tools",
+        "--build-dir",
+        "build-devops-20261019/cpu",
+        "--jobs",
+        "8"
+      ],
+      "started_at": "2026-10-19T11:23:39.370365+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 15.811577389016747,
+      "log": "cpu-build-accepted.log",
+      "raw_log": {
+        "path": "build-devops-20261019/cpu-build-accepted.log",
+        "bytes": 172424,
+        "sha256": "36ee4cadbf0c1714a9efc0dc3b806de29c02486ea6d6a503e1734761416a2b40"
+      }
+    },
+    {
+      "name": "vulkan-build-accepted",
+      "command": [
+        "python3",
+        "fork/build.py",
+        "--backend",
+        "vulkan",
+        "--tools",
+        "--build-dir",
+        "build-devops-20261019/vulkan",
+        "--jobs",
+        "8"
+      ],
+      "started_at": "2026-10-19T11:23:39.373785+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 371.8645660339389,
+      "log": "vulkan-build-accepted.log",
+      "raw_log": {
+        "path": "build-devops-20261019/vulkan-build-accepted.log",
+        "bytes": 260413,
+        "sha256": "5ba0ccc03047f905ef675a33660713ede110506d65f6d7455244b1380bb5c101"
+      }
+    },
+    {
+      "name": "isolation-accepted",
+      "command": [
+        "python3",
+        "fork/tests/isolation.py",
+        "--output",
+        "build-devops-20261019/isolation-accepted",
+        "--jobs",
+        "8",
+        "--model",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "--rerot-model",
+        "/home/kunweiz/atomic-llama-cpp-turboquant/build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf"
+      ],
+      "started_at": "2026-10-19T11:23:39.373536+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 698.1117294559954,
+      "log": "isolation-accepted.log",
+      "raw_log": {
+        "path": "build-devops-20261019/isolation-accepted.log",
+        "bytes": 65273,
+        "sha256": "7ffa9c2050aaeb9c3bf815ea98d3f38e0b826beb9c44dedda91d1719f0811e70"
+      }
+    },
+    {
+      "name": "hip-hardware",
+      "command": [
+        "env",
+        "-u",
+        "LD_LIBRARY_PATH",
+        "-u",
+        "LD_PRELOAD",
+        "build-devops-20261019/hip-relocated/bin/tq-relay-probe",
+        "--output",
+        "build-devops-20261019/probe-report.json",
+        "--bench",
+        "build-devops-20261019/bench-report.json",
+        "--rounds",
+        "2000"
+      ],
+      "started_at": "2026-10-19T11:19:32.287398+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 26.02419576793909,
+      "log": "hip-hardware.log",
+      "raw_log": {
+        "path": "build-devops-20261019/hip-hardware.log",
+        "bytes": 3571,
+        "sha256": "76462d864c5b87a90acd292f0f861a1e589df829c6ccb36433d1688fd8c715e3"
+      }
+    },
+    {
+      "name": "hip-clock",
+      "command": [
+        "env",
+        "-u",
+        "LD_LIBRARY_PATH",
+        "-u",
+        "LD_PRELOAD",
+        "build-devops-20261019/hip-relocated/bin/tq-clock-rate"
+      ],
+      "started_at": "2026-10-19T11:19:32.289151+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 10.64805121999234,
+      "log": "hip-clock.log",
+      "raw_log": {
+        "path": "build-devops-20261019/hip-clock.log",
+        "bytes": 515,
+        "sha256": "c6fd3f3e9a43b0d653350609b0514692a78216a35ad77f03a9bd7ebd535b6468"
+      }
+    },
+    {
+      "name": "cpu-real-model",
+      "command": [
+        "python3",
+        "fork/tests/real-model.py",
+        "--model",
+        "build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "--bin-dir",
+        "build-devops-20261019/cpu/install/bin",
+        "--output",
+        "build-devops-20261019/cpu-real-model",
+        "--gpu-layers",
+        "0",
+        "--threads",
+        "4"
+      ],
+      "started_at": "2026-10-19T11:24:30.028461+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 43.60990286793094,
+      "log": "cpu-real-model.log",
+      "raw_log": {
+        "path": "build-devops-20261019/cpu-real-model.log",
+        "bytes": 4123,
+        "sha256": "4ccf1c4a3bc9155e0d3023d69f08f2aa5437afaf934cec423d1bf77fbc27507c"
+      }
+    },
+    {
+      "name": "cpu-reader",
+      "command": [
+        "build-devops-20261019/cpu/modules/tests/a-seams/test-rerot-reader-views",
+        "--model",
+        "build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "--gpu-layers",
+        "0",
+        "--threads",
+        "4",
+        "--kv-type",
+        "f32",
+        "--require-cross-shape-equivalence"
+      ],
+      "started_at": "2026-10-19T11:24:30.027672+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 15.907258493010886,
+      "log": "cpu-reader.log",
+      "raw_log": {
+        "path": "build-devops-20261019/cpu-reader.log",
+        "bytes": 174888,
+        "sha256": "84120599111b15ef2abf806bd423005adec97164cbe20871b537d935ec453a2e"
+      }
+    },
+    {
+      "name": "vulkan-real-model",
+      "command": [
+        "python3",
+        "fork/tests/real-model.py",
+        "--model",
+        "build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "--bin-dir",
+        "build-devops-20261019/vulkan/install/bin",
+        "--output",
+        "build-devops-20261019/vulkan-real-model",
+        "--gpu-layers",
+        "99",
+        "--threads",
+        "4"
+      ],
+      "started_at": "2026-10-19T11:30:15.633677+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 37.32137787004467,
+      "log": "vulkan-real-model.log",
+      "raw_log": {
+        "path": "build-devops-20261019/vulkan-real-model.log",
+        "bytes": 4180,
+        "sha256": "d746dec8e7ef0b146a1ec6ec1063e6ae4046c83149bba3be515ed81d8c0c1ed9"
+      }
+    },
+    {
+      "name": "vulkan-reader",
+      "command": [
+        "build-devops-20261019/vulkan/modules/tests/a-seams/test-rerot-reader-views",
+        "--model",
+        "build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "--gpu-layers",
+        "99",
+        "--threads",
+        "4",
+        "--kv-type",
+        "f32",
+        "--require-cross-shape-equivalence"
+      ],
+      "started_at": "2026-10-19T11:30:15.633280+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 6.931922003976069,
+      "log": "vulkan-reader.log",
+      "raw_log": {
+        "path": "build-devops-20261019/vulkan-reader.log",
+        "bytes": 180724,
+        "sha256": "9e9091844d3a9901bcea305de91df2d32b5e0b5668288f5de251b856953e97be"
+      }
+    },
+    {
+      "name": "cpu-native-cancel",
+      "command": [
+        "build-devops-20261019/cpu/modules/rerot-compose/test_rerot_compose_cancellation",
+        "build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf"
+      ],
+      "started_at": "2026-10-19T11:25:35.201704+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 7.24489856697619,
+      "log": "cpu-native-cancel.log",
+      "raw_log": {
+        "path": "build-devops-20261019/cpu-native-cancel.log",
+        "bytes": 211587,
+        "sha256": "7d117e4bc19b45bf20645cd7d36ba347646bf50e3260519fc58dbc0830307dea"
+      }
+    },
+    {
+      "name": "cpu-process-exits",
+      "command": [
+        "python3",
+        "fork/rerot-compose/tests/real-interrupt.py",
+        "--binary",
+        "build-devops-20261019/cpu/install/bin/tq-rerot-compose",
+        "--model",
+        "build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "--output",
+        "build-devops-20261019/cpu-process-exits",
+        "--gpu-layers",
+        "0"
+      ],
+      "started_at": "2026-10-19T11:25:35.202263+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 28.59996560390573,
+      "log": "cpu-process-exits.log",
+      "raw_log": {
+        "path": "build-devops-20261019/cpu-process-exits.log",
+        "bytes": 263,
+        "sha256": "5e0383b8706e8658fbb09ac29a600f5074c7609e3b9507f9fd45be1b92ec4b43"
+      }
+    },
+    {
+      "name": "vulkan-process-exits",
+      "command": [
+        "python3",
+        "fork/rerot-compose/tests/real-interrupt.py",
+        "--binary",
+        "build-devops-20261019/vulkan/install/bin/tq-rerot-compose",
+        "--model",
+        "build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "--output",
+        "build-devops-20261019/vulkan-process-exits",
+        "--gpu-layers",
+        "99",
+        "--devices",
+        "Vulkan0"
+      ],
+      "started_at": "2026-10-19T11:30:15.633777+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 27.67443789599929,
+      "log": "vulkan-process-exits.log",
+      "raw_log": {
+        "path": "build-devops-20261019/vulkan-process-exits.log",
+        "bytes": 266,
+        "sha256": "f516c8bcb79da44653b484ad52741beb39b8d1e4c254629b742b5de57c0acd48"
+      }
+    },
+    {
+      "name": "vulkan-whiteboard",
+      "command": [
+        "python3",
+        "fork/rerot-compose/tests/real-whiteboard.py",
+        "--binary",
+        "build-devops-20261019/vulkan/install/bin/tq-rerot-compose",
+        "--model",
+        "build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "--output",
+        "build-devops-20261019/vulkan-whiteboard",
+        "--gpu-layers",
+        "99",
+        "--devices",
+        "Vulkan0",
+        "--split-mode",
+        "none",
+        "--parallel",
+        "2",
+        "--ubatch-sizes",
+        "128,1",
+        "--phase-modes",
+        "release,retain",
+        "--repeat",
+        "2",
+        "--require-cross-shape-equivalence",
+        "--source-commit",
+        "90aa90e2a7d12aeb181dd11c9c04e367034dc2a8"
+      ],
+      "started_at": "2026-10-19T11:30:15.633062+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 255.5815296981018,
+      "log": "vulkan-whiteboard.log",
+      "raw_log": {
+        "path": "build-devops-20261019/vulkan-whiteboard.log",
+        "bytes": 989,
+        "sha256": "6da66ce075da64c5c3aa02008736db22e56429cf84a304668eaea653eeb46da7"
+      }
+    },
+    {
+      "name": "vulkan-oracle",
+      "command": [
+        "build-devops-20261019/vulkan/modules/tests/a-seams/test-rerot-attention-oracle",
+        "--gpu-layers",
+        "99"
+      ],
+      "started_at": "2026-10-19T11:31:05.740747+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 0.41898624994792044,
+      "log": "vulkan-oracle.log",
+      "raw_log": {
+        "path": "build-devops-20261019/vulkan-oracle.log",
+        "bytes": 177636,
+        "sha256": "0057c2dbd0216f127445d39d5250a83bfba5f3cb78907be6e0eaf95eff553b0a"
+      }
+    },
+    {
+      "name": "http-service",
+      "command": [
+        "python3",
+        "fork/tests/server-phase.py",
+        "--binary",
+        "build-devops-20261019/vulkan/upstream/bin/llama-server",
+        "--model",
+        "build-devops-20261019/fixtures/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "--output-dir",
+        "build-devops-20261019/http-service"
+      ],
+      "started_at": "2026-10-19T11:31:05.740352+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 7.865091989981011,
+      "log": "http-service.log",
+      "raw_log": {
+        "path": "build-devops-20261019/http-service.log",
+        "bytes": 12381,
+        "sha256": "0c86829ac3b1d6a5cf80b8f9a40ae7539a9cd9eb4f688d84188fd33d93c797c3"
+      }
+    },
+    {
+      "name": "final-boundary",
+      "command": [
+        "python3",
+        "fork/check-upstream.py"
+      ],
+      "started_at": "2026-10-19T11:35:20.562367+00:00",
+      "returncode": 0,
+      "elapsed_seconds": 0.33223767299205065,
+      "log": "final-boundary.log",
+      "raw_log": {
+        "path": "build-devops-20261019/final-boundary.log",
+        "bytes": 40708,
+        "sha256": "e03458f97bd9e69024507631638a4908d823d4035a368d19175bff87d0452322"
+      }
+    }
+  ],
+  "receipts": [
+    {
+      "path": "build-devops-20261019/isolation-accepted/result.json",
+      "bytes": 42111,
+      "sha256": "b606c0dac33e9588eab757247e11b2f813d8c5b2aab4ec3e8a158a8a5c460d49"
+    },
+    {
+      "path": "build-devops-20261019/isolation-accepted/commands.json",
+      "bytes": 34839,
+      "sha256": "138ce9dfce371dd57edc278b8ac0d625b6ec997aaa75c4db393fa6ad7696d113"
+    },
+    {
+      "path": "build-devops-20261019/isolation-accepted/verified-boundary.json",
+      "bytes": 40708,
+      "sha256": "a7493bc4ccd03473b0f6d67ed0a6d975e0eac180ec89c7096122e9fddc5ecf79"
+    },
+    {
+      "path": "build-devops-20261019/isolation-accepted/environment.json",
+      "bytes": 245,
+      "sha256": "23ff0df04325091bc195f1b81b728895fedeb66bf28823ac179298be4d3135a3"
+    },
+    {
+      "path": "build-devops-20261019/isolation-accepted/consumer-test.log",
+      "bytes": 502,
+      "sha256": "582b5bea372fc27291ad6dfe6e5a98459293644fd143b7b7180b0299289eca3c"
+    },
+    {
+      "path": "build-devops-20261019/isolation-accepted/relocated-real-rerot/receipt.json",
+      "bytes": 305801,
+      "sha256": "fe26e4ec0704921bdb2a0cb53e905a8ad6954be06bad62068d4da1abd35e0683"
+    },
+    {
+      "path": "build-devops-20261019/vulkan-whiteboard/receipt.json",
+      "bytes": 604296,
+      "sha256": "2eb8072b7f3264d10a5f0339726ddefaaa2329391e45ee00393e803cf36b9e6a"
+    },
+    {
+      "path": "build-devops-20261019/reader-summary.json",
+      "bytes": 1402,
+      "sha256": "e5b7cac7858ad49b5123d4dcfb02918f42e6d2a755ced672f331e0d155ad6405"
+    },
+    {
+      "path": "build-devops-20261019/cpu-real-model/result.json",
+      "bytes": 869,
+      "sha256": "9e86218ec94c6c638b5739dec06715217eec40bee310d918e95df5e14ced1036"
+    },
+    {
+      "path": "build-devops-20261019/vulkan-real-model/result.json",
+      "bytes": 855,
+      "sha256": "89ef3c8c95350cc296c0029eae2e57eb86790357781612e29335305d6792c9f6"
+    },
+    {
+      "path": "build-devops-20261019/cpu-process-exits/receipt.json",
+      "bytes": 8757,
+      "sha256": "45edf53b872a7f545c06b2ceabf5c01e5de862992e4b5c99c3b83fe51a432eee"
+    },
+    {
+      "path": "build-devops-20261019/vulkan-process-exits/receipt.json",
+      "bytes": 8959,
+      "sha256": "9b1e328ce23c1b187c6e1829d19b237198b242f88e405abdd977e0db550925f0"
+    },
+    {
+      "path": "build-devops-20261019/http-service/summary.json",
+      "bytes": 12381,
+      "sha256": "0c86829ac3b1d6a5cf80b8f9a40ae7539a9cd9eb4f688d84188fd33d93c797c3"
+    },
+    {
+      "path": "build-devops-20261019/validator-counterexamples/pair-before-after.json",
+      "bytes": 489,
+      "sha256": "b83603af37356f6c07bb45c7fe4b76e77c2e660fd005bc6b87af1ff347638170"
+    },
+    {
+      "path": "build-devops-20261019/validator-counterexamples/surrogate-key-before.stderr",
+      "bytes": 1561,
+      "sha256": "908bd2ec856e928d48a6a5b905e834397515db1ee444285bd6f6988934fe9a39"
+    },
+    {
+      "path": "build-devops-20261019/validator-counterexamples/surrogate-key-after.stdout",
+      "bytes": 143,
+      "sha256": "e8b2b3814681b8ffe272752e458daa474a22b14cf4571d0636d58943441bbff5"
+    },
+    {
+      "path": "build-devops-20261019/probe-cpu-only/acceptance.json",
+      "bytes": 1319,
+      "sha256": "c7388a4b62ffb641466871c582e35191739ff964a21ce6aa4fb24c2a62510de4"
+    },
+    {
+      "path": "build-devops-20261019/guide-programs/source-digests.json",
+      "bytes": 1174,
+      "sha256": "75fbdbf01995d7cf8ccac2b27f17c113de06e8c4e45ff921e12518a0f43e3e1c"
+    }
+  ],
+  "preserved_failed_attempts": [
+    {
+      "name": "cpu-build",
+      "command": [
+        "python3",
+        "fork/build.py",
+        "--backend",
+        "cpu",
+        "--tools",
+        "--build-dir",
+        "build-devops-20261019/cpu",
+        "--jobs",
+        "8"
+      ],
+      "started_at": "2026-10-19T11:17:33.958200+00:00",
+      "returncode": 1,
+      "elapsed_seconds": 0.2402840480208397,
+      "log": "cpu-build.log",
+      "raw_log": {
+        "path": "build-devops-20261019/cpu-build.log",
+        "bytes": 937,
+        "sha256": "8f4ecc778f9afdf00da7b2d921d7320bc9ea8a1b5fc60083ecdefb88c41a1cc5"
+      }
+    },
+    {
+      "name": "cpu-build-final",
+      "command": [
+        "python3",
+        "fork/build.py",
+        "--backend",
+        "cpu",
+        "--tools",
+        "--build-dir",
+        "build-devops-20261019/cpu",
+        "--jobs",
+        "8"
+      ],
+      "started_at": "2026-10-19T11:18:33.939777+00:00",
+      "returncode": 1,
+      "elapsed_seconds": 263.8835103199817,
+      "log": "cpu-build-final.log",
+      "raw_log": {
+        "path": "build-devops-20261019/cpu-build-final.log",
+        "bytes": 200040,
+        "sha256": "7571d69cf1d085f0956d98eb2ca5065076a36be35edc16cce26801aecfa8887d"
+      }
+    },
+    {
+      "name": "vulkan-build",
+      "command": [
+        "python3",
+        "fork/build.py",
+        "--backend",
+        "vulkan",
+        "--tools",
+        "--build-dir",
+        "build-devops-20261019/vulkan",
+        "--jobs",
+        "8"
+      ],
+      "started_at": "2026-10-19T11:20:37.262965+00:00",
+      "returncode": 1,
+      "elapsed_seconds": 1.8242913848953322,
+      "log": "vulkan-build.log",
+      "raw_log": {
+        "path": "build-devops-20261019/vulkan-build.log",
+        "bytes": 43827,
+        "sha256": "3e739df5076e19db3be80902913b36d9092b837f1baeca68cd2bce9179fcfffa"
+      }
+    },
+    {
+      "name": "vulkan-build-final",
+      "command": [
+        "python3",
+        "fork/build.py",
+        "--backend",
+        "vulkan",
+        "--tools",
+        "--build-dir",
+        "build-devops-20261019/vulkan",
+        "--jobs",
+        "8"
+      ],
+      "started_at": "2026-10-19T11:21:11.662903+00:00",
+      "returncode": 1,
+      "elapsed_seconds": 44.199006529990584,
+      "log": "vulkan-build-final.log",
+      "raw_log": {
+        "path": "build-devops-20261019/vulkan-build-final.log",
+        "bytes": 61226,
+        "sha256": "28cf7d092cd8962a834657168dc95536d8925df96c76c6bd0ba935fde700b316"
+      }
+    },
+    {
+      "name": "isolation",
+      "command": [
+        "python3",
+        "fork/tests/isolation.py",
+        "--output",
+        "build-devops-20261019/isolation",
+        "--jobs",
+        "8"
+      ],
+      "started_at": "2026-10-19T11:18:57.872173+00:00",
+      "returncode": 1,
+      "elapsed_seconds": 179.17817315494176,
+      "log": "isolation.log",
+      "raw_log": {
+        "path": "build-devops-20261019/isolation.log",
+        "bytes": 17520,
+        "sha256": "a7e6aad244f89c4071ccf9cb60fa0da2c386f11268faccac90f66952cba9b777"
+      }
+    }
+  ],
+  "tests": {
+    "boundary_unit_tests": 12,
+    "logits_reader_unit_tests": 20,
+    "embedded_guide_programs": 4,
+    "cpu_public_seams": 11,
+    "vulkan_installation_public_seams": 20,
+    "hip_tool_ctests": 3,
+    "isolation_commands": 80,
+    "installed_package_consumers": 3
+  },
+  "reader_results": {
+    "cpu": {
+      "status": "PASS",
+      "logit_comparisons": 31,
+      "equivalence_max_abs": 0,
+      "cross_shape_logit_comparisons": 12,
+      "cross_shape_max_abs": 0,
+      "actual_decode_calls": 72,
+      "actual_input_rows": 169,
+      "qualifications": {
+        "same_shape_attention_and_lifecycle": {
+          "status": "PASS",
+          "comparisons": 33,
+          "failed_comparisons": 0
+        },
+        "cross_shape_equivalence": {
+          "status": "PASS",
+          "explicitly_required": true,
+          "observed_comparisons": 12,
+          "observed_failed_comparisons": 0,
+          "scope": "executed batch and serial shapes only; no general native batch-invariance claim"
+        }
+      }
+    },
+    "vulkan": {
+      "status": "PASS",
+      "logit_comparisons": 31,
+      "equivalence_max_abs": 1.52587890625e-05,
+      "cross_shape_logit_comparisons": 12,
+      "cross_shape_max_abs": 1.52587890625e-05,
+      "actual_decode_calls": 72,
+      "actual_input_rows": 169,
+      "qualifications": {
+        "same_shape_attention_and_lifecycle": {
+          "status": "PASS",
+          "comparisons": 33,
+          "failed_comparisons": 0
+        },
+        "cross_shape_equivalence": {
+          "status": "PASS",
+          "explicitly_required": true,
+          "observed_comparisons": 12,
+          "observed_failed_comparisons": 0,
+          "scope": "executed batch and serial shapes only; no general native batch-invariance claim"
+        }
+      }
+    }
+  },
+  "whiteboard": {
+    "cpu_relocated": {
+      "runs": 4,
+      "qualifications": {
+        "phase_memory_invariance": {
+          "status": "PASS",
+          "expected_comparisons": 2,
+          "comparisons": [
+            {
+              "group": "28115f38b4789cc4-ubatch-128",
+              "reference_run": "01-ubatch-128-release-1",
+              "run": "03-ubatch-128-retain-1",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "28115f38b4789cc4-ubatch-1",
+              "reference_run": "02-ubatch-1-release-1",
+              "run": "04-ubatch-1-retain-1",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            }
+          ]
+        },
+        "same_shape_reproducibility": {
+          "status": "NOT_QUALIFIED",
+          "expected_comparisons": 0,
+          "comparisons": []
+        },
+        "cross_shape_greedy_equivalence": {
+          "status": "NOT_QUALIFIED",
+          "explicitly_required": false,
+          "expected_comparisons": 1,
+          "observations": [
+            {
+              "reference_group": "28115f38b4789cc4-ubatch-128",
+              "group": "28115f38b4789cc4-ubatch-1",
+              "reference_run": "01-ubatch-128-release-1",
+              "run": "02-ubatch-1-release-1",
+              "greedy_trajectory_equal": true
+            }
+          ],
+          "scope": "observed executed shapes only; no general native batch-invariance claim"
+        },
+        "incremental_whiteboard_contract": {
+          "status": "PASS",
+          "expected_runs": 4,
+          "passed_runs": 4
+        }
+      }
+    },
+    "vulkan": {
+      "runs": 8,
+      "qualifications": {
+        "phase_memory_invariance": {
+          "status": "PASS",
+          "expected_comparisons": 2,
+          "comparisons": [
+            {
+              "group": "0a70cad239f7bc32-ubatch-128",
+              "reference_run": "01-ubatch-128-release-1",
+              "run": "05-ubatch-128-retain-1",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "0a70cad239f7bc32-ubatch-1",
+              "reference_run": "03-ubatch-1-release-1",
+              "run": "07-ubatch-1-retain-1",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            }
+          ]
+        },
+        "same_shape_reproducibility": {
+          "status": "PASS",
+          "expected_comparisons": 4,
+          "comparisons": [
+            {
+              "group": "0a70cad239f7bc32-ubatch-128",
+              "reference_run": "01-ubatch-128-release-1",
+              "run": "02-ubatch-128-release-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "0a70cad239f7bc32-ubatch-1",
+              "reference_run": "03-ubatch-1-release-1",
+              "run": "04-ubatch-1-release-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "0a70cad239f7bc32-ubatch-128",
+              "reference_run": "05-ubatch-128-retain-1",
+              "run": "06-ubatch-128-retain-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "0a70cad239f7bc32-ubatch-1",
+              "reference_run": "07-ubatch-1-retain-1",
+              "run": "08-ubatch-1-retain-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            }
+          ]
+        },
+        "cross_shape_greedy_equivalence": {
+          "status": "PASS",
+          "explicitly_required": true,
+          "expected_comparisons": 1,
+          "observations": [
+            {
+              "reference_group": "0a70cad239f7bc32-ubatch-128",
+              "group": "0a70cad239f7bc32-ubatch-1",
+              "reference_run": "01-ubatch-128-release-1",
+              "run": "03-ubatch-1-release-1",
+              "greedy_trajectory_equal": true
+            }
+          ],
+          "scope": "observed executed shapes only; no general native batch-invariance claim"
+        },
+        "incremental_whiteboard_contract": {
+          "status": "PASS",
+          "expected_runs": 8,
+          "passed_runs": 8
+        }
+      }
+    }
+  },
+  "platform_probe": {
+    "report": {
+      "path": "fork/audit/devops-fivecard-probe-20261019.json",
+      "bytes": 23472,
+      "sha256": "015962c9d820cd93ee6f6269c5d06fc693267c0c04c4809909dffe93e2d8670b"
+    },
+    "bench": {
+      "path": "fork/audit/devops-fivecard-bench-20261019.json",
+      "bytes": 1183,
+      "sha256": "1ceb1358d200344d33033d30ceb43f60a3f48fcc940c1bec509c807ea474c564"
+    },
+    "qualification": "pass",
+    "five_rank_status": "pass",
+    "rounds": 2000,
+    "host_fetch_add": "Failed on all five devices: 448 observed instead of 7; optional capability, never used by SPSC protocol",
+    "host_cas": "pass on all five devices",
+    "benchmark_limit": "Diagnostic only; concurrent calibration/acceptance work, no performance qualification"
+  },
+  "not_qualified": [
+    "Remote GitHub Actions execution",
+    "Whole-model TP5 or strict mapped-relay executor",
+    "Multi-device model PP",
+    "HIP/CUDA model execution",
+    "MTP and HTTP cancellation/recovery",
+    "General GPU operator qualification or closure of historical full-suite failures",
+    "New performance or quality improvements",
+    "CPU relocated same-shape repetition and cross-shape generation qualification: NOT_QUALIFIED in that four-run receipt"
+  ],
+  "artifact_storage": "Raw logs, per-command receipts, isolated delivered packages and model fixture remain in build-devops-20261019; archived platform evidence lives in fork/audit."
+}

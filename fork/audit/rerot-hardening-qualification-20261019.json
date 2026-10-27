@@ -1,0 +1,3820 @@
+{
+  "schema": "tq-rerot-hardening-qualification/1",
+  "date_utc": "2026-10-19",
+  "status": "PASS_RECORDED_CPU_AND_VULKAN_F32_READER_SCOPE",
+  "task_base_commit": "49ac1b2bdf5fcd65dab375ecfd91a11314b1706a",
+  "upstream_pin": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+  "legacy_reference_commit": "2777543b2358c88cd1c2000f7fa342b764a0e213",
+  "implementation_commits": {
+    "B": "23e1460af56e5ff6f8a3881bdf7783189237a13a",
+    "A": "81276fa6cfc4a5a1df5297a2d1a117bf96d8f145",
+    "C": "e60d999cb025be18d8b9a04877e925ec64a860d6"
+  },
+  "platform": "Linux-7.3.0-rc1-2-MANJARO-x86_64-with-glibc2.44",
+  "model": [
+    {
+      "path": "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+      "bytes": 4358844000,
+      "sha256": "a1921216ded964e5c4f787226729e8c2c32bd587ac7b897742e0b7a7cc7eff6a"
+    }
+  ],
+  "artifact_identity": {
+    "cpu": [
+      {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/isolation-expert/delivered/bin/tq-rerot-compose",
+        "bytes": 273576,
+        "sha256": "728668cc814ecea346bdfa03a1c9bcb4be7bcb067a1b09de1af7f1b6d11c4381"
+      },
+      {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/isolation-expert/delivered/lib/libggml-base.so",
+        "bytes": 1010472,
+        "sha256": "d646cd9e1a299e9835a0eb9a4e9401f75420e9c5e83239a8411e23bbacd92962"
+      },
+      {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/isolation-expert/delivered/lib/libggml-cpu.so",
+        "bytes": 1186760,
+        "sha256": "904ae7b364e61a15e9ce210ec51463b30da9cd6f0d2c81d9f7c6942b7d8d833f"
+      },
+      {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/isolation-expert/delivered/lib/libggml.so",
+        "bytes": 55472,
+        "sha256": "64a9ed9e14f9f70624fe8b7d1949baa17393b667c6e2753de834e65f4e061f0b"
+      },
+      {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/isolation-expert/delivered/lib/libllama.so",
+        "bytes": 5008072,
+        "sha256": "604e3fe059b544d912ac65aa432a93706cc868259edec9edd02b8f22291d6608"
+      }
+    ],
+    "vulkan": [
+      {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/bin/tq-rerot-compose",
+        "bytes": 273576,
+        "sha256": "82075c2aea97e3b3d7b36437403f59cdf89ebb8a82a01e17c02dedb511ad59fe"
+      },
+      {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/lib/libggml-base.so.0.18.1",
+        "bytes": 1010472,
+        "sha256": "d1cd477165646f060a55f73bc58d8b133b6faa40cb95d59bf7443bce8fe99cc6"
+      },
+      {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/lib/libggml-cpu.so.0.18.1",
+        "bytes": 1381088,
+        "sha256": "b10899c9f8357b6ac7dbeaa2cfbf95164194226b65a11ff549167815c17a8e49"
+      },
+      {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/lib/libggml-vulkan.so.0.18.1",
+        "bytes": 56864128,
+        "sha256": "aafa5e968bf179d5286ec170815c78d5fe64d1e3df9ee6d81ecdabcabf12d2f5"
+      },
+      {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/lib/libggml.so.0.18.1",
+        "bytes": 55264,
+        "sha256": "0d2cc08042253896e47d70a7915e595fdd12bc8358b9171ba2c957422551fe58"
+      },
+      {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/lib/libllama.so.0.0.2081",
+        "bytes": 4999880,
+        "sha256": "3cd2d257fa45ca91c000744bc6c085c152162ffc4c21cde3662b02bbc01d5e1c"
+      }
+    ]
+  },
+  "debug_artifacts": [
+    {
+      "path": "build-rerot-hardening-20261019/install-vulkan-expert-debug/lib/libggml-base.so",
+      "bytes": 1010472,
+      "sha256": "d1cd477165646f060a55f73bc58d8b133b6faa40cb95d59bf7443bce8fe99cc6"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/install-vulkan-expert-debug/lib/libggml-cpu.so",
+      "bytes": 1381088,
+      "sha256": "b10899c9f8357b6ac7dbeaa2cfbf95164194226b65a11ff549167815c17a8e49"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/install-vulkan-expert-debug/lib/libggml-vulkan.so",
+      "bytes": 56991896,
+      "sha256": "cb1f7e61e1ee562ca4560c9b782244f507ff69c13bcfc91bf53a0bbb8d6d32a6"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/install-vulkan-expert-debug/lib/libggml.so",
+      "bytes": 55264,
+      "sha256": "0d2cc08042253896e47d70a7915e595fdd12bc8358b9171ba2c957422551fe58"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/install-vulkan-expert-debug/lib/libllama.so",
+      "bytes": 4999880,
+      "sha256": "3cd2d257fa45ca91c000744bc6c085c152162ffc4c21cde3662b02bbc01d5e1c"
+    }
+  ],
+  "performance_raw_inputs": [
+    {
+      "path": "build-rerot-hardening-20261019/performance-vulkan-expert/identity.json",
+      "bytes": 2940,
+      "sha256": "99cee9e997a21121d944bded7009aba40c2317b324d3648a937bba3fc2336399"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/performance-vulkan-expert/commands.json",
+      "bytes": 5117,
+      "sha256": "4fb0198673fb0e48bd778cd582384e20d98f46f80346890e23da6d6f420aed8a"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/performance-vulkan-expert/dense-first-default.jsonl",
+      "bytes": 13483,
+      "sha256": "75034a2b9e7dc65e14a69c3e6beeefecf820381ba9d41d2a93f44aa7b7ad5fc4"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/performance-vulkan-expert/dense-first-batch-invariant.jsonl",
+      "bytes": 13685,
+      "sha256": "5dea54739b7400ccbf35e209a4eae929b4713ff72deddc50dd8de5aa45711c39"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/performance-vulkan-expert/mmvq-auto-first-auto.jsonl",
+      "bytes": 7570,
+      "sha256": "9c632f0c957fb3ad2b2da47f88ba14c61d035e4abb5c3d3227b29aa45144b5f4"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/performance-vulkan-expert/mmvq-auto-first-disable.jsonl",
+      "bytes": 7644,
+      "sha256": "50f1a020cb5bfd90641be88d6e25ff07d3df370a02d9d6ded3895572a08accb6"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/performance-vulkan-expert/mmvq-disable-first-disable.jsonl",
+      "bytes": 7652,
+      "sha256": "95b2f7c50b95249f61cd1f38451eba6302a7209c9372a8e3e079a74369e0eb6b"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/performance-vulkan-expert/mmvq-disable-first-auto.jsonl",
+      "bytes": 7567,
+      "sha256": "a600fa28aada12797ee12d37f2edf3e86f37c8ae0fb253a414c5ba1f01c45ca0"
+    }
+  ],
+  "retained_failures": [
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/whiteboard-cpu-strict/receipt.json",
+        "bytes": 66457,
+        "sha256": "406c3b1a5408ba3694163d38acf97b7858e65cc8c9a5ae16c55c1bda385fbc2c"
+      },
+      "scope": "Earlier observer prompt exhausted its 512-token EOG budget; later literal wording keeps the original budget and topology."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/whiteboard-vulkan-shape-policy/receipt.json",
+        "bytes": 307688,
+        "sha256": "7a343ced38919eda3863670cd0b829c19442332dd66e46cd6ff68e9c6de953f0"
+      },
+      "scope": "Earlier complete greedy trajectories differed across microbatch shapes."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/f32-layout-vulkan-before.log",
+        "bytes": 285,
+        "sha256": "aeb97d541cb30d77ce1337e81b799cafa3a78d2707134934cc209be9cf4f5ebc"
+      },
+      "scope": "Earlier F32 layout/operand precision counterexample."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/f32-shape-vulkan-before.log",
+        "bytes": 342,
+        "sha256": "7ecfeafb8538f3714cbb6f84ffe24f4895f846e3074c246224ec58dce8f70967"
+      },
+      "scope": "Earlier F32 cross-shape arithmetic counterexample."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/f32-head-padding-vulkan-before.log",
+        "bytes": 343,
+        "sha256": "bdb7fa8585ca8c3743960b04c12896ac2d1f28ead3de44715518b92272c1ca69"
+      },
+      "scope": "Earlier head-plane-only padding counterexample."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/cpu-f32-precision-before.log",
+        "bytes": 95,
+        "sha256": "db413a2803dca6c594ed9ef4579be36c201e50b847109a7b5b1e67b4184baac3"
+      },
+      "scope": "Earlier explicit CPU F32 precision counterexample."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/sampler-top-k-before.log",
+        "bytes": 71,
+        "sha256": "5d762f460513f326f91ab452728c7cd8990a9691fe9516aea64595105e08d7ed"
+      },
+      "scope": "Earlier extreme-finite native top-k set counterexample."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/quantized-shape-vulkan-before.log",
+        "bytes": 340,
+        "sha256": "70087dbc2f28cb1dd0f32b1ffad333742329d3b4cdcec5105cafbeab9b50a24c"
+      },
+      "scope": "Earlier dense native multi-column arithmetic differs from DEFAULT N1."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/quantized-shape-cpu-invariant.log",
+        "bytes": 338,
+        "sha256": "30d4748cbb63de780d92ec4bc7a649481be55bf9aeda34f60d789c37b7108ac9"
+      },
+      "scope": "Mode20 before native CPU fixed-dot routing."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/quantized-shape-cpu-native-control.log",
+        "bytes": 338,
+        "sha256": "30d4748cbb63de780d92ec4bc7a649481be55bf9aeda34f60d789c37b7108ac9"
+      },
+      "scope": "Native DEFAULT CPU control keeps its older multi-column behavior."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/id-shape-vulkan-native-before.log",
+        "bytes": 391,
+        "sha256": "c417c353b24793cddaeb8bd0e9c2d22b8949c90ed67ac79dbc8284d337c2ba5a"
+      },
+      "scope": "Earlier native ID tiled arithmetic differs from DEFAULT N1."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/native-prefill-vulkan-before.log",
+        "bytes": 5213239,
+        "sha256": "78d79096fad9cee27f0facd6be13ab730716a38b10786f54e4d3d340c66a15d4"
+      },
+      "scope": "Earlier full GPU prefill before consistency requests."
+    },
+    {
+      "artifact": {
+        "path": "build-rerot-hardening-20261019/native-prefill-vulkan-dense-invariant.log",
+        "bytes": 5199284,
+        "sha256": "0a84f5ad9a429c7a3ecc6e236d706e87a86e08022b1d00f1c407ed6ed138d685"
+      },
+      "scope": "Dense-only mode leaves expert-indexed prefill divergence."
+    }
+  ],
+  "qualifications": {
+    "source_isolation": {
+      "status": "PASS",
+      "result": {
+        "path": "build-rerot-hardening-20261019/isolation-expert/result.json",
+        "bytes": 41049,
+        "sha256": "a5500618ab4a84b64cdf1d3c149e99c177a5240f68310f3dce95c52d024a9bda"
+      },
+      "commands": {
+        "path": "build-rerot-hardening-20261019/isolation-expert/commands.json",
+        "bytes": 34672,
+        "sha256": "6a0a06ce1446ba84682d6c5e76003a758ff207ed5b2ceefebc6b8ed328c30898"
+      },
+      "verified_boundary": {
+        "path": "build-rerot-hardening-20261019/isolation-expert/verified-boundary.json",
+        "bytes": 39806,
+        "sha256": "ad4d1fbe9eaa79eb990b8a6460d3e7965988c6a1cf5da8a8e83f99a282c5519a"
+      },
+      "a_source_provenance": "built_from_pinned_archive_and_verified_overlay_bytes",
+      "a_prefix_reused": false,
+      "a_overlays": 34,
+      "commands_count": 77,
+      "isolated_modules": [
+        "sampling",
+        "corpus",
+        "scheduling",
+        "text",
+        "calibration",
+        "relay",
+        "rerot",
+        "compose",
+        "corpus-compose",
+        "batch-compose",
+        "logits-compose",
+        "imatrix-compose",
+        "rerot-compose"
+      ],
+      "source_and_build_copies_removed_before_consumption": true,
+      "relocated_installed_consumers_passed": true,
+      "relocated_real_rerot": "passed",
+      "real_rerot_receipt": {
+        "path": "build-rerot-hardening-20261019/isolation-expert/relocated-real-rerot/receipt.json",
+        "bytes": 309167,
+        "sha256": "9904f89dad505f33650ae06ad34c23ac8f18f3538d85144fb8cc7c1edcf7529d"
+      },
+      "real_rerot_qualifications": {
+        "phase_memory_invariance": "PASS",
+        "same_shape_reproducibility": "NOT_QUALIFIED",
+        "cross_shape_greedy_equivalence": "NOT_QUALIFIED",
+        "incremental_whiteboard_contract": "PASS"
+      },
+      "real_rerot_runs": 4
+    },
+    "cpu_a_seams": {
+      "status": "PASS",
+      "tests": 11,
+      "log": {
+        "path": "build-rerot-hardening-20261019/ctest-seams-cpu-expert.log",
+        "bytes": 1420,
+        "sha256": "b5533db923e384ec6999dc31ac7dea07bbcd91b287b7bf5c0f71a59246938fbd"
+      }
+    },
+    "vulkan_a_seams": {
+      "status": "PASS",
+      "tests": 20,
+      "log": {
+        "path": "build-rerot-hardening-20261019/ctest-seams-vulkan-expert-final.log",
+        "bytes": 2496,
+        "sha256": "c0309cfd36820128cd23d5d403fdba165c4bd453f1716a60bccec50049e085c7"
+      }
+    },
+    "cpu_c_tests": {
+      "status": "PASS",
+      "tests": 5,
+      "log": {
+        "path": "build-rerot-hardening-20261019/ctest-compose-cpu-expert-final.log",
+        "bytes": 779,
+        "sha256": "b17898b4016d1cb74750b0b704b9aeb098c8adb41c9d09a4bd09110ca29b7566"
+      }
+    },
+    "vulkan_linked_c_tests": {
+      "status": "PASS",
+      "tests": 5,
+      "log": {
+        "path": "build-rerot-hardening-20261019/ctest-compose-vulkan-expert.log",
+        "bytes": 782,
+        "sha256": "fc944db77489f2093e0e3dba0e67b38493c30408bf1bf5b38ac3177d7f060ce0"
+      },
+      "native_cancellation_scope": "Actual native CPU graph cancellation, not in-GPU instruction cancellation."
+    },
+    "independent_b": {
+      "status": "PASS",
+      "tests": 4,
+      "dags": 543,
+      "states": 3007,
+      "readers": 3904,
+      "f64_reader_head_comparisons": 3200,
+      "f64_max_abs": 7.77156e-16,
+      "log": {
+        "path": "build-rerot-hardening-20261019/module-rerot/Testing/Temporary/LastTest.log",
+        "bytes": 3120,
+        "sha256": "afddba8426906464ec8a2b9cd80a1112ef41f9aafdf902c06422c3a0d48eafad"
+      },
+      "final_source_isolation_retested_module": "rerot",
+      "sanitizer_identity_note": "Earlier sanitizer evidence retains its own source/build identity; no final A/C sanitizer claim is inferred."
+    },
+    "id-shape-cpu-expert": {
+      "log": {
+        "path": "build-rerot-hardening-20261019/id-shape-cpu-expert.log",
+        "bytes": 998,
+        "sha256": "c35079d4fd55e23a5ac6a6ac24bdfbabdcc7044e69658c02adaa89b1c5a67a97"
+      },
+      "result": {
+        "status": "pass",
+        "device": "CPU",
+        "backend": "CPU",
+        "matmul_id_mode": "batch_invariant_native_quantized",
+        "reference": "native_default_single_column",
+        "default_setter_omitted": true,
+        "types": [
+          "iq3_s",
+          "iq4_nl",
+          "q8_0",
+          "q4_K"
+        ],
+        "graphs": 1114,
+        "reference_graphs": 683,
+        "native_control_graphs": 39,
+        "cohort_graphs": 384,
+        "bitwise_comparisons": 431,
+        "boundary_graphs": 8,
+        "boundary_flattened_slots": 65540,
+        "bias_graphs": 222,
+        "scale_graphs": 222,
+        "cohort_sizes": [
+          2,
+          8,
+          9,
+          32,
+          128
+        ],
+        "orders": [
+          "ordered",
+          "reversed"
+        ],
+        "shared_and_per_slot_activations": true,
+        "padded_id_rows": true,
+        "repeated_and_varying_expert_ids": true,
+        "shared_per_slot_scale": true,
+        "uniform_imatrix_when_required": true,
+        "disable_mmvq": null,
+        "force_mmvq": null,
+        "disable_f16": null,
+        "disable_fusion": null,
+        "actual_dispatch_observed": false,
+        "model_or_performance_claim": false
+      }
+    },
+    "id-shape-vulkan-expert": {
+      "log": {
+        "path": "build-rerot-hardening-20261019/id-shape-vulkan-expert.log",
+        "bytes": 1006,
+        "sha256": "6364b2c377a813a74c900d37cb0b6f072b628d4eac807a22aee5e300835501b0"
+      },
+      "result": {
+        "status": "pass",
+        "device": "Vulkan0",
+        "backend": "Vulkan0",
+        "matmul_id_mode": "batch_invariant_native_quantized",
+        "reference": "native_default_single_column",
+        "default_setter_omitted": true,
+        "types": [
+          "iq3_s",
+          "iq4_nl",
+          "q8_0",
+          "q4_K"
+        ],
+        "graphs": 1114,
+        "reference_graphs": 683,
+        "native_control_graphs": 39,
+        "cohort_graphs": 384,
+        "bitwise_comparisons": 431,
+        "boundary_graphs": 8,
+        "boundary_flattened_slots": 65540,
+        "bias_graphs": 222,
+        "scale_graphs": 222,
+        "cohort_sizes": [
+          2,
+          8,
+          9,
+          32,
+          128
+        ],
+        "orders": [
+          "ordered",
+          "reversed"
+        ],
+        "shared_and_per_slot_activations": true,
+        "padded_id_rows": true,
+        "repeated_and_varying_expert_ids": true,
+        "shared_per_slot_scale": true,
+        "uniform_imatrix_when_required": true,
+        "disable_mmvq": null,
+        "force_mmvq": null,
+        "disable_f16": null,
+        "disable_fusion": null,
+        "actual_dispatch_observed": false,
+        "model_or_performance_claim": false
+      }
+    },
+    "quantized-shape-vulkan-expert": {
+      "log": {
+        "path": "build-rerot-hardening-20261019/quantized-shape-vulkan-expert.log",
+        "bytes": 544,
+        "sha256": "f64962c15f9f03869ba1b69665acc8c660ed997c5061b30dc446ee38dca8b786"
+      },
+      "result": {
+        "status": "pass",
+        "device": "Vulkan0",
+        "matmul_mode": "batch_invariant_native_quantized",
+        "reference": "native_default_single_column",
+        "types": [
+          "iq4_nl",
+          "q8_0",
+          "q4_K"
+        ],
+        "contiguous_operands": true,
+        "head_broadcast": true,
+        "cohort_sizes": [
+          2,
+          8,
+          9,
+          32,
+          128
+        ],
+        "graphs": 597,
+        "bitwise_comparisons": 90,
+        "bias_graphs": 18,
+        "force_mmvq": false,
+        "disable_mmvq": false
+      }
+    },
+    "cpu_whiteboard": {
+      "status": "PASS",
+      "receipt": {
+        "path": "build-rerot-hardening-20261019/whiteboard-cpu-expert/receipt.json",
+        "bytes": 615134,
+        "sha256": "c3f7e033a29c24260900f921288703400bac17b26c5b1ceaa338cdb8ba6c814a"
+      },
+      "qualifications": {
+        "phase_memory_invariance": {
+          "status": "PASS",
+          "expected_comparisons": 2,
+          "comparisons": [
+            {
+              "group": "0e65a21883ba3661-ubatch-128",
+              "reference_run": "01-ubatch-128-release-1",
+              "run": "05-ubatch-128-retain-1",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "0e65a21883ba3661-ubatch-1",
+              "reference_run": "03-ubatch-1-release-1",
+              "run": "07-ubatch-1-retain-1",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            }
+          ]
+        },
+        "same_shape_reproducibility": {
+          "status": "PASS",
+          "expected_comparisons": 4,
+          "comparisons": [
+            {
+              "group": "0e65a21883ba3661-ubatch-128",
+              "reference_run": "01-ubatch-128-release-1",
+              "run": "02-ubatch-128-release-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "0e65a21883ba3661-ubatch-1",
+              "reference_run": "03-ubatch-1-release-1",
+              "run": "04-ubatch-1-release-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "0e65a21883ba3661-ubatch-128",
+              "reference_run": "05-ubatch-128-retain-1",
+              "run": "06-ubatch-128-retain-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "0e65a21883ba3661-ubatch-1",
+              "reference_run": "07-ubatch-1-retain-1",
+              "run": "08-ubatch-1-retain-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            }
+          ]
+        },
+        "cross_shape_greedy_equivalence": {
+          "status": "PASS",
+          "explicitly_required": true,
+          "expected_comparisons": 1,
+          "observations": [
+            {
+              "reference_group": "0e65a21883ba3661-ubatch-128",
+              "group": "0e65a21883ba3661-ubatch-1",
+              "reference_run": "01-ubatch-128-release-1",
+              "run": "03-ubatch-1-release-1",
+              "greedy_trajectory_equal": true
+            }
+          ],
+          "scope": "observed executed shapes only; no general native batch-invariance claim"
+        },
+        "incremental_whiteboard_contract": {
+          "status": "PASS",
+          "expected_runs": 8,
+          "passed_runs": 8
+        }
+      },
+      "runs": [
+        {
+          "name": "01-ubatch-128-release-1",
+          "status": "PASS",
+          "ubatch_size": 128,
+          "phase_mode": "release",
+          "repetition": 1,
+          "frontiers": 764,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 336,
+            "4": 174,
+            "5": 142
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "release",
+            "releases": [
+              {
+                "before_frontier": 2,
+                "before": 75561120,
+                "after": 0
+              },
+              {
+                "before_frontier": 108,
+                "before": 75561120,
+                "after": 0
+              },
+              {
+                "before_frontier": 446,
+                "before": 1758848,
+                "after": 0
+              },
+              {
+                "before_frontier": 622,
+                "before": 1957024,
+                "after": 0
+              }
+            ]
+          },
+          "token_trajectory_sha256": "e64439aff455f0f74a0e9c70b6b63dbc5dc119034349cb77a85e90387ed60cad",
+          "seconds": 32.00531230587512,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/01-ubatch-128-release-1.stdout.jsonl",
+            "bytes": 760260,
+            "sha256": "ab7cbbae4c41465804a5f59dd1577995db99e0b2d9ae54d8d4505f5bb0d4295f"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/01-ubatch-128-release-1.stderr.log",
+            "bytes": 57016,
+            "sha256": "c2af70471c7e3b11df0c5bc88e55a4ba8d87d56785a150ebf7cba853f271dbd2"
+          }
+        },
+        {
+          "name": "02-ubatch-128-release-2",
+          "status": "PASS",
+          "ubatch_size": 128,
+          "phase_mode": "release",
+          "repetition": 2,
+          "frontiers": 764,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 336,
+            "4": 174,
+            "5": 142
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "release",
+            "releases": [
+              {
+                "before_frontier": 2,
+                "before": 75561120,
+                "after": 0
+              },
+              {
+                "before_frontier": 108,
+                "before": 75561120,
+                "after": 0
+              },
+              {
+                "before_frontier": 446,
+                "before": 1758848,
+                "after": 0
+              },
+              {
+                "before_frontier": 622,
+                "before": 1957024,
+                "after": 0
+              }
+            ]
+          },
+          "token_trajectory_sha256": "e64439aff455f0f74a0e9c70b6b63dbc5dc119034349cb77a85e90387ed60cad",
+          "seconds": 32.18499457789585,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/02-ubatch-128-release-2.stdout.jsonl",
+            "bytes": 760260,
+            "sha256": "ab7cbbae4c41465804a5f59dd1577995db99e0b2d9ae54d8d4505f5bb0d4295f"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/02-ubatch-128-release-2.stderr.log",
+            "bytes": 57016,
+            "sha256": "4ab0d9d603cfc9012f1eddcc8b127ff8a4be07ba22bfe127cb90995a2f8d88f4"
+          }
+        },
+        {
+          "name": "03-ubatch-1-release-1",
+          "status": "PASS",
+          "ubatch_size": 1,
+          "phase_mode": "release",
+          "repetition": 1,
+          "frontiers": 764,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 336,
+            "4": 174,
+            "5": 142
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "release",
+            "releases": [
+              {
+                "before_frontier": 2,
+                "before": 1757344,
+                "after": 0
+              },
+              {
+                "before_frontier": 108,
+                "before": 1757344,
+                "after": 0
+              },
+              {
+                "before_frontier": 446,
+                "before": 1758848,
+                "after": 0
+              },
+              {
+                "before_frontier": 622,
+                "before": 1957024,
+                "after": 0
+              }
+            ]
+          },
+          "token_trajectory_sha256": "e64439aff455f0f74a0e9c70b6b63dbc5dc119034349cb77a85e90387ed60cad",
+          "seconds": 32.75201558833942,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/03-ubatch-1-release-1.stdout.jsonl",
+            "bytes": 760256,
+            "sha256": "610b29d2de6f52e9a03c2387767264b62c6b979bbc8180bcf99cb915101dbcd5"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/03-ubatch-1-release-1.stderr.log",
+            "bytes": 56996,
+            "sha256": "97772bab156676b433f663470eaeb7ee4909ef5b4c38643dfeb4af9c869e4b8f"
+          }
+        },
+        {
+          "name": "04-ubatch-1-release-2",
+          "status": "PASS",
+          "ubatch_size": 1,
+          "phase_mode": "release",
+          "repetition": 2,
+          "frontiers": 764,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 336,
+            "4": 174,
+            "5": 142
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "release",
+            "releases": [
+              {
+                "before_frontier": 2,
+                "before": 1757344,
+                "after": 0
+              },
+              {
+                "before_frontier": 108,
+                "before": 1757344,
+                "after": 0
+              },
+              {
+                "before_frontier": 446,
+                "before": 1758848,
+                "after": 0
+              },
+              {
+                "before_frontier": 622,
+                "before": 1957024,
+                "after": 0
+              }
+            ]
+          },
+          "token_trajectory_sha256": "e64439aff455f0f74a0e9c70b6b63dbc5dc119034349cb77a85e90387ed60cad",
+          "seconds": 32.85060647316277,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/04-ubatch-1-release-2.stdout.jsonl",
+            "bytes": 760256,
+            "sha256": "610b29d2de6f52e9a03c2387767264b62c6b979bbc8180bcf99cb915101dbcd5"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/04-ubatch-1-release-2.stderr.log",
+            "bytes": 56996,
+            "sha256": "5ddbd49b52683485f4e356c0bbc79e10682952f7b2ece4e3aedbacd937a59250"
+          }
+        },
+        {
+          "name": "05-ubatch-128-retain-1",
+          "status": "PASS",
+          "ubatch_size": 128,
+          "phase_mode": "retain",
+          "repetition": 1,
+          "frontiers": 764,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 336,
+            "4": 174,
+            "5": 142
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "retain",
+            "releases": []
+          },
+          "token_trajectory_sha256": "e64439aff455f0f74a0e9c70b6b63dbc5dc119034349cb77a85e90387ed60cad",
+          "seconds": 32.78873905632645,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/05-ubatch-128-retain-1.stdout.jsonl",
+            "bytes": 760039,
+            "sha256": "40ea0812bd274d95027c72db1d1908ec22b02af8816cb2b248f1dacfe16e8429"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/05-ubatch-128-retain-1.stderr.log",
+            "bytes": 57011,
+            "sha256": "df87893807d5f77ddf8dafd0ed887358ace4a3cb65c0119cac00da33063058fa"
+          }
+        },
+        {
+          "name": "06-ubatch-128-retain-2",
+          "status": "PASS",
+          "ubatch_size": 128,
+          "phase_mode": "retain",
+          "repetition": 2,
+          "frontiers": 764,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 336,
+            "4": 174,
+            "5": 142
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "retain",
+            "releases": []
+          },
+          "token_trajectory_sha256": "e64439aff455f0f74a0e9c70b6b63dbc5dc119034349cb77a85e90387ed60cad",
+          "seconds": 32.922426767647266,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/06-ubatch-128-retain-2.stdout.jsonl",
+            "bytes": 760039,
+            "sha256": "40ea0812bd274d95027c72db1d1908ec22b02af8816cb2b248f1dacfe16e8429"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/06-ubatch-128-retain-2.stderr.log",
+            "bytes": 57010,
+            "sha256": "0d837d277b0dee7ed7e30985354712fd09e92c4452655c2cda2a9389b6d425f7"
+          }
+        },
+        {
+          "name": "07-ubatch-1-retain-1",
+          "status": "PASS",
+          "ubatch_size": 1,
+          "phase_mode": "retain",
+          "repetition": 1,
+          "frontiers": 764,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 336,
+            "4": 174,
+            "5": 142
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "retain",
+            "releases": []
+          },
+          "token_trajectory_sha256": "e64439aff455f0f74a0e9c70b6b63dbc5dc119034349cb77a85e90387ed60cad",
+          "seconds": 32.89937116019428,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/07-ubatch-1-retain-1.stdout.jsonl",
+            "bytes": 760037,
+            "sha256": "9c5fe3d31574d41c43230b9f027537112348322e1f3926812354e05729937d22"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/07-ubatch-1-retain-1.stderr.log",
+            "bytes": 56996,
+            "sha256": "ad6fbcceaeee0d2cb1b6238b33f4b86c2794473e4fdfd01fa0a5e29023ab367d"
+          }
+        },
+        {
+          "name": "08-ubatch-1-retain-2",
+          "status": "PASS",
+          "ubatch_size": 1,
+          "phase_mode": "retain",
+          "repetition": 2,
+          "frontiers": 764,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 336,
+            "4": 174,
+            "5": 142
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "retain",
+            "releases": []
+          },
+          "token_trajectory_sha256": "e64439aff455f0f74a0e9c70b6b63dbc5dc119034349cb77a85e90387ed60cad",
+          "seconds": 32.41392291802913,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/08-ubatch-1-retain-2.stdout.jsonl",
+            "bytes": 760037,
+            "sha256": "9c5fe3d31574d41c43230b9f027537112348322e1f3926812354e05729937d22"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-cpu-expert/08-ubatch-1-retain-2.stderr.log",
+            "bytes": 56996,
+            "sha256": "f953f62c90e266363952a00ff3430e93f4015b6a58cccb8cc89f6c75d89c51fd"
+          }
+        }
+      ],
+      "first_run_argv": [
+        "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/isolation-expert/delivered/bin/tq-rerot-compose",
+        "--model",
+        "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "--prompt",
+        "This is a short copying exercise on a shared whiteboard. Both writers may give the same answer; agreement is expected. Give the requested brief reply and finish your turn.",
+        "--synthesis",
+        "Reply with the single word complete.",
+        "--parallel",
+        "2",
+        "--ctx-size",
+        "4096",
+        "--batch-size",
+        "512",
+        "--threads",
+        "4",
+        "--gpu-layers",
+        "0",
+        "--split-mode",
+        "none",
+        "--worker-tokens",
+        "512",
+        "--final-tokens",
+        "512",
+        "--seed",
+        "0",
+        "--temperature",
+        "0",
+        "--json",
+        "--stage",
+        "writer_a=Reply with only this sentence: Shared work brings us to the same answer.",
+        "--stage",
+        "writer_b=Reply with only this sentence: Shared work brings us to the same answer.",
+        "--stage",
+        "observer=This turn is the observer's task. The earlier copying instructions belong to the writers. Read their shared work. Reply with exactly the literal lowercase word \"observed\" (without quotation marks), then finish your turn.",
+        "--stage",
+        "ready=Reply with the single word ready.",
+        "--after",
+        "ready=writer_a",
+        "--after",
+        "ready=writer_b",
+        "--after",
+        "ready=observer",
+        "--total-kv",
+        "4096",
+        "--ubatch-size",
+        "128",
+        "--phase-memory"
+      ],
+      "first_run_config": {
+        "event": "config",
+        "provider": "native-a",
+        "submission_domains": 1,
+        "profile": "assistant-eot",
+        "workers": 4,
+        "parallel": 2,
+        "base_tokens": 43,
+        "logical_context": 4096,
+        "physical_kv": 4096,
+        "required_physical_kv": 2746,
+        "required_reader_context": 2742,
+        "logical_sequences": 6,
+        "physical_recurrent_slots_requested": 3,
+        "split_mode_requested": "none",
+        "devices_requested": "",
+        "devices": [
+          {
+            "name": "CPU",
+            "description": "AMD Ryzen 5 7500F 6-Core Processor",
+            "scope": "available"
+          }
+        ],
+        "native_context": {
+          "pipeline_parallel_enabled": false,
+          "flash_attention_configured": false,
+          "batch_invariant_matmul_requested": true,
+          "batch_size": 512,
+          "ubatch_size": 128,
+          "kv_type_k": "f32",
+          "kv_type_v": "f32",
+          "reader_kv_policy": "resident-f32",
+          "reader_kv_policy_reason": "This reader implementation accepts only resident F32 K and V; other types need a verified reader precision path.",
+          "model_devices": []
+        },
+        "gpu_layers_requested": 0,
+        "phase_memory": true,
+        "seed": 0,
+        "temperature": 0,
+        "synthesis_stage": 5
+      },
+      "driver": {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/fork/rerot-compose/tests/real-whiteboard.py",
+        "bytes": 41444,
+        "sha256": "e05fba401a2019ab2f42e58047544d04f04acaf3cae3cc73ba26b19c5053b69c"
+      },
+      "scope": "real installed C whiteboard contract plus requested phase/repetition controls within each execution shape",
+      "not_qualified_by_this_harness": [
+        "reader attention numerical equivalence",
+        "whole-model TP5",
+        "LateBind",
+        "MTP",
+        "MMVQ kernel dispatch",
+        "performance benefit"
+      ],
+      "first_run_placement": {
+        "offloaded_layers": 0,
+        "model_buffer_devices": [],
+        "evidence": "actual model load log; device enumeration alone is excluded"
+      },
+      "context_shapes": [
+        {
+          "name": "01-ubatch-128-release-1",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 128
+          }
+        },
+        {
+          "name": "02-ubatch-128-release-2",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 128
+          }
+        },
+        {
+          "name": "03-ubatch-1-release-1",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 1
+          }
+        },
+        {
+          "name": "04-ubatch-1-release-2",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 1
+          }
+        },
+        {
+          "name": "05-ubatch-128-retain-1",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 128
+          }
+        },
+        {
+          "name": "06-ubatch-128-retain-2",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 128
+          }
+        },
+        {
+          "name": "07-ubatch-1-retain-1",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 1
+          }
+        },
+        {
+          "name": "08-ubatch-1-retain-2",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 1
+          }
+        }
+      ]
+    },
+    "cpu_process_failure": {
+      "status": "PASS",
+      "receipt": {
+        "path": "build-rerot-hardening-20261019/interrupt-cpu-expert/receipt.json",
+        "bytes": 10060,
+        "sha256": "23dfbcae7f0f43537041ec4cb24600fef90ef183018295db523dfecfa17057dd"
+      },
+      "runs": [
+        {
+          "kind": "sigint",
+          "status": "PASS",
+          "returncode": 130,
+          "seconds_after_injection": 0.16030124481767416,
+          "timed_out": false,
+          "forced_cleanup": [],
+          "injection": {
+            "kind": "sigint",
+            "at_seconds": 2.9307664800435305,
+            "after_observed_events": 13,
+            "after_committed_frontier": 3,
+            "after_committed_revision": 4,
+            "after_live_body_cohorts": 2,
+            "signal": "SIGINT"
+          },
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/interrupt-cpu-expert/01-sigint-1.stdout.jsonl",
+            "bytes": 3987,
+            "sha256": "a22019d0b68b5431c0dfa6e7772e7fd62af6386fbd8f1c75501aa0169178c4f6"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/interrupt-cpu-expert/01-sigint-1.stderr.log",
+            "bytes": 57347,
+            "sha256": "c1bea22458e138a21bdd83712fa48b819b97bb7260a3f483dcbf97c15986ab6a"
+          },
+          "not_qualified_by_this_run": [
+            "exact native in-flight state at signal delivery",
+            "independent device-drain proof",
+            "attention numerics",
+            "absence of unobserved stdout after the broken-pipe injection"
+          ]
+        },
+        {
+          "kind": "broken-pipe",
+          "status": "PASS",
+          "returncode": 1,
+          "seconds_after_injection": 0.21554678957909346,
+          "timed_out": false,
+          "forced_cleanup": [],
+          "injection": {
+            "kind": "broken-pipe",
+            "at_seconds": 2.9284887411631644,
+            "after_observed_events": 13,
+            "after_committed_frontier": 3,
+            "after_committed_revision": 4,
+            "after_live_body_cohorts": 2,
+            "operation": "close sole stdout read end"
+          },
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/interrupt-cpu-expert/02-broken-pipe-1.stdout.jsonl",
+            "bytes": 3906,
+            "sha256": "80c2a5f0ea4a507d66d4c6c3d5a29fb3c897965e0c44394d95293fce7d2f7199"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/interrupt-cpu-expert/02-broken-pipe-1.stderr.log",
+            "bytes": 57050,
+            "sha256": "647e1ec306a876188ba0e7baaf76b2be1e2d7e04b39aba17149144577acf9e2f"
+          },
+          "not_qualified_by_this_run": [
+            "exact native in-flight state at signal delivery",
+            "independent device-drain proof",
+            "attention numerics",
+            "absence of unobserved stdout after the broken-pipe injection"
+          ]
+        }
+      ]
+    },
+    "cpu_reader": {
+      "log": {
+        "path": "build-rerot-hardening-20261019/reader-strict-cpu-expert.log",
+        "bytes": 174869,
+        "sha256": "0eda86c8c7ac9a4cef9581cd322a2640de6edbd42f265edd2325b5265b2f5e37"
+      },
+      "status": "PASS",
+      "scope": "real full-model teacher-forced logits",
+      "keep_going_diagnostics": false,
+      "failed_comparisons": 0,
+      "hybrid_model": true,
+      "kv_type": "f32",
+      "batch_invariant_matmul": true,
+      "logical_sequences_requested": 8,
+      "physical_recurrent_slots_requested": 3,
+      "q_heads": 32,
+      "kv_heads": 0,
+      "logit_comparisons": 31,
+      "equivalence_max_abs": 0,
+      "cross_shape_logit_comparisons": 12,
+      "cross_shape_max_abs": 0,
+      "first_peer_effect_max_abs": 4.973962783813477,
+      "next_peer_effect_max_abs": 1.8032455444335938,
+      "invalid_views_rejected": 6,
+      "full_recurrent_pool_rejections": 1,
+      "actual_decode_calls": 72,
+      "actual_input_rows": 169,
+      "qualifications": {
+        "same_shape_attention_and_lifecycle": {
+          "status": "PASS",
+          "comparisons": 33,
+          "failed_comparisons": 0
+        },
+        "cross_shape_equivalence": {
+          "status": "PASS",
+          "explicitly_required": true,
+          "observed_comparisons": 12,
+          "observed_failed_comparisons": 0,
+          "scope": "executed batch and serial shapes only; no general native batch-invariance claim"
+        }
+      }
+    },
+    "cpu_f64_oracle": {
+      "status": "PASS",
+      "log": {
+        "path": "build-rerot-hardening-20261019/seams-cpu-expert/Testing/Temporary/LastTest.log",
+        "bytes": 191357,
+        "sha256": "9b25c22d4ff0117bbb90f26c150f4f3ce794a2a6701b35cc9b1c23a8e3d02b7d"
+      },
+      "cases": 16,
+      "reader_f64_max_abs": 6.75223405188774e-7,
+      "ordinary_f64_max_abs": 3.7782220707605063e-7,
+      "unsupported_profile_checks": 7,
+      "scope": "Actual tiny GGUF A execution with an independent F64 oracle; not a full 8B-model F64 reference."
+    },
+    "vulkan_whiteboard": {
+      "status": "PASS",
+      "receipt": {
+        "path": "build-rerot-hardening-20261019/whiteboard-vulkan-expert/receipt.json",
+        "bytes": 607052,
+        "sha256": "720823809d33a9eed73c94a6f71380d9a4808768f5692f2d7c91676f190c2fe3"
+      },
+      "qualifications": {
+        "phase_memory_invariance": {
+          "status": "PASS",
+          "expected_comparisons": 2,
+          "comparisons": [
+            {
+              "group": "088b6084304f20a9-ubatch-128",
+              "reference_run": "01-ubatch-128-release-1",
+              "run": "05-ubatch-128-retain-1",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "088b6084304f20a9-ubatch-1",
+              "reference_run": "03-ubatch-1-release-1",
+              "run": "07-ubatch-1-retain-1",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            }
+          ]
+        },
+        "same_shape_reproducibility": {
+          "status": "PASS",
+          "expected_comparisons": 4,
+          "comparisons": [
+            {
+              "group": "088b6084304f20a9-ubatch-128",
+              "reference_run": "01-ubatch-128-release-1",
+              "run": "02-ubatch-128-release-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "088b6084304f20a9-ubatch-1",
+              "reference_run": "03-ubatch-1-release-1",
+              "run": "04-ubatch-1-release-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "088b6084304f20a9-ubatch-128",
+              "reference_run": "05-ubatch-128-retain-1",
+              "run": "06-ubatch-128-retain-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            },
+            {
+              "group": "088b6084304f20a9-ubatch-1",
+              "reference_run": "07-ubatch-1-retain-1",
+              "run": "08-ubatch-1-retain-2",
+              "status": "PASS",
+              "greedy_trajectory_equal": true
+            }
+          ]
+        },
+        "cross_shape_greedy_equivalence": {
+          "status": "PASS",
+          "explicitly_required": true,
+          "expected_comparisons": 1,
+          "observations": [
+            {
+              "reference_group": "088b6084304f20a9-ubatch-128",
+              "group": "088b6084304f20a9-ubatch-1",
+              "reference_run": "01-ubatch-128-release-1",
+              "run": "03-ubatch-1-release-1",
+              "greedy_trajectory_equal": true
+            }
+          ],
+          "scope": "observed executed shapes only; no general native batch-invariance claim"
+        },
+        "incremental_whiteboard_contract": {
+          "status": "PASS",
+          "expected_runs": 8,
+          "passed_runs": 8
+        }
+      },
+      "runs": [
+        {
+          "name": "01-ubatch-128-release-1",
+          "status": "PASS",
+          "ubatch_size": 128,
+          "phase_mode": "release",
+          "repetition": 1,
+          "frontiers": 748,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 327,
+            "4": 148,
+            "5": 161
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "release",
+            "releases": [
+              {
+                "before_frontier": 2,
+                "before": 350938704,
+                "after": 0
+              },
+              {
+                "before_frontier": 108,
+                "before": 350938704,
+                "after": 0
+              },
+              {
+                "before_frontier": 437,
+                "before": 280607768,
+                "after": 0
+              },
+              {
+                "before_frontier": 587,
+                "before": 281143620,
+                "after": 0
+              }
+            ]
+          },
+          "token_trajectory_sha256": "c333a02d0f75ee4334e5de25523a03c530cd71efc202a0719efbb3ba286dce83",
+          "seconds": 19.690423955209553,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/01-ubatch-128-release-1.stdout.jsonl",
+            "bytes": 748564,
+            "sha256": "094742263fee847da10db49df23a6d8ca7f7f7228c6c432b8b37f645ad64897d"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/01-ubatch-128-release-1.stderr.log",
+            "bytes": 54036,
+            "sha256": "4d48449654108a7562e06d5e59b0cb1ade385ae39dec98c3e8448222ca41c19c"
+          }
+        },
+        {
+          "name": "02-ubatch-128-release-2",
+          "status": "PASS",
+          "ubatch_size": 128,
+          "phase_mode": "release",
+          "repetition": 2,
+          "frontiers": 748,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 327,
+            "4": 148,
+            "5": 161
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "release",
+            "releases": [
+              {
+                "before_frontier": 2,
+                "before": 350938704,
+                "after": 0
+              },
+              {
+                "before_frontier": 108,
+                "before": 350938704,
+                "after": 0
+              },
+              {
+                "before_frontier": 437,
+                "before": 280607768,
+                "after": 0
+              },
+              {
+                "before_frontier": 587,
+                "before": 281143620,
+                "after": 0
+              }
+            ]
+          },
+          "token_trajectory_sha256": "c333a02d0f75ee4334e5de25523a03c530cd71efc202a0719efbb3ba286dce83",
+          "seconds": 19.814170020166785,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/02-ubatch-128-release-2.stdout.jsonl",
+            "bytes": 748564,
+            "sha256": "094742263fee847da10db49df23a6d8ca7f7f7228c6c432b8b37f645ad64897d"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/02-ubatch-128-release-2.stderr.log",
+            "bytes": 54036,
+            "sha256": "7c28af6a209cf771a38198db08453382cb35d2c5dde15a4a5159a4e83b819171"
+          }
+        },
+        {
+          "name": "03-ubatch-1-release-1",
+          "status": "PASS",
+          "ubatch_size": 1,
+          "phase_mode": "release",
+          "repetition": 1,
+          "frontiers": 748,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 327,
+            "4": 148,
+            "5": 161
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "release",
+            "releases": [
+              {
+                "before_frontier": 2,
+                "before": 280232028,
+                "after": 0
+              },
+              {
+                "before_frontier": 108,
+                "before": 280262952,
+                "after": 0
+              },
+              {
+                "before_frontier": 437,
+                "before": 280607768,
+                "after": 0
+              },
+              {
+                "before_frontier": 587,
+                "before": 281143620,
+                "after": 0
+              }
+            ]
+          },
+          "token_trajectory_sha256": "c333a02d0f75ee4334e5de25523a03c530cd71efc202a0719efbb3ba286dce83",
+          "seconds": 21.0350353801623,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/03-ubatch-1-release-1.stdout.jsonl",
+            "bytes": 748562,
+            "sha256": "103143afe423659f7f8d0f5e6b478f297ef9cad74e4f1dbdbbe272823cadc0ca"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/03-ubatch-1-release-1.stderr.log",
+            "bytes": 54016,
+            "sha256": "97949ac3010243b417040df0ef30fc1b4623b43ca5a37ceb0b5feaeb8c8ed01c"
+          }
+        },
+        {
+          "name": "04-ubatch-1-release-2",
+          "status": "PASS",
+          "ubatch_size": 1,
+          "phase_mode": "release",
+          "repetition": 2,
+          "frontiers": 748,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 327,
+            "4": 148,
+            "5": 161
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "release",
+            "releases": [
+              {
+                "before_frontier": 2,
+                "before": 280232028,
+                "after": 0
+              },
+              {
+                "before_frontier": 108,
+                "before": 280262952,
+                "after": 0
+              },
+              {
+                "before_frontier": 437,
+                "before": 280607768,
+                "after": 0
+              },
+              {
+                "before_frontier": 587,
+                "before": 281143620,
+                "after": 0
+              }
+            ]
+          },
+          "token_trajectory_sha256": "c333a02d0f75ee4334e5de25523a03c530cd71efc202a0719efbb3ba286dce83",
+          "seconds": 20.72752494830638,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/04-ubatch-1-release-2.stdout.jsonl",
+            "bytes": 748562,
+            "sha256": "103143afe423659f7f8d0f5e6b478f297ef9cad74e4f1dbdbbe272823cadc0ca"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/04-ubatch-1-release-2.stderr.log",
+            "bytes": 54016,
+            "sha256": "f63c22881f6a5e072b72ebad168e98efcf5a4981dd0ff4884743669f24b09c66"
+          }
+        },
+        {
+          "name": "05-ubatch-128-retain-1",
+          "status": "PASS",
+          "ubatch_size": 128,
+          "phase_mode": "retain",
+          "repetition": 1,
+          "frontiers": 748,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 327,
+            "4": 148,
+            "5": 161
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "retain",
+            "releases": []
+          },
+          "token_trajectory_sha256": "c333a02d0f75ee4334e5de25523a03c530cd71efc202a0719efbb3ba286dce83",
+          "seconds": 19.726355260703713,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/05-ubatch-128-retain-1.stdout.jsonl",
+            "bytes": 748337,
+            "sha256": "653a01b35779c349150c39bf0b0e4bbc7859075f7c1186fb5799b9eaecafd84c"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/05-ubatch-128-retain-1.stderr.log",
+            "bytes": 54029,
+            "sha256": "a717558c9489b8c14dafa44bc34dd5a8861fdfa67f358927d8a37e035a1865a4"
+          }
+        },
+        {
+          "name": "06-ubatch-128-retain-2",
+          "status": "PASS",
+          "ubatch_size": 128,
+          "phase_mode": "retain",
+          "repetition": 2,
+          "frontiers": 748,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 327,
+            "4": 148,
+            "5": 161
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "retain",
+            "releases": []
+          },
+          "token_trajectory_sha256": "c333a02d0f75ee4334e5de25523a03c530cd71efc202a0719efbb3ba286dce83",
+          "seconds": 19.838477979879826,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/06-ubatch-128-retain-2.stdout.jsonl",
+            "bytes": 748337,
+            "sha256": "653a01b35779c349150c39bf0b0e4bbc7859075f7c1186fb5799b9eaecafd84c"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/06-ubatch-128-retain-2.stderr.log",
+            "bytes": 54029,
+            "sha256": "2b8db8bd3771d535d77f8fcdc75ad0e201fade672c715b24dc442f4c5beecea4"
+          }
+        },
+        {
+          "name": "07-ubatch-1-retain-1",
+          "status": "PASS",
+          "ubatch_size": 1,
+          "phase_mode": "retain",
+          "repetition": 1,
+          "frontiers": 748,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 327,
+            "4": 148,
+            "5": 161
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "retain",
+            "releases": []
+          },
+          "token_trajectory_sha256": "c333a02d0f75ee4334e5de25523a03c530cd71efc202a0719efbb3ba286dce83",
+          "seconds": 21.191743220668286,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/07-ubatch-1-retain-1.stdout.jsonl",
+            "bytes": 748335,
+            "sha256": "7f8b87b59a6ec9e9dbc2dfdc239d83ac1b51bd3420759c723413186e5949b555"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/07-ubatch-1-retain-1.stderr.log",
+            "bytes": 54016,
+            "sha256": "13a7de1ccb34cb03a91deee1e8e255fecd0d777252141be22e8b43bbc0fda245"
+          }
+        },
+        {
+          "name": "08-ubatch-1-retain-2",
+          "status": "PASS",
+          "ubatch_size": 1,
+          "phase_mode": "retain",
+          "repetition": 2,
+          "frontiers": 748,
+          "live_peer_reads": 208,
+          "body_tokens_by_stage": {
+            "1": 104,
+            "2": 104,
+            "3": 327,
+            "4": 148,
+            "5": 161
+          },
+          "frame_tokens_by_stage": {
+            "1": 25,
+            "2": 25,
+            "3": 54,
+            "4": 17,
+            "5": 17
+          },
+          "phase_memory": {
+            "status": "PASS",
+            "mode": "retain",
+            "releases": []
+          },
+          "token_trajectory_sha256": "c333a02d0f75ee4334e5de25523a03c530cd71efc202a0719efbb3ba286dce83",
+          "seconds": 21.217731169890612,
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/08-ubatch-1-retain-2.stdout.jsonl",
+            "bytes": 748335,
+            "sha256": "7f8b87b59a6ec9e9dbc2dfdc239d83ac1b51bd3420759c723413186e5949b555"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/whiteboard-vulkan-expert/08-ubatch-1-retain-2.stderr.log",
+            "bytes": 54016,
+            "sha256": "c146d386f874b1fba30a6b3892506ee2f8b235521cfa0bce7dfe2cb9bbce093e"
+          }
+        }
+      ],
+      "first_run_argv": [
+        "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/bin/tq-rerot-compose",
+        "--model",
+        "/home/kunweiz/models/lfm25/LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+        "--prompt",
+        "This is a short copying exercise on a shared whiteboard. Both writers may give the same answer; agreement is expected. Give the requested brief reply and finish your turn.",
+        "--synthesis",
+        "Reply with the single word complete.",
+        "--parallel",
+        "2",
+        "--ctx-size",
+        "4096",
+        "--batch-size",
+        "512",
+        "--threads",
+        "4",
+        "--gpu-layers",
+        "99",
+        "--split-mode",
+        "layer",
+        "--worker-tokens",
+        "512",
+        "--final-tokens",
+        "512",
+        "--seed",
+        "0",
+        "--temperature",
+        "0",
+        "--json",
+        "--stage",
+        "writer_a=Reply with only this sentence: Shared work brings us to the same answer.",
+        "--stage",
+        "writer_b=Reply with only this sentence: Shared work brings us to the same answer.",
+        "--stage",
+        "observer=This turn is the observer's task. The earlier copying instructions belong to the writers. Read their shared work. Reply with exactly the literal lowercase word \"observed\" (without quotation marks), then finish your turn.",
+        "--stage",
+        "ready=Reply with the single word ready.",
+        "--after",
+        "ready=writer_a",
+        "--after",
+        "ready=writer_b",
+        "--after",
+        "ready=observer",
+        "--total-kv",
+        "4096",
+        "--devices",
+        "Vulkan0",
+        "--ubatch-size",
+        "128",
+        "--phase-memory"
+      ],
+      "first_run_config": {
+        "event": "config",
+        "provider": "native-a",
+        "submission_domains": 1,
+        "profile": "assistant-eot",
+        "workers": 4,
+        "parallel": 2,
+        "base_tokens": 43,
+        "logical_context": 4096,
+        "physical_kv": 4096,
+        "required_physical_kv": 2746,
+        "required_reader_context": 2742,
+        "logical_sequences": 6,
+        "physical_recurrent_slots_requested": 3,
+        "split_mode_requested": "layer",
+        "devices_requested": "Vulkan0",
+        "devices": [
+          {
+            "name": "Vulkan0",
+            "description": "AMD Radeon RX 6800 (RADV NAVI21)",
+            "scope": "available"
+          },
+          {
+            "name": "CPU",
+            "description": "AMD Ryzen 5 7500F 6-Core Processor",
+            "scope": "available"
+          }
+        ],
+        "native_context": {
+          "pipeline_parallel_enabled": false,
+          "flash_attention_configured": false,
+          "batch_invariant_matmul_requested": true,
+          "batch_size": 512,
+          "ubatch_size": 128,
+          "kv_type_k": "f32",
+          "kv_type_v": "f32",
+          "reader_kv_policy": "resident-f32",
+          "reader_kv_policy_reason": "This reader implementation accepts only resident F32 K and V; other types need a verified reader precision path.",
+          "model_devices": [
+            {
+              "name": "Vulkan0",
+              "description": "AMD Radeon RX 6800 (RADV NAVI21)",
+              "scope": "model-selected"
+            }
+          ]
+        },
+        "gpu_layers_requested": 99,
+        "phase_memory": true,
+        "seed": 0,
+        "temperature": 0,
+        "synthesis_stage": 5
+      },
+      "driver": {
+        "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/fork/rerot-compose/tests/real-whiteboard.py",
+        "bytes": 41444,
+        "sha256": "e05fba401a2019ab2f42e58047544d04f04acaf3cae3cc73ba26b19c5053b69c"
+      },
+      "scope": "real installed C whiteboard contract plus requested phase/repetition controls within each execution shape",
+      "not_qualified_by_this_harness": [
+        "reader attention numerical equivalence",
+        "whole-model TP5",
+        "LateBind",
+        "MTP",
+        "MMVQ kernel dispatch",
+        "performance benefit"
+      ],
+      "first_run_placement": {
+        "offloaded_layers": 25,
+        "model_buffer_devices": [
+          "Vulkan0"
+        ],
+        "evidence": "actual model load log; device enumeration alone is excluded"
+      },
+      "context_shapes": [
+        {
+          "name": "01-ubatch-128-release-1",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 128
+          }
+        },
+        {
+          "name": "02-ubatch-128-release-2",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 128
+          }
+        },
+        {
+          "name": "03-ubatch-1-release-1",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 1
+          }
+        },
+        {
+          "name": "04-ubatch-1-release-2",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 1
+          }
+        },
+        {
+          "name": "05-ubatch-128-retain-1",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 128
+          }
+        },
+        {
+          "name": "06-ubatch-128-retain-2",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 128
+          }
+        },
+        {
+          "name": "07-ubatch-1-retain-1",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 1
+          }
+        },
+        {
+          "name": "08-ubatch-1-retain-2",
+          "shape": {
+            "n_batch": 512,
+            "n_ubatch": 1
+          }
+        }
+      ]
+    },
+    "vulkan_process_failure": {
+      "status": "PASS",
+      "receipt": {
+        "path": "build-rerot-hardening-20261019/interrupt-vulkan-expert/receipt.json",
+        "bytes": 10481,
+        "sha256": "0e606c35da6059d15bbc6e2b4ff9c47ab31fae2361a72dfee3dfeb63582597e2"
+      },
+      "runs": [
+        {
+          "kind": "sigint",
+          "status": "PASS",
+          "returncode": 130,
+          "seconds_after_injection": 0.09983073407784104,
+          "timed_out": false,
+          "forced_cleanup": [],
+          "injection": {
+            "kind": "sigint",
+            "at_seconds": 4.28636137675494,
+            "after_observed_events": 13,
+            "after_committed_frontier": 3,
+            "after_committed_revision": 4,
+            "after_live_body_cohorts": 2,
+            "signal": "SIGINT"
+          },
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/interrupt-vulkan-expert/01-sigint-1.stdout.jsonl",
+            "bytes": 4178,
+            "sha256": "5bb06c6876ad6c739363a9881a7bbe3e88970bb0542cbb8602be9cef30cc76cc"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/interrupt-vulkan-expert/01-sigint-1.stderr.log",
+            "bytes": 54043,
+            "sha256": "e2d4b42d7efac65b9295fe3abd9c784e93acfe3b0261037dcecbd36829f0b0af"
+          },
+          "not_qualified_by_this_run": [
+            "exact native in-flight state at signal delivery",
+            "independent device-drain proof",
+            "attention numerics",
+            "absence of unobserved stdout after the broken-pipe injection"
+          ]
+        },
+        {
+          "kind": "broken-pipe",
+          "status": "PASS",
+          "returncode": 1,
+          "seconds_after_injection": 0.10016063181683421,
+          "timed_out": false,
+          "forced_cleanup": [],
+          "injection": {
+            "kind": "broken-pipe",
+            "at_seconds": 4.258829782251269,
+            "after_observed_events": 13,
+            "after_committed_frontier": 3,
+            "after_committed_revision": 4,
+            "after_live_body_cohorts": 2,
+            "operation": "close sole stdout read end"
+          },
+          "stdout": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/interrupt-vulkan-expert/02-broken-pipe-1.stdout.jsonl",
+            "bytes": 4097,
+            "sha256": "211ed796cdbad8eea2908c5a5bc46059b6f1bc7845dcf1bbfccff5901ba5f656"
+          },
+          "stderr": {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/interrupt-vulkan-expert/02-broken-pipe-1.stderr.log",
+            "bytes": 54063,
+            "sha256": "2ba699000d19392b6d9bb22899b1daae2eae534e20e9695204974f97cc7317a7"
+          },
+          "not_qualified_by_this_run": [
+            "exact native in-flight state at signal delivery",
+            "independent device-drain proof",
+            "attention numerics",
+            "absence of unobserved stdout after the broken-pipe injection"
+          ]
+        }
+      ]
+    },
+    "vulkan_reader": {
+      "log": {
+        "path": "build-rerot-hardening-20261019/reader-strict-vulkan-expert.log",
+        "bytes": 180685,
+        "sha256": "57db9bd63ac29e42e7a50749997fd82de5e998f1cf4d45afd06f9b619ba350e7"
+      },
+      "status": "PASS",
+      "scope": "real full-model teacher-forced logits",
+      "keep_going_diagnostics": false,
+      "failed_comparisons": 0,
+      "hybrid_model": true,
+      "kv_type": "f32",
+      "batch_invariant_matmul": true,
+      "logical_sequences_requested": 8,
+      "physical_recurrent_slots_requested": 3,
+      "q_heads": 32,
+      "kv_heads": 0,
+      "logit_comparisons": 31,
+      "equivalence_max_abs": 0.0000152587890625,
+      "cross_shape_logit_comparisons": 12,
+      "cross_shape_max_abs": 0.0000152587890625,
+      "first_peer_effect_max_abs": 3.6496286392211914,
+      "next_peer_effect_max_abs": 4.216282844543457,
+      "invalid_views_rejected": 6,
+      "full_recurrent_pool_rejections": 1,
+      "actual_decode_calls": 72,
+      "actual_input_rows": 169,
+      "qualifications": {
+        "same_shape_attention_and_lifecycle": {
+          "status": "PASS",
+          "comparisons": 33,
+          "failed_comparisons": 0
+        },
+        "cross_shape_equivalence": {
+          "status": "PASS",
+          "explicitly_required": true,
+          "observed_comparisons": 12,
+          "observed_failed_comparisons": 0,
+          "scope": "executed batch and serial shapes only; no general native batch-invariance claim"
+        }
+      }
+    },
+    "vulkan_f64_oracle": {
+      "status": "PASS",
+      "log": {
+        "path": "build-rerot-hardening-20261019/oracle-vulkan-expert.log",
+        "bytes": 177639,
+        "sha256": "44f780d54d4e36bd7980d2d01517de8ed595a8239cdb9dc07ba3e5f3e38148a2"
+      },
+      "cases": 16,
+      "reader_f64_max_abs": 6.539480768563699e-7,
+      "ordinary_f64_max_abs": 6.109807473286821e-7,
+      "unsupported_profile_checks": 0,
+      "scope": "Actual tiny GGUF A execution with an independent F64 oracle; not a full 8B-model F64 reference."
+    },
+    "debug_dispatch": {
+      "status": "PASS",
+      "scope": "Separate DEBUG Release installation; dispatch evidence only, not normal-build timing. Completed graph/fixture checks accompany pre-dispatch logger lines.",
+      "commands": {
+        "path": "build-rerot-hardening-20261019/dispatch-vulkan-expert/commands.json",
+        "bytes": 9233,
+        "sha256": "812e0e48e64abd6049c17d7a0ce9a2408a3913e31ad52b3461f8910251ee0ba0"
+      },
+      "mmvq_controls": [
+        {
+          "control": "auto",
+          "status": "PASS",
+          "policy": "auto",
+          "receipt": {
+            "path": "build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-auto-receipt.json",
+            "bytes": 4004,
+            "sha256": "06c1e01b877b2591ad982001e517898242513f17aaf9e31659e61e74496b935e"
+          },
+          "cases": [
+            {
+              "id": "q4_K-b1",
+              "type": "q4_k",
+              "columns": 1,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_k_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.2254425798032571
+            },
+            {
+              "id": "q4_K-b2",
+              "type": "q4_k",
+              "columns": 2,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_k_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.2254425798032571
+            },
+            {
+              "id": "q4_K-b8",
+              "type": "q4_k",
+              "columns": 8,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_k_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.2254425798032571
+            },
+            {
+              "id": "q4_0-b1",
+              "type": "q4_0",
+              "columns": 1,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_0_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.22472648252733052
+            },
+            {
+              "id": "q4_0-b2",
+              "type": "q4_0",
+              "columns": 2,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_0_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.22472648252733052
+            },
+            {
+              "id": "q4_0-b8",
+              "type": "q4_0",
+              "columns": 8,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_0_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.22472648252733052
+            },
+            {
+              "id": "iq4_nl-b1",
+              "type": "iq4_nl",
+              "columns": 1,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000006405190561054042
+            },
+            {
+              "id": "iq4_nl-b2",
+              "type": "iq4_nl",
+              "columns": 2,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000006878793101350311
+            },
+            {
+              "id": "iq4_nl-b8",
+              "type": "iq4_nl",
+              "columns": 8,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000007047753570077475
+            }
+          ],
+          "inputs": [
+            {
+              "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-auto.jsonl",
+              "sha256": "b79b0667c4eb7aeefb2228f419764af1a46672193101a6e1f6e0f24c612f3e65"
+            },
+            {
+              "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-auto.jsonl.stderr",
+              "sha256": "a83f829bef1422e0c4b88550778b251478413d77a9f07b160c2dae9f4081f4a0"
+            }
+          ],
+          "non_case_dispatch_records": 0
+        },
+        {
+          "control": "force",
+          "status": "PASS",
+          "policy": "force",
+          "receipt": {
+            "path": "build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-force-receipt.json",
+            "bytes": 4007,
+            "sha256": "a567f5fae525fb82ea172eb20675aad7d3764ef76bdbddc5290b271b97792320"
+          },
+          "cases": [
+            {
+              "id": "q4_K-b1",
+              "type": "q4_k",
+              "columns": 1,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_k_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.2254425798032571
+            },
+            {
+              "id": "q4_K-b2",
+              "type": "q4_k",
+              "columns": 2,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_k_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.2254425798032571
+            },
+            {
+              "id": "q4_K-b8",
+              "type": "q4_k",
+              "columns": 8,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_k_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.2254425798032571
+            },
+            {
+              "id": "q4_0-b1",
+              "type": "q4_0",
+              "columns": 1,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_0_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.22472648252733052
+            },
+            {
+              "id": "q4_0-b2",
+              "type": "q4_0",
+              "columns": 2,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_0_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.22472648252733052
+            },
+            {
+              "id": "q4_0-b8",
+              "type": "q4_0",
+              "columns": 8,
+              "route": "mmvq_q8_1",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "quantize_q8_1_x4": 3,
+                "mul_mat_vec_q4_0_q8_1_f32": 3
+              },
+              "reference": "q8_valid",
+              "max_abs_error": 0.22472648252733052
+            },
+            {
+              "id": "iq4_nl-b1",
+              "type": "iq4_nl",
+              "columns": 1,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000006405190561054042
+            },
+            {
+              "id": "iq4_nl-b2",
+              "type": "iq4_nl",
+              "columns": 2,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000006878793101350311
+            },
+            {
+              "id": "iq4_nl-b8",
+              "type": "iq4_nl",
+              "columns": 8,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000007047753570077475
+            }
+          ],
+          "inputs": [
+            {
+              "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-force.jsonl",
+              "sha256": "a71cc10a963b9ad4e534d148f05ebd768a644b57f11afc20d73d445d8e28ca3c"
+            },
+            {
+              "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-force.jsonl.stderr",
+              "sha256": "70695b134e61732aa18b84be65bfa91ab8dffaa5a836cd4d6a69ece81446deaf"
+            }
+          ],
+          "non_case_dispatch_records": 0
+        },
+        {
+          "control": "disable",
+          "status": "PASS",
+          "policy": "disable",
+          "receipt": {
+            "path": "build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-disable-receipt.json",
+            "bytes": 4017,
+            "sha256": "c0ec62ab1094c7886a01e6d552eed816a37e07a16a0f73396218d7d300cade32"
+          },
+          "cases": [
+            {
+              "id": "q4_K-b1",
+              "type": "q4_k",
+              "columns": 1,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_k_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000008203443485399475
+            },
+            {
+              "id": "q4_K-b2",
+              "type": "q4_k",
+              "columns": 2,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_k_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000008203443485399475
+            },
+            {
+              "id": "q4_K-b8",
+              "type": "q4_k",
+              "columns": 8,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_k_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000008203443485399475
+            },
+            {
+              "id": "q4_0-b1",
+              "type": "q4_0",
+              "columns": 1,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_0_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000005669760867021978
+            },
+            {
+              "id": "q4_0-b2",
+              "type": "q4_0",
+              "columns": 2,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_0_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.0000060910097090527415
+            },
+            {
+              "id": "q4_0-b8",
+              "type": "q4_0",
+              "columns": 8,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_0_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000006783229764550924
+            },
+            {
+              "id": "iq4_nl-b1",
+              "type": "iq4_nl",
+              "columns": 1,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000006405190561054042
+            },
+            {
+              "id": "iq4_nl-b2",
+              "type": "iq4_nl",
+              "columns": 2,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000006878793101350311
+            },
+            {
+              "id": "iq4_nl-b8",
+              "type": "iq4_nl",
+              "columns": 8,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000007047753570077475
+            }
+          ],
+          "inputs": [
+            {
+              "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-disable.jsonl",
+              "sha256": "5f9f42332e1035d51ea2c75de15854573614e3d3933ee92211469c67b1492269"
+            },
+            {
+              "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-disable.jsonl.stderr",
+              "sha256": "b554c3388ffcf9559ddd264db8d206d72e1da7ca0f3ae6f6f6f391fdcae8f275"
+            }
+          ],
+          "non_case_dispatch_records": 0
+        },
+        {
+          "control": "both",
+          "status": "PASS",
+          "policy": "disable",
+          "receipt": {
+            "path": "build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-both-receipt.json",
+            "bytes": 4011,
+            "sha256": "67fa890648ce8cf035ce2a9e020c27effd0323b519043ab6235e731d1116e5f9"
+          },
+          "cases": [
+            {
+              "id": "q4_K-b1",
+              "type": "q4_k",
+              "columns": 1,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_k_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000008203443485399475
+            },
+            {
+              "id": "q4_K-b2",
+              "type": "q4_k",
+              "columns": 2,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_k_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000008203443485399475
+            },
+            {
+              "id": "q4_K-b8",
+              "type": "q4_k",
+              "columns": 8,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_k_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000008203443485399475
+            },
+            {
+              "id": "q4_0-b1",
+              "type": "q4_0",
+              "columns": 1,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_0_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000005669760867021978
+            },
+            {
+              "id": "q4_0-b2",
+              "type": "q4_0",
+              "columns": 2,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_0_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.0000060910097090527415
+            },
+            {
+              "id": "q4_0-b8",
+              "type": "q4_0",
+              "columns": 8,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_q4_0_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000006783229764550924
+            },
+            {
+              "id": "iq4_nl-b1",
+              "type": "iq4_nl",
+              "columns": 1,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000006405190561054042
+            },
+            {
+              "id": "iq4_nl-b2",
+              "type": "iq4_nl",
+              "columns": 2,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000006878793101350311
+            },
+            {
+              "id": "iq4_nl-b8",
+              "type": "iq4_nl",
+              "columns": 8,
+              "route": "native_quantized_weight_f32_activation",
+              "completed_graphs": 3,
+              "dispatch_counts": {
+                "scale_f32": 3,
+                "mul_mat_vec_iq4_nl_f32_f32": 3
+              },
+              "reference": "f32_valid",
+              "max_abs_error": 0.000007047753570077475
+            }
+          ],
+          "inputs": [
+            {
+              "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-both.jsonl",
+              "sha256": "31637f3b60f3adddad9376b81205abe4b8cf6676d867803ecb1eda41c83dd8fa"
+            },
+            {
+              "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/dispatch-vulkan-expert/mmvq-both.jsonl.stderr",
+              "sha256": "da398761239e47767c8541a86cd36bf57fa49e6b6583ea31e18a14c0fb94a92f"
+            }
+          ],
+          "non_case_dispatch_records": 0
+        }
+      ],
+      "id_boundary": {
+        "status": "PASS",
+        "graphs_completed": 1114,
+        "boundary_graphs": 8,
+        "flattened_slots": 65540,
+        "chunk_starts_inside_token_at_slot": 3,
+        "pairs": [
+          {
+            "log_lines": [
+              62920,
+              62921
+            ],
+            "pipeline": "mul_mat_vec_id_q8_0_f32",
+            "workgroups": [
+              [
+                3,
+                65535,
+                1
+              ],
+              [
+                3,
+                5,
+                1
+              ]
+            ]
+          },
+          {
+            "log_lines": [
+              62977,
+              62978
+            ],
+            "pipeline": "mul_mat_vec_id_q8_0_f32",
+            "workgroups": [
+              [
+                3,
+                65535,
+                1
+              ],
+              [
+                3,
+                5,
+                1
+              ]
+            ]
+          },
+          {
+            "log_lines": [
+              63032,
+              63033
+            ],
+            "pipeline": "mul_mat_vec_id_q8_0_f32",
+            "workgroups": [
+              [
+                3,
+                65535,
+                1
+              ],
+              [
+                3,
+                5,
+                1
+              ]
+            ]
+          },
+          {
+            "log_lines": [
+              63089,
+              63090
+            ],
+            "pipeline": "mul_mat_vec_id_q8_0_f32",
+            "workgroups": [
+              [
+                3,
+                65535,
+                1
+              ],
+              [
+                3,
+                5,
+                1
+              ]
+            ]
+          },
+          {
+            "log_lines": [
+              63143,
+              63144
+            ],
+            "pipeline": "mul_mat_vec_id_q8_0_f32",
+            "workgroups": [
+              [
+                3,
+                65535,
+                1
+              ],
+              [
+                3,
+                5,
+                1
+              ]
+            ]
+          },
+          {
+            "log_lines": [
+              63198,
+              63199
+            ],
+            "pipeline": "mul_mat_vec_id_q8_0_f32",
+            "workgroups": [
+              [
+                3,
+                65535,
+                1
+              ],
+              [
+                3,
+                5,
+                1
+              ]
+            ]
+          },
+          {
+            "log_lines": [
+              63253,
+              63254
+            ],
+            "pipeline": "mul_mat_vec_id_q8_0_f32",
+            "workgroups": [
+              [
+                3,
+                65535,
+                1
+              ],
+              [
+                3,
+                5,
+                1
+              ]
+            ]
+          },
+          {
+            "log_lines": [
+              63310,
+              63311
+            ],
+            "pipeline": "mul_mat_vec_id_q8_0_f32",
+            "workgroups": [
+              [
+                3,
+                65535,
+                1
+              ],
+              [
+                3,
+                5,
+                1
+              ]
+            ]
+          }
+        ],
+        "numeric_output": {
+          "path": "build-rerot-hardening-20261019/dispatch-vulkan-expert/id-shape.jsonl",
+          "bytes": 798,
+          "sha256": "bd5c5f0316c8aa67ade2632ce69ec7f75d7baea54fb3f634f100eb49076ed9b5"
+        },
+        "trace": {
+          "path": "build-rerot-hardening-20261019/dispatch-vulkan-expert/id-shape.jsonl.stderr",
+          "bytes": 3768381,
+          "sha256": "b8fb21cf937a0282a19ed17dad98c8b42b4d388055a24224dac9cccd4cca3394"
+        }
+      }
+    },
+    "prefill_diagnostics": {
+      "runs": [
+        {
+          "log": {
+            "path": "build-rerot-hardening-20261019/native-prefill-vulkan-expert.log",
+            "bytes": 5227911,
+            "sha256": "3810aa835a39d836865ab4561d30e16a9266805c433bb2693e53cac11f20a03e"
+          },
+          "metrics": {
+            "traced_batch_vs_serial": {
+              "rows": 32,
+              "max_abs": 0.00008106231689453125,
+              "greedy_mismatches": 0
+            },
+            "untraced_batch_vs_serial": {
+              "rows": 32,
+              "max_abs": 0.00006008148193359375,
+              "greedy_mismatches": 0
+            },
+            "batch_trace_effect": {
+              "rows": 32,
+              "max_abs": 0.00004100799560546875,
+              "greedy_mismatches": 0
+            },
+            "serial_trace_effect": {
+              "rows": 32,
+              "max_abs": 0.00010013580322265625,
+              "greedy_mismatches": 0
+            }
+          },
+          "expert_tensor_records": 2112,
+          "expert_record_policy_device_counts": [
+            {
+              "batch_precision": -1,
+              "serial_precision": -1,
+              "batch_device": "Vulkan0",
+              "serial_device": "Vulkan0",
+              "count": 2112
+            }
+          ]
+        },
+        {
+          "log": {
+            "path": "build-rerot-hardening-20261019/native-prefill-vulkan-expert-metadata.log",
+            "bytes": 5227912,
+            "sha256": "247f828fb4c2958b20eef817f54fb18a5ed2d0ad8330cbb18e183a8ad745e174"
+          },
+          "metrics": {
+            "traced_batch_vs_serial": {
+              "rows": 32,
+              "max_abs": 0.00008106231689453125,
+              "greedy_mismatches": 0
+            },
+            "untraced_batch_vs_serial": {
+              "rows": 32,
+              "max_abs": 0.00006008148193359375,
+              "greedy_mismatches": 0
+            },
+            "batch_trace_effect": {
+              "rows": 32,
+              "max_abs": 0.00004100799560546875,
+              "greedy_mismatches": 0
+            },
+            "serial_trace_effect": {
+              "rows": 32,
+              "max_abs": 0.00010013580322265625,
+              "greedy_mismatches": 0
+            }
+          },
+          "expert_tensor_records": 2112,
+          "expert_record_policy_device_counts": [
+            {
+              "batch_precision": 20,
+              "serial_precision": 20,
+              "batch_device": "Vulkan0",
+              "serial_device": "Vulkan0",
+              "count": 2112
+            }
+          ]
+        }
+      ],
+      "scope": "32-token prefix numerical tracing with four contexts; no whole-model generation or speed claim. Earlier metadata omitted ID precision; the later probe records it explicitly."
+    },
+    "release_performance": {
+      "status": "COMPLETE_RECORDED_RESIDENT_GRAPH_MEASUREMENTS",
+      "detail_file": "fork/audit/rerot-hardening-performance-20261019.json",
+      "normal_identity": {
+        "build": "normal Release; GGML_VULKAN_DEBUG=OFF",
+        "cache": {
+          "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/cache-vulkan-expert-normal-restored.log",
+          "bytes": 19991,
+          "sha256": "28204df2f73f1ee42966648b0a436453173aadfd12c73288351d18a28ac0607a"
+        },
+        "cleared_environment": [
+          "GGML_VK_FORCE_MMVQ",
+          "GGML_VK_DISABLE_MMVQ",
+          "GGML_VK_DISABLE_F16",
+          "GGML_VK_PERF_LOGGER",
+          "GGML_VK_PERF_LOGGER_CONCURRENT",
+          "GGML_VK_PERF_LOGGER_FREQUENCY",
+          "GGML_VK_PIPELINE_STATS",
+          "GGML_VK_SYNC_LOGGER",
+          "GGML_VK_MEMORY_LOGGER",
+          "GGML_VK_DISABLE_FUSION",
+          "GGML_VK_SERIALIZE_SUBMISSIONS"
+        ],
+        "clock_or_power_lock_applied": false,
+        "other_agent_builds_and_model_runs_completed_before_measurement": true,
+        "scope": "resident SCALE plus matrix product compute and sync; allocation/upload/host reference/readback excluded; no whole-model throughput claim",
+        "artifacts": [
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/lib/libggml-base.so.0.18.1",
+            "bytes": 1010472,
+            "sha256": "d1cd477165646f060a55f73bc58d8b133b6faa40cb95d59bf7443bce8fe99cc6"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/lib/libggml-cpu.so.0.18.1",
+            "bytes": 1381088,
+            "sha256": "b10899c9f8357b6ac7dbeaa2cfbf95164194226b65a11ff549167815c17a8e49"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/lib/libggml-vulkan.so.0.18.1",
+            "bytes": 56864128,
+            "sha256": "aafa5e968bf179d5286ec170815c78d5fe64d1e3df9ee6d81ecdabcabf12d2f5"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/lib/libggml.so.0.18.1",
+            "bytes": 55264,
+            "sha256": "0d2cc08042253896e47d70a7915e595fdd12bc8358b9171ba2c957422551fe58"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/install-vulkan-expert/lib/libllama.so.0.0.2081",
+            "bytes": 4999880,
+            "sha256": "3cd2d257fa45ca91c000744bc6c085c152162ffc4c21cde3662b02bbc01d5e1c"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/seams-vulkan-expert/test-vulkan-mmvq",
+            "bytes": 73112,
+            "sha256": "5971fed3c87eab92324fc9a620d1b017b1d018b5592430e0e8b7e5325c44e6e5"
+          },
+          {
+            "path": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant-clean-20261018/build-rerot-hardening-20261019/seams-vulkan-expert/test-vulkan-quantized-shape-invariance",
+            "bytes": 107216,
+            "sha256": "b08a0b8a34363af4c9d18e7afe2dd824edff73dce3b796db8825d1ad5c6f0786"
+          }
+        ]
+      },
+      "dense_summary": [
+        {
+          "columns": 9,
+          "ratio_min": 0.4693994280266921,
+          "ratio_max": 0.49910714285714286,
+          "meaning": "batch-invariant warm median divided by native DEFAULT warm median"
+        },
+        {
+          "columns": 32,
+          "ratio_min": 1.0925694444444445,
+          "ratio_max": 1.3113998001383658,
+          "meaning": "batch-invariant warm median divided by native DEFAULT warm median"
+        },
+        {
+          "columns": 128,
+          "ratio_min": 1.857106482660284,
+          "ratio_max": 2.0191091977017748,
+          "meaning": "batch-invariant warm median divided by native DEFAULT warm median"
+        }
+      ],
+      "dense_processes": 2,
+      "dense_graphs_per_process": 288,
+      "mmvq_processes": 4,
+      "mmvq_graphs_per_process": 144,
+      "scope": [
+        "Normal Release execution with GGML_VULKAN_DEBUG=OFF. Separate DEBUG receipts establish the recorded dispatch controls.",
+        "Timings cover resident SCALE followed by MUL_MAT plus submission and synchronization. Allocation, upload, host reference work, and readback are outside the timed interval.",
+        "Each mode/case has one separately recorded first computation and 15 warm samples. Dense mode order alternates by case and is reversed in the second process; MMVQ auto/disable uses ABBA process ordering.",
+        "Dense mode arithmetic is qualified by its separate 597-graph native DEFAULT N1 fixture. Performance-mode finite/nonzero/repeat checks are not a cross-mode numerical-equivalence gate.",
+        "The mode-20 cost rises for larger N in this fixture. The measurements do not establish full-model throughput or expert-indexed projection latency.",
+        "Q4_K at N=8 had auto medians 63.05–63.54 us and disabled medians 77.14–77.38 us. Other cases showed noise or no advantage, so no general MMVQ acceleration claim follows.",
+        "No clock or power lock was applied. Full raw samples and IQRs remain available for inspecting variance."
+      ],
+      "detail_artifact": {
+        "path": "fork/audit/rerot-hardening-performance-20261019.json",
+        "bytes": 91565,
+        "sha256": "9bdc1b85de850d0a1dd4472416cd6d8f4edc677c726aa8d1a4d81201bdee93b5"
+      }
+    }
+  },
+  "source_identity": {
+    "manifest": {
+      "path": "fork/upstream-exceptions.json",
+      "bytes": 39660,
+      "sha256": "d52ab562be8ac3fcc331fdc731267fd18341539f980f72a6f80257855b3ae715"
+    },
+    "overlays": [
+      {
+        "path": ".github/workflows/fork-extensions.yml",
+        "sha256": "e975f3af5399a42613670a8d810de7d76f9367316a3a64bb49b31a40afc9888c",
+        "mode": "100644"
+      },
+      {
+        "path": "AGENTS.md",
+        "sha256": "f6aa3e9b65cc9d9da54fc8b477789547036e7b25d4c33dc363b8f445647e1304",
+        "mode": "100644"
+      },
+      {
+        "path": "common/arg.cpp",
+        "sha256": "d395a1d926266275ec5df0c6d7e9e72bed221a5e9e7c4b74d84475470c19377f",
+        "mode": "100644"
+      },
+      {
+        "path": "common/common.cpp",
+        "sha256": "b8ea8bf3ca5832e5256249654c76fec864962174cc61d620ac715231ece5060a",
+        "mode": "100644"
+      },
+      {
+        "path": "common/common.h",
+        "sha256": "0572a4e92cd211a5ac2ce22c1430bd23998e2e1b347a2f3af4e3e04e6a4be7f2",
+        "mode": "100644"
+      },
+      {
+        "path": "ggml/include/ggml-backend.h",
+        "sha256": "bfe0c8ed6c5a648de5a9da79fad23ec17010760644801fb245d0649853b79fd9",
+        "mode": "100644"
+      },
+      {
+        "path": "ggml/include/ggml.h",
+        "sha256": "3a5f74e8d196bb3d284a92b2ae862a51095225b6922a2c939bedd01db8b7ab5b",
+        "mode": "100644"
+      },
+      {
+        "path": "ggml/src/ggml-backend-meta.cpp",
+        "sha256": "c141bb450b11ad5dc1a654d94b5188d14829c41dc9c28910bee544bbb728cfa7",
+        "mode": "100644"
+      },
+      {
+        "path": "ggml/src/ggml-backend.cpp",
+        "sha256": "b42ea28e0461055af8fe743acbea282615d6454fc34e403fabb2556d171a5211",
+        "mode": "100644"
+      },
+      {
+        "path": "ggml/src/ggml-cpu/ggml-cpu.c",
+        "sha256": "8cfe7ee653073919ff5d2d8785633bca565a8c7c136157fbaa85980f5c9adfcc",
+        "mode": "100644"
+      },
+      {
+        "path": "ggml/src/ggml-cpu/ops.cpp",
+        "sha256": "e5b6affc76f02ec3456ace39b626a2175fd70b2c2da3599af4df71e9f06ad00a",
+        "mode": "100644"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        "sha256": "5302e9a13c7da678d59f5f9308dac4743f0c99e428f72ef1df5c11775fa989ee",
+        "mode": "100644"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl",
+        "sha256": "8fee3a291996b45db71ddb3203f0a5c37b60b2acea1eab422e60983ed642fa01",
+        "mode": "100644"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl",
+        "sha256": "c7f7dc96d64bda77dbe893ea115585b824064922c0601249a04d8ca52ac98cc5",
+        "mode": "100644"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/vulkan-shaders/turbo_wht.comp",
+        "sha256": "f20b9dde57cfa34461daac288688dc8892fb6fad2303a07a17df188967970827",
+        "mode": "100644"
+      },
+      {
+        "path": "ggml/src/ggml.c",
+        "sha256": "5f49b8219ad0604067d84ef3953cfc0485b0cd1a4b375dc2f34f8ac28eb740ad",
+        "mode": "100644"
+      },
+      {
+        "path": "include/llama.h",
+        "sha256": "03968ac85560c02adb063f4f30d4d5ff968dd5d43bb7de102d74f1e0f39b37c4",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-attention-view.h",
+        "sha256": "fe8b08c29d18d099ffdaba2c3ba416175bdc76fd8081ecb61f5fe816005860d3",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-context.cpp",
+        "sha256": "ee718866901c4b3b7cf2ebc557fd289f91bb1ef219fd96fc697de913a474fdeb",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-context.h",
+        "sha256": "bb1eef721541edc9f04ead15782a7f2fff5171656490f9d0a195c5d187aa4db3",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-cparams.h",
+        "sha256": "4718f6c8ffacad57e7ed24f8ac0d3dd33b20485bff063c55c9146eb0fc37b0be",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-graph.cpp",
+        "sha256": "1de64639ecd6f00e701509f2b047e59bd74f00b4a96ce3e08e26b32b1299c78d",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-graph.h",
+        "sha256": "087693cb84344308b74dc7505c82f707124ff7d701c54b8d50ecf2408bdeaf17",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-kv-cache.cpp",
+        "sha256": "839df30582f517eec4715ff46b323fb57a773500675b9e84fbd5f6f04b7c4da5",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-kv-cache.h",
+        "sha256": "e230833526353e57beb9113162f002122bf8c63eb6de8d7e310abaaac50a04fa",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-memory-hybrid.h",
+        "sha256": "53229d1857b624ad9f4bfeceb7a2ba922c1a231b1044acd3d210dc223ef8e61f",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-memory-recurrent.cpp",
+        "sha256": "cd13ab45e4d44346210f5320917bb00300a8897708fa90328a5a5dbf9af77c5e",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-memory-recurrent.h",
+        "sha256": "8f79b71f2935ee2a8ec81f7ea8550e37ba6c3dce9ca31a5a24e1c811689a3eea",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-memory.h",
+        "sha256": "c027893445c4d663b1a9d83048919afd9d14dff27166bfaa0b6380f71e24c5a2",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-model.cpp",
+        "sha256": "57902ddda0b63b9ea285259a1dd0bfc41639c8b7c2d20ca768315681c649c687",
+        "mode": "100644"
+      },
+      {
+        "path": "src/llama-sampler.cpp",
+        "sha256": "f138e86df8ea5e288fa46f719e4d8b614bf0a14fb1906dda4a0330f39aa71538",
+        "mode": "100644"
+      },
+      {
+        "path": "tools/server/server-context.cpp",
+        "sha256": "a5892b7e9101f08a05769387758e736c038bc22fd70afad43d9b07f013041e2d",
+        "mode": "100644"
+      },
+      {
+        "path": "tools/server/server-task.h",
+        "sha256": "1505c19411c4dc0d5a498ff5dab554bee01e9324ab542f6e2740106c38679a7e",
+        "mode": "100644"
+      },
+      {
+        "path": "tools/server/server.cpp",
+        "sha256": "603018e5ae36a41ca4abbf45bdf0efebb73027a1f7e6a4ce338aa2a53c0c35a3",
+        "mode": "100644"
+      }
+    ],
+    "changed_runtime_and_test_sources": [
+      {
+        "path": "fork/rerot-compose/CMakeLists.txt",
+        "bytes": 2899,
+        "sha256": "6123bf4acd1fbefed1539549d23e7a51d564249cd462505d295729d162213c9c"
+      },
+      {
+        "path": "fork/rerot-compose/src/capacity.h",
+        "bytes": 1976,
+        "sha256": "f3ce7c03fdba70911354cc823d722e95cebd8297ff4756501a2005865a759488"
+      },
+      {
+        "path": "fork/rerot-compose/src/main.cpp",
+        "bytes": 17394,
+        "sha256": "2918c990696afd9db9df1ca571f83ce1bbc93a3517647b06d2c68ebfc764a002"
+      },
+      {
+        "path": "fork/rerot-compose/src/native.cpp",
+        "bytes": 20960,
+        "sha256": "ca57509f5773a2fdeee4edda70e6f158d782b4515d9f9ec31a4d5798f85ad9d9"
+      },
+      {
+        "path": "fork/rerot-compose/src/native.h",
+        "bytes": 2160,
+        "sha256": "7eaa07f74cff3d57bba031caeb96147f4a0ab6beec41c3636da5c3fa71da93b6"
+      },
+      {
+        "path": "fork/rerot-compose/src/sampling.h",
+        "bytes": 4992,
+        "sha256": "2ed3273083bfec8f7ecc7f338c9eb220e87a3ce862f82df1ddfc61141e7e3f4e"
+      },
+      {
+        "path": "fork/rerot-compose/tests/real-whiteboard.py",
+        "bytes": 41444,
+        "sha256": "e05fba401a2019ab2f42e58047544d04f04acaf3cae3cc73ba26b19c5053b69c"
+      },
+      {
+        "path": "fork/rerot-compose/tests/test-capacity.cpp",
+        "bytes": 2515,
+        "sha256": "0716774232844a0e9a80cb16fb1220cbaa291c23c0b74c6488905b6a83801883"
+      },
+      {
+        "path": "fork/rerot-compose/tests/test-native-cancellation.cpp",
+        "bytes": 4625,
+        "sha256": "83ba6e2224932bf0c438c47cfb1de055cac5fa1361f0e2e51e5beeb2b4b185d5"
+      },
+      {
+        "path": "fork/rerot-compose/tests/test-sampling.cpp",
+        "bytes": 8603,
+        "sha256": "85f2c26719185cd6284290c9dac067f5b8367fe8fb09001d14fa0023410f7570"
+      },
+      {
+        "path": "fork/rerot-compose/tests/test-whiteboard-validator.py",
+        "bytes": 8683,
+        "sha256": "51a65e1545b9b48a779344bca85d7c0f863aae21698ec2866277933e5c3bd56a"
+      },
+      {
+        "path": "fork/rerot/include/tq/rerot/episode.h",
+        "bytes": 3785,
+        "sha256": "025cc599a52b7172d2a9f8110fff9aad3c5f5a11159cffd1344549fe95ac04f0"
+      },
+      {
+        "path": "fork/rerot/src/episode.cpp",
+        "bytes": 21275,
+        "sha256": "209a666774ba73429923838837b23207179c64da5ac7f45b4e3dd142ecddbfc0"
+      },
+      {
+        "path": "fork/rerot/tests/test-rerot.cpp",
+        "bytes": 32520,
+        "sha256": "58328fa6e120018b97b39a89da5551e219f31a64fe7d4d596064d9822f726856"
+      },
+      {
+        "path": "fork/tests/a-seams/CMakeLists.txt",
+        "bytes": 7806,
+        "sha256": "778139f4315159584e8b6f2e415cc954493a1214e525ee4d837999236361be0b"
+      },
+      {
+        "path": "fork/tests/a-seams/check-vulkan-mmvq.py",
+        "bytes": 9603,
+        "sha256": "0dcfc3018d073947e79c8d494bbaa9207236d7394164a013cb4018088ab98190"
+      },
+      {
+        "path": "fork/tests/a-seams/cpu-f32-precision.cpp",
+        "bytes": 7230,
+        "sha256": "8d4f4b7dd983fc484da2bc282b0f7f603ffe4bf6ec018f6caaf52b6ca470f712"
+      },
+      {
+        "path": "fork/tests/a-seams/f32-matmul-layout.cpp",
+        "bytes": 11347,
+        "sha256": "095044afd371221966f7739617d06d0576151a446615d92b07296bda3e0ffa05"
+      },
+      {
+        "path": "fork/tests/a-seams/f32-shape-invariance.cpp",
+        "bytes": 14136,
+        "sha256": "04c752720e9e536321d10ef1e583aaf92f103355f2eaf4add1e24c7a773e278b"
+      },
+      {
+        "path": "fork/tests/a-seams/mul-mat-id-shape-invariance.cpp",
+        "bytes": 21085,
+        "sha256": "85666be491f9c03c24e071ee27f468d4d2d52300f64cc3923a12de61ecc3bdd4"
+      },
+      {
+        "path": "fork/tests/a-seams/rerot-attention-oracle.cpp",
+        "bytes": 25874,
+        "sha256": "9f7e56d21e8aa8ef2bbe13a8f5894d822015a009db9e82f4b25485f2b40eb6ac"
+      },
+      {
+        "path": "fork/tests/a-seams/rerot-native-trace.cpp",
+        "bytes": 28358,
+        "sha256": "6bf3f33dfa05f60f33eeeecf17c0552312c8be67083adaabdc842fa39d33475d"
+      },
+      {
+        "path": "fork/tests/a-seams/rerot-reader-views.cpp",
+        "bytes": 34174,
+        "sha256": "0b6774d907460ba26d534371784b67e5d7cfee3e8debaeb4e6f50c11aefbbc4f"
+      },
+      {
+        "path": "fork/tests/a-seams/sampler-top-k-extremes.cpp",
+        "bytes": 2685,
+        "sha256": "7217d316f1707f47ef3d8244a64b64196255d396efc669284c7d850bccab44f0"
+      },
+      {
+        "path": "fork/tests/a-seams/test-vulkan-mmvq-trace.py",
+        "bytes": 6471,
+        "sha256": "361d88c23bf06e2e789cefa8cab5f71e09ed760f7d286847e11d4cdb26023898"
+      },
+      {
+        "path": "fork/tests/a-seams/vulkan-mmvq.cpp",
+        "bytes": 23064,
+        "sha256": "966806c6551b27775178b59c65663976ace2327e67bfb591efd045622237a478"
+      },
+      {
+        "path": "fork/tests/a-seams/vulkan-quantized-shape-invariance.cpp",
+        "bytes": 27109,
+        "sha256": "94e9c8e31b1096ee334e6fd52916cd088c38c98d95a0ca1dd8d7dfebef892491"
+      },
+      {
+        "path": "fork/tests/isolation.py",
+        "bytes": 17842,
+        "sha256": "703682fe9b3500f3ef7127dd81364f1ebc4db699667b7a0b6ffed41df407cf44"
+      },
+      {
+        "path": "ggml/include/ggml.h",
+        "bytes": 116939,
+        "sha256": "3a5f74e8d196bb3d284a92b2ae862a51095225b6922a2c939bedd01db8b7ab5b"
+      },
+      {
+        "path": "ggml/src/ggml-cpu/ggml-cpu.c",
+        "bytes": 162153,
+        "sha256": "8cfe7ee653073919ff5d2d8785633bca565a8c7c136157fbaa85980f5c9adfcc"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        "bytes": 1050929,
+        "sha256": "5302e9a13c7da678d59f5f9308dac4743f0c99e428f72ef1df5c11775fa989ee"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl",
+        "bytes": 8471,
+        "sha256": "8fee3a291996b45db71ddb3203f0a5c37b60b2acea1eab422e60983ed642fa01"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl",
+        "bytes": 1137,
+        "sha256": "c7f7dc96d64bda77dbe893ea115585b824064922c0601249a04d8ca52ac98cc5"
+      },
+      {
+        "path": "ggml/src/ggml.c",
+        "bytes": 265690,
+        "sha256": "5f49b8219ad0604067d84ef3953cfc0485b0cd1a4b375dc2f34f8ac28eb740ad"
+      },
+      {
+        "path": "include/llama.h",
+        "bytes": 92578,
+        "sha256": "03968ac85560c02adb063f4f30d4d5ff968dd5d43bb7de102d74f1e0f39b37c4"
+      },
+      {
+        "path": "src/llama-context.cpp",
+        "bytes": 214344,
+        "sha256": "ee718866901c4b3b7cf2ebc557fd289f91bb1ef219fd96fc697de913a474fdeb"
+      },
+      {
+        "path": "src/llama-context.h",
+        "bytes": 15952,
+        "sha256": "bb1eef721541edc9f04ead15782a7f2fff5171656490f9d0a195c5d187aa4db3"
+      },
+      {
+        "path": "src/llama-cparams.h",
+        "bytes": 2601,
+        "sha256": "4718f6c8ffacad57e7ed24f8ac0d3dd33b20485bff063c55c9146eb0fc37b0be"
+      },
+      {
+        "path": "src/llama-graph.cpp",
+        "bytes": 158035,
+        "sha256": "1de64639ecd6f00e701509f2b047e59bd74f00b4a96ce3e08e26b32b1299c78d"
+      },
+      {
+        "path": "src/llama-sampler.cpp",
+        "bytes": 140062,
+        "sha256": "f138e86df8ea5e288fa46f719e4d8b614bf0a14fb1906dda4a0330f39aa71538"
+      }
+    ],
+    "notes": [
+      "A/B/C runtime bytes did not change between final qualification and these implementation commits.",
+      "Two trailing blank lines in the dense fixture were removed after performance/source-isolation execution. The final seam rebuild passed 20/20; the normal performance executable digest remained identical.",
+      "Documentation was completed after runtime qualification."
+    ],
+    "build_records": [
+      {
+        "path": "build-rerot-hardening-20261019/configure-a-vulkan-expert.log",
+        "bytes": 871,
+        "sha256": "0a87502d51508c6d9d4a0df40d737dac73e7c6c6ca54efd495f2b6ba66ab5f86"
+      },
+      {
+        "path": "build-rerot-hardening-20261019/build-a-vulkan-expert.log",
+        "bytes": 21285,
+        "sha256": "f24de02d82669b327b7d9bc50c0236b2e088084ced8a458228809a7406308b2e"
+      },
+      {
+        "path": "build-rerot-hardening-20261019/install-a-vulkan-expert.log",
+        "bytes": 7274,
+        "sha256": "09dd8661d55de1a56767415c6ae77e8a86f95244f632d35c1403c493b83a8ed2"
+      },
+      {
+        "path": "build-rerot-hardening-20261019/debug-build-commands.json",
+        "bytes": 1756,
+        "sha256": "b1cca90119640ac403eab099b9ce03532d15a24f2c47f930c927c938ecde1948"
+      },
+      {
+        "path": "build-rerot-hardening-20261019/cache-vulkan-expert-debug.log",
+        "bytes": 19996,
+        "sha256": "83f357ea9ee5f17e4b58eb96c7ca7b4f53c0fea4f679d03064cb550fa6238df7"
+      },
+      {
+        "path": "build-rerot-hardening-20261019/normal-metadata-restore-commands.json",
+        "bytes": 3175,
+        "sha256": "a538e49d451bd89d0f70cb2b6edefa1cab3f7290de03330111f67780f52b91fa"
+      },
+      {
+        "path": "build-rerot-hardening-20261019/cache-vulkan-expert-normal-restored.log",
+        "bytes": 19991,
+        "sha256": "28204df2f73f1ee42966648b0a436453173aadfd12c73288351d18a28ac0607a"
+      },
+      {
+        "path": "build-rerot-hardening-20261019/cpu-expert-gate-commands.json",
+        "bytes": 8036,
+        "sha256": "104a8215c8c829913430d8f4bfd26bdb0a377e950d2b34d20f7289efb8b48c2c"
+      },
+      {
+        "path": "build-rerot-hardening-20261019/dispatch-vulkan-expert/linked-libraries.log",
+        "bytes": 1229,
+        "sha256": "af3e81100d4335f57e80ba5d35838ddf3374899828bffab89e2b8784dea0bb8d"
+      },
+      {
+        "path": "build-rerot-hardening-20261019/performance-vulkan-expert/linked-libraries.log",
+        "bytes": 1205,
+        "sha256": "b04aeb59d4503f684a23a4393732edcd3e54bfdd3a9d2316b6e5ae4e46097deb"
+      },
+      {
+        "path": "build-rerot-hardening-20261019/vulkaninfo-summary-final.log",
+        "bytes": 3162,
+        "sha256": "c03931ecee83d734f4daa61d194efcceac65db15d78112ccbaa536982da6d5b6"
+      }
+    ]
+  },
+  "profile": {
+    "name": "native A RERoT with resident F32 K/V and batch-invariant projection request",
+    "hardware": {
+      "cpu": "AMD Ryzen 5 7500F 6-Core Processor",
+      "gpu": "AMD Radeon RX 6800 (RADV NAVI21)",
+      "gpu_count_exercised": 1,
+      "pci_id": "0000:03:00.0",
+      "driver": "Mesa 26.2.2-arch1.1 (RADV)",
+      "vulkan_device_api": "1.4.354",
+      "vulkan_loader_instance": "1.4.357",
+      "subgroup_size": 32,
+      "shared_memory_bytes": 65536,
+      "integer_dot": true,
+      "matrix_cores": false
+    },
+    "reader": {
+      "kv_k": "f32",
+      "kv_v": "f32",
+      "flash_attention": false,
+      "batch_invariant_matmul_requested": true
+    },
+    "whiteboard": {
+      "workers": 4,
+      "pens": 2,
+      "ubatch_sizes": [
+        128,
+        1
+      ],
+      "phase_modes": [
+        "release",
+        "retain"
+      ],
+      "repetitions": 2,
+      "worker_token_budget": 512,
+      "final_token_budget": 512,
+      "completion": "native EOG",
+      "cross_shape_greedy_equivalence_required": true
+    },
+    "backend_comparison": "CPU and Vulkan each compare with their own controls; their generated trajectories are not required or claimed to equal one another."
+  },
+  "support_boundaries": [
+    "Resident unified F32 K and V only, with flash attention off and the recorded public reader capability restrictions.",
+    "F16, mixed, or quantized reader KV remains unqualified/refused. Earlier failed F16 receipts are not promoted.",
+    "The tested native CPU and single RADV Vulkan execution profiles do not qualify other architectures, optional CPU compute providers, CUDA/HIP/Metal, or other Vulkan devices.",
+    "The precision getter records the requested context configuration; public operator checks and independent DEBUG traces establish their own executed scope.",
+    "The tiny F64 oracle covers full rotary NORMAL/NEOX with the specified head layout and amplitudes; it is not a full 8B-model oracle or partial-RoPE qualification.",
+    "The present native C route submits one opaque A domain. It is not a whole-model TP5 provider.",
+    "One-device layer placement does not establish multi-device PP overlap or Vulkan row split support.",
+    "LateBind and MTP providers remain absent and are refused explicitly. Unverified archived implementations were not migrated.",
+    "Recurrent rollback/replay profiles are outside the tested n_rs_seq=0 path; the GROVEMOE warmup count boundary has no real-model qualification here.",
+    "SIGINT/broken-pipe process checks do not identify the exact GPU instruction at signal delivery or independently establish all-device drain. The native cancellation fixture separately checks actual CPU graph abort, drain, and sticky failure.",
+    "These RERoT profile gates do not qualify every stock Vulkan backend-op configuration. The earlier full-suite FlashAttention failure remains a historical failure.",
+    "Legacy automatic planning, reasoning/tool routing, heuristic template probes, multi-device providers, and speculative decoding remain separate rewrite candidates."
+  ],
+  "identity_rule": "Use the recorded manifest/source maps, implementation commits, installed artifact digests, model digests, and receipt hashes together. A PASS applies only to its stated workload and artifact identity; later edits require the corresponding requalification.",
+  "reproducibility": {
+    "procedure": "fork/rerot-compose/QUALIFICATION.md",
+    "validation_ledger": "fork/VALIDATION.md",
+    "migration_ledger": "fork/MIGRATION.md",
+    "raw_evidence_directory": "build-rerot-hardening-20261019",
+    "historical_index": "fork/audit/rerot-qualification-20261019.json",
+    "push_performed": false
+  },
+  "historical_evidence_index": {
+    "path": "fork/audit/rerot-qualification-20261019.json",
+    "bytes": 85578,
+    "sha256": "750069f9b597fc37179e56d03c263fbfb1f69b73390c20cc222a607ec9daa87e"
+  },
+  "retained_historical_profiles": {
+    "f16_reader_cpu": {
+      "receipt": {
+        "path": "build-rerot-runtime-20261019/reader-physical-cpu-f16.stdout",
+        "bytes": 6062,
+        "sha256": "4662a1ca0532c62038ac9fc2a99e8bf74b5a062db2ba1dace3142f116bb8d2e8"
+      },
+      "status": "FAIL",
+      "strict_same_shape_failures": [
+        {
+          "comparison": "batch row permutation round 2",
+          "status": "FAIL",
+          "max_abs": 0.1179952621459961,
+          "checked_logits": 128000,
+          "failed_logits": 126371,
+          "max_tolerance_ratio": 367.1755226131209
+        },
+        {
+          "comparison": "restored continuation round 2",
+          "status": "FAIL",
+          "max_abs": 0.1179952621459961,
+          "checked_logits": 128000,
+          "failed_logits": 126371,
+          "max_tolerance_ratio": 367.1755226131209
+        }
+      ]
+    },
+    "f16_reader_vulkan": {
+      "receipt": {
+        "path": "build-rerot-runtime-20261019/reader-physical-vulkan-f16.stdout",
+        "bytes": 6132,
+        "sha256": "ba1513ca4afa5ba6cd42a25509c288c09be200381d92855fd43cd93df3f90bce"
+      },
+      "status": "FAIL",
+      "strict_same_shape_failures": [
+        {
+          "comparison": "batch row permutation round 2",
+          "status": "FAIL",
+          "max_abs": 0.00035762786865234375,
+          "checked_logits": 128000,
+          "failed_logits": 31,
+          "max_tolerance_ratio": 1.2629415369146397
+        }
+      ]
+    },
+    "vulkan_row_split": {
+      "receipt": {
+        "path": "build-rerot-single-gpu-row-20261019/receipt.json",
+        "bytes": 12166,
+        "sha256": "0b3fc924ebf014fb7d491fb8c859911de7aa6f3193ff6640d6ef6cdbebff80ef"
+      },
+      "status": "FAIL",
+      "failure": "01-ubatch-128-release-1: inference exited 1: A could not load the model",
+      "native_failure": [
+        "llama_model_load: error loading model: device Vulkan0 does not support split buffers"
+      ]
+    },
+    "scope": "Preserved previous candidates; none of these failed profiles is promoted by the current F32 non-FA profile passes."
+  },
+  "test_executables": [
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-compute-memory",
+      "bytes": 28872,
+      "sha256": "3819d2f2be03ec19b17a12b08c1a7a722fe60261c092fb82252f51324a30d1b1"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-cpu-f32-precision",
+      "bytes": 27392,
+      "sha256": "317117dc0df3db2650623648f90ffd995fe03af9f14faf11e8b8236db01ca1a6"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-f32-matmul-layout",
+      "bytes": 63496,
+      "sha256": "c082c1b7924f21379cec9c3c399a5b8a73bc4bbdca5034760272611ca8aa3f3a"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-f32-shape-invariance",
+      "bytes": 62992,
+      "sha256": "c5fb83bd79a25d32eb99a99b3f6c0187bbda6785e7594dd678b769e0f4dcf9ce"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-flash-attn-precision",
+      "bytes": 16776,
+      "sha256": "288001597f8877c2d96d0efcd5e6e98a663f32cf2b05ee86c025c1208658bb24"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-meta-transfers",
+      "bytes": 27928,
+      "sha256": "9be60249ea270ff3210f47928ec216222670f141aa88029e0f8ee173e86544ad"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-mul-mat-id-shape-invariance",
+      "bytes": 89640,
+      "sha256": "3832c8812c7b7eac4e3087a0dc2fe56864b7a3dcee2daf376061fe51edc42132"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-recurrent-lifecycle",
+      "bytes": 63016,
+      "sha256": "78d6cba955c8bc54533362da9317e045b63bd4b5c27446384d4b8aeb2ea9a9d0"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-rerot-attention-oracle",
+      "bytes": 118816,
+      "sha256": "d4a884711ce869fa6f1ad880a83336add4ea175c70692fb5e0f392b21454c374"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-rerot-native-trace",
+      "bytes": 100024,
+      "sha256": "e6fb6d2263f16f22849e8ec4ffd6bc8905f8be4681fd431ab851bf867729afd1"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-rerot-reader-views",
+      "bytes": 109192,
+      "sha256": "aabb5174c315e58481381087ac8d225fa5085e2d9d3b992830129fb1ceb1467b"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-sampler-top-k-extremes",
+      "bytes": 30808,
+      "sha256": "ccd4fbc8c0f6177c284c2a28414eccde4c4eb2c0b8a3d0ca0b32be95644612f4"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-cpu-expert/test-vulkan-quantized-shape-invariance",
+      "bytes": 90352,
+      "sha256": "4ba2c9609627b1184f304f494fdfdaf2bc7939df32dbf91137864d3e124275c1"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-compute-memory",
+      "bytes": 28872,
+      "sha256": "79f4e6cab3ca1f21117a74627a8210e4e53dc0c2aed8b5e3dcffa6d6f0e43542"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-cpu-f32-precision",
+      "bytes": 27392,
+      "sha256": "7782fb959564479d8ea46bf51bdb0110ea71e1f37ec9027d629e4e2a2890c148"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-f32-matmul-layout",
+      "bytes": 63496,
+      "sha256": "1d3009eb2e17ff3cd63302119a54a66f5464082b9eae6c4b51701fd617b5a715"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-f32-shape-invariance",
+      "bytes": 62992,
+      "sha256": "10aa2752531cc5db580b32e283910ed62d6de7ec4c912c27ac03717f654a10a2"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-flash-attn-precision",
+      "bytes": 16776,
+      "sha256": "63ebb6731837c92c4812b92ff86ac0c50b6307b1a75ee1fa73c90a29d7b71ffc"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-meta-transfers",
+      "bytes": 27928,
+      "sha256": "26cd3190cae3c93362c532989cec59cb5f3ece3bc47f6d402aaea6a9ab02a8dd"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-mul-mat-id-shape-invariance",
+      "bytes": 89640,
+      "sha256": "2b61e65c41a30d2d625fd372dd16b2b1c1a266992c20c132f6a4834f443c7b14"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-recurrent-lifecycle",
+      "bytes": 63016,
+      "sha256": "e99f1e018aad0eba7ea1b7139d85f48743912f96894cfa34b970f01ea3a464a2"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-rerot-attention-oracle",
+      "bytes": 118816,
+      "sha256": "b475220544f1e180c814f07120d35ee13d3c1ae2156b7df7f06214bb3273e894"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-rerot-native-trace",
+      "bytes": 100024,
+      "sha256": "630f577452b0fbad71548cddb8695ae71c4f30362fcf739908ad835b1cdd476f"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-rerot-reader-views",
+      "bytes": 109192,
+      "sha256": "f7216d8b19056023b50360f8d3eb869c25723dafaad822faa9ee4c70ac0fc398"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-sampler-top-k-extremes",
+      "bytes": 30808,
+      "sha256": "01939a711575a744e9adf43cf99093822a5587dd479420dbfceb52bf1d0800ce"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-vulkan-activation-cache",
+      "bytes": 42584,
+      "sha256": "05837fa0e406ca9abfbd47a98798b75a3d378a6fe4bae7bc07958e17b1a375dd"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-vulkan-mmvq",
+      "bytes": 73112,
+      "sha256": "5971fed3c87eab92324fc9a620d1b017b1d018b5592430e0e8b7e5325c44e6e5"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-vulkan-quantized-shape-invariance",
+      "bytes": 107216,
+      "sha256": "b08a0b8a34363af4c9d18e7afe2dd824edff73dce3b796db8825d1ad5c6f0786"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-vulkan-scratch-reuse",
+      "bytes": 37344,
+      "sha256": "55eea18031a727039f5eb1f2d63990242e889fd162f1dd8283599bc16d80e108"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-vulkan-set-rows-types",
+      "bytes": 32688,
+      "sha256": "d0f1263bfa42168448bb2c3ca118662b5b14e377a70cffd1b8e1aae93807411b"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert/test-vulkan-wht",
+      "bytes": 28512,
+      "sha256": "15ff0cfc967b6e4ef368de1a891384dc9a8b5deb48bb2a0bb20ce0619954d94f"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert-debug/test-mul-mat-id-shape-invariance",
+      "bytes": 89640,
+      "sha256": "1cda1cd460f937aea81206cc381ad8d25dfa924711c5665fa9b76cd271888bf4"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/seams-vulkan-expert-debug/test-vulkan-mmvq",
+      "bytes": 73112,
+      "sha256": "6794c7b4e90123f631b76ca4123bd76300afcc9654de69501f919e9f3e5d8e71"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/compose-cpu-expert/test_rerot_compose_cancellation",
+      "bytes": 170760,
+      "sha256": "2e691367aebde1fccec4757cb794ff5f2ec8529083ee6d0728ce8309d1f47089"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/compose-cpu-expert/test_rerot_compose_capacity",
+      "bytes": 27360,
+      "sha256": "75e168e7ec4120ba4284c6576ec9f19d074a323b90853af9a37255bc732baf99"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/compose-cpu-expert/test_rerot_compose_sampling",
+      "bytes": 53272,
+      "sha256": "05fc8c0baa24ee8b4575cf42851cadc8e976648232d18e03faf3d844a7d38351"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/compose-vulkan-expert/test_rerot_compose_cancellation",
+      "bytes": 170760,
+      "sha256": "e5c5b46cfc629f0947748cc82c3697e0aedb8ce1d1481dd4ab904898853561f4"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/compose-vulkan-expert/test_rerot_compose_capacity",
+      "bytes": 27360,
+      "sha256": "75e168e7ec4120ba4284c6576ec9f19d074a323b90853af9a37255bc732baf99"
+    },
+    {
+      "path": "build-rerot-hardening-20261019/compose-vulkan-expert/test_rerot_compose_sampling",
+      "bytes": 53272,
+      "sha256": "bc3ff0829157d4eff23adce3637d5ca4cdf937d32c866a123fba16a25e2c5810"
+    }
+  ],
+  "documents": [
+    {
+      "path": "fork/VALIDATION.md",
+      "bytes": 87391,
+      "sha256": "c0249b9591966d2dcd0a719a0c36fef397cf77334883eacd746f0dd542efc008"
+    },
+    {
+      "path": "fork/MIGRATION.md",
+      "bytes": 33910,
+      "sha256": "ae56ba08fb95701fc4778978736a75d52d673f70e1b7876c975b903227714697"
+    },
+    {
+      "path": "fork/rerot-compose/README.md",
+      "bytes": 31828,
+      "sha256": "989037ff8af5b1575589e52836f02b0606e7cd8332984e84c0654a4527f2b6ca"
+    },
+    {
+      "path": "fork/rerot-compose/QUALIFICATION.md",
+      "bytes": 18820,
+      "sha256": "fdadeaacb505b8930318f183967ff3ed13e9d9e0e3973627a3b58bdc516ff078"
+    }
+  ]
+}

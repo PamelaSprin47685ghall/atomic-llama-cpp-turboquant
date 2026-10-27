@@ -1,0 +1,119 @@
+{
+  "status": "qualification_pass",
+  "date": "2026-10-21",
+  "rate_unit": "tokens_per_second",
+  "metric": "512 natural outputs; all 511 commit-to-commit intervals",
+  "pairs": [
+    {
+      "pair": 1,
+      "order": "current → master",
+      "current": 47.56685717558793,
+      "master": 45.47452699487647,
+      "ratio": 1.0460110378046856,
+      "uplift_percent": 4.601103780468563
+    },
+    {
+      "pair": 2,
+      "order": "master → current",
+      "current": 47.30274114052937,
+      "master": 45.22375090530449,
+      "ratio": 1.0459712030428026,
+      "uplift_percent": 4.5971203042802555
+    },
+    {
+      "pair": 3,
+      "order": "current → master",
+      "current": 47.16217008446883,
+      "master": 45.18047275741496,
+      "ratio": 1.0438618103377113,
+      "uplift_percent": 4.3861810337711304
+    },
+    {
+      "pair": 4,
+      "order": "master → current",
+      "current": 47.34302373029402,
+      "master": 45.58793590504396,
+      "ratio": 1.0384989535149336,
+      "uplift_percent": 3.84989535149336
+    }
+  ],
+  "geometric_mean_rates": {
+    "current": 47.34347530079227,
+    "master": 45.366352993317236
+  },
+  "geometric_mean_ratio": 1.043581248591137,
+  "confidence_95": [
+    1.0379613362020288,
+    1.0492315892959827
+  ],
+  "confidence_method": "paired log ratios, two-sided Student-t, n=4, df=3, t(0.975)=3.182446305284263",
+  "predeclared_pass_rule": "lower 95% confidence bound >= 1",
+  "independent_audit": {
+    "status": "independent_complete_qualification_pass",
+    "all_raw_intervals_verified": 4088,
+    "independent_processes": 8,
+    "sha256": "b79c0aee4bc5a7c8a6f91e365f13e1294287dd2d19ea6c222925ea2e9f6e1482"
+  },
+  "scope": {
+    "gpus": 5,
+    "context_capacity": 262144,
+    "sequence_capacity": 262144,
+    "kv_capacity": 262144,
+    "output_tokens_per_run": 512,
+    "intervals_per_run": 511,
+    "windows": 1,
+    "prompt_tokens": 12,
+    "numerical_policy": "original-weights-native-backend-activations-ordered-f32",
+    "relay": "CPU rank-ordered F32",
+    "master_revision": "46a6fd8a129091741f9ebc6431f7f610abe1ccfc",
+    "full_history_262144_benchmarked": false,
+    "multiwindow_or_full_fault_suite_newly_qualified": false
+  },
+  "incremental_production_diff": {
+    "a_files": 10,
+    "a_insertions": 156,
+    "a_deletions": 132,
+    "a_net_lines": 24,
+    "c_files": 1,
+    "c_insertions": 4,
+    "c_deletions": 3,
+    "c_net_lines": 1,
+    "total_overlay_paths": 51,
+    "overlay_path_growth": 0,
+    "removed_obsolete_hc320_lines": 110,
+    "public_c_signature_or_struct_changes": 0,
+    "new_native_parameter": "tp5-relay-native",
+    "private_attention_padding_parameter_added": true
+  },
+  "patches_on_e5": {
+    "production": {
+      "path": "build-tp5-native-speed-20261021/final-incremental-production.patch",
+      "sha256": "00509db37f21da615413cbf13225b36173b05b3a9313b134cefc908f183a5931"
+    },
+    "test_correction": {
+      "path": "build-tp5-native-speed-20261021/test-correction.patch",
+      "sha256": "dea119c27f17136f995af1845b69326841996e010f09fc8a76ca157e34e67a08"
+    }
+  },
+  "frozen_install": {
+    "a": "build-tp5-native-speed-20261021/native-pad1024-install",
+    "c": "build-tp5-gap-repair-20261021/native-policy-compose-install/bin/tq-tp5-compose",
+    "launcher": "build-tp5-gap-repair-20261021/run-retained.py",
+    "launcher_sha256": "ef4c428d8fda41d3e56a4a4accd41e3f9ff0495684b7b1719b36933f886f00b0"
+  },
+  "final_checks": {
+    "upstream_source_guard_exit": 0,
+    "git_diff_check_exit": 0,
+    "overlay_manifest_matching_sources": 51,
+    "overlay_unique_paths": 51,
+    "production_frozen_sources_matching": 11,
+    "test_frozen_sources_matching": 1,
+    "patches_matching": 2,
+    "launcher_help_exit": 0,
+    "launcher_library_binding": "pass",
+    "updated_documentation_files": 7
+  },
+  "report": "build-tp5-native-speed-20261021/NATIVE-SPEED-REPORT.md",
+  "source_guard_receipt": "build-tp5-native-speed-20261021/final-source-guard.json",
+  "checkpoint": "build-tp5-native-speed-20261021/final-checkpoint.json"
+}

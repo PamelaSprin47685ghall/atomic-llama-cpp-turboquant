@@ -1,0 +1,48 @@
+cmake_minimum_required(VERSION 3.16)
+project(TQInstalledConsumer LANGUAGES CXX)
+enable_testing()
+# Resolve C's declared dependencies before any consumer explicitly finds B.
+find_package(TQCompose CONFIG REQUIRED)
+find_package(TQSampling CONFIG REQUIRED)
+find_package(TQCorpus CONFIG REQUIRED)
+find_package(TQText CONFIG REQUIRED)
+find_package(TQCalibration CONFIG REQUIRED)
+find_package(TQRelay CONFIG REQUIRED)
+
+if(TQ_EXPECTED_PREFIX)
+    get_filename_component(expected_prefix "${TQ_EXPECTED_PREFIX}" REALPATH)
+    foreach(imported_target IN ITEMS llama ggml::ggml ggml::ggml-base
+            TQCompose::compose TQSampling::sampling TQCorpus::corpus
+            TQText::text TQCalibration::calibration TQRelay::relay)
+        get_target_property(configurations ${imported_target} IMPORTED_CONFIGURATIONS)
+        set(location_properties IMPORTED_LOCATION)
+        foreach(configuration IN LISTS configurations)
+            string(TOUPPER "${configuration}" configuration)
+            list(APPEND location_properties "IMPORTED_LOCATION_${configuration}")
+        endforeach()
+        foreach(property IN LISTS location_properties)
+            get_target_property(location ${imported_target} ${property})
+            if(location)
+                get_filename_component(location "${location}" REALPATH)
+                string(FIND "${location}" "${expected_prefix}/" prefix_position)
+                if(NOT prefix_position EQUAL 0)
+                    message(FATAL_ERROR "${imported_target} escapes relocated prefix: ${location}")
+                endif()
+            endif()
+        endforeach()
+    endforeach()
+endif()
+
+add_executable(package-consumer main.cpp)
+target_compile_features(package-consumer PRIVATE cxx_std_17)
+target_link_libraries(package-consumer PRIVATE TQSampling::sampling TQCorpus::corpus
+    TQText::text TQCalibration::calibration)
+add_test(NAME installed-packages COMMAND package-consumer)
+
+add_executable(compose-consumer compose.cpp)
+target_link_libraries(compose-consumer PRIVATE TQCompose::compose)
+add_test(NAME installed-compose-transitive COMMAND compose-consumer)
+
+add_executable(relay-consumer relay.cpp)
+target_link_libraries(relay-consumer PRIVATE TQRelay::relay)
+add_test(NAME installed-relay COMMAND relay-consumer)

@@ -1,0 +1,12 @@
+{
+  "schema": "tp5.local_glu.v1",
+  "ranks": 5,
+  "hidden": 2048,
+  "intermediate": 512,
+  "active_rows": 2,
+  "block_elements": 256,
+  "block_bytes": 144,
+  "storage_layout": "independent_blocks_no_padding",
+  "strategy": "gather_intermediate",
+  "output_layout": "replicated"
+}

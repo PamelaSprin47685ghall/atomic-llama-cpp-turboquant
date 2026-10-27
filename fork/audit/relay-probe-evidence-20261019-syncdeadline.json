@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-19",
+  "status": "Sync-deadline batch complete: every bare native synchronize call is replaced by bounded event-poll sync (guide 35.8), and the timeout path is exercised on the live device by a new mandatory case, so a hung GPU becomes a bounded, attributable failure instead of a run that never returns (SPEC 7). Five-rank cross-device qualification remains pending the real five-GPU machine.",
+  "all_release_gates_passed": false,
+  "identity": {
+    "repository": "atomic-llama-cpp-turboquant",
+    "branch": "clean/fork-20261018",
+    "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "superseded_batch_commit": "a3d6035d0",
+    "superseded_batch_index": "audit/relay-probe-evidence-20261019-validator.json",
+    "provenance_note": "The validator-batch report (75dbd439) stays byte-identical history; this batch changes the probe binary (bounded syncs plus a new case), so the evidence was rerun from the final source and the new SHAs below supersede it. The 17 pre-existing per-device single-card results are identical in meaning."
+  },
+  "source": {
+    "probe_root": "fork/relay-probe",
+    "digests_at_head_before_commit": {
+      "main.cpp": "0afaae300632ed3fe02dbce93224fd6fcce5d44ac7836b42c047fb95716bc29f",
+      "evidence.cpp": "f963d9e498267de22e75e3a32cddcb9f90ee946ddcd524bb3dcc56d3375b199a",
+      "evidence.h": "b2bbce2e7857bfb6b7f0328b9eed639daf20ee33fc02ab60d9a304f7f3970b63",
+      "config-test.cpp": "ebd9af652b33d9f5924a16e14dc3dde0a645d079354daf8882d27894ac82369f",
+      "validate-report.py": "14058c110c2e57f3dbe9645c9dee6a80e4d5a1a0e782cb71c2a1873765b721e9"
+    },
+    "validator": {
+      "purpose": "Strict evidence validation for the operator on the real machine (guide 53.4).",
+      "self_test": "PASS (unchanged from the validator batch; registry list appended, so every fixture now carries the new case automatically).",
+      "checked_real_evidence": "both files below validate with exit 0"
+    }
+  },
+  "runtime": {
+    "system": "Linux x86_64",
+    "host_compiler": "GCC 16.2.1",
+    "probe_tu_compiler": "HIP clang (ROCm 7.2.4)",
+    "hip_runtime": "7.2.4",
+    "gpu": "AMD Radeon RX 6800",
+    "gcn_arch": "gfx1030",
+    "device_count": 1,
+    "rounds": 2000
+  },
+  "changes": [
+    "sync_with_deadline(stream, deadline_ms, what): all 17 bare hipDeviceSynchronize/hipStreamSynchronize sites (per-case checks, run_case and fail_case drains, five-rank per-rank and teardown drains, bench drains) now poll a recorded event with a host deadline; a healthy queue returns in microseconds, a stalled one raises a regular hip_error that the existing per-case handling records and moves past (guide 35.8; SPEC 7)",
+    "stall_kernel + case_native_sync_deadline: the timeout branch is executed on the live device instead of shipping unexecuted to the operator - a waiter spinning far past the 2 s short deadline triggers the bounded failure, the stop word recovers it, and the drain completes; the case is mandatory, so a machine that cannot observe this fails qualification",
+    "registry 18 -> 19 cases; validator REGISTRY and config-test registry/count updated in lockstep; record order per device is append-only, so superseded reports keep their exact claim scope",
+    "report limits now state the 60 s native-sync bound and the 2 s on-device exercise",
+    "README operator section updated: healthy-machine stdout now ends with native_sync_deadline=pass, 19 cases per device, and a hung rank yields a bounded failure instead of an infinite run"
+  ],
+  "evidence": {
+    "report": {
+      "path": "build-relay-probe-20261019c/probe-report-final-20261019d.json",
+      "sha256": "c0a21839a6bb1a3c338e1b228e77798acc756df9d066bcc0f13a8053b0762e1f",
+      "qualification": "pass",
+      "validated": "exit 0",
+      "summary": "19-case registry; 18 cases per device: all pass except the expected platform fact host_system_rmw_u64_add=fail; native_sync_deadline=pass with the 2 s deadline observed on the live device; five_rank_status=not_run (one device present)."
+    },
+    "bench": {
+      "path": "build-relay-probe-20261019c/probe-bench-final-20261019d.json",
+      "sha256": "04473ee14ab5ea1490da1424e826cd0a53d5905ded18f5886895cd76f8cc375b",
+      "validated": "exit 0",
+      "medians": {
+        "host_publish_to_device_ack_ns": 9630,
+        "device_produce_to_host_ready_ns": 7220,
+        "five_stream_relay_cycle_ns": 29930,
+        "host_five_way_fold_bytes_per_second": 42708852432
+      }
+    },
+    "superseded": {
+      "report_sha256": "75dbd439ab9bc04a00fbc7f4dbb6a9da8e10f3f95e9918cf70d06c4c87ddec4c",
+      "bench_sha256": "29efb0c18a388e3a551435627d4649e2191b636542b9a46df05e4a83cc78e80d",
+      "note": "Both stay byte-identical in build-relay-probe-20261019c/ as the validator-batch artifacts."
+    }
+  },
+  "pending_for_five_card_machine": [
+    "run the probe with HIP_VISIBLE_DEVICES selecting exactly five devices (README operator section)",
+    "expect exit 0, five_rank_status=pass, 19 cases per device; archive stdout/stderr/exit/SHAs",
+    "run validate-report.py on the produced files before shipping them back",
+    "update this index family with the cross-device evidence"
+  ]
+}

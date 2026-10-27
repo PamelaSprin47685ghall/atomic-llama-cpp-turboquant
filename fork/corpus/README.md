@@ -1,0 +1,93 @@
+# TQCorpus
+
+TQCorpus stores request token sequences in a shared prefix trie. Each request
+keeps its own record, including duplicate requests. It requires C++17 and the
+standard library. It has no llama.cpp, ggml, model, or GPU dependency.
+
+The consumer supplies token ids and a vocabulary size. The size checks the token
+range. It does not prove that a corpus and a model use the same tokenizer. The
+consumer must preserve and compare model or tokenizer provenance.
+
+## Build and install
+
+    cmake -S fork/corpus -B build-corpus -DBUILD_TESTING=ON
+    cmake --build build-corpus
+    ctest --test-dir build-corpus --output-on-failure
+    cmake --install build-corpus --prefix /path/to/prefix
+
+A separate consumer uses find_package(TQCorpus CONFIG REQUIRED) and links
+TQCorpus::corpus. Include <tq/corpus/trie.h>.
+
+## Contract
+
+Construct tq::corpus::token_trie with a positive vocabulary size. append accepts
+a vector of valid int32 token ids and returns the request leaf id. Empty
+requests are preserved as leaf 0 with length 0, as in the production format.
+Repeated prefixes share nodes. Repeated requests keep separate request records.
+
+The one-argument append records kind `completion` and timestamp 0, meaning the
+capture time was not recorded. It does not invent a capture time. To preserve
+an existing request, pass `request_metadata{request_kind::infill, timestamp_ms}`
+as the second argument. Kinds match the production format: completion=1,
+infill=2, embedding=3, rerank=4. Unknown kinds are rejected before changing the
+trie. `request_metadata_at(request_id)` returns an owned value; request ids are
+zero-based and follow append/load order.
+
+Node ids start at 1. Node 0 is the implicit root and has no token. node(0) throws;
+children(0) returns root children and path_to(0) returns an empty vector. Each
+query returns an owned value. Copies and separate instances do not share state.
+
+node_count counts stored token nodes. request_count counts request records.
+leaf_positions sums full request lengths, including repeated prefixes and
+duplicate requests. Requests must fit the format's uint32 token count.
+
+save requires a new target directory with an existing parent directory. It
+creates the target directory and refuses every existing target, including an
+empty directory. It writes nodes-000000.bin and requests-000000.bin. It does not
+provide crash-atomic publication or filesystem durability. If a process stops
+during a save, remove or inspect the incomplete new directory before retrying.
+Ordinary write failures remove the files that this save created.
+
+## Existing corpus format
+
+The reader and writer use the token records from the existing request-token
+prefix trie:
+
+| Item | Layout |
+| --- | --- |
+| Header | 8-byte magic, uint32 version 1, uint32 record size, uint64 first global id |
+| Nodes file | CLTNOD01; 16-byte records: uint64 parent, int32 token, 4 reserved bytes |
+| Requests file | CLTREQ01; 24-byte records: uint64 leaf, uint32 token count, uint32 kind, uint64 timestamp_ms |
+
+All integers use little-endian byte order. The first global id is 1 in the node
+header and 0 in the request header. Node reserved bytes must be zero. The reader
+and writer preserve token paths, node ids, request order, duplicate requests,
+request kinds and all 64 timestamp bits. They do not infer model identity from
+the vocabulary size.
+
+This package reads and writes one canonical shard per stream: `nodes-000000.bin`
+and `requests-000000.bin`. It rejects other numeric shard names, including gaps
+or alternate spellings of shard zero, rather than silently dropping requests.
+Read a quiescent corpus; concurrent server recording is not supported. The
+production server also supports recovery of partial final records; this snapshot
+API rejects incomplete records without repairing the source. Empty requests
+retain leaf 0, length 0 and their metadata. Multi-shard append/recovery is a separate
+production recording feature, not provided by this package.
+
+The original server opens a stream only when its first record is written. A
+missing stream therefore means zero records: an empty-only production corpus
+can have a requests file without a nodes file, and an unused corpus can have
+neither. Missing nodes still make any nonempty request invalid. Saving emits
+both canonical headers, including for empty streams. Present but unreadable or
+truncated streams are rejected.
+
+Early TQCorpus snapshots incorrectly wrote node start_id=0 and discarded request
+metadata. Those files are explicitly rejected; rebuild them from the original
+token requests or use the original production corpus. No metadata can be safely
+recovered from zero bytes alone.
+
+The reader rejects wrong magic, version, stride, incomplete records, invalid
+tokens, nondecreasing parents, duplicate trie edges, missing leaves, incorrect
+request depths, invalid start ids, reserved node bits and unknown request kinds.
+The parent rule rejects cycles without recursion. Parsing and path traversal
+are iterative.
