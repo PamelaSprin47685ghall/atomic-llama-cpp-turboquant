@@ -14,6 +14,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -80,6 +81,9 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    // Fixed once per loader: transform only the complete qualified HC profile.
+    ggml_type hc_weight_type = GGML_TYPE_BF16;
+    std::unordered_set<std::string> hc_quantized_loaded;
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
@@ -197,6 +201,12 @@ struct llama_model_loader {
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
+
+    static const std::map<std::string, bool> & hc_pair_profile();
+    const char * hc_weight_option_name() const;
+    bool is_hc_quantized_weight(const char * name) const;
+    bool ctx_has_hc_quantized_weights(ggml_context * ctx) const;
+    void validate_hc_quantized_loaded() const;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

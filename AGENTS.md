@@ -69,6 +69,20 @@ TODO
 
 # TP5-最新设计保姆级指南
 
+> **本轮单流性能修复补记（2026-10-19）**：Qwen3-8B Q8_0 / 五 RX 6800 的相同固定单请求，四个独立配对 block 确认原生重放前/修复后为 9.1784/54.9584 token/s，速率比 5.98781，95% CI [5.29900,6.76615]。采用有界整步 HIP 原生重放、两 kernel RELAY、无 activation 重量化的 Q8/F32 投影与保序 CPU SIMD；公共 relay ABI 1 不变，私有 provider ABI 为 2，通用 GGML_HIP_GRAPHS 仍关闭。FA on/off 完整 16-token 生命周期、KV 256→512 的 288-token 全 logits、第 8 epoch abort、host C/C++ ASan 与新安装搬迁均已实际通过，原数值门不变。FA 仍默认 off；当前四请求试验未确认双窗额外收益，不能沿用旧镜像 1.71597 倍结论。当前身份和范围见 `fork/audit/tp5-performance-20261019.json`、`fork/VALIDATION.md`；紧随其后的实现、速度、安装补记及正文旧状态保留原生重放前证据，不代表本轮新镜像。master 的 60–67 token/s 是另一模型/量化/Vulkan 负载，不作为本模型同条件加速比。
+
+> **当前实现状态补记（2026-10-19）**：下文 2026-10-18 的设计、固定比较对象和历史判断保持原身份；不要把它们当成后来代码的当前状态。现在已有可安装的 [`fork/tp5-compose`](fork/tp5-compose/README.md)：真实 Qwen3-8B Q8_0、五张 RX 6800 / HIP gfx1030、CPU ordered-F32 relay、整链预提交、两个独立 context。FA 默认 **off**，依据固定工作负载实测最快的合格模式选择；显式 **on 也有完整数值/生命周期资格**，不是禁用或不支持。精确 on profile 复用已有 fused online F32 kernel，保留 F32 操作数，不以 F16 舍入或拆开的 QK/softmax 图替代。最终 `acceptance-fa-final` 的四请求各八 token 完整 logits、慢消费者、取消与真实 native-drain abort 门全部通过；32 行 / 4,861,952 logits 在 `.002 + .001*abs(reference)` 门下超差 0，max_abs `2.193450927734375e-5`。五卡 arithmetic oracle 为 Q8/F32 170 例、最终 FA **180 例**（含 always-masked K/V NaN）；FA-on trace 是五卡各 144、合计 720 次融合 FA launch，off trace 为 0。
+>
+> 当前 manifest 共 **48 个已审 A 路径**（已经包含两个新增 Q8/F32 文件），组件为七 B / 七 C。85 条隔离命令通过属于保存的 **45-path 前 FA 候选**，不能提升为最终 FA 构建完整重跑 archive 隔离的资格。最终 HIP 已完成七 B / 七 C 构建安装与 11/11 A seams；最终安装包另已通过真实搬迁及公开消费者的选定合同。当前 48-path 精确源码身份、末尾 guard 与最终机器索引看各自最终回执，不用阶段通过代替所有门全绿。LFM2 MoE TP5、其他模型/后端、长上下文、MTP、RERoT+TP5 与通用性能收益均不从这里获得支持。以 [当前验证记录](fork/VALIDATION.md)、[机器索引](fork/audit/tp5-acceptance-20261019.json) 为准；原失败证据和历史 Vulkan FA/TOPK 失败保留，不放宽数值门。
+>
+> 后续实际回执：FA-off 八 token main/slow/cancel/abort 全通过；FA-on 32-token **main-only** 对照的 128 行 / 19,447,808 logits 超差 0、max_abs `9.059906005859375e-5`，不冒充 32-token 生命周期全矩阵。当前源码 host-only ASan 在四个原始 193-token prompt、两个 context、每请求生成两 token 下退出 0；此前四 token main+abort ASan 保留原候选身份。Leak detection 关闭，不声称 GPU sanitizer、全场景 ASan 或无泄漏。合法无输出 prefill 的空 tensor 由 strict preflight 跳过，不造 logits、不缩短 prompt。共享 F32 kernel 在 K/V 读取前跳过 -INF masked key，改善共享 banded kernel 的 masked-nonfinite 语义；普通 FA 路由/精度不变，不笼统宣称其他后端一切不变。
+>
+> **速度裁决**：`per-stream-fa-final/summary.json` 有 12 个进程、三个配对 block，固定四请求 × 193 prompt token × 32 teacher 输出。每流几何平均 token/s：off/1窗口 **8.9853**、off/2窗口 **15.4185**、on/1窗口 **7.7510**、on/2窗口 **13.4642**。两窗口 on/off 比 **0.87325**，95% CI **[0.83966,0.90818]**，on 慢约 **12.7%**，不晋级为性能默认。只有 n=3 独立 block；每请求 31 个 ITL，p99 不稳定；TTFT 是 admission-to-first-commit，排除模型加载和网络。原 `per-stream-fa` 失败与 `per-stream-fa-prefill-fixed` 较慢结果保留。用户关心速度不等于要求默认 on，先前的相反假设已按数据纠正。
+
+> 同一 off 工作负载的两/一窗口速率比 **1.71596659**，95% 配对 t 区间 **[1.28598327,2.28971978]**（`per-stream-fa-final/default-decision.json`），仍仅 n=3，不扩写为通用并发收益。TTFT 还排除 context startup 与 admission 前 queueing，不能当作端到端时延。
+
+> **最终安装包证明**：`hip-package-proof/summary.json` 通过选定合同。15 组件（A+七 B+七 C）fresh install 到 stage 后改名 relocated；外部消费者配置/构建与所有 GPU 调用期间，原 stage 与旧 install 前缀真实不存在，证明后才恢复。只用 `find_package(TQTP5Compose)`、安装公共头/imported targets，编译路径无旧前缀/私有源码头，`ldd` 指向 relocated libraries。外部两请求显式 on/双 context/五 rank/预算 0，直接 CLI 默认 off 双请求、单请求自动一窗口/off、三请求一窗口/on 均实际通过。实际 helper `share/TQTP5Compose/real-tp5.py` 的搬迁 predict4 main-only 全 logits 通过；初次猜错 share 路径的失败保留，未重复成功 setup。最终包 trace 绑定五个 BDF，on=720（144/卡）、off=0；native libraries 与 12 个性能进程相同，每个性能 case 均显式 on/off。W0 请求 delay/W1 abort 的组合场景两 completed mask=31、unknown=0、预算 0、exit1；**精确 held-borrow 分支未单独 instrument，不声称分支覆盖**。
+
 > 文档日期：2026-10-18。用途：对照固定旧 TP5 源码，修订《设计稿.md》，形成可逐步实现、可拒绝非法配置、可独立审查的工程设计。本文不是已完成的 ROCm TP5 发布声明。
 >
 > 目标保留为五张 GPU 共同承担模型计算、CPU 完成跨 rank 合并、两个独立窗口交错。对“每个大算子严格五等分”“零复制”“双端忙等”“每流性能提升”的要求分别建立合同，避免一个口号掩盖另一个条件不成立。

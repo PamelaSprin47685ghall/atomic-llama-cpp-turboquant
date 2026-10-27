@@ -3,8 +3,384 @@
 #include "unary.cuh"
 #include "mmvf.cuh"
 
+#include <climits>
 #include <cstdlib>
+#include <cstring>
 #include "convert.cuh"
+
+#if defined(GGML_USE_HIP)
+// Read four adjacent values per lane. Independent sums hide load and FMA latency.
+// Each short row uses one wave. Long rows use eight waves and one barrier.
+template<int threads_per_row>
+static __global__ void mul_mat_vec_bf16_load4(
+        const nv_bfloat16 * x, const float * y, float * dst,
+        const int ncols, const int nrows) {
+    constexpr int warp_size = 32;
+    constexpr int waves_per_row = threads_per_row / warp_size;
+    const int row = blockIdx.x * (blockDim.x / threads_per_row) + threadIdx.x / threads_per_row;
+    const int lane = threadIdx.x % threads_per_row;
+    if (row >= nrows) {
+        return;
+    }
+
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    for (int col = 4 * lane; col < ncols; col += 4 * threads_per_row) {
+        uint2 weights;
+        float4 values;
+        memcpy(&weights, x + int64_t(row) * ncols + col, sizeof(weights));
+        memcpy(&values, y + col, sizeof(values));
+        sum0 = __fmaf_rn(__uint_as_float(weights.x << 16), values.x, sum0);
+        sum1 = __fmaf_rn(__uint_as_float(weights.x & 0xffff0000u), values.y, sum1);
+        sum2 = __fmaf_rn(__uint_as_float(weights.y << 16), values.z, sum2);
+        sum3 = __fmaf_rn(__uint_as_float(weights.y & 0xffff0000u), values.w, sum3);
+    }
+
+    float sum = warp_reduce_sum<warp_size>((sum0 + sum1) + (sum2 + sum3));
+    if constexpr (threads_per_row > warp_size) {
+        __shared__ float partial[waves_per_row];
+        if (lane % warp_size == 0) {
+            partial[lane / warp_size] = sum;
+        }
+        __syncthreads();
+        if (lane >= warp_size) {
+            return;
+        }
+        sum = warp_reduce_sum<warp_size>(lane < waves_per_row ? partial[lane] : 0.0f);
+    }
+    if (lane == 0) {
+        dst[row] = sum;
+    }
+}
+
+// Same 256-thread load4 reduction as the qualified resident BF16 control;
+// scale and SiLU are evaluated once by lane zero before writing the terminal.
+static __global__ void hc_down_silu_t1_bf16(
+        const nv_bfloat16 * weights, const float * xn, float * lo) {
+    constexpr int columns = 10240, threads = 256, wave = 32, waves = threads / wave;
+    const int row = int(blockIdx.x), lane = int(threadIdx.x);
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    for (int col = 4 * lane; col < columns; col += 4 * threads) {
+        uint2 bits;
+        float4 values;
+        memcpy(&bits, weights + int64_t(row) * columns + col, sizeof(bits));
+        memcpy(&values, xn + col, sizeof(values));
+        sum0 = __fmaf_rn(__uint_as_float(bits.x << 16), values.x, sum0);
+        sum1 = __fmaf_rn(__uint_as_float(bits.x & 0xffff0000u), values.y, sum1);
+        sum2 = __fmaf_rn(__uint_as_float(bits.y << 16), values.z, sum2);
+        sum3 = __fmaf_rn(__uint_as_float(bits.y & 0xffff0000u), values.w, sum3);
+    }
+    float sum = warp_reduce_sum<wave>((sum0 + sum1) + (sum2 + sum3));
+    __shared__ float partial[waves];
+    if (lane % wave == 0) {
+        partial[lane / wave] = sum;
+    }
+    __syncthreads();
+    if (lane < wave) {
+        sum = warp_reduce_sum<wave>(lane < waves ? partial[lane] : 0.0f);
+        if (lane == 0) {
+            const float scaled = sum * 0.25f;
+            lo[row] = scaled / (1.0f + expf(-scaled));
+        }
+    }
+}
+
+// One block computes one mixed coordinate; each wave owns a complete dot product.
+static __global__ void hc_owner_tail4_t1_bf16(
+        const nv_bfloat16 * weights, const float * lo, const float * xn,
+        float * dst, int dim) {
+    constexpr int k = 320;
+    constexpr int wave_size = 32;
+    const int j = int(blockIdx.x);
+    const int stream = int(threadIdx.x) / wave_size;
+    const int lane = int(threadIdx.x) % wave_size;
+    const int row = stream * dim + j;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    for (int col = 4 * lane; col < k; col += 4 * wave_size) {
+        uint2 w;
+        float4 x;
+        memcpy(&w, weights + int64_t(row) * k + col, sizeof(w));
+        memcpy(&x, lo + col, sizeof(x));
+        sum0 = __fmaf_rn(__uint_as_float(w.x << 16), x.x, sum0);
+        sum1 = __fmaf_rn(__uint_as_float(w.x & 0xffff0000u), x.y, sum1);
+        sum2 = __fmaf_rn(__uint_as_float(w.y << 16), x.z, sum2);
+        sum3 = __fmaf_rn(__uint_as_float(w.y & 0xffff0000u), x.w, sum3);
+    }
+    const float sum = warp_reduce_sum<wave_size>((sum0 + sum1) + (sum2 + sum3));
+    __shared__ float gated[4];
+    if (lane == 0) {
+        const float gate = 1.0f / (1.0f + expf(-sum));
+        gated[stream] = xn[row] * gate;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        dst[j] = (((gated[0] + gated[1]) + gated[2]) + gated[3]) * 0.25f;
+    }
+}
+
+// Direct F32 activation kernels for immutable load-time Q8_0 HC weights.
+// Arithmetic and lane mapping match the qualified equal-two-kernel fixture.
+static_assert(QK8_0 == 32 && sizeof(block_q8_0) == 34, "HC Q8_0 block ABI");
+
+static __device__ __forceinline__ float hc_q8_group4(
+        const block_q8_0 * row, const float * x, const int col) {
+    const block_q8_0 & b = row[col / QK8_0];
+    uint16_t halves[2];
+    memcpy(halves, b.qs + col % QK8_0, sizeof(halves));
+    const uint32_t codes = uint32_t(halves[0]) | (uint32_t(halves[1]) << 16);
+    const float q0 = float(int(( codes        & 255u) ^ 128u) - 128);
+    const float q1 = float(int(((codes >>  8) & 255u) ^ 128u) - 128);
+    const float q2 = float(int(((codes >> 16) & 255u) ^ 128u) - 128);
+    const float q3 = float(int(((codes >> 24) & 255u) ^ 128u) - 128);
+    float4 values;
+    memcpy(&values, x + col, sizeof(values));
+    const float dot01 = __fmaf_rn(q0, values.x, q1 * values.y);
+    const float dot23 = __fmaf_rn(q2, values.z, q3 * values.w);
+    return __half2float(b.d) * (dot01 + dot23);
+}
+
+template<int columns, int threads>
+static __device__ __forceinline__ float hc_q8_row_partial(
+        const block_q8_0 * weights, const float * x, const int row, const int lane) {
+    static_assert(columns % QK8_0 == 0 && threads % 32 == 0, "complete HC Q8 blocks/waves");
+    const auto * w = weights + int64_t(row) * (columns / QK8_0);
+    float sums[4] = {};
+    // Unique four-coefficient chunks: lane, group, iteration partition the row.
+    for (int base = 4 * lane; base < columns; base += 16 * threads) {
+#pragma unroll
+        for (int group = 0; group < 4; ++group) {
+            const int col = base + group * 4 * threads;
+            if (col < columns) {
+                sums[group] += hc_q8_group4(w, x, col);
+            }
+        }
+    }
+    return (sums[0] + sums[1]) + (sums[2] + sums[3]);
+}
+
+static __global__ void hc_down_silu_t1_q8_f32(
+        const block_q8_0 * weights, const float * xn, float * lo) {
+    constexpr int columns = 10240, threads = 256, wave = 32, waves = threads / wave;
+    const int row = int(blockIdx.x), lane = int(threadIdx.x);
+    float sum = warp_reduce_sum<wave>(hc_q8_row_partial<columns, threads>(weights, xn, row, lane));
+    __shared__ float partial[waves];
+    if (lane % wave == 0) {
+        partial[lane / wave] = sum;
+    }
+    __syncthreads();
+    if (lane < wave) {
+        sum = warp_reduce_sum<wave>(lane < waves ? partial[lane] : 0.0f);
+        if (lane == 0) {
+            const float scaled = sum * 0.25f;
+            lo[row] = scaled / (1.0f + expf(-scaled));
+        }
+    }
+}
+
+static __global__ void hc_owner_tail4_t1_q8_f32(
+        const block_q8_0 * weights, const float * lo, const float * xn, float * dst) {
+    constexpr int dim = 2560, k = 320, wave = 32;
+    const int j = int(blockIdx.x), stream = int(threadIdx.x) / wave, lane = int(threadIdx.x) % wave;
+    const int row = stream * dim + j;
+    const float sum = warp_reduce_sum<wave>(hc_q8_row_partial<k, wave>(weights, lo, row, lane));
+    __shared__ float gated[4];
+    if (lane == 0) {
+        gated[stream] = xn[row] * (1.0f / (1.0f + expf(-sum)));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        dst[j] = (((gated[0] + gated[1]) + gated[2]) + gated[3]) * 0.25f;
+    }
+}
+
+// Direct F32 activation kernels for immutable load-time Q4_0 HC weights.
+// Paired-eight decoding and reduction match the qualified Q4/Q8 stream32 micro.
+static_assert(QK4_0 == 32 && sizeof(block_q4_0) == 18, "HC Q4_0 block ABI");
+
+// Four bytes encode eight coefficients: low nibbles at j..j+3,
+// high nibbles at j+16..j+19. Each packed byte and coefficient is visited once.
+static __device__ __forceinline__ float hc_q4_dot4(const uint32_t codes, const float4 values) {
+    const float q0 = float(int( codes        & 15u) - 8);
+    const float q1 = float(int((codes >>  8) & 15u) - 8);
+    const float q2 = float(int((codes >> 16) & 15u) - 8);
+    const float q3 = float(int((codes >> 24) & 15u) - 8);
+    return __fmaf_rn(q0, values.x, q1 * values.y) +
+           __fmaf_rn(q2, values.z, q3 * values.w);
+}
+
+static __device__ __forceinline__ float hc_q4_group8(
+        const block_q4_0 * row, const float * x, const int chunk) {
+    const int block = chunk / 4, offset = (chunk % 4) * 4;
+    const block_q4_0 & b = row[block];
+    uint16_t halves[2];
+    // An 18-byte block has only two-byte alignment. No aligned uint32_t cast.
+    memcpy(halves, b.qs + offset, sizeof(halves));
+    const uint32_t codes = uint32_t(halves[0]) | (uint32_t(halves[1]) << 16);
+    const int col = block * QK4_0 + offset;
+    float4 low, high;
+    memcpy(&low, x + col, sizeof(low));
+    const float low_dot = hc_q4_dot4(codes, low);
+    memcpy(&high, x + col + QK4_0 / 2, sizeof(high));
+    const float high_dot = hc_q4_dot4(codes >> 4, high);
+    // Q4_0's signed delta may be negative. Do not take abs or clamp it.
+    return __half2float(b.d) * (low_dot + high_dot);
+}
+
+template<int columns, int threads>
+static __device__ __forceinline__ float hc_q4_row_partial(
+        const block_q4_0 * weights, const float * x, const int row, const int lane) {
+    static_assert(columns % QK4_0 == 0 && threads % 32 == 0, "complete HC Q4 blocks/waves");
+    const auto * w = weights + int64_t(row) * (columns / QK4_0);
+    float sums[4] = {};
+    // g = lane + threads*(group + 4*iteration) is a unique group-of-eight id.
+    // g/4 selects the block; g%4 selects one disjoint four-byte packed span.
+    for (int base = lane; base < columns / 8; base += 4 * threads) {
+#pragma unroll
+        for (int group = 0; group < 4; ++group) {
+            const int chunk = base + group * threads;
+            if (chunk < columns / 8) {
+                sums[group] += hc_q4_group8(w, x, chunk);
+            }
+        }
+    }
+    return (sums[0] + sums[1]) + (sums[2] + sums[3]);
+}
+
+static __global__ void hc_down_silu_t1_q4_f32(
+        const block_q4_0 * weights, const float * xn, float * lo) {
+    constexpr int columns = 10240, threads = 256, wave = 32, waves = threads / wave;
+    const int row = int(blockIdx.x), lane = int(threadIdx.x);
+    float sum = warp_reduce_sum<wave>(hc_q4_row_partial<columns, threads>(weights, xn, row, lane));
+    __shared__ float partial[waves];
+    if (lane % wave == 0) {
+        partial[lane / wave] = sum;
+    }
+    __syncthreads();
+    if (lane < wave) {
+        sum = warp_reduce_sum<wave>(lane < waves ? partial[lane] : 0.0f);
+        if (lane == 0) {
+            const float scaled = sum * 0.25f;
+            lo[row] = scaled / (1.0f + expf(-scaled));
+        }
+    }
+}
+
+static __global__ void hc_owner_tail4_t1_q4_f32(
+        const block_q4_0 * weights, const float * lo, const float * xn, float * dst) {
+    constexpr int dim = 2560, k = 320, wave = 32;
+    const int j = int(blockIdx.x), stream = int(threadIdx.x) / wave, lane = int(threadIdx.x) % wave;
+    const int row = stream * dim + j;
+    const float sum = warp_reduce_sum<wave>(hc_q4_row_partial<k, wave>(weights, lo, row, lane));
+    __shared__ float gated[4];
+    if (lane == 0) {
+        gated[stream] = xn[row] * (1.0f / (1.0f + expf(-sum)));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        dst[j] = (((gated[0] + gated[1]) + gated[2]) + gated[3]) * 0.25f;
+    }
+}
+
+#endif
+
+// Private fixed-shape HC down entry point; the graph matcher proves closure.
+bool ggml_cuda_op_hc_down_silu_t1(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
+        const ggml_tensor * xn, ggml_tensor * lo) {
+#if defined(GGML_USE_HIP)
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    const bool q8 = weights && weights->type == GGML_TYPE_Q8_0;
+    const bool q4 = weights && weights->type == GGML_TYPE_Q4_0;
+    if (ctx.quantized_matmul_f32 || device.cc != GGML_CUDA_CC_RDNA2 || device.warp_size != 32 ||
+            !weights || !xn || !lo || (weights->type != GGML_TYPE_BF16 && !q8 && !q4) ||
+            xn->type != GGML_TYPE_F32 || lo->type != GGML_TYPE_F32 ||
+            weights->ne[0] != 10240 || weights->ne[1] != 320 ||
+            weights->ne[2] != 1 || weights->ne[3] != 1 ||
+            xn->ne[0] != 10240 || xn->ne[1] != 1 || xn->ne[2] != 1 || xn->ne[3] != 1 ||
+            lo->ne[0] != 320 || lo->ne[1] != 1 || lo->ne[2] != 1 || lo->ne[3] != 1 ||
+            !ggml_is_contiguous(weights) || !ggml_is_contiguous(xn) || !ggml_is_contiguous(lo) ||
+            !weights->data || !xn->data || !lo->data ||
+            uintptr_t(weights->data) % (q4 ? alignof(block_q4_0) : q8 ? alignof(block_q8_0) : alignof(uint2)) != 0 ||
+            uintptr_t(xn->data) % alignof(float4) != 0 ||
+            uintptr_t(lo->data) % alignof(float) != 0) {
+        return false;
+    }
+    const ggml_cuda_kernel_launch_params launch = {
+        dim3(320, 1, 1), dim3(256, 1, 1), 0, ctx.stream(),
+    };
+    if (q8) {
+        ggml_cuda_kernel_launch(hc_down_silu_t1_q8_f32, launch,
+            (const block_q8_0 *) weights->data, (const float *) xn->data, (float *) lo->data);
+    } else if (q4) {
+        ggml_cuda_kernel_launch(hc_down_silu_t1_q4_f32, launch,
+            (const block_q4_0 *) weights->data, (const float *) xn->data, (float *) lo->data);
+    } else {
+        ggml_cuda_kernel_launch(hc_down_silu_t1_bf16, launch,
+            (const nv_bfloat16 *) weights->data, (const float *) xn->data, (float *) lo->data);
+    }
+    return true;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(weights);
+    GGML_UNUSED(xn);
+    GGML_UNUSED(lo);
+    return false;
+#endif
+}
+
+// Private entry point; graph topology and lifetime guards are in the matcher.
+bool ggml_cuda_op_hc_owner_tail4_t1(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
+        const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP)
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    const bool q8 = weights && weights->type == GGML_TYPE_Q8_0;
+    const bool q4 = weights && weights->type == GGML_TYPE_Q4_0;
+    if (ctx.quantized_matmul_f32 || device.cc != GGML_CUDA_CC_RDNA2 || device.warp_size != 32 ||
+            !weights || !lo || !xn || !dst ||
+            (weights->type != GGML_TYPE_BF16 && !q8 && !q4) || lo->type != GGML_TYPE_F32 ||
+            xn->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            weights->ne[0] != 320 || weights->ne[1] <= 0 || weights->ne[1] > INT_MAX ||
+            weights->ne[1] % 4 != 0 || weights->ne[2] != 1 || weights->ne[3] != 1 ||
+            ((q8 || q4) && weights->ne[1] != 10240) ||
+            lo->ne[0] != 320 || lo->ne[1] != 1 || lo->ne[2] != 1 || lo->ne[3] != 1 ||
+            xn->ne[0] != weights->ne[1] || xn->ne[1] != 1 || xn->ne[2] != 1 || xn->ne[3] != 1 ||
+            dst->ne[0] != weights->ne[1] / 4 || dst->ne[1] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            !ggml_is_contiguous(weights) || !ggml_is_contiguous(lo) ||
+            !ggml_is_contiguous(xn) || !ggml_is_contiguous(dst) ||
+            !weights->data || !lo->data || !xn->data || !dst->data ||
+            uintptr_t(weights->data) % (q4 ? alignof(block_q4_0) : q8 ? alignof(block_q8_0) : alignof(uint2)) != 0 ||
+            uintptr_t(lo->data) % alignof(float4) != 0 ||
+            uintptr_t(xn->data) % alignof(float) != 0 ||
+            uintptr_t(dst->data) % alignof(float) != 0) {
+        return false;
+    }
+    const int dim = int(dst->ne[0]);
+    const ggml_cuda_kernel_launch_params launch = {
+        dim3(uint32_t(dim), 1, 1), dim3(128, 1, 1), 0, ctx.stream(),
+    };
+    if (q8) {
+        ggml_cuda_kernel_launch(hc_owner_tail4_t1_q8_f32, launch,
+            (const block_q8_0 *) weights->data, (const float *) lo->data,
+            (const float *) xn->data, (float *) dst->data);
+    } else if (q4) {
+        ggml_cuda_kernel_launch(hc_owner_tail4_t1_q4_f32, launch,
+            (const block_q4_0 *) weights->data, (const float *) lo->data,
+            (const float *) xn->data, (float *) dst->data);
+    } else {
+        ggml_cuda_kernel_launch(hc_owner_tail4_t1_bf16, launch,
+            (const nv_bfloat16 *) weights->data, (const float *) lo->data,
+            (const float *) xn->data, (float *) dst->data, dim);
+    }
+    return true;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(weights);
+    GGML_UNUSED(lo);
+    GGML_UNUSED(xn);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
@@ -432,6 +808,7 @@ void launch_mul_mat_vec_f_cuda(
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
 
+
     int64_t block_size_best = warp_size;
     int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
     int64_t max_block_size  = 256;
@@ -715,6 +1092,33 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         } break;
         case GGML_TYPE_BF16: {
             const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0->data;
+#if defined(GGML_USE_HIP)
+            // Native arithmetic may regroup sums. The decoded-F32 reference
+            // keeps its existing path. Strided, unaligned, batched and fused ops stay there.
+            if (!ctx.quantized_matmul_f32 && cc == GGML_CUDA_CC_RDNA2 &&
+                ggml_cuda_info().devices[ctx.device].warp_size == 32 &&
+                !ids && !fusion_local.gate && !fusion_local.x_bias && !fusion_local.gate_bias &&
+                ne00 > 0 && ne00 <= INT_MAX - 1024 && ne00 % 4 == 0 && ne01 > 0 && ne01 <= INT_MAX &&
+                ne02 == 1 && ne03 == 1 && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+                uintptr_t(src0_d) % alignof(uint2) == 0 && uintptr_t(src1_d) % alignof(float4) == 0) {
+                if (ne00 <= 512) {
+                    const ggml_cuda_kernel_launch_params launch = {
+                        dim3((ne01 + 3) / 4, 1, 1), dim3(128, 1, 1), 0, ctx.stream(),
+                    };
+                    ggml_cuda_kernel_launch(mul_mat_vec_bf16_load4<32>, launch,
+                        src0_d, src1_d, dst_d, int(ne00), int(ne01));
+                } else {
+                    const ggml_cuda_kernel_launch_params launch = {
+                        dim3(ne01, 1, 1), dim3(256, 1, 1), 0, ctx.stream(),
+                    };
+                    ggml_cuda_kernel_launch(mul_mat_vec_bf16_load4<256>, launch,
+                        src0_d, src1_d, dst_d, int(ne00), int(ne01));
+                }
+                return;
+            }
+#endif
+
             mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());

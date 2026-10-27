@@ -359,6 +359,10 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        // Place input-layer weights on the first offloaded device, without a
+        // CPU buffer fallback. Requires real GPU layers and allocated weights.
+        // Tensor Meta placement keeps one read-only embedding copy per rank.
+        bool offload_input;
     };
 
     struct llama_sampler_seq_config {
@@ -461,6 +465,32 @@ extern "C" {
         // Set before creating the context, including any prefix prefill.
         // false keeps the optimized native quantized matrix dispatch.
         bool batch_invariant_matmul;
+
+        // Decode Q8_0 weights using their stored scales and multiply by F32
+        // activations without activation requantization, with F32 multiply-adds
+        // and partial sums (and F32 CPU reduction for tp5_relay).
+        // Qualified only for dense Qwen3-8B Q8_0 with all layers, output and
+        // Q8_0 input weights on one HIP GPU, or the five-HIP-device tp5_relay
+        // profile below. Requires 1..4 sequences/rows and GPU operation/KQV
+        // offload; load the model with offload_input=true. Context
+        // initialization rejects CPU, mixed offload and unsupported profiles;
+        // quantized projections never silently fall back to CPU execution.
+        // For this RDNA2 profile, Flash Attention requested with GGML_PREC_F32
+        // keeps F32 cache views, probabilities and V-weighted accumulation in
+        // F32 through the fused online-softmax attention implementation.
+        // Separate from batch_invariant_matmul, which must remain false.
+        // Set before creating the context. false preserves native dispatch.
+        bool quantized_matmul_f32;
+
+        // Strict Qwen3-8B Q8_0 tensor-parallel CPU relay on five HIP RX6800
+        // devices. Unsupported models, shapes or providers fail context init.
+        // Requires quantized_matmul_f32=true.
+        // The caller drives ggml-relay.h events from an independent worker,
+        // uses one ubatch per decode, and serializes all access per context.
+        // Supports 1..4 independent sequence IDs and F16/F32 KV with native
+        // ordinary or flash attention; no host-routed compute is admitted.
+        // Two contexts may share one read-only model; no adapters are admitted.
+        bool tp5_relay;
     };
 
     struct llama_model_tensor_override {
@@ -589,8 +619,16 @@ extern "C" {
             struct llama_context_params   params),
             "use llama_init_from_model instead");
 
-    // Frees all allocated memory
+    // Frees all allocated memory. Strict tp5-relay contexts must first prove
+    // native completion using ggml-relay.h and drain result/event readers.
+    // Unproved native completion retains the context rather than freeing live
+    // device owners; the shared model must also remain alive in that case.
     LLAMA_API void llama_free(struct llama_context * ctx);
+
+    // Borrow the one strict relay Meta backend, or NULL outside relay mode.
+    // Its lifetime is the context's. Only the thread-safe ggml-relay.h event
+    // API may run concurrently with llama_decode/llama_synchronize.
+    LLAMA_API struct ggml_backend * llama_tp5_relay_backend(struct llama_context * ctx);
 
     LLAMA_API int64_t llama_time_us(void);
 

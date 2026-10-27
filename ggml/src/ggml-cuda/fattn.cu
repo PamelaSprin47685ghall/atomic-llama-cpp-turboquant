@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "fattn-banded.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-turbo.cuh"
@@ -3264,6 +3265,19 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+#if defined(GGML_USE_HIP) && defined(FLASH_ATTN_AVAILABLE)
+    // Only the explicit decoded-F32 context uses the fused online F32 kernel.
+    // All operands and intermediates stay F32; ordinary FA keeps its existing
+    // selector and conversion policy.
+    if (ctx.quantized_matmul_f32 && dst->op == GGML_OP_FLASH_ATTN_EXT &&
+            ggml_flash_attn_ext_get_prec(dst) == GGML_PREC_F32 &&
+            GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ctx.device].cc) &&
+            ggml_cuda_flash_attn_ext_f32_supported(dst)) {
+        ggml_cuda_flash_attn_ext_f32(ctx, dst);
+        return;
+    }
+#endif
 
     // Fused turbo MMA decode gate (DEFAULT ON, see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
     // Routes turbo2/3/4 K==V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed

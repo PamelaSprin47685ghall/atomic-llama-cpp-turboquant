@@ -4,6 +4,7 @@
 import argparse
 import io
 import json
+import os
 from pathlib import Path
 import runpy
 import shutil
@@ -65,6 +66,19 @@ def main():
     records = []
     source_copies = []
     build_copies = []
+    # Installed consumption must not borrow headers or libraries from a prior
+    # development build through the compiler or dynamic loader environment.
+    clean_environment = os.environ.copy()
+    removed_environment = {}
+    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+                "DYLD_FALLBACK_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH",
+                "CPLUS_INCLUDE_PATH", "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR"):
+        if key in clean_environment:
+            removed_environment[key] = clean_environment.pop(key)
+    (output / "environment.json").write_text(json.dumps({
+        "removed_search_overrides": removed_environment,
+        "cmake_environment_and_package_root_search": "disabled",
+    }, indent=2) + "\n")
 
     def remove_copy(path):
         # Every removable tree is a direct child that this run created. Never
@@ -78,7 +92,8 @@ def main():
         command = [str(part) for part in command]
         print("+ " + " ".join(command), flush=True)
         with (output / f"{name}.log").open("wb") as log:
-            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False, cwd=output)
+            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False,
+                                    cwd=output, env=clean_environment)
         records.append({"name": name, "command": command, "returncode": result.returncode})
         (output / "commands.json").write_text(json.dumps(records, indent=2) + "\n")
         if result.returncode:
@@ -88,6 +103,7 @@ def main():
         command = ["cmake", "-S", source, "-B", build, "-DCMAKE_BUILD_TYPE=Release",
                    f"-DCMAKE_INSTALL_PREFIX={prefix}", "-DCMAKE_INSTALL_RPATH=$ORIGIN",
                    "-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF", "-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF",
+                   "-DCMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH=OFF", "-DCMAKE_FIND_USE_PACKAGE_ROOT_PATH=OFF",
                    "-DCMAKE_PREFIX_PATH=" + ";".join(str(part) for part in dependencies)]
         run(name + "-configure", command + list(extra))
         build_copies.append(build)
@@ -152,6 +168,7 @@ def main():
     logits_compose = module("logits-compose", (prefix_a,))
     imatrix_compose = module("imatrix-compose", (prefix_a, calibration))
     rerot_compose = module("rerot-compose", (prefix_a, rerot, relay, text_package, sampling))
+    tp5_compose = module("tp5-compose", (prefix_a, relay, scheduling, text_package))
     conversion_test = output / "imatrix-conversion.py"
     shutil.copyfile(root / "fork/imatrix-compose/tests/test_conversion.py", conversion_test)
     rerot_cli_test = output / "rerot-cli.py"
@@ -171,7 +188,8 @@ def main():
 
     delivered = output / "delivered"
     for prefix in (prefix_a, sampling, corpus, scheduling, text_package, calibration, relay, rerot,
-                   compose, corpus_compose, batch_compose, logits_compose, imatrix_compose, rerot_compose):
+                   compose, corpus_compose, batch_compose, logits_compose, imatrix_compose, rerot_compose,
+                   tp5_compose):
         shutil.copytree(prefix, delivered, dirs_exist_ok=True)
         remove_copy(prefix)
     for path in source_copies + build_copies:
@@ -181,7 +199,8 @@ def main():
 
     consumer = output / "consumer"
     shutil.copytree(root / "fork/tests/package-consumer", consumer)
-    configure("consumer", consumer, output / "build-consumer", output / "unused", (delivered,))
+    configure("consumer", consumer, output / "build-consumer", output / "unused", (delivered,),
+              [f"-DTQ_EXPECTED_PREFIX={delivered}"])
     run("consumer-build", ["cmake", "--build", output / "build-consumer", "--parallel", args.jobs])
     run("consumer-test", ["ctest", "--test-dir", output / "build-consumer", "--output-on-failure", "--no-tests=error"])
 
@@ -224,7 +243,8 @@ int main() {
     run("rerot-consumer-test", ["ctest", "--test-dir", output / "build-rerot-consumer", "--output-on-failure", "--no-tests=error"])
     for label, binary in (("compose", "llama-compose"), ("corpus", "llama-corpus"),
                           ("batch", "tq-batch-compose"), ("logits", "tq-logits-compose"),
-                          ("imatrix", "tq-imatrix-compose"), ("rerot", "tq-rerot-compose")):
+                          ("imatrix", "tq-imatrix-compose"), ("rerot", "tq-rerot-compose"),
+                          ("tp5", "tq-tp5-compose")):
         run("installed-" + label, [delivered / "bin" / binary, "--help"])
     run("relocated-imatrix-conversion", [sys.executable, conversion_test,
                                          "--binary", delivered / "bin/tq-imatrix-compose"])
@@ -266,6 +286,10 @@ int main() {
                                    "rerot-compose"],
               "source_and_build_copies_removed_before_consumption": True,
               "relocated_installed_consumers_passed": True,
+              "relocated_relay_consumer": "passed",
+              "relocated_compose_transitive_consumer": "passed",
+              "consumer_import_locations_checked": True,
+              "search_environment_receipt": "environment.json",
               "relocated_imatrix_conversion": "passed",
               "relocated_rerot_consumer": "passed",
               "relocated_rerot_cli": "passed",

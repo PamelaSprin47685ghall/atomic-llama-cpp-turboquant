@@ -1,4 +1,40 @@
+<!-- two-requests-current-status-20261021 -->
+## 2026-10-21：双请求保留版本与最终测量；每路 47 tok/s 目标未达到
+
+保留版本、证据和入口见[双请求报告](../build-tp5-two-requests-20261021/TWO-REQUESTS-REPORT.md)；以下旧正文保留。本次增量为 3 个 A 源文件和 1 个 C 源文件，公共 API 不变；使用原始模型权重、每请求 262144 容量的 Q4_0 K/V，并保留 Swift 共享权重派生 view 生命周期修复及五 rank host 提交顺序 gate。
+
+同 prompt 双请求组（n=2 个独立进程），每路 512 token：两路几何均值为 **37.629332 / 37.624558 tok/s**，aggregate 几何均值 **74.923025 tok/s**，范围 **74.847236–74.998891**。相同 C 版本的单请求观测（n=1）为 **46.071845 tok/s**；aggregate 对单请求的 **1.626222×** 仅作描述性比较。不同 prompt 的一个双请求案例为 **34.571716 / 34.899258 tok/s**，aggregate **69.062687 tok/s**。**两个请求各 47 tok/s（合计 94 tok/s）的目标未达到。** 历史 **47.34 tok/s** 只属于旧 F16 单请求配置。
+
+完整 16-token trace 已通过，49 组五 rank 提交保持一致次序，但该完整 tracing 的共同生成期 GPU overlap 为 **0**。另一次相同保留版本的 kernel-only 采样已通过：共同输出阶段 GPU0–3 观察到跨请求算术/算术与算术/consume 的真实交集，GPU4 为零；含预填充的完整活动阶段五卡均有局部交集。由此可确认存在实际 GPU 重叠，但不能宣称五卡共同生成期都已重叠或通信完全隐藏。各次观测和证据分别保留，详见双请求报告。
+
+---
+
 # 功能迁移与取舍
+
+<!-- TP5_NATIVE_SPEED_20261021_FINAL -->
+## Latest retained result: native TP5, 2026-10-21
+
+The current retained native TP5 configuration is the 2026-10-21 four-pair-qualified build. Older “current”, “final”, and gap-failure entries below are historical. The user's relaxed numerical policy applies to native acceptance; explicit strict-reference modes retain their separate gates.
+
+Use `build-tp5-gap-repair-20261021/run-retained.py` with the existing compose arguments. It now selects C from `native-policy-compose-install` and A libraries from `build-tp5-native-speed-20261021/native-pad1024-install`; arguments are passed through unchanged. Launcher help and dynamic-library resolution passed.
+
+Four balanced pairs against fixed master `46a6fd8a129091741f9ebc6431f7f610abe1ccfc` passed: geometric-mean throughput **47.343475 vs 45.366353 token/s**, paired ratio **1.043581249**, two-sided 95% CI **[1.037961336, 1.049231589]**. Every run includes all 511 intervals from 512 natural outputs.
+
+The native parameter is `tp5-relay-native`; it retains relay ownership while allowing normal backend arithmetic. Explicit strict-reference selection continues to use its own acceptance contract. The final report records the narrow attention-padding admission conditions, reproduction command, and exact scope: [native TP5 report](../build-tp5-native-speed-20261021/NATIVE-SPEED-REPORT.md).
+
+<!-- /TP5_NATIVE_SPEED_20261021_FINAL -->
+
+## 2026-10-21：TP5 有效改动已落地，master 性能目标仍未达到
+
+最新保留镜像与完整证据见 `build-tp5-gap-repair-20261021/REPAIR-REPORT.md` 和 `fork/audit/tp5-gap-repair-20261021.json`。A 为 `fa-prefix-install`，C 为 `finite-greedy-compose-install/bin/tq-tp5-compose`；`run-retained.py` 显式绑定这两个已安装产物。后文旧镜像的“当前”“最终”保留历史身份，不覆盖本条更新。
+
+保留 gfx1030 的 tile32 attention 与稳定前缀并行指数、HC BF16 K320 的保序交错 rows8、indexed Q2 K128 的保序 rows2，以及独立 B sampling 的 finite-greedy API。A 的新增生产改动仍限定在三个既有 overlay 文件；C 通过公开安装包组合 TQSampling。relay 的临时设备时钟诊断已撤出生产源码，K256 Q3/Q5 展开候选因增量速度下降而撤回。
+
+最终 A+C 在冻结输入轨迹下的512行、127139840个完整 logits 逐位相同，超门/非有限/greedy差异均0，五个实际rank正常drain、预算归零。原F64 attention oracle实际五卡320例通过。B由只含sampling的副本独立构建，Release AVX2与scalar-only各2/2测试通过；C由只含自身源码的副本消费已安装A/B构建，新的外部安装消费者configure/build/run通过。上述安装组合证据不扩为Swift长程状态、填满262k历史或全部多窗口故障资格。
+
+单次相邻自然greedy增量对：finite-greedy **31.663348→32.247912 token/s**，其提交阶段均值 **0.944519→0.058066 ms/输出**；最终attention前缀 **31.581164→32.731905 token/s**。两对使用不同独立进程，不相乘、不提供置信区间，也不是最终master非劣效资格。固定master较早四组平衡运行几何均值为45.300541 token/s；目标仍未完成。原reference、误差门、权重编码、F32 activation/query、F16 KV、CPU rank顺序归约、512输出/511完整提交间隔均未改变。
+
+一次仅用于归因的设备时钟诊断显示各rank归约间工作约24–26ms/步，显式等待约0.74–2.92ms/步；前者包含计算、调度和尾部，不能称纯kernel计算。36个GDN层各两次join、12个FA层各一次join，最重段覆盖工作不同且mirrored工作可能越过命名terminal，不能把段差直接归因于FA。诊断与可复现离线解析均不提供性能资格。完整取舍、失败候选、精确源/二进制身份以新报告为准。
 
 ## 固定身份与原则
 
@@ -178,3 +214,26 @@ git diff cda0f9256665845cd9d6f3a0176880883f653a3d \
 ```
 
 原 master、旧实现、用户未跟踪实验资料和模型均保留。当前 clean 分支的每一项迁入、候选或拒绝都能回到固定原提交与实际测试范围；没有删除旧分支来掩盖尚未迁移的工作。
+
+
+## 2026-10-21 最新保留检查点：QSA full-coverage 回移
+
+当前入口为 build-tp5-gap-repair-20261021/run-retained.py；它使用 qsa-full-coverage-install 的 A 与原 finite-greedy-compose-install 的 C。以下早期章节的旧入口/旧速率属于历史证据。本检查点仍未宣称追平 master，四组平衡 master 非劣门尚未通过。
+
+固定 master 46a6fd8a129091741f9ebc6431f7f610abe1ccfc 已有全覆盖 QSA 快路径；当前 A 原先无条件计算无效排名。本次仅回移 full-coverage 逻辑，继续原始 indexer key 投影、F16 cache 写入和同一 QSA/F32 attention 路径，KV extent 变化使旧图失效；超过预算恢复原 selective 路径。未移植 pooled-cache、MTP 或 PLE API 迁移。另保留小型 relay idle-event 修正，避免已交付全部事件的 worker 空转抢 snapshot mutex；abort 优先可见。
+
+完整 512 步、127139840 logits bitwise equal，error_count=0、nonfinite_count=0、native_drained=true、budgets_zero=true。原始权重、五卡、F32 activation、F16 KV、ctx/sequence=262144、teacher 和数值门均保持。一次相邻无录制 pair：32.7820521 → 35.5374418 tok/s，ratio=1.08405177（+8.405%）。这是 QSA+idle-event 组合的增量比较，不是 master 非劣证明，不能将组合收益精确分给单项。
+
+真实五卡 A/B/A fixture 共 9 epochs，输入/选中终点/另一终点各 11565 项逐位检查通过；最后事件交付后的 idle abort 仍返回失败，已有五卡 drain 证明和安全销毁通过。QSA 跨预算切换已逐行分析：raw-key 写入在 early return 之前，旧 set_input_qsa 只写临时输入、没有持久状态推进，can_reuse 比较完整 n_kv。尚未另跑超过 2051 KV 的完整模型，不能把该边界表述为已实测。
+
+本轮撤回：shared-merge 全512有2个数值越门；shared-pair 数值通过但32.5804→32.8259仅+0.7535%，不足以保留双段私有协议；native capture 并行虽全512逐位一致、每卡解除约380条边，却32.5159→27.6277（-15.03%），调度代码全部撤回。所有失败/撤回源码与 receipts 保存在各自前缀。一次混用旧 Meta/model 对象导致 ABI 初始化失败也保留，已改为内容恢复后刷新 mtime 重编；当前安装与当前源对应。
+
+证据：qsa-full-coverage-{identity.json,full512/full-metrics.json,pair/summary.json,hazards}；设计 qsa-full-coverage-design.md；共享支路与调度撤回见 shared-pair-decision.json、native-parallel-decision.json。A 例外仍为原 51 路径，本次更新两个既有路径的 exact hash/理由/移除条件。
+
+## 2026-10-21 当前保留状态：原 Q2/F32 gate/up 融合
+
+在 QSA 全覆盖与 idle relay 基线上，复用上游三节点融合、外部使用者和别名检查，只补既有原编码权重/F32 路线的执行入口。48 个路由 FFN 每层由两次投影与 SwiGLU 三次 dispatch 合为一次，四链 FMA、实际 combine/XOR 树和原 SiLU 算术保持。共享专家因 gate/up 类型不同，未扩大覆盖。
+
+真实五卡 30 个定向用例通过，35840 个有限值逐位检查、F64 oracle、padding、无效 ID、外部中间结果使用均通过；完整 512 行/127139840 logits 与原冻结参照逐位一致，native drain/预算门通过。单次相邻无逐算子录制比较为 **35.559735 → 36.241402 tok/s（+1.91696%）**。真实模型五卡融合计数在后端关闭时读取，并逐项证明读取时间不在 511 个 commit 间隔内。详见 `build-tp5-gap-repair-20261021/precise-glu-retained-checkpoint.json` 与 `precise-glu-pair/summary.json`。
+
+当前 wrapper 已指向 `precise-glu-install`。历史固定 master 45.300541 tok/s；尚未达到非劣效目标。两项 attention 尝试均撤回：双输出 CTA 比例0.998978；独立分母 wave 比例1.002414，未提供足够保留收益。其数值通过和单次比较证据完整保留，没有追加调参网格。上游例外仍为51条，无新公共接口。

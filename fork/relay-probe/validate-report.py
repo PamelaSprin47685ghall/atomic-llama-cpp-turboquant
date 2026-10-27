@@ -24,6 +24,12 @@ import sys
 
 REPORT_TARGET = "tp5-mapped-relay"
 BENCH_TARGET = "tp5-relay-bench"
+BENCH_MEASUREMENTS = {
+    "host_publish_to_device_ack": "ns",
+    "device_produce_to_host_ready": "ns",
+    "five_stream_relay_cycle": "ns",
+    "host_five_way_fold": "bytes_per_second",
+}
 
 # Case registry order of src/evidence.cpp. Names are part of the evidence
 # record: renumbering or renaming changes what an old report can claim, so
@@ -99,14 +105,7 @@ def load_strict(path):
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         fail("not UTF-8")
-    try:
-        value = json.loads(text, object_pairs_hook=unique_object,
-                           parse_constant=reject_constant)
-    except EvidenceError:
-        raise
-    except json.JSONDecodeError as error:
-        fail("invalid JSON: %s" % error)
-    return value
+    return load_strict_text(text)
 
 
 def require_dict(value, where):
@@ -115,6 +114,7 @@ def require_dict(value, where):
     for key in value:
         if type(key) is not str:
             fail("%s has a non-string field name" % where)
+        require_str(key, where + " field name")
 
 
 def require_int(value, where):
@@ -129,6 +129,10 @@ def require_str(value, where, nonempty=False):
         fail("%s must be a string" % where)
     if nonempty and not value:
         fail("%s must not be empty" % where)
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        fail("%s must contain valid Unicode scalar values" % where)
 
 
 def require_keys(value, expected, where):
@@ -227,8 +231,8 @@ def validate_report(value):
         fail("control_word_bits must be 64")
     require_str(value["memory_flags_requested"], "memory_flags_requested", nonempty=True)
     require_int(value["hot_reuse_rounds"], "hot_reuse_rounds")
-    if value["hot_reuse_rounds"] == 0:
-        fail("hot_reuse_rounds must be positive")
+    if not 1 <= value["hot_reuse_rounds"] <= (1 << 32) - 1:
+        fail("hot_reuse_rounds must be a positive uint32")
     devices = value["devices"]
     if type(devices) is not list:
         fail("devices must be an array")
@@ -289,8 +293,8 @@ def validate_bench(value):
     require_str(value["device_name"], "device_name", nonempty=True)
     require_str(value["gcn_arch_name"], "gcn_arch_name", nonempty=True)
     require_int(value["rounds"], "rounds")
-    if value["rounds"] == 0:
-        fail("rounds must be positive")
+    if not 1 <= value["rounds"] <= (1 << 32) - 1:
+        fail("rounds must be a positive uint32")
     measurements = value["measurements"]
     if type(measurements) is not list or not measurements:
         fail("measurements must be a nonempty array")
@@ -300,23 +304,44 @@ def validate_bench(value):
         require_dict(measurement, where)
         require_keys(measurement, ["name", "unit", "samples", "min", "median", "p90", "max"], where)
         require_str(measurement["name"], where + ".name", nonempty=True)
+        if measurement["name"] not in BENCH_MEASUREMENTS:
+            fail("%s has an unknown measurement name" % where)
         if measurement["name"] in seen:
             fail("%s repeats measurement name %r" % (where, measurement["name"]))
         seen.add(measurement["name"])
         require_str(measurement["unit"], where + ".unit", nonempty=True)
-        if measurement["unit"] not in ("ns", "bytes_per_second"):
-            fail("%s.unit must be ns or bytes_per_second" % where)
+        if measurement["unit"] != BENCH_MEASUREMENTS[measurement["name"]]:
+            fail("%s.unit disagrees with its measurement name" % where)
         for field in ("samples", "min", "median", "p90", "max"):
             require_int(measurement[field], where + "." + field)
-        if measurement["samples"] == 0:
-            fail("%s.samples must be positive" % where)
+        expected_samples = 32 if measurement["name"] == "host_five_way_fold" else value["rounds"]
+        if measurement["samples"] != expected_samples:
+            fail("%s.samples must be %d" % (where, expected_samples))
         if not (measurement["min"] <= measurement["median"] <= measurement["p90"] <= measurement["max"]):
             fail("%s must satisfy min <= median <= p90 <= max" % where)
+    if seen != set(BENCH_MEASUREMENTS):
+        fail("bench is missing required measurements")
     limits = value["limits"]
     if type(limits) is not list:
         fail("limits must be an array")
     for index, limit in enumerate(limits):
         require_str(limit, "limits[%d]" % index, nonempty=True)
+
+
+def validate_pair(report, bench):
+    """Check the shared identity fields; this is not proof of same-run provenance."""
+    ordinal = bench["device_ordinal"]
+    if ordinal >= len(report["devices"]):
+        fail("bench device_ordinal is absent from the report")
+    device = report["devices"][ordinal]
+    if bench["device_name"] != device["reported_name"]:
+        fail("bench device_name disagrees with the report")
+    if bench["gcn_arch_name"] != device["gcn_arch_name"]:
+        fail("bench gcn_arch_name disagrees with the report")
+    if bench["rounds"] != report["hot_reuse_rounds"]:
+        fail("bench rounds disagree with the report")
+    if bench["hip_runtime_version_string"] != report["hip_runtime_version_string"]:
+        fail("bench HIP version disagrees with the report")
 
 
 # -------- self-test ---------------------------------------------------------
@@ -383,8 +408,10 @@ def good_bench():
         "gcn_arch_name": "gfx1030",
         "rounds": 2000,
         "measurements": [
-            {"name": "host_publish_to_device_ack", "unit": "ns",
-             "samples": 2000, "min": 100, "median": 200, "p90": 300, "max": 400},
+            {"name": name, "unit": unit,
+             "samples": 32 if name == "host_five_way_fold" else 2000,
+             "min": 100, "median": 200, "p90": 300, "max": 400}
+            for name, unit in BENCH_MEASUREMENTS.items()
         ],
         "limits": ["observations, not gates"],
     }
@@ -423,7 +450,7 @@ def load_strict_text(text):
                           parse_constant=reject_constant)
     except EvidenceError:
         raise
-    except json.JSONDecodeError as error:
+    except (ValueError, RecursionError) as error:
         fail("invalid JSON: %s" % error)
 
 
@@ -475,6 +502,7 @@ def self_test():
     validate_report(good_report(1))
     validate_report(good_report(5))
     validate_bench(good_bench())
+    validate_pair(good_report(1), good_bench())
     # No-device report (device count 0 or enumeration failure) is a real
     # writer output and must validate.
     validate_report(good_report(0, qualification="fail"))
@@ -498,6 +526,17 @@ def self_test():
         report["devices"][0]["cases"]["invented_case"] = {"result": "pass", "detail": "x"}
         return report
     expect_invalid("unknown case id", unknown_case)
+
+    for nested in (False, True):
+        report = good_report(1)
+        target = report["devices"][0]["cases"] if nested else report
+        target["\ud800"] = 1
+        try:
+            validate_report(report)
+        except EvidenceError as error:
+            str(error).encode("utf-8")
+        else:
+            raise AssertionError("invalid Unicode field name was accepted")
 
     def wrong_qualification_field():
         return good_report(1, qualification="fail")
@@ -556,6 +595,48 @@ def self_test():
         return report
     expect_invalid("device rank not equal to index", wrong_rank)
 
+    def rounds_out_of_range():
+        report = good_report(1)
+        report["hot_reuse_rounds"] = 1 << 32
+        return report
+    expect_invalid("report rounds outside the CLI uint32 domain", rounds_out_of_range)
+
+    def malformed_bench(change):
+        bench = good_bench()
+        change(bench)
+        return bench
+
+    expect_invalid("bench:missing required measurements",
+                   lambda: malformed_bench(lambda b: b["measurements"].pop()))
+    expect_invalid("bench:unknown measurement name",
+                   lambda: malformed_bench(lambda b: b["measurements"][0].update({"name": "invented"})))
+    expect_invalid("bench:known but incorrect unit",
+                   lambda: malformed_bench(lambda b: b["measurements"][0].update({"unit": "bytes_per_second"})))
+    expect_invalid("bench:latency samples disagree with rounds",
+                   lambda: malformed_bench(lambda b: b["measurements"][0].update({"samples": 1})))
+    expect_invalid("bench:fold must have 32 samples",
+                   lambda: malformed_bench(lambda b: b["measurements"][-1].update({"samples": 2000})))
+    expect_invalid("bench:rounds outside the CLI uint32 domain",
+                   lambda: malformed_bench(lambda b: b.update({"rounds": 1 << 32})))
+
+    for field, changed in (("device_ordinal", 1), ("device_name", "another GPU"),
+                           ("gcn_arch_name", "gfx1100"), ("rounds", 1),
+                           ("hip_runtime_version_string", "another runtime")):
+        bench = good_bench()
+        bench[field] = changed
+        try:
+            validate_pair(good_report(1), bench)
+        except EvidenceError:
+            pass
+        else:
+            raise SystemExit("self-test failed: mismatched bench %s was accepted" % field)
+    try:
+        validate_pair(good_report(0, qualification="fail"), good_bench())
+    except EvidenceError:
+        pass
+    else:
+        raise SystemExit("self-test failed: bench paired with no devices was accepted")
+
     def missing_pci():
         report = good_report(1)
         report["devices"][0]["pci_bdf"] = ""
@@ -582,6 +663,11 @@ def self_test():
                                           '"hot_reuse_rounds": true'),
                         "report")
     expect_invalid_text("trailing data", base_text + " {}", "report")
+    expect_invalid_text("unpaired Unicode surrogate",
+                        base_text.replace('"amd clang"', '"\\ud800"'), "report")
+    expect_invalid_text("JSON nesting exceeds parser depth", "[" * 10000 + "]" * 10000, "report")
+    expect_invalid_text("oversized integer", base_text.replace('"schema": 1', '"schema": ' + "9" * 5000),
+                        "report")
     bench_text = json.dumps(good_bench())
     expect_invalid_text("bench min above median",
                         bench_text.replace('"min": 100', '"min": 250'),
@@ -590,11 +676,8 @@ def self_test():
                         bench_text.replace('"unit": "ns"', '"unit": "furlongs"'),
                         "bench")
     expect_invalid_text("bench duplicate measurement name",
-                        bench_text.replace('"limits": ["observations, not gates"]',
-                                           '"limits": ["observations, not gates"], "measurements":'
-                                           ' [{"name": "host_publish_to_device_ack", "unit": "ns",'
-                                           ' "samples": 1, "min": 1, "median": 1, "p90": 1, "max": 1}]'),
-                        "bench")
+                        bench_text.replace('"device_produce_to_host_ready"',
+                                           '"host_publish_to_device_ack"'), "bench")
     mutation_fuzz()
     print("PASS: validator self-test")
 
@@ -612,15 +695,16 @@ def main():
         report = load_strict(args[0])
         validate_report(report)
         print("valid: %s" % args[0])
-    except EvidenceError as error:
+    except (EvidenceError, OSError) as error:
         print("invalid: %s: %s" % (args[0], error))
         return 1
     if len(args) == 2:
         try:
             bench = load_strict(args[1])
             validate_bench(bench)
+            validate_pair(report, bench)
             print("valid: %s" % args[1])
-        except EvidenceError as error:
+        except (EvidenceError, OSError) as error:
             print("invalid: %s: %s" % (args[1], error))
             return 1
     return 0

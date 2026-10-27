@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -37,8 +38,8 @@ __global__ void spin_then_write(std::uint64_t ticks, std::uint64_t * out) {
 }
 
 // Waits for the stream with a wall deadline instead of a bare synchronize:
-// on a hung device this reports a bounded failure for the device and moves
-// on. Returns false on timeout or HIP error.
+// on a hung device this reports a bounded failure. Returns false on timeout
+// or HIP error; the caller must not free memory still owned by the kernel.
 bool wait_bounded(hipEvent_t event) {
     const auto       begin  = std::chrono::steady_clock::now();
     const hipError_t record = hipEventRecord(event, nullptr);
@@ -121,6 +122,13 @@ int main(int argc, char ** argv) {
             ++failures;
             continue;
         }
+        std::uint64_t * device_out = nullptr;
+        if (hipHostGetDevicePointer(reinterpret_cast<void **>(&device_out), out, 0) != hipSuccess) {
+            std::fprintf(stderr, "device %d (%s): mapped device pointer unavailable\n", ordinal, props.name);
+            (void) hipHostFree(out);
+            ++failures;
+            continue;
+        }
         hipEvent_t event = nullptr;
         if (hipEventCreate(&event) != hipSuccess) {
             std::fprintf(stderr, "device %d (%s): event creation failed\n", ordinal, props.name);
@@ -133,15 +141,20 @@ int main(int argc, char ** argv) {
         for (int pass = 0; pass < PASSES; ++pass) {
             __atomic_store_n(out, 0, __ATOMIC_RELAXED);
             const auto begin = std::chrono::steady_clock::now();
-            spin_then_write<<<1, 64>>>(TICKS_PER_PASS, out);
+            // One writer owns the result; a full wave would race 64 stores
+            // with different clock64 deltas into this same word.
+            spin_then_write<<<1, 1>>>(TICKS_PER_PASS, device_out);
             const bool   done = wait_bounded(event);
             const double wall_ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
             if (!done) {
                 std::fprintf(stderr, "device %d (%s): pass %d did not finish in time\n", ordinal, props.name, pass);
-                ++failures;
-                rates.clear();
-                break;
+                // Completion is unknown: destroying the event or freeing
+                // mapped output may synchronize forever or race a late
+                // device write. Fail the diagnostic without HIP teardown.
+                std::fflush(stdout);
+                std::fflush(stderr);
+                std::_Exit(1);
             }
             const std::uint64_t ticks = acquire_load(out);
             if (ticks < TICKS_PER_PASS) {

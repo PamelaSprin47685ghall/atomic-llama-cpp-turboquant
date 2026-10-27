@@ -38,6 +38,18 @@ ctest --test-dir build-relay --output-on-failure
 边界、局部计划数字与 dense GLU 独立参考，以及一个与 Python 参考程序的实时
 交叉对照（需要 Python 3；缺失时该项报告 skip，不构成通过）。
 
+安装搬迁与无源码消费使用仓库的包边界入口：
+
+```sh
+python3 fork/tests/isolation.py --output build-relocated-packages --jobs 4
+```
+
+该入口删除本次创建的库源码、构建目录和原安装副本，再从搬迁后的前缀解析
+`TQRelay::relay`。`installed-relay` 消费者只链接这个公开目标，验证预约、发布、
+慢读者阻止复用及最后读取后的复用；不链接 llama 或其他 B 库。入口还校验导入库
+位置，禁止回退到另一个安装前缀，并清除编译器与加载器的外部头文件、库搜索环境
+覆盖；移除的覆盖项记录在 `environment.json`。这不是 OS 沙箱，也不提供 HIP 或模型资格。
+
 ## 为什么需要它
 
 旧 fork 的 RELAY 收益历史记录在案，但整条私有 runtime 暂留归档。本库把其中与

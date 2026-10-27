@@ -16,7 +16,7 @@ set_target_properties(tq_sampling PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 target_compile_features(tq_sampling PUBLIC cxx_std_17)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(tq_sampling PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_compile_options(tq_sampling PRIVATE -Wall -Wextra -Wpedantic -Werror -fno-fast-math)
 endif()
 target_include_directories(tq_sampling PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -30,6 +30,12 @@ if(TQ_SAMPLING_BUILD_TESTS)
     add_executable(tq_sampling_tests tests/shortlist-test.cpp)
     target_link_libraries(tq_sampling_tests PRIVATE TQSampling::sampling)
     add_test(NAME tq_sampling.boundaries COMMAND tq_sampling_tests)
+    add_executable(tq_sampling_finite_greedy_tests tests/finite-greedy-test.cpp)
+    target_link_libraries(tq_sampling_finite_greedy_tests PRIVATE TQSampling::sampling)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(tq_sampling_finite_greedy_tests PRIVATE -fno-fast-math)
+    endif()
+    add_test(NAME tq_sampling.finite-greedy COMMAND tq_sampling_finite_greedy_tests)
 endif()
 
 set(TQ_SAMPLING_PACKAGE_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/TQSampling")

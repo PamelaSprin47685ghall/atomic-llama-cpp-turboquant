@@ -43,8 +43,19 @@ fail，setup 失败的设备仍以 `device_identity=fail` 出现在报告里，�
 
 ## 构建与运行
 
-需要 ROCm HIP 工具链（CMake 的 `find_package(hip)`）。没有 HIP 时只构建证据配置
-测试，探针可执行文件不生成。
+需要 CMake 3.21 或更新版本；GPU 工具需要 ROCm HIP 工具链（CMake 的
+`find_package(hip)`）。没有 HIP 时只构建证据配置测试，探针可执行文件不生成。
+测试默认开启并要求 Python 3；安装后的证据校验器也需要 Python 3。
+`TQ_RELAY_PROBE_BUILD_HIP` 默认 ON（找到 HIP 才构建 GPU 工具）；在已安装 ROCm
+的机器上也可显式关闭，只验收 CPU 证据逻辑且不启用 HIP 编译器：
+
+```sh
+cmake -S fork/relay-probe -B build-relay-probe-cpu -DTQ_RELAY_PROBE_BUILD_HIP=OFF
+cmake --build build-relay-probe-cpu --parallel
+ctest --test-dir build-relay-probe-cpu --output-on-failure
+```
+
+CPU-only 不生成可安装的 GPU 工具，不能据此声称 HIP 构建、安装或五卡资格通过。
 
 ```sh
 cmake -S fork/relay-probe -B build-relay-probe \
@@ -52,7 +63,7 @@ cmake -S fork/relay-probe -B build-relay-probe \
 cmake --build build-relay-probe --parallel
 ctest --test-dir build-relay-probe --output-on-failure
 ./build-relay-probe/tq-relay-probe --output probe-report.json --rounds 2000
-./build-relay-probe/tq-relay-probe --output probe-report.json \
+./build-relay-probe/tq-relay-probe --output probe-bench-report.json \
   --bench bench-report.json --rounds 2000
 ```
 
@@ -64,7 +75,10 @@ ctest --test-dir build-relay-probe --output-on-failure
 host 内存里，与探针同一合同：本机实测 `hipHostMallocDefault` 返回 flags=0（不含
 Mapped）时核写入照样落地，属平台意外，不可依赖——工具因此只接受带 Mapped 标志的
 分配并逐卡校验。它只打印速率表，不写任何证据文件，也不进入资格；`--help` 退出 0，
-无可见设备退出 2。
+无可见设备退出 2。每轮只有一个设备线程拥有输出字，使用映射分配的设备地址写入，
+不依赖 host/device 指针恰好相同。若 event 无法证明队列已完成（超时或 HIP 错误），
+工具刷新日志后直接退出 1，不再释放设备仍可能写入的页或调用可能隐式同步的 HIP
+清理函数；此时不会继续测量其余设备。
 
 `--output` 使用排他创建，不会覆盖已有证据；重跑需换路径或先明确删除旧报告。退出码
 0 表示本机范围内的强制用例全部通过，1 表示有失败（含设备枚举失败与零设备），2 是
@@ -72,11 +86,15 @@ Mapped）时核写入照样落地，属平台意外，不可依赖——工具�
 只接受 1 到 UINT32_MAX 的纯十进制整数；尾随垃圾、前导零、正负号、首尾空白、空串
 和溢出都在提交前拒绝（退出 2）——`02000`、`+2000`、`" 2000"`、`-1` 全部拒绝，只有
 `2000` 这类纯数字才放行（本机已逐项实测）。
-`--output` 与 `--bench` 必须指向不同文件（退出 2）。
+`--output` 与 `--bench` 必须给出非空路径；相同路径文本在设备访问前拒绝（退出 2）。
+不同拼写若最终指向同一文件，排他发布仍会拒绝覆盖，不会改写已经发布的证据。
 
 `cmake --install` 会装出两个可执行文件、`validate-report.py`、README 与 LICENSE；
 装出的前缀可以脱离源码树独立跑（本机已做过安装冒烟：装出二进制跑 50 轮
 qualification=pass，装出的校验器对装出二进制写出的报告 exit 0）。
+这里的独立不包含移除声明依赖：目标机器仍需匹配的 ROCm HIP 运行库与 Python 3。
+构建树和安装目标都从 HIP 包导入的实际 runtime 库位置设置运行时搜索路径，
+不依赖 `LD_LIBRARY_PATH`，也不引用开发构建目录。
 
 证据文件经同目录临时文件写入、`fsync`、再以硬链接发布（指南 16.3、42.5）：目标路径
 要么完整出现，要么不出现；已有文件或符号链接一律拒绝覆盖。不承诺崩溃后的目录项持久
@@ -85,14 +103,21 @@ qualification=pass，装出的校验器对装出二进制写出的报告 exit 0�
 证据归档前用校验器做一次机器检查（指南 53.4 的终态一致性合同）：
 
 ```sh
-python3 fork/relay-probe/validate-report.py probe-report.json bench-report.json
+python3 fork/relay-probe/validate-report.py probe-report.json
+python3 fork/relay-probe/validate-report.py probe-bench-report.json bench-report.json
 ```
 
 exit 0 表示结构、类型与全部交叉不变量成立；exit 1 给出第一条不成立的检查；exit 2
 是用法错误。校验器拒绝重复键、非有限数、未知字段与尾随数据，未来字段变化必须升
-schema 或改校验器。`--self-test` 在无 GPU、无证据文件的机器上验证校验器自身。
-本目录的 config-test 已进入 `fork/build.py` 默认流水线：无 HIP 机器只构建并运行
-config-test 与校验器 `--self-test`，有 ROCm 工具链时顺带构建探针可执行文件。
+schema 或改校验器。bench 必须完整包含当前四项测量，名字、单位、样本数均与写入器
+一致（三项延迟各为 rounds 个样本，host 折减固定 32 个样本）。同时提供 REPORT 与
+BENCH 时还检查设备序号、设备名称、架构、轮数和 HIP 版本字段一致；这只排除明显
+配错，不是同一次运行的身份认证或性能资格。读取失败、过深 JSON、超长整数与非法
+Unicode 也按无效输入退出 1，不泄漏 Python traceback。
+`--self-test` 在无 GPU、无证据文件的机器上验证校验器自身。
+本目录的 config-test 已进入 `fork/build.py` 默认流水线：显式设置
+`TQ_RELAY_PROBE_BUILD_HIP=OFF`，只构建并运行 config-test 与校验器 `--self-test`。
+HIP 工具构建、CLI 检查、安装与实际平台运行由上面的 standalone 构建单独验收。
 
 ## 关键设计
 
@@ -119,15 +144,18 @@ config-test 与校验器 `--self-test`，有 ROCm 工具链时顺带构建探针
 真机上按以下步骤运行并保留证据：
 
 ```sh
-./tq-clock-rate            # 先复核 clock64 定标假设，输出逐卡速率表
+tq-clock-rate              # 先复核 clock64 定标假设，输出逐卡速率表
 HIP_VISIBLE_DEVICES=0,1,2,3,4 \
-./tq-relay-probe --output probe-report-5gpu.json \
+tq-relay-probe --output probe-report-5gpu.json \
   --bench probe-bench-5gpu.json --rounds 2000 \
   > run-stdout.txt 2> run-stderr.txt
 echo "exit=$?"
 sha256sum probe-report-5gpu.json probe-bench-5gpu.json
-python3 fork/relay-probe/validate-report.py probe-report-5gpu.json probe-bench-5gpu.json
+validate-report.py probe-report-5gpu.json probe-bench-5gpu.json
 ```
+
+以上命令假定安装前缀的 `bin` 已加入 PATH。从构建树运行时，把工具命令改为该构建
+目录中的路径，并用 `python3 fork/relay-probe/validate-report.py` 调用源码校验器。
 
 机器上可枚举的 HIP 设备多于 5 个（例如另有 iGPU 或第六张卡）时，必须先以
 `HIP_VISIBLE_DEVICES` 圈定目标五卡再运行，否则 `device_count != 5`，五卡用例保持

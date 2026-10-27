@@ -535,6 +535,62 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<int,      6>>  (enum llm_kv kid, std::array<int,      6>   & result, uint32_t n, bool required);
 
 
+const std::map<std::string, bool> & llama_model_loader::hc_pair_profile() {
+    // true: down [10240,320]; false: up [320,10240]. Never match by substring.
+    static const std::map<std::string, bool> profile = [] {
+        std::map<std::string, bool> result;
+        const auto add_pair = [&](const std::string & prefix) {
+            result.emplace(prefix + "down.weight", true);
+            result.emplace(prefix + "up.weight", false);
+        };
+        for (size_t layer = 0; layer < 48; ++layer) {
+            const std::string prefix = "blk." + std::to_string(layer);
+            add_pair(prefix + ".hc_attn_");
+            add_pair(prefix + ".hc_ffn_");
+        }
+        add_pair("output_hc_");
+        return result;
+    }();
+    return profile;
+}
+
+const char * llama_model_loader::hc_weight_option_name() const {
+    return hc_weight_type == GGML_TYPE_Q4_0 ? "GGML_TP5_HC_Q4_WEIGHTS" : "GGML_TP5_HC_Q8_WEIGHTS";
+}
+
+bool llama_model_loader::is_hc_quantized_weight(const char * name) const {
+    return (hc_weight_type == GGML_TYPE_Q8_0 || hc_weight_type == GGML_TYPE_Q4_0) &&
+            name && hc_pair_profile().count(name) != 0;
+}
+
+bool llama_model_loader::ctx_has_hc_quantized_weights(ggml_context * ctx) const {
+    if (hc_weight_type == GGML_TYPE_BF16) {
+        return false;
+    }
+    for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (is_hc_quantized_weight(ggml_get_name(t))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void llama_model_loader::validate_hc_quantized_loaded() const {
+    if (hc_weight_type == GGML_TYPE_BF16) {
+        return;
+    }
+    for (const auto & item : hc_pair_profile()) {
+        if (!hc_quantized_loaded.count(item.first)) {
+            throw std::runtime_error(std::string(hc_weight_option_name()) + ": HC matrix was not converted: " + item.first);
+        }
+    }
+    if (hc_quantized_loaded.size() != hc_pair_profile().size()) {
+        throw std::runtime_error(std::string(hc_weight_option_name()) + ": unexpected converted matrix count");
+    }
+    LLAMA_LOG_INFO("%s: converted all 194 HC BF16 matrices to %s once at model load; shared by all contexts\n",
+            __func__, hc_weight_type == GGML_TYPE_Q4_0 ? "Q4_0" : "Q8_0");
+}
+
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -549,6 +605,21 @@ llama_model_loader::llama_model_loader(
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    // Decide once, before opening the GGUF or creating any target tensors.
+    const char * hc_q8_env = std::getenv("GGML_TP5_HC_Q8_WEIGHTS");
+    const char * hc_q4_env = std::getenv("GGML_TP5_HC_Q4_WEIGHTS");
+    if (hc_q8_env && std::strcmp(hc_q8_env, "0") != 0 && std::strcmp(hc_q8_env, "1") != 0) {
+        throw std::runtime_error("GGML_TP5_HC_Q8_WEIGHTS requires 0 or 1 (or unset)");
+    }
+    if (hc_q4_env && std::strcmp(hc_q4_env, "0") != 0 && std::strcmp(hc_q4_env, "1") != 0) {
+        throw std::runtime_error("GGML_TP5_HC_Q4_WEIGHTS requires 0 or 1 (or unset)");
+    }
+    const bool hc_q8 = hc_q8_env && std::strcmp(hc_q8_env, "1") == 0;
+    const bool hc_q4 = hc_q4_env && std::strcmp(hc_q4_env, "1") == 0;
+    if (hc_q8 && hc_q4) {
+        throw std::runtime_error("GGML_TP5_HC_Q8_WEIGHTS and GGML_TP5_HC_Q4_WEIGHTS are mutually exclusive");
+    }
+    hc_weight_type = hc_q4 ? GGML_TYPE_Q4_0 : hc_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_BF16;
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -838,6 +909,35 @@ llama_model_loader::llama_model_loader(
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
     this->load_mtp = load_mtp;
+
+    if (hc_weight_type != GGML_TYPE_BF16) {
+        if (files.empty() || !this->use_mmap || this->use_direct_io) {
+            throw std::runtime_error(std::string(hc_weight_option_name()) + ": requires a file-backed GGUF loaded with mmap");
+        }
+        if (get_arch() != LLM_ARCH_QWEN4EXP) {
+            throw std::runtime_error(std::string(hc_weight_option_name()) + ": requires Qwen4Exp");
+        }
+        const auto & profile = hc_pair_profile();
+        static const std::regex any_hc_pair(
+                R"(((?:blk\.\d+\.(?:hc_attn|hc_ffn|nextn\.hc_head)|output_hc)_)(down|up)\.weight)");
+        for (const auto & entry : weights_map) {
+            if (std::regex_match(entry.first, any_hc_pair) && !profile.count(entry.first)) {
+                throw std::runtime_error(std::string(hc_weight_option_name()) + ": unexpected HC source matrix: " + entry.first);
+            }
+        }
+        for (const auto & item : profile) {
+            const auto * weight = get_weight(item.first.c_str());
+            const auto * t = weight ? weight->tensor : nullptr;
+            const bool down = item.second;
+            if (!t || t->type != GGML_TYPE_BF16 || t->op != GGML_OP_NONE || t->view_src ||
+                    !ggml_is_contiguous(t) || t->ne[0] != (down ? 10240 : 320) ||
+                    t->ne[1] != (down ? 320 : 10240) || t->ne[2] != 1 || t->ne[3] != 1) {
+                throw std::runtime_error(std::string(hc_weight_option_name()) + ": requires all 194 complete contiguous BF16 source matrices: " + item.first);
+            }
+        }
+        GGML_ASSERT(profile.size() == 194);
+        LLAMA_LOG_INFO("%s: qualified 194 HC source matrices; BF16 GGUF descriptors and byte extents remain unchanged\n", __func__);
+    }
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1300,6 +1400,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
+    const bool hc_quantized_target = is_hc_quantized_weight(tn.str().c_str());
+    if (hc_quantized_target && (flags & (TENSOR_DUPLICATED | TENSOR_ALLOW_RESHAPE | TENSOR_READ_LAZY))) {
+        throw std::runtime_error(std::string(hc_weight_option_name()) + ": HC targets cannot be duplicated, reshaped, or lazy: " + tn.str());
+    }
+
     if ((flags & TENSOR_READ_LAZY) && use_mmap && tensor_read_lazy != LLAMA_TENSOR_READ_LAZY_OFF) {
         // in auto mode, small tensors are cheap enough to keep resident
         constexpr size_t auto_lazy_min_size = 4ull * 1024 * 1024 * 1024;
@@ -1327,6 +1432,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
+    if (hc_quantized_target) {
+        // Only the owned target changes. weights_map keeps the source BF16
+        // descriptor, file offsets, and source byte size for every file read.
+        t_meta.type = hc_weight_type;
+        t_meta.nb[0] = ggml_type_size(t_meta.type);
+        t_meta.nb[1] = ggml_row_size(t_meta.type, t_meta.ne[0]);
+        for (size_t dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+            t_meta.nb[dim] = t_meta.nb[dim - 1] * t_meta.ne[dim - 1];
+        }
+    }
 
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
@@ -1427,11 +1542,16 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
             continue;
         }
         *first = std::min(*first, weight->offs);
-        *last  = std::max(*last,  weight->offs + ggml_nbytes(tensor));
+        const size_t file_size = is_hc_quantized_weight(ggml_get_name(tensor)) ?
+                ggml_nbytes(weight->tensor) : ggml_nbytes(tensor);
+        *last  = std::max(*last,  weight->offs + file_size);
     }
 }
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
+    if (is_hc_quantized_weight(ggml_get_name(cur))) {
+        throw std::runtime_error(std::string(hc_weight_option_name()) + ": legacy load_data_for cannot load transformed weights");
+    }
     const auto & w = require_weight(ggml_get_name(cur));
 
     if (use_mmap) {
@@ -1569,6 +1689,11 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    // Allocate only when transformed HC weights are loaded. The buffers are
+    // shared by this load call, never by inference contexts or decode tokens.
+    std::vector<float> hc_f32_staging;
+    std::vector<uint8_t> hc_quantized_staging;
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1580,6 +1705,53 @@ bool llama_model_loader::load_all_data(
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
                 return false;
             }
+        }
+
+        if (is_hc_quantized_weight(ggml_get_name(cur))) {
+            const std::string name = ggml_get_name(cur);
+            const auto * source = weight->tensor;
+            const size_t source_size = ggml_nbytes(source);
+            const size_t target_size = ggml_nbytes(cur);
+            if (!use_mmap || source->type != GGML_TYPE_BF16 || cur->type != hc_weight_type ||
+                    cur->view_src || !ggml_is_contiguous(cur) || !cur->buffer || !cur->data ||
+                    !ggml_are_same_shape(source, cur) || hc_quantized_loaded.count(name)) {
+                throw std::runtime_error(std::string(hc_weight_option_name()) + ": invalid or duplicate target load: " + name);
+            }
+            const auto & mapping = mappings.at(weight->idx);
+            if (weight->offs > mapping->size() || source_size > mapping->size() - weight->offs) {
+                throw std::runtime_error(std::string(hc_weight_option_name()) + ": source extent outside mmap: " + name);
+            }
+            const auto * source_data = reinterpret_cast<const ggml_bf16_t *>(
+                    static_cast<const char *>(mapping->addr()) + weight->offs);
+            if (check_tensors && !ggml_validate_row_data(GGML_TYPE_BF16, source_data, source_size)) {
+                throw std::runtime_error(std::string(hc_weight_option_name()) + ": invalid BF16 source data: " + name);
+            }
+            // All qualified matrices have the same element/storage counts.
+            // Resize lazily, then fully overwrite both buffers for every matrix.
+            const size_t elements = size_t(ggml_nelements(source));
+            if (hc_f32_staging.size() != elements) {
+                hc_f32_staging.resize(elements);
+            }
+            if (hc_quantized_staging.size() != target_size) {
+                hc_quantized_staging.resize(target_size);
+            }
+            ggml_bf16_to_fp32_row(source_data, hc_f32_staging.data(), ggml_nelements(source));
+            const size_t converted = ggml_quantize_chunk(
+                    hc_weight_type, hc_f32_staging.data(), hc_quantized_staging.data(),
+                    0, source->ne[1], source->ne[0], nullptr);
+            if (converted != target_size ||
+                    (check_tensors && !ggml_validate_row_data(hc_weight_type, hc_quantized_staging.data(), target_size))) {
+                throw std::runtime_error(std::string(hc_weight_option_name()) + ": invalid " +
+                        ggml_type_name(hc_weight_type) + " conversion: " + name);
+            }
+            // Synchronous backend setter copies once-quantized bytes into the
+            // model-owned Meta buffer (including any owner-mirrored replicas).
+            // tensor_set completes its source read before returning; only then
+            // may the next matrix overwrite the reusable host staging.
+            ggml_backend_tensor_set(cur, hc_quantized_staging.data(), 0, target_size);
+            hc_quantized_loaded.emplace(name);
+            size_done += source_size; // Progress/unmapping are in source bytes.
+            continue;
         }
 
         size_t n_size = ggml_nbytes(cur);

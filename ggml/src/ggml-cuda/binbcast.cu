@@ -430,6 +430,54 @@ static void ggml_cuda_op_bin_bcast(
     }
 }
 
+// SPEC: Keep the multiply and add as two F32 operations. The old path
+// stores the multiply result before the add. Do not contract them to FMA.
+static __global__ void hc_combine4_t1_f32(
+        const float * block_out, const float * weight, const float * residual,
+        float * dst, uint32_t n_embd) {
+    ggml_cuda_pdl_lc();
+
+    const uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n_embd) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    const uint32_t stream = blockIdx.y;
+    const uint32_t index = stream * n_embd + col;
+#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
+    // Use two register-only instructions to preserve both F32 rounds.
+    float product;
+    float sum;
+    asm volatile("v_mul_f32_e32 %0, %1, %2"
+            : "=v"(product) : "v"(block_out[col]), "v"(weight[stream]));
+    asm volatile("v_add_f32_e32 %0, %1, %2"
+            : "=v"(sum) : "v"(residual[index]), "v"(product));
+    dst[index] = sum;
+#else
+    const float product = __fmul_rn(block_out[col], weight[stream]);
+    dst[index] = __fadd_rn(residual[index], product);
+#endif
+}
+
+void ggml_cuda_op_hc_combine4_t1(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * block_out, const ggml_tensor * weight,
+        const ggml_tensor * residual, ggml_tensor * dst) {
+    GGML_ASSERT(dst->ne[0] > 0 && dst->ne[0] <= std::numeric_limits<uint32_t>::max() / 4);
+    GGML_ASSERT(dst->ne[1] == 4 && dst->ne[2] == 1 && dst->ne[3] == 1);
+
+    const uint32_t n_embd = (uint32_t) dst->ne[0];
+    const dim3 block_dims(128, 1, 1);
+    const dim3 grid_dims((n_embd + block_dims.x - 1) / block_dims.x, 4, 1);
+    const ggml_cuda_kernel_launch_params launch_params(
+            grid_dims, block_dims, 0, ctx.stream());
+    ggml_cuda_kernel_launch(hc_combine4_t1_f32, launch_params,
+            (const float *) block_out->data, (const float *) weight->data,
+            (const float *) residual->data, (float *) dst->data, n_embd);
+}
+
 void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_repeat, 0>>(dst, dst->src[0], dst, nullptr, dst->src[0]->data, dst->data, ctx.stream());
 }

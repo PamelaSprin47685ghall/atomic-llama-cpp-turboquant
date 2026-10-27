@@ -12,3 +12,13 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
+
+// Private T=1 owner HC up/gate/mean fusion. Caller checks topology, aliases and streams.
+bool ggml_cuda_op_hc_owner_tail4_t1(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
+        const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst);
+
+// Private T=1 HC down/scale/SiLU fusion. Caller checks closure, aliases and events.
+bool ggml_cuda_op_hc_down_silu_t1(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
+        const ggml_tensor * xn, ggml_tensor * lo);

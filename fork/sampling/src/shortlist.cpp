@@ -38,6 +38,20 @@ bool scan_scalar(const float * logits, std::int32_t count, std::int32_t first,
     return true;
 }
 
+bool scan_greedy_scalar(const float * logits, std::int32_t count, std::int32_t first,
+                        candidate & selected) {
+    for (std::int32_t i = first; i < count; ++i) {
+        const float value = logits[i];
+        if (!std::isfinite(value)) {
+            return false;
+        }
+        if (value > selected.logit) {
+            selected = {i, value};
+        }
+    }
+    return true;
+}
+
 #if defined(TQ_SAMPLING_HAS_AVX2_SCAN)
 __attribute__((target("avx2")))
 bool scan_avx2(const float * logits, std::int32_t count, std::int32_t first,
@@ -63,6 +77,33 @@ bool scan_avx2(const float * logits, std::int32_t count, std::int32_t first,
         }
     }
     return scan_scalar(logits, count, i, output);
+}
+
+__attribute__((target("avx2")))
+bool scan_greedy_avx2(const float * logits, std::int32_t count, candidate & selected) {
+    const __m256i exponent = _mm256_set1_epi32(0x7f800000);
+    std::int32_t i = 0;
+    for (; count - i >= 8; i += 8) {
+        const __m256 values = _mm256_loadu_ps(logits + i);
+        const __m256i nonfinite = _mm256_cmpeq_epi32(
+            _mm256_and_si256(_mm256_castps_si256(values), exponent), exponent);
+        if (_mm256_movemask_ps(_mm256_castsi256_ps(nonfinite))) {
+            return false;
+        }
+        const __m256 threshold = _mm256_set1_ps(selected.logit);
+        unsigned mask = static_cast<unsigned>(
+            _mm256_movemask_ps(_mm256_cmp_ps(values, threshold, _CMP_GT_OQ)));
+        while (mask != 0) {
+            const auto lane = static_cast<std::int32_t>(__builtin_ctz(mask));
+            mask &= mask - 1;
+            const float value = logits[i + lane];
+            // Visit ids in order. An earlier lane can raise the maximum.
+            if (value > selected.logit) {
+                selected = {i + lane, value};
+            }
+        }
+    }
+    return scan_greedy_scalar(logits, count, i, selected);
 }
 #endif
 
@@ -105,6 +146,23 @@ result select(const float * logits, std::int32_t count, int k) {
     }
     selected.usable = true;
     return selected;
+}
+
+greedy_result select_finite_greedy(const float * logits, std::int32_t count) {
+    if (logits == nullptr || count < 1) {
+        return {};
+    }
+    candidate selected{0, logits[0]};
+    bool valid = false;
+#if defined(TQ_SAMPLING_HAS_AVX2_SCAN)
+    if (__builtin_cpu_supports("avx2")) {
+        valid = scan_greedy_avx2(logits, count, selected);
+    } else
+#endif
+    {
+        valid = scan_greedy_scalar(logits, count, 0, selected);
+    }
+    return valid ? greedy_result{true, selected} : greedy_result{};
 }
 
 } // namespace tq::sampling

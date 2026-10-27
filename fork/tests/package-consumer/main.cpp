@@ -1,5 +1,4 @@
 #include "tq/calibration/reader.h"
-#include "tq/compose/sampler.h"
 #include "tq/corpus/trie.h"
 #include "tq/sampling/shortlist.h"
 #include "tq/text/stream.h"
@@ -23,14 +22,6 @@ int main() {
     if (trie.path_to(leaf).front() != 1 || trie.request_count() != 1) {
         throw std::runtime_error("installed corpus library failed");
     }
-    tq::compose::sampling_options options;
-    options.top_k = 2;
-    tq::compose::sampler sample(options);
-    if (sample.sample(values.data(), static_cast<int32_t>(values.size())) != 1 ||
-        sample.stats().compact_rows != 1) {
-        throw std::runtime_error("installed composer failed");
-    }
-
     tq::text::generation_stream text({"STOP"});
     const auto first = text.push("A\xE2\x82");
     const auto second = text.push("\xAC" "ST");

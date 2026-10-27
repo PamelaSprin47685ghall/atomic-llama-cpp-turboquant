@@ -747,12 +747,26 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
         const int u  = get_int_b4(bq8_1_chunk->qs, j*2+0);
         const int v  = get_int_b4(bq8_1_chunk->qs, j*2+1);
 
+#if defined(GGML_USE_HIP) && defined(RDNA2)
+        // Spread four 2-bit codes into separate bytes, then map 0..3 to -1..2.
+        // Unsigned operations avoid signed shifts; each byte sums to at most 130.
+        const uint32_t q_bits = static_cast<uint32_t>(q);
+        uint32_t qx_bits = q_bits & 0xffu;
+        uint32_t qy_bits = (q_bits >> 8) & 0xffu;
+        qx_bits = (qx_bits | (qx_bits << 12)) & 0x000f000fu;
+        qy_bits = (qy_bits | (qy_bits << 12)) & 0x000f000fu;
+        qx_bits = (qx_bits | (qx_bits << 6)) & 0x03030303u;
+        qy_bits = (qy_bits | (qy_bits << 6)) & 0x03030303u;
+        const int qx = (qx_bits + 0x7f7f7f7fu) ^ 0x80808080u;
+        const int qy = (qy_bits + 0x7f7f7f7fu) ^ 0x80808080u;
+#else
         // unpack even and odd crumbs into byte values
         const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
         const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
         // unshuffle values
         const int qx = __byte_perm(qe, qo, 0x5140);
         const int qy = __byte_perm(qe, qo, 0x7362);
+#endif
 
         sumi = ggml_cuda_dp4a(u, qx, sumi);
         sumi = ggml_cuda_dp4a(v, qy, sumi);

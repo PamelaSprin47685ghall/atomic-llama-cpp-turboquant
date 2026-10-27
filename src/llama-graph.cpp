@@ -1618,8 +1618,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
-        ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        // Repeat first so the reshape belongs to the graph, not shared weights.
+        ggml_tensor * s = ggml_repeat_4d(ctx0, w_s, n_expert, n_tokens, 1, 1);
+        s = ggml_reshape_3d(ctx0, s, 1, n_expert, n_tokens);
         s = ggml_get_rows(ctx0, s, ids);
         res = ggml_mul(ctx0, res, s);
     }
@@ -2683,12 +2684,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
-        // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
-        if (k->type == GGML_TYPE_F32) {
+        // The explicit F32 profile uses fused attention without an implicit
+        // F16 rounding boundary. Other profiles retain native operand casts.
+        if (k->type == GGML_TYPE_F32 && !cparams.quantized_matmul_f32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
 
-        if (v->type == GGML_TYPE_F32) {
+        if (v->type == GGML_TYPE_F32 && !cparams.quantized_matmul_f32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 

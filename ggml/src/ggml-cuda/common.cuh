@@ -1438,6 +1438,13 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // Claimed by one strict relay provider; never share queues across contexts.
+    bool tp5_relay = false;
+    void * tp5_relay_owner = nullptr;
+
+    // HIP opt-in: decode Q8_0 weights in registers and keep activations/accumulation F32.
+    bool quantized_matmul_f32 = false;
+
     // Per-graph-eval shared-quantize cache for the mmvq path. Several matvecs in one decode
     // layer consume the same normed activation (Q/V/K read attn_norm; the router, fused
     // gate/up and shared-expert gate read attn_post_norm), and each used to re-quantize it to

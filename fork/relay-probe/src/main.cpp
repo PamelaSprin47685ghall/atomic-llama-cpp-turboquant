@@ -2769,8 +2769,16 @@ int main(int argc, char ** argv) {
         }
         if (arg == "--output" && i + 1 < argc) {
             output_path = argv[++i];
+            if (output_path.empty()) {
+                std::fprintf(stderr, "--output must name a nonempty file\n");
+                return 2;
+            }
         } else if (arg == "--bench" && i + 1 < argc) {
             bench_path = argv[++i];
+            if (bench_path.empty()) {
+                std::fprintf(stderr, "--bench must name a nonempty file\n");
+                return 2;
+            }
         } else if (arg == "--rounds" && i + 1 < argc) {
             const char * text = argv[++i];
             // The README contract is "pure decimal integer": no sign, no

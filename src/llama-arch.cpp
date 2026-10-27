@@ -1246,6 +1246,11 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
 
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
+        // PLE's original-format table is a CPU input lookup, not a mirrored weight;
+        // only the prepared F32 rows enter the tensor graph. This admits that graph
+        // construction path, not a claim of backend or model qualification.
+        case LLM_ARCH_QWEN4EXP:
+            return true;
         case LLM_ARCH_GROK:
         case LLM_ARCH_MPT:
         case LLM_ARCH_PLAMO2:
@@ -1273,7 +1278,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_QWEN3TTS:
-        case LLM_ARCH_QWEN4EXP:   // TODO: fix test-llama-archs
         case LLM_ARCH_INKLING:
         case LLM_ARCH_KIMI_K3:
             return false;

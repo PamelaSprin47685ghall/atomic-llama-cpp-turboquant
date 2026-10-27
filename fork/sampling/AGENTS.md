@@ -5,9 +5,10 @@
 
 # LEMMA
 
-1. [AXIOM 1] Return the complete min(count, k) shortlist only for a unique finite maximum; return an empty unusable result outside the contract. Derivation: C can then decide whether the documented fast route applies without observing partial work.
+1. [AXIOM 1] The shortlist API returns the complete min(count, k) shortlist only for a unique finite maximum; it returns an empty unusable result outside that contract. Derivation: C can then decide whether the documented fast route applies without observing partial work.
 2. [AXIOM 2; parent LEMMA 2, 4] Accept values and return owned values. Do not include, link, or receive callbacks from llama or ggml. Derivation: B can respond independently and cannot mutate another participant's state.
 3. [AXIOM 1, 2] Keep a scalar implementation and check CPU support before AVX2. Derivation: the public numerical behavior must not require a specific CPU.
+4. [AXIOM 1, 2] The separate finite-greedy API accepts only a nonempty row of finite values and returns an owned maximum; equal maxima select the smallest id. Derivation: complete-logit inference needs deterministic greedy selection, including signed-zero ties, without changing the shortlist mask or unique-maximum contract.
 
 # SPEC
 
@@ -15,6 +16,7 @@
 2. [LEMMA 2] Input mutation or destruction and result mutation do not affect another result. Proof: the ownership cases in tests/shortlist-test.cpp.
 3. [LEMMA 2] Build, test and install this source directory without A or C. Consume its relocated installed package. Proof: ../tests/isolation.py and ../VALIDATION.md.
 4. [LEMMA 1] C must run its real sampler chain and retain random state; B does not claim that a shortlist alone proves full sampling equivalence. Proof: ../compose/tests/test-sampler.cpp and ../tests/real-model.py.
+5. [LEMMA 2, 3, 4] Compare finite-greedy selection with the scalar full-row reference across ties, signed zeros, all nonfinite inputs, unaligned rows and vector tails. Results retain their values after input destruction. Proof: tests/finite-greedy-test.cpp; the normal and scalar-only configurations use the same public tests. Execution qualification remains separate from source coverage.
 
 # Exceptions
 

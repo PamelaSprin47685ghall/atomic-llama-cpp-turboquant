@@ -368,6 +368,201 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
+// The experimental context-owner layout is immutable for the process. Only
+// execution domains in each Meta backend may select a request's owner rank.
+static bool llama_hc_context_owner_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_TP5_HC_CONTEXT_OWNER");
+        if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0) {
+            throw std::runtime_error("GGML_TP5_HC_CONTEXT_OWNER requires 0 or 1 (or unset)");
+        }
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static const std::map<std::string, bool> & llama_hc_context_owner_weights() {
+    return llama_model_loader::hc_pair_profile();
+}
+
+// The shared FFN's hidden dimension is partitioned once across five ranks.
+// Its output partials are joined with the routed experts at their existing boundary.
+static bool llama_shared_expert_shard_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_TP5_SHARED_EXPERT_SHARD");
+        if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0) {
+            throw std::runtime_error("GGML_TP5_SHARED_EXPERT_SHARD requires 0 or 1 (or unset)");
+        }
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static const std::map<std::string, bool> & llama_shared_expert_shard_weights() {
+    static const std::map<std::string, bool> weights = [] {
+        std::map<std::string, bool> result;
+        for (int layer = 0; layer < 48; ++layer) {
+            const std::string prefix = "blk." + std::to_string(layer) + ".ffn_";
+            result.emplace(prefix + "up_shexp.weight", false);
+            result.emplace(prefix + "gate_shexp.weight", false);
+            result.emplace(prefix + "down_shexp.weight", true);
+        }
+        return result;
+    }();
+    return weights;
+}
+
+static void llama_shared_expert_shard_validate_layout(const llama_model & model, const llama_model_loader & ml) {
+    if (!llama_shared_expert_shard_enabled()) {
+        return;
+    }
+    const auto fail = [](const std::string & reason) {
+        throw std::runtime_error("GGML_TP5_SHARED_EXPERT_SHARD: " + reason);
+    };
+    const auto & hp = model.hparams;
+    if (model.arch != LLM_ARCH_QWEN4EXP || hp.n_layer_all != 48 || hp.n_layer_nextn != 0 ||
+            hp.n_layer() != 48 || hp.n_embd != 2560 || hp.n_ff_shexp != 640 ||
+            hp.n_expert != 512 || hp.n_expert_used != 10) {
+        fail("requires Qwen4Exp with 48 trunk layers, no MTP, D=2560, shared FFN=640, and top10 of 512 experts");
+    }
+    if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || model.devices.size() != 1 ||
+            !model.devices[0].is_meta || !model.devices[0].dev ||
+            model.get_split_state_ud.model != &model || model.get_split_state_ud.n_devices != 5 ||
+            model.n_gpu_layers() <= hp.n_layer_all) {
+        fail("requires all layers and the output on one Meta device backed by five tensor-parallel ranks");
+    }
+    const float * split = model.tensor_split();
+    for (size_t rank = 0; split && rank < 5; ++rank) {
+        if (!std::isfinite(split[rank]) || split[rank] < 0.0f || split[rank] != split[0]) {
+            fail("requires equal finite nonnegative tensor split values");
+        }
+    }
+    const auto expected_buft = ggml_backend_dev_buffer_type(model.devices[0].dev);
+    if (!expected_buft) {
+        fail("the Meta device has no default buffer type");
+    }
+    const auto & expected = llama_shared_expert_shard_weights();
+    std::map<std::string, bool> seen;
+    static const std::regex any_shared_matrix(R"(blk\.\d+\.ffn_(?:up|gate|down)_shexp\.weight)");
+    for (const auto & entry : ml.ctx_map) {
+        for (auto * tensor = ggml_get_first_tensor(entry.second.get()); tensor;
+                tensor = ggml_get_next_tensor(entry.second.get(), tensor)) {
+            const std::string name = ggml_get_name(tensor);
+            const auto found = expected.find(name);
+            if (found == expected.end()) {
+                if (std::regex_match(name, any_shared_matrix)) {
+                    fail("unexpected shared-expert matrix: " + name);
+                }
+                continue;
+            }
+            if (!seen.emplace(name, true).second || entry.first != expected_buft) {
+                fail("shared matrix must occur once in the default Meta buffer: " + name);
+            }
+            const bool down = found->second;
+            const int64_t block = ggml_blck_size(tensor->type);
+            const bool supported = down ?
+                (tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q5_0 ||
+                 tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_IQ4_NL ||
+                 tensor->type == GGML_TYPE_Q2_0) :
+                (tensor->type == GGML_TYPE_Q3_K || tensor->type == GGML_TYPE_Q4_K ||
+                 tensor->type == GGML_TYPE_Q5_K || tensor->type == GGML_TYPE_Q6_K ||
+                 tensor->type == GGML_TYPE_IQ4_XS || tensor->type == GGML_TYPE_Q2_0);
+            if (!supported || block <= 0 || (down ? 128 : 2560) % block != 0 ||
+                    tensor->op != GGML_OP_NONE || tensor->view_src || !ggml_is_contiguous(tensor) ||
+                    tensor->ne[0] != (down ? 640 : 2560) || tensor->ne[1] != (down ? 2560 : 640) ||
+                    tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+                fail("shared matrix must retain its supported complete quantized shape and block alignment: " + name);
+            }
+        }
+    }
+    if (seen.size() != expected.size() || expected.size() != 144) {
+        fail("requires all 144 unique shared up/gate/down matrices before allocation");
+    }
+    for (int layer = 0; layer < 48; ++layer) {
+        const std::string name = "blk." + std::to_string(layer) + ".ffn_gate_inp_shexp.weight";
+        const auto * gate = model.get_tensor(name.c_str());
+        if (!gate || gate->type != GGML_TYPE_F32 || gate->op != GGML_OP_NONE || gate->view_src ||
+                !ggml_is_contiguous(gate) || gate->ne[0] != 2560 || gate->ne[1] != 1 ||
+                gate->ne[2] != 1 || gate->ne[3] != 1) {
+            fail("requires the original complete F32 scalar gate: " + name);
+        }
+    }
+    LLAMA_LOG_INFO("%s: qualified 144 shared matrices for five disjoint 128-of-640 hidden slices\n", __func__);
+}
+
+static void llama_hc_context_owner_validate_layout(const llama_model & model, const llama_model_loader & ml) {
+    const bool context_owner = llama_hc_context_owner_enabled();
+    if (!context_owner && ml.hc_weight_type == GGML_TYPE_BF16) {
+        return;
+    }
+    const auto fail = [&](const std::string & reason) {
+        throw std::runtime_error(std::string(ml.hc_weight_type != GGML_TYPE_BF16 ?
+                ml.hc_weight_option_name() : "GGML_TP5_HC_CONTEXT_OWNER") + ": " + reason);
+    };
+    const ggml_type expected_type = ml.hc_weight_type;
+    const auto & hp = model.hparams;
+    if (model.arch != LLM_ARCH_QWEN4EXP || hp.n_layer_all != 48 || hp.n_layer_nextn != 0 ||
+            hp.n_layer() != 48 || hp.n_embd != 2560 || hp.dsv4_hc_mult != 4 || hp.hc_low_rank != 320) {
+        fail("requires Qwen4Exp with 48 trunk layers, no MTP, D=2560, HC=4, and low rank 320");
+    }
+    if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || model.devices.size() != 1 ||
+            !model.devices[0].is_meta || !model.devices[0].dev ||
+            model.get_split_state_ud.model != &model || model.get_split_state_ud.n_devices != 5) {
+        fail("requires one Meta device backed by exactly five tensor-parallel ranks");
+    }
+    if (model.n_gpu_layers() <= hp.n_layer_all) {
+        fail("requires all trunk layers and the output layer on the Meta device");
+    }
+    const float * split = model.tensor_split();
+    for (size_t rank = 0; split && rank < 5; ++rank) {
+        if (!std::isfinite(split[rank]) || split[rank] < 0.0f || split[rank] != split[0]) {
+            fail("requires equal finite nonnegative tensor split values");
+        }
+    }
+    const ggml_backend_buffer_type_t expected_buft = ggml_backend_dev_buffer_type(model.devices[0].dev);
+    if (!expected_buft) {
+        fail("the Meta device has no default buffer type");
+    }
+    const auto & expected = llama_hc_context_owner_weights();
+    std::map<std::string, bool> seen;
+    static const std::regex any_hc_pair(
+            R"(((?:blk\.\d+\.(?:hc_attn|hc_ffn|nextn\.hc_head)|output_hc)_)(down|up)\.weight)");
+    for (const auto & entry : ml.ctx_map) {
+        const auto buft = entry.first;
+        const auto ctx = entry.second.get();
+        for (auto * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            const std::string name = ggml_get_name(tensor);
+            const auto it = expected.find(name);
+            if (it == expected.end()) {
+                if (std::regex_match(name, any_hc_pair)) {
+                    fail("unexpected HC pair tensor: " + name);
+                }
+                continue;
+            }
+            if (!seen.emplace(name, true).second) {
+                fail("duplicate HC tensor: " + name);
+            }
+            if (buft != expected_buft) {
+                fail("HC tensor must use the default Meta device buffer: " + name);
+            }
+            const bool down = it->second;
+            if (tensor->type != expected_type || tensor->op != GGML_OP_NONE || tensor->view_src ||
+                    !ggml_is_contiguous(tensor) || tensor->ne[0] != (down ? 10240 : 320) ||
+                    tensor->ne[1] != (down ? 320 : 10240) || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+                fail("HC tensor must be a complete contiguous " + std::string(ggml_type_name(expected_type)) + " matrix: " + name);
+            }
+        }
+    }
+    for (const auto & weight : expected) {
+        if (!seen.count(weight.first)) {
+            fail("missing HC tensor: " + weight.first);
+        }
+    }
+    GGML_ASSERT(expected.size() == 194 && seen.size() == expected.size());
+    LLAMA_LOG_INFO("%s: qualified 97 HC pairs (194 %s matrices) for five-rank %s storage\n",
+            __func__, ggml_type_name(expected_type), context_owner ? "mirrored context-owner" : "static-owner");
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
@@ -416,6 +611,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_up_shexp_weight   ("blk\\.\\d*\\.ffn_up_shexp.weight");
     static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
+
+    static const std::regex pattern_hc_pair(R"(((?:blk\.\d+\.(?:hc_attn|hc_ffn|nextn\.hc_head)|output_hc)_)(down|up)\.weight)");
 
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
@@ -471,7 +668,62 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {axis, tensor_axis_0, il, rotation};
     };
 
+    // A qualified HC pair has one complete low-rank owner. Both projections
+    // derive this index from the same pair prefix; all other tensors ignore it.
+    size_t hc_owner = ud->n_devices;
     auto get_tensor_config = [&]() -> tensor_config {
+        if (llama_hc_context_owner_enabled() && llama_hc_context_owner_weights().count(tensor_name)) {
+            // Full model qualification is completed before weight buffers are
+            // allocated. Shared physical children remain mirrored for all contexts.
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        if (llama_shared_expert_shard_enabled()) {
+            const auto found = llama_shared_expert_shard_weights().find(tensor_name);
+            if (found != llama_shared_expert_shard_weights().end()) {
+                // All three matrices use the same down-matrix block alignment.
+                // 640 / 5 = 128 is a whole number of every qualified source block.
+                return get_tensor_config_impl(found->second ?
+                        GGML_BACKEND_SPLIT_AXIS_0 : GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+            }
+        }
+        std::smatch hc_match;
+        if (ud->model->arch == LLM_ARCH_QWEN4EXP && ud->n_devices == 5 &&
+                hparams.hc_low_rank >= 5 && hparams.hc_low_rank % 5 == 0 &&
+                std::regex_match(tensor_name, hc_match, pattern_hc_pair)) {
+            const float * split = ud->model->tensor_split();
+            // A null or all-zero split uses equal shares in the allocator below.
+            bool equal_split = true;
+            for (size_t i = 0; split && i < ud->n_devices; ++i) {
+                equal_split = equal_split && std::isfinite(split[i]) && split[i] >= 0.0f && split[i] == split[0];
+            }
+            const std::string prefix = hc_match[1].str();
+            const auto * down = ud->model->get_tensor((prefix + "down.weight").c_str());
+            const auto * up   = ud->model->get_tensor((prefix + "up.weight").c_str());
+            const auto dense_matrix = [](const ggml_tensor * t) {
+                return t && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16 ||
+                        t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q4_0) &&
+                        t->ne[2] == 1 && t->ne[3] == 1 && ggml_is_contiguous(t);
+            };
+            const int64_t wide = int64_t(hparams.n_embd) * hparams.dsv4_hc_mult;
+            if (equal_split && wide > 0 && dense_matrix(down) && dense_matrix(up) &&
+                    ((down->type != GGML_TYPE_Q8_0 && up->type != GGML_TYPE_Q8_0 &&
+                       down->type != GGML_TYPE_Q4_0 && up->type != GGML_TYPE_Q4_0) || down->type == up->type) &&
+                    down->ne[0] == wide && down->ne[1] == hparams.hc_low_rank &&
+                    up->ne[0] == hparams.hc_low_rank && up->ne[1] == wide) {
+                // Keep the full K reduction on one owner so its arithmetic
+                // matches the mirrored path. Nonowners publish exact zero.
+                size_t pair_index = 2 * size_t(hparams.n_layer());
+                if (prefix.compare(0, 4, "blk.") == 0) {
+                    const size_t layer = std::stoull(prefix.substr(4));
+                    pair_index = prefix.find(".nextn.") != std::string::npos ?
+                            pair_index + 1 + layer :
+                            2 * layer + (prefix.find(".hc_ffn_") != std::string::npos);
+                }
+                hc_owner = pair_index % ud->n_devices;
+                return get_tensor_config_impl(hc_match[2] == "down" ?
+                        GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0);
+            }
+        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
@@ -810,6 +1062,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     }
 
     split_state.axis = tc.axis;
+    if (hc_owner < ud->n_devices) {
+        GGML_ASSERT(tc.axis == GGML_BACKEND_SPLIT_AXIS_0 || tc.axis == GGML_BACKEND_SPLIT_AXIS_1);
+        split_state.ne[hc_owner] = hparams.hc_low_rank;
+        split_state.nr[0] = 1;
+        split_state.n_segments = 1;
+        return split_state;
+    }
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
@@ -1185,6 +1444,7 @@ struct llama_model::impl {
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
     buft_list_t cpu_buft_list;
+    buft_list_t input_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
     struct layer_dev {
@@ -1202,6 +1462,9 @@ struct llama_model::impl {
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if (params.offload_input && (params.vocab_only || params.no_alloc || params.n_gpu_layers == 0)) {
+        throw std::runtime_error("offload_input requires allocated model weights and GPU layer offload");
+    }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -1502,9 +1765,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
+    // Keep the default CPU placement unless input offload is explicitly requested.
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    if (params.offload_input) {
+        if (devices.empty() || act_gpu_layers == 0) {
+            throw std::runtime_error("offload_input requires at least one offloaded GPU layer/device");
+        }
+        const auto input = get_layer_buft_list(i_gpu_start);
+        const auto type = ggml_backend_dev_type(input.dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_META) {
+            throw std::runtime_error("offload_input selected a non-GPU input device");
+        }
+        for (const auto & candidate : *input.buft_list) {
+            if (candidate.first == input.dev && !ggml_backend_buft_is_host(candidate.second)) {
+                pimpl->input_buft_list.push_back(candidate);
+            }
+        }
+        if (pimpl->input_buft_list.empty()) {
+            throw std::runtime_error("offload_input has no compatible device-local buffer candidates");
+        }
+        pimpl->dev_input = { input.dev, &pimpl->input_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -1702,6 +1983,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Reject an incomplete experimental layout before allocating any model
+    // weight buffers; do not silently mirror only part of the 97 HC pairs.
+    llama_hc_context_owner_validate_layout(*this, ml);
+    llama_shared_expert_shard_validate_layout(*this, ml);
+
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
@@ -1715,6 +2001,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
         ggml_context * ctx = ctx_ptr.get();
+        if (params.offload_input && tok_embd != nullptr &&
+            ggml_get_tensor(ctx, tok_embd->name) == tok_embd &&
+            (ggml_backend_buft_is_host(buft) || ggml_backend_buft_get_device(buft) != pimpl->dev_input.dev)) {
+            throw std::runtime_error("offload_input refuses an embedding buffer override outside its GPU device");
+        }
 
         // skip contexts without tensors
         if (ggml_get_first_tensor(ctx) == nullptr) {
@@ -1739,7 +2030,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft &&
+                !ml.ctx_has_hc_quantized_weights(ctx)) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1831,6 +2123,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    ml.validate_hc_quantized_loaded();
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -1841,6 +2135,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    if (arch == LLM_ARCH_QWEN4EXP && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD) {
+        // PLE is an input lookup, not a model-chain weight. Keep its original encoded
+        // rows in the ordinary CPU mmap buffer, even when token inputs are offloaded.
+        // In particular, do not select a CPU repack buffer or a Meta mirrored buffer.
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev == nullptr) {
+            throw std::runtime_error("qwen4exp PLE input lookup requires a CPU backend");
+        }
+        const buft_list_t cpu_rows = {{cpu_dev, ggml_backend_dev_buffer_type(cpu_dev)}};
+        auto * tensor = ml.create_tensor(hparams, &cpu_rows, &cpu_rows, &cpu_rows, nullptr,
+                tn, ne, flags | llama_model_loader::TENSOR_READ_LAZY | llama_model_loader::TENSOR_GET_ROWS);
+        // Buffer overrides may not turn this explicit input-preparation table into
+        // device weights (or a repacked representation that the row decoder cannot read).
+        if (tensor != nullptr) {
+            const auto it = ml.ctx_map.find(cpu_rows.front().second);
+            if (it == ml.ctx_map.end() || ggml_get_tensor(it->second.get(), tensor->name) != tensor) {
+                throw std::runtime_error("qwen4exp PLE table requires original-format CPU placement; incompatible buffer override");
+            }
+        }
+        return tensor;
+    }
     const buft_list_t * buft_list_layer = nullptr;
     if (tn.bid != -1) {
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
@@ -2492,7 +2807,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_kv_size      */ n_ctx_kv,
-                            /* attn_n_pad        */ 1,
+                            /* attn_n_pad        */ params.attn_n_pad,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
@@ -2625,7 +2940,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 hparams,
                                 params.type_k,
                                 params.type_v,
-                                !cparams.flash_attn,
+                                !cparams.flash_attn && !params.canonical_v,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
                                 n_ctx_kv,
@@ -2693,6 +3008,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.offload_input               =*/ false,
     };
 
     return result;

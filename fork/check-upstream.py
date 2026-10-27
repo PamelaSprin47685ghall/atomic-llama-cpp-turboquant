@@ -108,6 +108,18 @@ def verify(root):
             metadata, path = record.split(b"\t", 1)
             mode, oid, stage = metadata.decode().split()
             index[path.decode()] = (mode, oid, stage)
+    # A reviewed seam can change without staging the user's worktree. Accept
+    # its previous index bytes only when HEAD's own manifest reviews those
+    # exact committed bytes and the pin is unchanged. Arbitrary staged residue
+    # still fails, as does every unreviewed current worktree byte.
+    head_entries = {}
+    if git(root, "ls-tree", "HEAD", "--", "fork/upstream-exceptions.json"):
+        head_manifest = json.loads(git(root, "show", "HEAD:fork/upstream-exceptions.json"))
+        if (isinstance(head_manifest, dict) and head_manifest.get("version") == 1 and
+                head_manifest.get("upstream_commit") == base and isinstance(head_manifest.get("files"), list)):
+            for item in head_manifest["files"]:
+                if isinstance(item, dict) and isinstance(item.get("path"), str):
+                    head_entries[item["path"]] = item
     for path, entry in entries.items():
         original = base_tree.get(path)
         if original and original[:2] not in (("100644", "blob"), ("100755", "blob")):
@@ -121,7 +133,13 @@ def verify(root):
             mode, oid, _ = indexed
             unchanged_index = original and (mode, oid) == (original[0], original[2])
             reviewed_index = mode == entry["mode"] and digest(git(root, "cat-file", "blob", oid)) == entry["sha256"]
-            if not (unchanged_index or reviewed_index):
+            committed_reviewed_index = False
+            previous = head_entries.get(path)
+            if previous is not None and previous.get("mode") == mode:
+                committed = git(root, "ls-tree", "HEAD", "--", path).split(b"\t", 1)[0].decode().split()
+                committed_reviewed_index = (committed == [mode, "blob", oid] and
+                    digest(git(root, "cat-file", "blob", oid)) == previous.get("sha256"))
+            if not (unchanged_index or reviewed_index or committed_reviewed_index):
                 raise RuntimeError(f"index has unreviewed content or mode: {path}")
         elif original:
             raise RuntimeError(f"staged deletion of an A file is not an overlay: {path}")

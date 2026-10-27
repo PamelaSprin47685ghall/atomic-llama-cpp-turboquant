@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+find_dependency(llama CONFIG)
+find_dependency(TQRelay CONFIG)
+find_dependency(TQSampling CONFIG)
+find_dependency(TQScheduling CONFIG)
+find_dependency(TQText CONFIG)
+include("${CMAKE_CURRENT_LIST_DIR}/TQTP5ComposeTargets.cmake")
+check_required_components(TQTP5Compose)

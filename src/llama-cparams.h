@@ -60,6 +60,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool batch_invariant_matmul = false;
+    bool quantized_matmul_f32 = false;
 
     uint32_t kv_stream_arena_mib;
 

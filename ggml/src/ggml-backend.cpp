@@ -1751,7 +1751,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched, bool retained_inputs) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -1787,23 +1787,82 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    struct input_copy_scope {
+        ggml_backend_t backend;
+        bool pending;
+
+        void flush() {
+            if (pending) {
+                ggml_backend_synchronize(backend);
+                pending = false;
+            }
+        }
+
+        ~input_copy_scope() {
+            flush();
+        }
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        input_copy_scope input_copies = { split_backend, false };
+        bool batch_inputs = split->n_inputs > 0 && split_backend->iface.cpy_tensor_async != nullptr;
+        bool has_user_input = false;
+        for (int input_id = 0; batch_inputs && input_id < split->n_inputs; input_id++) {
+            const ggml_tensor * input = split->inputs[input_id];
+            ggml_backend_buffer_t buffer = input->view_src ? input->view_src->buffer : input->buffer;
+            const bool empty = ggml_nbytes(input) == 0;
+            has_user_input |= !empty && (input->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+            batch_inputs = empty ||
+                    (buffer && ggml_backend_buffer_is_host(buffer) && ggml_is_contiguous(input) &&
+                     ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+        batch_inputs &= has_user_input;
+        bool batch_slot_waited = false;
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            // Empty views neither read source bytes nor overwrite a copy slot.
+            if (ggml_nbytes(split->inputs[input_id]) == 0) {
+                continue;
+            }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) || batch_inputs) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                // A host-input batch waits for the previous copy slot once, then completes all uploads before dispatch.
+                if (!batch_inputs || !batch_slot_waited) {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    batch_slot_waited = true;
+                }
+                if (batch_inputs) {
+                    GGML_ASSERT(ggml_are_same_layout(input, input_cpy) && "cannot copy tensors with different layouts");
+                    const size_t nbytes = ggml_nbytes(input);
+                    GGML_ASSERT((nbytes == 0 || input_cpy->data != NULL) && "tensor not allocated");
+                    GGML_ASSERT(nbytes <= ggml_nbytes(input_cpy) && "tensor write out of bounds");
+                    ggml_backend_buffer_t buffer = input_cpy->view_src ? input_cpy->view_src->buffer : input_cpy->buffer;
+                    GGML_ASSERT(buffer != NULL && "tensor buffer not set");
+                    ggml_backend_moe_cache_invalidate_buffer(buffer, input_cpy->data, nbytes);
+
+                    // A callback can throw after queuing part of an upload. Keep caller memory alive until it drains.
+                    const bool was_pending = input_copies.pending;
+                    input_copies.pending = true;
+                    if (split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        continue;
+                    }
+                    // Rejection has no side effects, but earlier accepted uploads must finish before a blocking copy.
+                    input_copies.pending = was_pending;
+                    input_copies.flush();
+                    batch_inputs = false;
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
@@ -1915,6 +1974,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // The default API preserves immediate host-input reuse. The explicit
+        // retained-input API can leave uploads ordered before compute on each
+        // backend stream; a rejected/partial batch keeps the original contract.
+        const bool defer_input_flush = retained_inputs && sched->n_splits == 1 &&
+                sched->callback_eval == nullptr && batch_inputs;
+        if (!defer_input_flush) {
+            input_copies.flush();
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1959,6 +2027,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
+        }
+        if (defer_input_flush) {
+            // Transfer source lifetime only after successful graph submission.
+            // Every earlier return/exception still drains through the scope.
+            input_copies.pending = false;
         }
     }
 
@@ -2222,7 +2295,8 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
     return err;
 }
 
-enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+static enum ggml_status ggml_backend_sched_graph_compute_async_impl(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool retained_inputs) {
     GGML_ASSERT(sched);
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
@@ -2234,7 +2308,15 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    return ggml_backend_sched_compute_splits(sched, retained_inputs);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    return ggml_backend_sched_graph_compute_async_impl(sched, graph, false);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_async_retained_inputs(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    return ggml_backend_sched_graph_compute_async_impl(sched, graph, true);
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

@@ -1,4 +1,146 @@
+<!-- two-requests-current-status-20261021 -->
+## 2026-10-21：双请求保留版本与最终测量；每路 47 tok/s 目标未达到
+
+保留版本、证据和入口见[双请求报告](../build-tp5-two-requests-20261021/TWO-REQUESTS-REPORT.md)；以下旧正文保留。本次增量为 3 个 A 源文件和 1 个 C 源文件，公共 API 不变；使用原始模型权重、每请求 262144 容量的 Q4_0 K/V，并保留 Swift 共享权重派生 view 生命周期修复及五 rank host 提交顺序 gate。
+
+同 prompt 双请求组（n=2 个独立进程），每路 512 token：两路几何均值为 **37.629332 / 37.624558 tok/s**，aggregate 几何均值 **74.923025 tok/s**，范围 **74.847236–74.998891**。相同 C 版本的单请求观测（n=1）为 **46.071845 tok/s**；aggregate 对单请求的 **1.626222×** 仅作描述性比较。不同 prompt 的一个双请求案例为 **34.571716 / 34.899258 tok/s**，aggregate **69.062687 tok/s**。**两个请求各 47 tok/s（合计 94 tok/s）的目标未达到。** 历史 **47.34 tok/s** 只属于旧 F16 单请求配置。
+
+完整 16-token trace 已通过，49 组五 rank 提交保持一致次序，但该完整 tracing 的共同生成期 GPU overlap 为 **0**。另一次相同保留版本的 kernel-only 采样已通过：共同输出阶段 GPU0–3 观察到跨请求算术/算术与算术/consume 的真实交集，GPU4 为零；含预填充的完整活动阶段五卡均有局部交集。由此可确认存在实际 GPU 重叠，但不能宣称五卡共同生成期都已重叠或通信完全隐藏。各次观测和证据分别保留，详见双请求报告。
+
+---
+
 # 发布候选变更说明
+
+<!-- TP5_NATIVE_SPEED_20261021_FINAL -->
+## Latest retained result: native TP5, 2026-10-21
+
+The current retained native TP5 configuration is the 2026-10-21 four-pair-qualified build. Older “current”, “final”, and gap-failure entries below are historical. The user's relaxed numerical policy applies to native acceptance; explicit strict-reference modes retain their separate gates.
+
+Four balanced pairs against fixed master `46a6fd8a129091741f9ebc6431f7f610abe1ccfc` passed: geometric-mean throughput **47.343475 vs 45.366353 token/s**, paired ratio **1.043581249**, two-sided 95% CI **[1.037961336, 1.049231589]**. Every run includes all 511 intervals from 512 natural outputs.
+
+Retained changes enable the native backend policy, BF16 load4, existing HC fusions and Q2 short-row reuse, parallel per-rank graph instantiation, and guarded logical attention padding of 1024. Physical KV capacity and CPU rank-ordered F32 relay are unchanged. The F32 router extension was withdrawn; initial direct warm is retained.
+
+The incremental production patch changes ten existing A files (+24 net lines) and one C file (+1); the 51-path overlay set is unchanged. See the [final report](../build-tp5-native-speed-20261021/NATIVE-SPEED-REPORT.md).
+
+<!-- /TP5_NATIVE_SPEED_20261021_FINAL -->
+
+## 2026-10-19：TP5 单流性能修复，原数值门不变
+
+同一 Qwen3-8B Q8_0、五 RX 6800、固定单请求轨迹，四个独立配对 block 确认旧/新几何平均为 **9.1784/54.9584 token/s**；速率比 **5.98781**，95% CI **[5.29900,6.76615]**。主终点是 64 输出的 63 个真实提交间隔，不含模型加载、网络或排队。此前 11.30575/56.23309 是筛选单次值，不混入确认统计。
+
+- A 私有 provider 接收完整模型/RELAY 链，预热后进行至多两个精确绑定缓存项的整步原生重放；五卡 executable 准备完成后才实际 launch。通用 `GGML_HIP_GRAPHS` 仍关闭，未放宽原图/KV 失效条件。
+- 忙轮询不再反复切五个设备查询尾事件；snapshot/close 仍收集真实完成证据。每边界五 kernel 合为两个有界单 workgroup kernel，保留全写者发布和最后读者 ack，四值搬运不假定 view 的 16-byte 对齐。
+- 原 Q8 权重直接解码乘 F32 activation；投影改为无 LDS barrier 的四输出 block。CPU SIMD 只并行不同元素，各元素保持 rank 0→4 F32 加法和完整有限值检查。
+
+最终匹配轨迹的稳态四间隔观察到 0 次 `hipLaunchKernel` API、20 次 `hipGraphLaunch`；五个物理 BDF 都执行真实模型投影和 RELAY。性能来自无 profiler 的配对进程，而不是 launch 计数折算。
+
+FA on/off 各自完整 16-token 主路径、慢消费者、取消和第 8 epoch abort 通过，原 `.002 + .001*abs(reference)` 门下均零超差。288-token 单请求跨 KV 256→512，43,757,568 值最大绝对差 **0.0005264282**、零超差，并实际重新捕获后继续重放。1210 个 Q8/F32 GPU oracle、180 个 attention oracle、保序 CPU 回归及 host C/C++ ASan 主路径/第 8 epoch abort 通过；ASan 不覆盖 HIP 翻译单元/设备访问，leak detection 关闭。
+
+FA on/off 比值 **0.90844**、CI **[0.88025,0.93752]**，默认仍 off。新四请求 one/two-window 对照没有确认额外并发收益；保留现有自动窗口策略，不沿用旧镜像的 1.71597 倍结论。master 的 60–67 token/s 来自另一份 APEX-I-Compact 混合精度/MoE、激进 LateBind/Vulkan 负载，不作为当前 dense Q8_0/F32 路径的同模型加速比；未复制旧框架或移植不适用的 HC/LateBind。
+
+A + 七 B + 七 C 已重新安装、搬迁，在原 prefix/stage 不存在时用公共 target 构建外部消费者，运行双窗真实模型、默认单流和安装后的全 logits/第 8 epoch abort。发布 CLI/native 镜像与性能确认逐字节相同；原 prefix 已恢复。精确证据见 [当前机器索引](audit/tp5-performance-20261019.json) 和 [当前 C 文档](tp5-compose/README.md#single-request-performance-repair-2026-10-19)。以下保留原生重放前记录。
+
+## 2026-10-19：真实五卡 TP5、合格 F32 Flash Attention 与实测 off 默认
+
+新增独立 C [`tq-tp5-compose`](tp5-compose/README.md)：真实 Qwen3-8B Q8_0 在五张
+RX 6800 / HIP gfx1030 上执行，CPU 按 rank 顺序归约 F32，完整 producer / wait /
+consumer 整链预提交，两个 context 保持独立可变输入与 KV。现有组件为七 B、七 C。
+A pin 不变；当前 manifest 共 **48 个已审 A 路径**，包含两个新增 Q8/F32 文件，
+不是“48 修改另加二”。精确身份见 [机器索引](audit/tp5-acceptance-20261019.json) 与
+[本轮验证](VALIDATION.md#2026-10-19tp5-五卡-hipflash-attention-数值与生命周期验收)。
+
+- `--flash-attn on|off` 默认 **off**，严格解析；off 是实测最快的合格模式和显式数值参考，
+  不是错误回退。显式 on 仍有完整数值与生命周期资格，但没有性能默认晋级。
+  每个 context 的 resolved 设置必须与请求相同，报告区分请求与执行设置。
+- 精确 profile 复用已有融合 online F32 FA，模型图保留 F32 Q/K/V，不增加 F16 舍入
+  边界，也不拆成 QK / softmax 替代图。普通 FA 分派与精度不变；共享 online/banded F32
+  kernel 在 K/V 读取前跳过 -INF masked key，改善 masked NaN 语义，不笼统声称其他后端
+  一切不变。有限未屏蔽项的累加顺序保留。
+- 完整八 token 四请求的 `main/slow/cancel/abort` 门全部通过：32 行、4,861,952 logits，
+  固定 `.002 + .001 * abs(reference)` 门下超差和非有限值均为 0，max_abs
+  `2.193450927734375e-5`。慢消费者延迟 2 秒时另一窗口前进；取消后请求 1/2/3 继续；
+  abort 退出 1，两窗口真实 native completed mask 均为 31，最后预算为 0。
+- 最终 `acceptance-fa-final` 重跑完整八 token 全场景通过；五设备 Q8/F32 oracle 170 例与
+  最终 FA F64 oracle **180 例**通过（含 always-masked K/V NaN），max_abs `2.24640083e-6`
+  小于未改动的 `2e-5` 门。FA-on trace 记录 720 次
+  融合 FA launch，五物理设备各 144 次；FA-off trace 为 0。这不是吞吐或性能晋级证据。
+- 最终 FA-off 八 token main/slow/cancel/abort 全部通过。FA-on 的 32-token main-only
+  对照另检查 128 行 / 19,447,808 logits，同一数值门下非有限/超差 0，max_abs
+  `9.059906005859375e-5`；不扩写为 32-token 生命周期全矩阵或长上下文支持。
+- 当前源码 host-only ASan 对四个原始 193-token prompt、两个 context、每请求生成两 token
+  退出 0；此前四 token main+abort ASan 保留其独立候选身份。Leak detection 关闭，不代表
+  GPU sanitizer、全场景 ASan 或无泄漏。Strict preflight 只跳过合法无输出 prefill 空 tensor，
+  不造 logits、不缩短原始工作负载。最终 HIP 已完成七 B / 七 C 构建安装与 11/11
+  A seams；其末尾 guard 曾因根说明并发修改而拒绝旧 digest，最终身份回执另列。
+- 来源隔离的 85 条通过命令属于保存的 **45-path 前 FA 候选**，不冒充当前 48-path
+  构建的完整重跑。当前最终 HIP 包已有独立的搬迁/公开消费者证明，见下文；源码 guard
+  与最终机器索引看各自最终回执，不以这些选定合同代替所有门全绿。
+- `hip-package-proof/summary.json` 通过选定合同：15 组件（A+七 B+七 C）fresh install
+  到 stage 后改名 relocated，原 stage 与旧 install 前缀在消费者配置/构建和所有 GPU
+  调用期间均不可用，之后才恢复。外部项目仅安装公共头与 `find_package(TQTP5Compose)`
+  imported targets；编译路径无旧前缀/私有头，`ldd` 指向 relocated libraries。
+- 外部 consumer 两请求显式 on、双 context、真实五 rank、预算 0；直接 CLI 两请求
+  默认 off、单请求自动一窗口/off、三请求一窗口/on 均通过。搬迁 helper 的实际路径
+  **`share/TQTP5Compose/real-tp5.py`** 下 predict4 main-only 完整 logits 门通过。
+  首次 harness 猜错路径、子测试启动前退出 2 的失败保留；只改路径续跑，未重复成功 setup。
+- 最终发布包 trace 绑定五个实际 BDF：on 720 次、每卡 144 次，off 0；native libraries
+  与 12 个性能进程镜像相同。发布 CLI 的默认选择不同，但所有性能 case 显式传 on/off。
+- W0 请求 delay、W1 观察到 abort 的组合场景通过：两窗口 completed=31、unknown=0，
+  预算 0、exit 1、无成功输出。精确 held-borrow 分支未单独 instrument，不宣称该分支覆盖。
+
+### 逐流数据与默认模式裁决
+
+`per-stream-fa-final/summary.json`：12 个进程、三个配对 block，固定四请求，每请求
+193 prompt token 与 32 teacher 输出。每流几何平均速率（不是总吞吐）为：
+
+| FA | 窗口 | 每流 token/s |
+| --- | ---: | ---: |
+| off | 1 | 8.9853 |
+| off | 2 | **15.4185** |
+| on | 1 | 7.7510 |
+| on | 2 | 13.4642 |
+
+两窗口 on/off 速率比 `0.87325`，95% CI `[0.83966,0.90818]`，on 慢约 **12.7%**。
+因此默认 off、保留显式 qualified on。配对区间采用 Student t df=2，仅 n=3 独立 block；
+每请求只有 31 个 ITL，p99 不是稳定尾部估计。TTFT 为 admission-to-first-commit，排除
+模型加载和网络。`per-stream-fa` 原失败与 `per-stream-fa-prefill-fixed` 较慢候选均保留。
+用户关心速度不是要求默认 on，先前将两者等同的假设已纠正。
+
+Off 两/一窗口速率比 `1.71596659`，95% 配对 t 区间 `[1.28598327,2.28971978]`，
+仍来自同一 n=3 固定工作负载，不是通用并发收益。TTFT 还排除 context startup 和
+admission 前 queueing，不能理解为端到端时延。
+
+模型固定为 8,709,519,168 bytes，SHA-256
+`0cfbf745760f07a76ddeb358dd025a27f2e11d1ca9c9a4169a373d52990fe86e`。
+旧 FA-on、累加精度与 F16-cast 尝试的失败，以及原 Q8/ASan、Vulkan FA/TOPK 记录不删除，
+数值门不放宽。支持不扩展到 LFM2 MoE TP5、其他模型/后端、长上下文、MTP 或 RERoT+TP5；
+没有通用加速或 FA 性能晋级结论；上述固定工作负载的逐流测量不能扩大为通用性能保证。
+后文各批次维持自己的历史身份。
+
+## 2026-10-19：DevOps 交付收尾
+
+现有 CPU / Vulkan 包、CLI、真实模型与 HTTP 入口完成本轮重验；独立 HIP 探针完成
+五张 RX 6800 的 2000 轮运行。来源、具体门、失败前反例与新回执见
+[验证记录](VALIDATION.md#2026-10-19devops-收尾与当前交付验收) 和
+[机器索引](audit/devops-acceptance-20261019.json)。后文各批次仍保留自己的身份。
+
+- 修复 Vulkan 找到非系统 SPIRV-Headers 后仍缺少编译 include 的接线。只有这一项新增
+  A 例外，manifest 现为 35 路径；私有头依赖不传给安装消费者，不修改推理数学。
+- HIP 工具的 build/install RPATH 来自导入 runtime；搬迁安装不再依赖
+  `LD_LIBRARY_PATH`。定标 kernel 使用单写者与映射设备地址，未知完成时不做危险清理。
+- bench 校验强制四项测量的名字、单位、样本数，并检查与平台报告的共同字段。
+  缺项、配错轮数和非法 Unicode 字段名不再被接受或通过 traceback 退出。
+- 默认构建只运行 probe 的 CPU checks，显式关闭额外 HIP discovery；独立 HIP 构建、
+  CLI、安装与硬件运行仍是单独的门。空输出路径在设备访问前拒绝。
+- 隔离安装清理编译器与加载器搜索覆盖、禁用 CMake 环境/package-root 搜索，检查导入
+  位置。新增直接消费 Relay 和只链接 Compose 公共 target 的验收；污染环境下，
+  来源隔离、删除副本、搬迁与真实模型消费 80 条命令全部通过。
+- 文档统一指向当前 hardening 与本轮 DevOps 回执，不再将早期“正在验证”或 GPU oracle
+  失败误当成后续候选的现状。旧失败未删除，数值门未放宽。
+
+本轮五卡 **host fetch_add 仍为不可依赖能力**：全部实际返回错值；单写者 load/store
+平台门通过不等于全部系统原子可用。模型用例仍限定单卡 Vulkan 与 CPU；没有新增整模型
+TP5、HIP/CUDA 模型、多设备 PP、吞吐提升或远端 GitHub Actions 成功声明。
 
 ## 2026-10-19：RERoT 共享白板与独立执行包
 

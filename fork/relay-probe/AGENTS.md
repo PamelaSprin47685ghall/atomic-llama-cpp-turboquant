@@ -122,7 +122,9 @@
    `validate-report.py` 对报告与 bench 执行严格 JSON 解析（拒绝重复键、
    非有限数、未知字段与尾随数据）并重算全部交叉不变量——注册表覆盖、
    rank 与下标一致、five_rank 状态与设备数一致、qualification 与逐用例
-   结果一致、bench 序统计单调。未来字段变化必须升 schema 或改校验器，
+   结果一致、bench 四项测量完整、单位与样本数正确且序统计单调。配对提交时
+   设备序号、名称、架构、轮数与 HIP 版本字段必须一致；这不证明同一次运行身份。
+   未来字段变化必须升 schema 或改校验器，
    不允许静默漂移。`--self-test` 另含固定种子的结构化变异模糊：对合法报告
    与 bench 各 500 次逐层变异，任何结果都必须落在"仍合法"或校验器自己的
    EvidenceError 之内，意外异常（TypeError/KeyError/递归）会立即失败——
@@ -133,8 +135,9 @@
 # Exceptions
 
 - 本目录不是独立 B 库：它声明依赖 HIP 运行时与 ROCm 工具链，只在 GPU 机器上
-  构建探针可执行文件；证据配置测试无此依赖。`fork/build.py` 默认流水线已构建
-  并运行无 GPU 的 config-test（有 ROCm 工具链时顺带构建探针可执行文件）；
+  构建探针可执行文件；证据配置测试无此依赖。`fork/build.py` 默认流水线显式
+  设置 `TQ_RELAY_PROBE_BUILD_HIP=OFF`，只构建并运行无 GPU 的 config-test 与
+  validator 自测；HIP 工具构建、安装和硬件运行须单独验收；
   isolation.py 仍排除本目录，因为无 HIP 时没有可安装 target，重装级隔离验收
   不覆盖平台工具。解除条件：无——平台资格探针天然依赖平台工具链。
 - gfx1030 host fetch_add 的错误值行为按本机观察记录，不代表其他 ROCm 版本或

@@ -49,6 +49,13 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // Keep V in canonical [head elements, tokens] storage even with ordinary
+    // attention. Its existing graph path transposes V on-device for V*KQ.
+    bool canonical_v = false;
+
+    // Logical attention width granularity; physical cache capacity is unchanged.
+    uint32_t attn_n_pad = 1;
 };
 
 enum llama_memory_status {

@@ -65,6 +65,9 @@ struct llama_context {
 
     ggml_backend_sched_t get_sched() const;
 
+    ggml_backend_t get_tp5_relay_backend() const { return backend_tp5_relay; }
+    ggml_backend_t get_quantized_matmul_f32_backend() const { return backend_quantized_matmul_f32; }
+
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
     uint32_t n_ctx_kv() const;
@@ -419,6 +422,8 @@ private:
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_t backend_tp5_relay = nullptr;
+    ggml_backend_t backend_quantized_matmul_f32 = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
     // training

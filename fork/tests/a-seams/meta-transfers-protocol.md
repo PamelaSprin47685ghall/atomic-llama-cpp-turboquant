@@ -6,7 +6,11 @@ The Meta backend splits one tensor across child backends. A byte offset in the f
 
 The fix removes the two zero-offset restrictions and applies the existing local offset calculation to both asynchronous paths. It changes four lines in `ggml/src/ggml-backend-meta.cpp` and adds four replacement lines. It adds no public API, backend interface field, queue, cache, or allocation policy.
 
-The regression uses public GGML APIs and two real CPU child backends. The expected result is a flat host byte array. It tests each transfer direction separately, so a write error cannot cancel a matching read error.
+The offset matrix uses public GGML APIs and two real CPU child backends. The expected result is a flat host byte array. It tests each transfer direction separately, so a write error cannot cancel a matching read error.
+
+The 2026-10-20 extension uses the existing `cpy_tensor_async` callback for ordinary contiguous host sources and mirrored Meta destinations, with one segment and repetition. It synchronizes the source backend and queues existing child async-set operations. Unsupported layouts, foreign destination devices and Meta-as-host sources reject before copy effects. There is no new public interface field or GPU-to-GPU transfer path.
+
+The scheduler can batch a contiguous all-host, non-weight input split containing a nonempty USER INPUT through this existing callback. Ordinary host metadata participates in the same batch; empty views carry no bytes and do not force a synchronous data copy. It waits for the previous input slot once and drains accepted uploads before graph dispatch or evaluation callbacks. A scoped guard also drains a partially accepted callback if it throws. Callback rejection drains earlier uploads before the original synchronous copy, then disables batching for the remaining inputs. Source storage is still safe to reuse when the graph call returns; preparation copies do not escape the call. This is input preparation, not a model continuation or math fallback.
 
 ## Transfer contract
 
@@ -32,6 +36,8 @@ This is not a snapshot API. It does not copy source bytes into a new owned trans
 | Operation | Async get with independent sync initialization; async set with independent sync verification |
 
 Each split uses unequal shard extents of 3 and 7. The complete matrix contains 48 cases. `--zero-only` selects 16 controls. `--get-only` and `--set-only` each select 24 cases.
+
+The default full run additionally exercises a real host-copy/matmul/SiLU consumer, a scheduler consumer with ordinary host metadata and an interleaved empty view, and five exported expert-result boundaries, for 55 contract cases. Narrow offset modes do not require the new callback. The copy cases cover repeated source updates, reuse/destruction after completion, and rejected copies leaving destination data unchanged. This A seam accesses the existing private backend interface to invoke its capability directly; it is not an installed public-consumer test. CPU children do not prove HIP transfer concurrency, scheduler exception handling, or GPU source lifetime. Real HIP input-copy observations and full model logits are separate evidence.
 
 The test checks the requested bytes, the complete tensor after the operation, leading and trailing destination guards, and the unchanged source of async set. It checks range arithmetic before allocating guards or forming subrange pointers. All checks remain active in Release builds.
 
@@ -66,11 +72,6 @@ for option, expected in [('--zero-only', 0),
     result = subprocess.run([str(binary), option], capture_output=True, timeout=60)
     if result.returncode != expected:
         raise SystemExit(f'{option}: expected {expected}, got {result.returncode}')
-    if option == '--zero-only':
-        if b'PASS 16 real meta transfer cases' not in result.stdout:
-            raise SystemExit('the zero-offset controls did not run')
-    elif b'offset == 0' not in result.stderr:
-        raise SystemExit(f'{option}: failure did not reach the old offset assertion')
     print(option, result.returncode)
 PY
 ```
@@ -84,7 +85,7 @@ cmake --build build-meta-after --parallel 4 --target test-meta-transfers
 build-meta-after/test-meta-transfers
 ```
 
-The final command must return 0 and print `PASS 48 real meta transfer cases on two CPU children`.
+The current full command must return 0. The recorded 2026-10-18 run below covered the original 48 offset cases; it does not qualify the later host-copy or scheduler extension.
 
 Removing only the two assertions is not a complete fix: it leaves the wrong local offsets. The middle-range cases compare each direction with independently initialized or read tensor contents and check that untouched chunks remain unchanged.
 

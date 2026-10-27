@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-21",
+  "goal": "five-rank Swift performance no worse than fixed master with bounded upstream divergence",
+  "goal_met": false,
+  "source_and_installed_identity": {
+    "ggml/src/ggml-cuda/fattn-banded.cu": {
+      "path": "/home/kunweiz/atomic-llama-cpp-turboquant/ggml/src/ggml-cuda/fattn-banded.cu",
+      "resolved": "/home/kunweiz/atomic-llama-cpp-turboquant/ggml/src/ggml-cuda/fattn-banded.cu",
+      "bytes": 24360,
+      "sha256": "f63a1a26b8e231df543b6a8239b260e0cc362130305891e4463547bbdd1518f8"
+    },
+    "ggml/src/ggml-cuda/mmvf.cu": {
+      "path": "/home/kunweiz/atomic-llama-cpp-turboquant/ggml/src/ggml-cuda/mmvf.cu",
+      "resolved": "/home/kunweiz/atomic-llama-cpp-turboquant/ggml/src/ggml-cuda/mmvf.cu",
+      "bytes": 50676,
+      "sha256": "aa80c0288284c70211d76b0608488c4e6b68f10845b02a640dc1269935bffb8a"
+    },
+    "ggml/src/ggml-cuda/mmvq-q8-f32.hip": {
+      "path": "/home/kunweiz/atomic-llama-cpp-turboquant/ggml/src/ggml-cuda/mmvq-q8-f32.hip",
+      "resolved": "/home/kunweiz/atomic-llama-cpp-turboquant/ggml/src/ggml-cuda/mmvq-q8-f32.hip",
+      "bytes": 31918,
+      "sha256": "3fd25fc0470fd161bcf25c5e0c5bafe24030f76549c89e283b80947879157f8c"
+    },
+    "ggml/src/ggml-cuda/relay.hip": {
+      "path": "/home/kunweiz/atomic-llama-cpp-turboquant/ggml/src/ggml-cuda/relay.hip",
+      "resolved": "/home/kunweiz/atomic-llama-cpp-turboquant/ggml/src/ggml-cuda/relay.hip",
+      "bytes": 54261,
+      "sha256": "f05868dec2c0c295dd865d3dcd9097f843644c34e8988bb84ae93d5ddd257db4"
+    },
+    "build-tp5-gap-repair-20261021/fa-prefix-install/lib/libggml-hip.so.0.18.1": {
+      "path": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-gap-repair-20261021/fa-prefix-install/lib/libggml-hip.so.0.18.1",
+      "resolved": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-gap-repair-20261021/fa-prefix-install/lib/libggml-hip.so.0.18.1",
+      "bytes": 68528328,
+      "sha256": "72fb2967d0cf76cf7fd1db9951d39c894cfbeacc078b0d78b4f62fe8e706e0a3"
+    },
+    "build-tp5-gap-repair-20261021/finite-greedy-compose-install/bin/tq-tp5-compose": {
+      "path": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-gap-repair-20261021/finite-greedy-compose-install/bin/tq-tp5-compose",
+      "resolved": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-gap-repair-20261021/finite-greedy-compose-install/bin/tq-tp5-compose",
+      "bytes": 214728,
+      "sha256": "32549404af82ec461af61577c9b8010fa98f53c244e12662030255469e86edfe"
+    }
+  },
+  "final_numeric": "build-tp5-gap-repair-20261021/fa-prefix-full512/full-metrics.json",
+  "final_incremental_pair": "build-tp5-gap-repair-20261021/fa-prefix-pair/summary.json",
+  "finite_greedy": "build-tp5-gap-repair-20261021/finite-greedy-observation.json",
+  "independent_build": "build-tp5-gap-repair-20261021/finite-greedy-build-receipt.json",
+  "installed_consumer": "build-tp5-gap-repair-20261021/finite-greedy-build/installed-consumer/receipt.json",
+  "master_fixed": "46a6fd8a129091741f9ebc6431f7f610abe1ccfc",
+  "master_evidence": "build-tp5-gap-repair-20261020/balanced-final-4/summary.json",
+  "diagnostics": "build-tp5-gap-repair-20261021/phase-clock-reproducible-analysis.json",
+  "diagnostic_production_source_restored": true,
+  "withdrawn": [
+    "Q3/Q5 K256 block2 unroll: 31.08274556712034 -> 28.38933424499267 token/s; numerical pass does not justify a measured regression"
+  ],
+  "report": "build-tp5-gap-repair-20261021/REPAIR-REPORT.md",
+  "patch": "build-tp5-gap-repair-20261021/retained-production.patch",
+  "launcher": "build-tp5-gap-repair-20261021/run-retained.py",
+  "reference_regenerated": false,
+  "tolerance_changed": false,
+  "committed": false,
+  "pushed": false,
+  "limits": [
+    "No final current/master balanced noninferiority pass",
+    "262144 capacity is not a filled-history run",
+    "No new claim for all Swift multiwindow/failure/long-state cases",
+    "Single incremental pairs have no confidence interval; do not multiply their ratios"
+  ],
+  "qualified_source_identity": "build-tp5-gap-repair-20261021/fa-prefix-identity.json",
+  "source_whitespace_adjustment": "build-tp5-gap-repair-20261021/source-whitespace-adjustment.json",
+  "source_guard": {
+    "upstream": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "exception_manifest_sha256": "24ca85371cf9c42179095bd972aaa812096864e46085c011eee2f9d7fb79843d",
+    "changed_upstream_paths": 51,
+    "extension_paths": 259
+  },
+  "report_sha256": "59116961d11a4a26d5cbf4023e40a5ed9e5a6a3d0f6a739f87cc1bc2da9aafde",
+  "patch_sha256": "b52a2d9e34c8cec4f3a9d01adde7760fa0f530466185b58d32131d4099f8672e",
+  "qsa_retained_checkpoint": {
+    "state": "retained_incremental_not_master_parity",
+    "rates": [
+      32.78205213382536,
+      35.53744178688856
+    ],
+    "ratio": 1.0840517744836393,
+    "sources_and_binaries": {
+      "src/models/qwen4exp.cpp": "8f3e72b9e0955662877b93efcff7f27ea2bde897deca551b38db03784c6a00d3",
+      "ggml/src/ggml-cuda/relay.hip": "f6c3a46434fd1d9ae8ade55a0bf205b69c0e5ef0c35a95103ce36f548a5337d9",
+      "fork/tests/a-seams/hip-relay-rebinding.cpp": "aa7095ebe44222b175aeb7ca593c5c4cb29f4d7e0ed7e110840be80b44c37360",
+      "fork/upstream-exceptions.json": "2f36e79392143c4ecf4d488fe990669478a07c8d01b9f0c06a0e7698f84d46f1",
+      "build-tp5-gap-repair-20261021/run-retained.py": "e964bba749c018fa749dd726d62a38734f34901c218c8d5e91da4f6cc85aae7c",
+      "build-tp5-gap-repair-20261021/qsa-full-coverage-install/lib/libggml-hip.so.0.18.1": "0c793c68e2834831dd08f219040767160997bb103730dbd26b9559014af64efd",
+      "build-tp5-gap-repair-20261021/qsa-full-coverage-install/lib/libggml-base.so": "9e9b68c093e80bb25cabfda5c124aa4f45f96eb4d67e8dc9fcd32acec9e7a001",
+      "build-tp5-gap-repair-20261021/qsa-full-coverage-install/lib/libllama.so": "cd6857bfbaa12870dded452618f95efba21fa54f10173331418bcbfaa28e386e",
+      "build-tp5-gap-repair-20261021/finite-greedy-compose-install/bin/tq-tp5-compose": "32549404af82ec461af61577c9b8010fa98f53c244e12662030255469e86edfe"
+    }
+  },
+  "precise_glu_retained_checkpoint": {
+    "state": "retained_incremental_not_master_parity",
+    "rates": {
+      "baseline": 35.55973479352995,
+      "candidate": 36.24140233412695
+    },
+    "incremental_ratio": 1.019169646358584,
+    "sources_and_binaries": {
+      "ggml/src/ggml-cuda/fattn-banded.cu": "f63a1a26b8e231df543b6a8239b260e0cc362130305891e4463547bbdd1518f8",
+      "ggml/src/ggml-cuda/mmvf.cu": "aa80c0288284c70211d76b0608488c4e6b68f10845b02a640dc1269935bffb8a",
+      "ggml/src/ggml-cuda/mmvq-q8-f32.hip": "d587f864480eb99df9f6af6e0f780968bc1f417f82d7478da23a7e25f15ae9bc",
+      "ggml/src/ggml-cuda/mmvq-q8-f32.cuh": "f1f57eeaafc09db2e3237c7a3acab9868912992560c28b8142f1635db3b2546f",
+      "ggml/src/ggml-cuda/relay.hip": "f6c3a46434fd1d9ae8ade55a0bf205b69c0e5ef0c35a95103ce36f548a5337d9",
+      "ggml/src/ggml-cuda/relay.cuh": "6babbafb5da0586ecf6d08abdd31225fd64455c4b1512d1685330966c308257c",
+      "ggml/src/ggml-cuda/ggml-cuda.cu": "2351fcb40f3f1b5243569a2b9687d594ef74be8cfcfdb75a5b94e2f654a61bf0",
+      "fork/tests/a-seams/q2-f32-glu.cpp": "6c70330f0281ca6994be4f5c40b53b432a34a93d40a4cad7de474b2fd3a08d40",
+      "src/models/qwen4exp.cpp": "8f3e72b9e0955662877b93efcff7f27ea2bde897deca551b38db03784c6a00d3",
+      "src/llama-model.cpp": "42f867c22646f6ac995eba4fcc48b9408af1c228d4283b937f5a87bda38170f6",
+      "ggml/src/ggml-backend-meta.cpp": "fd6913c95ad1a15b5845b3a61863d39e346113661e233d447c6133686f73a646",
+      "fork/tests/a-seams/test-meta-transfers.cpp": "aafd5a0fb7c990052dfb7eaeb0b1f546061660cfe7fa349e5d636bcb506dfea6",
+      "fork/tests/a-seams/hip-relay-rebinding.cpp": "aa7095ebe44222b175aeb7ca593c5c4cb29f4d7e0ed7e110840be80b44c37360",
+      "ggml/src/ggml-relay-impl.h": "98ad0fd457ac3386cd29b2282eac1e8c2f44bcedf6bfcd87241ab6db467e3fe8",
+      "build-tp5-gap-repair-20261021/precise-glu-install/lib/libggml-hip.so.0.18.1": "3d358e4b40e05e193bb20e298f914f634a2401640989aeb2d66cc475c8935038",
+      "build-tp5-gap-repair-20261021/precise-glu-install/lib/libggml-base.so": "9e9b68c093e80bb25cabfda5c124aa4f45f96eb4d67e8dc9fcd32acec9e7a001",
+      "build-tp5-gap-repair-20261021/precise-glu-install/lib/libllama.so": "cd6857bfbaa12870dded452618f95efba21fa54f10173331418bcbfaa28e386e",
+      "build-tp5-gap-repair-20261021/finite-greedy-compose-install/bin/tq-tp5-compose": "32549404af82ec461af61577c9b8010fa98f53c244e12662030255469e86edfe",
+      "fork/upstream-exceptions.json": "ad618755f54f19ce671e1f5f6cd0d5e80408f98020d753994605476faa5558e0",
+      "build-tp5-gap-repair-20261021/run-retained.py": "665a8b21ad7f8fda758f1d6ef3c18ea0138b28b8aee98619d20ac71df041daae"
+    },
+    "close_time_fusion_counters": {
+      "baseline": [
+        {
+          "device": "ROCm0",
+          "mul_mat_glu": 0,
+          "monotonic_ns": 862081125323937
+        },
+        {
+          "device": "ROCm1",
+          "mul_mat_glu": 0,
+          "monotonic_ns": 862081135968491
+        },
+        {
+          "device": "ROCm2",
+          "mul_mat_glu": 0,
+          "monotonic_ns": 862081147074076
+        },
+        {
+          "device": "ROCm3",
+          "mul_mat_glu": 0,
+          "monotonic_ns": 862081157250880
+        },
+        {
+          "device": "ROCm4",
+          "mul_mat_glu": 0,
+          "monotonic_ns": 862081167179044
+        }
+      ],
+      "candidate": [
+        {
+          "device": "ROCm0",
+          "mul_mat_glu": 429,
+          "monotonic_ns": 862213852649513
+        },
+        {
+          "device": "ROCm1",
+          "mul_mat_glu": 429,
+          "monotonic_ns": 862213865508625
+        },
+        {
+          "device": "ROCm2",
+          "mul_mat_glu": 429,
+          "monotonic_ns": 862213878587590
+        },
+        {
+          "device": "ROCm3",
+          "mul_mat_glu": 429,
+          "monotonic_ns": 862213891061477
+        },
+        {
+          "device": "ROCm4",
+          "mul_mat_glu": 429,
+          "monotonic_ns": 862213903144136
+        }
+      ]
+    }
+  }
+}

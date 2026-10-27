@@ -61,6 +61,8 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+file(GLOB   GGML_SOURCES_NATIVE_HIP "../ggml-cuda/*.hip")
+list(APPEND GGML_SOURCES_ROCM ${GGML_SOURCES_NATIVE_HIP})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 # Exclude D>=576 tile kernels: exceed HIP local memory limit (67584 > 65536)
 list(FILTER SRCS EXCLUDE REGEX "dkq(576|640)")

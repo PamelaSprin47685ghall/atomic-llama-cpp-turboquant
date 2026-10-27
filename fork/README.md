@@ -4,6 +4,8 @@
 
 当前已实现 **RERoT 的逐 token 共享白板**：独立 B 拥有 DAG、reader 可见性和原子发布状态，C 通过公开接口编排一个真实 A context，并复用 TQRelay 的提交与排空合同。它建立在此前的阶段计算工作区、独立物理 KV 容量、Prefill 优先、准入队列、文本输出和校准工具之上。实现范围与运行资格分别记录；A 的实际变动以 [upstream-exceptions.json](upstream-exceptions.json) 登记的完整文件内容、消费者、理由和退出条件为准。
 
+当前 **Qwen3-8B Q8_0 五卡 HIP TP5** 已完成单流性能修复：有界整步原生重放、两 kernel RELAY、直接 Q8/F32 投影与保序 CPU SIMD 合并；不降低数值策略、不引入新的库或通用调度框架。四个独立配对 block 确认旧/新单请求几何平均为 **9.1784/54.9584 token/s**，速率比 **5.98781**，95% CI **[5.29900,6.76615]**。FA 仍默认 off；双窗安全可用，但新四请求试验没有确认额外并发收益。入口和范围见 [TQTP5Compose](tp5-compose/README.md#single-request-performance-repair-2026-10-19)、[本轮机器索引](audit/tp5-performance-20261019.json) 与 [验证记录](VALIDATION.md)。下文旧 TP5 交付节保留原生重放前身份。
+
 完整清单与取舍见 [AUDIT.md](AUDIT.md)、[MIGRATION.md](MIGRATION.md)，实际运行记录见 [VALIDATION.md](VALIDATION.md)。未迁入的有用能力仍是保留候选；旧实现与证据保存在 `archive/pre-clean-20261018`。
 
 TP5 重写后的细节与原始论文索引见 [REWRITE-CANDIDATES.md](REWRITE-CANDIDATES.md)。该文保留最初文本审计的固定身份，另在 E11 / E23 记录后续 RERoT 重写及剩余条件。未证实工作的旧代码继续只作文本依据；已经属于 A 的能力直接复用。
@@ -26,23 +28,58 @@ TP5 重写后的细节与原始论文索引见 [REWRITE-CANDIDATES.md](REWRITE-C
 | C：logits-compose | 录制真实输入 token 和原始 logits，完整后发布新文件 | 已安装 llama |
 | C：imatrix-compose | 明确选择 partial / unseen 策略，用有界磁盘暂存导出 A 可消费的 GGUF imatrix | 已安装 ggml 的 `ggml::ggml-base`、TQCalibration |
 | C：rerot-compose | 显式 DAG 的 `assistant-eot` 共享白板；原生模板、真实 reader attention、独立 sampler、阶段释放和终结 | 已安装 llama、TQRerot、TQRelay、TQText |
+| C：tp5-compose | Qwen3-8B Q8_0 五卡 HIP 推理；CPU ordered-F32 relay、独立双窗口、完整 logits 与取消/排空 | 已安装 llama、TQRelay、TQScheduling、TQText |
 
 A 与 B 不包含、调用或注入彼此的服务；各 B 也不依赖兄弟库。C 只消费安装后的公开接口。没有构建时改写源码、链接符号拦截或私有头文件桥接。原版 `llama-server` 的小范围调度修改是明确的 A 例外，尚未拆成完整独立 HTTP 编排层；详见 [UPSTREAM-EXCEPTIONS.md](UPSTREAM-EXCEPTIONS.md)。
 
 ## 构建
 
-需要 Git、Python 3.12 或更新版本、CMake、C++17 编译器，以及所选 A 后端需要的工具链。完整交付目前在 Linux 实测；logits 和 imatrix 文件发布需要 POSIX `openat` / `linkat`，imatrix 输出限定为小端系统。转换本身不需要 Python 或 NumPy，Python 用于构建入口和测试。从仓库根执行：
+需要 Git、Python 3.12 或更新版本、CMake 3.21 或更新版本、C++17 编译器，以及所选 A 后端需要的工具链。Vulkan 构建还需要 Vulkan SDK、`glslc` 和可由 CMake 查找的 `SPIRV-Headers`；非系统安装用 `CMAKE_PREFIX_PATH` 指定其前缀。完整交付目前在 Linux 实测；logits 和 imatrix 文件发布需要 POSIX `openat` / `linkat`，imatrix 输出限定为小端系统。转换本身不需要 Python 或 NumPy，Python 用于构建入口和测试。从仓库根执行：
 
 ```sh
 python3 fork/build.py --backend cpu --build-dir build-clean-fork --jobs 4
 python3 fork/build.py --backend vulkan --tools --build-dir build-clean-vulkan --jobs 4
+python3 fork/build.py --backend hip --tp5 --hip-root /absolute/path/to/rocm --build-dir build-tp5 --jobs 8
 ```
 
-脚本先检查 A，再单独构建和安装 A；随后分别构建、测试和安装七个 B，再分别构建六个 C。产物位于相应构建目录的 `install/`。默认组件测试不需要下载模型；启用的 Vulkan 接缝测试需要真实 Vulkan 设备。真实 RERoT 模型验收需要另外提供兼容的模型。
+脚本先检查 A，再单独构建和安装 A；随后分别构建、测试和安装七个 B，再分别构建七个 C。产物位于相应构建目录的 `install/`。默认组件测试不需要下载模型；启用的 Vulkan 接缝测试需要真实 Vulkan 设备。真实 RERoT 模型验收需要另外提供兼容的模型；真实 TP5 验收还需要上述 HIP profile、恰好五张兼容 GPU 与指定权重。
 
 `--tools` 额外构建 `llama-server`、`llama-bench` 及 A 在 tools 模式下必须安装的 `mtmd`；工具可执行文件位于 `upstream/bin/`。脚本也接受 `cuda`、`hip`，可选后端不等于已经取得运行资格。2026-10-18 的 CPU 独立交付与 CPU / Vulkan 同形状流式模型对照保留各自身份；RERoT 的后续资格单列在 [VALIDATION.md](VALIDATION.md)。`--no-test` 只用于明确跳过测试的构建，不构成验证记录。
 
-TP5 mapped-relay 的平台资格另有独立探针 [relay-probe](relay-probe/README.md)，其无 GPU 的 config-test 与证据校验器 `--self-test` 已进入上述默认流水线；探针可执行文件需要 ROCm HIP 工具链，只在 HIP 存在时构建，默认流水线不安装它（isolation 验收只排除无 HIP 的安装情形；探针自带的 `cmake --install` 在 HIP 存在时装出两个可执行文件、校验器与文档，已做过独立前缀冒烟）。它在每张现有设备上验证双向运行期可见、热复用、精确票据、多工作组完成与 abort、同流逆序依赖识别、双窗口独立前进、CPU 服务循环独立前进、非有限归约门与 host 有界等待，并按操作记录 host 内存系统 RMW 能力位；本机 RX 6800 实测 host fetch_add 产生错误值而 CAS 可用，恰好要求协议只用单写者 load/store 字。同批交付的 `tq-clock-rate` 在每张可见设备上实测 `clock64()` 速率，把探针设备侧自旋预算的 2.3 GHz 定标从一次性手工测量变成可复核的工具（它与探针共用同一份映射 host 内存合同：默认 pinned 本机实测 flags=0 却可被核写入，属平台意外，工具逐卡校验 Mapped 标志）。五卡用例的逐 rank 索引（核与 guard 布局）由单卡钉住用例 `five_rank_indexing` 在每张开发机上持续验证，跨设备可见性仍只在真实五卡机首次运行。五卡用例只在恰好五张设备时运行，运维人员在目标机上重跑同一程序即可取得新报告，归档前用校验器做机器检查。
+TP5 mapped-relay 的平台资格另有独立探针 [relay-probe](relay-probe/README.md)。默认流水线显式设置 `TQ_RELAY_PROBE_BUILD_HIP=OFF`，仅运行无 GPU 的 config-test 与证据校验器 `--self-test`，不因机器恰好安装 ROCm 而额外启用 HIP 编译器。HIP 工具须单独构建、测试和安装；安装包含两个可执行文件、校验器、README 与许可证，仍依赖目标机的 ROCm runtime 和 Python。构建与安装的运行库路径来自 HIP 包，不需要 `LD_LIBRARY_PATH`。
+
+探针逐卡验证双向运行期可见、热复用、精确票据、多工作组完成与 abort、同流逆序依赖识别、双窗口与 CPU 服务循环独立前进、非有限归约门和 host 有界等待。恰好五张设备时另执行跨设备用例，否则明确记录 `not_run`。系统 RMW 是独立能力观察，不可替代单写者 load/store 合同；本次五张 RX 6800 均观察到 host fetch_add 错值，禁止协议依赖该操作。`tq-clock-rate` 用单写者和映射设备地址测量各卡 `clock64()` 速率，不提供模型或性能资格。归档前使用安装后的校验器检查完整四项 bench 测量及 REPORT/BENCH 的共同字段；校验成功不证明任意两个文件来自同次运行。实际五卡结果与范围见 [VALIDATION.md](VALIDATION.md)。
+
+## TP5：原生重放前的模型与交付记录（历史）
+
+当前限定 Qwen3-8B Q8_0、五张 RX 6800 / gfx1030、每请求最多 512 个输入/生成 token，最多四请求、两个独立 context。模型身份为 8,709,519,168 bytes，SHA-256 `0cfbf745760f07a76ddeb358dd025a27f2e11d1ca9c9a4169a373d52990fe86e`。A 拥有模型和设备执行，C 只用已安装公共接口组合三个独立 B；详见 [公共选项与结果](tp5-compose/include/tq/tp5/runtime.h)、[C runtime](tp5-compose/src/runtime.cpp)、[HIP relay](../ggml/src/ggml-cuda/relay.hip) 和 [复用的 fused online F32 attention](../ggml/src/ggml-cuda/fattn-banded.cu)。
+
+`--flash-attn on|off` 严格解析，默认 `off`，是该工作负载中测得最快的合格模式，同时保留普通 attention 数值参考；显式 `on` 不是失败后的自动回退。该 decoded-F32 profile 保留 F32 Q/K/V，复用已有融合 online F32 FA，不增加 F16 舍入边界，也不拆成 QK / softmax / V 替代图。普通 FA 分派与精度选择不变；共享 banded F32 kernel 在 K/V 读取前排除 -INF mask，改善 masked-nonfinite 语义，不笼统宣称其他后端所有行为不变。
+
+最终 `acceptance-fa-final` 对四请求各生成八 token，在相同 FA 设置下比较单卡参考与五卡 teacher-forcing：32 行、4,861,952 个 logits 全部满足 `abs(diff) <= 0.002 + 0.001 * abs(reference)`，最大绝对差 `2.193450927734375e-5`。2 秒延迟期间另一窗口继续前进；取消后请求 1/2/3 继续生成；注入 abort 退出 1，两个窗口均提供真实 native drain 回执并释放全部预算。五卡 Q8/F32 oracle 170 例与最终 FA oracle **180 例**通过，后者包含 always-masked K/V NaN，最大 F64-oracle 绝对差 `2.24640083e-6`，门限仍为 `2e-5`。
+
+当前 manifest 为 48 个已审 A 路径（已包含两个新增 Q8/F32 文件），精确 digest 以 manifest 与最终 guard 回执为准；85 条隔离命令通过属于保存的 45-path 前 FA 候选，不冒充最终 FA 构建的重跑。FA-on 的实际 trace 已记录 720 次融合 FA launch，五个物理设备各 144 次；FA-off trace 为 0。
+
+最终 FA-off 八 token 全四场景也已通过。FA-on 的 32-token main 对照另检查 128 行 / 19,447,808 logits，max_abs `9.059906005859375e-5`，同一门下非有限/超差 0；它不是 32-token 全生命周期矩阵。当前源码 host ASan 又在原四个 193-token prompt、两个 context、每请求生成两 token 下退出 0（`asan-long-final.json`）；此前四 token main+abort 是另一候选的独立记录。Leak detection 关闭，不扩写为 GPU sanitizer 或无泄漏证明。严格 preflight 跳过合法的无输出 prefill 空 tensor，不制造 logits，也不缩短真实 prompt。最终 HIP 构建已完成七 B / 七 C 构建安装与 11/11 A seams；其末尾 guard 曾因根说明并发修改而拒绝旧 digest，身份刷新与最终结果在验证记录中单列。
+
+逐流测量 `per-stream-fa-final/summary.json` 使用 12 个进程、三个配对 block，四请求各保留 193 prompt token 与 32 个固定 teacher 输出：
+
+| FA | 窗口 | 每流几何平均 token/s | admission-to-first-commit TTFT（ms） |
+| --- | ---: | ---: | ---: |
+| off | 1 | 8.9853 | 25568.1 |
+| off | 2 | **15.4185** | 14059.6 |
+| on | 1 | 7.7510 | 26719.4 |
+| on | 2 | 13.4642 | 14748.4 |
+
+两窗口 on/off 比为 `0.87325`，配对 log-ratio 的 Student t（df=2）95% CI `[0.83966,0.90818]`：on 慢约 12.7%，不晋级为性能默认。只有三个独立 block，每请求 31 个 ITL，p99 接近最大值而非稳定总体尾部估计；TTFT 排除模型加载和网络。原 `per-stream-fa` 失败与 `per-stream-fa-prefill-fixed` 的较慢候选均保留。用户关心速度，不等于要求默认启用 FA，先前的相反理解已按实测纠正。
+
+同一固定工作负载下，off 两/一窗口速率比 `1.71596659`，95% 配对 t 区间 `[1.28598327,2.28971978]`，仍只有 n=3 block；不扩写为通用并发收益。TTFT 还排除 context startup 与 admission 前 queueing，不是端到端延迟。
+
+最终 HIP 包的 `hip-package-proof/summary.json` 已通过选定合同：A+七 B+七 C 共 15 组件 fresh install 到 stage 后改名 relocated；消费者配置/构建与全部 GPU 调用期间，原 stage 与旧 install 前缀真实不可用，之后才恢复。外部项目仅 `find_package(TQTP5Compose)` 和 installed headers/imported targets，编译路径无旧前缀/私有源码头，`ldd` 指向 relocated libraries。显式 on 的外部两请求双 context、默认 off 的 CLI 两请求、自动一窗口/off 的单请求及一窗口/on 的三请求均实际通过，最后预算为 0。
+
+实际安装 helper 是 **`share/TQTP5Compose/real-tp5.py`**，搬迁后的 predict4 main-only 全 logits 门通过；首次猜错 helper 路径、子测试启动前退出 2 的日志保留，修正安装路径后没有重复成功 setup。最终包 trace 绑定五个 BDF，on 720 次、每卡 144 次，off 0；native libraries 与 12 个性能进程镜像相同，发布 CLI 仅默认选择不同，性能 case 均显式 on/off。另有 W0 请求 delay、W1 abort 的组合场景，两 native completed mask 均为 31、unknown=0、预算 0；精确 held-borrow 分支未单独 instrument，不声称分支覆盖。
+
+这些记录不授予 LFM2 MoE、其他模型/后端、长上下文、MTP 或 RERoT+TP5 组合资格，也没有通用加速结论。当前 48-path source guard 和最终机器索引看各自最终回执，不提前宣布所有门全绿；不从旧候选的隔离或 sanitizer PASS 推导。
 
 ## 多请求与阶段内存
 
@@ -136,10 +173,10 @@ TQRelay 在这里登记的是 **一个真实 A 提交域**，只有 `llama_synch
 | 资格层次 | 当前记录 |
 |---|---|
 | 独立 B 状态与数学 | Release、UBSan、ASan 各 4/4 CTest 通过；包含四节点 DAG 穷举、事务反例和独立 F64 attention oracle |
-| 真实 A reader 数学 | 最新 helper 已通过 16 例 CPU 独立 F64 logits oracle：单层合法 GGUF、零 FFN、Llama NORMAL / Qwen2 NEOX、4 Q / 2 KV heads、RoPE amplitude 1 / 1.375、行重排及同一 frozen cohort 的串行对照。此前 8 例、最大绝对误差 `7.72386e-7` 的回执保留原实现身份。GPU 独立 F64 oracle 仍未通过，其 ordinary 校准先失败 |
-| 真实 F32 reader 状态 | LFM2.5 的最终 33 项严格门通过：31 个全 logits 等价组、2 个 peer 因果效应组。等价组最大绝对 logits 差为 CPU 0、Vulkan `0.0000133514404296875`，包含新增 reversed-serial / visible-serial 同形状对照；最终分组和回执见 [VALIDATION.md](VALIDATION.md)。关系与状态门的通过不代替 GPU 独立数学资格 |
-| 真实 LFM2.5 完整生成 | 正在验证；不能由小模型 oracle 或历史 batch / corpus 测试推出通过 |
-| 多 GPU PP、MMVQ 性能与其他优化组合 | 多 GPU PP 尚未实际运行；没有 RERoT 性能收益结论。LateBind、MTP、整模型 TP5 provider 和 Turbo / 量化 KV reader 路线尚未接入 |
+| 真实 A reader 数学 | 2026-10-19 hardening 候选的 CPU、Vulkan 独立 F64 logits oracle 各 16 例通过：单层合法 GGUF、零 FFN、Llama NORMAL / Qwen2 NEOX、GQA、RoPE amplitude 与 query 顺序。reader 最大绝对误差分别为 `6.75223405188774e-7`、`6.539480768563699e-7`；早期 GPU ordinary 校准失败仍保留原候选身份，不覆盖全模型或其他架构 |
+| 真实 F32 reader 状态 | 同一 hardening 记录中 CPU / Vulkan 均通过 33 个严格组与 12 个跨形状对照；最大绝对差分别为 0、`1.52587890625e-5`。具体安装产物、分组和阈值见 [VALIDATION.md](VALIDATION.md)，关系与状态门不代替独立数学资格 |
+| 真实 LFM2.5 完整生成 | 2026-10-19 hardening 候选的 CPU / 单卡 Vulkan 严格八例已分别通过，使用各自完整生成回执；不由小模型 oracle 或其他 C 的测试推出。当前构建的 DevOps 重验另列于 [VALIDATION.md](VALIDATION.md) |
+| 多 GPU PP、MMVQ 性能与其他优化组合 | 多 GPU PP 尚未实际运行；没有 RERoT 性能收益结论。LateBind、MTP、RERoT 与 TP5 的组合及 Turbo / 量化 KV reader 路线尚未接入；上文独立 Qwen3 TP5 不扩大 reader 资格 |
 
 A 的 oracle 未取得 partial rotary / GPTNeoX 资格；B 中的 partial rotary 数学对照不能扩大 A 的模型支持声明。本次 reader profile 只发布 **resident F32 K / F32 V**，C 显式配置 F32 并关闭 FA，A capability 拒绝 F16 或混合 KV 类型的 reader。普通 A 的 F16 解码支持不变。F16 reader 的 CPU 重排 / restore 对照最大误差 `0.11799526`、Vulkan 行重排误差 `0.0003576` 未过门，保留为 E23 的独立精度策略重写项。旧自动 planner、reasoning-end / tool 路由与模板启发式也保持独立候选。完整合同见 [RERoT B](rerot/README.md)、[RERoT C](rerot-compose/README.md)；最终命令、运行身份与资格以 [VALIDATION.md](VALIDATION.md) 为准。
 
@@ -224,7 +261,7 @@ python3 fork/tests/isolation.py \
   --output build-isolation --jobs 4 --model /absolute/path/to/model.gguf
 ```
 
-默认隔离流程从固定 A 提交导出源码，只应用验证通过的登记文件；A 构建时不含 B/C。七个 B 与六个 C 分别从各自源码副本构建，C 只找安装包。移除该流程创建的源码、构建副本和原安装前缀后，在搬迁后的安装包上重新编译消费者并运行程序；不会删除用户仓库。TQRerot 的独立消费者真实执行两 worker 的逐 token 发布，RERoT C 运行已安装程序的 help / CLI 检查。`--model` 另外启用既有真实 batch、streaming 和 logits 测试；独立消费者的 logits 对照限定为最终 greedy token / 最大 logit。
+默认隔离流程从固定 A 提交导出源码，只应用验证通过的登记文件；A 构建时不含 B/C。七个 B 与七个 C 分别从各自源码副本构建，C 只找安装包。移除该流程创建的源码、构建副本和原安装前缀后，在搬迁后的安装包上重新编译消费者并运行程序；不会删除用户仓库。TQRerot 的独立消费者真实执行两 worker 的逐 token 发布，RERoT C 运行已安装程序的 help / CLI 检查，TP5 C 的公共消费者与 help 不冒充五卡模型执行。`--model` 另外启用既有真实 batch、streaming 和 logits 测试；独立消费者的 logits 对照限定为最终 greedy token / 最大 logit。
 
 真实共享白板使用独立选项，避免让只适用于旧测试的模型隐式承担聊天模板与 source-end 合同：
 

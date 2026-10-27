@@ -2,6 +2,7 @@
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
 #include "ggml.h"
+#include "ggml-relay.h"
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-ext.h"
@@ -106,6 +107,118 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 
     const auto & hparams = model.hparams;
 
+    // Relay ownership is independent of the backend arithmetic policy. Keep
+    // the same model/layout admission for both native and decoded-F32 kernels.
+    if (params.quantized_matmul_f32 || params.tp5_relay) {
+        const bool dense_q8 = model.arch == LLM_ARCH_QWEN3 && model.ftype() == LLAMA_FTYPE_MOSTLY_Q8_0 &&
+            hparams.n_embd == 4096 && hparams.n_layer() == 36 && hparams.n_expert == 0 && hparams.n_expert_used == 0;
+        const bool swift = model.arch == LLM_ARCH_QWEN4EXP && model.ftype() == LLAMA_FTYPE_MOSTLY_Q2_0 &&
+            hparams.n_embd == 2560 && hparams.n_layer() == 48 && hparams.n_expert == 512 && hparams.n_expert_used == 10 &&
+            hparams.n_ff_exp == 640 && hparams.n_ff_shexp == 640 && hparams.ssm_d_conv == 4 &&
+            hparams.ssm_d_state == 128 && hparams.ssm_n_group == 16 && hparams.ssm_dt_rank == 48 &&
+            hparams.ssm_d_inner == 6144 && hparams.dsv4_hc_mult == 4 && hparams.hc_low_rank == 320 &&
+            hparams.ple_n_heads == 16 && hparams.ple_head_dim == 160 && hparams.ple_ngram_size == 3 &&
+            hparams.indexer_n_head == 4 && hparams.indexer_head_size == 128 && hparams.indexer_top_k == 2048;
+        if ((!dense_q8 && !swift) || hparams.vocab_only || hparams.no_alloc || hparams.n_layer_nextn != 0 ||
+            hparams.n_swa != 0 || !hparams.causal_attn || !model.loras.empty() || model.has_tensor_overrides()) {
+            throw std::runtime_error("quantized_matmul_f32 requires the Qwen3-8B Q8_0 or Swift Qwen4Exp mixed-Q2_0 profile without adapters or overrides");
+        }
+        for (uint32_t layer = 0; layer < hparams.n_layer(); ++layer) {
+            if (dense_q8 ?
+                (hparams.n_head(layer) != 32 || hparams.n_head_kv(layer) != 8 || hparams.n_ff(layer) != 12288 ||
+                 hparams.n_embd_head_k(layer) != 128 || hparams.n_embd_head_v(layer) != 128 ||
+                 hparams.is_recr(layer) || hparams.is_swa(layer)) :
+                (hparams.n_head(layer) != 24 || hparams.n_head_kv(layer) != 2 ||
+                 hparams.n_embd_head_k(layer) != 256 || hparams.n_embd_head_v(layer) != 256 ||
+                 hparams.is_recr(layer) != ((layer + 1) % 4 != 0) || hparams.is_ple(layer) != (layer == 1) ||
+                 hparams.is_swa(layer))) {
+                throw std::runtime_error("quantized_matmul_f32: unsupported layer geometry");
+            }
+        }
+        if (model.devices.size() != 1 || model.n_gpu_layers() <= hparams.n_layer_all) {
+            throw std::runtime_error("quantized_matmul_f32 requires full GPU layer/output offload on one execution device");
+        }
+        const auto device = model.devices.front().dev;
+        const bool meta = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_META;
+        if (swift && (!meta || model.split_mode() != LLAMA_SPLIT_MODE_TENSOR ||
+                      model.get_split_state_ud.n_devices != GGML_RELAY_RANKS)) {
+            throw std::runtime_error("Swift decoded-F32 requires five tensor-split HIP ranks, including the staged reference");
+        }
+        if (!params.tp5_relay && !meta) {
+            const auto reg = ggml_backend_dev_backend_reg(device);
+            if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU || reg == nullptr ||
+                std::strcmp(ggml_backend_reg_name(reg), "ROCm") != 0 ||
+                (model.split_mode() != LLAMA_SPLIT_MODE_NONE && model.split_mode() != LLAMA_SPLIT_MODE_LAYER)) {
+                throw std::runtime_error("quantized_matmul_f32 reference requires one HIP GPU without tensor/row split; CPU reference is unsupported");
+            }
+        }
+        if (model.dev_output() != device) {
+            throw std::runtime_error("quantized_matmul_f32 requires the output projection on the selected GPU device");
+        }
+        for (uint32_t layer = 0; layer < hparams.n_layer(); ++layer) {
+            if (model.dev_layer(layer) != device) {
+                throw std::runtime_error("quantized_matmul_f32 refuses mixed CPU/GPU layer offload");
+            }
+        }
+        for (const auto & entry : model.tensors_by_name) {
+            const auto * tensor = entry.second;
+            if (tensor != nullptr && ggml_is_quantized(tensor->type)) {
+                if (swift && entry.first == "per_layer_token_embd.weight") {
+                    if (tensor->type != GGML_TYPE_IQ4_NL || tensor->ne[0] != 160 ||
+                        tensor->ne[1] != 320001536 || tensor->buffer == nullptr ||
+                        !ggml_backend_buffer_is_host(tensor->buffer)) {
+                        throw std::runtime_error("Swift PLE requires its original CPU-resident IQ4_NL input table");
+                    }
+                    continue;
+                }
+                const bool supported_type = tensor->type == GGML_TYPE_Q8_0 || (swift &&
+                    (tensor->type == GGML_TYPE_Q2_0 || tensor->type == GGML_TYPE_Q3_K ||
+                     tensor->type == GGML_TYPE_Q4_K || tensor->type == GGML_TYPE_Q5_K || tensor->type == GGML_TYPE_Q6_K ||
+                     tensor->type == GGML_TYPE_IQ4_XS || tensor->type == GGML_TYPE_IQ4_NL ||
+                     tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q5_0));
+                if (!supported_type || tensor->buffer == nullptr ||
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer)) != device) {
+                    throw std::runtime_error("quantized_matmul_f32 requires supported original weight blocks on the selected GPU device");
+                }
+            }
+        }
+        if (params.batch_invariant_matmul || !params.op_offload || !params.offload_kqv ||
+            params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.ctx_other != nullptr ||
+            params.n_batch == 0 || params.n_batch > 4 || params.n_seq_max == 0 || params.n_seq_max > 4) {
+            throw std::runtime_error("quantized_matmul_f32 requires the default decoder, 1..4 sequences/rows, GPU operation/KQV offload and batch_invariant_matmul=false");
+        }
+    }
+
+    const bool tp5_native_q4_kv =
+        params.tp5_relay && model.arch == LLM_ARCH_QWEN4EXP &&
+        !params.quantized_matmul_f32 && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED &&
+        params.type_k == GGML_TYPE_Q4_0 && params.type_v == GGML_TYPE_Q4_0;
+
+    if (params.tp5_relay) {
+        if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || model.devices.size() != 1 ||
+            ggml_backend_dev_type(model.devices.front().dev) != GGML_BACKEND_DEVICE_TYPE_META ||
+            model.get_split_state_ud.n_devices != GGML_RELAY_RANKS || model.n_gpu_layers() <= hparams.n_layer_all) {
+            throw std::runtime_error("tp5-relay requires tensor split across five HIP devices and full GPU layer/output offload");
+        }
+        const auto input_device = model.tok_embd != nullptr && model.tok_embd->buffer != nullptr ?
+            ggml_backend_buft_get_device(ggml_backend_buffer_get_type(model.tok_embd->buffer)) : nullptr;
+        if (input_device == nullptr || ggml_backend_dev_type(input_device) != GGML_BACKEND_DEVICE_TYPE_META) {
+            throw std::runtime_error("tp5-relay requires offload_input=true when loading the model");
+        }
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.ctx_other != nullptr ||
+            params.n_seq_max == 0 || params.n_seq_max > 4 || params.n_batch == 0 || params.n_batch > 4 ||
+            params.n_ctx == 0 || params.n_ctx > (model.arch == LLM_ARCH_QWEN4EXP ? 1048576u : 2048u) ||
+            (params.n_ubatch != 0 && params.n_ubatch < params.n_batch) ||
+            (!tp5_native_q4_kv &&
+             ((params.type_k != GGML_TYPE_F16 && params.type_k != GGML_TYPE_F32) ||
+              (params.type_v != GGML_TYPE_F16 && params.type_v != GGML_TYPE_F32))) ||
+            !params.offload_kqv || !params.op_offload || params.embeddings || params.n_samplers != 0 ||
+            params.cb_eval != nullptr || params.kv_stream_arena_mib != 0 || params.n_rs_seq != 0 ||
+            params.attention_type == LLAMA_ATTENTION_TYPE_NON_CAUSAL || params.batch_invariant_matmul) {
+            throw std::runtime_error("tp5-relay requires 1..4 sequences/rows, bounded profile KV capacity, one ubatch, F16/F32 KV or native Swift FA Q4_0 KV, no sampler, callback or alternate compute policy");
+        }
+    }
+
     cparams.n_seq_max     = std::max(1u, params.n_seq_max);
     cparams.n_outputs_max = params.n_outputs_max;
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -125,6 +238,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     }
     cparams.gdn_replay = params.gdn_replay;
     cparams.batch_invariant_matmul = params.batch_invariant_matmul;
+    cparams.quantized_matmul_f32 = params.quantized_matmul_f32;
 
     cparams.n_threads            = params.n_threads;
     cparams.n_threads_batch      = params.n_threads_batch;
@@ -391,17 +505,30 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     if (!hparams.vocab_only) {
         // GPU backends
         for (const auto & dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+            const char * backend_params = params.tp5_relay ?
+                (params.quantized_matmul_f32 ? "tp5-relay" : "tp5-relay-native") :
+                (params.quantized_matmul_f32 ? "quantized-f32" : nullptr);
+            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, backend_params);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
             backends.emplace_back(backend);
+            if (params.quantized_matmul_f32) {
+                backend_quantized_matmul_f32 = backend;
+            }
+            if (params.tp5_relay) {
+                ggml_relay_status status = {};
+                if (!ggml_backend_relay_snapshot(backend, &status) || status.failed || status.ranks != GGML_RELAY_RANKS) {
+                    throw std::runtime_error("tp5-relay capability is unavailable on the initialized Meta backend");
+                }
+                backend_tp5_relay = backend;
+            }
         }
 
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            if (!params.quantized_matmul_f32 && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
                 ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
                 if (backend == nullptr) {
                     throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
@@ -725,6 +852,14 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                            __func__, kv_stream_arena_bytes / 1024.0 / 1024.0, kv_stream_stage_bytes / 1024.0 / 1024.0);
         }
 
+        // Amortize relay graph capture over more decode steps without changing
+        // physical KV capacity or the causal mask. Other contexts keep pad 1.
+        const uint32_t attn_n_pad =
+            params.tp5_relay && !cparams.quantized_matmul_f32 &&
+            model.arch == LLM_ARCH_QWEN4EXP && cparams.flash_attn && cparams.causal_attn &&
+            ((params.type_k == GGML_TYPE_F16 && params.type_v == GGML_TYPE_F16) || tp5_native_q4_kv) &&
+            cparams.n_ctx_kv >= 1024 && cparams.n_ctx_kv % 1024 == 0 ? 1024 : 1;
+
         llama_memory_params params_mem = {
             /*.type_k                =*/params.type_k,
             /*.type_v                =*/params.type_v,
@@ -734,6 +869,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             /*.swa_full              =*/params.swa_full,
             /*.ctx_type              =*/cparams.ctx_type,
             /*.mem_other             =*/llama_get_memory(cparams.ctx_other),
+            /*.canonical_v           =*/params.tp5_relay,
+            /*.attn_n_pad            =*/attn_n_pad,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -1827,6 +1964,12 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
+        if (backend_tp5_relay != nullptr) {
+            // This update can discard retained input storage before process_ubatch.
+            // NO_UPDATE returns above without adding a fence to the hot path.
+            ggml_backend_sched_synchronize(sched.get());
+        }
+
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
@@ -2361,6 +2504,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
                                                  ggml_status &            ret) {
+    if (backend_tp5_relay != nullptr) {
+        // A retained input batch owns this context's host graph buffers until
+        // completion. Drain before memory updates, graph reset, or set_inputs.
+        // Do not account the current, not-yet-submitted token as synchronized.
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2447,6 +2597,37 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         }
     }
 
+    // Validate the actual scheduler placement before submitting any compute.
+    // The reference may use CPU shape/index operations, never CPU quantized
+    // projections: CPU's native activation policy is not this F32 policy.
+    if (backend_quantized_matmul_f32 != nullptr) {
+        if (backend_tp5_relay != nullptr && ggml_backend_sched_get_n_splits(sched.get()) != 1) {
+            LLAMA_LOG_ERROR("%s: tp5-relay requires a single native Meta graph, not host-routed splits\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        for (int node = 0; node < ggml_graph_n_nodes(gf); ++node) {
+            ggml_tensor * tensor = ggml_graph_node(gf, node);
+            if ((tensor->op == GGML_OP_MUL_MAT || tensor->op == GGML_OP_MUL_MAT_ID) &&
+                tensor->src[0] != nullptr && ggml_is_quantized(tensor->src[0]->type) &&
+                ((tensor->op == GGML_OP_MUL_MAT_ID && tensor->src[0]->type != GGML_TYPE_Q2_0) ||
+                 tensor->src[1] == nullptr || tensor->src[1]->type != GGML_TYPE_F32 ||
+                 ggml_backend_sched_get_tensor_backend(sched.get(), tensor) != backend_quantized_matmul_f32)) {
+                LLAMA_LOG_ERROR("%s: quantized_matmul_f32 refuses unsupported or non-GPU quantized projection %s\n", __func__, tensor->name);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            if (backend_tp5_relay != nullptr &&
+                (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 && tensor->op != GGML_OP_NONE &&
+                tensor->op != GGML_OP_VIEW && tensor->op != GGML_OP_RESHAPE &&
+                tensor->op != GGML_OP_PERMUTE && tensor->op != GGML_OP_TRANSPOSE &&
+                ggml_backend_sched_get_tensor_backend(sched.get(), tensor) != backend_tp5_relay) {
+                LLAMA_LOG_ERROR("%s: tp5-relay refuses non-Meta compute node %s\n", __func__, tensor->name);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+    }
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -2470,6 +2651,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    if (backend_tp5_relay != nullptr) {
+        LLAMA_LOG_ERROR("%s: tp5-relay supports decoder-only calls\n", __func__);
+        return -1;
+    }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2799,6 +2984,23 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (backend_tp5_relay != nullptr &&
+        (batch_inp.n_tokens <= 0 || uint32_t(batch_inp.n_tokens) > cparams.n_ubatch ||
+         batch_inp.token == nullptr || batch_inp.embd != nullptr || !loras->empty() ||
+         cparams.embeddings || !cparams.causal_attn || !sampling.samplers.empty())) {
+        LLAMA_LOG_ERROR("%s: tp5-relay requires an adapter-free token batch fitting one ubatch\n", __func__);
+        return -1;
+    }
+    if (backend_tp5_relay != nullptr) {
+        for (int32_t token = 0; token < batch_inp.n_tokens; ++token) {
+            const int32_t count = batch_inp.n_seq_id != nullptr ? batch_inp.n_seq_id[token] : 1;
+            const llama_seq_id seq = batch_inp.seq_id != nullptr && count == 1 ? batch_inp.seq_id[token][0] : 0;
+            if (count != 1 || seq < 0 || uint32_t(seq) >= cparams.n_seq_max) {
+                LLAMA_LOG_ERROR("%s: tp5-relay requires independent sequence IDs within the context range\n", __func__);
+                return -1;
+            }
+        }
+    }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2959,6 +3161,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         break;
+    }
+
+    if (backend_tp5_relay != nullptr && mctx->get_ubatch().n_tokens != uint32_t(n_tokens_all)) {
+        LLAMA_LOG_ERROR("%s: tp5-relay refuses a decode partitioned into multiple ubatches\n", __func__);
+        return -1;
     }
 
     // reserve output buffer
@@ -3545,6 +3752,10 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t                       n_toke
                         __func__, n_tokens, n_seqs, n_outputs);
     }
 
+    if (backend_tp5_relay != nullptr) {
+        // graph_reserve can discard host input storage from a prior submission.
+        ggml_backend_sched_synchronize(sched.get());
+    }
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
@@ -3635,7 +3846,14 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    // Maintenance graphs can reuse the reserve arena between submissions.
+    // Only the inference result owns inputs through the fences below.
+    const bool retain_inputs = backend_tp5_relay != nullptr && gf_res_prev &&
+            gf == gf_res_prev->get_gf() && !batched &&
+            cparams.n_batch == 1 && cparams.n_ubatch == 1;
+    auto status = retain_inputs ?
+            ggml_backend_sched_graph_compute_async_retained_inputs(sched.get(), gf) :
+            ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -4612,6 +4830,10 @@ void llama_context::opt_epoch(ggml_opt_dataset_t      dataset,
                               int64_t                 idata_split,
                               ggml_opt_epoch_callback callback_train,
                               ggml_opt_epoch_callback callback_eval) {
+    if (backend_tp5_relay != nullptr) {
+        // The optimizer clears memory and rebuilds inputs outside process_ubatch.
+        ggml_backend_sched_synchronize(sched.get());
+    }
     const uint32_t n_ctx    = this->n_ctx();
     const uint32_t n_batch  = std::min(cparams.n_batch, n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
@@ -4704,6 +4926,8 @@ llama_context_params llama_context_default_params() {
         /*.n_ctx_kv                    =*/0,
         /*.n_rs_slots                  =*/0,
         /*.batch_invariant_matmul      =*/false,
+        /*.quantized_matmul_f32         =*/false,
+        /*.tp5_relay                   =*/false,
     };
 
     return result;
@@ -4730,7 +4954,7 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR && !params.tp5_relay) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -4831,6 +5055,17 @@ llama_context * llama_new_context_with_model(llama_model * model, llama_context_
 }
 
 void llama_free(llama_context * ctx) {
+    if (ctx != nullptr && ctx->get_tp5_relay_backend() != nullptr) {
+        ggml_relay_status status = {};
+        ggml_backend_t backend = ctx->get_tp5_relay_backend();
+        if (!ggml_backend_relay_snapshot(backend, &status) || (status.epoch != 0 && !status.finished)) {
+            ggml_backend_relay_abort(backend, GGML_STATUS_ABORTED);
+            // Scheduler buffers and memory are also native readers' owners.
+            // Do not enter an unbounded synchronize or release them on failure.
+            LLAMA_LOG_ERROR("%s: retaining tp5-relay context: native completion is unproved\n", __func__);
+            return;
+        }
+    }
     delete ctx;
 }
 
@@ -5102,10 +5337,18 @@ struct ggml_cgraph * llama_graph_reserve(struct llama_context * ctx,
 
 // llama adapter API
 
+ggml_backend_t llama_tp5_relay_backend(llama_context * ctx) {
+    return ctx != nullptr ? ctx->get_tp5_relay_backend() : nullptr;
+}
+
 int32_t llama_set_adapters_lora(llama_context *       ctx,
                                 llama_adapter_lora ** adapters,
                                 size_t                n_adapters,
                                 float *               scales) {
+    if (ctx->get_quantized_matmul_f32_backend() != nullptr && n_adapters != 0) {
+        LLAMA_LOG_ERROR("%s: quantized_matmul_f32 does not support adapters\n", __func__);
+        return -1;
+    }
     if (adapters == nullptr || scales == nullptr) {
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
@@ -5121,6 +5364,10 @@ int32_t llama_set_adapter_cvec(llama_context * ctx,
                                int32_t         n_embd,
                                int32_t         il_start,
                                int32_t         il_end) {
+    if (ctx->get_quantized_matmul_f32_backend() != nullptr && data != nullptr) {
+        LLAMA_LOG_ERROR("%s: quantized_matmul_f32 does not support control vectors\n", __func__);
+        return -1;
+    }
     bool res = ctx->set_adapter_cvec(data, len, n_embd, il_start, il_end);
 
     return res ? 0 : -1;

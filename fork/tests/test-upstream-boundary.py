@@ -70,6 +70,35 @@ class BoundaryTests(unittest.TestCase):
         self.git("add", "include/public-seam.h")
         self.verify()
 
+    def committed_upgrade(self, corrupt_previous=False):
+        self.overlay()
+        if corrupt_previous:
+            self.entries[0]["sha256"] = "0" * 64
+            self.manifest()
+        self.git("add", "a.cpp", "fork/upstream.json", "fork/upstream-exceptions.json")
+        self.git("commit", "-qm", "previous seam")
+        updated = b"new reviewed seam\n"
+        (self.root / "a.cpp").write_bytes(updated)
+        self.entries[0]["sha256"] = hashlib.sha256(updated).hexdigest()
+        self.manifest()
+
+    def test_unstaged_upgrade_of_committed_reviewed_seam(self):
+        self.committed_upgrade()
+        self.assertEqual(self.verify()["overlays"][0]["data"], b"new reviewed seam\n")
+
+    def test_upgrade_does_not_trust_unreviewed_committed_bytes(self):
+        self.committed_upgrade(corrupt_previous=True)
+        with self.assertRaisesRegex(RuntimeError, "index has unreviewed"):
+            self.verify()
+
+    def test_upgrade_does_not_trust_extra_staged_residue(self):
+        self.committed_upgrade()
+        (self.root / "a.cpp").write_bytes(b"unreviewed staged residue\n")
+        self.git("add", "a.cpp")
+        (self.root / "a.cpp").write_bytes(b"new reviewed seam\n")
+        with self.assertRaisesRegex(RuntimeError, "index has unreviewed"):
+            self.verify()
+
     def test_undeclared(self):
         (self.root / "a.cpp").write_bytes(b"unreviewed\n")
         with self.assertRaisesRegex(RuntimeError, "undeclared"):

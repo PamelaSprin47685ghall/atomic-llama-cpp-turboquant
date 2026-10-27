@@ -1,0 +1,903 @@
+#include <ggml-backend.h>
+#include <ggml-relay.h>
+#include <gguf.h>
+#include <llama.h>
+#include <tq/relay/ledger.h>
+#include <tq/sampling/shortlist.h>
+#include <tq/scheduling/admission.h>
+#include <tq/text/stream.h>
+#include <tq/tp5/runtime.h>
+
+#include "ordered-fold.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <thread>
+#include <utility>
+
+namespace tq::tp5 {
+namespace {
+using clock_type = std::chrono::steady_clock;
+
+std::uint64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(clock_type::now().time_since_epoch()).count();
+}
+
+void pause_cpu() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
+[[noreturn]] void retain_and_exit(const char * why) {
+    std::fprintf(stderr, "TP5_RETAINED_IN_FLIGHT: %s; native owners are not released\n", why);
+    std::fflush(stderr);
+    std::_Exit(125);
+}
+
+void require(bool ok, const char * why) {
+    if (!ok) {
+        throw std::runtime_error(why);
+    }
+}
+
+bool is_swift_model(const std::string & path) {
+    // Inspect public GGUF metadata before choosing device placement. File names
+    // and a failed single-GPU allocation cannot select the model's contract.
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(
+        gguf_init_from_file(path.c_str(), {true, nullptr}), gguf_free);
+    require(metadata != nullptr, "cannot read model metadata");
+    const auto key = gguf_find_key(metadata.get(), "general.architecture");
+    require(key >= 0 && gguf_get_kv_type(metadata.get(), key) == GGUF_TYPE_STRING,
+            "model has no valid architecture metadata");
+    return std::string(gguf_get_val_str(metadata.get(), key)) == "qwen4exp";
+}
+
+void check_ledger(relay::ledger_result value) {
+    if (value != relay::ledger_result::ok) {
+        throw std::runtime_error(std::string("relay ownership violation: ") + relay::to_string(value));
+    }
+}
+
+options validate(const options & value) {
+    options out = value;
+    require(!out.model.empty(), "model path is empty");
+    require(out.execution == mode::relay || out.execution == mode::reference, "unknown execution mode");
+    require(out.wire == wire_type::f32 || out.wire == wire_type::f16, "unknown relay wire format");
+    require(out.execution == mode::relay || out.wire == wire_type::f32,
+            "F16 relay wire requires relay mode");
+    require(!out.prompts.empty() && out.prompts.size() <= 4, "one through four requests are required");
+    require(out.windows >= 1 && out.windows <= 2 && out.windows <= out.prompts.size(), "invalid window count");
+    if (!out.hc_owner_offsets.empty()) {
+        require(out.execution == mode::relay && out.hc_owner_offsets.size() == out.windows &&
+                    out.prompts.size() == out.windows,
+                "HC owner offsets require relay mode, one offset and one request per window");
+        for (const auto offset : out.hc_owner_offsets) {
+            require(offset < 5, "HC owner offset must be in [0,4]");
+        }
+    }
+    require(out.predict && out.predict <= 4096, "predict must be in [1,4096]");
+    require(out.context_per_request >= 32 && out.context_per_request <= 262144, "context must be in [32,262144]");
+    require(out.threads && out.threads <= GGML_MAX_N_THREADS, "invalid CPU thread count");
+    require(out.deadline_seconds && out.deadline_seconds <= 3600, "invalid execution deadline");
+    require(out.delay_window < out.windows && out.delay_publish_ms <= 10000, "invalid controlled publish delay");
+    require(out.cancel_request >= -1 && out.cancel_request < static_cast<std::int32_t>(out.prompts.size()),
+            "invalid cancellation request");
+    require(out.cancel_after > 0 && out.cancel_after <= out.predict, "invalid cancellation position");
+    require(out.abort_window >= -1 && out.abort_window < static_cast<std::int32_t>(out.windows),
+            "invalid abort window");
+    require(out.abort_epoch > 0 && (out.abort_window >= 0 || out.abort_epoch == 1), "invalid abort epoch");
+    if (!out.teacher_tokens.empty()) {
+        require(out.teacher_tokens.size() == out.prompts.size(), "teacher request count differs");
+        for (const auto & row : out.teacher_tokens) {
+            require(row.size() == out.predict, "teacher trajectory must provide predict tokens per request");
+        }
+    }
+    for (const auto & prompt : out.prompts) {
+        require(!prompt.empty() && prompt.size() <= 1024 * 1024, "prompt size must be in [1,1048576]");
+    }
+    return out;
+}
+
+void configure_hc_owner_layout(const options & opts) {
+    // Set the physical layout before backend initialization or any model load.
+    // An environment-only request is rejected instead of silently mirroring
+    // weights without a matching private execution plan.
+    const char * hc_layout = std::getenv("GGML_TP5_HC_CONTEXT_OWNER");
+    if (opts.hc_owner_offsets.empty()) {
+        require(hc_layout == nullptr || std::string(hc_layout) == "0",
+                "GGML_TP5_HC_CONTEXT_OWNER requires explicit --hc-owner-offsets (or unset/0)");
+    } else {
+        require(hc_layout == nullptr || std::string(hc_layout) == "1",
+                "--hc-owner-offsets conflicts with GGML_TP5_HC_CONTEXT_OWNER; unset it or use 1");
+        require(::setenv("GGML_TP5_HC_CONTEXT_OWNER", "1", 1) == 0,
+                "cannot enable the HC context-owner weight layout before model loading");
+    }
+}
+
+struct backend_owner {
+    backend_owner() {
+        ggml_backend_load_all();
+        llama_backend_init();
+    }
+
+    ~backend_owner() { llama_backend_free(); }
+};
+
+struct model_deleter {
+    void operator()(llama_model * p) const { llama_model_free(p); }
+};
+
+struct context_deleter {
+    void operator()(llama_context * p) const { llama_free(p); }
+};
+
+using model_ptr   = std::unique_ptr<llama_model, model_deleter>;
+using context_ptr = std::unique_ptr<llama_context, context_deleter>;
+
+struct failure_state {
+    std::atomic<bool>  stopped{ false };
+    std::mutex         mutex;
+    std::exception_ptr first;
+
+    void fail(std::exception_ptr error) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!first) {
+            first = std::move(error);
+        }
+        stopped.store(true, std::memory_order_release);
+    }
+};
+
+struct channel_state {
+    relay::channel_ledger       ledger;
+    std::optional<relay::lease> held;
+    std::uint64_t               epoch = 0;
+    std::uint64_t               elements = 0;
+    std::uint64_t               wire_bytes = 0;
+    std::uint32_t               computed_mask = 0;
+
+    channel_state(std::uint64_t run, std::uint64_t plan, std::uint64_t channel) : ledger(run, plan, channel, 5, 1) {}
+};
+
+struct service_window {
+    ggml_backend_t                                                                    backend = nullptr;
+    std::map<std::pair<std::uint64_t, std::uint32_t>, std::unique_ptr<channel_state>> channels;
+    std::atomic<std::uint64_t>                                                        input_retired{ 0 };
+    std::atomic<std::uint64_t>                                                        output_retired{ 0 };
+    bool                                                                              delayed = false;
+    std::optional<ggml_relay_event_v2>                                                   delayed_event;
+    clock_type::time_point                                                            delay_until{};
+    // Only the service thread writes these; copy them after stop()/join().
+    std::array<std::uint64_t, 5> rank_input_packed_payload_bytes{};
+    std::array<std::uint64_t, 5> rank_output_consumed_payload_bytes{};
+    std::uint64_t cpu_input_payload_bytes = 0;
+    std::uint64_t cpu_output_payload_bytes = 0;
+};
+
+// This C object owns the A/B collaboration. Neither A nor the ledger calls a
+// sibling service. The reducer receives provider facts and sends ledger facts.
+class relay_service {
+  public:
+    relay_service(const options &                     opts,
+                  const std::vector<ggml_backend_t> & backends,
+                  failure_state &                     failure,
+                  std::uint64_t                       run) :
+        options_(opts),
+        failure_(failure),
+        run_(run) {
+        for (auto backend : backends) {
+            auto item     = std::make_unique<service_window>();
+            item->backend = backend;
+            windows_.push_back(std::move(item));
+        }
+        thread_ = std::thread([this] { loop(); });
+        while (!ready_.load(std::memory_order_acquire)) {
+            pause_cpu();
+        }
+    }
+
+    ~relay_service() { stop(); }
+
+    void abort_all() noexcept {
+        for (const auto & item : windows_) {
+            ggml_backend_relay_abort(item->backend, 1);
+        }
+    }
+
+    void stop() noexcept {
+        stop_.store(true, std::memory_order_release);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    bool retired(std::size_t index, const ggml_relay_status & state) const {
+        return windows_[index]->output_retired.load(std::memory_order_acquire) == state.cpu_reductions;
+    }
+
+    std::uint64_t inputs(std::size_t index) const { return windows_[index]->input_retired.load(); }
+
+    std::uint64_t outputs(std::size_t index) const { return windows_[index]->output_retired.load(); }
+
+    void finish_ledgers(bool failed) {
+        stop();
+        for (const auto & window : windows_) {
+            if (window->delayed_event) {
+                require(failed, "normal close has an unpublished delayed input");
+                ggml_backend_relay_publish_v2(window->backend, &*window->delayed_event, sizeof(*window->delayed_event));
+                window->delayed_event.reset();
+            }
+            for (auto & entry : window->channels) {
+                auto & owner = *entry.second;
+                if (failed) {
+                    owner.ledger.fail("run aborted after native drain");
+                } else {
+                    require(!owner.held.has_value(), "normal close still has a live output reader");
+                }
+                require(owner.ledger.mark_drained(true), "cannot record proved native drain");
+            }
+        }
+    }
+    void copy_wire_metrics(std::size_t index, window_result & result) const {
+        require(!thread_.joinable(), "wire metrics require the stopped CPU service");
+        const auto & window = *windows_[index];
+        result.rank_input_packed_payload_bytes = window.rank_input_packed_payload_bytes;
+        result.rank_output_consumed_payload_bytes = window.rank_output_consumed_payload_bytes;
+        result.cpu_input_payload_bytes = window.cpu_input_payload_bytes;
+        result.cpu_output_payload_bytes = window.cpu_output_payload_bytes;
+    }
+
+  private:
+    static void add_payload(std::uint64_t & total, std::uint64_t bytes) {
+        require(bytes <= UINT64_MAX - total, "wire payload byte counter overflow");
+        total += bytes;
+    }
+
+    void progress(std::size_t index) {
+        auto &           window = *windows_[index];
+        ggml_relay_event_v2 event{};
+        int              polled = 0;
+        if (window.delayed_event) {
+            if (clock_type::now() < window.delay_until && !failure_.stopped.load()) {
+                return;
+            }
+            event = *window.delayed_event;
+            window.delayed_event.reset();
+            polled = 1;
+        } else {
+            polled = ggml_backend_relay_poll_v2(window.backend, &event, sizeof(event));
+        }
+        if (polled < 0) {
+            if (!failure_.stopped.load()) {
+                throw std::runtime_error("native relay progress failed");
+            }
+            return;
+        }
+        if (!polled) {
+            return;
+        }
+        if (event.kind == GGML_RELAY_INPUT_READY && !window.delayed && options_.delay_publish_ms &&
+            index == options_.delay_window) {
+            // Retain this explicit provider borrow while servicing other windows.
+            window.delayed       = true;
+            window.delayed_event = event;
+            window.delay_until   = clock_type::now() + std::chrono::milliseconds(options_.delay_publish_ms);
+            return;
+        }
+        const bool borrowed = event.kind == GGML_RELAY_INPUT_READY;
+        bool       returned = false;
+        try {
+            require(
+                event.abi_version == GGML_RELAY_EVENT_V2_ABI_VERSION && event.ranks == 5 &&
+                    event.epoch && event.plan_generation,
+                "relay event v2 ABI or identity differs");
+            const auto expected_wire = options_.wire == wire_type::f16 ? GGML_RELAY_WIRE_F16 : GGML_RELAY_WIRE_F32;
+            const std::uint64_t width = options_.wire == wire_type::f16 ? 2 : 4;
+            require(event.wire_type == expected_wire && (event.computed_mask & ~std::uint32_t(31)) == 0,
+                    "relay wire format or computed mask differs");
+            require(event.elements > 0 && event.elements <= SIZE_MAX / width &&
+                        event.elements <= UINT64_MAX / width && event.wire_bytes == event.elements * width,
+                    "relay wire payload extent is invalid");
+            auto key = std::make_pair(event.plan_generation, event.channel);
+            if (event.kind == GGML_RELAY_INPUT_READY) {
+                auto & owner = window.channels[key];
+                if (!owner) {
+                    owner = std::make_unique<channel_state>(run_, event.plan_generation, event.channel);
+                }
+                require(!owner->held && event.epoch > owner->epoch, "relay input epoch is stale or has live readers");
+                auto reservation = owner->ledger.reserve(index, event.epoch, event.channel, event.plan_generation);
+                require(reservation.code == relay::reserve_code::accepted && reservation.granted.has_value(),
+                        "relay bank is not reusable");
+                owner->held          = reservation.granted;
+                owner->epoch         = event.epoch;
+                owner->elements      = event.elements;
+                owner->wire_bytes    = event.wire_bytes;
+                owner->computed_mask = event.computed_mask;
+                require(event.output != nullptr, "relay output is absent");
+                for (std::uint32_t rank = 0; rank < 5; ++rank) {
+                    require(event.inputs[rank] != nullptr, "relay input is absent");
+                    check_ledger(owner->ledger.producer_ready(*owner->held, rank));
+                }
+                if (options_.abort_window == static_cast<std::int32_t>(index) &&
+                    event.channel == options_.abort_channel && event.epoch == options_.abort_epoch) {
+                    throw std::runtime_error("TP5_INJECTED_ABORT window=" + std::to_string(index) +
+                                             " channel=" + std::to_string(event.channel) +
+                                             " epoch=" + std::to_string(event.epoch));
+                }
+                require(!failure_.stopped.load(), "relay stopped before reduction");
+                detail::fold_result reduced;
+                if (event.wire_type == GGML_RELAY_WIRE_F16) {
+                    const std::uint16_t * inputs[5];
+                    for (std::size_t rank = 0; rank < 5; ++rank) {
+                        inputs[rank] = static_cast<const std::uint16_t *>(event.inputs[rank]);
+                    }
+                    reduced = detail::ordered_fold_f16(inputs, static_cast<std::uint16_t *>(event.output),
+                                                       std::size_t(event.elements), event.computed_mask);
+                } else {
+                    const float * inputs[5];
+                    for (std::size_t rank = 0; rank < 5; ++rank) {
+                        inputs[rank] = static_cast<const float *>(event.inputs[rank]);
+                    }
+                    reduced = detail::ordered_fold_f32_masked(inputs, static_cast<float *>(event.output),
+                                                              std::size_t(event.elements), event.computed_mask);
+                }
+                require(reduced != detail::fold_result::nonfinite_input, "nonfinite rank partial");
+                require(reduced != detail::fold_result::nonfinite_sum, "nonfinite CPU reduction");
+                require(reduced != detail::fold_result::nonfinite_pack, "CPU reduction overflows F16 wire");
+                require(reduced == detail::fold_result::ok, "invalid relay computed mask");
+                for (std::size_t rank = 0; rank < 5; ++rank) {
+                    if (event.computed_mask & (1u << rank)) {
+                        add_payload(window.rank_input_packed_payload_bytes[rank], event.wire_bytes);
+                        add_payload(window.cpu_input_payload_bytes, event.wire_bytes);
+                    }
+                }
+                add_payload(window.cpu_output_payload_bytes, event.wire_bytes);
+                check_ledger(owner->ledger.reduce_done(*owner->held));
+                window.input_retired.fetch_add(1, std::memory_order_release);
+                const bool published = ggml_backend_relay_publish_v2(window.backend, &event, sizeof(event));
+                returned             = true;
+                require(published, "relay publication was rejected");
+                check_ledger(owner->ledger.output_published(*owner->held));
+            } else if (event.kind == GGML_RELAY_OUTPUT_RELEASED) {
+                auto found = window.channels.find(key);
+                require(found != window.channels.end() && found->second->held.has_value(),
+                        "output has no matching CPU lease");
+                auto & owner = *found->second;
+                require(owner.epoch == event.epoch && owner.elements == event.elements &&
+                            owner.wire_bytes == event.wire_bytes && owner.computed_mask == event.computed_mask,
+                        "output retirement has the wrong epoch or wire payload");
+                for (std::uint32_t rank = 0; rank < 5; ++rank) {
+                    check_ledger(owner.ledger.consumer_done(*owner.held, rank));
+                    add_payload(window.rank_output_consumed_payload_bytes[rank], event.wire_bytes);
+                }
+                owner.held.reset();
+                window.output_retired.fetch_add(1, std::memory_order_release);
+            } else {
+                throw std::runtime_error("unknown relay event kind");
+            }
+        } catch (...) {
+            failure_.fail(std::current_exception());
+            abort_all();
+            // Return the borrowed view after all CPU reads/writes have ceased.
+            // A failed publish only releases this borrow; it cannot publish data.
+            if (borrowed && !returned) {
+                ggml_backend_relay_publish_v2(window.backend, &event, sizeof(event));
+            }
+            throw;
+        }
+    }
+
+    void loop() noexcept {
+        ready_.store(true, std::memory_order_release);
+        while (!stop_.load(std::memory_order_acquire)) {
+            for (std::size_t i = 0; i < windows_.size(); ++i) {
+                try {
+                    progress(i);
+                } catch (...) {
+                    failure_.fail(std::current_exception());
+                    abort_all();
+                }
+            }
+            pause_cpu();
+        }
+    }
+
+    const options &                              options_;
+    failure_state &                              failure_;
+    std::uint64_t                                run_;
+    std::vector<std::unique_ptr<service_window>> windows_;
+    std::atomic<bool>                            ready_{ false }, stop_{ false };
+    std::thread                                  thread_;
+};
+
+struct row_batch {
+    llama_batch batch{};
+
+    explicit row_batch(std::uint32_t capacity) { batch = llama_batch_init(capacity, 0, 1); }
+
+    ~row_batch() { llama_batch_free(batch); }
+
+    row_batch(const row_batch &)             = delete;
+    row_batch & operator=(const row_batch &) = delete;
+
+    void clear() { batch.n_tokens = 0; }
+
+    void push(llama_token token, std::uint64_t position, llama_seq_id seq, bool output) {
+        auto i             = batch.n_tokens++;
+        batch.token[i]     = token;
+        batch.pos[i]       = static_cast<llama_pos>(position);
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = seq;
+        batch.logits[i]    = output;
+    }
+};
+
+std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string & prompt) {
+    auto needed =
+        llama_tokenize(vocab, prompt.data(), static_cast<std::int32_t>(prompt.size()), nullptr, 0, true, false);
+    require(needed != INT32_MIN, "tokenizer token count overflow");
+    if (needed < 0) {
+        needed = -needed;
+    }
+    require(needed > 0, "prompt has no tokens");
+    std::vector<llama_token> out(needed);
+    const auto               count =
+        llama_tokenize(vocab, prompt.data(), static_cast<std::int32_t>(prompt.size()), out.data(), needed, true, false);
+    require(count == needed, "tokenizer size changed");
+    return out;
+}
+
+std::string piece(const llama_vocab * vocab, llama_token token) {
+    std::string result(256, '\0');
+    auto size = llama_token_to_piece(vocab, token, result.data(), static_cast<std::int32_t>(result.size()), 0, false);
+    if (size < 0) {
+        require(size != INT32_MIN, "token piece size overflow");
+        result.resize(-size);
+        size = llama_token_to_piece(vocab, token, result.data(), static_cast<std::int32_t>(result.size()), 0, false);
+    }
+    require(size >= 0 && static_cast<std::size_t>(size) <= result.size(), "cannot detokenize accepted token");
+    result.resize(size);
+    return result;
+}
+
+}  // namespace
+
+run_result run(const options & requested) {
+    const options                   opts = validate(requested);
+    configure_hc_owner_layout(opts);
+    const bool                      swift = is_swift_model(opts.model);
+    require(swift || opts.hc_owner_offsets.empty(), "HC context-owner offsets require the Swift HC97 model");
+    require(swift || opts.execution != mode::relay || opts.context_per_request <= 512,
+            "the Qwen3-8B profile supports at most 512 input/generation tokens per request");
+    require(!swift || opts.context_per_request == 262144,
+            "the Swift profile requires --ctx-size 262144; context shrinking is not supported");
+    backend_owner                   backends;
+    std::vector<ggml_backend_dev_t> devices;
+    for (std::size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        const auto   registry = ggml_backend_dev_backend_reg(dev);
+        const char * name     = ggml_backend_reg_name(registry);
+        if (std::string(name) == "ROCm") {
+            devices.push_back(dev);
+        }
+    }
+    if (opts.execution == mode::relay || swift) {
+        require(devices.size() == 5, "TP5 requires exactly five HIP GPU devices");
+    } else {
+        require(!devices.empty(), "the decoded-F32 reference requires a HIP GPU");
+        if (devices.size() > 1) {
+            devices.resize(1);
+        }
+    }
+    devices.push_back(nullptr);
+    auto model_params          = llama_model_default_params();
+    model_params.devices       = devices.data();
+    model_params.n_gpu_layers  = 99;
+    model_params.split_mode    = opts.execution == mode::relay || swift ? LLAMA_SPLIT_MODE_TENSOR : LLAMA_SPLIT_MODE_NONE;
+    model_params.offload_input = true;
+    model_ptr model(llama_model_load_from_file(opts.model.c_str(), model_params));
+    require(model != nullptr, "model load failed");
+    const auto vocab   = llama_model_get_vocab(model.get());
+    const auto n_vocab = llama_vocab_n_tokens(vocab);
+    require(n_vocab > 0, "invalid model vocabulary");
+    if (opts.capture_logits) {
+        const auto bytes = std::uint64_t(opts.prompts.size()) * opts.predict * std::uint64_t(n_vocab) * sizeof(float);
+        require(bytes <= 1024ULL * 1024 * 1024, "requested full logits exceed the 1 GiB bound");
+    }
+    run_result result;
+    result.execution_mode = opts.execution == mode::relay ? "tp5-relay" :
+                            swift ? "cpu-staged-five-gpu-reference" : "single-gpu-reference";
+    // The opt-in loader converts HC weights once while preserving the source GGUF.
+    // A successful load with this flag requires the complete 194-tensor profile.
+    const char * hc_q8_weights = std::getenv("GGML_TP5_HC_Q8_WEIGHTS");
+    const bool load_hc_q8 = hc_q8_weights && std::string(hc_q8_weights) == "1";
+    const char * hc_q4_weights = std::getenv("GGML_TP5_HC_Q4_WEIGHTS");
+    const bool load_hc_q4 = hc_q4_weights && std::string(hc_q4_weights) == "1";
+    require(!(load_hc_q8 && load_hc_q4), "HC Q8 and Q4 weight modes are mutually exclusive");
+    result.numeric_policy = opts.execution == mode::relay ?
+                            (load_hc_q4 ? "original-gguf-load-time-hc-q4_0-weights-native-backend-activations-ordered-f32" :
+                             load_hc_q8 ? "original-gguf-load-time-hc-q8_0-weights-native-backend-activations-ordered-f32" :
+                                          "original-weights-native-backend-activations-ordered-f32") :
+                            swift ? "mixed-original-weights-f32-activations-ordered-f32" :
+                                    "q8_0-decoded-weights-f32-activations-ordered-f32";
+    result.wire_format = opts.execution == mode::relay ? (opts.wire == wire_type::f16 ? "f16" : "f32") : "none";
+    result.hc_weight_layout = opts.hc_owner_offsets.empty() ? "loader-default" : "mirrored-hc97";
+    if (opts.execution == mode::relay && opts.wire == wire_type::f16) {
+        result.numeric_policy += "-reduction-f16-wire";
+    }
+    result.vocabulary     = n_vocab;
+    char description[256]{};
+    llama_model_desc(model.get(), description, sizeof(description));
+    result.model_description = description;
+    result.requests.resize(opts.prompts.size());
+    result.windows.resize(opts.windows);
+    std::vector<std::vector<std::size_t>> assignments(opts.windows);
+    scheduling::admission_budget          budget(std::uint64_t(opts.context_per_request) * opts.prompts.size(),
+                                                 opts.prompts.size());
+    std::vector<scheduling::reservation>  reservations;
+    for (std::size_t i = 0; i < opts.prompts.size(); ++i) {
+        auto & request        = result.requests[i];
+        request.id            = i;
+        request.window        = i % opts.windows;
+        request.prompt_tokens = tokenize(vocab, opts.prompts[i]);
+        require(request.prompt_tokens.size() + opts.predict <= opts.context_per_request,
+                "prompt plus generation exceeds per-request context");
+        if (!opts.teacher_tokens.empty()) {
+            for (auto token : opts.teacher_tokens[i]) {
+                require(token >= 0 && token < n_vocab, "teacher token outside vocabulary");
+            }
+        }
+        auto held = budget.try_acquire(i + 1, opts.context_per_request);
+        require(held.has_value(), "request reservation failed");
+        reservations.push_back(*held);
+        assignments[request.window].push_back(i);
+    }
+    std::vector<context_ptr>    contexts;
+    std::vector<ggml_backend_t> native;
+    for (std::uint32_t i = 0; i < opts.windows; ++i) {
+        auto params      = llama_context_default_params();
+        params.n_ctx     = opts.context_per_request * assignments[i].size();
+        params.n_seq_max = assignments[i].size();
+        params.n_batch   = assignments[i].size();
+        params.n_ubatch  = params.n_batch;
+        params.n_threads = params.n_threads_batch = opts.threads;
+        // Two full Swift contexts must fit alongside the shared model.
+        const bool native_q4_kv = swift && opts.execution == mode::relay && opts.flash_attention;
+        params.type_k = params.type_v = native_q4_kv ? GGML_TYPE_Q4_0 :
+                                        swift ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        params.flash_attn_type        = opts.flash_attention ? LLAMA_FLASH_ATTN_TYPE_ENABLED :
+                                                             LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        params.kv_unified             = true;
+        params.tp5_relay              = opts.execution == mode::relay;
+        params.quantized_matmul_f32   = opts.execution != mode::relay;
+        context_ptr context(llama_init_from_model(model.get(), params));
+        require(context != nullptr, "context preparation failed");
+        auto & dimensions = result.windows[i];
+        dimensions.context_tokens = llama_n_ctx(context.get());
+        dimensions.sequence_tokens = llama_n_ctx_seq(context.get());
+        dimensions.kv_capacity_tokens = llama_n_ctx_kv(context.get());
+        require(dimensions.context_tokens >= params.n_ctx &&
+                    dimensions.sequence_tokens >= opts.context_per_request &&
+                    dimensions.kv_capacity_tokens >= opts.context_per_request,
+                "context preparation shrank the requested context or KV capacity");
+        const bool flash_attention = llama_get_flash_attention(context.get());
+        require(flash_attention == opts.flash_attention, "context did not honor the requested Flash Attention setting");
+        result.flash_attention = flash_attention;
+        if (opts.execution == mode::relay) {
+            auto lane = llama_tp5_relay_backend(context.get());
+            require(lane != nullptr, "context did not expose the requested TP5 relay capability");
+            require(ggml_backend_relay_set_wire_type(
+                        lane, opts.wire == wire_type::f16 ? GGML_RELAY_WIRE_F16 : GGML_RELAY_WIRE_F32),
+                    "context rejected the requested relay wire format before decode");
+            if (!opts.hc_owner_offsets.empty()) {
+                require(ggml_backend_relay_set_hc_owner_offset(lane, opts.hc_owner_offsets[i]),
+                        "context rejected the HC owner offset before its first decode");
+                result.windows[i].hc_owner_offset = static_cast<std::int32_t>(opts.hc_owner_offsets[i]);
+                result.hc_owner_offsets.push_back(opts.hc_owner_offsets[i]);
+            }
+            native.push_back(lane);
+        }
+        contexts.push_back(std::move(context));
+        result.windows[i].id = i;
+    }
+    failure_state                  failure;
+    std::unique_ptr<relay_service> service;
+    if (opts.execution == mode::relay) {
+        service = std::make_unique<relay_service>(opts, native, failure, now_ns() | 1);
+    }
+    result.started_ns = now_ns();
+    // Count submitted epochs until native work and CPU readers retire.
+    std::atomic<std::uint64_t> active{ 0 }, maximum{ 0 };
+    std::mutex                 submission_mutex;
+    std::atomic<std::uint32_t> workers_done{ 0 };
+    std::atomic<bool>          watchdog_stop{ false };
+    std::vector<std::thread>   workers;
+    workers.reserve(opts.windows);
+    std::thread watchdog([&] {
+        const auto deadline           = clock_type::now() + std::chrono::seconds(opts.deadline_seconds);
+        bool       aborted            = false;
+        auto       retention_deadline = deadline + std::chrono::seconds(45);
+        while (!watchdog_stop.load(std::memory_order_acquire)) {
+            if (!aborted && (clock_type::now() >= deadline || failure.stopped.load())) {
+                if (!failure.stopped.load()) {
+                    failure.fail(std::make_exception_ptr(std::runtime_error("TP5 execution deadline exceeded")));
+                }
+                if (service) {
+                    service->abort_all();
+                }
+                aborted            = true;
+                retention_deadline = clock_type::now() + std::chrono::seconds(45);
+            }
+            if (aborted && workers_done.load() != opts.windows && clock_type::now() >= retention_deadline) {
+                retain_and_exit("decode or native drain did not return within the abort grace period");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+    for (std::uint32_t wi = 0; wi < opts.windows; ++wi) {
+        try {
+            workers.emplace_back([&, wi] {
+                bool epoch_active = false;
+                try {
+                    auto                                 ctx     = contexts[wi].get();
+                    auto &                               metrics = result.windows[wi];
+                    const auto &                         ids     = assignments[wi];
+                    std::vector<std::uint64_t>           consumed(ids.size(), 0);
+                    std::vector<text::generation_stream> streams(ids.size());
+                    row_batch                            batch(ids.size());
+                    std::vector<std::size_t>             local_rows;
+                    local_rows.reserve(ids.size());
+                    for (auto id : ids) {
+                        result.requests[id].admitted_ns = now_ns();
+                    }
+                    while (!failure.stopped.load()) {
+                        batch.clear();
+                        local_rows.clear();
+                        std::uint32_t output_rows = 0;
+                        std::int32_t single_output_row = -1;
+                        for (std::size_t local = 0; local < ids.size(); ++local) {
+                            auto & request = result.requests[ids[local]];
+                            if (!request.stop_reason.empty()) {
+                                continue;
+                            }
+                            llama_token input;
+                            if (consumed[local] < request.prompt_tokens.size()) {
+                                input = request.prompt_tokens[consumed[local]];
+                            } else {
+                                require(!request.tokens.empty(), "request has no accepted pending token");
+                                input = request.tokens.back().emitted_token;
+                            }
+                            const bool output = consumed[local] + 1 >= request.prompt_tokens.size();
+                            batch.push(input, consumed[local], local, output);
+                            if (output) {
+                                ++output_rows;
+                                single_output_row = batch.batch.n_tokens - 1;
+                            }
+                            local_rows.push_back(local);
+                        }
+                        if (!batch.batch.n_tokens) {
+                            break;
+                        }
+                        // Keep each window's five-rank submission together.
+                        // Completion waits and CPU relay work stay outside this gate.
+                        std::unique_lock<std::mutex> submission_lock(submission_mutex, std::defer_lock);
+                        if (service) {
+                            submission_lock.lock();
+                        }
+                        const auto current = active.fetch_add(1) + 1;
+                        epoch_active = true;
+                        auto       seen    = maximum.load();
+                        while (seen < current && !maximum.compare_exchange_weak(seen, current)) {
+                        }
+                        if (!metrics.first_submit_ns) {
+                            metrics.first_submit_ns = now_ns();
+                        }
+                        const auto submit_start = now_ns();
+                        const int decoded = llama_decode(ctx, batch.batch);
+                        metrics.decode_submit_ns += now_ns() - submit_start;
+                        if (submission_lock.owns_lock()) {
+                            submission_lock.unlock();
+                        }
+                        ++metrics.decode_calls;
+                        metrics.input_rows += batch.batch.n_tokens;
+                        require(decoded == 0, "real model decode failed");
+                        const auto wait_start = now_ns();
+                        const float * single_output_logits = nullptr;
+                        if (output_rows == 1) {
+                            // This public getter synchronizes the context. Keep only
+                            // its pointer here; read logits after native retirement.
+                            single_output_logits = llama_get_logits_ith(ctx, single_output_row);
+                        } else {
+                            llama_synchronize(ctx);
+                        }
+                        if (service) {
+                            ggml_relay_status status{};
+                            for (;;) {
+                                if (!ggml_backend_relay_snapshot(native[wi], &status)) {
+                                    pause_cpu();
+                                    continue;
+                                }
+                                require(!status.failed && !failure.stopped.load(), "native relay epoch failed");
+                                if (status.finished && service->retired(wi, status)) {
+                                    break;
+                                }
+                                pause_cpu();
+                            }
+                        }
+                        metrics.native_wait_ns += now_ns() - wait_start;
+                        active.fetch_sub(1);
+                        epoch_active = false;
+                        require(!failure.stopped.load(), "request stopped before state commit");
+                        const auto commit_start = now_ns();
+                        for (std::size_t row = 0; row < local_rows.size(); ++row) {
+                            const auto local          = local_rows[row];
+                            auto &     request        = result.requests[ids[local]];
+                            const auto input_position = consumed[local]++;
+                            if (!batch.batch.logits[row]) {
+                                continue;
+                            }
+                            const float * logits =
+                                output_rows == 1 && row == static_cast<std::size_t>(single_output_row) ?
+                                    single_output_logits : llama_get_logits_ith(ctx, row);
+                            require(logits != nullptr, "full logits row is missing");
+                            const auto greedy = tq::sampling::select_finite_greedy(logits, n_vocab);
+                            require(greedy.usable, "nonfinite full model logits");
+                            const llama_token selected = greedy.selected.id;
+                            token_record record;
+                            record.input_token    = batch.batch.token[row];
+                            record.sampled_token  = selected;
+                            record.emitted_token  = opts.teacher_tokens.empty() ?
+                                                        selected :
+                                                        opts.teacher_tokens[ids[local]][request.tokens.size()];
+                            record.input_position = input_position;
+                            if (opts.capture_logits) {
+                                record.logits.assign(logits, logits + n_vocab);
+                            }
+                            // There is exactly one owner/worker for this request. No
+                            // other window can mutate its input, sampler or cursor.
+                            record.committed_ns = now_ns();
+                            request.tokens.push_back(std::move(record));
+                            auto delta = streams[local].push(piece(vocab, request.tokens.back().emitted_token));
+                            request.text += delta.text;
+                            if (opts.cancel_request == static_cast<std::int32_t>(ids[local]) &&
+                                request.tokens.size() >= opts.cancel_after) {
+                                request.stop_reason = "cancelled";
+                            } else if (!opts.ignore_eos &&
+                                       llama_vocab_is_eog(vocab, request.tokens.back().emitted_token)) {
+                                request.stop_reason = "eos";
+                            } else if (request.tokens.size() == opts.predict) {
+                                request.stop_reason = "budget";
+                            }
+                            if (!request.stop_reason.empty()) {
+                                request.text += streams[local].finish().text;
+                                request.finished_ns = now_ns();
+                            }
+                        }
+                        metrics.last_finish_ns = now_ns();
+                        metrics.result_commit_ns += metrics.last_finish_ns - commit_start;
+                    }
+                } catch (...) {
+                    if (epoch_active) {
+                        active.fetch_sub(1);
+                        epoch_active = false;
+                    }
+                    failure.fail(std::current_exception());
+                    if (service) {
+                        service->abort_all();
+                    }
+                }
+                workers_done.fetch_add(1, std::memory_order_release);
+            });
+        } catch (...) {
+            failure.fail(std::current_exception());
+            if (service) {
+                service->abort_all();
+            }
+            break;
+        }
+    }
+    for (auto & worker : workers) {
+        worker.join();
+    }
+    // Keep the independent CPU service alive while native abort/tail work exits.
+    if (service) {
+        const auto deadline = clock_type::now() + std::chrono::seconds(45);
+        for (std::uint32_t wi = 0; wi < opts.windows; ++wi) {
+            ggml_relay_status status{};
+            for (;;) {
+                if (!ggml_backend_relay_snapshot(native[wi], &status)) {
+                    if (clock_type::now() >= deadline) {
+                        retain_and_exit("native status remained unavailable");
+                    }
+                    pause_cpu();
+                    continue;
+                }
+                if (status.finished && (status.failed || service->retired(wi, status))) {
+                    break;
+                }
+                if (clock_type::now() >= deadline) {
+                    retain_and_exit("native completion or CPU reader retirement is unproved");
+                }
+                pause_cpu();
+            }
+            auto & metrics              = result.windows[wi];
+            if (status.failed || failure.stopped.load()) {
+                std::fprintf(stderr,
+                             "TP5_NATIVE_DRAIN window=%u epoch=%llu attempted=%u accepted=%u unknown=%u completed=%u sealed=%u finished=%u error=%d detail=%.*s\n",
+                             wi, static_cast<unsigned long long>(status.epoch), status.attempted_mask,
+                             status.accepted_mask, status.unknown_mask, status.completed_mask,
+                             unsigned(status.sealed), unsigned(status.finished), status.error_code,
+                             int(sizeof(status.error)), status.error);
+            }
+            metrics.epochs              = status.epoch;
+            metrics.channels            = status.channels;
+            metrics.cpu_reductions      = status.cpu_reductions;
+            metrics.input_retirements   = service->inputs(wi);
+            metrics.output_retirements  = service->outputs(wi);
+            metrics.hip_runtime_version = status.hip_runtime_version;
+            metrics.native_drained      = status.finished;
+            for (std::size_t rank = 0; rank < 5; ++rank) {
+                metrics.rank_graphs[rank]          = status.rank_graphs[rank];
+                metrics.rank_compute_nodes[rank]   = status.rank_compute_nodes[rank];
+                metrics.rank_relay_nodes[rank]     = status.rank_relay_nodes[rank];
+                metrics.rank_published_bytes[rank] = status.rank_published_bytes[rank];
+                metrics.rank_consumed_bytes[rank]  = status.rank_consumed_bytes[rank];
+                metrics.pci_bdf[rank]              = status.pci_bdf[rank];
+            }
+        }
+        try {
+            service->finish_ledgers(failure.stopped.load());
+            for (std::size_t wi = 0; wi < opts.windows; ++wi) {
+                service->copy_wire_metrics(wi, result.windows[wi]);
+            }
+        } catch (...) {
+            failure.fail(std::current_exception());
+        }
+    }
+    watchdog_stop.store(true, std::memory_order_release);
+    watchdog.join();
+    for (std::uint32_t wi = 0; wi < opts.windows; ++wi) {
+        llama_synchronize(contexts[wi].get());
+        for (std::size_t local = 0; local < assignments[wi].size(); ++local) {
+            require(llama_memory_seq_rm(llama_get_memory(contexts[wi].get()), local, -1, -1),
+                    "request state removal failed");
+        }
+        llama_synchronize(contexts[wi].get());
+    }
+    contexts.clear();
+    for (const auto & held : reservations) {
+        require(budget.release(held), "state budget release failed");
+    }
+    result.reserved_tokens_after_close = budget.reserved_tokens();
+    result.active_requests_after_close = budget.active_count();
+    result.max_simultaneous_windows     = maximum.load();
+    result.finished_ns                 = now_ns();
+    if (failure.first) {
+        std::fprintf(stderr, "TP5_FAILURE_CLEANUP reserved_tokens=%llu active_requests=%u\n",
+                     static_cast<unsigned long long>(result.reserved_tokens_after_close),
+                     result.active_requests_after_close);
+        std::rethrow_exception(failure.first);
+    }
+    for (const auto & request : result.requests) {
+        require(!request.stop_reason.empty(), "request did not complete");
+    }
+    return result;
+}
+}  // namespace tq::tp5

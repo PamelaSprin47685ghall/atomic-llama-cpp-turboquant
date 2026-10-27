@@ -803,6 +803,10 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
             if (p_hn->n_children == 0 && p_hn->n_views == 0) {
                 if (ggml_impl_is_view(parent)) {
+                    // An output view must retain its source after its last consumer.
+                    if (parent->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                        continue;
+                    }
                     struct ggml_tensor * view_src = parent->view_src;
                     struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
                     view_src_hn->n_views -= 1;

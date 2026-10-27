@@ -1277,12 +1277,20 @@ void ggml_cuda_mul_mat_vec_q(
     // ConvRot types and MUL_MAT_ID stay uncached; oversized batches fall back too.
     auto & qc = ctx.q8_cache;
     static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
+    // Ordinary MMVQ always quantizes to plain block_q8_1: weight type only selects
+    // its read-only dot product. MMQ layouts and ConvRot are separate paths.
+    // Keep the legacy weight-type key by default for same-binary A/B comparison.
+    static const bool q8_cache_same_format = [] {
+        const char * value = getenv("GGML_CUDA_Q8CACHE_SAME_FORMAT");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    const ggml_type q8_cache_type = q8_cache_same_format ? GGML_TYPE_Q8_1 : src0->type;
     // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
     const bool q8_cacheable = !q8_cache_disabled && !convrot && ids == nullptr && q8_bytes <= (1u << 20) &&
                               ctx.curr_stream_no == 0;
     const bool q8_hit = q8_cacheable && qc.epoch == ctx.graph_epoch && qc.src1 == src1 &&
                         qc.data == src1->data && qc.size == q8_bytes &&
-                        qc.ne10_padded == ne10_padded && qc.type == src0->type &&
+                        qc.ne10_padded == ne10_padded && qc.type == q8_cache_type &&
                         qc.dev == ctx.device;
 
     ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
@@ -1313,7 +1321,7 @@ void ggml_cuda_mul_mat_vec_q(
             qc.epoch       = ctx.graph_epoch;
             qc.size        = q8_bytes;
             qc.ne10_padded = ne10_padded;
-            qc.type        = src0->type;
+            qc.type        = q8_cache_type;
         } else {
             src1_q8_1 = src1_q8_1_local.alloc(q8_bytes);
         }
