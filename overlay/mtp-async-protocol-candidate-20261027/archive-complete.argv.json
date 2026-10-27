@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "ar",
+    "r",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/libtq_tp5_runtime.a",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/runtime.cpp.o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/ordered-fold.cpp.o"
+  ],
+  "cwd": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027",
+  "reused_member_from": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-ready-split-draft-candidate-20261025/libtq_tp5_runtime.a",
+  "ordered_fold_sha256": "2759732433a38d53529346096f5968eadad2066a3e3ec1925f8e146d1013ea14"
+}
