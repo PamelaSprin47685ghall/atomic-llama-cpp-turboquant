@@ -1,0 +1,482 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-18",
+  "upstream": {
+    "upstream": {
+      "url": "https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant",
+      "branch": "master",
+      "commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+      "release": "b10298-2.0.0",
+      "remote_checked_utc": "2026-10-18"
+    },
+    "previous_fork": {
+      "commit": "2777543b2358c88cd1c2000f7fa342b764a0e213",
+      "archive_branch": "archive/pre-clean-20261018"
+    },
+    "extension_root": "fork"
+  },
+  "a_overlay_manifest_sha256": "5ebc5ae4c4feabfcaad5eb55724f3fbfb754712610801265caf8f17d52921525",
+  "phase": {
+    "cpu": {
+      "status": "passed",
+      "participants": "real installed A and B",
+      "requests": 3,
+      "actual_batches_per_run": 22,
+      "actual_rows_per_run": 145,
+      "phase_release_outputs_equal": true,
+      "limits": [
+        "This test does not measure peak GPU allocation or throughput.",
+        "This is a greedy causal text runner; no HTTP, MTP, cache retry or shared-KV reasoning claim."
+      ],
+      "raw_directory": "build-phase-cpu-20261018",
+      "modes": {
+        "on": {
+          "config": {
+            "event": "config",
+            "requests": 3,
+            "logical_context_requested": 512,
+            "logical_context_actual": 512,
+            "total_kv_requested": 1024,
+            "total_kv_actual": 1024,
+            "batch_actual": 16,
+            "gpu_layers_requested": 0,
+            "phase_memory": true
+          },
+          "phases": [
+            {
+              "event": "phase",
+              "from": null,
+              "to": "prompt",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 1726848,
+              "compute_bytes_after": 1726848
+            },
+            {
+              "event": "phase",
+              "from": "prompt",
+              "to": "generation",
+              "synchronized": true,
+              "release_compute_requested": true,
+              "release_compute_success": true,
+              "compute_bytes_before": 1726848,
+              "compute_bytes_after": 0
+            },
+            {
+              "event": "phase",
+              "from": "generation",
+              "to": "prompt",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 1074368,
+              "compute_bytes_after": 1074368
+            },
+            {
+              "event": "phase",
+              "from": "prompt",
+              "to": "generation",
+              "synchronized": true,
+              "release_compute_requested": true,
+              "release_compute_success": true,
+              "compute_bytes_before": 1074368,
+              "compute_bytes_after": 0
+            }
+          ],
+          "generation_compute_bytes": [
+            1074368,
+            1611456
+          ]
+        },
+        "off": {
+          "config": {
+            "event": "config",
+            "requests": 3,
+            "logical_context_requested": 512,
+            "logical_context_actual": 512,
+            "total_kv_requested": 1024,
+            "total_kv_actual": 1024,
+            "batch_actual": 16,
+            "gpu_layers_requested": 0,
+            "phase_memory": false
+          },
+          "phases": [
+            {
+              "event": "phase",
+              "from": null,
+              "to": "prompt",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 1726848,
+              "compute_bytes_after": 1726848
+            },
+            {
+              "event": "phase",
+              "from": "prompt",
+              "to": "generation",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 1726848,
+              "compute_bytes_after": 1726848
+            },
+            {
+              "event": "phase",
+              "from": "generation",
+              "to": "prompt",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 1726848,
+              "compute_bytes_after": 1726848
+            },
+            {
+              "event": "phase",
+              "from": "prompt",
+              "to": "generation",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 1726848,
+              "compute_bytes_after": 1726848
+            }
+          ],
+          "generation_compute_bytes": [
+            1726848
+          ]
+        }
+      }
+    },
+    "vulkan": {
+      "status": "passed",
+      "participants": "real installed A and B",
+      "gpu_layers_requested": 999,
+      "gpu_layers_observed": [
+        25,
+        25
+      ],
+      "requests": 3,
+      "actual_batches_per_run": 22,
+      "actual_rows_per_run": 145,
+      "phase_release_outputs_equal": true,
+      "limits": [
+        "This test does not measure peak GPU allocation or throughput.",
+        "This is a greedy causal text runner; no HTTP, MTP, cache retry or shared-KV reasoning claim."
+      ],
+      "raw_directory": "build-phase-vulkan-20261018",
+      "modes": {
+        "on": {
+          "config": {
+            "event": "config",
+            "requests": 3,
+            "logical_context_requested": 512,
+            "logical_context_actual": 512,
+            "total_kv_requested": 1024,
+            "total_kv_actual": 1024,
+            "batch_actual": 16,
+            "gpu_layers_requested": 999,
+            "phase_memory": true
+          },
+          "phases": [
+            {
+              "event": "phase",
+              "from": null,
+              "to": "prompt",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 2846956,
+              "compute_bytes_after": 2846956
+            },
+            {
+              "event": "phase",
+              "from": "prompt",
+              "to": "generation",
+              "synchronized": true,
+              "release_compute_requested": true,
+              "release_compute_success": true,
+              "compute_bytes_before": 2846956,
+              "compute_bytes_after": 0
+            },
+            {
+              "event": "phase",
+              "from": "generation",
+              "to": "prompt",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 1168472,
+              "compute_bytes_after": 1168472
+            },
+            {
+              "event": "phase",
+              "from": "prompt",
+              "to": "generation",
+              "synchronized": true,
+              "release_compute_requested": true,
+              "release_compute_success": true,
+              "compute_bytes_before": 1262680,
+              "compute_bytes_after": 0
+            }
+          ],
+          "generation_compute_bytes": [
+            1168472,
+            1738356
+          ]
+        },
+        "off": {
+          "config": {
+            "event": "config",
+            "requests": 3,
+            "logical_context_requested": 512,
+            "logical_context_actual": 512,
+            "total_kv_requested": 1024,
+            "total_kv_actual": 1024,
+            "batch_actual": 16,
+            "gpu_layers_requested": 999,
+            "phase_memory": false
+          },
+          "phases": [
+            {
+              "event": "phase",
+              "from": null,
+              "to": "prompt",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 2846956,
+              "compute_bytes_after": 2846956
+            },
+            {
+              "event": "phase",
+              "from": "prompt",
+              "to": "generation",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 2846956,
+              "compute_bytes_after": 2846956
+            },
+            {
+              "event": "phase",
+              "from": "generation",
+              "to": "prompt",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 2846956,
+              "compute_bytes_after": 2846956
+            },
+            {
+              "event": "phase",
+              "from": "prompt",
+              "to": "generation",
+              "synchronized": true,
+              "release_compute_requested": false,
+              "release_compute_success": null,
+              "compute_bytes_before": 2846956,
+              "compute_bytes_after": 2846956
+            }
+          ],
+          "generation_compute_bytes": [
+            2846956
+          ]
+        }
+      }
+    }
+  },
+  "model_rechecks": {
+    "cpu": {
+      "raw_directory": "build-model-small-cpu-20261018",
+      "model": "LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+      "gpu_layers": 0,
+      "observed_offloaded_layers": 0,
+      "sampling": {
+        "greedy": {
+          "tokens_equal": true,
+          "tokens": 24,
+          "compact_rows": 24,
+          "full_rows": 0
+        },
+        "stochastic": {
+          "tokens_equal": true,
+          "tokens": 24,
+          "compact_rows": 0,
+          "full_rows": 24
+        }
+      },
+      "corpus": {
+        "requests": 6,
+        "unique_tokens": 44,
+        "full_tokens": 120,
+        "mean_nll_absolute_difference": 0.0,
+        "maximum_per_request_mean_nll_difference": 1.8947806286936005e-15,
+        "reversed_order_maximum_mean_nll_difference": 1.8947806286936005e-15,
+        "mean_nll_tolerance": 1e-05,
+        "prefix_mean_nll": 5.2485678755225615,
+        "full_mean_nll": 5.2485678755225615
+      },
+      "failure_checks": [
+        "context limit",
+        "no overwrite",
+        "unchanged corpus after rejection"
+      ]
+    },
+    "vulkan": {
+      "raw_directory": "build-model-small-vulkan-20261018",
+      "model": "LFM2.5-8B-A1B-UD-IQ4_NL.gguf",
+      "gpu_layers": 99,
+      "observed_offloaded_layers": 25,
+      "sampling": {
+        "greedy": {
+          "tokens_equal": true,
+          "tokens": 24,
+          "compact_rows": 24,
+          "full_rows": 0
+        },
+        "stochastic": {
+          "tokens_equal": true,
+          "tokens": 24,
+          "compact_rows": 0,
+          "full_rows": 24
+        }
+      },
+      "corpus": {
+        "requests": 6,
+        "unique_tokens": 44,
+        "full_tokens": 120,
+        "mean_nll_absolute_difference": 0.0,
+        "maximum_per_request_mean_nll_difference": 9.473903143468002e-16,
+        "reversed_order_maximum_mean_nll_difference": 9.473903143468002e-16,
+        "mean_nll_tolerance": 1e-05,
+        "prefix_mean_nll": 5.15723864954567,
+        "full_mean_nll": 5.15723864954567
+      },
+      "failure_checks": [
+        "context limit",
+        "no overwrite",
+        "unchanged corpus after rejection"
+      ]
+    }
+  },
+  "server": {
+    "status": "passed",
+    "limits": [
+      "SSE receipt times do not prove batch pause or absence of generation interleaving.",
+      "This smoke test does not measure throughput or peak GPU memory."
+    ],
+    "invalid_combo_rejected_before_model_load": true,
+    "injection": {
+      "seconds": 3.002839031862095,
+      "initial_stream_chunks": [
+        2,
+        2
+      ],
+      "initial_streams_client_complete": [
+        false,
+        false
+      ]
+    },
+    "phases": [
+      "prefill",
+      "generation",
+      "prefill",
+      "generation"
+    ],
+    "completed_phase_cycles": 2,
+    "actual_offloaded_layers": [
+      25,
+      25
+    ],
+    "physical_kv_capacity": 1536,
+    "raw_directory": "build-server-phase-verified-20261018",
+    "requests": [
+      {
+        "id_slot": 0,
+        "predicted_n": 48,
+        "stream_chunks": 48,
+        "returned_tokens_supported": true
+      },
+      {
+        "id_slot": 1,
+        "predicted_n": 48,
+        "stream_chunks": 48,
+        "returned_tokens_supported": true
+      },
+      {
+        "id_slot": 2,
+        "predicted_n": 8,
+        "stream_chunks": 8,
+        "returned_tokens_supported": true
+      }
+    ]
+  },
+  "corpus_interop": {
+    "raw_directory": "build-corpus-interop-verified-20261018",
+    "status": "passed",
+    "legacy_commit": "2777543b2358c88cd1c2000f7fa342b764a0e213",
+    "unmodified_sources_sha256": {
+      "wanxiangqi/server/server-corpus-dump.h": "0ce1d80aff1b75aab67c2d3c36a8f40e632ffbeca93c214e8c4c7995d0ef6209",
+      "wanxiangqi/server/server-corpus-dump.cpp": "f031635a31c9c4a9c40633d99b09d70365659371beff6b353a3e743fe97518e7"
+    },
+    "production_writer_and_reader": true,
+    "byte_round_trip": true,
+    "kinds_timestamps_empty_and_prefix_requests": true,
+    "reader_changed_files": false
+  },
+  "isolation": {
+    "upstream": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "a_source_provenance": "built_from_pinned_archive_and_verified_overlay_bytes",
+    "a_archive_has_no_b_or_c": true,
+    "a_reuse_limit": null,
+    "a_public_seams_tests_passed": true,
+    "isolated_modules": [
+      "sampling",
+      "corpus",
+      "scheduling",
+      "compose",
+      "corpus-compose",
+      "batch-compose"
+    ],
+    "source_and_build_copies_removed_before_consumption": true,
+    "relocated_installed_consumers_passed": true,
+    "relocated_real_batch": "passed",
+    "limits": [
+      "Help/package checks alone do not establish model execution or throughput.",
+      "Separate source copies and installed consumption do not constitute an OS sandbox."
+    ],
+    "commands": 41,
+    "raw_directory": "build-isolation-small-20261018"
+  },
+  "model_sha256": "a1921216ded964e5c4f787226729e8c2c32bd587ac7b897742e0b7a7cc7eff6a",
+  "model_hash_rechecked_after_runtime_tests": true,
+  "precision_regression": {
+    "test": "fork/tests/a-seams/flash-attn-precision.cpp",
+    "before_failed": true,
+    "kv_lengths": [
+      256,
+      1024
+    ],
+    "before_max_abs": [
+      0.000388145447,
+      0.000388026237
+    ],
+    "after_max_abs": [
+      1.1920929e-07,
+      1.1920929e-07
+    ]
+  },
+  "vulkan_wht_regression": {
+    "test": "fork/tests/a-seams/vulkan-wht.cpp",
+    "cases": 12,
+    "before_failed_cases": 10,
+    "after_failed_cases": 0,
+    "after_max_abs": 0,
+    "device": "RX 6800 / RADV",
+    "limits": [
+      "Public-op CPU/Vulkan comparison, not full-model logits equivalence or throughput."
+    ]
+  }
+}

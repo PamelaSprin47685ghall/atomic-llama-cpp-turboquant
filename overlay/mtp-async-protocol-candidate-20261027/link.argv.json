@@ -1,0 +1,24 @@
+{
+  "argv": [
+    "/usr/bin/c++",
+    "-O3",
+    "-DNDEBUG",
+    "-Wl,--dependency-file=/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/link.d",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/runtime-000-main.cpp.o",
+    "-o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/install/bin/tq-tp5-compose",
+    "-Wl,-rpath,$ORIGIN/../lib",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/libtq_tp5_runtime.a",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/install/lib/libllama.so",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/install/lib/libggml.so",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/install/lib/libggml-cpu.so",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/install/lib/libggml-hip.so",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/install/lib/libggml-base.so",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/runtime-002-libtq-relay.a",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/runtime-003-libtq-sampling.a",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/runtime-004-libtq-scheduling.a",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/runtime-005-libtq-text.a"
+  ],
+  "cwd": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027",
+  "origin": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-catchup-candidate-20261024/link.argv.json"
+}

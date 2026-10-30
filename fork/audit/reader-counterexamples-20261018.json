@@ -1,0 +1,167 @@
+{
+  "execution_model": "AST-selected original pure function bodies plus a bash read builtin; no runner module top-level, network, GPU, or model execution",
+  "status": "confirmed",
+  "sources": [
+    {
+      "path": "scripts/flashprefill-quality.py",
+      "sha256": "ce4517fee415ada7c6661714d93007d7368bfa4ec4ba5c4ae73d65d95b962608",
+      "functions": [
+        {
+          "name": "canonical",
+          "range": [
+            312,
+            313
+          ]
+        },
+        {
+          "name": "parse_last_number",
+          "range": [
+            494,
+            501
+          ]
+        },
+        {
+          "name": "score_numeric",
+          "range": [
+            513,
+            524
+          ]
+        },
+        {
+          "name": "check_pair_equality",
+          "range": [
+            960,
+            984
+          ]
+        }
+      ]
+    },
+    {
+      "path": "scripts/tp5-necessity-audit.py",
+      "sha256": "3aa0b425c0332ae6265c93dc0c7e19bd348c48a7aafec3b2b953dd078e8481d0",
+      "functions": [
+        {
+          "name": "finite",
+          "range": [
+            26,
+            31
+          ]
+        }
+      ]
+    },
+    {
+      "path": "scripts/tp5-necessity-certificate.py",
+      "sha256": "b3b38d830b6ec0ac32ffc481fc6873a9599a4a825847d9a688761ee05973cc93",
+      "functions": [
+        {
+          "name": "_lp_dimensions_ok",
+          "range": [
+            269,
+            275
+          ]
+        },
+        {
+          "name": "verify_lp_dual",
+          "range": [
+            278,
+            304
+          ]
+        }
+      ]
+    },
+    {
+      "path": "scripts/xkv/run-evaluation-matrix.py",
+      "sha256": "2f2dd7ef49bbc63e46493eeacbd418bcf459a60c6fe7a3dadd2b54fc3d33a45b",
+      "functions": [
+        {
+          "name": "parse_sse_stream",
+          "range": [
+            230,
+            313
+          ]
+        }
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "id": "SC-Q01",
+      "path": "scripts/flashprefill-quality.py",
+      "range": [
+        960,
+        984
+      ],
+      "case": "A={} vs X={missing_or_null:null}",
+      "observed": [],
+      "confirms": true,
+      "implication": "Unequal canonical payloads can return no violations."
+    },
+    {
+      "id": "SC-Q02",
+      "path": "scripts/flashprefill-quality.py",
+      "range": [
+        494,
+        524
+      ],
+      "case": "score_numeric(output=1, expected=1e309)",
+      "observed": [
+        1,
+        null
+      ],
+      "confirms": true,
+      "implication": "Infinite parsed reference permits inf <= inf false acceptance."
+    },
+    {
+      "id": "SC-N01",
+      "path": "scripts/tp5-necessity-certificate.py",
+      "range": [
+        278,
+        304
+      ],
+      "case": "min 0*x subject x>=1, x>=0; y=5e-10",
+      "observed_lower": 5e-10,
+      "actual_primal_optimum": 0,
+      "confirms": true,
+      "implication": "Tolerance accepts an infeasible dual and returns a positive lower bound above optimum."
+    },
+    {
+      "id": "SC-S01",
+      "path": "scripts/xkv/run-evaluation-matrix.py",
+      "range": [
+        230,
+        313
+      ],
+      "case": "one malformed JSON data line followed by stop=true",
+      "observed": {
+        "assembled_content": "",
+        "finish_reason": "stop",
+        "done_count": 0,
+        "finish_count": 1,
+        "prompt_tokens": null,
+        "predicted_tokens": null,
+        "timings": {},
+        "malformed_lines": 1,
+        "error": null
+      },
+      "confirms": true,
+      "implication": "Parser terminal success alone does not enforce all JSON events valid; caller must check malformed_lines."
+    },
+    {
+      "id": "SC-P01",
+      "path": "scripts/gpu-hard-unlock.sh",
+      "range": [
+        421,
+        423
+      ],
+      "case": "read -a from two newline-separated fuser PID values",
+      "observed_pids": [
+        "101"
+      ],
+      "confirms": true,
+      "implication": "Bash read consumes first line only. No recovery or signaling script was executed."
+    }
+  ],
+  "source_original_fork": "2777543b2358c88cd1c2000f7fa342b764a0e213",
+  "classification": "executed isolated reader counterexamples; not old model/runtime qualification",
+  "source_receipt_sha256": "c2860d4ab9ba75a46930ac2de242e670af713df76f441f2be842f8ab35565585"
+}

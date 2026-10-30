@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-19",
+  "status": "Single-device platform facts established; five-rank cross-device qualification is pending the real five-GPU machine.",
+  "all_release_gates_passed": false,
+  "identity": {
+    "repository": "atomic-llama-cpp-turboquant",
+    "branch": "clean/fork-20261018",
+    "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "probe_source_at_evidence_commit": "35d41c8fc",
+    "hardening_commit": "f1ab00c93",
+    "provenance_note": "The evidence below was produced by the binary built from 35d41c8fc. f1ab00c93 hardened the five-rank path, device discipline and CLI parsing afterwards without producing new hardware evidence; the report's five_rank_status=not_run therefore remains accurate and no report bytes were rewritten."
+  },
+  "source": {
+    "probe_root": "fork/relay-probe",
+    "digests_at_35d41c8fc": {
+      "src/main.cpp": "bf6106a9933656ebb7d53d874caeb56056d46a178a4e567d6e95972e8f8e2959",
+      "src/evidence.cpp": "074274d45652f5ada30b4e21632b00bd602af9b11d5ecc5f2ce2e1f61ce9e67f",
+      "src/evidence.h": "bfb19a5e3bc7ffa8efbfe7324200bd68c458f32a3be08a0f4311daa27833ee26",
+      "tests/config-test.cpp": "d3270663df87106b1052b53ad58e001868a37c2a5fc77f44fdc020c8a3799e9b"
+    }
+  },
+  "runtime": {
+    "system": "Linux x86_64",
+    "host_compiler": "GCC 16.2.1",
+    "probe_tu_compiler": "HIP clang (ROCm 7.2.4)",
+    "hip_runtime": "7.2.4",
+    "gpu": "AMD Radeon RX 6800",
+    "gcn_arch": "gfx1030",
+    "device_count": 1,
+    "rounds": 2000
+  },
+  "evidence": {
+    "report": {
+      "path": "build-relay-probe-20261019/probe-report-final-20261019.json",
+      "sha256": "0cdd86bd4e2af7b6a2042fcdf64ba376e944b305539d791d8363a5f7c379cb8a",
+      "qualification": "pass",
+      "summary": "16 cases per present device: bidirectional running visibility and hot reuse, producer delay ordering, exact tickets, multi-group completion, abort, five-consumer output credit, delayed last reader (H08), two-bank rotation, varying live extents (H05), five-stream relay cycle all pass; host fetch_add yields 448 instead of 7 (fail, expected platform fact), host CAS pass; five_rank_status=not_run (one device present)."
+    },
+    "bench": {
+      "path": "build-relay-probe-20261019/probe-bench-final-20261019.json",
+      "sha256": "062c28060bb8d31a930f0c954a2aa3069ad3045f2f887618cec3e3713a9de0ad",
+      "medians": {
+        "host_publish_to_device_ack_ns": 9690,
+        "device_produce_to_host_ready_ns": 7770,
+        "five_stream_relay_cycle_ns": 29930,
+        "host_five_way_fold_bytes_per_second": 65741545049
+      },
+      "note": "Observations for the guide-14 cost model, not qualification gates; latencies include kernel launch time on this machine."
+    },
+    "superseded": {
+      "path": "earlier 12-case single-device report",
+      "sha256_prefix": "9d1d1429",
+      "disposition": "preserved byte-for-byte as superseded history; its qualification conclusions are replaced by the 16-case report."
+    }
+  },
+  "post_evidence_changes": {
+    "commit": "f1ab00c93",
+    "changes": [
+      "run_five_rank: guard sandwich, multi-round hot reuse with per-round payload, per-rank/round failure attribution, drain before reset",
+      "five_rank_cross_device recorded per participating device record",
+      "free_device_context and run_bench pin their own device with hipSetDevice",
+      "--rounds rejects trailing garbage and overflow",
+      "real clang-tidy items fixed; HIP false positives documented in AGENTS.md"
+    ],
+    "verification": "Single-GPU 2000-round smoke after the changes: qualification=pass, five_rank=not_run, same 16-case distribution; relay release and sanitizer ctest 4/4; no-HIP build 1/1; fork/check-upstream.py exit 0."
+  },
+  "limits": [
+    "Single-device results do not qualify five-rank cross-device behavior; the cross-device path has never executed on any machine.",
+    "Five-card qualification requires exactly five devices and must be rerun after any toolchain or topology change.",
+    "Bench values are single-device observations and are not qualification gates."
+  ]
+}

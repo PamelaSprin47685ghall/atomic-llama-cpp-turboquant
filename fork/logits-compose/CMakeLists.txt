@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.16)
+project(TQLogitsCompose VERSION 0.1.0 LANGUAGES CXX)
+
+if(NOT UNIX)
+    message(FATAL_ERROR "TQLogitsCompose requires POSIX openat/linkat for no-clobber output.")
+endif()
+include(GNUInstallDirs)
+if(NOT TARGET llama)
+    find_package(llama CONFIG REQUIRED)
+endif()
+
+add_executable(tq_logits_compose src/main.cpp)
+set_target_properties(tq_logits_compose PROPERTIES OUTPUT_NAME tq-logits-compose)
+if(UNIX AND NOT APPLE)
+    set_target_properties(tq_logits_compose PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+endif()
+target_compile_features(tq_logits_compose PRIVATE cxx_std_17)
+target_link_libraries(tq_logits_compose PRIVATE llama)
+install(TARGETS tq_logits_compose RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/TQLogitsCompose")
+install(FILES README.md DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/TQLogitsCompose")
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(tq_logits_writer_test tests/test-writer.cpp)
+    target_compile_features(tq_logits_writer_test PRIVATE cxx_std_17)
+    target_include_directories(tq_logits_writer_test PRIVATE src)
+    add_test(NAME tq_logits_compose.writer COMMAND tq_logits_writer_test)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME tq_logits_compose.cli
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.py"
+            --binary "$<TARGET_FILE:tq_logits_compose>")
+endif()

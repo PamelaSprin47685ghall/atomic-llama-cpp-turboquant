@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+if(NOT TARGET llama)
+    find_dependency(llama CONFIG)
+endif()
+find_dependency(TQSampling CONFIG)
+include("${CMAKE_CURRENT_LIST_DIR}/TQComposeTargets.cmake")
+check_required_components(TQCompose)

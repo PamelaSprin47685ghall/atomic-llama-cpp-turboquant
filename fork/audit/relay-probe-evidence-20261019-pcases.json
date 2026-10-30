@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-19",
+  "status": "P-case batch complete: the single-device-testable half of guide 39.6's completion-and-progress cases is now on the live device. same_stream_inverse_dependency proves an inverse same-stream ordering (consumer ahead of its payload producer, guide 33.7/39.6 P04) is caught deterministically by the consumer's acquire-then-verify read instead of silently consuming garbage. dual_window_independent_progress proves two independent channels interleave on one device (guide 31.1, 39.6 P05/P06/P08 software layer): window B keeps advancing while window A is stalled by a withheld ticket, 64 resident waiter workgroups and a delayed last reader, and A's slot is never touched by B's traffic. Five-rank cross-device qualification remains pending the real five-GPU machine.",
+  "all_release_gates_passed": false,
+  "identity": {
+    "repository": "atomic-llama-cpp-turboquant",
+    "branch": "clean/fork-20261018",
+    "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "superseded_batch_commit": "1c06dab4c",
+    "superseded_batch_index": "audit/relay-probe-evidence-20261019-syncdeadline.json",
+    "provenance_note": "The sync-deadline-batch report (c0a21839) stays byte-identical history; this batch changes the probe binary (two new cases plus a second channel allocation), so the evidence was rerun from the final source and the new SHAs below supersede it. The 18 pre-existing per-device single-card results are identical in meaning."
+  },
+  "source": {
+    "probe_root": "fork/relay-probe",
+    "digests_at_head_before_commit": {
+      "main.cpp": "745ee054ded5e4dd94bff39f8cf4d2845e2dfdc96088df631e95584d6fdf691c",
+      "evidence.cpp": "4116967d0ac83b27f35095fef8b0436141f347da2447c12ed457b167c8daf598",
+      "evidence.h": "ea6eee81579425df516410c75caa0272a0e2528a107537156ede691e65adfda6",
+      "config-test.cpp": "2a55d1074567d1c956ff545f57c8cfc5c0a9e28c49ca61cf0680bd8b8274b9b4",
+      "validate-report.py": "bf445335e686625f9c3f8ebead56d48f4377c41a191d04d1072e54090521acab"
+    },
+    "validator": {
+      "purpose": "Strict evidence validation for the operator on the real machine (guide 53.4).",
+      "self_test": "PASS (registry list appended only, so every fixture now carries the two new cases automatically).",
+      "checked_real_evidence": "both files below validate with exit 0"
+    }
+  },
+  "runtime": {
+    "system": "Linux x86_64",
+    "host_compiler": "GCC 16.2.1",
+    "probe_tu_compiler": "HIP clang (ROCm 7.2.4)",
+    "hip_runtime": "7.2.4",
+    "gpu": "AMD Radeon RX 6800",
+    "gcn_arch": "gfx1030",
+    "device_count": 1,
+    "rounds": 2000,
+    "build_tree": "build-relay-probe-20261019d"
+  },
+  "changes": [
+    "case_same_stream_inverse_dependency (guide 39.6 P04): consumer kernel queued ahead of its payload producer on one stream; stream order guarantees the consumer reads the pre-write payload, and the verification marker (0xDEADBEEFDEADBEEF) proves the acquire-then-verify read caught the premature read deterministically; the producer's later write is verified exact, so the corruption is ordering alone and the run stays bounded",
+    "case_dual_window_independent_progress (guide 31.1, 39.6 P05/P06/P08 software layer): two independent channels (own control block, slot and seed) on one device; window B runs 528 host-driven generations while window A is stalled by a withheld ticket, 64 resident waiter workgroups and a delayed last reader; per-generation canaries prove B never wrote A's slot and A's acknowledgment stayed withheld mid-read; A completes exactly on release and reuses its channel after the stall",
+    "device_context gains a second channel (cb2, slot_b) allocated and freed like the first; a bare_waiter_kernel with the cumulative wait budget holds occupancy without payload access",
+    "registry 19 -> 21 cases; validator REGISTRY and config-test registry/count updated in lockstep; record order per device is append-only, so superseded reports keep their exact claim scope",
+    "report limits and README operator section updated: healthy-machine stdout now ends with dual_window_independent_progress=pass, 21 cases per device on a five-card machine"
+  ],
+  "evidence": {
+    "report": {
+      "path": "build-relay-probe-20261019d/probe-report-final-20261019e.json",
+      "sha256": "b6baeb8146e3224cc99b67743233990964d4ec71f61acebb093afa13ab03f5be",
+      "qualification": "pass",
+      "validated": "exit 0",
+      "summary": "21-case registry; 20 cases per device: all pass except the expected platform fact host_system_rmw_u64_add=fail; same_stream_inverse_dependency=pass (deterministic premature-read detection), dual_window_independent_progress=pass (528 B generations across three A-stall shapes); five_rank_status=not_run (one device present)."
+    },
+    "bench": {
+      "path": "build-relay-probe-20261019d/probe-bench-final-20261019e.json",
+      "sha256": "d51f2e089de8520d9a18f482718befc11fc7f21ccfee7fc4ca05a793f41fa16e",
+      "validated": "exit 0",
+      "medians": {
+        "host_publish_to_device_ack_ns": 9570,
+        "device_produce_to_host_ready_ns": 7770,
+        "five_stream_relay_cycle_ns": 29700,
+        "host_five_way_fold_bytes_per_second": 65716926914
+      }
+    },
+    "superseded": {
+      "report_sha256": "c0a21839a6bb1a3c338e1b228e77798acc756df9d066bcc0f13a8053b0762e1f",
+      "bench_sha256": "04473ee14ab5ea1490da1424e826cd0a53d5905ded18f5886895cd76f8cc375b",
+      "note": "Both stay byte-identical in build-relay-probe-20261019c/ as the sync-deadline-batch artifacts."
+    }
+  },
+  "pending_for_five_card_machine": [
+    "run the probe with HIP_VISIBLE_DEVICES selecting exactly five devices (README operator section)",
+    "expect exit 0, five_rank_status=pass, 21 cases per device; archive stdout/stderr/exit/SHAs",
+    "run validate-report.py on the produced files before shipping them back",
+    "update this index family with the cross-device evidence"
+  ]
+}

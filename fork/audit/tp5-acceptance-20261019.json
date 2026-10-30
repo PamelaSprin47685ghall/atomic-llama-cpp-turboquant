@@ -1,0 +1,1154 @@
+{
+  "schema": "tq.tp5.acceptance.v1",
+  "status": "qualified-selected-configuration",
+  "date": "2026-10-19",
+  "support": {
+    "model": {
+      "path": "build-tp5-runtime/fixtures/Qwen3-8B-Q8_0.gguf",
+      "bytes": 8709519168,
+      "sha256": "0cfbf745760f07a76ddeb358dd025a27f2e11d1ca9c9a4169a373d52990fe86e",
+      "repository": "unsloth/Qwen3-8B-GGUF",
+      "revision": "a6adef130ffb23ddaf1a62fec9dced968c9bc482"
+    },
+    "architecture": "Qwen3 dense 8B; 36layers hidden4096 Q32/KV8 head128 FFN12288",
+    "platform": {
+      "devices": [
+        "0000:0f:00.0",
+        "0000:0c:00.0",
+        "0000:06:00.0",
+        "0000:09:00.0",
+        "0000:03:00.0"
+      ],
+      "hip_runtime_version": 71526333,
+      "execution_mode": "tp5-relay",
+      "numeric_policy": "q8_0-decoded-weights-f32-activations-ordered-f32",
+      "native_profile": "gfx1030 five RX6800; HIP graphs OFF; no peer copy; FA compiled ON, runtime default OFF"
+    },
+    "requests": {
+      "maximum": 4,
+      "reservation_tokens_each": 512,
+      "windows": [
+        1,
+        2
+      ],
+      "ordinary_greedy": true,
+      "fixed_teacher": true
+    },
+    "flash_attention": {
+      "compiled": true,
+      "explicit_on": "numerical/lifecycle qualified, not performance default",
+      "default": false,
+      "precision": "F32 Q/K/V, online softmax and weighted value accumulation; no silent F16 operand casts"
+    },
+    "hip_graph_capture": false,
+    "gpu_peer_copy": false
+  },
+  "source": {
+    "maintenance_baseline": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "project_head_at_build": "90aa90e2a7d12aeb181dd11c9c04e367034dc2a8",
+    "working_tree_changes_preserved": true,
+    "reviewed_A_paths": 48,
+    "exception_manifest": {
+      "path": "fork/upstream-exceptions.json",
+      "bytes": 60697,
+      "sha256": "fef4c03dc308a8d7c8d14015162b46c751d927d864bc51083a96b8fc44b8ca85"
+    },
+    "boundary_receipt": {
+      "path": "build-tp5-runtime/final-post-index-source-guard.json",
+      "bytes": 60843,
+      "sha256": "761a8f69148c2ef87a445290f7386ef0f3d77e83678f70902166e187c9e252da"
+    },
+    "boundary_tests": {
+      "path": "build-tp5-runtime/final-boundary-tests/exit.json",
+      "bytes": 214,
+      "sha256": "cef55107d2ff729f9d3cd2531c0308400c61c26021bb627ee9db578171cb58b8"
+    },
+    "components": {
+      "independent_B": 7,
+      "composition_C": 7
+    },
+    "A_sources": [
+      {
+        "path": "ggml/src/ggml-cuda/fattn.cu",
+        "sha256": "268bffec70a377171973307db310a3d0a59b551cfd8b252384c7c9cd55f5c32c"
+      },
+      {
+        "path": "ggml/src/ggml-cuda/fattn-banded.cu",
+        "sha256": "9721b70f3acfd2476a5e504901234f30aa6651d8e7c4a69a7396931c18e3504b"
+      },
+      {
+        "path": "ggml/src/ggml-cuda/fattn-banded.cuh",
+        "sha256": "4cb3dce0c8351611a16cc7dad1ffca20f0ae361003bb3d2e53c7251d72ff1ef3"
+      },
+      {
+        "path": "ggml/src/ggml-cuda/mmvq-q8-f32.cuh",
+        "sha256": "94d3f85a95e6f373f49d113451e25424db8e849fe6d68a4e596468c659e3b150"
+      },
+      {
+        "path": "ggml/src/ggml-cuda/mmvq-q8-f32.hip",
+        "sha256": "9889f7cc9841cb122e7efb66ad32c99d61574ae69a40a1a2671ed314c8064b5a"
+      },
+      {
+        "path": "ggml/include/ggml-relay.h",
+        "sha256": "764ddda0843a5b3a76980fbb2aec3518e86616353a38359b7349b08e5068c2cd"
+      },
+      {
+        "path": "ggml/src/ggml-relay-impl.h",
+        "sha256": "5848e5c9ffd2e219d43736c0e05ff12e027515ca5cc86b64521975a4360bb8ac"
+      },
+      {
+        "path": "ggml/src/ggml-cuda/relay.hip",
+        "sha256": "e2f6f5bd7d46ff91ff3edfd8ba6a7418a5123887c0273998df53e61d26ce01b7"
+      },
+      {
+        "path": "ggml/src/ggml-cuda/relay.cuh",
+        "sha256": "d6ffc3e0b6dd4b5cae0568bfa3958b16e8a1fbcdf60bde8b5c09d3073ea5ad3d"
+      },
+      {
+        "path": "ggml/src/ggml-cuda/common.cuh",
+        "sha256": "f4bf280878998ca164adcb36f28a3a50c7f4482c20552b9ecb9cabbef385092a"
+      },
+      {
+        "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
+        "sha256": "5e62c2fa4c5bd362f5febf9dcd6c1d73f1749e746ec9888a21cef226784ecda6"
+      },
+      {
+        "path": "ggml/src/ggml-hip/CMakeLists.txt",
+        "sha256": "a9ac972a52bee244f46791cf4705d05b5b9f7bfde08e80c8f79c07e108189ad5"
+      },
+      {
+        "path": "ggml/CMakeLists.txt",
+        "sha256": "64e32884913d8a7be00ad8a3c3de03567b697289c181c65c3b511a50a5cf04a0"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/CMakeLists.txt",
+        "sha256": "c847306ea27c9cabefd29c5cf0df6bc8fca9916a9a9c780f623359f25b377d65"
+      },
+      {
+        "path": ".github/workflows/fork-extensions.yml",
+        "sha256": "e975f3af5399a42613670a8d810de7d76f9367316a3a64bb49b31a40afc9888c"
+      },
+      {
+        "path": "AGENTS.md",
+        "sha256": "8230df6fdc92832133435a39ec4d15baa357346fbc28b037c2e5f8d7d71100a0"
+      },
+      {
+        "path": "common/arg.cpp",
+        "sha256": "d395a1d926266275ec5df0c6d7e9e72bed221a5e9e7c4b74d84475470c19377f"
+      },
+      {
+        "path": "common/common.cpp",
+        "sha256": "b8ea8bf3ca5832e5256249654c76fec864962174cc61d620ac715231ece5060a"
+      },
+      {
+        "path": "common/common.h",
+        "sha256": "0572a4e92cd211a5ac2ce22c1430bd23998e2e1b347a2f3af4e3e04e6a4be7f2"
+      },
+      {
+        "path": "ggml/include/ggml-backend.h",
+        "sha256": "bfe0c8ed6c5a648de5a9da79fad23ec17010760644801fb245d0649853b79fd9"
+      },
+      {
+        "path": "ggml/include/ggml.h",
+        "sha256": "3a5f74e8d196bb3d284a92b2ae862a51095225b6922a2c939bedd01db8b7ab5b"
+      },
+      {
+        "path": "ggml/src/ggml-backend-meta.cpp",
+        "sha256": "1ac09373905b2c7904b25b8b4a8e1ca9f6e5929552968a411bf2e391b13bf07b"
+      },
+      {
+        "path": "ggml/src/ggml-backend.cpp",
+        "sha256": "b42ea28e0461055af8fe743acbea282615d6454fc34e403fabb2556d171a5211"
+      },
+      {
+        "path": "ggml/src/ggml-cpu/ggml-cpu.c",
+        "sha256": "8cfe7ee653073919ff5d2d8785633bca565a8c7c136157fbaa85980f5c9adfcc"
+      },
+      {
+        "path": "ggml/src/ggml-cpu/ops.cpp",
+        "sha256": "e5b6affc76f02ec3456ace39b626a2175fd70b2c2da3599af4df71e9f06ad00a"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        "sha256": "5302e9a13c7da678d59f5f9308dac4743f0c99e428f72ef1df5c11775fa989ee"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl",
+        "sha256": "8fee3a291996b45db71ddb3203f0a5c37b60b2acea1eab422e60983ed642fa01"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl",
+        "sha256": "c7f7dc96d64bda77dbe893ea115585b824064922c0601249a04d8ca52ac98cc5"
+      },
+      {
+        "path": "ggml/src/ggml-vulkan/vulkan-shaders/turbo_wht.comp",
+        "sha256": "f20b9dde57cfa34461daac288688dc8892fb6fad2303a07a17df188967970827"
+      },
+      {
+        "path": "ggml/src/ggml.c",
+        "sha256": "5f49b8219ad0604067d84ef3953cfc0485b0cd1a4b375dc2f34f8ac28eb740ad"
+      },
+      {
+        "path": "include/llama.h",
+        "sha256": "bad66f3437131f8219070587d366111c325695b17caacccdbf90b6e8e56c9290"
+      },
+      {
+        "path": "src/llama-attention-view.h",
+        "sha256": "fe8b08c29d18d099ffdaba2c3ba416175bdc76fd8081ecb61f5fe816005860d3"
+      },
+      {
+        "path": "src/llama-context.cpp",
+        "sha256": "0c8c50da2571e2640c62c87638eaa27f7c52c6f89edbc52c51455ca86c953876"
+      },
+      {
+        "path": "src/llama-context.h",
+        "sha256": "a097c9435ccb2472c9eb4b6d02a1811b23e8d3a183320d759b961911df5e8fc8"
+      },
+      {
+        "path": "src/llama-cparams.h",
+        "sha256": "f36eb2da24e040e9211ba533515bf2820bf3e13eb6efc5c0e61b2e7e03951292"
+      },
+      {
+        "path": "src/llama-graph.cpp",
+        "sha256": "968a989d66a9002bd2259c7b5460ea183ca7b02f659052db122786c6f976a0fb"
+      },
+      {
+        "path": "src/llama-graph.h",
+        "sha256": "087693cb84344308b74dc7505c82f707124ff7d701c54b8d50ecf2408bdeaf17"
+      },
+      {
+        "path": "src/llama-kv-cache.cpp",
+        "sha256": "839df30582f517eec4715ff46b323fb57a773500675b9e84fbd5f6f04b7c4da5"
+      },
+      {
+        "path": "src/llama-kv-cache.h",
+        "sha256": "e230833526353e57beb9113162f002122bf8c63eb6de8d7e310abaaac50a04fa"
+      },
+      {
+        "path": "src/llama-memory-hybrid.h",
+        "sha256": "53229d1857b624ad9f4bfeceb7a2ba922c1a231b1044acd3d210dc223ef8e61f"
+      },
+      {
+        "path": "src/llama-memory-recurrent.cpp",
+        "sha256": "cd13ab45e4d44346210f5320917bb00300a8897708fa90328a5a5dbf9af77c5e"
+      },
+      {
+        "path": "src/llama-memory-recurrent.h",
+        "sha256": "8f79b71f2935ee2a8ec81f7ea8550e37ba6c3dce9ca31a5a24e1c811689a3eea"
+      },
+      {
+        "path": "src/llama-memory.h",
+        "sha256": "5c29cfca2695cf3aec7f6dbd8e1747630e7ec641fa0ad180d9d0a0618a9fc314"
+      },
+      {
+        "path": "src/llama-model.cpp",
+        "sha256": "b054e70665348da2949e9b18267885b8a0f76a135315db6a87c3841a516019a2"
+      },
+      {
+        "path": "src/llama-sampler.cpp",
+        "sha256": "f138e86df8ea5e288fa46f719e4d8b614bf0a14fb1906dda4a0330f39aa71538"
+      },
+      {
+        "path": "tools/server/server-context.cpp",
+        "sha256": "a5892b7e9101f08a05769387758e736c038bc22fd70afad43d9b07f013041e2d"
+      },
+      {
+        "path": "tools/server/server-task.h",
+        "sha256": "1505c19411c4dc0d5a498ff5dab554bee01e9324ab542f6e2740106c38679a7e"
+      },
+      {
+        "path": "tools/server/server.cpp",
+        "sha256": "603018e5ae36a41ca4abbf45bdf0efebb73027a1f7e6a4ce338aa2a53c0c35a3"
+      }
+    ],
+    "product_sources": [
+      {
+        "path": "fork/build.py",
+        "bytes": 5601,
+        "sha256": "909ea0c7195048634fdbde0289641f915c0e8964036925f1cb4525e04772b9f4"
+      },
+      {
+        "path": "fork/tp5-compose/CMakeLists.txt",
+        "bytes": 3686,
+        "sha256": "aa00f5540bf3b5a24f3280c893b8679015d921659c9d7ad2c5d347ec710ef65a"
+      },
+      {
+        "path": "fork/tp5-compose/include/tq/tp5/runtime.h",
+        "bytes": 4679,
+        "sha256": "7bc9123d75fadc38949c191010a0607c9a307b04de4bd57e62c98ecd042cccd6"
+      },
+      {
+        "path": "fork/tp5-compose/src/main.cpp",
+        "bytes": 31774,
+        "sha256": "24529549c05610e217fbe2fc5b7370299f82189b89f6c6f2f5915cdb63a1d4cb"
+      },
+      {
+        "path": "fork/tp5-compose/src/runtime.cpp",
+        "bytes": 34359,
+        "sha256": "b4b5f1185bf396842d2c4267f9af526eab104fca2654f5032881de520e29357b"
+      },
+      {
+        "path": "fork/tp5-compose/tests/real-tp5.py",
+        "bytes": 31220,
+        "sha256": "064a87ec09699e426d9d1a72325dcf1700ad468f53d4fce12bf4c05724c94a90"
+      },
+      {
+        "path": "fork/tp5-compose/tests/test-q8-f32.cpp",
+        "bytes": 7527,
+        "sha256": "8f5772945313568b4e1eb595d3f3a1e7d2fff8088513280d3cd398e9be6f92a6"
+      },
+      {
+        "path": "fork/tp5-compose/tests/test-flash-f32.cpp",
+        "bytes": 14066,
+        "sha256": "8557ece069ea0ed95c61fc351df4de744c1e70f7a08557fd24b73bf17f36b81c"
+      },
+      {
+        "path": "fork/tp5-compose/cmake/TQTP5ComposeConfig.cmake.in",
+        "bytes": 307,
+        "sha256": "e63d66bb1c70d504eb0ff8d32c338843d6edfdb1a953f155b3465fa37503d22c"
+      }
+    ]
+  },
+  "build": {
+    "entry": "python3 fork/build.py --backend hip --tp5 --hip-root /opt/rocm/core-10.0 --build-dir build-tp5-runtime --jobs 8",
+    "receipt": {
+      "path": "build-tp5-runtime/final-hip-build-qualified/exit.json",
+      "bytes": 346,
+      "sha256": "2b44da151065b80ea2450c19454f2fdf4bb5285eee73470d64e000e8a841ea62"
+    },
+    "log": {
+      "path": "build-tp5-runtime/final-hip-build-qualified/stdout.log",
+      "bytes": 230673,
+      "sha256": "ecb673462a35f36b3e04a598c3755508221ed1bd4702c1887efb808235f965f9"
+    },
+    "A_public_seam_tests_passed": 11,
+    "Cxx_formatter": "not run: clang-format binary unavailable; no formatting claim"
+  },
+  "numerical": {
+    "fa_on_full8": {
+      "receipt": {
+        "path": "build-tp5-runtime/acceptance-fa-final/summary.json",
+        "bytes": 15723,
+        "sha256": "f42cf3f9ff6a00007b05298d50415932bb0468a4c3e6fb0b2f3f1a3c638e684c"
+      },
+      "selected_cases": [
+        "main",
+        "slow",
+        "cancel",
+        "abort"
+      ],
+      "all_case_selection_passed": true,
+      "rows": 32,
+      "logits": 4861952,
+      "max_absolute_error": 2.193450927734375e-05,
+      "max_relative_l2": 1.5382966086639344e-06,
+      "outside_tolerance": 0,
+      "atol": 0.002,
+      "rtol": 0.001
+    },
+    "fa_off_full8": {
+      "receipt": {
+        "path": "build-tp5-runtime/acceptance-fa-off-final/summary.json",
+        "bytes": 15846,
+        "sha256": "7ff401748c28ce7f380d8933bf847a74ea2785a3b702094cb475f5bce0ed3f90"
+      },
+      "selected_cases": [
+        "main",
+        "slow",
+        "cancel",
+        "abort"
+      ],
+      "all_case_selection_passed": true,
+      "rows": 32,
+      "logits": 4861952,
+      "max_absolute_error": 2.193450927734375e-05,
+      "max_relative_l2": 1.5382966086639344e-06,
+      "outside_tolerance": 0,
+      "atol": 0.002,
+      "rtol": 0.001
+    },
+    "fa_on_main32": {
+      "receipt": {
+        "path": "build-tp5-runtime/acceptance-fa-f32-long/summary.json",
+        "bytes": 7446,
+        "sha256": "3da02878ec788fbef564f501b73b47b8d5b029cc6199e9748101f170c0261d4a"
+      },
+      "selected_cases": [
+        "main"
+      ],
+      "all_case_selection_passed": false,
+      "rows": 128,
+      "logits": 19447808,
+      "max_absolute_error": 9.059906005859375e-05,
+      "max_relative_l2": 7.175087193869005e-06,
+      "outside_tolerance": 0,
+      "atol": 0.002,
+      "rtol": 0.001
+    },
+    "relocated_fa_on_main4": {
+      "receipt": {
+        "path": "build-tp5-runtime/hip-package-proof/full-logits/summary.json",
+        "bytes": 7599,
+        "sha256": "09ecba49bb3064f9e4a73d06330115949c96b60e8d5deafc42a0e35b56c52e2f"
+      },
+      "selected_cases": [
+        "main"
+      ],
+      "all_case_selection_passed": false,
+      "rows": 16,
+      "logits": 2430976,
+      "max_absolute_error": 2.193450927734375e-05,
+      "max_relative_l2": 1.5382966086639344e-06,
+      "outside_tolerance": 0,
+      "atol": 0.002,
+      "rtol": 0.001
+    }
+  },
+  "lifecycle": {
+    "FA_on_full8": {
+      "reference": {
+        "mode": "single-gpu-reference",
+        "flash_attention": true,
+        "requests": 4,
+        "tokens": 32,
+        "max_simultaneous_windows": 1,
+        "rank_bdfs": [
+          [
+            "",
+            "",
+            "",
+            "",
+            ""
+          ]
+        ],
+        "reserved_tokens_after_close": 0,
+        "active_requests_after_close": 0
+      },
+      "relay-teacher": {
+        "mode": "tp5-relay",
+        "flash_attention": true,
+        "requests": 4,
+        "tokens": 32,
+        "max_simultaneous_windows": 2,
+        "rank_bdfs": [
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ],
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ]
+        ],
+        "reserved_tokens_after_close": 0,
+        "active_requests_after_close": 0,
+        "sampled_vs_emitted_differences": 0
+      },
+      "slow-consumer": {
+        "mode": "tp5-relay",
+        "flash_attention": true,
+        "requests": 4,
+        "tokens": 32,
+        "max_simultaneous_windows": 2,
+        "rank_bdfs": [
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ],
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ]
+        ],
+        "reserved_tokens_after_close": 0,
+        "active_requests_after_close": 0,
+        "delay_ms": 2000,
+        "delayed_window_duration_ns": 4883279186,
+        "tokenized_prompt_lengths": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "other_window_commits_before_first_delayed_token": 2
+      },
+      "cancel-request": {
+        "mode": "tp5-relay",
+        "flash_attention": true,
+        "requests": 4,
+        "tokens": 26,
+        "max_simultaneous_windows": 2,
+        "rank_bdfs": [
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ],
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ]
+        ],
+        "reserved_tokens_after_close": 0,
+        "active_requests_after_close": 0,
+        "survivors_with_commits_after_cancel": [
+          1,
+          2,
+          3
+        ]
+      },
+      "abort": {
+        "nonzero_bounded_exit": true,
+        "success_report_absent": true,
+        "injection_marker_observed": true,
+        "caught_exception_exit": true,
+        "abort_window": 0,
+        "abort_channel": 0,
+        "elapsed_ns": 17951581676,
+        "returncode": 1,
+        "native_drain_receipts": [
+          {
+            "window": 0,
+            "epoch": 1,
+            "attempted": 31,
+            "accepted": 31,
+            "unknown": 0,
+            "completed": 31,
+            "sealed": 1,
+            "finished": 1,
+            "error": 1
+          },
+          {
+            "window": 1,
+            "epoch": 1,
+            "attempted": 31,
+            "accepted": 31,
+            "unknown": 0,
+            "completed": 31,
+            "sealed": 1,
+            "finished": 1,
+            "error": 1
+          }
+        ],
+        "request_reservations_released": true
+      }
+    },
+    "FA_off_full8": {
+      "reference": {
+        "mode": "single-gpu-reference",
+        "flash_attention": false,
+        "requests": 4,
+        "tokens": 32,
+        "max_simultaneous_windows": 1,
+        "rank_bdfs": [
+          [
+            "",
+            "",
+            "",
+            "",
+            ""
+          ]
+        ],
+        "reserved_tokens_after_close": 0,
+        "active_requests_after_close": 0
+      },
+      "relay-teacher": {
+        "mode": "tp5-relay",
+        "flash_attention": false,
+        "requests": 4,
+        "tokens": 32,
+        "max_simultaneous_windows": 2,
+        "rank_bdfs": [
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ],
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ]
+        ],
+        "reserved_tokens_after_close": 0,
+        "active_requests_after_close": 0,
+        "sampled_vs_emitted_differences": 0
+      },
+      "slow-consumer": {
+        "mode": "tp5-relay",
+        "flash_attention": false,
+        "requests": 4,
+        "tokens": 32,
+        "max_simultaneous_windows": 2,
+        "rank_bdfs": [
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ],
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ]
+        ],
+        "reserved_tokens_after_close": 0,
+        "active_requests_after_close": 0,
+        "delay_ms": 2000,
+        "delayed_window_duration_ns": 3587139663,
+        "tokenized_prompt_lengths": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "other_window_commits_before_first_delayed_token": 2
+      },
+      "cancel-request": {
+        "mode": "tp5-relay",
+        "flash_attention": false,
+        "requests": 4,
+        "tokens": 26,
+        "max_simultaneous_windows": 2,
+        "rank_bdfs": [
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ],
+          [
+            "0000:0f:00.0",
+            "0000:0c:00.0",
+            "0000:06:00.0",
+            "0000:09:00.0",
+            "0000:03:00.0"
+          ]
+        ],
+        "reserved_tokens_after_close": 0,
+        "active_requests_after_close": 0,
+        "survivors_with_commits_after_cancel": [
+          1,
+          2,
+          3
+        ]
+      },
+      "abort": {
+        "nonzero_bounded_exit": true,
+        "success_report_absent": true,
+        "injection_marker_observed": true,
+        "caught_exception_exit": true,
+        "abort_window": 0,
+        "abort_channel": 0,
+        "elapsed_ns": 14847449140,
+        "returncode": 1,
+        "native_drain_receipts": [
+          {
+            "window": 0,
+            "epoch": 1,
+            "attempted": 31,
+            "accepted": 31,
+            "unknown": 0,
+            "completed": 31,
+            "sealed": 1,
+            "finished": 1,
+            "error": 1
+          },
+          {
+            "window": 1,
+            "epoch": 1,
+            "attempted": 31,
+            "accepted": 31,
+            "unknown": 0,
+            "completed": 31,
+            "sealed": 0,
+            "finished": 1,
+            "error": 1
+          }
+        ],
+        "request_reservations_released": true
+      }
+    },
+    "additional_delay_peer_abort": {
+      "receipt": {
+        "path": "build-tp5-runtime/hip-package-proof/delay-abort-valid/summary.json",
+        "bytes": 672,
+        "sha256": "89bfca105f8e31284005e6c0a207653ed0a8c7fbffdfba1609a678794692f4fa"
+      },
+      "limit": "Requested W0 delay and observed W1 abort; exact deferred-borrow branch not separately instrumented"
+    }
+  },
+  "primitive_oracles": {
+    "q8_f32_cases": 170,
+    "fused_FA_F32": {
+      "status": "passed",
+      "devices": [
+        "ROCm0",
+        "ROCm1",
+        "ROCm2",
+        "ROCm3",
+        "ROCm4"
+      ],
+      "cases": 180,
+      "fixed_atol": 2e-05,
+      "fixtures": [
+        "f16-exact",
+        "f32-masked-nan",
+        "f32-non-f16-exact"
+      ],
+      "max_absolute_error": 2.24640083e-06,
+      "errors": 0,
+      "nonfinite": 0,
+      "sources_and_guards_preserved": true
+    },
+    "receipt": {
+      "path": "build-tp5-runtime/fa-final-oracles/LastTest.log",
+      "bytes": 56406,
+      "sha256": "c8415979a7049ef57b965b412f8eac797a2b9b00c0d3f8f0944583e5e04492d5"
+    },
+    "unchanged_F64_FA_gate_absolute": 2e-05,
+    "earlier_failure_to_pass": {
+      "path": "build-tp5-runtime/fa-oracle-before-after.json",
+      "bytes": 775,
+      "sha256": "b8ab0189eb51aa969dc49154532e21713c8e0eb68439ee3898782992bce65598"
+    }
+  },
+  "host_memory": {
+    "current_long_prefill": {
+      "status": "passed",
+      "scope": "host A/C memory sanitizer, current full F32 attention and no-output prefill fix",
+      "request_prompt_tokens": [
+        193,
+        193,
+        193,
+        193
+      ],
+      "tokens": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "native_drained": true,
+      "max_simultaneous_windows": 2,
+      "reservations_after_close": 0,
+      "asan_options": "detect_leaks=0:abort_on_error=1",
+      "limits": [
+        "HIP kernels are not GPU-sanitized",
+        "leak detection disabled",
+        "earlier short main+abort ASan has its own candidate scope"
+      ],
+      "report": {
+        "path": "build-tp5-runtime/asan-long-final.json",
+        "bytes": 8609,
+        "sha256": "a0eac879a7a31896eb656b9d844814fecd3572a0bf7e2c542a9c2e7832ceb9ca"
+      }
+    },
+    "older_short_main_abort": {
+      "path": "build-tp5-runtime/acceptance-fa-asan/summary.json",
+      "bytes": 10201,
+      "sha256": "90b2c311bc256cf66a54f35bbe2383ddca7076a021901594171c4874e81ef5cc"
+    },
+    "earlier_shared_metadata_UAF_and_repair": {
+      "path": "build-tp5-runtime/smoke/asan-ownership-before-after.json",
+      "bytes": 1469,
+      "sha256": "65e08194a33c972ba04d1317b21090a018c604218a6607045731abb17bc91f6e"
+    },
+    "limits": [
+      "host-only A/C ASan, not GPU memory sanitizer",
+      "leak detection disabled",
+      "not an all-schedule proof"
+    ]
+  },
+  "actual_kernel_dispatch": {
+    "receipt": {
+      "path": "build-tp5-runtime/hip-package-proof/final-dispatch-summary.json",
+      "bytes": 2079,
+      "sha256": "ac1fb8999414c8e8cf26b6e0e9762d4fb514d602f18f89776afa12a5ad1e074e"
+    },
+    "on_total": 720,
+    "on_per_physical_device": 144,
+    "off_total": 0,
+    "devices": [
+      "0000:0f:00.0",
+      "0000:0c:00.0",
+      "0000:06:00.0",
+      "0000:09:00.0",
+      "0000:03:00.0"
+    ],
+    "trace_is_not_speed_measurement": true
+  },
+  "package": {
+    "receipt": {
+      "path": "build-tp5-runtime/hip-package-proof/summary.json",
+      "bytes": 5925,
+      "sha256": "1b873410f4b20e06d586c7e88d2ce2807e3f35cd01493afdb54764b12a9b3449"
+    },
+    "fresh_installations": 15,
+    "prefix_moved": true,
+    "original_prefix_absent_during_verification": true,
+    "original_stage_absent_during_verification": true,
+    "original_prefix_restored": true,
+    "external_public_consumer": {
+      "path": "build-tp5-runtime/hip-package-proof/consumer-explicit-fa-on.stdout",
+      "bytes": 69,
+      "sha256": "b105bcb5d1e2d14cb5ec0abe4d6627926c81151b7bdb1f4c23c68ac1729e3a85"
+    },
+    "compile_search_paths": {
+      "path": "build-tp5-runtime/hip-package-proof/compile-path-validation.json",
+      "bytes": 257,
+      "sha256": "93b73306be0c729eb6ad6a36f22230ef7ea57c421b4ecabc9458a71b1357ba99"
+    },
+    "actual_libraries": {
+      "path": "build-tp5-runtime/hip-package-proof/consumer-ldd.stdout",
+      "bytes": 3621,
+      "sha256": "28b7ad9c7aadf6dffef4fec53bdc3b44b27d2e9f4ab7cb25aabf9746010d9fc1"
+    },
+    "default_single_request_and_three_row_on": true,
+    "relocated_main_only_logits": {
+      "path": "build-tp5-runtime/hip-package-proof/full-logits/summary.json",
+      "bytes": 7599,
+      "sha256": "09ecba49bb3064f9e4a73d06330115949c96b60e8d5deafc42a0e35b56c52e2f"
+    },
+    "payload_manifest": {
+      "path": "build-tp5-runtime/hip-package-proof/bundle-manifest.json",
+      "bytes": 27337,
+      "sha256": "7eb5e4a31e3d81f9deb69b8bb58e0214fa2d10882ada7a51b66397b9ab95b17c"
+    },
+    "canonical_payload_manifest_sha256": "39b84e2a28e3adf54cbb42fb45af8099daf014d0daa8b0de944945cb8e232371",
+    "native_images_equal_to_measurement": {
+      "path": "build-tp5-runtime/hip-package-proof/performance-image-binding.json",
+      "bytes": 877,
+      "sha256": "93d01734a60405e209029873be34230a2dd3c5f95d98418582b6fd9a48d5472e"
+    },
+    "published_cli": {
+      "path": "build-tp5-runtime/hip-package-proof/relocated/bin/tq-tp5-compose",
+      "bytes": 200896,
+      "sha256": "440cfc23ac0cfa1b2fecd4651f48c1ac0d50923b6aa5d4867681aae497f0b23a"
+    },
+    "installed_helper": "<prefix>/share/TQTP5Compose/real-tp5.py",
+    "CLI_boundary_checks": {
+      "path": "build-tp5-runtime/hip-package-proof/final-cli-contracts.json",
+      "bytes": 2615,
+      "sha256": "6e1c261324a8ed187a39db4504a3bba0b58117e8177ea73e9b935e02b2d513d7"
+    },
+    "older_source_isolation": {
+      "receipt": {
+        "path": "build-tp5-runtime/isolation/result.json",
+        "bytes": 59085,
+        "sha256": "7602b36f9fd1459f68615a7ef4c4816a74acdbcf8a666571c6aa023930dedaab"
+      },
+      "commands": 85,
+      "reviewed_A_paths_in_that_candidate": 45,
+      "not_relabelled_as_current_48_path_full_archive_isolation": true
+    }
+  },
+  "performance": {
+    "status": "measured-supported-workload",
+    "receipt": {
+      "path": "build-tp5-runtime/per-stream-fa-final/summary.json",
+      "bytes": 28510,
+      "sha256": "85ceb9b8234cad4ca43b1cbdf819e634e058fc718b3d96d56ef8a802ee46822a"
+    },
+    "preregistration": {
+      "path": "build-tp5-runtime/per-stream-fa-final/preregistration.json",
+      "bytes": 31383,
+      "sha256": "6f55296f700dc8fb725a0a5a4d285515b00191a63d652e245941fecf4613ad84"
+    },
+    "raw_process_receipt": {
+      "path": "build-tp5-runtime/per-stream-fa-final/execution.json",
+      "bytes": 6203,
+      "sha256": "8f24a0e652a775620a46a0c641e2fb39e9e1470661dabefa5d48e9916fe92ced"
+    },
+    "independent_blocks": 3,
+    "requests_each": 4,
+    "prompt_tokens_each": 193,
+    "teacher_outputs_each": 32,
+    "intervals_per_request": 31,
+    "conditions": [
+      {
+        "flash_attention": false,
+        "windows": 1,
+        "blocks": 3,
+        "requests_per_block": 4,
+        "geomean_stream_tokens_per_second": 8.985322565124855,
+        "worst_stream_geomean_tokens_per_second": 8.98526694033955,
+        "geomean_ttft_ms": 25568.12988513514,
+        "per_request": [
+          {
+            "id": 0,
+            "steady_tokens_per_second": 8.98526694033955,
+            "p95_itl_ms_median_blocks": 137.053626
+          },
+          {
+            "id": 1,
+            "steady_tokens_per_second": 8.98527126510623,
+            "p95_itl_ms_median_blocks": 137.07505
+          },
+          {
+            "id": 2,
+            "steady_tokens_per_second": 8.985319732626786,
+            "p95_itl_ms_median_blocks": 137.073765
+          },
+          {
+            "id": 3,
+            "steady_tokens_per_second": 8.985432323416287,
+            "p95_itl_ms_median_blocks": 137.036374
+          }
+        ]
+      },
+      {
+        "flash_attention": false,
+        "windows": 2,
+        "blocks": 3,
+        "requests_per_block": 4,
+        "geomean_stream_tokens_per_second": 15.418513338926749,
+        "worst_stream_geomean_tokens_per_second": 15.41454398491527,
+        "geomean_ttft_ms": 14059.563569818576,
+        "per_request": [
+          {
+            "id": 0,
+            "steady_tokens_per_second": 15.422417175574237,
+            "p95_itl_ms_median_blocks": 66.223728
+          },
+          {
+            "id": 1,
+            "steady_tokens_per_second": 15.41454398491527,
+            "p95_itl_ms_median_blocks": 66.306442
+          },
+          {
+            "id": 2,
+            "steady_tokens_per_second": 15.422426978667335,
+            "p95_itl_ms_median_blocks": 66.224697
+          },
+          {
+            "id": 3,
+            "steady_tokens_per_second": 15.41466719809945,
+            "p95_itl_ms_median_blocks": 66.240769
+          }
+        ]
+      },
+      {
+        "flash_attention": true,
+        "windows": 1,
+        "blocks": 3,
+        "requests_per_block": 4,
+        "geomean_stream_tokens_per_second": 7.7510138293689685,
+        "worst_stream_geomean_tokens_per_second": 7.750962617376016,
+        "geomean_ttft_ms": 26719.37036606503,
+        "per_request": [
+          {
+            "id": 0,
+            "steady_tokens_per_second": 7.750966277216271,
+            "p95_itl_ms_median_blocks": 183.818931
+          },
+          {
+            "id": 1,
+            "steady_tokens_per_second": 7.751035555510719,
+            "p95_itl_ms_median_blocks": 183.829063
+          },
+          {
+            "id": 2,
+            "steady_tokens_per_second": 7.751090868101208,
+            "p95_itl_ms_median_blocks": 183.829457
+          },
+          {
+            "id": 3,
+            "steady_tokens_per_second": 7.750962617376016,
+            "p95_itl_ms_median_blocks": 183.828864
+          }
+        ]
+      },
+      {
+        "flash_attention": true,
+        "windows": 2,
+        "blocks": 3,
+        "requests_per_block": 4,
+        "geomean_stream_tokens_per_second": 13.464216278431504,
+        "worst_stream_geomean_tokens_per_second": 13.463044215961943,
+        "geomean_ttft_ms": 14748.35074733874,
+        "per_request": [
+          {
+            "id": 0,
+            "steady_tokens_per_second": 13.465370843773677,
+            "p95_itl_ms_median_blocks": 77.830624
+          },
+          {
+            "id": 1,
+            "steady_tokens_per_second": 13.463162472656341,
+            "p95_itl_ms_median_blocks": 77.797166
+          },
+          {
+            "id": 2,
+            "steady_tokens_per_second": 13.465287765724433,
+            "p95_itl_ms_median_blocks": 77.789073
+          },
+          {
+            "id": 3,
+            "steady_tokens_per_second": 13.463044215961943,
+            "p95_itl_ms_median_blocks": 77.802084
+          }
+        ]
+      }
+    ],
+    "decision": {
+      "selected_default_flash_attention": false,
+      "selected_default_windows": 2,
+      "reason": "Measured same-work FA-on/off two-window speed ratio excludes 1 below 1; preserve explicit numerically/lifecycle-qualified FA-on without claiming speedup.",
+      "FA_on_vs_off_two_windows": {
+        "comparison": "FA-on/off two windows",
+        "independent_blocks": 3,
+        "speed_ratio": 0.8732499679095989,
+        "speed_ratio_95_ci": [
+          0.839663276462865,
+          0.9081801334297616
+        ],
+        "method": "paired per-block mean of four per-request log speed ratios; Student t df=2",
+        "block_log_speed_ratios": [
+          -0.1263033431769464,
+          -0.12653297235124203,
+          -0.15376398060212254
+        ]
+      },
+      "default_two_vs_one_window_speed_ratio": 1.7159665918696485,
+      "default_two_vs_one_window_95_ci": [
+        1.2859832747850972,
+        2.289719782634657
+      ],
+      "independent_blocks": 3,
+      "clock_limit": "ttft_ms is admission-to-first-committed-token, excludes model/context startup, queueing and network",
+      "short_tail_limit": "31 ITLs per request/process cannot qualify population p99",
+      "performance_image": {
+        "case": "block-0-fa-0-windows-1",
+        "returncode": 0,
+        "elapsed_ns": 42574803148,
+        "binary_sha256": "f206be7d39c969c6e7d734baa68ae4fed633c6ee38d208ee7161869937a884d0",
+        "library_sha256": {
+          "libllama.so": "60f0369bf10087dab499020c2a29517f31a65b9df31df4c83eb858349fd1d010",
+          "libggml-base.so": "74b19aeaa37fe75c2b3308207c6527ce32d01f23b0b04bd0f438adaf2e67dcce",
+          "libggml-hip.so": "09e530a0cb4c3043c9326a471feb71c7b4afbf0d051fa149c20100c18aeea1ac"
+        }
+      }
+    },
+    "no_profiler_or_logit_capture_or_other_GPU_work_during_measurement": true,
+    "limits": [
+      "p99 is near sample maximum, not a qualified population-tail estimate",
+      "admission-to-first-commit excludes model/context startup, queueing and network",
+      "no universal model/hardware/long-context speed claim"
+    ]
+  },
+  "retained_rejections_and_negative_results": {
+    "numerical": [
+      {
+        "name": "native_q8_activation_loss",
+        "receipt": {
+          "path": "build-tp5-runtime/acceptance-native-layout-fixed/summary.json",
+          "bytes": 7533,
+          "sha256": "53644bef23f5b3dd4fcf7a77b4ed562fd238c0ba6ccb7bb7631408d588a9f1e6"
+        },
+        "status": "failed",
+        "max_absolute_error": 0.42545080184936523,
+        "error_count": 969809
+      },
+      {
+        "name": "native_fa_half_arithmetic",
+        "receipt": {
+          "path": "build-tp5-runtime/acceptance-fa-on/summary.json",
+          "bytes": 7471,
+          "sha256": "4286736d7e4e96461976f9332fb0c8e05c834680a6cd5130d25969b2453913ad"
+        },
+        "status": "failed",
+        "max_absolute_error": 0.005507469177246094,
+        "error_count": 2387
+      },
+      {
+        "name": "f32_probability_but_wrong_operand_gate",
+        "receipt": {
+          "path": "build-tp5-runtime/acceptance-fa-precise/summary.json",
+          "bytes": 7531,
+          "sha256": "bbbd6765f21a92ba5bcf55a41d263966cb753ace94363fe43f1543bcf60acfee"
+        },
+        "status": "failed",
+        "max_absolute_error": 0.005507469177246094,
+        "error_count": 2387
+      },
+      {
+        "name": "f32_accumulation_with_f16_operands",
+        "receipt": {
+          "path": "build-tp5-runtime/acceptance-fa-cast/summary.json",
+          "bytes": 7485,
+          "sha256": "2f8c6de5f01133bec0b36f11b6c2840b99fdfaf8eb7f1a9f154b6fc13277048c"
+        },
+        "status": "failed",
+        "max_absolute_error": 0.006798088550567627,
+        "error_count": 3295
+      }
+    ],
+    "pre_mask_performance_regression": {
+      "path": "build-tp5-runtime/per-stream-fa-prefill-fixed/summary.json",
+      "bytes": 28513,
+      "sha256": "836489d02fac19da9af98aa3d83c27ab24b50698a54c62228dcf19fae44bd97e"
+    },
+    "legitimate_empty_prefill_rejection_before_fix": {
+      "path": "build-tp5-runtime/per-stream-fa/block-0-fa-0-windows-1/exit.json",
+      "bytes": 174,
+      "sha256": "13a6230639f66ac0a30c26d4898d5e09ef499e447984072976edefa78fe69dc7"
+    },
+    "harness_errors_preserved": [
+      {
+        "path": "build-tp5-runtime/hip-package-proof/commands.json",
+        "reason": "wrong guessed installed-helper path; corrected using actual install manifest, successful setup not repeated"
+      },
+      {
+        "path": "build-tp5-runtime/hip-package-proof/delay-abort/failure.json",
+        "reason": "wrong delay flag rejected before backend initialization"
+      },
+      {
+        "path": "build-tp5-runtime/fa-asan-command/stderr.log",
+        "reason": "space-separated case selector rejected; valid comma-separated invocation separately passed"
+      }
+    ],
+    "stock_Vulkan_FA_TOPK_failures": "retained in fork/audit/devops-acceptance-20261019.json, not overwritten by TP5/HIP claims"
+  },
+  "verification_helper_sources": {
+    "path": "build-tp5-runtime/retired-verification-programs.json",
+    "bytes": 16718,
+    "sha256": "bf6999c261dd78f28af7b90e80cec59b295c7d7c7b76f99edb65738c912144bc"
+  },
+  "unqualified_or_unsupported": [
+    "LFM2MoE TP5 and other model architectures",
+    "other quantization mixes, GPUs and ROCm versions",
+    "context reservations above512 tokens/request",
+    "MTP/speculative rollback, grammar and arbitrary sampler profiles",
+    "RERoT+TP5 and LoRA",
+    "HIP graph capture",
+    "universal FA speedup, network service latency or population p99",
+    "GPU sanitizer and exhaustive failure-order coverage"
+  ]
+}

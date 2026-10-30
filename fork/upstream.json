@@ -1,0 +1,14 @@
+{
+  "upstream": {
+    "url": "https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant",
+    "branch": "master",
+    "commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "release": "b10298-2.0.0",
+    "remote_checked_utc": "2026-10-18"
+  },
+  "previous_fork": {
+    "commit": "2777543b2358c88cd1c2000f7fa342b764a0e213",
+    "archive_branch": "archive/pre-clean-20261018"
+  },
+  "extension_root": "fork"
+}

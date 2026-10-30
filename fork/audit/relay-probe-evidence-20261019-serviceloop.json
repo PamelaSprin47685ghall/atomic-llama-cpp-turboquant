@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-19",
+  "status": "Service-loop batch complete: the last single-device-testable cells of guide 39.6's completion-and-progress table and the injectable half of guide 39.7's fault table now run on the live device. service_loop_independent_progress closes P07/P09/P10 at the software layer: a detached worker thread drives a full generation loop while the observer only reads status (P07), a bounded service publishes to two simultaneously-ready channels with the fast one completing mid-read of a deterministically slow reader in both orientations (P09, no head-of-line serialization), and shutdown with a resident GPU waiter drains inside the worker before it exits (P10, the join cannot strand live device work). nonfinite_reduction_gate closes F04: the host fold now carries a publication gate (the rank weights sum to 1 mod 2^64, so a corrupted partial — a quiet-NaN bit pattern included — breaks the exact identity deterministically) and the case proves both a flipped bit and a NaN pattern are rejected before publication with nothing written to the output slot; run_relay_round shares the same gate. host_wait_deadline_no_reuse closes F07: a consumer that finishes its whole verified read but withholds the acknowledgment fires the host's bounded wait (the spin_until timeout branch, dead code on a healthy device until now), the slot stays byte-identical, and the stop word recovers the waiter. Five-rank cross-device qualification remains pending the real five-GPU machine.",
+  "all_release_gates_passed": false,
+  "identity": {
+    "repository": "atomic-llama-cpp-turboquant",
+    "branch": "clean/fork-20261018",
+    "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "superseded_batch_commit": "02c857516",
+    "superseded_batch_index": "audit/relay-probe-evidence-20261019-pcases.json",
+    "provenance_note": "The P-case-batch report (b6baeb81) stays byte-identical history; this batch changes the probe binary (three new cases, a checked fold shared by five_stream and the bench, and a worker thread), so the evidence was rerun from the final source and the new SHAs below supersede it. The 21 pre-existing per-device single-card results are identical in meaning."
+  },
+  "source": {
+    "probe_root": "fork/relay-probe",
+    "digests_at_head_before_commit": {
+      "main.cpp": "9142f1153b6029b4d3bc389b7043a0498391a1d65aaa1d886d00144a639ee417",
+      "evidence.cpp": "6508dcb8825be8f51c432bdcdd6632f444ca4c321118ff257dfe82dc9f8f1609",
+      "evidence.h": "83e43b24664f589413ea2d91dea72a9329bb9e1288a2bc305e6b83b36c871f5a",
+      "config-test.cpp": "9263d1f1f9d2fce164e3617bad49effd53e5af5e85412d094f0d53e9df85d8b6",
+      "validate-report.py": "3de8f8a3388bd124b3a8bf62e05e1a6298a0a8b0cdab45b64265136322549d32"
+    },
+    "validator": {
+      "purpose": "Strict evidence validation for the operator on the real machine (guide 53.4).",
+      "self_test": "PASS (registry list appended only, so every fixture now carries the three new cases automatically).",
+      "checked_real_evidence": "both files below validate with exit 0"
+    }
+  },
+  "runtime": {
+    "system": "Linux x86_64",
+    "host_compiler": "GCC 16.2.1",
+    "probe_tu_compiler": "HIP clang (ROCm 7.2.4)",
+    "hip_runtime": "7.2.4",
+    "gpu": "AMD Radeon RX 6800",
+    "gcn_arch": "gfx1030",
+    "device_count": 1,
+    "rounds": 2000,
+    "build_tree": "build-relay-probe-20261019e"
+  },
+  "changes": [
+    "case_service_loop_independent_progress (guide 34.1/34.2, 39.6 P07/P09/P10 software layer): phase 1, a detached worker thread drives channel B through 256 generations while the main thread performs no HIP call and no store (the observer only reads a progress flag; both sides bounded); phase 2, two simultaneously-ready channels where one reader is deterministically slow (delayed_reader) and the service publishes both tickets back to back, with the fast channel completing its verified read while the slow one is still mid-read, in both orientations; phase 3, shutdown with a resident bare waiter on channel A and the worker mid-loop on B: the worker publishes the stop words and drains both streams inside itself before exiting, and the observer only joins afterwards",
+    "case_nonfinite_reduction_gate (guide 35.5, 39.7 F04, 41.6): the host five-way fold now carries a publication gate — the rank weights sum to 1 mod 2^64, so the exact fold identity catches any corrupted partial (a quiet-NaN bit pattern is just another wrong word for these synthetic payloads); a flipped bit and a NaN pattern are both rejected before publication with nothing written to the output slot, and the clean fold passes; run_relay_round and the five_stream case and bench share the same gate",
+    "case_host_wait_deadline_no_reuse (guide 35.8 handoff deadline, 39.7 F07): a read_hold_kernel finishes its whole verified read but withholds the acknowledgment, so the host's spin_until timeout branch — dead code on a healthy device until now — fires at a 400 ms deadline; the slot stays byte-identical (no reuse while a reader is un-acknowledged) and the stop word recovers the waiter",
+    "registry 21 -> 24 cases; validator REGISTRY and config-test registry/count updated in lockstep; record order per device is append-only, so superseded reports keep their exact claim scope",
+    "report limits and README operator section updated: healthy-machine stdout now ends with host_wait_deadline_no_reuse=pass, 24 cases per device on a five-card machine"
+  ],
+  "evidence": {
+    "report": {
+      "path": "build-relay-probe-20261019e/probe-report-final-20261019f.json",
+      "sha256": "01533600f04fbf73795beb7ebecf8fbf35f7e1bccf11a70b7e46465e58bffc73",
+      "qualification": "pass",
+      "validated": "exit 0",
+      "summary": "24-case registry; 23 cases per device: all pass except the expected platform fact host_system_rmw_u64_add=fail; service_loop_independent_progress=pass (worker-driven 256 generations under observer-only status reads; fast channel finishes mid-read of a slow reader in both orientations; shutdown drains inside the worker), nonfinite_reduction_gate=pass (flipped bit and quiet-NaN pattern rejected before publication), host_wait_deadline_no_reuse=pass (400 ms bounded wait fired, slot untouched); five_rank_status=not_run (one device present)."
+    },
+    "bench": {
+      "path": "build-relay-probe-20261019e/probe-bench-final-20261019f.json",
+      "sha256": "05c3f2071b817acfe5d8d49d2319b72e407b7254ac2714a75b3549530106f75e",
+      "validated": "exit 0",
+      "medians": {
+        "host_publish_to_device_ack_ns": 9570,
+        "device_produce_to_host_ready_ns": 7220,
+        "five_stream_relay_cycle_ns": 29890,
+        "host_five_way_fold_bytes_per_second": 72324315003
+      }
+    },
+    "superseded": {
+      "report_sha256": "b6baeb8146e3224cc99b67743233990964d4ec71f61acebb093afa13ab03f5be",
+      "bench_sha256": "d51f2e089de8520d9a18f482718befc11fc7f21ccfee7fc4ca05a793f41fa16e",
+      "note": "Both stay byte-identical in build-relay-probe-20261019d/ as the P-case-batch artifacts."
+    }
+  },
+  "single_card_residual": [
+    "F01 (allocation failure before the first submit), F03 (launch accepted, event record failure), F06 (output extent over capacity), F08 (drain unprovable), F09 (double close), F11 (cancel one request of a window), F12 (retry after error) are not injectable on a healthy single device; their software paths exist (setup-failure record path, bounded sync, per-case error capture) and are code-reviewed, not device-proven",
+    "P03 is closed by multi_group_completion's 2-live-groups-of-8 run; F05 is closed by ticket_semantics' device-side budget expiry; F02 is five-card-only"
+  ],
+  "pending_for_five_card_machine": [
+    "run the probe with HIP_VISIBLE_DEVICES selecting exactly five devices (README operator section)",
+    "expect exit 0, five_rank_status=pass, 24 cases per device; archive stdout/stderr/exit/SHAs",
+    "run validate-report.py on the produced files before shipping them back",
+    "update this index family with the cross-device evidence"
+  ]
+}

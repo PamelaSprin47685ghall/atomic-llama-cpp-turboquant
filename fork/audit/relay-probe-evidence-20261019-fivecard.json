@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-19",
+  "status": "Five-rank path audit batch complete. Three defects in the only never-run code path were found and fixed, one of them live-reproduced on this machine and its fix pinned by a new per-device case. (1) rank_write_kernel published ready to the BASE pointer: all five ranks stomped ready[0] and ready[1..4] never arrived, so the five-card case would have waited out the whole 5 s deadline in round 1 and attributed a phantom stall to rank 1 on the operator's machine — the entire trip would have produced a spurious failure. Fixed to &ready[rank]; the /tmp reproduction showed ready=[1,0,0,0,0] on the live device. (2) run_five_rank's setup-failure pre-check tested record.ordinal < 0, which run_probe's catch always writes non-negative before the five-rank case runs: a broken card on the real machine would be launched into, then misreported as a stall. The check now reads the device_identity outcome and the mapped capability bit instead, so a bad card is attributed before the first kernel launch (the bench got the same mapped guard). (3) The zero-device branch returned exit 0 with qualification=fail; it now returns 1 like the enumeration-failure branch (the zero branch is defensive on ROCm 7.2.4, which errors inside hipGetDeviceCount instead of returning zero). New case five_rank_indexing (registry 24 -> 25, appended) runs the exact cross-device kernel and guarded layout with five streams on ONE device, verifying every rank's payload word and its own ready word for the whole round count; the five-device case and this case now share one rounds protocol (run_rank_rounds), so the loop that will run on the real machine is the same code pinned on every dev machine. Falsification on a scratch worktree with the bug re-injected: five_rank_indexing=fail, 'rank 1 did not publish ready in round 1 within 5 s', exit 1, run bounded — the regression net provably discriminates. HIP_VISIBLE_DEVICES semantics measured: canonical form 0,1,2,3,4 and a trailing comma work; leading/trailing whitespace or an empty value make enumeration error (report still written, exit 1) — documented in the operator README section so a typo can no longer masquerade as a broken machine.",
+  "all_release_gates_passed": false,
+  "identity": {
+    "repository": "atomic-llama-cpp-turboquant",
+    "branch": "clean/fork-20261018",
+    "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
+    "superseded_batch_commit": "6495a5d19",
+    "superseded_batch_index": "audit/relay-probe-evidence-20261019-calib.json",
+    "provenance_note": "The calibration-batch report (b40dd940) and bench (a1505a8c) stay byte-identical history. This batch changes the probe binary (five-rank kernel fix, shared rounds protocol, new case, exit-code and guard fixes), so the evidence was rerun from the final source in a fresh tree; the new SHAs below supersede them. The case registry is append-only (24 -> 25)."
+  },
+  "source": {
+    "probe_root": "fork/relay-probe",
+    "digests_at_head_before_commit": {
+      "main.cpp": "5f886dea05213585a2d74eee98c57164ac3ea7f1ca86fb5fd61ec237c0689deb",
+      "evidence.cpp": "c3d14d4ba8d9fe2e95a2319d976b39165c0ece0825a9bc7b215c1c281cd096d9",
+      "evidence.h": "8299f32ad871b0da780e75d4cfea2b6d9e13c952e506352d09119d6dfe7e05db",
+      "config-test.cpp": "bc51c5659e8ed084c565e70f5896ea62fdb032e8d4c51929833f5124552be3a5",
+      "validate-report.py": "1f3e4f8caee01c7a1f0e0cd8bd889b23ddf609a5485c14ab40847885ff14ca2d",
+      "CMakeLists.txt": "a4017d7457a58af99a79a1612025d1cbe6c4799a754db58c33648e461f263f53"
+    }
+  },
+  "defects": [
+    {
+      "id": "D1",
+      "where": "rank_write_kernel (the five-rank case kernel, never executed on a single-device machine)",
+      "what": "release_store(ready, generation) wrote ready[0] from all five ranks; ready[1..4] stayed unpublished",
+      "effect": "deterministic failure on the real machine: 5 s timeout in round 1, phantom 'rank 1 did not publish ready' attribution",
+      "evidence": "/tmp throwaway reproduction on the live device printed ready=[1,0,0,0,0] with payload and guards correct",
+      "fix": "release_store(&ready[rank], generation)"
+    },
+    {
+      "id": "D2",
+      "where": "run_five_rank setup pre-check",
+      "what": "tested record.ordinal < 0, but run_probe's catch sets ordinal >= 0 for every failed setup before the case runs, so the check could never fire",
+      "effect": "a broken card on the five-card machine would be launched into and misreported as a stall instead of being attributed at setup",
+      "fix": "check device_identity result and the mapped capability bit before the first launch; run_bench got the same mapped guard"
+    },
+    {
+      "id": "D3",
+      "where": "run_probe zero-device branch",
+      "what": "returned write_report's code directly: exit 0 with qualification=fail",
+      "effect": "a script keying on the exit code alone would misread an empty machine as success",
+      "fix": "return written != 0 ? written : 1, matching the enumeration-failure branch; the branch is defensive on ROCm 7.2.4 (hipGetDeviceCount errors instead of returning 0)"
+    }
+  ],
+  "new_case": {
+    "id": "five_rank_indexing",
+    "registry": "appended at the end; 24 -> 25 (validator and config-test updated in lockstep)",
+    "what": "five streams on one device run the exact five-rank kernel against one guarded five_rank_mem; every rank's payload word AND its own ready word are verified each round for the whole --rounds count",
+    "shared_protocol": "run_rank_rounds extracted from run_five_rank and used by both cases: the loop that runs on the real machine is the same code pinned on every dev machine",
+    "falsification": "scratch worktree with D1 re-injected: five_rank_indexing=fail with exact attribution, exit 1, run bounded at ~10 s (5 s timeout + normal cases) — the discriminating power is proven on the live device",
+    "not_what_it_is": "not cross-device qualification; multi-device visibility remains with five_rank_cross_device (first real run still happens on the five-card machine)"
+  },
+  "env_semantics": {
+    "measured_on": "ROCm 7.2.4, RX 6800",
+    "HIP_VISIBLE_DEVICES": [
+      "0 -> one device, works",
+      "0,1 -> one device (extra index ignored), works",
+      "0, -> one device (trailing comma tolerated), works",
+      "' 0' (leading space) -> hipGetDeviceCount errors: report written with qualification=fail, exit 1",
+      "'' (empty) -> hipGetDeviceCount errors: report written with qualification=fail, exit 1",
+      "99 -> hipGetDeviceCount errors: report written with qualification=fail, exit 1"
+    ],
+    "rocr_layer": "ROCR_VISIBLE_DEVICES=99 also errors rather than returning zero; the zero-device report branch is therefore unreachable on this runtime and stays as a defensive consistency fix",
+    "operator_note": "the canonical 0,1,2,3,4 form is documented in the README operator section together with these measured failure shapes"
+  },
+  "runtime": {
+    "system": "Linux x86_64",
+    "host_compiler": "GCC 16.2.1",
+    "probe_tu_compiler": "HIP clang (ROCm 7.2.4)",
+    "gpu": "AMD Radeon RX 6800",
+    "gcn_arch": "gfx1030",
+    "device_count": 1,
+    "rounds": 2000,
+    "build_tree": "build-relay-probe-20261019g",
+    "clock64_calibration_recheck": "tq-clock-rate on the final binary: median 2320.2 MHz (min 2245.0, max 2320.3); the 2.3 GHz budget anchor holds"
+  },
+  "evidence": {
+    "report": {
+      "path": "build-relay-probe-20261019g/probe-report-final-20261019h.json",
+      "sha256": "65146f98ff167bc475d93d8a84fe17208b75ea491affb8e055c3caa13b2e4533",
+      "qualification": "pass",
+      "validated": "exit 0",
+      "summary": "25-case registry; 24 cases per device: all pass except the expected platform fact host_system_rmw_u64_add=fail; five_rank_indexing=pass (every rank's payload and own ready word for 2000 rounds, guards intact); five_rank_status=not_run (one device present)."
+    },
+    "bench": {
+      "path": "build-relay-probe-20261019g/probe-bench-final-20261019h.json",
+      "sha256": "704007326e9f03bd6e704cd8a186fd008e4cd8a3b593977f942e5398b24203c3",
+      "validated": "exit 0",
+      "medians": {
+        "host_publish_to_device_ack_ns": 9670,
+        "device_produce_to_host_ready_ns": 7260,
+        "five_stream_relay_cycle_ns": 29950,
+        "host_five_way_fold_bytes_per_second": 74049493396,
+        "host_five_way_fold_samples": 32,
+        "host_five_way_fold_min_max": [
+          38618774509,
+          77149536750
+        ]
+      }
+    },
+    "superseded": {
+      "report_sha256": "b40dd9407791a9c3bd6719407b1c6197c75caf10827da52980fdc726a9586b26",
+      "bench_sha256": "a1505a8c524f2fc29e2ff430f663e8e5f593cb8b5a2f017ec85dc6c7e08c7b2c",
+      "note": "Both stay byte-identical in build-relay-probe-20261019f/ as the calibration-batch artifacts."
+    }
+  },
+  "verification": [
+    "no-HIP tree rebuilt and ctest 2/2 (config + validator); HIP tree ctest 2/2",
+    "relay release and sanitizer ctests 4/4 each",
+    "validator --self-test PASS; py_compile clean; fork/check-upstream.py exit 0",
+    "clang-format clean on all five C++ files",
+    "clang-tidy (default set, exact compile command via compile_commands.json): zero findings from this batch's diff — the two findings my edits created (rank_stream padding, null-pointer inference) were fixed, and the pre-existing C++ style findings (misc-misplaced-const, two comment-bearing empty catches, performance-no-automatic-move, one suspicious-missing-comma limit string) are now registered in probe AGENTS.md exceptions alongside the four HIP false-positive classes",
+    "authoritative 2000-round run from a fresh tree: qualification=pass, five_rank=not_run, five_rank_indexing=pass; validator exit 0 on both files",
+    "falsification run on a scratch worktree: bug re-injected -> five_rank_indexing=fail with exact attribution, exit 1 (bounded)"
+  ],
+  "single_card_residual": [
+    "cross-device visibility and per-rank attribution across five physical devices: first execution remains on the five-card machine (five_rank_cross_device)",
+    "D2's fixed pre-check can only be exercised end-to-end when a real device fails setup on the five-card machine (its dead-condition bug is eliminated by construction: the checks now read recorded outcomes, not an ordinal that the caller guarantees non-negative)",
+    "F01/F03/F06/F08/F09/F11/F12 stay non-injectable on a healthy single device as in the previous indexes",
+    "tidy findings outside the registered exceptions are zero for this batch's diff; the pre-existing style findings are registered, not fixed, to avoid churn on code this batch does not otherwise change"
+  ],
+  "pending_for_five_card_machine": [
+    "run tq-clock-rate first and record the per-device clock64 table",
+    "run the probe with HIP_VISIBLE_DEVICES=0,1,2,3,4 (exact form, no spaces) selecting exactly five devices",
+    "expect exit 0, five_rank_status=pass, 25 cases per device (24 single-device + five_rank_cross_device), stdout lines ending with five_rank_indexing=pass",
+    "archive stdout, stderr, exit code, report and bench SHAs; run validate-report.py before shipping back",
+    "update this index family with the cross-device evidence"
+  ]
+}
