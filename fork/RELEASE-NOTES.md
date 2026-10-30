@@ -1,3 +1,9 @@
+## 2026-10-30：TP5 双请求 MTP ready snapshot 源码交付
+
+此版本移植 2026-10-25 ready snapshot 的合并源码补丁；默认保留 post-submit unlock 关闭的配置。历史正式运行在五张 RX 6800、F32 relay、Flash Attention、两路各 262144 KV 和 512 token 下，包含全部 511 个间隔，观察到 51.23 / 52.09 tok/s；短测 logits 与参考逐位一致。结果来自历史隔离安装，不是本次提交的重建测试，也不保证其他环境达到该性能。
+
+快照历史复现闭包位于原机器 `mtp-endtoend-20261024/mtp-ready-snapshot-consolidated-20261025/`；它复用历史对象和本机模型，不能据此宣称本提交已从干净源码完整重建或通过设备验收。row-tail 56.77 / 58.93 tok/s 是另一候选，未包含于此版本。未合入未验收的 FA true-len、provider 归属、prefab 或 LateBind 默认开启候选。
+
 <!-- two-requests-current-status-20261021 -->
 ## 2026-10-21：双请求保留版本与最终测量；每路 47 tok/s 目标未达到
 

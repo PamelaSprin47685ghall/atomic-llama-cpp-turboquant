@@ -87,7 +87,7 @@ public:
         // position the next token of this sequence must have; -1 means the window is not trusted
         llama_pos next_pos = -1;
 
-        // the tokens at [next_pos - toks.size(), next_pos), oldest first, at most ple_ngram_size - 1
+        // the tokens at [next_pos - toks.size(), next_pos), oldest first, at most ple_hist_capacity()
         // it can be shorter near a sequence start or after a rewind; the caller pads the front with EOS
         std::vector<llama_token> toks;
     };
@@ -95,6 +95,9 @@ public:
     // history for seq_id, default-constructed (and so untrusted) on first use
     // const because set_input updates it through a const memory context
     ple_history & ple_hist_get(llama_seq_id seq_id) const;
+
+    // Retain the hash predecessors plus the maximum supported recurrent rewind.
+    size_t ple_hist_capacity() const;
 
 private:
     // forget seq_id (or, for seq_id < 0, everything) in every cache at once, so that a restore
@@ -166,6 +169,7 @@ public:
 
     // [TAG_PLE_HISTORY] the per-sequence n-gram history of the owning memory, for set_input
     llama_memory_hybrid_idx::ple_history & get_ple_hist(llama_seq_id seq_id) const;
+    size_t ple_hist_capacity() const;
 
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:

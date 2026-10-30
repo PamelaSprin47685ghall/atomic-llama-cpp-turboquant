@@ -6,6 +6,8 @@
 
 #include <cstdint>
 #include <limits>
+#include <cstdlib>
+#include <cstring>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -702,6 +704,103 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+// MTP target verification small-batch Q2_0 on gfx1030.
+// Shape-gated candidate only; default original MMVQ remains untouched.
+// One warp per output token for M128,N4/8; Q2 weight unpack once for M640,N4.
+template <int N>
+__launch_bounds__(32*N,1)
+static __global__ void mtp_q2_token_wave_columns(
+    const void * vx, const block_q8_1 * vy, float * dst,
+    uint32_t ncols_x, uint3 nchannels_y,
+    uint32_t stride_row_x, uint32_t stride_col_y, uint32_t stride_col_dst,
+    uint3 channel_ratio, uint32_t stride_channel_x, uint32_t stride_channel_y, uint32_t stride_channel_dst,
+    uint3 sample_ratio, uint32_t stride_sample_x, uint32_t stride_sample_y, uint32_t stride_sample_dst) {
+    static_assert(N == 4 || N == 8, "strictly tested MTP verifier N4/N8");
+    const int row = blockIdx.x;
+    const int j = threadIdx.y;
+    const int lane = threadIdx.x;
+    const int blocks = ncols_x/QK2_0;
+    ggml_cuda_pdl_sync();
+    const uint32_t cdst = blockIdx.y;
+    const uint32_t cx = fastdiv(cdst, channel_ratio);
+    const uint32_t sy = blockIdx.z;
+    const uint32_t sx = fastdiv(sy, sample_ratio);
+    const uint64_t wxoff = uint64_t(sx)*stride_sample_x + uint64_t(cx)*stride_channel_x +
+                           uint64_t(row)*stride_row_x;
+    const block_q8_1 * y = vy + sy*stride_sample_y + cdst*stride_channel_y + j*stride_col_y;
+    float acc = 0.0f;
+    for (int kbx=lane/2; kbx<blocks; kbx+=16) {
+        const int iqs=lane%2;
+        acc+=vec_dot_q2_0_q8_1(vx, &y[2*kbx], wxoff+kbx, iqs);
+    }
+    acc=warp_reduce_sum<32>(acc);
+    if (lane == 0) {
+        dst[sy*stride_sample_dst+cdst*stride_channel_dst+j*stride_col_dst+row]=acc;
+    }
+    GGML_UNUSED(nchannels_y);
+}
+
+template<int N>
+__launch_bounds__(32,1)
+static __global__ void mtp_q2_reuse_unpacked_weights(
+    const block_q2_0 * vx, const block_q8_1 * vy, float * dst,
+    uint32_t ncols_x, uint3 nchannels_y,
+    uint32_t stride_row_x, uint32_t stride_col_y, uint32_t stride_col_dst,
+    uint3 channel_ratio, uint32_t stride_channel_x, uint32_t stride_channel_y, uint32_t stride_channel_dst,
+    uint3 sample_ratio, uint32_t stride_sample_x, uint32_t stride_sample_y, uint32_t stride_sample_dst) {
+    static_assert(N == 3 || N == 4, "tested MTP verifier N3/N4");
+    const int row=blockIdx.x;
+    const int lane=threadIdx.x;
+    const int blocks=ncols_x/QK2_0;
+    ggml_cuda_pdl_sync();
+    const uint32_t cdst=blockIdx.y;
+    const uint32_t cx=fastdiv(cdst,channel_ratio);
+    const uint32_t sy=blockIdx.z;
+    const uint32_t sx=fastdiv(sy,sample_ratio);
+    const uint64_t wxoff=uint64_t(sx)*stride_sample_x+uint64_t(cx)*stride_channel_x+
+                         uint64_t(row)*stride_row_x;
+    const block_q8_1 * y=vy+sy*stride_sample_y+cdst*stride_channel_y;
+    float acc[N]={0};
+    for(int kbx=lane/2;kbx<blocks;kbx+=16){
+        const int iqs=lane%2;
+        const block_q2_0 *w=vx+wxoff+kbx;
+        const float d2=w->d;
+        const int16_t*qs=(const int16_t*)w->qs+iqs*4;
+        int qx[4],qy[4];
+#pragma unroll
+        for(int t=0;t<4;++t){
+            const uint32_t bits=(uint32_t)qs[t];
+            uint32_t bx=bits&0xffu, by=(bits>>8)&0xffu;
+            bx=(bx|(bx<<12))&0x000f000fu;
+            by=(by|(by<<12))&0x000f000fu;
+            bx=(bx|(bx<<6))&0x03030303u;
+            by=(by|(by<<6))&0x03030303u;
+            qx[t]=(int)((bx+0x7f7f7f7fu)^0x80808080u);
+            qy[t]=(int)((by+0x7f7f7f7fu)^0x80808080u);
+        }
+#pragma unroll
+        for(int j=0;j<N;++j){
+            const block_q8_1 *b=y+j*stride_col_y+2*kbx+iqs;
+            int sumi=0;
+#pragma unroll
+            for(int t=0;t<4;++t){
+                const int u=get_int_b4(b->qs,t*2);
+                const int v=get_int_b4(b->qs,t*2+1);
+                sumi=ggml_cuda_dp4a(u,qx[t],sumi);
+                sumi=ggml_cuda_dp4a(v,qy[t],sumi);
+            }
+            const float d8=__low2float(b->ds);
+            acc[j]+=d2*d8*sumi;
+        }
+    }
+#pragma unroll
+    for(int j=0;j<N;++j){
+        const float sum=warp_reduce_sum<32>(acc[j]);
+        if(lane==0)dst[sy*stride_sample_dst+cdst*stride_channel_dst+j*stride_col_dst+row]=sum;
+    }
+    GGML_UNUSED(nchannels_y);
+}
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
@@ -817,6 +916,15 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
+// Process-static flag; the selected original Q2_0 MMVQ is ALWAYS default.
+static bool mtp_gfx1030_q2_shape_gate() {
+    static const bool on = [] {
+        const char *p = std::getenv("GGML_TP5_MTP_MMVQ_Q2_SHAPE");
+        return p != nullptr && std::strcmp(p, "1") == 0;
+    }();
+    return on;
+}
+
 template<ggml_type type, int c_ncols_dst, bool small_k = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -829,6 +937,33 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+    if constexpr (type == GGML_TYPE_Q2_0 && (c_ncols_dst == 3 || c_ncols_dst == 4) && !small_k) {
+        // Guard everything beyond the native N: shape and installed GPU must
+        // match independently verified gfx1030 original-vs-candidate AB tests.
+        const int device = ggml_cuda_get_device();
+        const int cc = ggml_cuda_info().devices[device].cc;
+        // Model GGUF inventory proves actual ordinary Q2 shared-expert matrices:
+        //   K2560->M640, N4; K640->M2560, N3.
+        // No M128 matrix in GGUF, no invented K2560->M2560 Q2 projection.
+        // Do not touch MoE expert-ID kernels or N5 without real speed proof.
+        constexpr bool n3 = c_ncols_dst == 3;
+        constexpr bool n4 = c_ncols_dst == 4;
+        const bool chosen = (n4 && ncols_x == 2560 && block_nums.x == 640) ||
+                            (n3 && ncols_x == 640 && block_nums.x == 2560);
+        if (chosen && mtp_gfx1030_q2_shape_gate() && !has_fusion &&
+            ids == nullptr && GGML_CUDA_CC_IS_RDNA2(cc) &&
+            block_dims.x == 32 && block_dims.y == 1 &&
+            block_nums.z >= 1 && nbytes_shared == 0) {
+            const ggml_cuda_kernel_launch_params p =
+                ggml_cuda_kernel_launch_params(block_nums, dim3(32,1,1), 0, stream);
+            ggml_cuda_kernel_launch(mtp_q2_reuse_unpacked_weights<c_ncols_dst>, p,
+                    (const block_q2_0 *)vx, (const block_q8_1 *)vy, dst,
+                    ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+            return;
+        }
+    }
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -849,6 +984,56 @@ static void mul_mat_vec_q_switch_fusion(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 }
 
+
+static bool mtp_q2_down_subwarp_enabled() {
+    static const bool on = [] {
+        const char * value=std::getenv("TP5_MTP_Q2_DOWN_SUBWARP");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    return on;
+}
+
+// Exact K128 Q2_0/Q8_1 path: four active partials per output row.
+// Eight disjoint 4-lane groups fill one wave. Token and expert slot remain
+// independent grid dimensions; no weights or IDs are assumed equal across rows.
+__launch_bounds__(32,1)
+static __global__ void mtp_q2_down_subwarp(
+        const void * vx, const block_q8_1 * vy, const int32_t * ids,
+        const int32_t * act_ids, float * dst, uint3 nchannels_y,
+        uint32_t stride_row_x, uint32_t stride_col_y, uint32_t stride_col_dst,
+        uint32_t stride_channel_x, uint32_t stride_channel_y, uint32_t stride_channel_dst,
+        uint32_t ids_stride) {
+    static_assert(QK2_0==64 && QI2_0/VDR_Q2_0_Q8_1_MMVQ==2,
+                  "four lane partition requires two Q2 chunks per block");
+    const uint32_t row=8*blockIdx.x+threadIdx.x/4;
+    const uint32_t sub=threadIdx.x%4;
+    const uint32_t slot=blockIdx.y;
+    const uint32_t token=blockIdx.z;
+    ggml_cuda_pdl_sync();
+    const uint32_t expert=ids[slot+token*ids_stride];
+    const uint32_t channel_y=act_ids ? act_ids[slot+token*ids_stride] : fastmodulo(slot,nchannels_y);
+    const block_q8_1 * y=vy+channel_y*stride_channel_y+token*stride_col_y;
+    const int kbx=sub/2;
+    const int iqs=sub%2;
+    const int64_t offset=int64_t(expert)*stride_channel_x+int64_t(row)*stride_row_x+kbx;
+    float sum=0.0f;
+    sum+=vec_dot_q2_0_q8_1(vx,&y[2*kbx],offset,iqs);
+#if defined(GGML_USE_HIP) && defined(RDNA2)
+    // Preserve the old kernel's rounded per-lane dot before XOR reduction.
+    // Without this register barrier clang contracts the first reduction add
+    // into scale*int_dot, changing the rounding despite the same sum tree.
+    asm volatile("" : "+v"(sum));
+#else
+    volatile float rounded_dot=sum;
+    sum=rounded_dot;
+#endif
+    // The original 32-lane reduction first adds zero at offsets 16,8,4.
+    // Keep the actual nonzero addition tree (offsets 2 then 1).
+    sum=warp_reduce_sum<4>(sum);
+    ggml_cuda_pdl_lc();
+    if(sub==0) dst[slot*stride_channel_dst+token*stride_col_dst+row]=sum;
+}
+
 template <ggml_type type, bool has_fusion = false, bool has_clamp = false>
 static void mul_mat_vec_q_moe_launch(
         const void * vx, const void * vy, const int32_t * ids,
@@ -862,6 +1047,32 @@ static void mul_mat_vec_q_moe_launch(
         const float up_min, const float up_max, const float gate_min,
         const float gate_max, cudaStream_t stream) {
 
+
+    if constexpr (type == GGML_TYPE_Q2_0 && !has_fusion) {
+        const int device=ggml_cuda_get_device();
+        const auto & info=ggml_cuda_info().devices[device];
+        if (mtp_q2_down_subwarp_enabled() && GGML_CUDA_CC_IS_RDNA2(info.cc) &&
+                warp_size==32 && info.warp_size==32 &&
+                ncols_x==128 && nrows_x==2560 && nchannels_dst==10 &&
+                ncols_dst>=2 && ncols_dst<=4) {
+            if (std::getenv("TP5_MTP_KERNEL_TRACE")) {
+                static thread_local uint64_t seen=0;
+                const uint64_t bit=uint64_t(1) << (4*device+ncols_dst-1);
+                if (!(seen & bit)) {
+                    seen|=bit;
+                    GGML_LOG_INFO("TP5_MTP_Q2_DOWN_SUBWARP device=%d N=%u K=%u M=%u slots=%d rows_per_wave=8\n",
+                        device,ncols_dst,ncols_x,nrows_x,nchannels_dst);
+                }
+            }
+            const ggml_cuda_kernel_launch_params p(
+                dim3(320,nchannels_dst,ncols_dst),dim3(32,1,1),0,stream);
+            ggml_cuda_kernel_launch(mtp_q2_down_subwarp,p,vx,
+                static_cast<const block_q8_1 *>(vy),ids,act_ids,dst,nchannels_y,
+                stride_row_x,stride_col_y,stride_col_dst,
+                stride_channel_x,stride_channel_y,stride_channel_dst,ids_stride);
+            return;
+        }
+    }
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst);

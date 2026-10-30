@@ -29,7 +29,12 @@ constexpr uint32_t all_ranks        = (1u << ranks) - 1;
 // Swift needs 36 recurrent-output, 48 expert-output and 97 HC joins. Reserve a
 // fixed bound before submission; unused slots never become active transfers.
 constexpr size_t   channel_capacity = 256;
-constexpr size_t   element_capacity = 4 * 4096;
+// Isolated real MTP verifier T4 capacity: the original worst HC residual
+// channel is 10240 F32 per token, so T4 needs 40960 scalars. Keep the
+// existing strict bounds, five-rank host-mapped stride and producer/consumer
+// wire checks, now with enough reserved capacity for 4 genuine target rows.
+// Original selected source/runtime remain byte-identical elsewhere.
+constexpr size_t   element_capacity = 16 * 4096;
 // The gfx1030 shader cycle counter can move backwards during this wait.
 // Use the constant-rate steady counter; the host deadline aborts first.
 constexpr uint64_t wait_seconds = 600;
@@ -1480,7 +1485,11 @@ bool describe_frame(provider & p, ggml_cgraph * const * graphs, size_t stages, u
 
 bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
     auto & p = *static_cast<provider *>(opaque);
+    const int64_t d0=ggml_time_us();
     std::lock_guard<std::mutex> lock(p.mutex);
+    const int64_t dlock=ggml_time_us();
+    const bool changed=p.definition_changed || !p.current;
+    bool hit=!changed;
     if (!idle(p) || p.status.failed || !graphs || stages != p.status.channels + 1) {
         return false;
     }
@@ -1493,6 +1502,7 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
         p.current = nullptr;
         for (auto & f : p.frames) {
             if (f.signature == p.signature) {
+                hit=true;
                 p.current = &f;
                 break;
             }
@@ -1515,9 +1525,17 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
     }
     p.mode = p.current->exec[0] ? submission::replay :
         (p.current->warmed ? submission::capture : submission::direct);
+    const int64_t dkey=ggml_time_us();
     if (!begin(p)) {
         return false;
     }
+    const int64_t dbegin=ggml_time_us();
+    auto diag_finish=[&]() {
+        const int64_t dfinish=ggml_time_us();
+        const bool ok=finish(p);
+        if (std::getenv("TP5_DIAG_GRAPH")) GGML_LOG_INFO("TP5_DIAG_RELAY ctx=%p epoch=%llu mode=%d changed=%d hit=%d stages=%zu lock_us=%lld key_us=%lld begin_us=%lld dispatch_us=%lld finish_us=%lld total_us=%lld\n", (void*)&p,(unsigned long long)p.status.epoch,int(p.mode),int(changed),int(hit),stages,(long long)(dlock-d0),(long long)(dkey-dlock),(long long)(dbegin-dkey),(long long)(dfinish-dbegin),(long long)(ggml_time_us()-dfinish),(long long)(ggml_time_us()-d0));
+        return ok;
+    };
     p.current->last_used = p.status.epoch;
     if (p.mode == submission::replay) {
         p.next_channel = p.status.channels;
@@ -1525,7 +1543,7 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
             p.channels[i].enqueued = true;
             include_ready_candidate(p, i);
         }
-        return finish(p);
+        return diag_finish();
     }
     if (p.mode == submission::capture) {
         for (uint32_t r = 0; r < ranks && !p.status.failed; ++r) {
@@ -1553,7 +1571,7 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
             enqueue(p, uint32_t(stage));
         }
     }
-    return finish(p); // Also terminates partial captures and records failed tails.
+    return diag_finish(); // Also terminates partial captures and records failed tails.
 }
 
 void fill_event(provider & p, size_t index, ggml_relay_event_kind kind, ggml_relay_event & event) {

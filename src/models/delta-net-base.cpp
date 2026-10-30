@@ -661,6 +661,12 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     ggml_tensor * base_state = s; // no rollback pending: the optimistic state is already correct
 
     if (replay_len > 0) {
+        // The unaccepted draft suffix may consume the ENTIRE replay ring.
+        // In that case m == 0: use the oldest-edge checkpoint directly,
+        // never issue a zero-token GDN compute graph (Meta would correctly
+        // reject its empty q/k/v input split state).
+        base_state = s_ckpt;
+        if (replay_len < n_rs_seq) {
         // Replay the accepted (n_rs_seq - replay_len) ingredients forward from s_ckpt in ONE
         // batched call, not a chain of single-token ones. This works because emit_mode=1 stores
         // ingredients in CHRONOLOGICAL order (slot 0 = oldest of the K retained tokens; see the
@@ -675,26 +681,24 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         const size_t   ingr_row_size = (size_t) hparams.n_embd_s_ingredient() * ingr_elemsize;
         const size_t   slot0_off     = (size_t) kv_head * ingr_row_size; // slot 0 = oldest accepted
 
-        // ggml_gated_delta_net requires g/beta (and, transitively via q_dummy, q) to be fully
-        // contiguous; these are strided views into the packed per-head ingredient ring, so
-        // materialize them. k/v only need contiguous *rows*, which the views already satisfy,
-        // but ggml_cont them too for safety against stricter checks in other backends later.
-        ggml_tensor * k_batch = ggml_cont(ctx0, ggml_view_4d(ctx0, ingr_all, S_v, H_v, m, n_seqs,
-            4 * S_v * ingr_elemsize, mem_size * ingr_row_size, ingr_all->nb[1],
-            slot0_off));
-        ggml_tensor * v_batch = ggml_cont(ctx0, ggml_view_4d(ctx0, ingr_all, S_v, H_v, m, n_seqs,
-            4 * S_v * ingr_elemsize, mem_size * ingr_row_size, ingr_all->nb[1],
-            slot0_off + S_v * ingr_elemsize));
-        ggml_tensor * g_batch = ggml_cont(ctx0, ggml_view_4d(ctx0, ingr_all, kda ? S_v : 1, H_v, m, n_seqs,
-            4 * S_v * ingr_elemsize, mem_size * ingr_row_size, ingr_all->nb[1],
-            slot0_off + 2 * S_v * ingr_elemsize));
-        ggml_tensor * beta_batch = ggml_cont(ctx0, ggml_view_4d(ctx0, ingr_all, 1, H_v, m, n_seqs,
-            4 * S_v * ingr_elemsize, mem_size * ingr_row_size, ingr_all->nb[1],
-            slot0_off + 3 * S_v * ingr_elemsize));
+        // Materialize whole per-head records before selecting components. Scalar g/beta
+        // views into the flat split cache otherwise lose their internal byte offsets.
+        ggml_tensor * packed = ggml_cont(ctx0, ggml_view_4d(ctx0, ingr_all,
+            4 * S_v, H_v, m, n_seqs,
+            4 * S_v * ingr_elemsize, mem_size * ingr_row_size, ingr_all->nb[1], slot0_off));
+        ggml_tensor * k_batch = ggml_cont(ctx0, ggml_view_4d(ctx0, packed, S_v, H_v, m, n_seqs,
+            packed->nb[1], packed->nb[2], packed->nb[3], 0));
+        ggml_tensor * v_batch = ggml_cont(ctx0, ggml_view_4d(ctx0, packed, S_v, H_v, m, n_seqs,
+            packed->nb[1], packed->nb[2], packed->nb[3], S_v * ingr_elemsize));
+        ggml_tensor * g_batch = ggml_cont(ctx0, ggml_view_4d(ctx0, packed, kda ? S_v : 1, H_v, m, n_seqs,
+            packed->nb[1], packed->nb[2], packed->nb[3], 2 * S_v * ingr_elemsize));
+        ggml_tensor * beta_batch = ggml_cont(ctx0, ggml_view_4d(ctx0, packed, 1, H_v, m, n_seqs,
+            packed->nb[1], packed->nb[2], packed->nb[3], 3 * S_v * ingr_elemsize));
         ggml_tensor * q_dummy = ggml_scale(ctx0, k_batch, 0.0f); // q doesn't affect state, only the (discarded) attn output
 
         ggml_tensor * replay_out = ggml_gated_delta_net(ctx0, q_dummy, k_batch, v_batch, g_batch, beta_batch, s_ckpt, /*K=*/1, /*emit_mode=*/0);
         base_state = extract_state_k1(replay_out, /*ntok=*/(int64_t) m);
+        }
     }
 
     // main call: emit_mode=1 records ingredients (+ the trailing final-state block) instead of

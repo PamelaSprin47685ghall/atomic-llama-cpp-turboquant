@@ -597,6 +597,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_r_cache         ("cache_r_l\\d*");
     static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
+    // Upstream GDN ingredient replay adds two recurrent caches absent from
+    // the original TP5 state-name table. Without this, Meta defaults to
+    // MIRRORED full 24,576-wide ingredient storage even though GDN emits
+    // rank-local 3,072-wide chunks, causing fatal CPY size mismatch.
+    static const std::regex pattern_ingr_cache      ("cache_ingr_l\\d*");
+    static const std::regex pattern_s_ckpt_cache    ("cache_s_ckpt_l\\d*");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
@@ -804,7 +810,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ssm_beta_alpha)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+        if (std::regex_match(tensor_name, pattern_r_cache) ||
+                std::regex_match(tensor_name, pattern_s_cache) ||
+                std::regex_match(tensor_name, pattern_ingr_cache) ||
+                std::regex_match(tensor_name, pattern_s_ckpt_cache)) {
+            // Ingredient K/V/g/beta and GDN oldest-edge checkpoint must
+            // follow EXACT same whole-value-head shard as s_l state.
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_conv1d)) {
@@ -885,8 +896,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 if (std::regex_match(tensor_name, pattern_r_cache)) {
                     return {{key_dim * (hparams.ssm_d_conv - 1), 2 + head_ratio}};
                 }
-                if (std::regex_match(tensor_name, pattern_s_cache)) {
+                if (std::regex_match(tensor_name, pattern_s_cache) ||
+                        std::regex_match(tensor_name, pattern_s_ckpt_cache)) {
                     return {{n_k_heads * head_v_dim * head_v_dim, head_ratio}};
+                }
+                if (std::regex_match(tensor_name, pattern_ingr_cache)) {
+                    // Every value head emits exactly four S_v rows:
+                    // (K, V, g, beta), not S_v*S_v state entries.
+                    GGML_ASSERT(tensor->ne[axis] == 4 * value_dim);
+                    return {{n_k_heads * 4 * head_v_dim, head_ratio}};
                 }
             }
 
@@ -943,8 +961,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_r_cache)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * (hparams.ssm_d_conv - 1));
             }
-            if (std::regex_match(tensor_name, pattern_s_cache)) {
+            if (std::regex_match(tensor_name, pattern_s_cache) ||
+                    std::regex_match(tensor_name, pattern_s_ckpt_cache)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
+            }
+            if (std::regex_match(tensor_name, pattern_ingr_cache)) {
+                // Match s_l head boundaries after reducing each full
+                // [S_v,S_v] state per head to four [S_v] ingredients.
+                return std::vector<int64_t>(segments.size(), granularity_qkv * 4);
             }
         } else {
             // regular attention
@@ -1115,6 +1139,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
+        if (ud->model->arch == LLM_ARCH_QWEN4EXP &&
+                (std::regex_match(tensor_name, pattern_ingr_cache) ||
+                 std::regex_match(tensor_name, pattern_s_ckpt_cache))) {
+            // MODEL callback proof of local expected per-rank cache width,
+            // computed with the EXACT old s_l head partition.
+            LLAMA_LOG_INFO("TP5_GDN_MTP_CACHE_SPLIT name=%s axis=%d global=%lld ranks=[%lld,%lld,%lld,%lld,%lld] segments=%u repeats=%u\n",
+                tensor_name.c_str(), int(split_state.axis),
+                (long long) tensor->ne[split_state.axis],
+                (long long) split_state.ne[0],(long long) split_state.ne[1],
+                (long long) split_state.ne[2],(long long) split_state.ne[3],
+                (long long) split_state.ne[4],
+                split_state.n_segments,split_state.nr[0]);
+        }
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
         split_state.nr[0] = 1;

@@ -718,8 +718,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     res->add_input(std::move(inp));
 
+    const char * kv_only_flag = std::getenv("TP5_MTP_DRAFT_KV_ONLY");
+    const bool kv_only = kv_only_flag && std::strcmp(kv_only_flag, "1") == 0 &&
+        n_outputs == 0 && n_tokens == 1 && cparams.embeddings_nextn &&
+        cparams.embeddings_nextn_masked && !cparams.embeddings &&
+        cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && samplers.empty();
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // Zero-output gathers must not register an unallocated out_ids setter.
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -804,6 +810,23 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             nullptr, nullptr, nullptr,
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "mtp_attn_pregate", il);
+
+    // build_attn has already expanded the original Q/K/V and cache-copy roots.
+    // For a masked, zero-output catch-up no later hidden or logits are consumed.
+    // Keep the existing rotations, copy order, positions and KV quantization.
+    if (kv_only && inp_attn->readers.empty()) {
+        res->t_logits = nullptr;
+        res->t_h_nextn = nullptr;
+        if (std::getenv("TP5_MTP_KV_ONLY_TRACE")) {
+            LLAMA_LOG_INFO("TP5_MTP_KV_ONLY_BUILD rows=%lld outputs=%lld nodes=%d il=%d\n",
+                (long long) n_tokens, (long long) n_outputs, ggml_graph_n_nodes(gf), il);
+        }
+        return;
+    }
+    if (kv_only) {
+        // Preserve the original full path if attention readers require it.
+        inp_out_ids = build_inp_out_ids();
+    }
 
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
     cb(cur, "mtp_attn_gated", il);
@@ -1606,6 +1629,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // contiguous with the incoming position; otherwise the window is EOS-padded
     GGML_ASSERT(mctx != nullptr);
 
+    const size_t n_hist = size_t(n_gram - 1);
+    const size_t hist_capacity = mctx->ple_hist_capacity();
+
     // snapshot the history first, so a token cannot read an earlier token of this same ubatch
     // the snapshot is always n_gram - 1 long and EOS-padded at the front: prev() puts the most recent token last
     struct history_snapshot {
@@ -1623,12 +1649,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             h.next_pos = ubatch->pos[i];
             h.toks.clear();
         }
-        if ((int64_t) h.toks.size() > n_gram - 1) {
-            h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
-        }
-
         std::vector<llama_token> padded(n_gram - 1, (llama_token) eos);
-        std::copy(h.toks.begin(), h.toks.end(), padded.end() - (int64_t) h.toks.size());
+        const size_t n_copy = std::min(h.toks.size(), n_hist);
+        std::copy(h.toks.end() - n_copy, h.toks.end(), padded.end() - n_copy);
         snap[seq] = {std::move(padded), i};
     }
 
@@ -1682,8 +1705,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
         auto & h = mctx->get_ple_hist(seq);
         h.toks.push_back(tok_of(i));
-        if ((int64_t) h.toks.size() > n_gram - 1) {
-            h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
+        // Keep predecessors that a supported speculative rewind may need.
+        if (h.toks.size() > hist_capacity) {
+            h.toks.erase(h.toks.begin(), h.toks.end() - hist_capacity);
         }
         h.next_pos = pos + 1;
     }
@@ -1727,7 +1751,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     auto it = rs_rows.find(conv_states_all);
     if (it == rs_rows.end()) {
-        it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_states_all, row_total, n_seqs)).first;
+        // Ingredient replay leaves rs_idx at zero. Convolution still uses rollback slots.
+        ggml_tensor * conv_src = conv_states_all;
+        const uint32_t rollback = mctx_cur->get_replay_len();
+        if (rollback > 0) {
+            const uint32_t mem_size = mctx_cur->get_size();
+            GGML_ASSERT((uint32_t) conv_states_all->ne[1] >= (rollback + 1) * mem_size);
+            conv_src = ggml_view_2d(ctx0, conv_states_all,
+                    conv_states_all->ne[0], mem_size, conv_states_all->nb[1],
+                    size_t(rollback) * mem_size * conv_states_all->nb[1]);
+        }
+        it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_src, row_total, n_seqs)).first;
     }
     ggml_tensor * rows = it->second;
 

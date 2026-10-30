@@ -428,6 +428,23 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
     const int64_t ne = ggml_nelements(src0);
+    if (ne != ggml_nelements(src1)) {
+        // Diagnostic ONLY: keep the original fail-closed tensor-size assert.
+        // Exact names, op type and source/destination sizes pinpoint the
+        // Qwen4Exp GDN ingredient replay graph's malformed CPY shape.
+        fprintf(stderr,
+                "TP5_GDN_INGREDIENT_CPY_SIZE_MISMATCH src_name=%s src_op=%s src_shape=[%lld,%lld,%lld,%lld] src_elems=%lld dst_name=%s dst_op=%s dst_shape=[%lld,%lld,%lld,%lld] dst_elems=%lld base_src_name=%s\n",
+                ggml_get_name(src0), ggml_op_name(src0->op),
+                (long long)src0->ne[0], (long long)src0->ne[1],
+                (long long)src0->ne[2], (long long)src0->ne[3],
+                (long long)ne,
+                ggml_get_name(src1), ggml_op_name(src1->op),
+                (long long)src1->ne[0], (long long)src1->ne[1],
+                (long long)src1->ne[2], (long long)src1->ne[3],
+                (long long)ggml_nelements(src1),
+                src0->src[0] ? ggml_get_name(src0->src[0]) : "(none)");
+        fflush(stderr);
+    }
     GGML_ASSERT(ne == ggml_nelements(src1));
 
     const int64_t ne00 = src0->ne[0];

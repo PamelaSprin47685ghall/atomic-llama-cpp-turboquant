@@ -1,7 +1,13 @@
 #include <ggml-backend.h>
+#include "tp5-meta-submit-ready.h"
 #include <ggml-relay.h>
 #include <gguf.h>
 #include <llama.h>
+#include "llama-memory-hybrid-idx.h"
+// The selected original libllama exports these stable fork MTP staging APIs;
+// only this isolated one-object candidate uses them.
+void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked);
+float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t index);
 #include <tq/relay/ledger.h>
 #include <tq/sampling/shortlist.h>
 #include <tq/scheduling/admission.h>
@@ -13,8 +19,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <limits>
@@ -173,6 +181,163 @@ struct channel_state {
     channel_state(std::uint64_t run, std::uint64_t plan, std::uint64_t channel) : ledger(run, plan, channel, 5, 1) {}
 };
 
+class mtp_phase_pair {
+  public:
+    mtp_phase_pair(std::size_t participants, bool enabled) :
+        participants_(participants), enabled_(enabled) {}
+
+    bool meet(const std::atomic<bool> & stopped) {
+        if (!enabled_) return true;
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (cancelled_ || stopped.load()) return false;
+        const auto generation = generation_;
+        ++arrivals_;
+        if (arrivals_ == participants_) {
+            arrivals_ = 0;
+            ++generation_;
+            changed_.notify_all();
+            return true;
+        }
+        while (generation_ == generation && !cancelled_ && !stopped.load()) {
+            changed_.wait_for(lock, std::chrono::milliseconds(1));
+        }
+        if (stopped.load()) {
+            cancelled_ = true;
+            changed_.notify_all();
+        }
+        return !cancelled_;
+    }
+
+    void retire() noexcept {
+        if (!enabled_) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (participants_ > 0) --participants_;
+        if (arrivals_ == participants_) {
+            arrivals_ = 0;
+            ++generation_;
+        }
+        changed_.notify_all();
+    }
+
+    void cancel() noexcept {
+        if (!enabled_) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        cancelled_ = true;
+        changed_.notify_all();
+    }
+
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::size_t participants_;
+    std::size_t arrivals_ = 0;
+    std::uint64_t generation_ = 0;
+    const bool enabled_;
+    bool cancelled_ = false;
+};
+
+
+class mtp_submit_ready_scope {
+  public:
+    mtp_submit_ready_scope(bool enabled, bool release_after_submit, mtp_phase_pair & pair,
+                          std::unique_lock<std::mutex> & submission,
+                          const std::atomic<bool> & stopped, unsigned window,
+                          std::uint64_t call, std::uint64_t & waits, std::uint64_t & hits,
+                          std::uint64_t & submitted_hits)
+        : enabled_(enabled), release_after_submit_(release_after_submit), pair_(pair),
+          submission_(submission), stopped_(stopped), window_(window), call_(call),
+          waits_(waits), hits_(hits), submitted_hits_(submitted_hits) {
+        require(!release_after_submit_ || enabled_, "post-submit unlock requires the ready pair");
+        if (enabled_) {
+            require(submission_.owns_lock(), "ready pair requires the existing submission gate");
+            require(ggml_backend_meta_set_submit_ready_hook(&arrive, this),
+                    "nested Meta submit-ready hook");
+            if (release_after_submit_ &&
+                    !ggml_backend_meta_set_submitted_hook(&submitted, this)) {
+                ggml_backend_meta_set_submit_ready_hook(nullptr, nullptr);
+                require(false, "nested Meta submitted hook");
+            }
+        }
+    }
+    ~mtp_submit_ready_scope() {
+        if (release_after_submit_) ggml_backend_meta_set_submitted_hook(nullptr, nullptr);
+        if (enabled_) ggml_backend_meta_set_submit_ready_hook(nullptr, nullptr);
+    }
+    void check(int decoded) {
+        if (enabled_ && decoded == 0) {
+            require(called_ == 1, "target decode did not visit exactly one Meta submit-ready point");
+            require(!release_after_submit_ || submitted_ == 1,
+                    "target decode did not visit exactly one successful Meta submit point");
+        }
+    }
+  private:
+    static bool arrive(void * opaque) {
+        auto & self = *static_cast<mtp_submit_ready_scope *>(opaque);
+        if (++self.called_ != 1 || !self.submission_.owns_lock()) {
+            self.pair_.cancel();
+            return false;
+        }
+        const auto begin = now_ns();
+        self.submission_.unlock();
+        bool met;
+        try {
+            met = self.pair_.meet(self.stopped_);
+        } catch (...) {
+            self.submission_.lock();
+            throw;
+        }
+        self.submission_.lock();
+        const auto released = now_ns();
+        self.waits_ += released - begin;
+        ++self.hits_;
+        if (std::getenv("TP5_MTP_READY_PAIR_TRACE")) {
+            std::fprintf(stderr,"TP5_MTP_READY window=%u call=%llu arrive_ns=%llu release_ns=%llu\n",
+                self.window_,(unsigned long long)self.call_,
+                (unsigned long long)begin,(unsigned long long)released);
+        }
+        return met && !self.stopped_.load();
+    }
+    static bool submitted(void * opaque) {
+        auto & self = *static_cast<mtp_submit_ready_scope *>(opaque);
+        if (self.called_ != 1 || ++self.submitted_ != 1 || !self.submission_.owns_lock()) {
+            self.pair_.cancel();
+            return false;
+        }
+        // The native provider has accepted and sealed all five private graphs.
+        // Only this context's output copies remain; context synchronization and
+        // the after-target pair still precede output reads, draft work and reuse.
+        const auto released = now_ns();
+        self.submission_.unlock();
+        ++self.submitted_hits_;
+        if (std::getenv("TP5_MTP_READY_PAIR_TRACE")) {
+            std::fprintf(stderr,"TP5_MTP_SUBMITTED window=%u call=%llu release_ns=%llu\n",
+                self.window_,(unsigned long long)self.call_,(unsigned long long)released);
+        }
+        return !self.stopped_.load();
+    }
+    bool enabled_;
+    bool release_after_submit_;
+    mtp_phase_pair & pair_;
+    std::unique_lock<std::mutex> & submission_;
+    const std::atomic<bool> & stopped_;
+    unsigned window_;
+    std::uint64_t call_;
+    std::uint64_t & waits_;
+    std::uint64_t & hits_;
+    std::uint64_t & submitted_hits_;
+    unsigned called_ = 0;
+    unsigned submitted_ = 0;
+};
+
+struct relay_timing_row {
+    std::uint64_t epoch, plan, ready_ns, reduced_ns, published_ns, elements;
+    std::uint32_t channel, computed_mask;
+};
+
+struct cycle_timing_row {
+    std::uint64_t call, rows, position, queue_ns, submit_ns, submitted_ns, waited_ns, committed_ns;
+};
+
 struct service_window {
     ggml_backend_t                                                                    backend = nullptr;
     std::map<std::pair<std::uint64_t, std::uint32_t>, std::unique_ptr<channel_state>> channels;
@@ -186,6 +351,7 @@ struct service_window {
     std::array<std::uint64_t, 5> rank_output_consumed_payload_bytes{};
     std::uint64_t cpu_input_payload_bytes = 0;
     std::uint64_t cpu_output_payload_bytes = 0;
+    std::vector<relay_timing_row> timings;
 };
 
 // This C object owns the A/B collaboration. Neither A nor the ledger calls a
@@ -202,6 +368,9 @@ class relay_service {
         for (auto backend : backends) {
             auto item     = std::make_unique<service_window>();
             item->backend = backend;
+            if (std::getenv("TP5_MTP_TIMELINE_PREFIX")) {
+                item->timings.reserve(131072);
+            }
             windows_.push_back(std::move(item));
         }
         thread_ = std::thread([this] { loop(); });
@@ -252,6 +421,26 @@ class relay_service {
             }
         }
     }
+    void write_timings(const std::string & prefix) const {
+        require(!thread_.joinable(), "timing output requires a stopped service");
+        for (std::size_t i = 0; i < windows_.size(); ++i) {
+            const auto path = prefix + ".relay-" + std::to_string(i) + ".csv";
+            auto * out = std::fopen(path.c_str(), "wx");
+            require(out != nullptr, "cannot create relay timing output");
+            std::fprintf(out, "epoch,plan,channel,elements,mask,ready_ns,reduced_ns,published_ns\n");
+            for (const auto & r : windows_[i]->timings) {
+                std::fprintf(out, "%llu,%llu,%u,%llu,%u,%llu,%llu,%llu\n",
+                    (unsigned long long)r.epoch, (unsigned long long)r.plan, r.channel,
+                    (unsigned long long)r.elements, r.computed_mask,
+                    (unsigned long long)r.ready_ns, (unsigned long long)r.reduced_ns,
+                    (unsigned long long)r.published_ns);
+            }
+            const bool written = !std::ferror(out);
+            const int closed = std::fclose(out);
+            require(written && closed == 0, "relay timing output failed");
+        }
+    }
+
     void copy_wire_metrics(std::size_t index, window_result & result) const {
         require(!thread_.joinable(), "wire metrics require the stopped CPU service");
         const auto & window = *windows_[index];
@@ -299,6 +488,8 @@ class relay_service {
             return;
         }
         const bool borrowed = event.kind == GGML_RELAY_INPUT_READY;
+        const bool timed = window.timings.capacity() != 0 && borrowed;
+        const auto ready_ns = timed ? now_ns() : 0;
         bool       returned = false;
         try {
             require(
@@ -355,6 +546,7 @@ class relay_service {
                     reduced = detail::ordered_fold_f32_masked(inputs, static_cast<float *>(event.output),
                                                               std::size_t(event.elements), event.computed_mask);
                 }
+                const auto reduced_ns = timed ? now_ns() : 0;
                 require(reduced != detail::fold_result::nonfinite_input, "nonfinite rank partial");
                 require(reduced != detail::fold_result::nonfinite_sum, "nonfinite CPU reduction");
                 require(reduced != detail::fold_result::nonfinite_pack, "CPU reduction overflows F16 wire");
@@ -372,6 +564,11 @@ class relay_service {
                 returned             = true;
                 require(published, "relay publication was rejected");
                 check_ledger(owner->ledger.output_published(*owner->held));
+                if (timed) {
+                    require(window.timings.size() < window.timings.capacity(), "relay timing capacity exhausted");
+                    window.timings.push_back({event.epoch, event.plan_generation, ready_ns, reduced_ns,
+                        now_ns(), event.elements, event.channel, event.computed_mask});
+                }
             } else if (event.kind == GGML_RELAY_OUTPUT_RELEASED) {
                 auto found = window.channels.find(key);
                 require(found != window.channels.end() && found->second->held.has_value(),
@@ -477,7 +674,68 @@ std::string piece(const llama_vocab * vocab, llama_token token) {
 }  // namespace
 
 run_result run(const options & requested) {
+    // Independent TP5 real target T4 qualification. Default original full512 path
+    // unaffected. Requires exactly one owner/request per independent window.
+    const char * t4_env = std::getenv("GGML_TP5_MTP_VERIFY_PROBE");
+    const bool mtp_t4_probe = t4_env && std::string(t4_env) == "1";
+    const char * mtp_path = std::getenv("GGML_TP5_REAL_TRAINED_MTP_GGUF");
+    const bool mtp_draft_smoke = mtp_path && mtp_path[0];
+    const char * depth_env = std::getenv("GGML_TP5_MTP_DRAFT_DEPTH");
+    require(!depth_env || (std::string(depth_env)=="1" ||
+                           std::string(depth_env)=="2" ||
+                           std::string(depth_env)=="3"),
+            "real MTP target draft depth must be 1..3");
+    const std::uint32_t mtp_depth = depth_env ? std::uint32_t(std::atoi(depth_env)) : 1;
+    require(!depth_env || mtp_draft_smoke,
+            "MTP multistep depth requires genuine trained NextN draft");
+    // Compare IDENTICAL MTP-aware target/draft models, same optimizer binary
+    // and algorithm with only device-native checkpoint mode changed.
+    const char * cp_mode = std::getenv("GGML_TP5_MTP_ON_DEVICE_CHECKPOINT");
+    require(!cp_mode || std::string(cp_mode) == "0" ||
+            std::string(cp_mode) == "1", "MTP checkpoint mode must be 0 or 1");
+    const bool mtp_device_snapshot = cp_mode && std::string(cp_mode) == "1";
+    const char * ring_env=std::getenv("GGML_TP5_MTP_RS_RING");
+    require(!ring_env || std::string(ring_env)=="0" ||
+            std::string(ring_env)=="1", "bounded Qwen MTP native ring flag must be 0 or 1");
+    const bool mtp_native_trim = ring_env && std::string(ring_env)=="1";
+    const bool mtp_state_trace = std::getenv("GGML_TP5_MTP_PLE_KV_TRACE") &&
+        std::string(std::getenv("GGML_TP5_MTP_PLE_KV_TRACE"))=="1";
+    const char * draft_output_env = std::getenv("TP5_MTP_LAST_DRAFT_LOGITS");
+    require(!draft_output_env || std::string(draft_output_env) == "0" ||
+            std::string(draft_output_env) == "1", "MTP last draft logits must be 0 or 1");
+    const bool last_draft_logits = draft_output_env && std::string(draft_output_env) == "1";
+    const char * prompt_catchup_env = std::getenv("TP5_MTP_PROMPT_CATCHUP");
+    require(!prompt_catchup_env || std::string(prompt_catchup_env) == "0" ||
+            std::string(prompt_catchup_env) == "1", "MTP prompt catch-up must be 0 or 1");
+    const bool prompt_catchup = prompt_catchup_env && std::string(prompt_catchup_env) == "1";
+    require(!prompt_catchup || mtp_draft_smoke, "prompt catch-up requires a trained MTP context");
+    const char * prompt_audit_env = std::getenv("TP5_MTP_PROMPT_AUDIT_PREFIX");
+    const std::string prompt_audit_prefix = prompt_audit_env ? prompt_audit_env : "";
+    require(!mtp_native_trim || (mtp_draft_smoke && mtp_depth==2 && !mtp_device_snapshot),
+            "native two-slot GDN ring requires real trained NextN depth2, N3 main target and host output");
+    const llama_state_seq_flags checkpoint_flags =
+        mtp_device_snapshot ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : LLAMA_STATE_SEQ_FLAGS_NONE;
+    require(!mtp_device_snapshot || mtp_draft_smoke,
+            "MTP device snapshot requires genuine trained MTP decoding");
+    require(!mtp_draft_smoke || mtp_t4_probe,
+            "actual trained MTP smoke requires genuine T4 target verification mode");
     const options                   opts = validate(requested);
+    const char * pair_env = std::getenv("TP5_MTP_READY_PAIR");
+    require(!pair_env || std::string(pair_env) == "0" || std::string(pair_env) == "1",
+            "MTP phase pair must be 0 or 1");
+    const bool paired_phases = pair_env && std::string(pair_env) == "1";
+    const char * unlock_env = std::getenv("TP5_MTP_POST_SUBMIT_UNLOCK");
+    require(!unlock_env || std::string(unlock_env) == "0" || std::string(unlock_env) == "1",
+            "MTP post-submit unlock must be 0 or 1");
+    const bool post_submit_unlock = unlock_env && std::string(unlock_env) == "1";
+    require(!post_submit_unlock || paired_phases,
+            "MTP post-submit unlock requires paired private native snapshot windows");
+    require(!paired_phases || (mtp_draft_smoke && opts.windows == 2 && mtp_native_trim),
+            "MTP phase pair requires two private native snapshot windows");
+    require(prompt_audit_prefix.empty() || (prompt_catchup && opts.capture_logits),
+            "prompt hidden audit is only valid in the numerical short run");
+    require(!mtp_t4_probe || (opts.prompts.size() == 2 && opts.windows == 2),
+            "MTP native T4 probe requires two distinct private windows");
     configure_hc_owner_layout(opts);
     const bool                      swift = is_swift_model(opts.model);
     require(swift || opts.hc_owner_offsets.empty(), "HC context-owner offsets require the Swift HC97 model");
@@ -575,7 +833,7 @@ run_result run(const options & requested) {
         auto params      = llama_context_default_params();
         params.n_ctx     = opts.context_per_request * assignments[i].size();
         params.n_seq_max = assignments[i].size();
-        params.n_batch   = assignments[i].size();
+        params.n_batch   = mtp_t4_probe ? 4u : uint32_t(assignments[i].size());
         params.n_ubatch  = params.n_batch;
         params.n_threads = params.n_threads_batch = opts.threads;
         // Two full Swift contexts must fit alongside the shared model.
@@ -586,9 +844,12 @@ run_result run(const options & requested) {
                                                              LLAMA_FLASH_ATTN_TYPE_DISABLED;
         params.kv_unified             = true;
         params.tp5_relay              = opts.execution == mode::relay;
+        params.n_rs_seq                = mtp_native_trim ? 2u : 0u;
         params.quantized_matmul_f32   = opts.execution != mode::relay;
         context_ptr context(llama_init_from_model(model.get(), params));
         require(context != nullptr, "context preparation failed");
+        require(!mtp_native_trim || llama_n_rs_seq(context.get())==2,
+                "target Qwen MTP depth2 native GDN ring was not admitted as n_rs_seq2");
         auto & dimensions = result.windows[i];
         dimensions.context_tokens = llama_n_ctx(context.get());
         dimensions.sequence_tokens = llama_n_ctx_seq(context.get());
@@ -614,8 +875,112 @@ run_result run(const options & requested) {
             }
             native.push_back(lane);
         }
+        if (mtp_draft_smoke) {
+            // Unmasked: export one genuine 10240-wide residual per token,
+            // including all four prefill rows without requested vocab logits.
+            llama_set_embeddings_nextn(context.get(), true, false);
+        }
         contexts.push_back(std::move(context));
         result.windows[i].id = i;
+    }
+
+    // Real trained Strata Qwen4Exp MTP head, now converted to native NextN GGUF
+    // with EXACT model token embeddings/LM head Q3_K/Q5_K source bytes.
+    // Load on a distinct physical GPU, without fifth Meta rank scheduling the
+    // draft graph or touching the two target contexts' KV/recurrent states.
+    model_ptr trained_mtp_model;
+    model_ptr trained_mtp_model_secondary;
+    std::vector<context_ptr> trained_mtp_contexts;
+    if (mtp_draft_smoke) {
+        const char * split_draft_env = std::getenv("TP5_MTP_SPLIT_DRAFT_DEVICES");
+        require(!split_draft_env || std::string(split_draft_env) == "0" ||
+                std::string(split_draft_env) == "1", "split draft devices must be 0 or 1");
+        const bool split_draft_devices = split_draft_env && std::string(split_draft_env) == "1";
+        require(!split_draft_devices || (opts.windows == 2 && devices.size() >= 5 && devices[3]),
+                "split draft devices requires the two private windows and ROCm3");
+        std::array<ggml_backend_dev_t,2> ddevices{ devices[0], nullptr };
+        auto mp = llama_model_default_params();
+        mp.devices = ddevices.data();
+        mp.n_gpu_layers = 99;
+        mp.split_mode = LLAMA_SPLIT_MODE_NONE;
+        mp.offload_input = true;
+        mp.load_mtp = true;
+        // The selected main trunk has 194 Q8-converted HC matrices. The
+        // separate trained MTP-only model has exactly ONE own BF16 HC block
+        // (blk.48), and MUST retain those trained source BF16 bytes. This
+        // model-loader option is read fresh in every loader constructor;
+        // change it in a strictly synchronous/no-thread interval only.
+        // The original main trunk is already fully loaded and owns its
+        // immutable physical Q8 descriptors. Restore the original env before
+        // any target/draft compute or CPU relay service starts.
+        struct scoped_hc_q8_loader_policy {
+            std::string previous;
+            bool had = false;
+            scoped_hc_q8_loader_policy() {
+                const char * p = std::getenv("GGML_TP5_HC_Q8_WEIGHTS");
+                had = p != nullptr;
+                previous = p ? p : "";
+                require(::setenv("GGML_TP5_HC_Q8_WEIGHTS", "0", 1)==0,
+                        "could not temporarily select trained BF16 HC MTP-only loader");
+            }
+            ~scoped_hc_q8_loader_policy() {
+                if (had) ::setenv("GGML_TP5_HC_Q8_WEIGHTS", previous.c_str(), 1);
+                else ::unsetenv("GGML_TP5_HC_Q8_WEIGHTS");
+            }
+        };
+        {
+            scoped_hc_q8_loader_policy mtp_only_weights;
+            trained_mtp_model.reset(llama_model_load_from_file(mtp_path, mp));
+            if (split_draft_devices) {
+                ggml_backend_dev_props props{};
+                ggml_backend_dev_get_props(devices[3], &props);
+                std::fprintf(stderr,
+                    "TP5_MTP_DRAFT_SECOND_MODEL name=%s bdf=%s free_before_bytes=%zu total_bytes=%zu\n",
+                    props.name, props.device_id ? props.device_id : "", props.memory_free, props.memory_total);
+                std::array<ggml_backend_dev_t,2> secondary_devices{ devices[3], nullptr };
+                auto secondary_params = mp;
+                secondary_params.devices = secondary_devices.data();
+                secondary_params.main_gpu = 0;
+                trained_mtp_model_secondary.reset(llama_model_load_from_file(mtp_path, secondary_params));
+                require(trained_mtp_model_secondary != nullptr &&
+                        llama_model_n_layer_nextn(trained_mtp_model_secondary.get()) == 1,
+                        "second private MTP model failed to load on ROCm3");
+            }
+        }
+        require(trained_mtp_model != nullptr && llama_model_n_layer_nextn(trained_mtp_model.get()) == 1,
+                "real native trained MTP-only Qwen4Exp model could not be loaded");
+        require(std::getenv("GGML_TP5_HC_Q8_WEIGHTS") &&
+                std::string(std::getenv("GGML_TP5_HC_Q8_WEIGHTS"))=="1",
+                "main Q8 HC loader policy not restored before native MTP compute");
+        trained_mtp_contexts.reserve(opts.windows);
+        for (std::uint32_t wi=0; wi<opts.windows; ++wi) {
+            auto p=llama_context_default_params();
+            p.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            p.ctx_other = contexts[wi].get();
+            p.n_ctx = opts.context_per_request;
+            p.n_seq_max = 1;
+            p.n_batch = 4;
+            p.n_ubatch = 4;
+            p.n_threads = p.n_threads_batch = opts.threads;
+            p.type_k = p.type_v = GGML_TYPE_Q4_0;
+            p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            const std::uint32_t draft_device = split_draft_devices && wi == 1 ? 3u : 0u;
+            auto * draft_model = draft_device == 3 ? trained_mtp_model_secondary.get() : trained_mtp_model.get();
+            context_ptr dctx(llama_init_from_model(draft_model, p));
+            require(dctx != nullptr && llama_n_ctx_kv(dctx.get()) >= opts.context_per_request,
+                    "real MTP draft context failed to allocate full independent 262144 KV");
+            llama_set_embeddings_nextn(dctx.get(), true, true);
+            ggml_backend_dev_props props{};
+            ggml_backend_dev_get_props(devices[draft_device], &props);
+            std::fprintf(stderr,
+                "TP5_MTP_DRAFT_ASSIGN window=%u index=%u name=%s bdf=%s model=%p context=%p kv_capacity=%u model_copies=%u free_after_bytes=%zu\n",
+                wi, draft_device, props.name, props.device_id ? props.device_id : "",
+                (void *) draft_model, (void *) dctx.get(), llama_n_ctx_kv(dctx.get()),
+                split_draft_devices ? 2u : 1u, props.memory_free);
+            trained_mtp_contexts.push_back(std::move(dctx));
+        }
+        require(trained_mtp_contexts.size()==opts.windows,
+                "real MTP trained draft and target window count disagree");
     }
     failure_state                  failure;
     std::unique_ptr<relay_service> service;
@@ -625,6 +990,13 @@ run_result run(const options & requested) {
     result.started_ns = now_ns();
     // Count submitted epochs until native work and CPU readers retire.
     std::atomic<std::uint64_t> active{ 0 }, maximum{ 0 };
+    const char * timeline_env = std::getenv("TP5_MTP_TIMELINE_PREFIX");
+    const std::string timeline_prefix = timeline_env ? timeline_env : "";
+    std::vector<std::vector<cycle_timing_row>> cycle_timings(opts.windows);
+    if (!timeline_prefix.empty()) {
+        for (auto & rows : cycle_timings) rows.reserve(1024);
+    }
+    mtp_phase_pair phase_pair(opts.windows, paired_phases);
     std::mutex                 submission_mutex;
     std::atomic<std::uint32_t> workers_done{ 0 };
     std::atomic<bool>          watchdog_stop{ false };
@@ -661,7 +1033,35 @@ run_result run(const options & requested) {
                     const auto &                         ids     = assignments[wi];
                     std::vector<std::uint64_t>           consumed(ids.size(), 0);
                     std::vector<text::generation_stream> streams(ids.size());
-                    row_batch                            batch(ids.size());
+                    row_batch                            batch(mtp_t4_probe ? 4u : uint32_t(ids.size()));
+                    // A single REAL trained MTP speculative round is verified
+                    // with target batch [previously emitted target token,
+                    // trained MTP proposal], then either committed by the
+                    // target or fully rolled back (KV + recurrent).
+                    std::vector<llama_token>            pending_mtp_tokens;
+                    std::uint64_t                       mtp_proposal_tokens = 0;
+                    std::uint64_t                       mtp_accepted_draft_tokens = 0;
+                    std::uint64_t                       mtp_verify_rounds = 0;
+                    std::uint64_t                       mtp_accept_rounds = 0;
+                    std::uint64_t                       mtp_rollback_rounds = 0;
+                    const auto diag_begin=now_ns();
+                    std::uint64_t diag_draft_first=0,diag_draft_extra=0,diag_state=0,diag_queue=0;
+                    std::uint64_t diag_first_count=0,diag_extra_count=0,diag_state_count=0;
+                    std::uint64_t diag_state_only_count=0;
+                    bool draft_pending = false;
+                    std::uint64_t draft_phase_drains = 0;
+                    std::uint64_t pair_before_ns=0, pair_after_ns=0, pair_meets=0;
+                    std::uint64_t pair_ready_ns = 0, pair_ready_hits = 0, pair_submitted_hits = 0;
+                    std::vector<float> draft_prompt_previous_h(10240, 0.0f);
+                    std::size_t draft_prompt_rows=0;
+                    std::uint64_t draft_prompt_ns=0;
+                    auto timed_seq_rm = [&](llama_memory_t memory, llama_seq_id seq, llama_pos p0, llama_pos p1) {
+                        const auto start=now_ns();
+                        const bool result=llama_memory_seq_rm(memory,seq,p0,p1);
+                        diag_state+=now_ns()-start; ++diag_state_count;
+                        return result;
+                    };
+                    std::vector<std::uint8_t>           target_state_checkpoint;
                     std::vector<std::size_t>             local_rows;
                     local_rows.reserve(ids.size());
                     for (auto id : ids) {
@@ -672,7 +1072,71 @@ run_result run(const options & requested) {
                         local_rows.clear();
                         std::uint32_t output_rows = 0;
                         std::int32_t single_output_row = -1;
+                        bool verify_mtp_this_epoch = false;
+                        if (mtp_draft_smoke && !pending_mtp_tokens.empty() &&
+                            ids.size()==1 &&
+                            result.requests[ids[0]].tokens.size()+1 < opts.predict) {
+                            auto & rr = result.requests[ids[0]];
+                            require(!rr.tokens.empty() &&
+                                    consumed[0] == rr.prompt_tokens.size()+rr.tokens.size()-1,
+                                    "MTP N4 target verification cursor misaligned");
+                            require(rr.stop_reason.empty(), "MTP N4 after stopped request");
+                            require(pending_mtp_tokens.size()<=3 &&
+                                    pending_mtp_tokens.size()+1<=4,
+                                    "MTP N4 too many draft inputs for true native TP5");
+                            require(pending_mtp_tokens.size()+1<=opts.predict-rr.tokens.size(),
+                                    "MTP N4 would generate more true tokens than remaining budget");
+                            for (const auto tok : pending_mtp_tokens)
+                                require(tok>=0 && std::uint32_t(tok)<n_vocab,
+                                        "MTP prediction ID outside real vocab");
+
+                            // Save BOTH real attention KV and hybrid GDN recurrent
+                            // state. The native two-slot GDN ring failed full
+                            // 248320 logits quality (KL 7.31), so use the ONLY
+                            // qualified full host sequence snapshot.
+                            std::size_t state_sz=0;
+                            if(!mtp_native_trim) {
+                                state_sz=llama_state_seq_get_size_ext(ctx,0,checkpoint_flags);
+                                require(state_sz>0 && state_sz<=(512ull<<20),
+                                        "MTP valid full GDN+KV checkpoint unavailable");
+                                target_state_checkpoint.resize(state_sz);
+                                const auto written=llama_state_seq_get_data_ext(
+                                    ctx,target_state_checkpoint.data(),state_sz,0,checkpoint_flags);
+                                require(written==state_sz,
+                                        "MTP full target state snapshot failed");
+                            }
+                            batch.push(rr.tokens.back().emitted_token,consumed[0],0,true);
+                            local_rows.push_back(0);
+                            for (std::size_t i=0;i<pending_mtp_tokens.size();++i) {
+                                batch.push(pending_mtp_tokens[i],consumed[0]+i+1,0,true);
+                                local_rows.push_back(0);
+                            }
+                            output_rows=std::uint32_t(batch.batch.n_tokens);
+                            single_output_row=-1;
+                            verify_mtp_this_epoch=true;
+                            mtp_proposal_tokens+=pending_mtp_tokens.size();
+                            if (mtp_state_trace) {
+                                std::fprintf(stderr,
+                                    "TP5_REAL_MTP_TARGET_MULTI_BEGIN window=%u N=%u draft_n=%zu source_pos=%llu snapshot_bytes=%zu draft0=%d\n",
+                                    wi,unsigned(output_rows),pending_mtp_tokens.size(),
+                                    (unsigned long long)consumed[0],state_sz,int(pending_mtp_tokens[0]));
+                                std::fflush(stderr);
+                            }
+                        }
+                        if (mtp_t4_probe && ids.size() == 1 && consumed[0] == 0) {
+                            auto & initial = result.requests[ids[0]];
+                            require(initial.prompt_tokens.size() >= 5,
+                                    "MTP T4 verification probe requires prompt length >=5");
+                            for (std::uint32_t n = 0; n < 4; ++n) {
+                                batch.push(initial.prompt_tokens[n], n, 0, false);
+                                local_rows.push_back(0);
+                            }
+                        }
                         for (std::size_t local = 0; local < ids.size(); ++local) {
+                            if (verify_mtp_this_epoch ||
+                                (mtp_t4_probe && consumed[local] == 0 && !local_rows.empty())) {
+                                continue; // Actual T4 prefill or T2 verification already assembled.
+                            }
                             auto & request = result.requests[ids[local]];
                             if (!request.stop_reason.empty()) {
                                 continue;
@@ -695,11 +1159,27 @@ run_result run(const options & requested) {
                         if (!batch.batch.n_tokens) {
                             break;
                         }
+                        if (paired_phases) {
+                            const auto begin = now_ns();
+                            if (draft_pending) {
+                                llama_synchronize(trained_mtp_contexts.at(wi).get());
+                                draft_pending = false;
+                                ++draft_phase_drains;
+                            }
+                            require(phase_pair.meet(failure.stopped), "MTP phase pair stopped before target");
+                            pair_before_ns += now_ns() - begin;
+                            ++pair_meets;
+                        }
+                        const auto cycle_queue_start = timeline_prefix.empty() ? 0 : now_ns();
+                        const auto cycle_rows = batch.batch.n_tokens;
+                        const auto cycle_position = batch.batch.pos[0];
                         // Keep each window's five-rank submission together.
                         // Completion waits and CPU relay work stay outside this gate.
                         std::unique_lock<std::mutex> submission_lock(submission_mutex, std::defer_lock);
                         if (service) {
+                            const auto queue_start=now_ns();
                             submission_lock.lock();
+                            diag_queue+=now_ns()-queue_start;
                         }
                         const auto current = active.fetch_add(1) + 1;
                         epoch_active = true;
@@ -710,8 +1190,16 @@ run_result run(const options & requested) {
                             metrics.first_submit_ns = now_ns();
                         }
                         const auto submit_start = now_ns();
-                        const int decoded = llama_decode(ctx, batch.batch);
-                        metrics.decode_submit_ns += now_ns() - submit_start;
+                        int decoded;
+                        {
+                            mtp_submit_ready_scope ready(paired_phases, post_submit_unlock, phase_pair, submission_lock,
+                                failure.stopped, wi, metrics.decode_calls + 1, pair_ready_ns, pair_ready_hits,
+                                pair_submitted_hits);
+                            decoded = llama_decode(ctx, batch.batch);
+                            ready.check(decoded);
+                        }
+                        const auto submit_finished = now_ns();
+                        metrics.decode_submit_ns += submit_finished - submit_start;
                         if (submission_lock.owns_lock()) {
                             submission_lock.unlock();
                         }
@@ -741,15 +1229,314 @@ run_result run(const options & requested) {
                                 pause_cpu();
                             }
                         }
-                        metrics.native_wait_ns += now_ns() - wait_start;
+                        const auto wait_finished = now_ns();
+                        metrics.native_wait_ns += wait_finished - wait_start;
                         active.fetch_sub(1);
                         epoch_active = false;
                         require(!failure.stopped.load(), "request stopped before state commit");
+                        if (paired_phases) {
+                            const auto begin = now_ns();
+                            require(phase_pair.meet(failure.stopped), "MTP phase pair stopped after target");
+                            pair_after_ns += now_ns() - begin;
+                        }
+                        if (verify_mtp_this_epoch) {
+                            const std::size_t n=pending_mtp_tokens.size();
+                            require(n>=1&&n<=3&&local_rows.size()==n+1&&output_rows==n+1,
+                                "MTP multistep must have exactly 1+N true target output rows");
+                            std::size_t accepted=0;
+                            for (;accepted<n;++accepted) {
+                                const float * logits=llama_get_logits_ith(ctx,int(accepted));
+                                require(logits!=nullptr,"MTP multi target logits missing");
+                                const auto greedy=tq::sampling::select_finite_greedy(logits,n_vocab);
+                                require(greedy.usable,"MTP multi target logits nonfinite");
+                                if(greedy.selected.id!=pending_mtp_tokens[accepted])break;
+                            }
+                            const bool full_accept=accepted==n;
+                            ++mtp_verify_rounds;
+                            mtp_accepted_draft_tokens+=accepted;
+                            if(full_accept)++mtp_accept_rounds;
+                            else ++mtp_rollback_rounds;
+                            if (mtp_state_trace) {
+                                std::fprintf(stderr,
+                                    "TP5_REAL_MTP_MULTI_VERDICT window=%u N=%zu accepted_prefix=%zu full=%u source_pos=%llu\n",
+                                    wi,n+1,accepted,unsigned(full_accept),
+                                    (unsigned long long)consumed[0]);
+                                std::fflush(stderr);
+                            }
+
+                            // The trained single-NextN head drafted and cached
+                            // predicted tokens at positions > source x. Drop
+                            // ALL predicted draft KV, retaining only the true
+                            // emitted source token x at consumed[0]. The next
+                            // actual target output rows will re-enter the
+                            // trained head with REAL target hidden states.
+                            auto * dctx=trained_mtp_contexts.at(wi).get();
+                            require(timed_seq_rm(llama_get_memory(dctx),0,
+                                       static_cast<llama_pos>(consumed[0]+1),-1),
+                                    "MTP draft attention KV speculative tail trim failed");
+                            pending_mtp_tokens.clear();
+
+                            if (!full_accept) {
+                                if(mtp_native_trim) {
+                                    // The actual N3 target processed TRUE x at
+                                    // pos p plus up to 2 tentative trained
+                                    // NextN proposals y0,y1. Only the accepted
+                                    // prefix [x, y0..y(accepted-1)] is VALID.
+                                    // Rewind INVALID suffix beginning
+                                    // p+1+accepted, at most TWO GDN steps;
+                                    // preserve the model's already-computed
+                                    // recurrent GDN/PLE/attention/indexer state
+                                    // for valid prefix. No 118MB state copy and
+                                    // no costly second target GPU decode.
+                                    const llama_pos invalid_from=static_cast<llama_pos>(
+                                        consumed[0]+1+accepted);
+                                    auto debug_recurrent = [&](const char * stage) {
+                                        if (!mtp_state_trace) return;
+                                        auto * mem = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx));
+                                        require(mem != nullptr,
+                                            "MTP ring-state trace requires Qwen4Exp hybrid_idx");
+                                        const auto & hist=mem->ple_hist_get(0);
+                                        auto * rec=mem->get_mem_recr();
+                                        const int tail=rec->tails[0];
+                                        const auto last_pos=tail>=0 ? rec->cells[tail].pos : -1;
+                                        const int ht1=hist.toks.empty() ? -1 : int(hist.toks.back());
+                                        const int ht2=hist.toks.size()<2 ? -1 : int(hist.toks[hist.toks.size()-2]);
+                                        const auto idxpos=mem->get_mem_idx() ?
+                                            mem->get_mem_idx()->seq_pos_max(0) : -1;
+                                        const auto attpos=mem->get_mem_attn()->seq_pos_max(0);
+                                        std::fprintf(stderr,
+                                            "TP5_REAL_MTP_RECURRENT_PLE_KV_TRACE stage=%s window=%u source_pos=%llu accepted_drafts=%zu invalid_pos=%d GDN_tail_pos=%d replay_len=%u rs_idx=%u PLE_next_pos=%d PLE_count=%zu PLE_recent2=[%d,%d] attention_pos_max=%d indexer_pos_max=%d\n",
+                                            stage,wi,(unsigned long long)consumed[0],
+                                            accepted,int(invalid_from),int(last_pos),
+                                            rec->replay_len.empty()?0:rec->replay_len[0],
+                                            rec->rs_idx.empty()?0:rec->rs_idx[0],
+                                            int(hist.next_pos),hist.toks.size(),ht2,ht1,
+                                            int(attpos),int(idxpos));
+                                        std::fflush(stderr);
+                                    };
+                                    debug_recurrent("before_invalid_suffix_trim");
+                                    require(timed_seq_rm(
+                                                llama_get_memory(ctx),0,invalid_from,-1),
+                                            "bounded native Qwen recurrent/PLE/attention/indexer speculative suffix trim failed");
+                                    debug_recurrent("after_invalid_suffix_trim");
+                                    const auto valid_rows=accepted+1;
+                                    local_rows.resize(valid_rows);
+                                    batch.batch.n_tokens=int32_t(valid_rows);
+                                    output_rows=uint32_t(valid_rows);
+                                    if(valid_rows==1) {
+                                        single_output_row=0;
+                                        single_output_logits=llama_get_logits_ith(ctx,0);
+                                        require(single_output_logits,
+                                                "native ring missing verified target N3 row0");
+                                    }
+                                    if (mtp_state_trace) {
+                                        std::fprintf(stderr,
+                                            "TP5_REAL_MTP_MULTI_NATIVE_SUFFIX_TRIM window=%u accepted_drafts=%zu valid_rows=%zu removed_invalid_start=%d rollback_steps=%zu host_checkpoint_bytes=0 extra_target_replay=0\n",
+                                            wi,accepted,valid_rows,int(invalid_from),n-accepted);
+                                        std::fflush(stderr);
+                                    }
+                                } else {
+                                // The target N4 executed 1+N speculative inputs.
+                                // Only the first [x,d0,...,d_{k-1}] were
+                                // verified as a legitimate chain. Keep copies
+                                // of those original verifier logits BEFORE the
+                                // full restore; replay overwrites host output.
+                                const std::size_t replay_n=accepted+1;
+                                std::vector<std::vector<float>> verifier_rows(replay_n);
+                                for (std::size_t j=0;j<replay_n;++j) {
+                                    const float * t=llama_get_logits_ith(ctx,int(j));
+                                    require(t!=nullptr,"MTP rejected prefix verifier logits missing");
+                                    verifier_rows[j].assign(t,t+n_vocab);
+                                }
+                                require(!target_state_checkpoint.empty(),
+                                        "MTP multi full target checkpoint missing");
+                                const std::size_t restored=llama_state_seq_set_data_ext(
+                                    ctx,target_state_checkpoint.data(),
+                                    target_state_checkpoint.size(),0,checkpoint_flags);
+                                require(restored==target_state_checkpoint.size(),
+                                        "MTP multi full GDN+attention KV restore failed");
+                                target_state_checkpoint.clear();
+                                std::vector<llama_token> verified_inputs(replay_n);
+                                std::vector<llama_pos> verified_positions(replay_n);
+                                for(std::size_t j=0;j<replay_n;++j){
+                                    verified_inputs[j]=batch.batch.token[j];
+                                    verified_positions[j]=batch.batch.pos[j];
+                                }
+                                batch.clear();
+                                for(std::size_t j=0;j<replay_n;++j)
+                                    batch.push(verified_inputs[j],verified_positions[j],0,true);
+                                local_rows.resize(replay_n);
+                                output_rows=std::uint32_t(replay_n);
+                                single_output_row=replay_n==1 ? 0 : -1;
+                                std::unique_lock<std::mutex> replay_lock(
+                                    submission_mutex,std::defer_lock);
+                                if(service)replay_lock.lock();
+                                const auto active_count=active.fetch_add(1)+1;
+                                epoch_active=true;
+                                auto seen=maximum.load();
+                                while(seen<active_count &&
+                                      !maximum.compare_exchange_weak(seen,active_count)){}
+                                const auto begin_replay=now_ns();
+                                const int ret=llama_decode(ctx,batch.batch);
+                                metrics.decode_submit_ns+=now_ns()-begin_replay;
+                                if(replay_lock.owns_lock())replay_lock.unlock();
+                                ++metrics.decode_calls;
+                                metrics.input_rows+=batch.batch.n_tokens;
+                                require(ret==0,"MTP multi verified-target-prefix replay failed");
+                                llama_synchronize(ctx);
+                                if(service) {
+                                    ggml_relay_status status{};
+                                    for(;;) {
+                                        if(!ggml_backend_relay_snapshot(native[wi],&status)){
+                                            pause_cpu();continue;
+                                        }
+                                        require(!status.failed&&!failure.stopped.load(),
+                                            "native relay failed MTP multi prefix replay");
+                                        if(status.finished&&service->retired(wi,status))break;
+                                        pause_cpu();
+                                    }
+                                }
+                                active.fetch_sub(1);
+                                epoch_active=false;
+
+                                for(std::size_t j=0;j<replay_n;++j) {
+                                    const float * replay=llama_get_logits_ith(ctx,int(j));
+                                    require(replay!=nullptr,
+                                        "MTP multi genuine replay missing original target logits");
+                                    const auto greedy=tq::sampling::select_finite_greedy(replay,n_vocab);
+                                    require(greedy.usable,
+                                        "MTP multi replay has nonfinite target logits");
+                                    auto & ref=verifier_rows[j];
+                                    const auto v=tq::sampling::select_finite_greedy(ref.data(),n_vocab);
+                                    require(v.usable,
+                                        "MTP multi target original verifier row nonfinite");
+                                    if(greedy.selected.id!=v.selected.id) {
+                                        double e2=0,b2=0,maxabs=0;
+                                        for(std::uint32_t t=0;t<n_vocab;++t) {
+                                            const double a=ref[t],b=replay[t];
+                                            require(std::isfinite(a)&&std::isfinite(b),
+                                                "MTP multi target/replay nonfinite F32");
+                                            e2+=(a-b)*(a-b);b2+=a*a;
+                                            maxabs=std::max(maxabs,std::abs(a-b));
+                                        }
+                                        const double rel=std::sqrt(e2/std::max(b2,1e-30));
+                                        std::vector<int> orderA(n_vocab),orderB(n_vocab);
+                                        for(std::uint32_t t=0;t<n_vocab;++t){
+                                            orderA[t]=int(t);orderB[t]=int(t);
+                                        }
+                                        std::partial_sort(orderA.begin(),orderA.begin()+10,orderA.end(),
+                                            [&](int a,int b){return ref[a]>ref[b];});
+                                        std::partial_sort(orderB.begin(),orderB.begin()+10,orderB.end(),
+                                            [&](int a,int b){return replay[a]>replay[b];});
+                                        int overlap=0;
+                                        for(int a=0;a<10;++a)for(int b=0;b<10;++b)
+                                            if(orderA[a]==orderB[b])++overlap;
+                                        const double amax=ref[orderA[0]];
+                                        const double bmax=replay[orderB[0]];
+                                        double Za=0,Zb=0,mean_delta=0;
+                                        for(std::uint32_t t=0;t<n_vocab;++t){
+                                            const double w=std::exp(double(ref[t])-amax);
+                                            Za+=w;
+                                            Zb+=std::exp(double(replay[t])-bmax);
+                                            mean_delta+=w*(double(ref[t])-double(replay[t]));
+                                        }
+                                        const double KL=mean_delta/Za +
+                                            (bmax+std::log(Zb))-(amax+std::log(Za));
+                                        if (mtp_state_trace) {
+                                            std::fprintf(stderr,
+                                                "TP5_REAL_MTP_MULTI_NUMERIC window=%u row=%zu original_top1=%d replay_top1=%d relL2=%.9g KL=%.9g top10=%d maxabs=%.9g\n",
+                                                wi,j,int(v.selected.id),
+                                                int(greedy.selected.id),rel,KL,overlap,maxabs);
+                                            std::fflush(stderr);
+                                        }
+                                        require(std::isfinite(KL)&&KL>=-1e-6&&KL<=0.05&&
+                                                rel<=0.05&&overlap>=9,
+                                            "MTP multi verifier/replay F32 distribution materially differs");
+                                    }
+                                    if(j<accepted)
+                                        require(greedy.selected.id==v.selected.id,
+                                            "MTP multi accepted-prefix token changed during rollback replay");
+                                }
+                                if(replay_n==1)
+                                    single_output_logits=llama_get_logits_ith(ctx,0);
+                                if (mtp_state_trace) {
+                                    std::fprintf(stderr,
+                                        "TP5_REAL_MTP_MULTI_REJECT_ROLLBACK_PASS window=%u matched_prefix=%zu replay_N=%zu restored_bytes=%zu\n",
+                                        wi,accepted,replay_n,restored);
+                                    std::fflush(stderr);
+                                }
+                                }
+                            } else {
+                                target_state_checkpoint.clear();
+                                if (mtp_state_trace) {
+                                    std::fprintf(stderr,
+                                        "TP5_REAL_MTP_MULTI_ACCEPT window=%u n_drafts=%zu committed_outputs=%zu\n",
+                                        wi,n,n+1);
+                                    std::fflush(stderr);
+                                }
+                            }
+                        }
                         const auto commit_start = now_ns();
                         for (std::size_t row = 0; row < local_rows.size(); ++row) {
                             const auto local          = local_rows[row];
                             auto &     request        = result.requests[ids[local]];
                             const auto input_position = consumed[local]++;
+                            if (prompt_catchup && input_position < request.prompt_tokens.size()) {
+                                require(ids.size() == 1 && local == 0 &&
+                                        input_position == draft_prompt_rows &&
+                                        batch.batch.pos[row] == static_cast<llama_pos>(input_position) &&
+                                        batch.batch.token[row] == request.prompt_tokens[input_position],
+                                        "draft prompt rows must match the private prompt in order");
+                                const auto prompt_start=now_ns();
+                                constexpr int wide=10240;
+                                const float * target_h=llama_get_embeddings_nextn_ith(ctx, int32_t(row));
+                                require(target_h != nullptr, "prompt target hidden row is missing");
+                                for (int j=0;j<wide;++j)
+                                    require(std::isfinite(target_h[j]), "prompt target hidden is nonfinite");
+                                if (!prompt_audit_prefix.empty()) {
+                                    const auto save_row = [&](const char * kind, const float * data) {
+                                        const auto path=prompt_audit_prefix+"-"+kind+"-w"+std::to_string(wi)+".f32le";
+                                        FILE * file=std::fopen(path.c_str(), input_position == 0 ? "wbx" : "ab");
+                                        require(file != nullptr, "could not open prompt hidden audit");
+                                        const bool written=std::fwrite(data, sizeof(float), wide, file) == wide;
+                                        const bool closed=std::fclose(file) == 0;
+                                        require(written && closed, "prompt hidden audit write failed");
+                                    };
+                                    save_row("input", draft_prompt_previous_h.data());
+                                    save_row("target", target_h);
+                                }
+                                auto * dctx=trained_mtp_contexts.at(wi).get();
+                                llama_batch prompt_batch=llama_batch_init(1,wide,1);
+                                prompt_batch.token=static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
+                                require(prompt_batch.token != nullptr, "prompt draft token allocation failed");
+                                prompt_batch.n_tokens=1;
+                                prompt_batch.token[0]=batch.batch.token[row];
+                                prompt_batch.pos[0]=static_cast<llama_pos>(input_position);
+                                prompt_batch.n_seq_id[0]=1;
+                                prompt_batch.seq_id[0][0]=0;
+                                prompt_batch.logits[0]=0;
+                                std::memcpy(prompt_batch.embd,draft_prompt_previous_h.data(),wide*sizeof(float));
+                                const int rc=llama_decode(dctx,prompt_batch);
+                                std::free(prompt_batch.token);
+                                prompt_batch.token=nullptr;
+                                llama_batch_free(prompt_batch);
+                                require(rc == 0, "draft prompt catch-up failed");
+                                draft_pending = true;
+                                std::memcpy(draft_prompt_previous_h.data(),target_h,wide*sizeof(float));
+                                ++draft_prompt_rows;
+                                if (draft_prompt_rows == request.prompt_tokens.size()) {
+                                    llama_synchronize(dctx);
+                                    draft_pending = false;
+                                    const auto kv_min=llama_memory_seq_pos_min(llama_get_memory(dctx),0);
+                                    const auto kv_max=llama_memory_seq_pos_max(llama_get_memory(dctx),0);
+                                    require(kv_min == 0 && kv_max+1 == static_cast<llama_pos>(draft_prompt_rows),
+                                            "draft prompt KV is incomplete before the first generated input");
+                                    std::fprintf(stderr,
+                                        "TP5_MTP_PROMPT_CATCHUP window=%u rows=%zu kv_min=%d kv_max=%d initial_hidden_zero=1 next_input_pos=%zu\n",
+                                        wi,draft_prompt_rows,int(kv_min),int(kv_max),draft_prompt_rows);
+                                }
+                                draft_prompt_ns+=now_ns()-prompt_start;
+                            }
                             if (!batch.batch.logits[row]) {
                                 continue;
                             }
@@ -760,6 +1547,135 @@ run_result run(const options & requested) {
                             const auto greedy = tq::sampling::select_finite_greedy(logits, n_vocab);
                             require(greedy.usable, "nonfinite full model logits");
                             const llama_token selected = greedy.selected.id;
+                            if (mtp_draft_smoke && request.tokens.size() + 1 < opts.predict) {
+                                require(row < static_cast<std::size_t>(batch.batch.n_tokens),
+                                        "MTP output row must belong to actual target decode");
+                                // This hidden row corresponds to the last real prompt
+                                // token; the newly target-sampled id is the NEXT token
+                                // to feed the trained MTP block (shift-by-one).
+                                const float * real_h = llama_get_embeddings_nextn_ith(ctx, int32_t(row));
+                                require(real_h != nullptr, "actual target did not export its wide NextN residual");
+                                constexpr int wide = 10240;
+                                double hnorm = 0;
+                                for (int j=0;j<wide;++j) {
+                                    require(std::isfinite(real_h[j]), "target MTP wide residual is nonfinite");
+                                    hnorm += double(real_h[j])*real_h[j];
+                                }
+                                require(hnorm > 0, "actual target residual must be nontrivial");
+                                auto * dctx = trained_mtp_contexts.at(wi).get();
+                                const bool last_target_row=row+1==local_rows.size();
+                                const bool draft_output = !last_draft_logits || last_target_row;
+                                const auto first_start=now_ns();
+                                llama_batch dft_batch = llama_batch_init(1, wide, 1);
+                                dft_batch.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
+                                require(dft_batch.token != nullptr, "actual MTP token input allocation failed");
+                                dft_batch.n_tokens = 1;
+                                dft_batch.token[0] = selected;
+                                dft_batch.pos[0] = static_cast<llama_pos>(consumed[local]);
+                                dft_batch.n_seq_id[0] = 1;
+                                dft_batch.seq_id[0][0] = 0;
+                                dft_batch.logits[0] = draft_output ? 1 : 0;
+                                std::memcpy(dft_batch.embd, real_h, wide*sizeof(float));
+                                const int dc = llama_decode(dctx, dft_batch);
+                                std::free(dft_batch.token);
+                                dft_batch.token = nullptr;
+                                llama_batch_free(dft_batch);
+                                require(dc == 0, "actual MTP draft decode from target residual failed");
+                                draft_pending = true;
+                                // These rows only update draft KV. Their outputs are unused.
+                                if (!draft_output) {
+                                    diag_draft_first+=now_ns()-first_start; ++diag_first_count;
+                                    ++diag_state_only_count;
+                                } else {
+                                    const auto * dl = llama_get_logits_ith(dctx, 0);
+                                    const auto * dh = llama_get_embeddings_nextn_ith(dctx, 0);
+                                    require(dl && dh, "actual MTP draft missing logits/wide output");
+                                    draft_pending = false;
+                                    auto dg = tq::sampling::select_finite_greedy(dl,n_vocab);
+                                    require(dg.usable, "actual trained MTP logits must be finite");
+                                    double dsum=0;
+                                    for (int j=0;j<wide;++j) {
+                                        require(std::isfinite(dh[j]),"actual MTP output residual nonfinite");
+                                        dsum+=double(dh[j])*dh[j];
+                                    }
+                                    require(dsum>0,"actual trained MTP output residual empty");
+                                    // Each emitted real target token's ACTUAL
+                                    // corresponding h_nextn is paired with that
+                                    // selected token at shifted position. When
+                                    // the target accepted two outputs in one
+                                    // batch, process BOTH true output tokens
+                                    // sequentially in the MTP context; the last
+                                    // proposal supersedes the earlier proposal.
+                                    diag_draft_first+=now_ns()-first_start; ++diag_first_count;
+                                    if(last_target_row){
+                                        pending_mtp_tokens.clear();
+                                        const auto produced_after_this=request.tokens.size()+1;
+                                        const std::size_t remaining=opts.predict-produced_after_this;
+                                        const auto n_propose=std::min<std::size_t>(
+                                            mtp_depth,remaining>1?remaining-1:0);
+                                        if(n_propose>0){
+                                            pending_mtp_tokens.push_back(dg.selected.id);
+                                            std::vector<float> prev_draft_h(dh,dh+wide);
+                                            auto next_token=dg.selected.id;
+                                            for(std::size_t extra=1;extra<n_propose;++extra){
+                                                const auto extra_start=now_ns();
+                                                llama_batch extra_batch=llama_batch_init(1,wide,1);
+                                                extra_batch.token=static_cast<llama_token *>(
+                                                    std::malloc(sizeof(llama_token)));
+                                                require(extra_batch.token!=nullptr,
+                                                    "MTP multi extra draft token input malloc failed");
+                                                extra_batch.n_tokens=1;
+                                                extra_batch.token[0]=next_token;
+                                                extra_batch.pos[0]=static_cast<llama_pos>(
+                                                    consumed[local]+extra);
+                                                extra_batch.n_seq_id[0]=1;
+                                                extra_batch.seq_id[0][0]=0;
+                                                extra_batch.logits[0]=1;
+                                                std::memcpy(extra_batch.embd,prev_draft_h.data(),
+                                                    wide*sizeof(float));
+                                                const int extra_rc=llama_decode(dctx,extra_batch);
+                                                std::free(extra_batch.token);
+                                                extra_batch.token=nullptr;
+                                                llama_batch_free(extra_batch);
+                                                require(extra_rc==0,
+                                                    "real trained multi-draft MTP decode failed");
+                                                const float * more=llama_get_logits_ith(dctx,0);
+                                                const float * h_more=llama_get_embeddings_nextn_ith(dctx,0);
+                                                require(more&&h_more,
+                                                    "multi-draft NextN missing true logits/hidden");
+                                                const auto greedy_more=tq::sampling::select_finite_greedy(
+                                                    more,n_vocab);
+                                                require(greedy_more.usable,
+                                                    "multi-draft NextN full logits nonfinite");
+                                                for(int j=0;j<wide;++j)
+                                                    require(std::isfinite(h_more[j]),
+                                                        "multi-draft NextN hidden nonfinite");
+                                                pending_mtp_tokens.push_back(greedy_more.selected.id);
+                                                next_token=greedy_more.selected.id;
+                                                std::memcpy(prev_draft_h.data(),h_more,
+                                                    wide*sizeof(float));
+                                                diag_draft_extra+=now_ns()-extra_start; ++diag_extra_count;
+                                            }
+                                            if (mtp_state_trace) {
+                                                std::fprintf(stderr,
+                                                    "TP5_REAL_MTP_MULTI_DRAFT window=%u depth=%zu source_pos=%llu draft0=%d draft_last=%d\n",
+                                                    wi,pending_mtp_tokens.size(),
+                                                    (unsigned long long)consumed[local],
+                                                    int(pending_mtp_tokens.front()),
+                                                    int(pending_mtp_tokens.back()));
+                                                std::fflush(stderr);
+                                            }
+                                        }
+                                    }
+                                    if (mtp_state_trace) {
+                                        std::fprintf(stderr,
+                                            "TP5_REAL_TRAINED_MTP_FROM_TARGET window=%u seq=0 target_last_input=%d next_token=%d next_pos=%llu draft_proposal=%d target_h_l2sq=%.8g draft_h_l2sq=%.8g\n",
+                                            wi, int(batch.batch.token[row]), int(selected),
+                                            (unsigned long long)consumed[local],int(dg.selected.id),hnorm,dsum);
+                                        std::fflush(stderr);
+                                    }
+                                }
+                            }
                             token_record record;
                             record.input_token    = batch.batch.token[row];
                             record.sampled_token  = selected;
@@ -792,6 +1708,70 @@ run_result run(const options & requested) {
                         }
                         metrics.last_finish_ns = now_ns();
                         metrics.result_commit_ns += metrics.last_finish_ns - commit_start;
+                        if (!timeline_prefix.empty()) {
+                            auto & rows = cycle_timings[wi];
+                            require(rows.size() < rows.capacity(), "cycle timing capacity exhausted");
+                            rows.push_back({metrics.decode_calls, (std::uint64_t)cycle_rows,
+                                (std::uint64_t)cycle_position, cycle_queue_start, submit_start,
+                                submit_finished, wait_finished, metrics.last_finish_ns});
+                        }
+                    }
+                    std::fprintf(stderr,
+                        "TP5_DIAG_PHASE window=%u elapsed_ns=%llu draft_first_ns=%llu draft_extra_ns=%llu state_trim_ns=%llu submission_queue_ns=%llu target_submit_ns=%llu native_wait_ns=%llu commit_including_draft_ns=%llu draft_first_calls=%llu draft_extra_calls=%llu state_trim_calls=%llu\n",
+                        wi,(unsigned long long)(now_ns()-diag_begin),
+                        (unsigned long long)diag_draft_first,(unsigned long long)diag_draft_extra,
+                        (unsigned long long)diag_state,(unsigned long long)diag_queue,
+                        (unsigned long long)metrics.decode_submit_ns,(unsigned long long)metrics.native_wait_ns,
+                        (unsigned long long)metrics.result_commit_ns,(unsigned long long)diag_first_count,
+                        (unsigned long long)diag_extra_count,(unsigned long long)diag_state_count);
+                    if (paired_phases) {
+                        std::fprintf(stderr, "TP5_MTP_READY_PAIR_TOTAL window=%u meets=%llu before_ns=%llu after_ns=%llu\n",
+                            wi, (unsigned long long)pair_meets, (unsigned long long)pair_before_ns,
+                            (unsigned long long)pair_after_ns);
+                    }
+                    if (paired_phases) {
+                        if (draft_pending) {
+                            llama_synchronize(trained_mtp_contexts.at(wi).get());
+                            draft_pending = false;
+                            ++draft_phase_drains;
+                        }
+                        std::fprintf(stderr, "TP5_MTP_DRAFT_PHASE_DRAIN_TOTAL window=%u count=%llu\n",
+                            wi, (unsigned long long) draft_phase_drains);
+                        require(pair_ready_hits == metrics.decode_calls, "Meta submit-ready count mismatch");
+                        require(!post_submit_unlock || pair_submitted_hits == metrics.decode_calls,
+                                "Meta submitted count mismatch");
+                        std::fprintf(stderr,"TP5_MTP_SUBMITTED_TOTAL window=%u enabled=%u calls=%llu\n",
+                            wi,unsigned(post_submit_unlock),(unsigned long long)pair_submitted_hits);
+                        std::fprintf(stderr,"TP5_MTP_READY_TOTAL window=%u calls=%llu wait_ns=%llu\n",
+                            wi,(unsigned long long)pair_ready_hits,(unsigned long long)pair_ready_ns);
+                    }
+                    if (mtp_draft_smoke) {
+                        if (prompt_catchup) {
+                            require(ids.size() == 1 &&
+                                    draft_prompt_rows == result.requests[ids[0]].prompt_tokens.size(),
+                                    "request ended with missing draft prompt rows");
+                            std::fprintf(stderr,
+                                "TP5_MTP_PROMPT_TOTAL window=%u rows=%zu elapsed_ns=%llu\n",
+                                wi,draft_prompt_rows,(unsigned long long)draft_prompt_ns);
+                        }
+                        std::fprintf(stderr,
+                            "TP5_MTP_DRAFT_OUTPUT_TOTAL window=%u state_only_calls=%llu output_calls=%llu\n",
+                            wi,(unsigned long long)diag_state_only_count,
+                            (unsigned long long)(diag_first_count-diag_state_only_count));
+                        std::fprintf(stderr,
+                            "TP5_REAL_MTP_REPEATED_TOTAL window=%u verified_rounds=%llu accepted_rounds=%llu rejected_rollback_rounds=%llu emitted=%zu target_decode_calls=%llu\n",
+                            wi,(unsigned long long)mtp_verify_rounds,
+                            (unsigned long long)mtp_accept_rounds,
+                            (unsigned long long)mtp_rollback_rounds,
+                            result.requests[ids[0]].tokens.size(),
+                            (unsigned long long)metrics.decode_calls);
+                        std::fprintf(stderr,
+                            "TP5_REAL_MTP_MULTI_TOTAL window=%u draft_depth=%u drafted_tokens=%llu accepted_draft_tokens=%llu accepted_fraction=%.6f\n",
+                            wi,mtp_depth,(unsigned long long)mtp_proposal_tokens,
+                            (unsigned long long)mtp_accepted_draft_tokens,
+                            mtp_proposal_tokens ?
+                                double(mtp_accepted_draft_tokens)/mtp_proposal_tokens : 0.0);
+                        std::fflush(stderr);
                     }
                 } catch (...) {
                     if (epoch_active) {
@@ -803,10 +1783,12 @@ run_result run(const options & requested) {
                         service->abort_all();
                     }
                 }
+                phase_pair.retire();
                 workers_done.fetch_add(1, std::memory_order_release);
             });
         } catch (...) {
             failure.fail(std::current_exception());
+            phase_pair.cancel();
             if (service) {
                 service->abort_all();
             }
@@ -864,6 +1846,7 @@ run_result run(const options & requested) {
         }
         try {
             service->finish_ledgers(failure.stopped.load());
+            if (!timeline_prefix.empty()) service->write_timings(timeline_prefix);
             for (std::size_t wi = 0; wi < opts.windows; ++wi) {
                 service->copy_wire_metrics(wi, result.windows[wi]);
             }
@@ -889,6 +1872,24 @@ run_result run(const options & requested) {
     result.active_requests_after_close = budget.active_count();
     result.max_simultaneous_windows     = maximum.load();
     result.finished_ns                 = now_ns();
+    if (!timeline_prefix.empty()) {
+        for (std::size_t i = 0; i < cycle_timings.size(); ++i) {
+            const auto path = timeline_prefix + ".cycles-" + std::to_string(i) + ".csv";
+            auto * out = std::fopen(path.c_str(), "wx");
+            require(out != nullptr, "cannot create cycle timing output");
+            std::fprintf(out, "call,rows,position,queue_ns,submit_ns,submitted_ns,waited_ns,committed_ns\n");
+            for (const auto & r : cycle_timings[i]) {
+                std::fprintf(out, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                    (unsigned long long)r.call, (unsigned long long)r.rows,
+                    (unsigned long long)r.position, (unsigned long long)r.queue_ns,
+                    (unsigned long long)r.submit_ns, (unsigned long long)r.submitted_ns,
+                    (unsigned long long)r.waited_ns, (unsigned long long)r.committed_ns);
+            }
+            const bool written = !std::ferror(out);
+            const int closed = std::fclose(out);
+            require(written && closed == 0, "cycle timing output failed");
+        }
+    }
     if (failure.first) {
         std::fprintf(stderr, "TP5_FAILURE_CLEANUP reserved_tokens=%llu active_requests=%u\n",
                      static_cast<unsigned long long>(result.reserved_tokens_after_close),

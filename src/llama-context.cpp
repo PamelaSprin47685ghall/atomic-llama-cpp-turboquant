@@ -1,3 +1,4 @@
+#include "llama-memory-hybrid-idx.h"
 #include "llama-context.h"
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
@@ -213,7 +214,17 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
              ((params.type_k != GGML_TYPE_F16 && params.type_k != GGML_TYPE_F32) ||
               (params.type_v != GGML_TYPE_F16 && params.type_v != GGML_TYPE_F32))) ||
             !params.offload_kqv || !params.op_offload || params.embeddings || params.n_samplers != 0 ||
-            params.cb_eval != nullptr || params.kv_stream_arena_mib != 0 || params.n_rs_seq != 0 ||
+            params.cb_eval != nullptr || params.kv_stream_arena_mib != 0 ||
+            // Opt-in, fully bounded Qwen4Exp MTP N=2 target verifier rollback.
+            // The model has native (1+n_rs_seq) recurrent state planes, and
+            // llama_memory_recurrent::seq_rm checks rollback distance <=2.
+            // Keep ALL other tp5-relay admissions exactly as before; never
+            // permit an unqualified arch/seq count/batch or switch the default.
+            (params.n_rs_seq != 0 &&
+             !(params.n_rs_seq == 2 && model.arch == LLM_ARCH_QWEN4EXP &&
+               params.n_seq_max == 1 && params.n_batch == 4 && params.n_ubatch == 4 &&
+               std::getenv("GGML_TP5_MTP_RS_RING") &&
+               std::strcmp(std::getenv("GGML_TP5_MTP_RS_RING"), "1") == 0)) ||
             params.attention_type == LLAMA_ATTENTION_TYPE_NON_CAUSAL || params.batch_invariant_matmul) {
             throw std::runtime_error("tp5-relay requires 1..4 sequences/rows, bounded profile KV capacity, one ubatch, F16/F32 KV or native Swift FA Q4_0 KV, no sampler, callback or alternate compute policy");
         }
@@ -2504,6 +2515,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
                                                  ggml_status &            ret) {
+    const int64_t diag_start = ggml_time_us();
+    const auto * diag_hybrid = dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx);
+    const uint32_t diag_replay = diag_hybrid ? diag_hybrid->get_recr()->get_replay_len() : 0;
+    int64_t diag_build = 0, diag_alloc = 0;
     if (backend_tp5_relay != nullptr) {
         // A retained input batch owns this context's host graph buffers until
         // completion. Drain before memory updates, graph reset, or set_inputs.
@@ -2561,7 +2576,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const int64_t diag_prepared = ggml_time_us();
+    const bool diag_reused = !graph_reuse_disable && res->can_reuse(gparams);
+    if (diag_reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2573,6 +2590,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
         n_reused++;
     } else {
+        const int64_t diag_build_start = ggml_time_us();
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -2590,11 +2608,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             return nullptr;
         }
 
+        diag_build = ggml_time_us() - diag_build_start;
+        const int64_t diag_alloc_start = ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        diag_alloc = ggml_time_us() - diag_alloc_start;
     }
 
     // Validate the actual scheduler placement before submitting any compute.
@@ -2628,6 +2649,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             }
         }
     }
+    const int64_t diag_input_start = ggml_time_us();
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -2638,7 +2660,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t diag_compute_start = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (backend_tp5_relay && std::getenv("TP5_DIAG_GRAPH")) {
+        LLAMA_LOG_INFO("TP5_DIAG_GRAPH ctx=%p N=%u pos=%d replay=%u reused=%d pre_us=%lld build_us=%lld alloc_us=%lld inputs_us=%lld compute_us=%lld total_us=%lld\n",
+            (void *) this, ubatch.n_tokens, ubatch.pos ? ubatch.pos[0] : -1, diag_replay, int(diag_reused),
+            (long long)(diag_prepared-diag_start),(long long)diag_build,(long long)diag_alloc,
+            (long long)(diag_compute_start-diag_input_start),(long long)(ggml_time_us()-diag_compute_start),
+            (long long)(ggml_time_us()-diag_start));
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

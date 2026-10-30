@@ -228,6 +228,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 // An invalid window makes set_input pad with EOS, which is what a fresh sequence also gets.
 //
 
+size_t llama_memory_hybrid_idx::ple_hist_capacity() const {
+    const auto n_gram = hparams_idx.ple_ngram_size;
+    return n_gram > 0 ? size_t(n_gram - 1) + get_mem_recr()->n_rs_seq : 0;
+}
+
 llama_memory_hybrid_idx::ple_history & llama_memory_hybrid_idx::ple_hist_get(llama_seq_id seq_id) const {
     return ple_hist[seq_id];
 }
@@ -393,7 +398,7 @@ void llama_memory_hybrid_idx::ple_hist_div(llama_seq_id seq_id, llama_pos p0, ll
 // sequence share one format:
 //   u32 n_entries
 //   n_entries * { i32 seq_id, i32 next_pos, u32 n_toks, i32 toks[n_toks] }
-// n_toks is at most ple_ngram_size - 1, so an entry is a handful of bytes.
+// n_toks is bounded by ple_hist_capacity(), including the supported rewind suffix.
 void llama_memory_hybrid_idx::ple_hist_state_write(llama_io_write_i & io, llama_seq_id seq_id) const {
     uint32_t n_entries = 0;
     for (const auto & it : ple_hist) {
@@ -443,9 +448,8 @@ void llama_memory_hybrid_idx::ple_hist_state_read(llama_io_read_i & io, llama_se
         io.read(&next_pos, sizeof(next_pos));
         io.read(&n_toks,   sizeof(n_toks));
 
-        // the window is never longer than ple_ngram_size - 1, so a larger count is a corrupt
-        // blob and would size an allocation from the file
-        if (n_toks > LLAMA_MAX_PLE_NGRAM - 1) {
+        // Reject counts beyond this context's history and rewind capacity before allocation.
+        if (n_toks > ple_hist_capacity()) {
             throw std::runtime_error("qwen4exp PLE history: implausible token count in state blob");
         }
 
@@ -621,6 +625,11 @@ llama_memory_hybrid_idx::ple_history & llama_memory_hybrid_idx_context::get_ple_
     GGML_ASSERT(mem != nullptr);
 
     return mem->ple_hist_get(seq_id);
+}
+
+size_t llama_memory_hybrid_idx_context::ple_hist_capacity() const {
+    GGML_ASSERT(mem != nullptr);
+    return mem->ple_hist_capacity();
 }
 
 void llama_memory_hybrid_idx_context::set_input_qsa(

@@ -1808,6 +1808,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        const int64_t d0=ggml_time_us();
         input_copy_scope input_copies = { split_backend, false };
         bool batch_inputs = split->n_inputs > 0 && split_backend->iface.cpy_tensor_async != nullptr;
         bool has_user_input = false;
@@ -1977,12 +1978,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // The default API preserves immediate host-input reuse. The explicit
         // retained-input API can leave uploads ordered before compute on each
         // backend stream; a rejected/partial batch keeps the original contract.
+        const int64_t dcopied=ggml_time_us();
         const bool defer_input_flush = retained_inputs && sched->n_splits == 1 &&
                 sched->callback_eval == nullptr && batch_inputs;
         if (!defer_input_flush) {
             input_copies.flush();
         }
 
+        const int64_t dflushed=ggml_time_us();
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2022,6 +2025,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t dcomputed=ggml_time_us();
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2033,6 +2037,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // Every earlier return/exception still drains through the scope.
             input_copies.pending = false;
         }
+        if (std::getenv("TP5_DIAG_GRAPH")) GGML_LOG_INFO("TP5_DIAG_SCHED backend=%s split=%d inputs=%d batched=%d retained=%d defer=%d copy_us=%lld flush_us=%lld compute_us=%lld event_us=%lld\n",ggml_backend_name(split_backend),split_id,split->n_inputs,int(batch_inputs),int(retained_inputs),int(defer_input_flush),(long long)(dcopied-d0),(long long)(dflushed-dcopied),(long long)(dcomputed-dflushed),(long long)(ggml_time_us()-dcomputed));
     }
 
     return GGML_STATUS_SUCCESS;
