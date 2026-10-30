@@ -271,6 +271,11 @@ public:
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
+    // the context's long-lived inference graph result (ABI-stable accessor
+    // used by the side-table state in llama-nout-state.cpp; layout-neutral
+    // member-function declaration)
+    llm_graph_result * get_gf_res_prev() const { return gf_res_prev.get(); }
+
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
@@ -288,6 +293,24 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    // union-graph runtime n_kv binder.
+    //
+    // The live graph is built at a 256-aligned n_kv envelope (>= the next bucket
+    // boundary) and its pre-allocation skeleton + per-tensor byte envelopes are
+    // stored in nkv_record. When only the KV cache's n_kv bucket moved, the binder
+    // rebuilds the graph in a scratch result at the new n_kv, verifies the node
+    // skeleton matches, checks every changed tensor still fits inside the live
+    // graph's envelope, and copies the changed fields (ne/nb/op_params/view_offs/
+    // data) into the live graph in place. Fail-closed: only 256-aligned n_kv values
+    // are accepted; any mismatch falls back to a full rebuild.
+    // returns true when res's graph was patched in place and can be reused.
+    // env: LLAMA_GRAPH_UNION_NKV_RUNTIME (enabled only by the exact value "1")
+    bool graph_try_patch_nkv(llm_graph_result * res, const llm_graph_params & params);
+
+    // record the pre-allocation skeleton + byte envelopes of a freshly built (not
+    // yet sched-placed) graph into the nkv_record_* members
+    void nkv_record_snapshot(ggml_cgraph * gf);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)

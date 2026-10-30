@@ -8,6 +8,7 @@
 #include "llama-ext.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-nout-state.h"
 #include "llama-io.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
@@ -30,6 +31,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 //
 // llama_context
@@ -439,9 +441,88 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
     }
 
+    {
+        // activation is deliberately strict: only the exact string "1" enables the
+        // runtime n_kv binder; any other value (including "0", "true", "on") leaves
+        // the feature off, so the disabled path stays bitwise-identical to baseline
+        // (ABI-stable: the flag lives in the side table, not a data member)
+        const char * LLAMA_GRAPH_UNION_NKV_RUNTIME = getenv("LLAMA_GRAPH_UNION_NKV_RUNTIME");
+        llama_nkv_ctx_state_get(this).nkv_enabled =
+            LLAMA_GRAPH_UNION_NKV_RUNTIME && strcmp(LLAMA_GRAPH_UNION_NKV_RUNTIME, "1") == 0;
+
+        if (llama_nkv_ctx_state_get(this).nkv_enabled) {
+            LLAMA_LOG_WARN("%s: union nkv runtime graph patching enabled\n", __func__);
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
+    // env: GGML_TP5_NOUT_REUSE - exact string "1" enables the runtime
+    // output-capacity reuse lane; unset or any other value keeps it off.
+    //
+    // Capacity reuse: the graph is built once over the output envelope
+    // (cparams.n_outputs_max) and each ubatch narrows the whole output
+    // closure (gather -> add/norm/ffn -> lm_head) to the active count in
+    // place - 0 outputs executes 0 rows, no padding. build_sampling()
+    // consumes the gather output through a PAD (+1 row), so with backend
+    // samplers attached the lane is NOT safe; the effective flag is forced
+    // off in that case.
+    {
+        const char * GGML_TP5_NOUT_REUSE = getenv("GGML_TP5_NOUT_REUSE");
+        auto & nout_st = llama_nkv_ctx_state_get(this);
+        nout_st.nout_gate    = GGML_TP5_NOUT_REUSE != nullptr && strcmp(GGML_TP5_NOUT_REUSE, "1") == 0;
+        nout_st.nout_enabled = nout_st.nout_gate;
+
+        if (nout_st.nout_gate) {
+            if (!sampling.samplers.empty()) {
+                nout_st.nout_enabled = false;
+                LLAMA_LOG_WARN("%s: runtime n_outputs binding DISABLED: backend samplers attached; the gather output feeds build_sampling (PAD +1 row), which the binding does not cover - graphs rebuild at the exact count instead\n", __func__);
+            } else {
+                LLAMA_LOG_WARN("%s: runtime n_outputs binding enabled (GGML_TP5_NOUT_REUSE=1, logits extraction only)\n", __func__);
+            }
+        }
+    }
+
+    {
+        // env: LLAMA_NOUT_FLOOR1_REUSE - exact string "1" enables the nout
+        // floor1 lane: graphs build at max(active, 1) rows (a floor of one
+        // output row for 0-output steps, the exact active count otherwise -
+        // never an envelope/capacity build), and the bind lane narrows the
+        // executed output closure to the active count in place. Unset or any
+        // other value keeps it off, bitwise-identical to baseline.
+        // Mutually exclusive with the GGML_TP5_NOUT_REUSE envelope lane: the
+        // envelope lane owns the reuse machinery when armed, so floor1 only
+        // arms on a clean baseline.
+        const char * LLAMA_NOUT_FLOOR1_REUSE = getenv("LLAMA_NOUT_FLOOR1_REUSE");
+        auto & nout_st = llama_nkv_ctx_state_get(this);
+        nout_st.nout1_gate = LLAMA_NOUT_FLOOR1_REUSE != nullptr && strcmp(LLAMA_NOUT_FLOOR1_REUSE, "1") == 0;
+        nout_st.nout1_enabled = nout_st.nout1_gate && !nout_st.nout_gate;
+
+        if (nout_st.nout1_gate) {
+            if (nout_st.nout_gate) {
+                LLAMA_LOG_WARN("%s: nout floor1 refused: GGML_TP5_NOUT_REUSE envelope lane already armed\n", __func__);
+            } else if (!sampling.samplers.empty()) {
+                nout_st.nout1_enabled = false;
+                LLAMA_LOG_WARN("%s: nout floor1 DISABLED: backend samplers attached; the gather output feeds build_sampling (PAD +1 row), which the bind lane does not cover\n", __func__);
+            } else {
+                LLAMA_LOG_WARN("%s: nout floor1 enabled (LLAMA_NOUT_FLOOR1_REUSE=1): graphs build at max(active, 1) rows; 0-output steps bind the floor row to 0\n", __func__);
+            }
+        }
+    }
+
+    {
+        // env: LLAMA_NOUT_FLOOR1_TRACE - r8 floor1 decision/build/skip trace.
+        // Exact string "1" only; pure instrumentation (side-table counters +
+        // log lines). Unset or any other value: no counter is touched and no
+        // line is logged - the context is bit-identical to stock.
+        const char * LLAMA_NOUT_FLOOR1_TRACE = getenv("LLAMA_NOUT_FLOOR1_TRACE");
+        auto & nout_st = llama_nkv_ctx_state_get(this);
+        nout_st.t_enabled = LLAMA_NOUT_FLOOR1_TRACE != nullptr && strcmp(LLAMA_NOUT_FLOOR1_TRACE, "1") == 0;
+        if (nout_st.t_enabled) {
+            LLAMA_LOG_INFO("%s: nout floor1 trace enabled (LLAMA_NOUT_FLOOR1_TRACE=1); trace is emitted on decoder steps of the floor1 lane only\n", __func__);
+        }
+    }
     if (cparams.kv_unified) {
         cparams.n_ctx_seq = cparams.n_ctx;
     } else {
@@ -978,6 +1059,40 @@ llama_context::~llama_context() {
             }
         }
     }
+    // one-line summary at context destruction (runbook contract: exact prefix
+    // NKV_BINDER_STATS, greppable by the HIP gate harness; printed only when
+    // LLAMA_GRAPH_UNION_NKV_RUNTIME=="1")
+    // (ABI-stable: the counters live in the side table, not data members)
+    {
+        const auto & st = llama_nkv_ctx_state_get(this);
+        if (st.nkv_enabled) {
+            LLAMA_LOG_INFO("NKV_BINDER_STATS attempts=%zu applied=%zu refused_align=%zu refused_skeleton=%zu refused_envelope=%zu refused_relay=%zu refused_pipeline=%zu fallbacks=%zu env_builds=%zu\n",
+                           st.c_attempts, st.c_applied, st.c_refused_align, st.c_refused_skeleton,
+                           st.c_refused_envelope, st.c_refused_relay, st.c_refused_pipeline,
+                           st.c_fallbacks, st.c_env_builds);
+        }
+        if (st.nout_gate) {
+            // runbook contract: exact prefix NOUT_REUSE_STATS
+            LLAMA_LOG_INFO("NOUT_REUSE_STATS binds=%zu fallbacks=%zu\n", st.nout_binds, st.nout_fallbacks);
+        }
+        if (st.nout1_gate) {
+            // runbook contract: exact prefix NOUT1_FLOOR_STATS
+            LLAMA_LOG_INFO("NOUT1_FLOOR_STATS binds=%zu fallbacks=%zu\n", st.nout1_binds, st.nout1_fallbacks);
+        }
+        if (st.t_enabled) {
+            // r8 floor1 trace aggregates (LLAMA_NOUT_FLOOR1_TRACE=1 only);
+            // runbook contract: exact prefix NOUT1_FLOOR_TRACE_STATS
+            LLAMA_LOG_INFO("NOUT1_FLOOR_TRACE_STATS dec=%llu reuse=%llu miss(first=%llu disabled=%llu ubatch=%llu outputs=%llu samplers=%llu cparams=%llu inputs=%llu) builds=%llu builds_fb=%llu bind_zero=%llu compute_skip=%llu gen=%llu\n",
+                (unsigned long long) st.t_dec, (unsigned long long) st.t_dec_reuse,
+                (unsigned long long) st.t_miss_first, (unsigned long long) st.t_miss_disabled, (unsigned long long) st.t_miss_ubatch,
+                (unsigned long long) st.t_miss_outputs, (unsigned long long) st.t_miss_samplers,
+                (unsigned long long) st.t_miss_cparams, (unsigned long long) st.t_miss_inputs,
+                (unsigned long long) st.t_builds, (unsigned long long) st.t_builds_fb,
+                (unsigned long long) st.t_bind_zero, (unsigned long long) st.t_compute_skip,
+                (unsigned long long) st.t_graph_gen);
+        }
+    }
+    llama_nkv_ctx_state_erase(this);
     ggml_opt_free(opt_ctx);
 }
 
@@ -1304,6 +1419,9 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
+    // ABI-stable side table: refresh the result->context reverse mapping
+    // (llama-nout-state.cpp) after replacing the long-lived result object
+    llama_nkv_ctx_state_get(this);
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
@@ -2500,6 +2618,372 @@ bool llama_context::set_adapter_cvec(const float * data, size_t len, int32_t n_e
     return res;
 }
 
+// union-graph runtime n_kv binder.
+//
+// Mechanism (reference nkv-bind semantics, bidirectional within a pre-built envelope):
+// 1. when the live graph is (re)built, process_ubatch builds it at a 256-aligned
+//    n_kv envelope cap >= the applied n_kv (clamped to the physical KV capacity)
+//    and records the graph's pre-allocation skeleton + per-tensor byte envelopes
+//    (nkv_record_* members); the scheduler allocates backing for the full cap;
+// 2. when the KV cache later moves within the envelope (can_reuse fails only on
+//    the stale n_kv-coupled shapes), graph_try_patch_nkv builds a scratch graph
+//    at the new n_kv and requires an exact skeleton match against the recorded
+//    live one;
+// 3. every changed graph-owned tensor must fit inside the recorded byte envelope
+//    of its live counterpart (the envelope IS the sched-allocated extent, so both
+//    shrink and growth within the cap have real backing);
+// 4. the changed fields (ne/nb/op_params/view_offs + view data pointers) are
+//    copied into the live graph in place, then set_inputs refills the KQ mask at
+//    the live width (cells beyond the applied n_kv are empty -> -INF masked).
+// Any mismatch -> false and the caller falls through to the normal full rebuild.
+// Only 256-aligned n_kv values are accepted (kernel contract, FATTN_KQ_STRIDE;
+// exact/unaligned n_kv is not bitwise-stable and NaN-unsafe under HIP FA).
+
+
+namespace {
+
+struct llama_nkv_record_t {
+    // DFS post-order: nodes and, before each, its not-yet-seen sources / view source
+    std::vector<ggml_tensor *> t;
+    std::vector<int32_t>       src;   // (GGML_MAX_SRC + 1) entries per tensor, view source last
+    std::vector<uint8_t>       fixed; // pre-existing storage (weights, KV cache)
+    std::vector<size_t>        bytes; // byte envelope of each graph-owned tensor
+
+    void record(ggml_cgraph * gf) {
+        t.clear();
+        src.clear();
+        fixed.clear();
+        bytes.clear();
+
+        std::unordered_map<const ggml_tensor *, int32_t> idx;
+        std::unordered_map<const ggml_tensor *, uint8_t> seen;
+        idx.reserve(4 * (size_t) ggml_graph_n_nodes(gf) + 16);
+        seen.reserve(4 * (size_t) ggml_graph_n_nodes(gf) + 16);
+
+        std::vector<std::pair<ggml_tensor *, int>> stack;
+
+        auto add = [&](ggml_tensor * root) {
+            if (root == nullptr || seen.count(root)) {
+                return;
+            }
+            stack.clear();
+            stack.push_back({ root, 0 });
+            seen[root] = 1;
+            while (!stack.empty()) {
+                ggml_tensor * x = stack.back().first;
+                // fixed = pre-existing storage (weights, KV cache); views created by
+                // this build are graph-owned
+                const bool is_fixed = x->view_src == nullptr && (x->data != nullptr || x->buffer != nullptr);
+
+                bool pushed = false;
+                while (!is_fixed && stack.back().second <= GGML_MAX_SRC) {
+                    const int k = stack.back().second++;
+                    ggml_tensor * s = k < GGML_MAX_SRC ? x->src[k] : x->view_src;
+                    if (s != nullptr && !seen.count(s)) {
+                        seen[s] = 1;
+                        stack.push_back({ s, 0 });
+                        pushed = true;
+                        break;
+                    }
+                }
+                if (pushed) {
+                    continue;
+                }
+                stack.pop_back();
+
+                const int32_t id = (int32_t) t.size();
+                idx[x] = id;
+                t.push_back(x);
+                fixed.push_back(is_fixed ? 1 : 0);
+
+                for (int j = 0; j <= GGML_MAX_SRC; ++j) {
+                    ggml_tensor * s = is_fixed ? nullptr : (j < GGML_MAX_SRC ? x->src[j] : x->view_src);
+                    int32_t v = -1;
+                    if (s != nullptr) {
+                        auto it = idx.find(s);
+                        v = it != idx.end() ? it->second : -2; // -2: back-edge (on DFS stack)
+                    }
+                    src.push_back(v);
+                }
+            }
+        };
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            add(ggml_graph_node(gf, i));
+        }
+    }
+
+    void record_bytes() {
+        bytes.assign(t.size(), 0);
+        for (size_t k = 0; k < t.size(); ++k) {
+            if (!fixed[k] && t[k]->view_src == nullptr) {
+                bytes[k] = ggml_nbytes(t[k]);
+            }
+        }
+    }
+};
+} // namespace
+
+// record the pre-allocation skeleton + byte envelopes of a freshly built (not yet
+// sched-placed) graph into the side-table record state
+// (ABI-stable: was llama_context::nkv_record_* data members)
+void llama_context::nkv_record_snapshot(ggml_cgraph * gf) {
+    llama_nkv_record_t rec;
+    rec.record(gf);
+    rec.record_bytes();
+
+    auto & st = llama_nkv_ctx_state_get(this);
+    st.record_t     = std::move(rec.t);
+    st.record_src   = std::move(rec.src);
+    st.record_fixed = std::move(rec.fixed);
+    st.record_bytes = std::move(rec.bytes);
+}
+
+bool llama_context::graph_try_patch_nkv(llm_graph_result * res, const llm_graph_params & params) {
+    static constexpr uint32_t NKV_ALIGN = 256u;
+
+    auto & st = llama_nkv_ctx_state_get(this);
+
+    // NKV_BINDER_STATS: every binder invocation counts as an attempt
+    ++st.c_attempts;
+
+    if (!res || res->get_gf() == nullptr) {
+        ++st.c_fallbacks;
+        return false;
+    }
+    // the binder needs the pre-allocation record of a live envelope build
+    if (!st.record_valid || st.record_t.empty()) {
+        ++st.c_fallbacks;
+        return false;
+    }
+    // tp5-relay pins host graph buffers and validates every node's scheduler
+    // placement after the rebuild; in-place n_kv patching is out of its contract
+    if (backend_tp5_relay != nullptr || cparams.pipeline_parallel) {
+        if (backend_tp5_relay != nullptr) {
+            ++st.c_refused_relay;
+        }
+        if (cparams.pipeline_parallel) {
+            ++st.c_refused_pipeline;
+        }
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    // collect every KV-cache context whose n_kv shapes this graph
+    const llama_kv_cache_context * kvs[2] = { nullptr, nullptr };
+    int nkvs = 0;
+    if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(params.mctx)) {
+        kvs[nkvs++] = h->get_attn();
+    } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(params.mctx)) {
+        kvs[nkvs++] = k;
+    }
+    if (nkvs == 0) {
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    uint32_t nkv_now = kvs[0]->get_n_kv();
+    for (int i = 1; i < nkvs; ++i) {
+        if (kvs[i]->get_n_kv() != nkv_now) {
+            nkv_now = 0;
+        }
+    }
+    // kernel contract: FA consumers require K->ne[1] % 256 == 0 (FATTN_KQ_STRIDE);
+    // exact/unaligned n_kv is not bitwise-stable and NaN-unsafe under HIP FA
+    if (nkv_now == 0 || nkv_now % NKV_ALIGN != 0) {
+        ++st.c_refused_align;
+        ++st.c_fallbacks;
+        return false;
+    }
+    // non-nkv graph keys must be identical: allow_reuse compares every graph-
+    // shaping input EXCEPT the n_kv-coupled shapes (ubatch layout, sequence
+    // ids, output flags, samplers, adapters, cross, cparams flags, arch,
+    // gtype). Without this gate, a non-nkv difference whose node skeleton
+    // happens to match could be patched while the live graph's recorded
+    // params (and its set_inputs closures) still reflect the old keys.
+    // NOTE: the caller only invokes the binder when can_reuse already failed,
+    // so this rejects precisely the "reuse failed for a NON-nkv reason" case.
+    // (ABI-stable: llm_graph_result::params stays private; the accessor
+    // get_params() is a layout-neutral member-function declaration)
+    if (!res->get_params().allow_reuse(params)) {
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+    // envelope: the live graph was built and sched-allocated AT the recorded
+    // cap (see process_ubatch envelope build), so any n_kv in (0, cap] has
+    // real backing. record_bound tracks the width the live graph's
+    // nkv-coupled shapes are CURRENTLY bound at (it moves on every successful
+    // patch and equals cap right after an envelope build), so:
+    // - equality with the bound width is a true no-op (a patch would be an
+    //   exact no-op; the normal reuse path usually takes this case first, but
+    //   stay fail-closed);
+    // - equality with the CAP is NOT a no-op: the live graph may have been
+    //   patched down to a smaller width and must be allowed to grow back
+    //   into the sched-allocated envelope without a rebuild;
+    // - anything above the cap has no allocated backing -> full rebuild
+    //   (which re-records a higher cap).
+    if (nkv_now > st.record_cap) {
+        ++st.c_refused_envelope;
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (nkv_now == st.record_bound) {
+        // the live graph's nkv-coupled shapes are already bound at exactly this
+        // width: a patch would be an exact no-op. NOTE this compares against
+        // record_bound (current bound width), NOT record_cap — cap
+        // equality is a legitimate grow-back-into-envelope case, not a no-op.
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    // scratch build at the new n_kv. Everything except the n_kv-coupled shapes must
+    // match, and the skeleton compare below is the definitive gate: a skeleton match
+    // proves the only difference is n_kv-coupled shapes, and the envelope checks prove
+    // the placement still fits.
+
+    llm_graph_result_ptr & nkv_scratch = *reinterpret_cast<llm_graph_result_ptr *>(&st.nkv_scratch);
+    if (!nkv_scratch) {
+        nkv_scratch.reset(new llm_graph_result(res->get_max_nodes()));
+    }
+    nkv_scratch->reset();
+
+    // naming-only callback: the real callback pins tensors on the scheduler, which a
+    // never-placed scratch graph must not touch
+    llm_graph_params gp = params;
+    gp.res = nkv_scratch.get();
+    gp.cb = [](const llama_ubatch &, ggml_tensor * cur, const char * name, int il) {
+        if (il >= 0) {
+            ggml_format_name(cur, "%s-%d", name, il);
+        } else {
+            ggml_set_name(cur, name);
+        }
+    };
+
+    ggml_cgraph * gs = model.build_graph(gp);
+    if (gs == nullptr) {
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    llama_nkv_record_t rec_new;
+    rec_new.record(gs);
+    rec_new.record_bytes(); // envelope sizes for the shrink-only byte checks below
+
+    const size_t n = st.record_t.size();
+    if (rec_new.t.size() != n || rec_new.src != st.record_src ||
+            rec_new.fixed != st.record_fixed || rec_new.bytes.size() != st.record_bytes.size()) {
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    // exact skeleton + every changed field fits: copy in place
+    for (size_t k = 0; k < n; ++k) {
+        ggml_tensor * s = rec_new.t[k];
+        ggml_tensor * d = st.record_t[k];
+
+        if (st.record_fixed[k]) {
+            // pre-existing storage (weights, KV cache): the scratch build must
+            // reference the very same tensor object
+            if (s != d) {
+                ++st.c_refused_skeleton;
+                ++st.c_fallbacks;
+                return false;
+            }
+            continue;
+        }
+
+        if (s->op != d->op || s->type != d->type ||
+                strncmp(s->name, d->name, GGML_MAX_NAME) != 0 ||
+                (s->view_src == nullptr) != (d->view_src == nullptr)) {
+            ++st.c_refused_skeleton;
+            ++st.c_fallbacks;
+            return false;
+        }
+
+        if (s->view_src == nullptr) {
+            // graph-owned tensor: must fit inside the envelope the scheduler
+            // allocated the live tensor at (shrink-only)
+            if (ggml_nbytes(s) > st.record_bytes[k]) {
+                ++st.c_refused_envelope;
+                ++st.c_fallbacks;
+                return false;
+            }
+        } else {
+            // 0-byte view can have a nonzero view_offs (static slicing); no bytes
+            // are accessed, so skip the range check (avoids false OOB rejections)
+            if (ggml_nbytes(s) == 0) {
+                continue;
+            }
+            const int32_t vs = rec_new.src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
+            if (vs < 0) {
+                ++st.c_refused_skeleton;
+                ++st.c_fallbacks;
+                return false;
+            }
+            // the limit is the full byte size of the view's source: a fixed source
+            // (KV cache) has no recorded envelope, its allocation is exact
+            const size_t lim = st.record_fixed[vs] ? ggml_nbytes(st.record_t[vs]) : st.record_bytes[vs];
+            if (s->view_offs + ggml_nbytes(s) > lim) {
+                ++st.c_refused_envelope;
+                ++st.c_fallbacks;
+                return false;
+            }
+        }
+    }
+
+    // apply: copy every changed tensor's layout into the live graph
+    for (size_t k = 0; k < n; ++k) {
+        if (st.record_fixed[k]) {
+            continue;
+        }
+        ggml_tensor * s = rec_new.t[k];
+        ggml_tensor * d = st.record_t[k];
+
+        const bool diff = memcmp(s->ne, d->ne, sizeof(d->ne)) != 0 ||
+                          memcmp(s->nb, d->nb, sizeof(d->nb)) != 0 ||
+                          memcmp(s->op_params, d->op_params, sizeof(d->op_params)) != 0 ||
+                          s->view_offs != d->view_offs;
+        if (!diff) {
+            continue;
+        }
+
+        memcpy(d->ne, s->ne, sizeof(d->ne));
+        memcpy(d->nb, s->nb, sizeof(d->nb));
+        memcpy(d->op_params, s->op_params, sizeof(d->op_params));
+        d->view_offs = s->view_offs;
+        if (d->view_src != nullptr && d->view_src->data != nullptr) {
+            d->data = (char *) d->view_src->data + d->view_offs;
+        }
+    }
+
+    // restore: the previous alloc_graph's split_graph pass 5 (ggml-backend.cpp,
+    // "node->src[j] = tensor_id_copy(...)") rewrote the LIVE graph's node src[]
+    // to point at sched->ctx-owned split-input copies. ggml_backend_sched_reset
+    // + alloc_graph re-runs split_graph on this same live graph, and the freed
+    // copy structs' stale buffer/data fields then poison the re-derivation (the
+    // freed input_cpy is treated as a pre-allocated tensor of the GPU backend,
+    // so no new copy is created for it and the node keeps a freed struct as its
+    // source -> garbage ids read at compute -> OOB). The record was taken
+    // pre-alloc (nkv_record_snapshot, before the first alloc_graph), so it
+    // holds the pristine build-time topology: restore every non-fixed recorded
+    // tensor's src[]/view_src from it. Fixed tensors (weights, KV cache) are
+    // never rewritten by split_graph and are skipped. -1 = null src (unchanged),
+    // -2 = back-edge (impossible in a build DAG; leave the pointer untouched).
+    // Pure pointer fix-up from the same vectors the skeleton compare validated:
+    // no new failure mode, and the OFF path never enters this function.
+    // restore + clear: shared implementation (llama-nout-state.cpp), also
+    // used by the nout bind before its re-plan
+    llama_nkv_record_restore(this);
+    llama_nkv_record_clear_alloc(this);
+    nkv_scratch->reset();
+    st.record_bound = nkv_now;   // the live graph's nkv-coupled shapes are now bound at nkv_now
+    ++st.c_applied;
+    return true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch,
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
@@ -2561,26 +3045,193 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    bool reused = !graph_reuse_disable && res->can_reuse(gparams);
+
+    // set only when the in-place n_kv patch (below) succeeds: the scheduler's
+    // split-input copies were created during the PREVIOUS alloc_graph and still
+    // carry the pre-patch layout, so they must be re-planned before compute.
+    bool nkv_patched = false;
+
+    if (!reused && !graph_reuse_disable && llama_nkv_ctx_state_get(this).nkv_enabled) {
+        // union-graph runtime n_kv: when the previous graph cannot be reused only
+        // because the KV cache crossed a 256-alignment n_kv bucket, rebuild the
+        // graph in a scratch result at the new n_kv, verify the skeleton matches,
+        // and patch the live graph in place. Fail-closed: any mismatch or any
+        // non-256-aligned n_kv falls back to a full rebuild.
+        reused  = graph_try_patch_nkv(res, gparams);
+        nkv_patched = reused;
+    }
+
+    if (reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+        // n_kv in-place patch (graph_try_patch_nkv) mutated the live graph
+        // tensors' ne/nb/op_params/view_offs AFTER the previous alloc_graph
+        // created the scheduler's split-input copies at the OLD layout; at
+        // compute time ggml_backend_sched_compute_splits would copy graph
+        // tensor -> stale split copy and the ggml_are_same_layout assert fires.
+        // Force a re-plan: alloc_graph unconditionally re-runs split_graph,
+        // which frees the whole copy-tensor context and re-creates every
+        // split-input copy at the CURRENT (patched) layout, and re-assigns
+        // input tensor data pointers (incl. views), so set_inputs() must run
+        // AFTER it. Fail-closed: on alloc failure fall through to the normal
+        // full-rebuild path below (the rebuild's res->reset() + build_graph
+        // discards the in-place mutation; gparams already reflects the new
+        // n_kv) and keep the NKV_BINDER_STATS counters honest
+        // (--c_applied, ++c_fallbacks).
+        if (nkv_patched) {
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
+                auto & nkv_st = llama_nkv_ctx_state_get(this);
+                --nkv_st.c_applied;
+                ++nkv_st.c_fallbacks;
+                reused = false;
+                nkv_patched = false;
+            }
         }
 
-        n_reused++;
-    } else {
+        if (reused) {
+            // with pipeline parallelism, the previous graph_compute_async may still be running
+            // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
+            // that the previous compute is still reading.
+            if (cparams.pipeline_parallel) {
+                ggml_backend_sched_synchronize(sched.get());
+            }
+
+            n_reused++;
+        }
+    }
+
+    // ---- r8 floor1 reuse-decision trace (LLAMA_NOUT_FLOOR1_TRACE, strict "1") ----
+    // Re-derivation of the decision above. VERIFIED purity of the re-call:
+    // llm_graph_result::can_reuse is non-const and input can_reuse impls DO
+    // rebind state, but only `this->mctx = params.mctx` (and dsv4's
+    // inp_raw->mctx, same params-derived value) - idempotent under a
+    // same-params re-call; no counter/vector/shape is written, and
+    // mctx->consume_replay_len() lives in set_input, not can_reuse. The
+    // re-call also runs only AFTER stock's own can_reuse in the same step
+    // with identical params, so no new state or read is introduced. With the
+    // trace off (unset or any value other than exactly "1") this block does
+    // not run at all. step_reused_final / step_fell_back / step_bind_rows
+    // feed the end-of-step outcome counters at the bottom of process_ubatch.
+    bool         step_reused_final = reused;  // final reuse decision (incl. the nkv patch)
+    bool         step_fell_back    = false;   // set when a bind-failure fallback rebuild ran
+    int          step_bind_rows    = -1;      // rows bound on the reused graph (-1: none)
+    const char * step_miss         = nullptr; // trace-only miss reason
+    {
+        auto & tst = llama_nkv_ctx_state_get(this);
+        if (tst.t_enabled && tst.nout1_enabled && gtype == LLM_GRAPH_TYPE_DECODER) {
+            ++tst.t_dec;
+            if (graph_reuse_disable) {
+                ++tst.t_miss_disabled;
+                step_miss = "disabled";
+            } else if (!res->can_reuse(gparams)) {
+                if (res->get_gf() == nullptr) {
+                    // never-built stored result (first step after
+                    // sched_reserve): the stored params are default-constructed
+                    // (llama_ubatch has no member initializers), so the
+                    // decomposition below would read indeterminate values.
+                    // Attribute to a dedicated first-step bucket instead; the
+                    // re-call purity note below still applies (stock's own
+                    // can_reuse at the decision line above already read the
+                    // same objects).
+                    ++tst.t_miss_first;
+                    step_miss = "first";
+                } else if (!gparams.allow_reuse(res->get_params())) {
+                    // mirror allow_reuse's check order for the miss reason
+                    // (read-only decomposition)
+                    const llm_graph_params & old  = res->get_params();
+                    const llama_ubatch &     uo   = old.ubatch;
+                    const llama_ubatch &     un   = gparams.ubatch;
+                    const bool               ub_ok =
+                        uo.equal_seqs() == un.equal_seqs() &&
+                        uo.n_tokens     == un.n_tokens     &&
+                        uo.n_seq_tokens == un.n_seq_tokens &&
+                        uo.n_seqs       == un.n_seqs       &&
+                        uo.n_seqs_unq   == un.n_seqs_unq   &&
+                        ((!uo.token && !un.token) ||
+                         (!uo.embd  && !un.embd)  ||
+                         (uo.token && un.token && uo.embd && un.embd));
+                    if (!ub_ok) {
+                        ++tst.t_miss_ubatch;
+                        step_miss = "ubatch";
+                    } else if (old.n_outputs != gparams.n_outputs) {
+                        ++tst.t_miss_outputs;
+                        step_miss = "outputs";
+                    } else if (!llm_graph_params::samplers_equal(old.samplers, gparams.samplers)) {
+                        ++tst.t_miss_samplers;
+                        step_miss = "samplers";
+                    } else {
+                        ++tst.t_miss_cparams;
+                        step_miss = "cparams";
+                    }
+                } else {
+                    ++tst.t_miss_inputs;
+                    step_miss = "inputs";
+                }
+            } else {
+                ++tst.t_dec_reuse;
+            }
+            LLAMA_LOG_INFO("NOUT1_FLOOR_TRACE dec=%llu reuse=%d miss=%s n_out=%u key=%u stored=%u\n",
+                (unsigned long long) tst.t_dec, (int) reused, step_miss ? step_miss : "-",
+                (unsigned) n_outputs, (unsigned) gparams.n_outputs,
+                (unsigned) res->get_params().n_outputs);
+        }
+    }
+    if (!reused) {
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        // union-graph runtime nkv envelope build: build the graph AT a
+        // 256-aligned envelope cap >= the applied n_kv (clamped to the physical
+        // per-stream KV capacity), so the scheduler allocates backing for the
+        // whole envelope and a later bucket-crossing within it can be patched in
+        // place without a rebuild. The override is armed ONLY around graph
+        // construction: K/V cache views, KQ mask and pos-bucket shapes derive
+        // from get_n_kv() at build time; set_inputs()/compute still see the real
+        // applied n_kv. Cells beyond the applied n_kv are empty and the KQ mask
+        // impl writes mask_drop (-INF) for every such cell over the full built
+        // width, so unwritten-but-allocated tail K/V cells are masked out, never
+        // read as data (same argument as upstream padded-n_kv builds).
+        // Fail-closed elsewhere: the binder accepts 256-aligned n_kv only
+        // (kernel contract, FATTN_KQ_STRIDE).
+        bool     env   = false;
+        uint32_t cap   = 0;
+        const llama_kv_cache_context * kv_ctx = nullptr;
+        if (!graph_reuse_disable && llama_nkv_ctx_state_get(this).nkv_enabled && !cparams.pipeline_parallel && backend_tp5_relay == nullptr) {
+            if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+                kv_ctx = h->get_attn();
+            } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+                kv_ctx = k;
+            }
+            if (kv_ctx != nullptr) {
+                const uint32_t nkv_size = cparams.n_ctx_kv != 0 ? cparams.n_ctx_kv : cparams.n_ctx_seq;
+                const uint32_t nkv_now  = kv_ctx->get_n_kv();
+                // physical per-stream cell count: hybrid/iswa sub-caches may back
+                // fewer cells per stream than the cparams totals suggest; the
+                // envelope must stay within real, allocated cells
+                const uint32_t limit = std::min(nkv_size, kv_ctx->get_capacity());
+                // one bucket ahead of the applied n_kv; the built width itself
+                // must stay 256-aligned (the first execution runs at this width)
+                // and strictly above the applied n_kv to leave headroom
+                cap = std::min(limit, GGML_PAD(nkv_now + 1, 256u));
+                if (cap % 256u == 0 && cap > nkv_now) {
+                    env = true;
+                }
+            }
+        }
 
-        //const auto t_start_us = ggml_time_us();
+        if (env) {
+            const_cast<llama_kv_cache_context *>(kv_ctx)->nkv_envelope_begin(cap);
+        }
 
         gf = model.build_graph(gparams);
+
+        if (env) {
+            const_cast<llama_kv_cache_context *>(kv_ctx)->nkv_envelope_end();
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2590,11 +3241,49 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
+        if (env) {
+            nkv_record_snapshot(gf);
+            auto & st = llama_nkv_ctx_state_get(this);
+            st.record_valid = true;
+            st.record_cap   = cap;   // the graph was built + sched-allocated at this width
+            st.record_bound = cap;   // fresh build: the nkv-coupled shapes are at cap
+            ++st.c_env_builds;
+        } else if (llama_nkv_ctx_state_get(this).nout_enabled ||
+                   (llama_nkv_ctx_state_get(this).nout1_enabled && gtype == LLM_GRAPH_TYPE_DECODER)) {
+            // the nout bind lane re-plans the scheduler after every bind and
+            // restores split-rewritten src[]/allocation state from this record;
+            // a nout-only context never takes an env build, so snapshot here or
+            // its re-plan would run over the previous plan's freed split copies.
+            // No nkv envelope: cap/bound stay 0, which keeps graph_try_patch_nkv
+            // refused (nkv_now > record_cap), exactly as the invalid-record
+            // path does today.
+            // r8 root-cause fix: the floor1 lane shares this record (same
+            // restore/clear helpers, same record_valid precondition in the
+            // bind below). Without arming it, EVERY floor1 fresh build leaves
+            // record_valid=false, the next step's bind is refused, and the
+            // step falls back to an exact-active rebuild that stores the RAW
+            // active n_outputs - which breaks allow_reuse's output-count key
+            // for the following 0<->1 transition, so floor1 could never
+            // produce a production reuse hit. The condition is the effective
+            // floor1 lane on a DECODER graph only (the lane flag already
+            // encodes the exact-"1" gate, the envelope-lane mutual exclusion
+            // and the sampler veto); the one-shot suppress fallback below
+            // refreshes its own record, and non-decoder graphs stay
+            // record-invalid (stock behavior). The trace gate never enables
+            // this branch.
+            nkv_record_snapshot(gf);
+            auto & st2 = llama_nkv_ctx_state_get(this);
+            st2.record_valid = true;
+            st2.record_cap   = 0;
+            st2.record_bound = 0;
+        } else {
+            auto & st3 = llama_nkv_ctx_state_get(this);
+            st3.record_valid = false;
+            st3.record_bound = 0;
         }
+
+        // nout lane bind happens after set_inputs (below), in both the reuse
+        // and fresh-build paths
     }
 
     // Validate the actual scheduler placement before submitting any compute.
@@ -2632,8 +3321,143 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     {
         //const auto t_start_us = ggml_time_us();
 
-        // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
+        // Check capacity before writing any inputs: out_ids is allocated for
+        // the envelope, which can be smaller than this ubatch's output count.
+        // floor1 (LLAMA_NOUT_FLOOR1_REUSE) shares the envelope lane's bind +
+        // fail-closed rebuild: its graphs build at max(active, 1) rows, so the
+        // bind below only ever narrows the built width (never a growth bind)
+        if (llama_nout_runtime_enabled(gparams) || llama_nout1_runtime_enabled(gparams)) {
+            auto & st = llama_nkv_ctx_state_get(this);
+            const bool nout1_lane = llama_nout1_runtime_enabled(gparams);
+            // The bind re-plans the scheduler and restores split-rewritten
+            // src[]/allocation state from the pre-alloc record (below); without
+            // a record that is valid AND current for this exact graph, the
+            // re-split would run over the previous plan's freed split copies.
+            // Fail closed to the exact-count rebuild below.
+            bool bound = st.record_valid && !st.record_t.empty() &&
+                n_outputs <= res->outputs_envelope() && res->bind_outputs(n_outputs);
+            if (bound) {
+                // bind_outputs narrowed out_ids->ne[0] (and the gather dst
+                // I32 graph input, so the same stale-input-copy hazard as the
+                // n_kv patch applies here (in BOTH the reuse and fresh-build
+                // paths, since bind runs after alloc in both). Force a
+                // re-plan: alloc_graph re-creates the split copies at the
+                // narrowed layout and re-assigns input data pointers, so
+                // set_inputs() must re-run AFTER it.
+                // the previous alloc_graph rewrote this graph's node src[]
+                // to split copies; restore the pristine topology and clear
+                // the stale allocation state before the re-plan (same
+                // mechanism as the nkv patch)
+                llama_nkv_record_restore(this);
+                llama_nkv_record_clear_alloc(this);
+                ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+                if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                    // alloc failure after a successful bind: take the same
+                    // fail-closed fallback rebuild as a bind failure
+                    // (nout_suppress_envelope one-shot path, below). The
+                    // rebuild's res->reset() discards the narrowed tensors
+                    // (fresh ctx_compute + gf), so no explicit restore is
+                    // needed.
+                    bound = false;
+                } else {
+                    res->set_inputs(&ubatch);
+                }
+            }
+            if (bound) {
+                step_bind_rows = (int) n_outputs;
+                if (nout1_lane) {
+                    if (st.nout1_binds == 0) {
+                        LLAMA_LOG_INFO("%s: nout floor1 binding ACTIVE: first bind active=%u envelope=%u\n",
+                            __func__, n_outputs, res->outputs_envelope());
+                    }
+                    ++st.nout1_binds;
+                    // r8 trace: a 0-row bind is the floor1 lane executing a
+                    // 0-output step with zero gathered rows (trace-gated)
+                    if (st.t_enabled && n_outputs == 0) {
+                        ++st.t_bind_zero;
+                    }
+                } else {
+                    if (st.nout_binds == 0) {
+                        LLAMA_LOG_INFO("%s: runtime n_outputs binding ACTIVE: first bind active=%u envelope=%u\n",
+                            __func__, n_outputs, res->outputs_envelope());
+                    }
+                    ++st.nout_binds;
+                }
+                LLAMA_LOG_DEBUG("%s: bound outputs active=%u envelope=%u\n", __func__,
+                    n_outputs, res->outputs_envelope());
+            } else {
+                // fail-closed fallback: rebuild the graph at the exact active
+                // count. the rebuild path keeps normal reuse semantics; the
+                // envelope override is disabled for this rebuild so the graph
+                // is built with n_outputs == active n_outputs (one-shot
+                // suppress flag consumed by graph_params()).
+                llama_nkv_ctx_state_get(this).nout_suppress_envelope = true;
+                if (nout1_lane) {
+                    ++st.nout1_fallbacks;
+                } else {
+                    ++st.nout_fallbacks;
+                }
+                // r8: this fallback discards the reuse decision the step was
+                // counted on (n_reused was already incremented in the reuse
+                // path above, but the step will compute on the REBUILT graph,
+                // so it is not a compute skip). Correction is trace-gated
+                // (LLAMA_NOUT_FLOOR1_TRACE exact "1"); with the trace off the
+                // r7 counter behavior is preserved bit-for-bit. The fallback
+                // itself is unchanged fail-closed stock semantics: exact
+                // active rows (0-output steps rebuild at 0 rows and truly
+                // execute 0 rows), and the following step's reuse miss is
+                // accepted.
+                step_fell_back = true;
+                auto & tst_fb = llama_nkv_ctx_state_get(this);
+                if (tst_fb.t_enabled && step_reused_final) {
+                    --n_reused;
+                }
+                llm_graph_params p_fallback = graph_params(res, ubatch, mctx, gtype);
+                p_fallback.n_outputs             = n_outputs;
+
+                res->reset();
+                ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+                gf = model.build_graph(p_fallback);
+                if (!gf) {
+                    LLAMA_LOG_ERROR("%s: failed to rebuild graph at n_outputs=%u\n", __func__, n_outputs);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                // the fallback replaced the graph: refresh the pre-alloc
+                // record so the shared restore/clear helpers (bind re-plan)
+                // and graph_try_patch_nkv never see pointers into the
+                // discarded graph (record_valid was still true with freed
+                // tensors here). No nkv envelope: the graph was built at the
+                // real applied n_kv, so cap/bound follow it - no headroom,
+                // growth re-records through a full rebuild.
+                {
+                    const llama_kv_cache_context * kv_fb = nullptr;
+                    if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+                        kv_fb = h->get_attn();
+                    } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+                        kv_fb = k;
+                    }
+                    nkv_record_snapshot(gf);
+                    auto & stf = llama_nkv_ctx_state_get(this);
+                    stf.record_valid = true;
+                    stf.record_cap   = kv_fb ? kv_fb->get_n_kv() : 0;
+                    stf.record_bound = stf.record_cap;
+                }
+                if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate rebuilt graph\n", __func__);
+                    ret = GGML_STATUS_ALLOC_FAILED;
+                    return nullptr;
+                }
+
+                res->set_inputs(&ubatch);
+            }
+        } else {
+            // FIXME unused graph inputs may not have been allocated.
+            res->set_inputs(&ubatch);
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -2646,6 +3470,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    // ---- r8 floor1 step outcome (LLAMA_NOUT_FLOOR1_TRACE, strict "1") ----
+    // Compute-skip/build bookkeeping for the floor1 lane: a step counted on
+    // the reused graph AND computed on it is a compute skip; a fresh or
+    // fallback rebuild is a build (with the resulting graph generation).
+    // Gated on the effective floor1 lane + decoder graph; the trace gate
+    // alone never enables anything here.
+    {
+        auto & tst = llama_nkv_ctx_state_get(this);
+        if (tst.t_enabled && tst.nout1_enabled && gtype == LLM_GRAPH_TYPE_DECODER) {
+            if (step_reused_final && !step_fell_back) {
+                ++tst.t_compute_skip;
+            } else if (step_fell_back) {
+                ++tst.t_builds_fb;
+                ++tst.t_graph_gen;
+            } else {
+                ++tst.t_builds;
+                ++tst.t_graph_gen;
+            }
+            LLAMA_LOG_INFO("NOUT1_FLOOR_STEP step=%llu reuse=%d fell_back=%d bind_rows=%d builds=%llu builds_fb=%llu skip=%llu gen=%llu binds=%zu bind0=%zu fallbacks=%zu\n",
+                (unsigned long long) tst.t_dec, (int) step_reused_final, (int) step_fell_back,
+                step_bind_rows,
+                (unsigned long long) tst.t_builds, (unsigned long long) tst.t_builds_fb,
+                (unsigned long long) tst.t_compute_skip, (unsigned long long) tst.t_graph_gen,
+                tst.nout1_binds, tst.t_bind_zero, tst.nout1_fallbacks);
+        }
+    }
 
     return res;
 }
@@ -3809,6 +4660,28 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
                                              const llama_ubatch &           ubatch,
                                              const llama_memory_context_i * mctx,
                                              llm_graph_type                 gtype) const {
+    // env: LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME (ABI-stable: the flag is
+    // derived from the context side table, not an llm_graph_params member;
+    // when enabled and this is a decoder graph, build over the n_outputs
+    // envelope instead of the active count. the one-shot suppress flag is
+    // the bind-fail fallback rebuild: that rebuild must use the ACTIVE count,
+    // matching the original patch's per-params union_outputs_runtime = false)
+    auto & nout_st = llama_nkv_ctx_state_get(const_cast<llama_context *>(this));
+    // one-shot suppress shared by both lanes; captured before the clear so
+    // the floor1 lane sees the same bind-fail fallback signal
+    const bool nout1_suppressed = nout_st.nout_suppress_envelope;
+    const bool nout_envelope = nout_st.nout_enabled && !nout1_suppressed;
+    nout_st.nout_suppress_envelope = false;
+    // env: LLAMA_NOUT_FLOOR1_REUSE (ABI-stable: same side-table derivation).
+    // floor1 builds the decoder at max(active, 1) rows - a floor of one output
+    // row for 0-output steps, the exact active count otherwise. NOT an
+    // envelope: the built width never exceeds the active count of the ubatch
+    // that built it (or 1 for its 0-output step); the bind lane narrows the
+    // executed closure to the active count in place, and growth past the
+    // built width fails closed to a rebuild. Mutually exclusive with the
+    // envelope lane (constructor refuses to co-arm).
+    const bool nout1_floor1 = nout_st.nout1_enabled && !nout1_suppressed &&
+        gtype == LLM_GRAPH_TYPE_DECODER;
     return {
         /*.arch        =*/model.arch,
         /*.hparams     =*/model.hparams,
@@ -3822,7 +4695,10 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.mctx        =*/mctx,
         /*.cross       =*/&cross,
         /*.samplers    =*/sampling.samplers,
-        /*.n_outputs   =*/n_outputs,
+        /*.n_outputs   =*/nout1_floor1 ? (uint32_t) std::max(n_outputs, 1u) :
+                           nout_envelope && gtype == LLM_GRAPH_TYPE_DECODER ?
+            (uint32_t) cparams.n_outputs_max : n_outputs,
+
         /*.cb          =*/graph_get_cb(),
         /*.res         =*/res,
     };

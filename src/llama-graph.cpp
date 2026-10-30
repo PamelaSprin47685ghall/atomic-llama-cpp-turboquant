@@ -13,6 +13,8 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-nout-bind.h"
+#include "llama-nout-state.h"
 
 #include <cassert>
 #include <cmath>
@@ -22,6 +24,34 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
+
+// ---- ABI-stable side tables (env: LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME) ----
+//
+// The original patches stored this state in data members of
+// llm_graph_input_out_ids (bind_env) and llama_context /
+// llama_cparams (flags + counters). To keep every header layout
+// byte-identical to baseline, the state lives in .cpp-local side tables
+// keyed by object identity instead:
+//
+//   - g_nout_bind_env: per-out_ids-input envelope map recorded by a previous
+//     bind_outputs() call; keyed by the llm_graph_input_out_ids object and
+//     erased in its destructor.
+//
+// The enabled-flag lookup (llama_nout_runtime_enabled) is shared with
+// llama-context.cpp and lives in llama-nout-state.cpp.
+namespace {
+std::unordered_map<llm_graph_input_out_ids *, std::vector<llama_nout_plan_entry>> g_nout_bind_env;
+} // namespace
+
+static std::vector<llama_nout_plan_entry> & nout_bind_env_get(llm_graph_input_out_ids * inp) {
+    return g_nout_bind_env[inp];
+}
+
+llm_graph_input_out_ids::~llm_graph_input_out_ids() {
+    // ABI-stable side-table cleanup
+    g_nout_bind_env.erase(this);
+}
 
 // MoE down-proj activation path — CUDA is first-class, not an exception.
 //
@@ -238,7 +268,20 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
     int32_t * data = (int32_t *) out_ids->data;
 
-    if (n_outputs == n_tokens) {
+    // the graph may be built over an output envelope (GGML_TP5_NOUT_REUSE),
+    // so the identity mapping is decided by the ACTIVE count of this ubatch,
+    // not by the build-time envelope
+    uint32_t n_active = 0;
+
+    if (ubatch->output != nullptr) {
+        for (int i = 0; i < n_tokens; ++i) {
+            n_active += ubatch->output[i] != 0;
+        }
+    } else {
+        n_active = n_tokens; // all tokens output
+    }
+
+    if (n_active == (uint32_t) n_tokens) {
         for (int i = 0; i < n_tokens; ++i) {
             data[i] = i;
         }
@@ -260,9 +303,36 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
-    res &= n_outputs == params.n_outputs;
+    // env: LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME - the active count is bound at execution
+    // time and is not part of the reuse key. (ABI-stable: the flag is derived
+    // on the fly from the context side table instead of an llm_graph_params
+    // data member.)
+    if (!llama_nout_runtime_enabled(params)) {
+        res &= n_outputs == params.n_outputs;
+    }
 
     return res;
+}
+
+bool llm_graph_input_out_ids::bind(uint32_t n_active) {
+    GGML_ASSERT(out_ids);
+
+    // envelope is the build-time count; never compare against out_ids->ne[0],
+    // which holds the LAST bound count after a previous bind (a later ubatch
+    // with a larger active count must still bind, not fail)
+    if (n_active == 0 || n_active > n_outputs) {
+        // zero outputs or over-envelope: caller rebuilds the graph instead
+        return false;
+    }
+
+    // set_input has already written exactly the active entries; narrow the
+    // executed shape so the gather kernel reads only those entries.
+    // out_ids is contiguous I32 with rows of 1 element, so ne[0] == the
+    // element count and the buffer (allocated for the envelope) is not
+    // exceeded; nb[0] is unchanged.
+    out_ids->ne[0] = n_active;
+
+    return true;
 }
 
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
@@ -1494,6 +1564,92 @@ void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
 }
+
+const llm_graph_params & llm_graph_result::get_params() const {
+    return params;
+}
+
+// GGML_TP5_NOUT_REUSE plans the complete output-gather closure before
+// narrowing out_ids and row-bearing tensors. The planner accepts only the
+// operations and layouts documented in llama-nout-bind.h; unsupported graphs
+// fall back to a fresh graph at the active count. Envelope shapes and strides
+// are restored before each new plan, including when the count grows.
+//
+uint32_t llm_graph_result::outputs_envelope() const {
+    for (auto & input : inputs) {
+        auto * inp = dynamic_cast<llm_graph_input_out_ids *>(input.get());
+        if (inp != nullptr && inp->out_ids != nullptr) {
+            // the build-time envelope, not out_ids->ne[0]: bind() narrows the
+            // executed shape to the active count, so ne[0] would return the
+            // last bound count and the caller's gate would silently skip
+            // re-binding
+            return inp->n_outputs;
+        }
+    }
+    return 0;
+}
+
+// Bind counts in [0, envelope]; zero-row execution and backend safety must be
+// validated on each target backend. Backend samplers disable this lane.
+
+bool llm_graph_result::bind_outputs(uint32_t n_active) {
+    // locate the out_ids input
+    llm_graph_input_out_ids * out_ids_inp = nullptr;
+    for (auto & input : inputs) {
+        auto * inp = dynamic_cast<llm_graph_input_out_ids *>(input.get());
+        if (inp != nullptr && inp->out_ids != nullptr) {
+            out_ids_inp = inp;
+            break;
+        }
+    }
+    if (out_ids_inp == nullptr || out_ids_inp->out_ids == nullptr) {
+        return false; // graph has no output gather (e.g. pooling)
+    }
+
+    ggml_tensor * out_ids_t = out_ids_inp->out_ids;
+
+    if (n_active > (uint32_t) out_ids_inp->n_outputs) {
+        return false; // over-envelope: caller rebuilds (zero rows bind below)
+    }
+
+    ggml_cgraph * gf = get_gf();
+    if (gf == nullptr) {
+        return false;
+    }
+
+    // restore the envelope shapes recorded by a previous bind, so planning
+    // always starts from the build-time topology (a later ubatch may have a
+    // LARGER active count than the last bind). (ABI-stable: the recorded
+    // envelope lives in a .cpp-local side table keyed by the out_ids input
+    // object instead of a data member.)
+    for (auto & e : nout_bind_env_get(out_ids_inp)) {
+        memcpy(e.t->ne, e.env_ne, sizeof(e.t->ne));
+        memcpy(e.t->nb, e.env_nb, sizeof(e.t->nb));
+    }
+    out_ids_t->ne[0] = out_ids_inp->n_outputs;
+
+    // plan the row narrowing of the whole output closure; a failure leaves
+    // every shape restored (envelope) and rejects the bind: the caller
+    // rebuilds the graph at the exact active count (stock behavior).
+    // Zero active rows are accepted: the closure narrows to zero rows and
+    // ggml skips the empty tensors (no padding, no rebuild).
+    llama_nout_plan plan;
+    if (!llama_nout_plan_bind(gf, out_ids_t, out_ids_inp->n_outputs, n_active, &plan)) {
+        return false;
+    }
+
+    // apply: narrow the executed shapes in place
+    llama_nout_plan_apply(&plan);
+
+    // record the envelope for the next round's restore; the plan vector owns
+    // its entries and frees them on reassignment
+    auto & env = nout_bind_env_get(out_ids_inp);
+    env.assign(plan.entries, plan.entries + plan.n_entries);
+    delete[] plan.entries;
+
+    return true;
+}
+
 
 //
 // llm_graph_context

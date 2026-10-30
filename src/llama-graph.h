@@ -221,11 +221,20 @@ public:
             const llama_hparams & hparams,
             const llama_cparams & cparams,
             uint32_t n_outputs) : hparams(hparams), cparams(cparams), n_outputs(n_outputs) {}
-    virtual ~llm_graph_input_out_ids() = default;
+    virtual ~llm_graph_input_out_ids();
 
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    // env: LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME - narrow the executed out_ids index
+    // tensor from its build-time envelope to n_active entries. the gather
+    // kernel iterates over the index count, so the gather reads only the
+    // active rows; set_input has already written exactly those entries into
+    // data[0..n_active). returns false (untouched) for n_active == 0 or
+    // n_active over the envelope; the caller then rebuilds the graph at the
+    // exact active count.
+    bool bind(uint32_t n_active);
 
     ggml_tensor * out_ids; // I32 [n_outputs]
 
@@ -907,9 +916,27 @@ public:
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
+    // env: LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME - bounded runtime binding. the ONLY
+    // tensor narrowed is the dst of a GET_ROWS node whose src[1] is the
+    // out_ids index tensor, from its envelope row count (ne[1]) down to
+    // n_active; the CPU gather kernels require
+    // ggml_nrows(dst) == ggml_nelements(src1), so dst and the index narrow
+    // together. the gather dst must be terminal for the narrowed dim (no
+    // consumer derives a shape from it); otherwise the bind fails closed and
+    // the caller rebuilds the graph at the exact active count. contexts with
+    // backend samplers never reach here with the flag effective: build_sampling
+    // pads the logits by +1 row, so the gather dst is consumed by a PAD - the
+    // effective flag is forced off at context init.
+    bool bind_outputs(uint32_t n_active);
+
+    // build-time (envelope) output count this graph was built for
+    uint32_t outputs_envelope() const;
     void set_params(const llm_graph_params & params);
 
-
+    // the params the graph was last built with (ABI-stable accessor: keeps
+    // the params member private; used by llama_context's union-graph runtime
+    // n_kv binder to verify non-nkv graph keys are unchanged before patching)
+    const llm_graph_params & get_params() const;
 
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
@@ -947,6 +974,7 @@ private:
     // env: LLAMA_GRAPH_RESULT_DEBUG
     int debug = 0;
 };
+
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 

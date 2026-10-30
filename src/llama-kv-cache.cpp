@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <unordered_map>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -3619,7 +3620,31 @@ llama_kv_cache_context::llama_kv_cache_context(
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
 }
 
-llama_kv_cache_context::~llama_kv_cache_context() = default;
+// union-graph runtime nkv binder: build-scoped n_kv override side table
+// (ABI-stable: keyed by object identity, zero header data members). The
+// override is armed only around model.build_graph() by llama_context
+// (nkv_envelope_begin/end) and read by get_n_kv() during graph construction.
+namespace {
+std::unordered_map<const llama_kv_cache_context *, int32_t> g_nkv_build_override;
+} // namespace
+
+static int32_t nkv_build_override_get(const llama_kv_cache_context * ctx) {
+    const auto it = g_nkv_build_override.find(ctx);
+    return it != g_nkv_build_override.end() ? it->second : 0;
+}
+
+static void nkv_build_override_set(const llama_kv_cache_context * ctx, int32_t v) {
+    if (v == 0) {
+        g_nkv_build_override.erase(ctx);
+    } else {
+        g_nkv_build_override[ctx] = v;
+    }
+}
+
+llama_kv_cache_context::~llama_kv_cache_context() {
+    // ABI-stable side-table cleanup (union-graph runtime nkv binder override)
+    g_nkv_build_override.erase(this);
+}
 
 bool llama_kv_cache_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
@@ -3668,7 +3693,24 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
+    // build-scoped envelope override (union-graph runtime nkv binder): while
+    // armed, report the envelope width so the graph under construction is
+    // sized and sched-allocated for the full envelope, not just the applied
+    // cache n_kv. Only ever armed during model.build_graph().
+    // (ABI-stable: the override lives in a .cpp-local side table keyed by
+    // this object instead of a data member.)
+    if (const int32_t ov = nkv_build_override_get(this)) {
+        return (uint32_t) ov;
+    }
     return n_kv;
+}
+
+void llama_kv_cache_context::nkv_envelope_begin(uint32_t cap) const {
+    nkv_build_override_set(this, (int32_t) cap);
+}
+
+void llama_kv_cache_context::nkv_envelope_end() const {
+    nkv_build_override_set(this, 0);
 }
 
 bool llama_kv_cache_context::has_attention_views() const {

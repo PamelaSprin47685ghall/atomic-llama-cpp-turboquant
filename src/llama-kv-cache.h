@@ -495,11 +495,28 @@ public:
     // llama_kv_cache_context specific API
     //
 
-    uint32_t get_n_kv() const;
+    uint32_t get_n_kv() const;   // honored: see nkv_envelope_begin
     uint32_t get_n_kv_pos_contiguous() const;
 
     bool has_attention_views() const;
     llama_attention_view_resolved attention_view(llama_seq_id seq, llama_pos pos) const;
+
+    // physical per-stream capacity of the underlying cache (upper bound for any
+    // n_kv the cache can back); used by the union-graph runtime nkv binder to
+    // clamp its envelope build to real, allocated cells
+    uint32_t get_capacity() const {
+        return kv ? kv->get_size() : 0u;
+    }
+
+    // union-graph runtime nkv binder: build-scoped n_kv override. While armed,
+    // get_n_kv() reports the envelope width instead of the applied cache n_kv,
+    // so a graph built in that scope is sized/allocated for the full envelope.
+    // Must not span set_inputs()/compute; only graph construction.
+    // (ABI-stable: the override value lives in a .cpp-local side table keyed
+    // by this object, not in a data member.)
+    void nkv_envelope_begin(uint32_t cap) const;
+
+    void nkv_envelope_end() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
