@@ -95,6 +95,48 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+// Graph-type classification for the union binder's decoder-build gate
+// (binder_record_snapshot / nout_record_valid).
+//
+// Decoder builds are exactly:
+//  - LLM_GRAPH_TYPE_DEFAULT: what ctx_type_to_graph_type() returns for every
+//    plain LLAMA_CONTEXT_TYPE_DEFAULT context - prefill AND decode. This is
+//    the graph type of every llama_decode() build in the tree (llama-cli, the
+//    TP5 compose driver, the tiny-model harnesses), i.e. the n_outputs lane's
+//    primary consumer. The pre-classifier gate compared against
+//    LLM_GRAPH_TYPE_DECODER only, which this fork's context path never
+//    produces (ctx_type_to_graph_type maps DEFAULT -> GRAPH_TYPE_DEFAULT and
+//    MTP -> GRAPH_TYPE_DECODER_MTP; the explicit DECODER tag has no
+//    producer), so the outputs lane never recorded a snapshot and every
+//    union_rebind_outputs entry exited at !nout_record_valid before any
+//    counted decision - the lane was dead for every context.
+//  - LLM_GRAPH_TYPE_DECODER: kept accepted for an explicit decoder tag
+//    (models group DEFAULT and DECODER identically, e.g. dflash/t5
+//    build_arch_graph) so a future/out-of-tree producer of the explicit tag
+//    keeps the documented contract.
+//
+// NOT decoder builds (fail closed, no snapshot is taken):
+//  - LLM_GRAPH_TYPE_ENCODER: llama_encode() builds; the n_outputs lane's
+//    contract (out_ids gather closure over decoder output rows, sampler-free
+//    builds, nout_bound bookkeeping) does not describe encoder graphs, and a
+//    snapshot taken there would poison the shared record for the decoder
+//    lane until the next fresh decoder build.
+//  - LLM_GRAPH_TYPE_DECODER_MTP: the nextn/MTP context's builds (its own
+//    state slot); the lane was designed and validated for the plain decoder
+//    graph. Excluding it keeps the MTP path byte-identical to r7 (its rebind
+//    attempts keep exiting at !nout_record_valid).
+static bool llm_graph_type_is_decoder_build(llm_graph_type gtype) {
+    switch (gtype) {
+        case LLM_GRAPH_TYPE_DEFAULT:
+        case LLM_GRAPH_TYPE_DECODER:
+            return true;
+        case LLM_GRAPH_TYPE_ENCODER:
+        case LLM_GRAPH_TYPE_DECODER_MTP:
+            return false;
+    }
+    return false; // out-of-range tag: fail closed
+}
+
 llama_context::llama_context(const llama_model & model, llama_context_params params) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
@@ -2785,16 +2827,25 @@ void llama_context::binder_record_snapshot(ggml_cgraph * gf, uint32_t nkv_built)
     if (st.cov_enabled) {
         st.cov_nkv_built = nkv_built;   // the classifier's width reference for this record
         memset(st.cov_present, 0, sizeof(st.cov_present));
-        for (size_t k = 0; k < st.record_t.size(); ++k) {
-            const ggml_tensor * t = st.record_t[k];
-            const int32_t s0 = st.record_src[k * (GGML_MAX_SRC + 1) + 0];
-            const int32_t vs = st.record_src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
-            ++st.cov_present[llama_nkv_cov_classify((int32_t) t->op, t->name,
-                                                    (t->flags & GGML_TENSOR_FLAG_INPUT) != 0,
-                                                    st.record_fixed[k] != 0,
-                                                    s0 >= 0 && st.record_fixed[s0] != 0,
-                                                    vs >= 0 && st.record_fixed[vs] != 0,
-                                                    t->ne[0], nkv_built)];
+        // Walk only when the nkv lane recorded this build (nkv_built > 0): the
+        // coverage families describe the nkv-coupled tensors of a build at the
+        // n_kv width. The n_outputs lane also records snapshots (every fresh
+        // DEFAULT decoder build) but passes nkv_built == 0 (no n_kv width was
+        // bound); classifying that record against width 0 would misclassify
+        // every family, so the outputs-only record is left all-zero here and
+        // the nkv coverage accounting stays exactly r8.
+        if (nkv_built > 0) {
+            for (size_t k = 0; k < st.record_t.size(); ++k) {
+                const ggml_tensor * t = st.record_t[k];
+                const int32_t s0 = st.record_src[k * (GGML_MAX_SRC + 1) + 0];
+                const int32_t vs = st.record_src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
+                ++st.cov_present[llama_nkv_cov_classify((int32_t) t->op, t->name,
+                                                        (t->flags & GGML_TENSOR_FLAG_INPUT) != 0,
+                                                        st.record_fixed[k] != 0,
+                                                        s0 >= 0 && st.record_fixed[s0] != 0,
+                                                        vs >= 0 && st.record_fixed[vs] != 0,
+                                                        t->ne[0], nkv_built)];
+            }
         }
     }
 }
@@ -3687,7 +3738,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         // nout_cap records that built width; the rebind only moves the
         // executed shapes within [0, nout_cap])
         env_out = !graph_reuse_disable && union_binder_state_peek() != nullptr &&
-            union_binder_state_peek()->nout_enabled && gtype == LLM_GRAPH_TYPE_DECODER;
+            union_binder_state_peek()->nout_enabled && llm_graph_type_is_decoder_build(gtype);
+        // ^ decoder builds = DEFAULT (every plain context: prefill + decode)
+        //   and DECODER (explicit tag). ENCODER and DECODER_MTP are excluded:
+        //   see llm_graph_type_is_decoder_build. The pre-classifier form
+        //   compared against DECODER only, which this tree never produces -
+        //   the lane recorded nothing and union_rebind_outputs always exited
+        //   at !nout_record_valid (dead outputs-only lane).
 
         gf = model.build_graph(gparams);
 
