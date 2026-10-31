@@ -885,22 +885,7 @@ public:
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
-    ggml_context * get_ctx() const {
-#if defined(M3_PROBE_GRAPH_HOOK)
-        // Test-only: a caller-owned graph context that this result does not own.
-        // Null (the production default) keeps the shipped behaviour exactly.
-        if (ctx_compute_view != nullptr) {
-            return ctx_compute_view;
-        }
-#endif
-        return ctx_compute.get();
-    }
-
-#if defined(M3_PROBE_GRAPH_HOOK)
-    // Test-only hook, compiled only for the M3 device probe: point the result at a
-    // context and graph owned by the caller.  Not part of the model API.
-    void reset_context_view(ggml_context * c, ggml_cgraph * g) { ctx_compute_view = c; gf = g; }
-#endif
+    ggml_context * get_ctx() const { return ctx_compute.get(); }
 
     int64_t get_max_nodes() const;
 
@@ -945,11 +930,6 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
 
     ggml_context_ptr ctx_compute;
-
-#if defined(M3_PROBE_GRAPH_HOOK)
-    // Test-only, non-owning; set by reset_context_view() from the M3 device probe.
-    ggml_context * ctx_compute_view = nullptr;
-#endif
 
     // memory buffers used to evaluate the model
     std::vector<uint8_t> buf_compute_meta;

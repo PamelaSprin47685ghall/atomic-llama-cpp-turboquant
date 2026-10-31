@@ -64,34 +64,9 @@ OUTPUT_ONLY = {"-MD", "-MMD"}                      # drop: bare output switches
 # Accepted translation-unit suffixes for the recorded compile command.
 SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".cu", ".c++", ".C")
 
-# The test-only hook lives in the tree (src/llama-graph.h under M3_PROBE_GRAPH_HOOK);
-# the recipe only verifies it is present and consistent with -DM3_PROBE_GRAPH_HOOK,
-# and reports the header/source names the patch touches.
-HOOK_HEADER = os.path.join(WORKTREE, "src/llama-graph.h")
-HOOK_TOKENS = (
-    ("ctx_compute_view", "the non-owning context member"),
-    ("reset_context_view", "the caller-owned context hook"),
-    ("M3_PROBE_GRAPH_HOOK", "the guard that keeps production builds byte-identical"),
-)
-
-
-def check_hook():
-    """Refuse to emit a -DM3_PROBE_GRAPH_HOOK compile when the header cannot honour it."""
-    if not os.path.isfile(HOOK_HEADER):
-        raise ValueError("hook header missing: %s" % HOOK_HEADER)
-    text = open(HOOK_HEADER, errors="replace").read()
-    missing = [tok for tok, what in HOOK_TOKENS if tok not in text]
-    if missing:
-        raise ValueError("src/llama-graph.h lacks the test-only hook (%s); the -D alone "
-                         "cannot make it exist" % ", ".join(missing))
-    # The hook must be inside the guarded region: every occurrence of the member must be
-    # preceded by the #if in the same file, which a simple count check approximates.
-    if text.count("M3_PROBE_GRAPH_HOOK") < 2:
-        raise ValueError("the hook guard appears only once in src/llama-graph.h; it must "
-                         "wrap both the member and the getter branch")
-    return {"header": HOOK_HEADER, "tokens": [tok for tok, _ in HOOK_TOKENS]}
-
-
+# There is no header hook and no extra macro: the probe uses the shipped
+# llm_graph_result (whose ctx_compute owns the test context) and only subclasses
+# the model graph, so the whole binary compiles with exactly the library's flags.
 def split_argv(argv, what="command"):
     """Parse an explicitly recorded compiler command.
 
@@ -198,12 +173,14 @@ def compile_commands(outdir):
     # The deduplicated flag tail must not contain -c/-o/-MF: those are re-emitted per
     # source below, exactly once.
     flags = dedup_groups(hip_flags + llama_flags)
+    # No extra -D: the probe must see the headers with exactly the library's macros,
+    # otherwise a class layout or inline definition could differ between TUs (ODR).
     flat = [x for g in flags for x in g]
     for forbidden in ("-c", "-o", "-MF", "-MT", "-MQ", "-MD", "-MMD"):
         if forbidden in flat:
             raise ValueError("flag tail still contains %r; refusing to emit two output "
                              "specifications" % forbidden)
-    flat = flat + ["-DM3_PROBE_GRAPH_HOOK"]
+    # deliberately nothing added: same macros as the library TU
     cmds = []
     emitted = set()
     for src in ("m3-mixer-prod-path.cpp", "m3-probe-hc-mix.cpp"):
@@ -274,7 +251,6 @@ def main(argv):
         print("# ERROR: missing sources: %s" % ", ".join(missing))
         return 2
     try:
-        hook = check_hook()
         compiles = compile_commands(outdir)
         link = link_command(outdir, libdir)
     except ValueError as exc:
@@ -306,7 +282,7 @@ def main(argv):
         print("# ERROR: link argv lacks the private dir rpath entries")
         return 2
     json.dump({"compile": compiles, "link": link,
-               "hook": hook},
+               "hook": {"header": "none", "tokens": []}},
               open(os.path.join(outdir, "build.argv.json"), "w"), indent=1)
     for c in compiles:
         print(shlex.join(c))
@@ -320,8 +296,8 @@ def main(argv):
     print("#     the first -l flag;")
     print("#   * the recorded templates must name an existing single .cu/.cpp with -x")
     print("#     and -iquote present, else the script refuses instead of guessing;")
-    print("#   * src/llama-graph.h must already carry the M3_PROBE_GRAPH_HOOK block")
-    print("#     (this tree does); the recipe verifies it and never patches at run time.")
+    print("#   * no macro beyond the recorded flags is added, so no class layout or inline")
+    print("#     definition can differ between the probe and the library.")
     print()
     print("# run matrix (Devops, both GPU flocks):")
     print("# 1. N=1 reference, MIXER site, production gate OFF:")

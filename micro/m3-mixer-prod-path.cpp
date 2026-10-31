@@ -42,6 +42,10 @@ extern "C" ggml_tensor * m3_probe_build_hc_mix(
         ggml_tensor * w_inject, int64_t nt, int il,
         ggml_tensor ** lo_out, ggml_tensor ** up_out, ggml_tensor ** inject_out);
 extern "C" bool m3_probe_lo_retained(ggml_tensor * lo);
+// Destroys the result (and with it the test-created ggml context) of the last
+// m3_probe_build_hc_mix call.  Frees exactly once; the harness must not free the
+// context itself.
+extern "C" void m3_probe_release(void);
 
 namespace {
 
@@ -112,11 +116,17 @@ bool run_site(ggml_backend_t be, llama_model * model, int64_t n_embd, int64_t nt
     s.inject = mixer ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 4 * n_embd, 4);
     s.x      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, nt);
     ggml_set_input(s.x);
+    // Weights and the input live in the same context the library will own, so they
+    // are freed with it: exactly one owner and one free.
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
     seed(be, s, n_embd, nt, mixer);
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4096, false);
     if (!m3_probe_attach(model, ctx, gf)) {
+        // Nothing was transferred (the probe refuses when it still holds an owner),
+        // so the harness frees its own objects here.
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
         return false;
     }
     ggml_tensor * lo = nullptr;
@@ -124,9 +134,8 @@ bool run_site(ggml_backend_t be, llama_model * model, int64_t n_embd, int64_t nt
     ggml_tensor * inj = nullptr;
     ggml_tensor * mixed = m3_probe_build_hc_mix(s.x, s.norm, s.down, s.up, s.inject,
                                                 nt, /*il=*/0, &lo, &up, &inj);
-    if (mixed == nullptr || lo == nullptr || up == nullptr) {
-        fprintf(stderr, "production builder returned no site (nt=%lld mixer=%d)\n",
-                (long long) nt, int(mixer));
+    if (mixed == nullptr) {
+        m3_probe_release();
         return false;
     }
     // Only the compared tensors are outputs; the mixed node keeps its own scale
@@ -136,6 +145,8 @@ bool run_site(ggml_backend_t be, llama_model * model, int64_t n_embd, int64_t nt
     ggml_set_output(up);
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
     if (!ggml_gallocr_alloc_graph(ga, gf)) {
+        ggml_gallocr_free(ga);
+        m3_probe_release();
         return false;
     }
     const bool retained = m3_probe_lo_retained(lo);
@@ -146,25 +157,25 @@ bool run_site(ggml_backend_t be, llama_model * model, int64_t n_embd, int64_t nt
            mixer ? "<none>" : ggml_type_name(s.inject->type),
            std::getenv("GGML_TP5_HC_N3_TAIL_KEEP") ? std::getenv("GGML_TP5_HC_N3_TAIL_KEEP") : "<unset>",
            std::getenv("GGML_TP5_HC_N3_TAIL_DIAG_SCOPE") ? std::getenv("GGML_TP5_HC_N3_TAIL_DIAG_SCOPE") : "<unset>");
-    for (int i = 0; i < 3; ++i) {
-        if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
-            return false;
-        }
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; ++i) {
+        ok = ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS;
     }
-    {
+    if (ok) {
         std::vector<float> v(ggml_nelements(mixed));
         ggml_backend_tensor_get(mixed, v.data(), 0, v.size() * sizeof(float));
         FILE * f = fopen(out.c_str(), "wb");
         if (f == nullptr) {
-            return false;
+            ok = false;
+        } else {
+            fwrite(v.data(), sizeof(float), v.size(), f);
+            fclose(f);
         }
-        fwrite(v.data(), sizeof(float), v.size(), f);
-        fclose(f);
     }
     ggml_gallocr_free(ga);
-    ggml_backend_buffer_free(buf);
-    ggml_free(ctx);
-    return true;
+    ggml_backend_buffer_free(buf);   // weights/input buffer, before the context dies
+    m3_probe_release();              // frees the ggml context exactly once
+    return ok;
 }
 
 } // namespace

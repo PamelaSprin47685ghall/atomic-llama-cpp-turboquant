@@ -472,6 +472,20 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 // The device test harness (micro/m3-mixer-prod-path.cpp) calls the same probe, so
 // a leg can prove the production gate decided the retention instead of inferring
 // it from output values.
+
+std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
+    return std::make_unique<graph>(*this, params);
+}
+
+// Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
+// Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
+
+// M3 N-row owner-tail device diagnostics (see micro/m3-mixer-prod-path.cpp).
+// Compiled into the model TU so the device probe links the same definition the
+// model links; the switches are inert unless set to exactly "1".
 struct qwen4exp_hc_mix_probe {
     static bool tail_diag() { const char * v = std::getenv("M3_TAIL_DIAG"); return v && std::atoi(v) != 0; }
     static bool tail_why()  { const char * v = std::getenv("M3_TAIL_WHY");  return v && std::atoi(v) != 0; }
@@ -522,15 +536,6 @@ struct qwen4exp_hc_mix_probe {
     }
 };
 
-std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
-    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        return std::make_unique<graph_mtp>(*this, params);
-    }
-    return std::make_unique<graph>(*this, params);
-}
-
-// Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
-// Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  x,
         ggml_tensor *  w_norm,

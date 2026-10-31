@@ -499,6 +499,50 @@ Two independent blockers, both inside the delivery (`lead-m3mixer3-verify-202610
 Nothing was compiled, run or syntax-checked for this revision by me: the probe TU, the harness and
 both recipes remain **authored, NOT verified**, and **G2 is not claimed**.
 
+## 5h. Fifth review: remove the macro-level layout change; sole ownership of the test context
+
+The independent scheduler review is right on both counts, and the previous revision is withdrawn as
+evidence of a usable build:
+
+* `M3_PROBE_GRAPH_HOOK` added a member to `llm_graph_result` and changed the inline `get_ctx()`.
+  Because the macro was defined for the probe TUs only, the class had **two layouts** and `get_ctx()`
+  two definitions across the binary (ODR/ABI split), and — worse — the production builder runs in the
+  library TU, where `build_hc_mix` reaches the context through `res->get_ctx()`; a shadow member the
+  probe could see but the library could not would make the hook useless even if it linked.
+* The fix is not a better macro, it is no macro: `src/llama-graph.h` is now **byte-identical to the
+  production header** (`git diff f1c5fafc0 -- src/llama-graph.h` is empty) and every TU of the probe
+  is compiled with exactly the library's flags.
+
+Ownership, the part that needed care:
+
+* `llm_graph_result::ctx_compute` is a `ggml_context_ptr` = `std::unique_ptr<ggml_context,
+  ggml_context_deleter>` and the deleter is `ggml_free` (`ggml/include/ggml-cpp.h:17`).  The shipped
+  `reset()` does exactly `ctx_compute.reset(ggml_init(...))`, so a result can be handed a
+  caller-created context through the same unique_ptr type and will free it on destruction with the
+  same deleter — one owner, one free.
+* The probe therefore does:
+
+  ```cpp
+  std::unique_ptr<llm_graph_result> res(new llm_graph_result(4096,
+          std::unique_ptr<ggml_context, ggml_context_deleter>(g_probe.ctx)));
+  g_probe.ctx = nullptr;                 // ownership moved, nothing left to free twice
+  params.res = res.get();                // the library reads get_ctx()/get_gf() from it
+  ...                                    // build_hc_mix(...) — the shipped definition
+  g_probe.res = res.release();           // outlives the call; caller reads tensors back
+  ```
+
+  `m3_probe_release()` deletes it, `m3_probe_attach()` refuses to install a second context while one
+  is outstanding, and a build whose context, weights or input do not come from the handed-over
+  context is refused (checked via the backend buffer's `context` tag, since the public API does not
+  expose a tensor's context).  The harness allocates weights, input and graph in that one context, so
+  there is a single allocation site and a single free site.
+* **No production API was added**: nothing new in `llama-graph.h`, `llama-impl.h` or the model header;
+  the probe only subclasses `llama_model_qwen4exp::graph` (which exposes one protected member to a
+  derived type) and uses the public `llm_graph_context` constructor.
+
+Every claim in this section is a static reading of the code.  Nothing was compiled, run or
+syntax-checked; **G2 is not claimed** and the probe/harness/recipes remain authored-only.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -516,7 +560,9 @@ both recipes remain **authored, NOT verified**, and **G2 is not claimed**.
   rejected for a duplicated compiler, a misordered `-MMD`, and a link line without the private
   `-L` (§5e), and the parser likewise mistook the `-MF` dependency file for the translation unit
   (§5f), and the probe's hook was printed rather than delivered while its call site used the wrong
-  arity (§5g). All of those are fixed; nothing has been executed, so G2 remains unproven; the production gate is exact `"1"` again and the previous
+  arity (§5g); the hook itself was then withdrawn because a macro-guarded member change splits the
+  class layout across TUs and cannot reach the library anyway (§5h adds real sole ownership of the
+  test context instead). Nothing has been executed, so G2 remains unproven; the production gate is exact `"1"` again and the previous
   `trunk`/`mixer`-inside-`TAIL_KEEP` revision is reverted (kept as evidence above);
   token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
   §5a/§5b give the placement-stamp and per-layer capture plan.  The gate stays closed: promotion is
