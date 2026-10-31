@@ -675,6 +675,44 @@ Devops reading rules (also printed by the recipe):
 
 Nothing in this section was compiled, run or syntax-checked: **G2 remains unproven**.
 
+## 5m. Tenth review: sizing is not execution, and identity must be a real join
+
+Two correct findings, both fixed inside `ggml/src/ggml-alloc.c`:
+
+1. **Sizing passes were reported as plans.**  `ggml_gallocr_reserve_n_size()` calls the same
+   `ggml_gallocr_reserve_n_impl()` with `no_alloc = true`, which reaches
+   `ggml_gallocr_alloc_graph_impl()`; the witness therefore printed `status=planned` for a sizing
+   pass, which a reader could mistake for an execution plan.  The mode is now threaded into the
+   planning function and printed:
+   `pass=actual` only when `no_alloc == false` (buffer-backed plan), `pass=sizing` otherwise.  The
+   harness performs no sizing pass and uses one gallocr per site, so its line is `pass=actual`.
+2. **`first`/`last`/`nodes`/`plan_id` share no key with `M3_TAIL_BUILD`.**  They identify a graph
+   *shape*, not the decision.  The allocator now records, at the decision point itself
+   (`ggml_gallocr_free_node`, the branch that refuses to release a retained node), the identity of
+   every tensor it kept — `name`, `op`, `ne[0]` — into a fixed-capacity array on the gallocr
+   (`M3_WITNESS_MAX_RETAINED = 8`, no allocation; overflow sets `truncated=1`).  It emits one
+   `M3_ALLOC_RETAINED plan_id=… pass=… idx=… name=… op=… ne0=…` line per retained tensor.
+
+   The join is now by tensor identity: `build_hc_mix` names the site's tensors `hc_lo` / `hc_up` /
+   `hc_mixed` and the model TU's `M3_TAIL_BUILD` line reports those same names with `row_scope`,
+   `il`, `nt`.  A retained `hc_lo` at `pass=actual` is therefore the allocator stating *which*
+   tensor it kept, and it can be matched to the site that built it — no inference from counts or
+   from log order.  (The op name is printed from the tensor's own `op`, so a wrongly attributed
+   tensor would be visible as a different `name`/`op` pair rather than silently accepted.)
+
+Reading rules, final form:
+
+| line | meaning |
+|---|---|
+| `status=planned pass=actual` + `retained_free_skip>0` + `M3_ALLOC_RETAINED … name=hc_lo` | the gate armed retention and the allocator kept the site's `lo` allocation |
+| same, plus `view_reuse_skip>0` | a retained view owner (the mixer's `xn`) also changed the plan |
+| `status=planned pass=actual`, both counters 0, `retained=0` | no retention in a real plan (OFF leg expectation) |
+| `status=planned pass=sizing` | sizing only: never evidence about an execution plan |
+| `status=not_measured` | plan reuse, no planning pass: no conclusion |
+| no line | witness unarmed: not measured |
+
+Nothing in this section was compiled, run or syntax-checked: **G2 remains unproven**.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -701,7 +739,10 @@ Nothing in this section was compiled, run or syntax-checked: **G2 remains unprov
   `ggml_graph_n_nodes`), and the retention counters were global and racy (§5k replaces them with
   per-instance, per-call state that is written only when armed), and that state was then reported
   from a path that can reuse a plan (§5l reports only real planning passes and adds `plan_id` plus
-  first/last node identity). Nothing has been executed, so G2 remains unproven; the production gate is exact `"1"` again and the previous
+  first/last node identity), which still could not tell a sizing pass from an actual one and whose
+  identity keys did not join with the site line (§5m adds `pass=sizing|actual` and per-tensor
+  `M3_ALLOC_RETAINED name/op/ne0` recorded at the retention decision). Nothing has been executed, so
+  G2 remains unproven; the production gate is exact `"1"` again and the previous
   `trunk`/`mixer`-inside-`TAIL_KEEP` revision is reverted (kept as evidence above);
   token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
   §5a/§5b give the placement-stamp and per-layer capture plan.  The gate stays closed: promotion is

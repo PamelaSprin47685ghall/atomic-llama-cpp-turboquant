@@ -479,6 +479,10 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+// Fixed capacity so the witness never allocates; a graph with more retained
+// tensors reports the first M3_WITNESS_MAX_RETAINED and sets retained_truncated.
+#define M3_WITNESS_MAX_RETAINED 8
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
@@ -503,9 +507,17 @@ struct ggml_gallocr {
         int64_t retained_free_skip;   // free path refused a NO_REUSE node
         int64_t no_reuse_inplace_skip; // in-place reuse refused: parent retained
         int64_t view_reuse_skip;      // in-place reuse refused: view owner retained
+        // identities of the tensors actually retained during this window; the
+        // identity strings are the tensors' own names, so a leg can join the
+        // decision with the model TU's site line instead of guessing by order
+        int n_retained;
+        const char * retained_names[M3_WITNESS_MAX_RETAINED];
+        const char * retained_ops[M3_WITNESS_MAX_RETAINED];
+        int64_t retained_ne[M3_WITNESS_MAX_RETAINED];
     } m3_witness;
     bool m3_witness_on;   // armed once per instance from GGML_M3_ALLOC_WITNESS
     int64_t m3_plan_id;   // increments once per real planning pass on this instance
+    int m3_mode;          // 0 = sizing pass, 1 = actual (buffer-backed) pass
 };
 
 // The M3 retention witness is armed by GGML_M3_ALLOC_WITNESS=1, read once per
@@ -729,6 +741,13 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
         AT_PRINTF("not freeing retained tensor %s\n", node->name);
         if (galloc->m3_witness_on && (node->flags & GGML_TENSOR_FLAG_NO_REUSE)) {
             galloc->m3_witness.retained_free_skip++;
+            // The identity of the tensor whose allocation the free path kept.
+            if (galloc->m3_witness.n_retained < M3_WITNESS_MAX_RETAINED) {
+                const int i = galloc->m3_witness.n_retained++;
+                galloc->m3_witness.retained_names[i] = node->name;
+                galloc->m3_witness.retained_ops[i]   = ggml_op_name(node->op);
+                galloc->m3_witness.retained_ne[i]    = node->ne[0];
+            }
         }
         return;
     }
@@ -753,7 +772,11 @@ static int get_node_buffer_id(const int * node_buffer_ids, int i) {
     return node_buffer_ids ? node_buffer_ids[i] : 0;
 }
 
-static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+// `m3_mode` distinguishes a real (buffer-backed) planning pass from a sizing
+// pass (ggml_gallocr_reserve_n_size, no_alloc = true): both reach this function,
+// but only a real pass corresponds to an execution plan, so the report says which
+// one it measured.  Values: 0 = sizing, 1 = actual.
+static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, int m3_mode) {
     // M3 witness window: this function is the only place that plans an allocation
     // (it is reached from ggml_gallocr_reserve_n_impl).  Counters start at zero
     // here and are reported at the end of this same call, so a report always
@@ -762,7 +785,9 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         galloc->m3_witness.retained_free_skip    = 0;
         galloc->m3_witness.no_reuse_inplace_skip = 0;
         galloc->m3_witness.view_reuse_skip       = 0;
+        galloc->m3_witness.n_retained            = 0;
         galloc->m3_plan_id++;
+        galloc->m3_mode = m3_mode;
     }
 
     // clear hash tables
@@ -876,17 +901,26 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
     if (galloc->m3_witness_on) {
         // Read-only summary of the planning pass that just finished on this
-        // instance.  The graph identity (node count + first/last node names) lets
-        // a leg attribute the numbers to one site instead of guessing by position.
-        GGML_LOG_INFO("%s: M3_ALLOC_WITNESS status=planned plan_id=%lld nodes=%d "
-                      "first=%s last=%s retained_free_skip=%lld no_reuse_inplace_skip=%lld "
-                      "view_reuse_skip=%lld\n", __func__, (long long) galloc->m3_plan_id,
-                ggml_graph_n_nodes(graph),
-                graph->n_nodes > 0 ? graph->nodes[0]->name : "-",
-                graph->n_nodes > 0 ? graph->nodes[graph->n_nodes - 1]->name : "-",
+        // instance: the pass kind (sizing vs actual), the plan id, and the
+        // identities of the tensors the allocator actually retained.
+        GGML_LOG_INFO("%s: M3_ALLOC_WITNESS status=planned pass=%s plan_id=%lld nodes=%d "
+                      "retained_free_skip=%lld no_reuse_inplace_skip=%lld view_reuse_skip=%lld "
+                      "retained=%d truncated=%d\n", __func__,
+                galloc->m3_mode == 1 ? "actual" : "sizing",
+                (long long) galloc->m3_plan_id, ggml_graph_n_nodes(graph),
                 (long long) galloc->m3_witness.retained_free_skip,
                 (long long) galloc->m3_witness.no_reuse_inplace_skip,
-                (long long) galloc->m3_witness.view_reuse_skip);
+                (long long) galloc->m3_witness.view_reuse_skip,
+                galloc->m3_witness.n_retained,
+                galloc->m3_witness.n_retained >= M3_WITNESS_MAX_RETAINED ? 1 : 0);
+        for (int i = 0; i < galloc->m3_witness.n_retained; i++) {
+            GGML_LOG_INFO("%s: M3_ALLOC_RETAINED plan_id=%lld pass=%s idx=%d name=%s op=%s ne0=%lld\n",
+                    __func__, (long long) galloc->m3_plan_id,
+                    galloc->m3_mode == 1 ? "actual" : "sizing", i,
+                    galloc->m3_witness.retained_names[i],
+                    galloc->m3_witness.retained_ops[i],
+                    (long long) galloc->m3_witness.retained_ne[i]);
+        }
     }
 }
 
@@ -913,7 +947,7 @@ static bool ggml_gallocr_reserve_n_impl(
     }
 
     // allocate in hash table
-    ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, no_alloc ? 0 : 1);
 
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {

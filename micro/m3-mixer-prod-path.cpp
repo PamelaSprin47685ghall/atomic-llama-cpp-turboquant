@@ -162,10 +162,11 @@ bool run_site(ggml_backend_t be, llama_model * model, int64_t n_embd, int64_t nt
     ggml_set_output(mixed);
     ggml_set_output(lo);
     ggml_set_output(up);
-    // A fresh gallocr per site: its first ggml_gallocr_alloc_graph is a real
-    // planning pass, so the M3_ALLOC_WITNESS "planned" line of this leg describes
-    // this graph and no other.  A reused plan (second call on the same gallocr)
-    // would print status=not_measured instead, which must never be read as zero.
+    // A fresh gallocr per site, and no sizing pass: the only planning pass on this
+    // instance is the real one, so the M3_ALLOC_WITNESS line of this leg says
+    // pass=actual and describes this graph and no other.  A reused plan would print
+    // status=not_measured, a sizing pass would print pass=sizing; neither may be
+    // read as "retention did not happen".
     ggml_gallocr_t ga = ggml_gallocr_new(buft);
     if (!ggml_gallocr_alloc_graph(ga, gf)) {
         ggml_gallocr_free(ga);
