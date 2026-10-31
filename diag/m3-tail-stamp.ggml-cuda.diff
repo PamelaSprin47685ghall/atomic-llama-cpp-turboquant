@@ -24,18 +24,20 @@
 +        static const char * const stamp_path = std::getenv("M3TAIL_STAMP_PATH");
 +        if (stamp && stamp_path && stamp_path[0]) {
 +            FILE * fp = fopen(stamp_path, "a");
-+            const auto off = [](const ggml_tensor * t) -> long long {
-+                if (!t || !t->data || !t->buffer) {
-+                    return -1;
-+                }
-+                return (long long) ((const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer));
-+            };
-+            fprintf(fp, "M3STAMP why=%d node=%d rows=%lld upb=%lld upo=%lld lob=%lld loo=%lld "
-+                    "xnb=%lld xno=%lld outb=%lld outo=%lld wb=%lld wo=%lld\n",
-+                    why, i, (long long) rows, (long long) (intptr_t) up, off(up),
-+                    (long long) (intptr_t) lo, off(lo), (long long) (intptr_t) xn, off(xn),
-+                    (long long) (intptr_t) out, off(out), (long long) (intptr_t) weights, off(weights));
-+            fclose(fp);
++            if (fp) {
++                const auto off = [](const ggml_tensor * t) -> long long {
++                    if (!t || !t->data || !t->buffer) {
++                        return -1;
++                    }
++                    return (long long) ((const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer));
++                };
++                fprintf(fp, "M3STAMP why=%d node=%d rows=%lld upb=%lld upo=%lld lob=%lld loo=%lld "
++                        "xnb=%lld xno=%lld outb=%lld outo=%lld wb=%lld wo=%lld\n",
++                        why, i, (long long) rows, (long long) (intptr_t) up, off(up),
++                        (long long) (intptr_t) lo, off(lo), (long long) (intptr_t) xn, off(xn),
++                        (long long) (intptr_t) out, off(out), (long long) (intptr_t) weights, off(weights));
++                fclose(fp);
++            }
 +        }
 +        if (why) {
 +            return false;
