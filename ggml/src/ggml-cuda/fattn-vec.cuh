@@ -168,6 +168,16 @@ static __global__ void flash_attn_ext_vec(
 
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
+    // Mask Q-token row stride in half units. This is the mask's OWN stride
+    // (nb31 == mask->nb[1]), never assumed equal to K->ne[1]: every current
+    // producer builds the ubatch mask contiguous with ne[0] == K->ne[1], so
+    // nb31/2 == ne11 and the index below is bit-identical to the previous
+    // hard-coded j*ne11 form. Sliced/staged masks (e.g. the KV-stream chunk
+    // staging keeps nb[1] at the full row stride while shrinking ne[0]) keep
+    // their true stride here, so a ncols >= 2 consumer can never walk into the
+    // next query row or past the allocation at the tail.
+    const int stride_mask = int(nb31 / sizeof(half));
+
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
     static_assert(D % (2*WARP_SIZE) == 0, "D not divisible by 2*WARP_SIZE == 64.");
@@ -417,7 +427,11 @@ static __global__ void flash_attn_ext_vec(
                 // Checked tail: the mask row of an invalid row is skipped entirely;
                 // the neutral sum keeps it out of the max update like a -INF row.
                 if (mask && row_valid && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    // Mask Q-token stride is the mask's own nb31/2 (see the
+                    // stride_mask note at the top of the kernel), never the
+                    // hard-coded K->ne[1]. Bit-identical for every contiguous
+                    // ubatch mask (nb31/2 == ne11); correct for sliced masks.
+                    sum += slope*__half2float(maskh[j*stride_mask + i_KQ]);
                 } else if (!row_valid) {
                     sum = -FLT_MAX/2.0f;
                 }
