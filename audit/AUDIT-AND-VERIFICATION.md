@@ -371,6 +371,44 @@ per-row `nt=1` images written with the trunk micro's `M3_ROW0` seeding) plus
 4. `diag/m3-locate-divergence.py`: per row, whether the difference is already in the logits
    (top-8 index sets equal but `|Δlogit| > 0`) or only in the softmax tail.
 
+## 5d. Fixes after the Devops harness audit (2026-10-31, `lead-m3mixer-verify-20261031`)
+
+Devops found two real defects in the first harness revision; both are fixed and both are recorded
+here as evidence rather than edited away:
+
+1. **Recipe flag loss.**  `build_mixer_n1ref.py` whitelisted `-I/-D/-O/-f/-W/--offload-arch/-std`
+   and thereby dropped the lane's `-x hip`, so the generated command failed on
+   `hip/hip_runtime.h` (`build-harness.log`).  Both recipes now copy **every** recorded argv element
+   and drop only output naming (`-o/-c/-MF/-MT/-MD`, `-Wl,--dependency-file`); the n1ref recipe also
+   stopped re-adding `-fPIC/-O3/--offload-arch` the template already carries.
+2. **Wrong subject under test.**  The first harness rebuilt the HC block with local ops and **F32**
+   weights, so it never entered `llama_model_qwen4exp::graph::build_hc_mix`, never met the
+   production `Q8_0` door and could not observe the retention decision.  The replacement is
+   `micro/m3-mixer-prod-path.cpp`:
+   * weights exactly as the model loads them — `hc_*_down` Q8_0 `[10240,320]`, `hc_*_up` Q8_0
+     `[320,10240]`, `hc_*_inject` Q8_0 `[10240,4]` (trunk) or absent (mixer);
+   * the site is built by the **shipped** builder through `micro/m3-probe-hc-mix.cpp`, a subclass of
+     `llama_model_qwen4exp::graph` that exposes the one protected member; the definition called is the
+     one inside the candidate `libllama`, not a copy;
+   * the harness never sets `GGML_TENSOR_FLAG_NO_REUSE`; it reads `lo->flags` back and prints
+     `lo_retained`, so a leg **witnesses** that the production gate decided it;
+   * per-row `nt = 1` images are written by the same builder with the `M3_ROW0` seeding, which is the
+     `chk-N1-r<k>` convention, for `diag/m3-n1-rowref.py`.
+   The only test-only code change is a hook pair in `src/llama-graph.h` under
+   `M3_PROBE_GRAPH_HOOK` (a non-owning `ctx_compute_view` plus `reset_context_view`), printed verbatim
+   by `micro/build_mixer_prod.py`; without the macro nothing changes and the null-view path is the
+   shipped one.
+
+Production diagnostics added (inert unless the env value is exactly `"1"`): `build_hc_mix` now
+labels `hc_lo`/`hc_up` and calls `qwen4exp_hc_mix_probe::hc_mix_built`, which emits
+`M3_TAIL_BUILD` (scope, il, nt, and the retained flags of `lo` and `xn` read from the tensors) under
+`M3_TAIL_DIAG=1` and per-site placement rows under `M3TAIL_STAMP=1`.  Names and logging only; no
+value, op, flag or gate changes, and the production gate stays exact `"1"` with the OFF matrix
+(`""`/`0`/`01`/`true`/anything) intact.
+
+Gate matrix after this round (unchanged from §5c): `TAIL_KEEP` exact `"1"` + `TRIO` `"1"`; every other
+value OFF; the diagnostic scope is a separate variable and is never a promotion input.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -382,8 +420,9 @@ per-row `nt=1` images written with the trunk micro's `M3_ROW0` seeding) plus
   (needs G3-1), the exact compute-buffer delta (G3-3), kernel-census equivalence (G3-4), and every
   G4 numerics number. No build, no syntax check, no test was run for this report by contract.
 * **2026-10-31 update (Devops data, re-read only):** reach 774/774 with the unmodified trio proven;
-  the trunk/mixer isolation and the mixer N=1 harness (§5c) are code-only in this branch and have
-  NOT been built or run; the production gate is exact `"1"` again and the previous
+  the trunk/mixer isolation and the production-path mixer test (§5c/§5d) are code-only in this
+  branch and have NOT been built or run; the first harness revision was rejected by Devops for
+  dropping `-x hip` and for not driving the production builder, both fixed in §5d; the production gate is exact `"1"` again and the previous
   `trunk`/`mixer`-inside-`TAIL_KEEP` revision is reverted (kept as evidence above);
   token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
   §5a/§5b give the placement-stamp and per-layer capture plan.  The gate stays closed: promotion is
