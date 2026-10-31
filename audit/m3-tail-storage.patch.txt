@@ -1,18 +1,30 @@
 == worktree
 /home/kunweiz/work/m3tail-storage-20261031
-2ae2c7d9d1ab66f4d7ac214400ce268e28aeb671
+5af6f785824a8453fc4bfec180a2a81344041db0
+5af6f7858 audit: trunk/mixer isolation semantics and the N=1 row-reference plan
+4e4d0cd4c diag: N1 row-reference checker and trunk/mixer row-split helper
+7732fdaca qwen4exp: split the M3 tail retention into trunk/mixer scopes, fail closed
+e5b141efb audit: 2026-10-31 8x2 reach data, KL class check and layered diag plan
+014e0fda9 diag: layered divergence locator for captured logits pairs
+d7810e452 diag: offset/id stamp variant of the M3 tail hook (log-only)
+ffa185d85 audit: M3 tail-storage patch trail, defect chain and Devops verification plan
 2ae2c7d9d qwen4exp: retain xn at the no-inject mixer sites too (default off)
 1d529d64a qwen4exp: give the M3 N-row owner tail independent lo storage (default off)
-2ef9cf2e3 alloc: add GGML_TENSOR_FLAG_NO_REUSE retention contract
-f1c5fafc0 add async-protocol candidate overlay + SYNC.md
 
-== diff vs base f1c5fafc0
- ggml/include/ggml.h     |  1 +
- ggml/src/ggml-alloc.c   | 19 +++++++++++-----
- src/models/qwen4exp.cpp | 60 +++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 74 insertions(+), 6 deletions(-)
+== diff vs base f1c5fafc0 (code+diag+audit)
+ audit/AUDIT-AND-VERIFICATION.md   | 385 ++++++++++++++++++++++++++++++++++++++
+ audit/m3-tail-storage.patch.txt   |  14 ++
+ diag/m3-locate-divergence.py      | 109 +++++++++++
+ diag/m3-n1-rowref.py              | 129 +++++++++++++
+ diag/m3-split-trunk-mixer.py      | 105 +++++++++++
+ diag/m3-tail-stamp-diff.py        |  91 +++++++++
+ diag/m3-tail-stamp.ggml-cuda.diff |  47 +++++
+ ggml/include/ggml.h               |   1 +
+ ggml/src/ggml-alloc.c             |  19 +-
+ src/models/qwen4exp.cpp           | 110 +++++++++++
+ 10 files changed, 1004 insertions(+), 6 deletions(-)
 
-== patch
+== code diff
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 4cb5eb4d1..45344b30c 100644
 --- a/ggml/include/ggml.h
@@ -91,10 +103,10 @@ index cbe45779d..e2c8b9b58 100644
      if (!node->data && !node->view_src) {
          // If we previously had data but don't now then reallocate
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 78b58ee94..928cf2acb 100644
+index 78b58ee94..03fb25af7 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -65,6 +65,46 @@ static bool qwen4exp_hc_keep_lo_enabled() {
+@@ -65,6 +65,90 @@ static bool qwen4exp_hc_keep_lo_enabled() {
      return enabled;
  }
  
@@ -105,48 +117,91 @@ index 78b58ee94..928cf2acb 100644
 +    return value != nullptr && value[0] == '1' && value[1] == '\0';
 +}
 +
-+// M3 N-row owner-tail storage separation. The HIP trio's fused tail
-+// (hc_owner_tail4_rows) reads every lo element from all output CTAs while it
-+// writes the hc_mixed scale, so out and lo must not share storage. galloc
-+// frees lo right after its last ordinary consumer (up) for nt = 2..4, and the
-+// hc_mixed chain then lands in that freed range; the backend guard
-+// (ggml-cuda.cu hc_owner_tail4_rows, untouched and fail-closed) vetoes, so the
-+// tail silently falls back to the generic twelve-node chain. Retaining lo's
-+// allocation keeps its storage out of the free list for the rest of the graph,
-+// which is exactly the independent storage the fused tail needs. This is an
-+// allocator-only lifetime contract (GGML_TENSOR_FLAG_NO_REUSE): no node is
-+// added, no value changes, lo stays an external input of the fused subgraph so
-+// ggml_can_fuse_subgraph is unaffected, and Meta's HC owner/late-join plan
-+// keys on GGML_TENSOR_FLAG_OUTPUT only, so it keeps its previous decisions.
-+// Requires the trio gate as well, so the trio alone keeps its previous
-+// allocation decisions, and N = 1 keeps using GGML_TP5_HC_KEEP_LO above.
-+static bool qwen4exp_hc_n3_tail_keep_enabled() {
-+    static const bool enabled = qwen4exp_env_is_1("GGML_TP5_HC_N3_TAIL_KEEP") &&
-+            qwen4exp_env_is_1("GGML_TP5_HC_N3_TRIO");
-+    return enabled;
++// M3 N-row owner-tail storage separation, split into two independently gated
++// mechanisms so the trunk sites (micro-baselined) and the mixer sites (no micro
++// baseline) can be measured apart.  Both share this derivation of the strict
++// gate value:
++//   GGML_TP5_HC_N3_TAIL_KEEP  unset/"0"/""  -> nothing retained
++//                             "1"            -> trunk and mixer retention (the
++//                                              complete coverage)
++//                             "trunk"        -> trunk sites only   (diagnostic)
++//                             "mixer"        -> mixer sites only   (diagnostic)
++// Any other value is a configuration error and aborts, so a mistyped isolation
++// knob can never silently narrow the coverage of a candidate run.
++enum qwen4exp_hc_n3_tail_scope {
++    QWEN4EXP_HC_N3_TAIL_SCOPE_OFF     = 0,
++    QWEN4EXP_HC_N3_TAIL_SCOPE_TRUNK   = 1 << 0,
++    QWEN4EXP_HC_N3_TAIL_SCOPE_MIXER   = 1 << 1,
++    QWEN4EXP_HC_N3_TAIL_SCOPE_ALL     = QWEN4EXP_HC_N3_TAIL_SCOPE_TRUNK | QWEN4EXP_HC_N3_TAIL_SCOPE_MIXER,
++};
++
++static int qwen4exp_hc_n3_tail_scope() {
++    const char * value = std::getenv("GGML_TP5_HC_N3_TAIL_KEEP");
++    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
++        return QWEN4EXP_HC_N3_TAIL_SCOPE_OFF;
++    }
++    if (std::strcmp(value, "1") == 0) {
++        return QWEN4EXP_HC_N3_TAIL_SCOPE_ALL;
++    }
++    if (std::strcmp(value, "trunk") == 0) {
++        return QWEN4EXP_HC_N3_TAIL_SCOPE_TRUNK;
++    }
++    if (std::strcmp(value, "mixer") == 0) {
++        return QWEN4EXP_HC_N3_TAIL_SCOPE_MIXER;
++    }
++    throw std::runtime_error("GGML_TP5_HC_N3_TAIL_KEEP must be unset, 0, 1, trunk, or mixer");
 +}
 +
-+// Retain the storage owner of xn for the same reason. A view cannot be
++// The HIP trio's fused tail (hc_owner_tail4_rows) reads every lo element from all
++// output CTAs while it writes the hc_mixed scale, so out and lo must not share
++// storage.  galloc frees lo right after its last ordinary consumer (up) for
++// nt = 2..4, and the hc_mixed chain then lands in that freed range; the backend
++// guard (ggml-cuda.cu hc_owner_tail4_rows, untouched and fail-closed) vetoes, so
++// the tail silently falls back to the generic twelve-node chain.  Retaining lo's
++// allocation keeps its storage out of the free list for the rest of the graph,
++// which is exactly the independent storage the fused tail needs.  This is an
++// allocator-only lifetime contract (GGML_TENSOR_FLAG_NO_REUSE): no node is
++// added, no value changes, lo stays an external input of the fused subgraph so
++// ggml_can_fuse_subgraph is unaffected, and Meta's HC owner/late-join plan keys
++// on GGML_TENSOR_FLAG_OUTPUT only, so it keeps its previous decisions.
++//
++// Scope: a mixer site is one whose caller passes no inject projection (the
++// output mixer and the MTP head mixer); every other site is a trunk site.  The
++// trunk sites are the ones the M3 micro baseline covers with per-row N1
++// references; the mixer sites have no such baseline, which is why they can be
++// isolated.  Requires the trio gate as well, so the trio alone keeps its
++// previous allocation decisions, and N = 1 keeps using
++// GGML_TP5_HC_KEEP_LO above.
++static bool qwen4exp_hc_n3_tail_keep_enabled(bool mixer_site) {
++    const int scope = qwen4exp_hc_n3_tail_scope();
++    const int needed = mixer_site ? QWEN4EXP_HC_N3_TAIL_SCOPE_MIXER : QWEN4EXP_HC_N3_TAIL_SCOPE_TRUNK;
++    return (scope & needed) != 0 && qwen4exp_env_is_1("GGML_TP5_HC_N3_TRIO");
++}
++
++// Retain the storage owner of xn for the same reason.  A view cannot be
 +// retained, and galloc frees a view's owner once the last view loses its last
-+// consumer, so the flag belongs on the base tensor. Only the mixer sites
-+// without an inject projection need it: everywhere else xn outlives the tail
-+// because the inject projection still reads it.
-+static void qwen4exp_hc_n3_retain_xn(ggml_tensor * xn) {
++// consumer, so the flag belongs on the base tensor.  Only mixer sites (no
++// inject projection) need it: everywhere else xn outlives the tail because the
++// inject projection still reads it.  Returns false when the base tensor is not
++// the shape the HIP guard accepts, so the caller can fall back instead of
++// taking the retention policy on faith.
++static bool qwen4exp_hc_n3_retain_xn(ggml_tensor * xn, int64_t hc_dim, int64_t nt) {
 +    ggml_tensor * base = xn->view_src != nullptr ? xn->view_src : xn;
-+    if (base->type == GGML_TYPE_F32 && ggml_is_contiguous(base)) {
-+        base->flags |= GGML_TENSOR_FLAG_NO_REUSE;
++    if (base->type != GGML_TYPE_F32 || ggml_nelements(base) != hc_dim * nt || !ggml_is_contiguous(base)) {
++        return false;
 +    }
++    base->flags |= GGML_TENSOR_FLAG_NO_REUSE;
++    return true;
 +}
 +
  // Keep the two existing top-k outputs alive for the fused expert reduction.
  // Their views, not the internal argsort/divide tensors, are materialized outputs.
  static void qwen4exp_moe_keep_route(ggml_tensor * out) {
-@@ -435,6 +475,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+@@ -435,6 +519,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
          // mixed after the original up node. No extra operation or copy is added.
          ggml_set_output(lo);
      }
-+    if (qwen4exp_hc_n3_tail_keep_enabled() && hc == 4 && n_embd == 2560 &&
-+            nt >= 2 && nt <= 4 &&
++    if (hc == 4 && n_embd == 2560 && nt >= 2 && nt <= 4 &&
 +            w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
 +            w_down->op == GGML_OP_NONE && w_down->view_src == nullptr &&
 +            w_up->op == GGML_OP_NONE && w_up->view_src == nullptr &&
@@ -160,9 +215,16 @@ index 78b58ee94..928cf2acb 100644
 +            ggml_is_contiguous(lo)) {
 +        // Same shapes the HIP tail guard accepts, so only sites that can fuse
 +        // pay the retained 320 x nt x 4 B.
-+        lo->flags |= GGML_TENSOR_FLAG_NO_REUSE;
-+        if (inject == nullptr) {
-+            qwen4exp_hc_n3_retain_xn(xn);
++        const bool mixer_site = inject == nullptr;
++        if (qwen4exp_hc_n3_tail_keep_enabled(mixer_site)) {
++            if (mixer_site && !qwen4exp_hc_n3_retain_xn(xn, hc_dim, nt)) {
++                // The mixer site needs both lo and xn retained to be free of the
++                // guard's veto. Retaining lo alone would only move the arena plan
++                // without proving anything, so take no retention here and let the
++                // guard fall back to the generic chain.
++            } else {
++                lo->flags |= GGML_TENSOR_FLAG_NO_REUSE;
++            }
 +        }
 +    }
      ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
