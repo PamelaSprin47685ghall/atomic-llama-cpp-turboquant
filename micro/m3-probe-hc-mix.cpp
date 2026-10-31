@@ -158,7 +158,9 @@ ggml_tensor * m3_probe_build_hc_mix(llama_model * model, int64_t n_embd, int64_t
     // Seven-argument production call: the real weight is passed, and only the
     // inject OUTPUT slot is null, which is how the builder selects a mixer site.
     ggml_tensor * mixed = g.hc_mix(xn, w_norm, w_down, w_up, w_inject, inject_arg, int(il));
-    if (mixed == nullptr || gf->n_nodes == 0) {
+    // ggml_cgraph is opaque in the public headers, so the node count is read
+    // through the documented accessor rather than by touching the struct.
+    if (mixed == nullptr || ggml_graph_n_nodes(gf) == 0) {
         return nullptr;
     }
     if (lo_out != nullptr) {

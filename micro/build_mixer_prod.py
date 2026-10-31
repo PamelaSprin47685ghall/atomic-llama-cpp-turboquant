@@ -309,8 +309,18 @@ def main(argv):
     print("#    GGML_TP5_HC_N3_TRIO=1 ./m3-mixer-prod-path <libdir> 3 trunk ref-trunk")
     print("#    GGML_TP5_HC_N3_TRIO=1 GGML_TP5_HC_N3_TAIL_KEEP=1 ./m3-mixer-prod-path <libdir> 3 trunk on-trunk")
     print("# 4. compare with diag/m3-n1-rowref.py <leg-prefix> <ref-prefix>")
-    print("# 5. witness: ON mixer prints lo_retained=1, OFF prints 0, trunk prints")
-    print("#    xn ret=0 in its M3_TAIL_BUILD line.")
+    print("# 5. witness, in this order (all read-only, all emitted by the code under test):")
+    print("#    a) rebuild the candidate libggml-base with GGML_M3_ALLOC_COUNTERS=1 in the")
+    print("#       environment and compare the allocator's own decisions:")
+    print("#         ON  leg: retained_free_skip > 0 (the free path refused to release the")
+    print("#                  retained tensors) and, for a mixer site, view_reuse_skip > 0;")
+    print("#         OFF leg: retained_free_skip == 0 and view_reuse_skip == 0;")
+    print("#         gate-misarmed leg (TAIL_KEEP unset/0/01): identical to OFF -- this is")
+    print("#         what separates 'library did not retain' from 'gate never fired'.")
+    print("#    b) the model TU's M3_TAIL_BUILD line (M3_TAIL_DIAG=1) names the site and")
+    print("#       nt; it must appear once per built site in both legs.")
+    print("#    c) the harness line's lo_flags is informational only and is NOT a criterion.")
+    print("#    d) the numeric verdict is diag/m3-n1-rowref.py over the row images.")
     return 0
 
 

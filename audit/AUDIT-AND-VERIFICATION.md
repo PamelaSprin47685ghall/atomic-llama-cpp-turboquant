@@ -579,6 +579,40 @@ Witnesses, stated honestly:
 
 Nothing in this section was compiled, run or syntax-checked: **G2 remains unproven**.
 
+## 5j. Seventh review: opaque cgraph, and a witness that can tell "not retained" from "gate off"
+
+1. **Compile error.**  `ggml_cgraph` is opaque in the public headers, so `gf->n_nodes` does not
+   compile from the probe.  Fixed by the documented accessor: `ggml_graph_n_nodes(gf)`; no private
+   header is included anywhere in the probe or harness.
+
+2. **The witness was not discriminating.**  A log line carrying `lo->flags` proves nothing on its own:
+   the same zero bits appear when the library decided not to retain *and* when the gate never armed.
+   Two read-only instruments now separate those cases, both emitted by the code under test and both
+   inert unless asked for:
+
+   | instrument | where | what it shows | how it discriminates |
+   |---|---|---|---|
+   | `M3_ALLOC_COUNTERS` | `ggml/src/ggml-alloc.c`: counted at the allocator's own decisions (`ggml_gallocr_free_node` retention skip; in-place refusal for a retained parent; in-place refusal through a retained view owner), printed at the end of `ggml_gallocr_alloc_graph` | `retained_free_skip`, `no_reuse_inplace_skip`, `view_reuse_skip` | ON leg: `retained_free_skip > 0` (and `view_reuse_skip > 0` at a mixer site).  OFF leg and every mis-armed spelling (`unset`, `""`, `0`, `01`, `true`): all three are **0**.  A non-zero count can only be produced by a tensor that really carries `GGML_TENSOR_FLAG_NO_REUSE`, so "gate armed" and "gate off" are distinguishable by data, not by reading a log's wording |
+   | `M3_TAIL_BUILD` | `src/models/qwen4exp.cpp` (model TU, namespace scope) | per built site: scope (trunk/mixer), `il`, `nt`, tensor names, and the flag bits of `lo` and `xn` | says *which* site was built and at which `nt`, so a count from the first instrument can be attributed to a site; it is deliberately not the criterion |
+   | row images | harness | `*.rows.bin` vs `*.nt1.<r>.bin` | the numeric witness (`diag/m3-n1-rowref.py`, per-row ulp/bitdiff/top1) |
+
+   The counters live in `ggml-alloc.c` (allocator build), are `static` (no exported symbol, no API, no
+   header change), are written only in the free/reuse branches, and are read by nothing: the
+   allocation plan is identical whether the switch is on or off.  "Permanent test-only API" is
+   therefore not introduced — the only externally visible surface is a log line gated on an
+   environment variable that is off by default.
+
+3. **What a leg must show to be admissible** (Devops):
+   a. `libggml-base` rebuilt from this HEAD (the counters live there), same lane argv;
+   b. ON leg `TAIL_KEEP=1`: `retained_free_skip > 0`, `view_reuse_skip > 0` for the mixer site;
+   c. OFF leg (`TRIO=1` only) **and** the gate-exactness legs (`""`, `0`, `01`, `true`): all counters 0;
+   d. `M3_TAIL_BUILD` present once per site in both legs with the expected scope/`nt`;
+   e. then `diag/m3-n1-rowref.py` per row.
+   If (b) fails while (d) shows the site was built, that is a real finding about the gate, not a
+   numerics question; if (c) differs from OFF, the gate matrix is broken and the leg is void.
+
+Nothing in this section was compiled, run or syntax-checked: **G2 remains unproven**.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -600,7 +634,9 @@ Nothing in this section was compiled, run or syntax-checked: **G2 remains unprov
   class layout across TUs and cannot reach the library anyway (§5h adds real sole ownership of the
   test context instead). The adopting constructor and the `buffer->context` precondition it used
   do not exist in the shipped interface, so §5i replaces both with the real
-  `llm_graph_result(max_nodes)` and the public `ggml_tallocr` path. Nothing has been executed, so G2
+  `llm_graph_result(max_nodes)` and the public `ggml_tallocr` path; the probe also used the opaque
+  `ggml_cgraph` struct and its witness could not separate "not retained" from "gate off" (§5j adds
+  `ggml_graph_n_nodes` and allocator-side retention counters). Nothing has been executed, so G2
   remains unproven; the production gate is exact `"1"` again and the previous
   `trunk`/`mixer`-inside-`TAIL_KEEP` revision is reverted (kept as evidence above);
   token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
