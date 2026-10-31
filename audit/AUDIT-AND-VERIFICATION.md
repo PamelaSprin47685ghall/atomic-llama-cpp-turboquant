@@ -325,6 +325,49 @@ about the tail at all.  Then C vs B per layer; then D's placement diff.  A verdi
 margins; a verdict of "bug" needs a site whose `why=0` but tensors overlap, or a layer whose
 captured tensor differs beyond the ulp class.
 
+## 5c. Trunk / mixer isolation and the N=1 row-reference plan (code in this branch)
+
+**Stage 1 — isolate the mechanism (code landed).**  `GGML_TP5_HC_N3_TAIL_KEEP` now takes
+`unset`/`0`/`""` (nothing retained), `1` (**trunk + mixer, the complete coverage the promotion
+target requires**) and the diagnostics `trunk` / `mixer` (one mechanism only).  Any other value
+throws, so a mistyped name cannot silently narrow a candidate run.  A mixer site (caller passes no
+`inject`: output mixer and MTP head mixer) retains `lo` **only if** its `xn` owner can also be
+retained (`qwen4exp_hc_n3_retain_xn` now returns a bool on the guard's shapes); if not, the site
+takes no retention and the untouched fail-closed HIP guard runs the generic chain — no half policy
+is left in the graph.  Trunk sites (the micro-baselined ones) are unaffected by the mixer branch.
+No value, node, kernel, tolerance or threshold changes.
+
+**Stage 2 — per-row N=1 reference (plan + tool).**  Strict `numeric-order-only` means each row must
+equal the N=1 path at rounding level, not that the class average is small.  The reference
+convention already exists in the M3 micro harness (`mtp-hc-n3-trio-m3-20261027/src/run.py`):
+`chk-N1-r0/r1/r2` run the same block with `nt=1` and `M3_ROW0=r`, so "row r reproduced with a
+single row" is the established shape of an N=1 witness, and `numeric-check.json` shows
+`trio_vs_N1_rows` = 0 bitdiff for `lo` and `mixed`.  That baseline covers the **96 trunk sites**;
+there is no such witness for the mixer shapes, which is exactly why the scopes are split.
+
+Executable plan (Devops):
+
+1. reference legs, same model/env/argv as the candidate run, `--predict 1`, one leg per request
+   (positions 0..: every graph is single-row, so every HC site is the N=1 path);
+2. candidate legs: `GGML_TP5_HC_N3_TAIL_KEEP=trunk` (A) and `=mixer` (B), plus the unchanged
+   `TRIO=1` leg as the relational control;
+3. `diag/m3-n1-rowref.py <candidate> <reference>` per row prints `dlogit_max`, float32 **ulp
+   step**, `bitdiff`, `top1` against the N=1 row of the same position — the accepted class is the
+   one the micro baseline already measured (0 bit for the HC values, 1–3 ulp for the propagated
+   logits, top1 equal).  It refuses any reference that is not a `--predict 1` leg or the
+   `chk-N1-r*.bin` bundle, so a mislabelled off/off comparison cannot pass as an N=1 witness;
+4. `diag/m3-split-trunk-mixer.py <leg> <stamp>` projects rows onto N1 vs multi-row and sites onto
+   graph shapes (3 sites = trunk complete, 2 = trunk without tail, 1 = mixer graph) and prints,
+   per partition, only indices and positions: the trunk verdict is read from A's rows, the mixer
+   verdict from B's rows, never from a pooled average;
+5. `diag/m3-tail-stamp-diff.py` (Stage-1 placement) tells whether a moved row's site kept identical
+   placement; `diag/m3-locate-divergence.py` says whether the moved rows differ before softmax.
+
+Expected shapes of a real mechanism difference (reported as such, never absorbed into an average):
+a mixer-only change with trunk ulps 0 → the mixer path needs its own N=1 reference before any
+candidate claim; a trunk change beyond the micro class → the retention contract changed the trunk
+placement, which is a patch bug, not numerics.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -336,6 +379,7 @@ captured tensor differs beyond the ulp class.
   (needs G3-1), the exact compute-buffer delta (G3-3), kernel-census equivalence (G3-4), and every
   G4 numerics number. No build, no syntax check, no test was run for this report by contract.
 * **2026-10-31 update (Devops data, re-read only):** reach 774/774 with the unmodified trio proven;
+  the trunk/mixer isolation (§5c) is code-only in this branch and has NOT been built or run;
   token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
   §5a/§5b give the placement-stamp and per-layer capture plan.  The gate stays closed: promotion is
   NOT claimed and no threshold was relaxed.
