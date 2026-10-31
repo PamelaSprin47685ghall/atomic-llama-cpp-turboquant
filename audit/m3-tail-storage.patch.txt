@@ -1,6 +1,8 @@
 == worktree
 /home/kunweiz/work/m3tail-storage-20261031
-f7354f517bab252bcdece6aa5f6cd19eb644764d
+5c973d803054d456bb42f929a9d7bbf581b7112f
+5c973d803 probe,harness: use the shipped llm_graph_result(max_nodes) and the public tallocr
+9ac9a6e89 audit: refresh patch copy after removing the header hook
 f7354f517 graph,probe: drop the macro-guarded hook; hand the shipped result sole ownership
 23bd431f9 audit: refresh patch copy after the hook delivery
 e753c9c31 graph,probe: deliver the test-only hook in the tree and call the 7-arg builder
@@ -25,22 +27,22 @@ ffa185d85 audit: M3 tail-storage patch trail, defect chain and Devops verificati
 1d529d64a qwen4exp: give the M3 N-row owner tail independent lo storage (default off)
 
 == diff vs base f1c5fafc0 (stat)
- audit/AUDIT-AND-VERIFICATION.md   | 569 ++++++++++++++++++++++++++++++++++++++
- audit/m3-tail-storage.patch.txt   |  27 ++
- diag/m3-locate-divergence.py      | 109 ++++++++
- diag/m3-n1-rowref.py              | 129 +++++++++
+ audit/AUDIT-AND-VERIFICATION.md   | 608 ++++++++++++++++++++++++++++++++++++++
+ audit/m3-tail-storage.patch.txt   |  29 ++
+ diag/m3-locate-divergence.py      | 109 +++++++
+ diag/m3-n1-rowref.py              | 129 ++++++++
  diag/m3-split-trunk-mixer.py      | 105 +++++++
  diag/m3-tail-stamp-diff.py        |  91 ++++++
- diag/m3-tail-stamp.ggml-cuda.diff |  47 ++++
+ diag/m3-tail-stamp.ggml-cuda.diff |  47 +++
  ggml/include/ggml.h               |   1 +
  ggml/src/ggml-alloc.c             |  19 +-
- micro/build_mixer_n1ref.py        | 174 ++++++++++++
- micro/build_mixer_prod.py         | 318 +++++++++++++++++++++
- micro/m3-mixer-n1ref.cpp          | 306 ++++++++++++++++++++
- micro/m3-mixer-prod-path.cpp      | 233 ++++++++++++++++
- micro/m3-probe-hc-mix.cpp         | 169 +++++++++++
- src/models/qwen4exp.cpp           | 194 ++++++++++++-
- 15 files changed, 2484 insertions(+), 7 deletions(-)
+ micro/build_mixer_n1ref.py        | 174 +++++++++++
+ micro/build_mixer_prod.py         | 318 ++++++++++++++++++++
+ micro/m3-mixer-n1ref.cpp          | 306 +++++++++++++++++++
+ micro/m3-mixer-prod-path.cpp      | 256 ++++++++++++++++
+ micro/m3-probe-hc-mix.cpp         | 202 +++++++++++++
+ src/models/qwen4exp.cpp           | 194 +++++++++++-
+ 15 files changed, 2581 insertions(+), 7 deletions(-)
 
 == code diff (ggml/, src/)
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
