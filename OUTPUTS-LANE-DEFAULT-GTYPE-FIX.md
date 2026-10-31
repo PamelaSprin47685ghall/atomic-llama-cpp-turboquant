@@ -127,51 +127,31 @@ Devops：`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.tx
 - 于是第二轮 pass 1 会把副本当"pre-allocated"（`1.dst` 分支、陈旧 buffer 推 backend），pass 3/4 的 `supports_op(src[])` 走这条链，且**没有任何环节清掉副本的 buffer/data**。被共享的 split 输入（`attn_inp_k_idxs` 这类）在轮间布局变化后可能指向"副本或其副本"，re-plan 后 `set_inputs()` 拿到的就是 `data == NULL` 的那个 → `set_input_k_idxs(dst=NULL)` → SIGSEGV。
 - 为何只有 outputs 窄化路径命中：需要 (a) lane 真正记录并 applied（第一轮修好后首次可达），(b) split 布局轮间变化。nkv plain-rebind 同机制但布局未变；out-live/out-clear 在记录/骨架门早退，根本没走到。
 
-### 6.2 现状（scheduler 清理已回退；改为内存上下文所有权根因）
-Devops 插桩证据（`/home/kunweiz/work/dbg-fa-sched-20261031/EVIDENCE-ABC.txt`）：
-- `llm_graph_input_attn_kv::set_input` 传入的 `self_k_idxs` 与三参入口 `dst` **同指针**、`buffer/data` **均非空**；
-- 崩溃点在函数**入口之后**（打印语句已执行），保存 `this` 的寄存器为 0、`slot_info` 引用为 `0x200000000`；
-- gates OFF 的同一二进制 14 checks PASS，无坏 `this`。
+### 6.2 第三轮：scratch probe 覆写 live 输入对象（真实机制）
+Reviewer 对 `b8f8753cd` 的 P1/Finding 2 成立（`mctx_built` 地址比较导致复用全失效；额外 `init_batch` 二次切分 `balloc` 且 `embd_all` 不一致），二者均已撤销。重新定位的机制如下。
 
-**ABI 推断的核实**：`r12 = 0x200000000`、`rbx = 0` 这类"参数寄存器错位"通常意味着**调用方通过了一个已销毁对象的虚表/成员**，而不是 `set_input_k_idxs` 的签名错误（该签名 3 参、无重载冲突，且 `dst`/`ubatch` 在入口处都正确）。因此断言"ABI/签名错"为时过早；**能确定的是 `mctx` 这个对象已经不可用**。
+**机制（静态可证）**
+1. `union_binder_scratch_patch()` 用 `nkv_scratch->reset()` + `model.build_graph(gp)` 构建 scratch 图（`gp.res = nkv_scratch`），并以此为探针判断补丁布局可建性。
+2. 该路径上若 `can_reuse()` 落到 **live 结果**的输入对象（binder 打补丁的对象就是 live 图），`llm_graph_input_attn_kv::can_reuse()` 会执行 `this->mctx = mctx;`，把**探针这次**的临时上下文（`gp.mctx`，随本次 decode 的 `llama_memory_context_ptr` 一起销毁）写进 live 图的输入对象。
+3. live 图在后续 decode 被复用/re-plan 时，`set_input()` 仍按 memo 调用 `mctx->set_input_k_idxs(...)` → 调用已销毁对象 ⇒ 与 Devops 的"`this == 0`、`slot_info` 垃圾、`dst`/buffer/data 均正常"一致。
+4. 该机制同时解释：OFF 不触发（无 binder probe）、只在该窄化路径崩、以及清 scheduler 副本无效（问题在输入对象的上下文指针，不在副本）。
 
-**真实根因（所有权）**：
-1. `llm_graph_input_attn_kv` 在建图时保存 `mctx`（`build_attn_inp_kv_impl`）；
-2. `mctx` 由 `llama_decode` 内的 `memory->init_batch(...)` 产生，`llama_memory_context_ptr` **只存活于该次 decode 调用**；
-3. `can_reuse()` 在复用分支把 `this->mctx` **改写成新 ubatch 的上下文**（原注释还提到"指向上一批已释放的 llm_graph_params 会导致 stack-use-after-return"）；
-4. outputs 窄化 lane 的 re-plan 走 `sched_reset + alloc_graph` 复用同一张 live 图，而该图的 `mctx` 已被改写/或指向 `union_binder_scratch_patch` 里 `model.build_graph(gp)` 的临时上下文——两者都在本次 decode 调用结束时销毁；随后 `set_inputs()` 经 `mctx->set_input_k_idxs(...)` 调用**已销毁对象** ⇒ 与 `this == 0` 一致。
+**修复（只消除探针副作用；不改判定结果、不新增上下文、不比较地址）**
+- `llm_graph_params`：新增 `bool probe` 与 `llm_graph_result * probe_guard_res`；binder 的 scratch 构建设 `gp.probe = true; gp.probe_guard_res = res;`。
+- `llm_graph_result::can_reuse()`：probe 模式下先对**自身 + guarded 结果**的每个输入快照 `mctx_saved()`，执行原判定（`can_reuse_impl` 即原实现，结果与 stock 逐位一致），随后把 memo 原样写回。
+- `llm_graph_input_i`：新增默认空实现 `mctx_saved()/mctx_restore()`；`llm_graph_input_attn_kv` 覆盖（返回/恢复 `mctx`）。其它持 `mctx` 的输入类未覆盖 ⇒ 它们的 memo 快照/恢复都是空值，**探针不会改动它们**（见残余风险）。
+- `llm_graph_input_attn_kv::can_reuse()`：恢复 stock 的 `this->mctx = mctx;`；只保留唯一守卫 `if (mctx_built == nullptr) return false;`（memo 被非探针路径破坏时的 fail-closed，不会误拒正常复用）。
+- `process_ubatch()`：删除 b8f 的额外 `init_batch`，并注释说明不得在此重建上下文（balloc 二次 `split_reset()`、`embd_all` 不一致）。
 
-**修复（真实根因，局部）**
-- `src/llama-graph.h`：`llm_graph_input_attn_kv` 新增 `const llama_kv_cache_context * mctx_built`（构造时赋值，永不改写），作为**建图期上下文身份**。
-- `src/llama-graph.cpp`：`can_reuse()` 增加 `mctx != mctx_built → return false`。复用被拒即走**完整重建**（重建时 `build_attn_inp_kv_impl` 用当前上下文新建输入对象），不再存在"沿用上一调用上下文"的路径。
-- `src/llama-context.cpp`：`process_ubatch` 在复用被接受后，先用**与首次构建相同的 loader 契约** `memory->init_batch(*balloc, cparams.n_ubatch, false)` **重建上下文**，再用新上下文重算 `gparams` 与 `can_reuse`；这样"同一对象身份"可与"上下文仍存活"同时成立（否则每次 decode 都会拒绝复用，性能退化）。上下文指针由 `llama_memory_context_ptr mctx`（decode 循环自有）持有，生命周期覆盖 `set_inputs + compute`。
-- **scheduler 侧清理全部回退**（`ggml/src/ggml-backend.cpp` 回到 `762631033`）：与证据不符，属无关高风险改动。
-
-**OFF 影响**：`can_reuse` 的严格身份判定在 OFF 下只可能拒绝、不会错误接受；拒绝触发一次完整重建（图与结果等价，`REFLOGITS` 应逐字节相同）。`GGML_TP5_UNION_BINDER` 关闭时不存在 in-place re-plan，路径即 stock 的"复用或不复用"。
-
-**保留的失败场景**：A1 `probe-out-applied`、A4 `sched-replan-chain`（第二次窄化）原样保留，供 Devops 验证修复；A6 `sched-same-nodes` rc=-1 仍待定位（既可能是探针位置数组，也可能是本修复前后新增的 `init_batch` 调用改变分区，需要 Devops 用 `--scenario` 单跑确认）。
-
-### 6.3 与已撤销设计的关系（55d6ff7bd / 622afaf35 / e3e8f9b27 / ab08adeac）
-| 轮次 | 做了什么 | 结论 |
+**与 b8f8753cd 对照**
+| 项 | b8f8753cd | 本轮 |
 |---|---|---|
-| 762631033 | gtype 门修复（DEFAULT 也是解码构建） | 保留；out-clear 已 PASS |
-| 55d6ff7bd | schema 覆盖 `src[]`（按节点数识别图） | 撤销（reviewer F1） |
-| 622afaf35 | reset 内清 split 副本 | 撤销（refresh-alloc 漏、且非根因） |
-| e3e8f9b27 | split 入口清 split 副本 | 撤销（仍非根因，Devops A1/A4 复崩） |
-| ab08adeac | 入口清理 + `plan_alloc_ok` 保护失败重试 | **回退**（scheduler 无关高风险） |
-| 本轮 | `mctx_built` 身份判定 + 复用前重建上下文 | 真实根因修复，A1/A4 待复验 |
+| `can_reuse` 地址比较 | 有 → 复用全失效 | 无 |
+| 额外 `init_batch` | 有（二次切分、`embd_all` 不一致） | 无 |
+| probe 覆写 live memo | 未处理 | 快照/回滚 |
+| OFF | 退化为全量重建 | 走 stock 路径（无 probe 标志） |
 
-### 6.4 验证指引（Devops；失败场景原样保留）
-| 场景 | 期望 |
-|---|---|
-| A1 `probe-out-applied` | **本次必须 rc=0**；`applied ≥ 1`；logits 与 OFF 同批逐位相同 |
-| A4 `sched-replan-chain` 第二次窄化 | rc=0（不得复现 SIGSEGV） |
-| A2 out-clear | `refused_view=1`、`applied=0`（不回退） |
-| A3 gates-off | 14 checks PASS（不回退） |
-| A5 mixed-shapes / A7 nkv 系列 / A8 OFF≡stock | PASS；`REFLOGITS` 逐字节相同 |
-| A6 `sched-same-nodes` | rc=-1 待定位：先确认探针位置数组连续；再用 `GGML_TP5_UNION_BINDER=1` 单跑比较 `n_reused` |
-| A9 复用计数 | 修复后每次 decode 都会重建上下文再复用：观察 `n_reused` 是否仍增长（若恒为 0 说明身份判定把复用全拒了，需要检查 `init_batch` 返回的对象身份） |
-| A10 K-shift / A11 多 copy | 无 abort（与本次改动无直接关系，防退化） |
+**仍待证的关键事实**：binder probe 是否真的在 live 结果上调用过 `can_reuse()`（第 2 步）。若否，本修复为无害硬化而崩溃仍另有原因；Devops 需在 `llm_graph_input_attn_kv::can_reuse` 打印 `res->get_gf()==live_gf` 与调用栈确认。
 
 ### 6.5 残余风险 / PARTIAL
 - 未编译未测试；A1–A11 全部无运行证据。

@@ -645,33 +645,22 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
         return false;
     }
 
-    // A reused graph's input must dereference a memory context that is still
-    // alive when set_input() runs. llama_memory::init_batch() creates a NEW
-    // context object for every decode loop (the old one is destroyed right
-    // after), so `mctx` here is a different object than the one this graph was
-    // built with - re-pointing to it is safe for the lifetime of this ubatch
-    // only because the ubatch's own context is still owned by the caller. What
-    // is NOT safe is keeping the graph across a context that is gone: the
-    // union binder's in-place re-plan reused the live graph after
-    // union_binder_scratch_patch() built a throwaway context, and the pointer
-    // written here pointed at that freed context - set_input() then called
-    // through a destroyed object (Devops: set_input_k_idxs entered with a null
-    // `this`, evidence /home/kunweiz/work/dbg-fa-sched-20261031).
-    //
-    // Accept the reuse only while the memory context object is unchanged, and
-    // otherwise refuse it so the caller rebuilds the graph (whose build then
-    // attaches a fresh context). The refusal is a build, not a failure: it
-    // cannot change results, and it removes the dangling-pointer class
-    // entirely instead of relying on the context outliving the graph.
-    //
-    // No exception: llama_context::process_ubatch() recreates a memory context
-    // for the reused graph on the same loader contract the original build used,
-    // so accepting a different context here would re-introduce exactly the
-    // stale-ownership this guard exists to prevent.
-    if (mctx != mctx_built) {
+    // set_input() calls through `mctx`, and the k/v-idx setters take the
+    // ubatch's slot_info from the context (llama_kv_cache_context::sinfos[i_cur]).
+    // That state belongs to the context object: re-pointing the input at a
+    // DIFFERENT context only yields correct indices when that context is the
+    // ubatch's own (the one decode() handed to process_ubatch) - its i_cur
+    // tracks apply() exactly. What surfaced as a crash is a third case: the
+    // union binder's scratch build ran can_reuse() for a scratch graph and this
+    // method wrote the OUTER live input's pointer with a thrown-away context, so
+    // the live graph kept calling into a destroyed object (Devops: set_input_k_idxs
+    // entered with a null `this`). The guard below rejects that case; scratch
+    // builds restore the value they overwrote (see llm_graph_result::can_reuse).
+    if (mctx_built == nullptr) {
         return false;
     }
 
+    this->mctx = mctx;
     this->mctx = mctx;
 
     bool res = true;
@@ -1592,6 +1581,44 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+    // Probe pass: the inputs' can_reuse() implementations memoize the memory
+    // context they saw (llm_graph_input_attn_kv::mctx and friends) so a later
+    // set_input() uses it. A graph that is only being PROBED (the union
+    // binder's scratch build reuses this same result object to learn whether
+    // the patched layout is buildable) must never leave that memo behind: the
+    // scratch run carries a throwaway context, and writing it into the live
+    // graph's inputs is what turned later set_input() calls into calls through
+    // a destroyed object (Devops: set_input_k_idxs entered with a null `this`).
+    //
+    // A probe is any can_reuse() pass whose caller declared it (params.probe)
+    // or that the binder routed to guard a different result (probe_guard_res).
+    // Both passes are answered identically; only the side effects differ.
+    if (params.probe || params.probe_guard_res != nullptr) {
+        // snapshot the memo of BOTH this result and the guard result (the
+        // binder probes the live graph through the scratch build)
+        std::vector<std::pair<llm_graph_input_i *, const void *>> saved;
+        auto snapshot = [&saved](llm_graph_result * r) {
+            if (r == nullptr) {
+                return;
+            }
+            for (const auto & input : r->get_inputs()) {
+                saved.emplace_back(input.get(), input->mctx_saved());
+            }
+        };
+        snapshot(this);
+        if (params.probe_guard_res != this) {
+            snapshot(params.probe_guard_res);
+        }
+        const bool res = can_reuse_impl(params);
+        for (auto & [input, prev] : saved) {
+            input->mctx_restore(prev);
+        }
+        return res;
+    }
+    return can_reuse_impl(params);
+}
+
+bool llm_graph_result::can_reuse_impl(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params)) {
         return false;
     }

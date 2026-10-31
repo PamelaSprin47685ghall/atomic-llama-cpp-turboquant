@@ -3251,6 +3251,13 @@ bool llama_context::union_binder_scratch_patch(llm_graph_result * res, llm_graph
     // never-placed scratch graph must not touch
 
     gp.res = nkv_scratch.get();
+    // This is a PROBE: any can_reuse() pass it triggers (the scratch graph and,
+    // for the union binder, the live result it patches) must answer without
+    // memoizing this build's throwaway memory context into the live graph's
+    // inputs - that memo is what later made set_input() call through a destroyed
+    // context (Devops: set_input_k_idxs entered with a null `this`).
+    gp.probe = true;
+    gp.probe_guard_res = res;
     gp.cb = [](const llama_ubatch &, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
@@ -3543,25 +3550,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
     bool reused = !graph_reuse_disable && !llama_ctx_fa_nkv_param_enabled() && res->can_reuse(gparams);
 
-    // A reused graph's input keeps referencing the memory context it was BUILT
-    // with (llm_graph_input_attn_kv::mctx, and can_reuse() refuses a reuse whose
-    // context object differs). llama_decode owns its llama_memory_context_ptr
-    // only for the duration of one call, so when the graph is reused across
-    // calls that context is long gone while the batched-update partition it
-    // described is still what the graph's inputs assume. Recreate it here,
-    // before planning, through the same loader contract the previous call used;
-    // the inputs then point at a context that is alive for this ubatch and
-    // describes the same tokens.
-    if (reused) {
-        auto next_mctx = memory->init_batch(*balloc, cparams.n_ubatch, false);
-        if (next_mctx == nullptr) {
-            LLAMA_LOG_ERROR("%s: failed to recreate the memory context for a reused graph\n", __func__);
-            status = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
-        }
-        mctx   = std::move(next_mctx);
-        reused = res->can_reuse(gparams = graph_params(res, ubatch, mctx, gtype));
-    }
+    // NOTE: no memory context is created here on purpose. decode() owns exactly
+    // one context per call (its llama_memory_context_ptr) and this graph must be
+    // planned against that very object, including its per-ubatch slot_info -
+    // see llm_graph_input_attn_kv::can_reuse(). A second init_batch() would
+    // re-split the shared llama_batch_allocr (dropping the decode loop's
+    // progress) and could pick a different partition for recurrent/hybrid
+    // memories (output_all differs), so the context is never re-created here.
 
     // set only when an in-place patch (below) succeeded: the scheduler's
     // split-input copies were created during the PREVIOUS alloc_graph and still
