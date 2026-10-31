@@ -952,6 +952,12 @@ struct ggml_backend_sched {
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
 
+    // true once the current plan's ggml_backend_sched_alloc_splits() succeeded;
+    // ggml_backend_sched_drop_input_copies() consumes (and clears) it, so only a
+    // COMPLETED plan has its split copies dropped. A failed allocation keeps its
+    // data pointers - they are what makes a retry re-reserve.
+    bool plan_alloc_ok;
+
     // graph splits
     struct ggml_backend_sched_split * splits;
     int n_splits;
@@ -1211,27 +1217,31 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
-// Drops the split-input copies of the last plan.
+// Drops the split-input copies installed by the previous plan.
 //
 // Pass 5 rewrites node src[] slots of the live graph to point at copies it
-// creates loose in sched->ctx. Those copies are not graph tensors: the allocator
-// neither assigns nor frees them, and sched->ctx is only ggml_free'd, so their
-// structs keep the previous plan's buffer/data. A later plan that consumes them
-// as pre-allocated inputs is how a split input can end up unallocated (observed
-// as set_input_k_idxs with dst == NULL after the union binder's re-plan of a
-// live graph that had been patched in place).
+// creates loose in sched->ctx. Those copies are not graph tensors (the allocator
+// only walks sched->graph), sched->ctx is only ggml_free'd, so their structs keep
+// the previous plan's buffer/data - stale after gallocr recycled the memory. A
+// later plan that consumes them as pre-allocated inputs is how a split input can
+// end up unallocated: observed as set_input_k_idxs called with dst == NULL after
+// the union binder's re-plan of an in-place patched graph.
 //
-// Scope: exactly the scheduler's OWN record of the last plan - splits[i].inputs[]
-// resolved through the hash table that describes that plan, then every copy slot
-// of that input. A graph tensor is never touched (only the copies pass 5
-// installed), no model weights/KV storage is involved, and with no previous
-// split the loops are empty - so a first plan and every stock consumer are
-// unchanged. Must be called while the plan tables are still valid, i.e. before
-// the hash/copy tables are wiped.
+// A plan whose ggml_backend_sched_alloc_splits() failed is left untouched: its
+// data pointers are the allocator's only record of what fits, and
+// ggml_gallocr_needs_realloc()/ggml_gallocr_node_needs_realloc() decide "must
+// re-reserve" from `data == NULL`, so clearing them would turn the retry into a
+// silent reuse of a buffer that was never enlarged.
+//
+// Scope: exactly the scheduler's OWN record of that plan - splits[i].inputs[]
+// resolved through the hash table that describes it, then every copy slot of
+// that input (all backends x copies). A graph tensor is never touched, no model
+// weights/KV storage is involved, and with no previous plan the loops are empty.
 static void ggml_backend_sched_drop_input_copies(struct ggml_backend_sched * sched) {
-    if (sched->n_splits == 0) {
+    if (sched->n_splits == 0 || !sched->plan_alloc_ok) {
         return;
     }
+    sched->plan_alloc_ok = false;
     for (int i = 0; i < sched->n_splits; ++i) {
         const struct ggml_backend_sched_split * split = &sched->splits[i];
         for (int j = 0; j < split->n_inputs; ++j) {
@@ -2349,6 +2359,8 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     sched->is_alloc = true;
+    // the plan is complete: the NEXT plan may drop this plan's split copies
+    sched->plan_alloc_ok = true;
 
     return true;
 }

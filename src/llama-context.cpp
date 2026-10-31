@@ -3451,13 +3451,16 @@ bool llama_context::union_binder_scratch_patch(llm_graph_result * res, llm_graph
         d->data   = nullptr;
         d->extra  = nullptr;
     }
-    // In-place re-plan of the live graph: the next sched_reset + alloc_graph
-    // re-splits this SAME graph object. split copies of the previous plan are
-    // loose tensors the allocator never assigns; ggml_backend_sched_reset now
-    // drops them (buffer/data/extra) before it rebuilds its tables, so the
-    // re-plan re-creates them by content instead of consuming stale placement
-    // (Devops: set_input_k_idxs was reached with dst == NULL after the bind
-    // re-plan because such a copy survived as a split input).
+    // In-place re-plan of the live graph: the next alloc_graph re-splits this
+    // SAME graph object. The split copies of the previous plan are loose tensors
+    // the allocator never assigns; they are dropped in
+    // ggml_backend_sched_split_graph() (entry, before the new passes run and
+    // while the previous plan's tables are still valid) so the re-plan
+    // re-creates them by content instead of consuming stale placement.
+    // Devops: set_input_k_idxs was reached with dst == NULL after the bind
+    // re-plan because such a copy survived as a split input - see
+    // /home/kunweiz/work/lead-fa-622af-verify-20261031 for the still-open
+    // evidence (this drop alone did not fix the crash).
 
     nkv_scratch->reset();
     // r8: success counting moved to the CALLERS (union_rebind_n_kv bumps
