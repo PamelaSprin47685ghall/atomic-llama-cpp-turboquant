@@ -1,0 +1,102 @@
+--- /dev/null
++++ b/overlay/mtp-async-protocol-candidate-20261027/dw-hip-join-tests-provider-audit.sh
+@@ -0,0 +1,99 @@
++#!/bin/bash
++# Provider-mapping audit fixtures for dw-hip-overlap-join (CPU only).
++# Static addition after the 12022 no-test discipline: do not run while the
++# discipline is active. Focus areas:
++#   A. every MAP line carries provider= but NO span provider matches any
++#      provider= (nor any native=) -> must refuse, never shared;
++#   B. empty window side (one provider= window has no spans) -> valid;
++#   C. shared-mode sparse PCI (only one provider has spans on a PCI) ->
++#      no provider pair, pair_scope=not_computable;
++#   D/E. empty MAP side / empty span side -> refuse;
++#   F/G. duplicate and conflict shapes that are LEGAL and must not be
++#      over-refused (multi-rank provider; provider= == same window's native=).
++J="$(cd "$(dirname "$0")/../.." && pwd)/build/dw-hip-overlap-join"
++pass=0; fail=0
++t() { local name="$1" want="$2"; shift 2; out=$("$J" "$@" 2>&1); rc=$?;
++  if [ "$rc" = "$want" ]; then pass=$((pass+1)); echo "PASS $name (rc=$rc)";
++  else fail=$((fail+1)); echo "FAIL $name want=$want got=$rc :: $out"; fi; }
++want_msg() { local name="$1" pat="$2"; shift 2; out=$("$J" "$@" 2>&1); rc=$?;
++  if [ "$rc" = 1 ] && grep -q "$pat" <<<"$out"; then pass=$((pass+1)); echo "PASS $name (rc=1, refused)";
++  else fail=$((fail+1)); echo "FAIL $name want rc=1 + '$pat' :: rc=$rc out=$out"; fi; }
++T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
++
++# A: broken identity chain — all MAP provider= present, no span match.
++cat > "$T/a1.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x777 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x777 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x888 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x888 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++LOG
++want_msg audit-all-unmatched-refused "incomplete provider mapping" "$T/a1.log"
++[ -z "$("$J" "$T/a1.log" 2>/dev/null)" ] && { pass=$((pass+1)); echo "PASS audit-all-unmatched-no-stdout"; } || { fail=$((fail+1)); echo "FAIL audit-all-unmatched-no-stdout"; }
++
++# B: empty window side is valid. w1 provider=0x222 has no spans.
++# Hand-verified: pair spans_a=1 spans_b=0 overlap 0; w1 row 0/0/0.
++cat > "$T/b1.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++LOG
++t audit-empty-window-positive 0 "$T/b1.log"
++out=$("$J" "$T/b1.log")
++grep -q "mode=provider windows=2 pcis=1 pair_scope=same_pci_shared_epoch" <<<"$out" && { pass=$((pass+1)); echo "PASS audit-empty-window-mode"; } || { fail=$((fail+1)); echo "FAIL audit-empty-window-mode :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_PAIR a=0 b=1 pci=0000:03:00.0 spans_a=1 spans_b=0 overlap_ns=0" <<<"$out" && { pass=$((pass+1)); echo "PASS audit-empty-window-pair"; } || { fail=$((fail+1)); echo "FAIL audit-empty-window-pair :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_WINDOW_PCI window=1 pci=0000:03:00.0 spans=0 busy_ns=0 wall_ns=100 busy_frac=0.000000" <<<"$out" && { pass=$((pass+1)); echo "PASS audit-empty-window-row"; } || { fail=$((fail+1)); echo "FAIL audit-empty-window-row :: $out"; }
++# C: shared mode, two providers exist but each PCI has spans from only one.
++# No pair may be inferred; pair_scope=not_computable.
++cat > "$T/c1.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 pci_bdf0=0000:03:00.0 pci_bdf1=0000:04:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 pci_bdf0=0000:03:00.0 pci_bdf1=0000:04:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x222 rank=0 pci=0000:04:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x222 rank=0 pci=0000:04:00.0 seq=0 begin_ns=150 end_ns=250
++LOG
++t audit-empty-pci-side 0 "$T/c1.log"
++out=$("$J" "$T/c1.log")
++grep -q "pair_scope=not_computable" <<<"$out" && { pass=$((pass+1)); echo "PASS audit-empty-pci-side-scope"; } || { fail=$((fail+1)); echo "FAIL audit-empty-pci-side-scope :: $out"; }
++[ -z "$(grep "_JOINED_PROVIDER_PAIR" <<<"$out")" ] && { pass=$((pass+1)); echo "PASS audit-empty-pci-side-no-pair"; } || { fail=$((fail+1)); echo "FAIL audit-empty-pci-side-no-pair :: $out"; }
++
++# D: MAP without any pci_bdf entry -> parse refusal.
++want_msg audit-empty-map-refused "without any pci_bdf entry" <(sed 's/ provider=0x222 pci_bdf0=0000:03:00.0//' "$T/b1.log")
++# E: MAP present, no span lines -> refusal.
++want_msg audit-empty-spans-refused "no TP5_DW_HIP_SPAN lines" <(grep -v 'TP5_DW_HIP_SPAN' "$T/b1.log")
++
++# F: duplicate-positive — one provider owns several ranks; legal, pair 50.
++cat > "$T/f1.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0 pci_bdf1=0000:04:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0 pci_bdf1=0000:04:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x111 rank=1 pci=0000:04:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=1 pci=0000:04:00.0 seq=0 begin_ns=300 end_ns=400
++TP5_DW_HIP_SPANS provider=0x222 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x222 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++TP5_DW_HIP_SPANS provider=0x222 rank=1 pci=0000:04:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x222 rank=1 pci=0000:04:00.0 seq=0 begin_ns=350 end_ns=450
++LOG
++t audit-duplicate-positive 0 "$T/f1.log"
++out=$("$J" "$T/f1.log")
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_PAIR a=0 b=1 pci=0000:03:00.0 spans_a=1 spans_b=1 overlap_ns=50" <<<"$out" && { pass=$((pass+1)); echo "PASS audit-duplicate-positive-pair03"; } || { fail=$((fail+1)); echo "FAIL audit-duplicate-positive-pair03 :: $out"; }
++
++# G: conflict-positive — provider= equals the SAME window's native=.
++# Different-window collision is refused elsewhere; same-window is not.
++cat > "$T/g1.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x111 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x222 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x222 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++LOG
++t audit-same-window-coincidence-positive 0 "$T/g1.log"
++out=$("$J" "$T/g1.log")
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_PAIR a=0 b=1 pci=0000:03:00.0 spans_a=1 spans_b=1 overlap_ns=50" <<<"$out" && { pass=$((pass+1)); echo "PASS audit-same-window-coincidence-pair"; } || { fail=$((fail+1)); echo "FAIL audit-same-window-coincidence-pair :: $out"; }
++
++echo "pass=$pass fail=$fail"; [ "$fail" = 0 ]

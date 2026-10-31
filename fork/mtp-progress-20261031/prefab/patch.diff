@@ -1,0 +1,3745 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index fbc858d..389203c 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -37,6 +37,8 @@ add_library(llama
+             llama-mmap.cpp
+             llama-model-loader.cpp
+             llama-model-saver.cpp
++            llama-prefab.cpp
++            llama-prefab-mtp.cpp
+             llama-model.cpp
+             llama-quant.cpp
+             llama-sampler.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 97c8c72..316c01e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -8,6 +8,8 @@
+ #include "llama-ext.h"
+ #include "llama-graph.h"
+ #include "llama-impl.h"
++#include "llama-prefab-env.h"
++#include "llama-prefab-iface.h"
+ #include "llama-io.h"
+ #include "llama-kv-cache-dsa.h"
+ #include "llama-kv-cache-dsv4.h"
+@@ -24,6 +26,7 @@
+ #include "llama.h"
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -945,6 +948,9 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
+         }
+     }
+ 
++    // factor-prefab envelopes (default off; throws -> context creation fails closed)
++    prefab_init();
++
+     // Initialize the full vocabulary token ids for backend samplers.
+     {
+         const int n_vocab = model.vocab.n_tokens();
+@@ -960,6 +966,10 @@ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
++    // envelope scheds/graphs and the factor cache reference this context's backends and memory:
++    // drop them first (the factor cache is context-owned, nothing outlives the context)
++    prefab.reset();
++
+     if (!model.hparams.no_alloc) {
+         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+             ggml_backend_t             backend = backend_ptrs[i];
+@@ -1286,7 +1296,19 @@ void llama_context::sched_reserve() {
+ 
+     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+ 
++    // drain every envelope still in flight before the main sched is touched or any slot is
++    // reset; synchronize() below then only has the main sched left to wait for
++    if (prefab) {
++        prefab->sync_pending();
++    }
+     synchronize();
++
++    if (prefab) {
++        // cparams may have changed (warmup, causal, ...): envelopes are recomposed on next use,
++        // factor modules survive iff the topology key still matches
++        prefab->reset_slots();
++    }
++
+     if (kv_stream_phase_arena.configured && sched && kv_stream_phase_arena.backend_index < backend_ptrs.size()) {
+         if (!kv_stream_phase_arena.graph_reset_fn(backend_ptrs[kv_stream_phase_arena.backend_index])) {
+             throw std::runtime_error("failed to reset CUDA graphs before measuring phase arena");
+@@ -1604,6 +1626,11 @@ void llama_context::synchronize() {
+         return;
+     }
+ 
++    if (prefab) {
++        // every envelope executed since the last synchronize, not just the last active one: a
++        // ubatch may have switched slots, or fallen back to stock and cleared `active`
++        prefab->sync_pending();
++    }
+     ggml_backend_sched_synchronize(sched.get());
+ 
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+@@ -1643,6 +1670,13 @@ bool llama_context::release_compute() {
+     }
+ 
+     synchronize();
++    if (prefab) {
++        prefab->reset_slots();
++        for (auto & s : prefab->slots) {
++            s.sched.reset();
++        }
++        prefab->cache.clear();
++    }
+     // These own the only inference graph metadata that may reuse allocator
+     // addresses. Reset both before the allocator is freed, retaining their
+     // graph-result objects for the normal next graph build.
+@@ -2385,6 +2419,9 @@ void llama_context::set_warmup(bool value) {
+         return;
+     }
+ 
++    if (prefab && llama_prefab_mtp_lifetime_enabled()) {
++        prefab->reset_slots();
++    }
+     cparams.warmup = value;
+ 
+     // warmups are usually with small batches, so no need to reserve
+@@ -2554,6 +2591,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
+         }
+     }
+ 
++    if (prefab) {
++        bool hook;
++        if (llama_prefab_decouple_enabled()) {
++            // decouple path: the gtype filter is part of the request contract;
++            // A passes every DEFAULT/DECODER/DECODER_MTP ubatch to B and B's
++            // own runtime gate (via the request) declines what it cannot run.
++            // A does not read B's mtp_mode flag here to build the filter.
++            hook = gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER ||
++                   gtype == LLM_GRAPH_TYPE_DECODER_MTP;
++        } else {
++            hook = gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER ||
++                   (prefab->mtp_mode && gtype == LLM_GRAPH_TYPE_DECODER_MTP);
++        }
++        if (hook) {
++            llm_graph_result * res_env = nullptr;
++            if (prefab_process_ubatch(ubatch, gtype, mctx, res_env, ret)) {
++                return res_env;
++            }
++        }
++    }
++    if (prefab) {
++        prefab->active = nullptr;
++    }
++    if (llama_prefab_stats_enabled()) {
++        prefab_stats.n_ubatch_stock++;
++    }
++
+     auto * res = gf_res_prev.get();
+     auto * gf  = res->get_gf();
+ 
+@@ -2572,6 +2636,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
+         }
+ 
+         n_reused++;
++        if (llama_prefab_stats_enabled()) {
++            prefab_stats.n_stock_reuses++;
++        }
+     } else {
+         res->reset();
+ 
+@@ -2580,7 +2647,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
+-        gf = model.build_graph(gparams);
++        {
++            llama_prefab_build_timer timer{prefab_stats, gf};
++            gf = model.build_graph(gparams);
++        }
++        if (llama_prefab_stats_enabled()) {
++            prefab_stats.n_stock_builds++;
++        }
+ 
+         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+ 
+@@ -2753,7 +2826,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+ 
+     // extract logits
+     if (logits.data && t_logits) {
+-        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_active(), t_logits);
+         GGML_ASSERT(backend_res != nullptr);
+         GGML_ASSERT(logits.data != nullptr);
+ 
+@@ -2765,7 +2838,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+ 
+     // extract embeddings
+     if (embd.data && t_embd) {
+-        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
++        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_active(), t_embd);
+         GGML_ASSERT(backend_embd != nullptr);
+ 
+         switch (cparams.pooling_type) {
+@@ -2827,7 +2900,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+ 
+     // extract nextn embeddings (hidden state before the final output norm)
+     if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+-        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
++        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_active(), t_h_nextn);
+         GGML_ASSERT(backend_h != nullptr);
+ 
+         const uint32_t n_embd = hparams.n_embd_out();
+@@ -3251,7 +3324,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         // extract logits
+         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_active(), t_logits);
+             GGML_ASSERT(backend_res != nullptr);
+             GGML_ASSERT(logits.data != nullptr);
+ 
+@@ -3267,7 +3340,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         // extract embeddings
+         if (embd.data && t_embd && n_outputs > 0) {
+-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
++            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_active(), t_embd);
+             GGML_ASSERT(backend_embd != nullptr);
+ 
+             switch (cparams.pooling_type) {
+@@ -3343,7 +3416,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             const int64_t offset = masked ? n_outputs_prev : n_tokens_prev;
+ 
+             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
++                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_active(), t_h_nextn);
+                 GGML_ASSERT(backend_h != nullptr);
+ 
+                 const uint32_t n_embd         = hparams.n_embd_out();
+@@ -3361,14 +3434,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             const auto stride            = n_vocab;
+ 
+             // async copy the sampling data from the backend to the host
+-            copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());
++            copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched_active());
+ 
+             copy_tensor_async_floats(res->t_sampled_logits, sampling.logits, stride, sampling.logits_count,
+-                                     seq_to_output_row, sched.get());
++                                     seq_to_output_row, sched_active());
+             copy_tensor_async_floats(res->t_sampled_probs, sampling.probs, stride, sampling.probs_count,
+-                                     seq_to_output_row, sched.get());
++                                     seq_to_output_row, sched_active());
+             copy_tensor_async_candidates(res->t_candidates, sampling.candidates, stride, sampling.candidates_count,
+-                                         seq_to_output_row, sched.get());
++                                         seq_to_output_row, sched_active());
+         }
+ 
+         n_outputs_prev += n_outputs;
+@@ -3621,7 +3694,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
+         const size_t dst_offset = token_offset * row_floats;
+         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
+ 
+-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
++        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched_active(), t);
+         GGML_ASSERT(backend != nullptr);
+         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+     }
+@@ -3828,7 +3901,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
+     };
+ }
+ 
+-ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
++ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_override) {
+     int               n_threads = batched ? cparams.n_threads_batch : cparams.n_threads;
+     ggml_threadpool_t tp        = batched ? threadpool_batch : threadpool;
+ 
+@@ -3851,9 +3924,10 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
+     const bool retain_inputs = backend_tp5_relay != nullptr && gf_res_prev &&
+             gf == gf_res_prev->get_gf() && !batched &&
+             cparams.n_batch == 1 && cparams.n_ubatch == 1;
+-    auto status = retain_inputs ?
+-            ggml_backend_sched_graph_compute_async_retained_inputs(sched.get(), gf) :
+-            ggml_backend_sched_graph_compute_async(sched.get(), gf);
++    ggml_backend_sched_t sched_run = sched_override ? sched_override : sched.get();
++    auto status = retain_inputs && sched_override == nullptr ?
++            ggml_backend_sched_graph_compute_async_retained_inputs(sched_run, gf) :
++            ggml_backend_sched_graph_compute_async(sched_run, gf);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+     }
+@@ -5724,3 +5798,604 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
+     return ctx->get_cparams().ctx_other;
+ }
++
++//
++// factor-prefab envelopes (see llama-prefab.h)
++//
++
++static bool prefab_env_flag(const char * name) {
++    // enabled only by the exact string "1": unset, "0", "true", "01", "1 ", "2" all stay off,
++    // so the disabled path is bitwise-identical to baseline and no loose truthy value can
++    // activate an experimental lane
++    const char * v = getenv(name);
++    return v != nullptr && v[0] == '1' && v[1] == '\0';
++}
++
++void llama_context::prefab_init() {
++    // whole-graph MTP lane (LLAMA_PREFAB_MTP): instead of composing factor envelopes, build the
++    // stock model graph (e.g. qwen4exp graph_mtp for LLM_GRAPH_TYPE_DECODER_MTP) into a prefab
++    // slot and reuse it when the graph inputs allow. The stock builder reproduces every MTP
++    // feature exactly (wide hc stream, hyper-connections, IMROPE, token+embd dual input), so
++    // this is a strict correctness superset of the factor path for MTP contexts.
++    //
++    // GGML_TP5_PREFAB_AB=1 (r7, production): single-flag production lane over the same
++    // whole-graph slot machinery. The AB gate itself only widens WHICH lane handles an
++    // eligible MTP context: static-contract refusals below still throw (fail closed, they
++    // never silently reroute), and ubatches that are not exact-fit candidates stay counted
++    // (n_fallback_runtime) and run by the stock builder -- exact can_reuse, no pad, no
++    // headroom, no bucket.
++    const bool in_graph = llama_prefab_in_graph_enabled();
++    const bool ab       = llama_prefab_ab_enabled();
++    const bool mtp      = prefab_env_flag("LLAMA_PREFAB_MTP") || in_graph || ab;
++
++    if (!mtp && !prefab_env_flag("LLAMA_PREFAB_ENABLE")) {
++        return; // default off
++    }
++    if (!mtp && !prefab_env_flag("LLAMA_PREFAB_EXPERIMENTAL")) {
++        throw std::runtime_error("factor-prefab: LLAMA_PREFAB_ENABLE=1 requires LLAMA_PREFAB_EXPERIMENTAL=1");
++    }
++
++    const auto & hparams = model.hparams;
++
++    const bool mtp_ok = mtp && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.arch == LLM_ARCH_QWEN4EXP;
++
++    // LLAMA_PREFAB_MTP=1 / GGML_TP5_PREFAB_IN_GRAPH=1 select the MTP lane only: any context
++    // that is not an eligible Qwen4Exp MTP context (e.g. the Qwen4Exp DEFAULT target context
++    // kept alive by the speculative driver, or a plain trunk ctx created while the flag is on)
++    // runs pure stock -- no prefab state, no factorization claim, no throw.
++    if (mtp && !mtp_ok) {
++        LLAMA_LOG_WARN("%s: MTP prefab lane requested but this context is not an eligible Qwen4Exp MTP context; running stock (no prefab state)\n",
++                       __func__);
++        return;
++    }
++
++    // static contract: anything the factor decomposition does not reproduce exactly is refused here,
++    // so an enabled context can never silently run a half-composed graph.
++    // MTP mode (mtp_ok) bypasses the factor-specific rejects (arch / ctx type / swa / alibi /
++    // m-rope / n_embd_inp / nextn outputs): the stock-built graph handles all of those natively.
++    // Flags-off parity: with LLAMA_PREFAB_MTP unset, mtp_ok=false makes every !mtp_ok-gated
++    // condition identical to the original unconditional chain.
++    std::string why;
++    auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
++    // mtp_ok bypasses the hybrid reject: an MTP ctx over a hybrid-Qwen trunk (qwen3next /
++    // qwen35 / qwen35moe / qwen4exp) owns a PLAIN llama_kv_cache by construction
++    // (llama-model.cpp mtp_on_hybrid_qwen), so the kv==nullptr / n_stream checks below are
++    // the real memory gate; the factor-path hybrid objection does not apply to the
++    // stock-built MTP graph this lane caches.
++    if (!mtp_ok && (llm_arch_is_recurrent(model.arch) || llm_arch_is_hybrid(model.arch))) {
++        why = "recurrent/hybrid memory: rs_z/rs_head are baked into stock views; no envelope factors for it";
++    } else if (!mtp_ok && model.arch != LLM_ARCH_LLAMA) {
++        why = std::string("arch '") + llm_arch_name(model.arch) + "' has no factor decomposition (supported: llama)";
++    } else if (!mtp_ok && cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
++        why = "non-default context type";
++    } else if (kv == nullptr) {
++        why = "memory is not a plain llama_kv_cache";
++    } else if (kv->get_n_stream() != 1) {
++        why = "multi-stream KV cache (kv_unified=false with n_seq_max>1)";
++    } else if (!mtp_ok && (hparams.swa_type != LLAMA_SWA_TYPE_NONE || hparams.use_alibi || hparams.n_pos_per_embd() != 1 ||
++               hparams.n_embd_inp() != hparams.n_embd)) {
++        why = "unsupported hparams (swa / alibi / m-rope / n_embd_inp != n_embd)";
++    } else if (cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
++        why = "pooled embeddings";
++    } else if (!mtp_ok && (cparams.embeddings_nextn || cparams.mtp_chain)) {
++        why = "nextn/mtp outputs";
++    } else if (mtp_ok && (model.tok_embd == nullptr || model.output == nullptr)) {
++        why = "draft-only checkpoint requires ctx_other (token embedding or output projection missing)";
++    } else if (std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; })) {
++        why = "layer-input extraction";
++    } else if (backend_tp5_relay != nullptr || backend_quantized_matmul_f32 != nullptr) {
++        why = "tp5 relay / quantized_matmul_f32 backends";
++    } else if (kv->has_kv_stream_targets()) {
++        why = "kv-stream runtime";
++    }
++    if (!why.empty()) {
++        throw std::runtime_error("factor-prefab: refusing context (fail closed): " + why);
++    }
++
++    // envelope widths: LLAMA_PREFAB_ENVELOPES="1,4,512" (default 1,4,n_ubatch); n_ubatch is always the top envelope
++    std::vector<uint32_t> env;
++    if (const char * s = getenv("LLAMA_PREFAB_ENVELOPES")) {
++        std::string str(s);
++        size_t p = 0;
++        while (p < str.size()) {
++            size_t q = str.find(',', p);
++            if (q == std::string::npos) {
++                q = str.size();
++            }
++            const long v = atol(str.substr(p, q - p).c_str());
++            if (v > 0) {
++                env.push_back((uint32_t) v);
++            }
++            p = q + 1;
++        }
++    } else {
++        env = { 1, 4 };
++    }
++    const uint32_t n_max = std::min(cparams.n_ctx, cparams.n_ubatch);
++    env.push_back(n_max);
++    env.erase(std::remove_if(env.begin(), env.end(), [&](uint32_t v) { return v > n_max; }), env.end());
++    std::sort(env.begin(), env.end());
++    env.erase(std::unique(env.begin(), env.end()), env.end());
++
++    if (llama_prefab_decouple_enabled()) {
++        // ---- decouple path (GGML_TP5_PREFAB_DECOUPLE=1): explicit A->B interface ----
++        // A (this layer) computes the eligibility facts and hands them to B as
++        // values; B initializes its own state. No direct slot-table writes.
++        llama_prefab_eligibility elig;
++        elig.mtp_mode   = mtp_ok;
++        elig.envelopes  = env;
++        prefab = std::make_unique<llama_prefab_state>();
++        if (!llama_prefab_state_init(*prefab, elig)) {
++            prefab.reset();
++            throw std::runtime_error("factor-prefab: empty envelope set (decouple)");
++        }
++        // A owns the backend list, the node-budget policy and the slot result
++        // objects; it attaches ready handles to B's slots.
++        const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
++            model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
++        const ggml_moe_cache_mode moe_cache_mode =
++            moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
++        std::string desc;
++        for (size_t i = 0; i < env.size(); ++i) {
++            ggml_backend_sched_t slot_sched = ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
++                                                    backend_ptrs.size(), graph_max_nodes(env[i]),
++                                                    cparams.pipeline_parallel, cparams.op_offload);
++            ggml_backend_sched_set_moe_cache(slot_sched, moe_cache_mode, cparams.moe_cache_budget_mib);
++            llama_prefab_attach_slot(*prefab, i, slot_sched, new llm_graph_result(graph_max_nodes(env[i])));
++            desc += (i ? "," : "") + std::to_string(env[i]);
++        }
++        if (mtp_ok) {
++            LLAMA_LOG_WARN("%s: %s (decoupled compose): whole-graph MTP mode%s%s, envelopes N={%s}\n", __func__,
++                    ab ? "production A+B compose lane (GGML_TP5_PREFAB_AB=1)" : "factor-prefab EXPERIMENTAL enabled",
++                    (in_graph || ab) ? ", A x B compose on rebuild" : "",
++                    llama_prefab_noclone_enabled() ? ", shared A nodes (noclone)" : "",
++                           desc.c_str());
++        } else {
++            LLAMA_LOG_WARN("%s: factor-prefab EXPERIMENTAL enabled (decoupled compose): envelopes N={%s}, factors EMBD/QKV/ATTN/FFN/OUT\n",
++                           __func__, desc.c_str());
++        }
++        return;
++    }
++
++    prefab = std::make_unique<llama_prefab_state>();
++    prefab->envelopes = env;
++    prefab->slots.resize(env.size());
++    prefab->mtp_mode  = mtp_ok;
++
++    std::string desc;
++    for (size_t i = 0; i < env.size(); ++i) {
++        auto & s = prefab->slots[i];
++        s.n_env = env[i];
++        s.res.reset(new llm_graph_result(graph_max_nodes(env[i])));
++        desc += (i ? "," : "") + std::to_string(env[i]);
++    }
++    if (mtp_ok) {
++        LLAMA_LOG_WARN("%s: %s: whole-graph MTP mode%s%s, envelopes N={%s}\n", __func__,
++                ab ? "production A+B compose lane (GGML_TP5_PREFAB_AB=1)" : "factor-prefab EXPERIMENTAL enabled",
++                (in_graph || ab) ? ", A x B compose on rebuild" : "",
++                llama_prefab_noclone_enabled() ? ", shared A nodes (noclone)" : "",
++                       desc.c_str());
++    } else {
++        LLAMA_LOG_WARN("%s: factor-prefab EXPERIMENTAL enabled: envelopes N={%s}, factors EMBD/QKV/ATTN/FFN/OUT\n",
++                       __func__, desc.c_str());
++    }
++}
++
++ggml_backend_sched_t llama_context::sched_active() const {
++    return (prefab && prefab->active) ? prefab->active : sched.get();
++}
++
++bool llama_context::prefab_process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx,
++                                          llm_graph_result *& out, ggml_status & ret) {
++    auto & st = *prefab;
++    out = nullptr;
++
++    if (llama_prefab_decouple_enabled()) {
++        // ---- decouple path (GGML_TP5_PREFAB_DECOUPLE=1) ----
++        // A runs its fail-closed runtime checks (the SAME checks as the legacy
++        // path below, on local values), then hands an explicit request to B.
++        // A never reads st.slots / st.scratch_cell to decide or to drive the
++        // ubatch; the only state it reads is the mode flag it itself set at init
++        // (st.mtp_mode) plus the envelope widths it itself chose (st.envelopes).
++        auto * kvc = dynamic_cast<llama_kv_cache_context *>(mctx);
++        // IMROPE draft heads (qwen4exp) carry n_pos >= 3 per token; their own pos input
++        // (build_inp_pos) writes the full multi-section positions, so the MTP mode only
++        // needs the 1-D restriction of the factor path, not of the stock head it reuses.
++        const bool pos_ok = !ubatch.is_pos_2d() || st.mtp_mode;
++        bool ok = kvc != nullptr && ubatch.token != nullptr && pos_ok &&
++                  !kvc->has_attention_views() && !mctx->has_kv_stream_targets() &&
++                  (loras == nullptr || loras->empty()) && sampling.samplers.empty();
++        if (st.mtp_mode) {
++            // MTP mode: only the MTP draft graph; draft batches always carry embd
++            if (gtype != LLM_GRAPH_TYPE_DECODER_MTP) {
++                llama_prefab_stat_tick(prefab_stats.n_fallback_runtime);
++                return false;
++            }
++        } else {
++            // factor mode: token-only ubatches, DEFAULT/DECODER graphs only
++            ok = ok && ubatch.embd == nullptr && (gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER);
++        }
++        if (ok && cvec) {
++            for (int il = 0; il < (int) model.hparams.n_layer(); ++il) {
++                if (cvec->tensor_for(il) != nullptr) {
++                    ok = false;
++                    break;
++                }
++            }
++        }
++        if (!ok) {
++            llama_prefab_stat_tick(prefab_stats.n_fallback_runtime);
++            return false;
++        }
++
++        // envelope selection: smallest envelope >= n_tokens (A picks, B validates).
++        // GGML_TP5_PREFAB_AB=1 (mtp_mode only): require an exact-fit candidate -- a
++        // sub-envelope ubatch is rejected here (counted as a runtime fallback) instead
++        // of being padded into a larger envelope; factor-mode envelopes keep the
++        // smallest-fit selection, so other gates are untouched.
++        uint32_t n_env = 0;
++        const bool ab_exact = llama_prefab_ab_enabled() && st.mtp_mode;
++        for (uint32_t e : st.envelopes) {
++            if (ab_exact ? e == ubatch.n_tokens : ubatch.n_tokens <= e) {
++                n_env = e;
++                break;
++            }
++        }
++        if (n_env == 0) {
++            llama_prefab_stat_tick(prefab_stats.n_fallback_runtime);
++            return false;
++        }
++
++        llama_prefab_request req;
++        req.gtype               = gtype;
++        req.n_tokens            = ubatch.n_tokens;
++        req.n_env               = n_env;
++        req.mtp_mode            = st.mtp_mode;
++        req.graph_reuse_disable = graph_reuse_disable;
++        req.pipeline_parallel   = cparams.pipeline_parallel;
++        req.cb_eval             = cparams.cb_eval;
++        req.cb_eval_user_data   = cparams.cb_eval_user_data;
++        req.nkv_obs             = llama_prefab_nkv_obs_enabled();
++
++        // res is B's own (slot-owned); the main sched is passed so the graph
++        // callback's placement hints (offload_kqv, moe f16 guard) behave
++        // exactly as in the legacy path, where gparams.sched was also the
++        // main sched at compose time
++        const auto gparams = graph_params(nullptr, ubatch, mctx, gtype);
++
++        const auto rep = llama_prefab_process(st, prefab_stats, model, gparams, ubatch, mctx, req,
++            [this](ggml_cgraph * gf, bool batched, ggml_backend_sched_t slot_sched) {
++                return graph_compute(gf, batched, slot_sched);
++            });
++
++        if (!rep.handled) {
++            // B declined: fall back to the stock builder (decline counted by B)
++            return false;
++        }
++        ret = rep.status;
++        if (rep.reused) {
++            // map B's reuse to the context's graphs-reused perf counter
++            n_reused++;
++        }
++        if (rep.status == GGML_STATUS_SUCCESS) {
++            out = rep.result;
++        }
++        return true;
++    }
++
++    // this branch handles only the MTP draft graph; DEFAULT/DECODER requests (e.g. warmup)
++    // fall through to the stock builder -- the trunk graph must never be built here
++    if (st.mtp_mode && gtype != LLM_GRAPH_TYPE_DECODER_MTP) {
++        llama_prefab_stat_tick(prefab_stats.n_fallback_runtime);
++        return false;
++    }
++    if (st.mtp_mode) {
++        // ---- whole-graph MTP mode (LLAMA_PREFAB_MTP) ----
++        // Build the stock DECODER_MTP graph (e.g. qwen4exp graph_mtp) into a slot and reuse it
++        // only when every graph input allows (llm_graph_result::can_reuse enforces exact n_kv
++        // mask width, n_tokens and n_outputs). No envelope padding, no scratch cell, no
++        // canonical ubatch: the real ubatch is built into the graph as-is, so fallback to the
++        // stock builder is always safe and exact.
++        // runtime contract; anything else falls back to the stock builder (counted)
++        auto * kvc_m = dynamic_cast<llama_kv_cache_context *>(mctx);
++        // IMROPE draft heads (qwen4exp) carry n_pos >= 3 per token; their own pos input
++        // writes the full multi-section positions, so the MTP mode does not need the
++        // factor path's 1-D restriction.
++        const bool pos_ok_m = !ubatch.is_pos_2d() || st.mtp_mode;
++        bool ok_m = kvc_m != nullptr && ubatch.token != nullptr && pos_ok_m &&
++                    !kvc_m->has_attention_views() && !mctx->has_kv_stream_targets() &&
++                    (loras == nullptr || loras->empty()) && sampling.samplers.empty();
++        if (ok_m && cvec) {
++            for (int il = 0; il < (int) model.hparams.n_layer(); ++il) {
++                if (cvec->tensor_for(il) != nullptr) {
++                    ok_m = false;
++                    break;
++                }
++            }
++        }
++        // exact-fit slot only: the stock MTP graph has no padding, so a sub-envelope slot
++        // with n_env > n_tokens would compute on padded mask columns (wrong n_kv semantics)
++        const int is_m = ok_m ? st.slot_for(ubatch.n_tokens) : -1;
++        if (is_m < 0 || st.slots[is_m].n_env != ubatch.n_tokens) {
++            llama_prefab_stat_tick(prefab_stats.n_fallback_runtime);
++            return false;
++        }
++
++        auto & slot = st.slots[is_m];
++        const uint32_t n_env = slot.n_env;
++
++        if (!slot.sched) {
++            const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
++                model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
++            const ggml_moe_cache_mode moe_cache_mode =
++                moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
++            slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
++                                                    graph_max_nodes(n_env), cparams.pipeline_parallel, cparams.op_offload));
++            ggml_backend_sched_set_moe_cache(slot.sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
++        }
++
++        auto gparams = graph_params(slot.res.get(), ubatch, mctx, gtype);
++        gparams.sched = slot.sched.get();
++        // gparams.n_outputs keeps the member value set by the decode loop (correct for MTP:
++        // build_inp_out_ids is sized by it and can_reuse fails closed on mismatch)
++
++        const llama_prefab_topology_key key = llama_prefab_key_for(model, gparams);
++
++        ggml_cgraph * gf = nullptr;
++        bool gf_composed = false;
++        bool composed_attempted = false;
++        if (slot.built && !graph_reuse_disable && slot.key == key && slot.res->can_reuse(gparams)) {
++            gf = slot.res->get_gf();
++            if (cparams.pipeline_parallel) {
++                ggml_backend_sched_synchronize(slot.sched.get());
++            }
++            llama_prefab_stat_tick(prefab_stats.n_envelope_reuses);
++            n_reused++;
++        } else {
++            if (llama_prefab_noclone_enabled() && st.mtp_mode) {
++                // shared-node compose (GGML_TP5_PREFAB_NOCLONE=1): the graph being replaced
++                // references the cached A template's tensors in place. The reuse path above
++                // never reaches this branch, so the only graph that can reference them is
++                // the one being replaced (one A template per envelope width, one slot per
++                // width). Drain every dispatched-but-unsynchronized sched BEFORE the old
++                // graph is destroyed and A's allocation state is reset, so the constraint
++                // is enforced here rather than assumed from synchronous dispatch.
++                st.sync_pending();
++            }
++            slot.built = false;
++            slot.res->reset();
++            ggml_backend_sched_reset(slot.sched.get());
++            ggml_backend_sched_set_eval_callback(slot.sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++
++            {
++            llama_prefab_build_timer timer{prefab_stats, gf};
++            // MTP factor compose (GGML_TP5_PREFAB_IN_GRAPH=1, or the production single-flag
++            // lane GGML_TP5_PREFAB_AB=1): the A x B envelope instead of the stock whole
++            // graph. Exact fit only; a declined ubatch falls back to the stock builder
++            // below, so with both gates off (or on a decline) this is the stock path.
++            if ((llama_prefab_in_graph_enabled() || llama_prefab_ab_enabled()) && ubatch.n_tokens == n_env) {
++                composed_attempted = true;
++                try {
++                    gf = llama_prefab_mtp_compose(model, gparams, n_env, st, prefab_stats);
++                    gf_composed = gf != nullptr;
++                } catch (const std::exception & e) {
++                    // a declined ubatch, not a swallowed failure: logged and counted
++                    LLAMA_LOG_WARN("%s: mtp factor compose declined: %s\n", __func__, e.what());
++                    gf = nullptr;
++                }
++                if (!gf) {
++                    llama_prefab_stat_tick(prefab_stats.n_mtp_declines);
++                }
++            }
++            if (!gf && composed_attempted) {
++                // the compose may have filled slot.res with a partial graph and inputs before it
++                // declined: rebuild the slot from scratch so the stock graph gets a clean result.
++                // Only after an attempt -- with the gate off the path is exactly the stock one.
++                slot.res->reset();
++                ggml_backend_sched_reset(slot.sched.get());
++                ggml_backend_sched_set_eval_callback(slot.sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++            }
++            if (!gf) {
++                gf = model.build_graph(gparams);
++                // a stock-built graph: count it as a stock build (it is one) on top of the
++                // envelope alloc that tracks slot bookkeeping
++                llama_prefab_stat_tick(prefab_stats.n_stock_builds);
++            }
++            }
++            if (!ggml_backend_sched_alloc_graph(slot.sched.get(), gf)) {
++                LLAMA_LOG_ERROR("%s: factor-prefab: failed to allocate MTP graph (N=%u)\n", __func__, n_env);
++                ret = GGML_STATUS_ALLOC_FAILED;
++                return true;
++            }
++            llama_prefab_stat_tick(prefab_stats.n_envelope_allocs);
++            slot.built = true;
++            slot.key   = key;
++        }
++
++        llama_prefab_stat_tick(prefab_stats.n_ubatch_prefab);
++        if (llama_prefab_stats_enabled()) {
++            prefab_stats.last_n_env          = n_env;
++            prefab_stats.last_n_tokens       = ubatch.n_tokens;
++            prefab_stats.last_graph_nodes    = ggml_graph_n_nodes(gf);
++            prefab_stats.last_inp_tokens_ne0 = slot.res->get_inp_tokens() ? slot.res->get_inp_tokens()->ne[0] : 0;
++        }
++        slot.res->set_inputs(&ubatch);
++
++        st.active = slot.sched.get();
++        st.mark_pending(slot.sched.get());
++
++        const auto status = graph_compute(gf, ubatch.n_tokens > 1, slot.sched.get());
++        if (gf_composed && status == GGML_STATUS_SUCCESS) {
++            llama_prefab_stat_tick(prefab_stats.n_mtp_compose_hits);
++        }
++        if (status != GGML_STATUS_SUCCESS) {
++            LLAMA_LOG_ERROR("%s: failed to compute MTP envelope graph, compute status: %d\n", __func__, status);
++            ret = status;
++            return true;
++        }
++
++        ret = GGML_STATUS_SUCCESS;
++        out = slot.res.get();
++        return true;
++    }
++
++    // runtime contract (anything else -> stock builder, counted)
++    auto * kvc = dynamic_cast<llama_kv_cache_context *>(mctx);
++    bool ok = kvc != nullptr && ubatch.token != nullptr && ubatch.embd == nullptr && !ubatch.is_pos_2d() &&
++              !kvc->has_attention_views() && !mctx->has_kv_stream_targets() &&
++              (loras == nullptr || loras->empty()) && sampling.samplers.empty();
++    if (ok && cvec) {
++        for (int il = 0; il < (int) model.hparams.n_layer(); ++il) {
++            if (cvec->tensor_for(il) != nullptr) {
++                ok = false;
++                break;
++            }
++        }
++    }
++    const int is = ok ? st.slot_for(ubatch.n_tokens) : -1;
++    if (is < 0) {
++        llama_prefab_stat_tick(prefab_stats.n_fallback_runtime);
++        return false;
++    }
++
++    auto & slot = st.slots[is];
++    const uint32_t n_env = slot.n_env;
++
++    st.scratch_cell = -1;
++    if (ubatch.n_tokens < n_env) {
++        st.scratch_cell = kvc->prefab_scratch_cell();
++        if (st.scratch_cell < 0) {
++            llama_prefab_stat_tick(prefab_stats.n_fallback_no_scratch);
++            return false;
++        }
++    }
++
++    if (!slot.sched) {
++        const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
++            model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
++        const ggml_moe_cache_mode moe_cache_mode =
++            moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
++        slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
++                                                graph_max_nodes(n_env), cparams.pipeline_parallel, cparams.op_offload));
++        ggml_backend_sched_set_moe_cache(slot.sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
++    }
++
++    // canonical ubatch: envelope shape, real data (envelope inputs read the real ubatch and pad)
++    llama_ubatch canon = ubatch;
++    canon.n_tokens     = n_env;
++    canon.n_seq_tokens = n_env;
++    canon.n_seqs       = 1;
++    canon.n_seqs_unq   = 1;
++    canon.b_equal_seqs = 0;
++
++    auto gparams = graph_params(slot.res.get(), canon, mctx, gtype);
++    gparams.n_outputs = n_env;
++    gparams.sched     = slot.sched.get();
++
++    const llama_prefab_topology_key key = llama_prefab_key_for(model, gparams);
++    // n_kv is a runtime parameter: reuse the envelope graph while the current n_kv fits the
++    // padded KV width the graph was composed for; recompose (new ATTN factor key) only when
++    // n_kv outgrows the pad window. can_reuse() alone is not sufficient: the inherited
++    // llm_graph_input_attn_kv::can_reuse compares the mask width against the exact n_kv.
++    const uint32_t n_kv_pad_cur = kvc->get_n_kv_pad();
++    const bool n_kv_fits = slot.n_kv_pad != 0 && kvc->n_kv_pad_fits(slot.n_kv_pad);
++
++    ggml_cgraph * gf = nullptr;
++    bool gf_reused = false;
++    if (slot.built && !graph_reuse_disable && slot.key == key && n_kv_fits && slot.res->can_reuse(gparams)) {
++        gf = slot.res->get_gf();
++        gf_reused = true;
++        if (cparams.pipeline_parallel) {
++            ggml_backend_sched_synchronize(slot.sched.get());
++        }
++        llama_prefab_stat_tick(prefab_stats.n_envelope_reuses);
++        n_reused++;
++    } else {
++        if (llama_prefab_noclone_enabled()) {
++            // Shared-node factor compose (GGML_TP5_PREFAB_NOCLONE=1): the envelope being
++            // replaced references the cached factor modules' tensors in place. The reuse
++            // path above never reaches this branch, so the only live graph that references
++            // them is the one being replaced (one module set per envelope width, one slot
++            // per width). Drain every dispatched-but-unsynchronized sched BEFORE the old
++            // graph is destroyed and the shared allocation state is released, so the
++            // constraint is enforced here rather than assumed from synchronous dispatch.
++            st.sync_pending();
++        }
++        slot.built = false;
++        slot.res->reset();
++        ggml_backend_sched_reset(slot.sched.get());
++        ggml_backend_sched_set_eval_callback(slot.sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++
++        try {
++            gf = llama_prefab_compose(model, gparams, n_env, st, prefab_stats);
++        } catch (const std::exception & e) {
++            LLAMA_LOG_ERROR("%s: factor-prefab compose failed: %s\n", __func__, e.what());
++            gf = nullptr;
++        }
++        if (!gf) {
++            ret = GGML_STATUS_FAILED;
++            return true;
++        }
++        if (!ggml_backend_sched_alloc_graph(slot.sched.get(), gf)) {
++            LLAMA_LOG_ERROR("%s: factor-prefab: failed to allocate envelope N=%u\n", __func__, n_env);
++            ret = GGML_STATUS_ALLOC_FAILED;
++            return true;
++        }
++        llama_prefab_stat_tick(prefab_stats.n_envelope_allocs);
++        slot.built    = true;
++        slot.key      = key;
++        slot.n_kv_pad = n_kv_pad_cur;
++    }
++
++    if (llama_prefab_nkv_obs_enabled()) {
++        // env: LLAMA_PREFAB_NKV_OBS=1 - one stderr line per prefab ubatch (parsed by
++        // scripts/nkv-gate/analyze.py); a single bool check per ubatch when off.
++        fprintf(stderr, "prefab nkv: n_kv=%u n_kv_pad=%u decision=%s\n",
++                kvc->get_n_kv(), n_kv_pad_cur, gf_reused ? "reuse" : "build");
++    }
++
++    llama_prefab_stat_tick(prefab_stats.n_ubatch_prefab);
++    if (ubatch.n_tokens < n_env) {
++        llama_prefab_stat_tick(prefab_stats.n_sub_envelope);
++        llama_prefab_stat_add(prefab_stats.n_pad_rows, n_env - ubatch.n_tokens);
++    }
++    if (llama_prefab_stats_enabled()) {
++        prefab_stats.last_n_env       = n_env;
++        prefab_stats.last_n_tokens    = ubatch.n_tokens;
++        prefab_stats.last_graph_nodes = ggml_graph_n_nodes(gf);
++        prefab_stats.last_inp_tokens_ne0 = slot.res->get_inp_tokens() ? slot.res->get_inp_tokens()->ne[0] : 0;
++    }
++
++    // inputs take the REAL ubatch
++    slot.res->set_inputs(&ubatch);
++
++    st.active = slot.sched.get();
++
++    const auto status = graph_compute(gf, ubatch.n_tokens > 1, slot.sched.get());
++    if (status != GGML_STATUS_SUCCESS) {
++        LLAMA_LOG_ERROR("%s: failed to compute envelope graph, compute status: %d\n", __func__, status);
++        ret = status;
++        return true;
++    }
++
++    ret = GGML_STATUS_SUCCESS;
++    out = slot.res.get();
++    return true;
++}
++
++bool llama_prefab_is_enabled(const llama_context * ctx) {
++    return ctx != nullptr && ctx->get_prefab() != nullptr;
++}
++
++void llama_prefab_get_stats(const llama_context * ctx, llama_prefab_stats * out) {
++    *out = ctx->get_prefab_stats();
++}
++
++void llama_prefab_reset_stats(llama_context * ctx) {
++    ctx->reset_prefab_stats();
++}
++
++size_t llama_prefab_n_cached_factors(const llama_context * ctx) {
++    const auto * st = ctx->get_prefab();
++    return st ? st->cache.modules.size() : 0;
++}
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 4bade14..b826c76 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -7,6 +7,7 @@
+ #include "llama-adapter.h"
+ #include "llama-impl.h"
+ #include "llama-memory.h"
++#include "llama-prefab.h"
+ 
+ #include "ggml-cpp.h"
+ #include "ggml-opt.h"
+@@ -272,7 +273,13 @@ public:
+     llm_graph_result * get_gf_res_reserve() const;
+ 
+     // returns the result of ggml_backend_sched_graph_compute_async execution
+-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
++    // sched_override: run gf on a different scheduler (factor-prefab envelope slots own their own sched)
++    ggml_status graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_override = nullptr);
++
++    // factor-prefab (LLAMA_PREFAB_ENABLE=1 + LLAMA_PREFAB_EXPERIMENTAL=1; default off)
++    const llama_prefab_state * get_prefab() const { return prefab.get(); }
++    const llama_prefab_stats & get_prefab_stats() const { return prefab_stats; }
++    void reset_prefab_stats() { prefab_stats = {}; }
+ 
+     // reserve a graph with a dummy ubatch of the specified size
+     ggml_cgraph * graph_reserve(
+@@ -453,6 +460,17 @@ private:
+ 
+     bool has_evaluated_once = false;
+ 
++    // factor-prefab state (null unless enabled); see llama-prefab.h
++    std::unique_ptr<llama_prefab_state> prefab;
++    llama_prefab_stats prefab_stats = {};
++
++    void prefab_init();
++    // returns true if the ubatch was handled by an envelope (out/ret set), false -> stock path
++    bool prefab_process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx,
++                               llm_graph_result *& out, ggml_status & ret);
++    // scheduler that executed the last graph (envelope slot sched or the main sched)
++    ggml_backend_sched_t sched_active() const;
++
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+     bool graph_reuse_disable = false;
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 18e9dff..b844cd6 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1391,6 +1391,9 @@ void llm_graph_result::reset() {
+     t_embd        = nullptr;
+     t_embd_pooled = nullptr;
+     t_h_nextn     = nullptr;
++    t_prefab_cut  = nullptr;
++    t_prefab_cut_res = nullptr;
++    t_prefab_cut_inject = nullptr;
+ 
+     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
+     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+@@ -3101,8 +3104,12 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * kq_mask = inp->get_kq_mask();
+ 
+     ggml_tensor * q = q_cur;
+-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
++    // factor-prefab graphs compile for a padded KV width (n_kv is a runtime parameter):
++    // when the input declares one, size the K/V views by it instead of the exact n_kv.
++    // The kq_mask covers the same width and its pad columns are masked out.
++    const uint32_t n_kv_pad = inp->n_kv_pad;
++    ggml_tensor * k = n_kv_pad ? mctx_cur->get_k_pad(ctx0, il, n_kv_pad) : mctx_cur->get_k(ctx0, il);
++    ggml_tensor * v = n_kv_pad ? mctx_cur->get_v_pad(ctx0, il, n_kv_pad) : mctx_cur->get_v(ctx0, il);
+ 
+     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
+     // Q shape: (n_embd_head, n_head, n_tokens)
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 00ecf89..9c38d33 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -368,6 +368,11 @@ public:
+     ggml_tensor * self_k_rot = nullptr;
+     ggml_tensor * self_v_rot = nullptr;
+ 
++    // factor-prefab: padded KV width the graph is compiled for (0 = stock behavior:
++    // K/V views sized by the exact n_kv). Set only by llm_graph_input_prefab_attn_kv;
++    // build_attn reads it to size the K/V views. n_kv is a runtime parameter for such
++    // graphs: the mask covers [0, n_kv_pad) and the pad columns are masked out.
++    uint32_t n_kv_pad = 0;
+     // note: these have to be copies because in order to be able to reuse a graph, its inputs
+     //       need to carry these parameters with them. otherwise, they can point to freed
+     //       llm_graph_params from a previous batch, causing stack-use-after-return
+@@ -918,6 +923,13 @@ public:
+     ggml_tensor * t_embd        = nullptr;
+     ggml_tensor * t_embd_pooled = nullptr;
+     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
++    // factor-prefab MTP compose: the head prologue (A) outputs, i.e. the block input, the HC
++    // residual stream the block (B) folds its output into, and the scatter weights that combine
++    // uses. Set by graph_mtp::build_mtp_prologue(); consumed only by the compose layer
++    // (GGML_TP5_PREFAB_IN_GRAPH=1) to cut A from B, null otherwise.
++    ggml_tensor * t_prefab_cut        = nullptr;
++    ggml_tensor * t_prefab_cut_res    = nullptr;
++    ggml_tensor * t_prefab_cut_inject = nullptr;
+ 
+     std::vector<ggml_tensor *> t_layer_inp;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 5d82f2e..fbfba35 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2,6 +2,8 @@
+ #include "llama-kv-stream-plan.h"
+ 
+ #include "llama-impl.h"
++#include "llama-prefab-env.h"
++#include "llama-prefab-hotpath.h"
+ #include "llama-io.h"
+ #include "llama-model.h"
+ #include "llama-context.h"
+@@ -1876,6 +1878,10 @@ std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
+     return res;
+ }
+ 
++int32_t llama_kv_cache::first_layer_id() const {
++    return map_layer_ids.empty() ? 0 : map_layer_ids.begin()->first;
++}
++
+ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
+     const int32_t ikv = map_layer_ids.at(il);
+ 
+@@ -2760,6 +2766,114 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+ }
+ 
++int64_t llama_kv_cache::prefab_scratch_cell(const slot_info & sinfo) const {
++    // single-stream only (the prefab path refuses multi-stream caches at context creation)
++    if (sinfo.n_stream() != 1 || v_cells.size() != 1) {
++        return -1;
++    }
++    const auto & cells = v_cells[sinfo.strm[0]];
++    const auto & idxs  = sinfo.idxs[0];
++    // after apply() the cells of the current ubatch are occupied, but check explicitly anyway
++    for (int64_t i = (int64_t) cells.size() - 1; i >= 0; --i) {
++        if (!cells.is_empty((uint32_t) i)) {
++            continue;
++        }
++        if (std::find(idxs.begin(), idxs.end(), (uint32_t) i) != idxs.end()) {
++            continue;
++        }
++        return i;
++    }
++    return -1;
++}
++
++void llama_kv_cache::prefab_set_input_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch,
++                                           const slot_info & sinfo, uint32_t n_env, int64_t scratch) const {
++    const uint32_t n_tokens = ubatch->n_tokens;
++    GGML_ASSERT(sinfo.n_stream() == 1);
++    GGML_ASSERT(n_tokens == (uint32_t) sinfo.size());
++    GGML_ASSERT(n_tokens <= n_env);
++    GGML_ASSERT(n_tokens == n_env || scratch >= 0);
++    GGML_ASSERT(kv_stream_runtime.runtime == nullptr);
++
++    const int64_t offs = (int64_t) sinfo.strm[0]*get_size();
++
++    if (k_dst) {
++        GGML_ASSERT(ggml_backend_buffer_is_host(k_dst->buffer));
++        GGML_ASSERT(k_dst->ne[0] == (int64_t) n_env);
++        int64_t * data = (int64_t *) k_dst->data;
++        for (uint32_t i = 0; i < n_env; ++i) {
++            data[i] = offs + (i < n_tokens ? (int64_t) sinfo.idxs[0][i] : scratch);
++        }
++    }
++
++    if (v_dst) {
++        GGML_ASSERT(ggml_backend_buffer_is_host(v_dst->buffer));
++        int64_t * data = (int64_t *) v_dst->data;
++        if (!v_trans) {
++            GGML_ASSERT(v_dst->ne[0] == (int64_t) n_env);
++            for (uint32_t i = 0; i < n_env; ++i) {
++                data[i] = offs + (i < n_tokens ? (int64_t) sinfo.idxs[0][i] : scratch);
++            }
++        } else {
++            const int64_t kv_size      = get_size();
++            const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
++            const int64_t voffs        = (int64_t) sinfo.strm[0]*kv_size*n_embd_v_gqa;
++            GGML_ASSERT(v_dst->ne[0] == (int64_t) n_env*n_embd_v_gqa);
++            for (uint32_t i = 0; i < n_env; ++i) {
++                const int64_t cell = i < n_tokens ? (int64_t) sinfo.idxs[0][i] : scratch;
++                for (int64_t j = 0; j < n_embd_v_gqa; ++j) {
++                    data[i*n_embd_v_gqa + j] = voffs + j*kv_size + cell;
++                }
++            }
++        }
++    }
++}
++
++void llama_kv_cache::prefab_set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_env,
++                                              const slot_info & sinfo) const {
++    const uint32_t n_tokens = ubatch->n_tokens;
++    GGML_ASSERT(dst->ne[3] == 1 && dst->ne[2] == 1);
++    GGML_ASSERT(dst->ne[1] == (int64_t) n_env);
++    GGML_ASSERT(n_tokens >= 1 && n_tokens <= n_env);
++
++    // real rows [0, n_tokens): exactly the stock mask (stock writes only n_tps rows of dst)
++    set_input_kq_mask(dst, ubatch, causal_attn);
++
++    // pad rows: replicate the last real row
++    const size_t row_elems = (size_t) dst->ne[0];
++    const size_t row_bytes = row_elems*ggml_element_size(dst);
++    char * base = (char *) dst->data;
++    for (uint32_t i = n_tokens; i < n_env; ++i) {
++        memcpy(base + (size_t) i*dst->nb[1], base + (size_t) (n_tokens - 1)*dst->nb[1], row_bytes);
++    }
++
++    // pad columns [live n_kv, n_kv_pad): the stock writer leaves them untouched when
++    // tokens reuse previous masks (prev == true) or cells are outside the sequence, and
++    // scheduler buffers hold stale values from earlier executions. Explicitly fill them
++    // with -INFINITY (F32) or 0xfc00 (-inf in F16) for all n_env rows.
++    const size_t live_n_kv = (size_t) get_n_kv(sinfo);
++    if (llama_prefab_nkv_pad_enabled() && live_n_kv < row_elems) {
++        if (dst->type == GGML_TYPE_F16) {
++            const ggml_fp16_t drop = llama_cast<ggml_fp16_t, float>(-INFINITY);
++            ggml_fp16_t * rows = (ggml_fp16_t *) dst->data;
++            for (uint32_t i = 0; i < n_env; ++i) {
++                ggml_fp16_t * r = rows + (size_t) i*row_elems;
++                for (size_t j = live_n_kv; j < row_elems; ++j) {
++                    r[j] = drop;
++                }
++            }
++        } else {
++            float * rows = (float *) dst->data;
++            for (uint32_t i = 0; i < n_env; ++i) {
++                float * r = rows + (size_t) i*row_elems;
++                for (size_t j = live_n_kv; j < row_elems; ++j) {
++                    r[j] = -INFINITY;
++                }
++            }
++        }
++    }
++}
++
+ size_t llama_kv_cache::total_size() const {
+     size_t size = 0;
+ 
+@@ -3670,6 +3784,27 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
+ uint32_t llama_kv_cache_context::get_n_kv() const {
+     return n_kv;
+ }
++uint32_t llama_kv_cache_context::get_n_kv_pad() const {
++    // no concrete ubatch (reserve/update contexts): report 0, callers fall back to n_kv
++    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
++        return 0;
++    }
++    if (!llama_prefab_nkv_pad_enabled()) {
++        // gate off (LLAMA_PREFAB_NKV_PAD unset or not exactly "1"): the padded width equals
++        // the exact live n_kv, so the ATTN factor key, the mask width and the K/V views are
++        // exactly what the unpatched prefab layer produced (baseline reuse rule).
++        return n_kv;
++    }
++    // gate on: round the live width up to the 1024-aligned window (>= 1024),
++    // clamped to the physical cache size -- the shared production contract in
++    // llama-prefab-hotpath.h (llama_prefab_nkv_window), so the same window
++    // shape drives the real lane and the ggml-free hot-path seam.
++    return llama_prefab_nkv_window(n_kv, kv->get_size());
++}
++
++bool llama_kv_cache_context::n_kv_pad_fits(uint32_t n_kv_pad) const {
++    return n_kv_pad >= n_kv;
++}
+ 
+ bool llama_kv_cache_context::has_attention_views() const {
+     return !ubatches.empty() && !kv->attention_views.empty();
+@@ -3724,6 +3859,18 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
+ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
+     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+ }
++// factor-prefab ATTN factor support: K/V views sized by a padded KV width (>= n_kv,
++// 256-aligned) so the factor/envelope graph stays shape-stable while n_kv grows within
++// the pad window. The stock graph path uses get_k/get_v above (exact n_kv) and is
++// unaffected. The kq_mask covers the same padded width; the stock mask writer only
++// writes the live [0, n_kv) columns and pad columns are explicitly masked -inf.
++ggml_tensor * llama_kv_cache_context::get_k_pad(ggml_context * ctx, int32_t il, uint32_t n_kv_pad) const {
++    return kv->get_k(ctx, il, n_kv_pad, sinfos[i_cur]);
++}
++
++ggml_tensor * llama_kv_cache_context::get_v_pad(ggml_context * ctx, int32_t il, uint32_t n_kv_pad) const {
++    return kv->get_v(ctx, il, n_kv_pad, sinfos[i_cur]);
++}
+ 
+ ggml_tensor * llama_kv_cache_context::get_turbo_rotation() const {
+     return kv->get_turbo_rotation();
+@@ -3780,6 +3927,18 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
+     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+ }
+ 
++int64_t llama_kv_cache_context::prefab_scratch_cell() const {
++    return kv->prefab_scratch_cell(sinfos[i_cur]);
++}
++
++void llama_kv_cache_context::prefab_set_input_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch, uint32_t n_env, int64_t scratch) const {
++    kv->prefab_set_input_idxs(k_dst, v_dst, ubatch, sinfos[i_cur], n_env, scratch);
++}
++
++void llama_kv_cache_context::prefab_set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_env) const {
++    kv->prefab_set_input_kq_mask(dst, ubatch, causal_attn, n_env, sinfos[i_cur]);
++}
++
+ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 294ae52..2b3d1d8 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -194,6 +194,9 @@ public:
+     std::vector<uint32_t> get_layer_ids() const;
+     ggml_tensor * get_k_storage(int32_t il) const;
+     ggml_tensor * get_v_storage(int32_t il) const;
++    // a global layer id this cache maps (0 when empty); filtered caches (MTP contexts
++    // hold only their nextn layer) have no entry for global layer 0
++    int32_t first_layer_id() const;
+     bool get_v_transposed() const;
+ 
+     bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
+@@ -298,6 +301,18 @@ public:
+     void set_input_k_rot(ggml_tensor * dst) const;
+     void set_input_v_rot(ggml_tensor * dst) const;
+ 
++    // factor-prefab envelope support (LLAMA_PREFAB_ENABLE=1, default off).
++    // A ubatch with n_tokens < n_env runs on a graph compiled for n_env rows. The pad rows
++    // [n_tokens, n_env) must not touch any live cell: they write K/V into one scratch cell that is
++    // empty (hence masked -inf for every real row) and their mask rows replicate the last real row
++    // (finite softmax, no NaN can leak through the non-FA KQ path).
++    // returns -1 when no such cell exists (caller falls back to the stock builder)
++    int64_t prefab_scratch_cell(const slot_info & sinfo) const;
++    void prefab_set_input_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch,
++                               const slot_info & sinfo, uint32_t n_env, int64_t scratch) const;
++    void prefab_set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_env,
++                                  const slot_info & sinfo) const;
++
+ private:
+     const llama_model & model;
+     const llama_hparams & hparams;
+@@ -547,6 +562,23 @@ public:
+ 
+     void set_input_k_rot(ggml_tensor * dst) const;
+     void set_input_v_rot(ggml_tensor * dst) const;
++    // factor-prefab ATTN factor support: the graph is compiled for a padded KV width
++    // (multiple of 1024, >= n_kv, capped at the cache size) instead of the exact n_kv,
++    // so the factor/envelope graph stays valid while n_kv grows within the pad window
++    // (n_kv itself is 256-aligned). Returns the current padded width; 0 when the
++    // context has no concrete ubatch (reserve/update contexts).
++    uint32_t get_n_kv_pad() const;
++    // true when the current n_kv fits the given padded width (graph reuse condition)
++    bool n_kv_pad_fits(uint32_t n_kv_pad) const;
++    // K/V views sized by the padded width (prefab graphs only; stock path uses get_k/get_v)
++    ggml_tensor * get_k_pad(ggml_context * ctx, int32_t il, uint32_t n_kv_pad) const;
++    ggml_tensor * get_v_pad(ggml_context * ctx, int32_t il, uint32_t n_kv_pad) const;
++
++    // factor-prefab envelope helpers (see llama_kv_cache::prefab_*)
++    const llama_kv_cache * get_kv_cache() const { return kv; }
++    int64_t prefab_scratch_cell() const;
++    void prefab_set_input_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch, uint32_t n_env, int64_t scratch) const;
++    void prefab_set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_env) const;
+ 
+ private:
+     llama_memory_status status;
+diff --git a/src/llama-prefab-env.h b/src/llama-prefab-env.h
+new file mode 100644
+index 0000000..38835a4
+--- /dev/null
++++ b/src/llama-prefab-env.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++// Default-off env gates for the prefab n_kv pad (this layer, not the upstream
++// LLAMA_PREFAB_ENABLE gate). Each value is read once (function-local static) and counts
++// as enabled only for the exact string "1": unset, "0", "true", "01", "1 " all leave
++// stock behaviour. When both are unset the only cost is one boolean check per call site.
++#include <cstdlib>
++
++static inline bool llama_prefab_nkv_pad_enabled() {
++    static const bool on = []() {
++        const char * s = getenv("LLAMA_PREFAB_NKV_PAD");
++        return s != nullptr && s[0] == '1' && s[1] == '\0';
++    }();
++    return on;
++}
++
++static inline bool llama_prefab_nkv_obs_enabled() {
++    static const bool on = []() {
++        const char * s = getenv("LLAMA_PREFAB_NKV_OBS");
++        return s != nullptr && s[0] == '1' && s[1] == '\0';
++    }();
++    return on;
++}
++
++// production A+B compose lane (r7). Same exact-"1" contract as the gates above:
++// unset, "0", "true", "01", "1 " all leave stock behaviour. When exactly "1" it selects the
++// whole-graph MTP lane with the A x B compose as the production path on its own (no
++// LLAMA_PREFAB_MTP / LLAMA_PREFAB_ENABLE / LLAMA_PREFAB_EXPERIMENTAL needed): eligible
++// Qwen4Exp MTP contexts cache one whole graph per envelope width and reuse it across
++// requests while the graph inputs allow (exact can_reuse, no pad / headroom / bucket),
++// and each rebuild splices the cached A prologue under the fresh B block.
++static inline bool llama_prefab_ab_enabled() {
++    static const bool on = []() {
++        const char * s = getenv("GGML_TP5_PREFAB_AB");
++        return s != nullptr && s[0] == '1' && s[1] == '\0';
++    }();
++    return on;
++}
+diff --git a/src/llama-prefab-hotpath.h b/src/llama-prefab-hotpath.h
+new file mode 100644
+index 0000000..07e0049
+--- /dev/null
++++ b/src/llama-prefab-hotpath.h
+@@ -0,0 +1,94 @@
++#pragma once
++//
++// llama-prefab-hotpath.h — ggml-free hot-path seam of the A x B whole-graph
++// MTP slot lane (src/llama-prefab-mtp.cpp).
++//
++// This header carries the production contracts that must stay testable and
++// observable without ggml:
++//
++//   - the padded KV window the whole-graph slot is composed for (the reuse
++//     contract of the lane) and the fit judgement the slot reuse gate uses;
++//   - the organic counter events POD (llama_prefab_stats), moved here so a
++//     CPU mock drives the identical production decision code and counters.
++//
++// Every counter write in the lane is armed only by the exact-"1" gate
++// (GGML_TP5_PREFAB_STATS, llama_prefab_stats_enabled, defined in
++// llama-prefab-mtp.cpp); with the gate off no hot-path write happens and the
++// stock branches are behaviourally identical to the unpatched builder.
++//
++#include <cstdint>
++
++#include <algorithm>
++
++// exact-"1" arm gate of every build/reuse counter write in the lane
++bool llama_prefab_stats_enabled();
++
++// the padded KV width a whole-graph slot is composed for, derived from the
++// live n_kv at compose time: a 1024-aligned window (>= 1024) that absorbs
++// n_kv growth across steps so the composed graph is reused instead of
++// rebuilt while the live width stays inside the window. kv_size (the
++// physical cache size; 0 skips the clamp) bounds the window.
++inline uint32_t llama_prefab_nkv_window(uint32_t n_kv, uint32_t kv_size) {
++    const uint32_t w = n_kv <= 1024u ? 1024u : ((n_kv + 1023u) / 1024u) * 1024u;
++    return kv_size ? std::min(w, kv_size) : w;
++}
++
++// the slot reuse judgement: the composed graph stays valid while the live
++// width fits the window it was composed for (pad columns are -INF-masked by
++// the prefab mask writer, so attention never reads beyond the live width)
++inline bool llama_prefab_nkv_fits(uint32_t n_kv_pad, uint32_t n_kv) {
++    return n_kv_pad >= n_kv;
++}
++
++// armed counter writes: the ONLY sanctioned mutation of llama_prefab_stats in
++// the lane. Both no-op unless the exact-"1" gate (GGML_TP5_PREFAB_STATS) is
++// on, so stats-off never writes -- stock hot-path parity is structural, not
++// observational.
++inline void llama_prefab_stat_tick(uint64_t & counter) {
++    if (llama_prefab_stats_enabled()) {
++        ++counter;
++    }
++}
++
++inline void llama_prefab_stat_add(uint64_t & counter, uint64_t v) {
++    if (llama_prefab_stats_enabled()) {
++        counter += v;
++    }
++}
++
++// per-context counters (all organic: incremented only where the event happens;
++// armed by llama_prefab_stats_enabled, the exact-"1" gate above)
++struct llama_prefab_stats {
++    uint64_t n_ubatch_prefab;       // ubatches executed on an envelope graph
++    uint64_t n_ubatch_stock;        // ubatches executed by the stock builder path
++    uint64_t n_stock_builds;        // stock model.build_graph() invocations
++    uint64_t n_stock_reuses;        // stock graph reuses (can_reuse == true)
++    uint64_t n_envelope_builds;     // envelope graph compositions
++    uint64_t n_envelope_reuses;     // envelope graph reused without rebuild
++    uint64_t n_envelope_allocs;     // ggml_backend_sched_alloc_graph on an envelope sched
++    uint64_t n_sub_envelope;        // ubatches with n_tokens < n_env (runtime padded)
++    uint64_t n_pad_rows;            // total pad rows executed
++    uint64_t n_factor_compiles;     // factor modules compiled
++    uint64_t n_factor_cache_hits;   // factor modules taken from the cache while composing
++    uint64_t n_factor_splices;      // factor modules spliced into an envelope
++    uint64_t n_factor_clones;       // tensors cloned by splicing
++    uint64_t n_cache_resets;        // topology-key invalidations of the factor cache
++    uint64_t n_fallback_no_scratch; // runtime fallback to stock: no free scratch KV cell
++    uint64_t n_fallback_runtime;    // runtime fallback to stock: adapters / samplers / attention views / ...
++    uint64_t last_n_env;            // envelope width of the last prefab ubatch
++    uint64_t last_n_tokens;         // real n_tokens of the last prefab ubatch
++    uint64_t last_graph_nodes;      // node count of the last executed envelope graph
++    uint64_t last_inp_tokens_ne0;   // ne[0] of the token input of the executed envelope graph (== last_n_env)
++    uint64_t n_decouple_declines;    // decouple iface: ubatches declined by the compose layer (gate on)
++    uint64_t n_decouple_handled;     // decouple iface: ubatches executed by the compose layer (gate on)
++    // MTP factor compose (GGML_TP5_PREFAB_IN_GRAPH=1), all organic:
++    uint64_t n_mtp_compose_hits;     // DECODER_MTP ubatches executed on a composed A x B envelope graph
++    uint64_t n_mtp_a_compiles;       // A (head prologue) modules built
++    uint64_t n_mtp_a_reuses;         // A modules taken from the cache while composing
++    uint64_t n_mtp_b_builds;         // B (block + epilogue) parts emitted into an envelope
++    uint64_t n_mtp_a_clones;         // tensors cloned from A while splicing it into an envelope
++    uint64_t n_mtp_declines;         // DECODER_MTP ubatches the compose layer declined (stock fallback)
++    uint64_t build_ns;              // wall time in instrumented request graph builds, excluding allocation/compute
++    uint64_t n_nodes_built;         // nodes in successfully emitted request graphs, plus compiled MTP A graphs
++    uint64_t template_hits;         // MTP A template cache hits, not whole-graph hits
++};
+diff --git a/src/llama-prefab-iface.h b/src/llama-prefab-iface.h
+new file mode 100644
+index 0000000..5186793
+--- /dev/null
++++ b/src/llama-prefab-iface.h
+@@ -0,0 +1,97 @@
++#pragma once
++
++// llama-prefab-iface.h — explicit composition interface between the prefab
++// eligibility layer (A, lives in llama-context.cpp) and the prefab compose
++// layer (B, lives in llama-prefab.cpp).
++//
++// Gate: GGML_TP5_PREFAB_DECOUPLE (exact "1"). When the gate is unset or not
++// exactly "1", both layers keep their legacy direct coupling and behavior is
++// byte-identical to the baseline (A+B compose + MTP elig cumulative patch).
++// When the gate is exactly "1":
++//   - A no longer reads B's internals (llama_prefab_state::mtp_mode, slot
++//     tables, scratch_cell, active sched pointer) to decide eligibility or to
++//     drive the ubatch; it fills an explicit request struct and calls B
++//     through the functions below.
++//   - B no longer reaches back into llama_context for eligibility facts; all
++//     facts it needs arrive as values in the request struct.
++//
++// This header is the ONLY shared surface between the two layers under the
++// gate. It deliberately contains no llama_context / llama_prefab_state
++// definitions so neither layer can silently grow a new dependency through it.
++
++#include "ggml-backend.h"
++
++#include "llama-graph.h"
++
++#include <cstdint>
++#include <vector>
++
++// exact-"1" env gate for the decouple lane (unset / "0" / "true" / "01" /
++// "1 " / "2" all stay off)
++bool llama_prefab_decouple_enabled();
++
++// ---- A -> B: explicit eligibility facts (values, not object reach-ins) ----
++//
++// Filled by the eligibility layer (A) after its fail-closed checks; consumed
++// by the compose layer (B). Every field is a plain value or plain pointer
++// that B is allowed to use; nothing here grants B access to A's internals.
++struct llama_prefab_eligibility {
++    // whole-graph MTP mode: slots hold stock-built DECODER_MTP graphs
++    // (e.g. qwen4exp graph_mtp) instead of composed factor envelopes
++    bool     mtp_mode = false;
++
++    // envelope widths (ascending, last == max); one slot per width
++    std::vector<uint32_t> envelopes;
++};
++
++// ---- A -> B: per-ubatch request (values, not object reach-ins) ----
++//
++// Filled by A for one ubatch; B answers through llama_prefab_reply. A never
++// inspects B's slot tables, factor cache, scratch bookkeeping or active-sched
++// pointer to build this — the fields below are the complete contract.
++struct llama_prefab_request {
++    // graph type the caller wants (DEFAULT / DECODER / DECODER_MTP)
++    llm_graph_type gtype = LLM_GRAPH_TYPE_DEFAULT;
++
++    // real ubatch token count (<= the chosen envelope width)
++    uint32_t n_tokens = 0;
++
++    // envelope width selected for this ubatch (must be one of envelopes)
++    uint32_t n_env = 0;
++
++    // whole-graph MTP mode request (exact-fit slot semantics)
++    bool mtp_mode = false;
++
++    // graph_reuse_disable (env LLAMA_GRAPH_REUSE_DISABLE) — disables slot
++    // reuse for both factor and MTP slots equally
++    bool graph_reuse_disable = false;
++
++    // pipeline parallel: slot sched must be synchronized before set_inputs
++    // on the reuse path
++    bool pipeline_parallel = false;
++
++    // eval callback for the slot sched (may be null)
++    ggml_backend_sched_eval_callback cb_eval = nullptr;
++    void * cb_eval_user_data = nullptr;
++
++    // per-ubatch observation gate (LLAMA_PREFAB_NKV_OBS, exact "1")
++    bool nkv_obs = false;
++};
++
++// ---- B -> A: explicit reply (A does not read B's state to learn these) ----
++struct llama_prefab_reply {
++    // false: B declined the ubatch; A must fall back to the stock builder
++    // (A increments its own fallback counters — B does not touch A's stats)
++    bool handled = false;
++
++    // hard failure inside B after accepting the ubatch (alloc/compute);
++    // when set, handled == true and status carries the ggml_status
++    ggml_status status = GGML_STATUS_SUCCESS;
++
++    // the slot graph was reused without rebuild (A maps this to its own
++    // graphs-reused perf counter; B cannot reach it)
++    bool reused = false;
++
++    // the graph result B executed (slot-owned); null iff handled == false
++    llm_graph_result * result = nullptr;
++};
+diff --git a/src/llama-prefab-mtp.cpp b/src/llama-prefab-mtp.cpp
+new file mode 100644
+index 0000000..2330aaa
+--- /dev/null
++++ b/src/llama-prefab-mtp.cpp
+@@ -0,0 +1,406 @@
++#include "llama-prefab.h"
++#include "llama-prefab-splice.h"
++
++#include "llama-impl.h"
++#include "llama-model.h"
++#include "llama-kv-cache.h"
++
++#include "models/models.h"
++
++#include <cstdlib>
++#include <set>
++#include <stdexcept>
++#include <string>
++
++//
++// MTP factor compose (GGML_TP5_PREFAB_IN_GRAPH=1)
++//
++// The DECODER_MTP head of qwen4exp is cut in two where the block input has been produced
++// (graph_mtp::build_mtp_prologue records it in llm_graph_result::t_prefab_cut):
++//
++//   A (head prologue)   token embedding, hnorm/enorm, eh_proj, hc_attn mix
++//   B (block+epilogue)  QKV, IMRoPE, dense attention, gate, wo, hc combine, MoE FFN,
++//                       hc combine, h_nextn export, out_ids gather, head mixer, LM head
++//
++// A is emitted once per (model, n_env) into its own ggml context and cached in
++// llama_prefab_state::mtp_a. Default (clone splice): every envelope graph re-instantiates A
++// node-by-node into its own context (llama-prefab-splice.h); weights stay shared -- they live
++// outside A's context -- and the envelope's own input tensors are substituted for A's formal
++// inputs. Shared-node compose (GGML_TP5_PREFAB_NOCLONE=1): the envelope graph references A's
++// tensors in place -- the envelope's input writer feeds A's formal input tensors and B is
++// emitted directly on A's resident cut tensors -- so nothing is re-instantiated per compose.
++// In both cases B is emitted into the envelope context, because it binds the KV cache context
++// of the running llama_context and the envelope's own attention/mask inputs. The prologue is
++// therefore built once per envelope width and never recomputed per graph.
++//
++// Both halves come from graph_mtp, i.e. exactly the code of the stock graph, so the composed
++// graph has the same nodes, op_params and tensor shapes as the stock one. The stock ctor runs
++// the same two halves in order, so gate off is byte-identical to the pre-split builder.
++//
++// Scope of the claim: the compose removes the prologue recompute only. It does not change the
++// KV layout -- the inherited nkv padding of the decouple lane (LLAMA_PREFAB_NKV_PAD, slot
++// n_kv_pad) is not used here, and B binds the stock KV input exactly as the stock head does.
++//
++
++bool llama_prefab_in_graph_enabled() {
++    // enabled only by the exact string "1": unset, "0", "true", "01", "1 ", "2" all stay off
++    static const bool on = []() {
++        const char * s = getenv("GGML_TP5_PREFAB_IN_GRAPH");
++        return s != nullptr && s[0] == '1' && s[1] == '\0';
++    }();
++    return on;
++}
++
++// r8 shared-node A x B compose (see llama-prefab.h): enabled only by the exact string "1";
++// unset, "0", "true", "01", "1 ", "2" all keep the clone splice (byte-identical to baseline).
++bool llama_prefab_noclone_enabled() {
++    static const bool on = []() {
++        const char * s = getenv("GGML_TP5_PREFAB_NOCLONE");
++        return s != nullptr && s[0] == '1' && s[1] == '\0';
++    }();
++    return on;
++}
++
++bool llama_prefab_mtp_lifetime_enabled() {
++    static const bool on = []() {
++        const char * s = getenv("GGML_TP5_PREFAB_MTP_LIFETIME");
++        return s != nullptr && s[0] == '1' && s[1] == '\0';
++    }();
++    return on;
++}
++
++bool llama_prefab_stats_enabled() {
++    static const bool on = []() {
++        const char * s = getenv("GGML_TP5_PREFAB_STATS");
++        return s != nullptr && s[0] == '1' && s[1] == '\0';
++    }();
++    return on;
++}
++
++llama_prefab_mtp_a_module * llama_prefab_mtp_a_cache::get(const llama_model & model, uint32_t n_env) {
++    auto it = modules.find({ &model, n_env });
++    return it == modules.end() ? nullptr : it->second.get();
++}
++
++void llama_prefab_mtp_a_cache::clear() {
++    modules.clear();
++}
++
++//
++// A: the cached head prologue
++//
++// A is captured by running graph_mtp::build_mtp_prologue into its own graph: it returns the block
++// input and records it (with the HC residual stream and the scatter weights) in t_prefab_cut /
++// t_prefab_cut_res / t_prefab_cut_inject, and A's graph is built by expanding exactly those three.
++// Its formal inputs are the head's own input tensors (tokens / h); the KV/pos/out_ids inputs
++// belong to B.
++//
++
++static std::unique_ptr<llama_prefab_mtp_a_module> prefab_mtp_compile_a(
++        const llama_model & model, const llm_graph_params & params, uint32_t n_env) {
++    auto mod = std::make_unique<llama_prefab_mtp_a_module>();
++    mod->res = std::make_unique<llm_graph_result>(PREFAB_MTP_A_MAX_NODES);
++
++    llm_graph_params p = params;
++    p.ubatch.n_tokens     = n_env;
++    p.ubatch.n_seq_tokens = n_env;
++    p.ubatch.n_seqs       = 1;
++    p.ubatch.n_seqs_unq   = 1;
++    p.ubatch.b_equal_seqs = 0;
++    p.n_outputs = n_env;
++    p.res       = mod->res.get();
++
++    // only the prologue runs here: the no-build ctor binds the members without running either
++    // head half, and the prologue binds no KV/pos/out_ids input
++    llama_model_qwen4exp::graph_mtp g(model, p, llama_model_qwen4exp::graph_mtp::no_build_t{});
++    g.build_mtp_prologue();
++
++    ggml_tensor * block_in = mod->res->t_prefab_cut;
++    ggml_tensor * res_hc   = mod->res->t_prefab_cut_res;
++    ggml_tensor * inject   = mod->res->t_prefab_cut_inject;
++    if (block_in == nullptr || res_hc == nullptr || inject == nullptr) {
++        throw std::runtime_error("mtp factor compose: head prologue did not reach the A/B cut");
++    }
++
++    // A's formal inputs: the head's own input tensors (op == NONE, never allocated on this
++    // graph). They are only reachable through the graph inputs the prologue registered. The
++    // prologue reads tokens (token embedding) and h (hidden stream); embd is registered by the
++    // stock head input but the prologue does not consume it, so it is not an A input.
++    mod->inputs["tokens"] = nullptr;
++    mod->inputs["h"]      = nullptr;
++
++    for (const auto & inp : mod->res->inputs) {
++        if (auto * e = dynamic_cast<llm_graph_input_embd_h *>(inp.get())) {
++            mod->inputs["tokens"] = e->tokens;
++            mod->inputs["h"]      = e->h;
++        }
++    }
++    for (const auto & [name, t] : mod->inputs) {
++        if (t == nullptr) {
++            throw std::runtime_error("mtp factor compose: missing head input '" + name + "'");
++        }
++    }
++    mod->outputs["block_in"] = block_in;
++    mod->outputs["res_hc"]   = res_hc;
++    mod->outputs["inject"]   = inject;
++
++    // A's graph is exactly the prologue: expand the three cut tensors in emission order. Their
++    // ancestors are the whole prologue (the prologue emits nothing else) and the weights are
++    // shared, not expanded.
++    ggml_cgraph * gf = mod->res->get_gf();
++    ggml_build_forward_expand(gf, block_in);
++    ggml_build_forward_expand(gf, res_hc);
++    ggml_build_forward_expand(gf, inject);
++
++    const int n_keep = ggml_graph_n_nodes(gf);
++    if (n_keep == 0) {
++        throw std::runtime_error("mtp factor compose: empty head prologue");
++    }
++    mod->n_a = n_keep;
++
++    return mod;
++}
++
++//
++// splice: clone A's DAG into the envelope context, substituting the formal inputs
++//
++
++static std::map<std::string, ggml_tensor *> prefab_mtp_splice_a(
++        llm_graph_context & dst,
++        const llama_prefab_mtp_a_module & mod,
++        const std::map<std::string, ggml_tensor *> & subs,
++        llama_prefab_stats & stats) {
++    // the shared ggml-only splice kernel (llama-prefab-splice.h): A is a DAG in its own
++    // context, its formal inputs are substituted by this graph's inputs, weights are shared.
++    // Every failure is a throw, i.e. a decline that falls back to the stock builder.
++    llama_prefab_dag dag;
++    dag.ctx     = mod.res->get_ctx();
++    dag.gf      = mod.res->get_gf();
++    dag.n_nodes = mod.n_a;
++    dag.inputs  = mod.inputs;
++    dag.outputs = mod.outputs;
++
++    return llama_prefab_dag_splice(dst.ctx0, dst.gf, dag, subs, &stats.n_mtp_a_clones);
++}
++
++//
++// envelope input of the composed MTP graph
++//
++
++// tokens / h: the head's dual input (token ids + the trunk's wide hidden state).
++// Exact fit only: the compose path never runs with n_tokens < n_env, so this writes the whole
++// ubatch and pads nothing.
++class llm_graph_input_prefab_mtp_inp : public llm_graph_input_i {
++public:
++    llm_graph_input_prefab_mtp_inp(int64_t n_embd, uint32_t n_env) : n_embd(n_embd), n_env(n_env) {}
++    ~llm_graph_input_prefab_mtp_inp() override = default;
++
++    void set_input(const llama_ubatch * ubatch) override {
++        // the same contract the stock llm_graph_input_embd_h relies on; a graph that does not
++        // match it is never built (can_reuse) nor run (compose eligibility check)
++        GGML_ASSERT(ubatch->token != nullptr);
++        GGML_ASSERT(ubatch->embd  != nullptr);
++        GGML_ASSERT(ubatch->n_tokens == n_env);
++
++        // stock llm_graph_input_embd_h semantics: h takes the provided embeddings
++        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_env*sizeof(int32_t));
++        ggml_backend_tensor_set(h,      ubatch->embd,  0, (size_t) n_env*n_embd*sizeof(float));
++    }
++
++    bool can_reuse(const llm_graph_params & params) override {
++        return tokens->ne[0] == (int64_t) params.ubatch.n_tokens && params.ubatch.n_tokens == n_env;
++    }
++
++    ggml_tensor * tokens = nullptr; // I32 [n_env]
++    ggml_tensor * h      = nullptr; // F32 [n_embd, n_env]
++
++    const int64_t  n_embd;
++    const uint32_t n_env;
++};
++
++//
++// compose
++//
++ggml_cgraph * llama_prefab_mtp_compose(
++        const llama_model & model,
++        const llm_graph_params & params,
++        uint32_t n_env,
++        llama_prefab_state & st,
++        llama_prefab_stats & stats) {
++    // eligibility is checked, never asserted: a declined ubatch must not abort the process.
++    // Exact fit only (no envelope padding, no KV headroom); n_outputs may be smaller than the
++    // envelope (the stock head sizes out_ids by it), never larger.
++    if (model.arch != LLM_ARCH_QWEN4EXP) {
++        throw std::runtime_error("mtp factor compose: arch is not QWEN4EXP");
++    }
++    if (params.gtype != LLM_GRAPH_TYPE_DECODER_MTP) {
++        throw std::runtime_error("mtp factor compose: graph type is not DECODER_MTP");
++    }
++    if (params.ubatch.n_tokens != n_env) {
++        throw std::runtime_error("mtp factor compose: ubatch does not fill the envelope");
++    }
++    if (params.res == nullptr) {
++        throw std::runtime_error("mtp factor compose: no result object");
++    }
++    if (params.ubatch.token == nullptr || params.ubatch.embd == nullptr) {
++        throw std::runtime_error("mtp factor compose: ubatch lacks token or embedding input");
++    }
++    if (params.n_outputs <= 0 || params.n_outputs > (int64_t) n_env) {
++        // the stock head sizes out_ids by n_outputs and the driver reads exactly that many rows
++        // back; more outputs than the envelope has rows cannot be produced
++        throw std::runtime_error("mtp factor compose: n_outputs does not fit the envelope");
++    }
++
++    // n_kv is the live count: B binds the stock KV input, whose can_reuse compares the mask width
++    // against the exact n_kv, so the graph is rebuilt whenever n_kv changes. The MTP compose never
++    // widens the KV window.
++
++    // params is used as-is: the stock head sizes out_ids by params.n_outputs, exactly as on the
++    // stock path, so the composed graph returns the same rows
++    llm_graph_params p = params;
++    llm_graph_context g(p);
++
++    const int64_t hc_dim = (int64_t) g.hparams.n_embd_out();
++
++    // --- A: cached head prologue, compiled once per (model, n_env). Fetched before the input
++    // tensors because the shared-node path binds this graph's inputs to A's own tensors.
++    llama_prefab_mtp_a_module * a = st.mtp_a.get(model, n_env);
++    if (a != nullptr) {
++        llama_prefab_stat_tick(stats.n_mtp_a_reuses);
++        llama_prefab_stat_tick(stats.template_hits);
++    } else {
++        auto mod = prefab_mtp_compile_a(model, params, n_env);
++        llama_prefab_stat_tick(stats.n_mtp_a_compiles);
++        llama_prefab_stat_add(stats.n_nodes_built, mod->n_a);
++        a = mod.get();
++        st.mtp_a.modules[{ &model, n_env }] = std::move(mod);
++    }
++
++    // --- inputs, same shapes/types as the stock head's own inputs
++    auto inp_u = std::make_unique<llm_graph_input_prefab_mtp_inp>(hc_dim, n_env);
++    ggml_tensor * tokens = nullptr;
++    ggml_tensor * h      = nullptr;
++    std::map<std::string, ggml_tensor *> a_outs;
++    if (llama_prefab_noclone_enabled()) {
++        // shared-node A x B compose: A's tensors are referenced in place, never
++        // re-instantiated. The envelope's input writer feeds A's formal input tensors and
++        // B is emitted directly on A's resident cut tensors; when B's outputs are expanded,
++        // A's nodes enter this graph through the normal src walk (the weights were already
++        // shared that way). Before the graph is built, the data/buffer pointers of every
++        // tensor A owns are cleared so THIS graph's scheduler allocation plans them afresh:
++        // a pointer left over from a previous allocation is indistinguishable from an
++        // external tensor and would be left out of a re-planned layout, letting fresh
++        // allocations overlap A's memory. A fresh template has null pointers, so this is a
++        // no-op on the first compose.
++        ggml_cgraph * ga = a->res->get_gf();
++        // ownership range as integers: relational comparison of pointers into unrelated
++        // objects is unspecified in C++, so compare uintptr_t values instead.
++        const uintptr_t buf_beg = reinterpret_cast<uintptr_t>(ggml_get_mem_buffer(a->res->get_ctx()));
++        const uintptr_t buf_end = buf_beg + ggml_get_mem_size(a->res->get_ctx());
++        auto release_owned = [&](ggml_tensor * t) {
++            if (t == nullptr) {
++                return;
++            }
++            if (reinterpret_cast<uintptr_t>(t) < buf_beg || reinterpret_cast<uintptr_t>(t) >= buf_end) {
++                return; // weights and other external tensors: not owned by A, never touched
++            }
++            t->data = nullptr;
++            t->buffer = nullptr;
++        };
++        // walk the template graph's nodes and transitively their sources and view sources:
++        // this reaches every tensor of the template graph, including leaves (the formal
++        // input placeholders and any leaf a future prologue might add), so no A-owned
++        // tensor can retain a stale allocation pointer into a re-planned pool. Tensors
++        // outside A's context (weights) fail the ownership test and are never touched.
++        std::set<const ggml_tensor *> visited;
++        std::function<void(ggml_tensor *)> visit = [&](ggml_tensor * t) {
++            if (t == nullptr || visited.count(t) != 0) {
++                return;
++            }
++            visited.insert(t);
++            release_owned(t);
++            for (int i = 0; i < GGML_MAX_SRC; ++i) {
++                visit(t->src[i]);
++            }
++            if (t->view_src != nullptr) {
++                visit(t->view_src);
++            }
++        };
++        for (int i = 0; i < ggml_graph_n_nodes(ga); ++i) {
++            visit(ggml_graph_node(ga, i));
++        }
++        for (const auto & kv : a->inputs) {
++            visit(kv.second); // formal inputs, incl. any the prologue registered but the
++                              // graph does not reach (defensive; data stays null there)
++        }
++        tokens = a->inputs.at("tokens");
++        h      = a->inputs.at("h");
++        GGML_ASSERT(tokens->type == GGML_TYPE_I32 && tokens->ne[0] == (int64_t) n_env);
++        GGML_ASSERT(h->type == GGML_TYPE_F32 && h->ne[0] == hc_dim && h->ne[1] == (int64_t) n_env);
++        // A's formal inputs already carry the input flag and their build-time names (the
++        // prologue's own embedding input registered them), so they are bound as-is.
++        inp_u->tokens = tokens;
++        inp_u->h      = h;
++        a_outs        = a->outputs; // the shared cut tensors: B reads A in place
++    } else {
++        // clone path (unchanged): fresh envelope input tensors, A re-instantiated per compose
++        inp_u->tokens = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, n_env);
++        ggml_set_name(inp_u->tokens, "inp_tokens");
++        ggml_set_input(inp_u->tokens);
++        inp_u->h = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, hc_dim, n_env);
++        ggml_set_input(inp_u->h);
++        ggml_set_name(inp_u->h, "mtp_h_input");
++        tokens = inp_u->tokens;
++        h      = inp_u->h;
++        a_outs = prefab_mtp_splice_a(g, *a, { { "tokens", tokens }, { "h", h } }, stats);
++    }
++    g.res->t_inp_tokens = tokens;
++    g.res->add_input(std::move(inp_u));
++
++    // --- B: the trunk-style block + epilogue, emitted by the stock head code on top of the
++    // A cut tensors (shared in place with GGML_TP5_PREFAB_NOCLONE=1, re-instantiated by the
++    // splice otherwise). It binds this graph's pos / out_ids / KV inputs; out_ids is sized by
++    // params.n_outputs, exactly as on the stock path.
++    llama_model_qwen4exp::graph_mtp gm(model, p, llama_model_qwen4exp::graph_mtp::no_build_t{});
++    // --- B's KV input: the padded KV window of the whole-graph slot (n_kv is a runtime
++    // parameter; the prefab mask writer -INF-masks the pad columns, so attention never
++    // reads beyond the live width and the composed graph is reused while n_kv fits the
++    // window the slot was composed for -- the reuse judgement in llama-prefab-hotpath.h)
++    const auto * kvc = static_cast<const llama_kv_cache_context *>(params.mctx);
++    const uint32_t n_kv_pad = kvc->get_n_kv_pad();
++    GGML_ASSERT(llama_prefab_nkv_fits(n_kv_pad, kvc->get_n_kv()));
++    auto inp_attn_u = std::make_unique<llm_graph_input_prefab_attn_kv>(
++            g.hparams, g.cparams, kvc, n_env, n_kv_pad, &st);
++    // the input object owns the per-ubatch tensors the stock attention build consumes:
++    // cache cell indices (fed to cpy_k/cpy_v), the padded KV mask, and the rotation tables.
++    // Same constructors as the stock head (build_attn_inp_kv_impl) and the factor envelope
++    // (llama-prefab.cpp), so shapes/types match and set_input can write them each ubatch.
++    inp_attn_u->self_k_idxs  = kvc->build_input_k_idxs(g.ctx0, g.ubatch);
++    inp_attn_u->self_v_idxs  = kvc->build_input_v_idxs(g.ctx0, g.ubatch);
++    inp_attn_u->self_kq_mask = ggml_new_tensor_4d(g.ctx0,
++            g.cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, n_kv_pad, n_env, 1, 1);
++    ggml_set_input(inp_attn_u->self_kq_mask);
++    ggml_set_name(inp_attn_u->self_kq_mask, "attn_inp_kq_mask");
++    inp_attn_u->self_kq_mask_cnv = inp_attn_u->self_kq_mask;
++    inp_attn_u->self_k_rot = kvc->build_input_k_rot(g.ctx0);
++    inp_attn_u->self_v_rot = kvc->build_input_v_rot(g.ctx0);
++    // register BEFORE the block build: the slot result owns the input object
++    // (res->inputs), so set_input/can_reuse run per ubatch and the raw pointer
++    // stays valid past this scope; an unregistered input would die with this
++    // function and its mask/idxs tensors would never be written per request.
++    auto * inp_attn = (llm_graph_input_attn_kv *) g.res->add_input(std::move(inp_attn_u));
++    gm.build_mtp_block(a_outs.at("block_in"), a_outs.at("res_hc"), a_outs.at("inject"), inp_attn);
++    if (gm.res->t_h_nextn == nullptr || gm.res->t_logits == nullptr) {
++        throw std::runtime_error("mtp factor compose: head block did not emit its outputs");
++    }
++    llama_prefab_stat_tick(stats.n_mtp_b_builds);
++
++    g.res->t_h_nextn = gm.res->t_h_nextn;
++    g.res->t_logits  = gm.res->t_logits;
++
++    // the stock builder does this in llama_model::build_graph; without it the scheduler may
++    // reuse t_h_nextn / t_logits as scratch and clobber them before they are read back
++    g.res->set_outputs(p);
++
++    return g.res->get_gf();
++}
+diff --git a/src/llama-prefab-splice.h b/src/llama-prefab-splice.h
+new file mode 100644
+index 0000000..a23da9d
+--- /dev/null
++++ b/src/llama-prefab-splice.h
+@@ -0,0 +1,130 @@
++#pragma once
++
++// ggml-only DAG splice kernel of the factor-prefab compose layers.
++//
++// A module ("A") is a graph emitted into its own ggml context: a list of `n_nodes` nodes in
++// emission order (a topological order, because it was built with ggml_build_forward_expand),
++// named cut tensors ("outputs") and formal placeholder inputs.
++//
++// Splice clones that DAG into a destination context/graph:
++//   - a formal input is substituted by the destination tensor of the same name; the layout
++//     (type, ne[0..3], nb[0..3]) must match exactly, otherwise it throws;
++//   - a tensor that is not allocated in the module's own mem buffer is a shared weight (or any
++//     other model-owned tensor): it is never cloned, the pointer is reused as-is;
++//   - an unbound placeholder (op NONE, no view_src) throws: the DAG cannot be spliced without
++//     one of its inputs;
++//   - every other node is cloned into the destination context, its sources are cloned
++//     recursively, and the clone is expanded into the destination graph in the module's node
++//     order.
++//
++// This header depends only on ggml so that the kernel can be exercised outside llama.cpp
++// (a standalone CPU harness covers the splice contract; it lives next to the workdir root).
++
++#include "ggml.h"
++
++#include <cstdint>
++#include <cstring>
++#include <functional>
++#include <map>
++#include <stdexcept>
++#include <string>
++#include <unordered_map>
++
++struct llama_prefab_dag {
++    ggml_context * ctx = nullptr; // context the module's tensors live in (ownership test)
++    ggml_cgraph  * gf  = nullptr; // the module's graph (node order)
++
++    int n_nodes = 0; // nodes to splice, in emission order
++
++    std::map<std::string, ggml_tensor *> inputs;  // formal placeholders
++    std::map<std::string, ggml_tensor *> outputs; // named cut tensors
++};
++
++// Clone `src` into dst_ctx/dst_gf, substituting `subs`. Returns the cloned outputs by name.
++// `n_clones` (may be null) receives the number of cloned tensors; it is bumped as tensors are
++// cloned, so a throw leaves it holding the clones created up to that point.
++inline std::map<std::string, ggml_tensor *> llama_prefab_dag_splice(
++        ggml_context * dst_ctx,
++        ggml_cgraph  * dst_gf,
++        const llama_prefab_dag & src,
++        const std::map<std::string, ggml_tensor *> & subs,
++        uint64_t * n_clones) {
++    // ownership: tensor addresses inside the module's mem buffer belong to the module
++    const char * buf_beg = (const char *) ggml_get_mem_buffer(src.ctx);
++    const char * buf_end = buf_beg + ggml_get_mem_size(src.ctx);
++
++    std::unordered_map<const ggml_tensor *, ggml_tensor *> map;
++
++    for (const auto & [name, ph] : src.inputs) {
++        auto it = subs.find(name);
++        if (it == subs.end() || it->second == nullptr) {
++            throw std::runtime_error("factor-prefab splice: unbound input '" + name + "'");
++        }
++        ggml_tensor * t = it->second;
++        bool same = t->type == ph->type;
++        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++            same = same && t->ne[i] == ph->ne[i] && t->nb[i] == ph->nb[i];
++        }
++        if (!same) {
++            throw std::runtime_error("factor-prefab splice: layout mismatch for input '" + name + "'");
++        }
++        map[ph] = t;
++    }
++
++    std::function<ggml_tensor * (ggml_tensor *)> clone = [&](ggml_tensor * t_src) -> ggml_tensor * {
++        if (t_src == nullptr) {
++            return nullptr;
++        }
++        auto it = map.find(t_src);
++        if (it != map.end()) {
++            return it->second;
++        }
++        const char * p = (const char *) t_src;
++        if (p < buf_beg || p >= buf_end) {
++            // weights: shared, never cloned
++            map[t_src] = t_src;
++            return t_src;
++        }
++        if (t_src->op == GGML_OP_NONE && t_src->view_src == nullptr) {
++            // an unbound placeholder: the DAG registered an input the caller did not bind
++            throw std::runtime_error(std::string("factor-prefab splice: leaf '") + t_src->name +
++                    "' is not a formal input");
++        }
++
++        ggml_tensor * t = ggml_new_tensor(dst_ctx, t_src->type, GGML_MAX_DIMS, t_src->ne);
++        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++            t->nb[i] = t_src->nb[i];
++        }
++        t->op    = t_src->op;
++        t->flags = t_src->flags;
++        memcpy(t->op_params, t_src->op_params, sizeof(t->op_params));
++        ggml_set_name(t, t_src->name);
++
++        for (int i = 0; i < GGML_MAX_SRC; ++i) {
++            t->src[i] = clone(t_src->src[i]);
++        }
++        if (t_src->view_src != nullptr) {
++            t->view_src  = clone(t_src->view_src);
++            t->view_offs = t_src->view_offs;
++            if (t->view_src->data != nullptr) {
++                t->data = (char *) t->view_src->data + t->view_offs;
++            }
++        }
++
++        map[t_src] = t;
++        if (n_clones != nullptr) {
++            (*n_clones)++;
++        }
++        return t;
++    };
++
++    for (int i = 0; i < src.n_nodes; ++i) {
++        ggml_build_forward_expand(dst_gf, clone(ggml_graph_node(src.gf, i)));
++    }
++
++    std::map<std::string, ggml_tensor *> outs;
++    for (const auto & [name, t] : src.outputs) {
++        outs[name] = clone(t);
++    }
++    return outs;
++}
+diff --git a/src/llama-prefab.cpp b/src/llama-prefab.cpp
+new file mode 100644
+index 0000000..7bce811
+--- /dev/null
++++ b/src/llama-prefab.cpp
+@@ -0,0 +1,1184 @@
++#include "llama-prefab.h"
++
++#include "llama-prefab-env.h"
++#include "llama-impl.h"
++#include "llama-model.h"
++#include "llama-kv-cache.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <functional>
++#include <stdexcept>
++#include <cstdlib>
++#include <cstdio>
++
++//
++// topology key / cache / state
++//
++
++bool llama_prefab_topology_key::operator==(const llama_prefab_topology_key & o) const {
++    return model == o.model && memory == o.memory && arch == o.arch &&
++           n_embd == o.n_embd && n_layer == o.n_layer && n_head == o.n_head && n_head_kv == o.n_head_kv &&
++           kv_size == o.kv_size && type_k == o.type_k && type_v == o.type_v &&
++           flash_attn == o.flash_attn && v_trans == o.v_trans && causal == o.causal && warmup == o.warmup &&
++           rope_freq_base == o.rope_freq_base && rope_freq_scale == o.rope_freq_scale;
++}
++
++bool llama_prefab_factor_module::owns(const ggml_tensor * t) const {
++    ggml_context * ctx = res->get_ctx();
++    const char * b = (const char *) ggml_get_mem_buffer(ctx);
++    const char * e = b + ggml_get_mem_size(ctx);
++    const char * p = (const char *) t;
++    return p >= b && p < e;
++}
++
++bool llama_prefab_factor_cache::validate_or_reset(const llama_prefab_topology_key & k) {
++    if (has_key && key == k) {
++        return false;
++    }
++    const bool had = has_key && !modules.empty();
++    clear();
++    key     = k;
++    has_key = true;
++    return had;
++}
++
++void llama_prefab_factor_cache::clear() {
++    modules.clear();
++    has_key = false;
++    key = {};
++}
++
++int llama_prefab_state::slot_for(uint32_t n_tokens) const {
++    for (size_t i = 0; i < slots.size(); ++i) {
++        if (n_tokens <= slots[i].n_env) {
++            return (int) i;
++        }
++    }
++    return -1;
++}
++
++void llama_prefab_state::sync_pending() {
++    // every slot whose graph was executed since the last synchronize may still be running: the
++    // output copies read from its buffers, and resetting the slot would free them under the
++    // backend. Drain all of them, not just the last one that became active.
++    for (ggml_backend_sched_t s : pending) {
++        if (s != nullptr) {
++            ggml_backend_sched_synchronize(s);
++        }
++    }
++    pending.clear();
++}
++
++void llama_prefab_state::mark_pending(ggml_backend_sched_t s) {
++    // the envelope graph was just dispatched on s: its outputs are read asynchronously and its
++    // buffers must not be reset/freed before a synchronize drains it
++    if (s == nullptr) {
++        return;
++    }
++    for (ggml_backend_sched_t p : pending) {
++        if (p == s) {
++            return;
++        }
++    }
++    pending.push_back(s);
++}
++
++void llama_prefab_state::reset_slots() {
++    // nothing may be reset while a slot's graph is still in flight
++    sync_pending();
++    for (auto & s : slots) {
++        if (s.res) {
++            s.res->reset();
++        }
++        if (s.sched) {
++            ggml_backend_sched_reset(s.sched.get());
++        }
++        s.built = false;
++    }
++    if (llama_prefab_mtp_lifetime_enabled()) {
++        mtp_a.clear();
++    }
++    active = nullptr;
++}
++
++//
++// envelope inputs
++//
++
++bool llm_graph_input_is_prefab(const llm_graph_input_i * inp) {
++    return dynamic_cast<const llm_graph_input_prefab_tokens  *>(inp) != nullptr ||
++           dynamic_cast<const llm_graph_input_prefab_pos     *>(inp) != nullptr ||
++           dynamic_cast<const llm_graph_input_prefab_out_ids *>(inp) != nullptr ||
++           dynamic_cast<const llm_graph_input_prefab_attn_kv *>(inp) != nullptr;
++}
++
++void llm_graph_input_prefab_tokens::set_input(const llama_ubatch * ubatch) {
++    GGML_ASSERT(ubatch->token != nullptr);
++    const uint32_t n = ubatch->n_tokens;
++    GGML_ASSERT(n >= 1 && n <= n_env);
++    std::vector<int32_t> data(n_env);
++    for (uint32_t i = 0; i < n_env; ++i) {
++        data[i] = ubatch->token[i < n ? i : n - 1];
++    }
++    ggml_backend_tensor_set(tokens, data.data(), 0, n_env*sizeof(int32_t));
++}
++
++bool llm_graph_input_prefab_tokens::can_reuse(const llm_graph_params & params) {
++    return tokens->ne[0] == (int64_t) params.ubatch.n_tokens && params.ubatch.n_tokens == n_env;
++}
++
++void llm_graph_input_prefab_pos::set_input(const llama_ubatch * ubatch) {
++    GGML_ASSERT(ubatch->pos != nullptr);
++    const uint32_t n = ubatch->n_tokens;
++    GGML_ASSERT(n >= 1 && n <= n_env);
++    std::vector<int32_t> data(n_env);
++    for (uint32_t i = 0; i < n_env; ++i) {
++        data[i] = ubatch->pos[i < n ? i : n - 1];
++    }
++    ggml_backend_tensor_set(pos, data.data(), 0, n_env*sizeof(int32_t));
++}
++
++bool llm_graph_input_prefab_pos::can_reuse(const llm_graph_params & params) {
++    return pos->ne[0] == (int64_t) params.ubatch.n_tokens && params.ubatch.n_tokens == n_env;
++}
++
++void llm_graph_input_prefab_out_ids::set_input(const llama_ubatch * ubatch) {
++    const uint32_t n = ubatch->n_tokens;
++    GGML_ASSERT(n >= 1 && n <= n_env);
++    std::vector<int32_t> data;
++    data.reserve(n_env);
++    for (uint32_t i = 0; i < n; ++i) {
++        if (ubatch->output == nullptr || ubatch->output[i]) {
++            data.push_back((int32_t) i);
++        }
++    }
++    // pad rows: duplicate the last real output (or the last real row if there is no output)
++    const int32_t pad = data.empty() ? (int32_t) (n - 1) : data.back();
++    while (data.size() < n_env) {
++        data.push_back(pad);
++    }
++    ggml_backend_tensor_set(out_ids, data.data(), 0, n_env*sizeof(int32_t));
++}
++
++bool llm_graph_input_prefab_out_ids::can_reuse(const llm_graph_params & params) {
++    return out_ids->ne[0] == (int64_t) params.n_outputs && params.n_outputs == n_env;
++}
++
++void llm_graph_input_prefab_attn_kv::set_input(const llama_ubatch * ubatch) {
++    GGML_ASSERT(readers.empty());
++    GGML_ASSERT(st != nullptr);
++    const uint32_t n = ubatch->n_tokens;
++    GGML_ASSERT(n >= 1 && n <= n_env);
++    GGML_ASSERT(n == n_env || st->scratch_cell >= 0);
++
++    mctx->prefab_set_input_idxs(self_k_idxs, self_v_idxs, ubatch, n_env, st->scratch_cell);
++
++    if (self_kq_mask && self_kq_mask->buffer) {
++        // the mask is [n_kv_pad, n_env, 1, 1]; the writer masks pad columns
++        // [live n_kv, n_kv_pad) with -inf so the extra K/V view columns never contribute
++        mctx->prefab_set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn, n_env);
++    }
++    if (self_k_rot && self_k_rot->buffer) {
++        mctx->set_input_k_rot(self_k_rot);
++    }
++    if (self_v_rot && self_v_rot->buffer) {
++        mctx->set_input_v_rot(self_v_rot);
++    }
++}
++
++bool llm_graph_input_prefab_attn_kv::can_reuse(const llm_graph_params & params) {
++    const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
++
++    if (!readers.empty() || mctx->has_attention_views()) {
++        return false;
++    }
++
++    // re-bind the (possibly new) context, like the stock can_reuse
++    this->mctx = mctx;
++
++    bool res = true;
++
++    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
++
++    // n_kv is a runtime parameter: the mask/K/V-view width is the padded width, and the
++    // graph is reused as long as the live n_kv fits it (the mask writer masks the pad
++    // columns). ne[1]/ne[2]/ne[3] checks as in the stock can_reuse_kq_mask, with n_env rows.
++    res &= self_kq_mask->ne[0] == (int64_t) n_kv_pad;
++    res &= self_kq_mask->ne[1] == (int64_t) n_env;
++    res &= self_kq_mask->ne[2] == 1;
++    res &= self_kq_mask->ne[3] == 1;
++    res &= mctx->n_kv_pad_fits(n_kv_pad);
++
++    return res;
++}
++
++//
++// factor modules
++//
++
++static const llm_graph_cb & prefab_cb() {
++    // names only: the stock callback pins "norm"/"l_last" on the *main* sched, which never runs envelopes
++    // (the llama builder never emits those names, so this is placement-neutral for the supported archs)
++    static const llm_graph_cb cb = [](const llama_ubatch &, ggml_tensor * cur, const char * name, int il) {
++        if (il >= 0) {
++            ggml_format_name(cur, "%s-%d", name, il);
++        } else {
++            ggml_set_name(cur, name);
++        }
++    };
++    return cb;
++}
++
++static constexpr int64_t PREFAB_FACTOR_MAX_NODES = 2048;
++
++struct prefab_module_builder {
++    std::unique_ptr<llama_prefab_factor_module> m;
++    llm_graph_params                            p;
++    std::unique_ptr<llm_graph_context>          g;
++
++    prefab_module_builder(const llm_graph_params & params, const llama_prefab_factor_key & key) {
++        m = std::make_unique<llama_prefab_factor_module>();
++        m->key = key;
++        m->res = std::make_unique<llm_graph_result>(PREFAB_FACTOR_MAX_NODES);
++        p = params;
++        p.res = m->res.get();
++        p.cb  = prefab_cb();
++        g = std::make_unique<llm_graph_context>(p);
++    }
++
++    ggml_tensor * input(const char * name, ggml_type type, int64_t ne0, int64_t ne1 = 1, int64_t ne2 = 1, int64_t ne3 = 1) {
++        ggml_tensor * t = ggml_new_tensor_4d(g->ctx0, type, ne0, ne1, ne2, ne3);
++        ggml_format_name(t, "pf_in_%s", name);
++        m->inputs[name] = t;
++        return t;
++    }
++
++    // placeholder with the exact layout (ne + nb) of a producer tensor of another factor
++    ggml_tensor * input_like(const char * name, const ggml_tensor * ref) {
++        ggml_tensor * t = ggml_new_tensor(g->ctx0, ref->type, GGML_MAX_DIMS, ref->ne);
++        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++            t->nb[i] = ref->nb[i];
++        }
++        ggml_format_name(t, "pf_in_%s", name);
++        m->inputs[name] = t;
++        return t;
++    }
++
++    void bind(const char * name, ggml_tensor * t) {
++        if (t == nullptr) {
++            return;
++        }
++        m->inputs[name] = t;
++    }
++
++    void output(const char * name, ggml_tensor * t) {
++        GGML_ASSERT(t != nullptr);
++        ggml_build_forward_expand(g->gf, t);
++        m->outputs[name] = t;
++    }
++
++    std::unique_ptr<llama_prefab_factor_module> finish() {
++        g.reset();
++        return std::move(m);
++    }
++};
++
++static std::unique_ptr<llama_prefab_factor_module> prefab_compile_embd(
++        const llama_model & model, const llm_graph_params & params, uint32_t n_env) {
++    prefab_module_builder b(params, { LLAMA_PREFAB_FACTOR_EMBD, -1, n_env, 0 });
++    auto & g = *b.g;
++
++    ggml_tensor * tokens = b.input("tokens", GGML_TYPE_I32, n_env);
++    ggml_tensor * cur = ggml_get_rows(g.ctx0, model.tok_embd, tokens);
++    if (g.hparams.f_embedding_scale != 0.0f) {
++        cur = ggml_scale(g.ctx0, cur, g.hparams.f_embedding_scale);
++    }
++    b.output("inpL", cur);
++    return b.finish();
++}
++
++static std::unique_ptr<llama_prefab_factor_module> prefab_compile_qkv(
++        const llama_model & model, const llm_graph_params & params, int il, uint32_t n_env) {
++    prefab_module_builder b(params, { LLAMA_PREFAB_FACTOR_QKV, il, n_env, 0 });
++    auto & g = *b.g;
++
++    const int64_t n_embd_head = g.hparams.n_embd_head_v();
++    GGML_ASSERT(n_embd_head == g.hparams.n_embd_head_k());
++    GGML_ASSERT(n_embd_head == g.n_rot);
++
++    ggml_tensor * inpL    = b.input("inpL",    GGML_TYPE_F32, g.n_embd, n_env);
++    ggml_tensor * inp_pos = b.input("inp_pos", GGML_TYPE_I32, n_env);
++
++    // == llama_model_llama::graph<false> (src/models/llama.cpp), per-layer attention prologue
++    ggml_tensor * cur = g.build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
++    g.cb(cur, "attn_norm", il);
++
++    ggml_tensor * rope_factors = model.get_rope_factors(g.cparams, il);
++
++    auto [Qcur, Kcur, Vcur] = g.build_qkv(model.layers[il], cur, n_embd_head, g.n_head, g.n_head_kv, il);
++
++    Qcur = ggml_rope_ext(g.ctx0, Qcur, inp_pos, rope_factors,
++            g.n_rot, g.rope_type, g.n_ctx_orig, g.freq_base, g.freq_scale,
++            g.ext_factor, g.attn_factor, g.beta_fast, g.beta_slow);
++    Kcur = ggml_rope_ext(g.ctx0, Kcur, inp_pos, rope_factors,
++            g.n_rot, g.rope_type, g.n_ctx_orig, g.freq_base, g.freq_scale,
++            g.ext_factor, g.attn_factor, g.beta_fast, g.beta_slow);
++
++    g.cb(Qcur, "Qcur", il);
++    g.cb(Kcur, "Kcur", il);
++    g.cb(Vcur, "Vcur", il);
++
++    if (g.hparams.use_kq_norm) {
++        Qcur = ggml_rms_norm(g.ctx0, Qcur, g.hparams.f_norm_rms_eps);
++        Kcur = ggml_rms_norm(g.ctx0, Kcur, g.hparams.f_norm_rms_eps);
++        g.cb(Qcur, "Qcur_normed", il);
++        g.cb(Kcur, "Kcur_normed", il);
++    }
++
++    // same expansion order as build_attn (q, v, k)
++    b.output("q", Qcur);
++    b.output("v", Vcur);
++    b.output("k", Kcur);
++    return b.finish();
++}
++
++static std::unique_ptr<llama_prefab_factor_module> prefab_compile_attn(
++        const llama_model & model, const llm_graph_params & params, int il, uint32_t n_env, uint32_t n_kv_pad,
++        const llama_prefab_factor_module & qkv) {
++    prefab_module_builder b(params, { LLAMA_PREFAB_FACTOR_ATTN, il, n_env, n_kv_pad });
++    auto & g = *b.g;
++
++    const auto * kvc = static_cast<const llama_kv_cache_context *>(g.mctx);
++    // n_kv is a runtime parameter: the factor is compiled for the padded width, which must
++    // cover the current n_kv (the envelope asserts the same before composing)
++    GGML_ASSERT(kvc->n_kv_pad_fits(n_kv_pad));
++
++    const int64_t n_embd_head = g.hparams.n_embd_head_v();
++    const float kq_scale = g.hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : g.hparams.f_attention_scale;
++
++    ggml_tensor * q = b.input_like("q", qkv.outputs.at("q"));
++    ggml_tensor * k = b.input_like("k", qkv.outputs.at("k"));
++    ggml_tensor * v = b.input_like("v", qkv.outputs.at("v"));
++
++    // formal KV inputs: same constructors as the envelope inputs -> same shapes/types
++    llm_graph_input_attn_kv inp(g.hparams, g.cparams, kvc);
++    inp.n_kv_pad = n_kv_pad; // build_attn sizes the K/V views by the padded width
++    inp.self_k_idxs = kvc->build_input_k_idxs(g.ctx0, g.ubatch);
++    inp.self_v_idxs = kvc->build_input_v_idxs(g.ctx0, g.ubatch);
++    inp.self_kq_mask = ggml_new_tensor_4d(g.ctx0, g.cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, n_kv_pad, n_env, 1, 1);
++    inp.self_kq_mask_cnv = inp.self_kq_mask;
++    inp.self_k_rot = kvc->build_input_k_rot(g.ctx0);
++    inp.self_v_rot = kvc->build_input_v_rot(g.ctx0);
++
++    b.bind("k_idxs",  inp.self_k_idxs);
++    b.bind("v_idxs",  inp.self_v_idxs);
++    b.bind("kq_mask", inp.self_kq_mask);
++    b.bind("k_rot",   inp.self_k_rot);
++    b.bind("v_rot",   inp.self_v_rot);
++
++    ggml_tensor * cur = g.build_attn(&inp,
++            model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
++            q, k, v, nullptr, nullptr, nullptr, kq_scale, il);
++    g.cb(cur, "attn_out", il);
++
++    b.output("out", cur);
++    return b.finish();
++}
++
++static std::unique_ptr<llama_prefab_factor_module> prefab_compile_ffn(
++        const llama_model & model, const llm_graph_params & params, int il, uint32_t n_env) {
++    prefab_module_builder b(params, { LLAMA_PREFAB_FACTOR_FFN, il, n_env, 0 });
++    auto & g = *b.g;
++
++    ggml_tensor * cur   = b.input("cur",   GGML_TYPE_F32, g.n_embd, n_env);
++    ggml_tensor * inpSA = b.input("inpSA", GGML_TYPE_F32, g.n_embd, n_env);
++
++    ggml_tensor * ffn_inp = ggml_add(g.ctx0, cur, inpSA);
++    g.cb(ffn_inp, "ffn_inp", il);
++
++    if (model.layers[il].ffn_gate_inp == nullptr) {
++        cur = g.build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
++        g.cb(cur, "ffn_norm", il);
++
++        cur = g.build_ffn(cur,
++                model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
++                model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
++                model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
++                NULL,
++                LLM_FFN_SILU, LLM_FFN_PAR, il);
++        g.cb(cur, "ffn_out", il);
++    } else {
++        cur = g.build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
++        g.cb(cur, "ffn_norm", il);
++
++        cur = g.build_moe_ffn(cur,
++                model.layers[il].ffn_gate_inp,
++                model.layers[il].ffn_up_exps,
++                model.layers[il].ffn_gate_exps,
++                model.layers[il].ffn_down_exps,
++                nullptr,
++                g.n_expert, g.n_expert_used,
++                LLM_FFN_SILU, true,
++                g.hparams.expert_weights_scale,
++                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
++                il,
++                nullptr, nullptr,
++                model.layers[il].ffn_up_exps_s,
++                model.layers[il].ffn_gate_exps_s,
++                model.layers[il].ffn_down_exps_s);
++        g.cb(cur, "ffn_moe_out", il);
++    }
++    cur = ggml_add(g.ctx0, cur, ffn_inp);
++    g.cb(cur, "ffn_out", il);
++
++    cur = g.build_cvec(cur, il);
++    g.cb(cur, "l_out", il);
++
++    b.output("out", cur);
++    return b.finish();
++}
++
++static std::unique_ptr<llama_prefab_factor_module> prefab_compile_out(
++        const llama_model & model, const llm_graph_params & params, uint32_t n_env) {
++    prefab_module_builder b(params, { LLAMA_PREFAB_FACTOR_OUT, -1, n_env, 0 });
++    auto & g = *b.g;
++
++    ggml_tensor * cur = b.input("inpL", GGML_TYPE_F32, g.n_embd, n_env);
++
++    cur = g.build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
++    g.cb(cur, "result_norm", -1);
++    b.output("embd", cur);
++
++    cur = g.build_lora_mm(model.output, cur, model.output_s);
++    g.cb(cur, "result_output", -1);
++    b.output("logits", cur);
++    return b.finish();
++}
++
++#include <set>
++
++//
++// Shared-node compose (GGML_TP5_PREFAB_NOCLONE, exact "1"): the factor's DAG is bound into
++// the envelope graph IN PLACE — no tensor is re-instantiated per splice (n_factor_clones
++// stays 0). This generalizes the MTP shared-node pattern (llama-prefab-mtp.cpp:284-344)
++// to a chain of cached factors:
++//
++//   - rewiring, not substitution: a compiled module's nodes read its own formal placeholders.
++//     On the first in-place splice the (node, src-slot) wire points referencing each
++//     placeholder are recorded on the module (llama_prefab_factor_module::wiring); every
++//     splice then rewrites exactly those points to the current actuals, unconditionally —
++//     never by comparing against the previous actual. This is what makes rebinding correct
++//     when an actual changes between builds (per-build KV mask/views, the envelope's
++//     out_ids gather, an ATTN factor recompiled for a new pad width): after the first
++//     splice the srcs hold the previous actuals, which a placeholder comparison could no
++//     longer find, and a stale src would silently wire the wrong tensor.
++//   - the placeholders never enter the envelope graph: after the rewire nothing references
++//     them, so the envelope's scheduler never plans them; the envelope's own input tensors
++//     (created by the caller exactly as on the clone path) are what the rewired nodes read.
++//   - stale allocations: after a rebuild the module-owned tensors carry data/buffer
++//     pointers from the previous plan. The release pass below clears exactly those (test
++//     by context range, like the MTP release; weights and upstream factor tensors are not
++//     ours and are not at risk — their own module releases them), so the envelope's
++//     scheduler plans them afresh as graph tensors; leaving them set would make the
++//     planner treat them as external and hand out overlapping allocations.
++//   - node order: the module's nodes are expanded in the module's emission order — the
++//     same order the clone path expands its clones in — so the composed graph's node
++//     sequence and every descriptor byte match the clone path.
++//   - safety: at most one live envelope graph references a module (one slot per width;
++//     the rebuild sites drain in-flight work and destroy the old graph first — the
++//     sync_pending gates at the rebuild branches cover the factor mode as well), and the
++//     modules die with the cache (topology change, release_compute) only after the graphs
++//     referencing them are gone.
++//
++
++static void prefab_factor_release_owned(const llama_prefab_factor_module & mod) {
++    std::set<const ggml_tensor *> visited;
++    std::function<void(ggml_tensor *)> visit = [&](ggml_tensor * t) {
++        // ownership test on the pointer value only; a stale src pointer (previous
++        // envelope) is never dereferenced — non-module tensors stop the walk
++        if (t == nullptr || visited.count(t) != 0 || !mod.owns(t)) {
++            return;
++        }
++        visited.insert(t);
++        t->data = nullptr;
++        t->buffer = nullptr;
++        for (int i = 0; i < GGML_MAX_SRC; ++i) {
++            visit(t->src[i]);
++        }
++        if (t->view_src != nullptr) {
++            visit(t->view_src);
++        }
++    };
++    ggml_cgraph * gf = mod.res->get_gf();
++    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
++        visit(ggml_graph_node(gf, i));
++    }
++    for (const auto & kv : mod.inputs) {
++        visit(kv.second);
++    }
++}
++
++static std::map<std::string, ggml_tensor *> prefab_splice_shared(
++        llm_graph_context & dst,
++        llama_prefab_factor_module & mod,
++        const std::map<std::string, ggml_tensor *> & subs,
++        llama_prefab_stats & stats) {
++    // 1. validate exactly like the clone kernel: fail closed on an unbound input or a
++    // layout mismatch — the rewired nodes would otherwise read malformed bindings.
++    for (const auto & [name, ph] : mod.inputs) {
++        auto it = subs.find(name);
++        if (it == subs.end() || it->second == nullptr) {
++            throw std::runtime_error("factor-prefab: unbound factor input '" + name + "'");
++        }
++        ggml_tensor * t = it->second;
++        bool same = t->type == ph->type;
++        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++            same = same && t->ne[i] == ph->ne[i] && t->nb[i] == ph->nb[i];
++        }
++        if (!same) {
++            throw std::runtime_error("factor-prefab: layout mismatch for factor input '" + name + "'");
++        }
++    }
++    for (const auto & [name, t] : subs) {
++        if (t != nullptr && mod.inputs.find(name) == mod.inputs.end()) {
++            throw std::runtime_error("factor-prefab: substitution for unknown factor input '" + name + "'");
++        }
++    }
++
++    // 2. record the wire points once; the module's DAG is fixed after compile, so the
++    // record stays valid for the module's lifetime. The walk never dereferences a
++    // non-module tensor (weights cannot reference the module's placeholders).
++    if (mod.wiring.empty()) {
++        std::set<const ggml_tensor *> seen;
++        std::function<void(ggml_tensor *)> record = [&](ggml_tensor * t) {
++            if (t == nullptr || !mod.owns(t) || seen.count(t) != 0) {
++                return;
++            }
++            seen.insert(t);
++            for (int i = 0; i < GGML_MAX_SRC; ++i) {
++                ggml_tensor * s = t->src[i];
++                if (s == nullptr) {
++                    continue;
++                }
++                for (const auto & [name, ph] : mod.inputs) {
++                    if (s == ph) {
++                        mod.wiring[ph].push_back({ t, i });
++                        break;
++                    }
++                }
++                record(s);
++            }
++            if (t->view_src != nullptr) {
++                for (const auto & [name, ph] : mod.inputs) {
++                    if (t->view_src == ph) {
++                        mod.wiring[ph].push_back({ t, -1 }); // -1 marks the view_src slot
++                        break;
++                    }
++                }
++                record(t->view_src);
++            }
++        };
++        ggml_cgraph * gf = mod.res->get_gf();
++        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
++            record(ggml_graph_node(gf, i));
++        }
++    }
++
++    // 3. rewire the recorded points to the current actuals — unconditional, so changed
++    // actuals rebind correctly on every rebuild.
++    for (const auto & [name, actual] : subs) {
++        const auto ph_it = mod.inputs.find(name);
++        if (ph_it == mod.inputs.end()) {
++            continue;
++        }
++        const auto wires = mod.wiring.find(ph_it->second);
++        if (wires == mod.wiring.end()) {
++            continue;
++        }
++        for (const auto & [node, slot] : wires->second) {
++            if (slot < 0) {
++                node->view_src = actual;
++            } else {
++                node->src[slot] = actual;
++            }
++        }
++    }
++
++    // 4. release the module's stale plan pointers so this envelope's scheduler re-plans
++    // the shared tensors as graph tensors (fresh allocations cannot overlap them).
++    prefab_factor_release_owned(mod);
++
++    // 5. bind in place: the module's nodes enter the envelope graph in the module's
++    // emission order — the same order the clone path expands its clones in.
++    ggml_cgraph * gf = mod.res->get_gf();
++    const int n_nodes = ggml_graph_n_nodes(gf);
++    for (int i = 0; i < n_nodes; ++i) {
++        ggml_build_forward_expand(dst.gf, ggml_graph_node(gf, i));
++    }
++
++    llama_prefab_stat_tick(stats.n_factor_splices);
++    return mod.outputs;   // the resident tensors: the next factor reads them in place
++}
++
++// splice: bind the factor's DAG into the envelope context (GGML_TP5_PREFAB_NOCLONE=1) or
++// clone it per envelope build (default, byte-identical to the pre-noclone splice)
++
++static std::map<std::string, ggml_tensor *> prefab_splice_clone(
++        llm_graph_context & dst,
++        const llama_prefab_factor_module & mod,
++        const std::map<std::string, ggml_tensor *> & subs,
++        llama_prefab_stats & stats);
++
++static std::map<std::string, ggml_tensor *> prefab_splice(
++        llm_graph_context & dst,
++        llama_prefab_factor_module & mod,
++        const std::map<std::string, ggml_tensor *> & subs,
++        llama_prefab_stats & stats) {
++    if (llama_prefab_noclone_enabled()) {
++        return prefab_splice_shared(dst, mod, subs, stats);
++    }
++    return prefab_splice_clone(dst, mod, subs, stats);
++}
++
++// clone splice (the r7 path, byte-identical with the gate off): the factor's DAG is
++// re-instantiated node-by-node into the envelope context; weights, KV cache storage and
++// adapter tensors are shared by pointer, never cloned.
++static std::map<std::string, ggml_tensor *> prefab_splice_clone(
++        llm_graph_context & dst,
++        const llama_prefab_factor_module & mod,
++        const std::map<std::string, ggml_tensor *> & subs,
++        llama_prefab_stats & stats) {
++    std::unordered_map<const ggml_tensor *, ggml_tensor *> map;
++
++    for (const auto & [name, ph] : mod.inputs) {
++        auto it = subs.find(name);
++        if (it == subs.end() || it->second == nullptr) {
++            throw std::runtime_error("factor-prefab: unbound factor input '" + name + "'");
++        }
++        ggml_tensor * t = it->second;
++        bool same = t->type == ph->type;
++        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++            same = same && t->ne[i] == ph->ne[i] && t->nb[i] == ph->nb[i];
++        }
++        if (!same) {
++            throw std::runtime_error("factor-prefab: layout mismatch for factor input '" + name + "'");
++        }
++        map[ph] = t;
++    }
++    for (const auto & [name, t] : subs) {
++        if (t != nullptr && mod.inputs.find(name) == mod.inputs.end()) {
++            throw std::runtime_error("factor-prefab: substitution for unknown factor input '" + name + "'");
++        }
++    }
++
++    std::function<ggml_tensor * (ggml_tensor *)> clone = [&](ggml_tensor * src) -> ggml_tensor * {
++        if (src == nullptr) {
++            return nullptr;
++        }
++        auto it = map.find(src);
++        if (it != map.end()) {
++            return it->second;
++        }
++        if (!mod.owns(src)) {
++            // weights, KV cache storage, adapter tensors: shared, never cloned
++            map[src] = src;
++            return src;
++        }
++        if (src->op == GGML_OP_NONE && src->view_src == nullptr) {
++            throw std::runtime_error(std::string("factor-prefab: factor leaf '") + src->name + "' is not a formal input");
++        }
++
++        ggml_tensor * t = ggml_new_tensor(dst.ctx0, src->type, GGML_MAX_DIMS, src->ne);
++        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++            t->nb[i] = src->nb[i];
++        }
++        t->op    = src->op;
++        t->flags = src->flags;
++        memcpy(t->op_params, src->op_params, sizeof(t->op_params));
++        ggml_set_name(t, src->name);
++
++        for (int i = 0; i < GGML_MAX_SRC; ++i) {
++            t->src[i] = clone(src->src[i]);
++        }
++        if (src->view_src != nullptr) {
++            t->view_src  = clone(src->view_src);
++            t->view_offs = src->view_offs;
++            if (t->view_src->data != nullptr) {
++                t->data = (char *) t->view_src->data + t->view_offs;
++            }
++        }
++
++        map[src] = t;
++        llama_prefab_stat_tick(stats.n_factor_clones);
++        return t;
++    };
++
++    const int n_nodes = ggml_graph_n_nodes(mod.res->get_gf());
++    for (int i = 0; i < n_nodes; ++i) {
++        ggml_build_forward_expand(dst.gf, clone(ggml_graph_node(mod.res->get_gf(), i)));
++    }
++
++    std::map<std::string, ggml_tensor *> outs;
++    for (const auto & [name, t] : mod.outputs) {
++        outs[name] = clone(t);
++    }
++    llama_prefab_stat_tick(stats.n_factor_splices);
++    return outs;
++}
++
++//
++// envelope composition
++//
++
++static llama_prefab_topology_key prefab_make_key(const llama_model & model, const llm_graph_params & params) {
++    const auto * kvc = static_cast<const llama_kv_cache_context *>(params.mctx);
++    const llama_kv_cache * kv = kvc->get_kv_cache();
++
++    llama_prefab_topology_key k;
++    k.model      = &model;
++    k.memory     = kv;
++    k.arch       = (int32_t) model.arch;
++    k.n_embd     = params.hparams.n_embd;
++    k.n_layer    = params.hparams.n_layer();
++    k.n_head     = params.hparams.n_head();
++    k.n_head_kv  = params.hparams.n_head_kv();
++    k.kv_size    = kv->get_size();
++    // a filtered cache (an MTP context holds only its nextn layer(s)) has no entry for
++    // global layer 0; take the storage type of a layer this cache actually maps
++    const int32_t il_kv = kv->first_layer_id();
++    k.type_k     = (int32_t) kv->get_k_storage(il_kv)->type;
++    k.type_v     = kv->get_v_storage(il_kv) ? (int32_t) kv->get_v_storage(il_kv)->type : -1;
++    k.flash_attn = params.cparams.flash_attn;
++    k.v_trans    = kv->get_v_transposed();
++    k.causal     = params.cparams.causal_attn;
++    k.warmup     = params.cparams.warmup;
++    k.rope_freq_base  = params.cparams.rope_freq_base;
++    k.rope_freq_scale = params.cparams.rope_freq_scale;
++    return k;
++}
++
++llama_prefab_topology_key llama_prefab_key_for(const llama_model & model, const llm_graph_params & params) {
++    return prefab_make_key(model, params);
++}
++
++ggml_cgraph * llama_prefab_compose(
++        const llama_model & model,
++        const llm_graph_params & params,
++        uint32_t n_env,
++        llama_prefab_state & st,
++        llama_prefab_stats & stats) {
++    GGML_ASSERT(params.ubatch.n_tokens == n_env);
++    GGML_ASSERT(params.n_outputs == n_env);
++
++    const auto * kvc = static_cast<const llama_kv_cache_context *>(params.mctx);
++    // n_kv is a RUNTIME parameter, not a recompile key: the ATTN factor and the envelope
++    // graph are compiled for a padded KV width (multiple of 1024, clamped to the cache
++    // size) that covers the current n_kv. While n_kv stays within the pad window, the
++    // cached factor and the envelope graph are reused as-is: the K/V views and kq_mask
++    // cover [0, n_kv_pad) and the pad columns are masked out by the prefab mask writer.
++    // When n_kv outgrows the window, the ATTN factor is recompiled for the new padded
++    // width (a new factor key); QKV/FFN/EMBD/OUT factors are unaffected (cache hits).
++    const uint32_t n_kv     = kvc->get_n_kv();
++    const uint32_t n_kv_pad = kvc->get_n_kv_pad();
++    GGML_ASSERT(n_kv_pad >= n_kv);
++
++    if (st.cache.validate_or_reset(prefab_make_key(model, params))) {
++        llama_prefab_stat_tick(stats.n_cache_resets);
++    }
++
++    llm_graph_params p = params;
++    p.cb = prefab_cb();
++    llm_graph_context g(p);
++
++    auto factor = [&](const llama_prefab_factor_key & key, auto && compile) -> llama_prefab_factor_module & {
++        auto it = st.cache.modules.find(key);
++        if (it != st.cache.modules.end()) {
++            llama_prefab_stat_tick(stats.n_factor_cache_hits);
++            return *it->second;
++        }
++        auto mod = compile();
++        llama_prefab_stat_tick(stats.n_factor_compiles);
++        auto & ref = *mod;
++        st.cache.modules[key] = std::move(mod);
++        return ref;
++    };
++
++    // --- envelope inputs (fixed width n_env, padded at set_input time from the real ubatch)
++    auto inp_tok = std::make_unique<llm_graph_input_prefab_tokens>(n_env);
++    inp_tok->tokens = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, n_env);
++    ggml_set_name(inp_tok->tokens, "inp_tokens");
++    ggml_set_input(inp_tok->tokens);
++    g.res->t_inp_tokens = inp_tok->tokens;
++    ggml_tensor * tokens = inp_tok->tokens;
++    g.res->add_input(std::move(inp_tok));
++
++    auto inp_pos_u = std::make_unique<llm_graph_input_prefab_pos>(n_env);
++    inp_pos_u->pos = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, n_env);
++    ggml_set_name(inp_pos_u->pos, "inp_pos");
++    ggml_set_input(inp_pos_u->pos);
++    ggml_tensor * inp_pos = inp_pos_u->pos;
++    g.res->add_input(std::move(inp_pos_u));
++
++    auto inp_attn_u = std::make_unique<llm_graph_input_prefab_attn_kv>(g.hparams, g.cparams, kvc, n_env, n_kv_pad, &st);
++    inp_attn_u->self_k_idxs = kvc->build_input_k_idxs(g.ctx0, g.ubatch);
++    inp_attn_u->self_v_idxs = kvc->build_input_v_idxs(g.ctx0, g.ubatch);
++    inp_attn_u->self_kq_mask = ggml_new_tensor_4d(g.ctx0, g.cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, n_kv_pad, n_env, 1, 1);
++    ggml_set_input(inp_attn_u->self_kq_mask);
++    ggml_set_name(inp_attn_u->self_kq_mask, "attn_inp_kq_mask");
++    inp_attn_u->self_kq_mask_cnv = inp_attn_u->self_kq_mask;
++    inp_attn_u->self_k_rot = kvc->build_input_k_rot(g.ctx0);
++    inp_attn_u->self_v_rot = kvc->build_input_v_rot(g.ctx0);
++    auto * inp_attn = (llm_graph_input_prefab_attn_kv *) g.res->add_input(std::move(inp_attn_u));
++
++    auto inp_out_u = std::make_unique<llm_graph_input_prefab_out_ids>(n_env);
++    inp_out_u->out_ids = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, n_env);
++    ggml_set_name(inp_out_u->out_ids, "inp_out_ids");
++    ggml_set_input(inp_out_u->out_ids);
++    ggml_tensor * out_ids = inp_out_u->out_ids;
++    g.res->add_input(std::move(inp_out_u));
++
++    // --- A: embedding factor
++    auto & f_embd = factor({ LLAMA_PREFAB_FACTOR_EMBD, -1, n_env, 0 }, [&]() { return prefab_compile_embd(model, p, n_env); });
++    ggml_tensor * inpL = prefab_splice(g, f_embd, { { "tokens", tokens } }, stats).at("inpL");
++    g.res->t_inp_embd = inpL;
++
++    // --- B: per-layer factors QKV(il) + ATTN(il, n_kv) + FFN(il)
++    for (int il = 0; il < g.n_layer; ++il) {
++        g.res->t_layer_inp[il] = inpL;
++
++        auto & f_qkv = factor({ LLAMA_PREFAB_FACTOR_QKV, il, n_env, 0 }, [&]() { return prefab_compile_qkv(model, p, il, n_env); });
++        auto qkv = prefab_splice(g, f_qkv, { { "inpL", inpL }, { "inp_pos", inp_pos } }, stats);
++
++        auto & f_attn = factor({ LLAMA_PREFAB_FACTOR_ATTN, il, n_env, n_kv_pad },
++                [&]() { return prefab_compile_attn(model, p, il, n_env, n_kv_pad, f_qkv); });
++        std::map<std::string, ggml_tensor *> attn_subs = {
++            { "q", qkv.at("q") }, { "k", qkv.at("k") }, { "v", qkv.at("v") },
++            { "k_idxs",  inp_attn->self_k_idxs },
++            { "v_idxs",  inp_attn->self_v_idxs },
++            { "kq_mask", inp_attn->self_kq_mask },
++        };
++        if (inp_attn->self_k_rot) attn_subs["k_rot"] = inp_attn->self_k_rot;
++        if (inp_attn->self_v_rot) attn_subs["v_rot"] = inp_attn->self_v_rot;
++        ggml_tensor * cur = prefab_splice(g, f_attn, attn_subs, stats).at("out");
++
++        ggml_tensor * inpSA = inpL;
++        if (il == g.n_layer - 1) {
++            // envelope out_ids: real outputs first, pad rows duplicate the last one
++            cur   = ggml_get_rows(g.ctx0,   cur, out_ids);
++            inpSA = ggml_get_rows(g.ctx0, inpSA, out_ids);
++        }
++
++        auto & f_ffn = factor({ LLAMA_PREFAB_FACTOR_FFN, il, n_env, 0 }, [&]() { return prefab_compile_ffn(model, p, il, n_env); });
++        inpL = prefab_splice(g, f_ffn, { { "cur", cur }, { "inpSA", inpSA } }, stats).at("out");
++    }
++
++    // --- output factor
++    auto & f_out = factor({ LLAMA_PREFAB_FACTOR_OUT, -1, n_env, 0 }, [&]() { return prefab_compile_out(model, p, n_env); });
++    auto outs = prefab_splice(g, f_out, { { "inpL", inpL } }, stats);
++
++    g.res->t_embd   = outs.at("embd");
++    g.res->t_logits = outs.at("logits");
++
++    ggml_build_forward_expand(g.gf, g.res->t_logits);
++    g.res->set_outputs(p);
++
++    llama_prefab_stat_tick(stats.n_envelope_builds);
++
++    return g.res->get_gf();
++}
++
++//
++// C API
++//
++// (implemented in llama-context.cpp, which owns the state)
++
++//
++// decouple interface (GGML_TP5_PREFAB_DECOUPLE=1)
++//
++// The eligibility layer (llama-context.cpp) calls these entry points with
++// explicit request values; this layer never reaches back into llama_context.
++// Gate off: these functions are never called (llama-context.cpp keeps the
++// legacy direct-coupling path), so behavior is byte-identical to baseline.
++//
++
++#include "../ggml/src/ggml-backend-moe-cache.h"
++
++bool llama_prefab_decouple_enabled() {
++    // enabled only by the exact string "1": unset, "0", "true", "01", "1 ", "2" all stay off
++    static const bool on = []() {
++        const char * s = getenv("GGML_TP5_PREFAB_DECOUPLE");
++        return s != nullptr && s[0] == '1' && s[1] == '\0';
++    }();
++    return on;
++}
++
++bool llama_prefab_state_init(llama_prefab_state & st, const llama_prefab_eligibility & elig) {
++    if (elig.envelopes.empty()) {
++        return false;
++    }
++    st = llama_prefab_state{};
++    st.envelopes = elig.envelopes;
++    st.slots.resize(elig.envelopes.size());
++    for (size_t i = 0; i < st.slots.size(); ++i) {
++        st.slots[i].n_env = elig.envelopes[i];
++    }
++    st.mtp_mode  = elig.mtp_mode;
++    return true;
++}
++
++// slot scheduler + graph-result attachment, decouple path: the eligibility
++// layer owns the backend list (llama_context::backend_ptrs/buft), the node
++// budget policy (llama_context::graph_max_nodes) and the slot result objects;
++// it creates them and hands ready handles to the compose layer. The moe-cache
++// probe is a pure query over (model, cparams, backends) with no llama_context
++// state, so the eligibility layer applies the same moe-cache settings it
++// applies to its own scheds. Backend ownership and device probing stay
++// entirely in the eligibility layer; the compose layer only sees ready
++// sched/result handles.
++
++void llama_prefab_attach_slot(llama_prefab_state & st, size_t slot_index,
++                              ggml_backend_sched_t sched, llm_graph_result * res) {
++    GGML_ASSERT(slot_index < st.slots.size());
++    GGML_ASSERT(sched != nullptr && res != nullptr);
++    auto & slot = st.slots[slot_index];
++    slot.sched.reset(sched);
++    slot.res.reset(res);
++    slot.built = false;
++}
++
++llama_prefab_reply llama_prefab_process(
++        llama_prefab_state & st,
++        llama_prefab_stats & stats,
++        const llama_model & model,
++        const llm_graph_params & params,
++        const llama_ubatch & ubatch,
++        llama_memory_context_i * mctx,
++        const llama_prefab_request & req,
++        const std::function<ggml_status(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched)> & compute) {
++    llama_prefab_reply rep;
++
++    // slot selection by explicit request values (no st.slot_for reach-in from A)
++    int is = -1;
++    for (size_t i = 0; i < st.slots.size(); ++i) {
++        if (req.n_tokens <= st.slots[i].n_env) {
++            is = (int) i;
++            break;
++        }
++    }
++    if (is < 0) {
++        llama_prefab_stat_tick(stats.n_decouple_declines);
++        return rep;
++    }
++    auto & slot = st.slots[is];
++    const uint32_t n_env = slot.n_env;
++
++    if (req.mtp_mode) {
++        // ---- whole-graph MTP mode: exact-fit slot only ----
++        if (n_env != req.n_tokens) {
++            llama_prefab_stat_tick(stats.n_decouple_declines);
++            return rep;
++        }
++    } else {
++        // ---- factor mode: scratch cell for sub-envelope padding ----
++        st.scratch_cell = -1;
++        if (req.n_tokens < n_env) {
++            const auto * kvc = dynamic_cast<const llama_kv_cache_context *>(mctx);
++            if (kvc == nullptr) {
++                llama_prefab_stat_tick(stats.n_decouple_declines);
++                return rep;
++            }
++            st.scratch_cell = kvc->prefab_scratch_cell();
++            if (st.scratch_cell < 0) {
++                llama_prefab_stat_tick(stats.n_fallback_no_scratch);
++                llama_prefab_stat_tick(stats.n_decouple_declines);
++                return rep;
++            }
++        }
++    }
++
++    // canonical ubatch: envelope shape, real data (envelope inputs read the real ubatch and pad)
++    llama_ubatch canon = ubatch;
++    if (!req.mtp_mode) {
++        canon.n_tokens     = n_env;
++        canon.n_seq_tokens = n_env;
++        canon.n_seqs       = 1;
++        canon.n_seqs_unq   = 1;
++        canon.b_equal_seqs = 0;
++    }
++
++    llm_graph_result * slot_res = slot.res.get();
++    if (slot_res == nullptr || slot.sched == nullptr) {
++        // slot not fully attached by the eligibility layer: decline, never crash
++        llama_prefab_stat_tick(stats.n_decouple_declines);
++        return rep;
++    }
++
++    auto gparams = llm_graph_params{
++        /*.arch        =*/model.arch,
++        /*.hparams     =*/model.hparams,
++        /*.cparams     =*/params.cparams,
++        /*.ubatch      =*/canon,
++        /*.gtype       =*/req.gtype,
++        /*.sched       =*/params.sched,
++        /*.backend_cpu =*/params.backend_cpu,
++        /*.cvec        =*/params.cvec,
++        /*.loras       =*/params.loras,
++        /*.mctx        =*/mctx,
++        /*.cross       =*/params.cross,
++        /*.samplers    =*/params.samplers,
++        /*.n_outputs   =*/req.mtp_mode ? params.n_outputs : n_env,
++        /*.cb          =*/params.cb,
++        /*.res         =*/slot_res,
++    };
++
++    const llama_prefab_topology_key key = llama_prefab_key_for(model, gparams);
++
++    ggml_cgraph * gf = nullptr;
++    bool gf_reused = false;
++    bool gf_composed = false;
++    bool composed_attempted = false;
++    bool n_kv_fits = true;
++    if (!req.mtp_mode) {
++        // n_kv is a runtime parameter: reuse the envelope graph while the current
++        // n_kv fits the padded KV width the graph was composed for
++        const auto * kvc = dynamic_cast<const llama_kv_cache_context *>(mctx);
++        n_kv_fits = kvc != nullptr && slot.n_kv_pad != 0 && kvc->n_kv_pad_fits(slot.n_kv_pad);
++    }
++
++    if (slot.built && !req.graph_reuse_disable && slot.key == key && n_kv_fits && slot_res->can_reuse(gparams)) {
++        gf = slot_res->get_gf();
++        gf_reused = true;
++        if (req.pipeline_parallel) {
++            ggml_backend_sched_synchronize(slot.sched.get());
++        }
++        llama_prefab_stat_tick(stats.n_envelope_reuses);
++        rep.reused = true;
++    } else {
++        if (llama_prefab_noclone_enabled()) {
++            // Shared-node compose (GGML_TP5_PREFAB_NOCLONE=1): the graph being replaced
++            // references the cached templates' tensors in place -- the MTP A template and,
++            // since the factor-lane extension, the cached factor modules as well. The reuse
++            // path above never reaches this branch, so the only live graph that references
++            // them is the one being replaced (one template set per envelope width, one slot
++            // per width). Drain every dispatched-but-unsynchronized sched BEFORE the old
++            // graph is destroyed and the shared allocation state is released, so the
++            // constraint is enforced here rather than assumed from synchronous dispatch.
++            st.sync_pending();
++        }
++        slot.built = false;
++        slot_res->reset();
++        ggml_backend_sched_reset(slot.sched.get());
++        ggml_backend_sched_set_eval_callback(slot.sched.get(), req.cb_eval, req.cb_eval_user_data);
++
++        {
++        llama_prefab_build_timer timer{stats, gf};
++        if (req.mtp_mode) {
++            // MTP factor compose (GGML_TP5_PREFAB_IN_GRAPH=1): the A x B envelope instead of
++            // the stock whole graph. Exact fit only; a declined ubatch falls back to the stock
++            // builder below, so gate off (or a declined ubatch) is the stock path.
++            if ((llama_prefab_in_graph_enabled() || llama_prefab_ab_enabled()) && req.n_tokens == n_env) {
++                composed_attempted = true;
++                try {
++                    gf = llama_prefab_mtp_compose(model, gparams, n_env, st, stats);
++                    gf_composed = gf != nullptr;
++                } catch (const std::exception & e) {
++                    // a declined ubatch, not a swallowed failure: logged and counted
++                    LLAMA_LOG_WARN("mtp factor compose declined: %s\n", e.what());
++                    gf = nullptr;
++                }
++                if (!gf) {
++                    llama_prefab_stat_tick(stats.n_mtp_declines);
++                }
++            }
++            if (!gf && composed_attempted) {
++                // the compose may have filled slot_res with a partial graph and inputs before it
++                // declined: rebuild the slot from scratch so the stock graph gets a clean result.
++                // Only after an attempt -- with the gate off the path is exactly the stock one.
++                slot_res->reset();
++                ggml_backend_sched_reset(slot.sched.get());
++                ggml_backend_sched_set_eval_callback(slot.sched.get(), req.cb_eval, req.cb_eval_user_data);
++            }
++            if (!gf) {
++                gf = model.build_graph(gparams);
++                llama_prefab_stat_tick(stats.n_stock_builds);
++            }
++            if (!gf) {
++                rep.handled = true;
++                rep.status  = GGML_STATUS_FAILED;
++                rep.result  = nullptr;
++                return rep;
++            }
++        } else {
++            try {
++                gf = llama_prefab_compose(model, gparams, n_env, st, stats);
++            } catch (const std::exception & e) {
++                LLAMA_LOG_ERROR("factor-prefab compose failed: %s\n", e.what());
++                gf = nullptr;
++            }
++            if (!gf) {
++                rep.handled = true;
++                rep.status  = GGML_STATUS_FAILED;
++                return rep;
++            }
++        }
++        }
++        if (!ggml_backend_sched_alloc_graph(slot.sched.get(), gf)) {
++            rep.handled = true;
++            rep.status  = GGML_STATUS_ALLOC_FAILED;
++            return rep;
++        }
++        llama_prefab_stat_tick(stats.n_envelope_allocs);
++        slot.built    = true;
++        slot.key      = key;
++        if (!req.mtp_mode) {
++            const auto * kvc = dynamic_cast<const llama_kv_cache_context *>(mctx);
++            slot.n_kv_pad = kvc ? kvc->get_n_kv_pad() : 0;
++        } else {
++            slot.n_kv_pad = 0;
++        }
++    }
++
++    if (req.nkv_obs && !req.mtp_mode) {
++        const auto * kvc = dynamic_cast<const llama_kv_cache_context *>(mctx);
++        if (kvc) {
++            fprintf(stderr, "prefab nkv: n_kv=%u n_kv_pad=%u decision=%s\n",
++                    kvc->get_n_kv(), slot.n_kv_pad, gf_reused ? "reuse" : "build");
++        }
++    }
++
++    llama_prefab_stat_tick(stats.n_ubatch_prefab);
++    llama_prefab_stat_tick(stats.n_decouple_handled);
++    if (req.n_tokens < n_env) {
++        llama_prefab_stat_tick(stats.n_sub_envelope);
++        llama_prefab_stat_add(stats.n_pad_rows, n_env - req.n_tokens);
++    }
++    if (llama_prefab_stats_enabled()) {
++        stats.last_n_env       = n_env;
++        stats.last_n_tokens    = req.n_tokens;
++        stats.last_graph_nodes = ggml_graph_n_nodes(gf);
++        stats.last_inp_tokens_ne0 = slot_res->get_inp_tokens() ? slot_res->get_inp_tokens()->ne[0] : 0;
++    }
++
++    // inputs take the REAL ubatch
++    slot_res->set_inputs(&ubatch);
++
++    st.active = slot.sched.get();
++    st.mark_pending(slot.sched.get());
++
++    const auto status = compute(gf, req.n_tokens > 1, slot.sched.get());
++    if (status != GGML_STATUS_SUCCESS) {
++        rep.handled = true;
++        rep.status  = status;
++        return rep;
++    }
++    if (gf_composed) {
++        llama_prefab_stat_tick(stats.n_mtp_compose_hits);
++    }
++
++    rep.handled = true;
++    rep.status  = GGML_STATUS_SUCCESS;
++    rep.result  = slot_res;
++    return rep;
++}
+diff --git a/src/llama-prefab.h b/src/llama-prefab.h
+new file mode 100644
+index 0000000..294788f
+--- /dev/null
++++ b/src/llama-prefab.h
+@@ -0,0 +1,350 @@
++#pragma once
++
++// factor-prefab: compose decoder graphs from independently compiled, cached factor modules
++// into fixed-width microbatch envelopes (default N = 1 / 4 / n_ubatch).
++//
++// Default OFF. Enabled only with LLAMA_PREFAB_ENABLE=1 *and* LLAMA_PREFAB_EXPERIMENTAL=1.
++//
++//   envelope   : a graph compiled for n_env rows; a ubatch with n_tokens <= n_env runs on it with
++//                runtime padding (pad rows write a scratch KV cell, mask rows replicate the last
++//                real row, out_ids select the real outputs first).
++//   factor     : an isolated sub-graph (EMBD / QKV(il) / ATTN(il) / FFN(il) / OUT) compiled once into
++//                its own ggml context with formal placeholder inputs, cached per (kind, il, n_env[, n_kv])
++//                and spliced into the envelope graph: default by clone + input substitution; with
++//                GGML_TP5_PREFAB_NOCLONE=1 (exact "1") the module's DAG is referenced in place --
++//                shared nodes/views, no per-splice clone (see llama-prefab.cpp / llama-prefab-mtp.cpp).
++//   ownership  : the factor cache lives in llama_context (no global state); it is validated against a
++//                topology key (model, memory, shapes, cache types, FA, warmup, ...) and reset on mismatch.
++
++#include "llama.h"
++#include "llama-graph.h"
++#include "llama-prefab-iface.h"
++#include "llama-prefab-hotpath.h"
++
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++
++#include <cstdint>
++#include <functional>
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++#include <chrono>
++
++struct llama_model;
++struct llama_kv_cache;
++class  llama_kv_cache_context;
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// per-context counters: see llama-prefab-hotpath.h (ggml-free seam: the POD
++// and the padded-KV reuse judgement of the whole-graph slot lane live there).
++
++LLAMA_API bool llama_prefab_is_enabled(const struct llama_context * ctx);
++LLAMA_API void llama_prefab_get_stats  (const struct llama_context * ctx, struct llama_prefab_stats * out);
++LLAMA_API void llama_prefab_reset_stats(struct llama_context * ctx);
++// number of cached factor modules currently owned by the context
++LLAMA_API size_t llama_prefab_n_cached_factors(const struct llama_context * ctx);
++
++#ifdef __cplusplus
++}
++#endif
++bool llama_prefab_mtp_lifetime_enabled();
++bool llama_prefab_stats_enabled();
++
++struct llama_prefab_build_timer {
++    llama_prefab_stats & stats;
++    ggml_cgraph *& graph;
++    bool enabled = llama_prefab_stats_enabled();
++    std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++    ~llama_prefab_build_timer() {
++        if (!enabled) return;
++        stats.build_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
++                std::chrono::steady_clock::now() - start).count();
++        if (graph) stats.n_nodes_built += ggml_graph_n_nodes(graph);
++    }
++};
++
++enum llama_prefab_factor_kind : int32_t {
++    LLAMA_PREFAB_FACTOR_EMBD = 0,
++    LLAMA_PREFAB_FACTOR_QKV  = 1,
++    LLAMA_PREFAB_FACTOR_ATTN = 2,
++    LLAMA_PREFAB_FACTOR_FFN  = 3,
++    LLAMA_PREFAB_FACTOR_OUT  = 4,
++};
++
++struct llama_prefab_factor_key {
++    int32_t  kind;
++    int32_t  il;
++    uint32_t n_env;
++    uint32_t n_kv; // only for ATTN: the padded KV width the factor is compiled for (multiple of 1024, >= n_kv)
++
++    bool operator<(const llama_prefab_factor_key & o) const {
++        if (kind  != o.kind)  return kind  < o.kind;
++        if (il    != o.il)    return il    < o.il;
++        if (n_env != o.n_env) return n_env < o.n_env;
++        return n_kv < o.n_kv;
++    }
++};
++
++// everything a cached factor module bakes in, besides (kind, il, n_env, n_kv).
++// note: n_kv is deliberately NOT part of this key - the ATTN factor is compiled for a padded
++// KV width and stays valid across n_kv changes within the pad window (see llama_prefab_compose)
++struct llama_prefab_topology_key {
++    const void * model  = nullptr;
++    const void * memory = nullptr;
++    int32_t  arch       = -1;
++    uint32_t n_embd     = 0;
++    uint32_t n_layer    = 0;
++    uint32_t n_head     = 0;
++    uint32_t n_head_kv  = 0;
++    uint32_t kv_size    = 0;
++    int32_t  type_k     = -1;
++    int32_t  type_v     = -1;
++    bool     flash_attn = false;
++    bool     v_trans    = false;
++    bool     causal     = true;
++    bool     warmup     = false;
++    float    rope_freq_base  = 0.0f;
++    float    rope_freq_scale = 0.0f;
++
++    bool operator==(const llama_prefab_topology_key & o) const;
++    bool operator!=(const llama_prefab_topology_key & o) const { return !(*this == o); }
++};
++
++// an isolated, compiled sub-graph with formal (placeholder) inputs and named outputs
++struct llama_prefab_factor_module {
++    llama_prefab_factor_key key = {};
++
++    std::unique_ptr<llm_graph_result> res; // owns the ggml context + cgraph of the factor
++
++    std::map<std::string, ggml_tensor *> inputs;  // formal placeholders (op == NONE, never allocated)
++    std::map<std::string, ggml_tensor *> outputs; // block_in / res_hc / inject
++
++    bool owns(const ggml_tensor * t) const;
++
++    // Shared-node compose (GGML_TP5_PREFAB_NOCLONE, exact "1"): for every formal input, the
++    // (node, src-slot) wire points of this module's DAG that reference its placeholder,
++    // recorded on the first in-place splice. Every later in-place splice rewrites exactly
++    // these points to the current actuals — unconditionally, never by comparing against the
++    // previous actual — so variable bindings (the per-build KV mask/views, the envelope's
++    // out_ids gather, an ATTN factor recompiled for a new pad width) rebind correctly and
++    // no stale src survives a rebuild. Placeholders are module-owned and never scheduled:
++    // after the rewire nothing in the envelope graph references them.
++    std::map<const ggml_tensor *, std::vector<std::pair<ggml_tensor *, int>>> wiring;
++
++};
++
++// owned by llama_context; dies with it (and is cleared on release_compute / topology change)
++struct llama_prefab_factor_cache {
++    bool has_key = false;
++    llama_prefab_topology_key key;
++
++    std::map<llama_prefab_factor_key, std::unique_ptr<llama_prefab_factor_module>> modules;
++
++    // returns true if the cache was reset
++    bool validate_or_reset(const llama_prefab_topology_key & k);
++    void clear();
++};
++
++struct llama_prefab_slot {
++    uint32_t n_env = 0;
++
++    std::unique_ptr<llm_graph_result> res;
++    ggml_backend_sched_ptr            sched;
++
++    bool     built = false;
++    // padded KV width the envelope graph was composed for (n_kv is a runtime parameter:
++    // the graph is reused while n_kv fits this width, recomposed when it outgrows it)
++    uint32_t n_kv_pad = 0;
++    llama_prefab_topology_key key;
++};
++
++// one cached A part (head prologue) of the MTP factor compose. A is captured by running
++// graph_mtp::build_mtp_prologue() into its own graph and keeping the node prefix that produces
++// llm_graph_result::t_prefab_cut / t_prefab_cut_res / t_prefab_cut_inject; its formal inputs are
++// the head input tensors.
++struct llama_prefab_mtp_a_module {
++    std::unique_ptr<llm_graph_result> res; // owns the ggml context + cgraph of A
++
++    std::map<std::string, ggml_tensor *> inputs;  // formal placeholders (op == NONE)
++    std::map<std::string, ggml_tensor *> outputs; // block_in / res_hc / inject
++
++    int n_a = 0; // number of prologue nodes in res's graph
++};
++
++// per-context cache of the A parts; validated against the model pointer and n_env
++struct llama_prefab_mtp_a_cache {
++    std::map<std::pair<const void *, uint32_t>, std::unique_ptr<llama_prefab_mtp_a_module>> modules;
++
++    llama_prefab_mtp_a_module * get(const llama_model & model, uint32_t n_env);
++    void clear();
++};
++
++struct llama_prefab_state {
++    std::vector<uint32_t>          envelopes; // ascending, last == max
++    std::vector<llama_prefab_slot> slots;     // one per envelope
++    llama_prefab_factor_cache      cache;
++
++    ggml_backend_sched_t active = nullptr; // sched of the last executed envelope graph
++    std::vector<ggml_backend_sched_t> pending; // envelope scheds with work not yet synchronized
++
++    // pad bookkeeping for the current ubatch (consumed by the envelope inputs at set_input time)
++    int64_t scratch_cell = -1;
++
++    // whole-graph MTP mode (LLAMA_PREFAB_MTP): slots hold stock-built DECODER_MTP graphs
++    // (e.g. qwen4exp graph_mtp) instead of composed factor envelopes; see llama-context.cpp
++    bool mtp_mode = false;
++
++    // MTP factor compose (GGML_TP5_PREFAB_IN_GRAPH=1): cached A parts (head prologue) of the
++    // qwen4exp DECODER_MTP head, keyed by (model, n_env). Empty unless the gate is on.
++    llama_prefab_mtp_a_cache mtp_a;
++
++    int slot_for(uint32_t n_tokens) const; // -1 if none
++    void sync_pending(); // wait for every envelope sched that has unsynchronized work
++    void mark_pending(ggml_backend_sched_t s); // record a sched whose graph was just dispatched
++    void reset_slots(); // drop envelope graphs (keeps factor cache), after sync_pending()
++};
++
++llama_prefab_topology_key llama_prefab_key_for(const llama_model & model, const llm_graph_params & params);
++
++// Compose the envelope graph for params (params.ubatch.n_tokens == n_env, params.res == slot result).
++// Returns nullptr on failure.
++ggml_cgraph * llama_prefab_compose(
++        const llama_model & model,
++        const llm_graph_params & params,
++        uint32_t n_env,
++        llama_prefab_state & st,
++        llama_prefab_stats & stats);
++
++// ---- decouple interface (GGML_TP5_PREFAB_DECOUPLE=1) ----
++// See llama-prefab-iface.h (gate fn declared there). These entry points are
++// the gate-on path: the eligibility layer (llama-context.cpp) calls them with
++// explicit request values instead of reading/writing llama_prefab_state
++// internals.
++
++// initialize B's state from explicit eligibility facts (envelope widths,
++// mtp_mode). Returns false if the envelope set is empty (caller must not
++// enable prefab).
++bool llama_prefab_state_init(llama_prefab_state & st, const llama_prefab_eligibility & elig);
++
++// process one ubatch through the compose layer. All facts arrive as values in
++// `req`; the reply says whether B handled it. `compute` is B's only way to run
++// the graph (B never calls llama_context methods directly).
++llama_prefab_reply llama_prefab_process(
++        llama_prefab_state & st,
++        llama_prefab_stats & stats,
++        const llama_model & model,
++        const llm_graph_params & params,
++        const llama_ubatch & ubatch,
++        llama_memory_context_i * mctx,
++        const llama_prefab_request & req,
++        const std::function<ggml_status(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched)> & compute);
++
++// attach a ready-made scheduler and graph-result to a slot (decouple path):
++// the eligibility layer owns the backend list, the node budget policy
++// (graph_max_nodes) and the slot result objects; the compose layer only
++// receives ready handles. Takes ownership of both.
++void llama_prefab_attach_slot(llama_prefab_state & st, size_t slot_index,
++                              ggml_backend_sched_t sched, llm_graph_result * res);
++
++// Input classes of an envelope graph. They read the *real* ubatch (n_tokens <= n_env) and pad.
++// (llm_graph_input_i is not modified: only the existing virtuals are overridden.)
++class llm_graph_input_prefab_tokens : public llm_graph_input_i {
++public:
++    explicit llm_graph_input_prefab_tokens(uint32_t n_env) : n_env(n_env) {}
++    void set_input(const llama_ubatch * ubatch) override;
++    bool can_reuse(const llm_graph_params & params) override;
++
++    ggml_tensor * tokens = nullptr; // I32 [n_env]
++    const uint32_t n_env;
++};
++
++class llm_graph_input_prefab_pos : public llm_graph_input_i {
++public:
++    explicit llm_graph_input_prefab_pos(uint32_t n_env) : n_env(n_env) {}
++    void set_input(const llama_ubatch * ubatch) override;
++    bool can_reuse(const llm_graph_params & params) override;
++
++    ggml_tensor * pos = nullptr; // I32 [n_env]
++    const uint32_t n_env;
++};
++
++class llm_graph_input_prefab_out_ids : public llm_graph_input_i {
++public:
++    explicit llm_graph_input_prefab_out_ids(uint32_t n_env) : n_env(n_env) {}
++    void set_input(const llama_ubatch * ubatch) override;
++    bool can_reuse(const llm_graph_params & params) override;
++
++    ggml_tensor * out_ids = nullptr; // I32 [n_env]: real outputs first, then padding
++    const uint32_t n_env;
++};
++
++class llm_graph_input_prefab_attn_kv : public llm_graph_input_attn_kv {
++public:
++    llm_graph_input_prefab_attn_kv(
++            const llama_hparams & hparams,
++            const llama_cparams & cparams,
++            const llama_kv_cache_context * mctx,
++            uint32_t n_env,
++            uint32_t n_kv_pad,
++            const llama_prefab_state * st) :
++        llm_graph_input_attn_kv(hparams, cparams, mctx), n_env(n_env), st(st) {
++        this->n_kv_pad = n_kv_pad;
++    }
++
++    void set_input(const llama_ubatch * ubatch) override;
++    // n_kv is a runtime parameter: reuse the graph while the live n_kv fits the padded
++    // KV width (the mask/K/V-view width). The inherited can_reuse compares the mask
++    // width against the exact n_kv and would force a rebuild on every 256-boundary.
++    bool can_reuse(const llm_graph_params & params) override;
++
++    const uint32_t n_env;
++    const llama_prefab_state * st;
++};
++
++// free-function probe (no new virtuals on llm_graph_input_i): is this input an envelope input?
++bool llm_graph_input_is_prefab(const llm_graph_input_i * inp);
++
++// ---- MTP factor compose (GGML_TP5_PREFAB_IN_GRAPH=1) ----
++//
++//   A: the head prologue -- token embedding, hnorm/enorm normalisation, eh_proj, the HC mix
++//      that produces the block input. Depends only on the head inputs and the head weights,
++//      so it is built once per (model, n_env). Default: cloned into every envelope. With
++//      GGML_TP5_PREFAB_NOCLONE=1 the composed graph references A's tensors in place instead
++//      (shared nodes/views, no per-compose clone).
++//   B: the trunk-style block -- QKV, IMRoPE, dense attention, output gate, wo, HC combine,
++//      MoE FFN, HC combine -- plus the head epilogue (h_nextn export, head mixer, LM head).
++//      Built per envelope because it binds the KV cache context of the running context.
++// Both parts are emitted by the same code that builds the stock graph (qwen4exp
++// graph_mtp::build_mtp_prologue / build_mtp_block), so the composed graph is node-for-node the
++// stock graph: A is built once per envelope width, B runs in every envelope on top of it.
++//
++// The gate is exact "1" (llama_prefab_in_graph_enabled). Off: these functions are never
++// called and the MTP slot keeps the whole-graph cache path (byte-identical to baseline).
++
++// true only for the exact string "1" of GGML_TP5_PREFAB_IN_GRAPH
++bool llama_prefab_in_graph_enabled();
++
++// node budget of a cached A module (the head prologue is a few dozen nodes)
++static constexpr int64_t PREFAB_MTP_A_MAX_NODES = 512;
++
++// r8 shared-node A x B compose: true only for the exact string "1" of GGML_TP5_PREFAB_NOCLONE.
++// Set together with the compose lane (GGML_TP5_PREFAB_IN_GRAPH=1 or GGML_TP5_PREFAB_AB=1) it
++// makes every A x B compose reference the cached A template's tensors in place: the envelope's
++// input writer feeds A's formal input tensors and B is emitted directly on A's resident cut
++// tensors, so no A-owned tensor is ever re-instantiated (n_mtp_a_clones stays 0). Off: the
++// clone splice runs exactly as before.
++bool llama_prefab_noclone_enabled();
++// Compose the DECODER_MTP envelope graph for params (params.ubatch.n_tokens == n_env,
++// params.res == slot result). Uses/refills st.mtp_a. Returns nullptr on failure.
++
++ggml_cgraph * llama_prefab_mtp_compose(
++        const llama_model & model,
++        const llm_graph_params & params,
++        uint32_t n_env,
++        llama_prefab_state & st,
++        llama_prefab_stats & stats);
+diff --git a/src/models/models.h b/src/models/models.h
+index cad93a5..f1d5a8c 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2346,6 +2346,24 @@ struct llama_model_qwen4exp : public llama_model_base {
+     // LLM_GRAPH_TYPE_DECODER_MTP draft head: one HC-wrapped dense-attention + MoE block
+     struct graph_mtp : public graph {
+         graph_mtp(const llama_model & model, const llm_graph_params & params);
++
++        // binds the members without running either head half: the caller drives
++        // build_mtp_prologue() / build_mtp_block() itself (factor-prefab compose). The stock
++        // ctor is this ctor followed by both halves in order.
++        struct no_build_t {};
++        graph_mtp(const llama_model & model, const llm_graph_params & params, no_build_t) :
++            graph(model, params, graph::no_build_t{}) {}
++
++        // The head in two halves. The prologue (A) depends only on the head inputs and the head
++        // weights and returns the block input; its three outputs (block input, HC residual
++        // stream, hc_attn scatter weights) are also recorded in llm_graph_result::t_prefab_cut /
++        // t_prefab_cut_res / t_prefab_cut_inject. The block + epilogue (B) binds the
++        // KV/pos/out_ids inputs of the graph it runs in. The factor-prefab compose layer
++        // (src/llama-prefab-mtp.cpp) builds A once and runs only B in each envelope; the stock
++        // ctor runs both in order.
++        ggml_tensor * build_mtp_prologue();
++        ggml_tensor * build_mtp_block(ggml_tensor * block_in, ggml_tensor * res_in, ggml_tensor * inject_in,
++                                      llm_graph_input_attn_kv * inp_attn_ext = nullptr);
+     };
+ 
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 78b58ee..34c7581 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -661,7 +661,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+ // either way. The indexer tensors are still loaded so the GGUF stays complete.
+ // TODO: wire up QSA here for long-context draft fidelity.
+ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
+-    graph(model, params, no_build_t{}) {
++    graph_mtp(model, params, no_build_t{}) {
++    // The head is two halves so the factor-prefab compose layer can build the prologue once and
++    // splice it into every envelope (see llama-prefab-mtp.cpp). Stock path: both halves in order.
++    ggml_tensor * block_in = build_mtp_prologue();
++    build_mtp_block(block_in, res->t_prefab_cut_res, res->t_prefab_cut_inject);
++}
++
++ggml_tensor * llama_model_qwen4exp::graph_mtp::build_mtp_prologue() {
+     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
+     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP currently only supports a single MTP block");
+     GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
+@@ -676,20 +683,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+     GGML_ASSERT(layer.nextn.eh_proj     && "MTP block missing nextn.eh_proj");
+     GGML_ASSERT(layer.nextn.enorm       && "MTP block missing nextn.enorm");
+     GGML_ASSERT(layer.nextn.hnorm       && "MTP block missing nextn.hnorm");
+-    // The MTP head's final mixer is normally the trunk's own output_hc_* (model.hc_head_*):
+-    // upstream trains one hc mixer, shared between the trunk's last layer and the draft head.
+-    // A draft-only export has no trunk to share with, so it carries its own
+-    // blk.N.nextn.hc_head_* instead. Prefer that when it is there, the same way the LM head
+-    // is chosen further down. Without this an MTP-only file loads (trunk_flags makes the
+-    // trunk mixer optional for it) and then aborts here.
+-    ggml_tensor * mtp_hc_norm = layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm;
+-    ggml_tensor * mtp_hc_down = layer.nextn.hc_head_down ? layer.nextn.hc_head_down : model.hc_head_down;
+-    ggml_tensor * mtp_hc_up   = layer.nextn.hc_head_up   ? layer.nextn.hc_head_up   : model.hc_head_up;
+-    GGML_ASSERT(mtp_hc_norm && "QWEN4EXP MTP: no output mixer (neither nextn.hc_head_norm nor model.hc_head_norm)");
+-
+-    int sections[4];
+-    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+ 
++    // ---- head prologue (A) -------------------------------------------------------------
++    // The prologue depends only on the head inputs and the head weights, so the factor-prefab
++    // compose layer builds it once into its own graph and splices that graph into every envelope.
++    // This builder always emits it; the block input it produces is recorded in t_prefab_cut,
++    // which is where the compose layer cuts A from B.
+     auto inp = std::make_unique<llm_graph_input_embd_h>(hc_dim);
+ 
+     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+@@ -718,11 +717,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+ 
+     res->add_input(std::move(inp));
+ 
+-    ggml_tensor * inp_pos     = build_inp_pos();
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+-
+-    auto * inp_attn = build_attn_inp_kv();
+-
+     // grouped RMSNorm over the wide stream: normalise each hc stream, then scale the flattened
+     // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
+     ggml_tensor * h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
+@@ -757,6 +751,62 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+             layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject,
+             &inject, il);
+     cb(cur, "mtp_hc_attn_pre", il);
++    GGML_ASSERT(inject != nullptr && "QWEN4EXP MTP: hc_attn mix produced no inject");
++
++    // the cut point between A (cached prologue) and B (block + epilogue). A has three outputs,
++    // all consumed by B: the block input `cur`, the HC residual stream `res_hc` that the first
++    // combine folds the block output into, and the scatter weights `inject` that combine uses.
++    res->t_prefab_cut       = cur;
++    res->t_prefab_cut_res   = res_hc;
++    res->t_prefab_cut_inject = inject;
++    return cur;
++}
++
++ggml_tensor * llama_model_qwen4exp::graph_mtp::build_mtp_block(
++        ggml_tensor * block_in,
++        ggml_tensor * res_in,
++        ggml_tensor * inject_in,
++        llm_graph_input_attn_kv * inp_attn_ext) {
++    GGML_ASSERT(block_in != nullptr && "QWEN4EXP MTP: missing block input");
++    GGML_ASSERT(res_in != nullptr && "QWEN4EXP MTP: missing block residual");
++    GGML_ASSERT(inject_in != nullptr && "QWEN4EXP MTP: missing block inject");
++
++    const int64_t hc     = hparams.dsv4_hc_mult;
++    const int64_t hc_dim = hc * n_embd;
++    GGML_ASSERT(hparams.n_embd_out() == (uint32_t) hc_dim && "QWEN4EXP MTP hidden width mismatch");
++
++    const int il = hparams.n_layer();
++    const auto & layer = model.layers[il];
++
++    // The MTP head's final mixer is normally the trunk's own output_hc_* (model.hc_head_*):
++    // upstream trains one hc mixer, shared between the trunk's last layer and the draft head.
++    // A draft-only export has no trunk to share with, so it carries its own
++    // blk.N.nextn.hc_head_* instead. Prefer that when it is there, the same way the LM head
++    // is chosen further down. Without this an MTP-only file loads (trunk_flags makes the
++    // trunk mixer optional for it) and then aborts here.
++    ggml_tensor * mtp_hc_norm = layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm;
++    ggml_tensor * mtp_hc_down = layer.nextn.hc_head_down ? layer.nextn.hc_head_down : model.hc_head_down;
++    ggml_tensor * mtp_hc_up   = layer.nextn.hc_head_up   ? layer.nextn.hc_head_up   : model.hc_head_up;
++    GGML_ASSERT(mtp_hc_norm && "QWEN4EXP MTP: no output mixer (neither nextn.hc_head_norm nor model.hc_head_norm)");
++
++    int sections[4];
++    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
++
++    // B binds the inputs of the graph it runs in: the stock head's own ones, or (compose path)
++    // the envelope's exact-width pos / out_ids / KV inputs.
++    ggml_tensor * inp_pos     = build_inp_pos();
++    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    // compose path: an external attn input carries the padded KV window the
++    // whole-graph slot was composed for (n_kv is a runtime parameter there);
++    // the stock head builds its own exact-width input.
++    auto * inp_attn = inp_attn_ext ? inp_attn_ext : build_attn_inp_kv();
++
++    // the prologue hands over the block input, the HC residual stream the first combine folds
++    // the block output into, and the scatter weights that combine uses. The FFN mix below
++    // overwrites `inject` with its own weights.
++    ggml_tensor * res_hc = res_in;
++    ggml_tensor * inject = inject_in;
++    ggml_tensor * cur    = block_in;
+ 
+     // ---- dense attention, mirroring the trunk's full-attention branch ----
+     const int64_t n_embd_head = hparams.n_embd_head_v();
+@@ -866,6 +916,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+     res->t_logits = cur;
+ 
+     ggml_build_forward_expand(gf, cur);
++    return cur;
+ }
+ 
+ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(

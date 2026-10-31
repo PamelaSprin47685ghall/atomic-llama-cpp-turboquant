@@ -1,0 +1,3659 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 4cb5eb4..f143bc9 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2478,6 +2478,14 @@ extern "C" {
+             struct ggml_tensor * a,
+             int32_t              n_kv_max);
+ 
++    // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length for plain
++    // FLASH_ATTN_EXT, stored in op params slot 5 (i32). Only ever consumed as
++    // an upper bound, so the value must never exceed the built KV width.
++    // n_kv_runtime == -1 is the documented off sentinel (kernel-side clamp
++    // dead); any other negative value is rejected.
++    GGML_API void ggml_flash_attn_ext_set_n_kv_runtime(
++            struct ggml_tensor * a,
++            int32_t              n_kv_runtime);
+     GGML_API void ggml_flash_attn_ext_add_sinks(
+             struct ggml_tensor * a,
+             struct ggml_tensor * sinks);
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 178d6c5..5d595df 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8548,8 +8548,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+     const ggml_tensor * v     = dst->src[2];
+     const ggml_tensor * mask  = dst->src[3];
+     const ggml_tensor * sinks = dst->src[4];
+-    const ggml_tensor * rel   = dst->src[5];
+-
++    // GGML_TP5_FA_RTLEN: src[5] is either the banded rel logits (F32/F16/BF16,
++    // stock) or the runtime effective KV length (I32[1], exact env gate). The type
++    // disambiguates the two: an I32 src[5] is the nkv_eff bound, never rel.
++    ggml_tensor * rel   = (dst->src[5] && dst->src[5]->type != GGML_TYPE_I32) ? dst->src[5] : nullptr;
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+@@ -8559,6 +8561,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+     GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+     GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+ 
++    // GGML_TP5_FA_RTLEN: the runtime effective KV length from src[5] (I32[1]).
++    // Derived after the locals so nek1 (k->ne[1]) exists; bounded by the built
++    // width. OFF (no I32 src[5]) == nek1 == stock.
++    const ggml_tensor * n_kv_eff_t = (dst->src[5] && dst->src[5]->type == GGML_TYPE_I32 &&
++                                      ggml_nelements(dst->src[5]) == 1) ? dst->src[5] : nullptr;
++    const int64_t n_kv_eff = n_kv_eff_t ? std::min<int64_t>(((const int32_t *) n_kv_eff_t->data)[0], nek1) : nek1;
++
+     const int64_t DK = nek0;
+     const int64_t DV = nev0;
+     const int64_t N  = neq1;
+@@ -8661,7 +8670,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         // loop over n_kv and n_head_kv
+         // ref: https://arxiv.org/pdf/2112.05682.pdf
+ 
+-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
++        // GGML_TP5_FA_RTLEN: the runtime effective KV length from src[5] (I32[1])
++        // is a hard upper bound on this chunk's KV iteration. The caller's
++        // ic_end is already <= n_kv_eff; clamping again keeps the checked-tail
++        // invariant local to this function (OFF: n_kv_eff == nek1, no change).
++        const int64_t ic_end_eff = std::min<int64_t>(ic_end, n_kv_eff);
++        for (int64_t ic = ic_start; ic < ic_end_eff; ++ic) {
+             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+             if (mv == -INFINITY) {
+                 continue;
+@@ -9150,7 +9164,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+     const ggml_tensor * q     = dst->src[0];
+     const ggml_tensor * k     = dst->src[1];
+     const ggml_tensor * v     = dst->src[2];
+-    const ggml_tensor * rel   = dst->src[5];
++    // GGML_TP5_FA_RTLEN: src[5] is the banded rel logits (F32/F16/BF16, stock) or
++    // the runtime effective KV length (I32[1]); the type disambiguates the two.
++    const ggml_tensor * rel   = (dst->src[5] && dst->src[5]->type != GGML_TYPE_I32) ? dst->src[5] : nullptr;
++    const ggml_tensor * n_kv_eff_t = (dst->src[5] && dst->src[5]->type == GGML_TYPE_I32 &&
++                                      ggml_nelements(dst->src[5]) == 1) ? dst->src[5] : nullptr;
++    // effective length: bounded by the built width (envelope); stock == nek1
++    const int64_t n_kv_eff = n_kv_eff_t ? std::min<int64_t>(((const int32_t *) n_kv_eff_t->data)[0], k->ne[1]) : k->ne[1];
+ 
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+@@ -9196,19 +9216,19 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+ 
+     if (use_split_kv_path) {
+-        const int64_t chunk_size = (nek1 + nth - 1) / nth;
++        const int64_t chunk_size = (n_kv_eff + nth - 1) / nth;
+ 
+         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
+         const int64_t partial_size  = 2 + DV;
+         float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+ 
+         const int64_t ic_start = ith * chunk_size;
+-        const int64_t ic_end   = std::min(ic_start + chunk_size, nek1);
++        const int64_t ic_end   = std::min(ic_start + chunk_size, n_kv_eff);
+ 
+         const int64_t partial_stride = nth * partial_size;
+         float *       chunk_partials = partials_base + ith * partial_size;
+ 
+-        if (ic_start < nek1) {
++        if (ic_start < n_kv_eff) {
+             for (int64_t q_head = 0; q_head < neq2; q_head++) {
+                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+                     params, dst, q_head, q_head + 1, ic_start, ic_end,
+@@ -9269,10 +9289,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+             const int64_t ir0 = dr * current_chunk;
+             const int64_t ir1 = MIN(ir0 + dr, nr);
+ 
+-            if (use_tiled) {
++            // GGML_TP5_FA_RTLEN: the tiled path iterates the full envelope width
++            // (nek1) with no row checks — force the checked one-chunk path under
++            // rtlen; the envelope rows past n_kv_eff are -INF-masked there.
++            if (use_tiled && n_kv_eff_t == nullptr) {
+                 ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
+             } else {
+-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
++                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, n_kv_eff, nullptr, 0);
+             }
+ 
+             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 215b3c8..fceb1d2 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -19,6 +19,11 @@
+ // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
+ #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
+ 
++// GGML_TP5_FA_RTLEN: trailing kernel parameter carrying the runtime effective KV length.
++// nullptr (feature off / non-rtlen paths) keeps every kernel on its stock path.
++// The pointer is a device int32[1] input tensor (dst->src[5] for plain FA); its CONTENT
++// is refreshed per eval via ggml_backend_tensor_set, so captured CUDA graphs replay with
++// the new value without a topology change.
+ typedef void (* fattn_kernel_t)(
+         const char * __restrict__ Q,
+         const char * __restrict__ K,
+@@ -26,6 +31,9 @@ typedef void (* fattn_kernel_t)(
+         const char * __restrict__ mask,
+         const char * __restrict__ sinks,
+         const int  * __restrict__ KV_max,
++        const int32_t * __restrict__ n_kv_eff,
++        const bool fast_full_tiles,
++        const int32_t n_kv_runtime,
+         float      * __restrict__ dst,
+         float2     * __restrict__ dst_meta,
+         const float scale,
+@@ -42,6 +50,98 @@ typedef void (* fattn_kernel_t)(
+                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
+                             const int32_t nb31, const int32_t nb32, const int64_t nb33);
+ 
++// Exact-"1" env gates for the runtime FA length feature. GGML_TP5_FA_CHECKED_TAIL
++// is the required gate name and also arms the streamed checked tail; the r4-lineage
++// GGML_TP5_FA_RTLEN alias is accepted so the landed kernel/dispatch paths keep their
++// documented contract. Either value (or both) arms every rtlen lane; OFF (neither
++// set, or any other value) keeps every kernel on its stock path. Read once.
++static inline bool ggml_cuda_fattn_rtlen_enabled() {
++    static const bool enabled = []() {
++        const char * ct = getenv("GGML_TP5_FA_CHECKED_TAIL");
++        if (ct != nullptr && strcmp(ct, "1") == 0) {
++            return true;
++        }
++        const char * env = getenv("GGML_TP5_FA_RTLEN");
++        return env != nullptr && strcmp(env, "1") == 0;
++    }();
++    return enabled;
++}
++
++// GGML_TP5_FA_CHECKED_TAIL (exact "1"): strict gate of the r6 streamed checked
++// tail ONLY (kv_stream_chunk_bound_dual + the streamed launcher's chunk clamp). It
++// deliberately does NOT accept the r4-lineage GGML_TP5_FA_RTLEN alias: the
++// alias keeps the landed r4 behavior, including the streamed fail-closed
++// abort. Read once.
++static inline bool ggml_cuda_fa_checked_tail_enabled() {
++    static const bool enabled = []() {
++        const char * ct = getenv("GGML_TP5_FA_CHECKED_TAIL");
++        return ct != nullptr && strcmp(ct, "1") == 0;
++    }();
++    return enabled;
++}
++
++// GGML_TP5_FA_TILE_FAST_FULL (exact "1", r7): independent opt-in that lets the
++// checked-tail TILE kernel run KV tiles that end at or below the runtime bound
++// with the stock unchecked iterator (oob_check = false) and keep the per-row
++// checks only on the final partial tile. It is a pure performance lane inside
++// the checked-tail path: alone it changes nothing (no checked tail, no fast
++// branch), and off it leaves the r6 always-checked loop bit-for-bit.
++static inline bool ggml_cuda_fa_tile_fast_full_enabled() {
++    static const bool enabled = []() {
++        const char * env = getenv("GGML_TP5_FA_TILE_FAST_FULL");
++        return env != nullptr && strcmp(env, "1") == 0;
++    }();
++    return enabled;
++}
++// GGML_TP5_FA_NKV_PARAM (exact "1", r8): process-static gate for the
++// per-request runtime KV length lane. Any other value (or unset) keeps every
++// kernel and dispatch on its stock path.
++static inline bool ggml_cuda_fattn_nkv_param_enabled() {
++    static const bool enabled = []() {
++        const char * env = getenv("GGML_TP5_FA_NKV_PARAM");
++        return env != nullptr && strcmp(env, "1") == 0;
++    }();
++    return enabled;
++}
++// GGML_TP5_FA_NKV_PARAM (exact "1", r8): per-request runtime KV length. The
++// plain-FA graph route writes op_params[5] at build time; the launcher reads
++// it per launch. The CUDA-graph layer re-captures whenever the value changes
++// (full-tensor node_props memcmp), so a captured scalar can never go stale.
++// GGML_TP5_FA_NKV_PARAM (r8): raw slot reader for plain FLASH_ATTN_EXT nodes,
++// gate-gated but otherwise uninterpreted. The launcher validates this raw
++// value against [-1, built KV width] (fail-closed), so a corrupted slot can
++// not be silently swallowed by the <=0-to-off mapping of the resolver below.
++static inline int32_t ggml_cuda_fattn_nkv_runtime_param_raw(const ggml_tensor * dst) {
++    if (!ggml_cuda_fattn_nkv_param_enabled() || dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT) {
++        return -1;
++    }
++    return ggml_get_op_params_i32(dst, 5);
++}
++// GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length resolver for plain
++// FLASH_ATTN_EXT nodes. Values <= 0 mean "not written" (ggml zeroes the slot
++// at tensor creation; raw creators outside the gated graph route must stay on
++// the stock path) and resolve to -1 = off. The dispatch/streamed/sparse gates
++// use this normalized view ("a valid bound is present"); launch_fattn
++// additionally validates the raw slot value before consuming it.
++static inline int32_t ggml_cuda_fattn_nkv_runtime_param(const ggml_tensor * dst) {
++    const int32_t v = ggml_cuda_fattn_nkv_runtime_param_raw(dst);
++    return v > 0 ? v : -1;
++}
++
++// The runtime effective length lives in src[5] of a plain FA node. src[5] is also the
++// banded op's rel_logits slot, so the slot is disambiguated by op + tensor type:
++// i32 == n_kv_eff (this feature), anything else == banded rel (stock).
++static inline const ggml_tensor * ggml_cuda_fattn_rtlen_tensor(const ggml_tensor * dst) {
++    if (dst->op != GGML_OP_FLASH_ATTN_EXT) {
++        return nullptr;
++    }
++    const ggml_tensor * t = dst->src[5];
++    if (t == nullptr || t->type != GGML_TYPE_I32 || ggml_nelements(t) != 1) {
++        return nullptr;
++    }
++    return t;
++}
++
+ typedef float (*vec_dot_KQ_t)(
+     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
+ 
+@@ -1489,10 +1589,42 @@ void launch_fattn(
+     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
+     const int gqa_ratio    = Q->ne[2] / K->ne[2];
+     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
++    // GGML_TP5_FA_RTLEN: runtime effective KV length. src[5] (i32[1]) carries the
++    // applied n_kv_eff; absent means stock semantics. nullptr reaches every kernel.
++    const ggml_tensor * n_kv_eff_t = ggml_cuda_fattn_rtlen_tensor(dst);
++    const int32_t * n_kv_eff = (n_kv_eff_t != nullptr) ? (const int32_t *) n_kv_eff_t->data : nullptr;
++    // GGML_TP5_FA_TILE_FAST_FULL (exact "1", r7): independent fast-tile lane;
++    // without the checked tail it has no consumer, so it only matters when
++    // the runtime bound reaches the tile kernel.
++    const bool fa_tile_fast_full = ggml_cuda_fa_tile_fast_full_enabled();
++
+     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
+ 
+-    const int32_t n_kv_max = use_sparse ? ggml_get_op_params_i32(KQV, 4) : 0;
+-    if (use_sparse) {
++    // GGML_TP5_FA_NKV_PARAM (exact "1", r8): per-request runtime KV length read
++    // from op_params[5] and passed to every kernel as a scalar argument. -1
++    // (unset, reader-routed nodes, feature off) keeps the kernel-side clamp
++    // dead. Fail-closed on the RAW slot value: anything outside [-1, built KV
++    // width] aborts instead of being silently folded into "off" or clamping
++    // to a wrong bound. Only after validation is the value normalized
++    // (<= 0 -> -1) for the kernels.
++    const int32_t n_kv_runtime_raw = ggml_cuda_fattn_nkv_runtime_param_raw(dst);
++    if (n_kv_runtime_raw > (int32_t) K->ne[1]) {
++        GGML_ABORT("GGML_TP5_FA_NKV_PARAM: runtime KV length %d exceeds built KV width %d",
++                (int) n_kv_runtime_raw, (int) K->ne[1]);
++    }
++    if (n_kv_runtime_raw < -1) {
++        GGML_ABORT("GGML_TP5_FA_NKV_PARAM: invalid runtime KV length %d",
++                (int) n_kv_runtime_raw);
++    }
++    const int32_t n_kv_runtime = n_kv_runtime_raw > 0 ? n_kv_runtime_raw : -1;
++    const bool fa_nkv_param_valid = n_kv_runtime >= 0;
++    // GGML_TP5_FA_RTLEN / GGML_TP5_FA_NKV_PARAM and the sparse KV_max mask
++    // compaction are mutually exclusive: the runtime-bound lanes bound K/V
++    // reads by their own length, while sparse compaction assumes a 256-aligned
++    // envelope with no runtime tail. The runtime lanes win.
++    const bool use_sparse_eff = use_sparse && (n_kv_eff == nullptr) && !fa_nkv_param_valid;
++    const int32_t n_kv_max = use_sparse_eff ? ggml_get_op_params_i32(KQV, 4) : 0;
++    if (use_sparse_eff) {
+         GGML_ASSERT(mask != nullptr);
+         GGML_ASSERT(n_kv_max > 0);
+         const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
+@@ -1504,7 +1636,7 @@ void launch_fattn(
+     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
+     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
+     //     multiple sequences of possibly different lengths.
+-    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
++    if (!use_sparse_eff && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+         const int64_t s31 = mask->nb[1] / sizeof(half2);
+         const int64_t s33 = mask->nb[3] / sizeof(half2);
+ 
+@@ -1525,8 +1657,7 @@ void launch_fattn(
+     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+     GGML_ASSERT(max_blocks_per_sm > 0);
+     int parallel_blocks = max_blocks_per_sm;
+-
+-    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
++    const int64_t n_kv = use_sparse_eff ? n_kv_max : K->ne[1];
+     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+ 
+     dim3 blocks_num;
+@@ -1626,7 +1757,6 @@ void launch_fattn(
+     if (logit_softcap != 0.0f) {
+         scale /= logit_softcap;
+     }
+-
+     const uint32_t n_head      = Q->ne[2];
+     const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
+ 
+@@ -1645,6 +1775,9 @@ void launch_fattn(
+         mask ? ((const char *) mask->data) : nullptr,
+         sinks ? ((const char *) sinks->data) : nullptr,
+         KV_max.ptr,
++        n_kv_eff,
++        fa_tile_fast_full,
++        n_kv_runtime,
+         output_partial ? partial_dst : (!stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data),
+         output_partial ? partial_meta : dst_tmp_meta.ptr,
+         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 7c46f14..00caedb 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -2125,6 +2125,9 @@ static __global__ void flash_attn_ext_f16(
+         const char * mask_ptr,
+         const char * sinks_ptr,
+         const int  * KV_max_ptr,
++        const int32_t * n_kv_eff_ptr,
++        const bool fast_full_tiles,
++        const int32_t n_kv_runtime,
+         float      * dst_ptr,
+         float2     * dst_meta_ptr,
+         const float scale,
+@@ -2147,6 +2150,14 @@ static __global__ void flash_attn_ext_f16(
+     const char * GGML_CUDA_RESTRICT V              = V_ptr;
+     const char * GGML_CUDA_RESTRICT mask           = mask_ptr;
+     const char * GGML_CUDA_RESTRICT sinks          = sinks_ptr;
++    // GGML_TP5_FA_RTLEN: the rtlen feature never selects this kernel (the CUDA
++    // dispatch routes rtlen FA to the checked-tail TILE/VEC kernels); the
++    // parameter exists only to match fattn_kernel_t.
++    // GGML_TP5_FA_NKV_PARAM (r8): same contract — the dispatch routes
++    // param-carrying FA to the TILE kernel, so the scalar stays unused here.
++    GGML_UNUSED(n_kv_eff_ptr);
++    GGML_UNUSED(fast_full_tiles);
++    GGML_UNUSED(n_kv_runtime);
+     const int  * GGML_CUDA_RESTRICT KV_max         = use_sparse ? nullptr : KV_max_ptr;
+     const int  * GGML_CUDA_RESTRICT sparse_indices = use_sparse ? KV_max_ptr : nullptr;
+     float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
+@@ -2320,7 +2331,7 @@ static __global__ void flash_attn_ext_f16(
+         (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, rel_f, dstk, dst_meta_tile, scale, slope, logit_softcap,
+          rel_extent, zt_Q, ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+ #else
+-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, n_kv_eff_ptr, fast_full_tiles, n_kv_runtime, dst_ptr, dst_meta_ptr, scale,
+         max_bias, m0, m1, n_head_log2, logit_softcap,
+         ne00, ne01, ne02, ne03,
+               nb01, nb02, nb03,
+diff --git a/ggml/src/ggml-cuda/fattn-runtime-nkv-reference.h b/ggml/src/ggml-cuda/fattn-runtime-nkv-reference.h
+new file mode 100644
+index 0000000..678936b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fattn-runtime-nkv-reference.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include <cmath>
++#include <cstddef>
++#include <cstring>
++#include <cstdlib>
++#include <limits>
++
++// Reference only: physical stride is independent of the logical KV extent.
++// This does not bind the GPU launch or update captured graph parameters.
++inline bool fattn_runtime_nkv_enabled() {
++    const char * value = std::getenv("GGML_TP5_FA_RUNTIME_NKV");
++    return value && std::strcmp(value, "1") == 0;
++}
++
++inline float fattn_runtime_nkv_reference(const float * logits, const float * values,
++                                         std::size_t n_kv, std::size_t value_stride) {
++    if (n_kv == 0) {
++        return std::numeric_limits<float>::quiet_NaN();
++    }
++    float maximum = -std::numeric_limits<float>::infinity();
++    for (std::size_t base = 0; base < n_kv; base += 256) {
++        const std::size_t end = base + ((n_kv - base < 256) ? n_kv - base : 256);
++        for (std::size_t i = base; i < end; ++i) maximum = std::fmax(maximum, logits[i]);
++    }
++    float numerator = 0.0f, denominator = 0.0f;
++    for (std::size_t base = 0; base < n_kv; base += 256) {
++        const std::size_t end = base + ((n_kv - base < 256) ? n_kv - base : 256);
++        for (std::size_t i = base; i < end; ++i) {
++            const float weight = std::exp(logits[i] - maximum);
++            numerator += weight * values[i * value_stride];
++            denominator += weight;
++        }
++    }
++    return numerator / denominator;
++}
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index 1103cff..5df50dd 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -815,6 +815,9 @@ static __global__ void flash_attn_tile(
+         const char * mask_ptr,
+         const char * sinks_ptr,
+         const int  * KV_max_ptr,
++        const int  * n_kv_eff_ptr,
++        const bool fast_full_tiles,
++        const int32_t n_kv_runtime,
+         float      * dst_ptr,
+         float2     * dst_meta_ptr,
+         const float scale,
+@@ -843,7 +846,7 @@ static __global__ void flash_attn_tile(
+     // Skip unused kernel variants for faster compilation:
+ 
+     if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))) {
+-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
++        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, n_kv_eff_ptr, fast_full_tiles, n_kv_runtime, dst, dst_meta, scale,
+             max_bias, m0, m1, n_head_log2, logit_softcap,
+             ne00, ne01, ne02, ne03,
+                   nb01, nb02, nb03,
+@@ -859,6 +862,18 @@ static __global__ void flash_attn_tile(
+     static_assert(ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols1*ncols2) != 0, "kernel config not defined");
+ 
+     constexpr int ncols     = ncols1*ncols2;
++    // GGML_TP5_FA_RTLEN: runtime effective KV length; nullptr keeps stock ne11 bounds.
++    // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length (op param,
++    // read at HIP launch, -1 off). It only ever tightens the bound above; it
++    // never widens one, and a negative value keeps stock behavior exactly.
++    int n_kv_eff = n_kv_eff_ptr ? std::min((int32_t)*n_kv_eff_ptr, (int32_t)ne11) : ne11;
++    if (n_kv_runtime >= 0) {
++        n_kv_eff = std::min(n_kv_eff, (int) n_kv_runtime);
++    }
++    // Checked tail: only the last partial 256-block can have rows >= n_kv_eff.
++    // Rows past n_kv_eff are never read from K/V and are skipped in the softmax.
++    const bool check_tail = n_kv_eff_ptr != nullptr || n_kv_runtime >= 0;
++
+     constexpr int warp_size = 32;
+     constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
+     constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
+@@ -969,8 +984,44 @@ static __global__ void flash_attn_tile(
+     __syncthreads();
+ 
+     // Main loop over KV cache:
+-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+-    if (ncols2 == 1) {
++    // GGML_TP5_FA_RTLEN: the logical bound is the runtime length (never above the
++    // built width); the checked-tail iter covers the final partial 256-block.
++    const int k_VKQ_max = check_tail ? n_kv_eff
++        : (KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11);
++    if (check_tail) {
++        // Checked tail: the runtime bound replaces the static width; rows at or
++        // past n_kv_eff are never read from K/V and are skipped in the softmax.
++        if (fast_full_tiles) {
++            // GGML_TP5_FA_TILE_FAST_FULL (exact "1", r7): tiles that end at or
++            // below the runtime bound run the stock unchecked iterator (the
++            // per-row oob guards are dead there), only the final partial tile
++            // keeps the checks. Tile order, arithmetic and reduction sequence
++            // are unchanged; off (or r6 behavior) runs the always-checked loop.
++            for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
++                if (k_VKQ_max - k_VKQ_0 >= nbatch_fa) {
++                    constexpr bool oob_check = false;
++                    flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++                        (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
++                        stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++                } else {
++                    constexpr bool oob_check = true;
++                    flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++                        (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
++                        stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++                }
++            }
++        } else {
++            // Checked tail: every tile is row-checked against the runtime
++            // length; the iter zero-fills K/V rows at or past n_kv_eff and
++            // skips their mask add.
++            for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
++                constexpr bool oob_check = true;
++                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++                    (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
++                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++            }
++        }
++    } else if (ncols2 == 1) {
+         // Branch with out-of-bounds checks.
+         int k_VKQ_0 = blockIdx.y*nbatch_fa;
+         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
+@@ -1150,7 +1201,7 @@ static __global__ void flash_attn_tile(
+         }
+     }
+ #else
+-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, n_kv_eff_ptr, fast_full_tiles, n_kv_runtime, dst_ptr, dst_meta_ptr, scale,
+         max_bias, m0, m1, n_head_log2, logit_softcap,
+         ne00, ne01, ne02, ne03,
+               nb01, nb02, nb03,
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index d782de8..4ebef36 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -27,6 +27,9 @@ static __global__ void flash_attn_ext_vec(
+         const char * mask_ptr,
+         const char * sinks_ptr,
+         const int  * KV_max_ptr,
++        const int  * n_kv_eff_ptr,
++        const bool fast_full_tiles,
++        const int32_t n_kv_runtime,
+         float      * dst_ptr,
+         float2     * dst_meta_ptr,
+         const float scale,
+@@ -43,7 +46,22 @@ static __global__ void flash_attn_ext_vec(
+                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
+                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+     ggml_cuda_pdl_lc();
+-#ifdef FLASH_ATTN_AVAILABLE
++ #ifdef FLASH_ATTN_AVAILABLE
++    // GGML_TP5_FA_RTLEN: runtime effective KV length; nullptr keeps stock ne11 bounds.
++    // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length (op param,
++    // read at HIP launch, -1 off). It only ever tightens the bound above; it
++    // never widens one, and a negative value keeps stock behavior exactly.
++    int n_kv_eff = n_kv_eff_ptr ? std::min((int32_t)*n_kv_eff_ptr, (int32_t)ne11) : ne11;
++    if (n_kv_runtime >= 0) {
++        n_kv_eff = std::min(n_kv_eff, (int) n_kv_runtime);
++    }
++    // Checked tail: only the last partial 256-block can have rows >= n_kv_eff.
++    // Rows past n_kv_eff must not be read from K/V (they may be uninitialised or
++    // poisoned) and must not take part in the softmax; they are zero-filled and
++    // their mask contribution is skipped, exactly like a -INF mask row.
++    const bool check_tail = n_kv_eff_ptr != nullptr || n_kv_runtime >= 0;
++    GGML_UNUSED(fast_full_tiles); // r7 tile-only fast lane; vec tail behavior unchanged
++
+     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
+     const char * GGML_CUDA_RESTRICT K        = K_ptr;
+     const char * GGML_CUDA_RESTRICT V        = V_ptr;
+@@ -55,7 +73,7 @@ static __global__ void flash_attn_ext_vec(
+ 
+     // Skip unused kernel variants for faster compilation:
+     if (use_logit_softcap && !(D == 128 || D == 256 || D == 512)) {
+-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
++        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, n_kv_eff_ptr, fast_full_tiles, n_kv_runtime, dst, dst_meta, scale,
+             max_bias, m0, m1, n_head_log2, logit_softcap,
+             ne00, ne01, ne02, ne03,
+                   nb01, nb02, nb03,
+@@ -316,7 +334,8 @@ static __global__ void flash_attn_ext_vec(
+         __syncthreads();
+     }
+ 
+-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
++    // rtlen: the logical bound is the runtime length (never above the built width).
++    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : n_kv_eff;
+     K     += blockIdx.y*nthreads * nb11;
+     V     += blockIdx.y*nthreads * nb21;
+     maskh += blockIdx.y*nthreads;
+@@ -336,60 +355,71 @@ static __global__ void flash_attn_ext_vec(
+ #pragma unroll
+         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
+             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
++            // Checked tail: rows at or past n_kv_eff are never read from K/V.
++            const bool row_valid = !check_tail || k_VKQ_0 + i_KQ < n_kv_eff;
+ 
+ #pragma unroll
+             for (int j = 0; j < ncols; ++j) {
+                 float sum;
+-                if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO3_0) {
+-                    // LUT scoring: 8 elements per iteration (2 qs bytes + 1 signs byte)
+-                    const block_turbo3_0 * K_turbo = (const block_turbo3_0 *)(K + i_KQ*nb11);
+-                    sum = 0.0f;
+-                    for (int d0 = 0; d0 < D; d0 += 8) {
+-                        const int ib = d0 / QK_TURBO3;
+-                        const int jj = d0 % QK_TURBO3;
+-                        const float norm = __half2float(K_turbo[ib].norm);
+-                        const uint8_t qs0 = K_turbo[ib].qs[jj / 4];
+-                        const uint8_t qs1 = K_turbo[ib].qs[jj / 4 + 1];
+-                        const uint8_t sgn = K_turbo[ib].signs[jj / 8];
+-                        sum += (__half2float(turbo_lut[d0  ][((qs0>>0)&3)|((sgn>>0&1)<<2)]) +
+-                                __half2float(turbo_lut[d0+1][((qs0>>2)&3)|((sgn>>1&1)<<2)]) +
+-                                __half2float(turbo_lut[d0+2][((qs0>>4)&3)|((sgn>>2&1)<<2)]) +
+-                                __half2float(turbo_lut[d0+3][((qs0>>6)&3)|((sgn>>3&1)<<2)]) +
+-                                __half2float(turbo_lut[d0+4][((qs1>>0)&3)|((sgn>>4&1)<<2)]) +
+-                                __half2float(turbo_lut[d0+5][((qs1>>2)&3)|((sgn>>5&1)<<2)]) +
+-                                __half2float(turbo_lut[d0+6][((qs1>>4)&3)|((sgn>>6&1)<<2)]) +
+-                                __half2float(turbo_lut[d0+7][((qs1>>6)&3)|((sgn>>7&1)<<2)])) * norm;
+-                    }
+-                } else if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO2_0) {
+-                    // LUT scoring for turbo2: 8 elements per iteration (2 qs bytes, no signs)
+-                    const block_turbo2_0 * K_turbo = (const block_turbo2_0 *)(K + i_KQ*nb11);
+-                    sum = 0.0f;
+-                    for (int d0 = 0; d0 < D; d0 += 8) {
+-                        const int ib = d0 / QK_TURBO2;
+-                        const int jj = d0 % QK_TURBO2;
+-                        const float norm = __half2float(K_turbo[ib].norm);
+-                        const uint8_t qs0 = K_turbo[ib].qs[jj / 4];
+-                        const uint8_t qs1 = K_turbo[ib].qs[jj / 4 + 1];
+-                        sum += (__half2float(turbo_lut[d0  ][(qs0>>0)&3]) +
+-                                __half2float(turbo_lut[d0+1][(qs0>>2)&3]) +
+-                                __half2float(turbo_lut[d0+2][(qs0>>4)&3]) +
+-                                __half2float(turbo_lut[d0+3][(qs0>>6)&3]) +
+-                                __half2float(turbo_lut[d0+4][(qs1>>0)&3]) +
+-                                __half2float(turbo_lut[d0+5][(qs1>>2)&3]) +
+-                                __half2float(turbo_lut[d0+6][(qs1>>4)&3]) +
+-                                __half2float(turbo_lut[d0+7][(qs1>>6)&3])) * norm;
++                if (row_valid) {
++                    if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO3_0) {
++                        // LUT scoring: 8 elements per iteration (2 qs bytes + 1 signs byte)
++                        const block_turbo3_0 * K_turbo = (const block_turbo3_0 *)(K + i_KQ*nb11);
++                        sum = 0.0f;
++                        for (int d0 = 0; d0 < D; d0 += 8) {
++                            const int ib = d0 / QK_TURBO3;
++                            const int jj = d0 % QK_TURBO3;
++                            const float norm = __half2float(K_turbo[ib].norm);
++                            const uint8_t qs0 = K_turbo[ib].qs[jj / 4];
++                            const uint8_t qs1 = K_turbo[ib].qs[jj / 4 + 1];
++                            const uint8_t sgn = K_turbo[ib].signs[jj / 8];
++                            sum += (__half2float(turbo_lut[d0  ][((qs0>>0)&3)|((sgn>>0&1)<<2)]) +
++                                    __half2float(turbo_lut[d0+1][((qs0>>2)&3)|((sgn>>1&1)<<2)]) +
++                                    __half2float(turbo_lut[d0+2][((qs0>>4)&3)|((sgn>>2&1)<<2)]) +
++                                    __half2float(turbo_lut[d0+3][((qs0>>6)&3)|((sgn>>3&1)<<2)]) +
++                                    __half2float(turbo_lut[d0+4][((qs1>>0)&3)|((sgn>>4&1)<<2)]) +
++                                    __half2float(turbo_lut[d0+5][((qs1>>2)&3)|((sgn>>5&1)<<2)]) +
++                                    __half2float(turbo_lut[d0+6][((qs1>>4)&3)|((sgn>>6&1)<<2)]) +
++                                    __half2float(turbo_lut[d0+7][((qs1>>6)&3)|((sgn>>7&1)<<2)])) * norm;
++                        }
++                    } else if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO2_0) {
++                        // LUT scoring for turbo2: 8 elements per iteration (2 qs bytes, no signs)
++                        const block_turbo2_0 * K_turbo = (const block_turbo2_0 *)(K + i_KQ*nb11);
++                        sum = 0.0f;
++                        for (int d0 = 0; d0 < D; d0 += 8) {
++                            const int ib = d0 / QK_TURBO2;
++                            const int jj = d0 % QK_TURBO2;
++                            const float norm = __half2float(K_turbo[ib].norm);
++                            const uint8_t qs0 = K_turbo[ib].qs[jj / 4];
++                            const uint8_t qs1 = K_turbo[ib].qs[jj / 4 + 1];
++                            sum += (__half2float(turbo_lut[d0  ][(qs0>>0)&3]) +
++                                    __half2float(turbo_lut[d0+1][(qs0>>2)&3]) +
++                                    __half2float(turbo_lut[d0+2][(qs0>>4)&3]) +
++                                    __half2float(turbo_lut[d0+3][(qs0>>6)&3]) +
++                                    __half2float(turbo_lut[d0+4][(qs1>>0)&3]) +
++                                    __half2float(turbo_lut[d0+5][(qs1>>2)&3]) +
++                                    __half2float(turbo_lut[d0+6][(qs1>>4)&3]) +
++                                    __half2float(turbo_lut[d0+7][(qs1>>6)&3])) * norm;
++                        }
++                    } else {
++                        sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
++                        sum = warp_reduce_sum<nthreads_KQ>(sum);
+                     }
+                 } else {
+-                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+-                    sum = warp_reduce_sum<nthreads_KQ>(sum);
++                    // Checked tail: rows at or past n_kv_eff are never read from K.
++                    sum = 0.0f;
+                 }
+ 
+                 if (use_logit_softcap) {
+                     sum = logit_softcap*tanhf(sum);
+                 }
+ 
+-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
++                // Checked tail: the mask row of an invalid row is skipped entirely;
++                // the neutral sum keeps it out of the max update like a -INF row.
++                if (mask && row_valid && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                     sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
++                } else if (!row_valid) {
++                    sum = -FLT_MAX/2.0f;
+                 }
+ 
+                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
+@@ -436,6 +466,11 @@ static __global__ void flash_attn_ext_vec(
+         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
+             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
+ 
++            // Checked tail: V rows at or past n_kv_eff are never read. Their KQ
++            // weight is already 0, but a poisoned V row would still yield 0*NaN,
++            // so the whole V contribution of such a row is skipped.
++            const bool v_row_valid = !check_tail || k_VKQ_0 + k < n_kv_eff;
++
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+             half2 KQ_k[ncols];
+ #pragma unroll
+@@ -448,6 +483,10 @@ static __global__ void flash_attn_ext_vec(
+                 }
+             }
+ 
++            // Checked tail: skip the entire V contribution of a row past n_kv_eff
++            // before any dequant happens (the KQ weight is already exp->0).
++            if (!v_row_valid) { continue; }
++
+             // Sparse V: skip V dequant if all attention weights for this position are negligible.
+             // Compiled out for unquantized V (f16/bf16/turbo): at short decode depth the
+             // threshold almost never fires, so the branch is pure overhead and regresses
+@@ -485,6 +524,10 @@ static __global__ void flash_attn_ext_vec(
+                 }
+             }
+ #else
++            // Checked tail: rows at or past n_kv_eff are never read from V (their
++            // KQ weight is already 0, but a poisoned row would still give 0*NaN).
++            if (!v_row_valid) { continue; }
++
+             float KQ_k[ncols];
+ #pragma unroll
+             for (int j = 0; j < ncols; ++j) {
+@@ -767,7 +810,7 @@ static __global__ void flash_attn_ext_vec(
+         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
+     }
+ #else
+-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, n_kv_eff_ptr, fast_full_tiles, n_kv_runtime, dst_ptr, dst_meta_ptr, scale,
+         max_bias, m0, m1, n_head_log2, logit_softcap,
+         ne00, ne01, ne02, ne03,
+               nb01, nb02, nb03,
+@@ -824,8 +867,20 @@ void ggml_cuda_flash_attn_ext_vec_partial_case_impl(
+         (const char *) K->data,
+         (const char *) V->data,
+         mask ? (const char *) mask->data : nullptr,
+-        nullptr,
+-        nullptr,
++        nullptr,   // sinks: the streamed partial path carries none
++        nullptr,   // KV_max: sparse compaction is not used here
++        // GGML_TP5_FA_RTLEN: the staged dst keeps src[5]; the kernel reads its
++        // bound from there. nullptr keeps stock ne11 bounds.
++        [] (const ggml_tensor * d) {
++            const ggml_tensor * t = ggml_cuda_fattn_rtlen_tensor(d);
++            return t ? (const int32_t *) t->data : nullptr;
++        } (dst),
++        // GGML_TP5_FA_RTLEN: vec never uses the tile-only fast-full lane.
++        false,
++        // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length from the
++        // staged dst's op param (normalized; -1 keeps stock bounds). The
++        // streamed staging validates it against the staged width.
++        ggml_cuda_fattn_nkv_runtime_param(dst),
+         partial_dst,
+         partial_meta,
+         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+@@ -834,7 +889,7 @@ void ggml_cuda_flash_attn_ext_vec_partial_case_impl(
+         V->nb[1], V->nb[2], V->nb[3],
+         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0);
+-    CUDA_CHECK(cudaGetLastError());
++     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+ template<int D, ggml_type type_K, ggml_type type_V>
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index ece91d7..1d3e8a6 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -799,6 +799,37 @@ static __global__ void kv_stream_normalize_chunk_results(
+     const float denom = accumulator_meta[row].y;
+     dst[row*D + tid] = denom > 0.0f ? accumulator[row*D + tid]/denom : 0.0f;
+ }
++// GGML_TP5_FA_CHECKED_TAIL (r6) + GGML_TP5_FA_NKV_PARAM (r8): translate the
++// global runtime bounds into a chunk's relative bound as the TRUE MIN of the
++// armed lanes. The streamed chunk covering global rows
++// [token_begin, token_begin + token_count) attends rows [token_begin, bound)
++// only; an inactive lane passes a neutral sentinel (nullptr device tensor for
++// the r6 lane, -1 host scalar for the r8 lane) and clamps to the full chunk
++// width. Zero is a real result: a chunk fully past an armed frontier attends
++// nothing and emits a neutral partial (weight 0). token_begin/token_count
++// are capture-time constants of the chunk node; the r6 lane re-reads its
++// device tensor on every replay (set_input refresh) and the r8 lane's scalar
++// is kept current by the freshness contract (graph-reuse disable +
++// full-tensor op_params memcmp -> re-capture on change), so the recorded
++// 1-thread launch stays replay-safe.
++static __global__ void kv_stream_chunk_bound_dual(
++        const int32_t * __restrict__ n_kv_eff_global,
++        const int32_t   n_kv_runtime_global,
++        const int32_t   token_begin,
++        const int32_t   token_count,
++        int32_t * __restrict__ chunk_bound) {
++    int64_t bound = INT32_MAX;
++    if (n_kv_eff_global != nullptr) {
++        bound = n_kv_eff_global[0];
++    }
++    if (n_kv_runtime_global >= 0) {
++        bound = bound < n_kv_runtime_global ? bound : n_kv_runtime_global;
++    }
++    const int64_t remaining = bound - token_begin;
++    chunk_bound[0] = remaining < 0 ? 0 :
++        (remaining < token_count ? (int32_t) remaining : token_count);
++}
++
+ 
+ #ifdef GGML_CUDA_FA_ALL_QUANTS
+ using kv_stream_native_partial_fn = void (*)(
+@@ -1779,6 +1810,48 @@ void ggml_cuda_flash_attn_ext_streamed(
+     const ggml_tensor * K = dst->src[1];
+     const ggml_tensor * V = dst->src[2];
+     const ggml_tensor * mask = dst->src[3];
++    // GGML_TP5_FA_CHECKED_TAIL (exact "1") is the ONLY gate of the r6 streamed
++    // checked tail: it never reads the runtime bound on the host. Each chunk gets
++    // a device-side, chunk-relative bound (kv_stream_chunk_bound_dual) computed inside
++    // the captured graph from the global n_kv_eff tensor (dst->src[5]); chunk
++    // token offsets are capture-time constants, so the recorded launch stays
++    // correct across replays. K/V rows at or past the translated bound are never
++    // read; an exhausted chunk contributes a neutral partial (see accumulate:
++    // weight == 0).
++    const ggml_tensor * nkv_eff_tensor = ggml_cuda_fattn_rtlen_tensor(dst);
++    // GGML_TP5_FA_RTLEN (r4, landed): the RTLEN lane alone keeps the landed
++    // fail-closed contract verbatim — streamed attention + runtime bound still
++    // aborts. CHECKED_TAIL=1 takes precedence (both set: the r6 tail runs).
++    if (ggml_cuda_fattn_rtlen_enabled() && nkv_eff_tensor != nullptr &&
++        !ggml_cuda_fa_checked_tail_enabled()) {
++        GGML_ABORT("runtime KV length is not supported for streamed attention");
++    }
++    // GGML_TP5_FA_NKV_PARAM (r8): the per-request runtime bound IS supported on
++    // the streamed path via per-chunk translation. The global node's op param
++    // is a host scalar; each staged chunk gets the chunk-relative bound
++    // (chunk - token_begin clamped to [0, token_count]) written into its slot
++    // by a scalar kernel and carried on the staged dst's src[5], with the
++    // positive bound also folded into the staged dst's op param so the
++    // dispatch reroutes (MMA->TILE, fused-path skips) stay armed. Fail-closed
++    // on the raw slot value with the same contract as launch_fattn (this path
++    // bypasses the launcher for the global node). The baked values are capture
++    // time constants kept current by the r8 freshness contract: the gate
++    // disables graph reuse and the full-tensor node_props memcmp (op_params
++    // included) re-captures whenever the bound changes. Nodes without the
++    // param ([-1]) keep the stock/r6 streamed behavior.
++    const int32_t n_kv_runtime_raw = ggml_cuda_fattn_nkv_runtime_param_raw(dst);
++    if (n_kv_runtime_raw > (int32_t) K->ne[1]) {
++        GGML_ABORT("GGML_TP5_FA_NKV_PARAM: runtime KV length %d exceeds built KV width %d",
++                (int) n_kv_runtime_raw, (int) K->ne[1]);
++    }
++    if (n_kv_runtime_raw < -1) {
++        GGML_ABORT("GGML_TP5_FA_NKV_PARAM: invalid runtime KV length %d",
++                (int) n_kv_runtime_raw);
++    }
++    const int32_t n_kv_runtime_global = n_kv_runtime_raw > 0 ? n_kv_runtime_raw : -1;
++    if (!ggml_cuda_fa_checked_tail_enabled()) {
++        nkv_eff_tensor = nullptr;   // the r6 tail is CHECKED_TAIL-only
++    }
+     const auto attention_mode =
+         ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type);
+     const bool convert_to_f16 =
+@@ -1919,7 +1992,13 @@ void ggml_cuda_flash_attn_ext_streamed(
+         }
+     }
+ 
+-    const bool use_mma_prefill = !convert_to_f16 &&
++    // GGML_TP5_FA_CHECKED_TAIL: the MMA prefill kernel has no checked tail (reads the
++    // full staged span), so under the runtime bound the chunk runs on the
++    // checked vec partial path instead. RTLEN alone keeps the landed r4 abort
++    // and MMA prefill.
++    // GGML_TP5_FA_NKV_PARAM (r8): same contract for the per-request bound.
++    const bool use_mma_prefill = !convert_to_f16 && nkv_eff_tensor == nullptr &&
++        n_kv_runtime_global < 0 &&
+         Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
+     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
+@@ -1935,6 +2014,15 @@ void ggml_cuda_flash_attn_ext_streamed(
+     ggml_cuda_pool_alloc<float> parts(pool);
+     ggml_cuda_pool_alloc<float2> meta(pool);
+     ggml_cuda_pool_alloc<float> accumulator(pool);
++    // GGML_TP5_FA_CHECKED_TAIL: one device i32 per chunk holding the chunk-relative
++    // runtime bound (written by kv_stream_chunk_bound_dual each eval/replay). The new
++    // streamed tail arms only on this gate; RTLEN alone keeps the landed r4 abort.
++    ggml_cuda_pool_alloc<int32_t> chunk_bounds(pool);
++    // GGML_TP5_FA_NKV_PARAM (r8): the per-request lane shares the per-chunk
++    // slot mechanism (translated bound, zero case included).
++    if (nkv_eff_tensor != nullptr || n_kv_runtime_global >= 0) {
++        chunk_bounds.alloc(nchunks);
++    }
+     ggml_cuda_pool_alloc<float2> accumulator_meta(pool);
+     const bool needs_partial_reduction = convert_to_f16 || (!streamed_chunks.empty() && nchunks > 1);
+     if (needs_partial_reduction) {
+@@ -2136,6 +2224,35 @@ void ggml_cuda_flash_attn_ext_streamed(
+             }
+         }
+ 
++        // GGML_TP5_FA_CHECKED_TAIL (r6) + GGML_TP5_FA_NKV_PARAM (r8):
++        // translate the global runtime bounds into this chunk's relative
++        // bound as the TRUE MIN of the armed lanes — never a last-writer
++        // overwrite. Each lane contributes its own global bound; an inactive
++        // lane passes a neutral sentinel (nullptr device tensor for r6, -1
++        // host scalar for r8) and clamps to the full chunk width. The r6 lane
++        // re-reads its device tensor on every replay (set_input refresh); the
++        // r8 lane's scalar is a capture-time constant kept current by the
++        // freshness contract (graph-reuse disable + full-tensor op_params
++        // memcmp -> re-capture on change). token_begin/token_count are
++        // capture-time constants of this chunk node, so the recorded
++        // 1-thread launch stays replay-safe. Zero is a real result: a chunk
++        // fully past an armed frontier attends nothing and emits a neutral
++        // partial. Launched per chunk before the chunk's FA work.
++        if (nkv_eff_tensor != nullptr || n_kv_runtime_global >= 0) {
++            kv_stream_chunk_bound_dual<<<1, 1, 0, ctx.stream()>>>(
++                nkv_eff_tensor != nullptr ? (const int32_t *) nkv_eff_tensor->data : nullptr,
++                n_kv_runtime_global,
++                (int32_t) desc.token_begin, (int32_t) desc.token_count,
++                chunk_bounds.ptr + chunk);
++            CUDA_CHECK(cudaGetLastError());
++        }
++        int32_t staged_chunk_bound = -1;
++        if (n_kv_runtime_global >= 0) {
++            const int64_t remaining = (int64_t) n_kv_runtime_global - desc.token_begin;
++            staged_chunk_bound = (int32_t) std::min<int64_t>(
++                std::max<int64_t>(remaining, 0), desc.token_count);
++        }
++
+         ggml_tensor staged_k = *K;
+         ggml_tensor staged_v = *V;
+         staged_k.data = desc.k_stage;
+@@ -2149,6 +2266,30 @@ void ggml_cuda_flash_attn_ext_streamed(
+         staged_v.nb[2] = desc.v_stage_head_stride;
+         staged_v.nb[3] = desc.v_stage_token_stride*desc.token_count;
+ 
++        ggml_tensor staged_dst = *dst;
++        // GGML_TP5_FA_CHECKED_TAIL: point the staged dst's src[5] at this chunk's slot of
++        // the translated-bound buffer (the launcher's lambda reads ->data), so
++        // the checked vec kernel clamps its chunk-local rows. OFF (stock): the
++        // staged dst keeps the original src[5] untouched.
++        ggml_tensor chunk_nkv_eff{};
++        if (nkv_eff_tensor != nullptr || n_kv_runtime_global >= 0) {
++            chunk_nkv_eff.type  = GGML_TYPE_I32;
++            chunk_nkv_eff.ne[0] = 1;
++            chunk_nkv_eff.nb[0] = sizeof(int32_t);
++            chunk_nkv_eff.data  = chunk_bounds.ptr + chunk;
++            staged_dst.src[5]   = &chunk_nkv_eff;
++        }
++        // GGML_TP5_FA_NKV_PARAM (r8): the staged chunk carries this lane's
++        // per-request bound as its op param scalar (validated against the
++        // staged width by launch_fattn), keeping the dispatch reroutes
++        // (MMA->TILE, fused-path skips) armed on the fast path even for a
++        // fully-exhausted chunk (-1 scalar, combined slot 0). The kernels
++        // fold slot and scalar with min(), so the effective bound is the
++        // true min of the armed lanes.
++        if (n_kv_runtime_global >= 0) {
++            staged_dst.op_params[5] = staged_chunk_bound > 0 ? staged_chunk_bound : -1;
++        }
++
+         ggml_tensor converted_k{};
+         ggml_tensor converted_v{};
+         if (convert_to_f16) {
+@@ -2202,7 +2343,6 @@ void ggml_cuda_flash_attn_ext_streamed(
+             staged_mask_ptr = &staged_mask;
+         }
+ 
+-        ggml_tensor staged_dst = *dst;
+         staged_dst.src[1] = convert_to_f16 ? &converted_k : &staged_k;
+         staged_dst.src[2] = convert_to_f16 ? &converted_v : &staged_v;
+         staged_dst.src[3] = staged_mask_ptr;
+@@ -2429,6 +2569,15 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
+     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+ 
+     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
++    // GGML_TP5_FA_RTLEN and the sparse KV_max compaction are mutually exclusive:
++    // the checked tail bounds reads by the runtime n_kv_eff, sparse compaction
++    // assumes a 256-aligned envelope with no runtime tail.
++    // GGML_TP5_FA_NKV_PARAM (r8): a param-carrying FA node never takes the
++    // sparse path; the runtime bound is the authority for those nodes.
++    if (ggml_cuda_fattn_nkv_runtime_param(dst) >= 0 ||
++            (ggml_cuda_fattn_rtlen_enabled() && ggml_cuda_fattn_rtlen_tensor(dst) != nullptr)) {
++        return false;
++    }
+     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
+@@ -3266,11 +3415,31 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
+ 
++    // GGML_TP5_FA_RTLEN (all backends): runtime effective KV length via src[5]
++    // (i32[1]). OFF (no src[5] tensor / env != "1") == stock. Declared outside the
++    // HIP ifdef below so the fused-path bypass and the MMA-F16 route stay
++    // unconditional.
++    // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length in op
++    // params slot 5. Behaves like the rtlen lane for dispatch purposes:
++    // fused fast paths that cannot consume the bound are skipped and the
++    // bound-aware TILE kernel takes over; MMA-F16 reroutes below.
++    const bool fattn_nkv_param = ggml_cuda_fattn_nkv_runtime_param(dst) >= 0;
++    const bool fattn_rtlen = ggml_cuda_fattn_rtlen_enabled() &&
++        ggml_cuda_fattn_rtlen_tensor(dst) != nullptr;
++    // GGML_TP5_FA_NKV_PARAM (r8): staged streamed chunks carry a chunk-local
++    // bound as src[5] even when only this gate is on; the bound-aware kernels
++    // must be selected for them too (a fully-exhausted chunk with bound 0
++    // must still hit the checked kernels, never an unchecked fast path).
++    // Without any gate, src[5] is never produced, so arming on its presence
++    // alone cannot touch stock behavior.
++    const bool fattn_nkv_bound = fattn_rtlen || fattn_nkv_param ||
++        (ggml_cuda_fattn_nkv_param_enabled() && ggml_cuda_fattn_rtlen_tensor(dst) != nullptr);
++
+ #if defined(GGML_USE_HIP) && defined(FLASH_ATTN_AVAILABLE)
+     // Only the explicit decoded-F32 context uses the fused online F32 kernel.
+     // All operands and intermediates stay F32; ordinary FA keeps its existing
+     // selector and conversion policy.
+-    if (ctx.quantized_matmul_f32 && dst->op == GGML_OP_FLASH_ATTN_EXT &&
++    if (!fattn_nkv_bound && ctx.quantized_matmul_f32 && dst->op == GGML_OP_FLASH_ATTN_EXT &&
+             ggml_flash_attn_ext_get_prec(dst) == GGML_PREC_F32 &&
+             GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ctx.device].cc) &&
+             ggml_cuda_flash_attn_ext_f32_supported(dst)) {
+@@ -3292,7 +3461,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+         const bool turbo_matched = (K->type == V->type &&
+             (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0));
+-        if (ggml_cuda_turbo_mma_fused() && turbo_matched
++        if (!fattn_nkv_bound && ggml_cuda_turbo_mma_fused() && turbo_matched
+                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
+             if (Q->ne[0] == 128) {
+                 switch (K->type) {
+@@ -3318,7 +3487,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+         }
+     }
+ 
+-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
++    // GGML_TP5_FA_RTLEN: the MMA-F16 kernel has no checked tail (it reads the full
++    // envelope and relies on -INF mask rows). Under rtlen, route to the checked
++    // TILE/VEC kernels instead. OFF keeps the stock selection.
++    best_fattn_kernel best = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
++    if (fattn_nkv_bound && best == BEST_FATTN_KERNEL_MMA_F16) {
++        best = BEST_FATTN_KERNEL_TILE;
++    }
++    switch (best) {
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("fatal error");
+         case BEST_FATTN_KERNEL_TILE:
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 3a22947..639135e 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5593,6 +5593,18 @@ void ggml_flash_attn_ext_set_n_kv_max(
+ 
+     ggml_set_op_params_i32(a, 4, n_kv_max);
+ }
++// GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length in op params slot
++// 5. Slot 0-2 are the f32 scale/max_bias/softcap, 3 is the prec enum and 4 the
++// sparse n_kv_max; slot 5 is unused by every FLASH_ATTN_EXT reader, so the
++// byte stays zero in stock builds and this write is the only producer.
++void ggml_flash_attn_ext_set_n_kv_runtime(
++        struct ggml_tensor * a,
++        int32_t              n_kv_runtime) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT(n_kv_runtime >= -1);
++
++    ggml_set_op_params_i32(a, 5, n_kv_runtime);
++}
+ 
+ void ggml_flash_attn_ext_add_sinks(
+         struct ggml_tensor * a,
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index fbc858d..b880b4d 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -22,6 +22,7 @@ add_library(llama
+             llama-hparams.cpp
+             llama-impl.cpp
+             llama-io.cpp
++            llama-nout-state.cpp
+             llama-kv-cache.cpp
+             llama-kv-cache-iswa.cpp
+             llama-kv-cache-dsa.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 97c8c72..1c18821 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -8,6 +8,7 @@
+ #include "llama-ext.h"
+ #include "llama-graph.h"
+ #include "llama-impl.h"
++#include "llama-nout-state.h"
+ #include "llama-io.h"
+ #include "llama-kv-cache-dsa.h"
+ #include "llama-kv-cache-dsv4.h"
+@@ -30,6 +31,7 @@
+ #include <limits>
+ #include <stdexcept>
+ #include <string>
++#include <unordered_map>
+ 
+ //
+ // llama_context
+@@ -102,6 +104,13 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
+     //     may need to be backend-dependent
+     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+ 
++    // per-context union-binder state slot (llama-nout-state.h): NOT created
++    // here eagerly - the constructor reads the env gate below and creates the
++    // slot only when the gate is on, so the OFF path allocates no binder
++    // state. Unique_ptr ownership in llama-context.h: a constructor-body
++    // throw still destroys fully-initialized members, so the slot cannot
++    // leak, and ~llama_context releases it with the context.
++
+     t_start_us = model.t_start_us;
+     t_load_us  = model.t_load_us;
+ 
+@@ -439,9 +448,90 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
+         }
+     }
+ 
++    // Lane gates (independent, each exact "1"; unset or any other value is
++    // stock for that lane):
++    //  - GGML_TP5_UNION_BINDER: the legacy outputs lane (n_outputs binding).
++    //    Kept for old-gate compatibility: with only this gate on, the nkv
++    //    lane is off and n_kv behavior is stock.
++    //  - GGML_TP5_NKV_TRUEWIDTH: the r7 true-width nkv lane. With only this
++    //    gate on, the outputs lane is off and n_outputs behavior is stock.
++    //    With this gate OFF there is NO fallback to any envelope/pad
++    //    behavior: the envelope machinery was removed from the tree, not
++    //    gated, so OFF is stock, not r5.
++    const char * union_binder_env     = getenv("GGML_TP5_UNION_BINDER");
++    const bool   union_binder_gate    = union_binder_env != nullptr && strcmp(union_binder_env, "1") == 0;
++    const char * nkv_truewidth_env    = getenv("GGML_TP5_NKV_TRUEWIDTH");
++    const bool   nkv_truewidth_gate   = nkv_truewidth_env != nullptr && strcmp(nkv_truewidth_env, "1") == 0;
++
++    {
++        // The state slot exists only while at least one lane gate is exactly
++        // "1"; with both gates off the context holds no binder state at all
++        // (OFF = stock, zero alloc).
++        if (union_binder_gate || nkv_truewidth_gate) {
++            auto & nkv_st = llama_nkv_ctx_state_get(this);
++
++            // r7 true-width nkv lane: registered only under its own gate.
++            if (nkv_truewidth_gate) {
++                nkv_st.nkv_enabled = true;
++                if (!nkv_st.union_binder.add({
++                        llama_union_param_kind::n_kv, "n_kv",
++                        &llama_context::union_tensors_n_kv,
++                        &llama_context::union_rebind_n_kv,
++                    })) {
++                    // cannot happen for a valid kind; stay fail-closed anyway
++                    nkv_st.nkv_enabled = false;
++                    LLAMA_LOG_ERROR("%s: failed to register the n_kv union binding; runtime graph patching disabled\n", __func__);
++                }
++            }
++
++            // n_outputs binding: the legacy outputs lane under the old gate.
++            // Bounded binding: only the output-gather closure (out_ids + every
++            // GET_ROWS dst reading it) is reconciled, and only when the graph
++            // builds WITHOUT backend samplers: build_sampling() consumes the
++            // gather output through a PAD (+1 row), which the binding does not
++            // cover. Under the binding, decoder graphs build at the exact
++            // active count and the rebind narrows/restores the executed shapes
++            // within that built width; 0 active outputs is a supported bound
++            // (the stock zero-output topology).
++            if (union_binder_gate) {
++                if (!sampling.samplers.empty()) {
++                    LLAMA_LOG_WARN("%s: n_outputs union binding NOT registered: backend samplers attached; the gather output feeds build_sampling (PAD +1 row), which the binding does not cover - graphs rebuild at the exact count instead\n", __func__);
++                } else if (!nkv_st.union_binder.add({
++                        llama_union_param_kind::n_outputs, "n_outputs",
++                        &llama_context::union_tensors_n_outputs,
++                        &llama_context::union_rebind_outputs,
++                    })) {
++                    // cannot happen for a valid kind; stay fail-closed anyway
++                    LLAMA_LOG_ERROR("%s: failed to register the n_outputs union binding; runtime n_outputs patching disabled\n", __func__);
++                }
++                nkv_st.nout_enabled = nkv_st.union_binder.has(llama_union_param_kind::n_outputs);
++            }
++
++            // r8 coverage lane: exact "1"; the coverage audit and the
++            // binder_bind/graph_rebuild/refused_view counters are active only
++            // with it. The gate alone (both lane gates off) creates no slot
++            // and does nothing.
++            nkv_st.cov_enabled = getenv("GGML_TP5_NKV_COV") != nullptr && strcmp(getenv("GGML_TP5_NKV_COV"), "1") == 0;
++
++            if (nkv_st.nkv_enabled || nkv_st.nout_enabled) {
++                LLAMA_LOG_WARN("%s: union runtime binder enabled (%zu param kind(s) registered: n_kv=%d n_outputs=%d)\n",
++                               __func__, nkv_st.union_binder.size(),
++                               (int) nkv_st.nkv_enabled, (int) nkv_st.nout_enabled);
++            }
++        }
++    }
++
+     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+ 
++    // The legacy LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME lane was replaced by the
++    // n_outputs binding registered above (umbrella gate GGML_TP5_UNION_BINDER
++    // only); the legacy env var is no longer read. A stale value in the
++    // environment is reported, never silently ignored:
++    if (const char * legacy_env = getenv("LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME")) {
++        LLAMA_LOG_WARN("%s: LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME=%s ignored: the legacy outputs lane was replaced by the n_outputs union binding (GGML_TP5_UNION_BINDER=1)\n",
++                       __func__, legacy_env);
++    }
+     if (cparams.kv_unified) {
+         cparams.n_ctx_seq = cparams.n_ctx;
+     } else {
+@@ -978,6 +1068,43 @@ llama_context::~llama_context() {
+             }
+         }
+     }
++    // one-line summary at context destruction (runbook contract: exact prefix
++    // NKV_BINDER_STATS, greppable by the HIP gate harness; printed when the
++    // state slot exists and at least one lane gate is exactly "1" - the nkv
++    // counters are 0 when only the legacy outputs gate is on)
++    // (state note: the counters live in the context's own state slot, not in
++    // class data members)
++    {
++        // peek only: never create state during destruction (with the gate off
++        // no slot exists and no stats line prints - stock OFF)
++        const llama_nkv_ctx_state * st = union_binder_state_peek();
++        if (st != nullptr && (st->nkv_enabled || st->nout_enabled)) {
++            if (st->cov_enabled) {
++                // r8 coverage lane: the r7 fields verbatim, then the r8
++                // acceptance counters (binder_bind / graph_rebuild /
++                // refused_view) and the per-category coverage counts
++                // (present in the live record / patched by binds)
++                LLAMA_LOG_INFO("NKV_BINDER_STATS attempts=%zu applied=%zu refused_width=%zu refused_envelope=%zu refused_skeleton=%zu refused_grow=%zu refused_relay=%zu refused_pipeline=%zu fallbacks=%zu record_builds=%zu binder_bind=%zu graph_rebuild=%zu refused_view=%zu\n",
++                               st->c_attempts, st->c_applied, st->c_refused_width, st->c_refused_envelope,
++                               st->c_refused_skeleton, st->c_refused_grow, st->c_refused_relay,
++                               st->c_refused_pipeline, st->c_fallbacks, st->c_record_builds,
++                               st->c_binder_bind, st->c_graph_rebuild, st->c_refused_view);
++                LLAMA_LOG_INFO("NKV_BINDER_COV present(mask/view/rope/kvwrite/fa/other)=%u/%u/%u/%u/%u/%u patched(mask/view/rope/kvwrite/fa/other)=%u/%u/%u/%u/%u/%u\n",
++                               st->cov_present[LLAMA_NKV_COV_MASK], st->cov_present[LLAMA_NKV_COV_VIEW],
++                               st->cov_present[LLAMA_NKV_COV_ROPE], st->cov_present[LLAMA_NKV_COV_KVWRITE],
++                               st->cov_present[LLAMA_NKV_COV_FA], st->cov_present[LLAMA_NKV_COV_OTHER],
++                               st->c_cov_patched[LLAMA_NKV_COV_MASK], st->c_cov_patched[LLAMA_NKV_COV_VIEW],
++                               st->c_cov_patched[LLAMA_NKV_COV_ROPE], st->c_cov_patched[LLAMA_NKV_COV_KVWRITE],
++                               st->c_cov_patched[LLAMA_NKV_COV_FA], st->c_cov_patched[LLAMA_NKV_COV_OTHER]);
++            } else {
++                // r7 line format verbatim (byte-identical without the cov gate)
++                LLAMA_LOG_INFO("NKV_BINDER_STATS attempts=%zu applied=%zu refused_width=%zu refused_envelope=%zu refused_skeleton=%zu refused_grow=%zu refused_relay=%zu refused_pipeline=%zu fallbacks=%zu record_builds=%zu\n",
++                               st->c_attempts, st->c_applied, st->c_refused_width, st->c_refused_envelope,
++                               st->c_refused_skeleton, st->c_refused_grow, st->c_refused_relay,
++                               st->c_refused_pipeline, st->c_fallbacks, st->c_record_builds);
++            }
++    }
++    }
+     ggml_opt_free(opt_ctx);
+ }
+ 
+@@ -1304,7 +1431,12 @@ void llama_context::sched_reserve() {
+     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
+ 
+     gf_res_prev.reset(new llm_graph_result(max_nodes));
++    // the new long-lived result object is owned by this context: the union
++    // binder state uses this back-pointer (llama-nout-state.cpp) instead of a
++    // global result -> context reverse map
++    gf_res_prev->set_owner(this);
+     gf_res_reserve.reset(new llm_graph_result(max_nodes));
++    gf_res_reserve->set_owner(this); // same owner invariant for the reserve result
+ 
+     const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
+         model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
+@@ -2500,6 +2632,753 @@ bool llama_context::set_adapter_cvec(const float * data, size_t len, int32_t n_e
+     return res;
+ }
+ 
++// ---- per-context union-binder state slot (llama-nout-state.h) ----
++
++llama_nkv_ctx_state & llama_context::union_binder_state_get() {
++    if (union_binder_state == nullptr) {
++        // one slot per context, owned by the context (no process-global map);
++        // only the constructor's gate blocks create it - OFF allocates nothing
++        union_binder_state.reset(new llama_nkv_ctx_state);
++    }
++    return *union_binder_state;
++}
++
++const llama_nkv_ctx_state * llama_context::union_binder_state_peek() const {
++    return union_binder_state.get();
++}
++
++// union-graph runtime parameter binder: n_kv lane.
++//
++// 1. when the live graph is (re)built, process_ubatch builds it at the KV
++//    cache's CURRENT true n_kv (no envelope, no headroom, no bucket sizing on
++//    this lane's side) and records the graph's pre-allocation skeleton and
++//    per-tensor byte extents in the context's union-binder state slot; the
++//    scheduler allocates exactly that extent;
++// 2. when the KV cache later moves (can_reuse fails only on the stale
++//    n_kv-coupled shapes), union_rebind_n_kv builds a scratch graph at the
++//    cache's CURRENT n_kv and requires an exact skeleton match against the
++//    recorded live graph;
++// 3. a move to a smaller n_kv fits inside the recorded extents (the
++//    nkv-coupled shapes shrink with n_kv) and is patched in place; a move
++//    past the built width has no allocated backing and is refused - the
++//    caller full-rebuilds at the cache's exact current n_kv and the fresh
++//    build re-records. The binder never pads or rounds: it binds exactly the
++//    value get_n_kv() reports, so any bucket alignment still present is the
++//    stock cache-level pad (llama_kv_cache::get_n_kv), unchanged for OFF and
++//    ON alike;
++// 4. the changed fields (ne/nb/op_params/view_offs + view data pointers) are
++//    copied into the live graph in place, then set_inputs refills the KQ mask
++//    at the live width (cells beyond the applied n_kv are empty -> -INF
++//    masked).
++// Any mismatch -> false and the caller falls through to the normal full
++// rebuild at the cache's exact current n_kv.
++
++
++namespace {
++
++struct llama_nkv_record_t {
++    // DFS post-order: nodes and, before each, its not-yet-seen sources / view source
++    std::vector<ggml_tensor *> t;
++    std::vector<int32_t>       src;   // (GGML_MAX_SRC + 1) entries per tensor, view source last
++    std::vector<uint8_t>       fixed; // pre-existing storage (weights, KV cache)
++    std::vector<size_t>        bytes; // byte envelope of each graph-owned tensor
++
++    void record(ggml_cgraph * gf) {
++        t.clear();
++        src.clear();
++        fixed.clear();
++        bytes.clear();
++
++        std::unordered_map<const ggml_tensor *, int32_t> idx;
++        std::unordered_map<const ggml_tensor *, uint8_t> seen;
++        idx.reserve(4 * (size_t) ggml_graph_n_nodes(gf) + 16);
++        seen.reserve(4 * (size_t) ggml_graph_n_nodes(gf) + 16);
++
++        std::vector<std::pair<ggml_tensor *, int>> stack;
++
++        auto add = [&](ggml_tensor * root) {
++            if (root == nullptr || seen.count(root)) {
++                return;
++            }
++            stack.clear();
++            stack.push_back({ root, 0 });
++            seen[root] = 1;
++            while (!stack.empty()) {
++                ggml_tensor * x = stack.back().first;
++                // fixed = pre-existing storage (weights, KV cache); views created by
++                // this build are graph-owned
++                const bool is_fixed = x->view_src == nullptr && (x->data != nullptr || x->buffer != nullptr);
++
++                bool pushed = false;
++                while (!is_fixed && stack.back().second <= GGML_MAX_SRC) {
++                    const int k = stack.back().second++;
++                    ggml_tensor * s = k < GGML_MAX_SRC ? x->src[k] : x->view_src;
++                    if (s != nullptr && !seen.count(s)) {
++                        seen[s] = 1;
++                        stack.push_back({ s, 0 });
++                        pushed = true;
++                        break;
++                    }
++                }
++                if (pushed) {
++                    continue;
++                }
++                stack.pop_back();
++
++                const int32_t id = (int32_t) t.size();
++                idx[x] = id;
++                t.push_back(x);
++                fixed.push_back(is_fixed ? 1 : 0);
++
++                for (int j = 0; j <= GGML_MAX_SRC; ++j) {
++                    ggml_tensor * s = is_fixed ? nullptr : (j < GGML_MAX_SRC ? x->src[j] : x->view_src);
++                    int32_t v = -1;
++                    if (s != nullptr) {
++                        auto it = idx.find(s);
++                        v = it != idx.end() ? it->second : -2; // -2: back-edge (on DFS stack)
++                    }
++                    src.push_back(v);
++                }
++            }
++        };
++
++        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
++            add(ggml_graph_node(gf, i));
++        }
++    }
++
++    void record_bytes() {
++        bytes.assign(t.size(), 0);
++        for (size_t k = 0; k < t.size(); ++k) {
++            if (!fixed[k] && t[k]->view_src == nullptr) {
++                bytes[k] = ggml_nbytes(t[k]);
++            }
++        }
++    }
++};
++} // namespace
++
++// record the pre-allocation skeleton + byte extents of a freshly built (not
++// yet sched-placed) graph into the context's union-binder state slot; ONE
++// record serves both lanes (nkv + n_outputs) of the latest fresh build
++// (state note: was llama_context::nkv_record_* data members; now lives in the
++// context's own state slot)
++void llama_context::binder_record_snapshot(ggml_cgraph * gf, uint32_t nkv_built) {
++    llama_nkv_record_t rec;
++    rec.record(gf);
++    rec.record_bytes();
++
++    auto & st = llama_nkv_ctx_state_get(this);
++    st.record_t     = std::move(rec.t);
++    st.record_src   = std::move(rec.src);
++    st.record_fixed = std::move(rec.fixed);
++    st.record_bytes = std::move(rec.bytes);
++
++    // r8 coverage lane: classify the recorded nkv-coupled tensor families
++    // (structural: op / flags / name / first dim vs the built width; see
++    // llama_nkv_cov_classify in llama-nout-state.h). ACCOUNTING ONLY: the
++    // counts describe which nkv-coupled families the LIVE record contains;
++    // they are acceptance bookkeeping, not per-op correctness or coverage
++    // evidence. Reset per record: cov_present always describes the CURRENT
++    // live record, never an accumulation. OFF (cov gate not exactly "1"):
++    // no walk - the r7 record is untouched.
++    if (st.cov_enabled) {
++        st.cov_nkv_built = nkv_built;   // the classifier's width reference for this record
++        memset(st.cov_present, 0, sizeof(st.cov_present));
++        for (size_t k = 0; k < st.record_t.size(); ++k) {
++            const ggml_tensor * t = st.record_t[k];
++            const int32_t s0 = st.record_src[k * (GGML_MAX_SRC + 1) + 0];
++            const int32_t vs = st.record_src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
++            ++st.cov_present[llama_nkv_cov_classify((int32_t) t->op, t->name,
++                                                    (t->flags & GGML_TENSOR_FLAG_INPUT) != 0,
++                                                    st.record_fixed[k] != 0,
++                                                    s0 >= 0 && st.record_fixed[s0] != 0,
++                                                    vs >= 0 && st.record_fixed[vs] != 0,
++                                                    t->ne[0], nkv_built)];
++        }
++    }
++}
++
++// table-driven dispatch: kind -> tensor set provider -> rebind operation
++bool llama_union_binder::rebind(llama_union_param_kind kind,
++                                llama_context * ctx,
++                                llm_graph_result * res,
++                                const llm_graph_params & params) const {
++    const llama_union_binding * binding = get(kind);
++    if (binding == nullptr || binding->tensor_set == nullptr || binding->rebind == nullptr) {
++        return false;
++    }
++    const llama_union_tensor_set set = (ctx->*(binding->tensor_set))();
++    return (ctx->*(binding->rebind))(res, params, set);
++}
++
++// n_kv binding: the recorded skeleton + byte extents of the latest fresh build
++llama_union_tensor_set llama_context::union_tensors_n_kv() {
++    auto & st = llama_nkv_ctx_state_get(this);
++    return { &st.record_t, &st.record_src, &st.record_fixed, &st.record_bytes };
++}
++
++bool llama_context::union_rebind_n_kv(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set) {
++    // the record vectors come from the binding's tensor set provider; alias them
++    // once (all later reads/writes go through these names)
++    const std::vector<ggml_tensor *> & record_t     = *set.tensors;
++    const std::vector<int32_t>       & record_src   = *set.src;
++    const std::vector<uint8_t>       & record_fixed = *set.fixed;
++    const std::vector<size_t>        & record_bytes = *set.bytes;
++
++    auto & st = llama_nkv_ctx_state_get(this);
++
++    // NKV_BINDER_STATS: every binder invocation counts as an attempt
++    ++st.c_attempts;
++
++    if (!res || res->get_gf() == nullptr) {
++        ++st.c_fallbacks;
++        return false;
++    }
++    // the binder needs the pre-allocation record of the latest fresh build
++    if (!st.record_valid || record_t.empty()) {
++        ++st.c_fallbacks;
++        return false;
++    }
++    // tp5-relay pins host graph buffers and validates every node's scheduler
++    // placement after the rebuild; in-place n_kv patching is out of its contract
++    if (backend_tp5_relay != nullptr || cparams.pipeline_parallel) {
++        if (backend_tp5_relay != nullptr) {
++            ++st.c_refused_relay;
++        }
++        if (cparams.pipeline_parallel) {
++            ++st.c_refused_pipeline;
++        }
++        ++st.c_fallbacks;
++        return false;
++    }
++
++    // collect every KV-cache context whose n_kv shapes this graph
++    const llama_kv_cache_context * kvs[2] = { nullptr, nullptr };
++    int nkvs = 0;
++    if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(params.mctx)) {
++        kvs[nkvs++] = h->get_attn();
++    } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(params.mctx)) {
++        kvs[nkvs++] = k;
++    }
++    if (nkvs == 0) {
++        ++st.c_fallbacks;
++        return false;
++    }
++
++    uint32_t nkv_now = kvs[0]->get_n_kv();
++    for (int i = 1; i < nkvs; ++i) {
++        if (kvs[i]->get_n_kv() != nkv_now) {
++            nkv_now = 0;
++        }
++    }
++    // one well-defined width: nkv_now was zeroed above when the sub-caches
++    // disagree; an empty cache has no width to bind either. No alignment or
++    // rounding here - the binder binds exactly the value the cache reports
++    // (any bucket padding is the stock cache-level pad, unchanged for OFF
++    // and ON alike)
++    if (nkv_now == 0) {
++        ++st.c_refused_width;
++        ++st.c_fallbacks;
++        return false;
++    }
++    // r8 coverage lane: fail-closed on attention-view readers (the "view"
++    // family's reader subpath). Reader inputs capture build-time spans/values
++    // (llama-graph.cpp, build_attn_inp_kv_impl -> readers); the in-place patch
++    // copies tensor layouts only - it cannot re-resolve captured reader
++    // values - and the skeleton compare checks sizes only, so a frontier
++    // change with equal reader sizes would patch the graph and then write
++    // stale captured values at set_input. Refuse and let the caller
++    // full-rebuild (the fresh build re-resolves the readers at the current
++    // frontier). OFF (cov gate not exactly "1"): r7 behavior - unchanged.
++    if (st.cov_enabled) {
++        bool attn_views = false;
++        for (int i = 0; i < nkvs; ++i) {
++            attn_views |= kvs[i]->has_attention_views();
++        }
++        if (attn_views) {
++            ++st.c_refused_view;
++            ++st.c_fallbacks;
++            return false;
++        }
++    }
++    // non-nkv graph keys must be identical: allow_reuse compares every graph-
++    // shaping input EXCEPT the n_kv-coupled shapes (ubatch layout, sequence
++    // ids, output flags, samplers, adapters, cross, cparams flags, arch,
++    // gtype). Without this gate, a non-nkv difference whose node skeleton
++    // happens to match could be patched while the live graph's recorded
++    // params (and its set_inputs closures) still reflect the old keys.
++    // NOTE: the caller only invokes the binder when can_reuse already failed,
++    // so this rejects precisely the "reuse failed for a NON-nkv reason" case.
++    // (encapsulation: llm_graph_result::params stays private; the
++    // get_params() accessor adds no data member)
++    if (!res->get_params().allow_reuse(params)) {
++        ++st.c_refused_skeleton;
++        ++st.c_fallbacks;
++        return false;
++    }
++    // true-width window: the live graph was built and sched-allocated AT
++    // record_cap (the cache's exact n_kv at build time - no envelope), so
++    // only n_kv <= record_cap has real backing. record_bound tracks the width
++    // the live graph's nkv-coupled shapes are CURRENTLY bound at (it moves on
++    // every successful patch and equals record_cap right after a fresh
++    // build), so:
++    // - equality with the bound width is a true no-op (a patch would be an
++    //   exact no-op; the normal reuse path usually takes this case first, but
++    //   stay fail-closed);
++    // - anything above the built width has no allocated backing -> full
++    //   rebuild at the cache's exact current n_kv (which re-records).
++    if (nkv_now > st.record_cap) {
++        ++st.c_refused_grow;
++        ++st.c_fallbacks;
++        return false;
++    }
++    if (nkv_now == st.record_bound) {
++        // the live graph's nkv-coupled shapes are already bound at exactly
++        // this width: a patch would be an exact no-op. This compares against
++        // record_bound (the current bound width); a grow-back to the built
++        // width after a shrink patch is a real bind, not a no-op
++        ++st.c_fallbacks;
++        return false;
++    }
++
++    // scratch build at the cache's CURRENT n_kv. Everything except the
++    // nkv-coupled shapes must match; the shared scratch-validate-patch tail
++    // is the definitive gate: a skeleton match proves the only difference is
++    // nkv-coupled shapes (the scratch is built at the live graph's CURRENT
++    // bound output width), and the byte-extent checks prove the placement
++    // still fits.
++    llm_graph_params gp = params;
++    // build the scratch at the live graph's CURRENT bound output width
++    // (nout_bound), never at this ubatch's active count (params.n_outputs
++    // holds the requested count) - so the patch leaves every output shape
++    // untouched
++    gp.n_outputs = st.nout_bound;
++    if (!union_binder_scratch_patch(res, std::move(gp), set, st.cov_enabled ? st.cov_pending : nullptr)) {
++        return false;
++    }
++    st.record_bound = nkv_now;   // the live graph's nkv-coupled shapes are now bound at nkv_now
++    ++st.c_applied;
++    // Coverage remains staged until output reconciliation and scheduler allocation succeed.
++    return true;
++}
++
++// n_outputs binding: shares the nkv lane's pre-allocation record (one live
++// graph, one fresh-build record)
++llama_union_tensor_set llama_context::union_tensors_n_outputs() {
++    auto & st = llama_nkv_ctx_state_get(this);
++    return { &st.record_t, &st.record_src, &st.record_fixed, &st.record_bytes };
++}
++
++// n_outputs binding: narrow/restore the executed output shapes of the live
++// build to this ubatch's active count. The live graph was built and
++// sched-allocated at the EXACT active count of its build round (no
++// pad-to-max, no envelope - the stock out_ids topology); its out_ids input
++// and every GET_ROWS dst reading it currently hold nout_bound (the LAST
++// bound active count). This rebind:
++//   1. requires the same placement contracts as the nkv lane (fail-closed);
++//   2. requires the kv side of the live graph to be consistent (the scratch
++//      build must NOT touch nkv-coupled shapes - that is the n_kv lane's job);
++//   3. builds a scratch graph at the active count (plain n_outputs - no
++//      envelope);
++//   4. requires an exact skeleton match against the recorded live build
++//      (any topology difference -> caller rebuilds);
++//   5. checks every changed tensor fits its recorded byte extent;
++//   6. copies the changed fields into the live graph in place.
++// n_outputs == 0 is a first-class bound: the scratch build is the stock
++// zero-output topology (the gather over an empty out_ids), the skeleton
++// matches, and every narrowed tensor has nbytes 0 - the graph computes zero
++// output rows, exactly like a stock zero-output build.
++bool llama_context::union_rebind_outputs(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set) {
++    auto & st = llama_nkv_ctx_state_get(this);
++
++    // NKV_BINDER_STATS: every binder invocation counts as an attempt
++    ++st.c_attempts;
++
++    if (!res || res->get_gf() == nullptr) {
++        ++st.c_fallbacks;
++        return false;
++    }
++    // the binder needs the pre-allocation record of a live decoder build
++    if (!st.nout_record_valid || set.tensors->empty()) {
++        ++st.c_fallbacks;
++        return false;
++    }
++    // the live graph must actually carry an out_ids gather input (pooling /
++    // embedding-only graphs have none): nothing to reconcile -> fail closed
++    {
++        bool has_out_ids = false;
++        for (const auto & input : res->inputs) {
++            if (dynamic_cast<const llm_graph_input_out_ids *>(input.get()) != nullptr) {
++                has_out_ids = true;
++                break;
++            }
++        }
++        if (!has_out_ids) {
++            ++st.c_refused_skeleton;
++            ++st.c_fallbacks;
++            return false;
++        }
++    }
++    // tp5-relay pins host graph buffers and validates every node's scheduler
++    // placement after the rebuild; in-place n_outputs patching is out of its
++    // contract (same as the nkv lane)
++    if (backend_tp5_relay != nullptr || cparams.pipeline_parallel) {
++        if (backend_tp5_relay != nullptr) {
++            ++st.c_refused_relay;
++        }
++        if (cparams.pipeline_parallel) {
++            ++st.c_refused_pipeline;
++        }
++        ++st.c_fallbacks;
++        return false;
++    }
++    // non-nkv graph keys must be identical: normalize the n_outputs key (the
++    // graph is built at the exact active count; the ACTIVE count is exactly
++    // what THIS rebind reconciles)
++    {
++        llm_graph_params pk = params;
++        pk.n_outputs = res->get_params().n_outputs;
++        if (!res->get_params().allow_reuse(pk)) {
++            ++st.c_refused_skeleton;
++            ++st.c_fallbacks;
++            return false;
++        }
++    }
++    // no-op: the executed output shapes already hold this active count
++    if ((uint32_t) n_outputs == st.nout_bound) {
++        ++st.c_fallbacks;
++        return false;
++    }
++    // growth past the built width has no allocated backing; cannot normally
++    // happen (the live graph was built at a previous active count and this
++    // rebind only moves the executed shapes within [0, nout_cap]) but stay
++    // fail-closed
++    if ((uint32_t) n_outputs > st.nout_cap) {
++        ++st.c_refused_grow;
++        ++st.c_fallbacks;
++        return false;
++    }
++
++    // kv consistency: when the nkv lane has a live record, the scratch build
++    // runs at the cache's CURRENT n_kv and the live graph's nkv-coupled
++    // shapes are bound at record_bound - they must agree (the nkv lane binds
++    // first when the cache moved, or nothing moved), otherwise output shapes
++    // would be patched onto a kv side bound at another width: fail closed,
++    // caller rebuilds. This also refuses the combined "kv grew past the
++    // built width + outputs changed" round.
++    // When the nkv lane has NO live record (lane off, or no KV-cache
++    // context in this graph), no in-place nkv patching can have happened:
++    // the live kv shapes are exactly what the last fresh build produced and
++    // can_reuse (live-ne keys, llama-graph.cpp) already refused any mismatch
++    // with the cache - the check is skipped, not forced to a 0-bound
++    // rejection (an unconditional check would refuse every round when the
++    // legacy outputs gate runs alone, since record_bound stays 0 there).
++    const llama_kv_cache_context * kvs[2] = { nullptr, nullptr };
++    int nkvs = 0;
++    if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(params.mctx)) {
++        kvs[nkvs++] = h->get_attn();
++    } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(params.mctx)) {
++        kvs[nkvs++] = k;
++    }
++    if (nkvs > 0 && st.nkv_enabled && st.record_valid) {
++
++        uint32_t nkv_now = kvs[0]->get_n_kv();
++        for (int i = 1; i < nkvs; ++i) {
++            if (kvs[i]->get_n_kv() != nkv_now) {
++                nkv_now = 0;
++            }
++        }
++        if (nkv_now != st.record_bound) {
++            ++st.c_refused_width;
++            ++st.c_fallbacks;
++            return false;
++        }
++    }
++
++    // scratch build at the active count (plain n_outputs - no envelope)
++    llm_graph_params gp = params;
++    gp.n_outputs = (uint32_t) n_outputs;
++
++    const bool ok = union_binder_scratch_patch(res, std::move(gp), set, nullptr);
++    if (!ok) {
++        return false;
++    }
++
++    st.nout_bound = (uint32_t) n_outputs;   // the executed output shapes now hold this count
++    // r8: the shared scratch tail no longer bumps c_applied (the r7 tail bump
++    // double-counted the nkv lane); each caller counts its own success. This
++    // is the FINAL success point for the n_outputs lane: everything after it
++    // can only fail via the caller's alloc-failure rollback, which unwinds
++    // this increment (--c_applied per rolled-back lane).
++    ++st.c_applied;
++    ++st.nout_binds;
++    return true;
++}
++
++// shared scratch-validate-patch tail of every union binding (nkv + n_outputs):
++// build the scratch graph from gp, require an exact skeleton match against the
++// recorded fresh build, check every changed tensor fits its recorded byte
++// extent, and copy the changed fields into the live graph in place. Any
++// mismatch leaves the live graph untouched and returns false (the caller falls
++// back to a full rebuild). Takes gp by value: the caller sets res/n_outputs
++// before dispatching. cov_patched_out (r8 coverage lane, may be null): when
++// non-null, the apply loop classifies every changed tensor into its
++// nkv-coupled coverage category (llama_nkv_cov_classify) and accumulates the
++// per-category count into a LOCAL array that is published into the caller's
++// array only at the final success return - a refused patch can never leak
++// counts (no bump-on-fail); null keeps the accounting off.
++bool llama_context::union_binder_scratch_patch(llm_graph_result * res, llm_graph_params gp, const llama_union_tensor_set & set, uint32_t * cov_patched_out) {
++    auto & st = llama_nkv_ctx_state_get(this);
++
++    uint32_t cov_local[LLAMA_NKV_COV_N] = {};   // r8: staged per-category counts (published at the final return)
++
++    // the record vectors come from the binding's tensor set provider; alias them
++    // once (all later reads/writes go through these names)
++    const std::vector<ggml_tensor *> & record_t     = *set.tensors;
++    const std::vector<int32_t>       & record_src   = *set.src;
++    const std::vector<uint8_t>       & record_fixed = *set.fixed;
++    const std::vector<size_t>        & record_bytes = *set.bytes;
++
++    llm_graph_result_ptr & nkv_scratch = *reinterpret_cast<llm_graph_result_ptr *>(&st.nkv_scratch);
++    if (!nkv_scratch) {
++        nkv_scratch.reset(new llm_graph_result(res->get_max_nodes()));
++    }
++    nkv_scratch->reset();
++
++    // naming-only callback: the real callback pins tensors on the scheduler, which a
++    // never-placed scratch graph must not touch
++
++    gp.res = nkv_scratch.get();
++    gp.cb = [](const llama_ubatch &, ggml_tensor * cur, const char * name, int il) {
++        if (il >= 0) {
++            ggml_format_name(cur, "%s-%d", name, il);
++        } else {
++            ggml_set_name(cur, name);
++        }
++    };
++
++    ggml_cgraph * gs = model.build_graph(gp);
++    if (gs == nullptr) {
++        ++st.c_refused_skeleton;
++        ++st.c_fallbacks;
++        return false;
++    }
++
++    llama_nkv_record_t rec_new;
++    rec_new.record(gs);
++    rec_new.record_bytes(); // envelope sizes for the shrink-only byte checks below
++
++    const size_t n = record_t.size();
++    if (rec_new.t.size() != n || rec_new.src != record_src ||
++            rec_new.fixed != record_fixed || rec_new.bytes.size() != record_bytes.size()) {
++        ++st.c_refused_skeleton;
++        ++st.c_fallbacks;
++        return false;
++    }
++
++    // exact skeleton + every changed field fits: copy in place
++    for (size_t k = 0; k < n; ++k) {
++        ggml_tensor * s = rec_new.t[k];
++        ggml_tensor * d = record_t[k];
++
++        if (record_fixed[k]) {
++            // pre-existing storage (weights, KV cache): the scratch build must
++            // reference the very same tensor object
++            if (s != d) {
++                ++st.c_refused_skeleton;
++                ++st.c_fallbacks;
++                return false;
++            }
++            continue;
++        }
++
++        if (s->op != d->op || s->type != d->type ||
++                strncmp(s->name, d->name, GGML_MAX_NAME) != 0 ||
++                (s->view_src == nullptr) != (d->view_src == nullptr)) {
++            ++st.c_refused_skeleton;
++            ++st.c_fallbacks;
++            return false;
++        }
++
++        if (s->view_src == nullptr) {
++            // graph-owned tensor: must fit inside the envelope the scheduler
++            // allocated the live tensor at (shrink-only)
++            if (ggml_nbytes(s) > record_bytes[k]) {
++                ++st.c_refused_envelope;
++                ++st.c_fallbacks;
++                return false;
++            }
++        } else {
++            // 0-byte view can have a nonzero view_offs (static slicing); no bytes
++            // are accessed, so skip the range check (avoids false OOB rejections)
++            if (ggml_nbytes(s) == 0) {
++                continue;
++            }
++            const int32_t vs = rec_new.src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
++            if (vs < 0) {
++                ++st.c_refused_skeleton;
++                ++st.c_fallbacks;
++                return false;
++            }
++            // the limit is the full byte size of the view's source: a fixed source
++            // (KV cache) has no recorded envelope, its allocation is exact
++            const size_t lim = record_fixed[vs] ? ggml_nbytes(record_t[vs]) : record_bytes[vs];
++            if (s->view_offs + ggml_nbytes(s) > lim) {
++                ++st.c_refused_envelope;
++                ++st.c_fallbacks;
++                return false;
++            }
++        }
++    }
++
++    // apply: copy every changed tensor's layout into the live graph
++    for (size_t k = 0; k < n; ++k) {
++        if (record_fixed[k]) {
++            continue;
++        }
++        ggml_tensor * s = rec_new.t[k];
++        ggml_tensor * d = record_t[k];
++
++        const bool diff = memcmp(s->ne, d->ne, sizeof(d->ne)) != 0 ||
++                          memcmp(s->nb, d->nb, sizeof(d->nb)) != 0 ||
++                          memcmp(s->op_params, d->op_params, sizeof(d->op_params)) != 0 ||
++                          s->view_offs != d->view_offs;
++        if (!diff) {
++            continue;
++        }
++
++        // r8 coverage lane: classify BEFORE the copy (the mask rule keys on
++        // the record-time first dim == the recorded built width); the copy
++        // below overwrites d->ne with the scratch's shapes
++        int cov_cat = LLAMA_NKV_COV_OTHER;
++        if (cov_patched_out != nullptr) {
++            const int32_t s0 = record_src[k * (GGML_MAX_SRC + 1) + 0];
++            const int32_t vs = record_src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
++            cov_cat = llama_nkv_cov_classify((int32_t) s->op, s->name,
++                                             (s->flags & GGML_TENSOR_FLAG_INPUT) != 0,
++                                             record_fixed[k] != 0,
++                                             s0 >= 0 && record_fixed[s0] != 0,
++                                             vs >= 0 && record_fixed[vs] != 0,
++                                             d->ne[0], st.cov_nkv_built);
++        }
++        memcpy(d->ne, s->ne, sizeof(d->ne));
++        memcpy(d->nb, s->nb, sizeof(d->nb));
++        memcpy(d->op_params, s->op_params, sizeof(d->op_params));
++        d->view_offs = s->view_offs;
++        if (d->view_src != nullptr && d->view_src->data != nullptr) {
++            d->data = (char *) d->view_src->data + d->view_offs;
++        }
++
++        if (cov_patched_out != nullptr) {
++            ++cov_local[cov_cat];   // staged: published only at the final return
++        }
++    }
++
++    // restore: the previous alloc_graph's split_graph pass 5 (ggml-backend.cpp,
++    // "node->src[j] = tensor_id_copy(...)") rewrote the LIVE graph's node src[]
++    // to point at sched->ctx-owned split-input copies. ggml_backend_sched_reset
++    // + alloc_graph re-runs split_graph on this same live graph, and the freed
++    // copy structs' stale buffer/data fields then poison the re-derivation (the
++    // freed input_cpy is treated as a pre-allocated tensor of the GPU backend,
++    // so no new copy is created for it and the node keeps a freed struct as its
++    // source -> garbage ids read at compute -> OOB). The record was taken
++    // pre-alloc (binder_record_snapshot, before the first alloc_graph), so it
++    // holds the pristine build-time topology: restore every non-fixed recorded
++    // tensor's src[]/view_src from it. Fixed tensors (weights, KV cache) are
++    // never rewritten by split_graph and are skipped. -1 = null src (unchanged),
++    // -2 = back-edge (impossible in a build DAG; leave the pointer untouched).
++    // Pure pointer fix-up from the same vectors the skeleton compare validated:
++    // no new failure mode, and the OFF path never enters this function.
++    for (size_t k = 0; k < n; ++k) {
++        if (record_fixed[k]) {
++            continue;
++        }
++        const int32_t vsrc = record_src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
++        if (vsrc >= 0) {
++            record_t[k]->view_src = record_t[vsrc];
++        }
++        for (int j = 0; j < GGML_MAX_SRC; ++j) {
++            const int32_t v = record_src[k * (GGML_MAX_SRC + 1) + j];
++            if (v >= 0) {
++                record_t[k]->src[j] = record_t[v];
++            }
++        }
++    }
++
++    // clear stale allocation state: the previous alloc_graph's gallocr wrote
++    // buffer/data (and, for CPU-side buffers, extra) into every graph-owned
++    // tensor of this LIVE graph. The re-plan below (sched_reset +
++    // alloc_graph) re-runs split_graph on the same graph, and pass 1
++    // (ggml-backend.cpp, ggml_backend_sched_backend_id_from_cur ->
++    // ggml_backend_sched_backend_from_buffer) treats any tensor with a
++    // non-NULL buffer (directly or via view_src) as PRE-ALLOCATED: it derives
++    // the backend from the stale buffer instead of the op, and when no
++    // backend both owns that buffer type and supports the op it GGML_ABORTs
++    // ("pre-allocated tensor ... cannot run the operation"). The stale
++    // buffer/data also poison supports_op's src[] scan (a freed split-copy
++    // struct's buffer/buft is undefined). Clearing buffer/data/extra on the
++    // graph-owned tensors restores the fresh-build state the re-plan expects:
++    //   - split_graph pass 1 then assigns backends by op, as on a fresh graph;
++    //   - gallocr re-assigns storage: ggml_gallocr_init_tensor (ggml-alloc.c)
++    //     re-runs ggml_backend_view_init for views (buffer==NULL) and
++    //     ggml_vbuffer_tensor_alloc for base tensors (data==NULL), and
++    //     ggml_gallocr_needs_realloc falls back to a full reserve when a
++    //     cleared tensor's size no longer fits its recorded size_max - so no
++    //     cleared tensor can reach compute unallocated;
++    //   - extra is only ever written by CPU-side buffer init_tensor hooks
++    //     (repack/amx) and never read on GPU paths; clearing it is safe and
++    //     keeps the tensor byte-identical to a fresh build.
++    // Scope (matches the GPU-verified probe semantics): every recorded tensor
++    // that is NOT fixed (fixed = pre-existing storage: weights, KV cache) and
++    // NOT a view of a fixed tensor (KV-cache views keep their fixed source's
++    // live buffer/data; their own buffer/data were also gallocr-assigned but
++    // their view_src is never rewritten, and the re-plan re-inits them via
++    // ggml_backend_view_init only if their buffer is NULL - so leave them
++    // alone, exactly like the probe). Fixed tensors are never touched.
++    for (size_t k = 0; k < n; ++k) {
++        if (record_fixed[k]) {
++            continue;
++        }
++        const int32_t vsrc = record_src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
++        if (vsrc >= 0 && record_fixed[vsrc]) {
++            // view of a fixed tensor (KV view): keep its buffer/data
++            continue;
++        }
++        ggml_tensor * d = record_t[k];
++        d->buffer = nullptr;
++        d->data   = nullptr;
++        d->extra  = nullptr;
++    }
++    nkv_scratch->reset();
++    // r8: success counting moved to the CALLERS (union_rebind_n_kv bumps
++    // c_applied for the nkv lane, union_rebind_outputs for the n_outputs
++    // lane). The r7 tail bump double-counted every nkv bind (the caller
++    // bumps too), which broke attempts == applied + fallbacks on every
++    // successful bind; the r8 counters fix the identity.
++    // r8 coverage lane: publish the local per-category counts only now - the
++    // patch is committed past every failure path (skeleton/envelope checks
++    // all ran before the apply loop; the restore/clear loops cannot fail), so
++    // a refused patch can never leak counts into the caller's array.
++    if (cov_patched_out != nullptr) {
++        for (int c = 0; c < LLAMA_NKV_COV_N; ++c) {
++            cov_patched_out[c] = cov_local[c];
++        }
++    }
++    return true;
++}
++
++// GGML_TP5_FA_NKV_PARAM (exact "1", r8): per-request true runtime KV length.
++// The FA op param is written at graph build, so the gate must keep every
++// reuse/patch/envelope path off: a reused or patched graph would carry the
++// previous eval's param value and the kernels would read a stale bound.
++static bool llama_ctx_fa_nkv_param_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("GGML_TP5_FA_NKV_PARAM");
++        return env != nullptr && strcmp(env, "1") == 0;
++    }();
++    return enabled;
++}
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch,
+                                                  llm_graph_type           gtype,
+                                                  llama_memory_context_i * mctx,
+@@ -2561,24 +3440,204 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
++    bool reused = !graph_reuse_disable && !llama_ctx_fa_nkv_param_enabled() && res->can_reuse(gparams);
++
++    // set only when an in-place patch (below) succeeded: the scheduler's
++    // split-input copies were created during the PREVIOUS alloc_graph and still
++    // carry the pre-patch layout, so they must be re-planned before compute.
++    bool nkv_patched  = false;
++    bool nout_patched = false;
++
++    // n_outputs lane: the live graph is bound at nout_bound (the LAST bound
++    // active count); when this ubatch needs a different count and the
++    // n_outputs binding is registered, the binder must reconcile it
++    // (can_reuse keys the out_ids input on the count at BUILD time, so a
++    // changed count fails the stock key and the bound-vs-active difference
++    // forces the dispatch; a narrowed graph reused at its built count is
++    // re-narrowed here before any compute).
++    auto * binder_st = union_binder_state_peek();
++    const bool nout_lane = binder_st != nullptr && binder_st->nout_enabled;
++    const bool nout_pending = nout_lane && binder_st->nout_bound != (uint32_t) n_outputs;
++    // stale-bound guard: the build-time can_reuse keys mix live tensor shapes
++    // (can_reuse_kq_mask compares kq_mask->ne[0] against the cache's CURRENT
++    // get_n_kv(), llama-graph.cpp:95-101) with build-time members
++    // (llm_graph_input_out_ids::can_reuse compares the BUILD count,
++    // llama-graph.cpp:277). An in-place patch moves the live shapes without
++    // touching the build record, so a "reusable" verdict can coexist with a
++    // bound state that differs from this round's values: e.g. n_outputs
++    // returns to the build count after a narrow bind - the out_ids key
++    // passes, while the executed gather shapes still hold the narrowed width
++    // (missing outputs / OOB gather). Reuse is trusted only when every
++    // enabled lane's bound state equals the current value; otherwise fall
++    // through to the binder (restore within the built width) or a fail-
++    // closed full rebuild. Covers nkv_now == 0 (sub-cache disagreement) too.
++    if (reused && binder_st != nullptr) {
++        bool stale = false;
++        if (binder_st->nout_enabled && binder_st->nout_bound != (uint32_t) n_outputs) {
++            stale = true;
++        }
++        if (!stale && binder_st->nkv_enabled && binder_st->record_valid) {
++            const llama_kv_cache_context * kvs[2] = { nullptr, nullptr };
++            int nkvs = 0;
++            if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
++                kvs[nkvs++] = h->get_attn();
++            } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
++                kvs[nkvs++] = k;
++            }
++            if (nkvs > 0) {
++                uint32_t nkv_now = kvs[0]->get_n_kv();
++                for (int i = 1; i < nkvs; ++i) {
++                    if (kvs[i]->get_n_kv() != nkv_now) {
++                        nkv_now = 0;
++                    }
++                }
++                if (nkv_now != binder_st->record_bound) {
++                    stale = true;
++                }
++            }
++        }
++        if (stale) {
++            reused = false;
++        }
++    }
++    if (!reused && !graph_reuse_disable && binder_st != nullptr && binder_st->nkv_enabled &&
++            !llama_ctx_fa_nkv_param_enabled()) {
++        // union-graph runtime parameter binding: when the previous graph cannot
++        // be reused only because the KV cache moved (width change, bucket
++        // crossing, ...), rebuild the graph in a scratch result at the cache's
++        // CURRENT n_kv, verify the skeleton matches, and patch the live graph
++        // in place only when every changed shape fits the built extents.
++        // Table-driven: the kind -> (tensor set provider, rebind) entry lives
++        // in union_binder and n_kv and n_outputs are registered today (rs_z is
++        // reserved). Fail-closed: an unregistered kind, any mismatch or any
++        // growth past the built width falls back to a full rebuild.
++        // GGML_TP5_FA_NKV_PARAM (exact "1"): disabled - the FA op param is
++        // written at graph build only, so an in-place patch would leave the
++        // previous eval's param value in the live graph; the FA gate keeps
++        // every reuse/patch path off and every eval full-rebuilds at the
++        // true width.
++        auto & union_st = llama_nkv_ctx_state_get(this);
++        reused = nkv_patched = union_st.union_binder.rebind(llama_union_param_kind::n_kv, this, res, gparams);
++    }
++
++    // outputs-only change (or a pending reconcile after an nkv refusal): the
++    // n_outputs binding narrows/restores the executed gather shapes in place.
++    // Skipped when the nkv patch already reconciled the whole param set, or
++    // when the lane is unregistered (nout_pending false). GGML_TP5_FA_NKV_PARAM
++    // (exact "1"): disabled like every in-place patch - a patched-then-reused
++    // graph skips the rebuild that refreshes the FA op param.
++    if (nout_pending && (nkv_patched || !reused) && !graph_reuse_disable && binder_st != nullptr &&
++            binder_st->nout_enabled && !llama_ctx_fa_nkv_param_enabled()) {
++        if (binder_st->union_binder.rebind(llama_union_param_kind::n_outputs, this, res, gparams)) {
++            nout_patched = true;
++            reused = true;
++        } else if (nkv_patched) {
++            // the kv patch applied but the output reconcile failed: the live
++            // graph is half-patched (kv shapes at the new bucket, output shapes
++            // at the OLD bound) - discard it (the rebuild below resets the
++            // result and re-records a fresh build) and keep the counters
++            // honest
++            auto & nkv_st = llama_nkv_ctx_state_get(this);
++            --nkv_st.c_applied;
++            ++nkv_st.c_fallbacks;
++            nkv_patched = false;
++            reused      = false;
++        }
++    }
++
++    if (reused) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+-        // with pipeline parallelism, the previous graph_compute_async may still be running
+-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
+-        // that the previous compute is still reading.
+-        if (cparams.pipeline_parallel) {
+-            ggml_backend_sched_synchronize(sched.get());
++        // an in-place patch (union_rebind_n_kv / union_rebind_outputs) mutated
++        // the live graph tensors' ne/nb/op_params/view_offs AFTER the previous alloc_graph
++        // created the scheduler's split-input copies at the OLD layout; at
++        // compute time ggml_backend_sched_compute_splits would copy graph
++        // tensor -> stale split copy and the ggml_are_same_layout assert fires.
++        // Force a re-plan: alloc_graph unconditionally re-runs split_graph,
++        // which frees the whole copy-tensor context and re-creates every
++        // split-input copy at the CURRENT (patched) layout, and re-assigns
++        // input tensor data pointers (incl. views), so set_inputs() must run
++        // AFTER it. Fail-closed: on alloc failure fall through to the normal
++        // full-rebuild path below (the rebuild's res->reset() + build_graph
++        // discards the in-place mutation; gparams already reflects the new
++        // parameters) and keep the NKV_BINDER_STATS counters honest
++        // (--c_applied per patched lane, ++c_fallbacks).
++        if (nkv_patched || nout_patched) {
++            ggml_backend_sched_reset(sched.get());
++            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++            if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
++                auto & nkv_st = llama_nkv_ctx_state_get(this);
++                if (nkv_patched) {
++                    --nkv_st.c_applied;
++                    ++nkv_st.c_fallbacks;   // the unwound bind becomes a fallback (identity attempts == applied + fallbacks)
++                }
++                if (nout_patched) {
++                    --nkv_st.c_applied;
++                    --nkv_st.nout_binds;
++                    ++nkv_st.c_fallbacks;   // same, per rolled-back lane
++                }
++                reused       = false;
++                nkv_patched  = false;
++                nout_patched = false;
++            }
++            if (nkv_patched && binder_st->cov_enabled) {
++                auto & nkv_st = llama_nkv_ctx_state_get(this);
++                ++nkv_st.c_binder_bind;
++                for (int c = 0; c < LLAMA_NKV_COV_N; ++c) {
++                    nkv_st.c_cov_patched[c] += nkv_st.cov_pending[c];
++                }
++            }
+         }
+ 
+-        n_reused++;
+-    } else {
++        if (reused) {
++            // with pipeline parallelism, the previous graph_compute_async may still be running
++            // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
++            // that the previous compute is still reading.
++            if (cparams.pipeline_parallel) {
++                ggml_backend_sched_synchronize(sched.get());
++            }
++
++            n_reused++;
++        }
++    }
++    // fresh-build bookkeeping shared by the build branch below (record +
++    // per-lane validity/cap/bound); also read by nothing else - the narrow
++    // that used to live further down was folded into the dispatch above
++    bool     rec_nkv = false;
++    bool     env_out = false;
++    uint32_t nkv_built = 0;
++    const llama_kv_cache_context * kv_ctx = nullptr;
++    if (!reused) {
+         res->reset();
+ 
+         ggml_backend_sched_reset(sched.get());
+         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+-
+-        //const auto t_start_us = ggml_time_us();
++        // union-graph runtime nkv record: build the graph at the KV cache's
++        // CURRENT true n_kv (no envelope, no headroom, no bucket sizing on
++        // this lane's side - the value get_n_kv() reports is bound as-is), so
++        // a later move to a SMALLER n_kv can be patched in place while a move
++        // to a LARGER n_kv full-rebuilds at the exact new width.
++        if (!graph_reuse_disable && union_binder_state_peek() != nullptr &&
++                union_binder_state_peek()->nkv_enabled && !cparams.pipeline_parallel &&
++                backend_tp5_relay == nullptr) {
++            if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
++                kv_ctx = h->get_attn();
++            } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
++                kv_ctx = k;
++            }
++            if (kv_ctx != nullptr) {
++                // the cache's current width: what the fresh build uses and
++                // what the record binds (no +1 bucket, no padding)
++                nkv_built = kv_ctx->get_n_kv();
++                rec_nkv   = true;
++            }
++        }
++        // n_outputs record: taken on EVERY fresh decoder build under the lane
++        // (no pad-to-max - the graph is built at the exact active count and
++        // nout_cap records that built width; the rebind only moves the
++        // executed shapes within [0, nout_cap])
++        env_out = !graph_reuse_disable && union_binder_state_peek() != nullptr &&
++            union_binder_state_peek()->nout_enabled && gtype == LLM_GRAPH_TYPE_DECODER;
+ 
+         gf = model.build_graph(gparams);
+ 
+@@ -2590,11 +3649,56 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
+             return nullptr;
+         }
+ 
++        // one pre-allocation record serves both lanes (one live graph):
++        //  - the nkv lane's record_valid stays tied to its true-width fresh
++        //    build (r7 semantics: the graph is built and sched-allocated at
++        //    the cache's exact current n_kv - no envelope, no headroom; a
++        //    later move to a LARGER n_kv full-rebuilds and re-records);
++        //  - the n_outputs lane records EVERY fresh decoder build (no
++        //    pad-to-max): nout_cap is the BUILT width, nout_bound the width
++        //    the executed shapes currently hold (== nout_cap on a fresh
++        //    build).
++        // peek first: with the gate off no state slot exists and this whole
++        // block is skipped - the OFF path allocates nothing (stock). The
++        // get() below then reuses the existing slot (no allocation).
++        if (union_binder_state_peek() != nullptr) {
++            auto & st = llama_nkv_ctx_state_get(this);
++
++            if (rec_nkv || env_out) {
++                binder_record_snapshot(gf, nkv_built);
++            }
++            st.record_valid = rec_nkv;
++            if (rec_nkv) {
++                st.record_cap   = nkv_built;   // exact built n_kv (no envelope)
++                st.record_bound = nkv_built;   // fresh build: bound == cap
++                ++st.c_record_builds;
++            } else {
++                st.record_bound = 0;   // no nkv lane record: the nout consistency check is gated off (no in-place kv patching possible)
++            }
++            st.nout_record_valid = env_out;
++            if (env_out) {
++                st.nout_cap = (uint32_t) n_outputs;   // the BUILT width (no pad-to-max)
++            }
++            st.nout_bound = (uint32_t) n_outputs;
++        }
++
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+             return nullptr;
+         }
++
++        // r8 coverage lane: the graph was (re)built AND sched-allocated under
++        // the enabled nkv lane - count it (mock mirror: the contract harness
++        // counts the first build as a rebuild too). Counted only after the
++        // allocation succeeded: a failed alloc abandons the build (the caller
++        // returns above) and must not count as a completed rebuild.
++        if (union_binder_state_peek() != nullptr) {
++            auto & st = llama_nkv_ctx_state_get(this);
++            if (st.cov_enabled && st.nkv_enabled) {
++                ++st.c_graph_rebuild;
++            }
++        }
+     }
+ 
+     // Validate the actual scheduler placement before submitting any compute.
+@@ -2635,6 +3739,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+         res->set_inputs(&ubatch);
+ 
++        // NOTE: no narrow block here. Fresh builds run at the exact active
++        // count (stock build shape, no pad-to-max), so a fresh graph needs no
++        // narrow; every shrink/restore goes through the binder dispatch above
++        // (nout_pending -> union_rebind_outputs), which re-plans the scheduler
++        // and leaves set_inputs to the shared call below/above. A narrow
++        // failure there falls through to the normal full rebuild at the exact
++        // count, which re-records the state - no one-shot suppress flag and no
++        // stale record can survive.
++
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
+@@ -3809,6 +4922,12 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
+                                              const llama_ubatch &           ubatch,
+                                              const llama_memory_context_i * mctx,
+                                              llm_graph_type                 gtype) const {
++    // NOTE: stock. The n_outputs binding does NOT build over a padded
++    // envelope: every graph builds at the exact active count (the pre-r4
++    // behaviour) and the binder's n_outputs rebind only moves the executed
++    // shapes WITHIN the built width (shrink or restore); growth beyond the
++    // built width is refused (refused_envelope) and falls back to a full
++    // rebuild at the new count - no pad-to-max, no headroom.
+     return {
+         /*.arch        =*/model.arch,
+         /*.hparams     =*/model.hparams,
+@@ -3823,6 +4942,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
+         /*.cross       =*/&cross,
+         /*.samplers    =*/sampling.samplers,
+         /*.n_outputs   =*/n_outputs,
++
+         /*.cb          =*/graph_get_cb(),
+         /*.res         =*/res,
+     };
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 4bade14..ebebd74 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -7,12 +7,15 @@
+ #include "llama-adapter.h"
+ #include "llama-impl.h"
+ #include "llama-memory.h"
++#include "llama-union-binder.h"
+ 
+ #include "ggml-cpp.h"
+ #include "ggml-opt.h"
+ 
+ #include <map>
++#include <memory>
+ #include <vector>
++struct llama_nkv_ctx_state;
+ 
+ struct llama_model;
+ class llama_batch_allocr;
+@@ -271,6 +274,12 @@ public:
+     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
+     llm_graph_result * get_gf_res_reserve() const;
+ 
++    // the context's long-lived inference graph result (accessor used by the
++    // union-binder state in llama-nout-state.cpp; a member-function
++    // declaration that adds no data member of its own - note that
++    // llama_context itself does gain one opaque state member below, by
++    // design)
++    llm_graph_result * get_gf_res_prev() const { return gf_res_prev.get(); }
+     // returns the result of ggml_backend_sched_graph_compute_async execution
+     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+ 
+@@ -289,6 +298,70 @@ private:
+ 
+     llm_graph_cb graph_get_cb() const;
+ 
++    // union-graph runtime parameter binder (table-driven; see llama-union-binder.h).
++    //
++    // The live graph is built at the KV cache's CURRENT true n_kv (no
++    // envelope, no headroom, no bucket sizing on the binder's side) and its
++    // pre-allocation skeleton + per-tensor byte extents are stored in the
++    // context's union-binder state slot. When the KV cache's n_kv moved, the
++    // binder rebuilds the graph in a scratch result at the cache's CURRENT
++    // n_kv, verifies the node skeleton matches, checks every changed tensor
++    // still fits inside the live graph's recorded extents, and copies the
++    // changed fields (ne/nb/op_params/view_offs/data) into the live graph in
++    // place. Fail-closed: any mismatch or any n_kv past the built width falls
++    // back to a full rebuild at the cache's exact current n_kv.
++    //
++    // llama_union_binder dispatches per llama_union_param_kind: n_kv and
++    // n_outputs are registered (n_outputs only when no backend samplers are
++    // attached); rs_z is a reserved registration point.
++    //
++    // env: GGML_TP5_UNION_BINDER (enabled only by the exact value "1"); there
++    // is no separate outputs-lane env var - the legacy
++    // LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME lane was replaced by the registered
++    // n_outputs binding.
++    llama_union_tensor_set union_tensors_n_kv();
++
++    // returns true when res's graph was patched in place and can be reused
++    bool union_rebind_n_kv(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set);
++
++    // n_outputs binding: shares the nkv lane's pre-allocation record (one live
++    // graph, one fresh-build record)
++    llama_union_tensor_set union_tensors_n_outputs();
++
++    // narrows/restores the executed output shapes of the live build
++    // to this ubatch's active count
++    bool union_rebind_outputs(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set);
++
++public:
++    // the state slot, created on demand; only the constructor's env-derived
++    // gate blocks create it, so with GGML_TP5_UNION_BINDER unset the context
++    // allocates no binder state at all
++    llama_nkv_ctx_state & union_binder_state_get();
++
++    // read-only view of the state slot, or nullptr when the slot does not
++    // exist (i.e. the binder gate was off) - never creates it; used by
++    // OFF-reachable paths and by llama-nout-state.cpp to map a graph result
++    // back to its owning context
++    const llama_nkv_ctx_state * union_binder_state_peek() const;
++
++private:
++    // record the pre-allocation skeleton + byte extents of a freshly built (not
++    // yet sched-placed) graph into the context's union-binder state slot (shared
++    // by the nkv and n_outputs lanes; renamed from nkv_record_snapshot - the
++    // record now serves both kinds). nkv_built: the exact n_kv the graph was
++    // built at (r8 coverage lane classifier input; 0 when the nkv lane did
++    // not record this build).
++    void binder_record_snapshot(ggml_cgraph * gf, uint32_t nkv_built);
++
++    // shared scratch-validate-patch tail of every binding: build the scratch
++    // graph from gp, require an exact skeleton match against the recorded
++    // fresh build, check every changed tensor fits its recorded byte
++    // extent, and copy the changed fields into the live graph in place.
++    // Takes gp by value: the caller sets res/n_outputs/cb before dispatching.
++    // cov_patched_out (r8 coverage lane, may be null): when non-null the
++    // apply loop bumps the per-category count of every changed tensor.
++    bool union_binder_scratch_patch(llm_graph_result * res, llm_graph_params gp, const llama_union_tensor_set & set, uint32_t * cov_patched_out);
++
+     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
+     // that differs from the layer it belongs to (usually due to missing backend support)
+     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
+@@ -445,6 +518,16 @@ private:
+     llm_graph_result_ptr gf_res_prev;
+     llm_graph_result_ptr gf_res_reserve;
+ 
++    // opaque per-context state of the union-graph runtime binder
++    // (llama_nkv_ctx_state, defined in llama-nout-state.h; unique_ptr to an
++    // incomplete type - ~llama_nkv_ctx_state and the unique_ptr destruction
++    // are instantiated only in ~llama_context, which is out-of-line in
++    // llama-context.cpp where the type is complete). Exception-safe: if the
++    // constructor body throws after the slot was created, member destruction
++    // still runs and frees the slot; no leak. All access goes through
++    // llama_nkv_ctx_state_get() / llama_context::union_binder_state_peek().
++    std::unique_ptr<llama_nkv_ctx_state> union_binder_state;
++
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 18e9dff..c81a77a 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -13,6 +13,7 @@
+ #include "llama-memory-hybrid.h"
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-recurrent.h"
++#include "llama-nout-state.h"
+ 
+ #include <cassert>
+ #include <cmath>
+@@ -22,8 +23,45 @@
+ #include <sstream>
+ #include <string>
+ #include <unordered_set>
+-
+-// MoE down-proj activation path — CUDA is first-class, not an exception.
++#include <unordered_map>
++
++// State placement (no blanket "layout unchanged" claim: llm_graph_result
++// itself does gain an owner member, see llama-graph.h): all per-object state
++// of the lanes lives in the context's own state slot (llama-nout-state.h/cpp)
++// or in the binder's shared build record; there are no TU-local side
++// tables here.
++
++llm_graph_input_out_ids::~llm_graph_input_out_ids() = default;
++
++// GGML_TP5_FA_CHECKED_TAIL / GGML_TP5_FA_RTLEN: exact-"1" env gates for the
++// runtime effective-KV-length lane. CHECKED_TAIL is the required gate name and
++// also arms the streamed checked tail; RTLEN is the r4-lineage alias accepted
++// so the landed kernel/dispatch paths keep their documented contract. Either
++// value (or both) arms the host I32 input lane, the CUDA dispatch reroute and
++// the streamed checked tail; OFF (neither set, or any other value) leaves the
++// graph build and every kernel launch bitwise stock. Read once.
++static bool llama_graph_rtlen_enabled() {
++    static const bool enabled = [] {
++        const char * ct = getenv("GGML_TP5_FA_CHECKED_TAIL");
++        if (ct != nullptr && strcmp(ct, "1") == 0) {
++            return true;
++        }
++        const char * rl = getenv("GGML_TP5_FA_RTLEN");
++        return rl != nullptr && strcmp(rl, "1") == 0;
++    }();
++    return enabled;
++}
++// GGML_TP5_FA_NKV_PARAM (exact "1", r8): per-request true runtime KV length
++// carried in the plain-FA op params slot 5 and consumed as a scalar kernel
++// launch argument. Independent of the r6/r7 lanes; a build-time value, so the
++// gate also disables graph reuse in llama-context.cpp to keep it per-eval.
++static bool llama_graph_fa_nkv_param_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("GGML_TP5_FA_NKV_PARAM");
++        return env != nullptr && strcmp(env, "1") == 0;
++    }();
++    return enabled;
++}
+ //
+ // Default (CUDA / HIP / Vulkan / CPU): pass SwiGLU acts straight into
+ // MUL_MAT_ID. On CUDA the act path is F32→Q8_1; an L2 rescale chain is pure
+@@ -64,8 +102,19 @@ static ggml_tensor * build_attn_inp_kq_mask(
+         ggml_context * ctx,
+         const llama_kv_cache_context * mctx,
+         const llama_ubatch & ubatch,
+-        const llama_cparams & cparams) {
+-    const auto n_kv     = mctx->get_n_kv();
++        const llama_cparams & cparams,
++        int32_t n_kv_read = -1) {
++    // GGML_TP5_FA_NKV_PARAM (exact "1"): n_kv_read > 0 requests the mask at the
++    // true KV length (cell space, max over the ubatch's sequences of the
++    // per-sequence used-cell frontier). The accepted width is the SAME clamp
++    // as llama_kv_cache_context::get_k/get_v - only a value in (0,
++    // mctx->get_n_kv()] is used; anything else falls back to the stock cache
++    // width - so the mask and the FA read views can never disagree on the
++    // width, whatever the caller passes. The fill (set_input_kq_mask) bounds
++    // every write at dst->ne[0], and cells at or past each token's own
++    // sequence frontier stay -INF.
++    const auto n_kv     = (n_kv_read > 0 && n_kv_read <= (int32_t) mctx->get_n_kv()) ?
++        (uint32_t) n_kv_read : mctx->get_n_kv();
+     const auto n_tokens = ubatch.n_tokens;
+     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+ 
+@@ -230,6 +279,40 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
+     }
+ }
+ 
++bool llm_graph_input_pos_bucket_kv::can_reuse(const llm_graph_params & params) {
++    // r8 coverage lane: mirror can_reuse_kq_mask for the [n_kv, n_tokens]
++    // relative-position bucket over the KV cache. The bucket's refill
++    // (set_input_pos_bucket) asserts a single stream and a non-eq-seq batch,
++    // so both are part of this input's reuse key.
++    // The coverage gate must accompany at least one binder lane gate: the
++    // stock reuse path consults this input even when no slot exists.
++    static const bool cov_gate = [] {
++        const char * c = getenv("GGML_TP5_NKV_COV");
++        const char * t = getenv("GGML_TP5_NKV_TRUEWIDTH");
++        const char * u = getenv("GGML_TP5_UNION_BINDER");
++        return c != nullptr && strcmp(c, "1") == 0 &&
++               ((t != nullptr && strcmp(t, "1") == 0) ||
++                (u != nullptr && strcmp(u, "1") == 0));
++    }();
++    if (!cov_gate) {
++        return false;
++    }
++
++
++    const auto n_kv     = mctx->get_n_kv();
++    const auto n_tokens = params.ubatch.n_tokens;
++
++    bool res = true;
++
++    res &= pos_bucket->ne[0] == n_kv;
++    res &= pos_bucket->ne[1] == n_tokens;
++    res &= params.ubatch.n_seqs_unq == 1;      // the refill asserts a single stream
++    res &= !params.ubatch.equal_seqs();        // and a non-eq-seq batch
++
++    return res;
++}
++
++
+ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
+     GGML_ASSERT(out_ids);
+ 
+@@ -260,6 +343,12 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
+ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
+     bool res = true;
+ 
++    // NOTE: stock. The input's reuse key stays the active
++    // n_outputs: the graph always builds at the exact active
++    // count, so a changed count refuses reuse here and the
++    // caller hands the difference to the binder's n_outputs
++    // rebind (reconciles within the built width) or falls
++    // back to a full rebuild.
+     res &= n_outputs == params.n_outputs;
+ 
+     return res;
+@@ -511,6 +600,13 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+     mctx->set_input_k_idxs(self_k_idxs, ubatch);
+     mctx->set_input_v_idxs(self_v_idxs, ubatch);
+ 
++    // GGML_TP5_FA_RTLEN: refresh the runtime effective KV length read by the FA
++    // kernels from src[5]. Value = true used length (max used_max_p1 over streams),
++    // never the 256-aligned envelope.
++    if (self_nkv_eff && self_nkv_eff->buffer) {
++        mctx->set_input_nkv_eff(self_nkv_eff, ubatch);
++    }
++
+     // the mask is left unallocated when the graph only stores K/V without attending
+     // (e.g. DFlash's KV-injection pass)
+     if (self_kq_mask && self_kq_mask->buffer) {
+@@ -1495,6 +1591,13 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
+     this->params = params;
+ }
+ 
++const llm_graph_params & llm_graph_result::get_params() const {
++    return params;
++}
++
++
++
++
+ //
+ // llm_graph_context
+ //
+@@ -2541,6 +2644,10 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
+     //    return nullptr;
+     //}
+ 
++    // NOTE: stock. The graph always builds at the exact active count (the
++    // graph-context member == the context's active n_outputs); the n_outputs
++    // binding reconciles the executed shapes WITHIN the built width and never
++    // builds over a padded envelope.
+     auto inp = std::make_unique<llm_graph_input_out_ids>(hparams, cparams, n_outputs);
+ 
+     auto & cur = inp->out_ids;
+@@ -2654,13 +2761,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+          ggml_tensor * v,
+          ggml_tensor * kq_b,
+          ggml_tensor * kq_mask,
++         ggml_tensor * nkv_eff,
+          ggml_tensor * sinks,
+          ggml_tensor * v_mla,
+              int64_t   n_kv_max,
+                float   kq_scale,
+-                 int   il) const {
++                   int   il,
++                   int32_t nkv_runtime) const {
+     const bool v_trans = v->nb[1] > v->nb[2];
+ 
++    // FA's KV axis before the (0,2,1,3) permute below. This is the width the
++    // launcher later sees as K->ne[1], and it is the width the K/V read views
++    // and the KQ mask were clamped to.
++    const int64_t n_kv_built = k->ne[2];
++
+     // split the batch into streams if needed
+     const auto n_stream = k->ne[3];
+ 
+@@ -2679,7 +2793,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+     if (use_flash_attn) {
+         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
+-
++        // GGML_TP5_FA_NKV_PARAM (r8): the mask row length must equal the KV
++        // width of the read views. The FA kernels take the mask row stride from
++        // nb[1] (tile) or assume it equals K->ne[1] (vec), so a mask narrower
++        // than the K view would be indexed past its allocation. The shared
++        // builder narrows mask and views together, and stock-width consumers
++        // never narrow either; this assert turns any future mismatch into an
++        // immediate host-side failure instead of a device OOB read.
++        GGML_ASSERT(kq_mask == nullptr || kq_mask->ne[0] == n_kv_built);
+         if (v_trans) {
+             v = ggml_transpose(ctx0, v);
+         }
+@@ -2696,13 +2817,34 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+ 
+         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
++
++        // GGML_TP5_FA_RTLEN: attach the caller-provided runtime n_kv_eff tensor
++        // (owned by the attn_kv input object, refreshed per eval in set_input()).
++        // nullptr (feature off, or a builder without an owner) keeps src[5] empty
++        // and the kernel on the stock path.
++        if (nkv_eff != nullptr) {
++            cur->src[5] = nkv_eff;
++        }
+         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+ 
+         ggml_flash_attn_ext_add_sinks(cur, sinks);
+         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+-
++        // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length in op
++        // params slot 5. Gate on: every plain-FA node gets a defined value
++        // (the request length, or -1 when this builder carries no lane), so
++        // the launcher never reads an uninitialized slot. The value is clamped
++        // exactly like the mask builder and get_k/get_v: only (0, built KV
++        // width] is backed by the tensors; anything else falls back to the off
++        // sentinel instead of publishing a bound the launcher would reject.
++        // Gate off: nothing is written and the slot stays byte-identical to
++        // stock.
++        if (llama_graph_fa_nkv_param_enabled()) {
++            const int32_t nkv_publish =
++                (nkv_runtime > 0 && nkv_runtime <= (int32_t) n_kv_built) ? nkv_runtime : -1;
++            ggml_flash_attn_ext_set_n_kv_runtime(cur, nkv_publish);
++        }
+         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
+         // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
+         // Group size must come from K (which determines the WHT rotation), not V.
+@@ -2882,7 +3024,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = k_cur;
+     ggml_tensor * v = v_cur;
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+@@ -2905,9 +3047,15 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+      const llama_ubatch & ubatch,
+     const llama_hparams & hparams,
+     const llama_cparams & cparams,
+-    const llama_kv_cache_context * mctx_cur) {
++    const llama_kv_cache_context * mctx_cur,
++               bool      fa_true_len) {
+ 
+     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
++    // GGML_TP5_FA_NKV_PARAM (r8): the opt-in is per graph. Only the plain FA
++    // build_attn() path narrows the mask and the K/V read views together and
++    // publishes the matching op param; every other consumer of this input keeps
++    // the stock width.
++    inp->fa_true_len = fa_true_len;
+ 
+     {
+         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
+@@ -2935,25 +3083,55 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+                 inp->readers.push_back(std::move(reader));
+             }
+         } else {
+-            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
++            // GGML_TP5_FA_NKV_PARAM (exact "1"): with flash attention, the KQ
++            // mask carries the request's true KV length (get_n_kv_req: max over
++            // the ubatch's sequences; 0 live cells -> -1 sentinel -> stock
++            // width, matching the op param's off sentinel). This branch is
++            // reader-free by construction; the fill bounds at dst->ne[0].
++            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams,
++                    (cparams.flash_attn && inp->fa_true_len && llama_graph_fa_nkv_param_enabled()) ?
++                        mctx_cur->get_n_kv_req(ubatch) : -1);
+             inp->self_kq_mask_cnv = inp->self_kq_mask;
+         }
+     }
+ 
++    // GGML_TP5_FA_RTLEN: the runtime effective KV length input tensor (i32[1]).
++    // Created once per graph; refreshed per eval in set_input(); attached to
++    // every FA node's src[5] by build_attn_mha.
++    if (llama_graph_rtlen_enabled()) {
++        inp->self_nkv_eff = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
++        ggml_set_input(inp->self_nkv_eff);
++        ggml_set_name(inp->self_nkv_eff, "nkv_eff");
++    }
++    // GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length, computed
++    // once per graph build from the already-applied cell state (mctx->apply()
++    // precedes graph build in every decode path). The gate also disables graph
++    // reuse in llama-context.cpp, so this value always belongs to the eval
++    // being computed; the write happens in build_attn_mha. fa_true_len = false
++    // keeps the whole lane off for graphs whose mask is stock width (custom
++    // build_attn_mha consumers): there the value must not reach the op param.
++    if (inp->fa_true_len && llama_graph_fa_nkv_param_enabled()) {
++        inp->self_nkv_req = mctx_cur->get_n_kv_req(ubatch);
++        if (inp->self_nkv_req == 0) {
++            // no live cells for any sequence in this ubatch: no bound exists,
++            // keep the op params untouched (off sentinel)
++            inp->self_nkv_req = -1;
++        }
++    }
++
+     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
+     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
+ 
+     return inp;
+ }
+ 
+-llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
++llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv(bool fa_true_len) const {
+     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+ 
+-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
++    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, fa_true_len);
+ 
+     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+ }
+-
+ ggml_tensor * llm_graph_context::build_attn_reader(
+         llm_graph_input_attn_kv * inp,
+         ggml_tensor * q_rope,
+@@ -3101,8 +3279,19 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * kq_mask = inp->get_kq_mask();
+ 
+     ggml_tensor * q = q_cur;
+-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
++    // GGML_TP5_FA_NKV_PARAM (exact "1"): the FA read views carry the request's
++    // true KV length (self_nkv_req, set by build_attn_inp_kv_impl), matching
++    // the narrowed KQ mask and the op param written in build_attn_mha; the FA
++    // kernels bound every K/V/mask read at the same value, so no read passes
++    // the narrower views. The reader subpath (attention views) can address
++    // cells of sequences outside this ubatch and keeps the stock full-width
++    // views. inp->fa_true_len = false (non-plain-attention graph) keeps the
++    // stock widths, so the mask can never be narrower than these views.
++    // OFF, non-FA attention, empty live set (-1 sentinel): stock.
++    const int32_t nkv_read = (cparams.flash_attn && inp->readers.empty() && inp->fa_true_len &&
++                              llama_graph_fa_nkv_param_enabled()) ? inp->self_nkv_req : -1;
++    ggml_tensor * k = mctx_cur->get_k(ctx0, il, nkv_read);
++    ggml_tensor * v = mctx_cur->get_v(ctx0, il, nkv_read);
+ 
+     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
+     // Q shape: (n_embd_head, n_head, n_tokens)
+@@ -3120,8 +3309,15 @@ ggml_tensor * llm_graph_context::build_attn(
+ 
+     GGML_ASSERT(inp->readers.empty() || kq_b == nullptr);
+     ggml_tensor * cur = inp->readers.empty() ?
+-        build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il) :
++        build_attn_mha(q, k, v, kq_b, kq_mask, inp->self_nkv_eff, sinks, v_mla, 0, kq_scale, il, inp->self_nkv_req) :
+         build_attn_reader(inp, q_rope, q, k, v, sinks, kq_scale, il);
++    // GGML_TP5_FA_RTLEN: every FA node reads the runtime effective KV length from
++    // src[5] (the shared i32[1] input tensor owned by the attn_kv input object;
++    // refreshed per eval in set_input()). OFF: the tensor is nullptr, src[5] stays
++    // empty, kernels take the stock path.
++    if (inp->self_nkv_eff != nullptr && cur->op == GGML_OP_FLASH_ATTN_EXT) {
++        cur->src[5] = inp->self_nkv_eff;
++    }
+     cb(cur, "kqv_out", il);
+ 
+     // TurboQuant: if V was padded, the output has padded dimensions.
+@@ -3254,7 +3450,7 @@ ggml_tensor * llm_graph_context::build_attn(
+         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
+     }
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     // TurboQuant: if V was padded (MLA: V is view of K, may have padded dim),
+@@ -3365,7 +3561,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, nullptr, sinks, v_mla, top_k->ne[0], kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+@@ -3455,7 +3651,7 @@ ggml_tensor * llm_graph_context::build_attn(
+         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
+     }
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
+@@ -3553,7 +3749,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = k;
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (k_rot) {
+@@ -3612,7 +3808,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = k_cur;
+     ggml_tensor * v = v_cur;
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+@@ -3897,11 +4093,11 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
+     );
+ }
+ 
+-llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
++llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid(bool fa_true_len) const {
+     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
+ 
+     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
+-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
++    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), fa_true_len);
+ 
+     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 00ecf89..31d64eb 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -208,6 +208,18 @@ public:
+ 
+     void set_input(const llama_ubatch * ubatch) override;
+ 
++    // r8 coverage lane (GGML_TP5_NKV_COV exact "1" AND at least one binder
++    // lane gate - GGML_TP5_NKV_TRUEWIDTH or GGML_TP5_UNION_BINDER - exact
++    // "1"): the bucket over the KV cache is nkv-coupled ([n_kv, n_batch]).
++    // This can_reuse is consulted on the stock reuse path even when no state
++    // slot exists, so it activates only when the coverage gate accompanies a
++    // registered binder lane; any other combination (cov alone included)
++    // keeps the conservative base refusal - stock, every round rebuilds
++    // exactly as before r8. With the lane on it mirrors can_reuse_kq_mask -
++    // the live bucket shape must match the cache's CURRENT n_kv and this
++    // ubatch's token count.
++    bool can_reuse(const llm_graph_params & params) override;
++
+     ggml_tensor * pos_bucket = nullptr; // I32 [n_kv, n_batch]
+ 
+     const llama_hparams hparams;
+@@ -221,7 +233,7 @@ public:
+             const llama_hparams & hparams,
+             const llama_cparams & cparams,
+             uint32_t n_outputs) : hparams(hparams), cparams(cparams), n_outputs(n_outputs) {}
+-    virtual ~llm_graph_input_out_ids() = default;
++    virtual ~llm_graph_input_out_ids();
+ 
+     void set_input(const llama_ubatch * ubatch) override;
+ 
+@@ -326,6 +338,21 @@ public:
+ 
+ class llm_graph_input_attn_kv : public llm_graph_input_i {
+ public:
++    // GGML_TP5_FA_RTLEN: per-FA-node runtime effective KV length input tensor
++    // (i32[1], created by build_attn_inp_kv()); refreshed in set_input() every eval.
++    ggml_tensor * self_nkv_eff = nullptr;
++    // GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length (cell
++    // space, no padding) computed once per graph build and written into every
++    // plain-FA node's op params slot 5; -1 keeps those params untouched.
++    int32_t self_nkv_req = -1;
++    // GGML_TP5_FA_NKV_PARAM (r8): true-length lane opt-in for THIS graph. The
++    // builder that creates this input decides it; the mask width, the K/V read
++    // view width and the FA op param are all derived from it, so a graph either
++    // narrows all three together or stays at the stock width. Consumers that
++    // pair the mask with stock-width views (custom build_attn_mha call sites,
++    // QSA indexers) must create the input with fa_true_len = false: a narrower
++    // mask than K->ne[1] makes the FA kernels index mask rows past the tensor.
++    bool fa_true_len = false;
+     struct reader_span_input {
+         ggml_tensor * indices;
+         ggml_tensor * position;
+@@ -750,6 +777,7 @@ struct llm_graph_fused_node {
+ 
+ // callback that allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
+ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
++class llama_context;
+ 
+ class llm_graph_result;
+ 
+@@ -909,7 +937,19 @@ public:
+ 
+     void set_params(const llm_graph_params & params);
+ 
++    // the params the graph was last built with (encapsulation accessor: keeps
++    // the params member private; used by llama_context's union-graph runtime
++    // n_kv binder to verify non-nkv graph keys are unchanged before patching;
++    // adds no data member of its own - note llm_graph_result DOES gain the
++    // owner member below, by design)
++    const llm_graph_params & get_params() const;
+ 
++    // the llama_context that owns this result object (set by the context when
++    // the result is (re)created; nullptr for scratch/reserve results). Used by
++    // the union-graph runtime binder state lookup (llama-nout-state.cpp) to
++    // find the owning context from the graph params without any global map.
++    const llama_context * get_owner() const { return owner; }
++    void set_owner(const llama_context * ctx) { owner = ctx; }
+ 
+     // important graph nodes
+     ggml_tensor * t_inp_tokens  = nullptr;
+@@ -944,10 +984,16 @@ private:
+     // note: these are updated after constructing the new graph
+     llm_graph_params params;
+ 
++    // the owning llama_context (see get_owner()/set_owner(); nullptr until the
++    // owning context claims the result). Pointer member: llama_context is only
++    // forward-declared here.
++    const llama_context * owner = nullptr;
++
+     // env: LLAMA_GRAPH_RESULT_DEBUG
+     int debug = 0;
+ };
+ 
++
+ using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
+ 
+ //
+@@ -1152,11 +1198,15 @@ struct llm_graph_context {
+             ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans = false)
+             ggml_tensor * kq_b,
+             ggml_tensor * kq_mask,
++            ggml_tensor * nkv_eff, // [1] i32 runtime effective KV length (rtlen) or nullptr
+             ggml_tensor * sinks,   // [n_head_q]
+             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                 int64_t   n_kv_max,
+                   float   kq_scale,
+-                    int   il) const;
++                    int   il,
++                    // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length
++                    // (cell space, no padding); -1 writes no op param.
++                    int32_t nkv_runtime = -1) const;
+ 
+     ggml_tensor * build_attn_reader(
+         llm_graph_input_attn_kv * inp,
+@@ -1184,7 +1234,9 @@ struct llm_graph_context {
+                   float   kq_scale,
+                     int   il) const;
+ 
+-    llm_graph_input_attn_kv * build_attn_inp_kv() const;
++    // fa_true_len: false keeps the whole graph at stock mask/K/V widths even
++    // when GGML_TP5_FA_NKV_PARAM=1 (opt-out for non-plain attention builders).
++    llm_graph_input_attn_kv * build_attn_inp_kv(bool fa_true_len = true) const;
+ 
+     ggml_tensor * build_attn(
+             llm_graph_input_attn_kv * inp,
+@@ -1332,7 +1384,7 @@ struct llm_graph_context {
+     // hybrid
+     //
+ 
+-    llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
++    llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool fa_true_len = true) const;
+     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
+ 
+     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 5d82f2e..159b5b5 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -13,6 +13,7 @@
+ #include <cstring>
+ #include <limits>
+ #include <map>
++#include <unordered_map>
+ #include <stdexcept>
+ 
+ static bool ggml_is_power_of_2(int n) {
+@@ -2036,6 +2037,36 @@ bool llama_kv_cache::resolve_attention_view(llama_seq_id seq, llama_pos pos,
+     return true;
+ }
+ 
++uint32_t llama_kv_cache::get_used_max_p1(const slot_info & sinfo) const {
++    uint32_t result = 0;
++    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
++        result = std::max(result, v_cells[sinfo.strm[s]].used_max_p1());
++    }
++    return result;
++}
++// GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length. For every
++// sequence in the ubatch, the highest used cell index carrying that sequence
++// plus 1 (cell space, no padding, holes irrelevant — the mask governs them);
++// reduced by max over sequences so one plain-FA node covers the whole batch.
++// 0 means no sequence has live cells; the graph route maps that to the off
++// sentinel. This is deliberately NOT get_n_kv(): the stock builder pads the
++// graph width for graph reuse, which is exactly what this lane must not do.
++int32_t llama_kv_cache::get_seq_used_max_p1_batch(const llama_ubatch & ubatch) const {
++    if (other) {
++        return other->get_seq_used_max_p1_batch(ubatch);
++    }
++
++    int32_t result = 0;
++    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
++        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
++        if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
++            continue;
++        }
++        result = std::max(result, (int32_t) v_cells[seq_to_stream[seq_id]].seq_used_max_p1(seq_id));
++    }
++    return result;
++}
++
+ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+     uint32_t result = 0;
+ 
+@@ -2676,7 +2707,29 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+ 
+     //const int64_t t_end = ggml_time_us();
+ 
+-    //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
++     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
++}
++
++
++
++void llama_kv_cache_context::set_input_nkv_eff(ggml_tensor * dst, const llama_ubatch * ubatch) const {
++    GGML_UNUSED(ubatch);
++
++    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_nelements(dst) == 1);
++
++    // The same streams shape the K/V views and the unpadded bound.
++    const uint32_t result = kv->get_used_max_p1(sinfos[i_cur]);
++
++    const int32_t n_kv_eff = (int32_t) result;
++    ggml_backend_tensor_set(dst, &n_kv_eff, 0, sizeof(int32_t));
++}
++// GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length of the
++// currently applied ubatch, in cell space without padding. Unlike
++// set_input_nkv_eff (device tensor refreshed per eval), this feeds an FA op
++// param written at graph build, so it is only ever consumed behind the graph
++// reuse disable that the gate also arms in llama-context.cpp.
++int32_t llama_kv_cache_context::get_n_kv_req(const llama_ubatch & ubatch) const {
++    return kv->get_seq_used_max_p1_batch(ubatch);
+ }
+ 
+ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+@@ -3717,12 +3770,19 @@ ggml_type llama_kv_cache_context::type_v() const {
+     return kv->type_v();
+ }
+ 
+-ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
+-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
++ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, int32_t n_kv_read) const {
++    // GGML_TP5_FA_NKV_PARAM (exact "1"): n_kv_read in (0, n_kv] narrows the
++    // read view to the request's true KV length (cell space, no padding); the
++    // FA kernels bound every K/V/mask read at the same value (op_params slot
++    // 5, launcher fail-closed), so no read can pass the narrower view. Any
++    // other value keeps the stock cache-width view.
++    const uint32_t n_kv_eff = (n_kv_read > 0 && n_kv_read <= (int32_t) n_kv) ? (uint32_t) n_kv_read : n_kv;
++    return kv->get_k(ctx, il, n_kv_eff, sinfos[i_cur]);
+ }
+ 
+-ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
+-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
++ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, int32_t n_kv_read) const {
++    const uint32_t n_kv_eff = (n_kv_read > 0 && n_kv_read <= (int32_t) n_kv) ? (uint32_t) n_kv_read : n_kv;
++    return kv->get_v(ctx, il, n_kv_eff, sinfos[i_cur]);
+ }
+ 
+ ggml_tensor * llama_kv_cache_context::get_turbo_rotation() const {
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 294ae52..afe2484 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -191,9 +191,18 @@ public:
+ 
+     uint32_t get_size()     const;
+     uint32_t get_n_stream() const;
+-    std::vector<uint32_t> get_layer_ids() const;
++
++    // Maximum occupied physical cell bound among the participating streams.
++    uint32_t get_used_max_p1(const slot_info & sinfo) const;
++
++    // GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length — the max
++    // over the ubatch's unique sequences of that sequence's used-cell frontier
++    // (cell space, no padding); 0 when no sequence has cells. The caller turns
++    // 0 into the off sentinel: a request with no live cells imposes no bound.
++    int32_t get_seq_used_max_p1_batch(const llama_ubatch & ubatch) const;
+     ggml_tensor * get_k_storage(int32_t il) const;
+     ggml_tensor * get_v_storage(int32_t il) const;
++    std::vector<uint32_t> get_layer_ids() const;
+     bool get_v_transposed() const;
+ 
+     bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
+@@ -501,12 +510,31 @@ public:
+     bool has_attention_views() const;
+     llama_attention_view_resolved attention_view(llama_seq_id seq, llama_pos pos) const;
+ 
++    // Write the maximum occupied cell bound across the current streams
++    // (runtime effective KV length consumed by the FA checked tail).
++    // Holes remain governed by the attention mask.
++    void set_input_nkv_eff(ggml_tensor * dst, const llama_ubatch * ubatch) const;
++
++    // GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length for the
++    // current ubatch (max over its sequences of the per-sequence used-cell
++    // frontier; cell space, no padding). The plain-FA graph route turns this
++    // into the FA op param consumed at HIP launch.
++    int32_t get_n_kv_req(const llama_ubatch & ubatch) const;
++
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+ 
+     // get views of the current state of the cache
+-    ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+-    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
++    // n_kv_read (GGML_TP5_FA_NKV_PARAM, exact "1"): FA read-view width override
++    // - the request's true KV length. Only a value in (0, n_kv] narrows the
++    // view; -1 (default), any non-positive value, or a value above the cache's
++    // current width falls back to the stock cache-width view (actual behavior:
++    // the view is created at mctx->get_n_kv(), no error, no narrowing). The
++    // KQ mask builder applies the same clamp against the same context, so the
++    // mask and these views always share one width. OFF is byte-identical to
++    // stock.
++    ggml_tensor * get_k(ggml_context * ctx, int32_t il, int32_t n_kv_read = -1) const;
++    ggml_tensor * get_v(ggml_context * ctx, int32_t il, int32_t n_kv_read = -1) const;
+ 
+     // TurboQuant rotation accessors
+     ggml_tensor * get_turbo_rotation() const;
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index 903a1ae..dc9e7d8 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -94,6 +94,21 @@ public:
+         return used.empty() ? 0 : *used.rbegin() + 1;
+     }
+ 
++    // GGML_TP5_FA_NKV_PARAM (r8): per-request true used-cell frontier — the
++    // highest used cell index that still carries seq_id, plus 1; 0 when the
++    // sequence has no cells. Cell space, no padding. This is the per-request
++    // runtime KV length the FA kernels receive when the gate is armed; it is
++    // the tightest length that never drops a live cell of that sequence.
++    uint32_t seq_used_max_p1(llama_seq_id seq_id) const {
++        assert(seq_id >= 0);
++        for (auto it = used.rbegin(); it != used.rend(); ++it) {
++            if (seq[*it].test(seq_id)) {
++                return *it + 1;
++            }
++        }
++        return 0;
++    }
++
+     bool get_has_shift() const {
+         return has_shift;
+     }
+diff --git a/src/llama-nout-state.cpp b/src/llama-nout-state.cpp
+new file mode 100644
+index 0000000..85b5f91
+--- /dev/null
++++ b/src/llama-nout-state.cpp
+@@ -0,0 +1,42 @@
++//
++// llama-nout-state.cpp
++//
++// Per-context state for the combined runtime-engine patches
++// (env: GGML_TP5_UNION_BINDER, exact "1").
++// See llama-nout-state.h for the state-placement rationale.
++//
++// Storage: the state lives in a heap slot owned by the llama_context itself
++// (the `union_binder_state` unique_ptr member declared in llama-context.h).
++// The slot is created lazily by the llama_context constructor - and only when
++// the GGML_TP5_UNION_BINDER gate is exactly "1" - so the OFF path allocates
++// no binder state; ~llama_context destroys the member (exception-safe: a
++// constructor-body throw still runs member destruction), and the state's
++// out-of-line destructor releases the held scratch graph result.
++// There is no process-global map: nothing is shared between contexts, no
++// lookup is keyed by a raw address, and a context can never observe another
++// context's record/counters (previously possible if a llama_context address
++// was reused after destruction and the erase had been skipped).
++//
++// The nkv and n_outputs lanes reconcile through the binder's shared record;
++// there is no side table anywhere (the old kv-cache override map was removed
++// with the envelope build).
++
++#include "llama-nout-state.h"
++
++#include "llama-context.h"
++#include "llama-graph.h"
++
++llama_nkv_ctx_state & llama_nkv_ctx_state_get(llama_context * ctx) {
++    return ctx->union_binder_state_get();
++}
++
++// out-of-line destructor: the only place that needs llm_graph_result complete.
++// Releases the scratch graph result held as a void* (llama-context.h holds
++// this struct behind a unique_ptr to the incomplete type; that unique_ptr is
++// destroyed by ~llama_context, which is also out-of-line in llama-context.cpp).
++llama_nkv_ctx_state::~llama_nkv_ctx_state() {
++    if (nkv_scratch != nullptr) {
++        llm_graph_result_ptr res;
++        res.reset(static_cast<llm_graph_result *>(nkv_scratch));
++    }
++}
+diff --git a/src/llama-nout-state.h b/src/llama-nout-state.h
+new file mode 100644
+index 0000000..1beb116
+--- /dev/null
++++ b/src/llama-nout-state.h
+@@ -0,0 +1,180 @@
++#pragma once
++
++//
++// llama-nout-state.h
++//
++// Per-context state for the combined runtime-engine patches
++// (env gates: GGML_TP5_UNION_BINDER gates the legacy n_outputs lane,
++// GGML_TP5_NKV_TRUEWIDTH gates the r7 true-width nkv lane; both exact "1";
++// the nkv binding registers only under its own gate - there is no envelope
++// fallback path for either lane). r8 adds the coverage lane: GGML_TP5_NKV_COV
++// (exact "1") gates the coverage audit + binder_bind/graph_rebuild counters;
++// unset or any other value is stock (r7) for everything r8.
++//
++// State placement, exactly as measured against the stock baseline (no
++// blanket "layout unchanged" claim: two classes DO gain members below):
++//
++//   - llama_cparams, llm_graph_params, llm_graph_input_out_ids and the
++//     llama_kv_cache_* contexts carry NO added data members; their
++//     per-object state lives in TU-local side tables keyed by object
++//     identity (llama-graph.cpp / llama-kv-cache.cpp).
++//   - llama_context (llama-context.h) DOES gain one opaque member: a
++//     std::unique_ptr<llama_nkv_ctx_state> binder-state slot (see below),
++//     holding the nkv binder record + counters + nout flags. Internal
++//     layout changes by design; the public llama.h ABI is untouched.
++//   - llm_graph_result (llama-graph.h) DOES gain an owner back-pointer
++//     member (see llama-graph.h).
++//
++// This internal header defines one state struct plus free-function
++// accessors; it is included by llama-context.h (for the forward declaration
++// and the opaque member) and by the owning TUs.
++//
++
++#include "ggml.h"
++#include "llama-union-binder.h"
++
++#include <cstdint>
++#include <cstring>
++#include <map>
++#include <utility>
++#include <vector>
++
++struct ggml_tensor;
++struct llama_context;
++struct llm_graph_params;
++
++// ---- r8 coverage lane (GGML_TP5_NKV_COV, exact "1") ----
++//
++// nkv-coupled coverage categories of a recorded graph. The nkv binder binds
++// the whole graph generically (llama-context.cpp, union_rebind_n_kv); these
++// categories make the nkv-coupled tensor families explicit so the acceptance
++// run can verify each family was actually covered (present in the record /
++// patched by binds):
++//   mask    - graph inputs whose first dim is the current cache width (KQ
++//             masks and the relative-position buckets over the cache)
++//   view    - cache k/v read views (views over pre-existing cache storage)
++//   rope    - RoPE ops (GGML_OP_ROPE / GGML_OP_ROPE_BACK) and the Hadamard
++//             rotation input tensors (attn_inp_k_rot / attn_inp_v_rot)
++//   kvwrite - cache write nodes (SET_ROWS / CPY whose src0 is cache storage)
++//   fa      - flash-attention nodes
++// Classification is structural (op / flags / name / first dim vs the built
++// width); it never reads runtime state. ACCOUNTING ONLY: the counts are
++// acceptance bookkeeping for which families are present/patched - not per-op
++// correctness or coverage evidence. A shape coincidence (an unrelated input
++// whose ne[0] equals the built width) may over-count MASK by one.
++enum llama_nkv_cov_cat : int {
++    LLAMA_NKV_COV_MASK    = 0,
++    LLAMA_NKV_COV_VIEW    = 1,
++    LLAMA_NKV_COV_ROPE    = 2,
++    LLAMA_NKV_COV_KVWRITE = 3,
++    LLAMA_NKV_COV_FA      = 4,
++    LLAMA_NKV_COV_OTHER   = 5,
++    LLAMA_NKV_COV_N       = 6,
++};
++
++// classify one recorded graph tensor into its nkv-coupled coverage category;
++// pure function of the recorded fields (no ggml context, no runtime state):
++//   op              - the tensor's ggml op
++//   name            - the tensor's name (may be null; unnamed tensors exist)
++//   is_input        - GGML_TENSOR_FLAG_INPUT was set on the record
++//   is_fixed        - pre-existing storage (weights, KV cache): never bound
++//   src0_fixed      - src[0] resolves to fixed storage (cache write nodes)
++//   view_src_fixed  - view_src resolves to fixed storage (cache read views)
++//   ne0             - the tensor's first dim
++//   nkv_built       - the exact n_kv the graph was built at (0 when the nkv
++//                     lane did not record this build)
++static inline int llama_nkv_cov_classify(int32_t op, const char * name, bool is_input,
++                                         bool is_fixed, bool src0_fixed, bool view_src_fixed,
++                                         int64_t ne0, uint32_t nkv_built) {
++    if (is_fixed) {
++        return LLAMA_NKV_COV_OTHER;    // pre-existing storage: never nkv-coupled
++    }
++    if (op == GGML_OP_FLASH_ATTN_EXT) {
++        return LLAMA_NKV_COV_FA;
++    }
++    if (op == GGML_OP_VIEW) {
++        return view_src_fixed ? LLAMA_NKV_COV_VIEW : LLAMA_NKV_COV_OTHER;
++    }
++    if (op == GGML_OP_SET_ROWS || op == GGML_OP_CPY) {
++        return src0_fixed ? LLAMA_NKV_COV_KVWRITE : LLAMA_NKV_COV_OTHER;
++    }
++    if (op == GGML_OP_ROPE || op == GGML_OP_ROPE_BACK) {
++        return LLAMA_NKV_COV_ROPE;     // the rope family (rope ops)
++    }
++    if (is_input && name != nullptr &&
++            (strncmp(name, "attn_inp_k_rot", 14) == 0 || strncmp(name, "attn_inp_v_rot", 14) == 0)) {
++        return LLAMA_NKV_COV_ROPE;     // the rope family (Hadamard rotation inputs)
++    }
++    if (is_input && nkv_built > 0 && ne0 == (int64_t) nkv_built) {
++        return LLAMA_NKV_COV_MASK;     // graph inputs over the current cache width
++    }
++    return LLAMA_NKV_COV_OTHER;
++}
++
++// per-llama_context state for the union-graph runtime parameter binder and
++// its n_outputs lane (the n_outputs lane registers only under
++// GGML_TP5_UNION_BINDER == "1", the nkv lane only under
++// GGML_TP5_NKV_TRUEWIDTH == "1")
++struct llama_nkv_ctx_state {
++    // ---- nkv binder (GGML_TP5_NKV_TRUEWIDTH, exact "1") ----
++    bool                     nkv_enabled    = false;  // was llama_context::graph_union_nkv_runtime
++    llama_union_binder       union_binder;            // kind -> (tensor set provider, rebind)
++    void *                   nkv_scratch    = nullptr; // llm_graph_result_ptr held as void* (see .cpp)
++    bool                     record_valid   = false;   // was nkv_record_valid
++    uint32_t                 record_cap     = 0;       // exact n_kv the live graph was BUILT at (no envelope)
++    uint32_t                 record_bound   = 0;       // width the live graph's nkv shapes are currently bound at
++    std::vector<ggml_tensor *> record_t;               // was nkv_record_t
++    std::vector<int32_t>      record_src;               // was nkv_record_src
++    std::vector<uint8_t>     record_fixed;             // was nkv_record_fixed
++    std::vector<size_t>      record_bytes;             // was nkv_record_bytes
++    size_t c_attempts = 0, c_applied = 0, c_refused_width = 0, c_refused_envelope = 0,
++           c_refused_skeleton = 0, c_refused_grow = 0, c_refused_relay = 0,
++           c_refused_pipeline = 0, c_fallbacks = 0, c_record_builds = 0;  // 10 counters
++    // ---- nout binding lane (registered with the binder under GGML_TP5_UNION_BINDER) ----
++    bool   nout_enabled = false;      // the n_outputs binding is registered and the lane is active
++    size_t nout_binds  = 0;           // successful n_outputs reconciles
++    // validity/cap/bound of the n_outputs record. The skeleton/byte vectors
++    // are SHARED with the nkv lane (one live graph, one pre-allocation record
++    // of the latest build); these fields are the n_outputs lane's own view.
++    // No pad-to-max: the record is taken on every fresh decoder build and
++    // nout_cap is the BUILT width - the rebind only moves the executed shapes
++    // within [0, nout_cap] (shrink or restore); growth beyond the built width
++    // is refused and falls back to a full rebuild.
++    bool     nout_record_valid = false;
++    uint32_t nout_cap          = 0;    // width the live graph was BUILT at
++    uint32_t nout_bound        = 0;    // active count the live graph's output shapes currently hold
++
++    // ---- r8 coverage lane (GGML_TP5_NKV_COV, exact "1"; see the classifier
++    // above). Every field here is r8-only: with the gate off (unset or any
++    // value other than exactly "1") none of them is ever written and the
++    // behavior is exactly r7. The counts are acceptance accounting (which
++    // families are present/patched), not per-op correctness or coverage
++    // evidence. cov_present describes the CURRENT live record (reset per
++    // record); c_cov_patched accumulates.----
++    bool     cov_enabled    = false;  // the gate is exactly "1" (read once in the ctor)
++    size_t   c_binder_bind  = 0;      // committed nkv binds; c_applied also includes the n_outputs lane
++    size_t   c_graph_rebuild = 0;     // full rebuilds under the enabled nkv lane (mock mirror: "rebuilds")
++    size_t   c_refused_view = 0;      // refused: the graph carries attention-view readers
++    uint32_t cov_present[LLAMA_NKV_COV_N]  = {};  // per-category count in the CURRENT live record (reset per record)
++    uint32_t c_cov_patched[LLAMA_NKV_COV_N] = {}; // cumulative per-category tensors patched by binds
++    uint32_t cov_pending[LLAMA_NKV_COV_N] = {};   // staged nkv patch until scheduler allocation succeeds
++    uint32_t cov_nkv_built = 0;       // the exact n_kv the recorded graph was built at (classifier input)
++
++    // out-of-line destructor (llama-nout-state.cpp): releases the held scratch
++    // llm_graph_result. Out-of-line so llama-context.h can hold this struct
++    // behind a unique_ptr to the (there incomplete) type and still compile.
++    ~llama_nkv_ctx_state();
++};
++
++// per-context state slot owned by llama_context (llama-context.h declares the
++// member as a unique_ptr to this forward-declared type so the state struct
++// definition stays out of that header; the member itself is a new
++// llama_context data member - its internal layout changes by design).
++//
++// Lifetime: the slot is created lazily by the llama_context constructor and
++// only when the GGML_TP5_UNION_BINDER gate is exactly "1" - with the gate off
++// (stock OFF path) no binder state is allocated at all. It is destroyed with
++// the context (~llama_context destroys the unique_ptr member; the state's
++// out-of-line destructor releases the held scratch graph result). Nothing is
++// shared between contexts or threads.
++llama_nkv_ctx_state & llama_nkv_ctx_state_get(llama_context * ctx);
+diff --git a/src/llama-union-binder.h b/src/llama-union-binder.h
+new file mode 100644
+index 0000000..2af16d7
+--- /dev/null
++++ b/src/llama-union-binder.h
+@@ -0,0 +1,138 @@
++#pragma once
++
++//
++// llama-union-binder.h
++//
++// Table-driven union-graph runtime parameter binder.
++//
++// parameter change (n_kv width, output count, ...) by rebuilding the graph
++// in a scratch result and, when the only difference is the parameter's
++// tensor set, copying the changed fields into the live graph in place.
++// Each such parameter is one `llama_union_param_kind` and one
++// `llama_union_binding` entry in a fixed-size table: the binding names the
++// provider that yields the affected tensors (`tensor_set`) and the operation
++// that validates + patches them (`rebind`). `llama_union_binder::rebind()`
++// is the single dispatch point.
++//
++// Gates: two independent lane gates, each exact value "1" only (see
++// llama-context.cpp): GGML_TP5_UNION_BINDER (the legacy outputs lane) and
++// GGML_TP5_NKV_TRUEWIDTH (the r7 true-width nkv lane). Unset or any other
++// value is stock for that lane; the legacy
++// LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME flag is subordinate to
++// GGML_TP5_UNION_BINDER.
++//
++// Registered kinds:
++//   - n_kv: the whole KQ-mask / KV-view / attention tensor set of a built
++//     graph; provider `llama_context::union_tensors_n_kv()`, rebind
++//     `llama_context::union_rebind_n_kv()`.
++//   - n_outputs: the output-gather closure (out_ids + every GET_ROWS dst
++//     reading it) of a graph built at the exact active count (no
++//     pad-to-max); provider
++//     `llama_context::union_tensors_n_outputs()`, rebind
++//     `llama_context::union_rebind_outputs()`. Both kinds share the one
++//     pre-allocation record of the latest fresh build (one live graph).
++//
++// Reserved kinds (no binding is registered; the enum value + the fixed-size
++// `slots_` array + `add()` are the registration points):
++//   - rs_z: `llama_memory_recurrent_context::get_rs_z()` feeds
++//     `llm_graph_input_rs::rs_z` and the build_rs zero-state view; there is no
++//     validated tensor registry / rebind operation for it yet.
++//
++// This internal header adds a header-only table class plus two POD structs;
++// it is included by llama-context.{h,cpp} and llama-nout-state.h and is not
++// part of the public ABI.
++//
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++struct ggml_tensor;
++struct llama_context;
++class  llm_graph_result;
++struct llm_graph_params;
++
++// runtime parameter lanes of the union-graph binder; `count` is the table size
++enum class llama_union_param_kind : uint8_t {
++    n_kv      = 0,
++    n_outputs = 1,
++    rs_z      = 2,
++    count     = 3,
++};
++
++// the tensors a single rebind operation may touch, as recorded by a
++// per-kind provider. n_kv fills all four (DFS post-order tensor list, its
++// src/view_src adjacency, the fixed-storage flags and the byte envelopes); a
++// future kind may use only `tensors` and leave the auxiliary records null.
++struct llama_union_tensor_set {
++    const std::vector<ggml_tensor *> * tensors = nullptr;
++    const std::vector<int32_t>       * src     = nullptr;
++    const std::vector<uint8_t>       * fixed   = nullptr;
++    const std::vector<size_t>        * bytes   = nullptr;
++};
++
++// one table entry: kind -> (tensor set provider, rebind operation)
++struct llama_union_binding {
++    llama_union_param_kind kind = llama_union_param_kind::count;
++
++    // diagnostic name of the lane ("n_kv", ...)
++    const char * name = nullptr;
++
++    // yields the tensors recorded for this kind on the given context
++    llama_union_tensor_set (llama_context::*tensor_set)() = nullptr;
++
++    // validates + patches the live graph in place; returns true when the
++    // graph can be reused
++    bool (llama_context::*rebind)(llm_graph_result * res,
++                                  const llm_graph_params & params,
++                                  const llama_union_tensor_set & set) = nullptr;
++};
++
++// fixed-size table of registered bindings (no allocation, no ordered map:
++// registration happens once in the llama_context constructor)
++class llama_union_binder {
++public:
++    static constexpr size_t n_kinds = (size_t) llama_union_param_kind::count;
++
++    // register (or replace) the binding for its kind; false for an invalid or
++    // out-of-range kind
++    bool add(const llama_union_binding & binding) {
++        const size_t idx = (size_t) binding.kind;
++        if (idx >= n_kinds) {
++            return false;
++        }
++        slots_[idx]    = binding;
++        registered_[idx] = true;
++        return true;
++    }
++
++    bool has(llama_union_param_kind kind) const {
++        const size_t idx = (size_t) kind;
++        return idx < n_kinds && registered_[idx];
++    }
++
++    // registered binding for the kind, or nullptr
++    const llama_union_binding * get(llama_union_param_kind kind) const {
++        return has(kind) ? &slots_[(size_t) kind] : nullptr;
++    }
++
++    size_t size() const {
++        size_t n = 0;
++        for (size_t i = 0; i < n_kinds; ++i) {
++            n += registered_[i] ? 1 : 0;
++        }
++        return n;
++    }
++
++    // dispatch: look up the kind, obtain its tensor set from the context, run
++    // the rebind. false when the kind is unregistered / incomplete or the
++    // rebind refuses (callers fall back to a full rebuild).
++    bool rebind(llama_union_param_kind kind,
++                llama_context * ctx,
++                llm_graph_result * res,
++                const llm_graph_params & params) const;
++
++private:
++    llama_union_binding slots_[n_kinds];
++    bool                registered_[n_kinds] = {};
++};
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 91ce413..5d6d533 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -788,7 +788,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+     GGML_ASSERT(hparams.n_swa > 0);
+     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
+     GGML_ASSERT(n_kv_max <= k_all->ne[2]); // must not exceed raw_k + csa_k concat length
+-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
++    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, sinks, nullptr, n_kv_max, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+     }
+@@ -843,7 +843,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, hca_mask, 0);
+     cb(kq_mask, "hca_kq_mask", il);
+ 
+-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, 0, kq_scale, il);
++    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+     }
+@@ -879,7 +879,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
+ 
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+ 
+-    ggml_tensor * out = build_attn_mha(q, k, k, nullptr, kq_mask, sinks, nullptr, 0, kq_scale, il);
++    ggml_tensor * out = build_attn_mha(q, k, k, nullptr, kq_mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+     }
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 7683deb..1a176ec 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -543,14 +543,21 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     ggml_tensor * inp_pos     = build_inp_pos();
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+-    auto * inp_attn = build_attn_inp_kv();
++    // chained drafting: rows 1..n-1 take their inputs from the previous row's
++    // in-graph argmax and hidden state, so one decode drafts n_tokens tokens
++    const bool mtp_chain = params.cparams.mtp_chain && ubatch.n_seqs_unq == 1 && ubatch.token;
++
++    // GGML_TP5_FA_NKV_PARAM (r8): the chained graph builds its FA nodes through
++    // build_attn_mha with full-width cache views and no runtime op param, so a
++    // narrowed KQ mask would be shorter than the KV width and index past its
++    // allocation on the device. Keep that graph at stock widths; the standalone
++    // MTP path below uses the plain build_attn lane and keeps the true length.
++    auto * inp_attn = build_attn_inp_kv(!mtp_chain);
+ 
+     const float kq_scale = hparams.f_attention_scale == 0.0f
+             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+ 
+-    // chained drafting: rows 1..n-1 take their inputs from the previous row's
+-    // in-graph argmax and hidden state, so one decode drafts n_tokens tokens
+-    if (params.cparams.mtp_chain && ubatch.n_seqs_unq == 1 && ubatch.token) {
++    if (mtp_chain) {
+         const auto * mctx_kv = static_cast<const llama_kv_cache_context *>(mctx);
+ 
+         // per-step causal masks: row j of the stock kq mask (the mask builder pads
+@@ -636,7 +643,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+ 
+             ggml_tensor * mask_b = ggml_view_2d(ctx0, kq_mask, n_kv, width, kq_mask->nb[1], (size_t) row0*kq_mask->nb[1]);
+ 
+-            cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, 0, kq_scale, il);
++            cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, nullptr, 0, kq_scale, il);
+ 
+             cur_b = ggml_mul(ctx0, cur_b, ggml_sigmoid(ctx0, gate_b));
+             cur_b = build_lora_mm(layer.wo, cur_b, layer.wo_s);
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 78b58ee..6584744 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -531,11 +531,17 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+     cb(inpL, "model.input_embed", -1);
+     ggml_build_forward_expand(gf, inpL);
+ 
+-    auto * inp = build_inp_mem_hybrid();
+-
+     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
+     // the indexer cache inside it is absent when the GGUF has no indexer tensors
+-    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
++    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
++
++    // GGML_TP5_FA_NKV_PARAM (r8): build_layer_attn pairs the KQ mask with
++    // full-width cache views in build_attn_qsa and feeds the mask width to the
++    // indexer's top-k selection; a narrowed mask would make those indices and
++    // the set_rows patch run past the mask tensor. Keep this graph at stock
++    // widths whenever the indexer can be active (no indexer -> dense path only,
++    // so the true-length lane stays available there).
++    auto * inp = build_inp_mem_hybrid(mctx_hyb->get_idx() == nullptr);
+ 
+     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
+     if (mctx_idx) {
+@@ -1192,7 +1198,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, nullptr, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     // the rotation is its own inverse, so undo it on the value side of the output

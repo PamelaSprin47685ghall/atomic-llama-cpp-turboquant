@@ -1,0 +1,1135 @@
+diff --git a/docs/backend/DUALWIN-COMPOSE-EVENT.md b/docs/backend/DUALWIN-COMPOSE-EVENT.md
+index 03562e4..9aad6f0 100644
+--- a/docs/backend/DUALWIN-COMPOSE-EVENT.md
++++ b/docs/backend/DUALWIN-COMPOSE-EVENT.md
+@@ -1,14 +1,23 @@
+-# Dual-window compose handoff: device events replace the host synchronize
++# Dual-window compose epochs: device-event output barrier
+ 
+ `GGML_TP5_DW_COMPOSE_EVENT=1` (exact value `"1"`) changes how the TP5 compose
+ runtime (`fork/tp5-compose/src/runtime.cpp`) completes a decode epoch on the
+ host. With the gate ON, in relay mode, the per-epoch scheduler-wide
+-`llama_synchronize` / synchronizing logits getter is replaced by per-stream
+-device events recorded after the asynchronous output copy, and the cross-window
+-handoff is ordered by a device-side `ggml_backend_event_wait`. Every other value
+-— unset, `0`, `2`, `1x`, `" 1"`, `10` — keeps the stock path: no allocation, no
+-event, no record/wait/synchronize call, no receipt, and no new branch body
+-executed.
++`llama_synchronize` / synchronizing logits getter is replaced by device events
++recorded on the child streams after the asynchronous output copy. Every other
++value — unset, `0`, `2`, `1x`, `" 1"`, `10` — keeps the stock path: no
++allocation, no event, no record/wait/synchronize call, no receipt, and no new
++branch body executed.
++
++There is **no cross-window wait** in this design. Each window owns a private
++Meta relay provider, its own context, KV cache and requests; only the model
++weights are shared, and they are read-only. No writable state crosses windows,
++so a symmetric per-epoch peer event wait would be a same-phase rendezvous with
++no data dependency. The earlier peer layer (per-window event created from the
++Meta device, per-epoch record + release publication, first-child
++`event_wait`, and the teardown blocking `event_synchronize`) was removed; the
++epoch's only real cross-boundary dependency is this window's own logits D2H
++copy.
+ 
+ ## What is replaced
+ 
+@@ -25,29 +34,25 @@ Stock per epoch, in each window's decode worker:
+ 3. The relay dual-completion drain (device tail + CPU courier retirement).
+ 4. Read the logits row on the host.
+ 
+-Gate ON keeps 1, 3 and 4 and replaces 2 with three steps:
++Gate ON keeps 1, 3 and 4 and replaces 2 with two steps:
+ 
+ - `llama_tp5_output_copy_record(ctx)`, called immediately after `llama_decode`
+   returned. `ggml_backend_meta_output_record` resolves the same split state the
+-  D2H readback uses and records one private event on **exactly** the child
+-  streams that copy touched (one stream for a mirrored tensor, every
+-  contributing child for a split axis). Each record is ordered behind that
+-  stream's copy.
+-- a device-side `ggml_backend_event_wait` on this window's first-child stream
+-  for the PEER window's most recent unconsumed record. This is the dual-window
+-  handoff ordering expressed on the device: everything this window submits
+-  afterwards is ordered behind the peer's recorded epoch, without a host lock
+-  or a host wait. The decision state machine (peer selection, same-device
+-  requirement, release/acquire publication, "never wait on an unrecorded
+-  event", one consumption per record) is `dw_device_wait.h`.
+-- `llama_tp5_output_event_wait(ctx)`, deliberately deferred until after the
+-  relay drain and immediately before the host reads logits. It
+-  `cudaEventSynchronize`s the recorded events and releases them, then runs the
+-  context's `synchronize` bookkeeping. The drain has usually already covered
+-  the device latency, so this normally returns at once.
+-
+-Rows are then resolved with `llama_get_logits_ith_no_sync`, which performs only
+-the host-side output reorder and row resolution.
++  D2H readback uses and records one event per **exactly** the child streams that
++  copy touched (the first child for a mirrored tensor, every contributing child
++  for a split axis), through each child backend's `event_record` on that child's
++  own device. Each record is ordered behind that stream's copy.
++- `llama_tp5_output_event_wait(ctx)`, deliberately deferred until after the relay
++  drain and immediately before the host reads logits. It
++  `cudaEventSynchronize`s the recorded events, releases them, and runs the
++  context's `synchronize` bookkeeping — the bookkeeping only when at least one
++  event was actually synchronized. Rows are then resolved with
++  `llama_get_logits_ith_no_sync`, which performs only the host-side output
++  reorder and row resolution.
++
++`ggml` reports how many streams the record covered. The runtime requires the
++wait to release exactly that many, so a record/wait mismatch is a hard `require`
++failure rather than a silent read of incomplete data.
+ 
+ ## Why the events are a complete barrier for the logits
+ 
+@@ -60,18 +65,76 @@ relay provider recorded its per-lane tail events. The chain is instead:
+    their state from their sources, so the name-based device callback is not an
+    equivalent query). MIRRORED reads the first child alone; a split axis copies
+    from every child with a non-empty chunk. PARTIAL/unknown output is refused.
+-2. For each of those streams it records a device event through the child
+-   backend. `ggml_backend_cuda_get_tensor_async` issued the copy on
+-   `cuda_ctx->stream()` — the child's owned stream zero — and `event_record`
+-   uses the same stream, so the record is ordered behind the copy.
+-3. `cudaEventSynchronize` on those events therefore proves every copy of this
++2. The target set is the readback's own target set, by construction:
++   `ggml_backend_meta_get_tensor_async` (mirrored) calls
++   `ggml_backend_tensor_get_async` on `ggml_backend_meta_simple_backend(0)`, and
++   its split-axis branch calls `ggml_backend_tensor_get_2d_async` on
++   `ggml_backend_meta_simple_backend(j)` for every child with
++   `simple_tensor->nb[axis+1] != 0`. `output_record` uses the identical
++   predicate and the identical backend objects (`backend_configs[j].backend`).
++3. Stream identity. Both CUDA copy paths (`ggml_backend_cuda_get_tensor_async`
++   and `..._get_tensor_2d_async`) use `cuda_ctx->stream()`, and
++   `ggml_backend_cuda_event_record` uses the same `cuda_ctx->stream()`. In relay
++   mode that stream is provably the only stream of the child: strict relay
++   requires `curr_stream_no == 0` and rejects any other existing
++   `ctx->streams[device][s]` (`ggml/src/ggml-cuda/relay.hip`), the relay lane
++   count is one, the lane stream is `ctx->streams[device][0]`, and
++   `ggml_backend_cuda_graph_compute` fails relay work when `curr_stream_no != 0`.
++   The copy, the record and the relay lane therefore share one stream, and the
++   record is ordered behind the copy and behind that rank's relay work.
++4. `cudaEventSynchronize` on those events therefore proves every copy of this
+    epoch completed and the host logits rows are readable.
+ 
++The readback backend is the Meta backend itself, not a child: `llama_context`
++requires a single scheduler split in relay mode and rejects any non-Meta compute
++node (`src/llama-context.cpp`, `tp5-relay requires a single native Meta graph` /
++`tp5-relay refuses non-Meta compute node`).
++
+ If any step cannot be satisfied — non-relay context, no graph, host-resident or
+-PARTIAL output, a missing event interface, gate off — the record returns 0, no
+-event is left allocated, the ON path keeps the stock synchronize, and the epoch
+-is counted in `fallback_no_output_barrier`. A record/wait count mismatch is a
+-hard `require` failure rather than a silent read of incomplete data.
++PARTIAL output, a missing child event interface, gate off — the record returns
++0, no event is left allocated, the ON path keeps the stock synchronize, and the
++epoch is counted in `fallback_no_output_barrier`.
++
++## Meta event interface: deliberately absent
++
++The Meta device keeps stock `nullptr` `event_new` / `event_free` /
++`event_synchronize`, and the Meta backend keeps stock `nullptr` `event_record` /
++`event_wait`. This is a correctness requirement, not an omission:
++
++- A non-null **Meta-device** `event_new` makes `ggml_backend_sched` allocate and
++  use its own events for every Meta backend in the process
++  (`ggml/src/ggml-backend.cpp`: `ggml_backend_event_new(backends[b]->device)`),
++  replacing its stock `ggml_backend_synchronize` fallback. That is a
++  process-wide synchronization change no gate here can scope.
++- A Meta-**backend** `event_record` / `event_wait` forwards to child 0 only, so
++  it can never order all five relay ranks; using it as a scheduler barrier would
++  be incomplete.
++
++The output barrier therefore calls the contributing child devices directly and
++is confined to `GGML_TP5_DW_COMPOSE_EVENT`. `ggml_backend_meta_first_child_device`
++was removed with the peer layer because it had no remaining consumer in the
++tree.
++
++## Ownership, ordering and lifecycle
++
++- The events are owned by the Meta backend context (`output_copy_events`), one
++  slot per child. They are created lazily by `ggml_backend_meta_output_record`,
++  and every successful record is released by the paired
++  `ggml_backend_meta_output_wait` (synchronize + free + null).
++- A record is issued **after** `llama_decode` returned, on the same child stream
++  the D2H copy was enqueued on, so the wait is ordered behind the copy.
++- If an epoch is abandoned between record and wait (a throw on the error/abort
++  path), its events are still non-null at the next record. `output_record`
++  releases those stale events without waiting: nothing consumed their logits,
++  destroying a recorded event does not cancel stream work, and the next decode's
++  relay `process_ubatch` synchronize drains the stream. This keeps a later,
++  differently-shaped epoch's wait count exact.
++- `ggml_backend_meta_free` releases anything still owned when the context is
++  destroyed; if the relay retains its native owners, the whole Meta owner is
++  retained instead, and the events are not freed behind a live reader.
++- The runtime's teardown keeps its two `llama_synchronize` calls per window
++  around the host-only `seq_rm`; they are lifecycle boundaries, not part of the
++  replaced per-epoch barrier.
+ 
+ ## What is still a host wait
+ 
+@@ -86,36 +149,59 @@ CPU courier retirement.
+ ## Receipt
+ 
+ With the gate ON the runtime prints one `TP5_DW_COMPOSE_EVENT window=…` line per
+-window. Replacement fields:
+-
+-| Field | Meaning |
+-| --- | --- |
+-| `output_event_syncs` | epochs whose host barrier was the recorded output-copy events |
+-| `host_sync_replaced` | same count under the contract name (one stock `llama_synchronize` skipped each) |
+-| `fallback_no_output_barrier` | ON-path epochs that kept the stock synchronize because no sound output-copy barrier was available |
+-| `no_sync_logits_calls` | logits rows resolved without a synchronizing getter |
+-
+-`record_ok`, `wait_ok` and the fields above count issued calls. They are not
++window:
++
++|Field|Meaning|
++|---|---|
++|`epochs`|the window's decode epochs (same-work baseline; equals `decode_calls`)|
++|`output_event_syncs`|epochs whose host barrier was the recorded output-copy events|
++|`host_sync_replaced`|same count under the contract name (one stock `llama_synchronize` skipped each)|
++|`fallback_no_output_barrier`|ON-path epochs that kept the stock synchronize because no sound output-copy barrier was available|
++|`no_sync_logits_calls`|logits rows resolved without a synchronizing getter|
++
++`output_event_syncs == host_sync_replaced` and
++`output_event_syncs + fallback_no_output_barrier == epochs` are structural
++identities of the current code. They are host call counts: they are not
+ device-completion evidence, they do not prove the hardware stream mapping, and
+-an absent receipt is not a zero count.
++an absent receipt is not a zero count. The removed peer counters
++(`record_calls`, `wait_calls`, `sync_calls`, `free_calls`, …) no longer exist;
++the peer wait never received a receipt of its own here.
+ 
+ ## Verification status and limits
+ 
+-Implemented and reviewed statically; `apply --check` only. No HIP toolchain and
+-no GPU were available in this worktree, and compilation was not run (the shared
+-build slots refused further compilations under load). Specifically **not**
+-proven here:
+-
+-- that the reference run's logits tensor resolves to the split state assumed
+-  above and that the readback touches those exact streams — a mismatch makes the
+-  record return 0, which keeps the run correct but disables the replacement;
+-- that event record and the D2H copy share a stream on real hardware — this
+-  follows from the cited code paths and still needs a device trace;
+-- deadlock freedom, latency or overlap benefit. `wait_calls` and
+-  `host_sync_replaced` are call counts and no throughput claim is made.
++Implemented and reviewed statically. Under the current work rules no
++compilation, syntax check, mock, fixture, harness or GPU run was executed, so
++"compiles", "links" and "works on device" are not claimed.
++
++What the source shows (still not a hardware result): the target set of
++`output_record` is the readback's target set (same resolver, same predicate, same
++child backend objects); the copy and the record use the same `cuda_ctx->stream()`;
++and strict relay admits exactly one stream per child with `curr_stream_no == 0`,
++so copy, record and relay lane share it; every missing precondition returns 0 and
++keeps the stock synchronize.
++
++What remains **unproven** and must not be asserted as guaranteed:
++
++- that the reference run's logits tensor actually resolves to a split state with
++  a non-empty target set — a mismatch makes the record return 0, which keeps the
++  run correct but silently disables the replacement (it would show up as
++  `output_event_syncs == 0`, `fallback_no_output_barrier == epochs`);
++- that HIP event capture/synchronize semantics on the installed ROCm version
++  match the CUDA contract used in the reasoning, in particular that
++  `cudaEventSynchronize` on an event recorded after an async D2H copy proves that
++  copy completed (no device trace exists);
++- that no other component of the relay provider reorders or defers the copy on
++  the same stream outside the reviewed code paths;
++- that re-recording a single event object per epoch across a long run and freeing
++  it from a different thread of control is race-free on the target HIP runtime —
++  the code keeps one record/wait window per window worker, but that is a design
++  argument, not a measured property;
++- deadlock freedom, latency, or any overlap/time benefit. `wait_*` and
++  `host_sync_*` are call counts; the deferral past the drain is a placement, not
++  a measured saving.
+ 
+ Acceptance therefore still requires the fork RUNBOOK arms: stock, gate OFF, and
+ `GGML_TP5_DW_COMPOSE_EVENT=1` with two windows in relay mode, compared token by
+-token, checking that `TP5_DW_COMPOSE_EVENT` reports `host_sync_replaced > 0`,
+-`fallback_no_output_barrier == 0`, `wait_ok > 0`, and that OFF matches stock byte
+-for byte.
++token and logits byte for byte, checking that the receipt reports
++`output_event_syncs == host_sync_replaced > 0`,
++`fallback_no_output_barrier == 0`, and that OFF matches stock byte for byte.
+diff --git a/fork/tp5-compose/src/dw_compose_event.h b/fork/tp5-compose/src/dw_compose_event.h
+index 1c53832..9a06704 100644
+--- a/fork/tp5-compose/src/dw_compose_event.h
++++ b/fork/tp5-compose/src/dw_compose_event.h
+@@ -1,10 +1,6 @@
+-// DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): exact-"1" gate for
+-// the production-path ggml backend event record/wait wired into the fork
+-// compose runtime (fork/tp5-compose/src/runtime.cpp). The fork shipped
+-// without any event infrastructure (the r8 recorded gap: the shared
+-// dw_device_wait.h / dw_event_trace.h headers were mirrored here verbatim
+-// but never wired), so this gate closes that gap in the production compose
+-// decode loop rather than in the overlay candidate.
++// DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): exact-"1" gate for the
++// production-path ggml backend event record/wait wired into the fork compose
++// runtime (fork/tp5-compose/src/runtime.cpp).
+ //
+ // Semantics: exact value "1" only, read once at static initialization (the
+ // runtime aliases gate() into a file-scope const before main; later env
+@@ -13,35 +9,51 @@
+ // call, no receipt, no new branch body executed — OFF equals the applied
+ // baseline/stock in source structure.
+ //
+-// ON path (documented here, real calls stay in the runtime): each relay
+-// window creates ONE real backend event from its Meta device's first child
+-// (real HIP/CUDA; unknown/CPU children leave the event null and every site
+-// is a counted no-op), records it after llama_decode returned, publishes
+-// availability with release, and — before its own consumption — issues one
+-// real non-blocking ggml_backend_event_wait for the PEER window's most
+-// recent unwaited record, only for the same first-child device and never
+-// for an unrecorded event (the decision state machine is the shared
+-// dw_device_wait.h). That wait is the cross-window HANDOFF ordering on the
+-// device.
++// ON path (real calls stay in the runtime and in ggml):
++// llama_tp5_output_copy_record() records one device event per child stream
++// that the asynchronous logits D2H copy of the just-decoded epoch used. ggml
++// resolves the stream set from the same split state the readback uses and
++// records through each contributing child backend/device: MIRRORED reads the
++// first child alone; a split axis copies from every child with a non-empty
++// chunk. PARTIAL/unknown output, a host-resident output or a missing child
++// event interface make the record fail closed (it returns 0 and leaves no
++// allocated event behind).
+ //
+-// REPLACEMENT, not augmentation: llama_tp5_output_copy_record() records one
+-// device event per child stream that the asynchronous logits D2H copy of the
+-// just-decoded epoch used (ggml knows the stream set from the same split state
+-// the readback uses). The record is ordered behind that copy, so the paired
++// The record is ordered behind that copy on the same stream, so the paired
+ // llama_tp5_output_event_wait() — deferred until after the relay drain, right
+ // before the host reads logits — proves the host row is readable. That wait IS
+ // the epoch's host synchronization: the scheduler-wide llama_synchronize /
+-// syncing logits getter is skipped, and rows are resolved with
+-// llama_get_logits_ith_no_sync. The proof is the event, never the relay's
+-// finished/retired counters, which do not cover the scheduler's D2H copy. When
+-// no sound barrier exists (no event interface, PARTIAL/unknown or
+-// host-resident output) the stock synchronize stays and is counted
+-// (fallback_no_output_barrier).
++// syncing logits getter is skipped, rows are resolved with
++// llama_get_logits_ith_no_sync, and only the eval bookkeeping of a normal
++// synchronize() runs (and only when the wait actually released a barrier).
+ //
+-// Remaining host wait: the relay dual-completion drain (still the runtime's
+-// only exit predicate) and the event waits themselves, which block the host on
+-// device events. The receipt counts issued calls; it is NOT device completion
+-// evidence and does not prove the hardware stream mapping.
++// NOT a Meta event interface. The Meta device deliberately keeps stock
++// nullptr event_new/event_free/event_synchronize and the Meta backend keeps
++// stock nullptr event_record/event_wait. A non-null Meta event_new would make
++// ggml_backend_sched allocate and use its own events for every Meta backend in
++// the process (replacing its stock ggml_backend_synchronize fallback), and the
++// Meta forwarder only reaches child 0 — neither can order all five relay
++// ranks. The barrier therefore talks to the contributing child devices
++// directly and cannot change any other graph's synchronization.
++//
++// NO cross-window wait. Each window owns a private Meta relay provider, its
++// own context, KV and requests; the model weights are read-only shared state,
++// so no writable state crosses windows. A symmetric per-epoch peer event wait
++// would be a same-phase rendezvous with no data dependency (and a rank-0-only
++// one through the deleted Meta forwarder). It was removed together with its
++// per-window event, release publication and consumption watermark. The relay
++// dual-completion drain is unchanged and remains the runtime's only exit
++// predicate.
++//
++// Real dependencies that are NOT removed: the output-copy event wait itself
++// (it blocks the host on device events), the relay dual-completion drain, the
++// five-rank submission gate, and the stock synchronize kept fail-closed when
++// no sound output barrier exists (missing child event interface, PARTIAL/
++// unknown or host-resident output). That fallback is counted in
++// fallback_no_output_barrier and is never deferred to a later consumer.
++//
++// The receipt counts host calls; it is NOT device completion evidence and does
++// not prove the hardware stream mapping.
+ #pragma once
+ 
+ #include <cstdlib>
+diff --git a/fork/tp5-compose/src/dw_device_wait.h b/fork/tp5-compose/src/dw_device_wait.h
+deleted file mode 100644
+index 38393a2..0000000
+--- a/fork/tp5-compose/src/dw_device_wait.h
++++ /dev/null
+@@ -1,94 +0,0 @@
+-// DUALWIN-DEVICE-WAIT (GGML_TP5_DW_DEVICE_WAIT=1): gate parsing, peer
+-// selection and the wait/decision state machine shared verbatim by the fork
+-// and overlay runtimes (single source of truth: the two copies are kept
+-// byte-identical, same sync discipline as dw_event_trace.h). The REAL
+-// ggml_backend_event_wait call stays at the runtime's production consumption
+-// points (target decode / verified-prefix replay); this header holds
+-// everything testable without a GPU: the exact-"1" gate, the
+-// one-window-has-no-peer rule, the release/acquire pairing contract and the
+-// watermark that makes every record consumed at most once and never waits on
+-// an unrecorded event.
+-//
+-// HONEST SCOPE: whether the wait's stream/device actually covers relay work
+-// is unverified (inherited from the r7/r8 wording); the wait can only delay
+-// a consumption behind work the peer already submitted — it never weakens an
+-// exit predicate. Deadlock freedom does NOT rest on assertion: per the
+-// CUDA/HIP event contract (cudaEventRecord: "cudaStreamWaitEvent() use[s]
+-// the most recently captured state at the time of the API call, and [is]
+-// not affected by later calls to cudaEventRecord()"), a wait enqueued at
+-// host time T binds to a record issued at T_R <= T (the release/acquire
+-// pairing below guarantees the record's host call returned before T); any
+-// wait contained in that captured work was enqueued before T_R and binds
+-// strictly earlier, so binding times strictly decrease along any
+-// wait->captured-work->wait chain — finite, hence acyclic. Re-records cannot
+-// retarget an enqueued wait.
+-#pragma once
+-
+-#include <cstdint>
+-#include <cstdlib>
+-#include <cstring>
+-
+-namespace dw_device_wait {
+-
+-// Exact "1", read once at first call (static initialization at the runtime's
+-// gate aliases; unset/"0"/"2"/"1x" keep every site a counted no-op).
+-inline bool gate() {
+-    static const bool on = [] {
+-        const char * v = std::getenv("GGML_TP5_DW_DEVICE_WAIT");
+-        return v != nullptr && std::strcmp(v, "1") == 0;
+-    }();
+-    return on;
+-}
+-
+-// Peer selection: the cyclic neighbour (the dualwin pair for two windows).
+-inline std::uint32_t peer_of(std::uint32_t wi, std::uint32_t windows) noexcept {
+-    return windows > 1u ? (wi + 1u) % windows : wi;
+-}
+-
+-inline bool has_peer(std::uint32_t wi, std::uint32_t windows) noexcept {
+-    return windows > 1u && peer_of(wi, windows) != wi;
+-}
+-
+-// What the runtime knows about the peer at a consumption point. All fields
+-// are cheap reads; peer_event comes from the event pointers and same_device
+-// from the first-child devices resolved once at event creation
+-// (single-threaded setup, before any decode worker runs) through the public
+-// ggml_backend_meta_first_child_device accessor — the same resolution the
+-// meta event machinery uses, so a planned wait always targets the peer's
+-// event on THIS window's own first-child device.
+-struct context {
+-    bool event_gate  = false;  // GGML_TP5_DW_BACKEND_EVENT=1 (events exist)
+-    bool have_peer   = false;  // windows > 1
+-    bool peer_event  = false;  // the peer's event pointer is non-null
+-    bool self_event  = false;  // this window's event pointer is non-null
+-    bool same_device = false;  // both windows resolved the SAME first-child
+-                               // device (unknown device never waits)
+-};
+-
+-inline bool peer_usable(const context & c) noexcept {
+-    return c.event_gate && c.have_peer && c.peer_event && c.self_event && c.same_device;
+-}
+-
+-enum class action { none, wait, skip_unavailable, skip_unrecorded };
+-
+-// The production decision. peer_available is the peer's released publication
+-// count (acquire load in the caller); peer_consumed is this window's
+-// watermark — written ONLY by this window's own thread. A wait is planned
+-// iff the peer is usable AND published something not yet consumed; the
+-// watermark then advances to the observed value, so each published record is
+-// decided exactly once and a stale/empty count never issues a wait. The
+-// caller issues the non-blocking ggml_backend_event_wait enqueue only on
+-// action::wait.
+-inline action plan(const context & c, std::uint64_t peer_available,
+-                   std::uint64_t & peer_consumed) noexcept {
+-    if (!peer_usable(c)) {
+-        return action::skip_unavailable;
+-    }
+-    if (peer_available > peer_consumed) {
+-        peer_consumed = peer_available;
+-        return action::wait;
+-    }
+-    return action::skip_unrecorded;
+-}
+-
+-}  // namespace dw_device_wait
+diff --git a/fork/tp5-compose/src/dw_event_trace.h b/fork/tp5-compose/src/dw_event_trace.h
+index 2aad704..0fa93f0 100644
+--- a/fork/tp5-compose/src/dw_event_trace.h
++++ b/fork/tp5-compose/src/dw_event_trace.h
+@@ -46,14 +46,14 @@ inline void banner() {
+     (void) printed;
+ }
+ 
+-// Event-point trace (overlay runtime only): host timestamps around the real
+-// ggml_backend_event_record / ggml_backend_event_synchronize /
+-// ggml_backend_event_wait call sites, per window. Still HOST correlation
+-// metadata — never device interval evidence. wait_calls counts the real
+-// device-side waits issued under GGML_TP5_DW_DEVICE_WAIT=1 (the r7 wire and
+-// the r8 trace left it a documented 0 gap); wait_first_ns/wait_last_ns are
+-// the host stamps around those wait call sites (0 when that gate or the
+-// trace gate is off).
++// Event-point trace fields shared with the overlay runtime: host timestamps
++// around real ggml_backend_event record/synchronize/wait call sites, per
++// window. Still HOST correlation metadata — never device interval evidence.
++// wait_calls/wait_first_ns/wait_last_ns are populated by the overlay product
++// only (its GGML_TP5_DW_DEVICE_WAIT peer waits); the fork compose runtime
++// removed its peer-wait layer, so those three stay 0 there and are not a
++// zero-valued measurement. Its record_*/sync_* stamps are host call-site
++// correlation for the peer events that no longer exist in the fork either.
+ struct evpt {
+     std::uint64_t record_first_ns = 0;  // first record() call-site stamp
+     std::uint64_t record_last_ns  = 0;  // latest record() call-site stamp
+diff --git a/fork/tp5-compose/src/runtime.cpp b/fork/tp5-compose/src/runtime.cpp
+index 0b1ea4f..d7ebc3b 100644
+--- a/fork/tp5-compose/src/runtime.cpp
++++ b/fork/tp5-compose/src/runtime.cpp
+@@ -10,7 +10,6 @@
+ 
+ #include "ordered-fold.h"
+ #include "dw_event_trace.h"
+-#include "dw_device_wait.h"
+ #include "dw_compose_event.h"
+ 
+ #include <algorithm>
+@@ -1276,55 +1275,32 @@ run_result run(const options & requested) {
+     }
+     std::vector<context_ptr>    contexts;
+     std::vector<ggml_backend_t> native;
+-    // DUALWIN-COMPOSE-EVENT per-window state: one real backend event per
+-    // window, created after the relay lane resolves (below, single-threaded
+-    // setup, before decode workers run); counters touched only under the
+-    // gate. event==nullptr (CPU or non-event first child) keeps every site
+-    // a counted no-op — CPU-equivalent to OFF. The peer publication array
+-    // is allocated ONLY under this gate, once here and never reallocated:
+-    // the record site of window w publishes release into slot w while the
+-    // PEER window's consumption site reads it with acquire — the
+-    // happens-before edge that makes every issued wait refer to a record
+-    // the peer's host already returned from. (std::atomic members would
+-    // delete the struct's move constructor and break vector resize, so the
+-    // atomics live in this side array — same discipline as the overlay.)
++    // DUALWIN-COMPOSE-EVENT per-window state: counters only, touched under
++    // the gate by this window's own decode worker and read after the workers
++    // join. There is no per-window event, no peer publication array and no
++    // peer wait: each window owns a private Meta relay provider, its own
++    // context, KV and requests, and the model weights are read-only, so no
++    // writable state is shared between windows. A symmetric per-epoch peer
++    // event wait would therefore be a same-phase rendezvous with no data
++    // dependency (and, through the Meta forwarder, only a rank-0 wait, not a
++    // five-rank barrier). The epoch's only real cross-boundary dependency is
++    // this window's own logits D2H copy, covered by the output-copy events
++    // recorded below and host-completed after the relay drain.
+     struct dw_compose_event_state {
+-        ggml_backend_event_t event = nullptr;
+-        // First-child device, resolved once at event creation through the
+-        // public meta accessor; waits are issued only when the peer
+-        // resolved to the SAME device.
+-        ggml_backend_dev_t device = nullptr;
+-        std::uint64_t record_calls = 0, record_ok = 0, sync_calls = 0,
+-                      free_calls = 0, skipped_unavailable = 0;
+-        // Wait counters: touched only by this window's own decode worker
+-        // and read after the workers join. wait_peer_consumed is this
+-        // window's watermark of the peer's published count, so each record
+-        // is waited at most once and no wait ever targets an unrecorded
+-        // event.
+-        std::uint64_t wait_calls = 0, wait_ok = 0,
+-                      wait_skipped_unrecorded = 0,
+-                      wait_skipped_unavailable = 0,
+-                      wait_peer_consumed = 0;
+         // Host-synchronization replacement counters (GGML_TP5_DW_COMPOSE_EVENT
+         // only). output_event_syncs counts epochs whose host completion barrier
+-        // was THIS window's event recorded after llama_decode instead of the
++        // was the output-copy events recorded after llama_decode instead of the
+         // scheduler-wide llama_synchronize; host_sync_replaced is the same
+         // count under its contract name (one stock host synchronize skipped per
+         // count); fallback_no_output_barrier counts ON-path epochs that had to
+         // keep the stock synchronize because no sound output-copy barrier was
+-        // available. none of these is device-completion evidence.
++        // available. None of these is device-completion evidence.
+         std::uint64_t output_event_syncs = 0, host_sync_replaced = 0,
+                       fallback_no_output_barrier = 0, no_sync_logits_calls = 0;
+     };
+     std::vector<dw_compose_event_state> dw_compose_events;
+-    std::unique_ptr<std::atomic<std::uint64_t>[]>
+-        dw_compose_peer_available;
+     if (dw_compose_event_req && opts.execution == mode::relay) {
+         dw_compose_events.resize(opts.windows);
+-        if (opts.windows > 1) {
+-            dw_compose_peer_available.reset(
+-                new std::atomic<std::uint64_t>[opts.windows] {});
+-        }
+     }
+     for (std::uint32_t i = 0; i < opts.windows; ++i) {
+         auto params      = llama_context_default_params();
+@@ -1368,25 +1344,11 @@ run_result run(const options & requested) {
+                 result.hc_owner_offsets.push_back(opts.hc_owner_offsets[i]);
+             }
+             native.push_back(lane);
+-            // DUALWIN-COMPOSE-EVENT: one real backend event per window,
+-            // created from the window's Meta device (which forwards to the
+-            // first simple child device — real HIP/CUDA; the accessor is
+-            // the public ggml_backend_meta_first_child_device the baseline
+-            // added). nullptr (CPU or no-event child) keeps every site a
+-            // counted no-op. The first-child device is resolved once here
+-            // (single-threaded setup) so the wait sites can compare
+-            // devices without touching event internals.
+-            if (dw_compose_event_req && i < dw_compose_events.size() &&
+-                dw_compose_events[i].event == nullptr) {
+-                auto & dw_be     = dw_compose_events[i];
+-                auto * dw_be_dev = ggml_backend_get_device(native.back());
+-                dw_be.device     = ggml_backend_meta_first_child_device(dw_be_dev);
+-                dw_be.event      = dw_be_dev != nullptr ?
+-                    ggml_backend_event_new(dw_be_dev) : nullptr;
+-                if (dw_be.event == nullptr) {
+-                    ++dw_be.skipped_unavailable;
+-                }
+-            }
++            // DUALWIN-COMPOSE-EVENT: nothing per-window is created here. The
++            // output-copy events are owned by the Meta backend and allocated
++            // lazily by ggml_backend_meta_output_record on the exact child
++            // streams the logits D2H readback uses; see
++            // llama_tp5_output_copy_record.
+         }
+         contexts.push_back(std::move(context));
+         result.windows[i].id = i;
+@@ -1512,81 +1474,6 @@ run_result run(const options & requested) {
+                                 llama_tp5_output_copy_record(ctx) :
+                                 0;
+                         const bool dw_output_barrier = dw_copy_streams > 0;
+-                        // DUALWIN-COMPOSE-EVENT: real
+-                        // ggml_backend_event_record on this window's first
+-                        // child after the decode submit returned (outside
+-                        // the submission lock), then a release publication
+-                        // of this window's availability so the peer's
+-                        // consumption site can never wait on an unrecorded
+-                        // event. Counters mean "issued", not device
+-                        // completion.
+-                        if (dw_compose_event_req &&
+-                            wi < dw_compose_events.size() &&
+-                            dw_compose_events[wi].event != nullptr) {
+-                            auto & dw_be = dw_compose_events[wi];
+-                            ++dw_be.record_calls;
+-                            ggml_backend_event_record(dw_be.event, native[wi]);
+-                            ++dw_be.record_ok;
+-                            if (dw_compose_peer_available) {
+-                                dw_compose_peer_available[wi].fetch_add(
+-                                    1, std::memory_order_release);
+-                            }
+-                        }
+-                        // DUALWIN-COMPOSE-EVENT: enqueue ONE device-side
+-                        // wait on this window's first-child stream for the
+-                        // PEER window's most recent unwaited record, before
+-                        // this window's own consumption. The decision (peer
+-                        // usable, same first-child device, published-but-
+-                        // unconsumed record, watermark consumed exactly
+-                        // once) is the shared dw_device_wait::plan state
+-                        // machine; every skip is counted and wait_calls is
+-                        // bumped only in the branch that actually calls
+-                        // ggml_backend_event_wait. This wait is the cross-window
+-                        // HANDOFF ordering on the device; it never weakens an
+-                        // exit predicate because the relay dual-completion
+-                        // drain below is unchanged and still the only exit.
+-                        if (dw_compose_event_req &&
+-                            wi < dw_compose_events.size()) {
+-                            auto & dw_self = dw_compose_events[wi];
+-                            const std::uint32_t dw_n =
+-                                std::uint32_t(dw_compose_events.size());
+-                            const std::uint32_t dw_peer_wi =
+-                                dw_device_wait::peer_of(wi, dw_n);
+-                            const dw_device_wait::context dw_ctx{
+-                                dw_compose_event_req,
+-                                dw_device_wait::has_peer(wi, dw_n),
+-                                dw_peer_wi < dw_n &&
+-                                    dw_compose_events[dw_peer_wi].event !=
+-                                        nullptr,
+-                                dw_self.event != nullptr,
+-                                dw_peer_wi < dw_n &&
+-                                    dw_compose_events[dw_peer_wi].device !=
+-                                        nullptr &&
+-                                    dw_compose_events[dw_peer_wi].device ==
+-                                        dw_self.device,
+-                            };
+-                            const std::uint64_t dw_peer_avail =
+-                                dw_ctx.peer_event && dw_compose_peer_available
+-                                    ? dw_compose_peer_available[dw_peer_wi]
+-                                          .load(std::memory_order_acquire)
+-                                    : 0;
+-                            const dw_device_wait::action dw_act =
+-                                dw_device_wait::plan(dw_ctx, dw_peer_avail,
+-                                                     dw_self.wait_peer_consumed);
+-                            if (dw_act == dw_device_wait::action::wait) {
+-                                ggml_backend_event_wait(
+-                                    native[wi],
+-                                    dw_compose_events[dw_peer_wi].event);
+-                                ++dw_self.wait_calls;
+-                                ++dw_self.wait_ok;
+-                            } else if (dw_act ==
+-                                       dw_device_wait::action::skip_unavailable) {
+-                                ++dw_self.wait_skipped_unavailable;
+-                            } else if (dw_act ==
+-                                       dw_device_wait::action::skip_unrecorded) {
+-                                ++dw_self.wait_skipped_unrecorded;
+-                            }
+-                        }
+                         const auto wait_start = now_ns();
+                         const float * single_output_logits = nullptr;
+                         // DUALWIN-COMPOSE-EVENT: with the gate ON the per-epoch
+@@ -1604,17 +1491,19 @@ run_result run(const options & requested) {
+                         // Removed: the scheduler-wide
+                         // ggml_backend_sched_synchronize performed by
+                         // llama_synchronize / llama_get_logits_ith. Kept: the
+-                        // device-side peer wait above (cross-window ordering on
+-                        // the device) and the unchanged relay dual-completion
+-                        // drain below, still required by this runtime's own exit
+-                        // predicate. The output wait is deferred past the drain
++                        // unchanged relay dual-completion drain below, still
++                        // required by this runtime's own exit predicate. The
++                        // output wait is deferred past the drain
+                         // so the copies complete while the host services the
+                         // relay instead of blocking first.
+                         if (!dw_output_barrier) {
+-                            if (dw_compose_event_req && wi < dw_compose_events.size() &&
+-                                dw_compose_events[wi].event != nullptr) {
++                            if (dw_compose_event_req && wi < dw_compose_events.size()) {
+                                 // Gate ON but no sound output barrier: keep the
+-                                // exact stock synchronize, counted.
++                                // exact stock synchronize, fail-closed, counted.
++                                // No part of this epoch is proven readable by an
++                                // event, so the stock barrier stays exactly as in
++                                // the OFF arm; it is never deferred to a later
++                                // consumer.
+                                 ++dw_compose_events[wi].fallback_no_output_barrier;
+                             }
+                             if (output_rows == 1) {
+@@ -1694,10 +1583,12 @@ run_result run(const options & requested) {
+                         // now, immediately before the host reads logits, do we
+                         // host-complete the output-copy events recorded right
+                         // after decode: their completion proves the async D2H
+-                        // copy of this epoch finished, which is exactly the
+-                        // barrier the replaced llama_synchronize used to provide.
+-                        // The drain already covered the wait time, so this
+-                        // returns without adding the full device latency.
++                        // copy of this epoch finished, which is the barrier the
++                        // replaced llama_synchronize used to provide. The wait
++                        // is placed after the drain so the drain's host work can
++                        // proceed while any remaining copy latency elapses;
++                        // whether that overlap actually saves time is not
++                        // measured and is not claimed.
+                         if (dw_output_barrier) {
+                             auto & dw_be = dw_compose_events[wi];
+                             ++dw_be.output_event_syncs;
+@@ -1853,17 +1744,6 @@ run_result run(const options & requested) {
+     watchdog_stop.store(true, std::memory_order_release);
+     watchdog.join();
+     for (std::uint32_t wi = 0; wi < opts.windows; ++wi) {
+-        // DUALWIN-COMPOSE-EVENT: synchronize the first-child event on the
+-        // host before the existing llama_synchronize; the event's stream
+-        // and coverage relationship to relay work stays unverified (same
+-        // wording as the overlay receipt) — this drains the issued
+-        // record/wait calls before the contexts are torn down.
+-        if (dw_compose_event_req &&
+-            wi < dw_compose_events.size() &&
+-            dw_compose_events[wi].event != nullptr) {
+-            ++dw_compose_events[wi].sync_calls;
+-            ggml_backend_event_synchronize(dw_compose_events[wi].event);
+-        }
+         llama_synchronize(contexts[wi].get());
+         for (std::size_t local = 0; local < assignments[wi].size(); ++local) {
+             require(llama_memory_seq_rm(llama_get_memory(contexts[wi].get()), local, -1, -1),
+@@ -1872,20 +1752,14 @@ run_result run(const options & requested) {
+         llama_synchronize(contexts[wi].get());
+     }
+     if (dw_compose_event_req) {
+-        for (std::uint32_t wi = 0; wi < dw_compose_events.size();
+-             ++wi) {
+-            if (dw_compose_events[wi].event != nullptr) {
+-                ggml_backend_event_free(dw_compose_events[wi].event);
+-                dw_compose_events[wi].event = nullptr;
+-                ++dw_compose_events[wi].free_calls;
+-            }
+-        }
+-        // Receipt counts calls after free. The first child's stream
+-        // relationship to relay work is unverified; these are not overlap
+-        // or device completion evidence. record_ok/wait_ok count returned
+-        // record/wait calls issued in this production compose path; a Meta
+-        // forward may still silently skip a child whose interface member
+-        // is null (same honesty as the overlay receipt).
++        // Receipt counts host calls only. Any output-copy event still owned by
++        // a context is released by ggml_backend_meta_free when the context is
++        // destroyed below; on the success path every epoch's wait already
++        // released them, and the two llama_synchronize calls per window above
++        // drained the streams before that destruction. There is no per-window
++        // peer event, no peer wait and no blocking event synchronize here: the
++        // peer layer was a same-phase rendezvous between windows that share no
++        // writable state.
+         // host_sync_replaced>0 states that this window's per-epoch host
+         // synchronization was the recorded OUTPUT-COPY events instead of the
+         // scheduler-wide llama_synchronize. It does NOT prove on real hardware
+@@ -1902,24 +1776,11 @@ run_result run(const options & requested) {
+              ++wi) {
+             const auto & dw_be = dw_compose_events[wi];
+             std::fprintf(stderr,
+-                "TP5_DW_COMPOSE_EVENT window=%u created=%d"
+-                " record_calls=%llu record_ok=%llu sync_calls=%llu"
+-                " free_calls=%llu wait_calls=%llu wait_ok=%llu"
+-                " wait_skip_unrecorded=%llu wait_skip_unavailable=%llu"
+-                " skipped_unavailable=%llu"
++                "TP5_DW_COMPOSE_EVENT window=%u epochs=%llu"
+                 " output_event_syncs=%llu host_sync_replaced=%llu"
+                 " fallback_no_output_barrier=%llu no_sync_logits_calls=%llu\n",
+                 unsigned(wi),
+-                int(dw_be.event != nullptr || dw_be.free_calls != 0),
+-                (unsigned long long)dw_be.record_calls,
+-                (unsigned long long)dw_be.record_ok,
+-                (unsigned long long)dw_be.sync_calls,
+-                (unsigned long long)dw_be.free_calls,
+-                (unsigned long long)dw_be.wait_calls,
+-                (unsigned long long)dw_be.wait_ok,
+-                (unsigned long long)dw_be.wait_skipped_unrecorded,
+-                (unsigned long long)dw_be.wait_skipped_unavailable,
+-                (unsigned long long)dw_be.skipped_unavailable,
++                (unsigned long long)result.windows[wi].decode_calls,
+                 (unsigned long long)dw_be.output_event_syncs,
+                 (unsigned long long)dw_be.host_sync_replaced,
+                 (unsigned long long)dw_be.fallback_no_output_barrier,
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 083781b..b3ecdcb 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -418,13 +418,6 @@ extern "C" {
+     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
+         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+ 
+-    // DUALWIN-DEVICE-WAIT (GGML_TP5_DW_DEVICE_WAIT=1): resolve a meta device's
+-    // first "simple" child device — the device the event machinery actually
+-    // lands on (meta event_new forwards to it). Returns nullptr for non-meta
+-    // devices and for meta devices without simple children. Pure query: no
+-    // state changes, safe to call before decode workers start.
+-    GGML_API ggml_backend_dev_t ggml_backend_meta_first_child_device(ggml_backend_dev_t meta_dev);
+-
+     // DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): output-copy
+     // completion expressed as device events instead of a scheduler-wide
+     // synchronize.
+@@ -433,11 +426,15 @@ extern "C" {
+     // event on every child stream that the Meta D2H copy of `tensor` uses
+     // (exactly one stream for a MIRRORED tensor, every contributing child for a
+     // split axis), ordered behind everything already enqueued there —
+-    // including the asynchronous D2H copies issued before this call. It returns
+-    // the number of streams recorded, or 0 when the backend is not Meta, the
+-    // tensor is not Meta-buffered or is PARTIAL/unknown, the gate is off, or a
+-    // required stream lacks an event interface. On 0 the caller must keep its
+-    // full synchronize; no event is left allocated.
++    // including the asynchronous D2H copies issued before this call. A
++    // non-null event still held from an earlier record means that record was
++    // never waited on (its epoch was abandoned before output_wait); it is
++    // released first, without waiting, so the next wait cannot report a stale
++    // completion. It returns the number of streams recorded in THIS call, or 0
++    // when the backend is not Meta, the tensor is not Meta-buffered or is
++    // PARTIAL/unknown, the gate is off, or a required stream lacks an event
++    // interface. On 0 the caller must keep its full synchronize; no event is
++    // left allocated.
+     //
+     // ggml_backend_meta_output_wait(meta_backend) host-completes those events
+     // and releases them, returning the number proven complete. Only device event
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index b37ad3c..95e877a 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -182,57 +182,28 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
+     return true;
+ }
+ 
+-// DUALWIN-BACKEND-EVENT: forward real HIP/CUDA ggml backend events through the
+-// Meta device to its first simple child device. Two exact-"1" gates enable it,
+-// both read once at static initialization (tree convention):
+-//   GGML_TP5_DW_BACKEND_EVENT  — the overlay candidate's gate;
+-//   GGML_TP5_DW_COMPOSE_EVENT  — the fork compose runtime's replacement gate,
+-//                                which must be self-sufficient: the compose
+-//                                runtime creates its per-window event from this
+-//                                Meta device, so without it the gate could never
+-//                                engage.
+-// unset or any value other than exactly "1" for BOTH keeps every wrapper
+-// returning immediately, so OFF behavior is stock-identical. CPU children
+-// expose no event interface, so event_new returns nullptr and the feature is a
+-// no-op there (CPU-equivalent).
+-static const bool ggml_backend_meta_event_gate = [] {
+-    const auto exact_one = [](const char * name) {
+-        const char * value = std::getenv(name);
+-        return value != nullptr && std::strcmp(value, "1") == 0;
+-    };
+-    return exact_one("GGML_TP5_DW_BACKEND_EVENT") || exact_one("GGML_TP5_DW_COMPOSE_EVENT");
++// DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): the ONLY Meta event
++// surface in this tree. It is deliberately NOT a device/backend event
++// interface: the meta device keeps stock nullptr event_new/event_free/
++// event_synchronize and the meta backend keeps stock nullptr event_record/
++// event_wait. Consequence (the reason this is not negotiable): a non-null
++// meta-device event_new makes ggml_backend_sched allocate and use its own
++// events for every meta backend
++// (ggml/src/ggml-backend.cpp: ggml_backend_event_new(backends[b]->device)),
++// replacing its stock ggml_backend_synchronize fallback for the whole
++// process — an unverified, process-wide synchronization change. Conversely a
++// meta-backend event_record/event_wait forwards to child 0 only, which cannot
++// order all five relay ranks. The output-copy barrier is therefore expressed
++// directly on the contributing child devices by
++// ggml_backend_meta_output_record/output_wait below; it is confined to this
++// gate and cannot alter any other graph's cross-backend synchronization.
++// unset or any value other than exactly "1" keeps output_record a no-op, so
++// OFF behavior is stock-identical.
++static const bool ggml_backend_meta_compose_event_gate = [] {
++    const char * value = std::getenv("GGML_TP5_DW_COMPOSE_EVENT");
++    return value != nullptr && std::strcmp(value, "1") == 0;
+ }();
+ 
+-static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index);
+-
+-static ggml_backend_event_t ggml_backend_meta_device_event_new(ggml_backend_dev_t dev) {
+-    if (!ggml_backend_meta_event_gate) {
+-        return nullptr;
+-    }
+-    ggml_backend_dev_t child = ggml_backend_meta_dev_simple_dev(dev, 0);
+-    return child->iface.event_new != nullptr ? child->iface.event_new(child) : nullptr;
+-}
+-
+-static void ggml_backend_meta_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+-    if (!ggml_backend_meta_event_gate || event == nullptr) {
+-        return;
+-    }
+-    ggml_backend_dev_t child = ggml_backend_meta_dev_simple_dev(dev, 0);
+-    if (child->iface.event_free != nullptr) {
+-        child->iface.event_free(child, event);
+-    }
+-}
+-
+-static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+-    if (!ggml_backend_meta_event_gate || event == nullptr) {
+-        return;
+-    }
+-    ggml_backend_dev_t child = ggml_backend_meta_dev_simple_dev(dev, 0);
+-    if (child->iface.event_synchronize != nullptr) {
+-        child->iface.event_synchronize(child, event);
+-    }
+-}
+-
+ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .get_name             = */ ggml_backend_meta_device_get_name,
+     /* .get_description      = */ ggml_backend_meta_device_get_description,
+@@ -246,9 +217,9 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .supports_op          = */ ggml_backend_meta_device_supports_op,
+     /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
+     /* .offload_op           = */ nullptr,
+-    /* .event_new            = */ ggml_backend_meta_device_event_new,
+-    /* .event_free           = */ ggml_backend_meta_device_event_free,
+-    /* .event_synchronize    = */ ggml_backend_meta_device_event_synchronize,
++    /* .event_new            = */ nullptr,
++    /* .event_free           = */ nullptr,
++    /* .event_synchronize    = */ nullptr,
+ };
+ 
+ static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
+@@ -267,22 +238,6 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
+     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
+     return meta_dev_ctx->simple_devs[index];
+ }
+-// DUALWIN-DEVICE-WAIT (GGML_TP5_DW_DEVICE_WAIT=1): the event machinery
+-// (device event_new under GGML_TP5_DW_BACKEND_EVENT) resolves to the first
+-// simple child, so cross-window event waits must compare THIS device, not
+-// the meta device handle. Non-meta devices and meta devices without simple
+-// children return nullptr; the caller treats that as "device unknown" and
+-// skips (counted). Read-only; no gating of its own.
+-ggml_backend_dev_t ggml_backend_meta_first_child_device(ggml_backend_dev_t meta_dev) {
+-    if (meta_dev == nullptr || !ggml_backend_dev_is_meta(meta_dev)) {
+-        return nullptr;
+-    }
+-    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+-    if (meta_dev_ctx == nullptr || meta_dev_ctx->simple_devs.empty()) {
+-        return nullptr;
+-    }
+-    return meta_dev_ctx->simple_devs[0];
+-}
+ 
+ ggml_backend_dev_t ggml_backend_meta_device(
+         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
+@@ -4194,35 +4149,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+-// DUALWIN-BACKEND-EVENT (GGML_TP5_DW_BACKEND_EVENT=1): forward events
+-// through this Meta backend's first simple child. Its stream relationship to
+-// relay work is unverified. The per-instance backend iface fields are set
+-// only under the gate in
+-// ggml_backend_meta_device_init_backend, so with the gate off the iface is
+-// stock-identical (event_record/event_wait stay nullptr) and no new call
+-// exists on any path. A child without the event interface (CPU) is skipped.
+-static void ggml_backend_meta_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+-    auto * meta_ctx = (ggml_backend_meta_context *) backend->context;
+-    if (meta_ctx->backend_configs.empty() || event == nullptr) {
+-        return;
+-    }
+-    ggml_backend_t child = meta_ctx->backend_configs[0].backend;
+-    if (child != nullptr && child->iface.event_record != nullptr) {
+-        child->iface.event_record(child, event);
+-    }
+-}
+-
+-static void ggml_backend_meta_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+-    auto * meta_ctx = (ggml_backend_meta_context *) backend->context;
+-    if (meta_ctx->backend_configs.empty() || event == nullptr) {
+-        return;
+-    }
+-    ggml_backend_t child = meta_ctx->backend_configs[0].backend;
+-    if (child != nullptr && child->iface.event_wait != nullptr) {
+-        child->iface.event_wait(child, event);
+-    }
+-}
+-
+ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .get_name                = */ ggml_backend_meta_get_name,
+     /* .free                    = */ ggml_backend_meta_free,
+@@ -4256,10 +4182,12 @@ static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t d
+     ggml_backend_t backend = new struct ggml_backend;
+     backend->guid    = ggml_backend_meta_guid();
+     backend->iface   = ggml_backend_meta_i;
+-    if (ggml_backend_meta_event_gate) {
+-        backend->iface.event_record = ggml_backend_meta_event_record;
+-        backend->iface.event_wait   = ggml_backend_meta_event_wait;
+-    }
++    // DUALWIN-COMPOSE-EVENT: the meta backend deliberately exposes NO event
++    // interface. event_record/event_wait here would forward to child 0 only
++    // (not a five-rank barrier) and, with a non-null meta-device event_new,
++    // would change ggml_backend_sched's cross-backend synchronization for
++    // every meta graph in the process. The output-copy barrier uses the
++    // contributing child devices directly (ggml_backend_meta_output_record).
+     backend->device  = dev;
+     backend->context = backend_ctx;
+     return backend;
+@@ -4287,7 +4215,7 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
+ // is not a readable final row, and leaving it to the caller's full synchronize
+ // keeps that failure unchanged.
+ size_t ggml_backend_meta_output_record(ggml_backend_t meta_backend, const struct ggml_tensor * tensor) {
+-    if (!ggml_backend_meta_event_gate || meta_backend == nullptr || tensor == nullptr ||
++    if (!ggml_backend_meta_compose_event_gate || meta_backend == nullptr || tensor == nullptr ||
+             !ggml_backend_is_meta(meta_backend) || tensor->buffer == nullptr ||
+             !ggml_backend_buffer_is_meta(tensor->buffer)) {
+         return 0;
+@@ -4321,6 +4249,22 @@ size_t ggml_backend_meta_output_record(ggml_backend_t meta_backend, const struct
+         }
+         backend_ctx->output_copy_events.assign(n_backends, nullptr);
+     }
++    // Owner/record-wait ordering: a successful wait always nulls every entry,
++    // so a non-null entry here is a record from an epoch that was never
++    // waited on. That happens only when the epoch was abandoned between
++    // output_record and output_wait (a throw on the error/abort path); its
++    // logits were never consumed. Release it without synchronizing: destroying
++    // a recorded event does not cancel stream work, nothing waits on its
++    // captured state, and the next decode's relay process_ubatch synchronize
++    // drains the stream anyway. Keeping it would make a later epoch's wait
++    // release a stale event and return more completions than that epoch
++    // recorded, tripping the runtime's exact coverage check.
++    for (ggml_backend_event_t & stale : backend_ctx->output_copy_events) {
++        if (stale != nullptr) {
++            ggml_backend_event_free(stale);
++            stale = nullptr;
++        }
++    }
+     size_t recorded = 0;
+     for (size_t j : targets) {
+         ggml_backend_t child = backend_ctx->backend_configs[j].backend;
+diff --git a/include/llama.h b/include/llama.h
+index 385d479..1cedd7a 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -644,8 +644,10 @@ extern "C" {
+ 
+     // Host-complete and release the events recorded by
+     // llama_tp5_output_copy_record, then run the context's synchronize
+-    // bookkeeping. Returns the number of streams proven complete. Never
+-    // synchronizes the scheduler's backends.
++    // bookkeeping — only when at least one recorded event was actually
++    // synchronized, so an epoch with nothing to prove never reports its queued
++    // tokens as synchronized. Returns the number of streams proven complete.
++    // Never synchronizes the scheduler's backends.
+     LLAMA_API size_t llama_tp5_output_event_wait(struct llama_context * ctx);
+ 
+     // Resolve one output row without synchronizing the context. The caller must
+diff --git a/overlay/mtp-async-protocol-candidate-20261027/dw_device_wait.h b/overlay/mtp-async-protocol-candidate-20261027/dw_device_wait.h
+index 38393a2..319b609 100644
+--- a/overlay/mtp-async-protocol-candidate-20261027/dw_device_wait.h
++++ b/overlay/mtp-async-protocol-candidate-20261027/dw_device_wait.h
+@@ -1,10 +1,12 @@
+ // DUALWIN-DEVICE-WAIT (GGML_TP5_DW_DEVICE_WAIT=1): gate parsing, peer
+-// selection and the wait/decision state machine shared verbatim by the fork
+-// and overlay runtimes (single source of truth: the two copies are kept
+-// byte-identical, same sync discipline as dw_event_trace.h). The REAL
+-// ggml_backend_event_wait call stays at the runtime's production consumption
+-// points (target decode / verified-prefix replay); this header holds
+-// everything testable without a GPU: the exact-"1" gate, the
++// selection and the wait/decision state machine for the overlay
++// mtp-async runtime's production consumption points (target decode /
++// verified-prefix replay). This is the overlay product's own copy: the fork
++// tp5-compose runtime no longer ships or includes this header (its symmetric
++// per-epoch peer wait was a same-phase rendezvous with no cross-window data
++// dependency and was removed), so there is no longer a fork mirror to keep
++// byte-identical. `dw_event_trace.h` is still mirrored by both runtimes. The
++// header holds everything testable without a GPU: the exact-"1" gate, the
+ // one-window-has-no-peer rule, the release/acquire pairing contract and the
+ // watermark that makes every record consumed at most once and never waits on
+ // an unrecorded event.
+@@ -52,10 +54,13 @@ inline bool has_peer(std::uint32_t wi, std::uint32_t windows) noexcept {
+ // What the runtime knows about the peer at a consumption point. All fields
+ // are cheap reads; peer_event comes from the event pointers and same_device
+ // from the first-child devices resolved once at event creation
+-// (single-threaded setup, before any decode worker runs) through the public
+-// ggml_backend_meta_first_child_device accessor — the same resolution the
+-// meta event machinery uses, so a planned wait always targets the peer's
+-// event on THIS window's own first-child device.
++// (single-threaded setup, before any decode worker runs).
++// NOTE: the tree Meta source no longer exports
++// ggml_backend_meta_first_child_device (the fork runtime that used it removed
++// its peer-wait layer), and this overlay's own Meta build never defined it.
++// This overlay runtime therefore needs that resolution supplied by its own
++// Meta patch/build (a public, read-only first-simple-child query) before it
++// can link against either Meta source; the planner below is unchanged.
+ struct context {
+     bool event_gate  = false;  // GGML_TP5_DW_BACKEND_EVENT=1 (events exist)
+     bool have_peer   = false;  // windows > 1
+diff --git a/overlay/mtp-async-protocol-candidate-20261027/dw_event_trace.h b/overlay/mtp-async-protocol-candidate-20261027/dw_event_trace.h
+index 2aad704..0fa93f0 100644
+--- a/overlay/mtp-async-protocol-candidate-20261027/dw_event_trace.h
++++ b/overlay/mtp-async-protocol-candidate-20261027/dw_event_trace.h
+@@ -46,14 +46,14 @@ inline void banner() {
+     (void) printed;
+ }
+ 
+-// Event-point trace (overlay runtime only): host timestamps around the real
+-// ggml_backend_event_record / ggml_backend_event_synchronize /
+-// ggml_backend_event_wait call sites, per window. Still HOST correlation
+-// metadata — never device interval evidence. wait_calls counts the real
+-// device-side waits issued under GGML_TP5_DW_DEVICE_WAIT=1 (the r7 wire and
+-// the r8 trace left it a documented 0 gap); wait_first_ns/wait_last_ns are
+-// the host stamps around those wait call sites (0 when that gate or the
+-// trace gate is off).
++// Event-point trace fields shared with the overlay runtime: host timestamps
++// around real ggml_backend_event record/synchronize/wait call sites, per
++// window. Still HOST correlation metadata — never device interval evidence.
++// wait_calls/wait_first_ns/wait_last_ns are populated by the overlay product
++// only (its GGML_TP5_DW_DEVICE_WAIT peer waits); the fork compose runtime
++// removed its peer-wait layer, so those three stay 0 there and are not a
++// zero-valued measurement. Its record_*/sync_* stamps are host call-site
++// correlation for the peer events that no longer exist in the fork either.
+ struct evpt {
+     std::uint64_t record_first_ns = 0;  // first record() call-site stamp
+     std::uint64_t record_last_ns  = 0;  // latest record() call-site stamp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ee38d71..0a915c9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1665,9 +1665,14 @@ size_t llama_context::tp5_output_copy_wait() {
+         return 0;
+     }
+     const size_t complete = ggml_backend_meta_output_wait(backend_tp5_relay);
+-    // The epoch's device work was proven complete by the events; only the
+-    // bookkeeping of a normal synchronize() remains.
+-    synchronize_accounting();
++    // Only a wait that actually released recorded events is this epoch's
++    // completion barrier. With no event (gate off, refused record, or an
++    // already-drained epoch) nothing was synchronized, so the eval bookkeeping
++    // of synchronize() must NOT run: that would claim the queued tokens were
++    // synchronized when no host wait happened.
++    if (complete > 0) {
++        synchronize_accounting();
++    }
+     return complete;
+ }
+ 

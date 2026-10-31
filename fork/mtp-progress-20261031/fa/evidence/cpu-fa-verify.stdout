@@ -1,0 +1,460 @@
+A 3cafd0a0bee2ade33eb34bb4beaa93aa3d50b8d03e0c728c3e184698beabcdac3e6c12ecbeae99ae3ed97dda3ef79bf8beee9def3d1068903d6eb8f0bda57ca4be917d92bde50ce4be9c979cbe5962da3daed4b0beb265b2be367eb63e9355943e3fdec0beda7fda3e46b6c83ed73dd8bed23fd23ea82fa83d9ad4983daf0cb0be0e37e3bdc4a81e3e5fcca0be5d66f6bd9001ed3be53baf3e9e2595be8e723ebe0db1e3bd05eee73e37a3f93e4417d3bdd097653e8185af3dd0585abe056d95be45028dbe74bee8be9d18ed3d6b3c64bd9687a1be62dc40be0f64ac3e8389113e289a94be2866dd3d9023633da26eedbe0ad3683e140a013dfb5f01be4cfa503c8a5572be0b95373dcf9552bd9c0aa0bdfda7f83e33b1ec3e52fc47be904fcbbe75141f3e0064a83e10a50d3e942417bbdc9a893e0a00943d439384be11d06dbda042e8bdc1488ebe07d8c0bdafb628bcdd491fbdd7b9d0be104bee3e1165d33e23868abe29457e3d52a39f3dd5003c3c81371f3e41a5883d9aa403bdc706573e1b3fccbdc7f7da3ddb0b00bd63aa33be0b173e3e58934c3e035238be2443e4be38e1543e2f876f3e188eed3e6258d4bd3fc7403e08e6fb3d98ae67bd9c0d493cf2b4063cf92f05be1dc38cbda55238bd6ef8b6be285c1cbd4807903cb3bad33da83f06bd8d01113d474fbf3d7e9db33d22a8273e5fb6093cadb2b1bd24085d3e0b8e6cbe141d453bf318a73b7cfbe5bdffca793e4ee61c3d46d814be41fbccbe30219d3dfc26733ddf8e5f3e48d5c0bd5860583e3a2b923d1f7f3c3cefb45e3db327663d6917b7bd4427edbcb2ea39bd9c90fdbdb602ebbc5a5fc13e15d0d43b7f7f1cbce81b753addcdac3d4d9e023dc4dfb63dec77f63d1bb955bd5ed3a13d7ee3ccbe0abc6f3c9dd9ccbd1555ecbd98ddc23e3661f33d61aef2be3401b3bdde48033e09af4f3e0599773e3aa09a3c6141023e540bf33d81f0d83ce945cd3c7d170c3dba3205bb9198423d0aee9bbcd354e6bdbb98b8bcb582983d5eaad2bd842641bd1b975d3c91bc8f3dc2ff053e0033a63e0b26883d5391c3bd94a4dc3d8f95e5be26f7b63c9028f3bb4356eebbc2515b3e0d76f33cf28a82be3d85cdbd212a743dde27ef3df764523dccce383d9711d03df51bef3d613b513c8ea7cfb86f35503d975dd7bcd5be803da55198bd2ddf3bbdb26a523d4429413d67c0a4bc38433abcfa48ef3cc839193d0cf5773d3f78b83e182842bc9f7800bdcc8cfc3d789abdbddcad293c69f4883ccc6a7abcb3151f3e34bff03a87f017be49a139bd9e566e3ddf732d3da6dd7b3d60edc13d1155893dde19b43d5faa473c891fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS A stock graph state ran
+PASS B slot5=-1 ignored by ggml-cpu (dump == A)
+PASS B slot5=300 ignored by ggml-cpu (dump == A)
+C 3cafd0a0bee2ade33eb34bb4beaa93aa3d50b8d03e0c728c3e184698beabcdac3e6c12ecbeae99ae3ed97dda3ef79bf8beee9def3d1068903d6eb8f0bda57ca4be917d92bde50ce4be9c979cbe5962da3daed4b0beb265b2be367eb63e9355943e3fdec0beda7fda3e46b6c83ed73dd8bed23fd23ea82fa83d9ad4983daf0cb0be0e37e3bdc4a81e3e5fcca0be5d66f6bd9001ed3be53baf3e9e2595be8e723ebe0db1e3bd05eee73e37a3f93e4417d3bdd097653e8185af3dd0585abe056d95be45028dbe74bee8be9d18ed3d6b3c64bd9687a1be62dc40be0f64ac3e8389113e289a94be2866dd3d9023633da26eedbe0ad3683e140a013dfb5f01be4cfa503c8a5572be0b95373dcf9552bd9c0aa0bdfda7f83e33b1ec3e52fc47be904fcbbe75141f3e0064a83e10a50d3e942417bbdc9a893e0a00943d439384be11d06dbda042e8bdc1488ebe07d8c0bdafb628bcdd491fbdd7b9d0be104bee3e1165d33e23868abe29457e3d52a39f3dd5003c3c81371f3e41a5883d9aa403bdc706573e1b3fccbdc7f7da3ddb0b00bd63aa33be0b173e3e58934c3e035238be2443e4be38e1543e2f876f3e188eed3e6258d4bd3fc7403e08e6fb3d98ae67bd9c0d493cf2b4063cf92f05be1dc38cbda55238bd6ef8b6be285c1cbd4807903cb3bad33da83f06bd8d01113d474fbf3d7e9db33d22a8273e5fb6093cadb2b1bd24085d3e0b8e6cbe141d453bf318a73b7cfbe5bdffca793e4ee61c3d46d814be41fbccbe30219d3dfc26733ddf8e5f3e48d5c0bd5860583e3a2b923d1f7f3c3cefb45e3db327663d6917b7bd4427edbcb2ea39bd9c90fdbdb602ebbc5a5fc13e15d0d43b7f7f1cbce81b753addcdac3d4d9e023dc4dfb63dec77f63d1bb955bd5ed3a13d7ee3ccbe0abc6f3c9dd9ccbd1555ecbd98ddc23e3661f33d61aef2be3401b3bdde48033e09af4f3e0599773e3aa09a3c6141023e540bf33d81f0d83ce945cd3c7d170c3dba3205bb9198423d0aee9bbcd354e6bdbb98b8bcb582983d5eaad2bd842641bd1b975d3c91bc8f3dc2ff053e0033a63e0b26883d5391c3bd94a4dc3d8f95e5be26f7b63c9028f3bb4356eebbc2515b3e0d76f33cf28a82be3d85cdbd212a743dde27ef3df764523dccce383d9711d03df51bef3d613b513c8ea7cfb86f35503d975dd7bcd5be803da55198bd2ddf3bbdb26a523d4429413d67c0a4bc38433abcfa48ef3cc839193d0cf5773d3f78b83e182842bc9f7800bdcc8cfc3d789abdbddcad293c69f4883ccc6a7abcb3151f3e34bff03a87f017be49a139bd9e566e3ddf732d3da6dd7b3d60edc13d1155893dde19b43d5faa473c891fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS C src5=n_kv identical to stock graph state
+PASS C bound consumed src5=1
+PASS C bound consumed src5=255
+PASS C bound consumed src5=256
+PASS C bound consumed src5=257
+PASS C bound consumed src5=511
+PASS C src5=0 all-zero output (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__internal_syscall_cancel (a1=1023103, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+#0  __internal_syscall_cancel (a1=1023103, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+40	in ./nptl/cancellation.c
+#1  __syscall_cancel (a1=1023103, a2=0, a3=0, a4=0, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#2  0x00007f8117b1cacf in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#3  0x00007f81180db333 in ggml_print_backtrace () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#4  0x00007f81180db4e6 in ggml_abort () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#5  0x00007f81182844a4 in ggml_compute_forward_flash_attn_ext () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#6  0x00007f81181ef19f in ggml_graph_compute_thread.isra () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#7  0x00007f81181f197b in ggml_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#8  0x00007f81181f1ccb in ggml_backend_cpu_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#9  0x00007f81180f5cf2 in ggml_backend_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#10 0x000057ea67482b23 in (anonymous namespace)::run_fa((anonymous namespace)::inputs const&, bool, int, int, int) ()
+#11 0x000057ea67483fd9 in main ()
+[Inferior 1 (process 1023102) detached]
+fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS C src5=n_kv identical to stock graph state
+PASS C bound consumed src5=1
+PASS C bound consumed src5=255
+PASS C bound consumed src5=256
+PASS C bound consumed src5=257
+PASS C bound consumed src5=511
+PASS C src5=0 all-zero output (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-1 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__internal_syscall_cancel (a1=1023127, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+#0  __internal_syscall_cancel (a1=1023127, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+40	in ./nptl/cancellation.c
+#1  __syscall_cancel (a1=1023127, a2=0, a3=0, a4=0, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#2  0x00007f8117b1cacf in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#3  0x00007f81180db333 in ggml_print_backtrace () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#4  0x00007f81180db4e6 in ggml_abort () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#5  0x00007f81182844a4 in ggml_compute_forward_flash_attn_ext () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#6  0x00007f81181ef19f in ggml_graph_compute_thread.isra () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#7  0x00007f81181f197b in ggml_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#8  0x00007f81181f1ccb in ggml_backend_cpu_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#9  0x00007f81180f5cf2 in ggml_backend_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#10 0x000057ea67482b23 in (anonymous namespace)::run_fa((anonymous namespace)::inputs const&, bool, int, int, int) ()
+#11 0x000057ea67483fd9 in main ()
+[Inferior 1 (process 1023126) detached]
+fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS C src5=n_kv identical to stock graph state
+PASS C bound consumed src5=1
+PASS C bound consumed src5=255
+PASS C bound consumed src5=256
+PASS C bound consumed src5=257
+PASS C bound consumed src5=511
+PASS C src5=0 all-zero output (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-1 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__internal_syscall_cancel (a1=1023145, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+#0  __internal_syscall_cancel (a1=1023145, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+40	in ./nptl/cancellation.c
+#1  __syscall_cancel (a1=1023145, a2=0, a3=0, a4=0, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#2  0x00007f8117b1cacf in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#3  0x00007f81180db333 in ggml_print_backtrace () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#4  0x00007f81180db4e6 in ggml_abort () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#5  0x00007f81182844a4 in ggml_compute_forward_flash_attn_ext () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#6  0x00007f81181ef19f in ggml_graph_compute_thread.isra () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#7  0x00007f81181f197b in ggml_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#8  0x00007f81181f1ccb in ggml_backend_cpu_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#9  0x00007f81180f5cf2 in ggml_backend_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#10 0x000057ea67482b23 in (anonymous namespace)::run_fa((anonymous namespace)::inputs const&, bool, int, int, int) ()
+#11 0x000057ea67483fd9 in main ()
+[Inferior 1 (process 1023144) detached]
+fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS C src5=n_kv identical to stock graph state
+PASS C bound consumed src5=1
+PASS C bound consumed src5=255
+PASS C bound consumed src5=256
+PASS C bound consumed src5=257
+PASS C bound consumed src5=511
+PASS C src5=0 all-zero output (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-1 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2147483648 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__internal_syscall_cancel (a1=1023164, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+#0  __internal_syscall_cancel (a1=1023164, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+40	in ./nptl/cancellation.c
+#1  __syscall_cancel (a1=1023164, a2=0, a3=0, a4=0, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#2  0x00007f8117b1cacf in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#3  0x00007f81180db333 in ggml_print_backtrace () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#4  0x00007f81180db4e6 in ggml_abort () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#5  0x00007f81182844a4 in ggml_compute_forward_flash_attn_ext () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#6  0x00007f81181ef19f in ggml_graph_compute_thread.isra () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#7  0x00007f81181f197b in ggml_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#8  0x00007f81181f1ccb in ggml_backend_cpu_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#9  0x00007f81180f5cf2 in ggml_backend_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#10 0x000057ea67482b23 in (anonymous namespace)::run_fa((anonymous namespace)::inputs const&, bool, int, int, int) ()
+#11 0x000057ea67483fd9 in main ()
+[Inferior 1 (process 1023163) detached]
+fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS C src5=n_kv identical to stock graph state
+PASS C bound consumed src5=1
+PASS C bound consumed src5=255
+PASS C bound consumed src5=256
+PASS C bound consumed src5=257
+PASS C bound consumed src5=511
+PASS C src5=0 all-zero output (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-1 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2147483648 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=513 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__internal_syscall_cancel (a1=1023599, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+#0  __internal_syscall_cancel (a1=1023599, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+40	in ./nptl/cancellation.c
+#1  __syscall_cancel (a1=1023599, a2=0, a3=0, a4=0, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#2  0x00007f8117b1cacf in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#3  0x00007f81180db333 in ggml_print_backtrace () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#4  0x00007f81180db4e6 in ggml_abort () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#5  0x00007f81182844a4 in ggml_compute_forward_flash_attn_ext () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#6  0x00007f81181ef19f in ggml_graph_compute_thread.isra () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#7  0x00007f81181f197b in ggml_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#8  0x00007f81181f1ccb in ggml_backend_cpu_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#9  0x00007f81180f5cf2 in ggml_backend_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#10 0x000057ea67482b23 in (anonymous namespace)::run_fa((anonymous namespace)::inputs const&, bool, int, int, int) ()
+#11 0x000057ea67483fd9 in main ()
+[Inferior 1 (process 1023598) detached]
+fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS C src5=n_kv identical to stock graph state
+PASS C bound consumed src5=1
+PASS C bound consumed src5=255
+PASS C bound consumed src5=256
+PASS C bound consumed src5=257
+PASS C bound consumed src5=511
+PASS C src5=0 all-zero output (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-1 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2147483648 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=513 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=2147483647 aborts (n_q=8)
+PASS C src5=0 all-zero output (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__internal_syscall_cancel (a1=1023631, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+#0  __internal_syscall_cancel (a1=1023631, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+40	in ./nptl/cancellation.c
+#1  __syscall_cancel (a1=1023631, a2=0, a3=0, a4=0, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#2  0x00007f8117b1cacf in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#3  0x00007f81180db333 in ggml_print_backtrace () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#4  0x00007f81180db4e6 in ggml_abort () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#5  0x00007f81182844a4 in ggml_compute_forward_flash_attn_ext () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#6  0x00007f81181ef19f in ggml_graph_compute_thread.isra () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#7  0x00007f81181f197b in ggml_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#8  0x00007f81181f1ccb in ggml_backend_cpu_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#9  0x00007f81180f5cf2 in ggml_backend_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#10 0x000057ea67482b23 in (anonymous namespace)::run_fa((anonymous namespace)::inputs const&, bool, int, int, int) ()
+#11 0x000057ea67483fd9 in main ()
+[Inferior 1 (process 1023630) detached]
+fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS C src5=n_kv identical to stock graph state
+PASS C bound consumed src5=1
+PASS C bound consumed src5=255
+PASS C bound consumed src5=256
+PASS C bound consumed src5=257
+PASS C bound consumed src5=511
+PASS C src5=0 all-zero output (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-1 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2147483648 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=513 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=2147483647 aborts (n_q=8)
+PASS C src5=0 all-zero output (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-1 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__internal_syscall_cancel (a1=1023649, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+#0  __internal_syscall_cancel (a1=1023649, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+40	in ./nptl/cancellation.c
+#1  __syscall_cancel (a1=1023649, a2=0, a3=0, a4=0, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#2  0x00007f8117b1cacf in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#3  0x00007f81180db333 in ggml_print_backtrace () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#4  0x00007f81180db4e6 in ggml_abort () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#5  0x00007f81182844a4 in ggml_compute_forward_flash_attn_ext () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#6  0x00007f81181ef19f in ggml_graph_compute_thread.isra () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#7  0x00007f81181f197b in ggml_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#8  0x00007f81181f1ccb in ggml_backend_cpu_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#9  0x00007f81180f5cf2 in ggml_backend_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#10 0x000057ea67482b23 in (anonymous namespace)::run_fa((anonymous namespace)::inputs const&, bool, int, int, int) ()
+#11 0x000057ea67483fd9 in main ()
+[Inferior 1 (process 1023648) detached]
+fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS C src5=n_kv identical to stock graph state
+PASS C bound consumed src5=1
+PASS C bound consumed src5=255
+PASS C bound consumed src5=256
+PASS C bound consumed src5=257
+PASS C bound consumed src5=511
+PASS C src5=0 all-zero output (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-1 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2147483648 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=513 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=2147483647 aborts (n_q=8)
+PASS C src5=0 all-zero output (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-1 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-2 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__internal_syscall_cancel (a1=1023669, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+#0  __internal_syscall_cancel (a1=1023669, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+40	in ./nptl/cancellation.c
+#1  __syscall_cancel (a1=1023669, a2=0, a3=0, a4=0, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#2  0x00007f8117b1cacf in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#3  0x00007f81180db333 in ggml_print_backtrace () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#4  0x00007f81180db4e6 in ggml_abort () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#5  0x00007f81182844a4 in ggml_compute_forward_flash_attn_ext () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#6  0x00007f81181ef19f in ggml_graph_compute_thread.isra () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#7  0x00007f81181f197b in ggml_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#8  0x00007f81181f1ccb in ggml_backend_cpu_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#9  0x00007f81180f5cf2 in ggml_backend_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#10 0x000057ea67482b23 in (anonymous namespace)::run_fa((anonymous namespace)::inputs const&, bool, int, int, int) ()
+#11 0x000057ea67483fd9 in main ()
+[Inferior 1 (process 1023668) detached]
+fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS C src5=n_kv identical to stock graph state
+PASS C bound consumed src5=1
+PASS C bound consumed src5=255
+PASS C bound consumed src5=256
+PASS C bound consumed src5=257
+PASS C bound consumed src5=511
+PASS C src5=0 all-zero output (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-1 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2147483648 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=513 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=2147483647 aborts (n_q=8)
+PASS C src5=0 all-zero output (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-1 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-2 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-2147483648 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__internal_syscall_cancel (a1=1024275, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+#0  __internal_syscall_cancel (a1=1024275, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+40	in ./nptl/cancellation.c
+#1  __syscall_cancel (a1=1024275, a2=0, a3=0, a4=0, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#2  0x00007f8117b1cacf in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#3  0x00007f81180db333 in ggml_print_backtrace () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#4  0x00007f81180db4e6 in ggml_abort () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#5  0x00007f81182844a4 in ggml_compute_forward_flash_attn_ext () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#6  0x00007f81181ef19f in ggml_graph_compute_thread.isra () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#7  0x00007f81181f197b in ggml_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#8  0x00007f81181f1ccb in ggml_backend_cpu_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#9  0x00007f81180f5cf2 in ggml_backend_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#10 0x000057ea67482b23 in (anonymous namespace)::run_fa((anonymous namespace)::inputs const&, bool, int, int, int) ()
+#11 0x000057ea67483fd9 in main ()
+[Inferior 1 (process 1024274) detached]
+fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS C src5=n_kv identical to stock graph state
+PASS C bound consumed src5=1
+PASS C bound consumed src5=255
+PASS C bound consumed src5=256
+PASS C bound consumed src5=257
+PASS C bound consumed src5=511
+PASS C src5=0 all-zero output (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-1 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2147483648 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=513 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=2147483647 aborts (n_q=8)
+PASS C src5=0 all-zero output (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-1 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-2 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-2147483648 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=513 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__internal_syscall_cancel (a1=1024347, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+#0  __internal_syscall_cancel (a1=1024347, a2=0, a3=0, a4=0, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:40
+40	in ./nptl/cancellation.c
+#1  __syscall_cancel (a1=1024347, a2=0, a3=0, a4=0, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#2  0x00007f8117b1cacf in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#3  0x00007f81180db333 in ggml_print_backtrace () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#4  0x00007f81180db4e6 in ggml_abort () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#5  0x00007f81182844a4 in ggml_compute_forward_flash_attn_ext () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#6  0x00007f81181ef19f in ggml_graph_compute_thread.isra () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#7  0x00007f81181f197b in ggml_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#8  0x00007f81181f1ccb in ggml_backend_cpu_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-cpu.so.0
+#9  0x00007f81180f5cf2 in ggml_backend_graph_compute () from /home/kunweiz/work/lead-fa-lower-local/build/bin/libggml-base.so.0
+#10 0x000057ea67482b23 in (anonymous namespace)::run_fa((anonymous namespace)::inputs const&, bool, int, int, int) ()
+#11 0x000057ea67483fd9 in main ()
+[Inferior 1 (process 1024346) detached]
+fb6bc7c459b3d76f10dbd7cb1be3d7a9545bc7b6266bd3c19da3db8618c3daef15dbc755435bd628b353d2094993d6d68603c9ff3b53e21886abcce321ebda8264a
+PASS C src5=n_kv identical to stock graph state
+PASS C bound consumed src5=1
+PASS C bound consumed src5=255
+PASS C bound consumed src5=256
+PASS C bound consumed src5=257
+PASS C bound consumed src5=511
+PASS C src5=0 all-zero output (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-1 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=-2147483648 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=513 aborts (n_q=8)
+PASS C out-of-domain fork (n_q=8)
+PASS C src5=2147483647 aborts (n_q=8)
+PASS C src5=0 all-zero output (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-1 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-2 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=-2147483648 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=513 aborts (n_q=1)
+PASS C out-of-domain fork (n_q=1)
+PASS C src5=2147483647 aborts (n_q=1)
+PASS split-KV full-width result aligned with scalar reference (n_q=1, src5=512)
+PASS host_cpu_fa_off failures=0

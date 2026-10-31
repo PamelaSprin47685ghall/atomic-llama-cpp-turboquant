@@ -1,0 +1,685 @@
+--- a/overlay/mtp-async-protocol-candidate-20261027/dw-hip-join.h
++++ b/overlay/mtp-async-protocol-candidate-20261027/dw-hip-join.h
+@@ -30,8 +30,9 @@
+ //     per-provider anchors (shared_epoch=0) even the same-PCI cross-
+ //     provider numbers would compare unrelated clocks: refused.
+ //   - scope=device_stream on every emitted line, with the clock boundary
+-//     machine-readable (pair_scope=same_pci_shared_epoch, or
+-//     pair_scope=not_computable in shared-attribution mode).
++//     machine-readable (pair_scope=same_pci_shared_epoch for proven
++//     window pairs, cross_provider_unattributed for provider-scoped
++//     diagnostics, or not_computable when no pair of either kind exists).
+ //
+ // Failure policy (fail-closed, never swallowed):
+ //   - Any TP5_DW_HIP_* line that does not parse exactly is a hard error
+@@ -51,12 +52,48 @@
+ //   - PCI/rank consistency: one (provider, rank) maps to exactly one PCI
+ //     string across all its lines; one PCI string maps to one rank inside
+ //     a provider. Violations are hard errors.
+-//   - Window attribution: pointer mode (every span provider matches some
+-//     TP5_DW_HIP_OVERLAP_MAP native pointer) or shared mode (every span
+-//     PCI appears in exactly one window's PCI set). Mixed evidence is an
+-//     error. Shared mode cannot measure cross-window overlap at all
+-//     (attribution is shared, not exclusive) and says so instead of
+-//     guessing.
++//   - Provider mapping (TP5_DW_HIP_OVERLAP_MAP provider=) is the ONLY
++//     proven provider->window link, and it is all-or-nothing:
++//       * missing: MAP lines either ALL carry provider= or NONE do; a mix
++//         is refused, and when provider= is present on every MAP line but
++//         a span provider has no matching provider=, the mapping is
++//         incomplete and refused (never downgraded to shared);
++//       * duplicate: a second provider= key on one MAP line is a parse
++//         error; two windows claiming the same provider= pointer are
++//         refused (canonical pointer text, so 0xABC and 0xabc collide);
++//       * conflict: a provider matching one window's provider= AND a
++//         DIFFERENT window's native= is ambiguous and refused;
++//     Old logs without provider= remain shared attribution: usable
++//     diagnostics, but NO window claim, NO _JOINED_PAIR row and NO
++//     pair_scope=same_pci_shared_epoch — the old unattributed logs cannot
++//     pass a window-overlap gate. Provider-span interval intersection is
++//     device-event in-flight overlap; it is NEVER kernel parallelism.
++//   - Window attribution is PROVEN from the log, never inferred:
++//     pointer mode (no MAP carries provider=; every span provider matches
++//     some MAP native pointer) or provider mode (every MAP line carries
++//     provider= naming its window's relay provider, and every span
++//     provider matches one). Mixed evidence is an error. Otherwise:
++//     shared mode — used only for old MAP forms that carry no provider=
++//     at all, so the log ties no provider to any window and nothing is
++//     attributed to a window (window rows carry no busy numbers). A PCI
++//     legitimately appears in several windows' mapped PCI sets when those
++//     windows share the physical device (dual-window TP5 runs every window
++//     on every rank's GPU): that is topology, not evidence corruption,
++//     and never a refusal.
++//   - Shared mode still measures what the log proves — as DIAGNOSTICS on
++//     their own tag, deliberately kept apart from the window-pair
++//     contract: per-provider per-PCI rows, and the same-PCI overlap of
++//     two DISTINCT providers' span sets under the shared per-device
++//     epoch, emitted as _JOINED_PROVIDER_PAIR (provider pointers inline)
++//     with pair_scope=cross_provider_unattributed. The original
++//     _JOINED_PAIR tag and pair_scope=same_pci_shared_epoch are reserved
++//     for PROVEN window attribution (pointer/provider mode) — a
++//     window-overlap gate reading the original pair tag/scope can never
++//     be satisfied by unattributed evidence. A PCI with fewer than two
++//     distinct span-carrying providers yields NO provider pair
++//     (fail-closed). Overlap means device-event-time interval
++//     intersection of submit envelopes, never a kernel-level
++//     co-execution claim.
+ //
+ // Known non-goals (documented, not hidden):
+ //   - Same-stream serialization inside one provider is a stream-order
+@@ -77,6 +114,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <map>
++#include <set>
+ #include <stdexcept>
+ #include <string>
+ #include <utility>
+@@ -103,6 +141,8 @@
+     unsigned window = 0;
+     std::string native;                 // %p text as emitted, e.g. 0x55...
+     bool native_null = false;           // (nil)
++    std::string provider;               // provider=%p (newer runtime): this window's relay provider
++    bool provider_present = false;      // provider= seen on this MAP line
+     std::vector<std::string> pci;       // pci_bdf%u=%s in emit order
+ };
+ 
+@@ -440,7 +480,11 @@
+     }
+     if (toks[0] == "TP5_DW_HIP_OVERLAP_MAP") {
+         // Format (runtime.cpp): TP5_DW_HIP_OVERLAP_MAP window=%u native=%p
+-        // [pci_bdf%u=%s]*  -- keys in fixed order, pci_bdf entries variable.
++        // [provider=%p] [pci_bdf%u=%s]*  -- keys in fixed order, pci_bdf
++        // entries variable. provider= (newer runtimes) names the window's
++        // relay provider and is the ONLY key that proves which window a
++        // span provider belongs to; MAP lines either all carry it or none
++        // does (checked in analyze(), never inferred).
+         if (toks.size() < 3) {
+             throw parse_error("TP5_DW_HIP_OVERLAP_MAP too short", line_no);
+         }
+@@ -462,6 +506,18 @@
+         unsigned long long seen_mask = 0;
+         for (size_t i = 3; i < toks.size(); ++i) {
+             const auto kv = detail::split_kv(toks[i], line_no);
++            if (kv.first == "provider") {
++                if (m.provider_present) {
++                    throw parse_error("duplicate key in TP5_DW_HIP_OVERLAP_MAP: provider", line_no);
++                }
++                bool null_provider = false;
++                m.provider = detail::canon_pointer(kv.second, "provider", line_no, null_provider);
++                if (null_provider) {
++                    throw parse_error("null provider pointer in TP5_DW_HIP_OVERLAP_MAP", line_no);
++                }
++                m.provider_present = true;
++                continue;
++            }
+             if (kv.first.rfind("pci_bdf", 0) != 0) {
+                 throw parse_error("unknown key in TP5_DW_HIP_OVERLAP_MAP: " + kv.first, line_no);
+             }
+@@ -600,6 +656,25 @@
+         }
+         last_seq[key] = s.seq;
+     }
++    // Sequence numbers are exactly 0..count-1 per (provider, rank): the
++    // producer numbers harvested spans densely. A missing or repeated
++    // sequence number means lost or duplicated evidence even when
++    // dropped=0, so it is refused, never tolerated.
++    {
++        std::map<std::pair<std::string, unsigned>, std::set<unsigned long long>> seqs;
++        for (const auto & s : spans) {
++            seqs[{s.provider, s.rank}].insert(s.seq);
++        }
++        for (const auto & sp : seqs) {
++            const auto & set = sp.second;
++            if (*set.begin() != 0 || *set.rbegin() != set.size() - 1) {
++                throw std::runtime_error("seq gap or non-zero base for provider " + sp.first.first +
++                                         " rank " + detail::u64(sp.first.second) + " (count " +
++                                         detail::u64(set.size()) + ", first " + detail::u64(*set.begin()) +
++                                         ", last " + detail::u64(*set.rbegin()) + ")");
++            }
++        }
++    }
+     // Header n must equal the number of span lines for that (provider, rank).
+     for (const auto & h : spans_hdrs) {
+         unsigned long long count = 0;
+@@ -646,11 +721,12 @@
+ // inside exactly one PCI's device timestamp set. There is no cross-device
+ // number anywhere: different GPUs have independent event clocks and their
+ // intervals are never combined. Cross-window overlap exists only per shared
+-// PCI (pointer-attribution mode, shared_epoch=1 enforced).
++// PCI (window-attributed modes — pointer or provider — with shared_epoch=1
++// enforced; in shared mode the same math is emitted as cross-provider pairs,
++// labeled by provider index, never claiming a window).
+ struct verdict {
+-    enum class mode { pointer, shared };
++    enum class mode { pointer, provider, shared };
+     mode attribution;
+-    bool pairs_computable = false;   // pointer attribution only
+     struct window_pci_row {
+         std::string pci;
+         unsigned long long spans = 0;
+@@ -670,6 +746,26 @@
+         unsigned long long spans_b = 0;
+         unsigned long long overlap_ns = 0;             // same-device intersection
+     };
++    struct provider_pair_row {
++        std::string provider_a;                        // canonical, distinct
++        std::string provider_b;
++        std::string pci;                               // shared physical device
++        unsigned long long spans_a = 0;
++        unsigned long long spans_b = 0;
++        unsigned long long overlap_ns = 0;             // same-device intersection
++    };
++    struct provider_pci_row {
++        std::string pci;
++        unsigned long long spans = 0;
++        unsigned long long busy_ns = 0;                // union over this provider's spans on pci
++        unsigned long long wall_ns = 0;                // [min begin, max end], same clock
++        double busy_frac = 0.0;
++    };
++    struct provider_row {
++        unsigned index = 0;                            // deterministic label: pointer-sorted ordinal
++        std::string provider;                          // canonical provider pointer text
++        std::vector<provider_pci_row> pci_busy;
++    };
+     struct pci_row {
+         std::string pci;
+         unsigned long long spans = 0;
+@@ -678,7 +774,9 @@
+         double busy_frac = 0.0;
+     };
+     std::vector<window_row> windows;
+-    std::vector<pair_pci_row> pairs;       // empty when !pairs_computable
++    std::vector<provider_row> providers;   // shared mode only
++    std::vector<pair_pci_row> pairs;       // window ids, pointer/provider mode only
++    std::vector<provider_pair_row> provider_pairs;  // shared mode only, provider-scoped
+     std::vector<pci_row> pcis;
+ };
+ 
+@@ -719,7 +817,8 @@
+     }
+     // Window attribution.
+     std::map<std::string, const map_rec *> by_native;
+-    std::map<std::string, unsigned> pci_window_count;
++    std::map<std::string, const map_rec *> by_provider;
++    bool any_provider_key = false, all_provider_keys = true;
+     for (const auto & w : m.map) {
+         if (!w.native_null) {
+             const bool fresh = by_native.emplace(w.native, &w).second;
+@@ -727,37 +826,62 @@
+                 throw std::runtime_error("two windows claim the same native pointer");
+             }
+         }
+-        for (const auto & p : w.pci) {
+-            ++pci_window_count[p];
+-        }
+-    }
++        if (w.provider_present) {
++            any_provider_key = true;
++            const bool fresh = by_provider.emplace(w.provider, &w).second;
++            if (!fresh) {
++                throw std::runtime_error("duplicate provider mapping: two windows claim the same provider pointer");
++            }
++        } else {
++            all_provider_keys = false;
++        }
++    }
++    if (any_provider_key && !all_provider_keys) {
++        throw std::runtime_error("mixed TP5_DW_HIP_OVERLAP_MAP forms: some lines carry provider=, others do not");
++    }
++    // A span provider is attributed to a window only when the log proves
++    // the link: provider= (the MAP names its window's relay provider) or,
++    // on older MAP forms, the native pointer itself. A provider matching
++    // both keys of DIFFERENT windows is ambiguous and refused. When the
++    // MAP carries provider=, every span provider MUST map to one of those
++    // entries: an unmapped provider is a broken identity chain (missing
++    // mapping) and refuses — it is never silently downgraded to shared.
++    // Only old MAP forms without any provider= fall back to shared
++    // diagnostics when no native pointer matches; nothing is ever guessed
++    // from ordering, priority, slot or creation order.
+     bool all_matched = !m.spans.empty();
+     bool none_matched = true;
++    std::string first_unmapped;
+     for (const auto & s : m.spans) {
+-        const bool matched = by_native.count(s.provider) != 0;
++        const auto pit = by_provider.find(s.provider);
++        const auto nit = by_native.find(s.provider);
++        const map_rec * w = nullptr;
++        if (pit != by_provider.end()) {
++            w = pit->second;
++            if (nit != by_native.end() && nit->second != pit->second) {
++                throw std::runtime_error("ambiguous window attribution: provider " + s.provider +
++                                         " matches one window's provider= and another window's native=");
++            }
++        } else if (!any_provider_key && nit != by_native.end()) {
++            w = nit->second;
++        }
++        const bool matched = w != nullptr;
++        if (!matched && first_unmapped.empty()) {
++            first_unmapped = s.provider;
++        }
+         all_matched = all_matched && matched;
+         none_matched = none_matched && !matched;
+     }
++    if (any_provider_key && !all_matched) {
++        throw std::runtime_error("incomplete provider mapping: span provider " + first_unmapped +
++                                 " has no TP5_DW_HIP_OVERLAP_MAP provider= entry");
++    }
+     if (!all_matched && !none_matched) {
+-        throw std::runtime_error("mixed window attribution: some span providers match a mapped native pointer, others do not");
++        throw std::runtime_error("mixed window attribution: some span providers match a mapped window key, others do not");
+     }
+     verdict v;
+-    v.attribution = all_matched ? verdict::mode::pointer : verdict::mode::shared;
+-    v.pairs_computable = v.attribution == verdict::mode::pointer;
+-    if (v.attribution == verdict::mode::shared) {
+-        // Shared mode: every span PCI must belong to exactly one window, so
+-        // at least the per-PCI numbers are exclusively attributable. Cross-
+-        // window overlap is NOT computable in this mode (no exclusive owner
+-        // for the provider that emitted the spans) and is omitted.
+-        for (const auto & s : m.spans) {
+-            const auto it = pci_window_count.find(s.pci);
+-            if (it == pci_window_count.end() || it->second != 1) {
+-                throw std::runtime_error("shared mode requires every span pci to map to exactly one window (pci " +
+-                                         s.pci + " maps to " +
+-                                         (it == pci_window_count.end() ? "no window" : "multiple windows") + ")");
+-            }
+-        }
+-    }
++    v.attribution = !all_matched ? verdict::mode::shared
++                  : (any_provider_key ? verdict::mode::provider : verdict::mode::pointer);
+     // Cross-provider comparability on a shared PCI: the providers' anchors
+     // must be the same per-device epoch. shared_epoch=0 or absent is a hard
+     // refusal — otherwise same-PCI cross-provider overlap would compare
+@@ -786,12 +910,17 @@
+             }
+         }
+     }
+-    // Spans per window (pointer mode) or per window via its pci set (shared).
++    // Spans per provider (always provable: the provider is on every span
++    // line) and per window (only under proven attribution).
+     std::map<unsigned, std::map<std::string, detail::intervals>> wpci;
++    std::map<std::string, std::map<std::string, detail::intervals>> ppci;
+     for (const auto & s : m.spans) {
+-        if (v.attribution == verdict::mode::pointer) {
+-            const auto it = by_native.find(s.provider);
+-            if (it == by_native.end()) {
++        ppci[s.provider][s.pci].push_back({s.begin_ns, s.end_ns});
++        if (v.attribution != verdict::mode::shared) {
++            const std::map<std::string, const map_rec *> & key_map =
++                v.attribution == verdict::mode::provider ? by_provider : by_native;
++            const auto it = key_map.find(s.provider);
++            if (it == key_map.end()) {
+                 throw std::runtime_error("unreachable: span provider lost between mode decision and attribution");
+             }
+             const map_rec & w = *it->second;
+@@ -804,14 +933,6 @@
+                                          "'s mapped pci set");
+             }
+             wpci[w.window][s.pci].push_back({s.begin_ns, s.end_ns});
+-        } else {
+-            for (const auto & w : m.map) {
+-                for (const auto & p : w.pci) {
+-                    if (p == s.pci) {
+-                        wpci[w.window][s.pci].push_back({s.begin_ns, s.end_ns});
+-                    }
+-                }
+-            }
+         }
+     }
+     // Per-PCI rows: every number inside one device clock.
+@@ -841,8 +962,10 @@
+     for (const auto & row : v.pcis) {
+         pci_lookup.emplace(row.pci, &row);
+     }
+-    // Per-window rows: pointer mode only (exclusive attribution).
+-    if (v.attribution == verdict::mode::pointer) {
++    // Per-window rows: only under proven attribution (pointer or provider
++    // mode). Shared mode attributes nothing to a window, so its window
++    // rows carry the mapped PCI set alone — never a busy number.
++    if (v.attribution != verdict::mode::shared) {
+         for (const auto & w : m.map) {
+             verdict::window_row row;
+             row.window = w.window;
+@@ -874,8 +997,76 @@
+             v.windows.push_back(std::move(row));
+         }
+     }
+-    // Pairwise same-PCI cross-window overlap (pointer mode only).
+-    if (v.pairs_computable) {
++    // Shared mode: per-provider rows under a deterministic pointer-sorted
++    // ordinal. The ordinal is a labeling index into the emitted PROVIDER
++    // table; it is never a window claim and implies nothing about
++    // ordering, priority or creation order.
++    if (v.attribution == verdict::mode::shared) {
++        unsigned idx = 0;
++        for (const auto & pp : ppci) {
++            verdict::provider_row row;
++            row.index = idx++;
++            row.provider = pp.first;
++            for (const auto & cp : pp.second) {
++                verdict::provider_pci_row pr;
++                pr.pci = cp.first;
++                const auto & ivs = cp.second;
++                pr.spans = ivs.size();
++                unsigned long long wall_b = ivs.front().first;
++                unsigned long long wall_e = ivs.front().second;
++                for (const auto & iv : ivs) {
++                    wall_b = iv.first < wall_b ? iv.first : wall_b;
++                    wall_e = iv.second > wall_e ? iv.second : wall_e;
++                }
++                pr.wall_ns = wall_e - wall_b;
++                if (pr.wall_ns == 0) {
++                    throw std::runtime_error("degenerate evidence: provider " + pp.first + " pci " +
++                                             cp.first + " has wall_ns == 0");
++                }
++                pr.busy_ns = detail::union_measure(detail::merge_intervals(ivs));
++                pr.busy_frac = static_cast<double>(pr.busy_ns) / static_cast<double>(pr.wall_ns);
++                row.pci_busy.push_back(std::move(pr));
++            }
++            v.providers.push_back(std::move(row));
++        }
++    }
++    // Same-PCI overlap of two attributed span sets — the original
++    // definition, unchanged: merge each side's spans on ONE pci (one
++    // device clock, shared per-device epoch enforced above) and measure
++    // the intersection. Window-attributed modes pair windows over their
++    // mapped PCI sets: those are the ONLY rows on the original
++    // _JOINED_PAIR tag and the ONLY thing pair_scope=same_pci_shared_epoch
++    // ever describes. Shared mode emits its cross-provider pairs on a
++    // SEPARATE tag (_JOINED_PROVIDER_PAIR) with the provider pointers
++    // inline: the same single-clock math, but provider-scoped — it never
++    // claims a window and never satisfies a window-overlap gate.
++    if (v.attribution == verdict::mode::shared) {
++        std::map<std::string, std::vector<std::pair<const std::string *, const detail::intervals *>>> providers_by_pci;
++        for (const auto & pp : ppci) {
++            for (const auto & cp : pp.second) {
++                providers_by_pci[cp.first].push_back({&pp.first, &cp.second});
++            }
++        }
++        for (const auto & bp : providers_by_pci) {
++            const auto & lst = bp.second;  // ascending provider ordinal
++            for (size_t i = 0; i < lst.size(); ++i) {
++                for (size_t j = i + 1; j < lst.size(); ++j) {
++                    // ppci keys are distinct providers, so i != j are
++                    // distinct providers by construction; a provider is
++                    // never paired with itself.
++                    verdict::provider_pair_row pr;
++                    pr.provider_a = *lst[i].first;
++                    pr.provider_b = *lst[j].first;
++                    pr.pci = bp.first;
++                    pr.spans_a = lst[i].second->size();
++                    pr.spans_b = lst[j].second->size();
++                    pr.overlap_ns = detail::intersect_measure(detail::merge_intervals(*lst[i].second),
++                                                              detail::merge_intervals(*lst[j].second));
++                    v.provider_pairs.push_back(std::move(pr));
++                }
++            }
++        }
++    } else {
+         for (size_t i = 0; i < m.map.size(); ++i) {
+             for (size_t j = i + 1; j < m.map.size(); ++j) {
+                 const map_rec & wa = m.map[i];
+@@ -912,11 +1103,22 @@
+ 
+ // Prints the verdict in the machine-readable TP5_DW_HIP_OVERLAP_JOINED*
+ // format. Returns the number of lines printed. Every numeric field is a
+-// single-device-clock quantity; pair lines exist only when pairs_computable.
++// single-device-clock quantity. PAIR lines exist only when at least one
++// same-PCI pair was measured; with none, pair_scope=not_computable and
++// no pair of any kind is claimed.
+ inline unsigned long long print_verdict(const verdict & v, std::FILE * out) {
+     unsigned long long n = 0;
+-    const char * mode = v.attribution == verdict::mode::pointer ? "pointer" : "shared";
+-    const char * pair_scope = v.pairs_computable ? "same_pci_shared_epoch" : "not_computable";
++    const char * mode = v.attribution == verdict::mode::pointer ? "pointer"
++                      : v.attribution == verdict::mode::provider ? "provider" : "shared";
++    // pair_scope labels the family of the emitted rows: _JOINED_PAIR rows
++    // (window-attributed, pointer/provider mode only) are
++    // same_pci_shared_epoch; _JOINED_PROVIDER_PAIR rows (shared mode) are
++    // cross_provider_unattributed — provider-scoped diagnostics that
++    // never claim a window and never satisfy a window-overlap gate; with
++    // no rows of either kind nothing is claimed (not_computable).
++    const char * pair_scope = !v.pairs.empty() ? "same_pci_shared_epoch"
++                            : !v.provider_pairs.empty() ? "cross_provider_unattributed"
++                            : "not_computable";
+     std::fprintf(out, "TP5_DW_HIP_OVERLAP_JOINED mode=%s windows=%zu pcis=%zu pair_scope=%s scope=device_stream clock=hip_event device_only=1\n",
+                  mode, v.windows.size(), v.pcis.size(), pair_scope);
+     ++n;
+@@ -930,11 +1132,31 @@
+             ++n;
+         }
+     }
++    for (const auto & pr : v.providers) {
++        std::fprintf(out, "TP5_DW_HIP_OVERLAP_JOINED_PROVIDER index=%u provider=0x%s pcis=%zu\n",
++                     pr.index, pr.provider.c_str(), pr.pci_busy.size());
++        ++n;
++        for (const auto & cr : pr.pci_busy) {
++            std::fprintf(out, "TP5_DW_HIP_OVERLAP_JOINED_PROVIDER_PCI provider_index=%u pci=%s spans=%llu busy_ns=%llu wall_ns=%llu busy_frac=%.6f\n",
++                         pr.index, cr.pci.c_str(), cr.spans, cr.busy_ns, cr.wall_ns, cr.busy_frac);
++            ++n;
++        }
++    }
+     for (const auto & p : v.pairs) {
+         std::fprintf(out, "TP5_DW_HIP_OVERLAP_JOINED_PAIR a=%u b=%u pci=%s spans_a=%llu spans_b=%llu overlap_ns=%llu\n",
+                      p.a, p.b, p.pci.c_str(), p.spans_a, p.spans_b, p.overlap_ns);
+         ++n;
+     }
++    // Provider-scoped diagnostics (shared mode ONLY): deliberately NOT on
++    // the _JOINED_PAIR tag and NOT under pair_scope=same_pci_shared_epoch,
++    // so a window-overlap gate cannot read them as window pairs. The two
++    // providers are identified by their canonical pointers, inline.
++    for (const auto & p : v.provider_pairs) {
++        std::fprintf(out, "TP5_DW_HIP_OVERLAP_JOINED_PROVIDER_PAIR provider_a=0x%s provider_b=0x%s pci=%s spans_a=%llu spans_b=%llu overlap_ns=%llu\n",
++                     p.provider_a.c_str(), p.provider_b.c_str(), p.pci.c_str(),
++                     p.spans_a, p.spans_b, p.overlap_ns);
++        ++n;
++    }
+     for (const auto & c : v.pcis) {
+         std::fprintf(out, "TP5_DW_HIP_OVERLAP_JOINED_PCI pci=%s spans=%llu busy_ns=%llu wall_ns=%llu busy_frac=%.6f\n",
+                      c.pci.c_str(), c.spans, c.busy_ns, c.wall_ns, c.busy_frac);
+--- a/overlay/mtp-async-protocol-candidate-20261027/dw-hip-join-tests.sh
++++ b/overlay/mtp-async-protocol-candidate-20261027/dw-hip-join-tests.sh
+@@ -85,6 +85,100 @@
+ t shared-mode 0 "$T/f4.log"
+ grep -q "pair_scope=not_computable" <("$J" "$T/f4.log") && { pass=$((pass+1)); echo "PASS shared-not-computable"; } || { fail=$((fail+1)); echo "FAIL shared-not-computable"; }
+ 
++# E: multi-window-same-pci, shared mode — the REAL dual-window TP5 topology:
++# both windows legitimately map the SAME physical devices (TP5 runs every
++# window on every rank's GPU) and the providers (relay contexts) match no
++# MAP key. Hand-verified values:
++#   provider 0x111 pci03 spans [100,200],[300,400]  -> busy 200, wall 300
++#   provider 0x222 pci03 spans [150,250],[350,450]  -> busy 200, wall 300
++#   0x111 x 0x222 on 03: [150,200]+[350,400]        -> overlap 100
++#   pci04: 0x111 [500,600] vs 0x222 [700,800]       -> overlap 0
++#   pci03 union busy 300, wall 350; pci04 busy 200, wall 300
++# Window attribution is UNPROVABLE (no provider= in MAP): no WINDOW_PCI
++# rows anywhere, and pairs are labeled by provider index into the PROVIDER
++# table — never by window.
++cat > "$T/f5.log" <<'LOG'
++TP5_DW_HIP_SPANS enabled=1 flag=GGML_TP5_DW_HIP_SPANS join_map=1 scope=device_stream device_only=1
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 pci_bdf0=0000:03:00.0 pci_bdf1=0000:04:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 pci_bdf0=0000:03:00.0 pci_bdf1=0000:04:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:03:00.0 n=2 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=1 begin_ns=300 end_ns=400
++TP5_DW_HIP_SPANS provider=0x111 rank=1 pci=0000:04:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=1 pci=0000:04:00.0 seq=0 begin_ns=500 end_ns=600
++TP5_DW_HIP_SPANS provider=0x222 rank=0 pci=0000:03:00.0 n=2 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x222 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++TP5_DW_HIP_SPAN provider=0x222 rank=0 pci=0000:03:00.0 seq=1 begin_ns=350 end_ns=450
++TP5_DW_HIP_SPANS provider=0x222 rank=1 pci=0000:04:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x222 rank=1 pci=0000:04:00.0 seq=0 begin_ns=700 end_ns=800
++TP5_DW_HIP_OVERLAP provider=0x111 device=0 rank=0 pci=0000:03:00.0 active=1 spans=2 total_ns=300 max_ns=100 skipped_pending=0 skipped_mode=0 errors=0 coverage=enqueue_to_completion_stream_span clock=hip_event device_only=1
++TP5_DW_HIP_OVERLAP provider=0x111 device=1 rank=1 pci=0000:04:00.0 active=1 spans=1 total_ns=100 max_ns=100 skipped_pending=0 skipped_mode=0 errors=0 coverage=enqueue_to_completion_stream_span clock=hip_event device_only=1
++TP5_DW_HIP_OVERLAP provider=0x222 device=0 rank=0 pci=0000:03:00.0 active=1 spans=2 total_ns=200 max_ns=100 skipped_pending=0 skipped_mode=0 errors=0 coverage=enqueue_to_completion_stream_span clock=hip_event device_only=1
++TP5_DW_HIP_OVERLAP provider=0x222 device=1 rank=1 pci=0000:04:00.0 active=1 spans=1 total_ns=100 max_ns=100 skipped_pending=0 skipped_mode=0 errors=0 coverage=enqueue_to_completion_stream_span clock=hip_event device_only=1
++LOG
++t mwsp-shared 0 "$T/f5.log"
++out=$("$J" "$T/f5.log")
++grep -q "mode=shared windows=2 pcis=2 pair_scope=cross_provider_unattributed" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-shared-mode-scope"; } || { fail=$((fail+1)); echo "FAIL mwsp-shared-mode-scope :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_PROVIDER index=0 provider=0x111 pcis=2" <<<"$out" && grep -q "TP5_DW_HIP_OVERLAP_JOINED_PROVIDER index=1 provider=0x222 pcis=2" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-provider-table"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-table :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_PROVIDER_PCI provider_index=0 pci=0000:03:00.0 spans=2 busy_ns=200 wall_ns=300 busy_frac=0.666667" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-provider-pci-values"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-pci-values :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_PROVIDER_PAIR provider_a=0x111 provider_b=0x222 pci=0000:03:00.0 spans_a=2 spans_b=2 overlap_ns=100" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-shared-pair-value"; } || { fail=$((fail+1)); echo "FAIL mwsp-shared-pair-value :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_PROVIDER_PAIR provider_a=0x111 provider_b=0x222 pci=0000:04:00.0 spans_a=1 spans_b=1 overlap_ns=0" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-shared-pair-zero-overlap"; } || { fail=$((fail+1)); echo "FAIL mwsp-shared-pair-zero-overlap :: $out"; }
++[ -z "$(grep -E "TP5_DW_HIP_OVERLAP_JOINED_PAIR .*overlap_ns=" <<<"$out")" ] && { pass=$((pass+1)); echo "PASS mwsp-shared-no-original-pair-tag"; } || { fail=$((fail+1)); echo "FAIL mwsp-shared-no-original-pair-tag :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_PCI pci=0000:03:00.0 spans=4 busy_ns=300 wall_ns=350 busy_frac=0.857143" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-shared-pci-union"; } || { fail=$((fail+1)); echo "FAIL mwsp-shared-pci-union :: $out"; }
++[ -z "$(grep "_JOINED_WINDOW_PCI" <<<"$out")" ] && { pass=$((pass+1)); echo "PASS mwsp-shared-no-window-attribution"; } || { fail=$((fail+1)); echo "FAIL mwsp-shared-no-window-attribution :: $out"; }
++
++# F: multi-window-same-pci with PROVEN attribution — the same topology as
++# E, but every MAP line carries provider= naming its window's relay
++# provider. Values hand-verified as in E; a/b on PAIR rows are WINDOW ids
++# again and per-window busy rows are emitted.
++sed 's/native=0x5555 pci_bdf0/native=0x5555 provider=0x111 pci_bdf0/; s/native=0x6666 pci_bdf0/native=0x6666 provider=0x222 pci_bdf0/' "$T/f5.log" > "$T/f6.log"
++t mwsp-provider-mode 0 "$T/f6.log"
++out=$("$J" "$T/f6.log")
++grep -q "mode=provider windows=2 pcis=2 pair_scope=same_pci_shared_epoch" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-provider-mode-scope"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-mode-scope :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_PAIR a=0 b=1 pci=0000:03:00.0 spans_a=2 spans_b=2 overlap_ns=100" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-provider-window-pair"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-window-pair :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_WINDOW_PCI window=0 pci=0000:03:00.0 spans=2 busy_ns=200 wall_ns=350 busy_frac=0.571429" <<<"$out" && grep -q "TP5_DW_HIP_OVERLAP_JOINED_WINDOW_PCI window=1 pci=0000:03:00.0 spans=2 busy_ns=200 wall_ns=350 busy_frac=0.571429" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-provider-window-busy"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-window-busy :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_WINDOW_PCI window=0 pci=0000:04:00.0 spans=1 busy_ns=100 wall_ns=300 busy_frac=0.333333" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-provider-window-pci04"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-window-pci04 :: $out"; }
++[ -z "$(grep "_JOINED_PROVIDER" <<<"$out")" ] && { pass=$((pass+1)); echo "PASS mwsp-provider-no-provider-table"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-no-provider-table :: $out"; }
++
++# GATE guard: the ORIGINAL result.py GATE3 patterns — pair rows via
++# 'TP5_DW_HIP_OVERLAP_JOINED_PAIR .*overlap_ns=' and first pair_scope ==
++# same_pci_shared_epoch — must find NOTHING on the unattributed shared
++# output (the gate cannot pass without proven provider->window), and the
++# SAME checks must pass on the proven provider-mode output (so this
++# negative is not vacuous).
++sh=$($J "$T/f5.log"); pf=$($J "$T/f6.log")
++sp=$(grep -oE "pair_scope=(\S+)" <<<"$sh" | head -1)
++np=$(grep -cE "TP5_DW_HIP_OVERLAP_JOINED_PAIR " <<<"$sh")
++if [ "$np" -eq 0 ] && [ "$sp" != "pair_scope=same_pci_shared_epoch" ]; then
++  pass=$((pass+1)); echo "PASS mwsp-gate-cannot-pass-shared (scope=$sp, pairs=$np)"
++else
++  fail=$((fail+1)); echo "FAIL mwsp-gate-cannot-pass-shared :: scope=$sp"
++fi
++pp=$(grep -oE "pair_scope=(\S+)" <<<"$pf" | head -1)
++if [ "$(grep -cE "TP5_DW_HIP_OVERLAP_JOINED_PAIR .*overlap_ns=[0-9]+" <<<"$pf")" -ge 1 ] \
++   && [ "$pp" = "pair_scope=same_pci_shared_epoch" ]; then
++  pass=$((pass+1)); echo "PASS mwsp-gate-positive-control (scope=$pp)"
++else
++  fail=$((fail+1)); echo "FAIL mwsp-gate-positive-control :: scope=$pp"
++fi
++
++# G: same-PCI shared topology with a SINGLE span-carrying provider (the
++# failover shape): no second distinct attributable provider exists, so NO
++# pair may be claimed for the pci (fail-closed, no inference).
++cat > "$T/f7.log" <<'LOG'
++TP5_DW_HIP_SPANS enabled=1 flag=GGML_TP5_DW_HIP_SPANS join_map=1 scope=device_stream device_only=1
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:03:00.0 n=2 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=1 begin_ns=300 end_ns=400
++TP5_DW_HIP_OVERLAP provider=0x111 device=0 rank=0 pci=0000:03:00.0 active=1 spans=2 total_ns=200 max_ns=100 skipped_pending=0 skipped_mode=0 errors=0 coverage=enqueue_to_completion_stream_span clock=hip_event device_only=1
++LOG
++t mwsp-single-provider 0 "$T/f7.log"
++out=$("$J" "$T/f7.log")
++grep -q "mode=shared windows=2 pcis=1 pair_scope=not_computable" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-single-provider-scope"; } || { fail=$((fail+1)); echo "FAIL mwsp-single-provider-scope :: $out"; }
++[ -z "$(grep "_JOINED_PAIR" <<<"$out")" ] && { pass=$((pass+1)); echo "PASS mwsp-single-provider-no-pair"; } || { fail=$((fail+1)); echo "FAIL mwsp-single-provider-no-pair :: $out"; }
++
+ # negatives (fail-closed)
+ t neg-dropped 1 <(sed 's/dropped=0/dropped=2/' "$T/f1.log")
+ # header errors=3 must be REFUSED with the verdict refusal (not a parse
+@@ -108,4 +202,101 @@
+ t neg-banner-bad-enabled 1 <(sed 's/enabled=1/enabled=2/' "$T/f1.log")
+ t neg-banner-bad-flag 1 <(sed 's/flag=GGML_TP5_DW_HIP_SPANS/flag=GGML_TP5_DW_OVERLAP_METER/' "$T/f1.log")
+ t neg-banner-no-keys 1 <(sed '0,/TP5_DW_HIP_SPANS enabled=1.*/s//TP5_DW_HIP_SPANS/' "$T/f1.log")
++# mwsp fail-closed: mixed MAP forms (provider= on one line only).
++want_msg mwsp-mixed-map-refused "mixed TP5_DW_HIP_OVERLAP_MAP forms" <(sed '0,/native=0x5555 pci_bdf0/s//native=0x5555 provider=0x111 pci_bdf0/' "$T/f5.log")
++# mwsp fail-closed: a provider matching one window's provider= AND another
++# window's native= is ambiguous attribution.
++cat > "$T/f8.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x111 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x222 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x222 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++TP5_DW_HIP_OVERLAP provider=0x111 device=0 rank=0 pci=0000:03:00.0 active=1 spans=1 total_ns=100 max_ns=100 skipped_pending=0 skipped_mode=0 errors=0 coverage=enqueue_to_completion_stream_span clock=hip_event device_only=1
++TP5_DW_HIP_OVERLAP provider=0x222 device=0 rank=0 pci=0000:03:00.0 active=1 spans=1 total_ns=100 max_ns=100 skipped_pending=0 skipped_mode=0 errors=0 coverage=enqueue_to_completion_stream_span clock=hip_event device_only=1
++LOG
++want_msg mwsp-ambiguous-refused "ambiguous window attribution" "$T/f8.log"
++
++want_msg mwsp-seq-gap-refused "seq gap" <(sed 's/seq=1 begin_ns=350/seq=3 begin_ns=350/' "$T/f5.log")
++want_msg mwsp-shared-epoch0-refused "shared_epoch!=1" <(sed '/provider=0x222 rank=0 pci=0000:03:00.0 n=2/s/shared_epoch=1/shared_epoch=0/' "$T/f5.log")
++# H: provider mapping identity chain — missing / duplicate / conflict are
++# all fail-closed, and provider= is authoritative (native= is never used
++# as a fallback once the MAP carries provider=). Values hand-verified:
++#   w0 provider 0xabc span [100,200]; w1 provider 0x222 span [150,250]
++#   same pci 03 -> pair overlap 50; canonical 0xABC == 0xabc.
++cat > "$T/f9.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0xABC pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0xabc rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0xabc rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x222 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x222 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++LOG
++t mwsp-provider-canonical 0 "$T/f9.log"
++out=$("$J" "$T/f9.log")
++grep -q "mode=provider windows=2 pcis=1 pair_scope=same_pci_shared_epoch" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-provider-canonical-mode"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-canonical-mode :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_PAIR a=0 b=1 pci=0000:03:00.0 spans_a=1 spans_b=1 overlap_ns=50" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-provider-canonical-pair"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-canonical-pair :: $out"; }
++
++# H1 missing: a span provider with no provider= entry while the MAP form
++# carries provider= is an incomplete identity chain — refused, not shared.
++cat > "$T/f10.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x999 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x999 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++LOG
++want_msg mwsp-provider-missing-refused "incomplete provider mapping" "$T/f10.log"
++[ -z "$("$J" "$T/f10.log" 2>/dev/null)" ] && { pass=$((pass+1)); echo "PASS mwsp-provider-missing-no-stdout"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-missing-no-stdout"; }
++
++# H2 missing: provider= is authoritative — a span provider matching only a
++# MAP native= pointer does NOT silently re-enable pointer attribution.
++cat > "$T/f11.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x5555 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x5555 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x6666 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x6666 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++LOG
++want_msg mwsp-provider-native-fallback-refused "incomplete provider mapping" "$T/f11.log"
++
++# H3 duplicate: two windows claiming the same canonical provider pointer.
++cat > "$T/f12.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++LOG
++want_msg mwsp-duplicate-provider-refused "duplicate provider mapping" "$T/f12.log"
++# H3b duplicate: canonical pointer text collides across 0xABC / 0xabc —
++# the mapping is the same provider pointer, so two windows still refuse.
++cat > "$T/f14.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0xABC pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0xabc pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0xabc rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0xabc rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++LOG
++want_msg mwsp-duplicate-provider-canonical-refused "duplicate provider mapping" "$T/f14.log"
++
++# H4 duplicate: provider= twice on one MAP line is a parse error.
++want_msg mwsp-duplicate-provider-key-refused "duplicate key in TP5_DW_HIP_OVERLAP_MAP: provider" <(sed '0,/native=0x5555 provider=0xABC pci_bdf0/s//native=0x5555 provider=0xABC provider=0xABC pci_bdf0/' "$T/f9.log")
++
++# H5 missing value: a null provider pointer cannot prove a window link.
++want_msg mwsp-null-provider-refused "null provider pointer" <(sed 's/provider=0x222/provider=(nil)/' "$T/f9.log")
++
++# H6 conflict: provider->window and provider->pci disagree (the span's pci
++# is not in the attributed window's mapped set) — refused.
++cat > "$T/f13.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:04:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:04:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x222 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x222 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++LOG
++want_msg mwsp-provider-pci-conflict-refused "not in window 0's mapped pci set" "$T/f13.log"
++
+ echo "pass=$pass fail=$fail"; [ "$fail" = 0 ]

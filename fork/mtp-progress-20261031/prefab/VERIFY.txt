@@ -1,0 +1,169 @@
+# VERIFY — lead-prefab-fix-20261030（本工人实际执行记录）
+
+本文件记录调查/冻结的既有执行记录及本次禁令前由 verification 实际执行的三臂 decode；未修改现有工作树。历史五臂为基线记录，不是本次五臂复验。新禁令生效后不再执行任何编译、测试或语法检查。
+
+## 1. 基线与树身份
+
+```bash
+cd /home/kunweiz/src/atomic-llama-cpp-turboquant
+git rev-parse HEAD
+# f1c5fafc0449b22969ddabfcc9c361940d94d033
+git status --porcelain | wc -l
+# 1   （用户已有变更，本工人未触碰）
+```
+
+## 2. 最终 patch 落盘与身份
+
+```bash
+cd /home/kunweiz/work/lead-prefab-fix-20261030
+cp /home/kunweiz/work/prefab-share-live-r8-080352/patch.diff ./patch.diff
+sha256sum patch.diff
+# ddf7e97a9f26f52582f0991a8b78327e26d9e95b199dc98291ac2e418aef0aee  patch.diff
+wc -c patch.diff
+# 173262 patch.diff
+grep -c '^diff --git' patch.diff
+# 16
+```
+
+## 3. 隔离 apply-check（不触碰仓库 worktree/index）
+
+```bash
+cd /home/kunweiz/src/atomic-llama-cpp-turboquant
+TIDX=$(mktemp /tmp/prefab-idx.XXXXXX)
+export GIT_INDEX_FILE=$TIDX
+git read-tree f1c5fafc0449b22969ddabfcc9c361940d94d033
+git apply --cached --check /home/kunweiz/work/prefab-share-live-r8-080352/patch.diff
+# apply_check=0
+git apply --cached /home/kunweiz/work/prefab-share-live-r8-080352/patch.diff
+# apply=0
+git write-tree
+# 84f67dcf012fe3c8c84e2806df63b6fec91b0a38
+rm -f "$TIDX"
+```
+
+## 4. 基线 worktree 与 patch 逐文件一致
+
+```bash
+cd /home/kunweiz/work/prefab-share-live-r8-080352/wt
+TIDX=$(mktemp /tmp/prefab-wt-idx.XXXXXX)
+export GIT_INDEX_FILE=$TIDX
+git read-tree HEAD && git add -A
+git write-tree
+# 84f67dcf012fe3c8c84e2806df63b6fec91b0a38   （== §3 的 patch 应用树）
+rm -f "$TIDX"
+```
+
+`git status --short` 在冻结时为 16 项（12 修改 / 4 新增：`llama-prefab-env.h`、
+`llama-prefab-hotpath.h`、`llama-prefab-iface.h`、`llama-prefab-splice.h` 等；
+完整清单见 patch 的 `diff --git`）。注意：该 wt 的 git index 是旧冻结态，
+**worktree 内容才等于 patch**；本工人未执行 stage/commit，未改动它。
+
+## 5. patch 文件清单
+
+```bash
+grep '^diff --git' patch.diff | sed 's#diff --git a/##; s# b/.*##'
+```
+
+```
+src/CMakeLists.txt
+src/llama-context.cpp
+src/llama-context.h
+src/llama-graph.cpp
+src/llama-graph.h
+src/llama-kv-cache.cpp
+src/llama-kv-cache.h
+src/llama-prefab-env.h
+src/llama-prefab-hotpath.h
+src/llama-prefab-iface.h
+src/llama-prefab-mtp.cpp
+src/llama-prefab-splice.h
+src/llama-prefab.cpp
+src/llama-prefab.h
+src/models/models.h
+src/models/qwen4exp.cpp
+```
+
+## 6. 缺陷命中点与禁用项核对
+
+```bash
+cd /home/kunweiz/work/prefab-share-live-r8-080352/wt
+grep -rn "is_pos_2d" src/llama-context.cpp
+# 6004: const bool pos_ok   = !ubatch.is_pos_2d() || st.mtp_mode;      (decouple)
+# 6104: const bool pos_ok_m = !ubatch.is_pos_2d() || st.mtp_mode;      (whole-graph MTP)
+# 6244: bool ok = ... && !ubatch.is_pos_2d() && ...                     (factor lane, 保持 1-D)
+
+grep -n "first_layer_id" src/llama-kv-cache.h src/llama-kv-cache.cpp src/llama-prefab.cpp
+# src/llama-kv-cache.h:199:   int32_t first_layer_id() const;
+# src/llama-kv-cache.cpp:1881: int32_t llama_kv_cache::first_layer_id() const {
+# src/llama-prefab.cpp:750:   const int32_t il_kv = kv->first_layer_id();
+
+grep -rn "get_k_storage(0)\|get_v_storage(0)" src/*.cpp src/*.h
+# 无 prefab 命中（仅 dsv4 与已修复的 prefab_make_key）
+
+grep '^+' patch.diff | grep -c 'GGML_TP5_RSZ_RT'   # 0
+grep '^+' patch.diff | grep -c '\bHIP\b'           # 0
+grep '^+' patch.diff | grep -c '\bCUDA\b'          # 0
+grep '^+' patch.diff | grep -c '\bGPU\b'           # 0
+```
+
+085000 对照（其 patch 内两处缺陷仍在）：
+
+```bash
+grep -n "!ubatch.is_pos_2d()\|get_k_storage(0)\|first_layer_id" \
+  /home/kunweiz/work/prefab-share-live-r8-085000/patch.diff
+# 539:  bool ok   = ... && !ubatch.is_pos_2d() && ...
+# 636:  bool ok_m = ... && !ubatch.is_pos_2d() && ...
+# 2961: k.type_k = (int32_t) kv->get_k_storage(0)->type;
+# （无 first_layer_id）
+```
+
+## 7. 二进制/库时间戳与溯源限制
+
+```bash
+stat -c '%y %n' \
+  /home/kunweiz/work/prefab-share-live-r8-080352/build-live/bin/libllama.so.0.0.2 \
+  /home/kunweiz/work/prefab-share-live-r8-080352/harness/live_multi_request \
+  /home/kunweiz/work/prefab-share-live-r8-080352/wt/src/llama-context.cpp \
+  /home/kunweiz/work/prefab-share-live-r8-080352/wt/src/llama-prefab.cpp \
+  /home/kunweiz/work/prefab-share-live-r8-080352/wt/src/llama-kv-cache.cpp
+# libllama.so.0.0.2   2026-10-30 08:56:13
+# live_multi_request  2026-10-30 08:45:49   （动态链接，运行时加载上面的库）
+# llama-context.cpp   2026-10-30 08:51:58
+# llama-prefab.cpp    2026-10-30 08:55:09
+# llama-kv-cache.cpp  2026-10-30 08:55:09
+```
+
+这些时间戳及符号存在性仅为辅助线索，不能证明库确实编入全部修复，也不能证明二进制与冻结源码精确对应；没有记录源文件到对象的可复现构建溯源。
+
+驱动链接方式：
+
+```bash
+ldd /home/kunweiz/work/prefab-share-live-r8-080352/harness/live_multi_request | grep llama
+# libllama.so.0 => /home/kunweiz/work/prefab-share-live-r8-080352/build-live/bin/libllama.so.0
+```
+
+## 8. 基线记录的五臂结果（历史记录，非本次五臂实测）
+
+来自 `/home/kunweiz/work/prefab-share-live-r8-080352/VERIFY.txt`：
+
+| 负载 | decodes | 五臂 stream.bin | OFF builds | ON builds | ON hits | A 复用 | clone |
+|---|---|---|---|---|---|---|---|
+| 8×6..8, k=4 | 55 | 全同，`fc55bbbb…`，11,264 B | 10 | **5** | 50 | 3 | 0 |
+| 24×10..12, k=8 | 264 | 全同，`46c123b0…`，87,552 B | 30 | **13** | 251 | 11 | 0 |
+
+对照臂：on-clone clones=135（输出仍相同）；on-nostats 全计数 0（输出仍相同）。
+本次仅复跑 stock/OFF/ON，未复跑 on-clone、on-nostats 或大负载。
+
+## 9. 禁令前三臂实际执行
+
+精确命令及原始输出：`/home/kunweiz/work/lead-prefab-fix-20261030/cpu-080352/command.txt`。三个臂各自的 `events.log`、`stdout.log`、`stderr.log`、`stream.bin` 位于 `/home/kunweiz/work/lead-prefab-fix-20261030/cpu-080352/{stock,off,on}/`。
+
+三臂均退出 0，55 次 decode、88 行；三份 stream SHA-256 均为 `fc55bbbbf2b8a9aca93d438b286fbe754b04f80320343aef89f228e95bfdb4e9`。未执行 `cmp`。OFF 的 prefab/stock ubatch=0/55、stock builds/reuses=10/45、nodes=1320；ON 为 55/0、stock builds=0、envelope allocs/reuses=5/50、compose hits=5、A reuse=3、clones=0、nodes=714；两臂 runtime fallback 和 MTP declines 都为 0。stock 无计数器。请求 2、5 的序列后半删除均成功，pos_max 分别为 15、13。
+
+未来本机复现依赖：`/home/kunweiz/work/prefab-share-live-r8-080352/` 下的 `harness/live_multi_request.cpp`、`harness/{stock,live}_multi_request`、`build-{stock,live}/bin`、`qwen4exp-tiny-mtp.gguf` 和源码 `wt/`。此前实际三臂命令见上面的 `command.txt`；历史五臂脚本 `run-arms.sh` 和 `RUNBOOK.md` 在同一目录，脚本会覆盖历史 `arm-*`。仅未来禁令解除并获许可后方可运行；若届时需编译，须经 `/home/kunweiz/.local/bin/build-slot`，遇 75/124 停止、不重试。
+
+## 10. 未执行项
+
+- 本次未编译；新禁令生效后未运行编译、测试或语法检查。
+- 未对任何现有工作树执行 `git add`/`commit`/`reset`/`checkout`；树计算使用临时 index。
+- 未运行 GPU/HIP、未触 `GGML_TP5_RSZ_RT`、未修改 `selected`；真实模型未验证。

@@ -1,0 +1,190 @@
+--- a/overlay/mtp-async-protocol-candidate-20261027/dw-hip-join.h
++++ b/overlay/mtp-async-protocol-candidate-20261027/dw-hip-join.h
+@@ -30,8 +30,9 @@
+ //     per-provider anchors (shared_epoch=0) even the same-PCI cross-
+ //     provider numbers would compare unrelated clocks: refused.
+ //   - scope=device_stream on every emitted line, with the clock boundary
+-//     machine-readable (pair_scope=same_pci_shared_epoch, or
+-//     pair_scope=not_computable in shared-attribution mode).
++//     machine-readable (pair_scope=same_pci_shared_epoch for proven
++//     window pairs, cross_provider_unattributed for provider-scoped
++//     diagnostics, or not_computable when no pair of either kind exists).
+ //
+ // Failure policy (fail-closed, never swallowed):
+ //   - Any TP5_DW_HIP_* line that does not parse exactly is a hard error
+@@ -51,17 +52,34 @@
+ //   - PCI/rank consistency: one (provider, rank) maps to exactly one PCI
+ //     string across all its lines; one PCI string maps to one rank inside
+ //     a provider. Violations are hard errors.
++//   - Provider mapping (TP5_DW_HIP_OVERLAP_MAP provider=) is the ONLY
++//     proven provider->window link, and it is all-or-nothing:
++//       * missing: MAP lines either ALL carry provider= or NONE do; a mix
++//         is refused, and when provider= is present on every MAP line but
++//         a span provider has no matching provider=, the mapping is
++//         incomplete and refused (never downgraded to shared);
++//       * duplicate: a second provider= key on one MAP line is a parse
++//         error; two windows claiming the same provider= pointer are
++//         refused (canonical pointer text, so 0xABC and 0xabc collide);
++//       * conflict: a provider matching one window's provider= AND a
++//         DIFFERENT window's native= is ambiguous and refused;
++//     Old logs without provider= remain shared attribution: usable
++//     diagnostics, but NO window claim, NO _JOINED_PAIR row and NO
++//     pair_scope=same_pci_shared_epoch — the old unattributed logs cannot
++//     pass a window-overlap gate. Provider-span interval intersection is
++//     device-event in-flight overlap; it is NEVER kernel parallelism.
+ //   - Window attribution is PROVEN from the log, never inferred:
+-//     pointer mode (every span provider matches some TP5_DW_HIP_OVERLAP_MAP
+-//     native pointer) or provider mode (every MAP line carries provider=
+-//     naming its window's relay provider, and every span provider matches
+-//     one). Mixed evidence is an error. Otherwise: shared mode — the log
+-//     ties no provider to any window, so nothing is attributed to a
+-//     window (window rows carry no busy numbers). A PCI legitimately
+-//     appears in several windows' mapped PCI sets when those windows
+-//     share the physical device (dual-window TP5 runs every window on
+-//     every rank's GPU): that is topology, not evidence corruption, and
+-//     never a refusal.
++//     pointer mode (no MAP carries provider=; every span provider matches
++//     some MAP native pointer) or provider mode (every MAP line carries
++//     provider= naming its window's relay provider, and every span
++//     provider matches one). Mixed evidence is an error. Otherwise:
++//     shared mode — used only for old MAP forms that carry no provider=
++//     at all, so the log ties no provider to any window and nothing is
++//     attributed to a window (window rows carry no busy numbers). A PCI
++//     legitimately appears in several windows' mapped PCI sets when those
++//     windows share the physical device (dual-window TP5 runs every window
++//     on every rank's GPU): that is topology, not evidence corruption,
++//     and never a refusal.
+ //   - Shared mode still measures what the log proves — as DIAGNOSTICS on
+ //     their own tag, deliberately kept apart from the window-pair
+ //     contract: per-provider per-PCI rows, and the same-PCI overlap of
+@@ -812,7 +830,7 @@
+             any_provider_key = true;
+             const bool fresh = by_provider.emplace(w.provider, &w).second;
+             if (!fresh) {
+-                throw std::runtime_error("two windows claim the same provider pointer");
++                throw std::runtime_error("duplicate provider mapping: two windows claim the same provider pointer");
+             }
+         } else {
+             all_provider_keys = false;
+@@ -824,11 +842,16 @@
+     // A span provider is attributed to a window only when the log proves
+     // the link: provider= (the MAP names its window's relay provider) or,
+     // on older MAP forms, the native pointer itself. A provider matching
+-    // both keys of DIFFERENT windows is ambiguous and refused. With no
+-    // proven link for a provider, attribution is shared — never guessed
++    // both keys of DIFFERENT windows is ambiguous and refused. When the
++    // MAP carries provider=, every span provider MUST map to one of those
++    // entries: an unmapped provider is a broken identity chain (missing
++    // mapping) and refuses — it is never silently downgraded to shared.
++    // Only old MAP forms without any provider= fall back to shared
++    // diagnostics when no native pointer matches; nothing is ever guessed
+     // from ordering, priority, slot or creation order.
+     bool all_matched = !m.spans.empty();
+     bool none_matched = true;
++    std::string first_unmapped;
+     for (const auto & s : m.spans) {
+         const auto pit = by_provider.find(s.provider);
+         const auto nit = by_native.find(s.provider);
+@@ -843,9 +866,16 @@
+             w = nit->second;
+         }
+         const bool matched = w != nullptr;
++        if (!matched && first_unmapped.empty()) {
++            first_unmapped = s.provider;
++        }
+         all_matched = all_matched && matched;
+         none_matched = none_matched && !matched;
+     }
++    if (any_provider_key && !all_matched) {
++        throw std::runtime_error("incomplete provider mapping: span provider " + first_unmapped +
++                                 " has no TP5_DW_HIP_OVERLAP_MAP provider= entry");
++    }
+     if (!all_matched && !none_matched) {
+         throw std::runtime_error("mixed window attribution: some span providers match a mapped window key, others do not");
+     }
+--- a/overlay/mtp-async-protocol-candidate-20261027/dw-hip-join-tests.sh
++++ b/overlay/mtp-async-protocol-candidate-20261027/dw-hip-join-tests.sh
+@@ -220,4 +220,83 @@
+ 
+ want_msg mwsp-seq-gap-refused "seq gap" <(sed 's/seq=1 begin_ns=350/seq=3 begin_ns=350/' "$T/f5.log")
+ want_msg mwsp-shared-epoch0-refused "shared_epoch!=1" <(sed '/provider=0x222 rank=0 pci=0000:03:00.0 n=2/s/shared_epoch=1/shared_epoch=0/' "$T/f5.log")
++# H: provider mapping identity chain — missing / duplicate / conflict are
++# all fail-closed, and provider= is authoritative (native= is never used
++# as a fallback once the MAP carries provider=). Values hand-verified:
++#   w0 provider 0xabc span [100,200]; w1 provider 0x222 span [150,250]
++#   same pci 03 -> pair overlap 50; canonical 0xABC == 0xabc.
++cat > "$T/f9.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0xABC pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0xabc rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0xabc rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x222 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x222 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++LOG
++t mwsp-provider-canonical 0 "$T/f9.log"
++out=$("$J" "$T/f9.log")
++grep -q "mode=provider windows=2 pcis=1 pair_scope=same_pci_shared_epoch" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-provider-canonical-mode"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-canonical-mode :: $out"; }
++grep -q "TP5_DW_HIP_OVERLAP_JOINED_PAIR a=0 b=1 pci=0000:03:00.0 spans_a=1 spans_b=1 overlap_ns=50" <<<"$out" && { pass=$((pass+1)); echo "PASS mwsp-provider-canonical-pair"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-canonical-pair :: $out"; }
++
++# H1 missing: a span provider with no provider= entry while the MAP form
++# carries provider= is an incomplete identity chain — refused, not shared.
++cat > "$T/f10.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x999 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x999 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++LOG
++want_msg mwsp-provider-missing-refused "incomplete provider mapping" "$T/f10.log"
++[ -z "$("$J" "$T/f10.log" 2>/dev/null)" ] && { pass=$((pass+1)); echo "PASS mwsp-provider-missing-no-stdout"; } || { fail=$((fail+1)); echo "FAIL mwsp-provider-missing-no-stdout"; }
++
++# H2 missing: provider= is authoritative — a span provider matching only a
++# MAP native= pointer does NOT silently re-enable pointer attribution.
++cat > "$T/f11.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x5555 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x5555 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x6666 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x6666 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++LOG
++want_msg mwsp-provider-native-fallback-refused "incomplete provider mapping" "$T/f11.log"
++
++# H3 duplicate: two windows claiming the same canonical provider pointer.
++cat > "$T/f12.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++LOG
++want_msg mwsp-duplicate-provider-refused "duplicate provider mapping" "$T/f12.log"
++# H3b duplicate: canonical pointer text collides across 0xABC / 0xabc —
++# the mapping is the same provider pointer, so two windows still refuse.
++cat > "$T/f14.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0xABC pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0xabc pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0xabc rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0xabc rank=0 pci=0000:03:00.0 seq=0 begin_ns=100 end_ns=200
++LOG
++want_msg mwsp-duplicate-provider-canonical-refused "duplicate provider mapping" "$T/f14.log"
++
++# H4 duplicate: provider= twice on one MAP line is a parse error.
++want_msg mwsp-duplicate-provider-key-refused "duplicate key in TP5_DW_HIP_OVERLAP_MAP: provider" <(sed '0,/native=0x5555 provider=0xABC pci_bdf0/s//native=0x5555 provider=0xABC provider=0xABC pci_bdf0/' "$T/f9.log")
++
++# H5 missing value: a null provider pointer cannot prove a window link.
++want_msg mwsp-null-provider-refused "null provider pointer" <(sed 's/provider=0x222/provider=(nil)/' "$T/f9.log")
++
++# H6 conflict: provider->window and provider->pci disagree (the span's pci
++# is not in the attributed window's mapped set) — refused.
++cat > "$T/f13.log" <<'LOG'
++TP5_DW_HIP_OVERLAP_MAP window=0 native=0x5555 provider=0x111 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_OVERLAP_MAP window=1 native=0x6666 provider=0x222 pci_bdf0=0000:03:00.0
++TP5_DW_HIP_SPANS provider=0x111 rank=0 pci=0000:04:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x111 rank=0 pci=0000:04:00.0 seq=0 begin_ns=100 end_ns=200
++TP5_DW_HIP_SPANS provider=0x222 rank=0 pci=0000:03:00.0 n=1 dropped=0 errors=0 shared_epoch=1
++TP5_DW_HIP_SPAN provider=0x222 rank=0 pci=0000:03:00.0 seq=0 begin_ns=150 end_ns=250
++LOG
++want_msg mwsp-provider-pci-conflict-refused "not in window 0's mapped pci set" "$T/f13.log"
++
+ echo "pass=$pass fail=$fail"; [ "$fail" = 0 ]

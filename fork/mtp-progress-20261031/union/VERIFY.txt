@@ -1,0 +1,195 @@
+PARTIAL — 单对象编译 + 静态检查记录（2026-10-30）
+
+重要：用户新纪律禁止 12022 上任何编译或测试（含语法检查、CPU harness）。
+收到纪律后立即取消了运行中的完整构建；本文件不包含完整库/harness/运行级通过结论。
+唯一在纪律前完成的 C++ 编译是 10:24 的单对象 `llama-context.cpp.o`（exit 0），
+其源码随后有清理且未重编；最终源码本身从未编译。
+
+
+## 纪律时间线与 mock 说明
+
+- 10:24:34：单对象 `llama-context.cpp.o` 编译完成（纪律前，exit 0，源码后已清理）。
+- 10:26:48：分段构建生成 ggml 共享库（纪律前）。
+- 约 10:32:47：观察到“禁止任何编译和测试”纪律；立即取消 bg_26（cancelled，无退出码）。
+- 10:37:17：纪律后执行 `bash -n` 与 patch 生成/git 静态检查（仅 shell 语法与静态检查，
+  不是 C++ 编译或测试），mtime 见文件时间戳。
+- **本包没有任何 mock 运行记录**；harness（含受控注入）从未编译/运行。
+  若其他工作区有 mock 结果，不属于本包产物，不能作为本包证据。
+
+## 已实际执行的命令与结果
+
+1. 独立树创建
+   git clone /home/kunweiz/work/union-binder-true-width-r8/wt wt
+   git -C wt rev-parse HEAD -> b766f29549e46abb2ba65adfbae69ec035a85fe0
+   结果：exit 0；工作树初始干净。
+
+2. CPU 构建配置（第一次）
+   /home/kunweiz/.local/bin/build-slot cmake -S wt -B build -G 'Unix Makefiles' \
+     -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS_DEBUG='-O1 -g0' \
+     -DCMAKE_CXX_FLAGS_DEBUG='-O1 -g0' \
+     -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+     -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF \
+     -DLLAMA_CURL=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=OFF \
+     -DGGML_OPENMP=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF \
+     -DGGML_F16C=OFF -DBUILD_SHARED_LIBS=ON
+   结果：build-slot 获得锁；Configuring done / Generating done；exit 0。
+   该配置自动启用 -msse4.2;-mbmi2。
+
+3. 本机 CPU 能力检查（只读 /proc/cpuinfo）
+   AMD Athlon(tm) X4 760K；flags 有 sse4_2、avx、f16c、fma，**无 bmi2**。
+   为避免 SIGILL，重新配置关闭 BMI2：
+
+4. CPU 构建配置（第二次）
+   /home/kunweiz/.local/bin/build-slot cmake -S wt -B build -DGGML_BMI2=OFF -DGGML_SSE42=ON
+   结果：exit 0；CPU variant 仅 -msse4.2。
+
+5. 单对象编译（改动后的 llama-context.cpp）
+   /home/kunweiz/.local/bin/build-slot make -C build \
+     -f src/CMakeFiles/llama.dir/build.make -j 4 \
+     src/CMakeFiles/llama.dir/llama-context.cpp.o
+  结果：exit 0；产生 build/src/CMakeFiles/llama.dir/llama-context.cpp.o
+  （384784 bytes，mtime 10:24:34）。
+  编译输出 3 条 warning：record_src / record_fixed / record_bytes 未使用。
+  这些别名随后已从源码删除，但**未重新编译**；该 .o 相对最终源码已过期。
+  时间线：10:24 单对象编译（纪律前）；10:26 ggml 库由分段构建生成（纪律前）；
+  约 10:32:47 观察到新纪律并取消 bg_26；10:37:17 执行 `bash -n` 与补丁生成
+  （纪律后，仅 shell 语法/静态检查，不是 C++ 编译或测试）。
+
+6. 分段构建
+   ./build-segmented.sh
+   结果：用户在构建运行期间下达“禁止任何编译和测试”纪律；
+   已通过 write proc://bg_26/kill 取消该后台构建。job 状态为 cancelled，无退出码。
+   取消前静态检查到的残留：
+   - find build -name '*.o' | wc -l = 112
+   - build/bin/libggml-base.so*、libggml-cpu.so*、libggml.so* 已生成
+   - build/bin/libllama.so* 不存在（llama 未链接）
+   - ggml 对象时间 10:26；llama-context.o 时间 10:24
+   取消后未再执行任何编译/测试。
+
+7. 补丁静态检查
+   git -C wt diff --src-prefix=a/ --dst-prefix=b/ > patch.diff
+   sha256sum patch.diff -> 7fcf73674fd7efa6b058b7aad426cc97a72b27975276eda093a52f44b49d0980
+   git -C wt diff --check -> exit 0（无空白错误）
+   git -C wt apply --check --reverse /home/.../patch.diff -> exit 0
+   git -C wt diff --stat -> src/llama-context.cpp | 99 +++++-----（+63/−36）
+
+8. 构建脚本 shell 语法（纪律后，不是 C++ 编译/测试）
+   bash -n build-segmented.sh -> exit 0；mtime 10:37:17。
+   bash -n build-stock-segmented.sh -> exit 0；随后执行（见下）。
+   **本包没有运行过任何 mock**；harness 从未编译/运行。
+
+9. 工作树状态
+   git -C wt status --short -> " M src/llama-context.cpp"
+   git -C wt rev-parse HEAD -> b766f29...
+   stock worktree：git -C stock rev-parse HEAD -> f1c5faf...，干净。
+
+## 未执行（新纪律禁止）
+
+- 未编译链接 libllama，未编译/运行 harness，未运行 compare_logits.py，
+  未做任何 C/C++ 语法检查；只有纪律后的 `bash -n`（shell）与 git 静态检查。
+- 未创建真实 relay context，未使用 GPU/HIP，未观察任何 relay 计数或 logits。
+- 未验证 OFF 与 stock 的 bitwise、ON 的真实 binder hit、注入拒绝的运行时行为；
+  文档中的这些内容均为未来验收预期，不是已发生结果。
+- 没有运行过 mock；受控注入 harness 也未运行。
+
+## 本机未来可执行命令（须先在获得许可后运行）
+
+所有编译必须经 /home/kunweiz/.local/bin/build-slot；75/124 立即停止，不重试。
+
+### A. 重建 patched 树
+
+  cd /home/kunweiz/work/lead-union-relay-20261030
+  ./build-segmented.sh
+  # 该脚本只编译缺失或比源文件旧的对象；每批 3 个对象；
+  # 最后 cmake --build build --target llama -j4 完成链接。
+  # 产物：build/bin/libllama.so*、libggml*.so*
+
+### B. 构建干净 stock 对照（完整脚本）
+
+  已提供可执行脚本 `build-stock-segmented.sh`，内容等价于以下完整命令：
+
+  /home/kunweiz/.local/bin/build-slot cmake -S /home/kunweiz/work/lead-union-relay-20261030/stock \
+    -B /home/kunweiz/work/lead-union-relay-20261030/build-stock -G 'Unix Makefiles' \
+    -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS_DEBUG='-O1 -g0' \
+    -DCMAKE_CXX_FLAGS_DEBUG='-O1 -g0' \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF \
+    -DLLAMA_CURL=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=OFF \
+    -DGGML_OPENMP=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF \
+    -DGGML_F16C=OFF -DGGML_BMI2=OFF -DGGML_SSE42=ON -DBUILD_SHARED_LIBS=ON
+  ./build-segmented.sh "$PWD/stock" "$PWD/build-stock"
+
+  或直接：
+  ./build-stock-segmented.sh
+
+  说明：`build-segmented.sh` 接受 SRC/BUILD 两个参数；对 stock 使用同一
+  “每批 3 个对象 + 单独 build-slot + 75/124 停止”逻辑，并链接
+  `build-stock/bin/libllama.so*`。不要用 patched 的 `.o`/库冒充 stock，
+  也不要把两棵树的库混用。stock 构建尚未执行（纪律禁止）。
+
+### C. 编译 harness
+
+  /home/kunweiz/.local/bin/build-slot g++ -std=c++17 -O1 \
+    -I wt/include -I wt/ggml/include \
+    harness/resident_prod.cpp \
+    -L build/bin -Wl,-rpath,"$PWD/build/bin" -lllama -o resident_prod
+
+  /home/kunweiz/.local/bin/build-slot g++ -std=c++17 -O1 \
+    -I wt/src -I wt/include -I wt/ggml/include \
+    harness/relay_branch_test.cpp \
+    -L build/bin -Wl,-rpath,"$PWD/build/bin" -lllama -o relay_branch_test
+
+  # stock 版本必须用 stock 的头文件与库重新编译，不能复用 patched 二进制：
+  /home/kunweiz/.local/bin/build-slot g++ -std=c++17 -O1 \
+    -I stock/include -I stock/ggml/include \
+    harness/resident_prod.cpp \
+    -L build-stock/bin -Wl,-rpath,"$PWD/build-stock/bin" -lllama -o resident_prod_stock
+
+### D. 运行（真实 CPU 生产路径）
+
+  MODEL=$PWD/tiny-fake.gguf
+  # 干净 stock 基线
+  env -u GGML_TP5_UNION_BINDER -u GGML_TP5_NKV_TRUEWIDTH \
+    ./resident_prod_stock "$MODEL" stock.bin
+  # patched，门 OFF（应与 stock 逐 bit 一致）
+  env -u GGML_TP5_UNION_BINDER -u GGML_TP5_NKV_TRUEWIDTH \
+    ./resident_prod "$MODEL" off.bin
+  # patched，两门 ON（预期：真实 nkv 命中与宽度收缩/恢复；运行后按 applied 判定）
+  GGML_TP5_NKV_TRUEWIDTH=1 GGML_TP5_UNION_BINDER=1 \
+    ./resident_prod "$MODEL" on.bin
+  # 每次 process 结束会打印 NKV_BINDER_STATS；ON 的 applied 预期 >0（运行后核对），
+  # record_builds 是 fresh build 次数，不能把重建次数当 hit。
+
+  python3 compare_logits.py stock.bin off.bin   # 期望 PASS bitwise identical
+  python3 compare_logits.py stock.bin on.bin    # 期望 PASS（如差异，记录首个 bit 差异）
+
+### E. 受控注入（生产分支测试，不是 relay 运行）
+
+  GGML_TP5_NKV_TRUEWIDTH=1 GGML_TP5_UNION_BINDER=1 \
+    ./relay_branch_test "$MODEL"
+
+  期望（若编译/运行获准）：
+  - PASS: both real binder lanes registered on CPU
+  - PASS: fresh build recorded at the true width
+  - PASS: exactly one record build before injection
+  - 注入后 forced reuse failure -> nkv + n_outputs 两条 lane 均 refused
+  - PASS: both rebind lanes refused under the injected relay member
+  - PASS: no in-place patch applied under relay
+  - PASS: fresh build under relay took no new record
+  - COUNTERS attempts>=2 applied=0 refused_relay>=2 record_builds=1
+  该结果只证明真实生产拒绝分支被执行，**不证明真实 relay 运行或 bitwise**。
+
+### F. 真实 relay（本机不可执行）
+
+  需要 5 张同一 ROCm registry 的 HIP GPU、relay provider ABI 2、全 GPU offload。
+  预期日志：UNION_BINDER_REFUSED tp5-relay context。
+  预期：不出现 NKV_BINDER_STATS，不出现 refused_relay 计数（构造期已整体拒绝）。
+  在没有 5×HIP 的机器上不得执行，也不得用 mock/CPU 结果替代。
+
+## 与另一工人的独立调查一致性
+
+verification 只读调查与本文一致：
+- :206-210 / ggml-backend-meta.cpp:1865-1889 强制 Meta + 五个同 HIP registry；
+- 原两 lane 在 :2795/:2955 直接拒绝；
+- 真实 relay 无 GPU/HIP 不可运行；CPU 不得称 relay hit。
+本文按其提醒修正：relay 拒绝路径不再解引用 set；正常 relay 路径无 NKV_BINDER_STATS / refused_relay 计数，只有 UNION_BINDER_REFUSED warning。

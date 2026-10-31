@@ -1,0 +1,331 @@
+--- a/source/ggml/src/ggml-cpu/ops.cpp
++++ b/source/ggml/src/ggml-cpu/ops.cpp
+@@ -8564,9 +8564,19 @@
+     // GGML_TP5_FA_RTLEN: the runtime effective KV length from src[5] (I32[1]).
+     // Derived after the locals so nek1 (k->ne[1]) exists; bounded by the built
+     // width. OFF (no I32 src[5]) == nek1 == stock.
++    // Fail-closed tensor-channel contract: the src[5] tensor carries NO off
++    // sentinel (the documented -1 off sentinel belongs to the op-param
++    // channel, which ggml-cpu never reads); the producer
++    // (llama_kv_cache_context::set_input_nkv_eff) fills [0, built width] and
++    // any negative is corruption -> abort.
+     const ggml_tensor * n_kv_eff_t = (dst->src[5] && dst->src[5]->type == GGML_TYPE_I32 &&
+                                       ggml_nelements(dst->src[5]) == 1) ? dst->src[5] : nullptr;
+-    const int64_t n_kv_eff = n_kv_eff_t ? std::min<int64_t>(((const int32_t *) n_kv_eff_t->data)[0], nek1) : nek1;
++    int64_t n_kv_eff = nek1;
++    if (n_kv_eff_t != nullptr) {
++        const int32_t n_kv_raw = ((const int32_t *) n_kv_eff_t->data)[0];
++        GGML_ASSERT(n_kv_raw >= 0 && n_kv_raw <= nek1);
++        n_kv_eff = n_kv_raw;
++    }
+ 
+     const int64_t DK = nek0;
+     const int64_t DV = nev0;
+@@ -9169,8 +9179,19 @@
+     const ggml_tensor * rel   = (dst->src[5] && dst->src[5]->type != GGML_TYPE_I32) ? dst->src[5] : nullptr;
+     const ggml_tensor * n_kv_eff_t = (dst->src[5] && dst->src[5]->type == GGML_TYPE_I32 &&
+                                       ggml_nelements(dst->src[5]) == 1) ? dst->src[5] : nullptr;
+-    // effective length: bounded by the built width (envelope); stock == nek1
+-    const int64_t n_kv_eff = n_kv_eff_t ? std::min<int64_t>(((const int32_t *) n_kv_eff_t->data)[0], k->ne[1]) : k->ne[1];
++    // Fail-closed tensor-channel contract: the raw I32 src[5] value must lie
++    // in [0, built KV width]. The src[5] tensor carries NO off sentinel (the
++    // documented -1 off sentinel belongs to the op-param channel, which
++    // ggml-cpu never reads); the producer (set_input_nkv_eff) fills
++    // [0, built width] and any negative is corruption -> abort. 0 is a legal
++    // zero-length region (empty cache frontier).
++    // (k->ne[1] spelled out: the GGML_TENSOR_LOCALS below declare nek1 later.)
++    int64_t n_kv_eff = k->ne[1];
++    if (n_kv_eff_t != nullptr) {
++        const int32_t n_kv_raw = ((const int32_t *) n_kv_eff_t->data)[0];
++        GGML_ASSERT(n_kv_raw >= 0 && n_kv_raw <= k->ne[1]);
++        n_kv_eff = n_kv_raw;
++    }
+ 
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+--- a/source/src/llama-context.cpp
++++ b/source/src/llama-context.cpp
+@@ -2818,6 +2818,31 @@
+     return { &st.record_t, &st.record_src, &st.record_fixed, &st.record_bytes };
+ }
+ 
++// reader-audit: does this graph result carry attention-view reader inputs?
++// The plain attn_kv input (and the msa derivative sharing the class) holds
++// build-time captured spans; the hybrid wrapper embeds one. Checked against
++// the LIVE graph's captured input state so a graph built under attention
++// views stays refused even after the views are cleared from the cache. All
++// other input variants carry no reader state (verified: no other input class
++// has a readers member, and the msa/hybrid builders never populate one).
++static bool llama_graph_result_has_attn_readers(const llm_graph_result * res) {
++    if (res == nullptr) {
++        return false;
++    }
++    for (const auto & input : res->inputs) {
++        if (const auto * kv = dynamic_cast<const llm_graph_input_attn_kv *>(input.get())) {
++            if (!kv->readers.empty()) {
++                return true;
++            }
++        } else if (const auto * hy = dynamic_cast<const llm_graph_input_mem_hybrid *>(input.get())) {
++            if (hy->inp_attn != nullptr && !hy->inp_attn->readers.empty()) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ bool llama_context::union_rebind_n_kv(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set) {
+     // the record vectors come from the binding's tensor set provider; alias them
+     // once (all later reads/writes go through these names)
+@@ -2882,25 +2907,28 @@
+         ++st.c_fallbacks;
+         return false;
+     }
+-    // r8 coverage lane: fail-closed on attention-view readers (the "view"
+-    // family's reader subpath). Reader inputs capture build-time spans/values
+-    // (llama-graph.cpp, build_attn_inp_kv_impl -> readers); the in-place patch
+-    // copies tensor layouts only - it cannot re-resolve captured reader
+-    // values - and the skeleton compare checks sizes only, so a frontier
+-    // change with equal reader sizes would patch the graph and then write
+-    // stale captured values at set_input. Refuse and let the caller
+-    // full-rebuild (the fresh build re-resolves the readers at the current
+-    // frontier). OFF (cov gate not exactly "1"): r7 behavior - unchanged.
+-    if (st.cov_enabled) {
+-        bool attn_views = false;
+-        for (int i = 0; i < nkvs; ++i) {
+-            attn_views |= kvs[i]->has_attention_views();
+-        }
+-        if (attn_views) {
++    // Fail-closed on attention-view readers (reader-audit fix; was gated on
++    // the r8 cov lane). The in-place patch copies tensor layouts only: it
++    // cannot re-resolve build-time captured reader spans, so patching a
++    // reader graph would execute stale spans against the patched widths.
++    // Two detectors, both must miss: the cache's CURRENT attention-view
++    // state, and the live graph's captured input reader state (the latter
++    // covers graphs built under views that were cleared before this rebind).
++    // Refuse unconditionally and fall back to the caller's full rebuild,
++    // which re-resolves the readers at the current frontier.
++    // c_refused_view stays r8 cov-family (never written with the gate off);
++    // c_fallbacks (r7 field) accounts every refusal.
++    bool attn_readers = false;
++    for (int i = 0; i < nkvs; ++i) {
++        attn_readers |= kvs[i]->has_attention_views();
++    }
++    attn_readers |= llama_graph_result_has_attn_readers(res);
++    if (attn_readers) {
++        if (st.cov_enabled) {
+             ++st.c_refused_view;
+-            ++st.c_fallbacks;
+-            return false;
+         }
++        ++st.c_fallbacks;
++        return false;
+     }
+     // non-nkv graph keys must be identical: allow_reuse compares every graph-
+     // shaping input EXCEPT the n_kv-coupled shapes (ubatch layout, sequence
+@@ -3095,6 +3123,28 @@
+             return false;
+         }
+     }
++    // Fail-closed on attention-view readers (reader-audit fix): the n_outputs
++    // rebind's shared pre-allocation record covers reader input tensors too,
++    // and a patch copies layout only - it cannot re-resolve build-time
++    // captured reader spans. Two detectors, both must miss: the cache's
++    // CURRENT attention-view state, and the live graph's captured input
++    // reader state (the latter covers graphs built under views that were
++    // cleared before this rebind). Refuse and fall back to the caller's full
++    // rebuild, which re-resolves the readers at the current frontier.
++    // c_refused_view stays r8 cov-family (never written with the gate off);
++    // c_fallbacks (r7 field) accounts every refusal.
++    bool attn_readers = false;
++    for (int i = 0; i < nkvs; ++i) {
++        attn_readers |= kvs[i]->has_attention_views();
++    }
++    attn_readers |= llama_graph_result_has_attn_readers(res);
++    if (attn_readers) {
++        if (st.cov_enabled) {
++            ++st.c_refused_view;
++        }
++        ++st.c_fallbacks;
++        return false;
++    }
+ 
+     // scratch build at the active count (plain n_outputs - no envelope)
+     llm_graph_params gp = params;
+--- a/verify/host_cpu_fa_off.cpp
++++ b/verify/host_cpu_fa_off.cpp
+@@ -13,18 +13,28 @@
+ //   A  no src[5], slot 5 untouched : stock graph state
+ //   B  slot 5 = -1 / 300           : baseline only; ggml-cpu must ignore slot 5
+ //                                    (slot 5 is consumed by the CUDA launcher)
+-//   C  src[5] = I32[1] bound       : baseline only; production ggml-cpu clamps
+-//                                    at min(bound, k->ne[1])
++//   C  src[5] = I32[1] bound       : baseline only; ggml-cpu consumes the raw
++//                                    I32 value fail-closed: accepted domain is
++//                                    [-1, k->ne[1]] where -1 is the documented
++//                                    off sentinel (stock full width) and 0 is a
++//                                    legal zero-length region; anything outside
++//                                    the domain must GGML_ABORT (each case runs
++//                                    in a forked child; pass = child died by
++//                                    SIGABRT).
+ //
+ // A/B must hash identically on both trees. C is checked against an independent
+-// scalar reference for bounds in (0, n_kv]; out-of-range bounds are only
+-// recorded (contract: the value must never exceed the built KV width).
++// scalar reference for bounds in (0, n_kv]; out-of-domain bounds are no longer
++// clamped and must abort.
+ 
+ #include "ggml.h"
+ #include "ggml-alloc.h"
+ #include "ggml-backend.h"
+ #include "ggml-cpu.h"
+ 
++#include <csignal>
++#include <sys/wait.h>
++#include <unistd.h>
++
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+@@ -67,16 +77,16 @@
+     std::vector<uint16_t> mask;
+ };
+ 
+-inputs make_inputs() {
++inputs make_inputs(int n_q = N) {
+     inputs in;
+-    in.q.resize((size_t) D * N * H);
++    in.q.resize((size_t) D * n_q * H);
+     in.k.resize((size_t) D * KV * H);
+     in.v.resize((size_t) D * KV * H);
+-    in.mask.resize((size_t) KV * N);
++    in.mask.resize((size_t) KV * n_q);
+     for (size_t i = 0; i < in.q.size(); ++i) { in.q[i] = det((int) i); }
+     for (size_t i = 0; i < in.k.size(); ++i) { in.k[i] = det((int) i + 1000); }
+     for (size_t i = 0; i < in.v.size(); ++i) { in.v[i] = det((int) i + 2000); }
+-    for (int t = 0; t < N; ++t) {
++    for (int t = 0; t < n_q; ++t) {
+         for (int j = 0; j < KV; ++j) {
+             // causal, plus a second visible band far above the row position:
+             // keep j <= t, and keep 400 < j <= 400 + t
+@@ -87,17 +97,18 @@
+     return in;
+ }
+ 
+-// independent scalar reference for the attention extra: bound keys are read
+-void reference(const inputs & in, int bound, std::vector<float> & out) {
+-    out.assign((size_t) D * N * H, NAN);
++// n_q selects the query-token count (N for the checked one-chunk path,
++// 1 for the split-KV path with KV >= 512).
++void reference(const inputs & in, int bound, std::vector<float> & out, int n_q = N) {
++    out.assign((size_t) D * n_q * H, NAN);
+     for (int h = 0; h < H; ++h) {
+-        for (int t = 0; t < N; ++t) {
++        for (int t = 0; t < n_q; ++t) {
+             std::vector<double> s((size_t) bound, 0.0);
+             double maxs = -INFINITY;
+             for (int j = 0; j < bound; ++j) {
+                 double acc = 0.0;
+                 for (int d = 0; d < D; ++d) {
+-                    acc += (double) in.q[(size_t) d + (size_t) D * (t + (size_t) N * h)] *
++                    acc += (double) in.q[(size_t) d + (size_t) D * (t + (size_t) n_q * h)] *
+                                  in.k[(size_t) d + (size_t) D * (j + (size_t) KV * h)];
+                 }
+                 const uint16_t mb = in.mask[(size_t) j + (size_t) KV * t];
+@@ -115,7 +126,7 @@
+                 for (int j = 0; j < bound; ++j) {
+                     acc += s[j] * (double) in.v[(size_t) d + (size_t) D * (j + (size_t) KV * h)];
+                 }
+-                out[(size_t) d + (size_t) D * (t + (size_t) N * h)] = (float) (acc / sum);
++                out[(size_t) d + (size_t) D * (t + (size_t) n_q * h)] = (float) (acc / sum);
+             }
+         }
+     }
+@@ -128,17 +139,19 @@
+ 
+ // attach_bound: create I32[1] src[5] with the given value
+ // slot5:        when != NO_SLOT, write op params slot 5 (baseline only)
+-run_result run_fa(const inputs & in, bool attach_bound, int bound, int slot5) {
++// n_q:          query-token count; 1 (with KV >= 512) selects the split-KV
++//               dispatch path, N selects the checked one-chunk path
++run_result run_fa(const inputs & in, bool attach_bound, int bound, int slot5, int n_q = N) {
+     run_result res;
+ 
+     ggml_init_params ip = { 512u * 1024u * 1024u, nullptr, true /* no_alloc */ };
+     ggml_context * ctx = ggml_init(ip);
+     GGML_ASSERT(ctx != nullptr);
+ 
+-    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, N, H, 1);
++    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, H, 1);
+     ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, KV, H, 1);
+     ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, KV, H, 1);
+-    ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, KV, N, 1, 1);
++    ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, KV, n_q, 1, 1);
+ 
+     ggml_tensor * bound_t = nullptr;
+     if (attach_bound) {
+@@ -181,7 +194,7 @@
+     const ggml_status st = ggml_backend_graph_compute(backend, gf);
+     GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+ 
+-    res.out.resize((size_t) D * N * H);
++    res.out.resize((size_t) D * n_q * H);
+     ggml_backend_tensor_get(fa, res.out.data(), 0, res.out.size() * sizeof(float));
+ 
+     char tmp[32];
+@@ -243,13 +256,48 @@
+         expect(c.dump != a.dump, label("C bound changes result", bound, NO_SLOT));
+     }
+ 
+-    // out-of-contract bounds: recorded, not asserted. The CPU kernel clamps with
+-    // min(value, k->ne[1]) and has no lower bound, so <= 0 yields an empty KV
+-    // range; values above ne[1] are clamped. Contract: the value must never
+-    // exceed the built KV width (see REPORT.md boundary notes).
+-    for (int bound : { -1, 0, KV + 1, INT32_MAX }) {
+-        const run_result c = run_fa(in, true, bound, NO_SLOT);
+-        std::printf("WARN out-of-contract src5=%d dump=%s\n", bound, c.dump.c_str());
++    // Fail-closed channel separation: the src[5] I32[1] tensor lane accepts
++    // [0, built KV width] only (the documented -1 off sentinel belongs to the
++    // op-param channel, which ggml-cpu never reads). On BOTH dispatch paths
++    // (checked one-chunk for n_q = N, split-KV for n_q = 1 with KV >= 512):
++    // bound = 0 is a legal empty region -> all-zero output; every negative and
++    // every value above the built KV width must GGML_ABORT in a forked child.
++    for (int n_q : { N, 1 }) {
++        const inputs inq = make_inputs(n_q);
++        const run_result z = run_fa(inq, true, 0, NO_SLOT, n_q);
++        bool z_all_zero = true;
++        for (float f : z.out) {
++            z_all_zero = z_all_zero && (f == 0.0f);
++        }
++        expect(z_all_zero, "C src5=0 all-zero output (n_q=" + std::to_string(n_q) + ")");
++        for (int bound : { -1, -2, INT32_MIN, KV + 1, INT32_MAX }) {
++            const pid_t pid = fork();
++            expect(pid >= 0, "C out-of-domain fork (n_q=" + std::to_string(n_q) + ")");
++            if (pid == 0) {
++                run_fa(inq, true, bound, NO_SLOT, n_q); // must GGML_ABORT inside ggml-cpu
++                _exit(0);                               // reached only on a fail-open regression
++            }
++            int wstatus = 0;
++            waitpid(pid, &wstatus, 0);
++            const bool aborted = WIFSIGNALED(wstatus) && WTERMSIG(wstatus) == SIGABRT;
++            expect(aborted, "C src5=" + std::to_string(bound) + " aborts (n_q=" + std::to_string(n_q) + ")");
++        }
++    }
++
++    // split-KV positive: single-token query over the full envelope, aligned
++    // with the independent scalar reference (1e-4)
++    {
++        const inputs in1 = make_inputs(1);
++        std::vector<float> ref1;
++        reference(in1, KV, ref1, 1);
++        const run_result s_full = run_fa(in1, true, KV, NO_SLOT, 1);
++        bool ok = true;
++        for (size_t i = 0; i < ref1.size() && ok; ++i) {
++            if (!(std::fabs(s_full.out[i] - ref1[i]) <= 1e-4f)) {
++                ok = false;
++            }
++        }
++        expect(ok, "split-KV full-width result aligned with scalar reference (n_q=1, src5=512)");
+     }
+ #else
+     std::printf("NOTE stock tree build: src[5]/op-param variants are baseline-only\n");

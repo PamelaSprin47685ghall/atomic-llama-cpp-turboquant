@@ -1,0 +1,167 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d75eb64..f1f1653 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -463,11 +463,24 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
+     const char * nkv_truewidth_env    = getenv("GGML_TP5_NKV_TRUEWIDTH");
+     const bool   nkv_truewidth_gate   = nkv_truewidth_env != nullptr && strcmp(nkv_truewidth_env, "1") == 0;
+ 
++    // tp5-relay owns graph-shape stability: it pins host input storage,
++    // re-validates every node's scheduler placement after a rebuild, and its
++    // provider re-prepares stage terminals whenever a graph/layout/binding is
++    // redefined. The union binder mutates the live graph's shapes after
++    // allocation - the two contracts cannot coexist. Refuse the whole binder
++    // up front so no lane can register, record a graph, or attempt a rebind.
++    // The per-lane relay guards below remain as fail-closed backstops.
++    const bool relay_binder_refused = params.tp5_relay && (union_binder_gate || nkv_truewidth_gate);
++    if (relay_binder_refused) {
++        LLAMA_LOG_WARN("%s: UNION_BINDER_REFUSED tp5-relay context: GGML_TP5_UNION_BINDER and GGML_TP5_NKV_TRUEWIDTH stay inactive (relay pins graph shapes; record/rebind is out of contract)\n", __func__);
++    }
++
+     {
+         // The state slot exists only while at least one lane gate is exactly
+-        // "1"; with both gates off the context holds no binder state at all
++        // "1" and the context is not a tp5-relay context; with both gates off
++        // (or under relay) the context holds no binder state at all
+         // (OFF = stock, zero alloc).
+-        if (union_binder_gate || nkv_truewidth_gate) {
++        if (!relay_binder_refused && (union_binder_gate || nkv_truewidth_gate)) {
+             auto & nkv_st = llama_nkv_ctx_state_get(this);
+ 
+             // r7 true-width nkv lane: registered only under its own gate.
+@@ -2736,13 +2749,20 @@ struct llama_nkv_record_t {
+ // yet sched-placed) graph into the context's union-binder state slot; ONE
+ // record serves both lanes (nkv + n_outputs) of the latest fresh build
+ // (state note: was llama_context::nkv_record_* data members; now lives in the
+-// context's own state slot)
++// context's own state slot). Backstop: the caller already skips the snapshot
++// when backend_tp5_relay is set; this observable guard keeps the record out of
++// a relay context even if a future caller forgets. It only null-tests the
++// relay pointer and never dereferences it.
+ void llama_context::binder_record_snapshot(ggml_cgraph * gf) {
++    auto & st = llama_nkv_ctx_state_get(this);
++    if (backend_tp5_relay != nullptr) {
++        ++st.c_refused_relay;
++        return;
++    }
+     llama_nkv_record_t rec;
+     rec.record(gf);
+     rec.record_bytes();
+ 
+-    auto & st = llama_nkv_ctx_state_get(this);
+     st.record_t     = std::move(rec.t);
+     st.record_src   = std::move(rec.src);
+     st.record_fixed = std::move(rec.fixed);
+@@ -2769,29 +2789,15 @@ llama_union_tensor_set llama_context::union_tensors_n_kv() {
+ }
+ 
+ bool llama_context::union_rebind_n_kv(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set) {
+-    // the record vectors come from the binding's tensor set provider; alias them
+-    // once (all later reads/writes go through these names)
+-    const std::vector<ggml_tensor *> & record_t     = *set.tensors;
+-    const std::vector<int32_t>       & record_src   = *set.src;
+-    const std::vector<uint8_t>       & record_fixed = *set.fixed;
+-    const std::vector<size_t>        & record_bytes = *set.bytes;
+-
+     auto & st = llama_nkv_ctx_state_get(this);
+ 
+     // NKV_BINDER_STATS: every binder invocation counts as an attempt
+     ++st.c_attempts;
+ 
+-    if (!res || res->get_gf() == nullptr) {
+-        ++st.c_fallbacks;
+-        return false;
+-    }
+-    // the binder needs the pre-allocation record of the latest fresh build
+-    if (!st.record_valid || record_t.empty()) {
+-        ++st.c_fallbacks;
+-        return false;
+-    }
+     // tp5-relay pins host graph buffers and validates every node's scheduler
+-    // placement after the rebuild; in-place n_kv patching is out of its contract
++    // placement after the rebuild; in-place n_kv patching is out of its
++    // contract. Refuse before reading the tensor set or any record state, so
++    // the rejection is unconditional even for an empty/invalid set.
+     if (backend_tp5_relay != nullptr || cparams.pipeline_parallel) {
+         if (backend_tp5_relay != nullptr) {
+             ++st.c_refused_relay;
+@@ -2803,6 +2809,21 @@ bool llama_context::union_rebind_n_kv(llm_graph_result * res, const llm_graph_pa
+         return false;
+     }
+ 
++    if (!res || res->get_gf() == nullptr) {
++        ++st.c_fallbacks;
++        return false;
++    }
++
++    // the record vector comes from the binding's tensor set provider; alias it
++    // only after the refusals above, which do not need the set.
++    const std::vector<ggml_tensor *> & record_t = *set.tensors;
++
++    // the binder needs the pre-allocation record of the latest fresh build
++    if (!st.record_valid || record_t.empty()) {
++        ++st.c_fallbacks;
++        return false;
++    }
++
+     // collect every KV-cache context whose n_kv shapes this graph
+     const llama_kv_cache_context * kvs[2] = { nullptr, nullptr };
+     int nkvs = 0;
+@@ -2924,6 +2945,21 @@ bool llama_context::union_rebind_outputs(llm_graph_result * res, const llm_graph
+     // NKV_BINDER_STATS: every binder invocation counts as an attempt
+     ++st.c_attempts;
+ 
++    // tp5-relay pins host graph buffers and validates every node's scheduler
++    // placement after the rebuild; in-place n_outputs patching is out of its
++    // contract (same as the nkv lane). Refuse before reading any record or
++    // result state: the rejection is unconditional and observable.
++    if (backend_tp5_relay != nullptr || cparams.pipeline_parallel) {
++        if (backend_tp5_relay != nullptr) {
++            ++st.c_refused_relay;
++        }
++        if (cparams.pipeline_parallel) {
++            ++st.c_refused_pipeline;
++        }
++        ++st.c_fallbacks;
++        return false;
++    }
++
+     if (!res || res->get_gf() == nullptr) {
+         ++st.c_fallbacks;
+         return false;
+@@ -2949,19 +2985,6 @@ bool llama_context::union_rebind_outputs(llm_graph_result * res, const llm_graph
+             return false;
+         }
+     }
+-    // tp5-relay pins host graph buffers and validates every node's scheduler
+-    // placement after the rebuild; in-place n_outputs patching is out of its
+-    // contract (same as the nkv lane)
+-    if (backend_tp5_relay != nullptr || cparams.pipeline_parallel) {
+-        if (backend_tp5_relay != nullptr) {
+-            ++st.c_refused_relay;
+-        }
+-        if (cparams.pipeline_parallel) {
+-            ++st.c_refused_pipeline;
+-        }
+-        ++st.c_fallbacks;
+-        return false;
+-    }
+     // non-nkv graph keys must be identical: normalize the n_outputs key (the
+     // graph is built at the exact active count; the ACTIVE count is exactly
+     // what THIS rebind reconciles)
+@@ -3493,9 +3516,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
+         // n_outputs record: taken on EVERY fresh decoder build under the lane
+         // (no pad-to-max - the graph is built at the exact active count and
+         // nout_cap records that built width; the rebind only moves the
+-        // executed shapes within [0, nout_cap])
++        // executed shapes within [0, nout_cap]). tp5-relay refuses the record
++        // as well as the rebind: relay pins the graph metadata it validates,
++        // so no pre-allocation snapshot may be taken for an in-place patch
++        // that can never be admitted.
+         env_out = !graph_reuse_disable && union_binder_state_peek() != nullptr &&
+-            union_binder_state_peek()->nout_enabled && gtype == LLM_GRAPH_TYPE_DECODER;
++            union_binder_state_peek()->nout_enabled && gtype == LLM_GRAPH_TYPE_DECODER &&
++            backend_tp5_relay == nullptr;
+ 
+         gf = model.build_graph(gparams);
+ 

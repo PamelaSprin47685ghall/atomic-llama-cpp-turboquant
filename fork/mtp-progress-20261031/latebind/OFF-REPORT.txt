@@ -1,0 +1,15 @@
+基线：git archive f1c5fafc0449b22969ddabfcc9c361940d94d033，应用 lb-default-on-guards-r8-013805/patch.diff（sha256 a7d319ab08b292f3417e2effd39e96849dbbd9b087817da07b076a61d38e3487），所得 runtime.cpp 原 sha256 98e06fac9385fb34a73b8741cbb41464cd28e05dd0fa6c7905652f6a469111f3。该基线不能等同 qualified row-tail。
+
+变更：在 stock-f1c5fafc/fork/tp5-compose/src/runtime.cpp 的公开 run() 首先读取既有缓存 exact-1 master；OFF 返回 stock 的 run_stock_orig，ON 进入原 r8 worker 实现；原 ON guards/逻辑未改。src/runtime-stock.cpp 从上述 git 对象提取 pristine runtime，只机械改名公开 run 为 run_stock_orig。CMakeLists.txt 将 stock TU 加入 runtime 静态库。增量 guards-off-increment.patch 相对上述 r8 树，不是 stock 累计补丁。
+
+OFF 的 backend_owner、spin 规划、courier、MTP、softlogits、诊断都位于 r8 的 run_fork_impl 路径，不被 OFF 入口调用；stock TU 的自身初始化仍执行。r8 TU 仍含文件作用域空 vector 和零初始化原子统计对象，其加载/构造及一次 master getenv 是 stock 以外的进程级差异；不能声称零指令开销或动态等价。该门首次读取后进程内缓存，不能同进程切换环境分腿。
+
+未编译、链接或运行 GPU/HIP；真实链接、静态初始化影响、生产多请求 OFF 与 stock 的 token/logits 字节一致性均未验证，不能宣称生产通过或已合入 selected；本地缺少历史真实二进制、模型与 qualified row-tail。ON 的函数体与 r8 字节相同是静态证据，不是运行时安全证明。
+
+静态核验：原 r8 fork 上 git apply --check 对增量成功；在独立 replay-f1c5fafc 中从 f1c5fafc archive 依次应用原 r8 累计 patch 和增量均成功。重放后三文件与工作树 SHA-256 一致：runtime.cpp 2acdf681f3e72ee20011e72bf2aa378e80199effe92cd2c13e785023e357020d，runtime-stock.cpp 4a2bfb568e90d022809239d1a8be62983b3021c90b51b0947d924d041d4afbfe，CMakeLists.txt 572d2901df2f0dfedb31acf3ef18e22f99be3404942464b04bc1b6ba4792a3b5。逐字比较 stock TU 恢复入口名称后等于 git show 原件；ON 函数体恢复原名称后等于 r8 函数体；两源码和增量内 GGML_TP5_RSZ_RT 出现次数为 0。
+
+生产接线源码：src/main.cpp:868 调 tq::tp5::run；CMakeLists.txt:23、34-36 将两个 TU 编入 tq_tp5_runtime 并链接 tq-tp5-compose。runtime.cpp:980-988 先判门，OFF 进入 runtime-stock.cpp:479；后者 :131-135 和 :488 是 stock 后端构造，不包含 r8 的 HIP spin helper。r8 backend_owner 在 runtime.cpp:364-366，仅从 ON 函数体调用；文件作用域 vector/atomics 仍存在。两个 TU 内 helper 分别位于匿名命名空间，公开入口分别为 run、run_fork_impl、run_stock_orig，静态代码审计未见这三者相互重定义；未进行目标文件符号表或真实链接验证。
+
+重要功能契约变化：stock TU 不包含 TP5_SERVICE_ROUNDS、TP5_SERVICE_PROMPTS、GGML_TP5_REAL_TRAINED_MTP_GGUF 或 trained_mtp_contexts 读取/实现；它仍执行普通单次 run 的多窗口请求（runtime-stock.cpp:574-627），但并不提供 r8 的 trained MTP 或同进程 service rounds。r8 原路径 runtime.cpp:993-994、:1220-1221、:1282-1309 加载 MTP，:1353-1359 配置轮次/提示并要求 rounds>1 时有 MTP，:1396-1407 执行轮间重置。master OFF 分流会忽略这些环境变量，故不能把它称为保持 r8 OFF 生产服务契约的最小修复，也不能用于验证原先带 MTP 多轮的 OFF 工作负载；若要求关闭 latebind 但保留 MTP/service，应另选具该功能的独立非 latebind 基线并重新设计分流。此 patch 仅作为功能契约改变明确标注的实验候选，不能宣称满足原先 MTP 工作负载。
+
+生产 stock/OFF 对照尚未执行：本次未编译，任务禁止 GPU/HIP 和长编译；历史 receipt 所指可执行文件、主模型和 trained MTP 文件在本机不可访问；真正 qualified row-tail 基线身份与产物亦未核实；现有两个 TU 不具备等价 MTP/service workload，不能以同一环境变量假装比较相同工作。下一步须先取得可信 qualified stock 源码/补丁谱系、具同等 MTP 与 service rounds 的基线及构建产物、匹配的共享库、主模型与 MTP 模型、提示文件及完整 argv/env/哈希，确定 OFF 合同；在获准环境按 build-slot 和 GPU 纪律构建/运行独立进程并保留每轮 token、原始 logits 和退出码做逐字节比较，缺任何条件均不得宣称通过。

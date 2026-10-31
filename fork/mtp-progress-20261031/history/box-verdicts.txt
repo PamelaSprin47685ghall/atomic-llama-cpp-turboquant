@@ -1,0 +1,518 @@
+8lru-flagged-regate-prep-12022 | ## 总判定：**CONDITIONAL（机制有效，但不能按现状 PROMOTE）**
+8lru-flagged-regate-prep-nv-12022 | ## 总判定：**CONDITIONAL（机制有效，但不能按现状 PROMOTE）**
+8lru-frames-key-land-12022 | ## 总判定：**CONDITIONAL（机制有效，但不能按现状 PROMOTE）**
+8lru-frames-key-land-nv-12022 | ## 总判定：**CONDITIONAL（机制有效，但不能按现状 PROMOTE）**
+8lru-frames-regate-13022 | **Verdict: PASS (numerics + mechanism + steady-service delta)**, flag `GGML_TP5_RELAY_FRAMES` (default-off = 2 frames; =8 opts into 8-frame relay LRU).
+8lru-key-stabilize-12022 | ## 总判定：**CONDITIONAL（机制有效，但不能按现状 PROMOTE）**
+8lru-key-stabilize-nv-12022 | ## 总判定：**CONDITIONAL（机制有效，但不能按现状 PROMOTE）**
+8lru-multishape-13022 | ## 总判定：**CONDITIONAL（机制有效，但不能按现状 PROMOTE）**
+8lru-ptrsafe-key-12022 | # REPORT: 8-LRU HIP relay frame cache — default-off capacity flag (PARTIAL)
+8lru-ptrsafe-key-v2-12022 | # REPORT: 8-LRU frames capacity flag (patch copy) — PARTIAL
+8lru-ptrsafe-key-v3-12022 | # REPORT: 8-LRU relay frame cache — v3 pointer-safe key review (PARTIAL)
+8lru-sameplan-13022 | - **OFF：PASS（硬门）**——与 B8 逐位相同，无 REBIND 行。
+8lru-svcfix-13022 | **正确性：PASS**——15 组 cross 全部 18/18 tok、576/576 logits bitwise（含 B8）；各腿 self_repeat 全 bitwise。
+8lru-svcport-13022 | ## 正确性（coarse）：全部 PASS
+8lru-v25-13022 | ## 结果（11:22 JST（02:22Z） 收口）— **OFF 硬门 PASS；V2 PASS（可 promote）；V3 FAIL（SIGSEGV）**
+_push |  apply-check on clean `f1c5faf` PASS — VERIFY.txt §1).
+actual-kv-hip-13022 | **结论：PASS（GPU 微基准，bitwise）。** 这一关只证明 HIP 上 `FLASH_ATTN_EXT` 的 `actual_kv` 边界内核语义正确，还不是端到端 TP5 关：补丁是独立 ggml 构
+akv-bind-minimal-land-12022 | # akv-bind-minimal-land — PARTIAL deliverable REPORT (2026-10-28, rev 3)
+akv-envelope-13022 | **PASS（8×2 诊断门，v2）。**
+akv-envelope |  - 结果：**PASS**（退出码 0，补丁可清洁且无冲突地反向应用校验）。
+akv-longctx-rebind-12022 | **PASS（8×2 诊断门）**。target union 命中恢复到和 ctl 完全一样：w0 235/240，w1 368/373；relay hit 603/613。binds>0，NKV_FAIL 为 0，r8/r9 都没有失败。三对两�
+akv-longctx-rebind2-12022 | # akv-longctx-rebind2 — PARTIAL Deliverable Report
+akv-nkv-bind-symbols-12022 | **Date:** 2026-10-28 · **Status: BLOCKED BY MISSING DEPENDENCIES — empty patch.diff delivered**
+akv-rebind-patch-retry-12022 | **Date:** 2026-10-28 · **Status: PARTIAL — final patch not yet landed**
+akv-trim-13022 | Lane: `$E/mtp-akv-trim-20261028/`. Local loot: `/workspace/mtp-war-loot/akv-trim-13022/` (gpu.log, analysis-trim.json, runs-0913/* minus install and f32; earlier PARTIAL write-up in GATE-pre
+akv-trim-fills-probe-12022 | | 0913 trim-only | 09:13–09:29 | trim, no counter | trimA8x2, env2C8x2, trimB8x2 | correctness PASS bitwise; NO-PROMOTE; **firing unproven** |
+akv-trim-hit-counter-12022 | 4. **Health:** `grep -cE 'GGML_ASSERT|Memory Fault|ROCm error|nonfinite' runs/*/stderr.log` = 0; no `NKV_FAIL`; `TP5_AKV_ENV`/`TP5_UNION_NKV`/`TP5_DIAG_GRAPH`/`TP5_DIAG_RELAY` lines present 
+akv-trimcnt-13022 | ## Verdict: **correctness PASS + firing evidence PASS. Still NO-PROMOTE (no speed gain).**
+akv-u3-wire-land-12022 | | 独立头文件 LRU smoke（miss/hit/commit/abandon/all-pinned-refusal/eviction + `NKV_ALIGN==256` static_assert） | PASS |
+akv-union-lru-bind-12022 | # GATE — akv-union-lru-bind (12022) PARTIAL
+approx-fast-paths-scan | **Ashley Standing Rule:** Relaxed soft gate accepts small numerical order/rounding differences ONLY. Bugs, data races, broken reductions, top-1 collapse, and NaNs/Infs are strictly rejected.
+approx-intentional-veto | 2. Bugs, wrong implementations, silent no-ops, broken reductions, NaN/Inf, top1 collapse from bad code: REJECT (fail-closed).
+async-prewarm-draft-8x2 | **状态：DIAG_PASS（不晋升）— 4 条 8x2 全 rc0，numerics 全 bitwise（KL=0、top1/token 无 mismatch），没发现 bug。小重建：只动 runtime.cpp + relay.hip；Meta 没重
+async-proto-8x2 | **状态：DIAG_PASS（不晋升）— 3 条 8x2 全 rc0，numerics 全 bitwise，没发现 bug。没有重建，没碰 selected，没跑 nkv/akv 冷对比。**
+bf16-load4-n3-code | **Status:** **BLOCKED** (Missing source code prerequisite; `/home/kunweiz` is permission-denied) 
+binder-nout-slot-impl | # 13022 烧测与验收 — PARTIAL，禁止晋级
+binder-rsz-slot-impl | # 13022 烧机与验收：PARTIAL，禁止晋级
+carpet-dup-sites-12022 | # SITE-05 REPORT — Top-K MoE Fusion for N=2..3 (PARTIAL, UNVERIFIED)
+combo-cold-gap-glue-12022 | Status: **PARTIAL NO-GAP.** No seams were found in the tested VERIFY+DRAFT path under the fixed-worker harness actually run; this is NOT a claim that no seams exist elsewhere or universally.
+combo-cold-u5-draft-once2-13022 | **结论：PASS（正确性 + 冷路径消除）；ENTRY(once2) 叠在 VERIFY+DRAFT 上 = 中性/冗余，不 promote 为提速；稳态零提速（如实）。**
+combo-latebind-hunk8-fix-12022 | git apply --check "$PATCH" # must pass; if it fails, STOP — do not fuzz
+combo-u5lb-stack-land-12022 | this scope itself: "PARTIAL — do not treat as a complete composition".
+combo-union-u5-latebind-prep-12022 | ## 3. Layer B — U5 draft prewarm v2 (receipted PASS, 13022)
+courier-hit-prove-v2 | # 13022 验收 — PARTIAL，不可推广
+dc5-router-expert-static | | **N3 Verify Batching ($N=3$)** | Supported | **REJECTED by Meta** (T1-only check in ledger) | **Conditionally Feasible** (requires Meta join compiler) |
+dc6-dc8-13022-lane | ## DC6 GGML_TP5_SHARED_EXPERT_SHARD=1: BLOCKED (fail-closed loader reject, not numeric)
+dc6-shard-klgate-prep |  - **Finiteness**: 100% finite values across both reference and candidate. Any `NaN` or `Inf` in candidate OR reference immediately aborts the gate (`status: FAIL`, exit code 1).
+dc8-fold-13022 | # DC8 ids fold → M2+M3+KEEP integrate — GATE: **PASS**
+dc8-fold-m2m3-13022 | # DC8 ids folded into M2+M3+KEEP integrate — 13022 soft gate (2026-10-27 10:01 UTC) VERDICT: PASS (exact class)
+dc8-graph-capture-note-12022 | **MANDATE (13022): MoE N2 fusion is NO-PROMOTE (inferior to existing M2
+dc8-ids-gate-13022 | ## Numerics (exact class) — PASS
+dc8-ids-soft-sync | - **Node-count gate**: In the compiled N3 verify graph, the graph node count must drop by exactly 48 nodes compared to control. The 48 removed nodes must specifically be the redundant `quant
+dc8-q8cache-13022 | **Verdict: PARTIAL / NO-PROMOTE** (exact, but no steady-state gain; hit-count census never completed)
+dc8-q8cache-soft-code | ## 1. Executive Status: BLOCKED
+dc8-stderr-hit-13022 | ## Verdict: **PASS (correctness + hit-counter evidence). No speed claim.**
+dc8-stderr-hitctr-12022 | | Soft-code report (BLOCKED status, ledger provenance) | `inputs/dc8-q8cache-soft-code/REPORT.md` (duplicate: `finish-summary.txt`) |
+draft-pw-threadpool-12022 | 结论：**PARTIAL（诚实口径）——实现（patch.diff 终版，md5 `dd01f080391c320d3c64bd20580c3d5c`，+180/−0）完成并通过静态独立复核 + 并发 mock/TSan 冒烟（实�
+draft-router-row-trim-12022 | # 13022 验收（本补丁 PARTIAL，禁止当作已通过）
+dualwin-async-handoff-proto-12022 | # 柱 3 双窗异步交接 — PARTIAL
+dualwin-async-overlap-trace | 4. 报告多轮吞吐及波动；未观测提升不得宣称提速。任一正确性或设备重叠条件失败均 PARTIAL，保留证据，不调参掩盖。
+dualwin-async-prewarm-land-12022 |  apply-check on clean `f1c5faf` PASS — VERIFY.txt §1).
+dualwin-courier-13022 | ## Verdict: **NO-PROMOTE (correct, but not a speedup; the "default-off" port changes the production default)**
+dualwin-courier-hit-prove | # 13022 交接：PARTIAL，勿作为命中率验收补丁
+dualwin-courier-land-12022 | - `g++ -fsyntax-only -std=c++17` with fork include set: **PASS** on patched copy.
+dualwin-dc8-gate-prep-12022 | | `…/dualwin-courier-13022/…/GATE.md` + `pairs.txt` | the only OBS-complete GPU lane: courier NO-PROMOTE verdict, A/A noise precedent |
+dualwin-host-serial-12022 | **Status:** PARTIAL — static patch artifact only; NOT built, NOT run, NOT promoted.
+dualwin-mutex-meet-12022 | # GATE — dualwin-mutex-meet (12022) PARTIAL
+dualwin-ready-pair-async-rx | # 13022 验收手册 — PARTIAL / 不可烧本刀
+dualwin-ready-pair-async | 3. 固定模型、输入和种子，采用 K=9、两窗、32 token、多请求服务；至少两组 A/A、每组至少 16 对 steady 请求（排除 r0 冷启动）。记录 rc、完整 stde
+dualwin-ready-pair-real-rz | # PARTIAL — 柱 3：双窗异步交接
+dualwin-readypair-impl-12022 | # PARTIAL — 柱 3 双窗异步
+dualwin-serial-cut-land | 记录每轮完整 stderr（`TP5_MTP_ASYNC_PROTOCOL` 和每窗口 `TP5_GATE_METRICS`）、退出码、每 token 及 logits 原始位模式、请求→窗口映射、wire counters、跨窗口
+dualwin-service-throughput-proof-rx | 2. 对每轮每窗校验退出成功、请求与窗口对应关系、token 序列及所有完整 f32 logits 逐字节一致，并检查状态清理及现有 relay/wire 不变量。任一失�
+dualwin-service-throughput-proof |  apply-check on clean `f1c5faf` PASS — VERIFY.txt §1).
+dualwin-svc-k6-steady | # 柱3 双窗长驻服务 — PARTIAL
+dualwin-true-async-overlap | 本 patch 的 overlay `tq-tp5-compose` 路径有有限 K 次固定 CLI prompt 的进程内循环；不是能持续接收外部请求的 server。没有真实 server 对接，不能将该循�
+dualwin-waste-combo-land-12022 | `f1c5faf` (forward + reverse apply-checks PASS; §4), but the fork and overlay
+dualwin-window-id-plumb | # 13022 验收手册 — 阻塞 / PARTIAL
+dup-compute-site-cut-12022 | 互斥/无关：与 GGML_TP5_MOE_FUSE_N3（NO-PROMOTE）无任何重叠；
+dupcut-13022 | - **状态（08:12 JST 更新）：已推送、BUILD_OK，排队 #9**（见下方 BUILD 一节）。原文：PLACEHOLDER，未推送、未构建。推送 ssh 两次被 Auto-review 拦（分�
+dupcut-router-closure-count | - 记录前序 A/B/D 各自 hit、router closure hit、逐位结果和耗时；所有目标站点 hit>0、正确性及目标 workload 通过后方可 SHIP。计数器不证明性能收益，
+dupcut-router-hit-gt0 | **PARTIAL**：已增加按 router FFN 层归因的 host 图重建计数；尚未证明真实 32×2 路径 hit>0，也未证明 13022 逐位或性能。条件性模拟依赖虚构的已验证
+dupcut-sites-round2-rx | # 13022 验收手册（PARTIAL）
+dupcut-sites-round2 | 互斥/无关：与 GGML_TP5_MOE_FUSE_N3（NO-PROMOTE）无任何重叠；
+dupcut2-compile-land | # 13022 ROCm 验收（PARTIAL，禁止 promote）
+dupcut2-offstock-fix-12022 | 本刀 `src/ggml/src/ggml-backend-meta.cpp:2175` 将多行 owner/late-join 前置条件收拢到 DUPCUT2 exact `1`，`2381` 将多行融合别名扫描同样限制于该门；`src/src/models
+dwasync-pw-13022 | - **状态：BUILD_OK（23:01Z / 08:01 JST）**，等前序车道放锁。原：gpu.sh pid 1808879（kunweiz）先轮询 BUILD_OK/BUILD_FAIL/CANCEL；有 BUILD_OK 后等 1622677/1623447（la
+dwasync-rp-13022 | ## 结果（11:22 JST（02:22Z） 收口）— **NO-PROMOTE（逐位 PASS，但 READY_PAIR=1 稳态反而慢 ~1%）**
+dwcombo-dump-order-fix-12022 | `f1c5faf` (forward + reverse apply-checks PASS; §4), but the fork and overlay
+dwcombo-ov-13022 | ## 范围裁剪（按父令"勿与已 NO-PROMOTE 的 courier/dup-cut 混重烧"+ 初始禁令"不排 dualwin-dc8"）
+dwcombo-ov2-13022 | - **判定：稳定性/正确性 PASS（shutdown 修复可以合入）；combo overlay 本身 NO-PROMOTE（稳态零收益 + 冷启 enqueue hold 回退）**。如果 12022 要继续：冷启
+dwcombo-overlay-fork-unify | # 13022 交接与验收（当前 PARTIAL，先修后测）
+eightlru-epoch-cover-12022 | # REPORT: 8-LRU relay frame cache — v3 pointer-safe key review, fail-closed direct-only revision (PARTIAL)
+eightlru-epoch-fullcover-12022 | Independently verified by this worker: `git apply --check` PASS on a
+eightlru-v25-land-clean-12022 | - 上轮比例参照：warm TTFT ≈ OFF 的 3.9x（无新回退即 PASS）。
+eightlru-v3-pointerfree | 验收：所有请求 rc=0、无 SEGV；OFF 与 stock 逐位一致，V2、V3 与 OFF 576/576 一致；V3 观察到真实 hit、miss、逐出和之后的复用，capture=replay=0；记录延�
+eightlru-v3-segv-fix | **PARTIAL：补丁和静态检查完成，13022 实烧未完成，不能宣称 V3 可 promote。** 柱1/柱4 union 复用的实质推进：V3 不再绕过 8 槽选择，而与 V2 共用 poin
+entry-once2-service-glue-12022 | # ENTRY_PREWARM once2 / TP5_ONCE2_SERVICE_ROUNDS — final PARTIAL report (2026-10-28)
+entry-prewarm-once-land-12022 | **PASS / PROMOTE（作为默认关的 opt-in flag 晋升；不宣称墙钟/TTFT 提速）。**
+fa-checked-tail-hip-impl-12022 | # 13022 计划：PARTIAL，禁止晋级
+fa-nkv-checked-tail-impl | # 13022 验收步骤（当前 PARTIAL，不可晋级）
+factor-compose-13022 | **结论：PASS**（CPU / ASan+UBSan / HIP gfx1030 三套构建，全部 0 failed checks）。不宣称任何加速，本 GATE 只证正确性和结构。
+factor-compose |  - *Expected Gate Action*: **PASS** (small numerical rounding drift).
+factor-compose2 |  -> RESULT: [PASS] Strict Numerical Parity Confirmed!
+factor-compose3 | **Status: INCOMPLETE / PARTIAL IMPLEMENTATION**
+factor-prefab-push | Dir: $E/mtp-nkv-param-20261027 Status: PARAM_MICRO_PASS (CPU + 1x RX6800 ggml-HIP micro + raw-HIP relay mock). NOT in TP5, NOT promoted.
+factor-prefab-residual-12022 | ## Status: INCOMPLETE / PARTIAL (Unverified)
+factor-prefab |  * Output Logits Max Absolute Diff : 0.00e+00 (Parity PASS)
+gdn-concat-unstraddle-12022 | # GATE: gdn-hip-port (12022 PARTIAL) → HIP build + short correctness gate on 13022, 2026-10-28
+gdn-fma-13022 | Consistent with the ISA proof: FMA_ALIGN changes nothing. Verdict on patch6 as delivered: **FAIL (ineffective flag)**; real discriminant = fa2 legs.
+gdn-fuse-gate-13022 | **Verdict: PASS (bitwise)**
+gdn-fuse-n3-bitwise-fix-12022 | **Verdict: NO-PROMOTE (FUSE_N3 / UNSTRADDLE)** — bitwise-or-FAIL gate, fail-closed.
+gdn-fuse-n3-fma-align-12022 | Prior gates: hip-view (2026-10-28 11:26–11:37Z) **NO-PROMOTE** (L3 == R3_OLD bitwise; vs
+gdn-fuse-n3-hip-view-12022 | - GATE verdict: NO-PROMOTE; L3_N3 fails bitwise, `L3_RELAX` (the *broader*
+gdn-fuse-n3-silu-split-12022 | ## Verdict: **NO-PROMOTE.** The narrowed handler runs correctly on device: rc0, no assert. L3 is still == R3_OLD bitwise, with the same drift as before. As expected, this patch is not a fix.
+gdn-helper-13022 | ## Verdict: **NO-PROMOTE** (FUSE_N3 / UNSTRADDLE)
+gdn-helper-define-12022 | - GATE.md quantitative results (build PASS, 16/16 token equality, KL, dispatch census) are
+gdn-helper-define-nv-12022 | - GATE.md quantitative results (build PASS, 16/16 token equality, KL, dispatch census) are
+gdn-helper-hip-wire-12022 | - **控制流 scenario 测试**（`/tmp/ghw-flow-test.cpp`，20/20 PASS，rc=0）：以真实 ggml 图复刻 `build_conv_state_at` 控制流（state_cols=4, channels=2, n_tokens=3 → 3 slot
+gdn-hip-13022 | # GATE: gdn-hip-port (12022 PARTIAL) → HIP build + short correctness gate on 13022, 2026-10-28
+gdn-hip-fallback-clean-12022 | # GATE: gdn-hip-port (12022 PARTIAL) → HIP build + short correctness gate on 13022, 2026-10-28
+gdn-hipview-13022 | ## Verdict: **NO-PROMOTE.** The narrowed handler runs correctly on device: rc0, no assert. L3 is still == R3_OLD bitwise, with the same drift as before. As expected, this patch is not a fix.
+gdn-nanfix-13022 | ## Verdict: **fail-closed guard PASS. NO-PROMOTE FUSE_N3 (the L3 coarse bug is unchanged).**
+gdn-nosilu-13022 | ## Verdict: **NO-PROMOTE. Suspect ① (fused silu vs standalone silu numerics) is ruled out.**
+gdn-silu-concat |  - Max diff vs actual CUDA reference: `0.000000e+00` (**PASS**).
+gdn-silu-concat2 | ## 状态：部分验证（PARTIAL / CONDITIONAL）
+gdn-src2-13022 | ## Verdict: **NO-PROMOTE. As written, src2 aborts L3 (over-strict assert). With the assert relaxed, L3 == the old coarse result bitwise. The meta split-state hypothesis is ruled out.**
+gdn-ssm-conv-src2-12022 | | L2_REF/L2_INV | bitwise PASS |
+gdn-unstraddle-nan-fix-12022 | # GATE — gdn-unstraddle-nan-fix (12022) PARTIAL
+graph-union-prereq-land-12022 | **Status: research COMPLETE; U4 ggml-side partial delivered by the implementation agent (475-line patch over baseline `f1c5faf`, statically verified only). Verdict: PARTIAL. U3/libllama side
+hc-fuse-meta-reach-12022 | | **Exclusion of MoE** | `patch.diff` must contain 0 MoE / SITE-05 changes | **PASSED** | Automated scan: 0 occurrences of `topk_moe`, `moe_fuse`, `is_topk_moe`, `topk-moe`. |
+hc-fuse-meta-reach-nv-12022 | | **Exclusion of MoE** | `patch.diff` must contain 0 MoE / SITE-05 changes | **PASSED** | Automated scan: 0 occurrences of `topk_moe`, `moe_fuse`, `is_topk_moe`, `topk-moe`. |
+hc-meta-B3-13022 | - **判定：PASS（latejoin-fix 修复成立）**
+hc-meta-fb4-13022 | | FB4_OFF | owner 关 | 0 | 250.6 | **== DENSE3 / PFX_OFF 320/320 bitwise**（flag-off 回归 PASS） |
+hc-meta-latejoin-fix-12022 |  backend_ctx->relay_i->abort(backend_ctx->relay, GGML_STATUS_FAILED); // 3514
+hc-meta-n23-13022 | ## Verdict: **HARVEST-FAIL / NO-PROMOTE. This is a harness bug, not a kernel verdict.** The patch is neither validated nor refuted.
+hc-meta-n23-overturn-12022 | # Meta HC owner-plan 行泛化（N=1..3）补丁 — 交付报告（状态：PARTIAL）
+hc-meta-owner-offsets-fix-12022 | verification, closed as PARTIAL-OK.
+hc-meta-owner-prefill-fb-12022 | ORIGINAL fail-closed behavior (relay abort + `GGML_STATUS_FAILED` for a non-qualifying graph),
+hc-meta-owner-scope-13022 | ## Verdict: **owner-scope fix WORKS (cause 4 resolved). Still HARVEST-FAIL / NO-PROMOTE: hit a new 5th cause by design. The 8 owner legs did not run (preflight gate).**
+hc-meta-prefill-fb-13022 | ## Step 1: PREFLIGHT_PF (patch of record as delivered, FALLBACK=1): **FAIL rc1** (100.8 s)
+hc-meta-prefill-fb-emptypair-12022 |  use-count, duplicate owner domains): relay abort + `GGML_STATUS_FAILED`,
+hc-multirow-fuse-12022 | # SITE-05 REPORT — Top-K MoE Fusion for N=2..3 (PARTIAL, UNVERIFIED)
+hc-owner-scope-target-12022 | **HARVEST-FAIL / NO-PROMOTE** (harness + design gate, not a kernel verdict). The
+hc-owner-tail4-rows23-12022 | > **Status: FINAL — IMPLEMENTATION LANDED, REVIEW PASS, ACCEPTANCE PARTIAL.**
+hc-router-draft-scope-extend | # 13022 RUNBOOK — PARTIAL，不可作为 SCOPE2 验收
+hc-router-owner-draft-scope-12022 | 4. post.sh/analyze.py 照常收 counters；`owner_plan_FAILED`、`abort` 必须
+hc-router-owner-draft-scope | 4. post.sh/analyze.py 照常收 counters；`owner_plan_FAILED`、`abort` 必须
+hybrid-actual-kv |  [PASS] Failed context status returns 0: got=0 expected=0
+hybrid-akv-perf | 1. **Patch 清洁度验证**：`git apply --check --reverse patch.diff`（PASS，返回码 0）；
+hybrid-akv-tp5 | **结论：数值 PASS（bitwise），接线生效；PERF REGRESSION 未关闭（akv32x2 端到端约慢 14 倍，归因未定）。**
+latebind-bindrate-boost-12022 |  `KL > 0`, it is a FAIL, full stop. Reporting `0 < KL ≤ ε` as "soft
+latebind-bindrate-open-v2 | 本刀 PARTIAL、无新增提升路径；不要默认启用 D_ON。构建与运行在 13022 独立环境执行，固定模型、参数、seed、硬件、并发和请求顺序；锁定 GPU，
+latebind-bindrate-open | 本交付为 PARTIAL：只有 281L 复用与新增分桶，没有 281L 以上的 boost；不要将此补丁标记为 bindrate uplift 或默认开门。下述用于建立可比基线和确定
+latebind-boundaries-12022 | ### Site 3 — KV/RS ring slot wait/bind: **BLOCKED, empty patch**
+latebind-default-on-land-12022 | stop compiling, go static. Static tool of record (PASSED this session, exit 0,
+latebind-defer-default-compose | 当前候选不含真 DEFER，不能验收 DEFER_ON，也不是 don-fix 的完整组合；先修复并审核这些缺口，再将本手册作为完整候选验收方案。可用当前 patch 
+latebind-defer-guard-on | 当前补丁没有 DEFER execute-time 绑定；不要把 DEFER=1 的普通 graph reuse 当成 DEFER 命中。先实现安全的真实延迟绑定及独立 exact `"1"` 门，再执行以下�
+latebind-don-13022 | stop compiling, go static. Static tool of record (PASSED this session, exit 0,
+latebind-don-dw-compose | # RUNBOOK — 13022 四腿：PARTIAL 候选，不得直接 promote
+latebind-don-fullaccept-fix | 逐 window 记录 `prefetch`, `bind`, `bind_accept`, `reuse_kept`, `discard_mismatch`, `discard_replay`, `discard_bindsite`, `discard_guard` 及 guard 七分桶（token/trim/valid/row/pos/ou
+latebind-don-guard-fullaccept-safe-12022 | # 柱 2 LateBind / DON：PARTIAL，待 13022 长驻服务验证
+latebind-don-selfcheck-move | 另用 pristine stock 同配置同序列长驻服务生成参考，先比较每个 OFF 与 stock，再比较每对 OFF/ON；报告全部元素数、首个差异、rc，不能只比较 top1�
+latebind-donfix-13022 | - gpu.sh（kunweiz，setsid）：只靠双 flock 排队；腿 D_ON_i（全 unset=默认开）→ D_OFF_i（=0）×3 交替，ON 在前，D_ON_1 rc≠0 就提前停。K=5 predict 32，DRAFT1+
+latebind-dump-h10-port-12022 |  `(window, request, pos, token)`; **PASS iff every pair: residual blocks
+latebind-guard-ldl-fix-12022 | - Static verification tool of record (PASSED this session, exit 0, ~4s):
+latebind-lbr-13022 | ## 判定：**正确性 PASS / NO-PROMOTE（复用从未发生，bind_accept=0）**
+latebind-ldl-13022 | ## 判定：**PASS——生产帧下 guard 修复成立，可以 promote（knob 默认关）**
+latebind-long-13022 | ## 结果（11:22 JST（02:22Z） 收口）— **PASS（LateBind REUSE_ACCEPT predict128 稳态 decode −12.4%）**
+latebind-open-smoke-13022 | # latebind-open-smoke (13022) — **DONE 22:50:49Z (07:50 JST) → PASS：建议 REUSE_ACCEPT=1 默认开**，愿景柱 (2) LateBind 可开
+latebind-pforder-13022 | - **注意**：12022 RUNBOOK 写"apply 到 stock zd 066225f3"是错的——patch.diff 是在 281L ldl post（f53ff1cf）上的增量；对 zd 打会 3/5 hunk FAIL；对 ldl src 打 clean，
+latebind-pos99-logits-soft | # 13022 接力与验收：PARTIAL，尚不可烧软同步性能结论
+latebind-prefetch-export-order-12022 | - 静态验证工具（本 session PASSED，exit 0，~4.7s）：
+latebind-reuse-accept-harden | # 柱2 LateBind：PARTIAL
+latebind-site2-13022 | ## Verdict: **Correctness PASS (bitwise). The default-off flag is safe to land. NO speedup (NO-PROMOTE for perf).**
+latebind-site2-dump-ctr-12022 | 17/17 checks PASS — magic bytes spell `LBD1`, header 48 bytes, path at
+latebind-site2-hip-prep-12022 | # GATE — latebind-site2-hip-prep (12022) PARTIAL
+latebind-site2-zero-oh-12022 | **Role:** independent verification and ownership of the LateBind Site 2 patch (`patch.diff` at the worktree root — corrected final revision, see §2/§4), off-path overhead and bitwise ris
+latebind-state-only-prefetch-12022 | # 柱2 late-bind / DON：PARTIAL
+latebind-true-defer-bind-rx | # 13022 RUNBOOK — PARTIAL，禁止把第三腿视作 DEFER 验收
+latebind-true-defer-bind | exit 124 = 超 3 分钟去优化编译本身）。静态工具（本会话已 PASS，exit 0）：
+latebind-verdict-reuse-land-12022 | - Static verification tool of record (already PASSED on the final image, exit 0):
+latebind-verdict-reuse-land | - Static verification tool of record (already PASSED on the final image, exit 0):
+latebind-zoh-dump-13022 | ## Verdict: **PASS: bitwise, and the dump residuals match.** Correctness only. No speed claim.
+lb1-verify-token | $$\text{Status}(\tilde{p}) \ne \text{BOUND} \text{ at entry to } \text{Dep} \implies \text{ABORT / FAIL-CLOSED}$$
+longlegs-13022 | | A qsa 跨桶 rebind-on-hit | **PARTIAL** | draft 角色观察到 binds>place_env（4>2、3>2），跨 256→512 桶，bitwise。target 角色在 32×2 内 n_kv 始终是 1024，没有跨�
+m2-layer-scope-fix | ## 3. Why set_output on probs/weights/ids is REJECTED Forever
+m3-fused-tail-slow-fix-12022 | **NO-PROMOTE.** The 13022 gate evidence (a *different implementation* of the
+m3-hc-klgate-prep | * **Status on Host 13022:** The unit-level M3 micro-benchmark on host `13022` has **already PASSED** in candidate directory `mtp-hc-n3-trio-m3-20261027`.
+m3-hc-n3-code | * **Status on Host 13022:** The unit-level M3 micro-benchmark on host `13022` has **already PASSED** in candidate directory/branch `mtp-hc-n3-trio-m3-20261027`.
+m3-hc-n3-trio-13022 | **中文结论：HIP 正确性闸门 PASS（default-off 为真 no-op，gate-on 软闸通过，且与已测 M3 逐位一致）。不 PROMOTE**：模型内 decode 稳态看不出收益（噪�
+m3-rows-kernel-land-12022 | | **Exclusion of MoE** | `patch.diff` must contain 0 MoE / SITE-05 changes | **PASSED** | Automated scan: 0 occurrences of `topk_moe`, `moe_fuse`, `is_topk_moe`, `topk-moe`. |
+m3-rows-kernel-land-nv-12022 | | **Exclusion of MoE** | `patch.diff` must contain 0 MoE / SITE-05 changes | **PASSED** | Automated scan: 0 occurrences of `topk_moe`, `moe_fuse`, `is_topk_moe`, `topk-moe`. |
+m3-rows3-event-timer-12022 | # REPORT — 13022 rows3 HIP gate：event 计时交付评估（**PARTIAL：无 rows3 事件计时交付**）
+m3-rows3-timer-sync-prep-12022 | # GATE — m3-rows3-timer-sync-prep (12022) PARTIAL
+m3-rows3-timer-sync-prep | **Step 6 — exact numerical gate criteria** (all must pass for PROMOTE; any failure =
+m3-tail-alias-13022 | **判定：NO-PROMOTE。** 机制 PASS（tail alias 已被推翻），正确性软闸 PASS（没有 bug），但稳态没有收益。
+m3-tail-alias-code-12022 | - PASS 也不自动 PROMOTE，由 13022 裁决 land。
+m3-tail-alloc-13022 | - Verdict: soft gate PASS on numerics (no NaN, OFF bitwise, drift toward N1); req0 near-tie flip noted, not hidden.
+m3-tail-noop-reject | - **Status:** **PASS** under `TP5_HC_N3_TRIO=1`.
+m4a-fixed-n3-static |  - **Fail-Closed Prerequisite:** If safe padding and recurrent/KV state rollback cannot be proven supported by the underlying engine, the runtime **MUST FAIL CLOSED** at initialization.
+max-footprint-arena-land-12022 |  41 PASS via 19 `check()` sites across 2 scenarios (default-off spelling
+max-footprint-buf-share-12022 |  3 × 7 = 21/21 PASS (union-callers-wire REPORT §5:112 enumerates six off
+max-footprint-c3-land-12022 | Date: 2026-10-28. Status: **BLOCKED — no patch, no patch.diff.** See REPORT.md for the
+max-footprint-place-proof-12022 | python3 inputs/max-footprint-arena-land-12022/mock_union_reserve.py # rc=0, 39 [PASS] lines this session
+max-footprint-share-live-12022 |  尺寸 < max(pp,tg) = FAIL。
+maxfp-perwin-gate-land | 3. 每臂相同模型、确定性请求和调度，覆盖两窗交错、多轮请求和 shape 切换；保留命令、二进制/模型哈希、退出码、完整日志、每窗每 token 的�
+maxfp-share-13022 | ## 结果（11:22 JST（02:22Z） 收口）— **PASS（门全过）/ 本帧收益 ≈0 → 正确性可 land，内存收益 NO-PROMOTE 依据不足**
+moe-n2-fusion-12022 | # SITE-05 REPORT — Top-K MoE Fusion for N=2..3 (PARTIAL, UNVERIFIED)
+moe-n2-fusion-13022 | # GATE：moe-n2-fusion（12022 SITE-05，PARTIAL）→ 13022 HIP 构建 + 短正确性门，2026-10-28
+mtp-hc-replicated-static | **Kill plan** (in `REPORT.md` §4, implemented as `patch.diff` sketch, uncompiled per house rules): delete `llama_hc_replicated_compute_enabled` (slice:5–21), delete the mirrored branch in
+n1n3-entry-prewarm-once-13022 | **PASS / PROMOTE（作为默认关的 opt-in flag 晋升；不宣称墙钟/TTFT 提速）。**
+n1n3-entry-prewarm-once | **PASS / PROMOTE（作为默认关的 opt-in flag 晋升；不宣称墙钟/TTFT 提速）。**
+n1n3-rebuild-13022 | **PASS（重建消除 / 正确性）——不宣称提速。**
+nkv-abi-13022 | - **object swap 本身 PASS**：未整库重建，OFF/JUNK 与 B8 逐位相同 → 零布局头文件 + side table 的 ABI 主张在 13022 成立；exact "1" 门控 OK。
+nkv-abi2-13022 | - **OFF 回归 PASS**（rc0，== B8 逐位）→ 服务可重启；JUNK ≡ OFF，exact "1" 门控 OK。
+nkv-abi3-13022 | - ❌ **NKV_BINDER_STATS 没有出现**（进程没走到 teardown），applied/fallbacks 无法核验 → 验收不过 → **NO-PROMOTE**。
+nkv-abi4-13022 | ## 判定：**稳定性/正确性 PASS（正式版复现了 abi3b 探针，coarse 全部关闭）；覆盖率 NO-PROMOTE（fallbacks≠0，RUNBOOK §4 不满足）**
+nkv-abi5-13022 | - 远端 /home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-nkv-abi5-20261029/patch/gpu.sh（pid 1623460）在等 BUILD_OK/BUILD_FAIL/CANCEL；到�
+nkv-akv-stack | - libllama `af1a0654818d`：用 nkv 的 link-llama-u 配方，只换掉 llama-context.o。源码是 nkv gpu-src，先打 `apply_akv.py llama`（非 union 路径），再打 `apply_stack.py`�
+nkv-bind-r8r9 | 2. **r9 阻断**：`graph_union_nkv_bind:2042 r9` 即 `NKV_RELAYOUT_FAIL sched r4`（`ggml_backend_sched_union_relayout` 第 4 处 `return false`，11 次）。
+nkv-binder-slots-general | # 13022 验收手册 — PARTIAL，禁止晋级
+nkv-coverage-fix | > **PARTIAL / NO-SHIP。** 当前补丁尚未修复 ctx3/4 覆盖率，不能宣称达到 `fallbacks==0`。正式验收要求：先烧 NKV，rc0 后再烧 BOTH，OFF/B8 复用 abi3；两腿�
+nkv-ctx12-arm-or-exclude | 5. 若 rc、逐位输出或目标统计失败，保留日志并标记 NO-PROMOTE。即使以上通过，也只证明排除路径，不证明真变长或复合缓存可安全武装。
+nkv-fa-checked-tail-kernel-rx | # 13022 RUNBOOK — PARTIAL，不可验收或推广
+nkv-fa-checked-tail-kernel | **当前补丁只有前序基线，没有 `GGML_TP5_FA_RTLEN` 实现；不得以此启动目标 ON 烧测或判 SHIP。** 完整实现及逐位采集工具落地后，按以下协议执行�
+nkv-fa-runtime-len-mock | PARTIAL：现有 `patch.diff` 仅为 1400 行基线，不含 `GGML_TP5_FA_RTLEN` 实现；**不可按本次目标报通过**。先实现并审计真正的 runtime-kv_len 增量，生成累�
+nkv-fa-runtime-mock-12022 | | R1 | `./nkv_union_mock` (flag unset) | 0 | math PASS; stock parity PASS, nan_reads=0; union path correctly N/A |
+nkv-fa-runtime-ne-bind | # 13022：当前包为 PARTIAL，不是运行时 FA 候选
+nkv-getrows-oob-fix-12022 | - **OFF 回归 PASS**（rc0，== B8 逐位）→ 服务可重启；JUNK ≡ OFF，exact "1" 门控 OK。
+nkv-padded-envelope-opt-12022 |  PASS (exact command and output above).
+nkv-param-13022 | Dir: $E/mtp-nkv-param-20261027 Status: PARAM_MICRO_PASS (CPU + 1x RX6800 ggml-HIP micro + raw-HIP relay mock). NOT in TP5, NOT promoted.
+nkv-qsa-rebind-13022 | **PASS（8×2 诊断门）**。target union 命中恢复到和 ctl 完全一样：w0 235/240，w1 368/373；relay hit 603/613。binds>0，NKV_FAIL 为 0，r8/r9 都没有失败。三对两�
+nkv-qsa-rebind | - **核心逻辑隔离 Smoke 测试**：使用从实际源码提取的 class 逻辑配合隔离最小桩环境，对 cap 2048→1024 下调、后续 `can_reuse` 命中、1280 动态重绑、
+nkv-r8r9-binds | - fix 腿：`NKV_FAIL` 0 条，包括 r8 和 r9。
+nkv-skel-true-param-rx | 本交付是 PARTIAL，patch.diff 仅为 1400 行基线，不包含 GGML_TP5_NKV_FIXED_TOPO 实现。下面是实现完成后的验收流程，当前不得作为 FIXED_TOPO 烧测结果或�
+nkv-skel-true-param | # 13022 验收运行手册 — 当前 PARTIAL，禁止晋级
+nkv-union-coarse-shape | # 13022 验收流程（PARTIAL，禁止作为已完成方案烧录）
+nout-execute-param-wire-12022 | # PARTIAL — 柱 1 n_outputs 执行接线未完成
+nout-rsz-param-scaffold-12022 | | `./nkv_mock` self-test | **PASS** |
+nout-runtime-param-land-rx | # 13022 NKV + NOUT 验收（当前补丁为 PARTIAL，不可晋级）
+nout-runtime-param-land | **当前 PARTIAL：不要将本目录 patch 当成 NOUT 完成版送烧。** 当前补丁没有 `GGML_TP5_NOUT_RT`，旧 NOUT 门也不能达到本验收。以下是实现修复后的交付�
+nout-true-runtime-param | # 13022 后续计划（PARTIAL，禁止当完成版烧测）
+once2-round-cleanup-12022 | # once2-round-cleanup — REPORT (PARTIAL)
+once2-service-k4-13022 | **Verdict: PASS (correctness / fallback evidence only). No steady speedup. ENTRY stays default-off.**
+once2-service-k4-prep-12022 | # once2-service-k4-prep — BLOCKED
+once2-service-k4-prep-nv-12022 | # once2 same-process admission preparation — PARTIAL
+prefab-ab-compose-land-12022 | - AKV rebind lane: excluded; its hunks fail `git apply --check` on HEAD at `src/llama-context.cpp:1941` (hooks into `graph_union_nkv_bind`/`NKV_FAIL`/`p.nkv_cap`, none of which exist at HEAD
+prefab-ab-compose-wire | # 13022 运行手册 — PARTIAL，禁止作为 MTP compose SHIP 烧机
+prefab-ab-factor-mtp-rx | # PARTIAL：13022 验收说明
+prefab-ab-factor-mtp | # 13022 验收手册 — 当前 PARTIAL，禁止判 SHIP
+prefab-attn-nkv | **STATUS: PARTIAL** — environment staged and ready for review; the ATTN `n_kv` parameterization change is NOT included in the delivered patch, and a fully linked test binary was not produc
+prefab-attn-nkv2-12022 | **STATUS: PARTIAL.** The patch exists but is **not verified and not safe to
+prefab-attn-nkv3-12022 | **STATUS: PARTIAL.** The patch exists but is **not verified and not safe to
+prefab-nkv-pad-land-12022 | **状态：PARTIAL。** 脚本、补丁与分析器已交付并在合成数据上验证；但**无模型数值证明**（未做真实模型推理）且**零开销未证明**（未做构建/�
+prefab-nkv3-gate-prep-12022 | **STATUS: PARTIAL — static analysis only.** No builds, tests, or compiler runs.
+prefab-nkv3-gate-prep-nv-12022 | **STATUS: PARTIAL — static analysis only.** No builds, tests, or compiler runs.
+pwcold-13022 | ## 正确性：全 PASS（bitwise）
+pwdraft-cold-amortize-land-12022 | **⚠ This runbook does NOT provide executable candidate-gate commands. See §1 STOP
+pwdraft-first-tax-12022 | ## Status: PARTIAL (static-only; attribution of the ~13s figure not fully established)
+pwdraft-first-tax-cut-12022 | **Ticket status: PARTIAL.** (a) Zero-overhead-literal is not met — a runtime env gate costs one `getenv` + one `strcmp`; (b) no runtime smoke and no HIP measurement were possible in this s
+pwdraft-multireq-13022 | 评估口径：**长驻服务进程**，同一进程内串行处理多轮请求（`TP5_SERVICE_ROUNDS=K`，每轮 2 窗口 × 32 token，轮间 barrier + sync + 两份 memory clear）。一�
+pwdraft-ttft-13022 | ## 总判定：**FAIL（不 PROMOTE）**
+pwdraft-worker-pass-wire-12022 | Date: 2026-10-28 · Baseline: engine HEAD `f1c5faf` (master), overlay runtime tracked-clean · Status: **PARTIAL**
+q2-down-t3-code | Per the Ashley standing rule, soft gating is reserved exclusively for small numerical tolerances (such as low-order float associative accumulation drift). Any structural failure, misconfigur
+quantize-fuse-n3-code | At a measured launch pacing cost of $2.4\text{--}3.2\,\mu\text{s}$ per node (`mtp-critical-chain-20261026/dispatch-pacing-fit.json`), eliminating up to 291 standalone quantization dispatches
+readypair-cold-dig | **状态：DIAG_ONLY_PASS — 4 条 8x2 全 rc0，numerics 全 bitwise。没有重建，没有改 selected，没有跑 nkv/akv 冷对比。**
+relay-8lru-flag-12022 | ## 总判定：**CONDITIONAL（机制有效，但不能按现状 PROMOTE）**
+relay-prewarm-api |  - **Resolution**: Spawned both a concurrent CPU reducer pump and an active execution watchdog thread *before* calling `ggml_backend_graph_compute`. If compute hangs or fails to return withi
+relay-union-keymiss | - **用例 1: `real_ver32x2_history_zero_checks`**：使用 `summary.json` 中保存的真实 `ver32x2` relay 统计行（`verify_checks=0`）→ **FAIL (Expected, 成功拦截空跑假阳�
+rows3-dispatch-sync-port-12022 | - The documented 13022 `git apply --check` PASS + BUILD_OK is **authentic only for the 13022
+rs-z-runtime-param | # 13022 交接与验收：PARTIAL / 当前禁止烧机
+rsz-execute-param-wire-12022 | # 13022 交接：PARTIAL，禁止烧生产
+rsz-runtime-param-scaffold-12022 | PASS
+rsz-true-runtime-param | # 13022 交接：PARTIAL，禁止晋级
+sched-union-relayout-land-12022 | # GATE — sched-union-relayout-land (12022) PARTIAL
+serial-cut-real-eliminate | # 13022 双窗长驻服务验证 — PARTIAL，尚未执行
+shape-churn-compose-12022 | - **Gate smoke test:** the exact-1 env-gate semantics of `llama-prefab-env.h` were compiled and exercised in a standalone binary against the real header — 7 cases (unset, `"0"`, `"true"`, 
+site-next-quant-row-12022 | **Target Status:** **PARTIAL** (Documented Blocker & Static Architectural Analysis) 
+site-next-quant-row-nv-12022 | # Next quantization site — PARTIAL
+soft-gate-playbook | * **Rule B (Coarse Error Rejection):** Bugs, wrong implementations, coarse/gross errors (NaN/Inf, wrong shapes, silent no-op fusions, broken reductions, top-1 collapse from bad code, data ra
+u1-meta-containers | Dir: $E/mtp-union-shape-cache-20261027/meta-containers Status: U1_IMPL_MICRO_PASS (CPU only). NOT in TP5, NOT promoted.
+u2-sched-shells | Dir: $E/mtp-union-shape-cache-20261027/scheduler-u2 Status: U2_IMPL_MICRO_PASS (CPU only). NOT in TP5, NOT promoted.
+u3-llama-lru | Dir: $E/mtp-union-shape-cache-20261027/llama-u3 Status: U3_IMPL_MICRO_PASS (CPU only). NOT in TP5, NOT promoted.
+u4-union-13022 | Dir: $E/mtp-union-shape-cache-20261027/relay-u4 Status: U4_IMPL_STATIC_MICRO_PASS (CPU micro + HIP compile only). NOT in TP5, NOT promoted.
+u5-abort-reset-unblock-12022 | failures, ALL TESTS PASSED, exit 0**. Log: `tests/test_abort_reset_unblock.log`.
+u5-admit-13022 | **正确性：PASS（bitwise）**——U5_ON/OFF/JUNK/B8 两两 18/18 tok、576/576 logits bitwise；各 leg self_repeat 全 bitwise。
+u5-blocker-audit | [Test 1] Null fail-closed safety checks... PASSED
+u5-draft-prewarm-13022 | ## 结论：**PASS（req1 的 draft catch-up 冷账全部挪出 TTFT，req1 ≈ 稳态；逐位 = ctlE）——稳态不提速，不 PROMOTE 为“提速”**
+u5-drop-hr-13022 | ## 结果（11:22 JST（02:22Z） 收口）— **PASS**
+u5-drop-stc-static-headroom-12022 | rle3 GATE 已三腿全 PASS；本轮只删了一段 default-off 的死门，行为面唯一变化是 `GGML_TP5_STC_STATIC_HEADROOM=1` 变 no-op（从未是任何腿的配置）。故只需�
+u5-fix-abort | #include <thread> required before std::this_thread::sleep_for in relay.hip reset drain loop; 13022 hipcc PASS after add (gfx1030).
+u5-fix-gf-pin |  >>> ALL REAL PRODUCTION API MOCK INTEGRATION TESTS PASSED! <<<
+u5-fix-gf-res |  当所有槽位被显式 Pinning 占满且新形状请求到来时，`llama_graph_slots_find_eviction_target` 返回 `-1`，安全拒绝并返回 `nullptr`（映射为 `GGML_STATUS_ALLOC_FA
+u5-fix-n4 |  - **真实校验**：在独立的 worktree 中执行 `git apply --check patch-only.diff` 对比 commit `1a3e511`，校验结果通过（输出 `APPLY_CHECK_PASSED`，退出码 0，无任何
+u5-integrate-13022 | **结论：PARTIAL。**
+u5-kv-isolation-unblock-12022 | # expect: 16/16 PASS, "ALL PASS: TP5_U5_PREWARM_DRAFT gate is exact-\"1\", default-off"
+u5-multireq-13022 | ## 结论：**PASS（跨请求命中 + 正确性）——不宣称提速**
+u5-objnew-pool-locate-nv-12022 | ## 3. GPU gate 腿（只重烧 U5_OFF / U5_RL / U5_ON；PW/JUNK 上两轮已 PASS 不重烧）
+u5-prewarm-n3n2-13022 | ## 结论：**PASS（target 侧 req1/req2 冷账全部挪到 load + 逐位正确）——不宣称提速**
+u5-rc9-multireq-diag-12022 | **结论：首个真实图命中 prewarm 帧，已证（PASS）；在 v3b 下与 ctl 逐位一致（PASS）；不宣称 wall 提速。**
+u5-rle-13022 | - **推翻两处 ABI 破坏**（否则要整库重建）：① llama-context.h 新成员 `bool reserve_live` → graph_reserve 内局部 const（只在该函数读）；② llama-memory.h �
+u5-rle2-13022 | ## 腿（只重烧失败腿 + OFF；PW/JUNK 上轮已 PASS 不重烧）
+u5-rle3-13022 | ## 判定：**PASS——u5 objnew 溢出修好，可以 promote（reserve-live 门内生效，OFF 和 stock 逐位一致）**
+u5-runtime-link-exec-12022 | 3. CPU mock `./reserve_live_mock` → rc=0, ALL CHECKS PASSED (5 suites: OFF
+u5-uid-align-hardening-12022 | **结论：首个真实图命中 prewarm 帧，已证（PASS）；在 v3b 下与 ctl 逐位一致（PASS）；不宣称 wall 提速。**
+u5-uid-align-hardening-nv-12022 | **结论：首个真实图命中 prewarm 帧，已证（PASS）；在 v3b 下与 ctl 逐位一致（PASS）；不宣称 wall 提速。**
+union-binder-generalize | # 13022 交付试验 runbook — PARTIAL，禁止作为正式发布
+union-callers-audit-fix | # 13022 验证计划（PARTIAL，禁止发布）
+union-callers-gate-harness-12022 | | ctl | `DRIVER=... gate --ctl` (no flags, unpatched stock) | 0 | PASS (BITWISE-OK) |
+union-callers-harness-fix-12022 | 3. **Unset env fails closed.** `DRIVER`/`MODEL` unset → explicit `FAIL: … env var required`, exit 1.
+union-callers-hip-gate-12022 | Ship: (1) `patch.diff` (sha `6057da04…`), (2) this RUNBOOK, (3) the §0 provenance table. Record that `relay.hip` has **never been compiled** in this chain (12022 REPORT §6) — the 13022
+union-callers-wire-12022 | Smoke-verified gate matrix this session (fresh process per case, verbatim landed gate bodies): for each of the three gates, values `(unset)/"0"/" 1"/"1 "/"01"/"true"` → **off**, only exact
+union-callers-wire-13022 | 2. 12022 adds a **default-off fault-injection flag** (e.g. `GGML_SCHED_UNION_RELAYOUT_FAIL_ONCE=1`) so the rebuild-on-relayout-fail leg can be forced.
+union-coarse-only-key-12022 | # PARTIAL：union 粗 key / 真变长未实现
+union-entry-prewarm-once-12022 | **PASS（重建消除 / 正确性）——不宣称提速。**
+union-maxfp-dualwin-perwin | # RUNBOOK — 13022 双窗验收（阻塞，PARTIAL）
+union-nkv-devparam-12022 | Default trace, `--verify`, both garbage modes — stock/binder/devscalar/padmax all **PASS**: parity YES, `nan_reads=0`, `softKL(max)=softKL(mean)=0`.
+union-nkv-hip-gate-prep-12022 | | C `on-ungated` (NEGATIVE) | `LLAMA_GRAPH_UNION_NKV_RUNTIME=1` + an ungated mechanism that lets EXACT (unpadded) n_kv reach the graph | must DETECT: parity vs leg A breaks (bitwise NO), mir
+union-nkv-runtime-param-12022 | **Status: PARTIAL** — patch generation, clean-baseline apply, and single-object compile verified this lane; no real inference, no model load, no runtime behavior exercise.
+union-stack-apply-recipe-12022 | | akv-nkv-bind-symbols-12022 (PE) | `inputs/akv-union-lru-bind-12022/.../inputs/akv-nkv-bind-symbols-12022/patch.diff` | **Empty (0 bytes, sha256 `e3b0c44298fc1c14…`).** BLOCKED by missing
+union-u4-32-13022 | **结论：PASS（bitwise）。** ctl32x2、off32x2、ver32x2、on32x2 四个用例的 logits 文件 sha256 全部是 `8035d0c2290a280e`，与 control 逐位一致；两个请求各 32 个 e
+HANDOFF-MTP-20261030 | | — | mtp-lb-promote-lctx-20261030 | 已完成 02:35 JST：PROMOTE-eligible — SWITCH PROVEN，BITWISE ALL，3 对 decode 均 ON 更快（均值 −28%，pair1 OFF 90ms/tok 离群；pair2
+binder-nout-slot-impl | # 13022 烧测与验收 — PARTIAL，禁止晋级
+binder-rsz-slot-impl | # 13022 烧机与验收：PARTIAL，禁止晋级
+courier-hit-path-impl | # 13022 验收（当前 PARTIAL）
+cuisu-fill-r8-010623-1 | | r8b 候选（前序 PARTIAL，只读） | latebind-mismatch-breaker-r8/fork | runtime 7e2b8f24… / lb-breaker.h 4c1c4690… | cp 后实测一致 |
+dualwin-courier-handoff-prod-r8 | dualwin-courier-handoff-prod-r8 PARTIAL: no net source over courier-land r7; dual-window post-completion handoff not implemented (two attempts violated contract, removed). wt runtimes revert
+dualwin-courier-hit-prove-r4 | # courier 计数分布与候选 miss 修复 — PARTIAL（静态实现，未实测）
+dualwin-courier-land-prod-r7 | PARTIAL: per-window timeout latch + stock wait fallback; host -fsyntax-only + 11 CPU harness OK; cross-window courier handoff NOT implemented — no async overlap/throughput claim; no full b
+dualwin-courier-metrics-r8 | OFF 与重建 handoff 基线比较：同模型、配置、输入及负载，记录各门，比较全部逐请求 token 和完整逐 float 字节 logits，验证请求数、窗口映射、错
+dualwin-device-wait-live-r8-021202 | 结论：设备 wait 替换 meet 屏障的**核心替代未交付**；基线 meet 屏障与全部既有真实 host 同步（relay retirement 等待、drain/draft drain 的 llama_synchronize�
+dualwin-device-wait-live-r8-022201 | 当前交付是前序累计基线，未新增移除 host fence 的实现；结论为 PARTIAL。既有 peer event wait 排在 decode 后，不能视为替代既有同步。目标消费的 log
+dualwin-device-wait-live-r8-023001 | @PARTIAL
+dualwin-device-wait-live-r8-025004 | 本次撤回不安全 draft event 改动后，相对 024501 基线无净新增源码；draft 的 host 同步仍在，设备 event 替代 host 同步的硬要求未实现，状态为 **PARTIA
+dualwin-device-wait-live-r8-025009 | - 当前交付（`patch.diff`，sha256 `fcc38f06…`）是 **PARTIAL 观测型**：净新增 = drain 边界在**专用** per-window event 上 record + 发布计数 + rendezvous 处 `plan()` 
+dualwin-device-wait-live-r8-041902 | 6. 冷启动单列；同一服务进程连续多批独立请求，每轮至少 16 稳态配对请求、至少两组 A/A 和三轮交错 OFF/ON，完整记录请求 ID、窗口、发送、完
+dualwin-device-wait-live-r8-043501 | 任一输出字节差异、串窗、错误、设备故障、死锁、超时或计数不一致为 NO-SHIP；缺授权、可追溯产物、真实长驻接口、完整 logits、命中覆盖、�
+dualwin-device-wait-live-r8-045001 | 针对 `GGML_TP5_DW_HANDOFF` 精确 `1` 的 ON 与所有 OFF 值分别启动新进程；观察 `TP5_DW_HANDOFF` 按窗口的记录、等待、保留 host sync 及 skip 计数并保留原始�
+dualwin-device-wait-live-r8-045006 | 性能另外做诊断关闭的 OFF/ON 配对与 A/A，按共同稳态墙钟统计完成量、请求延迟及诊断开销，不相加单窗速率。任何字节差异、串窗、设备错误�
+dualwin-device-wait-live-r8-050201 |  in this increment (declared PARTIAL boundary): the single-row getter sync
+dualwin-device-wait-live-r8-053004 | [tool call] vibe_send {"i": "确认关键进度", "session": "implementation", "message": "请立即简报设计及当前进展；验收要求明确 PARTIAL 可交付但必须真实增量，
+dualwin-device-wait-live-r8-053502 | for e in unset 0 2 1x " 1" 1; do … ./dw_gate_check.bin … ; done # 6/6 PASS
+dualwin-device-wait-live-r8-054803 | [tool call] vibe_send {"i": "Requesting progress details", "session": "implementation", "message": "请尽早发当前工作目录、基线与设计安全性发现给 verification；若缺�
+dualwin-device-wait-live-r8-055403 | [tool call] vibe_send {"i": "Checking implementation progress", "session": "implementation", "message": "请及时汇报设计与证明的安全前提；不得把设备 wait 当成 CPU 可�
+dualwin-dual-slot-handoff-r6 | PARTIAL — production dual-slot NOT implemented; DUAL_SLOT=1 still refuses to start. Provider resource-ownership/completion protocol cannot safely dual-slot.
+dualwin-event-overlap-evidence-r8 | PARTIAL: GGML_TP5_DW_EVENT_TRACE host timestamps on courier dual-wait + overlay event record; synthetic overlap ratios only; wait_calls=0 (no device event wait); CPU backend trace unmet; HIP
+dualwin-gpu-event-overlap-r6 | dualwin-gpu-event-overlap-r6: PARTIAL / no SHIP. CPU mock only; device intersection + HIP not done. Loot: patch.diff REPORT.md RUNBOOK.md VERIFY.txt.
+dualwin-overlap-counter-land | # 柱3 墙钟重叠计数 — PARTIAL
+dualwin-overlap-ratio-r8-010154 | PARTIAL: 柱3 双窗 GGML_TP5_DW_OVERLAP_RATIO exact-1 host 观测计量已交付；合成 CPU A/B 602.55→1189.49 tok/s, overlap 0.83；未证 GPU 重叠/真实吞吐/OFF≡stock。loot /w
+dualwin-serial-cut-land-r4 | 对每个配置按 (轮次、请求、窗口、token/行) 对齐保存原始 token 和 `report.json.logits.f32le`，比较完整字节、长度及行映射；包括同配置复跑及 A/B、�
+dualwin-serial-cut-timing-r8 | PARTIAL / NO-PROMOTE. Added GGML_TP5_DW_SERIALCUT3=1 moving some enqueue bookkeeping outside the lock plus a separate _TIMING gate; cumulative patch applies forward/reverse and overlay runti
+dualwin-svc-k6-steady | # 柱3 双窗长驻服务 — PARTIAL
+dualwin-svc-ring-server | 真正验收仍需实现外部请求队列及常驻服务生命周期，使用真实多批独立请求保留请求 ID/窗映射，再重复上述分析；覆盖取消、失败和正常退出
+dualwin-throughput-ab-wire-r8 |  （serial/concurrent/exact/violations/win1/equality 全部须 PASS）；
+dualwin-throughput-prove-r8 | FAILED (upstream 429 TPM rate-limit at end of run). Before the error it delivered a PARTIAL: ported SERIALCUT2 + backend-event onto r7 overlap base and added exact-1 gate GGML_TP5_DW_SVC_PRE
+dualwin-thru-ab-device-r8 | PARTIAL. Added ggml_backend_event_elapsed API with CUDA implementation, called from overlay runtime.cpp:2093, but event pairs are created on the CPU host device so only host-side window dura
+dualwin-thru-ab-harness-r6 | PARTIAL; stats/lock counting moved out; REPORT precision/OFF-ON wording need fix; no 13022 HIP verify.
+dualwin-thru-ab-overlap-r7 | - CPU harness（`/tmp/dw-async-ts-harness`，g++ -O2 -pthread）六场景全 PASS
+dualwin-true-async-overlap | 本 patch 的 overlay `tq-tp5-compose` 路径有有限 K 次固定 CLI prompt 的进程内循环；不是能持续接收外部请求的 server。没有真实 server 对接，不能将该循�
+dualwin-window-id-plumb | # 13022 验收手册 — 阻塞 / PARTIAL
+dualwin-winid-impl | 当前为 PARTIAL；不要将其用于生产或声称 MAXFP 两窗隔离。
+dupcut-hit-counter-r8-012104 | 无需编译的源码静态检查从本目录运行 `python3 harness/static_verify.py`（结果 43 项 PASS、exit 0，日志 `harness/static-verify.out`）。其内容：门控纪律（DECO
+dupcut-hit-gt0-sim | # 柱4 dupcut 命中：PARTIAL
+dupcut-live-hit-close-r5 | PARTIAL: 3rd cache slot + LRU reuse within graph eval (GGML_TP5_DUPCUT_LIVE_FIX=1); fixed prior undeclared hitsim/dupcut2_enabled compile blockers. patch apply-check exit 0 vs f1c5fafc; CPU 
+dupcut-live-r8 | PARTIAL. Added exact-1 gate GGML_TP5_DUPCUT_DECODE with lookup/skip counters wired into production Q8 and TQ mmvq paths; patch applies cleanly to stock and shared header passes -fsyntax-only
+dupcut-router-crossN-reuse-r6 | PARTIAL pillar4; net-new hunks 0 vs r4; NCACHE not delivered; attempt rolled back (scheduler/alloc lifetime risk); patch.diff = r4 cumulative baseline; no 13022 HIP.
+dupcut2-offstock-fix | 本刀 `src/ggml/src/ggml-backend-meta.cpp:2175` 将多行 owner/late-join 前置条件收拢到 DUPCUT2 exact `1`，`2381` 将多行融合别名扫描同样限制于该门；`src/src/models
+dw-courier-hit-r8-023005 | **状态：计数器增量已落地并通过本机可达验证（两 runtime `-fsyntax-only`、计数器 6/6 场景、驱动器 mock 臂 PASS、干净 stock apply-check）；无 GPU、无 13
+dw-courier-hit-r8-023011 | 单窗改用 `--windows 1`。核验器要求在线计数与逐周期 host span 离线重算一致，并校验 XHAND 逐窗和汇总关系；输出 host overlap 比例。PASS 表示记录自�
+dw-courier-hit-r8-025501 | @PARTIAL
+dw-courier-hit-r8-043503 | PARTIAL. Delivered patch.diff/REPORT.md/RUNBOOK.md/VERIFY.txt: courier counters landed in both runtimes behind GGML_TP5_DW_ASYNC_CTR=1, plus analyze.py computing host overlap_ns/run_wall_ns 
+dw-courier-hit-r8-043508 | 7:PASS exact-1: unset, empty, 0, 2, 1x, whitespace, 01 OFF; 1 ON
+dw-courier-hit-r8-053003 | **已交付代码增量和验证材料，但验收仍为 PARTIAL。** 尚无真实生产路径计数器命中、真实 `overlap_ratio` 或 OFF≡stock 的运行证据；现有 throughput 驱
+dw-courier-hit-r8-054802 | 3:**Status: counters implemented, verbatim-extraction-synced, statics verified; PARTIAL by design — no build/link/device run was executed (see §6).**
+dw-courier-hit-r8-061502 | 1:# REPORT — courier 双窗 handoff：PARTIAL，硬要求未达
+dwcombo-overlay-fork-unify-r4 | **进入条件未满足：** 当前补丁为 PARTIAL，HIP relay 保持 stock 的 16384 元素容量与 wave sleep（`wt/ggml/src/ggml-cuda/relay.hip:32,227,1033-1039`），未实现旧 over
+dwcombo-pool-lifetime-r5 | 柱4 PARTIAL / NO-PROMOTE（禁止推广）。已拉回 patch.diff、REPORT.md、RUNBOOK.md、VERIFY.txt。仅有 git apply、-fsyntax-only、提取函数 stub 类型检查和 CPU mock 证�
+eightlru-auth-bind-provider-r8 | ## INITIAL RESULTS — QUALITY FAILURE
+eightlru-epoch-relay-rebase | # 柱4 eight-LRU epoch 移植 — PARTIAL
+eightlru-failclosed-writepoints-r8 | PARTIAL: root-node snapshot/empty-leaf reject/V3 gate/auth version; python model skips only; writepoints not exhaustive; fail-closed unproven; C++ harness not run. Do not deploy ON.
+eightlru-skip-abi-real-r8 | PARTIAL. Restored corrupted ggml-tp5-engine-gen.h to r6 and delivered cumulative patch.diff with x86-64 ABI static asserts (-fsyntax-only passes). No net-new production skip hunk was added, 
+eightlru-skip-prove-r8-012755 | 状态：**PARTIAL —— 已执行 CPU 生产切片局部验证，但完整 HIP 编译、GPU 与 13022 验收未执行，不得称完成验收。**
+eightlru-v3-describe-skip-r5 | 状态：**PARTIAL —— 硬要求未达成：本修订无实际 skip 实现**（见 §0）。
+eightlru-v3-engine-gen-abi-r6 | PARTIAL: engine closure snapshot + generation + weak-symbol auth + relay dual-gate skip describe_frame; stock apply OK. Write-point audit / fail-closed / production harness still blocked (bu
+eightlru-v3-pointerfree | 验收：所有请求 rc=0、无 SEGV；OFF 与 stock 逐位一致，V2、V3 与 OFF 576/576 一致；V3 观察到真实 hit、miss、逐出和之后的复用，capture=replay=0；记录延�
+fa-host-true-len-hipready-r8-010154 | PARTIAL: ff 142.2KB 6m ago - fa-nkv-cpu-smoke-output.txt 4.1KB 7m ago - fa-nkv-cpu-smoke 21.1KB 7m ago - fa-nkv-cpu-smoke-build.log 64B 7m ago - fa-nkv-cpu-smoke.cpp 6.7KB 7m ago - source/ 2
+fa-host-true-len-hipready-r8-023006 | **净新增 CPU 消费实现与设备 trace 已落盘并通过编译层/语义模型验证；端到端数值与设备验收 PARTIAL。** 本机未运行 13022、GPU、HIP，也没有真实�
+fa-nkv-checked-tail-impl | # 13022 验收步骤（当前 PARTIAL，不可晋级）
+hipspans-joiner-enabled-fix-r8-052500 | `RESULT.txt` records OFF_1, ON_1, OFF_2 and ON_2, each with rc=0. Gates 1, 2 and 4 passed: paired OFF/ON logits were bitwise equal and the reported environment/banner checks passed. Gate 3 f
+hipspans-joiner-rejoin-r8-054800 | **Status: FAIL (GATE3_REJOIN); the fix's observed behavior is clean where exercised.** `build-slot` was restored, the fixed joiner was rebuilt with it (**BUILD_RC=0**, binary sha256 `39549c6
+latebind-accept-decode-gain-r7 | # LateBind accept decode gain — PARTIAL（统计与反事实模型）
+latebind-accept-skip-path-r8 | PARTIAL. On positive accept with guard hit, keeps the prefetched cell and skips one commit-loop draft llama_decode, with a new skipped_graph counter; target verify is not skipped. Patch and 
+latebind-bindrate-dw-compose-r6 | PARTIAL; PERWIN stats-only; multi-row chain backed out; mock not real bind/bitexact; no 13022 HIP.
+latebind-bindrate-open-r4 | # 柱 2 LateBind bindrate / open-gate：PARTIAL
+latebind-bindrate-open-v2 | 本刀 PARTIAL、无新增提升路径；不要默认启用 D_ON。构建与运行在 13022 独立环境执行，固定模型、参数、seed、硬件、并发和请求顺序；锁定 GPU，
+latebind-breaker-evidence-r8-012104 | 的等价性主张同样由 §待执行 4 的实机 bitwise 承担。r8 的全部 PARTIAL 声明继续有效。
+latebind-breaker-kunweiz-r8-014048 | ## 1. 本地静态复验 (无需编译; 已执行, 全 PASS)
+latebind-default-on-surface-r8 | PARTIAL: GGML_TP5_LATEBIND exact-1 arms assembly; retires TP5_MTP_LATEBIND_DRAFT1; reuse needs REUSE_ACCEPT=1; mismatch/replay/bind-site rollback via saved dispatch pos + rollback_ok/fallbac
+latebind-defer-compose-impl | 当前为 PARTIAL，不可默认推广；本补丁不实现跨请求真 DEFER。先在独立 pristine `f1c5fafc0449b22969ddabfcc9c361940d94d033` 执行 `git apply --check /绝对路径/patch
+latebind-defer-default-compose | # 门矩阵 — PARTIAL，不可 promote
+latebind-don-dw-compose-r4 | **PARTIAL，不可 promote。** 本会话完成两件此前缺失的事：
+latebind-don-guard-fullaccept-safe | # 柱 2 LateBind / DON：PARTIAL，待 13022 长驻服务验证
+latebind-don-selfcheck-move | 另用 pristine stock 同配置同序列长驻服务生成参考，先比较每个 OFF 与 stock，再比较每对 OFF/ON；报告全部元素数、首个差异、rc，不能只比较 top1�
+latebind-lastdraft-multirow-reuse | # 柱2 LateBind：PARTIAL
+latebind-mismatch-breaker-r8 | # REPORT — r8b latebind-mismatch-breaker (PARTIAL)
+latebind-mismatch-fix-r6 | PARTIAL: r6 latebind-mismatch-fix. No safe real reuse; no net-new logic vs r5 (tree byte-identical to r5 cumulative). Decode-skip withdrawn: graph/KV-head/SWA/recurrent equivalence unproven.
+latebind-multireq-boundary-r8 | ## INITIAL RESULTS — QUALITY FAILURE
+latebind-multireq-reuse-r8 | PARTIAL. Added exact-1 gate GGML_TP5_LB_MULTIREQ with per-request draft/proposal/prompt state, verify-owner rotation and reuse identity guards; cumulative patch.diff plus net-new-r8.diff, ap
+latebind-multireq-verify-gate-r5 | PARTIAL: GGML_TP5_LB_MULTIREQ (exact-1, depends on DRAFT1=1) adds per-request slot/seq state, round-robin owner-exclusive verify epochs, cursor audit_refuse, owner-switch trimming; built on 
+latebind-multirow-target-resid | # 13022 烧法与验收（PARTIAL，不可上线）
+latebind-off-courier-mtp-r8 | - courier/MTP 结构探针（本轮更新版）：**95 PASS / 0 FAIL**（含门控包含性、OFF 默认逐条、无未门控 MTP/courier getenv、svc/diag 时钟门控、stock-parity courie
+latebind-off-stock-bitexact-r7 | 5. **长驻轮次与原始证据缺口。** r5:1313–1316 支持 service rounds，但大于一轮要求 trained MTP；r5:1356–1365 在新轮开始清空前一轮的 `result.requests[id].t
+latebind-off-stock-diffs-r8 | PARTIAL: exact-1 gate skips spin-core planning/affinity + HIP spin init when OFF; apply-check OK. OFF still reaches FIFO lock/submit hook/courier/MTP. Syntax/CPU probe not on assigned build-
+latebind-off-stock-fifo-r8 | PARTIAL: OFF gates FIFO/submit — only when GGML_TP5_LATEBIND exact "1"; OFF uses std::mutex, no hook register. apply-check OK; CPU static probe 18/18. No fsyntax/behavior harness (build-sl
+latebind-off-stock-remain-r8 | FAILED. omp exited unexpectedly (omp_exit=-6) about 136 s in, right after spawning fix/verify worker sessions; the workdir was empty and nothing was delivered. OFF side-effect cleanup (FIFO 
+latebind-pos99-logits-soft-r4 | # 13022 接力与验收：PARTIAL，实现已落地，三项门未测
+latebind-pos99-offon-gate-r5 | > **实现 + 静态验证完成(含真实 stock apply-check);GPU 三项门未测(PARTIAL),不是 SHIP。**
+latebind-reuse-accept-harden | # 柱2 LateBind：PARTIAL
+latebind-unset-default-safe-r7 | ## 5. 通过标准（全部满足才可晋级；任一 fail 记 PARTIAL+证据）
+latebind-v2-default-safe-r3 | print('PASS:', len(left[0]), 'aligned rows and', len(left[1]), 'bytes')
+lb-default-on-guards-r8-013805 | 结果替代真机对照，即判本轮验收未通过。不得把 PARTIAL 表述为完整。
+maxfp-window-id-then-perwin | 当前 PARTIAL，不可推广；先修复 REPORT 中 allocator measure 释放、共享别名及失败传播，并证明 chunk 容量能覆盖所测形状，才能进行 ON 安全验收。勿
+mtp-dw-hipspans-abon-20261030 | GATE1 all legs rc0: PASS {'OFF_1': 0, 'ON_1': 0, 'OFF_2': 0, 'ON_2': 0}
+mtp-dw-hipspans-direct-prep | - VERDICT line: "HIP_SPANS SAFE + DEVICE OVERLAP PROVEN" is the pass.
+mtp-dw-serialcut4-abon-20261030 | GATE1 all legs rc0: PASS {'OFF_1': 0, 'ON_1': 0, 'OFF_2': 0, 'ON_2': 0, 'OFF_3': 0, 'ON_3': 0}
+mtp-lb-default-on-hip-20261030 | GATE1 UNSET LBSUM == ON (bind_accept/reuse_kept>0): PASS | UNSET bind_accept=752 reuse_kept=752 ON bind_accept=752 reuse_kept=752
+mtp-lb-off0-on1-20261030 | SWITCH PROVEN (LBSUM OFF!=ON)
+mtp-lb-promote-lctx-20261030 | SWITCH PROVEN (LBSUM OFF!=ON)
+mtp-vision-r8-010104-1 | PARTIAL (柱2 LateBind): 新增 GGML_TP5_LB_FAKILL_BUCKET exact-1 子门; patch.diff 对 577184d apply-check 通过; 未编译/未验证 OFF≡stock（run 误用 hermes build-slot 规则，�
+ncache-hip-serve-r8-012405 | 柱4: push ncache serve into TP5/HIP relay path (CPU serve alone is PARTIAL). No GPU flock. Static OK if build-slot missing.
+nkv-binder-slots-general | # 13022 验收手册 — PARTIAL，禁止晋级
+nkv-coverage-fix-r4 | # NKV coverage：PARTIAL / NO-SHIP
+nkv-ctx12-reserve-propagate-r6 | PARTIAL / NO-SHIP. Vision: union + runtime varlen. Adds ctx12 arm reserve-fail propagate/rollback, gated by GGML_TP5_NKV_CTX12_ARM_SAFE exact "1" (new ggml_backend_sched_alloc_graph_arm_safe
+nkv-dense-gap-map-r8-012104 | # REPORT — PARTIAL / NO-PROMOTE
+nkv-fa-checked-tail-gap-r6 | 退出码 0 才算该 TU 通过；75 或 124（timeout）以及其他非零均停止并记录为 PARTIAL，**不重试同一构建**，也不以拆批、提高时限或绕过 slot 重试。�
+nkv-fa-checked-tail-kernel-r4 | PARTIAL / NO-SHIP. Streamed checked tail NOT implemented: rtlen + streamed-KV now explicitly GGML_ABORTs (sync D2H length read removed) instead of handling the tail. Fixed fattn-vec.cuh extr
+nkv-fa-host-kvlen-thread-r6 | PARTIAL / NO-SHIP. GGML_TP5_FA_TRUE_KVLEN=1 仅新增普通 KV 宿主 frontier 观测（written/refused，consumed=0 fail-closed）；FA 节点/kernel 未消费 kv_len，无设备传输/chec
+nkv-fa-host-len2-r8-014429 | PARTIAL/done: see /workspace/loot/nkv-fa-host-len2-r8-014429/FINAL.md
+nkv-fa-host-true-len-wire-r8 | HIP 工具链和目标配置数据库未找到，HIP 语法、真实 GPU 消费与 replay、真实 OFF 对 stock 位级比较、完整编译及性能均未执行。当前状态 **PARTIAL**�
+nkv-fa-runtime-len-mock-r4 | PARTIAL：累计 `patch.diff` 含基线及 FA 扫描武装增量；该增量只得到 256 粒度上界，未实现精确非对齐 runtime kv_len。`GGML_TP5_FA_RTLEN=1` 仅在非 sparse、ma
+nkv-fa-runtime-ne-bind | # 13022：当前包为 PARTIAL，不是运行时 FA 候选
+nkv-fa-tail-hip-ready-r7 | # r7 FA checked-tail：PARTIAL，不可 SHIP
+nkv-fa-tail-host-pass-r8 | 保存 stock/OFF/ON 全部进程命令、环境、请求轨迹、原始位模式、每步长度和 kernel 命中、graph 生命周期、毒化/边界诊断及退出码。任何数值、边�
+nkv-fa-tail-runtime-len-r8 | PARTIAL. Added exact-1 gate GGML_TP5_FA_NKV_PARAM passing the runtime max unfilled-cell KV frontier via op_params[5] to plain FA tile/vec kernels (graph reuse disabled when ON; inert when OF
+nkv-fa-true-kvlen-r5 | PARTIAL (not SHIP): FA true kv_len channel added (gated GGML_TP5_FA_TRUE_KVLEN=1) but passes shared slot-wide frontier, not per-request length; grid still capacity-sized. apply-check + host 
+nkv-fa-true-len-prove-r8-020702 | PARTIAL: see /workspace/loot/nkv-fa-true-len-prove-r8-020702
+nkv-fa-true-len-prove-r8-020704 | 日期：2026-10-30。状态：**核心实现完成，CPU 生产代码 harness 逐位证据完成；GPU/HIP/端到端未验证（PARTIAL）**。
+nkv-fa-true-len-prove-r8-022202 | HIP 侧使用目标配置产生的真实 `compile_commands.json`、架构和宏，按前序 `/home/kunweiz/work/nkv-fa-tail-hip-ready-r7/RUNBOOK.md` 的逐 TU 方法覆盖相关 fattn TU 和
+nkv-fa-true-len-prove-r8-023002 | ./harness/fa-view-mask-probe # → PROBE-PASS (P1 布局 / P2 src[5] bound / P3 slot-5 / P4 mask 行)，rc=0
+nkv-fa-true-len-prove-r8-024502 | ## 状态：PARTIAL
+nkv-fa-true-len-prove-r8-025001 | ## 状态: PARTIAL — 源码完成（final 版本静态/apply 检查通过）；设备/kernel 行为未验证
+nkv-fa-true-len-prove-r8-025006 | 当前仅 PARTIAL；下述后续运行尚未执行。本机 12022 禁止 GPU/HIP；13022 目标机设备测试须先取得授权、确认资源和本机纪律。所有编译须经实际核�
+nkv-fa-true-len-prove-r8-025502 | [tool call] vibe_send {"i": "Flagging shape correctness risks", "session": "implementation", "message": "注意 clamp(req_len,1,n_kv) 对零长度及真实长度超过 n_kv 不是 ne==真实
+nkv-fa-true-len-prove-r8-043504 | ## 柱 1：union + varlen — **PARTIAL**
+nkv-fa-true-len-prove-r8-045004 | 3. 同一模型、硬件、单线程、上下文和输入，分别以新进程运行 stock 与 patched OFF，工作目录中保存 stdout/stderr、exit code、logits 文件。清除全部相
+nkv-fa-true-len-prove-r8-050204 | 6:## 结论：PARTIAL
+nkv-fa-true-len-prove-r8-053001 | 当前 PARTIAL；本机 build-slot 已对 stock 全构建返回 124，按其规则停止编译，不要循环重试。所有编译（包括 CMake 配置时的编译探针）均经 `/home/kun
+nkv-skel-true-param-r4 | # 13022 验收运行手册 — 当前 PARTIAL，禁止晋级
+nkv-union-coarse-race-fix-r6 | PARTIAL / NO-SHIP. SAFE=1 gates coarse slot; per-context encode/decode recursive lock + scheduler sync before ubatch mutation; side-table mutexes under SAFE only. Added context_async_mock.py
+nkv-xbucket-alloc-fail-r6 | PARTIAL pillar1; alloc-fail/fallback gates; CPU mock only; no 13022 HIP; no RSZ_RT.
+nkv-xbucket-revert-polish-r8 | PARTIAL: GGML_TP5_NKV_XBUCKET_RELEASE grow→shrink release/realloc + failure invalidate; apply-check OK; fsyntax/harness not run (no build-slot); two residual post-failure risks noted in VE
+nout-binder-floor1-land-r6 | PARTIAL / NO-SHIP. 柱1 union binder + n_outputs 真变长：新增 CPU mock repo/harness/nout_mock/ (ggml.h, main.cpp) 接真实 planner，设计覆盖同图1200轮 0/1/多输出逐字节�
+nout-execute-param-wire-r4 | # REPORT — n_outputs 执行接线（PARTIAL，禁止晋级）
+nout-floor1-reuse-hits-r8 | - package.sh 实录（2026-10-30）：`Forward apply check: PASS`、`Reverse apply check: PASS`，见 `package.log`。
+nout-reuse-hit-prove-r8 | nout-reuse-hit-prove-r8 PARTIAL/FAIL acceptance: no runtime evidence of production reuse_hit>0, bitexact, or OFF≡stock. patch.diff identical to prior r8 cumulative (no real increment); sto
+nout-reuse-hitlive-r8-014850 | Require zero exits, successful model loading, `result=PASS`, intact complete dumps, and both `cmp` successes; record raw stdout/stderr, exits, build receipts and model hash. The probe genera
+nout-reuse-wire-r8 | - candidate 库（`libllama.so` + 传递依赖 ggml/base）：必须产自本验收源树本身——构建收据须把二进制与累计补丁 SHA `dfb13913937a1148e70e7054d7c190da2b9dca279
+nout-runtime-param-land-r4 | PARTIAL / NO-SHIP (REPORT: INCOMPLETE). NOUT n-dim row-remap binder (GGML_TP5_NOUT_RT exact "1") on 1400L NKV replan stack; round-5 review fixes (MUL_MAT_ID row dim, PERMUTE axes, CONCAT dim
+nout-true-runtime-param | # 13022 后续计划（PARTIAL，禁止当完成版烧测）
+prefab-ab-compose-noclone-r8 | PARTIAL. Added exact-1 gate GGML_TP5_PREFAB_NOCLONE so MTP A+B compose builds B directly from cached A inputs/cut tensors without per-tensor clone, with in-flight scheduler sync before rebui
+prefab-graph-multireq-bitexact-r6 | PARTIAL. Cumulative patch.diff vs stock f1c5fafc (sha256 8b0b8607...2041; git apply --cached --check rc=0). Adds MTP lifetime gate (GGML_TP5_PREFAB_MTP_LIFETIME), template invalidation on sl
+prefab-share-live-r8-020101 | # 复现与 13022 后续验收（PARTIAL）
+prefab-share-live-r8-020102 | PARTIAL: 6: llama-mmap.cpp 7: llama-model-loader.cpp 8: llama-model-saver.cpp 9:+ llama-prefab.cpp 10:+ llama-prefab-mtp.cpp 11: llama-model.cpp 12: llama-quant.cpp 13: llama-sampler.cpp 14:
+prefab-share-live-r8-020103 | 源码工人记录五个翻译单元语法检查退出 0；`llama-context.cpp` 两次遇 build-slot 退出 75，第二次构成违反 75 不重试纪律，且该单元语法检查仍为 PART
+prefab-share-live-r8-022203 | - /home/kunweiz/work/prefab-share-nodes-r8/（patch.diff / REPORT.md / RUNBOOK.md / VERIFY.txt：PARTIAL，构建计数下降/逐位/OFF≡stock 均缺实测）
+prefab-share-live-r8-023003 | # REPORT — prefab A+B 共享节点长驻服务热路径（观测轮；PARTIAL，窗口方案已按令撤销）
+prefab-share-live-r8-023009 | # REPORT — live-r8 PARTIAL（事件流已实现，未验收）
+prefab-share-live-r8-024002 | # Prefab live 交付报告：PARTIAL，未验收
+prefab-share-live-r8-024505 | @PARTIAL
+prefab-share-live-r8-025003 | ## 柱 4：PARTIAL
+prefab-share-live-r8-025008 | `-fsyntax-only` 全部退出 0;CPU mock 多请求行为 smoke(gate=ON 27/27 PASS;OFF 对照
+prefab-share-live-r8-041903 | - /home/kunweiz/work/prefab-share-nodes-r8/（patch.diff / REPORT.md / RUNBOOK.md / VERIFY.txt：PARTIAL，构建计数下降/逐位/OFF≡stock 均缺实测）
+prefab-share-live-r8-043505 | ## 柱4：PARTIAL
+prefab-share-live-r8-045005 | - 禁止依赖 `GGML_TP5_RSZ_RT`；禁止以 pad/headroom/桶化改变语义的变通；完整图下降不得以子图节省冒充（见 REPORT PARTIAL）。
+prefab-share-live-r8-050205 | # REPORT — PARTIAL，真实生产验收未验证
+prefab-share-live-r8-052601 | - /home/kunweiz/work/prefab-share-nodes-r8/（patch.diff / REPORT.md / RUNBOOK.md / VERIFY.txt：PARTIAL，构建计数下降/逐位/OFF≡stock 均缺实测）
+prefab-share-live-r8-053501 | - 门取值矩阵（13022 精确值要求）：对 GGML_STRICT_LIVE（及既有各门）取 unset、空串、0、1、true、01、带尾空格的 1、2 —— 门为进程内 static 缓存，
+prefab-share-nodes-r8 | 实现工人最终记录的 stock 基线为 `f1c5fafc0449b22969ddabfcc9c361940d94d033`，累计补丁 SHA-256 为 `3c5ba5459903b5c84f9d3e94ba679425a28df438e80e51059681052f78e4b911`，最终 
+prefab-share-prove-r8-012229 | - **T2 生产核探针（原文包含，非提取摘录）**：`cpu_prodpath_splice_harness.cpp` 经 `#include` 逐字使用冻结 `wt/src/llama-prefab-splice.h`（生产 splice 核 `:46-130
+router-ncache-serve-wire-r8 | PARTIAL/done: see /workspace/loot/router-ncache-serve-wire-r8/FINAL.md
+rs-z-runtime-param-r4 | # rs_z runtime 参数化交付：PARTIAL，禁止部署
+rsz-execute-param-wire | # 13022 交接：PARTIAL，禁止烧生产
+rsz-runtime-gate-impl | # 13022 交接：PARTIAL，禁止晋级
+serial-cut-evidence-r8-012158 | PARTIAL (柱3 serial-cut evidence): run done; loot (patch.diff/REPORT/RUNBOOK/VERIFY/FINAL) at /workspace/loot/serial-cut-evidence-r8-012158; GPU 真机验证留 13022。
+serial-cut-next-seg-r8 | ## 3. A/B 对比协议（13022，未执行 → BLOCKED）
+serial-cut-offstock-r8-014850 | 4. Save raw reports/companions, comparison output, provenance and path-hit evidence; exercise repeated resident batches, separate capture/eager and replay modes if claimed. Verify no errors 
+thru-ab-live-r8-020703 | `src/overlay/driver-live.py` 当前按模板启动服务：A 一窗、B 两窗，同门同负载；每轮固定 A 后 B，进程每臂重启，每进程只发一个测量批，没有预热�
+thru-ab-live-r8-021201 | 13022/HIP machine remains PARTIAL — see REPORT.md §8). The experimental
+thru-ab-live-r8-024001 | **硬要求状态：门控已实现，校验 PARTIAL。** 本轮已新增独立 exact-`1` 门 `GGML_TP5_DW_SVC_BARRIER`（默认 off）：barrier 控制行、outstanding 计账与 reader 分
+thru-ab-live-r8-024504 | 真实长驻服务应固定负载，至少两组 A/A 与五个稳态配对轮、交替 AB/BA，逐请求核对 token 和完整 logits，无丢失或错误；要求每轮 B>A、B host overlap
+thru-ab-live-r8-041901 | 该脚本的 PASS 要求 B tok/s > A 且 B overlap ratio > 0；overlap 为模拟工作区间交集除以客户端墙时。仅验证合成模型，不能证明真实服务、GPU 或多轮稳�
+thru-ab-live-r8-043502 | # → HARNESS-PASS failures=0（65 checks，含 LIVE 计量套件与 OFF 等价用例）
+thru-ab-live-r8-043507-round2 | `resident_cpu_ab.out` 保存本次实际输出：A 583.998 synthetic tok/s、B 1120.681 synthetic tok/s；A/B overlap_ratio 分别为 0/0.781408；A/B serial_submit_ms 分别为 29.299/30.56
+thru-ab-live-r8-043507 | `resident_cpu_ab.out` 保存本次实际输出：A 583.998 synthetic tok/s、B 1120.681 synthetic tok/s；A/B overlap_ratio 分别为 0/0.781408；A/B serial_submit_ms 分别为 29.299/30.56
+thru-ab-live-r8-045002 | B stderr 的 `TP5_DW_SVC_SUBMIT/DONE` 按 task 配对得到各窗 host 请求生命周期，裁剪到客户端批墙时、各窗求并集后取交集除以共同批墙时；`TP5_DW_THRU_CTR`
+thru-ab-live-r8-050202 | 本交付的目标入口是 `tools/server` 的长驻 llama-server HTTP 服务，而非 overlay 的 stdin NDJSON 服务。当前生产推理、吞吐、OFF 与 stock 运行期等价均未验�
+thru-ab-live-r8-052601 | 脚本复用 prove-r8 的 `resident_cpu_ab.py` 并增加禁用环境检查。A 与 B 各自启动一个进程，同一进程先接收 4 个预热请求，再接收 24 个测量请求；A 单
+thru-ab-live-r8-053503 | 60:PASS res/admit_stamps_monotonic
+thru-ab-live-r8-054801 | [tool call] vibe_send {"i": "确认交付执行进展", "session": "implementation", "message": "请优先确保四件套、累计 patch 可应用、真实源码新增与 CPU smoke，时间�
+thru-ab-prod-wire-r8-012405 |  vs stock run remains PARTIAL (needs the authorized machine).
+thru-prove-hipready-r8-014429 | **状态：PARTIAL** — 协议层（真实二进制）与宿主 A/B 已实测通过；生产模型服务与设备侧证据待 13022。
+union-binder-generalize-r4 | # 13022 burn-in runbook — 最终累计 patch（PARTIAL，未执行）
+union-binder-nout-lane-r5 | PARTIAL / cannot SHIP. Pillar 1 union+true varlen: n_outputs binder register/provider/rebind landed in cumulative patch; final impl lacks matching long-lived mock or real inference proof. Wo
+union-binder-true-width-r8 | PARTIAL/NO-PROMOTE: exact-1 gate GGML_TP5_KV_EXACT_SPAN; restricted layouts size span from highest physical KV index (drops 256-bucket align on that path) — span≠token count; empty/unsup
+union-maxfp-dualwin-perwin-r4 |  3 TP5_FAILURE_CLEANUP
+union-maxfp-dualwin-safe-r6 | union-maxfp-dualwin-safe-r6: PARTIAL (P1 static audit + P2 CPU mock pass; real GPU/13022 acceptance NOT exercised). patch.diff applies clean on stock f1c5faf (+1146/-16, 9 files), -fsyntax-o
+union-strip-fine-key-impl | # 13022 后续烧录与验收（当前禁止 SHIP）

@@ -1,0 +1,52 @@
+--- a/ggml/include/ggml-relay.h
++++ b/ggml/include/ggml-relay.h
+@@ -102,6 +102,14 @@
+ // False also permits temporary contention; retry without holding a provider
+ // view or lock. Capability discovery must precede concurrent execution.
+ GGML_API bool ggml_backend_relay_snapshot(ggml_backend_t backend, struct ggml_relay_status * status);
++// Identity token of this backend's relay provider -- the same opaque pointer
++// the relay evidence lines print as provider=%p. It is an identity, not a
++// handle: never dereference it, never free it, and never use it after the
++// backend has been freed. The value is stable while the backend is alive and
++// is null for a null backend, a non-Meta backend, or a Meta backend without a
++// live relay provider. This call does not synchronize with concurrent
++// backend teardown; callers must hold the backend owner's lifetime.
++GGML_API const void * ggml_backend_relay_provider(ggml_backend_t backend);
+ // Experimental HC4/K320 context owner offset (0..4), configured exactly once
+ // after context creation and before its first real graph_compute/submit.
+ // Requires GGML_TP5_HC_CONTEXT_OWNER=1 before model loading: 97 complete BF16
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -4299,6 +4299,11 @@
+     return ctx != nullptr && status != nullptr && ctx->relay_i->snapshot(ctx->relay, status);
+ }
+ 
++const void * ggml_backend_relay_provider(ggml_backend_t backend) {
++    auto * ctx = ggml_backend_relay_meta_context(backend);
++    return ctx != nullptr ? ctx->relay : nullptr;
++}
++
+ void ggml_backend_relay_abort(ggml_backend_t backend, int32_t error_code) {
+     auto * ctx = ggml_backend_relay_meta_context(backend);
+     if (ctx != nullptr) {
+--- a/overlay/mtp-async-protocol-candidate-20261027/runtime.cpp
++++ b/overlay/mtp-async-protocol-candidate-20261027/runtime.cpp
+@@ -3202,6 +3202,18 @@
+                 // PCI BDF as the join key) to this window.
+                 std::fprintf(stderr, "TP5_DW_HIP_OVERLAP_MAP window=%u native=%p",
+                     wi, (void *) native[wi]);
++                // Identity link for the offline joiner: provider= is the
++                // relay provider object (never the backend pointer). It is
++                // read while every window backend is still alive; the
++                // runtime clears its contexts only after this drain.
++                // Null means no live relay provider: omit the key. The
++                // joiner must not infer ownership from log order; it
++                // decides pointer/shared applicability from the log itself,
++                // and old logs without the key are evaluated as before.
++                const void * relay_provider = ggml_backend_relay_provider(native[wi]);
++                if (relay_provider != nullptr) {
++                    std::fprintf(stderr, " provider=%p", (void *) relay_provider);
++                }
+                 for (std::uint32_t r = 0; r < status.ranks && r < GGML_RELAY_RANKS; ++r) {
+                     std::fprintf(stderr, " pci_bdf%u=%s", r, status.pci_bdf[r]);
+                 }

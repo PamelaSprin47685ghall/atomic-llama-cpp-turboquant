@@ -1,0 +1,27 @@
+以下命令均未执行，须在获授权后另行运行；不使用 selected、RSZ_RT 或 mock。
+
+前置：干净的 stock f1c5fafc0449b22969ddabfcc9c361940d94d033 源树；git、CMake、C/C++ 编译器及项目 CPU 构建依赖；可读的真实兼容 GGUF 模型。GPU 验收额外需要相应 CUDA/ROCm 工具链、驱动和设备。真实分配失败注入器目前未提供，不能假称已覆盖失败路径。
+
+应用检查与应用（检查仅在未来授权后运行；第二项必须在第一项应用后检查）：
+  cd /path/to/clean-stock
+  git apply --check /home/kunweiz/work/lead-maxfp-safety-20261030/01-share.patch
+  git apply /home/kunweiz/work/lead-maxfp-safety-20261030/01-share.patch
+  git apply --check /home/kunweiz/work/lead-maxfp-safety-20261030/02-safety.patch
+  git apply /home/kunweiz/work/lead-maxfp-safety-20261030/02-safety.patch
+
+未来在 12022 解禁后才可构建；配置和构建均通过全局构建槽。build-slot 排队最多 180 秒、运行最多 180 秒；75 是排队超时、124 是运行超时，不代表构建成功。设置 MODEL 为真实兼容 GGUF 的绝对路径，并确保路径存在；各命令检查退出状态。
+  /home/kunweiz/.local/bin/build-slot cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Debug -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON
+  /home/kunweiz/.local/bin/build-slot cmake --build build-cpu --target llama-cli -j 2
+
+CPU 单 backend 只作为初步诊断，不作为 share 或双窗验收。静态代码中 share 门条件是 exact 1、非 model no_alloc，且 phase arena 分支先返回；scheduler 构造允许一个 CPU backend，但这不证明目标模型和构建满足 share 所有前置条件或能够覆盖多 backend、alias 和 pipeline。若日志无 share enable 或进程失败，记录未覆盖，不视为通过。
+
+双窗隔离需求是两个独立的实际窗口及其交错执行；两个命令顺序启动的独立进程或单窗口 CLI 不能证明双窗隔离。当前未确认可用的真实双窗驱动、可固定 token 输入并逐窗导出原始逐 token logits 的工具，因此无法给出真实可执行的双窗运行命令，双窗隔离和 logits 逐位比较均未完成。不得以 CLI 文本输出、hash 对照文本、模拟或假设驱动代替。获得真实驱动后，须分别在 stock、OFF、ON 中运行同一双窗交错序列，并单独运行每窗的隔离基线，固定模型、token、参数和设备配置；将每窗各步 logits 以相同 dtype、顺序和字节序保存为二进制文件后，用以下真实逐字节比较命令检查（文件名由实际驱动输出映射，不能假设其已存在）：
+  cmp -- /path/to/window0-isolated.logits.bin /path/to/window0-interleaved.logits.bin
+  cmp -- /path/to/window1-isolated.logits.bin /path/to/window1-interleaved.logits.bin
+  cmp -- /path/to/stock-window0.logits.bin /path/to/off-window0.logits.bin
+  cmp -- /path/to/stock-window1.logits.bin /path/to/off-window1.logits.bin
+  cmp -- /path/to/stock-window0.logits.bin /path/to/on-window0.logits.bin
+  cmp -- /path/to/stock-window1.logits.bin /path/to/on-window1.logits.bin
+每个 cmp 必须返回 0；还需对 OFF、ON 各自执行两条隔离基线对交错结果的比较。记录数据长度、dtype、token 顺序及实际执行方式；比较一致仍不能覆盖真实分配失败路径。目标 GPU、多 backend 和真实 pipeline 配置须另行观察分配、重分配与生命周期。
+
+真实失败注入：当前未找到可用的设备 backend 故障注入接口，因此没有可诚实提供的具体注入命令。提供该机制后应逐点注入实际 buffer allocation failure，并断言失败向上传播、alias 不悬空/重复释放、pipeline 回退重测后成功或清晰失败，使用 ASan 等工具检查 CPU 内存生命周期；不能把 dummy backend 或人为限制机器内存当成确定性注入。

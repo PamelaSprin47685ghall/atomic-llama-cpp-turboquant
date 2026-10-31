@@ -1,0 +1,135 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 4cb5eb4..45344b3 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -674,6 +674,7 @@ extern "C" {
+         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
+         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
++        GGML_TENSOR_FLAG_NO_REUSE = 32, // allocator retains a non-view tensor and forbids reuse through its views
+     };
+ 
+     enum ggml_tri_type {
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index cbe4577..e2c8b9b 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -467,6 +467,7 @@ struct tensor_alloc {
+     int buffer_id;
+     struct buffer_address addr;
+     size_t size_max; // 0 = pre-allocated, unused, or view
++    bool no_reuse; // allocation plans depend on the retained-lifetime contract
+ };
+ 
+ struct leaf_alloc {
+@@ -641,9 +642,10 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+                     continue;
+                 }
+ 
+-                // outputs cannot be reused
+-                if (parent->flags & GGML_TENSOR_FLAG_OUTPUT || (parent->view_src != NULL && parent->view_src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+-                    AT_PRINTF("not reusing parent %s for %s as it is an output\n", parent->name, node->name);
++                // Retained tensors, including their views, cannot be reused in-place.
++                if (parent->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_NO_REUSE) ||
++                    (parent->view_src != NULL && parent->view_src->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_NO_REUSE))) {
++                    AT_PRINTF("not reusing retained parent %s for %s\n", parent->name, node->name);
+                     continue;
+                 }
+ 
+@@ -688,9 +690,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+ }
+ 
+ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
+-    // graph outputs are never freed
+-    if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+-        AT_PRINTF("not freeing output %s\n", node->name);
++    // Graph outputs and explicitly retained allocations remain live throughout the graph.
++    if (node->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_NO_REUSE)) {
++        AT_PRINTF("not freeing retained tensor %s\n", node->name);
+         return;
+     }
+ 
+@@ -860,6 +862,7 @@ static bool ggml_gallocr_reserve_n_impl(
+     for (int i = 0; i < graph->n_nodes; i++) {
+         struct ggml_tensor * node = graph->nodes[i];
+         struct node_alloc * node_alloc = &galloc->node_allocs[i];
++        node_alloc->dst.no_reuse = (node->flags & GGML_TENSOR_FLAG_NO_REUSE) != 0;
+         if (node->view_src || node->data) {
+             node_alloc->dst.buffer_id = -1;
+             node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
+@@ -872,6 +875,7 @@ static bool ggml_gallocr_reserve_n_impl(
+         }
+         for (int j = 0; j < GGML_MAX_SRC; j++) {
+             struct ggml_tensor * src = node->src[j];
++            node_alloc->src[j].no_reuse = src && (src->flags & GGML_TENSOR_FLAG_NO_REUSE) != 0;
+             if (!src || src->view_src || src->data) {
+                 node_alloc->src[j].buffer_id = -1;
+                 node_alloc->src[j].addr = GGML_BUFFER_ADDRESS_INVALID;
+@@ -998,6 +1002,9 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
+ }
+ 
+ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
++    if (talloc->no_reuse != ((node->flags & GGML_TENSOR_FLAG_NO_REUSE) != 0)) {
++        return false;
++    }
+     size_t node_size = 0;
+     if (!node->data && !node->view_src) {
+         // If we previously had data but don't now then reallocate
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 78b58ee..c7a2822 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -65,6 +65,18 @@ static bool qwen4exp_hc_keep_lo_enabled() {
+     return enabled;
+ }
+ 
++// Experimental allocator-only router lifetime extension; disabled by default.
++static bool qwen4exp_router_scratch_enabled() {
++    static const bool enabled = [] {
++        const char * value = std::getenv("GGML_TP5_MOE_ROUTER_SCRATCH");
++        if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0) {
++            throw std::runtime_error("GGML_TP5_MOE_ROUTER_SCRATCH must be unset, 0, or 1");
++        }
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
+ // Keep the two existing top-k outputs alive for the fused expert reduction.
+ // Their views, not the internal argsort/divide tensors, are materialized outputs.
+ static void qwen4exp_moe_keep_route(ggml_tensor * out) {
+@@ -1478,6 +1490,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+         }
+     }
+ 
++    const bool retain_router = qwen4exp_router_scratch_enabled() &&
++            n_expert == 512 && n_expert_used == 10 && cur->ne[1] > 1;
++    const int router_first_node = retain_router ? ggml_graph_n_nodes(gf) : 0;
++
+     ggml_tensor * moe_out =
+         build_moe_ffn(cur,
+             model.layers[il].ffn_gate_inp,
+@@ -1495,6 +1511,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+             model.layers[il].ffn_down_exps_s);
+     cb(moe_out, "ffn_moe_out", il);
+     qwen4exp_moe_keep_route(moe_out);
++    if (retain_router) {
++        ggml_tensor * router_input = nullptr;
++        int matches = 0;
++        for (int i = router_first_node; i < ggml_graph_n_nodes(gf); ++i) {
++            ggml_tensor * node = ggml_graph_node(gf, i);
++            if (node->op == GGML_OP_SOFT_MAX && node->ne[0] == 512 && node->ne[1] == cur->ne[1] &&
++                    node->ne[2] == 1 && node->ne[3] == 1) {
++                router_input = node->src[0];
++                ++matches;
++            }
++        }
++        if (matches != 1 || !router_input || router_input->op != GGML_OP_MUL_MAT ||
++                router_input->view_src != nullptr || router_input->type != GGML_TYPE_F32) {
++            throw std::runtime_error("router scratch requires one direct F32 router projection per Qwen4Exp layer");
++        }
++        router_input->flags |= GGML_TENSOR_FLAG_NO_REUSE;
++    }
+ 
+     // Finish the existing expert reduction before independent HC/PLE branches
+     // are expanded, so the down projection and reduction stay adjacent.

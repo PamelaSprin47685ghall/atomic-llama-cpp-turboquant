@@ -1,0 +1,257 @@
+diff --git a/ggml/include/ggml-alloc.h b/ggml/include/ggml-alloc.h
+index a7926a2..f24fb31 100644
+--- a/ggml/include/ggml-alloc.h
++++ b/ggml/include/ggml-alloc.h
+@@ -67,6 +67,17 @@ GGML_API bool ggml_gallocr_reserve_n(
+     const int * node_buffer_ids,
+     const int * leaf_buffer_ids);
+ 
++// TP5 max-footprint share: like ggml_gallocr_reserve_n, but guarantees each
++// buffer's total capacity is at least min_sizes[i] by growing the last chunk
++// when the graph's own placement needs less. Used to reserve once at the max
++// footprint of a shape set so later shapes in the set never realloc.
++GGML_API void ggml_gallocr_reserve_n_min(
++    ggml_gallocr_t galloc,
++    struct ggml_cgraph * graph,
++    const int * node_buffer_ids,
++    const int * leaf_buffer_ids,
++    const size_t * min_sizes);
++
+ // automatic reallocation if the topology changes when using a single buffer
+ // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
+ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 4ec8bdf..23578fe 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -320,6 +320,7 @@ extern "C" {
+     // Initialize backend buffers from a measure graph
+     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
+     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
++    GGML_API void                 ggml_backend_sched_reserve_min(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, const size_t * min_sizes); // TP5 max-footprint share: reserve at a per-backend minimum size
+ 
+     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
+     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index cbe4577..be1d505 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -962,6 +962,68 @@ void ggml_gallocr_reserve_n_size(
+     }
+ }
+ 
++// TP5 max-footprint share: reserve with a caller-provided per-buffer minimum
++// size floor. The floor is applied to the buffer TOTAL (sum of chunk max_size)
++// after the graph's own placement pass, by growing the LAST chunk's max_size.
++// Growing the last chunk is safe for any later placement on this gallocr:
++//   - a later reserve resets the tallocr free lists and re-places from scratch,
++//     so only the chunk capacities (vbuffer sizes) persist across reserves;
++//   - chunk capacities are grow-only (reserve_n_impl never shrinks a chunk);
++//   - the last chunk is the one whose free block the allocator grows into when
++//     a placement overflows the earlier chunks (ggml_dyn_tallocr_alloc's
++//     last-block path), so extra capacity placed there is reachable by every
++//     later placement, unlike capacity in an interior chunk.
++// The floor is NOT a pad-to-max of the graph's own requirement: the graph is
++// still placed by the normal first-fit/best-fit pass; only the shortfall
++// between that placement's total and the measured max footprint of the shape
++// SET is added, once, at reserve time.
++void ggml_gallocr_reserve_n_min(
++        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, const size_t * min_sizes) {
++    GGML_ASSERT(min_sizes != NULL);
++    if (!ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false)) {
++        return;
++    }
++    for (int i = 0; i < galloc->n_buffers; i++) {
++        // if the buffer type is used multiple times, the same tallocr (and
++        // buffer) is shared; apply the floor once, at the first index
++        bool shared = false;
++        for (int j = 0; j < i; j++) {
++            if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
++                shared = true;
++                break;
++            }
++        }
++        if (shared) {
++            continue;
++        }
++        size_t total = 0;
++        for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
++            total += galloc->buf_tallocs[i]->chunks[c]->max_size;
++        }
++        if (min_sizes[i] > total) {
++            int last = galloc->buf_tallocs[i]->n_chunks - 1;
++            if (last < 0) {
++                // no chunk was created by this graph's placement (nothing was
++                // placed in this buffer); create one to hold the floor
++                if (ggml_dyn_tallocr_new_chunk(galloc->buf_tallocs[i], min_sizes[i] - total) == -1) {
++                    continue;
++                }
++                last = galloc->buf_tallocs[i]->n_chunks - 1;
++            }
++            galloc->buf_tallocs[i]->chunks[last]->max_size += min_sizes[i] - total;
++            // the buffer must be reallocated to the new capacity; the reserve
++            // pass above may have kept a smaller existing buffer (grow-only)
++            ggml_vbuffer_free(galloc->buffers[i]);
++            galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
++            if (galloc->buffers[i] == NULL) {
++                GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__,
++                               ggml_backend_buft_name(galloc->bufts[i]), min_sizes[i]);
++                GGML_ABORT("graph allocation: failed to reserve memory");
++            }
++        }
++    }
++}
++
+ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+     return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+ }
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index ff5f61f..deb9d36 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2253,6 +2253,25 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
+     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+ }
+ 
++// TP5 max-footprint share: reserve the measure graph while guaranteeing each
++// backend buffer's total capacity is at least min_sizes[backend_index]. The
++// graph is placed normally; only a shortfall against the caller's measured
++// max-footprint envelope is added to the last chunk. Later graphs from the
++// measured shape set then fit without any reallocation.
++void ggml_backend_sched_reserve_min(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, const size_t * min_sizes) {
++    GGML_ASSERT(sched);
++    GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
++    GGML_ASSERT(min_sizes);
++
++    ggml_backend_sched_synchronize(sched);
++
++    ggml_backend_sched_split_graph(sched, measure_graph);
++
++    ggml_gallocr_reserve_n_min(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, min_sizes);
++
++    ggml_backend_sched_reset(sched);
++}
++
+ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
+     GGML_ASSERT(sched);
+     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 97c8c72..49b5927 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1521,6 +1521,69 @@ void llama_context::sched_reserve() {
+ 
+     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+ 
++    // TP5 max-footprint share (GGML_TP5_MAXFP_SHARE=1, exact "1"): reserve the
++    // compute buffers ONCE at the max footprint of the {pp, tg} shape set
++    // instead of the stock pp -> tg -> pp triple. The stock triple re-places
++    // tensors on every reserve and relies on the allocator's grow-only chunk
++    // logic to (hopefully) cover the other shape; the max-footprint reserve
++    // measures both shapes first (no_alloc measure passes never touch live
++    // buffers), takes the per-backend max, and reserves the final pp graph
++    // with that floor, so both shapes fit the same buffer with zero
++    // reallocation and no headroom/pad guesswork.
++    const char * maxfp_env = getenv("GGML_TP5_MAXFP_SHARE");
++    const bool   maxfp_share = maxfp_env != nullptr && strcmp(maxfp_env, "1") == 0;
++    if (maxfp_share && !model.hparams.no_alloc) {
++        std::vector<size_t> sizes_pp(backend_ptrs.size(), 0);
++        std::vector<size_t> sizes_tg(backend_ptrs.size(), 0);
++
++        // measure pass 1: pp shape (split_only, no buffer is allocated or freed)
++        {
++            auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, sizes_pp.data());
++            if (!gf) {
++                throw std::runtime_error("failed to measure compute pp buffers");
++            }
++            n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
++            n_nodes_pp  = ggml_graph_n_nodes(gf);
++        }
++
++        // measure pass 2: tg shape (split_only, no buffer is allocated or freed)
++        {
++            auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), true, sizes_tg.data());
++            if (!gf) {
++                throw std::runtime_error("failed to measure compute tg buffers");
++            }
++            n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
++            n_nodes_tg  = ggml_graph_n_nodes(gf);
++        }
++
++        // per-backend max footprint of the shape set
++        std::vector<size_t> sizes_max(backend_ptrs.size(), 0);
++        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++            sizes_max[i] = std::max(sizes_pp[i], sizes_tg[i]);
++        }
++
++        // single real reserve at the max footprint, placed by the pp graph
++        // (the larger shape): the allocator places pp normally and grows the
++        // last chunk to the envelope where pp's own placement falls short
++        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), false, nullptr, sizes_max.data());
++        if (!gf) {
++            if (cparams.pipeline_parallel) {
++                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n",
++                               __func__);
++                cparams.pipeline_parallel = false;
++                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
++                                                   max_nodes, false, cparams.op_offload));
++                ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
++                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
++            }
++            if (!gf) {
++                throw std::runtime_error("failed to allocate compute pp buffers");
++            }
++        }
++
++        LLAMA_LOG_INFO("%s: max-footprint share enabled (GGML_TP5_MAXFP_SHARE=1): single reserve at max(pp, tg) per backend\n",
++                       __func__);
++    } else {
+     // reserve pp (prompt processing) graph first so that buffers are only allocated once
+     {
+         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc,
+@@ -1566,6 +1629,7 @@ void llama_context::sched_reserve() {
+             throw std::runtime_error("failed to allocate compute pp buffers");
+         }
+     }
++    }
+ 
+     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+         ggml_backend_t             backend = backend_ptrs[i];
+@@ -3741,7 +3805,8 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t                       n_toke
+                                            uint32_t                       n_outputs,
+                                            const llama_memory_context_i * mctx,
+                                            bool                           split_only,
+-                                           size_t *                       sizes) {
++                                           size_t *                       sizes,
++                                           const size_t *                 min_sizes) {
+     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__,
+                     n_tokens, n_seqs, n_outputs);
+     GGML_ASSERT(n_outputs >= 1);
+@@ -3796,8 +3861,13 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t                       n_toke
+         } else {
+             ggml_backend_sched_split_graph(sched.get(), gf);
+         }
++    } else if (min_sizes) {
++        // TP5 max-footprint share: reserve this graph while forcing each
++        // backend buffer to the measured max footprint of the shape set
++        // (min_sizes), so later shapes never reallocate.
++        ggml_backend_sched_reserve_min(sched.get(), gf, min_sizes);
+     } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+-        GGML_ASSERT(!sizes);
++        GGML_ASSERT(!sizes && !min_sizes);
+         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+         return nullptr;
+     }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 4bade14..1fe6e49 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -276,7 +276,7 @@ public:
+ 
+     // reserve a graph with a dummy ubatch of the specified size
+     ggml_cgraph * graph_reserve(
+-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
++        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr, const size_t * min_sizes = nullptr);
+ 
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+ 

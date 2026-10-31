@@ -1,0 +1,134 @@
+VERIFY — lead-device-wait-20261030 (static only)
+
+This file records exactly what was executed in this task and what was not.
+Under the active work rules NOTHING was compiled, syntax-checked, linked, tested,
+mocked, harnessed, or run on a GPU. The 12022 side permits only static reading and
+writing of code; 13022 HIP was not touched and no GPU lock was taken.
+
+## 1. Worktree provenance
+
+- Source copy: `cp -a /home/kunweiz/work/dualwin-device-wait-live-r8-085001/wt
+  /home/kunweiz/work/lead-device-wait-20261030/wt` (read-only predecessor; 188 MB).
+- `git -C wt log --oneline -1` → `f1c5faf add async-protocol candidate overlay + SYNC.md`
+  (stock `f1c5fafc0449b22969ddabfcc9c361940d94d033`).
+- `git -C wt status --short | wc -l` → 17 (the 085001 candidate, staged).
+- All edits below are unstaged worktree changes on top of that index.
+
+## 2. Patches produced (static `git diff`, no build)
+
+- `git -C wt diff HEAD > patch.diff` — cumulative stock → this tree, 4776 lines,
+  16 files, sha256 `d1a698a4780a4a9c8e207d70a61ab44741d044bcca77c2f60ba0e101eee95d5c`.
+- `git -C wt diff > net-increment.patch` — this round only (085001 → this tree),
+  1135 lines, 11 files, sha256 `ddd0f20912dc79198ae13aac127c322a8b208d16f59a39d32d8b3f8c74eab21f`.
+- `git -C wt diff HEAD --name-status`: 15 files listed (11 M/A plus the 5 files
+  that the candidate added and this round leaves untouched); the candidate's
+  `fork/tp5-compose/src/dw_device_wait.h` is absent from the cumulative patch
+  because this round deleted it back to non-existence relative to stock.
+- The cumulative patch therefore contains exactly: docs/backend/DUALWIN-COMPOSE-EVENT.md,
+  fork/tp5-compose/src/{dw_compose_event.h,dw_event_trace.h,runtime.cpp},
+  ggml/include/ggml-backend.h, ggml/src/ggml-backend-meta.cpp,
+  ggml/src/ggml-cuda/mmvq.cu, include/llama.h,
+  overlay/.../{dw-dev-overlap.h,dw-thru.h,dw_device_wait.h,dw_event_trace.h,
+  hip-relay/relay.hip,runtime.cpp}, src/llama-context.{cpp,h}.
+- **No apply/check was run** (it is a build-adjacent test under the current ban);
+  patch applicability is therefore unverified.
+
+## 3. Static checks actually performed (grep / read only)
+
+1. `grep -rn "ggml_backend_meta_first_child_device"` over the tree:
+   after the change the only remaining hits are the overlay runtime call
+   (`overlay/.../runtime.cpp:2121`) and the overlay header note. No tree
+   declaration/definition/consumer remains.
+2. `grep -rn "ggml_backend_meta_event_gate|ggml_backend_meta_event_record|ggml_backend_meta_event_wait"`:
+   zero hits. The new single gate is `ggml_backend_meta_compose_event_gate`
+   (`ggml/src/ggml-backend-meta.cpp:202`), read by
+   `ggml_backend_meta_output_record` (`:4218`) only.
+3. `grep -rn "GGML_TP5_DW_BACKEND_EVENT|GGML_TP5_DW_DEVICE_WAIT"` excluding
+   `overlay/`: only two comment lines in `fork/tp5-compose/src/dw_event_trace.h`
+   (now rewritten to say the fields are overlay-only). No tree code reads either
+   variable.
+4. `grep -n "dw_device_wait|dw_compose_peer_available|record_calls|wait_calls|sync_calls|free_calls|skipped_unavailable"` in
+   `fork/tp5-compose/src/runtime.cpp`: zero hits; the include was removed.
+5. `grep -rn "dw_device_wait|dw_compose_event|DUALWIN-COMPOSE-EVENT"` over `*.md`:
+   only the rewritten doc.
+6. `grep -n "decode_calls"` in `fork/tp5-compose`: field exists
+   (`include/tq/tp5/runtime.h:72`) and is incremented at `runtime.cpp:1454`, so the
+   new receipt argument `result.windows[wi].decode_calls` resolves.
+7. Read-level review of every edited region (meta gate/iface, backend iface,
+   output_record/output_wait, runtime state/setup/epoch/teardown/receipt,
+   llama-context wait, both headers) for brace/paren and identifier consistency.
+8. Event-target review against the actual readback (read both files fully):
+   `ggml_backend_meta_get_tensor_async` (ggml/src/ggml-backend-meta.cpp:2102-2145)
+   uses `ggml_backend_meta_simple_backend(backend, 0)` +
+   `ggml_backend_tensor_get_async` for MIRRORED, and
+   `ggml_backend_meta_simple_backend(backend, j)` +
+   `ggml_backend_tensor_get_2d_async` for every `j` with
+   `simple_tensor->nb[axis+1] != 0` for a split axis.
+   `ggml_backend_meta_output_record` (same file, 4217-4299) selects
+   `backend_configs[j].backend` with the identical `nb[axis+1] != 0` predicate,
+   so record targets == copy targets. MIRRORED -> child 0 only, matching.
+9. Stream-identity review (CUDA/HIP backend):
+   `ggml_backend_cuda_get_tensor_async` (ggml-cuda.cu:3843-3852) and
+   `ggml_backend_cuda_get_tensor_2d_async` (:3867-3878) issue
+   `cudaMemcpyAsync`/`cudaMemcpy2DAsync` on `cuda_ctx->stream()`;
+   `ggml_backend_cuda_event_record` (:6448-6452) records on the same
+   `cuda_ctx->stream()`. `ggml_backend_cuda_context::stream()` returns
+   `streams[device][curr_stream_no]` (common.cuh:1613-1621). Strict relay sets
+   `lanes_per_rank = 1` (relay.hip:26) and uses
+   `ctx->streams[ctx->device][0]` as the lane stream (relay.hip:902-920), fails
+   unless `curr_stream_no == 0` and no other stream exists (relay.hip:807-828),
+   and `ggml_backend_cuda_graph_compute` rejects relay work with
+   `curr_stream_no != 0` (ggml-cuda.cu:6342). Conclusion (source-level, not a
+   device result): copy, record and relay lane share the one child stream.
+10. Readback-backend review: llama_context rejects relay graphs with
+    `ggml_backend_sched_get_n_splits != 1` and rejects non-Meta compute nodes
+    (src/llama-context.cpp:2647-2670), so the tensor backend used by
+    `ggml_backend_tensor_get_async` is the Meta backend whose
+    `get_tensor_async` the record mirrors.
+11. Unsupported latency wording removed from the runtime comment
+    (former "The drain already covered the wait time, so this returns without
+    adding the full device latency"); the code now says the deferral is a
+    placement and any saving is unmeasured.
+12. RUNBOOK rewritten: fixed `/tmp` path with `rm -rf` replaced by
+    `mktemp -d`; real CLI from `fork/tp5-compose/src/main.cpp usage()`; build
+    route is the package's CMake (`find_package(llama CONFIG REQUIRED)`,
+    `find_package(TQRelay/TQSampling/TQScheduling/TQText CONFIG REQUIRED)`) with
+    per-TU flags taken from `compile_commands.json` instead of guessed include
+    lists; HIP and profiler flags explicitly marked version/site dependent.
+    Prerequisites that do not exist on 12022 (installed A/B packages,
+    ROCm/hipcc, five ranks, model files) are listed as such.
+    Every `cmake` invocation — configure included, since it runs compiler
+    probes — and every compiler invocation is now prefixed with `$BS`
+    (`/home/kunweiz/.local/bin/build-slot`), in Layer 1, Layer 2 and Layer 3;
+    read-only helpers (`git`, `tar`, `cmp`, `jq`, `mktemp`) are not.
+    Logits companion names corrected to `<output>.logits.f32le` /
+    `<output>.logits.rows.jsonl` (main.cpp appends the suffix to the full
+    `--output` path), so the `cmp` paths use `stock.json.logits.f32le` etc.
+    A concrete `tests/real-tp5.py` invocation was added (`--output-dir` must not
+    exist; runs are device work, not compiles).
+13. `grep -rn "GGML_TP5_RSZ_RT"` over the tree and patches: 0 hits (no such gate
+    was added or used). Sampling code (`greedy.selected`) was not modified.
+14. Overlay build status: `grep -rn "mtp-async-protocol" --include=CMakeLists.txt --include=*.cmake .`
+    → no hits, i.e. the overlay candidate is not built by this tree's CMake, so the
+    removed accessor and the absent submit hooks do not affect any default build.
+
+Items 1-7 and 13-14 are grep/read checks; items 8-12 record source reading and
+documentation edits. None of this is compilation: a compiler error remains
+possible.
+
+## 4. Explicitly NOT executed
+
+- No `g++`/`clang++`/`hipcc` invocation of any kind (including `-fsyntax-only`),
+  no `bash -n`, no preprocessor run, no link, no CMake/configure.
+- No mock, fixture, harness, Python emulation or smoke script.
+- No `git apply --check`, no build-slot request.
+- No GPU, no `/dev/kfd`, no rocprof, no 13022 connection, no HIP flock.
+- No real model run; no receipt values exist because the binary was never built.
+
+## 5. Limits of this evidence
+
+Every statement in REPORT.md about behavior is a source-reading conclusion. In
+particular the stream identity between the D2H copy and `event_record`, the
+split-state resolution of the reference logits, the cost/benefit of the barrier
+and any overlap claim are unverified. `output_event_syncs`/`host_sync_replaced`
+are host call counters, not device completion evidence.

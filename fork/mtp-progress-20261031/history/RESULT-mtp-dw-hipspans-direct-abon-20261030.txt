@@ -1,0 +1,39 @@
+dw-hipspans-DIRECT-abon RESULT (OFF=GGML_TP5_DW_HIP_SPANS=0, ON=HIP_SPANS=1; KEY_V3=1 RELAY_FRAMES=1 => direct-only; SUBMIT_ONLY_GATE=0 ASYNC_PROTOCOL=1 GATE_METRICS=1; LATEBIND UNSET; SERIALCUT4 unset; hsp bin + libs-hsp; long prompts, predict=128, windows=2, K=9)
+OFF_1 rc= 0 steady_tok= 2048 ms/tok= 97.8 tok/s= 2.515 (info only)
+ON_1 rc= 0 steady_tok= 2048 ms/tok= 113.26 tok/s= 2.209 (info only)
+OFF_2 rc= 0 steady_tok= 2048 ms/tok= 127.45 tok/s= 2.131 (info only)
+ON_2 rc= 0 steady_tok= 2048 ms/tok= 113.26 tok/s= 2.18 (info only)
+GATE1 all legs rc0: PASS {'OFF_1': 0, 'ON_1': 0, 'OFF_2': 0, 'ON_2': 0}
+  OFF_1 vs ON_1: BITWISE
+  OFF_2 vs ON_2: BITWISE
+GATE2 logits OFF_i == ON_i bitwise: PASS
+  METER OFF_1 aggregates=0 skipped_mode_nonzero=0 relay_capture=0 relay_replay=0
+  DEV OFF_1 span_lines=0 spans_hdr=0 bad_hdr=0 map_lines=0 joinrc=1 pair_scope=[] pairs=0 pairs_overlap>0=0 max_overlap_ns=0 join_err=['no TP5_DW_HIP_OVERLAP_MAP lines: no window join keys'] -> ok
+  METER ON_1 aggregates=10 skipped_mode_nonzero=0 relay_capture=0 relay_replay=0
+  DEV ON_1 span_lines=77995 spans_hdr=10 bad_hdr=0 map_lines=2 joinrc=1 pair_scope=[] pairs=0 pairs_overlap>0=0 max_overlap_ns=0 join_err=['shared mode requires every span pci to map to exactly one window (pci 0000:0f:00.0 maps to multiple windows)'] -> BAD
+  METER OFF_2 aggregates=0 skipped_mode_nonzero=0 relay_capture=0 relay_replay=0
+  DEV OFF_2 span_lines=0 spans_hdr=0 bad_hdr=0 map_lines=0 joinrc=1 pair_scope=[] pairs=0 pairs_overlap>0=0 max_overlap_ns=0 join_err=['no TP5_DW_HIP_OVERLAP_MAP lines: no window join keys'] -> ok
+  METER ON_2 aggregates=10 skipped_mode_nonzero=0 relay_capture=0 relay_replay=0
+  DEV ON_2 span_lines=77995 spans_hdr=10 bad_hdr=0 map_lines=2 joinrc=1 pair_scope=[] pairs=0 pairs_overlap>0=0 max_overlap_ns=0 join_err=['shared mode requires every span pci to map to exactly one window (pci 0000:0f:00.0 maps to multiple windows)'] -> BAD
+GATE3 device overlap (ON: all aggregates skipped_mode=0 + relay capture=replay=0, joiner rc0, same_pci_shared_epoch, >=1 pair overlap_ns>0, dropped=0 errors=0; OFF: no spans, no pair claim): FAIL ON_1: joinrc=1 spans=77995 bad_hdr=0 scope=[] pairs>0=0 err=['shared mode requires every span pci to map to exactly one window (pci 0000:0f:00.0 maps to multiple windows)']; ON_2: joinrc=1 spans=77995 bad_hdr=0 scope=[] pairs>0=0 err=['shared mode requires every span pci to map to exactly one window (pci 0000:0f:00.0 maps to multiple windows)']
+  ENV OFF_1 KEY_V3=1 FRAMES=1 HIP_SPANS=0 banner_count=0 LATEBIND=None SERIALCUT4=None RSZ_RT=None -> ok
+  ENV ON_1 KEY_V3=1 FRAMES=1 HIP_SPANS=1 banner_count=1 LATEBIND=None SERIALCUT4=None RSZ_RT=None -> ok
+  ENV OFF_2 KEY_V3=1 FRAMES=1 HIP_SPANS=0 banner_count=0 LATEBIND=None SERIALCUT4=None RSZ_RT=None -> ok
+  ENV ON_2 KEY_V3=1 FRAMES=1 HIP_SPANS=1 banner_count=1 LATEBIND=None SERIALCUT4=None RSZ_RT=None -> ok
+GATE4 KEY_V3=1+FRAMES=1 all legs; no RSZ_RT; HIP_SPANS banners match legs; LATEBIND/SERIALCUT4 unset: PASS
+logits OFF_1==ON_1 report.json.logits.f32le BITWISE
+logits OFF_2==ON_2 report.json.logits.f32le BITWISE
+logits OFF_1==OFF_2 report.json.logits.f32le BITWISE
+JOINRC OFF_1 1
+SPANLINES OFF_1 0
+JOINRC ON_1 1
+SPANLINES ON_1 77995
+JOINRC OFF_2 1
+SPANLINES OFF_2 0
+JOINRC ON_2 1
+SPANLINES ON_2 77995
+LBSUM OFF_1 prefetch=1039 bind=1039 bind_accept=752 reuse_kept=752 discard_mismatch=0 discard_replay=0 discard_guard=0 skip_gate=14560
+LBSUM ON_1 prefetch=1039 bind=1039 bind_accept=752 reuse_kept=752 discard_mismatch=0 discard_replay=0 discard_guard=0 skip_gate=14560
+LBSUM OFF_2 prefetch=1039 bind=1039 bind_accept=752 reuse_kept=752 discard_mismatch=0 discard_replay=0 discard_guard=0 skip_gate=14560
+LBSUM ON_2 prefetch=1039 bind=1039 bind_accept=752 reuse_kept=752 discard_mismatch=0 discard_replay=0 discard_guard=0 skip_gate=14560
+VERDICT HIP_SPANS SAFE, DEVICE OVERLAP NOT PROVEN (GATE1/2/4 PASS, GATE3 FAIL: ON_1: joinrc=1 spans=77995 bad_hdr=0 scope=[] pairs>0=0 err=['shared mode requires every span pci to map to exactly one window (pci 0000:0f:00.0 maps to multiple windows)']; ON_2: joinrc=1 spans=77995 bad_hdr=0 scope=[] pairs>0=0 err=['shared mode requires every span pci to map to exactly one window)
