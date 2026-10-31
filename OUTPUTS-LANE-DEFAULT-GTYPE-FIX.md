@@ -166,7 +166,17 @@ Devops：`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.tx
 | `mem_hybrid::can_reuse` 强转错误（既有 bug，新路径可达） | 成立 | 改为 `llama_memory_hybrid_context`，复现侧访问经 `get_recr()` |
 | OFF 等值 / 并发 | 无问题 | — |
 
-**绑定的真实性**：`revalidate_after_patch` 的拓扑参照取"patch 之前 out_ids 实际绑定的宽度"；n_outputs lane 的绑定值来自 `union_rebind_outputs` 写入的 `nout_bound`（真实绑定），不是本轮请求宽度；比对对象 `params.n_outputs` 同样是真实请求宽度。
+**第三轮（Devops 1e5a 实测 + reviewer）**
+| 项 | 核实 | 修复 |
+|---|---|---|
+| `llama-context.cpp:3667` 写 const peek 指针 | 实测唯一报错 | 改走 `llama_nkv_ctx_state_get(this)` 可变引用 |
+| `llama-graph.cpp:1339` `mem_hybrid::can_reuse` 重复定义 | 实测报错，且新实现被粘在旧函数前 | 删除旧定义；每类恰好一份（正确类型版） |
+| `522-532` 的 `s_copy` 等应为 `inp_rs->` | 实测报错，属同一段粘连代码（`llm_graph_input_rs` 无这些成员） | 随重复定义一并删除；现所有 `s_copy*`/`head`/`rs_z`/`replay_len` 访问均带正确前缀 |
+| 取上轮 out_ids 宽(2) 与请求(1) 比较仍自拒 | 成立 | 改为**显式证明**：`revalidate_after_patch(params, kind, bound_width)`；被 patch 的那一维按"已证明的绑定宽度"判定，未 patch 的维度仍按图真实绑定宽度判定（不跳过任何检查） |
+| hybrid 父调用 `inp_rs->revalidate(params)` 把 hybrid 强转 recurrent（UB） | 成立 | 传 `recr_params.mctx = mctx->get_recr()`（hybrid 与 hybrid_iswa 都有 `get_recr()`） |
+| alloc 失败路径 `nout_bound` 未回滚 | 成立 | 失败块补 `nkv_st.nout_bound = nkv_st.nout_bound_prev` |
+
+**绑定的真实性**：：`revalidate_after_patch` 的拓扑参照取"patch 之前 out_ids 实际绑定的宽度"；n_outputs lane 的绑定值来自 `union_rebind_outputs` 写入的 `nout_bound`（真实绑定），不是本轮请求宽度；比对对象 `params.n_outputs` 同样是真实请求宽度。
 
 
 | 项 | 核实 | 修正 |
