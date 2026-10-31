@@ -1,6 +1,8 @@
 == worktree
 /home/kunweiz/work/m3tail-storage-20261031
-b88be2990ff207d781c3c9b23eec75d19874512d
+e753c9c31ebadf23d69fcf3f84b28e04285173c0
+e753c9c31 graph,probe: deliver the test-only hook in the tree and call the 7-arg builder
+a5fe91936 audit: refresh patch copy after the parser rewrite
 b88be2990 micro: parse recorded commands with explicit switch semantics, fail closed on ambiguity
 da7651743 audit: refresh patch copy for the recipe correction
 820013b9f micro: exact argv reconstruction in both recipes (duplicate compiler, -MMD order, private -L)
@@ -21,22 +23,23 @@ ffa185d85 audit: M3 tail-storage patch trail, defect chain and Devops verificati
 1d529d64a qwen4exp: give the M3 N-row owner tail independent lo storage (default off)
 
 == diff vs base f1c5fafc0 (stat)
- audit/AUDIT-AND-VERIFICATION.md   | 485 ++++++++++++++++++++++++++++++++++++++
- audit/m3-tail-storage.patch.txt   |  23 ++
- diag/m3-locate-divergence.py      | 109 +++++++++
+ audit/AUDIT-AND-VERIFICATION.md   | 523 ++++++++++++++++++++++++++++++++++++++
+ audit/m3-tail-storage.patch.txt   |  25 ++
+ diag/m3-locate-divergence.py      | 109 ++++++++
  diag/m3-n1-rowref.py              | 129 ++++++++++
- diag/m3-split-trunk-mixer.py      | 105 +++++++++
+ diag/m3-split-trunk-mixer.py      | 105 ++++++++
  diag/m3-tail-stamp-diff.py        |  91 +++++++
  diag/m3-tail-stamp.ggml-cuda.diff |  47 ++++
  ggml/include/ggml.h               |   1 +
  ggml/src/ggml-alloc.c             |  19 +-
- micro/build_mixer_n1ref.py        | 174 ++++++++++++++
- micro/build_mixer_prod.py         | 334 ++++++++++++++++++++++++++
- micro/m3-mixer-n1ref.cpp          | 306 ++++++++++++++++++++++++
- micro/m3-mixer-prod-path.cpp      | 222 +++++++++++++++++
- micro/m3-probe-hc-mix.cpp         | 118 ++++++++++
- src/models/qwen4exp.cpp           | 189 ++++++++++++++-
- 15 files changed, 2345 insertions(+), 7 deletions(-)
+ micro/build_mixer_n1ref.py        | 174 +++++++++++++
+ micro/build_mixer_prod.py         | 342 +++++++++++++++++++++++++
+ micro/m3-mixer-n1ref.cpp          | 306 ++++++++++++++++++++++
+ micro/m3-mixer-prod-path.cpp      | 222 ++++++++++++++++
+ micro/m3-probe-hc-mix.cpp         | 129 ++++++++++
+ src/llama-graph.h                 |  22 +-
+ src/models/qwen4exp.cpp           | 189 +++++++++++++-
+ 16 files changed, 2425 insertions(+), 8 deletions(-)
 
 == code diff
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
@@ -116,6 +119,46 @@ index cbe45779d..e2c8b9b58 100644
      size_t node_size = 0;
      if (!node->data && !node->view_src) {
          // If we previously had data but don't now then reallocate
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 00ecf89ed..896300546 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -885,7 +885,22 @@ public:
+     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+ 
+     ggml_cgraph  * get_gf()  const { return gf; }
+-    ggml_context * get_ctx() const { return ctx_compute.get(); }
++    ggml_context * get_ctx() const {
++#if defined(M3_PROBE_GRAPH_HOOK)
++        // Test-only: a caller-owned graph context that this result does not own.
++        // Null (the production default) keeps the shipped behaviour exactly.
++        if (ctx_compute_view != nullptr) {
++            return ctx_compute_view;
++        }
++#endif
++        return ctx_compute.get();
++    }
++
++#if defined(M3_PROBE_GRAPH_HOOK)
++    // Test-only hook, compiled only for the M3 device probe: point the result at a
++    // context and graph owned by the caller.  Not part of the model API.
++    void reset_context_view(ggml_context * c, ggml_cgraph * g) { ctx_compute_view = c; gf = g; }
++#endif
+ 
+     int64_t get_max_nodes() const;
+ 
+@@ -931,6 +946,11 @@ public:
+ 
+     ggml_context_ptr ctx_compute;
+ 
++#if defined(M3_PROBE_GRAPH_HOOK)
++    // Test-only, non-owning; set by reset_context_view() from the M3 device probe.
++    ggml_context * ctx_compute_view = nullptr;
++#endif
++
+     // memory buffers used to evaluate the model
+     std::vector<uint8_t> buf_compute_meta;
+ 
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
 index 78b58ee94..df3879f47 100644
 --- a/src/models/qwen4exp.cpp
