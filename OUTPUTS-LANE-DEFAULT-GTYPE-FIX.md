@@ -151,9 +151,22 @@ Devops：`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.tx
 - 无新增内存/上下文；`revalidate` 不分配、不切分 `balloc`。
 - OFF：不进入 binder，`revalidate` 不被调用；`n_outputs_exec` 初始为 0 时键回落到 `n_outputs`，行为与 stock 等价。
 
+**第二轮 review（be99ce508）核实与修正**
+| 项 | 核实 | 修正 |
+|---|---|---|
+| `this->params.allow_reuse` 用**构建** n_outputs 比较，变窄 patch 必自拒（`llama-graph.h:898`） | 成立 | `allow_reuse(other, n_outputs_topology = numeric_limits::max())`；`revalidate_after_patch` 传入 **out_ids 当前的执行宽度**（`get_n_outputs_for_topology()`），其它调用点默认参数＝stock 行为 |
+| `n_outputs_exec == 0` 哨兵 | 成立（0 是合法 bound，`union_rebind_outputs` 注释明示） | 改为独立 `bool n_outputs_exec_set` |
+| nout lane revalidate 失败缺计数/`nout_bound` 回滚 | 成立 | 失败分支补 `--c_applied`、`--nout_binds`、`++c_fallbacks`，并用新增的 `nout_bound_prev`（成功写入前记录）回滚 `nout_bound` |
+| mctx 覆盖不全 | 成立（且 reviewer 指出 hybrid 的 `set_input` 走 `get_attn()->set_input_k_idxs`，`attn_kv` 的 revalidate 对其无效） | 新增 `mem_hybrid` / `mem_hybrid_k` / `mem_hybrid_iswa`（同时刷新子输入 `inp_attn`/`inp_rs`）、`dsv4`（含 `inp_raw->mctx`）、`pos_bucket_kv`、`attn_k_dsa` |
+| 头文件内联 revalidate 访问前置声明类型（Devops 构建失败 6 处） | 成立 | **全部改为类外定义**（声明在头，定义在 `llama-graph.cpp`，此时 `llm_graph_params` 已完整） |
+| OFF 等值 | 成立 | 无 binder ⇒ `revalidate` 不被调用；`n_outputs_exec_set=false` ⇒ out_ids 键即 stock |
+| 并发 | 无新增（context 串行） | — |
+| nkv lane 与 nout lane 同轮时 `gparams.n_outputs` 与 `nout_bound` 不一致 | 属实但属既有设计：nkv lane 的校验用本轮请求宽度，其 `allow_reuse` 走默认参数，行为与 stock 相同 | 不修改（避免两条 lane 语义互相渗透），记录为已知边界 |
+
 **未覆盖/仍需证据**
-- DSA / DSV4 / hybrid 输入类没有 `can_reuse` 里的 `mctx` memo（DSA 的 `set_input` 走 `mctx->get_mla()`，属于不同的 owner 结构），本轮未改；若将来在这些架构开启 binder 需补同样的 `revalidate`。
-- 触发点（第三轮 decode 的 `reused=false`）的精确原因未逐帧验证：本修复不依赖它——只要"patch 成功 → 刷新 memo → 逐输入合同校验"成立，`set_inputs` 就必然拿到本轮上下文。
+- 第三轮 `reused=false` 的逐帧原因未验证；本修复不依赖它。
+- `revalidate` 族不对 `params.mctx` 做 null 检查（调用点 `process_ubatch` 已在 `:3499` 解引用过，非空；encoder 图不构造 attn 输入）。若将来从别处调用需补。
+- 全部改动未编译（Devops 上一轮构建失败已按内联→类外修正）；A1/A4/A5/A7 判据待回填。
 
 ### 6.5 残余风险 / PARTIAL
 - 未编译未测试；A1–A11 全部无运行证据。

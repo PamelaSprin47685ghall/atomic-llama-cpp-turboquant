@@ -7,6 +7,7 @@
 #include "llama-attention-view.h"
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 #include <memory>
 #include <set>
@@ -228,6 +229,8 @@ public:
     // ubatch's token count.
     bool can_reuse(const llm_graph_params & params) override;
 
+    void revalidate(const llm_graph_params & params) override;
+
     ggml_tensor * pos_bucket = nullptr; // I32 [n_kv, n_batch]
 
     const llama_hparams hparams;
@@ -257,8 +260,12 @@ public:
     // live tensor's ne[0] is the patched width, and comparing it against the
     // pre-patch store count would keep rejecting every round (the stale key
     // that made a patched-then-reused graph impossible).
-    const uint32_t n_outputs;          // build count (immutable)
-    uint32_t       n_outputs_exec = 0; // executed count, updated by revalidate()
+    const uint32_t n_outputs;              // build count (immutable)
+    uint32_t       n_outputs_exec     = 0; // executed count, updated by revalidate()
+    bool           n_outputs_exec_set = false; // 0 is a legal executed count
+
+    // the width this graph's out_ids topology currently closes over
+    uint32_t get_n_outputs_for_topology() const;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -394,9 +401,7 @@ public:
     // a patched-in-place graph still needs set_input() to run against THIS
     // ubatch's memory context (it owns the per-ubatch slot_info the k/v idx
     // setters read), so refresh the memo after a successful patch
-    void revalidate(const llm_graph_params & params) override {
-        mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
-    }
+    void revalidate(const llm_graph_params & params) override;
 
     void set_reader_input();
     std::vector<reader_input> readers;
@@ -443,9 +448,7 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    void revalidate(const llm_graph_params & params) override {
-        mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
-    }
+    void revalidate(const llm_graph_params & params) override;
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
 
@@ -477,6 +480,8 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    void revalidate(const llm_graph_params & params) override;
 
     ggml_tensor * get_k_idxs_mla() const { return self_k_idxs_mla; }
     ggml_tensor * get_k_idxs_lid() const { return self_k_idxs_lid; }
@@ -513,11 +518,7 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    // same in-place contract: refresh both the MSA context and the base one
-    void revalidate(const llm_graph_params & params) override {
-        mctx_msa = static_cast<const llama_kv_cache_msa_context *>(params.mctx);
-        mctx     = mctx_msa->get_base();
-    }
+    void revalidate(const llm_graph_params & params) override;
 
     ggml_tensor * get_k_idxs_idx() const { return self_k_idxs_idx; }
 
@@ -542,9 +543,7 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    void revalidate(const llm_graph_params & params) override {
-        mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
-    }
+    void revalidate(const llm_graph_params & params) override;
 
     ggml_tensor * get_k_idxs()     const { return self_k_idxs; }
     ggml_tensor * get_v_idxs()     const { return self_v_idxs; }
@@ -592,9 +591,7 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    void revalidate(const llm_graph_params & params) override {
-        mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
-    }
+    void revalidate(const llm_graph_params & params) override;
 
     ggml_tensor * get_k_idxs()     const { return self_k_idxs; }
     ggml_tensor * get_k_idxs_swa() const { return self_k_idxs_swa; }
@@ -680,6 +677,8 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    void revalidate(const llm_graph_params & params) override;
+
     llm_graph_input_dsv4_raw * get_raw() const { return inp_raw.get(); }
     const comp_input & get_csa() const { return inp_csa; }
     const comp_input & get_hca() const { return inp_hca; }
@@ -729,6 +728,8 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
+    void revalidate(const llm_graph_params & params) override;
+
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
 
     llm_graph_input_attn_kv * get_attn() const { return inp_attn.get(); }
@@ -755,6 +756,8 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    void revalidate(const llm_graph_params & params) override;
 
     std::unique_ptr<llm_graph_input_attn_k> inp_attn;
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
@@ -783,6 +786,8 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    void revalidate(const llm_graph_params & params) override;
 
     std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn;
     std::unique_ptr<llm_graph_input_rs>          inp_rs;
@@ -861,9 +866,18 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // n_outputs is part of the topology key (the out_ids gather closes over the
+    // output count), but a graph that was PATCHED in place legitimately runs at
+    // a count that differs from the one it was built with. allow_reuse() is
+    // about topology, so the caller states which n_outputs the comparison
+    // should use: the current one when judging "would a fresh build at `other`
+    // be identical", and the width the graph is actually bound to when judging
+    // "is this patched graph still consistent".
+    //
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
-    bool allow_reuse(const llm_graph_params & other) const {
+    bool allow_reuse(const llm_graph_params & other,
+                     uint32_t n_outputs_topology = std::numeric_limits<uint32_t>::max()) const {
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -895,7 +909,8 @@ struct llm_graph_params {
             return false;
         }
 
-        if (n_outputs != other.n_outputs) {
+        if ((n_outputs_topology == std::numeric_limits<uint32_t>::max() ? n_outputs : n_outputs_topology) !=
+                other.n_outputs) {
             return false;
         }
 

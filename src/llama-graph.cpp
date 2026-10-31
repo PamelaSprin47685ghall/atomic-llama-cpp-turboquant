@@ -279,6 +279,10 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_pos_bucket_kv::revalidate(const llm_graph_params & params) {
+    mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+}
+
 bool llm_graph_input_pos_bucket_kv::can_reuse(const llm_graph_params & params) {
     // r8 coverage lane: mirror can_reuse_kq_mask for the [n_kv, n_tokens]
     // relative-position bucket over the KV cache. The bucket's refill
@@ -353,14 +357,21 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     // reusable afterwards. Keeping the build count here would reject every
     // round that follows a successful patch and turn the patch into a
     // guaranteed rebuild.
-    res &= (n_outputs_exec != 0 ? n_outputs_exec : n_outputs) == params.n_outputs;
+    res &= (n_outputs_exec_set ? n_outputs_exec : n_outputs) == params.n_outputs;
 
     return res;
 }
 
 void llm_graph_input_out_ids::revalidate(const llm_graph_params & params) {
-    // after an in-place patch the executed count is whatever the patch bound
-    n_outputs_exec = params.n_outputs;
+    // after an in-place patch the executed count is whatever the patch bound;
+    // 0 is a legal bound (union_rebind_outputs treats it as first class), so the
+    // "set" state is tracked separately instead of overloading 0
+    n_outputs_exec     = params.n_outputs;
+    n_outputs_exec_set = true;
+}
+
+uint32_t llm_graph_input_out_ids::get_n_outputs_for_topology() const {
+    return n_outputs_exec_set ? n_outputs_exec : n_outputs;
 }
 
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
@@ -480,7 +491,19 @@ void llm_graph_input_rs::revalidate(const llm_graph_params & params) {
     mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 }
 
-bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+void llm_graph_input_mem_hybrid::revalidate(const llm_graph_params & params) {
+    mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+    // the hybrid input owns its attn/recr children; their set_input() calls go
+    // through these same objects, so refresh both masters as well
+    if (inp_attn) {
+        inp_attn->revalidate(params);
+    }
+    if (inp_rs) {
+        inp_rs->revalidate(params);
+    }
+}
+
+bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 
     this->mctx = mctx;
@@ -649,6 +672,14 @@ void llm_graph_input_attn_kv::set_reader_input() {
     }
 }
 
+// A graph patched in place still runs set_input() against THIS ubatch's memory
+// context (it owns the per-ubatch slot_info the k/v idx setters read), so the
+// memo is refreshed after a successful patch. Defined out of line: params is
+// only forward declared in the header.
+void llm_graph_input_attn_kv::revalidate(const llm_graph_params & params) {
+    mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+}
+
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 
@@ -674,6 +705,10 @@ void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+}
+
+void llm_graph_input_attn_k::revalidate(const llm_graph_params & params) {
+    mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 }
 
 bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
@@ -706,6 +741,11 @@ void llm_graph_input_attn_kv_msa::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_attn_kv_msa::revalidate(const llm_graph_params & params) {
+    mctx_msa = static_cast<const llama_kv_cache_msa_context *>(params.mctx);
+    mctx     = mctx_msa->get_base();
+}
+
 bool llm_graph_input_attn_kv_msa::can_reuse(const llm_graph_params & params) {
     mctx_msa = static_cast<const llama_kv_cache_msa_context *>(params.mctx);
 
@@ -734,6 +774,10 @@ void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
     mctx->get_lid()->set_input_kq_mask(self_kq_mask_lid, ubatch, cparams.causal_attn);
 
     mctx->get_lid()->set_input_k_rot(self_k_rot_lid);
+}
+
+void llm_graph_input_attn_k_dsa::revalidate(const llm_graph_params & params) {
+    mctx = static_cast<const llama_kv_cache_dsa_context *>(params.mctx);
 }
 
 bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
@@ -799,6 +843,10 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_attn_kv_iswa::revalidate(const llm_graph_params & params) {
+    mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
+}
+
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
 
@@ -857,6 +905,10 @@ void llm_graph_input_attn_k_iswa::set_input(const llama_ubatch * ubatch) {
     if (self_k_rot_swa && self_k_rot_swa->buffer) {
         mctx->get_swa()->set_input_k_rot(self_k_rot_swa);
     }
+}
+
+void llm_graph_input_attn_k_iswa::revalidate(const llm_graph_params & params) {
+    mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
 }
 
 bool llm_graph_input_attn_k_iswa::can_reuse(const llm_graph_params & params) {
@@ -1168,6 +1220,14 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_dsv4::revalidate(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
+    this->mctx = mctx;
+    // the raw sub-input is a plain struct, not an input object: refresh its
+    // context the same way can_reuse() does
+    inp_raw->mctx = mctx->get_raw();
+}
+
 bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
 
@@ -1321,6 +1381,16 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_recr()->consume_replay_len();
 }
 
+void llm_graph_input_mem_hybrid_k::revalidate(const llm_graph_params & params) {
+    mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+    if (inp_attn) {
+        inp_attn->revalidate(params);
+    }
+    if (inp_rs) {
+        inp_rs->revalidate(params);
+    }
+}
+
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
 
@@ -1399,6 +1469,16 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     mctx->get_recr()->consume_replay_len();
+}
+
+void llm_graph_input_mem_hybrid_iswa::revalidate(const llm_graph_params & params) {
+    mctx = static_cast<const llama_memory_hybrid_iswa_context *>(params.mctx);
+    if (inp_attn) {
+        inp_attn->revalidate(params);
+    }
+    if (inp_rs) {
+        inp_rs->revalidate(params);
+    }
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1541,7 +1621,18 @@ bool llm_graph_result::revalidate_after_patch(const llm_graph_params & params) {
     for (auto & input : inputs) {
         input->revalidate(params);
     }
-    if (!this->params.allow_reuse(params)) {
+    // The out_ids key is the executed width (set by revalidate above): that is
+    // the topology this graph now has, so the eligibility check must use it too.
+    // Comparing the BUILD width here would reject every n_outputs patch - which
+    // is exactly the dead end the previous round hit.
+    uint32_t n_outputs_topology = this->params.n_outputs;
+    for (auto & input : inputs) {
+        if (const auto * o = dynamic_cast<const llm_graph_input_out_ids *>(input.get())) {
+            n_outputs_topology = o->get_n_outputs_for_topology();
+            break;
+        }
+    }
+    if (!this->params.allow_reuse(params, n_outputs_topology)) {
         return false;
     }
     for (auto & input : inputs) {

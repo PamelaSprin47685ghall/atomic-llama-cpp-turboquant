@@ -143,6 +143,7 @@ struct llama_nkv_ctx_state {
     bool     nout_record_valid = false;
     uint32_t nout_cap          = 0;    // width the live graph was BUILT at
     uint32_t nout_bound        = 0;    // active count the live graph's output shapes currently hold
+    uint32_t nout_bound_prev   = 0;    // the bound before the last successful bind (unwind target)
 
     // ---- r8 coverage lane (GGML_TP5_NKV_COV, exact "1"; see the classifier
     // above). Every field here is r8-only: with the gate off (unset or any

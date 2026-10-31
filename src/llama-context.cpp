@@ -3206,6 +3206,7 @@ bool llama_context::union_rebind_outputs(llm_graph_result * res, const llm_graph
         return false;
     }
 
+    st.nout_bound_prev = st.nout_bound;     // for the caller's unwind if the graph cannot run
     st.nout_bound = (uint32_t) n_outputs;   // the executed output shapes now hold this count
     // r8: the shared scratch tail no longer bumps c_applied (the r7 tail bump
     // double-counted the nkv lane); each caller counts its own success. This
@@ -3654,6 +3655,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             // patched graph could never be reused). Fail-closed: any refusal
             // unwinds the patch and falls back to the full rebuild.
             if (!res->revalidate_after_patch(gparams)) {
+                // the patch is being unwound: undo the success bookkeeping the
+                // binder already committed (applied/binds/bound) and count a
+                // fallback, so attempts == applied + fallbacks stays true and
+                // the next round re-binds instead of trusting a bound that the
+                // rebuilt graph does not have
+                auto & nkv_st = llama_nkv_ctx_state_get(this);
+                --nkv_st.c_applied;
+                --nkv_st.nout_binds;
+                ++nkv_st.c_fallbacks;
+                binder_st->nout_bound = binder_st->nout_bound_prev;
                 nout_patched = false;
                 reused       = false;
             } else {
