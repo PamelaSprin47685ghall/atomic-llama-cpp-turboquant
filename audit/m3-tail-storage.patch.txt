@@ -1,6 +1,8 @@
 == worktree
 /home/kunweiz/work/m3tail-storage-20261031
-e753c9c31ebadf23d69fcf3f84b28e04285173c0
+f7354f517bab252bcdece6aa5f6cd19eb644764d
+f7354f517 graph,probe: drop the macro-guarded hook; hand the shipped result sole ownership
+23bd431f9 audit: refresh patch copy after the hook delivery
 e753c9c31 graph,probe: deliver the test-only hook in the tree and call the 7-arg builder
 a5fe91936 audit: refresh patch copy after the parser rewrite
 b88be2990 micro: parse recorded commands with explicit switch semantics, fail closed on ambiguity
@@ -23,25 +25,24 @@ ffa185d85 audit: M3 tail-storage patch trail, defect chain and Devops verificati
 1d529d64a qwen4exp: give the M3 N-row owner tail independent lo storage (default off)
 
 == diff vs base f1c5fafc0 (stat)
- audit/AUDIT-AND-VERIFICATION.md   | 523 ++++++++++++++++++++++++++++++++++++++
- audit/m3-tail-storage.patch.txt   |  25 ++
+ audit/AUDIT-AND-VERIFICATION.md   | 569 ++++++++++++++++++++++++++++++++++++++
+ audit/m3-tail-storage.patch.txt   |  27 ++
  diag/m3-locate-divergence.py      | 109 ++++++++
- diag/m3-n1-rowref.py              | 129 ++++++++++
- diag/m3-split-trunk-mixer.py      | 105 ++++++++
- diag/m3-tail-stamp-diff.py        |  91 +++++++
+ diag/m3-n1-rowref.py              | 129 +++++++++
+ diag/m3-split-trunk-mixer.py      | 105 +++++++
+ diag/m3-tail-stamp-diff.py        |  91 ++++++
  diag/m3-tail-stamp.ggml-cuda.diff |  47 ++++
  ggml/include/ggml.h               |   1 +
  ggml/src/ggml-alloc.c             |  19 +-
- micro/build_mixer_n1ref.py        | 174 +++++++++++++
- micro/build_mixer_prod.py         | 342 +++++++++++++++++++++++++
- micro/m3-mixer-n1ref.cpp          | 306 ++++++++++++++++++++++
- micro/m3-mixer-prod-path.cpp      | 222 ++++++++++++++++
- micro/m3-probe-hc-mix.cpp         | 129 ++++++++++
- src/llama-graph.h                 |  22 +-
- src/models/qwen4exp.cpp           | 189 +++++++++++++-
- 16 files changed, 2425 insertions(+), 8 deletions(-)
+ micro/build_mixer_n1ref.py        | 174 ++++++++++++
+ micro/build_mixer_prod.py         | 318 +++++++++++++++++++++
+ micro/m3-mixer-n1ref.cpp          | 306 ++++++++++++++++++++
+ micro/m3-mixer-prod-path.cpp      | 233 ++++++++++++++++
+ micro/m3-probe-hc-mix.cpp         | 169 +++++++++++
+ src/models/qwen4exp.cpp           | 194 ++++++++++++-
+ 15 files changed, 2484 insertions(+), 7 deletions(-)
 
-== code diff
+== code diff (ggml/, src/)
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 4cb5eb4d1..45344b30c 100644
 --- a/ggml/include/ggml.h
@@ -119,48 +120,8 @@ index cbe45779d..e2c8b9b58 100644
      size_t node_size = 0;
      if (!node->data && !node->view_src) {
          // If we previously had data but don't now then reallocate
-diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 00ecf89ed..896300546 100644
---- a/src/llama-graph.h
-+++ b/src/llama-graph.h
-@@ -885,7 +885,22 @@ public:
-     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
- 
-     ggml_cgraph  * get_gf()  const { return gf; }
--    ggml_context * get_ctx() const { return ctx_compute.get(); }
-+    ggml_context * get_ctx() const {
-+#if defined(M3_PROBE_GRAPH_HOOK)
-+        // Test-only: a caller-owned graph context that this result does not own.
-+        // Null (the production default) keeps the shipped behaviour exactly.
-+        if (ctx_compute_view != nullptr) {
-+            return ctx_compute_view;
-+        }
-+#endif
-+        return ctx_compute.get();
-+    }
-+
-+#if defined(M3_PROBE_GRAPH_HOOK)
-+    // Test-only hook, compiled only for the M3 device probe: point the result at a
-+    // context and graph owned by the caller.  Not part of the model API.
-+    void reset_context_view(ggml_context * c, ggml_cgraph * g) { ctx_compute_view = c; gf = g; }
-+#endif
- 
-     int64_t get_max_nodes() const;
- 
-@@ -931,6 +946,11 @@ public:
- 
-     ggml_context_ptr ctx_compute;
- 
-+#if defined(M3_PROBE_GRAPH_HOOK)
-+    // Test-only, non-owning; set by reset_context_view() from the M3 device probe.
-+    ggml_context * ctx_compute_view = nullptr;
-+#endif
-+
-     // memory buffers used to evaluate the model
-     std::vector<uint8_t> buf_compute_meta;
- 
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 78b58ee94..df3879f47 100644
+index 78b58ee94..e6c89db53 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -2,9 +2,12 @@
@@ -259,7 +220,7 @@ index 78b58ee94..df3879f47 100644
  // Keep the two existing top-k outputs alive for the fused expert reduction.
  // Their views, not the internal argsort/divide tensors, are materialized outputs.
  static void qwen4exp_moe_keep_route(ggml_tensor * out) {
-@@ -381,6 +460,68 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -381,6 +460,19 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
      }
  }
  
@@ -275,6 +236,18 @@ index 78b58ee94..df3879f47 100644
 +// The device test harness (micro/m3-mixer-prod-path.cpp) calls the same probe, so
 +// a leg can prove the production gate decided the retention instead of inferring
 +// it from output values.
++
+ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
+     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+         return std::make_unique<graph_mtp>(*this, params);
+@@ -390,6 +482,60 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const
+ 
+ // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
+ // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
++
++// M3 N-row owner-tail device diagnostics (see micro/m3-mixer-prod-path.cpp).
++// Compiled into the model TU so the device probe links the same definition the
++// model links; the switches are inert unless set to exactly "1".
 +struct qwen4exp_hc_mix_probe {
 +    static bool tail_diag() { const char * v = std::getenv("M3_TAIL_DIAG"); return v && std::atoi(v) != 0; }
 +    static bool tail_why()  { const char * v = std::getenv("M3_TAIL_WHY");  return v && std::atoi(v) != 0; }
@@ -325,10 +298,10 @@ index 78b58ee94..df3879f47 100644
 +    }
 +};
 +
- std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
-     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-         return std::make_unique<graph_mtp>(*this, params);
-@@ -419,6 +560,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+         ggml_tensor *  x,
+         ggml_tensor *  w_norm,
+@@ -419,6 +565,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
  
      ggml_tensor * lo = build_lora_mm(w_down, xn);
      lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
@@ -339,7 +312,7 @@ index 78b58ee94..df3879f47 100644
      if (qwen4exp_hc_keep_lo_enabled() && hc == 4 && nt == 1 &&
              (w_down->type == GGML_TYPE_BF16 || w_down->type == GGML_TYPE_Q8_0 ||
               w_down->type == GGML_TYPE_Q4_0) &&
-@@ -435,7 +580,48 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+@@ -435,7 +585,48 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
          // mixed after the original up node. No extra operation or copy is added.
          ggml_set_output(lo);
      }
@@ -389,7 +362,7 @@ index 78b58ee94..df3879f47 100644
      cb(gate, "hc_gate", il);
  
      ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
-@@ -455,6 +641,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+@@ -455,6 +646,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
      }
      mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
      cb(mixed, "hc_mixed", il);
