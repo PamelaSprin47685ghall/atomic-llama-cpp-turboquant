@@ -3451,6 +3451,33 @@ bool llama_context::union_binder_scratch_patch(llm_graph_result * res, llm_graph
         d->data   = nullptr;
         d->extra  = nullptr;
     }
+    // Extend that clear to the split copies pass 5 installed into the live
+    // graph. They are NOT part of the graph's node list (gallocr does not own
+    // them; they were created loose in the scheduler's copy context), yet the
+    // re-plan derives their backend/host placement from their (now stale)
+    // buffer: pass 1 would take the pre-allocated branch, and pass 5 would
+    // treat a previous round's copy as an input again - Devops saw exactly
+    // that on the outputs narrow path (set_input_k_idxs called with dst ==
+    // NULL after the bind re-plan). Clearing buffer/data/extra on every copy
+    // recorded for this graph restores the "just split, not yet allocated"
+    // state alloc_graph expects; the copies keep their identity and topology
+    // (copy pointers are not rewritten here) so the round's splits map onto
+    // the same copies.
+    {
+        const ggml_cgraph * g = res->get_gf();
+        const int n_nodes = g != nullptr ? ggml_graph_n_nodes(g) : 0;
+        for (int i = 0; i < n_nodes; ++i) {
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                ggml_tensor * cpy = ggml_backend_sched_get_src_copy(sched.get(), i, j);
+                if (cpy == nullptr) {
+                    continue;
+                }
+                cpy->buffer = nullptr;
+                cpy->data   = nullptr;
+                cpy->extra  = nullptr;
+            }
+        }
+    }
     nkv_scratch->reset();
     // r8: success counting moved to the CALLERS (union_rebind_n_kv bumps
     // c_applied for the nkv lane, union_rebind_outputs for the n_outputs

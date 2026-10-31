@@ -334,6 +334,14 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // Split copies the last split_graph installed into the live graph: for the
+    // node at index i (same order as ggml_graph_node) and src slot j, the copy
+    // tensor that pass 5 put there, or NULL when the slot kept the graph's own
+    // src. Callers that patch a live graph in place between rounds must clear
+    // these copies (buffer/data) before re-planning, so a re-plan never treats
+    // a previous round's copy as pre-allocated storage.
+    GGML_API struct ggml_tensor * ggml_backend_sched_get_src_copy(ggml_backend_sched_t sched, int i_node, int i_src);
+
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
