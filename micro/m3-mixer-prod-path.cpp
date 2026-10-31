@@ -25,6 +25,7 @@
 
 #include "llama.h"
 #include "ggml.h"
+#include "ggml-cpp.h"   // op names live in the C++ header
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
@@ -171,10 +172,15 @@ bool run_site(ggml_backend_t be, llama_model * model, int64_t n_embd, int64_t nt
     // WITNESS A (diagnostic only): the raw retention bits, next to the M3_TAIL_BUILD
     // line the model TU emits for the same site.  Neither is a pass criterion on its
     // own; the numeric check is Witness B.
-    printf("{\"nt\":%lld,\"site\":\"%s\",\"lo_flags\":%d,\"lo_no_reuse\":%d,\"lo_type\":\"%s\","
-           "\"down_type\":\"%s\",\"up_type\":\"%s\",\"inject\":\"%s\",\"tail_keep\":\"%s\","
-           "\"diag_scope\":\"%s\"}\n",
-           (long long) nt, mixer ? "mixer" : "trunk", lo->flags, int(m3_probe_lo_retained(lo)),
+    // Tensor identity: the name the builder gave the node, its op and its shape.
+    // The same line is printed by every leg, so the ON/OFF pairing can be checked
+    // by identity rather than by position in a log.
+    printf("{\"nt\":%lld,\"site\":\"%s\",\"lo_name\":\"%s\",\"lo_op\":\"%s\",\"lo_shape\":\"%lldx%lldx%lldx%lld\","
+           "\"lo_flags\":%d,\"lo_no_reuse\":%d,\"lo_type\":\"%s\",\"down_type\":\"%s\",\"up_type\":\"%s\","
+           "\"inject\":\"%s\",\"tail_keep\":\"%s\",\"diag_scope\":\"%s\"}\n",
+           (long long) nt, mixer ? "mixer" : "trunk", lo->name, ggml_op_name(lo->op),
+           (long long) lo->ne[0], (long long) lo->ne[1], (long long) lo->ne[2], (long long) lo->ne[3],
+           lo->flags, int(m3_probe_lo_retained(lo)),
            ggml_type_name(lo->type), ggml_type_name(created.down->type),
            ggml_type_name(created.up->type),
            created.inject ? ggml_type_name(created.inject->type) : "<none>",

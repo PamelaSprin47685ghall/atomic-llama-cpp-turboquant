@@ -613,6 +613,42 @@ Nothing in this section was compiled, run or syntax-checked: **G2 remains unprov
 
 Nothing in this section was compiled, run or syntax-checked: **G2 remains unproven**.
 
+## 5k. Eighth review: no global counters — per-instance, per-call retention witness
+
+The reviewer's points were all correct and the previous instrument is withdrawn:
+
+* three `static int64_t` counters were incremented with plain `++` from
+  `ggml_gallocr_allocate_node` / `ggml_gallocr_free_node`, which run on whatever thread owns the
+  gallocr — a data race across concurrent `galloc`/window planning;
+* they accumulated for the process lifetime, so a number could not be attributed to one graph or one
+  mixer site;
+* they were written even with the switch off (the increment was unconditional; only the report was
+  gated), i.e. a normal-path write;
+* and "no line in the log" was being read as "count is zero", which is not a measurement.
+
+Replacement, in `ggml/src/ggml-alloc.c` only:
+
+| property | design |
+|---|---|
+| storage | `struct ggml_gallocr` gains a 3-counter struct plus one bool (`m3_witness`, `m3_witness_on`) — no global, no atomic, no allocation (the struct is already heap-allocated per allocator) |
+| isolation | gallocrs are not shared between threads (the existing API contract), so the counters are touched only by the thread that owns that instance; no `atomic exchange`, no cross-window bleed |
+| lifecycle | reset to zero at the **start of every `ggml_gallocr_alloc_graph` call**, so one report line describes exactly one graph plan on exactly one instance |
+| cost when off | the env is read once per instance in `ggml_gallocr_new_n`; with the switch off each counting site is a single `if (galloc->m3_witness_on)` test and writes nothing; with it on there is no allocation, only three integer increments |
+| output | one `M3_ALLOC_WITNESS nodes=<n> retained_free_skip=… no_reuse_inplace_skip=… view_reuse_skip=…` line per call, printed **only** when armed; absence of the line means "not measured", never "zero" |
+| no API | fields are internal to the `.c` file's struct; no header change, no exported symbol, no new function |
+
+Tensor identity is proven independently of the counters: the model TU's `M3_TAIL_BUILD` line names the
+site (`row_scope`, `il`, `nt`) and the tensors (`hc_lo`, `hc_up`, `hc_mixed`), and the harness line
+prints the **name, op and shape** of the `lo` node it received (`lo_name`/`lo_op`/`lo_shape`), which
+must be identical in the ON and OFF legs — the comparison is by identity, not by position in a log.
+`lo_flags` remains informational only.
+
+Admissibility (Devops): ON leg must show `retained_free_skip > 0` on the site's graph (and
+`view_reuse_skip > 0` for a mixer site); OFF and every mis-armed spelling (`unset`, `""`, `0`, `01`,
+`true`) must show both zero; identity lines must match; then the per-row N=1 numeric check.
+
+Nothing in this section was compiled, run or syntax-checked: **G2 remains unproven**.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -636,7 +672,8 @@ Nothing in this section was compiled, run or syntax-checked: **G2 remains unprov
   do not exist in the shipped interface, so §5i replaces both with the real
   `llm_graph_result(max_nodes)` and the public `ggml_tallocr` path; the probe also used the opaque
   `ggml_cgraph` struct and its witness could not separate "not retained" from "gate off" (§5j adds
-  `ggml_graph_n_nodes` and allocator-side retention counters). Nothing has been executed, so G2
+  `ggml_graph_n_nodes`), and the retention counters were global and racy (§5k replaces them with
+  per-instance, per-call state that is written only when armed). Nothing has been executed, so G2
   remains unproven; the production gate is exact `"1"` again and the previous
   `trunk`/`mixer`-inside-`TAIL_KEEP` revision is reverted (kept as evidence above);
   token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
