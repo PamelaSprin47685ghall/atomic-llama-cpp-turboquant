@@ -8564,9 +8564,19 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     // GGML_TP5_FA_RTLEN: the runtime effective KV length from src[5] (I32[1]).
     // Derived after the locals so nek1 (k->ne[1]) exists; bounded by the built
     // width. OFF (no I32 src[5]) == nek1 == stock.
+    // Fail-closed tensor-channel contract: the src[5] tensor carries NO off
+    // sentinel (the documented -1 off sentinel belongs to the op-param
+    // channel, which ggml-cpu never reads); the producer
+    // (llama_kv_cache_context::set_input_nkv_eff) fills [0, built width] and
+    // any negative is corruption -> abort.
     const ggml_tensor * n_kv_eff_t = (dst->src[5] && dst->src[5]->type == GGML_TYPE_I32 &&
                                       ggml_nelements(dst->src[5]) == 1) ? dst->src[5] : nullptr;
-    const int64_t n_kv_eff = n_kv_eff_t ? std::min<int64_t>(((const int32_t *) n_kv_eff_t->data)[0], nek1) : nek1;
+    int64_t n_kv_eff = nek1;
+    if (n_kv_eff_t != nullptr) {
+        const int32_t n_kv_raw = ((const int32_t *) n_kv_eff_t->data)[0];
+        GGML_ASSERT(n_kv_raw >= 0 && n_kv_raw <= nek1);
+        n_kv_eff = n_kv_raw;
+    }
 
     const int64_t DK = nek0;
     const int64_t DV = nev0;
@@ -9169,8 +9179,19 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const ggml_tensor * rel   = (dst->src[5] && dst->src[5]->type != GGML_TYPE_I32) ? dst->src[5] : nullptr;
     const ggml_tensor * n_kv_eff_t = (dst->src[5] && dst->src[5]->type == GGML_TYPE_I32 &&
                                       ggml_nelements(dst->src[5]) == 1) ? dst->src[5] : nullptr;
-    // effective length: bounded by the built width (envelope); stock == nek1
-    const int64_t n_kv_eff = n_kv_eff_t ? std::min<int64_t>(((const int32_t *) n_kv_eff_t->data)[0], k->ne[1]) : k->ne[1];
+    // Fail-closed tensor-channel contract: the raw I32 src[5] value must lie
+    // in [0, built KV width]. The src[5] tensor carries NO off sentinel (the
+    // documented -1 off sentinel belongs to the op-param channel, which
+    // ggml-cpu never reads); the producer (set_input_nkv_eff) fills
+    // [0, built width] and any negative is corruption -> abort. 0 is a legal
+    // zero-length region (empty cache frontier).
+    // (k->ne[1] spelled out: the GGML_TENSOR_LOCALS below declare nek1 later.)
+    int64_t n_kv_eff = k->ne[1];
+    if (n_kv_eff_t != nullptr) {
+        const int32_t n_kv_raw = ((const int32_t *) n_kv_eff_t->data)[0];
+        GGML_ASSERT(n_kv_raw >= 0 && n_kv_raw <= k->ne[1]);
+        n_kv_eff = n_kv_raw;
+    }
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)

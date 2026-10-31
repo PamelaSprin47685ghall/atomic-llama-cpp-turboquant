@@ -2818,6 +2818,31 @@ llama_union_tensor_set llama_context::union_tensors_n_kv() {
     return { &st.record_t, &st.record_src, &st.record_fixed, &st.record_bytes };
 }
 
+// reader-audit: does this graph result carry attention-view reader inputs?
+// The plain attn_kv input (and the msa derivative sharing the class) holds
+// build-time captured spans; the hybrid wrapper embeds one. Checked against
+// the LIVE graph's captured input state so a graph built under attention
+// views stays refused even after the views are cleared from the cache. All
+// other input variants carry no reader state (verified: no other input class
+// has a readers member, and the msa/hybrid builders never populate one).
+static bool llama_graph_result_has_attn_readers(const llm_graph_result * res) {
+    if (res == nullptr) {
+        return false;
+    }
+    for (const auto & input : res->inputs) {
+        if (const auto * kv = dynamic_cast<const llm_graph_input_attn_kv *>(input.get())) {
+            if (!kv->readers.empty()) {
+                return true;
+            }
+        } else if (const auto * hy = dynamic_cast<const llm_graph_input_mem_hybrid *>(input.get())) {
+            if (hy->inp_attn != nullptr && !hy->inp_attn->readers.empty()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool llama_context::union_rebind_n_kv(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set) {
     // the record vectors come from the binding's tensor set provider; alias them
     // once (all later reads/writes go through these names)
@@ -2882,25 +2907,28 @@ bool llama_context::union_rebind_n_kv(llm_graph_result * res, const llm_graph_pa
         ++st.c_fallbacks;
         return false;
     }
-    // r8 coverage lane: fail-closed on attention-view readers (the "view"
-    // family's reader subpath). Reader inputs capture build-time spans/values
-    // (llama-graph.cpp, build_attn_inp_kv_impl -> readers); the in-place patch
-    // copies tensor layouts only - it cannot re-resolve captured reader
-    // values - and the skeleton compare checks sizes only, so a frontier
-    // change with equal reader sizes would patch the graph and then write
-    // stale captured values at set_input. Refuse and let the caller
-    // full-rebuild (the fresh build re-resolves the readers at the current
-    // frontier). OFF (cov gate not exactly "1"): r7 behavior - unchanged.
-    if (st.cov_enabled) {
-        bool attn_views = false;
-        for (int i = 0; i < nkvs; ++i) {
-            attn_views |= kvs[i]->has_attention_views();
-        }
-        if (attn_views) {
+    // Fail-closed on attention-view readers (reader-audit fix; was gated on
+    // the r8 cov lane). The in-place patch copies tensor layouts only: it
+    // cannot re-resolve build-time captured reader spans, so patching a
+    // reader graph would execute stale spans against the patched widths.
+    // Two detectors, both must miss: the cache's CURRENT attention-view
+    // state, and the live graph's captured input reader state (the latter
+    // covers graphs built under views that were cleared before this rebind).
+    // Refuse unconditionally and fall back to the caller's full rebuild,
+    // which re-resolves the readers at the current frontier.
+    // c_refused_view stays r8 cov-family (never written with the gate off);
+    // c_fallbacks (r7 field) accounts every refusal.
+    bool attn_readers = false;
+    for (int i = 0; i < nkvs; ++i) {
+        attn_readers |= kvs[i]->has_attention_views();
+    }
+    attn_readers |= llama_graph_result_has_attn_readers(res);
+    if (attn_readers) {
+        if (st.cov_enabled) {
             ++st.c_refused_view;
-            ++st.c_fallbacks;
-            return false;
         }
+        ++st.c_fallbacks;
+        return false;
     }
     // non-nkv graph keys must be identical: allow_reuse compares every graph-
     // shaping input EXCEPT the n_kv-coupled shapes (ubatch layout, sequence
@@ -3094,6 +3122,28 @@ bool llama_context::union_rebind_outputs(llm_graph_result * res, const llm_graph
             ++st.c_fallbacks;
             return false;
         }
+    }
+    // Fail-closed on attention-view readers (reader-audit fix): the n_outputs
+    // rebind's shared pre-allocation record covers reader input tensors too,
+    // and a patch copies layout only - it cannot re-resolve build-time
+    // captured reader spans. Two detectors, both must miss: the cache's
+    // CURRENT attention-view state, and the live graph's captured input
+    // reader state (the latter covers graphs built under views that were
+    // cleared before this rebind). Refuse and fall back to the caller's full
+    // rebuild, which re-resolves the readers at the current frontier.
+    // c_refused_view stays r8 cov-family (never written with the gate off);
+    // c_fallbacks (r7 field) accounts every refusal.
+    bool attn_readers = false;
+    for (int i = 0; i < nkvs; ++i) {
+        attn_readers |= kvs[i]->has_attention_views();
+    }
+    attn_readers |= llama_graph_result_has_attn_readers(res);
+    if (attn_readers) {
+        if (st.cov_enabled) {
+            ++st.c_refused_view;
+        }
+        ++st.c_fallbacks;
+        return false;
     }
 
     // scratch build at the active count (plain n_outputs - no envelope)
