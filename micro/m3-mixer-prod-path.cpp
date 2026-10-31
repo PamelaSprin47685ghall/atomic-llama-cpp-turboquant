@@ -162,6 +162,10 @@ bool run_site(ggml_backend_t be, llama_model * model, int64_t n_embd, int64_t nt
     ggml_set_output(mixed);
     ggml_set_output(lo);
     ggml_set_output(up);
+    // A fresh gallocr per site: its first ggml_gallocr_alloc_graph is a real
+    // planning pass, so the M3_ALLOC_WITNESS "planned" line of this leg describes
+    // this graph and no other.  A reused plan (second call on the same gallocr)
+    // would print status=not_measured instead, which must never be read as zero.
     ggml_gallocr_t ga = ggml_gallocr_new(buft);
     if (!ggml_gallocr_alloc_graph(ga, gf)) {
         ggml_gallocr_free(ga);
@@ -201,7 +205,7 @@ bool run_site(ggml_backend_t be, llama_model * model, int64_t n_embd, int64_t nt
             fclose(f);
         }
     }
-    ggml_gallocr_free(ga);
+    ggml_gallocr_free(ga);          // one gallocr per site: no plan reuse across sites
     ggml_backend_buffer_free(buf);   // tensor data first ...
     m3_probe_release();              // ... then the context that describes it
     return ok;

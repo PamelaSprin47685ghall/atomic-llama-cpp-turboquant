@@ -505,6 +505,7 @@ struct ggml_gallocr {
         int64_t view_reuse_skip;      // in-place reuse refused: view owner retained
     } m3_witness;
     bool m3_witness_on;   // armed once per instance from GGML_M3_ALLOC_WITNESS
+    int64_t m3_plan_id;   // increments once per real planning pass on this instance
 };
 
 // The M3 retention witness is armed by GGML_M3_ALLOC_WITNESS=1, read once per
@@ -753,6 +754,17 @@ static int get_node_buffer_id(const int * node_buffer_ids, int i) {
 }
 
 static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    // M3 witness window: this function is the only place that plans an allocation
+    // (it is reached from ggml_gallocr_reserve_n_impl).  Counters start at zero
+    // here and are reported at the end of this same call, so a report always
+    // describes one real planning pass -- never a reuse of an earlier plan.
+    if (galloc->m3_witness_on) {
+        galloc->m3_witness.retained_free_skip    = 0;
+        galloc->m3_witness.no_reuse_inplace_skip = 0;
+        galloc->m3_witness.view_reuse_skip       = 0;
+        galloc->m3_plan_id++;
+    }
+
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
@@ -860,6 +872,21 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             }
             AT_PRINTF("\n");
         }
+    }
+
+    if (galloc->m3_witness_on) {
+        // Read-only summary of the planning pass that just finished on this
+        // instance.  The graph identity (node count + first/last node names) lets
+        // a leg attribute the numbers to one site instead of guessing by position.
+        GGML_LOG_INFO("%s: M3_ALLOC_WITNESS status=planned plan_id=%lld nodes=%d "
+                      "first=%s last=%s retained_free_skip=%lld no_reuse_inplace_skip=%lld "
+                      "view_reuse_skip=%lld\n", __func__, (long long) galloc->m3_plan_id,
+                ggml_graph_n_nodes(graph),
+                graph->n_nodes > 0 ? graph->nodes[0]->name : "-",
+                graph->n_nodes > 0 ? graph->nodes[graph->n_nodes - 1]->name : "-",
+                (long long) galloc->m3_witness.retained_free_skip,
+                (long long) galloc->m3_witness.no_reuse_inplace_skip,
+                (long long) galloc->m3_witness.view_reuse_skip);
     }
 }
 
@@ -1096,12 +1123,6 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
-    // Per-call witness window: counts start at zero for this graph plan on this
-    // allocator instance.  No allocation decision reads them.
-    galloc->m3_witness.retained_free_skip    = 0;
-    galloc->m3_witness.no_reuse_inplace_skip = 0;
-    galloc->m3_witness.view_reuse_skip       = 0;
-
     if (ggml_gallocr_needs_realloc(galloc, graph)) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
@@ -1146,15 +1167,15 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
         ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
     }
 
-    if (galloc->m3_witness_on) {
-        // Read-only summary of this call: what the allocator itself decided about
-        // retained tensors while planning this one graph.
-        GGML_LOG_INFO("%s: M3_ALLOC_WITNESS nodes=%d retained_free_skip=%lld "
-                      "no_reuse_inplace_skip=%lld view_reuse_skip=%lld\n", __func__,
-                ggml_graph_n_nodes(graph),
-                (long long) galloc->m3_witness.retained_free_skip,
-                (long long) galloc->m3_witness.no_reuse_inplace_skip,
-                (long long) galloc->m3_witness.view_reuse_skip);
+    // This call only applies a plan that already exists; whether that plan was just
+    // created (a "planned" report was printed by ggml_gallocr_alloc_graph_impl in
+    // this same call) or reused from an earlier call, no planning pass runs here.
+    // It therefore reports no counts: a zeroed counter set here would be
+    // indistinguishable from "the gate was off".
+    if (galloc->m3_witness_on && galloc->m3_plan_id == 0) {
+        GGML_LOG_INFO("%s: M3_ALLOC_WITNESS nodes=%d status=not_measured reason=no_plan_yet "
+                      "plan_id=%lld\n", __func__, ggml_graph_n_nodes(graph),
+                (long long) galloc->m3_plan_id);
     }
 
     return true;

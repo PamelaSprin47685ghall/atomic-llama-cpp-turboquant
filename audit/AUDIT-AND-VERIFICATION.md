@@ -649,6 +649,32 @@ Admissibility (Devops): ON leg must show `retained_free_skip > 0` on the site's 
 
 Nothing in this section was compiled, run or syntax-checked: **G2 remains unproven**.
 
+## 5l. Ninth review: report only a real planning pass, and attribute by graph identity
+
+The reviewer is right that `ggml_gallocr_alloc_graph` does not plan when it reuses an earlier plan, so a
+zeroed counter set printed there was indistinguishable from "the gate is off".  Corrections, still
+inside `ggml/src/ggml-alloc.c` with no API change:
+
+| point | now |
+|---|---|
+| when counters exist | the witness window opens **only** in `ggml_gallocr_alloc_graph_impl`, the single function that plans (reached from `ggml_gallocr_reserve_n_impl`); that is the only place counters are zeroed, counted and reported |
+| reuse | `ggml_gallocr_alloc_graph` reports **`status=not_measured reason=no_plan_yet`** (and only before the instance has ever planned) instead of a zeroed `planned` line; a reused plan is never presented as a measurement |
+| plan identity | each planning pass increments `m3_plan_id` on that instance; the report carries `plan_id` |
+| site attribution | the report carries `nodes=<n> first=<first node name> last=<last node name>`; with the model TU's `M3_TAIL_BUILD` (`row_scope`, `il`, `nt`) and the harness's `lo_name`/`lo_op`/`lo_shape`, a leg is matched by identity, not by log order |
+| OFF cost | unchanged: one bool test per counting site, no writes, and no line is emitted at all when unarmed |
+
+Devops reading rules (also printed by the recipe):
+
+* `status=planned` + `retained_free_skip > 0` ⇒ the gate armed retention on that graph;
+  `view_reuse_skip > 0` ⇒ a view owner (the mixer's `xn`) was retained;
+* `status=planned` + both counters `0` ⇒ no retention happened in that plan (this is the OFF leg's
+  expected line, and it is only meaningful because it comes from a real plan);
+* `status=not_measured` ⇒ no conclusion either way;
+* no line ⇒ witness not armed ⇒ not measured;
+* the harness builds one gallocr per site, so its first `ggml_gallocr_alloc_graph` always plans.
+
+Nothing in this section was compiled, run or syntax-checked: **G2 remains unproven**.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -673,8 +699,9 @@ Nothing in this section was compiled, run or syntax-checked: **G2 remains unprov
   `llm_graph_result(max_nodes)` and the public `ggml_tallocr` path; the probe also used the opaque
   `ggml_cgraph` struct and its witness could not separate "not retained" from "gate off" (§5j adds
   `ggml_graph_n_nodes`), and the retention counters were global and racy (§5k replaces them with
-  per-instance, per-call state that is written only when armed). Nothing has been executed, so G2
-  remains unproven; the production gate is exact `"1"` again and the previous
+  per-instance, per-call state that is written only when armed), and that state was then reported
+  from a path that can reuse a plan (§5l reports only real planning passes and adds `plan_id` plus
+  first/last node identity). Nothing has been executed, so G2 remains unproven; the production gate is exact `"1"` again and the previous
   `trunk`/`mixer`-inside-`TAIL_KEEP` revision is reverted (kept as evidence above);
   token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
   §5a/§5b give the placement-stamp and per-layer capture plan.  The gate stays closed: promotion is
