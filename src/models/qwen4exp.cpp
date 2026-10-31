@@ -93,6 +93,18 @@ static bool qwen4exp_hc_n3_tail_keep_enabled() {
     return enabled;
 }
 
+// Retain the storage owner of xn for the same reason. A view cannot be
+// retained, and galloc frees a view's owner once the last view loses its last
+// consumer, so the flag belongs on the base tensor. Only the mixer sites
+// without an inject projection need it: everywhere else xn outlives the tail
+// because the inject projection still reads it.
+static void qwen4exp_hc_n3_retain_xn(ggml_tensor * xn) {
+    ggml_tensor * base = xn->view_src != nullptr ? xn->view_src : xn;
+    if (base->type == GGML_TYPE_F32 && ggml_is_contiguous(base)) {
+        base->flags |= GGML_TENSOR_FLAG_NO_REUSE;
+    }
+}
+
 // Keep the two existing top-k outputs alive for the fused expert reduction.
 // Their views, not the internal argsort/divide tensors, are materialized outputs.
 static void qwen4exp_moe_keep_route(ggml_tensor * out) {
@@ -477,10 +489,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             lo->ne[2] == 1 && lo->ne[3] == 1 && lo->view_src == nullptr &&
             ggml_is_contiguous(lo)) {
         // Same shapes the HIP tail guard accepts, so only sites that can fuse
-        // pay the retained 320 x nt x 4 B. lo is not pinned for the mixer sites
-        // without an inject projection (inject == nullptr): xn dies at gated
-        // there, and an out/xn overlap only keeps the guard's fail-closed veto.
+        // pay the retained 320 x nt x 4 B.
         lo->flags |= GGML_TENSOR_FLAG_NO_REUSE;
+        if (inject == nullptr) {
+            qwen4exp_hc_n3_retain_xn(xn);
+        }
     }
     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
     cb(gate, "hc_gate", il);
