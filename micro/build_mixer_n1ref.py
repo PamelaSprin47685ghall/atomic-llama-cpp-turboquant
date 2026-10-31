@@ -29,14 +29,28 @@ SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "m3-mixer-n1ref.c
 
 
 def flags_from_template():
+    """Every recorded flag except the ones that name lane output files.
+
+    The previous filter kept only -I/-D/-O/-f/-W/--offload-arch/-std and thereby
+    dropped the lane's `-x hip`, so the generated command could not find
+    hip/hip_runtime.h.  Fidelity is now the rule: drop only what names an output
+    (-o, -c, -MF, -MT, -MD, -MTdeps) and keep everything else verbatim.
+    """
     argv = json.load(open(TEMPLATE))["argv"]
-    keep = []
-    for a in argv:
-        if a.startswith(("-I", "-D", "--offload-arch", "-std=", "-O", "-f", "-W")):
-            keep.append(a)
-        if a == "-isystem" or a == "-include":
-            keep.append(a)
-    return keep
+    drop_value_after = {"-o", "-c", "-MF", "-MT", "-MD", "-MTdeps"}
+    out = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in drop_value_after:
+            i += 2
+            continue
+        if a.startswith("-Wl,--dependency-file"):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
 
 
 def main(argv):
@@ -46,9 +60,9 @@ def main(argv):
     outdir, libdir = argv[1], argv[2]
     os.makedirs(outdir, exist_ok=True)
     cc = "/opt/rocm/core-10.0/lib/llvm/bin/clang++"
-    args = [cc, "-fPIC", "-O3", "-DNDEBUG", "--offload-arch=gfx1030", "-std=c++17"]
-    args += flags_from_template()
-    args += [
+    # The template already carries the lane's -x hip, -std, -O, -DNDEBUG,
+    # --offload-arch and include set; do not add a second copy of any of them.
+    args = [cc] + flags_from_template() + [
         SRC,
         "-o", os.path.join(outdir, "m3-mixer-n1ref"),
         "-L" + libdir,
