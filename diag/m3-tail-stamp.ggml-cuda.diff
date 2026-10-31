@@ -1,0 +1,45 @@
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@
+     if (!closed) {
+         return false;
+     }
+-    if (ggml_cuda_hc_trio_overlaps(out, lo) || ggml_cuda_hc_trio_overlaps(out, xn) ||
+-            ggml_cuda_hc_trio_overlaps(out, weights) ||
+-            (up_out && (ggml_cuda_hc_trio_overlaps(up, lo) || ggml_cuda_hc_trio_overlaps(up, xn) ||
+-                        ggml_cuda_hc_trio_overlaps(up, out))) ||
+-            aliases.has_owner_tail_hazard(ctx, cgraph, i)) {
+-        return false;
++    {
++        const int why = ggml_cuda_hc_trio_overlaps(out, lo) ? 1 : ggml_cuda_hc_trio_overlaps(out, xn) ? 2 :
++                ggml_cuda_hc_trio_overlaps(out, weights) ? 3 :
++                (up_out && ggml_cuda_hc_trio_overlaps(up, lo)) ? 4 : (up_out && ggml_cuda_hc_trio_overlaps(up, xn)) ? 5 :
++                (up_out && ggml_cuda_hc_trio_overlaps(up, out)) ? 6 : aliases.has_owner_tail_hazard(ctx, cgraph, i) ? 7 : 0;
++        static const bool m3d = [] { const char * v = std::getenv("M3_TAIL_DIAG"); return v && std::atoi(v) != 0; }();
++        if (m3d) {
++            GGML_LOG_INFO("M3_TAIL_WHY why=%d rows=%lld node=%d n_nodes=%d\n", why,
++                    (long long) cgraph->nodes[i]->ne[1], i, cgraph->n_nodes);
++        }
++        static const bool stamp = [] { const char * v = std::getenv("M3TAIL_STAMP"); return v && std::atoi(v) == 1; }();
++        static const char * const stamp_path = std::getenv("M3TAIL_STAMP_PATH");
++        if (stamp && stamp_path && stamp_path[0]) {
++            FILE * fp = fopen(stamp_path, "a");
++            const auto off = [](const ggml_tensor * t) -> long long {
++                if (!t || !t->data || !t->buffer) {
++                    return -1;
++                }
++                return (long long) ((const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer));
++            };
++            fprintf(fp, "M3STAMP why=%d node=%d rows=%lld upb=%lld upo=%lld lob=%lld loo=%lld "
++                    "xnb=%lld xno=%lld outb=%lld outo=%lld wb=%lld wo=%lld\n",
++                    why, i, (long long) rows, (long long) (intptr_t) up, off(up),
++                    (long long) (intptr_t) lo, off(lo), (long long) (intptr_t) xn, off(xn),
++                    (long long) (intptr_t) out, off(out), (long long) (intptr_t) weights, off(weights));
++            fclose(fp);
++        }
++        if (why) {
++            return false;
++        }
+     }
+     return ggml_cuda_op_hc_owner_tail4_rows(ctx, weights, lo, xn, out, up_out ? up : nullptr);
+ }
