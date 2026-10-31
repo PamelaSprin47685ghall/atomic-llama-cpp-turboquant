@@ -250,6 +250,81 @@ Acceptance:
   count and G4 passes; then it may be promoted as the *storage* half of M3 (the trio stays a
   separate knob because its steady-state gain was NO-PROMOTE in `mtp-m3-tail-alias-20261028`).
 
+## 5a. 2026-10-31 Devops reach run: what moved, and the layered diagnosis
+
+Real data: `/home/kunweiz/work/lead-m3cand-reach-20261031/{VERIFY-M3CAND-REACH.txt,runs/cand_{off,on}8x2}`,
+`runs/PER-ROW-KL.json`.  Legs: candidate `libllama` `fbfa019e…` (this patch's setters), candidate
+`libggml-base` `e8445fbe…` (NO_REUSE allocator, control relink `69545831` exact), trio
+`libggml-hip` `11800fe6…` **unmodified** (`1edd2678…` is its diag2 copy; device `.text` identical),
+runner `1160f624…`; identical in both legs; only `GGML_TP5_HC_N3_TAIL_KEEP=1` differs.  Re-read
+here (read-only, stdlib math):
+
+| quantity | value | note |
+|---|---|---|
+| reach | 774/774 sites `why=0`, 0 other why | the retention contract removed every `out↔lo` veto, incl. mixer sites |
+| site split | rows 4 = 192, rows 3 = 388, rows 2 = 194 | 96 + 194 + 96 + 194 + 194 per graph set |
+| graph sequence | 382 graphs, **identical** shape list in both legs | fused probe (`node=23`, `n_nodes=35`) vs generic (`node=16`, `n_nodes=28`) both fire |
+| emitted tokens | 16/16 equal, top1 16/16, 0 flips | no sampled-token change |
+| KL (their 4-dp Triton-style) | mean 1.816e-3, max 1.543e-2 | recomputed here as **1.816e-3 / 1.543e-2** with a pure-python reference softmax |
+| per-row KL | 3 rows ≈ 1e-8…1e-7, 13 rows 1e-4…1.5e-2 | non-uniform: not a constant rescale |
+| logits' own scale | `maxabs` logit 0.56–1.80 on **every** row incl. the 1e-8 ones | so the rows that stayed put did NOT change logits — the KL is all in softmax weights |
+| top-8 index sets | agree 6–8/8, disagreements listed per row | index churn coexists with sub-1e-7 KL rows |
+| MTP activity | identical counters on both legs (`drafted 7/5`, `accepted 3/4`) | no "different number of verify rows" explanation |
+
+**Which comparison is meaningful.**  This pairing is *tail fused vs tail not fused*, i.e. the same
+class the alias lane already ran (`ta_trio32x2` vs `ta_on32x2`, 32x2, 64 rows): there the
+tail-vs-tail-off delta was KL mean 0.00195/0.00106, max 0.0115/0.0055 with **token divergence at
+rows 2 and 26**, and it was accepted as soft drift.  The new run is *smaller* (mean 1.816e-3, max
+1.5e-2, no token change), so the KL value alone is not a regression of the same quantity; the
+gate that rejects it ("numeric-order-only, mean < 1e-6") cannot be met by any tail-fused run and
+was not met by the alias run either.  The residual open question is the **non-uniform** spread:
+13/16 rows move while 3 stay at 1e-8, and 8/16 rows disagree on top-8 indices.  A "layout only"
+story (same kernels, different addresses) predicts *either* a uniform ulp-level shift *or* a
+specific set of guard-driven fallbacks at exactly the sites whose aliases the old pin created —
+so the next step is not a bigger KL table but **placement + per-layer capture** (§5b).
+
+**Layered attribution order** (each layer is independent, stop at the first that separates):
+1. placement: per-site (buffer, offset) of `up/lo/xn/out/weights`, off vs on — tool
+   `diag/m3-tail-stamp-diff.py` over `M3TAIL_STAMP=1` logs from `diag/m3-tail-stamp.ggml-cuda.diff`;
+2. kernel identity: per-site fired-kernel name vs the generic chain (node index 23 fused /
+   16 generic already known), plus the census of §5-G3(4);
+3. value provenance: per-layer boundary capture, off vs on, using the existing
+   `--capture-logits`/`GGML_TP5_MTP_*_TRACE` plumbing or a layer-tap list; the first layer whose
+   `hc_mixed` rows differ names the tensor;
+4. only then a numerics verdict.
+
+`diag/m3-locate-divergence.py` is the read-only companion that turns one captured pair into
+row-level evidence (verified on this capture: reproduces their mean/max and flags the 8/16
+top-8 disagreements with the per-row `|dlogit|` on the shared index set).
+
+## 5b. Deterministic layered diagnostic (code delivered, not run)
+
+Files (branch `candidates/m3tail-storage-20261031`):
+
+| file | what it is |
+|---|---|
+| `diag/m3-tail-stamp.ggml-cuda.diff` | log-only replacement of the trio's final veto block. Same `why` 0..7 decision, and with `M3TAIL_STAMP=1` it appends one line per site: `why,node,rows` plus `(buffer,offset)` of `up/lo/xn/out/weights` (`offset` = `data - ggml_backend_buffer_get_base(buffer)`, so it is stable across legs). It touches nothing else; the guard still fails closed. |
+| `diag/m3-tail-stamp-diff.py` | read-only stdlib comparator: aligns the two logs by `(node,rows)` sequence, reports the count with *identical* placement and lists the first differing `(tensor, offset)` per site; flags a `why=0` site whose `lo`/`out` still overlap (diag-build bug); maps the first differing sites onto `--rows-jsonl` resume positions. |
+| `diag/m3-locate-divergence.py` | read-only stdlib comparator for one captured pair: per row token-KL, top-8 index agreement, and the `|Δlogit|` on the shared top-8 index set (non-zero ⇒ the logits moved *before* softmax), next to the cycle log's `(rows,position)` so prefill/catch-up rows are not mixed with verify rows. |
+
+Pairing that makes the diagnosis decisive with one extra leg pair (all under flock, `predict 8`, same
+argv as `lead-m3cand-reach-20261031/run-cand8x2.py`):
+
+| leg | env | question it answers |
+|---|---|---|
+| A `ref` | stock pair (`libggml-hip` `c4a1634f`, unmodified libllama `e959386a`, no TP5 HC knobs) | ground truth for row 0 |
+| B `trio_off` | trio `11800fe6` + candidate libllama + `GGML_TP5_HC_N3_TRIO=1` | already run (this run's OFF) |
+| C `tail_on` | + `GGML_TP5_HC_N3_TAIL_KEEP=1` | already run (this run's ON) |
+| D `tail_on_stamp` | C + diag2 `M3TAIL_STAMP=1 M3TAIL_STAMP_PATH=…`, and B likewise | placement diff `m3-tail-stamp-diff.py` |
+| E `lo_only` (optional) | C built with the `qwen4exp_hc_n3_retain_xn` call removed (code change, not an env value: the gate is strict `==1`) | separates "lo retention" from "xn retention" if D shows only mixer sites differing |
+
+Order of reading: B vs A must stay at the alias lane's trio-only class (mean ~1.95e-3/1.06e-3 rows
+8–40) — if it moves, the candidate llama/base relink changed something unrelated and the run is not
+about the tail at all.  Then C vs B per layer; then D's placement diff.  A verdict of
+"correct, soft drift of the same class as the alias lane" needs rows 8–40 and per-row flips with
+margins; a verdict of "bug" needs a site whose `why=0` but tensors overlap, or a layer whose
+captured tensor differs beyond the ulp class.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -260,3 +335,7 @@ Acceptance:
 * **NOT proven:** that under the new primitive the destination is disjoint at **all 3870** sites
   (needs G3-1), the exact compute-buffer delta (G3-3), kernel-census equivalence (G3-4), and every
   G4 numerics number. No build, no syntax check, no test was run for this report by contract.
+* **2026-10-31 update (Devops data, re-read only):** reach 774/774 with the unmodified trio proven;
+  token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
+  §5a/§5b give the placement-stamp and per-layer capture plan.  The gate stays closed: promotion is
+  NOT claimed and no threshold was relaxed.
