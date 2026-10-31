@@ -952,20 +952,6 @@ struct ggml_backend_sched {
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
 
-    // build schema of the graph handed to the first split_graph call: the
-    // tensors in id order and, per node, the src ids of every src slot.
-    // Used by ggml_backend_sched_restore_graph to undo pass 5's src rewrites
-    // before re-planning a previously planned graph. Never freed by a pass.
-    std::vector<struct ggml_tensor *> schema_t;
-    std::vector<int32_t>              schema_src; // [n_nodes][GGML_MAX_SRC]
-    std::vector<int32_t>              schema_n_src; // [n_nodes] highest schema src slot + 1
-    // per live-graph node, the split copies created for that node's srcs in
-    // the last split (node -> src slot -> copy). Owned by schedule_sched; it
-    // is the set that libllama's binder clear loop must reset between rounds
-    // (they are not part of the graph's node list when the split ate a whole
-    // backend boundary). Rebuilt on every split_graph call.
-    std::vector<std::vector<struct ggml_tensor *>> graph_src_copies; // [graph->n_nodes][GGML_MAX_SRC]
-
     // graph splits
     struct ggml_backend_sched_split * splits;
     int n_splits;
@@ -1225,51 +1211,49 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
-// Restores a graph from the build schema recorded at its first split.
+// Drops the split-input copies of the last plan before the scheduler forgets
+// which tensors they belong to.
 //
-// The graph's object topology is captured on the first split_graph call:
-//   schema_t      the tensors of that graph in id order (id = insert position
-//                 in sched->hash_set at that first call)
-//   schema_src    one GGML_MAX_SRC row per node: the id of each node->src[j]
-//                 (-1 = the schema had no src in that slot)
-//   schema_n_src  per node, the highest build src slot + 1
-// Re-running the passes on a graph whose src[] were rewritten by pass 5 (the
-// split copies) would treat the copies as inputs: their uuid does not hash
-// into sched->hash_set, a stale/freed buffer makes pass 1 take the
-// pre-allocated branch, and extra nodes can be injected - after which the
-// union binder's re-plan no longer matches the graph it recorded and its split
-// inputs cannot be resolved (a later set_inputs/compute then reads an
-// unallocated tensor: Devops saw set_input_k_idxs with dst == NULL after the
-// outputs narrow path's bind re-plan). Restoring every node slot from the
-// schema before the passes is a no-op for an unmodified graph and exact for a
-// re-planned one; the copies are re-created from content below, so topology
-// and values are unaffected.
+// Pass 5 rewrites node src[] slots of the live graph to point at copies it
+// creates loose in sched->ctx. Those copies are not graph tensors: the allocator
+// neither assigns nor frees them, and sched->ctx is only ggml_free'd, so their
+// structs keep the previous plan's buffer/data. A later plan that consumes them
+// as pre-allocated inputs is how a split input can end up unallocated (observed
+// as set_input_k_idxs with dst == NULL after the union binder's re-plan of a
+// live graph that had been patched in place).
 //
-// Graphs that this scheduler never planned have no schema: nothing is done.
-static void ggml_backend_sched_restore_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
-    if (sched->schema_src.empty()) {
-        return;
-    }
-    const int n_schema = (int) (sched->schema_src.size()/GGML_MAX_SRC);
-    if (n_schema != graph->n_nodes) {
-        // a rebuilt graph with a different node count has no matching schema
-        // (the binder refuses such graphs on its recorded skeleton anyway)
-        return;
-    }
-    for (int i = 0; i < graph->n_nodes; ++i) {
-        struct ggml_tensor * node = graph->nodes[i];
-        if (node == nullptr) {
-            continue;
-        }
-        // slots beyond the schema count are copies a later round put there
-        const int n_src = sched->schema_n_src[size_t(i)];
-        for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (j >= n_src) {
-                node->src[j] = nullptr;
+// Scope: exactly the scheduler's OWN record of the last plan - splits[i].inputs[]
+// resolved through the hash table that describes that plan, then every copy slot
+// of that input. A graph tensor is never touched (only the copies pass 5
+// installed), no model weights/KV storage is involved, and with no previous
+// split the loops are empty - so the first plan and every stock consumer are
+// unchanged. Called from ggml_backend_sched_reset() while those tables are still
+// valid, i.e. immediately before the hash/copy tables are wiped.
+static void ggml_backend_sched_drop_input_copies(struct ggml_backend_sched * sched) {
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->n_inputs; ++j) {
+            struct ggml_tensor * input = split->inputs[j];
+            if (input == nullptr) {
                 continue;
             }
-            const int32_t v = sched->schema_src[i*GGML_MAX_SRC + j];
-            node->src[j] = (v >= 0 && (size_t) v < sched->schema_t.size()) ? sched->schema_t[v] : nullptr;
+            const size_t id = ggml_hash_find(&sched->hash_set, input);
+            if (id == GGML_HASHSET_FULL) {
+                continue;
+            }
+            const int b = sched->hv_tensor_backend_ids[id];
+            if (b < 0 || b >= sched->n_backends) {
+                continue;
+            }
+            for (int c = 0; c < sched->n_copies; ++c) {
+                struct ggml_tensor * cpy = sched->hv_tensor_copies[id * sched->n_backends * sched->n_copies + b * sched->n_copies + c];
+                if (cpy == nullptr) {
+                    continue;
+                }
+                cpy->buffer = nullptr;
+                cpy->data   = nullptr;
+                cpy->extra  = nullptr;
+            }
         }
     }
 }
@@ -1280,20 +1264,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
-
-    // per-node split copies of the previous round are owned by sched->ctx,
-    // which is freed below: drop the pointers before re-creating them
-    sched->graph_src_copies.clear();
-
-    // The graph is the SCHEMA; the split copies are derivative. Pass 5 below
-    // rewrites node src[] slots of the live graph to point at structs (with
-    // op NONE) that live in sched->ctx. Re-running pass 5 on an already
-    // rewritten graph - e.g. the union binder's sched_reset + alloc_graph
-    // after an in-place patch - would walk those copies as if they were graph
-    // tensors: their op-NONE src slots then get revisited, and a stale copy
-    // is treated as an input leaf of the next round. The graph must therefore
-    // be restored from the recorded build schema BEFORE the passes run.
-    ggml_backend_sched_restore_graph(sched, graph);
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -1309,40 +1279,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     graph->uid = ggml_graph_next_uid();
-
-    // build schema: recorded on the FIRST split of this graph after the
-    // scheduler was (re)built (ggml_backend_sched_reset keeps it, so a
-    // re-plan restores from it). The id map of this call is the schema map.
-    if (sched->schema_src.empty()) {
-        sched->schema_t.reserve(graph->n_nodes + graph->n_leafs);
-        for (int i = 0; i < graph->n_leafs; ++i) {
-            const int id = hash_id(graph->leafs[i]);
-            if ((size_t) id >= sched->schema_t.size()) {
-                sched->schema_t.resize(size_t(id) + 1, nullptr);
-            }
-            sched->schema_t[id] = graph->leafs[i];
-        }
-        for (int i = 0; i < graph->n_nodes; ++i) {
-            const int id = hash_id(graph->nodes[i]);
-            if ((size_t) id >= sched->schema_t.size()) {
-                sched->schema_t.resize(size_t(id) + 1, nullptr);
-            }
-            sched->schema_t[id] = graph->nodes[i];
-        }
-        sched->schema_src.assign(size_t(graph->n_nodes)*GGML_MAX_SRC, -1);
-        // highest build src slot + 1 per node: restores must also DROP copies
-        // that a later round put into a slot the build left empty
-        sched->schema_n_src.assign(size_t(graph->n_nodes), 0);
-        for (int i = 0; i < graph->n_nodes; ++i) {
-            for (int j = 0; j < GGML_MAX_SRC; ++j) {
-                struct ggml_tensor * src = graph->nodes[i]->src[j];
-                if (src != nullptr) {
-                    sched->schema_src[size_t(i)*GGML_MAX_SRC + j] = (int32_t) hash_id(src);
-                    sched->schema_n_src[size_t(i)] = j + 1;
-                }
-            }
-        }
-    }
 
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
@@ -1687,22 +1623,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         }
                         split->inputs[n_inputs] = src;
                     }
-                    struct ggml_tensor * cpy = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
-                    node->src[j] = cpy;
-                    // per-node copy tree: the copies the binder must clear
-                    // before its next re-plan (they are not all in the
-                    // graph's node list)
-                    {
-                        const int idx = int(i);
-                        if ((int) sched->graph_src_copies.size() <= idx) {
-                            sched->graph_src_copies.resize(size_t(idx) + 1);
-                        }
-                        auto & row = sched->graph_src_copies[size_t(idx)];
-                        if (row.size() < size_t(GGML_MAX_SRC)) {
-                            row.resize(GGML_MAX_SRC, nullptr);
-                        }
-                        row[size_t(j)] = cpy;
-                    }
+                    node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
             }
         }
@@ -2334,6 +2255,9 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run
     if (!sched->is_reset) {
+        // split copies of the previous plan are dropped before the tables that
+        // describe them are reset (see ggml_backend_sched_drop_input_copies)
+        ggml_backend_sched_drop_input_copies(sched);
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
@@ -2517,17 +2441,6 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
         return NULL;
     }
     return sched->backends[backend_index];
-}
-
-struct ggml_tensor * ggml_backend_sched_get_src_copy(ggml_backend_sched_t sched, int i_node, int i_src) {
-    if (sched == NULL || i_node < 0 || i_src < 0 || i_src >= GGML_MAX_SRC) {
-        return NULL;
-    }
-    if ((size_t) i_node >= sched->graph_src_copies.size()) {
-        return NULL;
-    }
-    const std::vector<struct ggml_tensor *> & row = sched->graph_src_copies[size_t(i_node)];
-    return (size_t) i_src < row.size() ? row[size_t(i_src)] : NULL;
 }
 
 // utils

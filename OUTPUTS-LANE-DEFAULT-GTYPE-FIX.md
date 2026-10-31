@@ -114,51 +114,49 @@ cmp <(grep -E 'REFLOGITS|LOGITS' "$S/o1.txt" | sed 's/[[:space:]]*$//') \
 
 ---
 
-## 6. 第二轮：`probe-out-applied` SIGSEGV 根因与修复（2026-10-31）
+---
 
-Devops 复验（`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.txt`）：out-clear 已 PASS（`refused_view=1`）；out-live 在 skeleton 门提前拒绝（`refused_skeleton=2`，需 §3 O6 独立覆盖）；**out-applied（无 reader，真 applied 命中）SIGSEGV**——gdb：`process_ubatch → llm_graph_result::set_inputs → llm_graph_input_attn_kv::set_input → llama_kv_cache::set_input_k_idxs`，`dst == NULL`，发生在 bind 的 re-plan（`sched_reset + alloc_graph`）之后；同批 gates OFF 两树均 rc=0（14 checks）。
+## 6. 第二轮：`probe-out-applied` SIGSEGV — 根因与最终修复（2026-10-31，取代被撤销的 55d6ff7bd 设计）
 
-### 6.1 根因（已修）
-1. **split 副本不是图的节点**：`null_grads` 的 allocator 不遍历 `sched->graph`（splits 的 `ggml_graph_view` 不扩展 live graph），因此 `ggml_backend_sched_split_graph` pass 5 装进 live graph `node->src[j]` 的 split-input 副本（`ggml_dup_tensor_layout(sched->ctx, …)`，op=NONE）**永远不会被 gallocr 分配**，也**从未被任何清理循环清掉** `buffer/data`：`sched->ctx` 只被 `ggml_free`（不调 buffer 析构），副本结构体内容（含上一轮 `buffer` 指针与已被 gallocr 回收的 `data`）原样保留到下一轮。
-2. **pass 1 的 pre-allocated 分支**：下一轮 `split_graph` 从 live graph 的 `node->src[]` 看到这些副本，`ggml_backend_sched_backend_from_buffer` 依据其陈旧 buffer 给出 backend（`1.dst`），随后 pass 3/4 的 `ggml_backend_sched_set_if_supported/supports_op` 走 `src[]` 链，把副本当成输入叶/拷贝源；若该 buffer 类型与新后端不匹配则 `GGML_ABORT("pre-allocated tensor …")`，若匹配则副本的 `data` 仍是上一轮 gallocr 的地址。
-3. **`src[5]` 冲突**：nkv 输入的 `k_idxs` 在 **splits 之间共享**时，pass 5 会把包含它的节点（`SET_ROWS` 等）的 `src[0]` 改写成该副本指针。而 `FLASH_ATTN_EXT` 的 `src[5]` 在 **nkv 通道**（`GGML_TP5_FA_CHECKED_TAIL/RTLEN`）下是 rtlen I32 张量、在 stock 下为空；另一侧的 `staged_dst.src[5]`（流式 staging）证明该类插槽在别的路径会承载副本。隐含的 `src[5]`/`src[0]` 槽位在 re-plan 中被复用后，`attn_inp_k_idxs` 变成「副本-或其副本」的引用，re-plan 后 `ggml_backend_sched_alloc_graph` 不保证其 `data`，`set_inputs()` 以 `dst=attn_inp_k_idxs`（此时 NULL）调用 `set_input_k_idxs` → SIGSEGV。
-4. **为何只有 outputs 窄化路径炸**：它需要 (a) lane 真正记录并 applied（本轮修好后首次可达），(b) split 布局在轮间改变（prefill→decode 的 n_tokens 变化），使同一 src 的拷贝/副本归属改变。nkv lane 的 plain-rebind 用同一机制却不炸——差异正是分裂布局与 `src[5]` 的占用情况；历史 probe 的 `refused_skeleton=2/1` 解释了 out-live/out-clear 提前返回、从未走到这条代码。
+Devops：`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.txt`。out-clear 已 PASS；out-live 在 skeleton 门提前拒绝；**out-applied（无 reader，真 applied）SIGSEGV**：`set_inputs → llm_graph_input_attn_kv::set_input → set_input_k_idxs` 收到 `dst == NULL`，发生在 bind 的 `sched_reset + alloc_graph` re-plan 之后；同批 gates OFF 两树 rc=0。
 
-### 6.2 修复（源码，未编译）
-`ggml/src/ggml-backend.cpp`
-- `struct ggml_backend_sched` 新增构建 schema：`schema_t`（首次 split 时按 id 记录的图张量表）、`schema_src[n_nodes*GGML_MAX_SRC]`（每节点每槽的 schema src id，-1=建图无 src）、`schema_n_src[n_nodes]`（最高 schema 槽+1），以及 `graph_src_copies[n_nodes][GGML_MAX_SRC]`（本次 split 为每节点每槽实际装入的副本，pass 5 写入）。
-- `ggml_backend_sched_split_graph()` 开头调用新 `ggml_backend_sched_restore_graph()`：用 schema 还原每个节点全部 `src[]` 槽（含把 schema 之外的槽清空）——对未改动的图是恒等操作，对 re-plan 的图是精确还原，pass 5 随后按内容重新生成副本。
-- `ggml_backend_sched_restore_graph` 对「节点数与 schema 不同」的图直接跳过（binder 本身也会按其记录的骨架拒绝）。
-- 新增公共只读接口 `ggml_backend_sched_get_src_copy(sched, i_node, i_src)`（`ggml/include/ggml-backend.h`）。
-- `schema_*` 在 scheduler 生命周期内保留（`ggml_backend_sched_reset` 不清），因此 binder 的 `sched_reset + alloc_graph` 仍能还原到建图 schema。
+### 6.1 根因（生命周期，而非空指针）
+`ggml_backend_sched_split_graph` 的 pass 5 把 split-input **副本**写进 live graph 的 `node->src[]`。这些副本（`ggml_dup_tensor_layout(sched->ctx,…)`）**不是图张量**：
+- 图的分配器（no-grads 的 gallocr 只遍历 `sched->graph`，而 splits 只是同一 tensor 数组上的 view）**从不分配、也从不释放**它们；
+- `sched->ctx` 只在下次 split 开头 `ggml_free`，**不调用副本的 buffer 析构**，所以副本结构体连同上一轮的 `buffer` 指针与已被 gallocr 回收的 `data` 原样存活；
+- 于是第二轮 pass 1 会把副本当"pre-allocated"（`1.dst` 分支、陈旧 buffer 推 backend），pass 3/4 的 `supports_op(src[])` 走这条链，且**没有任何环节清掉副本的 buffer/data**。被共享的 split 输入（`attn_inp_k_idxs` 这类）在轮间布局变化后可能指向"副本或其副本"，re-plan 后 `set_inputs()` 拿到的就是 `data == NULL` 的那个 → `set_input_k_idxs(dst=NULL)` → SIGSEGV。
+- 为何只有 outputs 窄化路径命中：需要 (a) lane 真正记录并 applied（第一轮修好后首次可达），(b) split 布局轮间变化。nkv plain-rebind 同机制但布局未变；out-live/out-clear 在记录/骨架门早退，根本没走到。
 
-`src/llama-context.cpp`
-- `union_binder_scratch_patch()` 在既有的「记录张量清 buffer/data/extra」循环之后，遍历 `ggml_backend_sched_get_src_copy()` 把**本次 split 装入 live graph 的全部副本**同样清为 `buffer/data/extra = NULL`（副本不在 `gf->n_nodes` 里，旧循环覆盖不到；这正是 Devops 的失败点）。副本的**指针/拓扑不改**，下一轮按内容命中原副本，保证工具调用语义（`sched->ctx` 里副本的 `src[]` 与 `view_src` 需在 re-plan 时仍有效）不被破坏。
+### 6.2 最终修复（局部、明确生命周期；无新状态、无身份判定）
+- `ggml/src/ggml-backend.cpp`：新增 `ggml_backend_sched_drop_input_copies()`，在 **`ggml_backend_sched_reset()`** 内、`ggml_hash_set_reset()` **之前**调用。它只按"上一轮 split 自己记录的表"（`splits[i].inputs[]` → `hash_set` 查找 → `hv_tensor_backend_ids[id]` → `hv_tensor_copies[id][b][0..n_copies)`）把**上一轮 split 输入副本**的 `buffer/data/extra` 清空；随后 reset 才重建这些表。
+- 为什么不引入任何身份/schema 概念：清空发生在 **reset 内部、且只作用于 scheduler 自己上一轮的表**——对"同节点数的另一张图"操作时，被操作的是上一轮的**副本**（派生对象），图本身（`nodes/leafs/src`）完全不动，因此不存在"把别的图的拓扑写进本图"的风险，也不需要按图身份匹配、不需要新字段、不在 calloc/free 的 scheduler 结构体里放 C++ 对象。
+- `src/llama-context.cpp`：仅在 `union_binder_scratch_patch()` 中加注释，说明 bind 的 re-plan 走的是这条 reset 路径（无新 API、无门、无策略开关）。
+- 生命周期闭环：`reset` 前副本表仍有效（hash 表尚未清）→ 清完 → 表清空 → `split_graph` 按内容重建副本（`tensor_id_copy` 只在槽为空时新建，槽清了就重建）→ pass 5 重新写入 `src[]` → gallocr 正常分配。**多 copy（`n_copies > 1`）**：循环覆盖该 id 行下**全部** backend/copy 槽，不只 `cur_copy`。
+- 稳定性：`drop` 只读上一轮表、只写副本张量的三个字段；`ggml_backend_sched_reset` 的其余语义（`is_alloc=false`、`is_reset` 语义）不变；`ggml_backend_sched_free` 仍只 free 原始指针表，未新增需要析构的成员（**无泄漏、无 UB**）。
 
-### 6.3 安全边界（新改动）
-- **只清 `buffer/data/extra`**：不改 `ne/nb/op_params/view_offs/view_src/src`，所以不会改变调度结果的数据布局；gallocr 会在下一轮重新分配。
-- **不动 fixed 存储**：副本是拷贝张量，永远不是 weights/KV cache；清理循环只作用于 `graph_src_copies` 里记录的副本。
-- **schema 还原只作用于本 scheduler 规划过的图**（`schema_src` 为空即跳过）；其他用户（单元测试）零影响。
-- **OFF 不变**：整段只在 `union_binder_scratch_patch`（binder 门内）与 `split_graph` 的还原分支（schema 为空时早返回）里执行；门关无 binder 调用，schema 记录只是首次 split 的一次性 O(n*GGML_MAX_SRC) 填充（无行为变化）。
-- **计数恒等式不变**：失败仍在调用方回滚 `c_applied/nout_binds` 并 `++c_fallbacks`。
+### 6.3 与已撤销的 55d6ff7bd 的差异（reviewer 三项问题逐条）
+| reviewer 问题 | 55d6ff7bd（已撤销） | 本轮 |
+|---|---|---|
+| F1 同节点数图串味 | 按位置用 schema 覆盖 `src[]`，身份只用 `n_nodes` | **完全删除 schema**；不写任何图张量的 `src[]` |
+| F1b 依赖被刷新的 uid | 记录时 `graph->uid` 每轮刷新 | 不使用 uid |
+| F2 跨 split 副本未撤销 / 表被提前 clear | 新增 `graph_src_copies` 且每次 split 开头 clear，fallback 后丢失记录 | 改动落在 `reset()`：表在 clear 前使用；一轮内多次 split 由第一次 split 的清空覆盖 |
+| F3 `n_copies > 1` 只记录 `cur_copy` | 只记 `cur_copy` 槽 | 清理覆盖全部 backend × copy 槽 |
+| scheduler 结构体 std::vector | calloc/free 不跑析构 → 泄漏 | **无新增成员**，仍可 `calloc/free` |
+| OFF 作用范围 | schema 记录在首次 split 无条件执行 | reset 内清理只作用于"上一轮 split 副本"，无副本时为空循环；图/数值/拓扑不变 |
 
-### 6.4 为什么不是「屏蔽场景/降低条件」
-没有跳过 `set_input_k_idxs`、没有在 SIGSEGV 前加空指针守卫把 NULL 静默吞掉、没有把 `probe-out-applied` 从矩阵移除，也没有缩小 `n_outputs` 变化幅度；修的是 re-plan 生命周期本身（副本状态与图 schema 的一致性）。
-
-### 6.5 独立 out-live/out-clear 覆盖指引（Devops，CPU，同上纪律）
+### 6.4 独立验证指引（Devops，CPU tiny 模型；纪律不变）
 | 场景 | 期望 |
 |---|---|
-| **A1 out-applied（原 SIGSEGV）** | rc=0（不许崩溃）；`applied ≥ 1`；`attempts == applied + fallbacks`；每步 logits 与 OFF 同批逐位相同 |
-| **A2 out-applied 二轮** | 连续两次窄化（不同 n_outputs）→ `applied ≥ 2`，两次都 rc=0（验证副本清理可重复） |
-| **A3 out-clear** | `refused_view=1`、`applied=0`（保持既有 PASS 不回退） |
-| **A4 out-live（cache-side reader）** | 需补一个 n_outputs 不变的 reader decode 前置批次，使 prefill1 的 skeleton 与 view decode 一致；期望 `refused_view ≥ 1`。若仍先撞 skeleton，记录 `refused_skeleton` 差值并改用 **双 lane DELTA**（`rv_change − rv_same == 1`）作独立证据 |
-| **A5 nkv plain-rebind** | 保持 PASS（同一 `union_binder_scratch_patch` 尾部，验证新清理不破坏 nkv lane） |
-| **A6 OFF≡stock** | REFLOGITS + 7 步 LOGITS 仍逐字节相同 |
+| A1 out-applied（原崩溃） | rc=0，不崩；`applied ≥ 1`；`attempts == applied + fallbacks`；每步 logits 与 OFF 同批逐位相同 |
+| A2 连续两次窄化 | `applied ≥ 2`，两次 rc=0（验证 re-plan 可重复） |
+| A3 out-clear | `refused_view=1`、`applied=0`（不回退） |
+| A4 nkv plain-rebind | 保持 PASS（同一条 reset 路径） |
+| A5 OFF≡stock | REFLOGITS + 7 步 LOGITS 逐字节相同；无 stats 行 |
+| A6 回归：reserve 图 → 首个真实 eval | `graph_reserve(split_only)` 后立刻 full rebuild（同节点数、不同图）不出现串味（本设计不动图，仅副本） |
+| A7 `n_copies>1`（pipeline_parallel 或 `n_copies=4` 配置） | 连续两次 decode 正常、无 abort（覆盖 F3） |
+| A8 out-live（reader cache-side，仍未独立命中） | 需"n_outputs 不变的 reader decode 前置批"或改用双 lane DELTA（`rv_change − rv_same == 1`） |
 
-失败判读：A1 若仍崩 → 抓新的 gdb 栈确认是否仍在 `set_inputs`；A2 `applied<2` → 副本清理未生效（检查 `graph_src_copies` 是否被 `clear()` 提前清掉）；A4 仍 skeleton → 记录两次 `refused_skeleton` 差值。
-
-### 6.6 残余风险 / PARTIAL
-- 全部改动**未编译未测试**；`std::vector` 已由 `ggml-backend.cpp` 现有 include 提供。
-- `ggml_backend_sched_restore_graph` 依赖「首次 split 的 hash 顺序 == 后续 split 的次序」这一事实（节点未增删时成立；节点数变化时整段跳过，binder 会因骨架不符回退全量重建）。
-- `graph_src_copies` 中记录的副本指针在 `sched->ctx` 释放后不悬空使用：该表在每次 `split_graph` 开头 `clear()`，读它的 `union_binder_scratch_patch` 只在上一轮 split 之后、下一轮 split 之前调用。
-- out-live 的 reader 分支仍未由现有 probe 独立命中（见 A4），本轮不声称已证。
+### 6.5 残余风险 / PARTIAL
+- 未编译未测试；A1–A8 全部待回填。
+- `drop` 依据"上一轮 split 表"定位副本，若某消费者在 `reset` 前手动改写了 `splits[]`（仓库内无此调用），清理会漏；属保守失败（不清 = 旧行为）。
+- out-live 的 reader 分支仍未有独立运行证据（A8 设计）。
