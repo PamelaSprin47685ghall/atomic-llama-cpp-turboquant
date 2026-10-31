@@ -9,6 +9,8 @@
 #include <tq/tp5/runtime.h>
 
 #include "ordered-fold.h"
+#include "dw_event_trace.h"
+#include "dw_compose_event.h"
 
 #include <algorithm>
 #include <atomic>
@@ -16,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <map>
@@ -41,6 +44,11 @@ void pause_cpu() noexcept {
     std::atomic_signal_fence(std::memory_order_seq_cst);
 #endif
 }
+
+// DUALWIN-COMPOSE-EVENT: gate semantics, ON-path contract and honesty
+// notes live in dw_compose_event.h (exact "1", read once at static
+// initialization; OFF keeps every site an untouched stock branch).
+static const bool dw_compose_event_req = dw_compose_event::gate();
 
 [[noreturn]] void retain_and_exit(const char * why) {
     std::fprintf(stderr, "TP5_RETAINED_IN_FLIGHT: %s; native owners are not released\n", why);
@@ -186,6 +194,56 @@ struct service_window {
     std::array<std::uint64_t, 5> rank_output_consumed_payload_bytes{};
     std::uint64_t cpu_input_payload_bytes = 0;
     std::uint64_t cpu_output_payload_bytes = 0;
+    std::uint64_t courier_polls = 0;
+    std::uint64_t courier_idle = 0;
+    std::uint64_t courier_input = 0;
+    std::uint64_t courier_output = 0;
+    std::uint64_t courier_deferred = 0;
+    std::uint64_t courier_errors = 0;
+    // Per-epoch demand samples and the retirement race they observe. Written
+    // only by this window's worker (epoch_demand/epoch_drain), read after join.
+    // demand_* values are PER-EPOCH DELTAS against demand_base_*; the worker
+    // only leaves the wait loop once retired == cpu_reductions, so the previous
+    // sample's baseline is a fully drained epoch.
+    std::uint64_t demand_epochs = 0;
+    std::uint64_t demand_hits = 0;
+    std::uint64_t demand_misses = 0;
+    std::uint64_t demand_base_published = 0;
+    std::uint64_t demand_base_retired = 0;
+    std::uint64_t demand_delta_published_sum = 0;
+    std::uint64_t demand_delta_retired_sum = 0;
+    std::uint64_t demand_pending_sum = 0;
+    std::uint64_t demand_pending_max = 0;
+    std::array<std::uint64_t, 8> demand_pending_hist{};
+    std::uint64_t demand_drain_ns = 0;
+    std::uint64_t demand_drain_passes = 0;
+    std::uint64_t demand_drain_max = 0;
+    // Batching evidence for the gated lane.
+    std::uint64_t courier_batch_extra = 0;
+    // GGML_TP5_DW_COURIER_DUAL=1: independent dual completion verification at
+    // the logits consumption point. Written only by this window's worker
+    // while its dual wait is parked; read after the workers join for the
+    // exit summary. double_complete_ok counts epochs whose consumption
+    // proved BOTH completions; device_late/courier_late record the observed
+    // late completion from strict differential sightings; violations count
+    // protocol breaches or failures observed while the wait was parked.
+    std::uint64_t dual_double_ok    = 0;
+    std::uint64_t dual_device_late  = 0;
+    std::uint64_t dual_courier_late = 0;
+    std::uint64_t dual_violations   = 0;
+    // r7 production handoff state: a window whose dual verification latched
+    // (bounded handoff budget exhausted, or a dual scope breach) consumes
+    // every later epoch through the exact shipped stock single-completion
+    // loop. Written only by this window's worker; read after the workers
+    // join for the exit summary.
+    bool          dual_latched         = false;
+    const char *  dual_latch_reason    = nullptr;
+    std::uint64_t dual_timeouts        = 0;
+    std::uint64_t dual_fallback_epochs = 0;
+    // DUALWIN event-overlap trace (GGML_TP5_DW_EVENT_TRACE=1): host
+    // correlation records for the proven dual-consumption epochs. Single
+    // writer (this window's dual-wait worker); read after the workers join.
+    dw_event_trace::buf trace;
 };
 
 // This C object owns the A/B collaboration. Neither A nor the ledger calls a
@@ -204,9 +262,35 @@ class relay_service {
             item->backend = backend;
             windows_.push_back(std::move(item));
         }
-        thread_ = std::thread([this] { loop(); });
-        while (!ready_.load(std::memory_order_acquire)) {
-            pause_cpu();
+        const char * dw_env = std::getenv("GGML_TP5_DW_COURIER");
+        courier_metrics_ = dw_env != nullptr && std::strcmp(dw_env, "1") == 0;
+        const char * ab_env = std::getenv("TP5_DW_COURIER_ABLATE");
+        courier_ablate_ = courier_metrics_ && ab_env != nullptr && std::strcmp(ab_env, "1") == 0;
+        // GGML_TP5_DW_COURIER_DUAL: the exact value "1" gates the independent
+        // dual completion verification at the logits consumption point;
+        // unset, "0", "2" or any other spelling keeps the shipped single
+        // conjunction wait untouched.
+        const char * dual_env = std::getenv("GGML_TP5_DW_COURIER_DUAL");
+        courier_dual_ = dual_env != nullptr && std::strcmp(dual_env, "1") == 0;
+        const char * pw_env = std::getenv("TP5_RELAY_SERVICE_PER_WINDOW");
+        per_window_ = courier_metrics_ || (pw_env != nullptr && std::string(pw_env) == "1");
+        if (per_window_) {
+            for (std::size_t lane = 0; lane < windows_.size(); ++lane) {
+                try {
+                    threads_.emplace_back([this, lane] { loop_per_window(lane); });
+                } catch (...) {
+                    stop();
+                    throw;
+                }
+            }
+            while (lanes_ready_.load(std::memory_order_acquire) != windows_.size()) {
+                pause_cpu();
+            }
+        } else {
+            thread_ = std::thread([this] { loop(); });
+            while (!ready_.load(std::memory_order_acquire)) {
+                pause_cpu();
+            }
         }
     }
 
@@ -223,7 +307,130 @@ class relay_service {
         if (thread_.joinable()) {
             thread_.join();
         }
+        for (auto & t : threads_) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        if (courier_metrics_ && !metrics_dumped_) {
+            metrics_dumped_ = true;
+            dump_courier_metrics();
+        }
     }
+
+    // Per-window demand/retirement distribution. Emitted once, after every
+    // courier lane is joined, so no counter can still be written.
+    void dump_courier_metrics() const {
+        for (std::size_t i = 0; i < windows_.size(); ++i) {
+            const auto & w = *windows_[i];
+            const double hit_rate = w.demand_epochs ? double(w.demand_hits) / double(w.demand_epochs) : 0.0;
+            const double event_hit_rate = w.demand_delta_published_sum ?
+                                              double(w.demand_delta_retired_sum) / double(w.demand_delta_published_sum) :
+                                              0.0;
+            std::fprintf(stderr,
+                         "TP5_DW_COURIER_HIT window=%zu lanes=%zu ablate=%d epochs=%llu hits=%llu misses=%llu "
+                         "hit_rate=%.6f d_published=%llu d_retired_before=%llu event_hit_rate=%.6f "
+                         "pending_sum=%llu pending_max=%llu hist=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+                         "drain_ns=%llu drain_passes=%llu drain_max=%llu batch_extra=%llu "
+                         "polls=%llu idle=%llu serviced_in=%llu serviced_out=%llu deferred=%llu errors=%llu\n",
+                         i, threads_.size(), int(courier_ablate_),
+                         (unsigned long long) w.demand_epochs, (unsigned long long) w.demand_hits,
+                         (unsigned long long) w.demand_misses, hit_rate,
+                         (unsigned long long) w.demand_delta_published_sum,
+                         (unsigned long long) w.demand_delta_retired_sum, event_hit_rate,
+                         (unsigned long long) w.demand_pending_sum, (unsigned long long) w.demand_pending_max,
+                         (unsigned long long) w.demand_pending_hist[0], (unsigned long long) w.demand_pending_hist[1],
+                         (unsigned long long) w.demand_pending_hist[2], (unsigned long long) w.demand_pending_hist[3],
+                         (unsigned long long) w.demand_pending_hist[4], (unsigned long long) w.demand_pending_hist[5],
+                         (unsigned long long) w.demand_pending_hist[6], (unsigned long long) w.demand_pending_hist[7],
+                         (unsigned long long) w.demand_drain_ns, (unsigned long long) w.demand_drain_passes,
+                         (unsigned long long) w.demand_drain_max, (unsigned long long) w.courier_batch_extra,
+                         (unsigned long long) w.courier_polls, (unsigned long long) w.courier_idle,
+                         (unsigned long long) w.courier_input, (unsigned long long) w.courier_output,
+                         (unsigned long long) w.courier_deferred, (unsigned long long) w.courier_errors);
+        }
+    }
+
+    // One demand sample per epoch, taken by the worker after the first snapshot
+    // that reports finished. cpu_reductions is final there (every publish
+    // precedes its channel's generation store, which precedes every consumer
+    // ack, which precedes the rank tails that make finished true), but
+    // output_retired is read AFTER the snapshot returns and the courier may
+    // advance it in between: the sample is "at the first post-finished
+    // observation", not an instantaneous read at the finish instant.
+    // Both values are provider/courier LIFETIME counters (begin() never resets
+    // cpu_reductions), so per-epoch values are deltas against a baseline that
+    // is only ever a FULLY DRAINED point: epoch_end() sets it to
+    // (published, published) after the wait loop proved retired == published.
+    // The sample itself must not move the baseline - at that moment the epoch
+    // may still have unretired outputs, and folding them into the next epoch's
+    // delta would attribute this epoch's tail to the next one.
+    void epoch_demand(std::size_t index, const ggml_relay_status & state) {
+        if (!courier_metrics_) return;
+        auto &              w         = *windows_[index];
+        const std::uint64_t published = state.cpu_reductions;
+        const std::uint64_t retired   = w.output_retired.load(std::memory_order_acquire);
+        require(retired <= published, "courier retired more outputs than were published");
+        require(published >= w.demand_base_published && retired >= w.demand_base_retired,
+                "relay lifetime counters moved backwards");
+        const std::uint64_t delta_published = published - w.demand_base_published;
+        const std::uint64_t delta_retired   = retired - w.demand_base_retired;
+        require(delta_retired <= delta_published, "courier retired more outputs than this epoch published");
+        const std::uint64_t pending = delta_published - delta_retired;
+        ++w.demand_epochs;
+        w.demand_delta_published_sum += delta_published;
+        w.demand_delta_retired_sum += delta_retired;
+        w.demand_pending_sum += pending;
+        // pending == 0 is the hit bucket and is recorded in hist[0].
+        w.demand_pending_max = std::max(w.demand_pending_max, pending);
+        ++w.demand_pending_hist[std::min<std::size_t>(pending, 7)];
+        if (pending == 0) {
+            ++w.demand_hits;
+        } else {
+            ++w.demand_misses;
+        }
+    }
+
+    void epoch_drain(std::size_t index, std::uint64_t drain_ns, std::uint64_t drain_passes) {
+        if (!courier_metrics_) return;
+        auto & w = *windows_[index];
+        w.demand_drain_ns += drain_ns;
+        w.demand_drain_passes += drain_passes;
+        w.demand_drain_max = std::max(w.demand_drain_max, drain_passes);
+    }
+
+    // End of one epoch: the wait loop just proved retired == published, so this
+    // is the only place the delta baseline may advance. Both baselines are set
+    // to the same drained value, which keeps the next epoch's delta_retired
+    // bounded by its delta_published.
+    void epoch_end(std::size_t index, std::uint64_t drained) {
+        if (!courier_metrics_) return;
+        auto & w = *windows_[index];
+        require(drained >= w.demand_base_published && drained >= w.demand_base_retired,
+                "relay lifetime counters moved backwards");
+        w.demand_base_published = drained;
+        w.demand_base_retired   = drained;
+    }
+
+    // Worker-side re-check after the gated wait loop. The gated loop stops
+    // snapshotting once finished, so a provider failure recorded after that
+    // point is only visible through a fresh snapshot. snapshot() uses
+    // try_to_lock and returns false on ordinary contention, so retry the same
+    // way the wait loops do and fail closed only on a real failure.
+    void epoch_verify(std::size_t index, ggml_backend_t backend) const {
+        if (!courier_metrics_) return;
+        ggml_relay_status status{};
+        while (!ggml_backend_relay_snapshot(backend, &status)) {
+            require(!failure_.stopped.load(), "native relay stopped before the post-drain check");
+            pause_cpu();
+        }
+        require(!status.failed && !failure_.stopped.load(), "native relay epoch failed after drain");
+        require(status.finished && retired(index, status), "native relay epoch was not drained after finish");
+    }
+
+    bool metrics_enabled() const noexcept { return courier_metrics_; }
+
+    bool ablate() const noexcept { return courier_ablate_; }
 
     bool retired(std::size_t index, const ggml_relay_status & state) const {
         return windows_[index]->output_retired.load(std::memory_order_acquire) == state.cpu_reductions;
@@ -232,9 +439,460 @@ class relay_service {
     std::uint64_t inputs(std::size_t index) const { return windows_[index]->input_retired.load(); }
 
     std::uint64_t outputs(std::size_t index) const { return windows_[index]->output_retired.load(); }
+    // GGML_TP5_DW_COURIER_DUAL=1 (exact value; unset/"0"/"2"/"1x" stay OFF):
+    // independent dual completion verification at the logits consumption
+    // point. The two completions are INDEPENDENT signals already exposed by
+    // the existing runtime: the DEVICE tail (status.finished, driven by the
+    // relay provider's per-lane tail event queries inside
+    // ggml_backend_relay_snapshot) and the CPU COURIER retirement
+    // (retired(): output_retired == status.cpu_reductions). No new device
+    // event is created and no GPU kernel waits on its own tail.
+    //
+    // Event query first: every pass refreshes the relay snapshot BEFORE any
+    // courier counter is consulted. A lost snapshot try-lock is ordinary
+    // contention, never completion; status.failed and a stopped failure
+    // state propagate explicitly through require() and are never treated as
+    // completion either.
+    //
+    // Not a busy wait: the dual wait parks through a bounded pause_cpu
+    // phase and then sleeps in short slices instead of spinning unbounded
+    // the way the ungated loops spin.
+    //
+    // The exit condition stays exactly the shipped conjunction (both flags
+    // hold on the values of one pass), so the dual gate never invents an
+    // earlier exit and never blocks an exit the OFF path would take; it adds
+    // the per-epoch account rows, the invariant checks and the fresh
+    // re-verification below. With the gate off, every path here is untouched.
+    static constexpr unsigned                  kDualPausePasses = 128;
+    static constexpr std::chrono::microseconds kDualSliceSleep{50};
+
+    bool dual_enabled() const noexcept { return courier_dual_; }
+
+    static void dual_backoff(unsigned & passes) noexcept {
+        if (passes < kDualPausePasses) {
+            ++passes;
+            pause_cpu();
+            return;
+        }
+        std::this_thread::sleep_for(kDualSliceSleep);
+    }
+
+    // Monotonic relay facts while a dual wait is parked: the epoch and both
+    // lifetime counters (cpu_reductions, output_retired) never move
+    // backwards, and the courier never retires more than was published.
+    // Every breach is counted first, then fails explicitly.
+    void dual_scope_check(std::size_t index, const ggml_relay_status & state, bool & seen,
+                          std::uint64_t & prev_epoch, std::uint64_t & prev_published,
+                          std::uint64_t & prev_retired) {
+        auto &              w         = *windows_[index];
+        const std::uint64_t published = state.cpu_reductions;
+        const std::uint64_t retired   = w.output_retired.load(std::memory_order_acquire);
+        if (seen && (state.epoch < prev_epoch || published < prev_published || retired < prev_retired)) {
+            ++w.dual_violations;
+            require(false, "relay epoch or lifetime counters moved backwards during the dual completion wait");
+        }
+        seen = true;
+        if (retired > published) {
+            ++w.dual_violations;
+            require(false, "courier retired more outputs than were published");
+        }
+        prev_epoch     = state.epoch;
+        prev_published = published;
+        prev_retired   = retired;
+    }
+
+    // One account row per epoch whose consumption verified BOTH completions.
+    // first_witness: 1 = the device tail was observed finished first (the
+    // courier retired late), 2 = the courier was observed retired first (the
+    // device tail finished late), 0 = both flags first seen on one pass, so
+    // the order is not resolvable at this sampling and only the ok counter
+    // moves.
+    void dual_epoch_row(std::size_t index, int first_witness) {
+        auto & w = *windows_[index];
+        ++w.dual_double_ok;
+        if (first_witness == 1) {
+            ++w.dual_courier_late;
+        } else if (first_witness == 2) {
+            ++w.dual_device_late;
+        }
+    }
+    // r7 bounded production handoff: one wall-clock budget per consumed
+    // epoch. The dual machinery must never hold a production run hostage —
+    // when the budget runs out the window latches the shipped stock
+    // fallback (counted, one stderr line) and the epoch still completes
+    // through the exact shipped single-completion loop. The exit predicate
+    // never weakens: both arms consume only a proven finished && retired
+    // epoch.
+    static constexpr std::uint64_t kDualHandoffNs = 10'000'000'000ull; // 10 s
+
+    // The exact shipped single-completion wait (the gate-off arm): event
+    // query first, snapshot contention retries via pause_cpu, relay
+    // failures and stops propagate through require, exit only on the
+    // shipped finished && retired conjunction. Every call is one epoch
+    // consumed through the stock fallback arm (counted).
+    void stock_wait(std::size_t index, ggml_backend_t backend) {
+        ++windows_[index]->dual_fallback_epochs;
+        ggml_relay_status status{};
+        for (;;) {
+            if (!ggml_backend_relay_snapshot(backend, &status)) {
+                pause_cpu();
+                continue;
+            }
+            require(!status.failed && !failure_.stopped.load(), "native relay epoch failed");
+            if (status.finished && retired(index, status)) {
+                break;
+            }
+            pause_cpu();
+        }
+    }
+    // The exact shipped metrics drain arm (the gate-off consumption point):
+    // one demand sample per epoch at the first finished observation, drain
+    // accounting, epoch_end baseline advance and the fresh epoch_verify
+    // re-check. The bounded dual handoff degrades here, so the shipped
+    // metrics contract completes exactly once per epoch.
+    void stock_wait_metrics(std::size_t index, ggml_backend_t backend) {
+        ++windows_[index]->dual_fallback_epochs;
+        ggml_relay_status status        {};
+        const bool        keep_snapshot = courier_ablate_;
+        bool              finished      = false;
+        std::uint64_t     drain_start = 0, drain_passes = 0;
+        for (;;) {
+            if (!finished) {
+                if (!ggml_backend_relay_snapshot(backend, &status)) {
+                    pause_cpu();
+                    continue;
+                }
+                require(!status.failed && !failure_.stopped.load(), "native relay epoch failed");
+                if (!status.finished) {
+                    pause_cpu();
+                    continue;
+                }
+                finished = true;
+                epoch_demand(index, status);
+                drain_start = now_ns();
+            }
+            if (keep_snapshot && !ggml_backend_relay_snapshot(backend, &status)) {
+                pause_cpu();
+                continue;
+            }
+            require(!status.failed && !failure_.stopped.load(), "native relay epoch failed");
+            if (retired(index, status)) {
+                break;
+            }
+            ++drain_passes;
+            pause_cpu();
+        }
+        epoch_drain(index, now_ns() - drain_start, drain_passes);
+        epoch_end(index, status.cpu_reductions);
+        epoch_verify(index, backend);
+    }
+
+    // Latch this window's dual verification onto the shipped stock
+    // fallback: one stderr line per window, never silent.
+    void dual_fallback(std::size_t index, const char * reason) {
+        auto & w = *windows_[index];
+        if (!w.dual_latched) {
+            w.dual_latched      = true;
+            w.dual_latch_reason = reason;
+            std::fprintf(stderr,
+                         "TP5_DW_COURIER_DUAL_FALLBACK window=%zu reason=%s\n",
+                         index, reason);
+        }
+    }
+
+    bool dual_latched(std::size_t index) const noexcept { return windows_[index]->dual_latched; }
+
+    // Dual wait for the metrics-disabled arm: same snapshot/retry/require
+    // shape and the same exit conjunction as the ungated loop, plus the dual
+    // account rows; ends with a fresh independent re-verification (the same
+    // shape as the epoch_verify contract) right before the caller consumes.
+    void dual_wait_plain(std::size_t index, ggml_backend_t backend, const char * what) {
+        if (dual_latched(index)) {
+            stock_wait(index, backend);
+            return;
+        }
+        const std::uint64_t deadline = now_ns() + kDualHandoffNs;
+        // DUALWIN event-overlap trace (GGML_TP5_DW_EVENT_TRACE=1): host
+        // correlation timestamps only (see dw_event_trace.h). Zero stamps
+        // when the gate is off; a fallback/timeout/latched epoch pushes
+        // nothing (the push happens after the ok row below).
+        const bool          dw_tracing  = dw_event_trace::gate();
+        const std::uint64_t dw_entry_ns = dw_tracing ? now_ns() : 0;
+        std::uint64_t       dw_dev_ns = 0, dw_cour_ns = 0, dw_consumed_ns = 0;
+        bool                dw_dev_seen = false, dw_cour_seen = false;
+        ggml_relay_status status        {};
+        int               first_witness = 0;
+        unsigned          backoff       = 0;
+        bool              seen          = false;
+        std::uint64_t     prev_epoch = 0, prev_published = 0, prev_retired = 0;
+        for (;;) {
+            // r7 bounded handoff: on timeout the window latches the shipped
+            // stock fallback (counted) and this epoch still finishes through
+            // the exact stock single-completion loop — the exit predicate
+            // never weakens, only the dual machinery's own overhead stops.
+            if (now_ns() >= deadline) {
+                ++windows_[index]->dual_timeouts;
+                dual_fallback(index, "dual completion handoff timed out");
+                stock_wait(index, backend);
+                return;
+            }
+            // Event query first.
+            if (!ggml_backend_relay_snapshot(backend, &status)) {
+                dual_backoff(backoff);
+                continue;
+            }
+            if (status.failed || failure_.stopped.load()) {
+                require(false, (std::string(what) + ": native relay epoch failed during the dual completion wait").c_str());
+            }
+            dual_scope_check(index, status, seen, prev_epoch, prev_published, prev_retired);
+            const bool device_now  = status.finished;
+            const bool courier_now = retired(index, status);
+            if (dw_tracing) {
+                if (!dw_dev_seen && device_now) {
+                    dw_dev_seen = true;
+                    dw_dev_ns   = now_ns();
+                }
+                if (!dw_cour_seen && courier_now) {
+                    dw_cour_seen = true;
+                    dw_cour_ns   = now_ns();
+                }
+            }
+            if (!first_witness) {
+                if (device_now && !courier_now) {
+                    // Strict device-first: the tail is observed finished and
+                    // the retirement equality still fails at the later
+                    // retired() read of this pass.
+                    first_witness = 1;
+                } else if (courier_now && !device_now) {
+                    // Provisional courier-first: the snapshot's finished flag
+                    // was captured before the retired() read, so a strictly
+                    // later unfinished event query must confirm it.
+                    first_witness = -1;
+                }
+            } else if (first_witness == -1) {
+                first_witness = (courier_now && !device_now) ? 2 : 0;
+            }
+            if (device_now && courier_now) {
+                if (dw_tracing) dw_consumed_ns = now_ns();
+                break;
+            }
+            dual_backoff(backoff);
+        }
+        // Fresh independent re-verification immediately before the logits
+        // read: one new event query must still show BOTH completions. r7
+        // bounded: a re-verify that cannot confirm latches the shipped
+        // stock fallback and the epoch still completes through the exact
+        // stock single-completion loop — production never aborts on the
+        // dual machinery's own check; the main-loop proof already held.
+        status = {};
+        for (;;) {
+            if (ggml_backend_relay_snapshot(backend, &status)) {
+                break;
+            }
+            if (failure_.stopped.load()) {
+                ++windows_[index]->dual_violations;
+                require(false, "relay stopped before the dual completion re-verification");
+            }
+            if (now_ns() >= deadline) {
+                ++windows_[index]->dual_timeouts;
+                dual_fallback(index, "dual completion re-verification timed out");
+                stock_wait(index, backend);
+                return;
+            }
+            dual_backoff(backoff);
+        }
+        require(!status.failed && !failure_.stopped.load(),
+                (std::string(what) + ": native relay failed before the dual completion re-verification").c_str());
+        if (!(status.finished && retired(index, status))) {
+            // A failed re-check counts as a violation sighting before the
+            // explicit fail-closed require (same pattern as the stopped
+            // path); a holding re-check never counts.
+            ++windows_[index]->dual_violations;
+            require(false, (std::string(what) + ": dual completion did not hold at the fresh consumption re-verification").c_str());
+        }
+        dual_epoch_row(index, first_witness == -1 ? 0 : first_witness);
+        if (dw_tracing) {
+            dw_event_trace::rec r;
+            r.relay_epoch = status.epoch;
+            r.entry_ns    = dw_entry_ns;
+            r.dev_ns      = dw_dev_seen ? dw_dev_ns : dw_consumed_ns;
+            r.cour_ns     = dw_cour_seen ? dw_cour_ns : dw_consumed_ns;
+            r.consumed_ns = dw_consumed_ns;
+            r.order       = first_witness == -1 ? 0 : first_witness;
+            windows_[index]->trace.push(r);
+        }
+    }
+
+    // Dual wait for the metrics-enabled arm: preserves the shipped one
+    // demand-sample-per-epoch contract (sample at the FIRST finished
+    // observation, drain accounting, epoch_end baseline advance and the
+    // fresh epoch_verify re-check) while polling event-first and keeping the
+    // dual account rows.
+    void dual_wait_metrics(std::size_t index, ggml_backend_t backend, const char * what) {
+        if (dual_latched(index)) {
+            stock_wait_metrics(index, backend);
+            return;
+        }
+        const std::uint64_t deadline = now_ns() + kDualHandoffNs;
+        // DUALWIN event-overlap trace (GGML_TP5_DW_EVENT_TRACE=1): host
+        // correlation timestamps only (see dw_event_trace.h). The device
+        // stamp is the finished-flip (demand) instant; the courier stamp is
+        // the first drain-pass retirement sighting (or the same demand
+        // instant when same_tick holds). A fallback epoch pushes nothing.
+        const bool          dw_tracing  = dw_event_trace::gate();
+        const std::uint64_t dw_entry_ns = dw_tracing ? now_ns() : 0;
+        std::uint64_t       dw_dev_ns = 0, dw_cour_ns = 0, dw_consumed_ns = 0;
+        bool                dw_dev_seen = false, dw_cour_seen = false;
+        ggml_relay_status status        {};
+        const bool        keep_snapshot = courier_ablate_;
+        bool              finished      = false;
+        int               first_witness = 0;
+        bool              same_tick     = false;
+        unsigned          backoff       = 0;
+        std::uint64_t     drain_start = 0, drain_passes = 0;
+        bool              seen          = false;
+        std::uint64_t     prev_epoch = 0, prev_published = 0, prev_retired = 0;
+        for (;;) {
+            // r7 bounded handoff (pre-demand only): on timeout the window
+            // latches the shipped stock fallback and the epoch still runs
+            // through the exact stock metrics drain. The demand sample has
+            // not run yet, so the shipped contract completes exactly once.
+            if (!finished && now_ns() >= deadline) {
+                ++windows_[index]->dual_timeouts;
+                dual_fallback(index, "dual completion handoff timed out");
+                stock_wait_metrics(index, backend);
+                return;
+            }
+            if (!finished || keep_snapshot) {
+                // Event query first.
+                if (!ggml_backend_relay_snapshot(backend, &status)) {
+                    dual_backoff(backoff);
+                    continue;
+                }
+                if (status.failed || failure_.stopped.load()) {
+                    require(false, (std::string(what) + ": native relay epoch failed during the dual completion wait").c_str());
+                }
+                dual_scope_check(index, status, seen, prev_epoch, prev_published, prev_retired);
+                if (!finished) {
+                    if (!status.finished) {
+                        dual_backoff(backoff);
+                        continue;
+                    }
+                    finished = true;
+                    // Same-pass courier sighting at the demand instant is not
+                    // an order witness (the retired() read races the
+                    // snapshot's finished capture): it counts only in
+                    // double_complete_ok, matching the plain arm's rule.
+                    // Captured at the exact demand-sample instant, before
+                    // any further courier progress can be observed: true
+                    // means both flags were seen on one pass, which counts
+                    // only as double_complete_ok (no order witness).
+                    same_tick = retired(index, status);
+                    epoch_demand(index, status);
+                    drain_start = now_ns();
+                    if (dw_tracing) {
+                        dw_dev_seen = true;
+                        dw_dev_ns   = now_ns();
+                        if (same_tick) {
+                            dw_cour_seen = true;
+                            dw_cour_ns   = dw_dev_ns;
+                        }
+                    }
+                }
+            }
+            // Live failure check on every pass: the OFF loop re-checks it in
+            // the frozen-snapshot drain too, so a stop during the drain must
+            // propagate instead of parking this worker.
+            if (failure_.stopped.load()) {
+                ++windows_[index]->dual_violations;
+                require(false, (std::string(what) + ": stopped during the dual completion drain").c_str());
+            }
+            if (finished && retired(index, status)) {
+                if (!first_witness) {
+                    // Same-tick sighting (courier already retired at the
+                    // sample pass) records no order witness, only
+                    // double_complete_ok; a later retirement flip is the
+                    // strict courier_late witness.
+                    first_witness = same_tick ? 0 : 1;
+                }
+                if (dw_tracing) {
+                    if (!dw_cour_seen) {
+                        dw_cour_seen = true;
+                        dw_cour_ns   = now_ns();
+                    }
+                    dw_consumed_ns = now_ns();
+                }
+                break;
+            }
+            ++drain_passes;
+            dual_backoff(backoff);
+        }
+        epoch_drain(index, now_ns() - drain_start, drain_passes);
+        // status holds the finished snapshot whose cpu_reductions is final;
+        // that drained value is the only point where the baseline moves.
+        epoch_end(index, status.cpu_reductions);
+        epoch_verify(index, backend);
+        // The ok row commits only after the fresh epoch_verify held: a
+        // failed re-check must not leave the epoch counted as ok.
+        dual_epoch_row(index, first_witness);
+        if (dw_tracing) {
+            dw_event_trace::rec r;
+            r.relay_epoch = status.epoch;
+            r.entry_ns    = dw_entry_ns;
+            r.dev_ns      = dw_dev_seen ? dw_dev_ns : dw_consumed_ns;
+            r.cour_ns     = dw_cour_seen ? dw_cour_ns : dw_consumed_ns;
+            r.consumed_ns = dw_consumed_ns;
+            r.order       = first_witness;
+            windows_[index]->trace.push(r);
+        }
+    }
+
+    // GGML_TP5_DW_COURIER_DUAL=1 exit summary, one line per window: epochs
+    // whose consumption proved BOTH independent completions
+    // (double_complete_ok), the observed late completion per epoch
+    // (device_late: device tail finished after the courier retired;
+    // courier_late: courier retired after the device tail finished) and the
+    // protocol violations and failures observed while the dual waits were
+    // parked. Dumped once from finish_ledgers() next to the courier metrics;
+    // no-op when the dual gate is off, so OFF runs print nothing new.
+    void dump_dual_completions_summary() const {
+        if (!courier_dual_) return;
+        for (std::size_t i = 0; i < windows_.size(); ++i) {
+            const auto & w = *windows_[i];
+            std::fprintf(stderr,
+                         "TP5_DW_COURIER_DUAL window=%zu double_complete_ok=%llu device_late=%llu courier_late=%llu "
+                         "violations=%llu timeouts=%llu fallback_epochs=%llu latched=%d reason=%s\n",
+                         i, (unsigned long long) w.dual_double_ok, (unsigned long long) w.dual_device_late,
+                         (unsigned long long) w.dual_courier_late, (unsigned long long) w.dual_violations,
+                         (unsigned long long) w.dual_timeouts, (unsigned long long) w.dual_fallback_epochs,
+                         int(w.dual_latched), w.dual_latch_reason ? w.dual_latch_reason : "none");
+        }
+        // DUALWIN event-overlap trace summary: per-window WIN line with the
+        // first detail epochs, then cross-window host-interval overlap
+        // lines. Host correlation metadata only — never device evidence.
+        if (dw_event_trace::gate()) {
+            dw_event_trace::banner();
+            for (std::size_t i = 0; i < windows_.size(); ++i) {
+                windows_[i]->trace.dump_win(i);
+            }
+            for (std::size_t i = 0; i < windows_.size(); ++i) {
+                for (std::size_t j = i + 1; j < windows_.size(); ++j) {
+                    windows_[i]->trace.dump_overlap(i, j, windows_[j]->trace);
+                }
+            }
+        }
+    }
+
 
     void finish_ledgers(bool failed) {
         stop();
+        // Dual completion summary: printed here, at the single real
+        // end-of-run point, rather than inside stop() — a constructor spawn
+        // failure also calls stop() and must not print an all-zero summary.
+        if (courier_dual_ && !dual_dumped_) {
+            dual_dumped_ = true;
+            dump_dual_completions_summary();
+        }
         for (const auto & window : windows_) {
             if (window->delayed_event) {
                 require(failed, "normal close has an unpublished delayed input");
@@ -254,6 +912,9 @@ class relay_service {
     }
     void copy_wire_metrics(std::size_t index, window_result & result) const {
         require(!thread_.joinable(), "wire metrics require the stopped CPU service");
+        for (const auto & t : threads_) {
+            require(!t.joinable(), "wire metrics require the stopped CPU service");
+        }
         const auto & window = *windows_[index];
         result.rank_input_packed_payload_bytes = window.rank_input_packed_payload_bytes;
         result.rank_output_consumed_payload_bytes = window.rank_output_consumed_payload_bytes;
@@ -267,13 +928,17 @@ class relay_service {
         total += bytes;
     }
 
-    void progress(std::size_t index) {
+    // Returns true iff exactly one provider event was fully serviced. Empty,
+    // deferred and error-return passes return false so a batch stops there.
+    bool progress(std::size_t index) {
         auto &           window = *windows_[index];
+        if (courier_metrics_) ++window.courier_polls;
         ggml_relay_event_v2 event{};
         int              polled = 0;
         if (window.delayed_event) {
             if (clock_type::now() < window.delay_until && !failure_.stopped.load()) {
-                return;
+                if (courier_metrics_) ++window.courier_deferred;
+                return false;
             }
             event = *window.delayed_event;
             window.delayed_event.reset();
@@ -282,13 +947,15 @@ class relay_service {
             polled = ggml_backend_relay_poll_v2(window.backend, &event, sizeof(event));
         }
         if (polled < 0) {
+            if (courier_metrics_) ++window.courier_errors;
             if (!failure_.stopped.load()) {
                 throw std::runtime_error("native relay progress failed");
             }
-            return;
+            return false;
         }
         if (!polled) {
-            return;
+            if (courier_metrics_) ++window.courier_idle;
+            return false;
         }
         if (event.kind == GGML_RELAY_INPUT_READY && !window.delayed && options_.delay_publish_ms &&
             index == options_.delay_window) {
@@ -296,7 +963,8 @@ class relay_service {
             window.delayed       = true;
             window.delayed_event = event;
             window.delay_until   = clock_type::now() + std::chrono::milliseconds(options_.delay_publish_ms);
-            return;
+            if (courier_metrics_) ++window.courier_deferred;
+            return false;
         }
         const bool borrowed = event.kind == GGML_RELAY_INPUT_READY;
         bool       returned = false;
@@ -372,6 +1040,7 @@ class relay_service {
                 returned             = true;
                 require(published, "relay publication was rejected");
                 check_ledger(owner->ledger.output_published(*owner->held));
+                if (courier_metrics_) ++window.courier_input;
             } else if (event.kind == GGML_RELAY_OUTPUT_RELEASED) {
                 auto found = window.channels.find(key);
                 require(found != window.channels.end() && found->second->held.has_value(),
@@ -386,6 +1055,7 @@ class relay_service {
                 }
                 owner.held.reset();
                 window.output_retired.fetch_add(1, std::memory_order_release);
+                if (courier_metrics_) ++window.courier_output;
             } else {
                 throw std::runtime_error("unknown relay event kind");
             }
@@ -399,6 +1069,7 @@ class relay_service {
             }
             throw;
         }
+        return true;
     }
 
     void loop() noexcept {
@@ -416,12 +1087,45 @@ class relay_service {
         }
     }
 
+    // Gated lane: service up to kCourierPassEvents events per wake so a backlog
+    // of k costs one pass instead of k. Ablation keeps F1 off (one event per
+    // pass) while retaining every counter; F2 is switched off on the worker
+    // side (keep_snapshot), so both arms differ in F1+F2 only.
+    void loop_per_window(std::size_t lane) noexcept {
+        lanes_ready_.fetch_add(1, std::memory_order_acq_rel);
+        while (!stop_.load(std::memory_order_acquire)) {
+            try {
+                if (!courier_metrics_ || courier_ablate_) {
+                    (void) progress(lane);
+                } else {
+                    for (std::size_t n = 0; n < kCourierPassEvents; ++n) {
+                        if (!progress(lane)) break;
+                        if (n) ++windows_[lane]->courier_batch_extra;
+                    }
+                }
+            } catch (...) {
+                failure_.fail(std::current_exception());
+                abort_all();
+            }
+            pause_cpu();
+        }
+    }
+
+    static constexpr std::size_t                 kCourierPassEvents = 32;
     const options &                              options_;
+    bool                                         courier_metrics_ = false;
+    bool                                         courier_ablate_ = false;
+    bool                                         courier_dual_ = false;
+    bool                                         metrics_dumped_ = false;
     failure_state &                              failure_;
+    bool                                         dual_dumped_ = false;
     std::uint64_t                                run_;
     std::vector<std::unique_ptr<service_window>> windows_;
     std::atomic<bool>                            ready_{ false }, stop_{ false };
     std::thread                                  thread_;
+    std::vector<std::thread>                     threads_;
+    std::atomic<std::size_t>                     lanes_ready_{ 0 };
+    bool                                         per_window_ = false;
 };
 
 struct row_batch {
@@ -571,6 +1275,33 @@ run_result run(const options & requested) {
     }
     std::vector<context_ptr>    contexts;
     std::vector<ggml_backend_t> native;
+    // DUALWIN-COMPOSE-EVENT per-window state: counters only, touched under
+    // the gate by this window's own decode worker and read after the workers
+    // join. There is no per-window event, no peer publication array and no
+    // peer wait: each window owns a private Meta relay provider, its own
+    // context, KV and requests, and the model weights are read-only, so no
+    // writable state is shared between windows. A symmetric per-epoch peer
+    // event wait would therefore be a same-phase rendezvous with no data
+    // dependency (and, through the Meta forwarder, only a rank-0 wait, not a
+    // five-rank barrier). The epoch's only real cross-boundary dependency is
+    // this window's own logits D2H copy, covered by the output-copy events
+    // recorded below and host-completed after the relay drain.
+    struct dw_compose_event_state {
+        // Host-synchronization replacement counters (GGML_TP5_DW_COMPOSE_EVENT
+        // only). output_event_syncs counts epochs whose host completion barrier
+        // was the output-copy events recorded after llama_decode instead of the
+        // scheduler-wide llama_synchronize; host_sync_replaced is the same
+        // count under its contract name (one stock host synchronize skipped per
+        // count); fallback_no_output_barrier counts ON-path epochs that had to
+        // keep the stock synchronize because no sound output-copy barrier was
+        // available. None of these is device-completion evidence.
+        std::uint64_t output_event_syncs = 0, host_sync_replaced = 0,
+                      fallback_no_output_barrier = 0, no_sync_logits_calls = 0;
+    };
+    std::vector<dw_compose_event_state> dw_compose_events;
+    if (dw_compose_event_req && opts.execution == mode::relay) {
+        dw_compose_events.resize(opts.windows);
+    }
     for (std::uint32_t i = 0; i < opts.windows; ++i) {
         auto params      = llama_context_default_params();
         params.n_ctx     = opts.context_per_request * assignments[i].size();
@@ -613,6 +1344,11 @@ run_result run(const options & requested) {
                 result.hc_owner_offsets.push_back(opts.hc_owner_offsets[i]);
             }
             native.push_back(lane);
+            // DUALWIN-COMPOSE-EVENT: nothing per-window is created here. The
+            // output-copy events are owned by the Meta backend and allocated
+            // lazily by ggml_backend_meta_output_record on the exact child
+            // streams the logits D2H readback uses; see
+            // llama_tp5_output_copy_record.
         }
         contexts.push_back(std::move(context));
         result.windows[i].id = i;
@@ -718,28 +1454,149 @@ run_result run(const options & requested) {
                         ++metrics.decode_calls;
                         metrics.input_rows += batch.batch.n_tokens;
                         require(decoded == 0, "real model decode failed");
+
+                        // DUALWIN-COMPOSE-EVENT: record the OUTPUT-COPY
+                        // completion events immediately after llama_decode
+                        // returned. decode has already enqueued the asynchronous
+                        // logits D2H copy on the child stream(s) its Meta
+                        // readback uses; a record issued now on exactly those
+                        // streams is ordered behind the copy, so the paired wait
+                        // later proves the host logits row is readable. ggml
+                        // reports how many streams were covered (one for a
+                        // mirrored output, every contributing rank for a split
+                        // output); 0 means no sound barrier exists and the stock
+                        // synchronize below stays. These events are the ONLY
+                        // completion proof for the logits read — the relay's
+                        // finished/retired counters do not cover the scheduler's
+                        // D2H copy and are never substituted for it.
+                        const std::size_t dw_copy_streams =
+                            (dw_compose_event_req && wi < dw_compose_events.size()) ?
+                                llama_tp5_output_copy_record(ctx) :
+                                0;
+                        const bool dw_output_barrier = dw_copy_streams > 0;
                         const auto wait_start = now_ns();
                         const float * single_output_logits = nullptr;
-                        if (output_rows == 1) {
-                            // This public getter synchronizes the context. Keep only
-                            // its pointer here; read logits after native retirement.
-                            single_output_logits = llama_get_logits_ith(ctx, single_output_row);
-                        } else {
-                            llama_synchronize(ctx);
+                        // DUALWIN-COMPOSE-EVENT: with the gate ON the per-epoch
+                        // HOST synchronization is REPLACED, not augmented, when
+                        // the output-copy events recorded above exist.
+                        //
+                        // Proof chain (no relay counter is used): those events
+                        // were recorded on exactly the child streams the Meta
+                        // D2H readback of the logits tensor uses, after
+                        // llama_decode returned, so each record is ordered behind
+                        // that asynchronous copy on the same stream. Waiting on
+                        // them (below, after the relay drain) proves the host
+                        // logits row is readable.
+                        //
+                        // Removed: the scheduler-wide
+                        // ggml_backend_sched_synchronize performed by
+                        // llama_synchronize / llama_get_logits_ith. Kept: the
+                        // unchanged relay dual-completion drain below, still
+                        // required by this runtime's own exit predicate. The
+                        // output wait is deferred past the drain
+                        // so the copies complete while the host services the
+                        // relay instead of blocking first.
+                        if (!dw_output_barrier) {
+                            if (dw_compose_event_req && wi < dw_compose_events.size()) {
+                                // Gate ON but no sound output barrier: keep the
+                                // exact stock synchronize, fail-closed, counted.
+                                // No part of this epoch is proven readable by an
+                                // event, so the stock barrier stays exactly as in
+                                // the OFF arm; it is never deferred to a later
+                                // consumer.
+                                ++dw_compose_events[wi].fallback_no_output_barrier;
+                            }
+                            if (output_rows == 1) {
+                                // This public getter synchronizes the context. Keep only
+                                // its pointer here; read logits after native retirement.
+                                single_output_logits = llama_get_logits_ith(ctx, single_output_row);
+                            } else {
+                                llama_synchronize(ctx);
+                            }
                         }
                         if (service) {
                             ggml_relay_status status{};
-                            for (;;) {
-                                if (!ggml_backend_relay_snapshot(native[wi], &status)) {
+                            if (!service->metrics_enabled()) {
+                                if (service->dual_enabled()) {
+                                    service->dual_wait_plain(wi, native[wi], "target");
+                                } else
+                                for (;;) {
+                                    if (!ggml_backend_relay_snapshot(native[wi], &status)) {
+                                        pause_cpu();
+                                        continue;
+                                    }
+                                    require(!status.failed && !failure.stopped.load(), "native relay epoch failed");
+                                    if (status.finished && service->retired(wi, status)) {
+                                        break;
+                                    }
                                     pause_cpu();
-                                    continue;
                                 }
-                                require(!status.failed && !failure.stopped.load(), "native relay epoch failed");
-                                if (status.finished && service->retired(wi, status)) {
-                                    break;
+                            } else if (service->dual_enabled()) {
+                                service->dual_wait_metrics(wi, native[wi], "target");
+                            } else {
+                                // One demand sample per epoch at the first finished
+                                // snapshot. Ablation keeps refreshing the snapshot
+                                // through the drain (baseline mutex behaviour, i.e.
+                                // F2 off); the gated arm stops snapshotting after
+                                // finished so the courier can drain the tail.
+                                const bool    keep_snapshot = service->ablate();
+                                bool          finished      = false;
+                                std::uint64_t drain_start = 0, drain_passes = 0;
+                                for (;;) {
+                                    if (!finished) {
+                                        if (!ggml_backend_relay_snapshot(native[wi], &status)) {
+                                            pause_cpu();
+                                            continue;
+                                        }
+                                        require(!status.failed && !failure.stopped.load(),
+                                                "native relay epoch failed");
+                                        if (!status.finished) {
+                                            pause_cpu();
+                                            continue;
+                                        }
+                                        finished = true;
+                                        service->epoch_demand(wi, status);
+                                        drain_start = now_ns();
+                                    }
+                                    if (keep_snapshot && !ggml_backend_relay_snapshot(native[wi], &status)) {
+                                        pause_cpu();
+                                        continue;
+                                    }
+
+                                    require(!status.failed && !failure.stopped.load(), "native relay epoch failed");
+                                    if (service->retired(wi, status)) {
+                                        break;
+                                    }
+                                    ++drain_passes;
+                                    pause_cpu();
                                 }
-                                pause_cpu();
-                            }
+                                service->epoch_drain(wi, now_ns() - drain_start, drain_passes);
+                                // status holds the finished snapshot whose
+                                // cpu_reductions is final; that drained value is
+                                // the only point where the delta baseline moves.
+                                service->epoch_end(wi, status.cpu_reductions);
+                                service->epoch_verify(wi, native[wi]);
+                        }
+                        }
+                        // DUALWIN-COMPOSE-EVENT: the epoch's relay drain above
+                        // is the runtime's exit predicate and is unchanged. Only
+                        // now, immediately before the host reads logits, do we
+                        // host-complete the output-copy events recorded right
+                        // after decode: their completion proves the async D2H
+                        // copy of this epoch finished, which is the barrier the
+                        // replaced llama_synchronize used to provide. The wait
+                        // is placed after the drain so the drain's host work can
+                        // proceed while any remaining copy latency elapses;
+                        // whether that overlap actually saves time is not
+                        // measured and is not claimed.
+                        if (dw_output_barrier) {
+                            auto & dw_be = dw_compose_events[wi];
+                            ++dw_be.output_event_syncs;
+                            ++dw_be.host_sync_replaced;
+                            const std::size_t dw_proven =
+                                llama_tp5_output_event_wait(ctx);
+                            require(dw_proven == dw_copy_streams,
+                                    "output-copy event barrier did not cover every recorded stream");
                         }
                         metrics.native_wait_ns += now_ns() - wait_start;
                         active.fetch_sub(1);
@@ -753,9 +1610,22 @@ run_result run(const options & requested) {
                             if (!batch.batch.logits[row]) {
                                 continue;
                             }
+                            // DUALWIN-COMPOSE-EVENT: with the event barrier
+                            // above, every row is resolved without a further
+                            // host synchronize; the barrier already proved this
+                            // epoch's output copy completed. OFF and the
+                            // counted fallback keep the stock syncing getter.
+                            const bool single_row_hit =
+                                output_rows == 1 && row == static_cast<std::size_t>(single_output_row);
                             const float * logits =
-                                output_rows == 1 && row == static_cast<std::size_t>(single_output_row) ?
-                                    single_output_logits : llama_get_logits_ith(ctx, row);
+                                single_row_hit && single_output_logits != nullptr ?
+                                    single_output_logits :
+                                    (dw_output_barrier ?
+                                         llama_get_logits_ith_no_sync(ctx, row) :
+                                         llama_get_logits_ith(ctx, row));
+                            if (dw_output_barrier) {
+                                ++dw_compose_events[wi].no_sync_logits_calls;
+                            }
                             require(logits != nullptr, "full logits row is missing");
                             const auto greedy = tq::sampling::select_finite_greedy(logits, n_vocab);
                             require(greedy.usable, "nonfinite full model logits");
@@ -880,6 +1750,42 @@ run_result run(const options & requested) {
                     "request state removal failed");
         }
         llama_synchronize(contexts[wi].get());
+    }
+    if (dw_compose_event_req) {
+        // Receipt counts host calls only. Any output-copy event still owned by
+        // a context is released by ggml_backend_meta_free when the context is
+        // destroyed below; on the success path every epoch's wait already
+        // released them, and the two llama_synchronize calls per window above
+        // drained the streams before that destruction. There is no per-window
+        // peer event, no peer wait and no blocking event synchronize here: the
+        // peer layer was a same-phase rendezvous between windows that share no
+        // writable state.
+        // host_sync_replaced>0 states that this window's per-epoch host
+        // synchronization was the recorded OUTPUT-COPY events instead of the
+        // scheduler-wide llama_synchronize. It does NOT prove on real hardware
+        // that each event shares a stream with the copy it is meant to cover —
+        // that rests on the cited ggml/llama code paths and still needs the
+        // RUNBOOK's device trace. fallback_no_output_barrier counts epochs that
+        // kept the stock synchronize because no sound output-copy barrier was
+        // available; no_sync_logits_calls counts rows resolved without a
+        // synchronizing getter.
+        std::fprintf(stderr,
+            "TP5_DW_COMPOSE_EVENT enabled=1 flag=GGML_TP5_DW_COMPOSE_EVENT"
+            " windows=%u\n", unsigned(opts.windows));
+        for (std::uint32_t wi = 0; wi < dw_compose_events.size();
+             ++wi) {
+            const auto & dw_be = dw_compose_events[wi];
+            std::fprintf(stderr,
+                "TP5_DW_COMPOSE_EVENT window=%u epochs=%llu"
+                " output_event_syncs=%llu host_sync_replaced=%llu"
+                " fallback_no_output_barrier=%llu no_sync_logits_calls=%llu\n",
+                unsigned(wi),
+                (unsigned long long)result.windows[wi].decode_calls,
+                (unsigned long long)dw_be.output_event_syncs,
+                (unsigned long long)dw_be.host_sync_replaced,
+                (unsigned long long)dw_be.fallback_no_output_barrier,
+                (unsigned long long)dw_be.no_sync_logits_calls);
+        }
     }
     contexts.clear();
     for (const auto & held : reservations) {

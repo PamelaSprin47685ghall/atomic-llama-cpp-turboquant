@@ -1274,9 +1274,21 @@ void ggml_cuda_mul_mat_vec_q(
 
     // Shared-quantize cache: reuse the previous quantization when the same src1 tensor is
     // consumed again in this graph eval with the same layout (see q8_cache in common.cuh).
-    // ConvRot types and MUL_MAT_ID stay uncached; oversized batches fall back too.
+    // ConvRot types stay uncached; oversized batches fall back too.
     auto & qc = ctx.q8_cache;
     static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
+    // DC8: in the unfused N>=2 MTP verify graph, gate_exps and up_exps are two separate
+    // MUL_MAT_ID nodes over the SAME src1 activation, so the FP32 -> Q8_1 quantization of
+    // that activation runs twice per layer (+48 quantize_q8_1 nodes per N3 graph).
+    // The quantized bytes do not depend on ids (ids only selects expert rows in the dot
+    // product), so reusing the existing cache key (tensor identity + data pointer + layout +
+    // graph-eval epoch) is expected to be exact; this is unproven on hardware, and pointer
+    // identity does not detect in-place src1 mutation within one eval. Default off; enable
+    // with GGML_CUDA_Q8CACHE_IDS=1.
+    static const bool q8_cache_ids = [] {
+        const char * value = getenv("GGML_CUDA_Q8CACHE_IDS");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
     // Ordinary MMVQ always quantizes to plain block_q8_1: weight type only selects
     // its read-only dot product. MMQ layouts and ConvRot are separate paths.
     // Keep the legacy weight-type key by default for same-binary A/B comparison.
@@ -1286,8 +1298,9 @@ void ggml_cuda_mul_mat_vec_q(
     }();
     const ggml_type q8_cache_type = q8_cache_same_format ? GGML_TYPE_Q8_1 : src0->type;
     // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
-    const bool q8_cacheable = !q8_cache_disabled && !convrot && ids == nullptr && q8_bytes <= (1u << 20) &&
-                              ctx.curr_stream_no == 0;
+    // MUL_MAT_ID is cacheable only under the DC8 gate (default off).
+    const bool q8_cacheable = !q8_cache_disabled && !convrot && (ids == nullptr || q8_cache_ids) &&
+                              q8_bytes <= (1u << 20) && ctx.curr_stream_no == 0;
     const bool q8_hit = q8_cacheable && qc.epoch == ctx.graph_epoch && qc.src1 == src1 &&
                         qc.data == src1->data && qc.size == q8_bytes &&
                         qc.ne10_padded == ne10_padded && qc.type == q8_cache_type &&

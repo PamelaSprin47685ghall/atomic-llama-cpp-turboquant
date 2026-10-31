@@ -1606,6 +1606,14 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    synchronize_accounting();
+}
+
+void llama_context::synchronize_accounting() {
+    if (!sched) {
+        return;
+    }
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -1631,6 +1639,41 @@ void llama_context::synchronize() {
 
     n_queued_tokens    = 0;
     t_compute_start_us = 0;
+}
+
+size_t llama_context::tp5_output_copy_record() {
+    if (backend_tp5_relay == nullptr || !gf_res_prev) {
+        return 0;
+    }
+    const ggml_tensor * t_logits = gf_res_prev->get_logits();
+    if (t_logits == nullptr || t_logits->buffer == nullptr) {
+        return 0;
+    }
+    // A host-resident output is not copied by a device at all; no event on a
+    // device stream can be its barrier. Refuse and keep the full synchronize.
+    if (ggml_backend_buffer_is_host(t_logits->buffer)) {
+        return 0;
+    }
+    // ggml records on exactly the streams its D2H readback uses (MIRRORED reads
+    // the first child, a split axis copies from every contributing child) and
+    // fails closed for PARTIAL/unknown output or a missing event interface.
+    return ggml_backend_meta_output_record(backend_tp5_relay, t_logits);
+}
+
+size_t llama_context::tp5_output_copy_wait() {
+    if (backend_tp5_relay == nullptr) {
+        return 0;
+    }
+    const size_t complete = ggml_backend_meta_output_wait(backend_tp5_relay);
+    // Only a wait that actually released recorded events is this epoch's
+    // completion barrier. With no event (gate off, refused record, or an
+    // already-drained epoch) nothing was synchronized, so the eval bookkeeping
+    // of synchronize() must NOT run: that would claim the queued tokens were
+    // synchronized when no host wait happened.
+    if (complete > 0) {
+        synchronize_accounting();
+    }
+    return complete;
 }
 
 bool llama_context::release_compute() {
@@ -5189,6 +5232,25 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     return res;
 }
 
+// DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): resolve one output row
+// without synchronizing. The caller must already hold this epoch's output-copy
+// completion proof (llama_tp5_output_event_wait, or an equivalent full
+// synchronize). Only the host-side output reorder and row resolution happen
+// here.
+float * llama_get_logits_ith_no_sync(llama_context * ctx, int32_t i) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+
+    float * res = ctx->get_sampled_logits_ith(i);
+
+    if (!res) {
+        res = ctx->get_logits_ith(i);
+    }
+
+    return res;
+}
+
 float * llama_get_embeddings(llama_context * ctx) {
     ctx->synchronize();
 
@@ -5339,6 +5401,20 @@ struct ggml_cgraph * llama_graph_reserve(struct llama_context * ctx,
 
 ggml_backend_t llama_tp5_relay_backend(llama_context * ctx) {
     return ctx != nullptr ? ctx->get_tp5_relay_backend() : nullptr;
+}
+
+// DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): output-copy completion as
+// device events. The record must be issued AFTER llama_decode returned, so every
+// event is ordered behind the graph AND behind the asynchronous logits D2H copy
+// that decode enqueued on the same child stream(s); the wait is then a sound
+// host barrier for the readable logits row and replaces the scheduler-wide
+// synchronize. No relay counter participates in this proof.
+size_t llama_tp5_output_copy_record(llama_context * ctx) {
+    return ctx != nullptr ? ctx->tp5_output_copy_record() : 0;
+}
+
+size_t llama_tp5_output_event_wait(llama_context * ctx) {
+    return ctx != nullptr ? ctx->tp5_output_copy_wait() : 0;
 }
 
 int32_t llama_set_adapters_lora(llama_context *       ctx,

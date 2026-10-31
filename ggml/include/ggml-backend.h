@@ -418,6 +418,34 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): output-copy
+    // completion expressed as device events instead of a scheduler-wide
+    // synchronize.
+    //
+    // ggml_backend_meta_output_record(meta_backend, tensor) records one private
+    // event on every child stream that the Meta D2H copy of `tensor` uses
+    // (exactly one stream for a MIRRORED tensor, every contributing child for a
+    // split axis), ordered behind everything already enqueued there —
+    // including the asynchronous D2H copies issued before this call. A
+    // non-null event still held from an earlier record means that record was
+    // never waited on (its epoch was abandoned before output_wait); it is
+    // released first, without waiting, so the next wait cannot report a stale
+    // completion. It returns the number of streams recorded in THIS call, or 0
+    // when the backend is not Meta, the tensor is not Meta-buffered or is
+    // PARTIAL/unknown, the gate is off, or a required stream lacks an event
+    // interface. On 0 the caller must keep its full synchronize; no event is
+    // left allocated.
+    //
+    // ggml_backend_meta_output_wait(meta_backend) host-completes those events
+    // and releases them, returning the number proven complete. Only device event
+    // synchronizes run: no scheduler backend, CPU backend or relay counter
+    // participates.
+    //
+    // The pair owns backend-level state and is not thread-safe; one caller owns
+    // the record/wait window.
+    GGML_API size_t ggml_backend_meta_output_record(ggml_backend_t meta_backend, const struct ggml_tensor * tensor);
+    GGML_API size_t ggml_backend_meta_output_wait  (ggml_backend_t meta_backend);
+
     //
     // Utils
     //

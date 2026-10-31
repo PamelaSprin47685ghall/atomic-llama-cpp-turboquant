@@ -182,6 +182,28 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
     return true;
 }
 
+// DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): the ONLY Meta event
+// surface in this tree. It is deliberately NOT a device/backend event
+// interface: the meta device keeps stock nullptr event_new/event_free/
+// event_synchronize and the meta backend keeps stock nullptr event_record/
+// event_wait. Consequence (the reason this is not negotiable): a non-null
+// meta-device event_new makes ggml_backend_sched allocate and use its own
+// events for every meta backend
+// (ggml/src/ggml-backend.cpp: ggml_backend_event_new(backends[b]->device)),
+// replacing its stock ggml_backend_synchronize fallback for the whole
+// process — an unverified, process-wide synchronization change. Conversely a
+// meta-backend event_record/event_wait forwards to child 0 only, which cannot
+// order all five relay ranks. The output-copy barrier is therefore expressed
+// directly on the contributing child devices by
+// ggml_backend_meta_output_record/output_wait below; it is confined to this
+// gate and cannot alter any other graph's cross-backend synchronization.
+// unset or any value other than exactly "1" keeps output_record a no-op, so
+// OFF behavior is stock-identical.
+static const bool ggml_backend_meta_compose_event_gate = [] {
+    const char * value = std::getenv("GGML_TP5_DW_COMPOSE_EVENT");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}();
+
 static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .get_name             = */ ggml_backend_meta_device_get_name,
     /* .get_description      = */ ggml_backend_meta_device_get_description,
@@ -1851,6 +1873,11 @@ struct ggml_backend_meta_context {
     std::vector<ggml_cgraph *> relay_graphs;
     std::vector<float> staged_partial;
     std::vector<float> staged_sum;
+    // DUALWIN-COMPOSE-EVENT: one reusable event per child stream, allocated on
+    // the first ggml_backend_meta_output_record and released by
+    // ggml_backend_meta_output_wait (and by ggml_backend_meta_free). Empty and
+    // untouched unless that gate opened on this backend.
+    std::vector<ggml_backend_event_t> output_copy_events;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1986,6 +2013,14 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
         }
         backend_ctx->relay = nullptr;
     }
+    // A pending output-copy event is only ever recorded after its stream's last
+    // enqueued copy, so releasing it here (event destroy is deferred by the
+    // runtime) cannot invalidate outstanding work; the contexts that could still
+    // read those streams are already drained or retained above.
+    for (ggml_backend_event_t event : backend_ctx->output_copy_events) {
+        ggml_backend_event_free(event);
+    }
+    backend_ctx->output_copy_events.clear();
     delete backend_ctx;
     delete backend;
 }
@@ -4147,6 +4182,12 @@ static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t d
     ggml_backend_t backend = new struct ggml_backend;
     backend->guid    = ggml_backend_meta_guid();
     backend->iface   = ggml_backend_meta_i;
+    // DUALWIN-COMPOSE-EVENT: the meta backend deliberately exposes NO event
+    // interface. event_record/event_wait here would forward to child 0 only
+    // (not a five-rank barrier) and, with a non-null meta-device event_new,
+    // would change ggml_backend_sched's cross-backend synchronization for
+    // every meta graph in the process. The output-copy barrier uses the
+    // contributing child devices directly (ggml_backend_meta_output_record).
     backend->device  = dev;
     backend->context = backend_ctx;
     return backend;
@@ -4162,6 +4203,119 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
+}
+
+// DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): express output-copy
+// completion as per-child device events. An event recorded on a child stream is
+// ordered behind everything already enqueued there, including the asynchronous
+// D2H copy the caller issued before this call, so synchronizing it proves that
+// copy completed. The stream set mirrors ggml_backend_meta_get_tensor_async
+// exactly: MIRRORED reads the first child alone; a split axis copies from every
+// child with a non-empty chunk. PARTIAL/unknown output is refused — a partial sum
+// is not a readable final row, and leaving it to the caller's full synchronize
+// keeps that failure unchanged.
+size_t ggml_backend_meta_output_record(ggml_backend_t meta_backend, const struct ggml_tensor * tensor) {
+    if (!ggml_backend_meta_compose_event_gate || meta_backend == nullptr || tensor == nullptr ||
+            !ggml_backend_is_meta(meta_backend) || tensor->buffer == nullptr ||
+            !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return 0;
+    }
+    auto * backend_ctx = (ggml_backend_meta_context *) meta_backend->context;
+    const size_t n_backends = backend_ctx->backend_configs.size();
+    if (n_backends == 0) {
+        return 0;
+    }
+    const ggml_backend_meta_split_state split_state =
+        ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    std::vector<size_t> targets;
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        targets.push_back(0);
+    } else if (split_state.axis >= 0 && split_state.axis <= 2) {
+        for (size_t j = 0; j < n_backends; ++j) {
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+            if (simple_tensor != nullptr && simple_tensor->nb[split_state.axis + 1] != 0) {
+                targets.push_back(j);
+            }
+        }
+    } else {
+        return 0;
+    }
+    if (targets.empty()) {
+        return 0;
+    }
+    if (backend_ctx->output_copy_events.size() != n_backends) {
+        for (ggml_backend_event_t stale : backend_ctx->output_copy_events) {
+            ggml_backend_event_free(stale);
+        }
+        backend_ctx->output_copy_events.assign(n_backends, nullptr);
+    }
+    // Owner/record-wait ordering: a successful wait always nulls every entry,
+    // so a non-null entry here is a record from an epoch that was never
+    // waited on. That happens only when the epoch was abandoned between
+    // output_record and output_wait (a throw on the error/abort path); its
+    // logits were never consumed. Release it without synchronizing: destroying
+    // a recorded event does not cancel stream work, nothing waits on its
+    // captured state, and the next decode's relay process_ubatch synchronize
+    // drains the stream anyway. Keeping it would make a later epoch's wait
+    // release a stale event and return more completions than that epoch
+    // recorded, tripping the runtime's exact coverage check.
+    for (ggml_backend_event_t & stale : backend_ctx->output_copy_events) {
+        if (stale != nullptr) {
+            ggml_backend_event_free(stale);
+            stale = nullptr;
+        }
+    }
+    size_t recorded = 0;
+    for (size_t j : targets) {
+        ggml_backend_t child = backend_ctx->backend_configs[j].backend;
+        if (child == nullptr || child->iface.event_record == nullptr) {
+            break;
+        }
+        ggml_backend_dev_t child_dev = ggml_backend_get_device(child);
+        if (child_dev == nullptr || child_dev->iface.event_new == nullptr ||
+                child_dev->iface.event_synchronize == nullptr) {
+            break;
+        }
+        if (backend_ctx->output_copy_events[j] == nullptr) {
+            backend_ctx->output_copy_events[j] = child_dev->iface.event_new(child_dev);
+        }
+        if (backend_ctx->output_copy_events[j] == nullptr) {
+            break;
+        }
+        child->iface.event_record(child, backend_ctx->output_copy_events[j]);
+        ++recorded;
+    }
+    if (recorded != targets.size()) {
+        // Fail closed: release whatever was recorded and report "no barrier".
+        // The caller then keeps its full synchronize, which also drains these
+        // streams.
+        for (ggml_backend_event_t & event : backend_ctx->output_copy_events) {
+            ggml_backend_event_free(event);
+            event = nullptr;
+        }
+        return 0;
+    }
+    return recorded;
+}
+
+size_t ggml_backend_meta_output_wait(ggml_backend_t meta_backend) {
+    if (meta_backend == nullptr || !ggml_backend_is_meta(meta_backend)) {
+        return 0;
+    }
+    auto * backend_ctx = (ggml_backend_meta_context *) meta_backend->context;
+    size_t complete = 0;
+    for (ggml_backend_event_t & event : backend_ctx->output_copy_events) {
+        if (event == nullptr) {
+            continue;
+        }
+        // Host wait on the device event only; the record already bound it to the
+        // output copy of this stream.
+        ggml_backend_event_synchronize(event);
+        ggml_backend_event_free(event);
+        event = nullptr;
+        ++complete;
+    }
+    return complete;
 }
 
 static ggml_backend_meta_context * ggml_backend_relay_meta_context(ggml_backend_t backend) {

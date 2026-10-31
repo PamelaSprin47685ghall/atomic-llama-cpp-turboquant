@@ -57,6 +57,28 @@ struct llama_context {
 
     void synchronize();
 
+    // DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): tp5-relay only.
+    // Record one device event per child stream that the asynchronous logits D2H
+    // copy of the last decoded epoch used (one stream for a mirrored output,
+    // every contributing rank for a split output). The record is ordered behind
+    // that copy, so waiting on the events proves the host logits row is
+    // readable. Returns the number of streams covered, or 0 when no sound
+    // barrier exists (non-relay context, no graph, non-Meta/partial output,
+    // missing event interface, gate off); the caller must then keep the full
+    // synchronize(). No event is left allocated on 0.
+    size_t tp5_output_copy_record();
+
+    // Host-complete and release the events recorded above, then run
+    // synchronize()'s bookkeeping. Returns the number of streams proven
+    // complete (0 when nothing was recorded). Never synchronizes the
+    // scheduler's backends.
+    size_t tp5_output_copy_wait();
+
+    // Complete synchronize()'s host-side bookkeeping only. For callers that
+    // already proved this epoch's device work and output copy drained through a
+    // narrower barrier. Never touches a backend and never waits.
+    void synchronize_accounting();
+
     bool release_compute();
     uint64_t compute_bytes() const;
 

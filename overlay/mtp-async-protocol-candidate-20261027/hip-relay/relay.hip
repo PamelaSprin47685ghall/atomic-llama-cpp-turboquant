@@ -26,6 +26,47 @@ constexpr uint32_t ranks = GGML_RELAY_RANKS;
 constexpr uint32_t lanes_per_rank = 1;
 static_assert(std::atomic<int32_t>::is_always_lock_free, "relay abort must never acquire a hidden host lock");
 constexpr uint32_t all_ranks        = (1u << ranks) - 1;
+
+
+// DUALWIN-SERIALCUT-TRIM gate (relay side): effective only when the caller
+// runs with GGML_TP5_DW_SERIALCUT=1; read once at static initialization
+// (same convention as every gate in this tree). Off = r4 behavior exactly.
+static const bool dw_trim_active = [] {
+    const char * s = std::getenv("GGML_TP5_DW_SERIALCUT");
+    const char * t = std::getenv("GGML_TP5_DW_SERIALCUT_TRIM");
+    return s && std::strcmp(s, "1") == 0 && t && std::strcmp(t, "1") == 0;
+}();
+
+// DUALWIN-SERIALCUT-TRIM (dw_trim_active only): the per-submit diagnostic
+// environment scan at the use site below runs inside the provider mutex on
+// every submit — inside the process-wide five-rank ticket lock held by the
+// Meta hook pair. With TRIM on it is read once here (env-read-once
+// convention); SEMANTIC CHANGE under TRIM only: a setenv of TP5_DIAG_GRAPH
+// after process start is no longer observed; the log line content is
+// unchanged. With TRIM off the per-submit getenv is kept verbatim (r4
+// behavior, OFF byte-identical).
+static const bool tp5_diag_graph_env = std::getenv("TP5_DIAG_GRAPH") != nullptr;
+
+// DUALWIN-OVERLAP-METER (GGML_TP5_DW_OVERLAP_METER=1): device-side HIP
+// timing-event metering around the five-rank enqueue. One event pair per
+// rank, recorded on that rank's OWN lane stream (stream zero); the pair
+// spans the DEVICE execution of this submit's enqueued ops on that stream
+// (stream order: the stop event executes after the last enqueued op
+// completes; earlier queued work drains first, so the span includes that
+// drain). It is device stream residency — never host wall clock and never
+// claimed as kernel-execution-only. Only same-device, same-rank intervals
+// are comparable; cross-device intervals are never compared. Harvest then
+// re-record: a pending pair is queried/elapsed before its events are
+// re-recorded; an incomplete pair is skipped, never re-rewound. Direct
+// mode only: capture/replay submissions are counted as skipped (capture
+// would record events into the graph; replay enqueues inside finish()).
+// Metering never fails the run: every HIP error only disables the meter.
+// PARTIAL: this file cannot be compiled on this host (no HIP toolchain) —
+// syntax-unverified.
+static const bool dw_overlap_meter_req = [] {
+    const char * v = std::getenv("GGML_TP5_DW_OVERLAP_METER");
+    return v && std::strcmp(v, "1") == 0;
+}();
 // Swift needs 36 recurrent-output, 48 expert-output and 97 HC joins. Reserve a
 // fixed bound before submission; unused slots never become active transfers.
 constexpr size_t   channel_capacity = 256;
@@ -401,6 +442,21 @@ struct provider {
     bool                                  tails_attempted     = false;
     size_t                                next_channel        = 0;
     size_t                                borrowed            = std::numeric_limits<size_t>::max();
+
+    // DUALWIN-OVERLAP-METER device state (used only when dw_overlap_meter_req).
+    struct meter_pair {
+        hipEvent_t begin = nullptr, end = nullptr;
+        bool open = false;     // begin recorded this submit, end not yet
+        bool pending = false;  // complete pair awaiting harvest
+    };
+    meter_pair    meter_state[ranks]       = {};
+    std::uint64_t meter_spans[ranks]       = {};  // harvested span count
+    std::uint64_t meter_span_ns[ranks]     = {};  // harvested span total
+    std::uint64_t meter_span_max_ns[ranks] = {};
+    std::uint64_t meter_skipped[ranks]     = {};  // pending at harvest time
+    std::uint64_t meter_skipped_mode[ranks]= {};  // capture/replay submissions
+    std::uint64_t meter_errors[ranks]      = {};
+    bool          meter_active             = dw_overlap_meter_req;
 };
 
 // Upper bounds cover only candidates admitted by the original poll predicates.
@@ -1483,6 +1539,135 @@ bool describe_frame(provider & p, ggml_cgraph * const * graphs, size_t stages, u
     return true;
 }
 
+// DUALWIN-OVERLAP-METER helpers (direct-mode, five-rank enqueue spans).
+void meter_harvest(provider & p, uint32_t r, bool flush) {
+    auto & s = p.meter_state[r];
+    if (!s.pending) {
+        return;
+    }
+    if (!flush && hipEventQuery(s.end) != hipSuccess) {
+        ++p.meter_skipped[r];
+        return;
+    }
+    if (flush && hipEventSynchronize(s.end) != hipSuccess) {
+        ++p.meter_errors[r];
+        p.meter_active = false;
+        s.pending = false;
+        return;
+    }
+    float ms = 0.0f;
+    if (hipEventElapsedTime(&ms, s.begin, s.end) != hipSuccess) {
+        ++p.meter_errors[r];
+        p.meter_active = false;   // first HIP failure disables the meter only
+        s.pending = false;
+        return;
+    }
+    const std::uint64_t ns = std::uint64_t(double(ms) * 1e6 + 0.5);
+    ++p.meter_spans[r];
+    p.meter_span_ns[r] += ns;
+    if (ns > p.meter_span_max_ns[r]) {
+        p.meter_span_max_ns[r] = ns;
+    }
+    s.pending = false;
+}
+
+void meter_submit_begin(provider & p) {
+    if (!dw_overlap_meter_req || !p.meter_active) {
+        return;
+    }
+    if (p.mode != submission::direct) {
+        for (uint32_t r = 0; r < ranks; ++r) {
+            ++p.meter_skipped_mode[r];
+        }
+        return;
+    }
+    int original_device = -1;
+    (void) hipGetDevice(&original_device);
+    for (uint32_t r = 0; r < ranks && p.meter_active; ++r) {
+        meter_harvest(p, r, /*flush=*/false);
+        auto & s = p.meter_state[r];
+        if (s.pending) {
+            continue;   // previous span still in flight; this rank skips a submit
+        }
+        if (hipSetDevice(p.rank[r].physical) != hipSuccess) {
+            ++p.meter_errors[r];
+            p.meter_active = false;
+            break;
+        }
+        if (!s.begin &&
+                (hipEventCreateWithFlags(&s.begin, hipEventDefault) != hipSuccess ||
+                 hipEventCreateWithFlags(&s.end, hipEventDefault) != hipSuccess)) {
+            ++p.meter_errors[r];
+            p.meter_active = false;
+            break;
+        }
+        if (hipEventRecord(s.begin, p.rank[r].lanes[0].stream) != hipSuccess) {
+            ++p.meter_errors[r];
+            p.meter_active = false;
+            break;
+        }
+        s.open = true;
+    }
+    if (original_device >= 0) {
+        (void) hipSetDevice(original_device);
+    }
+}
+
+void meter_submit_end(provider & p) {
+    if (!dw_overlap_meter_req || !p.meter_active || p.mode != submission::direct) {
+        return;
+    }
+    int original_device = -1;
+    (void) hipGetDevice(&original_device);
+    for (uint32_t r = 0; r < ranks && p.meter_active; ++r) {
+        auto & s = p.meter_state[r];
+        if (!s.open) {
+            continue;
+        }
+        if (hipSetDevice(p.rank[r].physical) != hipSuccess ||
+            hipEventRecord(s.end, p.rank[r].lanes[0].stream) != hipSuccess) {
+            ++p.meter_errors[r];
+            p.meter_active = false;
+            s.open = false;
+            break;
+        }
+        s.open = false;
+        s.pending = true;
+    }
+    if (original_device >= 0) {
+        (void) hipSetDevice(original_device);
+    }
+}
+
+void meter_flush_dump(provider & p) {
+    if (!dw_overlap_meter_req) {
+        return;
+    }
+    for (uint32_t r = 0; r < ranks; ++r) {
+        // Flush even when the meter was disabled by an earlier HIP error:
+        // pending spans are still harvested, every created event is
+        // destroyed (destroy errors counted, never swallowed), and the line
+        // always reports the disabled state so errors stay visible.
+        meter_harvest(p, r, /*flush=*/true);
+        auto & s = p.meter_state[r];
+        if (s.begin) {
+            const hipError_t d1 = hipEventDestroy(s.begin);
+            const hipError_t d2 = hipEventDestroy(s.end);
+            if (d1 != hipSuccess || d2 != hipSuccess) {
+                ++p.meter_errors[r];
+            }
+            s.begin = s.end = nullptr;
+        }
+        std::fprintf(stderr,
+            "TP5_DW_HIP_OVERLAP provider=%p device=%d rank=%u pci=%s active=%d spans=%llu total_ns=%llu max_ns=%llu skipped_pending=%llu skipped_mode=%llu errors=%llu coverage=enqueue_to_completion_stream_span clock=hip_event device_only=1\n",
+            (void *)&p, p.rank[r].physical, unsigned(r), p.status.pci_bdf[r],
+            int(p.meter_active),
+            (unsigned long long)p.meter_spans[r], (unsigned long long)p.meter_span_ns[r],
+            (unsigned long long)p.meter_span_max_ns[r], (unsigned long long)p.meter_skipped[r],
+            (unsigned long long)p.meter_skipped_mode[r], (unsigned long long)p.meter_errors[r]);
+    }
+}
+
 bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
     auto & p = *static_cast<provider *>(opaque);
     const int64_t d0=ggml_time_us();
@@ -1533,7 +1718,7 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
     auto diag_finish=[&]() {
         const int64_t dfinish=ggml_time_us();
         const bool ok=finish(p);
-        if (std::getenv("TP5_DIAG_GRAPH")) GGML_LOG_INFO("TP5_DIAG_RELAY ctx=%p epoch=%llu mode=%d changed=%d hit=%d stages=%zu lock_us=%lld key_us=%lld begin_us=%lld dispatch_us=%lld finish_us=%lld total_us=%lld\n", (void*)&p,(unsigned long long)p.status.epoch,int(p.mode),int(changed),int(hit),stages,(long long)(dlock-d0),(long long)(dkey-dlock),(long long)(dbegin-dkey),(long long)(dfinish-dbegin),(long long)(ggml_time_us()-dfinish),(long long)(ggml_time_us()-d0));
+        if (dw_trim_active ? tp5_diag_graph_env : (std::getenv("TP5_DIAG_GRAPH") != nullptr)) GGML_LOG_INFO("TP5_DIAG_RELAY ctx=%p epoch=%llu mode=%d changed=%d hit=%d stages=%zu lock_us=%lld key_us=%lld begin_us=%lld dispatch_us=%lld finish_us=%lld total_us=%lld\n", (void*)&p,(unsigned long long)p.status.epoch,int(p.mode),int(changed),int(hit),stages,(long long)(dlock-d0),(long long)(dkey-dlock),(long long)(dbegin-dkey),(long long)(dfinish-dbegin),(long long)(ggml_time_us()-dfinish),(long long)(ggml_time_us()-d0));
         return ok;
     };
     p.current->last_used = p.status.epoch;
@@ -1554,6 +1739,7 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
             }
         }
     }
+    meter_submit_begin(p);
     for (size_t stage = 0; stage < stages && !p.status.failed; ++stage) {
         for (uint32_t r = 0; r < ranks && !p.status.failed; ++r) {
             auto * g = graphs[stage * ranks + r];
@@ -1571,6 +1757,7 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
             enqueue(p, uint32_t(stage));
         }
     }
+    meter_submit_end(p);
     return diag_finish(); // Also terminates partial captures and records failed tails.
 }
 
@@ -1805,6 +1992,7 @@ bool destroy(void * opaque) {
     if (!release_owners(*p)) {
         return false;
     }
+    meter_flush_dump(*p);
     lock.unlock();
     delete p;
     return true;

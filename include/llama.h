@@ -630,6 +630,32 @@ extern "C" {
     // API may run concurrently with llama_decode/llama_synchronize.
     LLAMA_API struct ggml_backend * llama_tp5_relay_backend(struct llama_context * ctx);
 
+    // DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): tp5-relay only.
+    // Record one device event per child stream that the asynchronous logits D2H
+    // copy of the last decoded epoch used (one stream for a mirrored output,
+    // every contributing rank for a split output). The record is ordered behind
+    // that copy, so the paired wait proves the host logits row is readable
+    // without a scheduler-wide synchronize. Returns the number of streams
+    // covered; 0 means no sound barrier exists (non-relay context, no graph,
+    // non-Meta/partial/host-resident output, missing event interface, gate off)
+    // and the caller must keep llama_synchronize. No event is left allocated
+    // on 0.
+    LLAMA_API size_t llama_tp5_output_copy_record(struct llama_context * ctx);
+
+    // Host-complete and release the events recorded by
+    // llama_tp5_output_copy_record, then run the context's synchronize
+    // bookkeeping — only when at least one recorded event was actually
+    // synchronized, so an epoch with nothing to prove never reports its queued
+    // tokens as synchronized. Returns the number of streams proven complete.
+    // Never synchronizes the scheduler's backends.
+    LLAMA_API size_t llama_tp5_output_event_wait(struct llama_context * ctx);
+
+    // Resolve one output row without synchronizing the context. The caller must
+    // already hold this epoch's output-copy completion proof (see
+    // llama_tp5_output_event_wait, or llama_synchronize). Only the host-side
+    // output reorder and row resolution happen here.
+    LLAMA_API float * llama_get_logits_ith_no_sync(struct llama_context * ctx, int32_t i);
+
     LLAMA_API int64_t llama_time_us(void);
 
     LLAMA_API size_t llama_max_devices(void);
