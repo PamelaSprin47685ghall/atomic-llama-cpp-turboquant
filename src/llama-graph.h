@@ -5,6 +5,7 @@
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 #include "llama-attention-view.h"
+#include "llama-union-binder.h"
 
 #include <cstdint>
 #include <limits>
@@ -990,7 +991,12 @@ public:
     // Refresh every input's memo for params and verify the patched graph still
     // satisfies each input's reuse/shape contract. Returns false when a patch
     // left the graph inconsistent (caller unwinds and rebuilds).
-    bool revalidate_after_patch(const llm_graph_params & params);
+    // bound_kind/bound_width: the union parameter the caller just patched and
+    // the width it bound. That dimension is proven by the patch itself and is
+    // not re-derived here; every other input/key is checked as usual.
+    bool revalidate_after_patch(const llm_graph_params & params,
+                                llama_union_param_kind bound_kind,
+                                uint32_t bound_width);
 
 private:
     bool inputs_partition_unchanged(const llm_graph_params & params) const;

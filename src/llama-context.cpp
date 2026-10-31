@@ -3625,7 +3625,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         // input's reuse key (the kq-mask key compares the mask against the
         // cache's CURRENT n_kv, so it accepts exactly the patched width). Any
         // refusal unwinds the patch and takes the rebuild below.
-        if (nkv_patched && !res->revalidate_after_patch(gparams)) {
+        // the n_kv patch leaves the output width at its bound value, so the
+        // n_outputs dimension is NOT the one this patch proved; the n_kv width
+        // it bound is the cache's current one (union_rebind_n_kv recorded it)
+        const uint32_t nkv_bound = union_st.record_bound;
+        if (nkv_patched && !res->revalidate_after_patch(gparams, llama_union_param_kind::n_kv, nkv_bound)) {
             auto & nkv_st = llama_nkv_ctx_state_get(this);
             --nkv_st.c_applied;
             ++nkv_st.c_fallbacks;
@@ -3654,7 +3658,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             // self-reject (stock keyed on the build count, which is why a
             // patched graph could never be reused). Fail-closed: any refusal
             // unwinds the patch and falls back to the full rebuild.
-            if (!res->revalidate_after_patch(gparams)) {
+            // this patch bound the requested output width; that dimension is
+            // proven by the patch and is not re-derived from the graph's
+            // previous bound (which is exactly what used to reject it)
+            if (!res->revalidate_after_patch(gparams, llama_union_param_kind::n_outputs,
+                                             (uint32_t) n_outputs)) {
                 // the patch is being unwound: undo the success bookkeeping the
                 // binder already committed (applied/binds/bound) and count a
                 // fallback, so attempts == applied + fallbacks stays true and
@@ -3724,6 +3732,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                     --nkv_st.c_applied;
                     --nkv_st.nout_binds;
                     ++nkv_st.c_fallbacks;   // same, per rolled-back lane
+                    // the bound was committed by the successful patch; the
+                    // rebuild below replaces the graph, so the recorded bound
+                    // must go back to what that patch replaced (otherwise the
+                    // next round believes it is already bound to this width and
+                    // skips the binding it needs)
+                    nkv_st.nout_bound = nkv_st.nout_bound_prev;
                 }
                 reused       = false;
                 nkv_patched  = false;

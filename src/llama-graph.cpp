@@ -499,39 +499,13 @@ void llm_graph_input_mem_hybrid::revalidate(const llm_graph_params & params) {
         inp_attn->revalidate(params);
     }
     if (inp_rs) {
-        inp_rs->revalidate(params);
+        // rs::revalidate casts params.mctx to the RECURRENT context, so hand it
+        // the hybrid's recurrent child: passing the hybrid context itself would
+        // be a type mismatch with undefined behaviour on the next access.
+        llm_graph_params recr_params = params;
+        recr_params.mctx = mctx->get_recr();
+        inp_rs->revalidate(recr_params);
     }
-}
-
-bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
-    // params.mctx is the hybrid context; the recurring-side checks below go
-    // through mctx->get_recr(). Casting it to the recurrent context (as the
-    // stock code did) makes every get_n_rs()/get_head()/get_rs_z() read a
-    // different type's layout - wrong values, and now reachable from
-    // revalidate_after_patch in the same class as the correctly-typed
-    // revalidate().
-    const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
-
-    this->mctx = mctx;
-
-    bool res = true;
-
-    // the recurrent-side accessors live on the hybrid's recurrent child
-    const auto * recr = mctx->get_recr();
-
-    res &= s_copy->ne[0] == recr->get_n_rs();
-
-    res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= s_copy_extra->ne[0] == recr->get_n_rs() - params.ubatch.n_seqs;
-
-    res &= head == recr->get_head();
-    res &= rs_z == recr->get_rs_z();
-
-    // DRC phase 2: a nonzero (or changed) replay length needs a differently-shaped extra
-    // reconstruction node in the graph, so it can't be satisfied by reusing existing topology.
-    res &= replay_len == recr->get_replay_len();
-
-    return res;
 }
 
 void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
@@ -1396,7 +1370,12 @@ void llm_graph_input_mem_hybrid_k::revalidate(const llm_graph_params & params) {
         inp_attn->revalidate(params);
     }
     if (inp_rs) {
-        inp_rs->revalidate(params);
+        // rs::revalidate casts params.mctx to the RECURRENT context, so hand it
+        // the hybrid's recurrent child: passing the hybrid context itself would
+        // be a type mismatch with undefined behaviour on the next access.
+        llm_graph_params recr_params = params;
+        recr_params.mctx = mctx->get_recr();
+        inp_rs->revalidate(recr_params);
     }
 }
 
@@ -1486,7 +1465,12 @@ void llm_graph_input_mem_hybrid_iswa::revalidate(const llm_graph_params & params
         inp_attn->revalidate(params);
     }
     if (inp_rs) {
-        inp_rs->revalidate(params);
+        // rs::revalidate casts params.mctx to the RECURRENT context, so hand it
+        // the hybrid's recurrent child: passing the hybrid context itself would
+        // be a type mismatch with undefined behaviour on the next access.
+        llm_graph_params recr_params = params;
+        recr_params.mctx = mctx->get_recr();
+        inp_rs->revalidate(recr_params);
     }
 }
 
@@ -1616,7 +1600,8 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
-bool llm_graph_result::revalidate_after_patch(const llm_graph_params & params) {
+bool llm_graph_result::revalidate_after_patch(const llm_graph_params & params,
+        llm_union_param_kind bound_kind, uint32_t bound_width) {
     // The graph was just patched in place: its memos (memory context pointers,
     // executed counts) still describe the previous round, so set_input() would
     // call through a stale context (Devops: set_input_k_idxs with this == 0).
@@ -1627,15 +1612,32 @@ bool llm_graph_result::revalidate_after_patch(const llm_graph_params & params) {
     //
     // Failure is not repaired here: the caller unwinds the patch and takes the
     // full-rebuild path. Inputs that memoize nothing are no-ops by contract.
-    // Snapshot the width out_ids is CURRENTLY bound to BEFORE refreshing the
-    // memos: revalidate() writes the width of `params`, so reading it afterwards
-    // would make the eligibility check compare params with itself and silently
-    // drop the n_outputs dimension from the verification.
+    // Which widths are already proven for THIS patched graph?
+    //  - the lane that just patched reports the width it bound the live tensors
+    //    to (bound_kind/bound_width): that dimension needs no further proof, the
+    //    patch itself verified it;
+    //  - a dimension this patch did not touch keeps the graph's own state, so
+    //    its can_reuse() verdict stands unchanged.
+    // Reading out_ids' width before/after the refresh cannot express that: the
+    // refresh writes params.n_outputs, so the eligibility check would either
+    // compare params with itself or compare the previous round's width against
+    // this round's request and reject the patch that just succeeded.
     uint32_t n_outputs_topology = this->params.n_outputs;
-    for (auto & input : inputs) {
-        if (const auto * o = dynamic_cast<const llm_graph_input_out_ids *>(input.get())) {
-            n_outputs_topology = o->get_n_outputs_for_topology();
-            break;
+    if (bound_kind == llama_union_param_kind::n_outputs) {
+        // This patch is the proof for this dimension: the binder built the
+        // scratch at params.n_outputs, the skeleton matched and the result was
+        // copied in. Comparing that same width back against the request could
+        // only repeat the proof, so the dimension is taken as bound at
+        // bound_width instead of being re-derived from the previous bound.
+        n_outputs_topology = bound_width;
+    } else {
+        // the patched lane did not touch the output width: keep judging it at
+        // the width the graph is still bound to
+        for (auto & input : inputs) {
+            if (const auto * o = dynamic_cast<const llm_graph_input_out_ids *>(input.get())) {
+                n_outputs_topology = o->get_n_outputs_for_topology();
+                break;
+            }
         }
     }
     for (auto & input : inputs) {
