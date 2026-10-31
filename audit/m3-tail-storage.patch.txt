@@ -1,6 +1,8 @@
 == worktree
 /home/kunweiz/work/m3tail-storage-20261031
-5c973d803054d456bb42f929a9d7bbf581b7112f
+ebbd2a67d2a95d5726744666fec2c7ff24cd2c6f
+ebbd2a67d alloc,probe: public node accessor; allocator-side retention counters as the witness
+28cae606d audit: refresh patch copy after the interface correction
 5c973d803 probe,harness: use the shipped llm_graph_result(max_nodes) and the public tallocr
 9ac9a6e89 audit: refresh patch copy after removing the header hook
 f7354f517 graph,probe: drop the macro-guarded hook; hand the shipped result sole ownership
@@ -27,22 +29,22 @@ ffa185d85 audit: M3 tail-storage patch trail, defect chain and Devops verificati
 1d529d64a qwen4exp: give the M3 N-row owner tail independent lo storage (default off)
 
 == diff vs base f1c5fafc0 (stat)
- audit/AUDIT-AND-VERIFICATION.md   | 608 ++++++++++++++++++++++++++++++++++++++
- audit/m3-tail-storage.patch.txt   |  29 ++
+ audit/AUDIT-AND-VERIFICATION.md   | 644 ++++++++++++++++++++++++++++++++++++++
+ audit/m3-tail-storage.patch.txt   |  31 ++
  diag/m3-locate-divergence.py      | 109 +++++++
  diag/m3-n1-rowref.py              | 129 ++++++++
  diag/m3-split-trunk-mixer.py      | 105 +++++++
  diag/m3-tail-stamp-diff.py        |  91 ++++++
  diag/m3-tail-stamp.ggml-cuda.diff |  47 +++
  ggml/include/ggml.h               |   1 +
- ggml/src/ggml-alloc.c             |  19 +-
- micro/build_mixer_n1ref.py        | 174 +++++++++++
- micro/build_mixer_prod.py         | 318 ++++++++++++++++++++
- micro/m3-mixer-n1ref.cpp          | 306 +++++++++++++++++++
- micro/m3-mixer-prod-path.cpp      | 256 ++++++++++++++++
- micro/m3-probe-hc-mix.cpp         | 202 +++++++++++++
+ ggml/src/ggml-alloc.c             |  60 +++-
+ micro/build_mixer_n1ref.py        | 174 ++++++++++
+ micro/build_mixer_prod.py         | 328 +++++++++++++++++++
+ micro/m3-mixer-n1ref.cpp          | 306 ++++++++++++++++++
+ micro/m3-mixer-prod-path.cpp      | 256 +++++++++++++++
+ micro/m3-probe-hc-mix.cpp         | 204 ++++++++++++
  src/models/qwen4exp.cpp           | 194 +++++++++++-
- 15 files changed, 2581 insertions(+), 7 deletions(-)
+ 15 files changed, 2672 insertions(+), 7 deletions(-)
 
 == code diff (ggml/, src/)
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
@@ -58,10 +60,44 @@ index 4cb5eb4d1..45344b30c 100644
  
      enum ggml_tri_type {
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index cbe45779d..e2c8b9b58 100644
+index cbe45779d..3bbc194ba 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -467,6 +467,7 @@ struct tensor_alloc {
+@@ -117,6 +117,33 @@ struct tallocr_chunk {
+     size_t max_size;
+ };
+ 
++// Read-only M3 diagnostics: counted at the allocator's own decisions so a leg can
++// tell "the gate armed retention" (kept > 0) from "the gate was off" (kept == 0)
++// without inferring anything from tensor flags or log text.  Written only when
++// GGML_M3_ALLOC_COUNTERS=1, and only in the free/reuse paths below; no allocation
++// decision reads these values.
++static int64_t g_m3_retained_free_skip = 0;  // retained nodes the free path refused to release
++static int64_t g_m3_no_reuse_inplace_skip = 0; // in-place reuses the plan refused because of retention
++static int64_t g_m3_view_reuse_skip = 0;     // view reuses refused because the view owner is retained
++
++static bool m3_alloc_counters_on(void) {
++    static const bool on = [] {
++        const char * v = std::getenv("GGML_M3_ALLOC_COUNTERS");
++        return v != nullptr && v[0] == '1' && v[1] == '\0';
++    }();
++    return on;
++}
++
++static void m3_alloc_counters_report(void) {
++    if (!m3_alloc_counters_on()) {
++        return;
++    }
++    GGML_LOG_INFO("%s: M3_ALLOC_COUNTERS retained_free_skip=%lld no_reuse_inplace_skip=%lld "
++                  "view_reuse_skip=%lld\n", __func__,
++            (long long) g_m3_retained_free_skip, (long long) g_m3_no_reuse_inplace_skip,
++            (long long) g_m3_view_reuse_skip);
++}
++
+ struct ggml_dyn_tallocr {
+     size_t alignment;
+     size_t max_chunk_size;
+@@ -467,6 +494,7 @@ struct tensor_alloc {
      int buffer_id;
      struct buffer_address addr;
      size_t size_max; // 0 = pre-allocated, unused, or view
@@ -69,7 +105,7 @@ index cbe45779d..e2c8b9b58 100644
  };
  
  struct leaf_alloc {
-@@ -641,9 +642,10 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+@@ -641,9 +669,16 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                      continue;
                  }
  
@@ -80,10 +116,16 @@ index cbe45779d..e2c8b9b58 100644
 +                if (parent->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_NO_REUSE) ||
 +                    (parent->view_src != NULL && parent->view_src->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_NO_REUSE))) {
 +                    AT_PRINTF("not reusing retained parent %s for %s\n", parent->name, node->name);
++                    if (parent->flags & GGML_TENSOR_FLAG_NO_REUSE) {
++                        ++g_m3_no_reuse_inplace_skip;
++                    } else if (parent->view_src != NULL &&
++                               (parent->view_src->flags & GGML_TENSOR_FLAG_NO_REUSE)) {
++                        ++g_m3_view_reuse_skip;
++                    }
                      continue;
                  }
  
-@@ -688,9 +690,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+@@ -688,9 +723,12 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
  }
  
  static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
@@ -93,10 +135,13 @@ index cbe45779d..e2c8b9b58 100644
 +    // Graph outputs and explicitly retained allocations remain live throughout the graph.
 +    if (node->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_NO_REUSE)) {
 +        AT_PRINTF("not freeing retained tensor %s\n", node->name);
++        if (node->flags & GGML_TENSOR_FLAG_NO_REUSE) {
++            ++g_m3_retained_free_skip;
++        }
          return;
      }
  
-@@ -860,6 +862,7 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -860,6 +898,7 @@ static bool ggml_gallocr_reserve_n_impl(
      for (int i = 0; i < graph->n_nodes; i++) {
          struct ggml_tensor * node = graph->nodes[i];
          struct node_alloc * node_alloc = &galloc->node_allocs[i];
@@ -104,7 +149,7 @@ index cbe45779d..e2c8b9b58 100644
          if (node->view_src || node->data) {
              node_alloc->dst.buffer_id = -1;
              node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
-@@ -872,6 +875,7 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -872,6 +911,7 @@ static bool ggml_gallocr_reserve_n_impl(
          }
          for (int j = 0; j < GGML_MAX_SRC; j++) {
              struct ggml_tensor * src = node->src[j];
@@ -112,7 +157,7 @@ index cbe45779d..e2c8b9b58 100644
              if (!src || src->view_src || src->data) {
                  node_alloc->src[j].buffer_id = -1;
                  node_alloc->src[j].addr = GGML_BUFFER_ADDRESS_INVALID;
-@@ -998,6 +1002,9 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
+@@ -998,6 +1038,9 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
  }
  
  static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
@@ -122,6 +167,18 @@ index cbe45779d..e2c8b9b58 100644
      size_t node_size = 0;
      if (!node->data && !node->view_src) {
          // If we previously had data but don't now then reallocate
+@@ -1097,6 +1140,11 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
+         ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
+     }
+ 
++    // Read-only diagnostics: report the allocator's own retention decisions for this
++    // graph, so a leg can separate "the gate armed retention" (counts > 0) from
++    // "the gate was off" (counts == 0).  Nothing here feeds back into the plan.
++    m3_alloc_counters_report();
++
+     return true;
+ }
+ 
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
 index 78b58ee94..e6c89db53 100644
 --- a/src/models/qwen4exp.cpp
