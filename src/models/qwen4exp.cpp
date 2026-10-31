@@ -72,39 +72,44 @@ static bool qwen4exp_env_is_1(const char * name) {
     return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
-// M3 N-row owner-tail storage separation, split into two independently gated
-// mechanisms so the trunk sites (micro-baselined) and the mixer sites (no micro
-// baseline) can be measured apart.  Both share this derivation of the strict
-// gate value:
-//   GGML_TP5_HC_N3_TAIL_KEEP  unset/"0"/""  -> nothing retained
-//                             "1"            -> trunk and mixer retention (the
-//                                              complete coverage)
-//                             "trunk"        -> trunk sites only   (diagnostic)
-//                             "mixer"        -> mixer sites only   (diagnostic)
-// Any other value is a configuration error and aborts, so a mistyped isolation
-// knob can never silently narrow the coverage of a candidate run.
-enum qwen4exp_hc_n3_tail_scope {
-    QWEN4EXP_HC_N3_TAIL_SCOPE_OFF     = 0,
-    QWEN4EXP_HC_N3_TAIL_SCOPE_TRUNK   = 1 << 0,
-    QWEN4EXP_HC_N3_TAIL_SCOPE_MIXER   = 1 << 1,
-    QWEN4EXP_HC_N3_TAIL_SCOPE_ALL     = QWEN4EXP_HC_N3_TAIL_SCOPE_TRUNK | QWEN4EXP_HC_N3_TAIL_SCOPE_MIXER,
+// Diagnostic scope for the M3 N-row tail retention.  This knob NEVER enables
+// retention: the production gate below stays exact "1", every other value off.
+// The diagnostic exists only to measure the two mechanisms apart, and is
+// default off:
+//   unset / "" / anything else -> both scopes off
+//   "trunk"                    -> lo retention at trunk sites only
+//   "mixer"                    -> lo + xn retention at mixer sites only
+// A diagnostic leg is not a candidate leg: it is never a promotion input, it is
+// listed as its own knob in every receipt, and the complete coverage is the
+// production gate "1" (trunk and mixer) with both scopes off.
+enum qwen4exp_hc_n3_diag_scope {
+    QWEN4EXP_HC_N3_DIAG_NONE  = 0,
+    QWEN4EXP_HC_N3_DIAG_TRUNK = 1 << 0,
+    QWEN4EXP_HC_N3_DIAG_MIXER = 1 << 1,
 };
 
-static int qwen4exp_hc_n3_tail_scope() {
-    const char * value = std::getenv("GGML_TP5_HC_N3_TAIL_KEEP");
-    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
-        return QWEN4EXP_HC_N3_TAIL_SCOPE_OFF;
-    }
-    if (std::strcmp(value, "1") == 0) {
-        return QWEN4EXP_HC_N3_TAIL_SCOPE_ALL;
+static int qwen4exp_hc_n3_diag_scope() {
+    const char * value = std::getenv("GGML_TP5_HC_N3_TAIL_DIAG_SCOPE");
+    if (value == nullptr) {
+        return QWEN4EXP_HC_N3_DIAG_NONE;
     }
     if (std::strcmp(value, "trunk") == 0) {
-        return QWEN4EXP_HC_N3_TAIL_SCOPE_TRUNK;
+        return QWEN4EXP_HC_N3_DIAG_TRUNK;
     }
     if (std::strcmp(value, "mixer") == 0) {
-        return QWEN4EXP_HC_N3_TAIL_SCOPE_MIXER;
+        return QWEN4EXP_HC_N3_DIAG_MIXER;
     }
-    throw std::runtime_error("GGML_TP5_HC_N3_TAIL_KEEP must be unset, 0, 1, trunk, or mixer");
+    // Off matrix: "" , "0", "true", "01", every other spelling -> OFF.
+    return QWEN4EXP_HC_N3_DIAG_NONE;
+}
+
+// The production gate: exact "1" only.  Unset, "", "0", "01", "true", " 1" and
+// every other spelling are OFF, so adding the diagnostic knob cannot change the
+// behaviour of any existing leg or of the promotion path.
+static bool qwen4exp_hc_n3_tail_keep_enabled() {
+    static const bool enabled = qwen4exp_env_is_1("GGML_TP5_HC_N3_TAIL_KEEP") &&
+            qwen4exp_env_is_1("GGML_TP5_HC_N3_TRIO");
+    return enabled;
 }
 
 // The HIP trio's fused tail (hc_owner_tail4_rows) reads every lo element from all
@@ -119,19 +124,6 @@ static int qwen4exp_hc_n3_tail_scope() {
 // added, no value changes, lo stays an external input of the fused subgraph so
 // ggml_can_fuse_subgraph is unaffected, and Meta's HC owner/late-join plan keys
 // on GGML_TENSOR_FLAG_OUTPUT only, so it keeps its previous decisions.
-//
-// Scope: a mixer site is one whose caller passes no inject projection (the
-// output mixer and the MTP head mixer); every other site is a trunk site.  The
-// trunk sites are the ones the M3 micro baseline covers with per-row N1
-// references; the mixer sites have no such baseline, which is why they can be
-// isolated.  Requires the trio gate as well, so the trio alone keeps its
-// previous allocation decisions, and N = 1 keeps using
-// GGML_TP5_HC_KEEP_LO above.
-static bool qwen4exp_hc_n3_tail_keep_enabled(bool mixer_site) {
-    const int scope = qwen4exp_hc_n3_tail_scope();
-    const int needed = mixer_site ? QWEN4EXP_HC_N3_TAIL_SCOPE_MIXER : QWEN4EXP_HC_N3_TAIL_SCOPE_TRUNK;
-    return (scope & needed) != 0 && qwen4exp_env_is_1("GGML_TP5_HC_N3_TRIO");
-}
 
 // Retain the storage owner of xn for the same reason.  A view cannot be
 // retained, and galloc frees a view's owner once the last view loses its last
@@ -532,17 +524,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             lo->ne[2] == 1 && lo->ne[3] == 1 && lo->view_src == nullptr &&
             ggml_is_contiguous(lo)) {
         // Same shapes the HIP tail guard accepts, so only sites that can fuse
-        // pay the retained 320 x nt x 4 B.
+        // pay the retained 320 x nt x 4 B.  A mixer site is one whose caller
+        // passes no inject projection (the output mixer and the MTP head mixer);
+        // every other site is a trunk site.  The trunk sites are the ones the M3
+        // micro baseline covers with per-row N1 references.
         const bool mixer_site = inject == nullptr;
-        if (qwen4exp_hc_n3_tail_keep_enabled(mixer_site)) {
-            if (mixer_site && !qwen4exp_hc_n3_retain_xn(xn, hc_dim, nt)) {
-                // The mixer site needs both lo and xn retained to be free of the
-                // guard's veto. Retaining lo alone would only move the arena plan
-                // without proving anything, so take no retention here and let the
-                // guard fall back to the generic chain.
-            } else {
+        const bool production = qwen4exp_hc_n3_tail_keep_enabled();
+        const int diag = qwen4exp_hc_n3_diag_scope();
+        const bool diag_trunk = (diag & QWEN4EXP_HC_N3_DIAG_TRUNK) != 0;
+        const bool diag_mixer = (diag & QWEN4EXP_HC_N3_DIAG_MIXER) != 0;
+        // Production "1" retains lo at every site and, at a mixer site, also xn's
+        // storage owner: that is the complete coverage.
+        if (production) {
+            if (!mixer_site || qwen4exp_hc_n3_retain_xn(xn, hc_dim, nt)) {
                 lo->flags |= GGML_TENSOR_FLAG_NO_REUSE;
             }
+        }
+        // Diagnostic scopes are mutually exclusive, off unless set, and never a
+        // promotion input.  Trunk needs no xn pin; mixer needs xn, and falls back
+        // to no retention when xn cannot be retained (fail-closed).
+        if (diag_trunk && !mixer_site) {
+            lo->flags |= GGML_TENSOR_FLAG_NO_REUSE;
+        }
+        if (diag_mixer && mixer_site && qwen4exp_hc_n3_retain_xn(xn, hc_dim, nt)) {
+            lo->flags |= GGML_TENSOR_FLAG_NO_REUSE;
         }
     }
     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
