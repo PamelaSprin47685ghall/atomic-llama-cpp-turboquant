@@ -65,6 +65,34 @@ static bool qwen4exp_hc_keep_lo_enabled() {
     return enabled;
 }
 
+// Strict opt-in gate: only the literal value "1" enables an experiment, so
+// unset, "", "0", "01", " 1", "true" and every other spelling stay off.
+static bool qwen4exp_env_is_1(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+// M3 N-row owner-tail storage separation. The HIP trio's fused tail
+// (hc_owner_tail4_rows) reads every lo element from all output CTAs while it
+// writes the hc_mixed scale, so out and lo must not share storage. galloc
+// frees lo right after its last ordinary consumer (up) for nt = 2..4, and the
+// hc_mixed chain then lands in that freed range; the backend guard
+// (ggml-cuda.cu hc_owner_tail4_rows, untouched and fail-closed) vetoes, so the
+// tail silently falls back to the generic twelve-node chain. Retaining lo's
+// allocation keeps its storage out of the free list for the rest of the graph,
+// which is exactly the independent storage the fused tail needs. This is an
+// allocator-only lifetime contract (GGML_TENSOR_FLAG_NO_REUSE): no node is
+// added, no value changes, lo stays an external input of the fused subgraph so
+// ggml_can_fuse_subgraph is unaffected, and Meta's HC owner/late-join plan
+// keys on GGML_TENSOR_FLAG_OUTPUT only, so it keeps its previous decisions.
+// Requires the trio gate as well, so the trio alone keeps its previous
+// allocation decisions, and N = 1 keeps using GGML_TP5_HC_KEEP_LO above.
+static bool qwen4exp_hc_n3_tail_keep_enabled() {
+    static const bool enabled = qwen4exp_env_is_1("GGML_TP5_HC_N3_TAIL_KEEP") &&
+            qwen4exp_env_is_1("GGML_TP5_HC_N3_TRIO");
+    return enabled;
+}
+
 // Keep the two existing top-k outputs alive for the fused expert reduction.
 // Their views, not the internal argsort/divide tensors, are materialized outputs.
 static void qwen4exp_moe_keep_route(ggml_tensor * out) {
@@ -434,6 +462,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         // A real graph output prevents galloc from recycling this storage for
         // mixed after the original up node. No extra operation or copy is added.
         ggml_set_output(lo);
+    }
+    if (qwen4exp_hc_n3_tail_keep_enabled() && hc == 4 && n_embd == 2560 &&
+            nt >= 2 && nt <= 4 &&
+            w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
+            w_down->op == GGML_OP_NONE && w_down->view_src == nullptr &&
+            w_up->op == GGML_OP_NONE && w_up->view_src == nullptr &&
+            w_down->ne[0] == hc_dim && w_down->ne[1] == 320 &&
+            w_down->ne[2] == 1 && w_down->ne[3] == 1 &&
+            w_up->ne[0] == 320 && w_up->ne[1] == hc_dim &&
+            w_up->ne[2] == 1 && w_up->ne[3] == 1 &&
+            lo->op == GGML_OP_UNARY && ggml_get_unary_op(lo) == GGML_UNARY_OP_SILU &&
+            lo->type == GGML_TYPE_F32 && lo->ne[0] == 320 && lo->ne[1] == nt &&
+            lo->ne[2] == 1 && lo->ne[3] == 1 && lo->view_src == nullptr &&
+            ggml_is_contiguous(lo)) {
+        // Same shapes the HIP tail guard accepts, so only sites that can fuse
+        // pay the retained 320 x nt x 4 B. lo is not pinned for the mixer sites
+        // without an inject projection (inject == nullptr): xn dies at gated
+        // there, and an out/xn overlap only keeps the guard's fail-closed veto.
+        lo->flags |= GGML_TENSOR_FLAG_NO_REUSE;
     }
     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
     cb(gate, "hc_gate", il);
