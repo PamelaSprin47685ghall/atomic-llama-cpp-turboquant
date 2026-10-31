@@ -462,6 +462,43 @@ Fix (both recipes, `micro/build_mixer_prod.py`, `micro/build_mixer_n1ref.py`):
 Nothing was executed for this revision: `m3-mixer-prod-path`, `m3-mixer-n1ref` and both recipes are
 **authored, NOT verified**, and **G2 is not claimed**.
 
+## 5g. Fourth Devops audit: hook closure and the seven-argument call
+
+Two independent blockers, both inside the delivery (`lead-m3mixer3-verify-20261031`):
+
+1. **The hook was printed, not delivered.**  `build_mixer_prod.py` only *emitted text* for
+   `src/llama-graph.h` while compiling with `-DM3_PROBE_GRAPH_HOOK`, so the frozen tree had no
+   `reset_context_view` and the probe TU could not compile.  Fixed by making the change a real file
+   edit in this tree, guarded so production is untouched:
+
+   ```cpp
+   ggml_context * get_ctx() const {
+   #if defined(M3_PROBE_GRAPH_HOOK)
+       if (ctx_compute_view != nullptr) { return ctx_compute_view; }
+   #endif
+       return ctx_compute.get();
+   }
+   #if defined(M3_PROBE_GRAPH_HOOK)
+       void reset_context_view(ggml_context * c, ggml_cgraph * g) { ctx_compute_view = c; gf = g; }
+       ggml_context * ctx_compute_view = nullptr;   // non-owning, next to ctx_compute
+   #endif
+   ```
+
+   The macro is defined **only** by the probe's compile line, so a normal build sees the shipped
+   header byte for byte; there is no permanent test-only API on the production class (the member
+   and both functions disappear without the macro, and the null-view path *is* the shipped path).
+   The recipe no longer prints a patch: it **verifies** that the tree's header carries the token
+   trio and that the guard appears at least twice, and refuses to emit a `-D` command otherwise.
+2. **Wrong arity at the call site.**  The trampoline called `hc_mix(x, w_norm, w_down, w_up,
+   &inject, il)` (6 arguments) while the production signature is
+   `build_hc_mix(x, w_norm, w_down, w_up, w_inject, ggml_tensor ** inject, il)` (7).  Fixed: the
+   weight is now passed explicitly as `w_inject` — never `NULL` in place of a required weight — and
+   `inject` is null *exactly* for the mixer site, which is the production way of selecting it.  The
+   subclass declaration is spelled with the same parameter list so a future drift is a compile error.
+
+Nothing was compiled, run or syntax-checked for this revision by me: the probe TU, the harness and
+both recipes remain **authored, NOT verified**, and **G2 is not claimed**.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -478,7 +515,8 @@ Nothing was executed for this revision: `m3-mixer-prod-path`, `m3-mixer-n1ref` a
   dropping `-x hip` and for not driving the production builder (§5d), and the recipes were again
   rejected for a duplicated compiler, a misordered `-MMD`, and a link line without the private
   `-L` (§5e), and the parser likewise mistook the `-MF` dependency file for the translation unit
-  (§5f). All of those are fixed; nothing has been executed, so G2 remains unproven; the production gate is exact `"1"` again and the previous
+  (§5f), and the probe's hook was printed rather than delivered while its call site used the wrong
+  arity (§5g). All of those are fixed; nothing has been executed, so G2 remains unproven; the production gate is exact `"1"` again and the previous
   `trunk`/`mixer`-inside-`TAIL_KEEP` revision is reverted (kept as evidence above);
   token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
   §5a/§5b give the placement-stamp and per-layer capture plan.  The gate stays closed: promotion is

@@ -64,26 +64,32 @@ OUTPUT_ONLY = {"-MD", "-MMD"}                      # drop: bare output switches
 # Accepted translation-unit suffixes for the recorded compile command.
 SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".cu", ".c++", ".C")
 
-PROBE_HOOK_H = """
-#if defined(M3_PROBE_GRAPH_HOOK)
-    // Test-only. The owning context stays in ctx_compute; this view points at a
-    // caller-owned context and the getters prefer it only while it is non-null.
-    ggml_context * ctx_compute_view = nullptr;
-#endif
-"""
+# The test-only hook lives in the tree (src/llama-graph.h under M3_PROBE_GRAPH_HOOK);
+# the recipe only verifies it is present and consistent with -DM3_PROBE_GRAPH_HOOK,
+# and reports the header/source names the patch touches.
+HOOK_HEADER = os.path.join(WORKTREE, "src/llama-graph.h")
+HOOK_TOKENS = (
+    ("ctx_compute_view", "the non-owning context member"),
+    ("reset_context_view", "the caller-owned context hook"),
+    ("M3_PROBE_GRAPH_HOOK", "the guard that keeps production builds byte-identical"),
+)
 
-PROBE_GETTER_PATCH = """
-    ggml_cgraph  * get_gf()  const { return gf; }
-    ggml_context * get_ctx() const {
-#if defined(M3_PROBE_GRAPH_HOOK)
-        if (ctx_compute_view != nullptr) {
-            return ctx_compute_view;
-        }
-#endif
-        return ctx_compute.get();
-    }
-    void reset_context_view(ggml_context * c, ggml_cgraph * g) { ctx_compute_view = c; gf = g; }
-"""
+
+def check_hook():
+    """Refuse to emit a -DM3_PROBE_GRAPH_HOOK compile when the header cannot honour it."""
+    if not os.path.isfile(HOOK_HEADER):
+        raise ValueError("hook header missing: %s" % HOOK_HEADER)
+    text = open(HOOK_HEADER, errors="replace").read()
+    missing = [tok for tok, what in HOOK_TOKENS if tok not in text]
+    if missing:
+        raise ValueError("src/llama-graph.h lacks the test-only hook (%s); the -D alone "
+                         "cannot make it exist" % ", ".join(missing))
+    # The hook must be inside the guarded region: every occurrence of the member must be
+    # preceded by the #if in the same file, which a simple count check approximates.
+    if text.count("M3_PROBE_GRAPH_HOOK") < 2:
+        raise ValueError("the hook guard appears only once in src/llama-graph.h; it must "
+                         "wrap both the member and the getter branch")
+    return {"header": HOOK_HEADER, "tokens": [tok for tok, _ in HOOK_TOKENS]}
 
 
 def split_argv(argv, what="command"):
@@ -268,10 +274,11 @@ def main(argv):
         print("# ERROR: missing sources: %s" % ", ".join(missing))
         return 2
     try:
+        hook = check_hook()
         compiles = compile_commands(outdir)
         link = link_command(outdir, libdir)
     except ValueError as exc:
-        # Ambiguous or unusable recorded command: stop before printing anything.
+        # Ambiguous recorded command or an unusable hook: stop before printing anything.
         print("# ERROR: %s" % exc)
         return 2
     for c in compiles:
@@ -299,8 +306,7 @@ def main(argv):
         print("# ERROR: link argv lacks the private dir rpath entries")
         return 2
     json.dump({"compile": compiles, "link": link,
-               "hook_header_patch": PROBE_HOOK_H,
-               "hook_getter_patch": PROBE_GETTER_PATCH},
+               "hook": hook},
               open(os.path.join(outdir, "build.argv.json"), "w"), indent=1)
     for c in compiles:
         print(shlex.join(c))
@@ -313,7 +319,9 @@ def main(argv):
     print("#   * -L<libdir> / -Wl,-rpath / -Wl,-rpath-link for the private dir, before")
     print("#     the first -l flag;")
     print("#   * the recorded templates must name an existing single .cu/.cpp with -x")
-    print("#     and -iquote present, else the script refuses instead of guessing.")
+    print("#     and -iquote present, else the script refuses instead of guessing;")
+    print("#   * src/llama-graph.h must already carry the M3_PROBE_GRAPH_HOOK block")
+    print("#     (this tree does); the recipe verifies it and never patches at run time.")
     print()
     print("# run matrix (Devops, both GPU flocks):")
     print("# 1. N=1 reference, MIXER site, production gate OFF:")

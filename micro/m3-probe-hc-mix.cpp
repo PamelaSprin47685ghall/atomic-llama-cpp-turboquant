@@ -9,9 +9,10 @@
 // GGML_TENSOR_FLAG_NO_REUSE decision.  No part of the builder is re-implemented.
 //
 // The trampoline does not create its own ggml context or cgraph: the device test
-// owns both.  Testing-only hooks declared in src/llama-graph.h under
-// M3_PROBE_GRAPH_HOOK (micro/build_mixer_prod.py prints the exact blocks) let the
-// result point at that context while leaving every production build untouched.
+// owns both.  src/llama-graph.h carries the test-only hook itself, guarded by
+// M3_PROBE_GRAPH_HOOK (a non-owning `ctx_compute_view` plus reset_context_view()),
+// so it is a real source change in this tree rather than text printed by a script;
+// without the macro the header is the shipped one and no code path changes.
 // After the build, the site tensors are found by the debug names the production
 // builder sets ("hc_lo", "hc_up"), so nothing depends on node positions.
 //
@@ -46,9 +47,15 @@ struct probe_graph : llama_model_qwen4exp::graph {
     probe_graph(const llama_model & model, const llm_graph_params & params) :
         llama_model_qwen4exp::graph(model, params) {}
 
-    ggml_tensor * hc_mix(ggml_tensor * x, ggml_tensor * w_norm, ggml_tensor * w_down,
-                         ggml_tensor * w_up, ggml_tensor * w_inject,
-                         ggml_tensor ** inject, int il) {
+    // Signature copied from src/models/qwen4exp.cpp so a drift is a compile error.
+    ggml_tensor * hc_mix(
+            ggml_tensor *  x,
+            ggml_tensor *  w_norm,
+            ggml_tensor *  w_down,
+            ggml_tensor *  w_up,
+            ggml_tensor *  w_inject,
+            ggml_tensor ** inject,
+            int            il) {
         return build_hc_mix(x, w_norm, w_down, w_up, w_inject, inject, il);
     }
 };
@@ -91,9 +98,13 @@ ggml_tensor * m3_probe_build_hc_mix(ggml_tensor * xn, ggml_tensor * w_norm,
     params.res = &res;
 
     probe_graph g(*g_probe.model, params);
-    ggml_tensor * inject = w_inject;
-    ggml_tensor * mixed = g.hc_mix(xn, w_norm, w_down, w_up,
-                                   w_inject != nullptr ? &inject : nullptr, int(il));
+    // Seven-argument production signature: (x, w_norm, w_down, w_up, w_inject,
+    // ggml_tensor ** inject, il).  The weight is passed explicitly and is never
+    // null for a trunk site; `inject` is null exactly for a mixer site, which is
+    // how the production builder distinguishes the two.
+    ggml_tensor * inject_slot = w_inject;
+    ggml_tensor ** inject_arg = w_inject != nullptr ? &inject_slot : nullptr;
+    ggml_tensor * mixed = g.hc_mix(xn, w_norm, w_down, w_up, w_inject, inject_arg, int(il));
     if (mixed == nullptr) {
         return nullptr;
     }
@@ -104,7 +115,7 @@ ggml_tensor * m3_probe_build_hc_mix(ggml_tensor * xn, ggml_tensor * w_norm,
         *up_out = ggml_graph_get_tensor(g_probe.gf, "hc_up");
     }
     if (inject_out != nullptr) {
-        *inject_out = w_inject != nullptr ? inject : nullptr;
+        *inject_out = inject_arg != nullptr ? inject_slot : nullptr;
     }
     return mixed;
 }
