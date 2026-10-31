@@ -1211,8 +1211,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
-// Drops the split-input copies of the last plan before the scheduler forgets
-// which tensors they belong to.
+// Drops the split-input copies of the last plan.
 //
 // Pass 5 rewrites node src[] slots of the live graph to point at copies it
 // creates loose in sched->ctx. Those copies are not graph tensors: the allocator
@@ -1226,10 +1225,13 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 // resolved through the hash table that describes that plan, then every copy slot
 // of that input. A graph tensor is never touched (only the copies pass 5
 // installed), no model weights/KV storage is involved, and with no previous
-// split the loops are empty - so the first plan and every stock consumer are
-// unchanged. Called from ggml_backend_sched_reset() while those tables are still
-// valid, i.e. immediately before the hash/copy tables are wiped.
+// split the loops are empty - so a first plan and every stock consumer are
+// unchanged. Must be called while the plan tables are still valid, i.e. before
+// the hash/copy tables are wiped.
 static void ggml_backend_sched_drop_input_copies(struct ggml_backend_sched * sched) {
+    if (sched->n_splits == 0) {
+        return;
+    }
     for (int i = 0; i < sched->n_splits; ++i) {
         const struct ggml_backend_sched_split * split = &sched->splits[i];
         for (int j = 0; j < split->n_inputs; ++j) {
@@ -1237,8 +1239,10 @@ static void ggml_backend_sched_drop_input_copies(struct ggml_backend_sched * sch
             if (input == nullptr) {
                 continue;
             }
+            // explicit membership test: ggml_hash_find returns the first EMPTY
+            // slot for a miss, so the used bit decides, not the returned index
             const size_t id = ggml_hash_find(&sched->hash_set, input);
-            if (id == GGML_HASHSET_FULL) {
+            if (id == GGML_HASHSET_FULL || !ggml_bitset_get(sched->hash_set.used, id)) {
                 continue;
             }
             const int b = sched->hv_tensor_backend_ids[id];
@@ -1260,6 +1264,15 @@ static void ggml_backend_sched_drop_input_copies(struct ggml_backend_sched * sch
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    // The plan tables still describe the PREVIOUS plan here: its split copies
+    // live at the src[] slots of the graph that plan was made for and are about
+    // to be abandoned (sched->ctx is freed below). Drop their stale placement
+    // first, by the record - not by inspecting the incoming graph. This is the
+    // point every planning path passes through (first plan, re-plan after an
+    // in-place patch, refresh-alloc compute), independent of the is_reset flag
+    // that ggml_backend_sched_reset() uses for its own bookkeeping.
+    ggml_backend_sched_drop_input_copies(sched);
+
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -2255,9 +2268,10 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run
     if (!sched->is_reset) {
-        // split copies of the previous plan are dropped before the tables that
-        // describe them are reset (see ggml_backend_sched_drop_input_copies)
-        ggml_backend_sched_drop_input_copies(sched);
+        // Split copies of the previous plan are dropped by the next
+        // ggml_backend_sched_split_graph() while these tables still describe
+        // that plan (see ggml_backend_sched_drop_input_copies); reset itself
+        // only forgets the mapping.
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));

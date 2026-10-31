@@ -127,36 +127,50 @@ Devops：`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.tx
 - 于是第二轮 pass 1 会把副本当"pre-allocated"（`1.dst` 分支、陈旧 buffer 推 backend），pass 3/4 的 `supports_op(src[])` 走这条链，且**没有任何环节清掉副本的 buffer/data**。被共享的 split 输入（`attn_inp_k_idxs` 这类）在轮间布局变化后可能指向"副本或其副本"，re-plan 后 `set_inputs()` 拿到的就是 `data == NULL` 的那个 → `set_input_k_idxs(dst=NULL)` → SIGSEGV。
 - 为何只有 outputs 窄化路径命中：需要 (a) lane 真正记录并 applied（第一轮修好后首次可达），(b) split 布局轮间变化。nkv plain-rebind 同机制但布局未变；out-live/out-clear 在记录/骨架门早退，根本没走到。
 
-### 6.2 最终修复（局部、明确生命周期；无新状态、无身份判定）
-- `ggml/src/ggml-backend.cpp`：新增 `ggml_backend_sched_drop_input_copies()`，在 **`ggml_backend_sched_reset()`** 内、`ggml_hash_set_reset()` **之前**调用。它只按"上一轮 split 自己记录的表"（`splits[i].inputs[]` → `hash_set` 查找 → `hv_tensor_backend_ids[id]` → `hv_tensor_copies[id][b][0..n_copies)`）把**上一轮 split 输入副本**的 `buffer/data/extra` 清空；随后 reset 才重建这些表。
-- 为什么不引入任何身份/schema 概念：清空发生在 **reset 内部、且只作用于 scheduler 自己上一轮的表**——对"同节点数的另一张图"操作时，被操作的是上一轮的**副本**（派生对象），图本身（`nodes/leafs/src`）完全不动，因此不存在"把别的图的拓扑写进本图"的风险，也不需要按图身份匹配、不需要新字段、不在 calloc/free 的 scheduler 结构体里放 C++ 对象。
-- `src/llama-context.cpp`：仅在 `union_binder_scratch_patch()` 中加注释，说明 bind 的 re-plan 走的是这条 reset 路径（无新 API、无门、无策略开关）。
-- 生命周期闭环：`reset` 前副本表仍有效（hash 表尚未清）→ 清完 → 表清空 → `split_graph` 按内容重建副本（`tensor_id_copy` 只在槽为空时新建，槽清了就重建）→ pass 5 重新写入 `src[]` → gallocr 正常分配。**多 copy（`n_copies > 1`）**：循环覆盖该 id 行下**全部** backend/copy 槽，不只 `cur_copy`。
-- 稳定性：`drop` 只读上一轮表、只写副本张量的三个字段；`ggml_backend_sched_reset` 的其余语义（`is_alloc=false`、`is_reset` 语义）不变；`ggml_backend_sched_free` 仍只 free 原始指针表，未新增需要析构的成员（**无泄漏、无 UB**）。
+### 6.2 最终修复（局部、无新状态；清理点 = 每个 plan 的入口）
+- `ggml/src/ggml-backend.cpp`：新增 `ggml_backend_sched_drop_input_copies()`，只按**上一轮 plan 自己的记录**定位：`splits[i].inputs[]` → `hash_set` 的**显式 used 位**判定（`ggml_hash_find` 未命中返回首个空槽，故必须用 `ggml_bitset_get(hash_set.used, id)`，不能靠 `backend_id == -1` 隐式兜底）→ `hv_tensor_copies[id][b][0..n_copies)` 全槽 → 清 `buffer/data/extra`。
+- 调用点：**`ggml_backend_sched_split_graph()` 的第一行**（`n_splits` 归零、`sched->ctx` 释放、hash/copy 表重建之前）。这是**所有** plan 的唯一入口：首轮 plan、binder 的同图 re-plan、以及公开 API 的 refresh-alloc（`alloc_graph` 一旦需要重新 split 时）都经过它，因此不再依赖 `is_reset` 这个与 plan 生命周期无关的布尔（前一轮的缺口）。
+- `ggml_backend_sched_reset()` 不再清理，只保留原有语义（清 hash/copy 表）；因为清理已移到下一个 plan 入口，那里表仍描述上一轮 plan。
+- `src/llama-context.cpp`：仅在 `union_binder_scratch_patch()` 加注释，说明 bind 的 re-plan 走这条路径（无新 API、无门、无策略开关）。
 
-### 6.3 与已撤销的 55d6ff7bd 的差异（reviewer 三项问题逐条）
+为什么仍然不需要任何身份/schema 概念：
+- 被清对象是**上一轮 plan 的派生副本**（pass 5 在 `sched->ctx` 里造的 dupllicate-layout 张量），图本身的 `nodes/leafs/src[]`、`ne/nb/op_params` 一律不写；
+- 定位只走"上一轮自己的表"，不会因为"另一张同节点数的图"而误写任何图拓扑（reviewer F1 的结构性规避）；
+- 每轮 plan 结束后副本必然带 allocation state（`alloc_splits` → gallocr init，或 compute 的 `tensor_copy`），因此"plan 入口统一清一次"覆盖首轮之后的**所有**轮次，包含 K-shift 图与 live 图交替的序列。
+
+### 6.3 生命周期与消费者行为（K-shift / 同图重复计算）
+- **同图重复计算（refresh-alloc）**：`ggml_backend_sched_graph_compute_async_impl` 在 `is_alloc == true` 时不 reset。若同图再次 compute 且不重新 alloc，副本仍是本轮已由 `compute_splits` 的 `tensor_copy` 写入的地址（同一轮，正确）；只有走到 `alloc_graph → split_graph` 时才需要清理，而清理就在 `split_graph` 入口——**不依赖 reset 是否被跳过**。
+- **K-shift 交错**：`llama-kv-cache.cpp` 的 shift 是 `sched_reset → alloc_graph(shift 图) → compute`，之后 `gf_res_reserve->reset()` 丢弃 shift 图，`gf_res_prev` 保持 reset 状态。下一轮 live 图重建时 `reset` 直接返回（`is_reset == true`），但随后的 `alloc_graph → split_graph` 仍会执行本清理，且此时表描述的是 **shift plan**，被清的正是 shift 图节点的 `src[]` 里的副本——shift 图此前带上了本轮 gallocr 的 state（`alloc_graph` 必然调用 gallocr init），所以能清到。
+- **多图交替**中"上一轮 plan 的图对象已被外部丢弃"的情形：src[] 指针随图对象一起失效，不会再被读取；本清理不触碰它们，只是不再拥有那份 allocation state。
+- **仍未覆盖**：若某消费者在同一轮内对同一张图连续 compute 两次且第一次 compute 时副本尚未被 `tensor_copy` 写入（即 `splits[i].inputs[]` 中不存在的输入被 pass 5 写入），这属于既有 scheduler 语义，不在本修复范围；报告不声称覆盖。
+
+### 6.4 与 55d6ff7bd 的差异（reviewer 三项问题逐条）
 | reviewer 问题 | 55d6ff7bd（已撤销） | 本轮 |
 |---|---|---|
-| F1 同节点数图串味 | 按位置用 schema 覆盖 `src[]`，身份只用 `n_nodes` | **完全删除 schema**；不写任何图张量的 `src[]` |
-| F1b 依赖被刷新的 uid | 记录时 `graph->uid` 每轮刷新 | 不使用 uid |
-| F2 跨 split 副本未撤销 / 表被提前 clear | 新增 `graph_src_copies` 且每次 split 开头 clear，fallback 后丢失记录 | 改动落在 `reset()`：表在 clear 前使用；一轮内多次 split 由第一次 split 的清空覆盖 |
-| F3 `n_copies > 1` 只记录 `cur_copy` | 只记 `cur_copy` 槽 | 清理覆盖全部 backend × copy 槽 |
-| scheduler 结构体 std::vector | calloc/free 不跑析构 → 泄漏 | **无新增成员**，仍可 `calloc/free` |
-| OFF 作用范围 | schema 记录在首次 split 无条件执行 | reset 内清理只作用于"上一轮 split 副本"，无副本时为空循环；图/数值/拓扑不变 |
+| F1 同节点数图串味 | 按位置用 schema 覆盖 `src[]`，身份只用 `n_nodes` | **无 schema**；不写任何图张量的 `src[]` |
+| 依赖被刷新的 uid | 记录时用每轮刷新的 `graph->uid` | 不使用 uid |
+| F2 表被提前 clear / 跨 split 丢失 | 新增 `graph_src_copies` 每次 split 开头 clear，fallback 后丢失 | 清理在 split 入口、表清空之前，用上一轮自身的表 |
+| F3 `n_copies>1` 只记 `cur_copy` | 只记 `cur_copy` | 覆盖 `b × c` 全部槽 |
+| 结构体 C++ 对象（泄漏/UB） | `std::vector` 成员 | **无新增成员**，仍可 `calloc/free` |
+| refresh-alloc 路径（is_reset 守卫） | 挂在 reset 内 → 漏 | 挂在 split_graph 入口 → 覆盖 |
+| hash 未命中隐式兜底 | `FULL`-only | 显式 `used` 位判定 |
 
-### 6.4 独立验证指引（Devops，CPU tiny 模型；纪律不变）
+### 6.5 独立验证指引（Devops，CPU tiny 模型）
 | 场景 | 期望 |
 |---|---|
-| A1 out-applied（原崩溃） | rc=0，不崩；`applied ≥ 1`；`attempts == applied + fallbacks`；每步 logits 与 OFF 同批逐位相同 |
-| A2 连续两次窄化 | `applied ≥ 2`，两次 rc=0（验证 re-plan 可重复） |
-| A3 out-clear | `refused_view=1`、`applied=0`（不回退） |
-| A4 nkv plain-rebind | 保持 PASS（同一条 reset 路径） |
+| A1 out-applied（原崩溃） | rc=0、`applied ≥ 1`、`attempts==applied+fallbacks`、logits 与 OFF 同批逐位相同 |
+| A2 连续两次窄化 | `applied ≥ 2`，两次 rc=0 |
+| A3 out-clear | `refused_view=1`、`applied=0` 不回退 |
+| A4 nkv plain-rebind | 保持 PASS |
 | A5 OFF≡stock | REFLOGITS + 7 步 LOGITS 逐字节相同；无 stats 行 |
-| A6 回归：reserve 图 → 首个真实 eval | `graph_reserve(split_only)` 后立刻 full rebuild（同节点数、不同图）不出现串味（本设计不动图，仅副本） |
-| A7 `n_copies>1`（pipeline_parallel 或 `n_copies=4` 配置） | 连续两次 decode 正常、无 abort（覆盖 F3） |
-| A8 out-live（reader cache-side，仍未独立命中） | 需"n_outputs 不变的 reader decode 前置批"或改用双 lane DELTA（`rv_change − rv_same == 1`） |
+| A6 reserve 图 → 首个真实 eval | 无强制重建/auto realloc/`1.dst` 异常；logits 与 OFF 一致 |
+| A7 `n_copies>1`（pipeline_parallel）两次 decode | 正常、无 abort，第二次 logits 与第一次同输入时逐位相同 |
+| A8 同图 refresh-alloc | 同一图连续两次 `alloc_graph + compute`（第二个 plan 前不 reset）不崩、logits 正确 |
+| A9 K-shift 交错 | 跑 prefill 触发 shift（`can_shift`）→ `memory_clear` → 首个 prefill：无 `pre-allocated tensor …` abort、两次 logits 均可复现 |
+| A10 out-live reader（cache-side） | 需"n_outputs 不变前置批"或双 lane DELTA（`rv_change − rv_same == 1`） |
 
-### 6.5 残余风险 / PARTIAL
-- 未编译未测试；A1–A8 全部待回填。
-- `drop` 依据"上一轮 split 表"定位副本，若某消费者在 `reset` 前手动改写了 `splits[]`（仓库内无此调用），清理会漏；属保守失败（不清 = 旧行为）。
-- out-live 的 reader 分支仍未有独立运行证据（A8 设计）。
+### 6.6 残余风险 / PARTIAL（不当作已通过）
+- 未编译未测试；A1–A10 全部无运行证据。
+- 清理只覆盖"上一轮 plan 记录的 split 输入副本"；若某消费者的副本从未进入 `splits[i].inputs[]`（constructively 不应发生，pass 5 在写 `src[]` 前必先登记），则不会被清——属保守失败（不清＝旧行为）。
+- 异步：清理只清字段不释放存储，不早于 drain 回收；但 `reset()` 路径本身没有同步（既有缺口），本修复未改变它。
+- out-live 的 reader 分支仍无独立运行证据（A10 设计）。
