@@ -1,6 +1,8 @@
 == worktree
 /home/kunweiz/work/m3tail-storage-20261031
-a4769fff635ac96525137a8d3f86bcc7e2d50637
+820013b9f79f397aea0da9a4ab9c9961772642d4
+820013b9f micro: exact argv reconstruction in both recipes (duplicate compiler, -MMD order, private -L)
+4a596baf6 audit: Devops harness audit findings, the production-path replacement and gate matrix
 a4769fff6 micro: production-path mixer/trunk device test, faithful recipes, shipped diagnostics
 845ec2a01 audit: record the reverted gate revision, the diag-only scope knob and the mixer N=1 plan
 797f5dd12 micro: mixer-shape N=1 reference harness and its build recipe
@@ -17,22 +19,22 @@ ffa185d85 audit: M3 tail-storage patch trail, defect chain and Devops verificati
 1d529d64a qwen4exp: give the M3 N-row owner tail independent lo storage (default off)
 
 == diff vs base f1c5fafc0 (stat)
- audit/AUDIT-AND-VERIFICATION.md   | 429 ++++++++++++++++++++++++++++++++++++++
- audit/m3-tail-storage.patch.txt   |  19 ++
- diag/m3-locate-divergence.py      | 109 ++++++++++
- diag/m3-n1-rowref.py              | 129 ++++++++++++
- diag/m3-split-trunk-mixer.py      | 105 ++++++++++
+ audit/AUDIT-AND-VERIFICATION.md   | 450 ++++++++++++++++++++++++++++++++++++++
+ audit/m3-tail-storage.patch.txt   |  21 ++
+ diag/m3-locate-divergence.py      | 109 +++++++++
+ diag/m3-n1-rowref.py              | 129 +++++++++++
+ diag/m3-split-trunk-mixer.py      | 105 +++++++++
  diag/m3-tail-stamp-diff.py        |  91 ++++++++
- diag/m3-tail-stamp.ggml-cuda.diff |  47 +++++
+ diag/m3-tail-stamp.ggml-cuda.diff |  47 ++++
  ggml/include/ggml.h               |   1 +
  ggml/src/ggml-alloc.c             |  19 +-
- micro/build_mixer_n1ref.py        |  94 +++++++++
- micro/build_mixer_prod.py         | 176 ++++++++++++++++
- micro/m3-mixer-n1ref.cpp          | 306 +++++++++++++++++++++++++++
- micro/m3-mixer-prod-path.cpp      | 222 ++++++++++++++++++++
- micro/m3-probe-hc-mix.cpp         | 118 +++++++++++
- src/models/qwen4exp.cpp           | 189 ++++++++++++++++-
- 15 files changed, 2047 insertions(+), 7 deletions(-)
+ micro/build_mixer_n1ref.py        | 122 +++++++++++
+ micro/build_mixer_prod.py         | 269 +++++++++++++++++++++++
+ micro/m3-mixer-n1ref.cpp          | 306 ++++++++++++++++++++++++++
+ micro/m3-mixer-prod-path.cpp      | 222 +++++++++++++++++++
+ micro/m3-probe-hc-mix.cpp         | 118 ++++++++++
+ src/models/qwen4exp.cpp           | 189 +++++++++++++++-
+ 15 files changed, 2191 insertions(+), 7 deletions(-)
 
 == code diff
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
