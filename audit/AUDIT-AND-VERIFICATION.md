@@ -543,6 +543,42 @@ Ownership, the part that needed care:
 Every claim in this section is a static reading of the code.  Nothing was compiled, run or
 syntax-checked; **G2 is not claimed** and the probe/harness/recipes remain authored-only.
 
+## 5i. Sixth review: use the shipped `llm_graph_result(max_nodes)` as-is
+
+Devops' G2 attempt found two hard interface errors in §5h, both correct:
+
+* `llm_graph_result` has **one** public constructor, `llm_graph_result(int64_t max_nodes)`, whose
+  body calls `reset()` and creates its own context and graph.  The "adopting" constructor assumed in
+  §5h does not exist, and adding one would be a production API/ABI change.
+* `ggml_backend_buffer::context` is the *backend's* private context (for a CPU buffer, a malloc base
+  address), not a `ggml_context *`; the `in_ctx` precondition was therefore always false.
+
+The probe and harness are rewritten to the real interface:
+
+* the probe constructs `llm_graph_result(4096)` and uses **the context and graph that result already
+  owns** (`res->get_ctx()`, `res->get_gf()`), which is exactly the pair the library dereferences
+  inside `build_hc_mix`; the probe and the library therefore share one context by construction;
+* the weights (`F32 [n_embd,4]`, `Q8_0 [10240,320]`, `Q8_0 [320,10240]`, `Q8_0 [10240,4]` for the
+  trunk) and the input `F32 [n_embd,4,nt]` are created **in that context**, with `no_alloc = true`
+  (the context the result creates is a no_alloc context), so nothing is allocated outside it;
+* the harness attaches backend storage through the **public** tensor allocator —
+  `ggml_backend_buft_alloc_buffer` + `struct ggml_tallocr` (`ggml-alloc.h:10-22`) +
+  `ggml_tallocr_alloc` — one buffer for all probe tensors, freed before the result;
+* release is `delete res`, the only owner; there is no adoption, no deleter swap, no
+  `buffer->context`, and no private header (`ggml-backend-impl.h` is no longer included);
+* `src/llama-graph.h` remains byte-identical to production and the recipe still adds no `-D`.
+
+Witnesses, stated honestly:
+
+* **Witness A (diagnostic only):** `M3_TAIL_BUILD` from the model TU (scope, il, nt, tensor names,
+  retained flag bits) plus the harness line with `lo_flags`; neither llama nor ggml exposes a public
+  query for the retention decision and this delivery adds none, so a flag bit is *logged*, not
+  asserted.
+* **Witness B (the numeric check):** `diag/m3-n1-rowref.py` over `<prefix>.rows.bin` vs
+  `<prefix>.nt1.<r>.bin`, per row ulp/bitdiff/top1.
+
+Nothing in this section was compiled, run or syntax-checked: **G2 remains unproven**.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -562,7 +598,10 @@ syntax-checked; **G2 is not claimed** and the probe/harness/recipes remain autho
   (§5f), and the probe's hook was printed rather than delivered while its call site used the wrong
   arity (§5g); the hook itself was then withdrawn because a macro-guarded member change splits the
   class layout across TUs and cannot reach the library anyway (§5h adds real sole ownership of the
-  test context instead). Nothing has been executed, so G2 remains unproven; the production gate is exact `"1"` again and the previous
+  test context instead). The adopting constructor and the `buffer->context` precondition it used
+  do not exist in the shipped interface, so §5i replaces both with the real
+  `llm_graph_result(max_nodes)` and the public `ggml_tallocr` path. Nothing has been executed, so G2
+  remains unproven; the production gate is exact `"1"` again and the previous
   `trunk`/`mixer`-inside-`TAIL_KEEP` revision is reverted (kept as evidence above);
   token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
   §5a/§5b give the placement-stamp and per-layer capture plan.  The gate stays closed: promotion is
