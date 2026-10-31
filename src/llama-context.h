@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-prefab.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -272,7 +273,13 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    // sched_override: run gf on a different scheduler (factor-prefab envelope slots own their own sched)
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_override = nullptr);
+
+    // factor-prefab (LLAMA_PREFAB_ENABLE=1 + LLAMA_PREFAB_EXPERIMENTAL=1; default off)
+    const llama_prefab_state * get_prefab() const { return prefab.get(); }
+    const llama_prefab_stats & get_prefab_stats() const { return prefab_stats; }
+    void reset_prefab_stats() { prefab_stats = {}; }
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -452,6 +459,17 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+
+    // factor-prefab state (null unless enabled); see llama-prefab.h
+    std::unique_ptr<llama_prefab_state> prefab;
+    llama_prefab_stats prefab_stats = {};
+
+    void prefab_init();
+    // returns true if the ubatch was handled by an envelope (out/ret set), false -> stock path
+    bool prefab_process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx,
+                               llm_graph_result *& out, ggml_status & ret);
+    // scheduler that executed the last graph (envelope slot sched or the main sched)
+    ggml_backend_sched_t sched_active() const;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

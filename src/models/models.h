@@ -2346,6 +2346,24 @@ struct llama_model_qwen4exp : public llama_model_base {
     // LLM_GRAPH_TYPE_DECODER_MTP draft head: one HC-wrapped dense-attention + MoE block
     struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+
+        // binds the members without running either head half: the caller drives
+        // build_mtp_prologue() / build_mtp_block() itself (factor-prefab compose). The stock
+        // ctor is this ctor followed by both halves in order.
+        struct no_build_t {};
+        graph_mtp(const llama_model & model, const llm_graph_params & params, no_build_t) :
+            graph(model, params, graph::no_build_t{}) {}
+
+        // The head in two halves. The prologue (A) depends only on the head inputs and the head
+        // weights and returns the block input; its three outputs (block input, HC residual
+        // stream, hc_attn scatter weights) are also recorded in llm_graph_result::t_prefab_cut /
+        // t_prefab_cut_res / t_prefab_cut_inject. The block + epilogue (B) binds the
+        // KV/pos/out_ids inputs of the graph it runs in. The factor-prefab compose layer
+        // (src/llama-prefab-mtp.cpp) builds A once and runs only B in each envelope; the stock
+        // ctor runs both in order.
+        ggml_tensor * build_mtp_prologue();
+        ggml_tensor * build_mtp_block(ggml_tensor * block_in, ggml_tensor * res_in, ggml_tensor * inject_in,
+                                      llm_graph_input_attn_kv * inp_attn_ext = nullptr);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

@@ -661,7 +661,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 // either way. The indexer tensors are still loaded so the GGUF stays complete.
 // TODO: wire up QSA here for long-context draft fidelity.
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
-    graph(model, params, no_build_t{}) {
+    graph_mtp(model, params, no_build_t{}) {
+    // The head is two halves so the factor-prefab compose layer can build the prologue once and
+    // splice it into every envelope (see llama-prefab-mtp.cpp). Stock path: both halves in order.
+    ggml_tensor * block_in = build_mtp_prologue();
+    build_mtp_block(block_in, res->t_prefab_cut_res, res->t_prefab_cut_inject);
+}
+
+ggml_tensor * llama_model_qwen4exp::graph_mtp::build_mtp_prologue() {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP currently only supports a single MTP block");
     GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
@@ -676,20 +683,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     GGML_ASSERT(layer.nextn.eh_proj     && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm       && "MTP block missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm       && "MTP block missing nextn.hnorm");
-    // The MTP head's final mixer is normally the trunk's own output_hc_* (model.hc_head_*):
-    // upstream trains one hc mixer, shared between the trunk's last layer and the draft head.
-    // A draft-only export has no trunk to share with, so it carries its own
-    // blk.N.nextn.hc_head_* instead. Prefer that when it is there, the same way the LM head
-    // is chosen further down. Without this an MTP-only file loads (trunk_flags makes the
-    // trunk mixer optional for it) and then aborts here.
-    ggml_tensor * mtp_hc_norm = layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm;
-    ggml_tensor * mtp_hc_down = layer.nextn.hc_head_down ? layer.nextn.hc_head_down : model.hc_head_down;
-    ggml_tensor * mtp_hc_up   = layer.nextn.hc_head_up   ? layer.nextn.hc_head_up   : model.hc_head_up;
-    GGML_ASSERT(mtp_hc_norm && "QWEN4EXP MTP: no output mixer (neither nextn.hc_head_norm nor model.hc_head_norm)");
 
-    int sections[4];
-    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
-
+    // ---- head prologue (A) -------------------------------------------------------------
+    // The prologue depends only on the head inputs and the head weights, so the factor-prefab
+    // compose layer builds it once into its own graph and splices that graph into every envelope.
+    // This builder always emits it; the block input it produces is recorded in t_prefab_cut,
+    // which is where the compose layer cuts A from B.
     auto inp = std::make_unique<llm_graph_input_embd_h>(hc_dim);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -717,11 +716,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(h_state, "mtp_h_state", il);
 
     res->add_input(std::move(inp));
-
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
-
-    auto * inp_attn = build_attn_inp_kv();
 
     // grouped RMSNorm over the wide stream: normalise each hc stream, then scale the flattened
     // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
@@ -757,6 +751,62 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject,
             &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
+    GGML_ASSERT(inject != nullptr && "QWEN4EXP MTP: hc_attn mix produced no inject");
+
+    // the cut point between A (cached prologue) and B (block + epilogue). A has three outputs,
+    // all consumed by B: the block input `cur`, the HC residual stream `res_hc` that the first
+    // combine folds the block output into, and the scatter weights `inject` that combine uses.
+    res->t_prefab_cut       = cur;
+    res->t_prefab_cut_res   = res_hc;
+    res->t_prefab_cut_inject = inject;
+    return cur;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph_mtp::build_mtp_block(
+        ggml_tensor * block_in,
+        ggml_tensor * res_in,
+        ggml_tensor * inject_in,
+        llm_graph_input_attn_kv * inp_attn_ext) {
+    GGML_ASSERT(block_in != nullptr && "QWEN4EXP MTP: missing block input");
+    GGML_ASSERT(res_in != nullptr && "QWEN4EXP MTP: missing block residual");
+    GGML_ASSERT(inject_in != nullptr && "QWEN4EXP MTP: missing block inject");
+
+    const int64_t hc     = hparams.dsv4_hc_mult;
+    const int64_t hc_dim = hc * n_embd;
+    GGML_ASSERT(hparams.n_embd_out() == (uint32_t) hc_dim && "QWEN4EXP MTP hidden width mismatch");
+
+    const int il = hparams.n_layer();
+    const auto & layer = model.layers[il];
+
+    // The MTP head's final mixer is normally the trunk's own output_hc_* (model.hc_head_*):
+    // upstream trains one hc mixer, shared between the trunk's last layer and the draft head.
+    // A draft-only export has no trunk to share with, so it carries its own
+    // blk.N.nextn.hc_head_* instead. Prefer that when it is there, the same way the LM head
+    // is chosen further down. Without this an MTP-only file loads (trunk_flags makes the
+    // trunk mixer optional for it) and then aborts here.
+    ggml_tensor * mtp_hc_norm = layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm;
+    ggml_tensor * mtp_hc_down = layer.nextn.hc_head_down ? layer.nextn.hc_head_down : model.hc_head_down;
+    ggml_tensor * mtp_hc_up   = layer.nextn.hc_head_up   ? layer.nextn.hc_head_up   : model.hc_head_up;
+    GGML_ASSERT(mtp_hc_norm && "QWEN4EXP MTP: no output mixer (neither nextn.hc_head_norm nor model.hc_head_norm)");
+
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    // B binds the inputs of the graph it runs in: the stock head's own ones, or (compose path)
+    // the envelope's exact-width pos / out_ids / KV inputs.
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // compose path: an external attn input carries the padded KV window the
+    // whole-graph slot was composed for (n_kv is a runtime parameter there);
+    // the stock head builds its own exact-width input.
+    auto * inp_attn = inp_attn_ext ? inp_attn_ext : build_attn_inp_kv();
+
+    // the prologue hands over the block input, the HC residual stream the first combine folds
+    // the block output into, and the scatter weights that combine uses. The FFN mix below
+    // overwrites `inject` with its own weights.
+    ggml_tensor * res_hc = res_in;
+    ggml_tensor * inject = inject_in;
+    ggml_tensor * cur    = block_in;
 
     // ---- dense attention, mirroring the trunk's full-attention branch ----
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -866,6 +916,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+    return cur;
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(

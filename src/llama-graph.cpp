@@ -1391,6 +1391,9 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_prefab_cut  = nullptr;
+    t_prefab_cut_res = nullptr;
+    t_prefab_cut_inject = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -3101,8 +3104,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    // factor-prefab graphs compile for a padded KV width (n_kv is a runtime parameter):
+    // when the input declares one, size the K/V views by it instead of the exact n_kv.
+    // The kq_mask covers the same width and its pad columns are masked out.
+    const uint32_t n_kv_pad = inp->n_kv_pad;
+    ggml_tensor * k = n_kv_pad ? mctx_cur->get_k_pad(ctx0, il, n_kv_pad) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = n_kv_pad ? mctx_cur->get_v_pad(ctx0, il, n_kv_pad) : mctx_cur->get_v(ctx0, il);
 
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
