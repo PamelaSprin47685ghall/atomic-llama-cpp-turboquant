@@ -209,3 +209,25 @@ Devops：`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.tx
 - **A9 的风险点**：如果 `init_batch(...)` 每次返回的上下文对象在"同一批 token 分区"下仍被判为不等价，`can_reuse` 会持续拒绝 → 每次都完整重建（正确但慢）。这需要 Devops 的 `n_reused` 证据，本轮不作乐观声明。
 - 其它大模型族（hybrid/iswa/msa/dsa）的输入类仍在 `can_reuse` 里改写 `mctx` 指针，同一类风险未修（本 lane 只用 `llama_kv_cache_context`）；如后续在这些架构打开 binder，需要同样加身份判定。
 - A6 rc=-1 未定位。
+
+---
+
+## 7. reader 检测器：内部消费者验证（测试件在树外，生产 API 零扩张）
+
+### 7.1 公共 API 无法构造 cache-side（可证）
+`src/llama-kv-cache.cpp`：`validate_attention_batch():1984-2010` 要求视图存在时解码行**逐行等于**视图 `(query_seq,query_pos)`；`prepare_attention_views():1938` 要求视图 query cell **尚不存在**；`apply_ubatch():1615-1624` 解码即写该 cell；`seq_rm():847` 清 cell 而 `resolve_attention_view():2024-2027` 依赖它们。⇒ 公共入口只剩"同位置重复解码"，而实现拒绝该形态。
+
+### 7.2 验证方式：树外真实内部消费者（非 mock）
+`/home/kunweiz/work/fa-outlive-probe-20261031/test-binder-reader-detectors.cpp`（链接 `libllama`），三用例各建真实 context/KV/graph result：
+- **cache-side**：先在无视图下建图（图侧必盲）→ 再 `llama_attention_set_views` 武装缓存 → 经注册的 `n_outputs` 绑定调用 `rebind()` → 断言 `rebind==false`、`c_refused_view +1`、`c_applied` 不变；
+- **graph-side**：武装 → 解码视图行（捕获 spans）→ `llama_attention_clear_views` → 同一组断言；
+- **no-readers**：控制组，断言检测器**不**触发。
+两个检测器通过**构造顺序**隔离，不需要任何合法/非法的解码技巧；观测点只用 binder 自身计数器与返回值。
+
+### 7.3 生产代码零扩张
+`llama_context::graph_params_for_test()` 属于**仅测试扩 API**，已撤销（`1eea533b3`）；`#ifdef` 保护下的 friend 方案同样未采用。测试自建 `llm_graph_params`（字段均为 struct 公有成员）+ 现有公开访问器（`get_cparams()`、`get_sched()`）+ 已有的内部绑定入口，因此**没有为测试向生产类添加访问器、friend 或行为**。
+
+### 7.4 状态（PARTIAL）
+- 测试**未编译未运行**；三用例全部未验。
+- 不可构造的状态输出 `SKIP: <reason>` 并计入 skipped，**不计 PASS**。
+- 需 `GGML_TP5_UNION_BINDER=1`（n_outputs 绑定仅门内注册）。
