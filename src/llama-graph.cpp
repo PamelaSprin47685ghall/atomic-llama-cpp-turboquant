@@ -504,23 +504,32 @@ void llm_graph_input_mem_hybrid::revalidate(const llm_graph_params & params) {
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
-    const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
+    // params.mctx is the hybrid context; the recurring-side checks below go
+    // through mctx->get_recr(). Casting it to the recurrent context (as the
+    // stock code did) makes every get_n_rs()/get_head()/get_rs_z() read a
+    // different type's layout - wrong values, and now reachable from
+    // revalidate_after_patch in the same class as the correctly-typed
+    // revalidate().
+    const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
 
     this->mctx = mctx;
 
     bool res = true;
 
-    res &= s_copy->ne[0] == mctx->get_n_rs();
+    // the recurrent-side accessors live on the hybrid's recurrent child
+    const auto * recr = mctx->get_recr();
+
+    res &= s_copy->ne[0] == recr->get_n_rs();
 
     res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
+    res &= s_copy_extra->ne[0] == recr->get_n_rs() - params.ubatch.n_seqs;
 
-    res &= head == mctx->get_head();
-    res &= rs_z == mctx->get_rs_z();
+    res &= head == recr->get_head();
+    res &= rs_z == recr->get_rs_z();
 
     // DRC phase 2: a nonzero (or changed) replay length needs a differently-shaped extra
     // reconstruction node in the graph, so it can't be satisfied by reusing existing topology.
-    res &= replay_len == mctx->get_replay_len();
+    res &= replay_len == recr->get_replay_len();
 
     return res;
 }
@@ -1618,19 +1627,26 @@ bool llm_graph_result::revalidate_after_patch(const llm_graph_params & params) {
     //
     // Failure is not repaired here: the caller unwinds the patch and takes the
     // full-rebuild path. Inputs that memoize nothing are no-ops by contract.
-    for (auto & input : inputs) {
-        input->revalidate(params);
-    }
-    // The out_ids key is the executed width (set by revalidate above): that is
-    // the topology this graph now has, so the eligibility check must use it too.
-    // Comparing the BUILD width here would reject every n_outputs patch - which
-    // is exactly the dead end the previous round hit.
+    // Snapshot the width out_ids is CURRENTLY bound to BEFORE refreshing the
+    // memos: revalidate() writes the width of `params`, so reading it afterwards
+    // would make the eligibility check compare params with itself and silently
+    // drop the n_outputs dimension from the verification.
     uint32_t n_outputs_topology = this->params.n_outputs;
     for (auto & input : inputs) {
         if (const auto * o = dynamic_cast<const llm_graph_input_out_ids *>(input.get())) {
             n_outputs_topology = o->get_n_outputs_for_topology();
             break;
         }
+    }
+    for (auto & input : inputs) {
+        input->revalidate(params);
+    }
+    // The ubatch partition is a property of the graph, not of params: judge it
+    // first, against the partition it was built with, so a mismatch (which no
+    // patch may introduce) is reported as such instead of being masked by the
+    // eligibility check below.
+    if (!inputs_partition_unchanged(params)) {
+        return false;
     }
     if (!this->params.allow_reuse(params, n_outputs_topology)) {
         return false;
@@ -1640,7 +1656,7 @@ bool llm_graph_result::revalidate_after_patch(const llm_graph_params & params) {
             return false;
         }
     }
-    return inputs_partition_unchanged(params);
+    return true;
 }
 
 bool llm_graph_result::inputs_partition_unchanged(const llm_graph_params & params) const {

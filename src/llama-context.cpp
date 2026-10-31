@@ -3660,11 +3660,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                 // fallback, so attempts == applied + fallbacks stays true and
                 // the next round re-binds instead of trusting a bound that the
                 // rebuilt graph does not have
+                // mutable reference: union_binder_state_peek() returns const
                 auto & nkv_st = llama_nkv_ctx_state_get(this);
                 --nkv_st.c_applied;
                 --nkv_st.nout_binds;
                 ++nkv_st.c_fallbacks;
-                binder_st->nout_bound = binder_st->nout_bound_prev;
+                nkv_st.nout_bound = nkv_st.nout_bound_prev;
+                // A successful nkv patch from THIS round is discarded by the
+                // same rebuild, so its bookkeeping has to be unwound exactly
+                // like the alloc-failure path below does - otherwise applied
+                // keeps a +1 for a graph that never ran.
+                if (nkv_patched) {
+                    --nkv_st.c_applied;
+                    ++nkv_st.c_fallbacks;
+                    nkv_patched = false;
+                }
                 nout_patched = false;
                 reused       = false;
             } else {

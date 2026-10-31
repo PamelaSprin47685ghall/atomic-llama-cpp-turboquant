@@ -250,6 +250,8 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    void revalidate(const llm_graph_params & params) override;
+
     ggml_tensor * out_ids; // I32 [n_outputs]
 
     const llama_hparams hparams;
@@ -301,6 +303,8 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    void revalidate(const llm_graph_params & params) override;
 
     ggml_tensor * s_copy;  // I32 [n_rs]
 

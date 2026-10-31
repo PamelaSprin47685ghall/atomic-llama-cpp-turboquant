@@ -154,6 +154,23 @@ Devops：`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.tx
 **第二轮 review（be99ce508）核实与修正**
 | 项 | 核实 | 修正 |
 |---|---|---|
+| 头文件内联 revalidate 访问前置声明类型（Devops 构建失败） | 成立 | 全部改为类外定义 |
+| `allow_reuse` 用**构建** n_outputs 比较 → 变窄 patch 必自拒 | 成立 | 新增 `n_outputs_topology` 参数（默认＝原行为），由 `revalidate_after_patch` 传入**patch 前**快照的 out_ids 绑定宽度 |
+| `n_outputs_exec==0` 哨兵 | 成立 | 独立 `bool n_outputs_exec_set` |
+| nout 失败缺计数/`nout_bound` 回滚 | 成立 | 补 `--c_applied/--nout_binds/++c_fallbacks` + `nout_bound_prev` 回退 |
+| mctx 覆盖不全 | 成立 | 新增 hybrid×3（含子输入）、dsv4、pos_bucket_kv、attn_k_dsa |
+| **Devops 实测的编译错误** `llama-context.cpp:3667` 写 `const` peek 指针 | 成立（`union_binder_state_peek()` 返回 `const llama_nkv_ctx_state *`） | 改走可变引用 `llama_nkv_ctx_state_get(this)` |
+| reviewer 预测的 `rs` 缺声明 | **实测未报错**；但仍补上声明（类外定义必须有声明，避免编译器差异与 hybrid 前向调用落到基类空实现） | 已补 |
+| `n_outputs_topology` 在 revalidate 之后取值 → 自比较恒真 | 成立 | 改为**先快照**（`revalidate` 之前） |
+| nkv 成功 + nout revalidate 失败，nkv 的 `c_applied` 不回滚 | 成立 | 失败块内若 `nkv_patched` 同样 `--c_applied/++c_fallbacks` 并清标志（与 alloc 失败路径同语义） |
+| `mem_hybrid::can_reuse` 强转错误（既有 bug，新路径可达） | 成立 | 改为 `llama_memory_hybrid_context`，复现侧访问经 `get_recr()` |
+| OFF 等值 / 并发 | 无问题 | — |
+
+**绑定的真实性**：`revalidate_after_patch` 的拓扑参照取"patch 之前 out_ids 实际绑定的宽度"；n_outputs lane 的绑定值来自 `union_rebind_outputs` 写入的 `nout_bound`（真实绑定），不是本轮请求宽度；比对对象 `params.n_outputs` 同样是真实请求宽度。
+
+
+| 项 | 核实 | 修正 |
+|---|---|---|
 | `this->params.allow_reuse` 用**构建** n_outputs 比较，变窄 patch 必自拒（`llama-graph.h:898`） | 成立 | `allow_reuse(other, n_outputs_topology = numeric_limits::max())`；`revalidate_after_patch` 传入 **out_ids 当前的执行宽度**（`get_n_outputs_for_topology()`），其它调用点默认参数＝stock 行为 |
 | `n_outputs_exec == 0` 哨兵 | 成立（0 是合法 bound，`union_rebind_outputs` 注释明示） | 改为独立 `bool n_outputs_exec_set` |
 | nout lane revalidate 失败缺计数/`nout_bound` 回滚 | 成立 | 失败分支补 `--c_applied`、`--nout_binds`、`++c_fallbacks`，并用新增的 `nout_bound_prev`（成功写入前记录）回滚 `nout_bound` |
