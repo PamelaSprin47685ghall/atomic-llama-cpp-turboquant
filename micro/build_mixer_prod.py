@@ -48,14 +48,21 @@ WORKTREE = os.path.dirname(HERE)
 
 CLANG = "/opt/rocm/core-10.0/lib/llvm/bin/clang++"
 
-# Switches that consume the next argv element.
-WITH_VALUE = {
-    "-o", "-c", "-MF", "-MT", "-MQ", "-MD", "-MMD", "-x", "-include", "-iquote",
-    "-isystem", "-I", "-D", "-U", "-L", "-l", "-std", "--offload-arch", "-arch",
-    "-Xlinker", "-Xclang", "-mllvm", "--sysroot", "-resource-dir",
-}
-# Output-only switches: dropped when re-emitting a compile command.
-OUTPUT_ONLY = {"-o", "-MF", "-MT", "-MQ", "-MD", "-MMD"}
+# Switches that consume the next argv element, grouped by what the value is.
+# Listed because the recorded commands use the separated form (`-o <file>`,
+# `-x hip`, `-iquote <dir>`), so a flat walk cannot tell a switch's value from the
+# translation unit; the previous parser guessed and mistook the `.d` dependency
+# file for the source.
+VALUE_FILE = {"-o", "-MF", "-MT", "-MQ"}           # drop: output naming
+VALUE_LANG = {"-x"}                                # keep: switch + value
+VALUE_PATH = {"-iquote", "-isystem", "-include", "-I", "-L", "--sysroot",
+              "-resource-dir"}                     # keep: switch + value
+VALUE_TEXT = {"-D", "-U", "-l", "-arch"}           # keep: switch + value
+VALUE_EXTRA = {"-Xlinker", "-Xclang", "-mllvm"}    # keep: switch + value
+VALUE_ALL = VALUE_FILE | VALUE_LANG | VALUE_PATH | VALUE_TEXT | VALUE_EXTRA
+OUTPUT_ONLY = {"-MD", "-MMD"}                      # drop: bare output switches
+# Accepted translation-unit suffixes for the recorded compile command.
+SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".cu", ".c++", ".C")
 
 PROBE_HOOK_H = """
 #if defined(M3_PROBE_GRAPH_HOOK)
@@ -79,86 +86,126 @@ PROBE_GETTER_PATCH = """
 """
 
 
-def split_argv(argv):
-    """(compiler, [flags...], source) with the driver's own argument grouping.
+def split_argv(argv, what="command"):
+    """Parse an explicitly recorded compiler command.
 
-    A switch that takes a value is emitted together with its value (so `-x hip`
-    and `-iquote <dir>` survive as pairs); output naming switches are dropped with
-    their value, and the single positional operand is the source.
+    Returns (compiler, flags, options, source, dep):
+      compiler : argv[0]
+      flags    : switch groups to keep, each as a list, in the recorded order
+      options  : {switch: value} for the value-carrying switches that were kept
+      source   : the ONE translation unit (validated by suffix and existence)
+      dep      : the value of -MF when recorded, else None
+
+    Exactly one `-c` and one source are required.  Civilised ambiguity is refused:
+    a second positional operand, a source after -MMD with no -MF value, or a source
+    with an unexpected suffix raises instead of producing a command that cannot be
+    compiled (the failure modes Devops hit twice).
     """
     if not argv:
-        raise ValueError("empty recorded command")
-    cc = argv[0]
+        raise ValueError("%s: empty recorded command" % what)
+    compiler = argv[0]
+    if compiler.startswith("-"):
+        raise ValueError("%s: first element is not a compiler: %r" % (what, compiler))
     flags = []
+    options = {}
     source = None
+    dep = None
+    have_c = False
     i = 1
     while i < len(argv):
         a = argv[i]
-        if a in OUTPUT_ONLY:
-            i += 2  # drop the switch and its value
+        if a in VALUE_ALL:
+            if i + 1 >= len(argv):
+                raise ValueError("%s: switch %r has no value" % (what, a))
+            value = argv[i + 1]
+            if value.startswith("-"):
+                raise ValueError("%s: switch %r value looks like a flag: %r" % (what, a, value))
+            if a in VALUE_FILE:
+                if a == "-MF":
+                    dep = value
+                # -o/-MT/-MQ name lane outputs; they are re-created here.
+            else:
+                flags.append([a, value])
+                options[a] = value
+            i += 2
             continue
-        if a in WITH_VALUE:
-            flags.append(a)
-            if i + 1 < len(argv):
-                flags.append(argv[i + 1])
-                i += 2
-                continue
+        if a in OUTPUT_ONLY:
             i += 1
             continue
-        if a.startswith(("-I", "-D", "-U", "-L", "-l", "-Wl,", "-Xlinker")) and len(a) > 2:
-            flags.append(a)
+        if a == "-c":
+            if have_c:
+                raise ValueError("%s: more than one -c" % what)
+            have_c = True
             i += 1
             continue
         if a.startswith("-"):
-            flags.append(a)
-        elif source is None:
-            source = a
-        else:
-            raise ValueError("unexpected second operand %r in recorded command" % a)
+            flags.append([a])
+            i += 1
+            continue
+        # positional operand: must be the single translation unit
+        if source is not None:
+            raise ValueError("%s: second positional operand %r (first was %r)" % (what, a, source))
+        if not a.endswith(SOURCE_SUFFIXES):
+            raise ValueError("%s: positional operand %r is not a source file; the recorded "
+                             "command must name exactly one translation unit" % (what, a))
+        source = a
         i += 1
     if source is None:
-        raise ValueError("recorded command has no source operand")
-    return cc, flags, source
+        raise ValueError("%s: no translation unit in recorded command" % what)
+    if not have_c:
+        raise ValueError("%s: no -c in recorded command" % what)
+    return compiler, flags, options, source, dep
 
 
-def dedup_groups(flat):
-    """Dedup a flat argv whose value-carrying switches are still adjacent."""
+def dedup_groups(groups):
+    """Deduplicate switch groups (each group is a list) while keeping order."""
     out = []
     seen = set()
-    i = 0
-    while i < len(flat):
-        a = flat[i]
-        if a in WITH_VALUE and i + 1 < len(flat):
-            group = (a, flat[i + 1])
-            i += 2
-        else:
-            group = (a,)
-            i += 1
-        if group in seen:
+    for g in groups:
+        key = tuple(g)
+        if key in seen:
             continue
-        seen.add(group)
-        out.extend(group)
+        seen.add(key)
+        out.append(list(g))
     return out
 
 
 def compile_commands(outdir):
-    """One command per TU, each with exactly one compiler and explicit outputs."""
-    _, hip_flags, _ = split_argv(json.load(open(HIP_TEMPLATE))["argv"])
-    _, llama_flags, _ = split_argv(json.load(open(LLAMA_TEMPLATE))["argv"])
-    # Exactly one driver compiles both probe TUs: the lane's HIP clang++ (the only
-    # one of the two recorded compilers that can see HIP headers), with the HIP
-    # flag set followed by the model TU's include/define/warning set.  Taking the
-    # compiler from the templates is what previously put a second compiler into
-    # the argv; it is now fixed at CLANG and asserted below.
-    # Value-carrying switches must keep their values adjacent; dedup therefore works
-    # on switch groups, not on flat elements.
-    flags = dedup_groups(hip_flags + llama_flags) + ["-DM3_PROBE_GRAPH_HOOK"]
+    """One command per probe TU, each with exactly one compiler and explicit outputs.
+
+    The recorded HIP and model commands are parsed only for their flags/options:
+    neither template's own translation unit or dependency file is carried over, and
+    `-c` appears exactly once in the emitted command.
+    """
+    _, hip_flags, hip_opts, hip_src, _ = split_argv(json.load(open(HIP_TEMPLATE))["argv"], "HIP template")
+    _, llama_flags, llama_opts, llama_src, _ = split_argv(json.load(open(LLAMA_TEMPLATE))["argv"], "model template")
+    if not os.path.isfile(hip_src) or not os.path.isfile(llama_src):
+        raise ValueError("recorded templates name sources that do not exist: %r / %r"
+                         % (hip_src, llama_src))
+    # The probe must be compiled as HIP C++ with both header families visible.
+    for required in ("-x", "-iquote"):
+        if required not in hip_opts:
+            raise ValueError("HIP template lost %r; refusing to emit a command that cannot "
+                             "find the HIP headers" % required)
+    # Include search order matters: the HIP template's -iquote/-I come first so the
+    # probe sees the HIP-facing ggml headers, then the model template's include set.
+    # The deduplicated flag tail must not contain -c/-o/-MF: those are re-emitted per
+    # source below, exactly once.
+    flags = dedup_groups(hip_flags + llama_flags)
+    flat = [x for g in flags for x in g]
+    for forbidden in ("-c", "-o", "-MF", "-MT", "-MQ", "-MD", "-MMD"):
+        if forbidden in flat:
+            raise ValueError("flag tail still contains %r; refusing to emit two output "
+                             "specifications" % forbidden)
+    flat = flat + ["-DM3_PROBE_GRAPH_HOOK"]
     cmds = []
+    emitted = set()
     for src in ("m3-mixer-prod-path.cpp", "m3-probe-hc-mix.cpp"):
+        if src in emitted:
+            raise ValueError("duplicate source %r" % src)
+        emitted.add(src)
         obj = os.path.join(outdir, os.path.splitext(src)[0] + ".o")
-        # -c first, then the source, then the output naming: the source is never
-        # emitted after -MMD and the dependency file always has a destination.
-        cmds.append([CLANG] + flags + [
+        cmds.append([CLANG] + flat + [
             "-c", os.path.join(HERE, src),
             "-o", obj, "-MMD", "-MF", obj + ".d",
         ])
@@ -220,17 +267,37 @@ def main(argv):
     if missing:
         print("# ERROR: missing sources: %s" % ", ".join(missing))
         return 2
-    compiles = compile_commands(outdir)
-    link = link_command(outdir, libdir)
+    try:
+        compiles = compile_commands(outdir)
+        link = link_command(outdir, libdir)
+    except ValueError as exc:
+        # Ambiguous or unusable recorded command: stop before printing anything.
+        print("# ERROR: %s" % exc)
+        return 2
     for c in compiles:
-        assert c[0] == CLANG and c.count(CLANG) == 1, "duplicate compiler in compile argv"
-        assert c.count("-c") == 1 and c.count("-o") == 1 and c.count("-MF") == 1
-        assert c.index("-c") < c.index("-o") < c.index("-MMD") < c.index("-MF")
-    assert link[0] == CLANG and link.count(CLANG) == 1, "duplicate compiler in link argv"
+        if c[0] != CLANG or c.count(CLANG) != 1:
+            print("# ERROR: compile argv does not start with exactly one compiler")
+            return 2
+        if c.count("-c") != 1 or c.count("-o") != 1 or c.count("-MF") != 1:
+            print("# ERROR: compile argv must carry exactly one -c/-o/-MF")
+            return 2
+        if not (c.index("-c") < c.index("-o") < c.index("-MMD") < c.index("-MF")):
+            print("# ERROR: compile argv order must be -c < src, -o, -MMD, -MF")
+            return 2
+        srcs = [a for a in c if a.endswith(SOURCE_SUFFIXES) and os.path.isfile(a)]
+        if len(srcs) != 1:
+            print("# ERROR: compile argv names %d existing sources: %s" % (len(srcs), srcs))
+            return 2
+    if link[0] != CLANG or link.count(CLANG) != 1:
+        print("# ERROR: link argv does not start with exactly one compiler")
+        return 2
     first_lib = next((i for i, a in enumerate(link) if a.startswith("-l")), None)
-    assert first_lib is not None, "link argv carries no library flag"
-    assert link.index(f"-L{libdir}") < first_lib, "-L<libdir> must precede the libraries"
-    assert f"-Wl,-rpath,{libdir}" in link and f"-Wl,-rpath-link,{libdir}" in link
+    if first_lib is None or link.index(f"-L{libdir}") > first_lib:
+        print("# ERROR: -L<libdir> must precede the libraries")
+        return 2
+    if f"-Wl,-rpath,{libdir}" not in link or f"-Wl,-rpath-link,{libdir}" not in link:
+        print("# ERROR: link argv lacks the private dir rpath entries")
+        return 2
     json.dump({"compile": compiles, "link": link,
                "hook_header_patch": PROBE_HOOK_H,
                "hook_getter_patch": PROBE_GETTER_PATCH},
@@ -239,16 +306,14 @@ def main(argv):
         print(shlex.join(c))
     print(shlex.join(link))
     print()
-    print("# invariants this script now guarantees (assert them mechanically before")
-    print("# running, e.g. by reading build.argv.json):")
-    print("#   * every command has exactly one compiler in position 0;")
-    print("#   * every compile command is `-c <src> ... -o <obj> -MMD -MF <obj>.d`:")
-    print("#     exactly one '-c', exactly one '-o', exactly one '-MF', and the")
-    print("#     source never appears after '-MMD';")
-    print("#   * the link command contains '-L<libdir>' and '-Wl,-rpath,<libdir>'")
-    print("#     before the first '-l' flag, and '-Wl,-rpath-link,<libdir>';")
-    print("#   * no argv element repeats the compiler path; these four are asserted")
-    print("#     by the script itself before anything is printed.")
+    print("# invariants enforced before printing (violations exit 2 with no command):")
+    print("#   * exactly one compiler per command;")
+    print("#   * exactly one -c/-o/-MF, ordered -c < src, -o, -MMD, -MF;")
+    print("#   * exactly one existing source in each compile command;")
+    print("#   * -L<libdir> / -Wl,-rpath / -Wl,-rpath-link for the private dir, before")
+    print("#     the first -l flag;")
+    print("#   * the recorded templates must name an existing single .cu/.cpp with -x")
+    print("#     and -iquote present, else the script refuses instead of guessing.")
     print()
     print("# run matrix (Devops, both GPU flocks):")
     print("# 1. N=1 reference, MIXER site, production gate OFF:")

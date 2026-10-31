@@ -428,6 +428,40 @@ Additionally the recipes now fail closed: a `--libdir` that does not exist, or t
 run for this revision: the production harness (`m3-mixer-prod-path`) and both recipes are
 **authored, NOT verified**, and G2 is **not** claimed.
 
+## 5f. Third Devops audit: the parser mistook the dependency file for the source
+
+Devops executed the recipe from `da7651743` and hit `AssertionError` at the single-`-c` check, then
+`clang: error: cannot specify -o when generating multiple output files`.  Root cause, reproduced by
+reading the two recorded argv verbatim: both use the **separated** form
+
+```
+<cc> ... -o <obj> <obj> -x hip -c <src>.cu -iquote <dir> -MMD -MF <obj>.d
+```
+
+so a parser that keeps "the first operand that is not a switch" as the source picks the value of
+`-o` and then the `.d` value of `-MF`, leaving `-c` and the real `.cu` inside the flag list — hence
+two `-c`s, two inputs, and no usable command (§5e's assertions fired for exactly that reason).
+
+Fix (both recipes, `micro/build_mixer_prod.py`, `micro/build_mixer_n1ref.py`):
+
+* the recorded argv is parsed with explicit switch semantics — every value-carrying switch is
+  listed by what its value *is*: output naming (`-o/-MF/-MT/-MQ`, dropped), language (`-x hip`),
+  search (`-iquote/-isystem/-include/-I/-L/--sysroot`), defines (`-D/-U/-l/-arch`), driver
+  pass-through (`-Xlinker/-Xclang/-mllvm`), and bare output switches (`-MD/-MMD`);
+* a value that looks like a switch, a missing value, a second `-c`, a second positional operand, or
+  a positional operand that is not a `.c/.cc/.cpp/.cxx/.cu/.c++` file each **raise** — the script
+  prints `# ERROR: …` and exits 2 without emitting any command;
+* the emitted compile command contains exactly one `-c` (the probe), one `-o`, one `-MMD`, one
+  `-MF <obj>.d`, the recorded flag tail with no output switch left in it (checked), and exactly one
+  existing source (checked by existence, not by suffix alone);
+* the HIP template must still provide `-x` and `-iquote`, and the model template's source must
+  exist, otherwise the script refuses instead of guessing;
+* the assertions were replaced by explicit checks with a printed reason, because an `AssertionError`
+  in a script whose job is to emit a command is indistinguishable from a real build failure.
+
+Nothing was executed for this revision: `m3-mixer-prod-path`, `m3-mixer-n1ref` and both recipes are
+**authored, NOT verified**, and **G2 is not claimed**.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -443,7 +477,8 @@ run for this revision: the production harness (`m3-mixer-prod-path`) and both re
   branch and have NOT been built or run; the first harness revision was rejected by Devops for
   dropping `-x hip` and for not driving the production builder (§5d), and the recipes were again
   rejected for a duplicated compiler, a misordered `-MMD`, and a link line without the private
-  `-L` (§5e). All of those are fixed; nothing has been executed, so G2 remains unproven; the production gate is exact `"1"` again and the previous
+  `-L` (§5e), and the parser likewise mistook the `-MF` dependency file for the translation unit
+  (§5f). All of those are fixed; nothing has been executed, so G2 remains unproven; the production gate is exact `"1"` again and the previous
   `trunk`/`mixer`-inside-`TAIL_KEEP` revision is reverted (kept as evidence above);
   token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
   §5a/§5b give the placement-stamp and per-layer capture plan.  The gate stays closed: promotion is
