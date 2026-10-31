@@ -2565,16 +2565,6 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
-// Test-only: the binder's own graph params, with an explicit n_outputs request.
-// Mirrors graph_params(res, ubatch, mctx, gtype) for the fields the n_outputs
-// rebind consults, so tests can enter union_rebind_outputs() exactly the way
-// process_ubatch does instead of assembling llm_graph_params by hand.
-llm_graph_params llama_context::graph_params_for_test(llm_graph_result * res, uint32_t n_outputs) const {
-    llm_graph_params p = graph_params(res, llama_ubatch(), nullptr, LLM_GRAPH_TYPE_DEFAULT);
-    p.n_outputs = n_outputs;
-    return p;
-}
-
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;

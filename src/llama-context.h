@@ -287,12 +287,6 @@ public:
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
-    // Test-only (no data member, no behavior change): the same graph params the
-    // binder's caller builds, with an explicit n_outputs request. Used by
-    // tests/test-binder-reader-detectors to drive union_rebind_outputs() through
-    // its real entry point without reconstructing llm_graph_params by hand.
-    llm_graph_params graph_params_for_test(llm_graph_result * res, uint32_t n_outputs) const;
-
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
