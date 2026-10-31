@@ -645,6 +645,33 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
         return false;
     }
 
+    // A reused graph's input must dereference a memory context that is still
+    // alive when set_input() runs. llama_memory::init_batch() creates a NEW
+    // context object for every decode loop (the old one is destroyed right
+    // after), so `mctx` here is a different object than the one this graph was
+    // built with - re-pointing to it is safe for the lifetime of this ubatch
+    // only because the ubatch's own context is still owned by the caller. What
+    // is NOT safe is keeping the graph across a context that is gone: the
+    // union binder's in-place re-plan reused the live graph after
+    // union_binder_scratch_patch() built a throwaway context, and the pointer
+    // written here pointed at that freed context - set_input() then called
+    // through a destroyed object (Devops: set_input_k_idxs entered with a null
+    // `this`, evidence /home/kunweiz/work/dbg-fa-sched-20261031).
+    //
+    // Accept the reuse only while the memory context object is unchanged, and
+    // otherwise refuse it so the caller rebuilds the graph (whose build then
+    // attaches a fresh context). The refusal is a build, not a failure: it
+    // cannot change results, and it removes the dangling-pointer class
+    // entirely instead of relying on the context outliving the graph.
+    //
+    // No exception: llama_context::process_ubatch() recreates a memory context
+    // for the reused graph on the same loader contract the original build used,
+    // so accepting a different context here would re-introduce exactly the
+    // stale-ownership this guard exists to prevent.
+    if (mctx != mctx_built) {
+        return false;
+    }
+
     this->mctx = mctx;
 
     bool res = true;

@@ -127,55 +127,54 @@ Devops：`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.tx
 - 于是第二轮 pass 1 会把副本当"pre-allocated"（`1.dst` 分支、陈旧 buffer 推 backend），pass 3/4 的 `supports_op(src[])` 走这条链，且**没有任何环节清掉副本的 buffer/data**。被共享的 split 输入（`attn_inp_k_idxs` 这类）在轮间布局变化后可能指向"副本或其副本"，re-plan 后 `set_inputs()` 拿到的就是 `data == NULL` 的那个 → `set_input_k_idxs(dst=NULL)` → SIGSEGV。
 - 为何只有 outputs 窄化路径命中：需要 (a) lane 真正记录并 applied（第一轮修好后首次可达），(b) split 布局轮间变化。nkv plain-rebind 同机制但布局未变；out-live/out-clear 在记录/骨架门早退，根本没走到。
 
-### 6.2 现状（重要：本修复**未**解决真实崩溃）
-Devops 独立复验 `622afaf35`（`/home/kunweiz/work/lead-fa-622af-verify-20261031/VERIFY-FA622AF-RESULTS.txt`）：
-- A1 `probe-out-applied` **仍 SIGSEGV**，栈同前；A4 `sched-replan-chain` 第二次窄化 **仍 SIGSEGV**；
-- A2 out-clear、A3 gates-off、A5 mixed-shapes、A7 nkv 系列、A8 OFF≡stock 均 PASS；
-- A6 `sched-same-nodes` rc=-1 "sequence 0 positions are not continuous" 待定位（探针 vs 运行时未判）。
+### 6.2 现状（scheduler 清理已回退；改为内存上下文所有权根因）
+Devops 插桩证据（`/home/kunweiz/work/dbg-fa-sched-20261031/EVIDENCE-ABC.txt`）：
+- `llm_graph_input_attn_kv::set_input` 传入的 `self_k_idxs` 与三参入口 `dst` **同指针**、`buffer/data` **均非空**；
+- 崩溃点在函数**入口之后**（打印语句已执行），保存 `this` 的寄存器为 0、`slot_info` 引用为 `0x200000000`；
+- gates OFF 的同一二进制 14 checks PASS，无坏 `this`。
 
-**为什么"清旧副本"治不到**：bind 的 re-plan 是 `sched_reset → alloc_graph → split_graph`。`split_graph` 首先 `ggml_free(sched->ctx)`，**旧副本连同其结构体一起消失**；随后 pass 5 用新的 `sched->ctx` **新建**副本并写回 `node->src[]`。崩溃点是**新副本**在 `set_inputs()` 时仍未分配——清旧副本（无论放在 reset 还是 split 入口）都不可能影响到新副本。因此本树的 drop 只是"不引入陈旧 placement"的卫生措施，**不是**该 SIGSEGV 的修复；e3e8/622 均**不得**视为已修。
+**ABI 推断的核实**：`r12 = 0x200000000`、`rbx = 0` 这类"参数寄存器错位"通常意味着**调用方通过了一个已销毁对象的虚表/成员**，而不是 `set_input_k_idxs` 的签名错误（该签名 3 参、无重载冲突，且 `dst`/`ubatch` 在入口处都正确）。因此断言"ABI/签名错"为时过早；**能确定的是 `mctx` 这个对象已经不可用**。
 
-### 6.3 目前确定的实现（保留，非崩溃修复）
-- `ggml_backend_sched_drop_input_copies()`：仅当上一轮 `alloc_splits()` **成功**（`plan_alloc_ok`）时，按 `splits[i].inputs[]` → 显式 `used` 位 → 全部 backend×copy 槽清 `buffer/data/extra`；
-- 调用点：`ggml_backend_sched_split_graph()` 入口（上一轮表仍有效、`sched->ctx` 未释放之前）；
-- 未成功分配的 plan **不清**：`data != NULL` 是 `ggml_gallocr_needs_realloc()` 判定"是否需要重新 reserve 扩容"的唯一依据，清掉会让失败重试静默复用未扩容的 buffer（reviewer P1）；
-- 新增字段 `plan_alloc_ok` 是普通 `bool`（calloc/free 语义不变，无 C++ 对象生命周期问题）；
-- 不写任何图张量的 `src[]`/`ne/nb/op_params`，无 schema、无 uid 身份判定。
+**真实根因（所有权）**：
+1. `llm_graph_input_attn_kv` 在建图时保存 `mctx`（`build_attn_inp_kv_impl`）；
+2. `mctx` 由 `llama_decode` 内的 `memory->init_batch(...)` 产生，`llama_memory_context_ptr` **只存活于该次 decode 调用**；
+3. `can_reuse()` 在复用分支把 `this->mctx` **改写成新 ubatch 的上下文**（原注释还提到"指向上一批已释放的 llm_graph_params 会导致 stack-use-after-return"）；
+4. outputs 窄化 lane 的 re-plan 走 `sched_reset + alloc_graph` 复用同一张 live 图，而该图的 `mctx` 已被改写/或指向 `union_binder_scratch_patch` 里 `model.build_graph(gp)` 的临时上下文——两者都在本次 decode 调用结束时销毁；随后 `set_inputs()` 经 `mctx->set_input_k_idxs(...)` 调用**已销毁对象** ⇒ 与 `this == 0` 一致。
 
-### 6.4 仍未定位/未实现（下一次的真实工作量）
-1. **新副本为何仍未分配**：pass 5 对每个 split 都会在 `graph_copy->nodes[]` 里放入 `input_cpy`（`ggml-backend.cpp:1708`），按理会被 gallocr 分配。需要运行期证据确定失败的是哪一类：
-   (a) `inputs[]` 登记了、但该 split 的 `graph_copy->nodes[]` 未含对应 `cur_copy` 副本（多 copy/后端变化）；
-   (b) `graph_copy->nodes[]` 含副本，但 gallocr 因 `node->data != NULL` 跳过（陈旧 data 来自**上一轮 alloc** 而非 reset 前）；
-   (c) `set_inputs` 遍历的输入对象指向旧图（跨轮 notep 的对象）。
-   这需要 Devops 在 `set_input_k_idxs` 入口打印 `dst`、`dst->buffer`、`dst->data`、`ggml_hash_find(&sched->graph.visited_hash_set, dst)`，并在 `split_graph` 末尾打印每个 split 的 `inputs[]` 与 `graph_copy->nodes[]` 的包含关系。
-2. **A6 same-nodes rc=-1**：探针与运行时两侧都要看（`positions are not continuous` 属 llama-batch 位置记账，可能与本 scheduler 改动无关，也可能是 in-place 修改后的位置数组问题）。
-3. 本树的 drop/flag 只是"必要的卫生 + 不退化"，A1/A4 通过前**不得**宣称修复。
+**修复（真实根因，局部）**
+- `src/llama-graph.h`：`llm_graph_input_attn_kv` 新增 `const llama_kv_cache_context * mctx_built`（构造时赋值，永不改写），作为**建图期上下文身份**。
+- `src/llama-graph.cpp`：`can_reuse()` 增加 `mctx != mctx_built → return false`。复用被拒即走**完整重建**（重建时 `build_attn_inp_kv_impl` 用当前上下文新建输入对象），不再存在"沿用上一调用上下文"的路径。
+- `src/llama-context.cpp`：`process_ubatch` 在复用被接受后，先用**与首次构建相同的 loader 契约** `memory->init_batch(*balloc, cparams.n_ubatch, false)` **重建上下文**，再用新上下文重算 `gparams` 与 `can_reuse`；这样"同一对象身份"可与"上下文仍存活"同时成立（否则每次 decode 都会拒绝复用，性能退化）。上下文指针由 `llama_memory_context_ptr mctx`（decode 循环自有）持有，生命周期覆盖 `set_inputs + compute`。
+- **scheduler 侧清理全部回退**（`ggml/src/ggml-backend.cpp` 回到 `762631033`）：与证据不符，属无关高风险改动。
 
-### 6.5 与 55d6ff7bd 的差异（reviewer 三项问题逐条）
-| reviewer 问题 | 55d6ff7bd（已撤销） | 现在 |
+**OFF 影响**：`can_reuse` 的严格身份判定在 OFF 下只可能拒绝、不会错误接受；拒绝触发一次完整重建（图与结果等价，`REFLOGITS` 应逐字节相同）。`GGML_TP5_UNION_BINDER` 关闭时不存在 in-place re-plan，路径即 stock 的"复用或不复用"。
+
+**保留的失败场景**：A1 `probe-out-applied`、A4 `sched-replan-chain`（第二次窄化）原样保留，供 Devops 验证修复；A6 `sched-same-nodes` rc=-1 仍待定位（既可能是探针位置数组，也可能是本修复前后新增的 `init_batch` 调用改变分区，需要 Devops 用 `--scenario` 单跑确认）。
+
+### 6.3 与已撤销设计的关系（55d6ff7bd / 622afaf35 / e3e8f9b27 / ab08adeac）
+| 轮次 | 做了什么 | 结论 |
 |---|---|---|
-| F1 同节点数图串味 | 按位置用 schema 覆盖 `src[]`，身份只用 `n_nodes` | **无 schema**；不写任何图张量的 `src[]` |
-| 依赖被刷新的 uid | 记录时用每轮刷新的 `graph->uid` | 不使用 uid |
-| F2 表被提前 clear / 跨 split 丢失 | 新增 `graph_src_copies` 每次 split 开头 clear | 用 scheduler 自己的 `splits[i].inputs[]` 记录，入口清理 |
-| F3 `n_copies>1` 只记 `cur_copy` | 只记 `cur_copy` | 覆盖 `b × c` 全槽 |
-| 结构体 C++ 对象（泄漏/UB） | `std::vector` 成员 | 仅一个 `bool` |
-| refresh-alloc 路径（is_reset 守卫） | 挂在 reset 内 → 漏 | 挂在 split_graph 入口 |
-| hash 未命中隐式兜底 | `FULL`-only | 显式 `used` 位 |
-| P1 失败重试抹掉扩容证据 | —（更早版本同样会在 reset 里清） | **不清未成功分配的 plan**（`plan_alloc_ok`） |
+| 762631033 | gtype 门修复（DEFAULT 也是解码构建） | 保留；out-clear 已 PASS |
+| 55d6ff7bd | schema 覆盖 `src[]`（按节点数识别图） | 撤销（reviewer F1） |
+| 622afaf35 | reset 内清 split 副本 | 撤销（refresh-alloc 漏、且非根因） |
+| e3e8f9b27 | split 入口清 split 副本 | 撤销（仍非根因，Devops A1/A4 复崩） |
+| ab08adeac | 入口清理 + `plan_alloc_ok` 保护失败重试 | **回退**（scheduler 无关高风险） |
+| 本轮 | `mctx_built` 身份判定 + 复用前重建上下文 | 真实根因修复，A1/A4 待复验 |
 
-### 6.6 验证指引（Devops；A1/A4 的失败必须原样保留）
-| 场景 | 期望 / 用途 |
+### 6.4 验证指引（Devops；失败场景原样保留）
+| 场景 | 期望 |
 |---|---|
-| A1 `probe-out-applied` | **当前预期仍 SIGSEGV**；用于定位新副本未分配的哪一类（见 6.4） |
-| A4 `sched-replan-chain` 第二次窄化 | 同上 |
-| A2 out-clear / A3 gates-off / A5 mixed-shapes / A7 nkv 系列 / A8 OFF≡stock | 必须保持 PASS（不得因本轮改动退化） |
-| A6 `sched-same-nodes` | rc=-1 待定位；先确认探针位置数组是否连续 |
-| A9 失败注入 | 在 `alloc_splits` 返回 false 后立即重试同一 `alloc_graph`：第二次必须进入 reserve 分支（`GGML_SCHED_DEBUG_REALLOC=1` 可观察），不得静默走 happy path |
-| A10 K-shift 交错 | prefill 触发 shift → `memory_clear` → 首个 prefill：无 abort |
-| A11 `pipeline_parallel` 两次 decode | 多 copy 下无 abort |
+| A1 `probe-out-applied` | **本次必须 rc=0**；`applied ≥ 1`；logits 与 OFF 同批逐位相同 |
+| A4 `sched-replan-chain` 第二次窄化 | rc=0（不得复现 SIGSEGV） |
+| A2 out-clear | `refused_view=1`、`applied=0`（不回退） |
+| A3 gates-off | 14 checks PASS（不回退） |
+| A5 mixed-shapes / A7 nkv 系列 / A8 OFF≡stock | PASS；`REFLOGITS` 逐字节相同 |
+| A6 `sched-same-nodes` | rc=-1 待定位：先确认探针位置数组连续；再用 `GGML_TP5_UNION_BINDER=1` 单跑比较 `n_reused` |
+| A9 复用计数 | 修复后每次 decode 都会重建上下文再复用：观察 `n_reused` 是否仍增长（若恒为 0 说明身份判定把复用全拒了，需要检查 `init_batch` 返回的对象身份） |
+| A10 K-shift / A11 多 copy | 无 abort（与本次改动无直接关系，防退化） |
 
-### 6.7 残余风险 / PARTIAL（不当作已通过）
-- **A1/A4 未修**；本树的 drop 只是卫生措施与失败重试保护，已明确写入 6.2。
-- 未编译未测试；6.6 全部无运行证据。
-- 新副本未分配的真实原因未定位（6.4 的三类候选）。
-- out-live reader 分支仍无独立运行证据。
+### 6.5 残余风险 / PARTIAL
+- 未编译未测试；A1–A11 全部无运行证据。
+- **A9 的风险点**：如果 `init_batch(...)` 每次返回的上下文对象在"同一批 token 分区"下仍被判为不等价，`can_reuse` 会持续拒绝 → 每次都完整重建（正确但慢）。这需要 Devops 的 `n_reused` 证据，本轮不作乐观声明。
+- 其它大模型族（hybrid/iswa/msa/dsa）的输入类仍在 `can_reuse` 里改写 `mctx` 指针，同一类风险未修（本 lane 只用 `llama_kv_cache_context`）；如后续在这些架构打开 binder，需要同样加身份判定。
+- A6 rc=-1 未定位。

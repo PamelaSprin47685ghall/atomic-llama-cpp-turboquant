@@ -3451,17 +3451,6 @@ bool llama_context::union_binder_scratch_patch(llm_graph_result * res, llm_graph
         d->data   = nullptr;
         d->extra  = nullptr;
     }
-    // In-place re-plan of the live graph: the next alloc_graph re-splits this
-    // SAME graph object. The split copies of the previous plan are loose tensors
-    // the allocator never assigns; they are dropped in
-    // ggml_backend_sched_split_graph() (entry, before the new passes run and
-    // while the previous plan's tables are still valid) so the re-plan
-    // re-creates them by content instead of consuming stale placement.
-    // Devops: set_input_k_idxs was reached with dst == NULL after the bind
-    // re-plan because such a copy survived as a split input - see
-    // /home/kunweiz/work/lead-fa-622af-verify-20261031 for the still-open
-    // evidence (this drop alone did not fix the crash).
-
     nkv_scratch->reset();
     // r8: success counting moved to the CALLERS (union_rebind_n_kv bumps
     // c_applied for the nkv lane, union_rebind_outputs for the n_outputs
@@ -3550,9 +3539,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     bool reused = !graph_reuse_disable && !llama_ctx_fa_nkv_param_enabled() && res->can_reuse(gparams);
+
+    // A reused graph's input keeps referencing the memory context it was BUILT
+    // with (llm_graph_input_attn_kv::mctx, and can_reuse() refuses a reuse whose
+    // context object differs). llama_decode owns its llama_memory_context_ptr
+    // only for the duration of one call, so when the graph is reused across
+    // calls that context is long gone while the batched-update partition it
+    // described is still what the graph's inputs assume. Recreate it here,
+    // before planning, through the same loader contract the previous call used;
+    // the inputs then point at a context that is alive for this ubatch and
+    // describes the same tokens.
+    if (reused) {
+        auto next_mctx = memory->init_batch(*balloc, cparams.n_ubatch, false);
+        if (next_mctx == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to recreate the memory context for a reused graph\n", __func__);
+            status = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+        mctx   = std::move(next_mctx);
+        reused = res->can_reuse(gparams = graph_params(res, ubatch, mctx, gtype));
+    }
 
     // set only when an in-place patch (below) succeeded: the scheduler's
     // split-input copies were created during the PREVIOUS alloc_graph and still

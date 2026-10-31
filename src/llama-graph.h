@@ -369,7 +369,8 @@ public:
             const llama_kv_cache_context * mctx) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        mctx_built(mctx) {
     }
     ~llm_graph_input_attn_kv() = default;
 
@@ -401,7 +402,18 @@ public:
     const llama_hparams hparams;
     const llama_cparams cparams;
 
+    // The memory context set_input() may dereference.
+    //
+    // Built with mctx_built at graph-build time; can_reuse() may re-point it at
+    // the context of a reused graph ONLY while that is provably the same object
+    // (llama_memory::init_batch hands a fresh context object to every decode
+    // call, so a stale mctx becomes a dangling pointer as soon as the owning
+    // context is reset - the union binder's in-place re-plan kept the graph
+    // while the build-time mctx was destroyed).
     const llama_kv_cache_context * mctx;
+
+    // identity of the memory context the graph was BUILT with (never re-pointed)
+    const llama_kv_cache_context * mctx_built;
 };
 
 // V-less input for the KV cache
