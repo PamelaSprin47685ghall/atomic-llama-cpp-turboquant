@@ -1,6 +1,8 @@
 == worktree
 /home/kunweiz/work/m3tail-storage-20261031
-4125de1eac01cefc0706c3302f402ddea0f1037c
+985c879c58b2528bd626272db7ab9bdb582c5b51
+985c879c5 alloc: separate sizing from actual planning; report retained tensor identity
+4abb8d6bb audit: refresh patch copy after the planned-only witness
 4125de1ea alloc: report the witness only from a real planning pass; attribute by graph identity
 406fe3172 audit: refresh patch copy after the per-instance witness
 4f4c09dfd alloc: per-instance, per-call retention witness instead of global counters
@@ -33,22 +35,22 @@ ffa185d85 audit: M3 tail-storage patch trail, defect chain and Devops verificati
 1d529d64a qwen4exp: give the M3 N-row owner tail independent lo storage (default off)
 
 == diff vs base f1c5fafc0 (stat)
- audit/AUDIT-AND-VERIFICATION.md   | 708 ++++++++++++++++++++++++++++++++++++++
- audit/m3-tail-storage.patch.txt   |  35 ++
+ audit/AUDIT-AND-VERIFICATION.md   | 749 ++++++++++++++++++++++++++++++++++++++
+ audit/m3-tail-storage.patch.txt   |  37 ++
  diag/m3-locate-divergence.py      | 109 ++++++
  diag/m3-n1-rowref.py              | 129 +++++++
  diag/m3-split-trunk-mixer.py      | 105 ++++++
  diag/m3-tail-stamp-diff.py        |  91 +++++
  diag/m3-tail-stamp.ggml-cuda.diff |  47 +++
  ggml/include/ggml.h               |   1 +
- ggml/src/ggml-alloc.c             |  93 ++++-
- micro/build_mixer_n1ref.py        | 174 ++++++++++
- micro/build_mixer_prod.py         | 337 ++++++++++++++++++
+ ggml/src/ggml-alloc.c             | 131 ++++++-
+ micro/build_mixer_n1ref.py        | 174 +++++++++
+ micro/build_mixer_prod.py         | 342 +++++++++++++++++
  micro/m3-mixer-n1ref.cpp          | 306 ++++++++++++++++
- micro/m3-mixer-prod-path.cpp      | 266 ++++++++++++++
+ micro/m3-mixer-prod-path.cpp      | 267 ++++++++++++++
  micro/m3-probe-hc-mix.cpp         | 204 +++++++++++
- src/models/qwen4exp.cpp           | 194 ++++++++++-
- 15 files changed, 2792 insertions(+), 7 deletions(-)
+ src/models/qwen4exp.cpp           | 194 +++++++++-
+ 15 files changed, 2877 insertions(+), 9 deletions(-)
 
 == code diff (ggml/, src/)
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
@@ -64,7 +66,7 @@ index 4cb5eb4d1..45344b30c 100644
  
      enum ggml_tri_type {
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index cbe45779d..399e31a5c 100644
+index cbe45779d..d5ffa558c 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
 @@ -467,6 +467,7 @@ struct tensor_alloc {
@@ -75,7 +77,18 @@ index cbe45779d..399e31a5c 100644
  };
  
  struct leaf_alloc {
-@@ -492,12 +493,39 @@ struct ggml_gallocr {
+@@ -478,6 +479,10 @@ struct node_alloc {
+     struct tensor_alloc src[GGML_MAX_SRC];
+ };
+ 
++// Fixed capacity so the witness never allocates; a graph with more retained
++// tensors reports the first M3_WITNESS_MAX_RETAINED and sets retained_truncated.
++#define M3_WITNESS_MAX_RETAINED 8
++
+ struct ggml_gallocr {
+     ggml_backend_buffer_type_t * bufts; // [n_buffers]
+     struct vbuffer ** buffers; // [n_buffers]
+@@ -492,12 +497,47 @@ struct ggml_gallocr {
  
      struct leaf_alloc * leaf_allocs; // [n_leafs]
      int n_leafs;
@@ -89,9 +102,17 @@ index cbe45779d..399e31a5c 100644
 +        int64_t retained_free_skip;   // free path refused a NO_REUSE node
 +        int64_t no_reuse_inplace_skip; // in-place reuse refused: parent retained
 +        int64_t view_reuse_skip;      // in-place reuse refused: view owner retained
++        // identities of the tensors actually retained during this window; the
++        // identity strings are the tensors' own names, so a leg can join the
++        // decision with the model TU's site line instead of guessing by order
++        int n_retained;
++        const char * retained_names[M3_WITNESS_MAX_RETAINED];
++        const char * retained_ops[M3_WITNESS_MAX_RETAINED];
++        int64_t retained_ne[M3_WITNESS_MAX_RETAINED];
 +    } m3_witness;
 +    bool m3_witness_on;   // armed once per instance from GGML_M3_ALLOC_WITNESS
 +    int64_t m3_plan_id;   // increments once per real planning pass on this instance
++    int m3_mode;          // 0 = sizing pass, 1 = actual (buffer-backed) pass
  };
  
 +// The M3 retention witness is armed by GGML_M3_ALLOC_WITNESS=1, read once per
@@ -115,7 +136,7 @@ index cbe45779d..399e31a5c 100644
      galloc->bufts = calloc(n_bufs, sizeof(ggml_backend_buffer_type_t));
      GGML_ASSERT(galloc->bufts != NULL);
  
-@@ -641,9 +669,17 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+@@ -641,9 +681,17 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                      continue;
                  }
  
@@ -136,7 +157,7 @@ index cbe45779d..399e31a5c 100644
                      continue;
                  }
  
-@@ -688,9 +724,12 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+@@ -688,9 +736,19 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
  }
  
  static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
@@ -148,14 +169,27 @@ index cbe45779d..399e31a5c 100644
 +        AT_PRINTF("not freeing retained tensor %s\n", node->name);
 +        if (galloc->m3_witness_on && (node->flags & GGML_TENSOR_FLAG_NO_REUSE)) {
 +            galloc->m3_witness.retained_free_skip++;
++            // The identity of the tensor whose allocation the free path kept.
++            if (galloc->m3_witness.n_retained < M3_WITNESS_MAX_RETAINED) {
++                const int i = galloc->m3_witness.n_retained++;
++                galloc->m3_witness.retained_names[i] = node->name;
++                galloc->m3_witness.retained_ops[i]   = ggml_op_name(node->op);
++                galloc->m3_witness.retained_ne[i]    = node->ne[0];
++            }
 +        }
          return;
      }
  
-@@ -715,6 +754,17 @@ static int get_node_buffer_id(const int * node_buffer_ids, int i) {
+@@ -714,7 +772,24 @@ static int get_node_buffer_id(const int * node_buffer_ids, int i) {
+     return node_buffer_ids ? node_buffer_ids[i] : 0;
  }
  
- static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+-static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
++// `m3_mode` distinguishes a real (buffer-backed) planning pass from a sizing
++// pass (ggml_gallocr_reserve_n_size, no_alloc = true): both reach this function,
++// but only a real pass corresponds to an execution plan, so the report says which
++// one it measured.  Values: 0 = sizing, 1 = actual.
++static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, int m3_mode) {
 +    // M3 witness window: this function is the only place that plans an allocation
 +    // (it is reached from ggml_gallocr_reserve_n_impl).  Counters start at zero
 +    // here and are reported at the end of this same call, so a report always
@@ -164,35 +198,55 @@ index cbe45779d..399e31a5c 100644
 +        galloc->m3_witness.retained_free_skip    = 0;
 +        galloc->m3_witness.no_reuse_inplace_skip = 0;
 +        galloc->m3_witness.view_reuse_skip       = 0;
++        galloc->m3_witness.n_retained            = 0;
 +        galloc->m3_plan_id++;
++        galloc->m3_mode = m3_mode;
 +    }
 +
      // clear hash tables
      ggml_hash_set_reset(&galloc->hash_set);
      memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
-@@ -823,6 +873,21 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+@@ -823,6 +898,30 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
              AT_PRINTF("\n");
          }
      }
 +
 +    if (galloc->m3_witness_on) {
 +        // Read-only summary of the planning pass that just finished on this
-+        // instance.  The graph identity (node count + first/last node names) lets
-+        // a leg attribute the numbers to one site instead of guessing by position.
-+        GGML_LOG_INFO("%s: M3_ALLOC_WITNESS status=planned plan_id=%lld nodes=%d "
-+                      "first=%s last=%s retained_free_skip=%lld no_reuse_inplace_skip=%lld "
-+                      "view_reuse_skip=%lld\n", __func__, (long long) galloc->m3_plan_id,
-+                ggml_graph_n_nodes(graph),
-+                graph->n_nodes > 0 ? graph->nodes[0]->name : "-",
-+                graph->n_nodes > 0 ? graph->nodes[graph->n_nodes - 1]->name : "-",
++        // instance: the pass kind (sizing vs actual), the plan id, and the
++        // identities of the tensors the allocator actually retained.
++        GGML_LOG_INFO("%s: M3_ALLOC_WITNESS status=planned pass=%s plan_id=%lld nodes=%d "
++                      "retained_free_skip=%lld no_reuse_inplace_skip=%lld view_reuse_skip=%lld "
++                      "retained=%d truncated=%d\n", __func__,
++                galloc->m3_mode == 1 ? "actual" : "sizing",
++                (long long) galloc->m3_plan_id, ggml_graph_n_nodes(graph),
 +                (long long) galloc->m3_witness.retained_free_skip,
 +                (long long) galloc->m3_witness.no_reuse_inplace_skip,
-+                (long long) galloc->m3_witness.view_reuse_skip);
++                (long long) galloc->m3_witness.view_reuse_skip,
++                galloc->m3_witness.n_retained,
++                galloc->m3_witness.n_retained >= M3_WITNESS_MAX_RETAINED ? 1 : 0);
++        for (int i = 0; i < galloc->m3_witness.n_retained; i++) {
++            GGML_LOG_INFO("%s: M3_ALLOC_RETAINED plan_id=%lld pass=%s idx=%d name=%s op=%s ne0=%lld\n",
++                    __func__, (long long) galloc->m3_plan_id,
++                    galloc->m3_mode == 1 ? "actual" : "sizing", i,
++                    galloc->m3_witness.retained_names[i],
++                    galloc->m3_witness.retained_ops[i],
++                    (long long) galloc->m3_witness.retained_ne[i]);
++        }
 +    }
  }
  
  static bool ggml_gallocr_reserve_n_impl(
-@@ -860,6 +925,7 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -848,7 +947,7 @@ static bool ggml_gallocr_reserve_n_impl(
+     }
+ 
+     // allocate in hash table
+-    ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
++    ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, no_alloc ? 0 : 1);
+ 
+     // set the node_allocs from the hash table
+     if (galloc->n_nodes < graph->n_nodes) {
+@@ -860,6 +959,7 @@ static bool ggml_gallocr_reserve_n_impl(
      for (int i = 0; i < graph->n_nodes; i++) {
          struct ggml_tensor * node = graph->nodes[i];
          struct node_alloc * node_alloc = &galloc->node_allocs[i];
@@ -200,7 +254,7 @@ index cbe45779d..399e31a5c 100644
          if (node->view_src || node->data) {
              node_alloc->dst.buffer_id = -1;
              node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
-@@ -872,6 +938,7 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -872,6 +972,7 @@ static bool ggml_gallocr_reserve_n_impl(
          }
          for (int j = 0; j < GGML_MAX_SRC; j++) {
              struct ggml_tensor * src = node->src[j];
@@ -208,7 +262,7 @@ index cbe45779d..399e31a5c 100644
              if (!src || src->view_src || src->data) {
                  node_alloc->src[j].buffer_id = -1;
                  node_alloc->src[j].addr = GGML_BUFFER_ADDRESS_INVALID;
-@@ -998,6 +1065,9 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
+@@ -998,6 +1099,9 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
  }
  
  static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
@@ -218,7 +272,7 @@ index cbe45779d..399e31a5c 100644
      size_t node_size = 0;
      if (!node->data && !node->view_src) {
          // If we previously had data but don't now then reallocate
-@@ -1097,6 +1167,17 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
+@@ -1097,6 +1201,17 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
          ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
      }
  
