@@ -492,6 +492,8 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+    bool failed;
+    bool safe_reserve;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -532,6 +534,10 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
 ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
+}
+
+bool ggml_gallocr_is_failed(ggml_gallocr_t galloc) {
+    return galloc->failed;
 }
 
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
@@ -826,7 +832,10 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 }
 
 static bool ggml_gallocr_reserve_n_impl(
-        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc, bool safe) {
+    if (galloc->failed) {
+        return false;
+    }
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -936,13 +945,30 @@ static bool ggml_gallocr_reserve_n_impl(
             }
 #endif
             ggml_vbuffer_free(galloc->buffers[i]);
+            if (safe) {
+                for (int j = i; j < galloc->n_buffers; j++) {
+                    if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                        galloc->buffers[j] = NULL;
+                    }
+                }
+            }
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
+                    if (safe) {
+                        galloc->failed = true;
+                    }
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
+                }
+            }
+            if (safe) {
+                for (int j = i + 1; j < galloc->n_buffers; j++) {
+                    if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                        galloc->buffers[j] = galloc->buffers[i];
+                    }
                 }
             }
         }
@@ -953,7 +979,7 @@ static bool ggml_gallocr_reserve_n_impl(
 
 void ggml_gallocr_reserve_n_size(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes) {
-    GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true));
+    GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true, /*safe =*/ false));
     for (int i = 0; i < galloc->n_buffers; i++) {
         sizes[i] = 0;
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
@@ -962,8 +988,80 @@ void ggml_gallocr_reserve_n_size(
     }
 }
 
+// TP5 max-footprint share: reserve with a caller-provided per-buffer minimum
+// size floor. The floor is applied to the buffer TOTAL (sum of chunk max_size)
+// after the graph's own placement pass, by growing the LAST chunk's max_size.
+// This guarantees a total capacity floor, not that every later placement fits
+// those chunks without reallocation.
+bool ggml_gallocr_reserve_n_min(
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, const size_t * min_sizes) {
+    GGML_ASSERT(min_sizes != NULL);
+    galloc->safe_reserve = true;
+    if (!ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false, /*safe =*/ true)) {
+        return false;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        // if the buffer type is used multiple times, the same tallocr (and
+        // buffer) is shared; apply the floor once, at the first index
+        bool shared = false;
+        for (int j = 0; j < i; j++) {
+            if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                shared = true;
+                break;
+            }
+        }
+        if (shared) {
+            continue;
+        }
+        size_t min_size = min_sizes[i];
+        for (int j = i + 1; j < galloc->n_buffers; j++) {
+            if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i] && min_sizes[j] > min_size) {
+                min_size = min_sizes[j];
+            }
+        }
+        size_t total = 0;
+        for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+            total += galloc->buf_tallocs[i]->chunks[c]->max_size;
+        }
+        if (min_size > total) {
+            int last = galloc->buf_tallocs[i]->n_chunks - 1;
+            if (last < 0) {
+                // no chunk was created by this graph's placement (nothing was
+                // placed in this buffer); create one to hold the floor
+                if (ggml_dyn_tallocr_new_chunk(galloc->buf_tallocs[i], min_size - total) == -1) {
+                    galloc->failed = true;
+                    return false;
+                }
+                last = galloc->buf_tallocs[i]->n_chunks - 1;
+            }
+            galloc->buf_tallocs[i]->chunks[last]->max_size += min_size - total;
+            // the buffer must be reallocated to the new capacity; the reserve
+            // pass above may have kept a smaller existing buffer (grow-only)
+            ggml_vbuffer_free(galloc->buffers[i]);
+            for (int j = i; j < galloc->n_buffers; j++) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                    galloc->buffers[j] = NULL;
+                }
+            }
+            galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            if (galloc->buffers[i] == NULL) {
+                GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__,
+                               ggml_backend_buft_name(galloc->bufts[i]), min_size);
+                galloc->failed = true;
+                return false;
+            }
+            for (int j = i + 1; j < galloc->n_buffers; j++) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                    galloc->buffers[j] = galloc->buffers[i];
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
-    return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+    return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false, galloc->safe_reserve);
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
@@ -1053,6 +1151,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    if (galloc->failed) {
+        return false;
+    }
     if (ggml_gallocr_needs_realloc(galloc, graph)) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG

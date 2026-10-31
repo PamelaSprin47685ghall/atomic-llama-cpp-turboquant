@@ -1521,6 +1521,65 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
+    // TP5 max-footprint share (GGML_TP5_MAXFP_SHARE=1, exact "1"): reserve the
+    // compute buffers ONCE at the max footprint of the {pp, tg} shape set
+    // instead of the stock pp -> tg -> pp triple. The stock triple re-places
+    // tensors on every reserve and relies on the allocator's grow-only chunk
+    // logic to (hopefully) cover the other shape; the max-footprint reserve
+    // measures both shapes, takes the per-backend max, and reserves the final
+    // pp graph with that total-size floor. A total-size floor alone does not
+    // guarantee that a different graph's chunk placement will fit.
+    const char * maxfp_env = getenv("GGML_TP5_MAXFP_SHARE");
+    const bool   maxfp_share = maxfp_env != nullptr && strcmp(maxfp_env, "1") == 0;
+    if (maxfp_share && !model.hparams.no_alloc) {
+        std::vector<size_t> sizes_pp(backend_ptrs.size(), 0);
+        std::vector<size_t> sizes_tg(backend_ptrs.size(), 0);
+
+        // A new scheduler has different graph copies and placement. Remeasure
+        // both shapes after disabling pipeline parallelism before reserving.
+        for (;;) {
+            // Measure both shapes without releasing the live buffers.
+            {
+                auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, sizes_pp.data(), nullptr, true);
+                if (!gf) {
+                    throw std::runtime_error("failed to measure compute pp buffers");
+                }
+                n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
+                n_nodes_pp  = ggml_graph_n_nodes(gf);
+            }
+            {
+                auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), true, sizes_tg.data(), nullptr, true);
+                if (!gf) {
+                    throw std::runtime_error("failed to measure compute tg buffers");
+                }
+                n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
+                n_nodes_tg  = ggml_graph_n_nodes(gf);
+            }
+
+            std::vector<size_t> sizes_max(backend_ptrs.size(), 0);
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                sizes_max[i] = std::max(sizes_pp[i], sizes_tg[i]);
+            }
+
+            auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), false, nullptr, sizes_max.data());
+            if (!gf) {
+                if (!cparams.pipeline_parallel) {
+                    throw std::runtime_error("failed to allocate compute pp buffers");
+                }
+                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n",
+                               __func__);
+                cparams.pipeline_parallel = false;
+                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                                                   max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+                continue;
+            }
+            break;
+        }
+
+        LLAMA_LOG_INFO("%s: max-footprint share enabled (GGML_TP5_MAXFP_SHARE=1): single reserve at max(pp, tg) per backend\n",
+                       __func__);
+    } else {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc,
@@ -1565,6 +1624,7 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
+    }
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -3741,7 +3801,9 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t                       n_toke
                                            uint32_t                       n_outputs,
                                            const llama_memory_context_i * mctx,
                                            bool                           split_only,
-                                           size_t *                       sizes) {
+                                           size_t *                       sizes,
+                                           const size_t *                 min_sizes,
+                                           bool                           preserve_buffers) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__,
                     n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
@@ -3792,12 +3854,16 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t                       n_toke
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {
-            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+            if (preserve_buffers) {
+                ggml_backend_sched_reserve_size_preserve(sched.get(), gf, sizes);
+            } else {
+                ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+            }
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
-        GGML_ASSERT(!sizes);
+    } else if (min_sizes ? !ggml_backend_sched_reserve_min(sched.get(), gf, min_sizes)
+                         : !ggml_backend_sched_reserve(sched.get(), gf)) {
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
     }

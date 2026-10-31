@@ -1700,6 +1700,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    if (ggml_gallocr_is_failed(sched->galloc)) {
+        return false;
+    }
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -2251,6 +2254,39 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+}
+
+void ggml_backend_sched_reserve_size_preserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(!ggml_gallocr_is_failed(sched->galloc));
+    GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
+    GGML_ASSERT(sizes);
+    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_synchronize(sched);
+    ggml_backend_sched_split_graph(sched, measure_graph);
+    ggml_gallocr_t measure = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    ggml_gallocr_reserve_n_size(measure, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    ggml_gallocr_free(measure);
+}
+
+// TP5 max-footprint share: reserve the measure graph while guaranteeing each
+// backend buffer's total capacity is at least min_sizes[backend_index]. The
+// graph is placed normally; only a shortfall against the caller's measured
+// max-footprint envelope is added to the last chunk. This total floor does not
+// guarantee that later placements fit without reallocation.
+bool ggml_backend_sched_reserve_min(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, const size_t * min_sizes) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
+    GGML_ASSERT(min_sizes);
+
+    ggml_backend_sched_synchronize(sched);
+
+    ggml_backend_sched_split_graph(sched, measure_graph);
+
+    const bool ok = ggml_gallocr_reserve_n_min(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, min_sizes);
+
+    ggml_backend_sched_reset(sched);
+    return ok;
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
