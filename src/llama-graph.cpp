@@ -487,6 +487,30 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     mctx->consume_replay_len();
 }
 
+// stock: the recurrent input's own reuse key (removed by mistake together with
+// the duplicated hybrid definition; restored verbatim from 762631033)
+bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
+
+    this->mctx = mctx;
+
+    bool res = true;
+
+    res &= s_copy->ne[0] == mctx->get_n_rs();
+
+    res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
+    res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
+
+    res &= head == mctx->get_head();
+    res &= rs_z == mctx->get_rs_z();
+
+    // DRC phase 2: a nonzero (or changed) replay length needs a differently-shaped extra
+    // reconstruction node in the graph, so it can't be satisfied by reusing existing topology.
+    res &= replay_len == mctx->get_replay_len();
+
+    return res;
+}
+
 void llm_graph_input_rs::revalidate(const llm_graph_params & params) {
     mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 }

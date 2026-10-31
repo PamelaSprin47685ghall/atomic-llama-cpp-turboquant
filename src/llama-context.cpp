@@ -3619,7 +3619,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         // every reuse/patch path off and every eval full-rebuilds at the
         // true width.
         auto & union_st = llama_nkv_ctx_state_get(this);
-        reused = nkv_patched = union_st.union_binder.rebind(llama_union_param_kind::n_kv, this, res, gparams);
+        // Joint change is not a patch candidate: the n_kv lane's scratch is
+        // built at the graph's CURRENT output bound and copies only the
+        // n_kv-coupled shapes, so a round that ALSO needs a different output
+        // width cannot be reconciled by it. In stock that case is simply a
+        // cache miss (the graph is rebuilt), which is exactly what staying out
+        // of the lane here reproduces - the outputs lane below then reports its
+        // own refusal and the full rebuild runs. Without this, the n_kv patch
+        // could be applied, fail the post-patch verification and be unwound,
+        // leaving a half-applied round whose bookkeeping has to be repaired
+        // afterwards.
+        const bool nkv_candidate = binder_st->nout_enabled
+            ? binder_st->nout_bound == (uint32_t) n_outputs
+            : true;
+        if (nkv_candidate) {
+            reused = nkv_patched = union_st.union_binder.rebind(llama_union_param_kind::n_kv, this, res, gparams);
+        }
         // same in-place contract as the outputs lane: a patched graph must have
         // every input's memo refreshed for this round and still satisfy each
         // input's reuse key (the kq-mask key compares the mask against the

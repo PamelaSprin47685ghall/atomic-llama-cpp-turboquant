@@ -176,7 +176,16 @@ Devops：`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.tx
 | hybrid 父调用 `inp_rs->revalidate(params)` 把 hybrid 强转 recurrent（UB） | 成立 | 传 `recr_params.mctx = mctx->get_recr()`（hybrid 与 hybrid_iswa 都有 `get_recr()`） |
 | alloc 失败路径 `nout_bound` 未回滚 | 成立 | 失败块补 `nkv_st.nout_bound = nkv_st.nout_bound_prev` |
 
-**绑定的真实性**：：`revalidate_after_patch` 的拓扑参照取"patch 之前 out_ids 实际绑定的宽度"；n_outputs lane 的绑定值来自 `union_rebind_outputs` 写入的 `nout_bound`（真实绑定），不是本轮请求宽度；比对对象 `params.n_outputs` 同样是真实请求宽度。
+**第四轮（8645a60d4 复核）**
+| 项 | 核实 | 修复 |
+|---|---|---|
+| `llm_graph_input_rs::can_reuse` 被误删（头文件仍声明 → 链接失败） | **成立**：删重复定义时把 rs 的 stock 键一起删了 | 从 `762631033` **逐字恢复** stock 实现 |
+| 头文件声明 vs 定义 | 复核全部输入类的 `set_input`/`can_reuse`/`revalidate`，唯余基类纯虚声明（正确） | 无缺口 |
+| 双 lane 联合收窄风险 | 成立：n_kv lane 的 scratch 建在图**当前输出绑定宽度**、只拷 n_kv 耦合形状，联合变化不属其能力范围 | 入口前置判定：`nout_enabled && nout_bound != n_outputs` 时**不进** n_kv lane（＝stock 的 cache miss → 全量重建）；不靠"patch 后再撤销" |
+| revalidate 失败必须 `reused=false` 且全量重建 | 已保证：两个失败块都 `reused=false`，随后 `res->reset()` + `build_graph`；计数与 `nout_bound` 一并回滚 | — |
+| 不得跳过必要校验 | 保持：被 patch 维度按**已证明的绑定宽度**判定（patch 的骨架+字节检查即证明），其余维度仍逐条跑原 `can_reuse`/`allow_reuse`/分区键 | — |
+
+**绑定的真实性**：：：`revalidate_after_patch` 的拓扑参照取"patch 之前 out_ids 实际绑定的宽度"；n_outputs lane 的绑定值来自 `union_rebind_outputs` 写入的 `nout_bound`（真实绑定），不是本轮请求宽度；比对对象 `params.n_outputs` 同样是真实请求宽度。
 
 
 | 项 | 核实 | 修正 |
