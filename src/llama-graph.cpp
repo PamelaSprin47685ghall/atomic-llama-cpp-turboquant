@@ -1625,7 +1625,7 @@ void llm_graph_result::reset() {
 }
 
 bool llm_graph_result::revalidate_after_patch(const llm_graph_params & params,
-        llm_union_param_kind bound_kind, uint32_t bound_width) {
+        llama_union_param_kind bound_kind, uint32_t bound_width) {
     // The graph was just patched in place: its memos (memory context pointers,
     // executed counts) still describe the previous round, so set_input() would
     // call through a stale context (Devops: set_input_k_idxs with this == 0).
