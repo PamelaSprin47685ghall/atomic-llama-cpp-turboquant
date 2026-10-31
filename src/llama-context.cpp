@@ -3251,13 +3251,6 @@ bool llama_context::union_binder_scratch_patch(llm_graph_result * res, llm_graph
     // never-placed scratch graph must not touch
 
     gp.res = nkv_scratch.get();
-    // This is a PROBE: any can_reuse() pass it triggers (the scratch graph and,
-    // for the union binder, the live result it patches) must answer without
-    // memoizing this build's throwaway memory context into the live graph's
-    // inputs - that memo is what later made set_input() call through a destroyed
-    // context (Devops: set_input_k_idxs entered with a null `this`).
-    gp.probe = true;
-    gp.probe_guard_res = res;
     gp.cb = [](const llama_ubatch &, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
@@ -3546,17 +3539,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     bool reused = !graph_reuse_disable && !llama_ctx_fa_nkv_param_enabled() && res->can_reuse(gparams);
-
-    // NOTE: no memory context is created here on purpose. decode() owns exactly
-    // one context per call (its llama_memory_context_ptr) and this graph must be
-    // planned against that very object, including its per-ubatch slot_info -
-    // see llm_graph_input_attn_kv::can_reuse(). A second init_batch() would
-    // re-split the shared llama_batch_allocr (dropping the decode loop's
-    // progress) and could pick a different partition for recurrent/hybrid
-    // memories (output_all differs), so the context is never re-created here.
 
     // set only when an in-place patch (below) succeeded: the scheduler's
     // split-input copies were created during the PREVIOUS alloc_graph and still

@@ -127,31 +127,28 @@ Devops：`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.tx
 - 于是第二轮 pass 1 会把副本当"pre-allocated"（`1.dst` 分支、陈旧 buffer 推 backend），pass 3/4 的 `supports_op(src[])` 走这条链，且**没有任何环节清掉副本的 buffer/data**。被共享的 split 输入（`attn_inp_k_idxs` 这类）在轮间布局变化后可能指向"副本或其副本"，re-plan 后 `set_inputs()` 拿到的就是 `data == NULL` 的那个 → `set_input_k_idxs(dst=NULL)` → SIGSEGV。
 - 为何只有 outputs 窄化路径命中：需要 (a) lane 真正记录并 applied（第一轮修好后首次可达），(b) split 布局轮间变化。nkv plain-rebind 同机制但布局未变；out-live/out-clear 在记录/骨架门早退，根本没走到。
 
-### 6.2 第三轮：scratch probe 覆写 live 输入对象（真实机制）
-Reviewer 对 `b8f8753cd` 的 P1/Finding 2 成立（`mctx_built` 地址比较导致复用全失效；额外 `init_batch` 二次切分 `balloc` 且 `embd_all` 不一致），二者均已撤销。重新定位的机制如下。
+### 6.2 现状：268f1b059 的安全网已撤销；崩溃仍未定位
+Reviewer 查实：binder 的 scratch 构建路径 `nkv_scratch->reset() + model.build_graph(gp)` **不调用 `llm_graph_result::can_reuse()`**，`268f1b059` 的 probe 快照分支不可达（`probe_guard_res`/`mctx_saved` 均为死状态，`this->mctx` 还有重复赋值）。该提交的源码改动**已全部撤销**（`src/llama-graph.{h,cpp}`、`src/llama-context.cpp` 回到 `762631033`；`ggml/src` 亦是 `762631033`）。净差异现在只剩本文件的文档。
 
-**机制（静态可证）**
-1. `union_binder_scratch_patch()` 用 `nkv_scratch->reset()` + `model.build_graph(gp)` 构建 scratch 图（`gp.res = nkv_scratch`），并以此为探针判断补丁布局可建性。
-2. 该路径上若 `can_reuse()` 落到 **live 结果**的输入对象（binder 打补丁的对象就是 live 图），`llm_graph_input_attn_kv::can_reuse()` 会执行 `this->mctx = mctx;`，把**探针这次**的临时上下文（`gp.mctx`，随本次 decode 的 `llama_memory_context_ptr` 一起销毁）写进 live 图的输入对象。
-3. live 图在后续 decode 被复用/re-plan 时，`set_input()` 仍按 memo 调用 `mctx->set_input_k_idxs(...)` → 调用已销毁对象 ⇒ 与 Devops 的"`this == 0`、`slot_info` 垃圾、`dst`/buffer/data 均正常"一致。
-4. 该机制同时解释：OFF 不触发（无 binder probe）、只在该窄化路径崩、以及清 scheduler 副本无效（问题在输入对象的上下文指针，不在副本）。
+**目前能确定的事实（全部有控制流依据）**
+| 事实 | 依据 |
+|---|---|
+| `probe-out-applied` 轨迹：prefill0(4 rows, seq0, nout 4) → prefill1(2 rows, seq1, nout 2) → same-shape decode(2 rows, nout 1) | probe 源码 `scenario_probe_out_applied` |
+| 崩溃发生在**第三次 decode** 的 `set_inputs()` 之后（`set_input_k_idxs` 内部） | EVIDENCE-ABC |
+| 该轮之前必然有一次 in-place patch：`reused=false → nout_pending → union_rebind_outputs → union_binder_scratch_patch → apply → alloc_graph(re-plan) → reused=true` | `llama-context.cpp:3630-3641, 3663-3700` |
+| `reused=false` 的轮次**不会调用** `can_reuse()` 来设置输入对象的 `mctx`（`can_reuse` 只在 `res->can_reuse(gparams)` 的一次调用里赋值） | `llama-context.cpp:3544` |
+| `llm_graph_input_attn_kv::mctx` 是**裸指针、可被 `can_reuse` 改写**（`llama-graph.cpp:647`） | 源码 |
+| `llm_graph_input_attn_k` / `iswa` / `dsa` / `msa` / `dsv4` / `mem_hybrid*` 等同类输入同样持裸 `mctx` | `llama-graph.cpp` 各 `can_reuse` 的 `this->mctx = mctx;` |
 
-**修复（只消除探针副作用；不改判定结果、不新增上下文、不比较地址）**
-- `llm_graph_params`：新增 `bool probe` 与 `llm_graph_result * probe_guard_res`；binder 的 scratch 构建设 `gp.probe = true; gp.probe_guard_res = res;`。
-- `llm_graph_result::can_reuse()`：probe 模式下先对**自身 + guarded 结果**的每个输入快照 `mctx_saved()`，执行原判定（`can_reuse_impl` 即原实现，结果与 stock 逐位一致），随后把 memo 原样写回。
-- `llm_graph_input_i`：新增默认空实现 `mctx_saved()/mctx_restore()`；`llm_graph_input_attn_kv` 覆盖（返回/恢复 `mctx`）。其它持 `mctx` 的输入类未覆盖 ⇒ 它们的 memo 快照/恢复都是空值，**探针不会改动它们**（见残余风险）。
-- `llm_graph_input_attn_kv::can_reuse()`：恢复 stock 的 `this->mctx = mctx;`；只保留唯一守卫 `if (mctx_built == nullptr) return false;`（memo 被非探针路径破坏时的 fail-closed，不会误拒正常复用）。
-- `process_ubatch()`：删除 b8f 的额外 `init_batch`，并注释说明不得在此重建上下文（balloc 二次 `split_reset()`、`embd_all` 不一致）。
+**为什么"给 mctx 加身份判定"不成立**：`init_batch` 每次 `make_unique`，地址永不相等 ⇒ 复用全失效（reviewer P1，已在 b8f 中证实）；额外 `init_batch` 又会二次切分 `balloc`、`embd_all` 不一致（reviewer Finding 2）。
 
-**与 b8f8753cd 对照**
-| 项 | b8f8753cd | 本轮 |
-|---|---|---|
-| `can_reuse` 地址比较 | 有 → 复用全失效 | 无 |
-| 额外 `init_batch` | 有（二次切分、`embd_all` 不一致） | 无 |
-| probe 覆写 live memo | 未处理 | 快照/回滚 |
-| OFF | 退化为全量重建 | 走 stock 路径（无 probe 标志） |
+**下一步需要的控制流证据（Devops，CPU，单次复现即可）**
+1. 在 `llm_graph_input_attn_kv::set_input()` 打印 `this`、`mctx`、`mctx` 是否等于 `params.mctx`（本轮 `process_ubatch` 传入的上下文指针）；
+2. 在 `llm_graph_result::can_reuse()` 打印**每次被调用的 result 指针**与 `gf` 指针，并与 `gf_res_prev.get()` 对比（确认是否真的存在 live 结果上的 probe）；
+3. 在 `ggml_backend_sched_split_graph()` 末尾打印每个 split 的 `inputs[]` 中哪些张量**在 `ggml_backend_sched_alloc_graph()` 返回后仍 `data == NULL`**，以及这些张量是否出现在任一 `graph_copy->nodes[]` 中（Devops 的 EVIDENCE-ABC 已确认 `self_k_idxs` 有 data，因此重点是其它输入如 mask/view）；
+4. 记录第三次 decode 的 `sched->is_reset` / `is_alloc` 与 `NKV_BINDER_STATS` 计数顺序，确认 `set_inputs()` 之前 scheduler 是否完成 re-plan。
 
-**仍待证的关键事实**：binder probe 是否真的在 live 结果上调用过 `can_reuse()`（第 2 步）。若否，本修复为无害硬化而崩溃仍另有原因；Devops 需在 `llm_graph_input_attn_kv::can_reuse` 打印 `res->get_gf()==live_gf` 与调用栈确认。
+在此之前不添加任何防御代码：既有的 `mctx` 裸指针语义保持 stock。
 
 ### 6.5 残余风险 / PARTIAL
 - 未编译未测试；A1–A11 全部无运行证据。

@@ -118,15 +118,6 @@ public:
         GGML_UNUSED(params);
         return false;
     }
-
-    // Memory-context memo carried by inputs whose can_reuse() stores the
-    // context that set_input() will dereference. Implementations overwrite it
-    // on every can_reuse(); probing readers save and restore it so a probe
-    // never mutates the live graph's inputs (see llm_graph_result::can_reuse).
-    // can_reuse() stores the context set_input() will use; mctx_saved() returns
-    // the last stored value so a probe can put it back after its own pass.
-    virtual const void * mctx_saved() const { return nullptr; }
-    virtual void mctx_restore(const void * /*prev*/) {}
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -378,8 +369,7 @@ public:
             const llama_kv_cache_context * mctx) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx),
-        mctx_built(mctx) {
+        mctx(mctx) {
     }
     ~llm_graph_input_attn_kv() = default;
 
@@ -411,21 +401,7 @@ public:
     const llama_hparams hparams;
     const llama_cparams cparams;
 
-    // The memory context set_input() may dereference. It is re-pointed by
-    // can_reuse() at the context of the ubatch that is about to be processed:
-    // decode() owns exactly one context per call and it holds the per-ubatch
-    // slot_info these setters read, so the ubatch's own context is the only
-    // correct one.
     const llama_kv_cache_context * mctx;
-
-    // context this input was BUILT with. Its nullness is the "the memo was
-    // damaged" state: llm_graph_result::can_reuse restores it after a probe, so
-    // a null here means the memo was cleared by something that is not a probe -
-    // refuse the reuse instead of calling into an unknown object.
-    const llama_kv_cache_context * mctx_built;
-
-    const void * mctx_saved() const override { return mctx; }
-    void mctx_restore(const void * prev) override { mctx = static_cast<const llama_kv_cache_context *>(prev); }
 };
 
 // V-less input for the KV cache
@@ -842,18 +818,6 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
-    // The caller is only PROBING buildability (the union binder's scratch
-    // build) while llm_graph_result::can_reuse may still be invoked on the LIVE
-    // result: the probe must then answer without memoizing its throwaway
-    // memory context into the live graph's inputs.
-    bool probe = false;
-
-    // Optional: the result whose inputs the probe may touch. When set, a
-    // can_reuse() pass on THIS result restores every input's memoized memory
-    // context afterwards (the union binder patches the live graph and probes it
-    // through the same machinery, so the objects it probes are the live ones).
-    llm_graph_result * probe_guard_res = nullptr;
-
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -965,15 +929,7 @@ public:
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
 
-private:
-    bool can_reuse_impl(const llm_graph_params & params);
-
-public:
-
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
-
-    // every input object of this result (read-only access for probe restores)
-    const std::vector<llm_graph_input_ptr> & get_inputs() const { return inputs; }
 
     void add_fused_node(llm_graph_fused_node result);
 
