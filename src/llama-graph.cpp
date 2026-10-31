@@ -343,15 +343,24 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
-    // NOTE: stock. The input's reuse key stays the active
-    // n_outputs: the graph always builds at the exact active
-    // count, so a changed count refuses reuse here and the
-    // caller hands the difference to the binder's n_outputs
-    // rebind (reconciles within the built width) or falls
-    // back to a full rebuild.
-    res &= n_outputs == params.n_outputs;
+    // NOTE: stock. The graph always builds at the exact active count, so a
+    // changed count refuses reuse here and the caller hands the difference to
+    // the binder's n_outputs rebind (reconciles within the built width) or
+    // falls back to a full rebuild.
+    //
+    // The key is the EXECUTED count, not the build count: the binder's in-place
+    // patch narrows/restores out_ids to the new count and must make the graph
+    // reusable afterwards. Keeping the build count here would reject every
+    // round that follows a successful patch and turn the patch into a
+    // guaranteed rebuild.
+    res &= (n_outputs_exec != 0 ? n_outputs_exec : n_outputs) == params.n_outputs;
 
     return res;
+}
+
+void llm_graph_input_out_ids::revalidate(const llm_graph_params & params) {
+    // after an in-place patch the executed count is whatever the patch bound
+    n_outputs_exec = params.n_outputs;
 }
 
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
@@ -465,6 +474,10 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     }
 
     mctx->consume_replay_len();
+}
+
+void llm_graph_input_rs::revalidate(const llm_graph_params & params) {
+    mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -1512,6 +1525,41 @@ void llm_graph_result::reset() {
     ctx_compute.reset(ggml_init(params));
 
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
+}
+
+bool llm_graph_result::revalidate_after_patch(const llm_graph_params & params) {
+    // The graph was just patched in place: its memos (memory context pointers,
+    // executed counts) still describe the previous round, so set_input() would
+    // call through a stale context (Devops: set_input_k_idxs with this == 0).
+    // Refresh them with the CURRENT params, then verify the same invariants
+    // can_reuse() checks - eligibility, every input's shape contract against
+    // the patched tensors, and self-consistency (a patch may not move the
+    // ubatch/stream partition the graph was built for).
+    //
+    // Failure is not repaired here: the caller unwinds the patch and takes the
+    // full-rebuild path. Inputs that memoize nothing are no-ops by contract.
+    for (auto & input : inputs) {
+        input->revalidate(params);
+    }
+    if (!this->params.allow_reuse(params)) {
+        return false;
+    }
+    for (auto & input : inputs) {
+        if (!input->can_reuse(params)) {
+            return false;
+        }
+    }
+    return inputs_partition_unchanged(params);
+}
+
+bool llm_graph_result::inputs_partition_unchanged(const llm_graph_params & params) const {
+    const auto & built = this->params.ubatch;
+    const auto & now   = params.ubatch;
+    return built.equal_seqs() == now.equal_seqs() &&
+           built.n_tokens     == now.n_tokens  &&
+           built.n_seq_tokens == now.n_seq_tokens &&
+           built.n_seqs       == now.n_seqs    &&
+           built.n_seqs_unq   == now.n_seqs_unq;
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {

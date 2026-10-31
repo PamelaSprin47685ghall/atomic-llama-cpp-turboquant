@@ -118,6 +118,14 @@ public:
         GGML_UNUSED(params);
         return false;
     }
+
+    // Refresh whatever can_reuse() memoizes (memory context pointers, executed
+    // counts) for a graph that was already patched in place, WITHOUT requiring
+    // the graph to be reusable. can_reuse() itself must not be used for that:
+    // its contract answers "same graph as before", so a shape key that matches
+    // the BUILT topology would reject a legitimately patched graph. Default:
+    // nothing memoized.
+    virtual void revalidate(const llm_graph_params & /*params*/) {}
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -244,7 +252,13 @@ public:
     const llama_hparams hparams;
     const llama_cparams cparams;
 
-    const uint32_t n_outputs;
+    // Count the graph was BUILT with and the count it currently EXECUTES.
+    // can_reuse() keys on the EXECUTED one: after an in-place binder patch the
+    // live tensor's ne[0] is the patched width, and comparing it against the
+    // pre-patch store count would keep rejecting every round (the stale key
+    // that made a patched-then-reused graph impossible).
+    const uint32_t n_outputs;          // build count (immutable)
+    uint32_t       n_outputs_exec = 0; // executed count, updated by revalidate()
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -377,6 +391,13 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // a patched-in-place graph still needs set_input() to run against THIS
+    // ubatch's memory context (it owns the per-ubatch slot_info the k/v idx
+    // setters read), so refresh the memo after a successful patch
+    void revalidate(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+    }
+
     void set_reader_input();
     std::vector<reader_input> readers;
 
@@ -421,6 +442,10 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    void revalidate(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+    }
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
 
@@ -488,6 +513,12 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // same in-place contract: refresh both the MSA context and the base one
+    void revalidate(const llm_graph_params & params) override {
+        mctx_msa = static_cast<const llama_kv_cache_msa_context *>(params.mctx);
+        mctx     = mctx_msa->get_base();
+    }
+
     ggml_tensor * get_k_idxs_idx() const { return self_k_idxs_idx; }
 
     ggml_tensor * self_k_idxs_idx = nullptr; // I64 [n_batch]
@@ -510,6 +541,10 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    void revalidate(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
+    }
 
     ggml_tensor * get_k_idxs()     const { return self_k_idxs; }
     ggml_tensor * get_v_idxs()     const { return self_v_idxs; }
@@ -556,6 +591,10 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    void revalidate(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
+    }
 
     ggml_tensor * get_k_idxs()     const { return self_k_idxs; }
     ggml_tensor * get_k_idxs_swa() const { return self_k_idxs_swa; }
@@ -929,6 +968,15 @@ public:
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
 
+    // Refresh every input's memo for params and verify the patched graph still
+    // satisfies each input's reuse/shape contract. Returns false when a patch
+    // left the graph inconsistent (caller unwinds and rebuilds).
+    bool revalidate_after_patch(const llm_graph_params & params);
+
+private:
+    bool inputs_partition_unchanged(const llm_graph_params & params) const;
+
+public:
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
     void add_fused_node(llm_graph_fused_node result);

@@ -127,28 +127,33 @@ Devops：`/home/kunweiz/work/lead-fa-fix-verify-20261031/VERIFY-FA762-RESULTS.tx
 - 于是第二轮 pass 1 会把副本当"pre-allocated"（`1.dst` 分支、陈旧 buffer 推 backend），pass 3/4 的 `supports_op(src[])` 走这条链，且**没有任何环节清掉副本的 buffer/data**。被共享的 split 输入（`attn_inp_k_idxs` 这类）在轮间布局变化后可能指向"副本或其副本"，re-plan 后 `set_inputs()` 拿到的就是 `data == NULL` 的那个 → `set_input_k_idxs(dst=NULL)` → SIGSEGV。
 - 为何只有 outputs 窄化路径命中：需要 (a) lane 真正记录并 applied（第一轮修好后首次可达），(b) split 布局轮间变化。nkv plain-rebind 同机制但布局未变；out-live/out-clear 在记录/骨架门早退，根本没走到。
 
-### 6.2 现状：268f1b059 的安全网已撤销；崩溃仍未定位
-Reviewer 查实：binder 的 scratch 构建路径 `nkv_scratch->reset() + model.build_graph(gp)` **不调用 `llm_graph_result::can_reuse()`**，`268f1b059` 的 probe 快照分支不可达（`probe_guard_res`/`mctx_saved` 均为死状态，`this->mctx` 还有重复赋值）。该提交的源码改动**已全部撤销**（`src/llama-graph.{h,cpp}`、`src/llama-context.cpp` 回到 `762631033`；`ggml/src` 亦是 `762631033`）。净差异现在只剩本文件的文档。
+### 6.2 根因：patch 成功后跳过了输入的 can_reuse（memo 未刷新）
+`268f1b059` 的 probe 安全网已撤销（源码回到 `762631033`）。本轮改用控制流定位，结论：
 
-**目前能确定的事实（全部有控制流依据）**
-| 事实 | 依据 |
-|---|---|
-| `probe-out-applied` 轨迹：prefill0(4 rows, seq0, nout 4) → prefill1(2 rows, seq1, nout 2) → same-shape decode(2 rows, nout 1) | probe 源码 `scenario_probe_out_applied` |
-| 崩溃发生在**第三次 decode** 的 `set_inputs()` 之后（`set_input_k_idxs` 内部） | EVIDENCE-ABC |
-| 该轮之前必然有一次 in-place patch：`reused=false → nout_pending → union_rebind_outputs → union_binder_scratch_patch → apply → alloc_graph(re-plan) → reused=true` | `llama-context.cpp:3630-3641, 3663-3700` |
-| `reused=false` 的轮次**不会调用** `can_reuse()` 来设置输入对象的 `mctx`（`can_reuse` 只在 `res->can_reuse(gparams)` 的一次调用里赋值） | `llama-context.cpp:3544` |
-| `llm_graph_input_attn_kv::mctx` 是**裸指针、可被 `can_reuse` 改写**（`llama-graph.cpp:647`） | 源码 |
-| `llm_graph_input_attn_k` / `iswa` / `dsa` / `msa` / `dsv4` / `mem_hybrid*` 等同类输入同样持裸 `mctx` | `llama-graph.cpp` 各 `can_reuse` 的 `this->mctx = mctx;` |
+**控制流事实**
+- `llm_graph_input_attn_kv::set_input()` 用的是 `members[mctx]`；该成员**只**在 `can_reuse()` 里被赋值（`llama-graph.cpp:647`）。
+- `process_ubatch()` 只有在 `res->can_reuse(gparams)` 那**一次**调用（`:3544`）时才会刷新 memo。第三轮 decode 的 `reused=false`，因此`can_reuse()` 根本没跑；随后的 outputs patch 成功把 `reused` 置 `true`（`:3641`），**memo 仍是上一轮的上下文**（已被销毁，`llama_memory_context_ptr` 仅存活一次 decode）。`set_inputs()` 随即被调用 ⇒ 调进已销毁对象 ⇒ Devops 观测的 `this == 0`。
 
-**为什么"给 mctx 加身份判定"不成立**：`init_batch` 每次 `make_unique`，地址永不相等 ⇒ 复用全失效（reviewer P1，已在 b8f 中证实）；额外 `init_batch` 又会二次切分 `balloc`、`embd_all` 不一致（reviewer Finding 2）。
+**修复（不做身份地址比较，不新增 init_batch）**
+1. `llm_graph_input_i` 新增 `virtual void revalidate(const llm_graph_params &)`（默认无操作）。持 `mctx` 的类覆盖它，只做"用本轮 params 刷新 memo"：`attn_kv`、`attn_k`、`attn_kv_msa`、`attn_kv_iswa`、`attn_k_iswa`、`rs`。
+2. `llm_graph_input_out_ids`：新增 `n_outputs_exec`（执行宽度），`can_reuse()` 用**执行宽度**而非建图宽度比较；`revalidate()` 把执行宽度置为 `params.n_outputs`。否则 patch 成功后 `can_reuse` 仍按旧宽度拒绝，patch 永远只能退化成重建（这正是 reviewer 指出的死结）。
+3. `llm_graph_result::revalidate_after_patch(params)`：① 逐输入 `revalidate`（刷新 memo）→ ② `params.allow_reuse` → ③ 逐输入 `can_reuse`（**原有的复用/形状合同**）→ ④ 校验 ubatch 分区未被 patch 改动。任一失败返回 false。
+4. binder 两条成功路径都由它把关：
+   - `n_outputs` 成功：`revalidate_after_patch` 通过才 `reused = true`，否则 `nout_patched=false, reused=false`（走下面的全量重建）；
+   - `n_kv` 成功：同样校验，失败则回滚 `c_applied/++c_fallbacks` 并 `reused=false`。
 
-**下一步需要的控制流证据（Devops，CPU，单次复现即可）**
-1. 在 `llm_graph_input_attn_kv::set_input()` 打印 `this`、`mctx`、`mctx` 是否等于 `params.mctx`（本轮 `process_ubatch` 传入的上下文指针）；
-2. 在 `llm_graph_result::can_reuse()` 打印**每次被调用的 result 指针**与 `gf` 指针，并与 `gf_res_prev.get()` 对比（确认是否真的存在 live 结果上的 probe）；
-3. 在 `ggml_backend_sched_split_graph()` 末尾打印每个 split 的 `inputs[]` 中哪些张量**在 `ggml_backend_sched_alloc_graph()` 返回后仍 `data == NULL`**，以及这些张量是否出现在任一 `graph_copy->nodes[]` 中（Devops 的 EVIDENCE-ABC 已确认 `self_k_idxs` 有 data，因此重点是其它输入如 mask/view）；
-4. 记录第三次 decode 的 `sched->is_reset` / `is_alloc` 与 `NKV_BINDER_STATS` 计数顺序，确认 `set_inputs()` 之前 scheduler 是否完成 re-plan。
+**为什么这是"用现有合同"，不是先用旧参数拒绝 nout**
+`can_reuse` 的 n_outputs 键现在比较**执行宽度**；patch 已经把 `out_ids` 改成新宽度，所以"刚 patch 成功"的图不会被自己拒绝。mask 键比较 `kq_mask->ne[0]` 与缓存**当前** `get_n_kv()`，patch 后两者一致。因此校验发生在 patch **之后**、针对**本轮** params，而不是 patch 之前用旧建模参数。
 
-在此之前不添加任何防御代码：既有的 `mctx` 裸指针语义保持 stock。
+**副作用与回滚（明确）**
+- `revalidate()` 有副作用（写 memo/执行宽度），但**所有写入都是本轮正确的值**，失败回退时不会污染：失败路径随后 `res->reset()` + 全量重建，输入对象连同 memo 一起重建。
+- `revalidate_after_patch` 在 nkv 失败路径上先 `++c_fallbacks` 再回滚计数，保持 `attempts == applied + fallbacks`。
+- 无新增内存/上下文；`revalidate` 不分配、不切分 `balloc`。
+- OFF：不进入 binder，`revalidate` 不被调用；`n_outputs_exec` 初始为 0 时键回落到 `n_outputs`，行为与 stock 等价。
+
+**未覆盖/仍需证据**
+- DSA / DSV4 / hybrid 输入类没有 `can_reuse` 里的 `mctx` memo（DSA 的 `set_input` 走 `mctx->get_mla()`，属于不同的 owner 结构），本轮未改；若将来在这些架构开启 binder 需补同样的 `revalidate`。
+- 触发点（第三轮 decode 的 `reused=false`）的精确原因未逐帧验证：本修复不依赖它——只要"patch 成功 → 刷新 memo → 逐输入合同校验"成立，`set_inputs` 就必然拿到本轮上下文。
 
 ### 6.5 残余风险 / PARTIAL
 - 未编译未测试；A1–A11 全部无运行证据。

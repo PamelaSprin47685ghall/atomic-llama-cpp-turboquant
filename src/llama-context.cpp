@@ -3619,6 +3619,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         // true width.
         auto & union_st = llama_nkv_ctx_state_get(this);
         reused = nkv_patched = union_st.union_binder.rebind(llama_union_param_kind::n_kv, this, res, gparams);
+        // same in-place contract as the outputs lane: a patched graph must have
+        // every input's memo refreshed for this round and still satisfy each
+        // input's reuse key (the kq-mask key compares the mask against the
+        // cache's CURRENT n_kv, so it accepts exactly the patched width). Any
+        // refusal unwinds the patch and takes the rebuild below.
+        if (nkv_patched && !res->revalidate_after_patch(gparams)) {
+            auto & nkv_st = llama_nkv_ctx_state_get(this);
+            --nkv_st.c_applied;
+            ++nkv_st.c_fallbacks;
+            nkv_patched = false;
+            reused      = false;
+        }
     }
 
     // outputs-only change (or a pending reconcile after an nkv refusal): the
@@ -3631,7 +3643,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             binder_st->nout_enabled && !llama_ctx_fa_nkv_param_enabled()) {
         if (binder_st->union_binder.rebind(llama_union_param_kind::n_outputs, this, res, gparams)) {
             nout_patched = true;
-            reused = true;
+            // The patch moved the live tensors in place; the inputs' memos still
+            // describe the pre-patch graph, and set_input() would call through
+            // the previous round's memory context (Devops: set_input_k_idxs
+            // entered with this == 0 after a real outputs narrow). Refresh the
+            // memos for THIS round and verify the patched graph still meets
+            // every input's contract. The n_outputs key is judged on the
+            // executed count, so the patch that just succeeded does not
+            // self-reject (stock keyed on the build count, which is why a
+            // patched graph could never be reused). Fail-closed: any refusal
+            // unwinds the patch and falls back to the full rebuild.
+            if (!res->revalidate_after_patch(gparams)) {
+                nout_patched = false;
+                reused       = false;
+            } else {
+                reused = true;
+            }
         } else if (nkv_patched) {
             // the kv patch applied but the output reconcile failed: the live
             // graph is half-patched (kv shapes at the new bucket, output shapes
