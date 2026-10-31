@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Build the mixer-shape N=1 reference micro and print its run matrix.
+"""Build the mixer-shape N=1 reference micro and print compile + link commands.
 
-Authored, NOT executed.  This script only assembles argv from the lane's own
-recorded recipes, so the compiler flags stay identical to the M3 micro that the
-trunk baselines were produced with:
+Authored, NOT executed.  The recorded HIP command
+(mtp-m3-trio-20261028/build/ggml-cuda-m3t.argv.json) is parsed with the driver's
+own argument rules rather than whitelisted per flag, because a whitelist already
+lost `-x hip` once.  Output is two commands:
 
-  compile flags : mtp-m3-trio-20261028/build/ggml-cuda-m3t.argv.json (clang++
-                  from /opt/rocm/core-10.0, gfx1030, the GGML_* defines)
-  link inputs   : the same file is used only for -L/-l values; the micro links
-                  against the lane install/lib of whichever library is under
-                  test, plus /opt/rocm/core-10.0/lib
+  compile : <clang++> <every recorded flag except output naming> -c <src>
+            -o <obj> -MMD -MF <obj>.d
+  link    : <clang++> <obj> -L<libdir> -L<rocm> -Wl,-rpath,<libdir>
+            -Wl,-rpath,<rocm> -Wl,-rpath-link,<libdir> -lggml -lggml-base
+            -lggml-hip -o <bin>
 
-Usage:
-  build_mixer_n1ref.py <outdir> <libdir>
+Exactly one compiler per command, exactly one `-o`/`-c`/`-MF`, the source never
+after `-MMD` with no destination, and the private directory always before the
+libraries.  The script asserts all of that and refuses to print a link command for
+a `--libdir` that does not exist.
 
-Writes <outdir>/m3-mixer-n1ref and <outdir>/build.argv.json for the record.
-Nothing in the official lanes is touched.  Devops owns execution (GPU flock);
-this file is not run by the engineer.
+Usage: build_mixer_n1ref.py <outdir> <libdir>
+Devops owns execution (GPU flock); this file is not run by the engineer.
 """
 import json
 import os
@@ -26,31 +28,47 @@ import sys
 E = "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024"
 TEMPLATE = E + "/mtp-m3-trio-20261028/build/ggml-cuda-m3t.argv.json"
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "m3-mixer-n1ref.cpp")
+CLANG = "/opt/rocm/core-10.0/lib/llvm/bin/clang++"
 
 
-def flags_from_template():
-    """Every recorded flag except the ones that name lane output files.
+def split_argv(argv):
+    """(compiler, [flags], source) using the driver's own argument grouping.
 
-    The previous filter kept only -I/-D/-O/-f/-W/--offload-arch/-std and thereby
-    dropped the lane's `-x hip`, so the generated command could not find
-    hip/hip_runtime.h.  Fidelity is now the rule: drop only what names an output
-    (-o, -c, -MF, -MT, -MD, -MTdeps) and keep everything else verbatim.
+    Output naming (-o/-MF/-MT/-MQ/-MD/-MMD) and its value are dropped; every other
+    element is kept, including `-x hip`, `-std=...`, `--offload-arch=...`, `-I`
+    and `-iquote` with their values.
     """
-    argv = json.load(open(TEMPLATE))["argv"]
-    drop_value_after = {"-o", "-c", "-MF", "-MT", "-MD", "-MTdeps"}
-    out = []
-    i = 0
+    if not argv:
+        raise ValueError("empty recorded command")
+    cc = argv[0]
+    with_value = {"-o", "-c", "-MF", "-MT", "-MQ", "-MD", "-MMD", "-x", "-include",
+                  "-iquote", "-isystem", "-I", "-D", "-U", "-L", "-l", "-std",
+                  "--offload-arch", "-arch"}
+    output_only = {"-o", "-MF", "-MT", "-MQ", "-MD", "-MMD"}
+    flags = []
+    source = None
+    i = 1
     while i < len(argv):
         a = argv[i]
-        if a in drop_value_after:
+        if a in output_only:
             i += 2
             continue
-        if a.startswith("-Wl,--dependency-file"):
-            i += 1
+        if a in with_value:
+            flags.append(a)
+            if i + 1 < len(argv):
+                flags.append(argv[i + 1])
+            i += 2
             continue
-        out.append(a)
+        if a.startswith("-"):
+            flags.append(a)
+        elif source is None:
+            source = a
+        else:
+            raise ValueError("unexpected second operand %r" % a)
         i += 1
-    return out
+    if source is None:
+        raise ValueError("recorded command has no source operand")
+    return cc, flags, source
 
 
 def main(argv):
@@ -59,20 +77,30 @@ def main(argv):
         return 1
     outdir, libdir = argv[1], argv[2]
     os.makedirs(outdir, exist_ok=True)
-    cc = "/opt/rocm/core-10.0/lib/llvm/bin/clang++"
-    # The template already carries the lane's -x hip, -std, -O, -DNDEBUG,
-    # --offload-arch and include set; do not add a second copy of any of them.
-    args = [cc] + flags_from_template() + [
-        SRC,
-        "-o", os.path.join(outdir, "m3-mixer-n1ref"),
-        "-L" + libdir,
-        "-L/opt/rocm/core-10.0/lib",
-        "-lggml", "-lggml-base", "-lggml-hip",
-        "-Wl,-rpath," + libdir,
-        "-Wl,-rpath,/opt/rocm/core-10.0/lib",
+    if not os.path.isdir(libdir):
+        print("# ERROR: --libdir %s does not exist; refusing to print a link command" % libdir)
+        return 2
+    _cc, flags, _src = split_argv(json.load(open(TEMPLATE))["argv"])
+    obj = os.path.join(outdir, "m3-mixer-n1ref.o")
+    compile_argv = [CLANG] + flags + [
+        "-c", SRC,
+        "-o", obj, "-MMD", "-MF", obj + ".d",
     ]
-    json.dump({"argv": args}, open(os.path.join(outdir, "build.argv.json"), "w"), indent=1)
-    print(shlex.join(args))
+    link_argv = [CLANG, obj,
+                 "-L" + libdir, "-L/opt/rocm/core-10.0/lib",
+                 "-Wl,-rpath," + libdir, "-Wl,-rpath,/opt/rocm/core-10.0/lib",
+                 "-Wl,-rpath-link," + libdir,
+                 "-lggml", "-lggml-base", "-lggml-hip",
+                 "-o", os.path.join(outdir, "m3-mixer-n1ref")]
+    assert compile_argv.count(CLANG) == 1 and compile_argv[0] == CLANG
+    assert compile_argv.count("-c") == 1 and compile_argv.count("-o") == 1
+    assert compile_argv.count("-MF") == 1 and compile_argv.index("-c") < compile_argv.index("-o")
+    first_lib = next(i for i, a in enumerate(link_argv) if a.startswith("-l"))
+    assert link_argv.count(CLANG) == 1 and link_argv.index("-L" + libdir) < first_lib
+    json.dump({"compile": compile_argv, "link": link_argv},
+              open(os.path.join(outdir, "build.argv.json"), "w"), indent=1)
+    print(shlex.join(compile_argv))
+    print(shlex.join(link_argv))
     print()
     print("# run matrix (Devops, under both GPU flocks), binary from the line above:")
     print("#   MIXER=1 %s <libdir> <nt> <sites> <prefix> [dev]" % os.path.join(outdir, "m3-mixer-n1ref"))

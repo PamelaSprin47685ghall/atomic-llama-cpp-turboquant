@@ -409,6 +409,25 @@ value, op, flag or gate changes, and the production gate stays exact `"1"` with 
 Gate matrix after this round (unchanged from §5c): `TAIL_KEEP` exact `"1"` + `TRIO` `"1"`; every other
 value OFF; the diagnostic scope is a separate variable and is never a promotion input.
 
+## 5e. Recipe corrections after the second Devops audit (2026-10-31)
+
+Devops re-ran the printed argv verbatim and reported four concrete defects; all four are fixed in
+`micro/build_mixer_prod.py` and `micro/build_mixer_n1ref.py`, and the fixes are structural rather
+than positional:
+
+| defect (executed argv) | cause | fix |
+|---|---|---|
+| compiler appeared twice → `ld.lld: unknown file type` | the compiler was taken from both recorded commands and concatenated | exactly one compiler per command, fixed to the lane's HIP `clang++`; asserted before printing |
+| `.cpp` after `-MMD` with no `-o`/`-MF` | template flags were concatenated and the source appended at the end | every compile is `-c <src> -o <obj> -MMD -MF <obj>.d`, asserted (`-c < -o < -MMD < -MF`) |
+| link line had no `-L`/rpath for the private dir | the recorded link argv was mined element-wise and its absolute lane paths dropped | link is rebuilt: objects, `-L<libdir>`, `-Wl,-rpath,<libdir>`, `-Wl,-rpath-link,<libdir>`, then the recorded library list, then `-o <bin>`; asserted that `-L<libdir>` precedes the first `-l` |
+| flag handling was position-based | `-o/-c/-MF` were rewritten in place | argv is parsed into (compiler, flags, source) with the driver's own grouping: value-carrying switches stay with their value, output naming is dropped, nothing else is touched (`-x hip`, `-iquote <dir>`, `-std=…`, `--offload-arch=…` all survive as groups) |
+
+Additionally the recipes now fail closed: a `--libdir` that does not exist, or that holds no
+`libllama`, or a missing probe source stops the script with `rc=2` and no command is printed
+(previously a link line was printed for a directory that could not exist).  Nothing was built or
+run for this revision: the production harness (`m3-mixer-prod-path`) and both recipes are
+**authored, NOT verified**, and G2 is **not** claimed.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -422,7 +441,9 @@ value OFF; the diagnostic scope is a separate variable and is never a promotion 
 * **2026-10-31 update (Devops data, re-read only):** reach 774/774 with the unmodified trio proven;
   the trunk/mixer isolation and the production-path mixer test (§5c/§5d) are code-only in this
   branch and have NOT been built or run; the first harness revision was rejected by Devops for
-  dropping `-x hip` and for not driving the production builder, both fixed in §5d; the production gate is exact `"1"` again and the previous
+  dropping `-x hip` and for not driving the production builder (§5d), and the recipes were again
+  rejected for a duplicated compiler, a misordered `-MMD`, and a link line without the private
+  `-L` (§5e). All of those are fixed; nothing has been executed, so G2 remains unproven; the production gate is exact `"1"` again and the previous
   `trunk`/`mixer`-inside-`TAIL_KEEP` revision is reverted (kept as evidence above);
   token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
   §5a/§5b give the placement-stamp and per-layer capture plan.  The gate stays closed: promotion is
