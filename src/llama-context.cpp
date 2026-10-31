@@ -85,6 +85,23 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/1,
 };
 
+// The nout lanes narrow the output gather (llm_graph_input_out_ids) of a
+// decoder-side inference graph. LLM_GRAPH_TYPE_DEFAULT is the graph decode()
+// builds for a primary context; LLM_GRAPH_TYPE_DECODER is the legacy alias for
+// the same decoder-side graph and is accepted for arch code that switches on
+// it. ENCODER (encode()) and DECODER_MTP (chained nextn draft head with its own
+// n_outputs/row semantics) are never narrowed.
+//
+// This tree never *produces* LLM_GRAPH_TYPE_DECODER (ctx_type_to_graph_type()
+// maps LLAMA_CONTEXT_TYPE_DEFAULT to DEFAULT, encode() passes ENCODER, and no
+// arch rewrites gtype in build_arch_graph()), so gating the lanes on DECODER
+// alone left them permanently inert - and, once the owner index was fixed,
+// would have armed the bind path without ever arming the matching floor1
+// build/snapshot, doubling the build on every non-reused step.
+static bool nout_narrowable_graph_type(llm_graph_type gtype) {
+    return gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER;
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT:
@@ -471,12 +488,16 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     {
         const char * GGML_TP5_NOUT_REUSE = getenv("GGML_TP5_NOUT_REUSE");
         auto & nout_st = llama_nkv_ctx_state_get(this);
-        nout_st.nout_gate    = GGML_TP5_NOUT_REUSE != nullptr && strcmp(GGML_TP5_NOUT_REUSE, "1") == 0;
-        nout_st.nout_enabled = nout_st.nout_gate;
+        nout_st.nout_gate = GGML_TP5_NOUT_REUSE != nullptr && strcmp(GGML_TP5_NOUT_REUSE, "1") == 0;
+
+        // effective flag derived from the CURRENT sampler set, so a later
+        // set_sampler() (public llama_set_sampler) cannot leave the lane armed
+        // with a sampler graph attached
+        refresh_nout_lane_flags();
 
         if (nout_st.nout_gate) {
-            if (!sampling.samplers.empty()) {
-                nout_st.nout_enabled = false;
+            if (!nout_st.nout_enabled) {
+
                 LLAMA_LOG_WARN("%s: runtime n_outputs binding DISABLED: backend samplers attached; the gather output feeds build_sampling (PAD +1 row), which the binding does not cover - graphs rebuild at the exact count instead\n", __func__);
             } else {
                 LLAMA_LOG_WARN("%s: runtime n_outputs binding enabled (GGML_TP5_NOUT_REUSE=1, logits extraction only)\n", __func__);
@@ -497,16 +518,17 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         const char * LLAMA_NOUT_FLOOR1_REUSE = getenv("LLAMA_NOUT_FLOOR1_REUSE");
         auto & nout_st = llama_nkv_ctx_state_get(this);
         nout_st.nout1_gate = LLAMA_NOUT_FLOOR1_REUSE != nullptr && strcmp(LLAMA_NOUT_FLOOR1_REUSE, "1") == 0;
-        nout_st.nout1_enabled = nout_st.nout1_gate && !nout_st.nout_gate;
+
+        refresh_nout_lane_flags();
 
         if (nout_st.nout1_gate) {
             if (nout_st.nout_gate) {
                 LLAMA_LOG_WARN("%s: nout floor1 refused: GGML_TP5_NOUT_REUSE envelope lane already armed\n", __func__);
-            } else if (!sampling.samplers.empty()) {
-                nout_st.nout1_enabled = false;
+            } else if (!nout_st.nout1_enabled) {
+
                 LLAMA_LOG_WARN("%s: nout floor1 DISABLED: backend samplers attached; the gather output feeds build_sampling (PAD +1 row), which the bind lane does not cover\n", __func__);
             } else {
-                LLAMA_LOG_WARN("%s: nout floor1 enabled (LLAMA_NOUT_FLOOR1_REUSE=1): graphs build at max(active, 1) rows; 0-output steps bind the floor row to 0\n", __func__);
+                LLAMA_LOG_WARN("%s: nout floor1 enabled (LLAMA_NOUT_FLOOR1_REUSE=1): graphs build at max(active, 1) rows; zero-row execution requires backend validation\n", __func__);
             }
         }
     }
@@ -1418,10 +1440,16 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
+    // The record contains pointers into the old graph. In particular sampler
+    // changes reach this reserve path; the NKV patch must not inspect them
+    // after the previous result is destroyed.
+    auto & nout_state = llama_nkv_ctx_state_get(this);
+    nout_state.record_valid = false;
+    nout_state.record_cap = 0;
+    nout_state.record_bound = 0;
+    llama_nkv_result_owner_update(this, gf_res_prev.get());
     gf_res_prev.reset(new llm_graph_result(max_nodes));
-    // ABI-stable side table: refresh the result->context reverse mapping
-    // (llama-nout-state.cpp) after replacing the long-lived result object
-    llama_nkv_ctx_state_get(this);
+    llama_nkv_result_owner_update(this, nullptr);
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
@@ -2509,12 +2537,37 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+// see llama-context.h: effective nout lane flags track the CURRENT backend
+// sampler set (llama_set_sampler() is callable at any time)
+void llama_context::refresh_nout_lane_flags() {
+    auto & st = llama_nkv_ctx_state_get(this);
+    const bool has_samplers = !sampling.samplers.empty();
+
+    st.nout_enabled  = st.nout_gate  && !has_samplers;
+    st.nout1_enabled = st.nout1_gate && !st.nout_gate && !has_samplers;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
+
+    // the sampler set is part of the nout lanes' safety precondition (a
+    // backend sampler routes the output gather through build_sampling's
+    // PAD(+1 row)); re-derive the effective flags on every change, including
+    // the attachment that happens after context construction
+    const bool lane_was_enabled = llama_nkv_ctx_state_get(this).nout_enabled ||
+                                  llama_nkv_ctx_state_get(this).nout1_enabled;
+    auto done = [&](bool result) {
+        refresh_nout_lane_flags();
+        const auto & lane_st = llama_nkv_ctx_state_get(this);
+        if (lane_was_enabled && !lane_st.nout_enabled && !lane_st.nout1_enabled) {
+            LLAMA_LOG_WARN("%s: nout lane disabled: backend sampler attached; the gather output feeds build_sampling (PAD +1 row), which the bind lane does not cover - graphs rebuild at the exact count instead\n", __func__);
+        }
+        return result;
+    };
 
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         static bool warned = false;
@@ -2526,7 +2579,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             sched_need_reserve = true;
         }
         sampling.samplers.erase(seq_id);
-        return false;
+        return done(false);
     }
 
     const bool can_offload =
@@ -2541,7 +2594,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sched_need_reserve = true;
 
-        return true;
+        return done(true);
     }
 
     if (sampler && !can_offload) {
@@ -2554,14 +2607,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers.erase(seq_id);
 
-        return false;
+        return done(false);
     }
 
     sampling.samplers.erase(seq_id);
 
     sched_need_reserve = true;
 
-    return true;
+    return done(true);
 }
 
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -3121,7 +3174,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     const char * step_miss         = nullptr; // trace-only miss reason
     {
         auto & tst = llama_nkv_ctx_state_get(this);
-        if (tst.t_enabled && tst.nout1_enabled && gtype == LLM_GRAPH_TYPE_DECODER) {
+        if (tst.t_enabled && tst.nout1_enabled && nout_narrowable_graph_type(gtype)) {
             ++tst.t_dec;
             if (graph_reuse_disable) {
                 ++tst.t_miss_disabled;
@@ -3249,7 +3302,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             st.record_bound = cap;   // fresh build: the nkv-coupled shapes are at cap
             ++st.c_env_builds;
         } else if (llama_nkv_ctx_state_get(this).nout_enabled ||
-                   (llama_nkv_ctx_state_get(this).nout1_enabled && gtype == LLM_GRAPH_TYPE_DECODER)) {
+                   (llama_nkv_ctx_state_get(this).nout1_enabled && nout_narrowable_graph_type(gtype))) {
             // the nout bind lane re-plans the scheduler after every bind and
             // restores split-rewritten src[]/allocation state from this record;
             // a nout-only context never takes an env build, so snapshot here or
@@ -3326,7 +3379,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         // floor1 (LLAMA_NOUT_FLOOR1_REUSE) shares the envelope lane's bind +
         // fail-closed rebuild: its graphs build at max(active, 1) rows, so the
         // bind below only ever narrows the built width (never a growth bind)
-        if (llama_nout_runtime_enabled(gparams) || llama_nout1_runtime_enabled(gparams)) {
+        // The lane must be armed for THIS graph type as well: the owner-derived
+        // flags are context-scoped, but the bind contract (output gather over
+        // out_ids, floor1/envelope build width) only holds for the narrowable
+        // decoder-side graphs. Without the graph-type gate the bind path would
+        // run - and fail closed into a second build - on ENCODER and
+        // DECODER_MTP graphs, where neither the floor1 build nor the pre-alloc
+        // record was armed.
+        if ((llama_nout_runtime_enabled(gparams) || llama_nout1_runtime_enabled(gparams)) &&
+            nout_narrowable_graph_type(gtype)) {
             auto & st = llama_nkv_ctx_state_get(this);
             const bool nout1_lane = llama_nout1_runtime_enabled(gparams);
             // The bind re-plans the scheduler and restores split-rewritten
@@ -3372,8 +3433,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                             __func__, n_outputs, res->outputs_envelope());
                     }
                     ++st.nout1_binds;
-                    // r8 trace: a 0-row bind is the floor1 lane executing a
-                    // 0-output step with zero gathered rows (trace-gated)
                     if (st.t_enabled && n_outputs == 0) {
                         ++st.t_bind_zero;
                     }
@@ -3398,19 +3457,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                 } else {
                     ++st.nout_fallbacks;
                 }
-                // r8: this fallback discards the reuse decision the step was
-                // counted on (n_reused was already incremented in the reuse
-                // path above, but the step will compute on the REBUILT graph,
-                // so it is not a compute skip). Correction is trace-gated
-                // (LLAMA_NOUT_FLOOR1_TRACE exact "1"); with the trace off the
-                // r7 counter behavior is preserved bit-for-bit. The fallback
-                // itself is unchanged fail-closed stock semantics: exact
-                // active rows (0-output steps rebuild at 0 rows and truly
-                // execute 0 rows), and the following step's reuse miss is
-                // accepted.
+                // this fallback discards the reuse decision the step was
+                // counted on: n_reused was already incremented in the reuse
+                // path above, but the step computes on the REBUILT graph, so
+                // it is not a reused graph. The rollback is unconditional - it
+                // is a metric correction for llama_perf_context() ("graphs
+                // reused"), not lane behavior, and leaving it under the trace
+                // gate made production report a graph rebuild as a reuse hit.
+                // The fallback itself is unchanged fail-closed semantics:
+                // exact active rows (0-output steps rebuild at 0 rows and
+                // truly execute 0 rows), and the following step's reuse miss
+                // is accepted.
                 step_fell_back = true;
-                auto & tst_fb = llama_nkv_ctx_state_get(this);
-                if (tst_fb.t_enabled && step_reused_final) {
+                if (step_reused_final) {
                     --n_reused;
                 }
                 llm_graph_params p_fallback = graph_params(res, ubatch, mctx, gtype);
@@ -3479,18 +3538,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     // alone never enables anything here.
     {
         auto & tst = llama_nkv_ctx_state_get(this);
-        if (tst.t_enabled && tst.nout1_enabled && gtype == LLM_GRAPH_TYPE_DECODER) {
+        if (tst.t_enabled && tst.nout1_enabled && nout_narrowable_graph_type(gtype)) {
             if (step_reused_final && !step_fell_back) {
                 ++tst.t_compute_skip;
-            } else if (step_fell_back) {
-                ++tst.t_builds_fb;
-                ++tst.t_graph_gen;
-            } else {
+            }
+            if (!step_reused_final) {
                 ++tst.t_builds;
                 ++tst.t_graph_gen;
             }
+            if (step_fell_back) {
+                ++tst.t_builds_fb;
+                ++tst.t_graph_gen;
+            }
             LLAMA_LOG_INFO("NOUT1_FLOOR_STEP step=%llu reuse=%d fell_back=%d bind_rows=%d builds=%llu builds_fb=%llu skip=%llu gen=%llu binds=%zu bind0=%zu fallbacks=%zu\n",
-                (unsigned long long) tst.t_dec, (int) step_reused_final, (int) step_fell_back,
+                (unsigned long long) tst.t_dec, (int) (step_reused_final && !step_fell_back), (int) step_fell_back,
                 step_bind_rows,
                 (unsigned long long) tst.t_builds, (unsigned long long) tst.t_builds_fb,
                 (unsigned long long) tst.t_compute_skip, (unsigned long long) tst.t_graph_gen,
@@ -4681,7 +4742,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
     // built width fails closed to a rebuild. Mutually exclusive with the
     // envelope lane (constructor refuses to co-arm).
     const bool nout1_floor1 = nout_st.nout1_enabled && !nout1_suppressed &&
-        gtype == LLM_GRAPH_TYPE_DECODER;
+        nout_narrowable_graph_type(gtype);
     return {
         /*.arch        =*/model.arch,
         /*.hparams     =*/model.hparams,
@@ -4696,7 +4757,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.cross       =*/&cross,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/nout1_floor1 ? (uint32_t) std::max(n_outputs, 1u) :
-                           nout_envelope && gtype == LLM_GRAPH_TYPE_DECODER ?
+                           nout_envelope && nout_narrowable_graph_type(gtype) ?
             (uint32_t) cparams.n_outputs_max : n_outputs,
 
         /*.cb          =*/graph_get_cb(),

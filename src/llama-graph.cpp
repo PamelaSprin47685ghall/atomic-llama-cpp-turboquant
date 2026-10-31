@@ -1589,8 +1589,8 @@ uint32_t llm_graph_result::outputs_envelope() const {
     return 0;
 }
 
-// Bind counts in [0, envelope]; zero-row execution and backend safety must be
-// validated on each target backend. Backend samplers disable this lane.
+// Bind counts in [0, envelope]. Empty execution still requires validation
+// across scheduler and backend paths; backend samplers disable this lane.
 
 bool llm_graph_result::bind_outputs(uint32_t n_active) {
     // locate the out_ids input
@@ -1609,7 +1609,7 @@ bool llm_graph_result::bind_outputs(uint32_t n_active) {
     ggml_tensor * out_ids_t = out_ids_inp->out_ids;
 
     if (n_active > (uint32_t) out_ids_inp->n_outputs) {
-        return false; // over-envelope: caller rebuilds (zero rows bind below)
+        return false; // over-envelope: rebuild at the active count
     }
 
     ggml_cgraph * gf = get_gf();
@@ -1631,8 +1631,6 @@ bool llm_graph_result::bind_outputs(uint32_t n_active) {
     // plan the row narrowing of the whole output closure; a failure leaves
     // every shape restored (envelope) and rejects the bind: the caller
     // rebuilds the graph at the exact active count (stock behavior).
-    // Zero active rows are accepted: the closure narrows to zero rows and
-    // ggml skips the empty tensors (no padding, no rebuild).
     llama_nout_plan plan;
     if (!llama_nout_plan_bind(gf, out_ids_t, out_ids_inp->n_outputs, n_active, &plan)) {
         return false;

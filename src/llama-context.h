@@ -292,6 +292,14 @@ private:
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
 
+    // Recompute the effective nout lane flags from the current backend-sampler
+    // set. The lanes narrow the graph's output gather; build_sampling()
+    // consumes the same tensor through PAD(+1 row), so a backend sampler
+    // invalidates them. set_sampler() can change the set after construction,
+    // so the flags are derived here on every change instead of being frozen at
+    // init. Pure flag derivation: no graph state is touched.
+    void refresh_nout_lane_flags();
+
     llm_graph_cb graph_get_cb() const;
 
     // union-graph runtime n_kv binder.

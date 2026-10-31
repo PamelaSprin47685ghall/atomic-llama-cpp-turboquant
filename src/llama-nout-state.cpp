@@ -22,24 +22,21 @@
 namespace {
 std::unordered_map<llama_context *, llama_nkv_ctx_state> g_nkv_ctx_state;
 
-// reverse index: which llama_context owns a given llm_graph_result; written
-// by llama_nkv_ctx_state_get() (every context registers on first use, i.e.
-// in its constructor env blocks) and erased together with the main entry
+// Reverse index for the context's current long-lived graph result.
+// Updated explicitly when that result is replaced.
 std::unordered_map<const llm_graph_result *, llama_context *> g_result_owner;
 } // namespace
 
 llama_nkv_ctx_state & llama_nkv_ctx_state_get(llama_context * ctx) {
-    auto [it, inserted] = g_nkv_ctx_state.try_emplace(ctx);
-    if (inserted) {
-        // register the context's long-lived result object for the reverse
-        // lookup used by llama_nout_runtime_enabled(); llama_context keeps
-        // gf_res_prev alive for its whole lifetime (rebuilt only via
-        // graph_reserve(), which calls this again to refresh the mapping)
-        if (llm_graph_result * res = ctx->get_gf_res_prev()) {
-            g_result_owner[res] = ctx;
-        }
+    return g_nkv_ctx_state.try_emplace(ctx).first->second;
+}
+
+void llama_nkv_result_owner_update(llama_context * ctx, const llm_graph_result * old_res) {
+    if (old_res != nullptr) {
+        g_result_owner.erase(old_res);
+    } else if (llm_graph_result * res = ctx->get_gf_res_prev()) {
+        g_result_owner[res] = ctx;
     }
-    return it->second;
 }
 
 void llama_nkv_ctx_state_erase(llama_context * ctx) {
@@ -66,6 +63,9 @@ bool llama_nout_runtime_enabled(const llm_graph_params & params) {
     // derived on the fly instead of stored in llm_graph_params.
     // The owning llama_context is located via the per-context result object
     // (params.res), which llama_context owns for its whole lifetime.
+    if (params.gtype != LLM_GRAPH_TYPE_DEFAULT && params.gtype != LLM_GRAPH_TYPE_DECODER) {
+        return false;
+    }
     const auto it = g_result_owner.find(params.res);
     if (it == g_result_owner.end()) {
         return false; // unregistered result: feature off (fail-closed)
@@ -77,6 +77,9 @@ bool llama_nout1_runtime_enabled(const llm_graph_params & params) {
     // floor1 lane: same owner-map derivation as the envelope lane; the flag is
     // a pure function of the owning context's env state
     // (LLAMA_NOUT_FLOOR1_REUSE == "1", envelope lane off, no backend samplers)
+    if (params.gtype != LLM_GRAPH_TYPE_DEFAULT && params.gtype != LLM_GRAPH_TYPE_DECODER) {
+        return false;
+    }
     const auto it = g_result_owner.find(params.res);
     if (it == g_result_owner.end()) {
         return false; // unregistered result: feature off (fail-closed)

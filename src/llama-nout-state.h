@@ -32,6 +32,7 @@
 struct ggml_tensor;
 struct llama_context;
 struct llm_graph_params;
+struct llm_graph_result;
 
 // per-llama_context state for the union-graph runtime n_kv binder
 // (env: LLAMA_GRAPH_UNION_NKV_RUNTIME) and the runtime n_outputs binding
@@ -54,7 +55,7 @@ struct llama_nkv_ctx_state {
     // ---- nout binding lane (GGML_TP5_NOUT_REUSE, strict value "1") ----
     bool   nout_enabled = false;      // was llama_cparams::graph_union_outputs_runtime
     bool   nout_gate    = false;      // raw env parse ("1"), before the sampler veto
-    size_t nout_binds  = 0;          // successful runtime binds (incl. 0-row)
+    size_t nout_binds  = 0;          // successful runtime binds, including zero
     size_t nout_fallbacks = 0;       // bind failures that fell back to a rebuild
     // one-shot: set by the bind-fail fallback rebuild so the next
     // graph_params() call derives the ACTIVE n_outputs (not the envelope),
@@ -67,14 +68,12 @@ struct llama_nkv_ctx_state {
     // for 0-output steps, the exact active count otherwise. This is NOT an
     // envelope/capacity build: the built width never exceeds the largest
     // active count seen since the last grow-rebuild. The bind lane narrows
-    // the executed output closure to the active count in place (only the
-    // 0-output step ever narrows: built == max(active, 1) >= active); growth
-    // past the built width is refused and falls back to an exact-count
-    // rebuild (stock semantics). Mutually exclusive with the envelope lane
+    // the output closure to the active count; unsupported binds fall back to
+    // an exact-count rebuild. Mutually exclusive with the envelope lane
     // above: the envelope lane owns the reuse machinery when its gate is on.
     bool   nout1_gate      = false;  // raw env parse
     bool   nout1_enabled   = false;  // effective: gate && envelope lane off && no samplers
-    size_t nout1_binds     = 0;      // successful narrowing binds (incl. 0-row)
+    size_t nout1_binds     = 0;      // successful binds, including zero
     size_t nout1_fallbacks = 0;      // bind failures that fell back to a rebuild
     // (suppress: floor1 shares the envelope lane's nout_suppress_envelope
     //  one-shot flag; one flag, one consumption point in graph_params)
@@ -96,13 +95,16 @@ struct llama_nkv_ctx_state {
     uint64_t t_miss_inputs   = 0;      // allow_reuse passed, a graph input refused reuse
     uint64_t t_builds        = 0;      // fresh floor1 decoder builds (non-fallback)
     uint64_t t_builds_fb     = 0;      // bind-failure fallback rebuilds
-    uint64_t t_bind_zero     = 0;      // binds that narrowed the gather to 0 rows
+    uint64_t t_bind_zero     = 0;      // binds that narrowed the gather to zero rows
     uint64_t t_compute_skip  = 0;      // steps that actually computed on a reused graph
     uint64_t t_graph_gen     = 0;      // graph generations: ++ per successful build
 };
 
 // side-table entry for the given context (created on first use)
 llama_nkv_ctx_state & llama_nkv_ctx_state_get(llama_context * ctx);
+
+// Erase old_res before destruction, or register the current result if null.
+void llama_nkv_result_owner_update(llama_context * ctx, const llm_graph_result * old_res);
 
 // held scratch llm_graph_result
 void llama_nkv_ctx_state_erase(llama_context * ctx);
