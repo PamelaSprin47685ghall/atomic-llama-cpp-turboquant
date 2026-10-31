@@ -8548,8 +8548,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
-    const ggml_tensor * rel   = dst->src[5];
-
+    // GGML_TP5_FA_RTLEN: src[5] is either the banded rel logits (F32/F16/BF16,
+    // stock) or the runtime effective KV length (I32[1], exact env gate). The type
+    // disambiguates the two: an I32 src[5] is the nkv_eff bound, never rel.
+    ggml_tensor * rel   = (dst->src[5] && dst->src[5]->type != GGML_TYPE_I32) ? dst->src[5] : nullptr;
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
@@ -8558,6 +8560,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
     GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
     GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    // GGML_TP5_FA_RTLEN: the runtime effective KV length from src[5] (I32[1]).
+    // Derived after the locals so nek1 (k->ne[1]) exists; bounded by the built
+    // width. OFF (no I32 src[5]) == nek1 == stock.
+    const ggml_tensor * n_kv_eff_t = (dst->src[5] && dst->src[5]->type == GGML_TYPE_I32 &&
+                                      ggml_nelements(dst->src[5]) == 1) ? dst->src[5] : nullptr;
+    const int64_t n_kv_eff = n_kv_eff_t ? std::min<int64_t>(((const int32_t *) n_kv_eff_t->data)[0], nek1) : nek1;
 
     const int64_t DK = nek0;
     const int64_t DV = nev0;
@@ -8661,7 +8670,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        // GGML_TP5_FA_RTLEN: the runtime effective KV length from src[5] (I32[1])
+        // is a hard upper bound on this chunk's KV iteration. The caller's
+        // ic_end is already <= n_kv_eff; clamping again keeps the checked-tail
+        // invariant local to this function (OFF: n_kv_eff == nek1, no change).
+        const int64_t ic_end_eff = std::min<int64_t>(ic_end, n_kv_eff);
+        for (int64_t ic = ic_start; ic < ic_end_eff; ++ic) {
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -9150,7 +9164,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
-    const ggml_tensor * rel   = dst->src[5];
+    // GGML_TP5_FA_RTLEN: src[5] is the banded rel logits (F32/F16/BF16, stock) or
+    // the runtime effective KV length (I32[1]); the type disambiguates the two.
+    const ggml_tensor * rel   = (dst->src[5] && dst->src[5]->type != GGML_TYPE_I32) ? dst->src[5] : nullptr;
+    const ggml_tensor * n_kv_eff_t = (dst->src[5] && dst->src[5]->type == GGML_TYPE_I32 &&
+                                      ggml_nelements(dst->src[5]) == 1) ? dst->src[5] : nullptr;
+    // effective length: bounded by the built width (envelope); stock == nek1
+    const int64_t n_kv_eff = n_kv_eff_t ? std::min<int64_t>(((const int32_t *) n_kv_eff_t->data)[0], k->ne[1]) : k->ne[1];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9196,19 +9216,19 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
-        const int64_t chunk_size = (nek1 + nth - 1) / nth;
+        const int64_t chunk_size = (n_kv_eff + nth - 1) / nth;
 
         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
         const int64_t partial_size  = 2 + DV;
         float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
 
         const int64_t ic_start = ith * chunk_size;
-        const int64_t ic_end   = std::min(ic_start + chunk_size, nek1);
+        const int64_t ic_end   = std::min(ic_start + chunk_size, n_kv_eff);
 
         const int64_t partial_stride = nth * partial_size;
         float *       chunk_partials = partials_base + ith * partial_size;
 
-        if (ic_start < nek1) {
+        if (ic_start < n_kv_eff) {
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                     params, dst, q_head, q_head + 1, ic_start, ic_end,
@@ -9269,10 +9289,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             const int64_t ir0 = dr * current_chunk;
             const int64_t ir1 = MIN(ir0 + dr, nr);
 
-            if (use_tiled) {
+            // GGML_TP5_FA_RTLEN: the tiled path iterates the full envelope width
+            // (nek1) with no row checks — force the checked one-chunk path under
+            // rtlen; the envelope rows past n_kv_eff are -INF-masked there.
+            if (use_tiled && n_kv_eff_t == nullptr) {
                 ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
             } else {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, n_kv_eff, nullptr, 0);
             }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);

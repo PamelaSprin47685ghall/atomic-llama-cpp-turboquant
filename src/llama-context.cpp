@@ -8,6 +8,7 @@
 #include "llama-ext.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-nout-state.h"
 #include "llama-io.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
@@ -30,6 +31,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 //
 // llama_context
@@ -101,6 +103,13 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    // per-context union-binder state slot (llama-nout-state.h): NOT created
+    // here eagerly - the constructor reads the env gate below and creates the
+    // slot only when the gate is on, so the OFF path allocates no binder
+    // state. Unique_ptr ownership in llama-context.h: a constructor-body
+    // throw still destroys fully-initialized members, so the slot cannot
+    // leak, and ~llama_context releases it with the context.
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -439,9 +448,90 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
     }
 
+    // Lane gates (independent, each exact "1"; unset or any other value is
+    // stock for that lane):
+    //  - GGML_TP5_UNION_BINDER: the legacy outputs lane (n_outputs binding).
+    //    Kept for old-gate compatibility: with only this gate on, the nkv
+    //    lane is off and n_kv behavior is stock.
+    //  - GGML_TP5_NKV_TRUEWIDTH: the r7 true-width nkv lane. With only this
+    //    gate on, the outputs lane is off and n_outputs behavior is stock.
+    //    With this gate OFF there is NO fallback to any envelope/pad
+    //    behavior: the envelope machinery was removed from the tree, not
+    //    gated, so OFF is stock, not r5.
+    const char * union_binder_env     = getenv("GGML_TP5_UNION_BINDER");
+    const bool   union_binder_gate    = union_binder_env != nullptr && strcmp(union_binder_env, "1") == 0;
+    const char * nkv_truewidth_env    = getenv("GGML_TP5_NKV_TRUEWIDTH");
+    const bool   nkv_truewidth_gate   = nkv_truewidth_env != nullptr && strcmp(nkv_truewidth_env, "1") == 0;
+
+    {
+        // The state slot exists only while at least one lane gate is exactly
+        // "1"; with both gates off the context holds no binder state at all
+        // (OFF = stock, zero alloc).
+        if (union_binder_gate || nkv_truewidth_gate) {
+            auto & nkv_st = llama_nkv_ctx_state_get(this);
+
+            // r7 true-width nkv lane: registered only under its own gate.
+            if (nkv_truewidth_gate) {
+                nkv_st.nkv_enabled = true;
+                if (!nkv_st.union_binder.add({
+                        llama_union_param_kind::n_kv, "n_kv",
+                        &llama_context::union_tensors_n_kv,
+                        &llama_context::union_rebind_n_kv,
+                    })) {
+                    // cannot happen for a valid kind; stay fail-closed anyway
+                    nkv_st.nkv_enabled = false;
+                    LLAMA_LOG_ERROR("%s: failed to register the n_kv union binding; runtime graph patching disabled\n", __func__);
+                }
+            }
+
+            // n_outputs binding: the legacy outputs lane under the old gate.
+            // Bounded binding: only the output-gather closure (out_ids + every
+            // GET_ROWS dst reading it) is reconciled, and only when the graph
+            // builds WITHOUT backend samplers: build_sampling() consumes the
+            // gather output through a PAD (+1 row), which the binding does not
+            // cover. Under the binding, decoder graphs build at the exact
+            // active count and the rebind narrows/restores the executed shapes
+            // within that built width; 0 active outputs is a supported bound
+            // (the stock zero-output topology).
+            if (union_binder_gate) {
+                if (!sampling.samplers.empty()) {
+                    LLAMA_LOG_WARN("%s: n_outputs union binding NOT registered: backend samplers attached; the gather output feeds build_sampling (PAD +1 row), which the binding does not cover - graphs rebuild at the exact count instead\n", __func__);
+                } else if (!nkv_st.union_binder.add({
+                        llama_union_param_kind::n_outputs, "n_outputs",
+                        &llama_context::union_tensors_n_outputs,
+                        &llama_context::union_rebind_outputs,
+                    })) {
+                    // cannot happen for a valid kind; stay fail-closed anyway
+                    LLAMA_LOG_ERROR("%s: failed to register the n_outputs union binding; runtime n_outputs patching disabled\n", __func__);
+                }
+                nkv_st.nout_enabled = nkv_st.union_binder.has(llama_union_param_kind::n_outputs);
+            }
+
+            // r8 coverage lane: exact "1"; the coverage audit and the
+            // binder_bind/graph_rebuild/refused_view counters are active only
+            // with it. The gate alone (both lane gates off) creates no slot
+            // and does nothing.
+            nkv_st.cov_enabled = getenv("GGML_TP5_NKV_COV") != nullptr && strcmp(getenv("GGML_TP5_NKV_COV"), "1") == 0;
+
+            if (nkv_st.nkv_enabled || nkv_st.nout_enabled) {
+                LLAMA_LOG_WARN("%s: union runtime binder enabled (%zu param kind(s) registered: n_kv=%d n_outputs=%d)\n",
+                               __func__, nkv_st.union_binder.size(),
+                               (int) nkv_st.nkv_enabled, (int) nkv_st.nout_enabled);
+            }
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
+    // The legacy LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME lane was replaced by the
+    // n_outputs binding registered above (umbrella gate GGML_TP5_UNION_BINDER
+    // only); the legacy env var is no longer read. A stale value in the
+    // environment is reported, never silently ignored:
+    if (const char * legacy_env = getenv("LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME")) {
+        LLAMA_LOG_WARN("%s: LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME=%s ignored: the legacy outputs lane was replaced by the n_outputs union binding (GGML_TP5_UNION_BINDER=1)\n",
+                       __func__, legacy_env);
+    }
     if (cparams.kv_unified) {
         cparams.n_ctx_seq = cparams.n_ctx;
     } else {
@@ -978,6 +1068,43 @@ llama_context::~llama_context() {
             }
         }
     }
+    // one-line summary at context destruction (runbook contract: exact prefix
+    // NKV_BINDER_STATS, greppable by the HIP gate harness; printed when the
+    // state slot exists and at least one lane gate is exactly "1" - the nkv
+    // counters are 0 when only the legacy outputs gate is on)
+    // (state note: the counters live in the context's own state slot, not in
+    // class data members)
+    {
+        // peek only: never create state during destruction (with the gate off
+        // no slot exists and no stats line prints - stock OFF)
+        const llama_nkv_ctx_state * st = union_binder_state_peek();
+        if (st != nullptr && (st->nkv_enabled || st->nout_enabled)) {
+            if (st->cov_enabled) {
+                // r8 coverage lane: the r7 fields verbatim, then the r8
+                // acceptance counters (binder_bind / graph_rebuild /
+                // refused_view) and the per-category coverage counts
+                // (present in the live record / patched by binds)
+                LLAMA_LOG_INFO("NKV_BINDER_STATS attempts=%zu applied=%zu refused_width=%zu refused_envelope=%zu refused_skeleton=%zu refused_grow=%zu refused_relay=%zu refused_pipeline=%zu fallbacks=%zu record_builds=%zu binder_bind=%zu graph_rebuild=%zu refused_view=%zu\n",
+                               st->c_attempts, st->c_applied, st->c_refused_width, st->c_refused_envelope,
+                               st->c_refused_skeleton, st->c_refused_grow, st->c_refused_relay,
+                               st->c_refused_pipeline, st->c_fallbacks, st->c_record_builds,
+                               st->c_binder_bind, st->c_graph_rebuild, st->c_refused_view);
+                LLAMA_LOG_INFO("NKV_BINDER_COV present(mask/view/rope/kvwrite/fa/other)=%u/%u/%u/%u/%u/%u patched(mask/view/rope/kvwrite/fa/other)=%u/%u/%u/%u/%u/%u\n",
+                               st->cov_present[LLAMA_NKV_COV_MASK], st->cov_present[LLAMA_NKV_COV_VIEW],
+                               st->cov_present[LLAMA_NKV_COV_ROPE], st->cov_present[LLAMA_NKV_COV_KVWRITE],
+                               st->cov_present[LLAMA_NKV_COV_FA], st->cov_present[LLAMA_NKV_COV_OTHER],
+                               st->c_cov_patched[LLAMA_NKV_COV_MASK], st->c_cov_patched[LLAMA_NKV_COV_VIEW],
+                               st->c_cov_patched[LLAMA_NKV_COV_ROPE], st->c_cov_patched[LLAMA_NKV_COV_KVWRITE],
+                               st->c_cov_patched[LLAMA_NKV_COV_FA], st->c_cov_patched[LLAMA_NKV_COV_OTHER]);
+            } else {
+                // r7 line format verbatim (byte-identical without the cov gate)
+                LLAMA_LOG_INFO("NKV_BINDER_STATS attempts=%zu applied=%zu refused_width=%zu refused_envelope=%zu refused_skeleton=%zu refused_grow=%zu refused_relay=%zu refused_pipeline=%zu fallbacks=%zu record_builds=%zu\n",
+                               st->c_attempts, st->c_applied, st->c_refused_width, st->c_refused_envelope,
+                               st->c_refused_skeleton, st->c_refused_grow, st->c_refused_relay,
+                               st->c_refused_pipeline, st->c_fallbacks, st->c_record_builds);
+            }
+    }
+    }
     ggml_opt_free(opt_ctx);
 }
 
@@ -1304,7 +1431,12 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
+    // the new long-lived result object is owned by this context: the union
+    // binder state uses this back-pointer (llama-nout-state.cpp) instead of a
+    // global result -> context reverse map
+    gf_res_prev->set_owner(this);
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    gf_res_reserve->set_owner(this); // same owner invariant for the reserve result
 
     const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
         model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
@@ -2500,6 +2632,753 @@ bool llama_context::set_adapter_cvec(const float * data, size_t len, int32_t n_e
     return res;
 }
 
+// ---- per-context union-binder state slot (llama-nout-state.h) ----
+
+llama_nkv_ctx_state & llama_context::union_binder_state_get() {
+    if (union_binder_state == nullptr) {
+        // one slot per context, owned by the context (no process-global map);
+        // only the constructor's gate blocks create it - OFF allocates nothing
+        union_binder_state.reset(new llama_nkv_ctx_state);
+    }
+    return *union_binder_state;
+}
+
+const llama_nkv_ctx_state * llama_context::union_binder_state_peek() const {
+    return union_binder_state.get();
+}
+
+// union-graph runtime parameter binder: n_kv lane.
+//
+// 1. when the live graph is (re)built, process_ubatch builds it at the KV
+//    cache's CURRENT true n_kv (no envelope, no headroom, no bucket sizing on
+//    this lane's side) and records the graph's pre-allocation skeleton and
+//    per-tensor byte extents in the context's union-binder state slot; the
+//    scheduler allocates exactly that extent;
+// 2. when the KV cache later moves (can_reuse fails only on the stale
+//    n_kv-coupled shapes), union_rebind_n_kv builds a scratch graph at the
+//    cache's CURRENT n_kv and requires an exact skeleton match against the
+//    recorded live graph;
+// 3. a move to a smaller n_kv fits inside the recorded extents (the
+//    nkv-coupled shapes shrink with n_kv) and is patched in place; a move
+//    past the built width has no allocated backing and is refused - the
+//    caller full-rebuilds at the cache's exact current n_kv and the fresh
+//    build re-records. The binder never pads or rounds: it binds exactly the
+//    value get_n_kv() reports, so any bucket alignment still present is the
+//    stock cache-level pad (llama_kv_cache::get_n_kv), unchanged for OFF and
+//    ON alike;
+// 4. the changed fields (ne/nb/op_params/view_offs + view data pointers) are
+//    copied into the live graph in place, then set_inputs refills the KQ mask
+//    at the live width (cells beyond the applied n_kv are empty -> -INF
+//    masked).
+// Any mismatch -> false and the caller falls through to the normal full
+// rebuild at the cache's exact current n_kv.
+
+
+namespace {
+
+struct llama_nkv_record_t {
+    // DFS post-order: nodes and, before each, its not-yet-seen sources / view source
+    std::vector<ggml_tensor *> t;
+    std::vector<int32_t>       src;   // (GGML_MAX_SRC + 1) entries per tensor, view source last
+    std::vector<uint8_t>       fixed; // pre-existing storage (weights, KV cache)
+    std::vector<size_t>        bytes; // byte envelope of each graph-owned tensor
+
+    void record(ggml_cgraph * gf) {
+        t.clear();
+        src.clear();
+        fixed.clear();
+        bytes.clear();
+
+        std::unordered_map<const ggml_tensor *, int32_t> idx;
+        std::unordered_map<const ggml_tensor *, uint8_t> seen;
+        idx.reserve(4 * (size_t) ggml_graph_n_nodes(gf) + 16);
+        seen.reserve(4 * (size_t) ggml_graph_n_nodes(gf) + 16);
+
+        std::vector<std::pair<ggml_tensor *, int>> stack;
+
+        auto add = [&](ggml_tensor * root) {
+            if (root == nullptr || seen.count(root)) {
+                return;
+            }
+            stack.clear();
+            stack.push_back({ root, 0 });
+            seen[root] = 1;
+            while (!stack.empty()) {
+                ggml_tensor * x = stack.back().first;
+                // fixed = pre-existing storage (weights, KV cache); views created by
+                // this build are graph-owned
+                const bool is_fixed = x->view_src == nullptr && (x->data != nullptr || x->buffer != nullptr);
+
+                bool pushed = false;
+                while (!is_fixed && stack.back().second <= GGML_MAX_SRC) {
+                    const int k = stack.back().second++;
+                    ggml_tensor * s = k < GGML_MAX_SRC ? x->src[k] : x->view_src;
+                    if (s != nullptr && !seen.count(s)) {
+                        seen[s] = 1;
+                        stack.push_back({ s, 0 });
+                        pushed = true;
+                        break;
+                    }
+                }
+                if (pushed) {
+                    continue;
+                }
+                stack.pop_back();
+
+                const int32_t id = (int32_t) t.size();
+                idx[x] = id;
+                t.push_back(x);
+                fixed.push_back(is_fixed ? 1 : 0);
+
+                for (int j = 0; j <= GGML_MAX_SRC; ++j) {
+                    ggml_tensor * s = is_fixed ? nullptr : (j < GGML_MAX_SRC ? x->src[j] : x->view_src);
+                    int32_t v = -1;
+                    if (s != nullptr) {
+                        auto it = idx.find(s);
+                        v = it != idx.end() ? it->second : -2; // -2: back-edge (on DFS stack)
+                    }
+                    src.push_back(v);
+                }
+            }
+        };
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            add(ggml_graph_node(gf, i));
+        }
+    }
+
+    void record_bytes() {
+        bytes.assign(t.size(), 0);
+        for (size_t k = 0; k < t.size(); ++k) {
+            if (!fixed[k] && t[k]->view_src == nullptr) {
+                bytes[k] = ggml_nbytes(t[k]);
+            }
+        }
+    }
+};
+} // namespace
+
+// record the pre-allocation skeleton + byte extents of a freshly built (not
+// yet sched-placed) graph into the context's union-binder state slot; ONE
+// record serves both lanes (nkv + n_outputs) of the latest fresh build
+// (state note: was llama_context::nkv_record_* data members; now lives in the
+// context's own state slot)
+void llama_context::binder_record_snapshot(ggml_cgraph * gf, uint32_t nkv_built) {
+    llama_nkv_record_t rec;
+    rec.record(gf);
+    rec.record_bytes();
+
+    auto & st = llama_nkv_ctx_state_get(this);
+    st.record_t     = std::move(rec.t);
+    st.record_src   = std::move(rec.src);
+    st.record_fixed = std::move(rec.fixed);
+    st.record_bytes = std::move(rec.bytes);
+
+    // r8 coverage lane: classify the recorded nkv-coupled tensor families
+    // (structural: op / flags / name / first dim vs the built width; see
+    // llama_nkv_cov_classify in llama-nout-state.h). ACCOUNTING ONLY: the
+    // counts describe which nkv-coupled families the LIVE record contains;
+    // they are acceptance bookkeeping, not per-op correctness or coverage
+    // evidence. Reset per record: cov_present always describes the CURRENT
+    // live record, never an accumulation. OFF (cov gate not exactly "1"):
+    // no walk - the r7 record is untouched.
+    if (st.cov_enabled) {
+        st.cov_nkv_built = nkv_built;   // the classifier's width reference for this record
+        memset(st.cov_present, 0, sizeof(st.cov_present));
+        for (size_t k = 0; k < st.record_t.size(); ++k) {
+            const ggml_tensor * t = st.record_t[k];
+            const int32_t s0 = st.record_src[k * (GGML_MAX_SRC + 1) + 0];
+            const int32_t vs = st.record_src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
+            ++st.cov_present[llama_nkv_cov_classify((int32_t) t->op, t->name,
+                                                    (t->flags & GGML_TENSOR_FLAG_INPUT) != 0,
+                                                    st.record_fixed[k] != 0,
+                                                    s0 >= 0 && st.record_fixed[s0] != 0,
+                                                    vs >= 0 && st.record_fixed[vs] != 0,
+                                                    t->ne[0], nkv_built)];
+        }
+    }
+}
+
+// table-driven dispatch: kind -> tensor set provider -> rebind operation
+bool llama_union_binder::rebind(llama_union_param_kind kind,
+                                llama_context * ctx,
+                                llm_graph_result * res,
+                                const llm_graph_params & params) const {
+    const llama_union_binding * binding = get(kind);
+    if (binding == nullptr || binding->tensor_set == nullptr || binding->rebind == nullptr) {
+        return false;
+    }
+    const llama_union_tensor_set set = (ctx->*(binding->tensor_set))();
+    return (ctx->*(binding->rebind))(res, params, set);
+}
+
+// n_kv binding: the recorded skeleton + byte extents of the latest fresh build
+llama_union_tensor_set llama_context::union_tensors_n_kv() {
+    auto & st = llama_nkv_ctx_state_get(this);
+    return { &st.record_t, &st.record_src, &st.record_fixed, &st.record_bytes };
+}
+
+bool llama_context::union_rebind_n_kv(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set) {
+    // the record vectors come from the binding's tensor set provider; alias them
+    // once (all later reads/writes go through these names)
+    const std::vector<ggml_tensor *> & record_t     = *set.tensors;
+    const std::vector<int32_t>       & record_src   = *set.src;
+    const std::vector<uint8_t>       & record_fixed = *set.fixed;
+    const std::vector<size_t>        & record_bytes = *set.bytes;
+
+    auto & st = llama_nkv_ctx_state_get(this);
+
+    // NKV_BINDER_STATS: every binder invocation counts as an attempt
+    ++st.c_attempts;
+
+    if (!res || res->get_gf() == nullptr) {
+        ++st.c_fallbacks;
+        return false;
+    }
+    // the binder needs the pre-allocation record of the latest fresh build
+    if (!st.record_valid || record_t.empty()) {
+        ++st.c_fallbacks;
+        return false;
+    }
+    // tp5-relay pins host graph buffers and validates every node's scheduler
+    // placement after the rebuild; in-place n_kv patching is out of its contract
+    if (backend_tp5_relay != nullptr || cparams.pipeline_parallel) {
+        if (backend_tp5_relay != nullptr) {
+            ++st.c_refused_relay;
+        }
+        if (cparams.pipeline_parallel) {
+            ++st.c_refused_pipeline;
+        }
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    // collect every KV-cache context whose n_kv shapes this graph
+    const llama_kv_cache_context * kvs[2] = { nullptr, nullptr };
+    int nkvs = 0;
+    if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(params.mctx)) {
+        kvs[nkvs++] = h->get_attn();
+    } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(params.mctx)) {
+        kvs[nkvs++] = k;
+    }
+    if (nkvs == 0) {
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    uint32_t nkv_now = kvs[0]->get_n_kv();
+    for (int i = 1; i < nkvs; ++i) {
+        if (kvs[i]->get_n_kv() != nkv_now) {
+            nkv_now = 0;
+        }
+    }
+    // one well-defined width: nkv_now was zeroed above when the sub-caches
+    // disagree; an empty cache has no width to bind either. No alignment or
+    // rounding here - the binder binds exactly the value the cache reports
+    // (any bucket padding is the stock cache-level pad, unchanged for OFF
+    // and ON alike)
+    if (nkv_now == 0) {
+        ++st.c_refused_width;
+        ++st.c_fallbacks;
+        return false;
+    }
+    // r8 coverage lane: fail-closed on attention-view readers (the "view"
+    // family's reader subpath). Reader inputs capture build-time spans/values
+    // (llama-graph.cpp, build_attn_inp_kv_impl -> readers); the in-place patch
+    // copies tensor layouts only - it cannot re-resolve captured reader
+    // values - and the skeleton compare checks sizes only, so a frontier
+    // change with equal reader sizes would patch the graph and then write
+    // stale captured values at set_input. Refuse and let the caller
+    // full-rebuild (the fresh build re-resolves the readers at the current
+    // frontier). OFF (cov gate not exactly "1"): r7 behavior - unchanged.
+    if (st.cov_enabled) {
+        bool attn_views = false;
+        for (int i = 0; i < nkvs; ++i) {
+            attn_views |= kvs[i]->has_attention_views();
+        }
+        if (attn_views) {
+            ++st.c_refused_view;
+            ++st.c_fallbacks;
+            return false;
+        }
+    }
+    // non-nkv graph keys must be identical: allow_reuse compares every graph-
+    // shaping input EXCEPT the n_kv-coupled shapes (ubatch layout, sequence
+    // ids, output flags, samplers, adapters, cross, cparams flags, arch,
+    // gtype). Without this gate, a non-nkv difference whose node skeleton
+    // happens to match could be patched while the live graph's recorded
+    // params (and its set_inputs closures) still reflect the old keys.
+    // NOTE: the caller only invokes the binder when can_reuse already failed,
+    // so this rejects precisely the "reuse failed for a NON-nkv reason" case.
+    // (encapsulation: llm_graph_result::params stays private; the
+    // get_params() accessor adds no data member)
+    if (!res->get_params().allow_reuse(params)) {
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+    // true-width window: the live graph was built and sched-allocated AT
+    // record_cap (the cache's exact n_kv at build time - no envelope), so
+    // only n_kv <= record_cap has real backing. record_bound tracks the width
+    // the live graph's nkv-coupled shapes are CURRENTLY bound at (it moves on
+    // every successful patch and equals record_cap right after a fresh
+    // build), so:
+    // - equality with the bound width is a true no-op (a patch would be an
+    //   exact no-op; the normal reuse path usually takes this case first, but
+    //   stay fail-closed);
+    // - anything above the built width has no allocated backing -> full
+    //   rebuild at the cache's exact current n_kv (which re-records).
+    if (nkv_now > st.record_cap) {
+        ++st.c_refused_grow;
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (nkv_now == st.record_bound) {
+        // the live graph's nkv-coupled shapes are already bound at exactly
+        // this width: a patch would be an exact no-op. This compares against
+        // record_bound (the current bound width); a grow-back to the built
+        // width after a shrink patch is a real bind, not a no-op
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    // scratch build at the cache's CURRENT n_kv. Everything except the
+    // nkv-coupled shapes must match; the shared scratch-validate-patch tail
+    // is the definitive gate: a skeleton match proves the only difference is
+    // nkv-coupled shapes (the scratch is built at the live graph's CURRENT
+    // bound output width), and the byte-extent checks prove the placement
+    // still fits.
+    llm_graph_params gp = params;
+    // build the scratch at the live graph's CURRENT bound output width
+    // (nout_bound), never at this ubatch's active count (params.n_outputs
+    // holds the requested count) - so the patch leaves every output shape
+    // untouched
+    gp.n_outputs = st.nout_bound;
+    if (!union_binder_scratch_patch(res, std::move(gp), set, st.cov_enabled ? st.cov_pending : nullptr)) {
+        return false;
+    }
+    st.record_bound = nkv_now;   // the live graph's nkv-coupled shapes are now bound at nkv_now
+    ++st.c_applied;
+    // Coverage remains staged until output reconciliation and scheduler allocation succeed.
+    return true;
+}
+
+// n_outputs binding: shares the nkv lane's pre-allocation record (one live
+// graph, one fresh-build record)
+llama_union_tensor_set llama_context::union_tensors_n_outputs() {
+    auto & st = llama_nkv_ctx_state_get(this);
+    return { &st.record_t, &st.record_src, &st.record_fixed, &st.record_bytes };
+}
+
+// n_outputs binding: narrow/restore the executed output shapes of the live
+// build to this ubatch's active count. The live graph was built and
+// sched-allocated at the EXACT active count of its build round (no
+// pad-to-max, no envelope - the stock out_ids topology); its out_ids input
+// and every GET_ROWS dst reading it currently hold nout_bound (the LAST
+// bound active count). This rebind:
+//   1. requires the same placement contracts as the nkv lane (fail-closed);
+//   2. requires the kv side of the live graph to be consistent (the scratch
+//      build must NOT touch nkv-coupled shapes - that is the n_kv lane's job);
+//   3. builds a scratch graph at the active count (plain n_outputs - no
+//      envelope);
+//   4. requires an exact skeleton match against the recorded live build
+//      (any topology difference -> caller rebuilds);
+//   5. checks every changed tensor fits its recorded byte extent;
+//   6. copies the changed fields into the live graph in place.
+// n_outputs == 0 is a first-class bound: the scratch build is the stock
+// zero-output topology (the gather over an empty out_ids), the skeleton
+// matches, and every narrowed tensor has nbytes 0 - the graph computes zero
+// output rows, exactly like a stock zero-output build.
+bool llama_context::union_rebind_outputs(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set) {
+    auto & st = llama_nkv_ctx_state_get(this);
+
+    // NKV_BINDER_STATS: every binder invocation counts as an attempt
+    ++st.c_attempts;
+
+    if (!res || res->get_gf() == nullptr) {
+        ++st.c_fallbacks;
+        return false;
+    }
+    // the binder needs the pre-allocation record of a live decoder build
+    if (!st.nout_record_valid || set.tensors->empty()) {
+        ++st.c_fallbacks;
+        return false;
+    }
+    // the live graph must actually carry an out_ids gather input (pooling /
+    // embedding-only graphs have none): nothing to reconcile -> fail closed
+    {
+        bool has_out_ids = false;
+        for (const auto & input : res->inputs) {
+            if (dynamic_cast<const llm_graph_input_out_ids *>(input.get()) != nullptr) {
+                has_out_ids = true;
+                break;
+            }
+        }
+        if (!has_out_ids) {
+            ++st.c_refused_skeleton;
+            ++st.c_fallbacks;
+            return false;
+        }
+    }
+    // tp5-relay pins host graph buffers and validates every node's scheduler
+    // placement after the rebuild; in-place n_outputs patching is out of its
+    // contract (same as the nkv lane)
+    if (backend_tp5_relay != nullptr || cparams.pipeline_parallel) {
+        if (backend_tp5_relay != nullptr) {
+            ++st.c_refused_relay;
+        }
+        if (cparams.pipeline_parallel) {
+            ++st.c_refused_pipeline;
+        }
+        ++st.c_fallbacks;
+        return false;
+    }
+    // non-nkv graph keys must be identical: normalize the n_outputs key (the
+    // graph is built at the exact active count; the ACTIVE count is exactly
+    // what THIS rebind reconciles)
+    {
+        llm_graph_params pk = params;
+        pk.n_outputs = res->get_params().n_outputs;
+        if (!res->get_params().allow_reuse(pk)) {
+            ++st.c_refused_skeleton;
+            ++st.c_fallbacks;
+            return false;
+        }
+    }
+    // no-op: the executed output shapes already hold this active count
+    if ((uint32_t) n_outputs == st.nout_bound) {
+        ++st.c_fallbacks;
+        return false;
+    }
+    // growth past the built width has no allocated backing; cannot normally
+    // happen (the live graph was built at a previous active count and this
+    // rebind only moves the executed shapes within [0, nout_cap]) but stay
+    // fail-closed
+    if ((uint32_t) n_outputs > st.nout_cap) {
+        ++st.c_refused_grow;
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    // kv consistency: when the nkv lane has a live record, the scratch build
+    // runs at the cache's CURRENT n_kv and the live graph's nkv-coupled
+    // shapes are bound at record_bound - they must agree (the nkv lane binds
+    // first when the cache moved, or nothing moved), otherwise output shapes
+    // would be patched onto a kv side bound at another width: fail closed,
+    // caller rebuilds. This also refuses the combined "kv grew past the
+    // built width + outputs changed" round.
+    // When the nkv lane has NO live record (lane off, or no KV-cache
+    // context in this graph), no in-place nkv patching can have happened:
+    // the live kv shapes are exactly what the last fresh build produced and
+    // can_reuse (live-ne keys, llama-graph.cpp) already refused any mismatch
+    // with the cache - the check is skipped, not forced to a 0-bound
+    // rejection (an unconditional check would refuse every round when the
+    // legacy outputs gate runs alone, since record_bound stays 0 there).
+    const llama_kv_cache_context * kvs[2] = { nullptr, nullptr };
+    int nkvs = 0;
+    if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(params.mctx)) {
+        kvs[nkvs++] = h->get_attn();
+    } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(params.mctx)) {
+        kvs[nkvs++] = k;
+    }
+    if (nkvs > 0 && st.nkv_enabled && st.record_valid) {
+
+        uint32_t nkv_now = kvs[0]->get_n_kv();
+        for (int i = 1; i < nkvs; ++i) {
+            if (kvs[i]->get_n_kv() != nkv_now) {
+                nkv_now = 0;
+            }
+        }
+        if (nkv_now != st.record_bound) {
+            ++st.c_refused_width;
+            ++st.c_fallbacks;
+            return false;
+        }
+    }
+
+    // scratch build at the active count (plain n_outputs - no envelope)
+    llm_graph_params gp = params;
+    gp.n_outputs = (uint32_t) n_outputs;
+
+    const bool ok = union_binder_scratch_patch(res, std::move(gp), set, nullptr);
+    if (!ok) {
+        return false;
+    }
+
+    st.nout_bound = (uint32_t) n_outputs;   // the executed output shapes now hold this count
+    // r8: the shared scratch tail no longer bumps c_applied (the r7 tail bump
+    // double-counted the nkv lane); each caller counts its own success. This
+    // is the FINAL success point for the n_outputs lane: everything after it
+    // can only fail via the caller's alloc-failure rollback, which unwinds
+    // this increment (--c_applied per rolled-back lane).
+    ++st.c_applied;
+    ++st.nout_binds;
+    return true;
+}
+
+// shared scratch-validate-patch tail of every union binding (nkv + n_outputs):
+// build the scratch graph from gp, require an exact skeleton match against the
+// recorded fresh build, check every changed tensor fits its recorded byte
+// extent, and copy the changed fields into the live graph in place. Any
+// mismatch leaves the live graph untouched and returns false (the caller falls
+// back to a full rebuild). Takes gp by value: the caller sets res/n_outputs
+// before dispatching. cov_patched_out (r8 coverage lane, may be null): when
+// non-null, the apply loop classifies every changed tensor into its
+// nkv-coupled coverage category (llama_nkv_cov_classify) and accumulates the
+// per-category count into a LOCAL array that is published into the caller's
+// array only at the final success return - a refused patch can never leak
+// counts (no bump-on-fail); null keeps the accounting off.
+bool llama_context::union_binder_scratch_patch(llm_graph_result * res, llm_graph_params gp, const llama_union_tensor_set & set, uint32_t * cov_patched_out) {
+    auto & st = llama_nkv_ctx_state_get(this);
+
+    uint32_t cov_local[LLAMA_NKV_COV_N] = {};   // r8: staged per-category counts (published at the final return)
+
+    // the record vectors come from the binding's tensor set provider; alias them
+    // once (all later reads/writes go through these names)
+    const std::vector<ggml_tensor *> & record_t     = *set.tensors;
+    const std::vector<int32_t>       & record_src   = *set.src;
+    const std::vector<uint8_t>       & record_fixed = *set.fixed;
+    const std::vector<size_t>        & record_bytes = *set.bytes;
+
+    llm_graph_result_ptr & nkv_scratch = *reinterpret_cast<llm_graph_result_ptr *>(&st.nkv_scratch);
+    if (!nkv_scratch) {
+        nkv_scratch.reset(new llm_graph_result(res->get_max_nodes()));
+    }
+    nkv_scratch->reset();
+
+    // naming-only callback: the real callback pins tensors on the scheduler, which a
+    // never-placed scratch graph must not touch
+
+    gp.res = nkv_scratch.get();
+    gp.cb = [](const llama_ubatch &, ggml_tensor * cur, const char * name, int il) {
+        if (il >= 0) {
+            ggml_format_name(cur, "%s-%d", name, il);
+        } else {
+            ggml_set_name(cur, name);
+        }
+    };
+
+    ggml_cgraph * gs = model.build_graph(gp);
+    if (gs == nullptr) {
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    llama_nkv_record_t rec_new;
+    rec_new.record(gs);
+    rec_new.record_bytes(); // envelope sizes for the shrink-only byte checks below
+
+    const size_t n = record_t.size();
+    if (rec_new.t.size() != n || rec_new.src != record_src ||
+            rec_new.fixed != record_fixed || rec_new.bytes.size() != record_bytes.size()) {
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    // exact skeleton + every changed field fits: copy in place
+    for (size_t k = 0; k < n; ++k) {
+        ggml_tensor * s = rec_new.t[k];
+        ggml_tensor * d = record_t[k];
+
+        if (record_fixed[k]) {
+            // pre-existing storage (weights, KV cache): the scratch build must
+            // reference the very same tensor object
+            if (s != d) {
+                ++st.c_refused_skeleton;
+                ++st.c_fallbacks;
+                return false;
+            }
+            continue;
+        }
+
+        if (s->op != d->op || s->type != d->type ||
+                strncmp(s->name, d->name, GGML_MAX_NAME) != 0 ||
+                (s->view_src == nullptr) != (d->view_src == nullptr)) {
+            ++st.c_refused_skeleton;
+            ++st.c_fallbacks;
+            return false;
+        }
+
+        if (s->view_src == nullptr) {
+            // graph-owned tensor: must fit inside the envelope the scheduler
+            // allocated the live tensor at (shrink-only)
+            if (ggml_nbytes(s) > record_bytes[k]) {
+                ++st.c_refused_envelope;
+                ++st.c_fallbacks;
+                return false;
+            }
+        } else {
+            // 0-byte view can have a nonzero view_offs (static slicing); no bytes
+            // are accessed, so skip the range check (avoids false OOB rejections)
+            if (ggml_nbytes(s) == 0) {
+                continue;
+            }
+            const int32_t vs = rec_new.src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
+            if (vs < 0) {
+                ++st.c_refused_skeleton;
+                ++st.c_fallbacks;
+                return false;
+            }
+            // the limit is the full byte size of the view's source: a fixed source
+            // (KV cache) has no recorded envelope, its allocation is exact
+            const size_t lim = record_fixed[vs] ? ggml_nbytes(record_t[vs]) : record_bytes[vs];
+            if (s->view_offs + ggml_nbytes(s) > lim) {
+                ++st.c_refused_envelope;
+                ++st.c_fallbacks;
+                return false;
+            }
+        }
+    }
+
+    // apply: copy every changed tensor's layout into the live graph
+    for (size_t k = 0; k < n; ++k) {
+        if (record_fixed[k]) {
+            continue;
+        }
+        ggml_tensor * s = rec_new.t[k];
+        ggml_tensor * d = record_t[k];
+
+        const bool diff = memcmp(s->ne, d->ne, sizeof(d->ne)) != 0 ||
+                          memcmp(s->nb, d->nb, sizeof(d->nb)) != 0 ||
+                          memcmp(s->op_params, d->op_params, sizeof(d->op_params)) != 0 ||
+                          s->view_offs != d->view_offs;
+        if (!diff) {
+            continue;
+        }
+
+        // r8 coverage lane: classify BEFORE the copy (the mask rule keys on
+        // the record-time first dim == the recorded built width); the copy
+        // below overwrites d->ne with the scratch's shapes
+        int cov_cat = LLAMA_NKV_COV_OTHER;
+        if (cov_patched_out != nullptr) {
+            const int32_t s0 = record_src[k * (GGML_MAX_SRC + 1) + 0];
+            const int32_t vs = record_src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
+            cov_cat = llama_nkv_cov_classify((int32_t) s->op, s->name,
+                                             (s->flags & GGML_TENSOR_FLAG_INPUT) != 0,
+                                             record_fixed[k] != 0,
+                                             s0 >= 0 && record_fixed[s0] != 0,
+                                             vs >= 0 && record_fixed[vs] != 0,
+                                             d->ne[0], st.cov_nkv_built);
+        }
+        memcpy(d->ne, s->ne, sizeof(d->ne));
+        memcpy(d->nb, s->nb, sizeof(d->nb));
+        memcpy(d->op_params, s->op_params, sizeof(d->op_params));
+        d->view_offs = s->view_offs;
+        if (d->view_src != nullptr && d->view_src->data != nullptr) {
+            d->data = (char *) d->view_src->data + d->view_offs;
+        }
+
+        if (cov_patched_out != nullptr) {
+            ++cov_local[cov_cat];   // staged: published only at the final return
+        }
+    }
+
+    // restore: the previous alloc_graph's split_graph pass 5 (ggml-backend.cpp,
+    // "node->src[j] = tensor_id_copy(...)") rewrote the LIVE graph's node src[]
+    // to point at sched->ctx-owned split-input copies. ggml_backend_sched_reset
+    // + alloc_graph re-runs split_graph on this same live graph, and the freed
+    // copy structs' stale buffer/data fields then poison the re-derivation (the
+    // freed input_cpy is treated as a pre-allocated tensor of the GPU backend,
+    // so no new copy is created for it and the node keeps a freed struct as its
+    // source -> garbage ids read at compute -> OOB). The record was taken
+    // pre-alloc (binder_record_snapshot, before the first alloc_graph), so it
+    // holds the pristine build-time topology: restore every non-fixed recorded
+    // tensor's src[]/view_src from it. Fixed tensors (weights, KV cache) are
+    // never rewritten by split_graph and are skipped. -1 = null src (unchanged),
+    // -2 = back-edge (impossible in a build DAG; leave the pointer untouched).
+    // Pure pointer fix-up from the same vectors the skeleton compare validated:
+    // no new failure mode, and the OFF path never enters this function.
+    for (size_t k = 0; k < n; ++k) {
+        if (record_fixed[k]) {
+            continue;
+        }
+        const int32_t vsrc = record_src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
+        if (vsrc >= 0) {
+            record_t[k]->view_src = record_t[vsrc];
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const int32_t v = record_src[k * (GGML_MAX_SRC + 1) + j];
+            if (v >= 0) {
+                record_t[k]->src[j] = record_t[v];
+            }
+        }
+    }
+
+    // clear stale allocation state: the previous alloc_graph's gallocr wrote
+    // buffer/data (and, for CPU-side buffers, extra) into every graph-owned
+    // tensor of this LIVE graph. The re-plan below (sched_reset +
+    // alloc_graph) re-runs split_graph on the same graph, and pass 1
+    // (ggml-backend.cpp, ggml_backend_sched_backend_id_from_cur ->
+    // ggml_backend_sched_backend_from_buffer) treats any tensor with a
+    // non-NULL buffer (directly or via view_src) as PRE-ALLOCATED: it derives
+    // the backend from the stale buffer instead of the op, and when no
+    // backend both owns that buffer type and supports the op it GGML_ABORTs
+    // ("pre-allocated tensor ... cannot run the operation"). The stale
+    // buffer/data also poison supports_op's src[] scan (a freed split-copy
+    // struct's buffer/buft is undefined). Clearing buffer/data/extra on the
+    // graph-owned tensors restores the fresh-build state the re-plan expects:
+    //   - split_graph pass 1 then assigns backends by op, as on a fresh graph;
+    //   - gallocr re-assigns storage: ggml_gallocr_init_tensor (ggml-alloc.c)
+    //     re-runs ggml_backend_view_init for views (buffer==NULL) and
+    //     ggml_vbuffer_tensor_alloc for base tensors (data==NULL), and
+    //     ggml_gallocr_needs_realloc falls back to a full reserve when a
+    //     cleared tensor's size no longer fits its recorded size_max - so no
+    //     cleared tensor can reach compute unallocated;
+    //   - extra is only ever written by CPU-side buffer init_tensor hooks
+    //     (repack/amx) and never read on GPU paths; clearing it is safe and
+    //     keeps the tensor byte-identical to a fresh build.
+    // Scope (matches the GPU-verified probe semantics): every recorded tensor
+    // that is NOT fixed (fixed = pre-existing storage: weights, KV cache) and
+    // NOT a view of a fixed tensor (KV-cache views keep their fixed source's
+    // live buffer/data; their own buffer/data were also gallocr-assigned but
+    // their view_src is never rewritten, and the re-plan re-inits them via
+    // ggml_backend_view_init only if their buffer is NULL - so leave them
+    // alone, exactly like the probe). Fixed tensors are never touched.
+    for (size_t k = 0; k < n; ++k) {
+        if (record_fixed[k]) {
+            continue;
+        }
+        const int32_t vsrc = record_src[k * (GGML_MAX_SRC + 1) + GGML_MAX_SRC];
+        if (vsrc >= 0 && record_fixed[vsrc]) {
+            // view of a fixed tensor (KV view): keep its buffer/data
+            continue;
+        }
+        ggml_tensor * d = record_t[k];
+        d->buffer = nullptr;
+        d->data   = nullptr;
+        d->extra  = nullptr;
+    }
+    nkv_scratch->reset();
+    // r8: success counting moved to the CALLERS (union_rebind_n_kv bumps
+    // c_applied for the nkv lane, union_rebind_outputs for the n_outputs
+    // lane). The r7 tail bump double-counted every nkv bind (the caller
+    // bumps too), which broke attempts == applied + fallbacks on every
+    // successful bind; the r8 counters fix the identity.
+    // r8 coverage lane: publish the local per-category counts only now - the
+    // patch is committed past every failure path (skeleton/envelope checks
+    // all ran before the apply loop; the restore/clear loops cannot fail), so
+    // a refused patch can never leak counts into the caller's array.
+    if (cov_patched_out != nullptr) {
+        for (int c = 0; c < LLAMA_NKV_COV_N; ++c) {
+            cov_patched_out[c] = cov_local[c];
+        }
+    }
+    return true;
+}
+
+// GGML_TP5_FA_NKV_PARAM (exact "1", r8): per-request true runtime KV length.
+// The FA op param is written at graph build, so the gate must keep every
+// reuse/patch/envelope path off: a reused or patched graph would carry the
+// previous eval's param value and the kernels would read a stale bound.
+static bool llama_ctx_fa_nkv_param_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_TP5_FA_NKV_PARAM");
+        return env != nullptr && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch,
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
@@ -2561,24 +3440,204 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    bool reused = !graph_reuse_disable && !llama_ctx_fa_nkv_param_enabled() && res->can_reuse(gparams);
+
+    // set only when an in-place patch (below) succeeded: the scheduler's
+    // split-input copies were created during the PREVIOUS alloc_graph and still
+    // carry the pre-patch layout, so they must be re-planned before compute.
+    bool nkv_patched  = false;
+    bool nout_patched = false;
+
+    // n_outputs lane: the live graph is bound at nout_bound (the LAST bound
+    // active count); when this ubatch needs a different count and the
+    // n_outputs binding is registered, the binder must reconcile it
+    // (can_reuse keys the out_ids input on the count at BUILD time, so a
+    // changed count fails the stock key and the bound-vs-active difference
+    // forces the dispatch; a narrowed graph reused at its built count is
+    // re-narrowed here before any compute).
+    auto * binder_st = union_binder_state_peek();
+    const bool nout_lane = binder_st != nullptr && binder_st->nout_enabled;
+    const bool nout_pending = nout_lane && binder_st->nout_bound != (uint32_t) n_outputs;
+    // stale-bound guard: the build-time can_reuse keys mix live tensor shapes
+    // (can_reuse_kq_mask compares kq_mask->ne[0] against the cache's CURRENT
+    // get_n_kv(), llama-graph.cpp:95-101) with build-time members
+    // (llm_graph_input_out_ids::can_reuse compares the BUILD count,
+    // llama-graph.cpp:277). An in-place patch moves the live shapes without
+    // touching the build record, so a "reusable" verdict can coexist with a
+    // bound state that differs from this round's values: e.g. n_outputs
+    // returns to the build count after a narrow bind - the out_ids key
+    // passes, while the executed gather shapes still hold the narrowed width
+    // (missing outputs / OOB gather). Reuse is trusted only when every
+    // enabled lane's bound state equals the current value; otherwise fall
+    // through to the binder (restore within the built width) or a fail-
+    // closed full rebuild. Covers nkv_now == 0 (sub-cache disagreement) too.
+    if (reused && binder_st != nullptr) {
+        bool stale = false;
+        if (binder_st->nout_enabled && binder_st->nout_bound != (uint32_t) n_outputs) {
+            stale = true;
+        }
+        if (!stale && binder_st->nkv_enabled && binder_st->record_valid) {
+            const llama_kv_cache_context * kvs[2] = { nullptr, nullptr };
+            int nkvs = 0;
+            if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+                kvs[nkvs++] = h->get_attn();
+            } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+                kvs[nkvs++] = k;
+            }
+            if (nkvs > 0) {
+                uint32_t nkv_now = kvs[0]->get_n_kv();
+                for (int i = 1; i < nkvs; ++i) {
+                    if (kvs[i]->get_n_kv() != nkv_now) {
+                        nkv_now = 0;
+                    }
+                }
+                if (nkv_now != binder_st->record_bound) {
+                    stale = true;
+                }
+            }
+        }
+        if (stale) {
+            reused = false;
+        }
+    }
+    if (!reused && !graph_reuse_disable && binder_st != nullptr && binder_st->nkv_enabled &&
+            !llama_ctx_fa_nkv_param_enabled()) {
+        // union-graph runtime parameter binding: when the previous graph cannot
+        // be reused only because the KV cache moved (width change, bucket
+        // crossing, ...), rebuild the graph in a scratch result at the cache's
+        // CURRENT n_kv, verify the skeleton matches, and patch the live graph
+        // in place only when every changed shape fits the built extents.
+        // Table-driven: the kind -> (tensor set provider, rebind) entry lives
+        // in union_binder and n_kv and n_outputs are registered today (rs_z is
+        // reserved). Fail-closed: an unregistered kind, any mismatch or any
+        // growth past the built width falls back to a full rebuild.
+        // GGML_TP5_FA_NKV_PARAM (exact "1"): disabled - the FA op param is
+        // written at graph build only, so an in-place patch would leave the
+        // previous eval's param value in the live graph; the FA gate keeps
+        // every reuse/patch path off and every eval full-rebuilds at the
+        // true width.
+        auto & union_st = llama_nkv_ctx_state_get(this);
+        reused = nkv_patched = union_st.union_binder.rebind(llama_union_param_kind::n_kv, this, res, gparams);
+    }
+
+    // outputs-only change (or a pending reconcile after an nkv refusal): the
+    // n_outputs binding narrows/restores the executed gather shapes in place.
+    // Skipped when the nkv patch already reconciled the whole param set, or
+    // when the lane is unregistered (nout_pending false). GGML_TP5_FA_NKV_PARAM
+    // (exact "1"): disabled like every in-place patch - a patched-then-reused
+    // graph skips the rebuild that refreshes the FA op param.
+    if (nout_pending && (nkv_patched || !reused) && !graph_reuse_disable && binder_st != nullptr &&
+            binder_st->nout_enabled && !llama_ctx_fa_nkv_param_enabled()) {
+        if (binder_st->union_binder.rebind(llama_union_param_kind::n_outputs, this, res, gparams)) {
+            nout_patched = true;
+            reused = true;
+        } else if (nkv_patched) {
+            // the kv patch applied but the output reconcile failed: the live
+            // graph is half-patched (kv shapes at the new bucket, output shapes
+            // at the OLD bound) - discard it (the rebuild below resets the
+            // result and re-records a fresh build) and keep the counters
+            // honest
+            auto & nkv_st = llama_nkv_ctx_state_get(this);
+            --nkv_st.c_applied;
+            ++nkv_st.c_fallbacks;
+            nkv_patched = false;
+            reused      = false;
+        }
+    }
+
+    if (reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+        // an in-place patch (union_rebind_n_kv / union_rebind_outputs) mutated
+        // the live graph tensors' ne/nb/op_params/view_offs AFTER the previous alloc_graph
+        // created the scheduler's split-input copies at the OLD layout; at
+        // compute time ggml_backend_sched_compute_splits would copy graph
+        // tensor -> stale split copy and the ggml_are_same_layout assert fires.
+        // Force a re-plan: alloc_graph unconditionally re-runs split_graph,
+        // which frees the whole copy-tensor context and re-creates every
+        // split-input copy at the CURRENT (patched) layout, and re-assigns
+        // input tensor data pointers (incl. views), so set_inputs() must run
+        // AFTER it. Fail-closed: on alloc failure fall through to the normal
+        // full-rebuild path below (the rebuild's res->reset() + build_graph
+        // discards the in-place mutation; gparams already reflects the new
+        // parameters) and keep the NKV_BINDER_STATS counters honest
+        // (--c_applied per patched lane, ++c_fallbacks).
+        if (nkv_patched || nout_patched) {
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
+                auto & nkv_st = llama_nkv_ctx_state_get(this);
+                if (nkv_patched) {
+                    --nkv_st.c_applied;
+                    ++nkv_st.c_fallbacks;   // the unwound bind becomes a fallback (identity attempts == applied + fallbacks)
+                }
+                if (nout_patched) {
+                    --nkv_st.c_applied;
+                    --nkv_st.nout_binds;
+                    ++nkv_st.c_fallbacks;   // same, per rolled-back lane
+                }
+                reused       = false;
+                nkv_patched  = false;
+                nout_patched = false;
+            }
+            if (nkv_patched && binder_st->cov_enabled) {
+                auto & nkv_st = llama_nkv_ctx_state_get(this);
+                ++nkv_st.c_binder_bind;
+                for (int c = 0; c < LLAMA_NKV_COV_N; ++c) {
+                    nkv_st.c_cov_patched[c] += nkv_st.cov_pending[c];
+                }
+            }
         }
 
-        n_reused++;
-    } else {
+        if (reused) {
+            // with pipeline parallelism, the previous graph_compute_async may still be running
+            // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
+            // that the previous compute is still reading.
+            if (cparams.pipeline_parallel) {
+                ggml_backend_sched_synchronize(sched.get());
+            }
+
+            n_reused++;
+        }
+    }
+    // fresh-build bookkeeping shared by the build branch below (record +
+    // per-lane validity/cap/bound); also read by nothing else - the narrow
+    // that used to live further down was folded into the dispatch above
+    bool     rec_nkv = false;
+    bool     env_out = false;
+    uint32_t nkv_built = 0;
+    const llama_kv_cache_context * kv_ctx = nullptr;
+    if (!reused) {
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
-
-        //const auto t_start_us = ggml_time_us();
+        // union-graph runtime nkv record: build the graph at the KV cache's
+        // CURRENT true n_kv (no envelope, no headroom, no bucket sizing on
+        // this lane's side - the value get_n_kv() reports is bound as-is), so
+        // a later move to a SMALLER n_kv can be patched in place while a move
+        // to a LARGER n_kv full-rebuilds at the exact new width.
+        if (!graph_reuse_disable && union_binder_state_peek() != nullptr &&
+                union_binder_state_peek()->nkv_enabled && !cparams.pipeline_parallel &&
+                backend_tp5_relay == nullptr) {
+            if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+                kv_ctx = h->get_attn();
+            } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+                kv_ctx = k;
+            }
+            if (kv_ctx != nullptr) {
+                // the cache's current width: what the fresh build uses and
+                // what the record binds (no +1 bucket, no padding)
+                nkv_built = kv_ctx->get_n_kv();
+                rec_nkv   = true;
+            }
+        }
+        // n_outputs record: taken on EVERY fresh decoder build under the lane
+        // (no pad-to-max - the graph is built at the exact active count and
+        // nout_cap records that built width; the rebind only moves the
+        // executed shapes within [0, nout_cap])
+        env_out = !graph_reuse_disable && union_binder_state_peek() != nullptr &&
+            union_binder_state_peek()->nout_enabled && gtype == LLM_GRAPH_TYPE_DECODER;
 
         gf = model.build_graph(gparams);
 
@@ -2590,10 +3649,55 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             return nullptr;
         }
 
+        // one pre-allocation record serves both lanes (one live graph):
+        //  - the nkv lane's record_valid stays tied to its true-width fresh
+        //    build (r7 semantics: the graph is built and sched-allocated at
+        //    the cache's exact current n_kv - no envelope, no headroom; a
+        //    later move to a LARGER n_kv full-rebuilds and re-records);
+        //  - the n_outputs lane records EVERY fresh decoder build (no
+        //    pad-to-max): nout_cap is the BUILT width, nout_bound the width
+        //    the executed shapes currently hold (== nout_cap on a fresh
+        //    build).
+        // peek first: with the gate off no state slot exists and this whole
+        // block is skipped - the OFF path allocates nothing (stock). The
+        // get() below then reuses the existing slot (no allocation).
+        if (union_binder_state_peek() != nullptr) {
+            auto & st = llama_nkv_ctx_state_get(this);
+
+            if (rec_nkv || env_out) {
+                binder_record_snapshot(gf, nkv_built);
+            }
+            st.record_valid = rec_nkv;
+            if (rec_nkv) {
+                st.record_cap   = nkv_built;   // exact built n_kv (no envelope)
+                st.record_bound = nkv_built;   // fresh build: bound == cap
+                ++st.c_record_builds;
+            } else {
+                st.record_bound = 0;   // no nkv lane record: the nout consistency check is gated off (no in-place kv patching possible)
+            }
+            st.nout_record_valid = env_out;
+            if (env_out) {
+                st.nout_cap = (uint32_t) n_outputs;   // the BUILT width (no pad-to-max)
+            }
+            st.nout_bound = (uint32_t) n_outputs;
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        // r8 coverage lane: the graph was (re)built AND sched-allocated under
+        // the enabled nkv lane - count it (mock mirror: the contract harness
+        // counts the first build as a rebuild too). Counted only after the
+        // allocation succeeded: a failed alloc abandons the build (the caller
+        // returns above) and must not count as a completed rebuild.
+        if (union_binder_state_peek() != nullptr) {
+            auto & st = llama_nkv_ctx_state_get(this);
+            if (st.cov_enabled && st.nkv_enabled) {
+                ++st.c_graph_rebuild;
+            }
         }
     }
 
@@ -2634,6 +3738,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+
+        // NOTE: no narrow block here. Fresh builds run at the exact active
+        // count (stock build shape, no pad-to-max), so a fresh graph needs no
+        // narrow; every shrink/restore goes through the binder dispatch above
+        // (nout_pending -> union_rebind_outputs), which re-plans the scheduler
+        // and leaves set_inputs to the shared call below/above. A narrow
+        // failure there falls through to the normal full rebuild at the exact
+        // count, which re-records the state - no one-shot suppress flag and no
+        // stale record can survive.
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -3809,6 +4922,12 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
                                              const llama_ubatch &           ubatch,
                                              const llama_memory_context_i * mctx,
                                              llm_graph_type                 gtype) const {
+    // NOTE: stock. The n_outputs binding does NOT build over a padded
+    // envelope: every graph builds at the exact active count (the pre-r4
+    // behaviour) and the binder's n_outputs rebind only moves the executed
+    // shapes WITHIN the built width (shrink or restore); growth beyond the
+    // built width is refused (refused_envelope) and falls back to a full
+    // rebuild at the new count - no pad-to-max, no headroom.
     return {
         /*.arch        =*/model.arch,
         /*.hparams     =*/model.hparams,
@@ -3823,6 +4942,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.cross       =*/&cross,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
+
         /*.cb          =*/graph_get_cb(),
         /*.res         =*/res,
     };

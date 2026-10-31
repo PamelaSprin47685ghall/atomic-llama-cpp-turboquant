@@ -19,6 +19,11 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// GGML_TP5_FA_RTLEN: trailing kernel parameter carrying the runtime effective KV length.
+// nullptr (feature off / non-rtlen paths) keeps every kernel on its stock path.
+// The pointer is a device int32[1] input tensor (dst->src[5] for plain FA); its CONTENT
+// is refreshed per eval via ggml_backend_tensor_set, so captured CUDA graphs replay with
+// the new value without a topology change.
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -26,6 +31,9 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const int32_t * __restrict__ n_kv_eff,
+        const bool fast_full_tiles,
+        const int32_t n_kv_runtime,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -41,6 +49,98 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33);
+
+// Exact-"1" env gates for the runtime FA length feature. GGML_TP5_FA_CHECKED_TAIL
+// is the required gate name and also arms the streamed checked tail; the r4-lineage
+// GGML_TP5_FA_RTLEN alias is accepted so the landed kernel/dispatch paths keep their
+// documented contract. Either value (or both) arms every rtlen lane; OFF (neither
+// set, or any other value) keeps every kernel on its stock path. Read once.
+static inline bool ggml_cuda_fattn_rtlen_enabled() {
+    static const bool enabled = []() {
+        const char * ct = getenv("GGML_TP5_FA_CHECKED_TAIL");
+        if (ct != nullptr && strcmp(ct, "1") == 0) {
+            return true;
+        }
+        const char * env = getenv("GGML_TP5_FA_RTLEN");
+        return env != nullptr && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
+// GGML_TP5_FA_CHECKED_TAIL (exact "1"): strict gate of the r6 streamed checked
+// tail ONLY (kv_stream_chunk_bound_dual + the streamed launcher's chunk clamp). It
+// deliberately does NOT accept the r4-lineage GGML_TP5_FA_RTLEN alias: the
+// alias keeps the landed r4 behavior, including the streamed fail-closed
+// abort. Read once.
+static inline bool ggml_cuda_fa_checked_tail_enabled() {
+    static const bool enabled = []() {
+        const char * ct = getenv("GGML_TP5_FA_CHECKED_TAIL");
+        return ct != nullptr && strcmp(ct, "1") == 0;
+    }();
+    return enabled;
+}
+
+// GGML_TP5_FA_TILE_FAST_FULL (exact "1", r7): independent opt-in that lets the
+// checked-tail TILE kernel run KV tiles that end at or below the runtime bound
+// with the stock unchecked iterator (oob_check = false) and keep the per-row
+// checks only on the final partial tile. It is a pure performance lane inside
+// the checked-tail path: alone it changes nothing (no checked tail, no fast
+// branch), and off it leaves the r6 always-checked loop bit-for-bit.
+static inline bool ggml_cuda_fa_tile_fast_full_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_TP5_FA_TILE_FAST_FULL");
+        return env != nullptr && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+// GGML_TP5_FA_NKV_PARAM (exact "1", r8): process-static gate for the
+// per-request runtime KV length lane. Any other value (or unset) keeps every
+// kernel and dispatch on its stock path.
+static inline bool ggml_cuda_fattn_nkv_param_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_TP5_FA_NKV_PARAM");
+        return env != nullptr && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+// GGML_TP5_FA_NKV_PARAM (exact "1", r8): per-request runtime KV length. The
+// plain-FA graph route writes op_params[5] at build time; the launcher reads
+// it per launch. The CUDA-graph layer re-captures whenever the value changes
+// (full-tensor node_props memcmp), so a captured scalar can never go stale.
+// GGML_TP5_FA_NKV_PARAM (r8): raw slot reader for plain FLASH_ATTN_EXT nodes,
+// gate-gated but otherwise uninterpreted. The launcher validates this raw
+// value against [-1, built KV width] (fail-closed), so a corrupted slot can
+// not be silently swallowed by the <=0-to-off mapping of the resolver below.
+static inline int32_t ggml_cuda_fattn_nkv_runtime_param_raw(const ggml_tensor * dst) {
+    if (!ggml_cuda_fattn_nkv_param_enabled() || dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT) {
+        return -1;
+    }
+    return ggml_get_op_params_i32(dst, 5);
+}
+// GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length resolver for plain
+// FLASH_ATTN_EXT nodes. Values <= 0 mean "not written" (ggml zeroes the slot
+// at tensor creation; raw creators outside the gated graph route must stay on
+// the stock path) and resolve to -1 = off. The dispatch/streamed/sparse gates
+// use this normalized view ("a valid bound is present"); launch_fattn
+// additionally validates the raw slot value before consuming it.
+static inline int32_t ggml_cuda_fattn_nkv_runtime_param(const ggml_tensor * dst) {
+    const int32_t v = ggml_cuda_fattn_nkv_runtime_param_raw(dst);
+    return v > 0 ? v : -1;
+}
+
+// The runtime effective length lives in src[5] of a plain FA node. src[5] is also the
+// banded op's rel_logits slot, so the slot is disambiguated by op + tensor type:
+// i32 == n_kv_eff (this feature), anything else == banded rel (stock).
+static inline const ggml_tensor * ggml_cuda_fattn_rtlen_tensor(const ggml_tensor * dst) {
+    if (dst->op != GGML_OP_FLASH_ATTN_EXT) {
+        return nullptr;
+    }
+    const ggml_tensor * t = dst->src[5];
+    if (t == nullptr || t->type != GGML_TYPE_I32 || ggml_nelements(t) != 1) {
+        return nullptr;
+    }
+    return t;
+}
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1489,10 +1589,42 @@ void launch_fattn(
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
+    // GGML_TP5_FA_RTLEN: runtime effective KV length. src[5] (i32[1]) carries the
+    // applied n_kv_eff; absent means stock semantics. nullptr reaches every kernel.
+    const ggml_tensor * n_kv_eff_t = ggml_cuda_fattn_rtlen_tensor(dst);
+    const int32_t * n_kv_eff = (n_kv_eff_t != nullptr) ? (const int32_t *) n_kv_eff_t->data : nullptr;
+    // GGML_TP5_FA_TILE_FAST_FULL (exact "1", r7): independent fast-tile lane;
+    // without the checked tail it has no consumer, so it only matters when
+    // the runtime bound reaches the tile kernel.
+    const bool fa_tile_fast_full = ggml_cuda_fa_tile_fast_full_enabled();
+
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
-    const int32_t n_kv_max = use_sparse ? ggml_get_op_params_i32(KQV, 4) : 0;
-    if (use_sparse) {
+    // GGML_TP5_FA_NKV_PARAM (exact "1", r8): per-request runtime KV length read
+    // from op_params[5] and passed to every kernel as a scalar argument. -1
+    // (unset, reader-routed nodes, feature off) keeps the kernel-side clamp
+    // dead. Fail-closed on the RAW slot value: anything outside [-1, built KV
+    // width] aborts instead of being silently folded into "off" or clamping
+    // to a wrong bound. Only after validation is the value normalized
+    // (<= 0 -> -1) for the kernels.
+    const int32_t n_kv_runtime_raw = ggml_cuda_fattn_nkv_runtime_param_raw(dst);
+    if (n_kv_runtime_raw > (int32_t) K->ne[1]) {
+        GGML_ABORT("GGML_TP5_FA_NKV_PARAM: runtime KV length %d exceeds built KV width %d",
+                (int) n_kv_runtime_raw, (int) K->ne[1]);
+    }
+    if (n_kv_runtime_raw < -1) {
+        GGML_ABORT("GGML_TP5_FA_NKV_PARAM: invalid runtime KV length %d",
+                (int) n_kv_runtime_raw);
+    }
+    const int32_t n_kv_runtime = n_kv_runtime_raw > 0 ? n_kv_runtime_raw : -1;
+    const bool fa_nkv_param_valid = n_kv_runtime >= 0;
+    // GGML_TP5_FA_RTLEN / GGML_TP5_FA_NKV_PARAM and the sparse KV_max mask
+    // compaction are mutually exclusive: the runtime-bound lanes bound K/V
+    // reads by their own length, while sparse compaction assumes a 256-aligned
+    // envelope with no runtime tail. The runtime lanes win.
+    const bool use_sparse_eff = use_sparse && (n_kv_eff == nullptr) && !fa_nkv_param_valid;
+    const int32_t n_kv_max = use_sparse_eff ? ggml_get_op_params_i32(KQV, 4) : 0;
+    if (use_sparse_eff) {
         GGML_ASSERT(mask != nullptr);
         GGML_ASSERT(n_kv_max > 0);
         const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
@@ -1504,7 +1636,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (!use_sparse_eff && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1525,8 +1657,7 @@ void launch_fattn(
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
-
-    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
+    const int64_t n_kv = use_sparse_eff ? n_kv_max : K->ne[1];
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
@@ -1626,7 +1757,6 @@ void launch_fattn(
     if (logit_softcap != 0.0f) {
         scale /= logit_softcap;
     }
-
     const uint32_t n_head      = Q->ne[2];
     const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
 
@@ -1645,6 +1775,9 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
+        n_kv_eff,
+        fa_tile_fast_full,
+        n_kv_runtime,
         output_partial ? partial_dst : (!stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data),
         output_partial ? partial_meta : dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,

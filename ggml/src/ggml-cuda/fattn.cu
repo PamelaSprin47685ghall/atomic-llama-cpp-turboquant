@@ -799,6 +799,37 @@ static __global__ void kv_stream_normalize_chunk_results(
     const float denom = accumulator_meta[row].y;
     dst[row*D + tid] = denom > 0.0f ? accumulator[row*D + tid]/denom : 0.0f;
 }
+// GGML_TP5_FA_CHECKED_TAIL (r6) + GGML_TP5_FA_NKV_PARAM (r8): translate the
+// global runtime bounds into a chunk's relative bound as the TRUE MIN of the
+// armed lanes. The streamed chunk covering global rows
+// [token_begin, token_begin + token_count) attends rows [token_begin, bound)
+// only; an inactive lane passes a neutral sentinel (nullptr device tensor for
+// the r6 lane, -1 host scalar for the r8 lane) and clamps to the full chunk
+// width. Zero is a real result: a chunk fully past an armed frontier attends
+// nothing and emits a neutral partial (weight 0). token_begin/token_count
+// are capture-time constants of the chunk node; the r6 lane re-reads its
+// device tensor on every replay (set_input refresh) and the r8 lane's scalar
+// is kept current by the freshness contract (graph-reuse disable +
+// full-tensor op_params memcmp -> re-capture on change), so the recorded
+// 1-thread launch stays replay-safe.
+static __global__ void kv_stream_chunk_bound_dual(
+        const int32_t * __restrict__ n_kv_eff_global,
+        const int32_t   n_kv_runtime_global,
+        const int32_t   token_begin,
+        const int32_t   token_count,
+        int32_t * __restrict__ chunk_bound) {
+    int64_t bound = INT32_MAX;
+    if (n_kv_eff_global != nullptr) {
+        bound = n_kv_eff_global[0];
+    }
+    if (n_kv_runtime_global >= 0) {
+        bound = bound < n_kv_runtime_global ? bound : n_kv_runtime_global;
+    }
+    const int64_t remaining = bound - token_begin;
+    chunk_bound[0] = remaining < 0 ? 0 :
+        (remaining < token_count ? (int32_t) remaining : token_count);
+}
+
 
 #ifdef GGML_CUDA_FA_ALL_QUANTS
 using kv_stream_native_partial_fn = void (*)(
@@ -1779,6 +1810,48 @@ void ggml_cuda_flash_attn_ext_streamed(
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    // GGML_TP5_FA_CHECKED_TAIL (exact "1") is the ONLY gate of the r6 streamed
+    // checked tail: it never reads the runtime bound on the host. Each chunk gets
+    // a device-side, chunk-relative bound (kv_stream_chunk_bound_dual) computed inside
+    // the captured graph from the global n_kv_eff tensor (dst->src[5]); chunk
+    // token offsets are capture-time constants, so the recorded launch stays
+    // correct across replays. K/V rows at or past the translated bound are never
+    // read; an exhausted chunk contributes a neutral partial (see accumulate:
+    // weight == 0).
+    const ggml_tensor * nkv_eff_tensor = ggml_cuda_fattn_rtlen_tensor(dst);
+    // GGML_TP5_FA_RTLEN (r4, landed): the RTLEN lane alone keeps the landed
+    // fail-closed contract verbatim — streamed attention + runtime bound still
+    // aborts. CHECKED_TAIL=1 takes precedence (both set: the r6 tail runs).
+    if (ggml_cuda_fattn_rtlen_enabled() && nkv_eff_tensor != nullptr &&
+        !ggml_cuda_fa_checked_tail_enabled()) {
+        GGML_ABORT("runtime KV length is not supported for streamed attention");
+    }
+    // GGML_TP5_FA_NKV_PARAM (r8): the per-request runtime bound IS supported on
+    // the streamed path via per-chunk translation. The global node's op param
+    // is a host scalar; each staged chunk gets the chunk-relative bound
+    // (chunk - token_begin clamped to [0, token_count]) written into its slot
+    // by a scalar kernel and carried on the staged dst's src[5], with the
+    // positive bound also folded into the staged dst's op param so the
+    // dispatch reroutes (MMA->TILE, fused-path skips) stay armed. Fail-closed
+    // on the raw slot value with the same contract as launch_fattn (this path
+    // bypasses the launcher for the global node). The baked values are capture
+    // time constants kept current by the r8 freshness contract: the gate
+    // disables graph reuse and the full-tensor node_props memcmp (op_params
+    // included) re-captures whenever the bound changes. Nodes without the
+    // param ([-1]) keep the stock/r6 streamed behavior.
+    const int32_t n_kv_runtime_raw = ggml_cuda_fattn_nkv_runtime_param_raw(dst);
+    if (n_kv_runtime_raw > (int32_t) K->ne[1]) {
+        GGML_ABORT("GGML_TP5_FA_NKV_PARAM: runtime KV length %d exceeds built KV width %d",
+                (int) n_kv_runtime_raw, (int) K->ne[1]);
+    }
+    if (n_kv_runtime_raw < -1) {
+        GGML_ABORT("GGML_TP5_FA_NKV_PARAM: invalid runtime KV length %d",
+                (int) n_kv_runtime_raw);
+    }
+    const int32_t n_kv_runtime_global = n_kv_runtime_raw > 0 ? n_kv_runtime_raw : -1;
+    if (!ggml_cuda_fa_checked_tail_enabled()) {
+        nkv_eff_tensor = nullptr;   // the r6 tail is CHECKED_TAIL-only
+    }
     const auto attention_mode =
         ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type);
     const bool convert_to_f16 =
@@ -1919,7 +1992,13 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
     }
 
-    const bool use_mma_prefill = !convert_to_f16 &&
+    // GGML_TP5_FA_CHECKED_TAIL: the MMA prefill kernel has no checked tail (reads the
+    // full staged span), so under the runtime bound the chunk runs on the
+    // checked vec partial path instead. RTLEN alone keeps the landed r4 abort
+    // and MMA prefill.
+    // GGML_TP5_FA_NKV_PARAM (r8): same contract for the per-request bound.
+    const bool use_mma_prefill = !convert_to_f16 && nkv_eff_tensor == nullptr &&
+        n_kv_runtime_global < 0 &&
         Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
@@ -1935,6 +2014,15 @@ void ggml_cuda_flash_attn_ext_streamed(
     ggml_cuda_pool_alloc<float> parts(pool);
     ggml_cuda_pool_alloc<float2> meta(pool);
     ggml_cuda_pool_alloc<float> accumulator(pool);
+    // GGML_TP5_FA_CHECKED_TAIL: one device i32 per chunk holding the chunk-relative
+    // runtime bound (written by kv_stream_chunk_bound_dual each eval/replay). The new
+    // streamed tail arms only on this gate; RTLEN alone keeps the landed r4 abort.
+    ggml_cuda_pool_alloc<int32_t> chunk_bounds(pool);
+    // GGML_TP5_FA_NKV_PARAM (r8): the per-request lane shares the per-chunk
+    // slot mechanism (translated bound, zero case included).
+    if (nkv_eff_tensor != nullptr || n_kv_runtime_global >= 0) {
+        chunk_bounds.alloc(nchunks);
+    }
     ggml_cuda_pool_alloc<float2> accumulator_meta(pool);
     const bool needs_partial_reduction = convert_to_f16 || (!streamed_chunks.empty() && nchunks > 1);
     if (needs_partial_reduction) {
@@ -2136,6 +2224,35 @@ void ggml_cuda_flash_attn_ext_streamed(
             }
         }
 
+        // GGML_TP5_FA_CHECKED_TAIL (r6) + GGML_TP5_FA_NKV_PARAM (r8):
+        // translate the global runtime bounds into this chunk's relative
+        // bound as the TRUE MIN of the armed lanes — never a last-writer
+        // overwrite. Each lane contributes its own global bound; an inactive
+        // lane passes a neutral sentinel (nullptr device tensor for r6, -1
+        // host scalar for r8) and clamps to the full chunk width. The r6 lane
+        // re-reads its device tensor on every replay (set_input refresh); the
+        // r8 lane's scalar is a capture-time constant kept current by the
+        // freshness contract (graph-reuse disable + full-tensor op_params
+        // memcmp -> re-capture on change). token_begin/token_count are
+        // capture-time constants of this chunk node, so the recorded
+        // 1-thread launch stays replay-safe. Zero is a real result: a chunk
+        // fully past an armed frontier attends nothing and emits a neutral
+        // partial. Launched per chunk before the chunk's FA work.
+        if (nkv_eff_tensor != nullptr || n_kv_runtime_global >= 0) {
+            kv_stream_chunk_bound_dual<<<1, 1, 0, ctx.stream()>>>(
+                nkv_eff_tensor != nullptr ? (const int32_t *) nkv_eff_tensor->data : nullptr,
+                n_kv_runtime_global,
+                (int32_t) desc.token_begin, (int32_t) desc.token_count,
+                chunk_bounds.ptr + chunk);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        int32_t staged_chunk_bound = -1;
+        if (n_kv_runtime_global >= 0) {
+            const int64_t remaining = (int64_t) n_kv_runtime_global - desc.token_begin;
+            staged_chunk_bound = (int32_t) std::min<int64_t>(
+                std::max<int64_t>(remaining, 0), desc.token_count);
+        }
+
         ggml_tensor staged_k = *K;
         ggml_tensor staged_v = *V;
         staged_k.data = desc.k_stage;
@@ -2148,6 +2265,30 @@ void ggml_cuda_flash_attn_ext_streamed(
         staged_v.nb[1] = desc.v_stage_token_stride;
         staged_v.nb[2] = desc.v_stage_head_stride;
         staged_v.nb[3] = desc.v_stage_token_stride*desc.token_count;
+
+        ggml_tensor staged_dst = *dst;
+        // GGML_TP5_FA_CHECKED_TAIL: point the staged dst's src[5] at this chunk's slot of
+        // the translated-bound buffer (the launcher's lambda reads ->data), so
+        // the checked vec kernel clamps its chunk-local rows. OFF (stock): the
+        // staged dst keeps the original src[5] untouched.
+        ggml_tensor chunk_nkv_eff{};
+        if (nkv_eff_tensor != nullptr || n_kv_runtime_global >= 0) {
+            chunk_nkv_eff.type  = GGML_TYPE_I32;
+            chunk_nkv_eff.ne[0] = 1;
+            chunk_nkv_eff.nb[0] = sizeof(int32_t);
+            chunk_nkv_eff.data  = chunk_bounds.ptr + chunk;
+            staged_dst.src[5]   = &chunk_nkv_eff;
+        }
+        // GGML_TP5_FA_NKV_PARAM (r8): the staged chunk carries this lane's
+        // per-request bound as its op param scalar (validated against the
+        // staged width by launch_fattn), keeping the dispatch reroutes
+        // (MMA->TILE, fused-path skips) armed on the fast path even for a
+        // fully-exhausted chunk (-1 scalar, combined slot 0). The kernels
+        // fold slot and scalar with min(), so the effective bound is the
+        // true min of the armed lanes.
+        if (n_kv_runtime_global >= 0) {
+            staged_dst.op_params[5] = staged_chunk_bound > 0 ? staged_chunk_bound : -1;
+        }
 
         ggml_tensor converted_k{};
         ggml_tensor converted_v{};
@@ -2202,7 +2343,6 @@ void ggml_cuda_flash_attn_ext_streamed(
             staged_mask_ptr = &staged_mask;
         }
 
-        ggml_tensor staged_dst = *dst;
         staged_dst.src[1] = convert_to_f16 ? &converted_k : &staged_k;
         staged_dst.src[2] = convert_to_f16 ? &converted_v : &staged_v;
         staged_dst.src[3] = staged_mask_ptr;
@@ -2429,6 +2569,15 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    // GGML_TP5_FA_RTLEN and the sparse KV_max compaction are mutually exclusive:
+    // the checked tail bounds reads by the runtime n_kv_eff, sparse compaction
+    // assumes a 256-aligned envelope with no runtime tail.
+    // GGML_TP5_FA_NKV_PARAM (r8): a param-carrying FA node never takes the
+    // sparse path; the runtime bound is the authority for those nodes.
+    if (ggml_cuda_fattn_nkv_runtime_param(dst) >= 0 ||
+            (ggml_cuda_fattn_rtlen_enabled() && ggml_cuda_fattn_rtlen_tensor(dst) != nullptr)) {
+        return false;
+    }
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
@@ -3266,11 +3415,31 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
+    // GGML_TP5_FA_RTLEN (all backends): runtime effective KV length via src[5]
+    // (i32[1]). OFF (no src[5] tensor / env != "1") == stock. Declared outside the
+    // HIP ifdef below so the fused-path bypass and the MMA-F16 route stay
+    // unconditional.
+    // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length in op
+    // params slot 5. Behaves like the rtlen lane for dispatch purposes:
+    // fused fast paths that cannot consume the bound are skipped and the
+    // bound-aware TILE kernel takes over; MMA-F16 reroutes below.
+    const bool fattn_nkv_param = ggml_cuda_fattn_nkv_runtime_param(dst) >= 0;
+    const bool fattn_rtlen = ggml_cuda_fattn_rtlen_enabled() &&
+        ggml_cuda_fattn_rtlen_tensor(dst) != nullptr;
+    // GGML_TP5_FA_NKV_PARAM (r8): staged streamed chunks carry a chunk-local
+    // bound as src[5] even when only this gate is on; the bound-aware kernels
+    // must be selected for them too (a fully-exhausted chunk with bound 0
+    // must still hit the checked kernels, never an unchecked fast path).
+    // Without any gate, src[5] is never produced, so arming on its presence
+    // alone cannot touch stock behavior.
+    const bool fattn_nkv_bound = fattn_rtlen || fattn_nkv_param ||
+        (ggml_cuda_fattn_nkv_param_enabled() && ggml_cuda_fattn_rtlen_tensor(dst) != nullptr);
+
 #if defined(GGML_USE_HIP) && defined(FLASH_ATTN_AVAILABLE)
     // Only the explicit decoded-F32 context uses the fused online F32 kernel.
     // All operands and intermediates stay F32; ordinary FA keeps its existing
     // selector and conversion policy.
-    if (ctx.quantized_matmul_f32 && dst->op == GGML_OP_FLASH_ATTN_EXT &&
+    if (!fattn_nkv_bound && ctx.quantized_matmul_f32 && dst->op == GGML_OP_FLASH_ATTN_EXT &&
             ggml_flash_attn_ext_get_prec(dst) == GGML_PREC_F32 &&
             GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ctx.device].cc) &&
             ggml_cuda_flash_attn_ext_f32_supported(dst)) {
@@ -3292,7 +3461,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const bool turbo_matched = (K->type == V->type &&
             (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0));
-        if (ggml_cuda_turbo_mma_fused() && turbo_matched
+        if (!fattn_nkv_bound && ggml_cuda_turbo_mma_fused() && turbo_matched
                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
             if (Q->ne[0] == 128) {
                 switch (K->type) {
@@ -3318,7 +3487,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
     }
 
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    // GGML_TP5_FA_RTLEN: the MMA-F16 kernel has no checked tail (it reads the full
+    // envelope and relies on -INF mask rows). Under rtlen, route to the checked
+    // TILE/VEC kernels instead. OFF keeps the stock selection.
+    best_fattn_kernel best = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (fattn_nkv_bound && best == BEST_FATTN_KERNEL_MMA_F16) {
+        best = BEST_FATTN_KERNEL_TILE;
+    }
+    switch (best) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

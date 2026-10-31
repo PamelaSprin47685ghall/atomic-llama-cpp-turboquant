@@ -27,6 +27,9 @@ static __global__ void flash_attn_ext_vec(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int  * n_kv_eff_ptr,
+        const bool fast_full_tiles,
+        const int32_t n_kv_runtime,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -43,7 +46,22 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
     ggml_cuda_pdl_lc();
-#ifdef FLASH_ATTN_AVAILABLE
+ #ifdef FLASH_ATTN_AVAILABLE
+    // GGML_TP5_FA_RTLEN: runtime effective KV length; nullptr keeps stock ne11 bounds.
+    // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length (op param,
+    // read at HIP launch, -1 off). It only ever tightens the bound above; it
+    // never widens one, and a negative value keeps stock behavior exactly.
+    int n_kv_eff = n_kv_eff_ptr ? std::min((int32_t)*n_kv_eff_ptr, (int32_t)ne11) : ne11;
+    if (n_kv_runtime >= 0) {
+        n_kv_eff = std::min(n_kv_eff, (int) n_kv_runtime);
+    }
+    // Checked tail: only the last partial 256-block can have rows >= n_kv_eff.
+    // Rows past n_kv_eff must not be read from K/V (they may be uninitialised or
+    // poisoned) and must not take part in the softmax; they are zero-filled and
+    // their mask contribution is skipped, exactly like a -INF mask row.
+    const bool check_tail = n_kv_eff_ptr != nullptr || n_kv_runtime >= 0;
+    GGML_UNUSED(fast_full_tiles); // r7 tile-only fast lane; vec tail behavior unchanged
+
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
     const char * GGML_CUDA_RESTRICT V        = V_ptr;
@@ -55,7 +73,7 @@ static __global__ void flash_attn_ext_vec(
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256 || D == 512)) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, n_kv_eff_ptr, fast_full_tiles, n_kv_runtime, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -316,7 +334,8 @@ static __global__ void flash_attn_ext_vec(
         __syncthreads();
     }
 
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    // rtlen: the logical bound is the runtime length (never above the built width).
+    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : n_kv_eff;
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
     maskh += blockIdx.y*nthreads;
@@ -336,60 +355,71 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
+            // Checked tail: rows at or past n_kv_eff are never read from K/V.
+            const bool row_valid = !check_tail || k_VKQ_0 + i_KQ < n_kv_eff;
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum;
-                if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO3_0) {
-                    // LUT scoring: 8 elements per iteration (2 qs bytes + 1 signs byte)
-                    const block_turbo3_0 * K_turbo = (const block_turbo3_0 *)(K + i_KQ*nb11);
-                    sum = 0.0f;
-                    for (int d0 = 0; d0 < D; d0 += 8) {
-                        const int ib = d0 / QK_TURBO3;
-                        const int jj = d0 % QK_TURBO3;
-                        const float norm = __half2float(K_turbo[ib].norm);
-                        const uint8_t qs0 = K_turbo[ib].qs[jj / 4];
-                        const uint8_t qs1 = K_turbo[ib].qs[jj / 4 + 1];
-                        const uint8_t sgn = K_turbo[ib].signs[jj / 8];
-                        sum += (__half2float(turbo_lut[d0  ][((qs0>>0)&3)|((sgn>>0&1)<<2)]) +
-                                __half2float(turbo_lut[d0+1][((qs0>>2)&3)|((sgn>>1&1)<<2)]) +
-                                __half2float(turbo_lut[d0+2][((qs0>>4)&3)|((sgn>>2&1)<<2)]) +
-                                __half2float(turbo_lut[d0+3][((qs0>>6)&3)|((sgn>>3&1)<<2)]) +
-                                __half2float(turbo_lut[d0+4][((qs1>>0)&3)|((sgn>>4&1)<<2)]) +
-                                __half2float(turbo_lut[d0+5][((qs1>>2)&3)|((sgn>>5&1)<<2)]) +
-                                __half2float(turbo_lut[d0+6][((qs1>>4)&3)|((sgn>>6&1)<<2)]) +
-                                __half2float(turbo_lut[d0+7][((qs1>>6)&3)|((sgn>>7&1)<<2)])) * norm;
-                    }
-                } else if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO2_0) {
-                    // LUT scoring for turbo2: 8 elements per iteration (2 qs bytes, no signs)
-                    const block_turbo2_0 * K_turbo = (const block_turbo2_0 *)(K + i_KQ*nb11);
-                    sum = 0.0f;
-                    for (int d0 = 0; d0 < D; d0 += 8) {
-                        const int ib = d0 / QK_TURBO2;
-                        const int jj = d0 % QK_TURBO2;
-                        const float norm = __half2float(K_turbo[ib].norm);
-                        const uint8_t qs0 = K_turbo[ib].qs[jj / 4];
-                        const uint8_t qs1 = K_turbo[ib].qs[jj / 4 + 1];
-                        sum += (__half2float(turbo_lut[d0  ][(qs0>>0)&3]) +
-                                __half2float(turbo_lut[d0+1][(qs0>>2)&3]) +
-                                __half2float(turbo_lut[d0+2][(qs0>>4)&3]) +
-                                __half2float(turbo_lut[d0+3][(qs0>>6)&3]) +
-                                __half2float(turbo_lut[d0+4][(qs1>>0)&3]) +
-                                __half2float(turbo_lut[d0+5][(qs1>>2)&3]) +
-                                __half2float(turbo_lut[d0+6][(qs1>>4)&3]) +
-                                __half2float(turbo_lut[d0+7][(qs1>>6)&3])) * norm;
+                if (row_valid) {
+                    if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO3_0) {
+                        // LUT scoring: 8 elements per iteration (2 qs bytes + 1 signs byte)
+                        const block_turbo3_0 * K_turbo = (const block_turbo3_0 *)(K + i_KQ*nb11);
+                        sum = 0.0f;
+                        for (int d0 = 0; d0 < D; d0 += 8) {
+                            const int ib = d0 / QK_TURBO3;
+                            const int jj = d0 % QK_TURBO3;
+                            const float norm = __half2float(K_turbo[ib].norm);
+                            const uint8_t qs0 = K_turbo[ib].qs[jj / 4];
+                            const uint8_t qs1 = K_turbo[ib].qs[jj / 4 + 1];
+                            const uint8_t sgn = K_turbo[ib].signs[jj / 8];
+                            sum += (__half2float(turbo_lut[d0  ][((qs0>>0)&3)|((sgn>>0&1)<<2)]) +
+                                    __half2float(turbo_lut[d0+1][((qs0>>2)&3)|((sgn>>1&1)<<2)]) +
+                                    __half2float(turbo_lut[d0+2][((qs0>>4)&3)|((sgn>>2&1)<<2)]) +
+                                    __half2float(turbo_lut[d0+3][((qs0>>6)&3)|((sgn>>3&1)<<2)]) +
+                                    __half2float(turbo_lut[d0+4][((qs1>>0)&3)|((sgn>>4&1)<<2)]) +
+                                    __half2float(turbo_lut[d0+5][((qs1>>2)&3)|((sgn>>5&1)<<2)]) +
+                                    __half2float(turbo_lut[d0+6][((qs1>>4)&3)|((sgn>>6&1)<<2)]) +
+                                    __half2float(turbo_lut[d0+7][((qs1>>6)&3)|((sgn>>7&1)<<2)])) * norm;
+                        }
+                    } else if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO2_0) {
+                        // LUT scoring for turbo2: 8 elements per iteration (2 qs bytes, no signs)
+                        const block_turbo2_0 * K_turbo = (const block_turbo2_0 *)(K + i_KQ*nb11);
+                        sum = 0.0f;
+                        for (int d0 = 0; d0 < D; d0 += 8) {
+                            const int ib = d0 / QK_TURBO2;
+                            const int jj = d0 % QK_TURBO2;
+                            const float norm = __half2float(K_turbo[ib].norm);
+                            const uint8_t qs0 = K_turbo[ib].qs[jj / 4];
+                            const uint8_t qs1 = K_turbo[ib].qs[jj / 4 + 1];
+                            sum += (__half2float(turbo_lut[d0  ][(qs0>>0)&3]) +
+                                    __half2float(turbo_lut[d0+1][(qs0>>2)&3]) +
+                                    __half2float(turbo_lut[d0+2][(qs0>>4)&3]) +
+                                    __half2float(turbo_lut[d0+3][(qs0>>6)&3]) +
+                                    __half2float(turbo_lut[d0+4][(qs1>>0)&3]) +
+                                    __half2float(turbo_lut[d0+5][(qs1>>2)&3]) +
+                                    __half2float(turbo_lut[d0+6][(qs1>>4)&3]) +
+                                    __half2float(turbo_lut[d0+7][(qs1>>6)&3])) * norm;
+                        }
+                    } else {
+                        sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                        sum = warp_reduce_sum<nthreads_KQ>(sum);
                     }
                 } else {
-                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
-                    sum = warp_reduce_sum<nthreads_KQ>(sum);
+                    // Checked tail: rows at or past n_kv_eff are never read from K.
+                    sum = 0.0f;
                 }
 
                 if (use_logit_softcap) {
                     sum = logit_softcap*tanhf(sum);
                 }
 
-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                // Checked tail: the mask row of an invalid row is skipped entirely;
+                // the neutral sum keeps it out of the max update like a -INF row.
+                if (mask && row_valid && (ncols == 1 || ic0 + j < int(ne01.z))) {
                     sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                } else if (!row_valid) {
+                    sum = -FLT_MAX/2.0f;
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -436,6 +466,11 @@ static __global__ void flash_attn_ext_vec(
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
+            // Checked tail: V rows at or past n_kv_eff are never read. Their KQ
+            // weight is already 0, but a poisoned V row would still yield 0*NaN,
+            // so the whole V contribution of such a row is skipped.
+            const bool v_row_valid = !check_tail || k_VKQ_0 + k < n_kv_eff;
+
 #ifdef V_DOT2_F32_F16_AVAILABLE
             half2 KQ_k[ncols];
 #pragma unroll
@@ -447,6 +482,10 @@ static __global__ void flash_attn_ext_vec(
                     KQ_k[j] = __half2half2(KQ[j*nthreads + k]);
                 }
             }
+
+            // Checked tail: skip the entire V contribution of a row past n_kv_eff
+            // before any dequant happens (the KQ weight is already exp->0).
+            if (!v_row_valid) { continue; }
 
             // Sparse V: skip V dequant if all attention weights for this position are negligible.
             // Compiled out for unquantized V (f16/bf16/turbo): at short decode depth the
@@ -485,6 +524,10 @@ static __global__ void flash_attn_ext_vec(
                 }
             }
 #else
+            // Checked tail: rows at or past n_kv_eff are never read from V (their
+            // KQ weight is already 0, but a poisoned row would still give 0*NaN).
+            if (!v_row_valid) { continue; }
+
             float KQ_k[ncols];
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
@@ -767,7 +810,7 @@ static __global__ void flash_attn_ext_vec(
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, n_kv_eff_ptr, fast_full_tiles, n_kv_runtime, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
@@ -824,8 +867,20 @@ void ggml_cuda_flash_attn_ext_vec_partial_case_impl(
         (const char *) K->data,
         (const char *) V->data,
         mask ? (const char *) mask->data : nullptr,
-        nullptr,
-        nullptr,
+        nullptr,   // sinks: the streamed partial path carries none
+        nullptr,   // KV_max: sparse compaction is not used here
+        // GGML_TP5_FA_RTLEN: the staged dst keeps src[5]; the kernel reads its
+        // bound from there. nullptr keeps stock ne11 bounds.
+        [] (const ggml_tensor * d) {
+            const ggml_tensor * t = ggml_cuda_fattn_rtlen_tensor(d);
+            return t ? (const int32_t *) t->data : nullptr;
+        } (dst),
+        // GGML_TP5_FA_RTLEN: vec never uses the tile-only fast-full lane.
+        false,
+        // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length from the
+        // staged dst's op param (normalized; -1 keeps stock bounds). The
+        // streamed staging validates it against the staged width.
+        ggml_cuda_fattn_nkv_runtime_param(dst),
         partial_dst,
         partial_meta,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -834,7 +889,7 @@ void ggml_cuda_flash_attn_ext_vec_partial_case_impl(
         V->nb[1], V->nb[2], V->nb[3],
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0);
-    CUDA_CHECK(cudaGetLastError());
+     CUDA_CHECK(cudaGetLastError());
 }
 
 template<int D, ggml_type type_K, ggml_type type_V>

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <unordered_map>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -2036,6 +2037,36 @@ bool llama_kv_cache::resolve_attention_view(llama_seq_id seq, llama_pos pos,
     return true;
 }
 
+uint32_t llama_kv_cache::get_used_max_p1(const slot_info & sinfo) const {
+    uint32_t result = 0;
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        result = std::max(result, v_cells[sinfo.strm[s]].used_max_p1());
+    }
+    return result;
+}
+// GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length. For every
+// sequence in the ubatch, the highest used cell index carrying that sequence
+// plus 1 (cell space, no padding, holes irrelevant — the mask governs them);
+// reduced by max over sequences so one plain-FA node covers the whole batch.
+// 0 means no sequence has live cells; the graph route maps that to the off
+// sentinel. This is deliberately NOT get_n_kv(): the stock builder pads the
+// graph width for graph reuse, which is exactly what this lane must not do.
+int32_t llama_kv_cache::get_seq_used_max_p1_batch(const llama_ubatch & ubatch) const {
+    if (other) {
+        return other->get_seq_used_max_p1_batch(ubatch);
+    }
+
+    int32_t result = 0;
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+        if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+            continue;
+        }
+        result = std::max(result, (int32_t) v_cells[seq_to_stream[seq_id]].seq_used_max_p1(seq_id));
+    }
+    return result;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -2676,7 +2707,29 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     //const int64_t t_end = ggml_time_us();
 
-    //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+
+
+void llama_kv_cache_context::set_input_nkv_eff(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_UNUSED(ubatch);
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_nelements(dst) == 1);
+
+    // The same streams shape the K/V views and the unpadded bound.
+    const uint32_t result = kv->get_used_max_p1(sinfos[i_cur]);
+
+    const int32_t n_kv_eff = (int32_t) result;
+    ggml_backend_tensor_set(dst, &n_kv_eff, 0, sizeof(int32_t));
+}
+// GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length of the
+// currently applied ubatch, in cell space without padding. Unlike
+// set_input_nkv_eff (device tensor refreshed per eval), this feeds an FA op
+// param written at graph build, so it is only ever consumed behind the graph
+// reuse disable that the gate also arms in llama-context.cpp.
+int32_t llama_kv_cache_context::get_n_kv_req(const llama_ubatch & ubatch) const {
+    return kv->get_seq_used_max_p1_batch(ubatch);
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -3717,12 +3770,19 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
-ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, int32_t n_kv_read) const {
+    // GGML_TP5_FA_NKV_PARAM (exact "1"): n_kv_read in (0, n_kv] narrows the
+    // read view to the request's true KV length (cell space, no padding); the
+    // FA kernels bound every K/V/mask read at the same value (op_params slot
+    // 5, launcher fail-closed), so no read can pass the narrower view. Any
+    // other value keeps the stock cache-width view.
+    const uint32_t n_kv_eff = (n_kv_read > 0 && n_kv_read <= (int32_t) n_kv) ? (uint32_t) n_kv_read : n_kv;
+    return kv->get_k(ctx, il, n_kv_eff, sinfos[i_cur]);
 }
 
-ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, int32_t n_kv_read) const {
+    const uint32_t n_kv_eff = (n_kv_read > 0 && n_kv_read <= (int32_t) n_kv) ? (uint32_t) n_kv_read : n_kv;
+    return kv->get_v(ctx, il, n_kv_eff, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_turbo_rotation() const {

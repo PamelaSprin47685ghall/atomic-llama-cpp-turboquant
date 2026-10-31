@@ -7,12 +7,15 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-union-binder.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <map>
+#include <memory>
 #include <vector>
+struct llama_nkv_ctx_state;
 
 struct llama_model;
 class llama_batch_allocr;
@@ -271,6 +274,12 @@ public:
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
+    // the context's long-lived inference graph result (accessor used by the
+    // union-binder state in llama-nout-state.cpp; a member-function
+    // declaration that adds no data member of its own - note that
+    // llama_context itself does gain one opaque state member below, by
+    // design)
+    llm_graph_result * get_gf_res_prev() const { return gf_res_prev.get(); }
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
@@ -288,6 +297,70 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    // union-graph runtime parameter binder (table-driven; see llama-union-binder.h).
+    //
+    // The live graph is built at the KV cache's CURRENT true n_kv (no
+    // envelope, no headroom, no bucket sizing on the binder's side) and its
+    // pre-allocation skeleton + per-tensor byte extents are stored in the
+    // context's union-binder state slot. When the KV cache's n_kv moved, the
+    // binder rebuilds the graph in a scratch result at the cache's CURRENT
+    // n_kv, verifies the node skeleton matches, checks every changed tensor
+    // still fits inside the live graph's recorded extents, and copies the
+    // changed fields (ne/nb/op_params/view_offs/data) into the live graph in
+    // place. Fail-closed: any mismatch or any n_kv past the built width falls
+    // back to a full rebuild at the cache's exact current n_kv.
+    //
+    // llama_union_binder dispatches per llama_union_param_kind: n_kv and
+    // n_outputs are registered (n_outputs only when no backend samplers are
+    // attached); rs_z is a reserved registration point.
+    //
+    // env: GGML_TP5_UNION_BINDER (enabled only by the exact value "1"); there
+    // is no separate outputs-lane env var - the legacy
+    // LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME lane was replaced by the registered
+    // n_outputs binding.
+    llama_union_tensor_set union_tensors_n_kv();
+
+    // returns true when res's graph was patched in place and can be reused
+    bool union_rebind_n_kv(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set);
+
+    // n_outputs binding: shares the nkv lane's pre-allocation record (one live
+    // graph, one fresh-build record)
+    llama_union_tensor_set union_tensors_n_outputs();
+
+    // narrows/restores the executed output shapes of the live build
+    // to this ubatch's active count
+    bool union_rebind_outputs(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set);
+
+public:
+    // the state slot, created on demand; only the constructor's env-derived
+    // gate blocks create it, so with GGML_TP5_UNION_BINDER unset the context
+    // allocates no binder state at all
+    llama_nkv_ctx_state & union_binder_state_get();
+
+    // read-only view of the state slot, or nullptr when the slot does not
+    // exist (i.e. the binder gate was off) - never creates it; used by
+    // OFF-reachable paths and by llama-nout-state.cpp to map a graph result
+    // back to its owning context
+    const llama_nkv_ctx_state * union_binder_state_peek() const;
+
+private:
+    // record the pre-allocation skeleton + byte extents of a freshly built (not
+    // yet sched-placed) graph into the context's union-binder state slot (shared
+    // by the nkv and n_outputs lanes; renamed from nkv_record_snapshot - the
+    // record now serves both kinds). nkv_built: the exact n_kv the graph was
+    // built at (r8 coverage lane classifier input; 0 when the nkv lane did
+    // not record this build).
+    void binder_record_snapshot(ggml_cgraph * gf, uint32_t nkv_built);
+
+    // shared scratch-validate-patch tail of every binding: build the scratch
+    // graph from gp, require an exact skeleton match against the recorded
+    // fresh build, check every changed tensor fits its recorded byte
+    // extent, and copy the changed fields into the live graph in place.
+    // Takes gp by value: the caller sets res/n_outputs/cb before dispatching.
+    // cov_patched_out (r8 coverage lane, may be null): when non-null the
+    // apply loop bumps the per-category count of every changed tensor.
+    bool union_binder_scratch_patch(llm_graph_result * res, llm_graph_params gp, const llama_union_tensor_set & set, uint32_t * cov_patched_out);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -444,6 +517,16 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // opaque per-context state of the union-graph runtime binder
+    // (llama_nkv_ctx_state, defined in llama-nout-state.h; unique_ptr to an
+    // incomplete type - ~llama_nkv_ctx_state and the unique_ptr destruction
+    // are instantiated only in ~llama_context, which is out-of-line in
+    // llama-context.cpp where the type is complete). Exception-safe: if the
+    // constructor body throws after the slot was created, member destruction
+    // still runs and frees the slot; no leak. All access goes through
+    // llama_nkv_ctx_state_get() / llama_context::union_binder_state_peek().
+    std::unique_ptr<llama_nkv_ctx_state> union_binder_state;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

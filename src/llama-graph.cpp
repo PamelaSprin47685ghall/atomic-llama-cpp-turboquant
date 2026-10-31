@@ -13,6 +13,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-nout-state.h"
 
 #include <cassert>
 #include <cmath>
@@ -22,8 +23,45 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 
-// MoE down-proj activation path — CUDA is first-class, not an exception.
+// State placement (no blanket "layout unchanged" claim: llm_graph_result
+// itself does gain an owner member, see llama-graph.h): all per-object state
+// of the lanes lives in the context's own state slot (llama-nout-state.h/cpp)
+// or in the binder's shared build record; there are no TU-local side
+// tables here.
+
+llm_graph_input_out_ids::~llm_graph_input_out_ids() = default;
+
+// GGML_TP5_FA_CHECKED_TAIL / GGML_TP5_FA_RTLEN: exact-"1" env gates for the
+// runtime effective-KV-length lane. CHECKED_TAIL is the required gate name and
+// also arms the streamed checked tail; RTLEN is the r4-lineage alias accepted
+// so the landed kernel/dispatch paths keep their documented contract. Either
+// value (or both) arms the host I32 input lane, the CUDA dispatch reroute and
+// the streamed checked tail; OFF (neither set, or any other value) leaves the
+// graph build and every kernel launch bitwise stock. Read once.
+static bool llama_graph_rtlen_enabled() {
+    static const bool enabled = [] {
+        const char * ct = getenv("GGML_TP5_FA_CHECKED_TAIL");
+        if (ct != nullptr && strcmp(ct, "1") == 0) {
+            return true;
+        }
+        const char * rl = getenv("GGML_TP5_FA_RTLEN");
+        return rl != nullptr && strcmp(rl, "1") == 0;
+    }();
+    return enabled;
+}
+// GGML_TP5_FA_NKV_PARAM (exact "1", r8): per-request true runtime KV length
+// carried in the plain-FA op params slot 5 and consumed as a scalar kernel
+// launch argument. Independent of the r6/r7 lanes; a build-time value, so the
+// gate also disables graph reuse in llama-context.cpp to keep it per-eval.
+static bool llama_graph_fa_nkv_param_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_TP5_FA_NKV_PARAM");
+        return env != nullptr && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
 //
 // Default (CUDA / HIP / Vulkan / CPU): pass SwiGLU acts straight into
 // MUL_MAT_ID. On CUDA the act path is F32→Q8_1; an L2 rescale chain is pure
@@ -64,8 +102,19 @@ static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+        const llama_cparams & cparams,
+        int32_t n_kv_read = -1) {
+    // GGML_TP5_FA_NKV_PARAM (exact "1"): n_kv_read > 0 requests the mask at the
+    // true KV length (cell space, max over the ubatch's sequences of the
+    // per-sequence used-cell frontier). The accepted width is the SAME clamp
+    // as llama_kv_cache_context::get_k/get_v - only a value in (0,
+    // mctx->get_n_kv()] is used; anything else falls back to the stock cache
+    // width - so the mask and the FA read views can never disagree on the
+    // width, whatever the caller passes. The fill (set_input_kq_mask) bounds
+    // every write at dst->ne[0], and cells at or past each token's own
+    // sequence frontier stay -INF.
+    const auto n_kv     = (n_kv_read > 0 && n_kv_read <= (int32_t) mctx->get_n_kv()) ?
+        (uint32_t) n_kv_read : mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
@@ -230,6 +279,40 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_graph_input_pos_bucket_kv::can_reuse(const llm_graph_params & params) {
+    // r8 coverage lane: mirror can_reuse_kq_mask for the [n_kv, n_tokens]
+    // relative-position bucket over the KV cache. The bucket's refill
+    // (set_input_pos_bucket) asserts a single stream and a non-eq-seq batch,
+    // so both are part of this input's reuse key.
+    // The coverage gate must accompany at least one binder lane gate: the
+    // stock reuse path consults this input even when no slot exists.
+    static const bool cov_gate = [] {
+        const char * c = getenv("GGML_TP5_NKV_COV");
+        const char * t = getenv("GGML_TP5_NKV_TRUEWIDTH");
+        const char * u = getenv("GGML_TP5_UNION_BINDER");
+        return c != nullptr && strcmp(c, "1") == 0 &&
+               ((t != nullptr && strcmp(t, "1") == 0) ||
+                (u != nullptr && strcmp(u, "1") == 0));
+    }();
+    if (!cov_gate) {
+        return false;
+    }
+
+
+    const auto n_kv     = mctx->get_n_kv();
+    const auto n_tokens = params.ubatch.n_tokens;
+
+    bool res = true;
+
+    res &= pos_bucket->ne[0] == n_kv;
+    res &= pos_bucket->ne[1] == n_tokens;
+    res &= params.ubatch.n_seqs_unq == 1;      // the refill asserts a single stream
+    res &= !params.ubatch.equal_seqs();        // and a non-eq-seq batch
+
+    return res;
+}
+
+
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
@@ -260,6 +343,12 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
+    // NOTE: stock. The input's reuse key stays the active
+    // n_outputs: the graph always builds at the exact active
+    // count, so a changed count refuses reuse here and the
+    // caller hands the difference to the binder's n_outputs
+    // rebind (reconciles within the built width) or falls
+    // back to a full rebuild.
     res &= n_outputs == params.n_outputs;
 
     return res;
@@ -510,6 +599,13 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
+
+    // GGML_TP5_FA_RTLEN: refresh the runtime effective KV length read by the FA
+    // kernels from src[5]. Value = true used length (max used_max_p1 over streams),
+    // never the 256-aligned envelope.
+    if (self_nkv_eff && self_nkv_eff->buffer) {
+        mctx->set_input_nkv_eff(self_nkv_eff, ubatch);
+    }
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
@@ -1494,6 +1590,13 @@ void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
 }
+
+const llm_graph_params & llm_graph_result::get_params() const {
+    return params;
+}
+
+
+
 
 //
 // llm_graph_context
@@ -2541,6 +2644,10 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     //    return nullptr;
     //}
 
+    // NOTE: stock. The graph always builds at the exact active count (the
+    // graph-context member == the context's active n_outputs); the n_outputs
+    // binding reconciles the executed shapes WITHIN the built width and never
+    // builds over a padded envelope.
     auto inp = std::make_unique<llm_graph_input_out_ids>(hparams, cparams, n_outputs);
 
     auto & cur = inp->out_ids;
@@ -2654,12 +2761,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v,
          ggml_tensor * kq_b,
          ggml_tensor * kq_mask,
+         ggml_tensor * nkv_eff,
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                   int   il,
+                   int32_t nkv_runtime) const {
     const bool v_trans = v->nb[1] > v->nb[2];
+
+    // FA's KV axis before the (0,2,1,3) permute below. This is the width the
+    // launcher later sees as K->ne[1], and it is the width the K/V read views
+    // and the KQ mask were clamped to.
+    const int64_t n_kv_built = k->ne[2];
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
@@ -2679,7 +2793,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
-
+        // GGML_TP5_FA_NKV_PARAM (r8): the mask row length must equal the KV
+        // width of the read views. The FA kernels take the mask row stride from
+        // nb[1] (tile) or assume it equals K->ne[1] (vec), so a mask narrower
+        // than the K view would be indexed past its allocation. The shared
+        // builder narrows mask and views together, and stock-width consumers
+        // never narrow either; this assert turns any future mismatch into an
+        // immediate host-side failure instead of a device OOB read.
+        GGML_ASSERT(kq_mask == nullptr || kq_mask->ne[0] == n_kv_built);
         if (v_trans) {
             v = ggml_transpose(ctx0, v);
         }
@@ -2696,13 +2817,34 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+
+        // GGML_TP5_FA_RTLEN: attach the caller-provided runtime n_kv_eff tensor
+        // (owned by the attn_kv input object, refreshed per eval in set_input()).
+        // nullptr (feature off, or a builder without an owner) keeps src[5] empty
+        // and the kernel on the stock path.
+        if (nkv_eff != nullptr) {
+            cur->src[5] = nkv_eff;
+        }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
-
+        // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length in op
+        // params slot 5. Gate on: every plain-FA node gets a defined value
+        // (the request length, or -1 when this builder carries no lane), so
+        // the launcher never reads an uninitialized slot. The value is clamped
+        // exactly like the mask builder and get_k/get_v: only (0, built KV
+        // width] is backed by the tensors; anything else falls back to the off
+        // sentinel instead of publishing a bound the launcher would reject.
+        // Gate off: nothing is written and the slot stays byte-identical to
+        // stock.
+        if (llama_graph_fa_nkv_param_enabled()) {
+            const int32_t nkv_publish =
+                (nkv_runtime > 0 && nkv_runtime <= (int32_t) n_kv_built) ? nkv_runtime : -1;
+            ggml_flash_attn_ext_set_n_kv_runtime(cur, nkv_publish);
+        }
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
         // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
         // Group size must come from K (which determines the WHT rotation), not V.
@@ -2882,7 +3024,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2905,9 +3047,15 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+               bool      fa_true_len) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
+    // GGML_TP5_FA_NKV_PARAM (r8): the opt-in is per graph. Only the plain FA
+    // build_attn() path narrows the mask and the K/V read views together and
+    // publishes the matching op param; every other consumer of this input keeps
+    // the stock width.
+    inp->fa_true_len = fa_true_len;
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -2935,8 +3083,39 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
                 inp->readers.push_back(std::move(reader));
             }
         } else {
-            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            // GGML_TP5_FA_NKV_PARAM (exact "1"): with flash attention, the KQ
+            // mask carries the request's true KV length (get_n_kv_req: max over
+            // the ubatch's sequences; 0 live cells -> -1 sentinel -> stock
+            // width, matching the op param's off sentinel). This branch is
+            // reader-free by construction; the fill bounds at dst->ne[0].
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams,
+                    (cparams.flash_attn && inp->fa_true_len && llama_graph_fa_nkv_param_enabled()) ?
+                        mctx_cur->get_n_kv_req(ubatch) : -1);
             inp->self_kq_mask_cnv = inp->self_kq_mask;
+        }
+    }
+
+    // GGML_TP5_FA_RTLEN: the runtime effective KV length input tensor (i32[1]).
+    // Created once per graph; refreshed per eval in set_input(); attached to
+    // every FA node's src[5] by build_attn_mha.
+    if (llama_graph_rtlen_enabled()) {
+        inp->self_nkv_eff = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(inp->self_nkv_eff);
+        ggml_set_name(inp->self_nkv_eff, "nkv_eff");
+    }
+    // GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length, computed
+    // once per graph build from the already-applied cell state (mctx->apply()
+    // precedes graph build in every decode path). The gate also disables graph
+    // reuse in llama-context.cpp, so this value always belongs to the eval
+    // being computed; the write happens in build_attn_mha. fa_true_len = false
+    // keeps the whole lane off for graphs whose mask is stock width (custom
+    // build_attn_mha consumers): there the value must not reach the op param.
+    if (inp->fa_true_len && llama_graph_fa_nkv_param_enabled()) {
+        inp->self_nkv_req = mctx_cur->get_n_kv_req(ubatch);
+        if (inp->self_nkv_req == 0) {
+            // no live cells for any sequence in this ubatch: no bound exists,
+            // keep the op params untouched (off sentinel)
+            inp->self_nkv_req = -1;
         }
     }
 
@@ -2946,14 +3125,13 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     return inp;
 }
 
-llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv(bool fa_true_len) const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, fa_true_len);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
-
 ggml_tensor * llm_graph_context::build_attn_reader(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * q_rope,
@@ -3101,8 +3279,19 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    // GGML_TP5_FA_NKV_PARAM (exact "1"): the FA read views carry the request's
+    // true KV length (self_nkv_req, set by build_attn_inp_kv_impl), matching
+    // the narrowed KQ mask and the op param written in build_attn_mha; the FA
+    // kernels bound every K/V/mask read at the same value, so no read passes
+    // the narrower views. The reader subpath (attention views) can address
+    // cells of sequences outside this ubatch and keeps the stock full-width
+    // views. inp->fa_true_len = false (non-plain-attention graph) keeps the
+    // stock widths, so the mask can never be narrower than these views.
+    // OFF, non-FA attention, empty live set (-1 sentinel): stock.
+    const int32_t nkv_read = (cparams.flash_attn && inp->readers.empty() && inp->fa_true_len &&
+                              llama_graph_fa_nkv_param_enabled()) ? inp->self_nkv_req : -1;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il, nkv_read);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il, nkv_read);
 
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
@@ -3120,8 +3309,15 @@ ggml_tensor * llm_graph_context::build_attn(
 
     GGML_ASSERT(inp->readers.empty() || kq_b == nullptr);
     ggml_tensor * cur = inp->readers.empty() ?
-        build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il) :
+        build_attn_mha(q, k, v, kq_b, kq_mask, inp->self_nkv_eff, sinks, v_mla, 0, kq_scale, il, inp->self_nkv_req) :
         build_attn_reader(inp, q_rope, q, k, v, sinks, kq_scale, il);
+    // GGML_TP5_FA_RTLEN: every FA node reads the runtime effective KV length from
+    // src[5] (the shared i32[1] input tensor owned by the attn_kv input object;
+    // refreshed per eval in set_input()). OFF: the tensor is nullptr, src[5] stays
+    // empty, kernels take the stock path.
+    if (inp->self_nkv_eff != nullptr && cur->op == GGML_OP_FLASH_ATTN_EXT) {
+        cur->src[5] = inp->self_nkv_eff;
+    }
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, the output has padded dimensions.
@@ -3254,7 +3450,7 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded (MLA: V is view of K, may have padded dim),
@@ -3365,7 +3561,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, nullptr, sinks, v_mla, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -3455,7 +3651,7 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
@@ -3553,7 +3749,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = k;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (k_rot) {
@@ -3612,7 +3808,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -3897,11 +4093,11 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
     );
 }
 
-llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
+llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid(bool fa_true_len) const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), fa_true_len);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

@@ -208,6 +208,18 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    // r8 coverage lane (GGML_TP5_NKV_COV exact "1" AND at least one binder
+    // lane gate - GGML_TP5_NKV_TRUEWIDTH or GGML_TP5_UNION_BINDER - exact
+    // "1"): the bucket over the KV cache is nkv-coupled ([n_kv, n_batch]).
+    // This can_reuse is consulted on the stock reuse path even when no state
+    // slot exists, so it activates only when the coverage gate accompanies a
+    // registered binder lane; any other combination (cov alone included)
+    // keeps the conservative base refusal - stock, every round rebuilds
+    // exactly as before r8. With the lane on it mirrors can_reuse_kq_mask -
+    // the live bucket shape must match the cache's CURRENT n_kv and this
+    // ubatch's token count.
+    bool can_reuse(const llm_graph_params & params) override;
+
     ggml_tensor * pos_bucket = nullptr; // I32 [n_kv, n_batch]
 
     const llama_hparams hparams;
@@ -221,7 +233,7 @@ public:
             const llama_hparams & hparams,
             const llama_cparams & cparams,
             uint32_t n_outputs) : hparams(hparams), cparams(cparams), n_outputs(n_outputs) {}
-    virtual ~llm_graph_input_out_ids() = default;
+    virtual ~llm_graph_input_out_ids();
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -326,6 +338,21 @@ public:
 
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
+    // GGML_TP5_FA_RTLEN: per-FA-node runtime effective KV length input tensor
+    // (i32[1], created by build_attn_inp_kv()); refreshed in set_input() every eval.
+    ggml_tensor * self_nkv_eff = nullptr;
+    // GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length (cell
+    // space, no padding) computed once per graph build and written into every
+    // plain-FA node's op params slot 5; -1 keeps those params untouched.
+    int32_t self_nkv_req = -1;
+    // GGML_TP5_FA_NKV_PARAM (r8): true-length lane opt-in for THIS graph. The
+    // builder that creates this input decides it; the mask width, the K/V read
+    // view width and the FA op param are all derived from it, so a graph either
+    // narrows all three together or stays at the stock width. Consumers that
+    // pair the mask with stock-width views (custom build_attn_mha call sites,
+    // QSA indexers) must create the input with fa_true_len = false: a narrower
+    // mask than K->ne[1] makes the FA kernels index mask rows past the tensor.
+    bool fa_true_len = false;
     struct reader_span_input {
         ggml_tensor * indices;
         ggml_tensor * position;
@@ -750,6 +777,7 @@ struct llm_graph_fused_node {
 
 // callback that allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
+class llama_context;
 
 class llm_graph_result;
 
@@ -909,7 +937,19 @@ public:
 
     void set_params(const llm_graph_params & params);
 
+    // the params the graph was last built with (encapsulation accessor: keeps
+    // the params member private; used by llama_context's union-graph runtime
+    // n_kv binder to verify non-nkv graph keys are unchanged before patching;
+    // adds no data member of its own - note llm_graph_result DOES gain the
+    // owner member below, by design)
+    const llm_graph_params & get_params() const;
 
+    // the llama_context that owns this result object (set by the context when
+    // the result is (re)created; nullptr for scratch/reserve results). Used by
+    // the union-graph runtime binder state lookup (llama-nout-state.cpp) to
+    // find the owning context from the graph params without any global map.
+    const llama_context * get_owner() const { return owner; }
+    void set_owner(const llama_context * ctx) { owner = ctx; }
 
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
@@ -944,9 +984,15 @@ private:
     // note: these are updated after constructing the new graph
     llm_graph_params params;
 
+    // the owning llama_context (see get_owner()/set_owner(); nullptr until the
+    // owning context claims the result). Pointer member: llama_context is only
+    // forward-declared here.
+    const llama_context * owner = nullptr;
+
     // env: LLAMA_GRAPH_RESULT_DEBUG
     int debug = 0;
 };
+
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 
@@ -1152,11 +1198,15 @@ struct llm_graph_context {
             ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans = false)
             ggml_tensor * kq_b,
             ggml_tensor * kq_mask,
+            ggml_tensor * nkv_eff, // [1] i32 runtime effective KV length (rtlen) or nullptr
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                    // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length
+                    // (cell space, no padding); -1 writes no op param.
+                    int32_t nkv_runtime = -1) const;
 
     ggml_tensor * build_attn_reader(
         llm_graph_input_attn_kv * inp,
@@ -1184,7 +1234,9 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    llm_graph_input_attn_kv * build_attn_inp_kv() const;
+    // fa_true_len: false keeps the whole graph at stock mask/K/V widths even
+    // when GGML_TP5_FA_NKV_PARAM=1 (opt-out for non-plain attention builders).
+    llm_graph_input_attn_kv * build_attn_inp_kv(bool fa_true_len = true) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
@@ -1332,7 +1384,7 @@ struct llm_graph_context {
     // hybrid
     //
 
-    llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
+    llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool fa_true_len = true) const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;

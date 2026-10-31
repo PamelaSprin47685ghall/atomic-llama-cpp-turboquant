@@ -191,9 +191,18 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
-    std::vector<uint32_t> get_layer_ids() const;
+
+    // Maximum occupied physical cell bound among the participating streams.
+    uint32_t get_used_max_p1(const slot_info & sinfo) const;
+
+    // GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length — the max
+    // over the ubatch's unique sequences of that sequence's used-cell frontier
+    // (cell space, no padding); 0 when no sequence has cells. The caller turns
+    // 0 into the off sentinel: a request with no live cells imposes no bound.
+    int32_t get_seq_used_max_p1_batch(const llama_ubatch & ubatch) const;
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const;
+    std::vector<uint32_t> get_layer_ids() const;
     bool get_v_transposed() const;
 
     bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
@@ -501,12 +510,31 @@ public:
     bool has_attention_views() const;
     llama_attention_view_resolved attention_view(llama_seq_id seq, llama_pos pos) const;
 
+    // Write the maximum occupied cell bound across the current streams
+    // (runtime effective KV length consumed by the FA checked tail).
+    // Holes remain governed by the attention mask.
+    void set_input_nkv_eff(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // GGML_TP5_FA_NKV_PARAM (r8): per-request true runtime KV length for the
+    // current ubatch (max over its sequences of the per-sequence used-cell
+    // frontier; cell space, no padding). The plain-FA graph route turns this
+    // into the FA op param consumed at HIP launch.
+    int32_t get_n_kv_req(const llama_ubatch & ubatch) const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    // n_kv_read (GGML_TP5_FA_NKV_PARAM, exact "1"): FA read-view width override
+    // - the request's true KV length. Only a value in (0, n_kv] narrows the
+    // view; -1 (default), any non-positive value, or a value above the cache's
+    // current width falls back to the stock cache-width view (actual behavior:
+    // the view is created at mctx->get_n_kv(), no error, no narrowing). The
+    // KQ mask builder applies the same clamp against the same context, so the
+    // mask and these views always share one width. OFF is byte-identical to
+    // stock.
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, int32_t n_kv_read = -1) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, int32_t n_kv_read = -1) const;
 
     // TurboQuant rotation accessors
     ggml_tensor * get_turbo_rotation() const;

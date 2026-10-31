@@ -815,6 +815,9 @@ static __global__ void flash_attn_tile(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int  * n_kv_eff_ptr,
+        const bool fast_full_tiles,
+        const int32_t n_kv_runtime,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -843,7 +846,7 @@ static __global__ void flash_attn_tile(
     // Skip unused kernel variants for faster compilation:
 
     if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, n_kv_eff_ptr, fast_full_tiles, n_kv_runtime, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -859,6 +862,18 @@ static __global__ void flash_attn_tile(
     static_assert(ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols1*ncols2) != 0, "kernel config not defined");
 
     constexpr int ncols     = ncols1*ncols2;
+    // GGML_TP5_FA_RTLEN: runtime effective KV length; nullptr keeps stock ne11 bounds.
+    // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length (op param,
+    // read at HIP launch, -1 off). It only ever tightens the bound above; it
+    // never widens one, and a negative value keeps stock behavior exactly.
+    int n_kv_eff = n_kv_eff_ptr ? std::min((int32_t)*n_kv_eff_ptr, (int32_t)ne11) : ne11;
+    if (n_kv_runtime >= 0) {
+        n_kv_eff = std::min(n_kv_eff, (int) n_kv_runtime);
+    }
+    // Checked tail: only the last partial 256-block can have rows >= n_kv_eff.
+    // Rows past n_kv_eff are never read from K/V and are skipped in the softmax.
+    const bool check_tail = n_kv_eff_ptr != nullptr || n_kv_runtime >= 0;
+
     constexpr int warp_size = 32;
     constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
     constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
@@ -969,8 +984,44 @@ static __global__ void flash_attn_tile(
     __syncthreads();
 
     // Main loop over KV cache:
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    if (ncols2 == 1) {
+    // GGML_TP5_FA_RTLEN: the logical bound is the runtime length (never above the
+    // built width); the checked-tail iter covers the final partial 256-block.
+    const int k_VKQ_max = check_tail ? n_kv_eff
+        : (KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11);
+    if (check_tail) {
+        // Checked tail: the runtime bound replaces the static width; rows at or
+        // past n_kv_eff are never read from K/V and are skipped in the softmax.
+        if (fast_full_tiles) {
+            // GGML_TP5_FA_TILE_FAST_FULL (exact "1", r7): tiles that end at or
+            // below the runtime bound run the stock unchecked iterator (the
+            // per-row oob guards are dead there), only the final partial tile
+            // keeps the checks. Tile order, arithmetic and reduction sequence
+            // are unchanged; off (or r6 behavior) runs the always-checked loop.
+            for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+                if (k_VKQ_max - k_VKQ_0 >= nbatch_fa) {
+                    constexpr bool oob_check = false;
+                    flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+                        (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                        stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                } else {
+                    constexpr bool oob_check = true;
+                    flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+                        (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                        stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                }
+            }
+        } else {
+            // Checked tail: every tile is row-checked against the runtime
+            // length; the iter zero-fills K/V rows at or past n_kv_eff and
+            // skips their mask add.
+            for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+                constexpr bool oob_check = true;
+                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+                    (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+            }
+        }
+    } else if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
@@ -1150,7 +1201,7 @@ static __global__ void flash_attn_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, n_kv_eff_ptr, fast_full_tiles, n_kv_runtime, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,

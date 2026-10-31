@@ -543,14 +543,21 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    auto * inp_attn = build_attn_inp_kv();
+    // chained drafting: rows 1..n-1 take their inputs from the previous row's
+    // in-graph argmax and hidden state, so one decode drafts n_tokens tokens
+    const bool mtp_chain = params.cparams.mtp_chain && ubatch.n_seqs_unq == 1 && ubatch.token;
+
+    // GGML_TP5_FA_NKV_PARAM (r8): the chained graph builds its FA nodes through
+    // build_attn_mha with full-width cache views and no runtime op param, so a
+    // narrowed KQ mask would be shorter than the KV width and index past its
+    // allocation on the device. Keep that graph at stock widths; the standalone
+    // MTP path below uses the plain build_attn lane and keeps the true length.
+    auto * inp_attn = build_attn_inp_kv(!mtp_chain);
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    // chained drafting: rows 1..n-1 take their inputs from the previous row's
-    // in-graph argmax and hidden state, so one decode drafts n_tokens tokens
-    if (params.cparams.mtp_chain && ubatch.n_seqs_unq == 1 && ubatch.token) {
+    if (mtp_chain) {
         const auto * mctx_kv = static_cast<const llama_kv_cache_context *>(mctx);
 
         // per-step causal masks: row j of the stock kq mask (the mask builder pads
@@ -636,7 +643,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
             ggml_tensor * mask_b = ggml_view_2d(ctx0, kq_mask, n_kv, width, kq_mask->nb[1], (size_t) row0*kq_mask->nb[1]);
 
-            cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, 0, kq_scale, il);
+            cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, nullptr, 0, kq_scale, il);
 
             cur_b = ggml_mul(ctx0, cur_b, ggml_sigmoid(ctx0, gate_b));
             cur_b = build_lora_mm(layer.wo, cur_b, layer.wo_s);

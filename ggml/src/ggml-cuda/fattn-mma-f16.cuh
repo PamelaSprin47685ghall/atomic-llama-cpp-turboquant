@@ -2125,6 +2125,9 @@ static __global__ void flash_attn_ext_f16(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int32_t * n_kv_eff_ptr,
+        const bool fast_full_tiles,
+        const int32_t n_kv_runtime,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -2147,6 +2150,14 @@ static __global__ void flash_attn_ext_f16(
     const char * GGML_CUDA_RESTRICT V              = V_ptr;
     const char * GGML_CUDA_RESTRICT mask           = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks          = sinks_ptr;
+    // GGML_TP5_FA_RTLEN: the rtlen feature never selects this kernel (the CUDA
+    // dispatch routes rtlen FA to the checked-tail TILE/VEC kernels); the
+    // parameter exists only to match fattn_kernel_t.
+    // GGML_TP5_FA_NKV_PARAM (r8): same contract — the dispatch routes
+    // param-carrying FA to the TILE kernel, so the scalar stays unused here.
+    GGML_UNUSED(n_kv_eff_ptr);
+    GGML_UNUSED(fast_full_tiles);
+    GGML_UNUSED(n_kv_runtime);
     const int  * GGML_CUDA_RESTRICT KV_max         = use_sparse ? nullptr : KV_max_ptr;
     const int  * GGML_CUDA_RESTRICT sparse_indices = use_sparse ? KV_max_ptr : nullptr;
     float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
@@ -2320,7 +2331,7 @@ static __global__ void flash_attn_ext_f16(
         (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, rel_f, dstk, dst_meta_tile, scale, slope, logit_softcap,
          rel_extent, zt_Q, ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, n_kv_eff_ptr, fast_full_tiles, n_kv_runtime, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,

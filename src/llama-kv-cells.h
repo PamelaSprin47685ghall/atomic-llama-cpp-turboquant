@@ -94,6 +94,21 @@ public:
         return used.empty() ? 0 : *used.rbegin() + 1;
     }
 
+    // GGML_TP5_FA_NKV_PARAM (r8): per-request true used-cell frontier — the
+    // highest used cell index that still carries seq_id, plus 1; 0 when the
+    // sequence has no cells. Cell space, no padding. This is the per-request
+    // runtime KV length the FA kernels receive when the gate is armed; it is
+    // the tightest length that never drops a live cell of that sequence.
+    uint32_t seq_used_max_p1(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        for (auto it = used.rbegin(); it != used.rend(); ++it) {
+            if (seq[*it].test(seq_id)) {
+                return *it + 1;
+            }
+        }
+        return 0;
+    }
+
     bool get_has_shift() const {
         return has_shift;
     }

@@ -2478,6 +2478,14 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // GGML_TP5_FA_NKV_PARAM (r8): per-request runtime KV length for plain
+    // FLASH_ATTN_EXT, stored in op params slot 5 (i32). Only ever consumed as
+    // an upper bound, so the value must never exceed the built KV width.
+    // n_kv_runtime == -1 is the documented off sentinel (kernel-side clamp
+    // dead); any other negative value is rejected.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_runtime(
+            struct ggml_tensor * a,
+            int32_t              n_kv_runtime);
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

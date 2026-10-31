@@ -531,11 +531,17 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(inpL, "model.input_embed", -1);
     ggml_build_forward_expand(gf, inpL);
 
-    auto * inp = build_inp_mem_hybrid();
-
     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
     // the indexer cache inside it is absent when the GGUF has no indexer tensors
-    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
+
+    // GGML_TP5_FA_NKV_PARAM (r8): build_layer_attn pairs the KQ mask with
+    // full-width cache views in build_attn_qsa and feeds the mask width to the
+    // indexer's top-k selection; a narrowed mask would make those indices and
+    // the set_rows patch run past the mask tensor. Keep this graph at stock
+    // widths whenever the indexer can be active (no indexer -> dense path only,
+    // so the true-length lane stays available there).
+    auto * inp = build_inp_mem_hybrid(mctx_hyb->get_idx() == nullptr);
 
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
     if (mctx_idx) {
@@ -1192,7 +1198,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, nullptr, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
