@@ -65,6 +65,18 @@ static bool qwen4exp_hc_keep_lo_enabled() {
     return enabled;
 }
 
+// Experimental allocator-only router lifetime extension; disabled by default.
+static bool qwen4exp_router_scratch_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_TP5_MOE_ROUTER_SCRATCH");
+        if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0) {
+            throw std::runtime_error("GGML_TP5_MOE_ROUTER_SCRATCH must be unset, 0, or 1");
+        }
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 // Keep the two existing top-k outputs alive for the fused expert reduction.
 // Their views, not the internal argsort/divide tensors, are materialized outputs.
 static void qwen4exp_moe_keep_route(ggml_tensor * out) {
@@ -1478,6 +1490,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         }
     }
 
+    const bool retain_router = qwen4exp_router_scratch_enabled() &&
+            n_expert == 512 && n_expert_used == 10 && cur->ne[1] > 1;
+    const int router_first_node = retain_router ? ggml_graph_n_nodes(gf) : 0;
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1495,6 +1511,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
     qwen4exp_moe_keep_route(moe_out);
+    if (retain_router) {
+        ggml_tensor * router_input = nullptr;
+        int matches = 0;
+        for (int i = router_first_node; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op == GGML_OP_SOFT_MAX && node->ne[0] == 512 && node->ne[1] == cur->ne[1] &&
+                    node->ne[2] == 1 && node->ne[3] == 1) {
+                router_input = node->src[0];
+                ++matches;
+            }
+        }
+        if (matches != 1 || !router_input || router_input->op != GGML_OP_MUL_MAT ||
+                router_input->view_src != nullptr || router_input->type != GGML_TYPE_F32) {
+            throw std::runtime_error("router scratch requires one direct F32 router projection per Qwen4Exp layer");
+        }
+        router_input->flags |= GGML_TENSOR_FLAG_NO_REUSE;
+    }
 
     // Finish the existing expert reduction before independent HC/PLE branches
     // are expanded, so the down projection and reduction stay adjacent.
