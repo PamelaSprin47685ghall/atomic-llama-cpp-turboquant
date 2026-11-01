@@ -325,10 +325,14 @@ static __global__ void hc_owner_tail4_t1_q8_mmvq(
     const int row = stream * dim + j;
     const block_q8_0 * w = weights + int64_t(row) * blocks_per_row;
     const int kqs = vdr * (lane % (qi / vdr));
-    // tmp += vec_dot(...) over kbx = lane / 4, lane / 4 + 8, ... below 10.
+    // tmp += vec_dot(vx, &y[kby], kbx, kqs) over kbx = lane / 4, lane / 4 + 8, ... below 10.
+    // vec_dot_q8_0_q8_1 offsets the weights by kbx itself but reads the
+    // activation block it is handed, so the caller must pass &act[kby] with
+    // kby = kbx * (QK8_0 / QK8_1) = kbx, exactly as mul_mat_vec_q does.
     float partial = 0.0f;
     for (int kbx = lane / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
-        partial += vec_dot_q8_0_q8_1(w, act, kbx, kqs);
+        const int kby = kbx * (qk / QK8_1);
+        partial += vec_dot_q8_0_q8_1(w, &act[kby], kbx, kqs);
     }
     // Whole-warp reduction: every lane joins the shuffle tree, which is what
     // the generic kernel does and what __shfl_xor_sync requires.
@@ -372,7 +376,8 @@ static __global__ void hc_owner_tail4_rows_q8_mmvq(
         const block_q8_1 * a = act + r * blocks_per_row;
         float partial = 0.0f;
         for (int kbx = lane / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
-            partial += vec_dot_q8_0_q8_1(w, a, kbx, kqs);
+            const int kby = kbx * (qk / QK8_1);
+            partial += vec_dot_q8_0_q8_1(w, &a[kby], kbx, kqs);
         }
         const float sum = warp_reduce_sum<wave>(partial);
         if (lane == 0) {
