@@ -4,6 +4,8 @@
 #include "mmvf.cuh"
 
 #include <climits>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include "convert.cuh"
@@ -49,6 +51,69 @@ static __global__ void mul_mat_vec_bf16_load4(
     }
     if (lane == 0) {
         dst[row] = sum;
+    }
+}
+
+// Exact multi-column extension of the load4 matvec. Column c keeps the T=1
+// kernel's lane mapping, four-adjacent-BF16 weight chunks, FMA order and warp
+// reduction order verbatim, so its output is the T=1 kernel's output for
+// column c; the weight row is loaded once and used by every admitted column.
+// Only the columns that exist are computed: no padding or extra row is added.
+template<int threads_per_row, int ncols_dst>
+static __global__ void mul_mat_vec_bf16_load4_multi(
+        const nv_bfloat16 * x, const float * y, float * dst,
+        const int ncols, const int nrows) {
+    static_assert(ncols_dst == 2 || ncols_dst == 3, "admitted N2/N3 column count");
+    constexpr int warp_size = 32;
+    constexpr int waves_per_row = threads_per_row / warp_size;
+    const int row = blockIdx.x * (blockDim.x / threads_per_row) + threadIdx.x / threads_per_row;
+    const int lane = threadIdx.x % threads_per_row;
+    if (row >= nrows) {
+        return;
+    }
+
+    float acc[ncols_dst][4] = {};
+    for (int col = 4 * lane; col < ncols; col += 4 * threads_per_row) {
+        uint2 weights;
+        memcpy(&weights, x + int64_t(row) * ncols + col, sizeof(weights));
+#pragma unroll
+        for (int c = 0; c < ncols_dst; ++c) {
+            float4 values;
+            memcpy(&values, y + int64_t(c) * ncols + col, sizeof(values));
+            acc[c][0] = __fmaf_rn(__uint_as_float(weights.x << 16), values.x, acc[c][0]);
+            acc[c][1] = __fmaf_rn(__uint_as_float(weights.x & 0xffff0000u), values.y, acc[c][1]);
+            acc[c][2] = __fmaf_rn(__uint_as_float(weights.y << 16), values.z, acc[c][2]);
+            acc[c][3] = __fmaf_rn(__uint_as_float(weights.y & 0xffff0000u), values.w, acc[c][3]);
+        }
+    }
+
+    float sums[ncols_dst];
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        sums[c] = warp_reduce_sum<warp_size>((acc[c][0] + acc[c][1]) + (acc[c][2] + acc[c][3]));
+    }
+    if constexpr (threads_per_row > warp_size) {
+        __shared__ float partial[ncols_dst][waves_per_row];
+        if (lane % warp_size == 0) {
+#pragma unroll
+            for (int c = 0; c < ncols_dst; ++c) {
+                partial[c][lane / warp_size] = sums[c];
+            }
+        }
+        __syncthreads();
+        if (lane >= warp_size) {
+            return;
+        }
+#pragma unroll
+        for (int c = 0; c < ncols_dst; ++c) {
+            sums[c] = warp_reduce_sum<warp_size>(lane < waves_per_row ? partial[c][lane] : 0.0f);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int c = 0; c < ncols_dst; ++c) {
+            dst[int64_t(c) * nrows + row] = sums[c];
+        }
     }
 }
 
@@ -1005,6 +1070,72 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
+#if defined(GGML_USE_HIP)
+// Opt-in accounting for the exact N2/N3 load4 path. Both knobs are strict "1"
+// environment values; the multi-column branch stays disabled unless admitted.
+namespace {
+bool tp5_env_is_exact_one(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+bool tp5_bf16_load4_multi_enabled() {
+    static const bool enabled = tp5_env_is_exact_one("GGML_TP5_BF16_LOAD4_MULTI");
+    return enabled;
+}
+
+struct tp5_bf16_load4_multi_stat {
+    std::atomic<long long> ncols2_launches{0};
+    std::atomic<long long> ncols2_rows{0};
+    std::atomic<long long> ncols3_launches{0};
+    std::atomic<long long> ncols3_rows{0};
+};
+
+constexpr int tp5_bf16_load4_multi_max_dev = 64;
+tp5_bf16_load4_multi_stat tp5_bf16_load4_multi_stats[tp5_bf16_load4_multi_max_dev];
+
+void tp5_bf16_load4_multi_stats_dump() {
+    for (int dev = 0; dev < tp5_bf16_load4_multi_max_dev; ++dev) {
+        const auto & s = tp5_bf16_load4_multi_stats[dev];
+        const long long l2 = s.ncols2_launches.load(), r2 = s.ncols2_rows.load();
+        const long long l3 = s.ncols3_launches.load(), r3 = s.ncols3_rows.load();
+        if (l2 + r2 + l3 + r3 == 0) {
+            continue;
+        }
+        std::fprintf(stderr, "ggml_cuda_mul_mat_vec_f: BF16_LOAD4_MULTI final dev=%d ncols2_launches=%lld ncols2_rows=%lld ncols3_launches=%lld ncols3_rows=%lld\n",
+                     dev, l2, r2, l3, r3);
+    }
+    std::fflush(stderr);
+}
+
+void tp5_bf16_load4_multi_stats_note(int dev, int ncols_dst, int nrows, int ncols) {
+    static const bool enabled = tp5_env_is_exact_one("GGML_TP5_BF16_LOAD4_MULTI_STATS");
+    if (!enabled) {
+        return;
+    }
+    static const bool registered = [] { std::atexit(tp5_bf16_load4_multi_stats_dump); return true; }();
+    (void) registered;
+    if (dev < 0 || dev >= tp5_bf16_load4_multi_max_dev) {
+        return;
+    }
+    auto & s = tp5_bf16_load4_multi_stats[dev];
+    const long long first = ncols_dst == 2
+        ? s.ncols2_launches.fetch_add(1) + 1
+        : s.ncols3_launches.fetch_add(1) + 1;
+    if (ncols_dst == 2) {
+        s.ncols2_rows.fetch_add(nrows);
+    } else {
+        s.ncols3_rows.fetch_add(nrows);
+    }
+    if (first == 1) {
+        std::fprintf(stderr, "ggml_cuda_mul_mat_vec_f: BF16_LOAD4_MULTI first dev=%d ncols_dst=%d ncols=%d nrows=%d\n",
+                     dev, ncols_dst, ncols, nrows);
+        std::fflush(stderr);
+    }
+}
+} // namespace
+#endif
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -1115,6 +1246,51 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
                     ggml_cuda_kernel_launch(mul_mat_vec_bf16_load4<256>, launch,
                         src0_d, src1_d, dst_d, int(ne00), int(ne01));
                 }
+                return;
+            }
+
+            // Exact N2/N3 extension, opt-in. The T=1 branch above is unchanged;
+            // this branch runs only when the activation and destination are the
+            // matching contiguous two/three-column slab, so no padded or extra
+            // column is ever computed. Each column keeps the T=1 lane mapping,
+            // weight chunks and reduction order, and the weight row is read once.
+            if (tp5_bf16_load4_multi_enabled() &&
+                !ctx.quantized_matmul_f32 && cc == GGML_CUDA_CC_RDNA2 &&
+                ggml_cuda_info().devices[ctx.device].warp_size == 32 &&
+                !ids && !fusion_local.gate && !fusion_local.x_bias && !fusion_local.gate_bias &&
+                ne00 > 0 && ne00 <= INT_MAX - 1024 && ne00 % 4 == 0 && ne01 > 0 && ne01 <= INT_MAX &&
+                (ne11 == 2 || ne11 == 3) && ne10 == ne00 &&
+                ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+                ne0 == ne01 && ne1 == ne11 && ne2 == 1 && ne3 == 1 &&
+                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+                uintptr_t(src0_d) % alignof(uint2) == 0 &&
+                uintptr_t(src1_d) % alignof(float4) == 0 &&
+                uintptr_t(dst_d) % alignof(float) == 0) {
+                const int nrows = int(ne01);
+                if (ne00 <= 512) {
+                    const ggml_cuda_kernel_launch_params launch = {
+                        dim3((ne01 + 3) / 4, 1, 1), dim3(128, 1, 1), 0, ctx.stream(),
+                    };
+                    if (ne11 == 2) {
+                        ggml_cuda_kernel_launch(mul_mat_vec_bf16_load4_multi<32, 2>, launch,
+                            src0_d, src1_d, dst_d, int(ne00), nrows);
+                    } else {
+                        ggml_cuda_kernel_launch(mul_mat_vec_bf16_load4_multi<32, 3>, launch,
+                            src0_d, src1_d, dst_d, int(ne00), nrows);
+                    }
+                } else {
+                    const ggml_cuda_kernel_launch_params launch = {
+                        dim3(ne01, 1, 1), dim3(256, 1, 1), 0, ctx.stream(),
+                    };
+                    if (ne11 == 2) {
+                        ggml_cuda_kernel_launch(mul_mat_vec_bf16_load4_multi<256, 2>, launch,
+                            src0_d, src1_d, dst_d, int(ne00), nrows);
+                    } else {
+                        ggml_cuda_kernel_launch(mul_mat_vec_bf16_load4_multi<256, 3>, launch,
+                            src0_d, src1_d, dst_d, int(ne00), nrows);
+                    }
+                }
+                tp5_bf16_load4_multi_stats_note(int(ctx.device), int(ne11), nrows, int(ne00));
                 return;
             }
 #endif
