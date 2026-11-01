@@ -722,6 +722,11 @@ struct llama_model {
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
+    // set once at load time from the loader's qualified HC pair profile; the split-state
+    // callback runs after loading and only holds the model, so it reads this instead of the
+    // loader. False for every model that does not enable GGML_TP5_HC_CONTEXT_OWNER.
+    bool hc_qualified_pairs = false;
+
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 

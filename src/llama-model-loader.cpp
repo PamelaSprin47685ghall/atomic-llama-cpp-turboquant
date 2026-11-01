@@ -535,23 +535,42 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<int,      6>>  (enum llm_kv kid, std::array<int,      6>   & result, uint32_t n, bool required);
 
 
-const std::map<std::string, bool> & llama_model_loader::hc_pair_profile() {
+const std::map<std::string, bool> & llama_model_loader::hc_pair_profile() const {
     // true: down [10240,320]; false: up [320,10240]. Never match by substring.
-    static const std::map<std::string, bool> profile = [] {
-        std::map<std::string, bool> result;
-        const auto add_pair = [&](const std::string & prefix) {
-            result.emplace(prefix + "down.weight", true);
-            result.emplace(prefix + "up.weight", false);
-        };
-        for (size_t layer = 0; layer < 48; ++layer) {
-            const std::string prefix = "blk." + std::to_string(layer);
-            add_pair(prefix + ".hc_attn_");
-            add_pair(prefix + ".hc_ffn_");
+    //
+    // Built per loader instance from this loader's weights_map, which holds the tensors of
+    // EVERY shard (the loader merges them by name and rejects duplicates). Reading the first
+    // shard's metadata instead would miss a tensor that lives in another shard - the attached
+    // NextN block sits in the third file - and a process-wide static would hand every later
+    // model the first one's tensor set.
+    if (hc_pair_profile_cache) {
+        return *hc_pair_profile_cache;
+    }
+    auto profile = std::make_unique<std::map<std::string, bool>>();
+    const auto add_pair = [&](const std::string & prefix) {
+        profile->emplace(prefix + "down.weight", true);
+        profile->emplace(prefix + "up.weight", false);
+    };
+    for (size_t layer = 0; layer < 48; ++layer) {
+        const std::string prefix = "blk." + std::to_string(layer);
+        add_pair(prefix + ".hc_attn_");
+        add_pair(prefix + ".hc_ffn_");
+    }
+    add_pair("output_hc_");
+    // The NextN/MTP block has the trunk's own HC modules plus a private head mixer. The model
+    // marks the head's hc_head_* as TENSOR_NOT_REQUIRED (a shared-mixer export carries none of
+    // them), so a pair is added only when the merged model really holds both matrices, in
+    // whichever shard they are stored. The completeness check then still demands every matrix
+    // the profile names.
+    for (const char * prefix : { "blk.48.hc_attn_", "blk.48.hc_ffn_", "blk.48.nextn.hc_head_" }) {
+        const std::string down = std::string(prefix) + "down.weight";
+        const std::string up   = std::string(prefix) + "up.weight";
+        if (get_weight(down.c_str()) != nullptr && get_weight(up.c_str()) != nullptr) {
+            add_pair(prefix);
         }
-        add_pair("output_hc_");
-        return result;
-    }();
-    return profile;
+    }
+    hc_pair_profile_cache = std::move(profile);
+    return *hc_pair_profile_cache;
 }
 
 const char * llama_model_loader::hc_weight_option_name() const {

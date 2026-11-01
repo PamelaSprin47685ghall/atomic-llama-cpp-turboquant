@@ -173,6 +173,19 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    // speculative-verify step: one sequence, [current, draft...] rows, full-vocabulary
+    // copies of the requested rows. See llama-ext.h for the contract.
+    // two_model = false: the model carries the NextN block (merged pair).
+    // two_model = true : the trunk has no NextN block and the head is a separate model.
+    int decode_n3_verify_logits(
+            llama_seq_id         seq_id,
+            llama_pos            p,
+            int32_t              n_rows,
+            const llama_token *  tokens,
+            const int32_t *      needs_logits,
+            float * const *      out_logits,
+            bool                 two_model);
+
     //
     // state save/load
     //
@@ -480,6 +493,10 @@ private:
     std::unique_ptr<llama_batch_allocr> balloc;
 
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
+
+    // set when decode_n3_verify_logits() could not rewind the sequence after a failed step: the
+    // memory caches may disagree from that point on, so every later verify call is refused.
+    bool n3_verify_unusable = false;
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
 

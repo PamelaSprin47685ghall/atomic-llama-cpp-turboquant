@@ -219,6 +219,19 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
             hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
         }
+    } else if (hparams.n_layer_nextn > 0) {
+        // The metadata array is length-checked against n_layer_all, so a checkpoint that
+        // carries the NextN block must also describe it. The block is a single dense-attention
+        // layer appended past the trunk: it is neither recurrent nor PLE, and it must not be,
+        // because graph_mtp runs a full-attention + MoE block over it. Refuse any other tail
+        // instead of building a head whose layer the graph would mis-read.
+        for (uint32_t i = hparams.n_layer(); i < hparams.n_layer_all; ++i) {
+            if (hparams.is_recr(i) || hparams.is_ple(i)) {
+                throw std::runtime_error(format(
+                        "NextN/MTP layer %u must be dense attention and non-PLE (recurrent=%d ple=%d)",
+                        i, int(hparams.is_recr(i)), int(hparams.is_ple(i))));
+            }
+        }
     }
 
     // the PLE conv history is a row of the recurrent cache, which linear layers alone have

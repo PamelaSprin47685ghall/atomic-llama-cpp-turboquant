@@ -163,14 +163,18 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     if (params.quantized_matmul_f32 || params.tp5_relay) {
         const bool dense_q8 = model.arch == LLM_ARCH_QWEN3 && model.ftype() == LLAMA_FTYPE_MOSTLY_Q8_0 &&
             hparams.n_embd == 4096 && hparams.n_layer() == 36 && hparams.n_expert == 0 && hparams.n_expert_used == 0;
-        const bool swift = model.arch == LLM_ARCH_QWEN4EXP && model.ftype() == LLAMA_FTYPE_MOSTLY_Q2_0 &&
-            hparams.n_embd == 2560 && hparams.n_layer() == 48 && hparams.n_expert == 512 && hparams.n_expert_used == 10 &&
+        // an attached NextN block adds a non-recurrent layer past the trunk; the trunk geometry
+        // this profile describes is unchanged, and the head's layer is checked by graph_mtp
+        const bool swift_trunk = model.arch == LLM_ARCH_QWEN4EXP && hparams.n_embd == 2560 &&
+            hparams.n_layer() == 48 && hparams.n_layer_all == hparams.n_layer() + hparams.n_layer_nextn;
+        const bool swift = swift_trunk && model.ftype() == LLAMA_FTYPE_MOSTLY_Q2_0 &&
+            hparams.n_expert == 512 && hparams.n_expert_used == 10 &&
             hparams.n_ff_exp == 640 && hparams.n_ff_shexp == 640 && hparams.ssm_d_conv == 4 &&
             hparams.ssm_d_state == 128 && hparams.ssm_n_group == 16 && hparams.ssm_dt_rank == 48 &&
             hparams.ssm_d_inner == 6144 && hparams.dsv4_hc_mult == 4 && hparams.hc_low_rank == 320 &&
             hparams.ple_n_heads == 16 && hparams.ple_head_dim == 160 && hparams.ple_ngram_size == 3 &&
             hparams.indexer_n_head == 4 && hparams.indexer_head_size == 128 && hparams.indexer_top_k == 2048;
-        if ((!dense_q8 && !swift) || hparams.vocab_only || hparams.no_alloc || hparams.n_layer_nextn != 0 ||
+        if ((!dense_q8 && !swift) || hparams.vocab_only || hparams.no_alloc ||
             hparams.n_swa != 0 || !hparams.causal_attn || !model.loras.empty() || model.has_tensor_overrides()) {
             throw std::runtime_error("quantized_matmul_f32 requires the Qwen3-8B Q8_0 or Swift Qwen4Exp mixed-Q2_0 profile without adapters or overrides");
         }
@@ -4281,6 +4285,19 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    // A context whose verify step failed to remove its speculative rows has memory caches that
+    // no longer agree (the recurrent state is ahead of the attention/indexer/PLE state). Every
+    // decode on it - not only another verify step - would compute on that disagreement, so the
+    // guard is here, at the one entry every decode goes through:
+    //   llama_decode() -> ctx->decode(), and llama_decode_n3_verify_logits[_pair]() -> decode()
+    // A context that never hit this condition is unaffected: the flag is false by default, is set
+    // only by a failed verify removal (decode_n3_verify_logits, n3_verify_unusable = true), and
+    // no other path writes it.
+    if (n3_verify_unusable) {
+        LLAMA_LOG_ERROR("%s: this context failed to roll back a verify step; its memory caches "
+                "no longer agree and no further decode is allowed on it\n", __func__);
+        return -1;
+    }
     if (backend_tp5_relay != nullptr &&
         (batch_inp.n_tokens <= 0 || uint32_t(batch_inp.n_tokens) > cparams.n_ubatch ||
          batch_inp.token == nullptr || batch_inp.embd != nullptr || !loras->empty() ||
@@ -4724,6 +4741,205 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    return 0;
+}
+
+//
+// speculative (N3) verify step
+//
+
+// The trunk's own decode loop feeds one token per active request per step, so the graph it
+// builds for a verify step never exists through llama_decode(). An MTP verify step is a
+// batch of [current, draft...] rows of ONE sequence at consecutive positions, which is a
+// decode of the same model at a wider ubatch shape. This entry point only accepts that
+// shape and adds the two things a capture needs: the full-vocabulary rows of THIS step's
+// graph (not of an N1 decode of the same sequence at some other time) and a refusal when
+// the context cannot export the NextN residual the draft head consumes.
+// `two_model` selects the qualified layout: a trunk with NO NextN block whose head is a separate
+// model. Everything else - the row contract, the guards, the copies, the return codes - is the
+// same code, so the two entry points cannot drift.
+int llama_context::decode_n3_verify_logits(
+        llama_seq_id         seq_id,
+        llama_pos            p,
+        int32_t              n_rows,
+        const llama_token *  tokens,
+        const int32_t *      needs_logits,
+        float * const *      out_logits,
+        bool                 two_model) {
+    const auto & vocab   = model.vocab;
+    const auto & hparams = model.hparams;
+    const int64_t n_vocab = vocab.n_tokens();
+
+    // A verify step is meaningful only when a draft head consumes these rows: either the model
+    // carries one NextN block itself, or the head is a separate model and this trunk exports the
+    // residual it consumes.
+    if (two_model) {
+        // qualified layout: the head is a separate model, so this trunk carries no NextN block.
+        // The block count is asserted from both sides - the trunk must have none, and the
+        // residual export below must exist - so a merged pair passed here is refused too.
+        if (hparams.n_layer_nextn != 0) {
+            LLAMA_LOG_ERROR("%s: the two-model entry point requires a trunk without a NextN block "
+                    "(n_layer_nextn=%u); use llama_decode_n3_verify_logits for a merged pair\n",
+                    __func__, hparams.n_layer_nextn);
+            return -1;
+        }
+    } else if (hparams.n_layer_nextn != 1) {
+        LLAMA_LOG_ERROR("%s: requires a model with exactly one NextN/MTP block (n_layer_nextn=%u)\n",
+                __func__, hparams.n_layer_nextn);
+        return -1;
+    }
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        LLAMA_LOG_ERROR("%s: requires the target (default decoder) context\n", __func__);
+        return -1;
+    }
+    if (n3_verify_unusable) {
+        LLAMA_LOG_ERROR("%s: this context failed a verify rewind earlier; its state is unusable\n", __func__);
+        return -1;
+    }
+    if (n_rows < 2 || n_rows > LLAMA_N3_VERIFY_MAX_ROWS) {
+        LLAMA_LOG_ERROR("%s: row count %d is outside [2, %d]\n", __func__, n_rows, LLAMA_N3_VERIFY_MAX_ROWS);
+        return -1;
+    }
+    // checked before the first tokens[i] / needs_logits[i]: every later index is bounded by n_rows,
+    // which is now known to be in [2, LLAMA_N3_VERIFY_MAX_ROWS]
+    if (tokens == nullptr) {
+        LLAMA_LOG_ERROR("%s: no token array given\n", __func__);
+        return -1;
+    }
+    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max) {
+        LLAMA_LOG_ERROR("%s: sequence %d outside [0, %u)\n", __func__, seq_id, cparams.n_seq_max);
+        return -1;
+    }
+    if (p < 0 || int64_t(p) + int64_t(n_rows) > int64_t(cparams.n_ctx)) {
+        LLAMA_LOG_ERROR("%s: positions [%lld, %lld) outside the context\n", __func__,
+                (long long) p, (long long) (int64_t(p) + int64_t(n_rows)));
+        return -1;
+    }
+    // The target graph publishes the wide NextN residual the head consumes. In the two-model
+    // layout the head is a separate model, so this export is the ONLY link between the two: if
+    // the trunk does not publish it, the head has no input and the rows cannot be verified.
+    if (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) {
+        LLAMA_LOG_ERROR("%s: the context must export unmasked NextN residuals "
+                "(llama_set_embeddings_nextn(ctx, true, false))\n", __func__);
+        return -1;
+    }
+    if (backend_tp5_relay != nullptr && uint32_t(n_rows) > cparams.n_ubatch) {
+        LLAMA_LOG_ERROR("%s: verify rows do not fit one tp5-relay ubatch (n_ubatch=%u)\n", __func__, cparams.n_ubatch);
+        return -1;
+    }
+    // the copies go through the context's logits buffer, which is sized for n_outputs_max rows
+    // and is only read back when it exists
+    if (logits.data == nullptr || n_vocab <= 0 ||
+            logits.size < size_t(uint64_t(n_vocab) * uint64_t(n_rows))) {
+        LLAMA_LOG_ERROR("%s: the context has no logits buffer for %d rows\n", __func__, n_rows);
+        return -1;
+    }
+    for (int32_t i = 0; i < n_rows; ++i) {
+        if (tokens[i] < 0 || int64_t(tokens[i]) >= n_vocab) {
+            LLAMA_LOG_ERROR("%s: row %d token %d outside the vocabulary\n", __func__, i, tokens[i]);
+            return -1;
+        }
+        const bool want = needs_logits == nullptr || needs_logits[i] != 0;
+        if (want && out_logits == nullptr) {
+            LLAMA_LOG_ERROR("%s: row %d requests logits but no destination was given\n", __func__, i);
+            return -1;
+        }
+    }
+
+    llama_batch batch = llama_batch_init(n_rows, 0, 1);
+    if (batch.token == nullptr || batch.pos == nullptr || batch.n_seq_id == nullptr ||
+            batch.seq_id == nullptr || batch.logits == nullptr) {
+        llama_batch_free(batch);
+        LLAMA_LOG_ERROR("%s: could not allocate the verify batch\n", __func__);
+        return -1;
+    }
+    batch.n_tokens = n_rows;
+    for (int32_t i = 0; i < n_rows; ++i) {
+        batch.token  [i]    = tokens[i];   // pointer: the array is the caller's three tokens
+        batch.pos    [i]    = llama_pos(int64_t(p) + i);
+        batch.n_seq_id[i]   = 1;
+        batch.seq_id [i][0] = seq_id;
+        // every row is an output row: all three are verified by the same step
+        batch.logits [i]    = 1;
+    }
+
+    // A failed step is not retryable at n_rs_seq == 0. The removal below is a PARTIAL removal of
+    // the recurrent (GDN) cache, and llama_memory_recurrent::seq_rm() only performs one when
+    // 1 <= (tail.pos - p + 1) <= n_rs_seq; the default context has n_rs_seq == 0, so the removal
+    // always fails and mutates nothing, while the hybrid memory returns before touching the
+    // attention cache, the indexer cache or the PLE history - the stores then disagree.
+    //
+    // The range is [p, p + n_rows): every position this call could have written. It is NEVER
+    // [p, -1) - that would also erase the sequence's existing, valid prefix (the prefill and
+    // every committed token).
+    //
+    // When the removal fails the context is marked unusable: this call and every later one
+    // return -3, and the caller must restore a full sequence state or destroy the context.
+    // Return codes after the batch was submitted, and ONLY these two:
+    //   -2  the step failed and the sequence was removed from p; the context is usable again
+    //       (this requires a recurrent state plane, i.e. n_rs_seq > 0 or the replay lane)
+    //   -3  the step failed and the removal failed too; the context is UNUSABLE
+    // -1 is never returned once decode() was called: it means "refused before anything was
+    // submitted", and reporting it after a submission would hide that state was written.
+    const auto rewind = [&](int cause) {
+        // bounded by the same int64 check as the position guard above, so the sum cannot wrap
+        const llama_pos end = llama_pos(int64_t(p) + int64_t(n_rows));
+        if (!memory->seq_rm(seq_id, p, end)) {
+            LLAMA_LOG_ERROR("%s: removal of [%lld, %lld) failed (n_rs_seq=%u, so a partial "
+                    "recurrent rollback is not available) after cause %d; the memory caches no "
+                    "longer agree and this context must not be used again\n", __func__,
+                    (long long) p, (long long) end, cparams.n_rs_seq, cause);
+            n3_verify_unusable = true;
+            return -3;
+        }
+        LLAMA_LOG_WARN("%s: step failed (cause %d) and [%lld, %lld) was removed; the sequence is "
+                "back at %lld\n", __func__, cause, (long long) p, (long long) end, (long long) p);
+        return -2;
+    };
+
+    const int rc = decode(batch);
+    llama_batch_free(batch);
+
+    if (rc != 0) {
+        LLAMA_LOG_ERROR("%s: verify decode failed (%d)\n", __func__, rc);
+        return rewind(rc);   // the underlying decode status is logged, not returned: see above
+    }
+
+    if (n_outputs != n_rows) {
+        LLAMA_LOG_ERROR("%s: verify step produced %d output rows, expected %d\n", __func__, n_outputs, n_rows);
+        return rewind(-100);  // not a decode status: this is the row-count check
+    }
+
+    // decode() queues the readback with ggml_backend_tensor_get_async; the host copy is only
+    // complete once the backend is synchronized. Do it before any row is copied out: reading
+    // an in-flight row would be a torn value, not a logits row.
+    synchronize();
+
+    // The output rows are the batch rows in batch order: one sequence with every row flagged
+    // output, so out_ids is [0, 1, 2] and llama_get_logits_ith(i) is batch row i.
+    //
+    // decode() can also leave output_swaps pending (it records them whenever the ubatch order
+    // differs from the batch order, and applies them lazily on the first getter). This entry
+    // point copies through the raw logits buffer instead of the getter, so apply them here:
+    // otherwise the raw buffer stays in ubatch order while every other getter of the context
+    // would see it reordered, and the next decode would clear a swap it never applied.
+    output_reorder();
+
+    for (int32_t i = 0; i < n_rows; ++i) {
+        const bool want = needs_logits == nullptr || needs_logits[i] != 0;
+        if (!want) {
+            continue;
+        }
+        const float * src = get_logits_ith(i);
+        if (src == nullptr) {
+            LLAMA_LOG_ERROR("%s: verify row %d has no logits\n", __func__, i);
+            return rewind(-101);  // not a decode status: a row is missing after a successful decode
+        }
+        // n_vocab and n_rows are both positive here and the buffer check above proves the
+        // context can hold n_vocab * n_rows floats; the copy is one row of that product
+        std::memcpy(out_logits[i], src, size_t(uint64_t(n_vocab) * sizeof(float)));
+    }
 
     return 0;
 }
@@ -6537,6 +6753,51 @@ bool llama_model_uses_shared_position_draft(const llama_model * model) {
 
 void llama_set_mtp_chain(llama_context * ctx, bool value) {
     ctx->set_mtp_chain(value);
+}
+
+int llama_decode_n3_verify_logits(
+        llama_context *       ctx,
+        llama_seq_id          seq_id,
+        llama_pos             p,
+        const llama_token     tokens[LLAMA_N3_VERIFY_MAX_ROWS],
+        const int32_t         needs_logits[LLAMA_N3_VERIFY_MAX_ROWS],
+        float * const         out_logits[LLAMA_N3_VERIFY_MAX_ROWS]) {
+    if (ctx == nullptr || tokens == nullptr) {
+        return -1;
+    }
+    // the declared row count is fixed at three: current + two drafts (MTP depth 2).
+    // `tokens` is an array parameter, so it decays to a pointer: pass it through unchanged.
+    // `out_logits` is optional only because a caller may ask for no copies; needs_logits == NULL
+    // then means "copy every row", which the callee refuses without destinations.
+    return ctx->decode_n3_verify_logits(seq_id, p, LLAMA_N3_VERIFY_MAX_ROWS,
+            tokens, needs_logits, out_logits, /*two_model=*/false);
+}
+
+int llama_decode_n3_verify_logits_pair(
+        llama_context *       ctx,
+        llama_seq_id          seq_id,
+        llama_pos             p,
+        const llama_token     tokens[LLAMA_N3_VERIFY_PAIR_MAX_ROWS],
+        const int32_t         needs_logits[LLAMA_N3_VERIFY_PAIR_MAX_ROWS],
+        float * const         out_logits[LLAMA_N3_VERIFY_PAIR_MAX_ROWS]) {
+    if (ctx == nullptr || tokens == nullptr) {
+        return -1;
+    }
+    // The row contract is the same as the single-model entry point; only the model shape differs.
+    // The two models are never merged here: this call touches only `ctx`, which must be a trunk
+    // context of the two-model pair, and the head model is not involved.
+    return ctx->decode_n3_verify_logits(seq_id, p, LLAMA_N3_VERIFY_PAIR_MAX_ROWS,
+            tokens, needs_logits, out_logits, /*two_model=*/true);
+}
+
+uint32_t llama_n3_verify_rollback_steps(llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    // Reported, never inferred: the recurrent cache's own n_rs_seq is what bounds a partial
+    // removal, and 0 means a failed step cannot be retried on this context. This is the same
+    // number the public llama_n_rs_seq() reports; the name here says what it is FOR.
+    return llama_n_rs_seq(ctx);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

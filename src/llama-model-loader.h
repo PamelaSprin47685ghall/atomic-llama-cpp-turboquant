@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -202,7 +203,11 @@ struct llama_model_loader {
 
     void done_getting_tensors(bool partial = false) const;
 
-    static const std::map<std::string, bool> & hc_pair_profile();
+    // per-loader and derived from THIS loader's weights_map (every shard), so a process that
+    // loads several models never reuses the first one's tensor set. Declared before the
+    // metadata members so it is destroyed after them.
+    mutable std::unique_ptr<std::map<std::string, bool>> hc_pair_profile_cache;
+    const std::map<std::string, bool> & hc_pair_profile() const;
     const char * hc_weight_option_name() const;
     bool is_hc_quantized_weight(const char * name) const;
     bool ctx_has_hc_quantized_weights(ggml_context * ctx) const;

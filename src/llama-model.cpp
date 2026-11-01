@@ -381,8 +381,20 @@ static bool llama_hc_context_owner_enabled() {
     return enabled;
 }
 
-static const std::map<std::string, bool> & llama_hc_context_owner_weights() {
-    return llama_model_loader::hc_pair_profile();
+// The profile is a per-loader member (derived from that loader's weights_map, i.e. from the
+// merged model), so it is reached through the loader instance. The split-state callback below
+// runs after loading and only holds the model, so the model carries the qualified flag and the
+// pair test there is name-based; both paths must agree, which is why the flag is set from the
+// loader's own profile at load time.
+static const std::map<std::string, bool> & llama_hc_context_owner_weights(const llama_model_loader & ml) {
+    return ml.hc_pair_profile();
+}
+
+// Same predicate as `profile.count(name)`, for callers that only have the model.
+static bool llama_hc_qualified_pair_name(const char * name) {
+    static const std::regex any_hc_pair(
+            R"(((?:blk\.\d+\.(?:hc_attn|hc_ffn|nextn\.hc_head)|output_hc)_)(down|up)\.weight)");
+    return name != nullptr && std::regex_match(name, any_hc_pair);
 }
 
 // The shared FFN's hidden dimension is partitioned once across five ranks.
@@ -420,7 +432,11 @@ static void llama_shared_expert_shard_validate_layout(const llama_model & model,
         throw std::runtime_error("GGML_TP5_SHARED_EXPERT_SHARD: " + reason);
     };
     const auto & hp = model.hparams;
-    if (model.arch != LLM_ARCH_QWEN4EXP || hp.n_layer_all != 48 || hp.n_layer_nextn != 0 ||
+    // the trunk geometry is unchanged by an attached NextN block, which this profile does not
+    // touch; accept it only when it is the one-block Swift pair and the trunk itself matches
+    const bool mtp_trunk = hp.n_layer_nextn == 1 && hp.n_layer_all == 49;
+    if (model.arch != LLM_ARCH_QWEN4EXP ||
+            !((hp.n_layer_all == 48 && hp.n_layer_nextn == 0) || mtp_trunk) ||
             hp.n_layer() != 48 || hp.n_embd != 2560 || hp.n_ff_shexp != 640 ||
             hp.n_expert != 512 || hp.n_expert_used != 10) {
         fail("requires Qwen4Exp with 48 trunk layers, no MTP, D=2560, shared FFN=640, and top10 of 512 experts");
@@ -501,7 +517,11 @@ static void llama_hc_context_owner_validate_layout(const llama_model & model, co
     };
     const ggml_type expected_type = ml.hc_weight_type;
     const auto & hp = model.hparams;
-    if (model.arch != LLM_ARCH_QWEN4EXP || hp.n_layer_all != 48 || hp.n_layer_nextn != 0 ||
+    // same reasoning as GGML_TP5_SHARED_EXPERT_SHARD: an attached NextN block leaves the 48
+    // trunk layers this profile covers untouched
+    const bool mtp_trunk = hp.n_layer_nextn == 1 && hp.n_layer_all == 49;
+    if (model.arch != LLM_ARCH_QWEN4EXP ||
+            !((hp.n_layer_all == 48 && hp.n_layer_nextn == 0) || mtp_trunk) ||
             hp.n_layer() != 48 || hp.n_embd != 2560 || hp.dsv4_hc_mult != 4 || hp.hc_low_rank != 320) {
         fail("requires Qwen4Exp with 48 trunk layers, no MTP, D=2560, HC=4, and low rank 320");
     }
@@ -523,7 +543,7 @@ static void llama_hc_context_owner_validate_layout(const llama_model & model, co
     if (!expected_buft) {
         fail("the Meta device has no default buffer type");
     }
-    const auto & expected = llama_hc_context_owner_weights();
+    const auto & expected = llama_hc_context_owner_weights(ml);
     std::map<std::string, bool> seen;
     static const std::regex any_hc_pair(
             R"(((?:blk\.\d+\.(?:hc_attn|hc_ffn|nextn\.hc_head)|output_hc)_)(down|up)\.weight)");
@@ -558,9 +578,13 @@ static void llama_hc_context_owner_validate_layout(const llama_model & model, co
             fail("missing HC tensor: " + weight.first);
         }
     }
-    GGML_ASSERT(expected.size() == 194 && seen.size() == expected.size());
-    LLAMA_LOG_INFO("%s: qualified 97 HC pairs (194 %s matrices) for five-rank %s storage\n",
-            __func__, ggml_type_name(expected_type), context_owner ? "mirrored context-owner" : "static-owner");
+    // 97 pairs (194 matrices) for the 48-layer trunk; an attached NextN block adds its own
+    // pairs, so the count is checked against the profile rather than a fixed 194.
+    GGML_ASSERT(seen.size() == expected.size());
+    GGML_ASSERT(expected.size() >= 194 && (expected.size() - 194) % 2 == 0);
+    LLAMA_LOG_INFO("%s: qualified %zu HC pairs (%zu %s matrices) for five-rank %s storage\n",
+            __func__, expected.size() / 2, expected.size(), ggml_type_name(expected_type),
+            context_owner ? "mirrored context-owner" : "static-owner");
 }
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
@@ -672,7 +696,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // derive this index from the same pair prefix; all other tensors ignore it.
     size_t hc_owner = ud->n_devices;
     auto get_tensor_config = [&]() -> tensor_config {
-        if (llama_hc_context_owner_enabled() && llama_hc_context_owner_weights().count(tensor_name)) {
+        if (ud->model->hc_qualified_pairs && llama_hc_qualified_pair_name(tensor_name.c_str())) {
             // Full model qualification is completed before weight buffers are
             // allocated. Shared physical children remain mirrored for all contexts.
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1987,6 +2011,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // weight buffers; do not silently mirror only part of the 97 HC pairs.
     llama_hc_context_owner_validate_layout(*this, ml);
     llama_shared_expert_shard_validate_layout(*this, ml);
+    // The split-state callback runs after loading and only holds the model; publish whether this
+    // model's HC pairs are qualified so that path does not need the loader.
+    hc_qualified_pairs = llama_hc_context_owner_enabled() && !ml.hc_pair_profile().empty();
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
@@ -2864,6 +2891,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     if (mtp_on_hybrid_qwen) {
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    }
+
+                    // A default context of a model that carries a NextN/MTP block attends only
+                    // its trunk layers: the draft head owns the block's KV in its own (MTP)
+                    // context. Without this filter the trunk cache also allocates a NextN-layer
+                    // slot set that no trunk graph ever writes or reads, i.e. a full extra
+                    // attention cache per context (the NextN block has n_head_kv heads at the
+                    // trunk's head width). The draft context keeps its filter above.
+                    if (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0 &&
+                            arch == LLM_ARCH_QWEN4EXP && filter == nullptr) {
+                        filter = [&](uint32_t il) { return il < hparams.n_layer(); };
                     }
 
                     if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3 || arch == LLM_ARCH_GLM_DSA ||
