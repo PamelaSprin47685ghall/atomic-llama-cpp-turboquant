@@ -1,0 +1,431 @@
+N3 TWO-MODEL LANE — G2 BUILD, G3 ATTEMPT
+Lane $E/mtp-n3-verify-20261031 with E=/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024
+Clean worktree /home/kunweiz/work/n3-two-model-clean-20261101 at
+59ce553d44bfafbccc293fc2e879a1188573d600 (candidates/n3-two-model-20261101), git status clean
+before and after the build. CPU work held /home/kunweiz/work/vfs-build.lock and
+vfs-build-2.lock; every GPU section held $E/ple-candidate-gpu.lock and /tmp/ple-candidate-gpu.lock
+(non-blocking), one HIP process at a time. No source file of the tree was modified by me; the two
+edits below are in the lane's own patch scripts and are called out in G2.3.
+
+================================================================================
+G2 — BUILD
+================================================================================
+    export N3_TREE=/home/kunweiz/work/n3-two-model-clean-20261101
+    python3 $E/mtp-n3-verify-20261031/patch/build.py        rc=0
+
+  Steps and times from build/BUILD-SHA256.txt and build-g2.log:
+    cmake-configure     rc 0
+    cmake-build-llama   rc 0     (GGML_HIP=ON, gfx1030, HIP_GRAPHS=OFF, MMQ_MFMA=OFF, CUDA_FA=ON,
+                                  CUDA_NO_PEER_COPY=ON, Release)
+    harness-compile     rc 0
+    harness2-compile    rc 0
+  BUILD_OK present, build/BUILD-SHA256.txt present (7,994 B), receipt validity.valid = true,
+  0 `error` occurrences in the build log.
+  Binaries: n3-verify-two-model 5c03be036c8df17d…, n3-verify-capture ddc2b34cee05ce6e…
+  Receipt's own ldd block: rc 0, resolved_to_private_libdir = true. Independently confirmed here:
+    libllama.so.0    -> $D/build/tree/bin/libllama.so.0
+    libggml.so.0     -> $D/build/tree/bin/libggml.so.0
+    libggml-base.so.0-> $D/build/tree/bin/libggml-base.so.0
+    libggml-hip.so.0 -> $D/build/tree/bin/libggml-hip.so.0
+    libggml-cpu.so.0 -> $D/build/tree/bin/libggml-cpu.so.0
+    RUNPATH = $D/build/tree/bin
+
+G2.3 TWO SCRIPT DEFECTS FOUND AND FIXED (both in patch/, no tree change)
+  1. run_capture.sh had LIB=$D/build/bin, but build.py links the harnesses against the private
+     tree build and puts the DSOs in $D/build/tree/bin; $D/build/bin holds only the two harness
+     binaries. With the old value the leg refuses at its own guard ("LEG-REFUSED ... $LIB/libllama.so
+     missing") and, had it got past, LD_LIBRARY_PATH would not have contained libllama at all.
+     Fixed as you authorised: LIB=$D/build/tree/bin. Backup: patch/run_capture.sh.bak-*.
+  2. build.py's harness link line did not name the HIP runtime, so the first two build attempts
+     failed at harness-compile with 35 unresolved symbols from libggml-hip
+     (hipDeviceGetPCIBusId@hip_4.2, hipStreamCreateWithFlags@hip_4.2, hipblasGemmBatchedEx, …) —
+     this build's libggml-hip does not carry libamdhip64 in DT_NEEDED. Adding
+     -L/opt/rocm/core-10.0/lib -lamdhip64 -lhipblas alone then failed on hipBLAS/rocSOLVER's own
+     transitive rocblas symbols, which this executable never references; the working form is those
+     three plus -Wl,--allow-shlib-undefined. Applied in link_line(); backup build.py.bak-*.
+     Verified standalone before re-running: the same link line produced a clean binary.
+
+================================================================================
+G3 — BOTH LEGS ABORT IN MODEL LOAD (NOT VRAM)
+================================================================================
+    bash $D/patch/run_capture.sh G3        $D/runs/G3        8 1 1   -> rc 134, wall 72 s
+    bash $D/patch/run_capture.sh G3-nocopy $D/runs/G3-nocopy 8 0 1   -> rc 134, wall 72 s
+  Both legs fail identically, before any context is created and before any capture, so no
+  rows.jsonl exists and neither gate command could be run (no data to gate).
+
+  EXACT FAILURE (stderr, identical in both legs):
+    /home/kunweiz/work/n3-two-model-clean-20261101/src/llama-model.cpp:691: GGML_ASSERT(tensor_axis_0 != nullptr) failed
+  Preceded by the last two tensor creations of the run:
+    create_tensor: loading tensor blk.48.nextn.embed_tokens.weight
+    create_tensor: loading tensor blk.48.nextn.shared_head_head.weight
+
+  BACKTRACE (the harness's own ggml_print_backtrace, stdout.log):
+    #4  ggml_print_backtrace
+    #5  ggml_abort
+    #6  llama_meta_device_get_split_state(ggml_tensor const*, void*)::{lambda(...)}
+    #7  llama_meta_device_get_split_state(ggml_tensor const*, void*)::{lambda()#1}
+    #8  llama_meta_device_get_split_state(ggml_tensor const*, void*)
+    #9  ggml_backend_meta_get_split_state(...)::{lambda()#1}
+    #10 ggml_backend_meta_get_split_state(...)
+    #11 ggml_backend_meta_buffer_init_tensor_impl(...)
+    #12 ggml_backend_meta_alloc_ctx_tensors_from_buft
+    #13 llama_model_base::load_tensors(llama_model_loader&)
+    #14 llama_model_load
+    #15 llama_model_load_from_file_impl
+    #16 llama_model_load_from_file
+    #17 main
+
+  WHAT THIS IS AND IS NOT
+  * NOT an out-of-memory on the fourth context. VRAM never moved: all five cards read 17.2 MB used
+    (17,163,091,968 B total) throughout both legs, and the abort is inside llama_model_load, before
+    the first llama_context is created. N3_CTX=262144 was never exercised, so the four-context VRAM
+    question is still open, not answered.
+  * It is the two-model/qualified-pair split configuration: `llama_meta_device_get_split_state`
+    derives a tensor's storage split during the meta buffer's per-tensor init
+    (`ggml_backend_meta_alloc_ctx_tensors_from_buft`) and `get_tensor_config_impl` cannot resolve
+    the tensor it wants to pair with, with no fallback name to try:
+      const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
+      if (tensor_axis_0 == nullptr) { GGML_ASSERT(!suffix_fallback.empty()); ... }
+      GGML_ASSERT(tensor_axis_0 != nullptr);                       // llama-model.cpp:691
+  * Which tensor fired was NOT isolated. What I established, and stopped at:
+      - the model being loaded is the trunk GGUF (Swift-…-00001-of-00002.gguf, 1224 tensors, arch
+        qwen4exp, 49 layers with its own blk.48.nextn block); the head GGUF is only read for
+        metadata ("additional 1 GGUFs metadata loaded"), its 33 tensors are never created;
+      - is_dsv4 is false for this arch, so every is_dsv4 branch is out of play;
+      - replaying the suffix-bearing branches over the 3703 logged create_tensor names, against the
+        set of names actually created, produces no candidate: for every name that hits a branch with
+        a non-empty suffix, prefix+suffix (or the fallback) is present in the created set;
+      - the one branch with no fallback and a name that always exists here
+        (pattern_qk_norm -> "attn_output.weight") also resolves for layer 48, which has
+        blk.48.attn_output.weight.
+      - a gdb run breaking at the mangled symbol
+        _Z33llama_meta_device_get_split_statePK11ggml_tensorPv took 2392 hits but the ggml_tensor
+        `name` field at offset 256 (offsetof from the tree's own ggml.h) did not yield readable
+        names, so that route was abandoned rather than guessed at.
+    The remaining likely place is a branch I did not model exactly (the ssm/attn_output family
+    around llama-model.cpp:789-846 or the hc_pair geometry test at :722-750, whose `get_tensor`
+    lookups are conditional on hparams). That needs a source-level read of the lane's own change,
+    not another blind run.
+
+  REPRODUCTION IS CHEAP: both legs are 72 s each and deterministic; the full stderr is kept at
+  runs/G3/stderr.log and runs/G3-nocopy/stderr.log (4,224 lines each), the backtrace in
+  runs/G3/stdout.log, and the gdb logs at /tmp/n3gdb.log and /tmp/n3gdb2.log.
+
+================================================================================
+LIMITS
+================================================================================
+  * G3 produced no rows, so the two logits gates were not run and there is no G3 == G3-nocopy
+    trajectory comparison to make. N3_PLAN / N3_WINDOW lines were never reached.
+  * No timing conclusion is drawn from the 72 s walls.
+  * Nothing was run beyond the two G3 legs; there is no 512-token G4 leg, as instructed.
+
+================================================================================
+APPENDIX A — AFTER THE load_mtp / gate_up_exps FIX
+================================================================================
+Tree /home/kunweiz/work/n3-two-model-clean-20261101 at 5ce3043cb1af3d571de33f782e213d7023e6dd0f,
+git status clean before and after. Hashes confirmed against the hand-off:
+  src/llama-model.cpp                  c227c7fddc05d470
+  delivery/…/n3_verify_two_model.cpp   3eab9c9004e72f66
+  delivery/…/n3_verify_capture.cpp     3cc4f6c09e39185b
+All CPU work under /home/kunweiz/work/vfs-build.lock + vfs-build-2.lock; every GPU section held both
+GPU locks; one HIP process at a time; no source byte of the tree changed by me.
+
+A.1 G2 — INCREMENTAL REBUILD
+    export N3_TREE=…; python3 $E/mtp-n3-verify-20261031/patch/build.py     rc=0
+    cmake-configure 0.5 s, cmake-build-llama 15.1 s (llama-model.cpp.o only), harness-compile 1.5 s,
+    harness2-compile 1.7 s — all rc 0, 0 `error` occurrences. BUILD_OK written; build/BUILD-SHA256.txt
+    rewritten (a6e543d960efed10… -> 6d01e4223529c21e…), validity.valid = true.
+    Binaries: n3-verify-two-model 03d0b87d3540459f…, n3-verify-capture 804cec125bc8e35c…
+
+A.2 THE PREVIOUS BLOCKER IS GONE
+    The llama-model.cpp:691 assert no longer fires. Both models load — `load_tensors: offloaded
+    49/49 layers to GPU` (trunk) and `offloaded 50/50 layers to GPU` (head) — five contexts reserve
+    (2 target + 2 head + 1 shared n1: five sched_reserve blocks, graph nodes 147, splits 1), and the
+    harness prints its plan:
+      N3_PLAN snapshot_probe_bytes=912 compatible=1
+      N3_PLAN two_model=1 trunk=…/Swift-…-00001-of-00002.gguf head=…/mtp-qwen4exp-nextn-self-contained-q2_0.gguf
+              vocab=248320 wide=10240 predict=8 rows=3 rollback_steps=[2,2] replay_allowed=1 capture=1
+    So N3_CTX=262144 with three trunk contexts DOES fit: the answer to the open VRAM question is yes,
+    the 4th-context case never arises because n1 is shared.
+
+A.3 TWO MORE HARNESS DEFECTS STOP THE LEG BEFORE ANY ROW
+    Third script defect, fixed here (same class as the LIB one, backups kept):
+      run_capture.sh pre-creates the leg dir, but the harness calls mkdir() on the directory it is
+      given and refuses on EEXIST — so the capture leg died at `N3_REFUSED output directory: File
+      exists` (rc 2) before decoding. Fixed: the harness is now given $OUT/capture (a path it
+      creates itself) and its files are hoisted into the leg dir afterwards, so the gates still read
+      rows.jsonl from the documented path. patch/run_capture.sh.bak3-* is the pre-edit copy.
+
+    With that fixed, both requested legs reach the same place and stop there:
+      bash …/run_capture.sh G3        …/runs/G3        8 1 1   -> rc 1, 76 s
+      bash …/run_capture.sh G3-nocopy …/runs/G3-nocopy 8 0 1   -> rc 1, 77 s
+      both: N3_FAIL prompt logits missing          (after N3_PLAN; no rows written)
+    DEFECT 1 — delivery/n3-verify-capture/n3_verify_two_model.cpp:592-593 (and the same pair at
+    n3_verify_capture.cpp:574-575):
+        const float * tgt = decode_one(win.target.get(), win.seq, llama_pos(i), pt[i], last);
+        require(tgt != nullptr, "prompt logits missing");
+      decode_one(..., want_logits=false) returns nullptr by construction, and `last` is false for
+      every prompt token but the final one — so any prompt longer than one token fails on its first
+      token. Both prompts in patch/prompts.txt are full sentences. The require belongs under
+      `if (last)`.
+    DEFECT 2 — same file, line 273 in head_step (and n3_verify_capture.cpp:287):
+        llama_batch b = llama_batch_init(1, wide, 1);   // wide = 10240 -> embd batch
+        b.token[0]     = token;                          // b.token is nullptr here
+      llama_batch_init() allocates embd OR token, never both (src/llama-batch.cpp:985-989), so with
+      embd != 0 batch.token stays nullptr and this store is a null write. Proven, not inferred: with
+      one-token prompts (N3_PROMPT0=A N3_PROMPT1=B) the leg gets past prefill and dies at that exact
+      instruction —
+        runs/G3-1tok-diag: rc 139 (SIGSEGV), 76 s, rows.jsonl and logits.f32le created but 0 bytes
+        gdb: #0 head_step(llama_context*, int, int, float const*, int, unsigned int, std::vector<float>*)
+             #1 main
+        objdump at the faulting PC (0x9424, head_step+0x124): `mov %r15d,(%rax)` where
+        rax = b.token, i.e. the b.token[0] = token store, straight after the llama_batch_init call.
+    Both defects are in the tree, which must stay clean for the build receipt, so neither was
+    edited. Each is a one-line change; after them the leg can be re-run in 76 s per leg.
+
+A.4 WHAT WAS NOT PRODUCED
+    No rows, therefore no gate run: `n3_logits_gate.py --class exact` and
+    `--class numeric-order-only` were not invoked (they refuse without rows.jsonl) and there is no
+    G3 == G3-nocopy trajectory comparison to report. No 512-token G4 leg was run.
+
+A.5 ARTEFACTS
+    runs/G3-pre-fix, runs/G3-nocopy-pre-fix        the original model-load aborts (rc 134)
+    runs/G3-postfix-refused, …-nocopy-postfix-refused   the mkdir-refusal run (rc 2 / rc 1)
+    runs/G3, runs/G3-nocopy                        the final runs: rc 1, "prompt logits missing"
+    runs/G3-1tok-diag                              one-token-prompt diagnostic: rc 139 at head_step:273
+    runs/dbg3, /tmp/n3gdb3.log                     the gdb capture of that SIGSEGV
+
+================================================================================
+APPENDIX B — AFTER THE head_step / prefill / replay FIX
+================================================================================
+Tree /home/kunweiz/work/n3-two-model-clean-20261101 at e4465ea5cc7cb6ec6704b39a23aee84176502e2a,
+git status clean. Hashes confirmed: n3_verify_two_model.cpp 98b9e0c6c00a1992,
+n3_verify_capture.cpp 7c42da8c9b8f807b. Build under both VFS locks, legs under both GPU locks,
+one HIP process at a time, no source byte of the tree changed by me.
+
+B.1 G2 — INCREMENTAL REBUILD
+    export N3_TREE=…; python3 $E/mtp-n3-verify-20261031/patch/build.py     rc=0
+    cmake-configure 0.4 s, cmake-build-llama 3.5 s (libllama.so unchanged), harness-compile 1.6 s,
+    harness2-compile 1.6 s, 0 `error` occurrences. BUILD_OK; build/BUILD-SHA256.txt rewritten
+    (6d01e4223529c21e… -> 5f3065e8c34fbe8e…), validity.valid = true.
+    Binaries: n3-verify-two-model 5ecf649274c02d56…, n3-verify-capture 96e7db46b2a2f678….
+
+B.2 THE THREE FIXES WORK — the leg now runs the real prefill
+    Both legs clear the plan and prefill both windows with the full sentences in patch/prompts.txt,
+    which the previous build could not do at all:
+      N3_PLAN snapshot_probe_bytes=912 compatible=1
+      N3_PLAN two_model=1 … vocab=248320 wide=10240 predict=8 rows=3 rollback_steps=[2,2]
+      rows written (G3): prefill/target w0, prefill/n1 w0, prefill/target w1, prefill/n1 w1,
+      then the first reference round: n1 side, window 0, rows 0..2 (three rows).
+    So head_step no longer faults on the embd batch, the multi-token prefill loop completes for both
+    windows, and the shared n1 reference context produces its three rows for window 0.
+
+B.3 NEXT BLOCKER — the target's three-row verify decode is refused before it runs
+    Both legs stop at the same call, 108 s (G3) and 95 s (G3-nocopy), rc 1:
+      decode_n3_verify_logits: the context has no logits buffer for 3 rows
+      N3_FAIL two-model verify decode failed
+    Site: n3_verify_two_model.cpp:707 llama_decode_n3_verify_logits_pair(win.target.get(), …) with
+    n_rows = 3. The callee checks BEFORE it decodes (src/llama-context.cpp:4833-4837):
+      if (logits.data == nullptr || n_vocab <= 0 ||
+              logits.size < size_t(uint64_t(n_vocab) * uint64_t(n_rows))) { … return -1; }
+    and logits.size is sized in output_reserve() as n_vocab * n_outputs_max with
+    n_outputs_max = max(n_outputs, n_seq_max) (src/llama-context.cpp:4955). This harness creates the
+    target context with n_seq_max = 1 (n3_verify_two_model.cpp:477), so the reserve made at context
+    creation (llama-context.cpp:700) and the one made by the single-token prefill decodes both size
+    the buffer for ONE row (248,320 floats); the three-row step needs three (744,960).
+    Two one-line fixes, either is enough:
+      (a) tree, the robust one: call output_reserve(n_rows) at the head of
+          llama_decode_n3_verify_logits_pair (and of llama_decode_n3_verify_logits, same pattern)
+          before the size check, and keep the check as the post-condition;
+      (b) harness: create the target context with n_seq_max = LLAMA_N3_VERIFY_PAIR_MAX_ROWS (3), so
+          the buffer is reserved for three rows at creation. Harmless here — the harness uses
+          sequence 0 only — and it matches the documented three-row contract.
+    Note the n1 reference side does not hit this: it decodes its rows one at a time through
+    decode_one(), which is why its three rows were written before the target step failed.
+
+B.4 WHAT WAS NOT PRODUCED
+    7 rows exist in runs/G3 (4 prefill + 3 reference) and 0 in runs/G3-nocopy, against a
+    --min-rows 8 gate, so neither `n3_logits_gate.py --class exact` nor `--class numeric-order-only`
+    was run: there is no differing / max_abs / mean_kl / max_row_kl / top1 /
+    flips_outside_margin to report, and no G3 == G3-nocopy trajectory comparison. No 512-token G4
+    leg was run.
+
+B.5 ARTEFACTS
+    runs/G3, runs/G3-nocopy            the final runs (rc 1, 7 rows / 0 rows)
+    runs/G3-pre-fix2, …-nocopy-pre-fix2  the previous round ("prompt logits missing")
+    runs/G3-pre-fix, runs/G3-1tok-diag, runs/*-postfix-refused, runs/dbg3   earlier rounds
+
+================================================================================
+APPENDIX C — AFTER THE LOGITS-SIZE CHECK MOVE: BOTH LEGS RUN TO COMPLETION
+================================================================================
+Tree /home/kunweiz/work/n3-two-model-clean-20261101 at 84e2ce2ce4c097438126944228f153fe4de12e88,
+git status clean; src/llama-context.cpp d8cb29085a47de64. Build under both VFS locks, legs and
+gates under both GPU locks, one HIP process at a time, no source byte changed by me.
+
+C.1 G2
+    export N3_TREE=…; python3 $E/mtp-n3-verify-20261031/patch/build.py   rc=0
+    cmake-configure 0.5 s, cmake-build-llama 10.9 s (libllama only), both harness compiles 1.6 s,
+    0 `error` occurrences. BUILD_OK; receipt 5f3065e8c34fbe8e… -> a2d56b4239ce22c2…
+    Harness binaries unchanged (n3-verify-two-model 5ecf649274c02d56…), so the leg measures the
+    new libllama alone.
+
+C.2 BOTH LEGS COMPLETE — rc 0
+    bash …/run_capture.sh G3        …/runs/G3        8 1 1   -> rc 0, 111 s, 44 rows
+    bash …/run_capture.sh G3-nocopy …/runs/G3-nocopy 8 0 1   -> rc 0, 108 s, 0 rows
+    N3_PLAN (both): vocab=248320 wide=10240 predict=8 rows=3 rollback_steps=[2,2]
+                    replay_allowed=1, snapshot_probe_bytes=912 compatible=1
+    Rows in G3: 4 prefill (target+n1, windows 0 and 1), 20 side=n1 (the row-by-row reference),
+    20 side=n3 (the three-row verify step) — 44 total.
+
+C.3 G3 vs G3-nocopy: THE CAPTURE PATH DOES NOT PERTURB THE TRAJECTORY
+    N3_WINDOW window=0  verify_rounds=4 drafts=7 accepted=4 full_accept=2 committed=8
+                        partial=3 native=3 replay=0 rollback_steps=2 n1_rows=11|0
+                        replay_rows=0 replay_bits_diff=0 replay_mean_kl=0 replay_max_kl=0
+    N3_WINDOW window=1  verify_rounds=3 drafts=6 accepted=5 full_accept=2 committed=8
+                        partial=1 native=1 replay=0 rollback_steps=2 n1_rows=9|0
+                        replay_rows=0 replay_bits_diff=0 replay_mean_kl=0 replay_max_kl=0
+    Every field is identical between the two legs except n1_rows, which is 11/9 with capture on and
+    0/0 with capture off because the reference rows are only decoded when capturing. The G3 run also
+    carries the replay diagnostic: replay_rows=0, replay_bits_diff=0, replay_mean_kl=0,
+    replay_max_kl=0 in both windows.
+    N3_STEP (G3, capture on) — the round structure both legs share:
+      w0 step0 accepted=1 rows=3 state_path=native
+      w0 step1 accepted=0 rows=3 state_path=native
+      w0 step2 accepted=2 rows=3 state_path=none
+      w0 step3 accepted=1 rows=2 state_path=native
+      w1 step0 accepted=1 rows=3 state_path=native
+      w1 step1 accepted=2 rows=3 state_path=none
+      w1 step2 accepted=2 rows=3 state_path=none
+
+C.4 THE LOGITS GATE — FAIL, AND NOT MARGINALLY
+    n3_logits_gate.py …/runs/G3 --class exact --min-rows 8            -> rc 1
+    n3_logits_gate.py …/runs/G3 --class numeric-order-only --min-rows 8 -> rc 1
+    Both print the same measurement (rows=20, vocabulary=248320):
+      differing            4,966,395 of 4,966,400 values (5 equal)
+      max_abs              2.189339280128479
+      mean_kl              0.00687884107978558
+      max_row_kl           0.057122588887246195
+      top1                 0.950000   (19 of 20 rows keep the reference argmax)
+      flips_outside_margin 1
+    The single flip: window 0, step 0, row 2, position 14, token 13962 —
+      ref top1 2500 with margin 0.10278, candidate top1 220. The reference margin is only 0.10278
+      against the class's 0.10 allowance, so the flip counts as outside the margin by 0.0028.
+    Against the gate's thresholds this is not close: numeric-order-only allows mean_kl 1e-6 and
+    max_row_kl 1e-5, the run is at 6.9e-3 and 5.7e-2 (roughly three orders above); top1 0.95 against
+    0.999. exact allows nothing at all and differs on 99.9999 % of values.
+    Per-row breakdown (side n1 vs side n3, sorted by KL):
+      w0 step0 row2  maxabs 2.1893  kl 0.057123  top1 2500/220   ref_margin 0.1028   <-- the flip
+      w0 step1 row0  maxabs 1.0882  kl 0.043424  top1 271/271    ref_margin 0.6603
+      w1 step0 row2  maxabs 0.9215  kl 0.020494  top1 220/220    ref_margin 1.1995
+      w0 step0 row1  maxabs 0.5158  kl 0.008109  top1 248068/248068
+      w1 step0 row0  maxabs 0.4330  kl 0.004154  top1 271/271
+      w0 step2 row2  maxabs 0.4048  kl 0.001182  top1 43/43
+      w0 step2 row0  maxabs 1.7580  kl 0.000868  top1 248069/248069
+      w1 step0 row1  maxabs 0.3797  kl 0.000802  top1 248068/248068
+      w0 step0 row0  maxabs 0.8033  kl 0.000591  top1 271/271
+      w1 step2 row0  maxabs 0.2402  kl 0.000447  top1 369/369
+      w1 step2 row2  maxabs 0.2541  kl 0.000197  top1 728/728
+      w1 step1 row0  maxabs 0.9060  kl 0.000166  top1 198/198
+      the remaining 8 rows: kl <= 1e-5, top1 equal in every one
+    Shape of the divergence: the absolute differences are large on EVERY row (0.24 to 2.19) while
+    the KL is large only where the reference row itself is close (step-0 rows), and it decays by
+    two to three orders over the later steps of the same window. That is the signature of two
+    different execution paths over the same tokens, not of a broken row pairing: the reference rows
+    come from the DEFAULT context decoded one token at a time, the n3 rows from the three-row
+    qualified/relay verify step, and no row is compared across positions or tokens (the gate
+    validates the global tiling and the identity of each pair).
+    Interpretation is yours; this leg reports the measurement, not a verdict on which side is right.
+
+C.5 WHAT WAS NOT RUN
+    G3 did not pass, so the 512-token G4 leg was not started (as instructed) and
+    patch/result.py was not run.
+
+C.6 ARTEFACTS
+    runs/G3 (rc 0, 44 rows, gate-exact.{json,log}, gate-order.{json,log})
+    runs/G3-nocopy (rc 0, 0 rows)
+    runs/G3-pre-fix3, runs/G3-nocopy-pre-fix3   the previous round (logits-buffer refusal)
+
+================================================================================
+DIAGNOSTIC — DOES THE N3-vs-N1 GAP COME FROM THE N=1-ONLY F32 SHORTCUTS?
+================================================================================
+Not acceptance evidence: no source edit, no promotion, one extra run of the same binary and the
+same build as appendix C (receipt a2d56b42…, tree 84e2ce2c, n3-verify-two-model 5ecf6492…).
+
+Method: the two-model harness invoked directly (not through run_capture.sh, whose leg_env strips
+extra variables), same env -i list as patch/common.sh, same models/prompts,
+N3_PREDICT=8 N3_CAPTURE=1 N3_SNAPSHOT_REPLAY=1, plus GGML_CUDA_DISABLE_FUSION=1.
+That flag is honoured here: ggml-cuda.cu:5290 reads it and ggml_cuda_try_fuse() returns 0 at :5291,
+so hc_down_silu_t1, hc_owner_tail4_t1, hc_combine4_t1 and moe_down_sum_t1 are off on BOTH sides;
+q2_f32_short inside ggml_cuda_mul_mat_id (ids->ne[1]==1) stays on.
+Output: runs/diag-nofusion (harness-created), rc 0, 116 s, 44 rows, report.json written by the
+harness itself (rows=44, bytes=43,704,320 — no stub needed).
+
+D.1 THE TRAJECTORY IS UNCHANGED
+    N3_WINDOW window=0 verify_rounds=4 drafts=7 accepted=4 full_accept=2 committed=8 p=20 n1_rows=11
+                        partial=3 native=3 replay=0 rollback_steps=2 replay_rows=0
+    N3_WINDOW window=1 verify_rounds=3 drafts=6 accepted=5 full_accept=2 committed=8 p=21 n1_rows=9
+                        partial=1 native=1 replay=0 rollback_steps=2 replay_rows=0
+    Identical to runs/G3 — the fusions change no acceptance decision.
+
+D.2 THE GATE LINE
+    with fusion    (runs/G3):         differing=4966395 max_abs=2.18933928 mean_kl=0.00687884108
+                                      max_row_kl=0.0571225889 top1=0.950000 flips_outside_margin=1
+    no fusion      (diag-nofusion):   differing=4966395 max_abs=1.83313751 mean_kl=0.00561988959
+                                      max_row_kl=0.0610540551 top1=0.950000 flips_outside_margin=0
+    mean_kl falls by a factor of 1.22, max_row_kl gets 7 % WORSE, top1 is unchanged at 0.95, and the
+    differing-value count is identical. Three orders of magnitude is what the hypothesis needs; 1.22x
+    is not it.
+
+D.3 PER-ROW KL (window, step, row, pos, tok, kl_fusion, kl_nofusion, maxabs_f, maxabs_nf, top n3/n1)
+    w0 s0 r0  12 13      0.000591  0.000332   0.8033 0.5977  271/271
+    w0 s0 r1  13 271     0.008109  0.004391   0.5158 0.4456  248068/248068
+    w0 s0 r2  14 13962   0.057123  0.024247   2.1893 1.1523  220/2500   <- the flip, still there
+    w0 s1 r0  14 248068  0.043424  0.000827   1.0882 0.5099  271/271
+    w0 s1 r1  15 198     0.000006  0.000005   0.9619 0.7501  760/760
+    w0 s1 r2  16 760     0.000000  0.000000   1.0216 0.5294  1156/1156
+    w0 s2 r0  15 271     0.000868  0.000569   1.7580 1.8331  248069/248069
+    w0 s2 r1  16 248069  0.000010  0.000058   0.5080 0.7907  271/271
+    w0 s2 r2  17 271     0.001182  0.000618   0.4048 0.6650  43/43
+    w0 s3 r0  18 43      0.000001  0.000000   0.3743 0.1927  14008/14008
+    w0 s3 r1  19 14008   0.000002  0.000002   0.3691 0.2680  4528/4528
+    w1 s0 r0  13 13      0.004154  0.014734   0.4330 0.6311  271/271
+    w1 s0 r1  14 271     0.000802  0.002829   0.3797 0.4543  248068/248068
+    w1 s0 r2  15 13962   0.020494  0.061054   0.9215 1.4701  220/220
+    w1 s1 r0  15 248068  0.000166  0.000653   0.9060 0.8761  198/198
+    w1 s1 r1  16 198     0.000000  0.000001   0.5200 0.7079  760/760
+    w1 s1 r2  17 760     0.000000  0.000000   0.8148 0.8053  1156/1156
+    w1 s2 r0  18 1156    0.000447  0.000908   0.2402 0.2247  369/369
+    w1 s2 r1  19 369     0.000000  0.000000   0.3218 0.3462  9859/9859
+    w1 s2 r2  20 9859    0.000197  0.001169   0.2541 0.2730  728/728
+    Nine rows improve, eleven get worse; the sum of KL goes 0.1376 -> 0.1124. The movement is
+    row-specific noise around the same gap, not a collapse of it.
+
+D.4 TWO THINGS THAT LOOK LIKE IMPROVEMENTS BUT ARE NOT
+    * flips_outside_margin 1 -> 0 is an artefact. The flip itself is unchanged (w0 s0 r2, reference
+      top1 2500, candidate 220). What moved is the REFERENCE's margin on that row: 0.10278 with
+      fusion, 0.01194 without, i.e. it dropped below the class's 0.10 allowance and stopped counting.
+    * the reference side is not a fixed ruler: disabling fusion changes it too. All 20 n1 rows differ
+      bitwise between the two runs (max |diff| 1.99). Both runs were therefore scored on their own
+      internal n3-vs-n1 gap, which is the right comparison, but it means cross-run absolute numbers
+      are not interchangeable.
+
+D.5 CONCLUSION
+    The hypothesis is NOT supported. Turning off every T1-only fused path on both sides moves the
+    n3-vs-n1 gap by 1.22x in mean KL, leaves top1 at 0.95 and leaves the single top1 flip in place,
+    with eleven of twenty rows worse. The residual gap is therefore not carried by hc_down_silu_t1,
+    hc_owner_tail4_t1, hc_combine4_t1 or moe_down_sum_t1. Since q2_f32_short (ids->ne[1]==1) stays
+    on under this flag, the one N=1-only F32 path still active is the untested one; that is where a
+    follow-up diagnostic would have to go.
+
+VERDICT N3 G2 PASS, G3 RUNS TO COMPLETION AND FAILS THE LOGITS GATE — with the size check moved the tree rebuilds clean (receipt a2d56b42…, 0 errors, harness binaries unchanged) and both legs finish rc 0 (G3 111 s with 44 rows, G3-nocopy 108 s with 0 rows) with identical trajectories (window 0 verify_rounds=4 drafts=7 accepted=4 committed=8; window 1 rounds=3 drafts=6 accepted=5 committed=8; replay_rows=0 replay_bits_diff=0, only n1_rows differing 11/9 vs 0/0 because reference rows are decoded only when capturing); but the two-model three-row verify does not reproduce the row-by-row reference — 4,966,395 of 4,966,400 values differ, max_abs 2.1893, mean_kl 0.0068788, max_row_kl 0.0571226, top1 0.95, and one top1 flip outside the margin (window 0 step 0 row 2, ref 2500 at margin 0.10278 vs candidate 220) — which fails both the exact and the numeric-order-only class by roughly three orders of magnitude, so the 512-token G4 leg was not run.
+DIAG-VERDICT NOT SUPPORTED — disabling every T1-only fused path on both sides (GGML_CUDA_DISABLE_FUSION=1, honoured at ggml-cuda.cu:5290) moves the N3-vs-N1 gap only from mean_kl 0.00687884108 to 0.00561988959 (1.22x) with max_row_kl worsening from 0.0571225889 to 0.0610540551, top1 unchanged at 0.950000, the same single top1 flip (window 0 step 0 row 2, reference 2500 vs candidate 220) and eleven of twenty rows worse, so the gap is not carried by hc_down_silu_t1, hc_owner_tail4_t1, hc_combine4_t1 or moe_down_sum_t1; the flips_outside_margin 1->0 is an artefact of the reference margin on that row falling from 0.10278 to 0.01194, and the remaining untested N=1-only path is q2_f32_short inside ggml_cuda_mul_mat_id.
+
+== LEAD NOTE (CPU, offline, from runs/G3 and runs/diag-nofusion) ==
+Same-side comparison across the two runs, same identities (window, step, row, pos, token):
+  n1 fusion vs n1 nofusion: rows 20, mean_kl 0.00291, max 0.0223
+  n3 fusion vs n3 nofusion: rows 20, mean_kl 0.00658, max 0.0532
+Prefill rows target vs n1 inside one run: bitwise equal (diff 0) in both windows.
+Reading: on this Q2_0 trunk, changing only the kernel choice for an N=1 decode already moves
+logits by ~1e-3 mean KL and ~2e-2 max. The N3-vs-N1 gap (6.9e-3 / 5.7e-2) is the same order.
+The numeric-order-only bar (1e-6 / 1e-5) is therefore met only by bit-identical paths.
+LEAD-VERDICT N3 G3 NOT PASSED; no single kernel family identified as the cause.
