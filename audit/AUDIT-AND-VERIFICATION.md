@@ -1,12 +1,19 @@
 # M3 N-row owner-tail storage: audit + Devops verification plan (12022, static only)
 
-Status: **PARTIAL**. Patch authored and audited; NOT compiled, NOT tested (contract: only Devops may build/run).
+Status: **PARTIAL**. Patch authored and audited; NOT compiled, NOT tested (contract: only Devops may
+build/run).
 Nothing in `$E` was modified; selected installs untouched; no GPU touched.
+Revision 2026-11-01: §5n adds the algorithm equivalence gate (R1, with a new Q8_0 mirror in
+`ggml/src/ggml-cuda/mmvf.cu`) and the storage-liveness check (R2) in
+`ggml/src/ggml-cuda/ggml-cuda.cu`, regenerates the placement stamp (R3), and restates the
+2026-10-31 KL accounting (§5a/§4/§6, R4).
 
 Worktree: `/home/kunweiz/work/m3tail-storage-20261031`, branch `candidates/m3tail-storage-20261031`
-Base: `f1c5fafc0` (= 13022 snapshot of clean/fork-20261018 `829d05f9e`, the base the M3 trio waves ran on).
+Base: `f1c5fafc0` (= 13022 snapshot of clean/fork-20261018 `829d05f9e`, the base the M3 trio waves
+ran on).
 Patch: `audit/m3-tail-storage.patch.txt` (`git diff f1c5fafc0`); commits `2ef9cf2e3`, `1d529d64a`,
-`2ae2c7d9d`; this audit file (and the patch copy) sits in the audit commit on top and is not part of the code diff.
+`2ae2c7d9d`; this audit file (and the patch copy) sits in the audit commit on top and is not part of
+the code diff.
 
 Operational note for anyone cloning the trio lane: the **shipping** trio binary
 (`libggml-hip` `11800fe6…`, source `47abaa3b…`) reads `GGML_TP5_HC_N3_TRIO` /
@@ -37,10 +44,12 @@ streams/ADD/ADD/ADD/SCALE -> mixed / hc_mixed          # [n_embd, nt] F32
   stream views alias it (`view_src == gated`, `has_owner_tail_hazard` counts 5);
 * `SCALE` (also `can_inplace`) is not in place: `scale_buffer` has no kernel for F32 dst ≠ src,
   so it allocates a fresh dst from the merged free block — i.e. exactly inside the `lo` range;
-* `ggml-cuda.cu:5649` `ggml_cuda_fuse_hc_owner_tail4_rows` — a **correct** fail-closed guard —
-  then sees `overlaps(out=hc_mixed, lo)` (`out->data` ∈ `[lo, lo+ggml_nbytes(lo))`) and the trio
-  silently falls back to the generic 12-node chain. `nrows==1` is irrelevant: the t1 fusion has its
-  own guard instance (`ggml_cuda.cu:5215`), which is why N=1 fires and N=2..4 do not.
+* `ggml_cuda.cu:5649` (trio tree; `5259` here, `ggml_cuda_fuse_hc_owner_tail4_rows`) — a
+  fail-closed guard — then sees `overlaps(out=hc_mixed, lo)` (`out->data` ∈ `[lo, lo+ggml_nbytes(lo))`)
+  and the trio silently falls back to the generic 12-node chain. `nrows==1` is irrelevant: the t1
+  fusion has its own guard instance (`ggml_cuda.cu:5259` here, `5215` in the trio tree), which is
+  why N=1 fires and N=2..4 do not.  That address check is necessary but not sufficient; §5a and
+  §5n add the storage-liveness half.
 
 Evidence chain (all pre-existing, re-read here):
 | claim | evidence |
@@ -199,9 +208,15 @@ Pinned inputs (verify by sha256 before use):
    * Legs (8x2, `TP5_DIAG_GRAPH=1`, `M3_TAIL_DIAG=1`, row-tail env):
      `nt_off8x2` = `GGML_TP5_HC_N3_TRIO=1`;
      `nt_on8x2`  = `GGML_TP5_HC_N3_TRIO=1 GGML_TP5_HC_N3_TAIL_KEEP=1`.
-   * PASS = ON `M3_TAIL_WHY why=0` totals **3870** with `why≠0` = 0 (rows 2/3/4 = 970/1940/960),
-     including the two no-inject mixer sites (`out=result_norm` and `out=result_output`), and
-     `reject` only the 40 foreign Q8_0-shape line; OFF must still show `why=1` ≈ 3840 / `why=0` = 30.
+   * PASS for the **pre-R1** tree = ON `M3_TAIL_WHY why=0` totals **3870** with `why≠0` = 0
+     (rows 2/3/4 = 970/1940/960), including the two no-inject mixer sites (`out=result_norm` and
+     `out=result_output`), and `reject` only the 40 foreign Q8_0-shape line; OFF must still show
+     `why=1` ≈ 3840 / `why=0` = 30.
+   * PASS for the **current** tree (R1 in place, §5n): every Q8_0 site reports `why=0` (the mirror
+     `hc_owner_tail4_t1_q8_mmvq` ran) and every Q4_0/BF16 site reports `why=1` (the equivalence gate
+     refused).  Counts follow the site table above; the Q8_0 total is the same 3870 less whatever
+     Q4_0/BF16 sites the config has.  A Q8_0 site reporting `why=1` means the mirror declined on
+     its own layout or device guard, and the leg then says nothing about the mirror.
    * A cheaper *negative* control without a second build: the stock DSO `c4a1634f…` (trio env
      unset) must show the same kernel census without `hc_tail_rows`; use it only to prove the
      census tool itself is not blind.
@@ -237,22 +252,28 @@ Acceptance:
 * `nt_off32x2` **bitwise** == ref trio-only leg (OFF equals trio alone);
 * `GGML_TP5_HC_N3_TAIL_KEEP=1` without trio **bitwise** == ref (gate);
 * `nt_on_rep32x2` == `nt_on32x2` **bitwise** (determinism, no race);
-* `nt_on32x2` vs `nt_off32x2`: 0 non-finite, top1 equal wherever the margin > 0.10, KL mean < 1e-3,
-  max < 0.03 and drift toward N1 (`mtp-hc-row-tail` N1 envelope max KL 0.067) — i.e. the same
-  soft-gate class the alias lane accepted, and each near-tie flip must be listed with its margin;
+* `nt_on32x2` vs `nt_off32x2` under R1: **bitwise** equal, whole logits, every row.  With the
+  equivalence gate in place the fused path refuses every Q8_0/Q4_0/BF16 site, so the two legs run
+  the same kernels in the same order and any difference is a bug in this patch, not noise.  A KL
+  budget is the wrong instrument here: it accepted 1.816e-3 in the 2026-10-31 run that this
+  section now reads as a reduction-order change (§5a), and "soft drift" is exactly the wording
+  that hid it.  When a matching kernel pair exists, the acceptance becomes "fused vs generic
+  bitwise equal at the fused sites" (a `M3_TAIL_WHY why=0` subset), with no KL threshold at all;
 * no new `TP5_MTP_*` counters regress; no RSZ_RT; no `LATEBIND` interaction (LATEBIND unset).
 * Formal 512x2 only if G3/G4 pass; expected outcome is "correct + not slower", a speed claim needs
   the paired ABAB median (`tB_*`/`tC_*` in `patch/gpu_ta.sh`) and a noise band.
 
 ### G5 promotion
 * Merge prerequisite: §4 (single `ggml/` copy).
-* Keep default **off** (`GGML_TP5_HC_N3_TAIL_KEEP` unset) until G3(1) shows `why=0` == full fire
-  count and G4 passes; then it may be promoted as the *storage* half of M3 (the trio stays a
-  separate knob because its steady-state gain was NO-PROMOTE in `mtp-m3-tail-alias-20261028`).
+* Keep default **off** (`GGML_TP5_HC_N3_TAIL_KEEP` unset).  Promotion now needs the Q8_0 mirror
+  to pass G4's bitwise comparison and a kernel census that shows the tail still saves nodes
+  (§5n R1: the mirror re-quantizes `lo`, so the saving is the 11 downstream nodes, not the
+  reduction).  The trio stays a separate knob (NO-PROMOTE in `mtp-m3-tail-alias-20261028`).
 
 ## 5a. 2026-10-31 Devops reach run: what moved, and the layered diagnosis
 
-Real data: `/home/kunweiz/work/lead-m3cand-reach-20261031/{VERIFY-M3CAND-REACH.txt,runs/cand_{off,on}8x2}`,
+Real data:
+`/home/kunweiz/work/lead-m3cand-reach-20261031/{VERIFY-M3CAND-REACH.txt,runs/cand_{off,on}8x2}`,
 `runs/PER-ROW-KL.json`.  Legs: candidate `libllama` `fbfa019e…` (this patch's setters), candidate
 `libggml-base` `e8445fbe…` (NO_REUSE allocator, control relink `69545831` exact), trio
 `libggml-hip` `11800fe6…` **unmodified** (`1edd2678…` is its diag2 copy; device `.text` identical),
@@ -271,17 +292,75 @@ here (read-only, stdlib math):
 | top-8 index sets | agree 6–8/8, disagreements listed per row | index churn coexists with sub-1e-7 KL rows |
 | MTP activity | identical counters on both legs (`drafted 7/5`, `accepted 3/4`) | no "different number of verify rows" explanation |
 
-**Which comparison is meaningful.**  This pairing is *tail fused vs tail not fused*, i.e. the same
-class the alias lane already ran (`ta_trio32x2` vs `ta_on32x2`, 32x2, 64 rows): there the
-tail-vs-tail-off delta was KL mean 0.00195/0.00106, max 0.0115/0.0055 with **token divergence at
-rows 2 and 26**, and it was accepted as soft drift.  The new run is *smaller* (mean 1.816e-3, max
-1.5e-2, no token change), so the KL value alone is not a regression of the same quantity; the
-gate that rejects it ("numeric-order-only, mean < 1e-6") cannot be met by any tail-fused run and
-was not met by the alias run either.  The residual open question is the **non-uniform** spread:
-13/16 rows move while 3 stay at 1e-8, and 8/16 rows disagree on top-8 indices.  A "layout only"
-story (same kernels, different addresses) predicts *either* a uniform ulp-level shift *or* a
-specific set of guard-driven fallbacks at exactly the sites whose aliases the old pin created —
-so the next step is not a bigger KL table but **placement + per-layer capture** (§5b).
+**Corrected accounting (2026-11-01).**  An earlier revision of this section called the result
+"the same soft-drift class the alias lane accepted".  That was wrong, and the numbers said so.
+The alias lane compared **two fused variants** (`ta_trio32x2` vs `ta_on32x2`): same kernels, same
+reduction order, only the OUTPUT pin differed, and its 1e-3-class delta was layout.  This run
+compares **fused vs not fused**, and the two sides do not compute the same function:
+
+* the fused kernel `hc_owner_tail4_t1_q8_f32` calls `hc_q8_row_partial<320, 32>`, which gives one
+  32-element block to each lane and reduces the ten lanes with an xor tree over the wave;
+* the generic `MUL_MAT` on Q8_0 reaches `mul_mat_vec_q<Q8_0>` (`mmvq.cu`), which on RDNA2 runs
+  `nwarps = 1` and gives lane `t` block `t / 2`, then reduces the row with one wave tree over the
+  same ten blocks that the fused kernel splits differently.
+
+The k = 320 dot product is therefore summed in two different orders, so each `up` element can
+differ by ~1 ulp, the sigmoid turns that into a per-row logit perturbation, and the KL lands at
+1e-8…1.5e-2 depending on the row's softmax curvature ($\kappa=\sum_k
+g_k(1-g_k)(\varepsilon_k-\bar\varepsilon)^2$).
+The gate that rejects it is "numeric-order-only, mean < 1e-6".  A tail-fused run **cannot** meet
+that gate, and this run misses it by three orders of magnitude; the correct reading is
+"the fusion changes the reduction algorithm", not "layout drift inside the soft class".  Calling
+it the alias lane's class would have accepted a value change the gate was written to refuse.
+
+The non-uniform spread confirms the same story and does not need a second explanation: 13/16 rows
+move while 3 stay at 1e-8 because those 3 rows' logits happened to round identically in float32,
+not because their sites skipped the fusion (the reach table shows 774/774 fused).
+
+**Decisive finding (2026-11-01): the activations were never quantized.**  The N-row trio kernel
+`hc_owner_tail4_rows_q8_f32<R>` (`mtp-m3-trio-20261028/tree/ggml/src/ggml-cuda/mmvf.cu:1395`)
+calls `hc_q8_row_partial` on the **unquantized F32** `lo` and multiplies it directly by the Q8_0
+weights.  The generic path does something else: with `R = 2..4 <= MMVQ_MAX_BATCH_SIZE` (`8`,
+`mmvq.cuh:3`) the `MUL_MAT` reaches `mul_mat_vec_q`, which first quantizes `lo` to **Q8_1**
+(`quantize_q8_1`: `d = amax / 127`, `q = roundf(x / d)`) and then runs
+`vec_dot_q8_0_q8_1`.  So the two paths differ by an **8-bit activation quantization**, not by a
+few ulps of summation order: an activation error of up to `d / 2` propagates through the sigmoid
+into every `gated` element and lands at exactly the 1e-3 KL class that was measured.  This
+supersedes the earlier "reduction order" reading, which explained the shape but not the size, and
+it also explains why the T=1 path was fine: it ran a different kernel instance on a different
+graph shape.
+
+**Which mechanism produced 1.8e-3: the activation format, not an overwrite.**  The two candidates were an
+`res_hc` overwrite (a wrong-value bug, ~1 logit) and the reduction-order change (~1 ulp on `up`).
+The reduction explains the magnitude on its own: a float32 ulp on a logit of order 1 is 1.2e-7, and
+the KL that a coherent row-wide shift of that size produces is $\kappa\,\varepsilon^2/2$ with
+$\kappa$ the row's softmax curvature, which is where 1e-4..1.5e-2 comes from; a purely independent
+per-element perturbation would cancel and stay at 1e-14.  The reduction changes every `up` element
+of a row by the same order of magnitude and the same sign pattern, so it acts coherently.  The
+overwrite mechanism is different in kind: it replaces bytes a later node still reads, which moves a
+logit by the size of the block it clobbers (hundreds of ulps), and it cannot leave 3 of 16 rows
+bit-identical.  The reach table (774/774 fused, `out` and `lo` disjoint at every site) rules the
+`out↔lo` variant out; the `xn`/`res_hc` variant was never separated by measurement, so R2 stays as
+a guard for it rather than as the explanation.  The 1e-6 gate in §4 is therefore not "1 ulp is
+allowed": it is a gate on a comparison the old fusion could not satisfy, and R1 is what makes it
+satisfiable.
+
+**What the accounting change requires.**  Three code-level consequences, recorded here because
+the document is the ledger (implemented in `ggml/src/ggml-cuda/ggml-cuda.cu`, see §5n):
+
+* R1, algorithm equivalence gate: the fused path runs only when its reduction order matches the
+  kernel the generic path would run.  Q8_0 now matches (a new mirror reproduces
+  `mul_mat_vec_q<Q8_0>` block for block), Q4_0/BF16 do not and keep the generic chain, so in both
+  cases the fused-vs-generic delta is exactly 0 and the gate is met by construction rather than
+  by a threshold.
+* R2, storage liveness: `overlaps(out, xn)` only proves the *addresses* differ at the moment of
+  the check.  It cannot prove that `xn`'s storage owner is dead when `out` is written, and
+  `build_hc_combine` feeds `res_hc` back into `build_hc_mix` as `x`, so a later node still reads
+  those bytes.  `prepare()` records every reader of every storage owner, and the tail refuses when
+  `weights`/`lo`/`xn`/`out` is read at or after `i+12`, the first node the fused kernel does not
+  absorb (reads inside `i..i+11` are the kernel's own).
+* R4, this section: the comparison above is restated, and G4's acceptance text (§4) is aligned
+  with it.
 
 **Layered attribution order** (each layer is independent, stop at the first that separates):
 1. placement: per-site (buffer, offset) of `up/lo/xn/out/weights`, off vs on — tool
@@ -713,6 +792,129 @@ Reading rules, final form:
 
 Nothing in this section was compiled, run or syntax-checked: **G2 remains unproven**.
 
+## 5n. Eleventh review: the guard decided on addresses, not on algorithms or lifetimes
+
+The 2026-10-31 run (§5a) was read again as a whole rather than as a KL table.  Two defects follow,
+and both live in `ggml/src/ggml-cuda/ggml-cuda.cu` (the HIP tail matcher and its guard index).
+
+### R1 — explicit algorithm equivalence gate (matched, not blanket)
+
+The old guard asked only "is `out` free of `lo`/`xn`/`weights` in address".  It never asked whether
+the fused kernel computes the same function as the kernel the generic chain would run, so it
+swapped a two-level reduction for a three-level one and returned a different float.  The gate now
+answers that question per weight type and per device, and it admits a fusion when the arithmetic is
+the same, refuses when it is not:
+
+| weight type | fused kernel | generic kernel | verdict |
+|---|---|---|---|
+| Q8_0 | `hc_owner_tail4_t1_q8_mmvq` (new) | `mul_mat_vec_q<Q8_0>` (`mmvq.cu`) | **equivalent**: the mirror reproduces it block for block |
+| Q4_0 | `hc_owner_tail4_t1_q4_f32` (wave tree) | `mul_mat_vec_q<Q4_0>`, which quantizes the weights on the fly | refused |
+| BF16 | `hc_owner_tail4_t1_bf16` (four FMA chains, one xor tree) | `mul_mat_vec_bf16_load4` (same chains, eight waves per row) | refused until a mirror exists |
+| Q8_0, R = 2..4 | `hc_owner_tail4_rows_q8_mmvq<R>` (new, ported) | `mul_mat_vec_q<Q8_0>` with a Q8_1 `lo` | **equivalent**, same mirror rule |
+
+`ggml_cuda_hc_owner_tail4_equivalent()` (`mmvf.cu`) is the predicate the matcher calls before any
+work; it is also what `M3_TAIL_WHY` reports as `why=1`.
+
+**How Q8_0 became equivalent.**  Read off the sources, not recalled:
+
+* `ggml-common.h`: `QR8_0 = 1`, so `QI8_0 = QK8_0 / (4 * QR8_0) = 32 / 4 = 8` — **eight** ints per
+  lane, not four.  `QK8_0 = 32`.
+* `vecdotq.cuh`: `VDR_Q8_0_Q8_1_MMVQ = 2`; `vec_dot_q8_0_q8_1(vbq, bq8_1, kbx, iqs)` reads
+  `qs[iqs + 0]` and `qs[iqs + 1]`, i.e. eight int8 of the block's 32.
+* `mmvq.cu`: table `MMVQ_PARAMETERS_RDNA2` ⇒ `calc_nwarps(Q8_0, 1) = 1`, `rows_per_cuda_block = 1`,
+  `blocks_per_iter = vdr * warp / qi = 2 * 32 / 8 = 8`, `kbx = tid / (qi/vdr) = lane / 4`, and
+  `kqs = vdr * (lane % (qi/vdr)) = 2 * (lane % 4)`.
+* The row is 10 blocks, so the `kbx` loop runs **twice**: `lane / 4` covers blocks 0..7, then
+  `+ 8` covers blocks 8..9.  Four lanes cooperate on one block, each reading a different
+  `kqs = 0, 2, 4, 6` quarter.  Reduction is one `warp_reduce_sum<32>` (nwarps = 1, no second row).
+
+An earlier revision had `nwarps = 4`, `kb = lane / 2` and fixed `iqs = 0, 1`; that read only the
+first eight weights of each block and missed 24 of 32 — a wrong result, not a rounding difference.
+The mirror now calls the generic `vec_dot_q8_0_q8_1` itself and copies the `kbx` loop verbatim, so
+the mapping cannot drift from the source.  It consumes the generic kernel's own activation form:
+`quantize_q8_1` with one thread per element, `d = amax / 127`, `q = roundf(x / d)`, `d` in the low
+half of `ds`, over `lo` directly (`ne00 = ne0 = k = 320`; 320 is a whole number of Q8_1 blocks, so
+no staging copy and no 512-wide padding — padding would only add zero blocks the loop never
+visits).
+
+The claim is measurable, not asserted.  `GGML_CUDA_HC_TAIL_SELFCHECK=1` runs the same kernel
+with `selfcheck = true`: after the mirror's own whole-warp reduction, the whole warp also runs the
+old wave-tree reduction over the same 320 products (every lane joins both shuffles, so the
+`__shfl_xor_sync` masks are full), and lane 0 `atomicAdd`s a counter when the two float32 bit
+patterns differ.  The launcher prints `HC tail selfcheck dim=2560 mismatches=<n>` per fused site.
+Zero is the expected reading and is the acceptance for R1; a non-zero count localises the defect
+to this kernel instead of to a logits diff.  The switch is off by default and costs one allocation
+and one stream synchronisation only in a diagnostic leg.
+
+What the mirror does **not** claim: it is not a speed win.  It re-quantizes `lo` on the device
+(the generic path quantizes it too, once, for the same `up` node), so the only saving left is the
+11 downstream nodes of the tail.  Whether that is still worth a knob is a Devops measurement, not
+an argument; the equivalence gate is about values, not performance.
+
+The Q4_0 and BF16 refusals are the fail-closed default, not a design goal.  A Q4_0 mirror would
+have to reproduce `vec_dot_q4_0_q8_1` including the on-the-fly weight quantization; a BF16 mirror
+would have to reproduce `mul_mat_vec_bf16_load4`'s eight-wave reduction.  Neither exists yet, so
+both keep the generic chain.
+
+### R2 — storage liveness, measured against the kernel's own window
+
+`overlaps(out, xn)` compares two address ranges at the moment of the check.  It cannot see that
+`xn` is a normalisation of `res_hc` and that `build_hc_combine` reads `res_hc` again after the
+mixer returns.  The guard index now answers the liveness question, but the first version of it
+asked the wrong one: it required every reader of `xn`, `lo`, `weights` and `out` to be strictly
+before `i`.  That is wrong by construction, because the fused kernel itself reads `weights` and
+`lo` at `i` (the `up` node) and `xn` at `i+2` (the `gated` node).  With that predicate every site
+returned false and the fusion would never have run.
+
+The corrected rule is about **what the kernel absorbs**.  The fused tail computes nodes
+`i .. i+11` in one kernel, so a read of any of its inputs inside that window is satisfied by the
+kernel and must not veto it.  A read that matters is one the kernel does not absorb:
+
+| tensor | role in the fused window | veto condition |
+|---|---|---|
+| `weights` | read by `up` at `i` | read at or after `i+12` |
+| `lo` | read by `up` at `i` | read at or after `i+12` |
+| `xn` | read by `gated` at `i+2` | read at or after `i+12` |
+| `out` | **written** by `scale` at `i+11` | not tested |
+
+`out` is the output, not an input, so the liveness question does not apply to it at all.  Every
+normal downstream consumer reads `out` at or after `i+12`, so a "read at or after `i+12`" test on
+`out` would reject every site — the second fatal defect found in review, after the same mistake in
+the input direction.  What matters for `out` is that it is a fresh allocation (`out->view_src ==
+nullptr`, part of the topology check) and that it does not overlap the inputs, which the
+`overlaps()` checks and `has_owner_tail_hazard()` already refuse.
+
+Implementation:
+
+* `prepare()` walks `cgraph->nodes` once and records, per **storage owner** (the leaf of the
+  `view_src` chain), every graph index that reads that owner, in ascending order.  A node that
+  appears twice contributes two entries, so nothing is silently merged;
+* `read_at_or_after(ctx, cgraph, t, limit)` answers whether the owner of `t` has a reader at or
+  after `limit`; the caller passes the limit that is correct for the tensor's role above;
+* the address-overlap vetoes and `has_owner_tail_hazard` are unchanged and still run after it.
+
+Cost: one `unordered_map` to `std::vector<int>` per graph execution, built lazily on the first HC
+candidate, the same lifetime as `view_counts`.
+
+### What this changes for the ledger
+
+* G3(1) reach is again the acceptance, but it is now a statement about *which* path ran:
+  `why=0` for every Q8_0 site on RDNA2 (the mirror is in use) and `why=1` for Q4_0/BF16.  A leg
+  that reports `why=1` on Q8_0 means the mirror's own guards declined and the run says nothing
+  about the mirror.
+* G4 is **bitwise** equality of `nt_on32x2` vs `nt_off32x2` (§4 corrected).  That is now a
+  meaningful requirement rather than a tautology: with the mirror, both legs run the same
+  arithmetic and must agree to the last bit.  A non-zero difference localises a real defect.
+* `M3_TAIL_WHY=1` now reports `why=0` from the matcher itself once per fused site, so the leg no
+  longer needs a separate diag DSO to prove the fused path ran; the diag DSO remains the only way
+  to see the refused reasons (1..9).
+* R3 (placement stamp): `diag/m3-tail-stamp.ggml-cuda.diff` is regenerated against this matcher.
+  Its hunk anchors on the `overlaps` lambda, replaces the whole veto block with one that computes
+  the current decision order, and prints `why` 0..9 plus `(buffer, offset)` of
+  `weights/lo/xn/out/up` and `node`/`n_nodes`/`rows`.  `diag/m3-tail-stamp-diff.py` still aligns
+  the two logs by `(node,rows)`, so it works unchanged.
+* §5a's reading of the 2026-10-31 run is restated: it is a reduction-order change, not layout drift.
+
 ## 6. Evidence boundary (what is and is not proven)
 
 * **Proven (pre-existing evidence re-read):** the veto is `out↔lo` overlap produced by galloc's
@@ -744,6 +946,66 @@ Nothing in this section was compiled, run or syntax-checked: **G2 remains unprov
   `M3_ALLOC_RETAINED name/op/ne0` recorded at the retention decision). Nothing has been executed, so
   G2 remains unproven; the production gate is exact `"1"` again and the previous
   `trunk`/`mixer`-inside-`TAIL_KEEP` revision is reverted (kept as evidence above);
-  token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).  Cause not yet localised;
-  §5a/§5b give the placement-stamp and per-layer capture plan.  The gate stays closed: promotion is
-  NOT claimed and no threshold was relaxed.
+  token stream unchanged; KL mean 1.816e-3 / max 1.543e-2 (reproduced).
+* **2026-11-01 update (§5n):** the cause of that KL is localised statically.  The fused kernel and
+  the generic kernel reduced k = 320 in different orders, so the fused path could not meet a
+  numeric-order gate.  R1 now states the equivalence and enforces it per type: Q8_0 runs a new
+  mirror that reproduces `mul_mat_vec_q<Q8_0>` block for block (same Q8_1 activation form, same
+  lane mapping, same wave tree), Q4_0/BF16 are refused until a mirror exists.  R2 replaces the
+  address check with a storage-liveness check.  Neither change was compiled, run or
+  syntax-checked here.
+  Consequences: G3(1) expects `why=0` at Q8_0 sites and `why=1` at Q4_0/BF16 sites, G4 is a
+  bitwise comparison, and the KL table of §5a is evidence about the pre-R1 trio DSO, not about
+  this tree.  The gate stays closed: promotion is NOT claimed, no threshold was relaxed, and no
+  fused value can differ from the generic one because the gate refuses the paths that would.
+* **2026-11-01, second pass (§5n):** a line-by-line review of the first revision found six
+  defects, all confirmed against the source and all fixed.  (1) R2 required every reader to be
+  before `i`, but the fused kernel itself reads `weights`/`lo` at `i` and `xn` at `i+2`, so no site
+  could ever fire; the window is now "read at or after `i+12`", with `out` treated as the output.
+  (2) `prepare()` kept only the first producer index while its comment claimed duplicates were
+  handled; it now records every reader index in order.  (3) `calc_nwarps(Q8_0, 1, RDNA2)` is 1,
+  not 4.  (4) The mirror's lane mapping was wrong for that: it must be `kb = lane / 2` with one
+  block per lane, which is now what it does.  (5) The self-check called `warp_reduce_sum` inside
+  `if (lane == 0)`, an incomplete-warp shuffle; both reductions now run on the whole warp.  (6) The
+  activation staging buffer was unnecessary: `quantize_q8_1` reads one element per thread and
+  320 % QK8_1 == 0, so it quantizes `lo` directly with no copy and no 512 padding.  A seventh
+  point, `__fadd_rn` versus the generic `+=`: the generic path accumulates with `+=` per visited
+  block and one `warp_reduce_sum`, and the mirror now uses exactly that.
+* **2026-11-01, third pass (§5n):** two more defects, both fatal, found in review and confirmed
+  against the source.  (a) The liveness test was applied to `out`, the fused kernel's own output;
+  every normal downstream consumer reads it at or after `i+12`, so every site would have been
+  rejected.  The test now covers only `weights`, `lo` and `xn`; `out` is covered by the topology
+  (`!out->view_src`), the `overlaps()` checks and `has_owner_tail_hazard()`.  (b) The mirror's
+  lane mapping was wrong twice over: `QI8_0` is 8 (not 4), so four lanes cooperate on a block,
+  `kbx = lane / 4`, `kqs = 2 * (lane % 4)`, and the 10-block row needs two `kbx` passes.  The
+  previous version read only the first eight weights of each block.  The mirror now calls
+  `vec_dot_q8_0_q8_1` and copies the `kbx` loop from `mmvq.cu`, with `static_assert`s on
+  `QI8_0 == 8` and `VDR_Q8_0_Q8_1_MMVQ == 2`.
+* **The N-row matcher is now in this tree (2026-11-01).**  `ggml_cuda_fuse_hc_owner_tail4_rows`
+  (`ggml-cuda.cu`, rows 2..4) and `ggml_cuda_op_hc_owner_tail4_rows` with the kernel
+  `hc_owner_tail4_rows_q8_mmvq<R>` (`mmvf.cu`) are ported from
+  `/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-m3-trio-20261028/tree`
+  (`ggml-cuda.cu:5560`, `mmvf.cu:1395`).  The topology checks, the `up`-as-output variant and the
+  view/`nb` layout checks are kept as they are there; the value gate and the liveness rule are
+  this tree's (`ggml_cuda_hc_owner_tail4_equivalent`, `read_at_or_after` on the three inputs only).
+  The kernel quantizes `lo` to Q8_1 **once for all R rows** in one launch
+  (`ne00 = ne0 = k = 320`, `ne1 = R`, so R * 10 blocks at stride 10) and each row then runs the
+  generic `vec_dot_q8_0_q8_1` over the same `kbx`/`kqs` mapping as the T=1 mirror, writing `up`
+  only when the graph exposes it as an output.  Registration is in `ggml_cuda_try_fuse` before the
+  T=1 entry; the knob is the existing `GGML_CUDA_FUSE_HC_OWNER_TAIL` (`0` disables both).
+  `GGML_CUDA_HC_TAIL_LEGACY_TREE=1` still forces the old, unquantized tree kernel for comparison.
+* **Where the N-row matcher used to live.**  This tree has only the T=1 matcher
+  (`ggml_cuda_fuse_hc_owner_tail4_t1`, `ne[1] == 1`); `grep -c hc_owner_tail4_rows` here is 0.  The
+  N-row entry point `ggml_cuda_op_hc_owner_tail4_rows` exists only in the trio sources the M3 runs
+  executed: `/home/kunweiz/work/lead-m3diag2-verify-20261031/src/{trio,diag2}.ggml-cuda.cu:5489`.
+  The earlier note that the rows path was absent from this tree is now historical: the sources
+  were at the trio tree above all along, and they are ported here.  `/home/kunweiz/work/merge-m3-20261031`
+  still does not exist; the sibling merge trees (`merge-dualwin-`, `merge-fa-`, `merge-maxfp-`,
+  `merge-nout-`, `merge-prefab-`, `merge-router-20261031`) contain no `hc_owner_tail4_rows`.
+* **R3 is regenerated.**  `diag/m3-tail-stamp.ggml-cuda.diff` now patches the current matcher:
+  it anchors on the `overlaps` lambda, replaces the whole veto block with one that computes the
+  decision order (1 equivalence, 2..4 a reader of `weights`/`lo`/`xn` at or after `i+12`,
+  5..7 address overlap, 8 owner-tail hazard, 0 fused), and prints `why`, `node`, `n_nodes`,
+`rows` and the
+  `(buffer, offset)` of `weights/lo/xn/out/up`.  `M3_TAIL_WHY` and `M3TAIL_STAMP` are still the
+  only switches, and the guard still fails closed on every non-zero `why`.

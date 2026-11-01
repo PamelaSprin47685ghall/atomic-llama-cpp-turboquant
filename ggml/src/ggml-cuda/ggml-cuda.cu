@@ -4915,6 +4915,11 @@ struct ggml_cuda_hc_combine_guards {
     bool ready = false;
     std::unordered_map<const ggml_tensor *, size_t> view_counts;
     std::unordered_set<const ggml_tensor *> event_nodes;
+    // Readers of each storage owner, as graph indices in ascending order. The
+    // owner is the leaf of the view chain, so every tensor that shares those
+    // bytes is covered by one entry. Duplicate nodes in a graph are kept, not
+    // merged: each occurrence reads the owner at its own index.
+    std::unordered_map<const ggml_tensor *, std::vector<int>> readers;
 
     void prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
         if (ready) {
@@ -4933,6 +4938,30 @@ struct ggml_cuda_hc_combine_guards {
                 ++view_counts[base];
             }
         }
+        // Every read of an owner, by index. Nodes run in graph order, so a
+        // reader is always later than the writer of what it reads.
+        std::unordered_set<const ggml_tensor *> produced;
+        for (int n = 0; n < cgraph->n_nodes; ++n) {
+            const ggml_tensor * node = cgraph->nodes[n];
+            const ggml_tensor * owner = node;
+            while (owner->view_src) {
+                owner = owner->view_src;
+            }
+            produced.insert(owner);
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = node->src[s];
+                if (src == nullptr) {
+                    continue;
+                }
+                const ggml_tensor * src_owner = src;
+                while (src_owner->view_src) {
+                    src_owner = src_owner->view_src;
+                }
+                if (produced.count(src_owner) != 0) {
+                    readers[src_owner].push_back(n);
+                }
+            }
+        }
         for (const auto & entry : ctx.stream_context().concurrent_events) {
             event_nodes.insert(entry.first);
             event_nodes.insert(entry.second.join_node);
@@ -4940,6 +4969,35 @@ struct ggml_cuda_hc_combine_guards {
                 event_nodes.insert(mapping.first);
             }
         }
+    }
+
+    // A fused tail consumes nodes first..first+11 in one kernel, so every read
+    // of its inputs inside that window is satisfied by the kernel itself. A
+    // read only forces the generic chain when it happens at or after `limit`,
+    // the index of the first node the fused kernel does not absorb.
+    //
+    // weights and lo are read by up (src[0], src[1]) at `first`, and xn by
+    // gated (src[0]) at first+2; the fused kernel absorbs nodes first..first+11,
+    // so callers pass first+12 for those three inputs. The output is not
+    // queried: it is written by the kernel and its readers are the normal
+    // downstream consumers.
+    bool read_at_or_after(
+            ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph,
+            const ggml_tensor * t, int limit) {
+        prepare(ctx, cgraph);
+        if (t == nullptr) {
+            return false;
+        }
+        const ggml_tensor * owner = t;
+        while (owner->view_src) {
+            owner = owner->view_src;
+        }
+        const auto found = readers.find(owner);
+        if (found == readers.end()) {
+            return false;
+        }
+        // readers[] is ascending, so the last entry answers the question.
+        return found->second.back() >= limit;
     }
 
     bool has_hazard(
@@ -5209,6 +5267,41 @@ static bool ggml_cuda_fuse_hc_owner_tail4_t1(
         const uintptr_t bp = uintptr_t(b->data);
         return ap <= bp ? bp - ap < ggml_nbytes(a) : ap - bp < ggml_nbytes(b);
     };
+    // Algorithm equivalence gate. The fused kernel and the generic MUL_MAT
+    // kernel must sum the k = 320 dot product in the same order, or the two
+    // paths return different floats and the fusion silently changes values.
+    // The predicate answers that question per weight type and device:
+    //   Q8_0  -> hc_owner_tail4_t1_q8_mmvq mirrors mul_mat_vec_q<Q8_0> block
+    //            for block (same Q8_1 activation form, same lane mapping, same
+    //            wave tree, no small-k packing): equivalent, fusion admitted;
+    //   Q4_0  -> the generic kernel quantizes the weights on the fly, so the
+    //            fused Q4_0 wave tree cannot match it: refused;
+    //   BF16  -> no mirror yet, and mmvf's load4 order is not the fused one:
+    //            refused.
+    // A refusal is fail-closed: the caller keeps the generic 12-node chain and
+    // no value changes. This gate is about values only; storage is the next
+    // check.
+    if (!ggml_cuda_hc_owner_tail4_equivalent(ctx, weights)) {
+        return false;
+    }
+    // Storage liveness of the three inputs. The fused kernel reads weights
+    // and lo at i (up) and xn at i+2 (gated), all inside nodes i..i+11, so a
+    // reader inside that window is the kernel's own read and must not veto.
+    // What vetoes is a reader the kernel does not absorb: one at or after
+    // i+12, the first node after the fused window.
+    //
+    // out is deliberately not tested here. It is the kernel's output, so every
+    // normal downstream consumer of it reads at or after i+12, and testing it
+    // would reject every site. The question that matters for out is whether it
+    // is a fresh allocation: out->view_src == nullptr is part of the topology
+    // above, and any address overlap with the inputs is already refused by the
+    // overlaps() checks and by has_owner_tail_hazard().
+    const int tail_end = i + 11;
+    if (aliases.read_at_or_after(ctx, cgraph, weights, tail_end + 1) ||
+            aliases.read_at_or_after(ctx, cgraph, lo, tail_end + 1) ||
+            aliases.read_at_or_after(ctx, cgraph, xn, tail_end + 1)) {
+        return false;
+    }
     if (overlaps(out, weights) || overlaps(out, lo) || overlaps(out, xn) ||
             aliases.has_owner_tail_hazard(ctx, cgraph, i)) {
         return false;
@@ -5217,7 +5310,145 @@ static bool ggml_cuda_fuse_hc_owner_tail4_t1(
     // Meta places this complete owner chain in one stage only after its
     // full-graph safety check. Multiple contributors end the stage at up,
     // before the nonlinear gate, so their partials cannot match this chain.
+    // Runtime witness for the equivalence claim: M3_TAIL_WHY=1 reports why=0
+    // (fused) once per fused site, so a leg states which path it took instead
+    // of leaving that to a kernel census.
+    static const bool tail_why = getenv("M3_TAIL_WHY") != nullptr &&
+            std::atoi(getenv("M3_TAIL_WHY")) != 0;
+    if (tail_why) {
+        GGML_LOG_INFO("M3_TAIL_WHY il=%d why=0 node=%d rows=%lld\n",
+                -1, i, (long long) cgraph->nodes[i]->ne[1]);
+    }
     return ggml_cuda_op_hc_owner_tail4_t1(ctx, weights, lo, xn, out);
+}
+
+// N-row twin of the T=1 matcher above (rows = 2..4). The topology, the value
+// gate and the storage-liveness rule are the same; the only differences are
+// the row count in the shape checks and that the kernel takes an optional
+// `up` output.
+static bool ggml_cuda_fuse_hc_owner_tail4_rows(
+        ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
+        ggml_cuda_hc_combine_guards & aliases) {
+    static const bool disabled = getenv("GGML_CUDA_FUSE_HC_OWNER_TAIL") != nullptr &&
+            std::atoi(getenv("GGML_CUDA_FUSE_HC_OWNER_TAIL")) == 0;
+    if (disabled || i + 11 >= cgraph->n_nodes || ctx.quantized_matmul_f32) {
+        return false;
+    }
+
+    ggml_tensor * up = cgraph->nodes[i];
+    ggml_tensor * gate = cgraph->nodes[i + 1];
+    ggml_tensor * gated = cgraph->nodes[i + 2];
+    ggml_tensor * streams = cgraph->nodes[i + 3];
+    ggml_tensor * out = cgraph->nodes[i + 11];
+    const int64_t width = up->ne[0];
+    const int64_t dim = width / 4;
+    const int64_t rows = up->ne[1];
+    if (width != 10240 || rows < 2 || rows > 4) {
+        return false;
+    }
+    auto mat_f32 = [rows](const ggml_tensor * t, int64_t n, bool contiguous = true) {
+        return t && t->type == GGML_TYPE_F32 && t->ne[0] == n &&
+                t->ne[1] == rows && t->ne[2] == 1 && t->ne[3] == 1 &&
+                t->data && t->nb[0] == sizeof(float) && (!contiguous || ggml_is_contiguous(t));
+    };
+    if (up->op != GGML_OP_MUL_MAT || !mat_f32(up, width) || up->view_src ||
+            gate->op != GGML_OP_UNARY || ggml_get_unary_op(gate) != GGML_UNARY_OP_SIGMOID ||
+            gate->src[0] != up || !mat_f32(gate, width) || gate->view_src ||
+            gated->op != GGML_OP_MUL || gated->src[1] != gate ||
+            !mat_f32(gated, width) || gated->view_src ||
+            streams->op != GGML_OP_RESHAPE || streams->src[0] != gated ||
+            streams->view_src != gated || streams->view_offs != 0 ||
+            streams->type != GGML_TYPE_F32 || streams->ne[0] != dim ||
+            streams->ne[1] != 4 || streams->ne[2] != rows || streams->ne[3] != 1 ||
+            !ggml_is_contiguous(streams) || !streams->data) {
+        return false;
+    }
+    const ggml_tensor * weights = up->src[0];
+    const ggml_tensor * lo = up->src[1];
+    const ggml_tensor * xn = gated->src[0];
+    if (!weights || weights->type != GGML_TYPE_Q8_0 ||
+            weights->op != GGML_OP_NONE || weights->view_src ||
+            weights->ne[0] != 320 || weights->ne[1] != width ||
+            weights->ne[2] != 1 || weights->ne[3] != 1 ||
+            !weights->data || !ggml_is_contiguous(weights) ||
+            !mat_f32(lo, 320) || !mat_f32(xn, width)) {
+        return false;
+    }
+    for (int k = 0; k < 12; ++k) {
+        if (weights == cgraph->nodes[i + k] || lo == cgraph->nodes[i + k] || xn == cgraph->nodes[i + k]) {
+            return false;
+        }
+    }
+    for (int k = 0; k < 4; ++k) {
+        const ggml_tensor * view = cgraph->nodes[i + 4 + k];
+        if (view->op != GGML_OP_VIEW || view->src[0] != streams || view->view_src != gated ||
+                view->view_offs != size_t(k * dim) * sizeof(float) ||
+                !mat_f32(view, dim, false) || view->nb[0] != sizeof(float) ||
+                view->nb[1] != size_t(width) * sizeof(float) ||
+                view->nb[2] != view->nb[1] * size_t(rows) || view->nb[3] != view->nb[2]) {
+            return false;
+        }
+    }
+    for (int k = 0; k < 3; ++k) {
+        const ggml_tensor * add = cgraph->nodes[i + 8 + k];
+        if (add->op != GGML_OP_ADD ||
+                add->src[0] != cgraph->nodes[i + (k == 0 ? 4 : 7 + k)] ||
+                add->src[1] != cgraph->nodes[i + 5 + k] ||
+                !mat_f32(add, dim) || add->view_src) {
+            return false;
+        }
+    }
+    float scale[2];
+    memcpy(scale, out->op_params, sizeof(scale));
+    uint32_t bias_bits;
+    memcpy(&bias_bits, &scale[1], sizeof(bias_bits));
+    // `up` is written by the fused kernel only when the graph exposes it.
+    const bool up_out = (up->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+    if (out->op != GGML_OP_SCALE || out->src[0] != cgraph->nodes[i + 10] ||
+            !mat_f32(out, dim) || out->view_src || scale[0] != 0.25f || bias_bits != 0) {
+        return false;
+    }
+    static const enum ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE,
+            GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+            GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_SCALE };
+    const int outs_up[] = { i, i + 11 };
+    const int outs_tail[] = { i + 11 };
+    const bool closed = up_out ? ggml_can_fuse_subgraph(cgraph, i, 12, ops, outs_up, 2)
+                               : ggml_can_fuse_subgraph(cgraph, i, 12, ops, outs_tail, 1);
+    if (!closed) {
+        return false;
+    }
+    // Algorithm equivalence gate: only Q8_0 on this device has a mirror whose
+    // reduction order equals the generic kernel's.
+    if (!ggml_cuda_hc_owner_tail4_equivalent(ctx, weights)) {
+        return false;
+    }
+    // Storage liveness of the three inputs; the fused kernel absorbs every read
+    // inside i..i+11. `out` is the kernel's output and is not tested (see the
+    // T=1 matcher).
+    const int tail_end = i + 11;
+    if (aliases.read_at_or_after(ctx, cgraph, weights, tail_end + 1) ||
+            aliases.read_at_or_after(ctx, cgraph, lo, tail_end + 1) ||
+            aliases.read_at_or_after(ctx, cgraph, xn, tail_end + 1)) {
+        return false;
+    }
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t ap = uintptr_t(a->data);
+        const uintptr_t bp = uintptr_t(b->data);
+        return ap <= bp ? bp - ap < ggml_nbytes(a) : ap - bp < ggml_nbytes(b);
+    };
+    if (overlaps(out, weights) || overlaps(out, lo) || overlaps(out, xn) ||
+            (up_out && (overlaps(up, weights) || overlaps(up, lo) || overlaps(up, xn) || overlaps(up, out))) ||
+            aliases.has_owner_tail_hazard(ctx, cgraph, i)) {
+        return false;
+    }
+    static const bool tail_why = getenv("M3_TAIL_WHY") != nullptr &&
+            std::atoi(getenv("M3_TAIL_WHY")) != 0;
+    if (tail_why) {
+        GGML_LOG_INFO("M3_TAIL_WHY il=%d why=0 node=%d rows=%lld\n",
+                -1, i, (long long) rows);
+    }
+    return ggml_cuda_op_hc_owner_tail4_rows(ctx, weights, lo, xn, out, up_out ? up : nullptr);
 }
 
 
@@ -5297,6 +5528,11 @@ static int ggml_cuda_try_fuse(
     if (node->op == GGML_OP_MUL_MAT &&
             ggml_cuda_fuse_hc_down_silu_t1(*cuda_ctx, cgraph, i, hc_combine_guards)) {
         return 2;
+    }
+
+    if (node->op == GGML_OP_MUL_MAT &&
+            ggml_cuda_fuse_hc_owner_tail4_rows(*cuda_ctx, cgraph, i, hc_combine_guards)) {
+        return 11;
     }
 
     if (node->op == GGML_OP_MUL_MAT &&

@@ -1,47 +1,236 @@
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@
-     if (!closed) {
-         return false;
-     }
--    if (ggml_cuda_hc_trio_overlaps(out, lo) || ggml_cuda_hc_trio_overlaps(out, xn) ||
--            ggml_cuda_hc_trio_overlaps(out, weights) ||
--            (up_out && (ggml_cuda_hc_trio_overlaps(up, lo) || ggml_cuda_hc_trio_overlaps(up, xn) ||
--                        ggml_cuda_hc_trio_overlaps(up, out))) ||
--            aliases.has_owner_tail_hazard(ctx, cgraph, i)) {
--        return false;
+     const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+         const uintptr_t ap = uintptr_t(a->data);
+         const uintptr_t bp = uintptr_t(b->data);
+         return ap <= bp ? bp - ap < ggml_nbytes(a) : ap - bp < ggml_nbytes(b);
+     };
++    // Diagnostic copy of the veto block (diag/m3-tail-stamp.ggml-cuda.diff).
++    // The why values are the ones this tree can produce, in the order the
++    // checks run, so a leg reports which decision it took:
++    //   1  equivalence gate refused (Q4_0, BF16, or a non-RDNA2 device)
++    //   2  weights' storage owner is read at or after i+12
++    //   3  lo's storage owner is read at or after i+12
++    //   4  xn's storage owner is read at or after i+12
++    //   5  out overlaps weights in address
++    //   6  out overlaps lo in address
++    //   7  out overlaps xn in address
++    //   8  has_owner_tail_hazard (event node or unexpected view count)
++    //   0  the fused path ran
++    // out is the fused kernel's output; its downstream readers are normal and
++    // are not part of the decision.
++    // M3_TAIL_WHY=1 writes one line per site to stderr; M3TAIL_STAMP=1 appends
++    // the per-site (buffer, offset) rows to $M3TAIL_STAMP_PATH. Both are read
++    // once, and the guard still fails closed on every non-zero why.
 +    {
-+        const int why = ggml_cuda_hc_trio_overlaps(out, lo) ? 1 : ggml_cuda_hc_trio_overlaps(out, xn) ? 2 :
-+                ggml_cuda_hc_trio_overlaps(out, weights) ? 3 :
-+                (up_out && ggml_cuda_hc_trio_overlaps(up, lo)) ? 4 : (up_out && ggml_cuda_hc_trio_overlaps(up, xn)) ? 5 :
-+                (up_out && ggml_cuda_hc_trio_overlaps(up, out)) ? 6 : aliases.has_owner_tail_hazard(ctx, cgraph, i) ? 7 : 0;
-+        static const bool m3d = [] { const char * v = std::getenv("M3_TAIL_DIAG"); return v && std::atoi(v) != 0; }();
-+        if (m3d) {
-+            GGML_LOG_INFO("M3_TAIL_WHY why=%d rows=%lld node=%d n_nodes=%d\n", why,
-+                    (long long) cgraph->nodes[i]->ne[1], i, cgraph->n_nodes);
++        const int why =
++                !ggml_cuda_hc_owner_tail4_equivalent(ctx, weights) ? 1 :
++                aliases.read_at_or_after(ctx, cgraph, weights, i + 12) ? 2 :
++                aliases.read_at_or_after(ctx, cgraph, lo, i + 12) ? 3 :
++                aliases.read_at_or_after(ctx, cgraph, xn, i + 12) ? 4 :
++                overlaps(out, weights) ? 5 : overlaps(out, lo) ? 6 : overlaps(out, xn) ? 7 :
++                aliases.has_owner_tail_hazard(ctx, cgraph, i) ? 8 : 0;
++        static const bool tail_why = getenv("M3_TAIL_WHY") != nullptr &&
++                std::atoi(getenv("M3_TAIL_WHY")) != 0;
++        const long long rows = (long long) cgraph->nodes[i]->ne[1];
++        if (tail_why) {
++            GGML_LOG_INFO("M3_TAIL_WHY why=%d rows=%lld node=%d n_nodes=%d\n",
++                    why, rows, i, cgraph->n_nodes);
 +        }
-+        static const bool stamp = [] { const char * v = std::getenv("M3TAIL_STAMP"); return v && std::atoi(v) == 1; }();
-+        static const char * const stamp_path = std::getenv("M3TAIL_STAMP_PATH");
-+        if (stamp && stamp_path && stamp_path[0]) {
++        static const bool stamp = getenv("M3TAIL_STAMP") != nullptr &&
++                std::atoi(getenv("M3TAIL_STAMP")) == 1;
++        const char * stamp_path = getenv("M3TAIL_STAMP_PATH");
++        if (stamp && stamp_path != nullptr && stamp_path[0] != '\0') {
 +            FILE * fp = fopen(stamp_path, "a");
-+            if (fp) {
++            if (fp != nullptr) {
 +                const auto off = [](const ggml_tensor * t) -> long long {
-+                    if (!t || !t->data || !t->buffer) {
++                    if (t == nullptr || t->data == nullptr || t->buffer == nullptr) {
 +                        return -1;
 +                    }
-+                    return (long long) ((const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer));
++                    return (long long) ((const char *) t->data -
++                            (const char *) ggml_backend_buffer_get_base(t->buffer));
 +                };
-+                fprintf(fp, "M3STAMP why=%d node=%d rows=%lld upb=%lld upo=%lld lob=%lld loo=%lld "
-+                        "xnb=%lld xno=%lld outb=%lld outo=%lld wb=%lld wo=%lld\n",
-+                        why, i, (long long) rows, (long long) (intptr_t) up, off(up),
-+                        (long long) (intptr_t) lo, off(lo), (long long) (intptr_t) xn, off(xn),
-+                        (long long) (intptr_t) out, off(out), (long long) (intptr_t) weights, off(weights));
++                const auto buf = [](const ggml_tensor * t) -> long long {
++                    if (t == nullptr || t->buffer == nullptr) {
++                        return -1;
++                    }
++                    return (long long) (intptr_t) t->buffer;
++                };
++                fprintf(fp, "M3STAMP why=%d node=%d n_nodes=%d rows=%lld "
++                        "wbuf=%lld woff=%lld lobuf=%lld looff=%lld "
++                        "xnbuf=%lld xnoff=%lld outbuf=%lld outoff=%lld "
++                        "upbuf=%lld upoff=%lld\n",
++                        why, i, cgraph->n_nodes, rows,
++                        buf(weights), off(weights), buf(lo), off(lo),
++                        buf(xn), off(xn), buf(out), off(out),
++                        buf(cgraph->nodes[i]), off(cgraph->nodes[i]));
 +                fclose(fp);
 +            }
 +        }
-+        if (why) {
++        if (why != 0) {
 +            return false;
 +        }
-     }
++    }
+-    // Algorithm equivalence gate. The fused kernel and the generic MUL_MAT
+-    // kernel must sum the k = 320 dot product in the same order, or the two
+-    // paths return different floats and the fusion silently changes values.
+-    // The predicate answers that question per weight type and device:
+-    //   Q8_0  -> hc_owner_tail4_t1_q8_mmvq mirrors mul_mat_vec_q<Q8_0> block
+-    //            for block (same Q8_1 activation form, same lane mapping, same
+-    //            wave tree, no small-k packing): equivalent, fusion admitted;
+-    //   Q4_0  -> the generic kernel quantizes the weights on the fly, so the
+-    //            fused Q4_0 wave tree cannot match it: refused;
+-    //   BF16  -> no mirror yet, and mmvf's load4 order is not the fused one:
+-    //            refused.
+-    // A refusal is fail-closed: the caller keeps the generic 12-node chain and
+-    // no value changes. This gate is about values only; storage is the next
+-    // check.
+-    if (!ggml_cuda_hc_owner_tail4_equivalent(ctx, weights)) {
+-        return false;
+-    }
+-    // Storage liveness of the three inputs. The fused kernel reads weights
+-    // and lo at i (up) and xn at i+2 (gated), all inside nodes i..i+11, so a
+-    // reader inside that window is the kernel's own read and must not veto.
+-    // What vetoes is a reader the kernel does not absorb: one at or after
+-    // i+12, the first node after the fused window.
+-    //
+-    // out is deliberately not tested here. It is the kernel's output, so every
+-    // normal downstream consumer of it reads at or after i+12, and testing it
+-    // would reject every site. The question that matters for out is whether it
+-    // is a fresh allocation: out->view_src == nullptr is part of the topology
+-    // above, and any address overlap with the inputs is already refused by the
+-    // overlaps() checks and by has_owner_tail_hazard().
+-    const int tail_end = i + 11;
+-    if (aliases.read_at_or_after(ctx, cgraph, weights, tail_end + 1) ||
+-            aliases.read_at_or_after(ctx, cgraph, lo, tail_end + 1) ||
+-            aliases.read_at_or_after(ctx, cgraph, xn, tail_end + 1)) {
+-        return false;
+-    }
+-    if (overlaps(out, weights) || overlaps(out, lo) || overlaps(out, xn) ||
+-            aliases.has_owner_tail_hazard(ctx, cgraph, i)) {
+-        return false;
+-    }
+-
++    // Diagnostic copy of the T=1 veto block: it replaces the checks below, so
++    // each one runs exactly once and the why value is the decision.
++    // out is not tested: it is the kernel's output, and its downstream readers
++    // are normal.
++    const int tail_end = i + 11;
++    {
++        const int why =
++                !ggml_cuda_hc_owner_tail4_equivalent(ctx, weights) ? 1 :
++                aliases.read_at_or_after(ctx, cgraph, weights, tail_end + 1) ? 2 :
++                aliases.read_at_or_after(ctx, cgraph, lo, tail_end + 1) ? 3 :
++                aliases.read_at_or_after(ctx, cgraph, xn, tail_end + 1) ? 4 :
++                overlaps(out, weights) ? 5 : overlaps(out, lo) ? 6 : overlaps(out, xn) ? 7 :
++                aliases.has_owner_tail_hazard(ctx, cgraph, i) ? 8 : 0;
++        static const bool tail_why = getenv("M3_TAIL_WHY") != nullptr &&
++                std::atoi(getenv("M3_TAIL_WHY")) != 0;
++        const long long rows = (long long) cgraph->nodes[i]->ne[1];
++        if (tail_why) {
++            GGML_LOG_INFO("M3_TAIL_WHY why=%d rows=%lld node=%d n_nodes=%d\n",
++                    why, rows, i, cgraph->n_nodes);
++        }
++        static const bool stamp = getenv("M3TAIL_STAMP") != nullptr &&
++                std::atoi(getenv("M3TAIL_STAMP")) == 1;
++        const char * stamp_path = getenv("M3TAIL_STAMP_PATH");
++        if (stamp && stamp_path != nullptr && stamp_path[0] != '\0') {
++            FILE * fp = fopen(stamp_path, "a");
++            if (fp != nullptr) {
++                const auto off = [](const ggml_tensor * t) -> long long {
++                    if (t == nullptr || t->data == nullptr || t->buffer == nullptr) {
++                        return -1;
++                    }
++                    return (long long) ((const char *) t->data -
++                            (const char *) ggml_backend_buffer_get_base(t->buffer));
++                };
++                const auto buf = [](const ggml_tensor * t) -> long long {
++                    if (t == nullptr || t->buffer == nullptr) {
++                        return -1;
++                    }
++                    return (long long) (intptr_t) t->buffer;
++                };
++                fprintf(fp, "M3STAMP why=%d node=%d n_nodes=%d rows=%lld "
++                        "wbuf=%lld woff=%lld lobuf=%lld looff=%lld "
++                        "xnbuf=%lld xnoff=%lld outbuf=%lld outoff=%lld "
++                        "upbuf=%lld upoff=%lld\n",
++                        why, i, cgraph->n_nodes, rows,
++                        buf(weights), off(weights), buf(lo), off(lo),
++                        buf(xn), off(xn), buf(out), off(out),
++                        buf(cgraph->nodes[i]), off(cgraph->nodes[i]));
++                fclose(fp);
++            }
++        }
++        if (why != 0) {
++            return false;
++        }
++    }
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@
+     // Storage liveness of the three inputs; the fused kernel absorbs every read
+     // inside i..i+11. `out` is the kernel's output and is not tested (see the
+     // T=1 matcher).
+     const int tail_end = i + 11;
+-    if (aliases.read_at_or_after(ctx, cgraph, weights, tail_end + 1) ||
+-            aliases.read_at_or_after(ctx, cgraph, lo, tail_end + 1) ||
+-            aliases.read_at_or_after(ctx, cgraph, xn, tail_end + 1)) {
+-        return false;
+-    }
+     const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+         const uintptr_t ap = uintptr_t(a->data);
+         const uintptr_t bp = uintptr_t(b->data);
+         return ap <= bp ? bp - ap < ggml_nbytes(a) : ap - bp < ggml_nbytes(b);
+     };
+-    if (overlaps(out, weights) || overlaps(out, lo) || overlaps(out, xn) ||
+-            (up_out && (overlaps(up, weights) || overlaps(up, lo) || overlaps(up, xn) || overlaps(up, out))) ||
+-            aliases.has_owner_tail_hazard(ctx, cgraph, i)) {
+-        return false;
+-    }
++    // Diagnostic copy of the rows matcher's veto block. Same why values as the
++    // T=1 block above; the up-overlap checks of this matcher are why 5..8 and
++    // the owner hazard is why 9. Rows are reported so a leg can split 2/3/4.
++    {
++        const int why =
++                !ggml_cuda_hc_owner_tail4_equivalent(ctx, weights) ? 1 :
++                aliases.read_at_or_after(ctx, cgraph, weights, tail_end + 1) ? 2 :
++                aliases.read_at_or_after(ctx, cgraph, lo, tail_end + 1) ? 3 :
++                aliases.read_at_or_after(ctx, cgraph, xn, tail_end + 1) ? 4 :
++                overlaps(out, weights) || (up_out && overlaps(up, weights)) ? 5 :
++                overlaps(out, lo) || (up_out && overlaps(up, lo)) ? 6 :
++                overlaps(out, xn) || (up_out && overlaps(up, xn)) ? 7 :
++                (up_out && overlaps(up, out)) ? 8 :
++                aliases.has_owner_tail_hazard(ctx, cgraph, i) ? 9 : 0;
++        static const bool tail_why = getenv("M3_TAIL_WHY") != nullptr &&
++                std::atoi(getenv("M3_TAIL_WHY")) != 0;
++        if (tail_why) {
++            GGML_LOG_INFO("M3_TAIL_WHY why=%d rows=%lld node=%d n_nodes=%d\n",
++                    why, (long long) rows, i, cgraph->n_nodes);
++        }
++        static const bool stamp = getenv("M3TAIL_STAMP") != nullptr &&
++                std::atoi(getenv("M3TAIL_STAMP")) == 1;
++        const char * stamp_path = getenv("M3TAIL_STAMP_PATH");
++        if (stamp && stamp_path != nullptr && stamp_path[0] != '\0') {
++            FILE * fp = fopen(stamp_path, "a");
++            if (fp != nullptr) {
++                const auto off = [](const ggml_tensor * t) -> long long {
++                    if (t == nullptr || t->data == nullptr || t->buffer == nullptr) {
++                        return -1;
++                    }
++                    return (long long) ((const char *) t->data -
++                            (const char *) ggml_backend_buffer_get_base(t->buffer));
++                };
++                fprintf(fp, "M3STAMP why=%d node=%d n_nodes=%d rows=%lld "
++                        "woff=%lld looff=%lld xnoff=%lld outoff=%lld upoff=%lld\n",
++                        why, i, cgraph->n_nodes, (long long) rows,
++                        off(weights), off(lo), off(xn), off(out), off(up));
++                fclose(fp);
++            }
++        }
++        if (why != 0) {
++            return false;
++        }
++    }
      return ggml_cuda_op_hc_owner_tail4_rows(ctx, weights, lo, xn, out, up_out ? up : nullptr);
  }

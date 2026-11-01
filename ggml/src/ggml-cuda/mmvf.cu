@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include "convert.cuh"
+#include "quantize.cuh"
+#include "vecdotq.cuh"
 
 #if defined(GGML_USE_HIP)
 // Read four adjacent values per lane. Independent sums hide load and FMA latency.
@@ -269,6 +271,9 @@ static __global__ void hc_owner_tail4_t1_q4_f32(
     constexpr int dim = 2560, k = 320, wave = 32;
     const int j = int(blockIdx.x), stream = int(threadIdx.x) / wave, lane = int(threadIdx.x) % wave;
     const int row = stream * dim + j;
+    // The Q4_0 path keeps the wave tree. Its generic counterpart quantizes the
+    // same weights on the fly, so no fused order matches it; the matcher's
+    // equivalence gate refuses this path (ggml_cuda_hc_owner_tail4_equivalent).
     const float sum = warp_reduce_sum<wave>(hc_q4_row_partial<k, wave>(weights, lo, row, lane));
     __shared__ float gated[4];
     if (lane == 0) {
@@ -277,6 +282,110 @@ static __global__ void hc_owner_tail4_t1_q4_f32(
     __syncthreads();
     if (threadIdx.x == 0) {
         dst[j] = (((gated[0] + gated[1]) + gated[2]) + gated[3]) * 0.25f;
+    }
+}
+
+// Arithmetic mirror of the generic Q8_0 MUL_MAT on this device. The matcher
+// admits the fused Q8_0 path only when this function reproduces it bit for
+// bit, so it calls the generic kernel's own vec_dot and copies its loop
+// exactly. Facts it relies on, all read from the sources:
+//   ggml-common.h: QR8_0 = 1, QI8_0 = QK8_0 / (4 * QR8_0) = 8, QK8_0 = 32;
+//   vecdotq.cuh:   VDR_Q8_0_Q8_1_MMVQ = 2, and vec_dot_q8_0_q8_1(vbq, bq8_1,
+//                  kbx, iqs) reads eight int8 at qs[iqs + 0] and qs[iqs + 1],
+//                  i.e. one lane covers 8 of the block's 32 weights;
+//   mmvq.cu:       table MMVQ_PARAMETERS_RDNA2 -> nwarps = 1,
+//                  rows_per_cuda_block = 1, qi/vdr = 8/2 = 4, so
+//                  blocks_per_iter = vdr * warp / qi = 2 * 32 / 8 = 8,
+//                  kbx = lane / 4 (four lanes per block) stepping by 8, and
+//                  kqs = vdr * (lane % 4) = 2 * (lane % 4).
+// The k = 320 row is 10 blocks, so the kbx loop runs twice: blocks 0..7 on the
+// first pass and 8..9 on the second. Reduction is one warp tree, as in the
+// generic kernel (nwarps = 1 means no second warp row to add).
+// The activations are the generic kernel's own Q8_1 form: quantize_q8_1 over
+// the 320-element vector (320 % QK8_1 == 0, so no padding block), one thread
+// per element, d = amax / 127 and q = roundf(x / d).
+// One block computes one mixed coordinate: four waves, one per stream.
+static_assert(QK8_1 == 32 && sizeof(block_q8_1) == 2*sizeof(ggml_half) + QK8_1,
+        "Q8_1 block ABI");
+static_assert(QK8_0 == 32 && sizeof(block_q8_0) == 34, "Q8_0 block ABI");
+static_assert(QI8_0 == 8 && VDR_Q8_0_Q8_1_MMVQ == 2, "Q8_0 lane mapping");
+
+// selfcheck != 0 also evaluates the old wave-tree dot product on the whole
+// warp and counts the coordinates whose float32 bits differ. That count is the
+// direct measurement of the equivalence claim, which states it is zero.
+template<bool selfcheck>
+static __global__ void hc_owner_tail4_t1_q8_mmvq(
+        const block_q8_0 * weights, const float * lo, const float * xn,
+        const block_q8_1 * act, float * dst, int * mismatches) {
+    constexpr int dim = 2560, k = 320, wave = 32;
+    constexpr int qk = QK8_0, qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int blocks_per_row = k / qk;          // 10
+    constexpr int blocks_per_iter = vdr * wave / qi; // 8
+    const int j = int(blockIdx.x), stream = int(threadIdx.x) / wave, lane = int(threadIdx.x) % wave;
+    const int row = stream * dim + j;
+    const block_q8_0 * w = weights + int64_t(row) * blocks_per_row;
+    const int kqs = vdr * (lane % (qi / vdr));
+    // tmp += vec_dot(...) over kbx = lane / 4, lane / 4 + 8, ... below 10.
+    float partial = 0.0f;
+    for (int kbx = lane / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        partial += vec_dot_q8_0_q8_1(w, act, kbx, kqs);
+    }
+    // Whole-warp reduction: every lane joins the shuffle tree, which is what
+    // the generic kernel does and what __shfl_xor_sync requires.
+    const float sum = warp_reduce_sum<wave>(partial);
+    if constexpr (selfcheck) {
+        const float legacy = warp_reduce_sum<wave>(hc_q8_row_partial<k, wave>(weights, lo, row, lane));
+        if (lane == 0 && __float_as_int(legacy) != __float_as_int(sum)) {
+            atomicAdd(mismatches, 1);
+        }
+    }
+    __shared__ float gated[4];
+    if (lane == 0) {
+        gated[stream] = xn[row] * (1.0f / (1.0f + expf(-sum)));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        dst[j] = (((gated[0] + gated[1]) + gated[2]) + gated[3]) * 0.25f;
+    }
+}
+
+
+// R = 2..4 mirror of the same generic kernel, one column per block and one
+// wave per stream, matching the N-row trio kernel's shape so the fused and
+// generic paths differ only in the activation format. Each row r has its own
+// quantized activation vector at act + r * blocks_per_row.
+template<int R>
+static __global__ void hc_owner_tail4_rows_q8_mmvq(
+        const block_q8_0 * weights, const block_q8_1 * act, const float * xn,
+        float * dst, float * up) {
+    constexpr int dim = 2560, width = 4 * dim, k = 320, wave = 32;
+    constexpr int qk = QK8_0, qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int blocks_per_row = k / qk;
+    constexpr int blocks_per_iter = vdr * wave / qi;
+    const int j = int(blockIdx.x), stream = int(threadIdx.x) / wave, lane = int(threadIdx.x) % wave;
+    const int row = stream * dim + j;
+    const block_q8_0 * w = weights + int64_t(row) * blocks_per_row;
+    const int kqs = vdr * (lane % (qi / vdr));
+    __shared__ float gated[R][4];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const block_q8_1 * a = act + r * blocks_per_row;
+        float partial = 0.0f;
+        for (int kbx = lane / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+            partial += vec_dot_q8_0_q8_1(w, a, kbx, kqs);
+        }
+        const float sum = warp_reduce_sum<wave>(partial);
+        if (lane == 0) {
+            if (up) {
+                up[r * width + row] = sum;
+            }
+            gated[r][stream] = xn[r * width + row] * (1.0f / (1.0f + expf(-sum)));
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < R) {
+        const int r = int(threadIdx.x);
+        dst[r * dim + j] = (((gated[r][0] + gated[r][1]) + gated[r][2]) + gated[r][3]) * 0.25f;
     }
 }
 
@@ -327,6 +436,43 @@ bool ggml_cuda_op_hc_down_silu_t1(
 #endif
 }
 
+// Same admission test as ggml_cuda_op_hc_owner_tail4_t1, evaluated on the host
+// before any work: the matcher calls it so that a refused launch does not have
+// to be undone after the fact.
+static bool hc_owner_tail4_t1_admissible(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
+        const ggml_tensor * lo, const ggml_tensor * xn, const ggml_tensor * dst) {
+    GGML_UNUSED(ctx);
+    if (!weights || !lo || !xn || !dst || weights->data == nullptr || lo->data == nullptr ||
+            xn->data == nullptr || dst->data == nullptr) {
+        return false;
+    }
+    const ggml_type type = weights->type;
+    const size_t align = type == GGML_TYPE_Q4_0 ? alignof(block_q4_0) :
+            type == GGML_TYPE_Q8_0 ? alignof(block_q8_0) : alignof(uint2);
+    return uintptr_t(weights->data) % align == 0;
+}
+
+// The fused Q8_0 tail is the generic kernel's arithmetic only when the device
+// runs the same reduction the mirror reproduces: RDNA2, warp 32, one warp row
+// and no small-k row packing (see hc_owner_tail4_t1_q8_mmvq). Everything else,
+// and every weight type whose generic kernel quantizes on the fly (Q4_0) or
+// has no faithful mirror yet (BF16), reports false and keeps the generic chain.
+bool ggml_cuda_hc_owner_tail4_equivalent(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weights) {
+#if defined(GGML_USE_HIP)
+    if (weights == nullptr || weights->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    return device.cc == GGML_CUDA_CC_RDNA2 && device.warp_size == 32;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(weights);
+    return false;
+#endif
+}
+
 // Private entry point; graph topology and lifetime guards are in the matcher.
 bool ggml_cuda_op_hc_owner_tail4_t1(
         ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
@@ -355,6 +501,74 @@ bool ggml_cuda_op_hc_owner_tail4_t1(
         return false;
     }
     const int dim = int(dst->ne[0]);
+    // The Q8_0 tail runs only when its arithmetic can be the generic kernel's
+    // arithmetic. hc_owner_tail4_t1_q8_f32 multiplies unquantized F32 lo by the
+    // Q8_0 weights, while mul_mat_vec_q quantizes lo to Q8_1 first, so the two
+    // differ by an 8-bit activation quantization. The mirror
+    // hc_owner_tail4_t1_q8_mmvq uses the generic vec_dot over the same Q8_1
+    // form, so the fused and generic paths differ in node count and in nothing
+    // else. Any mismatch in the layout, the device or the quantization falls
+    // back to the generic chain.
+    if (q8) {
+        static const bool legacy_tree = getenv("GGML_CUDA_HC_TAIL_LEGACY_TREE") != nullptr &&
+                std::atoi(getenv("GGML_CUDA_HC_TAIL_LEGACY_TREE")) == 1;
+        constexpr int64_t k = 320;
+        // The generic kernel packs rows only when one block already covers the
+        // row (should_use_small_k). On RDNA2 nwarps = 1 and blocks_per_iter is
+        // vdr * warp / qi = 2 * 32 / 8 = 8, so the test needs 10 < 8 and never
+        // packs.
+        constexpr int64_t blocks_per_row = k / QK8_1;
+        constexpr int64_t blocks_per_iter = VDR_Q8_0_Q8_1_MMVQ * 32 / QI8_0;
+        constexpr bool small_k = blocks_per_row < 1 * blocks_per_iter; // nwarps = 1
+        // quantize_q8_1 reads one element per thread with ne00 = ne0 = k, so the
+        // source is lo itself: no staging copy and no padding block. k must be
+        // a whole number of Q8_1 blocks for that to hold.
+        if (!legacy_tree && !small_k && k % QK8_1 == 0 &&
+                device.cc == GGML_CUDA_CC_RDNA2 && device.warp_size == 32 &&
+                hc_owner_tail4_t1_admissible(ctx, weights, lo, xn, dst) &&
+                ggml_nbytes(lo) == size_t(k) * sizeof(float)) {
+            ggml_cuda_pool_alloc<char> act_q8(ctx.pool());
+            // The generic kernel sizes this buffer as ne10_padded * sizeof(block_q8_1) / QK8_1
+            // and only ever reads blocks below k / QK8_1, so the unpadded size is
+            // the same set of blocks it reads.
+            char * quantized = act_q8.alloc(size_t(k) * sizeof(block_q8_1) / QK8_1);
+            // Strides in elements; the T=1 tensor has one row, so they are
+            // never used, but they are still the real ones.
+            const int64_t ts_lo = ggml_type_size(lo->type);
+            quantize_row_q8_1_cuda((const float *) lo->data, nullptr, quantized, GGML_TYPE_Q8_0,
+                    k, lo->nb[1] / ts_lo, lo->nb[2] / ts_lo, lo->nb[3] / ts_lo, k, 1, 1, 1, ctx.stream());
+            // One block per mixed coordinate, four waves of 32.
+            const ggml_cuda_kernel_launch_params launch_q8 = {
+                dim3(uint32_t(dim), 1, 1), dim3(4 * 32, 1, 1), 0, ctx.stream(),
+            };
+            // Optional witness, off unless GGML_CUDA_HC_TAIL_SELFCHECK=1: the
+            // same kernel also evaluates the old wave tree and counts the
+            // coordinates whose float32 bits differ. One allocation and one
+            // readback per fused site, only in a diagnostic leg.
+            static const bool selfcheck = getenv("GGML_CUDA_HC_TAIL_SELFCHECK") != nullptr &&
+                    std::atoi(getenv("GGML_CUDA_HC_TAIL_SELFCHECK")) == 1;
+            if (selfcheck) {
+                ggml_cuda_pool_alloc<int> mismatches(ctx.pool());
+                int * mismatches_d = mismatches.alloc(1);
+                CUDA_CHECK(cudaMemsetAsync(mismatches_d, 0, sizeof(int), ctx.stream()));
+                ggml_cuda_kernel_launch(hc_owner_tail4_t1_q8_mmvq<true>, launch_q8,
+                    (const block_q8_0 *) weights->data, (const float *) lo->data,
+                    (const float *) xn->data, (const block_q8_1 *) quantized,
+                    (float *) dst->data, mismatches_d);
+                int count = 0;
+                CUDA_CHECK(cudaMemcpyAsync(&count, mismatches_d, sizeof(int),
+                        cudaMemcpyDeviceToHost, ctx.stream()));
+                CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+                GGML_LOG_INFO("%s: HC tail selfcheck dim=%d mismatches=%d\n", __func__, dim, count);
+            } else {
+                ggml_cuda_kernel_launch(hc_owner_tail4_t1_q8_mmvq<false>, launch_q8,
+                    (const block_q8_0 *) weights->data, (const float *) lo->data,
+                    (const float *) xn->data, (const block_q8_1 *) quantized,
+                    (float *) dst->data, nullptr);
+            }
+            return true;
+        }
+    }
     const ggml_cuda_kernel_launch_params launch = {
         dim3(uint32_t(dim), 1, 1), dim3(128, 1, 1), 0, ctx.stream(),
     };
@@ -378,6 +592,77 @@ bool ggml_cuda_op_hc_owner_tail4_t1(
     GGML_UNUSED(lo);
     GGML_UNUSED(xn);
     GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+// Private fixed-shape N-row owner tail (R = 2..4). Same mirror rule as the T=1
+// entry point: the activations are quantized to Q8_1 exactly as mul_mat_vec_q
+// quantizes them, one vector per row, and each row runs the generic vec_dot
+// over the same lane mapping. Rows are contiguous, so the R vectors are one
+// contiguous buffer of R * blocks_per_row blocks.
+bool ggml_cuda_op_hc_owner_tail4_rows(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
+        const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst, ggml_tensor * up) {
+#if defined(GGML_USE_HIP)
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    const int64_t R = lo ? lo->ne[1] : 0;
+    if (ctx.quantized_matmul_f32 || device.cc != GGML_CUDA_CC_RDNA2 || device.warp_size != 32 ||
+            !weights || !lo || !xn || !dst || weights->type != GGML_TYPE_Q8_0 ||
+            lo->type != GGML_TYPE_F32 || xn->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            R < 2 || R > 4 ||
+            weights->ne[0] != 320 || weights->ne[1] != 10240 || weights->ne[2] != 1 || weights->ne[3] != 1 ||
+            lo->ne[0] != 320 || lo->ne[2] != 1 || lo->ne[3] != 1 ||
+            xn->ne[0] != 10240 || xn->ne[1] != R || xn->ne[2] != 1 || xn->ne[3] != 1 ||
+            dst->ne[0] != 2560 || dst->ne[1] != R || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            !ggml_is_contiguous(weights) || !ggml_is_contiguous(lo) ||
+            !ggml_is_contiguous(xn) || !ggml_is_contiguous(dst) ||
+            !weights->data || !lo->data || !xn->data || !dst->data ||
+            uintptr_t(weights->data) % alignof(block_q8_0) != 0 ||
+            uintptr_t(lo->data) % alignof(float4) != 0 ||
+            (up && (up->type != GGML_TYPE_F32 || up->ne[0] != 10240 || up->ne[1] != R ||
+                    !ggml_is_contiguous(up) || !up->data))) {
+        return false;
+    }
+    static const bool legacy_tree = getenv("GGML_CUDA_HC_TAIL_LEGACY_TREE") != nullptr &&
+            std::atoi(getenv("GGML_CUDA_HC_TAIL_LEGACY_TREE")) == 1;
+    if (legacy_tree) {
+        return false;
+    }
+    constexpr int64_t k = 320;
+    constexpr int64_t blocks_per_row = k / QK8_1;
+    // R rows of k elements, contiguous, quantized in one launch: ne00 = k,
+    // ne0 = k and ne1 = R give R * blocks_per_row blocks at stride
+    // blocks_per_row, which is exactly how the kernel indexes them.
+    // The source strides are in elements, as mul_mat_vec_q passes them
+    // (src1->nb[i] / sizeof(float)); s01 = 0 would read row 0 for every row.
+    const int64_t ts_lo = ggml_type_size(lo->type);
+    const int64_t s01 = lo->nb[1] / ts_lo;
+    const int64_t s02 = lo->nb[2] / ts_lo;
+    const int64_t s03 = lo->nb[3] / ts_lo;
+    ggml_cuda_pool_alloc<char> act_q8(ctx.pool());
+    char * quantized = act_q8.alloc(size_t(R * blocks_per_row) * sizeof(block_q8_1));
+    quantize_row_q8_1_cuda((const float *) lo->data, nullptr, quantized, GGML_TYPE_Q8_0,
+            k, s01, s02, s03, k, R, 1, 1, ctx.stream());
+    const ggml_cuda_kernel_launch_params launch = { dim3(2560, 1, 1), dim3(128, 1, 1), 0, ctx.stream() };
+    const auto * w = (const block_q8_0 *) weights->data;
+    const auto * a = (const block_q8_1 *) quantized;
+    const auto * x = (const float *) xn->data;
+    auto * d = (float *) dst->data;
+    auto * u = up ? (float *) up->data : nullptr;
+    switch (R) {
+        case 2: ggml_cuda_kernel_launch(hc_owner_tail4_rows_q8_mmvq<2>, launch, w, a, x, d, u); break;
+        case 3: ggml_cuda_kernel_launch(hc_owner_tail4_rows_q8_mmvq<3>, launch, w, a, x, d, u); break;
+        default: ggml_cuda_kernel_launch(hc_owner_tail4_rows_q8_mmvq<4>, launch, w, a, x, d, u); break;
+    }
+    return true;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(weights);
+    GGML_UNUSED(lo);
+    GGML_UNUSED(xn);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(up);
     return false;
 #endif
 }
