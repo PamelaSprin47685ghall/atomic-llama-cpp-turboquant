@@ -1,0 +1,83 @@
+FA src[5] RELAY-BOUND GUARD v3 — CPU-ONLY VERIFICATION, 2026-11-01
+===============================================================
+Auditor: DevopsRetry (sole DevOps). Fresh private 0700 snapshot relay-guard-v3-20261101/.
+Both CPU locks held for the whole run (fd9 $E/ple-candidate-gpu.lock, fd8
+/tmp/ple-candidate-gpu.lock; HELD/RELEASED 03:34:59–03:35:00 UTC).
+No GPU, no hipcc, no model. Source tree, delivery and LIMITS.md not modified.
+
+1. HASHES — all three match the frozen values
+---------------------------------------------
+  prepare_relay_bound_guard.py  ee1ffc7e974035a05f2b7e48fa5f21fc98a8b5a6b3a5df1ecba04d4f37919959  OK
+  g1_relay_static.sh            18f89a5d89a00fade68e0d6b74f52720fd00253b14722d71c31c6d8d4085411b  OK
+  LIMITS.md                     fae622a5d20d3ee6d1d24d316534a6c6df70c2c00fbd3f3fabdc37767a66a2cd  OK
+  Source tree /home/kunweiz/work/merge-fa-20261031 at 03024e721, clean except untracked FREEZE.txt.
+
+2. PATCH APPLY — OK
+-------------------
+  --copy-only rc=0 ; --patch-only rc=0 ; CANDIDATE.diff non-empty; eight closure headers present.
+  Patched hashes:
+    fattn-common.cuh  429e6082592eace38e239070c2ad6c86b01bfce8857b1fa387c6feb369967566
+    relay.hip         7c5b375923b74fe77f8c3fce6204e20d1cd39a14f990873a59bc95e2389561c1
+
+3. G1 — **STATIC-OK, rc=0**, verbatim
+-------------------------------------
+  bash g1_relay_static.sh <SRC> <SNAP>/relay-patch  ->  STATIC-OK  (steps 1..9 all pass)
+  Step 3 is now per file and per role, and the counts are what it says they are. My independent
+  comment-stripped count on the patched files:
+      fattn-common.cuh   active=3  enabled=2  in_graph=2
+      relay.hip          active=0  enabled=1  in_graph=1
+  Reading: active() is defined once (:200) and called at :215 (inside in_graph) and :1558
+  (launch_fattn) — both live calls in conditionals; enabled() is the definition plus one call
+  inside active(); in_graph() is defined once (:213) and called once per file (launch_fattn :1560,
+  relay.hip submit :1514). v2's aggregate-count defect and its dead helper are both gone.
+
+4. v2 DEAD CODE — REMOVED, and the removal is behaviourally correct
+-------------------------------------------------------------------
+  * relay_bound_active() is now the single activation predicate: launch_fattn branches on it
+    directly (:1558) and relay_bound_in_graph() starts with `if (!ggml_cuda_fattn_relay_bound_active(dst)) return false;`.
+  * Independent TU: the three helpers extracted with their three dependencies stubbed,
+    g++ -std=c++17 -Wall -Wextra -> rc=0, no warnings. I then ran them as real code:
+      gate ON, bound lane ON, src[5] i32[1] allocated + INPUT   -> active true, in_graph false
+      gate ON, src[5] null buffer (streamed chunk staging)      -> in_graph true
+      gate ON, src[5] allocated but not INPUT-flagged           -> in_graph true
+      gate ON, no src[5]                                        -> active false
+      gate ON, bound lane (rtlen/nkv) OFF                       -> active false
+      gate OFF from the first call                              -> active false, in_graph false
+    -> HELPER-CASES OK, OFF-CASES OK (two processes; the env read is a function-local static,
+       which is the real code's behaviour and which my first harness got wrong — corrected here).
+  * Negative control on G1's new step 3b: I put the launch guard back on
+    relay_bound_enabled() (making active() dead again) -> definition 1, calls 2, `if (active(` 0
+    -> step 3b reports FAIL. So the check that catches the v2 defect is live, not decorative.
+
+5. R2 PLACEMENT — unchanged and correct
+---------------------------------------
+      launch_fattn()                                   1539
+      R2  if (ggml_cuda_fattn_relay_bound_active(dst)) 1558
+      ggml_cuda_pool & pool = ctx.pool()               1596
+      first pool_alloc<int>/<float>/<float2>           1612/1613/1614
+      first to_fp16(...)                               1634
+      first ggml_cuda_kernel_launch(...)               1751
+  R2 is at the head of launch_fattn, before every pool allocation, every K/V conversion and the
+  first launch. (v2's negative control — moving the block past the first pool_alloc and watching
+  step 5 fail — was re-verified for the same predicate shape in v2; the block's position is
+  unchanged in v3.)
+
+6. LIMITS.md
+------------
+  New §3 paragraph "One predicate, called by both boundaries" states exactly what the code now
+  does and credits the v2 dead-code finding; §3a is rewritten to hang off active(). Both match
+  the measured code.
+
+7. NOT PROVEN (unchanged)
+-------------------------
+  * The patched HIP translation units are not compiled (no hipcc): G2 not established. The only
+    compile evidence is the standalone TU of the three helpers.
+  * No device behaviour: G3 not established.
+  * S1 (legal-but-stale) open per LIMITS.md §4.
+  * The lane as configured still arms none of the three gates (§3a), so the guard remains inert
+    for the relay run that is actually being made.
+
+VERDICT: v3 passes everything a CPU-only audit can establish — hashes, generator, G1 STATIC-OK
+with per-file/per-role counts that match an independent count, v2's dead code removed and now
+covered by a live negative control, helper semantics correct in direct execution, R2 before all
+K/V work. It is still NOT compile evidence for the patched TUs and NOT device evidence.
