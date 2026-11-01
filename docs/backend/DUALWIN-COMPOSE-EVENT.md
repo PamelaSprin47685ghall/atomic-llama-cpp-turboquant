@@ -9,7 +9,7 @@ value — unset, `0`, `2`, `1x`, `" 1"`, `10` — keeps the stock path: no
 allocation, no event, no record/wait/synchronize call, no receipt, and no new
 branch body executed.
 
-There is **no cross-window wait** in this design. Each window owns a private
+There is **no cross-window wait in this barrier**. Each window owns a private
 Meta relay provider, its own context, KV cache and requests; only the model
 weights are shared, and they are read-only. No writable state crosses windows,
 so a symmetric per-epoch peer event wait would be a same-phase rendezvous with
@@ -18,6 +18,16 @@ Meta device, per-epoch record + release publication, first-child
 `event_wait`, and the teardown blocking `event_synchronize`) was removed; the
 epoch's only real cross-boundary dependency is this window's own logits D2H
 copy.
+
+This document describes the compose gate only. The overlay mtp-async runtime reaches the same
+guarantee with the same Meta-level primitive under its own gate
+(`GGML_TP5_DW_DEVICE_WAIT=1`): `llama_tp5_output_copy_record` /
+`llama_tp5_output_event_wait`, i.e. real `ggml_backend_event_t` handles created per contributing
+child - all five ranks of that window for a split output - completed on the host after the relay
+drain. It never waits on another window's work (the two windows share no writable device state,
+and such a wait would be a same-phase lockstep), and it never substitutes a HIP `hipEvent_t` for a
+ggml event (that would be a type confusion). See the overlay's `PROVENANCE.md`, section
+"Rank events: RETRACTED".
 
 ## What is replaced
 
@@ -48,7 +58,11 @@ Gate ON keeps 1, 3 and 4 and replaces 2 with two steps:
   context's `synchronize` bookkeeping — the bookkeeping only when at least one
   event was actually synchronized. Rows are then resolved with
   `llama_get_logits_ith_no_sync`, which performs only the host-side output
-  reorder and row resolution.
+  reorder and row resolution of the FULL logits buffer. The proof covers
+  exactly the full-logits copy streams recorded above; device-sampled logits
+  resolve through different tensors on streams no recorded event orders, so
+  the no-sync getter never returns them — callers that need sampled outputs
+  keep the stock synchronizing getters.
 
 `ggml` reports how many streams the record covered. The runtime requires the
 wait to release exactly that many, so a record/wait mismatch is a hard `require`
@@ -141,10 +155,13 @@ tree.
 `llama_tp5_output_event_wait` blocks the host on the recorded device events. It
 replaces a scheduler-wide synchronize (every backend, every rank stream, plus
 the CPU backend) with exactly the streams the output copy used, and its coverage
-is proven by the chain above. The relay dual-completion drain is unchanged and
-remains the runtime's only exit predicate; the epoch's completion still requires
-the device tail (`status.finished`, driven by real per-lane HIP tail events) and
-CPU courier retirement.
+is proven by the chain above. The gate check is symmetric with
+`output_record`: with `GGML_TP5_DW_COMPOSE_EVENT` off nothing is recorded, so
+nothing is left to wait on and `output_wait` releases no event and reports 0.
+The relay dual-completion drain is unchanged and remains the runtime's only
+exit predicate; the epoch's completion still requires the device tail
+(`status.finished`, driven by real per-lane HIP tail events) and CPU courier
+retirement.
 
 ## Receipt
 

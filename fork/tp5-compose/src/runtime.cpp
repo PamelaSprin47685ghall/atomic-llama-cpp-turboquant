@@ -312,10 +312,6 @@ class relay_service {
                 t.join();
             }
         }
-        if (courier_metrics_ && !metrics_dumped_) {
-            metrics_dumped_ = true;
-            dump_courier_metrics();
-        }
     }
 
     // Per-window demand/retirement distribution. Emitted once, after every
@@ -480,8 +476,8 @@ class relay_service {
     // Monotonic relay facts while a dual wait is parked: the epoch and both
     // lifetime counters (cpu_reductions, output_retired) never move
     // backwards, and the courier never retires more than was published.
-    // Every breach is counted first, then fails explicitly.
-    void dual_scope_check(std::size_t index, const ggml_relay_status & state, bool & seen,
+    // A confirmed breach is counted first, then fails explicitly.
+    void dual_scope_check(std::size_t index, ggml_backend_t backend, const ggml_relay_status & state, bool & seen,
                           std::uint64_t & prev_epoch, std::uint64_t & prev_published,
                           std::uint64_t & prev_retired) {
         auto &              w         = *windows_[index];
@@ -493,6 +489,24 @@ class relay_service {
         }
         seen = true;
         if (retired > published) {
+            // Not a sound comparison on its own: state froze cpu_reductions
+            // inside the snapshot, while the courier keeps publishing and
+            // retiring, so this pass mixed two instants (a stale published
+            // against a later retired). Re-sample in the sound order —
+            // retired first, then a fresh provider snapshot. publish holds
+            // the provider mutex around ++cpu_reductions and snapshot reads
+            // it under the same mutex, so the fresh sample sees every publish
+            // that happened before it; under the retire-follows-publish
+            // protocol the fresh pair can only disagree if the courier truly
+            // retired more than was ever published. A lost snapshot try-lock
+            // or the stale sighting itself returns without counting anything:
+            // later passes re-check, and the finished-epoch demand sample
+            // (final published) stays the authoritative detector.
+            const std::uint64_t retired_again = w.output_retired.load(std::memory_order_acquire);
+            ggml_relay_status    fresh{};
+            if (!ggml_backend_relay_snapshot(backend, &fresh) || retired_again <= fresh.cpu_reductions) {
+                return;
+            }
             ++w.dual_violations;
             require(false, "courier retired more outputs than were published");
         }
@@ -644,7 +658,7 @@ class relay_service {
             if (status.failed || failure_.stopped.load()) {
                 require(false, (std::string(what) + ": native relay epoch failed during the dual completion wait").c_str());
             }
-            dual_scope_check(index, status, seen, prev_epoch, prev_published, prev_retired);
+            dual_scope_check(index, backend, status, seen, prev_epoch, prev_published, prev_retired);
             const bool device_now  = status.finished;
             const bool courier_now = retired(index, status);
             if (dw_tracing) {
@@ -772,7 +786,7 @@ class relay_service {
                 if (status.failed || failure_.stopped.load()) {
                     require(false, (std::string(what) + ": native relay epoch failed during the dual completion wait").c_str());
                 }
-                dual_scope_check(index, status, seen, prev_epoch, prev_published, prev_retired);
+                dual_scope_check(index, backend, status, seen, prev_epoch, prev_published, prev_retired);
                 if (!finished) {
                     if (!status.finished) {
                         dual_backoff(backoff);
@@ -886,9 +900,14 @@ class relay_service {
 
     void finish_ledgers(bool failed) {
         stop();
-        // Dual completion summary: printed here, at the single real
-        // end-of-run point, rather than inside stop() — a constructor spawn
-        // failure also calls stop() and must not print an all-zero summary.
+        // Both summaries print here, at the single real end-of-run point,
+        // rather than inside stop() — a constructor spawn failure also calls
+        // stop() and must not print an all-zero receipt. stop() joined every
+        // lane above, so no counter can still be written.
+        if (courier_metrics_ && !metrics_dumped_) {
+            metrics_dumped_ = true;
+            dump_courier_metrics();
+        }
         if (courier_dual_ && !dual_dumped_) {
             dual_dumped_ = true;
             dump_dual_completions_summary();

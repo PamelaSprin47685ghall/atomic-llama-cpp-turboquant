@@ -5242,13 +5242,14 @@ float * llama_get_logits_ith_no_sync(llama_context * ctx, int32_t i) {
         return nullptr;
     }
 
-    float * res = ctx->get_sampled_logits_ith(i);
-
-    if (!res) {
-        res = ctx->get_logits_ith(i);
-    }
-
-    return res;
+    // The recorded output-copy events cover exactly the child streams of the
+    // FULL-LOGITS D2H copy (ggml_backend_meta_output_record mirrors
+    // ggml_backend_meta_get_tensor_async's stream set for that one tensor) and
+    // nothing else. Device-sampled logits resolve through different tensors,
+    // whose async copies run on streams no recorded event orders, so returning
+    // them under this proof would read data no event covered. Callers that
+    // need sampled outputs must keep the stock synchronizing getters.
+    return ctx->get_logits_ith(i);
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

@@ -2244,7 +2244,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (have_snapshot) {
                 break;
             }
-            std::this_thread::yield();
+            // ASYNC-PROTOCOL: busy-wait, no scheduler yield.
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#endif
         } while (std::chrono::steady_clock::now() < snapshot_deadline);
         if (!have_snapshot || previous.failed ||
             (previous.epoch != 0 && !previous.finished)) {

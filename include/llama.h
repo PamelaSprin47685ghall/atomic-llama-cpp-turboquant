@@ -650,10 +650,13 @@ extern "C" {
     // Never synchronizes the scheduler's backends.
     LLAMA_API size_t llama_tp5_output_event_wait(struct llama_context * ctx);
 
-    // Resolve one output row without synchronizing the context. The caller must
-    // already hold this epoch's output-copy completion proof (see
-    // llama_tp5_output_event_wait, or llama_synchronize). Only the host-side
-    // output reorder and row resolution happen here.
+    // Resolve one output row of the FULL logits buffer without synchronizing
+    // the context. The caller must already hold this epoch's output-copy
+    // completion proof (see llama_tp5_output_event_wait, or
+    // llama_synchronize); that proof covers exactly the full-logits copy
+    // streams recorded by llama_tp5_output_copy_record. Device-sampled
+    // outputs resolve on streams no recorded event orders, so callers that
+    // need them must keep the synchronizing getters.
     LLAMA_API float * llama_get_logits_ith_no_sync(struct llama_context * ctx, int32_t i);
 
     LLAMA_API int64_t llama_time_us(void);

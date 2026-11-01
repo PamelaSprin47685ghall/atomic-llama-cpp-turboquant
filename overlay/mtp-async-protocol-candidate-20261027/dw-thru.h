@@ -39,9 +39,15 @@
 //   - Cross-window serialization must be argued from the lock inventory
 //     (per-window submit mutex, per-window courier, distinct relay priority)
 //     and from submit_wait*_ns staying ~0, not from overlap_ns alone.
-//   - order_violations == 0 proves the recorded event order is a single
-//     monotonic sequence, so the intervals above are not artifacts of lock
-//     unfairness. A nonzero value invalidates the overlap numbers.
+//   - order_violations counts observable transition-order anomalies: a
+//     reversed clock sample (also counted in discarded_reversed), a begin on
+//     an already-active window, and an end on an already-inactive window.
+//     order_violations == 0 means every recorded transition was well-formed
+//     and monotonic, so the intervals above are not artifacts of lock
+//     unfairness or unpaired begin/end. A nonzero value invalidates the
+//     overlap numbers.
+//   - order_violations == 0 alone never proves device concurrency; it only
+//     clears the host event stream for the interval accounting above.
 class dw_thru_counter {
 public:
     // Window enters host-in-flight (its decode submission was observed).
@@ -129,6 +135,9 @@ private:
             // Never rewind: a rewound last_ would charge one interval twice and
             // leave another uncharged. Drop the event and make it visible.
             ++discarded_reversed_;
+            // A reversed sample is itself an order violation of the recorded
+            // stream: the receipt's order_violations must be able to move.
+            ++order_violations_;
             return;
         }
         if (first_ == 0 || now < first_) first_ = now;
@@ -139,21 +148,25 @@ private:
             if (active_[0] && active_[1]) overlap_ += elapsed;
         }
         last_ = now;
+        const bool was_active = active_[w];
         active_[w] = begin;
         ++events_;
         ++seq_;
         if (seq_first_[w] == 0) seq_first_[w] = seq_;
         seq_last_[w] = seq_;
+        // Real transition-order anomalies this counter can observe: a begin on
+        // an already-active window (double begin) and an end on an
+        // already-inactive window (end without begin). Both corrupt the
+        // interval structure and must move order_violations; the previous
+        // check (seq_last_[w] > seq_ right after assigning it) was vacuously
+        // false and made the receipt's order_violations==0 meaningless.
+        if (begin ? was_active : !was_active) ++order_violations_;
         if (begin) {
             ++intervals_[w];
             const unsigned concurrent = unsigned(active_[0]) + unsigned(active_[1]);
             if (concurrent > max_concurrent_) max_concurrent_ = concurrent;
             if (concurrent == 2) ++both_entries_;
         }
-        // Per-window sequences must interleave monotonically: window w's
-        // events are a subsequence of the global sequence, so its last recorded
-        // sequence number is always the newest event of that window.
-        if (seq_last_[w] > seq_) ++order_violations_;
     }
 
     mutable std::mutex mutex_;

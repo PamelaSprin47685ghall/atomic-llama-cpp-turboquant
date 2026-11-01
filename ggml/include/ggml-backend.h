@@ -446,6 +446,41 @@ extern "C" {
     GGML_API size_t ggml_backend_meta_output_record(ggml_backend_t meta_backend, const struct ggml_tensor * tensor);
     GGML_API size_t ggml_backend_meta_output_wait  (ggml_backend_t meta_backend);
 
+    // ggml_backend_meta_first_child_device(meta_backend) returns the device of
+    // the Meta backend's FIRST simple child, or nullptr when there is none (not
+    // a Meta backend, no initialized child, or child 0 gone). A Meta backend
+    // enumerates its children in its Meta device's simple-device order, so
+    // child 0's device is that device. The pointer is owned by the child's own
+    // backend registry, so it stays valid for device-identity comparison while
+    // that registry lives; the caller must not free it. This probe is null-safe
+    // where the sibling accessors assert, and allocates, records and prints
+    // nothing.
+    GGML_API ggml_backend_dev_t ggml_backend_meta_first_child_device(ggml_backend_t meta_backend);
+
+    // ggml_backend_meta_first_child_backend(meta_backend) returns the FIRST
+    // simple child BACKEND of a Meta backend, or nullptr when there is none. A
+    // device is only the template a backend is initialized from: the Meta
+    // device's own interface deliberately has no event_new/event_record (event
+    // use on it would change scheduler-wide synchronization), so a caller that
+    // needs real stream events must be handed the child backend, whose iface
+    // carries event_record/event_wait. The pointer is owned by the Meta backend
+    // (valid until ggml_backend_meta_free) and must not be freed. Null-safe like
+    // its device sibling; allocates, records and prints nothing.
+    GGML_API ggml_backend_t ggml_backend_meta_first_child_backend(ggml_backend_t meta_backend);
+
+    // ggml_backend_meta_first_event_child_backend(meta_backend) returns the
+    // FIRST simple child backend whose device can create a real stream event,
+    // or nullptr when no child can. "Can create" is decided HERE, inside the
+    // Meta implementation, by asking the child device for an event through the
+    // public API (ggml_backend_event_new) and releasing it immediately: a
+    // caller must never inspect a device interface itself, because
+    // struct ggml_backend_device is incomplete outside this library. The child
+    // order is the Meta device's simple-device order, so child 0 wins whenever
+    // it can create events. The returned backend is owned by the Meta backend
+    // (valid until ggml_backend_meta_free) and must not be freed. Null-safe;
+    // the probe creates and frees one event per candidate and prints nothing.
+    GGML_API ggml_backend_t ggml_backend_meta_first_event_child_backend(ggml_backend_t meta_backend);
+
     //
     // Utils
     //

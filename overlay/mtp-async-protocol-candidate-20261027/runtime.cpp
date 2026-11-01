@@ -1,5 +1,4 @@
 #include <ggml-backend.h>
-#include <ggml-cuda.h>
 #include "tp5-meta-submit-ready.h"
 #include <ggml-relay.h>
 #include <gguf.h>
@@ -469,18 +468,23 @@ static const bool dw_backend_event_req = [] {
     const char * env = std::getenv("GGML_TP5_DW_BACKEND_EVENT");
     return env != nullptr && std::strcmp(env, "1") == 0;
 }();
-// DUALWIN-DEVICE-WAIT (GGML_TP5_DW_DEVICE_WAIT=1): gate parsing, peer
-// selection and the wait/decision state machine live in dw_device_wait.h
-// (shared verbatim with the fork runtime; see there for the acyclicity and
-// no-unrecorded-wait reasoning). Under this gate the runtime issues real
-// ggml_backend_event_wait calls at the consumption points: this window's
-// first-child stream waits for the PEER window's most recent unwaited
-// record, so the following host synchronize transitively covers the peer's
-// latest recorded device work too (device-side dual completion). It only
-// ever delays consumption behind work the peer already submitted; it never
-// weakens an exit predicate. It requires GGML_TP5_DW_BACKEND_EVENT=1 (the
-// events only exist under that gate); with the device-wait gate alone every
-// site is a counted no-op.
+// DUALWIN-DEVICE-WAIT (GGML_TP5_DW_DEVICE_WAIT=1): FAIL-CLOSED, no
+// cross-window wait. Two facts rule it out and neither is a guess:
+//   (1) no dependency - the two windows own disjoint writable device state
+//       (separate Meta relay providers, contexts, KV/recurrent state); only
+//       read-only weights are shared. A wait for another window's epoch would
+//       be a same-phase rendezvous with no data to order, and blocking one
+//       window on the other's epoch would make the pair run in lockstep;
+//   (2) no legal handle - the relay provider owns HIP events, and a HIP
+//       hipEvent_t is not a ggml_backend_event_t (that type is a struct whose
+//       first member is a device pointer, which is what
+//       ggml_backend_event_synchronize dereferences). Lending a HIP handle as a
+//       ggml event is a type confusion, not a shortcut.
+// Both consumption points therefore name no peer and the planner answers
+// skip_unavailable; the window's own drain stays its completion proof. A
+// per-window event (GGML_TP5_DW_BACKEND_EVENT) is a real ggml event created by
+// ggml_backend_event_new on a child device; it is used for THIS window's
+// record and teardown synchronize only.
 static const bool dw_device_wait_req = dw_device_wait::gate();
 struct gate_metrics {
     // Whole-decode submission-mutex hold (outer gate, target decodes).
@@ -1005,8 +1009,8 @@ class relay_service {
     // Monotonic relay facts while a dual wait is parked: the epoch and both
     // lifetime counters (cpu_reductions, output_retired) never move
     // backwards, and the courier never retires more than was published.
-    // Every breach is counted first, then fails explicitly.
-    void dual_scope_check(std::size_t index, const ggml_relay_status & state, bool & seen,
+    // A confirmed breach is counted first, then fails explicitly.
+    void dual_scope_check(std::size_t index, ggml_backend_t backend, const ggml_relay_status & state, bool & seen,
                           std::uint64_t & prev_epoch, std::uint64_t & prev_published,
                           std::uint64_t & prev_retired) {
         auto &              w         = *windows_[index];
@@ -1018,6 +1022,24 @@ class relay_service {
         }
         seen = true;
         if (retired > published) {
+            // Not a sound comparison on its own: state froze cpu_reductions
+            // inside the snapshot, while the courier keeps publishing and
+            // retiring, so this pass mixed two instants (a stale published
+            // against a later retired). Re-sample in the sound order —
+            // retired first, then a fresh provider snapshot. publish holds
+            // the provider mutex around ++cpu_reductions and snapshot reads
+            // it under the same mutex, so the fresh sample sees every publish
+            // that happened before it; under the retire-follows-publish
+            // protocol the fresh pair can only disagree if the courier truly
+            // retired more than was ever published. A lost snapshot try-lock
+            // or the stale sighting itself returns without counting anything:
+            // later passes re-check, and the finished-epoch demand sample
+            // (final published) stays the authoritative detector.
+            const std::uint64_t retired_again = w.output_retired.load(std::memory_order_acquire);
+            ggml_relay_status    fresh{};
+            if (!ggml_backend_relay_snapshot(backend, &fresh) || retired_again <= fresh.cpu_reductions) {
+                return;
+            }
             ++w.dual_violations;
             require(false, "courier retired more outputs than were published");
         }
@@ -1170,7 +1192,7 @@ class relay_service {
             if (status.failed || failure_.stopped.load()) {
                 require(false, (std::string(what) + ": native relay epoch failed during the dual completion wait").c_str());
             }
-            dual_scope_check(index, status, seen, prev_epoch, prev_published, prev_retired);
+            dual_scope_check(index, backend, status, seen, prev_epoch, prev_published, prev_retired);
             const bool device_now  = status.finished;
             const bool courier_now = retired(index, status);
             if (dw_tracing) {
@@ -1298,7 +1320,7 @@ class relay_service {
                 if (status.failed || failure_.stopped.load()) {
                     require(false, (std::string(what) + ": native relay epoch failed during the dual completion wait").c_str());
                 }
-                dual_scope_check(index, status, seen, prev_epoch, prev_published, prev_retired);
+                dual_scope_check(index, backend, status, seen, prev_epoch, prev_published, prev_retired);
                 if (!finished) {
                     if (!status.finished) {
                         dual_backoff(backoff);
@@ -2022,6 +2044,12 @@ run_result run(const options & requested) {
     // no-op — CPU-equivalent to OFF.
     struct dw_backend_event_state {
         ggml_backend_event_t event = nullptr;
+        // DUALWIN-BACKEND-EVENT: this window's first simple child BACKEND
+        // (resolved once, single-threaded, before any decode worker). The
+        // event is created from and recorded on THIS backend, and it is what
+        // the record/wait receipt prints, so a skipped leg can be diagnosed
+        // from the log alone.
+        ggml_backend_t backend = nullptr;
         // DUALWIN-DEVICE-WAIT: this window's first-child device, resolved
         // once at event creation (single-threaded setup, before decode
         // workers run) through the public meta accessor; waits are issued
@@ -2029,37 +2057,39 @@ run_result run(const options & requested) {
         ggml_backend_dev_t device = nullptr;
         std::uint64_t record_calls = 0, record_ok = 0, sync_calls = 0,
                       free_calls = 0, skipped_unavailable = 0;
-        // DUALWIN-DEVICE-WAIT (GGML_TP5_DW_DEVICE_WAIT=1): wait counters.
-        // These are touched only by this window's own decode worker and read
-        // after the workers join. wait_peer_consumed is this window's
-        // watermark of the peer's published count, so each record is waited
-        // at most once and no wait ever targets an unrecorded event. (The
-        // one cross-thread counter — the peer's release-published
-        // availability — lives in the dw_wait_peer_available side array
-        // below: std::atomic members would delete the struct's move
-        // constructor and break vector resize.)
-        std::uint64_t wait_calls = 0, wait_ok = 0,
-                      wait_skipped_unrecorded = 0, wait_skipped_unavailable = 0,
-                      wait_peer_consumed = 0;
-                      // DUALWIN event-point trace stamps (host correlation
-                      // metadata only; wait_calls counts the real device
-                      // waits under GGML_TP5_DW_DEVICE_WAIT=1).
-                      dw_event_trace::evpt ev;
+        // DUALWIN-BACKEND-EVENT attribution: `skipped_unavailable` counts
+        // failed creation attempts; these three split that same total by cause,
+        // so a skipped leg names its reason in the receipt instead of leaving
+        // it to a pointer inspection:
+        //   no_child  - the Meta backend exposed no first child backend;
+        //   no_device - that child backend has no device;
+        //   no_iface  - the device exists but its interface has no event_new
+        //               (the child is CPU, or the build has no usable stream
+        //               events).
+        // no_child + no_device + no_iface == skipped_unavailable always holds.
+        std::uint64_t skip_no_child = 0, skip_no_device = 0, skip_no_iface = 0;
+        // DUALWIN-DEVICE-WAIT (GGML_TP5_DW_DEVICE_WAIT=1): this gate never
+        // waits on another window. Each consumption point records THIS window's
+        // output-copy events (real ggml events on every contributing child) and
+        // completes them after the relay drain: wait_calls/wait_ok count those
+        // host waits, wait_skipped_unavailable counts epochs with no sound
+        // barrier (the stock synchronize then stays). Written only by this
+        // window's own decode worker and read after the workers join.
+        // wait_skipped_unrecorded is NOT kept: this runtime never names a
+        // peer, so plan() cannot answer skip_unrecorded and a counter for it
+        // would be permanently zero - a zero-valued field pretending to be a
+        // measurement. The planner's own enum keeps the state; only the
+        // counter is gone.
+        std::uint64_t wait_calls = 0, wait_ok = 0, wait_skipped_unavailable = 0;
+        // DUALWIN event-point trace stamps (host correlation metadata only;
+        // wait_* is stamped by the output-copy wait below).
+        dw_event_trace::evpt ev;
     };
     std::vector<dw_backend_event_state> dw_backend_events;
-    // DUALWIN-DEVICE-WAIT: per-window peer publication counters. The array
-    // is allocated ONLY under the device-wait gate (the BACKEND_EVENT gate
-    // alone must not gain a new allocation), once here (single-threaded
-    // setup, before decode workers run) and never reallocated, so the record
-    // site of window w publishes release into slot w while the PEER window's
-    // consumption site reads it with acquire — the happens-before edge that
-    // makes every issued wait refer to a record the peer's host already
-    // returned from.
-    std::unique_ptr<std::atomic<std::uint64_t>[]> dw_wait_peer_available;
-    if (dw_device_wait_req) {
-        dw_backend_events.resize(opts.windows);
-        dw_wait_peer_available.reset(new std::atomic<std::uint64_t>[opts.windows] {});
-    } else if (dw_backend_event_req) {
+    // DUALWIN-DEVICE-WAIT keeps its wait counters in the same per-window state
+    // as the BACKEND_EVENT receipt fields (see the gate above), so one array is
+    // sized under either gate.
+    if (dw_device_wait_req || dw_backend_event_req) {
         dw_backend_events.resize(opts.windows);
     }
     for (std::uint32_t i = 0; i < opts.windows; ++i) {
@@ -2114,15 +2144,70 @@ run_result run(const options & requested) {
             // DUALWIN-DEVICE-WAIT: the window's first-child device is
             // resolved here once (single-threaded setup) so the wait sites
             // can compare devices without touching event internals.
+            // The resolution is the public ggml-backend.h probe over the
+            // Meta backend's own child 0 (see
+            // ggml_backend_meta_first_child_device); it returns nullptr for a
+            // missing/non-Meta child, which the wait context treats as
+            // "unknown device never waits".
+            // ggml_backend_meta_first_child_device takes the Meta BACKEND
+            // (`native.back()`), exactly like its sibling
+            // ggml_backend_meta_simple_backend and ggml_backend_is_meta; it
+            // returns the child's DEVICE. dw_be_dev stays the Meta device,
+            // which is only what ggml_backend_event_new consumes.
             if ((dw_backend_event_req || dw_device_wait_req) &&
                 i < dw_backend_events.size() && dw_backend_events[i].event == nullptr) {
-                auto & dw_be     = dw_backend_events[i];
-                auto * dw_be_dev = ggml_backend_get_device(native.back());
-                dw_be.device     = ggml_backend_meta_first_child_device(dw_be_dev);
+                auto & dw_be = dw_backend_events[i];
+                // Events belong to the first simple child BACKEND, not to the
+                // Meta device: a Meta device deliberately has no
+                // event_new/event_record (event use on it would rewrite the
+                // scheduler's cross-backend synchronization for every Meta
+                // graph), so ggml_backend_event_new(meta_device) returns NULL.
+                // The child backend is also the one the record/wait sites pass
+                // to ggml_backend_event_record(event, backend).
+                dw_be.backend = ggml_backend_meta_first_child_backend(native.back());
+                // The same child backend's DEVICE. The event is created from
+                // this device (a device, not a backend, is what
+                // ggml_backend_event_new consumes) and the receipt prints it.
+                dw_be.device = ggml_backend_meta_first_child_device(native.back());
                 if (dw_backend_event_req) {
+                    // The event is created through the PUBLIC API only:
+                    // ggml_backend_event_new answers nullptr for a device that
+                    // cannot make a real stream event (a CPU child, or a build
+                    // without usable stream events), and struct
+                    // ggml_backend_device is incomplete outside libggml-base, so
+                    // this file must never inspect a device interface itself.
+                    //
+                    // Child 0 is the rank whose relay lane also carries the
+                    // logits D2H copy, so it is tried first. When it cannot
+                    // create an event the leg still has a real use for one - the
+                    // teardown barrier and the record/consume receipts - so the
+                    // Meta implementation is asked for the first child that CAN
+                    // (ggml_backend_meta_first_event_child_backend). That scan
+                    // lives in ggml-backend-meta.cpp for exactly that reason.
+                    ggml_backend_dev_t dw_be_dev =
+                        dw_be.backend != nullptr ? ggml_backend_get_device(dw_be.backend) : nullptr;
                     dw_be.event = dw_be_dev != nullptr ? ggml_backend_event_new(dw_be_dev) : nullptr;
                     if (dw_be.event == nullptr) {
+                        ggml_backend_t event_child =
+                            ggml_backend_meta_first_event_child_backend(native.back());
+                        if (event_child != nullptr) {
+                            dw_be.backend = event_child;
+                            dw_be_dev     = ggml_backend_get_device(event_child);
+                            dw_be.device  = dw_be_dev;
+                            dw_be.event   = dw_be_dev != nullptr ? ggml_backend_event_new(dw_be_dev) : nullptr;
+                        }
+                    }
+                    if (dw_be.event == nullptr) {
                         ++dw_be.skipped_unavailable;
+                        // Attribute the single failed attempt: the three
+                        // counters always sum to skipped_unavailable.
+                        if (dw_be.backend == nullptr) {
+                            ++dw_be.skip_no_child;
+                        } else if (dw_be_dev == nullptr) {
+                            ++dw_be.skip_no_device;
+                        } else {
+                            ++dw_be.skip_no_iface;
+                        }
                     }
                 }
             }
@@ -2501,95 +2586,83 @@ run_result run(const options & requested) {
                             auto & dw_be = dw_backend_events[wi];
                             ++dw_be.record_calls;
                             const std::uint64_t dw_ev_t0 = dw_event_trace::gate() ? now_ns() : 0;
-                            ggml_backend_event_record(dw_be.event, native[wi]);
+                            // Record on the CHILD backend the event belongs to; the Meta
+                            // backend has no event_record (the event's own
+                            // device is that child's device, so this is the
+                            // same stream the event was created for).
+                            ggml_backend_event_record(dw_be.event, dw_be.backend);
                             ++dw_be.record_ok;
-                            if (dw_device_wait_req) {
-                                dw_wait_peer_available[wi].fetch_add(1, std::memory_order_release);
-                            }
                             if (dw_ev_t0) {
                                 if (dw_be.ev.record_first_ns == 0) dw_be.ev.record_first_ns = dw_ev_t0;
                                 dw_be.ev.record_last_ns = dw_ev_t0;
                             }
                         }
-                        // DUALWIN-DEVICE-WAIT (GGML_TP5_DW_DEVICE_WAIT=1,
-                        // requires GGML_TP5_DW_BACKEND_EVENT=1): enqueue ONE
-                        // device-side wait on this window's first-child stream
-                        // for the peer window's most recent unwaited record —
-                        // the cross-window device dependency the r7 wire and
-                        // the r8 trace documented as missing (wait_calls 0).
-                        // Gate parsing, peer selection, the release/acquire
-                        // pairing, the watermark and the acyclicity argument
-                        // live in dw_device_wait.h; the call site only feeds
-                        // it the peer state and issues the non-blocking
-                        // enqueue it asks for. The wait binds at enqueue time
-                        // to a record the peer's host already returned from,
-                        // so re-records cannot retarget it; it is issued only
-                        // for the peer's event on the SAME first-child device
-                        // and only against an unconsumed record; every skip
-                        // is counted. It never weakens an exit predicate: the
-                        // following host synchronize still waits for this
-                        // stream to drain — now transitively covering the
-                        // peer's latest recorded work as well. With either
-                        // gate off this block is one false bool branch: stock
-                        // behaviour.
-                        if (dw_device_wait_req && wi < dw_backend_events.size()) {
-                            auto & dw_self = dw_backend_events[wi];
-                            // wait_calls counts REAL device-side waits: it is
-                            // bumped only in the branch that actually calls
-                            // ggml_backend_event_wait, never for skips — the
-                            // receipt's wait_calls>0 is direct evidence that
-                            // device-side waits were issued (the r8 field
-                            // documented the no-wait gap by staying 0).
-                            const std::uint32_t dw_n =
-                                std::uint32_t(dw_backend_events.size());
-                            const std::uint32_t dw_peer_wi = dw_device_wait::peer_of(wi, dw_n);
-                            const dw_device_wait::context dw_ctx{
-                                dw_backend_event_req,
-                                dw_device_wait::has_peer(wi, dw_n),
-                                dw_peer_wi < dw_n && dw_backend_events[dw_peer_wi].event != nullptr,
-                                dw_self.event != nullptr,
-                                // Same first-child device, resolved once at
-                                // event creation through the public meta
-                                // accessor (unknown device never waits).
-                                dw_peer_wi < dw_n &&
-                                    dw_backend_events[dw_peer_wi].device != nullptr &&
-                                    dw_backend_events[dw_peer_wi].device ==
-                                        dw_self.device,
-                            };
-                            const std::uint64_t dw_peer_avail =
-                                dw_ctx.peer_event
-                                    ? dw_wait_peer_available[dw_peer_wi].load(
-                                          std::memory_order_acquire)
-                                    : 0;
-                            const dw_device_wait::action dw_act =
-                                dw_device_wait::plan(dw_ctx, dw_peer_avail, dw_self.wait_peer_consumed);
-                            if (dw_act == dw_device_wait::action::wait) {
-                                const std::uint64_t dw_wait_t0 = dw_event_trace::gate() ? now_ns() : 0;
-                                ggml_backend_event_wait(native[wi], dw_backend_events[dw_peer_wi].event);
-                                ++dw_self.wait_calls;
-                                if (dw_event_trace::gate()) ++dw_self.ev.wait_calls;
-                                ++dw_self.wait_ok;
-                                if (dw_wait_t0) {
-                                    if (dw_self.ev.wait_first_ns == 0) dw_self.ev.wait_first_ns = dw_wait_t0;
-                                    dw_self.ev.wait_last_ns = dw_wait_t0;
-                                }
-                            } else if (dw_act == dw_device_wait::action::skip_unavailable) {
-                                ++dw_self.wait_skipped_unavailable;
-                            } else if (dw_act == dw_device_wait::action::skip_unrecorded) {
-                                ++dw_self.wait_skipped_unrecorded;
-                            }
+                        // DUALWIN-DEVICE-WAIT (target site): record THIS window's own
+                        // output-copy events, then host-complete them after the
+                        // relay drain, exactly like the fork runtime's compose
+                        // gate. Every handle is a real ggml_backend_event_t made
+                        // by ggml_backend_event_new on a child device
+                        // (ggml_backend_meta_output_record), and with a split
+                        // axis the record covers EVERY contributing child, i.e.
+                        // all five ranks of THIS window. Nothing here names
+                        // another window: the two windows share no writable
+                        // device state, so a cross-window wait would be a
+                        // same-phase rendezvous (the lockstep the dual-window
+                        // proof forbids). A rank lane's hipEvent_t is also not a
+                        // ggml event handle - ggml_backend_event_t is a struct
+                        // whose first member is a device pointer - so no HIP
+                        // handle is ever cast into one.
+                        const std::size_t dw_copy_streams =
+                            (dw_device_wait_req && wi < dw_backend_events.size()) ?
+                                llama_tp5_output_copy_record(ctx) :
+                                0;
+                        const bool dw_output_barrier = dw_copy_streams > 0;
+                        if (dw_device_wait_req && wi < dw_backend_events.size() && !dw_output_barrier) {
+                            // No sound barrier for this epoch: the stock
+                            // synchronize below stays, fail-closed and counted.
+                            ++dw_backend_events[wi].wait_skipped_unavailable;
                         }
-                        std::optional<scoped_spin_cpu> verify_spin;
+                        // The reviewed decision table is consulted with a
+                        // PEERLESS context: with no peer it can only answer
+                        // skip_unavailable, which the branch above already
+                        // counted. If it ever named a peer here, the runtime
+                        // would be about to order two windows against each
+                        // other, which is the lockstep this gate forbids.
+                        if (dw_device_wait_req) {
+                            dw_device_wait::context dw_ctx;
+                            dw_ctx.event_gate  = dw_backend_event_req;
+                            dw_ctx.have_peer   = false;
+                            dw_ctx.peer_event  = false;
+                            dw_ctx.self_event  = dw_output_barrier;
+                            dw_ctx.same_device = false;
+                            std::uint64_t dw_watermark = 0;
+                            require(dw_device_wait::plan(dw_ctx, 0, dw_watermark) ==
+                                        dw_device_wait::action::skip_unavailable,
+                                    "device-wait planner named a peer for a peerless context");
+                        }
+std::optional<scoped_spin_cpu> verify_spin;
                         verify_spin.emplace();
                         const auto wait_start = now_ns();
                         const float * single_output_logits = nullptr;
-                        if (output_rows == 1) {
-                            // This public getter synchronizes the context. Keep only
-                            // its pointer here; read logits after native retirement.
-                            single_output_logits = llama_get_logits_ith(ctx, single_output_row);
-                        } else {
-                            llama_synchronize(ctx);
+                        // The output-copy barrier replaces the per-epoch host
+                        // synchronize when it exists; without it the stock calls
+                        // stay exactly as before (fail-closed).
+                        if (!dw_output_barrier) {
+                            // No sound barrier: keep the stock host
+                            // synchronize exactly as before. This is the ONLY
+                            // place a pointer may be resolved before the wait.
+                            if (output_rows == 1) {
+                                // This public getter synchronizes the context.
+                                // Keep only its pointer here; read logits after
+                                // native retirement.
+                                single_output_logits = llama_get_logits_ith(ctx, single_output_row);
+                            } else {
+                                llama_synchronize(ctx);
+                            }
                         }
+                        // With the barrier the pointer is NOT taken here: the
+                        // copy is not yet proven complete, so the row is
+                        // resolved after llama_tp5_output_event_wait below.
                         if (service) {
                             ggml_relay_status status{};
                             if (!service->metrics_enabled()) {
@@ -2658,6 +2731,35 @@ run_result run(const options & requested) {
                             dw_overlap_meter.end(wi);
                         }
                         verify_spin.reset();
+                        // DUALWIN-DEVICE-WAIT: the relay drain above is this
+                        // window's exit predicate and is unchanged. Only now,
+                        // immediately before the host reads a logits row, are
+                        // this window's output-copy events completed: their
+                        // completion proves the asynchronous D2H copy of THIS
+                        // epoch finished, on exactly the child streams it used
+                        // (all five ranks for a split output). Placing the wait
+                        // after the drain lets the drain's host work overlap any
+                        // remaining copy latency; whether that overlap saves time
+                        // is not measured and is not claimed.
+                        if (dw_output_barrier) {
+                            auto & dw_be = dw_backend_events[wi];
+                            ++dw_be.wait_calls;
+                            const std::uint64_t dw_ev_t0 = dw_event_trace::gate() ? now_ns() : 0;
+                            const std::size_t dw_proven = llama_tp5_output_event_wait(ctx);
+                            require(dw_proven == dw_copy_streams,
+                                    "output-copy event barrier did not cover every recorded stream");
+                            ++dw_be.wait_ok;
+                            if (dw_ev_t0) {
+                                if (dw_be.ev.wait_first_ns == 0) dw_be.ev.wait_first_ns = dw_ev_t0;
+                                dw_be.ev.wait_last_ns = dw_ev_t0;
+                                ++dw_be.ev.wait_calls;
+                            }
+                            // Completion is proven: resolve the row pointer
+                            // now, and only now, without a second synchronize.
+                            if (output_rows == 1) {
+                                single_output_logits = llama_get_logits_ith_no_sync(ctx, single_output_row);
+                            }
+                        }
                         metrics.native_wait_ns += wait_finished - wait_start;
                         active.fetch_sub(1);
                         epoch_active = false;
@@ -2677,7 +2779,11 @@ run_result run(const options & requested) {
                                 "MTP multistep must have exactly 1+N true target output rows");
                             std::size_t accepted=0;
                             for (;accepted<n;++accepted) {
-                                const float * logits=llama_get_logits_ith(ctx,int(accepted));
+                                // Barrier proven above: resolve without a second
+                                // context synchronize. Stock getter otherwise.
+                                const float * logits = dw_output_barrier ?
+                                    llama_get_logits_ith_no_sync(ctx,int(accepted)) :
+                                    llama_get_logits_ith(ctx,int(accepted));
                                 require(logits!=nullptr,"MTP multi target logits missing");
                                 const auto greedy=tq::sampling::select_finite_greedy(logits,n_vocab);
                                 require(greedy.usable,"MTP multi target logits nonfinite");
@@ -2757,6 +2863,9 @@ run_result run(const options & requested) {
                                     output_rows=uint32_t(valid_rows);
                                     if(valid_rows==1) {
                                         single_output_row=0;
+                                        // A decode AFTER this epoch's barrier
+                                        // has no proof of its own, so the
+                                        // synchronizing getter stays here.
                                         single_output_logits=llama_get_logits_ith(ctx,0);
                                         require(single_output_logits,
                                                 "native ring missing verified target N3 row0");
@@ -2842,75 +2951,56 @@ run_result run(const options & requested) {
                                     auto & dw_be = dw_backend_events[wi];
                                     ++dw_be.record_calls;
                                     const std::uint64_t dw_ev_t0 = dw_event_trace::gate() ? now_ns() : 0;
-                                    ggml_backend_event_record(dw_be.event, native[wi]);
+                                    // Record on the CHILD backend the event belongs to; the Meta
+                            // backend has no event_record (the event's own
+                            // device is that child's device, so this is the
+                            // same stream the event was created for).
+                            ggml_backend_event_record(dw_be.event, dw_be.backend);
                                     ++dw_be.record_ok;
-                                    if (dw_device_wait_req) {
-                                        dw_wait_peer_available[wi].fetch_add(1, std::memory_order_release);
-                                    }
                                     if (dw_ev_t0) {
                                         if (dw_be.ev.record_first_ns == 0) dw_be.ev.record_first_ns = dw_ev_t0;
                                         dw_be.ev.record_last_ns = dw_ev_t0;
                                     }
                                 }
-                                // DUALWIN-DEVICE-WAIT: same contract as the
-                                // target site above — dw_device_wait.h owns
-                                // the decision (binding at enqueue time per
-                                // the CUDA/HIP event contract, same
-                                // first-child device only, skips counted,
-                                // exits never weakened); the replay epoch is
-                                // its own relay epoch, so its consumption
-                                // covers the peer's latest recorded work the
-                                // same way, and the host synchronize below
-                                // still drains this stream afterwards.
-                                if (dw_device_wait_req && wi < dw_backend_events.size()) {
-                                    auto & dw_self = dw_backend_events[wi];
-                                    // wait_calls counts REAL device-side waits
-                                    // (bumped only where the call is actually
-                                    // issued), never skips — same contract as
-                                    // the target site above.
-                                    const std::uint32_t dw_n =
-                                        std::uint32_t(dw_backend_events.size());
-                                    const std::uint32_t dw_peer_wi = dw_device_wait::peer_of(wi, dw_n);
-                                    const dw_device_wait::context dw_ctx{
-                                        dw_backend_event_req,
-                                        dw_device_wait::has_peer(wi, dw_n),
-                                        dw_peer_wi < dw_n && dw_backend_events[dw_peer_wi].event != nullptr,
-                                        dw_self.event != nullptr,
-                                        // Same first-child device, resolved once
-                                        // at event creation through the public
-                                        // meta accessor (unknown device never
-                                        // waits).
-                                        dw_peer_wi < dw_n &&
-                                            dw_backend_events[dw_peer_wi].device != nullptr &&
-                                            dw_backend_events[dw_peer_wi].device ==
-                                                dw_self.device,
-                                    };
-                                    const std::uint64_t dw_peer_avail =
-                                        dw_ctx.peer_event
-                                            ? dw_wait_peer_available[dw_peer_wi].load(
-                                                  std::memory_order_acquire)
-                                            : 0;
-                                    const dw_device_wait::action dw_act =
-                                        dw_device_wait::plan(dw_ctx, dw_peer_avail, dw_self.wait_peer_consumed);
-                                    if (dw_act == dw_device_wait::action::wait) {
-                                        const std::uint64_t dw_wait_t0 = dw_event_trace::gate() ? now_ns() : 0;
-                                        ggml_backend_event_wait(native[wi], dw_backend_events[dw_peer_wi].event);
-                                        ++dw_self.wait_calls;
-                                        if (dw_event_trace::gate()) ++dw_self.ev.wait_calls;
-                                        ++dw_self.wait_ok;
-                                        if (dw_wait_t0) {
-                                            if (dw_self.ev.wait_first_ns == 0) dw_self.ev.wait_first_ns = dw_wait_t0;
-                                            dw_self.ev.wait_last_ns = dw_wait_t0;
-                                        }
-                                    } else if (dw_act == dw_device_wait::action::skip_unavailable) {
-                                        ++dw_self.wait_skipped_unavailable;
-                                    } else if (dw_act == dw_device_wait::action::skip_unrecorded) {
-                                        ++dw_self.wait_skipped_unrecorded;
-                                    }
+                                // DUALWIN-DEVICE-WAIT (replay site): the replay path consumes
+                                // its own verified prefix, so it needs the same
+                                // barrier for the same window: record this
+                                // window's output-copy events now and complete
+                                // them below instead of the scheduler-wide
+                                // synchronize. Same rules as the target site -
+                                // real ggml events on every contributing child,
+                                // never another window's work, never a HIP
+                                // handle cast into a ggml event.
+                                const std::size_t dw_copy_streams =
+                                    (dw_device_wait_req && wi < dw_backend_events.size()) ?
+                                        llama_tp5_output_copy_record(ctx) :
+                                        0;
+                                const bool dw_output_barrier = dw_copy_streams > 0;
+                                if (dw_device_wait_req && wi < dw_backend_events.size() && !dw_output_barrier) {
+                                    ++dw_backend_events[wi].wait_skipped_unavailable;
+                                }
+                                // Same peerless consultation as the target
+                                // site: no peer can be named here either.
+                                if (dw_device_wait_req) {
+                                    dw_device_wait::context dw_ctx;
+                                    dw_ctx.event_gate  = dw_backend_event_req;
+                                    dw_ctx.have_peer   = false;
+                                    dw_ctx.peer_event  = false;
+                                    dw_ctx.self_event  = dw_output_barrier;
+                                    dw_ctx.same_device = false;
+                                    std::uint64_t dw_watermark = 0;
+                                    require(dw_device_wait::plan(dw_ctx, 0, dw_watermark) ==
+                                                dw_device_wait::action::skip_unavailable,
+                                            "device-wait planner named a peer for a peerless context (replay)");
                                 }
                                 std::optional<scoped_spin_cpu> replay_spin;
                                 replay_spin.emplace();
-                                llama_synchronize(ctx);
+                                // A sound output-copy barrier replaces this
+                                // scheduler-wide synchronize; without one the
+                                // stock call stays, unchanged.
+                                if (!dw_output_barrier) {
+                                    llama_synchronize(ctx);
+                                }
                                 if (overlap_meter_req) {
                                     dw_overlap_meter.end(wi);
                                 }
@@ -2973,12 +3063,44 @@ run_result run(const options & requested) {
                                         service->epoch_verify(wi, native[wi]);
                                     }
                                 }
+                                // DUALWIN-DEVICE-WAIT (replay site): the drain
+                                // above is the exit predicate and is unchanged.
+                                // Complete THIS window's recorded output-copy
+                                // events now, before the host reads a logits
+                                // row of this replay epoch.
+                                if (dw_output_barrier) {
+                                    auto & dw_be = dw_backend_events[wi];
+                                    ++dw_be.wait_calls;
+                                    const std::uint64_t dw_ev_t0 =
+                                        dw_event_trace::gate() ? now_ns() : 0;
+                                    const std::size_t dw_proven = llama_tp5_output_event_wait(ctx);
+                                    require(dw_proven == dw_copy_streams,
+                                            "output-copy event barrier did not cover every recorded stream (replay)");
+                                    ++dw_be.wait_ok;
+                                    if (dw_ev_t0) {
+                                        if (dw_be.ev.wait_first_ns == 0) dw_be.ev.wait_first_ns = dw_ev_t0;
+                                        dw_be.ev.wait_last_ns = dw_ev_t0;
+                                        ++dw_be.ev.wait_calls;
+                                    }
+                                    // Same rule as the target site: the replay
+                                    // row is resolved only after the barrier is
+                                    // proven complete.
+                                    if (output_rows == 1) {
+                                        single_output_logits = llama_get_logits_ith_no_sync(ctx, single_output_row);
+                                    }
+                                }
                                 active.fetch_sub(1);
                                 epoch_active=false;
                                 replay_spin.reset();
 
                                 for(std::size_t j=0;j<replay_n;++j) {
-                                    const float * replay=llama_get_logits_ith(ctx,int(j));
+                                    // The replay epoch's barrier (above) is the
+                                    // completion proof, so resolve without a
+                                    // second context synchronize; without a
+                                    // barrier the stock getter stays.
+                                    const float * replay = dw_output_barrier ?
+                                        llama_get_logits_ith_no_sync(ctx,int(j)) :
+                                        llama_get_logits_ith(ctx,int(j));
                                     require(replay!=nullptr,
                                         "MTP multi genuine replay missing original target logits");
                                     const auto greedy=tq::sampling::select_finite_greedy(replay,n_vocab);
@@ -3036,7 +3158,11 @@ run_result run(const options & requested) {
                                             "MTP multi accepted-prefix token changed during rollback replay");
                                 }
                                 if(replay_n==1)
-                                    single_output_logits=llama_get_logits_ith(ctx,0);
+                                    // Barrier proven above for this replay
+                                    // epoch; stock getter without one.
+                                    single_output_logits = dw_output_barrier ?
+                                        llama_get_logits_ith_no_sync(ctx,0) :
+                                        llama_get_logits_ith(ctx,0);
                                 if (mtp_state_trace) {
                                     std::fprintf(stderr,
                                         "TP5_REAL_MTP_MULTI_REJECT_ROLLBACK_PASS window=%u matched_prefix=%zu replay_N=%zu restored_bytes=%zu\n",
@@ -3118,9 +3244,15 @@ run_result run(const options & requested) {
                             if (!batch.batch.logits[row]) {
                                 continue;
                             }
+                            // With the output-copy barrier the epoch's D2H
+                            // copy is already proven complete, so the
+                            // non-synchronizing resolver is the correct
+                            // reader; without it the stock getter stays.
                             const float * logits =
                                 output_rows == 1 && row == static_cast<std::size_t>(single_output_row) ?
-                                    single_output_logits : llama_get_logits_ith(ctx, row);
+                                    single_output_logits :
+                                    (dw_output_barrier ? llama_get_logits_ith_no_sync(ctx, int32_t(row)) :
+                                                         llama_get_logits_ith(ctx, int32_t(row)));
                             require(logits != nullptr, "full logits row is missing");
                             const auto greedy = tq::sampling::select_finite_greedy(logits, n_vocab);
                             require(greedy.usable, "nonfinite full model logits");
@@ -3530,6 +3662,11 @@ run_result run(const options & requested) {
             }
         }
     }
+    // DUALWIN-XWIN-DEVICE needs no teardown of its own: the primitive borrows
+    // nothing. Every wait was enqueued on this window's own stream and the
+    // target tails stay owned by the relay provider, which outlives the
+    // enqueued waits by construction (streams drain at context synchronize
+    // above; the provider dies with the contexts below).
     if (dw_backend_event_req) {
         // Receipts count calls after drain and free. The first child's stream
         // relationship to relay work is unverified; these are not overlap or
@@ -3539,16 +3676,34 @@ run_result run(const options & requested) {
         for (std::uint32_t wi = 0; wi < dw_backend_events.size(); ++wi) {
             const auto & dw_be = dw_backend_events[wi];
             std::fprintf(stderr,
-                "TP5_DW_BACKEND_EVENT window=%u created=%d record_calls=%llu record_ok=%llu sync_calls=%llu free_calls=%llu skipped_unavailable=%llu\n",
+                "TP5_DW_BACKEND_EVENT window=%u created=%d record_calls=%llu record_ok=%llu sync_calls=%llu free_calls=%llu skipped_unavailable=%llu"
+                " skip_no_child=%llu skip_no_device=%llu skip_no_iface=%llu"
+                " child_backend=%p meta_backend=%p child_device=%p meta_device=%p\n",
                 unsigned(wi), int(dw_be.event != nullptr || dw_be.free_calls != 0),
                 (unsigned long long)dw_be.record_calls, (unsigned long long)dw_be.record_ok,
                 (unsigned long long)dw_be.sync_calls,
-                (unsigned long long)dw_be.free_calls, (unsigned long long)dw_be.skipped_unavailable);
+                (unsigned long long)dw_be.free_calls, (unsigned long long)dw_be.skipped_unavailable,
+                // The three causes sum to skipped_unavailable, so a single
+                // skipped attempt names itself: no child backend, a child
+                // without a device, or a device whose interface has no
+                // event_new (a CPU child or a build without stream events).
+                (unsigned long long)dw_be.skip_no_child,
+                (unsigned long long)dw_be.skip_no_device,
+                (unsigned long long)dw_be.skip_no_iface,
+                // Actual pointers, so a skipped leg names its own cause: a null
+                // child_backend means the Meta backend exposed no child; a
+                // non-null child_backend with a null child_device means that
+                // child has no device; a null event with both non-null means
+                // the child device has no event_new. Never an inference from a
+                // counter.
+                (void *)dw_be.backend, (void *)native[wi],
+                (void *)dw_be.device,
+                (void *)ggml_backend_get_device(native[wi]));
         }
         // DUALWIN event-point trace: per-window stamps around the real
-        // record/synchronize call sites. Host correlation metadata only;
-        // wait_calls counts the real device-side waits issued under
-        // GGML_TP5_DW_DEVICE_WAIT=1 (zero when that gate is off).
+        // record/synchronize/wait call sites. Host correlation metadata only:
+        // the wait_* stamps count host waits on THIS window's output-copy
+        // events and prove nothing about device overlap.
         if (dw_event_trace::gate()) {
             dw_event_trace::banner();
             for (std::uint32_t wi = 0; wi < dw_backend_events.size(); ++wi) {
@@ -3565,22 +3720,20 @@ run_result run(const options & requested) {
     }
     if (dw_device_wait_req) {
         // DUALWIN-DEVICE-WAIT receipt (GGML_TP5_DW_DEVICE_WAIT=1): per-window
-        // device-side event wait counters and host stamps. wait_ok counts
-        // ggml_backend_event_wait calls actually issued on this window's
-        // first-child stream for the peer window's event (same first-child
-        // device, unconsumed record only); every skip is counted, never
-        // silent. The first child's stream relationship to relay work is
-        // unverified; these are not overlap or device completion evidence.
-        // With GGML_TP5_DW_BACKEND_EVENT unset no event exists and every
-        // counter stays zero except the skips.
-        std::fprintf(stderr, "TP5_DW_DEVICE_WAIT enabled=1 flag=GGML_TP5_DW_DEVICE_WAIT windows=%u\n",
+        // host waits on THIS window's output-copy events. wait_calls counts the
+        // epochs whose barrier was those events, wait_ok the ones that reported
+        // exactly the recorded stream count, wait_skip_unavailable the epochs
+        // that kept the stock synchronize. There is no cross-window wait: the
+        // two windows share no writable device state. These are host call
+        // counts on device events; they are not GPU-overlap evidence.
+        std::fprintf(stderr, "TP5_DW_DEVICE_WAIT enabled=1 flag=GGML_TP5_DW_DEVICE_WAIT windows=%u "
+            "mode=same_window_output_copy_barrier note=no_cross_window_wait_no_hip_handle_as_ggml_event\n",
             unsigned(opts.windows));
         for (std::uint32_t wi = 0; wi < dw_backend_events.size(); ++wi) {
             const auto & dw_be = dw_backend_events[wi];
             std::fprintf(stderr,
-                "TP5_DW_DEVICE_WAIT window=%u wait_calls=%llu wait_ok=%llu wait_skip_unrecorded=%llu wait_skip_unavailable=%llu wait_first_ns=%llu wait_last_ns=%llu\n",
+                "TP5_DW_DEVICE_WAIT window=%u wait_calls=%llu wait_ok=%llu wait_skip_unavailable=%llu wait_first_ns=%llu wait_last_ns=%llu\n",
                 unsigned(wi), (unsigned long long)dw_be.wait_calls, (unsigned long long)dw_be.wait_ok,
-                (unsigned long long)dw_be.wait_skipped_unrecorded,
                 (unsigned long long)dw_be.wait_skipped_unavailable,
                 (unsigned long long)dw_be.ev.wait_first_ns, (unsigned long long)dw_be.ev.wait_last_ns);
         }

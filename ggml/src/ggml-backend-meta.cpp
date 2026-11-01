@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend.h"
+#include "tp5-meta-submit-ready.h"
 #include "ggml-backend-impl.h"
 #include "ggml-relay-impl.h"
 #include "ggml-alloc.h"
@@ -900,6 +901,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 continue;
             }
             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+                // Isolated read-only diagnostic for genuine Qwen4Exp MTP
+                // GDN ingredient replay on five-RX6800 Meta TP5. Never
+                // replace the original fail-closed unknown-axis assertion.
+                const ggml_tensor * bad = tensor->src[i];
+                GGML_LOG_ERROR(
+                    "TP5_MTP_GDN_META_UNKNOWN_SPLIT dst_name='%s' dst_op=%s dst_shape=[%lld,%lld,%lld,%lld] source_index=%zu src_name='%s' src_op=%s src_shape=[%lld,%lld,%lld,%lld] src_view_of='%s' src_nelements=%lld src_is_meta=%u src_has_buffer=%u\n",
+                    ggml_get_name(tensor), ggml_op_name(tensor->op),
+                    (long long)tensor->ne[0], (long long)tensor->ne[1], (long long)tensor->ne[2], (long long)tensor->ne[3],
+                    i, ggml_get_name(bad), ggml_op_name(bad->op),
+                    (long long)bad->ne[0], (long long)bad->ne[1], (long long)bad->ne[2], (long long)bad->ne[3],
+                    bad->view_src ? ggml_get_name(bad->view_src) : "(none)",
+                    (long long)ggml_nelements(bad), unsigned(bad->buffer && ggml_backend_buffer_is_meta(bad->buffer)),
+                    unsigned(bad->buffer != nullptr));
+            }
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         }
 
@@ -2153,7 +2169,28 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
+// Caller-scoped observation/coordination point; no provider lock is held here.
+static thread_local bool (*tp5_meta_submit_ready_hook)(void *) = nullptr;
+static thread_local void * tp5_meta_submit_ready_userdata = nullptr;
+bool ggml_backend_meta_set_submit_ready_hook(bool (*hook)(void *), void * userdata) {
+    if ((hook == nullptr) != (userdata == nullptr) || (hook && tp5_meta_submit_ready_hook)) return false;
+    tp5_meta_submit_ready_hook = hook;
+    tp5_meta_submit_ready_userdata = userdata;
+    return true;
+}
+
+// Successful native-submit notification; called after the provider has released its lock.
+static thread_local bool (*tp5_meta_submitted_hook)(void *) = nullptr;
+static thread_local void * tp5_meta_submitted_userdata = nullptr;
+bool ggml_backend_meta_set_submitted_hook(bool (*hook)(void *), void * userdata) {
+    if ((hook == nullptr) != (userdata == nullptr) || (hook && tp5_meta_submitted_hook)) return false;
+    tp5_meta_submitted_hook = hook;
+    tp5_meta_submitted_userdata = userdata;
+    return true;
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    const int64_t diag_start = ggml_time_us();
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
@@ -2242,7 +2279,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (have_snapshot) {
                 break;
             }
-            std::this_thread::yield();
+            // ASYNC-PROTOCOL: busy-wait, no scheduler yield.
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#endif
         } while (std::chrono::steady_clock::now() < snapshot_deadline);
         if (!have_snapshot || previous.failed ||
             (previous.epoch != 0 && !previous.finished)) {
@@ -2258,6 +2298,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
+    const int64_t diag_prepared = ggml_time_us();
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
 
     bool max_nnodes_raised = false;
@@ -2868,9 +2909,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const ggml_tensor * mixed   = cgraph->nodes[i + 11];
                 const int64_t width = up->ne[0];
                 const int64_t dim = width / 4;
-                auto vector_f32 = [](const ggml_tensor * t, const int64_t n) {
+                const int64_t token_rows = up->ne[1];
+                const char * rows_option = std::getenv("GGML_TP5_HC_MEAN_ROWS4");
+                if (token_rows != 1 && (token_rows < 2 || token_rows > 4 ||
+                        !rows_option || std::strcmp(rows_option,"1") != 0)) {
+                    return i;
+                }
+                auto vector_f32 = [token_rows](const ggml_tensor * t, const int64_t n) {
                     return t != nullptr && t->type == GGML_TYPE_F32 &&
-                        t->ne[0] == n && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
+                        t->ne[0] == n && t->ne[1] == token_rows && t->ne[2] == 1 && t->ne[3] == 1 &&
                         ggml_is_contiguous(t);
                 };
                 if (width <= 0 || width % 4 != 0 || !vector_f32(up, width) || up->view_src ||
@@ -2881,7 +2928,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     execution_split_state(gated->src[0], false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
                     !vector_f32(gated, width) || gated->view_src ||
                     streams->src[0] != gated || streams->view_src != gated || streams->view_offs != 0 ||
-                    streams->ne[0] != dim || streams->ne[1] != 4 || streams->ne[2] != 1 || streams->ne[3] != 1 ||
+                    streams->ne[0] != dim || streams->ne[1] != 4 || streams->ne[2] != token_rows || streams->ne[3] != 1 ||
                     !ggml_is_contiguous(streams)) {
                     return i;
                 }
@@ -2897,9 +2944,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // ggml views flatten view_src to the underlying gated tensor.
                     if (view->src[0] != streams || view->view_src != gated ||
                         view->view_offs != size_t(k * dim) * sizeof(float) ||
-                        view->ne[0] != dim || view->ne[1] != 1 || view->ne[2] != 1 || view->ne[3] != 1 ||
+                        view->ne[0] != dim || view->ne[1] != token_rows || view->ne[2] != 1 || view->ne[3] != 1 ||
                         view->nb[0] != sizeof(float) || view->nb[1] != size_t(width) * sizeof(float) ||
-                        view->nb[2] != view->nb[1] || view->nb[3] != view->nb[1]) {
+                        view->nb[2] != view->nb[1] * size_t(token_rows) || view->nb[3] != view->nb[2]) {
                         return i;
                     }
                 }
@@ -3205,6 +3252,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         for (int k = i - 6; k < i - 3; ++k) {
                             backend_ctx->backend_configs[rank].nodes[k]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
                         }
+                    }
+                }
+                if (token_rows > 1 && apply_norm && std::getenv("TP5_DIAG_GRAPH")) {
+                    static thread_local unsigned seen_rows = 0;
+                    if (!(seen_rows & (1u << token_rows))) {
+                        seen_rows |= (1u << token_rows);
+                        GGML_LOG_INFO("TP5_HC_MEAN_ROWS_EXEC rows=%lld owner=%zu width=%lld terminal_width=%lld\n",
+                            (long long)token_rows,owner,(long long)width,(long long)dim);
                     }
                 }
                 return last;
@@ -3798,6 +3853,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    const int64_t diag_built = ggml_time_us();
     if (backend_ctx->relay_mode) {
         const auto * ri = backend_ctx->relay_i;
         void * relay = backend_ctx->relay;
@@ -3830,8 +3886,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     backend_ctx->backend_configs[rank].cgraphs[stage].cgraph_main;
             }
         }
+        const int64_t diag_submit = ggml_time_us();
         try {
+            // Inputs have completed, every child graph is private and prepare has
+            // released its provider lock. Nothing is active until submit begins.
+            if (tp5_meta_submit_ready_hook &&
+                    !tp5_meta_submit_ready_hook(tp5_meta_submit_ready_userdata)) {
+                ri->abort(relay, GGML_STATUS_FAILED);
+                return GGML_STATUS_FAILED;
+            }
             if (!ri->submit(relay, backend_ctx->relay_graphs.data(), backend_ctx->n_subgraphs)) {
+                ri->abort(relay, GGML_STATUS_FAILED);
+                return GGML_STATUS_FAILED;
+            }
+            // All private child graphs are accepted and sealed. No shared
+            // conversion follows; only this context's diagnostics and return.
+            if (tp5_meta_submitted_hook &&
+                    !tp5_meta_submitted_hook(tp5_meta_submitted_userdata)) {
                 ri->abort(relay, GGML_STATUS_FAILED);
                 return GGML_STATUS_FAILED;
             }
@@ -3840,6 +3911,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // any partially submitted relay waits before that stream fence.
             ri->abort(relay, GGML_STATUS_FAILED);
             throw;
+        }
+        if (std::getenv("TP5_DIAG_GRAPH")) {
+            GGML_LOG_INFO("TP5_DIAG_META ctx=%p uid=%llu rebuild=%d nodes=%d channels=%zu pre_us=%lld plan_us=%lld prepare_us=%lld submit_us=%lld total_us=%lld\n",
+                (void *) backend_ctx, (unsigned long long)cgraph->uid, int(needs_rebuild), cgraph->n_nodes, channels,
+                (long long)(diag_prepared-diag_start),(long long)(diag_built-diag_prepared),
+                (long long)(diag_submit-diag_built),(long long)(ggml_time_us()-diag_submit),(long long)(ggml_time_us()-diag_start));
         }
         return GGML_STATUS_SUCCESS;
     }
@@ -4316,6 +4393,66 @@ size_t ggml_backend_meta_output_wait(ggml_backend_t meta_backend) {
         ++complete;
     }
     return complete;
+}
+
+ggml_backend_dev_t ggml_backend_meta_first_child_device(ggml_backend_t meta_backend) {
+    // Null-safe where the sibling accessors assert: their callers already
+    // proved a Meta backend, an ungated probe may have nothing to look at.
+    if (meta_backend == nullptr || !ggml_backend_is_meta(meta_backend)) {
+        return nullptr;
+    }
+    const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
+    if (backend_ctx == nullptr || backend_ctx->backend_configs.empty() ||
+            backend_ctx->backend_configs[0].backend == nullptr) {
+        return nullptr;
+    }
+    // The device object is owned by the child's backend registry, not by this
+    // Meta backend, so returning it borrows nothing that can be freed here.
+    return ggml_backend_get_device(backend_ctx->backend_configs[0].backend);
+}
+
+ggml_backend_t ggml_backend_meta_first_child_backend(ggml_backend_t meta_backend) {
+    // Same null-safe contract as the device sibling above.
+    if (meta_backend == nullptr || !ggml_backend_is_meta(meta_backend)) {
+        return nullptr;
+    }
+    const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
+    if (backend_ctx == nullptr || backend_ctx->backend_configs.empty()) {
+        return nullptr;
+    }
+    // The child BACKEND is what carries event_record/event_wait; the Meta device
+    // deliberately has no event_new, so a device alone cannot create a real
+    // stream event. Owned by this Meta backend, valid until its free.
+    return backend_ctx->backend_configs[0].backend;
+}
+
+ggml_backend_t ggml_backend_meta_first_event_child_backend(ggml_backend_t meta_backend) {
+    // "Can create an event" is answered by the public API and nowhere else:
+    // ggml_backend_event_new returns nullptr for a device whose interface has
+    // no event_new (a CPU child, or a build without usable stream events). The
+    // probe event is released immediately; nothing is left allocated.
+    if (meta_backend == nullptr || !ggml_backend_is_meta(meta_backend)) {
+        return nullptr;
+    }
+    const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
+    if (backend_ctx == nullptr) {
+        return nullptr;
+    }
+    for (const auto & config : backend_ctx->backend_configs) {
+        ggml_backend_t     child     = config.backend;
+        ggml_backend_dev_t child_dev = child != nullptr ? ggml_backend_get_device(child) : nullptr;
+        if (child_dev == nullptr) {
+            continue;
+        }
+        ggml_backend_event_t probe = ggml_backend_event_new(child_dev);
+        if (probe != nullptr) {
+            ggml_backend_event_free(probe);
+            // Same ownership as ggml_backend_meta_first_child_backend: the Meta
+            // backend owns every child backend until ggml_backend_meta_free.
+            return child;
+        }
+    }
+    return nullptr;
 }
 
 static ggml_backend_meta_context * ggml_backend_relay_meta_context(ggml_backend_t backend) {
