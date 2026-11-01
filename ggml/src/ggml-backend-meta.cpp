@@ -4349,12 +4349,29 @@ size_t ggml_backend_meta_output_record(ggml_backend_t meta_backend, const struct
             break;
         }
         ggml_backend_dev_t child_dev = ggml_backend_get_device(child);
-        if (child_dev == nullptr || child_dev->iface.event_new == nullptr ||
+        if (child_dev == nullptr || child_dev->iface.event_free == nullptr ||
                 child_dev->iface.event_synchronize == nullptr) {
             break;
         }
         if (backend_ctx->output_copy_events[j] == nullptr) {
-            backend_ctx->output_copy_events[j] = child_dev->iface.event_new(child_dev);
+            // A build without peer copies (GGML_CUDA_NO_PEER_COPY) hides
+            // event_new from the device interface so the scheduler keeps its
+            // synchronize fallback. The backend can still make a plain stream
+            // event through a private entry point that the scheduler never
+            // calls; use it only when the interface offers none.
+            if (child_dev->iface.event_new != nullptr) {
+                backend_ctx->output_copy_events[j] = child_dev->iface.event_new(child_dev);
+            }
+            if (backend_ctx->output_copy_events[j] == nullptr) {
+                using output_event_new_t = ggml_backend_event_t (*)(ggml_backend_dev_t);
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(child_dev);
+                auto output_event_new = reg != nullptr ?
+                    (output_event_new_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_output_event_new") :
+                    nullptr;
+                if (output_event_new != nullptr) {
+                    backend_ctx->output_copy_events[j] = output_event_new(child_dev);
+                }
+            }
         }
         if (backend_ctx->output_copy_events[j] == nullptr) {
             break;

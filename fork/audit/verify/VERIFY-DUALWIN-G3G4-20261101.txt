@@ -1,0 +1,259 @@
+DUALWIN LANE — G2 BUILD, G3 INERTNESS, G4 COUNTERS
+Tree /home/kunweiz/work/merge-dualwin-20261031, HEAD e79db6050, git status clean.
+Every artifact below lives under
+  /home/kunweiz/work/lead-fa-ncols2-g2-verify-20261031/dualwin-g3g4-20261101 (mode 0700).
+No source file of the lane was modified. CPU builds held /home/kunweiz/work/vfs-build.lock and
+vfs-build-2.lock; every GPU leg held $E/ple-candidate-gpu.lock and /tmp/ple-candidate-gpu.lock
+(non-blocking flock, one HIP process at a time). All five GPUs read 0 % after the last leg.
+
+================================================================================
+G2 — BUILD OF THE NON-RELAY HOST TUs
+================================================================================
+WHAT WAS BUILT
+  The change set is ggml/include/ggml-backend.h, ggml/src/ggml-backend-impl.h,
+  ggml/src/ggml-backend-meta.cpp, ggml/src/ggml-cuda/relay.hip, plus the compose runtime
+  (fork/tp5-compose/src/runtime.cpp, dw_compose_event.h) and llama-context.cpp. The host TUs were
+  built from the lane's own source with the lane's own configure flags, into a private build dir:
+
+    cmake -S <lane> -B <private>/upstream  Release, GGML_HIP=ON, CMAKE_HIP_ARCHITECTURES=gfx1030,
+          GGML_HIP_GRAPHS=OFF, GGML_HIP_MMQ_MFMA=OFF, GGML_CUDA_FA=ON, GGML_CUDA_NO_PEER_COPY=ON,
+          CMAKE_HIP_COMPILER=/opt/rocm/core-10.0/lib/llvm/bin/clang++
+    cmake --build <private>/upstream --parallel 32 --target llama
+
+  configure rc=0. The llama target reached 100 % with 0 errors and 1 warning. (build.log contains
+  one `error:` line: it is the first attempt, before the include path below was supplied.)
+
+  Artifacts: libggml-base.so.0.18.1 e75f8cec05f14172…, libggml-hip.so.0.18.1 785a0c9b184b116b…,
+  libllama.so.0.0.4 2718eddb45b64212…, tq-tp5-compose 37a02148cb580cba… (the compose runtime built
+  from fork/tp5-compose, see below).
+
+TWO THINGS THE LANE DOES NOT DO BY ITSELF — BOTH RECORDED, NEITHER WORKED AROUND IN SOURCE
+  1. ggml/src/ggml-backend-meta.cpp:4 includes "tp5-meta-submit-ready.h", which exists only in
+     overlay/mtp-async-protocol-candidate-20261027/base/. The tree does not add that directory to
+     any include path, so a plain cmake build fails:
+       ggml-backend-meta.cpp:4:10: fatal error: tp5-meta-submit-ready.h: No such file or directory
+     The build above supplies -I<overlay>/mtp-async-protocol-candidate-20261027/base. That is the
+     only deviation, and it changes no source byte. The lane needs this path in its build recipe.
+  2. fork/build.py refuses before it configures anything: fork/check-upstream.py runs
+       git merge-base --is-ancestor cda0f9256665845cd9d6f3a0176880883f653a3d HEAD
+     which fails on HEAD e79db6050 (the lane is a snapshot branch, not a descendant of that commit).
+     That guard is about upstream provenance, not buildability; the cmake invocation above is the
+     script's own configure line, so the build is the one build.py would have run.
+  Additionally the fork/tp5-compose module does not link the HIP runtime it needs through libggml-hip:
+  linking fails with ~85 `undefined reference to hipXxx@hip_4.2` until the caller appends
+  -L/opt/rocm/core-10.0/lib -lamdhip64 (here via CMAKE_CXX_STANDARD_LIBRARIES so it lands after the
+  objects). Worth fixing in the module's CMakeLists.
+
+HOST ABI DELTA (dualwin libggml-base vs the shipped selected libggml-base)
+  891 exported symbols against 886: five added, none removed.
+    ggml_backend_meta_first_child_backend
+    ggml_backend_meta_first_child_device
+    ggml_backend_meta_first_event_child_backend
+    ggml_backend_meta_output_record
+    ggml_backend_meta_output_wait
+  These are exactly the dual-window output-copy event entry points; nothing else in the host ABI
+  moved. The link object list of no shipped DSO was touched.
+
+MODULE CHAIN
+  fork/relay, fork/rerot, fork/sampling, fork/corpus, fork/scheduling, fork/text, fork/calibration:
+  configure, build and install all rc=0 against the private prefix. That is the dependency set
+  fork/tp5-compose asks for.
+
+================================================================================
+G3 — INERTNESS: DOES THE LANE CHANGE ANY NUMBER?
+================================================================================
+Legs: 2 windows x 32 tokens (and 2 x 1), same argv and environment as every earlier model leg,
+derived from mtp-hc-row-tail-candidate-20261025/on512x2/command.json, --capture-logits.
+
+(a) THE RELAY CHANGE (relay.hip prev 1251795e021b7bb9… vs head a901be26e8aa55a1…), both run with the
+    dualwin host TUs (dualwin libggml-base) and the same libllama:
+      8x2:  prev rc=0 75.8 s, head rc=0 121.4 s  ->  logits.f32le identical, 0 differing bytes
+      1x2:  prev rc=0 76.8 s, head rc=0 108.4 s  ->  logits.f32le identical, 0 differing bytes
+    The relay change is bitwise inert.
+
+(b) THE COMPOSE EVENT GATE, dualwin binary, GGML_TP5_DW_COMPOSE_EVENT=1 vs =0, nothing else differs:
+      ON  rc=0 73.1 s   OFF rc=0 72.7 s
+      row0 win0: 0/248320 differ, top1 271/271;  row1 win1: 0/248320 differ, top1 248046/248046
+    The gate is bitwise inert, as its own header claims.
+
+WHAT THE SOURCE CHANGE ACTUALLY IS (diff of the two relay.hip variants)
+    element_capacity            4*4096 -> 16*4096   (room for four real target rows)
+    consumer wait               __builtin_amdgcn_s_sleep(2) removed -> pure busy-wait
+    submit()                    TP5_DIAG_GRAPH timing instrumentation added
+  The tail-event record/query code (hipEventRecord at relay.hip:1337, hipEventQuery at :671) is
+  unchanged between prev and head; what the lane changes on the device side is the wait spin and the
+  channel capacity, and it adds the fork-side output-copy event path.
+
+================================================================================
+G4 — COUNTERS: WHAT ACTUALLY RAN
+================================================================================
+(a) RELAY SUBMIT PATH (r1 harness, dualwin/base DSOs, five devices, real submit):
+      submit=1, epoch 0->1, attempted_mask=31, accepted_mask=31, sealed=1, failed=0,
+      rank_relay_nodes=[1,1,1,1,1], completed_mask=0, finished=0 after 3903 polls
+    The frame was submitted and sealed on all five ranks. completed_mask stays 0 without a consumer
+    because the relay kernels wait for the consumer to publish; the same numbers come from the
+    pre-change DSO, so this is the protocol, not the lane.
+
+(b) TP5_DIAG_RELAY (the lane's own instrumentation), head DSO, 8x2 leg, 26 submits:
+      modes        direct 10 / capture 4 / replay 12
+      cache hits   16 (hit=1), definition_changed 10
+      lock_us      p50 0,        max 1
+      key_us       p50 1,        max 39654      (frame-key scan)
+      begin_us     p50 5,        max 9
+      dispatch_us  p50 38304,    max 19849866   (19.85 s — the host slowdown)
+      finish_us    p50 240,      max 38889      (tail hipEventRecord on every lane)
+      total_us     p50 57806,    max 19866250
+    1x2 leg, 19 submits: modes 6/2/11, 13 hits, finish_us p50 231 / max 26465.
+    finish_us is non-zero on every submit, so the tail-event record path ran; replay mode (12 of 26)
+    proves it ran on replayed graphs too. The pre-change DSO carries no instrumentation (0 lines),
+    so there is no prev-side number to compare; the code it runs is the same record block.
+
+(c) THE DUAL-WINDOW OUTPUT-COPY EVENT PATH NEVER EXECUTED — the decisive result of this leg.
+    With GGML_TP5_DW_COMPOSE_EVENT=1 the runtime prints its receipt, and it prints:
+      TP5_DW_COMPOSE_EVENT enabled=1 flag=GGML_TP5_DW_COMPOSE_EVENT windows=2
+      TP5_DW_COMPOSE_EVENT window=0 epochs=12 output_event_syncs=0 host_sync_replaced=0
+                          fallback_no_output_barrier=12 no_sync_logits_calls=0
+      TP5_DW_COMPOSE_EVENT window=1 epochs=13 output_event_syncs=0 host_sync_replaced=0
+                          fallback_no_output_barrier=13 no_sync_logits_calls=0
+    Every one of the 25 epochs kept the stock llama_synchronize: llama_tp5_output_copy_record()
+    returned 0 each time, so no device event was recorded, none was waited on, and no logits row was
+    read through llama_get_logits_ith_no_sync. The gate therefore changes nothing at all in this
+    configuration — which is why (b) above is bitwise inert — and the lane's headline feature is
+    unexercised, not merely quiet.
+    ISOLATED. Two private probe builds, no source tree touched: ggml-backend-meta.cpp and
+    llama-context.cpp were copied into probe/, a stderr line was inserted before every `return 0;`
+    in ggml_backend_meta_output_record and in llama_context::tp5_output_copy_record, the objects were
+    compiled with the build dir's own flags, dropped over the build dir's objects and relinked
+    (libggml-base 85d5cdcf200f63de…, libllama 6ee382209bc8df94…), then installed and run with the
+    gate ON. (A first probe run printed nothing: the private install tree still held the pre-probe
+    libraries — the probe rebuild writes to <build>/bin, not to <prefix>/lib.)
+    Result, 25 epochs, 25 calls of ggml_backend_meta_output_record:
+      23 x META_REC_FAIL at ggml-backend-meta.cpp:4320   -> the split-axis else branch
+       2 x META_REC_FAIL at ggml-backend-meta.cpp:4377   -> recorded != targets.size()
+      0 x at the earlier returns (no gate, not meta, no buffer, not a meta buffer, empty context)
+      0 x LLAMA_REC_FAIL (the llama-side early returns are all passed)
+    So the logits tensor IS a meta-buffer tensor of a meta backend with a live relay, and the record
+    dies on the split state: ggml_backend_meta_get_split_state(tensor, assume_sync=false) returns
+    GGML_BACKEND_SPLIT_AXIS_PARTIAL (or UNKNOWN) for this output, and the record treats anything that
+    is neither MIRRORED nor axis 0..2 as "no sound barrier". The mechanism is in the state function
+    itself: at ggml-backend-meta.cpp:628 an output whose two sources both split on axis 0 returns
+    {assume_sync ? MIRRORED : PARTIAL}, and the record asks with assume_sync=false. The call site
+    therefore cannot see the MIRRORED case its own comment describes ("MIRRORED reads the first
+    child"); it degrades to PARTIAL and fails closed by design.
+    The two late failures (recorded != targets.size()) are epochs where an axis was resolvable and
+    some event still failed to record; they are not the main path.
+    Consequence for acceptance: the RUNBOOK's device trace for the event path cannot be produced on
+    this configuration, because there is no event to trace.
+
+(d) CROSS-TREE COMPARISON IS NOT MEANINGFUL — measured, then set aside.
+    The dualwin binary against the shipped m4 control binary, same argv and environment:
+      2 rows, 248320 values each, all values differ, maxabs 0.887 / 1.100, top1 equal in both rows.
+    Isolated: swapping the m4 libllama into the dualwin stack changes nothing (0 differing bytes vs
+    the dualwin stack); swapping libllama and libggml-base both changes nothing. The difference is
+    the compose binary itself (fork/tp5-compose vs the m4 compose control) — a different program, not
+    a regression of this lane. Bitwise comparison is only sound inside the lane, which is what (a)
+    and (b) do.
+
+================================================================================
+LIMITS OF THIS LEG
+================================================================================
+  * 2x32 and 2x1 windows only; no formal 512x2, no timing claims (the host is still in its
+    post-reboot slowdown: dispatch p50 38 ms, max 19.85 s on a workload that ran at 1.44 s pre-reboot).
+  * The event path's absence is measured on this argv and model; a different split (PARTIAL output)
+    or a meta-buffer logits tensor could take the record path. That was not built.
+  * No source tree was changed; the two build deviations (overlay include path, -lamdhip64) are
+    recorded above rather than patched in.
+  * The probe builds were removed after use: the two instrumented objects were deleted and
+    libggml-base/libllama rebuilt from the pristine tree, reproducing libggml-base e75f8cec05f14172…
+    and libllama 2718eddb45b64212… (the installed copy of libllama is 1c837a48cdeccf7f… because
+    cmake --install rewrites its RPATH). The instrumented pair is kept for reference under
+    probe/lib/ (libggml-base-probe…, libllama-probe…) together with the two probe sources.
+
+================================================================================
+APPENDIX A — AFTER MAIN'S FIX: THE EVENT PATH EXECUTES
+================================================================================
+This appendix supersedes the G4 section above, which describes the PRE-FIX state of the lane. The
+root causes I reported (23 x line 4320, 2 x line 4377) are fixed in the tree; nothing below reuses
+the old binaries. Tree HEAD e79db6050, working tree modified in four files (docs, runtime.cpp,
+ggml-backend-meta.cpp, ggml-cuda.cu) plus the overlay copy; hashes verified against the hand-off:
+  ggml/src/ggml-backend-meta.cpp        ae54d2b301c43526  (overlay/…/ggml-backend-meta.cpp identical)
+  ggml/src/ggml-cuda/ggml-cuda.cu       568ed7020759aa96
+  fork/tp5-compose/src/runtime.cpp      cff8b10b68c77ab3
+All builds under /home/kunweiz/work/vfs-build.lock + vfs-build-2.lock, all GPU legs under both GPU
+locks, one HIP process at a time, private 0700 dirs, no source byte changed by me.
+
+A.1 G2 — REBUILD OF THE THREE TUs
+    cmake --build <private>/upstream --target llama   (recompiles ggml-backend-meta.cpp and
+    ggml-cuda.cu, relinks libggml-base, libggml-hip, libggml, libllama)      BUILD-RC=0, 0 errors
+    cmake --install <private>/upstream                                        INSTALL-RC=0
+    cmake --build <private>/compose  (recompiles runtime.cpp, relinks)        COMPOSE-RC=0, 0 errors
+    Artifacts: libggml-hip.so.0.18.1 5a6942ae0ec28e04… (68,604,216 B; installed copy
+    3779bbc15c04559e… because install rewrites RPATH), libggml-base.so.0.18.1 31551514e30b2484…,
+    tq-tp5-compose ad8fc413e074b356… (252,104 B).
+
+A.1a OBJECT-LEVEL DELTA OF ggml-cuda.cu — the only real addition is the static constructor.
+    I compiled the pre-change file (git show HEAD:ggml/src/ggml-cuda/ggml-cuda.cu) into a private
+    object with the build dir's exact HIP flags and diffed symbol tables:
+      added   _ZL34ggml_backend_cuda_output_event_newP19ggml_backend_device   (local 't')
+              _GLOBAL__sub_I_ggml_cuda.cu, __hip_cuid_…/__hip_gpubin_handle_… (new TU content id)
+              .L.str.*, .LCPI*, GCC_except_table* — renumbered locals only
+      removed the same renumbered locals plus the old cuid and the copy's own
+              _GLOBAL__sub_I_ggml_cuda_head.cu (artifact of my file name)
+      no exported (T/D) symbol added or removed: the function stays static.
+    Strings: the single new content string is "ggml_backend_output_event_new" (0 occurrences in the
+    pre-change object, 1 in the new one); everything else differs only in label names and in the
+    source path of my copy.
+
+A.1b THE DEVICE INTERFACE IS STILL THE NULLPTR STUB.
+    objdump of libggml-hip.so.0.18.1 at _ZL34ggml_backend_cuda_device_event_newP19ggml_backend_device
+    (0x33b6618):  xor %eax,%eax ; ret   — still returns nullptr, so ggml_backend_sched sees no event
+    interface and cannot change any other graph's synchronization. The new constructor
+    (0x33b70d0) checks dev, compares the device iface pointer against the CUDA device's, and returns
+    0 for anything else.
+
+A.2 G4 — OFF (gate unset) vs ON (GGML_TP5_DW_COMPOSE_EVENT=1), same 2x32 legs as before
+    Both legs: rc=0, 64 logits rows captured (2 windows x 32 tokens).
+      logits.f32le: 0 differing bytes; per row 0/64 rows differ, 0/64 top1 differ.
+    ON receipt:
+      TP5_DW_COMPOSE_EVENT enabled=1 flag=GGML_TP5_DW_COMPOSE_EVENT windows=2
+      window=0 epochs=43 output_event_syncs=32 host_sync_replaced=32 fallback_no_output_barrier=0
+                 no_sync_logits_calls=32 no_output_epochs=11
+      window=1 epochs=44 output_event_syncs=32 host_sync_replaced=32 fallback_no_output_barrier=0
+                 no_sync_logits_calls=32 no_output_epochs=12
+    Every condition asked for holds: output_event_syncs == host_sync_replaced == 32 > 0;
+    fallback_no_output_barrier == 0; and output_event_syncs + no_output_epochs == epochs
+    (32+11=43, 32+12=44). The 11/12 no-output epochs are the prompt epochs with output_rows==0 that
+    the fix now routes around, and they keep the stock synchronize as intended.
+    OFF (gate unset) prints no receipt at all (0 TP5_DW_COMPOSE_EVENT lines) and its logits are
+    bitwise identical to ON's, so the gate still changes no number.
+    Same checks at 2x1 (predict=1): ON window0 epochs=12 syncs=1 replaced=1 fallback=0 no_sync=1
+    no_output=11 (1+11=12); window1 epochs=13 syncs=1 replaced=1 fallback=0 no_sync=1 no_output=12
+    (1+12=13).
+
+A.3 THE DEVICE EVENTS REALLY HAPPEN — rocprofv3 --hip-trace on the ON leg
+    Same 2x1 ON leg re-run under `rocprofv3 --hip-trace --output-format csv` (child rc=0, trace
+    finalized, 476 MB of hip_hip_api_trace.csv). Event-call counts:
+      hipEventCreateWithFlags 20   hipEventRecord 135   hipEventSynchronize 10
+      hipEventDestroy 20           hipEventQuery 2320319 (the relay tail poller)
+    Split by window thread (each window runs on its own thread):
+      thread 2630263 (window 0): 65 records, 5 creates, 5 syncs, 5 destroys
+      thread 2630264 (window 1): 70 records, 5 creates, 5 syncs, 5 destroys
+    The decomposition is exact and leaves nothing unexplained:
+      window 0: 12 epochs x 5 ranks = 60 relay tail records + 5 output-copy records = 65
+      window 1: 13 epochs x 5 ranks = 65 relay tail records + 5 output-copy records = 70
+      total 135 records; 10 creates, 10 syncs, 10 destroys = 5 child events per window, one per rank.
+    So each window creates one device event per contributing child rank, records it on that child's
+    stream after decode, synchronizes it before the logits row is read, and destroys it afterwards —
+    the record/wait pair is real device work on the five child devices, not a host-side counter.
+
+A.4 (c) OFF AFTER THE FIX vs OFF BEFORE THE FIX — the scheduler did not change
+    predict=1, gate unset, new build vs the pre-fix build's gate-0 leg: logits.f32le identical,
+    0 differing bytes (1,986,560 B each). Combined with A.1b (device iface still nullptr) this says
+    the change is confined to the output-copy path.
+
+A.5 OBSERVED, NO CONCLUSION DRAWN
+    Wall times: 2x32 OFF 76.2 s, 2x32 ON 230.6 s; 2x1 OFF 85.4 s, 2x1 ON 102.8 s. The host is still
+    in its post-reboot slowdown and this leg makes no timing claim; the ON/OFF difference at 2x32 is
+    recorded only so it is not lost.
+
+VERDICT DUALWIN G2 BUILD PASS, G3 INERT, G4 EVENT PATH EXECUTES (PASS) — with Main's fix the three TUs rebuild clean (libggml-hip 5a6942ae…, libggml-base 31551514…, compose ad8fc413…, 0 errors), the object delta of ggml-cuda.cu is exactly one new static ggml_backend_cuda_output_event_new plus the string "ggml_backend_output_event_new" with no exported symbol change and ggml_backend_cuda_device_event_new still `xor eax,eax; ret`, so the scheduler is untouched; the 2x32 ON and OFF legs are bitwise identical (0 of 64 rows differ, 0 top1 differ) and the ON receipt satisfies every condition (output_event_syncs == host_sync_replaced == 32 > 0, fallback_no_output_barrier == 0, output_event_syncs + no_output_epochs == epochs for both windows), and rocprofv3 --hip-trace shows the events are real device work on the five child ranks: 5 creates, 5 records, 5 syncs and 5 destroys per window thread, with the 135 records decomposing exactly into 125 relay tail records (25 epochs x 5 ranks) and 10 output-copy records; the post-fix OFF leg is also bitwise identical to the pre-fix OFF leg, confirming the scheduler did not change.

@@ -129,6 +129,21 @@ is confined to `GGML_TP5_DW_COMPOSE_EVENT`. `ggml_backend_meta_first_child_devic
 was removed with the peer layer because it had no remaining consumer in the
 tree.
 
+## Where the child events come from
+
+The HIP build is configured with `GGML_CUDA_NO_PEER_COPY`, which makes the
+child device's `event_new` return `nullptr` (`ggml-cuda.cu`). That keeps
+`ggml_backend_sched` on its synchronize fallback, and it must stay so. It also
+made every `output_record` fail at event creation, so the barrier never ran.
+
+When the device interface offers no event, `output_record` now asks the child's
+backend registry for `ggml_backend_output_event_new` through
+`ggml_backend_reg_get_proc_address`. The CUDA/HIP backend answers with a plain
+stream event (`hipEventDisableTiming`) on that device. The scheduler never calls
+this entry point, so its behaviour is unchanged. The event is freed,
+synchronized and recorded by the device's existing `event_free`,
+`event_synchronize` and the backend's `event_record`.
+
 ## Ownership, ordering and lifecycle
 
 - The events are owned by the Meta backend context (`output_copy_events`), one
@@ -175,9 +190,10 @@ window:
 |`host_sync_replaced`|same count under the contract name (one stock `llama_synchronize` skipped each)|
 |`fallback_no_output_barrier`|ON-path epochs that kept the stock synchronize because no sound output-copy barrier was available|
 |`no_sync_logits_calls`|logits rows resolved without a synchronizing getter|
+|`no_output_epochs`|epochs with no output row (prompt rows before the last one); they issue no logits copy, keep the stock synchronize and are not attempted|
 
 `output_event_syncs == host_sync_replaced` and
-`output_event_syncs + fallback_no_output_barrier == epochs` are structural
+`output_event_syncs + fallback_no_output_barrier + no_output_epochs == epochs` are structural
 identities of the current code. They are host call counts: they are not
 device-completion evidence, they do not prove the hardware stream mapping, and
 an absent receipt is not a zero count. The removed peer counters

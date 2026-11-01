@@ -1315,7 +1315,8 @@ run_result run(const options & requested) {
         // keep the stock synchronize because no sound output-copy barrier was
         // available. None of these is device-completion evidence.
         std::uint64_t output_event_syncs = 0, host_sync_replaced = 0,
-                      fallback_no_output_barrier = 0, no_sync_logits_calls = 0;
+                      fallback_no_output_barrier = 0, no_sync_logits_calls = 0,
+                      no_output_epochs = 0;
     };
     std::vector<dw_compose_event_state> dw_compose_events;
     if (dw_compose_event_req && opts.execution == mode::relay) {
@@ -1488,10 +1489,19 @@ run_result run(const options & requested) {
                         // completion proof for the logits read — the relay's
                         // finished/retired counters do not cover the scheduler's
                         // D2H copy and are never substituted for it.
+                        // An epoch with no output row (prompt rows before the
+                        // last one) builds an empty logits tensor and issues no
+                        // logits D2H copy, so there is no copy for an event to
+                        // follow. It keeps the stock synchronize and is counted
+                        // apart from the fallback, which stays reserved for
+                        // epochs whose logits really needed a barrier.
+                        const bool dw_compose_epoch =
+                            dw_compose_event_req && wi < dw_compose_events.size() && output_rows > 0;
+                        if (dw_compose_event_req && wi < dw_compose_events.size() && output_rows == 0) {
+                            ++dw_compose_events[wi].no_output_epochs;
+                        }
                         const std::size_t dw_copy_streams =
-                            (dw_compose_event_req && wi < dw_compose_events.size()) ?
-                                llama_tp5_output_copy_record(ctx) :
-                                0;
+                            dw_compose_epoch ? llama_tp5_output_copy_record(ctx) : 0;
                         const bool dw_output_barrier = dw_copy_streams > 0;
                         const auto wait_start = now_ns();
                         const float * single_output_logits = nullptr;
@@ -1516,7 +1526,7 @@ run_result run(const options & requested) {
                         // so the copies complete while the host services the
                         // relay instead of blocking first.
                         if (!dw_output_barrier) {
-                            if (dw_compose_event_req && wi < dw_compose_events.size()) {
+                            if (dw_compose_epoch) {
                                 // Gate ON but no sound output barrier: keep the
                                 // exact stock synchronize, fail-closed, counted.
                                 // No part of this epoch is proven readable by an
@@ -1797,13 +1807,15 @@ run_result run(const options & requested) {
             std::fprintf(stderr,
                 "TP5_DW_COMPOSE_EVENT window=%u epochs=%llu"
                 " output_event_syncs=%llu host_sync_replaced=%llu"
-                " fallback_no_output_barrier=%llu no_sync_logits_calls=%llu\n",
+                " fallback_no_output_barrier=%llu no_sync_logits_calls=%llu"
+                " no_output_epochs=%llu\n",
                 unsigned(wi),
                 (unsigned long long)result.windows[wi].decode_calls,
                 (unsigned long long)dw_be.output_event_syncs,
                 (unsigned long long)dw_be.host_sync_replaced,
                 (unsigned long long)dw_be.fallback_no_output_barrier,
-                (unsigned long long)dw_be.no_sync_logits_calls);
+                (unsigned long long)dw_be.no_sync_logits_calls,
+                (unsigned long long)dw_be.no_output_epochs);
         }
     }
     contexts.clear();

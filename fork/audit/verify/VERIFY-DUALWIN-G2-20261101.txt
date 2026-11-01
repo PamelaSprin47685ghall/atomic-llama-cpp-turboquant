@@ -1,0 +1,68 @@
+DUALWIN G2 — HIP incremental build of the dual-window relay candidate, 2026-11-01
+================================================================================
+Executor: DevopsM3Gpu. CPU-only; no GPU leg was run (the host has a persistent post-reboot slowdown,
+so any timing would be meaningless). Both VFS build locks held for the build
+(/home/kunweiz/work/vfs-build.lock, vfs-build-2.lock, 12:16:58-12:17:16). Private dir
+/home/kunweiz/work/lead-fa-ncols2-g2-verify-20261031/dualwin-g2-20261101/ (0700). The source tree was not modified.
+
+1) FROZEN STATE
+---------------
+  tree      /home/kunweiz/work/merge-dualwin-20261031
+  HEAD      e79db60501d12d9f7606d132f8e6fdebc14bd84f  "dualwin-event: candidate snapshot 20261101"
+  status    clean (git status --porcelain empty)
+  The lane's own change set for this G2 is the ggml part of HEAD vs 5bbdaddf0
+  ("Preserve dual-window device wait candidate"):
+      ggml/include/ggml-backend.h         +35
+      ggml/src/ggml-backend-impl.h        +4
+      ggml/src/ggml-backend-meta.cpp      +149/-6
+      ggml/src/ggml-cuda/relay.hip        +26/-3
+  The one HIP translation unit in that set is relay.hip:
+      pre-change (5bbdaddf0) ac13937177faa06bda6a7f1abecdae6efab787732eb5a39d709c93264aeb1ba6
+      snapshot   (e79db6050) 1badd280b9a826d47182182a0058c9a0a4cdda362c2e9f8ee44b0f414fe3d389
+  (FROZEN-2.txt in the private dir lists both hashes.)
+
+2) BUILD — the lane's own recipes, privately redirected
+------------------------------------------------------
+  The lane ships no argv for libggml-hip; the recorded recipes used are the ones the
+  downstream lanes were built with (mtp-async-prewarm-draft-8x2-20261027/build/
+  relay-compile-pw.argv.json and hip-link-pw.argv.json), with source/object/dep/output
+  substituted. build_dualwin.py, logs in logs/.
+      relay-compile-prev  rc 0   5.4 s   relay-compile-head  rc 0   5.2 s
+      hip-link-prev       rc 0   0.3 s   hip-link-head       rc 0   0.1 s
+      relay-compile-v3fctl rc 0  5.7 s   hip-link-v3fctl     rc 0   0.1 s
+  Compile diagnostics: zero lines containing "error:" in every log.
+      libggml-hip-prev.so  68,638,040 B  1251795e021b7bb9dc90b2c195752c4fa9a8fe66dd8d8558ae37f5619a4b4e61
+      libggml-hip-head.so  68,639,120 B  a901be26e8aa55a1ae892910da9287476fbc738c3d7d979ca93ed03db305842a
+  Recipe fidelity: the same recipes applied to the unmodified relay.v3f.hip produce a library whose
+  .text, .rodata and .data sections are byte-identical to the shipped libs-v3f control
+  (dc236e2a…); only .hip_fatbin differs, as it does for every rebuild of this tree (CUID and
+  embedded paths). So the compiler settings reproduce the shipped control exactly; the whole-file
+  sha256 does not match, and that is expected, not a deviation.
+
+3) SYMBOLS — host and device, prev vs snapshot
+----------------------------------------------
+  Host symbols (nm -C, defined T/t/D/d): 70 before, 70 after; the sets are identical except the
+  compiler-generated CUID/GPUBIN handle names:
+      __hip_cuid_a471c3bb3aba690d  -> __hip_cuid_aa3ab1e7f229cc35
+      __hip_gpubin_handle_a471c3bb3aba690d -> __hip_gpubin_handle_aa3ab1e7f229cc35
+  No function added or removed. The change set is inside submit()/describe_frame() of relay.hip
+  (diag timestamps, a changed/hit flag, a diag_finish lambda, the 4x element_capacity) and does
+  not add an entry point.
+  Device: 16 kernel stubs before and after, same names. Device image size 50,858,112 B in both.
+  A byte comparison of the two device images shows exactly one differing region,
+  8,704,078..8,725,720 (21,643 B), which is the bundle's embedded host object (its size field moves
+  0x42e0 -> 0x44f8) — the device code after it is byte-identical (tail comparison true). So the
+  snapshot changed no kernel instruction; the size difference of the .so is the host object.
+  Against the control (libs-v3f, relay.v3f.hip): 83 host symbols vs 70, 16 device stubs both;
+  the extra 13 host symbols are the hipspans/dw instrumentation the v3f lane carries, not dualwin.
+
+4) SCOPE
+--------
+  Established: both revisions of relay.hip compile with the lane's recipes (0 errors) and link;
+  the snapshot adds no host entry point and no device kernel; its device code is byte-identical to
+  the pre-change build; the recipes reproduce the shipped control's code sections exactly.
+  NOT established: any behaviour or timing (no GPU leg was run, by instruction), and the
+  non-relay TUs of the change set (ggml-backend-meta.cpp, ggml-backend.h, ggml-backend-impl.h) are
+  host code outside libggml-hip and were not built here.
+
+VERDICT DUALWIN G2 BUILD PASS (relay.hip prev rc0/head rc0, 0 errors, host symbol set identical apart from the CUID handle names, 16 device stubs unchanged, device code byte-identical, recipe reproduces the shipped control's .text/.rodata/.data exactly; behaviour and timing untested by instruction)
