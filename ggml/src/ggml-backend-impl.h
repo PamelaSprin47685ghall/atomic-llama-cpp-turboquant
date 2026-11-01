@@ -229,6 +229,16 @@ extern "C" {
         void * context;
     };
 
+    //
+    // Scheduler internals
+    //
+
+    // The allocator the scheduler plans and replays with. Read-only, for in-tree
+    // callers that must read back which plan the scheduler holds
+    // (ggml_gallocr_plan_identity, ggml-impl.h). The scheduler keeps ownership
+    // and replaces the allocator in ggml_backend_sched_release_buffers.
+    GGML_API ggml_gallocr_t ggml_backend_sched_get_galloc(ggml_backend_sched_t sched);
+
     // Add backend dynamic loading support to the backend
 
     // Initialize the backend

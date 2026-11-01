@@ -1,0 +1,324 @@
+rev10: contract driver now follows the production loader order
+
+File changed (only this one): examples/tp5-router-verify/router-fixture-contract.cpp
+
+Why: rev9 reached load_hparams, then called load_tensors without load_vocab. The production
+path (src/llama.cpp:337-356) is
+    load_hparams -> (CLIP guard) -> load_vocab -> load_stats -> print_info -> load_tensors
+and load_vocab is the pass that reads qwen4exp.vocab_size. Without it the model kept
+n_vocab == 0, so load_arch_tensors asked for token_embd [8, 0] -- the rev9 contract failure
+(lead-router-rope-verify-20261031/VERIFY-ROUTER-REV9-CONTRACT.txt). The fixture's GGUF already
+carries qwen4exp.vocab_size = 128; nothing in the file needed to change.
+
+What the checker does now:
+1. model = llama_model_create(LLM_ARCH_QWEN4EXP, mparams)  [unchanged from rev9]
+2. load_hparams(ml)                      -> problems labelled "hparams:"
+3. load_vocab(ml); load_stats(ml)        -> problems labelled "vocab:"; additionally fails if
+                                            llama_vocab_n_tokens(llama_model_get_vocab(&model))
+                                            is still 0 (an empty vocab is a failure, not a detail)
+4. load_tensors(ml)                      -> only when (2) and (3) succeeded; problems labelled
+                                            "tensors:"
+5. binding/shape checks over the model's own tensors
+6. per-tensor F32 / non-empty checks on the file (independent of the loader passes)
+
+Release paths: every early return frees the gguf context and, once created, the model
+(delete model_raw; llama_model has a virtual destructor; no tensor data was materialized under
+no_alloc). The normal path runs that teardown once, model first and the gguf context last,
+because llama_model_loader holds a non-owning pointer to it. No double free, no leak, and no
+path reports success after a failed pass.
+
+Nothing else changed: no production source, no patch, no change to the fixture's metadata or
+tensors, no change to the verifier or to run-router-cpu.sh's criteria. Docs updated:
+ROUTER_SCRATCH_CPU_FIXTURE.md §6/§7 and HANDOFF-ROUTER-CPU-FIXTURE-REV9.txt.
+
+For Devops: rerun the frozen build + run-router-cpu.sh. Expected from the generator:
+  FIXTURE contract problems=0 meta_checked=5 tensors_checked=47
+(5 model-level + 14 per layer x 3 layers; the gate_up_exps merge check is separate) and then
+the OFF/ON legs. Any remaining disagreement prints as
+`FIXTURE contract_problem <pass>: <loader message>`.
+
+rev10b (same file): the SSM block was still wrong after rev10's loader-order fix. The loader
+reported blk.0.attn_qkv expected [8,8] got [8,6]; production computes
+value_dim = head_v_dim * n_v_heads = ssm_d_state * ssm_dt_rank = 4, the generator used
+value_dim = SSM_RANK = 2 (so the wrong shape was only visible once the loader compared it).
+Fixed by deriving every SSM dimension from qwen4exp.cpp:319-325:
+  head_k_dim = head_v_dim = SSM_STATE (2), n_k_heads = N_HEAD_KV (1), n_v_heads = SSM_RANK (2)
+  key_dim = 2, value_dim = 4, conv_dim = 2*2+4 = 8
+  attn_qkv [8, 8], attn_gate [8, 4], ssm_conv1d [2, 8], ssm_dt/ssm_a [2],
+  ssm_beta/ssm_alpha [8, 2], ssm_norm [2], ssm_out [4, 8].
+Metadata unchanged (ssm.state_size 2, time_step_rank 2, group_count 1, inner_size 4); with
+those, hparams.n_embd_s() = ssm_d_state*ssm_d_inner = 8, matching the state the graph reshapes.
+No other file touched.
+
+rev10c (same file + contract): the loader then rejected blk.2.attn_qkv.weight. The NextN block
+is structurally a trunk block but is past the trunk, so is_recr/is_ple are false and
+qwen4exp.cpp:337-349 gives it the FULL-ATTENTION branch, not the gated-delta-net one.
+Added for block 2: attn_qkv [8, 2*8+8+8] = [8, 32] (create_tensor_qkv: q+gate interleaved,
+then k, then v; one head, one kv head, n_embd_head_k = 8), attn_output [8, 8],
+attn_q_norm/attn_k_norm [8], indexer.q_proj [8, 1*2], indexer.k_proj [8, 2],
+indexer.q_norm/indexer.k_norm [2]; plus the existing HC/MoE/shared-expert set and
+nextn.enorm [8] / nextn.hnorm [32] / nextn.eh_proj [16, 8]. Metadata gained explicit
+attention.key_length and attention.value_length (= 8) and a named indexer head count (1), so
+n_embd_k_gqa/n_embd_v_gqa cannot pick up an unexpected default. The contract checker now
+validates per layer by branch (is_recr -> 9 GDN tensors; else -> 8 full-attention tensors;
+NextN -> additionally the 3 head tensors) instead of one merged list, so a wrong branch shows up
+as a named unbound tensor.
+
+rev10d (contract only): rev10c did not compile -- `&llama_layer::nextn.enorm` is not a
+member-pointer form (nextn is an embedded llama_layer_nextn value, not a base subobject).
+The NextN checks now use `struct ggml_tensor * llama_layer_nextn::*` in their own table and
+apply it as `layer.nextn.*(f.ptr)`, so the binding check and its
+`blk.N.<name> is unbound (NextN head)` message are unchanged. The per_layer and
+recr_only/full_attn_only tables keep `llama_layer::*` pointers and `layer.*(f.ptr)`.
+
+rev10e (fixture metadata + contract):
+- attention.recurrent_layers was [1,1,1]; the loader uses that array verbatim when present
+  (qwen4exp.cpp:235-243), so blk.2 was treated as recurrent and the loader asked for the GDN
+  attn_qkv [8,8] instead of the full-attention [8,32]. The fixture now writes [1,1,0]
+  (trunk recurrent, NextN full attention), which is also what the interval fallback would
+  compute for i >= n_layer().
+- the contract loader/model now run with load_mtp = true (block_count 3 with
+  nextn_predict_layers 1 is an MTP checkpoint; load_arch_tensors marks the NextN tensors
+  TENSOR_SKIP otherwise), and the contract asserts that exactly n_layer() blocks are recurrent,
+  so a wrong recurrent_layers array is named instead of failing on a shape later.
+
+rev10f (fixture probe + verifier plan leg): ggml_mul_mat_id asserts
+ids->ne[1] == b->ne[2]; both graphs built b as 2-D {8, rows}, so b->ne[2] was 1 and the probe
+aborted. The production layout (llama-graph.cpp:2203: cur reshaped to [n_embd, 1, n_tokens],
+ids [n_expert_used, n_tokens]) is now used in both: x is a 3-D [n_embd, 1, rows] input, the
+router MUL_MAT / shared-expert MUL_MAT take a 2-D reshape of it exactly as build_moe_ffn does,
+and MUL_MAT_ID takes the 3-D input. Fill sizes come from ggml_nelements on the tensors, so the
+3-D inputs are filled completely. No production code touched, no gate relaxed.
+
+rev10g (verifier + driver only): L1 llama_decode aborts in
+llm_graph_input_mem_hybrid::set_input (llama-graph.cpp:1129-1131) driving the hybrid ATTENTION
+context into llama_kv_cache::set_input_k_idxs, whose GGML_ASSERT(buffer) fails because a
+qwen4exp decode graph with recurrent-only trunk layers consumes no attention input and the
+scheduler leaves k_idxs/v_idxs/kq_mask unallocated. That is a production defect outside the
+router candidate (the same class of guard already exists for the mask at llama-graph.cpp:516);
+the production fix is spelled out in ROUTER_SCRATCH_CPU_FIXTURE.md §8 and was NOT applied.
+Fixture side: the verifier gained --no-model, which prints
+VERIFY_MODEL_LEG skipped=1 reason=... and runs only L2. run-router-cpu.sh defaults to
+MODEL_LEG=1 (fail-closed, real model leg); MODEL_LEG=0 is diagnostic only and ends with exit 3,
+never CRITERIA MET. No assert was bypassed, no criterion relaxed, no output faked.
+
+rev10i: the first version of that fix gated on buffer == NULL, which cannot tell "unused" from
+"allocation failed". Rewritten as an explicit consumption relation, in a separate worktree:
+/home/kunweiz/work/router-hybrid-input-fix-20261031/ (README.txt, llama-graph.cpp,
+llama-graph.h).
+
+- llm_graph_result::set_inputs computes, from the built graph, whether the hybrid attention
+  k_idxs/v_idxs are read by any node (graph_tensor_consumed: t among a node's sources) and
+  stores that on the input before set_input runs.
+- llm_graph_input_mem_hybrid::set_input feeds k_idxs/v_idxs and the reader inputs only when that
+  relation says they are consumed; when consumed it GGML_ASSERTs the tensors are allocated, so a
+  consumed-and-unallocated input aborts (fail closed) instead of being skipped.
+- consistency is proved, not assumed: k/v consumption disagreeing aborts; readers present with no
+  consumed attention key aborts. kq_mask/k_rot/v_rot and the recurrent s_copy path untouched.
+- per-input rationale is in the README (k_idxs: store/inject; v_idxs: same layer, stored with k;
+  readers: index stored KV cells, so they belong to a graph that writes attention keys).
+Must be applied to BOTH the candidate and the 4496493dd reference tree so it cancels out.
+
+rev10j (after SchedulerReview): the first consumption version scanned the graph in set_inputs,
+i.e. after sched_alloc_graph, where pass 5 has already replaced node->src[] with per-backend
+copies -- object identity would then miss a copied input (silent wrong data) or abort wrongly.
+Rewritten: the relation is computed once per graph result in set_outputs (end of build_graph,
+before any split) with graph_tensor_is_dependency (direct src, plus view/reshape/permute/
+transpose storage via src->view_src); set_input consumes only the cached flags, feeds each of
+k_idxs/v_idxs/kq_mask/k_rot/v_rot independently, asserts allocated-when-consumed (fail closed),
+feeds readers exactly when the attention path runs, and no longer requires k/v to agree (K-only /
+V-only layouts allowed). No full-graph scan in the decode path. set_inputs is a plain loop again.
+mem_hybrid_k (MLA hybrids, unguarded) and mem_hybrid_iswa (allocation-only guard) are NOT
+covered by this change and are not fixed; they need their own relation record in those
+architectures' own change.
+Rev10k: the switch had a `GGML_OP_VIEW_3D` case that does not exist in this tree's enum (3-D
+views are GGML_OP_VIEW) -- confirmed compile error, removed; the remaining cases are VIEW /
+RESHAPE / PERMUTE / TRANSPOSE.
+Rev10l: the second abort was llm_graph_input_pos (same root cause, different input class). The
+fix is now uniform instead of per class: set_graph_marks() runs at the end of build_graph and
+marks every input used/not-used from the completed graph (before pass 5 copies node->src[]);
+set_inputs feeds only marked inputs; llm_graph_input_rs, the three hybrid wrappers and
+llm_graph_input_sampling override graph_used() because their set_input also does memory/sampler
+bookkeeping; each input fails closed if a tensor it needs exists but is unallocated, and skips
+tensors the graph does not read. mem_hybrid_k (MLA) and mem_hybrid_iswa are now covered by the
+same relation as mem_hybrid. One O(nodes) pass per graph build, no per-step scan.
+Rev10m: attn_kv_msa's self_k_idxs_idx got its own recorded relation
+(attn_k_idxs_idx_consumed, set in set_outputs from the completed graph) instead of "assert buffer
+whenever non-NULL", which would abort when the base attention tensors are consumed but the index
+stream is not; it is skipped when unconsumed and asserted allocated when consumed. The input's
+used-mark now also counts the idx tensor. rs::graph_used's comment was corrected to match the real
+side effects (consume_replay_len must run once per decode; the s_copy path only writes when that
+tensor exists), with the unused-boundary stated: no pending replay / invalid memory context ->
+replay_len 0 -> s_copy unallocated -> the copy is skipped and consume_replay_len is a no-op.
+Rev10n: per reviewer + Devops compile error, the fix no longer assumes one interface for all
+classes. llama-graph.cpp:1568 used llm_graph_input_attn_k_dsa::self_k_idxs / self_kq_mask, which that
+class does not have; dsa keeps self_k_idxs_mla / self_kq_mask_mla / self_k_idxs_lid /
+self_kq_mask_lid / self_k_rot_lid and is now driven by its own bits. Each affected class got its own
+bits and set_input guards checked against its real members: attn_kv, attn_kv_msa (own base_* bits +
+separate idx bit; the parent's aggregate mark is never consulted), attn_kv_iswa, attn_k_iswa
+(k-only, no v tensors), attn_k_dsa, attn_k, plus mem_hybrid / mem_hybrid_k / mem_hybrid_iswa.
+rs got per-tensor bits (s_copy/s_copy_main/s_copy_extra): its s_copy pointer is always non-null, so
+`if (s_copy)` proves nothing; only s_copy_consumed decides, consumed-but-unallocated aborts, and
+consume_replay_len() still runs every decode per its contract. A static member-vs-cast check over
+all dynamic_cast-bound pointer uses in llama-graph.cpp reports no mismatches.
+Rev10o: (a) an earlier draft of mem_hybrid_k's set_input referenced attn_v_idxs_consumed /
+self_v_idxs, which that class does not have (K-only) -- removed; (b) all three hybrid wrappers
+used `if (inp_rs->s_copy)` + host-buffer assert, but s_copy is always created, so that test proves
+nothing: they now call one shared feed_rs_copy() helper that consults the recorded
+s_copy_consumed bit, skips when unconsumed and asserts s_copy && s_copy->buffer when consumed;
+consume_replay_len() stays unconditional (per-decode side effect, separate from the copy);
+(c) s_copy_main/s_copy_extra are views of s_copy -- their write-only bits were dropped. The
+wrappers now also record their wrapped rs input's relation in set_outputs.
+Rev10p: graph_tensor_is_dependency followed a node's op (VIEW/RESHAPE/...) to inspect src->view_src.
+That is wrong for the real recurrent layout: build_rs_inp_impl makes s_copy_main/s_copy_extra with
+ggml_view_1d(s_copy), and build_rs feeds them to GET_ROWS as src[1]; ggml_visit_parents_graph puts
+every tensor with op != NONE (VIEW included) into cgraph->nodes, so the consumer node is GET_ROWS
+and its src is the view, not the base. The old check would report s_copy "not consumed", the fix
+would skip the fill and the graph would gather stale indices. Now: a source consumes t if it is t
+or its view_src chain (iterative, capped, no allocation) contains t -- independent of the node's
+op. Repro code: router-hybrid-input-fix-20261031/rs_view_selftest.{h,cpp} (scenario mirroring
+s_copy/view/GET_ROWS/CPY, a depth-2 view, and an unreachable tensor).
+Rev10q: rs_view_selftest strengthened: (a) a dedicated chain_base reachable ONLY through
+view(view(base)) with an assertion that it is consumed (a one-level walk fails it) plus a check
+that the chain really is two views deep; (b) rs_feed_selftest(): pure decision table
+(unconsumed->skip, consumed+unallocated->fail, consumed+allocated->copy) and a real
+gallocr-placed host buffer where an allocated s_copy gets every row written, an unconsumed one is
+untouched, and consumed-but-unallocated reports FEED_FAIL instead of aborting so the case is
+runnable. Original cases kept.
+Rev10r (real-delivery tree, after Devops 7e838695):
+- router-hybrid-input-fix-20261031/llama-graph.cpp: the three feed_rs_copy calls passed a
+  std::unique_ptr<llm_graph_input_rs> to a helper taking the raw pointer; they now pass
+  inp_rs.get() (Devops had to patch this locally to link).
+- examples/tp5-router-verify/tp5-router-verify.cpp (verifier's own plan graph, not the library):
+  ggml_add was given a 3-D routed tensor [n_ff, 10, rows] and a 2-D shared tensor [n_ff, rows],
+  which fails ggml_can_repeat(b, a) on ne[1] = 10 vs 1. It now reduces exactly like
+  build_moe_ffn: permute(1,0,2,3) -> cont -> sum_rows -> [1, n_ff, rows] -> reshape_2d
+  [n_ff, rows], then adds the shared branch (same shape). Output is still the real computed
+  tensor [n_ff, rows], non-empty, hashed from its bytes; no gate relaxed.
+Rev10s (retain leg, after rev10r L1 passed): the plan leg was structurally unable to materialize
+retention. It called ggml_gallocr_alloc_graph while the graph inputs were still unallocated; a node
+behind a view only gets storage from ggml_backend_view_init, which needs its view_src to have a
+buffer, so the whole router chain stayed NULL, the pointer audit skipped everything
+(other_allocs=0) while retained_bytes came from tensor sizes, and audit_clean was 0 -> the ON leg
+was indistinguishable from OFF. Fixed in examples/tp5-router-verify/tp5-router-verify.cpp:
+- inputs are allocated on the plan buffer BEFORE ggml_gallocr_alloc_graph, with the tallocr cursor
+  pushed past the plan extent (ggml_gallocr_get_buffer_size) so no input lands inside the retained
+  block; single allocation of plan+inputs;
+- the audit reports materialized= (data != NULL and view_src == NULL); if the retained tensor is
+  not materialized the leg is reported inconclusive and audit_clean stays 0 (no silent pass);
+- reuses_retained is its own field (in-place continuation), retained_bytes no longer inferred from
+  that comparison, and both the per-leg line and VERIFY_PLAN_SUMMARY print materialized.
+- run-router-cpu.sh fails the ON leg when materialized=0.
+Allocator side is unchanged and already correct: node_allocs[].dst.no_reuse comes from the node
+flag at reserve time, ggml_gallocr_needs_realloc compares it on alloc_graph, and
+ggml_gallocr_free_node keeps NO_REUSE nodes live; that path only becomes observable once the node
+owns storage, which is what this harness fix provides. No audit rule was relaxed.
+Rev10t (after independent review of the L2 leg):
+- L2 rewritten on the real allocator API: ggml_gallocr_reserve_n_size measures, then
+  ggml_gallocr_reserve_n + ggml_gallocr_alloc_graph run with the allocator owning its own buffer.
+  Removed the plan_bytes+leaves arithmetic, the hardcoded 64-byte padding, the tallocr offset bump
+  and the second buffer; inputs are now allocated by that same reserve, so view chains resolve and
+  nothing is filled before allocation.
+- L2 audits pg.graph->nodes (the built graph), not a hand-written node list.
+- Synthetic graph made consumer-equivalent to build_moe_ffn: ids come straight from ggml_top_k; the
+  dead argsort/weights nodes are gone.
+- reuses_retained (any sharing of the retained extent, exact or partial) is now a FAIL: NO_REUSE
+  forbids sharing with any other allocation.
+- New L1 real-graph gate (TP5_VERIFY_PRIVATE, in-tree builds only): audits the context's
+  preallocated decode graph (ctx->get_gf_res_reserve()->get_gf()) -- the model's own marks, owners
+  and addresses -- and the driver fails closed if there is no such line, if OFF shows any retained
+  tensor, or if ON does not show n_retained=2 with shared=0.
+- Docs: ROUTER_SCRATCH_CPU_FIXTURE.md §9 now states explicitly that L2 is synthetic support and the
+  real-graph gate is the only promotable evidence. No audit rule was relaxed anywhere.
+Rev10z.1 (evidence hygiene, no gate change): C4b's audit regexes no longer anchor the line start
+(GGML_LOG_INFO adds nothing through ggml_log_internal, but llama installs its own log handler that
+prefixes; verified in ggml.c:286-318), and a `retention audit clean (size)` line on the ON leg is now a
+hard FAIL (a retained set in the measurement reserve means the mark reached a graph that never runs).
+OFF and 1-row legs now require the positive `enabled (reserve): 0 retained allocations` line and forbid
+clean lines. Regexes do not gate: C4b still sets fail=1 unconditionally (UNPROVEN).
+Rev11 (rc=127 fix, script only): Devops saw all four legs rc=127 under `build-slot` while the same argv run
+directly returned 0; build-slot got its lock and then failed inside `setsid timeout` to exec the binary, and
+its 127 replaced the tool's status. run-router-cpu.sh no longer routes the fixture/verifier through build-slot
+(tools are executed directly, argv is absolute, shells are never used), a non-zero tool exit now stops the run
+with `RESULT: FAIL - leg '<tag>' did not run` before any criterion reads its outputs, `require_file` guards
+every derived check (fixture output, each leg's stdout, the 1-row leg, VERIFY_PLAN_SUMMARY), C1/C2 require
+actual VERIFY_ROWS lines before reporting "identical", and argv parsing is strict (2 args, absolute bin/out,
+exit 64 otherwise). Documented exit codes: 0 met / 1 FAIL / 3 diagnostic / 64 usage / 2 missing binary.
+Rev10z.3 (triage only): C6 now also echoes the allocator's verbatim violation lines
+(`retained tensor '<name>' [<op>] overlaps|is a view ...`, buffer id is a galloc id not a device), so the
+allocator owner can diagnose without re-running. No verdict change: same hard failure, same UNPROVEN.
+Rev10z.2 (correction of rev10z.1): the `clean (size)` hard FAIL is withdrawn -- a measurement reserve has
+the same structure, so structural marks there are legitimate and merely carry no evidentiary weight.
+OFF/1-row zero-line presence is likewise a diagnostic about whatever reserve the audit actually saw; its
+absence yields UNPROVEN, not a semantic failure. C4b's only remaining hard failure besides the
+unconditional UNPROVEN verdict is an allocator contract violation (overlaps / view-as-retained), which is
+functional regardless of which graph was audited.
+Rev10z (single-owner freeze): examples/tp5-router-verify/ files, ggml/src/ggml-alloc.c and
+src/models/qwen4exp.cpp are now owned by one agent (RouterFixture); RouterEngineer handed off and stopped
+writing them, materials go to router-engineer-notes/ (not in the build). Static cleanup in this revision:
+the residual VERIFY_REAL wording no longer calls the allocator audit authoritative
+(allocator_audit=necessary_not_sufficient promotion=unproven); run-router-cpu.sh lost the leftover cb_eval
+gate block from the rev10v design (C4b is diagnostics + unconditional UNPROVEN); C6 no longer expects a
+GGML_LOG_DEBUG line and checks violation lines instead; the script header states C4b fails by design;
+CMakeLists.txt documents the header-only diag dependency instead of listing it as a source. Frozen file
+inventory with sha256 is in the rev10z message to Main.
+Rev10y (reverts part of rev10x): the phase tag added in rev10x was a test-driven public API plus an
+unproven identity claim ("the inputs_set reserve is the decode graph"), so it is withdrawn. Reverted:
+enum ggml_gallocr_phase + ggml_gallocr_set_phase/get_phase (ggml-alloc.h), ggml_backend_sched_get_galloc
+(ggml-backend.h/.cpp), the phase sets and the ggml-alloc.h include in llama-context.cpp graph_reserve
+(restored to the original else-if branch), and the (entry/phase) formatting in the allocator audit.
+Kept: RouterEngineer's entry, rows= and nodes= fields and the zero-retained "enabled" line. C4b in
+run-router-cpu.sh now prints `retention audit` lines as diagnostics and unconditionally fails the leg
+(UNPROVEN): no source ties an audited reserve to the graph llama_decode submits (gf_res_prev private,
+gf_res_reserve is sizing, decode reusing a plan prints nothing, reserve_n_size shares the entry,
+rows/nodes identify shape not owner). Needs an owner-side statement from llama_context (an accessor the
+project is willing to ship, or an in-tree audit where gf_res_prev is visible) before promotion.
+Rev10x (design draft only, code withdrawn): C4b accepts only audit lines from the phase that corresponds to the graph the decode submits.
+RouterEngineer added entry/rows/nodes to the audit line and a zero-retained "enabled" line; adding shape
+data alone does not attribute a line to the decode plan, so the allocator now carries a declared phase:
+enum ggml_gallocr_phase {UNKNOWN, INPUTS_UNSET, INPUTS_SET} + ggml_gallocr_set_phase/get_phase
+(ggml-alloc.h), ggml_backend_sched_get_galloc (ggml-backend.h), and llama_context::graph_reserve sets
+INPUTS_UNSET for split/sizing reserves and INPUTS_SET right before ggml_backend_sched_reserve (after
+res->set_inputs()), clearing to UNKNOWN around it. Audit lines print (entry/phase), e.g.
+`retention audit clean (reserve/inputs_set): N retained allocations, B bytes, rows=R, nodes=M`.
+C4b requires reserve/inputs_set lines only, N == 2*rows with 2<=rows<=4 and N in {2,4,6,8}; OFF and
+1-row legs must show the zero line with the same phase; (size)/(inputs_unset) lines are shown and
+ignored; (reserve/unknown) fails. Decode reusing the reserved plan prints nothing, so silence is never a
+failure. Residual, stated in the doc: "decode submits the inputs_set plan" is by construction, not
+observed, and cb_eval is not used to close it.
+Rev10w: C4b demoted the cb_eval observer and moved the gate to the production allocator audit.
+Source-confirmed limits of cb_eval (ggml-backend.cpp:1980 disables defer_input_flush when a callback is
+installed, and the callback branch synchronizes per split; the callback iterates split->graph only, so
+cross-backend copies in sched->graph are invisible; llama-context.cpp:216-218 rejects cb_eval on the
+relay path). C4b now requires on the ON leg a well-formed `retention audit clean: N retained
+allocations, B bytes` line with N in {2,4,6,8} (2 trunk layers x rows 1..4), and no
+overlap/view-violation line; OFF and 1-row legs must print no clean line. cb_eval counts are printed as
+triage only and cannot pass the leg. Docs: ROUTER_SCRATCH_CPU_FIXTURE.md section 9 rewritten around the
+allocator audit, with the "plan, not executed graph" caveat (reserve_n_size also enters the same impl
+at :1083) and the missing per-reserve attribution field. Open questions sent to the allocator owner:
+nodes=%d or ne[1] in the clean line, an explicit "enabled, 0 retained allocations" line, and the
+reserve_n_size entry.
+Rev10v: cb_eval owner-side evidence wired in (RouterEngineer's tp5-router-scratch-diag.h). The
+verifier passes cb_eval/cb_eval_user_data into llama_context_params and prints VERIFY_REAL_DIAG
+after VERIFY_REAL. run-router-cpu.sh: scrubs GGML_TP5_ROUTER_SCRATCH_DIAG{,_FILE} by default, sets
+DIAG=1 with a per-leg DIAG_FILE for off_1/on_1/on_n1, and C4b now judges VERIFY_REAL_DIAG
+(enabled=1, retain_hits=8, retain_steps=4, disjoint==retain_hits, overlaps=0, unresolved=0,
+fire_steps==retain_steps, n1_shape=0, plus the header invariant retain_hits == disjoint + overlaps
++ unresolved; OFF retain_hits=0; 1-row leg retain_hits=0). Counters are cumulative over the context,
+so 8/4 is the all-steps total; 12/16 would be an attribution finding. Not claimed: GPU fusion
+dispatch, gallocr plan/flag consistency.
+Rev10u: the L1 real-graph audit introduced in rev10t was wrong to use
+ctx->get_gf_res_reserve(). Source check of llama_context ownership: the executed graph is
+gf_res_prev (llama-context.cpp:2557, reuse :1976/:4777, rebuilt per ubatch); gf_res_reserve
+(:3782) is the reserve-sized graph built only to size scheduler buffers, with its own ubatch and
+ggml context. struct llama_context / llm_graph_result are private and llama.h exposes no
+ggml_cgraph accessor. The reserve graph audit was therefore removed (helper deleted, private
+include and TP5_VERIFY_PRIVATE dropped, CMake no longer adds src/). The verifier now prints
+VERIFY_REAL unavailable=1 reason=no_public_access_to_executed_decode_graph ... and
+run-router-cpu.sh C4b makes that a FAIL: retention is unproven until the executed graph is
+auditable. No public API was added for the test, no reserve-graph count is reported as a consumer
+hit.
+Read-only readers: no hard-coded invariant -- prepare_attention_views requires the reader's own
+cell to exist (llama-kv-cache.cpp:1955-1972), so readers always write the current K/V.
+
+Nothing here was compiled, run, syntax-checked or patch-applied by me.

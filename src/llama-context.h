@@ -453,6 +453,25 @@ private:
 
     bool has_evaluated_once = false;
 
+    // What the scheduler held right after it allocated the graph now being
+    // submitted, for the plan-identity evidence (GGML_TP5_MOE_ROUTER_SCRATCH=1 and
+    // GGML_TP5_ROUTER_SCRATCH_AUDIT=1). The planning pass that produces a plan is
+    // ggml_gallocr_reserve_n, reached from ggml_backend_sched_alloc_graph (and from
+    // graph_reserve); recording at the allocation is the only place that sees the
+    // plan the following graph_compute will actually use.
+    struct plan_identity {
+        bool     recorded = false; // an allocation recorded these fields
+        uint64_t graph_uid = 0;    // gf->uid, the uid the scheduler stamped on gf
+        uint64_t fp        = 0;    // ggml_gallocr_plan_fp(gf)
+        int64_t  plan_id   = 0;    // allocator planning pass at that moment
+        int      n_nodes   = 0;    // node count of the planned copy (sched->graph)
+    };
+
+    plan_identity exec_plan;
+
+    // Record the allocator's state for `gf` as just allocated.
+    void record_exec_plan(const ggml_cgraph * gf);
+
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 

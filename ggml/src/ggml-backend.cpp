@@ -1233,6 +1233,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     graph->uid = ggml_graph_next_uid();
 
+    // The graph the allocator plans and audits is `sched->graph`, the copy built
+    // from this graph's splits and input copies. It is not produced by
+    // ggml_graph_cpy (which does not copy the uid) and its split views carry
+    // uid 0, so without this line the planned graph has no identity at all.
+    sched->graph.uid = graph->uid;
+
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
@@ -2212,6 +2218,9 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
         sched->is_reset = true;
+        // the planned graph is gone; its identity with it, so a later reader cannot
+        // mistake a stale uid for the graph the next split_graph will produce
+        sched->graph.uid = 0;
     }
     sched->is_alloc = false;
 }
@@ -2373,6 +2382,11 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+}
+
+ggml_gallocr_t ggml_backend_sched_get_galloc(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->galloc;
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {

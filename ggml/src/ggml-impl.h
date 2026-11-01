@@ -354,6 +354,44 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph, int i0, int i1);
 // ggml-alloc.c: true if the operation can reuse memory from its sources
 GGML_API bool ggml_op_can_inplace(enum ggml_op op);
 
+// ggml-alloc.c: FNV-1a over the node pointer array in graph order, folded with
+// the node and leaf counts. Identifies a node sequence, not a computation: the
+// graph uid distinguishes two runs of one builder. Pure read.
+GGML_API uint64_t ggml_gallocr_plan_fp(const struct ggml_cgraph * graph);
+
+// Identity of the plan a graph allocator currently holds, for callers that must
+// prove that the plan they submit is the plan that was reserved and audited
+// (ggml-alloc.c: ggml_gallocr_plan_identity). Written only when
+// GGML_TP5_ROUTER_SCRATCH_AUDIT=1 ran the retention audit; with the audit off,
+// plan_id and graph_uid stay 0 and a caller that requires a match fails closed.
+// plan_id counts planning passes on that allocator (reserve_n and
+// reserve_n_size alike), so a re-reserve of the same graph object changes it
+// even though graph_uid does not. Read-only.
+struct ggml_gallocr_plan_identity {
+    int64_t  plan_id;    // 0 = no audited planning pass
+    uint64_t graph_uid;  // ggml_cgraph.uid of the planned graph
+    uint64_t fp;         // ggml_gallocr_plan_fp of the planned graph
+    int      n_nodes;
+    int      n_leafs;
+    bool     entry_size; // the pass was a ggml_gallocr_reserve_n_size measurement
+    int      retained;   // retained allocations in the held plan; -1 = no audited pass
+
+    // The last plan the retention audit accepted **with retained allocations**.
+    // 0 when no such plan was accepted, so `audit_clean_plan_id == plan_id` is true
+    // only while the plan now held is exactly the one that passed with retention.
+    int64_t  audit_clean_plan_id;
+    uint64_t audit_clean_graph_uid;
+    uint64_t audit_clean_fp;
+    int      audit_clean_n_nodes;
+    int      audit_clean_n_leafs;
+};
+
+// ggml_gallocr_t is declared in ggml-alloc.h, which this header does not include.
+struct ggml_gallocr;
+typedef struct ggml_gallocr * ggml_gallocr_t;
+
+GGML_API void ggml_gallocr_plan_identity(ggml_gallocr_t galloc, struct ggml_gallocr_plan_identity * out);
+
 
 // Memory allocation
 

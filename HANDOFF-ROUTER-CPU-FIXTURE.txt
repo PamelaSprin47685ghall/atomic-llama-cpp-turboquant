@@ -1,0 +1,95 @@
+Router scratch CPU fixture + verifier — delivered, UNEXECUTED
+
+Lane rule: no build, run, test, syntax check or patch apply/dry-run is
+performed on this work; only Devops validates. Exception on record: an earlier
+round of this session ran `bash -n` on the driver script, and a predecessor
+revision claimed py_compile/`-fsyntax-only`; neither is a verification and
+neither result is claimed here. Everything below is read-only source work.
+
+Tree: /home/kunweiz/work/merge-router-20261031
+
+New/changed files
+- examples/tp5-router-verify/tp5-router-fixture.cpp        (new) writes the minimal real
+  Qwen4Exp 512/top-10 GGUF (n_embd=8, hc=4, 2 recurrent trunk blocks + 1 NextN block,
+  ~1.3 MB, fixed seed) and self-checks it: stock llama_model load + a one-layer MoE graph
+  (MUL_MAT[512,3] -> SOFT_MAX -> TOP_K10 -> MUL_MAT_ID over the file's own weight bytes)
+  through gallocr + CPU backend.
+- examples/tp5-router-verify/tp5-router-verify.cpp         (rewritten) L1 model leg:
+  llama_decode on the fixture for 1/2/3/4 rows, FNV-1a per-row logits hashes
+  (VERIFY_ROW/VERIFY_ROWS). L2 plan leg: one layer's real MoE node-for-node with the router
+  marked NO_REUSE, real gallocr reserve, physical-pointer disjointness audit
+  (OVERLAPS vs in-place continuation), graph compute + output hash (VERIFY_PLAN*).
+- examples/tp5-router-verify/run-router-cpu.sh             (new) fixture -> OFF(unset) ->
+  OFF(=0) -> ON, prints PASS/FAIL criteria incl. N1 zero-retain run.
+- examples/tp5-router-verify/CMakeLists.txt                (two targets)
+- examples/tp5-router-verify/router_hash.py                (hash reference helper)
+- ggml/src/ggml-alloc.c: plan audit rewritten, and placed after ggml_gallocr_hash_get so
+  no forward declaration is needed (the earlier revision had it above that helper and did
+  not compile). It now audits retained allocations only
+  (dst.no_reuse copied at reserve time, not the sticky tensor flag) and recognises the one
+  legitimate sharing — the in-place continuation (top-k reusing the retained logits block),
+  audited once at the owning node; anything else still fails reserve. dst.size_max now
+  records the aligned extent the plan reserves. OFF is unaffected (no flag => audit returns).
+- ROUTER_SCRATCH_CPU_FIXTURE.md (new: fixture contents, blocked-further-shrink argument,
+  commands, criteria, unproven list), ROUTER_SCRATCH_VERIFY.md (CPU leg superseded, false
+  "syntax-checked" claim removed).
+
+Blocked further shrink (exact): src/models/qwen4exp.cpp:1502-1504 hard-codes
+n_expert==512 && n_expert_used==10 for retention, and 1527-1539 requires exactly one
+SOFT_MAX [512,rows,1,1] with a direct contiguous non-view F32 MUL_MAT input; n_embd must
+stay a multiple of 8 (f32 MUL_MAT) with rope_sections [2,2,2,2]. Smaller router = different
+code path, not this candidate. Deliberately not covered: full-attention/QSA blocks (absent by
+layer count; pre-existing 2-D res_hc reshape in graph), MTP block execution (loaded, not run),
+CUDA/HIP fusion + cross-warp lifetime.
+
+Devops commands (CPU, serial, build-slot):
+  cmake -S $src -B $build -DGGML_CUDA=OFF -DGGML_HIP=OFF -DLLAMA_BUILD_EXAMPLES=ON \
+        -DCMAKE_BUILD_TYPE=Release
+  build-slot cmake --build $build -j2 --target llama-tp5-router-fixture llama-tp5-router-verify
+  $src/examples/tp5-router-verify/run-router-cpu.sh $build/bin <out-dir>
+
+Fix round 2: examples use public headers only (no llama-arch.h/llama-hparams.h) and the
+public backend registry init; the fixture no longer writes attention.indexer.types (only
+glm-dsa reads it, optionally). No LLAMA_MAX_LAYERS-sized array remains.
+
+Fix round 3: fixture derives the tensor data offset as GGML_PAD(gguf_get_meta_size, gguf_get_alignment)
+(a fresh gguf context reports gguf_get_data_offset()==0; rev3 aborted on that assert), and
+examples/tp5-router-verify/CMakeLists.txt now registers llama-tp5-router-verify as well as
+llama-tp5-router-fixture.
+
+Fix round 4: fixture context is no longer no_alloc (it owns the tensor bytes, sized for the
+model, and gguf only keeps the pointer), data is written in place, and before writing the
+file the gguf layout (meta pad = GGML_PAD(meta_size, alignment), every tensor at its recorded
+offset) plus the summed tensor byte count are checked, so no null / shifted / truncated model
+can be emitted.
+
+Fix round 5: the two layout/size failure paths ran before FILE * f existed (they called
+fclose(f)); they now only release the gguf/ggml contexts and return, and f is opened after
+them. The one fclose on the write path stays. Sizes are checked by portable value comparisons
+(ids / grid over n_used and rows) instead of signed/unsigned tensor-dimension compares.
+The self-check's `weights` (TOP_K) tensor is now named and verified (shape) in router_shape, so
+no unused variable remains.
+
+Fix round 7: the fixture wrote graph-style names (linear_attn_qkv / linear_attn_gate /
+linear_attn_a ...) but the loader maps blk.N.attn_qkv / attn_gate / ssm_conv1d / ssm_dt /
+ssm_a / ssm_beta / ssm_alpha / ssm_norm / ssm_out; corrected all nine per trunk block, with
+offline-checked shapes. Added router-fixture-contract.{h,cpp}: when configured in-tree it
+instantiates the real llama_model_qwen4exp and runs its load_hparams/load_tensors over the
+just-written file (no_alloc, no data read), reporting every wrong/missing key, array length
+or tensor as FIXTURE contract_problem and failing the generator; CMake enables it only when
+src/models/qwen4exp.cpp is present (needs private headers). Production loader untouched.
+
+Rev8: the abort was in the contract driver, not the loader. Revised finding (Devops proved the
+earlier one wrong: both trees already have the QWEN4EXP IMROPE case, so the patch would have been
+a duplicate case -- patch deleted, statement retracted). llama_model_create(arch) is the only
+place that stamps model->arch (src/llama-model.cpp:343-346); llama_model_qwen4exp's own ctor goes
+through llama_model_base -> llama_model(params) and leaves arch = LLM_ARCH_UNKNOWN, so
+load_hparams -> llama_model_rope_type aborted on LLM_ARCH_UNKNOWN. The checker now builds the
+model through llama_model_create(LLM_ARCH_QWEN4EXP, mparams) (the call llama.cpp:316 makes),
+fails closed if the factory returns null / arch is not qwen4exp / the type is not
+llama_model_qwen4exp, and then runs the real load_hparams/load_tensors with their exceptions as
+contract_problems. No production change, no invented hparams.
+
+Unverified: nothing built, run or otherwise behaviour-checked by me.
+First failure point to watch: whether the stock model path accepts the fixture (n_embd=8,
+both trunk layers recurrent).

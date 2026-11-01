@@ -1,6 +1,8 @@
 #include "llama-context.h"
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
+#include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
 #include "ggml-relay.h"
 #include "llama-arch.h"
@@ -30,6 +32,18 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+// Both knobs, exactly "1": the retention gate must be on for a plan to carry
+// retained allocations, and the allocator audit must be on for it to record and
+// print a plan identity. Read once, so the decode path only tests a bool.
+static bool plan_identity_enabled() {
+    static const bool enabled = [] {
+        const char * retain = getenv("GGML_TP5_MOE_ROUTER_SCRATCH");
+        const char * audit  = getenv("GGML_TP5_ROUTER_SCRATCH_AUDIT");
+        return retain && strcmp(retain, "1") == 0 && audit && strcmp(audit, "1") == 0;
+    }();
+    return enabled;
+}
 
 //
 // llama_context
@@ -1652,6 +1666,8 @@ bool llama_context::release_compute() {
     if (gf_res_reserve) {
         gf_res_reserve->reset();
     }
+    // the plan these graphs were built against is gone; its identity with it
+    exec_plan = plan_identity{};
     ggml_backend_sched_release_buffers(sched.get());
     return true;
 }
@@ -2595,6 +2611,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        // Remember which plan the allocator holds for this graph. graph_compute
+        // re-reads it after the submission and requires the two records to agree,
+        // so a plan replaced in between cannot pass as the audited one.
+        record_exec_plan(gf);
     }
 
     // Validate the actual scheduler placement before submitting any compute.
@@ -3761,6 +3782,11 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t                       n_toke
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
 
+    // the plan this context holds is about to be discarded: forget the recorded
+    // identity before anything can fail, so a failed reserve cannot leave a stale
+    // match behind for a later submission
+    exec_plan = plan_identity{};
+
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
     const auto save_n_outputs = this->n_outputs;
@@ -3802,6 +3828,11 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t                       n_toke
         return nullptr;
     }
 
+    // A reserve does not record an executable identity: the graph it plans is the
+    // sizing graph, and the plan that a later decode submits is produced (or
+    // replayed) by ggml_backend_sched_alloc_graph inside process_ubatch, which is
+    // where record_exec_plan() reads it. Recording here would name a plan the
+    // decode may never use.
     return gf;
 }
 
@@ -3828,6 +3859,24 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
     };
 }
 
+void llama_context::record_exec_plan(const ggml_cgraph * gf) {
+    if (!plan_identity_enabled()) {
+        return;
+    }
+
+    struct ggml_gallocr_plan_identity plan = {};
+    ggml_gallocr_plan_identity(ggml_backend_sched_get_galloc(sched.get()), &plan);
+
+    // Read right after the scheduler allocated gf: this is the plan the following
+    // graph_compute submits with. `gf->uid` is the uid split_graph stamped on gf
+    // and copied to sched->graph, so it names the graph the plan was built for.
+    exec_plan.recorded  = true;
+    exec_plan.graph_uid = gf->uid;
+    exec_plan.fp        = ggml_gallocr_plan_fp(gf);
+    exec_plan.plan_id   = plan.plan_id;
+    exec_plan.n_nodes   = plan.n_nodes;
+}
+
 ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
     int               n_threads = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp        = batched ? threadpool_batch : threadpool;
@@ -3851,9 +3900,48 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
     const bool retain_inputs = backend_tp5_relay != nullptr && gf_res_prev &&
             gf == gf_res_prev->get_gf() && !batched &&
             cparams.n_batch == 1 && cparams.n_ubatch == 1;
+
     auto status = retain_inputs ?
             ggml_backend_sched_graph_compute_async_retained_inputs(sched.get(), gf) :
             ggml_backend_sched_graph_compute_async(sched.get(), gf);
+
+    // Plan-identity evidence, checked AFTER the scheduler ran and for every
+    // submission, not only the retained-input one (a CPU context has no relay
+    // backend, so `retain_inputs` is false there and the evidence would never be
+    // printed). What it states: the allocator still holds the plan it accepted at
+    // audit time (`audit_clean_plan_id == plan_id`), and that plan was built for
+    // this very graph (`graph_uid` and `fp` agree with gf, node counts agree with
+    // sched->graph), and that plan carries the retained router scratch (a plan with
+    // zero retained allocations has nothing to promote). The record taken at
+    // allocation in process_ubatch must also agree, so a plan replaced between
+    // allocation and submission shows up as match=0. Off unless both knobs are
+    // exactly "1".
+    if (plan_identity_enabled() && status == GGML_STATUS_SUCCESS) {
+        struct ggml_gallocr_plan_identity plan = {};
+        ggml_gallocr_plan_identity(ggml_backend_sched_get_galloc(sched.get()), &plan);
+
+        const uint64_t exec_uid = gf->uid;
+        const uint64_t exec_fp  = ggml_gallocr_plan_fp(gf);
+        const bool     match    = exec_plan.recorded && plan.plan_id != 0 && plan.graph_uid != 0 &&
+                plan.retained > 0 && plan.audit_clean_plan_id == plan.plan_id &&
+                plan.audit_clean_graph_uid == plan.graph_uid && plan.audit_clean_fp == plan.fp &&
+                plan.audit_clean_n_nodes == plan.n_nodes && plan.audit_clean_n_leafs == plan.n_leafs &&
+                !plan.entry_size && exec_uid != 0 && exec_uid == plan.graph_uid && exec_fp == plan.fp &&
+                plan.n_nodes == gf->n_nodes && plan.n_leafs == gf->n_leafs &&
+                exec_plan.plan_id == plan.plan_id && exec_plan.graph_uid == exec_uid &&
+                exec_plan.fp == exec_fp && exec_plan.n_nodes == plan.n_nodes;
+
+        LLAMA_LOG_INFO("%s: router_scratch plan identity exec_uid=%" PRIu64 " exec_fp=%016" PRIx64
+                " exec_nodes=%d plan_uid=%" PRIu64 " plan_fp=%016" PRIx64 " plan_id=%" PRId64
+                " plan_nodes=%d retained=%d audit_plan_id=%" PRId64 " audit_uid=%" PRIu64
+                " audit_fp=%016" PRIx64 " recorded_plan_id=%" PRId64 " recorded_uid=%" PRIu64
+                " recorded_fp=%016" PRIx64 " entry_size=%d match=%d\n", __func__,
+                exec_uid, exec_fp, gf->n_nodes, plan.graph_uid, plan.fp, plan.plan_id, plan.n_nodes,
+                plan.retained, plan.audit_clean_plan_id, plan.audit_clean_graph_uid, plan.audit_clean_fp,
+                exec_plan.plan_id, exec_plan.graph_uid, exec_plan.fp,
+                plan.entry_size ? 1 : 0, match ? 1 : 0);
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }

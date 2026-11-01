@@ -1,0 +1,44 @@
+Router CPU fixture / contract driver — rev9 (corrected rev8 finding)
+
+Retraction first: my rev8 claim "llama_model_rope_type lacks a QWEN4EXP case" was wrong. Both
+trees already have `case LLM_ARCH_QWEN4EXP:` in the LLAMA_ROPE_TYPE_IMROPE group
+(src/llama-model.cpp:3267); the patch I wrote would have been a duplicate case. The patch file
+/home/kunweiz/work/router-qwen4exp-rope-type-20261031.patch.diff is deleted. No production file
+was changed for this, and none should be.
+
+Real cause (loader call chain):
+- llama_model_create(arch, params) (src/llama-model.cpp:343) = llama_model_mapping(arch, params)
+  followed by `model->arch = arch`. This is the only place arch is stamped; llama.cpp:316
+  (the real load path) goes through it.
+- Every arch model, including llama_model_qwen4exp (src/models/models.h:2243), builds through
+  llama_model_base -> llama_model(params), leaving arch = LLM_ARCH_UNKNOWN.
+- The contract driver did `llama_model_qwen4exp model(mparams);` directly, so arch stayed
+  LLM_ARCH_UNKNOWN, load_hparams ran and its last line
+  hparams.rope_type = llama_model_rope_type(this) (src/llama-model.cpp:1669) hit
+  `case LLM_ARCH_UNKNOWN: GGML_ABORT` (src/llama-model.cpp:3281) -> rev8 rc=134.
+
+Fix (driver only, examples/tp5-router-verify/router-fixture-contract.cpp):
+- model is created with llama_model_create(LLM_ARCH_QWEN4EXP, mparams), the production factory;
+- fail closed (contract_problem, non-zero generator exit) if it returns null, if
+  model->arch != LLM_ARCH_QWEN4EXP, or if dynamic_cast to llama_model_qwen4exp fails;
+- only then the passes run, in the production order of llama.cpp:337-356:
+  load_hparams -> load_vocab -> load_stats -> load_tensors. load_vocab is what reads
+  qwen4exp.vocab_size; without it the model keeps n_vocab = 0 and load_arch_tensors asks for
+  token_embd [8, 0] (rev9 evidence: VERIFY-ROUTER-REV9-CONTRACT.txt). Each pass is gated on
+  the previous one; exceptions become `hparams:`/`vocab:`/`tensors:` problems and no state is
+  invented or carried over. After load_vocab the check also fails closed if
+  llama_vocab_n_tokens() is still 0;
+- an additional assertion pins the resolved rope type to LLAMA_ROPE_TYPE_IMROPE, which is what
+  the existing production case returns for this arch (a wrong value is reported, not hidden).
+- release paths: every early return frees both the model and the gguf context it was built
+  for; the normal exit runs one teardown (model first, gguf context last, since the loader
+  holds a non-owning pointer to it). No path can double-free or leak.
+
+Unchanged: ggml/src/ggml-alloc.c and all production sources; the fixture's tensor/metadata set
+from rev7; the verifier; the driver script's criteria (its header no longer mentions any patch).
+
+What Devops should rerun: the frozen build + `run-router-cpu.sh`. Expect
+`FIXTURE contract problems=0 ...` from the generator, then the OFF/ON legs. A `contract_problem`
+line names the exact remaining loader disagreement.
+
+Nothing in this round was compiled, run, syntax-checked or patch-applied by me.

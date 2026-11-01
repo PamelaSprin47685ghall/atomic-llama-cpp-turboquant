@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -493,6 +494,36 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // Identity of the plan this instance currently holds. The evidence lines
+    // below print it, and an owner (llama_context) reads it back to check that
+    // the plan it reserved is the plan it submits. Nothing here decides an
+    // allocation: the fields are written after the plan is final.
+    //
+    // A "planning pass" is one ggml_gallocr_reserve_n_impl call, whatever its
+    // entry point. plan_id counts passes over the lifetime of this allocator,
+    // so a re-reserve of the same graph object (same graph_uid) still moves it.
+    int64_t  plan_id;        // 0 = no planning pass yet
+    uint64_t plan_graph_uid; // graph->uid of the planned graph, 0 when unset
+    uint64_t plan_fp;        // ggml_gallocr_plan_fp of the planned graph
+    int      plan_n_nodes;
+    int      plan_n_leafs;
+    bool     plan_entry_size; // true when the pass was a size measurement
+    // Retention the held plan actually carries: 0 when the pass that built it
+    // found no retained allocation, >0 otherwise, -1 while a pass is running or
+    // when the audit is off. Written only at the end of an audited pass, so a
+    // refused pass leaves -1 and a caller cannot read it as a clean plan.
+    int      plan_retained;
+
+    // Identity of the last plan the retention audit accepted **with retained
+    // allocations**. Set only by such an audit, so it never describes a plan that
+    // was refused, nor a plan with nothing to vouch for. Kept across later passes:
+    // a refused or unaudited pass advances plan_id, so the two ids part on their own.
+    int64_t  audit_clean_plan_id;
+    uint64_t audit_clean_graph_uid;
+    uint64_t audit_clean_fp;
+    int      audit_clean_n_nodes;
+    int      audit_clean_n_leafs;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -594,6 +625,330 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor 
     return t->data != NULL // tensor data already set externally
         || t->buffer // tensor on external buffer (but not yet allocated)
         || ggml_gallocr_is_own(galloc, t); // tensor will be allocated by galloc
+}
+
+// FNV-1a over the node pointer array in graph order, folded with the node and
+// leaf counts. The fingerprint says "the same node sequence was planned", not
+// "the same computation": it cannot tell two runs of one builder apart. The
+// graph uid carries that distinction, so both are printed and both are read
+// back by the owner. Pure read, no allocation.
+uint64_t ggml_gallocr_plan_fp(const struct ggml_cgraph * graph) {
+    uint64_t fp = 0xcbf29ce484222325ull;
+    const uint8_t * bytes = (const uint8_t *) graph->nodes;
+    const size_t    len   = (size_t) graph->n_nodes * sizeof(graph->nodes[0]);
+    for (size_t i = 0; i < len; i++) {
+        fp ^= bytes[i];
+        fp *= 0x100000001b3ull;
+    }
+    fp ^= (uint64_t) (uint32_t) graph->n_nodes;
+    fp *= 0x100000001b3ull;
+    fp ^= (uint64_t) (uint32_t) graph->n_leafs;
+    fp *= 0x100000001b3ull;
+    return fp;
+}
+
+// Fail-closed plan audit for explicitly retained allocations
+// (GGML_TENSOR_FLAG_NO_REUSE, e.g. the multi-row MoE router scratch): a
+// retained tensor must not share storage with any other allocation in the same
+// buffer, otherwise the retention contract is not actually provided. The
+// dyn_tallocr only hands out disjoint free blocks, so an overlap in a finished
+// plan can only come from a bug; refuse the plan instead of running it.
+// Off by default; GGML_TP5_ROUTER_SCRATCH_AUDIT=1 (exact) enables the check.
+//
+// Placement is what makes the audit able to pass: ggml_gallocr_alloc_graph_impl
+// allocates every non-view NO_REUSE node before the first temporary, and
+// ggml_gallocr_free_node never frees it, so the only address a retained tensor can
+// share is its own in-place continuation (checked below). Without that, a retained
+// node could take an address a temporary had already been freed from.
+//
+// An empty tensor (some ne[] is 0) is not an unverifiable neighbour: it has no
+// bytes and no address range, and every backend's kernel is a no-op for it. The
+// retained tensor itself is never allowed to be empty.
+//
+// Retention is tracked per plan (tensor_alloc.no_reuse, copied from the graph
+// at reserve time) because ggml_tensor flags are sticky: an in-place child of a
+// retained tensor keeps NO_REUSE set after the in-place pass. Retained tensors
+// are never freed during graph allocation, so in a finished plan the only
+// address a retained tensor can share is its own in-place continuation, which
+// is legitimate -- and is exactly what a retained tensor with a later NO_REUSE
+// consumer looks like. That shape is recognised explicitly, and every other
+// overlap is a contract violation.
+
+// Allocated extent of a planned tensor, for the retention audit only.
+//
+// size_max stores the unaligned logical size, because that is what
+// ggml_gallocr_node_needs_realloc() compares against an unaligned node_size;
+// the dyn_tallocr, however, rounds every allocation up to the buffer alignment
+// (ggml_dyn_tallocr_alloc). Judge overlap on what was actually reserved, not on
+// the logical bytes, hence the aligned extent here.
+//
+// This deliberately makes the audit STRICTER than the unaligned convention: a
+// neighbour placed inside the alignment tail now counts as an overlap. That is
+// the correct reading for a retention contract (a later in-place writer may
+// legitimately target that tail), so do not "simplify" it back to size_max.
+//
+// Nothing computed here is written back: the allocator's own re-reserve
+// decision keeps using the unaligned size_max. A tensor the plan recorded no
+// size for returns 0 and the audit refuses the plan rather than guessing an
+// extent. Whether a tensor belongs to this plan's address space at all is the
+// caller's decision, made from buffer_id, not from whether data is set: a
+// retained tensor can legitimately have been assigned by the plan and still
+// carry data when the same plan is replayed.
+static size_t ggml_gallocr_audit_extent(ggml_gallocr_t galloc, const struct tensor_alloc * alloc,
+                                        const struct ggml_tensor * t) {
+    if (alloc->buffer_id < 0) {
+        return 0;
+    }
+    // A zero size_max means this plan recorded no size for the tensor, so there
+    // is no reservation to describe; deriving one from the tensor would be a
+    // guess about storage the plan does not own.
+    if (alloc->size_max == 0) {
+        return 0;
+    }
+    // audit, not the realloc predicate: judge against what a placement in this
+    // buffer domain could occupy, which is the size rounded up to that buffer's
+    // alignment (ggml_dyn_tallocr_alloc does the same for every allocation).
+    const size_t alignment = galloc->buf_tallocs[alloc->buffer_id]->alignment;
+    return aligned_offset(NULL, alloc->size_max, alignment);
+}
+
+static bool ggml_gallocr_same_block(const struct hash_node * hn, const struct tensor_alloc * alloc) {
+    return hn->buffer_id == alloc->buffer_id && hn->addr.chunk == alloc->addr.chunk &&
+            hn->addr.offset == alloc->addr.offset;
+}
+
+static bool ggml_gallocr_check_no_reuse_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const char * entry) {
+    // Scope of this switch, stated once: it is OFF unless the variable is exactly
+    // "1". When it is on and the plan violates the retention contract (a
+    // retained extent overlaps another allocation, a retained tensor is a view,
+    // or a retained/neighbouring allocation is outside the plan so no extent can
+    // be compared), the audit returns false. That propagates out of
+    // ggml_gallocr_reserve_n (sched reserve fails, decode reports
+    // ALLOC_FAILED) and out of the ggml_gallocr_reserve_n_size ASSERT. It is a
+    // fail-closed diagnostic, NOT pure observation: enabling it can reject a
+    // plan that would otherwise have run. With it off nothing is computed or
+    // allocated beyond the existing reserve work.
+    //
+    // The audit also records the identity of the plan it judged (graph_uid,
+    // plan_id, fp) and prints it on the evidence lines. That record is what lets
+    // an owner check that the plan it submits is this plan; it changes no
+    // allocation and is only written when the audit is enabled.
+    const char * audit_env = getenv("GGML_TP5_ROUTER_SCRATCH_AUDIT");
+    if (!audit_env || strcmp(audit_env, "1") != 0) {
+        return true;
+    }
+
+    // Identity of the plan just produced by reserve_n_impl. Written here because
+    // this is the only place that knows the audit ran; the fields are read back
+    // through ggml_gallocr_plan_identity() and never feed an allocation
+    // decision. plan_id was bumped by reserve_n_impl for this pass.
+    galloc->plan_graph_uid = graph->uid;
+    galloc->plan_fp        = ggml_gallocr_plan_fp(graph);
+    galloc->plan_n_nodes   = graph->n_nodes;
+    galloc->plan_n_leafs   = graph->n_leafs;
+
+    size_t retained_bytes = 0;
+    int    n_retained     = 0;
+    int    n1_rows        = 0; // ne[1] of the retained projections, 0 when they disagree
+    bool   n1_mixed       = false;
+    int    n_unverifiable = 0; // retained tensors this audit cannot vouch for
+
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const struct tensor_alloc * kept = &galloc->node_allocs[i].dst;
+        if (!kept->no_reuse) {
+            continue;
+        }
+        struct ggml_tensor * node = graph->nodes[i];
+
+        // A retained view shares storage it does not own. This used to sit behind
+        // the buffer_id guard below, which views never pass, so the violation
+        // was silently accepted; decide it first.
+        if (node->view_src != NULL) {
+            GGML_LOG_ERROR("%s: retained tensor '%s' [%s] is a view, it cannot be retained\n",
+                    __func__, node->name, ggml_op_desc(node));
+            return false;
+        }
+
+        // Retained storage the plan does not describe cannot be proven disjoint:
+        // when the plan placed no allocation for it (buffer_id < 0: its own data
+        // or a view, already rejected above) or recorded no size for it, there is
+        // no extent to compare, and guessing from another buffer_id would be
+        // worse than admitting the gap. Refuse the plan; a retention contract
+        // that is only partly verified must not run.
+        if (kept->buffer_id < 0 || kept->size_max == 0) {
+            n_unverifiable += 1;
+            GGML_LOG_ERROR("%s: retained tensor '%s' [%s] is outside the audited plan "
+                    "(buffer_id=%d size_max=%zu); its disjointness cannot be proven\n",
+                    __func__, node->name, ggml_op_desc(node), kept->buffer_id, kept->size_max);
+            return false;
+        }
+
+        // A retained in-place continuation: its own storage belongs to an
+        // earlier retained producer. Audit the storage once, at the producer.
+        bool continued = false;
+        for (int j = 0; j < GGML_MAX_SRC && !continued; j++) {
+            struct ggml_tensor * parent = node->src[j];
+            if (parent == NULL) {
+                continue;
+            }
+            if (parent->view_src != NULL || (parent->flags & GGML_TENSOR_FLAG_NO_REUSE) == 0) {
+                continue;
+            }
+            // the parent is retained and shares this exact block, so it is the
+            // node that owns the storage; the continuation only names it
+            continued = ggml_gallocr_same_block(ggml_gallocr_hash_get(galloc, parent), kept);
+        }
+        if (continued) {
+            continue;
+        }
+
+        const size_t kept_size = ggml_gallocr_audit_extent(galloc, kept, node);
+        if (kept_size == 0) {
+            // Unreachable after the checks above; refuse rather than report a
+            // clean plan that did not actually cover this tensor.
+            GGML_LOG_ERROR("%s: retained tensor '%s' [%s] has no auditable extent\n",
+                    __func__, node->name, ggml_op_desc(node));
+            return false;
+        }
+
+        n_retained     += 1;
+        retained_bytes += kept_size;
+        if (n_retained == 1) {
+            n1_rows = (int) node->ne[1];
+        } else if (n1_rows != (int) node->ne[1]) {
+            n1_mixed = true;
+        }
+
+        const size_t kept_lo = kept->addr.offset;
+        const size_t kept_hi = kept_lo + kept_size;
+        bool clash = false;
+
+        for (int j = 0; j < graph->n_nodes && !clash; j++) {
+            if (j == i) {
+                continue;
+            }
+            const struct tensor_alloc * other = &galloc->node_allocs[j].dst;
+            // Domain, not data: a tensor the plan placed in another buffer (or in
+            // none at all) has no address in this plan's space, so the comparison
+            // is vacuous by construction. Note that a tensor which *does* carry
+            // data can still be in domain when the same plan is replayed, and
+            // must stay compared.
+            if (other->buffer_id < 0) {
+                continue;
+            }
+            if (other->buffer_id != kept->buffer_id) {
+                continue;
+            }
+            if (other->size_max == 0) {
+                // In-domain with no recorded size. An empty tensor (some ne[] is 0)
+                // has no bytes and no address range at all -- every backend's kernel
+                // is a no-op for it -- so it cannot overlap anything and needs no
+                // extent. Only a non-empty tensor with no recorded size is unknown.
+                if (!ggml_is_empty(graph->nodes[j])) {
+                    n_unverifiable += 1;
+                }
+                continue;
+            }
+            const size_t other_size = ggml_gallocr_audit_extent(galloc, other, graph->nodes[j]);
+            if (other->buffer_id == kept->buffer_id && other->addr.chunk == kept->addr.chunk &&
+                    other->addr.offset < kept_hi && kept_lo < other->addr.offset + other_size) {
+                GGML_LOG_ERROR("%s: retained tensor '%s' [%s] overlaps '%s' [%s] in buffer %d\n",
+                        __func__, node->name, ggml_op_desc(node),
+                        graph->nodes[j]->name, ggml_op_desc(graph->nodes[j]), kept->buffer_id);
+                clash = true;
+            }
+        }
+        for (int j = 0; j < graph->n_leafs && !clash; j++) {
+            const struct tensor_alloc * other = &galloc->leaf_allocs[j].leaf;
+            // Weights, token and embedding buffers are placed outside this galloc
+            // (buffer_id = -1): no address in this plan's space, nothing to
+            // compare. Only an in-domain leaf with no recorded size is genuinely
+            // unverifiable.
+            if (other->buffer_id < 0 || other->buffer_id != kept->buffer_id) {
+                continue;
+            }
+            if (other->size_max == 0) {
+                // Same rule as for nodes: an empty tensor occupies nothing.
+                if (!ggml_is_empty(graph->leafs[j])) {
+                    n_unverifiable += 1;
+                }
+                continue;
+            }
+            const size_t other_size = ggml_gallocr_audit_extent(galloc, other, graph->leafs[j]);
+            if (other->buffer_id == kept->buffer_id && other->addr.chunk == kept->addr.chunk &&
+                    other->addr.offset < kept_hi && kept_lo < other->addr.offset + other_size) {
+                GGML_LOG_ERROR("%s: retained tensor '%s' [%s] overlaps leaf '%s' in buffer %d\n",
+                        __func__, node->name, ggml_op_desc(node),
+                        graph->leafs[j]->name, kept->buffer_id);
+                clash = true;
+            }
+        }
+        if (clash) {
+            return false;
+        }
+    }
+
+    // INFO, not DEBUG: these are the production-path evidence lines. They are
+    // emitted by the allocator itself during reserve, so they need no eval
+    // callback, no extra synchronize and no change to scheduler timing.
+    //
+    // The line is per reserve instance, and it says which instance: `entry` is
+    // "reserve" for ggml_gallocr_reserve_n and "size" for ggml_gallocr_reserve_n_size
+    // (a measurement call that allocates nothing, so it must never be read as an
+    // executed-plan guarantee). Nothing here identifies the graph the decode submits:
+    // that relation has no source in this path, so a clean line is not evidence for
+    // it (see ROUTER_SCRATCH_CPU_FIXTURE.md §9).
+    // `rows` is the common ne[1] of the retained projections, "mixed" when they
+    // disagree, which attributes the line to a graph shape without relying on
+    // the shape being reserved exactly once. The zero-retained case is a
+    // separate "enabled" line with no rows field.
+    if (n_unverifiable != 0) {
+        // Some allocation the retained extent could collide with is outside this
+        // plan (it owns its data, or carries no recorded size), so no overlap was
+        // ruled out there. Report UNPROVEN and refuse: the retention contract
+        // holds only for allocations the plan actually describes.
+        GGML_LOG_ERROR("%s: retention audit unproven (%s): %d in-domain allocation(s) carry no "
+                "recorded size; disjointness is unproven\n",
+                __func__, entry, n_unverifiable);
+        return false;
+    }
+
+    if (n_retained == 0) {
+        // Explicit zero line: proves the audit ran and vouched for nothing.
+        // Without it, silence is ambiguous between "no retained allocations"
+        // and "audit not enabled / reserve not reached".
+        GGML_LOG_INFO("%s: retention audit enabled (%s): 0 retained allocations, nodes=%d, graph_uid=%" PRIu64 ", plan_id=%" PRId64 ", fp=%016" PRIx64 "\n",
+                __func__, entry, graph->n_nodes,
+                galloc->plan_graph_uid, galloc->plan_id, galloc->plan_fp);
+    } else {
+        char rows_buf[32];
+        if (n1_mixed) {
+            snprintf(rows_buf, sizeof(rows_buf), "mixed");
+        } else {
+            snprintf(rows_buf, sizeof(rows_buf), "%d", n1_rows);
+        }
+        GGML_LOG_INFO("%s: retention audit clean (%s): %d retained allocations, %zu bytes, rows=%s, nodes=%d, graph_uid=%" PRIu64 ", plan_id=%" PRId64 ", fp=%016" PRIx64 "\n",
+                __func__, entry, n_retained, retained_bytes, rows_buf, graph->n_nodes,
+                galloc->plan_graph_uid, galloc->plan_id, galloc->plan_fp);
+    }
+
+    // The plan passed the audit with retained allocations: this is the identity an
+    // owner may compare against. Written last, so a refusal above leaves it cleared.
+    //
+    // Only a plan that actually carries retention is recorded. A plan with zero
+    // retained allocations has nothing for this audit to vouch for, so claiming it
+    // would let a 1-row or knob-off reserve be reported as an audited retained plan;
+    // those passes leave the record cleared and any owner check fails closed.
+    galloc->plan_retained = n_retained;
+
+    if (n_retained > 0) {
+        galloc->audit_clean_plan_id   = galloc->plan_id;
+        galloc->audit_clean_graph_uid = galloc->plan_graph_uid;
+        galloc->audit_clean_fp        = galloc->plan_fp;
+        galloc->audit_clean_n_nodes   = galloc->plan_n_nodes;
+        galloc->audit_clean_n_leafs   = galloc->plan_n_leafs;
+    }
+    return true;
 }
 
 // free the extra space at the end if the new tensor is smaller
@@ -742,7 +1097,15 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             ggml_gallocr_hash_get(galloc, view_src)->n_views += 1;
         }
 
-        if (node->flags & GGML_TENSOR_FLAG_INPUT) {
+        // A retained node needs its own storage for the whole graph. Allocating it
+        // here, before any temporary is placed, is what gives it that: a temporary
+        // allocated first would own the address, and the retained node could only
+        // take an address a temporary has already been freed from -- a legal plan by
+        // the dyn_tallocr's rules and an overlap by the retention contract. Views are
+        // excluded: they do not own storage (allocate_node returns early for them),
+        // and their owner is retained through the NO_REUSE check on reuse below.
+        const bool retained_owner = (node->flags & GGML_TENSOR_FLAG_NO_REUSE) != 0 && !ggml_impl_is_view(node);
+        if ((node->flags & GGML_TENSOR_FLAG_INPUT) || retained_owner) {
             ggml_gallocr_allocate_node(galloc, graph->nodes[i], get_node_buffer_id(node_buffer_ids, i));
         }
 
@@ -754,8 +1117,9 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
             ggml_gallocr_hash_get(galloc, src)->n_children += 1;
 
-            // allocate explicit inputs
-            if (src->flags & GGML_TENSOR_FLAG_INPUT) {
+            // allocate explicit inputs, and retained sources for the same reason
+            const bool src_retained = (src->flags & GGML_TENSOR_FLAG_NO_REUSE) != 0 && !ggml_impl_is_view(src);
+            if ((src->flags & GGML_TENSOR_FLAG_INPUT) || src_retained) {
                 ggml_gallocr_allocate_node(galloc, src, get_node_buffer_id(node_buffer_ids, i));
             }
         }
@@ -849,6 +1213,21 @@ static bool ggml_gallocr_reserve_n_impl(
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
     }
 
+    // A new planning pass: the plan this instance holds is about to be replaced,
+    // so its identity must stop matching anything already handed out. Bumped
+    // before the plan is built, so a refused plan leaves the new id behind and
+    // an owner that saw the old one sees a mismatch instead of a false match.
+    galloc->plan_id += 1;
+    galloc->plan_entry_size = no_alloc;
+    // until the audit of this pass reports, nothing is known about retention
+    galloc->plan_retained = -1;
+
+    // The record of the last accepted plan is kept, not cleared: a pass that is
+    // refused or skips the audit must leave the two ids apart on its own, which it
+    // does because plan_id has just advanced. Clearing here would instead destroy
+    // the only record of the plan that is still installed in the buffers, so a
+    // caller could no longer tell whether the plan it submits was ever audited.
+
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 
@@ -871,7 +1250,11 @@ static bool ggml_gallocr_reserve_n_impl(
             struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
             node_alloc->dst.buffer_id = hn->buffer_id;
             node_alloc->dst.addr = hn->addr;
-            node_alloc->dst.size_max  = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
+            // plan validity is judged against the unaligned logical size, as
+            // ggml_gallocr_node_needs_realloc() compares an unaligned node_size:
+            // feeding it an aligned size would absorb a real growth of up to
+            // alignment-1 bytes and skip the re-reserve the layout needs.
+            node_alloc->dst.size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
         }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
@@ -906,6 +1289,11 @@ static bool ggml_gallocr_reserve_n_impl(
             galloc->leaf_allocs[i].leaf.addr = hn->addr;
             galloc->leaf_allocs[i].leaf.size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], leaf);
         }
+    }
+
+    // refuse a plan that violates the retention contract before it is materialized
+    if (!ggml_gallocr_check_no_reuse_plan(galloc, graph, no_alloc ? "size" : "reserve")) {
+        return false;
     }
 
     // reallocate buffers if needed
@@ -1105,6 +1493,25 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
 
     return true;
+}
+
+void ggml_gallocr_plan_identity(ggml_gallocr_t galloc, struct ggml_gallocr_plan_identity * out) {
+    GGML_ASSERT(galloc != NULL);
+    GGML_ASSERT(out != NULL);
+
+    out->plan_id    = galloc->plan_id;
+    out->graph_uid  = galloc->plan_graph_uid;
+    out->fp         = galloc->plan_fp;
+    out->n_nodes    = galloc->plan_n_nodes;
+    out->n_leafs    = galloc->plan_n_leafs;
+    out->entry_size = galloc->plan_entry_size;
+    out->retained   = galloc->plan_retained;
+
+    out->audit_clean_plan_id   = galloc->audit_clean_plan_id;
+    out->audit_clean_graph_uid = galloc->audit_clean_graph_uid;
+    out->audit_clean_fp        = galloc->audit_clean_fp;
+    out->audit_clean_n_nodes   = galloc->audit_clean_n_nodes;
+    out->audit_clean_n_leafs   = galloc->audit_clean_n_leafs;
 }
 
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {

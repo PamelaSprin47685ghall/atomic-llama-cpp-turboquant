@@ -358,6 +358,21 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     const int n_experts = logits->ne[0];
     const int n_rows    = logits->ne[1];
 
+    // Real-consumer fire evidence for the multi-row (N2/N3/N4) MoE router fusion.
+    // The single-row (nrows==1) exception keeps firing silently as before.
+    // Off by default; GGML_TP5_ROUTER_SCRATCH_DEBUG=1 (exact) enables the log.
+    if (n_rows > 1) {
+        static const bool debug_enabled = [] {
+            const char * value = getenv("GGML_TP5_ROUTER_SCRATCH_DEBUG");
+            return value != nullptr && value[0] == '1' && value[1] == '\0';
+        }();
+        if (debug_enabled) {
+            GGML_LOG_INFO("%s: topk_moe fused n_rows=%d n_expert=%d n_expert_used=%d logits='%s' no_reuse=%d\n",
+                          __func__, n_rows, n_experts, weights->ne[1], logits->name,
+                          (logits->flags & GGML_TENSOR_FLAG_NO_REUSE) ? 1 : 0);
+        }
+    }
+
     const float * logits_d  = (const float *) logits->data;
     float *       weights_d = (float *) weights->data;
     int32_t *     ids_d     = (int32_t *) ids->data;

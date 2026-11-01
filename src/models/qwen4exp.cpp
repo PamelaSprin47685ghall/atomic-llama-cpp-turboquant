@@ -77,6 +77,15 @@ static bool qwen4exp_router_scratch_enabled() {
     return enabled;
 }
 
+// Positive-fire telemetry for the verification harness; never changes behavior.
+static bool qwen4exp_router_scratch_debug_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_TP5_ROUTER_SCRATCH_DEBUG");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 // Keep the two existing top-k outputs alive for the fused expert reduction.
 // Their views, not the internal argsort/divide tensors, are materialized outputs.
 static void qwen4exp_moe_keep_route(ggml_tensor * out) {
@@ -1491,7 +1500,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     }
 
     const bool retain_router = qwen4exp_router_scratch_enabled() &&
-            n_expert == 512 && n_expert_used == 10 && cur->ne[1] > 1;
+            n_expert == 512 && n_expert_used == 10 &&
+            cur->ne[1] >= 2 && cur->ne[1] <= 4;
     const int router_first_node = retain_router ? ggml_graph_n_nodes(gf) : 0;
 
     ggml_tensor * moe_out =
@@ -1523,10 +1533,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             }
         }
         if (matches != 1 || !router_input || router_input->op != GGML_OP_MUL_MAT ||
-                router_input->view_src != nullptr || router_input->type != GGML_TYPE_F32) {
+                router_input->view_src != nullptr || router_input->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(router_input) ||
+                router_input->ne[0] != 512 || router_input->ne[1] != cur->ne[1]) {
             throw std::runtime_error("router scratch requires one direct F32 router projection per Qwen4Exp layer");
         }
         router_input->flags |= GGML_TENSOR_FLAG_NO_REUSE;
+        if (qwen4exp_router_scratch_debug_enabled()) {
+            LLAMA_LOG_INFO("%s: router_scratch retain layer %d logits '%s' shape [%lld, %lld]\n",
+                    __func__, il, router_input->name,
+                    (long long) router_input->ne[0], (long long) router_input->ne[1]);
+        }
     }
 
     // Finish the existing expert reduction before independent HC/PLE branches
