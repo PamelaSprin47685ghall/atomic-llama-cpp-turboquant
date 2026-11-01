@@ -8,14 +8,18 @@
 //
 //   - the padded KV window the whole-graph slot is composed for (the reuse
 //     contract of the lane) and the fit judgement the slot reuse gate uses;
-//   - the organic counter events POD (llama_prefab_stats), moved here so a
-//     CPU mock drives the identical production decision code and counters.
+//   - the armed counter-write helpers (llama_prefab_stat_tick/add); the POD
+//     itself (llama_prefab_stats) lives in the public header include/llama.h
+//     so external consumers read it through the llama_prefab_* C API, and a
+//     CPU mock still drives the identical production decision code.
 //
 // Every counter write in the lane is armed only by the exact-"1" gate
 // (GGML_TP5_PREFAB_STATS, llama_prefab_stats_enabled, defined in
 // llama-prefab-mtp.cpp); with the gate off no hot-path write happens and the
 // stock branches are behaviourally identical to the unpatched builder.
 //
+#include "llama.h" // struct llama_prefab_stats (public C API POD)
+
 #include <cstdint>
 
 #include <algorithm>
@@ -58,37 +62,6 @@ inline void llama_prefab_stat_add(uint64_t & counter, uint64_t v) {
 
 // per-context counters (all organic: incremented only where the event happens;
 // armed by llama_prefab_stats_enabled, the exact-"1" gate above)
-struct llama_prefab_stats {
-    uint64_t n_ubatch_prefab;       // ubatches executed on an envelope graph
-    uint64_t n_ubatch_stock;        // ubatches executed by the stock builder path
-    uint64_t n_stock_builds;        // stock model.build_graph() invocations
-    uint64_t n_stock_reuses;        // stock graph reuses (can_reuse == true)
-    uint64_t n_envelope_builds;     // envelope graph compositions
-    uint64_t n_envelope_reuses;     // envelope graph reused without rebuild
-    uint64_t n_envelope_allocs;     // ggml_backend_sched_alloc_graph on an envelope sched
-    uint64_t n_sub_envelope;        // ubatches with n_tokens < n_env (runtime padded)
-    uint64_t n_pad_rows;            // total pad rows executed
-    uint64_t n_factor_compiles;     // factor modules compiled
-    uint64_t n_factor_cache_hits;   // factor modules taken from the cache while composing
-    uint64_t n_factor_splices;      // factor modules spliced into an envelope
-    uint64_t n_factor_clones;       // tensors cloned by splicing
-    uint64_t n_cache_resets;        // topology-key invalidations of the factor cache
-    uint64_t n_fallback_no_scratch; // runtime fallback to stock: no free scratch KV cell
-    uint64_t n_fallback_runtime;    // runtime fallback to stock: adapters / samplers / attention views / ...
-    uint64_t last_n_env;            // envelope width of the last prefab ubatch
-    uint64_t last_n_tokens;         // real n_tokens of the last prefab ubatch
-    uint64_t last_graph_nodes;      // node count of the last executed envelope graph
-    uint64_t last_inp_tokens_ne0;   // ne[0] of the token input of the executed envelope graph (== last_n_env)
-    uint64_t n_decouple_declines;    // decouple iface: ubatches declined by the compose layer (gate on)
-    uint64_t n_decouple_handled;     // decouple iface: ubatches executed by the compose layer (gate on)
-    // MTP factor compose (GGML_TP5_PREFAB_IN_GRAPH=1), all organic:
-    uint64_t n_mtp_compose_hits;     // DECODER_MTP ubatches executed on a composed A x B envelope graph
-    uint64_t n_mtp_a_compiles;       // A (head prologue) modules built
-    uint64_t n_mtp_a_reuses;         // A modules taken from the cache while composing
-    uint64_t n_mtp_b_builds;         // B (block + epilogue) parts emitted into an envelope
-    uint64_t n_mtp_a_clones;         // tensors cloned from A while splicing it into an envelope
-    uint64_t n_mtp_declines;         // DECODER_MTP ubatches the compose layer declined (stock fallback)
-    uint64_t build_ns;              // wall time in instrumented request graph builds, excluding allocation/compute
-    uint64_t n_nodes_built;         // nodes in successfully emitted request graphs, plus compiled MTP A graphs
-    uint64_t template_hits;         // MTP A template cache hits, not whole-graph hits
-};
+// struct llama_prefab_stats moved to the public header (include/llama.h): the
+// counters are externally consumable through the llama_prefab_* C API, so the
+// POD lives where external consumers can see its layout.

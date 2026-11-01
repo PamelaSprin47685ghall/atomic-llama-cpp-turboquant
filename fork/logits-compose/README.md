@@ -85,3 +85,22 @@ python3 fork/logits-compose/tests/test_real_logits.py \
 ```
 
 This retains repeated full tapes, scalar-geometry suffix and prefill-only controls, a chunked-prefix tape, comparison output, and all commands and backend logs. The optional batch program checks the submitted prompt tokens and final maximum logit, and confirms that the selected token is within 1e-5 of that maximum, using an independent C consumer with the same prompt geometry. It does not obtain a second full-vocabulary row from that program. Repeated tapes and scalar suffix/prefix controls compare every vocabulary value. It also checks output preservation and, on Linux, a failed stdout sink after complete publication. Add `--gpu-layers 99` for a separate GPU run. It records cross-geometry differences as diagnostics and does not require CPU/GPU equality.
+
+## MTP draft contexts, prefab counters and the three-arm check
+
+`--mtp-ctx` creates the context as `LLAMA_CONTEXT_TYPE_MTP` over a Qwen4Exp GGUF with a nextn/MTP head. Each batch then carries the wide hidden-state plane (width `llama_model_n_embd_out`) next to the token ids, exactly like the production draft decode, and ubatches are forced to one token per step. The hidden-state plane is generated deterministically (pure integer splitmix64 over seed 20261031, position and channel) so every run, arm and host sees the same input stream; a real trunk export can replace it by driving the same `llama_batch::embd` plane. `--dual` adds a second independent context over the same model and interleaves decode steps A,B,A,B; it publishes a second tape at `OUTPUT.dual`.
+
+`--prefab-stats FILE` writes the per-context organic counters (public `llama_prefab_get_stats` / `llama_prefab_is_enabled` / `llama_prefab_n_cached_factors` C API) as JSON. The counters are armed only when `GGML_TP5_PREFAB_STATS` is exactly `"1"`; with the gate off every field stays zero and the hot path is untouched.
+
+The three-arm check runs identical decodes under environment arms that differ only in prefab gates and asserts, fail-closed:
+
+```sh
+python3 fork/logits-compose/tests/prefab_threarm.py \
+  --binary build-logits/tq-logits-compose \
+  --model /absolute/path/to/qwen4exp-draft.gguf \
+  --prompt-file prompts/one-prompt.txt \
+  --out-dir build-logits-threarm
+```
+
+Arms: `stock` (no prefab env; counters stay all-zero), `off` (`GGML_TP5_PREFAB_STATS=1` only: armed stock baseline), `slot` (`GGML_TP5_PREFAB_STATS=1 LLAMA_PREFAB_MTP=1`: the whole-graph slot over the exact live n_kv -- negative control with build parity against `off`), `on` (`GGML_TP5_PREFAB_STATS=1 GGML_TP5_PREFAB_AB=1 LLAMA_PREFAB_NKV_PAD=1`: the production A x B compose over the 1024-cell padded KV window) and `dual` (`on` + `--dual`). The prompt must tokenize to more than 256 tokens (with the default `--prefill 1` so every step requests `n_outputs = 1` and `--threads 1` so CPU split-KV chunking does not vary `chunk_size = ceil(nek1 / nth)` with `nek1`), crossing at least one 256-cell stock KV bucket inside the 1024-cell prefab window. The checks are: every tape bitwise identical to the stock tape; `stock` leaves every counter zero and never engages the lane; `off` never engages the lane and records the stock rebuilds (`>= 2`) across the 256-cell bucket boundary; `slot`/`on` engage it (slot reused or rebuilt per ubatch, no stock fallback, one A fetch per B emit); `slot` shows real build parity with `off` while `on` performs strictly fewer real graph builds (`1 < off`); and two dual contexts each count their own ubatches. A PASS certifies graph-build/reuse lifecycle and logits equality on the exercised host, model and backend only; it is not a throughput result and not a GPU claim.
+

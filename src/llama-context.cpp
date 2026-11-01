@@ -2648,6 +2648,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         //const auto t_start_us = ggml_time_us();
 
         {
+            // instrumented-build hygiene: a throwing build must not pollute the
+            // node counter with the PREVIOUS graph (gf still holds it here)
+            gf = nullptr;
             llama_prefab_build_timer timer{prefab_stats, gf};
             gf = model.build_graph(gparams);
         }

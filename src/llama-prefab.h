@@ -40,14 +40,14 @@ class  llama_kv_cache_context;
 extern "C" {
 #endif
 
-// per-context counters: see llama-prefab-hotpath.h (ggml-free seam: the POD
-// and the padded-KV reuse judgement of the whole-graph slot lane live there).
+// per-context counters: the POD (llama_prefab_stats) lives in the public
+// header include/llama.h; the padded-KV reuse judgement of the whole-graph
+// slot lane lives in llama-prefab-hotpath.h.
 
-LLAMA_API bool llama_prefab_is_enabled(const struct llama_context * ctx);
-LLAMA_API void llama_prefab_get_stats  (const struct llama_context * ctx, struct llama_prefab_stats * out);
-LLAMA_API void llama_prefab_reset_stats(struct llama_context * ctx);
-// number of cached factor modules currently owned by the context
-LLAMA_API size_t llama_prefab_n_cached_factors(const struct llama_context * ctx);
+// the four counters consumers (llama_prefab_is_enabled / get_stats /
+// reset_stats / n_cached_factors) are declared in the public header
+// include/llama.h next to struct llama_prefab_stats -- do not re-declare
+// them here with C++ linkage.
 
 #ifdef __cplusplus
 }
