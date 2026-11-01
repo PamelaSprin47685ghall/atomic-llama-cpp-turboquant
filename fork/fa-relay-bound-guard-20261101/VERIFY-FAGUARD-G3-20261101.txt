@@ -1,0 +1,290 @@
+FA RELAY-BOUND GUARD G3 — is the guard inert, and does the launch boundary fire?
+===============================================================================
+Executor: DevopsM3Gpu. GPU used (five cards idle, 0 %, both GPU locks held for every leg:
+12:30:09-12:31:12 and the probe runs after it). Private dir faguard-g3-20261101/ (0700). Source
+trees untouched. NOTE: the host is still in its post-reboot slowdown; every number below is a
+correctness result (bitwise / abort / predicate), never a timing claim.
+
+1) HARNESS
+----------
+  fa_relay_bound_micro.cpp (this leg) builds one FLASH_ATTN_EXT node through the real ggml-cuda
+  backend with an i32[1] src[5] and runs it on the same binary against two DSOs from the G2 leg:
+      base  libggml-hip-base.so   617e521d53569129…   (relay.hip without the guard)
+      guard libggml-hip-guard.so  14d0b3f5f6a0f21d…   (relay.hip + patched fattn-common.cuh)
+  The gate is set per case inside the process (GGML_TP5_FA_CHECKED_TAIL=1 always;
+  GGML_TP5_FA_RELAY_BOUND=1 only for the flag-on cases), so nothing leaks between cases.
+  Each case prints status, how many output words still hold the 0xA5A5A5A5 canary (proves the
+  destination was never written) and a hash of the output.
+  Command: ./fa_relay_bound_micro --case <name> [--n N] [--bound-kind scalar|vector|view]
+           env LD_LIBRARY_PATH=<libs-guard|libs-base>; logs in logs/.
+
+2) CASE MATRIX — guard DSO vs base DSO
+--------------------------------------
+  case                          guard                              base
+  a  flag unset, n=257          status 0, canary 0/1024, hash 923daf96…   identical
+  b  flag=1, n=1 / 257 / 512    status 0, canary 0/1024, hash 923daf96…   identical, all three
+  c  flag=1, n=513 / 700 / -2   status 0, canary 0/1024, hash 923daf96…   identical, all three
+  c  flag=1, src[5] i32[2]      status 0, canary 0/1024, hash 923daf96…   identical
+  c  flag=1, src[5] as a VIEW   status 0, canary 0/1024, hash 923daf96…   identical
+  c  flag=1, src[5] no buffer   status 0, canary 0/1024, hash 923daf96…   identical
+  d  flag unset, n=700          status 0, canary 0/1024, hash 923daf96…   identical
+  Every one of the 11 guard/base pairs is byte-identical, and every legal-value case is identical
+  for n = 1, 64, 257, 512 — which is also how this graph behaves without any bound at all, so the
+  src[5] value does not reach this node's output in any of these shapes.
+
+3) WHAT THE LAUNCH BOUNDARY SEES (evidence DSO, same relay.hip + one probe)
+--------------------------------------------------------------------------
+  The probe records the predicate at the op-dispatch case of ggml-cuda.cu, where the node is
+  handed to ggml_cuda_flash_attn_ext:
+      flag off, scalar src[5]   enabled=0 active=0 ingraph=0   flags=1  buffer set  ne0=1
+      flag on,  scalar src[5]   enabled=1 active=1 ingraph=0   flags=1  buffer set  ne0=1  (admitted)
+      flag on,  src[5] a VIEW   enabled=1 active=1 ingraph=1   flags=16 buffer set  ne0=1  (would abort)
+      flag on,  src[5] i32[2]   enabled=1 active=0                          (not a scalar: declines)
+  So the guard's predicate computes exactly what LIMITS.md §3a says it should, and it is the
+  identity of src[5] — flags/buffer/size — that decides it.
+
+4) WHAT IS NOT ESTABLISHED (stated because the matrix cannot show it)
+---------------------------------------------------------------------
+  * The abort itself was not observed: ggml_cuda_flash_attn_ext was reached in the probe build but
+    launch_fattn (the R2 site) was not entered for these nodes in this harness, so the "abort with
+    canary intact" claim has no direct witness here. What is witnessed is the predicate that guards
+    it (ingraph=1 for a view-bound src[5], 0 for the legal one) and the source order in the patch
+    (R2 sits at the head of launch_fattn, before any K/V work — G1 asserts that order statically).
+  * The vector case shows a real limit of the design, not a build problem: ggml_cuda_fattn_rtlen_tensor()
+    returns null for anything but i32[1], so the guard's predicate declines and the node runs
+    unguarded. That matches LIMITS.md §3a condition 3 (the guard protects only nodes that carry an
+    i32[1] src[5]); it means "not a scalar" is a case the launch boundary cannot refuse, because it
+    never becomes active for it.
+  * The relay's R1 (submit) path was not exercised: it needs the relay provider with captured stage
+    graphs, which this harness does not build.
+
+================================================================================
+APPENDIX — SECOND ATTEMPT: SHAPES THAT REACH launch_fattn (2026-11-01 12:40-12:46)
+================================================================================
+Both GPU locks held for every leg; no source tree modified; no timing claim (host still slow).
+
+1) WHY THE FIRST HARNESS NEVER REACHED launch_fattn
+---------------------------------------------------
+  Reading the selector (fattn.cu:3415-3505): a node with src[5] and GGML_TP5_FA_CHECKED_TAIL=1
+  sets fattn_nkv_bound, which skips the fused F32 route and the turbo-MMA route; the node then goes
+  through ggml_cuda_get_best_fattn_kernel(). For D=128, n_kv_head=1, gqa=8 and any query-row count
+  the selector answered BEST_FATTN_KERNEL_TILE (200) — confirmed with a probe build that prints the
+  value — and ggml_cuda_flash_attn_ext_tile() was entered. So the node does not take the MMA/VEC
+  route the first appendix assumed; it takes the tile route, whose launch_fattn is reached inside the
+  template chain (tile case -> switch_ncols2 -> switch_ncols1 -> launch_fattn). A probe at
+  launch_fattn still reported nothing, i.e. the chain stopped above it in that build; the exact frame
+  is not identified (probes inside the tile case body did not survive into the object either, so
+  that path of instrumentation is exhausted, not disproved).
+
+2) NEW HARNESS SHAPES (lf/fa_lf_micro, same binary for guard and base DSOs)
+--------------------------------------------------------------------------
+  Added --nq (query rows) and --ktype. Shapes exercised: nq = 1, 8, 33, 129 with F16 K/V,
+  D = 128, gqa = 8, built KV width 512, bound 257 (legal) or 700 (out of range).
+
+3) BITWISE LEGAL COMPARISON ON THOSE SHAPES (lf/logs/, both DSOs, flag on and off)
+--------------------------------------------------------------------------------
+    nq    guard flag-on        guard flag-off       base flag-on/off      identical
+     1    923daf960f308c6c     923daf960f308c6c     923daf960f308c6c      yes
+     8    f225b7f3d0c6c0be     f225b7f3d0c6c0be     f225b7f3d0c6c0be      yes
+    33    cc49a917c4a1611d     cc49a917c4a1611d     cc49a917c4a1611d      yes
+   129    f7781a998b50579d     f7781a998b50579d     f7781a998b50579d      yes
+  All 16 legs: status 0, canary 0/of, 0 non-finite. The guard changes nothing on legal input at any
+  of these shapes, and the bound value (257) does not change the output either.
+
+4) THE REFUSAL CASES, AND WHY THEY STILL DO NOT ABORT
+-----------------------------------------------------
+  At every shape, the view-bound src[5] case (the identity class the guard refuses) and the
+  out-of-range n=700 case both ran to status 0 with the same hash as the legal case, on the guard
+  DSO as well as the base DSO. Combined with the probe evidence of the first appendix (the launch
+  boundary's predicate reads active=1 ingraph=1 for the view-bound src[5], and ingraph=0 for the
+  legal one), the reading is: the predicate is computed correctly at the op dispatch, and the abort
+  block that consumes it is not executed on this path in this build. The canary is therefore intact
+  (nothing wrote dst) but that is not evidence of a refusal — it is evidence that no FA kernel ran
+  for these nodes in either build, which is also why every hash matches across DSOs.
+
+  So the R2 abort is still NOT witnessed end to end. The instrumentation that would prove it
+  (a probe inside launch_fattn) did not fire in any build made in this leg, and the two probes that
+  would have localised the gap (tile case body, ncols2 switch) did not survive into the objects —
+  this leg ran out of ways to instrument that chain without changing the object list of the link
+  (the tile instance objects are separate .cu.o files compiled from the same header, and the link
+  argv pins them by name).
+
+5) WHAT THIS APPENDIX DOES AND DOES NOT SETTLE
+----------------------------------------------
+  Settled: the guard is inert on legal input at four query-row shapes and two flags (16/16 legs
+  byte-identical to the base DSO), and the predicate that decides a refusal reads the right values
+  at the op dispatch.
+  Not settled: that the abort actually fires. Two independent attempts (decode shape and
+  query-row shapes) failed to enter launch_fattn, and the tile route this tree uses for these nodes
+  does not surface the abort to this harness.
+
+================================================================================
+APPENDIX 2 — TRACED KERNELS, CPU REFERENCE, AND THE REFUSAL CLASSES (12:47-12:50)
+================================================================================
+Both GPU locks held for every leg; no source tree modified; no timing claim. Link object lists
+unchanged: all probes live in DSOs rebuilt for this leg (tree4/), never in the shipped objects.
+
+1) THE HARNESS REALLY COMPUTES FA (rocprofv3 --kernel-trace, one legal leg, nq=8)
+-------------------------------------------------------------------------------
+  rocprofv3 is present (/usr/bin/rocprofv3). Kernel trace of one legal run on the guard DSO:
+      __amd_rocclr_copyBuffer              x2
+      flash_attn_tile<128,128,8,8,false>   x1   grid 32 x 64 x 1, LDS 33,792 B
+      flash_attn_combine_results<128>      x1   grid 1024 x 8 x 1
+  So the FA kernel launches on the GPU for these shapes, and the earlier "no FA kernel" reading
+  was wrong: it came from reading a value after the sentinel node had already overwritten dst.
+
+2) DESTINATION SENTINEL, DONE RIGHT
+-----------------------------------
+  The first attempt wrote the sentinel with ggml_backend_tensor_set before the compute, i.e. outside
+  the graph, so a later scheduling copy restored it and every hash became 0. The trace harness
+  (lf/fa_tr_micro) instead adds a GGML_OP_SET node after the FA node that fills dst with 0xA5A5A5A5,
+  and reads the FA output between the two computes. Result: with a real launch, dst holds FA values
+  (sentinel_left 0/8192, 0/33792); the sentinel survives only when no FA kernel runs.
+
+3) CPU REFERENCE (scalar FA over rows [0, bound), zero mask, F16 K/V, small inputs M3_SMALL=1)
+-------------------------------------------------------------------------------------------
+    nq   bound   GPU fa_maxabs   max |GPU - CPU|      fa_nonfinite
+     8     64       1.07e-2 (amp 0.05)   1.070e-02        0
+     8    257       3.86e-3              3.084e-03        0
+    33    257       3.86e-3              3.084e-03        0
+  Finite, and within 3.1e-3 of a straightforward fp64 scalar reference with F16 K/V (the tolerance
+  one expects from an fp16 tile kernel with fp32 accumulation); n=64's 1.07e-2 is the same shape of
+  error at a shorter bound. The output therefore is a real attention result, not a shape artefact.
+
+4) TRACED MATRIX, WITH THE REFUSAL CLASSES
+------------------------------------------
+    leg                     fa_kernels   dst sentinel left   max|GPU-CPU|
+    guard nq8 legal              4         0/8192             3.084e-03
+    guard nq8 no-flag            4         0/8192             3.084e-03
+    guard nq33 legal             4         0/33792            3.084e-03
+    guard nq8 view-bound         4         0/8192             3.084e-03
+    guard nq8 n=700              4         0/8192             9.555e-06
+    guard nq8 n=-2               4         0/8192             0.0
+    base  (same six legs)        4         0/of                same numbers
+  Legal legs are byte-identical between the guard and base DSOs (nq=8 hash f225b7f3d0c6c0be,
+  nq=33 cc49a917c4a1611d), so the guard is inert on legal input at these shapes, now on a path that
+  demonstrably runs the FA kernel.
+
+5) THE REFUSAL CLASSES DO NOT REFUSE — THE GUARD'S ABORT NEVER RUNS HERE
+-----------------------------------------------------------------------
+  * view-bound src[5] with GGML_TP5_FA_RELAY_BOUND=1: the op-dispatch record reads
+        enabled=1 rtlen=1 nkv=0 active=1 ingraph=1 has_buf=1 ne0=1 flags=16
+    i.e. the predicate classifies it as the class the guard refuses — and yet the FA kernel still
+    launches (4 kernels) and dst is overwritten. So on this path the abort block is not executed.
+  * n=700 and n=-2 with the flag on: both are legal values for this lane by design (the value keeps
+    the stock min() clamp, LIMITS.md §4 S1), and they ran, as expected. Note n=-2 behaves as
+    "no bound" (the reference over [0, bound) with bound<0 degenerates to all-zero logits, which is
+    why max|GPU-CPU| reads 0.0 there; it is not evidence of anything).
+  * The only path where the abort is claimed to run is launch_fattn, and in this build the tile
+    chain for these nodes does not reach it: probes at launch_fattn never fired, and the tile case
+    body/switch probes did not survive into the objects. Whether the abort is reachable at all from
+    the tile route therefore remains unproven.
+
+================================================================================
+APPENDIX 3 — R2 EXISTS NOW: FULL FA-TU REBUILD AND THE ABORT, WITNESSED
+================================================================================
+Main's diagnosis was right on both counts: the G2 objects were only relay-{base,guard}.o, so the
+launch_fattn template (instantiated in fattn.cu and the tile/vec/mma instance TUs) carried no R2 at
+all; and relay-patch had been patched twice. Both are fixed below. No source tree modified; the link
+object list and its order are the snapshot's own (191 objects, 79 of them substituted by content).
+
+1) PREPARE SCRIPT, FIXED (ee1ffc7e -> e380b803d2feef55)
+-------------------------------------------------------
+  clean DEST rp2/: --copy-only rc 0, --patch-only rc 0 ("candidate written"),
+  --patch-only again rc 0 -> "already applied once in … - nothing to do".
+  Counts in the patched copy: relay_bound_enabled=1, launch-boundary block=1, relay submit scan=1.
+  fattn-common.cuh 429e6082592eace3…, relay.hip 7c5b375923b74fe7… (single application).
+
+2) G2b — every TU that includes the FA headers, rebuilt twice
+------------------------------------------------------------
+  TU set: the 79 link objects whose source includes fattn-common.cuh (directly or through
+  fattn-tile.cuh / fattn-vec.cuh / fattn-mma-*.cuh): fattn.cu, fattn-tile.cu, fattn-vec.cu,
+  lightning-indexer.cu, relay.hip, and 73 template-instances/fattn-{tile,vec,mma-f16,mma-turbo}-
+  instance-*.cu. Recipes: the hybrid lane's recorded per-TU compile argv, redirected to a private
+  header root per variant (inc-guard = patched copy, inc-base = pristine fattn-common.cuh/relay.hip).
+      guard: 78 TUs compiled, 0 failed, 0 "error:" lines
+      base : 78 TUs compiled, 0 failed, 0 "error:" lines
+      relay: both variants rc 0, 0 errors
+      link : snapshot hip-link argv, 79 objects substituted, both rc 0
+  DSOs: libggml-hip-guard.so 79,729,880 B 33ab9fd7b44c7112…
+        libggml-hip-base.so  79,605,528 B b583bbc49f92c211…
+  Kernel set unchanged: 7,953 __device_stub__ symbols in both; the host symbol delta is exactly
+  76 copies of ggml_cuda_fattn_relay_bound_active + 76 of ggml_cuda_fattn_rtlen_enabled (the
+  header's inline helpers, one per TU) and nothing removed. The guard text is present in the guard
+  DSO ("produced inside this graph", "refused before submission") and absent from base.
+
+3) G3b — legal legs, traced, with the CPU reference
+---------------------------------------------------
+  Same harness (lf/fa_tr_micro, M3_DST_SENTINEL=1 M3_SMALL=1 M3_REF=1), rocprofv3 --kernel-trace:
+    guard nq=8  fa_hash d456383cf3e11a8b  ref_maxabs 1.128e-05  status 0  dst sentinel gone
+    base  nq=8  fa_hash d456383cf3e11a8b  ref_maxabs 1.128e-05  status 0  dst sentinel gone
+    guard nq=33 fa_hash b887fc44ee6d1f80  ref_maxabs (same)        status 0
+    base  nq=33 fa_hash b887fc44ee6d1f80                           status 0
+  Guard and base are bitwise identical on legal input, the FA output matches an fp64 CPU reference
+  to 1.1e-5, and the trace shows the FA kernels (flash_attn_tile<128,128,8,8,false> +
+  flash_attn_combine_results<128>) launching on the GPU.
+
+4) G3b — the refusal, witnessed (this is what failed twice before)
+------------------------------------------------------------------
+  Same shape (nq=8, D=128, gqa=8, F16 K/V), src[5] a view of a non-INPUT tensor, flag=1:
+    guard DSO  rc=134 (SIGABRT), stderr:
+        "GGML_TP5_FA_RELAY_BOUND: src[5] is produced inside this graph (streamed chunk staging);
+         the relay cannot prove that slot is fresh at replay time"
+        (from fattn-common.cuh:1563, inside launch_fattn's head)
+    guard DSO trace (rocprofv3, same run): 2 kernels, BOTH __amd_rocclr_copyBuffer (the input
+        uploads), flash_attn dispatches = 0.
+    base DSO, identical inputs and shape: rc 0, trace 8 kernels, flash_attn = 4
+        (two FA dispatches for the FA graph and two for the sentinel graph).
+  So with the guard on, the process dies at the launch boundary and no attention kernel is
+  dispatched; with the guard off, the same node runs four FA kernels. That differential is the
+  evidence the earlier attempts lacked.
+  The dst sentinel cannot be read back after SIGABRT (the process is gone and the device memory
+  with it); the equivalent fact is the trace's zero FA dispatches, plus R2's placement at the head
+  of launch_fattn, before the pool allocations, the K/V conversion and the first kernel.
+
+5) WHAT IS STILL NOT SHOWN
+--------------------------
+  R1 (the relay submit() refusal) has no runtime witness: it needs the relay provider with captured
+  stage graphs, and the DSO now contains it ("refused before submission" is in the guard build) but
+  no harness in this leg submits through the relay provider.
+  rocprofv3 cannot finalize after the child's SIGABRT (it hung and was killed at 45 s), so the abort
+  leg's CSV came from the killed profiler run and contains the two copyBuffer rows only; the zero
+  flash_attn count is from that file and is consistent with the process dying before any launch.
+
+================================================================================
+APPENDIX 4 — R1 WITNESSED: THE RELAY SUBMIT-TIME REFUSAL
+================================================================================
+New harness r1/fa_relay_r1.cpp: it creates a real relay provider over the five HIP devices (the same
+create() the meta backend calls), prepares one channel of F32 terminals, builds two stages x five
+ranks of graphs whose FLASH_ATTN_EXT nodes carry the src[5] class under test, and calls submit().
+Both GPU locks held for every leg; no source tree touched.
+
+1) THE REFUSAL (guard DSO, view-bound src[5], GGML_TP5_FA_RELAY_BOUND=1, CHECKED_TAIL=1)
+--------------------------------------------------------------------------------------
+  r1/fa_relay_r1 --case refuse --bound-kind view   (libggml-hip-guard.so, 33ab9fd7…)
+    {"case":"refuse","kind":"view","flag":1,"devices":5,"prepared":1,"submit":0,"error_code":95,
+     "epoch_before":0,"epoch_after":0,"attempted_mask":0,"accepted_mask":0,"failed":1,"finished":1,
+     "error":"relay: FLASH_ATTN_EXT src[5] is produced inside the graph; refused before submission"}
+  submit() returned false, error_code 95 = ENOTSUP, the message is the patch's own string, the epoch
+  stayed 0 and both masks stayed 0 — begin() was never entered, so no epoch, capture or launch exists.
+  Under rocprofv3 the same leg records 5 kernels, ALL __amd_rocclr_copyBuffer (the terminal uploads of
+  prepare) and zero compute/relay kernels: the refusal really happens before any submission work.
+
+2) THE SAME INPUT WITHOUT THE GUARD, AND WITHOUT THE FLAG
+---------------------------------------------------------
+    base DSO (no guard), view-bound, flag=1      -> no R1 error, submit proceeds (killed at 25 s)
+    guard DSO, view-bound, flag unset            -> no R1 error, submit proceeds (killed at 25 s)
+    guard DSO, legal host-input i32[1] bound     -> no R1 error, submit proceeds (killed at 25 s)
+  "Proceeds" means the provider leaves the scan and enters its real path; those legs do not return
+  within 25 s because a complete relay submission needs the consumer's poll/publish loop, which this
+  harness does not run. They are the differential that shows the refusal above is the scan's work and
+  not a generic failure: same process shape, same devices, only the src[5] class and the flag differ.
+
+3) HARNESS DETAIL THAT MATTERED
+-------------------------------
+  The legal case only passes once its src[5] is a real class-A bound: an INPUT tensor WITH a buffer,
+  allocated by ggml_backend_alloc_ctx_tensors into the rank's backend. Before that allocation the
+  tensor had buffer == nullptr and the guard correctly refused it as class B — the classifier's second
+  condition doing exactly what LIMITS.md §3 says.
+
+VERDICT FAGUARD G3 PASS (R1 + R2 witnessed) — R1: view-bound src[5] with GGML_TP5_FA_RELAY_BOUND=1 makes relay submit() return false, error_code 95 (ENOTSUP), message 'relay: FLASH_ATTN_EXT src[5] is produced inside the graph; refused before submission', epoch 0 and both masks 0 (begin() never entered), trace = 5 prepare copyBuffer kernels and 0 compute kernels; the same input with the flag unset or on the unguarded DSO proceeds instead, and a legal host-input bound passes the scan. R2 as in appendix 3: rc=134 with the exact 'src[5] is produced inside this graph' text and 0 flash_attn dispatches against 4 on base

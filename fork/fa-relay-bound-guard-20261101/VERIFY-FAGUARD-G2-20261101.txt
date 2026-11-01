@@ -1,0 +1,71 @@
+FA RELAY-BOUND GUARD G2 — HIP build and inertness check, 2026-11-01
+===================================================================
+Executor: DevopsM3Gpu. CPU-only; no GPU leg was run (the host has a persistent post-reboot slowdown,
+so timing would be meaningless). Private dir faguard-g2-20261101/ (0700). The source tree
+/home/kunweiz/work/fa-guard-publish-20261101 was not modified; the only file this leg wrote outside
+its private dir is the script's own default output (see step 1).
+
+1) PREPARE SCRIPT (ee1ffc7e…)
+-----------------------------
+  Script: /home/kunweiz/work/lead-fa-ncols2-g2-verify-20261031/relay-guard-v3-20261101/
+          prepare_relay_bound_guard.py  sha256 ee1ffc7e974035a0… (same file as in
+          fa-src5-device-guard-20261031/). It never writes into SRC; it copies the three pinned
+          files plus an include closure into DEST and applies anchored, assert-exactly-once edits.
+  Run:    python3 prepare_relay_bound_guard.py --all /home/kunweiz/work/fa-guard-publish-20261101
+              <private dir>/relay-patch        -> "copied to …", "candidate written to …"
+  Pinned inputs match: fattn-common.cuh bf48c4be…, fattn.cu 3c826daa…, relay.hip ac139371… are
+  byte-identical in the tree to revision 03024e721 (an ancestor of HEAD ad36abf9c), so no
+  SOURCE-DRIFT.
+  Idempotence: a second full run into a fresh directory produced byte-identical patched files
+  (diff -r: no differences except the CLOSURE/diff artefacts), and a --patch-only re-run on an
+  already patched copy still succeeds. The anchors are single-occurrence asserts, so a second apply
+  cannot silently double-apply.
+  Patched outputs: relay.hip ac139371… -> 7c5b3759…, fattn-common.cuh bf48c4be… -> 429e6082…
+  (fattn.cu unchanged). CANDIDATE.diff = 169 lines.
+  Declaration: the script's --patch-only default DEST is its own directory, so one early invocation
+  wrote relay-patch/ inside relay-guard-v3-20261101/ (a verification dir, not a source tree). It
+  was not used for the build; the build used the private copy.
+
+2) BUILD — lane recipes, privately redirected
+---------------------------------------------
+  Recipes: mtp-async-prewarm-draft-8x2-20261027/build/{relay-compile-pw,hip-link-pw}.argv.json,
+  with the source/object/output substituted and one added include root: the patched relay.hip now
+  includes fattn-common.cuh, so the private include dir (the guard tree's ggml-cuda headers with the
+  patched .cuh files overlaid) is put first on the command line. Logs: logs/.
+      base  (unpatched relay.hip, 03024e721): compile rc 0, 0 errors, link rc 0
+      guard (patched relay.hip, 7c5b3759):    compile rc 0, 0 errors, link rc 0
+      libggml-hip-base.so   68,638,040 B  617e521d53569129…
+      libggml-hip-guard.so  68,639,448 B  14d0b3f5f6a0f21d…
+  First attempt failed with "fattn-common.cuh file not found" and then with undeclared guard
+  helpers; both were the include root above (the patched header must be the one the TU sees), not a
+  source problem. With the patched headers in front, the build is clean.
+
+3) SYMBOLS AND INERTNESS
+------------------------
+  Host symbols: base 70, guard 70. The only difference is one compiler-generated lambda symbol,
+      ggml_cuda_fattn_rtlen_enabled()::{lambda()#1}::operator()()
+  i.e. the guard adds no exported entry point; the relay's submit() keeps its signature and the
+  gate is an in-line branch. Device: 16 kernel stubs before and after, identical names.
+  Device image: same size (50,858,112 B); a byte comparison shows exactly one differing region,
+  8,704,078..8,725,720 (21,643 B) — the bundle's embedded host object (its size field moves
+  0x42e0 -> 0x44f8); everything after it is byte-identical. So no kernel was added, removed or
+  changed by the guard.
+  Inertness by construction, read from the patch:
+      ggml_cuda_fattn_relay_bound_enabled() caches getenv("GGML_TP5_FA_RELAY_BOUND") == "1";
+      relay.hip submit() enters the scan only under that flag, and the scan itself only inspects
+      nodes whose op is GGML_OP_FLASH_ATTN_EXT and that the shared predicate classifies as carrying
+      an in-graph src[5] bound; launch_fattn's device check is likewise behind the same predicate.
+  With the variable unset the scan does not run, no kernel is launched by it, and no tensor is
+  touched — the only residue is the branch and the flag read.
+  NOT established here (no GPU leg, by instruction): that the flag-on path aborts as intended, and
+  any timing.
+
+4) SCOPE
+--------
+  Established: the prepare script applies once, idempotently, with pinned inputs intact; the patched
+  tree compiles and links with the lane's recipes (0 errors); the guard adds no host entry point and
+  no device kernel; with its env unset it is a branch around a scan that never runs.
+  NOT established: runtime behaviour, and the other patched TUs (fattn.cu, the .cuh closure) were
+  only used as headers for this one TU, not compiled on their own.
+
+VERDICT FAGUARD G2 BUILD PASS (prepare ee1ffc7e applies once and idempotently with pinned inputs intact; base and guard relay.hip both rc0 with 0 errors; host symbol set unchanged apart from one inlined lambda; 16 device stubs unchanged and the device code byte-identical, so with GGML_TP5_FA_RELAY_BOUND unset the guard adds no kernel and only a flag-gated branch; runtime path untested by instruction)

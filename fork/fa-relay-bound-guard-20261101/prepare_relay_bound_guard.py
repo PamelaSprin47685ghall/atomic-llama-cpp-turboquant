@@ -315,6 +315,17 @@ def patch_phase():
     # 1. predicates + in-graph classifier (fattn-common.cuh)
     p = os.path.join(DST, "ggml/src/ggml-cuda/fattn-common.cuh")
     s = open(p).read()
+    # A second run on an already patched DEST must not stack another copy of every block:
+    # the anchors survive patching, so counting them alone cannot tell the two states apart.
+    # Accept exactly one complete application as done; refuse anything else.
+    r = open(os.path.join(DST, "ggml/src/ggml-cuda/relay.hip")).read()
+    applied = (s.count("static inline bool ggml_cuda_fattn_relay_bound_enabled()"),
+               s.count(DEVICE_ANCHOR + DEVICE_CODE),
+               r.count(RELAY_CODE + RELAY_ANCHOR))
+    if applied == (1, 1, 1):
+        print("already applied once in", DST, "- nothing to do")
+        return
+    assert applied == (0, 0, 0), "DEST partially or repeatedly patched %s; re-run --copy-only first" % (applied,)
     assert s.count(HELPER_ANCHOR) == 1, "helper anchor"
     assert s.index("static inline const ggml_tensor * ggml_cuda_fattn_rtlen_tensor(") < \
         s.index(HELPER_ANCHOR), "helper must follow the rtlen accessor"
