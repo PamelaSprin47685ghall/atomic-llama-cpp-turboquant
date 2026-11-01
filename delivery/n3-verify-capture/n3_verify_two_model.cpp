@@ -269,6 +269,10 @@ int32_t head_step(llama_context * hctx, llama_token token, llama_pos q, const fl
     require(int32_t(llama_model_n_embd_out(llama_get_model(hctx))) == wide,
             "head_step: the residual width does not match the head model's input width");
     llama_batch b = llama_batch_init(1, wide, 1);
+    // llama_batch_init allocates embd or token, not both; the NextN graph reads both, and
+    // llama_batch_free frees both pointers with std::free.
+    b.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
+    require(b.token != nullptr, "head token allocation failed");
     b.n_tokens     = 1;
     b.token[0]     = token;
     b.pos[0]       = q;
@@ -590,7 +594,9 @@ int main(int argc, char ** argv) {
         for (size_t i = 0; i < pt.size(); ++i) {
             const bool last = (i + 1 == pt.size());
             const float * tgt = decode_one(win.target.get(), win.seq, llama_pos(i), pt[i], last);
-            require(tgt != nullptr, "prompt logits missing");
+            if (last) {
+                require(tgt != nullptr, "prompt logits missing");
+            }
             if (capture_on && !last) {
                 (void) decode_one(win.n1.get(), win.seq, llama_pos(i), pt[i], false);
             }
@@ -598,14 +604,18 @@ int main(int argc, char ** argv) {
             require(h != nullptr,
                     "the trunk did not export the wide NextN residual; the two-model layout "
                     "needs it as the head's input");
-            std::vector<float> next;
-            (void) head_step(win.head.get(), pt[i], llama_pos(i), prev.data(), wide, n_vocab, &next);
-            prev = next;
+            // This row's trunk residual is the head's input at the NEXT position (shift-by-one);
+            // copy it out before any later decode can overwrite the trunk's buffer.
+            std::vector<float> next(h, h + wide);
+            (void) head_step(win.head.get(), pt[i], llama_pos(i), prev.data(), wide, n_vocab, nullptr);
+            prev = std::move(next);
             if (last && capture_on) {
                 cap.row("prefill", "target", w, win.seq, 0, 0, llama_pos(i), pt[i], tgt);
                 const float * n1 = decode_one(win.n1.get(), win.seq, llama_pos(i), pt[i], true);
                 require(n1 != nullptr, "reference prompt logits missing");
                 cap.row("prefill", "n1", w, win.seq, 0, 0, llama_pos(i), pt[i], n1);
+                require(llama_memory_seq_rm(llama_get_memory(win.n1.get()), win.seq, -1, -1),
+                        "reference prefill state removal failed");
             }
         }
         win.head_h = prev;
@@ -774,7 +784,9 @@ int main(int argc, char ** argv) {
                                 size_t(n_vocab) * sizeof(float)) == 0) ? 0 : 1;
                     }
                 }
-                const float * hr2 = llama_get_embeddings_nextn_ith(win.target.get(), accepted);
+                // verify_one decodes one real row at batch index 0, so the last replayed row's
+                // residual sits at index 0 rather than `accepted`.
+                const float * hr2 = llama_get_embeddings_nextn_ith(win.target.get(), 0);
                 require(hr2 != nullptr, "trunk wide residual missing after the replay");
                 last_h.assign(hr2, hr2 + wide);
                 state_path = "replay";

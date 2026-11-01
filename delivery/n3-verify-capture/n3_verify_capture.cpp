@@ -283,6 +283,8 @@ int32_t greedy(const float * logits, uint32_t n_vocab) {
 int32_t head_step(llama_context * dctx, llama_token token, llama_pos q, const float * h_wide,
                   int32_t wide, uint32_t n_vocab, std::vector<float> * out_h) {
     llama_batch b = llama_batch_init(1, wide, 1);
+    b.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
+    require(b.token != nullptr, "head token allocation failed");
     b.n_tokens     = 1;
     b.token[0]     = token;
     b.pos[0]       = q;
@@ -572,14 +574,19 @@ int main(int argc, char ** argv) {
         for (size_t i = 0; i < pt.size(); ++i) {
             const bool last = (i + 1 == pt.size());
             const float * tgt = decode_one(win.target.get(), win.seq, llama_pos(i), pt[i], last);
-            require(tgt != nullptr, "prompt logits missing");
+            if (last) {
+                require(tgt != nullptr, "prompt logits missing");
+            }
+            if (!last) {
+                (void) decode_one(win.n1.get(), win.seq, llama_pos(i), pt[i], false);
+            }
             // this row's residual is the head's input for the NEXT row: fetch it before the next
             // decode overwrites the context's residual buffer
             const float * h = llama_get_embeddings_nextn_ith(win.target.get(), 0);
             require(h != nullptr, "target did not export the wide NextN residual");
-            std::vector<float> next;
-            (void) head_step(win.draft.get(), pt[i], llama_pos(i), prev.data(), wide, n_vocab, &next);
-            prev = next;
+            std::vector<float> next(h, h + wide);
+            (void) head_step(win.draft.get(), pt[i], llama_pos(i), prev.data(), wide, n_vocab, nullptr);
+            prev = std::move(next);
             if (last) {
                 const float * n1 = decode_one(win.n1.get(), win.seq, llama_pos(i), pt[i], true);
                 require(n1 != nullptr, "reference prompt logits missing");
@@ -587,6 +594,8 @@ int main(int argc, char ** argv) {
                     cap.row("prefill", w, win.seq, 0, 0, llama_pos(i), pt[i], tgt);
                     cap.row("prefill", w, win.seq, 0, 1, llama_pos(i), pt[i], n1);
                 }
+                require(llama_memory_seq_rm(llama_get_memory(win.n1.get()), win.seq, -1, -1),
+                        "reference prefill state removal failed");
             }
         }
         win.head_h = prev;
@@ -792,7 +801,7 @@ int main(int argc, char ** argv) {
                 ++win.replays;
                 // the replay re-decoded row `accepted`; re-read its residual so the head is fed
                 // the row that is actually in the context now
-                const float * hr2 = llama_get_embeddings_nextn_ith(win.target.get(), accepted);
+                const float * hr2 = llama_get_embeddings_nextn_ith(win.target.get(), 0);
                 require(hr2 != nullptr, "target wide residual missing after the replay");
                 last_h.assign(hr2, hr2 + wide);
             }
