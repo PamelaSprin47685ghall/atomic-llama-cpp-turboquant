@@ -203,7 +203,8 @@ struct model_ptr {
 
 struct context_ptr {
     llama_context * p = nullptr;
-    ~context_ptr() { if (p) llama_free(p); }
+    bool owned = true;
+    ~context_ptr() { if (p && owned) llama_free(p); }
     llama_context * get() const { return p; }
 };
 
@@ -438,6 +439,7 @@ int main(int argc, char ** argv) {
     mparams.n_gpu_layers  = 99;
     mparams.split_mode    = LLAMA_SPLIT_MODE_TENSOR;
     mparams.offload_input = true;
+    mparams.load_mtp      = true;
 
     model_ptr model;
     model.p = llama_model_load_from_file(model_path.c_str(), mparams);
@@ -499,7 +501,12 @@ int main(int argc, char ** argv) {
         auto np = base_params();
         np.n_batch  = 1;
         np.n_ubatch = 1;
-        win.n1.p    = llama_init_from_model(model.get(), np);
+        if (w == 0) {
+            win.n1.p    = llama_init_from_model(model.get(), np);
+        } else {
+            win.n1.p     = windows[0].n1.p;
+            win.n1.owned = false;
+        }
         require(win.n1.get() != nullptr, "N1 reference context creation failed");
         llama_set_embeddings_nextn(win.n1.get(), true, /*masked=*/false);
 

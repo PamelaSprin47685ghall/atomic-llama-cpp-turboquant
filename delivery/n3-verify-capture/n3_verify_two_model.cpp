@@ -185,7 +185,8 @@ struct model_ptr {
 
 struct context_ptr {
     llama_context * p = nullptr;
-    ~context_ptr() { if (p) llama_free(p); }
+    bool owned = true;
+    ~context_ptr() { if (p && owned) llama_free(p); }
     llama_context * get() const { return p; }
 };
 
@@ -417,7 +418,9 @@ int main(int argc, char ** argv) {
     }
 
     model_ptr head;
-    head.p = llama_model_load_from_file(head_path.c_str(), mparams);
+    auto hparams = mparams;
+    hparams.load_mtp = true;
+    head.p = llama_model_load_from_file(head_path.c_str(), hparams);
     require(head.get() != nullptr, "head model load failed (the separate trained NextN GGUF)");
     if (llama_model_n_layer_nextn(head.get()) != 1) {
         refuse("the head model does not carry exactly one NextN block");
@@ -518,7 +521,12 @@ int main(int argc, char ** argv) {
         np.n_batch   = 1;
         np.n_ubatch  = 1;
         np.n_rs_seq  = tp.n_rs_seq;
-        win.n1.p     = llama_init_from_model(trunk.get(), np);
+        if (w == 0) {
+            win.n1.p     = llama_init_from_model(trunk.get(), np);
+        } else {
+            win.n1.p     = windows[0].n1.p;
+            win.n1.owned = false;
+        }
         require(win.n1.get() != nullptr, "N1 reference context creation failed");
         llama_set_embeddings_nextn(win.n1.get(), true, /*masked=*/false);
         // and the values must actually agree, not merely be requested
