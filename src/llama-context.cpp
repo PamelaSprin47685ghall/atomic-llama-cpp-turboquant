@@ -4828,11 +4828,12 @@ int llama_context::decode_n3_verify_logits(
         LLAMA_LOG_ERROR("%s: verify rows do not fit one tp5-relay ubatch (n_ubatch=%u)\n", __func__, cparams.n_ubatch);
         return -1;
     }
-    // the copies go through the context's logits buffer, which is sized for n_outputs_max rows
-    // and is only read back when it exists
-    if (logits.data == nullptr || n_vocab <= 0 ||
-            logits.size < size_t(uint64_t(n_vocab) * uint64_t(n_rows))) {
-        LLAMA_LOG_ERROR("%s: the context has no logits buffer for %d rows\n", __func__, n_rows);
+    // The logits buffer is sized by decode() itself (output_reserve(n_outputs)), so its size
+    // before the step says nothing about this step: a context made with n_seq_max = 1 holds one
+    // row until a multi-row batch arrives. Only the vocabulary is checked here; the buffer is
+    // checked after the decode, before any row is copied out.
+    if (n_vocab <= 0) {
+        LLAMA_LOG_ERROR("%s: the model has no vocabulary\n", __func__);
         return -1;
     }
     for (int32_t i = 0; i < n_rows; ++i) {
@@ -4915,6 +4916,11 @@ int llama_context::decode_n3_verify_logits(
     // complete once the backend is synchronized. Do it before any row is copied out: reading
     // an in-flight row would be a torn value, not a logits row.
     synchronize();
+
+    if (logits.data == nullptr || logits.size < size_t(uint64_t(n_vocab) * uint64_t(n_rows))) {
+        LLAMA_LOG_ERROR("%s: the context has no logits buffer for %d rows after the step\n", __func__, n_rows);
+        return rewind(-102);  // not a decode status: the step left no room for its own rows
+    }
 
     // The output rows are the batch rows in batch order: one sequence with every row flagged
     // output, so out_ids is [0, 1, 2] and llama_get_logits_ith(i) is batch row i.
