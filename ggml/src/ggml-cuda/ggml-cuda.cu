@@ -5267,40 +5267,31 @@ static bool ggml_cuda_fuse_hc_owner_tail4_t1(
         const uintptr_t bp = uintptr_t(b->data);
         return ap <= bp ? bp - ap < ggml_nbytes(a) : ap - bp < ggml_nbytes(b);
     };
-    // Algorithm equivalence gate. The fused kernel and the generic MUL_MAT
-    // kernel must sum the k = 320 dot product in the same order, or the two
-    // paths return different floats and the fusion silently changes values.
-    // The predicate answers that question per weight type and device:
-    //   Q8_0  -> hc_owner_tail4_t1_q8_mmvq mirrors mul_mat_vec_q<Q8_0> block
-    //            for block (same Q8_1 activation form, same lane mapping, same
-    //            wave tree, no small-k packing): equivalent, fusion admitted;
-    //   Q4_0  -> the generic kernel quantizes the weights on the fly, so the
-    //            fused Q4_0 wave tree cannot match it: refused;
-    //   BF16  -> no mirror yet, and mmvf's load4 order is not the fused one:
-    //            refused.
-    // A refusal is fail-closed: the caller keeps the generic 12-node chain and
-    // no value changes. This gate is about values only; storage is the next
-    // check.
-    if (!ggml_cuda_hc_owner_tail4_equivalent(ctx, weights)) {
-        return false;
-    }
-    // Storage liveness of the three inputs. The fused kernel reads weights
-    // and lo at i (up) and xn at i+2 (gated), all inside nodes i..i+11, so a
-    // reader inside that window is the kernel's own read and must not veto.
-    // What vetoes is a reader the kernel does not absorb: one at or after
-    // i+12, the first node after the fused window.
-    //
-    // out is deliberately not tested here. It is the kernel's output, so every
-    // normal downstream consumer of it reads at or after i+12, and testing it
-    // would reject every site. The question that matters for out is whether it
-    // is a fresh allocation: out->view_src == nullptr is part of the topology
-    // above, and any address overlap with the inputs is already refused by the
-    // overlaps() checks and by has_owner_tail_hazard().
-    const int tail_end = i + 11;
-    if (aliases.read_at_or_after(ctx, cgraph, weights, tail_end + 1) ||
-            aliases.read_at_or_after(ctx, cgraph, lo, tail_end + 1) ||
-            aliases.read_at_or_after(ctx, cgraph, xn, tail_end + 1)) {
-        return false;
+    // T=1 keeps the qualified control's decisions and kernel
+    // (hc_owner_tail4_t1_q8_f32 / _q4_f32 / _bf16): the T=1 fused tail is the
+    // N=1 reference the acceptance rules compare against, so it must fuse at
+    // exactly the sites the control fuses. The two extra gates below exist
+    // for the opt-in Q8_1 mirror only (GGML_CUDA_HC_TAIL_MMVQ_T1=1, a micro
+    // comparison against the unfused chain):
+    //   * equivalence: only Q8_0 on RDNA2 has a mirror of mul_mat_vec_q;
+    //   * input liveness: a reader of weights/lo/xn at or after i+12.
+    // Neither is a storage hazard for the default kernel. It writes only out,
+    // never its inputs, so a later reader of an input sees unchanged bytes;
+    // out's disjointness from the inputs is refused below by overlaps() and
+    // has_owner_tail_hazard(), and the closure of the intermediate nodes by
+    // ggml_can_fuse_subgraph() above.
+    static const bool mmvq_t1 = getenv("GGML_CUDA_HC_TAIL_MMVQ_T1") != nullptr &&
+            std::atoi(getenv("GGML_CUDA_HC_TAIL_MMVQ_T1")) == 1;
+    if (mmvq_t1) {
+        if (!ggml_cuda_hc_owner_tail4_equivalent(ctx, weights)) {
+            return false;
+        }
+        const int tail_end = i + 11;
+        if (aliases.read_at_or_after(ctx, cgraph, weights, tail_end + 1) ||
+                aliases.read_at_or_after(ctx, cgraph, lo, tail_end + 1) ||
+                aliases.read_at_or_after(ctx, cgraph, xn, tail_end + 1)) {
+            return false;
+        }
     }
     if (overlaps(out, weights) || overlaps(out, lo) || overlaps(out, xn) ||
             aliases.has_owner_tail_hazard(ctx, cgraph, i)) {

@@ -506,17 +506,15 @@ bool ggml_cuda_op_hc_owner_tail4_t1(
         return false;
     }
     const int dim = int(dst->ne[0]);
-    // The Q8_0 tail runs only when its arithmetic can be the generic kernel's
-    // arithmetic. hc_owner_tail4_t1_q8_f32 multiplies unquantized F32 lo by the
-    // Q8_0 weights, while mul_mat_vec_q quantizes lo to Q8_1 first, so the two
-    // differ by an 8-bit activation quantization. The mirror
-    // hc_owner_tail4_t1_q8_mmvq uses the generic vec_dot over the same Q8_1
-    // form, so the fused and generic paths differ in node count and in nothing
-    // else. Any mismatch in the layout, the device or the quantization falls
-    // back to the generic chain.
+    // At T=1 (lo->ne[1] == 1), the qualified control (f1c5fafc0) and the trio
+    // baseline already fuse every Q8_0 site with hc_owner_tail4_t1_q8_f32 (one
+    // kernel, F32 lo). Keep that default at T=1 so T=1 preserves 1-kernel
+    // execution and bitwise parity with the T=1 control; the Q8_1 generic-MMVQ
+    // mirror at T=1 remains available under GGML_CUDA_HC_TAIL_MMVQ_T1=1 for
+    // direct micro comparison against GGML_CUDA_FUSE_HC_OWNER_TAIL=0.
     if (q8) {
-        static const bool legacy_tree = getenv("GGML_CUDA_HC_TAIL_LEGACY_TREE") != nullptr &&
-                std::atoi(getenv("GGML_CUDA_HC_TAIL_LEGACY_TREE")) == 1;
+        static const bool mmvq_t1 = getenv("GGML_CUDA_HC_TAIL_MMVQ_T1") != nullptr &&
+                std::atoi(getenv("GGML_CUDA_HC_TAIL_MMVQ_T1")) == 1;
         constexpr int64_t k = 320;
         // The generic kernel packs rows only when one block already covers the
         // row (should_use_small_k). On RDNA2 nwarps = 1 and blocks_per_iter is
@@ -528,7 +526,7 @@ bool ggml_cuda_op_hc_owner_tail4_t1(
         // quantize_q8_1 reads one element per thread with ne00 = ne0 = k, so the
         // source is lo itself: no staging copy and no padding block. k must be
         // a whole number of Q8_1 blocks for that to hold.
-        if (!legacy_tree && !small_k && k % QK8_1 == 0 &&
+        if (mmvq_t1 && !small_k && k % QK8_1 == 0 &&
                 device.cc == GGML_CUDA_CC_RDNA2 && device.warp_size == 32 &&
                 hc_owner_tail4_t1_admissible(ctx, weights, lo, xn, dst) &&
                 ggml_nbytes(lo) == size_t(k) * sizeof(float)) {

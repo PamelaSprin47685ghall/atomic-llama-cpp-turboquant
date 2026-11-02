@@ -261,3 +261,156 @@ B2) MODEL 32x2 — generic_32x2 (fix2 DSO, gate 0), both locks 11:10:19-11:12:29
       expected: ON is bitwise equal to GENERIC.
 
 VERDICT M3 ROWS EXACT (vs generic chain) — same-DSO micro: fused vs GGML_CUDA_FUSE_HC_OWNER_TAIL=0 bitwise at R=1..4 in three rounds (0 differing bytes, 12/12 comparisons); model 32x2: onfix_32x2 vs generic_32x2 whole logits bitwise, 32/32 rows per request, KL 0, top1 32/32 + 32/32, 32/32 tokens equal both requests; GENERIC leg has 0 fused sites (0 witness lines, gate 0 in command.json); the earlier R=1 residue and the ON-vs-OFF KL are the control build's old F32 shortcut (GENERIC vs OFF: req0 KL mean 0.00248 / max 0.00680, top1 2/3; req1 KL mean 0.00130 / max 0.02464, top1 32/32)
+
+================================================================================
+APPENDIX C — T=1 CONTROL PARITY AND R=2..4 MMVQ (fix3, 2026-11-02)
+================================================================================
+Executor: DevopsFreshBoot. Private dir m3-rows-g3g4-20261101/. Build under both VFS build locks;
+GPU legs under both GPU locks, one HIP process at a time. No selected install or source tree changed.
+
+A) BUILD
+--------
+  mmvf.cu sha256 fedc9845cd888afdfc073ff47eed98cbf791c5bb7ac922bfd6e0932a7ed471ce
+  fix3/build3.sh: compile rc=0 (0 errors), link rc=0, VFS locks 15:52:05-15:52:27.
+    fix3/obj/mmvf.cu.o              81e26bc365019a65f3902823c1dfaedb07cea59ed8ac1310239daccba01687b5
+    fix3/lib/libggml-hip-on-fix3.so 360256b6a97f12a5ada58f772fcc524cf9586a3ac9c935eef6c87ce6cb4ea406
+                                    68,663,280 B
+  Recipe identical to fix2 (G2 on-side mmvf argv, G2 on-side ggml-cuda.cu object, G2 on-side link
+  argv); fix3/inc is a copy of fix2/inc (mmvf.cuh unchanged 436c0d69…).
+  Reproduction note: m3rows-micro links libggml-hip.so.0 against a RUNPATH install, so the <libdir>
+  argument alone is ignored (the SONAME is already loaded). Every leg below sets
+  LD_LIBRARY_PATH=<libdir>; a first pass without it silently ran the trio install and produced a
+  false all-equal result, which was discarded.
+
+B) MICRO G3 (fix3p, sites=1, reps=50, check=1, pin=0, M3_TAIL_WHY=1)
+---------------------------------------------------------------------
+    R   fix3 kernels  control kernels  generic kernels  fix3-vs-control  fix3-vs-generic
+    1        4               4                7              0 B          5,098 B (F32 vs generic)
+    2        5               8                8              0 B              0 B
+    3        5               8                8              0 B              0 B
+    4        5               8                8              0 B              0 B
+    R=1 with GGML_CUDA_HC_TAIL_MMVQ_T1=1: 5 kernels, 0 B vs generic (7 kernels).
+  All required comparisons are zero: default R=1 == f1c5fafc0 control (4 kernels), MMVQ_T1=1 R=1 ==
+  FUSE=0, R=2..4 == control and FUSE=0 (5 vs 8 kernels); 8/8 required comparisons 0 bytes,
+  FIX3-MICRO rc=0. The R=1 default-vs-generic 5,098 B is the known F32-vs-Q8_1 arithmetic
+  difference, not a failure.
+  Output hashes: r1 control/fix3 d40f9e76…; r1 generic/mmvq 01808b52…; r2 16152a37…; r3 e90c652c…;
+  r4 1383d295….
+
+C) MODEL G4 32x2
+----------------
+  run-g4-fix3.sh, both locks 15:53:55-15:57:05:
+    onfix3_32x2  fix3 DSO                                   rc=0  wall  76.5 s
+    tkeep0_32x2  fix3 DSO + GGML_TP5_HC_N3_TAIL_KEEP=0      rc=0  wall 113.1 s
+  Both legs run with GGML_CUDA_FUSE_HC_OWNER_TAIL=1. The selected environment carries no HC_N3
+  keys and TAIL_KEEP requires both TAIL_KEEP=1 and TRIO=1, so both legs are tail-keep off; the
+  explicit-0 leg is a determinism control (its 113.1 s vs 76.5 s is host variance, values identical).
+  onfix3 vs tkeep0: 0/64 rows, 0 bytes, top1 32/32 both, tokens equal both.
+  onfix3 vs off2_32x2 (f1c5fafc0 control):
+    whole logits bitwise FALSE; 48,067,450 differing bytes; 64/64 rows differ
+    req0: tokens equal, top1 32/32, KL mean 0.00178, KL max 0.0165, maxabs 1.12
+    req1: tokens equal, top1 32/32, KL mean 0.00120, KL max 0.0127, maxabs 1.39
+  The requested 0-byte / KL 0 parity against the control is NOT met, although the token trajectory
+  and top1 are stable.
+
+D) WHERE THE RESIDUAL COMES FROM
+--------------------------------
+  Diagnostics (all 32x2, same bin/libs/argv):
+    off0_32x2       control DSO, GGML_CUDA_FUSE_HC_OWNER_TAIL=0        rc=0 124.7 s
+    fix3g_32x2      fix3 DSO,    GGML_CUDA_FUSE_HC_OWNER_TAIL=0        rc=0 135.1 s
+    onfix3ctl_32x2  fix3 mmvf + control ggml-cuda.cu matcher           rc=0 140.6 s
+  Results:
+    off0 vs fix3g: whole logits bitwise TRUE, 0 bytes -> the generic chains of the two builds are
+      identical.
+    off2 vs off0: not bitwise (req0 diverges at token 2; req1 KL mean 0.001303) -> the control's own
+      T=1 F32 fusion changes values relative to generic, as appendix B inferred.
+    onfix3 vs fix3g: not bitwise (req0 token 2; req1 KL mean 0.001182) -> fix3's fusion changes
+      values relative to generic by the same amount.
+    onfix3ctl vs off2: whole logits bitwise TRUE, 0 bytes, KL 0, top1 32/32 both -> the new mmvf.cu
+      is exactly control-equal when the control matcher decides the fusion.
+  Therefore the residual is not in mmvf.cu; it is in the on-side matcher's fusion decisions. A
+  kernel census (rocprofv3 --kernel-trace, 2x1, same command, predict=1) counts
+    control off2: 8,160 hc_owner_tail4_t1_q8_f32 dispatches (1,632 on each of the 5 agents)
+    fix3 onfix3:   4,080 (816 on each agent)
+  so the two matchers do not produce the same T=1 graph (the ratio is exactly 2, reported as
+  measured; the site/replay decomposition was not traced). The witness sets also differ: fix3 has
+  1,460 fused sites (1,440 rows=1 + 20 rows=3, no rows=2), fix2 had 1,465 (1,440 + 5 rows=2 + 20),
+  so the 5 rows=2 sites now fall back. With the old MMVQ T=1 path the reach difference was invisible
+  because MMVQ is generic-equal (appendix B); with the F32 path it becomes a visible value
+  difference.
+
+E) LIMITS
+---------
+  * One 32x2 leg per configuration; the bitwise comparisons are exact, not statistical.
+  * The census counts dispatches, not distinct sites; the exact 2x ratio is not decomposed further.
+  * The 113.1 s tkeep0 wall is not explained; values are bitwise, so it is host variance.
+  * No source or matcher change was made; the control-matcher DSO is a private diagnostic link.
+
+VERDICT MICRO PASS, MODEL CONTROL PARITY FAIL — the new mmvf.cu (fedc9845…) compiles and links clean (fix3 DSO 360256b6…), and the micro G3 matrix is exact: R=1 default == f1c5fafc0 control (0 B, 4 kernels), R=1 with GGML_CUDA_HC_TAIL_MMVQ_T1=1 == FUSE=0 (0 B), R=2..4 == FUSE=0 and control (0 B, 5 vs 8 kernels), 8/8 required comparisons zero; but the model 32x2 is NOT bitwise against the f1c5fafc0 control (48,067,450 differing bytes, 64/64 rows, KL mean 0.00178/0.00120, max 0.0165/0.0127, top1 32/32 and tokens equal), so the required 0-byte/KL-0 parity is not met; the cause is isolated to the on-side matcher, not mmvf: fix3 mmvf + control matcher is bitwise identical to off2 (0 B, KL 0), the generic chains are bitwise identical (off0 vs fix3g 0 B), and the two matchers do not produce the same T=1 graph (4,080 vs 8,160 T=1 dispatches in the same 2x1 leg; 1,460 vs 1,465 witness sites, the 5 rows=2 sites now falling back), so the matcher's T=1/rows fusion decisions must be reconciled with the control before this candidate can claim control parity; both GPU locks are free and all five GPUs read 0 %.
+
+================================================================================
+APPENDIX D — MATCHER GATE SCOPED TO MMVQ_T1 (fix4, 2026-11-02)
+================================================================================
+Executor: DevopsFreshBoot. Private dir m3-rows-g3g4-20261101/. Build under both VFS build locks;
+GPU legs under both GPU locks, one HIP process at a time. No selected install or source tree changed.
+
+A) BUILD
+--------
+  ggml-cuda.cu 4b35ce5202712dbce2432b331c699beb96179a11f9bad7ad3c65fd5e17974a00
+  mmvf.cu      fedc9845cd888afdfc073ff47eed98cbf791c5bb7ac922bfd6e0932a7ed471ce (unchanged)
+  fix4/build4.sh: compile ggml-cuda.cu rc=0, compile mmvf.cu rc=0, link rc=0; VFS locks
+  16:24:27-16:24:59.
+    fix4/obj/ggml-cuda.cu.o         9c959e504d00326754236259d823690d81ff2fc2b6e1b5d07c1ff1aa4a8f1722
+    fix4/obj/mmvf.cu.o              22ce6a676e7c293c1f2f4a14526e6b51200ee7818acd7309fbff15415bbf0a6b
+    fix4/lib/libggml-hip-on-fix4.so 5d191b2e094f5b47d9194b59e144812673f9bc9b84d73ed6639079c524a9f823
+                                    68,663,704 B
+  The only source change is the gate scope: the equivalence gate and the input-liveness check now
+  run only when GGML_CUDA_HC_TAIL_MMVQ_T1=1; by default the T=1 matcher makes the control's
+  decisions and launches the control's kernel.
+
+B) MICRO G3 (fix4p, sites=1, reps=50, check=1, pin=0, M3_TAIL_WHY=1)
+---------------------------------------------------------------------
+    R   fix4 kernels  control kernels  generic kernels  fix4-vs-control  fix4-vs-generic
+    1        4               4                7              0 B          5,098 B (F32 vs generic)
+    2        5               8                8              0 B              0 B
+    3        5               8                8              0 B              0 B
+    4        5               8                8              0 B              0 B
+    R=1 with GGML_CUDA_HC_TAIL_MMVQ_T1=1: 5 kernels, 0 B vs generic (7 kernels).
+  All 8 required comparisons are zero: R=1 default vs control, R=1 MMVQ_T1=1 vs FUSE=0, R=2..4 vs
+  control and FUSE=0; FIX4-MICRO rc=0. Output hashes match fix3 exactly (r1 d40f9e76…/01808b52…,
+  r2 16152a37…, r3 e90c652c…, r4 1383d295…).
+
+C) MODEL G4 32x2
+----------------
+  onfix4_32x2  fix4 DSO  rc=0  wall 104.1 s
+  onfix4 vs off2_32x2 (f1c5fafc0 control):
+    whole logits bitwise TRUE; 0 differing bytes; 0/64 rows differ
+    req0: tokens equal, top1 32/32, KL 0
+    req1: tokens equal, top1 32/32, KL 0
+  This is the requested 0-byte parity. The leg's own timing is not a speed claim (first-touch
+  submit dominates this run): window 0/1 submit 18,058/18,486 ms, native_wait 575/598 ms,
+  ttft 19,175/20,505 ms, per-token median 5.1/5.0 ms, 22/23 decode calls.
+
+D) CENSUS AND WITNESS
+---------------------
+  Kernel census (rocprofv3 --kernel-trace, 2x1, same command, predict=1):
+    control off2: 8,160 hc_owner_tail4_t1_q8_f32 dispatches
+    fix4 onfix4:  8,160   (fix3 was 4,080)
+  The default T=1 graph is now the control's, dispatch for dispatch.
+  M3_TAIL_WHY site counts, 32x2:
+    fix4: rows=1 2,984 + rows=3 20 = 3,004 sites (no rows=2)
+    fix3: rows=1 1,440 + rows=3 20 = 1,460
+    fix2: rows=1 1,440 + rows=2 5 + rows=3 20 = 1,465
+  The 2,984 rows=1 sites are the restored T=1 reach; the 5 rows=2 sites remain unfused in both
+  fix3 and fix4, but the control has no rows matcher and runs them generic, so their generic values
+  agree (the whole-logits bitwise result includes them). The 2x1 trace prints 2,880 rows=1 witness
+  lines for its one-token graph.
+
+E) LIMITS
+---------
+  * One 32x2 leg; the parity comparison is exact, not statistical.
+  * The census counts dispatches, not distinct sites; the 8,160 match is the decisive reach check.
+  * Timing is reported for completeness only; the first-touch submit is not a steady-state number.
+  * No source change beyond the gate scope; the DSO is a private link.
+
+VERDICT PASS — scoping the equivalence and input-liveness gates to GGML_CUDA_HC_TAIL_MMVQ_T1=1 restores the control's T=1 decisions: the fix4 DSO (5d191b2e…, from ggml-cuda.cu 4b35ce52… and mmvf.cu fedc9845…) builds clean, the 8 required micro comparisons are 0 bytes (R=1 default == control 4 kernels; MMVQ_T1=1 == FUSE=0; R=2..4 == both, 5 vs 8 kernels), the model 32x2 is whole-logits bitwise against off2_32x2 (0 of 63,569,920 bytes, 0/64 rows, KL 0, top1 32/32 both requests, tokens equal), and the T=1 kernel census is now 8,160 dispatches, exactly the control's 8,160 (fix3 was 4,080), with 3,004 witness sites (2,984 rows=1 + 20 rows=3) against fix3's 1,460; both GPU locks are free and all five GPUs read 0 %.
