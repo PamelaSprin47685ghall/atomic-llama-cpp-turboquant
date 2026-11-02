@@ -1517,14 +1517,6 @@ run_result run(const options & requested) {
                         // them (below, after the relay drain) proves the host
                         // logits row is readable.
                         //
-                        // Removed: the scheduler-wide
-                        // ggml_backend_sched_synchronize performed by
-                        // llama_synchronize / llama_get_logits_ith. Kept: the
-                        // unchanged relay dual-completion drain below, still
-                        // required by this runtime's own exit predicate. The
-                        // output wait is deferred past the drain
-                        // so the copies complete while the host services the
-                        // relay instead of blocking first.
                         if (!dw_output_barrier) {
                             if (dw_compose_epoch) {
                                 // Gate ON but no sound output barrier: keep the
@@ -1542,6 +1534,24 @@ run_result run(const options & requested) {
                             } else {
                                 llama_synchronize(ctx);
                             }
+                        } else {
+                            // DUALWIN-COMPOSE-EVENT: replace the scheduler-wide
+                            // llama_synchronize / llama_get_logits_ith here with
+                            // the recorded output-copy event wait on the contributing
+                            // child streams. Waiting here sleeps on the HSA signal
+                            // instead of spinning in ggml_backend_relay_snapshot
+                            // (which otherwise issues >1M hipSetDevice+hipEventQuery
+                            // calls per token across the 5 GPUs while the epoch runs);
+                            // the unchanged relay dual-completion drain still runs
+                            // immediately below before logits are read via
+                            // llama_get_logits_ith_no_sync.
+                            auto & dw_be = dw_compose_events[wi];
+                            ++dw_be.output_event_syncs;
+                            ++dw_be.host_sync_replaced;
+                            const std::size_t dw_proven =
+                                llama_tp5_output_event_wait(ctx);
+                            require(dw_proven == dw_copy_streams,
+                                    "output-copy event barrier did not cover every recorded stream");
                         }
                         if (service) {
                             ggml_relay_status status{};
@@ -1606,26 +1616,6 @@ run_result run(const options & requested) {
                                 service->epoch_end(wi, status.cpu_reductions);
                                 service->epoch_verify(wi, native[wi]);
                         }
-                        }
-                        // DUALWIN-COMPOSE-EVENT: the epoch's relay drain above
-                        // is the runtime's exit predicate and is unchanged. Only
-                        // now, immediately before the host reads logits, do we
-                        // host-complete the output-copy events recorded right
-                        // after decode: their completion proves the async D2H
-                        // copy of this epoch finished, which is the barrier the
-                        // replaced llama_synchronize used to provide. The wait
-                        // is placed after the drain so the drain's host work can
-                        // proceed while any remaining copy latency elapses;
-                        // whether that overlap actually saves time is not
-                        // measured and is not claimed.
-                        if (dw_output_barrier) {
-                            auto & dw_be = dw_compose_events[wi];
-                            ++dw_be.output_event_syncs;
-                            ++dw_be.host_sync_replaced;
-                            const std::size_t dw_proven =
-                                llama_tp5_output_event_wait(ctx);
-                            require(dw_proven == dw_copy_streams,
-                                    "output-copy event barrier did not cover every recorded stream");
                         }
                         metrics.native_wait_ns += now_ns() - wait_start;
                         active.fetch_sub(1);
