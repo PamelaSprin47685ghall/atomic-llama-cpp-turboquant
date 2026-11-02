@@ -3870,9 +3870,13 @@ void llama_context::record_exec_plan(const ggml_cgraph * gf) {
     // Read right after the scheduler allocated gf: this is the plan the following
     // graph_compute submits with. `gf->uid` is the uid split_graph stamped on gf
     // and copied to sched->graph, so it names the graph the plan was built for.
+    // The fingerprint is taken over sched->graph, the graph the allocator planned
+    // and audited (gf plus the scheduler's input copies); gf itself has fewer
+    // nodes and can never match the audited fingerprint.
+    const ggml_cgraph * planned = ggml_backend_sched_get_planned_graph(sched.get());
     exec_plan.recorded  = true;
     exec_plan.graph_uid = gf->uid;
-    exec_plan.fp        = ggml_gallocr_plan_fp(gf);
+    exec_plan.fp        = ggml_gallocr_plan_fp(planned);
     exec_plan.plan_id   = plan.plan_id;
     exec_plan.n_nodes   = plan.n_nodes;
 }
@@ -3920,14 +3924,26 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
         struct ggml_gallocr_plan_identity plan = {};
         ggml_gallocr_plan_identity(ggml_backend_sched_get_galloc(sched.get()), &plan);
 
+        // Compare against the scheduler's planned graph (gf plus its input
+        // copies), which is what the allocator fingerprinted and audited.
+        // split_graph stamps a fresh uid on every submission, while the
+        // allocator keeps an audited plan across submissions as long as
+        // ggml_gallocr_alloc_graph finds no node that needs reallocation. So the
+        // planned uid names the graph the plan was built and audited for, and a
+        // later submission that reuses the plan has a newer uid. The plan still
+        // applies when the same nodes (fp over the node pointers) and the same
+        // node/leaf counts are submitted; the uid is checked only for the
+        // record taken at allocation of this very submission.
+        const ggml_cgraph * planned = ggml_backend_sched_get_planned_graph(sched.get());
         const uint64_t exec_uid = gf->uid;
-        const uint64_t exec_fp  = ggml_gallocr_plan_fp(gf);
+        const uint64_t exec_fp  = ggml_gallocr_plan_fp(planned);
         const bool     match    = exec_plan.recorded && plan.plan_id != 0 && plan.graph_uid != 0 &&
                 plan.retained > 0 && plan.audit_clean_plan_id == plan.plan_id &&
                 plan.audit_clean_graph_uid == plan.graph_uid && plan.audit_clean_fp == plan.fp &&
                 plan.audit_clean_n_nodes == plan.n_nodes && plan.audit_clean_n_leafs == plan.n_leafs &&
-                !plan.entry_size && exec_uid != 0 && exec_uid == plan.graph_uid && exec_fp == plan.fp &&
-                plan.n_nodes == gf->n_nodes && plan.n_leafs == gf->n_leafs &&
+                !plan.entry_size && exec_uid != 0 &&
+                planned->uid == exec_uid && exec_fp == plan.fp &&
+                plan.n_nodes == planned->n_nodes && plan.n_leafs == planned->n_leafs &&
                 exec_plan.plan_id == plan.plan_id && exec_plan.graph_uid == exec_uid &&
                 exec_plan.fp == exec_fp && exec_plan.n_nodes == plan.n_nodes;
 
@@ -3936,7 +3952,7 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
                 " plan_nodes=%d retained=%d audit_plan_id=%" PRId64 " audit_uid=%" PRIu64
                 " audit_fp=%016" PRIx64 " recorded_plan_id=%" PRId64 " recorded_uid=%" PRIu64
                 " recorded_fp=%016" PRIx64 " entry_size=%d match=%d\n", __func__,
-                exec_uid, exec_fp, gf->n_nodes, plan.graph_uid, plan.fp, plan.plan_id, plan.n_nodes,
+                exec_uid, exec_fp, planned->n_nodes, plan.graph_uid, plan.fp, plan.plan_id, plan.n_nodes,
                 plan.retained, plan.audit_clean_plan_id, plan.audit_clean_graph_uid, plan.audit_clean_fp,
                 exec_plan.plan_id, exec_plan.graph_uid, exec_plan.fp,
                 plan.entry_size ? 1 : 0, match ? 1 : 0);

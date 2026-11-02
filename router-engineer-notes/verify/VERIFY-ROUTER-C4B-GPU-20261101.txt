@@ -198,3 +198,145 @@ UNPROVEN.
   G4 PASS only for the 1-row native 2x32: OFF_1==OFF_2, ON_1==ON_2 and OFF==ON are bitwise,
   0/64 rows, 0 B, KL 0, top1 32/32 both. Multi-row ON numerics are UNPROVEN.
 VERDICT FAIL — G2 PASS; G3 FAIL (as-shipped relay capacity aborts the multi-row graph; the capacity-lifted diagnostic shows fusion firing at n_rows=4/no_reuse=1 but the plan identity join is match=0 with exec_fp=aa634810… vs plan_fp=f46f3879…, and the run aborts at epoch 1); G4 PASS only for the 1-row native 2x32 (bitwise, KL 0, top1 32/32), multi-row ON numerics UNPROVEN.
+
+
+APPENDIX B — UID-ONLY PLAN REUSE AND DEADLINE 900
+==================================================
+Executor: DevopsFreshBoot. Both VFS build locks held for the libllama rebuild; both GPU
+locks held across the pair (19:10:53-19:35:47). Source tree not modified; private copies
+only. One compose process at a time.
+
+A) BUILD
+--------
+  Source: src/llama-context.cpp sha256 04d60520fc53615cb0923416698de4db792f034485594b98313fc6164b58c947
+  Other three files unchanged from the previous round:
+    relay.hip 23d7b491..., ggml-backend.cpp b9fa9b3f..., ggml-backend-impl.h 3ec66387...
+  Rebuilt only the `llama` target in router-gpu-20261101/build/upstream and mtp-build, then
+  refreshed both installs:
+    build/install/lib/libllama.so.0.0.4   d226d68083a0827425bff1d78ccc2483f2a0d8c67bd04f5b54bb7a9e26cc227d
+    mtp-install/lib/libllama.so.0.0.4     8011c9f183af954fbaf5c26704887150df6491437b62888504c8e97ac6062e81
+  Both run installs were checked to carry 8011c9f1...:
+    runs-mtp2/ONPROBE_FIX2/install/lib/libllama.so.0.0.4
+    runs-mtp2/OFFPROBE_FIX2/install/lib/libllama.so.0.0.4
+  The MTP compose binary is unchanged (eb5ea76363db0a96a925a8d71c337595165411d39964f5468862b2c766d1858d).
+  Runner: legs-router-mtp2.py, identical argv/environment to Appendix A's MTP probe except
+  --deadline 900; --predict 32 --windows 2; GGML_TP5_MTP_RS_RING unset; no RSZ_RT.
+
+B) RUN RESULT AND PHASE TIMING
+------------------------------
+    arm  rc  wall     window-0 TP5_DIAG_PHASE fields (ns)
+    ON   1   750.5 s  target_submit=35,314,828,719 native_wait=52,962,402
+                      commit_including_draft=606,687,077,105 elapsed=642,055,025,162
+    OFF  1   743.4 s  target_submit=30,280,780,297 native_wait=62,494,544
+                      commit_including_draft=605,922,239,875 elapsed=636,265,668,029
+  In ms: ON target_submit 35,314.8, native_wait 53.0, commit 606,687.1, elapsed 642,055.0;
+  OFF 30,280.8, 62.5, 605,922.2, 636,265.7.
+  report.json was not published (compose exits non-zero), so there are no report-level
+  decode_submit/native_wait fields for window 1 and no per-token committed_ns. The
+  TP5_DIAG_PHASE line exists for window 0 only. TP5_NATIVE_DRAIN covers both windows:
+    window 0: epoch=1 attempted=31 accepted=31 unknown=0 completed=31 sealed=1 finished=1
+              error=1 detail=relay aborted by host
+    window 1: epoch=1 attempted=31 accepted=31 unknown=0 completed=31 sealed=1 finished=1
+              error=110 detail=HIP relay wait failed channel=0 rank=0 epoch=1 device_code=3
+  No `TP5 execution deadline exceeded` line exists: --deadline 900 was not reached. The
+  effective limit is the relay wait `wait_seconds = 600` in relay.hip; the
+  commit_including_draft_ns is 606.7/605.9 s. The hang is at the 32nd token of the first
+  epoch (31 completed).
+
+C) IDENTITY
+-----------
+  ON total identity lines: 6. Retained>0: 2, both match=1. Retained=0: 4, all match=0
+  because the graph has no retained allocation (`retained=0`) and its audit identity is
+  the earlier plan (`plan_id=4`, `audit_plan_id=3`, `audit_uid=53` vs `plan_uid=1887`);
+  those are the NextN/no-retention graph, not a retained-plan mismatch.
+  The two retained lines:
+    graph_compute: router_scratch plan identity exec_uid=73 exec_fp=60243e4250e50f3b exec_nodes=6454 plan_uid=73 plan_fp=60243e4250e50f3b plan_id=4 plan_nodes=6454 retained=48 audit_plan_id=4 audit_uid=73 audit_fp=60243e4250e50f3b recorded_plan_id=4 recorded_uid=73 recorded_fp=60243e4250e50f3b entry_size=0 match=1
+    graph_compute: router_scratch plan identity exec_uid=980 exec_fp=1635439114fcaa72 exec_nodes=6454 plan_uid=980 plan_fp=1635439114fcaa72 plan_id=4 plan_nodes=6454 retained=48 audit_plan_id=4 audit_uid=980 audit_fp=1635439114fcaa72 recorded_plan_id=4 recorded_uid=980 recorded_fp=1635439114fcaa72 entry_size=0 match=1
+  No retained>0 line has match=0; the uid-only change resolves the Appendix A mismatch for
+  every retained plan this run reached. The earlier 38-retained/13-match run cannot be
+  re-counted because this run aborts after one epoch; only two retained plans were seen.
+
+D) AUDIT / FUSION / OVERLAP
+---------------------------
+  ON: retain 292; audit clean (reserve) 10:
+    6 x 48 retained allocations, 393,216 B, rows=4, nodes=6406/6454,
+      graph_uid=13/17/31/35/73/980
+    4 x 1 retained allocation, 8,192 B, rows=4, nodes=161, graph_uid=49/53/67/71
+    audit enabled (reserve) 5; fusion 480 lines, all
+      `n_rows=4 n_expert=512 n_expert_used=10 logits='ffn_moe_logits-N' no_reuse=1`
+    (literal `n_rows=3` gate = 0); overlaps 0; view, it cannot be retained 0.
+  OFF: retain 0, audit clean 0, audit enabled 0, fusion 0, identity 0, overlaps 0, view 0.
+
+E) OFF FAILURE CONTEXT (50 LINES BEFORE THE FIRST DRAIN ERROR)
+--------------------------------------------------------------
+  First error line (line 6420):
+    TP5_NATIVE_DRAIN window=0 epoch=1 attempted=31 accepted=31 unknown=0 completed=31 sealed=1 finished=1 error=1 detail=relay aborted by host
+  Lines 6370-6421:
+    6370: llama_kv_cache: layer  38: filtered
+    6371: llama_kv_cache: layer  39: filtered
+    6372: llama_kv_cache: layer  40: filtered
+    6373: llama_kv_cache: layer  41: filtered
+    6374: llama_kv_cache: layer  42: filtered
+    6375: llama_kv_cache: layer  43: filtered
+    6376: llama_kv_cache: layer  44: filtered
+    6377: llama_kv_cache: layer  45: filtered
+    6378: llama_kv_cache: layer  46: filtered
+    6379: llama_kv_cache: layer  47: filtered
+    6380: llama_kv_cache: layer  48: dev = ROCm3
+    6381: llama_kv_cache:      ROCm3 KV buffer size =   144.00 MiB
+    6382: llama_kv_cache: size =  144.00 MiB (262144 cells,   1 layers,  1/1 seqs), K (q4_0):   72.00 MiB, V (q4_0):   72.00 MiB
+    6383: llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 256
+    6384: llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 256
+    6385: llama_context: enumerating backends
+    6386: llama_context: backend_ptrs.size() = 2
+    6387: sched_reserve: reserving ...
+    6388: sched_reserve: max_nodes = 1056
+    6389: llama_model_has_cacheable_moe_weights: MoE cache disabled (no cacheable expert tensors found; largest expert slab=900 KiB, minimum=512 KiB)
+    6390: sched_reserve: MoE cache requested=provider resolved=off
+    6391: sched_reserve: reserving full memory module
+    6392: sched_reserve: worst-case: n_tokens = 4, n_seqs = 1, n_outputs = 1
+    6393: resolve_fused_ops: resolving fused Gated Delta Net support:
+    6394: graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+    6395: resolve_fused_ops: fused Gated Delta Net (autoregressive) enabled
+    6396: graph_reserve: reserving a graph for ubatch with n_tokens =   16, n_seqs =  1, n_outputs =   16
+    6397: resolve_fused_ops: fused Gated Delta Net (chunked) enabled
+    6398: resolve_fused_ops: resolving fused Lightning Indexer support:
+    6399: graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+    6400: resolve_fused_ops: Lightning Indexer enabled
+    6401: resolve_fused_ops: resolving fused DeepSeek V4 HC support:
+    6402: graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+    6403: resolve_fused_ops: fused DeepSeek V4 HC pre enabled
+    6404: graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+    6405: resolve_fused_ops: fused DeepSeek V4 HC comb enabled
+    6406: graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+    6407: resolve_fused_ops: fused DeepSeek V4 HC post enabled
+    6408: graph_reserve: reserving a graph for ubatch with n_tokens =    4, n_seqs =  1, n_outputs =    4
+    6409: graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+    6410: graph_reserve: reserving a graph for ubatch with n_tokens =    4, n_seqs =  1, n_outputs =    4
+    6411: sched_reserve:      ROCm3 compute buffer size =     3.98 MiB
+    6412: sched_reserve:  ROCm_Host compute buffer size =     2.16 MiB
+    6413: sched_reserve: graph nodes  = 147
+    6414: sched_reserve: graph splits = 1
+    6415: sched_reserve: reserve took 1584.95 ms, sched copies = 1
+    6416: set_embeddings_nextn: value = 1, masked = 1
+    6417: TP5_MTP_DRAFT_ASSIGN window=1 index=3 name=ROCm3 bdf=0000:06:00.0 model=0x56c5df0aa640 context=0x56c5de881080 kv_capacity=262144 model_copies=2 free_after_bytes=2483027968
+    6418: TP5_RELAY_SERVICE threads=2 windows=2
+    6419: TP5_DIAG_PHASE window=0 elapsed_ns=636265668029 draft_first_ns=0 draft_extra_ns=0 state_trim_ns=0 submission_queue_ns=385 target_submit_ns=30280780297 native_wait_ns=62494544 commit_including_draft_ns=605922239875 draft_first_calls=0 draft_extra_calls=0 state_trim_calls=0
+    6420: TP5_NATIVE_DRAIN window=0 epoch=1 attempted=31 accepted=31 unknown=0 completed=31 sealed=1 finished=1 error=1 detail=relay aborted by host
+    6421: TP5_NATIVE_DRAIN window=1 epoch=1 attempted=31 accepted=31 unknown=0 completed=31 sealed=1 finished=1 error=110 detail=HIP relay wait failed channel=0 rank=0 epoch=1 device_code=3
+
+F) NUMERICS
+-----------
+  Both arms rc=1 and no report.json, so no OFF/ON logits comparison and no per-token
+  median interval. cmp-logits-pure.py was not run because no logits file exists. This is
+  not a numeric disagreement; it is the same epoch-1 relay wait abort in both arms.
+
+G) VERDICT
+----------
+  The uid-only plan-reuse fix is confirmed for the retained plans observed: 2/2 retained
+  plans match=1, and the four match=0 lines are no-retention graphs (retained=0). The pair
+  still does not complete: both arms abort at epoch 1 after 31/32 tokens with
+  `HIP relay wait failed channel=0 rank=0 epoch=1 device_code=3`, at ~606 s, matching the
+  relay's 600 s wait; --deadline 900 is not reached. No OFF/ON logits or per-token median
+  exist.
+VERDICT FAIL — uid-only plan reuse PASS (2/2 retained plans match=1; 4 no-retention graphs match=0 for retained=0); the deadline-900 pair still aborts at epoch 1 after 31/32 tokens with HIP relay wait device_code=3 at ~606 s (relay wait_seconds=600; --deadline 900 not reached), so no OFF/ON logits or per-token median exist.

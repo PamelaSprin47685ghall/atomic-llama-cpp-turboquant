@@ -2389,6 +2389,11 @@ ggml_gallocr_t ggml_backend_sched_get_galloc(ggml_backend_sched_t sched) {
     return sched->galloc;
 }
 
+const struct ggml_cgraph * ggml_backend_sched_get_planned_graph(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return &sched->graph;
+}
+
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);

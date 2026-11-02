@@ -239,6 +239,13 @@ extern "C" {
     // and replaces the allocator in ggml_backend_sched_release_buffers.
     GGML_API ggml_gallocr_t ggml_backend_sched_get_galloc(ggml_backend_sched_t sched);
 
+    // The graph the scheduler last planned and allocated: its own copy built from
+    // the caller's graph plus the cross-backend input copies. This is the graph
+    // the allocator fingerprints and audits, so a caller that must compare the
+    // executed plan against the audited one reads this graph, not its own.
+    // Read-only; owned by the scheduler and replaced by the next split.
+    GGML_API const struct ggml_cgraph * ggml_backend_sched_get_planned_graph(ggml_backend_sched_t sched);
+
     // Add backend dynamic loading support to the backend
 
     // Initialize the backend

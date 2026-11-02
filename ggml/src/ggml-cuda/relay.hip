@@ -29,7 +29,10 @@ constexpr uint32_t all_ranks        = (1u << ranks) - 1;
 // Swift needs 36 recurrent-output, 48 expert-output and 97 HC joins. Reserve a
 // fixed bound before submission; unused slots never become active transfers.
 constexpr size_t   channel_capacity = 256;
-constexpr size_t   element_capacity = 4 * 4096;
+// Real MTP verifier T4 capacity, as in the qualified lane relay: the widest HC
+// residual channel is 10240 F32 per token, so four rows need 40960 scalars.
+// Bounds, the five-rank host-mapped stride and the wire checks are unchanged.
+constexpr size_t   element_capacity = 16 * 4096;
 // The gfx1030 shader cycle counter can move backwards during this wait.
 // Use the constant-rate steady counter; the host deadline aborts first.
 constexpr uint64_t wait_seconds = 600;
