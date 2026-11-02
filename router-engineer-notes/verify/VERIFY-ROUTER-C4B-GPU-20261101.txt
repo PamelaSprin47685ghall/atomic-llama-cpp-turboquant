@@ -1,0 +1,200 @@
+ROUTER C4B-V4 GPU VERIFICATION (G2/G3/G4), 2026-11-01
+=====================================================
+Executor: DevopsFreshBoot. Private dir router-gpu-20261101/. Both VFS build locks held for
+each build and both GPU locks held for each run (one compose process at a time). Source tree
+and selected installs were not modified; all builds and runs are private copies.
+
+VERDICT: FAIL — G2 PASS (HIP build and artifacts); G3 FAIL (retention and the
+allocator audit fire, and a private capacity-lifted diagnostic shows the fusion firing with
+`n_rows=4 no_reuse=1`, but the candidate's plan identity join is `match=0`
+(`exec_fp != plan_fp`), the as-shipped relay capacity aborts the graph before compute, and
+the diagnostic run aborts at epoch 1); G4 PASS only for the submitted 2x32 1-row graph
+(OFF/ON bitwise, KL 0, top1 32/32) with the ON gate inert; multi-row ON numerics are
+UNPROVEN.
+
+1. G2 — PRIVATE HIP BUILD
+-------------------------
+  Tree: /home/kunweiz/work/merge-router-20261031
+  HEAD: c9e03514676083a30c5def3e39da85ea813efbe0 (router-c4b-v4: candidate snapshot 20261101)
+  Changed-source hashes:
+    ggml/src/ggml-alloc.c                 f22ed5827aef82dc80cdae2a3f9ade6c6ac062f7fdfb0b6d42de17f48018f62b
+    src/models/qwen4exp.cpp               b14175ab35817d5d5f2a0968600ff810855d4e68e37d4ee8262178fdf9e25992
+    ggml/src/ggml-cuda/topk-moe.cu        fd58eb1eaca2e6c21d184526e3b376a70caa75cc1ee56ab02be8ba7af248701e
+    ggml/src/ggml-cuda/relay.hip          ac13937177faa06bda6a7f1abecdae6efab787732eb5a39d709c93264aeb1ba6
+  Build dir: router-gpu-20261101/build/upstream + build/modules/{sampling,scheduling,text,relay,tp5-compose}
+  Configure: -DGGML_HIP=ON -DGGML_CUDA=OFF -DCMAKE_HIP_ARCHITECTURES=gfx1030
+             -DGGML_HIP_GRAPHS=OFF -DGGML_HIP_MMQ_MFMA=OFF -DGGML_CUDA_FA=ON
+             -DGGML_CUDA_NO_PEER_COPY=ON -DLLAMA_BUILD_*=OFF -DCMAKE_BUILD_TYPE=Release
+  `fork/build.py --backend hip --tp5` stops at its provenance guard: `check-upstream.py`
+  cannot prove HEAD descends from cda0f925… (the candidate snapshot is not a descendant of
+  that upstream base). The same CMake flags were therefore issued directly; no source file
+  was changed. Build rc=0.
+  Installed artifact sha256:
+    libggml-base.so.0.18.1   3dd4b430d74eb8872cf1ca76bd3eddb876892bc8d093b76d913c6945b737cf6f
+    libggml-hip.so.0.18.1    7ebcb4c9a58033df2ca899ecca69d4a138a717b4ea57c4d5deb9f23c0beeb345
+    libllama.so.0.0.4        35e51543f1b4889299f850dcb83646280eb881a1063dfeabf1be21c77667ad45
+    tq-tp5-compose           7c516eaf2a1071919bce81e1effb94899805f4aaa07045af09117afd449209c8
+  The build's `libllama` has the MTP staging symbols (`llama_set_embeddings_nextn`,
+  `llama_get_embeddings_nextn_ith`), but its `libggml-base` does NOT export the two MTP
+  meta hooks (`ggml_backend_meta_set_submit_ready_hook`, `…_set_submitted_hook`) and its
+  `relay.hip` keeps `element_capacity = 4 * 4096 = 16,384` F32.
+
+2. G3 — NATIVE 2x32 PAIR (NEGATIVE CONTROL)
+-------------------------------------------
+  Runner: runs/{OFF_1,ON_1,OFF_2,ON_2}, command template
+  $E/mtp-hc-row-tail-candidate-20261025/on512x2/command.json, --predict 32, --windows 2,
+  --deadline 180, --capture-logits. OFF unsets all three router knobs; ON sets
+  GGML_TP5_MOE_ROUTER_SCRATCH=1, GGML_TP5_ROUTER_SCRATCH_AUDIT=1,
+  GGML_TP5_ROUTER_SCRATCH_DEBUG=1. No RSZ_RT in any leg.
+    leg    gate  rc  wall     rows  bytes/leg
+    OFF_1  off   0   143.9 s  64    63,569,920
+    ON_1   on    0   100.5 s  64    63,569,920
+    OFF_2  off   0    99.4 s  64    63,569,920
+    ON_2   on    0    95.9 s  64    63,569,920
+  ON witnesses (ON_1 / ON_2, identical shape):
+    "router_scratch retain layer"                 0 / 0
+    "topk_moe fused"                              0 / 0
+    "retention audit clean (reserve)"             0 / 0
+    "retention audit enabled (reserve): 0 retained allocations"  10 / 10
+    "router_scratch plan identity ... match=1"    0 / 0   (87 identity lines, all retained=0, match=0)
+    " overlaps "                                  0 / 0
+    "view, it cannot be retained"                 0 / 0
+  The native compose submits one row per window (graph rows=1), outside the 2..4 retention
+  window; the ON gate is therefore inert and this pair cannot satisfy G3. It is retained as
+  the negative control that separates the gate from the graph geometry.
+
+3. G3 — PRESCRIBED LANE HARNESS OVER THE CANDIDATE LIBS
+-------------------------------------------------------
+  The candidate's own `fork/tp5-compose` is the native TP5 compose and cannot build the
+  Qwen4Exp MTP draft graph. The lane's prebuilt `sc` compose is ABI-incompatible with the
+  candidate libs (it needs the two meta hooks; its `llama_context_params` layout differs).
+  I therefore built the archived MTP runtime already present in the candidate tree
+  (`overlay/mtp-async-protocol-candidate-20261027/runtime.cpp`, sha256 86acb16f…) with the
+  candidate's own `fork/tp5-compose/src/main.cpp` and the candidate libs, adding only the
+  two hook setters/invocations to a private `libggml-base` copy (patched base sha256
+  0148377d3047d70dc208fe6542156427ed3d1818e5f696580891b6cc6f0c881f). This is a harness
+  compatibility shim, not a change to the candidate sources. MTP compose sha256
+  59b492898e28adcb4bdeb98ea813ae92b3e359ae60a3d853a7e0384cece268e9.
+  Run: runs-mtp/ONPROBE_SC, same two prompts/argv as the lane template, --predict 32,
+  --windows 2, --ctx-size 262144, --threads 22, --deadline 180, --flash-attn on,
+  --mode relay, --tp5-wire f32, --capture-logits; ON knobs all "1"; no RSZ_RT.
+  With the lane's `GGML_TP5_MTP_RS_RING=1` the candidate `libllama` rejects the main
+  context: `tp5-relay requires … n_rs_seq …`. Unsetting that one ring knob gets past
+  admission; the run then builds the Qwen4Exp draft graph.
+
+  3a. AS-SHIPPED (element_capacity = 16,384 F32)
+  ----------------------------------------------
+    rc=1, wall 99.4 s
+    "router_scratch retain layer"                 292 lines (49 unique layer ids; 48 layers x 6 full graphs
+                                                  + 4 lines from one partial graph)
+    "retention audit clean (reserve)"             10 lines:
+      6 plans N=48 retained allocations, 393,216 B, rows=4, nodes=6406/6454,
+        graph_uid=13/17/31/35/73/75, plan_id=1/3/1/3/4/4, fp=c119d88f…/395693c8…/4c62e70c…/d2ff77a8…
+      4 plans N=1 retained allocation, 8,192 B, rows=4, nodes=161, graph_uid=49/53/67/71
+    "retention audit enabled (reserve): 0 retained allocations"  4 lines
+    "topk_moe fused"                              0
+    "router_scratch plan identity ... match=1"    0 (no identity line at all; compute failed)
+    " overlaps " / "view, it cannot be retained"  0 / 0
+    failure:
+      TP5_NATIVE_DRAIN window=0 epoch=0 attempted=0 accepted=0 unknown=0 completed=0
+          sealed=0 finished=1 error=95 detail=relay channel=0 tensor=node_9
+          shape=10240,4,1,1 exceeds 16384-F32 capacity
+      graph_compute: ggml_backend_sched_graph_compute_async failed with error -1
+      process_ubatch: failed to compute graph, compute status: -1
+      llama_decode: failed to decode, ret = -3
+      tq-tp5-compose: native relay progress failed
+    The retention mechanism fires and the allocator audit is clean at rows=4 (48 retained
+    F32 router projections, 393,216 B, no overlap), but the graph cannot cross the
+    candidate's relay: `relay.hip` has `element_capacity = 4 * 4096 = 16,384` and the draft
+    hidden-state terminal is 10240 x 4 = 40,960 F32. The abort happens before any topk-moe
+    fusion or plan-identity submission.
+    The doc's expected N = 2 trunk layers x rows does not describe this graph: the executed
+    Qwen4Exp draft graph retains one tensor per layer, N=48 at rows=4 (plus a separate
+    1-retained NextN graph). The lane's 2-trunk-layer verify graph was not produced by the
+    available MTP harness; the full 48-layer draft graph is the only multi-row consumer
+    available, so the N/R values above are the observed ones, not the doc's expectation.
+
+  3b. PRIVATE DIAGNOSTIC: element_capacity = 65,536 F32
+  -----------------------------------------------------
+    To separate the capacity blocker from the router-scratch mechanism, I rebuilt only the
+    private `libggml-hip` with `element_capacity = 4 * 4096 * 4 = 65,536` (diagnostic
+    libggml-hip sha256 f46421d5…). This is a harness change, not a candidate change; the
+    candidate's `topk-moe.cu`, `ggml-alloc.c`, `qwen4exp.cpp` and `libllama` are unchanged.
+    Result: rc=1, wall 324.9 s, and the graph now executes:
+      "router_scratch retain layer"               292
+      "retention audit clean (reserve)"           10 (same six N=48/rows=4 and four N=1/rows=4 plans)
+      "retention audit enabled (reserve)"         5
+      "topk_moe fused"                            240 lines, every one
+          `n_rows=4 n_expert=512 n_expert_used=10 logits='ffn_moe_logits-N' no_reuse=1`
+          (48 layers x 5 executed graphs; the log is `n_rows=4`, not the expected n_rows=3)
+      literal gate `grep "topk_moe fused n_rows=3" | grep -c "no_reuse=1"` = 0
+      "router_scratch plan identity"              5 lines, 0 with match=1
+      " overlaps " / "view, it cannot be retained"  0 / 0
+    The 48-retained plan's identity line is:
+      exec_uid=73 exec_fp=aa6348107edb112d exec_nodes=6434
+      plan_uid=73 plan_fp=f46f387900759453 plan_id=4 plan_nodes=6454 retained=48
+      audit_plan_id=4 audit_uid=73 audit_fp=f46f387900759453
+      recorded_plan_id=4 recorded_uid=73 recorded_fp=aa6348107edb112d
+      entry_size=0 match=0
+    The audit matches the reserved plan (`audit_fp == plan_fp == f46f3879…`), but the
+    executed graph's fingerprint is `aa634810…`, not the plan's `f46f3879…`; the identity
+    join therefore fails (`match=0`) even though retention and fusion are active. The
+    NextN/1-retained plan lines show the same pattern (`retained=0`, `plan_fp=aa97f50c…`,
+    `audit_fp=91ba6b85…`, match=0). This is a real G3 defect independent of relay capacity.
+    The run then aborts at epoch 1:
+      TP5_NATIVE_DRAIN window=0 epoch=1 attempted=31 accepted=31 unknown=0 completed=31
+          sealed=1 finished=1 error=1 detail=relay aborted by host
+      TP5_NATIVE_DRAIN window=1 epoch=1 attempted=31 accepted=31 unknown=0 completed=31
+          sealed=0 finished=1 error=1 detail=relay aborted by host
+      graph_compute: ggml_backend_sched_graph_compute_async failed with error -1
+      llama_decode: failed to decode, ret = -3
+      tq-tp5-compose: native relay progress failed
+    The epoch-1 abort may be the unset `GGML_TP5_MTP_RS_RING` state path (the candidate
+    libllama rejects the ring at admission) or a second multi-row defect; it is not
+    resolved by the capacity lift. No ON logits were produced.
+
+4. G4 — NUMERICS
+----------------
+  Comparator: cmp-logits-pure.py on the 64-row x 248,320-value tapes (63,569,920 B each).
+    OFF_1 vs OFF_2:  whole bitwise true; 0/64 differing rows; 0 differing bytes;
+                     KL mean/max 0/0; top1 32/32 and 32/32; emitted tokens equal.
+    ON_1  vs ON_2:   whole bitwise true; 0/64; 0 B; KL 0/0; top1 32/32 both; tokens equal.
+    OFF_1 vs ON_1:   whole bitwise true; 0/64; 0 B; KL 0/0; top1 32/32 both; tokens equal.
+  The ON legs are the 1-row native graphs, so this is a valid bitwise/OFF-inertness result
+  for the submitted 2x32 geometry and the nrows==1 exception, not a multi-row ON result.
+  The multi-row ON leg produced no logits (section 3).
+
+5. LIMITS AND DIAGNOSIS
+-----------------------
+  * The candidate's native 2x32 path is numerically clean and reproducible, but it cannot
+    fire the 2..4-row retention window: every relay graph is one row per window.
+  * The candidate's relay capacity (16,384 F32) is smaller than the smallest multi-row
+    draft terminal (10240 x 2 = 20,480 F32), so no 2..4-row Qwen4Exp draft graph can run
+    as shipped. The lane's `libs-v3f` relay carries the same graph; the candidate snapshot's
+    `relay.hip` does not.
+  * With the private capacity lift, retention fires (292 retain lines, 48 allocations,
+    rows=4) and the fusion fires (240 lines, `n_rows=4`, `no_reuse=1`), proving the
+    fusion consumes the retained scratch. The doc's expected `n_rows=3` is not met; this
+    draft graph is 4 rows.
+  * The plan identity join is `match=0`: `exec_fp=aa6348107edb112d` vs
+    `plan_fp=f46f387900759453` (audit_fp matches plan_fp). The candidate's
+    `ggml_gallocr_plan_fp(gf)` and the reserved plan's `fp` disagree on the executed graph,
+    so G3's `match=1` gate is not satisfied.
+  * The capacity-lifted run aborts at epoch 1 (`relay aborted by host`) after 31
+    accepted/completed tokens, so no ON logits exist. The candidate's `libllama` also
+    rejects the lane's `GGML_TP5_MTP_RS_RING=1` (`n_rs_seq != 0`); the diagnostic had to
+    unset that knob. These are baseline/harness mismatches independent of the router-scratch
+    code.
+
+6. VERDICT
+----------
+  G2 PASS: HIP build rc=0; libggml-base 3dd4b430…, libggml-hip 7ebcb4c9…, libllama
+  35e51543…, tq-tp5-compose 7c516eaf….
+  G3 FAIL: as shipped, the multi-row ON leg aborts on the 16,384-F32 relay capacity before
+  compute; with a private capacity lift the fusion does fire (`n_rows=4 no_reuse=1`, 240
+  lines) but the plan identity join is `match=0` (`exec_fp=aa634810…` vs
+  `plan_fp=f46f3879…`) and the run aborts at epoch 1, so no `match=1` and no ON logits
+  exist.
+  G4 PASS only for the 1-row native 2x32: OFF_1==OFF_2, ON_1==ON_2 and OFF==ON are bitwise,
+  0/64 rows, 0 B, KL 0, top1 32/32 both. Multi-row ON numerics are UNPROVEN.
+VERDICT FAIL — G2 PASS; G3 FAIL (as-shipped relay capacity aborts the multi-row graph; the capacity-lifted diagnostic shows fusion firing at n_rows=4/no_reuse=1 but the plan identity join is match=0 with exec_fp=aa634810… vs plan_fp=f46f3879…, and the run aborts at epoch 1); G4 PASS only for the 1-row native 2x32 (bitwise, KL 0, top1 32/32), multi-row ON numerics UNPROVEN.
