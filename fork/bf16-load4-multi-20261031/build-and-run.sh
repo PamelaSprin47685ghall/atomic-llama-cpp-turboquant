@@ -23,7 +23,7 @@ cp -f "$tree/ggml/src/ggml-cuda/mmvf.cu" "$out/mmvf.multi.cu"
   -DGGML_CUDA_NO_PEER_COPY -DGGML_HIP_NO_MMQ_MFMA -DGGML_HIP_NO_VMM \
   -DGGML_SCHED_MAX_COPIES=4 -DUSE_PROF_API=1 -D_GNU_SOURCE \
   -D_XOPEN_SOURCE=600 -D__HIP_PLATFORM_AMD__=1 -D__HIP_ROCclr__=1 \
-  -I"$tree/ggml/include" -iquote "$tree/ggml/src/ggml-cuda" \
+  -I"$tree/ggml/include" -I"$tree/ggml/src" -iquote "$tree/ggml/src/ggml-cuda" \
   -DTP5_MMVF_SOURCE="\"$out/mmvf.multi.cu\"" \
   -x hip "$here/micro.cpp" -o "$out/micro" \
   -L"$install/lib" -lggml-hip -lggml-base \

@@ -1,0 +1,204 @@
+BF16 LOAD4 MULTI — G3/G4 (first GPU execution), 2026-11-02
+==========================================================
+Executor: DevopsFreshBoot. Private dir bf16-load4-multi-g3g4-20261101/. The micro and every lane
+leg held both GPU locks ($E/ple-candidate-gpu.lock, /tmp/ple-candidate-gpu.lock), one HIP process at
+a time. The lane root is a private copy of the snapshot install (73 MB) so legs.sh's install/lib-on
+write does not touch the selected install; the original tree and installs were not modified.
+
+0) WHAT WAS RUN
+---------------
+  Tree: /home/kunweiz/work/bf16-load4-multi-20261031, branch candidates/bf16-load4-multi-20261101,
+        HEAD 209c395fa, working tree clean; mmvf.cu b0625442748dbb35e683fc8ec96172d4882a1bf18bff8a18c277ce747055e307
+  Candidate DSO (G2): bf16-load4-multi-g2-v2-20261101/g2/lib/libggml-hip-on.so
+        sha256 ed12ee7e202e45194e3add4e877dd15102072825d5f06b7a993f663db0b7b031, 68,643,848 B
+  Lane install (stock): mtp-ready-snapshot-consolidated-20261025/install
+        libggml-hip.so.0.18.1 sha256 5e48c33f9197286e44901d68054fcdf62babf13bc38fed63945f4726e5ee6fe3
+        (this is the prefix G2's build.sh used, per VERIFY-BF16-LOAD4-MULTI-G2-V2)
+  Candidate DSO identity: on_mmvf_obj a310d3d7…, on_lib ed12ee7e… (G2 build-receipt.json).
+
+1) G3 MICRO — FAIL, NO MICRO_BITWISE_PASS
+-----------------------------------------
+  Command (verbatim, plus one build-path workaround):
+    bash fork/bf16-load4-multi-20261031/build-and-run.sh \
+         /home/kunweiz/work/bf16-load4-multi-20261031 \
+         $E/mtp-ready-snapshot-consolidated-20261025/install 0 200
+  The script as written does not add -I<tree>/ggml/src, so common.cuh's #include "ggml-impl.h"
+  fails. It was not edited; CPATH=<tree>/ggml/src:<tree>/ggml/include supplied the missing search
+  path. The compile then succeeded and the micro ran on device 0 (RX 6800, gfx1030, warp 32),
+  200 repeats.
+  Result: 100 bitwise cases, 38 FAIL / 62 PASS; the summary line is
+    {"kind":"summary","device":0,"failures":38,"status":"FAIL"}
+  and the script exited 1 without printing MICRO_BITWISE_PASS. Evidence: micro/micro.jsonl.
+  Failures are pattern-selective, not shape-selective:
+    pattern 0 (default, weights 2^-3..2^3, y ~1/1024): 18 of 20 cases fail, maxabs ~3e-5..6e-5
+    pattern 2 (weights ~2^16, y ~1.5e15):              20 of 20 cases fail, maxabs up to 1.15e18
+    patterns 1 ([1,2)), 3 (~2^-79), 4 (signed zero):   20/20 each pass, 0 differing bits
+  Representative cases (different_bits / values, maxabs):
+    hc_inject     ncols=10240 nrows=4    C=2 pat0   5/8      6.10e-05
+    hc_inject     ncols=10240 nrows=4    C=3 pat2   8/12     8.65e+17
+    ssm_ab_shard12 ncols=2560 nrows=12   C=3 pat0   6/36     3.05e-05
+    indexer_q     ncols=2560 nrows=512   C=2 pat0 196/1024   6.10e-05
+    ple_value     ncols=2560 nrows=2560  C=3 pat0 1649/7680  6.10e-05
+    hc_up_short   ncols=320  nrows=10240 C=2 pat0 1603/20480 3.05e-05
+    short_boundary ncols=512 nrows=48    C=2 pat0  17/96     1.53e-05
+  All cases are finite (nonfinite_ref=0, nonfinite_cand=0) and guard_writes=0: this is an
+  arithmetic/reduction-order mismatch between one multi-column launch and C single-column
+  launches, not a guard trip or an out-of-bounds write. Patterns 1/3/4 are exactly representable
+  and hide the order difference; pattern 0 is the realistic one and fails.
+
+2) G4 LANE LEGS — OFF vs ON NOT BITWISE
+---------------------------------------
+  Driver: fork/bf16-load4-multi-20261031/legs.sh <private-lane> <G2-cand-dir> <run-lane.py> \
+          bf16-load4-multi-g3g4-20261101/legs OFF|ON 2
+  run-lane.py is the private runner implementing legs.sh's (leg, out, lib_dir, predict, rounds,
+  KEY=VAL) contract: it derives the lane root from lib_dir, takes the snapshot's
+  recommended-command.json, sets --predict 32 --windows 2 --deadline 180 --capture-logits and the
+  library path, and runs two independent rounds per leg. Both locks were held across OFF and ON
+  (16:33-16:40), one process at a time.
+    OFF r1 rc=0 115.2 s   OFF r2 rc=0  87.8 s
+    ON  r1 rc=0 137.2 s   ON  r2 rc=0 135.7 s
+  Reproducibility: OFF r1 vs r2 and ON r1 vs r2 are whole-logits bitwise (0 B, 64/64 rows,
+  KL 0, top1 32/32 both, tokens equal).
+  OFF vs ON: NOT bitwise.
+    whole logits: 47,195,822 differing bytes of 63,569,920; 62/64 rows differ
+    req0: tokens differ from token 25; top1 25/32; KL mean 2.793, max 18.78
+    req1: tokens equal; top1 32/32; KL mean 0.001097, max 0.01426
+    (OFF r2 vs ON r2 is identical: same 47,195,822 bytes, same req0 divergence at token 25.)
+  The multi path is exercised, so the difference is not a dormant gate:
+    ON  BF16_LOAD4_MULTI final, per device: ncols2_launches=0 ncols2_rows=0,
+        ncols3_launches=724, ncols3_rows=20,656 (dev0/2) or 20,704 (dev1/3/4)
+        totals over the five devices: 3,620 N3 launches, 103,424 N3 rows; N2 = 0.
+    First multi launch: dev=4 ncols_dst=3 ncols=2560 nrows=12.
+    OFF prints no BF16_LOAD4_MULTI lines (the path is off).
+  Timing (not a speed claim: submit is first-touch dominated and varies run to run):
+    OFF r1 win0/1 submit 25,939/26,728 ms, wait 651/677 ms, ttft 27,674/29,103 ms
+    OFF r2 win0/1 submit  5,923/ 4,270 ms, wait 623/689 ms, ttft  4,085/ 6,442 ms
+    ON  r1 win0/1 submit 34,882/35,559 ms, wait 611/684 ms, ttft 36,953/38,995 ms
+    ON  r2 win0/1 submit 43,984/45,390 ms, wait 639/666 ms, ttft 45,280/47,533 ms
+    per-token median interval 5.0-5.1 ms in all four runs.
+  In this pair the ON legs are slower in wall and submit, but the submit spread (OFF 5.9-25.9 s)
+  is larger than any candidate effect that could be claimed from two rounds.
+
+3) INTERPRETATION
+-----------------
+  The G2 work established that the candidate adds exactly four multi-column kernels and changes
+  none of the 360 existing instruction streams, and that the CPU reference arithmetic is bitwise.
+  The GPU micro and the lane now show that the multi kernel's reduction order does not reproduce
+  C single-column launches for general (pattern 0) or large (pattern 2) data, and that the model's
+  N3 sites take the multi path and change the logits. The N2 sites were never exercised
+  (0 launches), so nothing is established about N2.
+
+4) LIMITS
+---------
+  * One device (0) for the micro; one lane root and one model command for the legs.
+  * The micro's build needed CPATH because the delivered script omits -I<tree>/ggml/src; the source
+    was not edited. This is a build-path workaround, not a candidate change.
+  * Timing is two rounds per leg; the submit component is unstable and is not used as a claim.
+  * No selected install or tree was modified; the lane root is a private copy.
+
+VERDICT FAIL — the BF16 load4 multi candidate is not bitwise on the GPU: the micro reports 38/100 failing cases and never prints MICRO_BITWISE_PASS (pattern 0 realistic data fails 18/20 with last-bit differences, pattern 2 large data fails 20/20, while patterns 1/3/4 pass; all finite, no guard writes), and the lane's ON logits are not bitwise against OFF (47,195,822 differing bytes, 62/64 rows, req0 token divergence at token 25 with top1 25/32 and KL mean 2.793, req1 top1 32/32 but KL mean 0.001097), with the multi path exercised at N3 (3,620 launches / 103,424 rows over five devices; N2 = 0), so the multi-column kernel changes values relative to the admitted T=1 reference and the candidate cannot be promoted; both GPU locks are free and all five GPUs read 0 %.
+
+================================================================================
+APPENDIX A — COMBINE-TREE FIX
+================================================================================
+Executor: DevopsFreshBoot. Private dir bf16-load4-multi-g3g4-20261101/. Micro and lane legs under
+both GPU locks, one HIP process at a time; build under both VFS build locks. No selected install or
+source tree was modified; the lane root is the private copy.
+
+A) SOURCE AND BUILD
+-------------------
+  mmvf.cu            e5fa28c8661f947c5e1a8b36217038ee71feb4fc14cef3347f9fc502054c111c
+  build-and-run.sh   d7adcfb2156a56c57919247597abfca96313893108e152be3b840990140c1d92
+  The fix writes ((acc[c][0] + acc[c][2]) + (acc[c][1] + acc[c][3])) under
+  #pragma clang fp reassociate(off), so the multi kernel reproduces the T=1 kernel's compiled
+  tree instead of the 3-add chain the unrolled loop produced.
+  Candidate DSO rebuilt with fork/build.sh (tree, snapshot install, private out dir):
+    on_src        e5fa28c8…  (same hash as the tree file)
+    on_mmvf_obj   b90f23e04ba2d0d391568afee152dc4d5f6307a72c39cc82afe068917e12e433
+    on_lib        c23e17d33f614c69295d24204f5ad2857d96806b4fb835d3ff66275775bda029
+                  68,643,848 B
+    relinkref     5e48c33f… (reproduces the installed control)
+  The build's fidelity block reports control_obj_eq_snapshot=false (the control object hash is
+  path-dependent; the relinkref still reproduces the installed 5e48c33f…), and the script exits 1
+  after writing the on lib. The on lib itself is complete: on_src is e5fa28c8… and its mmvf object
+  is the new one.
+
+B) MICRO — 100/100 PASS
+-----------------------
+  Command: fork/bf16-load4-multi-20261031/build-and-run.sh <tree> \
+           $E/mtp-ready-snapshot-consolidated-20261025/install 0 200
+  (the script now carries -I"$tree/ggml/src"; no CPATH workaround was needed).
+  Result: 100 bitwise cases, 0 FAIL / 100 PASS, every case different_bits=0, max_abs=0,
+  nonfinite_ref=0, nonfinite_cand=0, guard_writes=0; summary
+    {"kind":"summary","device":0,"failures":0,"status":"PASS"}
+  and the script printed MICRO_BITWISE_PASS device=0 repeats=200. Evidence: micro-fixed/micro.jsonl.
+  Timing (20 rows; candidate/reference and candidate/generic; generic is -1 where the lane does not
+  use the generic block-256 path):
+    shape           C  ref_us  cand_us  gen_us  c/ref  c/gen
+    hc_inject       2   9.274    5.006   6.179  0.540  0.810
+    hc_inject       3  13.828    5.089   6.726  0.368  0.757
+    ssm_ab_shard6   2   7.796    4.013   4.356  0.515  0.921
+    ssm_ab_shard6   3  11.366    4.086   4.726  0.359  0.865
+    ssm_ab_shard12  2   7.651    4.053   4.475  0.530  0.906
+    ssm_ab_shard12  3  11.141    4.103   4.850  0.368  0.846
+    ssm_ab_full     2   7.637    4.113   4.415  0.539  0.932
+    ssm_ab_full     3  11.221    4.060   4.701  0.362  0.864
+    indexer_k       2   7.723    4.142   4.517  0.536  0.917
+    indexer_k       3  11.408    4.344   4.919  0.381  0.883
+    indexer_q       2  11.115    6.068   7.465  0.546  0.813
+    indexer_q       3  16.601    6.676   8.654  0.402  0.771
+    ple_value       2  48.772   24.383  28.374  0.500  0.859
+    ple_value       3  73.161   24.399  33.127  0.333  0.737
+    hc_up_short     2  18.822    9.946     n/a  0.528    n/a
+    hc_up_short     3  28.297   10.672     n/a  0.377    n/a
+    short_boundary  2   7.376    3.778   3.936  0.512  0.960
+    short_boundary  3  10.862    3.744   4.163  0.345  0.899
+    long_boundary   2   7.012    3.627     n/a  0.517    n/a
+    long_boundary   3  10.514    3.767     n/a  0.358    n/a
+  Candidate/reference is 0.333-0.546 and candidate/generic 0.737-0.960.
+
+C) LANE LEGS — DEFAULT-OFF INERT, ON TAKES THE MULTI PATH
+----------------------------------------------------------
+  Driver: fork/legs.sh <private-lane> <candidate-dir> <run-lane.py> legs-fix OFF|ON 2, plus a
+  direct run-lane.py OFFC with the candidate DSO and GGML_TP5_BF16_LOAD4_MULTI=0. Both locks held
+  across all six runs, one process at a time.
+    OFF  (control DSO 5e48c33f, MULTI off)   r1 rc=0  81.3 s   r2 rc=0  92.2 s
+    ON   (candidate c23e17d3, MULTI=1)       r1 rc=0 116.3 s   r2 rc=0 115.6 s
+    OFFC (candidate c23e17d3, MULTI=0)       r1 rc=0 108.2 s   r2 rc=0 148.5 s
+  Reproducibility: OFF r1==r2, ON r1==r2 and OFFC r1==r2 are each whole-logits bitwise (0 B,
+  64/64 rows, KL 0, top1 32/32 both, tokens equal).
+  Default-OFF inertness: OFFC vs OFF is whole-logits bitwise — 0 of 63,569,920 bytes, 0/64 rows,
+  KL 0, top1 32/32 both, tokens equal. The candidate's MULTI=0 path is 0-bit-diff identical to the
+  control DSO.
+  OFF vs ON (the intended tree change, not a parity claim):
+    whole logits: 49,249,197 differing bytes, 62/64 rows differ
+    req0: tokens differ from token 13; top1 13/32; KL mean 10.57, max 24.66
+    req1: tokens equal; top1 32/32; KL mean 0.0007232, max 0.006031
+  This is the expected consequence of the lane note: at ne11=3, OFF runs the generic
+  mul_mat_vec_f<bf16,float,3,256> (8 waves per row) while ON runs
+  mul_mat_vec_bf16_load4_multi, which the micro now proves reproduces the T=1
+  mul_mat_vec_bf16_load4 tree exactly. The two trees are different, so OFF and ON cannot be
+  bitwise; the micro is the parity proof against the T=1 reference.
+  Multi-stats counters (ON, per device; OFF and OFFC print no multi lines):
+    N2: 181 launches, 5,164 rows (dev0/2) or 5,176 (dev1/3/4) -> 905 launches / 25,856 rows total
+    N3: 724 launches, 20,656 rows (dev0/2) or 20,704 (dev1/3/4) -> 3,620 launches / 103,424 rows total
+    first multi launch: dev=4 ncols_dst=2 ncols=2560 nrows=12
+  Timing (submit is first-touch dominated; no speed claim):
+    OFF r1 submit 2,328/2,314 ms, wait 635/662, ttft 2,284/2,660, median 5.1/5.1 ms
+    OFF r2 submit 7,888/7,299 ms, wait 616/680, ttft 7,424/8,907, median 5.0/5.0 ms
+    ON  r1 submit 19,494/18,833 ms, wait 623/653, ttft 18,520/20,674, median 4.9/5.0 ms
+    ON  r2 submit 27,491/28,603 ms, wait 634/663, ttft 29,247/32,537, median 5.1/5.1 ms
+    OFFC r1 submit 13,376/13,056 ms, wait 621/688, ttft 13,144/14,487, median 5.1/5.1 ms
+    OFFC r2 submit 43,716/39,302 ms, wait 652/690, ttft 43,253/46,470, median 4.9/5.0 ms
+
+D) LIMITS
+---------
+  * One device (0) for the micro; one lane root and one model command for the legs; two rounds per
+    leg. The micro's 100 cases cover 10 shapes x C=2/3 x 5 patterns.
+  * The build's control-object fidelity check fails on a hash that includes the build path; the
+    relinkref reproduces the installed 5e48c33f…, and the on lib is built from on_src e5fa28c8….
+  * OFF vs ON is reported as measured; it is not a bitwise requirement, because the OFF generic
+    tree and the ON T=1 tree differ by construction.
+  * Timing is not a speed claim: submit varies by first-touch across the six runs.
+
+VERDICT PASS ON THE COMBINE-TREE FIX AND DEFAULT-OFF INERTNESS — the fixed mmvf.cu (e5fa28c8…) makes the multi kernel reproduce the T=1 kernel's compiled tree, the micro is 100/100 with 0 differing bits in every case and prints MICRO_BITWISE_PASS, the rebuilt candidate DSO c23e17d3… (on_src e5fa28c8…) is bitwise inert with MULTI=0 against the control DSO (0 of 63,569,920 bytes, 0/64 rows, KL 0, top1 32/32 both requests), and ON takes the multi path at N2 (905 launches / 25,856 rows) and N3 (3,620 launches / 103,424 rows); OFF vs ON is not bitwise by design (49,249,197 differing bytes, req0 divergence at token 13 with top1 13/32 and KL mean 10.57, req1 top1 32/32 with KL mean 0.0007232) because OFF runs the generic N=3 tree while ON matches the T=1 tree; both GPU locks are free and all five GPUs read 0 %.

@@ -88,9 +88,18 @@ static __global__ void mul_mat_vec_bf16_load4_multi(
     }
 
     float sums[ncols_dst];
+    {
+    // The lane build uses -funsafe-math-optimizations, so the compiler is free
+    // to reshape this combine. In the gfx1030 code of the admitted T=1 kernel
+    // (mul_mat_vec_bf16_load4<32> and <256>) it emits
+    // (acc0 + acc2) + (acc1 + acc3); in this kernel it emitted a three-add
+    // chain, which rounds differently. Write the T=1 tree explicitly and
+    // forbid reassociation so every column reproduces T=1 bit for bit.
+#pragma clang fp reassociate(off)
 #pragma unroll
     for (int c = 0; c < ncols_dst; ++c) {
-        sums[c] = warp_reduce_sum<warp_size>((acc[c][0] + acc[c][1]) + (acc[c][2] + acc[c][3]));
+        sums[c] = warp_reduce_sum<warp_size>((acc[c][0] + acc[c][2]) + (acc[c][1] + acc[c][3]));
+    }
     }
     if constexpr (threads_per_row > warp_size) {
         __shared__ float partial[ncols_dst][waves_per_row];
