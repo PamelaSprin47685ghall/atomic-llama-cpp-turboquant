@@ -640,6 +640,9 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
     uint64_t n_graph_builds = 0; // actual model.build_graph calls, including reserve
+    // Pillar 5 plan identity: bumped whenever the scheduler is recreated, so
+    // a plan key never survives a placement generation it did not observe.
+    uint64_t alloc_gen_ = 0;
 
     // The ubatch the live graph's inputs were last filled from. The mask
     // read-back (llama_union_mask_row_check) re-runs the same check the fill

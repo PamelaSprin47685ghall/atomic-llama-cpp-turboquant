@@ -2,7 +2,7 @@
 
 #include "ggml-relay.h"
 
-#define GGML_RELAY_PROVIDER_ABI_VERSION 2
+#define GGML_RELAY_PROVIDER_ABI_VERSION 3
 
 // Internal backend capability. No model, request or B-library types cross it.
 // HIP owns buffers, queues, system-scope flags and completion observations.
@@ -26,6 +26,15 @@ struct ggml_relay_provider_i {
     bool (*publish)(void * provider, const ggml_relay_event * event);
     bool (*snapshot)(void * provider, ggml_relay_status * status);
     void (*abort)(void * provider, int32_t error_code);
+    // ABI 3: prepare with the caller's plan identity. `key` may be null, in
+    // which case the provider keeps the legacy behavior. The channel count in
+    // the key is authoritative only after the provider validates it against
+    // `channels`. Providers that predate ABI 3 leave this field absent; the
+    // consumer must check abi_version before calling it.
+    bool (*prepare_ex)(void * provider, ggml_tensor * const * terminals, size_t channels,
+                       const ggml_relay_plan_key * key);
+    // ABI 3: optional plan-cache diagnostic. Returns false when unavailable.
+    bool (*plan_snapshot)(void * provider, ggml_relay_plan_snapshot * snapshot);
 };
 
 typedef const ggml_relay_provider_i * (*ggml_backend_relay_get_interface_t)(void);

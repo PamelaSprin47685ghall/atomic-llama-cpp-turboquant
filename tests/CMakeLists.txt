@@ -609,6 +609,16 @@ add_test(NAME test-rsz-relay-onegraph COMMAND test-rsz-relay-onegraph)
 set_property(TEST test-rsz-relay-onegraph PROPERTY LABELS "cpu;rsz")
 set_property(TEST test-rsz-relay-onegraph PROPERTY PASS_REGULAR_EXPRESSION "RSZ_RELAY_ONEGRAPH_TEST PASS")
 
+# TP5 pillar-5 plan/frame/pool policy. Header-only, no llama/ggml library and
+# no device: the K=8 plan cache, the five-shape frame LRU, the exact pool
+# budget, the per-window channel slots and the legacy switch defaults.
+add_executable(test-relay-plan-policy test-relay-plan-policy.cpp)
+target_compile_features(test-relay-plan-policy PRIVATE cxx_std_17)
+target_include_directories(test-relay-plan-policy PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
+add_test(NAME test-relay-plan-policy COMMAND test-relay-plan-policy)
+set_property(TEST test-relay-plan-policy PROPERTY LABELS "cpu;tp5")
+set_property(TEST test-relay-plan-policy PROPERTY PASS_REGULAR_EXPRESSION "RELAY_PLAN_POLICY_TEST PASS")
+
 if (UNIX)
     add_executable(test-ntok-onegraph test-ntok-onegraph.cpp)
     target_link_libraries(test-ntok-onegraph PRIVATE llama)

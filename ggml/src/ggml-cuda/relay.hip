@@ -2,6 +2,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "ggml-relay-plan.h"
 #include "relay.cuh"
 
 #include <algorithm>
@@ -28,7 +29,8 @@ static_assert(std::atomic<int32_t>::is_always_lock_free, "relay abort must never
 constexpr uint32_t all_ranks        = (1u << ranks) - 1;
 // Swift needs 36 recurrent-output, 48 expert-output and 97 HC joins. Reserve a
 // fixed bound before submission; unused slots never become active transfers.
-constexpr size_t   channel_capacity = 256;
+// Pillar 5 keeps the same 256-slot bound but lays the payload out per plan.
+constexpr size_t   channel_capacity = ggml_relay_plan::channel_capacity;
 // Isolated real MTP verifier T4 capacity: the original worst HC residual
 // channel is 10240 F32 per token, so T4 needs 40960 scalars. Keep the
 // existing strict bounds, five-rank host-mapped stride and producer/consumer
@@ -91,7 +93,11 @@ static_assert(element_capacity <= (SIZE_MAX - sizeof(control)) / (sizeof(float) 
 constexpr size_t channel_stride = sizeof(control) + element_capacity * sizeof(float) * (ranks + 1);
 static_assert(channel_stride % alignof(control) == 0, "relay controls must retain cache-line alignment");
 static_assert(channel_capacity <= SIZE_MAX / channel_stride, "relay pool byte capacity overflows size_t");
-constexpr size_t pool_bytes = channel_capacity * channel_stride;
+// Legacy fixed layout. Pillar 5 replaces it with a per-plan exact layout and a
+// 68 MiB budget; the legacy value remains the GGML_TP5_POOL_EXACT=0 behavior.
+constexpr size_t pool_bytes_legacy = ggml_relay_plan::pool_bytes_legacy;
+static_assert(sizeof(control) == ggml_relay_plan::control_bytes,
+              "relay control size must match the plan-policy control bytes");
 
 __host__ __device__ uint64_t load(const word * w) {
     return __atomic_load_n(&w->value, __ATOMIC_ACQUIRE);
@@ -280,6 +286,7 @@ struct channel {
     size_t        bound_nb[ranks][GGML_MAX_DIMS] = {};
     size_t        elements                       = 0;
     size_t        bytes                          = 0; // Effective bytes of one wire payload.
+    size_t        capacity                       = 0; // F32 elements per rank in this slot.
     uint32_t      computed_mask                  = 0; // Prepared COMPUTE flags, never ready/ack.
     bool          enqueued                       = false;
     bool          offered                        = false;
@@ -348,6 +355,8 @@ struct frame {
     hipGraphExec_t            exec[ranks]  = {};
     uint64_t                  compute_nodes[ranks] = {};
     uint64_t                  relay_nodes[ranks] = {};
+    uint64_t                  uid = 0;             // graph uid this frame was captured for
+    uint64_t                  plan_generation = 0; // plan that owned the bindings
     uint64_t                  last_used = 0;
     bool                      warmed = false;
 };
@@ -383,11 +392,30 @@ struct provider {
     rank_state                            rank[ranks];
     std::array<channel, channel_capacity> channels;
     void *                                channel_pool        = nullptr;
+    size_t                                pool_bytes          = 0;
+    size_t                                pool_budget         = pool_bytes_legacy;
+    bool                                  pool_exact          = false;
+    bool                                  pool_grown          = false;
+    ggml_relay_plan::pool_layout          pool_layout;
     word *                                abort_host          = nullptr;
     word *                                abort_device[ranks] = {};
     word *                                activation_host = nullptr;
     word *                                activation_device[ranks] = {};
-    std::array<frame, 2>                   frames;
+    std::array<frame, ggml_relay_plan::frame_capacity_max> frames;
+    ggml_relay_plan::frame_lru             frame_lru{ 2 };
+    ggml_relay_plan::plan_cache            plan_cache;
+    bool                                   plan_cache_enabled = false;
+    bool                                   plan_verify_uid = false;
+    bool                                   plan_stats_enabled = false;
+    bool                                   plan_flush_each_prepare = false;
+    bool                                   plan_pinned = false;
+    bool                                   plan_cache_generation = false;
+    bool                                   plan_key_absent_logged = false;
+    uint64_t                               plan_epoch = 0;
+    std::array<uint64_t, ggml_relay_plan::plan_capacity> retired_plans{};
+    size_t                                 retired_count = 0;
+    uint64_t                               pool_reallocations = 0;
+    uint64_t                               frames_cleared_for_pool = 0;
     std::vector<unsigned char>            signature;
     std::vector<const ggml_tensor *>       tensors;
     std::vector<ggml_tensor *>             tensor_keys;
@@ -511,6 +539,8 @@ bool clear_frame(provider & p, frame & f) {
     if (ok) {
         f.warmed = false;
         f.signature.clear();
+        f.uid = 0;
+        f.plan_generation = 0;
         std::fill(f.relay_nodes, f.relay_nodes + ranks, 0);
     }
     return ok;
@@ -521,8 +551,20 @@ bool free_channels(provider & p) {
         return false;
     }
     p.channel_pool = nullptr;
+    p.pool_bytes   = 0;
+    p.pool_layout.clear();
     for (auto & c : p.channels) {
         c.host_control = nullptr;
+        for (auto & inbox : c.inbox) {
+            inbox = nullptr;
+        }
+        c.output   = nullptr;
+        c.capacity = 0;
+        for (uint32_t r = 0; r < ranks; ++r) {
+            c.device_control[r] = nullptr;
+            c.device_inbox[r]   = nullptr;
+            c.device_output[r]  = nullptr;
+        }
     }
     return true;
 }
@@ -541,6 +583,7 @@ bool release_owners(provider & p) {
             return false;
         }
     }
+    p.frame_lru = ggml_relay_plan::frame_lru(p.frame_lru.capacity());
     if (!free_channels(p)) {
         return false;
     }
@@ -717,9 +760,9 @@ void bind(channel & c, uint32_t rank, ggml_tensor * tensor) {
     memcpy(c.bound_nb[rank], tensor->nb, sizeof(tensor->nb));
 }
 
-bool reserve_channels(provider & p) {
+bool allocate_channel_pool(provider & p, size_t bytes) {
     if (!select(p, 0) ||
-        !checked(p, hipHostMalloc(&p.channel_pool, pool_bytes, hipHostMallocMapped | hipHostMallocPortable),
+        !checked(p, hipHostMalloc(&p.channel_pool, bytes, hipHostMallocMapped | hipHostMallocPortable),
                  "hipHostMalloc channel pool")) {
         return false;
     }
@@ -729,16 +772,29 @@ bool reserve_channels(provider & p) {
         fail(p, ENOTSUP, "relay channel pool is not mapped");
         return false;
     }
-    for (size_t i = 0; i < channel_capacity; ++i) {
+    p.pool_bytes = bytes;
+    return true;
+}
+
+// Bind every used channel to its offset in the current layout. The layout is
+// frozen while a frame exists, so these pointers stay valid for every
+// captured graph.
+bool bind_channels(provider & p, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
         auto & c       = p.channels[i];
-        auto * host    = static_cast<char *>(p.channel_pool) + i * channel_stride;
+        auto * host    = static_cast<char *>(p.channel_pool) + p.pool_layout.offset[i];
         c.host_control = reinterpret_cast<control *>(host);
         memset(c.host_control, 0, sizeof(control));
         auto * payload = host + sizeof(control);
+        const size_t capacity = p.pool_layout.capacity[i];
         for (uint32_t r = 0; r < ranks; ++r) {
-            c.inbox[r] = payload + element_capacity * sizeof(float) * r;
+            c.inbox[r] = payload + capacity * sizeof(float) * r;
         }
-        c.output   = payload + element_capacity * sizeof(float) * ranks;
+        c.output   = payload + capacity * sizeof(float) * ranks;
+        c.capacity = capacity;
+        // A grown layout hands out fresh host memory. The zero-inbox claim
+        // belongs to the old payload and must be rebuilt by prepare.
+        c.zero_inbox_mask = 0;
         c.released = true;
     }
     for (uint32_t r = 0; r < ranks; ++r) {
@@ -747,16 +803,86 @@ bool reserve_channels(provider & p) {
             !checked(p, hipHostGetDevicePointer(&mapped, p.channel_pool, 0), "hipHostGetDevicePointer channel pool")) {
             return false;
         }
-        for (size_t i = 0; i < channel_capacity; ++i) {
+        for (size_t i = 0; i < count; ++i) {
             auto & c            = p.channels[i];
-            auto * device       = static_cast<char *>(mapped) + i * channel_stride;
+            auto * device       = static_cast<char *>(mapped) + p.pool_layout.offset[i];
             c.device_control[r] = reinterpret_cast<control *>(device);
             auto * payload      = device + sizeof(control);
-            c.device_inbox[r]   = payload + element_capacity * sizeof(float) * r;
-            c.device_output[r]  = payload + element_capacity * sizeof(float) * ranks;
+            const size_t capacity = p.pool_layout.capacity[i];
+            c.device_inbox[r]   = payload + capacity * sizeof(float) * r;
+            c.device_output[r]  = payload + capacity * sizeof(float) * ranks;
         }
     }
     return true;
+}
+
+bool reserve_channels_legacy(provider & p) {
+    if (!allocate_channel_pool(p, pool_bytes_legacy)) {
+        return false;
+    }
+    p.pool_layout.clear();
+    for (size_t i = 0; i < channel_capacity; ++i) {
+        p.pool_layout.offset[i]   = i * channel_stride;
+        p.pool_layout.capacity[i] = element_capacity;
+    }
+    p.pool_layout.bytes = pool_bytes_legacy;
+    p.pool_layout.count = channel_capacity;
+    return bind_channels(p, channel_capacity);
+}
+
+// Exact layout: create() allocated the 8 MiB baseline. The first prepare
+// computes the real per-channel need and grows once within the 68 MiB budget.
+// A later growth is allowed only while no captured frame exists, because a
+// captured graph holds the old device pointers. Everything else fails closed.
+bool reserve_channels_exact(provider & p, const size_t * elements, size_t count) {
+    size_t need = 0;
+    const ggml_relay_plan::pool_growth decision =
+        ggml_relay_plan::pool_growth_decision(p.pool_layout, elements, count, ranks, p.pool_budget, need);
+    if (decision == ggml_relay_plan::pool_growth::fail_budget) {
+        char detail[sizeof(p.status.error)];
+        std::snprintf(detail, sizeof(detail),
+                      "relay exact pool needs %zu bytes for %zu channels, budget is %zu; set GGML_TP5_POOL_EXACT=0",
+                      need, count, p.pool_budget);
+        fail(p, ENOSPC, detail);
+        return false;
+    }
+    if (decision == ggml_relay_plan::pool_growth::grow) {
+        // The layout is about to change, so every captured frame's channel
+        // pointers are stale even when the allocation itself does not move.
+        // prepare() is idle, so every captured frame is idle too. Clear them;
+        // the next submit recaptures the shapes it needs.
+        for (size_t i = 0; i < p.frame_lru.capacity(); ++i) {
+            if (!clear_frame(p, p.frames[i])) {
+                return false;
+            }
+            p.frame_lru.clear(static_cast<int>(i));
+            if (p.current == &p.frames[i]) {
+                p.current = nullptr;
+            }
+            ++p.frames_cleared_for_pool;
+        }
+        if (need > p.pool_bytes) {
+            if (p.channel_pool && !free_channels(p)) {
+                return false;
+            }
+            if (!allocate_channel_pool(p, need)) {
+                return false;
+            }
+            ++p.pool_reallocations;
+            p.pool_grown = true;
+            GGML_LOG_INFO("HIP relay exact pool: %zu bytes (%.2f MiB) for %zu channels, %llu reallocation(s)\n",
+                          p.pool_bytes, double(p.pool_bytes) / (1024.0 * 1024.0), count,
+                          static_cast<unsigned long long>(p.pool_reallocations));
+        }
+        if (!ggml_relay_plan::compute_pool_layout(elements, count, ranks, p.pool_bytes, p.pool_layout)) {
+            fail(p, ENOSPC, "relay exact pool layout does not fit the allocated pool");
+            return false;
+        }
+    }
+    if (decision == ggml_relay_plan::pool_growth::keep) {
+        return true; // The existing layout and pointers still cover the plan.
+    }
+    return bind_channels(p, count);
 }
 
 void * create(ggml_backend_t * backends, size_t count) {
@@ -780,6 +906,27 @@ void * create(ggml_backend_t * backends, size_t count) {
     p->status.abi_version         = GGML_RELAY_ABI_VERSION;
     p->status.ranks               = ranks;
     p->status.finished            = true;
+    // Pillar 5 switches. Every switch defaults to the legacy behavior; an
+    // illegal value fails the whole provider instead of clamping.
+    ggml_relay_plan::config cfg;
+    char                    cfg_error[160];
+    if (!ggml_relay_plan::parse_config(
+            std::getenv("GGML_TP5_PLAN_UNION"), std::getenv("GGML_TP5_RELAY_FRAMES"),
+            std::getenv("GGML_TP5_POOL_EXACT"), std::getenv("GGML_TP5_RELAY_SLOT_CHANNELS"),
+            std::getenv("GGML_TP5_RELAY_VERIFY_UID"), std::getenv("GGML_TP5_RELAY_PLAN_STATS"),
+            std::getenv("GGML_TP5_GRAPH_UID"), std::getenv("GGML_TP5_RELAY_PLAN_FLUSH"),
+            cfg, cfg_error, sizeof(cfg_error))) {
+        GGML_LOG_ERROR("HIP relay switch matrix rejected: %s\n", cfg_error);
+        delete p;
+        return nullptr;
+    }
+    p->plan_cache_enabled       = cfg.plan_union;
+    p->plan_verify_uid          = cfg.verify_uid;
+    p->plan_stats_enabled       = cfg.plan_stats;
+    p->plan_flush_each_prepare  = cfg.plan_flush;
+    p->pool_exact               = cfg.pool_exact;
+    p->pool_budget              = cfg.pool_exact ? ggml_relay_plan::pool_budget_default : pool_bytes_legacy;
+    p->frame_lru                = ggml_relay_plan::frame_lru(cfg.frames);
     if (priority_mode != 0) {
         p->priority_pair_slot = acquire_priority_pair_slot();
         if (p->priority_pair_slot < 0) {
@@ -958,7 +1105,8 @@ void * create(ggml_backend_t * backends, size_t count) {
         }
     }
     if (ok) {
-        ok = reserve_channels(*p);
+        ok = p->pool_exact ? allocate_channel_pool(*p, ggml_relay_plan::pool_baseline)
+                           : reserve_channels_legacy(*p);
     }
     if (!ok) {
         if (p->priority_pair_slot >= 0) {
@@ -977,6 +1125,9 @@ void * create(ggml_backend_t * backends, size_t count) {
                       static_cast<void *>(p), p->priority_pair_slot, requested_priority,
                       unsigned(hipStreamNonBlocking), ranks);
     }
+    GGML_LOG_INFO("HIP relay pillar5 provider=%p plan_cache=%d frames=%zu pool=%s bytes=%zu budget=%zu\n",
+                  static_cast<void *>(p), int(p->plan_cache_enabled), p->frame_lru.capacity(),
+                  p->pool_exact ? "exact" : "legacy", p->pool_bytes, p->pool_budget);
     return p;
 #endif
 }
@@ -1012,7 +1163,123 @@ bool set_wire_type(void * opaque, ggml_relay_wire_type wire_type) {
     return true;
 }
 
-bool prepare(void * opaque, ggml_tensor * const * terminals, size_t count) {
+void log_plan_stats(provider & p, const char * where) {
+    if (!p.plan_stats_enabled) {
+        return;
+    }
+    const auto & s = p.plan_cache.stats();
+    GGML_LOG_INFO("TP5_PLAN_STATS %s hits=%llu misses=%llu inserts=%llu evictions=%llu pinned=%llu "
+                  "flushes=%llu stale=%llu live=%zu pool=%zu reallocs=%llu frames_cleared=%llu frames=%zu\n",
+                  where,
+                  static_cast<unsigned long long>(s.hits), static_cast<unsigned long long>(s.misses),
+                  static_cast<unsigned long long>(s.inserts), static_cast<unsigned long long>(s.evictions),
+                  static_cast<unsigned long long>(s.pinned_refusals),
+                  static_cast<unsigned long long>(s.flushes),
+                  static_cast<unsigned long long>(s.stale_generation),
+                  p.plan_cache.live(), p.pool_bytes,
+                  static_cast<unsigned long long>(p.pool_reallocations),
+                  static_cast<unsigned long long>(p.frames_cleared_for_pool),
+                  p.frame_lru.used());
+}
+
+// Drop every frame captured for one plan generation and queue its retirement
+// event. prepare() is idle, so no frame here has a native or CPU user.
+bool retire_plan(provider & p, uint64_t generation, bool emit_event) {
+    if (generation == 0) {
+        return true;
+    }
+    for (size_t i = 0; i < p.frame_lru.capacity(); ++i) {
+        const int index = static_cast<int>(i);
+        if (!p.frame_lru.valid(index) || p.frame_lru.plan_generation(index) != generation) {
+            continue;
+        }
+        if (!clear_frame(p, p.frames[i])) {
+            return false;
+        }
+        p.frame_lru.clear(index);
+        if (p.current == &p.frames[i]) {
+            p.current = nullptr;
+        }
+    }
+    if (emit_event && p.retired_count < p.retired_plans.size()) {
+        p.retired_plans[p.retired_count++] = generation;
+    }
+    return true;
+}
+
+// Flush every plan. Refused while any plan is pinned, because native work may
+// still reference its bindings. Returns false after failing the provider.
+bool flush_all_plans(provider & p, bool emit_events) {
+    std::array<uint64_t, ggml_relay_plan::plan_capacity> generations{};
+    size_t count = 0;
+    for (size_t i = 0; i < ggml_relay_plan::plan_capacity; ++i) {
+        if (const auto * slot = p.plan_cache.at(i)) {
+            generations[count++] = slot->generation;
+        }
+    }
+    if (!p.plan_cache.flush_all()) {
+        fail(p, EBUSY, "relay plan flush refused: a plan is pinned");
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (!retire_plan(p, generations[i], emit_events)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Bind the plan identity to a generation. `same_plan` is the full binding
+// validation result; a key hit with different bindings is a key bug and fails
+// closed instead of silently sharing a generation.
+bool plan_generation_for(provider & p, const ggml_relay_plan_key * key, size_t count, bool same_plan,
+                         uint64_t & generation) {
+    if (!p.plan_cache_enabled || key == nullptr) {
+        p.plan_cache_generation = false;
+        if (!p.plan_cache_enabled && !p.plan_key_absent_logged) {
+            // No key means the caller cannot describe plan identity. Keep the
+            // legacy monotonic generation rather than guessing.
+            p.plan_key_absent_logged = true;
+        }
+        if (same_plan) {
+            generation = p.status.plan_generation;
+            return true;
+        }
+        if (p.status.plan_generation == UINT64_MAX) {
+            fail(p, EOVERFLOW, "relay plan generation overflow");
+            return false;
+        }
+        generation = ++p.status.plan_generation;
+        return true;
+    }
+    ggml_relay_plan::plan_key pk = ggml_relay_plan::plan_key::from_c(*key);
+    if (key->channels != 0 && key->channels != count) {
+        char detail[sizeof(p.status.error)];
+        std::snprintf(detail, sizeof(detail), "relay plan key channel count %u differs from prepared channels %zu",
+                      key->channels, count);
+        fail(p, EPROTO, detail);
+        return false;
+    }
+    pk.channels = uint32_t(count);
+    if (!same_plan && p.plan_cache.find(pk) != nullptr) {
+        fail(p, EPROTO, "relay plan key collided with a different terminal binding");
+        return false;
+    }
+    uint64_t evicted = 0;
+    ggml_relay_plan::plan_slot * slot = p.plan_cache.acquire(pk, p.plan_epoch, &evicted);
+    if (slot == nullptr) {
+        fail(p, ENOSPC, "relay plan cache exhausted: every slot is pinned");
+        return false;
+    }
+    if (evicted != 0 && !retire_plan(p, evicted, true)) {
+        return false;
+    }
+    p.plan_cache_generation = true;
+    generation = slot->generation;
+    return true;
+}
+
+bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, const ggml_relay_plan_key * key) {
     auto &                      p = *static_cast<provider *>(opaque);
     std::lock_guard<std::mutex> lock(p.mutex);
     if (!idle(p) || p.status.failed) {
@@ -1022,13 +1289,18 @@ bool prepare(void * opaque, ggml_tensor * const * terminals, size_t count) {
     // prepare announces a new owned definition even if its terminal bindings
     // are unchanged: intermediate topology, layouts or fusion may differ.
     p.definition_changed = true;
+    ++p.plan_epoch;
+    if (p.plan_flush_each_prepare && p.plan_cache_enabled && !flush_all_plans(p, true)) {
+        return false;
+    }
     if (!terminals || count == 0 || count > channel_capacity) {
-        fail(p, ENOTSUP, "relay plan exceeds reserved 256-channel capacity or is empty");
+        fail(p, ENOTSUP, "relay plan exceeds reserved 256-channel channel capacity or is empty");
         return false;
     }
     bool same_plan = p.status.channels == count;
+    std::array<size_t, channel_capacity> elements{};
     // Validate the entire next binding before changing any active plan. All
-    // mapped storage was reserved at create, before either context decodes.
+    // mapped storage is either the legacy pool or the exact layout below.
     for (size_t c = 0; c < count; ++c) {
         const auto * first = terminals[c * ranks];
         if (!first || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first) || ggml_nelements(first) <= 0) {
@@ -1043,6 +1315,7 @@ bool prepare(void * opaque, ggml_tensor * const * terminals, size_t count) {
             fail(p, ENOTSUP, detail);
             return false;
         }
+        elements[c] = size_t(ggml_nelements(first));
         for (uint32_t r = 0; r < ranks; ++r) {
             const auto * t = terminals[c * ranks + r];
             if (!t || !t->data || t->type != first->type || !ggml_is_contiguous(t) ||
@@ -1064,6 +1337,12 @@ bool prepare(void * opaque, ggml_tensor * const * terminals, size_t count) {
             }
         }
     }
+    if (p.pool_exact) {
+        // The exact layout must cover this plan before any inbox is cleared.
+        if (!reserve_channels_exact(p, elements.data(), count)) {
+            return false;
+        }
+    }
     // idle() proved native tails, CPU borrows and old output releases ended.
     // Inputs are read-only to the CPU service. Only a computed producer can
     // dirty a slot; mark it before any direct/captured/replayed submission.
@@ -1078,30 +1357,40 @@ bool prepare(void * opaque, ggml_tensor * const * terminals, size_t count) {
                 c.computed_mask |= bit;
                 c.zero_inbox_mask &= ~bit;
             } else if (!(c.zero_inbox_mask & bit)) {
-                memset(c.inbox[r], 0, element_capacity * wire_element_size(p));
+                memset(c.inbox[r], 0, c.capacity * wire_element_size(p));
                 c.zero_inbox_mask |= bit;
             }
         }
     }
-    if (same_plan) {
-        return true;
-    }
-    if (p.status.plan_generation == UINT64_MAX) {
-        fail(p, EOVERFLOW, "relay plan generation overflow");
+    uint64_t generation = 0;
+    if (!plan_generation_for(p, key, count, same_plan, generation)) {
         return false;
     }
-    for (size_t i = 0; i < count; ++i) {
-        auto & c   = p.channels[i];
-        c.elements = size_t(ggml_nelements(terminals[i * ranks]));
-        c.bytes    = c.elements * wire_element_size(p);
-        for (uint32_t r = 0; r < ranks; ++r) {
-            bind(c, r, terminals[i * ranks + r]);
+    if (!same_plan) {
+        for (size_t i = 0; i < count; ++i) {
+            auto & c   = p.channels[i];
+            c.elements = elements[i];
+            c.bytes    = c.elements * wire_element_size(p);
+            for (uint32_t r = 0; r < ranks; ++r) {
+                bind(c, r, terminals[i * ranks + r]);
+            }
+            c.released = true;
         }
-        c.released = true;
+        p.status.channels = count;
     }
-    ++p.status.plan_generation;
-    p.status.channels = count;
+    p.status.plan_generation = generation;
+    if (p.status.epoch != 0 && (p.status.epoch % 64) == 0) {
+        log_plan_stats(p, "prepare");
+    }
     return true;
+}
+
+bool prepare(void * opaque, ggml_tensor * const * terminals, size_t count) {
+    return prepare_impl(opaque, terminals, count, nullptr);
+}
+
+bool prepare_ex(void * opaque, ggml_tensor * const * terminals, size_t count, const ggml_relay_plan_key * key) {
+    return prepare_impl(opaque, terminals, count, key);
 }
 
 bool begin(provider & p) {
@@ -1111,6 +1400,13 @@ bool begin(provider & p) {
     if (p.status.epoch == UINT64_MAX) {
         fail(p, EOVERFLOW, "relay epoch overflow");
         return false;
+    }
+    if (p.plan_cache_enabled && p.plan_cache_generation && p.status.plan_generation != 0) {
+        if (!p.plan_cache.pin(p.status.plan_generation)) {
+            fail(p, EPROTO, "relay begin could not pin its plan generation");
+            return false;
+        }
+        p.plan_pinned = true;
     }
     ++p.status.epoch;
     // idle proved prior native tails and CPU readers ended. Captured kernels
@@ -1349,6 +1645,12 @@ bool finish(provider & p) {
     if (p.status.sealed && p.mode == submission::direct) {
         p.current->warmed = true;
     }
+    if (p.plan_pinned) {
+        p.plan_pinned = false;
+        if (!p.plan_cache.release(p.status.plan_generation)) {
+            fail(p, EPROTO, "relay finish could not release its plan pin");
+        }
+    }
     observe(p);
     return p.status.sealed;
 }
@@ -1488,40 +1790,84 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
     const int64_t d0=ggml_time_us();
     std::lock_guard<std::mutex> lock(p.mutex);
     const int64_t dlock=ggml_time_us();
-    const bool changed=p.definition_changed || !p.current;
-    bool hit=!changed;
     if (!idle(p) || p.status.failed || !graphs || stages != p.status.channels + 1) {
         return false;
     }
+    const uint64_t uid = graphs[0] ? graphs[0]->uid : 0;
+    const bool changed = p.definition_changed || !p.current;
+    bool hit = !changed;
     uint64_t compute_nodes[ranks] = {};
     try {
-        if (p.definition_changed || !p.current) {
-        if (!describe_frame(p, graphs, stages, compute_nodes)) {
-            return false;
-        }
-        p.current = nullptr;
-        for (auto & f : p.frames) {
-            if (f.signature == p.signature) {
-                hit=true;
-                p.current = &f;
-                break;
-            }
-        }
-        if (!p.current) {
-            auto & f = p.frames[p.frames[0].last_used <= p.frames[1].last_used ? 0 : 1];
-            // idle above proves this old executable has no native or CPU users.
-            if (!clear_frame(p, f)) {
+        // uid fast path: the same graph object, plan generation and nonempty
+        // signature means the captured executables are already current. The
+        // optional verification still pays the O(nodes) describe and asserts
+        // equality, so a wrong uid is caught instead of replayed.
+        const bool fast = uid != 0 && p.current != nullptr && p.current->uid == uid &&
+                          p.current->plan_generation == p.status.plan_generation &&
+                          !p.current->signature.empty();
+        if (fast && p.plan_verify_uid) {
+            if (!describe_frame(p, graphs, stages, compute_nodes)) {
                 return false;
             }
-            f.signature.swap(p.signature);
-            std::copy(compute_nodes, compute_nodes + ranks, f.compute_nodes);
-            p.current = &f;
+            if (p.current->signature != p.signature) {
+                fail(p, EPROTO, "relay uid fast path signature mismatch");
+                return false;
+            }
+        }
+        if (!fast && changed) {
+            if (!describe_frame(p, graphs, stages, compute_nodes)) {
+                return false;
+            }
+            // The previous current frame is not a reuse candidate for a new
+            // signature, but it is still the most recent cache entry. Skip it
+            // as an eviction victim like the design requires.
+            const int previous_index = p.current != nullptr
+                ? static_cast<int>(p.current - p.frames.data()) : -1;
+            p.current = nullptr;
+            int current_index = -1;
+            for (size_t i = 0; i < p.frame_lru.capacity(); ++i) {
+                if (p.frames[i].signature == p.signature) {
+                    p.current = &p.frames[i];
+                    current_index = static_cast<int>(i);
+                    hit = true;
+                    break;
+                }
+            }
+            if (!p.current) {
+                const int index = p.frame_lru.victim(previous_index);
+                if (index < 0) {
+                    fail(p, ENOSPC, "relay frame cache has no evictable slot");
+                    return false;
+                }
+                auto & f = p.frames[static_cast<size_t>(index)];
+                // idle above proves this old executable has no native or CPU users.
+                if (!clear_frame(p, f)) {
+                    return false;
+                }
+                p.frame_lru.clear(index);
+                f.signature.swap(p.signature);
+                std::copy(compute_nodes, compute_nodes + ranks, f.compute_nodes);
+                p.current = &f;
+                current_index = index;
+                hit = false;
+            }
+            p.frame_lru.assign(current_index, uid, p.status.plan_generation, p.status.epoch);
         }
         p.definition_changed = false;
-        }
     } catch (const std::bad_alloc &) {
         fail(p, ENOMEM, "allocating relay frame signature failed");
         return false;
+    }
+    p.current->uid = uid;
+    p.current->plan_generation = p.status.plan_generation;
+    {
+        const int index = static_cast<int>(p.current - p.frames.data());
+        if (!p.frame_lru.valid(index) || p.frame_lru.uid(index) != uid ||
+            p.frame_lru.plan_generation(index) != p.status.plan_generation) {
+            p.frame_lru.assign(index, uid, p.status.plan_generation, p.status.epoch);
+        } else {
+            p.frame_lru.touch(index, p.status.epoch);
+        }
     }
     p.mode = p.current->exec[0] ? submission::replay :
         (p.current->warmed ? submission::capture : submission::direct);
@@ -1614,6 +1960,23 @@ void fill_event(provider & p, size_t index, ggml_relay_event_kind kind, ggml_rel
 }
 
 template<typename Event>
+void fill_retired_event(provider & p, uint64_t generation, Event & event) {
+    event = {};
+    if constexpr (std::is_same<Event, ggml_relay_event_v2>::value) {
+        event.abi_version = GGML_RELAY_EVENT_V2_ABI_VERSION;
+    } else {
+        event.abi_version = GGML_RELAY_ABI_VERSION;
+    }
+    event.kind            = GGML_RELAY_PLAN_RETIRED;
+    // The runtime rejects a zero epoch as an identity error. Retirement is a
+    // provider fact, not an epoch fact; use the last observed epoch when the
+    // provider has not submitted yet.
+    event.epoch           = p.status.epoch != 0 ? p.status.epoch : 1;
+    event.plan_generation = generation;
+    event.ranks           = ranks;
+}
+
+template<typename Event>
 int poll_event(void * opaque, Event * event) {
     if (!opaque || !event) {
         return -1;
@@ -1627,8 +1990,9 @@ int poll_event(void * opaque, Event * event) {
     if (p.pending_abort.load(std::memory_order_acquire)) {
         return -1;
     }
+    const bool have_retired = p.retired_count != 0;
     const int event_status = p.event_status.load(std::memory_order_acquire);
-    if (event_status <= 0) {
+    if (event_status <= 0 && !have_retired) {
         return event_status;
     }
     std::unique_lock<std::mutex> lock(p.mutex, std::try_to_lock);
@@ -1636,8 +2000,23 @@ int poll_event(void * opaque, Event * event) {
         return 0;
     }
     consume_abort(p);
-    if (!p.status.sealed || p.borrowed != std::numeric_limits<size_t>::max()) {
-        return p.status.failed ? -1 : 0;
+    if (p.status.failed) {
+        return -1;
+    }
+    if (p.borrowed != std::numeric_limits<size_t>::max()) {
+        return 0;
+    }
+    if (p.retired_count != 0) {
+        const uint64_t generation = p.retired_plans[0];
+        for (size_t i = 1; i < p.retired_count; ++i) {
+            p.retired_plans[i - 1] = p.retired_plans[i];
+        }
+        --p.retired_count;
+        fill_retired_event(p, generation, *event);
+        return 1;
+    }
+    if (!p.status.sealed) {
+        return 0;
     }
     // Completion queries belong to snapshot/close. Calling into the HIP
     // runtime here switches five device contexts on every busy-wait iteration.
@@ -1768,6 +2147,37 @@ bool snapshot(void * opaque, ggml_relay_status * status) {
     return true;
 }
 
+bool plan_snapshot(void * opaque, ggml_relay_plan_snapshot * snapshot) {
+    if (!opaque || !snapshot) {
+        return false;
+    }
+    auto &                       p = *static_cast<provider *>(opaque);
+    std::unique_lock<std::mutex> lock(p.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return false;
+    }
+    *snapshot = {};
+    for (size_t i = 0; i < ggml_relay_plan::plan_capacity; ++i) {
+        const auto * slot = p.plan_cache.at(i);
+        if (slot == nullptr) {
+            continue;
+        }
+        snapshot->valid_mask |= 1u << i;
+        snapshot->generation[i] = slot->generation;
+        snapshot->channels[i]   = slot->channels;
+    }
+    const auto & stats = p.plan_cache.stats();
+    snapshot->hits             = stats.hits;
+    snapshot->misses           = stats.misses;
+    snapshot->inserts          = stats.inserts;
+    snapshot->evictions        = stats.evictions;
+    snapshot->pinned_refusals  = stats.pinned_refusals;
+    snapshot->flushes          = stats.flushes;
+    snapshot->stale_generation = stats.stale_generation;
+    snapshot->pool_bytes       = p.pool_bytes;
+    return true;
+}
+
 void abort(void * opaque, int32_t error) {
     if (!opaque) {
         return;
@@ -1802,6 +2212,10 @@ bool destroy(void * opaque) {
         fail(*p, EBUSY, "relay destroy cannot prove CPU and native completion; retaining owners");
         return false;
     }
+    if (p->plan_cache_enabled && !flush_all_plans(*p, false)) {
+        return false;
+    }
+    log_plan_stats(*p, "destroy");
     if (!release_owners(*p)) {
         return false;
     }
@@ -1820,6 +2234,8 @@ const ggml_relay_provider_i interface = {
     publish,
     snapshot,
     abort,
+    prepare_ex,
+    plan_snapshot,
 };
 
 const ggml_relay_wire_provider_i wire_interface = {
