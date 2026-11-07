@@ -6,6 +6,7 @@
 #include "llama-tp5-flags.h"
 
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -17,6 +18,9 @@ static ubatch_data_handle alloc_ubatch_data(const std::shared_ptr<ubatch_data_po
             return pooled;
         }
         pool->note_fallback();
+        if (tp5::flag_exact_one("TP5_UBATCH_TRACE")) {
+            std::fprintf(stderr, "TP5_UBATCH_FALLBACK capacity=%u\n", pool->capacity());
+        }
     }
 
     return ubatch_data_handle(std::make_shared<llama_ubatch_data>());
@@ -29,9 +33,16 @@ void llama_batch_allocr::ensure_ubatch_pool(uint32_t n_ubatch) {
 
     if (!ubatch_pool) {
         ubatch_pool = std::make_shared<ubatch_data_pool>();
+        if (tp5::flag_exact_one("TP5_UBATCH_TRACE")) {
+            std::fprintf(stderr, "TP5_UBATCH_POOL create\n");
+        }
     }
 
     ubatch_pool->configure(n_ubatch + 2);
+
+    if (tp5::flag_exact_one("TP5_UBATCH_TRACE")) {
+        std::fprintf(stderr, "TP5_UBATCH_POOL configure capacity=%u\n", ubatch_pool->capacity());
+    }
 }
 
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
@@ -469,6 +480,11 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.data         =*/ std::move(udata),
     };
 
+    if (tp5::flag_exact_one("TP5_UBATCH_TRACE")) {
+        std::fprintf(stderr, "TP5_UBATCH_RESERVE n=%u n_seqs=%u pooled=%d\n",
+                res.n_tokens, res.n_seqs, res.data.pooled() ? 1 : 0);
+    }
+
     return res;
 }
 
@@ -903,6 +919,12 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.data         =*/ std::move(udata),
     };
+
+    if (tp5::flag_exact_one("TP5_UBATCH_TRACE")) {
+        std::fprintf(stderr, "TP5_UBATCH_ADD n=%u n_seqs=%u unq=%u pos0=%d pooled=%d slot=%u gen=%u\n",
+                res.n_tokens, res.n_seqs, res.n_seqs_unq, res.pos[0],
+                res.data.pooled() ? 1 : 0, res.data.slot(), res.data.generation());
+    }
 
     if (debug > 0) {
         LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);
