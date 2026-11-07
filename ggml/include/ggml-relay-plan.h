@@ -41,6 +41,12 @@ constexpr std::size_t pool_bytes_legacy   = 402915328;
 // Seven coarse identity fields plus the channel count. Two epochs with the
 // same key must be interchangeable for every captured graph. `channels` is
 // part of the identity: a 180- and a 181-channel plan never share a slot.
+//
+// This is NOT tq::alloc::PlanKey. The F2 allocation ledger keys seven fields
+// (model, window, n_tokens, n_outputs, rs_class, n_kv_bucket, alloc_gen) and
+// owns arena placement. This relay plan adds `channels` because one allocation
+// plan can back relay graphs with different channel tables. The two domains
+// stay separate; the C adapters map each one explicitly.
 struct plan_key {
     std::uint64_t model      = 0;
     std::uint32_t window     = 0;
@@ -472,7 +478,7 @@ struct config {
     bool          slot_channels = false;
     bool          verify_uid    = false;
     bool          plan_stats    = false;
-    bool          graph_uid     = true; // relay mode auto-on; GGML_TP5_GRAPH_UID=0 disables
+    bool          graph_uid     = false; // GGML_TP5_GRAPH_UID=1 enables; OFF is stock
     bool          plan_flush    = false;
 };
 
@@ -531,7 +537,7 @@ inline bool parse_config(const char * plan_union, const char * frames, const cha
         return reject("GGML_TP5_RELAY_PLAN_STATS must be 0 or 1");
     }
     if (graph_uid == nullptr || graph_uid[0] == '\0') {
-        out.graph_uid = true;
+        out.graph_uid = false; // OFF == stock: llama leaves every graph uid zero
     } else if (!parse_switch(graph_uid, out.graph_uid)) {
         return reject("GGML_TP5_GRAPH_UID must be 0 or 1");
     }
