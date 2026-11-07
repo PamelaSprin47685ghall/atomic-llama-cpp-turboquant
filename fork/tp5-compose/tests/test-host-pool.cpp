@@ -208,6 +208,28 @@ static void test_steady_state() {
 #endif
 }
 
+static void test_event_cap() {
+    set_flag("TP5_MTP_BATCH_POOL", "1");
+    set_flag("TP5_ALLOC_PROBE", "1");
+
+    constexpr int wide = 4;
+    tq::tp5::mtp_batch_pool pool(1, wide);
+
+    // Two events per lease. The log must stop at its fixed cap instead of
+    // growing without bound.
+    for (int i = 0; i < 3000; ++i) {
+        auto lease = pool.acquire();
+        lease.set(i, i, 1, nullptr, wide);
+    }
+
+    const auto & events = pool.events();
+    check(events.size() == tq::tp5::mtp_batch_pool::max_events, "events: fixed cap is reached");
+    check(events.size() <= tq::tp5::mtp_batch_pool::max_events, "events: no growth past the cap");
+
+    set_flag("TP5_ALLOC_PROBE", nullptr);
+    set_flag("TP5_MTP_BATCH_POOL", nullptr);
+}
+
 int main() {
     test_pooled_lease();
     test_fallback_lease();
@@ -215,6 +237,7 @@ int main() {
     test_events();
     test_cancel_releases_lease();
     test_steady_state();
+    test_event_cap();
 
     std::printf("%s failures=%d\n", g_failures ? "FAILED" : "OK", g_failures);
 
