@@ -903,6 +903,85 @@ static void test_host_pool(testing & t) {
 
         set_pool_flag(nullptr);
     });
+
+    t.test("graph_copy_pins_slot", [&](testing & t) {
+        set_pool_flag("1");
+
+        batch_builder bb1;
+        bb1.add(0, {0}, false);
+        bb1.add(1, {0}, true);
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb1.make(), vocab, nullptr, bb1.n_embd, 4, false));
+
+        llama_ubatch first = ba.split_simple(2);
+        t.assert_true("first split is pooled", first.data.pooled());
+        const uint32_t slot = first.data.slot();
+
+        // llm_graph_params keeps an intentional copy of the ubatch.
+        llama_ubatch graph = first;
+        first = llama_ubatch{};
+
+        batch_builder bb2;
+        bb2.add(10, {0}, false);
+        bb2.add(11, {0}, true);
+
+        t.assert_true(ba.init(bb2.make(), vocab, nullptr, bb2.n_embd, 4, false));
+        llama_ubatch second = ba.split_simple(2);
+
+        t.assert_true("second split is pooled", second.data.pooled());
+        t.assert_true("pinned slot is not reused", second.data.slot() != slot);
+        t.assert_equal("graph copy keeps the old position", 0, graph.pos[0]);
+        t.assert_equal("graph copy keeps the old tail", 1, graph.pos[1]);
+        t.assert_equal("second split has the new position", 10, second.pos[0]);
+
+        // Dropping the last copy returns the slot.
+        graph = llama_ubatch{};
+
+        batch_builder bb3;
+        bb3.add(20, {0}, false);
+        bb3.add(21, {0}, true);
+
+        t.assert_true(ba.init(bb3.make(), vocab, nullptr, bb3.n_embd, 4, false));
+        llama_ubatch third = ba.split_simple(2);
+        t.assert_equal("released slot is reused", slot, third.data.slot());
+        t.assert_equal("third split has the new position", 20, third.pos[0]);
+
+        set_pool_flag(nullptr);
+    });
+
+    t.test("split_outlives_allocr", [&](testing & t) {
+        set_pool_flag("1");
+
+        // The exact graph_reserve lifetime: the allocator dies, the graph
+        // keeps a ubatch copy, and the copy is read afterwards.
+        llama_ubatch graph = {};
+        {
+            batch_builder bb;
+            bb.add(3, {0}, false);
+            bb.add(4, {0}, true);
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+            llama_ubatch ub = ba.split_simple(2);
+            t.assert_true("split is pooled", ub.data.pooled());
+            graph = ub;
+        }
+
+        t.assert_true("handle keeps the pool alive", graph.data.pooled());
+        t.assert_equal("token count survives", 2u, graph.n_tokens);
+        t.assert_equal("position survives", 3, graph.pos[0]);
+        t.assert_equal("tail position survives", 4, graph.pos[1]);
+        t.assert_equal("seq id survives", 0, graph.seq_id[0][0]);
+        t.assert_equal("output survives", 1, (int) graph.output[1]);
+        t.assert_equal("seq idx survives", 0, graph.seq_idx[0]);
+
+        graph = llama_ubatch{};
+        t.assert_true("release after the allocator died is safe", true);
+
+        set_pool_flag(nullptr);
+    });
 }
 
 int main(int argc, char ** argv) {
