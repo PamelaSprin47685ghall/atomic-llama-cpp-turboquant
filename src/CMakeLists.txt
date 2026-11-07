@@ -14,6 +14,7 @@ add_library(llama
             llama-adapter.cpp
             llama-arch.cpp
             llama-batch.cpp
+            llama-ubatch-pool.cpp
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp

@@ -3,11 +3,24 @@
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-memory.h"
+#include "llama-tp5-flags.h"
 
 #include <cassert>
 #include <cstring>
 #include <algorithm>
 #include <sstream>
+
+static ubatch_data_handle alloc_ubatch_data(ubatch_data_pool & pool) {
+    if (tp5::flag_exact_one("TP5_UBATCH_POOL")) {
+        ubatch_data_handle pooled = pool.acquire();
+        if (pooled) {
+            return pooled;
+        }
+        pool.note_fallback();
+    }
+
+    return ubatch_data_handle(std::make_shared<llama_ubatch_data>());
+}
 
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
@@ -394,21 +407,32 @@ bool llama_batch_allocr::init(
 llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs) {
     const uint32_t n_tokens = n_seq_tokens*n_seqs;
 
+    if (tp5::flag_exact_one("TP5_UBATCH_POOL")) {
+        // A reserve ubatch is short-lived and does not know n_ubatch. Two
+        // slots cover the reserve call and its caller; a decode split later
+        // grows the pool while no handle is live.
+        ubatch_pool.configure(2);
+    }
+
     clear();
     split_reset();
 
     const int64_t n_pos_all = (int64_t) n_tokens*n_pos_per_embd;
 
-    auto udata = std::make_shared<llama_ubatch::data_t>();
+    auto udata = alloc_ubatch_data(ubatch_pool);
 
-    udata->token     .resize(n_tokens);
+    // A reused slot keeps its previous contents. Every array that the reserve
+    // path leaves for the caller must be restored to the fresh-vector value.
+    udata->token     .assign(n_tokens, 0);
     udata->embd      .clear();
-    udata->pos       .resize(n_pos_all);
-    udata->n_seq_id  .resize(n_tokens);
-    udata->seq_id    .resize(n_tokens);
+    udata->pos       .assign(n_pos_all, 0);
+    udata->n_seq_id  .assign(n_tokens, 0);
+    udata->seq_id    .assign(n_tokens, nullptr);
     udata->seq_id_unq.resize(0);
-    udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
-    udata->output    .resize(n_tokens);
+    udata->seq_idx   .assign(LLAMA_MAX_SEQ, -1);
+    udata->output    .assign(n_tokens, 0);
+    udata->decision_order.clear();
+    udata->seq_id_data.clear();
 
     for (uint32_t s = 0; s < n_seqs; ++s) {
         udata->seq_idx[s] = s;
@@ -496,6 +520,10 @@ void llama_batch_allocr::split_reset() {
 }
 
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
+    if (tp5::flag_exact_one("TP5_UBATCH_POOL")) {
+        ubatch_pool.configure(n_ubatch + 2);
+    }
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -530,6 +558,10 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 }
 
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+    if (tp5::flag_exact_one("TP5_UBATCH_POOL")) {
+        ubatch_pool.configure(n_ubatch + 2);
+    }
+
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -701,6 +733,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+    if (tp5::flag_exact_one("TP5_UBATCH_POOL")) {
+        ubatch_pool.configure(n_ubatch + 2);
+    }
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -774,7 +810,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     assert(n_tokens%n_seqs == 0);
 
-    auto udata = std::make_shared<llama_ubatch::data_t>();
+    auto udata = alloc_ubatch_data(ubatch_pool);
 
     const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
@@ -785,10 +821,11 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->n_seq_id  .resize(n_tokens);
     udata->seq_id    .resize(n_tokens);
     udata->seq_id_unq.resize(0);
-    udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
+    udata->seq_idx   .assign(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
     udata->decision_order.resize(decision_order.empty() ? 0 : n_tokens);
 
+    udata->seq_id_data.clear();
     udata->seq_id_data.reserve(n_tokens);
 
     seq_set_t seq_set_unq;

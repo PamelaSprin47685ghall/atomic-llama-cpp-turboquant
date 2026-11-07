@@ -650,6 +650,241 @@ static void test_mrope(testing & t) {
     });
 }
 
+static void set_pool_flag(const char * value) {
+#ifdef _WIN32
+    _putenv_s("TP5_UBATCH_POOL", value ? value : "");
+#else
+    if (value) {
+        setenv("TP5_UBATCH_POOL", value, 1);
+    } else {
+        unsetenv("TP5_UBATCH_POOL");
+    }
+#endif
+}
+
+static bool same_ubatch(const llama_ubatch & a, const llama_ubatch & b, uint32_t n_embd) {
+    if (a.n_tokens     != b.n_tokens     ||
+        a.n_seq_tokens != b.n_seq_tokens ||
+        a.n_seqs       != b.n_seqs       ||
+        a.n_seqs_unq   != b.n_seqs_unq   ||
+        a.n_pos        != b.n_pos        ||
+        a.equal_seqs() != b.equal_seqs() ||
+        (a.token == nullptr) != (b.token == nullptr) ||
+        (a.embd  == nullptr) != (b.embd  == nullptr)) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < a.n_tokens; ++i) {
+        if (a.n_seq_id[i] != b.n_seq_id[i] || a.output[i] != b.output[i]) {
+            return false;
+        }
+        for (int s = 0; s < a.n_seq_id[i]; ++s) {
+            if (a.seq_id[i][s] != b.seq_id[i][s]) {
+                return false;
+            }
+        }
+        if (a.token && a.token[i] != b.token[i]) {
+            return false;
+        }
+        if (a.embd) {
+            for (uint32_t k = 0; k < n_embd; ++k) {
+                if (a.embd[i*n_embd + k] != b.embd[i*n_embd + k]) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < a.n_tokens*a.n_pos; ++i) {
+        if (a.pos[i] != b.pos[i]) {
+            return false;
+        }
+    }
+
+    for (uint32_t i = 0; i < LLAMA_MAX_SEQ; ++i) {
+        if (a.seq_idx[i] != b.seq_idx[i]) {
+            return false;
+        }
+    }
+
+    for (uint32_t i = 0; i < a.n_seqs_unq; ++i) {
+        if (a.seq_id_unq[i] != b.seq_id_unq[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void test_host_pool(testing & t) {
+    llama_vocab vocab;
+
+    t.test("split_values_match_reference", [&](testing & t) {
+        batch_builder bb_ref;
+        batch_builder bb_pool;
+
+        const auto add_all = [](batch_builder & bb) {
+            bb.add(0, {0, 1}, false);
+            bb.add(0, {0}, false);
+            bb.add(1, {0}, false);
+            bb.add(1, {1}, true);
+            bb.add(2, {0}, false);
+        };
+
+        add_all(bb_ref);
+        add_all(bb_pool);
+
+        set_pool_flag(nullptr);
+        llama_batch_allocr ref(1);
+        t.assert_true(ref.init(bb_ref.make(), vocab, nullptr, bb_ref.n_embd, 4, false));
+
+        set_pool_flag("1");
+        llama_batch_allocr pooled(1);
+        t.assert_true(pooled.init(bb_pool.make(), vocab, nullptr, bb_pool.n_embd, 4, false));
+
+        int splits = 0;
+        while (true) {
+            llama_ubatch a = ref.split_simple(2);
+            llama_ubatch b = pooled.split_simple(2);
+
+            t.assert_equal("same n_tokens", a.n_tokens, b.n_tokens);
+            if (a.n_tokens == 0) {
+                break;
+            }
+
+            t.assert_true("pooled handle", b.data.pooled());
+            t.assert_true("split values match the reference", same_ubatch(a, b, bb_ref.n_embd));
+            ++splits;
+        }
+
+        t.assert_equal("three splits", 3, splits);
+        t.assert_equal("both batches consumed", ref.get_n_used(), pooled.get_n_used());
+    });
+
+    t.test("reused_slot_clears_absent_seq_idx", [&](testing & t) {
+        set_pool_flag("1");
+
+        batch_builder bb;
+        bb.add(0, {0, 1}, false);
+        bb.add(0, {0}, false);
+        bb.add(1, {0}, false);
+        bb.add(1, {0}, false);
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+        uint32_t gen = 0;
+        {
+            llama_ubatch ub = ba.split_simple(1);
+            t.assert_equal("first ubatch has both seqs", 1, ub.seq_idx[1]);
+            gen = ub.data.generation();
+        }
+
+        llama_ubatch ub = ba.split_simple(1);
+        t.assert_true("reused slot", ub.data.pooled());
+        t.assert_equal("generation advances", gen + 1, ub.data.generation());
+        t.assert_equal("absent seq idx resets to -1", -1, ub.seq_idx[1]);
+        t.assert_equal("present seq idx is set", 0, ub.seq_idx[0]);
+    });
+
+    t.test("exhaustion_falls_back", [&](testing & t) {
+        set_pool_flag("1");
+
+        batch_builder bb;
+        for (int i = 0; i < 4; ++i) {
+            bb.add(i, {0}, false);
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+        std::vector<llama_ubatch> held;
+        for (int i = 0; i < 4; ++i) {
+            llama_ubatch ub = ba.split_simple(1);
+            t.assert_equal(1u, ub.n_tokens);
+            held.push_back(std::move(ub));
+        }
+
+        int pooled = 0;
+        for (const auto & ub : held) {
+            pooled += ub.data.pooled() ? 1 : 0;
+        }
+        t.assert_equal("capacity n_ubatch + 2 holds three", 3, pooled);
+
+        held.clear();
+
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+        llama_ubatch ub = ba.split_simple(1);
+        t.assert_true("slot is pooled again after release", ub.data.pooled());
+    });
+
+    t.test("reserve_resets_reused_slot", [&](testing & t) {
+        set_pool_flag("1");
+
+        llama_batch_allocr ba(1);
+
+        uint32_t gen = 0;
+        {
+            llama_ubatch ub = ba.ubatch_reserve(2, 2);
+            t.assert_true("reserve uses a pooled slot", ub.data.pooled());
+            gen = ub.data.generation();
+
+            for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+                ub.token[i]    = 7;
+                ub.output[i]   = 1;
+                ub.n_seq_id[i] = 3;
+            }
+            for (uint32_t i = 0; i < ub.n_tokens*ub.n_pos; ++i) {
+                ub.pos[i] = 9;
+            }
+        }
+
+        llama_ubatch ub = ba.ubatch_reserve(2, 2);
+        t.assert_true("second reserve reuses the pool", ub.data.pooled());
+        t.assert_equal("reserve generation advances", gen + 1, ub.data.generation());
+
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            t.assert_equal("token is cleared", 0, ub.token[i]);
+            t.assert_equal("output is cleared", 0, (int) ub.output[i]);
+            t.assert_equal("n_seq_id is cleared", 0, ub.n_seq_id[i]);
+        }
+        for (uint32_t i = 0; i < ub.n_tokens*ub.n_pos; ++i) {
+            t.assert_equal("pos is cleared", 0, ub.pos[i]);
+        }
+        t.assert_true("decision order is cleared", ub.decision_order == nullptr);
+        t.assert_true("embd stays empty", ub.embd == nullptr);
+
+        set_pool_flag(nullptr);
+        llama_batch_allocr ref(1);
+        llama_ubatch r = ref.ubatch_reserve(2, 2);
+        t.assert_true("flag off uses the heap", !r.data.pooled());
+        t.assert_equal("heap reserve token is zero", 0, r.token[0]);
+        t.assert_equal("heap reserve output is zero", 0, (int) r.output[0]);
+    });
+
+    t.test("handle_outlives_variable", [&](testing & t) {
+        set_pool_flag("1");
+
+        batch_builder bb;
+        bb.add(0, {0}, false);
+        bb.add(1, {0}, true);
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+        llama_ubatch ub = ba.split_simple(2);
+        llama_ubatch copy = ub;
+        ub = llama_ubatch{};
+
+        t.assert_true("copy keeps the payload", copy.data.pooled());
+        t.assert_equal(2u, copy.n_tokens);
+        t.assert_equal(0, copy.pos[0]);
+        t.assert_equal(1, copy.pos[1]);
+
+        set_pool_flag(nullptr);
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -669,6 +904,7 @@ int main(int argc, char ** argv) {
     t.test("split",     test_split);
     t.test("keep_tail", test_keep_tail);
     t.test("mrope",     test_mrope);
+    t.test("host_pool", test_host_pool);
 
     return t.summary();
 }

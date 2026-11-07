@@ -196,6 +196,22 @@ public:
         return res;
     }
 
+    // copy the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1]) into out
+    // same value set as cp() above, but out keeps its allocated capacity
+    void cp_into(const std::vector<uint32_t> & idxs, llama_kv_cells & out) const {
+        out.resize(idxs.size());
+
+        for (uint32_t j = 0; j < idxs.size(); ++j) {
+            const auto idx = idxs[j];
+
+            out.pos[j] = pos[idx];
+            out.ext[j] = ext[idx];
+            out.seq[j] = seq[idx];
+
+            assert(shift[idx] == 0);
+        }
+    }
+
     // set the state of cells [i, i + other.pos.size()) (used for save/restore the state of the cells)
     void set(uint32_t i, const llama_kv_cells & other) {
         assert(i + other.pos.size() <= pos.size());
