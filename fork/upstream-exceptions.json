@@ -736,7 +736,7 @@
     },
     {
       "path": "src/llama-batch.cpp",
-      "sha256": "a3677e029eab1a13f943b9d1f013e376d8486737c4c82ca1b1129d565d4cb21b",
+      "sha256": "d03065d393fa73df88f6f17f0606d0bd23d807f27e90dfe7f50462c180a18c3e",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose",
@@ -811,7 +811,7 @@
     },
     {
       "path": "tests/test-batch-alloc.cpp",
-      "sha256": "4756625d8492cbf141c4df853dc2033b18dd563425451d1340134e85841ec8d8",
+      "sha256": "cf542aa4273603eeec5fc4b2baaf206805be124cd89cdd5468f69936e404e4d1",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
