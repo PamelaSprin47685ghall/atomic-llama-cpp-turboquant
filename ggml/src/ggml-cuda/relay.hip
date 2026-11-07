@@ -1125,9 +1125,9 @@ void * create(ggml_backend_t * backends, size_t count) {
                       static_cast<void *>(p), p->priority_pair_slot, requested_priority,
                       unsigned(hipStreamNonBlocking), ranks);
     }
-    GGML_LOG_INFO("HIP relay pillar5 provider=%p plan_cache=%d frames=%zu pool=%s bytes=%zu budget=%zu\n",
+    GGML_LOG_INFO("HIP relay pillar5 provider=%p plan_cache=%d frames=%zu pool=%s bytes=%zu budget=%zu graph_uid=%d\n",
                   static_cast<void *>(p), int(p->plan_cache_enabled), p->frame_lru.capacity(),
-                  p->pool_exact ? "exact" : "legacy", p->pool_bytes, p->pool_budget);
+                  p->pool_exact ? "exact" : "legacy", p->pool_bytes, p->pool_budget, int(cfg.graph_uid));
     return p;
 #endif
 }

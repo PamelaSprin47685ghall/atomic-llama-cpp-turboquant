@@ -47,12 +47,14 @@
 //
 // Pillar 5: a graph object is built once and reused in place, so the uid is
 // assigned only when the object has none. A rebuild allocates a fresh graph
-// (llm_graph_result::reset) and therefore a fresh uid. GGML_TP5_GRAPH_UID=0
-// keeps every uid zero and the relay falls back to the full signature path.
+// (llm_graph_result::reset) and therefore a fresh uid. The switch is OFF by
+// default: with every pillar-5 flag unset, every uid stays zero and the relay
+// takes the full signature path, which is stock behavior. The ON leg must set
+// GGML_TP5_GRAPH_UID=1 explicitly.
 static void tp5_assign_graph_uid(ggml_backend_t relay, ggml_cgraph * gf) {
     static const bool enabled = [] {
         const char * value = getenv("GGML_TP5_GRAPH_UID");
-        return value == nullptr || value[0] == '\0' || strcmp(value, "0") != 0;
+        return value != nullptr && strcmp(value, "1") == 0;
     }();
     if (relay != nullptr && enabled && gf != nullptr && gf->uid == 0) {
         gf->uid = ggml_graph_next_uid();

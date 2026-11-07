@@ -358,7 +358,7 @@ void test_config() {
     CHECK(!cfg.slot_channels);
     CHECK(!cfg.verify_uid);
     CHECK(!cfg.plan_stats);
-    CHECK(cfg.graph_uid); // relay mode auto-on; the relay is only created there
+    CHECK(!cfg.graph_uid); // OFF == stock: every graph uid stays zero
     CHECK(!cfg.plan_flush);
 
     CHECK(ggml_relay_plan::parse_config("1", "8", "1", "1", "1", "1", "0", "1",
@@ -371,6 +371,14 @@ void test_config() {
     CHECK(cfg.plan_stats);
     CHECK(!cfg.graph_uid);
     CHECK(cfg.plan_flush);
+
+    // The uid assignment is an explicit ON-leg switch, never a default.
+    CHECK(ggml_relay_plan::parse_config(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "1", nullptr,
+                                        cfg, error, sizeof(error)));
+    CHECK(cfg.graph_uid);
+    CHECK(ggml_relay_plan::parse_config(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "0", nullptr,
+                                        cfg, error, sizeof(error)));
+    CHECK(!cfg.graph_uid);
 
     // FRAMES=0 is the legacy two-frame tier; 4 is the structural tier.
     CHECK(ggml_relay_plan::parse_config(nullptr, "0", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
