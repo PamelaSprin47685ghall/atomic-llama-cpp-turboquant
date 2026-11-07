@@ -1972,6 +1972,10 @@ struct ggml_backend_meta_context {
     ggml_relay_wire_type relay_wire_type = GGML_RELAY_WIRE_F32;
     void * relay = nullptr;
     bool relay_mode = false;
+    // Pillar 5: the last plan identity described by llama. A null key keeps
+    // the provider on its legacy monotonic generation path.
+    ggml_relay_plan_key relay_plan_key = {};
+    bool relay_plan_key_valid = false;
     bool cpu_staged_f32 = false;
     bool shared_expert_shard_started = false;
     bool shared_expert_shard_enabled = false;
@@ -2033,7 +2037,10 @@ struct ggml_backend_meta_context {
             auto get_interface = (ggml_backend_relay_get_interface_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_relay_get_interface");
             relay_i = get_interface != nullptr ? get_interface() : nullptr;
-            if (relay_i == nullptr || relay_i->abi_version != GGML_RELAY_PROVIDER_ABI_VERSION ||
+            // ABI 3 appends prepare_ex/plan_snapshot. Accept an older provider
+            // (ABI 2) and only call the fields it actually has.
+            if (relay_i == nullptr || relay_i->abi_version < 2 ||
+                relay_i->abi_version > GGML_RELAY_PROVIDER_ABI_VERSION ||
                 !relay_i->create || !relay_i->destroy || !relay_i->prepare || !relay_i->submit ||
                 !relay_i->poll || !relay_i->publish || !relay_i->snapshot || !relay_i->abort) {
                 GGML_LOG_ERROR("%s: HIP tp5-relay capability is unavailable or incompatible\n", __func__);
@@ -4014,7 +4021,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         // Every rank/stage tensor has been converted before preparing any
         // native communication storage. No lazy allocation after begin.
-        if (needs_rebuild && !ri->prepare(relay, backend_ctx->relay_terminals.data(), channels)) {
+        // ABI 3 receives the plan identity; without a key the provider keeps
+        // the legacy generation path.
+        const bool prepared = needs_rebuild &&
+            (ri->abi_version >= 3 && ri->prepare_ex != nullptr
+                 ? ri->prepare_ex(relay, backend_ctx->relay_terminals.data(), channels,
+                                  backend_ctx->relay_plan_key_valid ? &backend_ctx->relay_plan_key : nullptr)
+                 : ri->prepare(relay, backend_ctx->relay_terminals.data(), channels));
+        if (needs_rebuild && !prepared) {
             ri->abort(relay, GGML_STATUS_FAILED);
             return GGML_STATUS_FAILED;
         }
@@ -4676,4 +4690,20 @@ void ggml_backend_relay_abort(ggml_backend_t backend, int32_t error_code) {
     if (ctx != nullptr) {
         ctx->relay_i->abort(ctx->relay, error_code);
     }
+}
+
+void ggml_backend_meta_set_plan_key(ggml_backend_t backend, const ggml_relay_plan_key * key) {
+    auto * ctx = ggml_backend_relay_meta_context(backend);
+    if (ctx == nullptr || key == nullptr) {
+        return;
+    }
+    ctx->relay_plan_key       = *key;
+    ctx->relay_plan_key_valid = true;
+}
+
+bool ggml_backend_relay_plan_snapshot(ggml_backend_t backend, ggml_relay_plan_snapshot * snapshot) {
+    auto * ctx = ggml_backend_relay_meta_context(backend);
+    return ctx != nullptr && snapshot != nullptr && ctx->relay_i->abi_version >= 3 &&
+           ctx->relay_i->plan_snapshot != nullptr &&
+           ctx->relay_i->plan_snapshot(ctx->relay, snapshot);
 }

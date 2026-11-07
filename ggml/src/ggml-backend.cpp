@@ -1277,7 +1277,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ABORT("%s: failed to initialize context\n", __func__);
     }
 
-    graph->uid = ggml_graph_next_uid();
+    // Preserve a caller-assigned uid: it identifies one graph definition
+    // across re-splits. A zero uid keeps the historical fresh-per-split id.
+    if (graph->uid == 0) {
+        graph->uid = ggml_graph_next_uid();
+    }
 
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
@@ -1739,9 +1743,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         graph_copy->leafs[graph_copy->n_leafs++] = leaf;
     }
 
-    // set ids for all splits
+    // set ids for all splits. A single split is the whole graph, so it keeps
+    // the caller's uid and backend caches can key on the definition.
     for (int i = 0; i < sched->n_splits; ++i) {
-        sched->splits[i].graph.uid = ggml_graph_next_uid();
+        sched->splits[i].graph.uid = (sched->n_splits == 1 && graph->uid != 0)
+            ? graph->uid : ggml_graph_next_uid();
     }
 }
 
