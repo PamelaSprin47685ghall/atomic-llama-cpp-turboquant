@@ -10,16 +10,28 @@
 #include <algorithm>
 #include <sstream>
 
-static ubatch_data_handle alloc_ubatch_data(ubatch_data_pool & pool) {
-    if (tp5::flag_exact_one("TP5_UBATCH_POOL")) {
-        ubatch_data_handle pooled = pool.acquire();
+static ubatch_data_handle alloc_ubatch_data(const std::shared_ptr<ubatch_data_pool> & pool) {
+    if (tp5::flag_exact_one("TP5_UBATCH_POOL") && pool) {
+        ubatch_data_handle pooled = pool->acquire();
         if (pooled) {
             return pooled;
         }
-        pool.note_fallback();
+        pool->note_fallback();
     }
 
     return ubatch_data_handle(std::make_shared<llama_ubatch_data>());
+}
+
+void llama_batch_allocr::ensure_ubatch_pool(uint32_t n_ubatch) {
+    if (!tp5::flag_exact_one("TP5_UBATCH_POOL")) {
+        return;
+    }
+
+    if (!ubatch_pool) {
+        ubatch_pool = std::make_shared<ubatch_data_pool>();
+    }
+
+    ubatch_pool->configure(n_ubatch + 2);
 }
 
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
@@ -407,22 +419,20 @@ bool llama_batch_allocr::init(
 llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs) {
     const uint32_t n_tokens = n_seq_tokens*n_seqs;
 
-    if (tp5::flag_exact_one("TP5_UBATCH_POOL")) {
-        // A reserve ubatch is short-lived and does not know n_ubatch. Two
-        // slots cover the reserve call and its caller; a decode split later
-        // grows the pool while no handle is live.
-        ubatch_pool.configure(2);
-    }
-
     clear();
     split_reset();
 
     const int64_t n_pos_all = (int64_t) n_tokens*n_pos_per_embd;
 
-    auto udata = alloc_ubatch_data(ubatch_pool);
+    // A reserve ubatch can outlive this allocator: llm_graph_params keeps an
+    // intentional copy and llama_context stores it across graph_reserve()
+    // calls. A pool slot would release into a destroyed pool (pthread_mutex
+    // EINVAL). Reserve payloads are heap-owned; only split ubatches, which
+    // die before the allocator, use the pool.
+    auto udata = ubatch_data_handle(std::make_shared<llama_ubatch_data>());
 
-    // A reused slot keeps its previous contents. Every array that the reserve
-    // path leaves for the caller must be restored to the fresh-vector value.
+    // Every array that the reserve path leaves for the caller is explicitly
+    // set to the fresh-vector value.
     udata->token     .assign(n_tokens, 0);
     udata->embd      .clear();
     udata->pos       .assign(n_pos_all, 0);
@@ -520,9 +530,7 @@ void llama_batch_allocr::split_reset() {
 }
 
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
-    if (tp5::flag_exact_one("TP5_UBATCH_POOL")) {
-        ubatch_pool.configure(n_ubatch + 2);
-    }
+    ensure_ubatch_pool(n_ubatch);
 
     // find the first unused token
     uint32_t cur_idx = 0;
@@ -558,9 +566,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 }
 
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
-    if (tp5::flag_exact_one("TP5_UBATCH_POOL")) {
-        ubatch_pool.configure(n_ubatch + 2);
-    }
+    ensure_ubatch_pool(n_ubatch);
 
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
@@ -733,9 +739,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
-    if (tp5::flag_exact_one("TP5_UBATCH_POOL")) {
-        ubatch_pool.configure(n_ubatch + 2);
-    }
+    ensure_ubatch_pool(n_ubatch);
 
     // find the first unused token
     uint32_t cur_idx = 0;

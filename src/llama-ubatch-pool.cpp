@@ -5,8 +5,8 @@
 
 ubatch_data_handle::ubatch_data_handle(std::shared_ptr<llama_ubatch_data> data) : fallback_(std::move(data)) {}
 
-ubatch_data_handle::ubatch_data_handle(ubatch_data_pool * pool, uint32_t slot, uint32_t gen)
-    : pool_(pool), slot_(slot), gen_(gen) {}
+ubatch_data_handle::ubatch_data_handle(std::shared_ptr<ubatch_data_pool> pool, uint32_t slot, uint32_t gen)
+    : pool_(std::move(pool)), slot_(slot), gen_(gen) {}
 
 ubatch_data_handle::ubatch_data_handle(const ubatch_data_handle & other)
     : pool_(other.pool_), slot_(other.slot_), gen_(other.gen_), fallback_(other.fallback_) {
@@ -63,7 +63,7 @@ llama_ubatch_data * ubatch_data_handle::get() const {
 void ubatch_data_handle::reset() {
     if (pool_ != nullptr) {
         pool_->release(slot_, gen_);
-        pool_ = nullptr;
+        pool_.reset();
     }
 
     fallback_.reset();
@@ -119,7 +119,7 @@ ubatch_data_handle ubatch_data_pool::acquire() {
         ++in_use_;
         ++stats_.acquired;
 
-        return ubatch_data_handle(this, i, slot.gen);
+        return ubatch_data_handle(shared_from_this(), i, slot.gen);
     }
 
     ++stats_.exhausted;
