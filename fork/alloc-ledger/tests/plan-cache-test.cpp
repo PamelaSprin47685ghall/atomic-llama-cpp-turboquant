@@ -97,6 +97,33 @@ void test_key_description() {
     CHECK(std::strstr(text.data(), "alloc_gen=6") != nullptr);
 }
 
+void test_key_hash() {
+    const PlanKey base = base_key();
+    CHECK(base.hash() == base_key().hash());
+
+    PlanKey changed = base;
+    changed.model += 1;
+    CHECK(base.hash() != changed.hash());
+    changed = base;
+    changed.window += 1;
+    CHECK(base.hash() != changed.hash());
+    changed = base;
+    changed.n_tokens += 1;
+    CHECK(base.hash() != changed.hash());
+    changed = base;
+    changed.n_outputs += 1;
+    CHECK(base.hash() != changed.hash());
+    changed = base;
+    changed.rs_class += 1;
+    CHECK(base.hash() != changed.hash());
+    changed = base;
+    changed.n_kv_bucket += 1;
+    CHECK(base.hash() != changed.hash());
+    changed = base;
+    changed.alloc_gen += 1;
+    CHECK(base.hash() != changed.hash());
+}
+
 void test_cache_separates_all_key_fields() {
     PlanCache cache;
     const PlanKey base = base_key();
@@ -320,6 +347,7 @@ int main() {
     test_key_fields_are_distinct();
     test_key_validation();
     test_key_description();
+    test_key_hash();
     test_cache_separates_all_key_fields();
     test_footprint_is_not_key();
     test_hit_and_miss();

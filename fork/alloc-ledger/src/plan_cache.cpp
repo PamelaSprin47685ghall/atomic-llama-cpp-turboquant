@@ -17,6 +17,26 @@ std::array<char, 192> PlanKey::describe() const noexcept {
     return text;
 }
 
+std::uint64_t PlanKey::hash() const noexcept {
+    // FNV-1a over the seven fields, low byte first. The byte order is fixed,
+    // so the digest does not depend on host endianness or padding.
+    std::uint64_t value = 1469598103934665603ULL;
+    const auto mix = [&value](std::uint64_t part) {
+        for (int i = 0; i < 8; ++i) {
+            value ^= (part >> (8 * i)) & 0xffU;
+            value *= 1099511628211ULL;
+        }
+    };
+    mix(model);
+    mix(window);
+    mix(n_tokens);
+    mix(n_outputs);
+    mix(static_cast<std::uint8_t>(rs_class));
+    mix(n_kv_bucket);
+    mix(alloc_gen);
+    return value;
+}
+
 const PlanEntry * PlanCache::find(const PlanKey & key) noexcept {
     for (std::size_t i = 0; i < capacity; ++i) {
         Node & node = nodes_[i];

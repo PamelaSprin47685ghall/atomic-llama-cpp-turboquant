@@ -36,6 +36,10 @@ struct PlanKey {
 
     // Fixed text for logs. No allocation. The caller may copy the array.
     std::array<char, 192> describe() const noexcept;
+
+    // Stable 64-bit digest of all seven fields. A C adapter may format it as
+    // the external plan_key string.
+    std::uint64_t hash() const noexcept;
 };
 
 // Cached plan value. The cache owns its copy. The uid fields are opaque

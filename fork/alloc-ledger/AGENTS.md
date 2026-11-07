@@ -18,5 +18,6 @@
 2. [LEMMA 3] A repeated, stale, cross-window, or changed lease is rejected without a state change. Proof: tests/arena-test.cpp and tests/domain-test.cpp.
 3. [LEMMA 1, 2] Frame and staging slots wait for drain. Cold slots return at once. A fault quarantines the slot and adds one cold reserve unit. Proof: tests/domain-test.cpp.
 4. [LEMMA 4] A plan key has seven fields. Footprint is an entry value, not a key field. The cache keeps eight entries, evicts the least recently used unpinned entry, and never inserts the same key twice. Proof: tests/plan-cache-test.cpp.
-5. [LEMMA 4] AllocEvent, PlanEvent, and LegManifest are trivially copyable values with no I/O. Their fields follow the WS0/S3 record names. Proof: tests/events-test.cpp.
+5. [LEMMA 4] `LeaseEvent` and `PlanEvent` are in-memory values. They are trivially copyable and do no I/O. They are not external schema records: WS0 owns `alloc.schema.json`, `plan.schema.json`, and `leg.schema.json`; the C adapter writes the JSON. B defines no `LegManifest`. Proof: tests/events-test.cpp and README.md.
 6. [AXIOM 1] Live bytes, high water, leases, releases, and quarantines are tracked per lifetime and in total. Proof: tests/arena-test.cpp and tests/domain-test.cpp.
+7. [LEMMA 4] `PlanKey::describe()` and `PlanKey::hash()` give the C adapter a stable external `plan_key` string. The PlanKind to WS0 action mapping lives in README.md. Proof: tests/plan-cache-test.cpp.

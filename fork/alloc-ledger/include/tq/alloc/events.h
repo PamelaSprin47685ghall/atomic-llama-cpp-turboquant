@@ -8,7 +8,9 @@
 
 namespace tq::alloc {
 
-enum class AllocAction : std::uint8_t {
+// In-memory lease actions. These values are not the WS0 allocation actions.
+// A C adapter maps them to the external schema.
+enum class LeaseAction : std::uint8_t {
     lease = 0,
     release = 1,
     drain = 2,
@@ -17,7 +19,9 @@ enum class AllocAction : std::uint8_t {
     advance_window = 5,
 };
 
-enum class PlanAction : std::uint8_t {
+// In-memory plan cache actions. A C adapter maps them to the WS0 PlanEvent
+// action values. The mapping lives in README.md, not in this header.
+enum class PlanKind : std::uint8_t {
     hit = 0,
     miss = 1,
     insert = 2,
@@ -28,16 +32,11 @@ enum class PlanAction : std::uint8_t {
     unpin = 7,
 };
 
-enum class Verdict : std::uint8_t {
-    unknown = 0,
-    pass = 1,
-    fail = 2,
-};
-
-// Value record of one slot state change. site is an opaque allocation-site
-// id. This header defines data only. The caller decides when to store or
-// transmit a record.
-struct AllocEvent {
+// Value record of one slot state change inside this library. This is a
+// memory event. It is not the WS0 AllocEvent record. The WS0 schema observes
+// uprobe and kprobe data and owns a different class, action, and window
+// vocabulary. The C adapter writes the external JSON.
+struct LeaseEvent {
     std::uint64_t ts_ns = 0;
     std::uint32_t leg_id = 0;
     std::uint64_t seq = 0;
@@ -50,52 +49,29 @@ struct AllocEvent {
     std::uint64_t arena_gen = 0;
     std::uint32_t window = 0;
     std::uint32_t request = 0;
-    AllocAction action = AllocAction::lease;
+    LeaseAction action = LeaseAction::lease;
     State from = State::free;
     State to = State::free;
 };
 
-// Value record of one plan cache operation. The exec handles are opaque
-// counters, not pointers.
+// Value record of one plan cache operation. This is a memory event. The C
+// adapter serializes it to the WS0 PlanEvent schema, including the
+// plan_key string from PlanKey::describe() or PlanKey::hash().
 struct PlanEvent {
     std::uint64_t ts_ns = 0;
     std::uint32_t leg_id = 0;
     std::uint64_t seq = 0;
     PlanKey plan_key;
-    PlanAction action = PlanAction::miss;
+    PlanKind kind = PlanKind::miss;
     std::uint64_t graph_exec_create = 0;
     std::uint64_t graph_exec_destroy = 0;
     std::uint64_t relay_uid = 0;
     std::uint64_t arena_gen = 0;
 };
 
-// Value description of one allocation leg. SHA fields hold stable 64-bit
-// digests. closure4 holds four closure values. reserved counts cold reserve
-// units. generation_span is the number of arena generations the leg saw.
-struct LegManifest {
-    std::uint32_t leg_id = 0;
-    std::uint64_t build_sha = 0;
-    std::uint64_t closure4[4] = {};
-    std::uint64_t model_sha = 0;
-    std::uint64_t env_sha = 0;
-    std::uint64_t platform_fingerprint = 0;
-    double loadavg = 0.0;
-    bool gpu_idle = false;
-    std::uint64_t iova_last = 0;
-    double decode_submit_p50 = 0.0;
-    double decode_submit_p95 = 0.0;
-    double tok_s = 0.0;
-    bool all_511 = false;
-    double ttft = 0.0;
-    std::uint64_t generation_span = 0;
-    Verdict verdict = Verdict::unknown;
-};
-
-static_assert(std::is_trivially_copyable<AllocEvent>::value,
-              "AllocEvent must be a value type");
+static_assert(std::is_trivially_copyable<LeaseEvent>::value,
+              "LeaseEvent must be a value type");
 static_assert(std::is_trivially_copyable<PlanEvent>::value,
               "PlanEvent must be a value type");
-static_assert(std::is_trivially_copyable<LegManifest>::value,
-              "LegManifest must be a value type");
 
 } // namespace tq::alloc
