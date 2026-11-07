@@ -6,8 +6,10 @@
 #include "ggml-relay-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "ggml-cuda/staging.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -26,6 +28,79 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+// TP5 WS4: the meta layer reaches the persistent pinned staging pool through a
+// host-only vtable. ggml-base never links GPU symbols; a CPU-only build leaves
+// the table null and keeps the original copy path.
+static std::atomic<const ggml_cuda_staging::api *> g_staging_api{nullptr};
+
+extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
+    if (impl == nullptr) {
+        return false;
+    }
+    const auto * api = static_cast<const ggml_cuda_staging::api *>(impl);
+    if (api->abi_version != 1) {
+        return false;
+    }
+    g_staging_api.store(api, std::memory_order_release);
+    return true;
+}
+
+extern "C" const void * ggml_backend_meta_staging_get() {
+    return g_staging_api.load(std::memory_order_acquire);
+}
+
+static const ggml_cuda_staging::api * staging_api() {
+    return g_staging_api.load(std::memory_order_acquire);
+}
+
+static constexpr uint32_t kStagingWindow = 0;
+// Per-token inputs are far smaller than this. The bound keeps model weights
+// and other one-shot uploads out of the pool, so the 4 MiB budget always
+// serves the hot path.
+static constexpr size_t kMaxStagingBytes = 256u << 10;
+
+static ggml_cuda_staging::kind staging_kind_for(const ggml_tensor * tensor) {
+    using kind = ggml_cuda_staging::kind;
+    if (tensor == nullptr || tensor->name[0] == '\0') {
+        return kind::generic;
+    }
+    if (std::strstr(tensor->name, "out_ids") != nullptr) {
+        return kind::out_ids;
+    }
+    if (std::strstr(tensor->name, "KQ_mask") != nullptr ||
+            std::strstr(tensor->name, "kq_mask") != nullptr) {
+        return kind::kq_mask;
+    }
+    if (std::strstr(tensor->name, "token") != nullptr) {
+        return kind::tokens;
+    }
+    if (std::strstr(tensor->name, "pos") != nullptr) {
+        return kind::pos;
+    }
+    if (std::strstr(tensor->name, "mtp") != nullptr && std::strstr(tensor->name, "h") != nullptr) {
+        return kind::mtp_h;
+    }
+    return kind::generic;
+}
+
+static bool staging_eligible(const ggml_tensor * tensor, size_t size,
+                             ggml_cuda_staging::kind * out) {
+    if (tensor == nullptr || size == 0 || size > kMaxStagingBytes) {
+        return false;
+    }
+    // Only graph inputs rotate through the pool. Weights and other one-shot
+    // uploads keep the original path and never consume the 4 MiB budget.
+    if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) == 0) {
+        return false;
+    }
+    const ggml_cuda_staging::kind k = staging_kind_for(tensor);
+    if (k == ggml_cuda_staging::kind::generic) {
+        return false;
+    }
+    *out = k;
+    return true;
+}
 
 struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
@@ -1566,6 +1641,18 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        /chunk_size_full;
             const int64_t i_stop  = (offset + size)/chunk_size_full;
+            const ggml_cuda_staging::api * st = staging_api();
+            ggml_cuda_staging::lease staged_lease;
+            ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
+            bool staged = false;
+            if (st != nullptr && st->enabled() && staging_eligible(tensor, size, &staging_kind) &&
+                    st->acquire(kStagingWindow, staging_kind, size, &staged_lease)) {
+                staged = st->upload(&staged_lease, data, size);
+                if (!staged) {
+                    st->release(&staged_lease);
+                }
+            }
+            const uint8_t * src_base = staged ? staged_lease.host : static_cast<const uint8_t *>(data);
             size_t offset_j = 0;
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
@@ -1574,12 +1661,33 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     continue;
                 }
                 const size_t simple_offset = i_start * chunk_size_j;
-                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                ggml_backend_tensor_set_2d(simple_tensor, (const char *) src_base + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
+            }
+            if (staged) {
+                (void) st->wait(&staged_lease);
+                st->release(&staged_lease);
             }
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
+            const ggml_cuda_staging::api * st = staging_api();
+            ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
+            if (st != nullptr && st->enabled() && staging_eligible(tensor, size, &staging_kind)) {
+                ggml_cuda_staging::lease staged_lease;
+                if (st->acquire(kStagingWindow, staging_kind, size, &staged_lease)) {
+                    if (st->upload(&staged_lease, data, size)) {
+                        for (size_t j = 0; j < n_bufs; j++) {
+                            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            ggml_backend_tensor_set(simple_tensor, staged_lease.host, offset, size);
+                        }
+                        (void) st->wait(&staged_lease);
+                        st->release(&staged_lease);
+                        break;
+                    }
+                    st->release(&staged_lease);
+                }
+            }
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
@@ -2075,6 +2183,37 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
+            const ggml_cuda_staging::api * st = staging_api();
+            ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
+            if (st != nullptr && st->enabled() && staging_eligible(tensor, size, &staging_kind)) {
+                bool ranks_ok = true;
+                for (size_t j = 0; j < n_backends && ranks_ok; j++) {
+                    ranks_ok = st->can_enqueue_async(
+                        ggml_backend_meta_simple_backend(backend, j),
+                        ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size);
+                }
+                ggml_cuda_staging::lease staged_lease;
+                if (ranks_ok && st->acquire(kStagingWindow, staging_kind, size, &staged_lease)) {
+                    if (st->upload(&staged_lease, data, size)) {
+                        bool queued = true;
+                        for (size_t j = 0; j < n_backends; j++) {
+                            if (!st->enqueue_async(&staged_lease,
+                                    ggml_backend_meta_simple_backend(backend, j),
+                                    ggml_backend_meta_buffer_simple_tensor(tensor, j),
+                                    offset, size)) {
+                                queued = false;
+                                break;
+                            }
+                        }
+                        st->release(&staged_lease);
+                        if (queued) {
+                            break;
+                        }
+                    } else {
+                        st->release(&staged_lease);
+                    }
+                }
+            }
             for (size_t j = 0; j < n_backends; j++) {
                 ggml_backend_tensor_set_async(
                     ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
