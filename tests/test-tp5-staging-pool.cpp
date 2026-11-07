@@ -1,0 +1,392 @@
+// TP5 WS4 CPU test for the persistent pinned staging pool.
+//
+// Build and run without a GPU or HIP:
+//   g++ -std=c++17 -O2 -I ggml/include tests/test-tp5-staging-pool.cpp -o /tmp/test-tp5-staging
+//   /tmp/test-tp5-staging
+
+#include "../ggml/src/ggml-cuda/staging.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+using namespace ggml_cuda_staging;
+
+namespace {
+
+int g_allocs = 0;
+int g_frees = 0;
+int g_events = 0;
+int g_records = 0;
+int g_syncs = 0;
+int g_copies = 0;
+bool g_fail_alloc = false;
+bool g_fail_sync = false;
+
+bool fake_alloc(size_t bytes, void ** out) {
+    if (g_fail_alloc) {
+        return false;
+    }
+    void * p = std::malloc(bytes);
+    if (p == nullptr) {
+        return false;
+    }
+    std::memset(p, 0, bytes);
+    *out = p;
+    ++g_allocs;
+    return true;
+}
+
+void fake_free(void * p) {
+    if (p != nullptr) {
+        std::free(p);
+        ++g_frees;
+    }
+}
+
+bool fake_event_create(void ** out) {
+    *out = std::malloc(1);
+    ++g_events;
+    return *out != nullptr;
+}
+
+bool fake_event_record(void *, void *) {
+    ++g_records;
+    return true;
+}
+
+bool fake_event_sync(void *) {
+    ++g_syncs;
+    return !g_fail_sync;
+}
+
+void fake_event_destroy(void * p) {
+    std::free(p);
+}
+
+bool fake_copy(void * dst, const void * src, size_t bytes, void *) {
+    std::memcpy(dst, src, bytes);
+    ++g_copies;
+    return true;
+}
+
+bool fake_device_ptr(void *, void ** out) {
+    *out = reinterpret_cast<void *>(uintptr_t(0x1000));
+    return true;
+}
+
+backend_ops fake_ops() {
+    backend_ops ops;
+    ops.host_alloc    = fake_alloc;
+    ops.host_free     = fake_free;
+    ops.event_create  = fake_event_create;
+    ops.event_record  = fake_event_record;
+    ops.event_sync    = fake_event_sync;
+    ops.event_destroy = fake_event_destroy;
+    ops.copy_h2d      = fake_copy;
+    ops.device_ptr    = fake_device_ptr;
+    return ops;
+}
+
+#define CHECK(cond) do { \
+    if (!(cond)) { \
+        std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+        return 1; \
+    } \
+} while (0)
+
+int test_lease_release() {
+    pool p(fake_ops());
+    uint8_t src[1024];
+    std::memset(src, 0x5a, sizeof(src));
+
+    CHECK(p.usable());
+    CHECK(p.pool_bytes() == 0);
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(a.host != nullptr);
+    CHECK(a.cap >= sizeof(src));
+    CHECK(a.epoch == 1);
+    CHECK(a.slot == 0);
+    CHECK(a.which == kind::tokens);
+    CHECK(p.pool_bytes() >= sizeof(src));
+
+    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(std::memcmp(a.host, src, sizeof(src)) == 0);
+
+    p.release(a);
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, 16, &b));
+    CHECK(b.epoch == 2);
+    CHECK(b.host == a.host);  // reuse, no reallocation
+    CHECK(g_allocs == 1);
+    p.release(b);
+    return 0;
+}
+
+int test_double_buffer_and_stale_release() {
+    pool p(fake_ops());
+    uint8_t src[4096] = {};
+
+    lease a;
+    lease b;
+    CHECK(p.acquire(0, kind::mtp_h, sizeof(src), &a));
+    CHECK(p.acquire(0, kind::mtp_h, sizeof(src), &b));
+    CHECK(a.slot != b.slot);
+    CHECK(a.host != b.host);
+
+    // Both slots are leased. A third acquire must fail, never steal a lease.
+    lease c;
+    CHECK(!p.acquire(0, kind::mtp_h, sizeof(src), &c));
+    CHECK(p.snapshot().no_slot == 1);
+    CHECK(p.usable());
+    CHECK(p.upload(a, src, sizeof(src)));  // both leases stay valid
+    CHECK(p.upload(b, src, sizeof(src)));
+
+    // Releasing one slot makes it reusable.
+    p.release(a);
+    CHECK(p.acquire(0, kind::mtp_h, sizeof(src), &c));
+    CHECK(c.slot == a.slot);
+    CHECK(c.epoch > b.epoch);
+
+    // The old lease no longer names a live slot.
+    CHECK(!p.upload(a, src, 16));
+    p.release(a);  // stale
+    CHECK(p.snapshot().stale_release == 1);
+
+    CHECK(p.upload(c, src, sizeof(src)));
+    p.release(b);
+    p.release(c);
+    return 0;
+}
+
+int test_pending_slot_reuse() {
+    pool p(fake_ops());
+    uint8_t src[64] = {};
+    uint8_t dst[64] = {};
+
+    // Both slots become pending but unleased: enqueue, then release without
+    // waiting.
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr));
+    p.release(a);
+
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+    CHECK(b.slot != a.slot);
+    CHECK(p.upload(b, src, sizeof(src)));
+    CHECK(p.enqueue(b, 1, dst, sizeof(src), nullptr));
+    p.release(b);
+
+    // The next acquire waits one pending event and reuses that slot.
+    const int syncs_before = g_syncs;
+    lease c;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &c));
+    CHECK(c.slot == a.slot);
+    CHECK(g_syncs == syncs_before + 1);
+    p.release(c);
+    return 0;
+}
+
+int test_window_isolation() {
+    pool p(fake_ops());
+    lease a;
+    lease b;
+    CHECK(p.acquire(0, kind::pos, 64, &a));
+    CHECK(p.acquire(1, kind::pos, 64, &b));
+    CHECK(a.host != b.host);
+    CHECK(a.slot == 0);
+    CHECK(b.slot == 0);
+    CHECK(a.window == 0);
+    CHECK(b.window == 1);
+    CHECK(p.acquire(9, kind::pos, 64, &b) == false);
+    p.release(a);
+    p.release(b);
+    return 0;
+}
+
+int test_pool_cap() {
+    pool p(fake_ops(), 4u << 20);
+    lease a;
+
+    // A single request above the cap is a miss, not a permanent disable.
+    CHECK(!p.acquire(0, kind::generic, (4u << 20) + 1, &a));
+    CHECK(p.usable());
+
+    CHECK(p.acquire(0, kind::generic, 3u << 20, &a));
+    lease b;
+    CHECK(!p.acquire(0, kind::tokens, 2u << 20, &b));
+    CHECK(p.usable());
+
+    lease c;
+    CHECK(p.acquire(0, kind::pos, 1u << 20, &c));
+    CHECK(p.pool_bytes() == (4u << 20));
+    CHECK(!p.acquire(0, kind::out_ids, 1, &b));
+    p.release(a);
+    p.release(c);
+    return 0;
+}
+
+int test_alloc_failure_fail_closed() {
+    pool p(fake_ops());
+    lease a;
+    g_fail_alloc = true;
+    CHECK(!p.acquire(0, kind::tokens, 1024, &a));
+    CHECK(!p.usable());
+    g_fail_alloc = false;
+    CHECK(!p.acquire(0, kind::tokens, 1024, &a));
+    return 0;
+}
+
+int test_upload_bounds() {
+    pool p(fake_ops());
+    lease a;
+    uint8_t src[128] = {};
+    CHECK(p.acquire(0, kind::generic, 64, &a));
+    CHECK(!p.upload(a, src, 65));
+    CHECK(p.upload(a, src, 64));
+    CHECK(!p.upload(a, nullptr, 64));
+    CHECK(!p.upload(a, src, 0));
+    p.release(a);
+    return 0;
+}
+
+int test_upload_rows() {
+    pool p(fake_ops());
+    uint8_t src[3 * 16];
+    for (size_t i = 0; i < sizeof(src); ++i) {
+        src[i] = uint8_t(i);
+    }
+    lease a;
+    CHECK(p.acquire(0, kind::kq_mask, 3 * 16, &a));
+
+    // Strided destination keeps the source stride (the meta 2D consumer reads
+    // with that stride).
+    CHECK(p.upload_rows(a, src, 16, 16, 8, 3));
+    for (size_t r = 0; r < 3; ++r) {
+        CHECK(std::memcmp(a.host + r * 16, src + r * 16, 8) == 0);
+    }
+
+    // Packed destination removes the holes.
+    CHECK(p.upload_rows(a, src, 16, 8, 8, 3));
+    for (size_t r = 0; r < 3; ++r) {
+        CHECK(std::memcmp(a.host + r * 8, src + r * 16, 8) == 0);
+    }
+
+    CHECK(!p.upload_rows(a, src, 16, 16, 8, 4));  // span exceeds the slot
+    CHECK(!p.upload_rows(a, src, 4, 8, 8, 3));    // src_stride < row_bytes
+    CHECK(!p.upload_rows(a, src, 8, 4, 8, 3));    // dst_stride < row_bytes
+    p.release(a);
+    return 0;
+}
+
+int test_enqueue_wait() {
+    pool p(fake_ops());
+    uint8_t src[64];
+    std::memset(src, 0x33, sizeof(src));
+    uint8_t dst[64] = {};
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+
+    const int syncs_before = g_syncs;
+    const int copies_before = g_copies;
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr));
+    CHECK(p.enqueue(a, 4, dst, sizeof(src), nullptr));
+    CHECK(g_copies == copies_before + 2);
+    CHECK(p.wait(a));
+    CHECK(g_syncs == syncs_before + 2);
+    CHECK(std::memcmp(dst, src, sizeof(src)) == 0);
+
+    CHECK(!p.enqueue(a, 99, dst, sizeof(src), nullptr));
+    CHECK(!p.enqueue(a, -1, dst, sizeof(src), nullptr));
+    CHECK(!p.enqueue(a, 0, dst, sizeof(src) + 1, nullptr));
+    p.release(a);
+    return 0;
+}
+
+int test_wait_failure_disables() {
+    pool p(fake_ops());
+    uint8_t src[64] = {};
+    uint8_t dst[64] = {};
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr));
+
+    g_fail_sync = true;
+    CHECK(!p.wait(a));
+    CHECK(!p.usable());
+    g_fail_sync = false;
+    return 0;
+}
+
+int test_owns_and_diagnostics() {
+    pool p(fake_ops());
+    lease a;
+    CHECK(p.acquire(0, kind::generic, 256, &a));
+    CHECK(p.owns(a.host, 256));
+    CHECK(p.owns(a.host + 16, 32));
+    CHECK(!p.owns(a.host + 200, 100));
+    CHECK(!p.owns(nullptr, 1));
+    CHECK(!p.owns(a.host, 0));
+
+    p.note_source(a.host, 128);
+    p.note_source(a.host + 200, 100);
+    p.note_source(nullptr, 1);
+    const auto s = p.snapshot();
+    CHECK(s.hits == 1);
+    CHECK(s.misses == 2);
+    CHECK(s.leases == 1);
+    p.dump(stderr);
+    p.release(a);
+    return 0;
+}
+
+int test_device_ptr() {
+    pool p(fake_ops());
+    lease a;
+    CHECK(p.acquire(0, kind::out_ids, 32, &a));
+    CHECK(p.device_ptr(a, 0) != nullptr);
+    CHECK(p.device_ptr(a, 99) == nullptr);
+    p.release(a);
+    return 0;
+}
+
+}  // namespace
+
+int main() {
+    const struct {
+        const char * name;
+        int (*fn)();
+    } tests[] = {
+        {"lease_release",              test_lease_release},
+        {"double_buffer_stale_release", test_double_buffer_and_stale_release},
+        {"pending_slot_reuse",         test_pending_slot_reuse},
+        {"window_isolation",           test_window_isolation},
+        {"pool_cap",                   test_pool_cap},
+        {"alloc_failure_fail_closed",  test_alloc_failure_fail_closed},
+        {"upload_bounds",              test_upload_bounds},
+        {"upload_rows",                test_upload_rows},
+        {"enqueue_wait",               test_enqueue_wait},
+        {"wait_failure_disables",      test_wait_failure_disables},
+        {"owns_and_diagnostics",       test_owns_and_diagnostics},
+        {"device_ptr",                 test_device_ptr},
+    };
+
+    int failed = 0;
+    for (const auto & t : tests) {
+        g_fail_alloc = false;
+        g_fail_sync = false;
+        const int rc = t.fn();
+        std::printf("%s %s\n", rc == 0 ? "PASS" : "FAIL", t.name);
+        failed += rc != 0;
+    }
+    std::printf("%d/%zu passed\n", int(sizeof(tests) / sizeof(tests[0])) - failed,
+                sizeof(tests) / sizeof(tests[0]));
+    return failed == 0 ? 0 : 1;
+}
