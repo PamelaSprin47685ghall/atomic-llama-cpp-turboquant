@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include "llama-cparams.h"
+#include "llama-ubatch-pool.h"
 
 #include <array>
 #include <vector>
@@ -52,22 +53,10 @@ struct llama_ubatch {
     int8_t       *  output;     // [n_tokens]         | i   | -
     int32_t      *  decision_order; // [n_tokens], NULL if no entry has one, see llama_set_decision_order()
 
-    struct data_t {
-        std::vector<llama_token>    token;
-        std::vector<float>          embd;
-        std::vector<llama_pos>      pos;
-        std::vector<int32_t>        n_seq_id;
-        std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
-        std::vector<llama_seq_id>   seq_id_unq;
-        std::vector<int32_t>        seq_idx;
-        std::vector<int8_t>         output;
-        std::vector<int32_t>        decision_order;
-
-        std::vector<llama_seq_id> seq_id_data;
-    };
+    using data_t = llama_ubatch_data;
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
-    std::shared_ptr<data_t> data;
+    ubatch_data_handle data;
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch
@@ -175,6 +164,11 @@ private:
 
     // used[i] indicates if token i has already been used in a previous ubatch
     std::vector<bool> used;
+
+    // TP5_UBATCH_POOL=1: reused ubatch payload slots, configured to
+    // n_ubatch + 2 on the first split. Disabled: every ubatch owns a heap
+    // payload, as before.
+    ubatch_data_pool ubatch_pool;
 
     int debug;
 };
