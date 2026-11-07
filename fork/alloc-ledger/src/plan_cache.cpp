@@ -1,0 +1,97 @@
+#include "tq/alloc/plan_cache.h"
+
+namespace tq::alloc {
+
+const PlanEntry * PlanCache::find(const PlanKey & key) noexcept {
+    for (std::size_t i = 0; i < capacity; ++i) {
+        Node & node = nodes_[i];
+        if (node.used && node.entry.key == key) {
+            node.tick = ++clock_;
+            ++stats_.hits;
+            return &node.entry;
+        }
+    }
+    ++stats_.misses;
+    return nullptr;
+}
+
+Result PlanCache::insert(const PlanEntry & entry) noexcept {
+    for (std::size_t i = 0; i < capacity; ++i) {
+        Node & node = nodes_[i];
+        if (node.used && node.entry.key == entry.key) {
+            node.entry = entry;
+            node.tick = ++clock_;
+            ++stats_.replaces;
+            return success();
+        }
+    }
+    for (std::size_t i = 0; i < capacity; ++i) {
+        Node & node = nodes_[i];
+        if (!node.used) {
+            node.entry = entry;
+            node.tick = ++clock_;
+            node.pinned = false;
+            node.used = true;
+            ++size_;
+            ++stats_.inserts;
+            return success();
+        }
+    }
+
+    std::size_t victim = capacity;
+    std::uint64_t oldest = 0;
+    for (std::size_t i = 0; i < capacity; ++i) {
+        const Node & node = nodes_[i];
+        if (node.pinned) {
+            continue;
+        }
+        if (victim == capacity || node.tick < oldest) {
+            victim = i;
+            oldest = node.tick;
+        }
+    }
+    if (victim == capacity) {
+        ++stats_.pin_rejects;
+        return failure(Code::full);
+    }
+    nodes_[victim].entry = entry;
+    nodes_[victim].tick = ++clock_;
+    nodes_[victim].pinned = false;
+    nodes_[victim].used = true;
+    ++stats_.inserts;
+    ++stats_.evictions;
+    return success();
+}
+
+Result PlanCache::pin(const PlanKey & key, bool pinned) noexcept {
+    for (std::size_t i = 0; i < capacity; ++i) {
+        Node & node = nodes_[i];
+        if (node.used && node.entry.key == key) {
+            node.pinned = pinned;
+            return success();
+        }
+    }
+    return failure(Code::missing);
+}
+
+Result PlanCache::erase(const PlanKey & key) noexcept {
+    for (std::size_t i = 0; i < capacity; ++i) {
+        Node & node = nodes_[i];
+        if (node.used && node.entry.key == key) {
+            node = Node{};
+            --size_;
+            return success();
+        }
+    }
+    return failure(Code::missing);
+}
+
+void PlanCache::flush_all() noexcept {
+    for (std::size_t i = 0; i < capacity; ++i) {
+        nodes_[i] = Node{};
+    }
+    size_ = 0;
+    ++stats_.flushes;
+}
+
+} // namespace tq::alloc
