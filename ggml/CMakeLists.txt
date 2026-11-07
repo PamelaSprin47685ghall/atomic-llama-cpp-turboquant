@@ -326,6 +326,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-alloc.h
     include/ggml-backend.h
     include/ggml-relay.h
+    include/ggml-relay-plan.h
     include/ggml-blas.h
     include/ggml-cann.h
     include/ggml-cpp.h

@@ -1,0 +1,193 @@
+WS5 cross-owner patch: fork/tp5-compose/src/runtime.cpp (owner applies; not committed by WS5).
+Slotizes channel ownership: 8 plan slots x 256 channel_state per window,
+PLAN_RETIRED recycling, dual-window isolation, close-to-zero assertion,
+and the fail-closed PLAN_UNION=1 / SLOT_CHANNELS=0 matrix.
+Requires ggml/include/ggml-relay-plan.h from this branch.
+Apply from the worktree root: git apply patches/ws5/runtime.cpp.patch
+
+diff --git a/fork/tp5-compose/src/runtime.cpp b/fork/tp5-compose/src/runtime.cpp
+index 6c724545c..d7eccf9be 100644
+--- a/fork/tp5-compose/src/runtime.cpp
++++ b/fork/tp5-compose/src/runtime.cpp
+@@ -1,6 +1,7 @@
+ #include <ggml-backend.h>
+ #include "tp5-meta-submit-ready.h"
+ #include <ggml-relay.h>
++#include <ggml-relay-plan.h>
+ #include <gguf.h>
+ #include <llama.h>
+ #include "llama-memory-hybrid-idx.h"
+@@ -354,6 +355,33 @@ struct channel_state {
+     channel_state(std::uint64_t run, std::uint64_t plan, std::uint64_t channel) : ledger(run, plan, channel, 5, 1) {}
+ };
+ 
++// Pillar 5 channel ownership: one fixed table per window, eight plan slots of
++// 256 channel states. A slot is rebound only after its last reader ended.
++using plan_channel_slots = ggml_relay_plan::channel_slots<channel_state>;
++
++static bool plan_slot_idle(const plan_channel_slots::slot & slot) {
++    for (const auto & owner : slot.states) {
++        if (owner && owner->held.has_value()) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// GGML_TP5_RELAY_SLOT_CHANNELS overrides; otherwise slots follow the relay's
++// plan-cache switch. Both unset is the legacy map behavior.
++static bool relay_slot_channels_enabled() {
++    static const bool enabled = [] {
++        const char * slots = std::getenv("GGML_TP5_RELAY_SLOT_CHANNELS");
++        if (slots != nullptr && slots[0] != '\0') {
++            return std::strcmp(slots, "0") != 0;
++        }
++        const char * plan = std::getenv("GGML_TP5_PLAN_UNION");
++        return plan != nullptr && std::strcmp(plan, "1") == 0;
++    }();
++    return enabled;
++}
++
+ class mtp_phase_pair {
+   public:
+     mtp_phase_pair(std::size_t participants, bool enabled) :
+@@ -565,6 +593,10 @@ struct cycle_timing_row {
+ struct service_window {
+     ggml_backend_t                                                                    backend = nullptr;
+     std::map<std::pair<std::uint64_t, std::uint32_t>, std::unique_ptr<channel_state>> channels;
++    // Pillar 5: slotized ownership. The map above stays the fallback when
++    // GGML_TP5_RELAY_SLOT_CHANNELS=0 (and GGML_TP5_PLAN_UNION is unset).
++    plan_channel_slots                                                                plan_slots;
++    bool                                                                              slot_channels = relay_slot_channels_enabled();
+     std::atomic<std::uint64_t>                                                        input_retired{ 0 };
+     std::atomic<std::uint64_t>                                                        output_retired{ 0 };
+     bool                                                                              delayed = false;
+@@ -663,6 +695,12 @@ class relay_service {
+         const char * per_env = std::getenv("TP5_RELAY_SERVICE_PER_WINDOW");
+         require(!per_env || std::string(per_env) == "0" || std::string(per_env) == "1",
+                 "TP5_RELAY_SERVICE_PER_WINDOW must be 0 or 1");
++        // Pillar 5: a keyed plan without slotized channels reintroduces the
++        // unbounded per-generation map. The design matrix is fail-closed.
++        const char * plan_env = std::getenv("GGML_TP5_PLAN_UNION");
++        const char * slot_env = std::getenv("GGML_TP5_RELAY_SLOT_CHANNELS");
++        require(!(plan_env && std::strcmp(plan_env, "1") == 0 && slot_env && std::strcmp(slot_env, "0") == 0),
++                "GGML_TP5_PLAN_UNION=1 requires GGML_TP5_RELAY_SLOT_CHANNELS=1");
+         // MERGE NOTE: the dualwin line defaulted this OFF (single shared
+         // courier; opt-in per-window) while the LateBind line defaults it ON.
+         // The merged lane model is the LateBind one, so ON stays the default;
+@@ -1305,14 +1343,29 @@ class relay_service {
+                 ggml_backend_relay_publish_v2(window->backend, &*window->delayed_event, sizeof(*window->delayed_event));
+                 window->delayed_event.reset();
+             }
+-            for (auto & entry : window->channels) {
+-                auto & owner = *entry.second;
++            auto finish_owner = [&](channel_state & owner) {
+                 if (failed) {
+                     owner.ledger.fail("run aborted after native drain");
+                 } else {
+                     require(!owner.held.has_value(), "normal close still has a live output reader");
+                 }
+                 require(owner.ledger.mark_drained(true), "cannot record proved native drain");
++            };
++            if (window->slot_channels) {
++                for (std::size_t s = 0; s < plan_channel_slots::slot_capacity; ++s) {
++                    auto & slot = window->plan_slots.at(s);
++                    for (auto & owner : slot.states) {
++                        if (owner) {
++                            finish_owner(*owner);
++                        }
++                    }
++                }
++                window->plan_slots.clear();
++                require(window->plan_slots.live_channels() == 0, "relay plan slots did not return to zero at close");
++            } else {
++                for (auto & entry : window->channels) {
++                    finish_owner(*entry.second);
++                }
+             }
+         }
+     }
+@@ -1400,16 +1453,30 @@ class relay_service {
+                 "relay event v2 ABI or identity differs");
+             const auto expected_wire = options_.wire == wire_type::f16 ? GGML_RELAY_WIRE_F16 : GGML_RELAY_WIRE_F32;
+             const std::uint64_t width = options_.wire == wire_type::f16 ? 2 : 4;
+-            require(event.wire_type == expected_wire && (event.computed_mask & ~std::uint32_t(31)) == 0,
+-                    "relay wire format or computed mask differs");
+-            require(event.elements > 0 && event.elements <= SIZE_MAX / width &&
+-                        event.elements <= UINT64_MAX / width && event.wire_bytes == event.elements * width,
+-                    "relay wire payload extent is invalid");
++            if (event.kind != GGML_RELAY_PLAN_RETIRED) {
++                require(event.wire_type == expected_wire && (event.computed_mask & ~std::uint32_t(31)) == 0,
++                        "relay wire format or computed mask differs");
++                require(event.elements > 0 && event.elements <= SIZE_MAX / width &&
++                            event.elements <= UINT64_MAX / width && event.wire_bytes == event.elements * width,
++                        "relay wire payload extent is invalid");
++            }
+             auto key = std::make_pair(event.plan_generation, event.channel);
+             if (event.kind == GGML_RELAY_INPUT_READY) {
+-                auto & owner = window.channels[key];
+-                if (!owner) {
+-                    owner = std::make_unique<channel_state>(run_, event.plan_generation, event.channel);
++                channel_state * owner = nullptr;
++                if (window.slot_channels) {
++                    auto * slot = window.plan_slots.acquire(event.plan_generation, event.epoch, plan_slot_idle);
++                    require(slot != nullptr, "relay plan slots are all held by live readers");
++                    auto & slot_owner = slot->states[event.channel];
++                    if (!slot_owner) {
++                        slot_owner = std::make_unique<channel_state>(run_, event.plan_generation, event.channel);
++                    }
++                    owner = slot_owner.get();
++                } else {
++                    auto & map_owner = window.channels[key];
++                    if (!map_owner) {
++                        map_owner = std::make_unique<channel_state>(run_, event.plan_generation, event.channel);
++                    }
++                    owner = map_owner.get();
+                 }
+                 require(!owner->held && event.epoch > owner->epoch, "relay input epoch is stale or has live readers");
+                 auto reservation = owner->ledger.reserve(index, event.epoch, event.channel, event.plan_generation);
+@@ -1473,10 +1540,20 @@ class relay_service {
+                 }
+                 if (courier_metrics_) ++window.courier_input;
+             } else if (event.kind == GGML_RELAY_OUTPUT_RELEASED) {
+-                auto found = window.channels.find(key);
+-                require(found != window.channels.end() && found->second->held.has_value(),
+-                        "output has no matching CPU lease");
+-                auto & owner = *found->second;
++                channel_state * found_owner = nullptr;
++                if (window.slot_channels) {
++                    auto * slot = window.plan_slots.find(event.plan_generation);
++                    require(slot != nullptr && slot->states[event.channel] != nullptr,
++                            "output has no matching CPU lease");
++                    found_owner = slot->states[event.channel].get();
++                } else {
++                    auto found = window.channels.find(key);
++                    require(found != window.channels.end() && found->second->held.has_value(),
++                            "output has no matching CPU lease");
++                    found_owner = found->second.get();
++                }
++                auto & owner = *found_owner;
++                require(owner.held.has_value(), "output has no matching CPU lease");
+                 require(owner.epoch == event.epoch && owner.elements == event.elements &&
+                             owner.wire_bytes == event.wire_bytes && owner.computed_mask == event.computed_mask,
+                         "output retirement has the wrong epoch or wire payload");
+@@ -1487,6 +1564,19 @@ class relay_service {
+                 owner.held.reset();
+                 window.output_retired.fetch_add(1, std::memory_order_release);
+                 if (courier_metrics_) ++window.courier_output;
++            } else if (event.kind == GGML_RELAY_PLAN_RETIRED) {
++                // A window that never saw this plan has no slot: ignore it
++                // instead of manufacturing one.
++                if (window.slot_channels) {
++                    auto * slot = window.plan_slots.find(event.plan_generation);
++                    if (slot != nullptr) {
++                        for (const auto & owner : slot->states) {
++                            require(!owner || !owner->held.has_value(),
++                                    "retired plan still has a live reader");
++                        }
++                        window.plan_slots.retire(event.plan_generation);
++                    }
++                }
+             } else {
+                 throw std::runtime_error("unknown relay event kind");
+             }

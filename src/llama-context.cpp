@@ -2,6 +2,7 @@
 #include "llama-context.h"
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
+#include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-relay.h"
@@ -44,6 +45,20 @@
 //
 // llama_context
 //
+// Pillar 5: a graph object is built once and reused in place, so the uid is
+// assigned only when the object has none. A rebuild allocates a fresh graph
+// (llm_graph_result::reset) and therefore a fresh uid. GGML_TP5_GRAPH_UID=0
+// keeps every uid zero and the relay falls back to the full signature path.
+static void tp5_assign_graph_uid(ggml_backend_t relay, ggml_cgraph * gf) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_TP5_GRAPH_UID");
+        return value == nullptr || value[0] == '\0' || strcmp(value, "0") != 0;
+    }();
+    if (relay != nullptr && enabled && gf != nullptr && gf->uid == 0) {
+        gf->uid = ggml_graph_next_uid();
+    }
+}
+
 static bool union_model_shape_supported(const llama_model & model) {
     return model.arch == LLM_ARCH_LLAMA && !model.hparams.use_alibi &&
         model.hparams.n_expert == 0 && model.hparams.n_rel_attn_bkts == 0;
@@ -1535,6 +1550,7 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
 
     // Releasing the scheduler returns the only borrowed compute lease.
     sched.reset();
+    ++alloc_gen_; // Placement is rebuilt from scratch below.
     gf_res_prev->reset();
     union_record_invalidate();
 
@@ -1626,6 +1642,7 @@ void llama_context::sched_reserve() {
     }
 
     sched_need_reserve = false;
+    ++alloc_gen_; // A new reserve may recreate the scheduler and its placement.
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -6424,6 +6441,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // Pillar 5 plan identity. The relay provider turns this into its K=8 plan
+    // slot; channels is left zero because only Meta knows the stage count.
+    // rs_class packs the three recurrent-state switches into one coarse class.
+    if (backend_tp5_relay != nullptr) {
+        ggml_relay_plan_key plan_key = {};
+        plan_key.model       = uint64_t(reinterpret_cast<uintptr_t>(&model));
+        plan_key.window      = 0; // the provider is private to one service window
+        plan_key.n_tokens    = ubatch.n_tokens;
+        plan_key.n_outputs   = n_outputs;
+        plan_key.rs_class    = int32_t((uint32_t(cparams.nextn_layer_offset) << 8) |
+                                       (uint32_t(gparams.rs_row_armed ? 1 : 0) << 4) |
+                                       uint32_t(gtype));
+        const llama_kv_cache_context * plan_kv = union_kv_ctx(mctx);
+        plan_key.n_kv_bucket = plan_kv != nullptr ? plan_kv->get_n_kv_pad() : 0;
+        plan_key.alloc_gen   = alloc_gen_;
+        plan_key.channels    = 0;
+        ggml_backend_meta_set_plan_key(backend_tp5_relay, &plan_key);
+    }
+
     const int64_t diag_compute_start = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (backend_tp5_relay && std::getenv("TP5_DIAG_GRAPH")) {
@@ -7625,6 +7661,7 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t                       n_toke
         return nullptr;
     }
 
+    tp5_assign_graph_uid(backend_tp5_relay, gf);
     return gf;
 }
 
@@ -7772,6 +7809,11 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
 ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_override) {
     int               n_threads = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp        = batched ? threadpool_batch : threadpool;
+
+    // The graph uid must be stable before the scheduler hands this graph to
+    // the Meta backend. A reused graph keeps its uid; a rebuilt graph is a new
+    // object (llm_graph_result::reset) and receives a fresh one here.
+    tp5_assign_graph_uid(backend_tp5_relay, gf);
 
     if (backend_cpu != nullptr) {
         auto * reg               = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));

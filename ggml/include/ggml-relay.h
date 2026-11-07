@@ -14,6 +14,40 @@ extern "C" {
 enum ggml_relay_event_kind {
     GGML_RELAY_INPUT_READY     = 1,
     GGML_RELAY_OUTPUT_RELEASED = 2,
+    // A plan was evicted or flushed. The event carries only its generation
+    // and epoch; channel and payload fields are zero. Old consumers that do
+    // not know this kind ignore it.
+    GGML_RELAY_PLAN_RETIRED    = 3,
+};
+
+// TP5 pillar-5 plan identity. Seven coarse fields plus the channel count.
+// Two epochs with the same key must be interchangeable for every captured
+// graph. `channels` is part of the identity: a 180- and a 181-channel plan
+// never share a plan slot.
+struct ggml_relay_plan_key {
+    uint64_t model;       // model identity inside one process
+    uint32_t window;      // service window ordinal (provider is per window)
+    uint32_t n_tokens;    // rows in the stage graph
+    uint32_t n_outputs;   // active output-gather width
+    int32_t  rs_class;    // nextn offset << 8 | rs_row_armed << 4 | gtype
+    uint32_t n_kv_bucket; // padded KV width bucket
+    uint64_t alloc_gen;   // gallocr placement generation
+    uint32_t channels;    // relay channel count
+};
+
+// Optional diagnostic view. The provider owns the slots; this is a copy.
+struct ggml_relay_plan_snapshot {
+    uint32_t valid_mask;
+    uint32_t channels[8];
+    uint64_t generation[8];
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t inserts;
+    uint64_t evictions;
+    uint64_t pinned_refusals;
+    uint64_t flushes;
+    uint64_t stale_generation;
+    uint64_t pool_bytes;
 };
 
 struct ggml_relay_event {
@@ -129,6 +163,19 @@ GGML_API bool ggml_backend_relay_publish_v2(
         ggml_backend_t backend, const struct ggml_relay_event_v2 * event, size_t event_size);
 // Sticky failure: stop normal publication and make bounded device waits exit.
 GGML_API void ggml_backend_relay_abort(ggml_backend_t backend, int32_t error_code);
+
+// Pillar 5: describe the next relay plan before its graph is submitted.
+// The key is stored on the Meta backend and passed to the provider's
+// prepare_ex when that capability exists. A null key or a backend without a
+// relay provider is a no-op. Callers serialize configuration; llama calls it
+// from the decode thread before graph compute.
+GGML_API void ggml_backend_meta_set_plan_key(
+        ggml_backend_t backend, const struct ggml_relay_plan_key * key);
+// Optional diagnostic copy of the provider's plan cache. Returns false when
+// the backend is not a relay or the provider predates the plan cache. This
+// does not extend ggml_relay_status.
+GGML_API bool ggml_backend_relay_plan_snapshot(
+        ggml_backend_t backend, struct ggml_relay_plan_snapshot * snapshot);
 
 #ifdef __cplusplus
 }
