@@ -106,6 +106,18 @@ static std::vector<float> run_gdn(
     return result;
 }
 
+// run_gdn prints FAIL and returns an empty vector when the compute fails.
+// Slicing an empty vector is undefined, and the comparison that follows would
+// read unrelated memory. Every caller must stop here, so the printed FAIL and
+// the exit code agree.
+static bool have_output(const std::vector<float> & out) {
+    if (out.empty()) {
+        fprintf(stderr, "FAIL: gated_delta_net produced no output; the comparison would read nothing\n");
+        return false;
+    }
+    return true;
+}
+
 int main() {
     const int64_t S_v = 16;
     const int64_t H   = 4;
@@ -140,6 +152,7 @@ int main() {
         slice(q_full, S_v * H, 0, r), slice(k_full, S_v * H, 0, r), slice(v_full, S_v * H, 0, r),
         slice(g_full, H, 0, r), slice(beta_full, H, 0, r), s0,
         S_v, H, /*n_tokens=*/r, /*K=*/1, /*emit_mode=*/0);
+    if (!have_output(out_truth)) return 1;
     const int64_t attn_r = S_v * H * r;
     std::vector<float> state_truth(out_truth.begin() + attn_r, out_truth.begin() + attn_r + S_v * S_v * H);
 
@@ -148,6 +161,7 @@ int main() {
         slice(q_full, S_v * H, 0, c), slice(k_full, S_v * H, 0, c), slice(v_full, S_v * H, 0, c),
         slice(g_full, H, 0, c), slice(beta_full, H, 0, c), s0,
         S_v, H, /*n_tokens=*/c, /*K=*/1, /*emit_mode=*/0);
+    if (!have_output(out_ckpt)) return 1;
     const int64_t attn_c = S_v * H * c;
     std::vector<float> state_ckpt(out_ckpt.begin() + attn_c, out_ckpt.begin() + attn_c + S_v * S_v * H);
 
@@ -155,6 +169,7 @@ int main() {
     std::vector<float> out_ingr = run_gdn(backend.get(),
         q_full, k_full, v_full, g_full, beta_full, s0,
         S_v, H, /*n_tokens=*/N, /*K=*/N, /*emit_mode=*/1);
+    if (!have_output(out_ingr)) return 1;
     const int64_t attn_N = S_v * H * N;
     const int64_t snap_size = 4 * S_v * H; // ingredient rows per slot (k,v,g,beta x S_v x H)
 
@@ -163,6 +178,7 @@ int main() {
     std::vector<float> out_truth_N = run_gdn(backend.get(),
         q_full, k_full, v_full, g_full, beta_full, s0,
         S_v, H, /*n_tokens=*/N, /*K=*/1, /*emit_mode=*/0);
+    if (!have_output(out_truth_N)) return 1;
     std::vector<float> state_truth_N(out_truth_N.begin() + attn_N, out_truth_N.begin() + attn_N + S_v * S_v * H);
     const int64_t final_state_offset = attn_N + N * snap_size;
     std::vector<float> final_state_ingr(out_ingr.begin() + final_state_offset, out_ingr.begin() + final_state_offset + S_v * S_v * H);
@@ -182,11 +198,13 @@ int main() {
     std::vector<float> out_ingr_ckpt = run_gdn(backend.get(),
         q_full, k_full, v_full, g_full, beta_full, s0,
         S_v, H, /*n_tokens=*/N, /*K=*/K_small, /*emit_mode=*/1);
+    if (!have_output(out_ingr_ckpt)) return 1;
     const int64_t prefix_len = N - K_small;
     std::vector<float> out_truth_prefix = run_gdn(backend.get(),
         slice(q_full, S_v * H, 0, prefix_len), slice(k_full, S_v * H, 0, prefix_len), slice(v_full, S_v * H, 0, prefix_len),
         slice(g_full, H, 0, prefix_len), slice(beta_full, H, 0, prefix_len), s0,
         S_v, H, /*n_tokens=*/prefix_len, /*K=*/1, /*emit_mode=*/0);
+    if (!have_output(out_truth_prefix)) return 1;
     const int64_t attn_prefix = S_v * H * prefix_len;
     std::vector<float> state_truth_prefix(out_truth_prefix.begin() + attn_prefix, out_truth_prefix.begin() + attn_prefix + S_v * S_v * H);
     const int64_t ckpt_offset = attn_N + K_small * snap_size + S_v * S_v * H; // ingredients, then final-state, then ckpt
@@ -223,6 +241,7 @@ int main() {
     std::vector<float> out_replay = run_gdn(backend.get(),
         q_replay, k_replay, v_replay, g_replay, beta_replay, state_ckpt,
         S_v, H, /*n_tokens=*/n_replay, /*K=*/1, /*emit_mode=*/0);
+    if (!have_output(out_replay)) return 1;
     const int64_t attn_replay = S_v * H * n_replay;
     std::vector<float> state_replay(out_replay.begin() + attn_replay, out_replay.begin() + attn_replay + S_v * S_v * H);
 

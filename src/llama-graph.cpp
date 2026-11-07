@@ -1,3 +1,6 @@
+#include "llama-union-topology.h"
+#include "llama-union-width-table.h"
+
 #include "llama-graph.h"
 
 #include "llama-impl.h"
@@ -13,8 +16,10 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-nout-state.h"
 
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +27,18 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
+
+// ---- per-object state (env: GGML_TP5_UNION_BINDER) ----
+//
+// State placement (no blanket "layout unchanged" claim):
+//
+//   - llm_graph_params DOES gain n_outputs_build (allocation envelope).
+//   - llm_graph_input_out_ids DOES gain bound_outputs (executed width).
+//   - llm_graph_result DOES gain an owner member (see llama-graph.h).
+//   - llama_cparams and the llama_kv_cache_* contexts carry no state for
+//     this lane; the context flags/counters live in the context's own state
+//     slot (llama-nout-state.h/cpp).
 
 // MoE down-proj activation path — CUDA is first-class, not an exception.
 //
@@ -67,12 +84,22 @@ static ggml_tensor * build_attn_inp_kq_mask(
         const llama_cparams & cparams) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    // The mask is [n_kv, n_tps, 1, n_stream]. n_stream is the number of
+    // streams THIS ubatch executes, not the number the cache owns. The
+    // attention op slices q into k->ne[3] stream blocks (build_attn_mha) and
+    // asserts that a->ne[3] % mask->ne[3] == 0 (ggml_mul_mat_set_attn_scores).
+    // A cache-wide count would give the mask more stream blocks than the op
+    // executes, and the build would abort.
+    const auto n_stream = cparams.kv_unified ? 1u : std::max(1u, ubatch.n_seqs_unq);
+    // Rows per stream: every token of the ubatch when unified, else the
+    // ubatch's per-sequence token count. n_tokens/n_stream truncates to zero
+    // for a one-token ubatch over a two-stream cache.
+    const auto n_tps    = cparams.kv_unified ? n_tokens : ubatch.n_seq_tokens;
 
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tps, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
@@ -84,14 +111,21 @@ static bool can_reuse_kq_mask(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+    // compare against the width the graph is expected to execute at: exact
+    // when the experimental exact lane is active, padded otherwise. Using the
+    // padded get_n_kv() unconditionally would fail reuse on every ubatch of an
+    // exact-bound graph.
+    const auto n_kv     = mctx->get_n_kv_target();
     const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    // same definition as build_attn_inp_kq_mask: the ubatch's stream count,
+    // and the per-sequence token count as the row count
+    const auto n_stream = cparams.kv_unified ? 1u : std::max(1u, ubatch.n_seqs_unq);
+    const auto n_tps    = cparams.kv_unified ? n_tokens : ubatch.n_seq_tokens;
 
     bool res = true;
 
     res &= (kq_mask->ne[0] == n_kv);
-    res &= (kq_mask->ne[1] == n_tokens/n_stream);
+    res &= (kq_mask->ne[1] == n_tps);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
 
@@ -230,6 +264,236 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+llm_graph_input_nkv_runtime::~llm_graph_input_nkv_runtime() {
+    if (n_kv_buf != nullptr) {
+        ggml_backend_buffer_free(n_kv_buf);
+        n_kv_buf = nullptr;
+    }
+}
+
+void llm_graph_input_nkv_runtime::set_input(const llama_ubatch * ubatch) {
+    // This is the whole consumption path of the runtime width, so it fails
+    // closed: a width that cannot be proven to have been written, or that no
+    // registered mask can hold, refuses the fill instead of filling some
+    // other width. Every refusal is observable (mask_refused, mask_filled)
+    // and raises the same error the rest of the graph path raises, so a
+    // caller cannot compute on a mask nobody wrote.
+    mask_n_kv         = 0;
+    mask_filled       = 0;
+    mask_refused      = 0;
+    mask_row_checked  = 0;
+    mask_row_ok       = 0;
+    mask_row_refused  = 0;
+    mask_rows_all     = 0;
+
+    if (n_kv == nullptr || mctx == nullptr) {
+        ++mask_refused;
+        LLAMA_LOG_ERROR("%s: no runtime n_kv input or no KV context; refusing the mask fill\n", __func__);
+        GGML_ABORT("runtime n_kv input without a tensor or a KV context");
+    }
+
+    // 1. Supply the width: the KV cache's true used span for this ubatch.
+    //
+    // LLAMA_NKV_MASK_OVERRIDE is a TEST HOOK, and this is the only place it
+    // is read. It lets a test drive the fill with a width the guard must
+    // refuse, so the refusal path is exercised instead of merely read. Rules:
+    //   - read once per set_input, through getenv;
+    //   - applied AFTER the real width is computed, so every guard below runs
+    //     on the injected value (the hook cannot bypass a check);
+    //   - OFF unless the value is a strictly positive decimal integer. Empty,
+    //     "0", a negative, a sign, a suffix, whitespace or any non-digit
+    //     leaves the real width in place. atoi() is deliberately not used: it
+    //     reads "12abc" as 12 and "-1" as -1;
+    //   - nothing in the library or the tests sets it except part 4 of
+    //     tests/test-nkv-runtime-param.cpp, which sets it in a child process.
+    int32_t width = (int32_t) mctx->get_n_kv();
+    if (const char * ovr = std::getenv("LLAMA_NKV_MASK_OVERRIDE")) {
+        int64_t parsed = 0;
+        bool    ok_num = ovr[0] != '\0';
+        for (const char * p = ovr; ok_num && *p != '\0'; ++p) {
+            if (*p < '0' || *p > '9') {
+                ok_num = false;
+                break;
+            }
+            parsed = parsed * 10 + (*p - '0');
+            if (parsed > INT32_MAX) {
+                ok_num = false;
+            }
+        }
+        if (ok_num && parsed > 0) {
+            width = (int32_t) parsed;
+        }
+    }
+    ggml_backend_tensor_set(n_kv, &width, 0, sizeof(width));
+
+    // 2. Read it back. The KQ-mask fill takes its width from this tensor's
+    // VALUE, not from the mask tensor's shape, so the value read here is the
+    // one the attention executes at. The read requires a host buffer with a
+    // data pointer: a device buffer would hand back nothing (or a stale
+    // staging copy) and the mask would be filled at a width nobody wrote.
+    if (n_kv->buffer == nullptr || n_kv->data == nullptr) {
+        ++mask_refused;
+        LLAMA_LOG_ERROR("%s: runtime n_kv input has no allocated host buffer; refusing the mask fill\n", __func__);
+        GGML_ABORT("runtime n_kv input has no host buffer");
+    }
+    if (!ggml_backend_buffer_is_host(n_kv->buffer)) {
+        ++mask_refused;
+        LLAMA_LOG_ERROR("%s: runtime n_kv input is not host-resident; refusing the mask fill\n", __func__);
+        GGML_ABORT("runtime n_kv input must be a host buffer");
+    }
+    int32_t runtime = 0;
+    std::memcpy(&runtime, n_kv->data, sizeof(runtime));
+    if (runtime <= 0 || runtime != width) {
+        ++mask_refused;
+        LLAMA_LOG_ERROR("%s: runtime n_kv read back %d, wrote %d; refusing the mask fill\n",
+                __func__, runtime, width);
+        GGML_ABORT("runtime n_kv read-back disagrees with the written width");
+    }
+
+    // 3. Fill every registered mask at that width. A mask that cannot hold
+    // the width is a refusal, not a silent fallback to its own ne[0]: the
+    // fallback would fill a wider mask than the graph executes at, which is
+    // exactly the stale-mask defect this input exists to prevent.
+    //
+    // The fill is then READ BACK against the KV cells: `check_mask_row` walks
+    // the row the fill just wrote and compares every column below the width
+    // with the visibility the cache's own cell table implies. That is an
+    // independent observation of the executed width -- the width comes from
+    // this input's value, the visibility from llama_kv_cache::apply_ubatch --
+    // and it is what makes `mask_n_kv == runtime_n_kv` falsifiable: a fill at
+    // the wrong width, or a stale row, disagrees with the cells at the first
+    // column past the true span. The check is host-side, reads the buffer the
+    // fill just wrote, and adds no tensor to the graph.
+    //
+    // WHICH ROWS: every row of the batch when the batch is small, the last row
+    // otherwise. The last row alone is the weakest choice: it has the largest
+    // causal span, so it is the row where `want_visible` is true for the most
+    // columns, and the fill's per-row shortcut -- `std::copy` of a previous
+    // row's data at llama-kv-cache.cpp:2585 followed by re-evaluating only the
+    // `idxs` subset -- is exactly the code that can go wrong per row. A check
+    // that reads only the last row cannot see a row that inherited the wrong
+    // predecessor.
+    //
+    // `mask_rows_all` is MEASURED, not inferred from the choice above. It is
+    // set below, after the loop, from the counters the loop incremented: the
+    // rows it examined (agreed + disagreed + refused, summed over every mask
+    // it checked) against the rows the batches own (n_tok * mask_filled). A
+    // flag computed from `n_tok <= k_rows_max` before the loop only restates
+    // that branch: it reads 1 even when no mask was checked at all, and it
+    // cannot notice a loop that examined fewer rows than it decided to.
+    //
+    // The cap keeps the hot path bounded: at most k_rows_max rows per mask per
+    // step, and the matrix's widest cell is 7 tokens.
+    constexpr uint32_t k_rows_max = 8;
+    const uint32_t n_tok    = ubatch != nullptr ? ubatch->n_tokens : 0;
+    const uint32_t rows     = n_tok == 0 ? 0 : (n_tok <= k_rows_max ? n_tok : 1);
+    const uint32_t first_row = n_tok == 0 ? 0 : (n_tok <= k_rows_max ? 0 : n_tok - 1);
+    for (ggml_tensor * mask : kq_masks) {
+        if (mask == nullptr) {
+            continue;
+        }
+        if (mask->buffer == nullptr) {
+            // A registered mask with no buffer cannot be filled or read back.
+            // Count the refusal: a silent skip would leave mask_rows_all able
+            // to read 1 over the masks that were checked.
+            ++mask_refused;
+            LLAMA_LOG_ERROR("%s: mask %s has no buffer; refusing the mask fill\n",
+                    __func__, mask->name);
+            continue;
+        }
+        if ((int64_t) runtime > mask->ne[0]) {
+            ++mask_refused;
+            LLAMA_LOG_ERROR("%s: runtime n_kv %d exceeds mask %s ne[0] %" PRId64 "; refusing the mask fill\n",
+                    __func__, runtime, mask->name, mask->ne[0]);
+            GGML_ABORT("runtime n_kv exceeds the KQ mask width");
+        }
+        mctx->set_input_kq_mask(mask, ubatch, causal_attn, (uint32_t) runtime);
+        ++mask_filled;
+
+        if (mask->data == nullptr || n_tok == 0) {
+            continue;
+        }
+        if (mask->type != GGML_TYPE_F32) {
+            // The fill writes F16 only under flash attention, which this lane
+            // refuses; an F16 mask cannot be read as float and is not checked.
+            continue;
+        }
+        // The row offset is the check's business, not this caller's: it takes
+        // the mask's base pointer and the token, and derives the row from the
+        // fill's own layout. Handing it a pre-offset row is how a check ends
+        // up comparing token N against token 0's row.
+        //
+        // `swa` is the fill's own SWA rule: `llama_kv_cache::swa_type`, the
+        // same member the fill's args struct carries (llama-kv-cache.cpp:2744
+        // reads the member declared at llama-kv-cache.h:357; get_swa_type()
+        // returns that same member, not a copy). Passing `false`
+        // unconditionally would make the read-back disagree with the fill on
+        // every SWA model, in the lenient direction on the columns SWA drops.
+        const bool swa = mctx->get_swa_type() != LLAMA_SWA_TYPE_NONE;
+        for (uint32_t r = 0; r < rows; ++r) {
+            const uint32_t tok = first_row + r;
+            int64_t first_bad = -1;
+            const enum llama_gate_verdict verdict = mctx->check_mask_row(mask, ubatch, tok,
+                    (const float *) mask->data, (uint32_t) runtime, causal_attn, swa, &first_bad);
+            // Snapshot the row the fill produced, while its memory is still the
+            // mask's. This copy is a witness, not the read-back's fallback: the
+            // read-back compares the live row (the mask is flagged OUTPUT at
+            // registration, so the block survives the post-decode call) and
+            // uses this copy only to show whether the block was reused.
+            // The row offset is the fill's own layout: row `tok` at
+            // tok * ne[0] floats (the check derives the same offset).
+            {
+                const size_t off = (size_t) tok * (size_t) mask->ne[0];
+                const float * src = (const float *) mask->data + off;
+                this->mask_row_snapshot.assign(src, src + (size_t) mask->ne[0]);
+                this->mask_row_snapshot_tok = tok;
+            }
+            switch (verdict) {
+                case LLAMA_GATE_PASS:
+                    ++mask_row_checked;
+                    ++mask_row_ok;
+                    break;
+                case LLAMA_GATE_FAIL:
+                    ++mask_row_checked;
+                    LLAMA_LOG_ERROR("%s: mask %s row %u disagrees with the KV cells at column %" PRId64
+                            " (width %d); the mask does not match the executed span\n",
+                            __func__, mask->name, tok, first_bad, runtime);
+                    break;
+                case LLAMA_GATE_UNPROVEN:
+                    // The check refused to model this layout (a token count
+                    // that does not divide into the streams, a row whose
+                    // stream disagrees with its token's sequence). That is not
+                    // a disagreement and not a pass: it gets its own counter so
+                    // a layout change cannot look like a wrong mask.
+                    ++mask_row_refused;
+                    break;
+            }
+        }
+    }
+    // `mask_rows_all` is the measurement, taken here where both sides are
+    // known: the rows the loop examined -- agreed and disagreed both land in
+    // mask_row_checked, refusals in mask_row_refused -- against the rows the
+    // batch owns. A mask that was filled but not checked (F16, no host data, an
+    // empty batch) leaves the two unequal, and so does a batch wider than the
+    // row cap. A mask refused for a missing buffer is counted in mask_refused
+    // and is absent from both sides; the positive arms fail on that counter
+    // first. "Not every row was looked at" is the fact, and "no mask was
+    // checked" is the same fact, not a pass.
+    const uint64_t rows_examined = (uint64_t) mask_row_checked + (uint64_t) mask_row_refused;
+    const uint64_t rows_expected = (uint64_t) n_tok * (uint64_t) mask_filled;
+    mask_rows_all = (rows_expected != 0 && rows_examined == rows_expected) ? 1u : 0u;
+    mask_n_kv = (uint32_t) runtime;
+}
+
+bool llm_graph_input_nkv_runtime::can_reuse(const llm_graph_params & params) {
+    // The tensor is [1] at every width and carries no per-batch metadata, so
+    // its shape never decides reuse. Refresh the context pointer first: a
+    // later binder patch followed by set_inputs() must not write through the
+    // previous batch's context.
+    mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+    return n_kv != nullptr && mctx != nullptr;
+}
+
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
@@ -238,8 +502,21 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
     int32_t * data = (int32_t *) out_ids->data;
 
-    if (n_outputs == n_tokens) {
-        for (int i = 0; i < n_tokens; ++i) {
+    // The tensor's own row count bounds every write. The graph is built at
+    // n_outputs_build and bound in place, so this is the ACTIVE width: 0 for a
+    // step that marks no token as output. The fast path below used to write
+    // n_tokens rows into a tensor that can be narrower than the batch, which
+    // is a heap overflow as soon as the closure is bound below its build width
+    // (and a write into a zero-byte allocation at width 0).
+    const int64_t n_rows = out_ids->ne[0];
+
+    // The fast path is valid only when every token is an output. With the
+    // runtime n_outputs lane the build-time envelope can equal n_tokens while
+    // the ACTIVE count is smaller, so scan the per-token flags whenever they
+    // are present.
+    if (ubatch->output == nullptr) {
+        const int64_t n = n_tokens < n_rows ? n_tokens : n_rows;
+        for (int64_t i = 0; i < n; ++i) {
             data[i] = i;
         }
 
@@ -251,18 +528,33 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     int n_outputs = 0;
 
     for (int i = 0; i < n_tokens; ++i) {
-        if (ubatch->output[i]) {
+        if (!ubatch->output[i]) {
+            continue;
+        }
+        // the gather closure executes at this width; a batch that marks more
+        // rows than the live tensor holds is a binder defect, not a batch to
+        // truncate silently
+        GGML_ASSERT(n_outputs < n_rows);
+        if (n_outputs < n_rows) {
             data[n_outputs++] = i;
         }
     }
 }
 
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
-    bool res = true;
+    // compare the active count against the width the graph actually executes
+    // (bound_outputs), not the build-time envelope. before the first bind both
+    // are equal, which is stock behavior.
+    return bound_outputs == params.n_outputs;
+}
 
-    res &= n_outputs == params.n_outputs;
+void llm_graph_input_out_ids::union_bind_runtime() {
+    GGML_ASSERT(out_ids);
+    bound_outputs = (uint32_t) out_ids->ne[0];
+}
 
-    return res;
+uint32_t llm_graph_input_out_ids::union_bound_n_outputs() const {
+    return out_ids != nullptr ? bound_outputs : 0;
 }
 
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
@@ -360,19 +652,109 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
+// union-graph runtime binder: zero the recurrent state row selected by a
+// runtime I32 index. The op is in-place on `states` and its output is the
+// source of both state gathers, so zero-before-gather is an explicit graph
+// dependency, not a build-order convention. row == -1 is a no-op (no zero
+// cell available). CPU-only: the callback writes the host state buffer
+// directly; the binder refuses multi-backend graphs.
+static void union_rsz_zero_row(ggml_tensor * dst, const ggml_tensor * states,
+                               const ggml_tensor * index, int ith, int nth, void *) {
+    GGML_ASSERT(states->type == GGML_TYPE_F32 && index->type == GGML_TYPE_I32);
+    const int32_t row = *(const int32_t *) index->data;
+    GGML_ASSERT(row >= -1 && row < states->ne[1]);
+    if (row < 0) {
+        return;
+    }
+    float * p = (float *) ((char *) dst->data + row * dst->nb[1]);
+    for (int64_t i = ith; i < states->ne[0]; i += nth) {
+        p[i] *= 0.0f;
+    }
+}
 
-    const int64_t n_rs = mctx->get_n_rs();
+// bind the runtime zero-row index on every set_inputs() call, including graph
+// reuse: the index is a host I32 input and is never part of the topology.
+//
+// The value is the ROW of the state tensor the gathers will read, not the cell
+// index rs_z: s_copy() returns rs_idx[seq]*size + src0, so a sequence with a
+// pending rollback reads a row in group rs_idx. get_rs_zero_row() computes that
+// row without consuming rs_idx (s_copy() is the one consumer). The row is a
+// runtime value written here, so it never enters a graph key.
+//
+// One graph carries ONE such row, so this returns false when the ubatch's
+// sequences disagree on it. rs_idx is per sequence (set by seq_rm,
+// llama-memory-recurrent.cpp:244) and a sequential ubatch split can place two
+// sequences with different rollback depths in one ubatch, so disagreement is
+// reachable, not impossible. Refusing is the honest answer: the caller counts
+// a named refusal and the graph falls back to stock, where rs_z is a view
+// offset and each sequence's row is resolved by the view the stock build
+// makes. Asserting here would be a crash on a legal batch.
+static bool union_rsz_bind_index(ggml_tensor * index, const llama_memory_recurrent_context * mctx,
+                                 const llama_ubatch * ubatch) {
+    if (index == nullptr) {
+        return true;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(index->buffer));
+
+    int32_t row = -1;
+    for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
+        const int32_t r = mctx->get_rs_zero_row(ubatch->seq_id_unq[s]);
+        if (s == 0) {
+            row = r;
+        } else if (r != row) {
+            return false;
+        }
+    }
+    // -1 means "no zero row" and is a no-op in the op. Any other value must be
+    // a row of the state tensor; the op re-checks the same bound fail-closed.
+    GGML_ASSERT(row >= -1);
+    *(int32_t *) index->data = row;
+    return true;
+}
+
+void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+    n_seqs = ubatch->n_seqs;
+
+    // A stock build wires nothing: no copy tensor and no zero-row index. Such
+    // a call has nothing to read from the recurrent context, so it must not
+    // dereference one. This is not a defensive nicety: the arm that pins the
+    // stock path's no-op (test-rsz-selection-write (i)) calls set_input() with
+    // no context at all, and the unconditional get_n_rs() here was a null
+    // dereference (SIGSEGV) on exactly that call.
+    if (mctx == nullptr) {
+        GGML_ASSERT(s_copy == nullptr && s_zero == nullptr &&
+                    "a recurrent context is required to bind a copy tensor or a zero row");
+        rs_zero_row_refused = false;
+        return;
+    }
 
     if (s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
 
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+        const int64_t n_rs = mctx->get_n_rs();
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
         }
+    }
+
+    // a refusal leaves the row at its previous value; can_reuse() then
+    // refuses this graph and the next build is a stock one, where rs_z is a
+    // view offset and each sequence's row is resolved by the view
+    rs_zero_row_refused = !union_rsz_bind_index(s_zero, mctx, ubatch);
+
+    // The cached cell follows the live one, but ONLY on the runtime-index
+    // lane. The condition is load-bearing, not cosmetic: can_reuse() compares
+    // rs_z == mctx->get_rs_z() only when s_zero == nullptr (the stock lane,
+    // where rs_z becomes a view offset and is therefore the reuse key). On
+    // that lane refreshing rs_z here would make its own check vacuous and the
+    // stock lane would stop rebuilding on a moved selection. On the runtime
+    // lane the row is an input and can_reuse() deliberately does not compare
+    // rs_z, so this is pure metadata -- and it is what the write that used to
+    // live in set_rs_z_input() did before it was folded in here.
+    if (s_zero != nullptr) {
+        rs_z = mctx->get_rs_z();
     }
 
     mctx->consume_replay_len();
@@ -383,21 +765,40 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     this->mctx = mctx;
 
+    // a graph whose zero row could not be bound for the last ubatch must not
+    // be reused: the row it would clear is not the row this batch reads
+    if (rs_zero_row_refused) {
+        return false;
+    }
+
     bool res = true;
 
     res &= s_copy->ne[0] == mctx->get_n_rs();
 
+    res &= n_seqs == params.ubatch.n_seqs;
     res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
 
     res &= head == mctx->get_head();
-    res &= rs_z == mctx->get_rs_z();
+    // rs_z is a runtime index input when s_zero is wired (the zero-row op
+    // reads it at execution); only the stock view/scale path bakes the row
+    // into the topology.
+    if (s_zero == nullptr) {
+        res &= rs_z == mctx->get_rs_z();
+    }
 
-    // DRC phase 2: a nonzero (or changed) replay length needs a differently-shaped extra
-    // reconstruction node in the graph, so it can't be satisfied by reusing existing topology.
     res &= replay_len == mctx->get_replay_len();
 
     return res;
+}
+
+void llm_graph_input_rs::union_bind_runtime() {
+    if (mctx == nullptr) {
+        return;
+    }
+    head       = mctx->get_head();
+    rs_z       = mctx->get_rs_z();
+    replay_len = mctx->get_replay_len();
 }
 
 void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
@@ -513,7 +914,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
-    if (self_kq_mask && self_kq_mask->buffer) {
+    //
+    // The runtime n_kv input owns this mask's fill when it is registered:
+    // refilling it here at dst->ne[0] would overwrite the runtime-width fill
+    // with a full-width one.
+    if (self_kq_mask && self_kq_mask->buffer && !kq_mask_runtime_owned) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
 
@@ -543,13 +948,15 @@ void llm_graph_input_attn_kv::set_reader_input() {
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 
+    // update the cached mctx BEFORE any early return: a later binder patch
+    // followed by set_inputs() must not read the previous batch's mctx
+    this->mctx = mctx;
+
     // Reader positions and membership belong to this immutable frontier. A
     // different frontier can have the same shape and a different visible set.
     if (!readers.empty() || mctx->has_attention_views()) {
         return false;
     }
-
-    this->mctx = mctx;
 
     bool res = true;
 
@@ -1155,17 +1562,23 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    // outside the s_copy branch: with s_zero wired, rs_z no longer forces a
+    // rebuild, so this rebind is the only thing that carries the current zero
+    // row into a reused graph
+    inp_rs->rs_zero_row_refused = !union_rsz_bind_index(inp_rs->s_zero, mctx->get_recr(), ubatch);
+
     mctx->get_recr()->consume_replay_len();
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
 
+    // update the cached mctx BEFORE any early return (see attn_kv)
+    this->mctx = mctx;
+
     if (!inp_attn->readers.empty() || mctx->get_attn()->has_attention_views()) {
         return false;
     }
-
-    this->mctx = mctx;
 
     bool res = true;
 
@@ -1180,13 +1593,30 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    if (inp_rs->s_zero == nullptr) {
+        res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    }
+    // a zero row that could not be bound for the last ubatch makes this graph
+    // unusable for the next one (see llm_graph_input_rs::can_reuse)
+    res &= !inp_rs->rs_zero_row_refused;
 
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
     res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
 
     return res;
+}
+
+void llm_graph_input_mem_hybrid::union_bind_runtime() {
+    if (inp_rs == nullptr || mctx == nullptr) {
+        return;
+    }
+    inp_rs->mctx = mctx->get_recr();
+    inp_rs->union_bind_runtime();
+}
+
+bool llm_graph_input_mem_hybrid::union_has_readers() const {
+    return inp_attn != nullptr && inp_attn->union_has_readers();
 }
 
 // TODO: Hybrid input classes are a bit redundant.
@@ -1209,6 +1639,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    inp_rs->rs_zero_row_refused = !union_rsz_bind_index(inp_rs->s_zero, mctx->get_recr(), ubatch);
+
     mctx->get_recr()->consume_replay_len();
 }
 
@@ -1229,13 +1661,30 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    if (inp_rs->s_zero == nullptr) {
+        res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    }
+    // a zero row that could not be bound for the last ubatch makes this graph
+    // unusable for the next one (see llm_graph_input_rs::can_reuse)
+    res &= !inp_rs->rs_zero_row_refused;
 
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
     res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
 
     return res;
+}
+
+void llm_graph_input_mem_hybrid_k::union_bind_runtime() {
+    if (inp_rs == nullptr || mctx == nullptr) {
+        return;
+    }
+    inp_rs->mctx = mctx->get_recr();
+    inp_rs->union_bind_runtime();
+}
+
+bool llm_graph_input_mem_hybrid_k::union_has_readers() const {
+    return inp_attn != nullptr && inp_attn->union_has_readers();
 }
 
 void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
@@ -1289,6 +1738,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    inp_rs->rs_zero_row_refused = !union_rsz_bind_index(inp_rs->s_zero, mctx->get_recr(), ubatch);
+
     mctx->get_recr()->consume_replay_len();
 }
 
@@ -1323,13 +1774,30 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    if (inp_rs->s_zero == nullptr) {
+        res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    }
+    // a zero row that could not be bound for the last ubatch makes this graph
+    // unusable for the next one (see llm_graph_input_rs::can_reuse)
+    res &= !inp_rs->rs_zero_row_refused;
 
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
     res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
 
     return res;
+}
+
+void llm_graph_input_mem_hybrid_iswa::union_bind_runtime() {
+    if (inp_rs == nullptr || mctx == nullptr) {
+        return;
+    }
+    inp_rs->mctx = mctx->get_recr();
+    inp_rs->union_bind_runtime();
+}
+
+bool llm_graph_input_mem_hybrid_iswa::union_has_readers() const {
+    return inp_attn != nullptr && inp_attn->union_has_readers();
 }
 
 void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
@@ -1472,14 +1940,19 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
-    if (!this->params.allow_reuse(params)) {
+    // n_outputs is a runtime-bound key: the inputs compare the active count
+    // against the width the graph actually executes (bound_outputs), so the
+    // params-level check must not reject a bound graph whose build-time
+    // active count differs. Every non-runtime key is still compared.
+    if (!this->params.allow_reuse(params, /*ignore_runtime=*/true)) {
         return false;
     }
 
     bool res = true;
 
     for (auto & input : inputs) {
-        res = res && input->can_reuse(params);
+        const bool ok = input->can_reuse(params);
+        res = res && ok;
     }
 
     return res;
@@ -1497,6 +1970,60 @@ void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
 }
+
+const llm_graph_params & llm_graph_result::get_params() const {
+    return params;
+}
+
+// ---- union-graph runtime n_outputs binding ----
+//
+// The graph may be built over an output-count allocation envelope
+// (n_outputs_build) and bound to the active count in place by the
+// llama_context union binder. These accessors expose the build envelope
+// (allocation capacity) and the width the gather closure currently executes
+// at. Both are diagnostics/guards: the binder patches the closure from the
+// symbolic shape map recorded at build time, without a scratch graph.
+uint32_t llm_graph_result::outputs_envelope() const {
+    for (auto & input : inputs) {
+        auto * inp = dynamic_cast<llm_graph_input_out_ids *>(input.get());
+        if (inp != nullptr && inp->out_ids != nullptr) {
+            return inp->n_outputs;
+        }
+    }
+    return 0;
+}
+
+bool llm_graph_result::has_out_ids() const {
+    for (auto & input : inputs) {
+        auto * inp = dynamic_cast<llm_graph_input_out_ids *>(input.get());
+        if (inp != nullptr && inp->out_ids != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+uint32_t llm_graph_result::outputs_bound() const {
+    for (auto & input : inputs) {
+        auto * inp = dynamic_cast<llm_graph_input_out_ids *>(input.get());
+        if (inp != nullptr && inp->out_ids != nullptr) {
+            return inp->bound_outputs;
+        }
+    }
+    return 0;
+}
+
+// n_outputs target of the live graph's output-gather closure, read from the
+// input that owns it; 0 when the graph has no closure.
+uint32_t llm_graph_result::outputs_bound_target() const {
+    for (const auto & input : inputs) {
+        const uint32_t n = input->union_bound_n_outputs();
+        if (n != 0) {
+            return n;
+        }
+    }
+    return 0;
+}
+
 
 //
 // llm_graph_context
@@ -1529,8 +2056,11 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     norm_eps         (hparams.f_norm_eps),
     norm_rms_eps     (hparams.f_norm_rms_eps),
     n_tokens         (ubatch.n_tokens),
-    n_outputs        (params.n_outputs),
+    n_outputs        (params.n_outputs_build != 0 ? params.n_outputs_build : params.n_outputs),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
+    union_binder     (params.union_binder),
+    strict_ntok      (params.strict_ntok),
+    rs_row_armed     (params.rs_row_armed),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
     sched            (params.sched),
@@ -1728,6 +2258,14 @@ llm_graph_qkv llm_graph_context::build_qkv(
         Vcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens,
             ggml_row_size(qkv->type, n_embd_head), qkv->nb[1],
             ggml_row_size(qkv->type, n_embd_q + n_embd_kv));
+        if (strict_ntok) {
+            // The token lane cannot bind these: each is a non-contiguous row
+            // slice of one fused matmul, so the shape pass refuses the graph.
+            // The tag names that refusal (llama-context.cpp, GGML_OP_VIEW).
+            Qcur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = LLM_FUSED_QKV_SLICE_MARKER;
+            Kcur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = LLM_FUSED_QKV_SLICE_MARKER;
+            Vcur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = LLM_FUSED_QKV_SLICE_MARKER;
+        }
     } else {
         // separate Q/K/V path
         Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
@@ -1763,6 +2301,11 @@ llm_graph_qkv llm_graph_context::build_qkv(
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        if (strict_ntok) {
+            Qcur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = LLM_TOKEN_AXIS_MARKER | 2;
+            Kcur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = LLM_TOKEN_AXIS_MARKER | 2;
+            Vcur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = LLM_TOKEN_AXIS_MARKER | 2;
+        }
     }
 
     cb(Qcur, "Qcur", il);
@@ -2427,6 +2970,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    ggml_set_name(inp->tokens, "union_inp_tokens");
     cb(inp->tokens, "inp_tokens", -1);
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
@@ -2513,6 +3057,7 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
     auto & cur = inp->pos;
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens*hparams.n_pos_per_embd());
+    ggml_set_name(cur, "union_inp_pos");
     ggml_set_input(cur);
 
     res->add_input(std::move(inp));
@@ -2550,6 +3095,8 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
     ggml_set_input(cur);
+    // union binder root: the active output count is a runtime binding
+    ggml_set_name(cur, "union_out_ids");
 
     res->add_input(std::move(inp));
 
@@ -2651,6 +3198,85 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+// Attach a KQ mask to the graph's runtime n_kv input, so its fill takes its
+// width from that value. Called from every builder that creates an attention
+// input; a graph with no runtime input (binder off) is a no-op.
+// rt is the runtime input. Pass null to read it from res. owner is the
+// attention input that holds the mask. Pass null when the mask has no owner.
+// When owner is set, its set_input() no longer fills the mask.
+void llm_graph_context::register_nkv_runtime_mask(
+        llm_graph_input_nkv_runtime * rt,
+        llm_graph_input_attn_kv     * owner,
+        ggml_tensor                 * kq_mask) const {
+    if (kq_mask == nullptr || res == nullptr) {
+        return;
+    }
+
+    if (rt == nullptr) {
+        rt = res->get_nkv_runtime_input();
+    }
+
+    if (rt == nullptr) {
+        return;
+    }
+
+    if (owner != nullptr) {
+        // The runtime input fills this mask. A second fill in set_input()
+        // would overwrite the runtime width with the full width.
+        owner->kq_mask_runtime_owned = true;
+    }
+
+    rt->kq_masks.push_back(kq_mask);
+    // The read-back runs after llama_decode() returns, so ggml-alloc must
+    // keep this block past the mask's last consumer. This flag is what
+    // holds it.
+    ggml_set_output(kq_mask);
+}
+
+void llm_graph_context::register_nkv_runtime_mask(ggml_tensor * kq_mask) const {
+    register_nkv_runtime_mask(nullptr, nullptr, kq_mask);
+}
+
+ggml_tensor * llm_graph_context::build_inp_nkv_runtime() const {
+    // The width is supplied at execution time, so the tensor is [1] at every
+    // width: adding it cannot change the topology and a width change never
+    // rebuilds the graph. Only the union binder can bind the attention
+    // tensors in place, so every other build stays exactly as it was.
+    if (!union_binder || mctx == nullptr) {
+        return nullptr;
+    }
+    const auto * mctx_kv = dynamic_cast<const llama_kv_cache_context *>(mctx);
+    if (mctx_kv == nullptr) {
+        return nullptr;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_nkv_runtime>(mctx_kv, cparams.causal_attn);
+
+    auto & cur = inp->n_kv;
+
+    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_input(cur);
+    ggml_set_name(cur, "union_nkv_runtime");
+
+    // The tensor has no graph consumer, so ggml_backend_sched_alloc_graph()
+    // never allocates it; give it its own host storage. Without this,
+    // set_input()'s ggml_backend_tensor_set() aborts with "tensor buffer not
+    // set" -- the first bind that actually applies reaches it. This runs
+    // BEFORE add_input() moves the unique_ptr.
+    inp->n_kv_buf = ggml_backend_buft_alloc_buffer(
+            ggml_backend_cpu_buffer_type(), ggml_nbytes(cur));
+    if (inp->n_kv_buf == nullptr) {
+        LLAMA_LOG_ERROR("%s: cannot allocate the runtime n_kv input buffer\n", __func__);
+        return nullptr;
+    }
+    ggml_backend_tensor_alloc(inp->n_kv_buf, cur,
+            ggml_backend_buffer_get_base(inp->n_kv_buf));
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2740,6 +3366,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        if (kq_mask && (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_F32) &&
+                (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32) && q->type == GGML_TYPE_F32) {
+            ggml_mul_mat_set_attn_scores(kq, kq_mask);
+        }
         cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
@@ -2785,6 +3415,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        if (kq_mask && (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_F32)) {
+            ggml_mul_mat_set_attn_mask(kqv, kq_mask);
+        }
         if (v->type == GGML_TYPE_F32 && kq->type == GGML_TYPE_F32) {
             ggml_mul_mat_set_prec(kqv, GGML_PREC_F32_PEDANTIC);
         }
@@ -2812,12 +3445,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        if (strict_ntok) cur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = LLM_TOKEN_AXIS_MARKER | 1;
 
-        if (!cparams.offload_kqv) {
+        if (!cparams.offload_kqv && sched != nullptr) {
             // all nodes between the KV store and the attention output are run on the CPU
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         }
     }
+    // The runtime n_kv input is not wired here: it is created and consumed by
+    // llm_graph_input_nkv_runtime, which fills the KQ mask at the runtime
+    // width. Hanging it off cur->src[] would be a write-only edge no kernel
+    // reads, and would put a tensor in the attention output's source list.
 
     // TurboQuant: graph-side inverse WHT on attention output (undoes V rotation)
 
@@ -2954,7 +3592,23 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
+    // create the runtime n_kv input BEFORE the mask is registered with it
+    const ggml_tensor * nkv_rt = build_inp_nkv_runtime();
+    if (nkv_rt != nullptr) {
+        register_nkv_runtime_mask(res->get_nkv_runtime_input(), inp.get(), inp->self_kq_mask);
+    }
+
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+}
+
+// the graph's runtime n_kv input, or nullptr when this build has none
+llm_graph_input_nkv_runtime * llm_graph_result::get_nkv_runtime_input() const {
+    for (const auto & input : inputs) {
+        if (auto * rt = dynamic_cast<llm_graph_input_nkv_runtime *>(input.get())) {
+            return rt;
+        }
+    }
+    return nullptr;
 }
 
 ggml_tensor * llm_graph_context::build_attn_reader(
@@ -3050,7 +3704,7 @@ ggml_tensor * llm_graph_context::build_attn_reader(
     ggml_mul_mat_set_prec(output, GGML_PREC_F32_PEDANTIC);
     output = ggml_permute(ctx0, output, 0, 2, 1, 3);
     output = ggml_cont_2d(ctx0, output, output->ne[0] * output->ne[1], output->ne[2] * output->ne[3]);
-    if (!cparams.offload_kqv) {
+    if (!cparams.offload_kqv && sched != nullptr) {
         ggml_backend_sched_set_tensor_backend(sched, output, backend_cpu);
     }
     ggml_build_forward_expand(gf, output);
@@ -3097,8 +3751,13 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        // The token lane patches the token width in place, so the value tensors
+        // these calls create must carry their token axis explicitly: their build
+        // shape is 1 wide and the axis is otherwise ambiguous (see
+        // union_shape_analyze's token_reshape). strict_ntok is true only on the
+        // token lane; every other lane passes false and is unchanged.
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il, strict_ntok));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il, strict_ntok));
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -3786,6 +4445,7 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
 ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
         ggml_tensor * state_copy_main,
+        ggml_tensor * state_zero_index,
         ggml_tensor * state_copy_extra,
             int32_t   state_size,
             int32_t   n_seqs,
@@ -3796,12 +4456,33 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
 
     GGML_UNUSED(rs_size);
-    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+    ggml_tensor * states = nullptr;
 
-    // Clear a single state which will then be copied to the other cleared states.
-    // Note that this is a no-op when the view is zero-sized.
-    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    if (state_zero_index != nullptr) {
+        // The zero-row subtree is selected by the PRESENCE of the runtime
+        // index, never by the current rs_zero value: the graph is identical
+        // for every rs_z, so a reused graph stays valid when the row changes.
+        // The row is bound in set_input() on every execution. The op is
+        // applied to the state tensor itself, so its output aliases its own
+        // view source (an in-place view of `s`); the 2D gather view below is
+        // built on top of it, which is the explicit zero-before-gather
+        // dependency: both gathers consume a reshape of the op output.
+        GGML_ASSERT(s->buffer != nullptr && "runtime rs_z requires an allocated recurrent state");
+        GGML_ASSERT(ggml_backend_buffer_is_host(s->buffer) &&
+                    "runtime rs_z zero-row op requires a host-resident recurrent state");
+        ggml_tensor * zero_row = ggml_map_custom2_inplace(ctx0, s, state_zero_index,
+                                         union_rsz_zero_row, GGML_N_TASKS_MAX, nullptr);
+        ggml_set_name(zero_row, "union_rs_zero_row");
+        ggml_build_forward_expand(gf, zero_row);
+        states = ggml_reshape_2d(ctx0, zero_row, state_size, s->ne[1]);
+    } else {
+        states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+        // stock: clear a single state which will then be copied to the other
+        // cleared states. Note that this is a no-op when the view is
+        // zero-sized.
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    }
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
@@ -3809,12 +4490,16 @@ ggml_tensor * llm_graph_context::build_rs(
     ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
     ggml_build_forward_expand(gf, output_states);
 
-    // copy extra states which won't be changed further (between n_seqs and n_rs)
+
     ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);
+    // copy extra states which won't be changed further (between n_seqs and n_rs)
+    // union binder root: rs_head moves the destination view's offset
+    ggml_tensor * state_copy_dst = ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1]);
+    ggml_set_name(state_copy_dst, "union_rs_copy_dst");
     ggml_build_forward_expand(gf,
         ggml_cpy(ctx0,
             states_extra,
-            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+            state_copy_dst));
 
     return output_states;
 }
@@ -3822,7 +4507,8 @@ ggml_tensor * llm_graph_context::build_rs(
 static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
-    const llama_memory_recurrent_context * mctx_cur) {
+    const llama_memory_recurrent_context * mctx_cur,
+                     bool   rs_row_armed) {
 
     auto inp = std::make_unique<llm_graph_input_rs>(mctx_cur);
 
@@ -3830,10 +4516,28 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     const int64_t n_seqs = ubatch.n_seqs;
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+    // union binder roots: the state length (n_rs) sizes the copy index tensor
+    // and its two views. The build uses the full state envelope; the live
+    // length is bound in place afterwards.
+    ggml_set_name(inp->s_copy, "union_rs_copy");
     ggml_set_input(inp->s_copy);
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
+    // main is a constant-length prefix; extra carries the runtime length
+    ggml_set_name(inp->s_copy_main,  "union_rs_copy_main");
+    ggml_set_name(inp->s_copy_extra, "union_rs_copy_extra");
+
+    if (rs_row_armed) {
+        // runtime zero-row index: the row is bound on every set_inputs() call
+        // and consumed by the explicit-dependency zero-row op in build_rs().
+        // Armed on the binder lane AND on the relay lane (see
+        // llm_graph_params::rs_row_armed); the VALUE is a runtime row, so the
+        // tensor's presence is the only thing this build decides.
+        inp->s_zero = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_name(inp->s_zero, "union_rs_zero_index");
+        ggml_set_input(inp->s_zero);
+    }
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
@@ -3845,7 +4549,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 llm_graph_input_rs * llm_graph_context::build_rs_inp() const {
     const auto * mctx_cur = static_cast<const llama_memory_recurrent_context *>(mctx);
 
-    auto inp = build_rs_inp_impl(ctx0, ubatch, mctx_cur);
+    auto inp = build_rs_inp_impl(ctx0, ubatch, mctx_cur, rs_row_armed);
 
     return (llm_graph_input_rs *) res->add_input(std::move(inp));
 }
@@ -3858,7 +4562,7 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
-    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+    return build_rs(s, inp->s_copy_main, inp->s_zero, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
 }
@@ -3897,17 +4601,23 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
 
     const auto kv_head = mctx_cur->get_head();
 
+    // union binder root: the destination row is selected by the recurrent
+    // head; the build uses head 0 and the live head is bound in place.
+    ggml_tensor * token_shift_dst = ggml_view_1d(ctx0, mctx_cur->get_r_l(il),
+        hparams.n_embd_r()*n_seqs,
+        hparams.n_embd_r()*kv_head*ggml_element_size(mctx_cur->get_r_l(il)));
+    ggml_set_name(token_shift_dst, "union_rs_head_view");
     return ggml_cpy(
         ctx0,
         ggml_view_1d(ctx0, token_shift, n_embd * n_seqs * token_shift_count, 0),
-        ggml_view_1d(ctx0, mctx_cur->get_r_l(il), hparams.n_embd_r()*n_seqs, hparams.n_embd_r()*kv_head*ggml_element_size(mctx_cur->get_r_l(il)))
+        token_shift_dst
     );
 }
 
 llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
-    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
+    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr(), rs_row_armed);
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
@@ -3918,7 +4628,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
 llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
-    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
+    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr(), rs_row_armed);
     auto inp_attn = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
@@ -3929,7 +4639,7 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
 llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
 
-    auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
+    auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr(), rs_row_armed);
 
     // build iswa attention input
     const auto * attn_ctx = mctx_cur->get_attn();

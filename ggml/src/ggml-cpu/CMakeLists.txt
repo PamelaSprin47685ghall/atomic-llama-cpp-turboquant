@@ -29,6 +29,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
+        ggml-cpu/attn-ordered.cpp
+        ggml-cpu/attn-ordered.h
+        ggml-cpu/ggml-cpu-attn-stats.h
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
@@ -53,6 +56,15 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
         )
+
+    # Attention masks, nonfinite values and reduction order require strict FP.
+    if (MSVC)
+        set_source_files_properties(ggml-cpu/attn-ordered.cpp PROPERTIES COMPILE_OPTIONS "/fp:strict")
+    elseif (CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang|IntelLLVM)$")
+        set_source_files_properties(ggml-cpu/attn-ordered.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off;-fno-lto")
+    else()
+        message(FATAL_ERROR "Ordered CPU attention requires strict floating-point compiler options")
+    endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)

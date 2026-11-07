@@ -681,6 +681,241 @@ extern "C" {
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
+    // Diagnostics for the active CPU token graph. Plan bytes are allocator
+    // requests for token/KV/output-dependent roots; arena bytes are reusable
+    // backing capacity and may be larger. Returns false when unavailable.
+    struct llama_ntok_plan_stats {
+        uint64_t graph_builds;
+        uint64_t planned_bytes;
+        uint64_t active_bytes;
+        uint64_t arena_bytes;
+        uint64_t token_input_bytes;
+        uint64_t kv_mask_bytes;
+        uint64_t output_ids_bytes;
+        uint64_t checked_tensors;
+        uint64_t mismatched_tensors;
+        uint32_t active_tokens;
+        uint32_t active_kv;
+        uint32_t active_outputs;
+    };
+    LLAMA_API bool llama_get_ntok_plan_stats(const struct llama_context * ctx, struct llama_ntok_plan_stats * stats);
+
+    // LLAMA_UNION_KERNEL_SEL_LEN_INDEP: the CPU kernel-selection decoupling the
+    // exact n_kv lane depends on. It is defined here, in the only llama header
+    // a consumer includes, because the gate that reads it
+    // (tests/test-union-binder-stock-equiv.cpp) includes llama.h and no
+    // internal header; a definition in src/ could not turn that gate green,
+    // and that is the property the probe wants.
+    //
+    // What it asserts: on the non-flash CPU path a narrowed graph and a graph
+    // built at the same width run the same kernels with the same accumulation
+    // tree, because the binder patches the live graph's shapes in place and
+    // marks nothing. No REDUCE_PAD_TAIL, no MASKED_TAIL_GEMM and no
+    // op_params[2]/[4] write is left on the lane, so the only selection
+    // predicates that read ne00/ne01/ne11 read exactly n in both arms. Landed
+    // as c78df85 (the llamafile gate visible in both conditional regions),
+    // ce9ea33 (the reduction-order emulation cut from the n_kv lane) and
+    // 209ed25 (the in-place-narrowing test, with falsifiers that can fail).
+    //
+    // What it does NOT assert: flash attention. cparams.flash_attn is excluded
+    // from the token lane and the n_kv lane no longer marks FA at all, so a
+    // CPU FA graph keeps its length-dependent dispatch; that is outside this
+    // lane's contract and src/llama-union-binder.h states it there. Quantized
+    // K/V, GPU/HIP and end-to-end logits are outside the contract too.
+    //
+    // The evidence is not this macro. It is the selection-site table in
+    // ANALYSIS-EQUALITY.md section C (every predicate on the non-FA CPU path
+    // is a type, precision, flag-constant or output-shape test, except the
+    // three that read ne00/ne01/ne11, which the patch sets to exactly n in
+    // both arms) and the KERNEL_SEL_END ok=1 line the gate requires. The macro
+    // says only that the mechanism is present; it must be removed the day the
+    // mechanism is not.
+#define LLAMA_UNION_KERNEL_SEL_LEN_INDEP 1
+
+    // Pillar 1: n_kv, n_outputs and rs_z as runtime parameters of one graph.
+    //
+    // `runtime_n_kv` is the width the live graph must execute at, as a VALUE:
+    // the same value written into the graph's runtime n_kv input before each
+    // compute. It is 0 when no width is armed, and it is armed only within
+    // the width the live arena actually holds. `build_n_kv` is the width the
+    // graph was constructed at: the allocation envelope on the legacy lanes,
+    // the exact live width on the token lane (whose arena is widened by a
+    // replan as the width moves, so the envelope is not yet allocated).
+    // `bound_n_kv` is the width the last applied bind set.
+    //
+    // `build_n_outputs` is the out_ids row count the graph was built at
+    // (the output high-water envelope), `bound_n_outputs` the width the
+    // gather closure executes at, and `runtime_n_outputs` the active output
+    // count of the last ubatch. A build that did not move between two steps
+    // is the proof that the graph was not rebuilt.
+    //
+    // `bound_n_rs`, `bound_rs_head` and `bound_rs_z` are the recurrent state
+    // length, head and zero row the live graph is bound at. n_rs and head are
+    // shape bindings; rs_z is a runtime index consumed by the host zero-row
+    // op (-1: no zero row, -2: this graph has no recurrent state).
+    //
+    // `topology_hash` hashes the live graph's node set, edges, op types and
+    // non-runtime op parameters, with the n_kv, n_outputs and rs_z dimensions
+    // excluded (see src/llama-union-topology.h). Two combinations that report
+    // the same hash ran the same topology. `topology_hashed` is false when the
+    // graph could not be hashed; the hash is then 0 and must not be compared.
+    // This is the same value llama_get_union_diagnostics() reports as
+    // `topology_hash`, and it is NOT the binder's reuse key
+    // (src/llama-topology-hash.h), which is internal.
+    //
+    // `mask_n_kv`, `mask_filled` and `mask_refused` observe the last KQ-mask
+    // fill: the width the fill consumed (read back from the graph's runtime
+    // n_kv input, not taken from the width the caller asked for), how many
+    // registered masks were filled at that width, and how many fills refused.
+    // A step whose mask is stale cannot report mask_filled > 0 together with
+    // mask_refused == 0.
+    //
+    // `mask_row_checked`, `mask_row_ok`, `mask_row_refused` and `mask_rows_all`
+    // are the read-back that makes the three above falsifiable. After the fill,
+    // the rows it wrote are compared, column by column below the same width,
+    // with the visibility the KV cache's own cells imply (visible exactly when
+    // the cell carries the token's sequence and no causal/SWA rule drops it).
+    // The fill compares every row of the batch when the batch is at most 8
+    // tokens and the last row otherwise; `mask_rows_all` says which happened.
+    // The counters are rows, not masks: `mask_row_checked` rows compared,
+    // `mask_row_ok` rows that agreed, `mask_row_refused` rows the check
+    // declined to model. The per-field comment below states each one.
+    //
+    // The public test surface (`llama_union_mask_row_check`) re-runs the same
+    // check on ONE row, the last batch token's, and returns a single verdict.
+    // It is the test surface, not the fill's sweep.
+    //
+    // `graph_builds` is the context's monotonic model.build_graph() count at
+    // the time of the call (the value llama_graph_build_count() returns). A
+    // test compares it between two steps: an unchanged value across a run is
+    // proof that the graph was never rebuilt.
+    //
+    // Returns false when the union binder is off or no graph is recorded.
+    struct llama_nkv_runtime_stats {
+        uint64_t topology_hash;
+        uint32_t build_n_kv;
+        uint32_t runtime_n_kv;
+        uint32_t bound_n_kv;
+        uint32_t build_n_outputs;
+        uint32_t bound_n_outputs;
+        uint32_t runtime_n_outputs;
+        uint32_t bound_n_rs;
+        uint32_t bound_rs_head;
+        int32_t  bound_rs_z;
+        bool     topology_hashed;
+        bool     has_nkv_dims;
+        bool     has_nout_dims;
+        bool     has_nrs_dims;
+        // appended after the original fields: the mask observation, the
+        // build counter and the token-width observation. Appended, not
+        // inserted, so every existing initializer keeps its order.
+        uint32_t mask_n_kv;
+        uint32_t mask_filled;
+        uint32_t mask_refused;
+        // The read-back of the fill against the KV cells: `mask_row_checked`
+        // counts the ROWS compared with the cell table and `mask_row_ok` the
+        // rows that agreed at every column below the width. This is the
+        // independent observation: `mask_n_kv` is the width the fill was
+        // told, `mask_row_ok` is the mask the graph will execute agreeing
+        // with the cells it will attend. A stale mask is checked > 0 with
+        // ok < checked; a graph with no F32 mask checked nothing.
+        //
+        // `mask_row_refused` counts rows the check declined to model (a
+        // layout it cannot derive). It is separate from a disagreement on
+        // purpose: a layout change that makes every check refuse must not
+        // look like a wrong mask.
+        //
+        // `mask_rows_all` is 1 when EVERY row of the batch was compared and 0
+        // when only the last row was (the batch was wider than the row cap).
+        uint32_t mask_row_checked;
+        uint32_t mask_row_ok;
+        uint32_t mask_row_refused;
+        uint32_t mask_rows_all;
+        uint64_t graph_builds;
+        // the token lane: the token width the live graph was built at, the
+        // width it is bound at, and whether the token dimensions are recorded
+        // as runtime dimensions (token_map_valid). build_n_tokens == 0 means
+        // the token lane is not recorded for this graph.
+        uint32_t build_n_tokens;
+        uint32_t bound_n_tokens;
+        bool     has_ntok_dims;
+        // Appended again: the CPU attention work the last graph actually did,
+        // measured inside the kernels from the loop bounds they executed.
+        // `attn_live_elems` counts the elements the measured reductions
+        // processed, `attn_pad_elems` the extent those same rows cover, and
+        // `attn_rows` the number of executed runtime-length reduction rows.
+        // They are monotonic for the context's lifetime, so a caller takes
+        // deltas.
+        //
+        // The identity a test checks is attn_rows * (runtime n_kv) ==
+        // attn_live_elems: it fails if the two counters drift. Rows come from
+        // the ordered attention softmax and from a TRUE_LEN_REDUCE mul_mat.
+        // On the ordered n_kv lane the bind narrows the mask and the K/V
+        // views, so the executed length IS the extent and live == pad; a
+        // TRUE_LEN_REDUCE node shaped at a padded extent reports live < pad.
+        // A generic (unflagged) softmax still adds its elements to live and
+        // pad but no rows.
+        //
+        // All three stay 0 when the context ran no CPU attention (GPU-only
+        // placement, or no graph yet).
+        uint64_t attn_live_elems;
+        uint64_t attn_pad_elems;
+        uint64_t attn_rows;
+        // FIX-A: existing binder counter, appended for the zero-output arm.
+        // c_fallbacks is already exposed as llama_union_diagnostics::lane_declines.
+        uint64_t refused_nout;
+    };
+    LLAMA_API bool llama_get_nkv_runtime_stats(const struct llama_context * ctx, struct llama_nkv_runtime_stats * stats);
+
+    // The verdict of a gate check. One encoding, used by the API, the logs and
+    // the shell gates.
+    //
+    //   LLAMA_GATE_FAIL      the check ran and the observation did not hold.
+    //   LLAMA_GATE_PASS      the check ran and the observation held.
+    //   LLAMA_GATE_UNPROVEN  the check did not run, or refused to model its
+    //                        input. Nothing was compared.
+    //
+    // A refusal is UNPROVEN, never PASS. A disagreement is FAIL.
+    //
+    // Do NOT test a verdict for truthiness: `v != 0` is true for UNPROVEN.
+    // Compare against the named value.
+    enum llama_gate_verdict {
+        LLAMA_GATE_FAIL     = 0,
+        LLAMA_GATE_PASS     = 1,
+        LLAMA_GATE_UNPROVEN = 2,
+    };
+
+    // The read-back's test surface, for the same lane as the stats above.
+    //
+    // `llama_union_kq_mask_row` returns true when it set `*data` to row `row`
+    // of the KQ mask the live graph's runtime n_kv input filled (row-major
+    // over the mask's own ne[0] stride: the fill writes the first `width`
+    // columns and pads the rest), and set `*ne0` to the mask's own
+    // ne[0]. It returns false, and leaves `*data` null and `*ne0` zero, when
+    // the graph has no such mask, the mask is not F32, or `row` is outside it.
+    // The pointer is the live host buffer: it is valid only until the next
+    // decode, and only a test that drives the read-back's failure arm may
+    // write through it.
+    //
+    // `llama_union_mask_row_check` re-runs the read-back on the LAST row of
+    // the last batch (token n_tokens - 1; one row, because that row covers the
+    // whole step and because multi-row coverage is the fill's job, reported
+    // through the stats above). Every column below the fill width must be
+    // exactly 0.0f or -INFINITY and must agree with the visibility the KV
+    // cache's cells imply. It returns LLAMA_GATE_PASS when the row agrees,
+    // LLAMA_GATE_FAIL when a column disagrees, and LLAMA_GATE_UNPROVEN when
+    // there is nothing to check or the layout cannot be modelled.
+    //
+    // The answer depends on live state, all of it invalidated by the next
+    // decode: the mask row pointer the fill wrote (`llama_union_kq_mask_row`),
+    // the batch the inputs were last filled from, and the context's own KV
+    // cache, from which the cell table and the SWA rule are read. It is the
+    // same code path the fill runs (`llama_kv_cache::check_mask_row`); it
+    // exists so a test can prove the check can fail, not as a second
+    // implementation.
+    LLAMA_API bool llama_union_kq_mask_row  (const struct llama_context * ctx, uint32_t row, float ** data, int64_t * ne0);
+    LLAMA_API enum llama_gate_verdict llama_union_mask_row_check(const struct llama_context * ctx);
+
     // Reports the requested projection policy, not model-wide qualification
     // or proof that every backend kernel honored it. NULL returns false.
     LLAMA_API bool llama_get_batch_invariant_matmul(const struct llama_context * ctx);
@@ -1793,6 +2028,97 @@ extern "C" {
     };
 
     LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
+    // Monotonic count of model graph build calls, including reserve and fallback builds.
+    LLAMA_API uint64_t llama_graph_build_count(const struct llama_context * ctx);
+    // Diagnostics for the experimental single-stream CPU graph. Lane declines
+    // count per-kind dispatch misses; rebuild_fallbacks count failed reuse or
+    // envelope attempts that require a stock/replacement graph.
+    //
+    // bound_n_kv is the n_kv width the live graph is currently bound at, i.e.
+    // the width the next compute executes at: the true used span on the exact
+    // lane, the stock padded width when the lane is not armed. 0 before the
+    // first bind.
+    //
+    // pad_fallbacks counts the times the exact lane was armed and its width
+    // query refused, so the graph had to execute at the stock padded width
+    // instead of the width the binder chose. It is 0 on a run that stayed on
+    // the exact lane. Since the pad bucket and its forced-fallback hook were
+    // deleted (the padded lane is no longer a terminal state), the counter can
+    // only move on a layout refusal, and the exact lane treats that refusal as
+    // a hard failure; the field stays exported so a caller can see it is 0.
+    //
+    // exact_lane reports the GGML_TP5_UNION_BINDER_EXACT selection: 1 when the
+    // runtime-length lane is active (the default under the binder gate), 0
+    // when the stock padded control lane is selected. It is a configuration
+    // value, not an observation of what a step executed at.
+    //
+    // topology_hash is the width-table hash of the live graph
+    // (src/llama-union-topology.h): node set, edges, op types, every op
+    // parameter and every shape dimension EXCEPT the ones that carry the
+    // runtime parameters (n_kv, n_outputs, rs_z and, on the token lane,
+    // n_tokens). It is re-taken after every applied bind, so an unchanged
+    // value across a parameter sweep is evidence that the bind changed shapes
+    // only. 0 means no graph is hashed.
+    //
+    // It is NOT the binder's reuse key (src/llama-topology-hash.h,
+    // llama_topology_key). That key is invariant to the runtime parameters by
+    // construction and is internal; exporting it here would report a number
+    // that cannot move when the parameter does. This field is the pillar's
+    // public observable and reports the same value as
+    // llama_get_nkv_runtime_stats().topology_hash. It is a diagnostic
+    // identity, not a security boundary.
+    struct llama_union_diagnostics {
+        uint64_t lane_declines;
+        uint64_t rebuild_fallbacks;
+        uint64_t patch_binds;
+        uint64_t pad_fallbacks;
+        uint32_t bound_tokens;
+        uint32_t bound_n_kv;
+        bool enabled;
+        bool envelope_disabled;
+        bool record_valid;
+        bool token_map_valid;
+        uint64_t topology_hash;
+        int  exact_lane;
+        // rs_z runtime parameter (GGML_TP5_RSZ_RUNTIME_PARAM): the gate as
+        // read, whether the live graph carries the selection row, the named
+        // fallback counters (a refusal is never silent), and the rs_z the
+        // live graph is bound at.
+        //
+        // Every refusal of the lane increments exactly one named counter AND
+        // rsz_rt_fallbacks, so
+        //   rsz_rt_fallbacks == refused_gate + refused_arch + refused_no_rs_z
+        //                      + refused_cell + refused_envelope
+        //                      + refused_shape + refused_n_rs_seq
+        //                      + refused_ring + refused_mixed_depth
+        // holds for any context. A counter that moves is the reason the lane
+        // is not active; nothing falls back silently.
+        bool     rsz_rt_enabled;        // GGML_TP5_RSZ_RUNTIME_PARAM was exactly "1"
+        bool     rsz_rt_active;         // the live graph carries the selection row
+        uint64_t rsz_rt_fallbacks;      // total refusals of the lane
+        uint64_t rsz_rt_refused_gate;   // umbrella path off or cannot carry the lane
+        uint64_t rsz_rt_refused_arch;   // the graph has no recurrent-state input
+        uint64_t rsz_rt_refused_no_rs_z;// the build carried no zero-row index
+        uint64_t rsz_rt_refused_cell;   // rs_z < 0: no free zero-state cell
+        uint64_t rsz_rt_refused_envelope;// rs_z outside the cell capacity
+        uint64_t rsz_rt_refused_shape;  // index tensor absent or not I32 [1]
+        uint64_t rsz_rt_refused_n_rs_seq;// n_rs_seq > 0 on the non-relay lane
+        uint64_t rsz_rt_refused_ring;   // state rows are not a whole number of groups
+        uint64_t rsz_rt_refused_mixed_depth; // the ubatch's sequences disagree on the zero row
+        int32_t  rsz_rt_bound_rs_z;     // rs_z the live graph is bound at (-1: none)
+        // The cell capacity (mem->size), i.e. the per-group height of the state
+        // tensor. Named "zero_view_rows" for the field's original meaning; the
+        // zero view no longer exists, so read it as mem_size.
+        uint32_t rsz_rt_zero_view_rows;
+    };
+    LLAMA_API bool llama_get_union_diagnostics(const struct llama_context * ctx, struct llama_union_diagnostics * out);
+
+    // Copy a final normalized activation row after a successful single-
+    // microbatch dense LLAMA decode with all rows in batch order. Read before
+    // any other graph or memory operation on this context; output accessors
+    // and synchronization are safe. No eval callback or embeddings mode is
+    // enabled. Returns false for unsupported layouts or a wrong size.
+    LLAMA_API bool llama_copy_last_llama_activation(struct llama_context * ctx, int32_t row, float * dst, size_t count);
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
 

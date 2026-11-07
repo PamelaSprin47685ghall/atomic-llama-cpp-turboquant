@@ -108,10 +108,10 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
     cur                      = ggml_view_1d(ctx0, wkv_output, n_embd * n_tokens, 0);
     wkv_state = ggml_view_1d(ctx0, wkv_output, n_embd * head_size * n_seqs, n_embd * n_tokens * sizeof(float));
 
-    ggml_build_forward_expand(
-        gf, ggml_cpy(ctx0, wkv_state,
-                     ggml_view_1d(ctx0, mctx_cur->get_s_l(il), hparams.n_embd_s() * n_seqs,
-                                  hparams.n_embd_s() * kv_head * ggml_element_size(mctx_cur->get_s_l(il)))));
+    ggml_tensor * state_dst = ggml_view_1d(ctx0, mctx_cur->get_s_l(il), hparams.n_embd_s() * n_seqs,
+                                          hparams.n_embd_s() * kv_head * ggml_element_size(mctx_cur->get_s_l(il)));
+    ggml_set_name(state_dst, "union_rs_head_view");
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, wkv_state, state_dst));
 
     if (layer.time_mix_ln && layer.time_mix_ln_b) {
         // group norm with head_count groups

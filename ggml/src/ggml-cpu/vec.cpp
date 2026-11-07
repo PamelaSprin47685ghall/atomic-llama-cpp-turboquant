@@ -1,6 +1,7 @@
 #include "vec.h"
 
 #include <cassert>
+#include <cstring>
 
 // precomputed gelu table for f16 (128 KB)
 ggml_fp16_t ggml_table_gelu_f16[1 << 16];
@@ -134,6 +135,102 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
 #endif
 
     *s = sumf;
+}
+
+// Match the native dot order at a padded width without reading the tail.
+// The omitted weights and values are zero; only the last SIMD block needs a
+// temporary copy. Full zero blocks do not change finite accumulators.
+void ggml_vec_dot_f32_padded(int n, int padded, float * s, const float * x, const float * y) {
+    GGML_ASSERT(n >= 0 && padded >= n);
+    if (n == padded) {
+        ggml_vec_dot_f32(n, s, 0, x, 0, y, 0, 1);
+        return;
+    }
+#if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
+    const int epr = ggml_cpu_get_sve_cnt() * 8 / 32;
+    const int step = 8 * epr;
+    const int ref_np = padded & ~(step - 1);
+    const int ref_np2 = padded & ~(epr - 1);
+    svfloat32_t s1 = svdup_n_f32(0.0f), s2 = svdup_n_f32(0.0f);
+    svfloat32_t s3 = svdup_n_f32(0.0f), s4 = svdup_n_f32(0.0f);
+    svfloat32_t s5 = svdup_n_f32(0.0f), s6 = svdup_n_f32(0.0f);
+    svfloat32_t s7 = svdup_n_f32(0.0f), s8 = svdup_n_f32(0.0f);
+#define GGML_SVE_PAD_DOT(acc, pos) do { \
+        const int idx = (pos); \
+        if (idx < n) { \
+            const svbool_t pg = svwhilelt_b32(idx, n); \
+            const svfloat32_t ax = svld1_f32(pg, x + idx); \
+            const svfloat32_t ay = svld1_f32(pg, y + idx); \
+            acc = svsel_f32(pg, GGML_F32_VEC_FMA(acc, ax, ay), acc); \
+        } \
+    } while (0)
+    for (int i = 0; i < ref_np && i < n; i += step) {
+        GGML_SVE_PAD_DOT(s1, i);           GGML_SVE_PAD_DOT(s2, i + epr);
+        GGML_SVE_PAD_DOT(s3, i + 2*epr);   GGML_SVE_PAD_DOT(s4, i + 3*epr);
+        GGML_SVE_PAD_DOT(s5, i + 4*epr);   GGML_SVE_PAD_DOT(s6, i + 5*epr);
+        GGML_SVE_PAD_DOT(s7, i + 6*epr);   GGML_SVE_PAD_DOT(s8, i + 7*epr);
+    }
+    for (int i = ref_np; i < ref_np2 && i < n; i += epr) {
+        GGML_SVE_PAD_DOT(s1, i);
+    }
+#undef GGML_SVE_PAD_DOT
+    if (ref_np2 < padded && ref_np2 < n) {
+        const svbool_t pg = svwhilelt_b32(ref_np2, n);
+        const svfloat32_t ax = svld1_f32(pg, x + ref_np2);
+        const svfloat32_t ay = svld1_f32(pg, y + ref_np2);
+        s1 = svmla_f32_m(pg, s1, ax, ay);
+    }
+    float sumf = 0.0f;
+    GGML_F32_VEC_REDUCE(sumf, s1, s2, s3, s4, s5, s6, s7, s8);
+    *s = sumf;
+#elif defined(GGML_SIMD) && defined(__riscv_v_intrinsic)
+    int vl = __riscv_vsetvlmax_e32m8();
+    vfloat32m1_t vs = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    vfloat32m8_t sum, ax, ay;
+    sum = __riscv_vfmv_v_f_f32m8_tu(sum, 0.0f, vl);
+    for (int i = 0; i < n;) {
+        const int ref_vl = __riscv_vsetvl_e32m8(padded - i);
+        vl = __riscv_vsetvl_e32m8(MIN(ref_vl, n - i));
+        ax = __riscv_vle32_v_f32m8_tu(ax, x + i, vl);
+        ay = __riscv_vle32_v_f32m8_tu(ay, y + i, vl);
+        sum = __riscv_vfmacc_vv_f32m8_tu(sum, ax, ay, vl);
+        i += ref_vl;
+    }
+    vl = __riscv_vsetvlmax_e32m8();
+    vs = __riscv_vfredusum_vs_f32m8_f32m1(sum, vs, vl);
+    *s = __riscv_vfmv_f_s_f32m1_f32(vs);
+#elif defined(GGML_SIMD)
+    const int ref_np = padded & ~(GGML_F32_STEP - 1);
+    int np = MIN(ref_np, n & ~(GGML_F32_STEP - 1));
+    GGML_F32_VEC sum[GGML_F32_ARR] = { GGML_F32_VEC_ZERO };
+    for (int i = 0; i < np; i += GGML_F32_STEP) {
+        for (int j = 0; j < GGML_F32_ARR; ++j) {
+            const GGML_F32_VEC ax = GGML_F32_VEC_LOAD(x + i + j * GGML_F32_EPR);
+            const GGML_F32_VEC ay = GGML_F32_VEC_LOAD(y + i + j * GGML_F32_EPR);
+            sum[j] = GGML_F32_VEC_FMA(sum[j], ax, ay);
+        }
+    }
+    if (ref_np > n && np < n) {
+        float tx[GGML_F32_STEP] = {};
+        float ty[GGML_F32_STEP] = {};
+        std::memcpy(tx, x + np, (size_t) (n - np) * sizeof(float));
+        std::memcpy(ty, y + np, (size_t) (n - np) * sizeof(float));
+        for (int j = 0; j < GGML_F32_ARR; ++j) {
+            const GGML_F32_VEC ax = GGML_F32_VEC_LOAD(tx + j * GGML_F32_EPR);
+            const GGML_F32_VEC ay = GGML_F32_VEC_LOAD(ty + j * GGML_F32_EPR);
+            sum[j] = GGML_F32_VEC_FMA(sum[j], ax, ay);
+        }
+        np = n;
+    }
+    float sumf = 0.0f;
+    GGML_F32_VEC_REDUCE(sumf, sum);
+    for (int i = np; i < n; ++i) {
+        sumf += x[i] * y[i];
+    }
+    *s = sumf;
+#else
+    ggml_vec_dot_f32(n, s, 0, x, 0, y, 0, 1);
+#endif
 }
 
 void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc) {
@@ -377,6 +474,48 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
     *s = sumf;
 }
 
+void ggml_vec_dot_f16_padded(int n, int padded, float * s, const ggml_fp16_t * x, const ggml_fp16_t * y) {
+    GGML_ASSERT(n >= 0 && padded >= n);
+    if (n == padded) {
+        ggml_vec_dot_f16(n, s, 0, const_cast<ggml_fp16_t *>(x), 0, const_cast<ggml_fp16_t *>(y), 0, 1);
+        return;
+    }
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+    const int ref_np = padded & ~(GGML_F16_STEP - 1);
+    int np = MIN(ref_np, n & ~(GGML_F16_STEP - 1));
+    GGML_F16_VEC sum[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
+    for (int i = 0; i < np; i += GGML_F16_STEP) {
+        for (int j = 0; j < GGML_F16_ARR; ++j) {
+            const GGML_F16_VEC ax = GGML_F16_VEC_LOAD(x + i + j*GGML_F16_EPR, j);
+            const GGML_F16_VEC ay = GGML_F16_VEC_LOAD(y + i + j*GGML_F16_EPR, j);
+            sum[j] = GGML_F16_VEC_FMA(sum[j], ax, ay);
+        }
+    }
+    if (ref_np > n && np < n) {
+        ggml_fp16_t tx[GGML_F16_STEP] = {};
+        ggml_fp16_t ty[GGML_F16_STEP] = {};
+        std::memcpy(tx, x + np, size_t(n - np)*sizeof(*x));
+        std::memcpy(ty, y + np, size_t(n - np)*sizeof(*y));
+        for (int j = 0; j < GGML_F16_ARR; ++j) {
+            const GGML_F16_VEC ax = GGML_F16_VEC_LOAD(tx + j*GGML_F16_EPR, j);
+            const GGML_F16_VEC ay = GGML_F16_VEC_LOAD(ty + j*GGML_F16_EPR, j);
+            sum[j] = GGML_F16_VEC_FMA(sum[j], ax, ay);
+        }
+        np = n;
+    }
+    ggml_float sumf = 0.0;
+    GGML_F16_VEC_REDUCE(sumf, sum);
+    for (int i = np; i < n; ++i) {
+        sumf += (ggml_float) (GGML_CPU_FP16_TO_FP32(x[i])*GGML_CPU_FP16_TO_FP32(y[i]));
+    }
+    *s = sumf;
+#elif !defined(GGML_SIMD)
+    ggml_vec_dot_f16(n, s, 0, const_cast<ggml_fp16_t *>(x), 0, const_cast<ggml_fp16_t *>(y), 0, 1);
+#else
+    GGML_ABORT("padded F16 dot is not supported on this CPU");
+#endif
+}
+
 void ggml_vec_silu_f32(const int n, float * y, const float * x) {
     int i = 0;
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
@@ -597,6 +736,80 @@ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float 
         y[i] = val;
     }
     return sum;
+}
+
+// Preserve the padded SIMD exp and sum order for the live lanes. The final
+// vector is copied to a small -inf-filled buffer, never read past x or y.
+ggml_float ggml_vec_soft_max_f32_padded(int n, int padded, float * y, const float * x, float max) {
+    GGML_ASSERT(n >= 0 && padded >= n);
+    if (n == padded) {
+        return ggml_vec_soft_max_f32(n, y, x, max);
+    }
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    constexpr int lanes = 16;
+#elif defined(__AVX2__) && defined(__FMA__)
+    constexpr int lanes = 8;
+#elif defined(__SSE2__) || (defined(__ARM_NEON) && defined(__aarch64__) && !defined(__ARM_FEATURE_SVE))
+    constexpr int lanes = 4;
+#elif defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+    // SVE has at most 64 F32 lanes. Preserve the reference predicate on the
+    // last vector and use -inf only for its missing live inputs.
+    const int lanes = svcntw();
+    GGML_ASSERT(lanes <= 64);
+    const int np = n - n % lanes;
+    ggml_float sum = ggml_vec_soft_max_f32(np, y, x, max);
+    if (np < n) {
+        float tx[64], ty[64];
+        const int width = MIN(lanes, padded - np);
+        std::memcpy(tx, x + np, (size_t) (n - np) * sizeof(float));
+        for (int i = n - np; i < width; ++i) tx[i] = -INFINITY;
+        sum += ggml_vec_soft_max_f32(width, ty, tx, max);
+        std::memcpy(y + np, ty, (size_t) (n - np) * sizeof(float));
+    }
+    return sum;
+#elif defined(__riscv_v_intrinsic)
+    // RVV VLEN is at most 65536 bits; an m2 F32 vector has at most 4096 lanes.
+    float tx[4096];
+    GGML_ASSERT(__riscv_vsetvlmax_e32m2() <= 4096);
+    vfloat64m1_t sum = __riscv_vfmv_v_f_f64m1(0, 1);
+    for (int i = 0; i < n;) {
+        const int vl = __riscv_vsetvl_e32m2(padded - i);
+        const int live = MIN(vl, n - i);
+        const float * src = x + i;
+        if (live < vl) {
+            std::memcpy(tx, src, (size_t) live * sizeof(float));
+            for (int j = live; j < vl; ++j) tx[j] = -INFINITY;
+            src = tx;
+        }
+        const vfloat32m2_t val = ggml_v_expf_m2(
+            __riscv_vfsub_vf_f32m2(__riscv_vle32_v_f32m2(src, vl), max, vl), vl);
+        __riscv_vse32_v_f32m2(y + i, val, live);
+        sum = __riscv_vfwredusum_vs_f32m2_f64m1(val, sum, vl);
+        i += vl;
+    }
+    return (ggml_float) __riscv_vfmv_f_s_f64m1_f64(sum);
+#else
+    return ggml_vec_soft_max_f32(n, y, x, max);
+#endif
+#if (defined(__AVX512F__) && defined(__AVX512DQ__)) || (defined(__AVX2__) && defined(__FMA__)) || defined(__SSE2__) || (defined(__ARM_NEON) && defined(__aarch64__) && !defined(__ARM_FEATURE_SVE))
+    const int ref_np = padded - padded % lanes;
+    int np = MIN(ref_np, n - n % lanes);
+    ggml_float sum = ggml_vec_soft_max_f32(np, y, x, max);
+    if (ref_np > n && np < n) {
+        float tx[lanes], ty[lanes];
+        std::memcpy(tx, x + np, (size_t) (n - np) * sizeof(float));
+        for (int i = n - np; i < lanes; ++i) tx[i] = -INFINITY;
+        sum += ggml_vec_soft_max_f32(lanes, ty, tx, max);
+        std::memcpy(y + np, ty, (size_t) (n - np) * sizeof(float));
+        np = n;
+    }
+    for (int i = np; i < n; ++i) {
+        const float val = expf(x[i] - max);
+        sum += (ggml_float) val;
+        y[i] = val;
+    }
+    return sum;
+#endif
 }
 
 ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, float max) {

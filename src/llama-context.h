@@ -8,12 +8,15 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-prefab.h"
+#include "llama-union-binder.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <map>
+#include <memory>
 #include <vector>
+struct llama_nkv_ctx_state;
 
 struct llama_model;
 class llama_batch_allocr;
@@ -82,6 +85,8 @@ struct llama_context {
 
     bool release_compute();
     uint64_t compute_bytes() const;
+    bool ntok_plan_stats(llama_ntok_plan_stats * stats) const;
+    bool nkv_runtime_stats(llama_nkv_runtime_stats * stats) const;
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -235,6 +240,9 @@ struct llama_context {
     //
 
     llama_perf_context_data perf_get_data() const;
+    uint64_t graph_build_count() const { return n_graph_builds; }
+    bool union_diagnostics(llama_union_diagnostics * out) const;
+    bool copy_last_llama_activation(int32_t row, float * dst, size_t count);
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
@@ -294,6 +302,19 @@ public:
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
+    // the context's long-lived inference graph result (accessor used by the
+    // union-binder state in llama-nout-state.cpp; a member-function
+    // declaration that adds no data member of its own - note that
+    // llama_context itself does gain one opaque state member below, by
+    // design)
+    llm_graph_result * get_gf_res_prev() const { return gf_res_prev.get(); }
+
+    // The ubatch the live graph's inputs were last filled from, for the mask
+    // read-back's test surface. Empty until a graph has been filled. The copy
+    // shares the ubatch's own backing store (llama_ubatch::data), so it stays
+    // valid after the decode call returns.
+    const llama_ubatch & get_ubatch_inputs_last() const { return ubatch_inputs_last; }
+
     // returns the result of ggml_backend_sched_graph_compute_async execution
     // sched_override: run gf on a different scheduler (factor-prefab envelope slots own their own sched)
     ggml_status graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_override = nullptr);
@@ -317,6 +338,100 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    // union-graph runtime parameter binder (table-driven; see llama-union-binder.h).
+    //
+    // The n_kv and recurrent lanes build at their storage capacities; the
+    // output lane uses its observed high-water mark. The opt-in n_tokens lane
+    // builds at the active token/output/KV widths and replans the same graph
+    // for each changed layout. Replanning keeps the old arena alive until
+    // the new allocation succeeds. View bounds are checked before compute.
+    //
+    // The shape map is derived symbolically at record time: tagged roots use
+    // the formula from their construction site, consumers use the exact ggml
+    // op shape rules, and any unsupported op or ambiguous view fails the whole
+    // analysis closed (the context then runs stock). There is no finite-sample
+    // fitting. Supported graphs include dense Llama, recurrent models, and
+    // selected non-iSWA hybrid models without unsupported attention views.
+    // Relay, pipeline, unsupported operations and unsafe split copies fail closed.
+    // FA widths bound by the union binder pass the existing head-dimension
+    // guard only on CUDA or ROCm; this is not a GPU correctness proof.
+    //
+    // llama_union_binder dispatches over every registered kind: n_kv,
+    // n_outputs, rs_z and (on the token lane) n_tokens are table bindings.
+    // The exact lane binds the true used span from get_n_kv_exact(); the
+    // control lane (EXACT=0) binds the stock padded width. n_outputs binds the
+    // active per-request count (including 0) or a high-water envelope; rs_z
+    // binds the recurrent state view offset, and the recurrent length and head
+    // are shape bindings.
+    //
+    // GGML_TP5_UNION_BINDER: unset defaults on for qualified CPU contexts;
+    // "1" opts in, all other values disable it. EXACT=0 selects the stock
+    // padded control lane.
+    llama_union_tensor_set union_tensors_n_kv();
+    llama_union_tensor_set union_tensors_rs_z();
+    llama_union_tensor_set union_tensors_n_outputs();
+
+    // validate + apply the symbolic shape map at ALL THREE runtime targets
+    // (n_kv, n_outputs, n_rs/head) in one patch; returns true when res's graph
+    // was patched in place and can be reused
+    bool union_rebind_apply(llm_graph_result * res,
+                            const llm_graph_params & params,
+                            const llama_union_tensor_set & set,
+                            uint32_t new_nkv,
+                            uint32_t new_nout,
+                            uint32_t new_n_rs,
+                            uint32_t new_rs_head);
+
+    // Each of these is a GATE, not a lane: it validates the preconditions it
+    // owns and then calls union_rebind_apply with the same three targets, so
+    // one bind applies every delta of the step. The result says which of the
+    // three things happened, because the dispatch must tell "my parameter did
+    // not move" (declined: try the next kind) from "I ran and the bind was
+    // refused" (refused: stop, the caller rebuilds).
+    llama_union_rebind_result union_rebind_n_kv    (llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set);
+    llama_union_rebind_result union_rebind_n_tokens(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set);
+    llama_union_rebind_result union_rebind_rs_z    (llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set);
+
+    // Apply the existing FA width guard to the scheduler's placement. The
+    // CUDA/HIP-derived dimension list is not proof for other backends.
+    bool union_graph_gpu_fa_accepts_width(llm_graph_result * res, uint32_t n_kv) const;
+
+    // true when the scheduler runs the whole graph on the single CPU backend.
+    // Used as the first-build proof for the n_outputs envelope: the split
+    // count is only known after alloc_graph, while a single-backend CPU
+    // scheduler is patch-safe by construction.
+    bool union_sched_cpu_only() const;
+
+    // The first precondition is one live split, without relay or pipeline.
+    // Split input copies are allowed only when the scheduler validates their
+    // allocation envelopes and can update them as part of the bind.
+    bool union_sched_single_split() const;
+    // n_outputs gate: the active count of the current ubatch
+    llama_union_rebind_result union_rebind_n_outputs(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set);
+
+public:
+    // The constructor creates this state only when the binder gate is on.
+    llama_nkv_ctx_state & union_binder_state_get();
+
+    // read-only view of the state slot, or nullptr when the slot does not
+    // exist (i.e. the binder gate was off) - never creates it; used by
+    // OFF-reachable paths and by llama-nout-state.cpp to map a graph result
+    // back to its owning context
+    const llama_nkv_ctx_state * union_binder_state_peek() const;
+
+    // the live graph has a binder record (an envelope build succeeded); the
+    // exact target is only meaningful when the binder can actually patch
+    bool nkv_binder_record_valid() const;
+private:
+    // record the pre-allocation skeleton + byte envelopes of a freshly built (not
+    // yet sched-placed) graph into the context's union-binder state slot
+    void nkv_record_snapshot(ggml_cgraph * gf);
+
+    // drop the binder record after any path that destroys/reset the live graph
+    // (sched_reserve, graph_reserve, release_compute, memory update, nout
+    // fallback rebuild); a stale record would dereference freed tensors
+    void union_record_invalidate();
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -438,6 +553,8 @@ private:
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+    // Valid only for the last successful one-ubatch, ordered LLAMA decode.
+    bool last_llama_activation_valid = false;
 
     struct swap_info {
         uint32_t i0;
@@ -473,6 +590,16 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // opaque per-context state of the union-graph runtime binder
+    // (llama_nkv_ctx_state, defined in llama-nout-state.h; unique_ptr to an
+    // incomplete type - ~llama_nkv_ctx_state and the unique_ptr destruction
+    // are instantiated only in ~llama_context, which is out-of-line in
+    // llama-context.cpp where the type is complete). Exception-safe: if the
+    // constructor body throws after the slot was created, member destruction
+    // still runs and frees the slot; no leak. All access goes through
+    // llama_nkv_ctx_state_get() / llama_context::union_binder_state_peek().
+    std::unique_ptr<llama_nkv_ctx_state> union_binder_state;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
@@ -512,4 +639,18 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+    uint64_t n_graph_builds = 0; // actual model.build_graph calls, including reserve
+
+    // The ubatch the live graph's inputs were last filled from. The mask
+    // read-back (llama_union_mask_row_check) re-runs the same check the fill
+    // ran, and that check is a function of the batch: which token's row, which
+    // sequence, which position. Holding the batch is the alternative to
+    // duplicating the fill's row arithmetic in a second place, and it is one
+    // value assignment per ubatch on a path that already copies the batch into
+    // the graph parameters.
+    llama_ubatch ubatch_inputs_last = {};
+    // (No pointer to the per-decode memory context is stored. It is owned by
+    // the unique_ptr inside llama_context::decode and dies when decode
+    // returns; the read-back resolves the long-lived cache from `memory`
+    // instead. See llama_union_mask_row_check.)
 };

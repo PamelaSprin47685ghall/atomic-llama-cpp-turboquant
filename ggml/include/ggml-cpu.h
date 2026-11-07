@@ -22,6 +22,12 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // per-backend CPU context that owns the attention work counters, or
+        // NULL when the caller has none (ggml_graph_compute_with_ctx). The
+        // counters are MEASURED inside the kernels from the loop bounds they
+        // actually execute, never derived from an op parameter.
+        void * cpu_ctx;
     };
 
     // numa strategies
@@ -137,6 +143,26 @@ extern "C" {
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
+
+    // Measured CPU attention work for this backend, accumulated over every
+    // graph it computed. `live` counts the elements the measured reductions
+    // actually processed (the executed loop bound), `padded` the extent those
+    // same rows cover, and `rows` the number of executed runtime-length
+    // reduction rows. A caller that reads them twice gets deltas.
+    //
+    // The identity a test checks is rows * (runtime n_kv) == live_elems; it
+    // fails if the two counters drift. Rows come from the ordered
+    // attention softmax and from a TRUE_LEN_REDUCE mul_mat. On the ordered
+    // n_kv lane the bind narrows the mask and the K/V views, so the executed
+    // length is the extent and live == padded; a TRUE_LEN_REDUCE node shaped
+    // at a padded extent reports live < padded. A generic (unflagged) softmax
+    // adds elements to both totals but no rows.
+    //
+    // Any pointer may be NULL. A backend that is not CPU reports zero.
+    GGML_BACKEND_API void ggml_backend_cpu_attn_reduce_stats(ggml_backend_t backend_cpu,
+                                                             uint64_t * live,
+                                                             uint64_t * padded,
+                                                             uint64_t * rows);
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 

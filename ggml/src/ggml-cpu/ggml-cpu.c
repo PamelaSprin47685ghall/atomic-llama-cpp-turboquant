@@ -13,8 +13,10 @@
 #include "binary-ops.h"
 #include "vec.h"
 #include "ops.h"
+#include "attn-ordered.h"
 #include "ggml.h"
 #include "common.h"
+#include "ggml-cpu-attn-stats.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1241,6 +1243,78 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+// Attention masks are per query. A zero probability alone is not a mask.
+static void ggml_compute_forward_mul_mat_attn_mask(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * v = dst->src[0];
+    const struct ggml_tensor * p = dst->src[1];
+    const struct ggml_tensor * mask = dst->src[2];
+    const enum ggml_type type = v->type;
+    GGML_ASSERT(mask && (type == GGML_TYPE_F16 || type == GGML_TYPE_F32));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float));
+    GGML_ASSERT(p->type == GGML_TYPE_F32 && p->ne[0] == v->ne[0]);
+    GGML_ASSERT(mask->ne[0] >= p->ne[0] && mask->ne[1] >= p->ne[1]);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->nb[0] == ggml_type_size(type) && p->nb[0] == sizeof(float));
+    GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
+    GGML_ASSERT(p->ne[2] % v->ne[2] == 0 && p->ne[3] % v->ne[3] == 0);
+    GGML_ASSERT(p->ne[2] % mask->ne[2] == 0 && p->ne[3] % mask->ne[3] == 0);
+
+    const int64_t n = v->ne[0];
+    const int64_t total = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
+    const int64_t r2 = p->ne[2] / v->ne[2];
+    const int64_t r3 = p->ne[3] / v->ne[3];
+
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        int64_t t = index;
+        const int64_t row = t % dst->ne[0]; t /= dst->ne[0];
+        const int64_t q   = t % dst->ne[1]; t /= dst->ne[1];
+        const int64_t h   = t % dst->ne[2];
+        const int64_t b   = t / dst->ne[2];
+        const char * vr = (const char *) v->data + row*v->nb[1] + (h/r2)*v->nb[2] + (b/r3)*v->nb[3];
+        const float * pr = (const float *) ((const char *) p->data + q*p->nb[1] + h*p->nb[2] + b*p->nb[3]);
+        const char * mr = (const char *) mask->data + q*mask->nb[1] + (h % mask->ne[2])*mask->nb[2] + (b % mask->ne[3])*mask->nb[3];
+        float result;
+        ggml_cpu_attn_ordered_dot(n, type, vr, pr, mask->type, mr, &result);
+        *(float *) ((char *) dst->data + row*dst->nb[0] + q*dst->nb[1] + h*dst->nb[2] + b*dst->nb[3]) = result;
+    }
+}
+
+static void ggml_compute_forward_mul_mat_attn_scores(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * k = dst->src[0];
+    const struct ggml_tensor * q = dst->src[1];
+    const struct ggml_tensor * mask = dst->src[2];
+    GGML_ASSERT(mask && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32));
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == k->ne[0]);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->ne[0] == k->ne[1] && dst->ne[1] == q->ne[1] &&
+                dst->ne[2] == q->ne[2] && dst->ne[3] == q->ne[3]);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->ne[0] >= dst->ne[0] && mask->ne[1] >= dst->ne[1]);
+    GGML_ASSERT(k->nb[0] == ggml_type_size(k->type) && q->nb[0] == sizeof(float));
+    GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0 && q->ne[3] % k->ne[3] == 0);
+    GGML_ASSERT(q->ne[2] % mask->ne[2] == 0 && q->ne[3] % mask->ne[3] == 0);
+
+    const int64_t total = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
+    const int64_t r2 = q->ne[2] / k->ne[2];
+    const int64_t r3 = q->ne[3] / k->ne[3];
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        int64_t t = index;
+        const int64_t key = t % dst->ne[0]; t /= dst->ne[0];
+        const int64_t qi  = t % dst->ne[1]; t /= dst->ne[1];
+        const int64_t h   = t % dst->ne[2];
+        const int64_t b   = t / dst->ne[2];
+        const char * kr = (const char *) k->data + key*k->nb[1] + (h/r2)*k->nb[2] + (b/r3)*k->nb[3];
+        const float * qr = (const float *) ((const char *) q->data + qi*q->nb[1] + h*q->nb[2] + b*q->nb[3]);
+        const char * mr = (const char *) mask->data + qi*mask->nb[1] + (h % mask->ne[2])*mask->nb[2] + (b % mask->ne[3])*mask->nb[3];
+        float result;
+        ggml_cpu_attn_ordered_score(k->ne[0], k->type, kr, qr, mask->type, mr, key, &result);
+        *(float *) ((char *) dst->data + key*dst->nb[0] + qi*dst->nb[1] + h*dst->nb[2] + b*dst->nb[3]) = result;
+    }
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1260,6 +1334,33 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    const bool pad_tail = (dst->flags & GGML_TENSOR_FLAG_REDUCE_PAD_TAIL) != 0;
+    if (pad_tail) {
+        GGML_ASSERT((type == GGML_TYPE_F32 || type == GGML_TYPE_F16) && src1->type == GGML_TYPE_F32 && num_rows_per_vec_dot == 1);
+    }
+
+    // Runtime reduction length. TRUE_LEN_REDUCE says this node reduces over
+    // op_params[3] keys; the tensor's ne00 is the padded extent the graph is
+    // shaped at. `live_len` is what the dot actually reads, `pad_len` is the
+    // extent it covers, and the padded helpers keep the SIMD tail grouped at
+    // `pad_len` so the trimmed result stays deterministic in `live_len`.
+    const bool true_len = (dst->flags & GGML_TENSOR_FLAG_TRUE_LEN_REDUCE) != 0;
+    const int  live_len = true_len ? ggml_get_op_params_i32(dst, 3) : (int) ne00;
+    const int  pad_len  = true_len ? ggml_get_op_params_i32(dst, 4) : (int) ne00;
+    GGML_ASSERT(live_len >= 0 && live_len <= ne00);
+    GGML_ASSERT(pad_len  >= live_len && pad_len >= ne00);
+    if (true_len) {
+        // A paired vec_dot processes several rows at once and cannot take a
+        // per-row length; the trim is only defined for the single-row dot.
+        GGML_ASSERT(num_rows_per_vec_dot == 1);
+    }
+
+    // Measured work for this chunk. `live_len` is the length the dot is
+    // actually given below, so the counter cannot be satisfied by the op
+    // parameter alone.
+    uint64_t live_elems = 0;
+    uint64_t pad_elems  = 0;
+    uint64_t rows       = 0;
 
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
@@ -1320,7 +1421,28 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 //}
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    if (pad_tail && type == GGML_TYPE_F32) {
+                        ggml_vec_dot_f32_padded(live_len, pad_len, &tmp[ir0 - iir0],
+                                                (const float *) (src0_row + ir0 * nb01), (const float *) src1_col);
+                    } else if (pad_tail && type == GGML_TYPE_F16) {
+                        ggml_vec_dot_f16_padded(live_len, pad_len, &tmp[ir0 - iir0],
+                                                (const ggml_fp16_t *) (src0_row + ir0 * nb01), (const ggml_fp16_t *) src1_col);
+                    } else {
+                        vec_dot(live_len, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    }
+                    // Only a TRUE_LEN_REDUCE node is a runtime-length
+                    // attention reduction, so only its rows belong in
+                    // rows * runtime_n_kv == live_elems. An unflagged mul_mat
+                    // is some other product (a projection, the LM head) whose
+                    // reduction length is not the KV span; counting its
+                    // elements would make that identity false for the right
+                    // code. The ordered attention softmax is measured by its
+                    // own kernel, so nothing is double counted.
+                    if (true_len) {
+                        live_elems += (uint64_t) live_len;
+                        pad_elems  += (uint64_t) ne00;
+                        ++rows;
+                    }
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
@@ -1329,11 +1451,31 @@ static void ggml_compute_forward_mul_mat_one_chunk(
             }
         }
     }
+
+    // Flush when a flagged dot ran, including a row whose live length is 0:
+    // that row still contributes to pad_elems and rows, and `rows` is the
+    // exact "a flagged dot ran" predicate. Unflagged nodes contribute
+    // nothing.
+    if (params->cpu_ctx != NULL && (live_elems != 0 || rows != 0)) {
+        ggml_cpu_attn_stats_add((struct ggml_cpu_attn_stats *) params->cpu_ctx,
+                                live_elems, pad_elems, rows);
+    }
 }
 
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+    if (dst->flags & GGML_TENSOR_FLAG_ATTN_SCORES) {
+        GGML_ASSERT(!(dst->flags & GGML_TENSOR_FLAG_ATTN_MASK));
+        ggml_compute_forward_mul_mat_attn_scores(params, dst);
+        return;
+    }
+
+    if (dst->flags & GGML_TENSOR_FLAG_ATTN_MASK) {
+        ggml_compute_forward_mul_mat_attn_mask(params, dst);
+        return;
+    }
+
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1376,8 +1518,12 @@ void ggml_compute_forward_mul_mat(
     //   compute by src0 rows
 
     // TODO: extract to "extra_op"
-#if GGML_USE_LLAMAFILE
-    // broadcast factors
+    //
+    // These live OUTSIDE the GGML_USE_LLAMAFILE regions on purpose. There are
+    // two such regions in this function (the F32 attempt before the activation
+    // conversion, the F16 attempt after it) and both read the same gate; a
+    // declaration inside the first region is not in scope in the second, so
+    // keeping them here is what makes the file compile with llamafile enabled.
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
@@ -1387,9 +1533,59 @@ void ggml_compute_forward_mul_mat(
     // N=1 but can accept converted quantized N>=2
     // products with different arithmetic. Both SGEMM attempts use this gate;
     // default precision keeps the optimized paths.
-    const bool use_llamafile = precision != GGML_PREC_F32_PEDANTIC && !batch_invariant_quantized;
+    //
+    // REDUCE_PAD_TAIL means the reduction order is the padded width in
+    // op_params[2], not the tensor's ne00. No SGEMM satisfies that: the
+    // masked-tail GEMM keeps the tree at padded_k but its tile selection still
+    // reads ne00 (tinyBLAS::matmul, k % KN), and plain llamafile_sgemm
+    // accumulates over ne00 outright. Both attempts are therefore gated on the
+    // same flag, so a marked node always reaches ..._mul_mat_one_chunk and its
+    // ggml_vec_dot_*_padded kernels.
+    const bool can_llamafile = precision != GGML_PREC_F32_PEDANTIC && !batch_invariant_quantized;
+    const bool pad_tail      = (dst->flags & GGML_TENSOR_FLAG_REDUCE_PAD_TAIL) != 0;
+    const bool use_llamafile = can_llamafile && !pad_tail;
 
-    if (src1_cont && use_llamafile) {
+    // The masked-tail SGEMM exists to keep the padded reduction order while
+    // never reading the omitted K/V elements. Its `padded_k` argument is the
+    // dot length it iterates, so a TRUE_LEN_REDUCE node must hand it the
+    // LIVE length there and the padded extent as the tail bound; passing ne00
+    // would silently restore the full padded work. The arguments are
+    // (m, n, padded_k, live_k), so both call sites below pass
+    // (pad_len, live_len) in that order.
+    const bool true_len_sg = (dst->flags & GGML_TENSOR_FLAG_TRUE_LEN_REDUCE) != 0;
+    const int64_t sg_pad_len  = true_len_sg ? (int64_t) ggml_get_op_params_i32(dst, 4) : ne00;
+    const int64_t sg_live_len = true_len_sg ? (int64_t) ggml_get_op_params_i32(dst, 3) : ne00;
+
+#if !GGML_USE_LLAMAFILE
+    // Only the two conditional regions below read these.
+    GGML_UNUSED(r2);
+    GGML_UNUSED(r3);
+    GGML_UNUSED(src1_cont);
+    GGML_UNUSED(can_llamafile);
+    GGML_UNUSED(pad_tail);
+    GGML_UNUSED(use_llamafile);
+    GGML_UNUSED(true_len_sg);
+    GGML_UNUSED(sg_pad_len);
+    GGML_UNUSED(sg_live_len);
+#endif
+
+#if GGML_USE_LLAMAFILE
+    if (src1_cont && can_llamafile && !pad_tail && (dst->flags & GGML_TENSOR_FLAG_MASKED_TAIL_GEMM) && src0->type == GGML_TYPE_F32) {
+        for (int64_t i13 = 0; i13 < ne13; ++i13)
+            for (int64_t i12 = 0; i12 < ne12; ++i12)
+                if (!llamafile_sgemm_masked_tail(params, ne01, ne11, sg_pad_len, sg_live_len,
+                    (const char *) src0->data + i12/r2*nb02 + i13/r3*nb03, nb01/sizeof(float),
+                    (const char *) src1->data + i12*nb12 + i13*nb13, nb11/sizeof(float),
+                    (char *) dst->data + i12*nb2 + i13*nb3, nb1/sizeof(float), GGML_TYPE_F32))
+                    goto UseGgmlGemm1;
+        return;
+    }
+
+    // The plain SGEMM reduces over `k = ne00` and has no live-length form, so
+    // a TRUE_LEN_REDUCE node must not take it: it would compute the full
+    // padded reduction and silently undo the trim. Such a node falls through
+    // to the per-row dot below, which honours live_len.
+    if (src1_cont && use_llamafile && !true_len_sg) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1454,7 +1650,21 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type && use_llamafile) {
+    // Same gate as the F32 attempt above: a REDUCE_PAD_TAIL node must reach
+    // ggml_vec_dot_f16_padded, whose tree is op_params[2].
+    if (can_llamafile && !pad_tail && (dst->flags & GGML_TENSOR_FLAG_MASKED_TAIL_GEMM) && src0->type == GGML_TYPE_F16) {
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+        for (int64_t i13 = 0; i13 < ne13; ++i13)
+            for (int64_t i12 = 0; i12 < ne12; ++i12)
+                if (!llamafile_sgemm_masked_tail(params, ne01, ne11, sg_pad_len, sg_live_len,
+                    (const char *) src0->data + i12/r2*nb02 + i13/r3*nb03, nb01/sizeof(ggml_fp16_t),
+                    (const char *) params->wdata + (i12*ne11 + i13*ne12*ne11)*row_size, row_size/sizeof(ggml_fp16_t),
+                    (char *) dst->data + i12*nb2 + i13*nb3, nb1/sizeof(float), GGML_TYPE_F16))
+                    goto UseGgmlGemm2;
+        return;
+    }
+    // Same reason as the F32 arm above: the plain SGEMM has no live length.
+    if (src1->type != vec_dot_type && use_llamafile && !true_len_sg) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1478,7 +1688,36 @@ UseGgmlGemm2:;
 #endif
 
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
-    const int64_t nr0 = ne0;
+    //
+    // TRUE_LEN_REDUCE: the result's first dimension is the KV span, and only
+    // the runtime length is part of this computation. Rows [live, ne0) are
+    // not produced: the same dot values, just fewer of them. The chunk plan
+    // below is derived from nr0, so the bound has to be applied here, not in
+    // the chunk function.
+    const bool    true_len_nr0 = (dst->flags & GGML_TENSOR_FLAG_TRUE_LEN_REDUCE) != 0;
+    const int64_t nr0 = true_len_nr0 ? (int64_t) ggml_get_op_params_i32(dst, 3) : ne0;
+    GGML_ASSERT(nr0 >= 0 && nr0 <= ne0);
+    if (true_len_nr0) {
+        GGML_ASSERT(nr0 > 0 && "TRUE_LEN_REDUCE with a zero reduction length");
+        // The rows past the runtime length are not computed, so their bytes
+        // would keep whatever the previous step left there. The tensor is
+        // still read in full by its consumer (ggml_cont_2d copies ne0 per
+        // row, ggml/src/ggml-cpu/ops.cpp:90-93), so the tail must be DEFINED,
+        // not stale: zero it once per call. This is O(nr1 * (ne0 - nr0)),
+        // far less than the reduction it replaces, and it makes the node's
+        // contents a function of this step alone.
+        if (nr0 < ne0) {
+            const size_t row_bytes = (size_t) (ne0 - nr0) * sizeof(float);
+            for (int64_t i13 = 0; i13 < ne3; ++i13) {
+                for (int64_t i12 = 0; i12 < ne2; ++i12) {
+                    for (int64_t i11 = ith; i11 < ne1; i11 += nth) {
+                        memset((char *) dst->data + i11*nb1 + i12*nb2 + i13*nb3 + (size_t) nr0*sizeof(float),
+                               0, row_bytes);
+                    }
+                }
+            }
+        }
+    }
 
     // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
@@ -1527,7 +1766,15 @@ UseGgmlGemm2:;
         // N=1 always takes the single-output dot contract below. Preserve it
         // for the explicit quantized mode even on targets with paired MMLA
         // kernels, without changing the parallel row/query chunk scheduler.
-        int64_t num_rows_per_vec_dot = batch_invariant_quantized ? 1 : vec_dot_num_rows;
+        //
+        // A REDUCE_PAD_TAIL node is pinned to 1 here. The pairing decision
+        // reads ne11 and the chunk bounds, and ne11 is the runtime width under
+        // an in-place narrowed graph; a width that is even in the padded graph
+        // and odd in the narrowed one would otherwise switch the kernel. The
+        // padded dot kernels take one row anyway (asserted in
+        // ..._mul_mat_one_chunk), so the pin costs nothing on that lane.
+        const bool pad_tail_rows = (dst->flags & GGML_TENSOR_FLAG_REDUCE_PAD_TAIL) != 0;
+        int64_t num_rows_per_vec_dot = (batch_invariant_quantized || pad_tail_rows) ? 1 : vec_dot_num_rows;
 
         // these checks are needed to avoid crossing dim1 boundaries
         // can be optimized, but the logic would become more complicated, so keeping it like this for simplicity
@@ -1936,7 +2183,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 
     // extra_buffer op?
-    if (ggml_cpu_extra_compute_forward(params, tensor)) {
+    if (!(tensor->flags & GGML_TENSOR_FLAG_ATTN_ORDERED) &&
+            ggml_cpu_extra_compute_forward(params, tensor)) {
         return;
     }
 
@@ -3042,7 +3290,8 @@ struct ggml_cplan ggml_graph_plan(
 
         size_t cur = 0;
 
-        if (!ggml_cpu_extra_work_size(n_threads, node, &cur)) {
+        if ((node->flags & GGML_TENSOR_FLAG_ATTN_ORDERED) ||
+                !ggml_cpu_extra_work_size(n_threads, node, &cur)) {
             switch (node->op) {
                 case GGML_OP_CPY:
                 case GGML_OP_DUP:
@@ -3079,7 +3328,7 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
-                        if (node->src[1]->type != vec_dot_type) {
+                        if (!(node->flags & (GGML_TENSOR_FLAG_ATTN_MASK | GGML_TENSOR_FLAG_ATTN_SCORES)) && node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
                     } break;
@@ -3116,6 +3365,11 @@ struct ggml_cplan ggml_graph_plan(
                         }
                     } break;
                 case GGML_OP_SOFT_MAX:
+                    {
+                        if (!(node->flags & GGML_TENSOR_FLAG_ATTN_SOFT_MAX)) {
+                            cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
+                        }
+                    } break;
                 case GGML_OP_ROPE:
                 case GGML_OP_ROPE_BACK:
                     {
@@ -3633,6 +3887,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.cpu_ctx    =*/ cplan->cpu_ctx,
     };
 
 #ifdef GGML_USE_OPENMP

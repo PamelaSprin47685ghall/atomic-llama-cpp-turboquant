@@ -1364,15 +1364,57 @@ const llama_ubatch & llama_memory_recurrent_context::get_ubatch() const {
 }
 
 uint32_t llama_memory_recurrent_context::get_n_rs() const {
+    // union-graph runtime binder: while the build-scoped envelope override is
+    // armed, size the graph at the full recurrent state capacity. The live
+    // length is bound in place after the build.
+    if (nrs_build_override) {
+        return nrs_build_n_rs;
+    }
     return is_full ? mem->size : mem->n;
 }
 
 uint32_t llama_memory_recurrent_context::get_head() const {
+    // build at head 0 so every head-dependent view stays inside the state
+    // allocation; the live head is bound in place after the build.
+    if (nrs_build_override) {
+        return nrs_build_head;
+    }
     return is_full ? 0 : mem->head;
 }
 
 int32_t llama_memory_recurrent_context::get_rs_z() const {
+    // build with a present zero row (row 0) so the zero-view has a non-zero
+    // size; the live row (including -1 = no zero row) is bound in place.
+    if (nrs_build_override) {
+        return nrs_build_rs_z;
+    }
     return is_full ? 0 : mem->rs_z;
+}
+
+uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
+    return mem->n_rs_seq;
+}
+
+void llama_memory_recurrent_context::nrs_envelope_begin(uint32_t n_rs, uint32_t head, int32_t rs_z) const {
+    // poka-yoke: a nested/leaked override would silently size the next graph
+    // at a stale envelope. The RAII guard in llama-context.cpp is the only
+    // writer; assert rather than overwrite.
+    GGML_ASSERT(!nrs_build_override && "nested n_rs envelope build");
+    GGML_ASSERT(n_rs != 0 && "zero n_rs envelope length");
+    GGML_ASSERT(head < n_rs && "head outside the n_rs envelope");
+    GGML_ASSERT(rs_z >= -1 && (uint32_t) rs_z < n_rs && "rs_z outside the n_rs envelope");
+    nrs_build_override = true;
+    nrs_build_n_rs = n_rs;
+    nrs_build_head = head;
+    nrs_build_rs_z = rs_z;
+}
+
+void llama_memory_recurrent_context::nrs_envelope_end() const {
+    GGML_ASSERT(nrs_build_override && "unbalanced n_rs envelope build");
+    nrs_build_override = false;
+    nrs_build_n_rs = 0;
+    nrs_build_head = 0;
+    nrs_build_rs_z = 0;
 }
 
 uint32_t llama_memory_recurrent_context::get_size() const {
@@ -1416,6 +1458,10 @@ uint32_t llama_memory_recurrent_context::get_replay_len() const {
     return m;
 }
 
+bool llama_memory_recurrent_context::gdn_replay() const {
+    return mem->gdn_replay;
+}
+
 void llama_memory_recurrent_context::consume_replay_len() const {
     if (!mem->gdn_replay || is_full) {
         return;
@@ -1451,4 +1497,23 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         }
     }
     return (int32_t)(idx * mem->size) + src0;
+}
+
+int32_t llama_memory_recurrent_context::get_rs_zero_row(llama_seq_id seq_id) const {
+    // The zero row the gathers will read, not the cell index: s_copy() returns
+    // idx*size + src0, so a sequence with a pending rollback reads a row in
+    // group idx, and clearing cell rs_z would clear a row nobody reads.
+    //
+    // rs_idx is read, never consumed: s_copy() is the one consumer (it resets
+    // rs_idx[seq] to 0 on read, see above), and it runs in the same set_input()
+    // pass, so this must not clear the value it depends on.
+    const int32_t rs_z = get_rs_z();
+    if (rs_z < 0) {
+        return -1;
+    }
+    uint32_t idx = 0;
+    if (seq_id >= 0 && (size_t) seq_id < mem->rs_idx.size()) {
+        idx = mem->rs_idx[seq_id];
+    }
+    return (int32_t)(idx * mem->size) + rs_z;
 }

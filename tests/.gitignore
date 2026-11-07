@@ -1,5 +1,11 @@
 *
 !*.*
+# A negation cannot re-include a file whose PARENT directory is excluded, so
+# every new file under these directories was silently unstaged by `git add -A`
+# (the gate scripts are tracked only because they were force-added). Name the
+# directory, then its contents.
+!nkv-cpu-probe/
+!nkv-cpu-probe/**
 !snapshots/
 !laya/
 !laya/golden/

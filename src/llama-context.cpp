@@ -3,12 +3,14 @@
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "ggml-relay.h"
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-ext.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-nout-state.h"
 #include "llama-prefab-env.h"
 #include "llama-prefab-iface.h"
 #include "llama-io.h"
@@ -19,11 +21,14 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-stream-config.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-topology-hash.h"
+#include "llama-union-shape-guard.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -34,10 +39,38 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 //
 // llama_context
 //
+static bool union_model_shape_supported(const llama_model & model) {
+    return model.arch == LLM_ARCH_LLAMA && !model.hparams.use_alibi &&
+        model.hparams.n_expert == 0 && model.hparams.n_rel_attn_bkts == 0;
+}
+
+// Head dimensions used by the existing CUDA/HIP-derived width guard. This
+// list does not establish support on other backends or prove GPU correctness.
+// GGML_TP5_FA_MASK_KVLEN=1 remains prohibited on GPU/HIP until the documented
+// FA kernel issue is fixed.
+static bool union_fa_head_dim_generic(uint32_t dk, uint32_t dv) {
+    if (dk != dv) {
+        return false;
+    }
+    switch (dk) {
+        case 40:
+        case 64:
+        case 72:
+        case 80:
+        case 96:
+        case 112:
+        case 128:
+        case 256:
+            return true;
+        default:
+            return false;
+    }
+}
 
 struct llm_fused_op_probe {
     llm_fused_op op;
@@ -105,6 +138,13 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    // per-context union-binder state slot (llama-nout-state.h): NOT created
+    // here eagerly - the constructor reads the env gate below and creates the
+    // slot only when the gate is on, so the OFF path allocates no binder
+    // state. Unique_ptr ownership in llama-context.h: a constructor-body
+    // throw still destroys fully-initialized members, so the slot cannot
+    // leak, and ~llama_context releases it with the context.
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -223,6 +263,15 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             // llama_memory_recurrent::seq_rm checks rollback distance <=2.
             // Keep ALL other tp5-relay admissions exactly as before; never
             // permit an unqualified arch/seq count/batch or switch the default.
+            //
+            // pillar-1 note: the union tree removed the raw n_rs_seq read here
+            // and left the ring to the post-clamp "tp5-relay ring" check below,
+            // on the grounds that the clamp is what knows whether the arch can
+            // carry the ring. The integration tree keeps this stricter, shape-
+            // bounded admission as well: it admits exactly the one MTP ring the
+            // relay path has been verified with, and the post-clamp check below
+            // still refuses the gdn_replay ring. Both gates are kept; the
+            // stricter one decides.
             (params.n_rs_seq != 0 &&
              !(params.n_rs_seq == 2 && model.arch == LLM_ARCH_QWEN4EXP &&
                params.n_seq_max == 1 && params.n_batch == 4 && params.n_ubatch == 4 &&
@@ -231,6 +280,19 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             params.attention_type == LLAMA_ATTENTION_TYPE_NON_CAUSAL || params.batch_invariant_matmul) {
             throw std::runtime_error("tp5-relay requires 1..4 sequences/rows, bounded profile KV capacity, one ubatch, F16/F32 KV or native Swift FA Q4_0 KV, no sampler, callback or alternate compute policy");
         }
+        // The recurrent rollback ring (n_rs_seq) is read AFTER the arch clamp
+        // below, on purpose. The clamp is the only place that knows whether
+        // the architecture can carry the ring at all
+        // (llm_arch_supports_rs_rollback), and a request on an arch without
+        // rollback is not a ring: it is clamped to 0 and the relay graph is
+        // the stock graph. Reading the raw parameter here would refuse that
+        // case as if the ring existed, i.e. it would refuse a configuration
+        // the clamp already reduced to stock. The ring check therefore lives
+        // in the post-clamp block (see the "tp5-relay ring" check below),
+        // which refuses exactly the ring shape the relay path has not been
+        // proven to carry. The raw read was ordered wrong, not load-bearing:
+        // the user's intent is preserved by the clamp's debug log, and a ring
+        // the arch supports reaches the post-clamp check unchanged.
     }
 
     cparams.n_seq_max     = std::max(1u, params.n_seq_max);
@@ -250,7 +312,22 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
+
     cparams.gdn_replay = params.gdn_replay;
+
+    // tp5-relay ring: the relay path carries the recurrent rollback ring only
+    // when the ring keeps the stock state layout, i.e. one authoritative
+    // state per cell. gdn_replay replaces that layout with a per-seq
+    // ingredient ring plus an oldest-edge checkpoint
+    // (llama-memory-recurrent.cpp:121-145), so the state tensor the relay
+    // graph clears would no longer be the state the model reads. Refuse by
+    // name rather than build a graph whose cleared rows are not the rows the
+    // model uses. This is the only ring shape the relay path has not been
+    // proven to carry; n_rs_seq itself is carried (see graph_params()).
+    if (cparams.n_rs_seq > 0 && params.tp5_relay && cparams.gdn_replay) {
+        throw std::runtime_error(
+            "tp5-relay with n_rs_seq > 0 requires the snapshot ring; gdn_replay (ingredient ring) is not carried by the relay path");
+    }
     cparams.batch_invariant_matmul = params.batch_invariant_matmul;
     cparams.quantized_matmul_f32 = params.quantized_matmul_f32;
 
@@ -444,6 +521,33 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // initialized later
     cparams.pipeline_parallel = false;
 
+    // ENVIRONMENT AUDIT - the arm-distinguishing variables, read here and
+    // nowhere else, once per context, before any graph exists:
+    //
+    //   LLAMA_GRAPH_REUSE_DISABLE  this block. Nonzero selects the stock arm:
+    //       no graph reuse and no binder, so every ubatch builds. It is the
+    //       one variable that makes the stock arm a genuinely different path,
+    //       and the tests that use it keep it set for the context's whole
+    //       lifetime (tests/test-nkv-runtime-param.cpp part 3,
+    //       tests/test-topology-key-sweep.cpp) because unsetting it after
+    //       construction would not change this already-read value but would
+    //       mislead a reader about which arm a later context gets.
+    //
+    //   GGML_TP5_UNION_BINDER      the gate block below. Unset selects the
+    //       qualified CPU default; "1" opts in explicitly; "0" is stock.
+    //
+    //   LLAMA_EXPERIMENTAL_VARLEN_NTOK  the same gate block, read into
+    //       ntok_enabled. It selects the token-width lane, which is a
+    //       different contract (arena replan) from the n_kv / n_outputs /
+    //       rs_z lanes; part 3 unsets it so the matrix measures those three.
+    //
+    //   LLAMA_NKV_MASK_OVERRIDE    a test hook read per set_input in
+    //       llama-graph.cpp; it is not read here and cannot select an arm.
+    //
+    // None of these is re-read after construction, so a test that sets one
+    // before llama_init_from_model() selects the arm for that context's whole
+    // lifetime. The tests assert the resulting difference (the build-count
+    // deltas) instead of trusting the variable.
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
@@ -453,22 +557,202 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
     }
 
-    // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
-    cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+    const auto model_is_cpu_only = [&model]() {
+        const auto is_cpu = [](ggml_backend_dev_t dev) {
+            return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        };
+        if (!is_cpu(model.dev_output())) {
+            return false;
+        }
+        for (int il = 0; il < (int) model.hparams.n_layer_all; ++il) {
+            if (!is_cpu(model.dev_layer(il))) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Default only where the scheduler can have one CPU backend. The live
+    // split count and all tensor envelopes are still checked before binding.
+    bool cpu_default = model.devices.empty() && !model.has_tensor_overrides() &&
+        !params.tp5_relay && !params.quantized_matmul_f32 && !graph_reuse_disable &&
+        union_model_shape_supported(model) && sampling.samplers.empty() &&
+        (cparams.kv_unified || cparams.n_seq_max == 1) && model_is_cpu_only();
+    for (size_t i = 0; cpu_default && i < ggml_backend_dev_count(); ++i) {
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            cpu_default = false;
+        }
+    }
+
+    // Unset enables the qualified CPU path only. An explicit value enables
+    // the existing opt-in path only when it is exactly "1"; "0" is stock.
+    const char * union_binder_env = getenv("GGML_TP5_UNION_BINDER");
+    const bool union_binder_gate = llama_union_binder_enabled(union_binder_env, cpu_default);
+
+    {
+        // With the gate off, the context allocates no binder state.
+        if (union_binder_gate) {
+            auto & nkv_st = llama_nkv_ctx_state_get(this);
+            nkv_st.nkv_enabled = true;
+            const char * ntok_env = getenv("LLAMA_EXPERIMENTAL_VARLEN_NTOK");
+            nkv_st.ntok_enabled = ntok_env != nullptr && strcmp(ntok_env, "1") == 0;
+
+            // runtime-length n_kv lane: bind the true used span instead of
+            // the stock 256-cell padded width. The 256-cell floor exists only
+            // to keep the graph width constant across batches so a stock graph
+            // can be reused; the binder provides that constancy by patching
+            // the width in place, so the floor is not needed here. This is the
+            // default under the umbrella gate; the explicit value "0" selects
+            // the padded lane for the A/B control.
+            const char * exact_env = getenv("GGML_TP5_UNION_BINDER_EXACT");
+            nkv_st.nkv_exact_enabled = exact_env == nullptr || strcmp(exact_env, "1") == 0;
+
+            // n_kv execution width: the graph is built once at the physical
+            // per-stream capacity and the true used span is bound in place.
+            // The lane is fail-closed: a width the cache cannot prove
+            // (streaming arena, reserve context, block-misaligned V) keeps
+            // the width the cache applied for that ubatch.
+            const bool added_nkv = nkv_st.union_binder.add({
+                llama_union_param_kind::n_kv, "n_kv",
+                &llama_context::union_tensors_n_kv,
+                &llama_context::union_rebind_n_kv,
+            });
+            const bool added_ntok = nkv_st.union_binder.add({
+                llama_union_param_kind::n_tokens, "n_tokens",
+                &llama_context::union_tensors_n_kv,
+                &llama_context::union_rebind_n_tokens,
+            });
+            const bool added_rs_z = nkv_st.union_binder.add({
+                llama_union_param_kind::rs_z, "rs_z",
+                &llama_context::union_tensors_rs_z,
+                &llama_context::union_rebind_rs_z,
+            });
+
+            // rs_z runtime parameter (GGML_TP5_RSZ_RUNTIME_PARAM): exactly
+            // "1" enables it, and only under this umbrella gate. With the
+            // lane on, the graph carries the I32 state-selection row and a
+            // moved rs_z is an input write; the rs_z table binding above
+            // stays registered for the arm-refused case. The value contract
+            // is llama_union_gate_exact_one() (llama-union-binder.h), the
+            // same one the umbrella gate uses for explicit values.
+            {
+                nkv_st.rsz_rt_enabled = llama_union_gate_exact_one(getenv("GGML_TP5_RSZ_RUNTIME_PARAM"));
+                if (nkv_st.rsz_rt_enabled) {
+                    LLAMA_LOG_WARN("%s: rs_z runtime parameter enabled (GGML_TP5_RSZ_RUNTIME_PARAM=1): "
+                                   "the recurrent zero-state selection is an input write, not a graph key\n", __func__);
+                }
+            }
+
+            // backend samplers make build_sampling() derive extra nodes from
+            // the gather width; the generic patch can reproduce them, but that
+            // path is not proven, so keep the stock exact-count build instead
+            const bool nout_ok = sampling.samplers.empty();
+            const bool added_nout = nout_ok ? nkv_st.union_binder.add({
+                llama_union_param_kind::n_outputs, "n_outputs",
+                &llama_context::union_tensors_n_outputs,
+                &llama_context::union_rebind_n_outputs,
+            }) : true; // not registered: the stock exact-count build stays
+            if (!added_nkv || !added_ntok || !added_rs_z || !added_nout) {
+                // cannot happen for valid kinds; stay fail-closed anyway
+                nkv_st.nkv_enabled = false;
+                LLAMA_LOG_ERROR("%s: failed to register the union bindings; runtime graph patching disabled\n", __func__);
+            } else {
+                LLAMA_LOG_WARN("%s: union runtime binder enabled (%s, %zu param kind(s) registered)\n",
+                               __func__, union_binder_env == nullptr ? "CPU default" : "explicit opt-in",
+                               nkv_st.union_binder.size());
+                if (!nout_ok) {
+                    LLAMA_LOG_WARN("%s: n_outputs binding disabled: backend samplers attached (build_sampling derives nodes from the gather width)\n", __func__);
+                }
+            }
+        } else if (llama_union_gate_exact_one(getenv("GGML_TP5_RSZ_RUNTIME_PARAM"))) {
+            // rs_z runtime parameter asked for under a gate that is off. The
+            // umbrella gate decides whether the binder state exists at all,
+            // so there is no per-context slot to count in; the refusal is
+            // named here and the lane stays off (stock graph).
+            LLAMA_LOG_WARN("%s: GGML_TP5_RSZ_RUNTIME_PARAM=1 ignored: GGML_TP5_UNION_BINDER is off; "
+                           "the rs_z runtime lane requires the union binder\n", __func__);
+        }
+    }
+
+    // the legacy per-lane flag is retired: n_outputs is now a table binding
+    // under the umbrella gate. Keep one warning for stale environments.
+    {
+        const char * legacy = getenv("LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME");
+        if (legacy != nullptr && strcmp(legacy, "1") == 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_GRAPH_UNION_OUTPUTS_RUNTIME=1 is retired; n_outputs binding is controlled by GGML_TP5_UNION_BINDER=1\n", __func__);
+        }
+    }
+    // stock rounds n_ctx up to the 256-cell KV block. The binder gate keeps
+    // the raw value only when the exact sub-lane is active; with the gate off
+    // or the exact sub-lane explicitly disabled (GGML_TP5_UNION_BINDER_EXACT=0)
+    // this must stay byte-identical to stock (the original patch dropped the
+    // pad unconditionally, which changed OFF for any n_ctx that is not a
+    // multiple of 256).
+    if (!union_binder_gate || !llama_nkv_ctx_state_get(this).nkv_exact_enabled) {
+        // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+        cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+    }
+
+    // The stock capacity sites pad to a 256-cell bucket. The runtime-length
+    // lane uses the requested values instead: the KV cache only requires
+    // n_pad alignment (1 for a plain cache), and the n_kv graph width is
+    // bound to the true used span by the union binder, so the physical
+    // capacity is not a graph-width contract. The model's device assignment
+    // is fixed at this point (dev_layer/dev_output).
+    // The aligned-capacity guard is kept for GPU flash-attention head
+    // dimensions outside the CUDA/HIP-derived list. It is not a proof for
+    // other backends.
+    const bool gpu_fa_needs_aligned_capacity = [&]() {
+        if (!cparams.flash_attn || model_is_cpu_only()) {
+            return false;
+        }
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+            if (!model.hparams.has_kv(il)) {
+                continue;
+            }
+            if (!union_fa_head_dim_generic(model.hparams.n_embd_head_k(il), model.hparams.n_embd_head_v(il))) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    // One sub-lane controls every runtime-length replacement: the exact n_kv
+    // width and the two capacity sites. GGML_TP5_UNION_BINDER_EXACT=0 is
+    // therefore a full stock-shape control (padded n_kv + stock 256 capacity),
+    // not just an n_kv control.
+    const bool runtime_len_capacity = union_binder_gate &&
+        llama_nkv_ctx_state_get(this).nkv_exact_enabled && !gpu_fa_needs_aligned_capacity;
+
+    // rope long/short factor selection is keyed on the stock 256-cell bucket
+    // of the per-sequence window (a model-training property). Keep that value
+    // even when the capacity bucket itself is not applied, so the runtime-
+    // length lane cannot change logits through the rope factors.
+    const uint32_t n_ctx_stock = GGML_PAD(cparams.n_ctx, 256);
+    cparams.n_ctx_seq_rope = cparams.kv_unified ? n_ctx_stock
+                                                : GGML_PAD(n_ctx_stock / cparams.n_seq_max, 256);
 
     if (cparams.kv_unified) {
         cparams.n_ctx_seq = cparams.n_ctx;
     } else {
-        cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
-        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
+        if (runtime_len_capacity) {
+            // runtime length: ceil division keeps the requested n_ctx covered
+            // by the per-sequence windows; n_ctx itself is never reduced.
+            cparams.n_ctx_seq = (cparams.n_ctx + cparams.n_seq_max - 1) / cparams.n_seq_max;
+            if (cparams.n_ctx_seq == 0) {
+                throw std::runtime_error("n_ctx_seq == 0");
+            }
+        } else {
+            cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
+            cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
 
-        if (cparams.n_ctx_seq == 0) {
-            throw std::runtime_error("n_ctx_seq == 0");
-        }
+            if (cparams.n_ctx_seq == 0) {
+                throw std::runtime_error("n_ctx_seq == 0");
+            }
 
-        if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
-            cparams.n_ctx = cparams.n_ctx_seq * cparams.n_seq_max;
-            LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
+            if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
+                cparams.n_ctx = cparams.n_ctx_seq * cparams.n_seq_max;
+                LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
+            }
         }
     }
 
@@ -486,7 +770,15 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         if (params.kv_stream_arena_mib != 0) {
             throw std::runtime_error("separate physical KV capacity is not supported with a shared CUDA phase arena");
         }
-        cparams.n_ctx_kv = GGML_PAD(params.n_ctx_kv, 256);
+        // Runtime length: the physical KV capacity is a runtime parameter,
+        // not a 256-cell bucket. The binder envelope is built at the exact
+        // capacity and every width up to it binds in place. The KV cache only
+        // requires n_pad alignment, and attn_n_pad == 1024 is selected only
+        // when the capacity is already 1024-aligned, so the exact value is
+        // allocatable. A GPU FA consumer with a hard-gated head dim keeps the
+        // stock 256 pad: the padded lane clamps its last bucket to the
+        // capacity, so a non-256 capacity would hand it a non-256 K length.
+        cparams.n_ctx_kv = runtime_len_capacity ? params.n_ctx_kv : GGML_PAD(params.n_ctx_kv, 256);
         if (cparams.n_ctx_kv < cparams.n_ctx_seq) {
             throw std::runtime_error("physical KV capacity must cover one complete logical window");
         }
@@ -999,6 +1291,35 @@ llama_context::~llama_context() {
             }
         }
     }
+    // One-line summary at context destruction, only when the binder is enabled.
+    // The NKV_BINDER_STATS prefix is also used by external gate harnesses.
+    // (state note: the counters live in the context's own state slot, not in
+    // class data members)
+    {
+        // peek only: never create state during destruction (with the gate off
+        // no slot exists and no stats line prints - stock OFF)
+        const llama_nkv_ctx_state * st = union_binder_state_peek();
+        if (st != nullptr && st->nkv_enabled) {
+            LLAMA_LOG_INFO("NKV_BINDER_STATS attempts=%zu applied=%zu refused_align=%zu refused_skeleton=%zu refused_envelope=%zu refused_relay=%zu refused_pipeline=%zu refused_rs_z=%zu refused_nrs=%zu refused_reader=%zu refused_backend=%zu refused_iswa=%zu refused_nkv_unknown=%zu refused_nout=%zu refused_topology=%zu fallbacks=%zu env_builds=%zu graph_builds=%zu shape_analyses=%zu shape_fail=%zu fused_qkv_refused=%zu patch_binds=%zu cap=%u cap_nout=%u cap_nrs=%u env_disabled=%d nout_grow_binds=%zu nout_grow_rebuilds=%zu ntok_fallbacks=%zu ntok_recurrent_hybrid_fallbacks=%zu rsz_rt=%d rsz_rt_active=%d rsz_rt_fallbacks=%zu rsz_rt_refused_gate=%zu rsz_rt_refused_arch=%zu rsz_rt_refused_no_rs_z=%zu rsz_rt_refused_cell=%zu rsz_rt_refused_envelope=%zu rsz_rt_refused_shape=%zu rsz_rt_refused_n_rs_seq=%zu rsz_rt_refused_ring=%zu rsz_rt_refused_mixed_depth=%zu rsz_rt_bound_rs_z=%d rsz_rt_zero_view_rows=%u\n",
+                           st->c_attempts, st->c_applied, st->c_refused_align, st->c_refused_skeleton,
+                           st->c_refused_envelope, st->c_refused_relay, st->c_refused_pipeline,
+                           st->c_refused_rs_z, st->c_refused_nrs, st->c_refused_reader, st->c_refused_backend,
+                           st->c_refused_iswa, st->c_refused_nkv_unknown, st->c_refused_nout,
+                           st->c_refused_topology,
+                           st->c_fallbacks, st->c_env_builds, st->c_graph_builds,
+                           st->c_shape_analyses, st->c_shape_fail, st->c_fused_qkv_refused, st->c_patch_binds,
+                           st->record_cap, st->record_cap_nout, st->record_cap_nrs, st->env_disabled ? 1 : 0,
+                           st->c_nout_grow_binds, st->c_nout_grow_rebuilds,
+                           st->c_ntok_fallbacks, st->c_ntok_recurrent_hybrid_fallbacks,
+                           st->rsz_rt_enabled ? 1 : 0, st->rsz_rt_active ? 1 : 0,
+                           st->c_rsz_rt_fallbacks, st->c_rsz_rt_refused_gate,
+                           st->c_rsz_rt_refused_arch, st->c_rsz_rt_refused_no_rs_z,
+                           st->c_rsz_rt_refused_cell, st->c_rsz_rt_refused_envelope,
+                           st->c_rsz_rt_refused_shape, st->c_rsz_rt_refused_n_rs_seq,
+                           st->c_rsz_rt_refused_ring, st->c_rsz_rt_refused_mixed_depth,
+                           st->rsz_rt_bound_rs_z, st->rsz_rt_zero_view_rows);
+        }
+    }
     ggml_opt_free(opt_ctx);
 }
 
@@ -1215,6 +1536,7 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
     // Releasing the scheduler returns the only borrowed compute lease.
     sched.reset();
     gf_res_prev->reset();
+    union_record_invalidate();
 
     const size_t   old_kv_bytes       = arena.current_kv_bytes;
     const size_t   old_compute_offset = arena.current_compute_offset;
@@ -1337,7 +1659,13 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
+    union_record_invalidate();
+    // the new long-lived result object is owned by this context: the union
+    // binder state uses this back-pointer (llama-nout-state.cpp) instead of a
+    // global result -> context reverse map
+    gf_res_prev->set_owner(this);
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    gf_res_reserve->set_owner(this); // same owner invariant for the reserve result
 
     const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
         model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
@@ -1796,6 +2124,7 @@ bool llama_context::release_compute() {
     // graph-result objects for the normal next graph build.
     if (gf_res_prev) {
         gf_res_prev->reset();
+        union_record_invalidate();
     }
     if (gf_res_reserve) {
         gf_res_reserve->reset();
@@ -1826,6 +2155,120 @@ uint64_t llama_context::compute_bytes() const {
         }
     }
     return total;
+}
+
+bool llama_context::nkv_runtime_stats(llama_nkv_runtime_stats * stats) const {
+    if (!stats) return false;
+    *stats = {};
+    const auto * st = union_binder_state_peek();
+    if (!st || !st->nkv_enabled || !st->record_valid) return false;
+    stats->topology_hash     = st->topology_hash;
+    stats->topology_hashed   = st->topology_hashed;
+    stats->build_n_kv        = st->width_table.build_n_kv;
+    stats->runtime_n_kv      = st->width_table.runtime_n_kv;
+    stats->bound_n_kv        = st->record_bound;
+    stats->build_n_outputs   = st->width_table.build_n_outputs;
+    stats->bound_n_outputs   = st->record_bound_nout;
+    stats->runtime_n_outputs = n_outputs;
+    stats->bound_n_rs        = st->record_bound_n_rs;
+    stats->bound_rs_head     = st->record_bound_rs_head;
+    stats->bound_rs_z        = st->record_bound_rs_z;
+    stats->has_nkv_dims      = st->width_table.has_nkv;
+    stats->has_nout_dims     = st->width_table.has_nout;
+    stats->has_nrs_dims      = st->width_table.has_nrs;
+    // The n_outputs refusal counter. It moves on the one refusal that is left
+    // - a request above the recorded envelope on a lane that cannot replan
+    // (llama-context.cpp, union_rebind_n_outputs) - and not on a zero-output
+    // step, which is an ordinary shrink the bind applies. It stays exported,
+    // not just logged, because test-ntok-onegraph reads it to prove that a
+    // zero-output step binds instead of rebuilding.
+    stats->refused_nout      = st->c_refused_nout;
+    // The mask observation belongs to the live graph's runtime n_kv input.
+    // When the graph has none (the binder built no runtime input for this
+    // topology) the five counters stay 0, which reads as "nothing was
+    // filled", never as "filled correctly".
+    if (const llm_graph_result * res = gf_res_prev.get()) {
+        if (const llm_graph_input_nkv_runtime * rt = res->get_nkv_runtime_input()) {
+            stats->mask_n_kv        = rt->mask_n_kv;
+            stats->mask_filled      = rt->mask_filled;
+            stats->mask_refused     = rt->mask_refused;
+            stats->mask_row_checked = rt->mask_row_checked;
+            stats->mask_row_ok      = rt->mask_row_ok;
+            stats->mask_row_refused = rt->mask_row_refused;
+            stats->mask_rows_all    = rt->mask_rows_all;
+        }
+    }
+    stats->graph_builds = n_graph_builds;
+    // The token lane's observation. build_n_tokens is 0 on every other lane,
+    // which reads as "no token-width runtime dimension", never as "bound at
+    // width 0".
+    stats->build_n_tokens = st->width_table.build_n_tokens;
+    stats->bound_n_tokens = st->record_bound_ntok;
+    stats->has_ntok_dims  = st->width_table.has_ntok;
+    // The CPU attention work, read from the backend that owns the counters.
+    // A non-CPU backend reports zeros, which reads as "no CPU attention ran".
+    if (backend_cpu != nullptr) {
+        ggml_backend_cpu_attn_reduce_stats(backend_cpu,
+                &stats->attn_live_elems, &stats->attn_pad_elems, &stats->attn_rows);
+    }
+    return true;
+}
+
+bool llama_context::ntok_plan_stats(llama_ntok_plan_stats * stats) const {
+    if (!stats) return false;
+    *stats = {};
+    const auto * st = union_binder_state_peek();
+    if (!st || !st->record_valid || !st->shape_map.ntok_valid || !union_sched_cpu_only()) return false;
+    stats->graph_builds = st->c_graph_builds;
+    stats->active_tokens = st->record_bound_ntok;
+    stats->active_kv = st->record_bound;
+    stats->active_outputs = st->record_bound_nout;
+    stats->arena_bytes = ggml_backend_sched_get_buffer_size(sched.get(), backend_cpu);
+    auto buft = ggml_backend_sched_get_buffer_type(sched.get(), backend_cpu);
+    std::vector<uint8_t> seen(st->record_t.size(), 0);
+    auto account = [&](const std::vector<llama_union_shape_coeff> & coeffs) {
+        for (const auto & coeff : coeffs) {
+            const size_t i = coeff.tensor;
+            if (i >= st->record_t.size()) return false;
+            ggml_tensor * t = st->record_t[i];
+            if (seen[i] || st->record_fixed[i] || t->view_src) continue;
+            seen[i] = 1;
+            size_t planned = 0;
+            if (!ggml_backend_sched_get_tensor_plan_size(sched.get(), t, &planned)) return false;
+            stats->planned_bytes += planned;
+            const size_t active = ggml_backend_buft_get_alloc_size(buft, t);
+            stats->active_bytes += active;
+            if (planned != active) ++stats->mismatched_tensors;
+            ++stats->checked_tensors;
+        }
+        return true;
+    };
+    if (!account(st->shape_map.ntok) || !account(st->shape_map.nout) ||
+            !account(st->shape_map.nkv) || !account(st->shape_map.nkv_ntok)) return false;
+    bool have_mask = false, have_outputs = false;
+    for (ggml_tensor * tensor : st->record_t) {
+        if (strcmp(tensor->name, "attn_inp_kq_mask") == 0) {
+            size_t bytes = 0;
+            if (!ggml_backend_sched_get_tensor_plan_size(sched.get(), tensor, &bytes)) return false;
+            stats->kv_mask_bytes = bytes;
+            have_mask = true;
+        } else if (strcmp(tensor->name, "union_out_ids") == 0) {
+            size_t bytes = 0;
+            if (!ggml_backend_sched_get_tensor_plan_size(sched.get(), tensor, &bytes)) return false;
+            stats->output_ids_bytes = bytes;
+            have_outputs = true;
+        }
+    }
+    for (const auto & input : gf_res_prev->inputs) {
+        const auto * embd = dynamic_cast<const llm_graph_input_embd *>(input.get());
+        if (embd && embd->tokens) {
+            size_t bytes = 0;
+            if (!ggml_backend_sched_get_tensor_plan_size(sched.get(), embd->tokens, &bytes)) return false;
+            stats->token_input_bytes = bytes;
+            break;
+        }
+    }
+    return stats->checked_tensors > 0 && stats->token_input_bytes > 0 && have_mask && have_outputs;
 }
 
 const llama_model & llama_context::get_model() const {
@@ -2122,6 +2565,7 @@ bool llama_context::memory_update(bool optimize) {
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
+        union_record_invalidate();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -2651,6 +3095,2506 @@ bool llama_context::set_adapter_cvec(const float * data, size_t len, int32_t n_e
     return res;
 }
 
+// ---- per-context union-binder state slot (llama-nout-state.h) ----
+
+llama_nkv_ctx_state & llama_context::union_binder_state_get() {
+    if (union_binder_state == nullptr) {
+        // one slot per context, owned by the context (no process-global map);
+        // only the constructor's gate blocks create it - OFF allocates nothing
+        union_binder_state.reset(new llama_nkv_ctx_state);
+    }
+    return *union_binder_state;
+}
+
+const llama_nkv_ctx_state * llama_context::union_binder_state_peek() const {
+    return union_binder_state.get();
+}
+
+bool llama_context::nkv_binder_record_valid() const {
+    return union_binder_state != nullptr && union_binder_state->record_valid;
+}
+
+// union-graph runtime parameter binder: n_kv lane.
+//
+// 1. when the live graph is (re)built, process_ubatch builds it once at the
+//    full legal n_kv range (physical per-stream KV capacity) and at the
+//    n_outputs high-water mark for legacy lanes. The opt-in token lane builds
+//    at active KV, token and output widths and replans on changes. The
+//    pre-allocation topology and per-tensor bounds are recorded;
+// 2. union_shape_analyze derives, from the tagged roots and the exact ggml op
+//    shape rules, a symbolic map: every dependent tensor's ne/nb/view_offs/
+//    root_offs uses linear terms plus an n_kv * n_tokens cross term.
+//    There is no finite-sample fitting and no scratch graph;
+// 3. when a runtime parameter moves (can_reuse fails only on the stale coupled
+//    shapes), union_rebind_apply evaluates the map at the new values and
+//    validates every changed graph-owned tensor against its recorded byte
+//    envelope; views are checked against the ultimate source allocation, so
+//    nested views (the recurrent state zero view) are covered as well;
+// 4. the changed fields (ne/nb/view_offs + view data pointers) are written into
+//    the live graph in place, then set_inputs refills the KQ mask at the live
+//    width (cells beyond the applied n_kv are empty -> -INF masked).
+// Any mismatch -> false and the caller falls through to the normal full rebuild.
+// The n_kv lane binds the true used span (runtime length). The patch requires
+// exactly one live split. The scheduler verifies its split copies against
+// their allocation envelopes before the patch. The existing FA width guard is
+// retained; it is not a GPU correctness proof.
+//
+// The two capacity sites are runtime parameters too: the physical KV capacity
+// (n_ctx_kv) and the per-sequence window (n_ctx_seq) use the requested length
+// instead of a 256-cell bucket. The only remaining pad is the GPU FA capacity
+// bucket: a GPU FA consumer with a hard-gated head dim keeps the stock 256
+// capacity. The per-sequence window uses ceil division, so the requested
+// n_ctx is never reduced. The rope long/short selection keeps the stock
+// bucket (cparams.n_ctx_seq_rope), so removing the capacity padding does not
+// change logits.
+
+
+namespace {
+
+struct llama_nkv_record_t {
+    // DFS post-order: nodes and, before each, its not-yet-seen sources / view source
+    std::vector<ggml_tensor *> t;
+    std::vector<int32_t>       src;       // (GGML_MAX_SRC + 1) entries per tensor, view source last
+    std::vector<uint8_t>       fixed;     // pre-existing storage (weights, KV cache)
+    std::vector<size_t>        bytes;     // byte envelope of each graph-owned tensor
+    std::vector<int32_t>       root;      // ultimate non-view source per tensor
+    std::vector<size_t>        root_offs; // cumulative view offset from that root
+    std::vector<size_t>        root_bytes; // root allocation / envelope size
+
+    void record(ggml_cgraph * gf) {
+        t.clear();
+        src.clear();
+        fixed.clear();
+        bytes.clear();
+        root.clear();
+        root_offs.clear();
+        root_bytes.clear();
+
+        std::unordered_map<const ggml_tensor *, int32_t> idx;
+        std::unordered_map<const ggml_tensor *, uint8_t> seen;
+        idx.reserve(4 * (size_t) ggml_graph_n_nodes(gf) + 16);
+        seen.reserve(4 * (size_t) ggml_graph_n_nodes(gf) + 16);
+
+        std::vector<std::pair<ggml_tensor *, int>> stack;
+
+        auto add = [&](ggml_tensor * root_t) {
+            if (root_t == nullptr || seen.count(root_t)) {
+                return;
+            }
+            stack.clear();
+            stack.push_back({ root_t, 0 });
+            seen[root_t] = 1;
+            while (!stack.empty()) {
+                ggml_tensor * x = stack.back().first;
+                // fixed = pre-existing storage (weights, KV cache); views created by
+                // this build are graph-owned
+                const bool is_fixed = x->view_src == nullptr && (x->data != nullptr || x->buffer != nullptr);
+
+                bool pushed = false;
+                while (!is_fixed && stack.back().second <= GGML_MAX_SRC) {
+                    const int k = stack.back().second++;
+                    ggml_tensor * s = k < GGML_MAX_SRC ? x->src[k] : x->view_src;
+                    if (s != nullptr && !seen.count(s)) {
+                        seen[s] = 1;
+                        stack.push_back({ s, 0 });
+                        pushed = true;
+                        break;
+                    }
+                }
+                if (pushed) {
+                    continue;
+                }
+                stack.pop_back();
+
+                const int32_t id = (int32_t) t.size();
+                idx[x] = id;
+                t.push_back(x);
+                fixed.push_back(is_fixed ? 1 : 0);
+
+                // resolve the view chain to its ultimate non-view source and
+                // accumulate the byte offset from that source
+                int32_t r = id;
+                size_t roff = 0;
+                if (x->view_src != nullptr) {
+                    const auto it = idx.find(x->view_src);
+                    GGML_ASSERT(it != idx.end());
+                    const int32_t vs = it->second;
+                    r = root[vs];
+                    if (__builtin_add_overflow(root_offs[vs], x->view_offs, &roff)) roff = SIZE_MAX;
+                }
+                root.push_back(r);
+                root_offs.push_back(roff);
+
+                for (int j = 0; j <= GGML_MAX_SRC; ++j) {
+                    ggml_tensor * s = is_fixed ? nullptr : (j < GGML_MAX_SRC ? x->src[j] : x->view_src);
+                    int32_t v = -1;
+                    if (s != nullptr) {
+                        if (s == x) {
+                            // ggml_cast sets src[1] = result (self-reference).
+                            // Record the tensor's own index, not a cycle marker:
+                            // the topology is valid and the bind restores it.
+                            v = id;
+                        } else {
+                            auto it = idx.find(s);
+                            v = it != idx.end() ? it->second : -2; // -2: back-edge (on DFS stack)
+                        }
+                    }
+                    src.push_back(v);
+                }
+            }
+        };
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            add(ggml_graph_node(gf, i));
+        }
+
+        // The split graph the scheduler re-plans carries the graph's leaf list,
+        // and ggml_backend_sched_replan_graph() refuses a leaf that is not in
+        // the record. A leaf that is nobody's source never enters the node walk
+        // above: build_inp_embd() selects one of two inputs with
+        // ggml_build_forward_select(), which visits both candidates, so the
+        // unselected input (inp_embd in a token batch) is a leaf of the graph
+        // but not of the data path. Record the leaf list too; add() dedups
+        // through `seen`, so every node-walk index keeps its value.
+        for (int i = 0; i < ggml_graph_n_leafs(gf); ++i) {
+            add(ggml_graph_leaf(gf, i));
+        }
+    }
+
+    void record_bytes() {
+        bytes.assign(t.size(), 0);
+        for (size_t k = 0; k < t.size(); ++k) {
+            if (!fixed[k] && t[k]->view_src == nullptr) {
+                bytes[k] = ggml_nbytes(t[k]);
+            }
+        }
+        // the limit for any view is the allocation of its ultimate source:
+        // a fixed source's logical byte size, or a graph-owned source's
+        // sched-allocated envelope
+        root_bytes.assign(t.size(), 0);
+        for (size_t k = 0; k < t.size(); ++k) {
+            const int32_t r = root[k];
+            root_bytes[k] = fixed[r] ? ggml_nbytes(t[r]) : bytes[r];
+        }
+    }
+};
+} // namespace
+
+// record the pre-allocation topology + byte envelopes of a freshly built (not
+// yet sched-placed) graph into the context's union-binder state slot
+// (state note: was llama_context::nkv_record_* data members; now lives in the
+// context's own state slot)
+void llama_context::nkv_record_snapshot(ggml_cgraph * gf) {
+    llama_nkv_record_t rec;
+    rec.record(gf);
+    rec.record_bytes();
+
+    auto & st = llama_nkv_ctx_state_get(this);
+    // The single graph identity of the graph as built. Computed here, once,
+    // while the graph is still at its build shapes and before the binder
+    // patches anything: the key must describe the recorded topology, not
+    // whichever runtime width the first bind happens to choose. Every later
+    // bind refreshes it with the bound state (union_rebind_apply), so it
+    // always describes the graph as it currently is. See llama-topology-hash.h
+    // for what is and is not folded in.
+    //
+    // The exclusion is the record's LANE (see union_topology_key_excl() in
+    // llama-nout-state.h): a graph built with the token lane armed has token
+    // inputs whose ne[0] the bind patches, so those dimensions must stay out
+    // of the key or the bind would refuse itself. Every other lane passes
+    // none() and keeps every dimension hashed.
+    //
+    // This assignment uses the shape map of the PREVIOUS record, because the
+    // analysis for this one has not run yet. It is overwritten below, right
+    // after union_shape_analyze(), which is the assignment the binder reads.
+    // The exclusion is the map's, so it names every patched axis by tensor
+    // name: the four token roots AND the derived tensors the coefficient table
+    // knows (a name survives a rebuild, a pointer does not).
+    st.record_topology_key = llama_topology_key_of(gf, union_topology_key_excl(st.shape_map, st.record_t));
+    st.record_t          = std::move(rec.t);
+    st.record_src        = std::move(rec.src);
+    st.record_fixed      = std::move(rec.fixed);
+    st.record_bytes      = std::move(rec.bytes);
+    st.record_root       = std::move(rec.root);
+    st.record_root_offs  = std::move(rec.root_offs);
+    st.record_root_bytes = std::move(rec.root_bytes);
+}
+
+void llama_context::union_record_invalidate() {
+    if (union_binder_state == nullptr) {
+        return; // gate off: no state was ever allocated
+    }
+    auto & st = *union_binder_state;
+    st.record_valid = false;
+    st.record_t.clear();
+    st.record_src.clear();
+    st.record_fixed.clear();
+    st.record_bytes.clear();
+    st.record_root.clear();
+    st.record_root_offs.clear();
+    st.record_root_bytes.clear();
+    st.record_cap = 0;
+    st.record_cap_nout = 0;
+    st.record_has_out_ids = false;
+    st.record_cap_nrs = 0;
+    st.record_bound = 0;
+    st.record_arena_n_kv = 0;
+    st.record_bound_nout = 0;
+    st.record_bound_n_rs = 0;
+    st.record_bound_ntok = 0;
+    st.record_bound_rs_z = -2;
+    st.record_bound_rs_head = 0;
+    st.record_bound_replay_len = 0;
+    st.record_topology_key = llama_topology_key{};
+    st.shape_map = llama_union_shape_map{};
+    st.record_nodes.clear();
+    st.width_table.clear();
+    st.topology_hash   = 0;
+    st.topology_hashed = false;
+}
+
+// Table-driven dispatch: one bind applies ALL THREE runtime parameters.
+//
+// n_kv, n_outputs and rs_z are simultaneous parameters of one fixed-topology
+// graph, so a dispatch that returned on the first kind which "applied" would
+// leave the other two deltas unapplied whenever a step moves more than one of
+// them. The registered kinds therefore only GATE the bind: the first one whose
+// preconditions hold for this ubatch (single split, envelope, replay length,
+// rs_z present, ...) runs union_rebind_apply, and that single call evaluates
+// the symbolic shape map at all three targets at once. Every gating kind calls
+// apply with the same targets, so the enum order selects the precondition set,
+// never the set of parameters that move. A kind whose own target did not move
+// does not mask a delta in another kind: the delta test lives in apply, not in
+// the gate. The n_tokens kind keeps its own gate (ntok_valid, token width
+// moved), which is the token lane's own contract.
+bool llama_union_binder::rebind_any(llama_context * ctx,
+                                    llm_graph_result * res,
+                                    const llm_graph_params & params) const {
+    for (size_t i = 0; i < n_kinds; ++i) {
+        if (!registered_[i]) {
+            continue;
+        }
+        const llama_union_binding & binding = slots_[i];
+        if (binding.tensor_set == nullptr || binding.rebind == nullptr) {
+            continue;
+        }
+        const llama_union_tensor_set set = (ctx->*(binding.tensor_set))();
+        switch ((ctx->*(binding.rebind))(res, params, set)) {
+            case llama_union_rebind_result::applied:
+                return true;
+            case llama_union_rebind_result::refused:
+                // This kind RAN: it passed its preconditions and
+                // union_rebind_apply evaluated every runtime target at once.
+                // A later kind would repeat the same patch and meet the same
+                // refusal, so the first kind that ran decides the dispatch
+                // (llama-union-binder.h's contract). The caller rebuilds.
+                return false;
+            case llama_union_rebind_result::declined:
+                break;
+        }
+        // A failed replan can invalidate the live allocation. Do not let a
+        // later kind inspect or reuse that graph; the caller must rebuild it.
+        if (!ctx->nkv_binder_record_valid()) {
+            return false;
+        }
+    }
+    return false;
+}
+
+// n_kv / rs_z bindings share the recorded topology / envelope vectors of the
+// live envelope build; the kind selects the rebind preconditions
+llama_union_tensor_set llama_context::union_tensors_n_kv() {
+    auto & st = llama_nkv_ctx_state_get(this);
+    return { &st.record_t, &st.record_src, &st.record_fixed, &st.record_bytes,
+             &st.record_root, &st.record_root_offs, &st.record_root_bytes };
+}
+
+llama_union_tensor_set llama_context::union_tensors_rs_z() {
+    auto & st = llama_nkv_ctx_state_get(this);
+    return { &st.record_t, &st.record_src, &st.record_fixed, &st.record_bytes,
+             &st.record_root, &st.record_root_offs, &st.record_root_bytes };
+}
+
+llama_union_tensor_set llama_context::union_tensors_n_outputs() {
+    auto & st = llama_nkv_ctx_state_get(this);
+    return { &st.record_t, &st.record_src, &st.record_fixed, &st.record_bytes,
+             &st.record_root, &st.record_root_offs, &st.record_root_bytes };
+}
+
+namespace {
+
+// width a KV-cache context contributes to the graph: the true used span when
+// the cache layout supports it, 0 when it does not. The width is bound in
+// place by the symbolic shape map, so a width change does not rebuild the
+// graph. True kv_len on GPU still needs the flash-attention device parameter.
+//
+// 0 is not a width: a caller that needs a width must treat it as "the exact
+// lane cannot deliver here" and refuse the bind.
+//
+// One query, no second switch: get_n_kv_exact() is the single place that knows
+// whether the layout can address the true span, and get_n_kv() is the single
+// place that decides what the graph executes at. This function stays a pure
+// pass-through so no call site can disagree with the width the graph inputs
+// use.
+//
+// The `exact` parameter records the caller's intent -- "I want the lane's
+// width, not a clamp" -- and defaults to true. It cannot select a width: the
+// selection is nkv_exact_target's, and get_n_kv() is the one place that reads
+// it. A caller that passes false is saying "this is a reduction-order clamp,
+// not a lane choice", and on this line both values reach the same width
+// because the exact lane no longer degrades to the padded one.
+uint32_t union_nkv_width(const llama_kv_cache_context * kv, bool exact = true) {
+    (void) exact;
+    return kv->get_n_kv_exact();
+}
+
+// current n_kv of the KV-cache contexts that shape this graph; 0 when the
+// graph has no KV cache, when a context has no exact width, or when the
+// contexts disagree. A disagreement fails closed instead of silently using
+// one of the widths.
+//
+// `exact` defaults to true because every caller wants the lane's width, and
+// the one caller that is explicit about it (the reduction-order clamp in
+// union_rebind_apply) passes false to say "this is not a lane choice, it is a
+// clamp". Both values reach the same width on this line, so the default
+// cannot change a bind.
+uint32_t union_nkv_now(const llama_memory_context_i * mctx, bool exact = true) {
+    const llama_kv_cache_context * kvs[2] = { nullptr, nullptr };
+    int nkvs = 0;
+    if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        if (h->get_attn() == nullptr) {
+            return 0; // pure recurrent hybrid: no attention sub-cache to bind
+        }
+        kvs[nkvs++] = h->get_attn();
+    } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+        kvs[nkvs++] = k;
+    } else if (const auto * h = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
+        // the two sub-caches (base + SWA) can have different widths; report
+        // both so a disagreement fails closed instead of silently using one
+        const auto * attn = h->get_attn();
+        if (attn == nullptr || attn->get_base() == nullptr || attn->get_swa() == nullptr) {
+            return 0;
+        }
+        kvs[nkvs++] = attn->get_base();
+        kvs[nkvs++] = attn->get_swa();
+    }
+    if (nkvs == 0) {
+        return 0;
+    }
+    uint32_t nkv = union_nkv_width(kvs[0]);
+    for (int i = 1; i < nkvs; ++i) {
+        if (union_nkv_width(kvs[i]) != nkv) {
+            return 0;
+        }
+    }
+    return nkv;
+}
+
+// a hybrid iSWA graph builds two attention masks (base + SWA) whose widths
+// and readers the generic single-width patch does not cover; refuse it until
+// a dedicated dual-mask binding exists
+bool union_is_hybrid_iswa(const llama_memory_context_i * mctx) {
+    return dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx) != nullptr;
+}
+
+const llama_memory_recurrent_context * union_recr_ctx(const llama_memory_context_i * mctx) {
+    if (mctx == nullptr) {
+        return nullptr;
+    }
+    if (const auto * r = dynamic_cast<const llama_memory_recurrent_context *>(mctx)) {
+        return r;
+    }
+    if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        return h->get_recr();
+    }
+    if (const auto * h = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
+        return h->get_recr();
+    }
+    return nullptr;
+}
+
+int32_t union_rs_z_now(const llama_memory_context_i * mctx) {
+    const auto * r = union_recr_ctx(mctx);
+    return r != nullptr ? r->get_rs_z() : -2;
+}
+
+uint32_t union_rs_head_now(const llama_memory_context_i * mctx) {
+    const auto * r = union_recr_ctx(mctx);
+    return r != nullptr ? r->get_head() : 0;
+}
+
+uint32_t union_n_rs_now(const llama_memory_context_i * mctx) {
+    const auto * r = union_recr_ctx(mctx);
+    return r != nullptr ? r->get_n_rs() : 0;
+}
+uint32_t union_replay_len_now(const llama_memory_context_i * mctx) {
+    const auto * r = union_recr_ctx(mctx);
+    return r != nullptr ? r->get_replay_len() : 0;
+}
+
+// attention-view readers cache per-frontier metadata (reader indices/spans)
+// that the generic tensor patch does not refresh; the binder refuses such
+// graphs instead of patching stale reader state.
+bool union_has_attention_views(const llama_memory_context_i * mctx) {
+    if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+        return k->has_attention_views();
+    }
+    if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        const auto * attn = h->get_attn();
+        return attn != nullptr && attn->has_attention_views();
+    }
+    if (const auto * h = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
+        const auto * attn = h->get_attn();
+        if (attn == nullptr) {
+            return false;
+        }
+        const auto * base = attn->get_base();
+        const auto * swa  = attn->get_swa();
+        return (base != nullptr && base->has_attention_views()) ||
+               (swa  != nullptr && swa->has_attention_views());
+    }
+    return false;
+}
+
+
+// attention KV-cache context that shapes this graph (plain or hybrid); the
+// hybrid iSWA context is deliberately not returned (its dual-mask graph is
+// refused by union_rebind_apply)
+llama_kv_cache_context * union_kv_ctx(const llama_memory_context_i * mctx) {
+    if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        return const_cast<llama_kv_cache_context *>(h->get_attn());
+    }
+    if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+        return const_cast<llama_kv_cache_context *>(k);
+    }
+    return nullptr;
+}
+
+// The long-lived attention cache this context's memory owns, for the mask
+// read-back. The per-decode memory CONTEXT is owned by the unique_ptr inside
+// llama_context::decode and dies when decode returns, so nothing may be
+// resolved from it after the call. The memory object itself lives as long as
+// the context, and the cache is a sub-object of it.
+//
+// Same shape as union_kv_ctx above: plain KV cache, or the attention half of
+// a hybrid memory. The iSWA / DSA / MSA / DSV4 wrappers are deliberately not
+// returned -- their dual-mask graphs are refused by union_rebind_apply, and a
+// read-back against a cache the graph does not execute is worse than none.
+static llama_kv_cache * union_kv_cache_of(llama_memory_i * mem) {
+    if (mem == nullptr) {
+        return nullptr;
+    }
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return h->get_mem_attn();
+    }
+    if (auto * k = dynamic_cast<llama_kv_cache *>(mem)) {
+        return k;
+    }
+    return nullptr;
+}
+
+// RAII build-width override: while alive, get_n_kv() reports `width` so the
+// graph under construction is sized at that width. Used for the envelope
+// build (allocation width) and for the scratch build at the target true
+// width. Exception-safe: an aborted build cannot leave the override armed.
+class union_nkv_build_guard {
+public:
+    union_nkv_build_guard(llama_kv_cache_context * kv, uint32_t width) : kv(kv) {
+        if (kv != nullptr && width != 0) {
+            kv->nkv_envelope_begin(width);
+            armed = true;
+        }
+    }
+
+    ~union_nkv_build_guard() {
+        if (armed) {
+            kv->nkv_envelope_end();
+        }
+    }
+
+    union_nkv_build_guard(const union_nkv_build_guard &) = delete;
+    union_nkv_build_guard & operator=(const union_nkv_build_guard &) = delete;
+
+private:
+    llama_kv_cache_context * kv = nullptr;
+    bool armed = false;
+};
+
+// RAII recurrent-state envelope override: while alive, get_n_rs()/get_head()/
+// get_rs_z() report the full state envelope (n_rs = size, head = 0, rs_z = 0)
+// so the graph is sized and sched-allocated for every legal live width. Used
+// only around model.build_graph(); the live values are bound in place after.
+class union_nrs_build_guard {
+public:
+    union_nrs_build_guard(llama_memory_recurrent_context * recr, uint32_t n_rs)
+        : recr(recr) {
+        if (recr != nullptr && n_rs != 0) {
+            recr->nrs_envelope_begin(n_rs, 0, 0);
+            armed = true;
+        }
+    }
+
+    ~union_nrs_build_guard() {
+        if (armed) {
+            recr->nrs_envelope_end();
+        }
+    }
+
+    union_nrs_build_guard(const union_nrs_build_guard &) = delete;
+    union_nrs_build_guard & operator=(const union_nrs_build_guard &) = delete;
+
+private:
+    llama_memory_recurrent_context * recr = nullptr;
+    bool armed = false;
+};
+// byte span actually addressed by a tensor: the last addressed byte minus the
+// base, plus one unit. For a contiguous tensor this equals ggml_nbytes; for a
+// permuted/strided view ggml_nbytes (ne product) underestimates the span, so
+// the envelope check uses this for views.
+//
+// Quantized types are blocked: ggml_element_size()/nb[0] are the size of one
+// block, not one element, so the first dimension contributes
+// type_size * (ne[0] / blck_size) blocks, not (ne[0] - 1) * nb[0]. For
+// blck_size == 1 this reduces to the plain formula.
+size_t union_tensor_span(const ggml_tensor * t) {
+    if (t == nullptr) {
+        return 0;
+    }
+    // a zero-size dimension addresses no bytes; the data pointer may legally
+    // sit one past the root allocation
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (t->ne[i] == 0) {
+            return 0;
+        }
+    }
+    const size_t blck = ggml_blck_size(t->type);
+    if (blck == 0 || t->ne[0] < 0 || t->ne[0] % (int64_t) blck != 0) return SIZE_MAX;
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (t->ne[i] < 0) return SIZE_MAX;
+        if (t->ne[i] == 0) return 0;
+    }
+    size_t span = ggml_type_size(t->type);
+    size_t first_stride;
+    if (__builtin_mul_overflow((size_t) (t->ne[0] / (int64_t) blck - 1), t->nb[0], &first_stride) ||
+            __builtin_add_overflow(span, first_stride, &span)) return SIZE_MAX;
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        size_t contribution;
+        if (__builtin_mul_overflow((size_t) (t->ne[i] - 1), t->nb[i], &contribution) ||
+            __builtin_add_overflow(span, contribution, &span)) return SIZE_MAX;
+    }
+    return span;
+}
+
+// ---- symbolic runtime shape analysis (fixed-topology binder) ----
+//
+// The bind path must not build a graph. To patch the live graph in place we
+// need the exact layout of every tensor that depends on a runtime parameter.
+// This pass derives those layouts symbolically:
+//
+//   - tagged roots (K/V view, KQ mask, out_ids, recurrent state views) start
+//     with the formula from their construction site;
+//   - every consumer is derived from its sources with the exact ggml op shape
+//     rule (the same ne/nb arithmetic the op constructor uses);
+//   - an op outside the implemented rule set, an ambiguous view, or a
+//     metadata mismatch makes the whole analysis fail closed.
+//
+// There is no finite-sample fitting: the coefficients are the op rules
+// themselves. The supported range is the standard dense Llama decoder path
+// with a plain or hybrid (non-iSWA) KV cache, no attention views, no
+// ALiBi/relative-position inputs, no MoE, and no top-k attention. Anything
+// else runs stock.
+
+// contiguous nb from ne for a block-size-1 type; false for quantized types
+// (a runtime-dependent quantized tensor is outside the supported range)
+static bool union_contiguous_nb(enum ggml_type type, const union_dim_expr ne[4], union_dim_expr nb[4]) {
+    if (ggml_blck_size(type) != 1) {
+        return false;
+    }
+    nb[0] = union_dim_const((int64_t) ggml_type_size(type));
+    for (int i = 1; i < 4; ++i) {
+        if (!union_dim_mul(nb[i - 1], ne[i - 1], nb[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// exact symbolic shape map for the live graph. Returns false when the graph is
+// outside the supported range or any dependent tensor cannot be derived by an
+// exact rule. On success, map.*_valid says which parameters are bindable.
+// Architectures the symbolic rules below cover. Dense Llama binds n_kv,
+// n_outputs and n_tokens; its token lane also needs an attention KV cache,
+// Flash Attention off and one RoPE position per token. The pure recurrent
+// families have no attention KV cache (env false, token_runtime false) and
+// reach the record build on the n_rs lane (n_rs length and head-selected
+// copy views). Qwen3-Next is excluded by n_expert > 0 and Qwen3.5 by the
+// one-position-per-token ROPE check; hybrid iSWA, hybrid_idx/QSA and
+// ingredient-replay rollback groups (gdn_replay) stay fail-closed.
+static bool union_arch_supported(llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_LLAMA:
+        case LLM_ARCH_MAMBA:
+        case LLM_ARCH_MAMBA2:
+        case LLM_ARCH_RWKV6:
+        case LLM_ARCH_RWKV6QWEN2:
+        case LLM_ARCH_RWKV7:
+        case LLM_ARCH_ARWKV7:
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN35:
+            return true;
+        default:
+            return false;
+    }
+}
+static bool union_shape_analyze(const llm_graph_params & params,
+                                const std::vector<ggml_tensor *> & t,
+                                const std::vector<int32_t> & src,
+                                const std::vector<uint8_t> & fixed,
+                                const std::vector<int32_t> & root,
+                                const std::vector<size_t> & root_offs,
+                                uint32_t base_nkv, uint32_t base_nout,
+                                uint32_t base_rs_head, uint32_t base_n_rs, bool token_runtime,
+                                llama_union_shape_map & map) {
+    map = llama_union_shape_map{};
+    map.base_nkv     = base_nkv;
+    map.base_nout    = base_nout;
+    map.base_ntok    = params.ubatch.n_tokens;
+    map.base_rs_head = base_rs_head;
+    map.base_n_rs    = base_n_rs;
+
+    // strict support range: the exact rules below are proven only for the
+    // architectures in union_arch_supported(); everything else runs stock.
+    if (!union_arch_supported(params.arch)) {
+        return false;
+    }
+    if (const auto * recr = union_recr_ctx(params.mctx); recr != nullptr && recr->gdn_replay()) {
+        // ingredient-replay state views select a group by the pending replay
+        // length (a runtime shape); keep stock. The K-snapshot rollback path
+        // (gdn_replay false, n_rs_seq > 0) is shape-stable and supported.
+        return false;
+    }
+    if (dynamic_cast<const llama_memory_hybrid_idx_context *>(params.mctx) != nullptr) {
+        // qwen4exp hybrid_idx/QSA has a second KV cache (idx) whose envelope
+        // build and QSA input runtime metadata are not covered by this map
+        return false;
+    }
+    if (params.hparams.use_alibi || params.hparams.n_expert > 0 || params.hparams.n_rel_attn_bkts > 0) {
+        return false;
+    }
+    if (!params.samplers.empty()) {
+        return false;
+    }
+    if (params.mctx == nullptr || union_is_hybrid_iswa(params.mctx) || union_has_attention_views(params.mctx)) {
+        return false;
+    }
+
+    const size_t n = t.size();
+    if (n == 0 || src.size() != n * (GGML_MAX_SRC + 1) || fixed.size() != n ||
+            root.size() != n || root_offs.size() != n) {
+        return false;
+    }
+
+    std::vector<union_shape_expr> expr(n);
+    std::vector<uint8_t> is_root(n, 0);
+    bool have_k = false, have_v = false, have_mask = false;
+    bool have_out_ids = false;
+    bool have_rs_zero_index = false;
+    bool have_copy = false, have_copy_extra = false, have_copy_dst = false, have_head_view = false;
+
+    for (size_t k = 0; k < n; ++k) {
+        for (int i = 0; i < 4; ++i) {
+            if (t[k]->ne[i] < 0 || t[k]->nb[i] > INT64_MAX) return false;
+            expr[k].ne[i].base = t[k]->ne[i];
+            expr[k].nb[i].base = t[k]->nb[i];
+        }
+        if (t[k]->view_offs > INT64_MAX || root_offs[k] > INT64_MAX) return false;
+        expr[k].view_offs.base = (int64_t) t[k]->view_offs;
+        expr[k].root_offs.base = (int64_t) root_offs[k];
+    }
+
+    for (size_t k = 0; k < n; ++k) {
+        if (root[k] < 0 || root[k] >= (int32_t) n) {
+            return false;
+        }
+    }
+
+    auto src_idx = [&](size_t k, int j) -> int32_t {
+        return src[k * (GGML_MAX_SRC + 1) + j];
+    };
+    std::unordered_map<const ggml_tensor *, int> token_roots;
+    if (token_runtime) {
+        for (const auto & input : params.res->inputs) {
+            if (const auto * embd = dynamic_cast<const llm_graph_input_embd *>(input.get())) {
+                if (embd->tokens) token_roots[embd->tokens] = 0;
+                if (embd->embd) token_roots[embd->embd] = 1;
+            } else if (const auto * pos = dynamic_cast<const llm_graph_input_pos *>(input.get())) {
+                if (pos->pos) token_roots[pos->pos] = 0;
+            } else if (const auto * attn = dynamic_cast<const llm_graph_input_attn_kv *>(input.get())) {
+                if (attn->get_k_idxs()) token_roots[attn->get_k_idxs()] = 0;
+                if (attn->get_v_idxs()) token_roots[attn->get_v_idxs()] = 0;
+            }
+        }
+    }
+    size_t found_token_roots = 0;
+
+
+    for (size_t k = 0; k < n; ++k) {
+        ggml_tensor * x = t[k];
+        if (strcmp(x->name, "union_nkv_k") == 0) {
+            // get_k: view_4d(head_k_eff, n_head_kv, n_kv, ns)
+            if (x->ne[2] != (int64_t) base_nkv) {
+                return false;
+            }
+            expr[k].ne[2].d_nkv = 1;
+            is_root[k] = 1;
+            have_k = true;
+        } else if (strcmp(x->name, "union_nkv_v") == 0) {
+            // get_v: non-transposed view_4d(head_v_eff, n_head_kv, n_kv, ns);
+            // transposed view_4d(n_kv, n_head_kv, head_v_eff, ns)
+            const int dim = x->nb[1] > x->nb[2] ? 0 : 2;
+            if (x->ne[dim] != (int64_t) base_nkv) {
+                return false;
+            }
+            expr[k].ne[dim].d_nkv = 1;
+            is_root[k] = 1;
+            have_v = true;
+        } else if (strcmp(x->name, "attn_inp_kq_mask") == 0) {
+            // ggml_new_tensor_4d(type, n_kv, n_tokens/n_stream, 1, n_stream)
+            if (x->ne[0] != (int64_t) base_nkv || ggml_blck_size(x->type) != 1) {
+                return false;
+            }
+            expr[k].ne[0].d_nkv = 1;
+            if (token_runtime) {
+                if (x->ne[1] != (int64_t) map.base_ntok) return false;
+                expr[k].ne[1].d_ntok = 1;
+            }
+            if (!union_contiguous_nb(x->type, expr[k].ne, expr[k].nb)) return false;
+            is_root[k] = 1;
+            have_mask = true;
+        } else if (strcmp(x->name, "union_out_ids") == 0) {
+            if (x->ne[0] != (int64_t) base_nout) {
+                return false;
+            }
+            expr[k].ne[0].d_nout = 1;
+            // The row count is the width, and the strides follow it exactly as
+            // they do for every other 1-D runtime root (the KQ mask, the token
+            // inputs, the GET_ROWS result): the bind writes ne[0] and the
+            // derived nb[1..3], so the live tensor stays a well-formed
+            // contiguous 1-D tensor at every bound width, and the key's
+            // name-based exclusion covers the strides it moves. A width-only
+            // coefficient would leave nb[1..3] frozen at their build value and
+            // the tensor non-contiguous (ggml_is_contiguous() false) after the
+            // first bind.
+            if (!union_contiguous_nb(x->type, expr[k].ne, expr[k].nb)) return false;
+            is_root[k] = 1;
+            have_out_ids = true;
+        } else if (token_roots.count(x)) {
+            const int axis = token_roots.at(x);
+            if (!map.base_ntok || x->ne[axis] % map.base_ntok != 0) return false;
+            expr[k].ne[axis].d_ntok = x->ne[axis] / map.base_ntok;
+            if (!union_contiguous_nb(x->type, expr[k].ne, expr[k].nb)) return false;
+            is_root[k] = 1;
+            ++found_token_roots;
+        } else if (strcmp(x->name, "union_rs_copy") == 0) {
+            // build_rs_inp_impl: I32 [n_rs] copy-index tensor
+            if (x->ne[0] != (int64_t) base_n_rs) {
+                return false;
+            }
+            expr[k].ne[0].d_nrs = 1;
+            is_root[k] = 1;
+            have_copy = true;
+        } else if (strcmp(x->name, "union_rs_copy_main") == 0) {
+            // constant-length prefix view of union_rs_copy; it must not inherit
+            // the source's n_rs coefficient (the main gather is fixed n_seqs)
+            if (x->view_src == nullptr || x->view_offs != 0) {
+                return false;
+            }
+            is_root[k] = 1;
+        } else if (strcmp(x->name, "union_rs_copy_extra") == 0) {
+            // view_1d(s_copy, n_rs - n_seqs, n_seqs * nb[0])
+            if (x->view_src == nullptr || x->view_src->ne[0] != (int64_t) base_n_rs) {
+                return false;
+            }
+            const int64_t n_seqs = x->view_src->ne[0] - x->ne[0];
+            if (n_seqs < 0 || x->view_offs != (uint64_t) (n_seqs * x->view_src->nb[0])) {
+                return false;
+            }
+            expr[k].ne[0].d_nrs = 1;
+            is_root[k] = 1;
+            have_copy_extra = true;
+        } else if (strcmp(x->name, "union_rs_copy_dst") == 0) {
+            // build_rs: view_2d(s, state_size, n_rs-n_seqs, s->nb[1], (head+n_seqs)*s->nb[1])
+            if (x->view_src == nullptr || x->ne[1] > (int64_t) base_n_rs) {
+                return false;
+            }
+            const int64_t row = (int64_t) x->view_src->nb[1];
+            const int64_t n_seqs = (int64_t) base_n_rs - x->ne[1];
+            if (x->view_offs != (uint64_t) (n_seqs * row)) {
+                return false;
+            }
+            expr[k].ne[1].d_nrs = 1;
+            expr[k].view_offs.d_head = row;
+            expr[k].root_offs.d_head = row;
+            is_root[k] = 1;
+            have_copy_dst = true;
+        } else if (strcmp(x->name, "union_rs_head_view") == 0) {
+            // model state-store view: a constant base slot plus head * row
+            // stride. The shape is constant; only the offset follows the head.
+            // The base may be nonzero (rollback group s_slot * mem_size).
+            if (x->view_src == nullptr) {
+                return false;
+            }
+            const int64_t row = (int64_t) x->view_src->nb[1];
+            expr[k].view_offs.d_head = row;
+            expr[k].root_offs.d_head = row;
+            is_root[k] = 1;
+            have_head_view = true;
+        } else if (strcmp(x->name, "union_rs_zero_index") == 0) {
+            // rs_z runtime parameter: I32 [1] zero-row index written by
+            // union_rsz_bind_index() on every set_inputs(). Its shape never
+            // depends on the row, so it is a fixed root (no coefficients) and
+            // it feeds no fill() list: the row is a value, not a shape. A
+            // tensor with this name and another shape is not the input this
+            // analysis understands, so the whole analysis fails closed.
+            if (x->ne[0] != 1 || x->type != GGML_TYPE_I32) {
+                return false;
+            }
+            is_root[k] = 1;
+            have_rs_zero_index = true;
+        }
+    }
+
+    const bool has_kv = union_kv_ctx(params.mctx) != nullptr;
+    const bool has_recr = union_recr_ctx(params.mctx) != nullptr;
+    // The zero-row index is a fixed root: it must not carry coefficients, and
+    // a graph that carries it must have a recurrent state to clear.
+    if (have_rs_zero_index && !has_recr) {
+        return false;
+    }
+
+    // topological propagation (the record is DFS post-order: sources first)
+    for (size_t k = 0; k < n; ++k) {
+        if (is_root[k] || fixed[k]) {
+            continue;
+        }
+        ggml_tensor * x = t[k];
+
+        int dep_src = -1;
+        for (int j = 0; j <= GGML_MAX_SRC; ++j) {
+            const int32_t v = src_idx(k, j);
+            if (v >= 0 && expr[v].dep()) {
+                dep_src = v;
+                break;
+            }
+        }
+        if (dep_src < 0) {
+            continue; // invariant
+        }
+
+        union_shape_expr out;
+        for (int i = 0; i < 4; ++i) {
+            out.ne[i] = union_dim_const(x->ne[i]);
+            out.nb[i] = union_dim_const(x->nb[i]);
+        }
+        out.view_offs = union_dim_const((int64_t) x->view_offs);
+        out.root_offs = union_dim_const((int64_t) root_offs[k]);
+
+        const int32_t s0i = src_idx(k, 0);
+        const int32_t s1i = src_idx(k, 1);
+        const int32_t s2i = src_idx(k, 2);
+        const int32_t vsi = src_idx(k, GGML_MAX_SRC);
+
+        auto need = [&](int32_t v) -> bool { return v >= 0 && v < (int32_t) n; };
+        auto shape_preserving = [&](const union_shape_expr & s) -> bool {
+            for (int i = 0; i < 4; ++i) {
+                out.ne[i] = s.ne[i];
+            }
+            if (x->view_src != nullptr) {
+                for (int i = 0; i < 4; ++i) {
+                    out.nb[i] = s.nb[i];
+                }
+                out.view_offs = union_dim_const((int64_t) x->view_offs);
+                out.root_offs = union_dim_add(s.root_offs, out.view_offs);
+            } else {
+                if (!union_contiguous_nb(x->type, out.ne, out.nb)) {
+                    return false;
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = union_dim_const(0);
+            }
+            return true;
+        };
+        // A full reshape may split or merge constant dimensions around one
+        // token dimension. Map that dimension by its linear element stride.
+        auto token_reshape = [&](int32_t si) -> bool {
+            if (!need(si)) return false;
+            const auto & source = expr[si];
+            int token_axis = -1;
+            int64_t source_total = 1, token_stride = 1, output_total = 1;
+            for (int i = 0; i < 4; ++i) {
+                const auto & d = source.ne[i];
+                if (d.invalid || d.d_nkv || d.d_nout || d.d_nrs || d.d_head || d.d_nkv_ntok) return false;
+                if (d.d_ntok) {
+                    if (token_axis >= 0 || d.base <= 0) return false;
+                    token_axis = i;
+                    token_stride = source_total;
+                }
+                if (__builtin_mul_overflow(source_total, d.base, &source_total) ||
+                    __builtin_mul_overflow(output_total, x->ne[i], &output_total)) return false;
+            }
+            if (token_axis < 0 || source_total != output_total) return false;
+            const int32_t tag = x->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1];
+            if ((tag & ~3) == LLM_TOKEN_AXIS_MARKER) {
+                const int axis = tag & 3;
+                const int64_t base = source.ne[token_axis].base;
+                if (base <= 0 || x->ne[axis] % base != 0) {
+                    return false;
+                }
+                const int64_t factor = x->ne[axis] / base;
+                // The marked axis carries the token axis when one token's
+                // elements span the axis exactly once: the axis's byte stride
+                // times the number of tokens it folds equals the source token
+                // stride in bytes. This is the factor-1 case of the old
+                // `prefix == token_stride` test, generalized to a marked axis
+                // that folds the token axis into a larger extent. The
+                // transposed V cache write flattens (n_embd, n_tokens) to
+                // (1, n_embd*n_tokens), where the token stride lies inside
+                // axis 1 instead of at its start.
+                int64_t token_bytes, axis_bytes;
+                if (__builtin_mul_overflow(token_stride, (int64_t) ggml_type_size(x->type), &token_bytes) ||
+                        __builtin_mul_overflow((int64_t) x->nb[axis], factor, &axis_bytes) ||
+                        token_bytes != axis_bytes) {
+                    return false;
+                }
+                return union_dim_mul(source.ne[token_axis], union_dim_const(factor), out.ne[axis]);
+            }
+            // Equal layouts preserve the source axis even when its build
+            // width is one and several dimensions have the same value.
+            bool identity = true;
+            for (int i = 0; i < 4; ++i) identity &= x->ne[i] == t[si]->ne[i];
+            if (identity) {
+                for (int i = 0; i < 4; ++i) out.ne[i] = source.ne[i];
+                return true;
+            }
+            int64_t stride = 1;
+            int output_axis = -1;
+            int fallback_axis = -1;
+            int64_t fallback_stride = 1;
+            for (int i = 0; i < 4; ++i) {
+                int64_t next;
+                if (__builtin_mul_overflow(stride, x->ne[i], &next)) return false;
+                // The token axis starts at `token_stride` in the source. An
+                // output axis carries it when the token axis lies strictly
+                // inside the axis. A merge with a trailing extent of one
+                // instead leaves the token axis at the axis start: a 1-token
+                // build folds it onto the axis that begins exactly at its
+                // stride, e.g. the 2-D cache-write view (n_embd_gqa,
+                // n_tokens) of a (n_embd_head, n_head, n_tokens) source at
+                // n_tokens == 1. That equality is only a fallback, kept so an
+                // extent-1 axis before the real token axis cannot win; the
+                // widest candidate (earliest on a tie) is used when no axis
+                // holds the token stride strictly.
+                if (token_stride >= stride && token_stride < next) {
+                    output_axis = i;
+                    break;
+                }
+                if (stride == token_stride &&
+                        (fallback_axis < 0 || x->ne[i] > x->ne[fallback_axis])) {
+                    fallback_axis = i;
+                    fallback_stride = stride;
+                }
+                stride = next;
+            }
+            if (output_axis < 0) {
+                output_axis = fallback_axis;
+                stride = fallback_stride;
+            }
+            int64_t token_end, output_end;
+            if (output_axis < 0 || token_stride % stride ||
+                    __builtin_mul_overflow(token_stride, source.ne[token_axis].base, &token_end) ||
+                    __builtin_mul_overflow(stride, x->ne[output_axis], &output_end) || token_end > output_end ||
+                    x->ne[output_axis] % source.ne[token_axis].base) return false;
+            const int64_t factor = x->ne[output_axis] / source.ne[token_axis].base;
+            return union_dim_mul(source.ne[token_axis], union_dim_const(factor), out.ne[output_axis]);
+        };
+
+
+        switch (x->op) {
+            case GGML_OP_VIEW: {
+                // A fused-QKV projection slice is marked at build time. Each
+                // is a non-contiguous row slice of one fused matmul, so the
+                // general path below cannot prove its fused row stride. Every
+                // refusal of this view names that reason; the analysis still
+                // fails closed.
+                const bool fused_qkv_slice =
+                    x->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == LLM_FUSED_QKV_SLICE_MARKER;
+                auto view_refuse = [&]() -> bool {
+                    if (fused_qkv_slice) map.fused_qkv_refused = true;
+                    return false;
+                };
+                if (!need(vsi)) {
+                    return view_refuse();
+                }
+                if (token_runtime && need(s0i) && ggml_is_contiguous(t[s0i]) &&
+                        ggml_is_contiguous(x) && x->view_offs == t[s0i]->view_offs) {
+                    bool token_dep = false;
+                    for (const auto & dim : expr[s0i].ne) token_dep |= dim.d_ntok != 0;
+                    if (token_dep) {
+                        if (!token_reshape(s0i) || !union_contiguous_nb(x->type, out.ne, out.nb)) return view_refuse();
+                        out.view_offs = expr[s0i].view_offs;
+                        out.root_offs = expr[s0i].root_offs;
+                        break;
+                    }
+                }
+                const union_shape_expr & s = expr[vsi];
+                for (int i = 0; i < 4; ++i) {
+                    int match = -1;
+                    for (int j = 0; j < 4; ++j) {
+                        if (x->ne[i] == t[vsi]->ne[j]) {
+                            if (match >= 0 && !union_dim_equal(s.ne[match], s.ne[j])) {
+                                return view_refuse(); // ambiguous structural match
+                            }
+                            match = j;
+                        }
+                    }
+                    if (match >= 0) {
+                        out.ne[i] = s.ne[match];
+                    } else {
+                        if (s.dep()) {
+                            // no structural match on a dependent source: the
+                            // view may encode a product/slice we cannot prove
+                            return view_refuse();
+                        }
+                        if (x->ne[i] == (int64_t) base_nkv || x->ne[i] == (int64_t) base_nout ||
+                                x->ne[i] == (int64_t) base_n_rs || x->ne[i] == (int64_t) base_rs_head) {
+                            return view_refuse();
+                        }
+                        out.ne[i] = union_dim_const(x->ne[i]);
+                    }
+                    match = -1;
+                    for (int j = 0; j < 4; ++j) {
+                        if (x->nb[i] == t[vsi]->nb[j]) {
+                            if (match >= 0 && !union_dim_equal(s.nb[match], s.nb[j])) {
+                                return view_refuse(); // ambiguous structural match
+                            }
+                            match = j;
+                        }
+                    }
+                    if (match >= 0) {
+                        out.nb[i] = s.nb[match];
+                    } else {
+                        if (s.dep()) {
+                            return view_refuse();
+                        }
+                        out.nb[i] = union_dim_const((int64_t) x->nb[i]);
+                    }
+                }
+                out.view_offs = x->view_offs == t[vsi]->view_offs
+                    ? s.view_offs
+                    : union_dim_const((int64_t) x->view_offs);
+                out.root_offs = union_dim_add(s.root_offs, out.view_offs);
+            } break;
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE: {
+                if (!need(s0i)) {
+                    return false;
+                }
+                const union_shape_expr & s = expr[s0i];
+                int32_t axes[4] = { 0, 1, 2, 3 };
+                if (x->op == GGML_OP_PERMUTE) {
+                    memcpy(axes, x->op_params, sizeof(axes));
+                } else {
+                    axes[0] = 1;
+                    axes[1] = 0;
+                }
+                for (int i = 0; i < 4; ++i) {
+                    if (axes[i] < 0 || axes[i] > 3) {
+                        return false;
+                    }
+                    out.ne[axes[i]] = s.ne[i];
+                    out.nb[axes[i]] = s.nb[i];
+                }
+                // ggml_permute/ggml_transpose use ggml_view_tensor: the
+                // result aliases the source with view_offs == 0
+                if (x->view_offs != 0) {
+                    return false;
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = s.root_offs;
+            } break;
+            case GGML_OP_RESHAPE: {
+                if (!need(s0i)) {
+                    return false;
+                }
+                const union_shape_expr & s = expr[s0i];
+                bool token_dep = false;
+                for (const auto & dim : s.ne) token_dep |= dim.d_ntok != 0;
+                if (token_dep) {
+                    if (!token_reshape(s0i) || !union_contiguous_nb(x->type, out.ne, out.nb)) return false;
+                    out.view_offs = union_dim_const(0);
+                    out.root_offs = x->view_src != nullptr ? s.root_offs : union_dim_const(0);
+                    break;
+                }
+                for (int i = 0; i < 4; ++i) {
+                    int match = -1;
+                    for (int j = 0; j < 4; ++j) {
+                        if (x->ne[i] == t[s0i]->ne[j]) {
+                            if (match >= 0 && !union_dim_equal(s.ne[match], s.ne[j])) {
+                                return false; // ambiguous structural match
+                            }
+                            match = j;
+                        }
+                    }
+                    if (match >= 0) {
+                        out.ne[i] = s.ne[match];
+                    } else {
+                        if (s.dep()) {
+                            // a reshape can fold several dims into a product;
+                            // without a single structural match, fail closed
+                            return false;
+                        }
+                        if (x->ne[i] == (int64_t) base_nkv || x->ne[i] == (int64_t) base_nout ||
+                                x->ne[i] == (int64_t) base_n_rs || x->ne[i] == (int64_t) base_rs_head) {
+                            return false;
+                        }
+                        out.ne[i] = union_dim_const(x->ne[i]);
+                    }
+                }
+                if (!union_contiguous_nb(x->type, out.ne, out.nb)) {
+                    return false;
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = x->view_src != nullptr ? s.root_offs : union_dim_const(0);
+            } break;
+            case GGML_OP_CONT: {
+                if (!need(s0i)) {
+                    return false;
+                }
+                bool same_shape = true;
+                for (int i = 0; i < 4; ++i) same_shape &= x->ne[i] == t[s0i]->ne[i];
+                const int32_t tag = x->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1];
+                if (token_runtime && (tag & ~3) == LLM_TOKEN_AXIS_MARKER) {
+                    if (!token_reshape(s0i)) return false;
+                } else if (same_shape) {
+                    for (int i = 0; i < 4; ++i) out.ne[i] = expr[s0i].ne[i];
+                } else if (!token_runtime || !token_reshape(s0i)) {
+                    return false;
+                }
+                if (!union_contiguous_nb(x->type, out.ne, out.nb)) {
+                    return false;
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = union_dim_const(0);
+            } break;
+            case GGML_OP_CPY: {
+                if (t[k]->src[1] == t[k]) {
+                    // ggml_cast: new contiguous tensor with the source shape
+                    if (!need(s0i)) {
+                        return false;
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        out.ne[i] = expr[s0i].ne[i];
+                    }
+                    if (!union_contiguous_nb(x->type, out.ne, out.nb)) {
+                        return false;
+                    }
+                    out.view_offs = union_dim_const(0);
+                    out.root_offs = union_dim_const(0);
+                } else {
+                    // ggml_cpy: ggml_cpy_impl() returns ggml_view_tensor(b),
+                    // i.e. a view of the destination flattened to the
+                    // destination's ultimate source. Its shape is the
+                    // destination's shape, its view_offs is the destination's
+                    // (absolute) view offset and its root is the destination's
+                    // root, so both offsets follow the destination view's
+                    // symbolic expressions -- not the build-time constants,
+                    // which would leave a head-moved copy destination stale.
+                    if (!need(s1i)) {
+                        return false;
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        out.ne[i] = expr[s1i].ne[i];
+                        out.nb[i] = expr[s1i].nb[i];
+                    }
+                    out.view_offs = expr[s1i].view_offs;
+                    out.root_offs = expr[s1i].root_offs;
+                }
+            } break;
+            case GGML_OP_ROPE:
+                if (token_runtime) {
+                    if (!need(s0i) || !need(s1i) || !union_dim_equal(expr[s1i].ne[0], expr[s0i].ne[2])) return false;
+                    if (!shape_preserving(expr[s0i])) return false;
+                    break;
+                }
+                /* fall through */
+            case GGML_OP_SOFT_MAX:
+            case GGML_OP_SCALE:
+            case GGML_OP_ADD:
+            case GGML_OP_MUL:
+            case GGML_OP_SUB:
+            case GGML_OP_DIV:
+            case GGML_OP_NORM:
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_UNARY: {
+                int dep = need(s0i) ? s0i : (need(s1i) ? s1i : -1);
+                if (dep < 0) {
+                    return false;
+                }
+                if (need(s0i) && need(s1i)) {
+                    // broadcast: a constant-1 dim yields to the other source;
+                    // two different dependent shapes cannot be represented
+                    int winner = -1;
+                    for (int i = 0; i < 4; ++i) {
+                        const union_dim_expr & a = expr[s0i].ne[i];
+                        const union_dim_expr & b = expr[s1i].ne[i];
+                        int w = -1;
+                        if (union_dim_equal(a, b)) {
+                            w = -1;
+                        } else if (a.base == 1 && !a.dep()) {
+                            w = s1i;
+                        } else if (b.base == 1 && !b.dep()) {
+                            w = s0i;
+                        } else {
+                            return false;
+                        }
+                        if (w >= 0) {
+                            if (winner >= 0 && winner != w) {
+                                return false;
+                            }
+                            winner = w;
+                        }
+                    }
+                    if (winner >= 0) {
+                        dep = winner;
+                    }
+                }
+                if (!shape_preserving(expr[dep])) {
+                    return false;
+                }
+            } break;
+            case GGML_OP_GLU: {
+                if (!need(s0i)) {
+                    return false;
+                }
+                const union_shape_expr & s = expr[s0i];
+                for (int i = 0; i < 4; ++i) {
+                    out.ne[i] = s.ne[i];
+                }
+                if (x->src[1] == nullptr) {
+                    // merged GLU: ne[0] = a->ne[0] / 2
+                    union_dim_expr half = s.ne[0];
+                    if (half.base % 2 != 0 || half.d_nkv % 2 != 0 || half.d_nout % 2 != 0 ||
+                            half.d_head % 2 != 0 || half.d_nrs % 2 != 0 ||
+                            half.d_ntok % 2 != 0 || half.d_nkv_ntok % 2 != 0) {
+                        return false;
+                    }
+                    half.base /= 2;
+                    half.d_nkv /= 2;
+                    half.d_nout /= 2;
+                    half.d_head /= 2;
+                    half.d_nrs /= 2;
+                    half.d_ntok /= 2;
+                    half.d_nkv_ntok /= 2;
+                    out.ne[0] = half;
+                }
+                if (!union_contiguous_nb(x->type, out.ne, out.nb)) {
+                    return false;
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = union_dim_const(0);
+            } break;
+            case GGML_OP_MUL_MAT: {
+                out.ne[0] = expr[s0i].ne[1];
+                out.ne[1] = expr[s1i].ne[1];
+                out.ne[2] = expr[s1i].ne[2];
+                out.ne[3] = expr[s1i].ne[3];
+                if (!union_contiguous_nb(x->type, out.ne, out.nb)) {
+                    return false;
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = union_dim_const(0);
+            } break;
+            case GGML_OP_GET_ROWS: {
+                out.ne[0] = expr[s0i].ne[0];
+                out.ne[1] = expr[s1i].ne[0];
+                out.ne[2] = expr[s1i].ne[1];
+                out.ne[3] = expr[s1i].ne[2];
+                if (!union_contiguous_nb(x->type, out.ne, out.nb)) {
+                    return false;
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = union_dim_const(0);
+            } break;
+            case GGML_OP_FLASH_ATTN_EXT: {
+                out.ne[0] = expr[s2i].ne[0];
+                out.ne[1] = expr[s0i].ne[2];
+                out.ne[2] = expr[s0i].ne[1];
+                out.ne[3] = expr[s0i].ne[3];
+                if (!union_contiguous_nb(x->type, out.ne, out.nb)) {
+                    return false;
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = union_dim_const(0);
+            } break;
+            case GGML_OP_PAD: {
+                if (!need(s0i)) {
+                    return false;
+                }
+                const int32_t * pads = (const int32_t *) x->op_params;
+                for (int i = 0; i < 4; ++i) {
+                    // ggml_pad_ext stores (left, right) per dimension
+                    out.ne[i] = union_dim_add(expr[s0i].ne[i],
+                            union_dim_const(pads[2*i] + pads[2*i + 1]));
+                }
+                if (!union_contiguous_nb(x->type, out.ne, out.nb)) {
+                    return false;
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = union_dim_const(0);
+            } break;
+            case GGML_OP_SUM_ROWS: {
+                if (!need(s0i)) {
+                    return false;
+                }
+                // ggml_sum_rows: ne = {1, a->ne[1], a->ne[2], a->ne[3]}
+                out.ne[0] = union_dim_const(1);
+                out.ne[1] = expr[s0i].ne[1];
+                out.ne[2] = expr[s0i].ne[2];
+                out.ne[3] = expr[s0i].ne[3];
+                if (!union_contiguous_nb(x->type, out.ne, out.nb)) {
+                    return false;
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = union_dim_const(0);
+            } break;
+            case GGML_OP_CONCAT: {
+                const int axis = ((const int32_t *) x->op_params)[0];
+                if (axis < 0 || axis > 3 || !need(s0i)) {
+                    return false;
+                }
+                for (int i = 0; i < 4; ++i) {
+                    if (i == axis) {
+                        continue;
+                    }
+                    out.ne[i] = expr[s0i].ne[i];
+                }
+                union_dim_expr sum = union_dim_const(0);
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    const int32_t v = src_idx(k, j);
+                    if (v < 0) {
+                        continue;
+                    }
+                    if (!need(v)) {
+                        return false;
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        if (i != axis && !union_dim_equal(out.ne[i], expr[v].ne[i])) {
+                            return false;
+                        }
+                    }
+                    sum = union_dim_add(sum, expr[v].ne[axis]);
+                }
+                out.ne[axis] = sum;
+                if (!union_contiguous_nb(x->type, out.ne, out.nb)) {
+                    return false;
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = union_dim_const(0);
+            } break;
+            case GGML_OP_SET_ROWS: {
+                // ggml_set_rows(cache, cur, idxs): src[0] is the value tensor,
+                // src[1] the row indices, src[2] the destination. The result
+                // is a view of the destination, so it carries the
+                // destination's layout.
+                const int32_t rs = src_idx(k, 0);
+                const int32_t is = src_idx(k, 1);
+                const int32_t ds = src_idx(k, 2);
+                if (!need(rs) || !need(is) || !need(ds)) {
+                    return false;
+                }
+                // The SET_ROWS shape contract (destination frozen, index/value
+                // cross-check, post-copy kernel invariants) is one pure
+                // predicate shared with tests/test-union-shape-guard.cpp.
+                if (!union_set_rows_shape_ok(expr[ds], expr[rs], expr[is],
+                                             (int64_t) ggml_type_size(x->type),
+                                             ggml_blck_size(x->type), out)) {
+                    return false;
+                }
+                out.view_offs = union_dim_const((int64_t) x->view_offs);
+                out.root_offs = union_dim_add(expr[ds].root_offs, out.view_offs);
+            } break;
+            case GGML_OP_MAP_CUSTOM2: {
+                // in-place op: the output aliases src[0]; the zero-row op
+                // carries no shape coefficients of its own.
+                const int32_t s0i = src_idx(k, 0);
+                if (!need(s0i)) {
+                    return false;
+                }
+                for (int i = 0; i < 4; ++i) {
+                    out.ne[i] = expr[s0i].ne[i];
+                    out.nb[i] = expr[s0i].nb[i];
+                }
+                out.view_offs = expr[s0i].view_offs;
+                out.root_offs = expr[s0i].root_offs;
+            } break;
+            case GGML_OP_SSM_CONV:
+            case GGML_OP_SSM_SCAN: {
+                // the recurrent state and token axes are constant at the
+                // envelope; the ids input is a root with zero coefficients.
+                for (int i = 0; i < 4; ++i) {
+                    out.ne[i] = union_dim_const(x->ne[i]);
+                    out.nb[i] = union_dim_const(x->nb[i]);
+                }
+                out.view_offs = union_dim_const(0);
+                out.root_offs = union_dim_const(0);
+            } break;
+            default:
+                LLAMA_LOG_ERROR("%s: unsupported op %s tensor %s\n",
+                        __func__, ggml_op_name(x->op), x->name);
+                return false;
+        }
+
+        // the rule must reproduce the live metadata exactly
+        for (int i = 0; i < 4; ++i) {
+            if (out.ne[i].invalid || out.nb[i].invalid || out.ne[i].base != x->ne[i] ||
+                    out.nb[i].base != (int64_t) x->nb[i]) {
+                return false;
+            }
+        }
+        if (out.view_offs.invalid || out.root_offs.invalid ||
+                out.view_offs.base != (int64_t) x->view_offs ||
+                out.root_offs.base != (int64_t) root_offs[k]) {
+            LLAMA_LOG_ERROR("%s: offset mismatch tensor %s op %s: view %lld vs %lld root %lld vs %lld\n",
+                    __func__, x->name, ggml_op_name(x->op),
+                    (long long) out.view_offs.base, (long long) x->view_offs,
+                    (long long) out.root_offs.base, (long long) root_offs[k]);
+            return false;
+        }
+
+        expr[k] = out;
+    }
+
+    auto coefficient = [](const union_dim_expr & e, int which) -> int64_t {
+        switch (which) {
+            case 0: return e.d_nkv;
+            case 1: return e.d_nout;
+            case 2: return e.d_head;
+            case 3: return e.d_nrs;
+            case 4: return e.d_ntok;
+            default: return e.d_nkv_ntok;
+        }
+    };
+    // materialize the per-parameter coefficient lists
+    auto fill = [&](int which, bool valid, std::vector<llama_union_shape_coeff> & list, bool & out_valid) {
+        out_valid = valid;
+        if (!valid) {
+            return;
+        }
+        for (size_t k = 0; k < n; ++k) {
+            const union_shape_expr & e = expr[k];
+            llama_union_shape_coeff c;
+            c.tensor = (uint32_t) k;
+            bool any = false;
+            for (int i = 0; i < 4; ++i) {
+                c.ne[i] = coefficient(e.ne[i], which);
+                c.nb[i] = coefficient(e.nb[i], which);
+                c.base_ne[i] = e.ne[i].base;
+                c.base_nb[i] = e.nb[i].base;
+                any = any || c.ne[i] != 0 || c.nb[i] != 0;
+            }
+            c.view_offs = coefficient(e.view_offs, which);
+            c.root_offs = coefficient(e.root_offs, which);
+            c.base_view_offs = e.view_offs.base;
+            c.base_root_offs = e.root_offs.base;
+            any = any || c.view_offs != 0 || c.root_offs != 0;
+            if (any) {
+                list.push_back(c);
+            }
+        }
+    };
+
+    fill(0, has_kv && have_k && have_v && have_mask, map.nkv, map.nkv_valid);
+    fill(1, have_out_ids, map.nout, map.nout_valid);
+    fill(2, has_recr && have_copy_dst && have_head_view, map.rs_head, map.rs_head_valid);
+    fill(3, has_recr && have_copy && have_copy_extra && have_copy_dst, map.rs_len, map.nrs_valid);
+    fill(4, token_runtime && found_token_roots >= 3, map.ntok, map.ntok_valid);
+    bool mixed_valid = false;
+    fill(5, map.ntok_valid && map.nkv_valid, map.nkv_ntok, mixed_valid);
+    if (token_runtime && !map.ntok_valid) return false;
+
+    // A KV graph whose n_kv closure could not be derived must not keep the
+    // full-capacity build: the live mask would stay at cap while the reuse
+    // target is the applied width, and every ubatch would rebuild. Fail the
+    // whole analysis so the caller rebuilds at the stock width.
+    if (has_kv && !map.nkv_valid) {
+        return false;
+    }
+
+    return map.any_valid();
+}
+
+} // namespace
+
+// FA widths bound by the union binder use a CUDA/ROCm-specific head-dimension
+// guard. Other non-CPU backends and unknown placements must not use that
+// whitelist.
+bool llama_context::union_graph_gpu_fa_accepts_width(llm_graph_result * res, uint32_t n_kv) const {
+    ggml_cgraph * gf = res != nullptr ? res->get_gf() : nullptr;
+    if (gf == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+        ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+        if (b == backend_cpu) {
+            continue;
+        }
+        if (b == nullptr) {
+            return false;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(b);
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        const char * name = reg != nullptr ? ggml_backend_reg_name(reg) : nullptr;
+        if (name == nullptr || (std::strcmp(name, "CUDA") != 0 && std::strcmp(name, "ROCm") != 0)) {
+            return false;
+        }
+        const ggml_tensor * K = node->src[1];
+        const ggml_tensor * V = node->src[2];
+        if (K == nullptr || V == nullptr ||
+                !union_fa_head_dim_generic((uint32_t) K->ne[0], (uint32_t) V->ne[0])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// true when the scheduler runs the whole graph on the single CPU backend.
+// Used as the first-build proof for the n_outputs envelope: the split count is
+// only known after alloc_graph, while a single-backend CPU scheduler is
+// patch-safe by construction.
+bool llama_context::union_sched_cpu_only() const {
+    if (sched == nullptr || backend_cpu == nullptr) {
+        return false;
+    }
+    if (ggml_backend_sched_get_n_backends(sched.get()) != 1) {
+        return false;
+    }
+    return ggml_backend_sched_get_backend(sched.get(), 0) == backend_cpu;
+}
+
+// The patch requires one live split and rejects relay and pipeline contexts.
+// Split input copies are checked against their allocation envelopes by the
+// scheduler before any tensor is changed.
+bool llama_context::union_sched_single_split() const {
+    if (sched == nullptr || backend_cpu == nullptr) {
+        return false;
+    }
+    if (backend_tp5_relay != nullptr || cparams.pipeline_parallel) {
+        return false;
+    }
+    return ggml_backend_sched_get_n_splits(sched.get()) == 1;
+}
+// in-place runtime-parameter bind. The live graph is never rebuilt here: the
+// symbolic shape map (union_shape_analyze) derives each dependent layout as
+// linear terms and an n_kv * n_tokens cross term. The bind validates and
+// applies those values.
+// Bind-trace switch: GGML_TP5_UNION_BIND_TRACE=1 (the exact-one contract of
+// llama-union-binder.h) turns on the per-attempt trace lines below. OFF by
+// default, and deliberately so: a decode step binds once, so a 300-step run
+// would emit 300 ERROR lines, and a shipped lane must not. The COUNTERS are
+// the always-on observable; the trace only explains a refusal a counter
+// cannot attribute (several rules share c_fallbacks), and the named
+// site=<slug> in each refusal line is what makes a refusal reproducible.
+static bool union_bind_trace_on() {
+    static const bool on = llama_union_gate_exact_one(std::getenv("GGML_TP5_UNION_BIND_TRACE"));
+    return on;
+}
+
+bool llama_context::union_rebind_apply(llm_graph_result * res,
+                                       const llm_graph_params & params,
+                                       const llama_union_tensor_set & set,
+                                       uint32_t new_nkv,
+                                       uint32_t new_nout,
+                                       uint32_t new_n_rs,
+                                       uint32_t new_rs_head) {
+    auto & st = llama_nkv_ctx_state_get(this);
+    // Every envelope refusal names its rule and what it saw. The counters say
+    // how many binds were refused; a refusal nobody can attribute is a refusal
+    // nobody can fix, so the one line below is part of the contract, not
+    // debug output. It fires only on a refusal (never on a bind), and the
+    // counter semantics are exactly the ones the sites had before.
+    auto refuse_envelope = [&st](const char * site, const ggml_tensor * x,
+                                 const char * what, long long a, long long b) {
+        ++st.c_refused_envelope;
+        ++st.c_fallbacks;
+        if (x != nullptr) {
+            if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: envelope refusal %s: tensor %s op %s "
+                            "ne=[%lld %lld %lld %lld] nb=[%lld %lld %lld %lld] "
+                            "view_offs=%lld %s (%lld vs %lld)\n",
+                            "union_rebind_apply", site, x->name, ggml_op_name(x->op),
+                            (long long) x->ne[0], (long long) x->ne[1],
+                            (long long) x->ne[2], (long long) x->ne[3],
+                            (long long) x->nb[0], (long long) x->nb[1],
+                            (long long) x->nb[2], (long long) x->nb[3],
+                            (long long) x->view_offs,
+                            what, a, b);
+        } else {
+            if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: envelope refusal %s: %s (%lld vs %lld)\n",
+                            "union_rebind_apply", site, what, a, b);
+        }
+    };
+    // A step may mark no token as output, and the output-gather closure IS
+    // bindable to width 0. ggml_get_rows over a zero-row index yields a
+    // zero-row result (its ne[0] is the SOURCE width, its ne[1] the index
+    // length), every tensor of the closure derives its row axis from that
+    // result, and union_tensor_span() already treats a zero-size dimension as
+    // addressing no bytes, so the patch is a shrink like any other. The one
+    // thing that must not happen is a write past the live tensor:
+    // llm_graph_input_out_ids::set_input() bounds its write by out_ids->ne[0]
+    // for exactly this case.
+    //
+    // Refusing here is what this function did before the zero-output cell
+    // existed, and it cost two builds plus a build width the step did not ask
+    // for (nout_suppress_envelope, then graph_params() at the active count).
+    // Every registered kind passes the current n_outputs here, so this is the
+    // one place the rule lives.
+
+    if (set.tensors == nullptr || set.src == nullptr || set.fixed == nullptr ||
+            set.bytes == nullptr || set.root == nullptr || set.root_offs == nullptr ||
+            set.root_bytes == nullptr) {
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=set_vectors\n", "union_rebind_apply");
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    const std::vector<ggml_tensor *> & record_t          = *set.tensors;
+    const std::vector<int32_t>       & record_src        = *set.src;
+    const std::vector<uint8_t>       & record_fixed      = *set.fixed;
+    const std::vector<size_t>        & record_bytes      = *set.bytes;
+    const std::vector<size_t>        & record_root_bytes = *set.root_bytes;
+    // Bind decision trace: one line per attempt, naming every input the
+    // decision reads. A refusal that cannot be attributed to a rule is not
+    // diagnosable from the counters alone (several rules share a counter).
+    if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind attempt new_nkv=%u new_nout=%u new_n_rs=%u new_head=%u | "
+                    "record_cap=%u record_bound=%u cap_nout=%u bound_nout=%u has_out_ids=%d "
+                    "bound_ntok=%u | base_nkv=%u base_nout=%u base_ntok=%u ntok_valid=%d "
+                    "nkv_valid=%d nout_valid=%d | ubatch n_tokens=%u\n",
+                    "union_rebind_apply", new_nkv, new_nout, new_n_rs, new_rs_head,
+                    st.record_cap, st.record_bound, st.record_cap_nout, st.record_bound_nout,
+                    st.record_has_out_ids ? 1 : 0, st.record_bound_ntok,
+                    st.shape_map.base_nkv, st.shape_map.base_nout, st.shape_map.base_ntok,
+                    st.shape_map.ntok_valid ? 1 : 0, st.shape_map.nkv_valid ? 1 : 0,
+                    st.shape_map.nout_valid ? 1 : 0, params.ubatch.n_tokens);
+
+    if (!res || res->get_gf() == nullptr || !st.record_valid || record_t.empty()) {
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=no_record res=%d gf=%d valid=%d n=%zu\n",
+                        "union_rebind_apply", res != nullptr ? 1 : 0,
+                        (res != nullptr && res->get_gf() != nullptr) ? 1 : 0,
+                        st.record_valid ? 1 : 0, record_t.size());
+        ++st.c_fallbacks;
+        return false;
+    }
+    // The single graph cache key, as the first gate: the live graph must be
+    // the graph the record describes. The record is taken from this graph at
+    // its build shapes, and every successful bind refreshes the key to the
+    // bound shapes (see the refresh next to st.record_bound* below), so the
+    // two sides always describe the same moment. A graph that was rebuilt, or
+    // whose shapes were changed behind the binder's back, fails here before
+    // any address is trusted.
+    //
+    // This gate is strictly additive: it can refuse a bind the address walk
+    // would have accepted, never accept one the walk would refuse. The walk
+    // below remains the authority for the tensor-level identity - the key says
+    // "same topology", the walk says "same tensor objects".
+    {
+        const llama_topology_key live =
+                llama_topology_key_of(res->get_gf(), union_topology_key_excl(st.shape_map, st.record_t));
+        if (union_bind_trace_on()) {
+            LLAMA_LOG_ERROR("%s: topology gate live hash=%016llx nodes=%u | "
+                            "record hash=%016llx nodes=%u | gf=%p res_gf=%p same=%d\n",
+                            "union_rebind_apply",
+                            (unsigned long long) live.hash, live.n_nodes,
+                            (unsigned long long) st.record_topology_key.hash,
+                            st.record_topology_key.n_nodes,
+                            (const void *) res->get_gf(), (const void *) res->get_gf(),
+                            (int) (live.hash == st.record_topology_key.hash &&
+                                   live.n_nodes == st.record_topology_key.n_nodes));
+        }
+        if (!llama_topology_same(live, st.record_topology_key)) {
+            ++st.c_refused_topology;
+            ++st.c_fallbacks;
+            return false;
+        }
+    }
+    if (backend_tp5_relay != nullptr || cparams.pipeline_parallel) {
+        if (backend_tp5_relay != nullptr) {
+            ++st.c_refused_relay;
+        }
+        if (cparams.pipeline_parallel) {
+            ++st.c_refused_pipeline;
+        }
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (!union_sched_single_split()) {
+        ++st.c_refused_backend;
+        ++st.c_fallbacks;
+        return false;
+    }
+    // Scheduler split copies are validated together with the proposed graph
+    // layouts below, after the complete tensor patch has been computed.
+    auto compatible = params;
+    if (st.shape_map.ntok_valid && !params.ubatch.equal_seqs() &&
+            params.ubatch.n_seqs_unq == 1 && params.ubatch.n_seq_tokens == 1 &&
+            params.ubatch.n_seqs == params.ubatch.n_tokens &&
+            params.ubatch.n_tokens > 0 && params.ubatch.n_tokens <= cparams.n_ubatch) {
+        compatible.ubatch.n_tokens = res->get_params().ubatch.n_tokens;
+        compatible.ubatch.n_seqs = res->get_params().ubatch.n_seqs;
+    }
+    if (!res->get_params().allow_reuse(compatible, /*ignore_runtime=*/true)) {
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=allow_reuse\n", "union_rebind_apply");
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (union_is_hybrid_iswa(params.mctx)) {
+        ++st.c_refused_iswa;
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (dynamic_cast<const llama_memory_hybrid_idx_context *>(params.mctx) != nullptr) {
+        ++st.c_refused_iswa;
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (union_has_attention_views(params.mctx)) {
+        ++st.c_refused_reader;
+        ++st.c_fallbacks;
+        return false;
+    }
+    for (const auto & input : res->inputs) {
+        if (input->union_has_readers()) {
+            ++st.c_refused_reader;
+            ++st.c_fallbacks;
+            return false;
+        }
+    }
+    if (union_kv_ctx(params.mctx) != nullptr && new_nkv == 0) {
+        ++st.c_refused_nkv_unknown;
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (const llama_kv_cache_context * kv_ctx = union_kv_ctx(params.mctx)) {
+        // The K/V view offset encodes the build-time stream base (sinfo.s0);
+        // the symbolic map does not model a stream switch. A multi-stream
+        // cache therefore fails closed to a rebuild.
+        if (kv_ctx->get_n_stream() > 1) {
+            if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@4725\n", "union_rebind_apply");
+            ++st.c_refused_skeleton;
+            ++st.c_fallbacks;
+            return false;
+        }
+    }
+    if (new_nkv != 0) {
+        // The non-x86 F16 masked-dot refusal is gone with the marking it
+        // guarded: with no REDUCE_PAD_TAIL / MASKED_TAIL_GEMM on this lane the
+        // value product takes the same kernel stock takes, so there is no
+        // x86-only parity to protect.
+        if (union_sched_cpu_only() && new_nkv > INT32_MAX - 255) {
+            refuse_envelope("nkv_int32", nullptr, "new_nkv > INT32_MAX - 255",
+                            (long long) new_nkv, (long long) (INT32_MAX - 255));
+            return false;
+        }
+        if (!union_graph_gpu_fa_accepts_width(res, new_nkv)) {
+            ++st.c_refused_align;
+            ++st.c_fallbacks;
+            return false;
+        }
+        if (new_nkv > st.record_cap) {
+            refuse_envelope("nkv_cap", nullptr, "new_nkv > record_cap",
+                            (long long) new_nkv, (long long) st.record_cap);
+            return false;
+        }
+    }
+    uint32_t stock_nkv = 0;
+    if (new_nkv != 0) {
+        const llama_kv_cache_context * kv_ctx = union_kv_ctx(params.mctx);
+        stock_nkv = kv_ctx != nullptr ? kv_ctx->get_n_kv_stock() : 0;
+        // The applied width must be known before any tensor is changed.
+        if (stock_nkv < new_nkv || stock_nkv > INT32_MAX) {
+            ++st.c_refused_nkv_unknown;
+            ++st.c_fallbacks;
+            return false;
+        }
+    }
+    if (!st.shape_map.ntok_valid && st.record_has_out_ids && new_nout > st.record_cap_nout) {
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=nout_over_cap new_nout=%u cap_nout=%u\n",
+                        "union_rebind_apply", new_nout, st.record_cap_nout);
+        ++st.c_fallbacks;
+        return false;
+    }
+    const auto * recr = union_recr_ctx(params.mctx);
+    if (recr != nullptr) {
+        if (new_n_rs == 0 || new_n_rs > st.record_cap_nrs ||
+                new_rs_head >= st.record_cap_nrs ||
+                (uint64_t) new_rs_head + new_n_rs > st.record_cap_nrs) {
+            ++st.c_refused_nrs;
+            ++st.c_fallbacks;
+            return false;
+        }
+    } else if (new_n_rs != 0 || new_rs_head != 0) {
+        ++st.c_refused_nrs;
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (union_replay_len_now(params.mctx) != st.record_bound_replay_len) {
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@4783\n", "union_rebind_apply");
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (record_src.size() != record_t.size() * (GGML_MAX_SRC + 1)) {
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@4788\n", "union_rebind_apply");
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+    for (size_t k = 0; k < record_t.size(); ++k) {
+        if (record_fixed[k]) {
+            continue;
+        }
+        const ggml_tensor * x = record_t[k];
+        for (int j = 0; j <= GGML_MAX_SRC; ++j) {
+            const int32_t idx = record_src[k * (GGML_MAX_SRC + 1) + j];
+            const ggml_tensor * actual = j == GGML_MAX_SRC ? x->view_src : x->src[j];
+            const ggml_tensor * original = idx >= 0 && (size_t) idx < record_t.size() ? record_t[idx] : nullptr;
+            if (idx < -1 || (idx >= 0 && original == nullptr) ||
+                    (actual != original && (j == GGML_MAX_SRC || original == nullptr ||
+                     !ggml_backend_sched_is_tensor_copy(sched.get(), original, actual)))) {
+                if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=address_walk k=%zu j=%d tensor=%s idx=%d actual=%s original=%s\n",
+                        "union_rebind_apply", k, j, x->name, idx,
+                        actual != nullptr ? actual->name : "(null)",
+                        original != nullptr ? original->name : "(null)");
+                if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@4808\n", "union_rebind_apply");
+                ++st.c_refused_skeleton;
+                ++st.c_fallbacks;
+                return false;
+            }
+        }
+    }
+
+    const int64_t dW = (int64_t) new_nkv     - (int64_t) st.shape_map.base_nkv;
+    const int64_t dN = st.record_has_out_ids
+        ? (int64_t) new_nout - (int64_t) st.shape_map.base_nout
+        : 0;
+    const int64_t dL = (int64_t) new_n_rs - (int64_t) st.shape_map.base_n_rs;
+    const int64_t dH = (int64_t) new_rs_head - (int64_t) st.shape_map.base_rs_head;
+    const int64_t dT = (int64_t) params.ubatch.n_tokens - (int64_t) st.shape_map.base_ntok;
+    if (union_token_delta_refused(st, dT)) {
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@4823\n", "union_rebind_apply");
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    if (dW != 0 && !st.shape_map.nkv_valid) {
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@4829\n", "union_rebind_apply");
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (dN != 0 && !st.shape_map.nout_valid) {
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@4834\n", "union_rebind_apply");
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (dL != 0 && !st.shape_map.nrs_valid) {
+        ++st.c_refused_nrs;
+        ++st.c_fallbacks;
+        return false;
+    }
+    if (dH != 0 && !st.shape_map.rs_head_valid) {
+        ++st.c_refused_rs_z;
+        ++st.c_fallbacks;
+        return false;
+    }
+    // "nothing to do" is the live bound state, not the delta from the build
+    // base: a request equal to the build base after an earlier bind moved the
+    // graph away from it has dW/dN == 0 yet must be re-applied (the patch
+    // values below are absolute, so re-applying restores the base shapes).
+    //
+    // This is the one gate, and the per-kind rebinds apply the same rule with
+    // their own parameter live. rs_z is passed as the recorded value because
+    // it is a runtime INDEX input, not a shape this function patches: it is
+    // rebound on every set_inputs() by union_rsz_bind_index, so a row-only
+    // move must not reach this function at all. The kinds that own a row
+    // (rs_z kind) pass it live to decide whether to call here.
+    // The token width is a bindable parameter only on the token lane. On every
+    // other lane the recorded token width is the build width and the graph's
+    // token inputs are fixed shapes, so a request that differs there is NOT a
+    // bind: it is a rebuild, and the caller must see a refusal. Passing the
+    // live width unconditionally would let a non-token-lane bind "succeed" on a
+    // graph whose token inputs keep their build shape, i.e. compute with the
+    // wrong number of rows. The symbolic map's own guard below (dT != 0 &&
+    // !ntok_valid) refuses such a patch, but it is reached only after the
+    // no-op rule; stating the lane here keeps the two consistent.
+    const uint32_t bound_ntok = union_bound_ntok(st, params.ubatch.n_tokens);
+    if (union_bind_is_noop(st, new_nkv, new_nout, bound_ntok,
+                           st.record_bound_rs_z, new_rs_head)) {
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=noop new_nkv=%u bound=%u new_nout=%u bound_nout=%u "
+                        "ntok=%u bound_ntok=%u\n",
+                        "union_rebind_apply", new_nkv, st.record_bound, new_nout,
+                        st.record_bound_nout, bound_ntok, st.record_bound_ntok);
+        ++st.c_fallbacks;
+        return false;
+    }
+
+    struct union_patch_value {
+        int64_t ne[4] = {};
+        int64_t nb[4] = {};
+        int64_t view_offs = 0;
+        int64_t root_offs = 0;
+    };
+    std::unordered_map<uint32_t, union_patch_value> patch;
+    patch.reserve(st.shape_map.nkv.size() + st.shape_map.nout.size() +
+                  st.shape_map.rs_head.size() + st.shape_map.rs_len.size() +
+                  st.shape_map.ntok.size() + st.shape_map.nkv_ntok.size());
+
+    // Add all terms, including zero deltas, to restore build-base layouts.
+    auto add = [&](const std::vector<llama_union_shape_coeff> & list, int64_t delta) -> bool {
+        for (const auto & c : list) {
+            auto result = patch.emplace(c.tensor, union_patch_value {});
+            auto & v = result.first->second;
+            if (result.second) {
+                for (int i = 0; i < 4; ++i) {
+                    v.ne[i] = c.base_ne[i];
+                    v.nb[i] = c.base_nb[i];
+                }
+                v.view_offs = c.base_view_offs;
+                v.root_offs = c.base_root_offs;
+            }
+            auto term = [delta](int64_t & value, int64_t coeff) {
+                int64_t product;
+                return !__builtin_mul_overflow(coeff, delta, &product) &&
+                       !__builtin_add_overflow(value, product, &value);
+            };
+            for (int i = 0; i < 4; ++i) {
+                if (!term(v.ne[i], c.ne[i]) || !term(v.nb[i], c.nb[i])) return false;
+            }
+            if (!term(v.view_offs, c.view_offs) || !term(v.root_offs, c.root_offs)) return false;
+        }
+        return true;
+    };
+    int64_t mixed_delta;
+    if (__builtin_mul_overflow(dW, dT, &mixed_delta) ||
+            !add(st.shape_map.nkv, dW) || !add(st.shape_map.nout, dN) ||
+            !add(st.shape_map.rs_len, dL) || !add(st.shape_map.rs_head, dH) ||
+            !add(st.shape_map.ntok, dT) || !add(st.shape_map.nkv_ntok, mixed_delta)) {
+        refuse_envelope("patch_overflow", nullptr, "dW/dN/dT/dH/dNrs overflow",
+                        (long long) dW, (long long) dT);
+        return false;
+    }
+
+    std::vector<uint32_t> keys;
+    keys.reserve(patch.size());
+    for (const auto & kv : patch) {
+        keys.push_back(kv.first);
+    }
+    std::sort(keys.begin(), keys.end());
+
+    // validate every change before touching the live graph
+    bool any_change = false;
+    for (uint32_t k : keys) {
+        if (k >= record_t.size()) {
+            if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@4936\n", "union_rebind_apply");
+            ++st.c_refused_skeleton;
+            ++st.c_fallbacks;
+            return false;
+        }
+        const union_patch_value & v = patch[k];
+        ggml_tensor * x = record_t[k];
+        if (record_fixed[k]) {
+            bool changed = v.view_offs != (int64_t) x->view_offs;
+            for (int i = 0; i < 4; ++i) {
+                changed = changed || v.ne[i] != x->ne[i] || v.nb[i] != x->nb[i];
+            }
+            if (changed) {
+                if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@4948\n", "union_rebind_apply");
+                ++st.c_refused_skeleton;
+                ++st.c_fallbacks;
+                return false;
+            }
+            continue;
+        }
+        // the map is absolute: an entry equal to the live tensor is not a
+        // change. When no entry differs the graph is already at the target
+        // state (e.g. a repeat bind) and the caller must not count a bind.
+        if (v.view_offs != (int64_t) x->view_offs) {
+            any_change = true;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (v.ne[i] != x->ne[i] || v.nb[i] != (int64_t) x->nb[i]) {
+                any_change = true;
+            }
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (v.ne[i] < 0 || v.nb[i] < 0) {
+                refuse_envelope("patch_negative", x, "patched ne/nb < 0",
+                                (long long) v.ne[i], (long long) v.nb[i]);
+                return false;
+            }
+        }
+        if (v.view_offs < 0 || v.root_offs < 0) {
+            refuse_envelope("patch_negative_offs", x, "patched view/root offs < 0",
+                            (long long) v.view_offs, (long long) v.root_offs);
+            return false;
+        }
+        ggml_tensor tmp = *x;
+        for (int i = 0; i < 4; ++i) {
+            tmp.ne[i] = v.ne[i];
+            tmp.nb[i] = (size_t) v.nb[i];
+        }
+        tmp.view_offs = (size_t) v.view_offs;
+        if (x->view_src == nullptr) {
+            const size_t span = union_tensor_span(&tmp);
+            if (span == SIZE_MAX || (!st.shape_map.ntok_valid && span > record_bytes[k])) {
+                refuse_envelope("owned_span", x, "span vs record_bytes",
+                                (long long) span, (long long) record_bytes[k]);
+                return false;
+            }
+        } else {
+            const size_t span = union_tensor_span(&tmp);
+            if (span == SIZE_MAX) {
+                refuse_envelope("view_span", x, "view span unrepresentable",
+                                (long long) span, -1);
+                return false;
+            }
+            size_t root_limit = record_root_bytes[k];
+            if (st.shape_map.ntok_valid) {
+                const int32_t root_index = (*set.root)[k];
+                if (root_index < 0 || (size_t) root_index >= record_t.size()) return false;
+                if (!record_fixed[root_index]) {
+                    ggml_tensor root_tensor = *record_t[root_index];
+                    const auto root_patch = patch.find((uint32_t) root_index);
+                    if (root_patch != patch.end()) {
+                        for (int i = 0; i < 4; ++i) {
+                            if (root_patch->second.ne[i] < 0 || root_patch->second.nb[i] < 0) return false;
+                            root_tensor.ne[i] = root_patch->second.ne[i];
+                            root_tensor.nb[i] = (size_t) root_patch->second.nb[i];
+                        }
+                    }
+                    root_limit = union_tensor_span(&root_tensor);
+                    if (root_limit == SIZE_MAX) return false;
+                }
+            }
+            if (span != 0 && ((size_t) v.root_offs > root_limit ||
+                    span > root_limit - (size_t) v.root_offs)) {
+                refuse_envelope("view_root", x, "span vs root_limit - root_offs",
+                                (long long) span, (long long) root_limit);
+                return false;
+            }
+        }
+    }
+    // No change is a valid bind, not a refusal. The three parameters are
+    // simultaneous: when a step moved only rs_z (a runtime index that no
+    // tensor shape carries), the shape map is already at its targets, and the
+    // bind must still record the new row and refresh the input metadata below.
+    // Nothing is patched, so the graph cannot be harmed; the hash is re-taken
+    // over the unchanged shapes and must equal the reference.
+    std::vector<ggml_backend_sched_tensor_layout> layouts;
+    layouts.reserve(keys.size());
+    std::vector<size_t> view_offsets;
+    if (st.shape_map.ntok_valid) view_offsets.reserve(keys.size());
+    for (uint32_t k : keys) {
+        if (record_fixed[k]) {
+            continue;
+        }
+        const union_patch_value & v = patch[k];
+        ggml_backend_sched_tensor_layout layout = {};
+        layout.tensor = record_t[k];
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            layout.ne[i] = v.ne[i];
+            layout.nb[i] = (size_t) v.nb[i];
+        }
+        if (st.shape_map.ntok_valid) view_offsets.push_back((size_t) v.view_offs);
+        layouts.push_back(layout);
+    }
+    // Synchronize before preflight and commit; neither may mutate on failure.
+    ggml_backend_sched_synchronize(sched.get());
+    if (!st.shape_map.ntok_valid) {
+        if (!ggml_backend_sched_update_split_copies(sched.get(), layouts.data(), layouts.size(), false) ||
+                !ggml_backend_sched_update_split_copies(sched.get(), layouts.data(), layouts.size(), true)) {
+            refuse_envelope("split_copies", nullptr, "sched split copy layout refused",
+                            (long long) layouts.size(), -1);
+            return false;
+        }
+    }
+
+    if (st.shape_map.ntok_valid) {
+        if (!ggml_backend_sched_replan_graph(sched.get(), record_t.data(), record_fixed.data(),
+                                            record_t.size(), layouts.data(), view_offsets.data(), layouts.size())) {
+            st.record_valid = false;
+            ++st.c_refused_backend;
+            ++st.c_fallbacks;
+            return false;
+        }
+        // The replan just reallocated the arena at the patched shapes, so the
+        // arena width is exactly new_nkv. Raising the bound here is not
+        // headroom: it follows an allocation that already happened. The
+        // legacy lane below patches in place inside the envelope the graph
+        // was built with, so its arena width does not move.
+        if (new_nkv != 0) {
+            st.record_arena_n_kv = new_nkv;
+        }
+    } else {
+        // The legacy lanes use their existing allocation envelopes.
+        for (uint32_t k : keys) {
+            ggml_tensor * x = record_t[k];
+            if (record_fixed[k]) continue;
+            const union_patch_value & v = patch[k];
+            for (int i = 0; i < 4; ++i) {
+                x->ne[i] = v.ne[i];
+                x->nb[i] = (size_t) v.nb[i];
+            }
+            x->view_offs = (size_t) v.view_offs;
+        }
+    }
+
+
+    // No reduction-order fixup is applied on this lane, by design.
+    //
+    // The binder used to mark the softmax and the value product with
+    // GGML_TENSOR_FLAG_REDUCE_PAD_TAIL / MASKED_TAIL_GEMM and pin their
+    // accumulation tree to a padded width in op_params[2]. That emulated the
+    // padded graph's order, and it could not work: the marked node's tree
+    // became a function of the build envelope while stock's tree follows its
+    // own ne00, so the two trees differ whenever the envelope is not stock's
+    // padded width, however constant the envelope is.
+    //
+    // The in-place patch above is enough on its own. The attention products
+    // carry ATTN_SCORES / ATTN_MASK / ATTN_SOFT_MAX from the graph build
+    // (llama-graph.cpp, the two ggml_mul_mat_set_attn_* calls), and those route
+    // to the ordered CPU kernels, which accumulate sequentially over the
+    // surviving terms. A narrowed graph and a graph built at the same width
+    // therefore run the same kernels with the same tree, with no marking at
+    // all. See ANALYSIS-EQUALITY.md in the workdir for the site table.
+
+    // every view's data pointer follows its (possibly patched) source; the
+    // record is in source-before-consumer order
+    for (size_t k = 0; k < record_t.size(); ++k) {
+        if (record_fixed[k]) {
+            continue;
+        }
+        ggml_tensor * x = record_t[k];
+        if (x->view_src != nullptr && x->view_src->data != nullptr) {
+            x->data = (char *) x->view_src->data + x->view_offs;
+        }
+    }
+    ggml_backend_sched_refresh_split_copy_views(sched.get());
+    const uint32_t old_bound_nout = st.record_bound_nout;
+
+    st.record_bound         = new_nkv;
+    st.record_bound_nout    = new_nout;
+    st.record_bound_n_rs    = new_n_rs;
+    st.record_bound_ntok    = params.ubatch.n_tokens;
+    st.record_bound_rs_head = new_rs_head;
+    st.record_bound_rs_z    = union_rs_z_now(params.mctx); // runtime index, diagnostic only
+
+    // Two identities are refreshed here, and both must be:
+    //
+    //   record_topology_key  the live graph's shapes have moved to the bound
+    //     values, so the single graph cache key must move with them. It is
+    //     refreshed with the bound state so that "same graph" in the gate at
+    //     the top of this function means "same graph as the one currently
+    //     live". Without this the next bind would compare the record's
+    //     build-shape key against a patched graph and refuse every reuse after
+    //     the first. The address walk remains the authority for the
+    //     tensor-level identity; this key is the topology half of the same
+    //     question.
+    //
+    //   topology_hash        the width-table hash of llama-union-topology.h,
+    //     re-taken over the patched graph with the n_kv, n_outputs and rs_z
+    //     dimensions excluded. An unchanged value is the proof that this bind
+    //     changed shapes only: same node set, same edges, same op types, same
+    //     op params, same non-runtime dimensions. It is the pillar's public
+    //     observable (llama_get_nkv_runtime_stats().topology_hash and
+    //     llama_get_union_diagnostics().topology_hash), so it is NOT replaced
+    //     by the key, which is invariant to those dimensions by construction
+    //     and would therefore be stable for the wrong reason.
+    //
+    // The bind just moved every runtime-coupled shape to the three targets, so
+    // arm the same n_kv as the graph's runtime width before re-taking the
+    // hash. A hash that cannot be taken means the bind cannot prove what it
+    // did, so it is refused and the caller rebuilds.
+    st.record_topology_key = llama_topology_key_of(res->get_gf(), union_topology_key_excl(st.shape_map, st.record_t));
+    if (new_nkv != 0) {
+        // The bound is the arena the replan above just allocated, not the
+        // width the graph was recorded at: on the token lane the two differ
+        // and the build width would refuse the width the bind just applied.
+        // The arena is the allocation that backs the patched shapes, so this
+        // is the physical capacity boundary, not the KV envelope.
+        if (!st.width_table.set_runtime_n_kv(new_nkv, st.record_arena_n_kv)) {
+            // The patch and the replan are already committed, so the record
+            // no longer describes a graph whose width can be stated. Drop it:
+            // returning false alone would let the fresh path see
+            // delta_pending() == false (record_bound already moved) and keep
+            // executing the half-committed graph.
+            st.record_valid = false;
+            if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=arm@5214\n", "union_rebind_apply");
+            ++st.c_refused_skeleton;
+            ++st.c_fallbacks;
+            return false;
+        }
+    }
+    {
+        uint64_t hash = 0;
+        if (!st.width_table.topology_hash(st.record_nodes, hash)) {
+            st.topology_hashed = false;
+            st.topology_hash   = 0;
+            // The patch and the replan are already committed. The record must
+            // die with this refusal: the fresh path computes delta_pending()
+            // AFTER the bind, and record_bound has already moved, so a
+            // still-valid record would make it skip the rebuild and execute
+            // the half-committed graph.
+            st.record_valid = false;
+            if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@5155\n", "union_rebind_apply");
+            ++st.c_refused_skeleton;
+            ++st.c_fallbacks;
+            return false;
+        }
+        st.topology_hashed = true;
+        st.topology_hash   = hash;
+    }
+
+    {
+        llm_graph_params bound_params = st.shape_map.ntok_valid ? params : res->get_params();
+        bound_params.n_outputs       = new_nout;
+        bound_params.n_outputs_build = 0;
+        res->set_params(bound_params);
+    }
+    ++st.c_applied;
+    ++st.c_patch_binds;
+    if (new_nout > old_bound_nout) {
+        ++st.c_nout_grow_binds;
+    }
+
+    // refresh the cached runtime metadata of the live graph inputs so the next
+    // can_reuse() sees the patched graph as current (rs_z/head/replay_len)
+    for (auto & input : res->inputs) {
+        input->union_bind_runtime();
+    }
+    // poka-yoke: this one bind must have applied ALL THREE parameters. The
+    // shape map was evaluated at new_nkv, new_nout and new_n_rs/new_rs_head
+    // together, and the inputs now report what they execute at. A graph whose
+    // closure still reports another width means the patch and the metadata
+    // disagree; refuse the bind so the caller rebuilds instead of computing
+    // on a graph nobody can describe.
+    if (st.record_has_out_ids && res->outputs_bound_target() != new_nout) {
+        // Same rule as the hash refusal: the patch is committed, so the
+        // record can no longer describe the live graph. Without this the
+        // fresh path sees no pending delta and keeps the graph.
+        st.record_valid = false;
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@5187\n", "union_rebind_apply");
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+    // Refresh per-input context pointers and check the full active layout.
+    if (st.shape_map.ntok_valid && !res->can_reuse(params)) {
+        st.record_valid = false;
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: bind refusal site=skeleton@5194\n", "union_rebind_apply");
+        ++st.c_refused_skeleton;
+        ++st.c_fallbacks;
+        return false;
+    }
+    return true;
+}
+
+// Every registered kind below is a GATE, not a lane of its own: each one
+// validates the preconditions it owns and then calls union_rebind_apply with
+// the SAME three targets (n_kv, n_outputs, n_rs/head). That is what makes the
+// three parameters simultaneous: whichever gate fires, one bind applies all
+// three deltas, and a gate whose own target did not move cannot hide a delta
+// in another target (the delta test lives in apply, not here).
+llama_union_rebind_result llama_context::union_rebind_n_kv(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set) {
+
+    auto & st = llama_nkv_ctx_state_get(this);
+
+    // NKV_BINDER_STATS: every binder invocation counts as an attempt
+    ++st.c_attempts;
+
+    const uint32_t nkv_now = union_nkv_now(params.mctx);
+    if (nkv_now == 0) {
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+    // Retain the existing FA width guard before attempting a bind.
+    if (!union_graph_gpu_fa_accepts_width(res, nkv_now)) {
+        ++st.c_refused_align;
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+    // envelope: the live graph was built and sched-allocated AT the recorded
+    // cap (see process_ubatch envelope build), so any n_kv in (0, cap] has
+    // real backing. record_bound tracks the width the live graph's nkv-coupled
+    // shapes are CURRENTLY bound at; anything above the cap has no allocated
+    // backing -> full rebuild.
+    // No record means no envelope: nothing was built, so nothing can be
+    // outside one. Counting an envelope refusal here made the audit's
+    // refused_envelope=1 name a rule that had not been asked anything; the
+    // pre-record attempt is the documented "legitimate pre-record refusal"
+    // and declines.
+    if (!st.record_valid) {
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+    if (nkv_now > st.record_cap) {
+        if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: envelope refusal nkv_precheck: nkv_now > record_cap (%u vs %u)\n",
+                        "union_rebind_n_kv", nkv_now, st.record_cap);
+        ++st.c_refused_envelope;
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+    // The one no-op rule, with this kind's own parameter live (n_kv) and the
+    // other four at their recorded values: this kind declines only when n_kv
+    // has not moved, even if n_outputs or the token width also changed - the
+    // dispatch is first-kind-wins and union_rebind_apply patches every changed
+    // parameter.
+    if (union_bind_is_noop(st, nkv_now, st.record_bound_nout, st.record_bound_ntok,
+                           st.record_bound_rs_z, st.record_bound_rs_head)) {
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+
+    return union_rebind_apply(res, params, set, nkv_now, n_outputs,
+                              union_n_rs_now(params.mctx), union_rs_head_now(params.mctx))
+        ? llama_union_rebind_result::applied : llama_union_rebind_result::refused;
+}
+
+llama_union_rebind_result llama_context::union_rebind_n_tokens(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set) {
+    auto & st = llama_nkv_ctx_state_get(this);
+    ++st.c_attempts;
+    // The token width is a bindable parameter only when the symbolic token
+    // shape map is valid. When it is not, this lane cannot bind a token width
+    // at all, so the kind declines for that reason - not because the width
+    // happens to equal the recorded one. Stating it here keeps the helper's
+    // "own parameter live, others recorded" contract honest.
+    if (!st.shape_map.ntok_valid) {
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+    // The one no-op rule, with this kind's own parameter live (the token
+    // width) and the other four at their recorded values.
+    if (union_bind_is_noop(st, st.record_bound, st.record_bound_nout,
+                           params.ubatch.n_tokens,
+                           st.record_bound_rs_z, st.record_bound_rs_head)) {
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+    return union_rebind_apply(res, params, set, union_nkv_now(params.mctx), n_outputs,
+                              union_n_rs_now(params.mctx), union_rs_head_now(params.mctx))
+        ? llama_union_rebind_result::applied : llama_union_rebind_result::refused;
+}
+
+llama_union_rebind_result llama_context::union_rebind_rs_z(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set) {
+    auto & st = llama_nkv_ctx_state_get(this);
+
+    ++st.c_attempts;
+
+    // The rs_z zero row itself is a runtime index input (s_zero) consumed by
+    // the explicit-dependency zero-row op; it is not a shape parameter and -1
+    // is a valid no-op, so a row change alone needs no bind. This gate covers
+    // the coupled recurrent state shapes: the used cell count (n_rs) and the
+    // head-selected copy views. A row-only change must still let the bind
+    // through when n_kv or n_outputs moved, which is why the gate does not
+    // test the row.
+    if (union_recr_ctx(params.mctx) == nullptr) {
+        ++st.c_refused_rs_z;
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+    // Two refusals, then the one no-op rule. The refusals are this kind's own
+    // preconditions and both are kept: a recurrent context that reports no
+    // used cell (n_rs == 0) has no state to bind, and rs_z == -1 (no free
+    // zero-state cell) is outside the linear rule domain, so binding it would
+    // write a stale zero view. Neither is a "nothing moved" answer, so neither
+    // belongs in the no-op rule.
+    const uint32_t nrs_now  = union_n_rs_now(params.mctx);
+    const int32_t  rs_z_now = union_rs_z_now(params.mctx);
+    const uint32_t head_now = union_rs_head_now(params.mctx);
+    if (nrs_now == 0) {
+        ++st.c_refused_nrs;
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+    if (rs_z_now < 0) {
+        // rs_z == -1 (no free zero-state cell) is outside the linear rule
+        // domain; rebuild instead of binding a stale zero view
+        ++st.c_refused_rs_z;
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+    // The one no-op rule, with BOTH of this kind's parameters live: this is
+    // the one kind that owns two (rs_z and the recurrent head), so it declines
+    // only when both have stayed put. The other three are at their recorded
+    // values, as in the other kinds.
+    if (union_bind_is_noop(st, st.record_bound, st.record_bound_nout,
+                           st.record_bound_ntok, rs_z_now, head_now)) {
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+
+    return union_rebind_apply(res, params, set, union_nkv_now(params.mctx), n_outputs,
+                              nrs_now, head_now)
+        ? llama_union_rebind_result::applied : llama_union_rebind_result::refused;
+}
+
+llama_union_rebind_result llama_context::union_rebind_n_outputs(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set) {
+    auto & st = llama_nkv_ctx_state_get(this);
+
+    ++st.c_attempts;
+
+    const uint32_t nout_now = n_outputs;
+    if (!st.record_has_out_ids) {
+        // this graph has no output-gather closure; the active count is not a
+        // graph key. A zero-width closure is still a closure: has_out_ids()
+        // distinguishes it from "no closure" (both report envelope 0).
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+    // A zero active count is a SHRINK, not a grow: `0 > record_cap_nout` is
+    // false, so the zero step never takes this branch and needs no guard of
+    // its own. union_rebind_apply() patches the closure to zero rows like any
+    // other width.
+    //
+    // nout_now > record_cap_nout is the grow case. On a record build the
+    // envelope is the high-water mark max(active, observed maximum) (see
+    // graph_params), so this fires exactly when the request is above every
+    // width built so far. The caller rebuilds once at the new request; that
+    // rebuild raises the mark, and every later width up to it binds in
+    // place. Counted separately from the n_kv envelope.
+    if (!st.shape_map.ntok_valid && nout_now > st.record_cap_nout) {
+        ++st.c_refused_nout;
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+    // The one no-op rule, with this kind's own parameter live (n_outputs) and
+    // the other four at their recorded values.
+    if (union_bind_is_noop(st, st.record_bound, nout_now, st.record_bound_ntok,
+                           st.record_bound_rs_z, st.record_bound_rs_head)) {
+        ++st.c_fallbacks;
+        return llama_union_rebind_result::declined;
+    }
+
+    return union_rebind_apply(res, params, set, union_nkv_now(params.mctx), nout_now,
+                              union_n_rs_now(params.mctx), union_rs_head_now(params.mctx))
+        ? llama_union_rebind_result::applied : llama_union_rebind_result::refused;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch,
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
@@ -2664,6 +5608,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         // completion. Drain before memory updates, graph reset, or set_inputs.
         // Do not account the current, not-yet-submitted token as synchronized.
         ggml_backend_sched_synchronize(sched.get());
+    }
+
+    // The out_ids tensor is built at the high-water envelope (or at the
+    // active count when no envelope is active). An active count above
+    // n_outputs_max would write past its buffer in set_input; fail closed
+    // instead of relying on the caller contract.
+    if (n_outputs > cparams.n_outputs_max) {
+        LLAMA_LOG_ERROR("%s: n_outputs %u exceeds n_outputs_max %u\n", __func__, n_outputs, cparams.n_outputs_max);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
     }
 
     if (mctx && !mctx->apply()) {
@@ -2736,44 +5690,252 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         prefab_stats.n_ubatch_stock++;
     }
 
+    // arm the runtime-length n_kv lane on the KV context: the batch context
+    // is constructed without an lctx, so the width query carries the binder
+    // state on the object. Only a live record proves the symbolic shape map
+    // can patch the width in place, and the live split graph must be
+    // patch-safe (one split with scheduler-validated copies). Otherwise the
+    // stock padded width stays.
+    //
+    // This runs before the token-lane decision below because that decision
+    // reads the width the KV context reports through union_nkv_now().
+    //
+    // nkv_exact_enabled is the GGML_TP5_UNION_BINDER_EXACT selection: with it
+    // off the exact target is never armed, so the stock padded width is what
+    // the graph executes at. That is the A/B control lane, not a fallback.
+    if (llama_kv_cache_context * kv_ctx = union_kv_ctx(mctx)) {
+        const llama_nkv_ctx_state * st = union_binder_state_peek();
+        kv_ctx->set_nkv_exact_target(st != nullptr && st->nkv_enabled && !st->env_disabled &&
+                                     st->nkv_exact_enabled && st->record_valid &&
+                                     union_sched_single_split());
+    }
+
+    const llama_nkv_ctx_state * token_state = union_binder_state_peek();
+    const bool token_requested = token_state && token_state->nkv_enabled && token_state->ntok_enabled;
+    const bool token_recurrent = union_recr_ctx(mctx) != nullptr ||
+        dynamic_cast<const llama_memory_hybrid_context *>(mctx) != nullptr ||
+        dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx) != nullptr;
+    const bool plain_kv = dynamic_cast<const llama_kv_cache_context *>(mctx) != nullptr;
+    const ggml_type type_k = token_requested && plain_kv ? get_kv_type_k() : GGML_TYPE_COUNT;
+    const ggml_type type_v = token_requested && plain_kv ? get_kv_type_v() : GGML_TYPE_COUNT;
+    const bool plain_kv_types = (type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_F32) &&
+                                (type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_F32);
+    const bool token_candidate = token_requested && !token_recurrent && plain_kv && plain_kv_types &&
+        union_sched_cpu_only() && model.arch == LLM_ARCH_LLAMA && !cparams.flash_attn && !cparams.embeddings &&
+        !cparams.embeddings_nextn && !cparams.mtp_chain &&
+        cparams.kv_unified && cparams.n_seq_max == 1 && ubatch.token && !ubatch.embd &&
+        !ubatch.equal_seqs() && ubatch.n_seqs_unq == 1 && ubatch.n_seq_tokens == 1 &&
+        ubatch.n_seqs == ubatch.n_tokens && ubatch.n_tokens > 0;
+    if (token_requested && !token_candidate) {
+        auto & st = llama_nkv_ctx_state_get(this);
+        ++st.c_ntok_fallbacks;
+        if (token_recurrent) ++st.c_ntok_recurrent_hybrid_fallbacks;
+    }
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
+    // previous live envelope, captured before any bind/rebuild can clear it:
+    // a rebuild that raises record_cap_nout is the single envelope-expanding
+    // rebuild and is counted as such. record_valid is false when the live
+    // graph is stock (no envelope), so the first envelope build is not a
+    // "grow".
+    const llama_nkv_ctx_state * st_prev = union_binder_state_peek();
+    const bool     prev_record_valid = st_prev != nullptr && st_prev->record_valid;
+    const uint32_t prev_cap_nout     = prev_record_valid ? st_prev->record_cap_nout : 0;
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
+
+    bool reused = !graph_reuse_disable && res->can_reuse(gparams);
+
+    if (!reused && !graph_reuse_disable && union_binder_state_peek() != nullptr &&
+            union_binder_state_peek()->nkv_enabled) {
+        // union-graph runtime parameter binding: the previous graph is a
+        // fixed-topology envelope build, so a runtime parameter move (n_kv,
+        // n_outputs, recurrent rs_z/head) is a pure arithmetic metadata patch
+        // against the symbolic shape map recorded at build time. No scratch
+        // graph is built. Fail-closed: any mismatch falls back to a rebuild.
+        auto & union_st = llama_nkv_ctx_state_get(this);
+        reused = union_st.union_binder.rebind_any(this, res, gparams);
+        if (!reused && prev_record_valid) {
+            ++union_st.c_rebuild_fallbacks;
+        }
+    }
+
+    // rs_z runtime parameter: union_rsz_bind_index() writes the zero row into
+    // the live graph's I32 [1] tensor. A row that names nothing, or that only
+    // some of the ubatch's cells read, must never reach compute, so the value
+    // is checked here, before ANY reuse decision (the can_reuse() above, the
+    // bind above, or a fresh build below):
+    //   - no live lane (rsz_rt_active false): nothing is written, nothing to
+    //     check; the stock graph keys on rs_z itself.
+    //   - rs_z < 0: no free zero-state cell to name -> _cell.
+    //   - rs_z >= zero_view_rows (the cell capacity): names no row of any
+    //     group -> _envelope.
+    //   - the state tensor is not a whole number of mem_size groups -> _ring.
+    //   - the ubatch's sequences disagree on the zero row -> _mixed.
+    // Either refusal disables the lane for this context (the live graph is
+    // rebuilt stock below, which carries no index tensor), so the refusal is
+    // counted once, not once per decode.
+    if (union_binder_state != nullptr) {
+        auto & union_st = *union_binder_state;
+        if (union_st.rsz_rt_active) {
+            const int32_t rsz_now = union_rs_z_now(mctx);
+            // the rules are llama_rsz_rt_check_row() and
+            // llama_rsz_rt_check_relay_row() (llama-nout-state.h), pure
+            // predicates a model-free test pins. The relay form is used only
+            // when the ring is live: with n_rs_seq == 0 the state tensor is
+            // one group and the two rules agree on every input.
+            const bool relay_ring = backend_tp5_relay != nullptr && union_st.rsz_rt_state_rows > 0;
+            const llama_rsz_rt_row_check row = relay_ring
+                ? llama_rsz_rt_check_relay_row(rsz_now, union_st.rsz_rt_zero_view_rows,
+                        union_st.rsz_rt_state_rows)
+                : llama_rsz_rt_check_row(rsz_now, union_st.rsz_rt_zero_view_rows);
+            // One graph carries ONE zero row. rs_idx is per sequence and a
+            // sequential ubatch split can place two sequences with different
+            // rollback depths in one ubatch, so the row can be ambiguous. That
+            // is checked here, before any reuse decision and before
+            // set_inputs(), because a wrong row would be computed with, not
+            // merely reported afterwards.
+            bool mixed_depth = false;
+            if (row == llama_rsz_rt_row_check::ok) {
+                const auto * recr_chk = union_recr_ctx(mctx);
+                int32_t first = -2;
+                for (uint32_t s = 0; s < ubatch.n_seqs_unq && recr_chk != nullptr; ++s) {
+                    const int32_t r = recr_chk->get_rs_zero_row(ubatch.seq_id_unq[s]);
+                    if (s == 0) {
+                        first = r;
+                    } else if (r != first) {
+                        mixed_depth = true;
+                        break;
+                    }
+                }
+            }
+            if (row != llama_rsz_rt_row_check::ok || mixed_depth) {
+                size_t & cause = mixed_depth                                  ? union_st.c_rsz_rt_refused_mixed_depth :
+                                 row == llama_rsz_rt_row_check::cell          ? union_st.c_rsz_rt_refused_cell :
+                                 row == llama_rsz_rt_row_check::envelope      ? union_st.c_rsz_rt_refused_envelope :
+                                                                                union_st.c_rsz_rt_refused_ring;
+                union_st.rsz_rt_refuse(cause);
+                // the live graph keeps its index tensor until the stock
+                // rebuild below replaces it; no path writes through it without
+                // rsz_rt_active, so clearing the flag is enough
+                union_st.rsz_rt_active = false;
+                reused = false;
+            }
+        }
+    }
 
     const int64_t diag_prepared = ggml_time_us();
-    const bool diag_reused = !graph_reuse_disable && res->can_reuse(gparams);
-    if (diag_reused) {
+    if (reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
+        // Token-width binds replan before reaching this point. Legacy binds
+        // update metadata within their recorded allocation envelopes.
 
-        n_reused++;
-        if (llama_prefab_stats_enabled()) {
-            prefab_stats.n_stock_reuses++;
+        if (reused) {
+            // with pipeline parallelism, the previous graph_compute_async may still be running
+            // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
+            // that the previous compute is still reading.
+            if (cparams.pipeline_parallel) {
+                ggml_backend_sched_synchronize(sched.get());
+            }
+
+            n_reused++;
+            if (llama_prefab_stats_enabled()) {
+                prefab_stats.n_stock_reuses++;
+            }
         }
-    } else {
+    }
+    if (!reused) {
         const int64_t diag_build_start = ggml_time_us();
+        // the record points into the graph that res->reset() is about to
+        // destroy; drop it first so a build_graph() failure below cannot
+        // leave dangling tensor pointers behind (the next bind would trust
+        // record_valid and patch freed tensors).
+        union_record_invalidate();
+        // drain any in-flight compute before the rebuild reuses its buffers
+        ggml_backend_sched_synchronize(sched.get());
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        // Build at physical KV and recurrent capacities and the output
+        // high-water mark. Live widths are bound after allocation.
+        bool     env          = false;
+        bool     record_build = false;
+        uint32_t cap          = 0;
+        uint32_t cap_nrs      = 0;
+        const llama_kv_cache_context * kv_ctx = nullptr;
+        const llama_nkv_ctx_state * st_peek = union_binder_state_peek();
+        const bool shape_arch_ok = union_arch_supported(model.arch) &&
+            !model.hparams.use_alibi && model.hparams.n_expert == 0 &&
+            model.hparams.n_rel_attn_bkts == 0 && sampling.samplers.empty();
+        // The record build needs the exact lane: the padded control lane
+        // (GGML_TP5_UNION_BINDER_EXACT=0) is the stock path, so it builds and
+        // reuses stock graphs and records nothing. Recording there would make
+        // the binder patch a graph the control arm is supposed to leave alone.
+        if (!graph_reuse_disable && st_peek != nullptr && st_peek->nkv_enabled &&
+                st_peek->nkv_exact_enabled &&
+                !st_peek->env_disabled && shape_arch_ok &&
+                (gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER) &&
+                !cparams.pipeline_parallel && backend_tp5_relay == nullptr &&
+                (union_recr_ctx(mctx) == nullptr || union_sched_cpu_only()) &&
+                dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx) == nullptr &&
+                !union_is_hybrid_iswa(mctx) && !union_has_attention_views(mctx)) {
+            record_build = true;
+            if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+                kv_ctx = h->get_attn();
+            } else if (const auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+                kv_ctx = k;
+            }
+            if (kv_ctx != nullptr) {
+                const uint32_t nkv_size = cparams.n_ctx_kv != 0 ? cparams.n_ctx_kv : cparams.n_ctx_seq;
+                // full legal range: the physical per-stream capacity, never a
+                // bucket or headroom
+                cap = std::min(nkv_size, kv_ctx->get_capacity());
+                env = cap > 0;
+            }
+            if (const auto * recr = union_recr_ctx(mctx)) {
+                cap_nrs = recr->get_size();
+            }
+        }
+        // The token lane builds the graph at the live KV/token widths
+        // (strict line) and never reserves KV or token headroom. The legacy
+        // LLAMA_EXPERIMENTAL_VARLEN_NTOK envelope of the base line widened the
+        // graph to n_ubatch and is retired: it is exactly the headroom the
+        // strict gate forbids. token_candidate already carries the
+        // single-stream, simple token-batch, CPU-only and non-flash
+        // restrictions, so it replaces the old token_envelope predicate.
+        const uint32_t live_nkv = token_candidate && kv_ctx ? kv_ctx->get_n_kv_exact() : 0;
+        const bool token_runtime = token_candidate && env && record_build && live_nkv != 0 && live_nkv <= cap;
+        if (token_candidate && !token_runtime) ++llama_nkv_ctx_state_get(this).c_ntok_fallbacks;
+        auto build_params = gparams;
+        if (token_runtime) {
+            build_params.n_outputs_build = 0;
+            build_params.strict_ntok = true;
+        }
 
-        //const auto t_start_us = ggml_time_us();
 
         {
             // instrumented-build hygiene: a throwing build must not pollute the
             // node counter with the PREVIOUS graph (gf still holds it here)
             gf = nullptr;
             llama_prefab_build_timer timer{prefab_stats, gf};
-            gf = model.build_graph(gparams);
+            // RAII: an exception from build_graph must not leave the build
+            // overrides armed on the KV / recurrent contexts
+            union_nkv_build_guard env_guard(env ? const_cast<llama_kv_cache_context *>(kv_ctx) : nullptr,
+                                            env ? (token_runtime ? live_nkv : cap) : 0);
+            union_nrs_build_guard nrs_guard(
+                cap_nrs != 0 ? const_cast<llama_memory_recurrent_context *>(union_recr_ctx(mctx)) : nullptr,
+                cap_nrs);
+            if (st_peek != nullptr) {
+                ++llama_nkv_ctx_state_get(this).c_graph_builds;
+            }
+            ++n_graph_builds;
+            gf = model.build_graph(build_params);
         }
         if (llama_prefab_stats_enabled()) {
             prefab_stats.n_stock_builds++;
@@ -2788,13 +5950,378 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         }
 
         diag_build = ggml_time_us() - diag_build_start;
+
+        if (record_build) {
+            // The record snapshot takes the single graph cache key, and the
+            // key's lane exclusion is read from the shape map: a graph whose
+            // token shape map is valid has token inputs whose ne[0] the bind
+            // patches, so those dimensions must stay out of the key (see
+            // union_topology_key_excl()). The snapshot has to run first
+            // because the analysis below reads the record's tensor lists, so
+            // the key is taken again right after the analysis, with the lane
+            // now known. Nothing reads the key in between: the record is not
+            // used for a bind until this process_ubatch call returns.
+            nkv_record_snapshot(gf);
+            auto & st = llama_nkv_ctx_state_get(this);
+            st.record_valid = true;
+            // The width the graph was built at, read from the applied-width
+            // accessor: get_n_kv() reports the true used span when the exact
+            // lane is armed, and a build-time width is not a runtime target.
+            st.record_cap   = env ? cap : (kv_ctx != nullptr ? kv_ctx->get_n_kv_stock() : 0);
+            st.record_bound = token_runtime ? live_nkv : st.record_cap;
+            // The arena starts at the width the graph was built at: the
+            // allocation envelope on the legacy lanes, the exact live width
+            // on the token lane. A successful replan raises it; nothing else
+            // may, because nothing else reallocates the arena in place.
+            st.record_arena_n_kv = st.record_bound;
+            st.record_cap_nout      = res->outputs_envelope();
+            st.record_has_out_ids   = res->has_out_ids();
+            st.record_bound_nout    = st.record_cap_nout;
+            st.record_cap_nrs       = cap_nrs;
+            st.record_bound_n_rs    = cap_nrs;
+            st.record_bound_rs_z    = 0;
+            st.record_bound_rs_head = 0;
+            st.record_bound_ntok    = build_params.ubatch.n_tokens;
+            st.record_bound_replay_len = union_replay_len_now(mctx);
+            if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: record build env=%d cap=%u record_cap=%u record_bound=%u "
+                            "cap_nout=%u has_out_ids=%d ntok_build=%u live_nkv=%u token_runtime=%d\n",
+                            "union_rebind_apply", env ? 1 : 0, cap, st.record_cap, st.record_bound,
+                            st.record_cap_nout, st.record_has_out_ids ? 1 : 0,
+                            build_params.ubatch.n_tokens, live_nkv, token_runtime ? 1 : 0);
+
+            // Pillar 1: the node list and the width table are captured AFTER
+            // ggml_backend_sched_alloc_graph(), in the block next to the
+            // topology key. alloc_graph() runs ggml_backend_sched_split_graph(),
+            // which rewrites the graph nodes' src[] to point at scheduler-
+            // inserted copy tensors. The width-table hash is a CLOSED hash --
+            // every edge target must be a member of the hashed node list -- so
+            // a list captured before allocation cannot be hashed afterwards
+            // (the copies are not in it) and every bind refused with
+            // refused_skeleton. The build widths are unchanged by allocation
+            // (the patch runs later), so the table is the same table.
+            ++st.c_env_builds;
+            ++st.c_shape_analyses;
+
+            // rs_z runtime parameter: record what the built graph carries.
+            // The named refusal for "asked but not armed" is counted after
+            // the shape analysis below.
+            const llm_graph_input_rs * rs_inp = nullptr;
+            for (const auto & input : res->inputs) {
+                if (const auto * rs = dynamic_cast<const llm_graph_input_rs *>(input.get())) {
+                    rs_inp = rs;
+                    break;
+                }
+            }
+            st.rsz_rt_active     = rs_inp != nullptr && rs_inp->s_zero != nullptr;
+            // rsz_rt_bound_rs_z is NOT the source of the diagnostic: the live
+            // value is read from record_bound_rs_z when the record is valid
+            // (see union_diagnostics()). It is kept as the fallback for the
+            // one window where the record has been invalidated (a stock
+            // rebuild) but the lane's last binding is still the honest answer.
+            st.rsz_rt_bound_rs_z = st.record_bound_rs_z;
+            // The zero-row op clears ONE row of the state tensor, and that row
+            // is a runtime value bound in set_input(). What the decode-time
+            // check must prove is therefore a property of the state tensor and
+            // the cell capacity, not of a view:
+            //   rs_z < mem_size        (rs_z is a CELL index, never a row)
+            //   mem_size divides rows  (the tensor is (1 + n_rs_seq) groups)
+            //   bound row < rows       (the row the op names exists)
+            // rsz_rt_state_rows is the state tensor's row count and
+            // rsz_rt_zero_view_rows its per-group height (mem->size); the
+            // offsets/strides A recorded for its view no longer exist because
+            // there is no view. See llama_rsz_rt_check_relay_row().
+            st.rsz_rt_zero_view_rows = 0;
+            st.rsz_rt_state_rows = 0;
+            for (const ggml_tensor * x : st.record_t) {
+                if (strcmp(x->name, "union_rs_zero_row") == 0) {
+                    // the op is an in-place view of the state tensor
+                    st.rsz_rt_state_rows       = (uint32_t) x->ne[1];
+                    const auto * recr_rec = union_recr_ctx(mctx);
+                    st.rsz_rt_zero_view_rows   = recr_rec != nullptr ? recr_rec->get_size() : 0;
+                    break;
+                }
+            }
+
+            const bool shape_ok = union_shape_analyze(build_params, st.record_t, st.record_src,
+                    st.record_fixed, st.record_root, st.record_root_offs,
+                    token_runtime ? live_nkv : st.record_cap, st.record_cap_nout,
+                    0 /* build head */, cap_nrs, token_runtime, st.shape_map);
+            // The record's topology key is NOT taken here. It is taken after
+            // ggml_backend_sched_alloc_graph() below, because the key folds
+            // is_fixed() (llama-topology-hash.h) and allocation flips that flag
+            // for every graph-owned tensor: before alloc nothing has a buffer,
+            // after alloc everything does. Every later comparison -- the bind
+            // gate in union_rebind_apply() and the refresh after each applied
+            // bind -- runs on the allocated graph, so a key taken before
+            // allocation can never match and would refuse the first bind of
+            // every graph. That was the pre-existing refusal: the topology gate
+            // failed, c_refused_topology moved (a counter the stats line did not
+            // print), the caller rebuilt stock, env_disabled was set, and the
+            // mask PASS arm was never observed.
+
+            // rs_z runtime parameter: the record build either carried the
+            // zero-row index (rsz_rt_active) or it did not. A lane that asked
+            // for the row and did not get it is a named refusal; the graph
+            // then runs stock, where a moved rs_z is a rebuild. This runs
+            // AFTER the shape analysis because _no_rs_z is the analysis'
+            // verdict.
+            //
+            // The cases graph_params() already counted (gate, no recurrent
+            // context, rs_z < 0) are not counted again here: one refusal, one
+            // counter. What is left is what only the built graph can show.
+            if (st.rsz_rt_enabled && !st.rsz_rt_active) {
+                if (rs_inp == nullptr) {
+                    st.rsz_rt_refuse(st.c_rsz_rt_refused_arch);
+                } else if (rs_inp->s_zero == nullptr) {
+                    st.rsz_rt_refuse(st.c_rsz_rt_refused_no_rs_z);
+                } else {
+                    st.rsz_rt_refuse(st.c_rsz_rt_refused_shape);
+                }
+            }
+            if (!shape_ok) {
+                if (token_runtime) ++st.c_ntok_fallbacks;
+                // outside the provable support range: disable the envelope and
+                // rebuild at the stock width. This is a real graph build.
+                ++st.c_shape_fail;
+                if (st.shape_map.fused_qkv_refused) {
+                    // The one refusal this pass can name: the fused-QKV
+                    // projection's Q/K/V views are non-contiguous row slices
+                    // of one matmul, so no symbolic map can bind their token
+                    // axis. The lane still disables below; this names the cause.
+                    ++st.c_fused_qkv_refused;
+                    LLAMA_LOG_INFO("%s: token lane refused: fused QKV projection "
+                                   "(blk.*.attn_qkv.weight) is a non-contiguous slice "
+                                   "of one fused matmul\n", __func__);
+                }
+                ++st.c_fallbacks;
+                ++st.c_rebuild_fallbacks;
+                st.env_disabled = true;
+                st.nout_suppress_envelope = true;
+                union_record_invalidate();
+                record_build = false;
+
+                // drain the envelope build's (not yet computed) graph and any
+                // previous in-flight compute before the stock rebuild
+                ggml_backend_sched_synchronize(sched.get());
+                res->reset();
+                ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+                gparams = graph_params(res, ubatch, mctx, gtype);
+                ++st.c_graph_builds;
+                ++n_graph_builds;
+                gf = model.build_graph(gparams);
+                if (!gf) {
+                    LLAMA_LOG_ERROR("%s: failed to rebuild graph at the stock width\n", __func__);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+            }
+            if (record_build) {
+                // the analysis accepted this graph: the envelope is usable.
+                // record_cap_nout is max(active, previous high-water), so it
+                // can only stay or rise. A rise after a valid record is the
+                // single envelope-expanding rebuild; widths up to the new
+                // mark bind in place.
+                if (st.record_cap_nout > st.nout_high_water) {
+                    st.nout_high_water = st.record_cap_nout;
+                }
+                if (prev_record_valid && st.record_cap_nout > prev_cap_nout) {
+                    ++st.c_nout_grow_rebuilds;
+                }
+            }
+        } else if (union_binder_state_peek() != nullptr) {
+            // gate is on but this build is not a record build: drop the record
+            // (tensor vectors included) instead of leaving dangling pointers
+            union_record_invalidate();
+            // a stock build carries no selection row; the rs_z lane is off
+            // until the next record build proves it again
+            auto & st = llama_nkv_ctx_state_get(this);
+            st.rsz_rt_active = false;
+        }
+        // Only a recorded envelope can use the copy metadata. Keep stock
+        // graphs and scheduler reserve paths free of tracking allocations.
+        if (!ggml_backend_sched_set_split_copy_tracking(sched.get(), record_build)) {
+            LLAMA_LOG_ERROR("%s: failed to configure split copy tracking\n", __func__);
+            union_record_invalidate();
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
         const int64_t diag_alloc_start = ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            union_record_invalidate();
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
         diag_alloc = ggml_time_us() - diag_alloc_start;
+
+        // The record's node list, width table and topology key, all taken on
+        // the ALLOCATED graph -- the same state every later comparison sees.
+        // The address record stays the tensor-identity authority; the key is
+        // the topology half of the same question, and the width table is the
+        // runtime-dimension half.
+        if (record_build) {
+            auto & st = llama_nkv_ctx_state_get(this);
+            // The CANONICAL node set, not the raw graph node list. The width
+            // table exists to exclude the runtime dimensions of the tensors
+            // the graph reaches through src[]/view_src -- the KQ mask, the
+            // out_ids closure, the nkv runtime input, the K/V views -- and
+            // those tensors are NOT graph nodes: the raw list has 222 entries
+            // while the canonical set has 236. llama_union_topology_hash::
+            // hash_nodes() is a closed hash (every edge target must be a
+            // member), so hashing the raw list could never succeed: the
+            // excluded tensors were not even members. This is the same set
+            // llama_topology_key_of() hashes, so the two hashes describe the
+            // same graph.
+            //
+            // The const_cast is the type boundary only: the canonical list is
+            // const because the key never writes through it, while the record
+            // stores mutable pointers for the patch. The tensors are owned by
+            // the graph result and outlive the record; union_record_invalidate()
+            // drops the record before the graph is reset.
+            std::vector<const ggml_tensor *> canon;
+            llama_topology_detail::topology_index canon_index;
+            std::vector<size_t> canon_position;
+            llama_topology_canonical_nodes(gf, canon, canon_index, canon_position);
+            st.record_nodes.clear();
+            st.record_nodes.reserve(canon.size());
+            for (const ggml_tensor * x : canon) {
+                st.record_nodes.push_back(const_cast<ggml_tensor *>(x));
+            }
+            const uint32_t width = token_runtime ? live_nkv : st.record_cap;
+            const uint32_t build_ntok = token_runtime ? build_params.ubatch.n_tokens : 0;
+            // The table's exclusion set is the shape map's coefficient table:
+            // the same tensors and axes union_rebind_apply() patches. The map
+            // indexes the RECORD list, so the resolution is by tensor identity
+            // into the canonical list (see union_width_runtime_dims()).
+            const std::vector<llama_union_topology_excl> runtime_dims =
+                    union_width_runtime_dims(st.shape_map, st.record_t, st.record_nodes);
+            const bool table_ok = st.width_table.build(st.record_nodes, runtime_dims, width,
+                    st.record_cap_nout, cap_nrs, 0 /* build head */, build_ntok,
+                    model.hparams.n_pos_per_embd(), model.hparams.n_embd_v_gqa_max());
+            uint64_t hash = 0;
+            st.topology_hashed = table_ok && st.width_table.topology_hash(st.record_nodes, hash);
+            st.topology_hash   = st.topology_hashed ? hash : 0;
+            if (!table_ok) {
+                st.width_table.clear();
+            }
+            st.record_topology_key = llama_topology_key_of(gf, union_topology_key_excl(st.shape_map, st.record_t));
+            if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: record post-alloc nodes=%zu rt_dims=%zu table_ok=%d hashed=%d hash=%016llx\n",
+                    "union_rebind_apply", st.record_nodes.size(), runtime_dims.size(),
+                    table_ok ? 1 : 0, st.topology_hashed ? 1 : 0,
+                    (unsigned long long) st.topology_hash);
+        }
+
+        // the fresh graph is still at the build widths. Patch it to the runtime
+        // values BEFORE the first compute; a refusal on a graph the analysis
+        // accepted disables the envelope and rebuilds stock, so a deterministic
+        // bind failure cannot turn into a per-ubatch rebuild loop.
+        //
+        // The delta predicate decides whether a bind has anything to do. The
+        // record snapshot set record_bound* to the BUILD shapes (:5606-5614),
+        // so it is meaningful before the bind. A no-op bind would change
+        // nothing, and walking the kinds only to have all four decline would
+        // count four lane_declines for nothing: on the token lane the graph is
+        // already built at the active widths, so a step whose targets all
+        // match the record needs no bind at all.
+        //
+        // The rs_z zero row is a runtime INDEX input, not a shape: it is
+        // bound on every set_inputs() (union_rsz_bind_index) and no tensor
+        // layout depends on it. It is therefore not part of the predicate; a
+        // row-only move must not force a rebuild.
+        auto delta_pending = [&]() {
+            auto & st = llama_nkv_ctx_state_get(this);
+            const bool nout_changed = st.record_has_out_ids && n_outputs != st.record_bound_nout;
+            return union_nkv_now(mctx) != st.record_bound || nout_changed ||
+                   union_n_rs_now(mctx) != st.record_bound_n_rs ||
+                   union_rs_head_now(mctx) != st.record_bound_rs_head ||
+                   ubatch.n_tokens != st.record_bound_ntok;
+        };
+        bool fresh_bound = false;
+        {
+            auto & st_dbg = llama_nkv_ctx_state_get(this);
+            if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: post-build bind decision record_build=%d pending=%d "
+                            "nkv_now=%u record_bound=%u nout=%u bound_nout=%u ntok=%u bound_ntok=%u "
+                            "record_cap=%u\n",
+                            "union_rebind_apply", record_build ? 1 : 0, delta_pending() ? 1 : 0,
+                            union_nkv_now(mctx), st_dbg.record_bound, n_outputs,
+                            st_dbg.record_bound_nout, ubatch.n_tokens, st_dbg.record_bound_ntok,
+                            st_dbg.record_cap);
+        }
+        if (record_build && delta_pending()) {
+            auto & st = llama_nkv_ctx_state_get(this);
+            fresh_bound = st.union_binder.rebind_any(this, res, gparams);
+            if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: post-build bind result fresh_bound=%d\n",
+                            "union_rebind_apply", fresh_bound ? 1 : 0);
+        }
+        const uint32_t out_bound = res->outputs_bound();
+        if (record_build && !fresh_bound) {
+            auto & st = llama_nkv_ctx_state_get(this);
+            // The same predicate the bind decision used: with a no-op bind
+            // skipped above, false here means the record already matches the
+            // live targets.
+            const bool changed = delta_pending();
+            bool replan_failed = false;
+            if (!changed && st.record_valid && st.shape_map.ntok_valid) {
+                // transactional replan at the live token width; a refusal
+                // leaves the old arena and record intact and falls back below
+                replan_failed = !ggml_backend_sched_replan_graph(sched.get(), st.record_t.data(),
+                        st.record_fixed.data(), st.record_t.size(), nullptr, nullptr, 0);
+                // The replan reallocated the arena at the recorded bound
+                // shapes, so the arena width is that bound. A failed replan
+                // leaves the old arena and must leave this value alone.
+                if (!replan_failed && st.record_bound != 0) {
+                    st.record_arena_n_kv = st.record_bound;
+                }
+                // No reduction-order fixup, for the same reason as
+                // union_rebind_apply: the in-place patch is the whole
+                // mechanism, and the ordered attention kernels make the tree
+                // depend only on the surviving terms.
+            }
+            if (changed || out_bound > n_outputs || !st.record_valid || replan_failed) {
+                // The fresh record is dropped here, so its key must go with it:
+                // llama_topology_key_of() never returns 0 for a real graph, so
+                // a stale key would let the next bind's topology gate compare
+                // a live graph against a record that no longer exists.
+                // union_record_invalidate() below does this; the assignment
+                // here states it at the site that decides the record is dead.
+                // The width-table hash goes with it for the same reason: a
+                // hash left over from a record that no longer exists would
+                // report a topology nobody can vouch for.
+                st.record_topology_key = llama_topology_key{};
+                st.topology_hash       = 0;
+                st.topology_hashed     = false;
+                ++st.c_rebuild_fallbacks;
+                st.env_disabled = true;
+                st.nout_suppress_envelope = true;
+                union_record_invalidate();
+                ggml_backend_sched_synchronize(sched.get());
+                res->reset();
+                ggml_backend_sched_reset(sched.get());
+                if (!ggml_backend_sched_set_split_copy_tracking(sched.get(), false)) {
+                    LLAMA_LOG_ERROR("%s: failed to disable split copy tracking\n", __func__);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+                gparams = graph_params(res, ubatch, mctx, gtype);
+                ++st.c_graph_builds;
+                ++n_graph_builds;
+                gf = model.build_graph(gparams);
+                if (!gf) {
+                    LLAMA_LOG_ERROR("%s: failed to rebuild graph at the stock width\n", __func__);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate rebuilt graph\n", __func__);
+                    union_record_invalidate();
+                    ret = GGML_STATUS_ALLOC_FAILED;
+                    return nullptr;
+                }
+            }
+        }
     }
 
     // Validate the actual scheduler placement before submitting any compute.
@@ -2833,8 +6360,66 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     {
         //const auto t_start_us = ggml_time_us();
 
+
+        // poka-yoke: the output-gather closure must execute at the active
+        // width before compute. The binder patches it on both the reuse and
+        // fresh-build paths; a graph still at a different width would make the
+        // gather read stale or uninitialized tail indices.
+        const uint32_t out_bound = res->outputs_bound();
+        if (res->has_out_ids() && out_bound != n_outputs) {
+            LLAMA_LOG_ERROR("%s: output gather bound at %u, active n_outputs %u\n",
+                            __func__, out_bound, n_outputs);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        // Pillar 1: the width the attention consumers must execute at is a
+        // VALUE, re-armed from the KV cache before every compute (reused and
+        // fresh-build paths alike). It is written into the graph's runtime
+        // n_kv input by llm_graph_input_nkv_runtime::set_input below.
+        if (const llama_nkv_ctx_state * wst = union_binder_state_peek()) {
+            if (wst->nkv_enabled && wst->width_table.build_n_kv != 0) {
+                const llama_kv_cache_context * wkv = union_kv_ctx(mctx);
+                const uint32_t width = wkv != nullptr ? wkv->get_n_kv_runtime() : 0;
+                if (width != 0) {
+                    // Same bound as the bind's arm: the width the live arena
+                    // holds. A width above it has no backing and stays
+                    // unarmed (runtime_n_kv = 0), which is the fail-closed
+                    // direction; the bind's own envelope precheck is what
+                    // refuses such a step before it reaches this point.
+                    if (!llama_nkv_ctx_state_get(this).width_table.set_runtime_n_kv(
+                                width, wst->record_arena_n_kv)) {
+                        // The graph is about to execute at a width its arena
+                        // does not hold. Refuse the decode instead of
+                        // computing on a mask that cannot cover the width.
+                        LLAMA_LOG_ERROR("%s: runtime n_kv %u exceeds the live arena %u\n",
+                                        __func__, width, wst->record_arena_n_kv);
+                        ret = GGML_STATUS_FAILED;
+                        return nullptr;
+                    }
+                }
+            }
+        }
+
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+
+        // The batch the inputs were just filled from, for the mask read-back's
+        // test surface (llama_union_mask_row_check). One copy on a path that
+        // already copies the batch into the graph parameters.
+        //
+        // The copy is safe because a ubatch that reaches here owns its data:
+        // llama_batch_allocr builds it with a shared_ptr<data_t> and the
+        // ubatch's raw pointers point into that store (llama-batch.cpp:777,
+        // :846-863), so copying the ubatch copies the shared_ptr and the
+        // pointees outlive the per-decode memory context. If that invariant
+        // ever changes, the read-back must refuse rather than guess: it
+        // already returns UNPROVEN for an empty or unusable batch.
+        //
+        // Nothing per-decode is stored: the memory context is owned by the
+        // unique_ptr in decode() and is freed when decode returns, so the
+        // read-back resolves the long-lived cache from `memory` at call time.
+        ubatch_inputs_last = ubatch;
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -2843,7 +6428,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (backend_tp5_relay && std::getenv("TP5_DIAG_GRAPH")) {
         LLAMA_LOG_INFO("TP5_DIAG_GRAPH ctx=%p N=%u pos=%d replay=%u reused=%d pre_us=%lld build_us=%lld alloc_us=%lld inputs_us=%lld compute_us=%lld total_us=%lld\n",
-            (void *) this, ubatch.n_tokens, ubatch.pos ? ubatch.pos[0] : -1, diag_replay, int(diag_reused),
+            (void *) this, ubatch.n_tokens, ubatch.pos ? ubatch.pos[0] : -1, diag_replay, int(reused),
             (long long)(diag_prepared-diag_start),(long long)diag_build,(long long)diag_alloc,
             (long long)(diag_compute_start-diag_input_start),(long long)(ggml_time_us()-diag_compute_start),
             (long long)(ggml_time_us()-diag_start));
@@ -2856,10 +6441,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
     ret = GGML_STATUS_SUCCESS;
 
+    // c_pad_fallbacks is folded nowhere: the pad bucket and its forced-fallback
+    // hook were deleted with the padded lane, and the exact lane now treats a
+    // layout refusal as a hard failure in
+    // llama_kv_cache_context::get_n_kv(). The counter and its exported field
+    // stay (include/llama.h) so a reader can see it is 0; nothing increments
+    // it, so a step cannot be attributed a fallback that did not happen.
+
     return res;
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    last_llama_activation_valid = false;
     if (backend_tp5_relay != nullptr) {
         LLAMA_LOG_ERROR("%s: tp5-relay supports decoder-only calls\n", __func__);
         return -1;
@@ -3193,6 +6786,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    last_llama_activation_valid = false;
     if (backend_tp5_relay != nullptr &&
         (batch_inp.n_tokens <= 0 || uint32_t(batch_inp.n_tokens) > cparams.n_ubatch ||
          batch_inp.token == nullptr || batch_inp.embd != nullptr || !loras->empty() ||
@@ -3385,6 +6979,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    uint32_t n_ubatches_done = 0;
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -3582,10 +7177,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev += ubatch.n_tokens;
+        ++n_ubatches_done;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
+    bool activation_rows_ordered = true;
 
     // set output mappings
     if (n_outputs > 0) {
@@ -3600,6 +7197,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             output_ids[out_id] = i;
             if (out_id != i) {
                 sorted_output = false;
+                activation_rows_ordered = false;
             }
         }
 
@@ -3633,6 +7231,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
     }
+    // The final normalization tensor is already a graph output. Only expose
+    // it when one microbatch produced every row in the original order.
+    last_llama_activation_valid = model.arch == LLM_ARCH_LLAMA && activation_rows_ordered &&
+        n_ubatches_done == 1 && n_outputs_all == n_tokens_all && n_outputs_all > 0;
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
@@ -3971,6 +7573,11 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t                       n_toke
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
+    union_record_invalidate();
+    if (!ggml_backend_sched_set_split_copy_tracking(sched.get(), false)) {
+        LLAMA_LOG_ERROR("%s: failed to disable split copy tracking for reserve\n", __func__);
+        return nullptr;
+    }
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3996,6 +7603,7 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t                       n_toke
 
     res->reset();
 
+    ++n_graph_builds;
     auto * gf = model.build_graph(gparams);
 
     this->n_outputs = save_n_outputs;
@@ -4024,6 +7632,119 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
                                              const llama_ubatch &           ubatch,
                                              const llama_memory_context_i * mctx,
                                              llm_graph_type                 gtype) const {
+    // n_outputs is split into the ACTIVE count (this ubatch, a runtime key)
+    // and the BUILD envelope (allocation width). The envelope is only used on
+    // a single CPU-backend graph, where the binder can patch the output-gather
+    // closure in place; everywhere else the graph builds at the active count.
+    // Keep output allocation at the observed high-water mark. Recurrent
+    // zero-row execution additionally requires the single CPU backend.
+    const llama_nkv_ctx_state * nout_st = union_binder_state_peek();
+    const bool union_active =
+        nout_st != nullptr && nout_st->nkv_enabled && !nout_st->env_disabled &&
+        !graph_reuse_disable && sampling.samplers.empty() &&
+        union_arch_supported(model.arch) && !model.hparams.use_alibi &&
+        model.hparams.n_expert == 0 && model.hparams.n_rel_attn_bkts == 0 &&
+        (gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER) &&
+        (union_recr_ctx(mctx) == nullptr ? (union_sched_cpu_only() || union_sched_single_split())
+                                         : union_sched_cpu_only()) &&
+        !cparams.pipeline_parallel && backend_tp5_relay == nullptr &&
+        dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx) == nullptr &&
+        !union_is_hybrid_iswa(mctx) && !union_has_attention_views(mctx);
+    const bool nout_envelope = union_active && !nout_st->nout_suppress_envelope;
+    const uint32_t nout_build = nout_envelope
+        ? std::max<uint32_t>(n_outputs, nout_st->nout_high_water)
+        : 0;
+    if (nout_st != nullptr) {
+        nout_st->nout_suppress_envelope = false;
+    }
+
+    // rs_z runtime parameter: the lane is armed per build. A context that
+    // never passed the arm checks (gate, recurrent context, a free zero cell,
+    // the n_rs_seq row-set condition) builds the stock graph, and the refusal
+    // is counted HERE, once per build, by name. The record-build block below
+    // then only counts the cases this predicate cannot see (no rs input at
+    // all, a build that carried no zero-row index, a malformed index tensor).
+    //
+    // A refusal here is not a "fallback": nothing was bound and nothing was
+    // rebuilt, the build simply never carried the lane. The lane total
+    // (c_rsz_rt_fallbacks) counts refusals of the runtime path, so these
+    // count too; see llama-nout-state.h.
+    //
+    // These counters also move on the scheduler's reserve builds, which call
+    // graph_params() too. That is intended: the counters answer "why is the
+    // lane not armed", not "how many decodes fell back", and they stay 0 on
+    // any context where the lane arms.
+    const llama_memory_recurrent_context * rsz_recr = union_recr_ctx(mctx);
+    const uint32_t rsz_n_rs_seq = rsz_recr != nullptr ? rsz_recr->get_n_rs_seq() : 0;
+    // The relay path is a second arming form, not a widening of the first:
+    // its gate is the relay lane itself (a single scheduler split, so one
+    // topology on every rank and no relay channel bound to a graph input),
+    // and it carries the ring (n_rs_seq > 0) by clearing the single row the
+    // gathers read. A relay context never passes the stock gate (it refuses
+    // backend_tp5_relay), so exactly one form applies.
+    const bool rsz_relay_ok = llama_rsz_rt_relay_gate(
+        backend_tp5_relay != nullptr,
+        nout_st != nullptr && nout_st->rsz_rt_enabled,
+        !graph_reuse_disable,
+        cparams.pipeline_parallel,
+        union_sched_single_split());
+    const bool rsz_gate_ok = nout_st != nullptr && nout_st->nkv_enabled && nout_st->rsz_rt_enabled &&
+        !graph_reuse_disable && !cparams.pipeline_parallel && backend_tp5_relay == nullptr &&
+        !union_is_hybrid_iswa(mctx) && !union_has_attention_views(mctx) &&
+        dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx) == nullptr;
+    if (nout_st != nullptr && nout_st->rsz_rt_enabled && !rsz_gate_ok && !rsz_relay_ok) {
+        nout_st->rsz_rt_refuse(nout_st->c_rsz_rt_refused_gate);
+    }
+    // n_rs_seq > 0 widens the state tensors to mem_size*(1+n_rs_seq) rows and
+    // makes s_copy() return idx*size + src0, i.e. a row index is no longer a
+    // cell index. The stock lane bakes rs_z into a view offset, so it is
+    // refused by name rather than silently allowed; see build_rs().
+    // The relay lane carries the ring: there the zero-row op clears the row
+    // rs_idx[seq]*mem_size + rs_z, which is the row the gathers read
+    // (llama_rsz_rt_check_relay_row()).
+    // The arming rules themselves are llama_rsz_rt_relay_gate(),
+    // llama_rsz_rt_relay_armable() and llama_rsz_rt_armable()
+    // (llama-nout-state.h), pure predicates a model-free test pins. This site
+    // supplies their inputs and counts the refusals; it does not restate the
+    // rule. rsz_relay_ok is the gate half, rsz_row_armed below is the whole
+    // rule for the relay form.
+    const bool rsz_rows_ok = rsz_recr == nullptr || rsz_n_rs_seq == 0;
+    if (nout_st != nullptr && nout_st->rsz_rt_enabled && rsz_gate_ok && !rsz_relay_ok && !rsz_rows_ok) {
+        nout_st->rsz_rt_refuse(nout_st->c_rsz_rt_refused_n_rs_seq);
+    }
+    // ONE predicate decides whether this build carries the runtime rs row.
+    // It is true on B's binder lane (union_active already creates s_zero) and,
+    // independently, on the relay lane: a relay context never passes B's gate
+    // (union_active requires backend_tp5_relay == nullptr), yet the ticket
+    // needs the row there. On relay the row is written per set_inputs() and no
+    // shape is bound -- union_rebind_apply still refuses relay contexts, which
+    // is exactly right: a row move must not bind anything.
+    //
+    // The relay half is llama_rsz_rt_relay_armable() itself, not the bare gate.
+    // The predicate is stricter than the bare gate in two ways, and neither may
+    // change which builds carry the index tensor:
+    //
+    //   has_recr   a relay context with no recurrent sub-cache still reaches
+    //              this function (graph_params() does not know the arch). The
+    //              flag is inert there -- build_rs_inp_impl() is only reached
+    //              for graphs that have an rs input -- so the pre-existing
+    //              arming is preserved by the `rsz_recr == nullptr` term.
+    //
+    //   rs_z >= 0  the relay lane arms on a build whose rs_z is still -1 (no
+    //              free zero cell yet); the bound row is then the -1 no-op of
+    //              union_rsz_zero_row() (src/llama-graph.cpp:511-513). A
+    //              negative live rs_z is refused by name at decode time
+    //              (process_ubatch, c_rsz_rt_refused_cell), not here.
+    //
+    // Both relaxations reproduce `union_active || rsz_relay_ok` exactly, so
+    // this change cannot move the node set of any graph.
+    const int32_t rsz_rs_z_now = union_rs_z_now(mctx);
+    const bool rsz_relay_armed = rsz_relay_ok &&
+        (rsz_recr == nullptr ||   // no rs input to arm: the flag is inert
+         llama_rsz_rt_relay_armable(/*relay_ok=*/true, /*has_recr=*/true,
+                                    rsz_n_rs_seq, rsz_rs_z_now) ||
+         rsz_rs_z_now < 0);       // -1 row is the op's no-op
+    const bool rsz_row_armed = union_active || rsz_relay_armed;
     return {
         /*.arch        =*/model.arch,
         /*.hparams     =*/model.hparams,
@@ -4038,6 +7759,11 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.cross       =*/&cross,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
+        /*.n_outputs_build =*/nout_build,
+        /*.union_binder    =*/union_active,
+        /*.strict_ntok     =*/false,
+        /*.rs_row_armed    =*/rsz_row_armed,
+
         /*.cb          =*/graph_get_cb(),
         /*.res         =*/res,
     };
@@ -4996,6 +8722,7 @@ void llama_context::opt_epoch_iter(ggml_opt_dataset_t               dataset,
 
             res->reset();
 
+            ++n_graph_builds;
             auto * gf = model.build_graph(gparams);
 
             struct ggml_context * ctx_compute_opt;
@@ -5283,6 +9010,166 @@ void llama_free(llama_context * ctx) {
         }
     }
     delete ctx;
+}
+
+bool llama_get_ntok_plan_stats(const llama_context * ctx, llama_ntok_plan_stats * stats) {
+    return ctx && ctx->ntok_plan_stats(stats);
+}
+
+bool llama_get_nkv_runtime_stats(const llama_context * ctx, llama_nkv_runtime_stats * stats) {
+    return ctx && ctx->nkv_runtime_stats(stats);
+}
+
+// The KQ mask the live graph's runtime n_kv input filled, if any. The two
+// functions below are the read-back's test surface: they read the same
+// llm_graph_input_nkv_runtime the fill wrote and re-run the same
+// llama_kv_cache::check_mask_row the fill runs. There is no second
+// implementation of the check, which is the point: a test that corrupts the
+// row and sees the check fail proves the production check can fail.
+static const llm_graph_input_nkv_runtime * union_live_mask_input(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    const llm_graph_result * res = ctx->get_gf_res_prev();
+    if (res == nullptr) {
+        return nullptr;
+    }
+    const llm_graph_input_nkv_runtime * rt = res->get_nkv_runtime_input();
+    if (rt == nullptr || rt->mask_n_kv == 0) {
+        return nullptr;
+    }
+    return rt;
+}
+
+// The first registered F32 mask, which is the one the fill checked. The lane
+// registers exactly one mask (build_attn_inp_kv_impl); a graph with none has
+// nothing to read back.
+static ggml_tensor * union_live_mask_tensor(const llm_graph_input_nkv_runtime * rt) {
+    if (rt == nullptr) {
+        return nullptr;
+    }
+    for (ggml_tensor * mask : rt->kq_masks) {
+        if (mask != nullptr && mask->data != nullptr && mask->type == GGML_TYPE_F32) {
+            return mask;
+        }
+    }
+    return nullptr;
+}
+
+bool llama_union_kq_mask_row(const llama_context * ctx, uint32_t row, float ** data, int64_t * ne0) {
+    if (data != nullptr) {
+        *data = nullptr;
+    }
+    if (ne0 != nullptr) {
+        *ne0 = 0;
+    }
+    const llm_graph_input_nkv_runtime * rt = union_live_mask_input(ctx);
+    ggml_tensor * mask = union_live_mask_tensor(rt);
+    if (mask == nullptr || data == nullptr) {
+        return false;
+    }
+    const uint32_t width = rt->mask_n_kv;
+    if (width == 0 || (int64_t) width > mask->ne[0]) {
+        return false;
+    }
+    // The stride is the tensor's own ne[0], not the fill width: the fill pads
+    // every column from `width` up to ne[0], so row i starts at ne[0]*i and
+    // width*i would land inside a padded row. The row count is ne[1]*ne[3]
+    // (rows per stream times streams).
+    if ((int64_t) row >= mask->ne[1] * mask->ne[3]) {
+        return false;
+    }
+    // The live host row, the same pointer the read-back compares. The mask is
+    // flagged GGML_TENSOR_FLAG_OUTPUT at registration, so ggml-alloc keeps its
+    // block alive and mask->data still holds the row the fill wrote.
+    *data = (float *) mask->data + (size_t) row * (size_t) mask->ne[0];
+    if (ne0 != nullptr) {
+        *ne0 = mask->ne[0];
+    }
+    return true;
+}
+
+enum llama_gate_verdict llama_union_mask_row_check(const llama_context * ctx) {
+    const llm_graph_input_nkv_runtime * rt = union_live_mask_input(ctx);
+    ggml_tensor * mask = union_live_mask_tensor(rt);
+    if (mask == nullptr) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+    const llama_ubatch & ubatch = ctx->get_ubatch_inputs_last();
+    if (ubatch.n_tokens == 0) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+    const uint32_t width = rt->mask_n_kv;
+    if (width == 0 || (int64_t) width > mask->ne[0]) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+    // The last token of the last batch: its row covers the whole step, so the
+    // comparison is not vacuous. The row offset is the check's business.
+    //
+    // ONE row, deliberately. Multi-row coverage is the fill's job: it walks
+    // every row of the batch when the batch is at most k_rows_max tokens
+    // (llama-graph.cpp's set_input) and reports the totals through
+    // mask_row_checked / mask_rows_all. This function is the test surface for
+    // "the same check, called again", not a second sweep, so it must not be
+    // widened to compensate for anything the fill does not do.
+    const uint32_t tok = ubatch.n_tokens - 1;
+
+    // A step whose bind was refused and whose graph was then rebuilt has a
+    // patch that may have landed on a graph nobody executes (the pad-tail and
+    // shape patches are written inside union_rebind_apply, before the record
+    // is updated and before the post-bind can_reuse refusal). The rebuilt
+    // graph is a different object, so the hazard is a stale RECORD, not a
+    // stale node -- but a read-back taken across that boundary would compare a
+    // row against cells the record no longer describes. Refuse: UNPROVEN, not
+    // FAIL, because nothing was compared.
+    llama_union_diagnostics diag = {};
+    if (llama_get_union_diagnostics(ctx, &diag) && diag.rebuild_fallbacks != 0) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+
+    // The cache is resolved from the context's own memory, which lives as long
+    // as the context. The per-decode memory CONTEXT is not consulted: it is
+    // freed when decode returns, and this function is called after that.
+    llama_kv_cache * kv = union_kv_cache_of(ctx->get_memory());
+    if (kv == nullptr) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+    // The same two rules the fill applies: the context's causal flag and the
+    // cache's own SWA type, not defaults.
+    const bool swa = kv->get_swa_type() != LLAMA_SWA_TYPE_NONE;
+    int64_t first_bad = -1;
+    // The check's verdict is returned as-is. PASS and FAIL are observations;
+    // UNPROVEN means the check did not run. A caller must compare against the
+    // named value, because UNPROVEN is not 0.
+    // Compare the live row. The mask is flagged GGML_TENSOR_FLAG_OUTPUT when
+    // it is registered (register_nkv_runtime_mask), so ggml-alloc keeps its
+    // block and mask->data still holds the row the fill wrote when this runs
+    // after llama_decode() has returned. Without that flag the allocator
+    // would reuse the block after soft_max and this would read whatever took
+    // its place.
+    const float * row = (const float *) mask->data;
+    const enum llama_gate_verdict verdict = kv->check_mask_row(mask, &ubatch, tok,
+            row, width, ctx->get_cparams().causal_attn, swa, &first_bad);
+    // Trace the witness: how many of the `width` floats in the live row still
+    // agree with the row copied at fill time. A disagreement is evidence the
+    // block was reused, never the verdict.
+    if (union_bind_trace_on()) {
+        size_t agree = 0;
+        if (rt->mask_row_snapshot.size() >= (size_t) width) {
+            for (uint32_t i = 0; i < width; ++i) {
+                agree += (row[i] == rt->mask_row_snapshot[i]) ? 1 : 0;
+            }
+        }
+        LLAMA_LOG_ERROR("%s: mask row check verdict=%d tok=%u width=%u first_bad=%lld "
+                        "witness_agree=%zu/%u | mask_n_kv=%u mask_filled=%u mask_refused=%u "
+                        "mask_row_checked=%u mask_row_ok=%u mask_row_refused=%u mask_rows_all=%u mask_ne0=%lld\n",
+                        "llama_union_mask_row_check", (int) verdict, tok, width,
+                        (long long) first_bad, agree, width,
+                        rt->mask_n_kv, rt->mask_filled, rt->mask_refused,
+                        rt->mask_row_checked, rt->mask_row_ok, rt->mask_row_refused,
+                        rt->mask_rows_all, (long long) mask->ne[0]);
+    }
+    return verdict;
 }
 
 uint32_t llama_n_ctx(const llama_context * ctx) {
@@ -5905,6 +9792,99 @@ int32_t llama_decode(llama_context * ctx, llama_batch batch) {
 //
 // perf
 //
+
+bool llama_context::union_diagnostics(llama_union_diagnostics * out) const {
+    if (out == nullptr || union_binder_state == nullptr) return false;
+    const auto & st = *union_binder_state;
+    // `topology_hash` here is the width-table hash of llama-union-topology.h
+    // (st.topology_hash), NOT st.record_topology_key.hash. The two answer
+    // different questions and the public field keeps the one the pillar is
+    // observed through:
+    //
+    //   st.topology_hash          the live graph's topology with the n_kv,
+    //                             n_outputs, rs_z and (on the token lane)
+    //                             n_tokens dimensions excluded. It is re-taken
+    //                             after every applied bind, so an unchanged
+    //                             value across a parameter sweep is evidence
+    //                             that the bind changed shapes only.
+    //                             llama_get_nkv_runtime_stats() reports the
+    //                             same value, and test-nkv-runtime-param and
+    //                             test-topology-key-sweep compare it across
+    //                             cells.
+    //   st.record_topology_key    the single graph cache key of
+    //                             llama-topology-hash.h. It is the binder's
+    //                             reuse gate and it is invariant to those
+    //                             dimensions by construction, so exporting it
+    //                             here would report a number that cannot move
+    //                             when the parameter does - stable for the
+    //                             wrong reason. It stays internal; a caller
+    //                             that needs it reads it from the binder, not
+    //                             from this diagnostic.
+    //
+    // `exact_lane` is the GGML_TP5_UNION_BINDER_EXACT selection, a
+    // configuration value: 1 when the runtime-length lane is active, 0 when
+    // the stock padded control lane is. It is NOT an observation of what a
+    // step executed at; bound_n_kv is that observation.
+    // 26 values for 26 fields, in declaration order (include/llama.h).
+    // The rs_z lane's block is appended after exact_lane, so every earlier
+    // field keeps its position.
+    //
+    // rsz_rt_bound_rs_z: the rs_z the live graph is bound at. The authoritative
+    // value is record_bound_rs_z, refreshed at the record build and again by
+    // every applied union_rebind_apply() ("record_bound_rs_z =
+    // union_rs_z_now(...)"). The stored rsz_rt_bound_rs_z is only the
+    // record-build snapshot, so reading it here would report the build-time
+    // value on every step after a bind -- the diagnostic would name a row the
+    // graph no longer clears. Read the record while it is valid and fall back
+    // to the snapshot only when it is not (a stock rebuild invalidates it).
+    const int32_t rsz_bound_rs_z = st.record_valid ? st.record_bound_rs_z
+                                                   : st.rsz_rt_bound_rs_z;
+    *out = { st.c_fallbacks, st.c_rebuild_fallbacks, st.c_patch_binds, st.c_pad_fallbacks,
+             st.record_bound_ntok, st.record_bound, st.nkv_enabled, st.env_disabled,
+             st.record_valid, st.shape_map.ntok_valid, st.topology_hash,
+             st.nkv_exact_enabled ? 1 : 0,
+             st.rsz_rt_enabled, st.rsz_rt_active, st.c_rsz_rt_fallbacks,
+             st.c_rsz_rt_refused_gate, st.c_rsz_rt_refused_arch,
+             st.c_rsz_rt_refused_no_rs_z, st.c_rsz_rt_refused_cell,
+             st.c_rsz_rt_refused_envelope, st.c_rsz_rt_refused_shape,
+             st.c_rsz_rt_refused_n_rs_seq, st.c_rsz_rt_refused_ring,
+             st.c_rsz_rt_refused_mixed_depth,
+             rsz_bound_rs_z, st.rsz_rt_zero_view_rows };
+    return true;
+}
+
+bool llama_context::copy_last_llama_activation(int32_t row, float * dst, size_t count) {
+    if (!last_llama_activation_valid || dst == nullptr || row < 0 ||
+            (uint32_t) row >= n_outputs || count == 0 || count != model.hparams.n_embd_out() ||
+            !gf_res_prev || !sched || !backend_cpu) return false;
+    auto * t = gf_res_prev->get_embd();
+    if (!t || t->type != GGML_TYPE_F32 || t->ne[0] != (int64_t) count ||
+            t->ne[1] != (int64_t) n_outputs || t->ne[2] != 1 || t->ne[3] != 1 ||
+            !ggml_is_contiguous(t) || !t->data ||
+            !(t->view_src ? t->view_src->buffer : t->buffer) ||
+            ggml_backend_sched_get_tensor_backend(sched.get(), t) != backend_cpu) return false;
+    if (count > SIZE_MAX / sizeof(float)) return false;
+    const size_t row_bytes = count * sizeof(float);
+    if ((size_t) row > SIZE_MAX / row_bytes) return false;
+    const size_t offset = (size_t) row * row_bytes;
+    const size_t tensor_bytes = ggml_nbytes(t);
+    if (offset > tensor_bytes || row_bytes > tensor_bytes - offset) return false;
+    synchronize();
+    ggml_backend_tensor_get(t, dst, offset, row_bytes);
+    return true;
+}
+
+bool llama_get_union_diagnostics(const llama_context * ctx, llama_union_diagnostics * out) {
+    return ctx && ctx->union_diagnostics(out);
+}
+
+bool llama_copy_last_llama_activation(llama_context * ctx, int32_t row, float * dst, size_t count) {
+    return ctx && ctx->copy_last_llama_activation(row, dst, count);
+}
+
+uint64_t llama_graph_build_count(const llama_context * ctx) {
+    return ctx ? ctx->graph_build_count() : 0;
+}
 
 llama_perf_context_data llama_perf_context(const llama_context * ctx) {
     llama_perf_context_data data = {};

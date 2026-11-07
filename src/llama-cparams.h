@@ -10,6 +10,11 @@
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
+    // stock 256-cell bucket of the per-sequence window. The rope long/short
+    // factor selection is keyed on this model-training property, so it stays
+    // at the stock value even when the capacity bucket itself is not applied
+    // (union binder runtime-length lane).
+    uint32_t n_ctx_seq_rope = 0;
     uint32_t n_ctx_kv = 0;    // physical tokens per KV stream; 0 uses n_ctx_seq
     uint32_t n_batch;
     uint32_t n_ubatch;

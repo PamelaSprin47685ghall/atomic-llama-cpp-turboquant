@@ -27,6 +27,11 @@ struct ggml_compute_params {
 
     // use reference implementation
     bool use_ref;
+
+    // opaque ggml_backend_cpu_context that owns the attention work counters,
+    // or NULL when the caller has none. Appended last so every existing
+    // positional initialiser keeps its meaning.
+    void * cpu_ctx;
 };
 
 

@@ -6,7 +6,9 @@
 #include "simd-gemm.h"
 #include "ggml.h"
 #include "unary-ops.h"
+#include "attn-ordered.h"
 #include "vec.h"
+#include "ggml-cpu-attn-stats.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -5525,12 +5527,32 @@ static void ggml_compute_forward_soft_max_f32(
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-    float * wp = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
+    const bool ordered = (dst->flags & GGML_TENSOR_FLAG_ATTN_SOFT_MAX) != 0;
+    float * wp = ordered ? nullptr : (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
     const bool use_f16 = (src1 && src1->type == GGML_TYPE_F16);
 
     // sinks
     const float * sk = src2 ? (float *)((char *) src2->data) : nullptr;
+
+    // Runtime reduction length. TRUE_LEN_REDUCE says the op must reduce over
+    // op_params[3] keys, not over the tensor's ne00: the padded columns are
+    // not part of this computation. REDUCE_PAD_TAIL keeps its own meaning
+    // (the SIMD tail grouping of the length that IS computed).
+    const bool true_len = (dst->flags & GGML_TENSOR_FLAG_TRUE_LEN_REDUCE) != 0;
+    const int  live     = true_len ? ggml_get_op_params_i32(dst, 3) : (int) ne00;
+    GGML_ASSERT(live >= 0 && live <= ne00);
+    const bool pad_tail = (dst->flags & GGML_TENSOR_FLAG_REDUCE_PAD_TAIL) != 0;
+    const int  padded   = pad_tail ? ggml_get_op_params_i32(dst, 2) : (int) ne00;
+    GGML_ASSERT(padded >= live);
+
+    // Measured work. The increment uses `live`, the same value that bounds
+    // every loop below, so it cannot be satisfied by writing an op parameter:
+    // a trim that is not executed leaves the counter at the extent. `ne00` is
+    // the extent these ops cover, so live < padded proves the pad was skipped.
+    uint64_t live_elems = 0;
+    uint64_t pad_elems  = 0;
+    uint64_t rows       = 0;
 
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
@@ -5550,36 +5572,59 @@ static void ggml_compute_forward_soft_max_f32(
                 ggml_fp16_t * mp_f16 = src1 ? (ggml_fp16_t *)((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13) : NULL;
                 float       * mp_f32 = src1 ? (float       *)((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13) : NULL;
 
-                ggml_vec_cpy_f32  (ne00, wp, sp);
-                ggml_vec_scale_f32(ne00, wp, scale);
+                if (ordered) {
+                    GGML_ASSERT(src1 != nullptr);
+                    GGML_ASSERT((src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32) &&
+                                src1->ne[0] >= ne00 && src1->ne[1] >= ne01 &&
+                                src1->nb[0] == ggml_type_size(src1->type));
+                    ggml_cpu_attn_ordered_softmax(ne00, dp, sp, src1->type, mp_f32, scale, slope,
+                                                   sk ? sk + i02 : nullptr);
+                    // One runtime-length KV reduction row. The ordered path
+                    // runs on a tensor the bind patched to the runtime width,
+                    // so the helper's loop bound ne00 is both what executed
+                    // and the extent it covers: live == pad, and the row is
+                    // counted as a KV-span row. There is no padded work to
+                    // report on this lane; the narrowed mask/K/V are what
+                    // removed it.
+                    live_elems += (uint64_t) ne00;
+                    pad_elems  += (uint64_t) ne00;
+                    ++rows;
+                    continue;
+                }
+
+                ggml_vec_cpy_f32  (live, wp, sp);
+                ggml_vec_scale_f32(live, wp, scale);
                 if (mp_f32) {
                     if (use_f16) {
-                        for (int i = 0; i < ne00; ++i) {
-                            wp[i] += slope*GGML_CPU_FP16_TO_FP32(mp_f16[i]);
+                        for (int i = 0; i < live; ++i) {
+                            const float mv = GGML_CPU_FP16_TO_FP32(mp_f16[i]);
+                            wp[i] = mv == -INFINITY ? -INFINITY : wp[i] + slope*mv;
                         }
                     } else {
-                        for (int i = 0; i < ne00; ++i) {
-                            wp[i] += slope*mp_f32[i];
+                        for (int i = 0; i < live; ++i) {
+                            const float mv = mp_f32[i];
+                            wp[i] = mv == -INFINITY ? -INFINITY : wp[i] + slope*mv;
                         }
                     }
                 }
 
 #ifndef NDEBUG
-                for (int i = 0; i < ne00; ++i) {
+                for (int i = 0; i < live; ++i) {
                     //printf("p[%d] = %f\n", i, p[i]);
                     assert(!isnan(wp[i]));
                 }
 #endif // NDEBUG
 
                 float max = -INFINITY;
-                ggml_vec_max_f32(ne00, &max, wp);
+                ggml_vec_max_f32(live, &max, wp);
 
                 // if we have sinks, make a correction as if they were included in the softmax
                 if (sk) {
                     max = MAX(max, sk[i02]);
                 }
 
-                ggml_float sum = ggml_vec_soft_max_f32(ne00, dp, wp, max);
+                ggml_float sum = pad_tail ? ggml_vec_soft_max_f32_padded(live, padded, dp, wp, max)
+                                          : ggml_vec_soft_max_f32(live, dp, wp, max);
                 assert(sum > 0.0);
 
                 if (sk) {
@@ -5587,16 +5632,49 @@ static void ggml_compute_forward_soft_max_f32(
                 }
 
                 sum = 1.0/sum;
-                ggml_vec_scale_f32(ne00, dp, sum);
+                ggml_vec_scale_f32(live, dp, sum);
+
+                // The columns past the runtime length are not part of this
+                // computation, but the tensor is read in full by its consumer
+                // (ggml_compute_forward_dup copies ne00 floats per row), so
+                // they must be DEFINED rather than stale. Zero is the correct
+                // value: those are KV positions outside the runtime span, and
+                // the attention weight of a position that is not attended is
+                // exactly zero. This is O(ne00 - live) per row, strictly less
+                // than the reduction it replaces, and it makes the node's
+                // contents a function of this step alone.
+                if (true_len && live < ne00) {
+                    memset(dp + live, 0, (size_t) (ne00 - live) * sizeof(float));
+                }
+
+                // Only a TRUE_LEN_REDUCE softmax reduces over the KV span, so
+                // only its rows belong in rows * runtime_n_kv == live_elems.
+                // An unflagged softmax reduces over its own extent and would
+                // make that identity false. Its elements still count in both
+                // totals.
+                live_elems += (uint64_t) live;
+                pad_elems  += (uint64_t) ne00;
+                if (true_len) {
+                    ++rows;
+                }
 
 #ifndef NDEBUG
-                for (int i = 0; i < ne00; ++i) {
+                for (int i = 0; i < live; ++i) {
                     assert(!isnan(dp[i]));
                     assert(!isinf(dp[i]));
                 }
 #endif // NDEBUG
             }
         }
+    }
+
+    // One flush per call, per thread: the atomics stay off the row loop.
+    // The guard is the element count OR a flagged row: an unflagged softmax
+    // contributes elements without incrementing rows, and a flagged row whose
+    // live length is 0 still contributes pad_elems and rows.
+    if (params->cpu_ctx != nullptr && (live_elems != 0 || rows != 0)) {
+        ggml_cpu_attn_stats_add((ggml_cpu_attn_stats *) params->cpu_ctx,
+                                live_elems, pad_elems, rows);
     }
 }
 
@@ -8662,7 +8740,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            const float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
             }
@@ -8686,7 +8764,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
             }
 
-            s += mv; // apply mask
+            s += slope*mv; // apply mask
 
             const float Mold = M;
 
@@ -8935,7 +9013,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 for (int tq = 0; tq < tile_rows; tq++) {
                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                        const float mv = GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                        mask32[tq * KV_TILE_SZ + tk] = mv == -INFINITY ? -INFINITY : slope * mv;
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
                         }
@@ -8971,27 +9050,27 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             simd_gemm(KQ, (const float *)Q_q, K_f32, Q_TILE_SZ, DK, KV_TILE_SZ);
             ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, scale);
 
-            // Set padded KQ entries to -inf so softmax gives them zero weight
-            if (kv_tile < KV_TILE_SZ) {
-                for (int tq = 0; tq < Q_TILE_SZ; tq++) {
-                    for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
-                        KQ[tq * KV_TILE_SZ + tk] = -INFINITY;
-                    }
-                }
-            }
 
             if (logit_softcap != 0.0f) {
                 ggml_vec_tanh_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, KQ);
                 ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, logit_softcap);
             }
 
-            if (mask) {
-                ggml_vec_add_f32(tile_rows * KV_TILE_SZ, KQ, KQ, mask32);
+            // Apply an explicit mask before using the score. NaN + -inf is NaN.
+            for (int tq = 0; tq < tile_rows; ++tq) {
+                for (int tk = 0; tk < KV_TILE_SZ; ++tk) {
+                    float & score = KQ[tq * KV_TILE_SZ + tk];
+                    if (tk >= kv_tile || (mask && mask32[tq * KV_TILE_SZ + tk] == -INFINITY)) {
+                        score = -INFINITY;
+                    } else if (mask) {
+                        score += mask32[tq * KV_TILE_SZ + tk];
+                    }
+                }
             }
 
             bool skip[Q_TILE_SZ] = {};
 
-            for (int tq = 0; tq < Q_TILE_SZ; tq++) {
+            for (int tq = 0; tq < tile_rows; tq++) {
                 float * kq_row = KQ + tq * KV_TILE_SZ;
 
                 float tile_max;
@@ -9016,22 +9095,27 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 S[tq] += ggml_vec_soft_max_f32(KV_TILE_SZ, kq_row, kq_row, Mnew);
             }
 
-            // V accumulation: VKQ32 += softmax(KQ) * V
-            // Pack V tile to contiguous F32, zero-padded
-            for (int tk = 0; tk < kv_tile; tk++) {
-                const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
-                if (kv_type == GGML_TYPE_F16) {
-                    ggml_fp16_to_fp32_row((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
-                } else {
-                    memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
-                }
-            }
-            for (int tq = 0; tq < Q_TILE_SZ; tq++) {
+            // Each query can mask a different set of V rows. Pack only the
+            // rows visible to that query; do not infer a mask from zero weight.
+            for (int tq = 0; tq < tile_rows; ++tq) {
                 if (skip[tq]) {
-                    memset(KQ + tq * KV_TILE_SZ, 0, KV_TILE_SZ * sizeof(float));
+                    continue;
                 }
+                for (int tk = 0; tk < KV_TILE_SZ; ++tk) {
+                    float * packed = V32 + tk * DV;
+                    if (tk >= kv_tile || (mask && mask32[tq * KV_TILE_SZ + tk] == -INFINITY)) {
+                        memset(packed, 0, DV * sizeof(float));
+                        continue;
+                    }
+                    const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
+                    if (kv_type == GGML_TYPE_F16) {
+                        ggml_fp16_to_fp32_row((const ggml_fp16_t *)v_data, packed, DV);
+                    } else {
+                        memcpy(packed, v_data, DV * sizeof(float));
+                    }
+                }
+                simd_gemm(VKQ32 + tq * DV, KQ + tq * KV_TILE_SZ, V32, 1, KV_TILE_SZ, DV);
             }
-            simd_gemm(VKQ32, KQ, V32, Q_TILE_SZ, KV_TILE_SZ, DV);
         }
 
         // sinks (apply only to valid rows in the tile)

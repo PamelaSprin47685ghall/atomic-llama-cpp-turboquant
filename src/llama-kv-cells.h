@@ -94,6 +94,44 @@ public:
         return used.empty() ? 0 : *used.rbegin() + 1;
     }
 
+    // the position span of the used cells: the largest position present + 1
+    // return 0 if no cells are used
+    //
+    // This is a POSITION span, not a cell-index span. used_max_p1() above
+    // answers "how many cell indices are covered"; this answers "how many
+    // positions are covered". They differ whenever a cell index is not a
+    // position: a unified cache holds two sequences' tokens for the same
+    // position in two different cells, so the cell span (2) can exceed the
+    // position span (1). The attention width is a position span (see
+    // llama_kv_cache::get_n_kv), so it must read this one.
+    uint32_t used_pos_span_p1() const {
+        uint32_t result = 0;
+
+        for (const uint32_t i : used) {
+            const uint32_t p1 = (uint32_t) (pos[i] + 1);
+
+            if (p1 > result) {
+                result = p1;
+            }
+        }
+
+        return result;
+    }
+
+    // the index of a cell that holds position p, or -1 when no cell does.
+    // A unified cache has one cell per position; the caller shares that cell
+    // instead of appending a second one for a position that already has a
+    // slot (see llama_kv_cache::find_slot).
+    int64_t find_cell_by_pos(llama_pos p) const {
+        for (const uint32_t i : used) {
+            if (pos[i] == p) {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
     bool get_has_shift() const {
         return has_shift;
     }

@@ -55,6 +55,7 @@
 #include "simd-mappings.h"
 
 #include <array>
+#include <cstring>
 #include <type_traits>
 
 #ifdef _MSC_VER
@@ -487,8 +488,8 @@ class tinyBLAS {
     tinyBLAS(const ggml_compute_params * params, int64_t k,
              const TA *A, int64_t lda,
              const TB *B, int64_t ldb,
-             TC *C, int64_t ldc)
-        : params(params), A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc) {
+             TC *C, int64_t ldc, int64_t live_k = -1)
+        : params(params), A(A), B(B), C(C), k(k), live_k(live_k < 0 ? k : live_k), lda(lda), ldb(ldb), ldc(ldc) {
     }
 
     bool matmul(int64_t m, int64_t n) {
@@ -545,7 +546,21 @@ class tinyBLAS {
         }
     }
 
-    template <int RM, int RN>
+    template <bool masked, typename T>
+    inline V load_row(const T * row, int64_t offset) const {
+        if constexpr (masked) {
+            if (offset + KN > live_k) {
+                alignas(64) T values[KN] = {};
+                if (offset < live_k) {
+                    std::memcpy(values, row + offset, size_t(live_k - offset) * sizeof(T));
+                }
+                return load<V>(values);
+            }
+        }
+        return load<V>(row + offset);
+    }
+
+    template <int RM, int RN, bool masked>
     inline void gemm_bloc(int64_t ii, int64_t jj) {
         D Cv[RN][RM] = {};
         for (int64_t l = 0; l < k; l += KN) {
@@ -553,10 +568,10 @@ class tinyBLAS {
             if constexpr (RM <= RN) {
                 V Av[RM];
                 for (int64_t i = 0; i < RM; ++i) {
-                    Av[i] = load<V>(A + lda * (ii + i) + l);
+                    Av[i] = load_row<masked>(A + lda * (ii + i), l);
                 }
                 for (int64_t j = 0; j < RN; ++j) {
-                    V Bv = load<V>(B + ldb * (jj + j) + l);
+                    V Bv = load_row<masked>(B + ldb * (jj + j), l);
                     for (int64_t i = 0; i < RM; ++i) {
                         Cv[j][i] = madd(Av[i], Bv, Cv[j][i]);
                     }
@@ -564,10 +579,10 @@ class tinyBLAS {
             } else {
                 V Bv[RN];
                 for (int64_t j = 0; j < RN; ++j) {
-                    Bv[j] = load<V>(B + ldb * (jj + j) + l);
+                    Bv[j] = load_row<masked>(B + ldb * (jj + j), l);
                 }
                 for (int64_t i = 0; i < RM; ++i) {
-                    V Av = load<V>(A + lda * (ii + i) + l);
+                    V Av = load_row<masked>(A + lda * (ii + i), l);
                     for (int64_t j = 0; j < RN; ++j) {
                         Cv[j][i] = madd(Av, Bv[j], Cv[j][i]);
                     }
@@ -614,11 +629,13 @@ class tinyBLAS {
             for (int64_t bi = 0; bi < BM * RM; bi += RM) {
                 int64_t jj = jj0;
                 for (; jj < jj1; jj += RN) {
-                    gemm_bloc<RM, RN>(ii + bi, jj);
+                    if (live_k < k) gemm_bloc<RM, RN, true>(ii + bi, jj);
+                    else gemm_bloc<RM, RN, false>(ii + bi, jj);
                 }
                 if constexpr (RN > 1) {
                     for (; jj < jj2; jj += RN - 1) {
-                        gemm_bloc<RM, RN-1>(ii + bi, jj);
+                        if (live_k < k) gemm_bloc<RM, RN-1, true>(ii + bi, jj);
+                        else gemm_bloc<RM, RN-1, false>(ii + bi, jj);
                     }
                 }
                 GGML_ASSERT(jj == jj2);
@@ -636,6 +653,7 @@ class tinyBLAS {
     const TB *const B;
     TC *const C;
     const int64_t k;
+    const int64_t live_k;
     const int64_t lda;
     const int64_t ldb;
     const int64_t ldc;
@@ -3771,6 +3789,40 @@ class tinyBLAS_PPC {
 };
 #endif
 } // namespace
+
+bool llamafile_sgemm_masked_tail(const struct ggml_compute_params * params,
+                                int64_t m, int64_t n, int64_t padded_k, int64_t live_k,
+                                const void * a, int64_t lda, const void * b, int64_t ldb,
+                                void * c, int64_t ldc, int type) {
+    if (m <= 0 || n < 2 || live_k <= 0 || padded_k < live_k || lda < live_k ||
+            ldb < live_k || ldc < m) return false;
+#if defined(__AVX512F__)
+    if (type == GGML_TYPE_F32) {
+        tinyBLAS<16, __m512, __m512, float, float, float> tb {
+            params, padded_k, (const float *) a, lda, (const float *) b, ldb, (float *) c, ldc, live_k };
+        return tb.matmul(m, n);
+    }
+    if (type == GGML_TYPE_F16) {
+        tinyBLAS<16, __m512, __m512, ggml_fp16_t, ggml_fp16_t, float> tb {
+            params, padded_k, (const ggml_fp16_t *) a, lda, (const ggml_fp16_t *) b, ldb, (float *) c, ldc, live_k };
+        return tb.matmul(m, n);
+    }
+#elif defined(__AVX__) || defined(__AVX2__)
+    if (type == GGML_TYPE_F32) {
+        tinyBLAS<8, __m256, __m256, float, float, float> tb {
+            params, padded_k, (const float *) a, lda, (const float *) b, ldb, (float *) c, ldc, live_k };
+        return tb.matmul(m, n);
+    }
+#if defined(__F16C__)
+    if (type == GGML_TYPE_F16) {
+        tinyBLAS<8, __m256, __m256, ggml_fp16_t, ggml_fp16_t, float> tb {
+            params, padded_k, (const ggml_fp16_t *) a, lda, (const ggml_fp16_t *) b, ldb, (float *) c, ldc, live_k };
+        return tb.matmul(m, n);
+    }
+#endif
+#endif
+    return false;
+}
 
 /**
  * Performs optimized matrix multiplication on CPU.

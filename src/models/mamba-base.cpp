@@ -58,10 +58,13 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
         ggml_tensor * last_conv = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs, conv_x->nb[1], conv_x->nb[2],
                                                n_seq_tokens * (conv_x->nb[0]));
 
-        ggml_build_forward_expand(
-            gf, ggml_cpy(ctx0, last_conv,
-                         ggml_view_1d(ctx0, conv_states_all, (d_conv - 1) * (d_inner) * (n_seqs),
-                                      kv_head * (d_conv - 1) * (d_inner) *ggml_element_size(conv_states_all))));
+        // union binder root: the destination row is selected by the recurrent
+        // head; the build uses head 0 and the live head is bound in place.
+        ggml_tensor * conv_state_dst = ggml_view_1d(ctx0, conv_states_all,
+            (d_conv - 1) * (d_inner) * (n_seqs),
+            kv_head * (d_conv - 1) * (d_inner) * ggml_element_size(conv_states_all));
+        ggml_set_name(conv_state_dst, "union_rs_head_view");
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv, conv_state_dst));
 
         // 1D convolution
         // The equivalent is to make a self-overlapping view of conv_x
@@ -123,11 +126,14 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
 
         ggml_tensor * y_ssm = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows);
 
-        // store last states
-        ggml_build_forward_expand(
-            gf, ggml_cpy(ctx0, ggml_view_1d(ctx0, y_ssm, d_state * d_inner * n_seqs, x->nb[3] * x->ne[3]),
-                         ggml_view_1d(ctx0, ssm_states_all, d_state * d_inner * n_seqs,
-                                      kv_head * d_state * d_inner * ggml_element_size(ssm_states_all))));
+        // store last states; union binder root for the head-selected row
+        ggml_tensor * ssm_state_dst = ggml_view_1d(ctx0, ssm_states_all,
+            d_state * d_inner * n_seqs,
+            kv_head * d_state * d_inner * ggml_element_size(ssm_states_all));
+        ggml_set_name(ssm_state_dst, "union_rs_head_view");
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0, ggml_view_1d(ctx0, y_ssm, d_state * d_inner * n_seqs, x->nb[3] * x->ne[3]),
+                     ssm_state_dst));
 
         ggml_tensor * y = ggml_view_3d(ctx0, y_ssm, d_inner, n_seq_tokens, n_seqs, x->nb[2], x->nb[3], 0);
 

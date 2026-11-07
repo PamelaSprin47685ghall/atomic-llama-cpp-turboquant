@@ -66,9 +66,12 @@ not change fusion or Meta decisions, and (b) coverage of the mixer sites, see §
 
 ## 2. The fix
 
-`GGML_TENSOR_FLAG_NO_REUSE` (new, = 32) = "allocator retains this non-view tensor and forbids
-reuse through its views" (`ggml/include/ggml.h`), with the allocator contract taken verbatim from
-the preserved router-scratch candidate `4496493dd` so both branches carry one copy of the code:
+`GGML_TENSOR_FLAG_NO_REUSE` (new, = 2048) = "allocator retains this non-view tensor and forbids
+reuse through its views" (`ggml/include/ggml.h`). It was 32 in the original candidate; that bit is
+`GGML_TENSOR_FLAG_REDUCE_PAD_TAIL` on the CPU-attention lane, so the allocator flag yielded it and
+moved above the attention group. No bit is shared between the two lanes. The allocator contract is
+taken verbatim from the preserved router-scratch candidate `4496493dd` so both branches carry one
+copy of the code:
 `ggml-alloc.c` skips retained parents for in-place reuse (also via `view_src`), never frees a
 retained node, and records `no_reuse` per graph node/src so `ggml_gallocr_needs_realloc` re-plans
 when the flag differs.
@@ -167,7 +170,7 @@ Pinned inputs (verify by sha256 before use):
    no change to `GGML_TP5_HC_KEEP_LO`, `GGML_TP5_HC_ROW_EPILOGUE`, `NO_REUSE` semantics, or the
    HIP guard; `nrows==1` exception untouched.
 3. `grep -n "NO_REUSE" ggml/src/ggml-alloc.c` → 4 sites only (in-place skip, free skip, dst/src
-   capture, `needs_realloc`); no other consumer of flag 32 anywhere (`grep -rn NO_REUSE ggml/ src/`).
+   capture, `needs_realloc`); no other consumer of flag 2048 anywhere (`grep -rn NO_REUSE ggml/ src/`).
 
 ### G2 build (Devops only)
 * `libllama-nt` from `qwen4exp.cpp` with the row-tail recipe

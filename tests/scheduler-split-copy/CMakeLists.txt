@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.16)
+project(scheduler_split_copy_regression LANGUAGES C CXX ASM)
+
+enable_testing()
+set(GGML_CPU ON CACHE BOOL "Enable CPU backend" FORCE)
+set(GGML_CUDA OFF CACHE BOOL "Disable CUDA" FORCE)
+set(GGML_HIP OFF CACHE BOOL "Disable HIP" FORCE)
+set(GGML_VULKAN OFF CACHE BOOL "Disable Vulkan" FORCE)
+set(GGML_METAL OFF CACHE BOOL "Disable Metal" FORCE)
+set(GGML_SYCL OFF CACHE BOOL "Disable SYCL" FORCE)
+set(GGML_BACKEND_DL OFF CACHE BOOL "Link CPU backend directly" FORCE)
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../ggml" ggml)
+
+add_executable(test-scheduler-split-copy test-scheduler-split-copy.cpp)
+target_compile_features(test-scheduler-split-copy PRIVATE cxx_std_17)
+target_include_directories(test-scheduler-split-copy PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../ggml/src")
+target_link_libraries(test-scheduler-split-copy PRIVATE ggml::ggml ggml-cpu)
+add_test(NAME scheduler-split-copy COMMAND test-scheduler-split-copy)

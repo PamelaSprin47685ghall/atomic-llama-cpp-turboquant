@@ -459,18 +459,34 @@ int main(int argc, char ** argv) {
         };
         printf("backend=%s suite=memory device=%s\n", backend_kind.c_str(),
                ggml_backend_dev_description(chosen));
+        bool failed = false;
         for (const bias_test_config & c : memory_cases) {
             test_data data = make_data(c);
             const run_result flash = run_graph(backend.get(), c, data, false, 1);
             const run_result dense = run_graph(backend.get(), c, data, true, 1);
-            double max_abs, mean_abs, max_rel, mean_rel, rmse;
-            error_stats(flash.output, dense.output, max_abs, mean_abs, max_rel, mean_rel, rmse);
+            // This suite measures memory. It asserts no numerical bound, so a
+            // finite measurement is UNPROVEN, not PASS. An empty or
+            // mismatched output, or a non-finite statistic, is FAIL: the
+            // measurement itself is broken. error_stats() reads ref[i] for
+            // every i in got, so it must not run unless the sizes match.
+            const bool have_output = !flash.output.empty() &&
+                                     flash.output.size() == dense.output.size();
+            double max_abs = 0.0, mean_abs = 0.0, max_rel = 0.0, mean_rel = 0.0, rmse = 0.0;
+            if (have_output) {
+                error_stats(flash.output, dense.output, max_abs, mean_abs, max_rel, mean_rel, rmse);
+            }
+            const double ratio = double(dense.allocated_bytes) / double(flash.allocated_bytes);
+            const bool finite = std::isfinite(max_abs) && std::isfinite(mean_abs) && std::isfinite(ratio);
+            const char * verdict = (!have_output || !finite) ? "FAIL" : "UNPROVEN reason=no_tolerance";
+            if (!have_output || !finite) {
+                failed = true;
+            }
             printf("%s T=%lld flash_bytes=%zu dense_bytes=%zu memory_ratio=%.6f "
-                   "dense_max_abs=%.9g dense_mean_abs=%.9g PASS\n",
+                   "dense_max_abs=%.9g dense_mean_abs=%.9g %s\n",
                    c.name, (long long)c.nq, flash.allocated_bytes, dense.allocated_bytes,
-                   double(dense.allocated_bytes)/flash.allocated_bytes, max_abs, mean_abs);
+                   ratio, max_abs, mean_abs, verdict);
         }
-        return 0;
+        return failed ? 1 : 0;
     }
 
     std::vector<bias_test_config> configs;

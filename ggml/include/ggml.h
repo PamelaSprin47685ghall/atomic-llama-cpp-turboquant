@@ -674,7 +674,48 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
-        GGML_TENSOR_FLAG_NO_REUSE = 32, // allocator retains a non-view tensor and forbids reuse through its views
+        // integration: bit 32 was the collision point between two independently
+        // developed lanes. The CPU attention flag group below occupies 32..1024
+        // contiguously (its own comment relies on that), so the allocator flag
+        // takes the first free bit above the group instead of renumbering it.
+        // Bit 32 therefore belongs to REDUCE_PAD_TAIL alone. Both sides are
+        // symbol-only; nothing in either tree hardcodes a bit.
+        GGML_TENSOR_FLAG_NO_REUSE = 2048, // allocator retains a non-view tensor and forbids reuse through its views
+        // CPU attention reductions: op_params[2] is the width whose masked
+        // tail defines the reduction order. Tensor extents remain unchanged.
+        GGML_TENSOR_FLAG_REDUCE_PAD_TAIL = 32,
+        // MUL_MAT src[2] is the explicit per-query attention mask.
+        GGML_TENSOR_FLAG_ATTN_MASK = 64,
+        // SOFT_MAX uses a width-independent ordered attention reduction.
+        GGML_TENSOR_FLAG_ATTN_SOFT_MAX = 128,
+        // Experimental active-width GEMM preserves the padded reduction order.
+        // Re-spaced from 256 to 512: the nout-tail line assigns bit 256 to
+        // GGML_TENSOR_FLAG_ATTN_SCORES. No two flags share a bit.
+        GGML_TENSOR_FLAG_MASKED_TAIL_GEMM = 512,
+        // MUL_MAT src[2] is the explicit mask for attention scores.
+        GGML_TENSOR_FLAG_ATTN_SCORES = 256,
+        // CPU attention reductions execute at a RUNTIME length, not at the
+        // tensor extent. op_params[3] is that length: the number of keys the
+        // op actually reduces over. The tensor shapes stay at their padded
+        // width, so the graph topology and its allocation are unchanged; only
+        // the executed loop bounds follow the value. The op must not read
+        // elements beyond it.
+        //
+        // The op writes [0, op_params[3]) from the reduction and zeroes
+        // [op_params[3], ne[0]), so the tensor is fully defined after every
+        // call and its contents depend on this step alone.
+        //
+        // This is a different contract from REDUCE_PAD_TAIL, which keeps the
+        // full extent and only fixes the SIMD tail grouping. A node carries
+        // both when the padded order still defines the tail lanes.
+        //
+        // Bit 1024 is taken by TRUE_LEN_REDUCE below, not a free slot: the
+        // flags above occupy 1..512, GGML_TENSOR_FLAG_ATTN_ORDERED is an OR of
+        // three of them rather than a bit, and 2048 is NO_REUSE.
+        GGML_TENSOR_FLAG_TRUE_LEN_REDUCE = 1024,
+        GGML_TENSOR_FLAG_ATTN_ORDERED = GGML_TENSOR_FLAG_ATTN_MASK |
+                                        GGML_TENSOR_FLAG_ATTN_SOFT_MAX |
+                                        GGML_TENSOR_FLAG_ATTN_SCORES,
     };
 
     enum ggml_tri_type {
@@ -1462,6 +1503,20 @@ extern "C" {
     GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
+
+    // CPU F16/F32 value products skip explicitly masked V entries in index
+    // order. If a->src[1] is a masked softmax, it uses the same order. The
+    // mask must have the same logical entries as that softmax's mask.
+    // Other backends do not implement this contract.
+    GGML_API void ggml_mul_mat_set_attn_mask(
+            struct ggml_tensor * a,
+            struct ggml_tensor * mask);
+
+    // Mark an F16/F32 K by F32 Q product for ordered, masked CPU attention.
+    // mask is indexed by output key, query, head and batch, with broadcasting.
+    GGML_API void ggml_mul_mat_set_attn_scores(
+            struct ggml_tensor * a,
+            struct ggml_tensor * mask);
 
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(
@@ -2874,6 +2929,8 @@ extern "C" {
     GGML_API struct ggml_tensor *  ggml_graph_node   (struct ggml_cgraph * cgraph, int i); // if i < 0, returns nodes[n_nodes + i]
     GGML_API struct ggml_tensor ** ggml_graph_nodes  (struct ggml_cgraph * cgraph);
     GGML_API int                   ggml_graph_n_nodes(struct ggml_cgraph * cgraph);
+    GGML_API struct ggml_tensor *  ggml_graph_leaf   (struct ggml_cgraph * cgraph, int i); // if i < 0, returns leafs[n_leafs + i]
+    GGML_API int                   ggml_graph_n_leafs(struct ggml_cgraph * cgraph);
 
     GGML_API void   ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
 

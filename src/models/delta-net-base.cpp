@@ -510,6 +510,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
             ggml_view_2d(ctx0, conv_states_all,
                     row_count, n_seqs, conv_states_all->nb[1],
                     (s_slot * mem_size + kv_head) * row_size);
+        // union binder root: head-selected state row (build head = 0)
+        ggml_set_name(conv_state_update, "union_rs_head_view");
         cb(conv_state_update, "conv_state_update", il);
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
@@ -535,6 +537,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                         conv_states_all, row_count, n_seqs,
                         conv_states_all->nb[1],
                         (s_slot * mem_size + kv_head) * row_size);
+            // union binder root: group base + head-selected row (build head = 0)
+            ggml_set_name(conv_state_update, "union_rs_head_view");
 
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
         }
@@ -571,10 +575,12 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
-        ggml_build_forward_expand(gf,
-                ggml_cpy(ctx0, new_state,
-                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        // union binder root: head-selected state row (build head = 0)
+        ggml_tensor * ssm_state_dst =
+            ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+        ggml_set_name(ssm_state_dst, "union_rs_head_view");
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state, ssm_state_dst));
 
         return output;
     }
@@ -633,6 +639,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             ssm_states_all->nb[1],
             (size_t) mem_size * row_size,
             (size_t) kv_head * row_size);
+        // union binder root: head-selected state row (build head = 0)
+        ggml_set_name(dst, "union_rs_head_view");
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
 

@@ -1029,6 +1029,15 @@ llama_prefab_reply llama_prefab_process(
         /*.cross       =*/params.cross,
         /*.samplers    =*/params.samplers,
         /*.n_outputs   =*/req.mtp_mode ? params.n_outputs : n_env,
+        // pillar-1 added four fields between n_outputs and cb. GCC's GNU
+        // designated-initializer extension under -std=gnu++17 matches by
+        // POSITION, not by name, so they must be listed here in declaration
+        // order. The prefab path is not a binder build and not a relay build:
+        // no output-gather envelope, no zero-row index.
+        /*.n_outputs_build =*/0u,
+        /*.union_binder=*/false,
+        /*.strict_ntok =*/false,
+        /*.rs_row_armed=*/false,
         /*.cb          =*/params.cb,
         /*.res         =*/slot_res,
     };

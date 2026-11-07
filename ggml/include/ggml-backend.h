@@ -342,6 +342,7 @@ extern "C" {
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // The caller retains the graph and all host input sources, alive and unmodified,
@@ -350,6 +351,55 @@ extern "C" {
     // Failures still drain queued input transfers before returning or unwinding.
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_retained_inputs(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+    // Invalidate the backend-side executable cache of the live split graphs
+    // (e.g. CUDA/HIP graph captures). The next compute re-checks the tensor
+    // properties and rebuilds its capture. Used after an in-place metadata
+    // patch of the live graph, which the backends cannot observe otherwise.
+    GGML_API void                 ggml_backend_sched_invalidate_graph_cache(ggml_backend_sched_t sched);
+
+    // True when the live split graph holds a cross-backend copy of this
+    // tensor. Rebinding such a tensor requires tracked copy updates below.
+    GGML_API bool                 ggml_backend_sched_tensor_has_split_copy(ggml_backend_sched_t sched, const struct ggml_tensor * tensor);
+
+    // Enable before allocating a graph whose split copies may be rebound.
+    // The setting survives reset and reserve. Toggling requires no allocated
+    // graph; disabling releases tracking records. The caller must exclude
+    // concurrent scheduler use, as for reset and allocation.
+    GGML_API bool ggml_backend_sched_set_split_copy_tracking(ggml_backend_sched_t sched, bool enabled);
+
+    struct ggml_backend_sched_tensor_layout {
+        struct ggml_tensor * tensor;
+        int64_t ne[GGML_MAX_DIMS];
+        size_t  nb[GGML_MAX_DIMS];
+    };
+
+    // Validate all proposed source layouts against the captured allocation of
+    // every scheduler copy. Tracking must have been enabled before allocation.
+    // With apply=true, update copies only after all layouts pass. This does not
+    // update source tensors. Synchronize and exclude concurrent scheduler use;
+    // after updating source layouts and view pointers, refresh copy views.
+    GGML_API bool ggml_backend_sched_update_split_copies(
+            ggml_backend_sched_t sched, const struct ggml_backend_sched_tensor_layout * layouts,
+            size_t n_layouts, bool apply);
+    GGML_API void ggml_backend_sched_refresh_split_copy_views(ggml_backend_sched_t sched);
+
+    // Replan one live host-only split. Record the complete tensor list and
+    // fixed-storage flags before the first allocation; proposed layouts refer
+    // only to non-fixed entries. view_offsets has n_layouts entries.
+    // Serialize scheduler access and do not change tensor metadata before
+    // this call. On false, layouts, addresses, allocator and cache remain
+    // unchanged. On success, graph-owned inputs must be set again before
+    // compute. Non-input arena constants and split copies are refused.
+    GGML_API bool ggml_backend_sched_replan_graph(ggml_backend_sched_t sched,
+            struct ggml_tensor * const * tensors, const uint8_t * fixed, size_t count,
+            const struct ggml_backend_sched_tensor_layout * layouts, const size_t * view_offsets, size_t n_layouts);
+    // The requested per-tensor plan size excludes reusable arena capacity.
+    GGML_API bool ggml_backend_sched_get_tensor_plan_size(ggml_backend_sched_t sched,
+            const struct ggml_tensor * tensor, size_t * size);
+
+    // True only for a copy in the active slot of the live split graph.
+    GGML_API bool ggml_backend_sched_is_tensor_copy(
+            ggml_backend_sched_t sched, const struct ggml_tensor * original, const struct ggml_tensor * candidate);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.

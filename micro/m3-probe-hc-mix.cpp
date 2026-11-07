@@ -198,7 +198,7 @@ void m3_probe_release() {
 // exists only so the harness can LOG the raw flag bits next to the kernel witness;
 // it must not be read as the pass criterion (see the header comment).
 bool m3_probe_lo_retained(ggml_tensor * lo) {
-    return lo != nullptr && (lo->flags & 32) != 0;
+    return lo != nullptr && (lo->flags & GGML_TENSOR_FLAG_NO_REUSE) != 0;
 }
 
 } // extern "C"

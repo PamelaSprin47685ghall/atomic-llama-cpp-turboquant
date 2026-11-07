@@ -236,8 +236,25 @@ public:
     // graph_build API
     //
 
+    // the PADDED width: the stock 256-cell bucket, rounded up to n_pad and
+    // clamped to the physical cell count of the participating streams. This
+    // is the width a stock graph executes at. While any batch context of this
+    // cache has the exact lane armed, reaching this function with
+    // n_pad < 256 aborts: the exact lane is supposed to have answered first,
+    // and the test-only forced hook is the one exception.
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // exact-width lane (GGML_TP5_UNION_BINDER_EXACT=1, the default under the
+    // binder gate): the true occupied span, with no n_pad rounding and no
+    // 256-cell floor. An empty cache yields one masked cell; a transposed V
+    // rounds up to its block size. Returns 0 when the span cannot be addressed
+    // at one shared width (active streaming, unprovable V blocks, or a width
+    // that does not fit every participating stream); an unarmed caller then
+    // keeps the applied width, and an armed one aborts. The caller must apply
+    // the scheduler and backend width guards before binding. This is the width
+    // the union binder binds, and it is a different computation from
+    // get_n_kv() above.
+    uint32_t get_n_kv_exact(const slot_info & sinfo) const;
     // active cell count when position p lives in physical cell p; 0 for any non-contiguous layout
     uint32_t get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const;
 
@@ -255,8 +272,15 @@ public:
     ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
 
     // store k_cur and v_cur in the cache based on the provided head location
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    // token_axis_marker: the token lane asks the KV write to tag the value
+    // tensors it creates with LLM_TOKEN_AXIS_MARKER | 1, so the symbolic shape
+    // analysis derives their token axis from the construction site instead of
+    // guessing it from a 1-wide build shape. Default false: every other lane
+    // is byte-identical to before.
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo,
+                        bool token_axis_marker = false) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo,
+                        bool token_axis_marker = false) const;
 
     //
     // preparation API
@@ -292,7 +316,61 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // Fill the KQ mask over the first `n_kv` columns instead of dst->ne[0].
+    // Used by the union-binder runtime n_kv wire; the stock two-argument
+    // overload forwards here with n_kv == 0 (meaning dst->ne[0]).
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_kv) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // Cross-check ONE filled KQ-mask row against the KV cells themselves, for
+    // the mask-observation lane. `mask_data` is the mask tensor's base pointer
+    // (the fill's own buffer, row-major) and `tok` is the ubatch token whose
+    // row is checked: this function computes the row offset itself, from the
+    // fill's layout (row i = s*n_tps + ii at idst = width*i), so the caller
+    // cannot hand it the wrong row. `dst` is the mask tensor, `width` the
+    // width the fill consumed.
+    //
+    // This is an INDEPENDENT read of the executed width: the width comes from
+    // the mask the graph will execute, the visibility comes from the cache's
+    // own cell table, and the two are written by different code paths
+    // (llama-graph.cpp's runtime n_kv input vs. llama_kv_cache::apply_ubatch).
+    // Every column below `width` must hold exactly 0.0f (visible) or
+    // -INFINITY (dropped), and a column must be visible exactly when its cell
+    // carries the token's sequence and no causal/SWA rule drops it.
+    // `causal_attn` and `swa` are the two rules the fill itself applies; the
+    // caller passes the values it filled with.
+    //
+    // Returns one of three verdicts, so a refusal can never be mistaken for a
+    // disagreement or for a pass:
+    //    LLAMA_GATE_PASS      every column agrees;
+    //    LLAMA_GATE_FAIL      a column disagrees (the mask is wrong) --
+    //                         `first_bad` names it;
+    //    LLAMA_GATE_UNPROVEN  the layout cannot be modelled (a token count
+    //                         that does not divide into the streams, a row
+    //                         whose stream disagrees with its token's
+    //                         sequence, an unusable tensor). Nothing was
+    //                         compared.
+    // The caller counts UNPROVEN separately (mask_row_refused): a layout change
+    // that makes every check refuse must not look like a wrong mask.
+    // `first_bad` receives the first disagreeing column, or -1.
+    //
+    // Only F32 is compared. The row is read as `const float *`, so an F16 mask
+    // would be reinterpreted rather than converted; F16 (flash attention) and
+    // every other type are UNPROVEN, not compared.
+    enum llama_gate_verdict check_mask_row(
+            const ggml_tensor * dst,
+            const llama_ubatch * ubatch,
+            uint32_t tok,
+            const float * mask_data,
+            uint32_t width,
+            bool causal_attn,
+            bool swa,
+            int64_t * first_bad) const;
+
+    // The SWA rule this cache's fill applies. The fill's args struct carries
+    // the same value; this accessor exists so the read-back and the context's
+    // own view can apply that rule instead of assuming there is none.
+    llama_swa_type get_swa_type() const { return swa_type; }
 
     // inkling: fill dst I32 [n_kv, n_tokens] with flat rel-bias gather indices,
     // idx(i, j) = i*(extent + 1) + rel; empty/out-of-band cells map to the zero-bias column `extent`
@@ -491,8 +569,6 @@ public:
             slot_info_vec_t sinfos,
             std::vector<llama_ubatch> ubatches);
 
-    virtual ~llama_kv_cache_context();
-
     //
     // llama_memory_context_i
     //
@@ -510,11 +586,95 @@ public:
     // llama_kv_cache_context specific API
     //
 
+    // The width this batch context executes at, in three cases, in this order:
+    //   1. the build-scoped envelope override (nkv_envelope_begin): the
+    //      allocation width, during model.build_graph() only;
+    //   2. the exact lane armed (nkv_exact_target): the true used span from
+    //      get_n_kv_exact(); if that returns 0 the call aborts. There is no
+    //      padded fallback: the bucket floor, GGML_TP5_UNION_PAD_BUCKET and
+    //      the test-only forced hook are all deleted;
+    //   3. the exact lane not armed (stock context, gate off, envelope
+    //      disabled, multi-split): the width the cache applied in apply(),
+    //      unchanged from stock, with no abort.
     uint32_t get_n_kv() const;
+    // Width computed by apply(): the applied span, independent of the
+    // build-scoped override.
+    uint32_t get_n_kv_padded() const { return n_kv; }
+    // Applied width, independent of the build override.
+    // Zero means that this context has not supplied a width.
+    uint32_t get_n_kv_stock() const { return n_kv; }
+    // the true used span: 0 when unavailable, when a build override is
+    // armed, or for reserve/init_full contexts
+    uint32_t get_n_kv_exact() const;
+    // width the graph is expected to execute at: exactly what get_n_kv()
+    // reports. can_reuse_kq_mask() must use this so a bound graph compares
+    // against the same width it was built/bound at.
+    uint32_t get_n_kv_target() const;
+    // Width the attention consumers must execute at, as a VALUE: the true
+    // used span for this ubatch, or the applied width when the span cannot be
+    // proven. Unlike get_n_kv() it never reports the build-scoped envelope
+    // override, so it is the value written into the graph's runtime n_kv
+    // input (llm_graph_input_nkv_runtime). 0 means "no width".
+    uint32_t get_n_kv_runtime() const;
     uint32_t get_n_kv_pos_contiguous() const;
+    // The SWA rule the fill applies, so the read-back can apply the same one
+    // instead of assuming there is none. Forwards to the cache's own accessor;
+    // the fill's args struct carries the same value.
+    llama_swa_type get_swa_type() const {
+        return kv != nullptr ? kv->get_swa_type() : LLAMA_SWA_TYPE_NONE;
+    }
 
+    // Forwarded to llama_kv_cache::check_mask_row, which documents the three
+    // verdicts and the layout it models. This class adds the cache pointer and
+    // nothing else.
+    enum llama_gate_verdict check_mask_row(
+            const ggml_tensor * dst,
+            const llama_ubatch * ubatch,
+            uint32_t tok,
+            const float * mask_data,
+            uint32_t width,
+            bool causal_attn,
+            bool swa,
+            int64_t * first_bad) const;
+
+    // union-graph runtime-length n_kv lane: set by the owning llama_context
+    // before graph reuse/build, from the binder's own predicate (gate on, no
+    // env_disabled, the GGML_TP5_UNION_BINDER_EXACT selection, a live record,
+    // one patch-safe split). The batch context is constructed without an
+    // lctx, so the target flag travels on the object instead of being read
+    // from the owning context. While true, get_n_kv() reports the true used
+    // span from get_n_kv_exact() and aborts if the layout refuses it. While
+    // false, get_n_kv() keeps the width the cache applied. The owner arms it
+    // only for a single split. Each bind also validates scheduler copies
+    // before changing the live graph; refusal rebuilds.
+    void set_nkv_exact_target(bool enable) {
+        nkv_exact_target = enable;
+    }
     bool has_attention_views() const;
     llama_attention_view_resolved attention_view(llama_seq_id seq, llama_pos pos) const;
+
+    // physical per-stream capacity of the underlying cache (upper bound for any
+    // n_kv the cache can back); used by the union-graph runtime nkv binder to
+    // clamp its envelope build to real, allocated cells
+    uint32_t get_capacity() const {
+        return kv ? kv->get_size() : 0u;
+    }
+
+    // number of independent KV streams (1 for a unified cache). The binder
+    // refuses an in-place patch when this is > 1: the K/V view offset encodes
+    // the build-time stream base, which the symbolic shape map does not model.
+    uint32_t get_n_stream() const {
+        return kv ? kv->get_n_stream() : 0u;
+    }
+    // union-graph runtime nkv binder: build-scoped n_kv override. While armed,
+    // get_n_kv() reports the envelope width instead of the applied cache n_kv,
+    // so a graph built in that scope is sized/allocated for the full envelope.
+    // Must not span set_inputs()/compute; only graph construction.
+    // The value is a per-object member (no process-global side table): two
+    // llama_context instances on different threads never share it.
+    void nkv_envelope_begin(uint32_t cap) const;
+
+    void nkv_envelope_end() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -540,8 +700,10 @@ public:
     //   - k_idxs [n_tokens]
     //   - v_cur  [n_embd_head_v, n_head_v, n_tokens]
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
+                        bool token_axis_marker = false) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il,
+                        bool token_axis_marker = false) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
@@ -557,6 +719,13 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // Fill the KQ mask at an explicit width. `n_kv` is the width the graph
+    // must execute at, taken from the graph's runtime n_kv input rather than
+    // from the tensor shape. 0 means "no runtime width" and fills the whole
+    // tensor, exactly the stock behaviour. A nonzero width above the
+    // tensor's ne[0] is a contract violation and aborts: filling ne[0]
+    // instead would hand the graph a wider mask than it executes at.
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_kv) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const; // inkling
 
@@ -611,5 +780,25 @@ private:
 
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
-    int32_t n_kv;
+    int32_t n_kv = 0;
+
+    // build-scoped envelope width for the union-graph runtime nkv binder;
+    // 0 = not armed. mutable: armed/cleared through const graph-build paths.
+    mutable int32_t nkv_build_override = 0;
+
+    // runtime-length n_kv lane: the owning llama_context arms this before
+    // graph reuse/build when the union binder can patch the width in place.
+    // The batch context has no lctx, so the flag lives on the object. It is
+    // the only condition under which get_n_kv() asks the exact query at all;
+    // an unarmed context keeps the width the cache applied.
+    //
+    // The arming condition (llama-context.cpp, process_ubatch) is the binder
+    // gate, the GGML_TP5_UNION_BINDER_EXACT selection, a live record and a
+    // single-split scheduler. The stock padded width is what a context without
+    // a live record reports, and what a context with nkv_exact_enabled off
+    // reports as the A/B control lane. A cache whose layout cannot address the
+    // true used span while the exact target is armed is a hard failure in
+    // get_n_kv(), not a fallback: the pad bucket, its two knobs and the
+    // test-only forced hook are deleted, so there is no padded escape.
+    bool nkv_exact_target = false;
 };

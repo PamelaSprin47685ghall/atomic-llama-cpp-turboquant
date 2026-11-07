@@ -2566,7 +2566,13 @@ float llama_model::get_rope_freq_scale(const llama_cparams & cparams, int il) co
 }
 
 ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int il) const {
-    const uint32_t n_ctx_seq = cparams.n_ctx_seq;
+    // rope long/short selection is a model-training property keyed on the
+    // stock 256-cell bucket of the per-sequence window. The runtime-length
+    // lane removes that bucket from the physical capacity, so use the
+    // preserved stock value here: removing capacity padding must not change
+    // which rope factors the graph uses.
+    const uint32_t n_ctx_seq = cparams.n_ctx_seq_rope != 0 ? cparams.n_ctx_seq_rope
+                                                          : cparams.n_ctx_seq;
 
     // choose long/short freq factors based on the context size
     if (layers[il].rope_freqs != nullptr) {

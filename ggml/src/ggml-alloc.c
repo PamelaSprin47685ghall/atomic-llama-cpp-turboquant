@@ -1315,6 +1315,43 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     return true;
 }
 
+bool ggml_gallocr_owns_buffer(ggml_gallocr_t galloc, ggml_backend_buffer_t buffer) {
+    if (galloc == NULL || buffer == NULL) return false;
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        const struct vbuffer * v = galloc->buffers[i];
+        if (v == NULL) continue;
+        for (int j = 0; j < GGML_VBUFFER_MAX_CHUNKS; ++j) {
+            if (v->chunks[j] == buffer) return true;
+        }
+    }
+    return false;
+}
+
+bool ggml_gallocr_get_tensor_plan_size(ggml_gallocr_t galloc,
+        const struct ggml_cgraph * graph, const struct ggml_tensor * tensor, size_t * size) {
+    if (!galloc || !graph || !tensor || !size || galloc->n_nodes != graph->n_nodes ||
+            galloc->n_leafs != graph->n_leafs) return false;
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        if (graph->leafs[i] == tensor) {
+            *size = galloc->leaf_allocs[i].leaf.size_max;
+            return true;
+        }
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i] == tensor) {
+            *size = galloc->node_allocs[i].dst.size_max;
+            return true;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (graph->nodes[i]->src[j] == tensor) {
+                *size = galloc->node_allocs[i].src[j].size_max;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
 

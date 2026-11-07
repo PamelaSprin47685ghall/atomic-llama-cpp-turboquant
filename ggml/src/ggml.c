@@ -1329,6 +1329,35 @@ static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
 static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
 
+// The attention tensor flags share one bit field. Each bit is owned by one
+// meaning only; ATTN_ORDERED is the deliberate composite of three of them.
+static_assert((GGML_TENSOR_FLAG_ATTN_MASK       & GGML_TENSOR_FLAG_ATTN_SOFT_MAX) == 0, "ATTN_MASK/ATTN_SOFT_MAX overlap");
+static_assert((GGML_TENSOR_FLAG_ATTN_MASK       & GGML_TENSOR_FLAG_ATTN_SCORES)   == 0, "ATTN_MASK/ATTN_SCORES overlap");
+static_assert((GGML_TENSOR_FLAG_ATTN_SOFT_MAX   & GGML_TENSOR_FLAG_ATTN_SCORES)   == 0, "ATTN_SOFT_MAX/ATTN_SCORES overlap");
+static_assert((GGML_TENSOR_FLAG_MASKED_TAIL_GEMM & GGML_TENSOR_FLAG_ATTN_ORDERED) == 0, "MASKED_TAIL_GEMM/ATTN_ORDERED overlap");
+static_assert((GGML_TENSOR_FLAG_MASKED_TAIL_GEMM & GGML_TENSOR_FLAG_REDUCE_PAD_TAIL) == 0, "MASKED_TAIL_GEMM/REDUCE_PAD_TAIL overlap");
+static_assert((GGML_TENSOR_FLAG_REDUCE_PAD_TAIL  & GGML_TENSOR_FLAG_ATTN_ORDERED) == 0, "REDUCE_PAD_TAIL/ATTN_ORDERED overlap");
+// TRUE_LEN_REDUCE is a separate contract, not a member of the ordered set:
+// a node carries it INSTEAD of relying on the extent, and it may or may not
+// also carry REDUCE_PAD_TAIL (the padded SIMD tail grouping is orthogonal).
+static_assert((GGML_TENSOR_FLAG_TRUE_LEN_REDUCE & GGML_TENSOR_FLAG_ATTN_ORDERED) == 0, "TRUE_LEN_REDUCE/ATTN_ORDERED overlap");
+static_assert((GGML_TENSOR_FLAG_TRUE_LEN_REDUCE & GGML_TENSOR_FLAG_MASKED_TAIL_GEMM) == 0, "TRUE_LEN_REDUCE/MASKED_TAIL_GEMM overlap");
+static_assert((GGML_TENSOR_FLAG_TRUE_LEN_REDUCE & GGML_TENSOR_FLAG_REDUCE_PAD_TAIL) == 0, "TRUE_LEN_REDUCE/REDUCE_PAD_TAIL overlap");
+static_assert(GGML_TENSOR_FLAG_TRUE_LEN_REDUCE == 1024, "TRUE_LEN_REDUCE must not collide with a future low bit");
+
+// The allocator's lifetime flag is not a member of the attention group either.
+// It must own a bit that neither the baseline flags (1..16) nor the attention
+// group (32..1024) uses: a retained tensor must never be read as a pad-tail or
+// attention request, and an attention node must never be treated as retained.
+static_assert((GGML_TENSOR_FLAG_NO_REUSE & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT |
+                                            GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_LOSS   |
+                                            GGML_TENSOR_FLAG_COMPUTE)) == 0, "NO_REUSE overlaps a baseline flag");
+static_assert((GGML_TENSOR_FLAG_NO_REUSE & GGML_TENSOR_FLAG_REDUCE_PAD_TAIL) == 0, "NO_REUSE/REDUCE_PAD_TAIL overlap");
+static_assert((GGML_TENSOR_FLAG_NO_REUSE & GGML_TENSOR_FLAG_ATTN_ORDERED) == 0, "NO_REUSE/ATTN_ORDERED overlap");
+static_assert((GGML_TENSOR_FLAG_NO_REUSE & GGML_TENSOR_FLAG_MASKED_TAIL_GEMM) == 0, "NO_REUSE/MASKED_TAIL_GEMM overlap");
+static_assert((GGML_TENSOR_FLAG_NO_REUSE & GGML_TENSOR_FLAG_TRUE_LEN_REDUCE) == 0, "NO_REUSE/TRUE_LEN_REDUCE overlap");
+static_assert(GGML_TENSOR_FLAG_NO_REUSE == 2048, "NO_REUSE must stay above the attention group");
+
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -3373,6 +3402,31 @@ void ggml_mul_mat_set_prec(
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 0, prec_i32);
+}
+
+void ggml_mul_mat_set_attn_mask(struct ggml_tensor * a, struct ggml_tensor * mask) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT && a->src[2] == NULL);
+    GGML_ASSERT(mask && (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32));
+    GGML_ASSERT(a->src[0]->type == GGML_TYPE_F16 || a->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->ne[0] >= a->src[1]->ne[0] && mask->ne[1] >= a->src[1]->ne[1]);
+    GGML_ASSERT(a->src[1]->ne[2] % mask->ne[2] == 0 && a->src[1]->ne[3] % mask->ne[3] == 0);
+    a->src[2] = mask;
+    a->flags |= GGML_TENSOR_FLAG_ATTN_MASK;
+    if (a->src[1]->op == GGML_OP_SOFT_MAX && a->src[1]->src[1] != NULL) {
+        a->src[1]->flags |= GGML_TENSOR_FLAG_ATTN_SOFT_MAX;
+    }
+}
+
+void ggml_mul_mat_set_attn_scores(struct ggml_tensor * a, struct ggml_tensor * mask) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT && a->src[2] == NULL);
+    GGML_ASSERT(mask && (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32));
+    GGML_ASSERT(a->src[0]->type == GGML_TYPE_F16 || a->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->ne[0] >= a->ne[0] && mask->ne[1] >= a->ne[1]);
+    GGML_ASSERT(a->ne[2] % mask->ne[2] == 0 && a->ne[3] % mask->ne[3] == 0);
+    a->src[2] = mask;
+    a->flags |= GGML_TENSOR_FLAG_ATTN_SCORES;
 }
 
 void ggml_mul_mat_set_hint(
@@ -7707,6 +7761,20 @@ struct ggml_tensor ** ggml_graph_nodes(struct ggml_cgraph * cgraph) {
 
 int ggml_graph_n_nodes(struct ggml_cgraph * cgraph) {
     return cgraph->n_nodes;
+}
+
+struct ggml_tensor * ggml_graph_leaf(struct ggml_cgraph * cgraph, int i) {
+    if (i < 0) {
+        GGML_ASSERT(cgraph->n_leafs + i >= 0);
+        return cgraph->leafs[cgraph->n_leafs + i];
+    }
+
+    GGML_ASSERT(i < cgraph->n_leafs);
+    return cgraph->leafs[i];
+}
+
+int ggml_graph_n_leafs(struct ggml_cgraph * cgraph) {
+    return cgraph->n_leafs;
 }
 
 void ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {

@@ -5,7 +5,9 @@
 #include "traits.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
+#include "ggml-cpu-attn-stats.h"
 
+#include <atomic>
 #include <cctype>
 #include <string>
 #include <vector>
@@ -107,6 +109,15 @@ struct ggml_backend_cpu_context {
     void *              abort_callback_data;
 
     bool                use_ref;  // use reference implementation
+
+    // Measured CPU attention work. The kernels call
+    // ggml_cpu_attn_stats_add() with the loop bounds they actually execute;
+    // this object owns the storage and makes the update thread-safe. The
+    // public snapshot is a plain struct (ggml-cpu-attn-stats.h) so the C
+    // kernels can name it.
+    std::atomic<uint64_t> attn_live_elems{0};
+    std::atomic<uint64_t> attn_pad_elems{0};
+    std::atomic<uint64_t> attn_rows{0};
 };
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
@@ -146,6 +157,7 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
+    cpu_plan->cplan.cpu_ctx             = cpu_ctx;
 
     return cpu_plan;
 }
@@ -186,6 +198,7 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
+    cplan.cpu_ctx             = cpu_ctx;
 
     return ggml_graph_compute(cgraph, &cplan);
 }
@@ -282,6 +295,37 @@ void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->use_ref = use_ref;
+}
+
+// Thread-safe accumulation, called by the kernels with the loop bounds they
+// actually executed. `stats` is the opaque cpu_ctx pointer the plan carries,
+// which is always a live ggml_backend_cpu_context.
+void ggml_cpu_attn_stats_add(struct ggml_cpu_attn_stats * stats,
+                             uint64_t live, uint64_t padded, uint64_t n_rows) {
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *) stats;
+    ctx->attn_live_elems.fetch_add(live,   std::memory_order_relaxed);
+    ctx->attn_pad_elems .fetch_add(padded, std::memory_order_relaxed);
+    ctx->attn_rows      .fetch_add(n_rows, std::memory_order_relaxed);
+}
+
+void ggml_backend_cpu_attn_reduce_stats(ggml_backend_t backend_cpu,
+                                        uint64_t * live,
+                                        uint64_t * padded,
+                                        uint64_t * rows) {
+    // A non-CPU backend has no such counters; report zero rather than fail,
+    // so a caller can query unconditionally.
+    if (backend_cpu == NULL || !ggml_backend_is_cpu(backend_cpu)) {
+        if (live)   *live   = 0;
+        if (padded) *padded = 0;
+        if (rows)   *rows   = 0;
+        return;
+    }
+
+    const struct ggml_backend_cpu_context * ctx =
+        (const struct ggml_backend_cpu_context *)backend_cpu->context;
+    if (live)   *live   = ctx->attn_live_elems.load(std::memory_order_relaxed);
+    if (padded) *padded = ctx->attn_pad_elems .load(std::memory_order_relaxed);
+    if (rows)   *rows   = ctx->attn_rows      .load(std::memory_order_relaxed);
 }
 
 // CPU backend - device
@@ -424,6 +468,23 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
+    if (op->flags & GGML_TENSOR_FLAG_ATTN_ORDERED) {
+        if (((op->flags & (GGML_TENSOR_FLAG_ATTN_MASK | GGML_TENSOR_FLAG_ATTN_SCORES)) && op->op != GGML_OP_MUL_MAT) ||
+            ((op->flags & GGML_TENSOR_FLAG_ATTN_SOFT_MAX) && op->op != GGML_OP_SOFT_MAX) ||
+            ((op->flags & GGML_TENSOR_FLAG_ATTN_MASK) && (op->flags & GGML_TENSOR_FLAG_ATTN_SCORES))) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const ggml_tensor * src = op->src[i];
+            while (src && !src->buffer && src->view_src) {
+                src = src->view_src;
+            }
+            if (src && src->buffer && ggml_backend_cpu_is_extra_buffer_type(src->buffer->buft)) {
+                return false;
+            }
+        }
+    }
+
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
     }
@@ -433,6 +494,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     for (int i = 0; i < 4; i++) {
         if (op->src[i] && op->src[i]->buffer &&
             ggml_backend_cpu_is_extra_buffer_type(op->src[i]->buffer->buft)) {
+            if (op->flags & GGML_TENSOR_FLAG_ATTN_ORDERED) {
+                return false;
+            }
             auto * buf_extra = (ggml::cpu::extra_buffer_type *) op->src[i]->buffer->buft->context;
             return buf_extra->supports_op(dev, op);
         }
@@ -646,6 +710,9 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_supports_ordered_attention") == 0) {
+        return (void *) ggml_backend_cpu_device_supports_op;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

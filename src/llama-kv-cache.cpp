@@ -10,11 +10,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <map>
+#include <unordered_map>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -398,6 +401,11 @@ llama_kv_cache::llama_kv_cache(
         // [TAG_V_CACHE_VARIABLE]
         const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
         const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+        // The transposed V index layout (set_input_v_idxs) is written at the
+        // max V width, so every layer's V cache must have that width. A
+        // per-layer V narrower than the max would shift every later token's
+        // indices; allowing one requires changing the index layout first.
+        GGML_ASSERT(!v_trans || n_embd_v_gqa == hparams.n_embd_v_gqa_max());
 
         const char * dev_name = "CPU";
 
@@ -1354,6 +1362,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
             ggml_backend_sched_reset(sched);
+            if (!ggml_backend_sched_set_split_copy_tracking(sched, false)) {
+                LLAMA_LOG_ERROR("%s: failed to disable split copy tracking for K-shift\n", __func__);
+                return updated;
+            }
 
             auto * res = lctx->get_gf_res_reserve();
 
@@ -1515,13 +1527,27 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             }
 
             for (uint32_t i = 0; i < n_test; i++) {
+                // the token this cell would hold
+                const uint32_t i_tok = s*n_tokens + (uint32_t) res.idxs[s].size() + i;
+
+                // unified: a position has one K/V slot. A token whose position
+                // is already in the stream shares that cell instead of taking
+                // a second one: the mask width is a POSITION span (get_n_kv),
+                // so a duplicate cell would push the position past the mask's
+                // columns and hide the token from itself.
+                if (n_stream == 1 && !cont) {
+                    const int64_t reuse = cells.find_cell_by_pos(ubatch.pos[i_tok]);
+
+                    if (reuse >= 0) {
+                        res.idxs[s].push_back((uint32_t) reuse);
+                        continue;
+                    }
+                }
+
                 const auto idx = head_cur;
 
                 head_cur++;
                 n_tested++;
-
-                //const llama_pos    pos    = ubatch.pos[i];
-                //const llama_seq_id seq_id = ubatch.seq_id[i][0];
 
                 // can we use this cell? either:
                 //  - the cell is empty
@@ -1536,7 +1562,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
                     // (disabled) causal mask
                     // note: it's better to purge any "future" tokens beforehand
-                    //if (cells.seq_has(idx, seq_id)) {
+                    //if (cells.seq_has(idx, ubatch.seq_id[i_tok][0])) {
                     //    can_use = pos_cell >= pos;
                     //}
 
@@ -1608,10 +1634,25 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             const auto idx = sinfo.idxs[s][ii];
 
             if (!cells.is_empty(idx)) {
+                const llama_pos pos = cells.pos_get(idx);
+
+                if (n_stream == 1 && pos == ubatch.pos[i]) {
+                    // unified: the position already owns its K/V slot. The
+                    // token joins the cell instead of overwriting it, so the
+                    // cell stays the single slot of that position and the
+                    // position span (get_n_kv) keeps covering it.
+                    for (int32_t j = 0; j < ubatch.n_seq_id[i]; j++) {
+                        if (!cells.seq_has(idx, ubatch.seq_id[i][j])) {
+                            cells.seq_add(idx, ubatch.seq_id[i][j]);
+                        }
+                    }
+
+                    continue;
+                }
+
                 assert(cells.seq_count(idx) == 1);
 
                 const llama_seq_id seq_id = cells.seq_get(idx);
-                const llama_pos    pos    = cells.pos_get(idx);
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
 
@@ -2042,22 +2083,119 @@ bool llama_kv_cache::resolve_attention_view(llama_seq_id seq, llama_pos pos,
     return true;
 }
 
+// The PADDED width of the KV span: the stock 256-cell graph-stability bucket,
+// rounded up to n_pad and clamped to the physical cell count of the
+// participating streams. This is the width a stock graph executes at, and the
+// width the union binder never executes at while its exact lane is armed.
+//
+// The bucket floor is gone: this function rounds by n_pad, which is 1 for a
+// plain cache, so it reports the true used span rather than a 256-cell
+// bucket. The padded lane is therefore not a terminal state -- there is no
+// configuration in which a graph executes at a padded width the binder did
+// not choose.
+//
+// The true used span is get_n_kv_exact() below. The batch context chooses
+// between the two on nkv_exact_target (see llama_kv_cache_context::get_n_kv):
+// armed, it asks get_n_kv_exact() and aborts if the layout refuses; unarmed,
+// it keeps the width the cache applied in apply().
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
-    // pad the n_kv value so that the graph remains constant across batches and can be reused
+    // stock graph-stability pad: keep the n_kv width on a 256-cell bucket so a
+    // graph can be reused across batches without an in-place width patch.
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
-
+    // The union binder does not use this width: its exact lane takes the true
+    // span from get_n_kv_exact(), and GGML_TP5_UNION_BINDER_EXACT=0 selects
+    // this padded width as the A/B control.
+    //
+    // The bucket floor (n_pad_cur = 256 when n_pad < 256) and its structural
+    // guard are deleted: the padded lane is no longer a terminal state, so a
+    // bucket produced while the exact lane is armed cannot be "restored" by a
+    // knob. The rounding below uses n_pad, which is 1 for a plain cache, so
+    // the stock path reports the true used span.
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        // The executed width is a POSITION span, not a cell-index span:
+        // used_max_p1() counts cell indices, and in a unified cache two
+        // sequences' tokens for the same position sit in two different cells,
+        // so the cell span (2) exceeds the position span (1) and the mask
+        // would execute wider than the positions it covers. The width the
+        // mask, K and V must share is the largest position on the stream + 1,
+        // rounded by n_pad and clamped to the physical cell count.
+        const uint32_t span = std::min(cells.size(), std::max(n_pad, GGML_PAD(cells.used_pos_span_p1(), n_pad)));
+
+        result = std::max(span, result);
     }
 
     return result;
 }
 
+// experimental exact-width lane: the true used span, with no stock 256-cell
+// graph-stability floor and no n_pad rounding. Active streaming arenas are
+// excluded; with a transposed V (flash attention off) the first V dimension is
+// the quantized one, so the width is rounded up to the largest V block size and
+// rejected if it does not fit a participating stream.
+uint32_t llama_kv_cache::get_n_kv_exact(const slot_info & sinfo) const {
+    if (kv_stream_runtime.runtime != nullptr || sinfo.n_stream() == 0) {
+        return 0;
+    }
+
+    // a transposed V (flash attention off) has the quantized type on ne[0],
+    // so the shared width must be a multiple of every V block size
+    uint32_t align = 1;
+    if (v_trans) {
+        for (const auto & layer : layers) {
+            if (layer.v == nullptr) {
+                // a layer without its own V tensor (shared/view V, MLA) may
+                // still derive a quantized [n_kv, ...] view from K; without a
+                // concrete type the block constraint cannot be proven
+                return 0;
+            }
+            const uint32_t blck = ggml_blck_size(layer.v->type);
+            align = align / std::gcd(align, blck) * blck;
+        }
+    }
+
+    uint32_t result   = 0;
+    uint32_t min_size = UINT32_MAX;
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const auto & cells = v_cells[sinfo.strm[s]];
+        // a shared width covers the largest stream; cells beyond a smaller
+        // stream's used span are empty and masked. The width is a position
+        // span (used_pos_span_p1), not the cell-index span: a unified cache
+        // can hold the same position of two sequences in two cells, and the
+        // mask's columns are positions, so the cell span would overshoot.
+        const uint32_t width = std::min(cells.size(), std::max(1u, cells.used_pos_span_p1()));
+        result   = std::max(result, width);
+        min_size = std::min(min_size, cells.size());
+    }
+    if (result == 0) {
+        return 0;
+    }
+    // the width is shared by every participating stream, so it must fit the
+    // smallest stream's physical cell count even when align == 1
+    if (align > 1) {
+        result = GGML_PAD(result, align);
+    }
+    if (result > min_size) {
+        return 0;
+    }
+
+    return result;
+}
+
+// The TRUE USED SPAN of the KV span: no 256-cell bucket floor and no n_pad
+// rounding, so the graph can execute at the real history length. This is the
+// width the union binder binds; it is not the padded width get_n_kv() above
+// computes, and the two are deliberately separate functions.
+//
+// Returns 0 when the span cannot be addressed at one shared width: an active
+// streaming arena, a transposed V whose block size cannot be proven (a layer
+// without its own V tensor), or a width that does not fit the smallest
+// participating stream. Callers must treat 0 as "keep the applied width",
+// which is exactly what llama_kv_cache_context::get_n_kv() does when the exact
+// query refuses.
 uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const {
     if (sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0 ||
         ubatch.pos == nullptr || ubatch.n_seq_id == nullptr ||
@@ -2126,12 +2264,17 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
-    return ggml_view_4d(ctx, k,
+    ggml_tensor * res = ggml_view_4d(ctx, k,
             head_k_eff, hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, head_k_eff),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+    // union binder root: the n_kv dimension of this view is the runtime width.
+    // The symbolic shape pass in llama-context.cpp reads this tag and derives
+    // every dependent consumer from the exact ggml op rules.
+    ggml_set_name(res, "union_nkv_k");
+    return res;
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -2155,24 +2298,39 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
-        return ggml_view_4d(ctx, v,
+        ggml_tensor * res = ggml_view_4d(ctx, v,
                 head_v_eff, hparams.n_head_kv(il), n_kv, ns,
                 ggml_row_size(v->type, head_v_eff),                      // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                    // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),            // v->nb[3]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+        ggml_set_name(res, "union_nkv_v");
+        return res;
     }
 
     // note: v->nb[1] > v->nb[2]
-    return ggml_view_4d(ctx, v,
+    ggml_tensor * res = ggml_view_4d(ctx, v,
             n_kv, hparams.n_head_kv(il), head_v_eff, ns,
             ggml_row_size(v->type, kv_size*head_v_eff),              // v->nb[1]
             ggml_row_size(v->type, kv_size),                         // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),            // v->nb[3]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+    ggml_set_name(res, "union_nkv_v");
+    return res;
 }
 
-ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+// token lane: name the output axis that carries the token dimension. The tag
+// lives in the unused final op-parameter slot (see LLM_TOKEN_AXIS_MARKER in
+// llama-graph.h); VIEW/RESHAPE do not use it (VIEW writes only op_params[0..1],
+// RESHAPE writes none).
+static void llama_union_mark_token_axis(ggml_tensor * t, int axis) {
+    if (t != nullptr) {
+        t->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = LLM_TOKEN_AXIS_MARKER | axis;
+    }
+}
+
+ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo,
+                                    bool token_axis_marker) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
@@ -2201,6 +2359,9 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
 
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+    if (token_axis_marker) {
+        llama_union_mark_token_axis(k_cur, 1);   // (n_embd_gqa, n_tokens)
+    }
 
     const int64_t n_stream = k->ne[2];
 
@@ -2227,7 +2388,8 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     return result;
 }
 
-ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo,
+                                    bool token_axis_marker) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
@@ -2257,6 +2419,10 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     // take this branch when FA is enabled (the V cache is not transposed)
     if (!v_trans) {
         v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
+
+        if (token_axis_marker) {
+            llama_union_mark_token_axis(v_cur, 1);   // (n_embd_gqa, n_tokens)
+        }
 
         if (n_stream > 1) {
             const int64_t kv_size = get_size();
@@ -2289,11 +2455,24 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     if (n_embd_gqa < v->ne[0]) {
         v_cur = ggml_pad(ctx, v_cur, v->ne[0] - n_embd_gqa, 0, 0, 0);
     }
+    // The pad output is deliberately not marked: the symbolic shape pass reads
+    // the tag only on VIEW/RESHAPE/CONT nodes (token_reshape and the CONT
+    // branch), and this output is a PAD. The flatten below carries the token
+    // axis.
 
     // in this branch the v_idxs are constructed in such a way that each row is a single head element
     ggml_tensor * v_view = ggml_reshape_2d(ctx, v, 1, ggml_nelements(v));
 
     v_cur = ggml_reshape_2d(ctx, v_cur, 1, ggml_nelements(v_cur));
+    // The flatten folds the token axis into axis 1: one token's elements span
+    // the axis, so the symbolic shape pass must grow ne[1] to
+    // n_embd_gqa*n_tokens. Without the marker the axis search picks the
+    // degenerate trailing axis 2 (its start stride equals the token stride),
+    // and SET_ROWS then iterates i02 over tokens while adding dst->nb[2] (a
+    // full cache span) per plane.
+    if (token_axis_marker) {
+        llama_union_mark_token_axis(v_cur, 1);       // #10: (1, n_embd_gqa*n_tokens)
+    }
 
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
 }
@@ -2302,6 +2481,7 @@ ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama
     const uint32_t n_tokens = ubatch.n_tokens;
 
     ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_set_name(k_idxs, "union_inp_k_idxs");
 
     ggml_set_input(k_idxs);
 
@@ -2318,6 +2498,7 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     } else {
         v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens*hparams.n_embd_v_gqa_max());
     }
+    ggml_set_name(v_idxs, "union_inp_v_idxs");
 
     ggml_set_input(v_idxs);
 
@@ -2416,6 +2597,11 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
         // note: the V cache is transposed when not using flash attention
         const int64_t kv_size = get_size();
 
+        // The index layout is written at the max V width: one token's indices
+        // are n_embd_v_gqa apart and ggml_set_rows reads them linearly over
+        // the value tensor's rows. The construction pins the transposed V
+        // cache width to the same max; a per-layer width must change this
+        // layout first.
         const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
 
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -2457,6 +2643,14 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+    // Row stride of the mask tensor (dst->ne[0]). The fill writes row i at
+    // row_stride*i, which is the layout the consumer reads (nb[1]); a runtime
+    // width below ne[0] only shortens the row's filled prefix.
+    int64_t row_stride;
+    // mask columns past the runtime width, per token row: dst->ne[0] - n_kv.
+    // Filled with the drop value so a stale keep from a wider previous fill
+    // cannot survive, and so a padded consumer's max pass sees -inf.
+    int64_t n_pad_tail;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -2488,12 +2682,36 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
+        // Token index range of the group this stream owns. A unified mask has
+        // one stream carrying every token; a per-stream mask groups the
+        // ubatch by unique sequence (a sequence's tokens stay contiguous), and
+        // a stream with no token in this ubatch has no rows to fill.
+        uint32_t i0 = 0;
+        if (n_stream > 1) {
+            bool found = false;
+
+            for (uint32_t g = 0; g < ubatch->n_seqs_unq; ++g) {
+                if (seq_to_stream[ubatch->seq_id_unq[g]] != s) {
+                    continue;
+                }
+
+                i0 = g*(uint32_t) n_tps;
+                found = true;
+                break;
+            }
+
+            if (!found) {
+                continue;
+            }
+        }
+
         // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
-            const uint32_t i = s*n_tps + ii;
+            const uint32_t i   = i0 + ii;
+            const uint32_t row = s*n_tps + ii;
 
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
@@ -2506,7 +2724,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
             const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
 
-            const uint64_t idst = n_kv*i;
+            // The row starts at the tensor's own row stride, not at the runtime
+            // width: a narrower width only shortens the row's filled prefix,
+            // and the consumer reads rows at nb[1] == nb[0]*ne[0]. With
+            // ne[0] == n_kv (the bound lane) the two are the same.
+            const uint64_t idst = (uint64_t) args.row_stride * row;
 
             // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
             // the only cells that could change are the ones that are with similar positions as the
@@ -2522,7 +2744,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
 
-                    const uint64_t idst_prev = n_kv*srct;
+                    const uint64_t idst_prev = (uint64_t) args.row_stride * srct;
 
                     std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
 
@@ -2531,7 +2753,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     idxs.clear();
                     idxs.reserve(ubatch->n_tokens + n_swa + 32);
 
-                    seq_srct[seq_id] = i;
+                    seq_srct[seq_id] = row;
                 }
             }
 
@@ -2604,6 +2826,18 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 skip:
                 data[idst + j] = mask_drop;
             }
+
+            // The fill above stops at the runtime width. Everything past it
+            // is outside the span this graph executes at, so it must read as
+            // "masked" and not as whatever the previous fill left there: a
+            // shrinking width would otherwise leave the previous step's 0.0
+            // (keep) entries in the tail. The CPU attention kernels no longer
+            // read the tail (TRUE_LEN_REDUCE), but any other consumer must
+            // still see -inf, and the max pass of a padded consumer must not
+            // be raised by a stale 0.0.
+            if (args.n_pad_tail > 0) {
+                std::fill(data + idst + n_kv, data + idst + n_kv + args.n_pad_tail, mask_drop);
+            }
         }
     }
 }
@@ -2648,17 +2882,47 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    set_input_kq_mask(dst, ubatch, causal_attn, 0);
+}
+
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_kv_runtime) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    const int64_t n_kv     = dst->ne[0];
-    const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
+    // The fill addresses row i at dst->ne[0] (set_input_kq_mask_impl's
+    // `idst = row_stride*i`), which is the tensor's row stride while the mask
+    // is contiguous. A freshly built mask is, and the binder's shape map
+    // patches the mask with union_contiguous_nb, so this holds; a
+    // non-contiguous mask would make the fill and the consumer read different
+    // rows.
+    GGML_ASSERT(dst->nb[1] == dst->nb[0] * dst->ne[0] && "KQ mask rows are not contiguous");
 
-    GGML_ASSERT(n_tokens%n_stream == 0);
+    // The width to fill. The stock path (n_kv_runtime == 0) fills the whole
+    // tensor, exactly as before. The union-binder path passes the width the
+    // graph must execute at, read from the graph's runtime n_kv input. That
+    // width is a contract, not a hint: 0 or a width above the tensor's own
+    // ne[0] is not a width this tensor can hold, and falling back to ne[0]
+    // would fill a wider mask than the graph executes at. Refuse instead.
+    if (n_kv_runtime != 0 && (int64_t) n_kv_runtime > dst->ne[0]) {
+        LLAMA_LOG_ERROR("%s: runtime n_kv %u exceeds mask %s ne[0] %" PRId64 "\n",
+                __func__, n_kv_runtime, dst->name, dst->ne[0]);
+        GGML_ABORT("runtime n_kv exceeds the KQ mask width");
+    }
+    const int64_t n_kv     = n_kv_runtime != 0 ? (int64_t) n_kv_runtime : dst->ne[0];
+    // The mask is [n_kv, n_tps, 1, n_stream]: ne[3] is the number of KV
+    // streams the graph was built for, ne[1] the token rows per stream.
+    // n_tokens/n_stream is NOT that row count: a non-unified ubatch can touch
+    // a single stream while the cache has more (one token, two streams), and
+    // the division would truncate to zero.
+    const int64_t n_stream = dst->ne[3];
+    const int64_t n_tps    = dst->ne[1];
 
-    // n_tps == n_tokens_per_stream
-    const int64_t n_tps = n_tokens/n_stream;
+    if (n_stream > 1) {
+        GGML_ASSERT(n_tps*(int64_t)ubatch->n_seqs_unq == (int64_t)n_tokens);
+    } else {
+        GGML_ASSERT(n_tps == (int64_t)n_tokens);
+    }
 
     //const int64_t t_start = ggml_time_us();
 
@@ -2672,6 +2936,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.row_stride       =*/ dst->ne[0],
+        /*.n_pad_tail       =*/ dst->ne[0] - n_kv,
     };
 
     if (dst->type == GGML_TYPE_F16) {
@@ -2684,6 +2950,123 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
+
+enum llama_gate_verdict llama_kv_cache::check_mask_row(
+        const ggml_tensor * dst,
+        const llama_ubatch * ubatch,
+        uint32_t tok,
+        const float * mask_data,
+        uint32_t width,
+        bool causal_attn,
+        bool swa,
+        int64_t * first_bad) const {
+    if (first_bad != nullptr) {
+        *first_bad = -1;
+    }
+    if (dst == nullptr || ubatch == nullptr || mask_data == nullptr || tok >= ubatch->n_tokens) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+    if (width == 0 || (int64_t) width > dst->ne[0]) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+    // F32 only: `mask_data` is read as `const float *` below, so an F16 mask
+    // would be reinterpreted, not converted -- every value would be garbage
+    // and the verdict meaningless. The fill writes F16 only under flash
+    // attention, which this lane refuses; anything that is not F32 is a
+    // refusal (UNPROVEN), never a comparison.
+    if (dst->type != GGML_TYPE_F32) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+
+    // The fill's layout, restated exactly: n_stream = dst->ne[3],
+    // n_tps = dst->ne[1], row = s*n_tps + ii written at
+    // idst = dst->ne[0]*row (set_input_kq_mask_impl, the `const uint64_t idst =
+    // args.row_stride*row;` line, row_stride = dst->ne[0]). The check needs
+    // the same row count. It derives that count by division and refuses a
+    // layout that does not divide, rather than guessing.
+    const int64_t n_stream = dst->ne[3];
+    if (n_stream <= 0 || ubatch->n_tokens % n_stream != 0) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+    const uint32_t n_tps = ubatch->n_tokens / (uint32_t) n_stream;
+    if (n_tps == 0 || n_tps * (uint32_t) n_stream != ubatch->n_tokens) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+
+    // The stream comes from the ROW, not from the token's sequence: the fill
+    // takes its cells from v_cells.at(seq_to_stream[seq_id]) where seq_id is
+    // the sequence of the token in that same row, so the two agree only if
+    // seq_to_stream[seq_id(tok)] == tok / n_tps. When they disagree the row
+    // was filled from another stream and this check would compare it against
+    // the wrong table: refuse instead.
+    const uint32_t row_idx = tok / n_tps;
+    const llama_seq_id seq_id = ubatch->seq_id[tok][0];
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+    if (seq_to_stream[seq_id] != row_idx) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+    const uint32_t stream = row_idx;
+    if (stream >= v_cells.size()) {
+        return LLAMA_GATE_UNPROVEN;
+    }
+    const llama_kv_cells & cells = v_cells[stream];
+    const llama_pos p1 = ubatch->pos[tok];
+
+    // Row `tok` starts at the tensor's row stride, the same stride the fill
+    // writes and the consumer reads (nb[1] == nb[0]*ne[0]).
+    const float * row = mask_data + (size_t) dst->ne[0] * (size_t) tok;
+
+    for (uint32_t j = 0; j < width; ++j) {
+        // Column j of row `tok` is cell j of the row's own stream.
+        bool want_visible;
+        if (j >= cells.size() || cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
+            want_visible = false;
+        } else {
+            const llama_pos p0 = cells.pos_get(j);
+            want_visible = true;
+            if (causal_attn && p0 > p1) {
+                want_visible = false;
+            } else if (swa && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                want_visible = false;
+            }
+        }
+
+        const float v = row[j];
+        const bool visible = v == 0.0f;
+        const bool dropped = v == -INFINITY;
+        if (!visible && !dropped) {
+            if (first_bad != nullptr) {
+                *first_bad = (int64_t) j;
+            }
+            return LLAMA_GATE_FAIL;
+        }
+        if (visible != want_visible) {
+            if (first_bad != nullptr) {
+                *first_bad = (int64_t) j;
+            }
+            return LLAMA_GATE_FAIL;
+        }
+    }
+
+    // The tail: the fill writes [n_kv, dst->ne[0]) of every row with the drop
+    // value (set_input_kq_mask_impl's n_pad_tail), at the tensor's row stride,
+    // so each row's tail is its own. This check keeps the last-row scope the
+    // read-back uses; that row's tail is the fill's own and must read as -inf.
+    if (tok + 1 == ubatch->n_tokens) {
+        for (int64_t j = width; j < dst->ne[0]; ++j) {
+            if (row[j] != -INFINITY) {
+                if (first_bad != nullptr) {
+                    *first_bad = j;
+                }
+                return LLAMA_GATE_FAIL;
+            }
+        }
+    }
+    return LLAMA_GATE_PASS;
+}
+
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
@@ -3733,7 +4116,11 @@ llama_kv_cache_context::llama_kv_cache_context(
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
 }
 
-llama_kv_cache_context::~llama_kv_cache_context() = default;
+// union-graph runtime nkv binder: the build-scoped n_kv override is a
+// per-object member (llama_kv_cache_context::nkv_build_override), armed only
+// around model.build_graph() by llama_context (nkv_envelope_begin/end) and
+// read by get_n_kv() during graph construction. No process-global table, so
+// concurrent contexts on different threads never share state.
 
 bool llama_kv_cache_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
@@ -3782,6 +4169,58 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
+    // build-scoped envelope override (union-graph runtime nkv binder): while
+    // armed, report the envelope width so the graph under construction is
+    // sized and sched-allocated for the full envelope, not just the applied
+    // cache n_kv. Only ever armed during model.build_graph().
+    if (nkv_build_override != 0) {
+        return (uint32_t) nkv_build_override;
+    }
+    // runtime-length lane: the binder patches the width in place, so the
+    // stock 256-cell stability floor is not needed. The owning context arms
+    // nkv_exact_target only when a live record proves the symbolic shape map
+    // can patch the width in place and the scheduler runs one split (each bind
+    // validates its split copies). get_n_kv_exact() returns 0 when the layout
+    // cannot be addressed at an arbitrary width (reserve context, active
+    // streaming, unprovable V blocks).
+    //
+    // The exact width is computed here, never read from n_kv: n_kv is the
+    // stock padded width that apply() stored, so returning it would restore
+    // the padded lane this lane replaced.
+    //
+    // The lane is the binder's, not a separate switch: without an armed exact
+    // target there is no record to patch, so the padded width is the only
+    // width the graph can execute at.
+    //
+    // Unarmed (stock context, gate off, envelope disabled, multi-split) the
+    // width the cache applied is kept, exactly as before: a context that never
+    // asked for the exact lane must not abort on a layout refusal.
+    if (nkv_exact_target) {
+        const uint32_t exact = get_n_kv_exact();
+        if (exact != 0) {
+            return exact;
+        }
+        // The exact lane was armed and its query refused (0). A silent
+        // padded width here would execute the graph at a width the binder
+        // did not choose, so this is a hard failure. Reason class: the
+        // refusal comes from the layout, not from one layer's tensors.
+        //
+        // The padded width below is no longer reachable as a fallback: the
+        // pad bucket and its forced-fallback hook were deleted, so there is
+        // no configuration in which the exact lane silently degrades to the
+        // stock width. The one batch context is queried many times per step
+        // (graph inputs, the reuse key, the binder), which is why this is a
+        // hard failure at the query rather than a flag folded later.
+        //
+        // Reason class: the exact lane was armed and its query refused (0).
+        // The layer is not known here: one batch context serves every layer
+        // of the cache, and the refusal comes from the layout, not from one
+        // layer's tensors.
+        GGML_ABORT("%s: exact n_kv lane armed but no exact width is available "
+                   "(i_cur %zu of %zu, exact query returned 0, "
+                   "reason class layout_refusal)\n",
+                   __func__, i_cur, ubatches.size());
+    }
     return n_kv;
 }
 uint32_t llama_kv_cache_context::get_n_kv_pad() const {
@@ -3804,6 +4243,65 @@ uint32_t llama_kv_cache_context::get_n_kv_pad() const {
 
 bool llama_kv_cache_context::n_kv_pad_fits(uint32_t n_kv_pad) const {
     return n_kv_pad >= n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_exact() const {
+    // A batch context always carries one slot per ubatch; only the reserve
+    // and init_full contexts have no ubatch, and their stored n_kv is the
+    // full cache capacity, not a bucket. The assert keeps that structural
+    // fact visible: a batch context that asks for an exact width without a
+    // slot is a broken invariant, not a refusal.
+    if (!ubatches.empty()) {
+        GGML_ASSERT(!sinfos.empty() && i_cur < sinfos.size() &&
+                    "exact n_kv query on a batch context without a slot");
+    }
+    if (nkv_build_override != 0 || kv == nullptr || sinfos.empty() || i_cur >= sinfos.size()) {
+        return 0;
+    }
+    // reserve/init_full contexts have no concrete ubatch: their stored n_kv is
+    // the full cache capacity and must be preserved
+    if (ubatches.empty()) {
+        return 0;
+    }
+    return kv->get_n_kv_exact(sinfos[i_cur]);
+}
+
+
+uint32_t llama_kv_cache_context::get_n_kv_target() const {
+    // the width the graph is expected to execute at is exactly the width
+    // get_n_kv() reports: the runtime used span when the lane is armed and
+    // the layout is addressable, the stock padded width when the lane is not
+    // armed. can_reuse_kq_mask compares against this so a bound graph is not
+    // rebuilt on every step.
+    return get_n_kv();
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_runtime() const {
+    // The value the attention consumers must use for this compute. It is
+    // deliberately not get_n_kv(): during an envelope build that accessor
+    // reports the allocation width, which is not a width any consumer should
+    // execute at. Here the order is: the true used span, then the width the
+    // cache applied for this ubatch, then nothing.
+    const uint32_t exact = get_n_kv_exact();
+    if (exact != 0) {
+        return exact;
+    }
+    return n_kv > 0 ? (uint32_t) n_kv : 0u;
+}
+
+
+void llama_kv_cache_context::nkv_envelope_begin(uint32_t cap) const {
+    // poka-yoke: a nested/leaked override would silently size the next graph
+    // at a stale width. The RAII guard in llama-context.cpp is the only
+    // writer; assert rather than overwrite.
+    GGML_ASSERT(nkv_build_override == 0 && "nested n_kv envelope build");
+    GGML_ASSERT(cap != 0 && "zero n_kv envelope width");
+    nkv_build_override = (int32_t) cap;
+}
+
+void llama_kv_cache_context::nkv_envelope_end() const {
+    GGML_ASSERT(nkv_build_override != 0 && "unbalanced n_kv envelope build");
+    nkv_build_override = 0;
 }
 
 bool llama_kv_cache_context::has_attention_views() const {
@@ -3853,11 +4351,13 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    // use get_n_kv(), not the raw n_kv: during an envelope build the graph must
+    // size the K/V views to the same width as the KQ mask (nkv_envelope_begin)
+    return kv->get_k(ctx, il, get_n_kv(), sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_v(ctx, il, get_n_kv(), sinfos[i_cur]);
 }
 // factor-prefab ATTN factor support: K/V views sized by a padded KV width (>= n_kv,
 // 256-aligned) so the factor/envelope graph stays shape-stable while n_kv grows within
@@ -3891,12 +4391,14 @@ ggml_tensor * llama_kv_cache_context::get_turbo_rot_inverse() const {
 ggml_tensor * llama_kv_cache_context::get_turbo_innerq_scale_inv() const {
     return kv->get_turbo_innerq_scale_inv();
 }
-ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
-    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
+                                            bool token_axis_marker) const {
+    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur], token_axis_marker);
 }
 
-ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
-    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il,
+                                            bool token_axis_marker) const {
+    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur], token_axis_marker);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -3941,6 +4443,22 @@ void llama_kv_cache_context::prefab_set_input_kq_mask(ggml_tensor * dst, const l
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_kv) const {
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, n_kv);
+}
+
+enum llama_gate_verdict llama_kv_cache_context::check_mask_row(
+        const ggml_tensor * dst,
+        const llama_ubatch * ubatch,
+        uint32_t tok,
+        const float * mask_data,
+        uint32_t width,
+        bool causal_attn,
+        bool swa,
+        int64_t * first_bad) const {
+    return kv->check_mask_row(dst, ubatch, tok, mask_data, width, causal_attn, swa, first_bad);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

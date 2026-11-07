@@ -15,8 +15,11 @@
 #include "ggml-backend-moe-cache.h"
 
 #include <algorithm>
+#include <functional>
 #include <mutex>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 
 // MoE expert cache providers, keyed by backend registration object. Multiple
 // backends (CUDA, Metal, Vulkan, HIP) can register; each scheduler picks the
@@ -568,6 +571,13 @@ void ggml_backend_synchronize(ggml_backend_t backend) {
 ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
     GGML_ASSERT(backend->iface.graph_plan_create != NULL);
+    for (int i = 0; i < ggml_graph_n_nodes(cgraph); ++i) {
+        const ggml_tensor * node = ggml_graph_node(cgraph, i);
+        if ((node->flags & GGML_TENSOR_FLAG_ATTN_ORDERED) &&
+                !ggml_backend_supports_op(backend, node)) {
+            return NULL;
+        }
+    }
 
     return backend->iface.graph_plan_create(backend, cgraph);
 }
@@ -594,6 +604,14 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
+    // A backend that ignores the explicit mask cannot compute this node.
+    for (int i = 0; i < ggml_graph_n_nodes(cgraph); ++i) {
+        const ggml_tensor * node = ggml_graph_node(cgraph, i);
+        if ((node->flags & GGML_TENSOR_FLAG_ATTN_ORDERED) &&
+                !ggml_backend_supports_op(backend, node)) {
+            return GGML_STATUS_FAILED;
+        }
+    }
     return backend->iface.graph_compute(backend, cgraph);
 }
 
@@ -774,6 +792,14 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    if (op->flags & GGML_TENSOR_FLAG_ATTN_ORDERED) {
+        // A backend opts in with bool(device, op), including its layout checks.
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        typedef bool (*ordered_attention_support_t)(ggml_backend_dev_t, const struct ggml_tensor *);
+        auto support = reg ? (ordered_attention_support_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_supports_ordered_attention") : nullptr;
+        return support && support(device, op);
+    }
     return device->iface.supports_op(device, op);
 }
 
@@ -928,6 +954,20 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_sched_copy_record {
+    ggml_tensor * source;
+    ggml_tensor * copy;
+    ggml_tensor * dependency;
+    size_t bytes;
+    size_t alloc_size;
+    ggml_backend_buffer_t buffer;
+    void * data;
+    enum ggml_type type;
+    int backend_id;
+    int copy_id;
+    bool valid;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -942,6 +982,11 @@ struct ggml_backend_sched {
     struct ggml_hash_set  hash_set;
     int                 * hv_tensor_backend_ids; // [hash_set.size]
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
+    struct ggml_sched_copy_record * copy_records;
+    size_t n_copy_records;
+    size_t copy_records_capacity;
+    bool copy_tracking;
+    bool copy_envelopes_valid;
 
     int * node_backend_ids; // [graph_size]
     int * leaf_backend_ids; // [graph_size]
@@ -1217,6 +1262,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+    sched->copy_envelopes_valid = false;
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -2202,6 +2248,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
+    free(sched->copy_records);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
@@ -2222,6 +2269,8 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+    sched->copy_envelopes_valid = false;
+    sched->n_copy_records = 0;
 }
 
 void ggml_backend_sched_release_buffers(ggml_backend_sched_t sched) {
@@ -2311,6 +2360,190 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     return true;
 }
 
+// Compute a non-overlapping layout span without overflowing ggml_nbytes or
+// ggml_nelements. Empty and permuted layouts are not admitted for rebinding.
+static bool ggml_sched_layout_span(const ggml_tensor * t, size_t * span) {
+    if (t->type < 0 || t->type >= GGML_TYPE_COUNT) {
+        return false;
+    }
+    const size_t block = (size_t) ggml_blck_size(t->type);
+    const size_t unit = ggml_type_size(t->type);
+    if (block == 0 || unit == 0 || t->nb[0] != unit || t->ne[0] <= 0 ||
+            (uint64_t) t->ne[0] % block != 0 || (uint64_t) t->ne[0] > SIZE_MAX / unit) {
+        return false;
+    }
+    size_t row = (size_t) t->ne[0] / block * unit;
+    size_t bytes = row;
+    uint64_t elements = (uint64_t) t->ne[0];
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (t->ne[i] <= 0 || (uint64_t) t->ne[i] > (uint64_t) INT64_MAX / elements || t->nb[i] < row) {
+            return false;
+        }
+        elements *= (uint64_t) t->ne[i];
+        const size_t count = (size_t) t->ne[i] - 1;
+        if (count && t->nb[i] > (SIZE_MAX - bytes) / count) {
+            return false;
+        }
+        bytes += count * t->nb[i];
+        if ((size_t) t->ne[i] > SIZE_MAX / t->nb[i]) {
+            return false;
+        }
+        row = t->nb[i] * (size_t) t->ne[i];
+    }
+    *span = bytes;
+    return true;
+}
+
+static void ggml_backend_sched_capture_copy_envelopes(ggml_backend_sched_t sched) {
+    sched->copy_envelopes_valid = false;
+    sched->n_copy_records = 0;
+
+    size_t count = 0;
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const int inputs = sched->splits[i].n_inputs;
+        if (inputs < 0 || (size_t) inputs > (SIZE_MAX - count) / (size_t) sched->n_copies) {
+            return;
+        }
+        count += (size_t) inputs * (size_t) sched->n_copies;
+    }
+    const size_t extra_copies = (size_t) sched->n_copies - 1;
+    if (extra_copies && (size_t) sched->n_graph_inputs > (SIZE_MAX - count) / extra_copies) {
+        return;
+    }
+    count += (size_t) sched->n_graph_inputs * extra_copies;
+    if (count > SIZE_MAX / sizeof(sched->copy_records[0])) {
+        return;
+    }
+    if (count > sched->copy_records_capacity) {
+        auto * records = (ggml_sched_copy_record *) malloc(count * sizeof(sched->copy_records[0]));
+        if (!records) {
+            return;
+        }
+        free(sched->copy_records);
+        sched->copy_records = records;
+        sched->copy_records_capacity = count;
+    }
+
+    size_t n = 0;
+    auto add_copy = [&](ggml_tensor * source, ggml_tensor * copy, ggml_tensor * dependency, int b, int c) {
+        if (!source || !copy || copy == source || n >= count) {
+            return false;
+        }
+        ggml_sched_copy_record & record = sched->copy_records[n++];
+        record = {};
+        record.source = source;
+        record.copy = copy;
+        record.dependency = dependency;
+        record.backend_id = b;
+        record.copy_id = c;
+        if (!copy->view_src && copy->buffer && copy->data && ggml_sched_layout_span(copy, &record.bytes)) {
+            record.alloc_size = ggml_backend_buft_get_alloc_size(sched->bufts[b], copy);
+            record.buffer = copy->buffer;
+            record.data = copy->data;
+            record.type = copy->type;
+            record.valid = true;
+        }
+        return true;
+    };
+
+    if (sched->graph.n_nodes < 0) {
+        return;
+    }
+    size_t node = 0;
+    const size_t graph_nodes = (size_t) sched->graph.n_nodes;
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const ggml_backend_sched_split & split = sched->splits[i];
+        const int b = split.backend_id;
+        if (b < 0 || b >= sched->n_backends || split.i_end < split.i_start) {
+            return;
+        }
+        for (int j = 0; j < split.n_inputs; ++j) {
+            ggml_tensor * input = split.inputs[j];
+            if (!input || node > graph_nodes || graph_nodes - node < 2) {
+                return;
+            }
+            const size_t id = ggml_hash_find(&sched->hash_set, input);
+            if (id == GGML_HASHSET_FULL || !ggml_bitset_get(sched->hash_set.used, id)) {
+                return;
+            }
+            ggml_tensor * dependency = sched->graph.nodes[node++];
+            ggml_tensor * active_copy = sched->graph.nodes[node++];
+            if (!dependency || dependency->src[0] != input || active_copy != tensor_id_copy(id, b, sched->cur_copy)) {
+                return;
+            }
+            for (int c = 0; c < sched->n_copies; ++c) {
+                if (!add_copy(input, tensor_id_copy(id, b, c), dependency, b, c)) {
+                    return;
+                }
+            }
+        }
+        const size_t split_nodes = (size_t) (split.i_end - split.i_start);
+        if (node > graph_nodes || split_nodes > graph_nodes - node) {
+            return;
+        }
+        node += split_nodes;
+    }
+    if (node != graph_nodes) {
+        return;
+    }
+    for (int i = 0; i < sched->n_graph_inputs; ++i) {
+        ggml_tensor * input = sched->graph_inputs[i];
+        if (!input) {
+            return;
+        }
+        const size_t id = ggml_hash_find(&sched->hash_set, input);
+        if (id == GGML_HASHSET_FULL || !ggml_bitset_get(sched->hash_set.used, id)) {
+            return;
+        }
+        const int b = sched->hv_tensor_backend_ids[id];
+        if (b < 0 || b >= sched->n_backends) {
+            return;
+        }
+        for (int c = 0; c < sched->n_copies; ++c) {
+            ggml_tensor * copy = tensor_id_copy(id, b, c);
+            if (c == sched->cur_copy) {
+                if (copy != input) {
+                    return;
+                }
+            } else if (!add_copy(input, copy, nullptr, b, c)) {
+                return;
+            }
+        }
+    }
+    if (n != count) {
+        return;
+    }
+    if (n > 1) {
+        std::sort(sched->copy_records, sched->copy_records + n,
+                [](const ggml_sched_copy_record & a, const ggml_sched_copy_record & b) {
+                    return std::less<const ggml_tensor *>()(a.source, b.source);
+                });
+    }
+    sched->n_copy_records = n;
+    sched->copy_envelopes_valid = true;
+}
+
+bool ggml_backend_sched_set_split_copy_tracking(ggml_backend_sched_t sched, bool enabled) {
+    if (!sched) {
+        return false;
+    }
+    if (sched->copy_tracking == enabled) {
+        return true;
+    }
+    if (sched->is_alloc) {
+        return false;
+    }
+    sched->copy_tracking = enabled;
+    sched->copy_envelopes_valid = false;
+    sched->n_copy_records = 0;
+    if (!enabled) {
+        free(sched->copy_records);
+        sched->copy_records = nullptr;
+        sched->copy_records_capacity = 0;
+    }
+    return true;
+}
+
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
@@ -2324,10 +2557,313 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
+    if (sched->copy_tracking) {
+        ggml_backend_sched_capture_copy_envelopes(sched);
+    }
 
     sched->is_alloc = true;
 
     return true;
+}
+
+bool ggml_backend_sched_get_tensor_plan_size(ggml_backend_sched_t sched,
+        const ggml_tensor * tensor, size_t * size) {
+    return sched && sched->is_alloc &&
+        ggml_gallocr_get_tensor_plan_size(sched->galloc, &sched->graph, tensor, size);
+}
+
+bool ggml_backend_sched_replan_graph(ggml_backend_sched_t sched,
+        ggml_tensor * const * tensors, const uint8_t * fixed, size_t count,
+        const ggml_backend_sched_tensor_layout * layouts, const size_t * view_offsets, size_t n_layouts) {
+    // Re-splitting a graph can free scheduler copies still referenced by its
+    // nodes. Only replan an already-placed host graph without such copies.
+    if (!sched || !sched->is_alloc || !tensors || !fixed || count == 0 ||
+            (n_layouts != 0 && (!layouts || !view_offsets)) || sched->n_backends != 1 ||
+            sched->n_splits != 1 || sched->n_copies != 1 ||
+            sched->splits[0].n_inputs != 0 || !ggml_backend_buft_is_host(sched->bufts[0])) return false;
+
+    std::unordered_map<const ggml_tensor *, size_t> all;
+    all.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        ggml_tensor * t = tensors[i];
+        if (!t || !all.emplace(t, i).second) return false;
+        if (fixed[i]) {
+            if (t->view_src || ggml_gallocr_owns_buffer(sched->galloc, t->buffer)) return false;
+            continue;
+        }
+        // An arena-owned constant is not refreshed after relocation. Refuse it
+        // rather than silently lose its contents; external fixed roots are safe.
+        if (!t->view_src && t->op == GGML_OP_NONE &&
+                !(t->flags & GGML_TENSOR_FLAG_INPUT)) return false;
+        if (t->extra != nullptr) return false;
+        if (!t->view_src && ((t->buffer && !ggml_gallocr_owns_buffer(sched->galloc, t->buffer)) ||
+                            (t->data && !t->buffer))) return false;
+        if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) return false;
+    }
+    // The list includes external roots as well as all graph-owned views. This
+    // prevents stale external views and stale pointers into a relocated arena.
+    auto covered = [&](const ggml_tensor * t) { return !t || all.count(t) != 0; };
+    for (size_t i = 0; i < count; ++i) if (!covered(tensors[i]->view_src)) return false;
+    for (int i = 0; i < sched->graph.n_leafs; ++i) {
+        if (!covered(sched->graph.leafs[i])) return false;
+    }
+    for (int i = 0; i < sched->graph.n_nodes; ++i) {
+        const ggml_tensor * node = sched->graph.nodes[i];
+        if (!covered(node) || !covered(node->view_src)) return false;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) if (!covered(node->src[j])) return false;
+    }
+
+    std::unordered_set<const ggml_tensor *> changed;
+    for (size_t i = 0; i < n_layouts; ++i) {
+        const ggml_tensor * t = layouts[i].tensor;
+        const auto found = all.find(t);
+        if (!t || found == all.end() || !changed.insert(t).second || fixed[found->second]) return false;
+    }
+
+    ggml_backend_sched_synchronize(sched);
+    // Keep the old allocation alive until the new plan is fully allocated.
+    // A failed attempt restores all live metadata and addresses.
+    std::vector<ggml_tensor> saved;
+    saved.reserve(count);
+    for (size_t i = 0; i < count; ++i) saved.push_back(*tensors[i]);
+    auto restore = [&]() {
+        for (size_t i = 0; i < count; ++i) *tensors[i] = saved[i];
+    };
+    for (size_t i = 0; i < n_layouts; ++i) {
+        ggml_tensor * t = layouts[i].tensor;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            t->ne[d] = layouts[i].ne[d];
+            t->nb[d] = layouts[i].nb[d];
+        }
+        t->view_offs = view_offsets[i];
+    }
+
+    // Check byte spans and ultimate roots before an allocator can initialize
+    // a view. A zero-size view may point at the end, but not beyond it.
+    auto span = [](const ggml_tensor * t, size_t & bytes) {
+        const int64_t block = ggml_blck_size(t->type);
+        if (block <= 0 || t->ne[0] < 0 || t->ne[0] % block) return false;
+        bool empty = false;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (t->ne[d] < 0) return false;
+            empty = empty || t->ne[d] == 0;
+        }
+        if (empty) { bytes = 0; return true; }
+        bytes = ggml_type_size(t->type);
+        size_t part;
+        if (__builtin_mul_overflow(size_t(t->ne[0] / block - 1), t->nb[0], &part) ||
+                __builtin_add_overflow(bytes, part, &bytes)) return false;
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            if (__builtin_mul_overflow(size_t(t->ne[d] - 1), t->nb[d], &part) ||
+                    __builtin_add_overflow(bytes, part, &bytes)) return false;
+        }
+        return true;
+    };
+    for (size_t i = 0; i < count; ++i) {
+        const ggml_tensor * t = tensors[i];
+        size_t bytes;
+        if (!span(t, bytes)) { restore(); return false; }
+        if (!t->view_src) {
+            if (t->view_offs != 0) { restore(); return false; }
+            continue;
+        }
+        size_t offset = 0, depth = 0;
+        const ggml_tensor * root = t;
+        while (root->view_src) {
+            if (++depth > count || __builtin_add_overflow(offset, root->view_offs, &offset)) {
+                restore(); return false;
+            }
+            root = root->view_src;
+        }
+        size_t root_bytes;
+        if (!span(root, root_bytes) || offset > root_bytes || bytes > root_bytes - offset) {
+            restore(); return false;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (!fixed[i]) {
+            tensors[i]->data = nullptr;
+            tensors[i]->buffer = nullptr;
+        }
+    }
+    ggml_gallocr_t next = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    if (!ggml_gallocr_reserve_n(next, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids) ||
+            !ggml_gallocr_alloc_graph(next, &sched->graph)) {
+        restore();
+        ggml_gallocr_free(next);
+        return false;
+    }
+    // A fixed root can have a host data pointer but no backend buffer. The
+    // graph allocator deliberately skips those views; restore their address.
+    for (size_t i = 0; i < count; ++i) {
+        ggml_tensor * t = tensors[i];
+        if (fixed[i] || !t->view_src || t->data) continue;
+        size_t offset = 0;
+        ggml_tensor * root = t;
+        while (root->view_src) {
+            offset += root->view_offs; // overflow was checked above
+            root = root->view_src;
+        }
+        if (root->data && !root->buffer) {
+            t->data = static_cast<char *>(root->data) + offset;
+        } else if (ggml_nbytes(t) != 0) {
+            restore();
+            ggml_gallocr_free(next);
+            return false;
+        }
+    }
+    ggml_gallocr_t old = sched->galloc;
+    sched->galloc = next;
+    sched->copy_envelopes_valid = false;
+    if (sched->copy_tracking) ggml_backend_sched_capture_copy_envelopes(sched);
+    ggml_backend_sched_invalidate_graph_cache(sched);
+    ggml_gallocr_free(old);
+    return true;
+}
+
+void ggml_backend_sched_invalidate_graph_cache(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    // Backend executables (CUDA/HIP graph captures, meta subgraphs) key their
+    // cache on the split graph uid. A fresh uid makes the next compute
+    // re-check the node and source properties, which is the only way a
+    // metadata-only patch of the live tensors becomes visible to them.
+    for (int i = 0; i < sched->n_splits; ++i) {
+        sched->splits[i].graph.uid = ggml_graph_next_uid();
+    }
+}
+
+bool ggml_backend_sched_tensor_has_split_copy(ggml_backend_sched_t sched, const struct ggml_tensor * tensor) {
+    GGML_ASSERT(sched);
+    if (tensor == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const ggml_backend_sched_split & split = sched->splits[i];
+        for (int j = 0; j < split.n_inputs; ++j) {
+            if (split.inputs[j] == tensor) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static size_t ggml_sched_copy_lower_bound(ggml_backend_sched_t sched, const ggml_tensor * source) {
+    size_t first = 0;
+    size_t count = sched->n_copy_records;
+    while (count) {
+        const size_t step = count / 2;
+        const size_t middle = first + step;
+        if (std::less<const ggml_tensor *>()(sched->copy_records[middle].source, source)) {
+            first = middle + 1;
+            count -= step + 1;
+        } else {
+            count = step;
+        }
+    }
+    return first;
+}
+
+bool ggml_backend_sched_is_tensor_copy(ggml_backend_sched_t sched, const ggml_tensor * original, const ggml_tensor * candidate) {
+    if (!sched || !sched->is_alloc || !sched->copy_tracking || !sched->copy_envelopes_valid ||
+            !original || !candidate || original == candidate) {
+        return false;
+    }
+    for (size_t i = ggml_sched_copy_lower_bound(sched, original);
+            i < sched->n_copy_records && sched->copy_records[i].source == original; ++i) {
+        const ggml_sched_copy_record & record = sched->copy_records[i];
+        if (record.copy_id == sched->cur_copy && record.copy == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ggml_backend_sched_update_split_copies(ggml_backend_sched_t sched,
+        const ggml_backend_sched_tensor_layout * layouts, size_t n_layouts, bool apply) {
+    if (!sched || !sched->is_alloc || !sched->copy_tracking || !sched->copy_envelopes_valid ||
+            (n_layouts && !layouts)) {
+        return false;
+    }
+
+    // Validate the complete transaction before changing any copy or view.
+    for (size_t i = 0; i < n_layouts; ++i) {
+        const ggml_backend_sched_tensor_layout & layout = layouts[i];
+        if (!layout.tensor) {
+            return false;
+        }
+        const size_t first = ggml_sched_copy_lower_bound(sched, layout.tensor);
+        if (first == sched->n_copy_records || sched->copy_records[first].source != layout.tensor) {
+            continue;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (layout.tensor == layouts[j].tensor) {
+                return false;
+            }
+        }
+        const size_t id = ggml_hash_find(&sched->hash_set, layout.tensor);
+        if (id == GGML_HASHSET_FULL || !ggml_bitset_get(sched->hash_set.used, id)) {
+            return false;
+        }
+        ggml_tensor proposed = *layout.tensor;
+        memcpy(proposed.ne, layout.ne, sizeof(proposed.ne));
+        memcpy(proposed.nb, layout.nb, sizeof(proposed.nb));
+        size_t bytes;
+        if (!ggml_sched_layout_span(&proposed, &bytes)) {
+            return false;
+        }
+        for (size_t j = first; j < sched->n_copy_records && sched->copy_records[j].source == layout.tensor; ++j) {
+            const ggml_sched_copy_record & record = sched->copy_records[j];
+            ggml_tensor * copy = record.copy;
+            if (!record.valid || tensor_id_copy(id, record.backend_id, record.copy_id) != copy ||
+                    (record.dependency && record.dependency->src[0] != layout.tensor) ||
+                    copy->view_src || copy->buffer != record.buffer || copy->data != record.data ||
+                    copy->type != record.type || !ggml_are_same_layout(layout.tensor, copy) || bytes > record.bytes) {
+                return false;
+            }
+            ggml_tensor copy_proposed = *copy;
+            memcpy(copy_proposed.ne, layout.ne, sizeof(copy_proposed.ne));
+            memcpy(copy_proposed.nb, layout.nb, sizeof(copy_proposed.nb));
+            if (ggml_backend_buft_get_alloc_size(sched->bufts[record.backend_id], &copy_proposed) > record.alloc_size) {
+                return false;
+            }
+        }
+    }
+    if (!apply) {
+        return true;
+    }
+
+    for (size_t i = 0; i < n_layouts; ++i) {
+        const ggml_backend_sched_tensor_layout & layout = layouts[i];
+        for (size_t j = ggml_sched_copy_lower_bound(sched, layout.tensor);
+                j < sched->n_copy_records && sched->copy_records[j].source == layout.tensor; ++j) {
+            ggml_tensor * copy = sched->copy_records[j].copy;
+            memcpy(copy->ne, layout.ne, sizeof(copy->ne));
+            memcpy(copy->nb, layout.nb, sizeof(copy->nb));
+        }
+    }
+    ggml_backend_sched_invalidate_graph_cache(sched);
+    return true;
+}
+
+void ggml_backend_sched_refresh_split_copy_views(ggml_backend_sched_t sched) {
+    if (!sched || !sched->is_alloc || !sched->copy_tracking || !sched->copy_envelopes_valid) {
+        return;
+    }
+    for (size_t i = 0; i < sched->n_copy_records; ++i) {
+        const ggml_sched_copy_record & record = sched->copy_records[i];
+        if (!record.dependency || record.copy_id != sched->cur_copy) {
+            continue;
+        }
+        ggml_tensor * input = record.source;
+        ggml_tensor * dep = record.dependency;
+        memcpy(dep->ne, input->ne, sizeof(dep->ne));
+        memcpy(dep->nb, input->nb, sizeof(dep->nb));
+        dep->view_src = input->view_src ? input->view_src : input;
+        dep->view_offs = input->view_src ? input->view_offs : 0;
+        dep->data = input->data;
+        dep->buffer = dep->view_src->buffer;
+    }
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {

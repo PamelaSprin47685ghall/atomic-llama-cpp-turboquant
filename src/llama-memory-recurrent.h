@@ -196,7 +196,35 @@ public:
     uint32_t get_n_rs() const;
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
+    // number of rollback snapshots per sequence the state tensors are widened
+    // by (1 + n_rs_seq row groups). The rs_z runtime lane is only valid at 0:
+    // see build_rs() and llama-context.cpp (graph_params).
+    uint32_t get_n_rs_seq() const;
     uint32_t get_size() const;
+
+    // The ROW of the state tensor that the rs_z zero row must clear, for the
+    // cells of `seq_id` in the current ubatch: rs_idx[seq_id]*size + rs_z.
+    //
+    // Why a row and not the cell: s_copy() returns idx*size + src0, so the
+    // gathers in build_rs() read that row, not cell rs_z, whenever the
+    // sequence has a pending rollback (rs_idx > 0). Clearing cell rs_z would
+    // then clear a row nobody reads. rs_z is a CELL index in [0, size),
+    // never a group base (llama-memory-recurrent.cpp, apply()).
+    //
+    // Read-only: this function does NOT consume rs_idx. s_copy() is the one
+    // consumer (it resets rs_idx[seq] to 0 on read); callers must not reorder
+    // the two. Returns -1 when there is no zero row (rs_z < 0), which the
+    // zero-row op treats as a no-op.
+    int32_t get_rs_zero_row(llama_seq_id seq_id) const;
+
+    // union-graph runtime binder: build-scoped state envelope override.
+    // While armed, the graph under construction sees the full recurrent state
+    // envelope (n_rs = size, head = 0, rs_z = 0), so every live length/row can
+    // be bound in place afterwards without crossing an allocation. Only ever
+    // armed around model.build_graph() by llama_context; the RAII guard is the
+    // only writer.
+    void nrs_envelope_begin(uint32_t n_rs, uint32_t head, int32_t rs_z) const;
+    void nrs_envelope_end() const;
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
@@ -209,6 +237,12 @@ public:
     // DRC phase 2: pending replay length for the (single, in the n_seq_max==1 case) sequence
     // in the current ubatch, or 0 if none. Used by can_reuse() and the graph builder.
     uint32_t get_replay_len() const;
+
+    // true when this cache uses ingredient replay (rollback-group state views
+    // whose shapes depend on the pending replay length). The union binder
+    // fails closed for this mode; the K-snapshot rollback path (gdn_replay
+    // false with n_rs_seq > 0) is shape-stable and supported.
+    bool gdn_replay() const;
 
     // DRC phase 2: mark the pending replay as consumed. Called exactly once per decode, after the
     // graph has been built (every GDN layer reads get_replay_len() during build). Mirrors
@@ -232,4 +266,11 @@ private:
     //
 
     const bool is_full = false;
+
+    // build-scoped envelope override for the union-graph runtime binder;
+    // false = stock. mutable: armed/cleared through const graph-build paths.
+    mutable bool     nrs_build_override = false;
+    mutable uint32_t nrs_build_n_rs = 0;
+    mutable uint32_t nrs_build_head = 0;
+    mutable int32_t  nrs_build_rs_z = 0;
 };
