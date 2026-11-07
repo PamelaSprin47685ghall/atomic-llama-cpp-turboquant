@@ -6,6 +6,8 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -120,6 +122,24 @@ public:
     };
 
     using slot_info_vec_t = std::vector<slot_info>;
+
+    // one reusable snapshot of the cache state that prepare_into() restores
+    // when the batch cannot be placed. the pool hands these out per ubatch
+    struct snapshot_slot {
+        slot_info sinfo; // slot info for the ubatch
+
+        std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
+
+        std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+    };
+
+    // decode-time buffers reused by one batch context. the context returns
+    // them when it dies, so the next decode finds the capacity still there
+    struct decode_scratch {
+        slot_info_vec_t sinfos;
+        std::vector<llama_ubatch> ubatches;
+        bool in_use = false;
+    };
 
     // TODO: refactor the memory instances to not depend on `llama_model`
     //       instead pass all necessary info (e.g. hparams, dev layers, arch, etc.) directly
@@ -290,12 +310,23 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
+    // the decode scratch of this cache, or nullptr when another batch context
+    // still holds it
+    decode_scratch * scratch_acquire();
+
+    // take the vectors back into the scratch and mark it free again
+    void scratch_return(slot_info_vec_t & sinfos, std::vector<llama_ubatch> & ubatches, decode_scratch * scratch);
+
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
+
+    // same search, but fills out in place so that the vectors it already holds
+    // keep their capacity. out.idxs is empty on failure
+    bool find_slot(const llama_ubatch & ubatch, bool cont, slot_info & out) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
@@ -395,6 +426,13 @@ private:
     const llama_model & model;
     const llama_hparams & hparams;
 
+    // the pre-pool implementation of prepare(), kept as the flag-off path
+    slot_info_vec_t prepare_reference(const std::vector<llama_ubatch> & ubatches);
+
+    // pooled prepare: writes the slot infos into res and reuses the capacity
+    // that res already holds. returns false on failure
+    bool prepare_into(const std::vector<llama_ubatch> & ubatches, slot_info_vec_t & res);
+
     struct kv_layer {
         // layer index in the model
         // note: can be different from the layer index in the KV cache
@@ -484,6 +522,63 @@ private:
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
 
+    // fixed-slot pool of prepare snapshots. the pool allocates every slot once
+    // and hands the same slots out again on later decodes
+    class snapshot_pool {
+    public:
+        // nullptr when the pool has no free slot
+        snapshot_slot * acquire() {
+            std::lock_guard<std::mutex> lock(mutex);
+
+            if (free.empty()) {
+                ++fallback;
+                return nullptr;
+            }
+
+            snapshot_slot * slot = free.back();
+            free.pop_back();
+
+            ++acquired;
+
+            return slot;
+        }
+
+        void release(snapshot_slot * slot) {
+            std::lock_guard<std::mutex> lock(mutex);
+
+            free.push_back(slot);
+
+            ++released;
+        }
+
+        // add slots until the pool holds n of them. a later call never shrinks it
+        void reserve(size_t n) {
+            std::lock_guard<std::mutex> lock(mutex);
+
+            for (size_t i = storage.size(); i < n; ++i) {
+                storage.push_back(std::make_unique<snapshot_slot>());
+                free.push_back(storage.back().get());
+            }
+        }
+
+    private:
+        std::mutex mutex;
+
+        std::vector<std::unique_ptr<snapshot_slot>> storage;
+        std::vector<snapshot_slot *> free;
+
+        uint64_t acquired = 0;
+        uint64_t released = 0;
+        uint64_t fallback = 0;
+    };
+
+    // reusable snapshots for prepare_into()
+    snapshot_pool snapshots;
+
+    // decode-time buffers reused by the current batch context
+    decode_scratch decode_scratch_;
+    std::mutex decode_scratch_mutex;
+
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
 
@@ -548,6 +643,7 @@ public:
     // some shorthands
     using slot_info_vec_t  = llama_kv_cache::slot_info_vec_t;
     using stream_copy_info = llama_kv_cache::stream_copy_info;
+    using decode_scratch   = llama_kv_cache::decode_scratch;
 
     // used for errors
     llama_kv_cache_context(llama_memory_status status);
@@ -568,6 +664,9 @@ public:
             llama_kv_cache * kv,
             slot_info_vec_t sinfos,
             std::vector<llama_ubatch> ubatches);
+
+    // returns the decode scratch, when the context holds one
+    ~llama_kv_cache_context() override;
 
     //
     // llama_memory_context_i
@@ -749,6 +848,9 @@ public:
     void prefab_set_input_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch, uint32_t n_env, int64_t scratch) const;
     void prefab_set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_env) const;
 
+    // attach the decode scratch that this context returns when it dies
+    void set_decode_scratch(decode_scratch * scratch);
+
 private:
     llama_memory_status status;
 
@@ -773,6 +875,10 @@ private:
     slot_info_vec_t sinfos;
 
     std::vector<llama_ubatch> ubatches;
+
+    // set by set_decode_scratch(): the scratch that sinfos and ubatches came
+    // from, and the one that takes them back on destruction
+    decode_scratch * scratch_ = nullptr;
 
     //
     // data needed for building the compute graph for the current ubatch:

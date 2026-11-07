@@ -7,6 +7,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-tp5-flags.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1203,10 +1204,53 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             bool embd_all) {
     GGML_UNUSED(embd_all);
 
+    if (!tp5::flag_exact_one("TP5_KV_SNAPSHOT_POOL")) {
+        do {
+            balloc.split_reset();
+
+            std::vector<llama_ubatch> ubatches;
+            while (true) {
+                auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+
+                if (ubatch.n_tokens == 0) {
+                    break;
+                }
+
+                ubatches.push_back(std::move(ubatch)); // NOLINT
+            }
+
+            if (balloc.get_n_used() < balloc.get_n_tokens()) {
+                // failed to find a suitable split
+                break;
+            }
+
+            auto sinfos = prepare(ubatches);
+            if (sinfos.empty()) {
+                break;
+            }
+
+            return std::make_unique<llama_kv_cache_context>(
+                    this, std::move(sinfos), std::move(ubatches));
+        } while (false);
+
+        return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
+    // pooled path: the split and the prepared slot infos live in the decode
+    // scratch and return to it when the batch context dies
     do {
         balloc.split_reset();
 
-        std::vector<llama_ubatch> ubatches;
+        decode_scratch * scratch = scratch_acquire();
+
+        slot_info_vec_t           sinfos_local;
+        std::vector<llama_ubatch> ubatches_local;
+
+        slot_info_vec_t &           sinfos   = scratch != nullptr ? scratch->sinfos   : sinfos_local;
+        std::vector<llama_ubatch> & ubatches = scratch != nullptr ? scratch->ubatches : ubatches_local;
+
+        ubatches.clear();
+
         while (true) {
             auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
 
@@ -1219,16 +1263,21 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         if (balloc.get_n_used() < balloc.get_n_tokens()) {
             // failed to find a suitable split
+            scratch_return(sinfos, ubatches, scratch);
             break;
         }
 
-        auto sinfos = prepare(ubatches);
-        if (sinfos.empty()) {
+        if (!prepare_into(ubatches, sinfos)) {
+            scratch_return(sinfos, ubatches, scratch);
             break;
         }
 
-        return std::make_unique<llama_kv_cache_context>(
+        auto ctx = std::make_unique<llama_kv_cache_context>(
                 this, std::move(sinfos), std::move(ubatches));
+
+        ctx->set_decode_scratch(scratch);
+
+        return ctx;
     } while (false);
 
     return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -1247,6 +1296,22 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    if (!tp5::flag_exact_one("TP5_KV_SNAPSHOT_POOL")) {
+        return prepare_reference(ubatches);
+    }
+
+    slot_info_vec_t res;
+
+    if (!prepare_into(ubatches, res)) {
+        return {};
+    }
+
+    return res;
+}
+
+// the pre-pool implementation of prepare(). the TP5_KV_SNAPSHOT_POOL flag
+// keeps this path byte-for-byte identical to the code before the pool
+llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_reference(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
 
     struct state_t {
@@ -1310,6 +1375,141 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     }
 
     return res;
+}
+
+// pooled prepare: the same search, apply and restore order as
+// prepare_reference(), with the recovery snapshots taken from the pool
+bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, slot_info_vec_t & res) {
+    // the reference path returns an empty vector for an empty batch, which
+    // every caller treats as a failed prepare
+    if (ubatches.empty()) {
+        res.clear();
+        return false;
+    }
+
+    // the pool grows to the largest batch seen so far and never shrinks
+    snapshots.reserve(ubatches.size());
+
+    // release every acquired slot on all return paths
+    struct slot_guard {
+        explicit slot_guard(snapshot_pool & pool) : pool(pool) {}
+
+        ~slot_guard() {
+            for (snapshot_slot * slot : pooled) {
+                pool.release(slot);
+            }
+        }
+
+        snapshot_pool & pool;
+
+        std::vector<snapshot_slot *> pooled;
+        std::vector<std::unique_ptr<snapshot_slot>> fallback;
+    } guard(snapshots);
+
+    // keep the elements that res already holds: their inner vectors keep their capacity
+    res.resize(ubatches.size());
+
+    std::vector<snapshot_slot *> states;
+
+    bool success = true;
+
+    for (size_t i = 0; i < ubatches.size(); ++i) {
+        const auto & ubatch = ubatches[i];
+
+        snapshot_slot * st = snapshots.acquire();
+
+        if (st == nullptr) {
+            // the pool is exhausted: use a heap snapshot that dies with the guard
+            guard.fallback.push_back(std::make_unique<snapshot_slot>());
+            st = guard.fallback.back().get();
+        } else {
+            guard.pooled.push_back(st);
+        }
+
+        // only find a suitable slot for the ubatch. don't modify the cells yet
+        if (!find_slot(ubatch, false, st->sinfo)) {
+            success = false;
+            break;
+        }
+
+        // remember the position that we found
+        res[i] = st->sinfo;
+
+        // store the old state of the cells in the recovery stack
+        st->v_heads_old = v_heads;
+
+        st->v_cells.resize(n_stream);
+
+        for (uint32_t s = 0; s < st->sinfo.n_stream(); ++s) {
+            auto & cells = v_cells[st->sinfo.strm[s]];
+
+            cells.cp_into(st->sinfo.idxs[s], st->v_cells[s]);
+        }
+
+        states.push_back(st);
+
+        // now emplace the ubatch
+        apply_ubatch(st->sinfo, ubatch);
+    }
+
+    GGML_ASSERT(!states.empty() || !success);
+
+    // iterate backwards and restore the cells to their original state
+    for (auto it = states.rbegin(); it != states.rend(); ++it) {
+        const auto & sinfo = (*it)->sinfo;
+
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            auto & cells = v_cells[sinfo.strm[s]];
+            auto & head  = v_heads[sinfo.strm[s]];
+
+            cells.set(sinfo.idxs[s], (*it)->v_cells[s]);
+            head = (*it)->v_heads_old[s];
+        }
+    }
+
+    if (!success) {
+        return false;
+    }
+
+    return true;
+}
+
+llama_kv_cache::decode_scratch * llama_kv_cache::scratch_acquire() {
+    std::lock_guard<std::mutex> lock(decode_scratch_mutex);
+
+    if (decode_scratch_.in_use) {
+        return nullptr;
+    }
+
+    decode_scratch_.in_use = true;
+
+    return &decode_scratch_;
+}
+
+void llama_kv_cache::scratch_return(
+        slot_info_vec_t & sinfos,
+        std::vector<llama_ubatch> & ubatches,
+        decode_scratch * scratch) {
+    if (scratch == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(decode_scratch_mutex);
+
+    // the vectors may already be the scratch members, for example when
+    // prepare_into() failed. swap only when they are different objects
+    if (&scratch->sinfos != &sinfos) {
+        scratch->sinfos.swap(sinfos);
+    }
+
+    if (&scratch->ubatches != &ubatches) {
+        scratch->ubatches.swap(ubatches);
+    }
+
+    // drop the ubatches: this releases their payload slots
+    scratch->ubatches.clear();
+
+    scratch->in_use = false;
 }
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
@@ -1397,7 +1597,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     return updated;
 }
 
-llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+bool llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont, slot_info & out) const {
 
     if (debug > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
@@ -1475,14 +1675,10 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         n_tokens = n_tokens / n_seqs;
     }
 
-    slot_info res = {
-        /*.s0   =*/ LLAMA_MAX_SEQ,
-        /*.s1   =*/ 0,
-        /*.strm =*/ { },
-        /*.idxs =*/ { },
-    };
+    out.s0 = LLAMA_MAX_SEQ;
+    out.s1 = 0;
 
-    res.resize(n_seqs);
+    out.resize(n_seqs);
 
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const auto seq_id = ubatch.seq_id_unq[s];
@@ -1492,11 +1688,12 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             GGML_ASSERT(ubatch.seq_id  [s*n_tokens][0] == seq_id);
         }
 
-        res.s0 = std::min<uint32_t>(res.s0, seq_to_stream[seq_id]);
-        res.s1 = std::max<uint32_t>(res.s1, seq_to_stream[seq_id]);
+        out.s0 = std::min<uint32_t>(out.s0, seq_to_stream[seq_id]);
+        out.s1 = std::max<uint32_t>(out.s1, seq_to_stream[seq_id]);
 
-        res.strm[s] = seq_to_stream[seq_id];
-        res.idxs[s].reserve(n_tokens);
+        out.strm[s] = seq_to_stream[seq_id];
+        out.idxs[s].clear();
+        out.idxs[s].reserve(n_tokens);
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
@@ -1510,7 +1707,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         if (n_tokens > cells.size()) {
             LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
-            return { };
+            out.idxs.clear();
+            return false;
         }
 
         uint32_t n_tested = 0;
@@ -1528,7 +1726,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
             for (uint32_t i = 0; i < n_test; i++) {
                 // the token this cell would hold
-                const uint32_t i_tok = s*n_tokens + (uint32_t) res.idxs[s].size() + i;
+                const uint32_t i_tok = s*n_tokens + (uint32_t) out.idxs[s].size() + i;
 
                 // unified: a position has one K/V slot. A token whose position
                 // is already in the stream shares that cell instead of taking
@@ -1539,7 +1737,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     const int64_t reuse = cells.find_cell_by_pos(ubatch.pos[i_tok]);
 
                     if (reuse >= 0) {
-                        res.idxs[s].push_back((uint32_t) reuse);
+                        out.idxs[s].push_back((uint32_t) reuse);
                         continue;
                     }
                 }
@@ -1577,7 +1775,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 }
 
                 if (can_use) {
-                    res.idxs[s].push_back(idx);
+                    out.idxs[s].push_back(idx);
                 } else {
                     if (cont) {
                         break;
@@ -1585,27 +1783,39 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 }
             }
 
-            if (res.idxs[s].size() == n_tokens) {
+            if (out.idxs[s].size() == n_tokens) {
                 break;
             }
 
             if (cont) {
-                res.idxs[s].clear();
+                out.idxs[s].clear();
             }
 
             if (n_tested >= cells.size()) {
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
-                return { };
+                out.idxs.clear();
+                return false;
             }
         }
 
         // we didn't find a suitable slot - return empty result
-        if (res.idxs[s].size() < n_tokens) {
-            return { };
+        if (out.idxs[s].size() < n_tokens) {
+            out.idxs.clear();
+            return false;
         }
     }
 
-    assert(res.s1 >= res.s0);
+    assert(out.s1 >= out.s0);
+
+    return true;
+}
+
+llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+    slot_info res = {};
+
+    if (!find_slot(ubatch, cont, res)) {
+        return {};
+    }
 
     return res;
 }
@@ -4114,6 +4324,19 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+}
+
+llama_kv_cache_context::~llama_kv_cache_context() {
+    // give the decode buffers back while sinfos and ubatches are still alive
+    if (scratch_ != nullptr && kv != nullptr) {
+        kv->scratch_return(sinfos, ubatches, scratch_);
+    }
+
+    scratch_ = nullptr;
+}
+
+void llama_kv_cache_context::set_decode_scratch(llama_kv_cache::decode_scratch * scratch) {
+    scratch_ = scratch;
 }
 
 // union-graph runtime nkv binder: the build-scoped n_kv override is a
