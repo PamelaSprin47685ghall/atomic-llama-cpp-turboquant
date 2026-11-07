@@ -525,13 +525,11 @@ struct ggml_gallocr {
 
 // The M3 retention witness is armed by GGML_M3_ALLOC_WITNESS=1, read once per
 // gallocr (not per node) and cached on the object, so the disabled path costs one
-// bool test and writes nothing.
+// bool test and writes nothing.  This translation unit is C, so the read is a
+// plain getenv at construction; the result still lives on the instance.
 static bool m3_witness_armed(void) {
-    static const bool on = [] {
-        const char * v = std::getenv("GGML_M3_ALLOC_WITNESS");
-        return v != nullptr && v[0] == '1' && v[1] == '\0';
-    }();
-    return on;
+    const char * v = getenv("GGML_M3_ALLOC_WITNESS");
+    return v != NULL && v[0] == '1' && v[1] == '\0';
 }
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {

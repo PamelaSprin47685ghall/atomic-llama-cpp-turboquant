@@ -494,7 +494,7 @@ struct qwen4exp_hc_mix_probe {
     static void hc_mix_built(int il, bool mixer_site, const ggml_tensor * lo,
                              const ggml_tensor * xn, const ggml_tensor * mixed, int64_t nt) {
         if (tail_diag()) {
-            GGML_LOG_INFO("M3_TAIL_BUILD row_scope=%s il=%d nt=%lld lo=%s ret=%d xn=%s ret=%d mixed=%s\n",
+            LLAMA_LOG_INFO("M3_TAIL_BUILD row_scope=%s il=%d nt=%lld lo=%s ret=%d xn=%s ret=%d mixed=%s\n",
                     mixer_site ? "mixer" : "trunk", il, (long long) nt,
                     lo ? lo->name : "-", lo && (lo->flags & GGML_TENSOR_FLAG_NO_REUSE) ? 1 : 0,
                     xn ? xn->name : "-", xn && (xn->flags & GGML_TENSOR_FLAG_NO_REUSE) ? 1 : 0,
@@ -532,7 +532,7 @@ struct qwen4exp_hc_mix_probe {
         if (!tail_why()) {
             return;
         }
-        GGML_LOG_INFO("M3_TAIL_WHY il=%d why=%d\n", il, why);
+        LLAMA_LOG_INFO("M3_TAIL_WHY il=%d why=%d\n", il, why);
     }
 };
 
