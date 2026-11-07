@@ -41,6 +41,7 @@ public:
     // Flush unmatched text and incomplete UTF-8. Repeated finish emits no text.
     stream_delta finish();
     // Same as push(), but append the text to out and return no text.
+    // bytes must not refer into out.
     stream_event push_into(std::string_view bytes, std::string & out);
     // Same as finish(), but append the text to out and return no text.
     stream_event finish_into(std::string & out);
