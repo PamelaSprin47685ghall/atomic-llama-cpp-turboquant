@@ -1,0 +1,41 @@
+{
+  "created_utc": "2026-10-27T05:42:05.688033+00:00",
+  "steps": [
+    {
+      "step": "compile-meta",
+      "returncode": 0,
+      "seconds": 7.16832366597373
+    },
+    {
+      "step": "link-base",
+      "returncode": 0,
+      "seconds": 0.06680435402086005
+    },
+    {
+      "step": "compile",
+      "returncode": 0,
+      "seconds": 5.6525588590302505
+    },
+    {
+      "step": "archive-complete",
+      "returncode": 0,
+      "seconds": 0.0031829540384933352
+    },
+    {
+      "step": "link",
+      "returncode": 0,
+      "seconds": 0.7918603380094282
+    }
+  ],
+  "binary_sha256": "331a0ae92185b6bb851ed9f4e6b109a978a48ff2b01cd3ff4257ab970993b6c5",
+  "runtime_sha256": "86acb16fff12eb9c21ecc499f29b4156777c893618079a00ed1f32f580f30c95",
+  "meta_sha256": "e744a6dc582b24f76c1d483a7edfd5fb69b69a67f3b8175d64129759736e4109",
+  "libraries": {
+    "libggml-cpu.so.0.18.1": "e06514a581585f7c36d427d818a3a4f333878f409196c14ceb62ca765d846eb8",
+    "libggml.so.0.18.1": "2eb6dec13330ccf26abe17e0a6ef5741d160016e8ee9705d9b0abc6d14541151",
+    "libggml-hip.so.0.18.1": "202a55b5ff180ad6f3c3e4f09b16c5b053c651d77d851a470d809b0e7258ddb2",
+    "libllama.so.0.0.2451": "bc534172a948a633112b521d1d05df143d6a5074d29305488d1dd828b65302c2",
+    "libggml-base.so.0.18.1": "d9c159304be80bc2e3e59cd80f149cd8dbaed805dca482ff141c4e0f368c1663"
+  },
+  "incremental_scope": "runtime+Meta only; unchanged exact-Q2 HIP and KV-only llama libraries"
+}

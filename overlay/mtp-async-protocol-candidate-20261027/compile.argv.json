@@ -1,0 +1,29 @@
+{
+  "argv": [
+    "/usr/bin/c++",
+    "-I/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/headers/src",
+    "-ffile-prefix-map=/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/runtime.cpp=/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-catchup-candidate-20261024/runtime.cpp",
+    "-ffile-prefix-map=/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/headers=/home/kunweiz/atomic-llama-cpp-turboquant",
+    "-I/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/headers/fork/tp5-compose/include",
+    "-isystem",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/headers/build-tp5-dual50-20261022/hc-router-owner-a-install/include",
+    "-isystem",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/headers/build-tp5-swift-20261020/install/include",
+    "-isystem",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/headers/build-tp5-gap-repair-20261021/finite-greedy-sampling-install/include",
+    "-O3",
+    "-DNDEBUG",
+    "-fno-fast-math",
+    "-ffp-contract=off",
+    "-iquote",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/headers/fork/tp5-compose/src",
+    "-MD",
+    "-MF",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/runtime.d",
+    "-c",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/runtime.cpp",
+    "-o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/runtime.cpp.o"
+  ],
+  "cwd": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027"
+}

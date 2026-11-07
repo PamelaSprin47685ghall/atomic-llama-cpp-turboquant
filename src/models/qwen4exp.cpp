@@ -2,9 +2,12 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -63,6 +66,82 @@ static bool qwen4exp_hc_keep_lo_enabled() {
         return value != nullptr && std::atoi(value) != 0;
     }();
     return enabled;
+}
+
+// Strict opt-in gate: only the literal value "1" enables an experiment, so
+// unset, "", "0", "01", " 1", "true" and every other spelling stay off.
+static bool qwen4exp_env_is_1(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+// Diagnostic scope for the M3 N-row tail retention.  This knob NEVER enables
+// retention: the production gate below stays exact "1", every other value off.
+// The diagnostic exists only to measure the two mechanisms apart, and is
+// default off:
+//   unset / "" / anything else -> both scopes off
+//   "trunk"                    -> lo retention at trunk sites only
+//   "mixer"                    -> lo + xn retention at mixer sites only
+// A diagnostic leg is not a candidate leg: it is never a promotion input, it is
+// listed as its own knob in every receipt, and the complete coverage is the
+// production gate "1" (trunk and mixer) with both scopes off.
+enum qwen4exp_hc_n3_diag_scope {
+    QWEN4EXP_HC_N3_DIAG_NONE  = 0,
+    QWEN4EXP_HC_N3_DIAG_TRUNK = 1 << 0,
+    QWEN4EXP_HC_N3_DIAG_MIXER = 1 << 1,
+};
+
+static int qwen4exp_hc_n3_diag_scope() {
+    const char * value = std::getenv("GGML_TP5_HC_N3_TAIL_DIAG_SCOPE");
+    if (value == nullptr) {
+        return QWEN4EXP_HC_N3_DIAG_NONE;
+    }
+    if (std::strcmp(value, "trunk") == 0) {
+        return QWEN4EXP_HC_N3_DIAG_TRUNK;
+    }
+    if (std::strcmp(value, "mixer") == 0) {
+        return QWEN4EXP_HC_N3_DIAG_MIXER;
+    }
+    // Off matrix: "" , "0", "true", "01", every other spelling -> OFF.
+    return QWEN4EXP_HC_N3_DIAG_NONE;
+}
+
+// The production gate: exact "1" only.  Unset, "", "0", "01", "true", " 1" and
+// every other spelling are OFF, so adding the diagnostic knob cannot change the
+// behaviour of any existing leg or of the promotion path.
+static bool qwen4exp_hc_n3_tail_keep_enabled() {
+    static const bool enabled = qwen4exp_env_is_1("GGML_TP5_HC_N3_TAIL_KEEP") &&
+            qwen4exp_env_is_1("GGML_TP5_HC_N3_TRIO");
+    return enabled;
+}
+
+// The HIP trio's fused tail (hc_owner_tail4_rows) reads every lo element from all
+// output CTAs while it writes the hc_mixed scale, so out and lo must not share
+// storage.  galloc frees lo right after its last ordinary consumer (up) for
+// nt = 2..4, and the hc_mixed chain then lands in that freed range; the backend
+// guard (ggml-cuda.cu hc_owner_tail4_rows, untouched and fail-closed) vetoes, so
+// the tail silently falls back to the generic twelve-node chain.  Retaining lo's
+// allocation keeps its storage out of the free list for the rest of the graph,
+// which is exactly the independent storage the fused tail needs.  This is an
+// allocator-only lifetime contract (GGML_TENSOR_FLAG_NO_REUSE): no node is
+// added, no value changes, lo stays an external input of the fused subgraph so
+// ggml_can_fuse_subgraph is unaffected, and Meta's HC owner/late-join plan keys
+// on GGML_TENSOR_FLAG_OUTPUT only, so it keeps its previous decisions.
+
+// Retain the storage owner of xn for the same reason.  A view cannot be
+// retained, and galloc frees a view's owner once the last view loses its last
+// consumer, so the flag belongs on the base tensor.  Only mixer sites (no
+// inject projection) need it: everywhere else xn outlives the tail because the
+// inject projection still reads it.  Returns false when the base tensor is not
+// the shape the HIP guard accepts, so the caller can fall back instead of
+// taking the retention policy on faith.
+static bool qwen4exp_hc_n3_retain_xn(ggml_tensor * xn, int64_t hc_dim, int64_t nt) {
+    ggml_tensor * base = xn->view_src != nullptr ? xn->view_src : xn;
+    if (base->type != GGML_TYPE_F32 || ggml_nelements(base) != hc_dim * nt || !ggml_is_contiguous(base)) {
+        return false;
+    }
+    base->flags |= GGML_TENSOR_FLAG_NO_REUSE;
+    return true;
 }
 
 // Keep the two existing top-k outputs alive for the fused expert reduction.
@@ -381,6 +460,19 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+// M3 N-row owner-tail device diagnostics.  Not part of the model definition and
+// not part of any promotion path.  Default off; three independent switches:
+//   M3_TAIL_DIAG=1     one log line per HC site built: scope, il, nt, and whether
+//                      the production gate retained lo / xn (read back from the
+//                      tensors, so it is a witness, not a restatement of the branch)
+//   M3_TAIL_WHY=1      one log line per tail site the fused path could not take
+//   M3TAIL_STAMP=1     per-site (buffer, offset) rows appended to
+//                      $M3TAIL_STAMP_PATH for cross-leg placement comparison
+// Every switch is "== 1" only; anything else (including unset) writes nothing.
+// The device test harness (micro/m3-mixer-prod-path.cpp) calls the same probe, so
+// a leg can prove the production gate decided the retention instead of inferring
+// it from output values.
+
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
@@ -390,6 +482,60 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
 
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
+
+// M3 N-row owner-tail device diagnostics (see micro/m3-mixer-prod-path.cpp).
+// Compiled into the model TU so the device probe links the same definition the
+// model links; the switches are inert unless set to exactly "1".
+struct qwen4exp_hc_mix_probe {
+    static bool tail_diag() { const char * v = std::getenv("M3_TAIL_DIAG"); return v && std::atoi(v) != 0; }
+    static bool tail_why()  { const char * v = std::getenv("M3_TAIL_WHY");  return v && std::atoi(v) != 0; }
+    static bool stamp()     { const char * v = std::getenv("M3TAIL_STAMP"); return v && std::atoi(v) == 1; }
+
+    static void hc_mix_built(int il, bool mixer_site, const ggml_tensor * lo,
+                             const ggml_tensor * xn, const ggml_tensor * mixed, int64_t nt) {
+        if (tail_diag()) {
+            GGML_LOG_INFO("M3_TAIL_BUILD row_scope=%s il=%d nt=%lld lo=%s ret=%d xn=%s ret=%d mixed=%s\n",
+                    mixer_site ? "mixer" : "trunk", il, (long long) nt,
+                    lo ? lo->name : "-", lo && (lo->flags & GGML_TENSOR_FLAG_NO_REUSE) ? 1 : 0,
+                    xn ? xn->name : "-", xn && (xn->flags & GGML_TENSOR_FLAG_NO_REUSE) ? 1 : 0,
+                    mixed ? mixed->name : "-");
+        }
+        if (!stamp()) {
+            return;
+        }
+        const char * path = std::getenv("M3TAIL_STAMP_PATH");
+        if (path == nullptr || path[0] == '\0') {
+            return;
+        }
+        FILE * fp = std::fopen(path, "a");
+        if (fp == nullptr) {
+            return;
+        }
+        const auto off = [](const ggml_tensor * t) -> long long {
+            if (t == nullptr || t->data == nullptr || t->buffer == nullptr) {
+                return -1;
+            }
+            return (long long) ((const char *) t->data -
+                    (const char *) ggml_backend_buffer_get_base(t->buffer));
+        };
+        std::fprintf(fp, "M3BUILD il=%d scope=%s nt=%lld lo=%lld lo_off=%lld lo_flags=%d "
+                "xn=%lld xn_off=%lld xn_flags=%d mixed=%lld mixed_off=%lld\n",
+                il, mixer_site ? "mixer" : "trunk", (long long) nt,
+                (long long) (intptr_t) lo, off(lo), lo ? lo->flags : -1,
+                (long long) (intptr_t) xn, off(xn), xn ? xn->flags : -1,
+                (long long) (intptr_t) mixed, off(mixed));
+        std::fclose(fp);
+    }
+
+    // why = 1..7 mirrors the HIP guard's veto reason; 0 means the fused tail ran.
+    static void hc_mix_reason(int il, int why) {
+        if (!tail_why()) {
+            return;
+        }
+        GGML_LOG_INFO("M3_TAIL_WHY il=%d why=%d\n", il, why);
+    }
+};
+
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  x,
         ggml_tensor *  w_norm,
@@ -419,6 +565,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
+    // Name the fused tail's inputs.  This is a debug label only: the M3
+    // diagnostics locate the site and its retained tensors by name, and the
+    // name is what the offset stamp logs.  No value, op or flag changes.
+    cb(lo, "hc_lo", il);
     if (qwen4exp_hc_keep_lo_enabled() && hc == 4 && nt == 1 &&
             (w_down->type == GGML_TYPE_BF16 || w_down->type == GGML_TYPE_Q8_0 ||
              w_down->type == GGML_TYPE_Q4_0) &&
@@ -435,7 +585,48 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         // mixed after the original up node. No extra operation or copy is added.
         ggml_set_output(lo);
     }
-    ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
+    if (hc == 4 && n_embd == 2560 && nt >= 2 && nt <= 4 &&
+            w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
+            w_down->op == GGML_OP_NONE && w_down->view_src == nullptr &&
+            w_up->op == GGML_OP_NONE && w_up->view_src == nullptr &&
+            w_down->ne[0] == hc_dim && w_down->ne[1] == 320 &&
+            w_down->ne[2] == 1 && w_down->ne[3] == 1 &&
+            w_up->ne[0] == 320 && w_up->ne[1] == hc_dim &&
+            w_up->ne[2] == 1 && w_up->ne[3] == 1 &&
+            lo->op == GGML_OP_UNARY && ggml_get_unary_op(lo) == GGML_UNARY_OP_SILU &&
+            lo->type == GGML_TYPE_F32 && lo->ne[0] == 320 && lo->ne[1] == nt &&
+            lo->ne[2] == 1 && lo->ne[3] == 1 && lo->view_src == nullptr &&
+            ggml_is_contiguous(lo)) {
+        // Same shapes the HIP tail guard accepts, so only sites that can fuse
+        // pay the retained 320 x nt x 4 B.  A mixer site is one whose caller
+        // passes no inject projection (the output mixer and the MTP head mixer);
+        // every other site is a trunk site.  The trunk sites are the ones the M3
+        // micro baseline covers with per-row N1 references.
+        const bool mixer_site = inject == nullptr;
+        const bool production = qwen4exp_hc_n3_tail_keep_enabled();
+        const int diag = qwen4exp_hc_n3_diag_scope();
+        const bool diag_trunk = (diag & QWEN4EXP_HC_N3_DIAG_TRUNK) != 0;
+        const bool diag_mixer = (diag & QWEN4EXP_HC_N3_DIAG_MIXER) != 0;
+        // Production "1" retains lo at every site and, at a mixer site, also xn's
+        // storage owner: that is the complete coverage.
+        if (production) {
+            if (!mixer_site || qwen4exp_hc_n3_retain_xn(xn, hc_dim, nt)) {
+                lo->flags |= GGML_TENSOR_FLAG_NO_REUSE;
+            }
+        }
+        // Diagnostic scopes are mutually exclusive, off unless set, and never a
+        // promotion input.  Trunk needs no xn pin; mixer needs xn, and falls back
+        // to no retention when xn cannot be retained (fail-closed).
+        if (diag_trunk && !mixer_site) {
+            lo->flags |= GGML_TENSOR_FLAG_NO_REUSE;
+        }
+        if (diag_mixer && mixer_site && qwen4exp_hc_n3_retain_xn(xn, hc_dim, nt)) {
+            lo->flags |= GGML_TENSOR_FLAG_NO_REUSE;
+        }
+    }
+    ggml_tensor * up = build_lora_mm(w_up, lo);
+    cb(up, "hc_up", il);
+    ggml_tensor * gate = ggml_sigmoid(ctx0, up);
     cb(gate, "hc_gate", il);
 
     ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
@@ -455,6 +646,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     }
     mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     cb(mixed, "hc_mixed", il);
+    qwen4exp_hc_mix_probe::hc_mix_built(il, inject == nullptr, lo, xn, mixed, nt);
 
     if (inject) {
         *inject = build_lora_mm(w_inject, xn);

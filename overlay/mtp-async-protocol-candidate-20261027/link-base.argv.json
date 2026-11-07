@@ -1,0 +1,29 @@
+{
+  "argv": [
+    "/usr/bin/c++",
+    "-fPIC",
+    "-O3",
+    "-DNDEBUG",
+    "-shared",
+    "-Wl,--dependency-file=/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/base-link.d",
+    "-Wl,-soname,libggml-base.so.0",
+    "-o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/install/lib/libggml-base.so.0.18.1",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/base-000-ggml.c.o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/base-001-ggml.cpp.o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/base-002-ggml-alloc.c.o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/base-003-ggml-backend.cpp.o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027/ggml-backend-meta.cpp.o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/base-005-ggml-opt.cpp.o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/base-006-ggml-threading.cpp.o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/base-007-ggml-quants.c.o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/base-008-ggml-turbo-quant.c.o",
+    "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-prompt-hc-consolidated-20261024/objects/base-009-gguf.cpp.o",
+    "-Wl,-rpath,$ORIGIN",
+    "-lm",
+    "/usr/lib/gcc/x86_64-linux-gnu/15/libgomp.so",
+    "/usr/lib/x86_64-linux-gnu/libpthread.a"
+  ],
+  "cwd": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/mtp-async-protocol-candidate-20261027",
+  "origin": "/home/kunweiz/atomic-llama-cpp-turboquant/build-tp5-dual50-20261022/mtp-endtoend-20261024/hc-latejoin-formal-20261024/repro/commands/base-link.argv.json"
+}

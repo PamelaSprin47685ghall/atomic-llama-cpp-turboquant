@@ -1,0 +1,29 @@
+{
+ "status": "BUILT_NOT_RUN_NOT_PROMOTED",
+ "base_runtime": "mtp-post-submit-unlock-candidate-20261025/runtime.cpp (source of selected binary 1160f624)",
+ "libs": "row-tail libs except libggml-hip=202a55b5 (patched relay.o) and libggml-base relinked (patched Meta)",
+ "knobs_default_on": {
+  "TP5_MTP_ASYNC_PROTOCOL": "ignore READY_PAIR/POST_SUBMIT_UNLOCK; no same-phase meet()",
+  "TP5_MTP_SUBMIT_ONLY_GATE": "cross-window lock only around native 5-rank enqueue",
+  "TP5_RELAY_SERVICE_PER_WINDOW": "one CPU fold/publish courier per window",
+  "TP5_HIP_SCHEDULE_SPIN": "hipDeviceScheduleSpin on all devices before backend init",
+  "TP5_SPIN_CORES": "auto: one physical core per window (w0=21:43, w1=20:42); worker hyperthread migrates there only during verify/replay waits and contended ticket-lock spins; courier thread pinned to sibling for life; all other process threads excluded from those 4 CPUs; 0 disables; explicit w:c,w:c accepted"
+ },
+ "always_on": [
+  "FIFO spin ticket lock replaces std::mutex submission gate",
+  "meet() condvar wait_for(1ms) -> spin",
+  "Meta relay snapshot retry yield -> pause",
+  "relay.hip device wait loop: removed __builtin_amdgcn_s_sleep(2) (pure busy-wait); libggml-hip relinked from row-epilogue object set (control relink reproduced c4a1634f bit-exact) -> 202a55b5"
+ ],
+ "rollback": "set any knob to 0",
+ "binary_sha256_prefix": "331a0ae9",
+ "not_violations_per_ashley": [
+  "GPU->CPU fold->GPU relay latency (just part of the send/receive wait)",
+  "draft readback sync = own data dependency"
+ ],
+ "pin_micro": {
+  "pin_unpin_roundtrip_us_p50": 3.37,
+  "p99": 20.17,
+  "max": 71.43
+ }
+}

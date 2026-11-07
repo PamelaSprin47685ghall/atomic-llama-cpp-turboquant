@@ -18,6 +18,19 @@ bool ggml_cuda_op_hc_owner_tail4_t1(
         ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
         const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst);
 
+// True when the fused Q8_0 tail reduces k = 320 in the same order as the
+// generic Q8_0 MUL_MAT kernel on this device, i.e. when fusion changes no
+// value. False means the matcher must keep the generic chain.
+bool ggml_cuda_hc_owner_tail4_equivalent(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weights);
+
+// Private T=2..4 owner HC up/gate/mean fusion. Same arithmetic as the T=1
+// entry point, one quantized activation vector per row. `up` is written when
+// the graph exposes it as an output.
+bool ggml_cuda_op_hc_owner_tail4_rows(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
+        const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst, ggml_tensor * up);
+
 // Private T=1 HC down/scale/SiLU fusion. Caller checks closure, aliases and events.
 bool ggml_cuda_op_hc_down_silu_t1(
         ggml_backend_cuda_context & ctx, const ggml_tensor * weights,

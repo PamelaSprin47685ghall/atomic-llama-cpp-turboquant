@@ -1,0 +1,84 @@
+M3 ROWS PRIVATE G2 — CPU-only build and device diff, 2026-11-01
+=============================================================
+Auditor: DevopsRetry. Private 0700 dir m3-rows-g2-20261101/. Both CPU locks held for every build
+and link (05:22:51-05:23:49, 05:24:42). No GPU process, no model, original tree untouched.
+
+0) GPU READ-ONLY CHECK (done first, no process started)
+------------------------------------------------------
+  rocm-smi --showuse -> rc=8 ("ROCm SMI returned 8"). Bound amdgpu devices: 06:00.0, 09:00.0,
+  0c:00.0, 0f:00.0 — four, not five; 0000:03:00.0 is still unbound. No kfd clients, no HIP
+  process. Both CPU locks were free (/tmp/ple-candidate-gpu.lock and $E/ple-candidate-gpu.lock).
+  I did not retry, rebind or reset anything.
+
+1) HASHES — match the last M3TailGuardEngineer report
+-----------------------------------------------------
+  ggml/src/ggml-cuda/ggml-cuda.cu 71080368… · mmvf.cu c04951e6… · mmvf.cuh 436c0d69…
+  (tree HEAD 51caf0dd, same six modified files as before). Frozen in FROZEN-3.txt.
+
+2) BUILD — control (f1c5fafc0) and candidate, private outputs, 0 errors
+----------------------------------------------------------------------
+  Compile argv: the M3 trio lane's own recorded recipes
+  $E/mtp-m3-trio-20261028/build/{mmvf-m3t.argv.json, ggml-cuda-m3t.argv.json}, with -o/-MF/-c
+  redirected into the private dir and the source replaced by the private copy. Source basenames
+  kept as mmvf.cu / ggml-cuda.cu.
+  One deviation had to be made and is declared: the recorded -I/-iquote roots point at
+  mtp-hc-row-epilogue-candidate-20261025/headers, whose ggml-cuda headers are NOT the M3 tree's
+  (its mmvf.cuh lacks the two new declarations, and the on-side ggml-cuda.cu failed with
+  "use of undeclared identifier ggml_cuda_hc_owner_tail4_equivalent / ggml_cuda_op_hc_owner_tail4_rows").
+  I rebuilt the include roots inside the private dir from the M3 tree's own headers
+  (mmvf.cuh 436c0d69… on that path, vendors/ and mma/ filled from the same header set).
+  After that:
+    control mmvf.cu      rc=0     control ggml-cuda.cu rc=0
+    on      mmvf.cu      rc=0     on      ggml-cuda.cu rc=0
+  Link: the trio's link-m3t.argv.json with -o redirected and only the two replaced objects
+  (ggml-cuda.m3t.o, mmvf.m3t.o) swapped for the private ones; the other 189 objects are the
+  lane's. control rc=0, on rc=0.
+    libggml-hip-control.so 68,632,976 B   libggml-hip-on.so 68,663,288 B
+
+3) DEVICE DIFF — exactly the five new kernels, nothing else changed
+-------------------------------------------------------------------
+  .hip_fatbin: control 50,862,224 B, on 50,874,512 B; 182 embedded device objects each.
+  Per-object sha256 over the whole bundle: 180 identical, **differing indices 29 and 35**.
+    object 29 (k_compute_batched_ptrs, 39 differing bytes): same kernel, same .text; the bytes are
+      in its symbol/string tables (object size unchanged).
+    object 35 (the mmvf TU, 360 -> 365 kernels):
+        added (5): _ZL25hc_owner_tail4_t1_q8_mmvqILb0EE…, _ZL25hc_owner_tail4_t1_q8_mmvqILb1EE…,
+                   _ZL27hc_owner_tail4_rows_q8_mmvqILi2EE…, <Li3>, <Li4>
+        removed (0)
+        existing kernels whose instruction stream changed: **0 of 360**
+      (instruction streams compared with llvm-objdump over the extracted code objects)
+  So the added set is exactly `hc_owner_tail4_t1_q8_mmvq<selfcheck=false/true>` and
+  `hc_owner_tail4_rows_q8_mmvq<2,3,4>`, and every other kernel is untouched.
+
+4) quantize_row_q8_1_cuda STRIDE ARGUMENTS — real strides, verified in the emitted code
+-------------------------------------------------------------------------------------
+  Source (mmvf.cu:639-646):
+      const int64_t ts_lo = ggml_type_size(lo->type);
+      const int64_t s01 = lo->nb[1] / ts_lo;
+      const int64_t s02 = lo->nb[2] / ts_lo;
+      const int64_t s03 = lo->nb[3] / ts_lo;
+      quantize_row_q8_1_cuda(lo->data, nullptr, quantized, GGML_TYPE_Q8_0,
+                             k, s01, s02, s03, k, R, 1, 1, ctx.stream());
+  Compiled host code, inside ggml_cuda_op_hc_owner_tail4_rows (on-mmvf.cu.o):
+      1ae6: movq 0x38(%rbp),%rax     ; lo->nb[1]
+      1b06: movq 0x40(%rbp),%rax     ; lo->nb[2]
+      1b26: movq 0x48(%rbp),%rax     ; lo->nb[3]
+      1b85: movl $0x140,%r8d         ; ne00 = 320 (k)
+      1b8e: xorl %esi,%esi           ; ids = nullptr
+      1b90: movq 0x28(%rsp),%rdx     ; vy
+      1b95: movl $0x8,%ecx           ; type = GGML_TYPE_Q8_0
+      1b9a: movq 0x20(%rsp),%r9      ; x = lo->data
+      then the stack arguments, in order: 0x140 (ne0), then the three 8-byte values derived from
+      nb[1]/nb[2]/nb[3], then 0x140 again, 1, 1, and the stream.
+  The relocation `R_X86_64_PLT32 … _Z22quantize_row_q8_1_cudaPKfPKiPv9ggml_typellllllllP12ihipStream_t`
+  confirms the call target. So the three strides are the tensor's own nb[1..3] (divided by the
+  element size at compile time, i.e. the real element strides), not the old literal 0/1/1: the
+  v2 defect (s01 = 0) is not present in this build.
+
+5) SCOPE
+--------
+  Established: both sources compile and link in a private dir with 0 errors; the candidate's device
+  image differs from the control's only by the five new kernels (2 T=1 + 3 R=2..4) and by one
+  unrelated object's symbol tables; the quantize call receives the real strides.
+  NOT established: any GPU execution, any runtime behaviour, and the two objects' byte-identity
+  (impossible from a different header root — the CUID and embedded paths differ).

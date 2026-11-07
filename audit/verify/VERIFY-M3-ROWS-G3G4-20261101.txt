@@ -1,0 +1,416 @@
+M3 ROWS PRIVATE G3/G4 — GPU execution of the rows kernels, 2026-11-01
+====================================================================
+Executor: DevopsM3Gpu. Private 0700 dir m3-rows-g3g4-20261101/ next to this file.
+Source under test: /home/kunweiz/work/m3tail-storage-20261031 (HEAD eebd4269d;
+ggml-cuda.cu 71080368…, mmvf.cu c04951e6…, mmvf.cuh 436c0d69… — the G2 FROZEN-3 set).
+Original tree, selected installs and the trio lanes were not modified. No RSZ_RT, no
+GGML_TP5_FA_MASK_KVLEN, no formal 512x2 run, one HIP process at a time.
+
+0) GPU STATE AND LOCKS
+----------------------
+  rocm-smi --showuse rc=0, five GPUs bound, 0 % before and after every step; rocminfo
+  lists 5 gfx1030 agents. Every GPU block below ran under both locks, non-blocking:
+      exec 9>>$E/ple-candidate-gpu.lock; flock -n -x 9
+      exec 8>>/tmp/ple-candidate-gpu.lock;  flock -n -x 8
+  (E = mtp-endtoend-20261024). Lock holders at the start of this leg: none — both files
+  reported FREE (flock -n probe) and fuser showed no process, so the G2 leg's build
+  session had ended; nothing was force-released. Held windows: 10:44:37-10:44:37,
+  10:47:08-10:47:37 (G3 rounds), 10:48:00-10:51:08 (OFF+ON model legs),
+  10:55:09-10:56:57 (second ON leg). No residual process after each block.
+
+1) BINARIES AND HARNESS (sha256)
+--------------------------------
+  libggml-hip-control.so  8cf1e4f4d2b995f9958662e1bf7143b861bdbb7925b2cc64abf9978ebd4cd001
+  libggml-hip-on.so       bbd36ec49e3b1f198b6c813449f5b71955975fd523d764e9896de22fa5c0ba50
+  libggml-base.so.0.18.1  695458314f8b… (selected lane copy, identical in four lanes)
+  libggml.so.0.18.1       selected lane copy (backend registry)
+  micro harness           m3rows-micro.cpp 7e5f1e7ebef8f332 -> m3rows-micro 491c4e97ada39911
+  model driver            g4/g4-legs.py 3f1df69bcba21e37   analysis g4/g4-cmp.py 16edf34e54143473
+  Loaded DSO verified per leg with LD_DEBUG=libs: "calling init: …/libs-{on,control}/
+  libggml-hip.so.0", each a directory holding exactly one of the two G2 builds.
+
+2) HARNESS DEFECT FOUND AND FIXED (the earlier FAIL cause)
+----------------------------------------------------------
+  The first harness sized its float source buffer as HD*LO = 3,276,800 floats and then
+  quantized three different weight shapes from it, the largest being E*HD = 26,214,400
+  floats (chain 2560x10240). ggml_quantize_chunk reads nrows*n_per_row floats, so it read
+  ~92 MB past the end of the vector: the fault address was always a page boundary and the
+  outcome depended on what the allocator happened to map there, which is why identical
+  commands alternated between success and SIGSEGV. Fix: every quantize call now gets a
+  source of exactly n0*n1 floats and a destination of ggml_row_size(Q8_0, n0)*n1 bytes,
+  both checked (n0 % 32 == 0, f.size() == n0*n1, written == needed) before the call
+  (m3rows-micro.cpp, quantize_checked). After the fix: 8/8 identical invocations rc=0, and
+  all G3 legs below ran three times without a single fault.
+
+3) G3 — MICRO, THREE ROUNDS (command, then results)
+---------------------------------------------------
+  ./m3rows-micro <libs-{on|control}> <R> 1 50 1 <out> <tag> 1 ROCm0
+  env GGML_TP5_HC_KEEP_LO=1 TP5_HC_ROW_EPILOGUE=1 M3_TAIL_WHY=1
+  Graph: down = MUL_MAT(Q8_0 10240x320, xn) -> SCALE -> SILU = lo (materialised);
+  up = MUL_MAT(Q8_0 320x10240, lo); SIGMOID; MUL(xn, gate); RESHAPE(2560,4,R);
+  4 VIEWs (nb1 = 10240 B, nb2 = nb1*R); 3 ADDs; SCALE(0.25) = mixed. lo and up are graph
+  outputs, which keeps the generic chain and blocks the fusion (see section 5).
+  Per round: R=1..4 on vs control, plus R=1 legs for rows 0..3 (M3_ROW0).
+
+    round  R  on/control kernels   p50 on / control (us)   on-vs-control bytes
+      1   1        7 / 7               40.72 / 40.68            0 (of 52,480)
+      1   2        6 / 6               38.76 / 38.76            0 (of 104,960)
+      1   3        6 / 6               40.72 / 40.68            0 (of 157,440)
+      1   4        6 / 6               43.12 / 43.12            0 (of 209,920)
+    rounds 2 and 3 repeat all four pairs: 0 bytes against control and 0 bytes against
+    round 1 (on and control alike); the four single-row legs likewise 0 bytes.
+    Totals: 37 legs rc=0, 36/36 comparisons "differing bytes: 0", none non-zero.
+    logs/g3-rounds.txt, per-leg logs in micro/r{1,2,3}/.
+
+  Cross-check that the R-row result is the row-by-row result: row r of R=2,3,4 equals the
+  R=1 leg of the same row bitwise in lo, up and mixed (0 bytes; logs/micro-cmp-smoke.json).
+  The generic path here is the generic MUL_MAT + tail nodes: 8 kernels per site at R>=2
+  (MUL_MAT, SIGMOID, MUL, RESHAPE, 3 ADD, SCALE) and 6 on the fused side.
+
+  Body time: per site, captured-graph launch p50 38.8-43.1 us in both builds, i.e. the
+  values are equal and the timing difference is inside the run-to-run spread (the same
+  graph with 6 and with 8 kernels measured 40.72 / 40.68 us at R=1 in this box).
+
+4) G4 — MODEL, OFF (control DSO) AND ON (candidate DSO)
+-------------------------------------------------------
+  python3 g4/g4-legs.py <tag> <control|on> 32     (under both locks, run-g4.sh)
+  Selected bin 1160f624 + selected libs, only libggml-hip swapped; argv and environment
+  are the trio lane's (mtp-m3-trio-20261028/patch/m3t_run.py), 2 windows x 32 tokens,
+  --capture-logits, GGML_CUDA_FUSE_HC_OWNER_TAIL=1 in both legs, M3_TAIL_WHY=1.
+    off32x2  rc 0  75.3 s      on32x2  rc 0  112.5 s      on2_32x2 rc 0  108.2 s
+  OFF is a true no-op: off32x2 vs the reference replicated32x2 — whole logits bitwise,
+  32/32 tokens equal, KL 0, top1 32/32 (both requests).
+
+  Reach and rejection witness (stderr, candidate leg):
+    why=0 rows=1: 1680   why=0 rows=2: 10   why=0 rows=3: 20   why=0 rows=12: 2
+    (1712 fused sites; the rows=12 pair are the two 4-row prompt graphs, logged once per
+    dispatch; no other "why" value appears because the matcher logs only after all of its
+    gates pass — it has no reject-side logging in this tree.)
+    OFF leg: 0 witness lines, as expected for the control build.
+
+  Numerics, OFF vs ON (common-prefix rows; logs/g4-cmp.json):
+    whole logits bitwise           false
+    non-finite values              0
+    req0  rows 6   top1 5/6   KL mean 1.925  max 3.751   maxabs 19.69  relL2 0.777
+    req1  rows 1   top1 0/1   KL mean 5.239  max 5.239   maxabs  8.29  relL2 0.630
+    first token divergence req0 at token 5, req1 at token 0
+    ON is reproducible: on2_32x2 vs on32x2 — whole logits bitwise, 64/64 tokens equal.
+
+5) WHY THE MODEL NUMBERS ARE FAR OUT — THE FUSION PATH ITSELF IS WRONG
+----------------------------------------------------------------------
+  Same micro, but with the model's topology (only `mixed` is a graph output, so the middle
+  nodes may be absorbed). Results, ON vs control, R=2, differing bytes out of 20,480:
+    variant                                            on kernels   why=0   bytes
+    plain site (as in the model)                           5         4      15,338
+    raw `up` copied to a side buffer after the window      8         0           0
+    gate fed by a constant instead of up                   8         0           0
+    up forced to zero                                      9         0           0
+    epilogue reads x0 instead of xn                        5         4      15,338
+  So the fused site is admitted exactly when nothing else reads `up`, and in that case the
+  site's mixed output differs from the generic chain by max 2.6e-2, mean 3.5e-3, rel L2
+  3.2e-2 at R=1..4 — deterministic across runs (two identical ON legs, 0 bytes apart) and
+  identical in every row of the R-row legs. The row kernel's lo and up are not bitwise the
+  generic chain's either (up maxabs 0.22 in the same probe); the epilogue is not involved,
+  because forcing the gate constant and reading a fixed xn gives 0 bytes.
+  Section 3 measures the row kernels against the generic chain; section 5 shows the path
+  the model actually takes, and that path changes values far beyond ulp range. The model
+  drift in section 4 (KL 1.9-5.2, top1 5/6 and 0/1, token divergence) is consistent with
+  that and is not a natural N1-vs-N3 envelope: it is two to three orders of magnitude
+  larger than the lane's earlier trio measurement (KL mean 0.0020, max 0.0115) on the same
+  diagnostic.
+
+6) ARTIFACTS
+------------
+  micro/{m3rows-micro.cpp,m3rows-micro}, micro/r{1,2,3}/ (legs + outputs), micro/var/,
+  micro/xd/, micro/pin/, micro/epi/, micro/zero/, micro/up/, micro/alt/ (section-5 probes),
+  logs/g3-rounds.txt, logs/micro-cmp-smoke.json, logs/topology-map.txt, logs/g4-cmp.json,
+  runs/{off32x2,on32x2,on2_32x2}/ (command.json, report.json, logits, stderr, timing),
+  g4/{g4-legs.py,g4-cmp.py,run-g4.sh}, diag/ (reject-instrumented DSO build).
+
+7) SCOPE
+--------
+  Established: the five new kernels run on gfx1030; in the topology where the generic chain
+  is kept alive the row kernels reproduce it bitwise at R=1..4 over three rounds and every
+  row equals its single-row leg; the model takes the fused path (1712 sites) and is
+  reproducible run to run; with the fused path taken, values change by rel L2 ~3e-2 in the
+  micro and by KL mean 1.9-5.2 / top1 5/6 and 0/1 in the model.
+  NOT established: that the fused path is numerically equivalent to the generic chain —
+  section 5 shows it is not — and therefore no exact or numeric-order-only PASS can be
+  claimed for this candidate.
+
+================================================================================
+APPENDIX — FIX2: ROWS KERNELS RE-BUILT FROM THE CORRECTED mmvf.cu (2026-11-01)
+================================================================================
+Main fixed the activation pointer: vec_dot_q8_0_q8_1 offsets the weights by kbx
+but reads the activation block it is handed, so both fused kernels now pass
+&act[kby] / &a[kby] with kby = kbx*(QK8_0/QK8_1). Everything below is measured on
+a DSO rebuilt from that source.
+
+A1) FROZEN SOURCE (fix2/FROZEN-2.txt)
+------------------------------------
+  mmvf.cu   3778da15d1474ad3bf6db147ea7de9439c14fb82ef51768f68f60bc6bf606541
+  mmvf.cuh  436c0d6963bca942e10613cfca00f306fd723860646577ddc892418da9f6f6d2 (unchanged)
+  ggml-cuda.cu 710803686c00ac42b1bf48cca60c13a29dab5bc213bb7772918f02ef6d713846 (unchanged,
+            reused as the G2 on-side object)
+  tree: /home/kunweiz/work/m3tail-storage-20261031, git shows only mmvf.cu modified.
+
+A2) REBUILD (fix2/build2.sh, both GPU locks 11:00:26-11:00:49)
+-------------------------------------------------------------
+  Compile: G2's recorded on-side mmvf argv, source/output/dep and include roots
+  redirected into fix2/ (private header root = G2's, plus the tree's mmvf.cuh).
+      compile mmvf.cu rc=0, "error:" count 0
+  Link: G2's on-side link argv with the new mmvf object substituted
+      (ggml-cuda.cu object unchanged from G2). link rc=0.
+  libggml-hip-on-fix2.so  68,663,288 B
+      794c5bd5a21faa6f89823f57b30207d6c65fff14e7a424113eaeecc2ba91cc53
+  fix2/obj/mmvf.cu.o 2a70c59fff3b7ba36a1518e00c98eb51c79d4c727b68914b82549d2a62d693cc
+  Control DSO unchanged: 8cf1e4f4d2b995f9958662e1bf7143b861bdbb7925b2cc64abf9978ebd4cd001.
+
+A3) KERNEL SET AND SCOPE OF THE CHANGE
+--------------------------------------
+  Host symbols (d or t) in the mmvf object: 749 before, 749 after, sets identical
+  (diff empty) — the five new kernels are still the only additions, none removed.
+  Host .text: 390 functions, 6 differ; 3 instructions each in
+  ggml_cuda_op_hc_owner_tail4_t1 and in mul_mat_vec_f, and they are only the
+  __LINE__ immediate of the selfcheck log (%d 0x229->0x22e, 0x230->0x235,
+  0x231->0x236); the rows entry point ggml_cuda_op_hc_owner_tail4_rows and all
+  five device stubs are byte-identical.
+  Device image: old and new mmvf code objects are the same size (1,531,088 B);
+  the instruction streams differ, as intended, in the two tail kernels.
+
+A4) G3 — FUSION ACTUALLY TAKEN (model topology: only `mixed` is an output)
+-------------------------------------------------------------------------
+  Command: ./m3rows-micro <libs-fix2|libs-control> <R> 1 50 1 <out> f2 0
+           env M3_TAIL_WHY=1        (logs/fix2-summary.txt, micro/fix2p/)
+    round  R   kernels on / ctl   why=0   on-vs-control differing bytes
+      1    1      5 / 4              4       5,098  of 10,240   (T=1 site)
+      1    2      5 / 8              4           0  of 20,480
+      1    3      5 / 8              4           0  of 30,720
+      1    4      5 / 8              4           0  of 40,960
+    rounds 2 and 3: identical numbers and byte-identical outputs.
+  The T=1 comparison here is not like-for-like: the candidate fuses (5 kernels,
+  why=0) while the control build leaves 4 kernels and the two graphs differ in
+  node count, so its 5,098 bytes are a graph-shape difference, not a value error.
+  up-alive control (raw `up` copied out of the window, so both builds run the
+  generic chain): R=1..4, 0 differing bytes, 7/8/8/8 kernels — the row kernels
+  stay silent there, as before.
+
+A5) G4 — MODEL 32x2, OFF (control) vs ON (fix2)
+-----------------------------------------------
+  run-g4-fix2.sh, both locks 11:04:25-11:09:01, one HIP process at a time.
+    off2_32x2 rc 0 76.6 s   onfix_32x2 rc 0 99.7 s   onfix2_32x2 rc 0 98.6 s
+  OFF: off2_32x2 is bitwise to replicated32x2 (KL 0, top1 32/32, tokens equal)
+       and bitwise to the earlier off32x2 (64/64 rows) — the OFF path is a true
+       no-op and reproducible.
+  Reach (candidate stderr): why=0 rows=1 1440, rows=2 5, rows=3 20 (1465 fused
+       sites); no other why value (the matcher still has no reject-side logging).
+  ON is reproducible: onfix2_32x2 vs onfix_32x2 — whole logits bitwise.
+  ON vs OFF (logs/g4-fix2-cmp.json):
+       whole logits bitwise  false      non-finite 0
+       req0  rows 3   top1 2/3   KL mean 0.002481  max 0.006796  maxabs 0.967
+       req1  rows 32  top1 32/32 KL mean 0.001303  max 0.024640  maxabs 1.442
+       first token divergence: req0 token 2, req1 none (32/32 tokens equal)
+  For scale: the earlier broken candidate gave req0 KL mean 1.925 / max 3.751,
+  top1 5/6, req1 KL 5.239, top1 0/1; the lane's historical trio measurement on
+  this diagnostic was KL mean 0.0020 / max 0.0115, top1 32/32.
+
+A6) ARTIFACTS (fix2)
+--------------------
+  fix2/{FROZEN-2.txt, build2.sh, src/, inc/, obj/, lib/, dev/},
+  micro/fix2p/ (3 rounds x R=1..4), micro/fix2/ (up-alive control),
+  logs/fix2-summary.txt, logs/g4-fix2-cmp.json,
+  runs/{off2_32x2, onfix_32x2, onfix2_32x2}/.
+
+================================================================================
+APPENDIX B — GENERIC REFERENCE LEG (same DSO, GGML_CUDA_FUSE_HC_OWNER_TAIL=0)
+================================================================================
+The OFF leg in section A5 uses the control DSO, whose T=1 site still runs the old
+hc_owner_tail4_t1_q8_f32 (F32 lo x Q8_0), so ON-vs-OFF at rows=1 compared the
+new generic mirror against that old shortcut. This appendix uses the same fix2
+DSO as ON with the shared gate set to 0 (ggml-cuda.cu:5186 t1 matcher, :5333 rows
+matcher), so both legs differ only in whether the fusion fires.
+
+B1) MICRO — same DSO, gate off (micro/fix2g/, three rounds, R=1..4)
+------------------------------------------------------------------
+  Command: ./m3rows-micro <libs-fix2> <R> 1 50 1 <out> g 0
+           env GGML_CUDA_FUSE_HC_OWNER_TAIL=0 M3_TAIL_WHY=1
+    round  R   generic kernels / why0   ON-vs-GENERIC differing bytes
+      1    1        7 / 0                      0  of 10,240
+      1    2        8 / 0                      0  of 20,480
+      1    3        8 / 0                      0  of 30,720
+      1    4        8 / 0                      0  of 40,960
+    rounds 2 and 3: identical (0 bytes everywhere, 12/12 comparisons).
+  The earlier R=1 residue (5,098 bytes) was therefore the control build's old
+  F32 shortcut, not the new kernel: against the generic chain of the same build
+  the fused T=1 and rows sites are bitwise identical.
+
+B2) MODEL 32x2 — generic_32x2 (fix2 DSO, gate 0), both locks 11:10:19-11:12:29
+-----------------------------------------------------------------------------
+  rc 0, 129.8 s. Witness: 0 M3_TAIL_WHY lines, i.e. no fused site at all
+  (command.json confirms "GGML_CUDA_FUSE_HC_OWNER_TAIL": "0"; the rest of the
+  environment is identical to onfix_32x2).
+  ON vs GENERIC (logs/g4-generic-cmp.json):
+      whole logits bitwise TRUE; 32/32 tokens equal in both requests;
+      32/32 rows bitwise per request; KL 0; top1 32/32 and 32/32.
+      => the fused path reproduces the generic chain exactly, both requests.
+  GENERIC vs OFF (the old F32 shortcut's own drift, recorded for the record):
+      req0  top1 2/3   KL mean 0.002481  max 0.006796  maxabs 0.967
+      req1  top1 32/32 KL mean 0.001303  max 0.024640  maxabs 1.442
+      first token divergence req0 token 2, req1 none.
+      These are the same numbers as section A5's ON-vs-OFF table, which is
+      expected: ON is bitwise equal to GENERIC.
+
+VERDICT M3 ROWS EXACT (vs generic chain) — same-DSO micro: fused vs GGML_CUDA_FUSE_HC_OWNER_TAIL=0 bitwise at R=1..4 in three rounds (0 differing bytes, 12/12 comparisons); model 32x2: onfix_32x2 vs generic_32x2 whole logits bitwise, 32/32 rows per request, KL 0, top1 32/32 + 32/32, 32/32 tokens equal both requests; GENERIC leg has 0 fused sites (0 witness lines, gate 0 in command.json); the earlier R=1 residue and the ON-vs-OFF KL are the control build's old F32 shortcut (GENERIC vs OFF: req0 KL mean 0.00248 / max 0.00680, top1 2/3; req1 KL mean 0.00130 / max 0.02464, top1 32/32)
+
+================================================================================
+APPENDIX C — T=1 CONTROL PARITY AND R=2..4 MMVQ (fix3, 2026-11-02)
+================================================================================
+Executor: DevopsFreshBoot. Private dir m3-rows-g3g4-20261101/. Build under both VFS build locks;
+GPU legs under both GPU locks, one HIP process at a time. No selected install or source tree changed.
+
+A) BUILD
+--------
+  mmvf.cu sha256 fedc9845cd888afdfc073ff47eed98cbf791c5bb7ac922bfd6e0932a7ed471ce
+  fix3/build3.sh: compile rc=0 (0 errors), link rc=0, VFS locks 15:52:05-15:52:27.
+    fix3/obj/mmvf.cu.o              81e26bc365019a65f3902823c1dfaedb07cea59ed8ac1310239daccba01687b5
+    fix3/lib/libggml-hip-on-fix3.so 360256b6a97f12a5ada58f772fcc524cf9586a3ac9c935eef6c87ce6cb4ea406
+                                    68,663,280 B
+  Recipe identical to fix2 (G2 on-side mmvf argv, G2 on-side ggml-cuda.cu object, G2 on-side link
+  argv); fix3/inc is a copy of fix2/inc (mmvf.cuh unchanged 436c0d69…).
+  Reproduction note: m3rows-micro links libggml-hip.so.0 against a RUNPATH install, so the <libdir>
+  argument alone is ignored (the SONAME is already loaded). Every leg below sets
+  LD_LIBRARY_PATH=<libdir>; a first pass without it silently ran the trio install and produced a
+  false all-equal result, which was discarded.
+
+B) MICRO G3 (fix3p, sites=1, reps=50, check=1, pin=0, M3_TAIL_WHY=1)
+---------------------------------------------------------------------
+    R   fix3 kernels  control kernels  generic kernels  fix3-vs-control  fix3-vs-generic
+    1        4               4                7              0 B          5,098 B (F32 vs generic)
+    2        5               8                8              0 B              0 B
+    3        5               8                8              0 B              0 B
+    4        5               8                8              0 B              0 B
+    R=1 with GGML_CUDA_HC_TAIL_MMVQ_T1=1: 5 kernels, 0 B vs generic (7 kernels).
+  All required comparisons are zero: default R=1 == f1c5fafc0 control (4 kernels), MMVQ_T1=1 R=1 ==
+  FUSE=0, R=2..4 == control and FUSE=0 (5 vs 8 kernels); 8/8 required comparisons 0 bytes,
+  FIX3-MICRO rc=0. The R=1 default-vs-generic 5,098 B is the known F32-vs-Q8_1 arithmetic
+  difference, not a failure.
+  Output hashes: r1 control/fix3 d40f9e76…; r1 generic/mmvq 01808b52…; r2 16152a37…; r3 e90c652c…;
+  r4 1383d295….
+
+C) MODEL G4 32x2
+----------------
+  run-g4-fix3.sh, both locks 15:53:55-15:57:05:
+    onfix3_32x2  fix3 DSO                                   rc=0  wall  76.5 s
+    tkeep0_32x2  fix3 DSO + GGML_TP5_HC_N3_TAIL_KEEP=0      rc=0  wall 113.1 s
+  Both legs run with GGML_CUDA_FUSE_HC_OWNER_TAIL=1. The selected environment carries no HC_N3
+  keys and TAIL_KEEP requires both TAIL_KEEP=1 and TRIO=1, so both legs are tail-keep off; the
+  explicit-0 leg is a determinism control (its 113.1 s vs 76.5 s is host variance, values identical).
+  onfix3 vs tkeep0: 0/64 rows, 0 bytes, top1 32/32 both, tokens equal both.
+  onfix3 vs off2_32x2 (f1c5fafc0 control):
+    whole logits bitwise FALSE; 48,067,450 differing bytes; 64/64 rows differ
+    req0: tokens equal, top1 32/32, KL mean 0.00178, KL max 0.0165, maxabs 1.12
+    req1: tokens equal, top1 32/32, KL mean 0.00120, KL max 0.0127, maxabs 1.39
+  The requested 0-byte / KL 0 parity against the control is NOT met, although the token trajectory
+  and top1 are stable.
+
+D) WHERE THE RESIDUAL COMES FROM
+--------------------------------
+  Diagnostics (all 32x2, same bin/libs/argv):
+    off0_32x2       control DSO, GGML_CUDA_FUSE_HC_OWNER_TAIL=0        rc=0 124.7 s
+    fix3g_32x2      fix3 DSO,    GGML_CUDA_FUSE_HC_OWNER_TAIL=0        rc=0 135.1 s
+    onfix3ctl_32x2  fix3 mmvf + control ggml-cuda.cu matcher           rc=0 140.6 s
+  Results:
+    off0 vs fix3g: whole logits bitwise TRUE, 0 bytes -> the generic chains of the two builds are
+      identical.
+    off2 vs off0: not bitwise (req0 diverges at token 2; req1 KL mean 0.001303) -> the control's own
+      T=1 F32 fusion changes values relative to generic, as appendix B inferred.
+    onfix3 vs fix3g: not bitwise (req0 token 2; req1 KL mean 0.001182) -> fix3's fusion changes
+      values relative to generic by the same amount.
+    onfix3ctl vs off2: whole logits bitwise TRUE, 0 bytes, KL 0, top1 32/32 both -> the new mmvf.cu
+      is exactly control-equal when the control matcher decides the fusion.
+  Therefore the residual is not in mmvf.cu; it is in the on-side matcher's fusion decisions. A
+  kernel census (rocprofv3 --kernel-trace, 2x1, same command, predict=1) counts
+    control off2: 8,160 hc_owner_tail4_t1_q8_f32 dispatches (1,632 on each of the 5 agents)
+    fix3 onfix3:   4,080 (816 on each agent)
+  so the two matchers do not produce the same T=1 graph (the ratio is exactly 2, reported as
+  measured; the site/replay decomposition was not traced). The witness sets also differ: fix3 has
+  1,460 fused sites (1,440 rows=1 + 20 rows=3, no rows=2), fix2 had 1,465 (1,440 + 5 rows=2 + 20),
+  so the 5 rows=2 sites now fall back. With the old MMVQ T=1 path the reach difference was invisible
+  because MMVQ is generic-equal (appendix B); with the F32 path it becomes a visible value
+  difference.
+
+E) LIMITS
+---------
+  * One 32x2 leg per configuration; the bitwise comparisons are exact, not statistical.
+  * The census counts dispatches, not distinct sites; the exact 2x ratio is not decomposed further.
+  * The 113.1 s tkeep0 wall is not explained; values are bitwise, so it is host variance.
+  * No source or matcher change was made; the control-matcher DSO is a private diagnostic link.
+
+VERDICT MICRO PASS, MODEL CONTROL PARITY FAIL — the new mmvf.cu (fedc9845…) compiles and links clean (fix3 DSO 360256b6…), and the micro G3 matrix is exact: R=1 default == f1c5fafc0 control (0 B, 4 kernels), R=1 with GGML_CUDA_HC_TAIL_MMVQ_T1=1 == FUSE=0 (0 B), R=2..4 == FUSE=0 and control (0 B, 5 vs 8 kernels), 8/8 required comparisons zero; but the model 32x2 is NOT bitwise against the f1c5fafc0 control (48,067,450 differing bytes, 64/64 rows, KL mean 0.00178/0.00120, max 0.0165/0.0127, top1 32/32 and tokens equal), so the required 0-byte/KL-0 parity is not met; the cause is isolated to the on-side matcher, not mmvf: fix3 mmvf + control matcher is bitwise identical to off2 (0 B, KL 0), the generic chains are bitwise identical (off0 vs fix3g 0 B), and the two matchers do not produce the same T=1 graph (4,080 vs 8,160 T=1 dispatches in the same 2x1 leg; 1,460 vs 1,465 witness sites, the 5 rows=2 sites now falling back), so the matcher's T=1/rows fusion decisions must be reconciled with the control before this candidate can claim control parity; both GPU locks are free and all five GPUs read 0 %.
+
+================================================================================
+APPENDIX D — MATCHER GATE SCOPED TO MMVQ_T1 (fix4, 2026-11-02)
+================================================================================
+Executor: DevopsFreshBoot. Private dir m3-rows-g3g4-20261101/. Build under both VFS build locks;
+GPU legs under both GPU locks, one HIP process at a time. No selected install or source tree changed.
+
+A) BUILD
+--------
+  ggml-cuda.cu 4b35ce5202712dbce2432b331c699beb96179a11f9bad7ad3c65fd5e17974a00
+  mmvf.cu      fedc9845cd888afdfc073ff47eed98cbf791c5bb7ac922bfd6e0932a7ed471ce (unchanged)
+  fix4/build4.sh: compile ggml-cuda.cu rc=0, compile mmvf.cu rc=0, link rc=0; VFS locks
+  16:24:27-16:24:59.
+    fix4/obj/ggml-cuda.cu.o         9c959e504d00326754236259d823690d81ff2fc2b6e1b5d07c1ff1aa4a8f1722
+    fix4/obj/mmvf.cu.o              22ce6a676e7c293c1f2f4a14526e6b51200ee7818acd7309fbff15415bbf0a6b
+    fix4/lib/libggml-hip-on-fix4.so 5d191b2e094f5b47d9194b59e144812673f9bc9b84d73ed6639079c524a9f823
+                                    68,663,704 B
+  The only source change is the gate scope: the equivalence gate and the input-liveness check now
+  run only when GGML_CUDA_HC_TAIL_MMVQ_T1=1; by default the T=1 matcher makes the control's
+  decisions and launches the control's kernel.
+
+B) MICRO G3 (fix4p, sites=1, reps=50, check=1, pin=0, M3_TAIL_WHY=1)
+---------------------------------------------------------------------
+    R   fix4 kernels  control kernels  generic kernels  fix4-vs-control  fix4-vs-generic
+    1        4               4                7              0 B          5,098 B (F32 vs generic)
+    2        5               8                8              0 B              0 B
+    3        5               8                8              0 B              0 B
+    4        5               8                8              0 B              0 B
+    R=1 with GGML_CUDA_HC_TAIL_MMVQ_T1=1: 5 kernels, 0 B vs generic (7 kernels).
+  All 8 required comparisons are zero: R=1 default vs control, R=1 MMVQ_T1=1 vs FUSE=0, R=2..4 vs
+  control and FUSE=0; FIX4-MICRO rc=0. Output hashes match fix3 exactly (r1 d40f9e76…/01808b52…,
+  r2 16152a37…, r3 e90c652c…, r4 1383d295…).
+
+C) MODEL G4 32x2
+----------------
+  onfix4_32x2  fix4 DSO  rc=0  wall 104.1 s
+  onfix4 vs off2_32x2 (f1c5fafc0 control):
+    whole logits bitwise TRUE; 0 differing bytes; 0/64 rows differ
+    req0: tokens equal, top1 32/32, KL 0
+    req1: tokens equal, top1 32/32, KL 0
+  This is the requested 0-byte parity. The leg's own timing is not a speed claim (first-touch
+  submit dominates this run): window 0/1 submit 18,058/18,486 ms, native_wait 575/598 ms,
+  ttft 19,175/20,505 ms, per-token median 5.1/5.0 ms, 22/23 decode calls.
+
+D) CENSUS AND WITNESS
+---------------------
+  Kernel census (rocprofv3 --kernel-trace, 2x1, same command, predict=1):
+    control off2: 8,160 hc_owner_tail4_t1_q8_f32 dispatches
+    fix4 onfix4:  8,160   (fix3 was 4,080)
+  The default T=1 graph is now the control's, dispatch for dispatch.
+  M3_TAIL_WHY site counts, 32x2:
+    fix4: rows=1 2,984 + rows=3 20 = 3,004 sites (no rows=2)
+    fix3: rows=1 1,440 + rows=3 20 = 1,460
+    fix2: rows=1 1,440 + rows=2 5 + rows=3 20 = 1,465
+  The 2,984 rows=1 sites are the restored T=1 reach; the 5 rows=2 sites remain unfused in both
+  fix3 and fix4, but the control has no rows matcher and runs them generic, so their generic values
+  agree (the whole-logits bitwise result includes them). The 2x1 trace prints 2,880 rows=1 witness
+  lines for its one-token graph.
+
+E) LIMITS
+---------
+  * One 32x2 leg; the parity comparison is exact, not statistical.
+  * The census counts dispatches, not distinct sites; the 8,160 match is the decisive reach check.
+  * Timing is reported for completeness only; the first-touch submit is not a steady-state number.
+  * No source change beyond the gate scope; the DSO is a private link.
+
+VERDICT PASS — scoping the equivalence and input-liveness gates to GGML_CUDA_HC_TAIL_MMVQ_T1=1 restores the control's T=1 decisions: the fix4 DSO (5d191b2e…, from ggml-cuda.cu 4b35ce52… and mmvf.cu fedc9845…) builds clean, the 8 required micro comparisons are 0 bytes (R=1 default == control 4 kernels; MMVQ_T1=1 == FUSE=0; R=2..4 == both, 5 vs 8 kernels), the model 32x2 is whole-logits bitwise against off2_32x2 (0 of 63,569,920 bytes, 0/64 rows, KL 0, top1 32/32 both requests, tokens equal), and the T=1 kernel census is now 8,160 dispatches, exactly the control's 8,160 (fix3 was 4,080), with 3,004 witness sites (2,984 rows=1 + 20 rows=3) against fix3's 1,460; both GPU locks are free and all five GPUs read 0 %.

@@ -467,6 +467,7 @@ struct tensor_alloc {
     int buffer_id;
     struct buffer_address addr;
     size_t size_max; // 0 = pre-allocated, unused, or view
+    bool no_reuse; // allocation plans depend on the retained-lifetime contract
 };
 
 struct leaf_alloc {
@@ -477,6 +478,10 @@ struct node_alloc {
     struct tensor_alloc dst;
     struct tensor_alloc src[GGML_MAX_SRC];
 };
+
+// Fixed capacity so the witness never allocates; a graph with more retained
+// tensors reports the first M3_WITNESS_MAX_RETAINED and sets retained_truncated.
+#define M3_WITNESS_MAX_RETAINED 8
 
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
@@ -492,11 +497,46 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // M3 diagnostics, per gallocr instance and reset at the start of every
+    // ggml_gallocr_alloc_graph call, so a count belongs to exactly one graph plan
+    // on exactly one allocator object.  Gallocrs are not shared across threads
+    // (the API contract already requires that), so these fields need no atomics,
+    // and they are written only when GGML_M3_ALLOC_WITNESS=1.
+    struct {
+        int64_t retained_free_skip;   // free path refused a NO_REUSE node
+        int64_t no_reuse_inplace_skip; // in-place reuse refused: parent retained
+        int64_t view_reuse_skip;      // in-place reuse refused: view owner retained
+        // identities of the tensors actually retained during this window; the
+        // identity strings are the tensors' own names, so a leg can join the
+        // decision with the model TU's site line instead of guessing by order
+        int n_retained;
+        const char * retained_names[M3_WITNESS_MAX_RETAINED];
+        const char * retained_ops[M3_WITNESS_MAX_RETAINED];
+        int64_t retained_ne[M3_WITNESS_MAX_RETAINED];
+    } m3_witness;
+    bool m3_witness_on;   // armed once per instance from GGML_M3_ALLOC_WITNESS
+    int64_t m3_plan_id;   // increments once per real planning pass on this instance
+    int m3_mode;          // 0 = sizing pass, 1 = actual (buffer-backed) pass
 };
+
+// The M3 retention witness is armed by GGML_M3_ALLOC_WITNESS=1, read once per
+// gallocr (not per node) and cached on the object, so the disabled path costs one
+// bool test and writes nothing.
+static bool m3_witness_armed(void) {
+    static const bool on = [] {
+        const char * v = std::getenv("GGML_M3_ALLOC_WITNESS");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
     GGML_ASSERT(galloc != NULL);
+
+    // Armed once per instance; the witness fields stay zero unless it is on.
+    galloc->m3_witness_on = m3_witness_armed();
 
     galloc->bufts = calloc(n_bufs, sizeof(ggml_backend_buffer_type_t));
     GGML_ASSERT(galloc->bufts != NULL);
@@ -641,9 +681,17 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                     continue;
                 }
 
-                // outputs cannot be reused
-                if (parent->flags & GGML_TENSOR_FLAG_OUTPUT || (parent->view_src != NULL && parent->view_src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-                    AT_PRINTF("not reusing parent %s for %s as it is an output\n", parent->name, node->name);
+                // Retained tensors, including their views, cannot be reused in-place.
+                if (parent->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_NO_REUSE) ||
+                    (parent->view_src != NULL && parent->view_src->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_NO_REUSE))) {
+                    AT_PRINTF("not reusing retained parent %s for %s\n", parent->name, node->name);
+                    if (galloc->m3_witness_on) {
+                        if (parent->flags & GGML_TENSOR_FLAG_NO_REUSE) {
+                            galloc->m3_witness.no_reuse_inplace_skip++;
+                        } else {
+                            galloc->m3_witness.view_reuse_skip++;
+                        }
+                    }
                     continue;
                 }
 
@@ -688,9 +736,19 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
 }
 
 static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
-    // graph outputs are never freed
-    if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
-        AT_PRINTF("not freeing output %s\n", node->name);
+    // Graph outputs and explicitly retained allocations remain live throughout the graph.
+    if (node->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_NO_REUSE)) {
+        AT_PRINTF("not freeing retained tensor %s\n", node->name);
+        if (galloc->m3_witness_on && (node->flags & GGML_TENSOR_FLAG_NO_REUSE)) {
+            galloc->m3_witness.retained_free_skip++;
+            // The identity of the tensor whose allocation the free path kept.
+            if (galloc->m3_witness.n_retained < M3_WITNESS_MAX_RETAINED) {
+                const int i = galloc->m3_witness.n_retained++;
+                galloc->m3_witness.retained_names[i] = node->name;
+                galloc->m3_witness.retained_ops[i]   = ggml_op_name(node->op);
+                galloc->m3_witness.retained_ne[i]    = node->ne[0];
+            }
+        }
         return;
     }
 
@@ -714,7 +772,24 @@ static int get_node_buffer_id(const int * node_buffer_ids, int i) {
     return node_buffer_ids ? node_buffer_ids[i] : 0;
 }
 
-static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+// `m3_mode` distinguishes a real (buffer-backed) planning pass from a sizing
+// pass (ggml_gallocr_reserve_n_size, no_alloc = true): both reach this function,
+// but only a real pass corresponds to an execution plan, so the report says which
+// one it measured.  Values: 0 = sizing, 1 = actual.
+static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, int m3_mode) {
+    // M3 witness window: this function is the only place that plans an allocation
+    // (it is reached from ggml_gallocr_reserve_n_impl).  Counters start at zero
+    // here and are reported at the end of this same call, so a report always
+    // describes one real planning pass -- never a reuse of an earlier plan.
+    if (galloc->m3_witness_on) {
+        galloc->m3_witness.retained_free_skip    = 0;
+        galloc->m3_witness.no_reuse_inplace_skip = 0;
+        galloc->m3_witness.view_reuse_skip       = 0;
+        galloc->m3_witness.n_retained            = 0;
+        galloc->m3_plan_id++;
+        galloc->m3_mode = m3_mode;
+    }
+
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
@@ -823,6 +898,30 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             AT_PRINTF("\n");
         }
     }
+
+    if (galloc->m3_witness_on) {
+        // Read-only summary of the planning pass that just finished on this
+        // instance: the pass kind (sizing vs actual), the plan id, and the
+        // identities of the tensors the allocator actually retained.
+        GGML_LOG_INFO("%s: M3_ALLOC_WITNESS status=planned pass=%s plan_id=%lld nodes=%d "
+                      "retained_free_skip=%lld no_reuse_inplace_skip=%lld view_reuse_skip=%lld "
+                      "retained=%d truncated=%d\n", __func__,
+                galloc->m3_mode == 1 ? "actual" : "sizing",
+                (long long) galloc->m3_plan_id, ggml_graph_n_nodes(graph),
+                (long long) galloc->m3_witness.retained_free_skip,
+                (long long) galloc->m3_witness.no_reuse_inplace_skip,
+                (long long) galloc->m3_witness.view_reuse_skip,
+                galloc->m3_witness.n_retained,
+                galloc->m3_witness.n_retained >= M3_WITNESS_MAX_RETAINED ? 1 : 0);
+        for (int i = 0; i < galloc->m3_witness.n_retained; i++) {
+            GGML_LOG_INFO("%s: M3_ALLOC_RETAINED plan_id=%lld pass=%s idx=%d name=%s op=%s ne0=%lld\n",
+                    __func__, (long long) galloc->m3_plan_id,
+                    galloc->m3_mode == 1 ? "actual" : "sizing", i,
+                    galloc->m3_witness.retained_names[i],
+                    galloc->m3_witness.retained_ops[i],
+                    (long long) galloc->m3_witness.retained_ne[i]);
+        }
+    }
 }
 
 static bool ggml_gallocr_reserve_n_impl(
@@ -848,7 +947,7 @@ static bool ggml_gallocr_reserve_n_impl(
     }
 
     // allocate in hash table
-    ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, no_alloc ? 0 : 1);
 
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
@@ -860,6 +959,7 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+        node_alloc->dst.no_reuse = (node->flags & GGML_TENSOR_FLAG_NO_REUSE) != 0;
         if (node->view_src || node->data) {
             node_alloc->dst.buffer_id = -1;
             node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
@@ -872,6 +972,7 @@ static bool ggml_gallocr_reserve_n_impl(
         }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
+            node_alloc->src[j].no_reuse = src && (src->flags & GGML_TENSOR_FLAG_NO_REUSE) != 0;
             if (!src || src->view_src || src->data) {
                 node_alloc->src[j].buffer_id = -1;
                 node_alloc->src[j].addr = GGML_BUFFER_ADDRESS_INVALID;
@@ -998,6 +1099,9 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
 }
 
 static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
+    if (talloc->no_reuse != ((node->flags & GGML_TENSOR_FLAG_NO_REUSE) != 0)) {
+        return false;
+    }
     size_t node_size = 0;
     if (!node->data && !node->view_src) {
         // If we previously had data but don't now then reallocate
@@ -1095,6 +1199,17 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             ggml_gallocr_init_tensor(galloc, src, &node_alloc->src[j]);
         }
         ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
+    }
+
+    // This call only applies a plan that already exists; whether that plan was just
+    // created (a "planned" report was printed by ggml_gallocr_alloc_graph_impl in
+    // this same call) or reused from an earlier call, no planning pass runs here.
+    // It therefore reports no counts: a zeroed counter set here would be
+    // indistinguishable from "the gate was off".
+    if (galloc->m3_witness_on && galloc->m3_plan_id == 0) {
+        GGML_LOG_INFO("%s: M3_ALLOC_WITNESS nodes=%d status=not_measured reason=no_plan_yet "
+                      "plan_id=%lld\n", __func__, ggml_graph_n_nodes(graph),
+                (long long) galloc->m3_plan_id);
     }
 
     return true;
