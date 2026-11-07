@@ -19,6 +19,9 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t index);
 #include "dw_compose_event.h"
 
 #include <algorithm>
+#include <dlfcn.h>
+#include <sched.h>
+#include <unistd.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -45,6 +48,36 @@ std::uint64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(clock_type::now().time_since_epoch()).count();
 }
 
+// ASYNC-PROTOCOL: host waits on device completion must busy-wait, not sleep
+// on an interrupt/signal (HIP default is ScheduleAuto -> may block). Resolved
+// at runtime from the already-linked HIP runtime; no new link dependency.
+void tp5_force_hip_spin_wait() noexcept {
+    const char * env = std::getenv("TP5_HIP_SCHEDULE_SPIN");
+    if (env && std::string(env) == "0") return;
+    using set_flags_t = int (*)(unsigned);
+    using set_dev_t = int (*)(int);
+    using count_t = int (*)(int *);
+    void * self = dlopen("libamdhip64.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!self) self = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_NOLOAD);
+    if (!self) self = dlopen("libamdhip64.so.6", RTLD_NOW | RTLD_NOLOAD);
+    void * scope = self ? self : RTLD_DEFAULT;
+    auto set_flags = reinterpret_cast<set_flags_t>(dlsym(scope, "hipSetDeviceFlags"));
+    auto set_dev = reinterpret_cast<set_dev_t>(dlsym(scope, "hipSetDevice"));
+    auto count = reinterpret_cast<count_t>(dlsym(scope, "hipGetDeviceCount"));
+    if (!set_flags || !set_dev || !count) {
+        std::fprintf(stderr, "TP5_HIP_SCHEDULE_SPIN unavailable (symbols not found)\n");
+        return;
+    }
+    int n = 0;
+    if (count(&n) != 0) n = 0;
+    int ok = 0;
+    for (int d = 0; d < n; ++d) {
+        if (set_dev(d) == 0 && set_flags(0x1 /* hipDeviceScheduleSpin */) == 0) ++ok;
+    }
+    if (n > 0) set_dev(0);
+    std::fprintf(stderr, "TP5_HIP_SCHEDULE_SPIN devices=%d spin_set=%d\n", n, ok);
+}
+
 void pause_cpu() noexcept {
 #if defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
@@ -57,6 +90,137 @@ void pause_cpu() noexcept {
 // notes live in dw_compose_event.h (exact "1", read once at static
 // initialization; OFF keeps every site an untouched stock branch).
 static const bool dw_compose_event_req = dw_compose_event::gate();
+
+// ASYNC-PROTOCOL / CPU budget: busy-waiting is confined to ONE dedicated
+// physical core per window (worker on one hyperthread, relay courier on its
+// sibling). Every other thread of this process is excluded from those CPUs,
+// and all remaining CPUs stay free for ngram / other work.
+// TP5_SPIN_CORES: unset = auto (last physical cores), "0" = no pinning,
+// or explicit "worker:courier,worker:courier" per window, e.g. "21:43,20:42".
+void require(bool ok, const char * why);
+struct tp5_spin_slot { int worker = -1; int courier = -1; };
+std::vector<tp5_spin_slot> g_tp5_spin_slots;
+
+int tp5_sibling_of(int cpu) {
+    const std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list";
+    if (FILE * f = std::fopen(path.c_str(), "r")) {
+        char buf[64] = {};
+        const bool got = std::fgets(buf, sizeof(buf), f) != nullptr;
+        std::fclose(f);
+        if (got) {
+            int a = -1, b = -1;
+            if (std::sscanf(buf, "%d%*[,-]%d", &a, &b) == 2) return a == cpu ? b : a;
+        }
+    }
+    return cpu;
+}
+
+void tp5_plan_spin_cores(std::size_t windows) {
+    g_tp5_spin_slots.clear();
+    const char * env = std::getenv("TP5_SPIN_CORES");
+    if (env && std::string(env) == "0") {
+        std::fprintf(stderr, "TP5_SPIN_CORES disabled\n");
+        return;
+    }
+    const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (env && *env) {
+        std::string spec(env);
+        std::size_t pos = 0;
+        while (pos < spec.size()) {
+            const auto end = spec.find(',', pos);
+            const std::string item = spec.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            tp5_spin_slot slot;
+            require(std::sscanf(item.c_str(), "%d:%d", &slot.worker, &slot.courier) == 2 &&
+                        slot.worker >= 0 && slot.courier >= 0 && slot.worker < ncpu && slot.courier < ncpu,
+                    "TP5_SPIN_CORES must be worker:courier[,worker:courier]");
+            g_tp5_spin_slots.push_back(slot);
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        require(g_tp5_spin_slots.size() == windows, "TP5_SPIN_CORES needs one worker:courier pair per window");
+    } else {
+        // Highest-numbered CPUs; skip CPUs already claimed as a sibling.
+        std::vector<bool> used(std::size_t(ncpu), false);
+        for (long cpu = ncpu - 1; cpu >= 0 && g_tp5_spin_slots.size() < windows; --cpu) {
+            const int sib = tp5_sibling_of(int(cpu));
+            const int lo = std::min(int(cpu), sib), hi = std::max(int(cpu), sib);
+            if (used[std::size_t(lo)] || used[std::size_t(hi)]) continue;
+            used[std::size_t(lo)] = used[std::size_t(hi)] = true;
+            g_tp5_spin_slots.push_back({ lo, hi });
+        }
+        require(g_tp5_spin_slots.size() == windows, "not enough CPUs for dedicated spin cores");
+    }
+    // Exclude spin CPUs from this thread; threads created later inherit it.
+    cpu_set_t rest;
+    CPU_ZERO(&rest);
+    for (long cpu = 0; cpu < ncpu; ++cpu) CPU_SET(int(cpu), &rest);
+    for (const auto & slot : g_tp5_spin_slots) {
+        CPU_CLR(slot.worker, &rest);
+        CPU_CLR(slot.courier, &rest);
+    }
+    require(CPU_COUNT(&rest) > 0, "spin cores leave no CPU for the rest of the process");
+    require(sched_setaffinity(0, sizeof(rest), &rest) == 0, "cannot restrict process threads away from spin cores");
+    for (std::size_t w = 0; w < g_tp5_spin_slots.size(); ++w) {
+        std::fprintf(stderr, "TP5_SPIN_CORES window=%zu worker_cpu=%d courier_cpu=%d others_cpus=%d\n",
+            w, g_tp5_spin_slots[w].worker, g_tp5_spin_slots[w].courier, CPU_COUNT(&rest));
+    }
+}
+
+thread_local int tl_tp5_window = -1;
+
+// Busy-wait segments of a window worker migrate onto the window's dedicated
+// CPU and return to the shared mask afterwards, so host prepare / draft work
+// (which may fork CPU thread teams) never inherits a one-CPU mask.
+class scoped_spin_cpu {
+  public:
+    scoped_spin_cpu() {
+        if (tl_tp5_window < 0 || std::size_t(tl_tp5_window) >= g_tp5_spin_slots.size()) return;
+        if (sched_getaffinity(0, sizeof(saved_), &saved_) != 0) return;
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        CPU_SET(g_tp5_spin_slots[std::size_t(tl_tp5_window)].worker, &one);
+        active_ = sched_setaffinity(0, sizeof(one), &one) == 0;
+    }
+    ~scoped_spin_cpu() {
+        if (active_) sched_setaffinity(0, sizeof(saved_), &saved_);
+    }
+    scoped_spin_cpu(const scoped_spin_cpu &) = delete;
+    scoped_spin_cpu & operator=(const scoped_spin_cpu &) = delete;
+  private:
+    cpu_set_t saved_{};
+    bool active_ = false;
+};
+
+void tp5_pin_this_thread(std::size_t window, bool courier) {
+    if (window >= g_tp5_spin_slots.size()) return;
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(courier ? g_tp5_spin_slots[window].courier : g_tp5_spin_slots[window].worker, &one);
+    require(sched_setaffinity(0, sizeof(one), &one) == 0, "cannot pin spin thread");
+}
+
+// ASYNC-PROTOCOL (2026-10-27): FIFO ticket spin lock. No futex sleep, no
+// scheduler wake ("doorbell"): a waiter busy-waits on a shared counter and
+// enters the moment the previous holder's release store becomes visible.
+class spin_ticket_mutex {
+  public:
+    void lock() noexcept {
+        const std::uint32_t mine = next_.fetch_add(1, std::memory_order_relaxed);
+        if (serving_.load(std::memory_order_acquire) == mine) return;
+        scoped_spin_cpu dedicated;
+        while (serving_.load(std::memory_order_acquire) != mine) pause_cpu();
+    }
+    bool try_lock() noexcept {
+        std::uint32_t s = serving_.load(std::memory_order_acquire);
+        std::uint32_t n = s;
+        return next_.compare_exchange_strong(n, s + 1, std::memory_order_acquire, std::memory_order_relaxed);
+    }
+    void unlock() noexcept { serving_.fetch_add(1, std::memory_order_release); }
+  private:
+    alignas(64) std::atomic<std::uint32_t> next_{0};
+    alignas(64) std::atomic<std::uint32_t> serving_{0};
+};
+using submission_mutex_type = spin_ticket_mutex;
 
 [[noreturn]] void retain_and_exit(const char * why) {
     std::fprintf(stderr, "TP5_RETAINED_IN_FLIGHT: %s; native owners are not released\n", why);
@@ -146,6 +310,7 @@ void configure_hc_owner_layout(const options & opts) {
 
 struct backend_owner {
     backend_owner() {
+        tp5_force_hip_spin_wait();
         ggml_backend_load_all();
         llama_backend_init();
     }
@@ -206,8 +371,11 @@ class mtp_phase_pair {
             changed_.notify_all();
             return true;
         }
+        // ASYNC-PROTOCOL: no condvar sleep (1 ms scheduler doorbell); spin.
         while (generation_ == generation && !cancelled_ && !stopped.load()) {
-            changed_.wait_for(lock, std::chrono::milliseconds(1));
+            lock.unlock();
+            pause_cpu();
+            lock.lock();
         }
         if (stopped.load()) {
             cancelled_ = true;
@@ -248,7 +416,7 @@ class mtp_phase_pair {
 class mtp_submit_ready_scope {
   public:
     mtp_submit_ready_scope(bool enabled, bool release_after_submit, mtp_phase_pair & pair,
-                          std::unique_lock<std::mutex> & submission,
+                          std::unique_lock<submission_mutex_type> & submission,
                           const std::atomic<bool> & stopped, unsigned window,
                           std::uint64_t call, std::uint64_t & waits, std::uint64_t & hits,
                           std::uint64_t & submitted_hits)
@@ -326,7 +494,7 @@ class mtp_submit_ready_scope {
     bool enabled_;
     bool release_after_submit_;
     mtp_phase_pair & pair_;
-    std::unique_lock<std::mutex> & submission_;
+    std::unique_lock<submission_mutex_type> & submission_;
     const std::atomic<bool> & stopped_;
     unsigned window_;
     std::uint64_t call_;
@@ -334,6 +502,54 @@ class mtp_submit_ready_scope {
     std::uint64_t & hits_;
     std::uint64_t & submitted_hits_;
     unsigned called_ = 0;
+    unsigned submitted_ = 0;
+};
+
+// ASYNC-PROTOCOL: optional submit-only gate. The cross-window lock covers only
+// the native five-rank enqueue (Meta submit-ready -> submitted), i.e. the
+// asynchronous send itself; host prepare of one window never blocks the other.
+class mtp_submit_only_gate {
+  public:
+    mtp_submit_only_gate(bool enabled, std::unique_lock<submission_mutex_type> & submission,
+                         std::uint64_t & queue_ns)
+        : enabled_(enabled), submission_(submission), queue_ns_(queue_ns) {
+        if (!enabled_) return;
+        require(!submission_.owns_lock(), "submit-only gate must start unlocked");
+        require(ggml_backend_meta_set_submit_ready_hook(&arrive, this), "nested Meta submit-ready hook");
+        if (!ggml_backend_meta_set_submitted_hook(&submitted, this)) {
+            ggml_backend_meta_set_submit_ready_hook(nullptr, nullptr);
+            require(false, "nested Meta submitted hook");
+        }
+    }
+    ~mtp_submit_only_gate() {
+        if (!enabled_) return;
+        ggml_backend_meta_set_submitted_hook(nullptr, nullptr);
+        ggml_backend_meta_set_submit_ready_hook(nullptr, nullptr);
+    }
+    void check(int decoded) const {
+        if (enabled_ && decoded == 0) {
+            require(arrived_ == 1 && submitted_ == 1, "submit-only gate did not see exactly one native submit");
+        }
+    }
+  private:
+    static bool arrive(void * opaque) {
+        auto & self = *static_cast<mtp_submit_only_gate *>(opaque);
+        if (++self.arrived_ != 1 || self.submission_.owns_lock()) return false;
+        const auto begin = now_ns();
+        self.submission_.lock();
+        self.queue_ns_ += now_ns() - begin;
+        return true;
+    }
+    static bool submitted(void * opaque) {
+        auto & self = *static_cast<mtp_submit_only_gate *>(opaque);
+        if (self.arrived_ != 1 || ++self.submitted_ != 1 || !self.submission_.owns_lock()) return false;
+        self.submission_.unlock();
+        return true;
+    }
+    bool enabled_;
+    std::unique_lock<submission_mutex_type> & submission_;
+    std::uint64_t & queue_ns_;
+    unsigned arrived_ = 0;
     unsigned submitted_ = 0;
 };
 
@@ -427,7 +643,7 @@ class relay_service {
             auto item     = std::make_unique<service_window>();
             item->backend = backend;
             if (std::getenv("TP5_MTP_TIMELINE_PREFIX")) {
-                item->timings.reserve(131072);
+                item->timings.reserve(1048576);
             }
             windows_.push_back(std::move(item));
         }
@@ -441,26 +657,31 @@ class relay_service {
         // conjunction wait untouched.
         const char * dual_env = std::getenv("GGML_TP5_DW_COURIER_DUAL");
         courier_dual_ = dual_env != nullptr && std::strcmp(dual_env, "1") == 0;
-        const char * pw_env = std::getenv("TP5_RELAY_SERVICE_PER_WINDOW");
-        per_window_ = courier_metrics_ || (pw_env != nullptr && std::string(pw_env) == "1");
-        if (per_window_) {
-            for (std::size_t lane = 0; lane < windows_.size(); ++lane) {
-                try {
-                    threads_.emplace_back([this, lane] { loop_per_window(lane); });
-                } catch (...) {
-                    stop();
-                    throw;
-                }
-            }
-            while (lanes_ready_.load(std::memory_order_acquire) != windows_.size()) {
-                pause_cpu();
-            }
-        } else {
-            thread_ = std::thread([this] { loop(); });
-            while (!ready_.load(std::memory_order_acquire)) {
-                pause_cpu();
+        // ASYNC-PROTOCOL: one CPU courier per window (default). A single shared
+        // service thread serializes window A's fold/publish with window B's,
+        // so one window's T sits on the other's critical path.
+        const char * per_env = std::getenv("TP5_RELAY_SERVICE_PER_WINDOW");
+        require(!per_env || std::string(per_env) == "0" || std::string(per_env) == "1",
+                "TP5_RELAY_SERVICE_PER_WINDOW must be 0 or 1");
+        // MERGE NOTE: the dualwin line defaulted this OFF (single shared
+        // courier; opt-in per-window) while the LateBind line defaults it ON.
+        // The merged lane model is the LateBind one, so ON stays the default;
+        // TP5_RELAY_SERVICE_PER_WINDOW=0 restores the dualwin default. The
+        // dualwin courier-metrics gate still forces per-window lanes.
+        per_window_ = courier_metrics_ || !per_env || std::string(per_env) == "1";
+        const std::size_t lanes = per_window_ ? windows_.size() : 1;
+        for (std::size_t lane = 0; lane < lanes; ++lane) {
+            try {
+                threads_.emplace_back([this, lane, lanes] { loop(lane, lanes); });
+            } catch (...) {
+                stop();
+                throw;
             }
         }
+        while (ready_.load(std::memory_order_acquire) != lanes) {
+            pause_cpu();
+        }
+        std::fprintf(stderr, "TP5_RELAY_SERVICE threads=%zu windows=%zu\n", lanes, windows_.size());
     }
 
     ~relay_service() { stop(); }
@@ -473,9 +694,6 @@ class relay_service {
 
     void stop() noexcept {
         stop_.store(true, std::memory_order_release);
-        if (thread_.joinable()) {
-            thread_.join();
-        }
         for (auto & t : threads_) {
             if (t.joinable()) {
                 t.join();
@@ -1099,7 +1317,7 @@ class relay_service {
         }
     }
     void write_timings(const std::string & prefix) const {
-        require(!thread_.joinable(), "timing output requires a stopped service");
+        require(!running(), "timing output requires a stopped service");
         for (std::size_t i = 0; i < windows_.size(); ++i) {
             const auto path = prefix + ".relay-" + std::to_string(i) + ".csv";
             auto * out = std::fopen(path.c_str(), "wx");
@@ -1119,10 +1337,7 @@ class relay_service {
     }
 
     void copy_wire_metrics(std::size_t index, window_result & result) const {
-        require(!thread_.joinable(), "wire metrics require the stopped CPU service");
-        for (const auto & t : threads_) {
-            require(!t.joinable(), "wire metrics require the stopped CPU service");
-        }
+        require(!running(), "wire metrics require the stopped CPU service");
         const auto & window = *windows_[index];
         result.rank_input_packed_payload_bytes = window.rank_input_packed_payload_bytes;
         result.rank_output_consumed_payload_bytes = window.rank_output_consumed_payload_bytes;
@@ -1288,35 +1503,42 @@ class relay_service {
         return true;
     }
 
-    void loop() noexcept {
-        ready_.store(true, std::memory_order_release);
-        while (!stop_.load(std::memory_order_acquire)) {
-            for (std::size_t i = 0; i < windows_.size(); ++i) {
-                try {
-                    progress(i);
-                } catch (...) {
-                    failure_.fail(std::current_exception());
-                    abort_all();
-                }
-            }
-            pause_cpu();
+    bool running() const noexcept {
+        for (const auto & t : threads_) {
+            if (t.joinable()) return true;
         }
+        return false;
     }
 
-    // Gated lane: service up to kCourierPassEvents events per wake so a backlog
-    // of k costs one pass instead of k. Ablation keeps F1 off (one event per
-    // pass) while retaining every counter; F2 is switched off on the worker
-    // side (keep_snapshot), so both arms differ in F1+F2 only.
-    void loop_per_window(std::size_t lane) noexcept {
-        lanes_ready_.fetch_add(1, std::memory_order_acq_rel);
+    void loop(std::size_t lane, std::size_t lanes) noexcept {
+        // One courier per window -> its window's dedicated sibling CPU.
+        // A single shared courier (lanes==1) lands on window 0's courier CPU.
+        try {
+            tp5_pin_this_thread(lane, true);
+        } catch (...) {
+            failure_.fail(std::current_exception());
+        }
+        ready_.fetch_add(1, std::memory_order_acq_rel);
         while (!stop_.load(std::memory_order_acquire)) {
             try {
                 if (!courier_metrics_ || courier_ablate_) {
-                    (void) progress(lane);
+                    for (std::size_t i = lane; i < windows_.size(); i += lanes) {
+                        (void) progress(i);
+                    }
                 } else {
+                    // Gated lane: service up to kCourierPassEvents events per
+                    // wake so a backlog of k costs one pass instead of k.
+                    // Ablation keeps F1 off (one event per pass) while
+                    // retaining every counter; F2 is switched off on the
+                    // worker side (keep_snapshot), so both arms differ in
+                    // F1+F2 only.
                     for (std::size_t n = 0; n < kCourierPassEvents; ++n) {
-                        if (!progress(lane)) break;
-                        if (n) ++windows_[lane]->courier_batch_extra;
+                        bool any = false;
+                        for (std::size_t i = lane; i < windows_.size(); i += lanes) {
+                            any = progress(i) || any;
+                        }
+                        if (!any) break;
+                        if (n && lane < windows_.size()) ++windows_[lane]->courier_batch_extra;
                     }
                 }
             } catch (...) {
@@ -1337,10 +1559,9 @@ class relay_service {
     bool                                         dual_dumped_ = false;
     std::uint64_t                                run_;
     std::vector<std::unique_ptr<service_window>> windows_;
-    std::atomic<bool>                            ready_{ false }, stop_{ false };
-    std::thread                                  thread_;
+    std::atomic<std::size_t>                     ready_{ 0 };
+    std::atomic<bool>                            stop_{ false };
     std::vector<std::thread>                     threads_;
-    std::atomic<std::size_t>                     lanes_ready_{ 0 };
     bool                                         per_window_ = false;
 };
 
@@ -1446,11 +1667,25 @@ run_result run(const options & requested) {
     const char * pair_env = std::getenv("TP5_MTP_READY_PAIR");
     require(!pair_env || std::string(pair_env) == "0" || std::string(pair_env) == "1",
             "MTP phase pair must be 0 or 1");
-    const bool paired_phases = pair_env && std::string(pair_env) == "1";
+    // ASYNC-PROTOCOL (default ON in this candidate): fixed structure + async
+    // send + busy-wait. Same-phase meet() barriers contradict the dual-window
+    // proof (they force lockstep T with T), so TP5_MTP_READY_PAIR is ignored.
+    const char * async_env = std::getenv("TP5_MTP_ASYNC_PROTOCOL");
+    require(!async_env || std::string(async_env) == "0" || std::string(async_env) == "1",
+            "MTP async protocol must be 0 or 1");
+    const bool async_protocol = !async_env || std::string(async_env) == "1";
+    const bool ready_pair_requested = pair_env && std::string(pair_env) == "1";
+    const bool paired_phases = ready_pair_requested && !async_protocol;
+    const char * gate_env = std::getenv("TP5_MTP_SUBMIT_ONLY_GATE");
+    require(!gate_env || std::string(gate_env) == "0" || std::string(gate_env) == "1",
+            "MTP submit-only gate must be 0 or 1");
+    const bool submit_only_gate = async_protocol && (!gate_env || std::string(gate_env) == "1");
+    std::fprintf(stderr, "TP5_MTP_ASYNC_PROTOCOL enabled=%d ready_pair_requested=%d ready_pair_active=%d submit_only_gate=%d lock=fifo_spin\n",
+        int(async_protocol), int(ready_pair_requested), int(paired_phases), int(submit_only_gate));
     const char * unlock_env = std::getenv("TP5_MTP_POST_SUBMIT_UNLOCK");
     require(!unlock_env || std::string(unlock_env) == "0" || std::string(unlock_env) == "1",
             "MTP post-submit unlock must be 0 or 1");
-    const bool post_submit_unlock = unlock_env && std::string(unlock_env) == "1";
+    const bool post_submit_unlock = !async_protocol && unlock_env && std::string(unlock_env) == "1";
     require(!post_submit_unlock || paired_phases,
             "MTP post-submit unlock requires paired private native snapshot windows");
     require(!paired_phases || (mtp_draft_smoke && opts.windows == 2 && mtp_native_trim),
@@ -1460,6 +1695,7 @@ run_result run(const options & requested) {
     require(!mtp_t4_probe || (opts.prompts.size() == 2 && opts.windows == 2),
             "MTP native T4 probe requires two distinct private windows");
     configure_hc_owner_layout(opts);
+    tp5_plan_spin_cores(opts.windows);
     const bool                      swift = is_swift_model(opts.model);
     require(swift || opts.hc_owner_offsets.empty(), "HC context-owner offsets require the Swift HC97 model");
     require(swift || opts.execution != mode::relay || opts.context_per_request <= 512,
@@ -1750,10 +1986,10 @@ run_result run(const options & requested) {
     const std::string timeline_prefix = timeline_env ? timeline_env : "";
     std::vector<std::vector<cycle_timing_row>> cycle_timings(opts.windows);
     if (!timeline_prefix.empty()) {
-        for (auto & rows : cycle_timings) rows.reserve(1024);
+        for (auto & rows : cycle_timings) rows.reserve(1024 * 64);
     }
     mtp_phase_pair phase_pair(opts.windows, paired_phases);
-    std::mutex                 submission_mutex;
+    submission_mutex_type      submission_mutex;
     std::atomic<std::uint32_t> workers_done{ 0 };
     std::atomic<bool>          watchdog_stop{ false };
     std::vector<std::thread>   workers;
@@ -1779,11 +2015,69 @@ run_result run(const options & requested) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     });
+    const char * svc_rounds_env = std::getenv("TP5_SERVICE_ROUNDS");
+    const std::uint32_t service_rounds = svc_rounds_env ? std::uint32_t(std::max(1, std::atoi(svc_rounds_env))) : 1u;
+    require(service_rounds <= 64, "TP5_SERVICE_ROUNDS must be in [1,64]");
+    require(service_rounds == 1 || mtp_draft_smoke, "TP5_SERVICE_ROUNDS>1 requires the trained MTP path");
+    std::fprintf(stderr, "TP5_SERVICE_CONFIG rounds=%u\n", service_rounds);
+    std::vector<std::vector<llama_token>> svc_prompt_tokens;
+    if (const char * spf = std::getenv("TP5_SERVICE_PROMPTS")) {
+        FILE * pf = std::fopen(spf, "rb");
+        require(pf != nullptr, "cannot open TP5_SERVICE_PROMPTS");
+        std::string all; char pbuf[4096]; std::size_t pn;
+        while ((pn = std::fread(pbuf, 1, sizeof pbuf, pf)) > 0) all.append(pbuf, pn);
+        std::fclose(pf);
+        std::size_t s = 0;
+        while (s < all.size()) {
+            auto e = all.find('\n', s); if (e == std::string::npos) e = all.size();
+            if (e > s) {
+                svc_prompt_tokens.push_back(tokenize(vocab, all.substr(s, e - s)));
+                require(svc_prompt_tokens.back().size() + opts.predict <= opts.context_per_request, "service prompt too long");
+            }
+            s = e + 1;
+        }
+        require(!svc_prompt_tokens.empty(), "TP5_SERVICE_PROMPTS is empty");
+        require(assignments.size() == opts.windows, "service prompts need window assignments");
+        for (std::uint32_t w = 0; w < opts.windows; ++w) require(assignments[w].size() == 1, "service prompts need one request per window");
+        for (std::size_t k = 0; k < svc_prompt_tokens.size(); ++k)
+            std::fprintf(stderr, "TP5_SERVICE_PROMPT index=%zu round=%zu window=%zu tokens=%zu\n", k, k / opts.windows + 1, k % opts.windows, svc_prompt_tokens[k].size());
+    }
+    std::mutex svc_mutex; std::uint32_t svc_arrived = 0; std::uint64_t svc_gen = 0;
+    auto svc_barrier = [&]() {
+        std::unique_lock<std::mutex> lk(svc_mutex);
+        const auto g = svc_gen;
+        if (++svc_arrived == opts.windows) { svc_arrived = 0; ++svc_gen; return; }
+        while (svc_gen == g) {
+            require(!failure.stopped.load(), "service round barrier stopped");
+            lk.unlock(); std::this_thread::sleep_for(std::chrono::microseconds(50)); lk.lock();
+        }
+    };
     for (std::uint32_t wi = 0; wi < opts.windows; ++wi) {
         try {
             workers.emplace_back([&, wi] {
+                tl_tp5_window = int(wi);
                 bool epoch_active = false;
                 try {
+                for (std::uint32_t svc_round = 0; svc_round < service_rounds && !failure.stopped.load(); ++svc_round) {
+                    if (svc_round > 0) {
+                        svc_barrier();
+                        llama_synchronize(contexts[wi].get());
+                        llama_memory_clear(llama_get_memory(contexts[wi].get()), true);
+                        llama_synchronize(trained_mtp_contexts.at(wi).get());
+                        llama_memory_clear(llama_get_memory(trained_mtp_contexts.at(wi).get()), true);
+                        for (auto id : assignments[wi]) {
+                            auto & rq = result.requests[id];
+                            rq.tokens.clear(); rq.text.clear(); rq.stop_reason.clear(); rq.finished_ns = 0;
+                            if (!svc_prompt_tokens.empty()) {
+                                const std::size_t k = (std::size_t(svc_round) - 1) * opts.windows + wi;
+                                rq.prompt_tokens = svc_prompt_tokens[k % svc_prompt_tokens.size()];
+                            }
+                        }
+                        svc_barrier();
+                    }
+                    const auto svc_calls_begin = result.windows[wi].decode_calls;
+                    const auto svc_round_t0 = now_ns();
+                {
                     auto                                 ctx     = contexts[wi].get();
                     auto &                               metrics = result.windows[wi];
                     const auto &                         ids     = assignments[wi];
@@ -1805,6 +2099,162 @@ run_result run(const options & requested) {
                     std::uint64_t diag_first_count=0,diag_extra_count=0,diag_state_count=0;
                     std::uint64_t diag_state_only_count=0;
                     bool draft_pending = false;
+                    // LateBind Site 2 knob, resolved once per process
+                    // (C++11 static local init is thread-safe and runs exactly
+                    // once): one getenv and two direct char dereferences total,
+                    // never per run() call and never per epoch. No std::string
+                    // is constructed; the exact-'1' check is a direct
+                    // pointer/char comparison.
+                    static const bool lb_draft1_enabled = [] {
+                        const char * e = std::getenv("TP5_MTP_LATEBIND_DRAFT1");
+                        return e != nullptr && e[0] == '1' && e[1] == '\0';
+                    }();
+                    // LateBind verdict-reuse knob, default-ON candidate.
+                    // Three-state master gate GGML_TP5_LATEBIND:
+                    //   unset  -> ON (default-on candidate; the reuse capture
+                    //             and bind are still guarded by the exact-input
+                    //             guard, and OFF is recoverable at runtime by
+                    //             setting GGML_TP5_LATEBIND=0)
+                    //   "0"     -> OFF (hard kill switch; reuse fully disabled,
+                    //             byte-identical behavior to the knob-off base)
+                    //   "1"     -> ON (explicit opt-in, same as unset)
+                    //   other   -> require() failure (fail-loud; no silent
+                    //             interpretation of typos)
+                    // The legacy knob TP5_MTP_LATEBIND_REUSE_ACCEPT is kept as
+                    // an explicit override: when GGML_TP5_LATEBIND is unset,
+                    // exactly "1" turns reuse ON and exactly "0" turns it OFF
+                    // (anything else set fails loudly); when the master gate
+                    // IS set, the legacy knob must be unset or "1" (a "0"
+                    // under an explicit master gate is a contradiction and
+                    // fails loudly). Meaningful only when
+                    // TP5_MTP_LATEBIND_DRAFT1 is also on; every use site sits
+                    // inside lb_draft1_enabled-gated code.
+                    static const bool lb_reuse_accept_enabled = [] {
+                        const char * master = std::getenv("GGML_TP5_LATEBIND");
+                        const char * legacy = std::getenv("TP5_MTP_LATEBIND_REUSE_ACCEPT");
+                        if (master != nullptr) {
+                            require(std::string(master) == "0" || std::string(master) == "1",
+                                    "GGML_TP5_LATEBIND must be exactly \"0\" or \"1\"");
+                            require(legacy == nullptr || std::string(legacy) == "1",
+                                    "TP5_MTP_LATEBIND_REUSE_ACCEPT must be \"1\" or unset when GGML_TP5_LATEBIND is set");
+                            return std::string(master) == "1";
+                        }
+                        if (legacy != nullptr) {
+                            require(std::string(legacy) == "0" || std::string(legacy) == "1",
+                                    "TP5_MTP_LATEBIND_REUSE_ACCEPT must be exactly \"0\" or \"1\"");
+                            return std::string(legacy) == "1";
+                        }
+                        return true; // default-on candidate
+                    }();
+                    static const bool lb_selfcheck_reuse = [] {
+                        const char * e = std::getenv("GGML_TP5_LB_SELFCHECK_REUSE");
+                        return e != nullptr && e[0] == '1' && e[1] == '\0';
+                    }();
+                    static const bool lb_counters_enabled = [] {
+                        const char * e = std::getenv("TP5_MTP_LB_COUNTERS");
+                        return e != nullptr && e[0] == '1' && e[1] == '\0';
+                    }();
+                    static const bool lb_dump_enabled = [] {
+                        const char * e = std::getenv("TP5_MTP_LB_DUMP");
+                        return e != nullptr && e[0] == '1' && e[1] == '\0';
+                    }();
+                    std::string lb_dump_path;
+                    if (lb_dump_enabled) {
+                        // Path lookup and std::string construction run only
+                        // when the dump knob is on (one getenv + one small
+                        // allocation inside this branch). When the knob is
+                        // off, the remaining per-run cost is the empty
+                        // std::string default construction above plus the
+                        // two null checks at the dump site.
+                        const char * lb_dump_path_env = std::getenv("TP5_MTP_LB_DUMP_PATH");
+                        lb_dump_path = lb_dump_path_env && lb_dump_path_env[0]
+                            ? std::string(lb_dump_path_env) : std::string("latebind-site2-dump.bin");
+                    }
+                    // LateBind Site 2 instrumentation counters (env-gated,
+                    // default-off, exact value "1"): increment-on-event, one
+                    // stderr line per counter at run end. Every increment
+                    // sits behind lb_counters_enabled.
+                    // Counter semantics (exact):
+                    //   skip_gate  — the outer prefetch gate evaluated false.
+                    //       Counted ONLY for the verify_mtp_this_epoch term:
+                    //       epochs that reach the MTP verify block but were
+                    //       blocked by the other gate terms (flag off /
+                    //       mtp_draft_smoke off / no local rows) are NOT
+                    //       distinguishable here without re-evaluating those
+                    //       terms; they are simply not counted (see REPORT
+                    //       limitations).
+                    //   skip_null  — gate passed but h0/l0 were null.
+                    //   skip_eog / skip_budget — dispatch-conditional skips;
+                    //       BOTH may fire for the same epoch (EOG token AND
+                    //       exhausted budget are independent conditions), so
+                    //       their sum is NOT an event count and may exceed
+                    //       the number of skipped dispatches.
+                    //   prefetch / bind / discard_* / dump — one increment
+                    //       per event, disjoint by construction.
+                    // Process-wide (function-local static) dump mutex: ALL
+                    // window threads share ONE lock covering fopen through
+                    // fclose of a whole dump record (critical section at the
+                    // dump site below). A per-window mutex would NOT
+                    // serialize different window threads appending to the
+                    // same shared dump file — hence static here.
+                    static std::mutex lb_dump_mtx;
+                    std::uint64_t lb_ctr_prefetch = 0;
+                    std::uint64_t lb_ctr_bind = 0;
+                    std::uint64_t lb_ctr_discard_mismatch = 0;
+                    std::uint64_t lb_ctr_discard_replay = 0;
+                    std::uint64_t lb_ctr_discard_bindsite = 0;
+                    std::uint64_t lb_ctr_skip_gate = 0;
+                    std::uint64_t lb_ctr_skip_null = 0;
+                    std::uint64_t lb_ctr_skip_eog = 0;
+                    std::uint64_t lb_ctr_skip_budget = 0;
+                    std::uint64_t lb_ctr_reuse_kept = 0;
+                    // Additional verdict-reuse counters (allocated
+                    // unconditionally like the base counters; they are only
+                    // INCREMENTED under lb_counters_enabled; both stay 0 when
+                    // the reuse knob is off, printed unconditionally at the end
+                    // of the existing TP5_MTP_LB_COUNTERS line so the field
+                    // order never changes for pre-existing fields):
+                    //   bind_accept  — binds where the authoritative verdict
+                    //       a>0 and the exact-input guard passed (reuse
+                    //       happened). a==0 binds are NOT counted here.
+                    //   discard_guard — verdict-reuse attempts (knob on,
+                    //       prefetch live, a>0, row 0) that FAILED one of the
+                    //       exact-input guard terms at the bind site and fell
+                    //       back to the existing bindsite discard. Disjoint
+                    //       from bind_accept and from plain bindsite discards
+                    //       (a==0 gate misses keep only the old counter).
+                    //       discard_guard == sum of the seven per-term
+                    //       buckets below (token/trim/valid/row/pos/outflag/
+                    //       memcmp): each guard-failed attempt lands in the
+                    //       FIRST failing term by waterfall order, so the
+                    //       buckets are disjoint and exhaustive.
+                    std::uint64_t lb_ctr_bind_accept = 0;
+                    std::uint64_t lb_ctr_discard_guard = 0;
+                    std::uint64_t lb_ctr_disc_guard_token = 0;
+                    std::uint64_t lb_ctr_disc_guard_trim = 0;
+                    std::uint64_t lb_ctr_disc_guard_valid = 0;
+                    std::uint64_t lb_ctr_disc_guard_row = 0;
+                    std::uint64_t lb_ctr_disc_guard_pos = 0;
+                    std::uint64_t lb_ctr_disc_guard_outflag = 0;
+                    std::uint64_t lb_ctr_disc_guard_memcmp = 0;
+                    std::uint64_t lb_ctr_dump = 0;
+                    // Verdict-reuse persistent prefetch state. The h0 copy
+                    // buffer is allocated lazily at the (knob-gated) prefetch
+                    // capture site: with the reuse knob off it stays empty and
+                    // this block adds NO allocation. lb_reuse_h0_buf holds a
+                    // COPY of the h0 residual taken at prefetch time (the ctx
+                    // output buffer it aliases is overwritten by any later
+                    // decode before the bind site reads real_h). One buffer
+                    // reused across epochs — no per-epoch allocation when the
+                    // knob is on either.
+                    std::vector<float> lb_reuse_h0_buf;
+                    bool lb_reuse_h0_valid = false;
+                    bool lb_reuse_pref_output = false;
+                    std::int64_t lb_reuse_pos = -1;
+                    std::size_t lb_reuse_local0 = 0;
+                    // Captured from the authoritative verifier for this prefetch.
+                    bool lb_reuse_full_accept = false;
+                    std::size_t lb_reuse_verdict_n = 0;
                     std::uint64_t draft_phase_drains = 0;
                     std::uint64_t pair_before_ns=0, pair_after_ns=0, pair_meets=0;
                     std::uint64_t pair_ready_ns = 0, pair_ready_hits = 0, pair_submitted_hits = 0;
@@ -1931,8 +2381,8 @@ run_result run(const options & requested) {
                         const auto cycle_position = batch.batch.pos[0];
                         // Keep each window's five-rank submission together.
                         // Completion waits and CPU relay work stay outside this gate.
-                        std::unique_lock<std::mutex> submission_lock(submission_mutex, std::defer_lock);
-                        if (service) {
+                        std::unique_lock<submission_mutex_type> submission_lock(submission_mutex, std::defer_lock);
+                        if (service && !submit_only_gate) {
                             const auto queue_start=now_ns();
                             submission_lock.lock();
                             diag_queue+=now_ns()-queue_start;
@@ -1951,8 +2401,10 @@ run_result run(const options & requested) {
                             mtp_submit_ready_scope ready(paired_phases, post_submit_unlock, phase_pair, submission_lock,
                                 failure.stopped, wi, metrics.decode_calls + 1, pair_ready_ns, pair_ready_hits,
                                 pair_submitted_hits);
+                            mtp_submit_only_gate gate(service && submit_only_gate, submission_lock, diag_queue);
                             decoded = llama_decode(ctx, batch.batch);
                             ready.check(decoded);
+                            gate.check(decoded);
                         }
                         const auto submit_finished = now_ns();
                         metrics.decode_submit_ns += submit_finished - submit_start;
@@ -1991,6 +2443,8 @@ run_result run(const options & requested) {
                         const std::size_t dw_copy_streams =
                             dw_compose_epoch ? llama_tp5_output_copy_record(ctx) : 0;
                         const bool dw_output_barrier = dw_copy_streams > 0;
+                        std::optional<scoped_spin_cpu> verify_spin;
+                        verify_spin.emplace();
                         const auto wait_start = now_ns();
                         const float * single_output_logits = nullptr;
                         // DUALWIN-COMPOSE-EVENT: with the gate ON the per-epoch
@@ -2106,6 +2560,7 @@ run_result run(const options & requested) {
                         }
                         }
                         const auto wait_finished = now_ns();
+                        verify_spin.reset();
                         metrics.native_wait_ns += wait_finished - wait_start;
                         active.fetch_sub(1);
                         epoch_active = false;
@@ -2115,7 +2570,134 @@ run_result run(const options & requested) {
                             require(phase_pair.meet(failure.stopped), "MTP phase pair stopped after target");
                             pair_after_ns += now_ns() - begin;
                         }
+                        // LateBind Site 2 (Cut 10 / Bucket E): speculative
+                        // draft-step-1 prefetch on assumed verdict a=0.
+                        // Discard on a>0 is NOT side-effect-free: it
+                        // synchronizes the draft context and trims
+                        // speculative KV cells via timed_seq_rm.
+                        bool lb_draft1_prefetched = false;
+                        constexpr std::size_t lb_draft1_assumed_accepted = 0;
+                        std::size_t actual_accepted = 0;
+                        llama_token lb_draft1_token = 0;
+                        constexpr int wide = 10240;
+                        // skip_gate counts exactly the verify_mtp_this_epoch
+                        // term of the prefetch gate (see counter semantics
+                        // above for what is and is not distinguishable).
+                        if (lb_counters_enabled && !verify_mtp_this_epoch) ++lb_ctr_skip_gate;
+                        if (lb_draft1_enabled && mtp_draft_smoke && verify_mtp_this_epoch && local_rows.size() > 0) {
+                            auto * dctx_pref = trained_mtp_contexts.at(wi).get();
+                            const auto & req0 = result.requests[ids[local_rows[0]]];
+                            const float * h0 = llama_get_embeddings_nextn_ith(ctx, int32_t(local_rows[0]));
+                            const float * l0 = llama_get_logits_ith(ctx, 0);
+                            if (lb_counters_enabled && (h0 == nullptr || l0 == nullptr)) ++lb_ctr_skip_null;
+                            if (h0 != nullptr && l0 != nullptr) {
+                                bool h0_finite = true;
+                                for (int j = 0; j < wide; ++j) {
+                                    if (!std::isfinite(h0[j])) { h0_finite = false; break; }
+                                }
+                                require(h0_finite, "LateBind Pref(H0) invariant violation: nonfinite H0");
+                                const auto g0 = tq::sampling::select_finite_greedy(l0, n_vocab);
+                                require(g0.usable, "LateBind Pref(L0) invariant violation: nonfinite L0");
+                                lb_draft1_token = g0.selected.id;
+
+                                // Check predict budget and EOG before speculative dispatch
+                                const bool is_eog = !opts.ignore_eos && llama_vocab_is_eog(vocab, lb_draft1_token);
+                                if (lb_counters_enabled) {
+                                    if (is_eog) ++lb_ctr_skip_eog;
+                                    if (req0.tokens.size() + 1 >= opts.predict) ++lb_ctr_skip_budget;
+                                }
+                                if (req0.tokens.size() + 1 < opts.predict && !is_eog) {
+                                    // Speculatively dispatch draft step 1 on dctx for assumed state s~ (a=0).
+                                    // Synchronize any in-flight draft decode before KV metadata mutation:
+                                    if (draft_pending) {
+                                        llama_synchronize(dctx_pref);
+                                        draft_pending = false;
+                                    }
+                                    require(timed_seq_rm(llama_get_memory(dctx_pref), 0, static_cast<llama_pos>(consumed[0] + 1), -1),
+                                            "LateBind Pref draft attention KV pre-trim failed");
+
+                                    llama_batch dft_batch_pref = llama_batch_init(1, wide, 1);
+                                    dft_batch_pref.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
+                                    require(dft_batch_pref.token != nullptr, "LateBind pref MTP token allocation failed");
+                                    dft_batch_pref.n_tokens = 1;
+                                    dft_batch_pref.token[0] = lb_draft1_token;
+                                    dft_batch_pref.pos[0] = static_cast<llama_pos>(consumed[0] + 1);
+                                    dft_batch_pref.n_seq_id[0] = 1;
+                                    dft_batch_pref.seq_id[0][0] = 0;
+                                    dft_batch_pref.logits[0] = 1; // draft_output == true on assumed a=0
+                                    std::memcpy(dft_batch_pref.embd, h0, wide * sizeof(float));
+                                    const int dc_pref = llama_decode(dctx_pref, dft_batch_pref);
+                                    std::free(dft_batch_pref.token);
+                                    dft_batch_pref.token = nullptr;
+                                    llama_batch_free(dft_batch_pref);
+                                    require(dc_pref == 0, "LateBind pref speculative draft decode failed");
+                                    draft_pending = true;
+                                    lb_draft1_prefetched = true;
+                                    if (lb_counters_enabled) ++lb_ctr_prefetch;
+                                    if (lb_reuse_accept_enabled) {
+                                        // Verdict-reuse capture: persist the
+                                        // prefetch input residual. h0 aliases
+                                        // the ctx output buffer, which a
+                                        // replay-path decode overwrites before
+                                        // the bind site reads real_h; the
+                                        // bind-site guard needs the ORIGINAL
+                                        // bytes for the memcmp. The buffer is
+                                        // allocated here (first live prefetch)
+                                        // so the knob-off path never pays for
+                                        // it.
+                                        // Width self-check (fail-loud, no
+                                        // silent fallback): the whole LateBind
+                                        // site hardcodes wide=10240 for the
+                                        // memcpy/memcmp of the NextN residual.
+                                        // If the loaded target/draft model pair
+                                        // disagrees with that constant, the
+                                        // capture would copy the wrong number
+                                        // of bytes and the bind-site memcmp
+                                        // would compare a prefix/suffix mix —
+                                        // refuse to run rather than reuse
+                                        // garbage. Checked once per capture
+                                        // (first live prefetch per window);
+                                        // llama_model_n_embd_out returns the
+                                        // wide output-stream width
+                                        // (dsv4_hc_mult * n_embd = 4*2560).
+                                        require(llama_model_n_embd_out(
+                                                    llama_get_model(ctx)) == wide &&
+                                                llama_model_n_embd_out(
+                                                    llama_get_model(dctx_pref)) == wide,
+                                                "LateBind reuse width mismatch: model NextN residual width != 10240");
+                                        lb_reuse_h0_buf.resize(wide, 0.0f);
+                                        std::memcpy(lb_reuse_h0_buf.data(), h0,
+                                                    wide * sizeof(float));
+                                        lb_reuse_h0_valid   = true;
+                                        lb_reuse_pref_output = true;
+                                        lb_reuse_pos        = static_cast<std::int64_t>(consumed[0] + 1);
+                                        lb_reuse_local0     = local_rows[0];
+                                        lb_reuse_full_accept = false;
+                                        lb_reuse_verdict_n = 0;
+                                        // Superset invariant: the prefetch ran
+                                        // with logits[0]=1, so its dctx export
+                                        // (logits + NextN residual) is a
+                                        // SUPERSET of everything the serial
+                                        // row-0 decode could export under
+                                        // either draft_output value — the flag
+                                        // only gates whether dctx exports
+                                        // outputs, never the KV state it
+                                        // commits. draft_output=true consumers
+                                        // read the same bytes the serial path
+                                        // would have produced from the same
+                                        // inputs; draft_output=false consumers
+                                        // never read the export at all. The
+                                        // bind-site guard therefore checks
+                                        // that the prefetch DID export
+                                        // (lb_reuse_pref_output), not that the
+                                        // serial row-0 flag would have been
+                                        // equal.
+                                    }
+                                }
+                            }
+                        }
                         if (verify_mtp_this_epoch) {
+                            auto * dctx = trained_mtp_contexts.at(wi).get();
                             const std::size_t n=pending_mtp_tokens.size();
                             require(n>=1&&n<=3&&local_rows.size()==n+1&&output_rows==n+1,
                                 "MTP multistep must have exactly 1+N true target output rows");
@@ -2132,6 +2714,45 @@ run_result run(const options & requested) {
                             mtp_accepted_draft_tokens+=accepted;
                             if(full_accept)++mtp_accept_rounds;
                             else ++mtp_rollback_rounds;
+                            actual_accepted = accepted;
+                            if (lb_reuse_accept_enabled && lb_draft1_prefetched) {
+                                lb_reuse_full_accept = full_accept;
+                                if (lb_selfcheck_reuse) lb_reuse_verdict_n = n;
+                            }
+                            if (lb_draft1_enabled && lb_draft1_prefetched &&
+                                accepted != lb_draft1_assumed_accepted) {
+                                // Mismatch: authoritative verdict differs from
+                                // the assumed a=0. Base behavior discards the
+                                // prefetch unconditionally. With the reuse knob
+                                // on, a>0 epochs KEEP the prefetch alive for the
+                                // commit loop's bind site (guarded there); a==0
+                                // epochs keep the exact base discard.
+                                if (lb_reuse_accept_enabled && accepted > 0) {
+                                    if (lb_counters_enabled) ++lb_ctr_reuse_kept;
+                                    // Stop-condition self-check (fail-loud):
+                                    // keeping the prefetch alive across the
+                                    // commit loop assumes the request is still
+                                    // generating (its stop_reason is empty).
+                                    // The verify-epoch gate already checked the
+                                    // budget term (tokens+1 < predict) at
+                                    // prefetch time and the verdict does not
+                                    // emit tokens, so a non-empty stop_reason
+                                    // here would mean an invariant broke —
+                                    // refuse rather than bind into a finished
+                                    // request.
+                                    require(result.requests[ids[local_rows[0]]].stop_reason.empty(),
+                                            "LateBind reuse kept a prefetch for a stopped request");
+                                } else {
+                                    if (draft_pending) {
+                                        llama_synchronize(dctx);
+                                        draft_pending = false;
+                                    }
+                                    require(timed_seq_rm(llama_get_memory(dctx), 0, static_cast<llama_pos>(consumed[0] + 1), -1),
+                                            "LateBind mismatch speculative rollback trim failed");
+                                    lb_draft1_prefetched = false;
+                                    if (lb_counters_enabled) ++lb_ctr_discard_mismatch;
+                                }
+                            }
                             if (mtp_state_trace) {
                                 std::fprintf(stderr,
                                     "TP5_REAL_MTP_MULTI_VERDICT window=%u N=%zu accepted_prefix=%zu full=%u source_pos=%llu\n",
@@ -2146,10 +2767,15 @@ run_result run(const options & requested) {
                             // emitted source token x at consumed[0]. The next
                             // actual target output rows will re-enter the
                             // trained head with REAL target hidden states.
-                            auto * dctx=trained_mtp_contexts.at(wi).get();
-                            require(timed_seq_rm(llama_get_memory(dctx),0,
-                                       static_cast<llama_pos>(consumed[0]+1),-1),
-                                    "MTP draft attention KV speculative tail trim failed");
+                            if (!lb_draft1_prefetched) {
+                                if (lb_draft1_enabled && draft_pending) {
+                                    llama_synchronize(dctx);
+                                    draft_pending = false;
+                                }
+                                require(timed_seq_rm(llama_get_memory(dctx),0,
+                                           static_cast<llama_pos>(consumed[0]+1),-1),
+                                        "MTP draft attention KV speculative tail trim failed");
+                            }
                             pending_mtp_tokens.clear();
 
                             if (!full_accept) {
@@ -2244,21 +2870,28 @@ run_result run(const options & requested) {
                                 local_rows.resize(replay_n);
                                 output_rows=std::uint32_t(replay_n);
                                 single_output_row=replay_n==1 ? 0 : -1;
-                                std::unique_lock<std::mutex> replay_lock(
+                                std::unique_lock<submission_mutex_type> replay_lock(
                                     submission_mutex,std::defer_lock);
-                                if(service)replay_lock.lock();
+                                if(service && !submit_only_gate)replay_lock.lock();
                                 const auto active_count=active.fetch_add(1)+1;
                                 epoch_active=true;
                                 auto seen=maximum.load();
                                 while(seen<active_count &&
                                       !maximum.compare_exchange_weak(seen,active_count)){}
                                 const auto begin_replay=now_ns();
-                                const int ret=llama_decode(ctx,batch.batch);
+                                int ret;
+                                {
+                                    mtp_submit_only_gate replay_gate(service && submit_only_gate, replay_lock, diag_queue);
+                                    ret=llama_decode(ctx,batch.batch);
+                                    replay_gate.check(ret);
+                                }
                                 metrics.decode_submit_ns+=now_ns()-begin_replay;
                                 if(replay_lock.owns_lock())replay_lock.unlock();
                                 ++metrics.decode_calls;
                                 metrics.input_rows+=batch.batch.n_tokens;
                                 require(ret==0,"MTP multi verified-target-prefix replay failed");
+                                std::optional<scoped_spin_cpu> replay_spin;
+                                replay_spin.emplace();
                                 llama_synchronize(ctx);
                                 if(service) {
                                     ggml_relay_status status{};
@@ -2274,6 +2907,7 @@ run_result run(const options & requested) {
                                 }
                                 active.fetch_sub(1);
                                 epoch_active=false;
+                                replay_spin.reset();
 
                                 for(std::size_t j=0;j<replay_n;++j) {
                                     const float * replay=llama_get_logits_ith(ctx,int(j));
@@ -2341,6 +2975,22 @@ run_result run(const options & requested) {
                                         wi,accepted,replay_n,restored);
                                     std::fflush(stderr);
                                 }
+                                    // LateBind-only: discard prefetch and roll back dctx (fence + trim)
+                                    // on a rejected prefix. This discard sits inside the
+                                    // checkpoint-replay branch (the else of mtp_native_trim);
+                                    // on the native-trim path a rejected prefix leaves the
+                                    // prefetch live until the bind-site discard in the commit
+                                    // row loop (trim start equal for row 0).
+                                    if (lb_draft1_enabled && lb_draft1_prefetched) {
+                                        if (draft_pending) {
+                                            llama_synchronize(dctx);
+                                            draft_pending = false;
+                                        }
+                                        require(timed_seq_rm(llama_get_memory(dctx), 0, static_cast<llama_pos>(consumed[0] + 1), -1),
+                                                "LateBind replay fallback KV trim failed");
+                                        lb_draft1_prefetched = false;
+                                        if (lb_counters_enabled) ++lb_ctr_discard_replay;
+                                    }
                                 }
                             } else {
                                 target_state_checkpoint.clear();
@@ -2452,25 +3102,142 @@ run_result run(const options & requested) {
                                 }
                                 require(hnorm > 0, "actual target residual must be nontrivial");
                                 auto * dctx = trained_mtp_contexts.at(wi).get();
+                                bool reused_lb_draft = false;
+
+                                // LateBind Site 2 Bind check. Hoisted gate:
+                                // lb_draft1_enabled is tested once here, not in
+                                // each sub-branch, so per-row off-path cost is
+                                // exactly one predictable branch.
+                                if (lb_draft1_enabled && lb_draft1_prefetched) {
+                                    // Verdict-reuse guard (knob on): bind the
+                                    // prefetched draft when the authoritative
+                                    // verdict a>0 AND the serial decode this
+                                    // epoch would have consumed BITWISE-
+                                    // identical inputs: same slot layout, same
+                                    // pos, and the SAME target residual real_h
+                                    // (memcmp against the copy captured at
+                                    // prefetch time). Row 0 is pinned by the
+                                    // captured pos/local0/h0 triple, so the
+                                    // guard never needs to look at other rows.
+                                    // The serial row-0 draft_output flag is
+                                    // NOT a guard term: it only controls
+                                    // whether dctx exports logits/NextN
+                                    // outputs, never the KV state it commits.
+                                    // The prefetch ran with logits=1, so its
+                                    // export is a SUPERSET of every possible
+                                    // serial row-0 consumer (flag true → the
+                                    // consumer reads the prefetch export,
+                                    // same inputs → same bytes; flag false →
+                                    // the export is never read; row a's
+                                    // last-row decode re-exports on its own
+                                    // regardless). Under
+                                    // TP5_MTP_LAST_DRAFT_LOGITS=1 with a>0 the
+                                    // commit loop has a+1>=2 rows, so row 0
+                                    // has draft_output=false and its outputs
+                                    // are simply not read — reuse stays exact.
+                                    // The guard therefore only requires that
+                                    // the prefetch DID export
+                                    // (lb_reuse_pref_output, set at capture).
+                                    bool guard_ok = false;
+                                    if (lb_reuse_accept_enabled && mtp_native_trim &&
+                                        lb_reuse_h0_valid &&
+                                        row == 0 &&
+                                        local_rows[0] == lb_reuse_local0 &&
+                                        static_cast<std::int64_t>(consumed[local]) == lb_reuse_pos &&
+                                        actual_accepted > 0 &&
+                                        lb_reuse_pref_output) {
+                                        guard_ok = std::memcmp(real_h, lb_reuse_h0_buf.data(),
+                                                               std::size_t(wide) * sizeof(float)) == 0;
+                                    }
+                                    if (row == 0 && actual_accepted == lb_draft1_assumed_accepted &&
+                                        selected == lb_draft1_token) {
+                                        reused_lb_draft = true;
+                                        if (lb_counters_enabled) ++lb_ctr_bind;
+                                    } else if (selected == lb_draft1_token && guard_ok) {
+                                        if (lb_selfcheck_reuse) {
+                                            // Do not classify full acceptance as an error: the
+                                            // input guard above is authoritative for reuse.
+                                            // Check the latched verdict against its original N.
+                                            require(lb_reuse_verdict_n >= 1 &&
+                                                    actual_accepted <= lb_reuse_verdict_n &&
+                                                    lb_reuse_full_accept == (actual_accepted == lb_reuse_verdict_n),
+                                                    "LateBind reuse verifier verdict inconsistent");
+                                        } else {
+                                            require(!lb_reuse_full_accept,
+                                                    "LateBind reuse guard passed on a full_accept epoch");
+                                        }
+                                        reused_lb_draft = true;
+                                        // Deviation from base: base keeps
+                                        // lb_draft1_prefetched=true after a
+                                        // positive bind; here the prefetch
+                                        // state is consumed so a later replay
+                                        // or bind cannot double-use it.
+                                        lb_draft1_prefetched = false;
+                                        lb_reuse_h0_valid = false;
+                                        if (lb_counters_enabled) {
+                                            ++lb_ctr_bind;
+                                            ++lb_ctr_bind_accept;
+                                        }
+                                    } else {
+                                        // Discard: synchronize before roll back of speculative draft1 KV cache on dctx
+                                        if (draft_pending) {
+                                            llama_synchronize(dctx);
+                                            draft_pending = false;
+                                        }
+                                        require(timed_seq_rm(llama_get_memory(dctx), 0, static_cast<llama_pos>(consumed[local]), -1),
+                                                "LateBind Bind-site speculative KV rollback failed");
+                                        lb_draft1_prefetched = false;
+                                        if (lb_counters_enabled) {
+                                            if (lb_reuse_accept_enabled && actual_accepted > 0 && row == 0) {
+                                                // Guard attempt failed: bucket by
+                                                // the FIRST failing term in the
+                                                // same waterfall order the guard
+                                                // evaluates (token is checked
+                                                // first because the reuse branch
+                                                // tests it before guard_ok).
+                                                ++lb_ctr_discard_guard;
+                                                if (selected != lb_draft1_token) {
+                                                    ++lb_ctr_disc_guard_token;
+                                                } else if (!mtp_native_trim) {
+                                                    ++lb_ctr_disc_guard_trim;
+                                                } else if (!lb_reuse_h0_valid) {
+                                                    ++lb_ctr_disc_guard_valid;
+                                                } else if (local_rows[0] != lb_reuse_local0) {
+                                                    ++lb_ctr_disc_guard_row;
+                                                } else if (static_cast<std::int64_t>(consumed[local]) != lb_reuse_pos) {
+                                                    ++lb_ctr_disc_guard_pos;
+                                                } else if (!lb_reuse_pref_output) {
+                                                    ++lb_ctr_disc_guard_outflag;
+                                                } else {
+                                                    ++lb_ctr_disc_guard_memcmp;
+                                                }
+                                            } else {
+                                                ++lb_ctr_discard_bindsite;
+                                            }
+                                        }
+                                    }
+                                }
                                 const bool last_target_row=row+1==local_rows.size();
                                 const bool draft_output = !last_draft_logits || last_target_row;
                                 const auto first_start=now_ns();
-                                llama_batch dft_batch = llama_batch_init(1, wide, 1);
-                                dft_batch.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
-                                require(dft_batch.token != nullptr, "actual MTP token input allocation failed");
-                                dft_batch.n_tokens = 1;
-                                dft_batch.token[0] = selected;
-                                dft_batch.pos[0] = static_cast<llama_pos>(consumed[local]);
-                                dft_batch.n_seq_id[0] = 1;
-                                dft_batch.seq_id[0][0] = 0;
-                                dft_batch.logits[0] = draft_output ? 1 : 0;
-                                std::memcpy(dft_batch.embd, real_h, wide*sizeof(float));
-                                const int dc = llama_decode(dctx, dft_batch);
-                                std::free(dft_batch.token);
-                                dft_batch.token = nullptr;
-                                llama_batch_free(dft_batch);
-                                require(dc == 0, "actual MTP draft decode from target residual failed");
-                                draft_pending = true;
+                                if (!reused_lb_draft) {
+                                    llama_batch dft_batch = llama_batch_init(1, wide, 1);
+                                    dft_batch.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
+                                    require(dft_batch.token != nullptr, "actual MTP token input allocation failed");
+                                    dft_batch.n_tokens = 1;
+                                    dft_batch.token[0] = selected;
+                                    dft_batch.pos[0] = static_cast<llama_pos>(consumed[local]);
+                                    dft_batch.n_seq_id[0] = 1;
+                                    dft_batch.seq_id[0][0] = 0;
+                                    dft_batch.logits[0] = draft_output ? 1 : 0;
+                                    std::memcpy(dft_batch.embd, real_h, wide*sizeof(float));
+                                    const int dc = llama_decode(dctx, dft_batch);
+                                    std::free(dft_batch.token);
+                                    dft_batch.token = nullptr;
+                                    llama_batch_free(dft_batch);
+                                    require(dc == 0, "actual MTP draft decode from target residual failed");
+                                    draft_pending = true;
+                                }
                                 // These rows only update draft KV. Their outputs are unused.
                                 if (!draft_output) {
                                     diag_draft_first+=now_ns()-first_start; ++diag_first_count;
@@ -2480,6 +3247,119 @@ run_result run(const options & requested) {
                                     const auto * dh = llama_get_embeddings_nextn_ith(dctx, 0);
                                     require(dl && dh, "actual MTP draft missing logits/wide output");
                                     draft_pending = false;
+                                    if (lb_dump_enabled && row == 0) {
+                                        // Bind-site dump: captures the draft
+                                        // logits row at the SAME Dep site for
+                                        // BOTH control paths — the reused
+                                        // prefetched draft (path=1) and the
+                                        // baseline serial decode (path=0) —
+                                        // plus the input residual that produced
+                                        // them, so leg 3 can establish
+                                        // same-input comparison (equal
+                                        // residual, equal token, equal pos).
+                                        //
+                                        // EXACT FILE FORMAT (portable, explicit
+                                        // little-endian byte serialization; no
+                                        // raw struct fwrite, host-ABI- and
+                                        // endian-independent):
+                                        //   u32le magic: file bytes 'L','B',
+                                        //     'D','1' (0x31 0x44 0x42 0x4C)
+                                        //   u32le window_id
+                                        //   u32le request_id
+                                        //   u32le accepted (target verdict a)
+                                        //   u32le row
+                                        //   i32le token (draft token fed at
+                                        //     this site; reused -> the
+                                        //     prefetched lb_draft1_token,
+                                        //     serial -> the target-selected id)
+                                        //   i32le selected (target greedy id
+                                        //     at this row)
+                                        //   i32le pos (llama_pos fed to the
+                                        //     draft decode: consumed[local])
+                                        //   u64le epoch (decode call count)
+                                        //   u32le n_vocab (logit count below)
+                                        //   u32le path (0=serial, 1=reused)
+                                        //   -- header ends at offset 48 --
+                                        //   n_vocab x f32le: draft logits
+                                        //   wide(10240) x f32le: input wide
+                                        //     NextN residual (real_h at this
+                                        //     site, i.e. the residual the
+                                        //     SERIAL decode consumed; for the
+                                        //     reused path this aliases the same
+                                        //     embeddings row the prefetch read
+                                        //     — both are
+                                        //     llama_get_embeddings_nextn_ith(ctx,0)
+                                        //     in this epoch with no intervening
+                                        //     decode on ctx — a static aliasing
+                                        //     argument to be confirmed by the
+                                        //     recorded bytes on hardware, NOT an
+                                        //     independently proven equality)
+                                        // Record size =
+                                        //   48 + 4*n_vocab + 4*10240 bytes.
+                                        // Pairs are matched for comparison by
+                                        // (window, request_id, pos, token):
+                                        // same-input requires equal residual
+                                        // bytes; the gate is bitwise-equal
+                                        // logits or KL exactly 0.
+                                        // Whole-record serialization: the
+                                        // mutex makes each record (header +
+                                        // logits + residual) atomic against
+                                        // concurrent windows appending to the
+                                        // same file, so no interleaved or
+                                        // corrupted records are possible.
+                                        std::lock_guard<std::mutex> lb_lock(lb_dump_mtx);
+                                        FILE * lb_dump_file = std::fopen(lb_dump_path.c_str(), "ab");
+                                        require(lb_dump_file != nullptr, "LateBind dump open failed");
+                                        auto lb_w32 = [&](std::uint32_t v) {
+                                            unsigned char b[4] = {
+                                                (unsigned char)(v & 0xFFu),
+                                                (unsigned char)((v >> 8) & 0xFFu),
+                                                (unsigned char)((v >> 16) & 0xFFu),
+                                                (unsigned char)((v >> 24) & 0xFFu)};
+                                            return std::fwrite(b, 1, 4, lb_dump_file) == 4;
+                                        };
+                                        auto lb_w64 = [&](std::uint64_t v) {
+                                            unsigned char b[8];
+                                            for (int k = 0; k < 8; ++k) b[k] = (unsigned char)((v >> (8 * k)) & 0xFFu);
+                                            return std::fwrite(b, 1, 8, lb_dump_file) == 8;
+                                        };
+                                        auto lb_wf32a = [&](const float * p, std::size_t count) {
+                                            // IEEE-754 floats serialized as
+                                            // little-endian u32 bit patterns
+                                            // (bit-preserving; no float math).
+                                            for (std::size_t k = 0; k < count; ++k) {
+                                                std::uint32_t bits;
+                                                std::memcpy(&bits, p + k, sizeof(bits));
+                                                if (!lb_w32(bits)) return false;
+                                            }
+                                            return true;
+                                        };
+                                        const auto & lb_req = result.requests[ids[local]];
+                                        bool lb_ok = true;
+                                        lb_ok = lb_w32(0x3144424Cu) && lb_ok; // LE bytes spell "LBD1"
+                                        lb_ok = lb_w32(std::uint32_t(wi)) && lb_ok;
+                                        lb_ok = lb_w32(lb_req.id) && lb_ok;
+                                        lb_ok = lb_w32(std::uint32_t(actual_accepted)) && lb_ok;
+                                        lb_ok = lb_w32(std::uint32_t(row)) && lb_ok;
+                                        lb_ok = lb_w32(std::uint32_t(reused_lb_draft ? lb_draft1_token : selected)) && lb_ok;
+                                        lb_ok = lb_w32(std::uint32_t(selected)) && lb_ok;
+                                        lb_ok = lb_w32(std::uint32_t(consumed[local])) && lb_ok;
+                                        lb_ok = lb_w64(std::uint64_t(metrics.decode_calls)) && lb_ok;
+                                        lb_ok = lb_w32(std::uint32_t(n_vocab)) && lb_ok;
+                                        lb_ok = lb_w32(reused_lb_draft ? 1u : 0u) && lb_ok;
+                                        lb_ok = lb_ok && lb_wf32a(dl, size_t(n_vocab));
+                                        lb_ok = lb_ok && lb_wf32a(real_h, size_t(wide));
+                                        const bool lb_closed = std::fclose(lb_dump_file) == 0;
+                                        require(lb_ok && lb_closed, "LateBind dump write failed");
+                                        if (lb_counters_enabled) ++lb_ctr_dump;
+                                        std::fprintf(stderr,
+                                            "TP5_MTP_LB_DUMP window=%u path=%s request=%u accepted=%u row=%zu pos=%d token=%d selected=%d logits=%s\n",
+                                            wi, reused_lb_draft ? "reused" : "serial",
+                                            unsigned(lb_req.id), static_cast<unsigned>(actual_accepted), row,
+                                            (int)consumed[local], reused_lb_draft ? (int)lb_draft1_token : (int)selected,
+                                            (int)selected, lb_dump_path.c_str());
+                                        std::fflush(stderr);
+                                    }
                                     auto dg = tq::sampling::select_finite_greedy(dl,n_vocab);
                                     require(dg.usable, "actual trained MTP logits must be finite");
                                     double dsum=0;
@@ -2662,6 +3542,76 @@ run_result run(const options & requested) {
                                 double(mtp_accepted_draft_tokens)/mtp_proposal_tokens : 0.0);
                         std::fflush(stderr);
                     }
+                    if (lb_counters_enabled) {
+                        std::fprintf(stderr,
+                            "TP5_MTP_LB_COUNTERS window=%u prefetch=%llu bind=%llu reuse_kept=%llu discard_mismatch=%llu discard_replay=%llu discard_bindsite=%llu discard_guard=%llu skip_gate=%llu skip_null=%llu skip_eog=%llu skip_budget=%llu dump=%llu bind_accept=%llu discard_guard_token=%llu discard_guard_trim=%llu discard_guard_valid=%llu discard_guard_row=%llu discard_guard_pos=%llu discard_guard_outflag=%llu discard_guard_memcmp=%llu\n",
+                            wi,
+                            (unsigned long long)lb_ctr_prefetch,
+                            (unsigned long long)lb_ctr_bind,
+                            (unsigned long long)lb_ctr_reuse_kept,
+                            (unsigned long long)lb_ctr_discard_mismatch,
+                            (unsigned long long)lb_ctr_discard_replay,
+                            (unsigned long long)lb_ctr_discard_bindsite,
+                            (unsigned long long)lb_ctr_discard_guard,
+                            (unsigned long long)lb_ctr_skip_gate,
+                            (unsigned long long)lb_ctr_skip_null,
+                            (unsigned long long)lb_ctr_skip_eog,
+                            (unsigned long long)lb_ctr_skip_budget,
+                            (unsigned long long)lb_ctr_dump,
+                            (unsigned long long)lb_ctr_bind_accept,
+                            (unsigned long long)lb_ctr_disc_guard_token,
+                            (unsigned long long)lb_ctr_disc_guard_trim,
+                            (unsigned long long)lb_ctr_disc_guard_valid,
+                            (unsigned long long)lb_ctr_disc_guard_row,
+                            (unsigned long long)lb_ctr_disc_guard_pos,
+                            (unsigned long long)lb_ctr_disc_guard_outflag,
+                            (unsigned long long)lb_ctr_disc_guard_memcmp);
+                        std::fflush(stderr);
+                    }
+                }
+                    for (auto id : assignments[wi]) {
+                        const auto & rq = result.requests[id];
+                        auto fnv = [](std::uint64_t h, const void * p, std::size_t n) {
+                            const auto * b = static_cast<const unsigned char *>(p);
+                            for (std::size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+                            return h;
+                        };
+                        std::uint64_t th = 1469598103934665603ull, lh = 1469598103934665603ull;
+                        std::string toks, lhs, cns;
+                        for (const auto & t : rq.tokens) {
+                            th = fnv(th, &t.emitted_token, sizeof(t.emitted_token));
+                            const auto one = fnv(1469598103934665603ull, t.logits.data(), t.logits.size() * sizeof(float));
+                            lh = fnv(lh, &one, sizeof(one));
+                            char buf[64];
+                            std::snprintf(buf, sizeof buf, "%s%d", toks.empty() ? "" : ",", int(t.emitted_token)); toks += buf;
+                            std::snprintf(buf, sizeof buf, "%s\"%016llx\"", lhs.empty() ? "" : ",", (unsigned long long)one); lhs += buf;
+                            std::snprintf(buf, sizeof buf, "%s%llu", cns.empty() ? "" : ",", (unsigned long long)t.committed_ns); cns += buf;
+                        }
+                        const auto calls_end = result.windows[wi].decode_calls;
+                        const std::uint64_t ttft = rq.tokens.empty() ? 0 : rq.tokens.front().committed_ns - rq.admitted_ns;
+                        const std::uint64_t span = rq.tokens.empty() ? 0 : rq.tokens.back().committed_ns - rq.tokens.front().committed_ns;
+                        std::fprintf(stderr,
+                            "TP5_SERVICE_ROUND window=%u round=%u request=%u prompt_tokens=%zu tokens=%zu stop=%s calls_begin=%llu calls_end=%llu round_t0_ns=%llu admitted_ns=%llu ttft_ns=%llu decode_span_ns=%llu finished_ns=%llu tok_fnv=%016llx logits_fnv=%016llx logits_rows=%zu\n",
+                            wi, svc_round, unsigned(id), rq.prompt_tokens.size(), rq.tokens.size(), rq.stop_reason.c_str(),
+                            (unsigned long long)svc_calls_begin, (unsigned long long)calls_end,
+                            (unsigned long long)svc_round_t0, (unsigned long long)rq.admitted_ns,
+                            (unsigned long long)ttft, (unsigned long long)span, (unsigned long long)rq.finished_ns,
+                            (unsigned long long)th, (unsigned long long)lh,
+                            rq.tokens.empty() ? std::size_t(0) : rq.tokens.front().logits.size());
+                        if (!timeline_prefix.empty()) {
+                            const auto path = timeline_prefix + ".rounds-" + std::to_string(wi) + ".jsonl";
+                            FILE * f = std::fopen(path.c_str(), "a");
+                            require(f != nullptr, "cannot open service round output");
+                            std::fprintf(f, "{\"window\":%u,\"round\":%u,\"request\":%u,\"calls_begin\":%llu,\"calls_end\":%llu,\"round_t0_ns\":%llu,\"admitted_ns\":%llu,\"finished_ns\":%llu,\"stop\":\"%s\",\"emitted\":[%s],\"committed_ns\":[%s],\"logits_fnv\":[%s]}\n",
+                                wi, svc_round, unsigned(id), (unsigned long long)svc_calls_begin, (unsigned long long)calls_end,
+                                (unsigned long long)svc_round_t0, (unsigned long long)rq.admitted_ns, (unsigned long long)rq.finished_ns,
+                                rq.stop_reason.c_str(), toks.c_str(), cns.c_str(), lhs.c_str());
+                            require(std::fclose(f) == 0, "service round output failed");
+                        }
+                        require(!rq.stop_reason.empty() || failure.stopped.load(), "service round request did not complete");
+                    }
+                    std::fflush(stderr);
+                }
                 } catch (...) {
                     if (epoch_active) {
                         active.fetch_sub(1);

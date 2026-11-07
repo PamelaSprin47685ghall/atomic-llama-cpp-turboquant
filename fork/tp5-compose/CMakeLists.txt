@@ -29,7 +29,8 @@ target_include_directories(tq_tp5_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(tq_tp5_runtime PRIVATE llama TQRelay::relay
-    TQSampling::sampling TQScheduling::scheduling TQText::text Threads::Threads)
+    TQSampling::sampling TQScheduling::scheduling TQText::text Threads::Threads
+    ${CMAKE_DL_LIBS})
 
 add_executable(tq_tp5_compose src/main.cpp)
 set_target_properties(tq_tp5_compose PROPERTIES OUTPUT_NAME tq-tp5-compose)
