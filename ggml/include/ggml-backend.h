@@ -320,6 +320,8 @@ extern "C" {
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
+    GGML_API bool                 ggml_backend_sched_reserve_min(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, const size_t * min_sizes); // TP5 max-footprint share: reserve at a per-backend minimum size
+    GGML_API void                 ggml_backend_sched_reserve_size_preserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
