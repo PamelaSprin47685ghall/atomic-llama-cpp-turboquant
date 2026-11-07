@@ -3,10 +3,12 @@
   "upstream_commit": "cda0f9256665845cd9d6f3a0176880883f653a3d",
   "files": [
     {
-      "path": "保姆级蓝图手册.md",
+      "path": "\u4fdd\u59c6\u7ea7\u84dd\u56fe\u624b\u518c.md",
       "sha256": "1c68cfdaf1eca706a950e6601b97ecad66f8884ccb638e0f0eb70c3be591a537",
       "mode": "100644",
-      "consumers": ["TP5 MTP engineering and experiment review"],
+      "consumers": [
+        "TP5 MTP engineering and experiment review"
+      ],
       "reason": "Preserve the project-level MTP engineering blueprint and its bounded experimental evidence alongside the source snapshot.",
       "removal_condition": "Remove this root overlay when the blueprint is maintained under fork/ and all references use that location."
     },
@@ -508,24 +510,26 @@
     },
     {
       "path": "src/llama-kv-cache.cpp",
-      "sha256": "839df30582f517eec4715ff46b323fb57a773500675b9e84fbd5f6f04b7c4da5",
+      "sha256": "8f5a8f81ef6e39437db2cc2928c13cb58277c34e75134d256a91842599048bea",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
-        "fork/tests/a-seams"
+        "fork/tests/a-seams",
+        "tq-tp5-compose (WS3 host pool)"
       ],
-      "reason": "Resolve logical keys only inside A after allocation; reject missing, shifted, duplicate, ambiguous or pending peer identities.",
+      "reason": "Resolve logical keys only inside A after allocation; reject missing, shifted, duplicate, ambiguous or pending peer identities. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL.",
       "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
     },
     {
       "path": "src/llama-kv-cache.h",
-      "sha256": "e230833526353e57beb9113162f002122bf8c63eb6de8d7e310abaaac50a04fa",
+      "sha256": "449b9f8b397c7509c9ec6eb37795e6d13af2d58874287338572be7ad7acbc4da",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
-        "fork/tests/a-seams"
+        "fork/tests/a-seams",
+        "tq-tp5-compose (WS3 host pool)"
       ],
-      "reason": "Keep explicit reader views and expose internal preparation and resolution to the native graph builder.",
+      "reason": "Keep explicit reader views and expose internal preparation and resolution to the native graph builder. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL.",
       "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
     },
     {
@@ -719,6 +723,111 @@
       ],
       "reason": "For existing native Q2_0 by Q8_1 MMVQ on HIP RDNA2, replace the byte-permutation LUT decode with an exact unsigned integer crumb expansion to the same signed [-1,0,1,2] bytes. Preserve the stored weights and activation format, both integer dot products, scale loads, loop and return expression; all other architectures retain the original helper. This shared helper covers ordinary, routed, separate and fused gate/up native MMVQ. No new quantization, lower-bit conversion, removed term or expert is introduced. Actual gfx1030 ISA eliminates LUT LDS traffic and lowers register use; CPU exhaustive mapping and same-binary finite bitwise native micro evidence are recorded in build-tp5-dual50-20261022/q2-integer-unpack-candidate. Kernel micro throughput does not qualify full-model throughput.",
       "removal_condition": "Remove when upstream provides equivalent efficient decode or complete two-request measurements no longer justify the specialization. Preserve exact integer mapping, all original coefficients and expert contributions, original non-RDNA2 fallback and the established precision policy. Require defect-focused installed-backend numerical/capture checks, finite natural five-device two-request generation, unchanged capacities and independent complete token-interval measurements. Finite micro input qualification does not establish NaN/Inf-input equivalence or full-model quality; registering this hash alone is not runtime or performance qualification."
+    },
+    {
+      "path": "src/CMakeLists.txt",
+      "sha256": "128beb3e3ff595ca5e2bb09db9b11826c0b2c2b49e3d9a372b568631cf1585c9",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose"
+      ],
+      "reason": "Build the pooled ubatch payload source into libllama.",
+      "removal_condition": "Remove when the pool source is unconditional and upstream owns it."
+    },
+    {
+      "path": "src/llama-batch.cpp",
+      "sha256": "3f0b682e4e22821547fa04fc788d6eb627de83608f93801baa1e711deb5b7b6e",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose",
+        "llama batch allocator tests"
+      ],
+      "reason": "Acquire ubatch payloads from the fixed-slot pool and restore every caller-filled array on a reused slot.",
+      "removal_condition": "Remove when the pool is unconditional and upstream provides a reusable ubatch payload allocator."
+    },
+    {
+      "path": "src/llama-batch.h",
+      "sha256": "347fa0a9a5ed852fc60791aca6851ec24f7456711283e36e7e823f09b19894eb",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose",
+        "llama batch allocator tests"
+      ],
+      "reason": "Store the ubatch payload in the pooled handle and keep the allocr pool beside the split state.",
+      "removal_condition": "Remove when the pool is unconditional and upstream owns the ubatch payload type."
+    },
+    {
+      "path": "src/llama-kv-cells.h",
+      "sha256": "a83f1481e72ef801d49fbbee4544400f4c0c3bfff64932eefff137a1809c85e9",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose",
+        "llama kv snapshot tests"
+      ],
+      "reason": "Add cp_into, which copies the cp value set into an existing cell buffer so its capacity survives.",
+      "removal_condition": "Remove when upstream provides a reusable cell snapshot copy."
+    },
+    {
+      "path": "src/llama-tp5-flags.h",
+      "sha256": "418af26f2291b056730a606721691cb36deb4c12003a1cf03786b42d5ad7bba6",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose"
+      ],
+      "reason": "Define the exact-one TP5 host-pool switches so every pool keeps a flag-off path.",
+      "removal_condition": "Remove when the pool paths become unconditional."
+    },
+    {
+      "path": "src/llama-ubatch-pool.cpp",
+      "sha256": "685d020f6f6526f4633793f8eedb620762d8aa4a6f2eeae3da4df8c21c7c187f",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose",
+        "llama batch allocator tests"
+      ],
+      "reason": "Implement the fixed-slot ubatch payload pool, its intrusive handle, and stale-generation rejection.",
+      "removal_condition": "Remove when upstream provides an equivalent reusable ubatch payload allocator."
+    },
+    {
+      "path": "src/llama-ubatch-pool.h",
+      "sha256": "904038b105ae766afdb9eec04328a60d450e715f86cc32dc81bdd3ca3366302f",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose",
+        "llama batch allocator tests"
+      ],
+      "reason": "Declare the pooled ubatch payload and the handle that owns a slot or a heap fallback.",
+      "removal_condition": "Remove when upstream provides an equivalent reusable ubatch payload allocator."
+    },
+    {
+      "path": "tests/CMakeLists.txt",
+      "sha256": "0224082411c28b6cdc42ca62c0137724df7158435ab44a5f64bd394ab59e7b33",
+      "mode": "100644",
+      "consumers": [
+        "llama batch allocator tests"
+      ],
+      "reason": "Register the TP5 ubatch pool test target.",
+      "removal_condition": "Remove when the pool test moves into the upstream test tree."
+    },
+    {
+      "path": "tests/test-batch-alloc.cpp",
+      "sha256": "c93cf0473a290635e1986e83702e21243562abf71d90247d704ad393bee59d32",
+      "mode": "100644",
+      "consumers": [
+        "llama batch allocator tests"
+      ],
+      "reason": "Check that pooled and heap ubatch splits carry identical values and that reserve resets a reused slot.",
+      "removal_condition": "Remove when the pool is unconditional and the equivalent checks live in the upstream test suite."
+    },
+    {
+      "path": "tests/test-tp5-ubatch-pool.cpp",
+      "sha256": "e7583ae827008d85586fa21393fa8cb9a504a170fdb7939c914f6b3160bf02f3",
+      "mode": "100644",
+      "consumers": [
+        "llama batch allocator tests"
+      ],
+      "reason": "Check slot reuse, generations, concurrency, steady-state allocation, and cp_into value equality.",
+      "removal_condition": "Remove when the pool is unconditional and the equivalent checks live in the upstream test suite."
     }
   ]
 }
