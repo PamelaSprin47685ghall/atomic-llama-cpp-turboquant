@@ -166,9 +166,13 @@ private:
     std::vector<bool> used;
 
     // TP5_UBATCH_POOL=1: reused ubatch payload slots, configured to
-    // n_ubatch + 2 on the first split. Disabled: every ubatch owns a heap
-    // payload, as before.
-    ubatch_data_pool ubatch_pool;
+    // n_ubatch + 2 on the first split. The handles keep this pool alive, so
+    // a ubatch that outlives the allocator (llm_graph_params copies one)
+    // cannot release into a destroyed mutex. Disabled: every ubatch owns a
+    // heap payload, as before.
+    std::shared_ptr<ubatch_data_pool> ubatch_pool;
+
+    void ensure_ubatch_pool(uint32_t n_ubatch);
 
     int debug;
 };

@@ -58,16 +58,19 @@ public:
 private:
     friend class ubatch_data_pool;
 
-    ubatch_data_handle(ubatch_data_pool * pool, uint32_t slot, uint32_t gen);
+    ubatch_data_handle(std::shared_ptr<ubatch_data_pool> pool, uint32_t slot, uint32_t gen);
 
-    ubatch_data_pool * pool_ = nullptr;
+    // The handle keeps the pool alive. A ubatch can outlive the allocator
+    // that created it (llm_graph_params intentionally copies it), so a raw
+    // pool pointer would release into a destroyed mutex.
+    std::shared_ptr<ubatch_data_pool> pool_;
     uint32_t slot_ = 0;
     uint32_t gen_  = 0;
 
     std::shared_ptr<llama_ubatch_data> fallback_;
 };
 
-class ubatch_data_pool {
+class ubatch_data_pool : public std::enable_shared_from_this<ubatch_data_pool> {
 public:
     struct stats_t {
         std::uint64_t acquired  = 0; // handles handed out from a slot
@@ -90,7 +93,8 @@ public:
     bool     configured() const;
     uint32_t capacity()   const;
 
-    // Empty handle when the pool is not configured or exhausted.
+    // Empty handle when the pool is not configured or exhausted. The pool
+    // must be owned by a shared_ptr; every handle keeps that ownership.
     ubatch_data_handle acquire();
 
     // Count one caller-side heap payload created after an empty acquire().

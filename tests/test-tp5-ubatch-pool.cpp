@@ -76,61 +76,83 @@ static void fill(llama_ubatch_data & data, std::size_t n) {
 }
 
 static void test_reuse_and_lifetime() {
-    ubatch_data_pool pool;
+    auto pool = std::make_shared<ubatch_data_pool>();
 
-    check(!pool.configured(), "pool: starts unconfigured");
-    check(pool.configure(4), "pool: configure allocates slots");
-    check(pool.capacity() == 4, "pool: capacity is fixed");
+    check(!pool->configured(), "pool: starts unconfigured");
+    check(pool->configure(4), "pool: configure allocates slots");
+    check(pool->capacity() == 4, "pool: capacity is fixed");
 
     {
-        auto a = pool.acquire();
+        auto a = pool->acquire();
         check(bool(a), "pool: acquire succeeds");
         check(a.pooled(), "pool: handle reports a slot");
         fill(*a, 8);
         check(a->token.size() == 8 && a->token[0] == 7, "pool: payload visible");
 
         auto b = a;
-        check(pool.in_use() == 1, "pool: copy retains the slot");
+        check(pool->in_use() == 1, "pool: copy retains the slot");
         b.reset();
-        check(pool.in_use() == 1, "pool: dropping one copy keeps the slot");
+        check(pool->in_use() == 1, "pool: dropping one copy keeps the slot");
     }
-    check(pool.in_use() == 0, "pool: last copy returns the slot");
+    check(pool->in_use() == 0, "pool: last copy returns the slot");
 
     const uint32_t slot = [&] {
-        auto h = pool.acquire();
+        auto h = pool->acquire();
         const uint32_t s = h.slot();
         const uint32_t g = h.generation();
         h.reset();
-        auto again = pool.acquire();
+        auto again = pool->acquire();
         check(again.slot() == s, "pool: released slot is reused first");
         check(again.generation() == g + 1, "pool: generation advances on reuse");
-        check(pool.debug_release_stale(s, g), "pool: stale generation is rejected");
-        check(pool.in_use() == 1, "pool: stale release keeps the new occupant");
+        check(pool->debug_release_stale(s, g), "pool: stale generation is rejected");
+        check(pool->in_use() == 1, "pool: stale release keeps the new occupant");
         return again.slot();
     }();
     (void) slot;
-    check(pool.in_use() == 0, "pool: new occupant releases normally");
+    check(pool->in_use() == 0, "pool: new occupant releases normally");
 
     // Growing while a handle is live would move the slot storage.
-    auto held = pool.acquire();
-    check(!pool.configure(8), "pool: grow is refused while a handle is live");
+    auto held = pool->acquire();
+    check(!pool->configure(8), "pool: grow is refused while a handle is live");
     held.reset();
-    check(pool.configure(8), "pool: grow succeeds after release");
-    check(pool.capacity() == 8, "pool: grown capacity is visible");
+    check(pool->configure(8), "pool: grow succeeds after release");
+    check(pool->capacity() == 8, "pool: grown capacity is visible");
+}
+
+// Regression for the H-group abort: a ubatch handle can outlive the allocator
+// that owns the pool (llm_graph_params keeps an intentional copy). The handle
+// must keep the pool alive instead of releasing into a destroyed mutex.
+static void test_pool_outlives_owner() {
+    ubatch_data_handle kept;
+
+    {
+        auto pool = std::make_shared<ubatch_data_pool>();
+        check(pool->configure(1), "outlive: pool configured");
+
+        kept = pool->acquire();
+        fill(*kept, 4);
+        check(kept->token.size() == 4, "outlive: payload visible");
+    }
+
+    check(bool(kept), "outlive: handle survives the pool owner");
+    check(kept->token.size() == 4 && kept->token[0] == 7, "outlive: payload is still valid");
+
+    kept.reset();
+    check(true, "outlive: release after the owner died is safe");
 }
 
 static void test_exhaustion_and_fallback() {
-    ubatch_data_pool pool;
-    check(pool.configure(1), "pool: one-slot pool");
+    auto pool = std::make_shared<ubatch_data_pool>();
+    check(pool->configure(1), "pool: one-slot pool");
 
-    auto a = pool.acquire();
-    auto b = pool.acquire();
+    auto a = pool->acquire();
+    auto b = pool->acquire();
     check(bool(a), "pool: first acquire succeeds");
     check(!b, "pool: second acquire reports exhaustion");
-    check(pool.stats().exhausted == 1, "pool: exhaustion is counted");
+    check(pool->stats().exhausted == 1, "pool: exhaustion is counted");
 
-    pool.note_fallback();
-    check(pool.stats().fallback == 1, "pool: fallback is counted");
+    pool->note_fallback();
+    check(pool->stats().fallback == 1, "pool: fallback is counted");
 
     // The caller-side fallback owns a heap payload like the old shared_ptr.
     ubatch_data_handle heap(std::make_shared<llama_ubatch_data>());
@@ -140,18 +162,18 @@ static void test_exhaustion_and_fallback() {
 }
 
 static void test_steady_state() {
-    ubatch_data_pool pool;
-    check(pool.configure(4), "steady: pool configured");
+    auto pool = std::make_shared<ubatch_data_pool>();
+    check(pool->configure(4), "steady: pool configured");
 
     {
-        auto warm = pool.acquire();
+        auto warm = pool->acquire();
         fill(*warm, 8);
     }
 
     const long long base = alloc_delta();
 
     for (int i = 0; i < 10000; ++i) {
-        auto h = pool.acquire();
+        auto h = pool->acquire();
         if (!h) {
             check(false, "steady: unexpected exhaustion");
             break;
@@ -160,15 +182,15 @@ static void test_steady_state() {
     }
 
     check(alloc_delta() == base, "steady: 10k acquire/fill/release, zero net allocation");
-    check(pool.in_use() == 0, "steady: every slot returned");
-    check(pool.stats().acquired == 10001, "steady: acquire count");
-    check(pool.stats().released == 10001, "steady: release count");
-    check(pool.stats().stale == 0, "steady: no stale release");
+    check(pool->in_use() == 0, "steady: every slot returned");
+    check(pool->stats().acquired == 10001, "steady: acquire count");
+    check(pool->stats().released == 10001, "steady: release count");
+    check(pool->stats().stale == 0, "steady: no stale release");
 }
 
 static void test_concurrency() {
-    ubatch_data_pool pool;
-    check(pool.configure(8), "concurrent: eight slots");
+    auto pool = std::make_shared<ubatch_data_pool>();
+    check(pool->configure(8), "concurrent: eight slots");
 
     constexpr int threads = 8;
     constexpr int rounds  = 20000;
@@ -180,7 +202,7 @@ static void test_concurrency() {
     for (int t = 0; t < threads; ++t) {
         workers.emplace_back([&, t] {
             for (int i = 0; i < rounds; ++i) {
-                auto h = pool.acquire();
+                auto h = pool->acquire();
                 if (!h) {
                     errors.fetch_add(1);
                     continue;
@@ -199,9 +221,9 @@ static void test_concurrency() {
     }
 
     check(errors.load() == 0, "concurrent: no lost or duplicated slot");
-    check(pool.in_use() == 0, "concurrent: every slot returned");
-    check(pool.stats().exhausted == 0, "concurrent: capacity was sufficient");
-    check(pool.stats().stale == 0, "concurrent: no stale release");
+    check(pool->in_use() == 0, "concurrent: every slot returned");
+    check(pool->stats().exhausted == 0, "concurrent: capacity was sufficient");
+    check(pool->stats().stale == 0, "concurrent: no stale release");
 }
 
 static void test_kv_cells_cp_into() {
@@ -247,6 +269,7 @@ static void test_kv_cells_cp_into() {
 
 int main() {
     test_reuse_and_lifetime();
+    test_pool_outlives_owner();
     test_exhaustion_and_fallback();
     test_steady_state();
     test_concurrency();

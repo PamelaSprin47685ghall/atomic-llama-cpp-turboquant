@@ -818,16 +818,16 @@ static void test_host_pool(testing & t) {
         t.assert_true("slot is pooled again after release", ub.data.pooled());
     });
 
-    t.test("reserve_resets_reused_slot", [&](testing & t) {
+    t.test("reserve_is_heap_owned_and_zeroed", [&](testing & t) {
         set_pool_flag("1");
 
         llama_batch_allocr ba(1);
 
-        uint32_t gen = 0;
         {
             llama_ubatch ub = ba.ubatch_reserve(2, 2);
-            t.assert_true("reserve uses a pooled slot", ub.data.pooled());
-            gen = ub.data.generation();
+            // A reserve ubatch can outlive the allocator, so it must never
+            // borrow a pool slot.
+            t.assert_true("reserve payload is heap-owned", !ub.data.pooled());
 
             for (uint32_t i = 0; i < ub.n_tokens; ++i) {
                 ub.token[i]    = 7;
@@ -840,8 +840,7 @@ static void test_host_pool(testing & t) {
         }
 
         llama_ubatch ub = ba.ubatch_reserve(2, 2);
-        t.assert_true("second reserve reuses the pool", ub.data.pooled());
-        t.assert_equal("reserve generation advances", gen + 1, ub.data.generation());
+        t.assert_true("second reserve is heap-owned", !ub.data.pooled());
 
         for (uint32_t i = 0; i < ub.n_tokens; ++i) {
             t.assert_equal("token is cleared", 0, ub.token[i]);
@@ -860,6 +859,27 @@ static void test_host_pool(testing & t) {
         t.assert_true("flag off uses the heap", !r.data.pooled());
         t.assert_equal("heap reserve token is zero", 0, r.token[0]);
         t.assert_equal("heap reserve output is zero", 0, (int) r.output[0]);
+    });
+
+    t.test("reserve_outlives_allocr", [&](testing & t) {
+        set_pool_flag("1");
+
+        llama_ubatch kept = {};
+        {
+            llama_batch_allocr ba(1);
+            kept = ba.ubatch_reserve(2, 2);
+            t.assert_true("reserve payload does not borrow the pool", !kept.data.pooled());
+        }
+
+        // The allocator and its pool are gone. The heap payload must still be
+        // readable and must release without touching a destroyed mutex.
+        t.assert_equal("payload survives the allocator", 4u, kept.n_tokens);
+        t.assert_equal("token survives", 0, kept.token[0]);
+        t.assert_equal("seq idx survives", 0, kept.seq_idx[0]);
+        t.assert_equal("second seq idx survives", 1, kept.seq_idx[1]);
+        t.assert_equal("unique seq id survives", 1, kept.seq_id_unq[1]);
+
+        set_pool_flag(nullptr);
     });
 
     t.test("handle_outlives_variable", [&](testing & t) {
