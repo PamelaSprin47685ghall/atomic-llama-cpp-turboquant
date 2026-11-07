@@ -28,6 +28,10 @@ target_compile_options(tq_tp5_runtime PRIVATE -fno-fast-math -ffp-contract=off)
 target_include_directories(tq_tp5_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+# In-memory lease records come from the read-only F2 ledger library. Only its
+# value types are used here; the C adapter owns the external schema.
+target_include_directories(tq_tp5_runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../alloc-ledger/include)
 target_link_libraries(tq_tp5_runtime PRIVATE llama TQRelay::relay
     TQSampling::sampling TQScheduling::scheduling TQText::text Threads::Threads
     ${CMAKE_DL_LIBS})
@@ -65,6 +69,13 @@ if(BUILD_TESTING)
     target_include_directories(tq_tp5_ordered_fold_tests PRIVATE src)
     target_link_libraries(tq_tp5_ordered_fold_tests PRIVATE llama)
     add_test(NAME tq-tp5-ordered-f32-fold COMMAND tq_tp5_ordered_fold_tests)
+    add_executable(tq_tp5_host_pool_tests tests/test-host-pool.cpp)
+    target_compile_features(tq_tp5_host_pool_tests PRIVATE cxx_std_17)
+    target_include_directories(tq_tp5_host_pool_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../alloc-ledger/include)
+    target_link_libraries(tq_tp5_host_pool_tests PRIVATE llama)
+    add_test(NAME tq-tp5-host-pool COMMAND tq_tp5_host_pool_tests)
     if(TQ_TP5_BUILD_HIP_TESTS)
         add_executable(tq_tp5_q8_f32_tests tests/test-q8-f32.cpp)
         target_compile_features(tq_tp5_q8_f32_tests PRIVATE cxx_std_17)

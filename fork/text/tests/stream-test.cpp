@@ -3,14 +3,17 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 using tq::text::generation_stream;
 using tq::text::stream_delta;
+using tq::text::stream_event;
 
 namespace {
 
@@ -70,11 +73,62 @@ reference_result reference(std::string_view input, const std::vector<std::string
     return {text, std::nullopt};
 }
 
+struct transcript {
+    std::string text;
+    std::vector<std::uint64_t> offsets;
+    std::vector<bool> finished;
+    std::vector<std::optional<std::size_t>> stops;
+};
+
+void check_into(const std::string & input, const std::vector<std::string> & stops,
+                const std::vector<std::size_t> & ends, const transcript & expected) {
+    generation_stream stream(stops);
+    std::string text;
+    transcript actual;
+    const auto consume = [&](std::size_t before, const stream_event & event) {
+        check(event.offset == before, "into cursor lost or repeated bytes");
+        check(event.finished == stream.finished(), "into result lost terminal state");
+        if (event.stop_index) { check(event.finished, "into matched stop did not finish the stream"); }
+        actual.offsets.push_back(event.offset);
+        actual.finished.push_back(event.finished);
+        actual.stops.push_back(event.stop_index);
+    };
+    {
+        const auto before = text.size();
+        consume(before, stream.push_into(std::string_view{}, text));
+    }
+    std::size_t first = 0;
+    for (const auto end : ends) {
+        check(first <= end && end <= input.size(), "invalid into test partition");
+        if (!stream.finished()) {
+            const auto before = text.size();
+            consume(before, stream.push_into(std::string_view(input).substr(first, end - first), text));
+        }
+        first = end;
+    }
+    check(first == input.size(), "into test did not submit its complete input");
+    {
+        const auto before = text.size();
+        consume(before, stream.finish_into(text));
+    }
+    {
+        const auto before = text.size();
+        consume(before, stream.finish_into(text));
+    }
+    rejects<std::logic_error>([&] { stream.push_into("late", text); });
+    actual.text = std::move(text);
+    check(actual.text == expected.text, "into text differs from push text");
+    check(actual.offsets == expected.offsets, "into offsets differ from push offsets");
+    check(actual.finished == expected.finished, "into finished flags differ from push flags");
+    check(actual.stops == expected.stops, "into stop indices differ from push stop indices");
+}
+
 void run_chunks(const std::string & input, const std::vector<std::string> & stops, const std::vector<std::size_t> & ends) {
     generation_stream stream(stops);
     const auto expected = reference(input, stops);
     std::string output;
     std::optional<std::size_t> matched;
+    transcript expected_log;
     const auto consume = [&](const stream_delta & delta) {
         check(delta.offset == output.size(), "output cursor lost or repeated bytes");
         check(normalize(delta.text) == delta.text, "delta ends with invalid UTF-8");
@@ -84,6 +138,9 @@ void run_chunks(const std::string & input, const std::vector<std::string> & stop
         check(delta.finished == stream.finished(), "result lost terminal state");
         if (delta.stop_index) { check(delta.finished, "matched stop did not finish the stream"); }
         matched = delta.stop_index;
+        expected_log.offsets.push_back(delta.offset);
+        expected_log.finished.push_back(delta.finished);
+        expected_log.stops.push_back(delta.stop_index);
     };
     consume(stream.push({}));
     std::size_t first = 0;
@@ -103,8 +160,13 @@ void run_chunks(const std::string & input, const std::vector<std::string> & stop
     const auto again = stream.finish();
     check(again.finished && again.text.empty() && again.offset == output.size() && again.stop_index == matched,
           "repeated finish changed the result");
+    expected_log.text = output;
+    expected_log.offsets.push_back(again.offset);
+    expected_log.finished.push_back(again.finished);
+    expected_log.stops.push_back(again.stop_index);
     rejects<std::logic_error>([&] { stream.push("late"); });
     rejects<std::logic_error>([&] { stream.push({}); });
+    check_into(input, stops, ends, expected_log);
     ++checked_runs;
 }
 
@@ -244,6 +306,60 @@ void test_ownership_and_move() {
           "move lost text, UTF-8, stop, or cursor state");
 }
 
+void test_into_equivalence() {
+    struct fixture {
+        std::string input;
+        std::vector<std::string> stops;
+    };
+    const std::vector<fixture> fixtures = {
+        {"plain ascii text", {}},
+        {"multibyte \xe2\x82\xac and \xf0\x9f\x98\x80", {}},
+        {"invalid \xff and \xe2\x82 tail", {}},
+        {"prefixE\xe2\x82\xac!tail", {"E\xe2\x82\xac!"}},
+        {"middleENDtail", {"END"}},
+        {"", {"END"}},
+    };
+    for (const auto & item : fixtures) {
+        run_chunks(item.input, item.stops, {item.input.size()});
+        run_chunks(item.input, item.stops, fixed_chunks(item.input.size(), 1));
+        run_chunks(item.input, item.stops, fixed_chunks(item.input.size(), 2));
+        run_chunks(item.input, item.stops, fixed_chunks(item.input.size(), 3));
+    }
+}
+
+void test_into_capacity_stability() {
+    generation_stream stream({"\n\nEND"});
+    std::string out;
+    out.reserve(2 * 1024 * 1024);
+    const auto * const data = out.data();
+    const auto capacity = out.capacity();
+    std::uint64_t offset = 0;
+    for (std::size_t i = 0; i < 100000; ++i) {
+        const auto event = stream.push_into("token ", out);
+        check(event.offset == offset, "into loop lost the output cursor");
+        check(!event.finished, "into loop finished early");
+        offset += 6;
+    }
+    check(out.size() == offset, "into loop lost bytes");
+    check(out.data() == data && out.capacity() == capacity,
+          "push_into reallocated a pre-reserved output string");
+    const auto last = stream.finish_into(out);
+    check(last.finished && last.offset == offset && !last.stop_index && out.size() == offset,
+          "into loop finish lost state");
+}
+
+void test_into_append() {
+    generation_stream stream({"END"});
+    std::string out = "head:";
+    const auto first = stream.push_into("abc", out);
+    check(first.offset == 0 && out == "head:abc", "push_into did not append to the existing text");
+    const auto stop = stream.push_into("ENDtail", out);
+    check(stop.finished && stop.stop_index == 0 && stop.offset == 3 && out == "head:abc",
+          "push_into changed the existing text on a stop");
+    const auto done = stream.finish_into(out);
+    check(done.finished && done.offset == 3 && out == "head:abc", "finish_into changed the existing text");
+}
+
 } // namespace
 
 static_assert(!std::is_copy_constructible<generation_stream>::value, "streams have one owner");
@@ -257,8 +373,12 @@ int main() {
         test_generated_cases();
         test_limits_and_long_prefixes();
         test_ownership_and_move();
+        test_into_equivalence();
+        test_into_capacity_stability();
+        test_into_append();
         std::cout << "{\"status\":\"pass\",\"partition_and_adversarial_runs\":" << checked_runs
-                  << ",\"generated_inputs\":300,\"long_prefix_input_bytes\":131073}\n";
+                  << ",\"generated_inputs\":300,\"long_prefix_input_bytes\":131073"
+                  << ",\"into_capacity_pushes\":100000}\n";
         return 0;
     } catch (const std::exception & error) {
         std::cerr << "text stream test: " << error.what() << '\n';

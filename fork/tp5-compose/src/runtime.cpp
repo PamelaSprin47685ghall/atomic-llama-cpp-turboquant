@@ -17,6 +17,7 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t index);
 #include "ordered-fold.h"
 #include "dw_event_trace.h"
 #include "dw_compose_event.h"
+#include "host_pool.h"
 
 #include <algorithm>
 #include <dlfcn.h>
@@ -46,6 +47,12 @@ using clock_type = std::chrono::steady_clock;
 
 std::uint64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(clock_type::now().time_since_epoch()).count();
+}
+
+// True only when the named variable holds the exact string "1".
+static bool tp5_exact_one(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
 // ASYNC-PROTOCOL: host waits on device completion must busy-wait, not sleep
@@ -2056,6 +2063,12 @@ run_result run(const options & requested) {
         try {
             workers.emplace_back([&, wi] {
                 tl_tp5_window = int(wi);
+                // One MTP batch pool and one piece buffer per worker. Both
+                // live across service rounds, so the steady state reuses
+                // them. The pool must outlive every lease.
+                mtp_batch_pool mtp_pool(4, 10240);
+                piece_scratch piece_buf;
+                const bool text_pool = tp5_exact_one("TP5_TEXT_POOL");
                 bool epoch_active = false;
                 try {
                 for (std::uint32_t svc_round = 0; svc_round < service_rounds && !failure.stopped.load(); ++svc_round) {
@@ -2616,21 +2629,16 @@ run_result run(const options & requested) {
                                     require(timed_seq_rm(llama_get_memory(dctx_pref), 0, static_cast<llama_pos>(consumed[0] + 1), -1),
                                             "LateBind Pref draft attention KV pre-trim failed");
 
-                                    llama_batch dft_batch_pref = llama_batch_init(1, wide, 1);
-                                    dft_batch_pref.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
-                                    require(dft_batch_pref.token != nullptr, "LateBind pref MTP token allocation failed");
-                                    dft_batch_pref.n_tokens = 1;
-                                    dft_batch_pref.token[0] = lb_draft1_token;
-                                    dft_batch_pref.pos[0] = static_cast<llama_pos>(consumed[0] + 1);
-                                    dft_batch_pref.n_seq_id[0] = 1;
-                                    dft_batch_pref.seq_id[0][0] = 0;
-                                    dft_batch_pref.logits[0] = 1; // draft_output == true on assumed a=0
-                                    std::memcpy(dft_batch_pref.embd, h0, wide * sizeof(float));
-                                    const int dc_pref = llama_decode(dctx_pref, dft_batch_pref);
-                                    std::free(dft_batch_pref.token);
-                                    dft_batch_pref.token = nullptr;
-                                    llama_batch_free(dft_batch_pref);
-                                    require(dc_pref == 0, "LateBind pref speculative draft decode failed");
+                                    {
+                                        auto mtp_lease = mtp_pool.acquire();
+                                        require(mtp_lease.batch().token != nullptr,
+                                                "LateBind pref MTP token allocation failed");
+                                        // draft_output == true on assumed a=0
+                                        mtp_lease.set(lb_draft1_token,
+                                            static_cast<llama_pos>(consumed[0] + 1), 1, h0, wide);
+                                        const int dc_pref = llama_decode(dctx_pref, mtp_lease.batch());
+                                        require(dc_pref == 0, "LateBind pref speculative draft decode failed");
+                                    }
                                     draft_pending = true;
                                     lb_draft1_prefetched = true;
                                     if (lb_counters_enabled) ++lb_ctr_prefetch;
@@ -3032,21 +3040,16 @@ run_result run(const options & requested) {
                                     save_row("target", target_h);
                                 }
                                 auto * dctx=trained_mtp_contexts.at(wi).get();
-                                llama_batch prompt_batch=llama_batch_init(1,wide,1);
-                                prompt_batch.token=static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
-                                require(prompt_batch.token != nullptr, "prompt draft token allocation failed");
-                                prompt_batch.n_tokens=1;
-                                prompt_batch.token[0]=batch.batch.token[row];
-                                prompt_batch.pos[0]=static_cast<llama_pos>(input_position);
-                                prompt_batch.n_seq_id[0]=1;
-                                prompt_batch.seq_id[0][0]=0;
-                                prompt_batch.logits[0]=0;
-                                std::memcpy(prompt_batch.embd,draft_prompt_previous_h.data(),wide*sizeof(float));
-                                const int rc=llama_decode(dctx,prompt_batch);
-                                std::free(prompt_batch.token);
-                                prompt_batch.token=nullptr;
-                                llama_batch_free(prompt_batch);
-                                require(rc == 0, "draft prompt catch-up failed");
+                                {
+                                    auto mtp_lease = mtp_pool.acquire();
+                                    require(mtp_lease.batch().token != nullptr,
+                                            "prompt draft token allocation failed");
+                                    mtp_lease.set(batch.batch.token[row],
+                                        static_cast<llama_pos>(input_position), 0,
+                                        draft_prompt_previous_h.data(), wide);
+                                    const int rc = llama_decode(dctx, mtp_lease.batch());
+                                    require(rc == 0, "draft prompt catch-up failed");
+                                }
                                 draft_pending = true;
                                 std::memcpy(draft_prompt_previous_h.data(),target_h,wide*sizeof(float));
                                 ++draft_prompt_rows;
@@ -3221,21 +3224,16 @@ run_result run(const options & requested) {
                                 const bool draft_output = !last_draft_logits || last_target_row;
                                 const auto first_start=now_ns();
                                 if (!reused_lb_draft) {
-                                    llama_batch dft_batch = llama_batch_init(1, wide, 1);
-                                    dft_batch.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
-                                    require(dft_batch.token != nullptr, "actual MTP token input allocation failed");
-                                    dft_batch.n_tokens = 1;
-                                    dft_batch.token[0] = selected;
-                                    dft_batch.pos[0] = static_cast<llama_pos>(consumed[local]);
-                                    dft_batch.n_seq_id[0] = 1;
-                                    dft_batch.seq_id[0][0] = 0;
-                                    dft_batch.logits[0] = draft_output ? 1 : 0;
-                                    std::memcpy(dft_batch.embd, real_h, wide*sizeof(float));
-                                    const int dc = llama_decode(dctx, dft_batch);
-                                    std::free(dft_batch.token);
-                                    dft_batch.token = nullptr;
-                                    llama_batch_free(dft_batch);
-                                    require(dc == 0, "actual MTP draft decode from target residual failed");
+                                    {
+                                        auto mtp_lease = mtp_pool.acquire();
+                                        require(mtp_lease.batch().token != nullptr,
+                                                "actual MTP token input allocation failed");
+                                        mtp_lease.set(selected,
+                                            static_cast<llama_pos>(consumed[local]),
+                                            draft_output ? 1 : 0, real_h, wide);
+                                        const int dc = llama_decode(dctx, mtp_lease.batch());
+                                        require(dc == 0, "actual MTP draft decode from target residual failed");
+                                    }
                                     draft_pending = true;
                                 }
                                 // These rows only update draft KV. Their outputs are unused.
@@ -3388,26 +3386,17 @@ run_result run(const options & requested) {
                                             auto next_token=dg.selected.id;
                                             for(std::size_t extra=1;extra<n_propose;++extra){
                                                 const auto extra_start=now_ns();
-                                                llama_batch extra_batch=llama_batch_init(1,wide,1);
-                                                extra_batch.token=static_cast<llama_token *>(
-                                                    std::malloc(sizeof(llama_token)));
-                                                require(extra_batch.token!=nullptr,
-                                                    "MTP multi extra draft token input malloc failed");
-                                                extra_batch.n_tokens=1;
-                                                extra_batch.token[0]=next_token;
-                                                extra_batch.pos[0]=static_cast<llama_pos>(
-                                                    consumed[local]+extra);
-                                                extra_batch.n_seq_id[0]=1;
-                                                extra_batch.seq_id[0][0]=0;
-                                                extra_batch.logits[0]=1;
-                                                std::memcpy(extra_batch.embd,prev_draft_h.data(),
-                                                    wide*sizeof(float));
-                                                const int extra_rc=llama_decode(dctx,extra_batch);
-                                                std::free(extra_batch.token);
-                                                extra_batch.token=nullptr;
-                                                llama_batch_free(extra_batch);
-                                                require(extra_rc==0,
-                                                    "real trained multi-draft MTP decode failed");
+                                                {
+                                                    auto mtp_lease = mtp_pool.acquire();
+                                                    require(mtp_lease.batch().token != nullptr,
+                                                        "MTP multi extra draft token input malloc failed");
+                                                    mtp_lease.set(next_token,
+                                                        static_cast<llama_pos>(consumed[local]+extra),
+                                                        1, prev_draft_h.data(), wide);
+                                                    const int extra_rc = llama_decode(dctx, mtp_lease.batch());
+                                                    require(extra_rc == 0,
+                                                        "real trained multi-draft MTP decode failed");
+                                                }
                                                 const float * more=llama_get_logits_ith(dctx,0);
                                                 const float * h_more=llama_get_embeddings_nextn_ith(dctx,0);
                                                 require(more&&h_more,
@@ -3459,8 +3448,13 @@ run_result run(const options & requested) {
                             // other window can mutate its input, sampler or cursor.
                             record.committed_ns = now_ns();
                             request.tokens.push_back(std::move(record));
-                            auto delta = streams[local].push(piece(vocab, request.tokens.back().emitted_token));
-                            request.text += delta.text;
+                            if (text_pool) {
+                                streams[local].push_into(
+                                    piece_buf.view(vocab, request.tokens.back().emitted_token), request.text);
+                            } else {
+                                auto delta = streams[local].push(piece(vocab, request.tokens.back().emitted_token));
+                                request.text += delta.text;
+                            }
                             if (opts.cancel_request == static_cast<std::int32_t>(ids[local]) &&
                                 request.tokens.size() >= opts.cancel_after) {
                                 request.stop_reason = "cancelled";
@@ -3471,7 +3465,11 @@ run_result run(const options & requested) {
                                 request.stop_reason = "budget";
                             }
                             if (!request.stop_reason.empty()) {
-                                request.text += streams[local].finish().text;
+                                if (text_pool) {
+                                    streams[local].finish_into(request.text);
+                                } else {
+                                    request.text += streams[local].finish().text;
+                                }
                                 request.finished_ns = now_ns();
                             }
                         }

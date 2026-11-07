@@ -89,10 +89,10 @@ generation_stream & generation_stream::operator=(generation_stream && other) noe
     return *this;
 }
 
-stream_delta generation_stream::prepare_delta(std::size_t incoming) const {
-    stream_delta result;
+stream_event generation_stream::prepare_event(std::size_t incoming, std::string & out) const {
+    stream_event result;
     result.offset = emitted_;
-    auto room = result.text.max_size();
+    auto room = out.max_size();
     const auto cursor_room = std::numeric_limits<std::uint64_t>::max() - emitted_;
     if (cursor_room < room) { room = static_cast<std::size_t>(cursor_room); }
     if (pending_size_ > room || utf8_size_ > (room - pending_size_) / 3) {
@@ -101,12 +101,12 @@ stream_delta generation_stream::prepare_delta(std::size_t incoming) const {
     const auto held = pending_size_ + 3 * utf8_size_;
     if (incoming > (room - held) / 3) { throw std::length_error("text message exceeds output capacity"); }
     // Reserve before changing state. One invalid input byte can produce three output bytes.
-    result.text.reserve(held + 3 * incoming);
+    out.reserve(out.size() + held + 3 * incoming);
     return result;
 }
 
-stream_delta generation_stream::complete_delta(stream_delta result) {
-    emitted_ += result.text.size();
+stream_event generation_stream::complete_event(stream_event result, std::size_t appended) {
+    emitted_ += appended;
     result.finished = finished_;
     result.stop_index = stop_index_;
     return result;
@@ -179,31 +179,45 @@ void generation_stream::consume_byte(unsigned char byte, std::string & output) {
     }
 }
 
-stream_delta generation_stream::push(std::string_view bytes) {
+stream_event generation_stream::push_into(std::string_view bytes, std::string & out) {
     if (finished_) { throw std::logic_error("text stream is finished"); }
-    auto result = prepare_delta(bytes.size());
+    const auto before = out.size();
+    auto result = prepare_event(bytes.size(), out);
     for (const auto byte : bytes) {
-        consume_byte(static_cast<unsigned char>(byte), result.text);
+        consume_byte(static_cast<unsigned char>(byte), out);
         if (finished_) { break; }
     }
-    return complete_delta(std::move(result));
+    return complete_event(result, out.size() - before);
 }
 
-stream_delta generation_stream::finish() {
+stream_event generation_stream::finish_into(std::string & out) {
     if (finished_) {
-        stream_delta result;
+        stream_event result;
         result.offset = emitted_;
         result.finished = true;
         result.stop_index = stop_index_;
         return result;
     }
-    auto result = prepare_delta(0);
+    const auto before = out.size();
+    auto result = prepare_event(0, out);
     const auto count = utf8_size_;
     utf8_size_ = 0;
-    for (std::size_t i = 0; i < count && !finished_; ++i) { consume_text(replacement, result.text); }
-    if (!finished_) { emit_pending(pending_size_, result.text); }
+    for (std::size_t i = 0; i < count && !finished_; ++i) { consume_text(replacement, out); }
+    if (!finished_) { emit_pending(pending_size_, out); }
     finished_ = true;
-    return complete_delta(std::move(result));
+    return complete_event(result, out.size() - before);
+}
+
+stream_delta generation_stream::push(std::string_view bytes) {
+    std::string text;
+    const auto result = push_into(bytes, text);
+    return stream_delta{result.offset, std::move(text), result.finished, result.stop_index};
+}
+
+stream_delta generation_stream::finish() {
+    std::string text;
+    const auto result = finish_into(text);
+    return stream_delta{result.offset, std::move(text), result.finished, result.stop_index};
 }
 
 bool generation_stream::finished() const noexcept {

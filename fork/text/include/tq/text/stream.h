@@ -17,6 +17,12 @@ struct stream_delta {
     std::optional<std::size_t> stop_index;
 };
 
+struct stream_event {
+    std::uint64_t offset = 0;
+    bool finished = false;
+    std::optional<std::size_t> stop_index;
+};
+
 class generation_stream {
 public:
     static constexpr std::size_t max_stops = 32;
@@ -34,6 +40,10 @@ public:
     stream_delta push(std::string_view bytes);
     // Flush unmatched text and incomplete UTF-8. Repeated finish emits no text.
     stream_delta finish();
+    // Same as push(), but append the text to out and return no text.
+    stream_event push_into(std::string_view bytes, std::string & out);
+    // Same as finish(), but append the text to out and return no text.
+    stream_event finish_into(std::string & out);
     bool finished() const noexcept;
 
 private:
@@ -43,8 +53,8 @@ private:
         std::size_t matched = 0;
     };
 
-    stream_delta prepare_delta(std::size_t incoming) const;
-    stream_delta complete_delta(stream_delta delta);
+    stream_event prepare_event(std::size_t incoming, std::string & out) const;
+    stream_event complete_event(stream_event event, std::size_t appended);
     void consume_byte(unsigned char byte, std::string & output);
     void consume_text(std::string_view text, std::string & output);
     void emit_pending(std::size_t count, std::string & output);
