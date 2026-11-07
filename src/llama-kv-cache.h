@@ -194,6 +194,9 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const;
+    // a global layer id this cache maps (0 when empty); filtered caches (MTP contexts
+    // hold only their nextn layer) have no entry for global layer 0
+    int32_t first_layer_id() const;
     bool get_v_transposed() const;
 
     bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
@@ -297,6 +300,18 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // factor-prefab envelope support (LLAMA_PREFAB_ENABLE=1, default off).
+    // A ubatch with n_tokens < n_env runs on a graph compiled for n_env rows. The pad rows
+    // [n_tokens, n_env) must not touch any live cell: they write K/V into one scratch cell that is
+    // empty (hence masked -inf for every real row) and their mask rows replicate the last real row
+    // (finite softmax, no NaN can leak through the non-FA KQ path).
+    // returns -1 when no such cell exists (caller falls back to the stock builder)
+    int64_t prefab_scratch_cell(const slot_info & sinfo) const;
+    void prefab_set_input_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch,
+                               const slot_info & sinfo, uint32_t n_env, int64_t scratch) const;
+    void prefab_set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_env,
+                                  const slot_info & sinfo) const;
 
 private:
     const llama_model & model;
@@ -547,6 +562,23 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+    // factor-prefab ATTN factor support: the graph is compiled for a padded KV width
+    // (multiple of 1024, >= n_kv, capped at the cache size) instead of the exact n_kv,
+    // so the factor/envelope graph stays valid while n_kv grows within the pad window
+    // (n_kv itself is 256-aligned). Returns the current padded width; 0 when the
+    // context has no concrete ubatch (reserve/update contexts).
+    uint32_t get_n_kv_pad() const;
+    // true when the current n_kv fits the given padded width (graph reuse condition)
+    bool n_kv_pad_fits(uint32_t n_kv_pad) const;
+    // K/V views sized by the padded width (prefab graphs only; stock path uses get_k/get_v)
+    ggml_tensor * get_k_pad(ggml_context * ctx, int32_t il, uint32_t n_kv_pad) const;
+    ggml_tensor * get_v_pad(ggml_context * ctx, int32_t il, uint32_t n_kv_pad) const;
+
+    // factor-prefab envelope helpers (see llama_kv_cache::prefab_*)
+    const llama_kv_cache * get_kv_cache() const { return kv; }
+    int64_t prefab_scratch_cell() const;
+    void prefab_set_input_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch, uint32_t n_env, int64_t scratch) const;
+    void prefab_set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_env) const;
 
 private:
     llama_memory_status status;

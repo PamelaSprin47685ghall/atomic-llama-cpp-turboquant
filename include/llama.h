@@ -1796,6 +1796,54 @@ extern "C" {
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
 
+    //
+    // factor-prefab counters (llama-prefab lane; see src/llama-prefab.h)
+    //
+    // Organic per-context counters for the graph-build/reuse lifecycle of the
+    // prefab and stock builder paths. Every write is armed only when the env
+    // gate GGML_TP5_PREFAB_STATS is exactly "1"; with the gate off (the
+    // default) all fields stay zero and the hot path is untouched.
+    //
+    struct llama_prefab_stats {
+        uint64_t n_ubatch_prefab;       // ubatches executed on an envelope graph
+        uint64_t n_ubatch_stock;        // ubatches executed by the stock builder path
+        uint64_t n_stock_builds;        // stock model.build_graph() invocations
+        uint64_t n_stock_reuses;        // stock graph reuses (can_reuse == true)
+        uint64_t n_envelope_builds;     // envelope graph compositions
+        uint64_t n_envelope_reuses;     // envelope graph reused without rebuild
+        uint64_t n_envelope_allocs;     // ggml_backend_sched_alloc_graph on an envelope sched
+        uint64_t n_sub_envelope;        // ubatches with n_tokens < n_env (runtime padded)
+        uint64_t n_pad_rows;            // total pad rows executed
+        uint64_t n_factor_compiles;     // factor modules compiled
+        uint64_t n_factor_cache_hits;   // factor modules taken from the cache while composing
+        uint64_t n_factor_splices;      // factor modules spliced into an envelope
+        uint64_t n_factor_clones;       // tensors cloned by splicing
+        uint64_t n_cache_resets;        // topology-key invalidations of the factor cache
+        uint64_t n_fallback_no_scratch; // runtime fallback to stock: no free scratch KV cell
+        uint64_t n_fallback_runtime;    // runtime fallback to stock: adapters / samplers / attention views / ...
+        uint64_t last_n_env;            // envelope width of the last prefab ubatch
+        uint64_t last_n_tokens;         // real n_tokens of the last prefab ubatch
+        uint64_t last_graph_nodes;      // node count of the last executed envelope graph
+        uint64_t last_inp_tokens_ne0;   // ne[0] of the token input of the executed envelope graph (== last_n_env)
+        uint64_t n_decouple_declines;   // decouple iface: ubatches declined by the compose layer (gate on)
+        uint64_t n_decouple_handled;    // decouple iface: ubatches executed by the compose layer (gate on)
+        // MTP factor compose (GGML_TP5_PREFAB_IN_GRAPH=1), all organic:
+        uint64_t n_mtp_compose_hits;    // DECODER_MTP ubatches executed on a composed A x B envelope graph
+        uint64_t n_mtp_a_compiles;      // A (head prologue) modules built
+        uint64_t n_mtp_a_reuses;        // A modules taken from the cache while composing
+        uint64_t n_mtp_b_builds;        // B (block + epilogue) parts emitted into an envelope
+        uint64_t n_mtp_a_clones;        // tensors cloned from A while splicing it into an envelope
+        uint64_t n_mtp_declines;        // DECODER_MTP ubatches the compose layer declined (stock fallback)
+        uint64_t build_ns;              // wall time in instrumented request graph builds, excluding allocation/compute
+        uint64_t n_nodes_built;         // nodes in successfully emitted request graphs, plus compiled MTP A graphs
+        uint64_t template_hits;         // MTP A template cache hits, not whole-graph hits
+    };
+
+    LLAMA_API bool   llama_prefab_is_enabled      (const struct llama_context * ctx);
+    LLAMA_API void   llama_prefab_get_stats       (const struct llama_context * ctx, struct llama_prefab_stats * out);
+    LLAMA_API void   llama_prefab_reset_stats     (      struct llama_context * ctx);
+    LLAMA_API size_t llama_prefab_n_cached_factors(const struct llama_context * ctx);
+
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);

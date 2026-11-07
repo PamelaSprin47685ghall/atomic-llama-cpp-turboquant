@@ -368,6 +368,11 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // factor-prefab: padded KV width the graph is compiled for (0 = stock behavior:
+    // K/V views sized by the exact n_kv). Set only by llm_graph_input_prefab_attn_kv;
+    // build_attn reads it to size the K/V views. n_kv is a runtime parameter for such
+    // graphs: the mask covers [0, n_kv_pad) and the pad columns are masked out.
+    uint32_t n_kv_pad = 0;
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -918,6 +923,13 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    // factor-prefab MTP compose: the head prologue (A) outputs, i.e. the block input, the HC
+    // residual stream the block (B) folds its output into, and the scatter weights that combine
+    // uses. Set by graph_mtp::build_mtp_prologue(); consumed only by the compose layer
+    // (GGML_TP5_PREFAB_IN_GRAPH=1) to cut A from B, null otherwise.
+    ggml_tensor * t_prefab_cut        = nullptr;
+    ggml_tensor * t_prefab_cut_res    = nullptr;
+    ggml_tensor * t_prefab_cut_inject = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 

@@ -2,6 +2,8 @@
 #include "llama-kv-stream-plan.h"
 
 #include "llama-impl.h"
+#include "llama-prefab-env.h"
+#include "llama-prefab-hotpath.h"
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
@@ -1876,6 +1878,10 @@ std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
     return res;
 }
 
+int32_t llama_kv_cache::first_layer_id() const {
+    return map_layer_ids.empty() ? 0 : map_layer_ids.begin()->first;
+}
+
 ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -2758,6 +2764,114 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
 
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+}
+
+int64_t llama_kv_cache::prefab_scratch_cell(const slot_info & sinfo) const {
+    // single-stream only (the prefab path refuses multi-stream caches at context creation)
+    if (sinfo.n_stream() != 1 || v_cells.size() != 1) {
+        return -1;
+    }
+    const auto & cells = v_cells[sinfo.strm[0]];
+    const auto & idxs  = sinfo.idxs[0];
+    // after apply() the cells of the current ubatch are occupied, but check explicitly anyway
+    for (int64_t i = (int64_t) cells.size() - 1; i >= 0; --i) {
+        if (!cells.is_empty((uint32_t) i)) {
+            continue;
+        }
+        if (std::find(idxs.begin(), idxs.end(), (uint32_t) i) != idxs.end()) {
+            continue;
+        }
+        return i;
+    }
+    return -1;
+}
+
+void llama_kv_cache::prefab_set_input_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch,
+                                           const slot_info & sinfo, uint32_t n_env, int64_t scratch) const {
+    const uint32_t n_tokens = ubatch->n_tokens;
+    GGML_ASSERT(sinfo.n_stream() == 1);
+    GGML_ASSERT(n_tokens == (uint32_t) sinfo.size());
+    GGML_ASSERT(n_tokens <= n_env);
+    GGML_ASSERT(n_tokens == n_env || scratch >= 0);
+    GGML_ASSERT(kv_stream_runtime.runtime == nullptr);
+
+    const int64_t offs = (int64_t) sinfo.strm[0]*get_size();
+
+    if (k_dst) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(k_dst->buffer));
+        GGML_ASSERT(k_dst->ne[0] == (int64_t) n_env);
+        int64_t * data = (int64_t *) k_dst->data;
+        for (uint32_t i = 0; i < n_env; ++i) {
+            data[i] = offs + (i < n_tokens ? (int64_t) sinfo.idxs[0][i] : scratch);
+        }
+    }
+
+    if (v_dst) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(v_dst->buffer));
+        int64_t * data = (int64_t *) v_dst->data;
+        if (!v_trans) {
+            GGML_ASSERT(v_dst->ne[0] == (int64_t) n_env);
+            for (uint32_t i = 0; i < n_env; ++i) {
+                data[i] = offs + (i < n_tokens ? (int64_t) sinfo.idxs[0][i] : scratch);
+            }
+        } else {
+            const int64_t kv_size      = get_size();
+            const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
+            const int64_t voffs        = (int64_t) sinfo.strm[0]*kv_size*n_embd_v_gqa;
+            GGML_ASSERT(v_dst->ne[0] == (int64_t) n_env*n_embd_v_gqa);
+            for (uint32_t i = 0; i < n_env; ++i) {
+                const int64_t cell = i < n_tokens ? (int64_t) sinfo.idxs[0][i] : scratch;
+                for (int64_t j = 0; j < n_embd_v_gqa; ++j) {
+                    data[i*n_embd_v_gqa + j] = voffs + j*kv_size + cell;
+                }
+            }
+        }
+    }
+}
+
+void llama_kv_cache::prefab_set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_env,
+                                              const slot_info & sinfo) const {
+    const uint32_t n_tokens = ubatch->n_tokens;
+    GGML_ASSERT(dst->ne[3] == 1 && dst->ne[2] == 1);
+    GGML_ASSERT(dst->ne[1] == (int64_t) n_env);
+    GGML_ASSERT(n_tokens >= 1 && n_tokens <= n_env);
+
+    // real rows [0, n_tokens): exactly the stock mask (stock writes only n_tps rows of dst)
+    set_input_kq_mask(dst, ubatch, causal_attn);
+
+    // pad rows: replicate the last real row
+    const size_t row_elems = (size_t) dst->ne[0];
+    const size_t row_bytes = row_elems*ggml_element_size(dst);
+    char * base = (char *) dst->data;
+    for (uint32_t i = n_tokens; i < n_env; ++i) {
+        memcpy(base + (size_t) i*dst->nb[1], base + (size_t) (n_tokens - 1)*dst->nb[1], row_bytes);
+    }
+
+    // pad columns [live n_kv, n_kv_pad): the stock writer leaves them untouched when
+    // tokens reuse previous masks (prev == true) or cells are outside the sequence, and
+    // scheduler buffers hold stale values from earlier executions. Explicitly fill them
+    // with -INFINITY (F32) or 0xfc00 (-inf in F16) for all n_env rows.
+    const size_t live_n_kv = (size_t) get_n_kv(sinfo);
+    if (llama_prefab_nkv_pad_enabled() && live_n_kv < row_elems) {
+        if (dst->type == GGML_TYPE_F16) {
+            const ggml_fp16_t drop = llama_cast<ggml_fp16_t, float>(-INFINITY);
+            ggml_fp16_t * rows = (ggml_fp16_t *) dst->data;
+            for (uint32_t i = 0; i < n_env; ++i) {
+                ggml_fp16_t * r = rows + (size_t) i*row_elems;
+                for (size_t j = live_n_kv; j < row_elems; ++j) {
+                    r[j] = drop;
+                }
+            }
+        } else {
+            float * rows = (float *) dst->data;
+            for (uint32_t i = 0; i < n_env; ++i) {
+                float * r = rows + (size_t) i*row_elems;
+                for (size_t j = live_n_kv; j < row_elems; ++j) {
+                    r[j] = -INFINITY;
+                }
+            }
+        }
+    }
 }
 
 size_t llama_kv_cache::total_size() const {
@@ -3670,6 +3784,27 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
+uint32_t llama_kv_cache_context::get_n_kv_pad() const {
+    // no concrete ubatch (reserve/update contexts): report 0, callers fall back to n_kv
+    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
+        return 0;
+    }
+    if (!llama_prefab_nkv_pad_enabled()) {
+        // gate off (LLAMA_PREFAB_NKV_PAD unset or not exactly "1"): the padded width equals
+        // the exact live n_kv, so the ATTN factor key, the mask width and the K/V views are
+        // exactly what the unpatched prefab layer produced (baseline reuse rule).
+        return n_kv;
+    }
+    // gate on: round the live width up to the 1024-aligned window (>= 1024),
+    // clamped to the physical cache size -- the shared production contract in
+    // llama-prefab-hotpath.h (llama_prefab_nkv_window), so the same window
+    // shape drives the real lane and the ggml-free hot-path seam.
+    return llama_prefab_nkv_window(n_kv, kv->get_size());
+}
+
+bool llama_kv_cache_context::n_kv_pad_fits(uint32_t n_kv_pad) const {
+    return n_kv_pad >= n_kv;
+}
 
 bool llama_kv_cache_context::has_attention_views() const {
     return !ubatches.empty() && !kv->attention_views.empty();
@@ -3723,6 +3858,18 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+// factor-prefab ATTN factor support: K/V views sized by a padded KV width (>= n_kv,
+// 256-aligned) so the factor/envelope graph stays shape-stable while n_kv grows within
+// the pad window. The stock graph path uses get_k/get_v above (exact n_kv) and is
+// unaffected. The kq_mask covers the same padded width; the stock mask writer only
+// writes the live [0, n_kv) columns and pad columns are explicitly masked -inf.
+ggml_tensor * llama_kv_cache_context::get_k_pad(ggml_context * ctx, int32_t il, uint32_t n_kv_pad) const {
+    return kv->get_k(ctx, il, n_kv_pad, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_pad(ggml_context * ctx, int32_t il, uint32_t n_kv_pad) const {
+    return kv->get_v(ctx, il, n_kv_pad, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_turbo_rotation() const {
@@ -3778,6 +3925,18 @@ void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+int64_t llama_kv_cache_context::prefab_scratch_cell() const {
+    return kv->prefab_scratch_cell(sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::prefab_set_input_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch, uint32_t n_env, int64_t scratch) const {
+    kv->prefab_set_input_idxs(k_dst, v_dst, ubatch, sinfos[i_cur], n_env, scratch);
+}
+
+void llama_kv_cache_context::prefab_set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_env) const {
+    kv->prefab_set_input_kq_mask(dst, ubatch, causal_attn, n_env, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {

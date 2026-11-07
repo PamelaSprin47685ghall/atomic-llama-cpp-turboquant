@@ -1,0 +1,86 @@
+PREFAB THREARM, 262-token prompt, --threads 1 / default prefill — CPU VERIFICATION, 2026-11-01
+============================================================================================
+Auditor: DevopsRetry. Private 0700 dir prefab-threarm-v3-20261101/. Both CPU locks held
+(04:47:07-04:49:43 for the run, 04:49:54-04:50:13 for the cross-check). No GPU, original trees
+untouched.
+
+VERDICT: **VERDICT PASS, driver rc=0 — 23/23 checks PASS** (the listing below has 23 PASS lines
+plus the VERDICT line), with `declines=0`, `off_stock_builds=2`, `slot_builds=2`, `on_builds=1`,
+and all five tapes bitwise identical.
+
+1. HASHES
+---------
+  fork/logits-compose/tests/prefab_threarm.py  57300312  OK
+  fork/logits-compose/README.md                b36eaf39  OK
+  `--threads` defaults to 1; the driver no longer forwards `--prefill` (0 occurrences).
+
+2. SETUP
+--------
+  Prompt: 'the quick brown fox jumps over the lazy dog ' x 29 = 1276 bytes.
+  Command: prefab_threarm.py --binary …/bld-collector/tq-logits-compose
+           --model $E/mtp-qwen4exp-nextn-self-contained-q2_0.gguf --prompt-file prompt.txt
+           --out-dir …/out        (no --threads, no --prefill: defaults 1 and 1)
+  TP5LOG2 summary: input_tokens=262, prefill=1, rows=262, decode_calls=262, threads=1, mtp_ctx=true.
+
+3. RESULTS (verbatim, 23 PASS)
+------------------------------
+  PASS off tape bitwise == stock tape
+  PASS slot tape bitwise == stock tape
+  PASS on tape bitwise == stock tape
+  PASS dual tape A bitwise == stock tape
+  PASS dual tape B bitwise == stock tape
+  PASS prompt crosses the 256-cell stock KV bucket (decode_calls > 256) :: decode_calls=262
+  PASS stock: lane never engaged
+  PASS stock: stats gate off leaves every counter zero :: non_zero=[]
+  PASS off: lane never engaged
+  PASS off: builds happened on the stock path across KV buckets :: n_stock_builds=2
+  PASS off: every ubatch ran on the stock path and no envelope built :: n_ubatch_stock=262 calls=262
+  PASS slot: lane engaged
+  PASS slot: every ubatch reused or rebuilt the slot
+  PASS slot: no stock fallback
+  PASS slot: build parity with stock (no pad window, no compose) :: slot_builds=2 off_stock_builds=2
+  PASS on: lane engaged
+  PASS on: every ubatch reused or rebuilt the slot :: reuses=261 allocs=1 calls=262
+  PASS on: no stock fallback
+  PASS on: every rebuild composed (A x B)
+  PASS on: one A fetch per B emit
+  PASS on: A prologue compiled once (single envelope width)
+  PASS on: strictly fewer graph builds than stock :: off_stock_builds=2 on_builds=1
+  PASS dual: both contexts engaged
+  PASS dual: each context counted its own ubatches
+  VERDICT PASS
+
+4. INDEPENDENT CONFIRMATION OF THE CLAIMS
+-----------------------------------------
+  Per-arm counters (context A):
+    arm    enabled  ubatch_stock  declines  stock_builds  allocs  reuses  compose  ubatch_prefab
+    stock  False    0             0         0             0       0       0        0
+    off    False    262           0         2             0       0       0        0
+    slot   True     0             0         2             2       260     0        262
+    on     True     0             0         0             1       261     1        262
+    dual A/B True   0             0         0             1       261     1        262
+  `declines = 0` everywhere; `off_stock_builds = 2`, `slot_builds = 2`, `on_builds = 1`.
+  Tapes: five files, 260,240,432 B each (24 + 262x4 header/tokens + 262 rows x 248320 x 4);
+  `cmp` reports stock == off == slot == on == dual(B) bitwise. So all 262 rows agree in every arm,
+  including the row at pos 257/258 that diverged at --threads 4 last round.
+
+5. THE SINGLE-THREAD EXPLANATION IS CONFIRMED BY A DIRECT CROSS-CHECK
+---------------------------------------------------------------------
+  I re-ran the same 262-token prompt with the same binary at **--threads 4**, default prefill,
+  comparing the stats-only arm against the compose arm:
+    threads=4: off vs on DIFFER — row 257 (pos 258) differs in all 248,320 floats, max |diff| 0.1054.
+  Same prompt, same code, same model; only `--threads` changed. That is exactly the behaviour you
+  attributed to `use_split_kv_path` with `chunk_size = ceil(nek1 / nth)`: at nth=4 the stock arm
+  (nek1=512) splits the first 256 KV cells across two thread blocks while the compose arm
+  (nek1=1024) keeps them in one loop; at nth=1 both accumulate 0..live_n_kv-1 in one loop and the
+  padding columns are skipped by `if (mv == -INFINITY) continue;`, so the float sequence is
+  identical. The divergence is a threading-order artefact of the CPU reference, not a defect in
+  the prefab lane, and the driver now pins the thread count that makes the comparison meaningful.
+
+6. SCOPE
+--------
+  Established: with `--threads 1`, default prefill, and a 262-token prompt crossing the 256-cell
+  KV bucket, the whole-graph prefab lane is bitwise transparent on all 262 rows across all five
+  arms, engages only where intended, declines nothing, and turns 2 stock builds into 1.
+  Not established: anything about GPU, and the multi-threaded CPU case remains numerically
+  divergent by construction (documented above, not a pass criterion any more).

@@ -1,0 +1,128 @@
+PREFAB THREARM, 262-token prompt, --gpu-layers 99 — GPU VERIFICATION, 2026-11-01
+================================================================================
+Executor: DevopsFreshBoot. Private dir prefab-gpu-20261101/. Both VFS build locks held for
+the builds and both GPU locks held for the run (18:14:03–18:14:44). Source tree and selected
+installs were not modified.
+
+VERDICT: PASS — 24/24 checks PASS, `declines=0`, `off_stock_builds=2`,
+`slot_builds=2`, `on_builds=1`, all five tapes bitwise identical, 50/50 layers offloaded to
+GPU and 0 to CPU. On GPU FlashAttention the nek1=1024 `on`/`dual` arms are bitwise identical
+to the nek1=512 `stock`/`off`/`slot` arms at all 262 rows; the CPU nth=4 split-KV divergence
+does not reproduce.
+
+1. HASHES AND BUILD
+-------------------
+  Tree: /home/kunweiz/work/merge-prefab-20261031
+  HEAD: d9c07fff47f593ad4e00a5db09f1c62413a391db (prefab-threarm: candidate snapshot 20261101)
+  Build: cmake -S <tree> -B build/upstream -DGGML_HIP=ON -DGGML_CUDA=OFF -DGGML_VULKAN=OFF
+         -DCMAKE_HIP_ARCHITECTURES=gfx1030 -DGPU_TARGETS=gfx1030
+         -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang++ -DCMAKE_PREFIX_PATH=$(hipconfig --path)
+         -DLLAMA_BUILD_{TESTS,EXAMPLES,SERVER,TOOLS,COMMON,APP,MTMD}=OFF
+         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=install
+         then fork/logits-compose against install. The compose link needed
+         -DCMAKE_EXE_LINKER_FLAGS="-L$HIP/lib -lamdhip64 -Wl,-rpath,$HIP/lib"; that is a
+         link-harness detail, not a source change.
+  Artifact sha256:
+    libggml-base.so.0.18.1   9ba044da6ac318aae7cf44705e8aad0af54160ee5a720c9d8ffbd2e98229450e
+    libggml-hip.so.0.18.1    a83e37da34540238511df24383239c226fe2cefa738a37ca4b4b7f898a545ce2
+    libllama.so.0.0.4        d5229b202b2b8a43787e31ae3df47209cc92744a33a4b3a5f0d7405d2d611b4e
+    tq-logits-compose        b7c3e7814e00c23852195e8e9da86fe8cd6cf0a77982e23221a9f3fb54e51547
+
+2. WHAT RAN
+-----------
+  Prompt: 'the quick brown fox jumps over the lazy dog ' x 29 = 1276 bytes, tokenizes to 262
+  input tokens. Command:
+    prefab_threarm.py --binary build/logits/tq-logits-compose
+      --model $E/mtp-qwen4exp-nextn-self-contained-q2_0.gguf
+      --prompt-file prompt.txt --out-dir run-gpu --gpu-layers 99
+  The script's defaults were kept: --threads 1, --prefill 1. Five arms, one process at a
+  time: stock, off (GGML_TP5_PREFAB_STATS=1), slot (LLAMA_PREFAB_MTP=1), on
+  (GGML_TP5_PREFAB_AB=1 LLAMA_PREFAB_NKV_PAD=1), dual (on + --dual).
+  Every arm's stdout summary: input_tokens=262, prefill=1, rows=262, decode_calls=262,
+  threads=1, gpu_layers_requested=99, mtp_ctx=true; dual has dual=true.
+
+3. THE 24 CHECKS (VERBATIM)
+---------------------------
+  PASS off tape bitwise == stock tape
+  PASS slot tape bitwise == stock tape
+  PASS on tape bitwise == stock tape
+  PASS dual tape A bitwise == stock tape
+  PASS dual tape B bitwise == stock tape
+  PASS prompt crosses the 256-cell stock KV bucket (decode_calls > 256) :: decode_calls=262
+  PASS stock: lane never engaged
+  PASS stock: stats gate off leaves every counter zero :: non_zero=[]
+  PASS off: lane never engaged
+  PASS off: builds happened on the stock path across KV buckets :: n_stock_builds=2
+  PASS off: every ubatch ran on the stock path and no envelope built :: n_ubatch_stock=262 calls=262
+  PASS slot: lane engaged
+  PASS slot: every ubatch reused or rebuilt the slot
+  PASS slot: no stock fallback
+  PASS slot: build parity with stock (no pad window, no compose) :: slot_builds=2 off_stock_builds=2
+  PASS on: lane engaged
+  PASS on: every ubatch reused or rebuilt the slot :: reuses=261 allocs=1 calls=262
+  PASS on: no stock fallback
+  PASS on: every rebuild composed (A x B)
+  PASS on: one A fetch per B emit
+  PASS on: A prologue compiled once (single envelope width)
+  PASS on: strictly fewer graph builds than stock :: off_stock_builds=2 on_builds=1
+  PASS dual: both contexts engaged
+  PASS dual: each context counted its own ubatches
+  VERDICT PASS
+  The script emits 24 PASS lines plus its own VERDICT PASS. The earlier CPU report's
+  "23/23" undercounts that same 24-line listing by one; the run is 24/24 here.
+
+4. PER-ARM COUNTERS (CONTEXT A; DUAL HAS TWO IDENTICAL CONTEXTS)
+----------------------------------------------------------------
+    arm    enabled  ubatch_stock  declines  stock_builds  allocs  reuses  compose  ubatch_prefab
+    stock  False    0             0         0             0       0       0        0
+    off    False    262           0         2             0       0       0        0
+    slot   True     0             0         2             2       260     0        262
+    on     True     0             0         0             1       261     1        262
+    dual A True     0             0         0             1       261     1        262
+    dual B True     0             0         0             1       261     1        262
+  `declines = 0` everywhere. `off_stock_builds = 2`, `slot_builds = 2`, `on_builds = 1`.
+  On-arm detail: n_mtp_a_compiles=1, n_mtp_a_clones=31, n_mtp_a_reuses=0, n_mtp_b_builds=1,
+  n_mtp_compose_hits=1, n_mtp_declines=0, n_envelope_allocs=1, n_envelope_reuses=261,
+  n_ubatch_prefab=262.
+
+5. GPU OFFLOAD (STDERR)
+-----------------------
+  Every arm: `ggml_cuda_init: found 5 ROCm devices`, layers 0..49 assigned to ROCm0..ROCm4,
+  `load_tensors: offloaded 50/50 layers to GPU`, 0 `assigned to CPU` lines. Example tail:
+    load_tensors: layer  49 assigned to device ROCm4, is_swa = 0
+    load_tensors: offloaded 50/50 layers to GPU
+  So the 262-row run is a real GPU run, not a CPU fallback.
+
+6. BITWISE GROUPS AND OFF-vs-ON COMPARISON
+------------------------------------------
+  Tapes: five files, 260,240,432 B each (24 B header + 262 x 4 B tokens + 262 rows x
+  248,320 x 4 B). `cmp` reports:
+    stock == off == slot == on == dual(A) == dual(B)  (all 0)
+  Therefore stock == off == slot is bitwise, and on == dual(A) == dual(B) is bitwise; the
+  two groups are also bitwise equal to each other.
+  compare-logits.py off.bin on.bin --atol 0.0001 --rtol 0.00001:
+    bitwise true, different_values 0, outside_tolerance 0, argmax_mismatches 0,
+    argmax_unavailable_rows 0, max_abs 0.0, max_rel 0.0, nonfinite 0,
+    first_different_row null, rows 262, vocabulary 248320, prefill 1, normalized_mse 0.0.
+  Independent KL/top1 pass over the same tapes:
+    differing_rows 0, differing_bytes 0, max_abs 0.0, mean_kl 0.0, max_kl 0.0,
+    top1_agree 262/262, first_div null.
+  The GPU FlashAttention path therefore does not reproduce the CPU --threads 4 split-KV
+  divergence at pos 258: the nek1=1024 padded prefab window and the nek1=512 stock window
+  produce identical rows on this backend. All 262 rows agree in every arm, including the
+  row at pos 257/258 that diverged in the earlier multi-threaded CPU cross-check.
+
+7. SCOPE
+--------
+  Established on GPU: the whole-graph prefab lane is bitwise transparent across stock, off,
+  slot, on and both dual contexts; it engages only where intended, declines nothing, and
+  turns 2 stock builds into 1; all 50 layers (including the output layer) are offloaded.
+  Not established here: CPU behaviour (covered by the V3 report) or any speed claim; the
+  run is a correctness/threarm check, not a timing benchmark.
+
+7. VERDICT
+----------
+  G2 PASS (HIP build rc=0; compose and libraries hashed above), G3/G4 PASS (24/24 checks,
+  declines=0, off_stock_builds=2, slot_builds=2, on_builds=1, 50/50 layers on GPU, 0 CPU,
+  all five tapes bitwise, off-vs-on max_abs 0.0, mean_kl 0.0, max_kl 0.0, top1 262/262).
+VERDICT PASS — 24/24 checks PASS; declines=0; off_stock_builds=2; slot_builds=2; on_builds=1; 50/50 layers GPU-offloaded (0 CPU); stock == off == slot == on == dual(A) == dual(B) bitwise over all 262 rows; compare-logits off vs on: max_abs 0.0, mean_kl 0.0, max_kl 0.0, top1 262/262, bitwise true; the nek1=1024 prefab window is numerically transparent on GPU FlashAttention.
