@@ -86,7 +86,7 @@
     },
     {
       "path": "ggml/include/ggml-relay.h",
-      "sha256": "7fdd8249b94a707220b6ef220fa43e8e7b4c30fa0471c430ef62652ca789cac1",
+      "sha256": "6515be02a00f7755e88b7b5fc7a247e18d96e2e34c508a409ae81dbfed2019c6",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -97,7 +97,7 @@
     },
     {
       "path": "ggml/src/ggml-relay-impl.h",
-      "sha256": "527c06d6540832d1a4e186b89e93bfe915a6d6fe3062304c741a6c03aa0845ec",
+      "sha256": "5bffa8b906d2ad782819c20a52a374cdd5f465f8d01849da46a477328c2b4a86",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -109,7 +109,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/relay.hip",
-      "sha256": "ac13937177faa06bda6a7f1abecdae6efab787732eb5a39d709c93264aeb1ba6",
+      "sha256": "8ca6d29c1d2088c33e773f38b6cdd92892771a3e6e8846a83fbd1518c85c3d75",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -143,7 +143,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "sha256": "ed4085720505729abdde2fdd011fb3250b25a262eb125853fa7a7913dbee4dc8",
+      "sha256": "feb717e88f4af933dd0d3639d150a3db823327bb8bbd08f64f6c8d71f4ab222a",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -168,7 +168,7 @@
     },
     {
       "path": "ggml/CMakeLists.txt",
-      "sha256": "64e32884913d8a7be00ad8a3c3de03567b697289c181c65c3b511a50a5cf04a0",
+      "sha256": "f29244c173f414a2f0ff4b29f539beed13504772333ff001621b1492f8b0d9d3",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution"
@@ -264,7 +264,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "cfbc9a166e42f38484064bc2dda48bf133559c46324394300b5bbf8c75703b73",
+      "sha256": "1fb3fdd97cb368fb6c0fdb3fec83f54976f42c54fe2be496845891fd159d9f16",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",
@@ -282,7 +282,7 @@
     },
     {
       "path": "ggml/src/ggml-backend.cpp",
-      "sha256": "797281a79664810364c13e67c049d5ccc5aa0de36335223af6128270b66e4b1b",
+      "sha256": "07e8059e51f8eb3afb463eda658e8674850e586fa73434116e6a491655cb1f8f",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -438,7 +438,7 @@
     },
     {
       "path": "src/llama-context.cpp",
-      "sha256": "ca6286855864e316d934e4738b13c095ae648857276ba5a392d2a5c483879e0f",
+      "sha256": "633c469274e2cd1f7e04a63cf6bb568ce1243b7fe26ce80f0ab6cf404f2ba08e",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -455,7 +455,7 @@
     },
     {
       "path": "src/llama-context.h",
-      "sha256": "a097c9435ccb2472c9eb4b6d02a1811b23e8d3a183320d759b961911df5e8fc8",
+      "sha256": "6bb331b8054be7c145fd4482f835d7c0a4e885c690009ee74bff561968018736",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -801,7 +801,7 @@
     },
     {
       "path": "tests/CMakeLists.txt",
-      "sha256": "0224082411c28b6cdc42ca62c0137724df7158435ab44a5f64bd394ab59e7b33",
+      "sha256": "e83a94b4a62073f37348f002e1b2e1fd1e7b7f028f27d115d70d4f8dbea384f9",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
@@ -828,6 +828,98 @@
       ],
       "reason": "Check slot reuse, generations, concurrency, steady-state allocation, and cp_into value equality.",
       "removal_condition": "Remove when the pool is unconditional and the equivalent checks live in the upstream test suite."
+    },
+    {
+      "path": "ggml/include/ggml-relay-plan.h",
+      "sha256": "32dd75b87dae13ca6ea9d452541200884898c4b940c971a6647a8416ae6c1778",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose pillar-5 plan cache and frame LRU (WS5)",
+        "ggml relay plan-key provider ABI"
+      ],
+      "reason": "Declare the pillar-5 relay plan key (eight fields including channels), frame LRU, exact pool policy and the environment switch matrix. graph_uid defaults to false so the unset path is stock; ON runs set GGML_TP5_GRAPH_UID=1 explicitly.",
+      "removal_condition": "Remove when upstream provides equivalent plan identity, frame LRU and exact pool policy, or when the WS5 consumer is removed."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/staging.cu",
+      "sha256": "1749ee19e0052569d5a424ccb88430a23606c5fce1eae25dc659bf78c62f2a34",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose persistent pinned H2D staging pool (WS4)"
+      ],
+      "reason": "Implement the persistent pinned H2D staging pool: slot allocation, lease and fence lifetime, copy submission, and refusal to reuse a leased slot.",
+      "removal_condition": "Remove when upstream provides equivalent persistent pinned H2D staging, or when the WS4 consumer is removed."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/staging.h",
+      "sha256": "1cd446aea239a0168789ef0ab576b9f072004164d1f67544cbd6011f57a87d5d",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose persistent pinned H2D staging pool (WS4)",
+        "WS4 staging pool CPU test"
+      ],
+      "reason": "Declare the staging pool API and host-side lease/slot state used by the meta backend and the CPU test harness.",
+      "removal_condition": "Remove with the WS4 staging pool implementation."
+    },
+    {
+      "path": "tests/test-tp5-staging-pool.cpp",
+      "sha256": "33efe233f5425efe408ed6ab311cbbf14e5a8d812d45ec1648def16482bcf587",
+      "mode": "100644",
+      "consumers": [
+        "WS4 staging pool CPU test"
+      ],
+      "reason": "Cover the twelve staging-pool checks: lease reuse, allocation/sync failure, and never reusing a leased slot.",
+      "removal_condition": "Remove with the WS4 staging pool test target."
+    },
+    {
+      "path": "tests/test-relay-plan-policy.cpp",
+      "sha256": "a5b2c64cb26b69cba21466ec9648ba2953f7092d8ff2af3274c95e9c268cd860",
+      "mode": "100644",
+      "consumers": [
+        "WS5 relay plan policy CPU test"
+      ],
+      "reason": "Cover the eight-field plan key, FRAMES default 2 versus ON 8, POOL_EXACT default 0 versus ON 1, PLAN_UNION default 0 versus ON 1, and graph_uid default false.",
+      "removal_condition": "Remove with the WS5 plan-policy implementation."
+    },
+    {
+      "path": "patches/ws5/ggml-backend-meta.cpp.patch",
+      "sha256": "d28bfbc9a2eaaa3afba2669aaccdf2db6303bd7db40d6ce61d5f0375883284e4",
+      "mode": "100644",
+      "consumers": [
+        "integ/tp5-mtp-r28b integration maintainers"
+      ],
+      "reason": "Record the applied WS5 cross-owner patch for the meta backend plan-key setter and ABI-3 prepare_ex; kept as integration provenance.",
+      "removal_condition": "Remove after the applied change is upstreamed or folded into the integration commit."
+    },
+    {
+      "path": "patches/ws5/runtime.cpp.patch",
+      "sha256": "231491f0f72e01ce20811de8de4b0e8fb548b9ce5d154d8db9851952bedf84ca",
+      "mode": "100644",
+      "consumers": [
+        "integ/tp5-mtp-r28b integration maintainers"
+      ],
+      "reason": "Record the applied WS5 cross-owner patch for 8x256 slot ownership, PLAN_RETIRED recycling and the close-to-zero assertion.",
+      "removal_condition": "Remove after the applied change is upstreamed or folded into the integration commit."
+    },
+    {
+      "path": "patches/ws5/ggml-backend.cpp.patch",
+      "sha256": "ac7b71a0828f8aa2cf32139eb03b2fd65c92d74c4d83ba43c24ddcfad9e61cbf",
+      "mode": "100644",
+      "consumers": [
+        "integ/tp5-mtp-r28b integration maintainers"
+      ],
+      "reason": "Record the applied WS5 proposal preserving a caller-assigned main-graph uid across split_graph; kept because the plan-policy test passes and the zero-uid path remains stock.",
+      "removal_condition": "Remove after the applied change is upstreamed, rejected by a later gate, or folded into the integration commit."
+    },
+    {
+      "path": "patches/ws5/README.md",
+      "sha256": "891a3afc4fe68be33c01774f926892c976b0da2d37a6e5f619dfd816a46da702",
+      "mode": "100644",
+      "consumers": [
+        "integ/tp5-mtp-r28b integration maintainers"
+      ],
+      "reason": "Document the WS5 cross-owner patch order, the graph_uid default-off contract, and the OFF/ON switch matrix.",
+      "removal_condition": "Remove after the WS5 patches are upstreamed or folded into the integration commit."
     }
   ]
 }
