@@ -7844,6 +7844,30 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
+// DUALWIN-COMPOSE-EVENT: a stream event for the Meta output-copy barrier.
+// GGML_CUDA_NO_PEER_COPY makes the device's event_new return nullptr so that
+// ggml_backend_sched never orders cross-device copies with events. This
+// constructor is reached only through get_proc_address, never through the
+// device interface, so the scheduler still sees no event_new. The event is an
+// ordinary device event: the device's event_free / event_synchronize and the
+// backend's event_record handle it unchanged.
+static ggml_backend_event_t ggml_backend_cuda_output_event_new(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->iface.get_name != ggml_backend_cuda_device_get_name) {
+        return nullptr;
+    }
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    ggml_cuda_set_device(dev_ctx->device);
+
+    cudaEvent_t event;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ event,
+    };
+}
+
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .get_name                = */ ggml_backend_cuda_device_get_name,
     /* .get_description         = */ ggml_backend_cuda_device_get_description,
@@ -8041,6 +8065,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_output_event_new") == 0) {
+        return (void *)ggml_backend_cuda_output_event_new;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

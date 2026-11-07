@@ -229,7 +229,7 @@ __global__ void consume_output(float *       terminal,
                 store(&c->error[rank], 3);
                 break;
             }
-            __builtin_amdgcn_s_sleep(2);
+            // ASYNC-PROTOCOL: pure busy-wait, no wave sleep.
         }
     }
     __syncthreads();

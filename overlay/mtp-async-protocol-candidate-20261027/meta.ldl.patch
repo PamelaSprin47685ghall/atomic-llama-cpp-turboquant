@@ -1,0 +1,14 @@
+--- meta.orig.cpp	2026-10-27 13:29:48.465468143 +0800
++++ ggml-backend-meta.cpp	2026-10-27 13:30:26.153287240 +0800
+@@ -2244,7 +2244,10 @@
+             if (have_snapshot) {
+                 break;
+             }
+-            std::this_thread::yield();
++            // ASYNC-PROTOCOL: busy-wait, no scheduler yield.
++#if defined(__x86_64__) || defined(__i386__)
++            __builtin_ia32_pause();
++#endif
+         } while (std::chrono::steady_clock::now() < snapshot_deadline);
+         if (!have_snapshot || previous.failed ||
+             (previous.epoch != 0 && !previous.finished)) {

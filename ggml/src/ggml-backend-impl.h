@@ -95,6 +95,10 @@ extern "C" {
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
+    // The first-child probes (ggml_backend_meta_first_child_device /
+    // ..._first_child_backend / ..._first_event_child_backend) are declared in
+    // the public ggml-backend.h header; no private declaration is needed here.
+
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 

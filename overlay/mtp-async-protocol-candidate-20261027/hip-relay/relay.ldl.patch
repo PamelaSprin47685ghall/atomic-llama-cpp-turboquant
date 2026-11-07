@@ -1,0 +1,4 @@
+232c232
+<             __builtin_amdgcn_s_sleep(2);
+---
+>             // ASYNC-PROTOCOL: pure busy-wait, no wave sleep.

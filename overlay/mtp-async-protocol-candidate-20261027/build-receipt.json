@@ -28,8 +28,8 @@
     }
   ],
   "binary_sha256": "331a0ae92185b6bb851ed9f4e6b109a978a48ff2b01cd3ff4257ab970993b6c5",
-  "runtime_sha256": "86acb16fff12eb9c21ecc499f29b4156777c893618079a00ed1f32f580f30c95",
-  "meta_sha256": "e744a6dc582b24f76c1d483a7edfd5fb69b69a67f3b8175d64129759736e4109",
+  "runtime_sha256": "f29f3b0809cbb1959f2a50ce8a29b6e5af54f93de06eef73d4139bcecfc38688",
+  "meta_sha256": "44461aad1c517a8bc29ae64d8d96636a32e2da7e4418c8f96f72a8971cffdc52",
   "libraries": {
     "libggml-cpu.so.0.18.1": "e06514a581585f7c36d427d818a3a4f333878f409196c14ceb62ca765d846eb8",
     "libggml.so.0.18.1": "2eb6dec13330ccf26abe17e0a6ef5741d160016e8ee9705d9b0abc6d14541151",
@@ -37,5 +37,45 @@
     "libllama.so.0.0.2451": "bc534172a948a633112b521d1d05df143d6a5074d29305488d1dd828b65302c2",
     "libggml-base.so.0.18.1": "d9c159304be80bc2e3e59cd80f149cd8dbaed805dca482ff141c4e0f368c1663"
   },
-  "incremental_scope": "runtime+Meta only; unchanged exact-Q2 HIP and KV-only llama libraries"
+  "incremental_scope": "runtime+Meta only; unchanged exact-Q2 HIP and KV-only llama libraries",
+  "meta_sha256_built_source": "e744a6dc582b24f76c1d483a7edfd5fb69b69a67f3b8175d64129759736e4109",
+  "provenance": {
+    "runtime_built_source_sha256": "86acb16fff12eb9c21ecc499f29b4156777c893618079a00ed1f32f580f30c95",
+    "runtime_delivered_sha256": "f29f3b0809cbb1959f2a50ce8a29b6e5af54f93de06eef73d4139bcecfc38688",
+    "meta_built_source_sha256": "e744a6dc582b24f76c1d483a7edfd5fb69b69a67f3b8175d64129759736e4109",
+    "meta_delivered_sha256": "44461aad1c517a8bc29ae64d8d96636a32e2da7e4418c8f96f72a8971cffdc52",
+    "note": "runtime_sha256/meta_sha256 name the DELIVERED sources (what a rebuild compiles now). The 2026-10-27 steps/binary/libraries were produced from the BUILT sources recorded in _built_source_sha256; no artifact of the delivered sources exists. Overlay sources are under this directory; tree copies (ggml/src/ggml-backend-meta.cpp, fork/tp5-compose/src/runtime.cpp) are separate files with their own hashes, recorded in PROVENANCE.md / headers/README.md.",
+    "runtime_patch_sha256": "8173485a237d59d9787fa11e002c5d1b8b08047bb42fb8d39c442570ac7a2de9",
+    "meta_patch_sha256": "eb17e98b173d419cc1b1daa5953284be9da063cd94b3efb3bfd2df38a6342ac8",
+    "header_closure": {
+      "dir": "headers/",
+      "manifest": "headers/README.md",
+      "ggml-backend.h": "1d52503425e7a14f85181c9aacc1d0e1258c4a26399180fc7df08dc661bea7c7",
+      "ggml-backend.patch": "6e6747c0cd08071f4d2ac36445382729f8755b2bb60cac933c325c7d292f232f",
+      "llama.h": "c0aad9efd9eb1167b1240da95b674e7d28997f16e4964dc56fdc5b87c10f3510",
+      "llama.patch": "8694829d1e452ef3f10d6d02488a5ea6c5752c7ef7bc43c40a683715f8fd75fb",
+      "note": "recorded -I root 3 (hc-router-owner-a-install/include) lacks the candidate declarations; headers/base/<h> + headers/<h>.patch -> headers/<h> == tree delivered header. ggml-cuda.h is no longer included by runtime.cpp."
+    },
+    "relay": {
+      "note": "relay.hip is the HIP candidate source this lane compiles; the 2026-10-27 receipt describes the earlier host build only.",
+      "baseline": {
+        "file": "hip-relay/relay.orig.hip",
+        "sha256": "8bf84b65894146cd8d0858f2cff95121c110e8ac03881f292b3a22d7fc8de2a7"
+      },
+      "busywait_stage": {
+        "file": "hip-relay/relay.ldl.hip",
+        "sha256": "1badd280b9a826d47182182a0058c9a0a4cdda362c2e9f8ee44b0f414fe3d389",
+        "patch": "hip-relay/relay.ldl.patch",
+        "patch_sha256": "403d3a0ff40021be9123bc42193557101d473545404fbed91f2d4bf87692fb02"
+      },
+      "delivered": {
+        "file": "hip-relay/relay.hip",
+        "sha256": "318c9b505a85052a84f0ab78a302e94e5c2df88209242ec1490dba48346efdc1",
+        "patch": "hip-relay/relay.patch",
+        "patch_sha256": "746cf0b8fefb893682a0cddb9a074de11435bee6e596567d7f5aeabe7efc07dc",
+        "patch_added": "DUALWIN-SERIALCUT-TRIM + DUALWIN-OVERLAP-METER host-gate adoption (189+/1-)"
+      },
+      "manifest": "hip-relay/PROVENANCE.md"
+    }
+  }
 }

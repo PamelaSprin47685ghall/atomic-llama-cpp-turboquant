@@ -1,0 +1,535 @@
+DUALWIN LANE — G2 BUILD, G3 INERTNESS, G4 COUNTERS
+Tree /home/kunweiz/work/merge-dualwin-20261031, HEAD e79db6050, git status clean.
+Every artifact below lives under
+  /home/kunweiz/work/lead-fa-ncols2-g2-verify-20261031/dualwin-g3g4-20261101 (mode 0700).
+No source file of the lane was modified. CPU builds held /home/kunweiz/work/vfs-build.lock and
+vfs-build-2.lock; every GPU leg held $E/ple-candidate-gpu.lock and /tmp/ple-candidate-gpu.lock
+(non-blocking flock, one HIP process at a time). All five GPUs read 0 % after the last leg.
+
+================================================================================
+G2 — BUILD OF THE NON-RELAY HOST TUs
+================================================================================
+WHAT WAS BUILT
+  The change set is ggml/include/ggml-backend.h, ggml/src/ggml-backend-impl.h,
+  ggml/src/ggml-backend-meta.cpp, ggml/src/ggml-cuda/relay.hip, plus the compose runtime
+  (fork/tp5-compose/src/runtime.cpp, dw_compose_event.h) and llama-context.cpp. The host TUs were
+  built from the lane's own source with the lane's own configure flags, into a private build dir:
+
+    cmake -S <lane> -B <private>/upstream  Release, GGML_HIP=ON, CMAKE_HIP_ARCHITECTURES=gfx1030,
+          GGML_HIP_GRAPHS=OFF, GGML_HIP_MMQ_MFMA=OFF, GGML_CUDA_FA=ON, GGML_CUDA_NO_PEER_COPY=ON,
+          CMAKE_HIP_COMPILER=/opt/rocm/core-10.0/lib/llvm/bin/clang++
+    cmake --build <private>/upstream --parallel 32 --target llama
+
+  configure rc=0. The llama target reached 100 % with 0 errors and 1 warning. (build.log contains
+  one `error:` line: it is the first attempt, before the include path below was supplied.)
+
+  Artifacts: libggml-base.so.0.18.1 e75f8cec05f14172…, libggml-hip.so.0.18.1 785a0c9b184b116b…,
+  libllama.so.0.0.4 2718eddb45b64212…, tq-tp5-compose 37a02148cb580cba… (the compose runtime built
+  from fork/tp5-compose, see below).
+
+TWO THINGS THE LANE DOES NOT DO BY ITSELF — BOTH RECORDED, NEITHER WORKED AROUND IN SOURCE
+  1. ggml/src/ggml-backend-meta.cpp:4 includes "tp5-meta-submit-ready.h", which exists only in
+     overlay/mtp-async-protocol-candidate-20261027/base/. The tree does not add that directory to
+     any include path, so a plain cmake build fails:
+       ggml-backend-meta.cpp:4:10: fatal error: tp5-meta-submit-ready.h: No such file or directory
+     The build above supplies -I<overlay>/mtp-async-protocol-candidate-20261027/base. That is the
+     only deviation, and it changes no source byte. The lane needs this path in its build recipe.
+  2. fork/build.py refuses before it configures anything: fork/check-upstream.py runs
+       git merge-base --is-ancestor cda0f9256665845cd9d6f3a0176880883f653a3d HEAD
+     which fails on HEAD e79db6050 (the lane is a snapshot branch, not a descendant of that commit).
+     That guard is about upstream provenance, not buildability; the cmake invocation above is the
+     script's own configure line, so the build is the one build.py would have run.
+  Additionally the fork/tp5-compose module does not link the HIP runtime it needs through libggml-hip:
+  linking fails with ~85 `undefined reference to hipXxx@hip_4.2` until the caller appends
+  -L/opt/rocm/core-10.0/lib -lamdhip64 (here via CMAKE_CXX_STANDARD_LIBRARIES so it lands after the
+  objects). Worth fixing in the module's CMakeLists.
+
+HOST ABI DELTA (dualwin libggml-base vs the shipped selected libggml-base)
+  891 exported symbols against 886: five added, none removed.
+    ggml_backend_meta_first_child_backend
+    ggml_backend_meta_first_child_device
+    ggml_backend_meta_first_event_child_backend
+    ggml_backend_meta_output_record
+    ggml_backend_meta_output_wait
+  These are exactly the dual-window output-copy event entry points; nothing else in the host ABI
+  moved. The link object list of no shipped DSO was touched.
+
+MODULE CHAIN
+  fork/relay, fork/rerot, fork/sampling, fork/corpus, fork/scheduling, fork/text, fork/calibration:
+  configure, build and install all rc=0 against the private prefix. That is the dependency set
+  fork/tp5-compose asks for.
+
+================================================================================
+G3 — INERTNESS: DOES THE LANE CHANGE ANY NUMBER?
+================================================================================
+Legs: 2 windows x 32 tokens (and 2 x 1), same argv and environment as every earlier model leg,
+derived from mtp-hc-row-tail-candidate-20261025/on512x2/command.json, --capture-logits.
+
+(a) THE RELAY CHANGE (relay.hip prev 1251795e021b7bb9… vs head a901be26e8aa55a1…), both run with the
+    dualwin host TUs (dualwin libggml-base) and the same libllama:
+      8x2:  prev rc=0 75.8 s, head rc=0 121.4 s  ->  logits.f32le identical, 0 differing bytes
+      1x2:  prev rc=0 76.8 s, head rc=0 108.4 s  ->  logits.f32le identical, 0 differing bytes
+    The relay change is bitwise inert.
+
+(b) THE COMPOSE EVENT GATE, dualwin binary, GGML_TP5_DW_COMPOSE_EVENT=1 vs =0, nothing else differs:
+      ON  rc=0 73.1 s   OFF rc=0 72.7 s
+      row0 win0: 0/248320 differ, top1 271/271;  row1 win1: 0/248320 differ, top1 248046/248046
+    The gate is bitwise inert, as its own header claims.
+
+WHAT THE SOURCE CHANGE ACTUALLY IS (diff of the two relay.hip variants)
+    element_capacity            4*4096 -> 16*4096   (room for four real target rows)
+    consumer wait               __builtin_amdgcn_s_sleep(2) removed -> pure busy-wait
+    submit()                    TP5_DIAG_GRAPH timing instrumentation added
+  The tail-event record/query code (hipEventRecord at relay.hip:1337, hipEventQuery at :671) is
+  unchanged between prev and head; what the lane changes on the device side is the wait spin and the
+  channel capacity, and it adds the fork-side output-copy event path.
+
+================================================================================
+G4 — COUNTERS: WHAT ACTUALLY RAN
+================================================================================
+(a) RELAY SUBMIT PATH (r1 harness, dualwin/base DSOs, five devices, real submit):
+      submit=1, epoch 0->1, attempted_mask=31, accepted_mask=31, sealed=1, failed=0,
+      rank_relay_nodes=[1,1,1,1,1], completed_mask=0, finished=0 after 3903 polls
+    The frame was submitted and sealed on all five ranks. completed_mask stays 0 without a consumer
+    because the relay kernels wait for the consumer to publish; the same numbers come from the
+    pre-change DSO, so this is the protocol, not the lane.
+
+(b) TP5_DIAG_RELAY (the lane's own instrumentation), head DSO, 8x2 leg, 26 submits:
+      modes        direct 10 / capture 4 / replay 12
+      cache hits   16 (hit=1), definition_changed 10
+      lock_us      p50 0,        max 1
+      key_us       p50 1,        max 39654      (frame-key scan)
+      begin_us     p50 5,        max 9
+      dispatch_us  p50 38304,    max 19849866   (19.85 s — the host slowdown)
+      finish_us    p50 240,      max 38889      (tail hipEventRecord on every lane)
+      total_us     p50 57806,    max 19866250
+    1x2 leg, 19 submits: modes 6/2/11, 13 hits, finish_us p50 231 / max 26465.
+    finish_us is non-zero on every submit, so the tail-event record path ran; replay mode (12 of 26)
+    proves it ran on replayed graphs too. The pre-change DSO carries no instrumentation (0 lines),
+    so there is no prev-side number to compare; the code it runs is the same record block.
+
+(c) THE DUAL-WINDOW OUTPUT-COPY EVENT PATH NEVER EXECUTED — the decisive result of this leg.
+    With GGML_TP5_DW_COMPOSE_EVENT=1 the runtime prints its receipt, and it prints:
+      TP5_DW_COMPOSE_EVENT enabled=1 flag=GGML_TP5_DW_COMPOSE_EVENT windows=2
+      TP5_DW_COMPOSE_EVENT window=0 epochs=12 output_event_syncs=0 host_sync_replaced=0
+                          fallback_no_output_barrier=12 no_sync_logits_calls=0
+      TP5_DW_COMPOSE_EVENT window=1 epochs=13 output_event_syncs=0 host_sync_replaced=0
+                          fallback_no_output_barrier=13 no_sync_logits_calls=0
+    Every one of the 25 epochs kept the stock llama_synchronize: llama_tp5_output_copy_record()
+    returned 0 each time, so no device event was recorded, none was waited on, and no logits row was
+    read through llama_get_logits_ith_no_sync. The gate therefore changes nothing at all in this
+    configuration — which is why (b) above is bitwise inert — and the lane's headline feature is
+    unexercised, not merely quiet.
+    ISOLATED. Two private probe builds, no source tree touched: ggml-backend-meta.cpp and
+    llama-context.cpp were copied into probe/, a stderr line was inserted before every `return 0;`
+    in ggml_backend_meta_output_record and in llama_context::tp5_output_copy_record, the objects were
+    compiled with the build dir's own flags, dropped over the build dir's objects and relinked
+    (libggml-base 85d5cdcf200f63de…, libllama 6ee382209bc8df94…), then installed and run with the
+    gate ON. (A first probe run printed nothing: the private install tree still held the pre-probe
+    libraries — the probe rebuild writes to <build>/bin, not to <prefix>/lib.)
+    Result, 25 epochs, 25 calls of ggml_backend_meta_output_record:
+      23 x META_REC_FAIL at ggml-backend-meta.cpp:4320   -> the split-axis else branch
+       2 x META_REC_FAIL at ggml-backend-meta.cpp:4377   -> recorded != targets.size()
+      0 x at the earlier returns (no gate, not meta, no buffer, not a meta buffer, empty context)
+      0 x LLAMA_REC_FAIL (the llama-side early returns are all passed)
+    So the logits tensor IS a meta-buffer tensor of a meta backend with a live relay, and the record
+    dies on the split state: ggml_backend_meta_get_split_state(tensor, assume_sync=false) returns
+    GGML_BACKEND_SPLIT_AXIS_PARTIAL (or UNKNOWN) for this output, and the record treats anything that
+    is neither MIRRORED nor axis 0..2 as "no sound barrier". The mechanism is in the state function
+    itself: at ggml-backend-meta.cpp:628 an output whose two sources both split on axis 0 returns
+    {assume_sync ? MIRRORED : PARTIAL}, and the record asks with assume_sync=false. The call site
+    therefore cannot see the MIRRORED case its own comment describes ("MIRRORED reads the first
+    child"); it degrades to PARTIAL and fails closed by design.
+    The two late failures (recorded != targets.size()) are epochs where an axis was resolvable and
+    some event still failed to record; they are not the main path.
+    Consequence for acceptance: the RUNBOOK's device trace for the event path cannot be produced on
+    this configuration, because there is no event to trace.
+
+(d) CROSS-TREE COMPARISON IS NOT MEANINGFUL — measured, then set aside.
+    The dualwin binary against the shipped m4 control binary, same argv and environment:
+      2 rows, 248320 values each, all values differ, maxabs 0.887 / 1.100, top1 equal in both rows.
+    Isolated: swapping the m4 libllama into the dualwin stack changes nothing (0 differing bytes vs
+    the dualwin stack); swapping libllama and libggml-base both changes nothing. The difference is
+    the compose binary itself (fork/tp5-compose vs the m4 compose control) — a different program, not
+    a regression of this lane. Bitwise comparison is only sound inside the lane, which is what (a)
+    and (b) do.
+
+================================================================================
+LIMITS OF THIS LEG
+================================================================================
+  * 2x32 and 2x1 windows only; no formal 512x2, no timing claims (the host is still in its
+    post-reboot slowdown: dispatch p50 38 ms, max 19.85 s on a workload that ran at 1.44 s pre-reboot).
+  * The event path's absence is measured on this argv and model; a different split (PARTIAL output)
+    or a meta-buffer logits tensor could take the record path. That was not built.
+  * No source tree was changed; the two build deviations (overlay include path, -lamdhip64) are
+    recorded above rather than patched in.
+  * The probe builds were removed after use: the two instrumented objects were deleted and
+    libggml-base/libllama rebuilt from the pristine tree, reproducing libggml-base e75f8cec05f14172…
+    and libllama 2718eddb45b64212… (the installed copy of libllama is 1c837a48cdeccf7f… because
+    cmake --install rewrites its RPATH). The instrumented pair is kept for reference under
+    probe/lib/ (libggml-base-probe…, libllama-probe…) together with the two probe sources.
+
+================================================================================
+APPENDIX A — AFTER MAIN'S FIX: THE EVENT PATH EXECUTES
+================================================================================
+This appendix supersedes the G4 section above, which describes the PRE-FIX state of the lane. The
+root causes I reported (23 x line 4320, 2 x line 4377) are fixed in the tree; nothing below reuses
+the old binaries. Tree HEAD e79db6050, working tree modified in four files (docs, runtime.cpp,
+ggml-backend-meta.cpp, ggml-cuda.cu) plus the overlay copy; hashes verified against the hand-off:
+  ggml/src/ggml-backend-meta.cpp        ae54d2b301c43526  (overlay/…/ggml-backend-meta.cpp identical)
+  ggml/src/ggml-cuda/ggml-cuda.cu       568ed7020759aa96
+  fork/tp5-compose/src/runtime.cpp      cff8b10b68c77ab3
+All builds under /home/kunweiz/work/vfs-build.lock + vfs-build-2.lock, all GPU legs under both GPU
+locks, one HIP process at a time, private 0700 dirs, no source byte changed by me.
+
+A.1 G2 — REBUILD OF THE THREE TUs
+    cmake --build <private>/upstream --target llama   (recompiles ggml-backend-meta.cpp and
+    ggml-cuda.cu, relinks libggml-base, libggml-hip, libggml, libllama)      BUILD-RC=0, 0 errors
+    cmake --install <private>/upstream                                        INSTALL-RC=0
+    cmake --build <private>/compose  (recompiles runtime.cpp, relinks)        COMPOSE-RC=0, 0 errors
+    Artifacts: libggml-hip.so.0.18.1 5a6942ae0ec28e04… (68,604,216 B; installed copy
+    3779bbc15c04559e… because install rewrites RPATH), libggml-base.so.0.18.1 31551514e30b2484…,
+    tq-tp5-compose ad8fc413e074b356… (252,104 B).
+
+A.1a OBJECT-LEVEL DELTA OF ggml-cuda.cu — the only real addition is the static constructor.
+    I compiled the pre-change file (git show HEAD:ggml/src/ggml-cuda/ggml-cuda.cu) into a private
+    object with the build dir's exact HIP flags and diffed symbol tables:
+      added   _ZL34ggml_backend_cuda_output_event_newP19ggml_backend_device   (local 't')
+              _GLOBAL__sub_I_ggml_cuda.cu, __hip_cuid_…/__hip_gpubin_handle_… (new TU content id)
+              .L.str.*, .LCPI*, GCC_except_table* — renumbered locals only
+      removed the same renumbered locals plus the old cuid and the copy's own
+              _GLOBAL__sub_I_ggml_cuda_head.cu (artifact of my file name)
+      no exported (T/D) symbol added or removed: the function stays static.
+    Strings: the single new content string is "ggml_backend_output_event_new" (0 occurrences in the
+    pre-change object, 1 in the new one); everything else differs only in label names and in the
+    source path of my copy.
+
+A.1b THE DEVICE INTERFACE IS STILL THE NULLPTR STUB.
+    objdump of libggml-hip.so.0.18.1 at _ZL34ggml_backend_cuda_device_event_newP19ggml_backend_device
+    (0x33b6618):  xor %eax,%eax ; ret   — still returns nullptr, so ggml_backend_sched sees no event
+    interface and cannot change any other graph's synchronization. The new constructor
+    (0x33b70d0) checks dev, compares the device iface pointer against the CUDA device's, and returns
+    0 for anything else.
+
+A.2 G4 — OFF (gate unset) vs ON (GGML_TP5_DW_COMPOSE_EVENT=1), same 2x32 legs as before
+    Both legs: rc=0, 64 logits rows captured (2 windows x 32 tokens).
+      logits.f32le: 0 differing bytes; per row 0/64 rows differ, 0/64 top1 differ.
+    ON receipt:
+      TP5_DW_COMPOSE_EVENT enabled=1 flag=GGML_TP5_DW_COMPOSE_EVENT windows=2
+      window=0 epochs=43 output_event_syncs=32 host_sync_replaced=32 fallback_no_output_barrier=0
+                 no_sync_logits_calls=32 no_output_epochs=11
+      window=1 epochs=44 output_event_syncs=32 host_sync_replaced=32 fallback_no_output_barrier=0
+                 no_sync_logits_calls=32 no_output_epochs=12
+    Every condition asked for holds: output_event_syncs == host_sync_replaced == 32 > 0;
+    fallback_no_output_barrier == 0; and output_event_syncs + no_output_epochs == epochs
+    (32+11=43, 32+12=44). The 11/12 no-output epochs are the prompt epochs with output_rows==0 that
+    the fix now routes around, and they keep the stock synchronize as intended.
+    OFF (gate unset) prints no receipt at all (0 TP5_DW_COMPOSE_EVENT lines) and its logits are
+    bitwise identical to ON's, so the gate still changes no number.
+    Same checks at 2x1 (predict=1): ON window0 epochs=12 syncs=1 replaced=1 fallback=0 no_sync=1
+    no_output=11 (1+11=12); window1 epochs=13 syncs=1 replaced=1 fallback=0 no_sync=1 no_output=12
+    (1+12=13).
+
+A.3 THE DEVICE EVENTS REALLY HAPPEN — rocprofv3 --hip-trace on the ON leg
+    Same 2x1 ON leg re-run under `rocprofv3 --hip-trace --output-format csv` (child rc=0, trace
+    finalized, 476 MB of hip_hip_api_trace.csv). Event-call counts:
+      hipEventCreateWithFlags 20   hipEventRecord 135   hipEventSynchronize 10
+      hipEventDestroy 20           hipEventQuery 2320319 (the relay tail poller)
+    Split by window thread (each window runs on its own thread):
+      thread 2630263 (window 0): 65 records, 5 creates, 5 syncs, 5 destroys
+      thread 2630264 (window 1): 70 records, 5 creates, 5 syncs, 5 destroys
+    The decomposition is exact and leaves nothing unexplained:
+      window 0: 12 epochs x 5 ranks = 60 relay tail records + 5 output-copy records = 65
+      window 1: 13 epochs x 5 ranks = 65 relay tail records + 5 output-copy records = 70
+      total 135 records; 10 creates, 10 syncs, 10 destroys = 5 child events per window, one per rank.
+    So each window creates one device event per contributing child rank, records it on that child's
+    stream after decode, synchronizes it before the logits row is read, and destroys it afterwards —
+    the record/wait pair is real device work on the five child devices, not a host-side counter.
+
+A.4 (c) OFF AFTER THE FIX vs OFF BEFORE THE FIX — the scheduler did not change
+    predict=1, gate unset, new build vs the pre-fix build's gate-0 leg: logits.f32le identical,
+    0 differing bytes (1,986,560 B each). Combined with A.1b (device iface still nullptr) this says
+    the change is confined to the output-copy path.
+
+A.5 OBSERVED, NO CONCLUSION DRAWN
+    Wall times: 2x32 OFF 76.2 s, 2x32 ON 230.6 s; 2x1 OFF 85.4 s, 2x1 ON 102.8 s. The host is still
+    in its post-reboot slowdown and this leg makes no timing claim; the ON/OFF difference at 2x32 is
+    recorded only so it is not lost.
+
+VERDICT DUALWIN G2 BUILD PASS, G3 INERT, G4 EVENT PATH EXECUTES (PASS) — with Main's fix the three TUs rebuild clean (libggml-hip 5a6942ae…, libggml-base 31551514…, compose ad8fc413…, 0 errors), the object delta of ggml-cuda.cu is exactly one new static ggml_backend_cuda_output_event_new plus the string "ggml_backend_output_event_new" with no exported symbol change and ggml_backend_cuda_device_event_new still `xor eax,eax; ret`, so the scheduler is untouched; the 2x32 ON and OFF legs are bitwise identical (0 of 64 rows differ, 0 top1 differ) and the ON receipt satisfies every condition (output_event_syncs == host_sync_replaced == 32 > 0, fallback_no_output_barrier == 0, output_event_syncs + no_output_epochs == epochs for both windows), and rocprofv3 --hip-trace shows the events are real device work on the five child ranks: 5 creates, 5 records, 5 syncs and 5 destroys per window thread, with the 135 records decomposing exactly into 125 relay tail records (25 epochs x 5 ranks) and 10 output-copy records; the post-fix OFF leg is also bitwise identical to the pre-fix OFF leg, confirming the scheduler did not change.
+
+================================================================================
+APPENDIX B — FRESH-BOOT 2x32 TIMING
+================================================================================
+Executor: DevopsFreshBoot. Private dir dualwin-g3g4-20261101/. One clean back-to-back OFF/ON pair
+under both GPU locks ($E/ple-candidate-gpu.lock, /tmp/ple-candidate-gpu.lock) held across the pair;
+released 15:39:30, both lock files then free to flock, 0 KFD processes, five GPUs at 0 %. No source
+file, install tree or command was modified; the fixed artifacts of appendix A are reused verbatim.
+
+A) WHAT RAN
+-----------
+  Runner: fresh-legs.sh (new, 3.5 KB). It takes both locks, then calls legs2.py twice with
+  DW_KEEP_HIP=1 so the run's install/lib keeps the fixed libggml-hip (the pre-fix head overlay is
+  not applied), and finally compares the two logits files.
+    runs/fresh_off_2x32  GGML_TP5_DW_COMPOSE_EVENT unset  --predict 32  rc=0  wall  89.1 s  rc 15:36:33
+    runs/fresh_on_2x32   GGML_TP5_DW_COMPOSE_EVENT=1      --predict 32  rc=0  wall 176.1 s  rc 15:39:30
+  Build identity (sha256, first 16 hex), identical to appendix A's fixed build:
+    libggml-hip.so.0.18.1   3779bbc15c04559e   68,604,216 B
+    libggml-base.so.0.18.1  31551514e30b2484
+    libllama.so.0.0.4       1c837a48cdeccf7f
+    tq-tp5-compose          ad8fc413e074b356
+  Same argv/environment as the earlier 2x32 legs (mtp-hc-row-tail-candidate-20261025/on512x2), with
+  --capture-logits and --deadline 180.
+
+B) TIMING, BOTH WINDOWS
+-----------------------
+    metric                        OFF (gate unset)      ON (gate = 1)
+    wall                                89.1 s               176.1 s
+    window 0 decode_submit          8,884.3 ms            1,333.9 ms
+    window 1 decode_submit          1,240.1 ms              604.4 ms
+    window 0 native_wait              799.9 ms           89,400.6 ms
+    window 1 native_wait              923.5 ms           89,328.7 ms
+    request 0 ttft                  8,933.8 ms            2,554.2 ms
+    request 1 ttft                  9,081.4 ms            2,709.3 ms
+    request 0 total                10,838.3 ms           91,195.7 ms
+    request 1 total                10,815.8 ms           91,196.0 ms
+    request 0 median interval          25.0 ms            2,852.2 ms   (min 20.8 / max 256.0)
+    request 1 median interval          22.1 ms            2,845.9 ms   (min 20.8 / max 219.6)
+  Window calls: 43 and 44 in both legs, so the epoch counts are unchanged.
+
+C) CORRECTNESS — STILL BITWISE IDENTICAL, GATE EXECUTES
+-------------------------------------------------------
+  logits: 64 rows x 248,320 values x 4 B = 63,569,920 B per leg.
+    differing bytes 0; differing rows 0/64; differing token metadata rows 0/64
+    (input_token, sampled_token, emitted_token identical row by row)
+  The fresh OFF leg is also bitwise identical to runs/nOff (the post-fix OFF of appendix A):
+    0/64 rows, 0 bytes. The fresh boot changes no number.
+  ON receipt (stderr, verbatim):
+    TP5_DW_COMPOSE_EVENT enabled=1 flag=GGML_TP5_DW_COMPOSE_EVENT windows=2
+    TP5_DW_COMPOSE_EVENT window=0 epochs=43 output_event_syncs=32 host_sync_replaced=32
+        fallback_no_output_barrier=0 no_sync_logits_calls=32 no_output_epochs=11
+    TP5_DW_COMPOSE_EVENT window=1 epochs=44 output_event_syncs=32 host_sync_replaced=32
+        fallback_no_output_barrier=0 no_sync_logits_calls=32 no_output_epochs=12
+  Every condition asked for holds: output_event_syncs == host_sync_replaced == 32 per window,
+  fallback_no_output_barrier == 0, and 32 + 11 = 43, 32 + 12 = 44. The OFF leg prints 0
+  TP5_DW_COMPOSE_EVENT lines, as before.
+
+D) WHAT THE ON TIMING IS
+------------------------
+  The barrier's cost is the native wait: 89,400.6 / 32 = 2,793.8 ms per output-event sync (window 1:
+  2,791.5 ms), and 2,852.2 / 2,845.9 ms per emitted token. The device work per token is the OFF
+  interval, 25.0 / 22.1 ms, so the wait is 114-129x the work it guards, and the wall is 1.98x OFF.
+  The wait is a near-constant per-sync cost (min 2,054.5 ms, max 4,740.4 ms), not proportional to
+  device work, and the two windows are lockstep: their 31 intervals agree within 3 % (most within
+  0.5 %) and their last commits differ by 305 us (1,806,190,526,974 vs 1,806,190,832,434 ns),
+  consistent with each output event wait being tied to the shared relay tail rather than to its own
+  child's 25 ms of work.
+  The submit counters are not comparable across the pair because of first touch: OFF ran first and
+  its first TP5_DIAG_RELAY dispatch is 7,287,782 us (total_us 7,307,073), which alone explains most
+  of its 8,884.3 ms window-0 submit; ON's first dispatch is 803,177 us (41,642 us on the other
+  window) and steady relay totals are 233-279 us in both legs. So the clean comparisons are
+  native_wait, per-token interval, and the steady window-1 submit (1,240.1 vs 604.4 ms), not
+  window-0 submit.
+
+E) AGAINST APPENDIX A (PRE-FIX PAIR, 2026-11-01 16:27/16:31, BOOT -2)
+---------------------------------------------------------------------
+    metric                        appendix A OFF / ON      fresh OFF / ON
+    wall                            76.2 s / 230.6 s        89.1 s / 176.1 s
+    window 0 decode_submit       1,473 / 31,393 ms      8,884.3 / 1,333.9 ms
+    window 1 decode_submit         589 / 4,898 ms       1,240.1 / 604.4 ms
+    window 0 native_wait           913 / 110,436 ms        799.9 / 89,400.6 ms
+    window 1 native_wait           963 / 114,175 ms        923.5 / 89,328.7 ms
+    request 0 median interval     25.1 / 3,798.6 ms       25.0 / 2,852.2 ms
+    request 1 median interval     24.2 / 4,020.9 ms       22.1 / 2,845.9 ms
+  OFF is 17 % slower in wall than the pre-fix OFF, concentrated in first touch (window 0 submit 8.9 s
+  vs 1.5 s and ttft 8.93 s vs 1.81 s, both carrying the 7.29 s first relay dispatch; window 1 submit
+  1.24 vs 0.59 s). ON is 24 % faster in wall and 25/29 % faster per token than the
+  pre-fix ON, and its submit fell from 31.4/4.9 s to 1.33/0.60 s, but its wait only fell 19/22 %
+  (110.4/114.2 s to 89.4/89.3 s), so the barrier itself remains the dominant cost.
+
+F) LIMITS
+---------
+  * One pair, run in the order OFF then ON; no repeat and no reverse order. The OFF first-touch
+    submit (7.29 s first relay dispatch) is an order artifact, not a gate effect.
+  * No rocprofv3 trace this time; the event-wait mechanism is measured, not decomposed. The
+    lockstep reading is an inference from timestamps, not a traced causal chain.
+  * The numbers cover this argv, model and split only (2x32, --deadline 180, PARTIAL output state).
+  * No source or build change; appendix A's fixed artifacts were reused byte for byte.
+
+VERDICT PASS ON CORRECTNESS AND GATE, TIMING RECORDED — the fresh translated DMA-FQ boot reproduces appendix A exactly (fixed build 3779bbc1/31551514/1c837a48/ad8fc413, 2x32 OFF and ON bitwise identical: 0/64 rows, 0 of 63,569,920 bytes, 0/64 token-metadata rows; fresh OFF also 0/64 against the post-fix OFF), the gate executes as specified (output_event_syncs == host_sync_replaced == 32 per window, fallback_no_output_barrier == 0, no_sync_logits_calls == 32, 32+11=43 and 32+12=44), and the clean pair prices the barrier at 89.4 s of native wait per window (2.79 s per sync, 2.85 s per token) against 25.0/22.1 ms per token with the gate off — 176.1 s vs 89.1 s wall (1.98x) — so the barrier is correct but still expensive, 24 % cheaper than the pre-fix ON leg and 19-22 % lower in wait, while the OFF window-0 submit of 8.9 s is a first-touch artifact of running OFF first (7.29 s first relay dispatch) and the steady window-1 submit is 1.24 vs 0.60 s; both GPU locks are free and all five GPUs read 0 %.
+
+================================================================================
+APPENDIX C — SNAPSHOT MUTEX-CONTENTION FIX
+================================================================================
+Executor: DevopsFreshBoot. Private dir dualwin-g3g4-20261101/. Builds under both VFS build locks
+(/home/kunweiz/work/vfs-build.lock, vfs-build-2.lock); GPU legs under both GPU locks, one HIP
+process at a time. No source byte was changed by me: the tree's relay.hip is Main's ab963b67… and
+both private build dirs compile it read-only. Selected installs untouched.
+
+A) BUILD
+--------
+  Source: /home/kunweiz/work/merge-dualwin-20261031/ggml/src/ggml-cuda/relay.hip
+          sha256 ab963b67894b504afd6ad0c88314474d1e3204033486ad3e0f0f6740cacde185
+  g3g4: cmake --build upstream --target ggml-hip -j 32, rc=0, 15:51:28-15:51:54 (VFS locks held).
+        bin/libggml-hip.so.0.18.1 -> libggml-hip-snapshotfix.so
+        sha256 f02a85d2b3902b408a7a504d4f335dbca1b2dbdc8b089d580f25b79ddcfe4793, 68,604,264 B
+        (the appendix-A/B lib was 3779bbc15c04559e…, 68,604,216 B; +48 B is the new code).
+  g2:   build_dualwin.py rerun with the same relay.hip copied into src-head/ (old copy kept as
+        src-head/relay.hip.prefix-1badd280, old receipt as build-receipt-20261101.json).
+        relay-compile-head rc=0, hip-link-head rc=0; libggml-hip-head.so
+        sha256 de372ae5772d17366ee8deefecac11b7a04e20fe799280788ae50186de67e723, 68,639,168 B
+        (was a901be26e8aa55a1…, 68,639,120 B).
+  Both v2 runs loaded the g3g4 f02a85d2… file; sha256 verified in each run's install/lib.
+
+B) THE PAIR
+-----------
+  fresh-legs-v2.sh, both GPU locks 16:09:27-16:13:42, one process at a time:
+    runs/fresh_off_2x32_v2  gate unset  rc=0  wall  85.8 s
+    runs/fresh_on_2x32_v2   gate =1     rc=0  wall 169.0 s
+  Same argv/environment as appendix B; the only difference is the DSO (DW_HIP_FROM copies the new
+  lib into each run's install/lib, the appendix-A install tree is not modified).
+
+C) TIMING
+---------
+    metric                        OFF v2                  ON v2
+    wall                              85.8 s                 169.0 s
+    window 0 decode_submit      1,887,002,818 ns        2,295,646,900 ns
+    window 1 decode_submit        590,081,249 ns          887,749,441 ns
+    window 0 native_wait          794,514,664 ns       88,974,326,596 ns
+    window 1 native_wait          915,464,345 ns       88,893,755,576 ns
+    request 0 ttft                  2,197.4 ms              4,061.7 ms
+    request 1 ttft                  2,408.2 ms              4,377.9 ms
+    request 0 total                 3,193.8 ms             92,006.2 ms
+    request 1 total                 3,233.6 ms             92,006.0 ms
+    request 0 median interval          21.3 ms              2,857.7 ms  (min 20.9 / max 166.0)
+    request 1 median interval          21.2 ms              2,712.1 ms  (min 19.8 / max 122.3)
+  Per output-event sync: 88,974,326,596 / 32 = 2,780.4 ms; 88,893,755,576 / 32 = 2,777.9 ms.
+  The ON wait is 97-112x the OFF wait (88.97 s vs 0.79/0.92 s) and the token interval 128-134x.
+
+D) LOGITS AND RECEIPTS — THE FIX IS VALUE-INERT
+-----------------------------------------------
+  fresh_off_2x32_v2 vs fresh_on_2x32_v2:  0/64 rows, 0 of 63,569,920 B
+  fresh_off_2x32_v2 vs fresh_off_2x32:    0/64 rows, 0 B   (old build 3779bbc1…)
+  fresh_on_2x32_v2  vs fresh_on_2x32:     0/64 rows, 0 B   (old build 3779bbc1…)
+  ON receipt (stderr, verbatim):
+    TP5_DW_COMPOSE_EVENT enabled=1 flag=GGML_TP5_DW_COMPOSE_EVENT windows=2
+    TP5_DW_COMPOSE_EVENT window=0 epochs=43 output_event_syncs=32 host_sync_replaced=32
+        fallback_no_output_barrier=0 no_sync_logits_calls=32 no_output_epochs=11
+    TP5_DW_COMPOSE_EVENT window=1 epochs=44 output_event_syncs=32 host_sync_replaced=32
+        fallback_no_output_barrier=0 no_sync_logits_calls=32 no_output_epochs=12
+  OFF prints 0 TP5_DW_COMPOSE_EVENT lines. Every gate condition still holds.
+
+E) DID THE FIX REDUCE THE WAIT? NO
+----------------------------------
+    metric                    appendix B (3779bbc1)   appendix C (f02a85d2)   change
+    ON wall                        176.1 s                 169.0 s             -4.0 %
+    ON win0 native_wait         89,400.6 ms             88,974.3 ms            -0.5 %
+    ON win1 native_wait         89,328.7 ms             88,893.8 ms            -0.5 %
+    ON per-sync (win0)           2,793.8 ms              2,780.4 ms            -0.5 %
+    ON median interval           2,852.2 / 2,845.9 ms    2,857.7 / 2,712.1 ms  +0.2 / -4.7 %
+    OFF wall                        89.1 s                  85.8 s             -3.7 %
+  The targeted quantity is the native wait; it moved by 0.5 %, inside the run-to-run spread of the
+  OFF wait itself (0.79 vs 0.92 s between the two windows of one leg). The 2.8 s per sync is
+  unchanged. The wall change is first-touch/load, not barrier cost.
+  Relay dispatch is unchanged: steady TP5_DIAG_RELAY total_us 243-274 in both v2 legs (257-279 in
+  the appendix-B ON leg); the v2 ON first dispatch is 1.76 s, the same first-touch effect that gave
+  the appendix-B OFF leg a 7.29 s first dispatch.
+
+F) LIMITS
+---------
+  * One pair per build. The ON wait is stable across the two builds (89.4 vs 89.0 s), so "no change"
+    is not a single-sample artifact, but no third repeat was made.
+  * No instrumentation inside the new bounded-scan branch; the report can say that the build does
+    not move the wait, not whether the branch is taken. The 0.5 % change is within the OFF spread.
+  * The wait's mechanism is not decomposed; 2.8 s per sync is measured, not traced.
+  * No source or build change beyond the two private build dirs; selected installs untouched.
+
+VERDICT NO EFFECT ON THE ON WAIT — the snapshot-mutex fix builds cleanly (relay.hip ab963b67…, g3g4 lib f02a85d2…, g2 lib de372ae5…) and is value-inert (OFF vs ON and both against the old build: 0/64 rows, 0 bytes; receipts 32 syncs / 32 replacements / 0 fallbacks per window, 43/44 epochs), but the quantity it targets does not move: ON native_wait 88,974.3/88,893.8 ms (2,780.4/2,777.9 ms per sync) against 89,400.6/89,328.7 ms (2,793.8/2,791.5) for the old build, -0.5 %; per-token 2,857.7/2,712.1 ms vs 2,852.2/2,845.9; wall 169.0 vs 176.1 s (-4.0 %, load/first-touch); so the snapshot-mutex contention is not the dominant path of the 2.8 s/sync wait (or the new bounded branch does not change the critical path), and the barrier still costs ~2.8 s/token against 21 ms with the gate off; both GPU locks are free and all five GPUs read 0 %.
+
+================================================================================
+APPENDIX D — EVENT-WAIT ORDERING FIX
+================================================================================
+Executor: DevopsFreshBoot. Private dir dualwin-g3g4-20261101/. Build under both VFS build locks;
+both legs under both GPU locks, one HIP process at a time. No selected install or source tree was
+modified; the lane's install/lib was left at the original unpatched lib.
+
+A) BUILD
+--------
+  runtime.cpp d4583aa394066a417cc18640257d7740f2be468f5eb90a3708c94d75fddac166
+  The fix moves llama_tp5_output_event_wait(ctx) into the else branch of if (!dw_output_barrier),
+  i.e. before if (service), at the site of the llama_get_logits_ith / llama_synchronize call it
+  replaces; if (service) still runs the unchanged relay dual-completion drain, and
+  llama_get_logits_ith_no_sync still reads the logits after it.
+  Rebuild: cmake --build dualwin-g3g4-20261101/compose -j 32, rc=0, 17:17:13-17:17:17 (VFS locks).
+    runtime.cpp.o recompiled, libtq_tp5_runtime.a relinked, tq-tp5-compose relinked
+    new compose  d0ec808eada893587e2477d282db7dc3028bd637116150e3f94f06fe27c444b7, 252,104 B
+    old compose  ad8fc413e074b35634afcf377633ce7046bd9f014522eeebe47b6e612e75ebf8
+  Link/runtime library: install/lib/libggml-hip.so.0.18.1
+    3779bbc15c04559eedbf49f37880ce35c50c9d4e833cfa908f99f95d65f4a213 (original unpatched,
+    68,604,216 B), NOT libggml-hip-snapshotfix.so f02a85d2…. Both run installs carry 3779bbc1…;
+    the run bin carries d0ec808e… (sha256 verified after the legs).
+    The cited 3a2e62ab… file was not present anywhere on disk (the installed original unpatched lib
+    is 3779bbc1…); 3779bbc1… is the pre-relay-fix build the compose had always linked, so the
+    ordering fix is measured on the unpatched library as intended.
+
+B) THE PAIR
+-----------
+  fresh-legs-v3.sh, both GPU locks 17:17:56-17:20:39:
+    runs/fresh_off_2x32_v3  gate unset  rc=0  wall 80.7 s
+    runs/fresh_on_2x32_v3   gate =1     rc=0  wall 81.8 s
+  Same argv/environment as appendix B/C; the only difference is the compose binary (d0ec808e…).
+
+C) TIMING
+---------
+    metric                        OFF v3                ON v3
+    wall                              80.7 s                81.8 s
+    window 0 decode_submit      1,846,673,384 ns      2,376,434,996 ns
+    window 1 decode_submit        614,944,612 ns      1,266,333,998 ns
+    window 0 native_wait          800,048,271 ns        862,585,496 ns
+    window 1 native_wait          898,972,917 ns        877,377,702 ns
+    request 0 ttft                  2,217.2 ms            2,949.1 ms
+    request 1 ttft                  2,369.8 ms            3,649.2 ms
+    request 0 total                 3,190.0 ms            4,431.9 ms
+    request 1 total                 3,209.8 ms            4,453.9 ms
+    request 0 median interval          21.2 ms               21.4 ms  (min 20.8 / max 217.3)
+    request 1 median interval          21.2 ms               21.4 ms  (min 20.0 / max 148.5)
+  ON native_wait is 862.6/877.4 ms, matching OFF's 800.0/899.0 ms; the per-token median is
+  21.4/21.4 ms, matching OFF's 21.2/21.2 ms. The ON wall is 81.8 s against OFF's 80.7 s (1.014x).
+
+D) AGAINST APPENDIX B/C (THE SAME GATE, BEFORE THE ORDERING FIX)
+-----------------------------------------------------------------
+    metric                     appendix B/C ON          appendix D ON v3       change
+    native_wait win0/1        89,400.6 / 89,328.7 ms    862.6 / 877.4 ms       -99.0 % / -99.0 %
+    per-sync (win0)           2,793.8 ms               26.96 ms               -99.0 %
+    per-token median          2,852.2 / 2,845.9 ms     21.4 / 21.4 ms         -99.2 % / -99.2 %
+    wall                      176.1 / 169.0 s          81.8 s                 -53.5 % / -51.6 %
+    decode_submit win0/1      1,333.9 / 604.4 ms       2,376.4 / 1,266.3 ms   first-touch, not barrier
+  The 2,320,319 hipEventQuery calls of the 2x1 ON trace (line 237) were the two window threads
+  spinning in ggml_backend_relay_snapshot while the streams ran; moving the event wait back before
+  if (service) lets them sleep on the HSA completion signal first, and the spin disappears from the
+  critical path. The relay drain still runs afterwards, so the 2.8 s/sync cost is gone.
+
+E) LOGITS AND RECEIPTS
+----------------------
+  fresh_off_2x32_v3 vs fresh_on_2x32_v3:  0/64 rows, 0 of 63,569,920 B
+  fresh_off_2x32_v3 vs fresh_off_2x32:    0/64 rows, 0 B (old compose ad8fc413…, same lib)
+  ON receipt (stderr, verbatim):
+    TP5_DW_COMPOSE_EVENT enabled=1 flag=GGML_TP5_DW_COMPOSE_EVENT windows=2
+    TP5_DW_COMPOSE_EVENT window=0 epochs=43 output_event_syncs=32 host_sync_replaced=32
+        fallback_no_output_barrier=0 no_sync_logits_calls=32 no_output_epochs=11
+    TP5_DW_COMPOSE_EVENT window=1 epochs=44 output_event_syncs=32 host_sync_replaced=32
+        fallback_no_output_barrier=0 no_sync_logits_calls=32 no_output_epochs=12
+  OFF prints 0 TP5_DW_COMPOSE_EVENT lines. The gate conditions are unchanged; only the wait order
+  moved.
+
+F) LIMITS
+---------
+  * One pair per build; the wait is stable across the two windows (862.6 vs 877.4 ms) and matches
+    the OFF spread (800.0 vs 899.0 ms), so the drop is not a single-sample artifact.
+  * The compose link used the installed original unpatched lib 3779bbc1… because the cited
+    3a2e62ab… file is not on disk; both run installs were verified to carry 3779bbc1…, not the
+    snapshotfix f02a85d2….
+  * decode_submit is first-touch dominated in this pair and is not used as a barrier metric.
+  * No source change beyond Main's runtime.cpp; the compose was rebuilt from it.
+
+VERDICT PASS — moving llama_tp5_output_event_wait(ctx) before if (service) removes the event-wait pathology: ON native_wait falls from 89,400.6/89,328.7 ms to 862.6/877.4 ms (-99.0 %, 103.6x/101.8x) and the per-token median from 2,852.2/2,845.9 ms to 21.4/21.4 ms, matching OFF's 800.0/899.0 ms and 21.2/21.2 ms; ON wall is 81.8 s against OFF's 80.7 s (1.014x) instead of 176.1/169.0 s; the logits are bitwise against OFF v3 and against fresh_off_2x32 (0/64 rows, 0 bytes), and the receipts still show output_event_syncs=32, host_sync_replaced=32, fallback_no_output_barrier=0, no_sync_logits_calls=32, 43/44 epochs; the compose is d0ec808e… (runtime.cpp d4583aa3…) linked against the original unpatched lib 3779bbc1…; both GPU locks are free and all five GPUs read 0 %.
