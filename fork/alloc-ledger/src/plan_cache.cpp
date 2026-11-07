@@ -1,6 +1,21 @@
 #include "tq/alloc/plan_cache.h"
 
+#include <cstdio>
+
 namespace tq::alloc {
+
+std::array<char, 192> PlanKey::describe() const noexcept {
+    std::array<char, 192> text{};
+    std::snprintf(
+        text.data(), text.size(),
+        "model=%llu window=%u n_tokens=%u n_outputs=%u rs_class=%d "
+        "n_kv_bucket=%u alloc_gen=%llu",
+        static_cast<unsigned long long>(model), static_cast<unsigned>(window),
+        static_cast<unsigned>(n_tokens), static_cast<unsigned>(n_outputs),
+        static_cast<int>(rs_class), static_cast<unsigned>(n_kv_bucket),
+        static_cast<unsigned long long>(alloc_gen));
+    return text;
+}
 
 const PlanEntry * PlanCache::find(const PlanKey & key) noexcept {
     for (std::size_t i = 0; i < capacity; ++i) {
@@ -16,6 +31,9 @@ const PlanEntry * PlanCache::find(const PlanKey & key) noexcept {
 }
 
 Result PlanCache::insert(const PlanEntry & entry) noexcept {
+    if (!entry.key.valid()) {
+        return failure(Code::invalid_argument);
+    }
     for (std::size_t i = 0; i < capacity; ++i) {
         Node & node = nodes_[i];
         if (node.used && node.entry.key == entry.key) {

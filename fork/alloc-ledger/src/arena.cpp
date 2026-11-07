@@ -3,12 +3,17 @@
 namespace tq::alloc {
 namespace {
 
-constexpr bool valid_class(Class cls) noexcept {
-    return cls == Class::frame || cls == Class::staging || cls == Class::cold;
+constexpr bool valid_reuse(ReuseClass reuse) noexcept {
+    return reuse == ReuseClass::frame || reuse == ReuseClass::staging ||
+           reuse == ReuseClass::cold;
 }
 
-constexpr bool deferred(Class cls) noexcept {
-    return cls == Class::frame || cls == Class::staging;
+constexpr bool valid_lifetime(Lifetime lifetime) noexcept {
+    return static_cast<std::size_t>(lifetime) < lifetime_count;
+}
+
+constexpr bool deferred(ReuseClass reuse) noexcept {
+    return reuse == ReuseClass::frame || reuse == ReuseClass::staging;
 }
 
 } // namespace
@@ -25,8 +30,9 @@ Arena::Arena(Slot * storage, std::size_t capacity, std::uint32_t id,
     }
 }
 
-Result Arena::acquire(Class cls, Extent extent, Lease & out) noexcept {
-    if (!valid_class(cls)) {
+Result Arena::acquire(Lifetime lifetime, ReuseClass reuse, Extent extent,
+                      Lease & out) noexcept {
+    if (!valid_lifetime(lifetime) || !valid_reuse(reuse)) {
         return failure(Code::invalid_argument);
     }
     if (extent.empty()) {
@@ -59,7 +65,7 @@ Result Arena::acquire(Class cls, Extent extent, Lease & out) noexcept {
     std::size_t chosen = capacity_;
     bool out_of_order = false;
     for (std::size_t i = 0; i < capacity_; ++i) {
-        Slot & slot = storage_[i];
+        const Slot & slot = storage_[i];
         if (slot.state != State::free) {
             continue;
         }
@@ -73,23 +79,104 @@ Result Arena::acquire(Class cls, Extent extent, Lease & out) noexcept {
     if (chosen == capacity_) {
         return failure(out_of_order ? Code::out_of_order : Code::no_slot);
     }
+    return issue(chosen, lifetime, reuse, extent, out);
+}
 
-    Slot & slot = storage_[chosen];
+Result Arena::acquire(Lifetime lifetime, ReuseClass reuse, std::size_t bytes,
+                      Lease & out) noexcept {
+    if (!valid_lifetime(lifetime) || !valid_reuse(reuse)) {
+        return failure(Code::invalid_argument);
+    }
+    if (bytes == 0) {
+        return failure(Code::invalid_argument);
+    }
+    const std::uint64_t need = static_cast<std::uint64_t>(bytes);
+    if (need > footprint_limit_) {
+        return failure(Code::out_of_range);
+    }
+    if (live_bytes_ > footprint_limit_ ||
+        need > footprint_limit_ - live_bytes_) {
+        return failure(Code::over_capacity);
+    }
+
+    std::size_t chosen = capacity_;
+    std::uint64_t chosen_begin = 0;
+    bool saw_free = false;
+    bool saw_overlap = false;
+
+    for (std::size_t i = 0; i < capacity_; ++i) {
+        const Slot & slot = storage_[i];
+        if (slot.state != State::free) {
+            continue;
+        }
+        saw_free = true;
+        const std::uint64_t begin = slot.last_end;
+        if (begin > footprint_limit_ || need > footprint_limit_ - begin) {
+            continue;
+        }
+        const Extent candidate{begin, begin + need};
+        bool blocked = false;
+        for (std::size_t j = 0; j < capacity_; ++j) {
+            const Slot & other = storage_[j];
+            if ((other.state == State::leased ||
+                 other.state == State::quarantined) &&
+                other.extent.overlaps(candidate)) {
+                blocked = true;
+                break;
+            }
+        }
+        if (blocked) {
+            saw_overlap = true;
+            continue;
+        }
+        if (chosen == capacity_ || begin < chosen_begin) {
+            chosen = i;
+            chosen_begin = begin;
+        }
+    }
+    if (chosen == capacity_) {
+        if (!saw_free) {
+            return failure(Code::no_slot);
+        }
+        return failure(saw_overlap ? Code::overlap : Code::out_of_range);
+    }
+    return issue(chosen, lifetime, reuse,
+                 Extent{chosen_begin, chosen_begin + need}, out);
+}
+
+Result Arena::issue(std::size_t index, Lifetime lifetime, ReuseClass reuse,
+                    Extent extent, Lease & out) noexcept {
+    Slot & slot = storage_[index];
     slot.extent = extent;
-    slot.cls = cls;
+    slot.lifetime = lifetime;
+    slot.reuse = reuse;
     slot.state = State::leased;
     ++slot.gen;
-    live_bytes_ += extent.size();
+
+    const std::uint64_t size = extent.size();
+    live_bytes_ += size;
     ++live_count_;
+    ++leases_;
+    if (live_bytes_ > high_water_) {
+        high_water_ = live_bytes_;
+    }
+    LifetimeStats & stats = lifetime_[static_cast<std::size_t>(lifetime)];
+    stats.live_bytes += size;
+    ++stats.live_count;
+    ++stats.leases;
+    if (stats.live_bytes > stats.high_water) {
+        stats.high_water = stats.live_bytes;
+    }
 
     out = Lease{};
     out.arena = id_;
     out.window = window_;
     out.arena_gen = generation_;
-    out.slot = static_cast<std::uint32_t>(chosen);
+    out.slot = static_cast<std::uint32_t>(index);
     out.slot_gen = slot.gen;
     out.extent = extent;
-    out.cls = cls;
+    out.lifetime = lifetime;
+    out.reuse = reuse;
     out.live = true;
     return success();
 }
@@ -120,7 +207,8 @@ Result Arena::check(const Lease & lease) const noexcept {
     if (slot.state != State::leased) {
         return failure(Code::invalid_lease);
     }
-    if (slot.extent != lease.extent || slot.cls != lease.cls) {
+    if (slot.extent != lease.extent || slot.lifetime != lease.lifetime ||
+        slot.reuse != lease.reuse) {
         return failure(Code::invalid_lease);
     }
     return success();
@@ -132,11 +220,18 @@ Result Arena::release(const Lease & lease) noexcept {
         return checked;
     }
     Slot & slot = storage_[lease.slot];
-    slot.state = deferred(slot.cls) ? State::draining : State::free;
+    slot.state = deferred(slot.reuse) ? State::draining : State::free;
     slot.last_end = slot.extent.end;
     ++slot.gen;
-    live_bytes_ -= slot.extent.size();
+
+    const std::uint64_t size = slot.extent.size();
+    live_bytes_ -= size;
     --live_count_;
+    ++releases_;
+    LifetimeStats & stats = lifetime_[static_cast<std::size_t>(slot.lifetime)];
+    stats.live_bytes -= size;
+    --stats.live_count;
+    ++stats.releases;
     return success();
 }
 
@@ -148,6 +243,7 @@ Result Arena::drain(std::size_t slot) noexcept {
         return failure(Code::not_draining);
     }
     storage_[slot].state = State::free;
+    ++drains_;
     return success();
 }
 
@@ -160,9 +256,16 @@ Result Arena::quarantine(const Lease & lease) noexcept {
     slot.state = State::quarantined;
     slot.last_end = slot.extent.end;
     ++slot.gen;
-    live_bytes_ -= slot.extent.size();
+
+    const std::uint64_t size = slot.extent.size();
+    live_bytes_ -= size;
     --live_count_;
+    ++quarantines_;
     ++cold_reserve_;
+    LifetimeStats & stats = lifetime_[static_cast<std::size_t>(slot.lifetime)];
+    stats.live_bytes -= size;
+    --stats.live_count;
+    ++stats.quarantines;
     return success();
 }
 
@@ -179,6 +282,26 @@ Result Arena::advance_window(std::uint32_t next) noexcept {
         storage_[i].last_end = 0;
     }
     return success();
+}
+
+ArenaStats Arena::stats() const noexcept {
+    ArenaStats result;
+    result.live_bytes = live_bytes_;
+    result.live_count = live_count_;
+    result.high_water = high_water_;
+    result.leases = leases_;
+    result.releases = releases_;
+    result.drains = drains_;
+    result.quarantines = quarantines_;
+    result.cold_reserve = cold_reserve_;
+    result.capacity = capacity_;
+    result.footprint_limit = footprint_limit_;
+    return result;
+}
+
+LifetimeStats Arena::stats(Lifetime lifetime) const noexcept {
+    const std::size_t index = static_cast<std::size_t>(lifetime);
+    return index < lifetime_count ? lifetime_[index] : LifetimeStats{};
 }
 
 } // namespace tq::alloc

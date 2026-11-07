@@ -2,25 +2,54 @@
 
 namespace tq::alloc {
 
-Result Domain::lease(Class cls, Extent extent, Lease & out) noexcept {
+Result Domain::lease(Lifetime lifetime, ReuseClass reuse, Extent extent,
+                     Lease & out) noexcept {
     if (state_ == DomainState::draining) {
         const Result drained = drain();
         if (!drained) {
             return drained;
         }
     }
-    const Result result = arena_->acquire(cls, extent, out);
+    const Result result = arena_->acquire(lifetime, reuse, extent, out);
     if (result) {
         state_ = DomainState::active;
     }
     return result;
 }
 
-Result Domain::try_lease(Class cls, Extent extent, Lease & out) noexcept {
+Result Domain::lease(Lifetime lifetime, ReuseClass reuse, std::size_t bytes,
+                     Lease & out) noexcept {
+    if (state_ == DomainState::draining) {
+        const Result drained = drain();
+        if (!drained) {
+            return drained;
+        }
+    }
+    const Result result = arena_->acquire(lifetime, reuse, bytes, out);
+    if (result) {
+        state_ = DomainState::active;
+    }
+    return result;
+}
+
+Result Domain::try_lease(Lifetime lifetime, ReuseClass reuse, Extent extent,
+                         Lease & out) noexcept {
     if (state_ == DomainState::draining) {
         return failure(Code::busy);
     }
-    const Result result = arena_->acquire(cls, extent, out);
+    const Result result = arena_->acquire(lifetime, reuse, extent, out);
+    if (result) {
+        state_ = DomainState::active;
+    }
+    return result;
+}
+
+Result Domain::try_lease(Lifetime lifetime, ReuseClass reuse,
+                         std::size_t bytes, Lease & out) noexcept {
+    if (state_ == DomainState::draining) {
+        return failure(Code::busy);
+    }
+    const Result result = arena_->acquire(lifetime, reuse, bytes, out);
     if (result) {
         state_ = DomainState::active;
     }
@@ -28,7 +57,7 @@ Result Domain::try_lease(Class cls, Extent extent, Lease & out) noexcept {
 }
 
 Result Domain::cancel(const Lease & lease) noexcept {
-    if (lease.cls == Class::cold) {
+    if (lease.reuse == ReuseClass::cold) {
         return failure(Code::invalid_argument);
     }
     if (pending_count_ == max_pending) {
@@ -47,7 +76,8 @@ Result Domain::cancel(const Lease & lease) noexcept {
 }
 
 Result Domain::release(const Lease & lease) noexcept {
-    const bool deferred = lease.cls == Class::frame || lease.cls == Class::staging;
+    const bool deferred = lease.reuse == ReuseClass::frame ||
+                          lease.reuse == ReuseClass::staging;
     if (deferred && pending_count_ == max_pending) {
         return failure(Code::full);
     }
@@ -86,6 +116,19 @@ Result Domain::quarantine(const Lease & lease) noexcept {
         return result;
     }
     state_ = DomainState::quarantined;
+    return success();
+}
+
+Result Domain::advance_window(std::uint32_t next) noexcept {
+    const Result drained = drain();
+    if (!drained) {
+        return drained;
+    }
+    const Result advanced = arena_->advance_window(next);
+    if (!advanced) {
+        return advanced;
+    }
+    settle();
     return success();
 }
 

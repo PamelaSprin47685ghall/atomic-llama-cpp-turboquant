@@ -5,13 +5,27 @@
 
 namespace tq::alloc {
 
-// Storage class of a leased extent. Frame and staging extents defer reuse
+// Reuse semantics of a leased extent. Frame and staging extents defer reuse
 // until drain. Cold extents return to the free list on release.
-enum class Class : std::uint8_t {
+enum class ReuseClass : std::uint8_t {
     frame = 0,
     staging = 1,
     cold = 2,
 };
+
+// Lifecycle scope of a lease. Accounting and invariants are kept per
+// lifetime.
+enum class Lifetime : std::uint8_t {
+    process = 0,
+    model = 1,
+    context = 2,
+    request = 3,
+    window = 4,
+    step = 5,
+    plan = 6,
+};
+
+inline constexpr std::size_t lifetime_count = 7;
 
 // State of one slot. A slot is a reusable position in the footprint, not a
 // physical address.
@@ -77,7 +91,8 @@ struct Slot {
     Extent extent;
     std::uint64_t last_end = 0;
     std::uint64_t gen = 0;
-    Class cls = Class::frame;
+    Lifetime lifetime = Lifetime::process;
+    ReuseClass reuse = ReuseClass::frame;
     State state = State::free;
 };
 
@@ -90,8 +105,31 @@ struct Lease {
     std::uint32_t slot = 0;
     std::uint64_t slot_gen = 0;
     Extent extent;
-    Class cls = Class::frame;
+    Lifetime lifetime = Lifetime::process;
+    ReuseClass reuse = ReuseClass::frame;
     bool live = false;
+};
+
+struct LifetimeStats {
+    std::uint64_t live_bytes = 0;
+    std::size_t live_count = 0;
+    std::uint64_t high_water = 0;
+    std::uint64_t leases = 0;
+    std::uint64_t releases = 0;
+    std::uint64_t quarantines = 0;
+};
+
+struct ArenaStats {
+    std::uint64_t live_bytes = 0;
+    std::size_t live_count = 0;
+    std::uint64_t high_water = 0;
+    std::uint64_t leases = 0;
+    std::uint64_t releases = 0;
+    std::uint64_t drains = 0;
+    std::uint64_t quarantines = 0;
+    std::uint32_t cold_reserve = 0;
+    std::size_t capacity = 0;
+    std::uint64_t footprint_limit = 0;
 };
 
 // Slot and lease bookkeeping. The caller supplies the slot storage. Arena
@@ -106,10 +144,18 @@ public:
     Arena(const Arena &) = delete;
     Arena & operator=(const Arena &) = delete;
 
-    // Issue a lease for a free slot. Reject an invalid, out-of-range,
+    // Issue a lease for an explicit extent. Reject an invalid, out-of-range,
     // over-capacity, overlapping, or out-of-order extent. out is unchanged
     // on failure.
-    Result acquire(Class cls, Extent extent, Lease & out) noexcept;
+    Result acquire(Lifetime lifetime, ReuseClass reuse, Extent extent,
+                   Lease & out) noexcept;
+
+    // Issue a lease of bytes at the smallest free last_end that fits. The
+    // candidate extent is [last_end, last_end + bytes). A candidate that
+    // would overlap a live or quarantined extent is skipped. The chosen slot
+    // must satisfy the same invariants as the explicit form.
+    Result acquire(Lifetime lifetime, ReuseClass reuse, std::size_t bytes,
+                   Lease & out) noexcept;
 
     // Return a live lease. Frame and staging slots enter draining. Cold slots
     // become free. A repeated or stale release changes nothing.
@@ -134,6 +180,10 @@ public:
     std::size_t live_count() const noexcept { return live_count_; }
     std::size_t capacity() const noexcept { return capacity_; }
     std::uint32_t cold_reserve() const noexcept { return cold_reserve_; }
+    std::uint64_t high_water() const noexcept { return high_water_; }
+
+    ArenaStats stats() const noexcept;
+    LifetimeStats stats(Lifetime lifetime) const noexcept;
 
     const Slot * slots() const noexcept { return storage_; }
     const Slot * slot_at(std::size_t index) const noexcept {
@@ -142,6 +192,8 @@ public:
 
 private:
     Result check(const Lease & lease) const noexcept;
+    Result issue(std::size_t index, Lifetime lifetime, ReuseClass reuse,
+                 Extent extent, Lease & out) noexcept;
 
     Slot * storage_;
     std::size_t capacity_;
@@ -152,6 +204,12 @@ private:
     std::uint64_t live_bytes_ = 0;
     std::size_t live_count_ = 0;
     std::uint32_t cold_reserve_ = 0;
+    std::uint64_t high_water_ = 0;
+    std::uint64_t leases_ = 0;
+    std::uint64_t releases_ = 0;
+    std::uint64_t drains_ = 0;
+    std::uint64_t quarantines_ = 0;
+    LifetimeStats lifetime_[lifetime_count];
 };
 
 } // namespace tq::alloc

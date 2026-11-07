@@ -26,7 +26,7 @@ void test_cancel_drain_reuse() {
     CHECK(domain.state() == DomainState::idle);
 
     Lease a;
-    CHECK(domain.lease(Class::frame, {0, 10}, a).ok());
+    CHECK(domain.lease(Lifetime::request, ReuseClass::frame, {0, 10}, a).ok());
     CHECK(domain.state() == DomainState::active);
 
     CHECK(domain.cancel(a).ok());
@@ -36,7 +36,9 @@ void test_cancel_drain_reuse() {
 
     // A draining domain refuses a nonblocking lease.
     Lease blocked;
-    CHECK(domain.try_lease(Class::frame, {10, 20}, blocked).code == Code::busy);
+    CHECK(domain.try_lease(Lifetime::request, ReuseClass::frame, {10, 20},
+                           blocked)
+              .code == Code::busy);
     CHECK(!blocked.live);
 
     CHECK(domain.drain().ok());
@@ -44,7 +46,9 @@ void test_cancel_drain_reuse() {
     CHECK(domain.state() == DomainState::idle);
 
     Lease reused;
-    CHECK(domain.try_lease(Class::frame, {10, 20}, reused).ok());
+    CHECK(domain.try_lease(Lifetime::request, ReuseClass::frame, {10, 20},
+                           reused)
+              .ok());
     CHECK(reused.slot == a.slot);
     CHECK(domain.state() == DomainState::active);
 
@@ -60,11 +64,12 @@ void test_quarantine_transition() {
     Domain domain(arena);
 
     Lease a;
-    CHECK(domain.lease(Class::staging, {0, 10}, a).ok());
+    CHECK(domain.lease(Lifetime::plan, ReuseClass::staging, {0, 10}, a).ok());
     CHECK(domain.quarantine(a).ok());
     CHECK(domain.state() == DomainState::quarantined);
     CHECK(domain.cold_reserve() == 1);
     CHECK(arena.slot_at(a.slot)->state == State::quarantined);
+    CHECK(domain.stats(Lifetime::plan).quarantines == 1);
 
     // A repeated quarantine changes nothing.
     CHECK(domain.quarantine(a).code == Code::duplicate_release);
@@ -72,7 +77,7 @@ void test_quarantine_transition() {
 
     // The domain can still lease from the remaining slots.
     Lease b;
-    CHECK(domain.lease(Class::cold, {20, 30}, b).ok());
+    CHECK(domain.lease(Lifetime::request, ReuseClass::cold, {20, 30}, b).ok());
     CHECK(domain.state() == DomainState::active);
     CHECK(domain.release(b).ok());
     CHECK(domain.state() == DomainState::idle);
@@ -84,16 +89,20 @@ void test_release_defers_frame_reuse() {
     Domain domain(arena);
 
     Lease a;
-    CHECK(domain.lease(Class::frame, {0, 10}, a).ok());
+    CHECK(domain.lease(Lifetime::request, ReuseClass::frame, {0, 10}, a).ok());
     CHECK(domain.release(a).ok());
     CHECK(domain.state() == DomainState::draining);
 
     Lease blocked;
-    CHECK(domain.try_lease(Class::frame, {10, 20}, blocked).code == Code::busy);
+    CHECK(domain.try_lease(Lifetime::request, ReuseClass::frame, {10, 20},
+                           blocked)
+              .code == Code::busy);
 
     CHECK(domain.drain().ok());
     CHECK(domain.state() == DomainState::idle);
-    CHECK(domain.try_lease(Class::frame, {10, 20}, blocked).ok());
+    CHECK(domain.try_lease(Lifetime::request, ReuseClass::frame, {10, 20},
+                           blocked)
+              .ok());
     CHECK(blocked.slot == a.slot);
     CHECK(domain.release(blocked).ok());
     CHECK(domain.drain().ok());
@@ -105,7 +114,7 @@ void test_cold_release_is_immediate() {
     Domain domain(arena);
 
     Lease a;
-    CHECK(domain.lease(Class::cold, {0, 10}, a).ok());
+    CHECK(domain.lease(Lifetime::request, ReuseClass::cold, {0, 10}, a).ok());
     CHECK(domain.release(a).ok());
     CHECK(domain.state() == DomainState::idle);
     CHECK(domain.pending_drains() == 0);
@@ -113,18 +122,67 @@ void test_cold_release_is_immediate() {
 
     // cancel applies to frame and staging leases only.
     Lease b;
-    CHECK(domain.lease(Class::cold, {10, 20}, b).ok());
+    CHECK(domain.lease(Lifetime::request, ReuseClass::cold, {10, 20}, b).ok());
     CHECK(domain.cancel(b).code == Code::invalid_argument);
     CHECK(domain.release(b).ok());
 }
 
-void test_stale_and_cross_window_rejected() {
+void test_lifetime_accounting_through_domain() {
     Slot storage[4];
     Arena arena(storage, 4, 24, 0, 1000);
     Domain domain(arena);
 
     Lease a;
-    CHECK(domain.lease(Class::cold, {0, 10}, a).ok());
+    CHECK(domain.lease(Lifetime::step, ReuseClass::cold, std::size_t{8}, a)
+              .ok());
+    CHECK(domain.stats(Lifetime::step).live_count == 1);
+    CHECK(domain.stats(Lifetime::step).live_bytes == 8);
+    CHECK(domain.stats(Lifetime::step).leases == 1);
+    CHECK(domain.high_water() == 8);
+    CHECK(domain.release(a).ok());
+    CHECK(domain.stats(Lifetime::step).releases == 1);
+    CHECK(domain.stats(Lifetime::step).live_bytes == 0);
+    CHECK(domain.high_water() == 8);
+}
+
+void test_advance_window() {
+    Slot storage[4];
+    Arena arena(storage, 4, 25, 0, 1000);
+    Domain domain(arena);
+
+    Lease a;
+    CHECK(domain.lease(Lifetime::request, ReuseClass::frame, {0, 10}, a).ok());
+    CHECK(domain.advance_window(1).code == Code::busy);
+    CHECK(arena.window() == 0);
+    CHECK(domain.state() == DomainState::active);
+
+    CHECK(domain.release(a).ok());
+    CHECK(domain.state() == DomainState::draining);
+
+    // advance_window drains the queued slot first.
+    CHECK(domain.advance_window(1).ok());
+    CHECK(domain.pending_drains() == 0);
+    CHECK(domain.state() == DomainState::idle);
+    CHECK(arena.window() == 1);
+    CHECK(arena.generation() == 2);
+    CHECK(arena.slot_at(a.slot)->state == State::free);
+
+    // The old lease belongs to the previous window.
+    CHECK(domain.release(a).code == Code::wrong_window);
+
+    Lease b;
+    CHECK(domain.lease(Lifetime::window, ReuseClass::cold, {0, 10}, b).ok());
+    CHECK(b.window == 1);
+    CHECK(domain.release(b).ok());
+}
+
+void test_stale_and_cross_window_rejected() {
+    Slot storage[4];
+    Arena arena(storage, 4, 26, 0, 1000);
+    Domain domain(arena);
+
+    Lease a;
+    CHECK(domain.lease(Lifetime::request, ReuseClass::cold, {0, 10}, a).ok());
     CHECK(domain.release(a).ok());
 
     Lease stale = a;
@@ -132,7 +190,8 @@ void test_stale_and_cross_window_rejected() {
 
     // A changed copy is rejected and the live lease stays valid.
     Lease live;
-    CHECK(domain.lease(Class::frame, {10, 20}, live).ok());
+    CHECK(domain.lease(Lifetime::request, ReuseClass::frame, {10, 20}, live)
+              .ok());
     Lease copy = live;
     copy.slot_gen += 1;
     CHECK(domain.release(copy).code == Code::stale_lease);
@@ -140,7 +199,7 @@ void test_stale_and_cross_window_rejected() {
     CHECK(domain.release(live).ok());
     CHECK(domain.drain().ok());
 
-    CHECK(arena.advance_window(1).ok());
+    CHECK(domain.advance_window(1).ok());
     CHECK(domain.generation() == arena.generation());
     CHECK(domain.release(stale).code == Code::wrong_window);
     CHECK(domain.cancel(stale).code == Code::invalid_argument);
@@ -149,19 +208,19 @@ void test_stale_and_cross_window_rejected() {
 void test_instances_are_independent() {
     Slot first_storage[2];
     Slot second_storage[2];
-    Arena first_arena(first_storage, 2, 25, 0, 1000);
-    Arena second_arena(second_storage, 2, 26, 0, 1000);
+    Arena first_arena(first_storage, 2, 27, 0, 1000);
+    Arena second_arena(second_storage, 2, 28, 0, 1000);
     Domain first(first_arena);
     Domain second(second_arena);
 
     Lease a;
-    CHECK(first.lease(Class::frame, {0, 10}, a).ok());
+    CHECK(first.lease(Lifetime::request, ReuseClass::frame, {0, 10}, a).ok());
     CHECK(first.state() == DomainState::active);
     CHECK(second.state() == DomainState::idle);
     CHECK(second.arena().live_count() == 0);
 
     Lease b;
-    CHECK(second.lease(Class::frame, {0, 10}, b).ok());
+    CHECK(second.lease(Lifetime::step, ReuseClass::frame, {0, 10}, b).ok());
     CHECK(first.cancel(a).ok());
     CHECK(second.state() == DomainState::active);
     CHECK(second.release(b).ok());
@@ -175,6 +234,8 @@ int main() {
     test_quarantine_transition();
     test_release_defers_frame_reuse();
     test_cold_release_is_immediate();
+    test_lifetime_accounting_through_domain();
+    test_advance_window();
     test_stale_and_cross_window_rejected();
     test_instances_are_independent();
 
