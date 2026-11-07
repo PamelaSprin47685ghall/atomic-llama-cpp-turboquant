@@ -6,6 +6,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 static int g_failures = 0;
 
@@ -143,11 +148,73 @@ static void test_events() {
     set_flag("TP5_MTP_BATCH_POOL", nullptr);
 }
 
+static void test_cancel_releases_lease() {
+    set_flag("TP5_MTP_BATCH_POOL", "1");
+    set_flag("TP5_ALLOC_PROBE", "1");
+
+    tq::tp5::mtp_batch_pool pool(1, 4);
+
+    try {
+        auto lease = pool.acquire();
+        lease.set(1, 0, 1, nullptr, 4);
+        throw std::runtime_error("cancelled");
+    } catch (const std::runtime_error &) {
+    }
+
+    auto lease = pool.acquire();
+    lease.set(2, 1, 1, nullptr, 4);
+
+    const auto & events = pool.events();
+    check(events.size() == 3, "cancel: acquire, release on unwind, acquire");
+    if (events.size() == 3) {
+        check(events[1].action == tq::alloc::LeaseAction::release, "cancel: unwind released the slot");
+        check(events[2].slot == events[0].slot, "cancel: the slot is reused");
+        check(events[2].slot_gen == events[0].slot_gen + 1, "cancel: generation advances");
+    }
+
+    set_flag("TP5_ALLOC_PROBE", nullptr);
+    set_flag("TP5_MTP_BATCH_POOL", nullptr);
+}
+
+static void test_steady_state() {
+#if defined(__GLIBC__)
+    set_flag("TP5_MTP_BATCH_POOL", "1");
+
+    constexpr int wide = 4;
+    tq::tp5::mtp_batch_pool pool(4, wide);
+
+    float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
+
+    // Warm the first slot. The pool scans from slot 0, so a sequential
+    // lease stream always reuses it after the first acquire.
+    for (int i = 0; i < 1; ++i) {
+        auto lease = pool.acquire();
+        lease.set(i, i, 1, embd, wide);
+    }
+
+    const std::size_t before = mallinfo2().uordblks;
+
+    for (int i = 0; i < 10000; ++i) {
+        auto lease = pool.acquire();
+        lease.set(i, i, 1, embd, wide);
+    }
+
+    const std::size_t after = mallinfo2().uordblks;
+    check(before == after, "steady: 10k MTP leases, no heap growth");
+
+    set_flag("TP5_MTP_BATCH_POOL", nullptr);
+#else
+    check(true, "steady: skipped without mallinfo2");
+#endif
+}
+
 int main() {
     test_pooled_lease();
     test_fallback_lease();
     test_exhaustion_falls_back();
     test_events();
+    test_cancel_releases_lease();
+    test_steady_state();
 
     std::printf("%s failures=%d\n", g_failures ? "FAILED" : "OK", g_failures);
 
