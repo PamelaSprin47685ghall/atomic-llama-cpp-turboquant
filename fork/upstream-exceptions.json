@@ -736,7 +736,7 @@
     },
     {
       "path": "src/llama-batch.cpp",
-      "sha256": "3f0b682e4e22821547fa04fc788d6eb627de83608f93801baa1e711deb5b7b6e",
+      "sha256": "a3677e029eab1a13f943b9d1f013e376d8486737c4c82ca1b1129d565d4cb21b",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose",
@@ -747,7 +747,7 @@
     },
     {
       "path": "src/llama-batch.h",
-      "sha256": "347fa0a9a5ed852fc60791aca6851ec24f7456711283e36e7e823f09b19894eb",
+      "sha256": "e0440479841dedd26b6e89878dc67fae0e9592955eaf50662981b5eb56c7f144",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose",
@@ -779,7 +779,7 @@
     },
     {
       "path": "src/llama-ubatch-pool.cpp",
-      "sha256": "685d020f6f6526f4633793f8eedb620762d8aa4a6f2eeae3da4df8c21c7c187f",
+      "sha256": "5bc5cfbfab0cb23c3005d748d03a86ee29db73b5da07e37ad1dffd85e8ee2022",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose",
@@ -790,7 +790,7 @@
     },
     {
       "path": "src/llama-ubatch-pool.h",
-      "sha256": "904038b105ae766afdb9eec04328a60d450e715f86cc32dc81bdd3ca3366302f",
+      "sha256": "bf83afd3eb050cec1b8f28f76b33a1eeab8ef313a22a9e78cbe488533191f569",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose",
@@ -811,7 +811,7 @@
     },
     {
       "path": "tests/test-batch-alloc.cpp",
-      "sha256": "c93cf0473a290635e1986e83702e21243562abf71d90247d704ad393bee59d32",
+      "sha256": "4756625d8492cbf141c4df853dc2033b18dd563425451d1340134e85841ec8d8",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
@@ -821,7 +821,7 @@
     },
     {
       "path": "tests/test-tp5-ubatch-pool.cpp",
-      "sha256": "e7583ae827008d85586fa21393fa8cb9a504a170fdb7939c914f6b3160bf02f3",
+      "sha256": "ab6f019cfd9735bd0eb1326519c31d8507988895a62b4f1dc513bdb12e50f131",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
