@@ -84,8 +84,9 @@ bool api_upload(const lease * l, const void * src, size_t bytes) {
 }
 
 bool api_upload_rows(const lease * l, const void * src, size_t src_stride,
-                     size_t row_bytes, size_t rows) {
-    return l != nullptr && global_pool().upload_rows(*l, src, src_stride, row_bytes, rows);
+                     size_t dst_stride, size_t row_bytes, size_t rows) {
+    return l != nullptr &&
+        global_pool().upload_rows(*l, src, src_stride, dst_stride, row_bytes, rows);
 }
 
 bool api_wait(const lease * l) {

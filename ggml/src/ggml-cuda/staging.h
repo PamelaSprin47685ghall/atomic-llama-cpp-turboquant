@@ -75,6 +75,7 @@ public:
         uint64_t alloc_fail                = 0;
         uint64_t stale_release             = 0;
         uint64_t wait_fail                 = 0;
+        uint64_t no_slot                   = 0;
         uint64_t invalid                   = 0;
     };
 
@@ -108,7 +109,8 @@ public:
     }
 
     // Reuses a slot for (window, kind). Grows a free slot within the pool cap.
-    // When both slots are busy, waits the older one and reuses it.
+    // A leased slot is never reused: when both slots are leased the call fails
+    // and the caller falls back. A pending but unleased slot is waited first.
     bool acquire(uint32_t window, kind k, size_t bytes, lease * out) {
         if (out == nullptr || bytes == 0 || window >= kWindows || size_t(k) >= kKindCount) {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -121,48 +123,44 @@ public:
         }
         auto & key = slots_[window][size_t(k)];
         slot * chosen = nullptr;
-        // Prefer a slot whose previous upload already retired. A pending slot
-        // is used only when no other slot fits, so the double buffer rotates
-        // instead of serializing on the first slot.
+        // 1) Free and retired, large enough.
         for (auto & s : key) {
-            if (!s.busy && !s.pending && s.cap >= bytes) {
+            if (!s.leased && !s.pending && s.cap >= bytes) {
                 chosen = &s;
                 break;
             }
         }
+        // 2) Free and retired, grow.
         if (chosen == nullptr) {
             for (auto & s : key) {
-                if (!s.busy && s.cap >= bytes) {
+                if (!s.leased && !s.pending) {
                     chosen = &s;
                     break;
                 }
             }
         }
+        // 3) Free but pending, large enough: wait, then reuse.
         if (chosen == nullptr) {
-            slot * best = nullptr;
             for (auto & s : key) {
-                if (!s.busy && !s.pending && (best == nullptr || s.cap > best->cap)) {
-                    best = &s;
-                }
-            }
-            chosen = best;
-        }
-        if (chosen == nullptr) {
-            slot * best = nullptr;
-            for (auto & s : key) {
-                if (!s.busy && (best == nullptr || s.cap > best->cap)) {
-                    best = &s;
-                }
-            }
-            chosen = best;
-        }
-        if (chosen == nullptr) {
-            chosen = &key[0];
-            for (auto & s : key) {
-                if (s.epoch < chosen->epoch) {
+                if (!s.leased && s.cap >= bytes) {
                     chosen = &s;
+                    break;
                 }
             }
+        }
+        // 4) Free but pending, grow after the wait.
+        if (chosen == nullptr) {
+            for (auto & s : key) {
+                if (!s.leased) {
+                    chosen = &s;
+                    break;
+                }
+            }
+        }
+        // 5) Both slots are leased. Never steal a live lease.
+        if (chosen == nullptr) {
+            stats_.no_slot++;
+            return false;
         }
         if (!wait_slot_locked(*chosen)) {
             return false;
@@ -170,7 +168,7 @@ public:
         if (!grow_locked(*chosen, bytes)) {
             return false;
         }
-        chosen->busy  = true;
+        chosen->leased = true;
         chosen->epoch = next_epoch_++;
         out->host     = chosen->host;
         out->cap      = chosen->cap;
@@ -199,13 +197,20 @@ public:
         return true;
     }
 
-    // Copies rows into the slot with the source stride. Used by the 2D path.
+    // Copies rows into the slot. src_stride and dst_stride are independent so
+    // a packed destination is possible; the meta 2D path passes equal strides
+    // because its consumer reads with the source stride.
     bool upload_rows(const lease & l, const void * src, size_t src_stride,
-                     size_t row_bytes, size_t rows) {
+                     size_t dst_stride, size_t row_bytes, size_t rows) {
         if (src == nullptr || row_bytes == 0 || rows == 0) {
             return false;
         }
-        const size_t span = (rows - 1) * src_stride + row_bytes;
+        if (src_stride < row_bytes || dst_stride < row_bytes) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats_.invalid++;
+            return false;
+        }
+        const size_t span = (rows - 1) * dst_stride + row_bytes;
         std::lock_guard<std::mutex> lock(mutex_);
         slot * s = find_locked(l);
         if (s == nullptr || span > s->cap) {
@@ -214,7 +219,7 @@ public:
         }
         const auto * p = static_cast<const uint8_t *>(src);
         for (size_t r = 0; r < rows; ++r) {
-            std::memcpy(s->host + r * src_stride, p + r * src_stride, row_bytes);
+            std::memcpy(s->host + r * dst_stride, p + r * src_stride, row_bytes);
         }
         stats_.uploads++;
         stats_.upload_bytes += span;
@@ -273,7 +278,7 @@ public:
             stats_.stale_release++;
             return;
         }
-        s->busy = false;
+        s->leased = false;
         stats_.releases++;
     }
 
@@ -329,7 +334,7 @@ public:
         std::fprintf(f,
             "TP5_STAGING leases=%llu uploads=%llu upload_bytes=%llu waits=%llu wait_ms=%.3f "
             "enqueues=%llu releases=%llu hits=%llu misses=%llu oversize=%llu alloc_fail=%llu "
-            "stale_release=%llu wait_fail=%llu invalid=%llu\n",
+            "stale_release=%llu wait_fail=%llu no_slot=%llu invalid=%llu\n",
             (unsigned long long) stats_.leases,
             (unsigned long long) stats_.uploads,
             (unsigned long long) stats_.upload_bytes,
@@ -343,6 +348,7 @@ public:
             (unsigned long long) stats_.alloc_fail,
             (unsigned long long) stats_.stale_release,
             (unsigned long long) stats_.wait_fail,
+            (unsigned long long) stats_.no_slot,
             (unsigned long long) stats_.invalid);
     }
 
@@ -351,7 +357,7 @@ private:
         uint8_t * host = nullptr;
         size_t    cap = 0;
         uint64_t  epoch = 0;
-        bool      busy = false;
+        bool      leased = false;
         bool      pending = false;
         uint32_t  pending_ranks = 0;
         void *    events[kRanks] = {};
@@ -365,7 +371,7 @@ private:
             return nullptr;
         }
         slot & s = slots_[l.window][size_t(l.which)][l.slot];
-        if (!s.busy || s.epoch != l.epoch || s.host != l.host) {
+        if (!s.leased || s.epoch != l.epoch || s.host != l.host) {
             return nullptr;
         }
         return &s;
@@ -469,7 +475,7 @@ struct api {
     bool (*acquire)(uint32_t window, kind k, size_t bytes, lease * out);
     bool (*upload)(const lease * l, const void * src, size_t bytes);
     bool (*upload_rows)(const lease * l, const void * src, size_t src_stride,
-                        size_t row_bytes, size_t rows);
+                        size_t dst_stride, size_t row_bytes, size_t rows);
     bool (*wait)(const lease * l);
     void (*release)(const lease * l);
     bool (*owns)(const void * p, size_t bytes);

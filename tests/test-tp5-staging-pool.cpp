@@ -136,13 +136,19 @@ int test_double_buffer_and_stale_release() {
     CHECK(a.slot != b.slot);
     CHECK(a.host != b.host);
 
-    // Both slots are busy: the older one is waited and reused.
-    const int syncs_before = g_syncs;
+    // Both slots are leased. A third acquire must fail, never steal a lease.
     lease c;
+    CHECK(!p.acquire(0, kind::mtp_h, sizeof(src), &c));
+    CHECK(p.snapshot().no_slot == 1);
+    CHECK(p.usable());
+    CHECK(p.upload(a, src, sizeof(src)));  // both leases stay valid
+    CHECK(p.upload(b, src, sizeof(src)));
+
+    // Releasing one slot makes it reusable.
+    p.release(a);
     CHECK(p.acquire(0, kind::mtp_h, sizeof(src), &c));
     CHECK(c.slot == a.slot);
     CHECK(c.epoch > b.epoch);
-    CHECK(g_syncs == syncs_before);  // no enqueue was pending
 
     // The old lease no longer names a live slot.
     CHECK(!p.upload(a, src, 16));
@@ -151,6 +157,36 @@ int test_double_buffer_and_stale_release() {
 
     CHECK(p.upload(c, src, sizeof(src)));
     p.release(b);
+    p.release(c);
+    return 0;
+}
+
+int test_pending_slot_reuse() {
+    pool p(fake_ops());
+    uint8_t src[64] = {};
+    uint8_t dst[64] = {};
+
+    // Both slots become pending but unleased: enqueue, then release without
+    // waiting.
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr));
+    p.release(a);
+
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+    CHECK(b.slot != a.slot);
+    CHECK(p.upload(b, src, sizeof(src)));
+    CHECK(p.enqueue(b, 1, dst, sizeof(src), nullptr));
+    p.release(b);
+
+    // The next acquire waits one pending event and reuses that slot.
+    const int syncs_before = g_syncs;
+    lease c;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &c));
+    CHECK(c.slot == a.slot);
+    CHECK(g_syncs == syncs_before + 1);
     p.release(c);
     return 0;
 }
@@ -226,11 +262,23 @@ int test_upload_rows() {
     }
     lease a;
     CHECK(p.acquire(0, kind::kq_mask, 3 * 16, &a));
-    CHECK(p.upload_rows(a, src, 16, 8, 3));
+
+    // Strided destination keeps the source stride (the meta 2D consumer reads
+    // with that stride).
+    CHECK(p.upload_rows(a, src, 16, 16, 8, 3));
     for (size_t r = 0; r < 3; ++r) {
         CHECK(std::memcmp(a.host + r * 16, src + r * 16, 8) == 0);
     }
-    CHECK(!p.upload_rows(a, src, 16, 8, 4));  // span exceeds the slot
+
+    // Packed destination removes the holes.
+    CHECK(p.upload_rows(a, src, 16, 8, 8, 3));
+    for (size_t r = 0; r < 3; ++r) {
+        CHECK(std::memcmp(a.host + r * 8, src + r * 16, 8) == 0);
+    }
+
+    CHECK(!p.upload_rows(a, src, 16, 16, 8, 4));  // span exceeds the slot
+    CHECK(!p.upload_rows(a, src, 4, 8, 8, 3));    // src_stride < row_bytes
+    CHECK(!p.upload_rows(a, src, 8, 4, 8, 3));    // dst_stride < row_bytes
     p.release(a);
     return 0;
 }
@@ -246,9 +294,10 @@ int test_enqueue_wait() {
     CHECK(p.upload(a, src, sizeof(src)));
 
     const int syncs_before = g_syncs;
+    const int copies_before = g_copies;
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr));
     CHECK(p.enqueue(a, 4, dst, sizeof(src), nullptr));
-    CHECK(g_copies == 2);
+    CHECK(g_copies == copies_before + 2);
     CHECK(p.wait(a));
     CHECK(g_syncs == syncs_before + 2);
     CHECK(std::memcmp(dst, src, sizeof(src)) == 0);
@@ -317,6 +366,7 @@ int main() {
     } tests[] = {
         {"lease_release",              test_lease_release},
         {"double_buffer_stale_release", test_double_buffer_and_stale_release},
+        {"pending_slot_reuse",         test_pending_slot_reuse},
         {"window_isolation",           test_window_isolation},
         {"pool_cap",                   test_pool_cap},
         {"alloc_failure_fail_closed",  test_alloc_failure_fail_closed},
