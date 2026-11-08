@@ -101,7 +101,8 @@ static bool staging_diag_enabled() {
     return on;
 }
 
-static void staging_log_reject(const char * lane, const ggml_tensor * tensor, size_t size) {
+static void staging_log_reject(const char * lane, const ggml_tensor * tensor, size_t size,
+                               const char * reason_override = nullptr) {
     if (!staging_diag_enabled()) {
         return;
     }
@@ -109,8 +110,10 @@ static void staging_log_reject(const char * lane, const ggml_tensor * tensor, si
     if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
         return;
     }
-    const char * reason = "unknown";
-    if (tensor == nullptr) {
+    const char * reason = reason_override != nullptr ? reason_override : "unknown";
+    if (reason_override != nullptr) {
+        // keep the explicit reason
+    } else if (tensor == nullptr) {
         reason = "null";
     } else if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) == 0) {
         reason = "no_input_flag";
@@ -2296,14 +2299,24 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
             const bool staging_on = st != nullptr && st->enabled();
             const ggml_tensor * staging_src = staging_meta != nullptr ? staging_meta : tensor;
-            const bool staging_hit = staging_on && staging_eligible(staging_src, size, &staging_kind);
+            // A non-scheduler caller must not make the upload size, type or
+            // layout diverge from the destination. The scheduler already
+            // asserts this; the check makes the staging lane self-contained.
+            const bool staging_shape_ok =
+                staging_meta == nullptr ||
+                (staging_meta->data != nullptr &&
+                 ggml_are_same_layout(staging_meta, tensor) &&
+                 size == ggml_nbytes(tensor));
+            const bool staging_hit = staging_on && staging_shape_ok &&
+                staging_eligible(staging_src, size, &staging_kind);
             if (st == nullptr) {
                 g_staging_meta_diag.async_api_null.fetch_add(1, std::memory_order_relaxed);
             } else if (!staging_on) {
                 g_staging_meta_diag.async_disabled.fetch_add(1, std::memory_order_relaxed);
             } else if (!staging_hit) {
                 g_staging_meta_diag.async_not_eligible.fetch_add(1, std::memory_order_relaxed);
-                staging_log_reject("async", staging_src, size);
+                staging_log_reject("async", staging_src, size,
+                                   staging_shape_ok ? nullptr : "layout");
             } else {
                 g_staging_meta_diag.async_eligible.fetch_add(1, std::memory_order_relaxed);
             }
