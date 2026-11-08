@@ -55,51 +55,49 @@ static const ggml_cuda_staging::api * staging_api() {
 }
 
 static constexpr uint32_t kStagingWindow = 0;
-// Per-token inputs are far smaller than this. The bound keeps model weights
-// and other one-shot uploads out of the pool, so the 4 MiB budget always
-// serves the hot path.
-static constexpr size_t kMaxStagingBytes = 256u << 10;
-
-static ggml_cuda_staging::kind staging_kind_for(const ggml_tensor * tensor) {
-    using kind = ggml_cuda_staging::kind;
-    if (tensor == nullptr || tensor->name[0] == '\0') {
-        return kind::generic;
-    }
-    if (std::strstr(tensor->name, "out_ids") != nullptr) {
-        return kind::out_ids;
-    }
-    if (std::strstr(tensor->name, "KQ_mask") != nullptr ||
-            std::strstr(tensor->name, "kq_mask") != nullptr) {
-        return kind::kq_mask;
-    }
-    if (std::strstr(tensor->name, "token") != nullptr) {
-        return kind::tokens;
-    }
-    if (std::strstr(tensor->name, "pos") != nullptr) {
-        return kind::pos;
-    }
-    if (std::strstr(tensor->name, "mtp") != nullptr && std::strstr(tensor->name, "h") != nullptr) {
-        return kind::mtp_h;
-    }
-    return kind::generic;
-}
+// Per-request inputs are bounded by this. It must cover the MTP hidden input
+// (n_env * n_embd * 4, about 1.25 MiB at 32 rows) while still allowing two
+// slots inside the 4 MiB pool. Weights stay out through the input flag.
+static constexpr size_t kMaxStagingBytes = 2u << 20;
 
 static bool staging_eligible(const ggml_tensor * tensor, size_t size,
                              ggml_cuda_staging::kind * out) {
-    if (tensor == nullptr || size == 0 || size > kMaxStagingBytes) {
+    if (tensor == nullptr) {
         return false;
     }
     // Only graph inputs rotate through the pool. Weights and other one-shot
     // uploads keep the original path and never consume the 4 MiB budget.
-    if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) == 0) {
-        return false;
-    }
-    const ggml_cuda_staging::kind k = staging_kind_for(tensor);
-    if (k == ggml_cuda_staging::kind::generic) {
-        return false;
-    }
-    *out = k;
-    return true;
+    return ggml_cuda_staging::staging_candidate(
+        (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0, tensor->name, size,
+        kMaxStagingBytes, out);
+}
+
+// Low-noise counters for the next ALLf run. They explain why the MIRRORED
+// path did or did not stage without changing behaviour.
+struct staging_meta_diag {
+    std::atomic<uint64_t> mirrored{0};
+    std::atomic<uint64_t> api_null{0};
+    std::atomic<uint64_t> disabled{0};
+    std::atomic<uint64_t> not_eligible{0};
+    std::atomic<uint64_t> eligible{0};
+    std::atomic<uint64_t> generic{0};
+    std::atomic<uint64_t> lease_ok{0};
+    std::atomic<uint64_t> lease_fail{0};
+};
+static staging_meta_diag g_staging_meta_diag;
+
+extern "C" void ggml_backend_meta_staging_diag_dump() {
+    std::fprintf(stderr,
+        "TP5_STAGING_META mirrored=%llu api_null=%llu disabled=%llu not_eligible=%llu "
+        "eligible=%llu generic=%llu lease_ok=%llu lease_fail=%llu\n",
+        (unsigned long long) g_staging_meta_diag.mirrored.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.api_null.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.disabled.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.not_eligible.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.eligible.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.generic.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.lease_ok.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.lease_fail.load(std::memory_order_relaxed));
 }
 
 struct ggml_backend_meta_device;
@@ -1671,21 +1669,67 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
+            g_staging_meta_diag.mirrored.fetch_add(1, std::memory_order_relaxed);
             const ggml_cuda_staging::api * st = staging_api();
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
-            if (st != nullptr && st->enabled() && staging_eligible(tensor, size, &staging_kind)) {
+            const bool staging_on = st != nullptr && st->enabled();
+            const bool staging_hit = staging_on && staging_eligible(tensor, size, &staging_kind);
+            if (st == nullptr) {
+                g_staging_meta_diag.api_null.fetch_add(1, std::memory_order_relaxed);
+            } else if (!staging_on) {
+                g_staging_meta_diag.disabled.fetch_add(1, std::memory_order_relaxed);
+            } else if (!staging_hit) {
+                g_staging_meta_diag.not_eligible.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_staging_meta_diag.eligible.fetch_add(1, std::memory_order_relaxed);
+                if (staging_kind == ggml_cuda_staging::kind::generic) {
+                    g_staging_meta_diag.generic.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (staging_hit) {
                 ggml_cuda_staging::lease staged_lease;
                 if (st->acquire(kStagingWindow, staging_kind, size, &staged_lease)) {
+                    g_staging_meta_diag.lease_ok.fetch_add(1, std::memory_order_relaxed);
                     if (st->upload(&staged_lease, data, size)) {
-                        for (size_t j = 0; j < n_bufs; j++) {
-                            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                            ggml_backend_tensor_set(simple_tensor, staged_lease.host, offset, size);
+                        bool merged = false;
+                        if (st->merge_wait()) {
+                            // P8b: enqueue every rank first, then wait all events
+                            // once. The copies run on the same per-thread stream
+                            // as the synchronous set_tensor they replace.
+                            bool ranks_ok = true;
+                            for (size_t j = 0; j < n_bufs && ranks_ok; j++) {
+                                ranks_ok = st->can_enqueue_sync(
+                                    ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size);
+                            }
+                            if (ranks_ok) {
+                                bool queued = true;
+                                for (size_t j = 0; j < n_bufs; j++) {
+                                    if (!st->enqueue_sync(&staged_lease,
+                                            ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size)) {
+                                        queued = false;
+                                        break;
+                                    }
+                                }
+                                if (queued) {
+                                    (void) st->wait(&staged_lease);
+                                    st->release(&staged_lease);
+                                    merged = true;
+                                }
+                            }
                         }
-                        (void) st->wait(&staged_lease);
-                        st->release(&staged_lease);
+                        if (!merged) {
+                            for (size_t j = 0; j < n_bufs; j++) {
+                                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                                ggml_backend_tensor_set(simple_tensor, staged_lease.host, offset, size);
+                            }
+                            (void) st->wait(&staged_lease);
+                            st->release(&staged_lease);
+                        }
                         break;
                     }
                     st->release(&staged_lease);
+                } else {
+                    g_staging_meta_diag.lease_fail.fetch_add(1, std::memory_order_relaxed);
                 }
             }
             for (size_t j = 0; j < n_bufs; j++) {
