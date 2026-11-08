@@ -8,13 +8,14 @@
 namespace ggml_cuda_staging {
 namespace {
 
-bool hip_host_alloc(size_t bytes, void ** out) {
+int hip_host_alloc(size_t bytes, void ** out) {
     void * host = nullptr;
-    if (cudaHostAlloc(&host, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
-        return false;
+    const cudaError_t err = cudaHostAlloc(&host, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
+    if (err != cudaSuccess) {
+        return int(err);
     }
     *out = host;
-    return true;
+    return 0;
 }
 
 void hip_host_free(void * ptr) {
@@ -23,28 +24,23 @@ void hip_host_free(void * ptr) {
     }
 }
 
-bool hip_event_create(void ** out) {
+int hip_event_create(void ** out) {
     cudaEvent_t event = nullptr;
-    if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
-        return false;
+    const cudaError_t err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        return int(err);
     }
     *out = reinterpret_cast<void *>(event);
-    return true;
+    return 0;
 }
 
-bool hip_event_record(void * event, void * stream) {
-    if (cudaEventRecord(reinterpret_cast<cudaEvent_t>(event),
-                        reinterpret_cast<cudaStream_t>(stream)) != cudaSuccess) {
-        return false;
-    }
-    return true;
+int hip_event_record(void * event, void * stream) {
+    return int(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event),
+                               reinterpret_cast<cudaStream_t>(stream)));
 }
 
-bool hip_event_sync(void * event) {
-    if (cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(event)) != cudaSuccess) {
-        return false;
-    }
-    return true;
+int hip_event_sync(void * event) {
+    return int(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(event)));
 }
 
 void hip_event_destroy(void * event) {
@@ -53,21 +49,19 @@ void hip_event_destroy(void * event) {
     }
 }
 
-bool hip_copy_h2d(void * dst, const void * src, size_t bytes, void * stream) {
-    if (cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice,
-                        reinterpret_cast<cudaStream_t>(stream)) != cudaSuccess) {
-        return false;
-    }
-    return true;
+int hip_copy_h2d(void * dst, const void * src, size_t bytes, void * stream) {
+    return int(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice,
+                               reinterpret_cast<cudaStream_t>(stream)));
 }
 
-bool hip_device_ptr(void * host, void ** out) {
+int hip_device_ptr(void * host, void ** out) {
     void * dev = nullptr;
-    if (cudaHostGetDevicePointer(&dev, host, 0) != cudaSuccess) {
-        return false;
+    const cudaError_t err = cudaHostGetDevicePointer(&dev, host, 0);
+    if (err != cudaSuccess) {
+        return int(err);
     }
     *out = dev;
-    return true;
+    return 0;
 }
 
 int hip_current_device() {
@@ -97,12 +91,6 @@ bool hip_restore_device(int physical) {
     return true;
 }
 
-// The first sticky error stays visible: staging never clears it. The pool
-// records the value for the diagnostic dump and then fails closed.
-int hip_peek_error() {
-    return int(cudaPeekAtLastError());
-}
-
 const backend_ops kHipOps = {
     /* .host_alloc   = */ hip_host_alloc,
     /* .host_free    = */ hip_host_free,
@@ -115,7 +103,6 @@ const backend_ops kHipOps = {
     /* .current_device = */ hip_current_device,
     /* .select_device  = */ hip_select_device,
     /* .restore_device = */ hip_restore_device,
-    /* .peek_error     = */ hip_peek_error,
 };
 
 bool api_acquire(uint32_t window, kind k, size_t bytes, lease * out) {
@@ -126,14 +113,19 @@ bool api_acquire_nowait(uint32_t window, kind k, size_t bytes, lease * out) {
     return global_pool().acquire(window, k, bytes, out, /*wait_pending =*/ false);
 }
 
-bool api_upload(const lease * l, const void * src, size_t bytes) {
-    return l != nullptr && global_pool().upload(*l, src, bytes);
+int api_upload(const lease * l, const void * src, size_t bytes) {
+    if (l == nullptr) {
+        return int(submit_result::rejected);
+    }
+    return int(global_pool().upload(*l, src, bytes));
 }
 
-bool api_upload_rows(const lease * l, const void * src, size_t src_stride,
-                     size_t dst_stride, size_t row_bytes, size_t rows) {
-    return l != nullptr &&
-        global_pool().upload_rows(*l, src, src_stride, dst_stride, row_bytes, rows);
+int api_upload_rows(const lease * l, const void * src, size_t src_stride,
+                    size_t dst_stride, size_t row_bytes, size_t rows) {
+    if (l == nullptr) {
+        return int(submit_result::rejected);
+    }
+    return int(global_pool().upload_rows(*l, src, src_stride, dst_stride, row_bytes, rows));
 }
 
 bool api_wait(const lease * l) {
@@ -199,6 +191,8 @@ const api kApi = {
     /* .can_enqueue_sync  = */ can_enqueue_sync_impl,
     /* .enqueue_sync      = */ api_enqueue_sync,
     /* .first_error       = */ api_first_error,
+    /* .configured        = */ configured,
+    /* .usable            = */ usable,
     /* .zc_enabled        = */ api_zc_enabled,
 };
 
@@ -211,11 +205,19 @@ pool & global_pool() {
 }
 
 bool enabled() {
+    return configured() && usable();
+}
+
+bool configured() {
     static const bool flag = [] {
         const char * v = std::getenv("GGML_TP5_STAGING");
         return v != nullptr && std::strcmp(v, "1") == 0;
     }();
-    return flag && global_pool().usable();
+    return flag;
+}
+
+bool usable() {
+    return global_pool().usable();
 }
 
 bool merge_wait_enabled() {

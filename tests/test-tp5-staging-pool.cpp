@@ -27,20 +27,18 @@ bool g_fail_sync = false;
 int  g_fail_copy_remaining = 0;
 bool g_fail_event_create = false;
 bool g_fail_event_record = false;
-int  g_peek_error = 0;
-
-bool fake_alloc(size_t bytes, void ** out) {
+int fake_alloc(size_t bytes, void ** out) {
     if (g_fail_alloc) {
-        return false;
+        return 1;
     }
     void * p = std::malloc(bytes);
     if (p == nullptr) {
-        return false;
+        return 1;
     }
     std::memset(p, 0, bytes);
     *out = p;
     ++g_allocs;
-    return true;
+    return 0;
 }
 
 void fake_free(void * p) {
@@ -50,26 +48,26 @@ void fake_free(void * p) {
     }
 }
 
-bool fake_event_create(void ** out) {
+int fake_event_create(void ** out) {
     if (g_fail_event_create) {
-        return false;
+        return 2;
     }
     *out = std::malloc(1);
     ++g_events;
-    return *out != nullptr;
+    return *out != nullptr ? 0 : 2;
 }
 
-bool fake_event_record(void *, void *) {
+int fake_event_record(void *, void *) {
     if (g_fail_event_record) {
-        return false;
+        return 3;
     }
     ++g_records;
-    return true;
+    return 0;
 }
 
-bool fake_event_sync(void *) {
+int fake_event_sync(void *) {
     ++g_syncs;
-    return !g_fail_sync;
+    return g_fail_sync ? 4 : 0;
 }
 
 void fake_event_destroy(void * p) {
@@ -77,19 +75,19 @@ void fake_event_destroy(void * p) {
     ++g_destroys;
 }
 
-bool fake_copy(void * dst, const void * src, size_t bytes, void *) {
+int fake_copy(void * dst, const void * src, size_t bytes, void *) {
     if (g_fail_copy_remaining > 0) {
         --g_fail_copy_remaining;
-        return false;
+        return 5;
     }
     std::memcpy(dst, src, bytes);
     ++g_copies;
-    return true;
+    return 0;
 }
 
-bool fake_device_ptr(void *, void ** out) {
+int fake_device_ptr(void *, void ** out) {
     *out = reinterpret_cast<void *>(uintptr_t(0x1000));
-    return true;
+    return 0;
 }
 
 int g_current_device = 0;
@@ -114,10 +112,6 @@ bool fake_restore_device(int physical) {
     return true;
 }
 
-int fake_peek_error() {
-    return g_peek_error;
-}
-
 backend_ops fake_ops() {
     backend_ops ops;
     ops.host_alloc    = fake_alloc;
@@ -128,7 +122,6 @@ backend_ops fake_ops() {
     ops.event_destroy = fake_event_destroy;
     ops.copy_h2d      = fake_copy;
     ops.device_ptr    = fake_device_ptr;
-    ops.peek_error    = fake_peek_error;
     return ops;
 }
 
@@ -156,7 +149,7 @@ int test_lease_release() {
     CHECK(a.which == kind::tokens);
     CHECK(p.pool_bytes() >= sizeof(src));
 
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
     CHECK(std::memcmp(a.host, src, sizeof(src)) == 0);
 
     p.release(a);
@@ -185,8 +178,8 @@ int test_double_buffer_and_stale_release() {
     CHECK(!p.acquire(0, kind::mtp_h, sizeof(src), &c));
     CHECK(p.snapshot().no_slot == 1);
     CHECK(p.usable());
-    CHECK(p.upload(a, src, sizeof(src)));  // both leases stay valid
-    CHECK(p.upload(b, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);  // both leases stay valid
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
 
     // Releasing one slot makes it reusable.
     p.release(a);
@@ -195,11 +188,11 @@ int test_double_buffer_and_stale_release() {
     CHECK(c.epoch > b.epoch);
 
     // The old lease no longer names a live slot.
-    CHECK(!p.upload(a, src, 16));
+    CHECK(p.upload(a, src, 16) == submit_result::rejected);
     p.release(a);  // stale
     CHECK(p.snapshot().stale_release == 1);
 
-    CHECK(p.upload(c, src, sizeof(src)));
+    CHECK(p.upload(c, src, sizeof(src)) == submit_result::ok);
     p.release(b);
     p.release(c);
     return 0;
@@ -214,14 +207,14 @@ int test_pending_slot_reuse() {
     // waiting.
     lease a;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);
     p.release(a);
 
     lease b;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
     CHECK(b.slot != a.slot);
-    CHECK(p.upload(b, src, sizeof(src)));
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
     CHECK(p.enqueue(b, 1, dst, sizeof(src), nullptr) == submit_result::ok);
     p.release(b);
 
@@ -242,14 +235,14 @@ int test_acquire_nowait() {
 
     lease a;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);
     p.release(a);
 
     lease b;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
     CHECK(b.slot != a.slot);
-    CHECK(p.upload(b, src, sizeof(src)));
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
     CHECK(p.enqueue(b, 1, dst, sizeof(src), nullptr) == submit_result::ok);
     p.release(b);
 
@@ -334,10 +327,10 @@ int test_upload_bounds() {
     lease a;
     uint8_t src[128] = {};
     CHECK(p.acquire(0, kind::generic, 64, &a));
-    CHECK(!p.upload(a, src, 65));
-    CHECK(p.upload(a, src, 64));
-    CHECK(!p.upload(a, nullptr, 64));
-    CHECK(!p.upload(a, src, 0));
+    CHECK(p.upload(a, src, 65) == submit_result::rejected);
+    CHECK(p.upload(a, src, 64) == submit_result::ok);
+    CHECK(p.upload(a, nullptr, 64) == submit_result::rejected);
+    CHECK(p.upload(a, src, 0) == submit_result::rejected);
     p.release(a);
     return 0;
 }
@@ -353,20 +346,20 @@ int test_upload_rows() {
 
     // Strided destination keeps the source stride (the meta 2D consumer reads
     // with that stride).
-    CHECK(p.upload_rows(a, src, 16, 16, 8, 3));
+    CHECK(p.upload_rows(a, src, 16, 16, 8, 3) == submit_result::ok);
     for (size_t r = 0; r < 3; ++r) {
         CHECK(std::memcmp(a.host + r * 16, src + r * 16, 8) == 0);
     }
 
     // Packed destination removes the holes.
-    CHECK(p.upload_rows(a, src, 16, 8, 8, 3));
+    CHECK(p.upload_rows(a, src, 16, 8, 8, 3) == submit_result::ok);
     for (size_t r = 0; r < 3; ++r) {
         CHECK(std::memcmp(a.host + r * 8, src + r * 16, 8) == 0);
     }
 
-    CHECK(!p.upload_rows(a, src, 16, 16, 8, 4));  // span exceeds the slot
-    CHECK(!p.upload_rows(a, src, 4, 8, 8, 3));    // src_stride < row_bytes
-    CHECK(!p.upload_rows(a, src, 8, 4, 8, 3));    // dst_stride < row_bytes
+    CHECK(p.upload_rows(a, src, 16, 16, 8, 4) == submit_result::rejected);  // span exceeds the slot
+    CHECK(p.upload_rows(a, src, 4, 8, 8, 3) == submit_result::rejected);    // src_stride < row_bytes
+    CHECK(p.upload_rows(a, src, 8, 4, 8, 3) == submit_result::rejected);    // dst_stride < row_bytes
     p.release(a);
     return 0;
 }
@@ -379,7 +372,7 @@ int test_enqueue_wait() {
 
     lease a;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
 
     const int syncs_before = g_syncs;
     const int copies_before = g_copies;
@@ -405,7 +398,7 @@ int test_merged_wait() {
 
     lease a;
     CHECK(p.acquire(0, kind::mtp_h, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
 
     const int copies_before = g_copies;
     const int syncs_before = g_syncs;
@@ -434,17 +427,15 @@ int test_wait_failure_disables() {
     uint8_t dst[64] = {};
     lease a;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);
 
     g_fail_sync = true;
-    g_peek_error = 43;
     CHECK(!p.wait(a));
     CHECK(!p.usable());
     CHECK(p.snapshot().quarantine == 1);
-    CHECK(p.snapshot().first_error == 43);
+    CHECK(p.snapshot().first_error == 4);  // fake_event_sync error code
     g_fail_sync = false;
-    g_peek_error = 0;
     return 0;
 }
 
@@ -454,23 +445,21 @@ int test_fault_event_create_quarantine() {
     uint8_t dst[64] = {};
     lease a;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
 
     // The copy succeeds, the event cannot be created: completion is
     // unprovable, so the slot is quarantined and the pool stops.
     g_fail_event_create = true;
-    g_peek_error = 11;
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
     g_fail_event_create = false;
     CHECK(!p.usable());
     CHECK(p.snapshot().quarantine == 1);
-    CHECK(p.snapshot().first_error == 11);
+    CHECK(p.snapshot().first_error == 2);  // fake_event_create error code
     CHECK(p.pool_bytes() > 0);  // the pinned buffer is retained
 
     p.release(a);
-    CHECK(!p.upload(a, src, sizeof(src)));  // released lease is stale
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::fatal);  // pool stopped
     CHECK(p.snapshot().quarantine == 1);
-    g_peek_error = 0;
     return 0;
 }
 
@@ -480,18 +469,16 @@ int test_fault_event_record_quarantine() {
     uint8_t dst[64] = {};
     lease a;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
 
     g_fail_event_record = true;
-    g_peek_error = 12;
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
     g_fail_event_record = false;
     CHECK(!p.usable());
     CHECK(p.snapshot().quarantine == 1);
-    CHECK(p.snapshot().first_error == 12);
+    CHECK(p.snapshot().first_error == 3);  // fake_event_record error code
     p.release(a);
     CHECK(p.snapshot().quarantine == 1);
-    g_peek_error = 0;
     return 0;
 }
 
@@ -570,7 +557,7 @@ int test_source_mutation_isolation() {
 
     lease a;
     CHECK(p.acquire(0, kind::mtp_h, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
     // The caller may reuse the source as soon as upload returns: the pinned
     // copy is independent, unlike the original path which holds the pointer
     // until the H2D copy drains.
@@ -593,7 +580,7 @@ int test_partial_enqueue_stops_pool() {
 
     lease a;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
 
     // Rank 0 is queued; rank 1's copy fails. Whether anything was queued is
     // unprovable, so the slot is quarantined and the pool stops.
@@ -606,8 +593,8 @@ int test_partial_enqueue_stops_pool() {
 
     // No lease operation may continue after the stop. The caller falls back
     // outside the pool with the original pageable path.
-    CHECK(!p.upload(a, src, sizeof(src)));
-    CHECK(p.enqueue(a, 0, dst0, sizeof(src), nullptr) == submit_result::rejected);
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::fatal);
+    CHECK(p.enqueue(a, 0, dst0, sizeof(src), nullptr) == submit_result::fatal);
     CHECK(!p.wait(a));
     p.release(a);
     return 0;
@@ -619,18 +606,16 @@ int test_copy_failure_quarantine() {
     uint8_t dst[64] = {};
     lease a;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
 
     g_fail_copy_remaining = 1;
-    g_peek_error = 13;
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
     CHECK(!p.usable());
     CHECK(p.snapshot().quarantine == 1);
-    CHECK(p.snapshot().first_error == 13);
+    CHECK(p.snapshot().first_error == 5);  // fake_copy error code
     CHECK(p.pool_bytes() > 0);  // retained: a copy may still read it
     p.release(a);
-    CHECK(!p.upload(a, src, sizeof(src)));
-    g_peek_error = 0;
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::fatal);
     return 0;
 }
 
@@ -640,7 +625,7 @@ int test_fatal_stops_submits() {
     uint8_t dst[32] = {};
     lease a;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
 
     g_fail_copy_remaining = 1;
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
@@ -648,9 +633,9 @@ int test_fatal_stops_submits() {
     // After fatal, nothing else may be submitted: no copy call is made and the
     // destination is never replayed.
     const int copies_after_fatal = g_copies;
-    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::rejected);
-    CHECK(p.enqueue(a, 1, dst, sizeof(src), nullptr) == submit_result::rejected);
-    CHECK(!p.upload(a, src, sizeof(src)));
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
+    CHECK(p.enqueue(a, 1, dst, sizeof(src), nullptr) == submit_result::fatal);
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::fatal);
     CHECK(g_copies == copies_after_fatal);
     p.release(a);
     return 0;
@@ -662,7 +647,7 @@ int test_disabled_blocks_lease_ops() {
     uint8_t dst[64] = {};
     lease a;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
 
     g_fail_event_create = true;
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
@@ -670,15 +655,67 @@ int test_disabled_blocks_lease_ops() {
     CHECK(!p.usable());
 
     // An existing lease cannot bypass the stop.
-    CHECK(!p.upload(a, src, sizeof(src)));
-    CHECK(p.enqueue(a, 1, dst, sizeof(src), nullptr) == submit_result::rejected);
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::fatal);
+    CHECK(p.enqueue(a, 1, dst, sizeof(src), nullptr) == submit_result::fatal);
     CHECK(!p.wait(a));
     CHECK(p.device_ptr(a, 0) == nullptr);
 
     const uint64_t stale_before = p.snapshot().stale_release;
     p.release(a);  // releasing the handle is still allowed
     CHECK(p.snapshot().stale_release == stale_before);
-    g_peek_error = 0;
+    return 0;
+}
+
+int test_two_lease_race_fatal() {
+    pool p(fake_ops());
+    uint8_t src[64] = {};
+    uint8_t dst[64] = {};
+
+    // Two live leases in different windows.
+    lease a;
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.acquire(1, kind::mtp_h, sizeof(src), &b));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
+
+    // Lease a trips the global fault while b is still live.
+    g_fail_copy_remaining = 1;
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
+    CHECK(!p.usable());
+
+    // The other window's live lease must see fatal, never a replayable
+    // rejection: no further copy may be submitted for either destination.
+    const int copies_after_fatal = g_copies;
+    CHECK(p.enqueue(b, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::fatal);
+    CHECK(p.enqueue(b, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
+    CHECK(g_copies == copies_after_fatal);
+    p.release(a);
+    p.release(b);
+    return 0;
+}
+
+int test_capacity_reject_keeps_other_lease() {
+    pool p(fake_ops());
+    uint8_t src[32] = {};
+    uint8_t dst[64] = {};
+
+    lease a;
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, 32, &a));
+    CHECK(p.acquire(0, kind::generic, 32, &b));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
+
+    // Capacity rejection has no side effect and does not stop the pool.
+    CHECK(p.enqueue(a, 0, dst, sizeof(dst), nullptr) == submit_result::rejected);
+    CHECK(p.usable());
+
+    // The other live lease still submits normally.
+    CHECK(p.enqueue(b, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+    p.release(a);
+    p.release(b);
     return 0;
 }
 
@@ -691,7 +728,7 @@ int test_quarantine_destructor_retains() {
         uint8_t dst[64] = {};
         lease a;
         CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-        CHECK(p.upload(a, src, sizeof(src)));
+        CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
         g_fail_event_create = true;
         CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
         g_fail_event_create = false;
@@ -700,7 +737,6 @@ int test_quarantine_destructor_retains() {
     // The destructor must not free or destroy a quarantined slot.
     CHECK(g_frees == frees_before);
     CHECK(g_destroys == destroys_before);
-    g_peek_error = 0;
     return 0;
 }
 
@@ -748,7 +784,7 @@ int test_wait_device_switch() {
 
     lease a;
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
-    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);
     CHECK(p.enqueue(a, 3, dst, sizeof(src), nullptr) == submit_result::ok);
 
@@ -787,6 +823,8 @@ int main() {
         {"copy_failure_quarantine",    test_copy_failure_quarantine},
         {"fatal_stops_submits",        test_fatal_stops_submits},
         {"disabled_blocks_lease_ops",  test_disabled_blocks_lease_ops},
+        {"two_lease_race_fatal",       test_two_lease_race_fatal},
+        {"capacity_reject_keeps_other_lease", test_capacity_reject_keeps_other_lease},
         {"quarantine_destructor_retains", test_quarantine_destructor_retains},
         {"owns_and_diagnostics",       test_owns_and_diagnostics},
         {"device_ptr",                 test_device_ptr},
@@ -804,7 +842,6 @@ int main() {
         g_fail_copy_remaining = 0;
         g_fail_event_create = false;
         g_fail_event_record = false;
-        g_peek_error = 0;
         g_current_device = 0;
         g_select_count = 0;
         g_restore_count = 0;

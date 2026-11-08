@@ -142,6 +142,15 @@ static void staging_log_reject(const char * lane, const ggml_tensor * tensor, si
     GGML_ABORT("TP5 staging fatal");
 }
 
+// A configured but unusable pool is a global fault, not a capacity miss: every
+// caller must stop before it submits a replacement copy.
+static void staging_check_pool_or_fatal(const char * lane, const ggml_cuda_staging::api * st) {
+    if (st != nullptr && st->configured != nullptr && st->configured() &&
+            st->usable != nullptr && !st->usable()) {
+        staging_fatal(lane, st);
+    }
+}
+
 extern "C" void ggml_backend_meta_staging_diag_dump() {
     std::fprintf(stderr,
         "TP5_STAGING_META mirrored=%llu api_null=%llu disabled=%llu not_eligible=%llu "
@@ -1711,12 +1720,18 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             bool staged = false;
             if (st != nullptr && st->enabled() && staging_eligible(tensor, size, &staging_kind) &&
                     st->acquire(kStagingWindow, staging_kind, size, &staged_lease)) {
-                staged = st->upload(&staged_lease, data, size);
+                const int upload_result = st->upload(&staged_lease, data, size);
+                if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
+                    st->release(&staged_lease);
+                    staging_fatal("sync-2d-upload", st);
+                }
+                staged = upload_result == int(ggml_cuda_staging::submit_result::ok);
                 if (!staged) {
                     st->release(&staged_lease);
                 }
             }
             const uint8_t * src_base = staged ? staged_lease.host : static_cast<const uint8_t *>(data);
+            staging_check_pool_or_fatal("sync-2d-fallback", st);
             size_t offset_j = 0;
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
@@ -1760,7 +1775,12 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 ggml_cuda_staging::lease staged_lease;
                 if (st->acquire(kStagingWindow, staging_kind, size, &staged_lease)) {
                     g_staging_meta_diag.lease_ok.fetch_add(1, std::memory_order_relaxed);
-                    if (st->upload(&staged_lease, data, size)) {
+                    const int upload_result = st->upload(&staged_lease, data, size);
+                    if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
+                        st->release(&staged_lease);
+                        staging_fatal("sync-upload", st);
+                    }
+                    if (upload_result == int(ggml_cuda_staging::submit_result::ok)) {
                         bool merged = false;
                         if (st->merge_wait()) {
                             // P8b: enqueue every rank first, then wait all events
@@ -1819,6 +1839,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     g_staging_meta_diag.lease_fail.fetch_add(1, std::memory_order_relaxed);
                 }
             }
+            staging_check_pool_or_fatal("sync-fallback", st);
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
@@ -2356,7 +2377,12 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                 // the pipeline. A miss falls back to the pageable path.
                 if (ranks_ok && st->acquire_nowait(kStagingWindow, staging_kind, size, &staged_lease)) {
                     g_staging_meta_diag.async_lease_ok.fetch_add(1, std::memory_order_relaxed);
-                    if (st->upload(&staged_lease, data, size)) {
+                    const int upload_result = st->upload(&staged_lease, data, size);
+                    if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
+                        st->release(&staged_lease);
+                        staging_fatal("async-upload", st);
+                    }
+                    if (upload_result == int(ggml_cuda_staging::submit_result::ok)) {
                         bool submitted = false;
                         int result = int(ggml_cuda_staging::submit_result::ok);
                         for (size_t j = 0; j < n_backends; j++) {
@@ -2388,6 +2414,7 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                     g_staging_meta_diag.async_lease_fail.fetch_add(1, std::memory_order_relaxed);
                 }
             }
+            staging_check_pool_or_fatal("async-fallback", st);
             for (size_t j = 0; j < n_backends; j++) {
                 ggml_backend_tensor_set_async(
                     ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
