@@ -34,6 +34,7 @@
 #include "ggml-cpu.h"
 
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -80,6 +81,17 @@ struct fake_state {
     int  submission_error = 0;
     bool submission_pending = false;
     bool reject_copy = false;
+    // Publish an unproven submission after an accepted copy, with no native
+    // error. This is a real Meta state: a staging pool can be disabled before
+    // it records first_error.
+    bool pending_on_accept = false;
+    // Publish a native error after an accepted copy. The scheduler's entry
+    // gate therefore sees a clean backend; only the copy observation does.
+    bool error_on_accept = false;
+    bool compute_fail = false;
+    // Publish pending during graph_compute. With compute_fail=false this
+    // models a successful compute whose result is still unproven.
+    bool compute_pending = false;
 
     int cpy_calls = 0;
     int error_calls = 0;
@@ -107,6 +119,12 @@ void fake_synchronize(ggml_backend_t) { ++g_fake.sync_calls; }
 
 enum ggml_status fake_graph_compute(ggml_backend_t, ggml_cgraph *) {
     ++g_fake.compute_calls;
+    if (g_fake.compute_pending) {
+        g_fake.submission_pending = true;
+    }
+    if (g_fake.compute_fail) {
+        return GGML_STATUS_FAILED;
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -126,6 +144,12 @@ bool fake_cpy_tensor_async(ggml_backend_t, ggml_backend_t, const ggml_tensor * s
         } else {
             std::memcpy(dst->data, src->data, nbytes);
         }
+    }
+    if (g_fake.pending_on_accept) {
+        g_fake.submission_pending = true;
+    }
+    if (g_fake.error_on_accept) {
+        g_fake.submission_error = kFatalError;
     }
     return true;
 }
@@ -308,6 +332,49 @@ void init_fake_backend() {
     set_iface_submission_error(g_fake_backend.iface, fake_submission_error);
 }
 
+// Fake MoE cache provider. The scheduler probes providers with a null config
+// at construction; only an explicit ggml_backend_sched_set_moe_cache creates
+// a session. It records creation/destruction so the pending gate is visible
+// from outside the scheduler.
+int g_moe_creates = 0;
+int g_moe_destroys = 0;
+int g_moe_enters = 0;
+int g_moe_leaves = 0;
+int g_moe_session_marker = 0;
+
+int fake_moe_query_config(int, size_t budget_mib, ggml_moe_cache_config * config) {
+    if (config == nullptr) {
+        return 0;
+    }
+    std::memset(config, 0, sizeof(*config));
+    config->budget_bytes = budget_mib * 1024 * 1024;
+    config->min_devices  = 1;
+    return 1;
+}
+
+void * fake_moe_session_create(void * const *, int, const ggml_moe_cache_config * config) {
+    if (config == nullptr) {
+        return nullptr; // construction probe: leave the scheduler without a session
+    }
+    ++g_moe_creates;
+    return &g_moe_session_marker;
+}
+
+void fake_moe_session_destroy(void *) { ++g_moe_destroys; }
+void fake_moe_session_enter(void *) { ++g_moe_enters; }
+void fake_moe_session_leave(void *) { ++g_moe_leaves; }
+
+void register_fake_moe_provider() {
+    ggml_moe_cache_api api = {};
+    api.owner            = &g_fake_reg;
+    api.query_config     = fake_moe_query_config;
+    api.session_create   = fake_moe_session_create;
+    api.session_destroy  = fake_moe_session_destroy;
+    api.session_enter    = fake_moe_session_enter;
+    api.session_leave    = fake_moe_session_leave;
+    ggml_moe_cache_register(&api);
+}
+
 // One scheduler fixture: a CPU input pair, an ADD on the fake backend, and
 // the scheduler's own input copies.
 struct fixture {
@@ -321,7 +388,7 @@ struct fixture {
     ggml_backend_buffer_t input_buf = nullptr;
 };
 
-bool fixture_init(fixture & f) {
+bool fixture_init(fixture & f, bool track_copies = false) {
     f.cpu = ggml_backend_cpu_init();
     if (f.cpu == nullptr) {
         return false;
@@ -361,6 +428,9 @@ bool fixture_init(fixture & f) {
     };
     f.sched = ggml_backend_sched_new(backends, bufts, 2, ggml_graph_size(f.graph), false, false);
     if (f.sched == nullptr) {
+        return false;
+    }
+    if (track_copies && !ggml_backend_sched_set_split_copy_tracking(f.sched, true)) {
         return false;
     }
 
@@ -424,10 +494,13 @@ void test_success() {
     CHECK(fixture_init(f));
 
     const int cpy_before = g_fake.cpy_calls;
+    const int err_before = g_fake.error_calls;
     const enum ggml_status st = ggml_backend_sched_graph_compute(f.sched, f.graph);
     CHECK(st == GGML_STATUS_SUCCESS);
     CHECK(g_fake.cpy_calls == cpy_before + 2); // both ADD inputs
-    CHECK(g_fake.error_calls == 2);
+    // Two submission-state gates (async entry, sync-wrapper exit) plus one
+    // query after each accepted copy.
+    CHECK(g_fake.error_calls == err_before + 4);
     CHECK(g_fake.compute_calls == 1);
     CHECK(g_fake.submission_error == 0);
 
@@ -438,8 +511,11 @@ void test_success() {
     }
 
     // A second compute is a normal reuse, not a retained fatal state.
+    const int cpy_second = g_fake.cpy_calls;
+    const int err_second = g_fake.error_calls;
     CHECK(ggml_backend_sched_graph_compute(f.sched, f.graph) == GGML_STATUS_SUCCESS);
-    CHECK(g_fake.cpy_calls == cpy_before + 4);
+    CHECK(g_fake.cpy_calls == cpy_second + 2);
+    CHECK(g_fake.error_calls == err_second + 4);
 
     fixture_free(f, false);
 }
@@ -454,10 +530,12 @@ void test_rejected() {
     CHECK(fixture_init(f));
 
     const int cpy_before = g_fake.cpy_calls;
+    const int err_before = g_fake.error_calls;
     const enum ggml_status st = ggml_backend_sched_graph_compute(f.sched, f.graph);
     CHECK(st == GGML_STATUS_SUCCESS);
     CHECK(g_fake.cpy_calls >= cpy_before + 1);
-    CHECK(g_fake.error_calls == 0); // only asked after an accepted copy
+    // No accepted copy, so only the entry and sync-wrapper gates asked.
+    CHECK(g_fake.error_calls == err_before + 2);
     CHECK(g_fake.compute_calls == 1);
 
     // The rejected call left last_dst untouched; the scheduler's fallback
@@ -475,18 +553,22 @@ void test_rejected() {
 // replay or overwrite it on reset/reserve/next compute.
 void test_fatal() {
     reset_fake();
-    g_fake.submission_error = kFatalError;
     fixture f;
     CHECK(fixture_init(f));
+    // Publish the fault after allocation: an error observed before the graph
+    // is allocated makes alloc_graph refuse (the entry gate covers it).
+    g_fake.error_on_accept = true;
 
+    const int err_before = g_fake.error_calls;
     const enum ggml_status st = ggml_backend_sched_graph_compute(f.sched, f.graph);
     CHECK(st == GGML_STATUS_FAILED);
     CHECK(g_fake.cpy_calls == 1);   // stopped at the first input
-    CHECK(g_fake.error_calls == 1);
+    // The entry gate and the accepted copy observed the native error.
+    CHECK(g_fake.error_calls == err_before + 2);
     CHECK(g_fake.compute_calls == 0);
     CHECK(g_fake.last_dst != nullptr);
 
-    // The fake wrote the sentinel into the accepted destination.
+    // The accepted destination bytes, which no later path may change.
     std::vector<unsigned char> sentinel;
     if (g_fake.last_dst && g_fake.last_dst->data) {
         const unsigned char * p = static_cast<const unsigned char *>(g_fake.last_dst->data);
@@ -539,8 +621,9 @@ void test_pending_without_failure() {
     fixture f;
     CHECK(fixture_init(f));
 
+    const int err_before = g_fake.error_calls;
     CHECK(ggml_backend_sched_graph_compute(f.sched, f.graph) == GGML_STATUS_SUCCESS);
-    CHECK(g_fake.error_calls == 2);
+    CHECK(g_fake.error_calls == err_before + 4);
     CHECK(g_fake.last_dst != nullptr);
     g_fake.submission_pending = true; // generic pending observed after a clean compute
     CHECK(ggml_backend_sched_has_unproven(f.sched));
@@ -594,6 +677,14 @@ void test_public_copy_async_return() {
         unproven.assign(p, p + sizeof(values));
     }
 
+    // Accepted but pending with no native error -> also false. This is the
+    // state a disabled staging pool can report before it records an error.
+    g_fake.submission_error = 0;
+    g_fake.pending_on_accept = true;
+    CHECK(!ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, src, dst));
+    g_fake.pending_on_accept = false;
+    g_fake.submission_pending = false;
+
     // Rejected async callback -> the helper performs the blocking copy and
     // returns true. The false return above is not a rejected copy.
     g_fake.submission_error = 0;
@@ -608,6 +699,277 @@ void test_public_copy_async_return() {
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
+}
+
+// An accepted copy that publishes pending without a native error must stop the
+// split at once: the destination is unprovable, so no later input may overwrite
+// it and no compute may consume it.
+void test_pending_accept_stops_split() {
+    reset_fake();
+    fixture f;
+    CHECK(fixture_init(f));
+    g_fake.pending_on_accept = true;
+
+    CHECK(ggml_backend_sched_graph_compute_async(f.sched, f.graph) == GGML_STATUS_FAILED);
+    CHECK(g_fake.cpy_calls == 1);   // stopped at the first accepted copy
+    CHECK(g_fake.compute_calls == 0);
+    CHECK(g_fake.submission_error == 0);
+    CHECK(ggml_backend_sched_has_unproven(f.sched));
+
+    fixture_free(f, true);
+}
+
+static bool fake_eval_callback(ggml_tensor *, bool ask, void *) {
+    return ask;
+}
+
+// A failed split compute on the callback path may be the first observation of
+// a staging fault. It must publish the fail-stop state just like the normal
+// split path.
+void test_callback_failed_split_pending() {
+    reset_fake();
+    fixture f;
+    CHECK(fixture_init(f));
+    ggml_backend_sched_set_eval_callback(f.sched, fake_eval_callback, nullptr);
+    g_fake.compute_fail = true;
+    g_fake.compute_pending = true;
+
+    CHECK(ggml_backend_sched_graph_compute_async(f.sched, f.graph) == GGML_STATUS_FAILED);
+    CHECK(g_fake.compute_calls == 1);
+    CHECK(g_fake.submission_error == 0);
+    CHECK(ggml_backend_sched_has_unproven(f.sched));
+
+    fixture_free(f, true);
+}
+
+// A native error with no pending flag is still unproven for this scheduler.
+// any_pending must query the error capability and cache it, not only pending.
+void test_error_only_gate() {
+    reset_fake();
+    fixture f;
+    CHECK(fixture_init(f));
+    g_fake.submission_error = kFatalError;
+    g_fake.submission_pending = false;
+
+    CHECK(ggml_backend_sched_has_unproven(f.sched));
+    CHECK(!ggml_backend_sched_alloc_graph(f.sched, f.graph));
+    CHECK(!ggml_backend_sched_reserve(f.sched, f.graph));
+
+    fixture_free(f, true);
+}
+
+// The synchronous wrapper must not turn an unproven submission into
+// completion. It skips the synchronize call and never returns SUCCESS.
+void test_sync_wrapper_no_silent_success() {
+    {
+        reset_fake();
+        fixture f;
+        CHECK(fixture_init(f));
+        g_fake.compute_fail = true;
+        g_fake.compute_pending = true;
+        const int sync_before = g_fake.sync_calls;
+
+        CHECK(ggml_backend_sched_graph_compute(f.sched, f.graph) == GGML_STATUS_FAILED);
+        CHECK(g_fake.compute_calls == 1);
+        // Slot wait + input-copy flush, and no third synchronize from a
+        // wrapper that claims completion.
+        CHECK(g_fake.sync_calls == sync_before + 2);
+        CHECK(ggml_backend_sched_has_unproven(f.sched));
+        fixture_free(f, true);
+    }
+    {
+        reset_fake();
+        fixture f;
+        CHECK(fixture_init(f));
+        // The graph compute itself succeeds but leaves a pending submission.
+        // The async call reports success; the synchronous wrapper must not.
+        g_fake.compute_pending = true;
+        const int sync_before = g_fake.sync_calls;
+
+        CHECK(ggml_backend_sched_graph_compute(f.sched, f.graph) == GGML_STATUS_FAILED);
+        CHECK(g_fake.compute_calls == 1);
+        CHECK(g_fake.sync_calls == sync_before + 2);
+        CHECK(ggml_backend_sched_has_unproven(f.sched));
+        fixture_free(f, true);
+    }
+    {
+        // Retained inputs defer the copy flush until a successful submission.
+        // A failed split that reveals an unknown submission must not drain in
+        // the scope destructor either.
+        reset_fake();
+        fixture f;
+        CHECK(fixture_init(f));
+        g_fake.compute_fail = true;
+        g_fake.compute_pending = true;
+        const int sync_before = g_fake.sync_calls;
+
+        CHECK(ggml_backend_sched_graph_compute_async_retained_inputs(f.sched, f.graph) == GGML_STATUS_FAILED);
+        CHECK(g_fake.compute_calls == 1);
+        // Only the pre-copy slot wait. The failed compute turned the state
+        // unproven, so the scope kept the upload ordered and did not flush.
+        CHECK(g_fake.sync_calls == sync_before + 1);
+        CHECK(ggml_backend_sched_has_unproven(f.sched));
+        fixture_free(f, true);
+    }
+}
+
+// update_split_copies and refresh_split_copy_views mutate live copy metadata.
+// Both must refuse while a destination is unproven; refresh is observable
+// through the dependency view returned by the diagnostic accessor.
+void test_update_and_refresh_pending_gate() {
+    reset_fake();
+    fixture f;
+    CHECK(fixture_init(f, true));
+    CHECK(ggml_backend_sched_graph_compute(f.sched, f.graph) == GGML_STATUS_SUCCESS);
+    CHECK(ggml_backend_sched_tensor_has_split_copy(f.sched, f.a));
+
+    ggml_backend_sched_tensor_layout layout = {};
+    layout.tensor = f.a;
+    std::memcpy(layout.ne, f.a->ne, sizeof(layout.ne));
+    std::memcpy(layout.nb, f.a->nb, sizeof(layout.nb));
+    CHECK(ggml_backend_sched_update_split_copies(f.sched, &layout, 1, false));
+    CHECK(ggml_backend_sched_update_split_copies(f.sched, &layout, 1, true));
+
+    ggml_tensor * dep = ggml_backend_sched_debug_copy_dependency(f.sched, f.a);
+    CHECK(dep != nullptr);
+    if (dep != nullptr) {
+        // The clean path really refreshes: mutate the source width, then check
+        // the dependency view followed it.
+        f.a->ne[0] = 4;
+        ggml_backend_sched_refresh_split_copy_views(f.sched);
+        CHECK(dep->ne[0] == 4);
+        CHECK(dep->data == f.a->data);
+        CHECK(dep->view_src == (f.a->view_src ? f.a->view_src : f.a));
+        f.a->ne[0] = 8;
+        ggml_backend_sched_refresh_split_copy_views(f.sched);
+        CHECK(dep->ne[0] == 8);
+
+        const ggml_tensor dep_before = *dep;
+        g_fake.submission_pending = true;
+        CHECK(ggml_backend_sched_has_unproven(f.sched));
+
+        f.a->ne[0] = 2;
+        CHECK(!ggml_backend_sched_update_split_copies(f.sched, &layout, 1, false));
+        CHECK(!ggml_backend_sched_update_split_copies(f.sched, &layout, 1, true));
+        ggml_backend_sched_refresh_split_copy_views(f.sched);
+        CHECK(dep->ne[0] == 8);
+        CHECK(std::memcmp(dep, &dep_before, sizeof(*dep)) == 0);
+        CHECK(f.a->ne[0] == 2); // the source itself was not touched
+    }
+
+    fixture_free(f, true);
+}
+
+// A MoE cache session may own provider resources that an unproven submission
+// still uses. set_moe_cache must neither destroy nor replace it.
+void test_set_moe_cache_pending_gate() {
+    reset_fake();
+    g_moe_creates = g_moe_destroys = g_moe_enters = g_moe_leaves = 0;
+    fixture f;
+    CHECK(fixture_init(f));
+
+    ggml_backend_sched_set_moe_cache(f.sched, GGML_MOE_CACHE_MODE_ON, 16);
+    CHECK(g_moe_creates == 1 && g_moe_destroys == 0);
+    CHECK(ggml_backend_sched_graph_compute(f.sched, f.graph) == GGML_STATUS_SUCCESS);
+    CHECK(g_moe_enters == 1 && g_moe_leaves == 1);
+
+    // Clean switch-off works: the session is destroyed.
+    ggml_backend_sched_set_moe_cache(f.sched, GGML_MOE_CACHE_MODE_OFF, 0);
+    CHECK(g_moe_destroys == 1);
+    ggml_backend_sched_set_moe_cache(f.sched, GGML_MOE_CACHE_MODE_ON, 16);
+    CHECK(g_moe_creates == 2 && g_moe_destroys == 1);
+
+    g_fake.submission_pending = true;
+    CHECK(ggml_backend_sched_has_unproven(f.sched));
+    ggml_backend_sched_set_moe_cache(f.sched, GGML_MOE_CACHE_MODE_OFF, 0);
+    CHECK(g_moe_destroys == 1);              // refused: no destroy
+    ggml_backend_sched_set_moe_cache(f.sched, GGML_MOE_CACHE_MODE_AUTO, 16);
+    CHECK(g_moe_creates == 2);               // refused: no replacement
+
+    fixture_free(f, true);
+}
+
+// replan_graph replaces the graph arena. It must refuse while unproven and
+// leave every tensor address, layout and plan size untouched. The first
+// replan proves the same call succeeds on a clean scheduler.
+void test_replan_pending_gate() {
+    ggml_init_params gp = { /*.mem_size=*/ 4u << 20, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+    ggml_init_params fp = { /*.mem_size=*/ 4096,     /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ false };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_context * fixed_ctx = ggml_init(fp);
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    CHECK(ctx != nullptr && fixed_ctx != nullptr && cpu != nullptr);
+    if (ctx == nullptr || fixed_ctx == nullptr || cpu == nullptr) {
+        return;
+    }
+
+    ggml_tensor * weights = ggml_new_tensor_2d(fixed_ctx, GGML_TYPE_F32, 8, 1);
+    CHECK(weights != nullptr);
+    if (weights == nullptr || weights->data == nullptr) {
+        return;
+    }
+    for (int i = 0; i < 8; ++i) {
+        static_cast<float *>(weights->data)[i] = float(i);
+    }
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 1);
+    ggml_set_input(input);
+    ggml_tensor * view = ggml_view_2d(ctx, input, 8, 1, input->nb[1], 0);
+    ggml_tensor * output = ggml_add(ctx, view, weights);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 1024, false);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_t backends[] = { cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, 1024, false, false);
+    CHECK(sched != nullptr);
+    if (sched == nullptr) {
+        return;
+    }
+    CHECK(ggml_backend_sched_alloc_graph(sched, graph));
+
+    ggml_tensor * tensors[] = { weights, input, view, output };
+    const uint8_t fixed[] = { 1, 0, 0, 0 };
+    auto make_layouts = [&](int width, ggml_backend_sched_tensor_layout * layouts, size_t * offsets) {
+        ggml_tensor * dynamic[] = { input, view, output };
+        for (int i = 0; i < 3; ++i) {
+            layouts[i] = {};
+            layouts[i].tensor = dynamic[i];
+            std::memcpy(layouts[i].ne, dynamic[i]->ne, sizeof(layouts[i].ne));
+            std::memcpy(layouts[i].nb, dynamic[i]->nb, sizeof(layouts[i].nb));
+            layouts[i].ne[1] = width;
+            layouts[i].nb[2] = layouts[i].nb[1] * size_t(width);
+            layouts[i].nb[3] = layouts[i].nb[2];
+            offsets[i] = dynamic[i]->view_offs;
+        }
+    };
+    ggml_backend_sched_tensor_layout layouts[3];
+    size_t offsets[3];
+    make_layouts(3, layouts, offsets);
+    CHECK(ggml_backend_sched_replan_graph(sched, tensors, fixed, 4, layouts, offsets, 3));
+    size_t plan = 0;
+    CHECK(ggml_backend_sched_get_tensor_plan_size(sched, input, &plan));
+    CHECK(plan == size_t(3) * 8 * sizeof(float));
+
+    std::vector<ggml_tensor> snapshot;
+    for (ggml_tensor * tensor : tensors) {
+        snapshot.push_back(*tensor);
+    }
+    void * fixed_data = weights->data;
+
+    ggml_backend_sched_mark_unproven(sched);
+    CHECK(ggml_backend_sched_has_unproven(sched));
+    make_layouts(2, layouts, offsets);
+    CHECK(!ggml_backend_sched_replan_graph(sched, tensors, fixed, 4, layouts, offsets, 3));
+    for (size_t i = 0; i < snapshot.size(); ++i) {
+        CHECK(std::memcmp(tensors[i], &snapshot[i], sizeof(ggml_tensor)) == 0);
+    }
+    size_t plan_after = 0;
+    CHECK(ggml_backend_sched_get_tensor_plan_size(sched, input, &plan_after));
+    CHECK(plan_after == plan);
+    CHECK(weights->data == fixed_data);
+
+    // The scheduler and its backends are retained for the process: the owner
+    // contract forbids freeing them while unproven.
 }
 
 // The production llama_context destroys its backends before the scheduler
@@ -678,18 +1040,18 @@ void test_pending_entry_points() {
 }
 
 // On the unknown return path the input copy scope must not flush. The async
-// entry point is used because the sync wrapper would synchronize after the
-// failed compute and hide the scope's own flush.
+// entry point isolates that flush from any wrapper-level synchronization.
 void test_fatal_no_flush() {
     reset_fake();
-    g_fake.submission_error = kFatalError;
     fixture f;
     CHECK(fixture_init(f));
+    g_fake.error_on_accept = true;
     const int sync_before = g_fake.sync_calls; // alloc/split may synchronize
+    const int err_before = g_fake.error_calls;
 
     CHECK(ggml_backend_sched_graph_compute_async(f.sched, f.graph) == GGML_STATUS_FAILED);
     CHECK(g_fake.cpy_calls == 1);
-    CHECK(g_fake.error_calls == 1);
+    CHECK(g_fake.error_calls == err_before + 2); // entry gate + accepted copy
     // One sync is the scheduler's pre-copy slot wait. The input_copy_scope
     // must add no second flush on the unknown return; before the fix it did.
     CHECK(g_fake.sync_calls == sync_before + 1);
@@ -703,15 +1065,25 @@ void test_fatal_no_flush() {
 
 int main() {
     init_fake_backend();
+    register_fake_moe_provider();
 
     test_success();
     test_rejected();
+    test_pending_accept_stops_split();
     test_fatal();
+    test_callback_failed_split_pending();
     test_pending_without_failure();
+    test_error_only_gate();
     test_public_copy_async_return();
+    test_sync_wrapper_no_silent_success();
+    test_update_and_refresh_pending_gate();
+    test_set_moe_cache_pending_gate();
+    test_replan_pending_gate();
     test_pending_entry_points();
     test_fatal_no_flush();
     test_backends_first_shutdown();
+
+    ggml_moe_cache_unregister(&g_fake_reg);
 
     if (g_failures != 0) {
         std::fprintf(stderr, "TP5_STAGING_SCHED_TEST FAIL failures=%d\n", g_failures);

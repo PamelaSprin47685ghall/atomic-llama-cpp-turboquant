@@ -167,6 +167,8 @@ GGML_API struct ggml_moe_cache_api ggml_moe_cache_get(const void * owner);
 // executes a graph with a cache session; falls back to the first registered
 // provider for direct CPU users.
 GGML_API struct ggml_moe_cache_api ggml_moe_cache_active(void);
+// While an async submission is unproven, this keeps the current session: it is
+// neither destroyed nor replaced.
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib);
 

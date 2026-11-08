@@ -700,9 +700,12 @@ bool ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
         ggml_backend_moe_cache_invalidate_buffer(
                 dst_buf, dst->data, ggml_nbytes(dst));
         if (backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
-            // Accepted. A nonzero capability answer means the completion is
+            // Accepted. Either capability answer means the completion is
             // unprovable: report failure instead of replaying the destination.
-            return ggml_backend_sched_submission_error(backend_dst) == 0;
+            // A pending destination may also have no native error yet (for
+            // example a staging pool disabled before it recorded one).
+            return ggml_backend_sched_submission_error(backend_dst) == 0 &&
+                   !ggml_backend_sched_submission_pending(backend_dst);
         }
         // Rejected with no side effects: the blocking copy below is safe.
     }
@@ -1836,6 +1839,29 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Fold one backend's optional submission state into the scheduler's cached
+// fail-stop state. True means the submission is unproven: the backend either
+// reported a native error or still reports outstanding work. Pending without
+// an error is a real state (a disabled staging pool can have no recorded
+// native error), so both answers must be consulted.
+static bool ggml_backend_sched_note_submission_state(
+        ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    const int err = ggml_backend_sched_submission_error(backend);
+    if (err != 0) {
+        if (sched->submission_failed == 0) {
+            sched->submission_failed = err;
+        }
+        sched->submission_unproven = true;
+        return true;
+    }
+    if (ggml_backend_sched_submission_pending(backend)) {
+        sched->submission_unproven = true;
+        return true;
+    }
+    return false;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched, bool retained_inputs) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1947,12 +1973,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const bool was_pending = input_copies.pending;
                     input_copies.pending = true;
                     if (split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        const int sub_err = ggml_backend_sched_submission_error(split_backend);
-                        if (sub_err != 0) {
+                        if (ggml_backend_sched_note_submission_state(sched, split_backend)) {
                             // Unknown submission: keep the destination and
                             // stop. Do not flush or replay the copy.
-                            sched->submission_failed = sub_err;
-                            sched->submission_unproven = true;
                             input_copies.retain = true;
                             return GGML_STATUS_FAILED;
                         }
@@ -2063,10 +2086,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const bool copied = split_backend->iface.cpy_tensor_async != nullptr &&
                         split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
                     if (copied) {
-                        const int sub_err = ggml_backend_sched_submission_error(split_backend);
-                        if (sub_err != 0) {
-                            sched->submission_failed = sub_err;
-                            sched->submission_unproven = true;
+                        if (ggml_backend_sched_note_submission_state(sched, split_backend)) {
                             input_copies.retain = true;
                             return GGML_STATUS_FAILED;
                         }
@@ -2098,14 +2118,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
-                const int sub_err = ggml_backend_sched_submission_error(split_backend);
-                if (sub_err != 0 || ggml_backend_sched_submission_pending(split_backend)) {
-                    // A compute failure may be the first observation of a
-                    // staging fault that happened outside the scheduler copy
-                    // path. Turn it into the scheduler's fail-stop state so
-                    // reset/reserve/alloc/release cannot free the owners.
-                    sched->submission_failed = sub_err != 0 ? sub_err : -1;
-                    sched->submission_unproven = true;
+                // A compute failure may be the first observation of a staging
+                // fault that happened outside the scheduler copy path. Query
+                // every backend, not only the failed split: the capability is
+                // process-global for the Meta owner. Turn any answer into the
+                // scheduler's fail-stop state so reset/reserve/alloc/release
+                // cannot free the owners.
+                if (ggml_backend_sched_any_pending(sched)) {
+                    // The compute failure revealed an unknown submission. The
+                    // scope must not flush it on the return path.
+                    input_copies.retain = true;
                 }
                 return ec;
             }
@@ -2129,6 +2151,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    if (ggml_backend_sched_any_pending(sched)) {
+                        input_copies.retain = true;
+                    }
                     return ec;
                 }
 
@@ -2255,6 +2280,12 @@ void ggml_backend_sched_set_moe_cache(
     if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED) {
         return;
     }
+    if (ggml_backend_sched_any_pending(sched)) {
+        // Destroying or replacing the session would free provider resources
+        // that an unproven submission may still use. Keep the current session.
+        GGML_LOG_ERROR("%s: refusing to change the MoE cache session: an async submission is still unproven\n", __func__);
+        return;
+    }
 
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
         sched->moe_cache_api.session_destroy(sched->moe_cache_session);
@@ -2306,6 +2337,14 @@ static bool ggml_backend_sched_any_pending(ggml_backend_sched_t sched) {
         return true;
     }
     for (int b = 0; b < sched->n_backends; ++b) {
+        const int err = ggml_backend_sched_submission_error(sched->backends[b]);
+        if (err != 0) {
+            if (sched->submission_failed == 0) {
+                sched->submission_failed = err;
+            }
+            sched->submission_unproven = true;
+            return true;
+        }
         if (ggml_backend_sched_submission_pending(sched->backends[b])) {
             sched->submission_unproven = true;
             return true;
@@ -2713,7 +2752,8 @@ bool ggml_backend_sched_replan_graph(ggml_backend_sched_t sched,
         const ggml_backend_sched_tensor_layout * layouts, const size_t * view_offsets, size_t n_layouts) {
     // Re-splitting a graph can free scheduler copies still referenced by its
     // nodes. Only replan an already-placed host graph without such copies.
-    if (!sched || !sched->is_alloc || !tensors || !fixed || count == 0 ||
+    if (!sched || ggml_backend_sched_any_pending(sched) ||
+            !sched->is_alloc || !tensors || !fixed || count == 0 ||
             (n_layouts != 0 && (!layouts || !view_offsets)) || sched->n_backends != 1 ||
             sched->n_splits != 1 || sched->n_copies != 1 ||
             sched->splits[0].n_inputs != 0 || !ggml_backend_buft_is_host(sched->bufts[0])) return false;
@@ -2915,9 +2955,25 @@ bool ggml_backend_sched_is_tensor_copy(ggml_backend_sched_t sched, const ggml_te
     return false;
 }
 
+struct ggml_tensor * ggml_backend_sched_debug_copy_dependency(
+        ggml_backend_sched_t sched, const ggml_tensor * source) {
+    if (!sched || !source || !sched->is_alloc || !sched->copy_tracking ||
+            !sched->copy_envelopes_valid) {
+        return nullptr;
+    }
+    for (size_t i = ggml_sched_copy_lower_bound(sched, source);
+            i < sched->n_copy_records && sched->copy_records[i].source == source; ++i) {
+        if (sched->copy_records[i].copy_id == sched->cur_copy) {
+            return sched->copy_records[i].dependency;
+        }
+    }
+    return nullptr;
+}
+
 bool ggml_backend_sched_update_split_copies(ggml_backend_sched_t sched,
         const ggml_backend_sched_tensor_layout * layouts, size_t n_layouts, bool apply) {
-    if (!sched || !sched->is_alloc || !sched->copy_tracking || !sched->copy_envelopes_valid ||
+    if (!sched || ggml_backend_sched_any_pending(sched) ||
+            !sched->is_alloc || !sched->copy_tracking || !sched->copy_envelopes_valid ||
             (n_layouts && !layouts)) {
         return false;
     }
@@ -2986,6 +3042,13 @@ void ggml_backend_sched_refresh_split_copy_views(ggml_backend_sched_t sched) {
     if (!sched || !sched->is_alloc || !sched->copy_tracking || !sched->copy_envelopes_valid) {
         return;
     }
+    if (ggml_backend_sched_any_pending(sched)) {
+        // The dependency views may describe a destination an unproven copy is
+        // still writing. Refreshing them would publish metadata for work that
+        // has not completed.
+        GGML_LOG_ERROR("%s: refusing to refresh split copy views: an async submission is still unproven\n", __func__);
+        return;
+    }
     for (size_t i = 0; i < sched->n_copy_records; ++i) {
         const ggml_sched_copy_record & record = sched->copy_records[i];
         if (!record.dependency || record.copy_id != sched->cur_copy) {
@@ -3004,6 +3067,12 @@ void ggml_backend_sched_refresh_split_copy_views(ggml_backend_sched_t sched) {
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     enum ggml_status err = ggml_backend_sched_graph_compute_async(sched, graph);
+    if (ggml_backend_sched_any_pending(sched)) {
+        // Do not synchronize an unproven submission: a drain is not claimed.
+        // A successful async result is not proof when a backend reports
+        // outstanding work, so never return SUCCESS here.
+        return err == GGML_STATUS_SUCCESS ? GGML_STATUS_FAILED : err;
+    }
     ggml_backend_sched_synchronize(sched);
     return err;
 }

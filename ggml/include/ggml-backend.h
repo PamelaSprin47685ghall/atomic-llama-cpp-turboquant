@@ -119,9 +119,10 @@ extern "C" {
     // completion (an unknown submission). The destination must not be replayed
     // and the caller must keep the source, destination and both backends alive
     // until the process/context owner resolves it; do not free or overwrite the
-    // destination. The optional registry capability
-    // "ggml_backend_submission_pending" reports whether such work is still
-    // outstanding.
+    // destination. Either optional registry capability
+    // "ggml_backend_submission_error" (a recorded native error) or
+    // "ggml_backend_submission_pending" (outstanding work) makes the return
+    // false, including pending work with no recorded error yet.
     GGML_API bool ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
     GGML_API ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend);
@@ -325,15 +326,21 @@ extern "C" {
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
-    // Query the optional backend submission state while the scheduler's
-    // backends are still alive. Returns true when an asynchronous submission
-    // is unproven; the scheduler keeps its copy slots and refuses reset,
-    // reserve, alloc, release_buffers and compute. The owner must call this
-    // before destroying the backends. ggml_backend_sched_free uses only the
-    // cached answer and never dereferences the backends.
+    // Query every backend's optional submission error/pending while the
+    // scheduler's backends are still alive. Returns true when an asynchronous
+    // submission is unproven. The scheduler keeps its copy slots and refuses
+    // reset, reserve, alloc, release_buffers, compute, replan_graph,
+    // update_split_copies, refresh_split_copy_views and set_moe_cache. The
+    // owner must call this before destroying the backends.
+    // ggml_backend_sched_free uses only the cached answer and never
+    // dereferences the backends.
     GGML_API bool                 ggml_backend_sched_has_unproven(ggml_backend_sched_t sched);
     // Test/diagnostic only: force the cached unproven state.
     GGML_API void                 ggml_backend_sched_mark_unproven(ggml_backend_sched_t sched);
+    // Test/diagnostic only: the active-slot dependency view attached to the
+    // split copy of source, or NULL. The scheduler owns the pointer.
+    GGML_API struct ggml_tensor * ggml_backend_sched_debug_copy_dependency(
+            ggml_backend_sched_t sched, const struct ggml_tensor * source);
 
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
@@ -359,6 +366,7 @@ extern "C" {
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
+    // On an unproven submission this returns FAILED and does not synchronize.
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
@@ -396,9 +404,11 @@ extern "C" {
     // With apply=true, update copies only after all layouts pass. This does not
     // update source tensors. Synchronize and exclude concurrent scheduler use;
     // after updating source layouts and view pointers, refresh copy views.
+    // Returns false while an async submission is unproven.
     GGML_API bool ggml_backend_sched_update_split_copies(
             ggml_backend_sched_t sched, const struct ggml_backend_sched_tensor_layout * layouts,
             size_t n_layouts, bool apply);
+    // Refuses (and mutates nothing) while an async submission is unproven.
     GGML_API void ggml_backend_sched_refresh_split_copy_views(ggml_backend_sched_t sched);
 
     // Replan one live host-only split. Record the complete tensor list and
@@ -407,7 +417,8 @@ extern "C" {
     // Serialize scheduler access and do not change tensor metadata before
     // this call. On false, layouts, addresses, allocator and cache remain
     // unchanged. On success, graph-owned inputs must be set again before
-    // compute. Non-input arena constants and split copies are refused.
+    // compute. Non-input arena constants, split copies and an unproven
+    // submission are refused.
     GGML_API bool ggml_backend_sched_replan_graph(ggml_backend_sched_t sched,
             struct ggml_tensor * const * tensors, const uint8_t * fixed, size_t count,
             const struct ggml_backend_sched_tensor_layout * layouts, const size_t * view_offsets, size_t n_layouts);

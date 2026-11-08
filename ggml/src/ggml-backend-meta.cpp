@@ -347,6 +347,7 @@ static const bool ggml_backend_meta_compose_event_gate = [] {
 // capability so no backend iface layout changes.
 static int  ggml_backend_meta_submission_error(ggml_backend_t backend);
 static bool ggml_backend_meta_submission_pending(ggml_backend_t backend);
+static bool ggml_backend_meta_submission_failed(ggml_backend_t backend);
 
 static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .get_name             = */ ggml_backend_meta_device_get_name,
@@ -2348,7 +2349,7 @@ static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
 static void ggml_backend_meta_free(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
-    if (ggml_backend_meta_submission_pending(backend)) {
+    if (ggml_backend_meta_submission_failed(backend)) {
         // An accepted but unprovable async copy may still write into a child
         // buffer. Retain the whole Meta owner (context, child backends,
         // buffers) instead of freeing behind it. The process owns it until
@@ -2644,9 +2645,17 @@ static bool ggml_backend_meta_submission_pending(ggml_backend_t backend) {
     return st->submission_pending != nullptr ? st->submission_pending() : false;
 }
 
+// Both capability answers mean the submission is unproven. Pending without a
+// recorded native error is reachable (a pool that fails before recording one),
+// so an error-only check is not sufficient.
+static bool ggml_backend_meta_submission_failed(ggml_backend_t backend) {
+    return ggml_backend_meta_submission_error(backend) != 0 ||
+           ggml_backend_meta_submission_pending(backend);
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     const int64_t diag_start = ggml_time_us();
-    if (ggml_backend_meta_submission_error(backend) != 0) {
+    if (ggml_backend_meta_submission_failed(backend)) {
         return GGML_STATUS_FAILED;
     }
     GGML_ASSERT(cgraph->grads == nullptr);
@@ -4567,7 +4576,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // The destination is a child backend whose CUDA reg does not expose
             // the staging capability. Query the Meta backend itself; the child
             // helper's bool only covers other child capabilities.
-            if (ggml_backend_meta_submission_error(backend) != 0) {
+            if (ggml_backend_meta_submission_failed(backend)) {
                 return GGML_STATUS_FAILED;
             }
             assert(step_cgraphs[j_dst] == nullptr);
@@ -4658,7 +4667,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         // If n_backends is not a power of 2, copy back the reduced tensors to the excess:
         for (size_t j = 2*offset_j_max; j < n_backends; j++) {
-            if (ggml_backend_meta_submission_error(backend) != 0) {
+            if (ggml_backend_meta_submission_failed(backend)) {
                 return GGML_STATUS_FAILED;
             }
             auto & bcj_src = backend_ctx->backend_configs[j - 2*offset_j_max];
