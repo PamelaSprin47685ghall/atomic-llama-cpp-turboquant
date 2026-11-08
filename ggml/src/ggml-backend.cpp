@@ -1001,6 +1001,10 @@ struct ggml_backend_sched {
     // Nonzero after an asynchronous submission whose completion is unprovable.
     // The destination copy slots stay owned and no further graph is submitted.
     int submission_failed = 0;
+    // Cached result of a submission_pending query. Set while the backends are
+    // alive, so ggml_backend_sched_free never has to dereference them (the
+    // caller may destroy the backends before the scheduler).
+    bool submission_unproven = false;
 
     int n_backends;
 
@@ -1063,6 +1067,8 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 };
+
+static bool ggml_backend_sched_any_pending(ggml_backend_sched_t sched);
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
@@ -1869,9 +1875,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct input_copy_scope {
         ggml_backend_t backend;
         bool pending;
+        // Set when the submission is unprovable. The destructor must then
+        // skip the flush: synchronizing would contradict the no-drain
+        // contract and could make the caller reuse the source.
+        bool retain;
 
         void flush() {
-            if (pending) {
+            if (pending && !retain) {
                 ggml_backend_synchronize(backend);
                 pending = false;
             }
@@ -1888,7 +1898,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
         const int64_t d0=ggml_time_us();
-        input_copy_scope input_copies = { split_backend, false };
+        input_copy_scope input_copies = { split_backend, false, false };
         bool batch_inputs = split->n_inputs > 0 && split_backend->iface.cpy_tensor_async != nullptr;
         bool has_user_input = false;
         for (int input_id = 0; batch_inputs && input_id < split->n_inputs; input_id++) {
@@ -1942,6 +1952,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // Unknown submission: keep the destination and
                             // stop. Do not flush or replay the copy.
                             sched->submission_failed = sub_err;
+                            sched->submission_unproven = true;
+                            input_copies.retain = true;
                             return GGML_STATUS_FAILED;
                         }
                         continue;
@@ -2054,6 +2066,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const int sub_err = ggml_backend_sched_submission_error(split_backend);
                         if (sub_err != 0) {
                             sched->submission_failed = sub_err;
+                            sched->submission_unproven = true;
+                            input_copies.retain = true;
                             return GGML_STATUS_FAILED;
                         }
                     }
@@ -2084,6 +2098,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                const int sub_err = ggml_backend_sched_submission_error(split_backend);
+                if (sub_err != 0 || ggml_backend_sched_submission_pending(split_backend)) {
+                    // A compute failure may be the first observation of a
+                    // staging fault that happened outside the scheduler copy
+                    // path. Turn it into the scheduler's fail-stop state so
+                    // reset/reserve/alloc/release cannot free the owners.
+                    sched->submission_failed = sub_err != 0 ? sub_err : -1;
+                    sched->submission_unproven = true;
+                }
                 return ec;
             }
         } else {
@@ -2271,22 +2294,44 @@ void ggml_backend_sched_set_moe_cache(
     }
 }
 
+static bool ggml_backend_sched_any_pending(ggml_backend_sched_t sched) {
+    if (sched == nullptr) {
+        return false;
+    }
+    if (sched->submission_failed != 0) {
+        sched->submission_unproven = true;
+        return true;
+    }
+    if (sched->submission_unproven) {
+        return true;
+    }
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (ggml_backend_sched_submission_pending(sched->backends[b])) {
+            sched->submission_unproven = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ggml_backend_sched_has_unproven(ggml_backend_sched_t sched) {
+    return ggml_backend_sched_any_pending(sched);
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
-    // Check every backend regardless of whether this scheduler observed the
-    // fault itself. A pending submission may come from the Meta reduce path or
-    // from a process-global staging fault; freeing the copy slots behind it
-    // would let a native copy write into freed storage.
-    for (int b = 0; b < sched->n_backends; b++) {
-        if (ggml_backend_sched_submission_pending(sched->backends[b])) {
-            // Keep the copy slots and their buffers: an in-flight copy may
-            // still read them. The process owns them until exit; this is not
-            // a claim that the submission drained.
-            GGML_LOG_ERROR("%s: retaining copy slots, an async submission is still unproven\n", __func__);
-            return;
-        }
+    // Use the cached state only. The owner must call
+    // ggml_backend_sched_has_unproven() while its backends are alive; a caller
+    // may destroy the backends before the scheduler, and dereferencing them
+    // here would be a use-after-free on every normal shutdown.
+    if (sched->submission_failed != 0 || sched->submission_unproven) {
+        // Keep the copy slots and their buffers: an in-flight copy may still
+        // read them. The process owns them until exit; this is not a claim
+        // that the submission drained.
+        GGML_LOG_ERROR("%s: retaining copy slots, an async submission is still unproven\n", __func__);
+        return;
     }
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
         sched->moe_cache_api.session_destroy(sched->moe_cache_session);
@@ -2320,7 +2365,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
-    if (sched->submission_failed) {
+    if (ggml_backend_sched_any_pending(sched)) {
         // Keep every copy slot and its destination: an unknown submission may
         // still read them.
         return;
@@ -2339,6 +2384,12 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_release_buffers(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    if (ggml_backend_sched_any_pending(sched)) {
+        // The gallocr owns the copy-slot destinations. Releasing it here would
+        // free them behind an in-flight native copy.
+        GGML_LOG_ERROR("%s: refusing to release buffers, an async submission is still unproven\n", __func__);
+        return;
+    }
     ggml_backend_sched_synchronize(sched);
 
     // Keep the scheduler and its provider session; only the allocator owns
@@ -2362,6 +2413,9 @@ void ggml_backend_sched_release_buffers(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
+    if (ggml_backend_sched_any_pending(sched)) {
+        return;
+    }
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     GGML_ASSERT(sizes);
 
@@ -2376,6 +2430,9 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
 void ggml_backend_sched_reserve_size_preserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
+    if (ggml_backend_sched_any_pending(sched)) {
+        return;
+    }
     GGML_ASSERT(!ggml_gallocr_is_failed(sched->galloc));
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     GGML_ASSERT(sizes);
@@ -2394,7 +2451,7 @@ void ggml_backend_sched_reserve_size_preserve(ggml_backend_sched_t sched, struct
 // guarantee that later placements fit without reallocation.
 bool ggml_backend_sched_reserve_min(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, const size_t * min_sizes) {
     GGML_ASSERT(sched);
-    if (sched->submission_failed) {
+    if (ggml_backend_sched_any_pending(sched)) {
         return false;
     }
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
@@ -2412,7 +2469,7 @@ bool ggml_backend_sched_reserve_min(ggml_backend_sched_t sched, struct ggml_cgra
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
-    if (sched->submission_failed) {
+    if (ggml_backend_sched_any_pending(sched)) {
         return false;
     }
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
@@ -2616,6 +2673,9 @@ bool ggml_backend_sched_set_split_copy_tracking(ggml_backend_sched_t sched, bool
 
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    if (ggml_backend_sched_any_pending(sched)) {
+        return false;
+    }
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
@@ -2945,7 +3005,7 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 static enum ggml_status ggml_backend_sched_graph_compute_async_impl(
         ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool retained_inputs) {
     GGML_ASSERT(sched);
-    if (sched->submission_failed) {
+    if (ggml_backend_sched_any_pending(sched)) {
         return GGML_STATUS_FAILED;
     }
     if (!sched->is_reset && !sched->is_alloc) {

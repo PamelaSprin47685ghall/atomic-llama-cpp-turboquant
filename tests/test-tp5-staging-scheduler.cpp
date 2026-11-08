@@ -89,6 +89,9 @@ struct fake_state {
 
     const ggml_tensor * last_src = nullptr;
     ggml_tensor *       last_dst = nullptr;
+
+    bool backend_freed = false;
+    int  pending_after_free = 0; // submission_pending called after iface.free
 };
 
 fake_state g_fake;
@@ -98,7 +101,7 @@ ggml_backend_buffer_type g_fake_buft;
 // Fake backend (stream) interface.
 const char * fake_get_name(ggml_backend_t) { return "fake-staging"; }
 
-void fake_free(ggml_backend_t) {}
+void fake_free(ggml_backend_t) { g_fake.backend_freed = true; }
 
 void fake_synchronize(ggml_backend_t) { ++g_fake.sync_calls; }
 
@@ -134,6 +137,10 @@ int fake_submission_error(ggml_backend_t) {
 
 bool fake_submission_pending(ggml_backend_t) {
     ++g_fake.pending_calls;
+    if (g_fake.backend_freed) {
+        // The scheduler must never query a backend the owner already freed.
+        ++g_fake.pending_after_free;
+    }
     return g_fake.submission_pending;
 }
 
@@ -469,7 +476,6 @@ void test_rejected() {
 void test_fatal() {
     reset_fake();
     g_fake.submission_error = kFatalError;
-    g_fake.submission_pending = true;
     fixture f;
     CHECK(fixture_init(f));
 
@@ -511,9 +517,9 @@ void test_fatal() {
     // iface-field version has no pending hook, so it may free them; do not
     // read the destination after free in that variant.
     const bool retains_on_free = !iface_has_submission_error;
+    g_fake.submission_pending = true; // observation after the fault, not before alloc
     fixture_free(f, retains_on_free);
     if (retains_on_free) {
-        CHECK(g_fake.pending_calls >= 1);
         if (g_fake.last_dst && g_fake.last_dst->data) {
             CHECK(std::memcmp(g_fake.last_dst->data, sentinel.data(), sentinel.size()) == 0);
         }
@@ -529,7 +535,6 @@ void test_pending_without_failure() {
         return;
     }
     reset_fake();
-    g_fake.submission_pending = true;
     g_fake.submission_error  = 0;
     fixture f;
     CHECK(fixture_init(f));
@@ -537,6 +542,8 @@ void test_pending_without_failure() {
     CHECK(ggml_backend_sched_graph_compute(f.sched, f.graph) == GGML_STATUS_SUCCESS);
     CHECK(g_fake.error_calls == 2);
     CHECK(g_fake.last_dst != nullptr);
+    g_fake.submission_pending = true; // generic pending observed after a clean compute
+    CHECK(ggml_backend_sched_has_unproven(f.sched));
 
     std::vector<unsigned char> copied;
     if (g_fake.last_dst && g_fake.last_dst->data) {
@@ -544,9 +551,9 @@ void test_pending_without_failure() {
         copied.assign(p, p + 8 * sizeof(float));
     }
 
-    const int pending_before = g_fake.pending_calls;
-    fixture_free(f, true); // sched_free must retain: pending with submission_failed == 0
-    CHECK(g_fake.pending_calls > pending_before);
+    // has_unproven() cached the pending state; sched_free must retain using
+    // that cache without querying the backends again.
+    fixture_free(f, true);
     if (g_fake.last_dst && g_fake.last_dst->data && !copied.empty()) {
         CHECK(std::memcmp(g_fake.last_dst->data, copied.data(), copied.size()) == 0);
     }
@@ -603,6 +610,95 @@ void test_public_copy_async_return() {
     ggml_free(ctx);
 }
 
+// The production llama_context destroys its backends before the scheduler
+// (members destroy in reverse declaration order). The scheduler free must not
+// query them then: it uses its cached unproven state only. This test frees the
+// backends first and asserts the capability hook was not called afterwards.
+void test_backends_first_shutdown() {
+    reset_fake();
+    fixture f;
+    CHECK(fixture_init(f));
+    CHECK(ggml_backend_sched_graph_compute(f.sched, f.graph) == GGML_STATUS_SUCCESS);
+    CHECK(g_fake.pending_after_free == 0);
+
+    // Production order: backends are destroyed before the scheduler.
+    ggml_backend_free(f.cpu);
+    f.cpu = nullptr;
+    ggml_backend_free(&g_fake_backend); // fake iface.free sets backend_freed
+    ggml_backend_sched_free(f.sched);
+    f.sched = nullptr;
+
+    CHECK(g_fake.pending_after_free == 0);
+
+    ggml_backend_buffer_free(f.input_buf);
+    ggml_free(f.ctx);
+}
+
+// Pending state must stop every entry that can reuse or free the copy slots:
+// alloc_graph, reserve, reserve_size, release_buffers, reset and compute.
+void test_pending_entry_points() {
+    if (iface_has_submission_error) {
+        return; // the older iface-field scheduler predates these gates
+    }
+    reset_fake();
+    g_fake.submission_error = 0;
+    fixture f;
+    CHECK(fixture_init(f));
+    CHECK(ggml_backend_sched_graph_compute(f.sched, f.graph) == GGML_STATUS_SUCCESS);
+    g_fake.submission_pending = true;
+    CHECK(ggml_backend_sched_has_unproven(f.sched));
+
+    std::vector<unsigned char> copy_bytes;
+    if (g_fake.last_dst && g_fake.last_dst->data) {
+        const unsigned char * p = static_cast<const unsigned char *>(g_fake.last_dst->data);
+        copy_bytes.assign(p, p + 8 * sizeof(float));
+    }
+
+    CHECK(!ggml_backend_sched_alloc_graph(f.sched, f.graph));
+    CHECK(!ggml_backend_sched_reserve(f.sched, f.graph));
+    size_t sizes[2] = { 0, 0 };
+    ggml_backend_sched_reserve_size(f.sched, f.graph, sizes); // refused, no mutation
+
+    // release_buffers must not free the gallocr that owns the copy slots.
+    ggml_backend_sched_release_buffers(f.sched);
+    if (g_fake.last_dst && g_fake.last_dst->data && !copy_bytes.empty()) {
+        CHECK(std::memcmp(g_fake.last_dst->data, copy_bytes.data(), copy_bytes.size()) == 0);
+    }
+
+    ggml_backend_sched_reset(f.sched);
+    CHECK(ggml_backend_sched_graph_compute_async(f.sched, f.graph) == GGML_STATUS_FAILED);
+    CHECK(g_fake.cpy_calls == 2);
+
+    // Free retains on the cached unproven state; do not read the scheduler
+    // after this call.
+    fixture_free(f, true);
+    if (g_fake.last_dst && g_fake.last_dst->data && !copy_bytes.empty()) {
+        CHECK(std::memcmp(g_fake.last_dst->data, copy_bytes.data(), copy_bytes.size()) == 0);
+    }
+}
+
+// On the unknown return path the input copy scope must not flush. The async
+// entry point is used because the sync wrapper would synchronize after the
+// failed compute and hide the scope's own flush.
+void test_fatal_no_flush() {
+    reset_fake();
+    g_fake.submission_error = kFatalError;
+    fixture f;
+    CHECK(fixture_init(f));
+    const int sync_before = g_fake.sync_calls; // alloc/split may synchronize
+
+    CHECK(ggml_backend_sched_graph_compute_async(f.sched, f.graph) == GGML_STATUS_FAILED);
+    CHECK(g_fake.cpy_calls == 1);
+    CHECK(g_fake.error_calls == 1);
+    // One sync is the scheduler's pre-copy slot wait. The input_copy_scope
+    // must add no second flush on the unknown return; before the fix it did.
+    CHECK(g_fake.sync_calls == sync_before + 1);
+    CHECK(g_fake.compute_calls == 0);
+    CHECK(ggml_backend_sched_has_unproven(f.sched));
+
+    fixture_free(f, true);
+}
+
 } // namespace
 
 int main() {
@@ -613,6 +709,9 @@ int main() {
     test_fatal();
     test_pending_without_failure();
     test_public_copy_async_return();
+    test_pending_entry_points();
+    test_fatal_no_flush();
+    test_backends_first_shutdown();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "TP5_STAGING_SCHED_TEST FAIL failures=%d\n", g_failures);

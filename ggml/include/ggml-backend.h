@@ -325,6 +325,13 @@ extern "C" {
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
+    // Query the optional backend submission state while the scheduler's
+    // backends are still alive. Returns true when an asynchronous submission
+    // is unproven; the scheduler keeps its copy slots and refuses reset,
+    // reserve, alloc, release_buffers and compute. The owner must call this
+    // before destroying the backends. ggml_backend_sched_free uses only the
+    // cached answer and never dereferences the backends.
+    GGML_API bool                 ggml_backend_sched_has_unproven(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);

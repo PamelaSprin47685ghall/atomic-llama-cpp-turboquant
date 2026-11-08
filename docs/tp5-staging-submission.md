@@ -34,19 +34,25 @@ process exit. Other backends report `0`/`false`.
     backends must stay alive until the process/context owner resolves it.
 - The scheduler queries `submission_error` after an accepted
   `cpy_tensor_async`. A nonzero answer stops the split, keeps the input copy
-  slots, and returns `GGML_STATUS_FAILED`. Later computes fail without
-  submitting; `ggml_backend_sched_reset` and `reserve` are refused while the
-  fault is pending.
-- `ggml_backend_sched_free` checks `submission_pending` on **every** backend,
-  regardless of whether that scheduler observed the fault itself. If any is
-  pending, the copy slots and their buffers are retained. The process owns them
-  until exit.
-- The Meta allreduce/reduce path checks the return value of every
-  `ggml_backend_tensor_copy_async` call. A false result stops before building or
-  launching the reduce node that would consume an unproven destination; the
-  Meta `graph_compute` returns `GGML_STATUS_FAILED`. There is no `(void)`
-  caller left.
-- staging faults do not abort: sync paths stop in place and the async path
+  slots, and returns `GGML_STATUS_FAILED`. It also queries a failed split
+  compute for the same state, so a fault first observed on the backend side
+  still becomes the scheduler's fail-stop state.
+- `ggml_backend_sched_has_unproven(sched)` queries every backend while they
+  are alive and caches the answer in the scheduler. `reset`,
+  `reserve_size`, `reserve_size_preserve`, `reserve`, `alloc_graph`,
+  `release_buffers` and `graph_compute` all refuse while that state is set.
+- `ggml_backend_sched_free` uses the **cached** state only. It never
+  dereferences the backends: the caller may destroy them before the scheduler
+  (llama_context does), and a probe there would be a use-after-free on a
+  normal shutdown.
+- The Meta allreduce/reduce path checks both the generic helper result and the
+  **Meta backend's own** `submission_error` before each child copy and before
+  the copy-back. The child CUDA registry does not expose the staging
+  capability, so the helper bool alone is not sufficient there.
+- The scheduler's input-copy scope does not flush on the unknown return path.
+  The pre-copy slot wait is separate; no additional drain is performed after
+  the fault.
+- Staging faults do not abort: sync paths stop in place and the async path
   returns to the scheduler. The pool quarantines the pinned slot, records the
   unknown destinations (`TP5_STAGING_UNKNOWN` in the diagnostic dump), and
   keeps the first native error.
@@ -54,12 +60,17 @@ process exit. Other backends report `0`/`false`.
 ## Ownership and lifetime
 
 - **Scheduler input copies**: the scheduler owns the copy tensors and retains
-  them while any backend reports pending. The caller must not free the
-  scheduler, its backends or the destination graph/context while pending.
+  them while the cached state is unproven. The caller must not free the
+  scheduler or its backends while pending.
+- **llama_context**: the destructor queries `ggml_backend_sched_has_unproven`
+  before any synchronize or free. On a pending state it retains the scheduler,
+  the backends, prefab, graph results, output buffer, union-binder state and
+  the per-sequence buffers by releasing/moving them to process-owned storage;
+  it returns without freeing behind the native copy. On a clean state it frees
+  the scheduler **before** the backend members are destroyed, matching the
+  actual reverse member order.
 - **Meta owner**: `ggml_backend_meta_free` retains the whole Meta owner
-  (context, child backends, buffers) while `submission_pending` is true instead
-  of freeing behind an unknown child-buffer destination. This is retention, not
-  a drain.
+  (context, child backends, buffers) while `submission_pending` is true.
 - **Public helper callers**: `ggml_backend_tensor_copy_async` does not retain
   anything. On `false` the caller is the owner of the source, destination and
   both backends until process exit; there is no public release operation for an
@@ -75,24 +86,46 @@ process exit. Other backends report `0`/`false`.
   an already queued native copy complete.
 - The capability scope is global, not per backend/context. A fault in one Meta
   context makes every Meta backend report pending/error; a clean context's
-  `ggml_backend_sched_free` therefore retains its copy slots too. This is a
-  fail-stop policy, not per-context isolation.
-- Freeing a backend/context behind an unknown submission is a contract
-  violation, not something the API can prevent for a caller that ignores the
-  pending capability.
+  scheduler and llama_context therefore retain too. This is a fail-stop policy,
+  not per-context isolation.
+- A caller that ignores `ggml_backend_sched_has_unproven` and frees the
+  scheduler's backends first is a contract violation; the cached free path
+  avoids dereferencing them, but it cannot protect a destination the caller
+  itself freed.
+- Meta owners retained on pending leak intentionally; the process owns them.
 
 ## Tests
 
 ```
-# staging pool (standalone)
-g++ -std=c++17 -O2 -pthread -I ggml/include -I ggml/src \
-    tests/test-tp5-staging-pool.cpp -o /tmp/test-tp5-staging-pool
-/tmp/test-tp5-staging-pool
-
-# scheduler boundary (ctest)
+# scheduler boundary (ctest, CPU)
 cmake -S . -B build-ws4-sched-ctest -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=OFF \
       -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
       -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF
 cmake --build build-ws4-sched-ctest -j --target test-tp5-staging-scheduler
 ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-scheduler --output-on-failure
+
+# ASAN variant: catches the backends-before-scheduler UAF and the
+# release_buffers-while-pending free.
+cmake -S . -B build-ws4-sched-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGGML_HIP=OFF \
+      -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF \
+      -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+      -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address"
+cmake --build build-ws4-sched-asan -j --target test-tp5-staging-scheduler
+ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-ws4-sched-asan \
+      -R test-tp5-staging-scheduler --output-on-failure
+
+# staging pool (standalone)
+g++ -std=c++17 -O2 -pthread -I ggml/include -I ggml/src \
+    tests/test-tp5-staging-pool.cpp -o /tmp/test-tp5-staging-pool
+/tmp/test-tp5-staging-pool
 ```
+
+The scheduler test covers: success, rejected, fatal (no replay), a pending
+state without a local failure, the public helper true/false contract, the
+pending entry gates (`alloc_graph`, `reserve`, `reserve_size`,
+`release_buffers`, `reset`, `compute`), no input-scope flush on the unknown
+path, and the production backends-before-scheduler destruction order (the fake
+records any capability probe after `iface.free`).

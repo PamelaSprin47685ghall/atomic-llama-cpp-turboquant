@@ -1266,6 +1266,27 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 }
 
 llama_context::~llama_context() {
+    // If an async submission is unproven, do not synchronize, free or reuse
+    // any owner that may be referenced by the copy. Retain the scheduler, its
+    // backends and the context-owned buffers/graphs; the process owns them
+    // until exit. This is retention, not a native drain.
+    if (sched && ggml_backend_sched_has_unproven(sched.get())) {
+        LLAMA_LOG_ERROR("%s: retaining scheduler/backends: an async submission is still unproven\n", __func__);
+        sched.release();
+        for (auto & backend : backends) {
+            backend.release();
+        }
+        prefab.release();
+        gf_res_prev.release();
+        gf_res_reserve.release();
+        buf_output.release();
+        union_binder_state.release();
+        // mem_storage is a map member, not a pointer. Move it to a leaked
+        // owner so the per-sequence buffers outlive this context.
+        new std::map<llama_seq_id, llama_memory_buffers>(std::move(mem_storage));
+        return;
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1321,6 +1342,11 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // Members destroy in reverse declaration order, so the backends would be
+    // freed before the scheduler. Free the scheduler first, while the backends
+    // are still alive; sched_free never dereferences them afterwards.
+    sched.reset();
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -2108,6 +2134,10 @@ bool llama_context::release_compute() {
     // graphs also have a separate lifetime. Reject both before any mutation.
     if (!sched || model.hparams.no_alloc || opt_ctx != nullptr ||
             kv_stream_phase_arena.arena != nullptr || kv_stream_phase_arena.configured) {
+        return false;
+    }
+    if (ggml_backend_sched_has_unproven(sched.get())) {
+        LLAMA_LOG_ERROR("%s: refusing to release compute buffers: an async submission is still unproven\n", __func__);
         return false;
     }
 

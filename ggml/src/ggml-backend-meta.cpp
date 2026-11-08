@@ -4564,6 +4564,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 
         auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) -> ggml_status {
+            // The destination is a child backend whose CUDA reg does not expose
+            // the staging capability. Query the Meta backend itself; the child
+            // helper's bool only covers other child capabilities.
+            if (ggml_backend_meta_submission_error(backend) != 0) {
+                return GGML_STATUS_FAILED;
+            }
             assert(step_cgraphs[j_dst] == nullptr);
             auto & bcj_src = backend_ctx->backend_configs[j_src];
             auto & bcj_dst = backend_ctx->backend_configs[j_dst];
@@ -4652,6 +4658,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         // If n_backends is not a power of 2, copy back the reduced tensors to the excess:
         for (size_t j = 2*offset_j_max; j < n_backends; j++) {
+            if (ggml_backend_meta_submission_error(backend) != 0) {
+                return GGML_STATUS_FAILED;
+            }
             auto & bcj_src = backend_ctx->backend_configs[j - 2*offset_j_max];
             auto & bcj_dst = backend_ctx->backend_configs[j];
 
