@@ -160,11 +160,13 @@ from an older backend is accepted, and a partial submission that cannot call
   scheduler (plus the recorded in-flight slot list); a slot-only fault retains
   the whole context too. A duplicate `llama_free` on a retained context is
   ignored and does not increment the count again.
-  `llama_context::~llama_context()` refuses a direct delete of a pending
-  context (aborts) because a direct delete cannot keep the external model and
-  context-owned buffers alive. On a clean state the destructor frees the
-  scheduler **before** the backend members are destroyed, matching the actual
-  reverse member order.
+  `llama_context::~llama_context()` refuses a direct delete of a
+  scheduler-unproven context (aborts) because a direct delete cannot keep the
+  external model and context-owned buffers alive. A relay-only pending context
+  is retained by `llama_free`; a direct delete is unsupported and is not
+  covered by that abort. On a clean state the destructor frees the scheduler
+  **before** the backend members are destroyed, matching the actual reverse
+  member order.
 - **Model**: `llama_model` carries a live-context reference count and a
   retained-context count. The live count and the free request are read and
   changed under a lifetime mutex; the retained count is atomic and is
@@ -178,10 +180,15 @@ from an older backend is accepted, and a partial submission that cannot call
   ignored. A retained pending context and the model are process-owned; there
   is no release operation by design, and the retained context must not be used
   again.
-- **External borrows**: LoRA adapters, samplers and cvec data are caller-owned.
-  A retained context never computes or samples again, so the caller may free
-  those borrows after `llama_free` returns; no retained member dereferences
-  them. The model-owned LoRA set is released only by the deferred model free.
+- **External borrows**: LoRA adapters and samplers are caller-owned raw
+  pointers stored in the context. A retained context never computes or samples
+  again, so no retained member dereferences them. `llama_adapter_lora_free`
+  after retention erases the adapter from the model and marks it process-owned
+  instead of deleting it, because submitted native work may still read the
+  adapter tensors; a duplicate call is ignored. Samplers may be freed after
+  `llama_free` returns. Cvec input data is copied into context-owned tensors
+  by `llama_set_adapter_cvec`, so it is not borrowed after that call. The
+  model-owned LoRA set is released only by the deferred model free.
 - **Meta owner**: `ggml_backend_meta_free` retains the whole Meta owner
   (context, child backends, buffers) while `submission_pending` is true.
 - **Public helper callers**: `ggml_backend_tensor_copy_async` does not retain
@@ -236,17 +243,21 @@ from an older backend is accepted, and a partial submission that cannot call
 - A second free of the same model or context handle after the first one
   completed cannot be detected without a global handle registry. The retained
   path is idempotent; a clean double free remains caller undefined behavior.
-- External borrows (LoRA adapters, samplers, cvec) are not reference-counted.
-  They are safe to free after retention only because the retained context is
-  never used again. Calling any context API after `llama_free` is a caller
-  contract violation.
+- External borrows (LoRA adapters, samplers) are not reference-counted. They
+  are safe to free after retention only because the retained context is never
+  used again. Cvec input data is copied, not borrowed. Calling any context API
+  after `llama_free` is a caller contract violation.
 - The LoRA-adapter borrow arm constructs a bare adapter, registers it on a
   real CPU context, retains the context and then frees the adapter. It proves
-  the erase-from-retained-model path and the duplicate-free path do not read
-  the stale pointer. It does not load adapter weights and does not compute
+  the erase-from-retained-model path, the process-owned retention and the
+  duplicate-free path. It also checks the ordinary delete path without a
+  retained context. It does not load adapter weights and does not compute
   with them; full LoRA arithmetic is outside this test. Freeing an adapter
   before retention, while the context can still compute, is a use-after-free
   by contract.
+- The retained adapter allocation prevents freeing tensors that submitted
+  native work may still read; it is not a proof that the in-flight kernel
+  finished. CPU tests cannot observe that ordering, and no GPU run is claimed.
 - `llama_adapter_lora_free` and the final `llama_model_free` are not
   internally serialized against each other. The caller must not run them
   concurrently; the retained-context path keeps the model alive, so the

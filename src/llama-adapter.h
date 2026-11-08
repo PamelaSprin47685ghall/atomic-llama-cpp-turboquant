@@ -62,6 +62,10 @@ struct llama_adapter_lora_weight {
 
 struct llama_adapter_lora {
     llama_model * model = nullptr;
+    // A retained pending context may still have submitted native work that
+    // reads these tensors. llama_adapter_lora_free then erases the adapter
+    // from the model but keeps it allocated for the process.
+    bool process_owned = false;
 
     // map tensor name to lora_a_b
     std::unordered_map<std::string, llama_adapter_lora_weight> ab_map;

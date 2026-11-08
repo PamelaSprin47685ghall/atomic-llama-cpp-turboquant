@@ -243,26 +243,28 @@ void test_cpu_threadpool_detached(const char * model_path) {
     CHECK(!c.model->name.empty());
 }
 
-// A sampler is an external borrow. After retention the context never samples
-// again, so the caller may free it; a duplicate llama_free must neither
+// A sampler is an external borrow. The public setter requires a sampler chain,
+// not a bare backend sampler. After retention the context never samples again,
+// so the caller may free the chain; a duplicate llama_free must neither
 // re-evaluate nor dereference it.
 void test_sampler_borrow_after_retention(const char * model_path) {
     open_ctx c;
     if (!open_context(model_path, c)) {
         return;
     }
-    llama_sampler * smpl = llama_sampler_init_greedy();
-    CHECK(smpl != nullptr);
-    if (smpl != nullptr) {
-        CHECK(llama_set_sampler(c.ctx, 0, smpl));
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    CHECK(chain != nullptr);
+    if (chain != nullptr) {
+        llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+        CHECK(llama_set_sampler(c.ctx, 0, chain));
     }
 
     c.ctx->debug_mark_unproven();
     llama_free(c.ctx); // retain
     CHECK(c.ctx->is_retained());
 
-    if (smpl != nullptr) {
-        llama_sampler_free(smpl); // caller-owned borrow dies after retention
+    if (chain != nullptr) {
+        llama_sampler_free(chain); // caller-owned borrow dies after retention
     }
     llama_free(c.ctx); // duplicate free is ignored; no stale sampler deref
     CHECK(c.ctx->is_retained());
@@ -271,10 +273,12 @@ void test_sampler_borrow_after_retention(const char * model_path) {
     CHECK(!c.model->name.empty());
 }
 
-// A LoRA adapter is a caller-owned borrow too. After retention the context
-// never builds or computes a graph, so freeing the adapter only erases it from
-// the retained model's set; the retained context's map keeps a stale pointer
-// that no path may read. The model free stays deferred.
+// A LoRA adapter is a caller-owned borrow too. A retained context may still
+// have submitted native work that reads the adapter tensors, so
+// llama_adapter_lora_free erases it from the model but keeps it process-owned
+// instead of deleting it. The retained context's map keeps a pointer that no
+// path may read, and a duplicate free is ignored. The model free stays
+// deferred.
 void test_lora_borrow_after_retention(const char * model_path) {
     open_ctx c;
     if (!open_context(model_path, c)) {
@@ -294,8 +298,15 @@ void test_lora_borrow_after_retention(const char * model_path) {
     llama_free(c.ctx); // retain
     CHECK(c.ctx->is_retained());
 
-    llama_adapter_lora_free(adapter); // erase from the retained model, delete
+    llama_adapter_lora_free(adapter); // erase from the retained model, retain
     CHECK(c.model->loras.empty());
+    CHECK(adapter->model == nullptr);
+    CHECK(adapter->process_owned);
+
+    // A duplicate free is a no-op; it must not delete the process-owned
+    // adapter that submitted native work may still read.
+    llama_adapter_lora_free(adapter);
+    CHECK(adapter->process_owned);
 
     // A duplicate free must not re-enter the context or dereference the stale
     // adapter pointer in the retained context's loras map.
@@ -306,6 +317,24 @@ void test_lora_borrow_after_retention(const char * model_path) {
     llama_model_free(c.model); // deferred by the retained context
     CHECK(!c.model->name.empty());
     CHECK(c.model->loras.empty());
+}
+
+// Without a retained context the adapter keeps the ordinary delete path.
+void test_lora_clean_free() {
+    llama_model * model = make_mock_model();
+    CHECK(model != nullptr);
+    if (model == nullptr) {
+        return;
+    }
+    auto * adapter = new llama_adapter_lora(model);
+    CHECK(adapter != nullptr);
+    adapter->alpha = 1.0f;
+    model->loras.insert(adapter);
+
+    CHECK(model->retained_contexts() == 0);
+    llama_adapter_lora_free(adapter); // no retained context: delete
+    CHECK(model->loras.empty());
+    llama_model_free(model);
 }
 
 // A prefab envelope slot owns a scheduler separate from the main scheduler.
@@ -486,6 +515,7 @@ int main(int argc, char ** argv) {
 
     test_model_retention();
     test_model_lifetime_reference();
+    test_lora_clean_free();
     test_model_free_before_context(model_path);
     test_cpu_threadpool_detached(model_path);
     test_sampler_borrow_after_retention(model_path);

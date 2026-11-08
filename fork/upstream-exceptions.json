@@ -395,7 +395,7 @@
     },
     {
       "path": "include/llama.h",
-      "sha256": "cbf54525472f28e1fc6c0f2fae30c799d7c6870b8b469febaee9b1d7bb726d89",
+      "sha256": "6587b179dce8431e07fa3ce33db769698b126e5217585cdb9388f71b260c5068",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -405,7 +405,7 @@
         "fork/tests/a-seams/mul-mat-id-shape-invariance.cpp",
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution"
       ],
-      "reason": "Expose versioned physical KV sizing, compute allocation observation and synchronized release. Expose owned logical reader views, capability checks, physical recurrent-state capacity and recurrent-only retirement through public A APIs. Expose installed-public read-only queries for resolved pipeline-parallel and Flash Attention settings, the model loader's selected devices, and the first unsupported reader-view requirement. Keep the capability boolean and setter aligned with the same native predicate, including the FA-off requirement of the current non-FA reader. Add the opt-in batch_invariant_matmul context parameter and its null-safe getter; require the choice before context creation and prefix prefill, document its default-false behavior and precedence over a dense quantized projection builder's accumulator request, and distinguish native activation quantization from true-F32 arithmetic. C uses the installed API without reading private A state. These queries report configuration and capability reasons, not actual kernel dispatch, device overlap, model-wide invariance, or performance. Describe the creation-time opt-in projection request as covering qualified direct and expert-indexed quantized products, with contiguous F32 activations, native activation quantization, shared/per-slot expert inputs, row-padded IDs and descriptor-aligned storage where required by Vulkan. Include its precedence over a projection builder's requested accumulator precision. Preserve default-false behavior, creation-before-prefill semantics, and the getter's meaning as a request rather than proof of model-wide/backend execution. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged. Expose model live/retained context counts and prefab envelope statistics for the retention and prefab CPU tests.",
+      "reason": "Expose versioned physical KV sizing, compute allocation observation and synchronized release. Expose owned logical reader views, capability checks, physical recurrent-state capacity and recurrent-only retirement through public A APIs. Expose installed-public read-only queries for resolved pipeline-parallel and Flash Attention settings, the model loader's selected devices, and the first unsupported reader-view requirement. Keep the capability boolean and setter aligned with the same native predicate, including the FA-off requirement of the current non-FA reader. Add the opt-in batch_invariant_matmul context parameter and its null-safe getter; require the choice before context creation and prefix prefill, document its default-false behavior and precedence over a dense quantized projection builder's accumulator request, and distinguish native activation quantization from true-F32 arithmetic. C uses the installed API without reading private A state. These queries report configuration and capability reasons, not actual kernel dispatch, device overlap, model-wide invariance, or performance. Describe the creation-time opt-in projection request as covering qualified direct and expert-indexed quantized products, with contiguous F32 activations, native activation quantization, shared/per-slot expert inputs, row-padded IDs and descriptor-aligned storage where required by Vulkan. Include its precedence over a projection builder's requested accumulator precision. Preserve default-false behavior, creation-before-prefill semantics, and the getter's meaning as a request rather than proof of model-wide/backend execution. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged. Expose model live/retained context counts and prefab envelope statistics for the retention and prefab CPU tests. Document that a retained pending context keeps a released LoRA adapter process-owned and that cvec data is copied.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Replace these additions with upstream equivalents when the pinned API exposes the same read-only configuration, selected-device and reader-rejection information plus the explicit direct and expert-indexed quantized projection policy and getter semantics. Rebuild all consumers with matching headers and libraries, and retain capability, policy/default, device-reporting, and real numerical gates. Preserve the original physical-KV, workspace, reader-view, recurrent-capacity, and retirement removal conditions. Replace these comments and interfaces when upstream provides the same explicit direct/expert projection request, default and getter semantics, with matching installed consumers and complete-model gates. Keep all unrelated reader capability, physical capacity, scheduler/device observation and lifetime removal conditions. Remove the TP5 portion when upstream provides equivalent versioned numerical, independent-window, pre-submission, last-reader and native-drain contracts and all installed full-model acceptance cases pass without this change."
     },
     {
@@ -476,6 +476,28 @@
       ],
       "reason": "A owns physical size observation and private graph/allocator release implementation. Store the native reader-graph budget and declare A-owned view and active-state helpers. Declare the context-owned unsupported-reader-reason query used by the installed public capability interface. Keep the capability boolean and view setter tied to one predicate so diagnostics cannot announce a profile that the native reader rejects. Preserve the existing physical-size, graph-budget, active-state, and allocator-release declarations; the new batch policy is carried by the context's cparams rather than a second mutable policy owner. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged. Declare the retention, pending-state and prefab diagnostic surface.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Remove this internal declaration when the pinned upstream supplies an equivalent installed-public reader capability query backed by the native context's own predicate. Remove the TP5 portion when upstream provides equivalent versioned numerical, independent-window, pre-submission, last-reader and native-drain contracts and all installed full-model acceptance cases pass without this change."
+    },
+    {
+      "path": "src/llama-adapter.h",
+      "sha256": "37c4df24827860f3a65c1d310e9121f0fcc8537d726b30e0b2c8bcd1026808e1",
+      "mode": "100644",
+      "consumers": [
+        "llama LoRA adapter ownership",
+        "TP5 retained-context lifetime"
+      ],
+      "reason": "Carry a process-owned flag so a LoRA adapter released while the model has a retained pending context is kept alive instead of deleted behind submitted native work.",
+      "removal_condition": "Remove when upstream provides an equivalent retained-owner rule for adapter tensors, or when retained contexts synchronously prove that no native work can read them."
+    },
+    {
+      "path": "src/llama-adapter.cpp",
+      "sha256": "093d393437bf30da9f27557399a8b91a271ff648de757ce7e23cf5e4dc8a003b",
+      "mode": "100644",
+      "consumers": [
+        "llama LoRA adapter free path",
+        "TP5 retained-context lifetime"
+      ],
+      "reason": "llama_adapter_lora_free erases the adapter from the model and, when retained contexts exist, marks it process-owned instead of deleting it; a duplicate free is ignored. The ordinary no-retained-context path still deletes.",
+      "removal_condition": "Remove when upstream provides an equivalent retained-owner free rule or guarantees that no submitted native work can read adapter tensors."
     },
     {
       "path": "src/llama-cparams.h",
@@ -953,12 +975,12 @@
     },
     {
       "path": "docs/tp5-staging-submission.md",
-      "sha256": "448a20568e4663ba8837470f93e3c3b3d03e16ac30a778f2159f470c5cf83bf9",
+      "sha256": "a06bdc99672afad55174e37fca1478f73d4ec0ce5de8adb81018a77322d8ceee",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose staging/Meta integration maintainers"
       ],
-      "reason": "Record the async submission boundary, staging pool ownership and retention contract, the prefab sub-envelope mask row-count rule, and the CPU/ASan evidence used by the WS4 integration. The async MIRRORED lane now reclaims completed pending slots with a non-blocking event query; the recorded CPU probe reaches lease_ok=343, no_slot=0, reaps=333, queries=1665 with completed events, while in-flight events preserve the fallback. Record the helper pre/post fail-stop checks, partial-rejection publication, the caller/source-binary cutover, the frozen overlay status and the LoRA-adapter proof limit. Record the v2 append-only api prefix, partial-rejection publication with first_error zero, the synchronous setter's unobservable partial write, and the bare-adapter runtime test. Record that adapter free and the final model free are caller-serialized and that the retained path keeps the model alive. Record that both Meta partial lanes and the mark-before-release ordering are exercised.",
+      "reason": "Record the async submission boundary, staging pool ownership and retention contract, the prefab sub-envelope mask row-count rule, and the CPU/ASan evidence used by the WS4 integration. The async MIRRORED lane now reclaims completed pending slots with a non-blocking event query; the recorded CPU probe reaches lease_ok=343, no_slot=0, reaps=333, queries=1665 with completed events, while in-flight events preserve the fallback. Record the helper pre/post fail-stop checks, partial-rejection publication, the caller/source-binary cutover, the frozen overlay status and the LoRA-adapter proof limit. Record the v2 append-only api prefix, partial-rejection publication with first_error zero, the synchronous setter's unobservable partial write, and the bare-adapter runtime test. Record that adapter free and the final model free are caller-serialized and that the retained path keeps the model alive. Record that both Meta partial lanes and the mark-before-release ordering are exercised. Record adapter process ownership behind retained native work, cvec copy semantics and the narrowed direct-delete abort scope.",
       "removal_condition": "Remove when the maintained fork documentation carries the same contracts or the WS4 async-staging work is upstreamed."
     },
     {
@@ -1018,12 +1040,12 @@
     },
     {
       "path": "tests/test-tp5-context-retain.cpp",
-      "sha256": "c1fbddd0fbac5c19eb334507d24b72967072e06fc22b9ac09e1aa4d6b36589de",
+      "sha256": "243c44b5baba169b905171c0151290eb01cf2b73c42f46fe515da4adf041d4c4",
       "mode": "100644",
       "consumers": [
         "WS4 context/model retention CPU test"
       ],
-      "reason": "Cover llama_free retention, model-free deferral, duplicate free, CPU threadpool detach, sampler borrow, prefab slot retention, and the real-model pending-context path. Construct a bare LoRA adapter, register it on a real CPU context, retain the context, free the adapter and defer the model free; the stale pointer is never read. Initialize the bare test adapter before registering it.",
+      "reason": "Cover llama_free retention, model-free deferral, duplicate free, CPU threadpool detach, sampler borrow, prefab slot retention, and the real-model pending-context path. Construct a bare LoRA adapter, register it on a real CPU context, retain the context, free the adapter and defer the model free; the stale pointer is never read. Initialize the bare test adapter before registering it. Use a sampler chain; cover the adapter process-owned/duplicate-free path and the ordinary no-retained-context delete path.",
       "removal_condition": "Remove with the WS4 retention test target when the contract is covered elsewhere."
     },
     {
