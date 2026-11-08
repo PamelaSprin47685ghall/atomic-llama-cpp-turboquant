@@ -982,6 +982,58 @@ static void test_host_pool(testing & t) {
 
         set_pool_flag(nullptr);
     });
+
+    t.test("relay_pins_until_completion", [&](testing & t) {
+        set_pool_flag("1");
+
+        batch_builder bb1;
+        bb1.add(0, {0}, false);
+        bb1.add(1, {0}, true);
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb1.make(), vocab, nullptr, bb1.n_embd, 4, false));
+
+        llama_ubatch u = ba.split_simple(2);
+        t.assert_true("relay source is pooled", u.data.pooled());
+        const uint32_t slot = u.data.slot();
+
+        // A decode holds the ubatch through the memory context and the graph
+        // result. Both copies must pin the slot until relay completion.
+        llama_ubatch mctx  = u;
+        llama_ubatch graph = u;
+        u = llama_ubatch{};
+
+        batch_builder bb2;
+        bb2.add(10, {0}, false);
+        bb2.add(11, {0}, true);
+        t.assert_true(ba.init(bb2.make(), vocab, nullptr, bb2.n_embd, 4, false));
+        llama_ubatch s2 = ba.split_simple(2);
+        t.assert_true("graph and mctx pin the slot", s2.data.slot() != slot);
+        t.assert_equal("graph copy keeps the old position", 0, graph.pos[0]);
+
+        // Graph completion drops one copy; the memory context still pins.
+        graph = llama_ubatch{};
+
+        batch_builder bb3;
+        bb3.add(20, {0}, false);
+        bb3.add(21, {0}, true);
+        t.assert_true(ba.init(bb3.make(), vocab, nullptr, bb3.n_embd, 4, false));
+        llama_ubatch s3 = ba.split_simple(2);
+        t.assert_true("mctx still pins the slot", s3.data.slot() != slot);
+        t.assert_equal("mctx copy keeps the old position", 0, mctx.pos[0]);
+
+        // Completion drops the last copy; the slot returns.
+        mctx = llama_ubatch{};
+
+        batch_builder bb4;
+        bb4.add(30, {0}, false);
+        bb4.add(31, {0}, true);
+        t.assert_true(ba.init(bb4.make(), vocab, nullptr, bb4.n_embd, 4, false));
+        llama_ubatch s4 = ba.split_simple(2);
+        t.assert_equal("slot returns after completion", slot, s4.data.slot());
+
+        set_pool_flag(nullptr);
+    });
 }
 
 int main(int argc, char ** argv) {
