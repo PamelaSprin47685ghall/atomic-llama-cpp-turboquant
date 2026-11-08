@@ -174,9 +174,35 @@ process exit. Other backends report `0`/`false`.
   it needs a Meta backend with the CUDA staging provider. It mirrors the
   scheduler rule that either capability answer is unproven, but this branch
   records no GPU runtime evidence.
-- The prefab-slot-unproven test is model- and environment-gated: without
-  `LLAMA_TEST_MODEL`, or when prefab refuses the model, it prints
-  `prefab-skip` instead of proving the slot arm.
+- The prefab-slot-unproven test is model-gated. Without `LLAMA_TEST_MODEL`, or
+  when prefab refuses the context, it prints `prefab-skip`. When prefab is
+  enabled it pins `LLAMA_PREFAB_ENVELOPES=1` for the constructor (the caller's
+  value is restored afterwards), then decodes one token on that exact-fit
+  envelope: the slot scheduler is created lazily by that ubatch, and only then
+  is it marked unproven. The test proves the slot state (`sched`, `built`, a
+  clean `has_unproven`) before it faults the slot.
+- A prefab envelope mask has `n_env` rows, but only `ubatch->n_tokens` rows are
+  real. The fill therefore takes an explicit real-row count
+  (`llama_kv_cache::fill_input_kq_mask`); the stock entry point keeps its
+  `n_tps == n_tokens` equality as a stock-layout contract, and the prefab
+  wrapper writes the real rows and replicates the last one into the pad rows.
+  A regression that reuses the stock row count on the envelope mask would read
+  past the ubatch's token arrays, so the row count is an invariant, not an
+  assertion to relax.
+- The sub-envelope test compares stock, exact-envelope and padded-envelope
+  logits. A GGUF whose raw F32 tensors are not finite (the
+  `/tmp/min-llama.gguf` generator writes arbitrary bytes, so it contains
+  NaN/Inf) cannot support a numeric comparison: the test prints
+  `numeric-skip` and falls back to raw-bit agreement with the stock arm. Use a
+  finite-weight GGUF (for example `/tmp/min-llama-finite.gguf`) for the
+  numeric arm.
+- Stock multi-token decode with the non-unified KV cache (`kv_unified=false`,
+  the default context parameter, `n_seq_max=1`) still hits the stock
+  `n_tps == n_tokens` assertion in `set_input_kq_mask`: the batch allocator
+  reports `n_seq_tokens=1` for a 3-token single-sequence batch while the mask
+  has one row. The sub-envelope test sets `kv_unified=true` for the stock
+  baseline, and compares padded against exact prefab under `kv_unified=false`
+  without a stock arm. That stock lane is outside this fix.
 - A backend that reports neither capability cannot report an unknown
   submission; the scheduler has no way to detect one.
 - The retained process-owned allocations are intentional. Tests that force a
@@ -212,6 +238,13 @@ cmake --build build-ws4-sched-ctest -j --target test-tp5-context-retain
 LLAMA_TEST_MODEL=/path/to/model.gguf ctest --test-dir build-ws4-sched-ctest \
       -R test-tp5-context-retain --output-on-failure
 
+# prefab sub-envelope mask/logits (ctest); use a finite-weight GGUF for the
+# numeric arm. The context-retain fixture (/tmp/min-llama.gguf) still runs the
+# raw-bit fallback.
+cmake --build build-ws4-sched-ctest -j --target test-tp5-prefab-subenvelope
+LLAMA_TEST_MODEL=/path/to/finite-model.gguf ctest --test-dir build-ws4-sched-ctest \
+      -R test-tp5-prefab-subenvelope --output-on-failure
+
 # staging pool (standalone)
 g++ -std=c++17 -O2 -pthread -I ggml/include -I ggml/src \
     tests/test-tp5-staging-pool.cpp -o /tmp/test-tp5-staging-pool
@@ -238,8 +271,17 @@ The context-retain test covers, without a model: the live-context reference
 a free request), retained-count deferral, and a clean model free. With
 `LLAMA_TEST_MODEL` it additionally covers: model-free-before-context on clean
 and pending contexts, the CPU backend threadpool pointer cleared by
-`retain_for_process`, a sampler borrow freed after retention, an unproven
-prefab envelope slot retaining the context, a duplicate `llama_free` that
-keeps the retained count at one, and a real CPU context retained whole. The
-model part reports `context-skip` without a model; the prefab arm reports
-`prefab-skip` when prefab refuses the model.
+`retain_for_process`, a sampler borrow freed after retention, a prefab
+envelope slot built by a real one-token decode and then marked unproven
+retaining the context, a duplicate `llama_free` that keeps the retained count
+at one, and a real CPU context retained whole. The model part reports
+`context-skip` without a model; the prefab arm reports `prefab-skip` when
+prefab refuses the context.
+
+The prefab sub-envelope test covers the mask fill for `n_tokens < n_env`: it
+decodes a 3-token batch and two 1-token batches through a stock baseline, an
+exact-envelope arm (envelopes 1 and 3) and a padded arm (envelope 4 only). It
+requires `n_sub_envelope == 3`, `n_pad_rows == 7` and no stock fallback in the
+padded arm, and compares the user-visible logits of every step. Under the
+default non-unified cache it repeats the padded/exact comparison inside the
+prefab lane, which is the configuration of the retention fixture.

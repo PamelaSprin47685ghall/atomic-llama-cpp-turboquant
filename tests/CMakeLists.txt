@@ -1305,3 +1305,16 @@ target_include_directories(test-tp5-context-retain PRIVATE ${PROJECT_SOURCE_DIR}
 add_test(NAME test-tp5-context-retain COMMAND test-tp5-context-retain)
 set_property(TEST test-tp5-context-retain PROPERTY LABELS "cpu;tp5")
 set_property(TEST test-tp5-context-retain PROPERTY PASS_REGULAR_EXPRESSION "TP5_CONTEXT_RETAIN_TEST PASS")
+
+# TP5 factor-prefab sub-envelope KQ-mask regression. A ubatch with
+# n_tokens < n_env runs on an n_env-row envelope; the mask fill must write only
+# the real rows and the wrapper must pad the rest. The test compares stock,
+# exact-envelope and padded-envelope logits for one real token sequence, and
+# requires the padded arm's n_sub_envelope/n_pad_rows counters with no stock
+# fallback. Needs LLAMA_TEST_MODEL; without it the arm is skipped.
+add_executable(test-tp5-prefab-subenvelope test-tp5-prefab-subenvelope.cpp)
+target_link_libraries(test-tp5-prefab-subenvelope PRIVATE llama)
+add_test(NAME test-tp5-prefab-subenvelope COMMAND test-tp5-prefab-subenvelope)
+set_property(TEST test-tp5-prefab-subenvelope PROPERTY LABELS "cpu;tp5;prefab")
+set_property(TEST test-tp5-prefab-subenvelope PROPERTY PASS_REGULAR_EXPRESSION "PREFAB_SUBENVELOPE_TEST PASS")
+set_property(TEST test-tp5-prefab-subenvelope PROPERTY FAIL_REGULAR_EXPRESSION "^FAIL:")

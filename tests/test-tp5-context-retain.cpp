@@ -13,7 +13,8 @@
 //   * a duplicate llama_free does not increment the retained count,
 //   * retain_for_process clears the CPU backend's external threadpool pointer,
 //   * a sampler borrow may die after retention without a dereference,
-//   * an unproven prefab envelope slot is part of the context's unproven state,
+//   * a prefab envelope slot built by a real decode is part of the context's
+//     unproven state when its scheduler is faulted,
 //   * a clean model still frees normally,
 //   * with LLAMA_TEST_MODEL (or argv[1]), a real CPU context marked unproven is
 //     retained by llama_free and the model free is deferred; the context is
@@ -270,7 +271,10 @@ void test_sampler_borrow_after_retention(const char * model_path) {
 }
 
 // A prefab envelope slot owns a scheduler separate from the main scheduler.
-// An unproven slot alone must retain the context and defer the model free.
+// The scheduler is created only when an envelope ubatch runs (the legacy init
+// path builds the slot result, not the scheduler), so the fixture must decode
+// one token first. An unproven slot alone must then retain the context and
+// defer the model free.
 void test_prefab_slot_unproven(const char * model_path) {
     if (model_path == nullptr || model_path[0] == '\0') {
         return;
@@ -284,10 +288,16 @@ void test_prefab_slot_unproven(const char * model_path) {
 
     const char * old_enable = std::getenv("LLAMA_PREFAB_ENABLE");
     const char * old_experimental = std::getenv("LLAMA_PREFAB_EXPERIMENTAL");
+    const char * old_envelopes = std::getenv("LLAMA_PREFAB_ENVELOPES");
     const std::string save_enable = old_enable ? old_enable : "";
     const std::string save_experimental = old_experimental ? old_experimental : "";
+    const std::string save_envelopes = old_envelopes ? old_envelopes : "";
     set_env("LLAMA_PREFAB_ENABLE", "1");
     set_env("LLAMA_PREFAB_EXPERIMENTAL", "1");
+    // Pin a one-row envelope: the fixture decodes exactly one token, and the
+    // slot arm is about slot retention, not sub-envelope padding. Without this
+    // an exported LLAMA_PREFAB_ENVELOPES would change the path under test.
+    set_env("LLAMA_PREFAB_ENVELOPES", "1");
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx            = 64;
@@ -304,6 +314,7 @@ void test_prefab_slot_unproven(const char * model_path) {
     // was for the other tests.
     set_env("LLAMA_PREFAB_ENABLE", old_enable ? save_enable.c_str() : nullptr);
     set_env("LLAMA_PREFAB_EXPERIMENTAL", old_experimental ? save_experimental.c_str() : nullptr);
+    set_env("LLAMA_PREFAB_ENVELOPES", old_envelopes ? save_envelopes.c_str() : nullptr);
 
     if (ctx == nullptr) {
         llama_model_free(model);
@@ -317,6 +328,16 @@ void test_prefab_slot_unproven(const char * model_path) {
         std::printf("TP5_CONTEXT_RETAIN_TEST prefab-skip (no envelope slot)\n");
         return;
     }
+
+    // Build the smallest envelope on the real path: one token selects slot 0
+    // and creates its scheduler, graph result and proof of completion.
+    CHECK(prefab->slots[0].n_env == 1);
+    llama_token token = 1;
+    llama_batch batch = llama_batch_get_one(&token, 1);
+    CHECK(llama_decode(ctx, batch) == 0);
+    CHECK(prefab->slots[0].sched != nullptr);
+    CHECK(prefab->slots[0].built);
+    CHECK(!ctx->has_unproven()); // the envelope compute proved its scheduler
 
     CHECK(ctx->debug_mark_prefab_slot_unproven(0));
     CHECK(ctx->has_unproven()); // main scheduler is clean; the slot is not
