@@ -884,7 +884,18 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 
         // graph outputs buffer
         {
-            if (output_reserve(params.n_seq_max) < params.n_seq_max) {
+            // Pillar 5: a relay context reserves the full output envelope here,
+            // before the first decode. Every decode passes n_outputs <=
+            // cparams.n_outputs_max (process_ubatch refuses more), so the
+            // first decode can no longer grow the host output buffer. That
+            // grow freed the old buffer with hipHostFree while another
+            // window's kernel launch held the ROCm runtime mutex, and the
+            // HSA signal wait deadlocked (H2e). The stock path keeps its
+            // original lazy initial size.
+            const uint32_t n_outputs_reserve = backend_tp5_relay != nullptr
+                ? std::max<uint32_t>(cparams.n_outputs_max, n_seq_max())
+                : params.n_seq_max;
+            if (output_reserve(int32_t(n_outputs_reserve)) < n_outputs_reserve) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
 
@@ -7354,8 +7365,17 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 #endif
             synchronize();
 
-            // TODO: not needed?
-            buf_output      = nullptr;
+            // ROCm: hipHostFree on the device host buffer waits on HSA
+            // signals. A concurrent kernel launch on the same device can hold
+            // the ROCm runtime mutex, so the free and the launch deadlock
+            // (H2e: ggml_cuda_op_scale -> hipLaunchKernel vs output_reserve
+            // -> hipHostFree -> BusyWaitSignal::WaitRelaxed). Retire the
+            // buffer instead. ~llama_context synchronizes and then destroys
+            // the retired buffers after the owner stopped submitting. In
+            // relay mode the constructor reserved the full output envelope,
+            // so this path is reached only on a configuration change, never
+            // on the first decode.
+            buf_output_retired.emplace_back(std::move(buf_output));
             logits.data     = nullptr;
             embd.data       = nullptr;
             embd_nextn.data = nullptr;

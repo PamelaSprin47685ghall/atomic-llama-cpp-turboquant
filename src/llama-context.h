@@ -603,6 +603,12 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+    // Buffers replaced by an output_reserve() grow. ROCm's hipHostFree on a
+    // device host buffer waits on HSA signals; freeing it while any context
+    // launches a kernel can deadlock on the runtime mutex. Keep the old
+    // buffer alive until ~llama_context, which synchronizes first and runs
+    // after the owner stops submitting.
+    std::vector<ggml_backend_buffer_ptr> buf_output_retired;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
