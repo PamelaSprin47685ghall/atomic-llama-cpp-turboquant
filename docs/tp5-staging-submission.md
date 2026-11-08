@@ -86,6 +86,15 @@ process exit. Other backends report `0`/`false`.
   graph is not re-bound behind in-flight work.
 - **MoE cache session**: `set_moe_cache` keeps the current session and its
   provider resources. It neither destroys nor replaces them while unproven.
+- **Staging submit gate**: `enter_submit()` holds `submit_mutex_` across the
+  meta fallback's backend set path. A CUDA simple tensor on that path calls
+  `pool::note_source()` on the same thread, so note_source must not `try_lock`
+  the owned mutex (undefined) and must not take `mutex_` while the gate is
+  held: the fatal publication holds `mutex_` and waits for `submit_mutex_`.
+  The pool publishes `submit_gate_held_` in `enter_submit()` and clears it in
+  `leave_submit()`; note_source reads it, skips, and counts a fast miss. A
+  successful try_lock would drop the gate, so the flag is the contract, not a
+  hint.
 - **llama_context / llama_free**: `llama_free` queries
   `llama_context::has_unproven()` (and the relay status) while every member is
   still alive. If either is pending it does **not** delete the context: it
@@ -219,6 +228,10 @@ cmake -S . -B build-ws4-sched-ctest -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=OFF \
 cmake --build build-ws4-sched-ctest -j --target test-tp5-staging-scheduler
 ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-scheduler --output-on-failure
 
+# staging submit-gate / note_source lock ownership (ctest, CPU)
+cmake --build build-ws4-sched-ctest -j --target test-tp5-staging-note-source-lock
+ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-note-source-lock --output-on-failure
+
 # ASAN variant: catches the backends-before-scheduler UAF and the
 # release_buffers-while-pending free.
 cmake -S . -B build-ws4-sched-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGGML_HIP=OFF \
@@ -265,6 +278,14 @@ metadata (observed through the diagnostic dependency view); that
 `set_moe_cache` neither destroys nor replaces the session; no input-scope
 flush on the unknown path; and the production backends-before-scheduler
 destruction order (the fake records any capability probe after `iface.free`).
+
+The staging lock test covers the meta fallback path where `enter_submit()` is
+held while the backend set path calls `note_source()` on the same thread. It
+checks that note_source does not try_lock the owned gate, does not drop it
+while a second entrant waits, and does not take `mutex_` while a fatal
+publication is waiting for the gate; the same-thread and concurrent calls are
+counted as fast misses. The fatal path then completes after `leave_submit()`
+with the unknown-work record intact.
 
 The context-retain test covers, without a model: the live-context reference
 (free-before-context deferral, last-release delete, new-context refusal after

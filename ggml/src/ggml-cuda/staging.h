@@ -452,12 +452,15 @@ public:
             misses_fast_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        // The submit gate may call the backend set path; never block there.
-        if (!submit_mutex_.try_lock()) {
+        // The submit gate may call the backend set path on this same thread.
+        // enter_submit() publishes submit_gate_held_ before that path and
+        // leave_submit() clears it, so this check needs no lock. A try_lock on
+        // submit_mutex_ here would be undefined when the caller already owns
+        // it, and a successful try_lock would drop the gate.
+        if (submit_gate_held_.load(std::memory_order_acquire)) {
             misses_fast_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        submit_mutex_.unlock();
         std::lock_guard<std::mutex> lock(mutex_);
         if (owns_locked(p, bytes)) {
             stats_.hits++;
@@ -480,19 +483,22 @@ public:
 
     // Submission gate. The fallback copy and the fatal publication share this
     // lock: a fatal cannot be published between the check and the submit.
-    // note_source skips itself while the gate is held, so the caller may use
-    // the GGML backend set path inside the gate. The lock is released on a
-    // false return.
+    // note_source reads submit_gate_held_ and skips while the gate is held,
+    // so the caller may use the GGML backend set path inside the gate without
+    // taking mutex_ (the fatal publication holds mutex_ and waits for this
+    // gate). The lock is released on a false return.
     bool enter_submit() {
         submit_mutex_.lock();
         if (submit_fatal_) {
             submit_mutex_.unlock();
             return false;
         }
+        submit_gate_held_.store(true, std::memory_order_release);
         return true;
     }
 
     void leave_submit() {
+        submit_gate_held_.store(false, std::memory_order_release);
         submit_mutex_.unlock();
     }
 
@@ -724,6 +730,9 @@ private:
 
     mutable std::mutex mutex_;
     std::mutex submit_mutex_;
+    // True while enter_submit owns the gate. Published for note_source, which
+    // must not touch submit_mutex_ on the owning thread.
+    std::atomic<bool> submit_gate_held_{false};
     bool submit_fatal_ = false;
     backend_ops ops_ = {};
     size_t max_bytes_ = kMaxPoolBytes;

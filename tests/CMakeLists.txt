@@ -1295,6 +1295,18 @@ add_test(NAME test-tp5-staging-scheduler COMMAND test-tp5-staging-scheduler)
 set_property(TEST test-tp5-staging-scheduler PROPERTY LABELS "cpu;tp5")
 set_property(TEST test-tp5-staging-scheduler PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_SCHED_TEST PASS")
 
+# TP5 staging submit-gate / note_source lock ownership. The meta fallback holds
+# the submit gate while it calls the backend set path, and a CUDA simple tensor
+# on that path calls note_source on the same thread. The test pins that the
+# same-thread note does not try_lock the owned gate, does not drop it, and does
+# not take mutex_ while a fatal publication waits for the gate. CPU only.
+add_executable(test-tp5-staging-note-source-lock test-tp5-staging-note-source-lock.cpp)
+target_link_libraries(test-tp5-staging-note-source-lock PRIVATE ggml ggml-cpu)
+add_test(NAME test-tp5-staging-note-source-lock COMMAND test-tp5-staging-note-source-lock)
+set_property(TEST test-tp5-staging-note-source-lock PROPERTY LABELS "cpu;tp5;staging")
+set_property(TEST test-tp5-staging-note-source-lock PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_NOTE_SOURCE_LOCK PASS")
+set_property(TEST test-tp5-staging-note-source-lock PROPERTY TIMEOUT 60)
+
 # TP5 WS4 pending-context/model ownership test. llama_free retains the whole
 # context (and defers llama_model_free) while an async submission is unproven;
 # a clean context/model takes the normal destruction path. The context part
