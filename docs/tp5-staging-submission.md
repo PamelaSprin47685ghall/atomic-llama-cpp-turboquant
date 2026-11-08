@@ -298,6 +298,24 @@ publication. The blocking design fails this case with the explicit
 `note_source blocked on mutex_ (TOCTOU cycle)` message. The fatal path then
 completes after `leave_submit()` with the unknown-work record intact.
 
+The staging pool test covers the slot lifecycle with injected primitives: a
+leased slot is never reused, both slots may be pending, a blocking acquire
+waits the pending events before reuse, and `acquire(wait_pending=false)` does
+not wait. Before reporting `no_slot`, that non-blocking acquire reclaims a
+pending slot whose recorded events have already completed; it polls the
+events instead of synchronizing them, so the async lane rotates its two slots
+without blocking the pipeline. Each pending rank event is tracked separately:
+a slot is not reclaimed until every recorded rank event has completed, an
+active lease is skipped even when its event has completed, and recording a
+reused slot resets that event's completion. The dump reports `reaps` (slots
+returned to rotation) and `queries` (backend event-query calls, at most one
+per pending rank event examined and stopping at the first not-ready or
+error); neither is a latency measurement. A query error is fatal, like a
+failed wait. A not-ready query is a state, not a fault, and the adapter does
+not clear the runtime's sticky error. A slot whose events are still in flight
+stays pending and the async lane falls back, which is the intended transient
+collision.
+
 The context-retain test covers, without a model: the live-context reference
 (free-before-context deferral, last-release delete, new-context refusal after
 a free request), retained-count deferral, and a clean model free. With

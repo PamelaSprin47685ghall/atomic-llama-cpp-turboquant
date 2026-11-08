@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 using namespace ggml_cuda_staging;
 
@@ -22,12 +23,40 @@ int g_destroys = 0;
 int g_events = 0;
 int g_records = 0;
 int g_syncs = 0;
+int g_queries = 0;
 int g_copies = 0;
 bool g_fail_alloc = false;
 bool g_fail_sync = false;
+bool g_fail_query = false;
 int  g_fail_copy_remaining = 0;
 bool g_fail_event_create = false;
 bool g_fail_event_record = false;
+
+struct fake_event {
+    int  id       = 0;
+    int  records  = 0;
+    bool complete = false;
+};
+
+std::vector<fake_event *> g_record_log;
+
+fake_event * fake_record_at(int index) {
+    return index >= 0 && index < int(g_record_log.size())
+        ? g_record_log[size_t(index)] : nullptr;
+}
+
+void fake_complete_record(int index) {
+    fake_event * event = fake_record_at(index);
+    if (event != nullptr) {
+        event->complete = true;
+    }
+}
+
+void fake_complete_all_records() {
+    for (fake_event * event : g_record_log) {
+        event->complete = true;
+    }
+}
 int fake_alloc(size_t bytes, void ** out) {
     if (g_fail_alloc) {
         return 1;
@@ -53,26 +82,44 @@ int fake_event_create(void ** out) {
     if (g_fail_event_create) {
         return 2;
     }
-    *out = std::malloc(1);
-    ++g_events;
-    return *out != nullptr ? 0 : 2;
+    fake_event * event = new fake_event;
+    event->id = g_events++;
+    *out = event;
+    return 0;
 }
 
-int fake_event_record(void *, void *) {
+int fake_event_record(void * opaque, void *) {
     if (g_fail_event_record) {
         return 3;
     }
+    fake_event * event = static_cast<fake_event *>(opaque);
+    event->complete = false;
+    event->records++;
+    g_record_log.push_back(event);
     ++g_records;
     return 0;
 }
 
-int fake_event_sync(void *) {
+int fake_event_sync(void * opaque) {
     ++g_syncs;
-    return g_fail_sync ? 4 : 0;
+    if (g_fail_sync) {
+        return 4;
+    }
+    static_cast<fake_event *>(opaque)->complete = true;
+    return 0;
 }
 
-void fake_event_destroy(void * p) {
-    std::free(p);
+int fake_event_query(void * opaque, bool * complete) {
+    ++g_queries;
+    if (g_fail_query) {
+        return 6;
+    }
+    *complete = static_cast<fake_event *>(opaque)->complete;
+    return 0;
+}
+
+void fake_event_destroy(void * opaque) {
+    delete static_cast<fake_event *>(opaque);
     ++g_destroys;
 }
 
@@ -120,6 +167,7 @@ backend_ops fake_ops() {
     ops.event_create  = fake_event_create;
     ops.event_record  = fake_event_record;
     ops.event_sync    = fake_event_sync;
+    ops.event_query   = fake_event_query;
     ops.event_destroy = fake_event_destroy;
     ops.copy_h2d      = fake_copy;
     ops.device_ptr    = fake_device_ptr;
@@ -253,11 +301,360 @@ int test_acquire_nowait() {
     lease c;
     CHECK(!p.acquire(0, kind::tokens, sizeof(src), &c, /*wait_pending =*/ false));
     CHECK(g_syncs == syncs_before);
-    CHECK(p.snapshot().no_slot >= 1);
+    const auto s = p.snapshot();
+    CHECK(s.no_slot == 1);
+    CHECK(s.reaps == 0);
+    CHECK(s.queries == 2);
+    CHECK(g_queries == 2);
 
     // The synchronous lane still waits one event and reuses a slot.
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &c));
     CHECK(g_syncs == syncs_before + 1);
+    p.release(c);
+    return 0;
+}
+
+int test_acquire_nowait_reaps_completed() {
+    pool p(fake_ops());
+    uint8_t src[64] = {};
+    uint8_t dst[64] = {};
+
+    // Two async copies fill both slots. Neither event has completed.
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+    p.release(a);
+
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+    CHECK(b.slot != a.slot);
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(b, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+    p.release(b);
+
+    const int syncs_before = g_syncs;
+    lease c;
+    CHECK(!p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    auto s = p.snapshot();
+    CHECK(s.no_slot == 1);
+    CHECK(s.reaps == 0);
+    CHECK(s.queries == 2);  // one query per pending slot, both not ready
+    CHECK(s.waits == 0);
+    CHECK(g_queries == 2);
+    CHECK(g_syncs == syncs_before);
+
+    // A completed first slot is reclaimed; the second slot is not examined
+    // because the first one is enough.
+    fake_complete_record(0);
+    fake_complete_record(1);
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    CHECK(c.slot == a.slot);
+    s = p.snapshot();
+    CHECK(s.no_slot == 1);
+    CHECK(s.reaps == 1);
+    CHECK(s.queries == 3);
+    CHECK(s.waits == 0);
+
+    // The reused slot is in flight again. The next acquire skips it and
+    // reclaims the still-completed second slot.
+    CHECK(p.upload(c, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(c, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+    p.release(c);
+
+    lease d;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &d, false));
+    CHECK(d.slot == b.slot);
+    s = p.snapshot();
+    CHECK(s.reaps == 2);
+    CHECK(s.queries == 5);
+    CHECK(s.waits == 0);
+    CHECK(p.upload(d, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(d, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+    fake_complete_record(g_records - 1);
+    p.release(d);
+
+    // Async-only traffic keeps rotating while each new copy completes. The
+    // first slot stays in flight for the whole loop and is never reclaimed.
+    const int records_before_loop = g_records;
+    for (int i = 0; i < 64; ++i) {
+        lease e;
+        CHECK(p.acquire(0, kind::tokens, sizeof(src), &e, false));
+        CHECK(p.upload(e, src, sizeof(src)) == submit_result::ok);
+        CHECK(p.enqueue(e, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+        fake_complete_record(g_records - 1);
+        p.release(e);
+    }
+    s = p.snapshot();
+    CHECK(s.no_slot == 1);
+    CHECK(s.waits == 0);
+    CHECK(s.reaps == 2 + 64);
+    CHECK(s.queries == 5 + 2 * 64);
+    CHECK(g_queries == int(s.queries));
+    CHECK(g_records == records_before_loop + 64);
+    CHECK(g_syncs == syncs_before);
+    return 0;
+}
+
+int test_reap_partial_rank() {
+    pool p(fake_ops());
+    uint8_t src[32] = {};
+    uint8_t dst[32] = {};
+
+    // Slot A has two recorded rank events; slot B has one.
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 0
+    CHECK(p.enqueue(a, 1, dst, sizeof(src), nullptr) == submit_result::ok);  // 1
+    p.release(a);
+
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(b, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 2
+    p.release(b);
+
+    // A/rank0 is complete; A/rank1 and B/rank0 are still in flight.
+    fake_complete_record(0);
+    const int syncs_before = g_syncs;
+    lease c;
+    CHECK(!p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    auto s = p.snapshot();
+    CHECK(s.no_slot == 1);
+    CHECK(s.reaps == 0);
+    CHECK(s.queries == 3);  // A/r0 ready, A/r1 not ready, B/r0 not ready
+    CHECK(s.waits == 0);
+    CHECK(g_syncs == syncs_before);
+    CHECK(p.usable());
+
+    // Completing the last rank of A reclaims exactly A, not B.
+    fake_complete_record(1);
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    CHECK(c.slot == a.slot);
+    s = p.snapshot();
+    CHECK(s.no_slot == 1);
+    CHECK(s.reaps == 1);
+    CHECK(s.queries == 5);  // A/r0, A/r1; stops before B
+    CHECK(s.waits == 0);
+    p.release(c);
+    return 0;
+}
+
+int test_reap_skips_active_lease() {
+    pool p(fake_ops());
+    uint8_t src[32] = {};
+    uint8_t dst[32] = {};
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 0
+    // a stays leased on purpose.
+
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(b, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 1
+    p.release(b);
+
+    // A's event completed while its lease is still active. A must not be
+    // queried or reclaimed.
+    fake_complete_record(0);
+    lease c;
+    CHECK(!p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    auto s = p.snapshot();
+    CHECK(s.no_slot == 1);
+    CHECK(s.reaps == 0);
+    CHECK(s.queries == 1);  // only slot B is pending and unleased
+    CHECK(s.waits == 0);
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+
+    // Once released, the completed slot joins the rotation.
+    p.release(a);
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    CHECK(c.slot == a.slot);
+    s = p.snapshot();
+    CHECK(s.reaps == 1);
+    CHECK(s.queries == 2);
+    CHECK(s.no_slot == 1);
+    CHECK(s.waits == 0);
+    p.release(c);
+    return 0;
+}
+
+int test_reap_event_rerecord() {
+    pool p(fake_ops());
+    uint8_t src[32] = {};
+    uint8_t dst[32] = {};
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 0
+    p.release(a);
+
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(b, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 1
+    p.release(b);
+
+    fake_complete_record(0);
+    fake_complete_record(1);
+    const int creates_before = g_events;
+    const int destroys_before = g_destroys;
+
+    lease c;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    CHECK(c.slot == a.slot);
+    CHECK(p.upload(c, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(c, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 2
+
+    // The reused slot keeps its event object; record resets completion.
+    CHECK(fake_record_at(2) == fake_record_at(0));
+    CHECK(fake_record_at(2) != nullptr);
+    CHECK(fake_record_at(2)->records == 2);
+    CHECK(fake_record_at(2)->complete == false);
+    CHECK(g_events == creates_before);
+    CHECK(g_destroys == destroys_before);
+    CHECK(g_records == 3);
+
+    // The re-recorded event is in flight, so the next acquire takes slot B.
+    lease d;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &d, false));
+    CHECK(d.slot == b.slot);
+
+    // Once the re-recorded event completes, slot A is reclaimable again.
+    // Keep d leased so the free-slot fast path cannot choose B.
+    fake_complete_record(2);
+    p.release(c);
+    lease e;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &e, false));
+    CHECK(e.slot == a.slot);
+    auto s = p.snapshot();
+    CHECK(s.reaps == 3);
+    CHECK(s.queries == 3);
+    CHECK(s.waits == 0);
+    p.release(d);
+    p.release(e);
+    return 0;
+}
+
+int test_reap_preserves_other_slot() {
+    pool p(fake_ops());
+    uint8_t src[32] = {};
+    uint8_t dst[32] = {};
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 0
+    CHECK(p.enqueue(a, 2, dst, sizeof(src), nullptr) == submit_result::ok);  // 1
+    p.release(a);
+
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(b, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 2
+    p.release(b);
+
+    // A is partially complete, so the first acquire reclaims B.
+    fake_complete_record(0);
+    fake_complete_record(2);
+    lease c;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    CHECK(c.slot == b.slot);
+    auto s = p.snapshot();
+    CHECK(s.no_slot == 0);
+    CHECK(s.reaps == 1);
+    CHECK(s.queries == 3);  // A/r0 ready, A/r2 not ready, B/r0 ready
+    CHECK(s.waits == 0);
+
+    // A's rank2 bit survived B's reap; A becomes reclaimable when it clears.
+    // Keep c leased so the free-slot fast path cannot choose B.
+    fake_complete_record(1);
+    lease d;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &d, false));
+    CHECK(d.slot == a.slot);
+    s = p.snapshot();
+    CHECK(s.no_slot == 0);
+    CHECK(s.reaps == 2);
+    CHECK(s.queries == 5);  // A/r0, A/r2
+    p.release(c);
+    p.release(d);
+    return 0;
+}
+
+int test_reap_query_failure_disables() {
+    pool p(fake_ops());
+    uint8_t src[8] = {};
+    uint8_t dst[8] = {};
+
+    lease a;
+    lease b;
+    CHECK(p.acquire(0, kind::pos, sizeof(src), &a));
+    CHECK(p.acquire(0, kind::pos, sizeof(src), &b));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+    CHECK(p.enqueue(b, 1, dst, sizeof(src), nullptr) == submit_result::ok);
+    p.release(a);
+    p.release(b);
+
+    g_fail_query = true;
+    lease c;
+    CHECK(!p.acquire(0, kind::pos, sizeof(src), &c, false));
+    CHECK(!p.usable());
+    const auto s = p.snapshot();
+    CHECK(s.query_fail == 1);
+    CHECK(s.quarantine == 1);
+    CHECK(s.queries == 1);
+    CHECK(s.first_error == 6);
+    CHECK(s.no_slot == 0);
+    return 0;
+}
+
+int test_reap_device_switch() {
+    backend_ops ops = fake_ops();
+    ops.current_device = fake_current_device;
+    ops.select_device  = fake_select_device;
+    ops.restore_device = fake_restore_device;
+    g_current_device = 5;
+    g_select_count = 0;
+    g_restore_count = 0;
+    g_last_selected = -1;
+    g_last_restored = -1;
+
+    pool p(ops);
+    uint8_t src[16] = {};
+    uint8_t dst[16] = {};
+
+    // Both slots carry events on ranks 0 and 3.
+    lease a;
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+    CHECK(p.enqueue(a, 3, dst, sizeof(src), nullptr) == submit_result::ok);
+    CHECK(p.enqueue(b, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+    CHECK(p.enqueue(b, 3, dst, sizeof(src), nullptr) == submit_result::ok);
+    p.release(a);
+    p.release(b);
+
+    // Reaping two pending ranks selects each recording device, then restores
+    // the caller's physical device exactly as a blocking wait does.
+    fake_complete_all_records();
+    lease c;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    CHECK(g_select_count == 2);
+    CHECK(g_last_selected == 3);
+    CHECK(g_restore_count == 1);
+    CHECK(g_last_restored == 5);
+    CHECK(p.snapshot().queries == 2);
+    CHECK(g_queries == 2);
     p.release(c);
     return 0;
 }
@@ -854,6 +1251,13 @@ int main() {
         {"double_buffer_stale_release", test_double_buffer_and_stale_release},
         {"pending_slot_reuse",         test_pending_slot_reuse},
         {"acquire_nowait",             test_acquire_nowait},
+        {"acquire_nowait_reaps_completed", test_acquire_nowait_reaps_completed},
+        {"reap_partial_rank",          test_reap_partial_rank},
+        {"reap_skips_active_lease",    test_reap_skips_active_lease},
+        {"reap_event_rerecord",        test_reap_event_rerecord},
+        {"reap_preserves_other_slot",  test_reap_preserves_other_slot},
+        {"reap_query_failure_disables", test_reap_query_failure_disables},
+        {"reap_device_switch",         test_reap_device_switch},
         {"note_source_fast_path",      test_note_source_fast_path},
         {"window_isolation",           test_window_isolation},
         {"pool_cap",                   test_pool_cap},
@@ -885,6 +1289,10 @@ int main() {
     for (const auto & t : tests) {
         g_fail_alloc = false;
         g_fail_sync = false;
+        g_fail_query = false;
+        g_queries = 0;
+        g_records = 0;
+        g_record_log.clear();
         g_fail_copy_remaining = 0;
         g_fail_event_create = false;
         g_fail_event_record = false;

@@ -43,6 +43,22 @@ int hip_event_sync(void * event) {
     return int(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(event)));
 }
 
+int hip_event_query(void * event, bool * complete) {
+    const cudaError_t err = cudaEventQuery(reinterpret_cast<cudaEvent_t>(event));
+    if (err == cudaSuccess) {
+        *complete = true;
+        return 0;
+    }
+    if (err == cudaErrorNotReady) {
+        // NotReady is a state, not a fault. Do not call cudaGetLastError()
+        // here: clearing the sticky error would hide a real asynchronous
+        // failure from the next CUDA_CHECK(cudaGetLastError()).
+        *complete = false;
+        return 0;
+    }
+    return int(err);
+}
+
 void hip_event_destroy(void * event) {
     if (event != nullptr) {
         (void) cudaEventDestroy(reinterpret_cast<cudaEvent_t>(event));
@@ -97,6 +113,7 @@ const backend_ops kHipOps = {
     /* .event_create = */ hip_event_create,
     /* .event_record = */ hip_event_record,
     /* .event_sync   = */ hip_event_sync,
+    /* .event_query  = */ hip_event_query,
     /* .event_destroy= */ hip_event_destroy,
     /* .copy_h2d     = */ hip_copy_h2d,
     /* .device_ptr   = */ hip_device_ptr,

@@ -109,6 +109,9 @@ struct backend_ops {
     int  (*event_create)(void ** out)                               = nullptr;
     int  (*event_record)(void * event, void * stream)               = nullptr;
     int  (*event_sync)(void * event)                                = nullptr;
+    // Non-blocking completion probe: returns 0 when the query ran and set
+    // *complete, or a native error code when completion is unprovable.
+    int  (*event_query)(void * event, bool * complete)              = nullptr;
     void (*event_destroy)(void * event)                             = nullptr;
     int  (*copy_h2d)(void * dst, const void * src, size_t bytes, void * stream) = nullptr;
     int  (*device_ptr)(void * host, void ** out)                    = nullptr;
@@ -136,7 +139,10 @@ public:
         uint64_t alloc_fail                = 0;
         uint64_t stale_release             = 0;
         uint64_t wait_fail                 = 0;
+        uint64_t query_fail                = 0;
         uint64_t no_slot                   = 0;
+        uint64_t reaps                     = 0;
+        uint64_t queries                   = 0;
         uint64_t quarantine                = 0;
         int      first_error               = 0;
         uint64_t invalid                   = 0;
@@ -191,23 +197,7 @@ public:
             return false;
         }
         auto & key = slots_[window][size_t(k)];
-        slot * chosen = nullptr;
-        // 1) Free and retired, large enough.
-        for (auto & s : key) {
-            if (!s.leased && !s.pending && !s.quarantined && s.cap >= bytes) {
-                chosen = &s;
-                break;
-            }
-        }
-        // 2) Free and retired, grow.
-        if (chosen == nullptr) {
-            for (auto & s : key) {
-                if (!s.leased && !s.pending && !s.quarantined) {
-                    chosen = &s;
-                    break;
-                }
-            }
-        }
+        slot * chosen = pick_free_locked(key, bytes);
         // 3) Free but pending, large enough: wait, then reuse.
         if (chosen == nullptr && wait_pending) {
             for (auto & s : key) {
@@ -226,7 +216,24 @@ public:
                 }
             }
         }
-        // 5) No usable slot. Never steal a live lease and never wait unless
+        // 5) A completed in-flight copy can be reclaimed without waiting. The
+        //    async lane never waits, so without this step both slots stay
+        //    pending after their first copy and every later copy misses.
+        if (chosen == nullptr && !wait_pending) {
+            for (auto & s : key) {
+                if (s.leased || s.quarantined || !s.pending) {
+                    continue;
+                }
+                if (try_reap_locked(s)) {
+                    chosen = pick_free_locked(key, bytes);
+                    break;
+                }
+                if (disabled_.load(std::memory_order_relaxed)) {
+                    return false;
+                }
+            }
+        }
+        // 6) No usable slot. Never steal a live lease and never wait unless
         //    the caller asked for it.
         if (chosen == nullptr) {
             stats_.no_slot++;
@@ -552,7 +559,8 @@ public:
         std::fprintf(f,
             "TP5_STAGING leases=%llu uploads=%llu upload_bytes=%llu waits=%llu wait_ms=%.3f "
             "enqueues=%llu releases=%llu hits=%llu misses=%llu oversize=%llu alloc_fail=%llu "
-            "stale_release=%llu wait_fail=%llu no_slot=%llu quarantine=%llu invalid=%llu "
+            "stale_release=%llu wait_fail=%llu query_fail=%llu no_slot=%llu reaps=%llu "
+            "queries=%llu quarantine=%llu invalid=%llu "
             "first_error=%d\n",
             (unsigned long long) stats_.leases,
             (unsigned long long) stats_.uploads,
@@ -567,7 +575,10 @@ public:
             (unsigned long long) stats_.alloc_fail,
             (unsigned long long) stats_.stale_release,
             (unsigned long long) stats_.wait_fail,
+            (unsigned long long) stats_.query_fail,
             (unsigned long long) stats_.no_slot,
+            (unsigned long long) stats_.reaps,
+            (unsigned long long) stats_.queries,
             (unsigned long long) stats_.quarantine,
             (unsigned long long) stats_.invalid,
             stats_.first_error);
@@ -654,6 +665,85 @@ private:
             }
         }
         return false;
+    }
+
+    // Caller holds mutex_. A free slot that fits is preferred; otherwise any
+    // free slot is returned for growth.
+    slot * pick_free_locked(rotation & key, size_t bytes) {
+        for (auto & s : key) {
+            if (!s.leased && !s.pending && !s.quarantined && s.cap >= bytes) {
+                return &s;
+            }
+        }
+        for (auto & s : key) {
+            if (!s.leased && !s.pending && !s.quarantined) {
+                return &s;
+            }
+        }
+        return nullptr;
+    }
+
+    // Non-blocking completion reclaim. A query error is fatal, like a failed
+    // wait: an unprovable completion keeps the slot out of rotation.
+    bool try_reap_locked(slot & s) {
+        if (!s.pending) {
+            return true;
+        }
+        if (s.leased) {
+            return false;
+        }
+        if (ops_.event_query == nullptr) {
+            return false;
+        }
+        const int saved = ops_.current_device != nullptr ? ops_.current_device() : -1;
+        bool complete = true;
+        int fail_err = 0;
+        for (uint32_t r = 0; r < kRanks; ++r) {
+            if ((s.pending_ranks & (uint32_t(1) << r)) == 0) {
+                continue;
+            }
+            if (ops_.select_device != nullptr && !ops_.select_device(int(r))) {
+                fail_err = -1;
+                break;
+            }
+            if (s.events[r] == nullptr) {
+                fail_err = -1;
+                break;
+            }
+            // Queries counts backend calls only: one per pending rank event
+            // examined, stopping at the first not-ready or error. It is a
+            // call count, not a latency measurement.
+            stats_.queries++;
+            bool rank_complete = false;
+            const int query_err = ops_.event_query(s.events[r], &rank_complete);
+            if (query_err != 0) {
+                fail_err = query_err;
+                break;
+            }
+            if (!rank_complete) {
+                complete = false;
+                break;
+            }
+        }
+        if (ops_.restore_device != nullptr && !ops_.restore_device(saved)) {
+            if (fail_err == 0) {
+                fail_err = -1;
+            }
+        }
+        if (fail_err != 0) {
+            quarantine_locked(s, fail_err);
+            disabled_.store(true, std::memory_order_relaxed);
+            publish_fatal_locked();
+            stats_.query_fail++;
+            return false;
+        }
+        if (!complete) {
+            return false;
+        }
+        s.pending = false;
+        s.pending_ranks = 0;
+        stats_.reaps++;
+        return true;
     }
 
     bool wait_slot_locked(slot & s) {
