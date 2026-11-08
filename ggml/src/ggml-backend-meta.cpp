@@ -39,7 +39,7 @@ extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
         return false;
     }
     const auto * api = static_cast<const ggml_cuda_staging::api *>(impl);
-    if (api->abi_version != 1) {
+    if (api->abi_version < 1 || api->abi_version > ggml_cuda_staging::kApiVersion) {
         return false;
     }
     g_staging_api.store(api, std::memory_order_release);
@@ -1853,6 +1853,19 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                                     }
                                     if (result == int(ggml_cuda_staging::submit_result::rejected)) {
                                         if (submitted) {
+                                            // Some rank copies are already queued and this
+                                            // rank is a clean rejection: the destination is
+                                            // partially written. The pool must publish the
+                                            // same fail-stop state as a native fatal, or the
+                                            // void set path would return a silent success.
+                                            if (st->abi_version >= 2 && st->mark_partial != nullptr) {
+                                                st->mark_partial(&staged_lease, tensor->data);
+                                            } else {
+                                                // An old table cannot publish the partial
+                                                // fault. Do not return a success that hides
+                                                // a partially written destination.
+                                                GGML_ABORT("TP5 staging partial enqueue without fault publication");
+                                            }
                                             st->release(&staged_lease);
                                             staging_record_fatal("sync-enqueue-partial", st);
                                             return;
@@ -2482,6 +2495,15 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                             }
                             if (result == int(ggml_cuda_staging::submit_result::rejected)) {
                                 if (submitted) {
+                                    // See the synchronous twin: a partial mirrored
+                                    // submission has no clean rejection. Publish the
+                                    // fatal state so cpy_tensor_async cannot report
+                                    // true for a partially written destination.
+                                    if (st->abi_version >= 2 && st->mark_partial != nullptr) {
+                                        st->mark_partial(&staged_lease, tensor->data);
+                                    } else {
+                                        GGML_ABORT("TP5 staging partial enqueue without fault publication");
+                                    }
                                     st->release(&staged_lease);
                                     staging_record_fatal("async-enqueue-partial", st);
                                     return;

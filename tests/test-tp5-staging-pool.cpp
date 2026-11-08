@@ -998,6 +998,40 @@ int test_partial_enqueue_stops_pool() {
     return 0;
 }
 
+int test_partial_rejection_marks_pool() {
+    pool p(fake_ops());
+    uint8_t src[64];
+    uint8_t dst[64] = {};
+    std::memset(src, 0x44, sizeof(src));
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+    const uint64_t enqueues_before = p.snapshot().enqueues;
+
+    // The meta layer observed that rank 0 was queued and rank 1 was rejected
+    // cleanly. That is a partially written destination, not a clean rejection:
+    // the pool must stop and publish an unknown submission with no native
+    // error code.
+    p.mark_partial(a, dst);
+    CHECK(!p.usable());
+    CHECK(p.submission_pending());
+    CHECK(p.unknown_count() == 1);
+    CHECK(p.snapshot().partial == 1);
+    CHECK(p.snapshot().quarantine == 1);
+    CHECK(p.snapshot().first_error == 0);
+    CHECK(p.snapshot().enqueues == enqueues_before);
+
+    // Nothing may be submitted after the partial publication.
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::fatal);
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
+    CHECK(!p.wait(a));
+    p.release(a);
+    CHECK(p.submission_pending());
+    return 0;
+}
+
 int test_copy_failure_quarantine() {
     pool p(fake_ops());
     uint8_t src[64] = {};
@@ -1281,6 +1315,7 @@ int main() {
         {"staging_candidate",          test_staging_candidate},
         {"source_mutation_isolation",  test_source_mutation_isolation},
         {"partial_enqueue_stops_pool", test_partial_enqueue_stops_pool},
+        {"partial_rejection_marks_pool", test_partial_rejection_marks_pool},
         {"layout_predicate",           test_layout_predicate},
         {"wait_device_switch",         test_wait_device_switch},
     };

@@ -26,12 +26,19 @@ process exit. Other backends report `0`/`false`.
 ## Semantics
 
 - `ggml_backend_tensor_copy_async` returns `bool`:
-  - `true`: accepted and ordered, or completed synchronously. A rejected async
-    copy also returns `true`: the helper synchronizes both backends and performs
-    the blocking copy.
-  - `false`: **only** the accepted-but-unprovable case. The destination must
-    not be replayed, freed or overwritten, and the source, destination and both
-    backends must stay alive until the process/context owner resolves it.
+  - The helper queries the optional error/pending capability on **both**
+    backends before it does anything. If either reports an unknown submission,
+    it returns `false` and performs no copy. This is what keeps the blocking
+    fallback from overwriting a destination an earlier copy may still write.
+  - `true`: the async copy was accepted and ordered, or the async callback
+    rejected with no effects and the helper completed the blocking copy. The
+    helper re-queries both backends before returning `true`; a concurrent
+    publication turns the result into `false`.
+  - `false`: an unknown submission already existed (no copy was attempted), or
+    the copy was accepted but cannot be proven. The destination must not be
+    replayed, freed or overwritten, and the source, destination and both
+    backends must stay alive until the process/context owner resolves it. The
+    helper never clears the state.
 - The scheduler queries **both** capabilities after an accepted
   `cpy_tensor_async`. A nonzero error or a pending answer stops the split,
   keeps the input copy slots, and returns `GGML_STATUS_FAILED`. Pending with no
@@ -64,7 +71,8 @@ process exit. Other backends report `0`/`false`.
   **Meta backend's own** error/pending state at graph-compute entry, before
   each child copy and before the copy-back. The child CUDA registry does not
   expose the staging capability, so the helper bool alone is not sufficient
-  there. `ggml_backend_tensor_copy_async` itself returns false for either
+  there. When the helper is called with a Meta backend as either operand, its
+  pre-check and post-check do query that registry and return false for either
   capability answer, including pending with no error.
 - The scheduler's input-copy scope does not flush on an unknown return path,
   whether the fault was observed at the accepted copy or at a failed split
@@ -74,6 +82,30 @@ process exit. Other backends report `0`/`false`.
   returns to the scheduler. The pool quarantines the pinned slot, records the
   unknown destinations (`TP5_STAGING_UNKNOWN` in the diagnostic dump), and
   keeps the first native error.
+
+## Callers and source/binary contract
+
+- All live in-repo callers are compiled against the bool declaration:
+  - `ggml/src/ggml-backend-meta.cpp` checks the helper result before building
+    the reduce node or returning the copy-back status; `false` returns
+    `GGML_STATUS_FAILED` and leaves the aux destination allocated.
+  - The scheduler input-copy paths call `ggml_backend_i::cpy_tensor_async`
+    directly. There, `false` is a clean rejection with no effects and the
+    scheduler may perform its blocking copy; it is not the public helper's
+    `false`.
+  - `tests/test-tp5-staging-scheduler.cpp` asserts both helper outcomes,
+    including the sticky refusal before any callback.
+    `tests/test-moe-cache.cpp` checks the CPU fallback's `true` result.
+- `overlay/mtp-async-protocol-candidate-20261027/` is a frozen provenance
+  snapshot of the pre-cutover candidate. Its `void` declaration and ignored
+  returns are historical bytes; this tree does not compile them. Do not edit
+  them or rebuild them against the current library.
+- The return-type change is source-incompatible. External consumers must
+  rebuild against the installed header and honor `false`. The symbol keeps its
+  name; a caller compiled against the old `void` prototype can invoke it on the
+  tested CPU ABI but cannot observe the result. There is no void compatibility
+  entry, version gate or runtime API-version probe, so an old external binary's
+  behavior is not qualified.
 
 ## Ownership and lifetime
 
@@ -141,7 +173,9 @@ process exit. Other backends report `0`/`false`.
 - **Public helper callers**: `ggml_backend_tensor_copy_async` does not retain
   anything. On `false` the caller is the owner of the source, destination and
   both backends until process exit; there is no public release operation for an
-  unknown submission.
+  unknown submission. A pre-existing unproven state returns `false` before any
+  copy, so the blocking fallback cannot overwrite a destination behind an
+  in-flight copy.
 - **Threadpools** are caller-owned. `retain_for_process` detaches them and
   clears the CPU backend's pointer without pausing the pool, so the caller may
   free them; the retained context does not compute again.
@@ -162,6 +196,14 @@ process exit. Other backends report `0`/`false`.
 - Pending with zero error is a runtime state, not a test-only state: the
   staging pool can be disabled before it records `first_error`. The public
   helper and the scheduler therefore treat pending alone as unproven.
+- The helper's pre-check and post-check are point-in-time queries. A fault
+  published after the final check but before the caller acts is not observed;
+  the capability is sticky, so a later query or scheduler gate sees it, but a
+  fallback copy that ran in that window may already have overwritten the
+  destination. No lock spans the caller's action.
+- The helper observes only the registries of the two backends passed to it. A
+  fault exposed only by an unexposed child capability is invisible; the Meta
+  reduce path therefore keeps its own Meta-backend check.
 - A caller that ignores `ggml_backend_sched_has_unproven` and frees the
   scheduler's backends first is a contract violation; the cached free path
   avoids dereferencing them, but it cannot protect a destination the caller
@@ -184,6 +226,12 @@ process exit. Other backends report `0`/`false`.
   They are safe to free after retention only because the retained context is
   never used again. Calling any context API after `llama_free` is a caller
   contract violation.
+- The LoRA-adapter borrow rule is a code-inspection proof: a retained context
+  never reads `loras`, `llama_adapter_lora_free` erases the adapter from the
+  retained model's set, and `llama_model_free` is deferred. No runtime test
+  loads a LoRA adapter; the sampler borrow arm is the executable analogue.
+  Freeing an adapter before retention, while the context can still compute, is
+  a use-after-free by contract.
 - Meta owners retained on pending leak intentionally; the process owns them.
 - The Meta reduce-path pending gate is not exercised by the CPU tests below:
   it needs a Meta backend with the CUDA staging provider. It mirrors the

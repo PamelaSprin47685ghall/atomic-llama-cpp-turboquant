@@ -206,8 +206,14 @@ bool api_submission_pending() {
     return global_pool().submission_pending();
 }
 
+void api_mark_partial(const lease * l, const void * dst) {
+    if (l != nullptr && dst != nullptr) {
+        global_pool().mark_partial(*l, dst);
+    }
+}
+
 const api kApi = {
-    /* .abi_version       = */ 1,
+    /* .abi_version       = */ kApiVersion,
     /* .enabled           = */ enabled,
     /* .merge_wait        = */ merge_wait_enabled,
     /* .acquire           = */ api_acquire,
@@ -228,6 +234,7 @@ const api kApi = {
     /* .leave_submit      = */ api_leave_submit,
     /* .unknown_count     = */ api_unknown_count,
     /* .submission_pending= */ api_submission_pending,
+    /* .mark_partial      = */ api_mark_partial,
     /* .configured        = */ configured,
     /* .usable            = */ usable,
     /* .zc_enabled        = */ api_zc_enabled,

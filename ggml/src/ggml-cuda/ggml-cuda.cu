@@ -845,7 +845,7 @@ namespace ggml_cuda_staging {
 
 bool can_enqueue_async_impl(ggml_backend_t backend, ggml_tensor * tensor,
                             size_t offset, size_t size) {
-    if (backend == nullptr || tensor == nullptr || size == 0) {
+    if (backend == nullptr || tensor == nullptr || tensor->data == nullptr || size == 0) {
         return false;
     }
     if (!ggml_backend_is_cuda(backend)) {
@@ -883,7 +883,7 @@ submit_result enqueue_async_impl(const lease & l, ggml_backend_t backend,
 // per-thread stream as ggml_backend_cuda_buffer_set_tensor, so ordering with
 // the surrounding synchronous copies is unchanged; only the wait is merged.
 bool can_enqueue_sync_impl(ggml_tensor * tensor, size_t offset, size_t size) {
-    if (tensor == nullptr || size == 0) {
+    if (tensor == nullptr || tensor->data == nullptr || size == 0) {
         return false;
     }
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;

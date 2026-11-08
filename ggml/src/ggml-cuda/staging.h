@@ -23,6 +23,9 @@ constexpr size_t   kMaxPoolBytes = 4u << 20;
 constexpr uint32_t kRanks        = 16;  // == GGML_CUDA_MAX_DEVICES
 constexpr uint32_t kWindows      = 4;
 constexpr uint32_t kSlotsPerKey  = 2;   // double buffer
+// Bump when the host-only api table grows. The meta layer accepts older
+// tables but must not read a field they do not have.
+constexpr uint32_t kApiVersion   = 2;
 
 enum class kind : uint32_t {
     tokens  = 0,
@@ -144,6 +147,7 @@ public:
         uint64_t reaps                     = 0;
         uint64_t queries                   = 0;
         uint64_t quarantine                = 0;
+        uint64_t partial                   = 0;
         int      first_error               = 0;
         uint64_t invalid                   = 0;
     };
@@ -425,6 +429,24 @@ public:
         stats_.releases++;
     }
 
+    // A partial multi-rank submission has no clean rejection to return: at
+    // least one rank copy was queued and a later rank was rejected. The
+    // destination may be partially written and its completion is not
+    // provable. Stop the pool, keep the staging slot quarantined, and publish
+    // the same fatal gate as a native error. There may be no native error to
+    // record, so first_error stays 0 and submission_pending() is the signal.
+    void mark_partial(const lease & l, const void * dst) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.partial++;
+        disabled_.store(true, std::memory_order_relaxed);
+        record_unknown_locked(dst, -1, 0);
+        slot * s = find_locked(l);
+        if (s != nullptr) {
+            quarantine_locked(*s, 0);
+        }
+        publish_fatal_locked();
+    }
+
     bool owns(const void * p, size_t bytes) const {
         std::lock_guard<std::mutex> lock(mutex_);
         return owns_locked(p, bytes);
@@ -561,7 +583,7 @@ public:
             "enqueues=%llu releases=%llu hits=%llu misses=%llu oversize=%llu alloc_fail=%llu "
             "stale_release=%llu wait_fail=%llu query_fail=%llu no_slot=%llu reaps=%llu "
             "queries=%llu quarantine=%llu invalid=%llu "
-            "first_error=%d\n",
+            "partial=%llu first_error=%d\n",
             (unsigned long long) stats_.leases,
             (unsigned long long) stats_.uploads,
             (unsigned long long) stats_.upload_bytes,
@@ -581,6 +603,7 @@ public:
             (unsigned long long) stats_.queries,
             (unsigned long long) stats_.quarantine,
             (unsigned long long) stats_.invalid,
+            (unsigned long long) stats_.partial,
             stats_.first_error);
         std::fprintf(f, "TP5_STAGING_UNKNOWN unknown=%zu\n", unknown_count_);
         for (size_t i = 0; i < unknown_count_; ++i) {
@@ -903,6 +926,11 @@ struct api {
     void (*leave_submit)();
     size_t (*unknown_count)();
     bool (*submission_pending)();
+    // Mark a multi-rank submission that queued some ranks and then hit a
+    // clean rejection. The pool stops, records the destination as unknown and
+    // makes submission_pending() true. first_error is unchanged because a
+    // rejection is not a native error.
+    void (*mark_partial)(const lease * l, const void * dst);
     // configured: GGML_TP5_STAGING requests the pool. usable: the pool has not
     // stopped. A configured but unusable pool is a global fault.
     bool (*configured)();

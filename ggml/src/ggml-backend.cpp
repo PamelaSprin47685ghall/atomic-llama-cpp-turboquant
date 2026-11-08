@@ -660,6 +660,14 @@ static bool ggml_backend_sched_submission_pending(ggml_backend_t backend) {
     return fn != nullptr ? fn(backend) : false;
 }
 
+// Either capability answer means the submission is unproven: a native error
+// was recorded, or the destination may still be in flight (a pool can fail
+// before it records the error).
+static bool ggml_backend_submission_unproven(ggml_backend_t backend) {
+    return ggml_backend_sched_submission_error(backend) != 0 ||
+           ggml_backend_sched_submission_pending(backend);
+}
+
 void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
@@ -690,22 +698,30 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 bool ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
+    GGML_ASSERT(backend_dst);
+    // Do not submit more work to an owner that already reported an unknown
+    // submission: the blocking fallback below must never overwrite a
+    // destination that an in-flight copy may still write. Return false without
+    // touching the destination or either backend's stream.
+    if (ggml_backend_submission_unproven(backend_src) ||
+            ggml_backend_submission_unproven(backend_dst)) {
+        return false;
+    }
+
     if (src == dst) {
         return true;
     }
 
-    GGML_ASSERT(backend_dst);
     if (backend_dst->iface.cpy_tensor_async != NULL) {
         ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
         ggml_backend_moe_cache_invalidate_buffer(
                 dst_buf, dst->data, ggml_nbytes(dst));
         if (backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
-            // Accepted. Either capability answer means the completion is
-            // unprovable: report failure instead of replaying the destination.
-            // A pending destination may also have no native error yet (for
-            // example a staging pool disabled before it recorded one).
-            return ggml_backend_sched_submission_error(backend_dst) == 0 &&
-                   !ggml_backend_sched_submission_pending(backend_dst);
+            // Accepted. Re-query both backends: the callback may have published
+            // the fault, and either operand can make completion unprovable.
+            // Report failure instead of replaying the destination.
+            return !ggml_backend_submission_unproven(backend_src) &&
+                   !ggml_backend_submission_unproven(backend_dst);
         }
         // Rejected with no side effects: the blocking copy below is safe.
     }
@@ -715,7 +731,9 @@ bool ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     ggml_backend_synchronize(backend_src);
     ggml_backend_synchronize(backend_dst);
     ggml_backend_tensor_copy(src, dst);
-    return true;
+    // A fault published while the blocking copy ran is not a completion proof.
+    return !ggml_backend_submission_unproven(backend_src) &&
+           !ggml_backend_submission_unproven(backend_dst);
 }
 
 // events

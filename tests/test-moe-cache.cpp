@@ -220,7 +220,10 @@ static bool run_invalidation_hook_coverage(ggml_backend_t cpu) {
     ggml_backend_tensor_copy(src, dst);
     check("tensor copy", {{dst_base, ggml_nbytes(dst)}});
 
-    ggml_backend_tensor_copy_async(cpu, cpu, src, dst);
+    if (!ggml_backend_tensor_copy_async(cpu, cpu, src, dst)) {
+        fprintf(stderr, "cache-invalidation-hooks: async tensor copy failed\n");
+        ok = false;
+    }
     check("async tensor copy", {{dst_base, ggml_nbytes(dst)}});
 
     ggml_backend_buffer_clear(buffer, 0);

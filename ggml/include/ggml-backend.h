@@ -115,14 +115,16 @@ extern "C" {
     // automatic fallback to sync copy if async is not supported
     // Returns true when the copy was accepted and its completion is ordered,
     // or when a rejected async copy was completed synchronously by this helper.
-    // Returns false only when the backend accepted the copy but cannot prove
-    // completion (an unknown submission). The destination must not be replayed
-    // and the caller must keep the source, destination and both backends alive
-    // until the process/context owner resolves it; do not free or overwrite the
-    // destination. Either optional registry capability
-    // "ggml_backend_submission_error" (a recorded native error) or
-    // "ggml_backend_submission_pending" (outstanding work) makes the return
-    // false, including pending work with no recorded error yet.
+    // Returns false when an unknown submission is already outstanding on either
+    // backend (no copy is attempted), or when the accepted copy cannot be
+    // proven complete. The destination must not be replayed, freed or
+    // overwritten, and the caller must keep the source, destination and both
+    // backends alive until the process/context owner resolves it. Either
+    // optional registry capability "ggml_backend_submission_error" (a recorded
+    // native error) or "ggml_backend_submission_pending" (outstanding work)
+    // makes the return false, including pending work with no recorded error
+    // yet. The helper never clears that state: a retry keeps returning false
+    // until the process/context owner resolves it.
     // Contract: submission_pending must report only accepted-but-unprovable
     // work. Ordinary ordered in-flight work must not set it; the scheduler
     // treats any true answer as a permanent fail-stop state.
