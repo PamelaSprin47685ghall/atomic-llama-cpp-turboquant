@@ -113,10 +113,15 @@ extern "C" {
     // the copy is performed after all the currently queued operations in backend_src
     // backend_dst will wait for the copy to complete before performing other operations
     // automatic fallback to sync copy if async is not supported
-    // Returns true when the copy was accepted and its completion is either
-    // ordered or synchronous. Returns false when the backend rejected the copy
-    // with no side effects, or accepted it but cannot prove completion (an
-    // unknown submission; the destination must not be replayed).
+    // Returns true when the copy was accepted and its completion is ordered,
+    // or when a rejected async copy was completed synchronously by this helper.
+    // Returns false only when the backend accepted the copy but cannot prove
+    // completion (an unknown submission). The destination must not be replayed
+    // and the caller must keep the source, destination and both backends alive
+    // until the process/context owner resolves it; do not free or overwrite the
+    // destination. The optional registry capability
+    // "ggml_backend_submission_pending" reports whether such work is still
+    // outstanding.
     GGML_API bool ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
     GGML_API ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend);

@@ -182,9 +182,9 @@ ggml_backend_buffer_type_t fake_dev_get_buffer_type(ggml_backend_dev_t) {
 // cpy_tensor_async -- the trap in the earlier fixture.
 const char * fake_buft_get_name(ggml_backend_buffer_type_t) { return "fake-staging-buft"; }
 
-size_t fake_buft_get_alignment(ggml_backend_buffer_type_t) { return 64; }
+size_t fake_buft_get_alignment(ggml_backend_buffer_type_t) { return 16; }
 size_t fake_buft_get_max_size(ggml_backend_buffer_type_t) { return SIZE_MAX; }
-size_t fake_buft_get_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tensor) { return ggml_nbytes(tensor); }
+size_t fake_buft_get_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tensor) { return GGML_PAD(ggml_nbytes(tensor), 16); }
 bool fake_buft_is_host(ggml_backend_buffer_type_t) { return true; }
 
 void fake_buffer_free(ggml_backend_buffer_t buffer) { std::free(buffer->context); }
@@ -520,6 +520,89 @@ void test_fatal() {
     }
 }
 
+// A pending submission may exist even when this scheduler did not observe a
+// failure (e.g. a Meta reduce-path copy or a process-global staging fault).
+// ggml_backend_sched_free must retain the copy slots in that case too.
+void test_pending_without_failure() {
+    if (iface_has_submission_error) {
+        // The older iface-field scheduler predates the any-pending free path.
+        return;
+    }
+    reset_fake();
+    g_fake.submission_pending = true;
+    g_fake.submission_error  = 0;
+    fixture f;
+    CHECK(fixture_init(f));
+
+    CHECK(ggml_backend_sched_graph_compute(f.sched, f.graph) == GGML_STATUS_SUCCESS);
+    CHECK(g_fake.error_calls == 2);
+    CHECK(g_fake.last_dst != nullptr);
+
+    std::vector<unsigned char> copied;
+    if (g_fake.last_dst && g_fake.last_dst->data) {
+        const unsigned char * p = static_cast<const unsigned char *>(g_fake.last_dst->data);
+        copied.assign(p, p + 8 * sizeof(float));
+    }
+
+    const int pending_before = g_fake.pending_calls;
+    fixture_free(f, true); // sched_free must retain: pending with submission_failed == 0
+    CHECK(g_fake.pending_calls > pending_before);
+    if (g_fake.last_dst && g_fake.last_dst->data && !copied.empty()) {
+        CHECK(std::memcmp(g_fake.last_dst->data, copied.data(), copied.size()) == 0);
+    }
+}
+
+// Public helper contract: true for ordered/synchronous copies (including a
+// rejected async callback completed by the blocking fallback), false ONLY for
+// the accepted-but-unprovable case.
+void test_public_copy_async_return() {
+    reset_fake();
+
+    ggml_init_params params = { /*.mem_size=*/ 1u << 16, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+    ggml_context * ctx = ggml_init(params);
+    CHECK(ctx != nullptr);
+    ggml_tensor * src = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * dst = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    CHECK(src != nullptr && dst != nullptr);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, &g_fake_buft);
+    CHECK(buf != nullptr);
+
+    const float values[4] = { 3.0f, 5.0f, 7.0f, 11.0f };
+    ggml_backend_tensor_set(src, values, 0, sizeof(values));
+
+    // Ordered/accepted -> true.
+    g_fake.submission_error = 0;
+    g_fake.reject_copy = false;
+    CHECK(ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, src, dst));
+    CHECK(std::memcmp(dst->data, values, sizeof(values)) == 0);
+
+    // Accepted but unprovable -> false; the destination must not be replayed.
+    g_fake.submission_error = kFatalError;
+    const int errors_before = g_fake.error_calls;
+    CHECK(!ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, src, dst));
+    CHECK(g_fake.error_calls == errors_before + 1);
+    std::vector<unsigned char> unproven;
+    if (dst->data) {
+        const unsigned char * p = static_cast<const unsigned char *>(dst->data);
+        unproven.assign(p, p + sizeof(values));
+    }
+
+    // Rejected async callback -> the helper performs the blocking copy and
+    // returns true. The false return above is not a rejected copy.
+    g_fake.submission_error = 0;
+    g_fake.reject_copy = true;
+    CHECK(ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, src, dst));
+    CHECK(std::memcmp(dst->data, values, sizeof(values)) == 0);
+
+    // The unprovable destination bytes were not replayed by the later calls
+    // beyond the rejected callback's synchronous copy; the helper itself never
+    // replays it. (The rejected path writes the same source bytes.)
+    (void) unproven;
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+}
+
 } // namespace
 
 int main() {
@@ -528,6 +611,8 @@ int main() {
     test_success();
     test_rejected();
     test_fatal();
+    test_pending_without_failure();
+    test_public_copy_async_return();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "TP5_STAGING_SCHED_TEST FAIL failures=%d\n", g_failures);

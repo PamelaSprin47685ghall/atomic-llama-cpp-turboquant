@@ -2348,6 +2348,14 @@ static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
 static void ggml_backend_meta_free(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    if (ggml_backend_meta_submission_pending(backend)) {
+        // An accepted but unprovable async copy may still write into a child
+        // buffer. Retain the whole Meta owner (context, child backends,
+        // buffers) instead of freeing behind it. The process owns it until
+        // exit; this is retention, not a drain claim.
+        GGML_LOG_ERROR("%s: retaining Meta owner: an async submission is still unproven\n", __func__);
+        return;
+    }
     if (backend_ctx->relay != nullptr) {
         if (!backend_ctx->relay_i->destroy(backend_ctx->relay)) {
             // A native reader may still own graph and child-backend storage.
@@ -4555,7 +4563,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 
-        auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) {
+        auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) -> ggml_status {
             assert(step_cgraphs[j_dst] == nullptr);
             auto & bcj_src = backend_ctx->backend_configs[j_src];
             auto & bcj_dst = backend_ctx->backend_configs[j_dst];
@@ -4568,9 +4576,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_tensor * node_tmp = get_node_aux(node_dst);
             set_tmp_data(node_tmp, j_dst, i_buf);
 
-            // Child backends have no staging capability; a false result means
-            // a synchronous copy was performed by the helper.
-            (void) ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+            // The helper returns true for an ordered/synchronous copy and
+            // false only when the backend accepted the copy but cannot prove
+            // completion. Never build the reduce node that would replay an
+            // unproven destination.
+            if (!ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp)) {
+                return GGML_STATUS_FAILED;
+            }
 
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
@@ -4585,6 +4597,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             cgraph_aux->nodes[0] = node_red;
             cgraph_aux->n_nodes = 1;
             step_cgraphs[j_dst] = cgraph_aux;
+            return GGML_STATUS_SUCCESS;
         };
 
         size_t offset_j = n_backends/2;
@@ -4597,7 +4610,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // If n_backends is not a power of 2, fold in the excess prior to butterfly reduction:
         for (size_t j_src = 2*offset_j_max; j_src < n_backends; j_src++) {
             const size_t j_dst = j_src - 2*offset_j_max;
-            push_data(j_src, j_dst, i_buf);
+            const ggml_status push_status = push_data(j_src, j_dst, i_buf);
+            if (push_status != GGML_STATUS_SUCCESS) {
+                return push_status;
+            }
             const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j_dst].backend, step_cgraphs[j_dst]);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
@@ -4614,7 +4630,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (j_other >= n_backends) {
                     continue;
                 }
-                push_data(j, j_other, i_buf);
+                const ggml_status push_status = push_data(j, j_other, i_buf);
+                if (push_status != GGML_STATUS_SUCCESS) {
+                    return push_status;
+                }
             }
 
             for (size_t j = 0; j < 2*offset_j_max; j++) {
@@ -4638,7 +4657,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
-            (void) ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+            if (!ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst)) {
+                return GGML_STATUS_FAILED;
+            }
         }
 
         return GGML_STATUS_SUCCESS;

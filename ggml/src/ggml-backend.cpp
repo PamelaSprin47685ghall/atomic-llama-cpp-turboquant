@@ -2275,15 +2275,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
-    if (sched->submission_failed != 0) {
-        bool pending = false;
-        for (int b = 0; b < sched->n_backends; b++) {
-            if (ggml_backend_sched_submission_pending(sched->backends[b])) {
-                pending = true;
-                break;
-            }
-        }
-        if (pending) {
+    // Check every backend regardless of whether this scheduler observed the
+    // fault itself. A pending submission may come from the Meta reduce path or
+    // from a process-global staging fault; freeing the copy slots behind it
+    // would let a native copy write into freed storage.
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (ggml_backend_sched_submission_pending(sched->backends[b])) {
             // Keep the copy slots and their buffers: an in-flight copy may
             // still read them. The process owns them until exit; this is not
             // a claim that the submission drained.
