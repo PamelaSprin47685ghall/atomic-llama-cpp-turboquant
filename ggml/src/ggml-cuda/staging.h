@@ -101,6 +101,11 @@ struct backend_ops {
     void (*event_destroy)(void * event)                             = nullptr;
     bool (*copy_h2d)(void * dst, const void * src, size_t bytes, void * stream) = nullptr;
     bool (*device_ptr)(void * host, void ** out)                    = nullptr;
+    // Device selection for event waits. Events belong to the device that
+    // recorded them; HIP requires the matching current device to synchronize.
+    int  (*current_device)()                                       = nullptr;
+    bool (*select_device)(int rank)                                = nullptr;
+    bool (*restore_device)(int physical)                           = nullptr;
 };
 
 class pool {
@@ -464,16 +469,29 @@ private:
             return true;
         }
         const auto t0 = std::chrono::steady_clock::now();
+        const int saved = ops_.current_device != nullptr ? ops_.current_device() : -1;
+        bool ok = true;
         for (uint32_t r = 0; r < kRanks; ++r) {
             if ((s.pending_ranks & (uint32_t(1) << r)) == 0) {
                 continue;
             }
+            if (ops_.select_device != nullptr && !ops_.select_device(int(r))) {
+                ok = false;
+                break;
+            }
             if (s.events[r] == nullptr || ops_.event_sync == nullptr ||
                     !ops_.event_sync(s.events[r])) {
-                disabled_.store(true, std::memory_order_relaxed);
-                stats_.wait_fail++;
-                return false;
+                ok = false;
+                break;
             }
+        }
+        if (ops_.restore_device != nullptr) {
+            (void) ops_.restore_device(saved);
+        }
+        if (!ok) {
+            disabled_.store(true, std::memory_order_relaxed);
+            stats_.wait_fail++;
+            return false;
         }
         const auto t1 = std::chrono::steady_clock::now();
         stats_.wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());

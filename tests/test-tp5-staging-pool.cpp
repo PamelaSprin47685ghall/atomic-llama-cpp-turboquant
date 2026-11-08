@@ -81,6 +81,28 @@ bool fake_device_ptr(void *, void ** out) {
     return true;
 }
 
+int g_current_device = 0;
+int g_select_count = 0;
+int g_restore_count = 0;
+int g_last_selected = -1;
+int g_last_restored = -1;
+
+int fake_current_device() {
+    return g_current_device;
+}
+
+bool fake_select_device(int rank) {
+    g_last_selected = rank;
+    ++g_select_count;
+    return true;
+}
+
+bool fake_restore_device(int physical) {
+    g_last_restored = physical;
+    ++g_restore_count;
+    return true;
+}
+
 backend_ops fake_ops() {
     backend_ops ops;
     ops.host_alloc    = fake_alloc;
@@ -552,6 +574,38 @@ int test_layout_predicate() {
     return 0;
 }
 
+int test_wait_device_switch() {
+    backend_ops ops = fake_ops();
+    ops.current_device = fake_current_device;
+    ops.select_device  = fake_select_device;
+    ops.restore_device = fake_restore_device;
+    g_current_device = 5;
+    g_select_count = 0;
+    g_restore_count = 0;
+    g_last_selected = -1;
+    g_last_restored = -1;
+
+    pool p(ops);
+    uint8_t src[32];
+    uint8_t dst[32];
+    std::memset(src, 0x55, sizeof(src));
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr));
+    CHECK(p.enqueue(a, 3, dst, sizeof(src), nullptr));
+
+    // Events live on their recording devices. The wait selects each pending
+    // rank, then restores the caller's physical device.
+    CHECK(p.wait(a));
+    CHECK(g_select_count == 2);
+    CHECK(g_restore_count == 1);
+    CHECK(g_last_restored == 5);
+    p.release(a);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -578,6 +632,7 @@ int main() {
         {"source_mutation_isolation",  test_source_mutation_isolation},
         {"fallback_reupload",          test_fallback_reupload},
         {"layout_predicate",           test_layout_predicate},
+        {"wait_device_switch",         test_wait_device_switch},
     };
 
     int failed = 0;
@@ -585,6 +640,9 @@ int main() {
         g_fail_alloc = false;
         g_fail_sync = false;
         g_fail_copy_remaining = 0;
+        g_current_device = 0;
+        g_select_count = 0;
+        g_restore_count = 0;
         const int rc = t.fn();
         std::printf("%s %s\n", rc == 0 ? "PASS" : "FAIL", t.name);
         failed += rc != 0;

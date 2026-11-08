@@ -871,6 +871,10 @@ bool enqueue_async_impl(const lease & l, ggml_backend_t backend,
         return false;
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    // The stream belongs to this backend's device. Without the switch the
+    // memcpy and event land on the caller's current device and HIP returns
+    // ERROR_INVALID_RESOURCE_HANDLE.
+    ggml_cuda_set_device(cuda_ctx->device);
     return global_pool().enqueue(l, cuda_ctx->device,
                                  (char *) tensor->data + offset, size, cuda_ctx->stream());
 }

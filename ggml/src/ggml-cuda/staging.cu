@@ -35,12 +35,21 @@ bool hip_event_create(void ** out) {
 }
 
 bool hip_event_record(void * event, void * stream) {
-    return cudaEventRecord(reinterpret_cast<cudaEvent_t>(event),
-                           reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess;
+    if (cudaEventRecord(reinterpret_cast<cudaEvent_t>(event),
+                        reinterpret_cast<cudaStream_t>(stream)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
 }
 
 bool hip_event_sync(void * event) {
-    return cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(event)) == cudaSuccess;
+    if (cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(event)) != cudaSuccess) {
+        // Clear the sticky error so the caller's fallback path starts clean.
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
 }
 
 void hip_event_destroy(void * event) {
@@ -50,8 +59,12 @@ void hip_event_destroy(void * event) {
 }
 
 bool hip_copy_h2d(void * dst, const void * src, size_t bytes, void * stream) {
-    return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice,
-                           reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess;
+    if (cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice,
+                        reinterpret_cast<cudaStream_t>(stream)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
 }
 
 bool hip_device_ptr(void * host, void ** out) {
@@ -64,6 +77,35 @@ bool hip_device_ptr(void * host, void ** out) {
     return true;
 }
 
+int hip_current_device() {
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1;
+    }
+    return device;
+}
+
+bool hip_select_device(int rank) {
+    if (rank < 0 || rank >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    // ggml_cuda_set_device translates the virtual rank to the physical GPU.
+    ggml_cuda_set_device(rank);
+    return true;
+}
+
+bool hip_restore_device(int physical) {
+    if (physical < 0) {
+        return true;
+    }
+    if (cudaSetDevice(physical) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 const backend_ops kHipOps = {
     /* .host_alloc   = */ hip_host_alloc,
     /* .host_free    = */ hip_host_free,
@@ -73,6 +115,9 @@ const backend_ops kHipOps = {
     /* .event_destroy= */ hip_event_destroy,
     /* .copy_h2d     = */ hip_copy_h2d,
     /* .device_ptr   = */ hip_device_ptr,
+    /* .current_device = */ hip_current_device,
+    /* .select_device  = */ hip_select_device,
+    /* .restore_device = */ hip_restore_device,
 };
 
 bool api_acquire(uint32_t window, kind k, size_t bytes, lease * out) {
