@@ -873,12 +873,12 @@
     },
     {
       "path": "tests/test-tp5-staging-pool.cpp",
-      "sha256": "4a1da892f0319bbe72fcc0a41772f7fc5967498c11fc11a668257807e1f8d1ac",
+      "sha256": "acac0f7ce1207f71424fa20d3b782250c2233cf39dc0ab91044b6fa0964a325b",
       "mode": "100644",
       "consumers": [
         "WS4 staging pool CPU test"
       ],
-      "reason": "Cover staging lease reuse, tri-state upload/enqueue, quarantine and fatal fail-stop, submit-gate ordering, device wait selection, and the async reclaim cases: partial rank completion, active-lease exclusion, event re-record, and pending-rank preservation (36/36 in the CPU harness). Cover partial rejection publication: the pool stops, submission_pending is true, no native error is invented, the slot is quarantined and no later submit is accepted. Mirror the frozen v1 api prefix and static-assert that v2 fields are appended; cover partial rejection publication, the fatal submit gate and refusal to acquire after the stop.",
+      "reason": "Cover staging lease reuse, tri-state upload/enqueue, quarantine and fatal fail-stop, submit-gate ordering, device wait selection, and the async reclaim cases: partial rank completion, active-lease exclusion, event re-record, and pending-rank preservation (36/36 in the CPU harness). Cover partial rejection publication: the pool stops, submission_pending is true, no native error is invented, the slot is quarantined and no later submit is accepted. Mirror the frozen v1 api prefix and static-assert that v2 fields are appended; cover partial rejection publication, the fatal submit gate and refusal to acquire after the stop. Assert the pool is clean before mark_partial so the state transition is attributable to it.",
       "removal_condition": "Remove with the WS4 staging pool test target."
     },
     {
@@ -953,12 +953,12 @@
     },
     {
       "path": "docs/tp5-staging-submission.md",
-      "sha256": "4f5f7f76d558bfe991ff5f2eef026d345e4e76e16e9737f8f417ff604b9a37bf",
+      "sha256": "448a20568e4663ba8837470f93e3c3b3d03e16ac30a778f2159f470c5cf83bf9",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose staging/Meta integration maintainers"
       ],
-      "reason": "Record the async submission boundary, staging pool ownership and retention contract, the prefab sub-envelope mask row-count rule, and the CPU/ASan evidence used by the WS4 integration. The async MIRRORED lane now reclaims completed pending slots with a non-blocking event query; the recorded CPU probe reaches lease_ok=343, no_slot=0, reaps=333, queries=1665 with completed events, while in-flight events preserve the fallback. Record the helper pre/post fail-stop checks, partial-rejection publication, the caller/source-binary cutover, the frozen overlay status and the LoRA-adapter proof limit. Record the v2 append-only api prefix, partial-rejection publication with first_error zero, the synchronous setter's unobservable partial write, and the bare-adapter runtime test. Record that adapter free and the final model free are caller-serialized and that the retained path keeps the model alive.",
+      "reason": "Record the async submission boundary, staging pool ownership and retention contract, the prefab sub-envelope mask row-count rule, and the CPU/ASan evidence used by the WS4 integration. The async MIRRORED lane now reclaims completed pending slots with a non-blocking event query; the recorded CPU probe reaches lease_ok=343, no_slot=0, reaps=333, queries=1665 with completed events, while in-flight events preserve the fallback. Record the helper pre/post fail-stop checks, partial-rejection publication, the caller/source-binary cutover, the frozen overlay status and the LoRA-adapter proof limit. Record the v2 append-only api prefix, partial-rejection publication with first_error zero, the synchronous setter's unobservable partial write, and the bare-adapter runtime test. Record that adapter free and the final model free are caller-serialized and that the retained path keeps the model alive. Record that both Meta partial lanes and the mark-before-release ordering are exercised.",
       "removal_condition": "Remove when the maintained fork documentation carries the same contracts or the WS4 async-staging work is upstreamed."
     },
     {
@@ -1041,9 +1041,9 @@
       "consumers": [
         "TP5 staging Meta partial-enqueue CPU test"
       ],
-      "reason": "Build a real Meta backend over two CPU child devices and inject a v2 staging table that queues rank 0 and cleanly rejects rank 1. The test proves the partial branch calls mark_partial, releases the lease, publishes submission_pending with first_error zero, and stops the next set at the fatal gate; it also checks v1 prefix acceptance and unknown-version rejection.",
+      "reason": "Build a real Meta backend over two CPU child devices and inject a v2 staging table that queues rank 0 and cleanly rejects rank 1. The test proves the partial branch calls mark_partial, releases the lease, publishes submission_pending with first_error zero, and stops the next set at the fatal gate; it also checks v1 prefix acceptance and unknown-version rejection. Drive both the synchronous merge-wait and asynchronous partial lanes, assert mark_partial runs before release, and check the fatal gate afterwards.",
       "removal_condition": "Remove with the TP5 staging partial-enqueue path or when upstream supplies an equivalent CPU-testable fault-publication contract.",
-      "sha256": "7918747031c893f204d4310307a4ba498cc33862fb4d884e5c54e2976956de1c",
+      "sha256": "276559ef7a50fee50bea3c117857272458a1737f929452fe6f3597b84895794a",
       "mode": "100644"
     },
     {

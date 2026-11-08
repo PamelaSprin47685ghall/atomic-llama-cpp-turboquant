@@ -393,7 +393,9 @@ quarantined, and later upload/enqueue/wait/enter_submit/acquire calls fail.
 
 The Meta partial test builds a real Meta backend over two CPU child devices and
 injects a v2 staging table whose enqueue queues rank 0 and rejects rank 1. It
-asserts the partial branch calls `mark_partial` and releases the lease, that
+covers both the synchronous buffer-set lane (`merge_wait` + `enqueue_sync`)
+and the asynchronous lane (`acquire_nowait` + `enqueue_async`). It asserts the
+partial branch calls `mark_partial` before releasing the lease, that
 `submission_pending` becomes true with `first_error == 0`, and that the next
 set hits the fatal submit gate without another enqueue. It also checks that
 registration accepts the v1 prefix, accepts v2, and rejects a future version.

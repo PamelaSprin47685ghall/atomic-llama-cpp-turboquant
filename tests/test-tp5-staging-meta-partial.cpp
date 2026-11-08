@@ -1,12 +1,15 @@
 // TP5 staging Meta partial-enqueue CPU test (no GPU, no HIP runtime).
 //
-// A MIRRORED Meta set can queue rank 0 and then get a clean rejection from
-// rank 1. The destination is partially written; the Meta layer must call the
-// v2 staging mark_partial entry instead of returning a silent success.
+// A MIRRORED Meta submission can queue rank 0 and then get a clean rejection
+// from rank 1. The destination is partially written; the Meta layer must call
+// the v2 staging mark_partial entry instead of returning a silent success.
+//
+// Both lanes are exercised:
+//   * the synchronous buffer set path (merge_wait + enqueue_sync), and
+//   * the asynchronous backend path (acquire_nowait + enqueue_async).
 //
 // The test builds a real Meta backend over two CPU child devices and injects a
-// host-only staging api table. Its enqueue_async returns ok once then rejected.
-// No CUDA symbol is linked.
+// host-only staging api table. No CUDA symbol is linked.
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -37,9 +40,12 @@ int g_failures = 0;
 struct fake_staging_state {
     int  mark_partial_calls = 0;
     int  enqueue_calls      = 0;
+    int  sync_enqueue_calls = 0;
     int  release_calls      = 0;
     int  enter_submit_calls = 0;
     bool pending            = false;
+    bool released           = false;
+    bool merge_wait_mode    = false;
 };
 
 fake_staging_state g_fake;
@@ -47,14 +53,22 @@ fake_staging_state g_fake;
 bool fake_enabled()   { return !g_fake.pending; }
 bool fake_usable()    { return !g_fake.pending; }
 bool fake_configured(){ return true; }
-bool fake_merge_wait(){ return false; }
+bool fake_merge_wait(){ return g_fake.merge_wait_mode; }
 
-bool fake_acquire_nowait(uint32_t, kind, size_t, lease * out) {
+bool fake_acquire_common(lease * out) {
     if (g_fake.pending || out == nullptr) {
         return false;
     }
     *out = {};
     return true;
+}
+
+bool fake_acquire(uint32_t, kind, size_t, lease * out) {
+    return fake_acquire_common(out);
+}
+
+bool fake_acquire_nowait(uint32_t, kind, size_t, lease * out) {
+    return fake_acquire_common(out);
 }
 
 int fake_upload(const lease *, const void * src, size_t bytes) {
@@ -67,6 +81,8 @@ bool fake_wait(const lease *) {
 }
 
 void fake_release(const lease *) {
+    CHECK(!g_fake.released);
+    g_fake.released = true;
     ++g_fake.release_calls;
 }
 
@@ -78,6 +94,16 @@ int fake_enqueue_async(const lease *, ggml_backend_t, ggml_tensor *, size_t, siz
     ++g_fake.enqueue_calls;
     // Rank 0 is queued; rank 1 is a clean rejection before any copy.
     return g_fake.enqueue_calls == 1
+        ? int(submit_result::ok) : int(submit_result::rejected);
+}
+
+bool fake_can_enqueue_sync(ggml_tensor *, size_t, size_t) {
+    return !g_fake.pending;
+}
+
+int fake_enqueue_sync(const lease *, ggml_tensor *, size_t, size_t) {
+    ++g_fake.sync_enqueue_calls;
+    return g_fake.sync_enqueue_calls == 1
         ? int(submit_result::ok) : int(submit_result::rejected);
 }
 
@@ -104,6 +130,7 @@ bool fake_submission_pending() {
 void fake_mark_partial(const lease * l, const void * dst) {
     CHECK(l != nullptr);
     CHECK(dst != nullptr);
+    CHECK(!g_fake.released); // mark_partial must run before the lease release
     ++g_fake.mark_partial_calls;
     g_fake.pending = true;
 }
@@ -112,7 +139,7 @@ const api g_fake_api = {
     /* .abi_version       = */ kApiVersion,
     /* .enabled           = */ fake_enabled,
     /* .merge_wait        = */ fake_merge_wait,
-    /* .acquire           = */ nullptr,
+    /* .acquire           = */ fake_acquire,
     /* .acquire_nowait    = */ fake_acquire_nowait,
     /* .upload            = */ fake_upload,
     /* .upload_rows       = */ nullptr,
@@ -123,8 +150,8 @@ const api g_fake_api = {
     /* .dump              = */ nullptr,
     /* .can_enqueue_async = */ fake_can_enqueue_async,
     /* .enqueue_async     = */ fake_enqueue_async,
-    /* .can_enqueue_sync  = */ nullptr,
-    /* .enqueue_sync      = */ nullptr,
+    /* .can_enqueue_sync  = */ fake_can_enqueue_sync,
+    /* .enqueue_sync      = */ fake_enqueue_sync,
     /* .first_error       = */ fake_first_error,
     /* .enter_submit      = */ fake_enter_submit,
     /* .leave_submit      = */ fake_leave_submit,
@@ -138,6 +165,47 @@ const api g_fake_api = {
 
 ggml_backend_meta_split_state split_mirrored(const ggml_tensor *, void *) {
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+struct meta_fixture {
+    ggml_backend_t        backend = nullptr;
+    ggml_context *        ctx     = nullptr;
+    ggml_backend_buffer_t buffer  = nullptr;
+    ggml_tensor *         tensor  = nullptr;
+};
+
+bool make_fixture(ggml_backend_dev_t cpu, meta_fixture & fixture) {
+    ggml_backend_dev_t children[] = { cpu, cpu };
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(children, 2, split_mirrored, nullptr);
+    CHECK(meta_dev != nullptr);
+    if (meta_dev == nullptr) {
+        return false;
+    }
+    fixture.backend = ggml_backend_dev_init(meta_dev, nullptr);
+    CHECK(fixture.backend != nullptr);
+    if (fixture.backend == nullptr) {
+        return false;
+    }
+
+    ggml_init_params params = { /*.mem_size=*/ 64 * 1024, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+    fixture.ctx = ggml_init(params);
+    CHECK(fixture.ctx != nullptr);
+    if (fixture.ctx == nullptr) {
+        return false;
+    }
+
+    fixture.tensor = ggml_new_tensor_2d(fixture.ctx, GGML_TYPE_F32, 4, 4);
+    CHECK(fixture.tensor != nullptr);
+    if (fixture.tensor == nullptr) {
+        return false;
+    }
+    fixture.tensor->flags |= GGML_TENSOR_FLAG_INPUT; // the staging lane only rotates graph inputs
+
+    fixture.buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+            fixture.ctx, ggml_backend_dev_buffer_type(meta_dev));
+    CHECK(fixture.buffer != nullptr);
+    CHECK(fixture.tensor->data != nullptr);
+    return fixture.buffer != nullptr && fixture.tensor->data != nullptr;
 }
 
 } // namespace
@@ -166,56 +234,56 @@ int main() {
         return 1;
     }
 
-    ggml_backend_dev_t children[] = { cpu, cpu };
-    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(children, 2, split_mirrored, nullptr);
-    CHECK(meta_dev != nullptr);
-    ggml_backend_t meta = meta_dev != nullptr ? ggml_backend_dev_init(meta_dev, nullptr) : nullptr;
-    CHECK(meta != nullptr);
-    if (meta == nullptr) {
-        return 1;
+    // Synchronous buffer-set lane: merge_wait is enabled, rank 0 is queued and
+    // rank 1 rejects. The void setter cannot return the fault, but mark_partial
+    // must publish it and the next operations must see the fail-stop state.
+    {
+        g_fake = {};
+        g_fake.merge_wait_mode = true;
+
+        meta_fixture sync_fixture;
+        if (!make_fixture(cpu, sync_fixture)) {
+            return 1;
+        }
+        std::vector<uint8_t> source(ggml_nbytes(sync_fixture.tensor), 0x5a);
+        ggml_backend_tensor_set(sync_fixture.tensor, source.data(), 0, source.size());
+
+        CHECK(g_fake.sync_enqueue_calls == 2);
+        CHECK(g_fake.mark_partial_calls == 1);
+        CHECK(g_fake.release_calls == 1);
+        CHECK(g_fake.pending);
+        CHECK(g_fake.enter_submit_calls == 0); // partial returns before the fallback
     }
 
-    ggml_init_params params = { /*.mem_size=*/ 64 * 1024, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
-    ggml_context * ctx = ggml_init(params);
-    CHECK(ctx != nullptr);
-    if (ctx == nullptr) {
-        return 1;
+    // Asynchronous backend lane: the same partial publication, then the next
+    // set hits the fatal submit gate without another enqueue or fallback write.
+    {
+        g_fake = {};
+
+        meta_fixture async_fixture;
+        if (!make_fixture(cpu, async_fixture)) {
+            return 1;
+        }
+        std::vector<uint8_t> source(ggml_nbytes(async_fixture.tensor), 0x5a);
+        ggml_backend_tensor_set_async(
+                async_fixture.backend, async_fixture.tensor, source.data(), 0, source.size());
+
+        CHECK(g_fake.enqueue_calls == 2);          // rank 0 ok, rank 1 rejected
+        CHECK(g_fake.mark_partial_calls == 1);     // the partial state was published
+        CHECK(g_fake.release_calls == 1);          // the lease was released after marking
+        CHECK(g_fake.pending);                     // submission_pending() is now true
+
+        const int enqueues_before = g_fake.enqueue_calls;
+        const int enters_before   = g_fake.enter_submit_calls;
+        ggml_backend_tensor_set_async(
+                async_fixture.backend, async_fixture.tensor, source.data(), 0, source.size());
+        CHECK(g_fake.enqueue_calls == enqueues_before);
+        CHECK(g_fake.enter_submit_calls == enters_before + 1);
     }
 
-    ggml_tensor * tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 4);
-    CHECK(tensor != nullptr);
-    if (tensor == nullptr) {
-        return 1;
-    }
-    tensor->flags |= GGML_TENSOR_FLAG_INPUT; // the staging lane only rotates graph inputs
-
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(
-            ctx, ggml_backend_dev_buffer_type(meta_dev));
-    CHECK(buffer != nullptr);
-    CHECK(tensor->data != nullptr);
-    if (buffer == nullptr) {
-        return 1;
-    }
-
-    std::vector<uint8_t> source(ggml_nbytes(tensor), 0x5a);
-    ggml_backend_tensor_set_async(meta, tensor, source.data(), 0, source.size());
-
-    CHECK(g_fake.enqueue_calls == 2);          // rank 0 ok, rank 1 rejected
-    CHECK(g_fake.mark_partial_calls == 1);     // the partial state was published
-    CHECK(g_fake.release_calls == 1);          // the lease was released after marking
-    CHECK(g_fake.pending);                     // submission_pending() is now true
-
-    // The pool is fail-stop: the next set hits enter_submit() and returns
-    // without another enqueue or a fallback write.
-    const int enqueues_before = g_fake.enqueue_calls;
-    const int enters_before   = g_fake.enter_submit_calls;
-    ggml_backend_tensor_set_async(meta, tensor, source.data(), 0, source.size());
-    CHECK(g_fake.enqueue_calls == enqueues_before);
-    CHECK(g_fake.enter_submit_calls == enters_before + 1);
-
-    // The destination and Meta owner are intentionally retained: freeing them
-    // here would contradict the unknown-submission contract. The process owns
-    // them until exit (run with ASAN_OPTIONS=detect_leaks=0).
+    // The destinations and Meta owners are intentionally retained: freeing
+    // them here would contradict the unknown-submission contract. The process
+    // owns them until exit (run with ASAN_OPTIONS=detect_leaks=0).
     if (g_failures != 0) {
         std::fprintf(stderr, "TP5_STAGING_META_PARTIAL_TEST FAIL (%d)\n", g_failures);
         return 1;

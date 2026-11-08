@@ -1057,6 +1057,8 @@ int test_partial_rejection_marks_pool() {
     // cleanly. That is a partially written destination, not a clean rejection:
     // the pool must stop and publish an unknown submission with no native
     // error code.
+    CHECK(p.usable());
+    CHECK(!p.submission_pending());
     p.mark_partial(a, dst);
     CHECK(!p.usable());
     CHECK(p.submission_pending());
