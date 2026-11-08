@@ -504,6 +504,14 @@ public:
         return unknown_count_;
     }
 
+    // True while an asynchronous submission may still be in flight. The
+    // scheduler/context owner keeps the destination until this clears; it
+    // never clears for an unprovable submission.
+    bool submission_pending() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return disabled_.load(std::memory_order_relaxed) || unknown_count_ > 0;
+    }
+
     void dump(std::FILE * f) const {
         std::lock_guard<std::mutex> lock(mutex_);
         std::fprintf(f, "TP5_STAGING pool_bytes=%zu max_bytes=%zu disabled=%d\n",
@@ -779,6 +787,7 @@ struct api {
     bool (*enter_submit)();
     void (*leave_submit)();
     size_t (*unknown_count)();
+    bool (*submission_pending)();
     // configured: GGML_TP5_STAGING requests the pool. usable: the pool has not
     // stopped. A configured but unusable pool is a global fault.
     bool (*configured)();

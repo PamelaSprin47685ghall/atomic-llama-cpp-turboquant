@@ -343,6 +343,11 @@ static const bool ggml_backend_meta_compose_event_gate = [] {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }();
 
+// Implemented next to graph_compute; exposed through the reg proc-address
+// capability so no backend iface layout changes.
+static int  ggml_backend_meta_submission_error(ggml_backend_t backend);
+static bool ggml_backend_meta_submission_pending(ggml_backend_t backend);
+
 static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .get_name             = */ ggml_backend_meta_device_get_name,
     /* .get_description      = */ ggml_backend_meta_device_get_description,
@@ -359,6 +364,45 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
+};
+
+static const char * ggml_backend_meta_reg_get_name(ggml_backend_reg_t) {
+    return "Meta";
+}
+
+static size_t ggml_backend_meta_reg_get_device_count(ggml_backend_reg_t) {
+    return 0;
+}
+
+static ggml_backend_dev_t ggml_backend_meta_reg_get_device(ggml_backend_reg_t, size_t) {
+    return nullptr;
+}
+
+static void * ggml_backend_meta_reg_get_proc_address(ggml_backend_reg_t, const char * name) {
+    if (std::strcmp(name, "ggml_backend_submission_error") == 0) {
+        return reinterpret_cast<void *>(+[](ggml_backend_t backend) -> int {
+            return ggml_backend_meta_submission_error(backend);
+        });
+    }
+    if (std::strcmp(name, "ggml_backend_submission_pending") == 0) {
+        return reinterpret_cast<void *>(+[](ggml_backend_t backend) -> bool {
+            return ggml_backend_meta_submission_pending(backend);
+        });
+    }
+    return nullptr;
+}
+
+static const ggml_backend_reg_i ggml_backend_meta_reg_i = {
+    /* .get_name         = */ ggml_backend_meta_reg_get_name,
+    /* .get_device_count = */ ggml_backend_meta_reg_get_device_count,
+    /* .get_device       = */ ggml_backend_meta_reg_get_device,
+    /* .get_proc_address = */ ggml_backend_meta_reg_get_proc_address,
+};
+
+static ggml_backend_reg ggml_backend_meta_reg = {
+    /* .api_version = */ GGML_BACKEND_API_VERSION,
+    /* .iface       = */ ggml_backend_meta_reg_i,
+    /* .context     = */ nullptr,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -402,7 +446,7 @@ ggml_backend_dev_t ggml_backend_meta_device(
 
     struct ggml_backend_device meta_dev = {
         /*iface  =*/ ggml_backend_meta_device_iface,
-        /*reg    =*/ nullptr,
+        /*reg    =*/ &ggml_backend_meta_reg,
         /*ctx    =*/ ctxs.back().get(),
     };
 
@@ -2583,6 +2627,15 @@ static int ggml_backend_meta_submission_error(ggml_backend_t backend) {
     return st->first_error != nullptr ? st->first_error() : -1;
 }
 
+static bool ggml_backend_meta_submission_pending(ggml_backend_t backend) {
+    (void) backend;
+    const ggml_cuda_staging::api * st = staging_api();
+    if (st == nullptr || st->configured == nullptr || !st->configured()) {
+        return false;
+    }
+    return st->submission_pending != nullptr ? st->submission_pending() : false;
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     const int64_t diag_start = ggml_time_us();
     if (ggml_backend_meta_submission_error(backend) != 0) {
@@ -4515,7 +4568,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_tensor * node_tmp = get_node_aux(node_dst);
             set_tmp_data(node_tmp, j_dst, i_buf);
 
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+            // Child backends have no staging capability; a false result means
+            // a synchronous copy was performed by the helper.
+            (void) ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
 
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
@@ -4583,7 +4638,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+            (void) ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
         }
 
         return GGML_STATUS_SUCCESS;
@@ -4640,7 +4695,6 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
     /* .graph_optimize          = */ nullptr,
-    /* .submission_error        = */ ggml_backend_meta_submission_error,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {

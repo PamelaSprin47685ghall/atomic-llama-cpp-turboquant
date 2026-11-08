@@ -142,11 +142,6 @@ extern "C" {
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph);
 
-        // (optional) Nonzero when the last asynchronous submission may still
-        // be in flight and its completion is unprovable. The scheduler must
-        // not replay the destination and must keep the copy slots alive until
-        // this returns 0 (or the process/context is destroyed).
-        int (*submission_error)(ggml_backend_t backend);
     };
 
     struct ggml_backend {

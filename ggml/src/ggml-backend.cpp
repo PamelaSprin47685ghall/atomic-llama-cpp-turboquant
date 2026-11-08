@@ -637,6 +637,29 @@ ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend) {
 
 // backend copy
 
+// Optional backend capability negotiated through the existing reg proc-address
+// hook. Backends without it report no error and no pending submission.
+typedef int  (*ggml_backend_submission_error_t)(ggml_backend_t);
+typedef bool (*ggml_backend_submission_pending_t)(ggml_backend_t);
+
+static int ggml_backend_sched_submission_error(ggml_backend_t backend) {
+    if (backend == nullptr || backend->device == nullptr || backend->device->reg == nullptr) {
+        return 0;
+    }
+    auto fn = (ggml_backend_submission_error_t)
+        ggml_backend_reg_get_proc_address(backend->device->reg, "ggml_backend_submission_error");
+    return fn != nullptr ? fn(backend) : 0;
+}
+
+static bool ggml_backend_sched_submission_pending(ggml_backend_t backend) {
+    if (backend == nullptr || backend->device == nullptr || backend->device->reg == nullptr) {
+        return false;
+    }
+    auto fn = (ggml_backend_submission_pending_t)
+        ggml_backend_reg_get_proc_address(backend->device->reg, "ggml_backend_submission_pending");
+    return fn != nullptr ? fn(backend) : false;
+}
+
 void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
@@ -664,11 +687,11 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
     }
 }
 
-void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+bool ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
-        return;
+        return true;
     }
 
     GGML_ASSERT(backend_dst);
@@ -677,8 +700,11 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
         ggml_backend_moe_cache_invalidate_buffer(
                 dst_buf, dst->data, ggml_nbytes(dst));
         if (backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
-            return;
+            // Accepted. A nonzero capability answer means the completion is
+            // unprovable: report failure instead of replaying the destination.
+            return ggml_backend_sched_submission_error(backend_dst) == 0;
         }
+        // Rejected with no side effects: the blocking copy below is safe.
     }
 
     // an async copy would normally happen after all the queued operations on both backends are completed
@@ -686,6 +712,7 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     ggml_backend_synchronize(backend_src);
     ggml_backend_synchronize(backend_dst);
     ggml_backend_tensor_copy(src, dst);
+    return true;
 }
 
 // events
@@ -1910,14 +1937,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const bool was_pending = input_copies.pending;
                     input_copies.pending = true;
                     if (split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        if (split_backend->iface.submission_error != nullptr) {
-                            const int sub_err = split_backend->iface.submission_error(split_backend);
-                            if (sub_err != 0) {
-                                // Unknown submission: keep the destination and
-                                // stop. Do not flush or replay the copy.
-                                sched->submission_failed = sub_err;
-                                return GGML_STATUS_FAILED;
-                            }
+                        const int sub_err = ggml_backend_sched_submission_error(split_backend);
+                        if (sub_err != 0) {
+                            // Unknown submission: keep the destination and
+                            // stop. Do not flush or replay the copy.
+                            sched->submission_failed = sub_err;
+                            return GGML_STATUS_FAILED;
                         }
                         continue;
                     }
@@ -2025,8 +2050,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     const bool copied = split_backend->iface.cpy_tensor_async != nullptr &&
                         split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
-                    if (copied && split_backend->iface.submission_error != nullptr) {
-                        const int sub_err = split_backend->iface.submission_error(split_backend);
+                    if (copied) {
+                        const int sub_err = ggml_backend_sched_submission_error(split_backend);
                         if (sub_err != 0) {
                             sched->submission_failed = sub_err;
                             return GGML_STATUS_FAILED;
@@ -2249,6 +2274,22 @@ void ggml_backend_sched_set_moe_cache(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->submission_failed != 0) {
+        bool pending = false;
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (ggml_backend_sched_submission_pending(sched->backends[b])) {
+                pending = true;
+                break;
+            }
+        }
+        if (pending) {
+            // Keep the copy slots and their buffers: an in-flight copy may
+            // still read them. The process owns them until exit; this is not
+            // a claim that the submission drained.
+            GGML_LOG_ERROR("%s: retaining copy slots, an async submission is still unproven\n", __func__);
+            return;
+        }
     }
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
         sched->moe_cache_api.session_destroy(sched->moe_cache_session);

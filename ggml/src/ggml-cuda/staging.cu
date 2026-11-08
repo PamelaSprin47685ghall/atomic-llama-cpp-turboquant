@@ -185,6 +185,10 @@ size_t api_unknown_count() {
     return global_pool().unknown_count();
 }
 
+bool api_submission_pending() {
+    return global_pool().submission_pending();
+}
+
 const api kApi = {
     /* .abi_version       = */ 1,
     /* .enabled           = */ enabled,
@@ -206,6 +210,7 @@ const api kApi = {
     /* .enter_submit      = */ api_enter_submit,
     /* .leave_submit      = */ api_leave_submit,
     /* .unknown_count     = */ api_unknown_count,
+    /* .submission_pending= */ api_submission_pending,
     /* .configured        = */ configured,
     /* .usable            = */ usable,
     /* .zc_enabled        = */ api_zc_enabled,
