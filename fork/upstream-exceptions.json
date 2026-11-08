@@ -510,7 +510,7 @@
     },
     {
       "path": "src/llama-kv-cache.cpp",
-      "sha256": "e6f828fa75e157fd0f084a14fe170c7dfe82c1e5c74655cba41154dbb5f81dcb",
+      "sha256": "3a1acf60d2061de29a8e01b018de2bc66909b54c3b0b091976553dd80ba892c7",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
@@ -522,7 +522,7 @@
     },
     {
       "path": "src/llama-kv-cache.h",
-      "sha256": "449b9f8b397c7509c9ec6eb37795e6d13af2d58874287338572be7ad7acbc4da",
+      "sha256": "8265ab2018a50ba142ff85256a255732df80d656614895aa200f2ab77b9dc205",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
@@ -821,7 +821,7 @@
     },
     {
       "path": "tests/test-tp5-ubatch-pool.cpp",
-      "sha256": "1cb07dcefc94f10d2d83940fe7d40de93fd90998d4462e18b3626df2c65e73ae",
+      "sha256": "4b0a4b63716fba5fc7b8fb3f39b0aa471fc982a0fec429c0c66bffc402721999",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
