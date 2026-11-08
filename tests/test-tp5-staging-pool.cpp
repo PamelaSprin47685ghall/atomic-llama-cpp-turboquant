@@ -17,6 +17,7 @@ namespace {
 
 int g_allocs = 0;
 int g_frees = 0;
+int g_destroys = 0;
 int g_events = 0;
 int g_records = 0;
 int g_syncs = 0;
@@ -73,6 +74,7 @@ bool fake_event_sync(void *) {
 
 void fake_event_destroy(void * p) {
     std::free(p);
+    ++g_destroys;
 }
 
 bool fake_copy(void * dst, const void * src, size_t bytes, void *) {
@@ -582,7 +584,7 @@ int test_source_mutation_isolation() {
     return 0;
 }
 
-int test_fallback_reupload() {
+int test_partial_enqueue_stops_pool() {
     pool p(fake_ops());
     uint8_t src[64];
     uint8_t dst0[64] = {};
@@ -593,23 +595,90 @@ int test_fallback_reupload() {
     CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
     CHECK(p.upload(a, src, sizeof(src)));
 
-    // Rank 0 is queued, rank 1 fails: the pool disables and the caller falls
-    // back to the pageable path.
+    // Rank 0 is queued; rank 1's copy fails. Whether anything was queued is
+    // unprovable, so the slot is quarantined and the pool stops.
     CHECK(p.enqueue(a, 0, dst0, sizeof(src), nullptr));
     g_fail_copy_remaining = 1;
     CHECK(!p.enqueue(a, 1, dst1, sizeof(src), nullptr));
     CHECK(!p.usable());
+    CHECK(p.snapshot().quarantine == 1);
     CHECK(g_fail_copy_remaining == 0);
 
-    // The fallback repeats the copies from the same source. A fresh upload and
-    // a full enqueue must still deliver the source bytes.
-    CHECK(p.upload(a, src, sizeof(src)));
-    CHECK(p.enqueue(a, 0, dst0, sizeof(src), nullptr));
-    CHECK(p.enqueue(a, 1, dst1, sizeof(src), nullptr));
-    CHECK(p.wait(a));
-    CHECK(std::memcmp(dst0, src, sizeof(src)) == 0);
-    CHECK(std::memcmp(dst1, src, sizeof(src)) == 0);
+    // No lease operation may continue after the stop. The caller falls back
+    // outside the pool with the original pageable path.
+    CHECK(!p.upload(a, src, sizeof(src)));
+    CHECK(!p.enqueue(a, 0, dst0, sizeof(src), nullptr));
+    CHECK(!p.wait(a));
     p.release(a);
+    return 0;
+}
+
+int test_copy_failure_quarantine() {
+    pool p(fake_ops());
+    uint8_t src[64] = {};
+    uint8_t dst[64] = {};
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+
+    g_fail_copy_remaining = 1;
+    g_peek_error = 13;
+    CHECK(!p.enqueue(a, 0, dst, sizeof(src), nullptr));
+    CHECK(!p.usable());
+    CHECK(p.snapshot().quarantine == 1);
+    CHECK(p.snapshot().first_error == 13);
+    CHECK(p.pool_bytes() > 0);  // retained: a copy may still read it
+    p.release(a);
+    CHECK(!p.upload(a, src, sizeof(src)));
+    g_peek_error = 0;
+    return 0;
+}
+
+int test_disabled_blocks_lease_ops() {
+    pool p(fake_ops());
+    uint8_t src[64] = {};
+    uint8_t dst[64] = {};
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+
+    g_fail_event_create = true;
+    CHECK(!p.enqueue(a, 0, dst, sizeof(src), nullptr));
+    g_fail_event_create = false;
+    CHECK(!p.usable());
+
+    // An existing lease cannot bypass the stop.
+    CHECK(!p.upload(a, src, sizeof(src)));
+    CHECK(!p.enqueue(a, 1, dst, sizeof(src), nullptr));
+    CHECK(!p.wait(a));
+    CHECK(p.device_ptr(a, 0) == nullptr);
+
+    const uint64_t stale_before = p.snapshot().stale_release;
+    p.release(a);  // releasing the handle is still allowed
+    CHECK(p.snapshot().stale_release == stale_before);
+    g_peek_error = 0;
+    return 0;
+}
+
+int test_quarantine_destructor_retains() {
+    const int frees_before = g_frees;
+    const int destroys_before = g_destroys;
+    {
+        pool p(fake_ops());
+        uint8_t src[64] = {};
+        uint8_t dst[64] = {};
+        lease a;
+        CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+        CHECK(p.upload(a, src, sizeof(src)));
+        g_fail_event_create = true;
+        CHECK(!p.enqueue(a, 0, dst, sizeof(src), nullptr));
+        g_fail_event_create = false;
+        p.release(a);
+    }
+    // The destructor must not free or destroy a quarantined slot.
+    CHECK(g_frees == frees_before);
+    CHECK(g_destroys == destroys_before);
+    g_peek_error = 0;
     return 0;
 }
 
@@ -693,11 +762,14 @@ int main() {
         {"wait_failure_disables",      test_wait_failure_disables},
         {"fault_event_create_quarantine", test_fault_event_create_quarantine},
         {"fault_event_record_quarantine", test_fault_event_record_quarantine},
+        {"copy_failure_quarantine",    test_copy_failure_quarantine},
+        {"disabled_blocks_lease_ops",  test_disabled_blocks_lease_ops},
+        {"quarantine_destructor_retains", test_quarantine_destructor_retains},
         {"owns_and_diagnostics",       test_owns_and_diagnostics},
         {"device_ptr",                 test_device_ptr},
         {"staging_candidate",          test_staging_candidate},
         {"source_mutation_isolation",  test_source_mutation_isolation},
-        {"fallback_reupload",          test_fallback_reupload},
+        {"partial_enqueue_stops_pool", test_partial_enqueue_stops_pool},
         {"layout_predicate",           test_layout_predicate},
         {"wait_device_switch",         test_wait_device_switch},
     };

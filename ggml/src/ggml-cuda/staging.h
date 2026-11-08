@@ -140,6 +140,11 @@ public:
         for (auto & win : slots_) {
             for (auto & key : win) {
                 for (auto & s : key) {
+                    // A quarantined slot may still be read by a copy whose
+                    // completion was never proven. Keep it until process exit.
+                    if (s.quarantined) {
+                        continue;
+                    }
                     for (auto & e : s.events) {
                         if (e != nullptr && ops_.event_destroy != nullptr) {
                             ops_.event_destroy(e);
@@ -243,8 +248,12 @@ public:
         uint8_t * host = nullptr;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (disabled_.load(std::memory_order_relaxed)) {
+                stats_.invalid++;
+                return false;
+            }
             slot * s = find_locked(l);
-            if (s == nullptr || bytes > s->cap) {
+            if (s == nullptr || s->quarantined || bytes > s->cap) {
                 stats_.invalid++;
                 return false;
             }
@@ -299,14 +308,21 @@ public:
             return false;
         }
         std::lock_guard<std::mutex> lock(mutex_);
+        if (disabled_.load(std::memory_order_relaxed)) {
+            stats_.invalid++;
+            return false;
+        }
         slot * s = find_locked(l);
-        if (s == nullptr || bytes > s->cap || ops_.copy_h2d == nullptr ||
+        if (s == nullptr || s->quarantined || bytes > s->cap || ops_.copy_h2d == nullptr ||
                 ops_.event_create == nullptr || ops_.event_record == nullptr) {
             stats_.invalid++;
             return false;
         }
         if (!ops_.copy_h2d(dst, s->host, bytes, stream)) {
-            note_fault_locked();
+            // A failed async copy is treated as unknown: the runtime cannot
+            // prove that nothing was queued, so the buffer must not be reused.
+            s->pending = true;
+            quarantine_locked(*s);
             disabled_.store(true, std::memory_order_relaxed);
             stats_.alloc_fail++;
             return false;
@@ -337,8 +353,12 @@ public:
 
     bool wait(const lease & l) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (disabled_.load(std::memory_order_relaxed)) {
+            stats_.invalid++;
+            return false;
+        }
         slot * s = find_locked(l);
-        if (s == nullptr) {
+        if (s == nullptr || s->quarantined) {
             stats_.invalid++;
             return false;
         }
@@ -366,8 +386,11 @@ public:
             return nullptr;
         }
         std::lock_guard<std::mutex> lock(mutex_);
+        if (disabled_.load(std::memory_order_relaxed)) {
+            return nullptr;
+        }
         slot * s = find_locked(l);
-        if (s == nullptr || ops_.device_ptr == nullptr) {
+        if (s == nullptr || s->quarantined || ops_.device_ptr == nullptr) {
             return nullptr;
         }
         if (s->dev_ptrs[rank] == nullptr && !ops_.device_ptr(s->host, &s->dev_ptrs[rank])) {
