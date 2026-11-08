@@ -109,7 +109,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/relay.hip",
-      "sha256": "005ca5b91a3e9fbd05f08d45c26f6e5ac9c17f0e4c02e99cd194f6cb66f32470",
+      "sha256": "dd38b26d2a037cf579253995f9bb46dbea57b452745765aaf55aef18f75ba269",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -873,7 +873,7 @@
     },
     {
       "path": "tests/test-relay-plan-policy.cpp",
-      "sha256": "a5b2c64cb26b69cba21466ec9648ba2953f7092d8ff2af3274c95e9c268cd860",
+      "sha256": "3e98ea1c77ef24fbe40ad5f9b22177d1eb031804f03b82f888fb826eb8ef58cb",
       "mode": "100644",
       "consumers": [
         "WS5 relay plan policy CPU test"
