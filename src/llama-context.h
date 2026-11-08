@@ -15,7 +15,6 @@
 
 #include <map>
 #include <memory>
-#include <mutex>
 #include <vector>
 struct llama_nkv_ctx_state;
 
@@ -604,18 +603,6 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
-
-    // output_reserve() retires the buffer it replaces here instead of freeing
-    // it. The two windows decode on this one context, so a free can run while
-    // the other window is inside hipLaunchKernel: hipHostFree waits for that
-    // work and the launch waits for the driver mutex, and the pair never
-    // returns. The retired buffers stay alive until the context dies, when
-    // every decode has returned.
-    std::vector<ggml_backend_buffer_ptr> buf_output_retired;
-
-    // output_reserve() writes the buffer and the views derived from it. Two
-    // windows reach it from two threads, so the whole reserve is serialized.
-    std::mutex buf_output_mutex;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

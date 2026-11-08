@@ -7285,8 +7285,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
 //
 
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
-    std::lock_guard<std::mutex> lock(buf_output_mutex);
-
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -7356,12 +7354,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 #endif
             synchronize();
 
-            // Retire the old buffer instead of freeing it. Freeing calls
-            // hipHostFree, which waits for every outstanding use of the pinned
-            // host buffer; the other window's decode is at that moment inside
-            // hipLaunchKernel holding the driver mutex, so the free and the
-            // launch wait for each other and the first decode never returns.
-            buf_output_retired.push_back(std::move(buf_output));
+            // TODO: not needed?
+            buf_output      = nullptr;
             logits.data     = nullptr;
             embd.data       = nullptr;
             embd_nextn.data = nullptr;
