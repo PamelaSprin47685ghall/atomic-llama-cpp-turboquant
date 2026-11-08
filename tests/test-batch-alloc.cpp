@@ -716,6 +716,70 @@ static bool same_ubatch(const llama_ubatch & a, const llama_ubatch & b, uint32_t
     return true;
 }
 
+struct ubatch_layout {
+    uint32_t n_tokens   = 0;
+    uint32_t n_seqs_unq = 0;
+    std::vector<std::ptrdiff_t> vec_offsets;
+    std::vector<std::ptrdiff_t> seq_offsets;
+};
+
+static ubatch_layout capture_layout(const llama_ubatch & u) {
+    ubatch_layout l;
+    l.n_tokens   = u.n_tokens;
+    l.n_seqs_unq = u.n_seqs_unq;
+
+    const llama_ubatch_data & d = *u.data;
+
+    l.vec_offsets = {
+        u.token  ? u.token  - d.token.data()  : -1,
+        u.embd   ? u.embd   - d.embd.data()   : -1,
+        u.pos                - d.pos.data(),
+        u.n_seq_id           - d.n_seq_id.data(),
+        u.seq_id             - d.seq_id.data(),
+        u.seq_id_unq ? u.seq_id_unq - d.seq_id_unq.data() : -1,
+        u.seq_idx            - d.seq_idx.data(),
+        u.output             - d.output.data(),
+        u.decision_order ? u.decision_order - d.decision_order.data() : -1,
+    };
+
+    for (uint32_t i = 0; i < u.n_tokens; ++i) {
+        l.seq_offsets.push_back(u.seq_id[i] - d.seq_id_data.data());
+    }
+
+    return l;
+}
+
+static bool same_layout(const ubatch_layout & a, const ubatch_layout & b) {
+    return a.n_tokens == b.n_tokens && a.n_seqs_unq == b.n_seqs_unq &&
+           a.vec_offsets == b.vec_offsets && a.seq_offsets == b.seq_offsets;
+}
+
+// Every raw pointer in the ubatch must address the payload vectors it names.
+static void check_layout(testing & t, const llama_ubatch & u) {
+    const llama_ubatch_data & d = *u.data;
+
+    const auto in = [](const auto * p, const auto & v) {
+        return p == nullptr || (p >= v.data() && p < v.data() + v.size());
+    };
+
+    t.assert_true("token pointer is inside its vector", in(u.token, d.token));
+    t.assert_true("embd pointer is inside its vector",  in(u.embd,  d.embd));
+    t.assert_true("pos pointer is inside its vector",   in(u.pos,   d.pos));
+    t.assert_true("n_seq_id pointer is inside its vector", in(u.n_seq_id, d.n_seq_id));
+    t.assert_true("seq_id pointer is inside its vector",   in(u.seq_id,   d.seq_id));
+    t.assert_true("seq_id_unq pointer is inside its vector", in(u.seq_id_unq, d.seq_id_unq));
+    t.assert_true("seq_idx pointer is inside its vector",  in(u.seq_idx,  d.seq_idx));
+    t.assert_true("output pointer is inside its vector",   in(u.output,   d.output));
+    t.assert_true("decision_order pointer is inside its vector",
+                  in(u.decision_order, d.decision_order));
+
+    for (uint32_t i = 0; i < u.n_tokens; ++i) {
+        t.assert_true("seq_id row points into seq_id_data",
+                      u.seq_id[i] >= d.seq_id_data.data() &&
+                      u.seq_id[i] <  d.seq_id_data.data() + d.seq_id_data.size());
+    }
+}
+
 static void test_host_pool(testing & t) {
     llama_vocab vocab;
 
@@ -981,6 +1045,142 @@ static void test_host_pool(testing & t) {
         t.assert_true("release after the allocator died is safe", true);
 
         set_pool_flag(nullptr);
+    });
+
+    t.test("relay_pins_until_completion", [&](testing & t) {
+        set_pool_flag("1");
+
+        batch_builder bb1;
+        bb1.add(0, {0}, false);
+        bb1.add(1, {0}, true);
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb1.make(), vocab, nullptr, bb1.n_embd, 4, false));
+
+        llama_ubatch u = ba.split_simple(2);
+        t.assert_true("relay source is pooled", u.data.pooled());
+        const uint32_t slot = u.data.slot();
+
+        // A decode holds the ubatch through the memory context and the graph
+        // result. Both copies must pin the slot until relay completion.
+        llama_ubatch mctx  = u;
+        llama_ubatch graph = u;
+        u = llama_ubatch{};
+
+        batch_builder bb2;
+        bb2.add(10, {0}, false);
+        bb2.add(11, {0}, true);
+        t.assert_true(ba.init(bb2.make(), vocab, nullptr, bb2.n_embd, 4, false));
+        llama_ubatch s2 = ba.split_simple(2);
+        t.assert_true("graph and mctx pin the slot", s2.data.slot() != slot);
+        t.assert_equal("graph copy keeps the old position", 0, graph.pos[0]);
+
+        // Graph completion drops one copy; the memory context still pins.
+        graph = llama_ubatch{};
+
+        batch_builder bb3;
+        bb3.add(20, {0}, false);
+        bb3.add(21, {0}, true);
+        t.assert_true(ba.init(bb3.make(), vocab, nullptr, bb3.n_embd, 4, false));
+        llama_ubatch s3 = ba.split_simple(2);
+        t.assert_true("mctx still pins the slot", s3.data.slot() != slot);
+        t.assert_equal("mctx copy keeps the old position", 0, mctx.pos[0]);
+
+        // Completion drops the last copy; the slot returns.
+        mctx = llama_ubatch{};
+
+        batch_builder bb4;
+        bb4.add(30, {0}, false);
+        bb4.add(31, {0}, true);
+        t.assert_true(ba.init(bb4.make(), vocab, nullptr, bb4.n_embd, 4, false));
+        llama_ubatch s4 = ba.split_simple(2);
+        t.assert_equal("slot returns after completion", slot, s4.data.slot());
+
+        set_pool_flag(nullptr);
+    });
+
+    t.test("pointer_layout_is_stable", [&](testing & t) {
+        const auto make_builder = [](batch_builder & bb, int pos0, int n) {
+            for (int i = 0; i < n; ++i) {
+                const llama_pos p = pos0 + i/2;
+                if (i % 2 == 0) {
+                    bb.add(p, {0, 2}, i % 4 == 0);
+                } else {
+                    bb.add(p, {1}, i % 4 == 0);
+                }
+            }
+        };
+
+        std::vector<ubatch_layout> layouts_off;
+        std::vector<ubatch_layout> layouts_on;
+        std::vector<ubatch_layout> layouts_reuse;
+
+        {
+            set_pool_flag(nullptr);
+
+            batch_builder bb;
+            make_builder(bb, 0, 16);
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+            while (true) {
+                llama_ubatch u = ba.split_simple(4);
+                if (u.n_tokens == 0) {
+                    break;
+                }
+                check_layout(t, u);
+                layouts_off.push_back(capture_layout(u));
+            }
+        }
+
+        {
+            set_pool_flag("1");
+
+            batch_builder bb;
+            make_builder(bb, 0, 16);
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+            while (true) {
+                llama_ubatch u = ba.split_simple(4);
+                if (u.n_tokens == 0) {
+                    break;
+                }
+                check_layout(t, u);
+                layouts_on.push_back(capture_layout(u));
+            }
+
+            // The same allocator and slots serve a second batch. Every pointer
+            // must keep the same offset into its vector.
+            batch_builder bb2;
+            make_builder(bb2, 100, 16);
+            t.assert_true(ba.init(bb2.make(), vocab, nullptr, bb2.n_embd, 4, false));
+
+            while (true) {
+                llama_ubatch u = ba.split_simple(4);
+                if (u.n_tokens == 0) {
+                    break;
+                }
+                check_layout(t, u);
+                layouts_reuse.push_back(capture_layout(u));
+            }
+
+            set_pool_flag(nullptr);
+        }
+
+        t.assert_equal("same split count", layouts_off.size(), layouts_on.size());
+        t.assert_equal("same split count on reuse", layouts_off.size(), layouts_reuse.size());
+
+        for (size_t i = 0; i < layouts_off.size() && i < layouts_on.size(); ++i) {
+            t.assert_true("flag 0/1 pointer offsets match",
+                          same_layout(layouts_off[i], layouts_on[i]));
+        }
+        for (size_t i = 0; i < layouts_off.size() && i < layouts_reuse.size(); ++i) {
+            t.assert_true("reused slot pointer offsets match",
+                          same_layout(layouts_off[i], layouts_reuse[i]));
+        }
     });
 }
 
