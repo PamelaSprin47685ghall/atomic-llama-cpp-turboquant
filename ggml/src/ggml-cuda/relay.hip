@@ -774,6 +774,32 @@ void bind(channel & c, uint32_t rank, ggml_tensor * tensor) {
     memcpy(c.bound_nb[rank], tensor->nb, sizeof(tensor->nb));
 }
 
+// Digest of every fact same_binding() compares. Two prepares with the same
+// coarse llama key but different terminal storage or layout therefore get
+// different plan slots instead of failing the key-consistency check. FNV-1a
+// is enough here: this is a cache key, not a security boundary, and a
+// collision still falls back to the fail-closed same_binding check.
+uint64_t binding_fingerprint(const ggml_tensor * const * terminals, size_t count) {
+    uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&hash](uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    for (size_t c = 0; c < count; ++c) {
+        for (uint32_t r = 0; r < ranks; ++r) {
+            const auto * t = terminals[c * ranks + r];
+            mix(uint64_t(reinterpret_cast<uintptr_t>(t)));
+            mix(uint64_t(reinterpret_cast<uintptr_t>(t->data)));
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                mix(uint64_t(t->ne[d]));
+                mix(uint64_t(t->nb[d]));
+            }
+        }
+    }
+    mix(uint64_t(count));
+    return hash != 0 ? hash : 1;
+}
+
 bool allocate_channel_pool(provider & p, size_t bytes) {
     if (!select(p, 0) ||
         !checked(p, hipHostMalloc(&p.channel_pool, bytes, hipHostMallocMapped | hipHostMallocPortable),
@@ -1253,7 +1279,7 @@ bool flush_all_plans(provider & p, bool emit_events) {
 // validation result; a key hit with different bindings is a key bug and fails
 // closed instead of silently sharing a generation.
 bool plan_generation_for(provider & p, const ggml_relay_plan_key * key, size_t count, bool same_plan,
-                         uint64_t & generation) {
+                         uint64_t binding, uint64_t & generation) {
     if (!p.plan_cache_enabled || key == nullptr) {
         p.plan_cache_generation = false;
         if (!p.plan_cache_enabled && !p.plan_key_absent_logged) {
@@ -1281,6 +1307,7 @@ bool plan_generation_for(provider & p, const ggml_relay_plan_key * key, size_t c
         return false;
     }
     pk.channels = uint32_t(count);
+    pk.binding  = binding;
     if (!same_plan && p.plan_cache.find(pk) != nullptr) {
         fail(p, EPROTO, "relay plan key collided with a different terminal binding");
         return false;
@@ -1383,7 +1410,9 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
         }
     }
     uint64_t generation = 0;
-    if (!plan_generation_for(p, key, count, same_plan, generation)) {
+    const uint64_t binding = (p.plan_cache_enabled && key != nullptr)
+        ? binding_fingerprint(terminals, count) : 0;
+    if (!plan_generation_for(p, key, count, same_plan, binding, generation)) {
         return false;
     }
     if (!same_plan) {
