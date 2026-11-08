@@ -388,6 +388,41 @@ int test_device_ptr() {
     return 0;
 }
 
+int test_staging_candidate() {
+    const size_t max_bytes = 2u << 20;
+
+    CHECK(classify_name("inp_tokens") == kind::tokens);
+    CHECK(classify_name("union_inp_tokens") == kind::tokens);
+    CHECK(classify_name("inp_pos") == kind::pos);
+    CHECK(classify_name("inp_out_ids") == kind::out_ids);
+    CHECK(classify_name("attn_inp_kq_mask") == kind::kq_mask);
+    CHECK(classify_name("mtp_h_input") == kind::mtp_h);
+    CHECK(classify_name("inp_h") == kind::mtp_h);
+    CHECK(classify_name("") == kind::generic);
+    CHECK(classify_name(nullptr) == kind::generic);
+    CHECK(classify_name("blk.0.attn_q.weight") == kind::generic);
+    CHECK(classify_name("position_embd.weight") == kind::generic);
+    CHECK(classify_name("inp_hca") == kind::generic);
+
+    kind k = kind::count;
+    // The MTP token tensor is unnamed but carries the input flag: it stages
+    // through the generic rotation.
+    CHECK(staging_candidate(true, "", 128, max_bytes, &k));
+    CHECK(k == kind::generic);
+    // Large unnamed blocks stay out of the generic rotation.
+    CHECK(!staging_candidate(true, "", kGenericMaxBytes + 1, max_bytes, &k));
+    CHECK(staging_candidate(true, "", kGenericMaxBytes, max_bytes, &k));
+    // A weight without the input flag never stages, even with a matching name.
+    CHECK(!staging_candidate(false, "inp_tokens", 128, max_bytes, &k));
+    // Size bound covers the 32-row MTP hidden input and rejects larger blocks.
+    CHECK(staging_candidate(true, "mtp_h_input", max_bytes, max_bytes, &k));
+    CHECK(k == kind::mtp_h);
+    CHECK(!staging_candidate(true, "mtp_h_input", max_bytes + 1, max_bytes, &k));
+    CHECK(!staging_candidate(true, "inp_tokens", 0, max_bytes, &k));
+    CHECK(!staging_candidate(true, "inp_tokens", 128, max_bytes, nullptr));
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -408,6 +443,7 @@ int main() {
         {"wait_failure_disables",      test_wait_failure_disables},
         {"owns_and_diagnostics",       test_owns_and_diagnostics},
         {"device_ptr",                 test_device_ptr},
+        {"staging_candidate",          test_staging_candidate},
     };
 
     int failed = 0;

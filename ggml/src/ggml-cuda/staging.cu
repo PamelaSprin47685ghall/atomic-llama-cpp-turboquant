@@ -181,6 +181,7 @@ void dump() {
         return;
     }
     global_pool().dump(stderr);
+    ggml_backend_meta_staging_diag_dump();
 }
 
 void init() {

@@ -36,6 +36,51 @@ enum class kind : uint32_t {
 
 constexpr size_t kKindCount = size_t(kind::count);
 
+// Maps a graph-input tensor name to a slot kind. Names that do not match keep
+// kind::generic; the meta layer still stages them when they carry the input
+// flag, so an unnamed input (for example the MTP token tensor) is not lost.
+// Model weights never match these names.
+inline kind classify_name(const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return kind::generic;
+    }
+    if (std::strstr(name, "out_ids") != nullptr) {
+        return kind::out_ids;
+    }
+    if (std::strstr(name, "kq_mask") != nullptr || std::strstr(name, "KQ_mask") != nullptr) {
+        return kind::kq_mask;
+    }
+    if (std::strstr(name, "inp_tokens") != nullptr) {
+        return kind::tokens;
+    }
+    if (std::strstr(name, "inp_pos") != nullptr) {
+        return kind::pos;
+    }
+    if (std::strcmp(name, "inp_h") == 0 || std::strstr(name, "mtp_h_input") != nullptr) {
+        return kind::mtp_h;
+    }
+    return kind::generic;
+}
+
+constexpr size_t kGenericMaxBytes = 64u << 10;
+
+// A staging candidate is a graph input (the flag excludes weights and other
+// one-shot uploads) within the per-request size bound. Generic kinds are
+// allowed: unnamed inputs still rotate through their own slots, but only when
+// small, so a large unnamed block cannot crowd out the dedicated kinds.
+inline bool staging_candidate(bool has_input_flag, const char * name, size_t size,
+                              size_t max_bytes, kind * out) {
+    if (out == nullptr || !has_input_flag || size == 0 || size > max_bytes) {
+        return false;
+    }
+    const kind k = classify_name(name);
+    if (k == kind::generic && size > kGenericMaxBytes) {
+        return false;
+    }
+    *out = k;
+    return true;
+}
+
 struct lease {
     uint8_t * host   = nullptr;
     size_t    cap    = 0;
@@ -514,4 +559,5 @@ extern "C" {
 // once from its registry entry point. No-op when the meta layer is absent.
 GGML_BACKEND_API bool ggml_backend_meta_staging_register(const void * impl);
 GGML_BACKEND_API const void * ggml_backend_meta_staging_get();
+GGML_BACKEND_API void ggml_backend_meta_staging_diag_dump();
 }
