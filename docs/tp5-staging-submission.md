@@ -90,29 +90,46 @@ process exit. Other backends report `0`/`false`.
   `llama_context::has_unproven()` (and the relay status) while every member is
   still alive. If either is pending it does **not** delete the context: it
   logs, calls `retain_for_process()` (detach the caller-owned threadpools,
-  increment the model's retained-context count) and returns. The whole context
+  clear the CPU backend's raw threadpool pointer, increment the model's
+  retained-context count) and returns. The whole context
   and all its members stay allocated for process exit, so the pending copy
   cannot race a member destructor (memory, kv_stream_phase_arena,
   cvec/loras, balloc, sampling, graph results, scheduler, backends).
+  `has_unproven()` covers the main scheduler and every prefab envelope slot
+  scheduler (plus the recorded in-flight slot list); a slot-only fault retains
+  the whole context too. A duplicate `llama_free` on a retained context is
+  ignored and does not increment the count again.
   `llama_context::~llama_context()` refuses a direct delete of a pending
   context (aborts) because a direct delete cannot keep the external model and
   context-owned buffers alive. On a clean state the destructor frees the
   scheduler **before** the backend members are destroyed, matching the actual
   reverse member order.
-- **Model**: `llama_model` carries `n_retained_contexts`. Every retained
-  context increments it; `llama_model_free` defers and logs instead of
-  deleting while it is nonzero. The model, its pimpl buffers and the retained
-  context are process-owned; the caller must not use the freed pointer but the
-  underlying model is not deleted. There is no release operation for a
-  retained context by design.
+- **Model**: `llama_model` carries a live-context reference count and a
+  retained-context count. The live count and the free request are read and
+  changed under a lifetime mutex; the retained count is atomic and is
+  consulted in the same critical sections.
+  `llama_init_from_model` acquires one live reference before it reads the
+  model. A clean `llama_free` releases it; a retained context never does. A
+  `llama_model_free` before `llama_free` therefore defers instead of deleting
+  under the live context. The last clean release deletes the model when a free
+  was already requested. `llama_model_free` and `release_context()` share the
+  mutex, so two free paths cannot both delete. A second free request is
+  ignored. A retained pending context and the model are process-owned; there
+  is no release operation by design, and the retained context must not be used
+  again.
+- **External borrows**: LoRA adapters, samplers and cvec data are caller-owned.
+  A retained context never computes or samples again, so the caller may free
+  those borrows after `llama_free` returns; no retained member dereferences
+  them. The model-owned LoRA set is released only by the deferred model free.
 - **Meta owner**: `ggml_backend_meta_free` retains the whole Meta owner
   (context, child backends, buffers) while `submission_pending` is true.
 - **Public helper callers**: `ggml_backend_tensor_copy_async` does not retain
   anything. On `false` the caller is the owner of the source, destination and
   both backends until process exit; there is no public release operation for an
   unknown submission.
-- **Threadpools** are caller-owned. `retain_for_process` detaches them so the
-  caller may free them; the retained context does not compute again.
+- **Threadpools** are caller-owned. `retain_for_process` detaches them and
+  clears the CPU backend's pointer without pausing the pool, so the caller may
+  free them; the retained context does not compute again.
 - The process exit is the final owner. No API claims native completion. There
   is no operation that clears a cached unproven state.
 
@@ -134,11 +151,37 @@ process exit. Other backends report `0`/`false`.
   scheduler's backends first is a contract violation; the cached free path
   avoids dereferencing them, but it cannot protect a destination the caller
   itself freed.
+- `ggml_backend_submission_pending` means **accepted but unprovable**, not
+  ordinary ordered in-flight work. A backend that reports normal in-flight
+  work here would make every accepted copy fail-stop and retain the
+  context/model. The capability contract is strict for that reason; the Meta
+  staging implementation reports only `disabled || unknown_count > 0`.
+- The live-context reference protects a model that already has a context.
+  `llama_model_free` is not made safe against a concurrent
+  `llama_init_from_model` that is creating the first context: destroying the
+  model and its lifetime mutex while another thread enters the constructor
+  needs external serialization. The caller must serialize creation with the
+  final free.
+- A second free of the same model or context handle after the first one
+  completed cannot be detected without a global handle registry. The retained
+  path is idempotent; a clean double free remains caller undefined behavior.
+- External borrows (LoRA adapters, samplers, cvec) are not reference-counted.
+  They are safe to free after retention only because the retained context is
+  never used again. Calling any context API after `llama_free` is a caller
+  contract violation.
 - Meta owners retained on pending leak intentionally; the process owns them.
 - The Meta reduce-path pending gate is not exercised by the CPU tests below:
   it needs a Meta backend with the CUDA staging provider. It mirrors the
   scheduler rule that either capability answer is unproven, but this branch
   records no GPU runtime evidence.
+- The prefab-slot-unproven test is model- and environment-gated: without
+  `LLAMA_TEST_MODEL`, or when prefab refuses the model, it prints
+  `prefab-skip` instead of proving the slot arm.
+- A backend that reports neither capability cannot report an unknown
+  submission; the scheduler has no way to detect one.
+- The retained process-owned allocations are intentional. Tests that force a
+  pending state therefore leave their scheduler and arena allocated; run them
+  with `ASAN_OPTIONS=detect_leaks=0`.
 
 ## Tests
 
@@ -190,21 +233,13 @@ metadata (observed through the diagnostic dependency view); that
 flush on the unknown path; and the production backends-before-scheduler
 destruction order (the fake records any capability probe after `iface.free`).
 
-The context-retain test covers: `llama_model_free` deferral while a retained
-context exists, a clean model free, and (with `LLAMA_TEST_MODEL`) a real CPU
-context marked unproven that `llama_free` retains whole, followed by a
-deferred model free. Without a model it reports `context-skip` and still
-passes the model-retention checks.
-
-Remaining limits, not claimed closed:
-
-- The Meta reduce-path error/pending gate has no runtime test here. It needs a
-  Meta backend with the CUDA staging provider and a fault injection; the CPU
-  test builds neither.
-- There is no drain and no release operation. A pending scheduler, Meta owner,
-  context and model remain process-owned; the process exit is the final owner.
-- A backend that reports neither capability cannot report an unknown
-  submission; the scheduler has no way to detect one.
-- The retained process-owned allocations are intentional. Tests that force a
-  pending state therefore leave their scheduler and arena allocated; run them
-  with `ASAN_OPTIONS=detect_leaks=0`.
+The context-retain test covers, without a model: the live-context reference
+(free-before-context deferral, last-release delete, new-context refusal after
+a free request), retained-count deferral, and a clean model free. With
+`LLAMA_TEST_MODEL` it additionally covers: model-free-before-context on clean
+and pending contexts, the CPU backend threadpool pointer cleared by
+`retain_for_process`, a sampler borrow freed after retention, an unproven
+prefab envelope slot retaining the context, a duplicate `llama_free` that
+keeps the retained count at one, and a real CPU context retained whole. The
+model part reports `context-skip` without a model; the prefab arm reports
+`prefab-skip` when prefab refuses the model.

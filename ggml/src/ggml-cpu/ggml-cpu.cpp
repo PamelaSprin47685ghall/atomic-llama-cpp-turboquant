@@ -275,11 +275,16 @@ void ggml_backend_cpu_set_threadpool(ggml_backend_t backend_cpu, ggml_threadpool
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
 
-    if (ctx->threadpool && ctx->threadpool != threadpool) {
+    if (threadpool != nullptr && ctx->threadpool && ctx->threadpool != threadpool) {
         // already had a different threadpool, pause/suspend it before switching
         ggml_threadpool_pause(ctx->threadpool);
     }
     ctx->threadpool = threadpool;
+}
+
+ggml_threadpool_t ggml_backend_cpu_get_threadpool(ggml_backend_t backend_cpu) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+    return ((struct ggml_backend_cpu_context *)backend_cpu->context)->threadpool;
 }
 
 void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data) {
@@ -746,6 +751,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {
         return (void *)ggml_backend_cpu_set_threadpool;
+    }
+    if (strcmp(name, "ggml_backend_cpu_get_threadpool") == 0) {
+        return (void *)ggml_backend_cpu_get_threadpool;
     }
 
     return NULL;

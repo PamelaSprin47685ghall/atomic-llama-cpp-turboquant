@@ -13,6 +13,7 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <vector>
@@ -160,15 +161,27 @@ struct llama_context {
 
     void detach_threadpool();
 
-    // True while an asynchronous submission is unproven. Query only while the
-    // scheduler backends are alive; llama_free uses this to retain the whole
-    // context (and its model) for process exit.
+    // True while an asynchronous submission is unproven in the main scheduler
+    // or any prefab envelope slot scheduler. Query only while the scheduler
+    // backends are alive; llama_free uses this to retain the whole context
+    // (and its model) for process exit.
     bool has_unproven() const;
+    // True after llama_free retained this context for process exit. A duplicate
+    // llama_free must not evaluate or release it again.
+    bool is_retained() const { return retained.load(); }
     // Retain this whole context and increment the model's retained-context
     // count. llama_model_free then defers instead of freeing the model.
-    void retain_for_process();
+    // Returns false when the context was already retained (a duplicate
+    // llama_free); the count is not incremented twice.
+    bool retain_for_process();
     // Test/diagnostic only: force the scheduler's cached unproven state.
     void debug_mark_unproven();
+    // Test/diagnostic only: mark one prefab slot scheduler unproven. Returns
+    // false when prefab is off or the slot has no scheduler.
+    bool debug_mark_prefab_slot_unproven(size_t index);
+    // Test/diagnostic only: the CPU backend's installed threadpool pointer.
+    ggml_threadpool_t debug_cpu_backend_threadpool() const;
+    void debug_set_cpu_backend_threadpool(ggml_threadpool_t threadpool);
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
     void set_decode_phase(enum llama_decode_phase phase);
@@ -438,6 +451,10 @@ private:
     // yet sched-placed) graph into the context's union-binder state slot
     void nkv_record_snapshot(ggml_cgraph * gf);
 
+    // Install the context's current threadpool pointer in the CPU backend.
+    // nullptr clears it without pausing the caller's threadpool.
+    void set_backend_cpu_threadpool(ggml_threadpool_t threadpool);
+
     // drop the binder record after any path that destroys/reset the live graph
     // (sched_reserve, graph_reserve, release_compute, memory update, nout
     // fallback rebuild); a stale record would dereference freed tensors
@@ -587,6 +604,9 @@ private:
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
+    // Set by retain_for_process; guards the retained-context count against a
+    // duplicate llama_free on the same (already process-owned) context.
+    std::atomic<bool> retained{false};
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;

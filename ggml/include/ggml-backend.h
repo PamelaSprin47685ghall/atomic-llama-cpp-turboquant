@@ -123,6 +123,9 @@ extern "C" {
     // "ggml_backend_submission_error" (a recorded native error) or
     // "ggml_backend_submission_pending" (outstanding work) makes the return
     // false, including pending work with no recorded error yet.
+    // Contract: submission_pending must report only accepted-but-unprovable
+    // work. Ordinary ordered in-flight work must not set it; the scheduler
+    // treats any true answer as a permanent fail-stop state.
     GGML_API bool ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
     GGML_API ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend);

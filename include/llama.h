@@ -608,6 +608,11 @@ extern "C" {
     DEPRECATED(LLAMA_API void llama_free_model(struct llama_model * model),
             "use llama_model_free instead");
 
+    // Frees the model. Deletion is deferred while any clean or retained
+    // context still references it; the last clean llama_free performs it. A
+    // second free request is ignored. Creating a context after a free request
+    // fails, and the caller must serialize the final free with context
+    // creation. A retained pending context keeps the model process-owned.
     LLAMA_API void llama_model_free(struct llama_model * model);
 
     LLAMA_API struct llama_context * llama_init_from_model(
@@ -623,6 +628,9 @@ extern "C" {
     // native completion using ggml-relay.h and drain result/event readers.
     // Unproved native completion retains the context rather than freeing live
     // device owners; the shared model must also remain alive in that case.
+    // A retained context is process-owned: a duplicate llama_free is ignored,
+    // and the caller must not use the context again. Caller-owned LoRA
+    // adapters, samplers and cvec data may be freed after that return.
     LLAMA_API void llama_free(struct llama_context * ctx);
 
     // Borrow the one strict relay Meta backend, or NULL outside relay mode.
