@@ -2246,7 +2246,11 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
     delete backend;
 }
 
-static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+// staging_meta is the original graph input for a scheduler copy. The copy
+// destination is an internal tensor without the input flag or build-time name,
+// so staging must classify the source instead.
+static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size, const ggml_tensor * staging_meta) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
@@ -2284,14 +2288,15 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             const ggml_cuda_staging::api * st = staging_api();
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
             const bool staging_on = st != nullptr && st->enabled();
-            const bool staging_hit = staging_on && staging_eligible(tensor, size, &staging_kind);
+            const ggml_tensor * staging_src = staging_meta != nullptr ? staging_meta : tensor;
+            const bool staging_hit = staging_on && staging_eligible(staging_src, size, &staging_kind);
             if (st == nullptr) {
                 g_staging_meta_diag.async_api_null.fetch_add(1, std::memory_order_relaxed);
             } else if (!staging_on) {
                 g_staging_meta_diag.async_disabled.fetch_add(1, std::memory_order_relaxed);
             } else if (!staging_hit) {
                 g_staging_meta_diag.async_not_eligible.fetch_add(1, std::memory_order_relaxed);
-                staging_log_reject("async", tensor, size);
+                staging_log_reject("async", staging_src, size);
             } else {
                 g_staging_meta_diag.async_eligible.fetch_add(1, std::memory_order_relaxed);
             }
@@ -2340,6 +2345,11 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     }
 }
 
+static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size) {
+    ggml_backend_meta_set_tensor_async_impl(backend, tensor, data, offset, size, nullptr);
+}
+
 static bool ggml_backend_meta_cpy_tensor_async(
         ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     if (backend_src == nullptr || !ggml_backend_is_meta(backend_dst) ||
@@ -2365,7 +2375,7 @@ static bool ggml_backend_meta_cpy_tensor_async(
     // No rejection is allowed after this point: child uploads may already be
     // queued if a later child throws. The caller owns completion/source lifetime.
     ggml_backend_synchronize(backend_src);
-    ggml_backend_meta_set_tensor_async(backend_dst, dst, src->data, 0, ggml_nbytes(src));
+    ggml_backend_meta_set_tensor_async_impl(backend_dst, dst, src->data, 0, ggml_nbytes(src), src);
     return true;
 }
 
