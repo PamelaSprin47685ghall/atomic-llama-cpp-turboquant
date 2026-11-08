@@ -1304,3 +1304,50 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# TP5 WS4 scheduler submission-boundary CPU test. It drives the real
+# scheduler's split input copy through a fake backend with its own host buffer
+# type, so the scheduler must call cpy_tensor_async and then ask the optional
+# submission-state capability. Covers success, rejected, and fatal (unknown)
+# submissions, no replay after fatal, and copy-slot ownership. No GPU.
+add_executable(test-tp5-staging-scheduler test-tp5-staging-scheduler.cpp)
+target_link_libraries(test-tp5-staging-scheduler PRIVATE ggml ggml-cpu)
+add_test(NAME test-tp5-staging-scheduler COMMAND test-tp5-staging-scheduler)
+set_property(TEST test-tp5-staging-scheduler PROPERTY LABELS "cpu;tp5")
+set_property(TEST test-tp5-staging-scheduler PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_SCHED_TEST PASS")
+
+# TP5 staging submit-gate / note_source lock ownership. The meta fallback holds
+# the submit gate while it calls the backend set path, and a CUDA simple tensor
+# on that path calls note_source on the same thread. The test pins that the
+# same-thread note does not try_lock the owned gate, does not drop it, and does
+# not take mutex_ while a fatal publication waits for the gate. CPU only.
+add_executable(test-tp5-staging-note-source-lock test-tp5-staging-note-source-lock.cpp)
+target_link_libraries(test-tp5-staging-note-source-lock PRIVATE ggml ggml-cpu)
+add_test(NAME test-tp5-staging-note-source-lock COMMAND test-tp5-staging-note-source-lock)
+set_property(TEST test-tp5-staging-note-source-lock PROPERTY LABELS "cpu;tp5;staging")
+set_property(TEST test-tp5-staging-note-source-lock PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_NOTE_SOURCE_LOCK PASS")
+set_property(TEST test-tp5-staging-note-source-lock PROPERTY TIMEOUT 60)
+
+# TP5 WS4 pending-context/model ownership test. llama_free retains the whole
+# context (and defers llama_model_free) while an async submission is unproven;
+# a clean context/model takes the normal destruction path. The context part
+# needs LLAMA_TEST_MODEL; the model retention part always runs.
+add_executable(test-tp5-context-retain test-tp5-context-retain.cpp)
+target_link_libraries(test-tp5-context-retain PRIVATE llama)
+target_include_directories(test-tp5-context-retain PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME test-tp5-context-retain COMMAND test-tp5-context-retain)
+set_property(TEST test-tp5-context-retain PROPERTY LABELS "cpu;tp5")
+set_property(TEST test-tp5-context-retain PROPERTY PASS_REGULAR_EXPRESSION "TP5_CONTEXT_RETAIN_TEST PASS")
+
+# TP5 factor-prefab sub-envelope KQ-mask regression. A ubatch with
+# n_tokens < n_env runs on an n_env-row envelope; the mask fill must write only
+# the real rows and the wrapper must pad the rest. The test compares stock,
+# exact-envelope and padded-envelope logits for one real token sequence, and
+# requires the padded arm's n_sub_envelope/n_pad_rows counters with no stock
+# fallback. Needs LLAMA_TEST_MODEL; without it the arm is skipped.
+add_executable(test-tp5-prefab-subenvelope test-tp5-prefab-subenvelope.cpp)
+target_link_libraries(test-tp5-prefab-subenvelope PRIVATE llama)
+add_test(NAME test-tp5-prefab-subenvelope COMMAND test-tp5-prefab-subenvelope)
+set_property(TEST test-tp5-prefab-subenvelope PROPERTY LABELS "cpu;tp5;prefab")
+set_property(TEST test-tp5-prefab-subenvelope PROPERTY PASS_REGULAR_EXPRESSION "PREFAB_SUBENVELOPE_TEST PASS")
+set_property(TEST test-tp5-prefab-subenvelope PROPERTY FAIL_REGULAR_EXPRESSION "^FAIL:")

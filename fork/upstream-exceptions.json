@@ -143,7 +143,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "sha256": "5242df967ea3bdef7a39e4fe940d5c3a32e0a7ffc9b3e6674ac1adf3c88e8eba",
+      "sha256": "d20c92fe992aa6fcb5ca6f67d22e9eb6afeee844108c163c4c54962591189520",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -240,13 +240,13 @@
     },
     {
       "path": "ggml/include/ggml-backend.h",
-      "sha256": "4dc9e1da84bd9b45e2ac82710caefe3971b621bdb1bd9f0c2fef03bb4f31ed21",
+      "sha256": "fb02bb8d3e4b6ff11710254f7b4d98d5e909c3bb64ce4b74c83ecd6946fa21e2",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
         "fork/tp5-compose native-arithmetic Swift five-HIP two-request execution with independent 262144-capacity contexts"
       ],
-      "reason": "Declare a synchronized public scheduler workspace release; only A can own this allocator lifecycle. Declare the additive retained-input asynchronous graph-compute entry: its caller keeps the graph and host input storage alive and unchanged until scheduler synchronization. Eligible host input refresh may finish after return; errors drain any queued input transfers before returning or unwinding. The ordinary scheduler entry retains its existing lifetime contract.",
+      "reason": "Declare a synchronized public scheduler workspace release; only A can own this allocator lifecycle. Declare the additive retained-input asynchronous graph-compute entry: its caller keeps the graph and host input storage alive and unchanged until scheduler synchronization. Eligible host input refresh may finish after return; errors drain any queued input transfers before returning or unwinding. The ordinary scheduler entry retains its existing lifetime contract. The async tensor-copy entry returns bool for the accepted-but-unprovable submission contract; a false return forbids replay or freeing the destination.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Remove the retained-input API when upstream offers the same explicit storage-lifetime and failure-drain contract or no consumer needs it. Keep caller retention, synchronization and ordinary-entry behavior explicit."
     },
     {
@@ -264,7 +264,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "75082db15d47628383c93612e8a066bc6c7ba69ab2acce8626b83526070179f5",
+      "sha256": "266c585d85fae59932d0c2b1a34f722a1d0f2b55a6ac42665883406ac229e56e",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",
@@ -277,19 +277,19 @@
         "fork/tp5-compose explicit immutable-HC-Q4 five-HIP two-request experiment with independent contexts",
         "fork/tp5-compose explicit HC-router-owner F32-wire two-request experiment with configured private context ownership"
       ],
-      "reason": "Translate chunk-aligned logical async offsets into child tensor offsets for split axes 0/1/2, and permit existing mirrored partial transfers. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged. The private v2 TP5 cutover supplies all prepared rank/stage graphs to their HIP owner for bounded whole-epoch replay; it does not weaken ordinary graph/KV invalidation or move model execution into C.  Reuse prepared graph metadata under a single owner and batch admitted input-value refresh without changing graph structure or terminal bindings. Preserve general async transfers and complete graph/channel validation. Propagate the selected arithmetic policy through the existing child-backend initialization: native relay uses tp5-relay-native, while decoded-F32 relay keeps its existing parameter. Prepared graph, transfer, rank and ownership admission remain unchanged. Extend qualified HC plans to execute each complete down/up pair on one owner, omit redundant nonowner computation, prepare exact-zero noncontributor wire inputs and move an eligible join through its exclusive gate/mean tail. The full parent graph guards external view aliases and hidden users before delaying HC or six-node expert down/sum synchronization. Optional packed transformed injection and owner-only normalization retain exact closure and guarded fallback; an explicitly materialized lo is admitted only through its narrow keep-lo contract. Expose optional typed-wire dispatch and the public context-owner setter. Under the explicit mirrored-weight layout, install only context-private execution domains selected by pair index plus offset, validate the required graph plan before submission and fail closed on unsupported graphs; shared model/weight descriptors remain immutable. Every rank still participates in the real ready/ack and ownership protocol. Context-owner v3 requires all 97 complete, uniquely named HC projection pairs and admits only two exact execution profiles: 97 active HC pairs plus 84 other boundaries (181 channels) for T1 output, or the complete no-output graph with only pairs 95 and 96 empty, 95 active HC pairs and 83 other boundaries (178 channels). The no-output proof requires the three canonical empty GET_ROWS to share one non-view op-NONE I32 selector of shape [0,1,1,1], with checked source shapes and residual/normalization relationships; accept the real n_copies==1 scheduler layout duplicate even though it carries no INPUT flag. Empty tails retain UNKNOWN physical domains, unchanged empty children and no artificial owner/barrier work. On per-context graph-arena recreation, initialize every retained max_subgraphs slot with retained max_nnodes capacity so transitions between 179 and 182 stage graphs cannot reuse stale graph pointers or undersized node arrays. For the explicit down/SiLU fusion option, scan the full parent graph for external down/scaled aliases and mark only context-private child endpoints OUTPUT when necessary, forcing legal backend fallback without changing master/static flags, COMPUTE membership or stage boundaries. Admit a uniformly qualified 194-matrix/970-child HC profile with uniformly selected BF16, Q8_0 or Q4_0 weights, retain homogeneous pair checks, and extend keep-lo eligibility to matching Q8 or Q4 pairs while leaving dense injection qualification unchanged. Under separate default-off GGML_TP5_SHARED_EXPERT_SHARD=1, freeze five-rank relay configuration on first compute and require all 48 uniquely named complete shared branches. Validate the exact contiguous 14-node routed-down/weighted-sum plus shared gate/up/SwiGLU/down/scalar-gate/final-ADD closure, five disjoint hidden slices of 128, all ten selected experts, full-graph use/OUTPUT/view/leaf safety, and actual private COMPUTE children. Move the existing MoE terminal to M_r + g*S_r so the same D2560 F32 payload reduces both contributions. Require exactly 48 active branches/181 channels or the existing exact no-output profile with last shared branch empty, 47 active branches/178 channels; malformed or missing branches fail before prepare/submit. Preserve all five real ready/ack participants, leases and drain; add no relay channel and fabricate no completion facts. For configured context ownership the complete 194 parent matrices and 970 children must match the one fixed loader-selected HC type; mixed BF16/Q8/Q4 profiles fail before submit. Q4 does not alter the exact 95/178 and 97/181 plans, the independent shared-expert option or dense injection qualification. Retained optional source capability does not establish a throughput gain or select this configuration for the final two-request run. For default-off GGML_TP5_HC_ROUTER_OWNER=1, qualify all 48 uniquely named complete mirrored F32[2560,512] router weights, then require every 47 or 48 active FFN closure in the existing exact 95/178 or 97/181 profile before mutating any private child COMPUTE flag. Each closure is the original 12-node owner tail followed by canonical router MUL_MAT and axis-0 CONCAT, with exact raw-mixed/raw-logit/packet use counts, two full-compute exported views, canonical softmax consumption and full-parent view/leaf alias safety. A previously single-owner private router/packet is accepted on rebuild only through this same context and tensor execution-map credential. The inactive final T0 router retains UNKNOWN planning and its one original empty SOFT_MAX consumer; an empty packet or missing router is rejected. Move the existing delayed terminal to the materialized 3072-element packet and preserve all 178/181 channels and all five real ready/ack obligations. Record wire format only after a successful provider setter and reject F16, packed injection or owner normalization for this initial mode. Shared static descriptors and public/provider ABI remain unchanged. Source qualification and CPU plan evidence do not themselves establish native payload behavior or a performance gain.",
+      "reason": "Translate chunk-aligned logical async offsets into child tensor offsets for split axes 0/1/2, and permit existing mirrored partial transfers. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged. The private v2 TP5 cutover supplies all prepared rank/stage graphs to their HIP owner for bounded whole-epoch replay; it does not weaken ordinary graph/KV invalidation or move model execution into C.  Reuse prepared graph metadata under a single owner and batch admitted input-value refresh without changing graph structure or terminal bindings. Preserve general async transfers and complete graph/channel validation. Propagate the selected arithmetic policy through the existing child-backend initialization: native relay uses tp5-relay-native, while decoded-F32 relay keeps its existing parameter. Prepared graph, transfer, rank and ownership admission remain unchanged. Extend qualified HC plans to execute each complete down/up pair on one owner, omit redundant nonowner computation, prepare exact-zero noncontributor wire inputs and move an eligible join through its exclusive gate/mean tail. The full parent graph guards external view aliases and hidden users before delaying HC or six-node expert down/sum synchronization. Optional packed transformed injection and owner-only normalization retain exact closure and guarded fallback; an explicitly materialized lo is admitted only through its narrow keep-lo contract. Expose optional typed-wire dispatch and the public context-owner setter. Under the explicit mirrored-weight layout, install only context-private execution domains selected by pair index plus offset, validate the required graph plan before submission and fail closed on unsupported graphs; shared model/weight descriptors remain immutable. Every rank still participates in the real ready/ack and ownership protocol. Context-owner v3 requires all 97 complete, uniquely named HC projection pairs and admits only two exact execution profiles: 97 active HC pairs plus 84 other boundaries (181 channels) for T1 output, or the complete no-output graph with only pairs 95 and 96 empty, 95 active HC pairs and 83 other boundaries (178 channels). The no-output proof requires the three canonical empty GET_ROWS to share one non-view op-NONE I32 selector of shape [0,1,1,1], with checked source shapes and residual/normalization relationships; accept the real n_copies==1 scheduler layout duplicate even though it carries no INPUT flag. Empty tails retain UNKNOWN physical domains, unchanged empty children and no artificial owner/barrier work. On per-context graph-arena recreation, initialize every retained max_subgraphs slot with retained max_nnodes capacity so transitions between 179 and 182 stage graphs cannot reuse stale graph pointers or undersized node arrays. For the explicit down/SiLU fusion option, scan the full parent graph for external down/scaled aliases and mark only context-private child endpoints OUTPUT when necessary, forcing legal backend fallback without changing master/static flags, COMPUTE membership or stage boundaries. Admit a uniformly qualified 194-matrix/970-child HC profile with uniformly selected BF16, Q8_0 or Q4_0 weights, retain homogeneous pair checks, and extend keep-lo eligibility to matching Q8 or Q4 pairs while leaving dense injection qualification unchanged. Under separate default-off GGML_TP5_SHARED_EXPERT_SHARD=1, freeze five-rank relay configuration on first compute and require all 48 uniquely named complete shared branches. Validate the exact contiguous 14-node routed-down/weighted-sum plus shared gate/up/SwiGLU/down/scalar-gate/final-ADD closure, five disjoint hidden slices of 128, all ten selected experts, full-graph use/OUTPUT/view/leaf safety, and actual private COMPUTE children. Move the existing MoE terminal to M_r + g*S_r so the same D2560 F32 payload reduces both contributions. Require exactly 48 active branches/181 channels or the existing exact no-output profile with last shared branch empty, 47 active branches/178 channels; malformed or missing branches fail before prepare/submit. Preserve all five real ready/ack participants, leases and drain; add no relay channel and fabricate no completion facts. For configured context ownership the complete 194 parent matrices and 970 children must match the one fixed loader-selected HC type; mixed BF16/Q8/Q4 profiles fail before submit. Q4 does not alter the exact 95/178 and 97/181 plans, the independent shared-expert option or dense injection qualification. Retained optional source capability does not establish a throughput gain or select this configuration for the final two-request run. For default-off GGML_TP5_HC_ROUTER_OWNER=1, qualify all 48 uniquely named complete mirrored F32[2560,512] router weights, then require every 47 or 48 active FFN closure in the existing exact 95/178 or 97/181 profile before mutating any private child COMPUTE flag. Each closure is the original 12-node owner tail followed by canonical router MUL_MAT and axis-0 CONCAT, with exact raw-mixed/raw-logit/packet use counts, two full-compute exported views, canonical softmax consumption and full-parent view/leaf alias safety. A previously single-owner private router/packet is accepted on rebuild only through this same context and tensor execution-map credential. The inactive final T0 router retains UNKNOWN planning and its one original empty SOFT_MAX consumer; an empty packet or missing router is rejected. Move the existing delayed terminal to the materialized 3072-element packet and preserve all 178/181 channels and all five real ready/ack obligations. Record wire format only after a successful provider setter and reject F16, packed injection or owner normalization for this initial mode. Shared static descriptors and public/provider ABI remain unchanged. Source qualification and CPU plan evidence do not themselves establish native payload behavior or a performance gain. Route the WS4 staging fallback through the submit gate and the tri-state upload/enqueue results; a fatal result disables the pool and is not replayed.",
       "removal_condition": "Remove when the pinned upstream passes the real public meta transfer regression without this patch; update the pin and rerun get and set controls independently. Remove the TP5 portion when upstream provides equivalent versioned numerical, independent-window, pre-submission, last-reader and native-drain contracts and all installed full-model acceptance cases pass without this change. The decoded-F32 reference consumer retains its historical numerical checks. Native-arithmetic Swift replacements require defect-focused operator evidence, finite natural generation, real five-rank lifecycle evidence and independent paired master performance qualification; archived decoded-F32 logits or token-trajectory equality is not required under the user's current policy. Registering a reviewed hash is not itself runtime qualification. Remove each private execution-plan or optional owner-offset extension when equivalent upstream planning or independent measurements make it unnecessary. Preserve full-parent alias closure, all selected expert/HC contributions, immutable shared weights, private per-context domains, explicit pre-compute configuration and fail-closed unsupported plans. For the native two-request consumer, require defect-focused operator and graph-lifetime evidence, finite natural generation, real five-rank ready/ack/borrow/drain behavior, and independently measured complete two-request performance. Ordinary regrouping/FMA differences are allowed under the current user policy; archived decoded-F32 trajectory or bitwise-logit equality is not its acceptance rule. Registration alone is not runtime or performance qualification. Preserve the exact 95/178 and 97/181 profile proofs, legitimate zero-length scheduler-copy representation, and both retained graph-capacity dimensions across interleaved two-context rebuilds. Removal or replacement requires actual prefill/decode lifecycle evidence; source registration does not select a nonzero owner offset or claim its performance benefit. Remove the added optional BF16-down, immutable-Q8 or shared-expert extension when replaced upstream or no longer retained for the measured consumer; preserve exact qualification, full contributions, storage lifetime, default-off behavior and guarded failure/fallback. Registration does not waive independent native numeric/protocol and complete two-request measurement. Remove the optional Q4 extension if no longer retained or replaced upstream; preserve mutually exclusive fixed-type configuration, original BF16 source identity, complete-profile owned-target lifetime, full contributions and type-correct guarded fallback. Source registration alone does not select Q4 or establish a throughput benefit. Remove this optional planner extension with its graph producer or equivalent upstream support. Preserve complete 47/48 closure, exact 95/178 and 97/181 profiles, configured private offsets, F32 wire restriction, complete validation before private-flag changes, immutable shared weights, packed-view lifetime and all actual ready/ack/borrow/drain facts. Source registration is neither per-channel native payload proof nor a performance selection."
     },
     {
       "path": "ggml/src/ggml-backend.cpp",
-      "sha256": "07e8059e51f8eb3afb463eda658e8674850e586fa73434116e6a491655cb1f8f",
+      "sha256": "9b0ea7578dce759099d5ed7a33f487b29d72174523eaf5dd00e055528b4aaa0b",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
         "fork/tp5-compose Swift original-weight/F32/F16-KV single-window five-HIP execution",
         "fork/tp5-compose native-arithmetic Swift five-HIP two-request execution with independent 262144-capacity contexts"
       ],
-      "reason": "Rebuild the scheduler allocation owner after synchronization while preserving backends and scheduler identity.  The opt-in TP5 scheduler batches input-value refresh through Meta while retaining synchronization, allocation ownership and ordinary input-copy behavior. Implement the explicit retained-input entry only for admitted host input refresh with stable caller-owned storage, retaining ordinary behavior for excluded split/callback cases. Track queued transfers so failure and unwind drain before ownership returns; scheduler synchronization remains the retention boundary.",
+      "reason": "Rebuild the scheduler allocation owner after synchronization while preserving backends and scheduler identity.  The opt-in TP5 scheduler batches input-value refresh through Meta while retaining synchronization, allocation ownership and ordinary input-copy behavior. Implement the explicit retained-input entry only for admitted host input refresh with stable caller-owned storage, retaining ordinary behavior for excluded split/callback cases. Track queued transfers so failure and unwind drain before ownership returns; scheduler synchronization remains the retention boundary. Implement the bool async-copy return and query the optional submission-state registry hooks without changing backend iface layout.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. The archived decoded-F32 reference consumer retains its original full-vocabulary and trajectory checks. Native-arithmetic replacements follow the current user policy and require defect-focused operator evidence, finite natural generation, real five-rank lifecycle evidence and independent paired performance qualification. Registering a reviewed hash is not itself runtime qualification. Remove the retained-input path with its public declaration or an equivalent upstream lifetime contract. Preserve error/exception drain and never make the ordinary entry depend on undocumented caller retention. For the native two-request consumer, require defect-focused operator and graph-lifetime evidence, finite natural generation, real five-rank ready/ack/borrow/drain behavior, and independently measured complete two-request performance. Ordinary regrouping/FMA differences are allowed under the current user policy; archived decoded-F32 trajectory or bitwise-logit equality is not its acceptance rule. Registration alone is not runtime or performance qualification."
     },
     {
@@ -385,7 +385,7 @@
     },
     {
       "path": "include/llama.h",
-      "sha256": "bad66f3437131f8219070587d366111c325695b17caacccdbf90b6e8e56c9290",
+      "sha256": "cbf54525472f28e1fc6c0f2fae30c799d7c6870b8b469febaee9b1d7bb726d89",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -395,7 +395,7 @@
         "fork/tests/a-seams/mul-mat-id-shape-invariance.cpp",
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution"
       ],
-      "reason": "Expose versioned physical KV sizing, compute allocation observation and synchronized release. Expose owned logical reader views, capability checks, physical recurrent-state capacity and recurrent-only retirement through public A APIs. Expose installed-public read-only queries for resolved pipeline-parallel and Flash Attention settings, the model loader's selected devices, and the first unsupported reader-view requirement. Keep the capability boolean and setter aligned with the same native predicate, including the FA-off requirement of the current non-FA reader. Add the opt-in batch_invariant_matmul context parameter and its null-safe getter; require the choice before context creation and prefix prefill, document its default-false behavior and precedence over a dense quantized projection builder's accumulator request, and distinguish native activation quantization from true-F32 arithmetic. C uses the installed API without reading private A state. These queries report configuration and capability reasons, not actual kernel dispatch, device overlap, model-wide invariance, or performance. Describe the creation-time opt-in projection request as covering qualified direct and expert-indexed quantized products, with contiguous F32 activations, native activation quantization, shared/per-slot expert inputs, row-padded IDs and descriptor-aligned storage where required by Vulkan. Include its precedence over a projection builder's requested accumulator precision. Preserve default-false behavior, creation-before-prefill semantics, and the getter's meaning as a request rather than proof of model-wide/backend execution. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged.",
+      "reason": "Expose versioned physical KV sizing, compute allocation observation and synchronized release. Expose owned logical reader views, capability checks, physical recurrent-state capacity and recurrent-only retirement through public A APIs. Expose installed-public read-only queries for resolved pipeline-parallel and Flash Attention settings, the model loader's selected devices, and the first unsupported reader-view requirement. Keep the capability boolean and setter aligned with the same native predicate, including the FA-off requirement of the current non-FA reader. Add the opt-in batch_invariant_matmul context parameter and its null-safe getter; require the choice before context creation and prefix prefill, document its default-false behavior and precedence over a dense quantized projection builder's accumulator request, and distinguish native activation quantization from true-F32 arithmetic. C uses the installed API without reading private A state. These queries report configuration and capability reasons, not actual kernel dispatch, device overlap, model-wide invariance, or performance. Describe the creation-time opt-in projection request as covering qualified direct and expert-indexed quantized products, with contiguous F32 activations, native activation quantization, shared/per-slot expert inputs, row-padded IDs and descriptor-aligned storage where required by Vulkan. Include its precedence over a projection builder's requested accumulator precision. Preserve default-false behavior, creation-before-prefill semantics, and the getter's meaning as a request rather than proof of model-wide/backend execution. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged. Expose model live/retained context counts and prefab envelope statistics for the retention and prefab CPU tests.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Replace these additions with upstream equivalents when the pinned API exposes the same read-only configuration, selected-device and reader-rejection information plus the explicit direct and expert-indexed quantized projection policy and getter semantics. Rebuild all consumers with matching headers and libraries, and retain capability, policy/default, device-reporting, and real numerical gates. Preserve the original physical-KV, workspace, reader-view, recurrent-capacity, and retirement removal conditions. Replace these comments and interfaces when upstream provides the same explicit direct/expert projection request, default and getter semantics, with matching installed consumers and complete-model gates. Keep all unrelated reader capability, physical capacity, scheduler/device observation and lifetime removal conditions. Remove the TP5 portion when upstream provides equivalent versioned numerical, independent-window, pre-submission, last-reader and native-drain contracts and all installed full-model acceptance cases pass without this change."
     },
     {
@@ -438,7 +438,7 @@
     },
     {
       "path": "src/llama-context.cpp",
-      "sha256": "487aaefed813862e116b5bb1d8005ce81fcad578a48c1def1ee79f99b340bf0f",
+      "sha256": "0d758756c2aef1947a8d92f372b13346350052f87d352ef48397876fd3ebfa84",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -450,12 +450,12 @@
         "fork/tp5-compose native-arithmetic Swift five-HIP single-window execution",
         "fork/tp5-compose native-arithmetic Swift five-HIP two-request execution with independent 262144-capacity contexts"
       ],
-      "reason": "Validate physical KV independently from the logical window and invalidate graph state before workspace release. Validate reader capability and batches, drain before changing views, budget reader graphs and size physical recurrent reserve independently from logical identities. Implement the context-owned first unsupported reader requirement and read-only resolved PP/FA and selected-model-device observations. Return static reasons for null or unsupported contexts, derive the support boolean from the same predicate used before installing views, and reject FA-enabled contexts for the current non-FA reader. C can query the current pipeline flag after native graph-allocation fallback without exposing mutable context state. Copy the public batch_invariant_matmul request into context-owned cparams at construction, initialize the public default to false, and return the stored request through llama_get_batch_invariant_matmul with false for a null context. The getter reports a requested policy, not proof of backend execution. Preserve all existing physical-KV validation, reader batch validation, synchronized view replacement, graph budgeting, and physical recurrent-reserve responsibilities. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged.  Add fail-closed Swift model/device/numerical admission, actual context/sequence/KV observations and reuse of prepared single-token inputs. Verify required weight placement/types before submission. Unknown native completion retains an unsafe context; C must also retain the external model owner and fail-stop under the public lifecycle contract. Permit the explicit native relay arithmetic choice while retaining the same model, placement, five-HIP tensor-rank, capacity and lifecycle admission. Set the private logical attention padding to 1024 only for native TP5 relay Qwen4Exp with causal flash attention, either F16 K/V or the explicitly admitted Q4_0 K/V pair, and physical KV capacity at least 1024 and divisible by 1024; other contexts use the original value 1. This amortizes exact-shape graph rebuilding while preserving physical capacity, true positions and causal masking. Admit the stock Q4_0 K/V pair only for explicit TP5 relay Qwen4Exp, native arithmetic and enabled flash attention; preserve the existing model, device, placement and lifecycle gates. This stock FA pair permits two independent 262144-capacity contexts to fit alongside shared model weights on the five devices, with independent KV, indexer and recurrent state. This records the scoped source change and observed capacity evidence, not final two-request runtime qualification or general quantized-KV support. Use retained-input asynchronous scheduling only for the admitted reusable native-relay single-token graph with the same graph-result owner and unit batch/ubatch limits. Fence the prior scheduler work before mutating or freeing its graph/input owners, including actual memory-update, reserve and optimization/reset boundaries; avoid a redundant fence on a no-update hot path. This changes input-transfer scheduling, not physical KV capacity, causal masking or native borrow/drain ownership.",
+      "reason": "Validate physical KV independently from the logical window and invalidate graph state before workspace release. Validate reader capability and batches, drain before changing views, budget reader graphs and size physical recurrent reserve independently from logical identities. Implement the context-owned first unsupported reader requirement and read-only resolved PP/FA and selected-model-device observations. Return static reasons for null or unsupported contexts, derive the support boolean from the same predicate used before installing views, and reject FA-enabled contexts for the current non-FA reader. C can query the current pipeline flag after native graph-allocation fallback without exposing mutable context state. Copy the public batch_invariant_matmul request into context-owned cparams at construction, initialize the public default to false, and return the stored request through llama_get_batch_invariant_matmul with false for a null context. The getter reports a requested policy, not proof of backend execution. Preserve all existing physical-KV validation, reader batch validation, synchronized view replacement, graph budgeting, and physical recurrent-reserve responsibilities. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged.  Add fail-closed Swift model/device/numerical admission, actual context/sequence/KV observations and reuse of prepared single-token inputs. Verify required weight placement/types before submission. Unknown native completion retains an unsafe context; C must also retain the external model owner and fail-stop under the public lifecycle contract. Permit the explicit native relay arithmetic choice while retaining the same model, placement, five-HIP tensor-rank, capacity and lifecycle admission. Set the private logical attention padding to 1024 only for native TP5 relay Qwen4Exp with causal flash attention, either F16 K/V or the explicitly admitted Q4_0 K/V pair, and physical KV capacity at least 1024 and divisible by 1024; other contexts use the original value 1. This amortizes exact-shape graph rebuilding while preserving physical capacity, true positions and causal masking. Admit the stock Q4_0 K/V pair only for explicit TP5 relay Qwen4Exp, native arithmetic and enabled flash attention; preserve the existing model, device, placement and lifecycle gates. This stock FA pair permits two independent 262144-capacity contexts to fit alongside shared model weights on the five devices, with independent KV, indexer and recurrent state. This records the scoped source change and observed capacity evidence, not final two-request runtime qualification or general quantized-KV support. Use retained-input asynchronous scheduling only for the admitted reusable native-relay single-token graph with the same graph-result owner and unit batch/ubatch limits. Fence the prior scheduler work before mutating or freeing its graph/input owners, including actual memory-update, reserve and optimization/reset boundaries; avoid a redundant fence on a no-update hot path. This changes input-transfer scheduling, not physical KV capacity, causal masking or native borrow/drain ownership. Retain a pending context and defer the model free, clear the CPU backend threadpool pointer, and keep the graph UID assignment before the CPU threadpool update.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Remove these added implementations when equivalent upstream APIs provide the same null handling, static reason lifetime, shared reader acceptance predicate, current scheduler/device observations, and creation-time projection-policy/default/getter behavior. Retain installed capability, default/policy, runtime reporting, and real reader tests, together with the original physical-capacity and synchronized-lifetime gates. Remove the TP5 portion when upstream provides equivalent versioned numerical, independent-window, pre-submission, last-reader and native-drain contracts and all installed full-model acceptance cases pass without this change. The decoded-F32 reference consumer retains its historical numerical checks. Native-arithmetic Swift replacements require defect-focused operator evidence, finite natural generation, real five-rank lifecycle evidence and independent paired master performance qualification; archived decoded-F32 logits or token-trajectory equality is not required under the user's current policy. Registering a reviewed hash is not itself runtime qualification. Remove the logical-padding delta when upstream amortizes graph rebuilding with equivalent capacity, masking, raw-key history and reuse semantics, or when its measured benefit no longer applies. Remove the Q4_0 admission delta when pinned upstream exposes equivalent supported stock-Q4 flash-attention and independent full-capacity contexts without the architecture-specific gate, or when this consumer no longer requires it. Preserve the explicit native-policy guard, canonical cache layout, indexer type compatibility, padding/capacity conditions and independent-state/native-drain contracts; require corresponding operator and repeated two-context runtime evidence. Remove this retained-input integration when equivalent upstream scheduling/lifetime support replaces it or the consumer no longer benefits. Preserve stable graph-result/input ownership until synchronization and all existing context/model retention and native-drain gates."
     },
     {
       "path": "src/llama-context.h",
-      "sha256": "80e890d70c5b3ee5c3455ef1a0f035d317153ad27eaf666c589bca161196a595",
+      "sha256": "50cf52d1b0bcc367f8626c66fd07e5a7de2d57c740cc1161469674d43fe0880b",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -464,7 +464,7 @@
         "fork/tests/a-seams",
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution"
       ],
-      "reason": "A owns physical size observation and private graph/allocator release implementation. Store the native reader-graph budget and declare A-owned view and active-state helpers. Declare the context-owned unsupported-reader-reason query used by the installed public capability interface. Keep the capability boolean and view setter tied to one predicate so diagnostics cannot announce a profile that the native reader rejects. Preserve the existing physical-size, graph-budget, active-state, and allocator-release declarations; the new batch policy is carried by the context's cparams rather than a second mutable policy owner. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged.",
+      "reason": "A owns physical size observation and private graph/allocator release implementation. Store the native reader-graph budget and declare A-owned view and active-state helpers. Declare the context-owned unsupported-reader-reason query used by the installed public capability interface. Keep the capability boolean and view setter tied to one predicate so diagnostics cannot announce a profile that the native reader rejects. Preserve the existing physical-size, graph-budget, active-state, and allocator-release declarations; the new batch policy is carried by the context's cparams rather than a second mutable policy owner. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged. Declare the retention, pending-state and prefab diagnostic surface.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Remove this internal declaration when the pinned upstream supplies an equivalent installed-public reader capability query backed by the native context's own predicate. Remove the TP5 portion when upstream provides equivalent versioned numerical, independent-window, pre-submission, last-reader and native-drain contracts and all installed full-model acceptance cases pass without this change."
     },
     {
@@ -510,26 +510,26 @@
     },
     {
       "path": "src/llama-kv-cache.cpp",
-      "sha256": "ec3af40c6296a1da90e9feda5a4133dbeed33bbe0ab19c690a5f8ef8117618aa",
+      "sha256": "5e0eb2c88b7f2377cd1e1f5768026a2b360fa2d90cc7c71315b962a877e5019f",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
         "fork/tests/a-seams",
         "tq-tp5-compose (WS3 host pool)"
       ],
-      "reason": "Resolve logical keys only inside A after allocation; reject missing, shifted, duplicate, ambiguous or pending peer identities. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL.",
+      "reason": "Resolve logical keys only inside A after allocation; reject missing, shifted, duplicate, ambiguous or pending peer identities. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL. Fill a prefab envelope mask with an explicit real-row count, then replicate the last real row into the pad rows.",
       "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
     },
     {
       "path": "src/llama-kv-cache.h",
-      "sha256": "8265ab2018a50ba142ff85256a255732df80d656614895aa200f2ab77b9dc205",
+      "sha256": "0fbe78bb2693efebd6fd4cc1d27e4012170d9f8badba3fafaf24082ec3fc825d",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
         "fork/tests/a-seams",
         "tq-tp5-compose (WS3 host pool)"
       ],
-      "reason": "Keep explicit reader views and expose internal preparation and resolution to the native graph builder. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL.",
+      "reason": "Keep explicit reader views and expose internal preparation and resolution to the native graph builder. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL. Declare the shared KQ-mask fill with an explicit real-row count for prefab envelopes.",
       "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
     },
     {
@@ -580,7 +580,7 @@
     },
     {
       "path": "src/llama-model.cpp",
-      "sha256": "64edc5905857f88ea8d749838b8f767661ce423314d735581f360bb97f7cc25c",
+      "sha256": "5a0baa4c949f2fae13012d1320b32477d5b87ae73e5e669d5e23873537ccb0d4",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -595,7 +595,7 @@
         "fork/tp5-compose explicit immutable-HC-Q8 and shared-expert-shard five-HIP two-request experiments",
         "fork/tp5-compose explicit immutable-HC-Q4 five-HIP two-request experiment with independent contexts"
       ],
-      "reason": "Pass physical size only to attention KV constructors; preserve logical context and recurrent sizing. Construct native recurrent pools with physical state capacity while retaining the full logical sequence namespace. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; the following architecture-wide PLE rule is an explicit additional scope.  Honor explicit input-embedding offload and reject incompatible buffer overrides. Qwen4Exp PLE row tables retain original-format ordinary CPU storage and reject repack/Meta overrides; this PLE placement is architecture-wide, not confined to TP5. The withdrawn GDN mirror experiment is absent. Forward the admitted private attn_n_pad only to the Qwen4Exp hybrid/indexer cache constructor. Attention and indexer caches retain the same physical capacity and receive the same logical-width granularity; other cache constructors retain their original padding arguments. Place each qualified complete HC down/up pair on the same low-rank owner for equal five-rank tensor splits, with pair-index rotation and original fallback for unsupported pairs. This avoids replicated HC projection work without changing GGUF bytes. Add the separate process-immutable GGML_TP5_HC_CONTEXT_OWNER=1 model-load layout: require the supported Qwen4Exp trunk, five Meta ranks, equal split, device placement and all 97 complete BF16 pairs, or all 97 uniformly converted Q8_0 or Q4_0 pairs under the separate explicit loader option, before allocation, then mirror only those immutable HC weights so different contexts can select their own single execution owner. Reject incompatible models, partial/malformed pair sets and overrides. Weight layout is selected before loading; no per-token conversion or context-dependent mutation of shared weight descriptors is introduced. For mutually exclusive default-off GGML_TP5_HC_Q8_WEIGHTS=1 or GGML_TP5_HC_Q4_WEIGHTS=1, share the exact 194-name HC profile with the loader, require uniform complete targets of the selected Q8_0 or Q4_0 type and the existing full five-rank layout qualification, permit matching Q8 or Q4 static-owner pairs, disallow source-mmap host-pointer allocation for any context containing transformed targets, and require all 194 conversions before model load succeeds. Original BF16 loading remains the default. Independently, default-off GGML_TP5_SHARED_EXPERT_SHARD=1 validates all 144 actual shared matrices and all 48 F32 scalar gates before mapping/allocation: exact Qwen4Exp 48/no-MTP/D2560/shared640/512-expert/top10 shape, default Meta buffers, equal five-way full offload, accepted original quantization types and block divisibility. Split shared up/gate by output rows and shared down by K into five disjoint 128-wide intervals using the existing aligned splitter, retaining original encoded bytes and all 640 hidden contributions. Do not partially enable a malformed profile. Target dtype is fixed for the entire model load, and simultaneous Q8/Q4 opt-ins are rejected. The independent shared-expert qualification and original source GGUF descriptors remain unchanged. Retained optional source capability does not establish a throughput gain or select this configuration for the final two-request run.",
+      "reason": "Pass physical size only to attention KV constructors; preserve logical context and recurrent sizing. Construct native recurrent pools with physical state capacity while retaining the full logical sequence namespace. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; the following architecture-wide PLE rule is an explicit additional scope.  Honor explicit input-embedding offload and reject incompatible buffer overrides. Qwen4Exp PLE row tables retain original-format ordinary CPU storage and reject repack/Meta overrides; this PLE placement is architecture-wide, not confined to TP5. The withdrawn GDN mirror experiment is absent. Forward the admitted private attn_n_pad only to the Qwen4Exp hybrid/indexer cache constructor. Attention and indexer caches retain the same physical capacity and receive the same logical-width granularity; other cache constructors retain their original padding arguments. Place each qualified complete HC down/up pair on the same low-rank owner for equal five-rank tensor splits, with pair-index rotation and original fallback for unsupported pairs. This avoids replicated HC projection work without changing GGUF bytes. Add the separate process-immutable GGML_TP5_HC_CONTEXT_OWNER=1 model-load layout: require the supported Qwen4Exp trunk, five Meta ranks, equal split, device placement and all 97 complete BF16 pairs, or all 97 uniformly converted Q8_0 or Q4_0 pairs under the separate explicit loader option, before allocation, then mirror only those immutable HC weights so different contexts can select their own single execution owner. Reject incompatible models, partial/malformed pair sets and overrides. Weight layout is selected before loading; no per-token conversion or context-dependent mutation of shared weight descriptors is introduced. For mutually exclusive default-off GGML_TP5_HC_Q8_WEIGHTS=1 or GGML_TP5_HC_Q4_WEIGHTS=1, share the exact 194-name HC profile with the loader, require uniform complete targets of the selected Q8_0 or Q4_0 type and the existing full five-rank layout qualification, permit matching Q8 or Q4 static-owner pairs, disallow source-mmap host-pointer allocation for any context containing transformed targets, and require all 194 conversions before model load succeeds. Original BF16 loading remains the default. Independently, default-off GGML_TP5_SHARED_EXPERT_SHARD=1 validates all 144 actual shared matrices and all 48 F32 scalar gates before mapping/allocation: exact Qwen4Exp 48/no-MTP/D2560/shared640/512-expert/top10 shape, default Meta buffers, equal five-way full offload, accepted original quantization types and block divisibility. Split shared up/gate by output rows and shared down by K into five disjoint 128-wide intervals using the existing aligned splitter, retaining original encoded bytes and all 640 hidden contributions. Do not partially enable a malformed profile. Target dtype is fixed for the entire model load, and simultaneous Q8/Q4 opt-ins are rejected. The independent shared-expert qualification and original source GGUF descriptors remain unchanged. Retained optional source capability does not establish a throughput gain or select this configuration for the final two-request run. Implement live/retained context accounting and deferred model free for pending contexts.",
       "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Remove the TP5 portion when upstream provides equivalent versioned numerical, independent-window, pre-submission, last-reader and native-drain contracts and all installed full-model acceptance cases pass without this change. The decoded-F32 reference consumer retains its historical numerical checks. Native-arithmetic Swift replacements require defect-focused operator evidence, finite natural generation, real five-rank lifecycle evidence and independent paired master performance qualification; archived decoded-F32 logits or token-trajectory equality is not required under the user's current policy. Registering a reviewed hash is not itself runtime qualification. Remove the logical-padding delta when upstream amortizes graph rebuilding with equivalent capacity, masking, raw-key history and reuse semantics, or when its measured benefit no longer applies. Remove the complete-owner or mirrored-offset placement delta when equivalent upstream layout/execution planning replaces it or the measured consumer no longer benefits. Preserve full pair/type/shape/placement admission, immutable shared weights, one compute owner per pair and default fallback; qualify actual supported decode and prefill graph plans separately from model metadata. Remove the added optional BF16-down, immutable-Q8 or shared-expert extension when replaced upstream or no longer retained for the measured consumer; preserve exact qualification, full contributions, storage lifetime, default-off behavior and guarded failure/fallback. Registration does not waive independent native numeric/protocol and complete two-request measurement. Remove the optional Q4 extension if no longer retained or replaced upstream; preserve mutually exclusive fixed-type configuration, original BF16 source identity, complete-profile owned-target lifetime, full contributions and type-correct guarded fallback. Source registration alone does not select Q4 or establish a throughput benefit."
     },
     {
@@ -801,12 +801,12 @@
     },
     {
       "path": "tests/CMakeLists.txt",
-      "sha256": "ec0dbbd27a0d06a20ec759fe499559aae80840dc132435e66db2a51641f7c713",
+      "sha256": "fc117e099c3b7eef692f24c4ef760c3874c78adbf8082abcc9643368e74154ac",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
       ],
-      "reason": "Register the TP5 ubatch pool test target.",
+      "reason": "Register the TP5 ubatch-pool, staging scheduler/pool/lock, context-retention and prefab sub-envelope CPU tests.",
       "removal_condition": "Remove when the pool test moves into the upstream test tree."
     },
     {
@@ -842,33 +842,33 @@
     },
     {
       "path": "ggml/src/ggml-cuda/staging.cu",
-      "sha256": "856ddde15d14828e44e3f45de3617f66efbe69415b2fb56e911f6b6324c02325",
+      "sha256": "1c2921db74538076dd7550fbbbab9bf0192f24d33c9563e31a045f9ebb611914",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)"
       ],
-      "reason": "Implement the persistent pinned H2D staging pool: slot allocation, lease and fence lifetime, copy submission, and refusal to reuse a leased slot.",
+      "reason": "Implement the persistent pinned H2D staging pool: slot allocation, lease and fence lifetime, copy submission, and refusal to reuse a leased slot. Keep staging copies and their event waits on the recording device.",
       "removal_condition": "Remove when upstream provides equivalent persistent pinned H2D staging, or when the WS4 consumer is removed."
     },
     {
       "path": "ggml/src/ggml-cuda/staging.h",
-      "sha256": "470e87b069d96c958f3ebf4ff276346168d34605cae24279b7ae6625a9006a9f",
+      "sha256": "249878d00b17141e9f529280a3196ee52d275c666869c926de822686fe83b29e",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)",
         "WS4 staging pool CPU test"
       ],
-      "reason": "Declare the staging pool API and host-side lease/slot state used by the meta backend and the CPU test harness.",
+      "reason": "Declare the staging pool API and host-side lease/slot state used by the meta backend and the CPU test harness. Declare the tri-state submit_result API and make note_source wait-free: it publishes the submit gate, takes the pool lock only by try_lock, and skips with a fast miss when the gate or pool lock is held.",
       "removal_condition": "Remove with the WS4 staging pool implementation."
     },
     {
       "path": "tests/test-tp5-staging-pool.cpp",
-      "sha256": "263a07d174be163705563f1a8da8329252e2bd98307d2ae3cf3500d08486164f",
+      "sha256": "6c61b630342cf952ab0f48302f76872cb5d04393e0b80ab7d98528eebe5fcd66",
       "mode": "100644",
       "consumers": [
         "WS4 staging pool CPU test"
       ],
-      "reason": "Cover the twelve staging-pool checks: lease reuse, allocation/sync failure, and never reusing a leased slot.",
+      "reason": "Cover staging lease reuse, tri-state upload/enqueue, quarantine and fatal fail-stop, submit-gate ordering, and device wait selection.",
       "removal_condition": "Remove with the WS4 staging pool test target."
     },
     {
@@ -940,6 +940,111 @@
       ],
       "reason": "Cover the per-shape cache key, hit and miss accounting, and the flag-off path that must stay identical to stock.",
       "removal_condition": "Remove with the WS5 per-shape cache."
+    },
+    {
+      "path": "docs/tp5-staging-submission.md",
+      "sha256": "eb9f2ffc77d92e9c9c5889cd67d1ef7a411f1fbb1a560e10dffdd2abf48f9fd5",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose staging/Meta integration maintainers"
+      ],
+      "reason": "Record the async submission boundary, staging pool ownership and retention contract, the prefab sub-envelope mask row-count rule, and the CPU/ASan evidence used by the WS4 integration.",
+      "removal_condition": "Remove when the maintained fork documentation carries the same contracts or the WS4 async-staging work is upstreamed."
+    },
+    {
+      "path": "ggml/include/ggml-cpu.h",
+      "sha256": "ce9681499f68fc169892dff67f415bb9bce422db460167ac55f43603f72364eb",
+      "mode": "100644",
+      "consumers": [
+        "WS4 context-retention CPU test",
+        "CPU backend threadpool diagnostics"
+      ],
+      "reason": "Expose the CPU backend threadpool getter used to prove that retain_for_process clears the backend's raw threadpool pointer without pausing the caller's pool.",
+      "removal_condition": "Remove when the retention contract is covered by an upstream ownership API or the diagnostic is no longer needed."
+    },
+    {
+      "path": "ggml/src/ggml-backend-impl.h",
+      "sha256": "68beb3d83639cd57b95fc28b74f069d8efd7cac52a28759b8512b7b056993fe6",
+      "mode": "100644",
+      "consumers": [
+        "ggml async submission scheduler",
+        "ggml Meta backend submission-state capability"
+      ],
+      "reason": "Declare the optional submission-state proc hook that lets the scheduler and Meta backend query accepted-but-unprovable async copies without changing the backend iface layout.",
+      "removal_condition": "Remove when upstream exposes an equivalent submission-state capability negotiation."
+    },
+    {
+      "path": "ggml/src/ggml-backend-moe-cache.h",
+      "sha256": "09fde4ba2931312fc1d56ae3b49740246ca650d315a07e132ae5e0882670f0e8",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose MoE cache",
+        "ggml scheduler MoE cache session"
+      ],
+      "reason": "Declare the MoE cache session configuration, device-shape admission and ownership API used by the scheduler and the WS4 staging/Meta integration.",
+      "removal_condition": "Remove when upstream provides equivalent MoE cache session ownership."
+    },
+    {
+      "path": "ggml/src/ggml-cpu/ggml-cpu.cpp",
+      "sha256": "697d52eb833fca43a83e7a965cf0cd357703ee3036ae369a71969573ccab962e",
+      "mode": "100644",
+      "consumers": [
+        "WS4 context-retention CPU test",
+        "CPU backend threadpool diagnostics"
+      ],
+      "reason": "Register the CPU threadpool getter in the backend proc-address table so the retention test reads the same raw pointer the backend owns.",
+      "removal_condition": "Remove when the retention contract is covered by an upstream ownership API or the diagnostic is no longer needed."
+    },
+    {
+      "path": "src/llama-model.h",
+      "sha256": "96ed16c351c50596a3e8bff522da82d7a19fb23f799939263dcea3e11d49a345",
+      "mode": "100644",
+      "consumers": [
+        "llama context/model lifetime",
+        "tq-tp5-compose pending-context retention"
+      ],
+      "reason": "Add the live/retained context reference accounting and free-request fields that make llama_model_free wait for live or pending contexts.",
+      "removal_condition": "Remove when upstream provides equivalent model lifetime ownership."
+    },
+    {
+      "path": "tests/test-tp5-context-retain.cpp",
+      "sha256": "e9fad08540e1184fae4eceb288ee576bff6b4568eb5809e9115a49b8375c2a2d",
+      "mode": "100644",
+      "consumers": [
+        "WS4 context/model retention CPU test"
+      ],
+      "reason": "Cover llama_free retention, model-free deferral, duplicate free, CPU threadpool detach, sampler borrow, prefab slot retention, and the real-model pending-context path.",
+      "removal_condition": "Remove with the WS4 retention test target when the contract is covered elsewhere."
+    },
+    {
+      "path": "tests/test-tp5-prefab-subenvelope.cpp",
+      "sha256": "37a4d9d30f7b171eeca3157f78261e44018f4a886e7b2784a8e8d2ae8f5683c6",
+      "mode": "100644",
+      "consumers": [
+        "WS4 prefab sub-envelope CPU test"
+      ],
+      "reason": "Cover the n_tokens<n_env mask fill, pad-row replication, logits equality across stock/exact/padded arms, and the non-finite-fixture raw-bit fallback.",
+      "removal_condition": "Remove when the prefab sub-envelope path or its test is upstreamed."
+    },
+    {
+      "path": "tests/test-tp5-staging-note-source-lock.cpp",
+      "sha256": "902447668df5dddf596e97feb62433fad9245abb0877eb9036046ccb0becb78d",
+      "mode": "100644",
+      "consumers": [
+        "WS4 staging submit-gate lock CPU test"
+      ],
+      "reason": "Cover same-thread note_source under the submit gate, gate retention, and the check-then-lock TOCTOU wait-free try_lock against a fatal publication.",
+      "removal_condition": "Remove with the WS4 staging pool test target."
+    },
+    {
+      "path": "tests/test-tp5-staging-scheduler.cpp",
+      "sha256": "ea8e4b126f4e1ae158ddcb056f0dffbefbf8e4b86030ad47ffd6bd23cb708f40",
+      "mode": "100644",
+      "consumers": [
+        "WS4 scheduler submission-boundary CPU test"
+      ],
+      "reason": "Cover accepted/rejected/fatal async submission, pending entry gates, retained-input behavior, and backends-before-scheduler destruction.",
+      "removal_condition": "Remove with the WS4 scheduler test target."
     }
   ]
 }

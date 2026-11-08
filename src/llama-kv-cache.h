@@ -532,6 +532,14 @@ private:
     // vectors are reused too. returns false on failure
     bool prepare_into(const std::vector<llama_ubatch> & ubatches, slot_info_vec_t & res, decode_scratch * scratch);
 
+    // Shared KQ-mask fill. `n_rows` is the number of token rows per stream to
+    // write. The stock layout passes dst->ne[1] and asserts it equals the
+    // batch rows; a prefab envelope mask has n_env rows and passes only its
+    // real ubatch->n_tokens rows, leaving the pad rows to the caller. Both
+    // write at the tensor's own row stride (dst->ne[0]).
+    void fill_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+                            uint32_t n_kv_runtime, int64_t n_rows) const;
+
     struct kv_layer {
         // layer index in the model
         // note: can be different from the layer index in the KV cache

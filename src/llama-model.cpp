@@ -3066,6 +3066,19 @@ void llama_free_model(llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
+    if (model == nullptr) {
+        return;
+    }
+    if (!model->request_free()) {
+        // A live context, a retained pending context, or an earlier free
+        // request owns the model. The last clean context release (or the
+        // retained context itself, which never releases) resolves it. The
+        // request and the counts are serialized by the model lifetime mutex,
+        // so a concurrent llama_free cannot delete between a check and a
+        // second delete here.
+        LLAMA_LOG_ERROR("%s: retaining model: a live/retained context or an earlier free request owns it\n", __func__);
+        return;
+    }
     delete model;
 }
 

@@ -3160,6 +3160,29 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_kv_runtime) const {
+    // Stock layout contract: the mask carries one row per real token (per
+    // stream). A prefab envelope mask has n_env rows and only n_tokens of them
+    // are real, so it calls fill_input_kq_mask with an explicit row count
+    // instead (see prefab_set_input_kq_mask). Keeping the equality here means
+    // a stock caller can never silently fill fewer rows than its batch.
+    const int64_t n_tps = dst->ne[1];
+    if (dst->ne[3] > 1) {
+        GGML_ASSERT(n_tps*(int64_t)ubatch->n_seqs_unq == (int64_t)ubatch->n_tokens);
+    } else {
+        if (n_tps != (int64_t) ubatch->n_tokens) {
+            LLAMA_LOG_ERROR("%s: mask %s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+                    "], ubatch n_tokens=%u n_seqs=%u n_seqs_unq=%u n_seq_tokens=%u\n",
+                    __func__, dst->name, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                    ubatch->n_tokens, ubatch->n_seqs, ubatch->n_seqs_unq, ubatch->n_seq_tokens);
+        }
+        GGML_ASSERT(n_tps == (int64_t)ubatch->n_tokens);
+    }
+
+    fill_input_kq_mask(dst, ubatch, causal_attn, n_kv_runtime, n_tps);
+}
+
+void llama_kv_cache::fill_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+                                        uint32_t n_kv_runtime, int64_t n_rows) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -3185,18 +3208,23 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     }
     const int64_t n_kv     = n_kv_runtime != 0 ? (int64_t) n_kv_runtime : dst->ne[0];
     // The mask is [n_kv, n_tps, 1, n_stream]: ne[3] is the number of KV
-    // streams the graph was built for, ne[1] the token rows per stream.
-    // n_tokens/n_stream is NOT that row count: a non-unified ubatch can touch
-    // a single stream while the cache has more (one token, two streams), and
-    // the division would truncate to zero.
+    // streams the graph was built for, ne[1] the token row capacity per
+    // stream. n_tokens/n_stream is NOT that row count: a non-unified ubatch
+    // can touch a single stream while the cache has more (one token, two
+    // streams), and the division would truncate to zero.
     const int64_t n_stream = dst->ne[3];
-    const int64_t n_tps    = dst->ne[1];
 
-    if (n_stream > 1) {
-        GGML_ASSERT(n_tps*(int64_t)ubatch->n_seqs_unq == (int64_t)n_tokens);
-    } else {
-        GGML_ASSERT(n_tps == (int64_t)n_tokens);
-    }
+    // The rows this call may write. A narrower fill only has a layout meaning
+    // for the single-stream prefab mask: rows [0, n_rows) are real token rows
+    // and the remaining rows stay untouched for the prefab caller to pad. A
+    // multi-stream mask keeps the stock row count; a single-stream fill can
+    // never write more rows than the ubatch has tokens (the core reads
+    // ubatch->seq_id/pos per row).
+    GGML_ASSERT(n_rows > 0);
+    GGML_ASSERT(n_rows <= dst->ne[1]);
+    GGML_ASSERT(n_stream > 0);
+    GGML_ASSERT(n_stream == 1 || n_rows == dst->ne[1]);
+    GGML_ASSERT(n_stream > 1 || n_rows <= (int64_t) n_tokens);
 
     //const int64_t t_start = ggml_time_us();
 
@@ -3209,7 +3237,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.swa_type         =*/ swa_type,
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
-        /*.n_tps            =*/ n_tps,
+        /*.n_tps            =*/ n_rows,
         /*.row_stride       =*/ dst->ne[0],
         /*.n_pad_tail       =*/ dst->ne[0] - n_kv,
     };
@@ -3493,8 +3521,12 @@ void llama_kv_cache::prefab_set_input_kq_mask(ggml_tensor * dst, const llama_uba
     GGML_ASSERT(dst->ne[1] == (int64_t) n_env);
     GGML_ASSERT(n_tokens >= 1 && n_tokens <= n_env);
 
-    // real rows [0, n_tokens): exactly the stock mask (stock writes only n_tps rows of dst)
-    set_input_kq_mask(dst, ubatch, causal_attn);
+    // Real rows [0, n_tokens): the stock fill with the row count stated
+    // explicitly. The stock entry point derives n_tps from dst->ne[1] and
+    // asserts n_tps == n_tokens; that equality is a stock-layout contract,
+    // not a property of this n_env-row mask. Only the real rows are written
+    // here; the pad rows are replicated below from the last real row.
+    fill_input_kq_mask(dst, ubatch, causal_attn, 0, (int64_t) n_tokens);
 
     // pad rows: replicate the last real row
     const size_t row_elems = (size_t) dst->ne[0];

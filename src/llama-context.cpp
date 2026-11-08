@@ -1316,6 +1316,16 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 }
 
 llama_context::~llama_context() {
+    if (has_unproven()) {
+        // llama_free retains the whole context (and increments the model's
+        // retained-context count); a direct delete cannot keep the external
+        // model and context-owned buffers alive. This covers the main sched
+        // and every prefab envelope scheduler. Fail loudly instead of freeing
+        // behind an in-flight copy.
+        LLAMA_LOG_ERROR("%s: pending context destroyed directly; llama_free must retain it\n", __func__);
+        GGML_ABORT("pending llama_context destroyed directly");
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
     // Per-shape schedulers own native work too; drain and release them before
@@ -1374,6 +1384,11 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // Members destroy in reverse declaration order, so the backends would be
+    // freed before the scheduler. Free the scheduler first, while the backends
+    // are still alive; sched_free never dereferences them afterwards.
+    sched.reset();
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -2169,6 +2184,10 @@ bool llama_context::release_compute() {
             kv_stream_phase_arena.arena != nullptr || kv_stream_phase_arena.configured) {
         return false;
     }
+    if (ggml_backend_sched_has_unproven(sched.get())) {
+        LLAMA_LOG_ERROR("%s: refusing to release compute buffers: an async submission is still unproven\n", __func__);
+        return false;
+    }
 
     synchronize();
     if (prefab) {
@@ -2939,6 +2958,85 @@ void llama_context::detach_threadpool() {
 
     this->threadpool       = nullptr;
     this->threadpool_batch = nullptr;
+}
+
+bool llama_context::has_unproven() const {
+    if (sched && ggml_backend_sched_has_unproven(sched.get())) {
+        return true;
+    }
+    // Envelope slots own independent schedulers over the same backends. A
+    // backend with per-scheduler state can be unproven there while the main
+    // scheduler is clean, so every slot and every recorded in-flight slot is
+    // part of the context's state.
+    if (prefab) {
+        for (const llama_prefab_slot & slot : prefab->slots) {
+            if (slot.sched && ggml_backend_sched_has_unproven(slot.sched.get())) {
+                return true;
+            }
+        }
+        for (ggml_backend_sched_t pending : prefab->pending) {
+            if (pending && ggml_backend_sched_has_unproven(pending)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool llama_context::retain_for_process() {
+    // A duplicate llama_free must not increment the retained-context count
+    // again. The context is already process-owned.
+    if (retained.exchange(true)) {
+        return false;
+    }
+    // The threadpools are caller-owned; detach so the caller may free them.
+    // The CPU backend holds its own raw pointer, so clear that too; clearing
+    // never pauses the caller's pool.
+    // The context no longer computes after this point.
+    detach_threadpool();
+    set_backend_cpu_threadpool(nullptr);
+    model.retain_context();
+    return true;
+}
+
+void llama_context::debug_mark_unproven() {
+    if (sched) {
+        ggml_backend_sched_mark_unproven(sched.get());
+    }
+}
+
+bool llama_context::debug_mark_prefab_slot_unproven(size_t index) {
+    if (!prefab || index >= prefab->slots.size() || !prefab->slots[index].sched) {
+        return false;
+    }
+    ggml_backend_sched_mark_unproven(prefab->slots[index].sched.get());
+    return true;
+}
+
+void llama_context::set_backend_cpu_threadpool(ggml_threadpool_t threadpool) {
+    if (backend_cpu == nullptr) {
+        return;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+    auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cpu_set_threadpool");
+    if (set_threadpool_fn) {
+        set_threadpool_fn(backend_cpu, threadpool);
+    }
+}
+
+ggml_threadpool_t llama_context::debug_cpu_backend_threadpool() const {
+    if (backend_cpu == nullptr) {
+        return nullptr;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+    auto * get_threadpool_fn = (decltype(ggml_backend_cpu_get_threadpool) *) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cpu_get_threadpool");
+    return get_threadpool_fn ? get_threadpool_fn(backend_cpu) : nullptr;
+}
+
+void llama_context::debug_set_cpu_backend_threadpool(ggml_threadpool_t threadpool) {
+    set_backend_cpu_threadpool(threadpool);
 }
 
 void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
@@ -7970,14 +8068,7 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched, ggml_ba
     // object (llm_graph_result::reset) and receives a fresh one here.
     tp5_assign_graph_uid(backend_tp5_relay, gf);
 
-    if (backend_cpu != nullptr) {
-        auto * reg               = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
-        auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(
-            reg, "ggml_backend_cpu_set_threadpool");
-        if (set_threadpool_fn) {
-            set_threadpool_fn(backend_cpu, tp);
-        }
-    }
+    set_backend_cpu_threadpool(tp);
 
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
@@ -9080,6 +9171,30 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
         return nullptr;
     }
 
+    // The context holds one live model reference. Acquire it before the first
+    // model field is read: llama_model_free defers while live contexts exist,
+    // so the model cannot be deleted under construction. Any validation return
+    // or constructor exception releases the reference through this guard.
+    struct model_lifetime_ref {
+        llama_model * model;
+        bool acquired;
+        bool adopted = false;
+
+        explicit model_lifetime_ref(llama_model * model)
+            : model(model), acquired(model->acquire_context()) {}
+
+        ~model_lifetime_ref() {
+            if (acquired && !adopted && model->release_context()) {
+                delete model;
+            }
+        }
+    } model_ref(model);
+
+    if (!model_ref.acquired) {
+        LLAMA_LOG_ERROR("%s: model free already requested\n", __func__);
+        return nullptr;
+    }
+
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;
@@ -9182,6 +9297,7 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
 
     try {
         auto * ctx = new llama_context(*model, params);
+        model_ref.adopted = true;
         return ctx;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
@@ -9196,18 +9312,49 @@ llama_context * llama_new_context_with_model(llama_model * model, llama_context_
 }
 
 void llama_free(llama_context * ctx) {
-    if (ctx != nullptr && ctx->get_tp5_relay_backend() != nullptr) {
+    if (ctx == nullptr) {
+        return;
+    }
+    if (ctx->is_retained()) {
+        // Already process-owned. Re-evaluating the schedulers or the relay
+        // would touch state that no longer has an owner contract.
+        LLAMA_LOG_ERROR("%s: context is already retained; duplicate free ignored\n", __func__);
+        return;
+    }
+    llama_model * model = const_cast<llama_model *>(&ctx->get_model());
+    bool retain = false;
+    if (ctx->get_tp5_relay_backend() != nullptr) {
         ggml_relay_status status = {};
         ggml_backend_t backend = ctx->get_tp5_relay_backend();
         if (!ggml_backend_relay_snapshot(backend, &status) || (status.epoch != 0 && !status.finished)) {
             ggml_backend_relay_abort(backend, GGML_STATUS_ABORTED);
             // Scheduler buffers and memory are also native readers' owners.
             // Do not enter an unbounded synchronize or release them on failure.
-            LLAMA_LOG_ERROR("%s: retaining tp5-relay context: native completion is unproved\n", __func__);
-            return;
+            retain = true;
         }
     }
+    if (ctx->has_unproven()) {
+        retain = true;
+    }
+    if (retain) {
+        // Retain the whole context: every member (memory, arena, balloc,
+        // cvec/loras/sampling, graph results) stays alive, and the model's
+        // retained-context count keeps llama_model_free from freeing it.
+        // The process owns all of it until exit. This is retention, not a
+        // native drain.
+        if (!ctx->retain_for_process()) {
+            LLAMA_LOG_ERROR("%s: context is already retained; duplicate free ignored\n", __func__);
+            return;
+        }
+        LLAMA_LOG_ERROR("%s: retaining whole context: an async/native submission is still unproven\n", __func__);
+        return;
+    }
     delete ctx;
+    // The context released its model reference. When llama_model_free was
+    // requested while the context was alive, the last release owns the delete.
+    if (model->release_context()) {
+        delete model;
+    }
 }
 
 bool llama_get_ntok_plan_stats(const llama_context * ctx, llama_ntok_plan_stats * stats) {

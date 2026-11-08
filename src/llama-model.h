@@ -1,6 +1,8 @@
 #pragma once
 
 #include "llama.h"
+
+#include <atomic>
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
@@ -9,6 +11,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -611,6 +614,65 @@ struct llama_model {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
     std::string name = "n/a";
+
+    // Live llama_context objects that reference this model. A context acquired
+    // one reference before construction; a clean llama_free releases it, while
+    // a retained pending context never does. llama_model_free defers while
+    // either count is nonzero, so the model cannot be deleted under a live or
+    // retained context.
+    mutable std::mutex lifetime_mutex;
+    mutable int32_t n_live_contexts = 0;       // guarded by lifetime_mutex
+    bool model_free_requested = false;         // guarded by lifetime_mutex
+
+    // Diagnostic retained-context count. llama_free increments it once for a
+    // pending context; a duplicate llama_free does not. Never released by
+    // design because the context is process-owned.
+    mutable std::atomic<int32_t> n_retained_contexts{0};
+
+    void retain_context() const {
+        n_retained_contexts.fetch_add(1, std::memory_order_relaxed);
+    }
+    int32_t retained_contexts() const {
+        return n_retained_contexts.load(std::memory_order_relaxed);
+    }
+    int32_t live_contexts() const {
+        std::lock_guard<std::mutex> lock(lifetime_mutex);
+        return n_live_contexts;
+    }
+    bool free_requested() const {
+        std::lock_guard<std::mutex> lock(lifetime_mutex);
+        return model_free_requested;
+    }
+    // Called before constructing a context. Returns false when llama_model_free
+    // already requested the model's deletion; the caller must not use it then.
+    bool acquire_context() const {
+        std::lock_guard<std::mutex> lock(lifetime_mutex);
+        if (model_free_requested) {
+            return false;
+        }
+        ++n_live_contexts;
+        return true;
+    }
+    // Called after a context is destroyed. Returns true when this was the last
+    // live context and a model free was requested; the caller owns the delete.
+    bool release_context() const {
+        std::lock_guard<std::mutex> lock(lifetime_mutex);
+        if (n_live_contexts > 0) {
+            --n_live_contexts;
+        }
+        return n_live_contexts == 0 && model_free_requested &&
+               retained_contexts() == 0;
+    }
+    // Mark the model for deletion. Returns true when the caller must delete it
+    // now. A second call never deletes: the first request owns the decision.
+    bool request_free() {
+        std::lock_guard<std::mutex> lock(lifetime_mutex);
+        if (model_free_requested) {
+            return false;
+        }
+        model_free_requested = true;
+        return n_live_contexts == 0 && retained_contexts() == 0;
+    }
 
     llama_hparams hparams = {};
     llama_vocab   vocab;

@@ -36,6 +36,15 @@ enum class kind : uint32_t {
 
 constexpr size_t kKindCount = size_t(kind::count);
 
+// Outcome of one enqueue. The caller may replay the destination only after
+// rejected: ok is complete, fatal means a copy may already be in flight and
+// nothing else may be submitted to that destination.
+enum class submit_result : int {
+    ok       = 0,
+    rejected = 1,  // validated out before any runtime copy
+    fatal    = 2,  // submission is unknown or an event failed; stop
+};
+
 // Maps a graph-input tensor name to a slot kind. Names that do not match keep
 // kind::generic; the meta layer still stages them when they carry the input
 // flag, so an unnamed input (for example the MTP token tensor) is not lost.
@@ -93,14 +102,21 @@ struct lease {
 // Primitives supplied by the GPU backend. The pool calls them with its own
 // lock held; they must not call back into the pool.
 struct backend_ops {
-    bool (*host_alloc)(size_t bytes, void ** out)                   = nullptr;
+    // All runtime primitives return 0 on success and the native error code on
+    // failure. The pool records the code actually returned by the call.
+    int  (*host_alloc)(size_t bytes, void ** out)                   = nullptr;
     void (*host_free)(void * ptr)                                   = nullptr;
-    bool (*event_create)(void ** out)                               = nullptr;
-    bool (*event_record)(void * event, void * stream)               = nullptr;
-    bool (*event_sync)(void * event)                                = nullptr;
+    int  (*event_create)(void ** out)                               = nullptr;
+    int  (*event_record)(void * event, void * stream)               = nullptr;
+    int  (*event_sync)(void * event)                                = nullptr;
     void (*event_destroy)(void * event)                             = nullptr;
-    bool (*copy_h2d)(void * dst, const void * src, size_t bytes, void * stream) = nullptr;
-    bool (*device_ptr)(void * host, void ** out)                    = nullptr;
+    int  (*copy_h2d)(void * dst, const void * src, size_t bytes, void * stream) = nullptr;
+    int  (*device_ptr)(void * host, void ** out)                    = nullptr;
+    // Device selection for event waits. Events belong to the device that
+    // recorded them; HIP requires the matching current device to synchronize.
+    int  (*current_device)()                                       = nullptr;
+    bool (*select_device)(int rank)                                = nullptr;
+    bool (*restore_device)(int physical)                           = nullptr;
 };
 
 class pool {
@@ -121,6 +137,8 @@ public:
         uint64_t stale_release             = 0;
         uint64_t wait_fail                 = 0;
         uint64_t no_slot                   = 0;
+        uint64_t quarantine                = 0;
+        int      first_error               = 0;
         uint64_t invalid                   = 0;
     };
 
@@ -131,6 +149,11 @@ public:
         for (auto & win : slots_) {
             for (auto & key : win) {
                 for (auto & s : key) {
+                    // A quarantined slot may still be read by a copy whose
+                    // completion was never proven. Keep it until process exit.
+                    if (s.quarantined) {
+                        continue;
+                    }
                     for (auto & e : s.events) {
                         if (e != nullptr && ops_.event_destroy != nullptr) {
                             ops_.event_destroy(e);
@@ -171,7 +194,7 @@ public:
         slot * chosen = nullptr;
         // 1) Free and retired, large enough.
         for (auto & s : key) {
-            if (!s.leased && !s.pending && s.cap >= bytes) {
+            if (!s.leased && !s.pending && !s.quarantined && s.cap >= bytes) {
                 chosen = &s;
                 break;
             }
@@ -179,7 +202,7 @@ public:
         // 2) Free and retired, grow.
         if (chosen == nullptr) {
             for (auto & s : key) {
-                if (!s.leased && !s.pending) {
+                if (!s.leased && !s.pending && !s.quarantined) {
                     chosen = &s;
                     break;
                 }
@@ -188,7 +211,7 @@ public:
         // 3) Free but pending, large enough: wait, then reuse.
         if (chosen == nullptr && wait_pending) {
             for (auto & s : key) {
-                if (!s.leased && s.cap >= bytes) {
+                if (!s.leased && !s.quarantined && s.cap >= bytes) {
                     chosen = &s;
                     break;
                 }
@@ -197,7 +220,7 @@ public:
         // 4) Free but pending, grow after the wait.
         if (chosen == nullptr && wait_pending) {
             for (auto & s : key) {
-                if (!s.leased) {
+                if (!s.leased && !s.quarantined) {
                     chosen = &s;
                     break;
                 }
@@ -227,17 +250,25 @@ public:
         return true;
     }
 
-    bool upload(const lease & l, const void * src, size_t bytes) {
+    submit_result upload(const lease & l, const void * src, size_t bytes) {
         if (src == nullptr || bytes == 0) {
-            return false;
+            return submit_result::rejected;
         }
         uint8_t * host = nullptr;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (disabled_.load(std::memory_order_relaxed)) {
+                stats_.invalid++;
+                return submit_result::fatal;
+            }
             slot * s = find_locked(l);
             if (s == nullptr || bytes > s->cap) {
                 stats_.invalid++;
-                return false;
+                return submit_result::rejected;
+            }
+            if (s->quarantined) {
+                stats_.invalid++;
+                return submit_result::fatal;
             }
             host = s->host;
             stats_.uploads++;
@@ -246,30 +277,38 @@ public:
         }
         // The slot is leased, so the pointer cannot be reused while copying.
         std::memcpy(host, src, bytes);
-        return true;
+        return submit_result::ok;
     }
 
     // Copies rows into the slot. src_stride and dst_stride are independent so
     // a packed destination is possible; the meta 2D path passes equal strides
     // because its consumer reads with the source stride.
-    bool upload_rows(const lease & l, const void * src, size_t src_stride,
-                     size_t dst_stride, size_t row_bytes, size_t rows) {
+    submit_result upload_rows(const lease & l, const void * src, size_t src_stride,
+                              size_t dst_stride, size_t row_bytes, size_t rows) {
         if (src == nullptr || row_bytes == 0 || rows == 0) {
-            return false;
+            return submit_result::rejected;
         }
         if (src_stride < row_bytes || dst_stride < row_bytes) {
             std::lock_guard<std::mutex> lock(mutex_);
             stats_.invalid++;
-            return false;
+            return submit_result::rejected;
         }
         const size_t span = (rows - 1) * dst_stride + row_bytes;
         uint8_t * host = nullptr;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (disabled_.load(std::memory_order_relaxed)) {
+                stats_.invalid++;
+                return submit_result::fatal;
+            }
             slot * s = find_locked(l);
             if (s == nullptr || span > s->cap) {
                 stats_.invalid++;
-                return false;
+                return submit_result::rejected;
+            }
+            if (s->quarantined) {
+                stats_.invalid++;
+                return submit_result::fatal;
             }
             host = s->host;
             stats_.uploads++;
@@ -280,47 +319,88 @@ public:
         for (size_t r = 0; r < rows; ++r) {
             std::memcpy(host + r * dst_stride, p + r * src_stride, row_bytes);
         }
-        return true;
+        return submit_result::ok;
     }
 
-    bool enqueue(const lease & l, int rank, void * dst, size_t bytes, void * stream) {
+    submit_result enqueue(const lease & l, int rank, void * dst, size_t bytes, void * stream) {
         if (dst == nullptr || bytes == 0 || rank < 0 || rank >= int(kRanks)) {
             std::lock_guard<std::mutex> lock(mutex_);
             stats_.invalid++;
-            return false;
+            return submit_result::rejected;
         }
         std::lock_guard<std::mutex> lock(mutex_);
+        if (disabled_.load(std::memory_order_relaxed)) {
+            stats_.invalid++;
+            // A disabled pool is a global fault, not a removable capacity miss:
+            // every caller must stop instead of replaying the destination.
+            return submit_result::fatal;
+        }
         slot * s = find_locked(l);
-        if (s == nullptr || bytes > s->cap || ops_.copy_h2d == nullptr ||
+        if (s == nullptr) {
+            stats_.invalid++;
+            return submit_result::rejected;
+        }
+        if (s->quarantined) {
+            stats_.invalid++;
+            return submit_result::fatal;
+        }
+        if (bytes > s->cap || ops_.copy_h2d == nullptr ||
                 ops_.event_create == nullptr || ops_.event_record == nullptr) {
             stats_.invalid++;
-            return false;
+            return submit_result::rejected;
         }
-        if (!ops_.copy_h2d(dst, s->host, bytes, stream)) {
+        const int copy_err = ops_.copy_h2d(dst, s->host, bytes, stream);
+        if (copy_err != 0) {
+            // A failed async copy is treated as unknown: the runtime cannot
+            // prove that nothing was queued, so the buffer must not be reused.
+            s->pending = true;
+            quarantine_locked(*s, copy_err);
+            record_unknown_locked(dst, rank, copy_err);
             disabled_.store(true, std::memory_order_relaxed);
+            publish_fatal_locked();
             stats_.alloc_fail++;
-            return false;
+            return submit_result::fatal;
         }
-        if (s->events[rank] == nullptr && !ops_.event_create(&s->events[rank])) {
-            disabled_.store(true, std::memory_order_relaxed);
-            stats_.alloc_fail++;
-            return false;
+        if (s->events[rank] == nullptr) {
+            const int event_err = ops_.event_create(&s->events[rank]);
+            if (event_err != 0) {
+                // The copy is already queued. Without an event its completion
+                // is unprovable, so the slot is kept and never reused or freed.
+                s->pending = true;
+                s->pending_ranks |= uint32_t(1) << uint32_t(rank);
+                quarantine_locked(*s, event_err);
+                record_unknown_locked(dst, rank, event_err);
+                disabled_.store(true, std::memory_order_relaxed);
+                publish_fatal_locked();
+                stats_.alloc_fail++;
+                return submit_result::fatal;
+            }
         }
-        if (!ops_.event_record(s->events[rank], stream)) {
+        const int record_err = ops_.event_record(s->events[rank], stream);
+        if (record_err != 0) {
+            s->pending = true;
+            s->pending_ranks |= uint32_t(1) << uint32_t(rank);
+            quarantine_locked(*s, record_err);
+            record_unknown_locked(dst, rank, record_err);
             disabled_.store(true, std::memory_order_relaxed);
+            publish_fatal_locked();
             stats_.alloc_fail++;
-            return false;
+            return submit_result::fatal;
         }
         s->pending = true;
         s->pending_ranks |= uint32_t(1) << uint32_t(rank);
         stats_.enqueues++;
-        return true;
+        return submit_result::ok;
     }
 
     bool wait(const lease & l) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (disabled_.load(std::memory_order_relaxed)) {
+            stats_.invalid++;
+            return false;
+        }
         slot * s = find_locked(l);
-        if (s == nullptr) {
+        if (s == nullptr || s->quarantined) {
             stats_.invalid++;
             return false;
         }
@@ -348,12 +428,18 @@ public:
             return nullptr;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        slot * s = find_locked(l);
-        if (s == nullptr || ops_.device_ptr == nullptr) {
+        if (disabled_.load(std::memory_order_relaxed)) {
             return nullptr;
         }
-        if (s->dev_ptrs[rank] == nullptr && !ops_.device_ptr(s->host, &s->dev_ptrs[rank])) {
+        slot * s = find_locked(l);
+        if (s == nullptr || s->quarantined || ops_.device_ptr == nullptr) {
             return nullptr;
+        }
+        if (s->dev_ptrs[rank] == nullptr) {
+            const int err = ops_.device_ptr(s->host, &s->dev_ptrs[rank]);
+            if (err != 0) {
+                return nullptr;
+            }
         }
         return s->dev_ptrs[rank];
     }
@@ -366,7 +452,32 @@ public:
             misses_fast_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        // The submit gate may call the backend set path on this same thread.
+        // enter_submit() publishes submit_gate_held_ before that path and
+        // leave_submit() clears it. This flag is a fast path, not a lock: a
+        // gate can start between this load and the pool lock below.
+        if (submit_gate_held_.load(std::memory_order_acquire)) {
+            misses_fast_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        // Never block on mutex_ here. publish_fatal_locked() holds mutex_ and
+        // waits for the submit gate; a blocking note_source can close the cycle
+        // note_source -> mutex_ -> submit gate -> note_source when the gate
+        // holder waits for the note. A contended pool is a diagnostic fast
+        // miss, not a reason to sleep.
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            misses_fast_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        // A gate may have started while this thread was taking mutex_. Recheck
+        // before touching the stats: the flag keeps the documented "skip while
+        // the gate is held" accounting. This is an accuracy check, not the
+        // deadlock fix (try_lock above already makes it wait-free).
+        if (submit_gate_held_.load(std::memory_order_acquire)) {
+            misses_fast_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (owns_locked(p, bytes)) {
             stats_.hits++;
         } else {
@@ -379,6 +490,48 @@ public:
         stats copy = stats_;
         copy.misses += misses_fast_.load(std::memory_order_relaxed);
         return copy;
+    }
+
+    int first_error() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stats_.first_error;
+    }
+
+    // Submission gate. The fallback copy and the fatal publication share this
+    // lock: a fatal cannot be published between the check and the submit.
+    // note_source reads submit_gate_held_ as a fast path and takes mutex_ only
+    // by try_lock, so it never waits while this gate is held (the fatal
+    // publication holds mutex_ and waits for this gate). The lock is released
+    // on a false return.
+    bool enter_submit() {
+        submit_mutex_.lock();
+        if (submit_fatal_) {
+            submit_mutex_.unlock();
+            return false;
+        }
+        submit_gate_held_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    void leave_submit() {
+        submit_gate_held_.store(false, std::memory_order_release);
+        submit_mutex_.unlock();
+    }
+
+    // Number of destinations whose completion this process cannot prove.
+    // They are owned by the process until native completion; the pool only
+    // keeps its staging resource quarantined.
+    size_t unknown_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return unknown_count_;
+    }
+
+    // True while an asynchronous submission may still be in flight. The
+    // scheduler/context owner keeps the destination until this clears; it
+    // never clears for an unprovable submission.
+    bool submission_pending() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return disabled_.load(std::memory_order_relaxed) || unknown_count_ > 0;
     }
 
     void dump(std::FILE * f) const {
@@ -399,7 +552,8 @@ public:
         std::fprintf(f,
             "TP5_STAGING leases=%llu uploads=%llu upload_bytes=%llu waits=%llu wait_ms=%.3f "
             "enqueues=%llu releases=%llu hits=%llu misses=%llu oversize=%llu alloc_fail=%llu "
-            "stale_release=%llu wait_fail=%llu no_slot=%llu invalid=%llu\n",
+            "stale_release=%llu wait_fail=%llu no_slot=%llu quarantine=%llu invalid=%llu "
+            "first_error=%d\n",
             (unsigned long long) stats_.leases,
             (unsigned long long) stats_.uploads,
             (unsigned long long) stats_.upload_bytes,
@@ -414,7 +568,14 @@ public:
             (unsigned long long) stats_.stale_release,
             (unsigned long long) stats_.wait_fail,
             (unsigned long long) stats_.no_slot,
-            (unsigned long long) stats_.invalid);
+            (unsigned long long) stats_.quarantine,
+            (unsigned long long) stats_.invalid,
+            stats_.first_error);
+        std::fprintf(f, "TP5_STAGING_UNKNOWN unknown=%zu\n", unknown_count_);
+        for (size_t i = 0; i < unknown_count_; ++i) {
+            std::fprintf(f, "TP5_STAGING_UNKNOWN dst=%p rank=%d error=%d\n",
+                         unknown_[i].dst, unknown_[i].rank, unknown_[i].err);
+        }
     }
 
 private:
@@ -424,12 +585,48 @@ private:
         uint64_t  epoch = 0;
         bool      leased = false;
         bool      pending = false;
+        bool      quarantined = false;  // a copy may still read host: never reuse or free
         uint32_t  pending_ranks = 0;
         void *    events[kRanks] = {};
         void *    dev_ptrs[kRanks] = {};
     };
 
     using rotation = std::array<slot, kSlotsPerKey>;
+
+    struct unknown_work {
+        const void * dst = nullptr;
+        int rank = -1;
+        int err = 0;
+    };
+
+    void record_unknown_locked(const void * dst, int rank, int err) {
+        if (unknown_count_ < unknown_.size()) {
+            unknown_[unknown_count_++] = { dst, rank, err };
+        }
+    }
+
+    void note_error_locked(int err) {
+        if (stats_.first_error == 0 && err != 0) {
+            stats_.first_error = err;
+        }
+    }
+
+    void quarantine_locked(slot & s, int err) {
+        if (!s.quarantined) {
+            s.quarantined = true;
+            stats_.quarantine++;
+        }
+        note_error_locked(err);
+    }
+
+    // Caller holds mutex_. A fatal publication waits for an in-flight submit
+    // gate, so a submit that started before the fault completes first and no
+    // new submit can start after it.
+    void publish_fatal_locked() {
+        submit_mutex_.lock();
+        submit_fatal_ = true;
+        submit_mutex_.unlock();
+    }
 
     slot * find_locked(const lease & l) {
         if (l.window >= kWindows || size_t(l.which) >= kKindCount || l.slot >= kSlotsPerKey) {
@@ -464,16 +661,42 @@ private:
             return true;
         }
         const auto t0 = std::chrono::steady_clock::now();
+        const int saved = ops_.current_device != nullptr ? ops_.current_device() : -1;
+        bool ok = true;
+        int fail_err = 0;
         for (uint32_t r = 0; r < kRanks; ++r) {
             if ((s.pending_ranks & (uint32_t(1) << r)) == 0) {
                 continue;
             }
-            if (s.events[r] == nullptr || ops_.event_sync == nullptr ||
-                    !ops_.event_sync(s.events[r])) {
-                disabled_.store(true, std::memory_order_relaxed);
-                stats_.wait_fail++;
-                return false;
+            if (ops_.select_device != nullptr && !ops_.select_device(int(r))) {
+                ok = false;
+                fail_err = -1;
+                break;
             }
+            if (s.events[r] == nullptr || ops_.event_sync == nullptr) {
+                ok = false;
+                fail_err = -1;
+                break;
+            }
+            const int sync_err = ops_.event_sync(s.events[r]);
+            if (sync_err != 0) {
+                ok = false;
+                fail_err = sync_err;
+                break;
+            }
+        }
+        if (ops_.restore_device != nullptr && !ops_.restore_device(saved)) {
+            ok = false;
+            if (fail_err == 0) {
+                fail_err = -1;
+            }
+        }
+        if (!ok) {
+            quarantine_locked(s, fail_err);
+            disabled_.store(true, std::memory_order_relaxed);
+            publish_fatal_locked();
+            stats_.wait_fail++;
+            return false;
         }
         const auto t1 = std::chrono::steady_clock::now();
         stats_.wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
@@ -484,6 +707,9 @@ private:
     }
 
     bool grow_locked(slot & s, size_t bytes) {
+        if (s.quarantined) {
+            return false;
+        }
         if (bytes <= s.cap) {
             return true;
         }
@@ -498,7 +724,9 @@ private:
             return false;
         }
         void * host = nullptr;
-        if (!ops_.host_alloc(bytes, &host)) {
+        const int alloc_err = ops_.host_alloc(bytes, &host);
+        if (alloc_err != 0) {
+            note_error_locked(alloc_err);
             disabled_.store(true, std::memory_order_relaxed);
             stats_.alloc_fail++;
             return false;
@@ -517,6 +745,11 @@ private:
     }
 
     mutable std::mutex mutex_;
+    std::mutex submit_mutex_;
+    // True while enter_submit owns the gate. Published for note_source, which
+    // must not touch submit_mutex_ on the owning thread.
+    std::atomic<bool> submit_gate_held_{false};
+    bool submit_fatal_ = false;
     backend_ops ops_ = {};
     size_t max_bytes_ = kMaxPoolBytes;
     size_t bytes_used_ = 0;
@@ -525,12 +758,16 @@ private:
     std::atomic<bool> has_host_{false};
     mutable std::atomic<uint64_t> misses_fast_{0};
     stats stats_;
+    std::array<unknown_work, 16> unknown_ = {};
+    size_t unknown_count_ = 0;
     std::array<std::array<rotation, kKindCount>, kWindows> slots_ = {};
 };
 
 // Process-wide pool. Defined by the GPU backend; never linked into ggml-base.
 pool & global_pool();
 bool enabled();
+bool configured();
+bool usable();
 bool merge_wait_enabled();
 void init();
 bool zc_enabled();
@@ -548,9 +785,10 @@ struct api {
     // Never waits a pending slot; the async lane uses it so an in-flight
     // event cannot block the pipeline.
     bool (*acquire_nowait)(uint32_t window, kind k, size_t bytes, lease * out);
-    bool (*upload)(const lease * l, const void * src, size_t bytes);
-    bool (*upload_rows)(const lease * l, const void * src, size_t src_stride,
-                        size_t dst_stride, size_t row_bytes, size_t rows);
+    // Returns submit_result: 0 ok, 1 rejected (no side effect), 2 fatal.
+    int (*upload)(const lease * l, const void * src, size_t bytes);
+    int (*upload_rows)(const lease * l, const void * src, size_t src_stride,
+                       size_t dst_stride, size_t row_bytes, size_t rows);
     bool (*wait)(const lease * l);
     void (*release)(const lease * l);
     bool (*owns)(const void * p, size_t bytes);
@@ -559,24 +797,37 @@ struct api {
     // Async lane: the backend copies from the lease and records one event.
     bool (*can_enqueue_async)(ggml_backend_t backend, ggml_tensor * tensor,
                               size_t offset, size_t size);
-    bool (*enqueue_async)(const lease * l, ggml_backend_t backend,
-                          ggml_tensor * tensor, size_t offset, size_t size);
+    // Returns submit_result: 0 ok, 1 rejected (no runtime copy), 2 fatal.
+    int (*enqueue_async)(const lease * l, ggml_backend_t backend,
+                         ggml_tensor * tensor, size_t offset, size_t size);
     // Merge-wait lane: same-device copies on cudaStreamPerThread, the stream
     // the synchronous set_tensor uses.
     bool (*can_enqueue_sync)(ggml_tensor * tensor, size_t offset, size_t size);
-    bool (*enqueue_sync)(const lease * l, ggml_tensor * tensor,
-                         size_t offset, size_t size);
+    int (*enqueue_sync)(const lease * l, ggml_tensor * tensor,
+                        size_t offset, size_t size);
+    // First sticky runtime error observed by the pool; never cleared.
+    int (*first_error)();
+    // Submission gate shared with the fatal publication. The caller submits
+    // the fallback copy between a true enter and leave.
+    bool (*enter_submit)();
+    void (*leave_submit)();
+    size_t (*unknown_count)();
+    bool (*submission_pending)();
+    // configured: GGML_TP5_STAGING requests the pool. usable: the pool has not
+    // stopped. A configured but unusable pool is a global fault.
+    bool (*configured)();
+    bool (*usable)();
     bool (*zc_enabled)();
 };
 
 // Defined by the CUDA/HIP backend.
 bool can_enqueue_async_impl(ggml_backend_t backend, ggml_tensor * tensor,
                             size_t offset, size_t size);
-bool enqueue_async_impl(const lease & l, ggml_backend_t backend,
-                        ggml_tensor * tensor, size_t offset, size_t size);
+submit_result enqueue_async_impl(const lease & l, ggml_backend_t backend,
+                                 ggml_tensor * tensor, size_t offset, size_t size);
 bool can_enqueue_sync_impl(ggml_tensor * tensor, size_t offset, size_t size);
-bool enqueue_sync_impl(const lease & l, ggml_tensor * tensor,
-                       size_t offset, size_t size);
+submit_result enqueue_sync_impl(const lease & l, ggml_tensor * tensor,
+                                size_t offset, size_t size);
 
 }  // namespace ggml_cuda_staging
 

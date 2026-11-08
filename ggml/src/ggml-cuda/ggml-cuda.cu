@@ -865,12 +865,16 @@ bool can_enqueue_async_impl(ggml_backend_t backend, ggml_tensor * tensor,
     return offset <= nbytes && size <= nbytes - offset;
 }
 
-bool enqueue_async_impl(const lease & l, ggml_backend_t backend,
-                        ggml_tensor * tensor, size_t offset, size_t size) {
+submit_result enqueue_async_impl(const lease & l, ggml_backend_t backend,
+                                 ggml_tensor * tensor, size_t offset, size_t size) {
     if (!can_enqueue_async_impl(backend, tensor, offset, size)) {
-        return false;
+        return submit_result::rejected;
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    // The stream belongs to this backend's device. Without the switch the
+    // memcpy and event land on the caller's current device and HIP returns
+    // ERROR_INVALID_RESOURCE_HANDLE.
+    ggml_cuda_set_device(cuda_ctx->device);
     return global_pool().enqueue(l, cuda_ctx->device,
                                  (char *) tensor->data + offset, size, cuda_ctx->stream());
 }
@@ -894,9 +898,9 @@ bool can_enqueue_sync_impl(ggml_tensor * tensor, size_t offset, size_t size) {
     return offset <= nbytes && size <= nbytes - offset;
 }
 
-bool enqueue_sync_impl(const lease & l, ggml_tensor * tensor, size_t offset, size_t size) {
+submit_result enqueue_sync_impl(const lease & l, ggml_tensor * tensor, size_t offset, size_t size) {
     if (!can_enqueue_sync_impl(tensor, offset, size)) {
-        return false;
+        return submit_result::rejected;
     }
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     const auto * buf_ctx = static_cast<ggml_backend_cuda_buffer_context *>(buf->context);
@@ -3916,6 +3920,9 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     if (ggml_cuda_staging::enabled()) {
         ggml_cuda_staging::global_pool().note_source(data, size);
     }
+    // The fallback path must not inherit the caller's device: the stream and
+    // the copy belong to this backend's device.
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -3927,6 +3934,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -3942,6 +3950,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     if (ggml_cuda_staging::enabled()) {
         ggml_cuda_staging::global_pool().note_source(data, n_copies == 0 ? size : stride_data * (n_copies - 1) + size);
     }
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -3955,6 +3964,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
