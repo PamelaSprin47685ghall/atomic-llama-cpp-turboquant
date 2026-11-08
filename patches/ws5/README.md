@@ -30,6 +30,7 @@ explicitly. This keeps the F2/OFF leg equivalent to stock.
 | `GGML_TP5_RELAY_PLAN_STATS` | `0` | `1` | print plan/frame/pool counters |
 | `GGML_TP5_RELAY_PLAN_FLUSH` | `0` | `1` | diagnostic: flush every plan on each prepare |
 | `GGML_TP5_LLAMA_PLAN_CACHE` | `0` | `1..8` | llama-side per-shape `llm_graph_result`+scheduler cache; the value is the slot count; relay-only |
+| `GGML_TP5_RELAY_OUTPUT_ROWS` | `0` | first catch-up rows | relay-only host output preallocation bound; 0 keeps `max(n_outputs_max, n_seq_max)` |
 
 Recommended ON configuration for the five-shape MTP working set:
 
@@ -59,6 +60,28 @@ Cost: every slot owns a scheduler, and each scheduler allocates its own compute
 buffers. Slot count trades host/device memory for build reuse; the five-shape
 relay working set needs at least five slots to avoid LRU thrash. The flag is
 off by default, so the stock and relay-OFF legs keep the single scheduler.
+
+## First catch-up output rows
+
+The relay constructor preallocates the host output buffer for
+`max(cparams.n_outputs_max, n_seq_max())`. A first catch-up batch larger than
+that (the ALLf run used 13 rows with `n_outputs_max = 4`) still grows once.
+`GGML_TP5_RELAY_OUTPUT_ROWS` lets the owner name that bound before context
+creation; the constructor then reserves it and the first decode does not grow.
+The preallocation is allowed above `cparams.n_outputs_max`; every decode call
+keeps the contract assert. A late `set_embeddings_nextn` or sampler change can
+still grow once; that is the documented exception, and the old buffer is
+retired rather than freed (`buf_output_retired`), so no `hipHostFree` runs
+while kernels may be launching.
+
+## Plan/frame counters
+
+`TP5_PLAN_STATS destroy ...` is logged **before** the teardown flush, so
+`live` and `frames` are the steady-state values. The frame fields are
+`frame_hits`, `frame_misses`, `frame_evict`, `frame_inst`, `frame_destroy`.
+A nonzero `frame_inst` proves the capture path ran; a nonzero `frame_hits`
+proves the LRU served a repeat. `frames_cleared` counts frames dropped by an
+exact-pool layout growth, not by the destroy flush.
 
 ## Two plan-key domains (not the same type)
 

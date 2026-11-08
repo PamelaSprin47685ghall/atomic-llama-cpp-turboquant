@@ -892,10 +892,16 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             // window's kernel launch held the ROCm runtime mutex, and the
             // HSA signal wait deadlocked (H2e). The stock path keeps its
             // original lazy initial size.
+            // GGML_TP5_RELAY_OUTPUT_ROWS lets the owner name the first
+            // catch-up row count (the compose runtime knows it before context
+            // creation). Without it the legacy bound is used; a later late
+            // set_embeddings_nextn/sampler change can still grow once, which
+            // is safe because the old buffer is retired, not freed.
             const uint32_t n_outputs_reserve = backend_tp5_relay != nullptr
-                ? std::max<uint32_t>(cparams.n_outputs_max, n_seq_max())
+                ? llama_shape_cache::output_rows_bound(
+                      cparams.n_outputs_max, n_seq_max(), getenv("GGML_TP5_RELAY_OUTPUT_ROWS"))
                 : params.n_seq_max;
-            if (output_reserve(int32_t(n_outputs_reserve)) < n_outputs_reserve) {
+            if (output_reserve(int32_t(n_outputs_reserve), backend_tp5_relay != nullptr) < n_outputs_reserve) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
 
@@ -7416,7 +7422,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs, bool preallocate) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -7585,7 +7591,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     std::fill(output_ids.begin(), output_ids.end(), -1);
 
     this->n_outputs = 0;
-    GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
+    // The decode contract is n_outputs <= n_outputs_max. The constructor's
+    // explicit envelope reserve is the one caller allowed above it: the
+    // buffer is larger, the views are still sized by the requested rows, and
+    // later decode calls re-derive them below the allocation.
+    if (!preallocate) {
+        GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
+    }
     return n_outputs_max;
 }
 

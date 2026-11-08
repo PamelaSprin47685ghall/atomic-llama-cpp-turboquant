@@ -155,6 +155,28 @@ void test_dual_window_isolation() {
     CHECK(right.acquire(make_key(1), 2).hit);
 }
 
+void test_output_rows() {
+    using llama_shape_cache::output_rows_bound;
+    using llama_shape_cache::parse_output_rows;
+    CHECK(parse_output_rows(nullptr) == 0);
+    CHECK(parse_output_rows("") == 0);
+    CHECK(parse_output_rows("0") == 0);
+    CHECK(parse_output_rows("13") == 13);
+    CHECK(parse_output_rows("16") == 16);
+    CHECK(parse_output_rows("-1") == 0);
+    CHECK(parse_output_rows("x") == 0);
+    CHECK(parse_output_rows("4x") == 0);
+    CHECK(parse_output_rows("1048577") == 0);
+
+    // The constructor bound: max(n_outputs_max, n_seq_max, explicit rows).
+    CHECK(output_rows_bound(4, 1, nullptr) == 4);
+    CHECK(output_rows_bound(4, 1, "13") == 13);
+    CHECK(output_rows_bound(16, 1, "13") == 16);
+    CHECK(output_rows_bound(4, 2, "0") == 4);
+    CHECK(output_rows_bound(4, 8, nullptr) == 8);
+    CHECK(output_rows_bound(4, 1, "junk") == 4);
+}
+
 void test_flag_and_capacity() {
     using llama_shape_cache::parse_capacity;
     CHECK(parse_capacity(nullptr) == 0);
@@ -198,6 +220,7 @@ int main() {
     test_lru_eviction();
     test_flush_and_rekey();
     test_dual_window_isolation();
+    test_output_rows();
     test_flag_and_capacity();
     if (failures != 0) {
         std::fprintf(stderr, "SHAPE_CACHE_TEST FAIL %d\n", failures);

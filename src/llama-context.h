@@ -283,7 +283,10 @@ private:
 
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs);
+    // `preallocate` is the constructor's explicit envelope reserve: it may
+    // exceed cparams.n_outputs_max so the first catch-up decode does not grow
+    // the host buffer. Every decode call keeps the contract assert.
+    uint32_t output_reserve(int32_t n_outputs, bool preallocate = false);
 
     void output_reorder();
 

@@ -416,6 +416,14 @@ struct provider {
     size_t                                 retired_count = 0;
     uint64_t                               pool_reallocations = 0;
     uint64_t                               frames_cleared_for_pool = 0;
+    // Frame-cache evidence for the create/destroy gate. A frame hit is a
+    // signature or uid match; a miss installs a new frame; an instantiate is
+    // one rank's hipGraphInstantiate; a destroy is one frame teardown.
+    uint64_t                               frame_hits = 0;
+    uint64_t                               frame_misses = 0;
+    uint64_t                               frame_evictions = 0;
+    uint64_t                               frame_instantiates = 0;
+    uint64_t                               frame_destroys = 0;
     std::vector<unsigned char>            signature;
     std::vector<const ggml_tensor *>       tensors;
     std::vector<ggml_tensor *>             tensor_keys;
@@ -513,6 +521,7 @@ bool select(provider & p, uint32_t rank) {
 
 bool clear_frame(provider & p, frame & f) {
     bool ok = true;
+    bool destroyed = false;
     for (uint32_t r = 0; r < ranks; ++r) {
         if (!f.exec[r] && !f.graph[r]) {
             continue;
@@ -527,6 +536,7 @@ bool clear_frame(provider & p, frame & f) {
                 continue;
             }
             f.exec[r] = nullptr;
+            destroyed = true;
         }
         if (f.graph[r]) {
             if (!checked(p, hipGraphDestroy(f.graph[r]), "hipGraphDestroy relay")) {
@@ -534,7 +544,11 @@ bool clear_frame(provider & p, frame & f) {
                 continue;
             }
             f.graph[r] = nullptr;
+            destroyed = true;
         }
+    }
+    if (destroyed) {
+        ++p.frame_destroys;
     }
     if (ok) {
         f.warmed = false;
@@ -1169,7 +1183,8 @@ void log_plan_stats(provider & p, const char * where) {
     }
     const auto & s = p.plan_cache.stats();
     GGML_LOG_INFO("TP5_PLAN_STATS %s hits=%llu misses=%llu inserts=%llu evictions=%llu pinned=%llu "
-                  "flushes=%llu stale=%llu live=%zu pool=%zu reallocs=%llu frames_cleared=%llu frames=%zu\n",
+                  "flushes=%llu stale=%llu live=%zu pool=%zu reallocs=%llu frames_cleared=%llu frames=%zu "
+                  "frame_hits=%llu frame_misses=%llu frame_evict=%llu frame_inst=%llu frame_destroy=%llu\n",
                   where,
                   static_cast<unsigned long long>(s.hits), static_cast<unsigned long long>(s.misses),
                   static_cast<unsigned long long>(s.inserts), static_cast<unsigned long long>(s.evictions),
@@ -1179,7 +1194,12 @@ void log_plan_stats(provider & p, const char * where) {
                   p.plan_cache.live(), p.pool_bytes,
                   static_cast<unsigned long long>(p.pool_reallocations),
                   static_cast<unsigned long long>(p.frames_cleared_for_pool),
-                  p.frame_lru.used());
+                  p.frame_lru.used(),
+                  static_cast<unsigned long long>(p.frame_hits),
+                  static_cast<unsigned long long>(p.frame_misses),
+                  static_cast<unsigned long long>(p.frame_evictions),
+                  static_cast<unsigned long long>(p.frame_instantiates),
+                  static_cast<unsigned long long>(p.frame_destroys));
 }
 
 // Drop every frame captured for one plan generation and queue its retirement
@@ -1594,6 +1614,9 @@ bool finish(provider & p) {
             for (uint32_t r = 0; r < started; ++r) {
                 checked(p, jobs[r].get(), "select/instantiate relay epoch worker");
             }
+            if (!p.status.failed) {
+                p.frame_instantiates += ranks;
+            }
         }
     }
     if (p.mode != submission::direct && !p.status.failed) {
@@ -1805,6 +1828,9 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
         const bool fast = uid != 0 && p.current != nullptr && p.current->uid == uid &&
                           p.current->plan_generation == p.status.plan_generation &&
                           !p.current->signature.empty();
+        if (fast) {
+            hit = true;
+        }
         if (fast && p.plan_verify_uid) {
             if (!describe_frame(p, graphs, stages, compute_nodes)) {
                 return false;
@@ -1840,6 +1866,9 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
                     return false;
                 }
                 auto & f = p.frames[static_cast<size_t>(index)];
+                if (p.frame_lru.valid(index)) {
+                    ++p.frame_evictions;
+                }
                 // idle above proves this old executable has no native or CPU users.
                 if (!clear_frame(p, f)) {
                     return false;
@@ -1854,6 +1883,11 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
             p.frame_lru.assign(current_index, uid, p.status.plan_generation, p.status.epoch);
         }
         p.definition_changed = false;
+        if (hit) {
+            ++p.frame_hits;
+        } else {
+            ++p.frame_misses;
+        }
     } catch (const std::bad_alloc &) {
         fail(p, ENOMEM, "allocating relay frame signature failed");
         return false;
@@ -2212,10 +2246,12 @@ bool destroy(void * opaque) {
         fail(*p, EBUSY, "relay destroy cannot prove CPU and native completion; retaining owners");
         return false;
     }
+    // Snapshot before the teardown flush: live plans and frames are the
+    // steady-state evidence, not the post-flush zeros.
+    log_plan_stats(*p, "destroy");
     if (p->plan_cache_enabled && !flush_all_plans(*p, false)) {
         return false;
     }
-    log_plan_stats(*p, "destroy");
     if (!release_owners(*p)) {
         return false;
     }

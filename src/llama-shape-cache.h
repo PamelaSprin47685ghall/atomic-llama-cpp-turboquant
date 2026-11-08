@@ -70,6 +70,30 @@ inline std::size_t parse_capacity(const char * value) noexcept {
     return static_cast<std::size_t>(parsed);
 }
 
+// GGML_TP5_RELAY_OUTPUT_ROWS: relay-only preallocation bound for the host
+// output buffer. The compose runtime knows the first catch-up batch size
+// before it creates the context; setting this to that row count lets the
+// constructor reserve it, so the first decode does not grow. Unset/0 keeps
+// the legacy bound (max(n_outputs_max, n_seq_max)); an illegal value is 0.
+inline uint32_t parse_output_rows(const char * value) noexcept {
+    if (value == nullptr || value[0] == '\0') {
+        return 0;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || end == nullptr || *end != '\0' || parsed < 0 || parsed > (1 << 20)) {
+        return 0;
+    }
+    return static_cast<uint32_t>(parsed);
+}
+
+inline uint32_t output_rows_bound(uint32_t n_outputs_max, uint32_t n_seq_max,
+                                  const char * env_value) noexcept {
+    uint32_t bound = n_outputs_max > n_seq_max ? n_outputs_max : n_seq_max;
+    const uint32_t rows = parse_output_rows(env_value);
+    return rows > bound ? rows : bound;
+}
+
 // Fixed-capacity LRU over shape keys. The slots own no graph state; the
 // caller keeps a parallel array of entries and frees the entry named by
 // `evicted` before installing a new one.
