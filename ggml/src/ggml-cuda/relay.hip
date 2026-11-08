@@ -1165,7 +1165,7 @@ void * create(ggml_backend_t * backends, size_t count) {
                       static_cast<void *>(p), p->priority_pair_slot, requested_priority,
                       unsigned(hipStreamNonBlocking), ranks);
     }
-    GGML_LOG_INFO("HIP relay pillar5 provider=%p plan_cache=%d frames=%zu pool=%s bytes=%zu budget=%zu graph_uid=%d\n",
+    GGML_LOG_INFO("HIP relay pillar5 provider=%p plan_cache=%d frames=%zu pool=%s bytes=%zu budget=%zu graph_uid=%d key_digest=1\n",
                   static_cast<void *>(p), int(p->plan_cache_enabled), p->frame_lru.capacity(),
                   p->pool_exact ? "exact" : "legacy", p->pool_bytes, p->pool_budget, int(cfg.graph_uid));
     return p;
@@ -1308,10 +1308,13 @@ bool plan_generation_for(provider & p, const ggml_relay_plan_key * key, size_t c
     }
     pk.channels = uint32_t(count);
     pk.binding  = binding;
-    if (!same_plan && p.plan_cache.find(pk) != nullptr) {
-        fail(p, EPROTO, "relay plan key collided with a different terminal binding");
-        return false;
-    }
+    // A key hit is a plan-identity hit: the key carries the terminal binding
+    // digest. same_plan only says whether the provider's CURRENT channels
+    // already match this prepare; after a tail switch (180 <-> 181 channels)
+    // they describe the other plan, so same_plan=false must NOT be treated as
+    // a key bug. prepare_impl rebinds the channels when !same_plan; reusing
+    // the cached generation is correct and the runtime keeps that plan's slot.
+    // A genuinely different binding has a different digest and is a miss.
     uint64_t evicted = 0;
     ggml_relay_plan::plan_slot * slot = p.plan_cache.acquire(pk, p.plan_epoch, &evicted);
     if (slot == nullptr) {

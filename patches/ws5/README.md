@@ -90,11 +90,23 @@ all of them identical while the terminal tensors move or change layout. The
 relay therefore folds a digest of every terminal binding (`tensor` and `data`
 pointers, `ne`, `nb`, for all channels and ranks) into its internal plan key.
 "Same llama key, different terminal binding" is then a cache miss with its
-own slot, not the `relay plan key collided with a different terminal binding`
-fail-closed error. The full `same_binding` check still runs on every prepare;
-the fail-closed error now fires only on a digest collision (a true conflict).
-The digest is computed only when the plan cache is enabled and a key is
-present, so flag 0 keeps the legacy path.
+own slot.
+
+A key hit must not be compared against the provider's *current* channels:
+after a tail switch between the 180- and 181-channel plans, the current
+channels describe the other plan, so `same_plan` is false even though the
+cached plan is the right one. A cached key hit reuses that plan's generation
+and rebinds the channels; different bindings have a different digest and are
+a miss. The only remaining key fail-closed is an explicit channel-count
+contradiction between the caller's key and the prepared terminals. The digest
+is computed only when the plan cache is enabled and a key is present, so flag
+0 keeps the legacy path.
+
+The provider-create line ends with `key_digest=1` when the build contains this
+fix. A rerun log without that marker used an older installed
+`libggml-hip.so`; check it before attributing a remaining collision to the
+code. A rerun with the marker should show the catch-up as a plan-cache hit
+(or a new insert) and no `relay plan key collided` failure.
 
 ## Two plan-key domains (not the same type)
 

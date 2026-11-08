@@ -129,6 +129,29 @@ void test_plan_cache() {
     CHECK(rows.find(base_512)->generation == first_512->generation);
     CHECK(rows.find(catch_up)->generation == second_512->generation);
 
+    // 512-row tail switch: plans A (180 channels) and B (181) alternate. A
+    // key hit must return A's own slot even when the provider's current
+    // channels describe B; the cache never consults a separate "current
+    // binding" status. A different binding is a new plan, not a conflict.
+    plan_cache tail;
+    plan_key plan_a = make_key(12, 1, 180);
+    plan_a.binding  = 0x1111;
+    plan_key plan_b = make_key(12, 1, 181);
+    plan_b.binding  = 0x2222;
+    const plan_slot * slot_a = tail.acquire(plan_a, 1);
+    const plan_slot * slot_b = tail.acquire(plan_b, 2);
+    CHECK(slot_a != nullptr && slot_b != nullptr);
+    CHECK(slot_a != slot_b);
+    const plan_slot * again_a = tail.acquire(plan_a, 3);
+    CHECK(again_a == slot_a); // same slot, same generation
+    CHECK(again_a->generation == slot_a->generation);
+    CHECK(tail.live() == 2);
+    plan_key plan_a_other = plan_a;
+    plan_a_other.binding  = 0x3333;
+    const plan_slot * other = tail.acquire(plan_a_other, 4);
+    CHECK(other != slot_a); // different binding -> its own plan
+    CHECK(tail.find(plan_a)->generation == slot_a->generation); // old plan intact
+
     // Every slot pinned fails closed instead of dropping a plan.
     plan_cache pinned;
     for (uint32_t i = 0; i < plan_cache::capacity; ++i) {
@@ -363,6 +386,24 @@ void test_channel_slots() {
     CHECK(r->states[7] == nullptr);
     CHECK(left.live_channels() == 1);
     CHECK(right.live_channels() == 0);
+
+    // Non-monotonic plan generations are consumer-visible after a tail
+    // switch: generation 2 must return to its own slot after generation 5
+    // was used, with its state preserved and not shared with 5.
+    slot_table tail;
+    auto * gen2 = tail.acquire(2, 10, slot_idle);
+    CHECK(gen2 != nullptr);
+    gen2->states[3] = std::make_unique<dummy_channel>();
+    gen2->states[3]->id = 2;
+    auto * gen5 = tail.acquire(5, 11, slot_idle);
+    CHECK(gen5 != nullptr);
+    gen5->states[3] = std::make_unique<dummy_channel>();
+    gen5->states[3]->id = 5;
+    auto * gen2_again = tail.acquire(2, 12, slot_idle);
+    CHECK(gen2_again == gen2);
+    CHECK(gen2_again->states[3] != nullptr && gen2_again->states[3]->id == 2);
+    CHECK(tail.find(5)->states[3]->id == 5);
+    CHECK(tail.live() == 2);
 
     table.clear();
     CHECK(table.empty());
