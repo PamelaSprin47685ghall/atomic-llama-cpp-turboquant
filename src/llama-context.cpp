@@ -1266,25 +1266,13 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 }
 
 llama_context::~llama_context() {
-    // If an async submission is unproven, do not synchronize, free or reuse
-    // any owner that may be referenced by the copy. Retain the scheduler, its
-    // backends and the context-owned buffers/graphs; the process owns them
-    // until exit. This is retention, not a native drain.
     if (sched && ggml_backend_sched_has_unproven(sched.get())) {
-        LLAMA_LOG_ERROR("%s: retaining scheduler/backends: an async submission is still unproven\n", __func__);
-        sched.release();
-        for (auto & backend : backends) {
-            backend.release();
-        }
-        prefab.release();
-        gf_res_prev.release();
-        gf_res_reserve.release();
-        buf_output.release();
-        union_binder_state.release();
-        // mem_storage is a map member, not a pointer. Move it to a leaked
-        // owner so the per-sequence buffers outlive this context.
-        new std::map<llama_seq_id, llama_memory_buffers>(std::move(mem_storage));
-        return;
+        // llama_free retains the whole context (and increments the model's
+        // retained-context count); a direct delete cannot keep the external
+        // model and context-owned buffers alive. Fail loudly instead of
+        // freeing behind an in-flight copy.
+        LLAMA_LOG_ERROR("%s: pending context destroyed directly; llama_free must retain it\n", __func__);
+        GGML_ABORT("pending llama_context destroyed directly");
     }
 
     // wait for any pending asynchronous copies into the output buffers before they are freed
@@ -2907,6 +2895,23 @@ void llama_context::detach_threadpool() {
 
     this->threadpool       = nullptr;
     this->threadpool_batch = nullptr;
+}
+
+bool llama_context::has_unproven() const {
+    return sched && ggml_backend_sched_has_unproven(sched.get());
+}
+
+void llama_context::retain_for_process() {
+    // The threadpools are caller-owned; detach so the caller may free them.
+    // The context no longer computes after this point.
+    detach_threadpool();
+    model.retain_context();
+}
+
+void llama_context::debug_mark_unproven() {
+    if (sched) {
+        ggml_backend_sched_mark_unproven(sched.get());
+    }
 }
 
 void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
@@ -9028,16 +9033,32 @@ llama_context * llama_new_context_with_model(llama_model * model, llama_context_
 }
 
 void llama_free(llama_context * ctx) {
-    if (ctx != nullptr && ctx->get_tp5_relay_backend() != nullptr) {
+    if (ctx == nullptr) {
+        return;
+    }
+    bool retain = false;
+    if (ctx->get_tp5_relay_backend() != nullptr) {
         ggml_relay_status status = {};
         ggml_backend_t backend = ctx->get_tp5_relay_backend();
         if (!ggml_backend_relay_snapshot(backend, &status) || (status.epoch != 0 && !status.finished)) {
             ggml_backend_relay_abort(backend, GGML_STATUS_ABORTED);
             // Scheduler buffers and memory are also native readers' owners.
             // Do not enter an unbounded synchronize or release them on failure.
-            LLAMA_LOG_ERROR("%s: retaining tp5-relay context: native completion is unproved\n", __func__);
-            return;
+            retain = true;
         }
+    }
+    if (ctx->has_unproven()) {
+        retain = true;
+    }
+    if (retain) {
+        // Retain the whole context: every member (memory, arena, balloc,
+        // cvec/loras/sampling, graph results) stays alive, and the model's
+        // retained-context count keeps llama_model_free from freeing it.
+        // The process owns all of it until exit. This is retention, not a
+        // native drain.
+        LLAMA_LOG_ERROR("%s: retaining whole context: an async/native submission is still unproven\n", __func__);
+        ctx->retain_for_process();
+        return;
     }
     delete ctx;
 }

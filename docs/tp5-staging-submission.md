@@ -62,19 +62,33 @@ process exit. Other backends report `0`/`false`.
 - **Scheduler input copies**: the scheduler owns the copy tensors and retains
   them while the cached state is unproven. The caller must not free the
   scheduler or its backends while pending.
-- **llama_context**: the destructor queries `ggml_backend_sched_has_unproven`
-  before any synchronize or free. On a pending state it retains the scheduler,
-  the backends, prefab, graph results, output buffer, union-binder state and
-  the per-sequence buffers by releasing/moving them to process-owned storage;
-  it returns without freeing behind the native copy. On a clean state it frees
-  the scheduler **before** the backend members are destroyed, matching the
-  actual reverse member order.
+- **llama_context / llama_free**: `llama_free` queries
+  `llama_context::has_unproven()` (and the relay status) while every member is
+  still alive. If either is pending it does **not** delete the context: it
+  logs, calls `retain_for_process()` (detach the caller-owned threadpools,
+  increment the model's retained-context count) and returns. The whole context
+  and all its members stay allocated for process exit, so the pending copy
+  cannot race a member destructor (memory, kv_stream_phase_arena,
+  cvec/loras, balloc, sampling, graph results, scheduler, backends).
+  `llama_context::~llama_context()` refuses a direct delete of a pending
+  context (aborts) because a direct delete cannot keep the external model and
+  context-owned buffers alive. On a clean state the destructor frees the
+  scheduler **before** the backend members are destroyed, matching the actual
+  reverse member order.
+- **Model**: `llama_model` carries `n_retained_contexts`. Every retained
+  context increments it; `llama_model_free` defers and logs instead of
+  deleting while it is nonzero. The model, its pimpl buffers and the retained
+  context are process-owned; the caller must not use the freed pointer but the
+  underlying model is not deleted. There is no release operation for a
+  retained context by design.
 - **Meta owner**: `ggml_backend_meta_free` retains the whole Meta owner
   (context, child backends, buffers) while `submission_pending` is true.
 - **Public helper callers**: `ggml_backend_tensor_copy_async` does not retain
   anything. On `false` the caller is the owner of the source, destination and
   both backends until process exit; there is no public release operation for an
   unknown submission.
+- **Threadpools** are caller-owned. `retain_for_process` detaches them so the
+  caller may free them; the retained context does not compute again.
 - The process exit is the final owner. No API claims native completion.
 
 ## Limits
@@ -117,6 +131,12 @@ cmake --build build-ws4-sched-asan -j --target test-tp5-staging-scheduler
 ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-ws4-sched-asan \
       -R test-tp5-staging-scheduler --output-on-failure
 
+# pending-context/model ownership (ctest); the context part needs a model:
+#   LLAMA_TEST_MODEL=/path/to/model.gguf ctest -R test-tp5-context-retain
+cmake --build build-ws4-sched-ctest -j --target test-tp5-context-retain
+LLAMA_TEST_MODEL=/path/to/model.gguf ctest --test-dir build-ws4-sched-ctest \
+      -R test-tp5-context-retain --output-on-failure
+
 # staging pool (standalone)
 g++ -std=c++17 -O2 -pthread -I ggml/include -I ggml/src \
     tests/test-tp5-staging-pool.cpp -o /tmp/test-tp5-staging-pool
@@ -129,3 +149,16 @@ pending entry gates (`alloc_graph`, `reserve`, `reserve_size`,
 `release_buffers`, `reset`, `compute`), no input-scope flush on the unknown
 path, and the production backends-before-scheduler destruction order (the fake
 records any capability probe after `iface.free`).
+
+The context-retain test covers: `llama_model_free` deferral while a retained
+context exists, a clean model free, and (with `LLAMA_TEST_MODEL`) a real CPU
+context marked unproven that `llama_free` retains whole, followed by a
+deferred model free. Without a model it reports `context-skip` and still
+passes the model-retention checks.
+
+Known open points from the independent review that are not claimed closed:
+`replan_graph`, `refresh_split_copy_views`, `set_moe_cache` and the
+synchronous `ggml_backend_sched_graph_compute` wrapper do not all gate on the
+unproven state; the compute failure currently checks only the failed split
+backend; Meta reduce checks `submission_error` but not `submission_pending`
+(pending-with-zero-error is a scheduler-test-only state today).

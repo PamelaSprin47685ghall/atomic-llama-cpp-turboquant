@@ -1,6 +1,8 @@
 #pragma once
 
 #include "llama.h"
+
+#include <atomic>
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
@@ -611,6 +613,18 @@ struct llama_model {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
     std::string name = "n/a";
+
+    // Pending contexts that still reference this model. llama_model_free
+    // defers instead of freeing while nonzero: a context retained after
+    // llama_free owns the model until process exit. Never released by design.
+    mutable std::atomic<int32_t> n_retained_contexts{0};
+
+    void retain_context() const {
+        n_retained_contexts.fetch_add(1, std::memory_order_relaxed);
+    }
+    int32_t retained_contexts() const {
+        return n_retained_contexts.load(std::memory_order_relaxed);
+    }
 
     llama_hparams hparams = {};
     llama_vocab   vocab;

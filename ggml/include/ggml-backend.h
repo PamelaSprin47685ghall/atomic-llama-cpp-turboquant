@@ -332,6 +332,8 @@ extern "C" {
     // before destroying the backends. ggml_backend_sched_free uses only the
     // cached answer and never dereferences the backends.
     GGML_API bool                 ggml_backend_sched_has_unproven(ggml_backend_sched_t sched);
+    // Test/diagnostic only: force the cached unproven state.
+    GGML_API void                 ggml_backend_sched_mark_unproven(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);

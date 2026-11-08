@@ -2318,6 +2318,12 @@ bool ggml_backend_sched_has_unproven(ggml_backend_sched_t sched) {
     return ggml_backend_sched_any_pending(sched);
 }
 
+void ggml_backend_sched_mark_unproven(ggml_backend_sched_t sched) {
+    if (sched != nullptr) {
+        sched->submission_unproven = true;
+    }
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;

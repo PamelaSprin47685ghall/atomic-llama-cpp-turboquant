@@ -160,6 +160,16 @@ struct llama_context {
 
     void detach_threadpool();
 
+    // True while an asynchronous submission is unproven. Query only while the
+    // scheduler backends are alive; llama_free uses this to retain the whole
+    // context (and its model) for process exit.
+    bool has_unproven() const;
+    // Retain this whole context and increment the model's retained-context
+    // count. llama_model_free then defers instead of freeing the model.
+    void retain_for_process();
+    // Test/diagnostic only: force the scheduler's cached unproven state.
+    void debug_mark_unproven();
+
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
     void set_decode_phase(enum llama_decode_phase phase);
 

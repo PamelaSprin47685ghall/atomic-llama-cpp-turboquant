@@ -3066,6 +3066,16 @@ void llama_free_model(llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
+    if (model == nullptr) {
+        return;
+    }
+    if (model->retained_contexts() > 0) {
+        // A pending llama_context was retained after llama_free; its graphs,
+        // child backends and buffers still reference this model. The process
+        // owns both until exit.
+        LLAMA_LOG_ERROR("%s: retaining model: a pending context still references it\n", __func__);
+        return;
+    }
     delete model;
 }
 

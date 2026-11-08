@@ -1294,3 +1294,14 @@ target_link_libraries(test-tp5-staging-scheduler PRIVATE ggml ggml-cpu)
 add_test(NAME test-tp5-staging-scheduler COMMAND test-tp5-staging-scheduler)
 set_property(TEST test-tp5-staging-scheduler PROPERTY LABELS "cpu;tp5")
 set_property(TEST test-tp5-staging-scheduler PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_SCHED_TEST PASS")
+
+# TP5 WS4 pending-context/model ownership test. llama_free retains the whole
+# context (and defers llama_model_free) while an async submission is unproven;
+# a clean context/model takes the normal destruction path. The context part
+# needs LLAMA_TEST_MODEL; the model retention part always runs.
+add_executable(test-tp5-context-retain test-tp5-context-retain.cpp)
+target_link_libraries(test-tp5-context-retain PRIVATE llama)
+target_include_directories(test-tp5-context-retain PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME test-tp5-context-retain COMMAND test-tp5-context-retain)
+set_property(TEST test-tp5-context-retain PROPERTY LABELS "cpu;tp5")
+set_property(TEST test-tp5-context-retain PROPERTY PASS_REGULAR_EXPRESSION "TP5_CONTEXT_RETAIN_TEST PASS")
