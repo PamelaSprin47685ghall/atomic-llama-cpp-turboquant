@@ -5,6 +5,7 @@
 //   /tmp/test-tp5-staging
 
 #include "../ggml/src/ggml-cuda/staging.h"
+#include "../ggml/src/ggml-impl.h"  // ggml_are_same_layout (static inline)
 
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +23,7 @@ int g_syncs = 0;
 int g_copies = 0;
 bool g_fail_alloc = false;
 bool g_fail_sync = false;
+int  g_fail_copy_remaining = 0;
 
 bool fake_alloc(size_t bytes, void ** out) {
     if (g_fail_alloc) {
@@ -65,6 +67,10 @@ void fake_event_destroy(void * p) {
 }
 
 bool fake_copy(void * dst, const void * src, size_t bytes, void *) {
+    if (g_fail_copy_remaining > 0) {
+        --g_fail_copy_remaining;
+        return false;
+    }
     std::memcpy(dst, src, bytes);
     ++g_copies;
     return true;
@@ -467,6 +473,85 @@ int test_staging_candidate() {
     return 0;
 }
 
+int test_source_mutation_isolation() {
+    pool p(fake_ops());
+    uint8_t src[64];
+    uint8_t dst[64] = {};
+    std::memset(src, 0x11, sizeof(src));
+
+    lease a;
+    CHECK(p.acquire(0, kind::mtp_h, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+    // The caller may reuse the source as soon as upload returns: the pinned
+    // copy is independent, unlike the original path which holds the pointer
+    // until the H2D copy drains.
+    std::memset(src, 0x22, sizeof(src));
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr));
+    CHECK(p.wait(a));
+    for (size_t i = 0; i < sizeof(src); ++i) {
+        CHECK(dst[i] == 0x11);
+    }
+    p.release(a);
+    return 0;
+}
+
+int test_fallback_reupload() {
+    pool p(fake_ops());
+    uint8_t src[64];
+    uint8_t dst0[64] = {};
+    uint8_t dst1[64] = {};
+    std::memset(src, 0x33, sizeof(src));
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+
+    // Rank 0 is queued, rank 1 fails: the pool disables and the caller falls
+    // back to the pageable path.
+    CHECK(p.enqueue(a, 0, dst0, sizeof(src), nullptr));
+    g_fail_copy_remaining = 1;
+    CHECK(!p.enqueue(a, 1, dst1, sizeof(src), nullptr));
+    CHECK(!p.usable());
+    CHECK(g_fail_copy_remaining == 0);
+
+    // The fallback repeats the copies from the same source. A fresh upload and
+    // a full enqueue must still deliver the source bytes.
+    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.enqueue(a, 0, dst0, sizeof(src), nullptr));
+    CHECK(p.enqueue(a, 1, dst1, sizeof(src), nullptr));
+    CHECK(p.wait(a));
+    CHECK(std::memcmp(dst0, src, sizeof(src)) == 0);
+    CHECK(std::memcmp(dst1, src, sizeof(src)) == 0);
+    p.release(a);
+    return 0;
+}
+
+int test_layout_predicate() {
+    // The async staging lane relies on ggml_are_same_layout + contiguous to
+    // make nbytes(src) == nbytes(dst). Pin the predicate down here.
+    ggml_tensor a = {};
+    ggml_tensor b = {};
+    a.type = b.type = GGML_TYPE_F32;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        a.ne[i] = b.ne[i] = (i == 0 ? 32 : 1);
+        a.nb[i] = b.nb[i] = (i == 0 ? int64_t(sizeof(float)) : int64_t(32 * sizeof(float)));
+    }
+    CHECK(ggml_are_same_layout(&a, &b));
+    const size_t bytes_a = size_t(a.ne[0]) * a.ne[1] * a.ne[2] * a.ne[3] * sizeof(float);
+    const size_t bytes_b = size_t(b.ne[0]) * b.ne[1] * b.ne[2] * b.ne[3] * sizeof(float);
+    CHECK(bytes_a == bytes_b);
+
+    b.nb[1] = 256;
+    CHECK(!ggml_are_same_layout(&a, &b));
+    b.nb[1] = a.nb[1];
+    b.type = GGML_TYPE_F16;
+    CHECK(!ggml_are_same_layout(&a, &b));
+    b.type = GGML_TYPE_F32;
+    b.ne[1] = 2;
+    CHECK(!ggml_are_same_layout(&a, &b));
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -490,12 +575,16 @@ int main() {
         {"owns_and_diagnostics",       test_owns_and_diagnostics},
         {"device_ptr",                 test_device_ptr},
         {"staging_candidate",          test_staging_candidate},
+        {"source_mutation_isolation",  test_source_mutation_isolation},
+        {"fallback_reupload",          test_fallback_reupload},
+        {"layout_predicate",           test_layout_predicate},
     };
 
     int failed = 0;
     for (const auto & t : tests) {
         g_fail_alloc = false;
         g_fail_sync = false;
+        g_fail_copy_remaining = 0;
         const int rc = t.fn();
         std::printf("%s %s\n", rc == 0 ? "PASS" : "FAIL", t.name);
         failed += rc != 0;
