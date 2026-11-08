@@ -109,7 +109,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/relay.hip",
-      "sha256": "dd38b26d2a037cf579253995f9bb46dbea57b452745765aaf55aef18f75ba269",
+      "sha256": "9ec07069d2fd84b2b67a05c9bdcb573a90da4d5fb24a36edac3b8951892ea8fc",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -831,7 +831,7 @@
     },
     {
       "path": "ggml/include/ggml-relay-plan.h",
-      "sha256": "32dd75b87dae13ca6ea9d452541200884898c4b940c971a6647a8416ae6c1778",
+      "sha256": "73220f73122e0343b7261c28f0f92a0769863426cb9180b9f6f97b337709d97f",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose pillar-5 plan cache and frame LRU (WS5)",
@@ -873,7 +873,7 @@
     },
     {
       "path": "tests/test-relay-plan-policy.cpp",
-      "sha256": "3e98ea1c77ef24fbe40ad5f9b22177d1eb031804f03b82f888fb826eb8ef58cb",
+      "sha256": "e1b0332d786946d9e0cbbdb95cd983625a2ee53529e4b37289055f1491498119",
       "mode": "100644",
       "consumers": [
         "WS5 relay plan policy CPU test"
@@ -913,7 +913,7 @@
     },
     {
       "path": "patches/ws5/README.md",
-      "sha256": "891a3afc4fe68be33c01774f926892c976b0da2d37a6e5f619dfd816a46da702",
+      "sha256": "9663fbda0f62ece10034292dac037ffb2044bf44207180ba222cbe6a160c5a0b",
       "mode": "100644",
       "consumers": [
         "integ/tp5-mtp-r28b integration maintainers"
