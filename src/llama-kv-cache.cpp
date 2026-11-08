@@ -297,10 +297,24 @@ llama_kv_cache::llama_kv_cache(
 
     // The decode-time pools allocate here, before the relay service and the
     // first decode exist. The first prepare then only reuses them; a later
-    // larger batch still grows the pools.
-    snapshots.reserve(8);
-    decode_scratch_.sinfos.reserve(8);
-    decode_scratch_.ubatches.reserve(8);
+    // larger batch still grows the pools. Flags off keep the old path free of
+    // these startup allocations.
+    const bool pool_decode = tp5::flag_exact_one("TP5_KV_SNAPSHOT_POOL") ||
+                             tp5::flag_exact_one("TP5_DECODE_SCRATCH_POOL");
+
+    if (pool_decode) {
+        snapshots.reserve(8);
+
+        decode_scratch_.sinfos.reserve(8);
+        decode_scratch_.ubatches.reserve(8);
+        decode_scratch_.states.reserve(8);
+        decode_scratch_.pooled.reserve(8);
+        decode_scratch_.fallback.reserve(8);
+    }
+
+    if (tp5::flag_exact_one("TP5_DECODE_SCRATCH_POOL")) {
+        scratch_pool.reserve(2);
+    }
 
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
@@ -1211,7 +1225,10 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             bool embd_all) {
     GGML_UNUSED(embd_all);
 
-    if (!tp5::flag_exact_one("TP5_KV_SNAPSHOT_POOL")) {
+    const bool pool_decode = tp5::flag_exact_one("TP5_KV_SNAPSHOT_POOL") ||
+                             tp5::flag_exact_one("TP5_DECODE_SCRATCH_POOL");
+
+    if (!pool_decode) {
         do {
             balloc.split_reset();
 
@@ -1274,7 +1291,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             break;
         }
 
-        if (!prepare_into(ubatches, sinfos)) {
+        if (!prepare_into(ubatches, sinfos, scratch)) {
             scratch_return(sinfos, ubatches, scratch);
             break;
         }
@@ -1303,13 +1320,16 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
-    if (!tp5::flag_exact_one("TP5_KV_SNAPSHOT_POOL")) {
+    const bool pool_decode = tp5::flag_exact_one("TP5_KV_SNAPSHOT_POOL") ||
+                             tp5::flag_exact_one("TP5_DECODE_SCRATCH_POOL");
+
+    if (!pool_decode) {
         return prepare_reference(ubatches);
     }
 
     slot_info_vec_t res;
 
-    if (!prepare_into(ubatches, res)) {
+    if (!prepare_into(ubatches, res, nullptr)) {
         return {};
     }
 
@@ -1386,7 +1406,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_reference(const std::vec
 
 // pooled prepare: the same search, apply and restore order as
 // prepare_reference(), with the recovery snapshots taken from the pool
-bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, slot_info_vec_t & res) {
+bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, slot_info_vec_t & res, decode_scratch * scratch) {
     // the reference path returns an empty vector for an empty batch, which
     // every caller treats as a failed prepare
     if (ubatches.empty()) {
@@ -1397,26 +1417,46 @@ bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, sl
     // the pool grows to the largest batch seen so far and never shrinks
     snapshots.reserve(ubatches.size());
 
+    // the scratch reuses the recovery stack and the pool guard vectors
+    std::vector<snapshot_slot *>                states_local;
+    std::vector<snapshot_slot *>                pooled_local;
+    std::vector<std::unique_ptr<snapshot_slot>> fallback_local;
+
+    std::vector<snapshot_slot *> &                states   = scratch != nullptr ? scratch->states   : states_local;
+    std::vector<snapshot_slot *> &                pooled   = scratch != nullptr ? scratch->pooled   : pooled_local;
+    std::vector<std::unique_ptr<snapshot_slot>> & fallback = scratch != nullptr ? scratch->fallback : fallback_local;
+
+    states.clear();
+    pooled.clear();
+    fallback.clear();
+
     // release every acquired slot on all return paths
     struct slot_guard {
-        explicit slot_guard(snapshot_pool & pool) : pool(pool) {}
+        slot_guard(
+                snapshot_pool & pool,
+                std::vector<snapshot_slot *> & states,
+                std::vector<snapshot_slot *> & pooled,
+                std::vector<std::unique_ptr<snapshot_slot>> & fallback) :
+            pool(pool), states(states), pooled(pooled), fallback(fallback) {}
 
         ~slot_guard() {
             for (snapshot_slot * slot : pooled) {
                 pool.release(slot);
             }
+            pooled.clear();
+            states.clear();
+            fallback.clear();
         }
 
         snapshot_pool & pool;
 
-        std::vector<snapshot_slot *> pooled;
-        std::vector<std::unique_ptr<snapshot_slot>> fallback;
-    } guard(snapshots);
+        std::vector<snapshot_slot *> &                states;
+        std::vector<snapshot_slot *> &                pooled;
+        std::vector<std::unique_ptr<snapshot_slot>> & fallback;
+    } guard(snapshots, states, pooled, fallback);
 
     // keep the elements that res already holds: their inner vectors keep their capacity
     res.resize(ubatches.size());
-
-    std::vector<snapshot_slot *> states;
 
     bool success = true;
 
@@ -1427,10 +1467,10 @@ bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, sl
 
         if (st == nullptr) {
             // the pool is exhausted: use a heap snapshot that dies with the guard
-            guard.fallback.push_back(std::make_unique<snapshot_slot>());
-            st = guard.fallback.back().get();
+            fallback.push_back(std::make_unique<snapshot_slot>());
+            st = fallback.back().get();
         } else {
-            guard.pooled.push_back(st);
+            pooled.push_back(st);
         }
 
         // only find a suitable slot for the ubatch. don't modify the cells yet
@@ -1482,13 +1522,20 @@ bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, sl
 }
 
 llama_kv_cache::decode_scratch * llama_kv_cache::scratch_acquire() {
+    if (tp5::flag_exact_one("TP5_DECODE_SCRATCH_POOL")) {
+        if (decode_scratch * scratch = scratch_pool.acquire()) {
+            return scratch;
+        }
+    }
+
     std::lock_guard<std::mutex> lock(decode_scratch_mutex);
 
     if (decode_scratch_.in_use) {
         return nullptr;
     }
 
-    decode_scratch_.in_use = true;
+    decode_scratch_.in_use    = true;
+    decode_scratch_.from_pool = false;
 
     return &decode_scratch_;
 }
@@ -1515,8 +1562,16 @@ void llama_kv_cache::scratch_return(
 
     // drop the ubatches: this releases their payload slots
     scratch->ubatches.clear();
+    scratch->states.clear();
+    scratch->pooled.clear();
+    scratch->fallback.clear();
 
-    scratch->in_use = false;
+    if (scratch->from_pool) {
+        scratch_pool.release(scratch);
+    } else {
+        std::lock_guard<std::mutex> lock(decode_scratch_mutex);
+        scratch->in_use = false;
+    }
 }
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {

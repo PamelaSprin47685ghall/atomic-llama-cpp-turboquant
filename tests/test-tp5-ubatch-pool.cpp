@@ -227,6 +227,66 @@ static void test_concurrency() {
     check(pool->stats().stale == 0, "concurrent: no stale release");
 }
 
+static void test_decode_scratch_pool() {
+    llama_kv_cache::decode_scratch_pool pool(2);
+
+    check(pool.capacity() == 2, "scratch pool: capacity");
+    check(pool.in_use() == 0, "scratch pool: starts free");
+
+    auto * a = pool.acquire();
+    auto * b = pool.acquire();
+    check(a != nullptr && b != nullptr && a != b, "scratch pool: two distinct slots");
+    check(pool.in_use() == 2, "scratch pool: in-use count");
+
+    auto * c = pool.acquire();
+    check(c == nullptr, "scratch pool: exhaustion returns nullptr");
+    check(pool.fallbacks() == 1, "scratch pool: fallback counted");
+
+    // Cancel/failure recovery: a scratch with filled vectors is cleared on
+    // release and can be acquired again.
+    llama_kv_cache::snapshot_slot fake;
+    a->states.push_back(&fake);
+    a->pooled.push_back(&fake);
+    a->fallback.push_back(std::make_unique<llama_kv_cache::snapshot_slot>());
+    pool.release(a);
+    check(a->states.empty() && a->pooled.empty() && a->fallback.empty(),
+          "scratch pool: release clears the vectors");
+    check(pool.in_use() == 1, "scratch pool: release decrements");
+
+    auto * a2 = pool.acquire();
+    check(a2 == a, "scratch pool: released slot is reused first");
+
+    // Dual-window isolation: releasing one slot does not disturb the other.
+    check(pool.in_use() == 2, "scratch pool: both slots busy");
+    pool.release(b);
+    check(pool.in_use() == 1, "scratch pool: releasing one keeps the other");
+    check(a2->in_use, "scratch pool: the other slot remains busy");
+    pool.release(a2);
+    check(pool.in_use() == 0, "scratch pool: all slots returned");
+
+    // A separate cache has a separate pool.
+    llama_kv_cache::decode_scratch_pool other(1);
+    auto * x = other.acquire();
+    check(x != nullptr && x != a, "scratch pool: separate pools do not share slots");
+    other.release(x);
+
+    // 10k acquire/fill/release after warmup: no net host allocation.
+    const long long base = alloc_delta();
+    for (int i = 0; i < 10000; ++i) {
+        auto * s = pool.acquire();
+        if (s == nullptr) {
+            check(false, "scratch pool: unexpected exhaustion");
+            break;
+        }
+        s->sinfos.resize(4);
+        s->states.push_back(&fake);
+        s->pooled.push_back(&fake);
+        pool.release(s);
+    }
+    check(alloc_delta() == base, "scratch pool: 10k acquire/fill/release, zero net allocation");
+    check(pool.in_use() == 0, "scratch pool: every slot returned");
+}
+
 static void test_kv_snapshot_slot_reuse() {
     llama_kv_cells src;
     src.resize(64);
@@ -317,6 +377,7 @@ int main() {
     test_exhaustion_and_fallback();
     test_steady_state();
     test_concurrency();
+    test_decode_scratch_pool();
     test_kv_snapshot_slot_reuse();
     test_kv_cells_cp_into();
 

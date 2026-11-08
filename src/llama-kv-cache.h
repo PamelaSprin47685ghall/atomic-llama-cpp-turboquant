@@ -138,7 +138,105 @@ public:
     struct decode_scratch {
         slot_info_vec_t sinfos;
         std::vector<llama_ubatch> ubatches;
-        bool in_use = false;
+
+        // prepare_into() scratch: the recovery stack and the pool guard
+        std::vector<snapshot_slot *>                    states;
+        std::vector<snapshot_slot *>                    pooled;
+        std::vector<std::unique_ptr<snapshot_slot>>     fallback;
+
+        bool in_use    = false;
+        bool from_pool = false;
+    };
+
+    // fixed-slot pool of decode scratches. Two slots cover a nested decode;
+    // an exhausted pool falls back to the single scratch or to local vectors.
+    class decode_scratch_pool {
+    public:
+        decode_scratch_pool() = default;
+
+        explicit decode_scratch_pool(uint32_t capacity) {
+            reserve(capacity);
+        }
+
+        // Startup allocation: call before the first decode.
+        void reserve(uint32_t capacity) {
+            std::lock_guard<std::mutex> lock(mutex);
+
+            storage.reserve(storage.size() + capacity);
+            free.reserve(free.size() + capacity);
+
+            for (uint32_t i = 0; i < capacity; ++i) {
+                auto scratch = std::make_unique<decode_scratch>();
+                scratch->sinfos.reserve(8);
+                scratch->ubatches.reserve(8);
+                scratch->states.reserve(8);
+                scratch->pooled.reserve(8);
+                scratch->fallback.reserve(8);
+                free.push_back(scratch.get());
+                storage.push_back(std::move(scratch));
+            }
+        }
+
+        decode_scratch_pool(const decode_scratch_pool &)             = delete;
+        decode_scratch_pool & operator=(const decode_scratch_pool &) = delete;
+
+        decode_scratch * acquire() {
+            std::lock_guard<std::mutex> lock(mutex);
+
+            if (free.empty()) {
+                ++fallbacks_;
+                return nullptr;
+            }
+
+            decode_scratch * scratch = free.back();
+            free.pop_back();
+            scratch->in_use    = true;
+            scratch->from_pool = true;
+            ++in_use_;
+
+            return scratch;
+        }
+
+        void release(decode_scratch * scratch) {
+            if (scratch == nullptr) {
+                return;
+            }
+
+            std::lock_guard<std::mutex> lock(mutex);
+
+            // sinfos keeps its capacity; prepare_into() resizes it.
+            scratch->ubatches.clear();
+            scratch->states.clear();
+            scratch->pooled.clear();
+            scratch->fallback.clear();
+            scratch->in_use    = false;
+            scratch->from_pool = false;
+
+            --in_use_;
+            free.push_back(scratch);
+        }
+
+        uint32_t capacity() const {
+            std::lock_guard<std::mutex> lock(mutex);
+            return static_cast<uint32_t>(storage.size());
+        }
+
+        uint32_t in_use() const {
+            std::lock_guard<std::mutex> lock(mutex);
+            return in_use_;
+        }
+
+        uint64_t fallbacks() const {
+            std::lock_guard<std::mutex> lock(mutex);
+            return fallbacks_;
+        }
+
+    private:
+        mutable std::mutex mutex;
+        std::vector<std::unique_ptr<decode_scratch>> storage;
+        std::vector<decode_scratch *> free;
+        uint32_t in_use_   = 0;
+        uint64_t fallbacks_ = 0;
     };
 
     // TODO: refactor the memory instances to not depend on `llama_model`
@@ -430,8 +528,9 @@ private:
     slot_info_vec_t prepare_reference(const std::vector<llama_ubatch> & ubatches);
 
     // pooled prepare: writes the slot infos into res and reuses the capacity
-    // that res already holds. returns false on failure
-    bool prepare_into(const std::vector<llama_ubatch> & ubatches, slot_info_vec_t & res);
+    // that res already holds. when scratch is set, its states/pooled/fallback
+    // vectors are reused too. returns false on failure
+    bool prepare_into(const std::vector<llama_ubatch> & ubatches, slot_info_vec_t & res, decode_scratch * scratch);
 
     struct kv_layer {
         // layer index in the model
@@ -578,6 +677,10 @@ private:
     // decode-time buffers reused by the current batch context
     decode_scratch decode_scratch_;
     std::mutex decode_scratch_mutex;
+
+    // TP5_DECODE_SCRATCH_POOL=1: a fixed pool of decode scratches,
+    // reserved at cache construction so the first decode does not allocate
+    decode_scratch_pool scratch_pool;
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
