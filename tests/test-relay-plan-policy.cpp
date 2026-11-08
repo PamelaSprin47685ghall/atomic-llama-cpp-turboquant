@@ -38,6 +38,7 @@ using ggml_relay_plan::config;
 using ggml_relay_plan::frame_lru;
 using ggml_relay_plan::plan_cache;
 using ggml_relay_plan::plan_key;
+using ggml_relay_plan::plan_slot;
 
 plan_key make_key(uint32_t n_tokens, uint32_t n_outputs, uint32_t channels = 181) {
     plan_key key;
@@ -49,6 +50,7 @@ plan_key make_key(uint32_t n_tokens, uint32_t n_outputs, uint32_t channels = 181
     key.n_kv_bucket = 1024;
     key.alloc_gen   = 1;
     key.channels    = channels;
+    key.binding     = 1;
     return key;
 }
 
@@ -105,6 +107,27 @@ void test_plan_cache() {
     CHECK(split.acquire(narrow, 1) != nullptr);
     CHECK(split.acquire(wide, 1) != nullptr);
     CHECK(split.live() == 2);
+
+    // The terminal-binding digest is the second half of the identity. The
+    // 512-row catch-up rebuilt the graph with the same coarse llama fields but
+    // different terminal storage; it must be a miss, not a key collision.
+    plan_key base_512 = make_key(12, 1);
+    plan_key catch_up = base_512;
+    catch_up.binding  = 0x9e3779b97f4a7c15ull; // different terminal digest
+    CHECK(base_512 != catch_up);
+    plan_cache rows;
+    const plan_slot * first_512 = rows.acquire(base_512, 1);
+    CHECK(first_512 != nullptr);
+    const plan_slot * second_512 = rows.acquire(catch_up, 2);
+    CHECK(second_512 != nullptr);
+    CHECK(second_512->generation != first_512->generation);
+    CHECK(rows.live() == 2);
+    CHECK(rows.acquire(base_512, 3) != nullptr); // old plan still its own slot
+    CHECK(rows.find(catch_up) != nullptr);
+    // A true conflict is only a binding-digest collision; the cache itself
+    // never merges two different keys.
+    CHECK(rows.find(base_512)->generation == first_512->generation);
+    CHECK(rows.find(catch_up)->generation == second_512->generation);
 
     // Every slot pinned fails closed instead of dropping a plan.
     plan_cache pinned;

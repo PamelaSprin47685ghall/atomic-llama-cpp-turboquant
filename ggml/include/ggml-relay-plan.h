@@ -56,12 +56,19 @@ struct plan_key {
     std::uint32_t n_kv_bucket = 0;
     std::uint64_t alloc_gen  = 0;
     std::uint32_t channels   = 0;
+    // Relay-internal second half of the identity: a digest of every terminal
+    // binding (tensor/data pointers, ne, nb) the plan was prepared with. The
+    // seven llama fields are coarse; a graph rebuild can keep them identical
+    // while the terminal layout or storage changes. Including the binding in
+    // the key makes "same key, different binding" a cache miss instead of a
+    // fail-closed key bug. It stays 0 on the C boundary; relay.hip fills it.
+    std::uint64_t binding    = 0;
 
     bool operator==(const plan_key & other) const noexcept {
         return model == other.model && window == other.window && n_tokens == other.n_tokens &&
                n_outputs == other.n_outputs && rs_class == other.rs_class &&
                n_kv_bucket == other.n_kv_bucket && alloc_gen == other.alloc_gen &&
-               channels == other.channels;
+               channels == other.channels && binding == other.binding;
     }
     bool operator!=(const plan_key & other) const noexcept { return !(*this == other); }
 

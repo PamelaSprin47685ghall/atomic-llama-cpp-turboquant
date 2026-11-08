@@ -83,6 +83,19 @@ A nonzero `frame_inst` proves the capture path ran; a nonzero `frame_hits`
 proves the LRU served a repeat. `frames_cleared` counts frames dropped by an
 exact-pool layout growth, not by the destroy flush.
 
+## Plan identity: coarse llama key + terminal binding digest
+
+The seven llama fields plus `channels` are coarse: a graph rebuild can keep
+all of them identical while the terminal tensors move or change layout. The
+relay therefore folds a digest of every terminal binding (`tensor` and `data`
+pointers, `ne`, `nb`, for all channels and ranks) into its internal plan key.
+"Same llama key, different terminal binding" is then a cache miss with its
+own slot, not the `relay plan key collided with a different terminal binding`
+fail-closed error. The full `same_binding` check still runs on every prepare;
+the fail-closed error now fires only on a digest collision (a true conflict).
+The digest is computed only when the plan cache is enabled and a key is
+present, so flag 0 keeps the legacy path.
+
 ## Two plan-key domains (not the same type)
 
 | Type | Fields | Owner | Purpose |
