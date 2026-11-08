@@ -845,8 +845,16 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->output    .resize(n_tokens);
     udata->decision_order.resize(decision_order.empty() ? 0 : n_tokens);
 
+    // Reserve the exact number of sequence ids before the fill loop. The
+    // seq_id pointers are formed after the loop, but an exact reserve keeps
+    // the buffer stable and makes the pooled and heap layouts identical.
     udata->seq_id_data.clear();
-    udata->seq_id_data.reserve(n_tokens);
+
+    size_t n_seq_ids = 0;
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        n_seq_ids += (size_t) batch.n_seq_id[idxs[i]];
+    }
+    udata->seq_id_data.reserve(n_seq_ids);
 
     seq_set_t seq_set_unq;
 
