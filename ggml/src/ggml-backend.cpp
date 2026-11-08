@@ -971,6 +971,9 @@ struct ggml_sched_copy_record {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    // Nonzero after an asynchronous submission whose completion is unprovable.
+    // The destination copy slots stay owned and no further graph is submitted.
+    int submission_failed = 0;
 
     int n_backends;
 
@@ -1907,6 +1910,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const bool was_pending = input_copies.pending;
                     input_copies.pending = true;
                     if (split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        if (split_backend->iface.submission_error != nullptr) {
+                            const int sub_err = split_backend->iface.submission_error(split_backend);
+                            if (sub_err != 0) {
+                                // Unknown submission: keep the destination and
+                                // stop. Do not flush or replay the copy.
+                                sched->submission_failed = sub_err;
+                                return GGML_STATUS_FAILED;
+                            }
+                        }
                         continue;
                     }
                     // Rejection has no side effects, but earlier accepted uploads must finish before a blocking copy.
@@ -2011,7 +2023,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    const bool copied = split_backend->iface.cpy_tensor_async != nullptr &&
+                        split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+                    if (copied && split_backend->iface.submission_error != nullptr) {
+                        const int sub_err = split_backend->iface.submission_error(split_backend);
+                        if (sub_err != 0) {
+                            sched->submission_failed = sub_err;
+                            return GGML_STATUS_FAILED;
+                        }
+                    }
+                    if (!copied) {
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -2261,6 +2282,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    if (sched->submission_failed) {
+        // Keep every copy slot and its destination: an unknown submission may
+        // still read them.
+        return;
+    }
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -2330,6 +2356,9 @@ void ggml_backend_sched_reserve_size_preserve(ggml_backend_sched_t sched, struct
 // guarantee that later placements fit without reallocation.
 bool ggml_backend_sched_reserve_min(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, const size_t * min_sizes) {
     GGML_ASSERT(sched);
+    if (sched->submission_failed) {
+        return false;
+    }
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     GGML_ASSERT(min_sizes);
 
@@ -2345,6 +2374,9 @@ bool ggml_backend_sched_reserve_min(ggml_backend_sched_t sched, struct ggml_cgra
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
+    if (sched->submission_failed) {
+        return false;
+    }
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
 
     ggml_backend_sched_synchronize(sched);
@@ -2875,6 +2907,9 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 static enum ggml_status ggml_backend_sched_graph_compute_async_impl(
         ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool retained_inputs) {
     GGML_ASSERT(sched);
+    if (sched->submission_failed) {
+        return GGML_STATUS_FAILED;
+    }
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }

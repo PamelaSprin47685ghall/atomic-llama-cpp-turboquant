@@ -132,14 +132,13 @@ static void staging_log_reject(const char * lane, const ggml_tensor * tensor, si
 }
 
 // A fatal staging submit means the runtime cannot prove that nothing was
-// queued. Replaying the destination (which the bool cpy_tensor_async contract
-// would force the scheduler to do) is forbidden, so stop and surface the first
-// error to the execution owner.
-[[noreturn]] static void staging_fatal(const char * lane, const ggml_cuda_staging::api * st) {
+// queued. Replaying the destination is forbidden; the caller stops, the
+// scheduler keeps the copy slots alive, and submission_error reports the
+// first native error to the execution owner.
+static void staging_record_fatal(const char * lane, const ggml_cuda_staging::api * st) {
     const int err = (st != nullptr && st->first_error != nullptr) ? st->first_error() : 0;
     GGML_LOG_ERROR("%s: TP5 staging fatal first_error=%d; a copy may be in flight, "
-                   "refusing to replay the destination\n", lane, err);
-    GGML_ABORT("TP5 staging fatal");
+                   "destination retained, no replay\n", lane, err);
 }
 
 extern "C" void ggml_backend_meta_staging_diag_dump() {
@@ -1714,7 +1713,8 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 const int upload_result = st->upload(&staged_lease, data, size);
                 if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
                     st->release(&staged_lease);
-                    staging_fatal("sync-2d-upload", st);
+                    staging_record_fatal("sync-2d-upload", st);
+                    return;
                 }
                 staged = upload_result == int(ggml_cuda_staging::submit_result::ok);
                 if (!staged) {
@@ -1727,7 +1727,8 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     if (staged) {
                         st->release(&staged_lease);
                     }
-                    staging_fatal("sync-2d-disabled", st);
+                    staging_record_fatal("sync-2d-disabled", st);
+                    return;
                 }
             }
             size_t offset_j = 0;
@@ -1747,7 +1748,8 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             if (staged) {
                 if (!st->wait(&staged_lease)) {
                     st->release(&staged_lease);
-                    staging_fatal("sync-2d-wait", st);
+                    staging_record_fatal("sync-2d-wait", st);
+                    return;
                 }
                 st->release(&staged_lease);
             }
@@ -1779,7 +1781,8 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     const int upload_result = st->upload(&staged_lease, data, size);
                     if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
                         st->release(&staged_lease);
-                        staging_fatal("sync-upload", st);
+                        staging_record_fatal("sync-upload", st);
+                        return;
                     }
                     if (upload_result == int(ggml_cuda_staging::submit_result::ok)) {
                         bool merged = false;
@@ -1800,12 +1803,14 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                                             ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size);
                                     if (result == int(ggml_cuda_staging::submit_result::fatal)) {
                                         st->release(&staged_lease);
-                                        staging_fatal("sync-enqueue", st);
+                                        staging_record_fatal("sync-enqueue", st);
+                                        return;
                                     }
                                     if (result == int(ggml_cuda_staging::submit_result::rejected)) {
                                         if (submitted) {
                                             st->release(&staged_lease);
-                                            staging_fatal("sync-enqueue-partial", st);
+                                            staging_record_fatal("sync-enqueue-partial", st);
+                                            return;
                                         }
                                         break;
                                     }
@@ -1814,7 +1819,8 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                                 if (submitted && result == int(ggml_cuda_staging::submit_result::ok)) {
                                     if (!st->wait(&staged_lease)) {
                                         st->release(&staged_lease);
-                                        staging_fatal("sync-merge-wait", st);
+                                        staging_record_fatal("sync-merge-wait", st);
+                                        return;
                                     }
                                     st->release(&staged_lease);
                                     merged = true;
@@ -1827,7 +1833,8 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                             // fatal publication.
                             if (!st->enter_submit()) {
                                 st->release(&staged_lease);
-                                staging_fatal("sync-fallback-disabled", st);
+                                staging_record_fatal("sync-fallback-disabled", st);
+                                return;
                             }
                             for (size_t j = 0; j < n_bufs; j++) {
                                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
@@ -1836,7 +1843,8 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                             st->leave_submit();
                             if (!st->wait(&staged_lease)) {
                                 st->release(&staged_lease);
-                                staging_fatal("sync-fallback-wait", st);
+                                staging_record_fatal("sync-fallback-wait", st);
+                                return;
                             }
                             st->release(&staged_lease);
                         }
@@ -1849,7 +1857,8 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             }
             if (st != nullptr) {
                 if (!st->enter_submit()) {
-                    staging_fatal("sync-disabled", st);
+                    staging_record_fatal("sync-disabled", st);
+                    return;
                 }
             }
             for (size_t j = 0; j < n_bufs; j++) {
@@ -2395,7 +2404,8 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                     const int upload_result = st->upload(&staged_lease, data, size);
                     if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
                         st->release(&staged_lease);
-                        staging_fatal("async-upload", st);
+                        staging_record_fatal("async-upload", st);
+                        return;
                     }
                     if (upload_result == int(ggml_cuda_staging::submit_result::ok)) {
                         bool submitted = false;
@@ -2407,12 +2417,14 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                                     offset, size);
                             if (result == int(ggml_cuda_staging::submit_result::fatal)) {
                                 st->release(&staged_lease);
-                                staging_fatal("async-enqueue", st);
+                                staging_record_fatal("async-enqueue", st);
+                                return;
                             }
                             if (result == int(ggml_cuda_staging::submit_result::rejected)) {
                                 if (submitted) {
                                     st->release(&staged_lease);
-                                    staging_fatal("async-enqueue-partial", st);
+                                    staging_record_fatal("async-enqueue-partial", st);
+                                    return;
                                 }
                                 break;
                             }
@@ -2431,7 +2443,8 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
             }
             if (st != nullptr) {
                 if (!st->enter_submit()) {
-                    staging_fatal("async-disabled", st);
+                    staging_record_fatal("async-disabled", st);
+                    return;
                 }
             }
             for (size_t j = 0; j < n_backends; j++) {
@@ -2556,8 +2569,25 @@ bool ggml_backend_meta_set_submitted_hook(bool (*hook)(void *), void * userdata)
     return true;
 }
 
+// Optional backend capability: an unknown async submission makes every later
+// compute fail instead of running on a partially written destination.
+static int ggml_backend_meta_submission_error(ggml_backend_t backend) {
+    (void) backend;
+    const ggml_cuda_staging::api * st = staging_api();
+    if (st == nullptr || st->configured == nullptr || !st->configured()) {
+        return 0;
+    }
+    if (st->usable != nullptr && st->usable()) {
+        return 0;
+    }
+    return st->first_error != nullptr ? st->first_error() : -1;
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     const int64_t diag_start = ggml_time_us();
+    if (ggml_backend_meta_submission_error(backend) != 0) {
+        return GGML_STATUS_FAILED;
+    }
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
@@ -4610,6 +4640,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
     /* .graph_optimize          = */ nullptr,
+    /* .submission_error        = */ ggml_backend_meta_submission_error,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {
