@@ -842,33 +842,33 @@
     },
     {
       "path": "ggml/src/ggml-cuda/staging.cu",
-      "sha256": "1c2921db74538076dd7550fbbbab9bf0192f24d33c9563e31a045f9ebb611914",
+      "sha256": "aecddb56ab66006eaef2f2a8274adb27e702907aa74e1b4f01d508757797fa0e",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)"
       ],
-      "reason": "Implement the persistent pinned H2D staging pool: slot allocation, lease and fence lifetime, copy submission, and refusal to reuse a leased slot. Keep staging copies and their event waits on the recording device.",
+      "reason": "Implement the persistent pinned H2D staging pool: slot allocation, lease and fence lifetime, copy submission, and refusal to reuse a leased slot. Keep staging copies and their event waits on the recording device. Add hip_event_query as a non-blocking completion probe. cudaErrorNotReady is a state, not a fault, and must not call cudaGetLastError().",
       "removal_condition": "Remove when upstream provides equivalent persistent pinned H2D staging, or when the WS4 consumer is removed."
     },
     {
       "path": "ggml/src/ggml-cuda/staging.h",
-      "sha256": "249878d00b17141e9f529280a3196ee52d275c666869c926de822686fe83b29e",
+      "sha256": "95e84eceb6e61a59d14c67d802754a747b8f762c9b27578e5236d988e026bae1",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)",
         "WS4 staging pool CPU test"
       ],
-      "reason": "Declare the staging pool API and host-side lease/slot state used by the meta backend and the CPU test harness. Declare the tri-state submit_result API and make note_source wait-free: it publishes the submit gate, takes the pool lock only by try_lock, and skips with a fast miss when the gate or pool lock is held.",
+      "reason": "Declare the staging pool API and host-side lease/slot state used by the meta backend and the CPU test harness. Declare the tri-state submit_result API and make note_source wait-free: it publishes the submit gate, takes the pool lock only by try_lock, and skips with a fast miss when the gate or pool lock is held. Add backend_ops::event_query and try_reap_locked: acquire(wait_pending=false) polls the recorded events of pending slots, skips an active lease, quarantines a query error as fatal, and records query_fail/reaps/queries.",
       "removal_condition": "Remove with the WS4 staging pool implementation."
     },
     {
       "path": "tests/test-tp5-staging-pool.cpp",
-      "sha256": "6c61b630342cf952ab0f48302f76872cb5d04393e0b80ab7d98528eebe5fcd66",
+      "sha256": "11d0e6253080777b4b32569e9ff339c0be099cd91441ce0c6a0786444e3d9218",
       "mode": "100644",
       "consumers": [
         "WS4 staging pool CPU test"
       ],
-      "reason": "Cover staging lease reuse, tri-state upload/enqueue, quarantine and fatal fail-stop, submit-gate ordering, and device wait selection.",
+      "reason": "Cover staging lease reuse, tri-state upload/enqueue, quarantine and fatal fail-stop, submit-gate ordering, device wait selection, and the async reclaim cases: partial rank completion, active-lease exclusion, event re-record, and pending-rank preservation (36/36 in the CPU harness).",
       "removal_condition": "Remove with the WS4 staging pool test target."
     },
     {
@@ -943,12 +943,12 @@
     },
     {
       "path": "docs/tp5-staging-submission.md",
-      "sha256": "eb9f2ffc77d92e9c9c5889cd67d1ef7a411f1fbb1a560e10dffdd2abf48f9fd5",
+      "sha256": "f23e2c6d37854728833b26c4216921d5a5e6b8a5104b1d94b54e95e545bd0eb9",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose staging/Meta integration maintainers"
       ],
-      "reason": "Record the async submission boundary, staging pool ownership and retention contract, the prefab sub-envelope mask row-count rule, and the CPU/ASan evidence used by the WS4 integration.",
+      "reason": "Record the async submission boundary, staging pool ownership and retention contract, the prefab sub-envelope mask row-count rule, and the CPU/ASan evidence used by the WS4 integration. The async MIRRORED lane now reclaims completed pending slots with a non-blocking event query; the recorded CPU probe reaches lease_ok=343, no_slot=0, reaps=333, queries=1665 with completed events, while in-flight events preserve the fallback.",
       "removal_condition": "Remove when the maintained fork documentation carries the same contracts or the WS4 async-staging work is upstreamed."
     },
     {
