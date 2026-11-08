@@ -355,7 +355,9 @@ public:
             // prove that nothing was queued, so the buffer must not be reused.
             s->pending = true;
             quarantine_locked(*s, copy_err);
+            record_unknown_locked(dst, rank, copy_err);
             disabled_.store(true, std::memory_order_relaxed);
+            publish_fatal_locked();
             stats_.alloc_fail++;
             return submit_result::fatal;
         }
@@ -367,7 +369,9 @@ public:
                 s->pending = true;
                 s->pending_ranks |= uint32_t(1) << uint32_t(rank);
                 quarantine_locked(*s, event_err);
+                record_unknown_locked(dst, rank, event_err);
                 disabled_.store(true, std::memory_order_relaxed);
+                publish_fatal_locked();
                 stats_.alloc_fail++;
                 return submit_result::fatal;
             }
@@ -377,7 +381,9 @@ public:
             s->pending = true;
             s->pending_ranks |= uint32_t(1) << uint32_t(rank);
             quarantine_locked(*s, record_err);
+            record_unknown_locked(dst, rank, record_err);
             disabled_.store(true, std::memory_order_relaxed);
+            publish_fatal_locked();
             stats_.alloc_fail++;
             return submit_result::fatal;
         }
@@ -446,6 +452,12 @@ public:
             misses_fast_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        // The submit gate may call the backend set path; never block there.
+        if (!submit_mutex_.try_lock()) {
+            misses_fast_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        submit_mutex_.unlock();
         std::lock_guard<std::mutex> lock(mutex_);
         if (owns_locked(p, bytes)) {
             stats_.hits++;
@@ -464,6 +476,32 @@ public:
     int first_error() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return stats_.first_error;
+    }
+
+    // Submission gate. The fallback copy and the fatal publication share this
+    // lock: a fatal cannot be published between the check and the submit.
+    // note_source skips itself while the gate is held, so the caller may use
+    // the GGML backend set path inside the gate. The lock is released on a
+    // false return.
+    bool enter_submit() {
+        submit_mutex_.lock();
+        if (submit_fatal_) {
+            submit_mutex_.unlock();
+            return false;
+        }
+        return true;
+    }
+
+    void leave_submit() {
+        submit_mutex_.unlock();
+    }
+
+    // Number of destinations whose completion this process cannot prove.
+    // They are owned by the process until native completion; the pool only
+    // keeps its staging resource quarantined.
+    size_t unknown_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return unknown_count_;
     }
 
     void dump(std::FILE * f) const {
@@ -503,6 +541,11 @@ public:
             (unsigned long long) stats_.quarantine,
             (unsigned long long) stats_.invalid,
             stats_.first_error);
+        std::fprintf(f, "TP5_STAGING_UNKNOWN unknown=%zu\n", unknown_count_);
+        for (size_t i = 0; i < unknown_count_; ++i) {
+            std::fprintf(f, "TP5_STAGING_UNKNOWN dst=%p rank=%d error=%d\n",
+                         unknown_[i].dst, unknown_[i].rank, unknown_[i].err);
+        }
     }
 
 private:
@@ -520,6 +563,18 @@ private:
 
     using rotation = std::array<slot, kSlotsPerKey>;
 
+    struct unknown_work {
+        const void * dst = nullptr;
+        int rank = -1;
+        int err = 0;
+    };
+
+    void record_unknown_locked(const void * dst, int rank, int err) {
+        if (unknown_count_ < unknown_.size()) {
+            unknown_[unknown_count_++] = { dst, rank, err };
+        }
+    }
+
     void note_error_locked(int err) {
         if (stats_.first_error == 0 && err != 0) {
             stats_.first_error = err;
@@ -532,6 +587,15 @@ private:
             stats_.quarantine++;
         }
         note_error_locked(err);
+    }
+
+    // Caller holds mutex_. A fatal publication waits for an in-flight submit
+    // gate, so a submit that started before the fault completes first and no
+    // new submit can start after it.
+    void publish_fatal_locked() {
+        submit_mutex_.lock();
+        submit_fatal_ = true;
+        submit_mutex_.unlock();
     }
 
     slot * find_locked(const lease & l) {
@@ -600,6 +664,7 @@ private:
         if (!ok) {
             quarantine_locked(s, fail_err);
             disabled_.store(true, std::memory_order_relaxed);
+            publish_fatal_locked();
             stats_.wait_fail++;
             return false;
         }
@@ -650,6 +715,8 @@ private:
     }
 
     mutable std::mutex mutex_;
+    std::mutex submit_mutex_;
+    bool submit_fatal_ = false;
     backend_ops ops_ = {};
     size_t max_bytes_ = kMaxPoolBytes;
     size_t bytes_used_ = 0;
@@ -658,6 +725,8 @@ private:
     std::atomic<bool> has_host_{false};
     mutable std::atomic<uint64_t> misses_fast_{0};
     stats stats_;
+    std::array<unknown_work, 16> unknown_ = {};
+    size_t unknown_count_ = 0;
     std::array<std::array<rotation, kKindCount>, kWindows> slots_ = {};
 };
 
@@ -705,6 +774,11 @@ struct api {
                         size_t offset, size_t size);
     // First sticky runtime error observed by the pool; never cleared.
     int (*first_error)();
+    // Submission gate shared with the fatal publication. The caller submits
+    // the fallback copy between a true enter and leave.
+    bool (*enter_submit)();
+    void (*leave_submit)();
+    size_t (*unknown_count)();
     // configured: GGML_TP5_STAGING requests the pool. usable: the pool has not
     // stopped. A configured but unusable pool is a global fault.
     bool (*configured)();

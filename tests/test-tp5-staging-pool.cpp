@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 using namespace ggml_cuda_staging;
 
@@ -719,6 +720,50 @@ int test_capacity_reject_keeps_other_lease() {
     return 0;
 }
 
+int test_submit_gate_race() {
+    pool p(fake_ops());
+    uint8_t src[32] = {};
+    uint8_t dst[32] = {};
+
+    lease a;
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.acquire(0, kind::generic, sizeof(src), &b));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
+
+    // A fallback submit holds the gate.
+    CHECK(p.enter_submit());
+
+    g_fail_copy_remaining = 1;
+    std::atomic<bool> started{false};
+    std::atomic<bool> published{false};
+    std::thread worker([&] {
+        started.store(true);
+        p.enqueue(b, 0, dst, sizeof(src), nullptr);  // trips the fatal
+        published.store(true);
+    });
+
+    while (!started.load()) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    // The fatal publication cannot pass the held submit gate.
+    CHECK(!published.load());
+
+    // Completing the submit lets the fatal publish; after that no new submit
+    // may start.
+    p.leave_submit();
+    worker.join();
+    CHECK(published.load());
+    CHECK(!p.usable());
+    CHECK(!p.enter_submit());
+    CHECK(p.unknown_count() == 1);  // the failed copy is recorded as unknown
+    p.release(a);
+    p.release(b);
+    return 0;
+}
+
 int test_quarantine_destructor_retains() {
     const int frees_before = g_frees;
     const int destroys_before = g_destroys;
@@ -825,6 +870,7 @@ int main() {
         {"disabled_blocks_lease_ops",  test_disabled_blocks_lease_ops},
         {"two_lease_race_fatal",       test_two_lease_race_fatal},
         {"capacity_reject_keeps_other_lease", test_capacity_reject_keeps_other_lease},
+        {"submit_gate_race",           test_submit_gate_race},
         {"quarantine_destructor_retains", test_quarantine_destructor_retains},
         {"owns_and_diagnostics",       test_owns_and_diagnostics},
         {"device_ptr",                 test_device_ptr},

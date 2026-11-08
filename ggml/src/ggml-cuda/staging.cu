@@ -173,6 +173,18 @@ int api_first_error() {
     return global_pool().first_error();
 }
 
+bool api_enter_submit() {
+    return global_pool().enter_submit();
+}
+
+void api_leave_submit() {
+    global_pool().leave_submit();
+}
+
+size_t api_unknown_count() {
+    return global_pool().unknown_count();
+}
+
 const api kApi = {
     /* .abi_version       = */ 1,
     /* .enabled           = */ enabled,
@@ -191,6 +203,9 @@ const api kApi = {
     /* .can_enqueue_sync  = */ can_enqueue_sync_impl,
     /* .enqueue_sync      = */ api_enqueue_sync,
     /* .first_error       = */ api_first_error,
+    /* .enter_submit      = */ api_enter_submit,
+    /* .leave_submit      = */ api_leave_submit,
+    /* .unknown_count     = */ api_unknown_count,
     /* .configured        = */ configured,
     /* .usable            = */ usable,
     /* .zc_enabled        = */ api_zc_enabled,
