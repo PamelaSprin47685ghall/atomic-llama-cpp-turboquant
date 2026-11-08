@@ -36,6 +36,15 @@ enum class kind : uint32_t {
 
 constexpr size_t kKindCount = size_t(kind::count);
 
+// Outcome of one enqueue. The caller may replay the destination only after
+// rejected: ok is complete, fatal means a copy may already be in flight and
+// nothing else may be submitted to that destination.
+enum class submit_result : int {
+    ok       = 0,
+    rejected = 1,  // validated out before any runtime copy
+    fatal    = 2,  // submission is unknown or an event failed; stop
+};
+
 // Maps a graph-input tensor name to a slot kind. Names that do not match keep
 // kind::generic; the meta layer still stages them when they carry the input
 // flag, so an unnamed input (for example the MTP token tensor) is not lost.
@@ -301,22 +310,22 @@ public:
         return true;
     }
 
-    bool enqueue(const lease & l, int rank, void * dst, size_t bytes, void * stream) {
+    submit_result enqueue(const lease & l, int rank, void * dst, size_t bytes, void * stream) {
         if (dst == nullptr || bytes == 0 || rank < 0 || rank >= int(kRanks)) {
             std::lock_guard<std::mutex> lock(mutex_);
             stats_.invalid++;
-            return false;
+            return submit_result::rejected;
         }
         std::lock_guard<std::mutex> lock(mutex_);
         if (disabled_.load(std::memory_order_relaxed)) {
             stats_.invalid++;
-            return false;
+            return submit_result::rejected;
         }
         slot * s = find_locked(l);
         if (s == nullptr || s->quarantined || bytes > s->cap || ops_.copy_h2d == nullptr ||
                 ops_.event_create == nullptr || ops_.event_record == nullptr) {
             stats_.invalid++;
-            return false;
+            return submit_result::rejected;
         }
         if (!ops_.copy_h2d(dst, s->host, bytes, stream)) {
             // A failed async copy is treated as unknown: the runtime cannot
@@ -325,7 +334,7 @@ public:
             quarantine_locked(*s);
             disabled_.store(true, std::memory_order_relaxed);
             stats_.alloc_fail++;
-            return false;
+            return submit_result::fatal;
         }
         if (s->events[rank] == nullptr && !ops_.event_create(&s->events[rank])) {
             // The copy is already queued. Without an event its completion is
@@ -335,7 +344,7 @@ public:
             quarantine_locked(*s);
             disabled_.store(true, std::memory_order_relaxed);
             stats_.alloc_fail++;
-            return false;
+            return submit_result::fatal;
         }
         if (!ops_.event_record(s->events[rank], stream)) {
             s->pending = true;
@@ -343,12 +352,12 @@ public:
             quarantine_locked(*s);
             disabled_.store(true, std::memory_order_relaxed);
             stats_.alloc_fail++;
-            return false;
+            return submit_result::fatal;
         }
         s->pending = true;
         s->pending_ranks |= uint32_t(1) << uint32_t(rank);
         stats_.enqueues++;
-        return true;
+        return submit_result::ok;
     }
 
     bool wait(const lease & l) {
@@ -420,6 +429,11 @@ public:
         stats copy = stats_;
         copy.misses += misses_fast_.load(std::memory_order_relaxed);
         return copy;
+    }
+
+    int first_error() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stats_.first_error;
     }
 
     void dump(std::FILE * f) const {
@@ -641,24 +655,27 @@ struct api {
     // Async lane: the backend copies from the lease and records one event.
     bool (*can_enqueue_async)(ggml_backend_t backend, ggml_tensor * tensor,
                               size_t offset, size_t size);
-    bool (*enqueue_async)(const lease * l, ggml_backend_t backend,
-                          ggml_tensor * tensor, size_t offset, size_t size);
+    // Returns submit_result: 0 ok, 1 rejected (no runtime copy), 2 fatal.
+    int (*enqueue_async)(const lease * l, ggml_backend_t backend,
+                         ggml_tensor * tensor, size_t offset, size_t size);
     // Merge-wait lane: same-device copies on cudaStreamPerThread, the stream
     // the synchronous set_tensor uses.
     bool (*can_enqueue_sync)(ggml_tensor * tensor, size_t offset, size_t size);
-    bool (*enqueue_sync)(const lease * l, ggml_tensor * tensor,
-                         size_t offset, size_t size);
+    int (*enqueue_sync)(const lease * l, ggml_tensor * tensor,
+                        size_t offset, size_t size);
+    // First sticky runtime error observed by the pool; never cleared.
+    int (*first_error)();
     bool (*zc_enabled)();
 };
 
 // Defined by the CUDA/HIP backend.
 bool can_enqueue_async_impl(ggml_backend_t backend, ggml_tensor * tensor,
                             size_t offset, size_t size);
-bool enqueue_async_impl(const lease & l, ggml_backend_t backend,
-                        ggml_tensor * tensor, size_t offset, size_t size);
+submit_result enqueue_async_impl(const lease & l, ggml_backend_t backend,
+                                 ggml_tensor * tensor, size_t offset, size_t size);
 bool can_enqueue_sync_impl(ggml_tensor * tensor, size_t offset, size_t size);
-bool enqueue_sync_impl(const lease & l, ggml_tensor * tensor,
-                       size_t offset, size_t size);
+submit_result enqueue_sync_impl(const lease & l, ggml_tensor * tensor,
+                                size_t offset, size_t size);
 
 }  // namespace ggml_cuda_staging
 

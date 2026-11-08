@@ -131,6 +131,17 @@ static void staging_log_reject(const char * lane, const ggml_tensor * tensor, si
                  tensor != nullptr ? ggml_type_name(tensor->type) : "?");
 }
 
+// A fatal staging submit means the runtime cannot prove that nothing was
+// queued. Replaying the destination (which the bool cpy_tensor_async contract
+// would force the scheduler to do) is forbidden, so stop and surface the first
+// error to the execution owner.
+[[noreturn]] static void staging_fatal(const char * lane, const ggml_cuda_staging::api * st) {
+    const int err = (st != nullptr && st->first_error != nullptr) ? st->first_error() : 0;
+    GGML_LOG_ERROR("%s: TP5 staging fatal first_error=%d; a copy may be in flight, "
+                   "refusing to replay the destination\n", lane, err);
+    GGML_ABORT("TP5 staging fatal");
+}
+
 extern "C" void ggml_backend_meta_staging_diag_dump() {
     std::fprintf(stderr,
         "TP5_STAGING_META mirrored=%llu api_null=%llu disabled=%llu not_eligible=%llu "
@@ -1718,7 +1729,10 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 offset_j += chunk_size_j;
             }
             if (staged) {
-                (void) st->wait(&staged_lease);
+                if (!st->wait(&staged_lease)) {
+                    st->release(&staged_lease);
+                    staging_fatal("sync-2d-wait", st);
+                }
                 st->release(&staged_lease);
             }
             GGML_ASSERT(offset_j == chunk_size_full);
@@ -1758,27 +1772,44 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                                     ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size);
                             }
                             if (ranks_ok) {
-                                bool queued = true;
+                                bool submitted = false;
+                                int result = int(ggml_cuda_staging::submit_result::ok);
                                 for (size_t j = 0; j < n_bufs; j++) {
-                                    if (!st->enqueue_sync(&staged_lease,
-                                            ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size)) {
-                                        queued = false;
+                                    result = st->enqueue_sync(&staged_lease,
+                                            ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size);
+                                    if (result == int(ggml_cuda_staging::submit_result::fatal)) {
+                                        st->release(&staged_lease);
+                                        staging_fatal("sync-enqueue", st);
+                                    }
+                                    if (result == int(ggml_cuda_staging::submit_result::rejected)) {
+                                        if (submitted) {
+                                            st->release(&staged_lease);
+                                            staging_fatal("sync-enqueue-partial", st);
+                                        }
                                         break;
                                     }
+                                    submitted = true;
                                 }
-                                if (queued) {
-                                    (void) st->wait(&staged_lease);
+                                if (submitted && result == int(ggml_cuda_staging::submit_result::ok)) {
+                                    if (!st->wait(&staged_lease)) {
+                                        st->release(&staged_lease);
+                                        staging_fatal("sync-merge-wait", st);
+                                    }
                                     st->release(&staged_lease);
                                     merged = true;
                                 }
                             }
                         }
                         if (!merged) {
+                            // Reached only when nothing was submitted.
                             for (size_t j = 0; j < n_bufs; j++) {
                                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                                 ggml_backend_tensor_set(simple_tensor, staged_lease.host, offset, size);
                             }
-                            (void) st->wait(&staged_lease);
+                            if (!st->wait(&staged_lease)) {
+                                st->release(&staged_lease);
+                                staging_fatal("sync-fallback-wait", st);
+                            }
                             st->release(&staged_lease);
                         }
                         break;
@@ -2326,18 +2357,28 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                 if (ranks_ok && st->acquire_nowait(kStagingWindow, staging_kind, size, &staged_lease)) {
                     g_staging_meta_diag.async_lease_ok.fetch_add(1, std::memory_order_relaxed);
                     if (st->upload(&staged_lease, data, size)) {
-                        bool queued = true;
+                        bool submitted = false;
+                        int result = int(ggml_cuda_staging::submit_result::ok);
                         for (size_t j = 0; j < n_backends; j++) {
-                            if (!st->enqueue_async(&staged_lease,
+                            result = st->enqueue_async(&staged_lease,
                                     ggml_backend_meta_simple_backend(backend, j),
                                     ggml_backend_meta_buffer_simple_tensor(tensor, j),
-                                    offset, size)) {
-                                queued = false;
+                                    offset, size);
+                            if (result == int(ggml_cuda_staging::submit_result::fatal)) {
+                                st->release(&staged_lease);
+                                staging_fatal("async-enqueue", st);
+                            }
+                            if (result == int(ggml_cuda_staging::submit_result::rejected)) {
+                                if (submitted) {
+                                    st->release(&staged_lease);
+                                    staging_fatal("async-enqueue-partial", st);
+                                }
                                 break;
                             }
+                            submitted = true;
                         }
                         st->release(&staged_lease);
-                        if (queued) {
+                        if (submitted && result == int(ggml_cuda_staging::submit_result::ok)) {
                             break;
                         }
                     } else {

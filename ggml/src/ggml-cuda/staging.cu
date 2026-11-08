@@ -162,13 +162,23 @@ bool api_zc_enabled() {
     return zc_enabled();
 }
 
-bool api_enqueue_async(const lease * l, ggml_backend_t backend, ggml_tensor * tensor,
-                       size_t offset, size_t size) {
-    return l != nullptr && enqueue_async_impl(*l, backend, tensor, offset, size);
+int api_enqueue_async(const lease * l, ggml_backend_t backend, ggml_tensor * tensor,
+                      size_t offset, size_t size) {
+    if (l == nullptr) {
+        return int(submit_result::rejected);
+    }
+    return int(enqueue_async_impl(*l, backend, tensor, offset, size));
 }
 
-bool api_enqueue_sync(const lease * l, ggml_tensor * tensor, size_t offset, size_t size) {
-    return l != nullptr && enqueue_sync_impl(*l, tensor, offset, size);
+int api_enqueue_sync(const lease * l, ggml_tensor * tensor, size_t offset, size_t size) {
+    if (l == nullptr) {
+        return int(submit_result::rejected);
+    }
+    return int(enqueue_sync_impl(*l, tensor, offset, size));
+}
+
+int api_first_error() {
+    return global_pool().first_error();
 }
 
 const api kApi = {
@@ -188,6 +198,7 @@ const api kApi = {
     /* .enqueue_async     = */ api_enqueue_async,
     /* .can_enqueue_sync  = */ can_enqueue_sync_impl,
     /* .enqueue_sync      = */ api_enqueue_sync,
+    /* .first_error       = */ api_first_error,
     /* .zc_enabled        = */ api_zc_enabled,
 };
 

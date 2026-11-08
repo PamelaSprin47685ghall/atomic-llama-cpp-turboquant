@@ -865,10 +865,10 @@ bool can_enqueue_async_impl(ggml_backend_t backend, ggml_tensor * tensor,
     return offset <= nbytes && size <= nbytes - offset;
 }
 
-bool enqueue_async_impl(const lease & l, ggml_backend_t backend,
-                        ggml_tensor * tensor, size_t offset, size_t size) {
+submit_result enqueue_async_impl(const lease & l, ggml_backend_t backend,
+                                 ggml_tensor * tensor, size_t offset, size_t size) {
     if (!can_enqueue_async_impl(backend, tensor, offset, size)) {
-        return false;
+        return submit_result::rejected;
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     // The stream belongs to this backend's device. Without the switch the
@@ -898,9 +898,9 @@ bool can_enqueue_sync_impl(ggml_tensor * tensor, size_t offset, size_t size) {
     return offset <= nbytes && size <= nbytes - offset;
 }
 
-bool enqueue_sync_impl(const lease & l, ggml_tensor * tensor, size_t offset, size_t size) {
+submit_result enqueue_sync_impl(const lease & l, ggml_tensor * tensor, size_t offset, size_t size) {
     if (!can_enqueue_sync_impl(tensor, offset, size)) {
-        return false;
+        return submit_result::rejected;
     }
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     const auto * buf_ctx = static_cast<ggml_backend_cuda_buffer_context *>(buf->context);
