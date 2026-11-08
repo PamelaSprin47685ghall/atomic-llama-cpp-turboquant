@@ -11,7 +11,6 @@ namespace {
 bool hip_host_alloc(size_t bytes, void ** out) {
     void * host = nullptr;
     if (cudaHostAlloc(&host, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
-        (void) cudaGetLastError();
         return false;
     }
     *out = host;
@@ -27,7 +26,6 @@ void hip_host_free(void * ptr) {
 bool hip_event_create(void ** out) {
     cudaEvent_t event = nullptr;
     if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
-        (void) cudaGetLastError();
         return false;
     }
     *out = reinterpret_cast<void *>(event);
@@ -37,7 +35,6 @@ bool hip_event_create(void ** out) {
 bool hip_event_record(void * event, void * stream) {
     if (cudaEventRecord(reinterpret_cast<cudaEvent_t>(event),
                         reinterpret_cast<cudaStream_t>(stream)) != cudaSuccess) {
-        (void) cudaGetLastError();
         return false;
     }
     return true;
@@ -45,8 +42,6 @@ bool hip_event_record(void * event, void * stream) {
 
 bool hip_event_sync(void * event) {
     if (cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(event)) != cudaSuccess) {
-        // Clear the sticky error so the caller's fallback path starts clean.
-        (void) cudaGetLastError();
         return false;
     }
     return true;
@@ -61,7 +56,6 @@ void hip_event_destroy(void * event) {
 bool hip_copy_h2d(void * dst, const void * src, size_t bytes, void * stream) {
     if (cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice,
                         reinterpret_cast<cudaStream_t>(stream)) != cudaSuccess) {
-        (void) cudaGetLastError();
         return false;
     }
     return true;
@@ -70,7 +64,6 @@ bool hip_copy_h2d(void * dst, const void * src, size_t bytes, void * stream) {
 bool hip_device_ptr(void * host, void ** out) {
     void * dev = nullptr;
     if (cudaHostGetDevicePointer(&dev, host, 0) != cudaSuccess) {
-        (void) cudaGetLastError();
         return false;
     }
     *out = dev;
@@ -80,7 +73,6 @@ bool hip_device_ptr(void * host, void ** out) {
 int hip_current_device() {
     int device = -1;
     if (cudaGetDevice(&device) != cudaSuccess) {
-        (void) cudaGetLastError();
         return -1;
     }
     return device;
@@ -100,10 +92,15 @@ bool hip_restore_device(int physical) {
         return true;
     }
     if (cudaSetDevice(physical) != cudaSuccess) {
-        (void) cudaGetLastError();
         return false;
     }
     return true;
+}
+
+// The first sticky error stays visible: staging never clears it. The pool
+// records the value for the diagnostic dump and then fails closed.
+int hip_peek_error() {
+    return int(cudaPeekAtLastError());
 }
 
 const backend_ops kHipOps = {
@@ -118,6 +115,7 @@ const backend_ops kHipOps = {
     /* .current_device = */ hip_current_device,
     /* .select_device  = */ hip_select_device,
     /* .restore_device = */ hip_restore_device,
+    /* .peek_error     = */ hip_peek_error,
 };
 
 bool api_acquire(uint32_t window, kind k, size_t bytes, lease * out) {

@@ -106,6 +106,8 @@ struct backend_ops {
     int  (*current_device)()                                       = nullptr;
     bool (*select_device)(int rank)                                = nullptr;
     bool (*restore_device)(int physical)                           = nullptr;
+    // Reads the runtime's first sticky error without clearing it.
+    int  (*peek_error)()                                           = nullptr;
 };
 
 class pool {
@@ -126,6 +128,8 @@ public:
         uint64_t stale_release             = 0;
         uint64_t wait_fail                 = 0;
         uint64_t no_slot                   = 0;
+        uint64_t quarantine                = 0;
+        int      first_error               = 0;
         uint64_t invalid                   = 0;
     };
 
@@ -176,7 +180,7 @@ public:
         slot * chosen = nullptr;
         // 1) Free and retired, large enough.
         for (auto & s : key) {
-            if (!s.leased && !s.pending && s.cap >= bytes) {
+            if (!s.leased && !s.pending && !s.quarantined && s.cap >= bytes) {
                 chosen = &s;
                 break;
             }
@@ -184,7 +188,7 @@ public:
         // 2) Free and retired, grow.
         if (chosen == nullptr) {
             for (auto & s : key) {
-                if (!s.leased && !s.pending) {
+                if (!s.leased && !s.pending && !s.quarantined) {
                     chosen = &s;
                     break;
                 }
@@ -193,7 +197,7 @@ public:
         // 3) Free but pending, large enough: wait, then reuse.
         if (chosen == nullptr && wait_pending) {
             for (auto & s : key) {
-                if (!s.leased && s.cap >= bytes) {
+                if (!s.leased && !s.quarantined && s.cap >= bytes) {
                     chosen = &s;
                     break;
                 }
@@ -202,7 +206,7 @@ public:
         // 4) Free but pending, grow after the wait.
         if (chosen == nullptr && wait_pending) {
             for (auto & s : key) {
-                if (!s.leased) {
+                if (!s.leased && !s.quarantined) {
                     chosen = &s;
                     break;
                 }
@@ -302,16 +306,25 @@ public:
             return false;
         }
         if (!ops_.copy_h2d(dst, s->host, bytes, stream)) {
+            note_fault_locked();
             disabled_.store(true, std::memory_order_relaxed);
             stats_.alloc_fail++;
             return false;
         }
         if (s->events[rank] == nullptr && !ops_.event_create(&s->events[rank])) {
+            // The copy is already queued. Without an event its completion is
+            // unprovable, so the slot is kept and never reused or freed.
+            s->pending = true;
+            s->pending_ranks |= uint32_t(1) << uint32_t(rank);
+            quarantine_locked(*s);
             disabled_.store(true, std::memory_order_relaxed);
             stats_.alloc_fail++;
             return false;
         }
         if (!ops_.event_record(s->events[rank], stream)) {
+            s->pending = true;
+            s->pending_ranks |= uint32_t(1) << uint32_t(rank);
+            quarantine_locked(*s);
             disabled_.store(true, std::memory_order_relaxed);
             stats_.alloc_fail++;
             return false;
@@ -404,7 +417,8 @@ public:
         std::fprintf(f,
             "TP5_STAGING leases=%llu uploads=%llu upload_bytes=%llu waits=%llu wait_ms=%.3f "
             "enqueues=%llu releases=%llu hits=%llu misses=%llu oversize=%llu alloc_fail=%llu "
-            "stale_release=%llu wait_fail=%llu no_slot=%llu invalid=%llu\n",
+            "stale_release=%llu wait_fail=%llu no_slot=%llu quarantine=%llu invalid=%llu "
+            "first_error=%d\n",
             (unsigned long long) stats_.leases,
             (unsigned long long) stats_.uploads,
             (unsigned long long) stats_.upload_bytes,
@@ -419,7 +433,9 @@ public:
             (unsigned long long) stats_.stale_release,
             (unsigned long long) stats_.wait_fail,
             (unsigned long long) stats_.no_slot,
-            (unsigned long long) stats_.invalid);
+            (unsigned long long) stats_.quarantine,
+            (unsigned long long) stats_.invalid,
+            stats_.first_error);
     }
 
 private:
@@ -429,12 +445,31 @@ private:
         uint64_t  epoch = 0;
         bool      leased = false;
         bool      pending = false;
+        bool      quarantined = false;  // a copy may still read host: never reuse or free
         uint32_t  pending_ranks = 0;
         void *    events[kRanks] = {};
         void *    dev_ptrs[kRanks] = {};
     };
 
     using rotation = std::array<slot, kSlotsPerKey>;
+
+    void note_fault_locked() {
+        if (stats_.first_error != 0 || ops_.peek_error == nullptr) {
+            return;
+        }
+        const int err = ops_.peek_error();
+        if (err != 0) {
+            stats_.first_error = err;
+        }
+    }
+
+    void quarantine_locked(slot & s) {
+        if (!s.quarantined) {
+            s.quarantined = true;
+            stats_.quarantine++;
+        }
+        note_fault_locked();
+    }
 
     slot * find_locked(const lease & l) {
         if (l.window >= kWindows || size_t(l.which) >= kKindCount || l.slot >= kSlotsPerKey) {
@@ -485,10 +520,11 @@ private:
                 break;
             }
         }
-        if (ops_.restore_device != nullptr) {
-            (void) ops_.restore_device(saved);
+        if (ops_.restore_device != nullptr && !ops_.restore_device(saved)) {
+            ok = false;
         }
         if (!ok) {
+            quarantine_locked(s);
             disabled_.store(true, std::memory_order_relaxed);
             stats_.wait_fail++;
             return false;
@@ -502,6 +538,9 @@ private:
     }
 
     bool grow_locked(slot & s, size_t bytes) {
+        if (s.quarantined) {
+            return false;
+        }
         if (bytes <= s.cap) {
             return true;
         }
@@ -511,12 +550,14 @@ private:
             return false;
         }
         if (ops_.host_alloc == nullptr) {
+            note_fault_locked();
             disabled_.store(true, std::memory_order_relaxed);
             stats_.alloc_fail++;
             return false;
         }
         void * host = nullptr;
         if (!ops_.host_alloc(bytes, &host)) {
+            note_fault_locked();
             disabled_.store(true, std::memory_order_relaxed);
             stats_.alloc_fail++;
             return false;

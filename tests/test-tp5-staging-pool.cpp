@@ -24,6 +24,9 @@ int g_copies = 0;
 bool g_fail_alloc = false;
 bool g_fail_sync = false;
 int  g_fail_copy_remaining = 0;
+bool g_fail_event_create = false;
+bool g_fail_event_record = false;
+int  g_peek_error = 0;
 
 bool fake_alloc(size_t bytes, void ** out) {
     if (g_fail_alloc) {
@@ -47,12 +50,18 @@ void fake_free(void * p) {
 }
 
 bool fake_event_create(void ** out) {
+    if (g_fail_event_create) {
+        return false;
+    }
     *out = std::malloc(1);
     ++g_events;
     return *out != nullptr;
 }
 
 bool fake_event_record(void *, void *) {
+    if (g_fail_event_record) {
+        return false;
+    }
     ++g_records;
     return true;
 }
@@ -103,6 +112,10 @@ bool fake_restore_device(int physical) {
     return true;
 }
 
+int fake_peek_error() {
+    return g_peek_error;
+}
+
 backend_ops fake_ops() {
     backend_ops ops;
     ops.host_alloc    = fake_alloc;
@@ -113,6 +126,7 @@ backend_ops fake_ops() {
     ops.event_destroy = fake_event_destroy;
     ops.copy_h2d      = fake_copy;
     ops.device_ptr    = fake_device_ptr;
+    ops.peek_error    = fake_peek_error;
     return ops;
 }
 
@@ -422,9 +436,60 @@ int test_wait_failure_disables() {
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr));
 
     g_fail_sync = true;
+    g_peek_error = 43;
     CHECK(!p.wait(a));
     CHECK(!p.usable());
+    CHECK(p.snapshot().quarantine == 1);
+    CHECK(p.snapshot().first_error == 43);
     g_fail_sync = false;
+    g_peek_error = 0;
+    return 0;
+}
+
+int test_fault_event_create_quarantine() {
+    pool p(fake_ops());
+    uint8_t src[64] = {};
+    uint8_t dst[64] = {};
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+
+    // The copy succeeds, the event cannot be created: completion is
+    // unprovable, so the slot is quarantined and the pool stops.
+    g_fail_event_create = true;
+    g_peek_error = 11;
+    CHECK(!p.enqueue(a, 0, dst, sizeof(src), nullptr));
+    g_fail_event_create = false;
+    CHECK(!p.usable());
+    CHECK(p.snapshot().quarantine == 1);
+    CHECK(p.snapshot().first_error == 11);
+    CHECK(p.pool_bytes() > 0);  // the pinned buffer is retained
+
+    p.release(a);
+    CHECK(!p.upload(a, src, sizeof(src)));  // released lease is stale
+    CHECK(p.snapshot().quarantine == 1);
+    g_peek_error = 0;
+    return 0;
+}
+
+int test_fault_event_record_quarantine() {
+    pool p(fake_ops());
+    uint8_t src[64] = {};
+    uint8_t dst[64] = {};
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+
+    g_fail_event_record = true;
+    g_peek_error = 12;
+    CHECK(!p.enqueue(a, 0, dst, sizeof(src), nullptr));
+    g_fail_event_record = false;
+    CHECK(!p.usable());
+    CHECK(p.snapshot().quarantine == 1);
+    CHECK(p.snapshot().first_error == 12);
+    p.release(a);
+    CHECK(p.snapshot().quarantine == 1);
+    g_peek_error = 0;
     return 0;
 }
 
@@ -626,6 +691,8 @@ int main() {
         {"enqueue_wait",               test_enqueue_wait},
         {"merged_wait",                test_merged_wait},
         {"wait_failure_disables",      test_wait_failure_disables},
+        {"fault_event_create_quarantine", test_fault_event_create_quarantine},
+        {"fault_event_record_quarantine", test_fault_event_record_quarantine},
         {"owns_and_diagnostics",       test_owns_and_diagnostics},
         {"device_ptr",                 test_device_ptr},
         {"staging_candidate",          test_staging_candidate},
@@ -640,6 +707,9 @@ int main() {
         g_fail_alloc = false;
         g_fail_sync = false;
         g_fail_copy_remaining = 0;
+        g_fail_event_create = false;
+        g_fail_event_record = false;
+        g_peek_error = 0;
         g_current_device = 0;
         g_select_count = 0;
         g_restore_count = 0;

@@ -3920,6 +3920,9 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     if (ggml_cuda_staging::enabled()) {
         ggml_cuda_staging::global_pool().note_source(data, size);
     }
+    // The fallback path must not inherit the caller's device: the stream and
+    // the copy belong to this backend's device.
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -3931,6 +3934,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -3946,6 +3950,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     if (ggml_cuda_staging::enabled()) {
         ggml_cuda_staging::global_pool().note_source(data, n_copies == 0 ? size : stride_data * (n_copies - 1) + size);
     }
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -3959,6 +3964,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
