@@ -1283,3 +1283,14 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# TP5 WS4 scheduler submission-boundary CPU test. It drives the real
+# scheduler's split input copy through a fake backend with its own host buffer
+# type, so the scheduler must call cpy_tensor_async and then ask the optional
+# submission-state capability. Covers success, rejected, and fatal (unknown)
+# submissions, no replay after fatal, and copy-slot ownership. No GPU.
+add_executable(test-tp5-staging-scheduler test-tp5-staging-scheduler.cpp)
+target_link_libraries(test-tp5-staging-scheduler PRIVATE ggml ggml-cpu)
+add_test(NAME test-tp5-staging-scheduler COMMAND test-tp5-staging-scheduler)
+set_property(TEST test-tp5-staging-scheduler PROPERTY LABELS "cpu;tp5")
+set_property(TEST test-tp5-staging-scheduler PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_SCHED_TEST PASS")
