@@ -29,6 +29,7 @@ explicitly. This keeps the F2/OFF leg equivalent to stock.
 | `GGML_TP5_RELAY_VERIFY_UID` | `0` | `1` | uid fast path still computes and asserts the signature |
 | `GGML_TP5_RELAY_PLAN_STATS` | `0` | `1` | print plan/frame/pool counters |
 | `GGML_TP5_RELAY_PLAN_FLUSH` | `0` | `1` | diagnostic: flush every plan on each prepare |
+| `GGML_TP5_LLAMA_PLAN_CACHE` | `0` | `1..8` | llama-side per-shape `llm_graph_result`+scheduler cache; the value is the slot count; relay-only |
 
 Recommended ON configuration for the five-shape MTP working set:
 
@@ -42,6 +43,22 @@ GGML_TP5_GRAPH_UID=1
 
 `GGML_TP5_PLAN_UNION=1` together with `GGML_TP5_RELAY_SLOT_CHANNELS=0` is an
 illegal matrix entry; the runtime patch fails closed on it.
+
+## llama-side per-shape cache
+
+`GGML_TP5_LLAMA_PLAN_CACHE=<slots>` (default 0, relay-only) keeps up to
+`slots` `(llm_graph_result, ggml_backend_sched)` pairs keyed by
+`(n_tokens, n_seq_tokens, n_outputs, n_seqs, n_seqs_unq, equal_seqs,
+n_kv_target, gtype, alloc_gen)`. A hit skips both `model.build_graph` and the
+scheduler's reset/placement; `can_reuse()` is still the second-level check, and
+a key collision rebuilds in the same slot (`rekey`). A new `alloc_gen`
+(scheduler recreation or phase switch) flushes the cache. The cache is per
+context, so two windows never share a slot.
+
+Cost: every slot owns a scheduler, and each scheduler allocates its own compute
+buffers. Slot count trades host/device memory for build reuse; the five-shape
+relay working set needs at least five slots to avoid LRU thrash. The flag is
+off by default, so the stock and relay-OFF legs keep the single scheduler.
 
 ## Two plan-key domains (not the same type)
 
@@ -77,8 +94,9 @@ the symbol.
 cmake -S . -B build-ws5-20261107 -DCMAKE_BUILD_TYPE=Release \
       -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
       -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_HIP=OFF
-cmake --build build-ws5-20261107 -j44 --target llama test-relay-plan-policy
+cmake --build build-ws5-20261107 -j44 --target llama test-relay-plan-policy test-shape-cache
 ./build-ws5-20261107/bin/test-relay-plan-policy
+./build-ws5-20261107/bin/test-shape-cache
 ```
 
 HIP compile of the provider (no device needed):
@@ -97,3 +115,10 @@ five-shape frame LRU (cap 8 = five cold misses, cap 4 worst case 9/12); the T4
 pool layout (`71,209,984 B <= 68 MiB`) and the fail-closed 65536 bound; channel
 slot binding/retirement/dual-window isolation and the 1448/2896 bounds; and the
 legacy switch defaults.
+
+`test-shape-cache` pins the llama-side cache policy: same-shape second hit,
+per-field key identity, no reuse across `alloc_gen`, flush, LRU eviction,
+rekey after a `can_reuse` failure, dual-window isolation and the flag/capacity
+parsing (0 = off, 1..8 = slots). The runtime integration is relay-only and
+flag-gated, so a CPU build cannot execute it end to end; the GPU gates below
+must cover it.

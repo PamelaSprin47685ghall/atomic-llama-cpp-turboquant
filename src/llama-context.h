@@ -9,10 +9,12 @@
 #include "llama-memory.h"
 #include "llama-prefab.h"
 #include "llama-union-binder.h"
+#include "llama-shape-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <vector>
@@ -307,7 +309,7 @@ public:
     // declaration that adds no data member of its own - note that
     // llama_context itself does gain one opaque state member below, by
     // design)
-    llm_graph_result * get_gf_res_prev() const { return gf_res_prev.get(); }
+    llm_graph_result * get_gf_res_prev() const { return gf_res_current ? gf_res_current : gf_res_prev.get(); }
 
     // The ubatch the live graph's inputs were last filled from, for the mask
     // read-back's test surface. Empty until a graph has been filled. The copy
@@ -331,6 +333,16 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    // Pillar 5: per-shape graph/scheduler cache (GGML_TP5_LLAMA_PLAN_CACHE).
+    // Relay-only and off by default. The flag value is the slot count.
+    struct llama_shape_plan {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+    };
+    bool shape_plan_enabled() const { return shape_plan_active; }
+    std::unique_ptr<llama_shape_plan> make_shape_plan(uint32_t n_tokens);
+    void flush_shape_plans();
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -590,6 +602,15 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+    // Per-shape entries. Each owns its scheduler and graph result, so a shape
+    // switch reuses the placed graph instead of rebuilding it. The policy
+    // cache names the slots; this array holds the graph state.
+    std::array<std::unique_ptr<llama_shape_plan>, llama_shape_cache::capacity_max> shape_plans;
+    llama_shape_cache::cache shape_plan_cache;
+    llm_graph_result *       gf_res_current = nullptr;
+    ggml_backend_sched_t     shape_last_sched = nullptr;
+    bool                     shape_plan_active = false;
+    uint64_t                 shape_plan_clock = 0;
 
     // opaque per-context state of the union-graph runtime binder
     // (llama_nkv_ctx_state, defined in llama-nout-state.h; unique_ptr to an
