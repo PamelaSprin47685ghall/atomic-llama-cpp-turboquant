@@ -295,6 +295,13 @@ llama_kv_cache::llama_kv_cache(
         v_cells[s].resize(kv_size);
     }
 
+    // The decode-time pools allocate here, before the relay service and the
+    // first decode exist. The first prepare then only reuses them; a later
+    // larger batch still grows the pools.
+    snapshots.reserve(8);
+    decode_scratch_.sinfos.reserve(8);
+    decode_scratch_.ubatches.reserve(8);
+
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
 

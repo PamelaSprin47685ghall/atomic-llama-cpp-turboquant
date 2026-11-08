@@ -5,6 +5,7 @@
 // allocation. It is a test-local replacement of the global operators, so the
 // counts include every container touched by the loop.
 
+#include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cells.h"
 #include "../src/llama-ubatch-pool.h"
 
@@ -226,6 +227,49 @@ static void test_concurrency() {
     check(pool->stats().stale == 0, "concurrent: no stale release");
 }
 
+static void test_kv_snapshot_slot_reuse() {
+    llama_kv_cells src;
+    src.resize(64);
+
+    for (uint32_t i = 0; i < 64; ++i) {
+        src.pos_set(i, static_cast<llama_pos>(i*3));
+        src.seq_add(i, static_cast<llama_seq_id>(i%4));
+        llama_kv_cell_ext ext;
+        ext.x = static_cast<llama_pos>(i + 1);
+        ext.y = static_cast<llama_pos>(i + 2);
+        src.ext_set(i, ext);
+    }
+
+    const std::vector<uint32_t> first  = { 0, 5, 7, 63, 1, 2, 3 };
+    const std::vector<uint32_t> second = { 63, 0 };
+
+    llama_kv_cache::snapshot_slot slot;
+
+    for (int round = 0; round < 2; ++round) {
+        const auto & idxs = round == 0 ? first : second;
+
+        slot.sinfo.resize(1);
+        slot.sinfo.idxs[0] = idxs;
+        slot.v_cells.resize(1);
+
+        src.cp_into(idxs, slot.v_cells[0]);
+
+        const llama_kv_cells ref = src.cp(idxs);
+
+        check(slot.v_cells[0].size() == ref.size(), "kv snapshot: size");
+        check(slot.v_cells[0].get_used() == ref.get_used(), "kv snapshot: used");
+        for (std::size_t j = 0; j < idxs.size(); ++j) {
+            check(slot.v_cells[0].pos_get(j) == ref.pos_get(j), "kv snapshot: pos");
+            check(slot.v_cells[0].seq_get(j) == ref.seq_get(j), "kv snapshot: seq");
+            check(slot.v_cells[0].ext_get(j).x == ref.ext_get(j).x &&
+                  slot.v_cells[0].ext_get(j).y == ref.ext_get(j).y, "kv snapshot: ext");
+        }
+    }
+
+    // A second reuse with a shorter idxs must not expose the old tail.
+    check(slot.v_cells[0].size() == second.size(), "kv snapshot: shrinks on reuse");
+}
+
 static void test_kv_cells_cp_into() {
     llama_kv_cells src;
     src.resize(64);
@@ -273,6 +317,7 @@ int main() {
     test_exhaustion_and_fallback();
     test_steady_state();
     test_concurrency();
+    test_kv_snapshot_slot_reuse();
     test_kv_cells_cp_into();
 
     std::printf("%s failures=%d allocs=%lld frees=%lld\n",
