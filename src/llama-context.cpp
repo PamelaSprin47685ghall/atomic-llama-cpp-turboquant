@@ -892,16 +892,38 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             // window's kernel launch held the ROCm runtime mutex, and the
             // HSA signal wait deadlocked (H2e). The stock path keeps its
             // original lazy initial size.
+            // GGML_TP5_RELAY_OUTPUT_ROWS lets the owner name the first
+            // catch-up row count (the compose runtime knows it before context
+            // creation). Without it the legacy bound is used; a later late
+            // set_embeddings_nextn/sampler change can still grow once, which
+            // is safe because the old buffer is retired, not freed.
             const uint32_t n_outputs_reserve = backend_tp5_relay != nullptr
-                ? std::max<uint32_t>(cparams.n_outputs_max, n_seq_max())
+                ? llama_shape_cache::output_rows_bound(
+                      cparams.n_outputs_max, n_seq_max(), getenv("GGML_TP5_RELAY_OUTPUT_ROWS"))
                 : params.n_seq_max;
-            if (output_reserve(int32_t(n_outputs_reserve)) < n_outputs_reserve) {
+            if (output_reserve(int32_t(n_outputs_reserve), backend_tp5_relay != nullptr) < n_outputs_reserve) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
 
             LLAMA_LOG_INFO("%s: %10s  output buffer size = %8.2f MiB\n", __func__,
                            ggml_backend_buffer_name(buf_output.get()),
                            ggml_backend_buffer_get_size(buf_output.get()) / 1024.0 / 1024.0);
+        }
+
+        // Pillar 5: per-shape scheduler/graph cache. Relay-only: the stock
+        // builder has the union-binder and prefab lanes, which own their own
+        // per-shape state. The flag value is the slot count; 0 keeps the
+        // single-scheduler path.
+        {
+            const size_t cap = llama_shape_cache::parse_capacity(getenv("GGML_TP5_LLAMA_PLAN_CACHE"));
+            shape_plan_active = cap != 0 && backend_tp5_relay != nullptr;
+            shape_plan_cache  = llama_shape_cache::cache(shape_plan_active ? cap : 0);
+            if (cap != 0 && backend_tp5_relay == nullptr) {
+                LLAMA_LOG_WARN("%s: GGML_TP5_LLAMA_PLAN_CACHE is relay-only; ignored outside tp5-relay\n",
+                               __func__);
+            } else if (shape_plan_active) {
+                LLAMA_LOG_INFO("%s: per-shape plan cache enabled, slots=%zu\n", __func__, cap);
+            }
         }
     }
 
@@ -1296,6 +1318,9 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    // Per-shape schedulers own native work too; drain and release them before
+    // the backends go away.
+    flush_shape_plans();
 
     // envelope scheds/graphs and the factor cache reference this context's backends and memory:
     // drop them first (the factor cache is context-owned, nothing outlives the context)
@@ -1562,6 +1587,8 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
     }
 
     // Releasing the scheduler returns the only borrowed compute lease.
+    // Per-shape schedulers were placed in the old generation; drop them.
+    flush_shape_plans();
     sched.reset();
     ++alloc_gen_; // Placement is rebuilt from scratch below.
     gf_res_prev->reset();
@@ -1688,6 +1715,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
+    flush_shape_plans();
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     union_record_invalidate();
     // the new long-lived result object is owned by this context: the union
@@ -2098,10 +2126,11 @@ void llama_context::synchronize_accounting() {
 }
 
 size_t llama_context::tp5_output_copy_record() {
-    if (backend_tp5_relay == nullptr || !gf_res_prev) {
+    const llm_graph_result * current = gf_res_current ? gf_res_current : gf_res_prev.get();
+    if (backend_tp5_relay == nullptr || current == nullptr) {
         return 0;
     }
-    const ggml_tensor * t_logits = gf_res_prev->get_logits();
+    const ggml_tensor * t_logits = current->get_logits();
     if (t_logits == nullptr || t_logits->buffer == nullptr) {
         return 0;
     }
@@ -2149,6 +2178,9 @@ bool llama_context::release_compute() {
         }
         prefab->cache.clear();
     }
+    // Per-shape entries hold their own scheduler and graph metadata; release
+    // them before the shared allocator/buffers they reference are freed.
+    flush_shape_plans();
     // These own the only inference graph metadata that may reuse allocator
     // addresses. Reset both before the allocator is freed, retaining their
     // graph-result objects for the normal next graph build.
@@ -5625,6 +5657,38 @@ llama_union_rebind_result llama_context::union_rebind_n_outputs(llm_graph_result
         ? llama_union_rebind_result::applied : llama_union_rebind_result::refused;
 }
 
+std::unique_ptr<llama_context::llama_shape_plan> llama_context::make_shape_plan(uint32_t n_tokens) {
+    const size_t max_nodes = graph_max_nodes(n_tokens);
+    auto plan = std::make_unique<llama_shape_plan>();
+    plan->res = std::make_unique<llm_graph_result>(max_nodes);
+    plan->res->set_owner(this);
+    const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
+        model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
+    const ggml_moe_cache_mode moe_cache_mode =
+        moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
+    plan->sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                                             max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (!plan->sched) {
+        LLAMA_LOG_ERROR("%s: failed to create a per-shape scheduler\n", __func__);
+        return nullptr;
+    }
+    ggml_backend_sched_set_moe_cache(plan->sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+    ggml_backend_sched_set_eval_callback(plan->sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+    return plan;
+}
+
+void llama_context::flush_shape_plans() {
+    for (auto & plan : shape_plans) {
+        if (plan && plan->sched) {
+            ggml_backend_sched_synchronize(plan->sched.get());
+        }
+        plan.reset();
+    }
+    shape_plan_cache.flush();
+    gf_res_current    = nullptr;
+    shape_last_sched  = nullptr;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch,
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
@@ -5638,6 +5702,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         // completion. Drain before memory updates, graph reset, or set_inputs.
         // Do not account the current, not-yet-submitted token as synchronized.
         ggml_backend_sched_synchronize(sched.get());
+        // The previous decode may have run on a per-shape scheduler. Drain it
+        // too before any entry can be evicted or rebuilt.
+        if (shape_last_sched != nullptr && shape_last_sched != sched.get()) {
+            ggml_backend_sched_synchronize(shape_last_sched);
+        }
     }
 
     // The out_ids tensor is built at the high-water envelope (or at the
@@ -5762,7 +5831,54 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         if (token_recurrent) ++st.c_ntok_recurrent_hybrid_fallbacks;
     }
 
-    auto * res = gf_res_prev.get();
+    // Pillar 5: per-shape scheduler/graph selection. A hit reuses the entry's
+    // llm_graph_result and scheduler; can_reuse() below still decides whether
+    // the graph itself is current. The cache is relay-only and off by default.
+    llm_graph_result *   res       = gf_res_prev.get();
+    ggml_backend_sched_t run_sched = sched.get();
+    int                  shape_slot = -1;
+    bool                 shape_hit  = false;
+    llama_shape_cache::key shape_key{};
+    if (shape_plan_enabled()) {
+        shape_key.n_tokens     = ubatch.n_tokens;
+        shape_key.n_seq_tokens = ubatch.n_seq_tokens;
+        shape_key.n_outputs    = n_outputs;
+        shape_key.n_seqs       = ubatch.n_seqs;
+        shape_key.n_seqs_unq   = ubatch.n_seqs_unq;
+        shape_key.equal_seqs   = ubatch.b_equal_seqs;
+        const llama_kv_cache_context * shape_kv = union_kv_ctx(mctx);
+        shape_key.n_kv_target = shape_kv != nullptr ? shape_kv->get_n_kv_target() : 0;
+        shape_key.gtype       = uint32_t(gtype);
+        shape_key.alloc_gen   = alloc_gen_;
+        const auto got = shape_plan_cache.acquire(shape_key, ++shape_plan_clock);
+        shape_slot = got.index;
+        shape_hit  = got.hit;
+        if (!got.hit) {
+            // The victim's scheduler is idle: the previous decode was drained
+            // at the top of this function. Free it before installing a new
+            // entry in the same slot, and drop any stale back-pointers.
+            if (shape_plans[got.index]) {
+                if (shape_plans[got.index]->res.get() == gf_res_current) {
+                    gf_res_current = nullptr;
+                }
+                if (shape_plans[got.index]->sched.get() == shape_last_sched) {
+                    shape_last_sched = nullptr;
+                }
+            }
+            shape_plans[got.index].reset();
+            shape_plans[got.index] = make_shape_plan(ubatch.n_tokens);
+            if (!shape_plans[got.index]) {
+                // Allocation failure is not a decode failure: keep the legacy
+                // single-scheduler path for this epoch.
+                shape_plan_cache.invalidate(got.index);
+                shape_slot = -1;
+            }
+        }
+        if (shape_slot >= 0) {
+            res       = shape_plans[shape_slot]->res.get();
+            run_sched = shape_plans[shape_slot]->sched.get();
+        }
+    }
     auto * gf  = res->get_gf();
 
     // previous live envelope, captured before any bind/rebuild can clear it:
@@ -5777,6 +5893,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     auto gparams = graph_params(res, ubatch, mctx, gtype);
+    gparams.sched = run_sched;
 
     bool reused = !graph_reuse_disable && res->can_reuse(gparams);
 
@@ -5870,7 +5987,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
             // that the previous compute is still reading.
             if (cparams.pipeline_parallel) {
-                ggml_backend_sched_synchronize(sched.get());
+                ggml_backend_sched_synchronize(run_sched);
             }
 
             n_reused++;
@@ -5880,6 +5997,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         }
     }
     if (!reused) {
+        if (shape_slot >= 0 && shape_hit) {
+            // can_reuse() rejected a key hit: the entry now holds this shape.
+            shape_plan_cache.rekey(shape_slot, shape_key, shape_plan_clock);
+        }
         const int64_t diag_build_start = ggml_time_us();
         // the record points into the graph that res->reset() is about to
         // destroy; drop it first so a build_graph() failure below cannot
@@ -5887,11 +6008,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         // record_valid and patch freed tensors).
         union_record_invalidate();
         // drain any in-flight compute before the rebuild reuses its buffers
-        ggml_backend_sched_synchronize(sched.get());
+        ggml_backend_sched_synchronize(run_sched);
         res->reset();
 
-        ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_reset(run_sched);
+        ggml_backend_sched_set_eval_callback(run_sched, cparams.cb_eval, cparams.cb_eval_user_data);
         // Build at physical KV and recurrent capacities and the output
         // high-water mark. Live widths are bound after allocation.
         bool     env          = false;
@@ -6132,11 +6253,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
                 // drain the envelope build's (not yet computed) graph and any
                 // previous in-flight compute before the stock rebuild
-                ggml_backend_sched_synchronize(sched.get());
+                ggml_backend_sched_synchronize(run_sched);
                 res->reset();
-                ggml_backend_sched_reset(sched.get());
-                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+                ggml_backend_sched_reset(run_sched);
+                ggml_backend_sched_set_eval_callback(run_sched, cparams.cb_eval, cparams.cb_eval_user_data);
                 gparams = graph_params(res, ubatch, mctx, gtype);
+                gparams.sched = run_sched;
                 ++st.c_graph_builds;
                 ++n_graph_builds;
                 gf = model.build_graph(gparams);
@@ -6170,7 +6292,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         }
         // Only a recorded envelope can use the copy metadata. Keep stock
         // graphs and scheduler reserve paths free of tracking allocations.
-        if (!ggml_backend_sched_set_split_copy_tracking(sched.get(), record_build)) {
+        if (!ggml_backend_sched_set_split_copy_tracking(run_sched, record_build)) {
             LLAMA_LOG_ERROR("%s: failed to configure split copy tracking\n", __func__);
             union_record_invalidate();
             ret = GGML_STATUS_FAILED;
@@ -6178,7 +6300,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         }
 
         const int64_t diag_alloc_start = ggml_time_us();
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        if (!ggml_backend_sched_alloc_graph(run_sched, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             union_record_invalidate();
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -6296,7 +6418,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             if (!changed && st.record_valid && st.shape_map.ntok_valid) {
                 // transactional replan at the live token width; a refusal
                 // leaves the old arena and record intact and falls back below
-                replan_failed = !ggml_backend_sched_replan_graph(sched.get(), st.record_t.data(),
+                replan_failed = !ggml_backend_sched_replan_graph(run_sched, st.record_t.data(),
                         st.record_fixed.data(), st.record_t.size(), nullptr, nullptr, 0);
                 // The replan reallocated the arena at the recorded bound
                 // shapes, so the arena width is that bound. A failed replan
@@ -6326,16 +6448,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                 st.env_disabled = true;
                 st.nout_suppress_envelope = true;
                 union_record_invalidate();
-                ggml_backend_sched_synchronize(sched.get());
+                ggml_backend_sched_synchronize(run_sched);
                 res->reset();
-                ggml_backend_sched_reset(sched.get());
-                if (!ggml_backend_sched_set_split_copy_tracking(sched.get(), false)) {
+                ggml_backend_sched_reset(run_sched);
+                if (!ggml_backend_sched_set_split_copy_tracking(run_sched, false)) {
                     LLAMA_LOG_ERROR("%s: failed to disable split copy tracking\n", __func__);
                     ret = GGML_STATUS_FAILED;
                     return nullptr;
                 }
-                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+                ggml_backend_sched_set_eval_callback(run_sched, cparams.cb_eval, cparams.cb_eval_user_data);
                 gparams = graph_params(res, ubatch, mctx, gtype);
+                gparams.sched = run_sched;
                 ++st.c_graph_builds;
                 ++n_graph_builds;
                 gf = model.build_graph(gparams);
@@ -6344,7 +6467,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                     ret = GGML_STATUS_FAILED;
                     return nullptr;
                 }
-                if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                if (!ggml_backend_sched_alloc_graph(run_sched, gf)) {
                     LLAMA_LOG_ERROR("%s: failed to allocate rebuilt graph\n", __func__);
                     union_record_invalidate();
                     ret = GGML_STATUS_ALLOC_FAILED;
@@ -6358,7 +6481,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     // The reference may use CPU shape/index operations, never CPU quantized
     // projections: CPU's native activation policy is not this F32 policy.
     if (backend_quantized_matmul_f32 != nullptr) {
-        if (backend_tp5_relay != nullptr && ggml_backend_sched_get_n_splits(sched.get()) != 1) {
+        if (backend_tp5_relay != nullptr && ggml_backend_sched_get_n_splits(run_sched) != 1) {
             LLAMA_LOG_ERROR("%s: tp5-relay requires a single native Meta graph, not host-routed splits\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
@@ -6369,7 +6492,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                 tensor->src[0] != nullptr && ggml_is_quantized(tensor->src[0]->type) &&
                 ((tensor->op == GGML_OP_MUL_MAT_ID && tensor->src[0]->type != GGML_TYPE_Q2_0) ||
                  tensor->src[1] == nullptr || tensor->src[1]->type != GGML_TYPE_F32 ||
-                 ggml_backend_sched_get_tensor_backend(sched.get(), tensor) != backend_quantized_matmul_f32)) {
+                 ggml_backend_sched_get_tensor_backend(run_sched, tensor) != backend_quantized_matmul_f32)) {
                 LLAMA_LOG_ERROR("%s: quantized_matmul_f32 refuses unsupported or non-GPU quantized projection %s\n", __func__, tensor->name);
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
@@ -6378,7 +6501,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                 (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 && tensor->op != GGML_OP_NONE &&
                 tensor->op != GGML_OP_VIEW && tensor->op != GGML_OP_RESHAPE &&
                 tensor->op != GGML_OP_PERMUTE && tensor->op != GGML_OP_TRANSPOSE &&
-                ggml_backend_sched_get_tensor_backend(sched.get(), tensor) != backend_tp5_relay) {
+                ggml_backend_sched_get_tensor_backend(run_sched, tensor) != backend_tp5_relay) {
                 LLAMA_LOG_ERROR("%s: tp5-relay refuses non-Meta compute node %s\n", __func__, tensor->name);
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
@@ -6474,10 +6597,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     }
 
     const int64_t diag_compute_start = ggml_time_us();
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    gf_res_current   = res;
+    shape_last_sched = shape_plan_active ? run_sched : nullptr;
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1,
+                                      shape_plan_active ? run_sched : nullptr);
     if (backend_tp5_relay && std::getenv("TP5_DIAG_GRAPH")) {
-        LLAMA_LOG_INFO("TP5_DIAG_GRAPH ctx=%p N=%u pos=%d replay=%u reused=%d pre_us=%lld build_us=%lld alloc_us=%lld inputs_us=%lld compute_us=%lld total_us=%lld\n",
+        LLAMA_LOG_INFO("TP5_DIAG_GRAPH ctx=%p N=%u pos=%d replay=%u reused=%d plan_hit=%d slot=%d pre_us=%lld build_us=%lld alloc_us=%lld inputs_us=%lld compute_us=%lld total_us=%lld\n",
             (void *) this, ubatch.n_tokens, ubatch.pos ? ubatch.pos[0] : -1, diag_replay, int(reused),
+            int(shape_hit), shape_slot,
             (long long)(diag_prepared-diag_start),(long long)diag_build,(long long)diag_alloc,
             (long long)(diag_compute_start-diag_input_start),(long long)(ggml_time_us()-diag_compute_start),
             (long long)(ggml_time_us()-diag_start));
@@ -7295,7 +7422,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs, bool preallocate) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -7464,7 +7591,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     std::fill(output_ids.begin(), output_ids.end(), -1);
 
     this->n_outputs = 0;
-    GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
+    // The decode contract is n_outputs <= n_outputs_max. The constructor's
+    // explicit envelope reserve is the one caller allowed above it: the
+    // buffer is larger, the views are still sized by the requested rows, and
+    // later decode calls re-derive them below the allocation.
+    if (!preallocate) {
+        GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
+    }
     return n_outputs_max;
 }
 
@@ -7853,11 +7986,12 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched, ggml_ba
 
     // Maintenance graphs can reuse the reserve arena between submissions.
     // Only the inference result owns inputs through the fences below.
-    const bool retain_inputs = backend_tp5_relay != nullptr && gf_res_prev &&
-            gf == gf_res_prev->get_gf() && !batched &&
+    const bool retain_inputs = backend_tp5_relay != nullptr && gf_res_current &&
+            gf == gf_res_current->get_gf() && !batched &&
             cparams.n_batch == 1 && cparams.n_ubatch == 1;
     ggml_backend_sched_t sched_run = sched_override ? sched_override : sched.get();
-    auto status = retain_inputs && sched_override == nullptr ?
+    const bool retained_api = retain_inputs && (sched_override == nullptr || shape_plan_active);
+    auto status = retained_api ?
             ggml_backend_sched_graph_compute_async_retained_inputs(sched_run, gf) :
             ggml_backend_sched_graph_compute_async(sched_run, gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -9920,8 +10054,8 @@ bool llama_context::union_diagnostics(llama_union_diagnostics * out) const {
 bool llama_context::copy_last_llama_activation(int32_t row, float * dst, size_t count) {
     if (!last_llama_activation_valid || dst == nullptr || row < 0 ||
             (uint32_t) row >= n_outputs || count == 0 || count != model.hparams.n_embd_out() ||
-            !gf_res_prev || !sched || !backend_cpu) return false;
-    auto * t = gf_res_prev->get_embd();
+            !gf_res_current || !sched || !backend_cpu) return false;
+    auto * t = gf_res_current->get_embd();
     if (!t || t->type != GGML_TYPE_F32 || t->ne[0] != (int64_t) count ||
             t->ne[1] != (int64_t) n_outputs || t->ne[2] != 1 || t->ne[3] != 1 ||
             !ggml_is_contiguous(t) || !t->data ||

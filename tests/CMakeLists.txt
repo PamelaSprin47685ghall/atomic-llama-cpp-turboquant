@@ -619,6 +619,16 @@ add_test(NAME test-relay-plan-policy COMMAND test-relay-plan-policy)
 set_property(TEST test-relay-plan-policy PROPERTY LABELS "cpu;tp5")
 set_property(TEST test-relay-plan-policy PROPERTY PASS_REGULAR_EXPRESSION "RELAY_PLAN_POLICY_TEST PASS")
 
+# TP5 llama-side per-shape plan cache policy. Header-only, no model/backend:
+# same-shape hit, alloc_gen isolation, flush, LRU eviction, rekey and the
+# dual-window independence of two cache instances.
+add_executable(test-shape-cache test-shape-cache.cpp)
+target_compile_features(test-shape-cache PRIVATE cxx_std_17)
+target_include_directories(test-shape-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME test-shape-cache COMMAND test-shape-cache)
+set_property(TEST test-shape-cache PROPERTY LABELS "cpu;tp5")
+set_property(TEST test-shape-cache PROPERTY PASS_REGULAR_EXPRESSION "SHAPE_CACHE_TEST PASS")
+
 if (UNIX)
     add_executable(test-ntok-onegraph test-ntok-onegraph.cpp)
     target_link_libraries(test-ntok-onegraph PRIVATE llama)
