@@ -1569,7 +1569,9 @@ void llama_kv_cache::scratch_return(
     if (scratch->from_pool) {
         scratch_pool.release(scratch);
     } else {
-        std::lock_guard<std::mutex> lock(decode_scratch_mutex);
+        // The mutex is already held by this call. Locking it again here
+        // deadlocked every non-pooled return: the two decode threads stopped
+        // inside scratch_return and the main thread waited in std::thread::join.
         scratch->in_use = false;
     }
 }
