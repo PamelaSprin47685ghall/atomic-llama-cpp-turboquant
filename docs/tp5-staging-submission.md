@@ -23,6 +23,11 @@ staging pool. The functions ignore the backend argument: one staging fault in
 one Meta context makes every Meta backend report the error/pending state until
 process exit. Other backends report `0`/`false`.
 
+The CUDA backend's host-only staging `api` table is versioned. Version 2 adds
+`mark_partial` **after** the complete v1 prefix; no v1 field moved. A v1 table
+from an older backend is accepted, and a partial submission that cannot call
+`mark_partial` aborts instead of returning a silent success.
+
 ## Semantics
 
 - `ggml_backend_tensor_copy_async` returns `bool`:
@@ -78,6 +83,15 @@ process exit. Other backends report `0`/`false`.
   whether the fault was observed at the accepted copy or at a failed split
   compute. The pre-copy slot wait is separate; no additional drain is
   performed after the fault.
+- A mirrored submission that queues some ranks and then gets a clean rejection
+  is not a clean rejection of the whole copy. The pool publishes the same
+  fail-stop state as a native fatal: `mark_partial` disables the pool,
+  quarantines the slot and records the destination as unknown. `first_error`
+  stays `0` because a rejection is not a native error; `submission_pending`
+  is the signal, so the async helper returns false and no later compute runs.
+  The synchronous setter has no return value: its caller cannot observe the
+  partial write, but every later staging submit and Meta graph compute sees
+  the fail-stop state.
 - Staging faults do not abort: sync paths stop in place and the async path
   returns to the scheduler. The pool quarantines the pinned slot, records the
   unknown destinations (`TP5_STAGING_UNKNOWN` in the diagnostic dump), and
@@ -226,12 +240,17 @@ process exit. Other backends report `0`/`false`.
   They are safe to free after retention only because the retained context is
   never used again. Calling any context API after `llama_free` is a caller
   contract violation.
-- The LoRA-adapter borrow rule is a code-inspection proof: a retained context
-  never reads `loras`, `llama_adapter_lora_free` erases the adapter from the
-  retained model's set, and `llama_model_free` is deferred. No runtime test
-  loads a LoRA adapter; the sampler borrow arm is the executable analogue.
-  Freeing an adapter before retention, while the context can still compute, is
-  a use-after-free by contract.
+- The LoRA-adapter borrow arm constructs a bare adapter, registers it on a
+  real CPU context, retains the context and then frees the adapter. It proves
+  the erase-from-retained-model path and the duplicate-free path do not read
+  the stale pointer. It does not load adapter weights and does not compute
+  with them; full LoRA arithmetic is outside this test. Freeing an adapter
+  before retention, while the context can still compute, is a use-after-free
+  by contract.
+- `llama_adapter_lora_free` and the final `llama_model_free` are not
+  internally serialized against each other. The caller must not run them
+  concurrently; the retained-context path keeps the model alive, so the
+  documented free-after-retention order is safe without a new lock.
 - Meta owners retained on pending leak intentionally; the process owns them.
 - The Meta reduce-path pending gate is not exercised by the CPU tests below:
   it needs a Meta backend with the CUDA staging provider. It mirrors the
@@ -286,6 +305,10 @@ ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-scheduler --output-on
 cmake --build build-ws4-sched-ctest -j --target test-tp5-staging-note-source-lock
 ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-note-source-lock --output-on-failure
 
+# Meta partial-enqueue publication (ctest, CPU)
+cmake --build build-ws4-sched-ctest -j --target test-tp5-staging-meta-partial
+ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-meta-partial --output-on-failure
+
 # ASAN variant: catches the backends-before-scheduler UAF and the
 # release_buffers-while-pending free.
 cmake -S . -B build-ws4-sched-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGGML_HIP=OFF \
@@ -321,7 +344,8 @@ g++ -std=c++17 -O2 -pthread -I ggml/include -I ggml/src \
 The scheduler test covers: success, rejected, fatal (no replay), a pending
 state without a local failure, and pending published by an accepted copy with
 no error. It checks the public helper true/false contract for error, pending
-and rejected copies; the pending entry gates (`alloc_graph`, `reserve`,
+and rejected copies, the sticky refusal before any callback once a backend is
+unproven, and the no-op copy path; the pending entry gates (`alloc_graph`, `reserve`,
 `reserve_size`, `release_buffers`, `reset`, `compute`); that a failed split
 compute on both the normal and callback paths becomes fail-stop and does not
 flush deferred input copies; that the synchronous wrapper skips `synchronize`
@@ -362,14 +386,26 @@ error); neither is a latency measurement. A query error is fatal, like a
 failed wait. A not-ready query is a state, not a fault, and the adapter does
 not clear the runtime's sticky error. A slot whose events are still in flight
 stays pending and the async lane falls back, which is the intended transient
-collision.
+collision. The test also asserts the frozen v1 `api` prefix at compile time
+and covers a clean rejection after one rank was queued: `mark_partial` stops
+the pool, `submission_pending` is true, `first_error` stays 0, the slot is
+quarantined, and later upload/enqueue/wait/enter_submit/acquire calls fail.
+
+The Meta partial test builds a real Meta backend over two CPU child devices and
+injects a v2 staging table whose enqueue queues rank 0 and rejects rank 1. It
+asserts the partial branch calls `mark_partial` and releases the lease, that
+`submission_pending` becomes true with `first_error == 0`, and that the next
+set hits the fatal submit gate without another enqueue. It also checks that
+registration accepts the v1 prefix, accepts v2, and rejects a future version.
 
 The context-retain test covers, without a model: the live-context reference
 (free-before-context deferral, last-release delete, new-context refusal after
 a free request), retained-count deferral, and a clean model free. With
 `LLAMA_TEST_MODEL` it additionally covers: model-free-before-context on clean
 and pending contexts, the CPU backend threadpool pointer cleared by
-`retain_for_process`, a sampler borrow freed after retention, a prefab
+`retain_for_process`, a sampler borrow freed after retention, a bare LoRA
+adapter registered on the context and freed after retention (its stale pointer
+is never read by the duplicate free or the deferred model free), a prefab
 envelope slot built by a real one-token decode and then marked unproven
 retaining the context, a duplicate `llama_free` that keeps the retained count
 at one, and a real CPU context retained whole. The model part reports

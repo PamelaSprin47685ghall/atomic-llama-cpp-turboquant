@@ -7,6 +7,7 @@
 #include "../ggml/src/ggml-cuda/staging.h"
 #include "../ggml/src/ggml-impl.h"  // ggml_are_same_layout (static inline)
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,48 @@
 using namespace ggml_cuda_staging;
 
 namespace {
+
+// Frozen v1 host-only api prefix. The meta layer accepts a v1 table from an
+// older backend, so every new field must be appended after zc_enabled and no
+// existing field may move. Keep this mirror in sync with the header's prefix;
+// the assertions below fail the CPU test build if a field is inserted.
+struct api_v1 {
+    uint32_t abi_version;
+    bool (*enabled)();
+    bool (*merge_wait)();
+    bool (*acquire)(uint32_t window, kind k, size_t bytes, lease * out);
+    bool (*acquire_nowait)(uint32_t window, kind k, size_t bytes, lease * out);
+    int (*upload)(const lease * l, const void * src, size_t bytes);
+    int (*upload_rows)(const lease * l, const void * src, size_t src_stride,
+                       size_t dst_stride, size_t row_bytes, size_t rows);
+    bool (*wait)(const lease * l);
+    void (*release)(const lease * l);
+    bool (*owns)(const void * p, size_t bytes);
+    void * (*device_ptr)(const lease * l, int rank);
+    void (*dump)();
+    bool (*can_enqueue_async)(ggml_backend_t backend, ggml_tensor * tensor,
+                              size_t offset, size_t size);
+    int (*enqueue_async)(const lease * l, ggml_backend_t backend,
+                         ggml_tensor * tensor, size_t offset, size_t size);
+    bool (*can_enqueue_sync)(ggml_tensor * tensor, size_t offset, size_t size);
+    int (*enqueue_sync)(const lease * l, ggml_tensor * tensor,
+                        size_t offset, size_t size);
+    int (*first_error)();
+    bool (*enter_submit)();
+    void (*leave_submit)();
+    size_t (*unknown_count)();
+    bool (*submission_pending)();
+    bool (*configured)();
+    bool (*usable)();
+    bool (*zc_enabled)();
+};
+
+static_assert(offsetof(api, zc_enabled) == offsetof(api_v1, zc_enabled),
+              "the v1 api prefix moved");
+static_assert(offsetof(api, mark_partial) >= sizeof(api_v1),
+              "the v2 mark_partial field overlaps the v1 prefix");
+static_assert(offsetof(api, mark_partial) > offsetof(api, zc_enabled),
+              "new api fields must be appended after zc_enabled");
 
 int g_allocs = 0;
 int g_frees = 0;
@@ -1027,8 +1070,11 @@ int test_partial_rejection_marks_pool() {
     CHECK(p.upload(a, src, sizeof(src)) == submit_result::fatal);
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
     CHECK(!p.wait(a));
+    CHECK(!p.enter_submit());
     p.release(a);
     CHECK(p.submission_pending());
+    lease c;
+    CHECK(!p.acquire(0, kind::tokens, sizeof(src), &c));
     return 0;
 }
 

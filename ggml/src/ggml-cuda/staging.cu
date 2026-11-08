@@ -207,9 +207,8 @@ bool api_submission_pending() {
 }
 
 void api_mark_partial(const lease * l, const void * dst) {
-    if (l != nullptr && dst != nullptr) {
-        global_pool().mark_partial(*l, dst);
-    }
+    GGML_ASSERT(l != nullptr);
+    global_pool().mark_partial(*l, dst);
 }
 
 const api kApi = {
@@ -234,10 +233,10 @@ const api kApi = {
     /* .leave_submit      = */ api_leave_submit,
     /* .unknown_count     = */ api_unknown_count,
     /* .submission_pending= */ api_submission_pending,
-    /* .mark_partial      = */ api_mark_partial,
     /* .configured        = */ configured,
     /* .usable            = */ usable,
     /* .zc_enabled        = */ api_zc_enabled,
+    /* .mark_partial      = */ api_mark_partial,
 };
 
 }  // namespace

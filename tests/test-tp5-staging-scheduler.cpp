@@ -707,6 +707,16 @@ void test_public_copy_async_return() {
     CHECK(ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, src, dst));
     CHECK(std::memcmp(dst->data, values, sizeof(values)) == 0);
 
+    // No async callback: the helper synchronizes and performs its own blocking
+    // copy. The pre/post capability checks must still return true when clean.
+    g_fake.reject_copy = false;
+    g_fake_backend.iface.cpy_tensor_async = nullptr;
+    const int fallback_cpy_before = g_fake.cpy_calls;
+    CHECK(ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, src, dst));
+    CHECK(g_fake.cpy_calls == fallback_cpy_before);
+    CHECK(std::memcmp(dst->data, values, sizeof(values)) == 0);
+    g_fake_backend.iface.cpy_tensor_async = fake_cpy_tensor_async;
+
     // The later arms clear the fake capability only to exercise the remaining
     // return paths. That clear is not a production release operation: while
     // the capability stays set, the helper refuses before any callback.

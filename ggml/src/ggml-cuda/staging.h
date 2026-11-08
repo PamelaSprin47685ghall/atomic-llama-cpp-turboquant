@@ -23,8 +23,9 @@ constexpr size_t   kMaxPoolBytes = 4u << 20;
 constexpr uint32_t kRanks        = 16;  // == GGML_CUDA_MAX_DEVICES
 constexpr uint32_t kWindows      = 4;
 constexpr uint32_t kSlotsPerKey  = 2;   // double buffer
-// Bump when the host-only api table grows. The meta layer accepts older
-// tables but must not read a field they do not have.
+// Bump when the host-only api table grows. New fields are appended after
+// zc_enabled so every older table remains a valid prefix; the meta layer
+// accepts older tables but must not read a field they do not have.
 constexpr uint32_t kApiVersion   = 2;
 
 enum class kind : uint32_t {
@@ -926,16 +927,16 @@ struct api {
     void (*leave_submit)();
     size_t (*unknown_count)();
     bool (*submission_pending)();
-    // Mark a multi-rank submission that queued some ranks and then hit a
-    // clean rejection. The pool stops, records the destination as unknown and
-    // makes submission_pending() true. first_error is unchanged because a
-    // rejection is not a native error.
-    void (*mark_partial)(const lease * l, const void * dst);
     // configured: GGML_TP5_STAGING requests the pool. usable: the pool has not
     // stopped. A configured but unusable pool is a global fault.
     bool (*configured)();
     bool (*usable)();
     bool (*zc_enabled)();
+    // v2 only, appended after the v1 prefix. Mark a multi-rank submission that
+    // queued some ranks and then hit a clean rejection. The pool stops, records
+    // the destination as unknown and makes submission_pending() true.
+    // first_error is unchanged because a rejection is not a native error.
+    void (*mark_partial)(const lease * l, const void * dst);
 };
 
 // Defined by the CUDA/HIP backend.

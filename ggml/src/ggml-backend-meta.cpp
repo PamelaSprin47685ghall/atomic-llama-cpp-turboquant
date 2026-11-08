@@ -137,8 +137,10 @@ static void staging_log_reject(const char * lane, const ggml_tensor * tensor, si
 // first native error to the execution owner.
 static void staging_record_fatal(const char * lane, const ggml_cuda_staging::api * st) {
     const int err = (st != nullptr && st->first_error != nullptr) ? st->first_error() : 0;
-    GGML_LOG_ERROR("%s: TP5 staging fatal first_error=%d; a copy may be in flight, "
-                   "destination retained, no replay\n", lane, err);
+    const bool pending = st != nullptr && st->submission_pending != nullptr &&
+                         st->submission_pending();
+    GGML_LOG_ERROR("%s: TP5 staging fatal first_error=%d pending=%d; a copy may be in flight, "
+                   "destination retained, no replay\n", lane, err, int(pending));
 }
 
 extern "C" void ggml_backend_meta_staging_diag_dump() {

@@ -31,6 +31,7 @@
 #include "ggml-cpu.h"
 
 #include "../src/llama-context.h"
+#include "../src/llama-adapter.h"
 #include "../src/llama-model.h"
 
 #include <cstdio>
@@ -270,6 +271,43 @@ void test_sampler_borrow_after_retention(const char * model_path) {
     CHECK(!c.model->name.empty());
 }
 
+// A LoRA adapter is a caller-owned borrow too. After retention the context
+// never builds or computes a graph, so freeing the adapter only erases it from
+// the retained model's set; the retained context's map keeps a stale pointer
+// that no path may read. The model free stays deferred.
+void test_lora_borrow_after_retention(const char * model_path) {
+    open_ctx c;
+    if (!open_context(model_path, c)) {
+        return;
+    }
+
+    auto * adapter = new llama_adapter_lora(c.model);
+    CHECK(adapter != nullptr);
+    adapter->alpha = 1.0f;
+    c.model->loras.insert(adapter);
+
+    llama_adapter_lora * adapters[] = { adapter };
+    float scales[] = { 1.0f };
+    CHECK(llama_set_adapters_lora(c.ctx, adapters, 1, scales) == 0);
+
+    c.ctx->debug_mark_unproven();
+    llama_free(c.ctx); // retain
+    CHECK(c.ctx->is_retained());
+
+    llama_adapter_lora_free(adapter); // erase from the retained model, delete
+    CHECK(c.model->loras.empty());
+
+    // A duplicate free must not re-enter the context or dereference the stale
+    // adapter pointer in the retained context's loras map.
+    llama_free(c.ctx);
+    CHECK(c.ctx->is_retained());
+    CHECK(c.model->retained_contexts() == 1);
+
+    llama_model_free(c.model); // deferred by the retained context
+    CHECK(!c.model->name.empty());
+    CHECK(c.model->loras.empty());
+}
+
 // A prefab envelope slot owns a scheduler separate from the main scheduler.
 // The scheduler is created only when an envelope ubatch runs (the legacy init
 // path builds the slot result, not the scheduler), so the fixture must decode
@@ -451,6 +489,7 @@ int main(int argc, char ** argv) {
     test_model_free_before_context(model_path);
     test_cpu_threadpool_detached(model_path);
     test_sampler_borrow_after_retention(model_path);
+    test_lora_borrow_after_retention(model_path);
     test_pending_context_retention(model_path);
     test_prefab_slot_unproven(model_path);
     test_clean_context_retention(model_path);
