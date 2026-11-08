@@ -438,7 +438,7 @@
     },
     {
       "path": "src/llama-context.cpp",
-      "sha256": "633c469274e2cd1f7e04a63cf6bb568ce1243b7fe26ce80f0ab6cf404f2ba08e",
+      "sha256": "f215fd0cea1e3bffe809e5a1878ca086efc81142f0f89818a80ba71b2e8968d8",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -455,7 +455,7 @@
     },
     {
       "path": "src/llama-context.h",
-      "sha256": "6bb331b8054be7c145fd4482f835d7c0a4e885c690009ee74bff561968018736",
+      "sha256": "cbde2d7c3b059526b753b875f460136e202302ba54c911e378951d239c521c87",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
