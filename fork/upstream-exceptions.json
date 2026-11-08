@@ -109,7 +109,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/relay.hip",
-      "sha256": "8ca6d29c1d2088c33e773f38b6cdd92892771a3e6e8846a83fbd1518c85c3d75",
+      "sha256": "005ca5b91a3e9fbd05f08d45c26f6e5ac9c17f0e4c02e99cd194f6cb66f32470",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -143,7 +143,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "sha256": "feb717e88f4af933dd0d3639d150a3db823327bb8bbd08f64f6c8d71f4ab222a",
+      "sha256": "5242df967ea3bdef7a39e4fe940d5c3a32e0a7ffc9b3e6674ac1adf3c88e8eba",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -264,7 +264,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "1fb3fdd97cb368fb6c0fdb3fec83f54976f42c54fe2be496845891fd159d9f16",
+      "sha256": "0e77a603758a4aef145950fee7ac73dc81a1e629a8e6db8e8242aa72e576df84",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",
@@ -438,7 +438,7 @@
     },
     {
       "path": "src/llama-context.cpp",
-      "sha256": "0aef584a3e4f77a061577badfc80001917d6da80f75253ccc27f2943317fdee3",
+      "sha256": "487aaefed813862e116b5bb1d8005ce81fcad578a48c1def1ee79f99b340bf0f",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -455,7 +455,7 @@
     },
     {
       "path": "src/llama-context.h",
-      "sha256": "0aa899d796ffc7878d108d8cce31810f78ed27c9080946c737fb09ac8de476b6",
+      "sha256": "80e890d70c5b3ee5c3455ef1a0f035d317153ad27eaf666c589bca161196a595",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -801,7 +801,7 @@
     },
     {
       "path": "tests/CMakeLists.txt",
-      "sha256": "e83a94b4a62073f37348f002e1b2e1fd1e7b7f028f27d115d70d4f8dbea384f9",
+      "sha256": "ec0dbbd27a0d06a20ec759fe499559aae80840dc132435e66db2a51641f7c713",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
@@ -842,7 +842,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/staging.cu",
-      "sha256": "1749ee19e0052569d5a424ccb88430a23606c5fce1eae25dc659bf78c62f2a34",
+      "sha256": "0f41c0af7305681687d184c2d83abfa27df282a1c7d5dc2e7032b37d5999dcab",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)"
@@ -852,7 +852,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/staging.h",
-      "sha256": "1cd446aea239a0168789ef0ab576b9f072004164d1f67544cbd6011f57a87d5d",
+      "sha256": "81e45c49827317912c1f375a22f669044df48b07496e5ffd59aaad7bc51d601a",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)",
@@ -863,7 +863,7 @@
     },
     {
       "path": "tests/test-tp5-staging-pool.cpp",
-      "sha256": "33efe233f5425efe408ed6ab311cbbf14e5a8d812d45ec1648def16482bcf587",
+      "sha256": "20610f74c3f5847512aa6095172c49b55d4da135ad3cf673b2dbeeb0bba25c86",
       "mode": "100644",
       "consumers": [
         "WS4 staging pool CPU test"
@@ -920,6 +920,26 @@
       ],
       "reason": "Document the WS5 cross-owner patch order, the graph_uid default-off contract, and the OFF/ON switch matrix.",
       "removal_condition": "Remove after the WS5 patches are upstreamed or folded into the integration commit."
+    },
+    {
+      "path": "src/llama-shape-cache.h",
+      "sha256": "6fac92141dff8e01244a5e5f8e86660434ebeefd64c28c8eb8dea3252571f387",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose pillar-5 per-shape sched/graph cache (WS5)"
+      ],
+      "reason": "Declare the opt-in relay-only per-shape cache of scheduler and graph-build state, keyed by the ubatch shape.",
+      "removal_condition": "Remove when upstream reuses per-shape scheduler state, or when the WS5 consumer is removed."
+    },
+    {
+      "path": "tests/test-shape-cache.cpp",
+      "sha256": "87bdaa8b36694727928bca0fd3643e96d1c39cc8eab4a23e306dbc783d35162c",
+      "mode": "100644",
+      "consumers": [
+        "WS5 per-shape cache CPU test"
+      ],
+      "reason": "Cover the per-shape cache key, hit and miss accounting, and the flag-off path that must stay identical to stock.",
+      "removal_condition": "Remove with the WS5 per-shape cache."
     }
   ]
 }
