@@ -882,6 +882,27 @@
       "removal_condition": "Remove with the WS5 plan-policy implementation."
     },
     {
+      "path": "ggml/include/ggml-relay-verify.h",
+      "sha256": "bf124b500d0803d9d0050e78587f682eacc911051d14b265c863e4b9db9aa049",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose relay verification counters (WS5)",
+        "WS5 relay verification counter CPU test"
+      ],
+      "reason": "Declare the requested/resolved/executed ledger that relay.hip binds to the one describe call of GGML_TP5_RELAY_VERIFY_UID, so a run can distinguish 'verification requested but never resolved' from 'verification described every submission'.",
+      "removal_condition": "Remove with the WS5 relay verification counter instrumentation."
+    },
+    {
+      "path": "tests/test-relay-verify-counters.cpp",
+      "sha256": "98771b8bd57b7b5080d33bff9fdcafa937a6ed61e2e395ede6d8d2bfbbf2feb3",
+      "mode": "100644",
+      "consumers": [
+        "WS5 relay verification counter CPU test"
+      ],
+      "reason": "Cover the three-stage ledger: a switch-off submission counts nothing, a requested submission without the fast path counts requested only, and executed stays nested under resolved under requested.",
+      "removal_condition": "Remove with the WS5 relay verification counter test target."
+    },
+    {
       "path": "patches/ws5/ggml-backend-meta.cpp.patch",
       "sha256": "d28bfbc9a2eaaa3afba2669aaccdf2db6303bd7db40d6ce61d5f0375883284e4",
       "mode": "100644",

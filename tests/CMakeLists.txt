@@ -619,6 +619,16 @@ add_test(NAME test-relay-plan-policy COMMAND test-relay-plan-policy)
 set_property(TEST test-relay-plan-policy PROPERTY LABELS "cpu;tp5")
 set_property(TEST test-relay-plan-policy PROPERTY PASS_REGULAR_EXPRESSION "RELAY_PLAN_POLICY_TEST PASS")
 
+# TP5 relay verification counters. Header-only, no llama/ggml library and no
+# device: requested/resolved/executed stay nested and a submission that did
+# not request verification counts nothing.
+add_executable(test-relay-verify-counters test-relay-verify-counters.cpp)
+target_compile_features(test-relay-verify-counters PRIVATE cxx_std_17)
+target_include_directories(test-relay-verify-counters PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
+add_test(NAME test-relay-verify-counters COMMAND test-relay-verify-counters)
+set_property(TEST test-relay-verify-counters PROPERTY LABELS "cpu;tp5")
+set_property(TEST test-relay-verify-counters PROPERTY PASS_REGULAR_EXPRESSION "RELAY_VERIFY_COUNTERS_TEST PASS")
+
 # TP5 llama-side per-shape plan cache policy. Header-only, no model/backend:
 # same-shape hit, alloc_gen isolation, flush, LRU eviction, rekey and the
 # dual-window independence of two cache instances.
