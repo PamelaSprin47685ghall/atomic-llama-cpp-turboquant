@@ -264,7 +264,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "0e77a603758a4aef145950fee7ac73dc81a1e629a8e6db8e8242aa72e576df84",
+      "sha256": "c8b5b8c0fe8bb811359ea733546cf4a59ad6bcbbe0e2fd94bd9a1cdbf4f58d23",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",
@@ -842,7 +842,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/staging.cu",
-      "sha256": "0f41c0af7305681687d184c2d83abfa27df282a1c7d5dc2e7032b37d5999dcab",
+      "sha256": "856ddde15d14828e44e3f45de3617f66efbe69415b2fb56e911f6b6324c02325",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)"
@@ -852,7 +852,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/staging.h",
-      "sha256": "81e45c49827317912c1f375a22f669044df48b07496e5ffd59aaad7bc51d601a",
+      "sha256": "470e87b069d96c958f3ebf4ff276346168d34605cae24279b7ae6625a9006a9f",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)",
@@ -863,7 +863,7 @@
     },
     {
       "path": "tests/test-tp5-staging-pool.cpp",
-      "sha256": "20610f74c3f5847512aa6095172c49b55d4da135ad3cf673b2dbeeb0bba25c86",
+      "sha256": "3796398c637a7cf9b868e85779153e8caa802622ab9f3721e2a5c504320c7d39",
       "mode": "100644",
       "consumers": [
         "WS4 staging pool CPU test"
