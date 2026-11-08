@@ -191,6 +191,50 @@ int test_pending_slot_reuse() {
     return 0;
 }
 
+int test_acquire_nowait() {
+    pool p(fake_ops());
+    uint8_t src[64] = {};
+    uint8_t dst[64] = {};
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr));
+    p.release(a);
+
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+    CHECK(b.slot != a.slot);
+    CHECK(p.upload(b, src, sizeof(src)));
+    CHECK(p.enqueue(b, 1, dst, sizeof(src), nullptr));
+    p.release(b);
+
+    // Both slots are pending. The async lane must not wait: it fails and
+    // falls back to the pageable path.
+    const int syncs_before = g_syncs;
+    lease c;
+    CHECK(!p.acquire(0, kind::tokens, sizeof(src), &c, /*wait_pending =*/ false));
+    CHECK(g_syncs == syncs_before);
+    CHECK(p.snapshot().no_slot >= 1);
+
+    // The synchronous lane still waits one event and reuses a slot.
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &c));
+    CHECK(g_syncs == syncs_before + 1);
+    p.release(c);
+    return 0;
+}
+
+int test_note_source_fast_path() {
+    pool p(fake_ops());
+    // No slot has been allocated: note_source must not take the lock.
+    p.note_source(reinterpret_cast<const void *>(uintptr_t(0x1000)), 16);
+    p.note_source(nullptr, 1);
+    const auto s = p.snapshot();
+    CHECK(s.misses == 2);
+    CHECK(s.hits == 0);
+    return 0;
+}
+
 int test_window_isolation() {
     pool p(fake_ops());
     lease a;
@@ -433,6 +477,8 @@ int main() {
         {"lease_release",              test_lease_release},
         {"double_buffer_stale_release", test_double_buffer_and_stale_release},
         {"pending_slot_reuse",         test_pending_slot_reuse},
+        {"acquire_nowait",             test_acquire_nowait},
+        {"note_source_fast_path",      test_note_source_fast_path},
         {"window_isolation",           test_window_isolation},
         {"pool_cap",                   test_pool_cap},
         {"alloc_failure_fail_closed",  test_alloc_failure_fail_closed},

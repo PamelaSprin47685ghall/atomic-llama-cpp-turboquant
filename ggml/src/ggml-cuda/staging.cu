@@ -79,6 +79,10 @@ bool api_acquire(uint32_t window, kind k, size_t bytes, lease * out) {
     return global_pool().acquire(window, k, bytes, out);
 }
 
+bool api_acquire_nowait(uint32_t window, kind k, size_t bytes, lease * out) {
+    return global_pool().acquire(window, k, bytes, out, /*wait_pending =*/ false);
+}
+
 bool api_upload(const lease * l, const void * src, size_t bytes) {
     return l != nullptr && global_pool().upload(*l, src, bytes);
 }
@@ -129,6 +133,7 @@ const api kApi = {
     /* .enabled           = */ enabled,
     /* .merge_wait        = */ merge_wait_enabled,
     /* .acquire           = */ api_acquire,
+    /* .acquire_nowait    = */ api_acquire_nowait,
     /* .upload            = */ api_upload,
     /* .upload_rows       = */ api_upload_rows,
     /* .wait              = */ api_wait,
