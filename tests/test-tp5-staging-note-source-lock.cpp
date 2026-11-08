@@ -18,9 +18,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
 
 using namespace ggml_cuda_staging;
@@ -57,8 +59,18 @@ int fake_event_record(void *, void *) {
     return 0;
 }
 
+std::mutex              g_sync_mu;
+std::condition_variable g_sync_cv;
+bool                    g_sync_block   = false;
+bool                    g_sync_entered = false;
+int                     g_sync_rc      = 0;
+
 int fake_event_sync(void *) {
-    return 0;
+    std::unique_lock<std::mutex> lock(g_sync_mu);
+    g_sync_entered = true;
+    g_sync_cv.notify_all();
+    g_sync_cv.wait(lock, [] { return !g_sync_block; });
+    return g_sync_rc;
 }
 
 void fake_event_destroy(void * p) {
@@ -91,6 +103,42 @@ void wait_flag(const std::atomic<bool> & flag) {
     while (!flag.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
+}
+
+bool wait_flag_timeout(const std::atomic<bool> & flag, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms);
+    while (!flag.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return flag.load(std::memory_order_acquire);
+}
+
+void arm_blocking_sync(int rc) {
+    std::lock_guard<std::mutex> lock(g_sync_mu);
+    g_sync_block   = true;
+    g_sync_entered = false;
+    g_sync_rc      = rc;
+}
+
+bool wait_sync_entered(int timeout_ms) {
+    std::unique_lock<std::mutex> lock(g_sync_mu);
+    return g_sync_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                              [] { return g_sync_entered; });
+}
+
+void release_blocking_sync() {
+    std::lock_guard<std::mutex> lock(g_sync_mu);
+    g_sync_block = false;
+    g_sync_cv.notify_all();
+}
+
+void disarm_sync() {
+    std::lock_guard<std::mutex> lock(g_sync_mu);
+    g_sync_block   = false;
+    g_sync_entered = false;
+    g_sync_rc      = 0;
 }
 
 bool wait_pool_unusable(const pool & p, int timeout_ms) {
@@ -141,6 +189,69 @@ int test_same_thread_note_source_keeps_gate() {
     const auto s = p.snapshot();
     CHECK(s.hits == 1);
     CHECK(s.misses == 1); // the inside-gate note was counted as a fast miss
+    p.release(a);
+    return 0;
+}
+
+// Controlled interleaving for the check-then-lock TOCTOU:
+//   1. the wait thread holds mutex_ inside event_sync;
+//   2. note_source reads submit_gate_held_=false and reaches the pool lock;
+//   3. the gate holder then enters submit_mutex_ and waits for the note;
+//   4. the fatal publication holds mutex_ and waits for the gate.
+// A blocking note_source would sleep on mutex_ and close the cycle
+// note_source -> mutex_ -> submit gate -> note_source. The test requires the
+// note to return while mutex_ is held; it fails fast if the note blocks.
+int test_note_source_never_waits_on_pool_mutex() {
+    pool p(fake_ops());
+    uint8_t src[32] = {};
+    uint8_t dst[32] = {};
+    std::memset(src, 0x44, sizeof(src));
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+
+    arm_blocking_sync(4);
+    std::atomic<bool> wait_done{false};
+    std::thread waiter([&] {
+        p.wait(a); // holds mutex_ inside the blocked event sync
+        wait_done.store(true, std::memory_order_release);
+    });
+    if (!wait_sync_entered(2000)) {
+        std::fprintf(stderr, "FAIL waiter did not enter event_sync\n");
+        std::_Exit(1);
+    }
+
+    std::atomic<bool> note_done{false};
+    std::thread note([&] {
+        p.note_source(a.host, sizeof(src));
+        note_done.store(true, std::memory_order_release);
+    });
+    if (!wait_flag_timeout(note_done, 2000)) {
+        std::fprintf(stderr, "FAIL note_source blocked on mutex_ (TOCTOU cycle)\n");
+        std::_Exit(1);
+    }
+
+    // The gate holder waits for the note worker, as a backend set path could.
+    // The note already returned, so this join cannot close the cycle.
+    CHECK(p.enter_submit());
+    note.join();
+    CHECK(!wait_done.load());
+
+    // The waiter fails its event and blocks in publish_fatal_locked on the
+    // gate; leave_submit releases it. The note is already gone.
+    release_blocking_sync();
+    p.leave_submit();
+    waiter.join();
+    CHECK(wait_done.load());
+    CHECK(!p.usable());
+
+    const auto s = p.snapshot();
+    CHECK(s.hits == 0);
+    CHECK(s.misses == 1);    // the note was a fast miss while mutex_ was held
+    CHECK(s.wait_fail >= 1);
+
     p.release(a);
     return 0;
 }
@@ -205,11 +316,13 @@ int main() {
         int (*fn)();
     } tests[] = {
         { "same_thread_note_source_keeps_gate", test_same_thread_note_source_keeps_gate },
+        { "note_source_never_waits_on_pool_mutex", test_note_source_never_waits_on_pool_mutex },
         { "note_source_fatal_publication_order", test_note_source_does_not_deadlock_fatal_publication },
     };
 
     for (const auto & t : tests) {
         g_fail_copy = false;
+        disarm_sync();
         const int rc = t.fn();
         std::printf("%s %s\n", rc == 0 ? "PASS" : "FAIL", t.name);
         failed += rc != 0;

@@ -454,14 +454,30 @@ public:
         }
         // The submit gate may call the backend set path on this same thread.
         // enter_submit() publishes submit_gate_held_ before that path and
-        // leave_submit() clears it, so this check needs no lock. A try_lock on
-        // submit_mutex_ here would be undefined when the caller already owns
-        // it, and a successful try_lock would drop the gate.
+        // leave_submit() clears it. This flag is a fast path, not a lock: a
+        // gate can start between this load and the pool lock below.
         if (submit_gate_held_.load(std::memory_order_acquire)) {
             misses_fast_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        // Never block on mutex_ here. publish_fatal_locked() holds mutex_ and
+        // waits for the submit gate; a blocking note_source can close the cycle
+        // note_source -> mutex_ -> submit gate -> note_source when the gate
+        // holder waits for the note. A contended pool is a diagnostic fast
+        // miss, not a reason to sleep.
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            misses_fast_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        // A gate may have started while this thread was taking mutex_. Recheck
+        // before touching the stats: the flag keeps the documented "skip while
+        // the gate is held" accounting. This is an accuracy check, not the
+        // deadlock fix (try_lock above already makes it wait-free).
+        if (submit_gate_held_.load(std::memory_order_acquire)) {
+            misses_fast_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (owns_locked(p, bytes)) {
             stats_.hits++;
         } else {
@@ -483,10 +499,10 @@ public:
 
     // Submission gate. The fallback copy and the fatal publication share this
     // lock: a fatal cannot be published between the check and the submit.
-    // note_source reads submit_gate_held_ and skips while the gate is held,
-    // so the caller may use the GGML backend set path inside the gate without
-    // taking mutex_ (the fatal publication holds mutex_ and waits for this
-    // gate). The lock is released on a false return.
+    // note_source reads submit_gate_held_ as a fast path and takes mutex_ only
+    // by try_lock, so it never waits while this gate is held (the fatal
+    // publication holds mutex_ and waits for this gate). The lock is released
+    // on a false return.
     bool enter_submit() {
         submit_mutex_.lock();
         if (submit_fatal_) {

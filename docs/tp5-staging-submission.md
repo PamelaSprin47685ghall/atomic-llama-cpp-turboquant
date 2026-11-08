@@ -94,7 +94,13 @@ process exit. Other backends report `0`/`false`.
   The pool publishes `submit_gate_held_` in `enter_submit()` and clears it in
   `leave_submit()`; note_source reads it, skips, and counts a fast miss. A
   successful try_lock would drop the gate, so the flag is the contract, not a
-  hint.
+  hint. The flag alone is not the deadlock proof: a gate can start between
+  the flag load and the pool lock (TOCTOU), so note_source uses
+  `mutex_.try_lock()` and counts a fast miss when it is contended. It never
+  waits for `mutex_`; a blocking lock would close the cycle
+  note_source -> mutex_ -> submit gate -> note_source when the gate holder
+  waits for the note. The gate flag is rechecked after the try_lock so a gate
+  that started in that window still counts as a fast miss.
 - **llama_context / llama_free**: `llama_free` queries
   `llama_context::has_unproven()` (and the relay status) while every member is
   still alive. If either is pending it does **not** delete the context: it
@@ -284,8 +290,13 @@ held while the backend set path calls `note_source()` on the same thread. It
 checks that note_source does not try_lock the owned gate, does not drop it
 while a second entrant waits, and does not take `mutex_` while a fatal
 publication is waiting for the gate; the same-thread and concurrent calls are
-counted as fast misses. The fatal path then completes after `leave_submit()`
-with the unknown-work record intact.
+counted as fast misses. It also constructs the check-then-lock TOCTOU: a
+waiter holds `mutex_` inside `event_sync`, note_source sees
+`submit_gate_held_=false` and must return without waiting for the pool lock,
+then the gate holder waits for the note and the waiter fails into the fatal
+publication. The blocking design fails this case with the explicit
+`note_source blocked on mutex_ (TOCTOU cycle)` message. The fatal path then
+completes after `leave_submit()` with the unknown-work record intact.
 
 The context-retain test covers, without a model: the live-context reference
 (free-before-context deferral, last-release delete, new-context refusal after
