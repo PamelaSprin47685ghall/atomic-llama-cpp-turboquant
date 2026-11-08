@@ -404,6 +404,9 @@ struct provider {
     std::array<frame, ggml_relay_plan::frame_capacity_max> frames;
     ggml_relay_plan::frame_lru             frame_lru{ 2 };
     ggml_relay_plan::plan_cache            plan_cache;
+    // Exact per-slot terminal binding snapshot. The key's digest selects the
+    // slot; this snapshot proves a hit before its generation is reused.
+    std::array<ggml_relay_plan::binding_set, ggml_relay_plan::plan_capacity> plan_bindings;
     bool                                   plan_cache_enabled = false;
     bool                                   plan_verify_uid = false;
     bool                                   plan_stats_enabled = false;
@@ -1279,7 +1282,7 @@ bool flush_all_plans(provider & p, bool emit_events) {
 // validation result; a key hit with different bindings is a key bug and fails
 // closed instead of silently sharing a generation.
 bool plan_generation_for(provider & p, const ggml_relay_plan_key * key, size_t count, bool same_plan,
-                         uint64_t binding, uint64_t & generation) {
+                         const ggml_tensor * const * terminals, uint64_t binding, uint64_t & generation) {
     if (!p.plan_cache_enabled || key == nullptr) {
         p.plan_cache_generation = false;
         if (!p.plan_cache_enabled && !p.plan_key_absent_logged) {
@@ -1308,13 +1311,20 @@ bool plan_generation_for(provider & p, const ggml_relay_plan_key * key, size_t c
     }
     pk.channels = uint32_t(count);
     pk.binding  = binding;
-    // A key hit is a plan-identity hit: the key carries the terminal binding
-    // digest. same_plan only says whether the provider's CURRENT channels
-    // already match this prepare; after a tail switch (180 <-> 181 channels)
-    // they describe the other plan, so same_plan=false must NOT be treated as
-    // a key bug. prepare_impl rebinds the channels when !same_plan; reusing
-    // the cached generation is correct and the runtime keeps that plan's slot.
-    // A genuinely different binding has a different digest and is a miss.
+    // A key hit is a plan-identity candidate: the key carries the terminal
+    // binding digest, and the slot's exact binding snapshot is the authority.
+    // same_plan only says whether the provider's CURRENT channels already
+    // match this prepare; after a tail switch (180 <-> 181 channels) they
+    // describe the other plan, so same_plan=false is not a key bug. A digest
+    // collision with a different real binding is caught here and fails
+    // closed; a genuinely different binding normally has a different digest
+    // and is a miss.
+    const auto * existing = p.plan_cache.find(pk);
+    if (existing != nullptr &&
+        !ggml_relay_plan::binding_matches(p.plan_bindings[existing->index], terminals, count)) {
+        fail(p, EPROTO, "relay plan key collided with a different terminal binding");
+        return false;
+    }
     uint64_t evicted = 0;
     ggml_relay_plan::plan_slot * slot = p.plan_cache.acquire(pk, p.plan_epoch, &evicted);
     if (slot == nullptr) {
@@ -1323,6 +1333,9 @@ bool plan_generation_for(provider & p, const ggml_relay_plan_key * key, size_t c
     }
     if (evicted != 0 && !retire_plan(p, evicted, true)) {
         return false;
+    }
+    if (existing == nullptr) {
+        ggml_relay_plan::snapshot_binding(p.plan_bindings[slot->index], terminals, count);
     }
     p.plan_cache_generation = true;
     generation = slot->generation;
@@ -1415,7 +1428,7 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
     uint64_t generation = 0;
     const uint64_t binding = (p.plan_cache_enabled && key != nullptr)
         ? binding_fingerprint(terminals, count) : 0;
-    if (!plan_generation_for(p, key, count, same_plan, binding, generation)) {
+    if (!plan_generation_for(p, key, count, same_plan, terminals, binding, generation)) {
         return false;
     }
     if (!same_plan) {

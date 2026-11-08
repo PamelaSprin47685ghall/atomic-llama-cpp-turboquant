@@ -410,6 +410,70 @@ void test_channel_slots() {
     CHECK(table.live_channels() == 0);
 }
 
+void test_binding_snapshot() {
+    using ggml_relay_plan::binding_matches;
+    using ggml_relay_plan::binding_set;
+    using ggml_relay_plan::snapshot_binding;
+
+    ggml_tensor t0 = {};
+    ggml_tensor t1 = {};
+    t0.data = &t0;
+    t1.data = &t1;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        t0.ne[d] = 10 + d;
+        t1.ne[d] = 20 + d;
+        t0.nb[d] = 100 + d;
+        t1.nb[d] = 200 + d;
+    }
+    std::array<const ggml_tensor *, GGML_RELAY_RANKS * 2> terms{};
+    for (std::size_t r = 0; r < GGML_RELAY_RANKS; ++r) {
+        terms[r]                    = &t0;
+        terms[GGML_RELAY_RANKS + r] = &t1;
+    }
+
+    auto set = std::make_unique<binding_set>();
+    snapshot_binding(*set, terms.data(), 2);
+    CHECK(binding_matches(*set, terms.data(), 2));
+
+    // The digest is only a filter. Each real binding fact must be compared:
+    // a digest collision that reused a different binding is caught here and
+    // fails closed.
+    void * saved_data = t1.data;
+    t1.data = &t0;
+    CHECK(!binding_matches(*set, terms.data(), 2));
+    t1.data = saved_data;
+
+    t1.ne[2] += 1;
+    CHECK(!binding_matches(*set, terms.data(), 2));
+    t1.ne[2] -= 1;
+
+    t1.nb[3] += 8;
+    CHECK(!binding_matches(*set, terms.data(), 2));
+    t1.nb[3] -= 8;
+
+    terms[GGML_RELAY_RANKS] = &t0; // terminal pointer changed
+    CHECK(!binding_matches(*set, terms.data(), 2));
+    terms[GGML_RELAY_RANKS] = &t1;
+    CHECK(binding_matches(*set, terms.data(), 2));
+
+    // Same key (including the same digest) but a different real binding is
+    // exactly the fail-closed case: the cache finds the slot, the full
+    // snapshot comparison rejects it.
+    plan_cache collided;
+    plan_key key = make_key(12, 1);
+    key.binding  = 0x5a5a5a5a;
+    const plan_slot * slot = collided.acquire(key, 1);
+    CHECK(slot != nullptr);
+    auto stored = std::make_unique<binding_set>();
+    snapshot_binding(*stored, terms.data(), 2);
+    void * saved2 = t1.data;
+    t1.data = &t0;
+    CHECK(collided.find(key) != nullptr);              // digest alone still matches
+    CHECK(!binding_matches(*stored, terms.data(), 2)); // full check rejects
+    t1.data = saved2;
+    CHECK(binding_matches(*stored, terms.data(), 2));
+}
+
 void test_config() {
     config cfg;
     char error[160] = {};
@@ -479,6 +543,7 @@ int main() {
     test_frame_lru();
     test_pool_layout();
     test_channel_slots();
+    test_binding_snapshot();
     test_config();
     if (failures != 0) {
         std::fprintf(stderr, "RELAY_PLAN_POLICY_TEST FAIL %d\n", failures);

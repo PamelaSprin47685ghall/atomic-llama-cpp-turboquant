@@ -117,7 +117,51 @@ struct plan_slot {
     std::uint64_t last_used  = 0;
     std::uint32_t pins       = 0;
     std::uint32_t channels   = 0;
+    std::uint32_t index      = 0; // slot position, indexes the binding snapshot
 };
+
+// Exact terminal binding snapshot for one plan slot. The key's `binding`
+// digest is only a fast filter: a hit must also pass this full comparison.
+// A 64-bit digest collision therefore fails closed instead of reusing a
+// different binding. 256 channels x 5 ranks x (2 pointers + 4 ne + 4 nb).
+struct binding_entry {
+    const ggml_tensor * terminal        = nullptr;
+    void *              data            = nullptr;
+    std::int64_t        ne[GGML_MAX_DIMS] = {};
+    std::size_t         nb[GGML_MAX_DIMS] = {};
+};
+
+using binding_set = std::array<std::array<binding_entry, GGML_RELAY_RANKS>, channel_capacity>;
+
+inline void snapshot_binding(binding_set & out, const ggml_tensor * const * terminals,
+                             std::size_t count) noexcept {
+    for (std::size_t c = 0; c < count; ++c) {
+        for (std::size_t r = 0; r < GGML_RELAY_RANKS; ++r) {
+            const ggml_tensor * t = terminals[c * GGML_RELAY_RANKS + r];
+            binding_entry & e = out[c][r];
+            e.terminal = t;
+            e.data     = t->data;
+            std::memcpy(e.ne, t->ne, sizeof(e.ne));
+            std::memcpy(e.nb, t->nb, sizeof(e.nb));
+        }
+    }
+}
+
+inline bool binding_matches(const binding_set & set, const ggml_tensor * const * terminals,
+                            std::size_t count) noexcept {
+    for (std::size_t c = 0; c < count; ++c) {
+        for (std::size_t r = 0; r < GGML_RELAY_RANKS; ++r) {
+            const ggml_tensor * t = terminals[c * GGML_RELAY_RANKS + r];
+            const binding_entry & e = set[c][r];
+            if (e.terminal != t || e.data != t->data ||
+                std::memcmp(e.ne, t->ne, sizeof(e.ne)) != 0 ||
+                std::memcmp(e.nb, t->nb, sizeof(e.nb)) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 // Fixed-capacity plan cache. Hit touches the slot and returns it without
 // pinning: begin() pins, finish() releases. A miss inserts into an empty slot
@@ -169,6 +213,7 @@ public:
         slot.last_used  = epoch;
         slot.pins       = 0;
         slot.channels   = key.channels;
+        slot.index      = static_cast<std::uint32_t>(index);
         ++stats_.inserts;
         return &slot;
     }

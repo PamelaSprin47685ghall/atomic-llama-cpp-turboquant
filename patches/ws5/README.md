@@ -96,17 +96,25 @@ A key hit must not be compared against the provider's *current* channels:
 after a tail switch between the 180- and 181-channel plans, the current
 channels describe the other plan, so `same_plan` is false even though the
 cached plan is the right one. A cached key hit reuses that plan's generation
-and rebinds the channels; different bindings have a different digest and are
-a miss. The only remaining key fail-closed is an explicit channel-count
-contradiction between the caller's key and the prepared terminals. The digest
-is computed only when the plan cache is enabled and a key is present, so flag
-0 keeps the legacy path.
+and rebinds the channels; a genuinely different binding has a different
+digest and is a miss.
+
+The digest is only a fast filter, so every plan slot also stores an exact
+terminal binding snapshot: terminal and data pointers plus `ne`/`nb` for every
+channel and rank (819 KB per provider for 8 slots). A hit compares that
+snapshot in full before reusing the generation. A 64-bit digest collision that
+names a different real binding therefore fails closed with
+`relay plan key collided with a different terminal binding`, not a silent
+reuse. The snapshot is written on insert and overwritten when the slot is
+reused; the explicit key->channels vs prepared-count contradiction remains a
+key-consistency failure. The digest and snapshot are used only when the plan
+cache is enabled and a key is present, so flag 0 keeps the legacy path.
 
 The provider-create line ends with `key_digest=1` when the build contains this
-fix. A rerun log without that marker used an older installed
-`libggml-hip.so`; check it before attributing a remaining collision to the
-code. A rerun with the marker should show the catch-up as a plan-cache hit
-(or a new insert) and no `relay plan key collided` failure.
+fix. That marker is build freshness only, not a correctness proof: the
+correctness evidence is the full-snapshot comparison in the code and the CPU
+tests below. A rerun log without the marker used an older installed
+`libggml-hip.so`.
 
 ## Two plan-key domains (not the same type)
 
