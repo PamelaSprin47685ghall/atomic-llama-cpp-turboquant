@@ -297,18 +297,24 @@ llama_kv_cache::llama_kv_cache(
 
     // The decode-time pools allocate here, before the relay service and the
     // first decode exist. The first prepare then only reuses them; a later
-    // larger batch still grows the pools.
-    snapshots.reserve(8);
+    // larger batch still grows the pools. Flags off keep the old path free of
+    // these startup allocations.
+    const bool pool_decode = tp5::flag_exact_one("TP5_KV_SNAPSHOT_POOL") ||
+                             tp5::flag_exact_one("TP5_DECODE_SCRATCH_POOL");
+
+    if (pool_decode) {
+        snapshots.reserve(8);
+
+        decode_scratch_.sinfos.reserve(8);
+        decode_scratch_.ubatches.reserve(8);
+        decode_scratch_.states.reserve(8);
+        decode_scratch_.pooled.reserve(8);
+        decode_scratch_.fallback.reserve(8);
+    }
 
     if (tp5::flag_exact_one("TP5_DECODE_SCRATCH_POOL")) {
         scratch_pool.reserve(2);
     }
-
-    decode_scratch_.sinfos.reserve(8);
-    decode_scratch_.ubatches.reserve(8);
-    decode_scratch_.states.reserve(8);
-    decode_scratch_.pooled.reserve(8);
-    decode_scratch_.fallback.reserve(8);
 
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
