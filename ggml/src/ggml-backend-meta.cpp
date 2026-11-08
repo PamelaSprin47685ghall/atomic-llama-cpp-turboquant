@@ -83,8 +83,50 @@ struct staging_meta_diag {
     std::atomic<uint64_t> generic{0};
     std::atomic<uint64_t> lease_ok{0};
     std::atomic<uint64_t> lease_fail{0};
+    std::atomic<uint64_t> async_mirrored{0};
+    std::atomic<uint64_t> async_api_null{0};
+    std::atomic<uint64_t> async_disabled{0};
+    std::atomic<uint64_t> async_not_eligible{0};
+    std::atomic<uint64_t> async_eligible{0};
+    std::atomic<uint64_t> async_lease_ok{0};
+    std::atomic<uint64_t> async_lease_fail{0};
 };
 static staging_meta_diag g_staging_meta_diag;
+
+static bool staging_diag_enabled() {
+    static const bool on = [] {
+        const char * v = std::getenv("GGML_TP5_STAGING_DIAG");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+static void staging_log_reject(const char * lane, const ggml_tensor * tensor, size_t size) {
+    if (!staging_diag_enabled()) {
+        return;
+    }
+    static std::atomic<int> budget{512};
+    if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
+        return;
+    }
+    const char * reason = "unknown";
+    if (tensor == nullptr) {
+        reason = "null";
+    } else if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) == 0) {
+        reason = "no_input_flag";
+    } else if (size == 0) {
+        reason = "zero_size";
+    } else if (size > kMaxStagingBytes) {
+        reason = "size";
+    } else if (ggml_cuda_staging::classify_name(tensor->name) == ggml_cuda_staging::kind::generic &&
+               size > ggml_cuda_staging::kGenericMaxBytes) {
+        reason = "generic_size";
+    }
+    std::fprintf(stderr, "TP5_STAGING_REJECT lane=%s reason=%s name=%s flags=0x%x size=%zu type=%s\n",
+                 lane, reason, tensor != nullptr ? tensor->name : "(null)",
+                 tensor != nullptr ? unsigned(tensor->flags) : 0u, size,
+                 tensor != nullptr ? ggml_type_name(tensor->type) : "?");
+}
 
 extern "C" void ggml_backend_meta_staging_diag_dump() {
     std::fprintf(stderr,
@@ -98,6 +140,16 @@ extern "C" void ggml_backend_meta_staging_diag_dump() {
         (unsigned long long) g_staging_meta_diag.generic.load(std::memory_order_relaxed),
         (unsigned long long) g_staging_meta_diag.lease_ok.load(std::memory_order_relaxed),
         (unsigned long long) g_staging_meta_diag.lease_fail.load(std::memory_order_relaxed));
+    std::fprintf(stderr,
+        "TP5_STAGING_META_ASYNC mirrored=%llu api_null=%llu disabled=%llu not_eligible=%llu "
+        "eligible=%llu lease_ok=%llu lease_fail=%llu\n",
+        (unsigned long long) g_staging_meta_diag.async_mirrored.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.async_api_null.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.async_disabled.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.async_not_eligible.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.async_eligible.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.async_lease_ok.load(std::memory_order_relaxed),
+        (unsigned long long) g_staging_meta_diag.async_lease_fail.load(std::memory_order_relaxed));
 }
 
 struct ggml_backend_meta_device;
@@ -1680,6 +1732,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 g_staging_meta_diag.disabled.fetch_add(1, std::memory_order_relaxed);
             } else if (!staging_hit) {
                 g_staging_meta_diag.not_eligible.fetch_add(1, std::memory_order_relaxed);
+                staging_log_reject("sync", tensor, size);
             } else {
                 g_staging_meta_diag.eligible.fetch_add(1, std::memory_order_relaxed);
                 if (staging_kind == ggml_cuda_staging::kind::generic) {
@@ -2227,9 +2280,22 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
+            g_staging_meta_diag.async_mirrored.fetch_add(1, std::memory_order_relaxed);
             const ggml_cuda_staging::api * st = staging_api();
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
-            if (st != nullptr && st->enabled() && staging_eligible(tensor, size, &staging_kind)) {
+            const bool staging_on = st != nullptr && st->enabled();
+            const bool staging_hit = staging_on && staging_eligible(tensor, size, &staging_kind);
+            if (st == nullptr) {
+                g_staging_meta_diag.async_api_null.fetch_add(1, std::memory_order_relaxed);
+            } else if (!staging_on) {
+                g_staging_meta_diag.async_disabled.fetch_add(1, std::memory_order_relaxed);
+            } else if (!staging_hit) {
+                g_staging_meta_diag.async_not_eligible.fetch_add(1, std::memory_order_relaxed);
+                staging_log_reject("async", tensor, size);
+            } else {
+                g_staging_meta_diag.async_eligible.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (staging_hit) {
                 bool ranks_ok = true;
                 for (size_t j = 0; j < n_backends && ranks_ok; j++) {
                     ranks_ok = st->can_enqueue_async(
@@ -2237,7 +2303,10 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
                         ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size);
                 }
                 ggml_cuda_staging::lease staged_lease;
-                if (ranks_ok && st->acquire(kStagingWindow, staging_kind, size, &staged_lease)) {
+                // Never wait a pending slot here: the async lane must not block
+                // the pipeline. A miss falls back to the pageable path.
+                if (ranks_ok && st->acquire_nowait(kStagingWindow, staging_kind, size, &staged_lease)) {
+                    g_staging_meta_diag.async_lease_ok.fetch_add(1, std::memory_order_relaxed);
                     if (st->upload(&staged_lease, data, size)) {
                         bool queued = true;
                         for (size_t j = 0; j < n_backends; j++) {
@@ -2256,6 +2325,8 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
                     } else {
                         st->release(&staged_lease);
                     }
+                } else if (ranks_ok) {
+                    g_staging_meta_diag.async_lease_fail.fetch_add(1, std::memory_order_relaxed);
                 }
             }
             for (size_t j = 0; j < n_backends; j++) {

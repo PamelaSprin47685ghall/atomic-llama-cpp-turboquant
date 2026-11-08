@@ -154,9 +154,10 @@ public:
     }
 
     // Reuses a slot for (window, kind). Grows a free slot within the pool cap.
-    // A leased slot is never reused: when both slots are leased the call fails
-    // and the caller falls back. A pending but unleased slot is waited first.
-    bool acquire(uint32_t window, kind k, size_t bytes, lease * out) {
+    // A leased slot is never reused. A pending but unleased slot is waited
+    // only when wait_pending is true; the async lane passes false so it never
+    // blocks a pipeline on an in-flight event and falls back instead.
+    bool acquire(uint32_t window, kind k, size_t bytes, lease * out, bool wait_pending = true) {
         if (out == nullptr || bytes == 0 || window >= kWindows || size_t(k) >= kKindCount) {
             std::lock_guard<std::mutex> lock(mutex_);
             stats_.invalid++;
@@ -185,7 +186,7 @@ public:
             }
         }
         // 3) Free but pending, large enough: wait, then reuse.
-        if (chosen == nullptr) {
+        if (chosen == nullptr && wait_pending) {
             for (auto & s : key) {
                 if (!s.leased && s.cap >= bytes) {
                     chosen = &s;
@@ -194,7 +195,7 @@ public:
             }
         }
         // 4) Free but pending, grow after the wait.
-        if (chosen == nullptr) {
+        if (chosen == nullptr && wait_pending) {
             for (auto & s : key) {
                 if (!s.leased) {
                     chosen = &s;
@@ -202,7 +203,8 @@ public:
                 }
             }
         }
-        // 5) Both slots are leased. Never steal a live lease.
+        // 5) No usable slot. Never steal a live lease and never wait unless
+        //    the caller asked for it.
         if (chosen == nullptr) {
             stats_.no_slot++;
             return false;
@@ -229,16 +231,21 @@ public:
         if (src == nullptr || bytes == 0) {
             return false;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
-        slot * s = find_locked(l);
-        if (s == nullptr || bytes > s->cap) {
-            stats_.invalid++;
-            return false;
+        uint8_t * host = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            slot * s = find_locked(l);
+            if (s == nullptr || bytes > s->cap) {
+                stats_.invalid++;
+                return false;
+            }
+            host = s->host;
+            stats_.uploads++;
+            stats_.upload_bytes += bytes;
+            stats_.upload_bytes_by_kind[size_t(l.which)] += bytes;
         }
-        std::memcpy(s->host, src, bytes);
-        stats_.uploads++;
-        stats_.upload_bytes += bytes;
-        stats_.upload_bytes_by_kind[size_t(l.which)] += bytes;
+        // The slot is leased, so the pointer cannot be reused while copying.
+        std::memcpy(host, src, bytes);
         return true;
     }
 
@@ -256,19 +263,23 @@ public:
             return false;
         }
         const size_t span = (rows - 1) * dst_stride + row_bytes;
-        std::lock_guard<std::mutex> lock(mutex_);
-        slot * s = find_locked(l);
-        if (s == nullptr || span > s->cap) {
-            stats_.invalid++;
-            return false;
+        uint8_t * host = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            slot * s = find_locked(l);
+            if (s == nullptr || span > s->cap) {
+                stats_.invalid++;
+                return false;
+            }
+            host = s->host;
+            stats_.uploads++;
+            stats_.upload_bytes += span;
+            stats_.upload_bytes_by_kind[size_t(l.which)] += span;
         }
         const auto * p = static_cast<const uint8_t *>(src);
         for (size_t r = 0; r < rows; ++r) {
-            std::memcpy(s->host + r * dst_stride, p + r * src_stride, row_bytes);
+            std::memcpy(host + r * dst_stride, p + r * src_stride, row_bytes);
         }
-        stats_.uploads++;
-        stats_.upload_bytes += span;
-        stats_.upload_bytes_by_kind[size_t(l.which)] += span;
         return true;
     }
 
@@ -349,6 +360,12 @@ public:
 
     // Diagnostics only: counts whether a copy source belongs to the pool.
     void note_source(const void * p, size_t bytes) {
+        // No slot has ever been allocated: this is the common case while the
+        // weights load. Skip the lock entirely.
+        if (!has_host_.load(std::memory_order_relaxed)) {
+            misses_fast_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         if (owns_locked(p, bytes)) {
             stats_.hits++;
@@ -359,7 +376,9 @@ public:
 
     stats snapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return stats_;
+        stats copy = stats_;
+        copy.misses += misses_fast_.load(std::memory_order_relaxed);
+        return copy;
     }
 
     void dump(std::FILE * f) const {
@@ -376,6 +395,7 @@ public:
             std::fprintf(f, "TP5_STAGING kind=%s upload_bytes=%llu\n", names[k],
                          (unsigned long long) stats_.upload_bytes_by_kind[k]);
         }
+        const uint64_t misses = stats_.misses + misses_fast_.load(std::memory_order_relaxed);
         std::fprintf(f,
             "TP5_STAGING leases=%llu uploads=%llu upload_bytes=%llu waits=%llu wait_ms=%.3f "
             "enqueues=%llu releases=%llu hits=%llu misses=%llu oversize=%llu alloc_fail=%llu "
@@ -388,7 +408,7 @@ public:
             (unsigned long long) stats_.enqueues,
             (unsigned long long) stats_.releases,
             (unsigned long long) stats_.hits,
-            (unsigned long long) stats_.misses,
+            (unsigned long long) misses,
             (unsigned long long) stats_.oversize,
             (unsigned long long) stats_.alloc_fail,
             (unsigned long long) stats_.stale_release,
@@ -492,6 +512,7 @@ private:
             d = nullptr;
         }
         bytes_used_ = used + bytes;
+        has_host_.store(true, std::memory_order_relaxed);
         return true;
     }
 
@@ -501,6 +522,8 @@ private:
     size_t bytes_used_ = 0;
     uint64_t next_epoch_ = 1;
     std::atomic<bool> disabled_{false};
+    std::atomic<bool> has_host_{false};
+    mutable std::atomic<uint64_t> misses_fast_{0};
     stats stats_;
     std::array<std::array<rotation, kKindCount>, kWindows> slots_ = {};
 };
@@ -522,6 +545,9 @@ struct api {
     // first and waits all events once instead of syncing each rank in turn.
     bool (*merge_wait)();
     bool (*acquire)(uint32_t window, kind k, size_t bytes, lease * out);
+    // Never waits a pending slot; the async lane uses it so an in-flight
+    // event cannot block the pipeline.
+    bool (*acquire_nowait)(uint32_t window, kind k, size_t bytes, lease * out);
     bool (*upload)(const lease * l, const void * src, size_t bytes);
     bool (*upload_rows)(const lease * l, const void * src, size_t src_stride,
                         size_t dst_stride, size_t row_bytes, size_t rows);
