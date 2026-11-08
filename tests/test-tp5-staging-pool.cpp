@@ -309,6 +309,37 @@ int test_enqueue_wait() {
     return 0;
 }
 
+int test_merged_wait() {
+    pool p(fake_ops());
+    uint8_t src[64];
+    std::memset(src, 0x44, sizeof(src));
+    uint8_t dst[5][64] = {};
+
+    lease a;
+    CHECK(p.acquire(0, kind::mtp_h, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)));
+
+    const int copies_before = g_copies;
+    const int syncs_before = g_syncs;
+    const uint64_t enqueues_before = p.snapshot().enqueues;
+    for (int rank = 0; rank < 5; ++rank) {
+        CHECK(p.enqueue(a, rank, dst[rank], sizeof(src), nullptr));
+    }
+    CHECK(g_copies == copies_before + 5);
+    CHECK(p.snapshot().enqueues == enqueues_before + 5);
+
+    // One wait covers all five rank events.
+    const uint64_t waits_before = p.snapshot().waits;
+    CHECK(p.wait(a));
+    CHECK(g_syncs == syncs_before + 5);
+    CHECK(p.snapshot().waits == waits_before + 1);
+    for (int rank = 0; rank < 5; ++rank) {
+        CHECK(std::memcmp(dst[rank], src, sizeof(src)) == 0);
+    }
+    p.release(a);
+    return 0;
+}
+
 int test_wait_failure_disables() {
     pool p(fake_ops());
     uint8_t src[64] = {};
@@ -373,6 +404,7 @@ int main() {
         {"upload_bounds",              test_upload_bounds},
         {"upload_rows",                test_upload_rows},
         {"enqueue_wait",               test_enqueue_wait},
+        {"merged_wait",                test_merged_wait},
         {"wait_failure_disables",      test_wait_failure_disables},
         {"owns_and_diagnostics",       test_owns_and_diagnostics},
         {"device_ptr",                 test_device_ptr},

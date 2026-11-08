@@ -875,6 +875,36 @@ bool enqueue_async_impl(const lease & l, ggml_backend_t backend,
                                  (char *) tensor->data + offset, size, cuda_ctx->stream());
 }
 
+// Merge-wait lane for the synchronous MIRRORED path. It uses the same
+// per-thread stream as ggml_backend_cuda_buffer_set_tensor, so ordering with
+// the surrounding synchronous copies is unchanged; only the wait is merged.
+bool can_enqueue_sync_impl(ggml_tensor * tensor, size_t offset, size_t size) {
+    if (tensor == nullptr || size == 0) {
+        return false;
+    }
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (buf == nullptr || !ggml_backend_buffer_is_cuda(buf)) {
+        return false;
+    }
+    const auto * buf_ctx = static_cast<ggml_backend_cuda_buffer_context *>(buf->context);
+    if (buf_ctx->device < 0 || buf_ctx->device >= int(kRanks)) {
+        return false;
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    return offset <= nbytes && size <= nbytes - offset;
+}
+
+bool enqueue_sync_impl(const lease & l, ggml_tensor * tensor, size_t offset, size_t size) {
+    if (!can_enqueue_sync_impl(tensor, offset, size)) {
+        return false;
+    }
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    const auto * buf_ctx = static_cast<ggml_backend_cuda_buffer_context *>(buf->context);
+    ggml_cuda_set_device(buf_ctx->device);
+    return global_pool().enqueue(l, buf_ctx->device,
+                                 (char *) tensor->data + offset, size, cudaStreamPerThread);
+}
+
 }  // namespace ggml_cuda_staging
 
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {

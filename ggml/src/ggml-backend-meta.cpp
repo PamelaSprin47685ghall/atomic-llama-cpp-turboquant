@@ -1677,12 +1677,40 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 ggml_cuda_staging::lease staged_lease;
                 if (st->acquire(kStagingWindow, staging_kind, size, &staged_lease)) {
                     if (st->upload(&staged_lease, data, size)) {
-                        for (size_t j = 0; j < n_bufs; j++) {
-                            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                            ggml_backend_tensor_set(simple_tensor, staged_lease.host, offset, size);
+                        bool merged = false;
+                        if (st->merge_wait()) {
+                            // P8b: enqueue every rank first, then wait all events
+                            // once. The copies run on the same per-thread stream
+                            // as the synchronous set_tensor they replace.
+                            bool ranks_ok = true;
+                            for (size_t j = 0; j < n_bufs && ranks_ok; j++) {
+                                ranks_ok = st->can_enqueue_sync(
+                                    ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size);
+                            }
+                            if (ranks_ok) {
+                                bool queued = true;
+                                for (size_t j = 0; j < n_bufs; j++) {
+                                    if (!st->enqueue_sync(&staged_lease,
+                                            ggml_backend_meta_buffer_simple_tensor(tensor, j), offset, size)) {
+                                        queued = false;
+                                        break;
+                                    }
+                                }
+                                if (queued) {
+                                    (void) st->wait(&staged_lease);
+                                    st->release(&staged_lease);
+                                    merged = true;
+                                }
+                            }
                         }
-                        (void) st->wait(&staged_lease);
-                        st->release(&staged_lease);
+                        if (!merged) {
+                            for (size_t j = 0; j < n_bufs; j++) {
+                                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                                ggml_backend_tensor_set(simple_tensor, staged_lease.host, offset, size);
+                            }
+                            (void) st->wait(&staged_lease);
+                            st->release(&staged_lease);
+                        }
                         break;
                     }
                     st->release(&staged_lease);

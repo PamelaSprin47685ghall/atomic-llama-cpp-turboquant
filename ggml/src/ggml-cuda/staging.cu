@@ -120,9 +120,14 @@ bool api_enqueue_async(const lease * l, ggml_backend_t backend, ggml_tensor * te
     return l != nullptr && enqueue_async_impl(*l, backend, tensor, offset, size);
 }
 
+bool api_enqueue_sync(const lease * l, ggml_tensor * tensor, size_t offset, size_t size) {
+    return l != nullptr && enqueue_sync_impl(*l, tensor, offset, size);
+}
+
 const api kApi = {
     /* .abi_version       = */ 1,
     /* .enabled           = */ enabled,
+    /* .merge_wait        = */ merge_wait_enabled,
     /* .acquire           = */ api_acquire,
     /* .upload            = */ api_upload,
     /* .upload_rows       = */ api_upload_rows,
@@ -133,6 +138,8 @@ const api kApi = {
     /* .dump              = */ api_dump,
     /* .can_enqueue_async = */ can_enqueue_async_impl,
     /* .enqueue_async     = */ api_enqueue_async,
+    /* .can_enqueue_sync  = */ can_enqueue_sync_impl,
+    /* .enqueue_sync      = */ api_enqueue_sync,
     /* .zc_enabled        = */ api_zc_enabled,
 };
 
@@ -150,6 +157,14 @@ bool enabled() {
         return v != nullptr && std::strcmp(v, "1") == 0;
     }();
     return flag && global_pool().usable();
+}
+
+bool merge_wait_enabled() {
+    static const bool flag = [] {
+        const char * v = std::getenv("GGML_TP5_STAGING_MERGE_WAIT");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return flag && enabled();
 }
 
 bool zc_enabled() {

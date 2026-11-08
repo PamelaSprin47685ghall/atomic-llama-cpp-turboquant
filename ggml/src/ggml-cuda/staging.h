@@ -463,6 +463,7 @@ private:
 // Process-wide pool. Defined by the GPU backend; never linked into ggml-base.
 pool & global_pool();
 bool enabled();
+bool merge_wait_enabled();
 void init();
 bool zc_enabled();
 void dump();
@@ -472,6 +473,9 @@ void dump();
 struct api {
     uint32_t abi_version;
     bool (*enabled)();
+    // GGML_TP5_STAGING_MERGE_WAIT: the sync MIRRORED path enqueues every rank
+    // first and waits all events once instead of syncing each rank in turn.
+    bool (*merge_wait)();
     bool (*acquire)(uint32_t window, kind k, size_t bytes, lease * out);
     bool (*upload)(const lease * l, const void * src, size_t bytes);
     bool (*upload_rows)(const lease * l, const void * src, size_t src_stride,
@@ -486,6 +490,11 @@ struct api {
                               size_t offset, size_t size);
     bool (*enqueue_async)(const lease * l, ggml_backend_t backend,
                           ggml_tensor * tensor, size_t offset, size_t size);
+    // Merge-wait lane: same-device copies on cudaStreamPerThread, the stream
+    // the synchronous set_tensor uses.
+    bool (*can_enqueue_sync)(ggml_tensor * tensor, size_t offset, size_t size);
+    bool (*enqueue_sync)(const lease * l, ggml_tensor * tensor,
+                         size_t offset, size_t size);
     bool (*zc_enabled)();
 };
 
@@ -494,6 +503,9 @@ bool can_enqueue_async_impl(ggml_backend_t backend, ggml_tensor * tensor,
                             size_t offset, size_t size);
 bool enqueue_async_impl(const lease & l, ggml_backend_t backend,
                         ggml_tensor * tensor, size_t offset, size_t size);
+bool can_enqueue_sync_impl(ggml_tensor * tensor, size_t offset, size_t size);
+bool enqueue_sync_impl(const lease & l, ggml_tensor * tensor,
+                       size_t offset, size_t size);
 
 }  // namespace ggml_cuda_staging
 
