@@ -264,7 +264,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "c8b5b8c0fe8bb811359ea733546cf4a59ad6bcbbe0e2fd94bd9a1cdbf4f58d23",
+      "sha256": "75082db15d47628383c93612e8a066bc6c7ba69ab2acce8626b83526070179f5",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",
@@ -863,7 +863,7 @@
     },
     {
       "path": "tests/test-tp5-staging-pool.cpp",
-      "sha256": "3796398c637a7cf9b868e85779153e8caa802622ab9f3721e2a5c504320c7d39",
+      "sha256": "263a07d174be163705563f1a8da8329252e2bd98307d2ae3cf3500d08486164f",
       "mode": "100644",
       "consumers": [
         "WS4 staging pool CPU test"
