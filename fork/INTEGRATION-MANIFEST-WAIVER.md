@@ -800,6 +800,13 @@ semantics: same-size retained bytes, growth prefix, shrink prefix, short
 capture, short restore, exception unwinding, invalidation and zero size. The
 integrated test has 27 checks, not the source commit's 28.
 
+DevOps ran the checkpoint target once as an equivalent single-file compile
+against the main tree at `e49cac490`: the target has no macros or external
+libraries, so `c++ -std=gnu++17` with the `src` include reproduces its CMake
+properties; the binary ran once with 27 PASS, 0 FAIL and exit 0. Commands and
+output are recorded at `agent://kernel-devops-lock` (t9). This is a CPU
+header-semantics check only, not a CMake/CTest wiring or integration run.
+
 Runtime integration was not executed. No real MTP run, no HIP, no ASan/LSan,
 no full suite and no guard rerun. The first capture in each service round and
 any growth still zero-fill the new storage; same-size or shrink reuse avoids
