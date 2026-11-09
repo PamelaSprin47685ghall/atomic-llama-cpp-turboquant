@@ -608,9 +608,10 @@ struct llama_meta_device_get_split_state_userdata {
 };
 
 // Pure HC layout policy. The replicated local-compute layout qualifies only
-// the main Qwen4Exp trunk with Q8 HC weights. The private MTP-only model has
-// n_layer_nextn > 0 and deliberately keeps its own BF16 HC block, so the
-// switch must not reject it. Exposed for the CPU regression test.
+// the no-MTP Qwen4Exp main trunk with Q8 HC weights. A true MTP-only checkpoint
+// is marked by the absence of blk.0.hc_attn_norm.weight (models/qwen4exp.cpp),
+// not by n_layer_nextn alone: a full trunk can carry a trailing MTP head and
+// must not be skipped into a late allocation error.
 enum llama_hc_layout_validation {
     LLAMA_HC_LAYOUT_SKIP,                 // default static-owner path
     LLAMA_HC_LAYOUT_REJECT_WEIGHT_TYPE,   // replicated main trunk without Q8
@@ -620,10 +621,10 @@ enum llama_hc_layout_validation {
 
 llama_hc_layout_validation llama_hc_layout_validation_for(
         const struct llama_model & model, ggml_type hc_weight_type,
-        bool context_owner, bool replicated);
+        bool context_owner, bool replicated, bool mtp_only);
 
-// Exposed for the CPU regression test. The early policy decisions read only
-// hc_weight_type and the model hparams; they do not touch the loader maps.
+// Exposed for the CPU regression test. The wrapper reads ml.get_weight() for
+// the MTP-only marker before the policy decision; the policy itself is pure.
 void llama_hc_context_owner_validate_layout(
         const struct llama_model & model, const struct llama_model_loader & ml);
 

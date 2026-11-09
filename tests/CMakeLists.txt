@@ -1553,30 +1553,33 @@ endif()
 add_executable(test-tp5-hc-replicated-compute test-tp5-hc-replicated-compute.cpp)
 target_link_libraries(test-tp5-hc-replicated-compute PRIVATE llama)
 target_include_directories(test-tp5-hc-replicated-compute PRIVATE ${PROJECT_SOURCE_DIR}/src)
+set(TP5_HC_TEST_ENV ${CMAKE_COMMAND} -E env
+    --unset=GGML_TP5_HC_CONTEXT_OWNER
+    --unset=GGML_TP5_HC_Q8_WEIGHTS
+    --unset=GGML_TP5_HC_Q4_WEIGHTS)
 add_test(NAME test-tp5-hc-replicated-compute-unset
-    COMMAND ${CMAKE_COMMAND} -E env --unset=TP5_HC_REPLICATED_COMPUTE
+    COMMAND ${TP5_HC_TEST_ENV} --unset=TP5_HC_REPLICATED_COMPUTE
         $<TARGET_FILE:test-tp5-hc-replicated-compute> off)
 add_test(NAME test-tp5-hc-replicated-compute-off
-    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=0
+    COMMAND ${TP5_HC_TEST_ENV} TP5_HC_REPLICATED_COMPUTE=0
         $<TARGET_FILE:test-tp5-hc-replicated-compute> off)
 add_test(NAME test-tp5-hc-replicated-compute-on
-    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=1
+    COMMAND ${TP5_HC_TEST_ENV} TP5_HC_REPLICATED_COMPUTE=1
         $<TARGET_FILE:test-tp5-hc-replicated-compute> on)
 add_test(NAME test-tp5-hc-replicated-compute-invalid
-    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=2
+    COMMAND ${TP5_HC_TEST_ENV} TP5_HC_REPLICATED_COMPUTE=2
         $<TARGET_FILE:test-tp5-hc-replicated-compute> invalid)
 add_test(NAME test-tp5-hc-replicated-compute-conflict
-    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=1 GGML_TP5_HC_CONTEXT_OWNER=1
+    COMMAND ${TP5_HC_TEST_ENV} TP5_HC_REPLICATED_COMPUTE=1 GGML_TP5_HC_CONTEXT_OWNER=1
         $<TARGET_FILE:test-tp5-hc-replicated-compute> conflict)
 add_test(NAME test-tp5-hc-replicated-compute-mtp
-    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=1
+    COMMAND ${TP5_HC_TEST_ENV} TP5_HC_REPLICATED_COMPUTE=1
         $<TARGET_FILE:test-tp5-hc-replicated-compute> mtp)
 add_test(NAME test-tp5-hc-replicated-compute-policy
-    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=1
+    COMMAND ${TP5_HC_TEST_ENV} TP5_HC_REPLICATED_COMPUTE=1
         $<TARGET_FILE:test-tp5-hc-replicated-compute> policy)
 add_test(NAME test-tp5-hc-replicated-compute-validate
-    COMMAND ${CMAKE_COMMAND} -E env --unset=GGML_TP5_HC_Q8_WEIGHTS --unset=GGML_TP5_HC_Q4_WEIGHTS
-        TP5_HC_REPLICATED_COMPUTE=1
+    COMMAND ${TP5_HC_TEST_ENV} TP5_HC_REPLICATED_COMPUTE=1
         $<TARGET_FILE:test-tp5-hc-replicated-compute> validate)
 set_tests_properties(
     test-tp5-hc-replicated-compute-unset

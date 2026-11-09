@@ -521,14 +521,22 @@ static const char * llama_hc_storage_label(const bool context_owner, const bool 
 
 llama_hc_layout_validation llama_hc_layout_validation_for(
         const llama_model & model, const ggml_type hc_weight_type,
-        const bool context_owner, const bool replicated) {
-    // The replicated layout qualifies the main Qwen4Exp trunk only. The
-    // private MTP-only model has n_layer_nextn > 0 and deliberately keeps its
-    // own BF16 HC block; it must load through the static-owner path.
-    const bool main_trunk = model.arch == LLM_ARCH_QWEN4EXP && model.hparams.n_layer_nextn == 0;
+        const bool context_owner, const bool replicated, const bool mtp_only) {
+    // The replicated layout qualifies the no-MTP Qwen4Exp main trunk only.
+    const bool qwen4exp = model.arch == LLM_ARCH_QWEN4EXP;
+    const bool main_trunk = qwen4exp && model.hparams.n_layer_nextn == 0;
     if (replicated && main_trunk) {
         return hc_weight_type == GGML_TYPE_Q8_0 ?
                 LLAMA_HC_LAYOUT_VALIDATE_REPLICATED : LLAMA_HC_LAYOUT_REJECT_WEIGHT_TYPE;
+    }
+    // A full trunk with a trailing MTP head is neither the no-MTP main trunk
+    // nor a true MTP-only checkpoint. Let the exact-profile check reject it
+    // before any buffer allocation instead of skipping to a late allocation
+    // error in the Meta split-state callback.
+    const bool trailing_mtp = replicated && qwen4exp &&
+            model.hparams.n_layer_nextn > 0 && !mtp_only;
+    if (trailing_mtp) {
+        return LLAMA_HC_LAYOUT_VALIDATE_DEFAULT;
     }
     if (!context_owner && hc_weight_type == GGML_TYPE_BF16) {
         return LLAMA_HC_LAYOUT_SKIP;
@@ -542,8 +550,14 @@ void llama_hc_context_owner_validate_layout(const llama_model & model, const lla
     // return. A value other than 0/1 must fail the load instead of being
     // silently ignored when the default BF16 layout is selected.
     const bool replicated = llama_hc_replicated_compute_enabled();
+    // Match the real MTP-only marker used by llama_model_qwen4exp: the
+    // checkpoint carries the trailing NextN block but no trunk blocks, so
+    // blk.0.hc_attn_norm.weight is absent (models/qwen4exp.cpp:327).
+    const bool mtp_only = model.arch == LLM_ARCH_QWEN4EXP &&
+            model.hparams.n_layer_nextn > 0 &&
+            ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr;
     const llama_hc_layout_validation validation =
-            llama_hc_layout_validation_for(model, ml.hc_weight_type, context_owner, replicated);
+            llama_hc_layout_validation_for(model, ml.hc_weight_type, context_owner, replicated, mtp_only);
     if (validation == LLAMA_HC_LAYOUT_SKIP) {
         return;
     }

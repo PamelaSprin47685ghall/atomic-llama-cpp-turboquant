@@ -3,12 +3,13 @@
 // TP5_HC_REPLICATED_COMPUTE selects the historical mirrored local-compute HC
 // storage instead of the default static-owner layout:
 //   * unset/0: an HC pair keeps one complete 320-wide low-rank owner,
-//   * 1: the pair is MIRRORED on all five ranks and the load logs
-//     "mirrored local-compute",
+//   * 1: the pair is MIRRORED on all five ranks; the switch logs its
+//     selection, but the full-model storage-label line is not asserted here,
 //   * any other value: the load throws instead of silently ignoring the flag.
 //
-// The test drives the model's Meta split-state callback directly with a mock
-// Qwen4Exp model and Q8_0 HC pair tensors, so it needs no GGUF and no GPU.
+// The split-state tests drive the Meta callback with mock Qwen4Exp models and
+// Q8_0/BF16 HC pairs. The policy/validate tests exercise the pure validation
+// policy and a synthetic loader; they are unit tests, not real GGUF loads.
 // CTest runs separate processes because the switch is cached for the process
 // lifetime.
 //
@@ -160,8 +161,8 @@ int test_off(fixture & f) {
         return 1;
     }
 
-    if (has("mirrored local-compute")) {
-        std::fprintf(stderr, "FAIL off: the mirrored branch was selected while the switch is off\n");
+    if (has("TP5_HC_REPLICATED_COMPUTE=1")) {
+        std::fprintf(stderr, "FAIL off: the switch log appeared while the switch is off\n");
         return 1;
     }
     return 0;
@@ -193,10 +194,6 @@ int test_on(fixture & f) {
         std::fprintf(stderr, "FAIL on: the switch log line is missing\n");
         return 1;
     }
-    if (!has("mirrored local-compute")) {
-        std::fprintf(stderr, "FAIL on: the mirrored local-compute label is missing\n");
-        return 1;
-    }
     return 0;
 }
 
@@ -217,8 +214,8 @@ int test_invalid(fixture & f) {
         std::fprintf(stderr, "FAIL invalid: TP5_HC_REPLICATED_COMPUTE=2 was silently ignored\n");
         return 1;
     }
-    if (has("mirrored local-compute")) {
-        std::fprintf(stderr, "FAIL invalid: the mirrored branch was selected for an invalid value\n");
+    if (has("TP5_HC_REPLICATED_COMPUTE=1")) {
+        std::fprintf(stderr, "FAIL invalid: the switch was selected for an invalid value\n");
         return 1;
     }
     return 0;
@@ -302,22 +299,27 @@ int test_policy() {
         ggml_type weight_type;
         bool context_owner;
         bool replicated;
+        bool mtp_only;
         llama_hc_layout_validation want;
     };
     const policy_case cases[] = {
-        { "main q8 replicated",   main_model, GGML_TYPE_Q8_0,  false, true,  LLAMA_HC_LAYOUT_VALIDATE_REPLICATED },
-        { "main bf16 replicated", main_model, GGML_TYPE_BF16, false, true,  LLAMA_HC_LAYOUT_REJECT_WEIGHT_TYPE },
-        { "mtp bf16 replicated",  mtp_model,  GGML_TYPE_BF16, false, true,  LLAMA_HC_LAYOUT_SKIP },
-        { "mtp q8 replicated",    mtp_model,  GGML_TYPE_Q8_0, false, true,  LLAMA_HC_LAYOUT_VALIDATE_DEFAULT },
-        { "main q8 default",      main_model, GGML_TYPE_Q8_0, false, false, LLAMA_HC_LAYOUT_VALIDATE_DEFAULT },
-        { "main bf16 default",    main_model, GGML_TYPE_BF16, false, false, LLAMA_HC_LAYOUT_SKIP },
-        { "mtp bf16 default",     mtp_model,  GGML_TYPE_BF16, false, false, LLAMA_HC_LAYOUT_SKIP },
+        { "main q8 replicated",                main_model, GGML_TYPE_Q8_0,  false, true,  false, LLAMA_HC_LAYOUT_VALIDATE_REPLICATED },
+        { "main bf16 replicated",              main_model, GGML_TYPE_BF16, false, true,  false, LLAMA_HC_LAYOUT_REJECT_WEIGHT_TYPE },
+        { "trailing mtp full trunk bf16 repl", mtp_model,  GGML_TYPE_BF16, false, true,  false, LLAMA_HC_LAYOUT_VALIDATE_DEFAULT },
+        { "trailing mtp full trunk q8 repl",   mtp_model,  GGML_TYPE_Q8_0, false, true,  false, LLAMA_HC_LAYOUT_VALIDATE_DEFAULT },
+        { "mtp-only bf16 replicated",          mtp_model,  GGML_TYPE_BF16, false, true,  true,  LLAMA_HC_LAYOUT_SKIP },
+        { "mtp-only q8 replicated",            mtp_model,  GGML_TYPE_Q8_0, false, true,  true,  LLAMA_HC_LAYOUT_VALIDATE_DEFAULT },
+        { "main q8 default",                   main_model, GGML_TYPE_Q8_0,  false, false, false, LLAMA_HC_LAYOUT_VALIDATE_DEFAULT },
+        { "main bf16 default",                 main_model, GGML_TYPE_BF16, false, false, false, LLAMA_HC_LAYOUT_SKIP },
+        { "mtp-only bf16 default",             mtp_model,  GGML_TYPE_BF16, false, false, true,  LLAMA_HC_LAYOUT_SKIP },
+        { "trailing mtp full trunk bf16 def",  mtp_model,  GGML_TYPE_BF16, false, false, false, LLAMA_HC_LAYOUT_SKIP },
+        { "trailing mtp full trunk q8 def",    mtp_model,  GGML_TYPE_Q8_0, false, false, false, LLAMA_HC_LAYOUT_VALIDATE_DEFAULT },
     };
 
     int rc = 0;
     for (const auto & c : cases) {
         const llama_hc_layout_validation got = llama_hc_layout_validation_for(
-                *c.model, c.weight_type, c.context_owner, c.replicated);
+                *c.model, c.weight_type, c.context_owner, c.replicated, c.mtp_only);
         if (got != c.want) {
             std::fprintf(stderr, "FAIL policy %s: got %d, want %d\n",
                     c.name, int(got), int(c.want));
@@ -333,20 +335,80 @@ int test_policy() {
 
 struct loader_fixture {
     gguf_context * meta = nullptr;
+    FILE * file = nullptr;
     std::unique_ptr<llama_model_loader> ml;
 
-    explicit loader_fixture(ggml_type hc_weight_type) {
-        // The validation policy reads only hc_weight_type and the model
-        // hparams on the paths exercised here. An empty GGUF context satisfies
-        // the loader constructor without a model file.
-        meta = gguf_init_empty();
+    explicit loader_fixture(ggml_type hc_weight_type, bool with_trunk_tensor = false) {
         std::vector<std::string> splits;
-        ml = std::make_unique<llama_model_loader>(
-                meta, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
-                /*fname*/ std::string(), splits, /*file*/ nullptr,
-                LLAMA_LOAD_MODE_NONE, /*check_tensors*/ false, /*no_alloc*/ true,
-                /*load_mtp*/ false, /*param_overrides_p*/ nullptr,
-                /*param_tensor_buft_overrides_p*/ nullptr);
+        if (with_trunk_tensor) {
+            // A tiny metadata-only GGUF that carries the trunk marker
+            // blk.0.hc_attn_norm.weight. The loader only needs the weight map
+            // to distinguish a full trunk with a trailing MTP head from a true
+            // MTP-only checkpoint.
+            ggml_init_params ip = { 1u << 20, nullptr, false };
+            ggml_context * ctx = ggml_init(ip);
+            if (ctx == nullptr) {
+                throw std::runtime_error("cannot create the tiny GGUF context");
+            }
+            ggml_tensor * marker = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_name(marker, "blk.0.hc_attn_norm.weight");
+            *static_cast<float *>(marker->data) = 0.0f;
+
+            gguf_context * g = gguf_init_empty();
+            if (g == nullptr) {
+                ggml_free(ctx);
+                throw std::runtime_error("cannot create the tiny GGUF metadata");
+            }
+            gguf_add_tensor(g, marker);
+
+            file = tmpfile();
+            if (file == nullptr || !gguf_write_to_file_ptr(g, file, /*only_meta*/ false)) {
+                if (file != nullptr) {
+                    std::fclose(file);
+                    file = nullptr;
+                }
+                gguf_free(g);
+                ggml_free(ctx);
+                throw std::runtime_error("cannot write the tiny trunk GGUF");
+            }
+            std::fflush(file);
+            std::rewind(file);
+            gguf_free(g);
+            ggml_free(ctx);
+
+            try {
+                ml = std::make_unique<llama_model_loader>(
+                        /*metadata*/ nullptr, /*set_tensor_data*/ nullptr,
+                        /*set_tensor_data_ud*/ nullptr, /*fname*/ std::string(),
+                        splits, file, LLAMA_LOAD_MODE_NONE, /*check_tensors*/ false,
+                        /*no_alloc*/ true, /*load_mtp*/ false,
+                        /*param_overrides_p*/ nullptr,
+                        /*param_tensor_buft_overrides_p*/ nullptr);
+            } catch (...) {
+                std::fclose(file);
+                file = nullptr;
+                throw;
+            }
+        } else {
+            // The empty metadata path needs no file; it is enough for the
+            // policy paths that never consult the weight map.
+            meta = gguf_init_empty();
+            if (meta == nullptr) {
+                throw std::runtime_error("cannot create the empty GGUF metadata");
+            }
+            try {
+                ml = std::make_unique<llama_model_loader>(
+                        meta, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
+                        /*fname*/ std::string(), splits, /*file*/ nullptr,
+                        LLAMA_LOAD_MODE_NONE, /*check_tensors*/ false, /*no_alloc*/ true,
+                        /*load_mtp*/ false, /*param_overrides_p*/ nullptr,
+                        /*param_tensor_buft_overrides_p*/ nullptr);
+            } catch (...) {
+                gguf_free(meta);
+                meta = nullptr;
+                throw;
+            }
+        }
         ml->hc_weight_type = hc_weight_type;
     }
 
@@ -354,6 +416,9 @@ struct loader_fixture {
         ml.reset();
         if (meta != nullptr) {
             gguf_free(meta);
+        }
+        if (file != nullptr) {
+            std::fclose(file);
         }
     }
 };
@@ -378,6 +443,29 @@ int test_validate() {
             llama_hc_context_owner_validate_layout(*mtp_model, *lf.ml);
         } catch (const std::exception & e) {
             std::fprintf(stderr, "FAIL validate mtp bf16: unexpected error: %s\n", e.what());
+            rc = 1;
+        }
+    }
+
+    // A full trunk with a trailing MTP head is not MTP-only: the trunk marker
+    // is present, so the policy must not skip it into a late allocation error.
+    // It must fail the exact-profile check before any buffer allocation.
+    if (rc == 0) {
+        loader_fixture lf(GGML_TYPE_BF16, /*with_trunk_tensor*/ true);
+        bool threw = false;
+        try {
+            llama_hc_context_owner_validate_layout(*mtp_model, *lf.ml);
+        } catch (const std::runtime_error & e) {
+            threw = true;
+            if (std::string(e.what()).find("no MTP") == std::string::npos) {
+                std::fprintf(stderr, "FAIL validate trailing mtp: unexpected error: %s\n", e.what());
+                rc = 1;
+            } else {
+                std::printf("observed error: %s\n", e.what());
+            }
+        }
+        if (!threw && rc == 0) {
+            std::fprintf(stderr, "FAIL validate trailing mtp: the full trunk was skipped instead of rejected early\n");
             rc = 1;
         }
     }
