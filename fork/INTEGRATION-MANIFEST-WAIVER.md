@@ -887,10 +887,16 @@ Cherry-pick `3e65d33a1` -> `97fd640ec` -> `c3e8ce6fa` -> `4fc8cfcaf` ->
 and `no_reservations` are host-ledger facts only, not native-drain claims;
 `held` and `not_ready` entries are retained, and a stale `INPUT_READY` is
 rejected. The map uses the real TQRelay ledger API; no A dependency was
-invented. The candidate `test-relay-channel-map` uses real ledger/map state
-but was not run in this integration tree; courier and GPU behavior were not
-tested. The seven changed paths have no manifest entry, so no digest was
-updated.
+invented. The integrated tree at `e7d0a0d2` built and ran
+`tq-tp5-relay-channel-map` against the current TQRelay source installed in
+an exclusive prefix: 1/1 passed, exit 0. The first build against the existing
+install prefix failed because that TQRelay lacked
+`retirement()`/`retirement_state`; rebuilding TQRelay from the current
+source tree and putting that prefix first made the target compile and the
+test pass. Commands and output are recorded at `agent://safe-devops` (t2).
+This is a host CPU narrow test only: it does not cover courier, GPU/HIP,
+native drain, MTP, full-model or five-rank execution. The seven changed
+paths have no manifest entry, so no digest was updated.
 
 ### E.8 MoE session policy and KV phase transition round 2026-11-09
 
