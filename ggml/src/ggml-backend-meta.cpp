@@ -2140,7 +2140,8 @@ static bool ggml_backend_meta_buffer_cpy_tensor(
     }
     const ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
     const ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
-    if (src_buf == nullptr || dst_buf != buffer || dst->buffer != dst_buf ||
+    if (src_buf == nullptr || dst_buf != buffer ||
+            dst->view_src != nullptr || dst->buffer != dst_buf ||
             src->data == nullptr || dst->data == nullptr ||
             ggml_backend_buffer_is_meta(src_buf) || !ggml_backend_buffer_is_host(src_buf) ||
             !ggml_are_same_layout(src, dst) ||

@@ -150,16 +150,27 @@ calls the synchronous set path with the source tensor as `staging_meta`.
 Eligibility and the kind therefore use the source's input flag and build-time
 name while the upload still targets the destination. A direct
 `ggml_backend_tensor_set` of the decorated destination keeps the old behavior:
-the name is not parsed.
+the name is not parsed. A destination view (`dst->view_src != nullptr`) is
+excluded explicitly and falls back to `set_tensor`; the test covers the offset
+write through the real Meta read path.
 
-A false return is a pure preflight rejection with no side effect, so the
-caller may fall back to `set_tensor`. After the first possible child write the
-entry returns true even when staging publishes a fatal or partial submission:
-the existing sticky `submission_pending`/`submission_error` state is the only
-error signal, and the blocking fallback never replays a destination that may
-have been partially written. The CPU test `test-tp5-staging-sync-src` covers
-the source kind, mirrored bytes, a non-input source, a direct set without
-source identity, and a partial mirrored submission that must not be replayed.
+A false return from the Meta entry is a pure preflight rejection: it writes no
+destination and submits no staging work, so the caller may fall back to
+`set_tensor`. At the wrapper level, `ggml_backend_tensor_copy` calls
+`ggml_backend_buffer_copy_tensor` first, which may already have invalidated the
+MoE cache; the false path is not an absolute zero-side-effect guarantee.
+
+After the first possible child write the entry returns true even when staging
+publishes a fatal or partial submission. `ggml_backend_tensor_copy` is `void`,
+so it returns no error to its caller; the existing sticky
+`submission_pending`/`submission_error` state is the only error signal, and the
+next graph compute returns `GGML_STATUS_FAILED`. The blocking fallback never
+replays a destination that may have been partially written. The CPU test
+`test-tp5-staging-sync-src` covers the source kind, mirrored bytes, the
+non-merge synchronous lane, a non-input source, a direct set without source
+identity, a destination view that falls back, and a partial mirrored
+submission whose public capability and later graph compute expose the fault
+and whose child bytes are unchanged by a second copy.
 
 ## Ownership and lifetime
 
