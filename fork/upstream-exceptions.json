@@ -510,26 +510,26 @@
     },
     {
       "path": "src/llama-kv-cache.cpp",
-      "sha256": "681c9362e0b30e704d1308f68dffaafc279cdd9b2d154ca94d51f1534ef02f37",
+      "sha256": "c0fcfba6a7ec4aadd20e026ca5b0776960576350aa2e7461911a8e0c8e933aa0",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
         "fork/tests/a-seams",
         "tq-tp5-compose (WS3 host pool)"
       ],
-      "reason": "Resolve logical keys only inside A after allocation; reject missing, shifted, duplicate, ambiguous or pending peer identities. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL and TP5_DECODE_SCRATCH_POOL, returning the scratch on every non-transfer exit. Fill a prefab envelope mask with an explicit real-row count, then replicate the last real row into the pad rows.",
+      "reason": "Resolve logical keys only inside A after allocation; reject missing, shifted, duplicate, ambiguous or pending peer identities. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL and TP5_DECODE_SCRATCH_POOL, returning the scratch on every non-transfer exit. The prepare rollback stays on the normal paths; its exception behavior follows the llama_decode fatal-return contract, which already leaves processed ubatches in memory for the caller to reconcile. Fill a prefab envelope mask with an explicit real-row count, then replicate the last real row into the pad rows.",
       "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
     },
     {
       "path": "src/llama-kv-cache.h",
-      "sha256": "1ade439c72a7e60e3ec800b4bf8f7b0563df2b0cebbfccd1d6d2e076d3a4243d",
+      "sha256": "6d2c6cea1b239c7f18e07f1c223a3fe6cd2bbbe10faedbeca7080207b8699f2e",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
         "fork/tests/a-seams",
         "tq-tp5-compose (WS3 host pool)"
       ],
-      "reason": "Keep explicit reader views and expose internal preparation and resolution to the native graph builder. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL and TP5_DECODE_SCRATCH_POOL, with the batch context as the sole scratch owner. Declare the shared KQ-mask fill with an explicit real-row count for prefab envelopes.",
+      "reason": "Keep explicit reader views and expose internal preparation and resolution to the native graph builder. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL and TP5_DECODE_SCRATCH_POOL. Declare the shared KQ-mask fill with an explicit real-row count for prefab envelopes.",
       "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
     },
     {
@@ -821,12 +821,12 @@
     },
     {
       "path": "tests/test-tp5-ubatch-pool.cpp",
-      "sha256": "572f75bd9e2bc16c1c46e224529b2f9eb69399fb4e40f1c08cdd92ad87b51162",
+      "sha256": "bac8b583b2794ad9850a1c59195fe6a12a1acfd4252ab46f2eb5c97b88f06b34",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
       ],
-      "reason": "Check slot reuse, generations, concurrency, steady-state allocation, cp_into value equality, exclusive decode-scratch hand-out under contention, and the batch context's single-owner type.",
+      "reason": "Check slot reuse, generations, concurrency, steady-state allocation, cp_into value equality, and exclusive decode-scratch hand-out under contention.",
       "removal_condition": "Remove when the pool is unconditional and the equivalent checks live in the upstream test suite."
     },
     {

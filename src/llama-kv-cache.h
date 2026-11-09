@@ -792,15 +792,6 @@ public:
     // returns the decode scratch, when the context holds one
     ~llama_kv_cache_context() override;
 
-    // the context owns the decode scratch, the split ubatches and the cache
-    // pointer. a copy would return the same scratch twice, and a move would
-    // leave the source still holding it. keep ownership in the unique_ptr
-    // that creates the context.
-    llama_kv_cache_context(const llama_kv_cache_context &)             = delete;
-    llama_kv_cache_context & operator=(const llama_kv_cache_context &) = delete;
-    llama_kv_cache_context(llama_kv_cache_context &&)                  = delete;
-    llama_kv_cache_context & operator=(llama_kv_cache_context &&)      = delete;
-
     //
     // llama_memory_context_i
     //

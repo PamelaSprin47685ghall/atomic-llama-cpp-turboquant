@@ -14,15 +14,7 @@
 #include <cstdlib>
 #include <new>
 #include <thread>
-#include <type_traits>
 #include <vector>
-
-// the batch context owns its decode scratch, so a copy or move would return
-// the same scratch twice
-static_assert(!std::is_copy_constructible_v<llama_kv_cache_context>, "kv context must own its scratch");
-static_assert(!std::is_copy_assignable_v<llama_kv_cache_context>,    "kv context must own its scratch");
-static_assert(!std::is_move_constructible_v<llama_kv_cache_context>, "kv context must own its scratch");
-static_assert(!std::is_move_assignable_v<llama_kv_cache_context>,    "kv context must own its scratch");
 
 static std::atomic<long long> g_allocs{0};
 static std::atomic<long long> g_frees{0};

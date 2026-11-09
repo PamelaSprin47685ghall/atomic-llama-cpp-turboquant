@@ -1401,6 +1401,13 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_reference(const std::vec
 
     GGML_ASSERT(!states.empty() || !success);
 
+    // This reverse restore is the normal-path rollback. An allocation failure
+    // after apply_ubatch() unwinds past it and leaves the simulated placement
+    // in the cells. That is fatal, not a recoverable return: llama_decode()
+    // documents partial memory for abort (2) and fatal error (< -1), tells the
+    // caller to reconcile with llama_memory_seq_pos_min/max(), and has no
+    // exception contract. A no-throw rollback is impossible here because
+    // set() re-inserts into used/seq_pos (std::set/std::map) and can allocate.
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
         const auto & sinfo = it->sinfo;
@@ -1525,6 +1532,8 @@ bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, sl
 
     GGML_ASSERT(!states.empty() || !success);
 
+    // same normal-path rollback as prepare_reference(); the exception note
+    // there applies here too
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
         const auto & sinfo = (*it)->sinfo;
