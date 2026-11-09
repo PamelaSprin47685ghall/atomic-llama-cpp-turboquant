@@ -39,7 +39,16 @@ extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
         return false;
     }
     const auto * api = static_cast<const ggml_cuda_staging::api *>(impl);
-    if (api->abi_version != ggml_cuda_staging::kApiVersion || api->mark_partial == nullptr) {
+    if (api->abi_version != ggml_cuda_staging::kApiVersion) {
+        // Do not read any later field: an older table ends before mark_partial.
+        GGML_LOG_WARN("%s: rejecting staging api table abi_version=%u (expected %u); "
+                      "staging falls back\n", __func__, unsigned(api->abi_version),
+                      unsigned(ggml_cuda_staging::kApiVersion));
+        return false;
+    }
+    if (api->mark_partial == nullptr) {
+        GGML_LOG_WARN("%s: rejecting staging api table without mark_partial; "
+                      "staging falls back\n", __func__);
         return false;
     }
     g_staging_api.store(api, std::memory_order_release);
@@ -1865,7 +1874,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                                             } else {
                                                 // An old table cannot publish the partial
                                                 // fault. Do not return a success that hides
-                                                // a partially written destination.
+                                                // a partially written destination. Registration
+                                                // requires v2 + mark_partial, so this is
+                                                // defense against a mutated/bypassed table.
                                                 GGML_ABORT("TP5 staging partial enqueue without fault publication");
                                             }
                                             st->release(&staged_lease);
@@ -2504,6 +2515,8 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                                     if (st->abi_version >= 2 && st->mark_partial != nullptr) {
                                         st->mark_partial(&staged_lease, tensor->data);
                                     } else {
+                                        // Registration requires v2 + mark_partial; this is
+                                        // defense against a mutated/bypassed table.
                                         GGML_ABORT("TP5 staging partial enqueue without fault publication");
                                     }
                                     st->release(&staged_lease);

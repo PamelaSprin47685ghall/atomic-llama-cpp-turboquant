@@ -437,6 +437,8 @@ public:
     // provable. Stop the pool, keep the staging slot quarantined, and publish
     // the same fatal gate as a native error. There may be no native error to
     // record, so first_error stays 0 and submission_pending() is the signal.
+    // Idempotence is lease-scoped: the lease must still be valid. A call after
+    // release cannot find the slot and records another unknown destination.
     void mark_partial(const lease & l, const void * dst) {
         std::lock_guard<std::mutex> lock(mutex_);
         slot * s = find_locked(l);
