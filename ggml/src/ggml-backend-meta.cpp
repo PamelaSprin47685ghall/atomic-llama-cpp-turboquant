@@ -120,14 +120,14 @@ enum staging_reject_reason : int {
     reject_no_input_flag,
     reject_zero_size,
     reject_size,
-    reject_generic_size,
+    reject_slot_size,
     reject_layout,
     reject_count,
 };
 
 static const char * staging_reject_reason_name(int reason) {
     static const char * names[reject_count] = {
-        "other", "null", "no_input_flag", "zero_size", "size", "generic_size", "layout",
+        "other", "null", "no_input_flag", "zero_size", "size", "slot_size", "layout",
     };
     return reason >= 0 && reason < reject_count ? names[reason] : "?";
 }
@@ -175,18 +175,21 @@ static int staging_reject_reason(const ggml_tensor * tensor, size_t size, const 
     if (tensor == nullptr) {
         return reject_null;
     }
-    if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) == 0) {
-        return reject_no_input_flag;
-    }
-    if (size == 0) {
-        return reject_zero_size;
-    }
-    if (size > kMaxStagingBytes) {
-        return reject_size;
-    }
-    if (ggml_cuda_staging::classify_name(tensor->name) == ggml_cuda_staging::kind::generic &&
-            size > ggml_cuda_staging::kGenericMaxBytes) {
-        return reject_generic_size;
+    // One predicate decides eligibility and its reason. Do not re-derive the
+    // rules here: the union index kinds share the generic 64 KiB envelope, and
+    // a second copy of the rules reported those rejections as "other".
+    switch (ggml_cuda_staging::staging_candidate_reason(
+            (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0, tensor->name, size, kMaxStagingBytes)) {
+        case ggml_cuda_staging::candidate_reject::no_input_flag:
+            return reject_no_input_flag;
+        case ggml_cuda_staging::candidate_reject::zero_size:
+            return reject_zero_size;
+        case ggml_cuda_staging::candidate_reject::size:
+            return reject_size;
+        case ggml_cuda_staging::candidate_reject::slot_envelope:
+            return reject_slot_size;
+        case ggml_cuda_staging::candidate_reject::none:
+            break;
     }
     return reject_other;
 }

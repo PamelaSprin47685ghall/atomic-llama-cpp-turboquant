@@ -1310,6 +1310,34 @@ int test_staging_candidate() {
     CHECK(!staging_candidate(true, "union_inp_v_idxs", kGenericMaxBytes + 1, max_bytes, &k));
     CHECK(!staging_candidate(true, "union_inp_k_idxs", max_bytes + 1, max_bytes, &k));
     CHECK(!staging_candidate(true, "union_inp_v_idxs", 0, max_bytes, &k));
+    // The diagnostic reason and the eligibility decision are one predicate.
+    // The union index kinds share the generic 64 KiB envelope, so an oversized
+    // union input must be reported as slot_envelope, never as "other".
+    CHECK(staging_candidate_reason(true, "union_inp_k_idxs", kGenericMaxBytes + 1, max_bytes) ==
+          candidate_reject::slot_envelope);
+    CHECK(staging_candidate_reason(true, "union_inp_v_idxs", kGenericMaxBytes + 1, max_bytes) ==
+          candidate_reject::slot_envelope);
+    CHECK(staging_candidate_reason(true, "", kGenericMaxBytes + 1, max_bytes) ==
+          candidate_reject::slot_envelope);
+    CHECK(staging_candidate_reason(true, "inp_tokens", max_bytes, max_bytes) ==
+          candidate_reject::none);
+    CHECK(staging_candidate_reason(true, "inp_tokens", max_bytes + 1, max_bytes) ==
+          candidate_reject::size);
+    CHECK(staging_candidate_reason(false, "inp_tokens", 128, max_bytes) ==
+          candidate_reject::no_input_flag);
+    CHECK(staging_candidate_reason(true, "inp_tokens", 0, max_bytes) ==
+          candidate_reject::zero_size);
+    // Wherever the reason is not none, the candidate predicate rejects. A
+    // future rule added to one without the other fails here.
+    for (const char * name : { "", "union_inp_k_idxs", "union_inp_v_idxs", "inp_tokens" }) {
+        for (const std::size_t size : { std::size_t(0), kGenericMaxBytes, kGenericMaxBytes + 1,
+                                        max_bytes, max_bytes + 1 }) {
+            kind probe = kind::count;
+            const bool accepted = staging_candidate(true, name, size, max_bytes, &probe);
+            CHECK(accepted == (staging_candidate_reason(true, name, size, max_bytes) ==
+                               candidate_reject::none));
+        }
+    }
     // A weight without the input flag never stages, even with a matching name.
     CHECK(!staging_candidate(false, "inp_tokens", 128, max_bytes, &k));
     // Size bound covers the 32-row MTP hidden input and rejects larger blocks.

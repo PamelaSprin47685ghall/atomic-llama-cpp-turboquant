@@ -91,6 +91,17 @@ inline kind classify_name(const char * name) {
 
 constexpr size_t kGenericMaxBytes = 64u << 10;
 
+// Why a tensor is not a staging candidate. The eligibility predicate and the
+// diagnostics must read the same decision, so both call staging_candidate_reason;
+// a reason added here reaches the dump without a second copy of the rules.
+enum class candidate_reject : uint32_t {
+    none          = 0,
+    no_input_flag = 1,
+    zero_size     = 2,
+    size          = 3,  // above the per-request bound
+    slot_envelope = 4,  // generic/union_k/union_v above kGenericMaxBytes
+};
+
 // A staging candidate is a graph input (the flag excludes weights and other
 // one-shot uploads) within the per-request size bound. Generic kinds are
 // allowed: unnamed inputs still rotate through their own slots, but only when
@@ -102,17 +113,34 @@ constexpr size_t kGenericMaxBytes = 64u << 10;
 // and 1 MiB across all four window arrays), plus up to one lazily created
 // event per rank per new slot. The 4 MiB pool cap still bounds pinned bytes;
 // the extra event handles and metadata are outside that byte cap.
-inline bool staging_candidate(bool has_input_flag, const char * name, size_t size,
-                              size_t max_bytes, kind * out) {
-    if (out == nullptr || !has_input_flag || size == 0 || size > max_bytes) {
-        return false;
+inline candidate_reject staging_candidate_reason(bool has_input_flag, const char * name, size_t size,
+                                                 size_t max_bytes) {
+    if (!has_input_flag) {
+        return candidate_reject::no_input_flag;
+    }
+    if (size == 0) {
+        return candidate_reject::zero_size;
+    }
+    if (size > max_bytes) {
+        return candidate_reject::size;
     }
     const kind k = classify_name(name);
     if ((k == kind::generic || k == kind::union_k || k == kind::union_v) &&
             size > kGenericMaxBytes) {
+        return candidate_reject::slot_envelope;
+    }
+    return candidate_reject::none;
+}
+
+inline bool staging_candidate(bool has_input_flag, const char * name, size_t size,
+                              size_t max_bytes, kind * out) {
+    if (out == nullptr) {
         return false;
     }
-    *out = k;
+    if (staging_candidate_reason(has_input_flag, name, size, max_bytes) != candidate_reject::none) {
+        return false;
+    }
+    *out = classify_name(name);
     return true;
 }
 

@@ -515,8 +515,13 @@ TP5_STAGING_REJECT lane=sync reason=no_input_flag count=512 example_name=... fla
 
 `GGML_TP5_STAGING_DIAG_VERBOSE=1` restores the per-candidate trace (capped at
 512 lines) for an explicitly requested run. The reason classification
-(`null`, `no_input_flag`, `zero_size`, `size`, `generic_size`, `layout`) is
-unchanged, so the diagnostic still answers why a candidate was rejected.
+(`null`, `no_input_flag`, `zero_size`, `size`, `slot_size`, `layout`) is
+derived from `ggml_cuda_staging::staging_candidate_reason`, the same predicate
+`staging_candidate` uses. `slot_size` is the 64 KiB per-slot envelope shared by
+the generic and the two union index kinds, so an oversized `union_inp_k_idxs`
+or `union_inp_v_idxs` is reported as `slot_size`, never as `other`. Do not
+re-derive the rules in the diagnostic: a second copy of them classified those
+union rejections as `other`.
 
 Cost: the hot path performs one relaxed increment and no I/O; the example is
 written once per class with no allocation. The summary costs at most one line per
