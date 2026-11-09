@@ -23,15 +23,30 @@ staging pool. The functions ignore the backend argument: one staging fault in
 one Meta context makes every Meta backend report the error/pending state until
 process exit. Other backends report `0`/`false`.
 
+The CUDA backend's host-only staging `api` table is versioned. Version 2 adds
+`mark_partial` **after** the complete v1 prefix; no v1 field moved. A v1 table
+from an older backend is **rejected at registration** because it cannot publish
+a partial submission; staging then falls back to the original copy path. A
+future version with a different layout is rejected before any new field is
+read. The CPU pool test mirrors the v1 prefix and static-asserts that v2 is an
+append-only extension.
+
 ## Semantics
 
 - `ggml_backend_tensor_copy_async` returns `bool`:
-  - `true`: accepted and ordered, or completed synchronously. A rejected async
-    copy also returns `true`: the helper synchronizes both backends and performs
-    the blocking copy.
-  - `false`: **only** the accepted-but-unprovable case. The destination must
-    not be replayed, freed or overwritten, and the source, destination and both
-    backends must stay alive until the process/context owner resolves it.
+  - The helper queries the optional error/pending capability on **both**
+    backends before it does anything. If either reports an unknown submission,
+    it returns `false` and performs no copy. This is what keeps the blocking
+    fallback from overwriting a destination an earlier copy may still write.
+  - `true`: the async copy was accepted and ordered, or the async callback
+    rejected with no effects and the helper completed the blocking copy. The
+    helper re-queries both backends before returning `true`; a concurrent
+    publication turns the result into `false`.
+  - `false`: an unknown submission already existed (no copy was attempted), or
+    the copy was accepted but cannot be proven. The destination must not be
+    replayed, freed or overwritten, and the source, destination and both
+    backends must stay alive until the process/context owner resolves it. The
+    helper never clears the state.
 - The scheduler queries **both** capabilities after an accepted
   `cpy_tensor_async`. A nonzero error or a pending answer stops the split,
   keeps the input copy slots, and returns `GGML_STATUS_FAILED`. Pending with no
@@ -64,16 +79,51 @@ process exit. Other backends report `0`/`false`.
   **Meta backend's own** error/pending state at graph-compute entry, before
   each child copy and before the copy-back. The child CUDA registry does not
   expose the staging capability, so the helper bool alone is not sufficient
-  there. `ggml_backend_tensor_copy_async` itself returns false for either
+  there. When the helper is called with a Meta backend as either operand, its
+  pre-check and post-check do query that registry and return false for either
   capability answer, including pending with no error.
 - The scheduler's input-copy scope does not flush on an unknown return path,
   whether the fault was observed at the accepted copy or at a failed split
   compute. The pre-copy slot wait is separate; no additional drain is
   performed after the fault.
+- A mirrored submission that queues some ranks and then gets a clean rejection
+  is not a clean rejection of the whole copy. The pool publishes the same
+  fail-stop state as a native fatal: `mark_partial` disables the pool,
+  quarantines the slot and records the destination as unknown. `first_error`
+  stays `0` because a rejection is not a native error; `submission_pending`
+  is the signal, so the async helper returns false and no later compute runs.
+  The synchronous setter has no return value: its caller cannot observe the
+  partial write, but every later staging submit and Meta graph compute sees
+  the fail-stop state. A concurrent duplicate `mark_partial` for the same lease
+  keeps the gate closed but does not count the destination twice.
 - Staging faults do not abort: sync paths stop in place and the async path
   returns to the scheduler. The pool quarantines the pinned slot, records the
   unknown destinations (`TP5_STAGING_UNKNOWN` in the diagnostic dump), and
   keeps the first native error.
+
+## Callers and source/binary contract
+
+- All live in-repo callers are compiled against the bool declaration:
+  - `ggml/src/ggml-backend-meta.cpp` checks the helper result before building
+    the reduce node or returning the copy-back status; `false` returns
+    `GGML_STATUS_FAILED` and leaves the aux destination allocated.
+  - The scheduler input-copy paths call `ggml_backend_i::cpy_tensor_async`
+    directly. There, `false` is a clean rejection with no effects and the
+    scheduler may perform its blocking copy; it is not the public helper's
+    `false`.
+  - `tests/test-tp5-staging-scheduler.cpp` asserts both helper outcomes,
+    including the sticky refusal before any callback.
+    `tests/test-moe-cache.cpp` checks the CPU fallback's `true` result.
+- `overlay/mtp-async-protocol-candidate-20261027/` is a frozen provenance
+  snapshot of the pre-cutover candidate. Its `void` declaration and ignored
+  returns are historical bytes; this tree does not compile them. Do not edit
+  them or rebuild them against the current library.
+- The return-type change is source-incompatible. External consumers must
+  rebuild against the installed header and honor `false`. The symbol keeps its
+  name; a caller compiled against the old `void` prototype can invoke it on the
+  tested CPU ABI but cannot observe the result. There is no void compatibility
+  entry, version gate or runtime API-version probe, so an old external binary's
+  behavior is not qualified.
 
 ## Ownership and lifetime
 
@@ -114,11 +164,13 @@ process exit. Other backends report `0`/`false`.
   scheduler (plus the recorded in-flight slot list); a slot-only fault retains
   the whole context too. A duplicate `llama_free` on a retained context is
   ignored and does not increment the count again.
-  `llama_context::~llama_context()` refuses a direct delete of a pending
-  context (aborts) because a direct delete cannot keep the external model and
-  context-owned buffers alive. On a clean state the destructor frees the
-  scheduler **before** the backend members are destroyed, matching the actual
-  reverse member order.
+  `llama_context::~llama_context()` refuses a direct delete of a
+  scheduler-unproven context (aborts) because a direct delete cannot keep the
+  external model and context-owned buffers alive. A relay-only pending context
+  is retained by `llama_free`; a direct delete is unsupported and is not
+  covered by that abort. On a clean state the destructor frees the scheduler
+  **before** the backend members are destroyed, matching the actual reverse
+  member order.
 - **Model**: `llama_model` carries a live-context reference count and a
   retained-context count. The live count and the free request are read and
   changed under a lifetime mutex; the retained count is atomic and is
@@ -132,16 +184,23 @@ process exit. Other backends report `0`/`false`.
   ignored. A retained pending context and the model are process-owned; there
   is no release operation by design, and the retained context must not be used
   again.
-- **External borrows**: LoRA adapters, samplers and cvec data are caller-owned.
-  A retained context never computes or samples again, so the caller may free
-  those borrows after `llama_free` returns; no retained member dereferences
-  them. The model-owned LoRA set is released only by the deferred model free.
+- **External borrows**: LoRA adapters and samplers are caller-owned raw
+  pointers stored in the context. A retained context never computes or samples
+  again, so no retained member dereferences them. `llama_adapter_lora_free`
+  after retention erases the adapter from the model and marks it process-owned
+  instead of deleting it, because submitted native work may still read the
+  adapter tensors; a duplicate call is ignored. Samplers may be freed after
+  `llama_free` returns. Cvec input data is copied into context-owned tensors
+  by `llama_set_adapter_cvec`, so it is not borrowed after that call. The
+  model-owned LoRA set is released only by the deferred model free.
 - **Meta owner**: `ggml_backend_meta_free` retains the whole Meta owner
   (context, child backends, buffers) while `submission_pending` is true.
 - **Public helper callers**: `ggml_backend_tensor_copy_async` does not retain
   anything. On `false` the caller is the owner of the source, destination and
   both backends until process exit; there is no public release operation for an
-  unknown submission.
+  unknown submission. A pre-existing unproven state returns `false` before any
+  copy, so the blocking fallback cannot overwrite a destination behind an
+  in-flight copy.
 - **Threadpools** are caller-owned. `retain_for_process` detaches them and
   clears the CPU backend's pointer without pausing the pool, so the caller may
   free them; the retained context does not compute again.
@@ -162,6 +221,14 @@ process exit. Other backends report `0`/`false`.
 - Pending with zero error is a runtime state, not a test-only state: the
   staging pool can be disabled before it records `first_error`. The public
   helper and the scheduler therefore treat pending alone as unproven.
+- The helper's pre-check and post-check are point-in-time queries. A fault
+  published after the final check but before the caller acts is not observed;
+  the capability is sticky, so a later query or scheduler gate sees it, but a
+  fallback copy that ran in that window may already have overwritten the
+  destination. No lock spans the caller's action.
+- The helper observes only the registries of the two backends passed to it. A
+  fault exposed only by an unexposed child capability is invisible; the Meta
+  reduce path therefore keeps its own Meta-backend check.
 - A caller that ignores `ggml_backend_sched_has_unproven` and frees the
   scheduler's backends first is a contract violation; the cached free path
   avoids dereferencing them, but it cannot protect a destination the caller
@@ -180,10 +247,31 @@ process exit. Other backends report `0`/`false`.
 - A second free of the same model or context handle after the first one
   completed cannot be detected without a global handle registry. The retained
   path is idempotent; a clean double free remains caller undefined behavior.
-- External borrows (LoRA adapters, samplers, cvec) are not reference-counted.
-  They are safe to free after retention only because the retained context is
-  never used again. Calling any context API after `llama_free` is a caller
-  contract violation.
+- External borrows (LoRA adapters, samplers) are not reference-counted. They
+  are safe to free after retention only because the retained context is never
+  used again. Cvec input data is copied, not borrowed. Calling any context API
+  after `llama_free` is a caller contract violation.
+- The LoRA-adapter borrow arm constructs a bare adapter, registers it on a
+  real CPU context, retains the context and then frees the adapter. It proves
+  the erase-from-retained-model path, the process-owned retention and the
+  duplicate-free path. It also checks the ordinary delete path without a
+  retained context. It does not load adapter weights and does not compute
+  with them; full LoRA arithmetic is outside this test. Freeing an adapter
+  before retention, while the context can still compute, is a use-after-free
+  by contract.
+- The adapter decision uses the model's retained-context count, not a
+  per-adapter reference. Once any context on the model is retained, every
+  released adapter is process-owned; this is intentionally conservative.
+  The count is atomic and is read without the model lifetime mutex, which is
+  safe only under the documented rule that borrows are released after
+  `llama_free` returns, not concurrently with model teardown.
+- The retained adapter allocation prevents freeing tensors that submitted
+  native work may still read; it is not a proof that the in-flight kernel
+  finished. CPU tests cannot observe that ordering, and no GPU run is claimed.
+- `llama_adapter_lora_free` and the final `llama_model_free` are not
+  internally serialized against each other. The caller must not run them
+  concurrently; the retained-context path keeps the model alive, so the
+  documented free-after-retention order is safe without a new lock.
 - Meta owners retained on pending leak intentionally; the process owns them.
 - The Meta reduce-path pending gate is not exercised by the CPU tests below:
   it needs a Meta backend with the CUDA staging provider. It mirrors the
@@ -238,6 +326,10 @@ ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-scheduler --output-on
 cmake --build build-ws4-sched-ctest -j --target test-tp5-staging-note-source-lock
 ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-note-source-lock --output-on-failure
 
+# Meta partial-enqueue publication (ctest, CPU)
+cmake --build build-ws4-sched-ctest -j --target test-tp5-staging-meta-partial
+ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-meta-partial --output-on-failure
+
 # ASAN variant: catches the backends-before-scheduler UAF and the
 # release_buffers-while-pending free.
 cmake -S . -B build-ws4-sched-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGGML_HIP=OFF \
@@ -273,7 +365,8 @@ g++ -std=c++17 -O2 -pthread -I ggml/include -I ggml/src \
 The scheduler test covers: success, rejected, fatal (no replay), a pending
 state without a local failure, and pending published by an accepted copy with
 no error. It checks the public helper true/false contract for error, pending
-and rejected copies; the pending entry gates (`alloc_graph`, `reserve`,
+and rejected copies, the sticky refusal before any callback once a backend is
+unproven, and the no-op copy path; the pending entry gates (`alloc_graph`, `reserve`,
 `reserve_size`, `release_buffers`, `reset`, `compute`); that a failed split
 compute on both the normal and callback paths becomes fail-stop and does not
 flush deferred input copies; that the synchronous wrapper skips `synchronize`
@@ -314,14 +407,32 @@ error); neither is a latency measurement. A query error is fatal, like a
 failed wait. A not-ready query is a state, not a fault, and the adapter does
 not clear the runtime's sticky error. A slot whose events are still in flight
 stays pending and the async lane falls back, which is the intended transient
-collision.
+collision. The test also asserts the frozen v1 `api` prefix at compile time
+and covers a clean rejection after one rank was queued: `mark_partial` stops
+the pool, `submission_pending` is true, `first_error` stays 0, the slot is
+quarantined, and later upload/enqueue/wait/enter_submit/acquire calls fail. A
+held submit gate blocks `mark_partial` until it is released, and two concurrent
+publications for the same lease count one unknown destination and one partial
+fault.
+
+The Meta partial test builds a real Meta backend over two CPU child devices and
+injects a v2 staging table whose enqueue queues rank 0 and rejects rank 1. It
+covers both the synchronous buffer-set lane (`merge_wait` + `enqueue_sync`)
+and the asynchronous lane (`acquire_nowait` + `enqueue_async`). It asserts the
+partial branch calls `mark_partial` before releasing the lease, that
+`submission_pending` becomes true with `first_error == 0`, and that the next
+set hits the fatal submit gate without another enqueue. It also checks that
+registration rejects v1, rejects a v2 table without mark_partial, accepts the
+complete v2 table and rejects a future version.
 
 The context-retain test covers, without a model: the live-context reference
 (free-before-context deferral, last-release delete, new-context refusal after
 a free request), retained-count deferral, and a clean model free. With
 `LLAMA_TEST_MODEL` it additionally covers: model-free-before-context on clean
 and pending contexts, the CPU backend threadpool pointer cleared by
-`retain_for_process`, a sampler borrow freed after retention, a prefab
+`retain_for_process`, a sampler borrow freed after retention, a bare LoRA
+adapter registered on the context and freed after retention (its stale pointer
+is never read by the duplicate free or the deferred model free), a prefab
 envelope slot built by a real one-token decode and then marked unproven
 retaining the context, a duplicate `llama_free` that keeps the retained count
 at one, and a real CPU context retained whole. The model part reports

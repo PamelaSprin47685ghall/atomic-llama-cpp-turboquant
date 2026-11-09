@@ -1338,6 +1338,17 @@ set_property(TEST test-tp5-staging-note-source-lock PROPERTY LABELS "cpu;tp5;sta
 set_property(TEST test-tp5-staging-note-source-lock PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_NOTE_SOURCE_LOCK PASS")
 set_property(TEST test-tp5-staging-note-source-lock PROPERTY TIMEOUT 60)
 
+# TP5 staging Meta partial-enqueue CPU test. A real Meta backend over CPU
+# child devices receives an injected v2 staging api table whose enqueue queues
+# rank 0 and then cleanly rejects rank 1. The Meta layer must call
+# mark_partial, not return a silent success, and the next set must hit the
+# fatal submit gate. No GPU.
+add_executable(test-tp5-staging-meta-partial test-tp5-staging-meta-partial.cpp)
+target_link_libraries(test-tp5-staging-meta-partial PRIVATE ggml ggml-cpu)
+add_test(NAME test-tp5-staging-meta-partial COMMAND test-tp5-staging-meta-partial)
+set_property(TEST test-tp5-staging-meta-partial PROPERTY LABELS "cpu;tp5;staging")
+set_property(TEST test-tp5-staging-meta-partial PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_META_PARTIAL_TEST PASS")
+
 # TP5 WS4 pending-context/model ownership test. llama_free retains the whole
 # context (and defers llama_model_free) while an async submission is unproven;
 # a clean context/model takes the normal destruction path. The context part

@@ -476,9 +476,21 @@ void llama_adapter_lora_free(llama_adapter_lora * adapter) {
         return;
     }
 
+    if (adapter->process_owned) {
+        return; // a duplicate free of a retained-context adapter is ignored
+    }
+
     if (adapter->model != nullptr) {
+        const bool retained = adapter->model->retained_contexts() > 0;
         adapter->model->loras.erase(adapter);
         adapter->model = nullptr;
+        if (retained) {
+            // A retained context may still have in-flight native compute that
+            // reads the adapter tensors. The process owns them until exit; do
+            // not delete behind that work.
+            adapter->process_owned = true;
+            return;
+        }
     }
 
     delete adapter;

@@ -39,7 +39,16 @@ extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
         return false;
     }
     const auto * api = static_cast<const ggml_cuda_staging::api *>(impl);
-    if (api->abi_version != 1) {
+    if (api->abi_version != ggml_cuda_staging::kApiVersion) {
+        // Do not read any later field: an older table ends before mark_partial.
+        GGML_LOG_WARN("%s: rejecting staging api table abi_version=%u (expected %u); "
+                      "staging falls back\n", __func__, unsigned(api->abi_version),
+                      unsigned(ggml_cuda_staging::kApiVersion));
+        return false;
+    }
+    if (api->mark_partial == nullptr) {
+        GGML_LOG_WARN("%s: rejecting staging api table without mark_partial; "
+                      "staging falls back\n", __func__);
         return false;
     }
     g_staging_api.store(api, std::memory_order_release);
@@ -137,8 +146,10 @@ static void staging_log_reject(const char * lane, const ggml_tensor * tensor, si
 // first native error to the execution owner.
 static void staging_record_fatal(const char * lane, const ggml_cuda_staging::api * st) {
     const int err = (st != nullptr && st->first_error != nullptr) ? st->first_error() : 0;
-    GGML_LOG_ERROR("%s: TP5 staging fatal first_error=%d; a copy may be in flight, "
-                   "destination retained, no replay\n", lane, err);
+    const bool pending = st != nullptr && st->submission_pending != nullptr &&
+                         st->submission_pending();
+    GGML_LOG_ERROR("%s: TP5 staging fatal first_error=%d pending=%d; a copy may be in flight, "
+                   "destination retained, no replay\n", lane, err, int(pending));
 }
 
 extern "C" void ggml_backend_meta_staging_diag_dump() {
@@ -1853,6 +1864,21 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                                     }
                                     if (result == int(ggml_cuda_staging::submit_result::rejected)) {
                                         if (submitted) {
+                                            // Some rank copies are already queued and this
+                                            // rank is a clean rejection: the destination is
+                                            // partially written. The pool must publish the
+                                            // same fail-stop state as a native fatal, or the
+                                            // void set path would return a silent success.
+                                            if (st->abi_version >= 2 && st->mark_partial != nullptr) {
+                                                st->mark_partial(&staged_lease, tensor->data);
+                                            } else {
+                                                // An old table cannot publish the partial
+                                                // fault. Do not return a success that hides
+                                                // a partially written destination. Registration
+                                                // requires v2 + mark_partial, so this is
+                                                // defense against a mutated/bypassed table.
+                                                GGML_ABORT("TP5 staging partial enqueue without fault publication");
+                                            }
                                             st->release(&staged_lease);
                                             staging_record_fatal("sync-enqueue-partial", st);
                                             return;
@@ -2482,6 +2508,17 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                             }
                             if (result == int(ggml_cuda_staging::submit_result::rejected)) {
                                 if (submitted) {
+                                    // See the synchronous twin: a partial mirrored
+                                    // submission has no clean rejection. Publish the
+                                    // fatal state so cpy_tensor_async cannot report
+                                    // true for a partially written destination.
+                                    if (st->abi_version >= 2 && st->mark_partial != nullptr) {
+                                        st->mark_partial(&staged_lease, tensor->data);
+                                    } else {
+                                        // Registration requires v2 + mark_partial; this is
+                                        // defense against a mutated/bypassed table.
+                                        GGML_ABORT("TP5 staging partial enqueue without fault publication");
+                                    }
                                     st->release(&staged_lease);
                                     staging_record_fatal("async-enqueue-partial", st);
                                     return;
@@ -4607,8 +4644,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             // The helper returns true for an ordered/synchronous copy and
             // false only when the backend accepted the copy but cannot prove
-            // completion. Never build the reduce node that would replay an
-            // unproven destination.
+            // completion. Its capability pre-check queries these child
+            // registries, which do not expose the Meta staging state; the
+            // explicit ggml_backend_meta_submission_failed() above and the
+            // pool's disabled_ gate are the protection for this path. Never
+            // build the reduce node that would replay an unproven destination.
             if (!ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp)) {
                 return GGML_STATUS_FAILED;
             }
@@ -4689,6 +4729,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+            // The helper's child-registry pre-check is inert here for the same
+            // reason as push_data; the Meta check above is the protection.
             if (!ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst)) {
                 return GGML_STATUS_FAILED;
             }

@@ -629,8 +629,10 @@ extern "C" {
     // Unproved native completion retains the context rather than freeing live
     // device owners; the shared model must also remain alive in that case.
     // A retained context is process-owned: a duplicate llama_free is ignored,
-    // and the caller must not use the context again. Caller-owned LoRA
-    // adapters, samplers and cvec data may be freed after that return.
+    // and the caller must not use the context again. Caller-owned samplers may
+    // be freed after that return. A LoRA adapter released after retention is
+    // erased from the model but kept process-owned by llama_adapter_lora_free;
+    // a duplicate adapter free is ignored. Cvec data is copied, not borrowed.
     LLAMA_API void llama_free(struct llama_context * ctx);
 
     // Borrow the one strict relay Meta backend, or NULL outside relay mode.
@@ -1102,8 +1104,14 @@ extern "C" {
     // Get metadata value as a string by index
     LLAMA_API int32_t llama_adapter_meta_val_str_by_index(const struct llama_adapter_lora * adapter, int32_t i, char * buf, size_t buf_size);
 
-    // Manually free a LoRA adapter
-    // NOTE: loaded adapters that are not manually freed will be freed when the associated model is deleted
+    // Manually free a LoRA adapter.
+    // NOTE: loaded adapters that are not manually freed will be freed when the associated model is deleted.
+    // When the associated model has a retained pending context, the adapter is
+    // erased from the model and kept process-owned instead of deleted; a
+    // duplicate call is ignored. This avoids freeing tensors that submitted
+    // native work may still read. The decision uses the model's retained-
+    // context count, not a per-adapter reference: once any context on the model
+    // is retained, every released adapter is process-owned.
     LLAMA_API void llama_adapter_lora_free(struct llama_adapter_lora * adapter);
 
     // Get the invocation tokens if the current lora is an alora

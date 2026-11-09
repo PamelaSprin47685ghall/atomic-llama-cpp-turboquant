@@ -206,8 +206,13 @@ bool api_submission_pending() {
     return global_pool().submission_pending();
 }
 
+void api_mark_partial(const lease * l, const void * dst) {
+    GGML_ASSERT(l != nullptr);
+    global_pool().mark_partial(*l, dst);
+}
+
 const api kApi = {
-    /* .abi_version       = */ 1,
+    /* .abi_version       = */ kApiVersion,
     /* .enabled           = */ enabled,
     /* .merge_wait        = */ merge_wait_enabled,
     /* .acquire           = */ api_acquire,
@@ -231,6 +236,7 @@ const api kApi = {
     /* .configured        = */ configured,
     /* .usable            = */ usable,
     /* .zc_enabled        = */ api_zc_enabled,
+    /* .mark_partial      = */ api_mark_partial,
 };
 
 }  // namespace

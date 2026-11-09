@@ -666,6 +666,11 @@ void test_public_copy_async_return() {
     CHECK(ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, src, dst));
     CHECK(std::memcmp(dst->data, values, sizeof(values)) == 0);
 
+    // A no-op copy performs no callback work and remains true while clean.
+    const int self_cpy_before = g_fake.cpy_calls;
+    CHECK(ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, dst, dst));
+    CHECK(g_fake.cpy_calls == self_cpy_before);
+
     // Accepted but unprovable -> false; the destination must not be replayed.
     g_fake.submission_error = kFatalError;
     const int errors_before = g_fake.error_calls;
@@ -676,6 +681,21 @@ void test_public_copy_async_return() {
         const unsigned char * p = static_cast<const unsigned char *>(dst->data);
         unproven.assign(p, p + sizeof(values));
     }
+
+    // The pre-check runs before the self-copy shortcut: an unproven backend
+    // returns false even when no copy would be queued. True is not a completion
+    // proof for the earlier submission.
+    CHECK(!ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, dst, dst));
+
+    // The state is sticky: a second call must refuse before invoking the
+    // callback, so the unproven destination bytes are not overwritten by a
+    // blocking fallback and no new copy is queued.
+    const int unproven_cpy_before = g_fake.cpy_calls;
+    g_fake.reject_copy = true;
+    CHECK(!ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, src, dst));
+    CHECK(g_fake.cpy_calls == unproven_cpy_before);
+    CHECK(std::memcmp(dst->data, unproven.data(), unproven.size()) == 0);
+    g_fake.reject_copy = false;
 
     // Accepted but pending with no native error -> also false. This is the
     // state a disabled staging pool can report before it records an error.
@@ -692,10 +712,19 @@ void test_public_copy_async_return() {
     CHECK(ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, src, dst));
     CHECK(std::memcmp(dst->data, values, sizeof(values)) == 0);
 
-    // The unprovable destination bytes were not replayed by the later calls
-    // beyond the rejected callback's synchronous copy; the helper itself never
-    // replays it. (The rejected path writes the same source bytes.)
-    (void) unproven;
+    // No async callback: the helper synchronizes and performs its own blocking
+    // copy. The pre/post capability checks must still return true when clean.
+    g_fake.reject_copy = false;
+    g_fake_backend.iface.cpy_tensor_async = nullptr;
+    const int fallback_cpy_before = g_fake.cpy_calls;
+    CHECK(ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, src, dst));
+    CHECK(g_fake.cpy_calls == fallback_cpy_before);
+    CHECK(std::memcmp(dst->data, values, sizeof(values)) == 0);
+    g_fake_backend.iface.cpy_tensor_async = fake_cpy_tensor_async;
+
+    // The later arms clear the fake capability only to exercise the remaining
+    // return paths. That clear is not a production release operation: while
+    // the capability stays set, the helper refuses before any callback.
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
