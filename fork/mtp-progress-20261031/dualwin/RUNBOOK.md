@@ -218,9 +218,10 @@ Receipt checks on the ON arm (`TP5_DW_COMPOSE_EVENT …` lines on stderr):
 
 - `output_event_syncs == host_sync_replaced > 0`;
 - `output_event_syncs + fallback_no_output_barrier == epochs`;
-- `no_sync_logits_calls > 0` when the workload has output rows; cached
-  commit rows count, so an epoch whose commit rows are all cached still
-  satisfies this;
+- `no_sync_logits_calls` counts rows resolved through the no-sync path; it can
+  be 0 when all commit rows are cached and `capture_logits` is off, so it is
+  not a barrier proof; the barrier proof remains
+  `output_event_syncs == host_sync_replaced > 0`;
 - `epochs` equals the OFF arm's decode count for the same workload;
 - on a forced-fallback arm (e.g. a child without an event interface)
   `output_event_syncs == 0`, `fallback_no_output_barrier == epochs`, and tokens

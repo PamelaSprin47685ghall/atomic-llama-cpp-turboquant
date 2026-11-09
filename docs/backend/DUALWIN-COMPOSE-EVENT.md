@@ -189,16 +189,17 @@ window:
 |`output_event_syncs`|epochs whose host barrier was the recorded output-copy events|
 |`host_sync_replaced`|same count under the contract name (one stock `llama_synchronize` skipped each)|
 |`fallback_no_output_barrier`|ON-path epochs that kept the stock synchronize because no sound output-copy barrier was available|
-|`no_sync_logits_calls`|logits rows resolved without a synchronizing getter; a cached greedy commit row resolved under the output barrier counts once, and a `capture_logits` row resolved under the output barrier counts once more|
+|`no_sync_logits_calls`|rows resolved through the no-sync path under the output barrier (the no-sync getter or the pre-captured single-output pointer); a cached greedy commit row does not read the logits and is not counted, so the field can be 0 when all commit rows are cached; it is not a barrier proof|
 |`no_output_epochs`|epochs with no output row (prompt rows before the last one); they issue no logits copy, keep the stock synchronize and are not attempted|
 
 `output_event_syncs == host_sync_replaced` and
 `output_event_syncs + fallback_no_output_barrier + no_output_epochs == epochs` are structural
 identities of the current code. They are host call counts: they are not
 device-completion evidence, they do not prove the hardware stream mapping, and
-an absent receipt is not a zero count. A cached commit row resolved under the
-output barrier is counted even though no getter is called; the field remains
-row/call accounting, not device-completion evidence. The removed peer counters
+an absent receipt is not a zero count. Cached greedy commit rows are not
+counted because they do not read the logits; the field can be 0 when all
+commit rows are cached and `capture_logits` is off. The barrier proof remains
+`output_event_syncs == host_sync_replaced > 0`, not this field. The removed peer counters
 (`record_calls`, `wait_calls`, `sync_calls`, `free_calls`, …) no longer exist;
 the peer wait never received a receipt of its own here.
 

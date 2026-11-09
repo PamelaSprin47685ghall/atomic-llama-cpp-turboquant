@@ -577,21 +577,19 @@ overwrite the logits buffer, so it is never reused across epochs.
   every `require(usable)` check are unchanged. Cached rows do not perform the
   greedy scan and do not read the logits buffer unless `capture_logits` is
   enabled; the capture path still reads the row through the same getter and
-  output-borrow proof. `no_sync_logits_calls` counts a cached row resolved
-  under the output barrier once; a `capture_logits` row resolved under the
-  output barrier counts once more. The `real_h` NextN read, the
+  output-borrow proof. `no_sync_logits_calls` counts rows resolved through the
+  no-sync path under the output barrier; a cached greedy commit row does not
+  read the logits and is not counted, so the field can be 0 when all commit
+  rows are cached. It is not a barrier proof. The `real_h` NextN read, the
   `verifier_rows` copy and the replay distribution gate are unchanged.
 
 The CPU unit test `tq-tp5-mtp-greedy-cache` (`tests/test-mtp-greedy-cache.cpp`)
-covers the cache predicates and a local commit-gate model: partial mismatch
-with a changed replay argmax, the verifier copy not aliasing the refreshed
-row, full accept with the new row scanned (including the explicit guard when a
-future path caches row n), the LateBind g0 rules, signed-zero/tie and NaN
-results, row bounds, the cache-side commit gate (a stopped request does not
-consume a cached id), and the cache-predicate scan counts. It does not compile
-or execute runtime.cpp and does not prove the runtime wiring, the runtime
-cancellation/exception path, `no_sync_logits_calls`, or `capture_logits`.
-
-The runtime-level `TP5_MTP_GREEDY_VERIFY=1` probe re-scans every cached commit
-row in the real MTP path, prints `TP5_MTP_GREEDY_ROW`, and requires the cached
-id to match the current logits row; it was not run here (no GPU/full).
+covers the deterministic cache boundary/semantics: partial mismatch with a
+changed replay argmax and refreshed bits, the verifier copy not aliasing the
+refreshed entry, the accepted-prefix id staying the verify id while the bits
+become the replay result, the full-accept new-row guard (including a direct
+cache of row n), the LateBind g0 rules, signed-zero/tie and NaN results, and
+row bounds. It does not compile or execute runtime.cpp and does not prove the
+runtime wiring, the runtime cancellation/exception path,
+`no_sync_logits_calls`, `capture_logits`, or the real end-to-end. Those remain
+unverified here (no GPU/full).

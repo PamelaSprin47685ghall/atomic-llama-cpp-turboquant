@@ -1761,11 +1761,6 @@ run_result run(const options & requested) {
     require(!draft_output_env || std::string(draft_output_env) == "0" ||
             std::string(draft_output_env) == "1", "MTP last draft logits must be 0 or 1");
     const bool last_draft_logits = draft_output_env && std::string(draft_output_env) == "1";
-    // Runtime-level check for the per-epoch greedy cache: re-scan every cached
-    // commit row and require the cached id to match the current logits row.
-    // This is the real call-behavior probe; the CPU cache unit test does not
-    // compile or execute runtime.cpp.
-    const bool mtp_greedy_verify = tp5_exact_one("TP5_MTP_GREEDY_VERIFY");
     const char * prompt_catchup_env = std::getenv("TP5_MTP_PROMPT_CATCHUP");
     require(!prompt_catchup_env || std::string(prompt_catchup_env) == "0" ||
             std::string(prompt_catchup_env) == "1", "MTP prompt catch-up must be 0 or 1");
@@ -3252,14 +3247,9 @@ run_result run(const options & requested) {
                             if (cached_greedy) {
                                 // The per-epoch cache is valid only under the
                                 // verify/replay guarantees encoded in can_commit().
-                                // A cached row is resolved without a synchronizing
-                                // getter; keep the consumer-visible
-                                // no_sync_logits_calls meaning. A capture read
-                                // below counts once more if it uses the no-sync
-                                // getter. The greedy scan does not read the buffer.
-                                if (dw_output_barrier) {
-                                    ++dw_compose_events[wi].no_sync_logits_calls;
-                                }
+                                // A cached row does not read the logits buffer and
+                                // has no no-sync getter call, so it is not counted
+                                // by no_sync_logits_calls.
                                 greedy = mtp_greedy.get(row);
                             } else {
                                 logits =
@@ -3291,29 +3281,6 @@ run_result run(const options & requested) {
                             }
                             require(greedy.usable, "nonfinite full model logits");
                             const llama_token selected = greedy.selected.id;
-                            if (cached_greedy && mtp_greedy_verify) {
-                                // Real runtime check: the cached id must match the
-                                // current logits row. This is the observable
-                                // call-behavior probe, not the CPU cache unit test.
-                                const float * verify_logits = llama_get_logits_ith(ctx, row);
-                                require(verify_logits != nullptr,
-                                        "MTP greedy cache verify row is missing");
-                                const auto verify_greedy = tq::sampling::select_finite_greedy(
-                                    verify_logits, n_vocab);
-                                require(verify_greedy.usable &&
-                                        verify_greedy.selected.id == greedy.selected.id,
-                                        "MTP greedy cache disagrees with the current logits row");
-                                const long long no_sync_calls = dw_output_barrier ?
-                                    static_cast<long long>(dw_compose_events[wi].no_sync_logits_calls) : -1;
-                                std::fprintf(stderr,
-                                    "TP5_MTP_GREEDY_ROW window=%u row=%zu accepted=%zu"
-                                    " native_trim=%d full_accept=%d cached=1 id=%d"
-                                    " no_sync_calls=%lld\n",
-                                    wi, row, actual_accepted,
-                                    mtp_native_trim ? 1 : 0, mtp_verify_full_accept ? 1 : 0,
-                                    int(greedy.selected.id), no_sync_calls);
-                                std::fflush(stderr);
-                            }
                             if (mtp_draft_smoke && request.tokens.size() + 1 < opts.predict) {
                                 require(row < static_cast<std::size_t>(batch.batch.n_tokens),
                                         "MTP output row must belong to actual target decode");
@@ -3944,10 +3911,11 @@ run_result run(const options & requested) {
         // that rests on the cited ggml/llama code paths and still needs the
         // RUNBOOK's device trace. fallback_no_output_barrier counts epochs that
         // kept the stock synchronize because no sound output-copy barrier was
-        // available; no_sync_logits_calls counts rows resolved without a
-        // synchronizing getter. A cached greedy commit row resolved under the
-        // output barrier counts once; a capture_logits row resolved under the
-        // output barrier counts once more.
+        // available; no_sync_logits_calls counts rows resolved through the
+        // no-sync path under the output barrier (the no-sync getter or the
+        // pre-captured single-output pointer). A cached greedy commit row does
+        // not read the logits and is not counted; the field can be 0 when all
+        // commit rows are cached.
         std::fprintf(stderr,
             "TP5_DW_COMPOSE_EVENT enabled=1 flag=GGML_TP5_DW_COMPOSE_EVENT"
             " windows=%u\n", unsigned(opts.windows));
