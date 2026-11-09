@@ -94,6 +94,38 @@ WS4/WS5 delta only; the prior drift is not reviewed or blessed by this act.
 | `src/llama-kv-cache.cpp` | `839df30582f517ee` | `45da363f0b0a0492` | `8f5a8f81ef6e3943` | WS3 |
 | `src/llama-kv-cache.h` | `e230833526353e57` | `50e565be4a4b467e` | `449b9f8b397c7509` | WS3 |
 
+### B3. Refinement round 2026-11-09: KV decode scratch/snapshot ownership
+
+Base `5a34498fd` (`feat/pillar5-refine-20261109`). Cherry-picks
+`c6e985353` -> `92864c701` and `0bfb6a75f` -> `94e508c4d`. These three entries
+are re-signed for this round only. The older B2 hashes for the two KV files are
+left as history; this section does not rewrite them, and no Section A/C drift is
+re-signed.
+
+| path | old recorded at 5a34498fd | new hash | source / responsibility |
+|---|---|---|---|
+| `src/llama-kv-cache.cpp` | `5e0eb2c88b7f2377cd1e1f5768026a2b360fa2d90cc7c71315b962a877e5019f` | `b69703a4140951c6b5526b13419f0c928795d2d8ae3ccd6d5cc8defd2abe335c` | `c6e985353`, `0bfb6a75f`: `init_batch()` holds the decode scratch in a guard and returns it on every non-transfer exit; `prepare_into()` reserves the recovery vectors before taking a snapshot slot; `prepare_reference()`/`prepare_into()` document that the reverse restore is the normal-path rollback and that an allocation failure after `apply_ubatch()` is a C++ exception escaping `llama_decode()`, not a `llama_decode()` return. The documented abort (2) / fatal (< -1) partial-memory rule covers the normal return path; it does not make that exception a supported return. A no-throw rollback is impossible because `llama_kv_cells::set()` re-inserts into `std::set`/`std::map` and can allocate. |
+| `src/llama-kv-cache.h` | `0fbe78bb2693efebd6fd4cc1d27e4012170d9f8badba3fafaf24082ec3fc825d` | `6d2c6cea1b239c7f18e07f1c223a3fe6cd2bbbe10faedbeca7080207b8699f2e` | `c6e985353`, `0bfb6a75f`: `snapshot_pool::reserve()` reserves `storage` and `free` before publishing a slot, so `release()` does not allocate in the noexcept guard destructor; the decode-scratch pool comment states that the pool synchronizes the scratch buffers only, not the KV cells/heads. The context copy/move deletion added by `c6e985353` was removed by `0bfb6a75f` after the review found no consumer; the type-shape static asserts were removed with it. |
+| `tests/test-tp5-ubatch-pool.cpp` | `4b0a4b63716fba5fc7b8fb3f39b0aa471fc982a0fec429c0c66bffc402721999` | `bac8b583b2794ad9850a1c59195fe6a12a1acfd4252ab46f2eb5c97b88f06b34` | `c6e985353`: adds `test_decode_scratch_pool_concurrency()` with eight threads checking exclusive hand-out, full return and exact fallback counting; `0bfb6a75f` removes the context copy/move static asserts. CPU-only; registered as `test-tp5-ubatch-pool` with label `main`. |
+
+Ownership and boundary: A owns the KV cache scratch/snapshot pool; the named
+consumer is `tq-tp5-compose (WS3 host pool)` and the CPU test is
+`llama batch allocator tests`. No public API, B module, or C runtime changes.
+The pool flag is `TP5_DECODE_SCRATCH_POOL` (plus the existing
+`TP5_KV_SNAPSHOT_POOL`); both stay default-off. The install feature-string gate
+now lists `TP5_DECODE_SCRATCH_POOL` for `install/lib/libllama`.
+
+Verification: the three actual file digests match the table. The narrow CPU
+build reused `/tmp/r28b-pillar5-cpu` (reconfigured with
+`LLAMA_BUILD_TESTS=ON LLAMA_BUILD_COMMON=ON`, CUDA/HIP OFF), built only
+`test-tp5-ubatch-pool`, and ran it once: `OK failures=0 allocs=1682 frees=532`,
+119 `PASS`, 0 `FAIL`, including the new
+`scratch pool concurrent: exclusive slot`, `every slot returned`,
+`capacity was sufficient`, and both `scratch pool exhausted` checks; exit 0.
+`python3 fork/check-upstream.py` still fails first at
+`ggml/src/ggml-cuda/mmvf.cu`; that is the pre-existing red item recorded in
+Section A, not a new mismatch from this round.
+
 ## C. Pre-existing undeclared A paths
 
 172 paths remain undeclared after registering the WS2/WS3/WS4/WS5 paths.
