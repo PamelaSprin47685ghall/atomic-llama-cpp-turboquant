@@ -6,6 +6,10 @@
 // releases the tensor and the Meta owners, then dumps and checks that the
 // original name is still printed and the mutated name is not.
 //
+// It also records an oversized union index input. The consumer path must name
+// that class slot_size, not other: the diagnostic and the eligibility
+// predicate read one decision.
+//
 // Build (CPU only):
 //   cmake --build build-ws4-polish-cpu -j --target ggml
 //   g++ -std=c++17 -O2 -I ggml/include -I ggml/src \
@@ -102,6 +106,7 @@ struct fixture {
     ggml_context *        ctx     = nullptr;
     ggml_backend_buffer_t buffer  = nullptr;
     ggml_tensor *         tensor  = nullptr;
+    ggml_tensor *         union_tensor = nullptr;
 };
 
 bool make_fixture(ggml_backend_dev_t cpu, fixture & f) {
@@ -133,11 +138,24 @@ bool make_fixture(ggml_backend_dev_t cpu, fixture & f) {
     // No GGML_TENSOR_FLAG_INPUT: staging_eligible() rejects it as
     // no_input_flag, which is the class recorded by the summary.
 
+    // An oversized union index input: above the 64 KiB slot envelope but still
+    // inside the per-request bound. staging_eligible() rejects it as
+    // slot_envelope, which the consumer must report as slot_size.
+    f.union_tensor = ggml_new_tensor_2d(f.ctx, GGML_TYPE_F32,
+                                        int64_t(kGenericMaxBytes / 4 + 1), 1);
+    CHECK(f.union_tensor != nullptr);
+    if (f.union_tensor == nullptr) {
+        return false;
+    }
+    ggml_set_name(f.union_tensor, "union_inp_k_idxs");
+    f.union_tensor->flags |= GGML_TENSOR_FLAG_INPUT;
+
     f.buffer = ggml_backend_alloc_ctx_tensors_from_buft(
             f.ctx, ggml_backend_dev_buffer_type(meta_dev));
     CHECK(f.buffer != nullptr);
     CHECK(f.tensor->data != nullptr);
-    return f.buffer != nullptr && f.tensor->data != nullptr;
+    CHECK(f.union_tensor->data != nullptr);
+    return f.buffer != nullptr && f.tensor->data != nullptr && f.union_tensor->data != nullptr;
 }
 
 }  // namespace
@@ -164,10 +182,13 @@ int main() {
 
     std::vector<uint8_t> source(ggml_nbytes(f.tensor), 0x5a);
     ggml_backend_tensor_set(f.tensor, source.data(), 0, source.size());
+    std::vector<uint8_t> union_source(ggml_nbytes(f.union_tensor), 0x6b);
+    ggml_backend_tensor_set(f.union_tensor, union_source.data(), 0, union_source.size());
 
     // The summary must own its example. Mutate the source name, then release
     // the tensor, the buffer and the backend before the dump.
     std::snprintf(f.tensor->name, GGML_MAX_NAME, "%s", "mutated-after-log");
+    std::snprintf(f.union_tensor->name, GGML_MAX_NAME, "%s", "mutated-union-after-log");
     ggml_backend_buffer_free(f.buffer);
     ggml_free(f.ctx);
     ggml_backend_free(f.backend);
@@ -194,7 +215,13 @@ int main() {
     CHECK(std::strstr(out, "reason=no_input_flag") != nullptr);
     CHECK(std::strstr(out, "reason=no_input_flag count=1") != nullptr);
     CHECK(std::strstr(out, "example_name=reject-probe") != nullptr);
+    // The oversized union input reaches the consumer as slot_size, never as
+    // other, and its example name is the name captured at rejection time.
+    CHECK(std::strstr(out, "reason=slot_size count=1") != nullptr);
+    CHECK(std::strstr(out, "example_name=union_inp_k_idxs") != nullptr);
+    CHECK(std::strstr(out, "reason=other") == nullptr);
     CHECK(std::strstr(out, "mutated-after-log") == nullptr);
+    CHECK(std::strstr(out, "mutated-union-after-log") == nullptr);
 
     if (g_failures != 0) {
         std::fprintf(stderr, "TP5_STAGING_REJECT_TEST FAIL (%d)\n", g_failures);

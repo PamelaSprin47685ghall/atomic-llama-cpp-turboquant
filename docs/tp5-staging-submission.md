@@ -516,12 +516,15 @@ TP5_STAGING_REJECT lane=sync reason=no_input_flag count=512 example_name=... fla
 `GGML_TP5_STAGING_DIAG_VERBOSE=1` restores the per-candidate trace (capped at
 512 lines) for an explicitly requested run. The reason classification
 (`null`, `no_input_flag`, `zero_size`, `size`, `slot_size`, `layout`) is
-derived from `ggml_cuda_staging::staging_candidate_reason`, the same predicate
-`staging_candidate` uses. `slot_size` is the 64 KiB per-slot envelope shared by
-the generic and the two union index kinds, so an oversized `union_inp_k_idxs`
-or `union_inp_v_idxs` is reported as `slot_size`, never as `other`. Do not
-re-derive the rules in the diagnostic: a second copy of them classified those
-union rejections as `other`.
+derived from `ggml_cuda_staging::staging_candidate_reason`, which returns the
+reason of the same `staging_candidate_decision` that `staging_candidate` reads.
+One decision classifies the name once and carries both the kind and the
+reason, so the eligibility predicate and the diagnostic cannot drift apart,
+and an accepted or slot-rejected candidate is not looked up twice. `slot_size`
+is the 64 KiB per-slot envelope shared by the generic and the two union index
+kinds, so an oversized `union_inp_k_idxs` or `union_inp_v_idxs` is reported as
+`slot_size`, never as `other`. Do not re-derive the rules in the diagnostic: a
+second copy of them classified those union rejections as `other`.
 
 Cost: the hot path performs one relaxed increment and no I/O; the example is
 written once per class with no allocation. The summary costs at most one line per
@@ -537,7 +540,10 @@ the class record, written in place by the CAS winner. The source tensor may be
 renamed, freed, or its arena reused before the exit dump; the summary still
 prints the name captured at rejection time. A test records a rejection,
 renames the tensor, releases the buffer, context and backend, and then dumps:
-it requires the original name and rejects the mutated one.
+it requires the original name and rejects the mutated one. The same Meta test
+records an oversized `union_inp_k_idxs` input and requires
+`reason=slot_size` in the dump, so the consumer path, not the predicate in
+isolation, proves that union over-limit rejections never surface as `other`.
 
 The dump loads the counter (relaxed) and the state (acquire) without holding a
 lock, so it never blocks the rejection path and never holds a lock across

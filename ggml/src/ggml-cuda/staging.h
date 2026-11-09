@@ -92,14 +92,24 @@ inline kind classify_name(const char * name) {
 constexpr size_t kGenericMaxBytes = 64u << 10;
 
 // Why a tensor is not a staging candidate. The eligibility predicate and the
-// diagnostics must read the same decision, so both call staging_candidate_reason;
-// a reason added here reaches the dump without a second copy of the rules.
+// diagnostics must read the same decision, so both go through
+// staging_candidate_decision; a reason added here reaches the dump without a
+// second copy of the rules.
 enum class candidate_reject : uint32_t {
     none          = 0,
     no_input_flag = 1,
     zero_size     = 2,
     size          = 3,  // above the per-request bound
     slot_envelope = 4,  // generic/union_k/union_v above kGenericMaxBytes
+};
+
+// One decision carries the rejection reason and the classified kind, so a
+// caller that needs both looks the name up once. Rejection priority is fixed
+// here: input flag, zero size, per-request bound, then the per-kind slot
+// envelope.
+struct candidate_decision {
+    candidate_reject reason = candidate_reject::none;
+    kind             which  = kind::generic;
 };
 
 // A staging candidate is a graph input (the flag excludes weights and other
@@ -113,23 +123,28 @@ enum class candidate_reject : uint32_t {
 // and 1 MiB across all four window arrays), plus up to one lazily created
 // event per rank per new slot. The 4 MiB pool cap still bounds pinned bytes;
 // the extra event handles and metadata are outside that byte cap.
-inline candidate_reject staging_candidate_reason(bool has_input_flag, const char * name, size_t size,
-                                                 size_t max_bytes) {
+inline candidate_decision staging_candidate_decision(bool has_input_flag, const char * name,
+                                                     size_t size, size_t max_bytes) {
     if (!has_input_flag) {
-        return candidate_reject::no_input_flag;
+        return {candidate_reject::no_input_flag, kind::generic};
     }
     if (size == 0) {
-        return candidate_reject::zero_size;
+        return {candidate_reject::zero_size, kind::generic};
     }
     if (size > max_bytes) {
-        return candidate_reject::size;
+        return {candidate_reject::size, kind::generic};
     }
     const kind k = classify_name(name);
     if ((k == kind::generic || k == kind::union_k || k == kind::union_v) &&
             size > kGenericMaxBytes) {
-        return candidate_reject::slot_envelope;
+        return {candidate_reject::slot_envelope, k};
     }
-    return candidate_reject::none;
+    return {candidate_reject::none, k};
+}
+
+inline candidate_reject staging_candidate_reason(bool has_input_flag, const char * name, size_t size,
+                                                 size_t max_bytes) {
+    return staging_candidate_decision(has_input_flag, name, size, max_bytes).reason;
 }
 
 inline bool staging_candidate(bool has_input_flag, const char * name, size_t size,
@@ -137,10 +152,12 @@ inline bool staging_candidate(bool has_input_flag, const char * name, size_t siz
     if (out == nullptr) {
         return false;
     }
-    if (staging_candidate_reason(has_input_flag, name, size, max_bytes) != candidate_reject::none) {
+    const candidate_decision decision =
+        staging_candidate_decision(has_input_flag, name, size, max_bytes);
+    if (decision.reason != candidate_reject::none) {
         return false;
     }
-    *out = classify_name(name);
+    *out = decision.which;
     return true;
 }
 
