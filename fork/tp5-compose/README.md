@@ -61,8 +61,9 @@ call fits one microbatch, with one known input token per active request.
 
 The worker-local MTP batch pool reuses four one-token batches; the token storage
 is inline and the pool is allocated once per worker. The piece scratch keeps at
-least 256 bytes and never shrinks, so a token piece does not zero-fill the buffer
-again. With `TP5_TEXT_POOL=1`, each request pre-reserves a conservative
+least 256 bytes, grows for a piece longer than the current buffer, and never
+shrinks, so a token piece does not zero-fill the buffer again. With
+`TP5_TEXT_POOL=1`, each request pre-reserves a conservative
 emitted-text bound, and `push_into` grows the text geometrically past it. The pool flags
 (`TP5_UBATCH_POOL`, `TP5_KV_SNAPSHOT_POOL`, `TP5_DECODE_SCRATCH_POOL`,
 `TP5_MTP_BATCH_POOL`, `TP5_TEXT_POOL`) are exact-`1` and default off; the

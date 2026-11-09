@@ -4,8 +4,10 @@
 #include "host_pool.h"
 
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <stdexcept>
 
 #if defined(__GLIBC__)
@@ -230,12 +232,44 @@ static void test_event_cap() {
     set_flag("TP5_MTP_BATCH_POOL", nullptr);
 }
 
+// Independent reference path: a fresh 256-byte buffer with the same retry.
+static std::string reference_piece(const llama_vocab * vocab, llama_token token) {
+    std::string buffer(256, '\0');
+    auto size = llama_token_to_piece(vocab, token, buffer.data(), 256, 0, false);
+    if (size < 0) {
+        if (size == INT32_MIN) {
+            return {};
+        }
+        buffer.resize(static_cast<std::size_t>(-size));
+        size = llama_token_to_piece(vocab, token, buffer.data(),
+                                    static_cast<std::int32_t>(buffer.size()), 0, false);
+    }
+    if (size < 0 || static_cast<std::size_t>(size) > buffer.size()) {
+        return {};
+    }
+    buffer.resize(static_cast<std::size_t>(size));
+    return buffer;
+}
+
 static void test_piece_scratch_buffer() {
-    const char * path = std::getenv("TP5_TEST_VOCAB");
+    const char * env = std::getenv("TP5_TEST_VOCAB");
+#ifdef TP5_TEST_VOCAB_DEFAULT
+    const char * fallback = TP5_TEST_VOCAB_DEFAULT;
+#else
+    const char * fallback = nullptr;
+#endif
+    const char * path = env != nullptr && env[0] != '\0' ? env : fallback;
     if (path == nullptr || path[0] == '\0') {
-        check(true, "piece scratch: skipped without TP5_TEST_VOCAB");
+        std::printf("SKIP piece scratch: no vocabulary fixture (set TP5_TEST_VOCAB)\n");
         return;
     }
+
+    FILE * probe = std::fopen(path, "rb");
+    if (probe == nullptr) {
+        std::printf("SKIP piece scratch: fixture not readable: %s\n", path);
+        return;
+    }
+    std::fclose(probe);
 
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
@@ -250,19 +284,56 @@ static void test_piece_scratch_buffer() {
     check(n_vocab > 0, "piece scratch: vocabulary is not empty");
 
     tq::tp5::piece_scratch scratch;
-    std::size_t retained = 0;
-    bool inside = true;
-    for (int i = 0; i < n_vocab; ++i) {
-        const auto view = scratch.view(vocab, i);
-        inside = inside && view.size() <= scratch.buffer_size();
-        if (i == 0) {
-            retained = scratch.buffer_size();
+    std::size_t mismatches = 0;
+    std::size_t max_piece = 0;
+    llama_token max_token = -1;
+
+    for (int token = 0; token < n_vocab; ++token) {
+        const std::string want = reference_piece(vocab, token);
+        const auto view = scratch.view(vocab, token);
+        if (std::string(view) != want) {
+            ++mismatches;
+            if (mismatches <= 4) {
+                std::printf("FAIL piece scratch: token %d differs (want %zu, got %zu)\n",
+                            token, want.size(), view.size());
+            }
+        }
+        if (want.size() > max_piece) {
+            max_piece = want.size();
+            max_token = token;
+        }
+        if (scratch.buffer_size() < 256) {
+            std::printf("FAIL piece scratch: buffer fell below 256 at token %d\n", token);
+            ++mismatches;
+            break;
         }
     }
 
-    check(inside, "piece scratch: every view stays inside the buffer");
-    check(retained >= 256, "piece scratch: first buffer is at least 256 bytes");
-    check(scratch.buffer_size() == retained, "piece scratch: buffer size is stable across tokens");
+    check(mismatches == 0, "piece scratch: every token matches the reference");
+    check(max_token >= 0, "piece scratch: longest token is known");
+
+    if (max_piece > 256) {
+        const auto view = scratch.view(vocab, max_token);
+        const std::string want = reference_piece(vocab, max_token);
+        check(std::string(view) == want, "piece scratch: the long piece matches after the retry");
+        check(scratch.buffer_size() >= max_piece, "piece scratch: the retry grew the buffer");
+    } else {
+        std::printf("SKIP piece scratch retry: fixture max piece %zu <= 256\n", max_piece);
+    }
+
+    check(scratch.buffer_size() >= 256, "piece scratch: buffer keeps its 256-byte floor");
+
+    // Lifetime: a copied view survives the next view call; the next view is
+    // the current piece, not the previous one.
+    {
+        const auto first = scratch.view(vocab, 0);
+        const std::string first_copy(first);
+        const auto second = scratch.view(vocab, 1);
+        check(std::string(second) == reference_piece(vocab, 1),
+              "piece scratch: the next view is the next token");
+        check(first_copy == reference_piece(vocab, 0),
+              "piece scratch: a copied view keeps its bytes");
+    }
 
     llama_model_free(model);
 }

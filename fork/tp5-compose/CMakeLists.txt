@@ -74,6 +74,8 @@ if(BUILD_TESTING)
     target_include_directories(tq_tp5_host_pool_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/../alloc-ledger/include)
+    target_compile_definitions(tq_tp5_host_pool_tests PRIVATE
+        TP5_TEST_VOCAB_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/../../models/ggml-vocab-command-r.gguf")
     target_link_libraries(tq_tp5_host_pool_tests PRIVATE llama)
     add_test(NAME tq-tp5-host-pool COMMAND tq_tp5_host_pool_tests)
     if(TQ_TP5_BUILD_HIP_TESTS)
