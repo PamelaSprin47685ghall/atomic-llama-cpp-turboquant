@@ -986,6 +986,7 @@ class relay_service {
         ggml_relay_status status{};
         for (;;) {
             if (!ggml_backend_relay_snapshot(backend, &status)) {
+                require(!failure_.stopped.load(), "native relay stopped before snapshot");
                 pause_cpu();
                 continue;
             }
@@ -1010,6 +1011,7 @@ class relay_service {
         for (;;) {
             if (!finished) {
                 if (!ggml_backend_relay_snapshot(backend, &status)) {
+                    require(!failure_.stopped.load(), "native relay stopped before snapshot");
                     pause_cpu();
                     continue;
                 }
@@ -1023,6 +1025,7 @@ class relay_service {
                 drain_start = now_ns();
             }
             if (keep_snapshot && !ggml_backend_relay_snapshot(backend, &status)) {
+                require(!failure_.stopped.load(), "native relay stopped before snapshot");
                 pause_cpu();
                 continue;
             }
@@ -3978,10 +3981,10 @@ run_result run(const options & requested) {
             auto & metrics              = result.windows[wi];
             if (status.failed || failure.stopped.load()) {
                 std::fprintf(stderr,
-                             "TP5_NATIVE_DRAIN window=%u epoch=%llu attempted=%u accepted=%u unknown=%u completed=%u sealed=%u finished=%u error=%d detail=%.*s\n",
+                             "TP5_NATIVE_DRAIN window=%u epoch=%llu attempted=%u accepted=%u unknown=%u completed=%u failed=%u sealed=%u finished=%u error=%d detail=%.*s\n",
                              wi, static_cast<unsigned long long>(status.epoch), status.attempted_mask,
                              status.accepted_mask, status.unknown_mask, status.completed_mask,
-                             unsigned(status.sealed), unsigned(status.finished), status.error_code,
+                             unsigned(status.failed), unsigned(status.sealed), unsigned(status.finished), status.error_code,
                              int(sizeof(status.error)), status.error);
             }
             metrics.epochs              = status.epoch;

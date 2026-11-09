@@ -1010,6 +1010,38 @@ runtime abort/finish behavior test exists. Old caller-owned buffers still wait
 for real native completion or remain retained with the old owner; this is
 retention, not a GPU completion claim. No GPU, full suite or guard rerun.
 
+### E.11 Relay failed-drain and seal-history round 2026-11-09
+
+Merge the final net `6596b6f29` -> `6035c35d` (`1af7d0907` -> `19419fda7`
+-> `6035c35d`). `sealed` is the historical seal fact: `fail()` no longer
+clears it, so `sealed && failed` is legal and means a sealed epoch later
+failed; callers must check `failed`/`poll() == -1`, never `sealed` alone.
+`finish()` clears `sealed` only when its own seal claim does not succeed, i.e.
+when that finish did not seal the epoch.
+
+On a failed or abort-claimed path, `snapshot()` calls `observe(p)` before
+returning the sticky status, so native tails and `finished` continue to
+advance without publishing success. During capture, `consume_abort()` runs
+after the EndCapture loop, again before instantiate, and after the blocking
+instantiate jobs; no new instantiate/launch starts after a visible abort. The
+instantiate counter counts only jobs that actually succeeded. The runtime
+drain stops waiting on a stopped/failed service and can exit once `finished`
+advances; `llama_free()` retains only on a failed snapshot or an unfinished
+epoch, not on sticky `failed` alone. The intermediate `19419` behavior of
+permanent retain on failed is not present.
+
+Manifest: `ggml/include/ggml-relay.h`, `ggml/src/ggml-cuda/relay.hip` and
+`patches/ws5/README.md` matched their baseline digests and were reviewed;
+their hashes are updated. `src/llama-context.cpp` remains a historical stale
+entry and was not re-signed; `fork/tp5-compose/src/runtime.cpp` has no entry.
+
+Verification boundary: t4 (`agent://audit-integrated-relay`) is the static
+audit. No GPU, full suite or guard rerun. Capture-phase abort, actual
+instantiate counts and the wait/drain stop path were not executed; device
+abort-word visibility and RMW concurrency remain unverified. t4 also records
+the pre-existing staging `submission_failed` gap in `llama_free`, which this
+net does not change.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure

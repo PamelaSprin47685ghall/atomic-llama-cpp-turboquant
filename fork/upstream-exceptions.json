@@ -86,7 +86,7 @@
     },
     {
       "path": "ggml/include/ggml-relay.h",
-      "sha256": "c3e2263d87726f4d7afbc3a3db0142736e5ef20e8f10d7bfc2c651fa04803431",
+      "sha256": "5649184837368658b8f6b63aaf9a44db7df639c60f828c4b4c614205e73a1d43",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -109,7 +109,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/relay.hip",
-      "sha256": "8ac2f5c9f3759cb1b43edd44b82a963ffb76cd77a47dc748aa78662f5310b70f",
+      "sha256": "c5f688f5bd07ff17b4273a9fe83e63ea173c4ad4598f0d3a59ef9f9329442874",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -935,7 +935,7 @@
     },
     {
       "path": "patches/ws5/README.md",
-      "sha256": "96ad49c246cdf9843096b0c99da04ced4214acf35516627a72d1e348abf75d96",
+      "sha256": "0006c31d7db3f41587140a5882c2e0a3f99dee7ad5a3ac50fe7338381af620b5",
       "mode": "100644",
       "consumers": [
         "integ/tp5-mtp-r28b integration maintainers"

@@ -591,7 +591,7 @@ bool claim_host_success(provider & p) {
 // a read-modify-write: the first abort stores its code, later aborts read it
 // with acquire, and the fetch_or release publishes that first error to any
 // reader that sees the bit. fetch_or is a single RMW with no retry loop, so
-// abort is wait-free with respect to host lock holders and other aborts.
+// the claim does not wait for host lock holders or other aborts.
 void claim_host_abort(provider & p, int32_t error) {
     int32_t expected = 0;
     p.pending_abort.compare_exchange_strong(expected, error ? error : ECANCELED,
@@ -1804,6 +1804,10 @@ bool finish(provider & p) {
             }
             checked(p, result, "hipStreamEndCapture relay epoch");
         }
+        // Observe an abort between the EndCapture and instantiate phases. The
+        // EndCapture loop above must still end every capture, but no new
+        // instantiate/launch work starts after an abort is visible here.
+        consume_abort(p);
         for (uint32_t r = 0; r < ranks; ++r) {
             if (p.rank[r].accepted_graphs != p.status.channels + 1 || p.rank[r].graph_pending) {
                 fail(p, EIO, "relay capture is missing stages");
@@ -1811,6 +1815,7 @@ bool finish(provider & p) {
         }
         // No launch until all five complete executables exist. Failure leaves
         // partially created graph handles owned for checked destruction.
+        consume_abort(p);
         if (!p.status.failed) {
             // Each job owns one rank. All jobs finish before any graph launch.
             // Async futures also wait if worker creation throws.
@@ -1831,12 +1836,21 @@ bool finish(provider & p) {
             } catch (const std::system_error &) {
                 fail(p, EAGAIN, "starting relay graph workers failed");
             }
+            uint32_t instantiated = 0;
             for (uint32_t r = 0; r < started; ++r) {
-                checked(p, jobs[r].get(), "select/instantiate relay epoch worker");
+                const hipError_t result = jobs[r].get();
+                if (result == hipSuccess) {
+                    ++instantiated;
+                }
+                checked(p, result, "select/instantiate relay epoch worker");
             }
-            if (!p.status.failed) {
-                p.frame_instantiates += ranks;
-            }
+            // Count the instantiate calls that actually succeeded, even if an
+            // abort arrives before the launch phase. This is a fact counter,
+            // not a permission to launch.
+            p.frame_instantiates += instantiated;
+            // An abort during the blocking instantiate jobs is observed here;
+            // the launch loop below must not start after it.
+            consume_abort(p);
         }
     }
     if (p.mode != submission::direct && !p.status.failed) {
@@ -2432,12 +2446,19 @@ bool snapshot(void * opaque, ggml_relay_status * status) {
     // epoch released, and event_status==0. Epoch 0 is settled by definition;
     // after prepare, status.channels may change before begin without touching
     // outputs_released, so the explicit count comparison is required.
-    if (read_abort_claim(p) & abort_claim_bit) {
+    if ((read_abort_claim(p) & abort_claim_bit) != 0) {
         consume_abort(p);
+        // Failure is sticky, but physical drain is a separate fact. Keep
+        // querying native tails and completion even in the failed state; do
+        // not publish a success. This lets finished/borrow advance so a later
+        // destroy can prove completion instead of retaining forever.
+        observe(p);
         *status = p.status;
         return true;
     }
     if (p.status.failed) {
+        // Same rule for a non-abort failure: observe the tails, do not publish.
+        observe(p);
         *status = p.status;
         return true;
     }
@@ -2491,12 +2512,14 @@ void abort(void * opaque, int32_t error) {
     }
     auto & p = *static_cast<provider *>(opaque);
     // Owner lifetime is externally serialized against destroy; the claim word
-    // does not protect lifetime. This path is wait-free: the pending-error RMW
-    // stores the first error, then one fetch_or sets the sticky abort bit.
+    // does not protect lifetime. This path is non-blocking: the pending-error
+    // RMW stores the first error, then one fetch_or sets the sticky abort bit.
     // The device abort word is published only after that claim, so a host
     // success claim that wins the RMW order is before this abort, and a host
-    // claim that loses sees the bit. Abort never takes the provider mutex or
-    // any other host lock and never waits for another thread or a HIP holder.
+    // claim that loses sees the bit. Abort never blocks on the provider mutex;
+    // it may try_lock it after publishing to consume the abort into status.
+    // It takes no other host lock and never waits for another thread or a HIP
+    // holder. A return guarantees the claim/device word, not status.failed.
     claim_host_abort(p, error);
     if (p.abort_host) {
         store(p.abort_host, 1);

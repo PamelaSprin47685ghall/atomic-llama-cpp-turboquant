@@ -9473,7 +9473,8 @@ void llama_free(llama_context * ctx) {
     if (ctx->get_tp5_relay_backend() != nullptr) {
         ggml_relay_status status = {};
         ggml_backend_t backend = ctx->get_tp5_relay_backend();
-        if (!ggml_backend_relay_snapshot(backend, &status) || (status.epoch != 0 && !status.finished)) {
+        if (!ggml_backend_relay_snapshot(backend, &status) ||
+            (status.epoch != 0 && !status.finished)) {
             ggml_backend_relay_abort(backend, GGML_STATUS_ABORTED);
             // Scheduler buffers and memory are also native readers' owners.
             // Do not enter an unbounded synchronize or release them on failure.

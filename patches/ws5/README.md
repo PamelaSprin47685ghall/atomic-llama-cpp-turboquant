@@ -198,6 +198,22 @@ replayed. The caller aborts the epoch; native owners stay retained until
 completion is proved (`idle()` still requires `finished`, and `destroy()`
 retains an unproved owner).
 
+`sealed` records that `finish()` sealed the epoch's submission at that time;
+it is not a current-health or success flag. A later abort/failure may leave
+`sealed=true` and `failed=true`. That combination is legal and does not mean
+success: consumers must check `failed` (and `poll()` returning -1), never
+`sealed` alone. `failed` is sticky. The native-drain log prints `failed` next
+to `sealed`.
+
+Failure and physical drain are separate. `snapshot()` on a failed/abort path
+still calls `observe()` to query native tails and completion, without
+publishing success; `finished` can therefore advance while `failed` remains
+sticky. `llama_free()` retains only on a failed snapshot or an unfinished
+epoch, not on sticky `failed` alone; when `finished` is true it allows the
+normal free, and provider `destroy()`/`idle()` still verifies borrow/release.
+The runtime drain loop can complete once `finished` advances; its 45 s deadline
+is for missing evidence only. Retain only when the evidence is missing.
+
 `finish()` and `publish()` claim a host success by compare-exchange on one
 64-bit `abort_claim` word: bit 63 is the sticky abort bit, bits 0..62 are a
 host-success counter. `abort()` stores the first pending error with a CAS,
@@ -231,14 +247,19 @@ later failure. A snapshot that linearizes before a later abort may return a
 status that was true at that point even if the abort publishes its device word
 before the caller observes the status.
 
-Abort is wait-free: exactly two RMWs (one pending-error CAS plus one
-`fetch_or`), no retry loop, no host mutex, and no wait for another thread or a
-HIP launch/JIT/EventRecord holder. The device abort word is published after the
-claim RMW, not before, so a host success CAS cannot be ordered after an
-already-published device abort. A success CAS that wins is ordered before a
-later abort; a later abort can still set `failed` and publish the device word
-after a true return. The true return is a point-in-time success, not immunity
-to a later abort.
+Abort is non-blocking: exactly two RMWs (one pending-error CAS plus one
+`fetch_or`), no retry loop, and no wait for another thread or a HIP
+launch/JIT/EventRecord holder. After publishing the device word it may
+`try_lock` the provider mutex to consume the abort into status; that lock
+attempt is non-blocking and may fail. An abort return therefore guarantees the
+claim/device word, not that `status.failed` is already set; the next consuming
+entry sets it. If the try_lock succeeds, abort briefly holds the provider
+mutex, so a concurrent snapshot/destroy try_lock can fail and destroy can
+retain. The device abort word is published after the claim RMW, not before, so
+a host success CAS cannot be ordered after an already-published device abort.
+A success CAS that wins is ordered before a later abort; a later abort can
+still set `failed` and publish the device word after a true return. The true
+return is a point-in-time success, not immunity to a later abort.
 
 The claim word orders abort against finish/publish success publication.
 General `fail()` (GPU/protocol errors) is not a host success claim; its status
@@ -279,9 +300,22 @@ and the Meta owner is retained. The old caller-owned buffers stay with that
 retained owner and are not reusable by a new provider. This is a retention
 path, not a GPU completion claim.
 
+In capture mode, `finish()` still ends every capture, then consumes an abort
+after EndCapture, before starting instantiate, and after the instantiate jobs;
+an abort observed at those points skips further instantiate/launch.
+`frame_instantiates` adds the number of successful `hipGraphInstantiate`
+results even if an abort arrives before the launch, so the fact counter is not
+gated on final health. A blocking
+`hipStreamEndCapture`/`hipGraphInstantiate` call itself cannot be interrupted.
+The runtime wait loops now check `failure_.stopped` when a snapshot fails and
+stop instead of spinning until the watchdog. This is code-structural; no GPU
+runtime timing is claimed.
+
 `abort()` requires the backend to outlive the call, as for any
 `ggml_backend_t` operation; the claim word protects ordering, not object
-lifetime. The in-tree callers keep it alive: `llama_free()` calls abort before
+lifetime. Concurrent destruction during abort is outside that contract, not a
+provider state the claim protects; no refcount or duplicate authorization was
+added. The in-tree callers keep it alive: `llama_free()` calls abort before
 deciding to retain the whole context (and retains it on abort), and
 `relay_service::abort_all()` runs from service/worker/watchdog paths while the
 service and its backends are alive, with the service destructor joining its
