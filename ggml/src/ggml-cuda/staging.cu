@@ -294,6 +294,8 @@ void init() {
     if (done.exchange(true, std::memory_order_relaxed)) {
         return;
     }
+    // A rejected table disables staging on the meta side; the provider keeps
+    // running and does not receive a failure state.
     (void) ggml_backend_meta_staging_register(&kApi);
     static const bool diag = [] {
         const char * v = std::getenv("GGML_TP5_STAGING_DIAG");

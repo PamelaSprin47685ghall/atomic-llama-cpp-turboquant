@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -218,6 +219,25 @@ int main() {
     // are rejected and the staging path falls back instead of aborting later.
     // An unknown future version is rejected before any new field is read.
     const void * before = ggml_backend_meta_staging_get();
+
+    // Version-only short tables. Registration must read only abi_version
+    // before rejecting; under ASan any read of mark_partial or kind_count past
+    // these four-byte allocations is a heap-buffer-overflow.
+    uint32_t * short_v1 = (uint32_t *)std::malloc(sizeof(uint32_t));
+    uint32_t * short_v2 = (uint32_t *)std::malloc(sizeof(uint32_t));
+    CHECK(short_v1 != nullptr && short_v2 != nullptr);
+    if (short_v1 == nullptr || short_v2 == nullptr) {
+        std::free(short_v1);
+        std::free(short_v2);
+        return 1;
+    }
+    *short_v1 = 1;
+    *short_v2 = 2;
+    CHECK(!ggml_backend_meta_staging_register(short_v1));
+    CHECK(ggml_backend_meta_staging_get() == before);
+    CHECK(!ggml_backend_meta_staging_register(short_v2));
+    CHECK(ggml_backend_meta_staging_get() == before);
+
     api v1 = {};
     v1.abi_version = 1;
     CHECK(!ggml_backend_meta_staging_register(&v1));
@@ -245,6 +265,26 @@ int main() {
 
     CHECK(ggml_backend_meta_staging_register(&g_fake_api));
     CHECK(ggml_backend_meta_staging_get() == &g_fake_api);
+
+    // A rejected table must not replace a previously accepted one.
+    CHECK(!ggml_backend_meta_staging_register(short_v1));
+    CHECK(ggml_backend_meta_staging_get() == &g_fake_api);
+    CHECK(!ggml_backend_meta_staging_register(short_v2));
+    CHECK(ggml_backend_meta_staging_get() == &g_fake_api);
+    CHECK(!ggml_backend_meta_staging_register(&short_kinds));
+    CHECK(ggml_backend_meta_staging_get() == &g_fake_api);
+
+    // A kind domain larger than the host's is accepted: the provider covers
+    // every host kind and may understand more.
+    api more_kinds = g_fake_api;
+    more_kinds.kind_count = uint32_t(kKindCount + 1);
+    CHECK(ggml_backend_meta_staging_register(&more_kinds));
+    CHECK(ggml_backend_meta_staging_get() == &more_kinds);
+    CHECK(ggml_backend_meta_staging_register(&g_fake_api));
+    CHECK(ggml_backend_meta_staging_get() == &g_fake_api);
+
+    std::free(short_v1);
+    std::free(short_v2);
 
     ggml_backend_reg_t cpu_reg = ggml_backend_cpu_reg();
     CHECK(cpu_reg != nullptr);

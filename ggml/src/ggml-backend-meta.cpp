@@ -38,23 +38,27 @@ extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
     if (impl == nullptr) {
         return false;
     }
+    // Rejection disables staging globally and the original copy path is used.
+    // This is an explicit mode, not a claim of equivalent performance.
     const auto * api = static_cast<const ggml_cuda_staging::api *>(impl);
     if (api->abi_version != ggml_cuda_staging::kApiVersion) {
         // Do not read any later field: v1 ends before mark_partial and v2 ends
         // before kind_count. Mixed versions are explicitly unsupported.
         GGML_LOG_WARN("%s: rejecting staging api table abi_version=%u (expected %u); "
-                      "staging falls back\n", __func__, unsigned(api->abi_version),
+                      "staging is disabled and the original copy path is used\n",
+                      __func__, unsigned(api->abi_version),
                       unsigned(ggml_cuda_staging::kApiVersion));
         return false;
     }
     if (api->mark_partial == nullptr) {
         GGML_LOG_WARN("%s: rejecting staging api table without mark_partial; "
-                      "staging falls back\n", __func__);
+                      "staging is disabled and the original copy path is used\n", __func__);
         return false;
     }
     if (api->kind_count < ggml_cuda_staging::kKindCount) {
         GGML_LOG_WARN("%s: rejecting staging api table kind_count=%u (host needs %u); "
-                      "staging falls back\n", __func__, unsigned(api->kind_count),
+                      "staging is disabled and the original copy path is used\n",
+                      __func__, unsigned(api->kind_count),
                       unsigned(ggml_cuda_staging::kKindCount));
         return false;
     }

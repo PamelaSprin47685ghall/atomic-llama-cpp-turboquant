@@ -27,12 +27,14 @@ The CUDA backend's host-only staging `api` table is versioned. Version 2 added
 `mark_partial` after the complete v1 prefix; version 3 appends `kind_count`
 after `mark_partial`. A v1 table cannot publish a partial submission; a v2
 table cannot advertise its kind domain. Both are **rejected at registration**
-before any later field is read, and staging falls back with a warning. A v3
-table is accepted only when `mark_partial` is present and `kind_count` covers
-the host's full kind domain. Mixed v1/v2/v3 installs are explicitly
-unsupported; a provider with a smaller kind domain is rejected instead of
-receiving kind values it would treat as invalid. The CPU pool test mirrors the
-v1 prefix and static-asserts that v3 appends `kind_count` after `mark_partial`.
+before any later field is read. Rejection disables staging globally; the
+original copy path is used. This is an explicit mode, not a claim of
+equivalent performance. A v3 table is accepted only when `mark_partial` is
+present and `kind_count` covers the host's full kind domain. Mixed v1/v2/v3
+installs are explicitly unsupported; a provider with a smaller kind domain is
+rejected instead of receiving kind values it would treat as invalid. The CPU
+pool test mirrors the v1 prefix and static-asserts that v3 appends
+`kind_count` after `mark_partial`.
 
 ## Semantics
 
@@ -489,7 +491,10 @@ partial branch calls `mark_partial` before releasing the lease, that
 set hits the fatal submit gate without another enqueue. It also checks that
 registration rejects v1, rejects a v2 table, rejects a v3 table without
 mark_partial, rejects a v3 table whose kind_count is smaller than the host's
-kind domain, accepts the complete v3 table and rejects a future version.
+kind domain, accepts the complete v3 table and rejects a future version. It
+also registers version-only four-byte v1/v2 tables (ASan checks the read
+boundary), checks that a rejected table does not replace an already accepted
+one, and accepts a v3 table whose kind_count is larger than the host's.
 
 The context-retain test covers, without a model: the live-context reference
 (free-before-context deferral, last-release delete, new-context refusal after

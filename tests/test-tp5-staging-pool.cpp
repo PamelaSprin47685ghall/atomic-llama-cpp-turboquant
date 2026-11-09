@@ -22,7 +22,8 @@ namespace {
 
 // Frozen v1 host-only api prefix. The meta layer rejects a v1 table because it
 // cannot publish a partial submission, but the prefix is still the ABI
-// baseline: v2 must append its new field after zc_enabled and move nothing.
+// baseline: v2 and v3 must append their new fields after the previous
+// version's last field and move nothing.
 // Keep this mirror in sync with the header's prefix; the assertions below fail
 // the CPU test build if a field is inserted.
 struct api_v1 {

@@ -28,8 +28,9 @@ constexpr uint32_t kSlotsPerKey  = 2;   // double buffer
 // version and checks the version before reading any later field. v1 cannot
 // publish a partial submission; v2 has mark_partial but no kind domain; v3
 // adds kind_count. A mixed v1/v2/v3 install is explicitly unsupported and
-// staging falls back with a warning instead of sending kind values the
-// provider does not understand.
+// staging is disabled with a warning; the original copy path is used instead
+// of sending kind values the provider does not understand. This is not a
+// claim of equivalent performance.
 constexpr uint32_t kApiVersion   = 3;
 
 enum class kind : uint32_t {
