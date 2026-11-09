@@ -399,6 +399,59 @@ children; it does not exercise a real HIP provider, the async lane, or a
 full scheduler/model run. The other staging tests were not rerun. The guard
 was not rerun; the red items above remain, so this integration is not clean.
 
+### B8. Relay polish v3 manifest reconciliation 2026-11-09
+
+Scope: only the five relay manifest entries below were re-signed. No source
+file, test, or other manifest entry was changed.
+
+Evidence chain from `agent://polish-manifest-reconcile` (t2):
+
+- At `d401ea986` all five manifest entries matched the actual files and
+  mode `100644`; the report lists the last manifest sign for each path and
+  no unsigned change between that sign and `d401ea986`.
+- Between `d401ea986` and HEAD only `5a34498fd` touches these five files.
+  This round verified that `git log 5a34498fd..HEAD -- <five paths>` is
+  empty and `git diff 5a34498fd HEAD -- <five paths>` is empty.
+- For each path the HEAD git blob equals the v3 patch post-image blob, so
+  the current bytes are the reviewed patch output, not a later edit.
+- The exported v3 patch artifact
+  `/home/kunweiz/work/r28b-relay-polish-export-20261109T101312Z/relay-polish-v3.patch`
+  has SHA256 `5bc1ad65f9f5cb2c29932c358e548a9e955dac4ec8972ea1f9d30b39e9a66468`,
+  matching the commit message and sidecar. The report records apply-check,
+  apply, reverse-check, byte-identical roundtrip, `test-relay-plan-policy`
+  (normal and ASan+UBSan), `test-relay-verify-counters`,
+  `test-shape-cache`, and `hipcc gfx1030` compile receipts.
+
+| path | d401 manifest | new signed sha256 | HEAD / post-image blob |
+|---|---|---|---|
+| `ggml/include/ggml-relay-plan.h` | `73220f73122e0343b7261c28f0f92a0769863426cb9180b9f6f97b337709d97f` | `296a0257682c3d7844fd6ccef4a6eb891b82ec3c25c0c492cb71c3afc985142d` | `1f9ceffd42c7769410b2f50b065382f0fa9b8fba` |
+| `ggml/include/ggml-relay.h` | `6515be02a00f7755e88b7b5fc7a247e18d96e2e34c508a409ae81dbfed2019c6` | `41f97fa931e5a823261b329bb29d672ea232ae34d5790b7b8ed974a906b427eb` | `69dfb15173156e18c8d3f51c9f681877a6bb42b6` |
+| `ggml/src/ggml-cuda/relay.hip` | `600d494e7c6f8c7360b9eab6ff96406a107c0e351c37abaaa92083cba8e8b259` | `6f608d139b422a5cf39397b6ea8ed81d6bbbd8aa7a78adb8dfefd4fb759242a0` | `af6eca18bfff7c2b2f89a6cb18910a5145a1bbae` |
+| `patches/ws5/README.md` | `3d91142be018064d463453f794225e283909eccc75d5dba26bf8d1f3e4a17c4d` | `04df9c7459d371f22cc140982697fd803bca6dd8149a153ae3a4a4b34afb7f8c` | `9b99636f7008fba1b9b5a75544e143b3d9439802` |
+| `tests/test-relay-plan-policy.cpp` | `e1b0332d786946d9e0cbbdb95cd983625a2ee53529e4b37289055f1491498119` | `4d849f8de99a5e0364cea495d6e5428e7d2cf5abdc10ab9b37007a3855f39efc` | `0d955dfb8f46ae2d484eb0b299690d0df65df8c1` |
+
+This is patch-level span review, not per-file runtime qualification.
+`test-relay-plan-policy.cpp` has a direct test receipt; `relay.hip` has a
+`hipcc` compile receipt; `ggml-relay-plan.h`, `ggml-relay.h` and
+`patches/ws5/README.md` rely on the whole-patch review and their consumers.
+Do not call these five entries runtime-qualified.
+
+Remaining unresolved mismatches: this round does not claim the guard
+passes and did not rerun it. All other manifest debt recorded in B5-B7
+remains, including the staging red items (`docs`,
+`ggml-backend-meta.cpp`, `staging.h`, `test-tp5-staging-pool.cpp`), the
+three A red items (`src/llama-context.cpp`,
+`tools/server/server-context.cpp`, `tests/test-tp5-prefab-subenvelope.cpp`),
+the B6 MTP paths (including the 58 unregistered paths), the B7 paths
+(`ggml-backend.cpp`, `tests/CMakeLists.txt`,
+`tests/test-tp5-staging-sync-src.cpp`), and the pre-existing Section A
+drift (`mmvf.cu` and the other listed A paths). No entry outside the five
+rows was re-signed.
+
+Verification: JSON is valid; the five actual file SHA256 values match the
+new entries; the diff is exactly five SHA256 lines. The guard was not
+rerun; no GPU or full suite was run.
+
 ## C. Pre-existing undeclared A paths
 
 172 paths remain undeclared after registering the WS2/WS3/WS4/WS5 paths.
