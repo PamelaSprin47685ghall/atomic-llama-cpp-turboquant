@@ -97,6 +97,10 @@ struct ggml_relay_event_v2 {
 // rank_graphs counts prepared GGML stages accepted directly or in a native
 // replay. rank_relay_nodes counts relay kernel nodes accepted by those paths,
 // not host launch API calls. Neither counter proves native completion.
+// sealed is true only for an epoch whose finish completed without a failure.
+// finish clears it when its plan-pin release or final observation fails, so a
+// true submit return is the only continuation permit. A later asynchronous
+// failure may set failed after sealed was observed; failed is sticky.
 struct ggml_relay_status {
     uint32_t abi_version;
     uint32_t ranks;

@@ -187,6 +187,18 @@ channels and queries only ranks whose tail is still incomplete
 (`completed_mask` is checked before `hipSetDevice`). Those queries are the
 evidence used to decide completion, so they are not skipped.
 
+## Finish contract
+
+`finish()` sets `sealed` and `event_status = 1` only after every stage and
+rank submission is accepted. The plan-pin release and the final `observe()`
+run after that point. If either fails, `finish()` clears `sealed` and returns
+false; `fail()` has already set `event_status = -1`. A true submit return is
+therefore the only permission to continue, and a false return must not be
+replayed. The caller aborts the epoch; native owners stay retained until
+completion is proved (`idle()` still requires `finished`, and `destroy()`
+retains an unproved owner). A later asynchronous failure can set `failed`
+after `sealed` was observed; `failed` is sticky and `poll()` then returns -1.
+
 ## Plan identity: coarse llama key + terminal binding digest
 
 The seven llama fields plus `channels` are coarse: a graph rebuild can keep

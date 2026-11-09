@@ -1797,6 +1797,13 @@ bool finish(provider & p) {
         }
     }
     observe(p);
+    if (p.status.failed) {
+        // The plan-pin release and this final observation run after sealed and
+        // event_status were set. A failure here must not return a sealed
+        // epoch: fail() already set event_status=-1, so clear sealed too. A
+        // true return then always means the epoch is sealed and publishable.
+        p.status.sealed = false;
+    }
     return p.status.sealed;
 }
 
