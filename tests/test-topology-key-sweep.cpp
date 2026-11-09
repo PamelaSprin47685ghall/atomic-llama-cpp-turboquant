@@ -169,7 +169,11 @@ int main(int argc, char ** argv) {
         llama_batch batch = llama_batch_init(width, 0, 1);
         if (!llama_batch_is_complete(&batch, width, false, true)) {
             llama_batch_free(batch);
-            GGML_ABORT("llama_batch_init failed");
+            batch = {};
+            ++g_failures;
+            ++g_checks;
+            std::fprintf(stderr, "FAIL: batch allocation step=%ld\n", step);
+            break;
         }
         for (int i = 0; i < width; ++i) {
             batch.token[i] = 3 + (int) (((int64_t) (pos + i) * 7 + 1) % (vocab - 3));

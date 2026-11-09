@@ -72,7 +72,7 @@ bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos, llama_seq_i
     llama_batch batch = llama_batch_init(1, 0, 1);
     if (!llama_batch_is_complete(&batch, 1, false, true)) {
         llama_batch_free(batch);
-        GGML_ABORT("llama_batch_init failed");
+        return false;
     }
     batch.n_tokens    = 1;
     batch.token[0]    = tok;
@@ -361,14 +361,16 @@ int main(int argc, char ** argv) {
         // one batch, two sequences, one token each: equal_seqs() holds
         const llama_seq_id pair[2] = { fs.a, fs.b };
         llama_batch batch_on  = llama_batch_init(2, 0, 1);
-        if (!llama_batch_is_complete(&batch_on, 2, false, true)) {
-            llama_batch_free(batch_on);
-            GGML_ABORT("llama_batch_init failed");
-        }
         llama_batch batch_off = llama_batch_init(2, 0, 1);
-        if (!llama_batch_is_complete(&batch_off, 2, false, true)) {
+        if (!llama_batch_is_complete(&batch_on, 2, false, true) ||
+            !llama_batch_is_complete(&batch_off, 2, false, true)) {
+            llama_batch_free(batch_on);
             llama_batch_free(batch_off);
-            GGML_ABORT("llama_batch_init failed");
+            batch_on = {};
+            batch_off = {};
+            std::fprintf(stderr, "FAIL: batch allocation step=%u\n", step);
+            ok = false;
+            break;
         }
         batch_on.n_tokens  = 2;
         batch_off.n_tokens = 2;

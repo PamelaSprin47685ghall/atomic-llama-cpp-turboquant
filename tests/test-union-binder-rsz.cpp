@@ -96,7 +96,7 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos, llam
     llama_batch b = llama_batch_init(1, 0, 1);
     if (!llama_batch_is_complete(&b, 1, false, true)) {
         llama_batch_free(b);
-        GGML_ABORT("llama_batch_init failed");
+        return false;
     }
     b.n_tokens    = 1;
     b.token[0]    = tok;
@@ -442,7 +442,7 @@ static bool decode_many(llama_context * ctx, const llama_token * toks,
     llama_batch b = llama_batch_init(n, 0, n);
     if (!llama_batch_is_complete(&b, n, false, true)) {
         llama_batch_free(b);
-        GGML_ABORT("llama_batch_init failed");
+        return false;
     }
     b.n_tokens = n;
     for (int i = 0; i < n; ++i) {

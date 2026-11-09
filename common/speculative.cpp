@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -27,6 +28,31 @@
 #define SPC_WRN(fmt, ...) LOG_WRN("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_ERR(fmt, ...) LOG_ERR("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
+
+namespace {
+
+// Frees a successfully initialized batch when the constructor throws before
+// the object is complete; the class destructor does not run in that case.
+struct speculative_batch_guard {
+    llama_batch * batch;
+    bool          owns_token;
+
+    ~speculative_batch_guard() {
+        if (batch == nullptr) {
+            return;
+        }
+        if (owns_token && batch->token != nullptr) {
+            free(batch->token);
+            batch->token = nullptr;
+        }
+        llama_batch_free(*batch);
+        *batch = {};
+    }
+
+    void release() { batch = nullptr; }
+};
+
+} // namespace
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -224,6 +250,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             batch = {};
             throw std::bad_alloc();
         }
+        speculative_batch_guard batch_guard{&batch, false};
 
         // TODO: optimize or pass from outside?
         // {
@@ -268,6 +295,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
             throw std::runtime_error("the draft model number of sequences is incompatible with the speculative n_seq");
         }
+        batch_guard.release();
     }
 
     ~common_speculative_impl_draft_simple() override {
@@ -517,6 +545,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             batch = {};
             throw std::bad_alloc();
         }
+        speculative_batch_guard batch_guard{&batch, true};
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -564,6 +593,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         verify_g.assign(n_seq, std::vector<float>());
         verify_pos_first.assign(n_seq, -1);
         verify_g_rows.assign(n_seq, 0);
+        batch_guard.release();
     }
 
     ~common_speculative_impl_draft_eagle3() override {
@@ -1046,6 +1076,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 throw std::bad_alloc();
             }
         }
+        speculative_batch_guard batch_guard{&batch, false};
+        speculative_batch_guard batch_inject_guard{&batch_inject, false};
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1085,6 +1117,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             llama_set_causal_attn(ctx_dft, causal);
         }
+        batch_guard.release();
+        batch_inject_guard.release();
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1532,6 +1566,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             batch = {};
             throw std::bad_alloc();
         }
+        speculative_batch_guard batch_guard{&batch, true};
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1612,6 +1647,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        batch_guard.release();
     }
 
     ~common_speculative_impl_draft_mtp() override {

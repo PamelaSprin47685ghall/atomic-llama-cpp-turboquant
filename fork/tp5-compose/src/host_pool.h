@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -138,7 +139,8 @@ public:
             }
             // llama_batch_init leaves token null when embd > 0. The lease owns
             // that one token separately; its destructor frees it and clears
-            // the pointer before llama_batch_free runs.
+            // the pointer before llama_batch_free runs. Free any token a
+            // future init might return so the lease is the only owner.
             std::free(batch.token);
             batch.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
             if (batch.token == nullptr) {
@@ -207,10 +209,10 @@ public:
                         discard_partial(batch);
                         throw std::bad_alloc();
                     }
-                    // embd > 0 makes llama_batch_init leave token null. The
-                    // slot supplies that storage inline. Release a token that
-                    // llama_batch_init returned anyway so the inline storage is the
-                    // only owner.
+                    // embd > 0 makes llama_batch_init leave token null; the
+                    // slot supplies inline storage. Free any token a future
+                    // init might return so the inline storage is the only
+                    // owner.
                     std::free(batch.token);
                     batch.token = &s.token;
                     s.batch = batch;

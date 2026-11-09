@@ -2123,6 +2123,11 @@ int llama_perplexity(int argc, char ** argv) {
         kl_divergence(ctx, params);
     } else {
         results = perplexity(ctx, params, n_ctx);
+        if (results.ppl_value < 0) {
+            LOG_ERR("%s: perplexity failed\n", __func__);
+            llama_backend_free();
+            return 1;
+        }
     }
 
     LOG("\n");

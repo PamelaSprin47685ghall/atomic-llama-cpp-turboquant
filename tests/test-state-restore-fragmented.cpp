@@ -52,7 +52,7 @@ int main(int argc, char ** argv) {
     llama_batch batch = llama_batch_init(params.n_parallel*tokens.size(), 0, 1);
     if (!llama_batch_is_complete(&batch, (int32_t) (params.n_parallel*tokens.size()), false, true)) {
         llama_batch_free(batch);
-        GGML_ABORT("llama_batch_init failed");
+        return 1;
     }
     for (size_t i = 0; i < tokens.size(); i++) {
         for (int s = 0; s < params.n_parallel; ++s) {

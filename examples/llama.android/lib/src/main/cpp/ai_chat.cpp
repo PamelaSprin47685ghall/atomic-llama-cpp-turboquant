@@ -121,6 +121,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv * /*env*/, jobje
         LOGe("%s: failed to allocate batch", __func__);
         llama_batch_free(g_batch);
         g_batch = {};
+        // The Kotlin cleanUp() does not unload on State.Error; release the
+        // context here so a later loadModel() does not overwrite it.
+        llama_free(g_context);
+        g_context = nullptr;
         return 1;
     }
     g_chat_templates = common_chat_templates_init(g_model, "");

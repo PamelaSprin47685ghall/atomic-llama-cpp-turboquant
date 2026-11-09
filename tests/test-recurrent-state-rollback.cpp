@@ -21,7 +21,7 @@ static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & 
     llama_batch batch = llama_batch_init(count, 0, 1);
     if (!llama_batch_is_complete(&batch, (int32_t) count, false, true)) {
         llama_batch_free(batch);
-        GGML_ABORT("llama_batch_init failed");
+        return false;
     }
     for (uint32_t pos = 0; pos < count; ++pos) {
         common_batch_add(batch, tokens[pos], pos, { 0 }, pos + 1 == count);
@@ -35,7 +35,7 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     llama_batch batch = llama_batch_init(1, 0, 1);
     if (!llama_batch_is_complete(&batch, 1, false, true)) {
         llama_batch_free(batch);
-        GGML_ABORT("llama_batch_init failed");
+        return false;
     }
     common_batch_add(batch, tok, pos, { 0 }, true);
     const bool ok = llama_decode(ctx, batch) == 0;

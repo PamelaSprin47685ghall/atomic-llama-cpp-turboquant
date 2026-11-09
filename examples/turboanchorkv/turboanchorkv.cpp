@@ -1176,8 +1176,10 @@ std::vector<llama_token> generate_greedy(llama_context *     ctx,
                                          const llama_vocab * vocab,
                                          llama_token         final_prompt_token,
                                          llama_pos           final_prompt_position,
-                                         int                 n_generate) {
+                                         int                 n_generate,
+                                         bool &              ok) {
     std::vector<llama_token> result;
+    ok = false;
     llama_batch              batch    = llama_batch_init(1, 0, 1);
     if (!llama_batch_is_complete(&batch, 1, false, true)) {
         std::fprintf(stderr, "batch allocation failed\n");
@@ -1190,7 +1192,8 @@ std::vector<llama_token> generate_greedy(llama_context *     ctx,
     for (int i = 0; i < n_generate; ++i) {
         if (!decode_one(ctx, batch, input, position++)) {
             result.clear();
-            break;
+            llama_batch_free(batch);
+            return result;
         }
         const float * logits  = llama_get_logits_ith(ctx, 0);
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
@@ -1202,6 +1205,7 @@ std::vector<llama_token> generate_greedy(llama_context *     ctx,
         input = next;
     }
     llama_batch_free(batch);
+    ok = true;
     return result;
 }
 
@@ -1358,7 +1362,12 @@ int run_generate_mode(llama_context *                  ctx,
     if (!state_restore(ctx, state)) {
         return 1;
     }
-    const auto baseline = generate_greedy(ctx, vocab, tokens[final], llama_pos(final), n_generate);
+    bool       baseline_ok = false;
+    const auto baseline = generate_greedy(ctx, vocab, tokens[final], llama_pos(final), n_generate, baseline_ok);
+    if (!baseline_ok) {
+        std::fprintf(stderr, "baseline generation failed\n");
+        return 1;
+    }
     if (!state_restore(ctx, state)) {
         return 1;
     }
@@ -1369,7 +1378,12 @@ int run_generate_mode(llama_context *                  ctx,
         return 1;
     }
     const double      roundtrip_s     = elapsed_seconds(start);
-    const auto        compressed      = generate_greedy(ctx, vocab, tokens[final], llama_pos(final), n_generate);
+    bool              compressed_ok   = false;
+    const auto        compressed      = generate_greedy(ctx, vocab, tokens[final], llama_pos(final), n_generate, compressed_ok);
+    if (!compressed_ok) {
+        std::fprintf(stderr, "compressed generation failed\n");
+        return 1;
+    }
     const std::string text_baseline   = common_detokenize(vocab, baseline, false);
     const std::string text_compressed = common_detokenize(vocab, compressed, false);
     size_t            common          = 0;

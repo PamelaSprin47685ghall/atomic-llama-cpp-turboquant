@@ -47,7 +47,9 @@ int main(int argc, char ** argv) {
         llama_batch batch = llama_batch_init(width, 0, 1);
         if (!llama_batch_is_complete(&batch, width, false, true)) {
             llama_batch_free(batch);
-            GGML_ABORT("llama_batch_init failed");
+            batch = {};
+            ok = false;
+            break;
         }
         batch.n_tokens = width;
         for (int i = 0; i < width; ++i) {

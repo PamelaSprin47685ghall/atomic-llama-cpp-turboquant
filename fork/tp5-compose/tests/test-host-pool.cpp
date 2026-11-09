@@ -4,6 +4,7 @@
 
 #include "host_pool.h"
 
+#include <cstddef>
 #include <cstdint>
 #if defined(__unix__) || defined(__APPLE__)
 #include <dlfcn.h>
@@ -22,12 +23,18 @@
 #endif
 
 static int g_failures = 0;
+static int g_skips    = 0;
 
 static void check(bool ok, const char * name) {
     if (!ok) {
         ++g_failures;
     }
     std::printf("%s %s\n", ok ? "PASS" : "FAIL", name);
+}
+
+static void skip(const char * name) {
+    ++g_skips;
+    std::printf("SKIP %s\n", name);
 }
 
 static void set_flag(const char * name, const char * value) {
@@ -50,6 +57,10 @@ using fail_malloc_disarm_fn = void (*)(void);
 static fail_malloc_arm_fn    g_fail_malloc_arm    = nullptr;
 static fail_malloc_disarm_fn g_fail_malloc_disarm = nullptr;
 
+// Volatile call target so the compiler cannot fold the probe malloc/free pair
+// away and bypass the interposer.
+static void * (*volatile g_probe_malloc)(size_t) = std::malloc;
+
 static bool load_fail_malloc() {
 #if defined(TP5_HAVE_DLOPEN)
     g_fail_malloc_arm = reinterpret_cast<fail_malloc_arm_fn>(
@@ -60,6 +71,32 @@ static bool load_fail_malloc() {
 #else
     return false;
 #endif
+}
+
+static bool require_fail_malloc() {
+    const char * value = std::getenv("TP5_REQUIRE_FAIL_MALLOC");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+// Returns true only when the interposer is loaded and a probe allocation
+// actually fails. In CTest-required mode a missing or inert interposer is a
+// failure; a manual run without the preload reports SKIP.
+static bool fail_malloc_ready(const char * name) {
+    if (load_fail_malloc()) {
+        g_fail_malloc_arm(0);
+        void * probe = g_probe_malloc(1);
+        g_fail_malloc_disarm();
+        if (probe == nullptr) {
+            return true;
+        }
+        std::free(probe);
+    }
+    if (require_fail_malloc()) {
+        check(false, "failure injection is required but the interposer is unavailable or inert");
+    } else {
+        skip(name);
+    }
+    return false;
 }
 
 static void test_pooled_lease() {
@@ -515,13 +552,19 @@ static void test_pool_lifetime() {
 }
 
 static bool batch_init_failure_matches(const llama_batch & batch, int index) {
+    const bool embd = batch.embd != nullptr;
+    const bool pos = batch.pos != nullptr;
+    const bool nseq = batch.n_seq_id != nullptr;
+    const bool seq = batch.seq_id != nullptr;
+    const bool seq0 = seq && batch.seq_id[0] != nullptr;
+    const bool logits = batch.logits != nullptr;
     switch (index) {
-        case 0: return batch.embd == nullptr;
-        case 1: return batch.embd != nullptr && batch.pos == nullptr;
-        case 2: return batch.pos != nullptr && batch.n_seq_id == nullptr;
-        case 3: return batch.n_seq_id != nullptr && batch.seq_id == nullptr;
-        case 4: return batch.seq_id != nullptr && batch.seq_id[0] == nullptr && batch.logits == nullptr;
-        case 5: return batch.seq_id != nullptr && batch.seq_id[0] != nullptr && batch.logits == nullptr;
+        case 0: return !embd && !pos && !nseq && !seq && !logits;
+        case 1: return  embd && !pos && !nseq && !seq && !logits;
+        case 2: return  embd &&  pos && !nseq && !seq && !logits;
+        case 3: return  embd &&  pos &&  nseq && !seq && !logits;
+        case 4: return  embd &&  pos &&  nseq &&  seq && !seq0 && !logits;
+        case 5: return  embd &&  pos &&  nseq &&  seq &&  seq0 && !logits;
         default: return false;
     }
 }
@@ -532,8 +575,7 @@ static bool batch_init_complete(const llama_batch & batch) {
 }
 
 static void test_real_batch_init_failure() {
-    if (!load_fail_malloc()) {
-        check(true, "real init: failure injection skipped without LD_PRELOAD");
+    if (!fail_malloc_ready("real init: failure injection")) {
         return;
     }
 
@@ -554,13 +596,12 @@ static void test_real_batch_init_failure() {
 }
 
 static void test_real_pooled_failure_retry() {
-    if (!load_fail_malloc()) {
-        check(true, "real init: pooled failure injection skipped without LD_PRELOAD");
+    if (!fail_malloc_ready("real init: pooled failure injection")) {
         return;
     }
 
     set_flag("TP5_MTP_BATCH_POOL", "1");
-    set_flag("TP5_ALLOC_PROBE", nullptr);
+    set_flag("TP5_ALLOC_PROBE", "1");
 
     constexpr int wide = 4;
     float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
@@ -582,14 +623,23 @@ static void test_real_pooled_failure_retry() {
         auto lease = pool.acquire();
         lease.set(3, 0, 1, embd, wide);
         check(lease.batch().token[0] == 3, "real init: the pooled slot retries after the failure");
+
+        // Slot 0 is pooled; a fallback lease records slot == slots_.size().
+        bool pooled = false;
+        for (const auto & event : pool.events()) {
+            if (event.action == tq::alloc::LeaseAction::lease) {
+                pooled = event.slot == 0;
+            }
+        }
+        check(pooled, "real init: the retry used the pooled slot, not the fallback");
     }
 
+    set_flag("TP5_ALLOC_PROBE", nullptr);
     set_flag("TP5_MTP_BATCH_POOL", nullptr);
 }
 
 static void test_real_fallback_failure_retry() {
-    if (!load_fail_malloc()) {
-        check(true, "real init: fallback failure injection skipped without LD_PRELOAD");
+    if (!fail_malloc_ready("real init: fallback failure injection")) {
         return;
     }
 
@@ -620,8 +670,9 @@ static void test_real_fallback_failure_retry() {
 
     // The fallback token is the seventh allocation after a complete six-array
     // llama_batch_init(1, wide, 1).
+    constexpr int batch_allocs = 6;
     tq::tp5::mtp_batch_pool token_pool(1, wide);
-    g_fail_malloc_arm(6);
+    g_fail_malloc_arm(batch_allocs);
     bool threw = false;
     try {
         auto lease = token_pool.acquire();
@@ -656,7 +707,7 @@ int main() {
     test_real_pooled_failure_retry();
     test_real_fallback_failure_retry();
 
-    std::printf("%s failures=%d\n", g_failures ? "FAILED" : "OK", g_failures);
+    std::printf("%s failures=%d skips=%d\n", g_failures ? "FAILED" : "OK", g_failures, g_skips);
 
     return g_failures ? 1 : 0;
 }

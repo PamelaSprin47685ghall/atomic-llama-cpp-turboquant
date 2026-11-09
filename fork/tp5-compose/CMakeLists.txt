@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(TQTP5Compose VERSION 0.1.0 LANGUAGES CXX)
+project(TQTP5Compose VERSION 0.1.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -81,10 +81,15 @@ if(BUILD_TESTING)
     target_compile_definitions(tq_tp5_host_pool_tests PRIVATE
         TP5_TEST_VOCAB_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/../../models/ggml-vocab-command-r.gguf")
     target_link_libraries(tq_tp5_host_pool_tests PRIVATE llama ${CMAKE_DL_LIBS})
-    add_test(NAME tq-tp5-host-pool COMMAND tq_tp5_host_pool_tests)
     if(UNIX AND NOT APPLE)
-        set_tests_properties(tq-tp5-host-pool PROPERTIES
-            ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:tp5_fail_malloc>")
+        # Wrap with cmake -E env: ENVIRONMENT genex expansion is not
+        # guaranteed at the declared CMake 3.21 minimum.
+        add_test(NAME tq-tp5-host-pool COMMAND ${CMAKE_COMMAND} -E env
+            "LD_PRELOAD=$<TARGET_FILE:tp5_fail_malloc>"
+            "TP5_REQUIRE_FAIL_MALLOC=1"
+            $<TARGET_FILE:tq_tp5_host_pool_tests>)
+    else()
+        add_test(NAME tq-tp5-host-pool COMMAND tq_tp5_host_pool_tests)
     endif()
     if(TQ_TP5_BUILD_HIP_TESTS)
         add_executable(tq_tp5_q8_f32_tests tests/test-q8-f32.cpp)

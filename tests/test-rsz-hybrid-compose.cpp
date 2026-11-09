@@ -153,7 +153,7 @@ bool decode_batch(llama_context * ctx, const std::vector<token_step> & ts) {
     llama_batch b = llama_batch_init((int32_t) ts.size(), 0, 1);
     if (!llama_batch_is_complete(&b, (int32_t) ts.size(), false, true)) {
         llama_batch_free(b);
-        GGML_ABORT("llama_batch_init failed");
+        return false;
     }
     b.n_tokens = (int32_t) ts.size();
     for (size_t i = 0; i < ts.size(); ++i) {

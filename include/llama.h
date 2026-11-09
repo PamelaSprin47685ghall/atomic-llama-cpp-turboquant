@@ -1412,11 +1412,15 @@ extern "C" {
     // If embd != 0, llama_batch.embd will be allocated with size of n_tokens * embd * sizeof(float)
     // Otherwise, llama_batch.token will be allocated to store n_tokens llama_token
     // The rest of the llama_batch members are allocated with size n_tokens
-    // On success, all members are allocated but left uninitialized.
-    // On allocation failure or an invalid extent, every field that could not be
-    // allocated is null; the function never dereferences a failed allocation and
-    // never throws. The caller must check every field it uses and call
-    // llama_batch_free() on the partial batch before discarding it.
+    // n_tokens must be positive, embd non-negative, and n_seq_max positive;
+    // an invalid extent returns an empty batch.
+    // On success, the selected token or embd array and every common array are
+    // allocated. Their contents are uninitialized except that seq_id[i] is
+    // non-null for i < n_tokens and seq_id[n_tokens] is the null sentinel.
+    // On allocation failure, every field that could not be allocated is null;
+    // the function never dereferences a failed allocation and never throws.
+    // The caller must check every field it uses and call llama_batch_free() on
+    // the partial batch before discarding it.
     LLAMA_API struct llama_batch llama_batch_init(
             int32_t n_tokens,
             int32_t embd,
@@ -1424,6 +1428,8 @@ extern "C" {
 
     // Frees a batch of tokens allocated with llama_batch_init()
     // Safe for a partially allocated batch returned after an allocation failure.
+    // The seq_id pointer array must end with a null sentinel; llama_batch_init
+    // always sets it.
     LLAMA_API void llama_batch_free(struct llama_batch batch);
 
     // Returns true when every array needed for n_tokens rows is present.
@@ -1431,6 +1437,9 @@ extern "C" {
     // input. A batch returned by llama_batch_init can be incomplete after an
     // allocation failure; check it before use and call llama_batch_free() when
     // this returns false.
+    // n_tokens must equal the capacity passed to llama_batch_init (or the
+    // number of initialized seq_id entries). llama_batch does not store the
+    // capacity, so a larger value reads past seq_id.
     static inline bool llama_batch_is_complete(
             const struct llama_batch * batch,
             int32_t n_tokens,
