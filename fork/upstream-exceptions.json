@@ -510,27 +510,27 @@
     },
     {
       "path": "src/llama-kv-cache.cpp",
-      "sha256": "1b50c714a6ca94a841c3c6cc27954bb942fef9ad188226241bf31321a926f7d0",
+      "sha256": "1d18cf8b7e2e12f8bdd56736a1c0beda18580a8e33dbb9e232cdfe41fdf2b6d5",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
         "fork/tests/a-seams",
         "tq-tp5-compose (WS3 host pool)"
       ],
-      "reason": "Resolve logical keys only inside A after allocation; reject missing, shifted, duplicate, ambiguous or pending peer identities. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL and TP5_DECODE_SCRATCH_POOL, returning the scratch on every non-transfer exit. The prepare restore runs on success and on the find_slot failure path, reads each head at sinfo.strm[s] rather than the loop index s, and undoes every recorded trial placement. An allocation failure after apply_ubatch is a C++ exception escaping llama_decode, not a llama_decode return, and the documented abort (2) / fatal (< -1) partial-memory rule only covers the normal return path. Fill a prefab envelope mask with an explicit real-row count, then replicate the last real row into the pad rows.",
-      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+      "reason": "Resolve logical keys only inside A after allocation; reject missing, shifted, duplicate, ambiguous or pending peer identities. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL and TP5_DECODE_SCRATCH_POOL, returning the scratch on every non-transfer exit. The prepare restore runs on success and on the find_slot failure path, reads each head at sinfo.strm[s] rather than the loop index s, and undoes every recorded trial placement. An allocation failure after apply_ubatch is a C++ exception escaping llama_decode, not a llama_decode return, and the documented abort (2) / fatal (< -1) partial-memory rule only covers the normal return path. The pooled prepare skips the last trial only when n_swa == 0 and swa_type == LLAMA_SWA_TYPE_NONE; with SWA active every ubatch is trialled so apply_ubatch()'s seq_rm purge keeps the reference path's timing. The real-cache SWA counterexample covers the earlier-window purge. The exception boundary is unchanged: an allocation failure after an earlier apply unwinds past restore_cells; no no-throw rollback because set() allocates. Fill a prefab envelope mask with an explicit real-row count, then replicate the last real row into the pad rows.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views, recurrent-state lifetime control and SWA/reference purge timing, or when the installed RERoT consumer is removed; rerun independent attention, SWA purge-timing and native lifecycle gates."
     },
     {
       "path": "src/llama-kv-cache.h",
-      "sha256": "beaa815a0ea1638c6ef9b94b6e958586557cfb1270f40a8092f8a1b2ae0a5e9e",
+      "sha256": "35574422ffeadc7804ff227af348d7b90c30aebfbb861647a881f5c14e4448ff",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
         "fork/tests/a-seams",
         "tq-tp5-compose (WS3 host pool)"
       ],
-      "reason": "Keep explicit reader views and expose internal preparation and resolution to the native graph builder. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL and TP5_DECODE_SCRATCH_POOL. Expose the inline restore helper that both prepare paths use, so the multi-stream head index is tested once; it reads v_heads_old[sinfo.strm[s]] and v_cells_old[s]. The batch context is non-copyable and non-movable because it owns the exclusive decode scratch; a copy would create a second owner and return the same scratch twice, and a move would leave the source still holding it. Declare the shared KQ-mask fill with an explicit real-row count for prefab envelopes.",
-      "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
+      "reason": "Keep explicit reader views and expose internal preparation and resolution to the native graph builder. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL and TP5_DECODE_SCRATCH_POOL. Expose the inline restore helper that both prepare paths use, so the multi-stream head index is tested once; it reads v_heads_old[sinfo.strm[s]] and v_cells_old[s]. The batch context is non-copyable and non-movable because it owns the exclusive decode scratch; a copy would create a second owner and return the same scratch twice, and a move would leave the source still holding it. Expose a test-only friend access for the real-cache SWA prepare test; it adds no runtime behavior. The last-trial skip is gated on inactive SWA. Declare the shared KQ-mask fill with an explicit real-row count for prefab envelopes.",
+      "removal_condition": "Remove when the selected upstream provides equivalent public reader views, recurrent-state lifetime control and SWA/reference purge timing, or when the installed RERoT consumer is removed; rerun independent attention, SWA purge-timing and native lifecycle gates."
     },
     {
       "path": "src/llama-memory-hybrid.h",
@@ -821,13 +821,13 @@
     },
     {
       "path": "tests/test-tp5-ubatch-pool.cpp",
-      "sha256": "ffd14c9077c1e690653bbb0a9f15e4a94128b3661e7e41822ac90ad3537d2326",
+      "sha256": "3775b34915d44137a16f144b21987b4a7bb0c3f90ef2e03a01cf313441f859a4",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
       ],
-      "reason": "Check slot reuse, generations, concurrency, steady-state allocation, cp_into value equality, exclusive decode-scratch hand-out under contention, and the multi-stream reverse restore with non-identity stream order on the success and find_slot failure paths.",
-      "removal_condition": "Remove when the pool is unconditional and the equivalent checks live in the upstream test suite."
+      "reason": "Check slot reuse, generations, concurrency, steady-state allocation, cp_into value equality, exclusive decode-scratch hand-out under contention, and the multi-stream reverse restore with non-identity stream order on the success and find_slot failure paths. Construct a real llama_kv_cache with n_swa=512 and two ubatches: the last trial overwrites a masked cell and purges earlier-window cells; reference and pooled must leave the same cache. A non-SWA control still skips the last trial and leaves the same restored cache; the unconditional-skip negative control fails the SWA check.",
+      "removal_condition": "Remove when the pool is unconditional, the equivalent checks and the real-cache SWA purge-timing counterexample live in the upstream test suite."
     },
     {
       "path": "ggml/include/ggml-relay-plan.h",

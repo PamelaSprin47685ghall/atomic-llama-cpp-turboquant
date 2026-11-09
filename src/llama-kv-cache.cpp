@@ -1486,19 +1486,42 @@ bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, sl
     // keep the elements that res already holds: their inner vectors keep their capacity
     res.resize(ubatches.size());
 
+    // The last trial can be skipped only when apply_ubatch() has no SWA
+    // purge. The purge removes cells outside sinfo.idxs and is not restored,
+    // so deferring it to the real apply would change what earlier ubatches'
+    // graphs read. With SWA active, trial every ubatch as the reference path
+    // does.
+    const bool skip_last_trial = n_swa == 0 && swa_type == LLAMA_SWA_TYPE_NONE;
+
     bool success = true;
 
     for (size_t i = 0; i < ubatches.size(); ++i) {
         const auto & ubatch = ubatches[i];
+        const bool last = i + 1 == ubatches.size();
+        const bool skip = skip_last_trial && last;
 
-        snapshot_slot * st = snapshots.acquire();
+        snapshot_slot * st = nullptr;
 
-        if (st == nullptr) {
-            // the pool is exhausted: use a heap snapshot that dies with the guard
-            fallback.push_back(std::make_unique<snapshot_slot>());
-            st = fallback.back().get();
-        } else {
-            pooled.push_back(st);
+        if (!skip) {
+            st = snapshots.acquire();
+
+            if (st == nullptr) {
+                // the pool is exhausted: use a heap snapshot that dies with the guard
+                fallback.push_back(std::make_unique<snapshot_slot>());
+                st = fallback.back().get();
+            } else {
+                pooled.push_back(st);
+            }
+        }
+
+        if (skip) {
+            // No later find_slot observes this placement and the real apply
+            // rebuilds it after the earlier trials are restored. The output
+            // slot is written in place, so no snapshot is acquired.
+            if (!find_slot(ubatch, false, res[i])) {
+                success = false;
+            }
+            break;
         }
 
         // only find a suitable slot for the ubatch. don't modify the cells yet
@@ -1527,10 +1550,16 @@ bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, sl
         apply_ubatch(st->sinfo, ubatch);
     }
 
-    GGML_ASSERT(!states.empty() || !success);
+    GGML_ASSERT(!success || states.size() + (skip_last_trial ? 1 : 0) == ubatches.size());
 
-    // the same always-run reverse restore as prepare_reference(); the
-    // exception note there applies here too
+    // The reverse restore covers every recorded trial. With SWA active the
+    // last ubatch is recorded too, so the reference path's purge timing is
+    // preserved; without SWA its skipped apply has no cache side effect. An
+    // allocation failure after an earlier apply still unwinds past this loop:
+    // no no-throw rollback is possible because restore_cells() ->
+    // llama_kv_cells::set() re-inserts into std::set/std::map and allocates.
+    // That is the documented C++-exception boundary, not a llama_decode
+    // return.
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
         restore_cells(v_cells, v_heads, (*it)->sinfo, (*it)->v_heads_old, (*it)->v_cells);
     }

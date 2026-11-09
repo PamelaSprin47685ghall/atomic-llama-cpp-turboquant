@@ -77,6 +77,16 @@ emitted-text bound, and `push_into` grows the text geometrically past it. The po
 `TP5_MTP_BATCH_POOL`, `TP5_TEXT_POOL`) are exact-`1` and default off; the
 default path keeps the pre-pool allocations.
 
+With `TP5_KV_SNAPSHOT_POOL` or `TP5_DECODE_SCRATCH_POOL` on, the pooled KV
+prepare trials every ubatch except the last only when the cache has no SWA
+(`n_swa == 0` and `swa_type == LLAMA_SWA_TYPE_NONE`). No later `find_slot`
+observes the last placement, so its output slot is written directly and the
+snapshot/apply/restore is not spent on it. With SWA active, every ubatch is
+trialled: `apply_ubatch()`'s `seq_rm` purge removes cells outside the trial
+slot and is not restored, so deferring it would change what earlier ubatches'
+graphs read. The reference path (`prepare_reference`) keeps the full trial
+sequence.
+
 A prepares every rank/stage and mapped communication allocation before starting
 an epoch. Each partial-sum boundary uses two bounded single-workgroup kernels:
 producer copy plus all-writer publication; exact-epoch wait plus output copy and

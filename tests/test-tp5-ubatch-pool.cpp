@@ -8,6 +8,10 @@
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cells.h"
 #include "../src/llama-ubatch-pool.h"
+#include "../src/llama-batch.h"
+#include "../src/llama-hparams.h"
+#include "../src/llama-model.h"
+#include "ggml-backend.h"
 
 #include <atomic>
 #include <cstdio>
@@ -613,6 +617,242 @@ static void test_restore_cells_multi_stream() {
     }
 }
 
+// The CPU test seam for the real-cache SWA counterexample. It calls the
+// production prepare paths and reads the cells/heads they mutate; it adds no
+// runtime behavior.
+struct llama_kv_cache_prepare_test_access {
+    static llama_kv_cache::slot_info_vec_t prepare_reference(
+            llama_kv_cache & kv, const std::vector<llama_ubatch> & ubatches) {
+        return kv.prepare_reference(ubatches);
+    }
+
+    static bool prepare_into(
+            llama_kv_cache & kv, const std::vector<llama_ubatch> & ubatches,
+            llama_kv_cache::slot_info_vec_t & res) {
+        return kv.prepare_into(ubatches, res, nullptr);
+    }
+
+    static llama_kv_cells & cells(llama_kv_cache & kv, uint32_t stream) {
+        return kv.v_cells[stream];
+    }
+
+    static std::vector<uint32_t> & heads(llama_kv_cache & kv) {
+        return kv.v_heads;
+    }
+};
+
+// A model that exists only to carry hparams. The loaders are never called;
+// the cache constructor only reads hparams and the CPU buffer type.
+struct test_stub_model : llama_model {
+    explicit test_stub_model(const llama_model_params & params) : llama_model(params) {}
+
+    void load_stats        (struct llama_model_loader &) override {}
+    void load_hparams      (struct llama_model_loader &) override {}
+    void load_vocab        (struct llama_model_loader &) override {}
+    bool load_tensors      (struct llama_model_loader &) override { return false; }
+    void load_arch_hparams (struct llama_model_loader &) override {}
+    void load_arch_tensors (struct llama_model_loader &) override {}
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params &) const override {
+        return nullptr;
+    }
+};
+
+struct test_kv_fixture {
+    ggml_backend_dev_t devices[1] = { nullptr };
+    test_stub_model *  model      = nullptr;
+
+    test_kv_fixture(uint32_t n_swa, llama_swa_type swa_type) {
+        llama_model_params mp = llama_model_default_params();
+        mp.n_gpu_layers = 0;
+        mp.vocab_only   = true;
+        mp.devices      = devices;
+
+        model = new test_stub_model(mp);
+
+        model->hparams.n_layer_all          = 1;
+        model->hparams.n_layer_nextn        = 0;
+        model->hparams.n_embd               = 8;
+        model->hparams.n_ctx_train          = 1024;
+        model->hparams.n_head_arr[0]        = 1;
+        model->hparams.n_head_kv_arr[0]     = 1;
+        model->hparams.n_embd_head_k_full   = 8;
+        model->hparams.n_embd_head_v_full   = 8;
+        model->hparams.n_embd_head_k_swa    = 8;
+        model->hparams.n_embd_head_v_swa    = 8;
+        model->hparams.is_swa_impl[0]       = swa_type != LLAMA_SWA_TYPE_NONE ? 1 : 0;
+        model->hparams.n_swa                = n_swa;
+        model->hparams.swa_type             = swa_type;
+        model->hparams.n_layer_kv_from_start = -1;
+    }
+
+    ~test_kv_fixture() {
+        delete model;
+    }
+};
+
+static llama_kv_cache * make_test_cache(
+        test_kv_fixture & f, uint32_t n_swa, llama_swa_type swa_type, uint32_t kv_size) {
+    return new llama_kv_cache(
+            *f.model, f.model->hparams,
+            GGML_TYPE_F32, GGML_TYPE_F32,
+            /*v_trans=*/false,
+            /*offload=*/false,
+            /*unified=*/true,
+            kv_size,
+            /*n_seq_max=*/1,
+            /*n_pad=*/1,
+            n_swa,
+            swa_type,
+            /*mem_other=*/nullptr,
+            /*filter=*/{},
+            /*reuse=*/{},
+            /*share=*/{});
+}
+
+static void seed_test_cache(llama_kv_cache & kv, uint32_t n_cells, uint32_t gap0, uint32_t gap1, uint32_t head) {
+    auto & cells = llama_kv_cache_prepare_test_access::cells(kv, 0);
+
+    for (uint32_t i = 0; i < n_cells; ++i) {
+        if (i == gap0 || i == gap1) {
+            continue;
+        }
+
+        cells.pos_set(i, static_cast<llama_pos>(i));
+        cells.seq_add(i, 0);
+    }
+
+    llama_kv_cache_prepare_test_access::heads(kv)[0] = head;
+}
+
+struct test_ubatch {
+    llama_token  token     = 1;
+    llama_pos    pos;
+    int32_t      n_seq_id  = 1;
+    llama_seq_id seq       = 0;
+    llama_seq_id * seq_ptr = &seq;
+    int8_t       output    = 0;
+    int32_t      seq_idx[LLAMA_MAX_SEQ];
+    llama_ubatch ub        = {};
+
+    explicit test_ubatch(llama_pos p) : pos(p) {
+        for (int i = 0; i < LLAMA_MAX_SEQ; ++i) {
+            seq_idx[i] = -1;
+        }
+        seq_idx[0] = 0;
+
+        ub.n_tokens     = 1;
+        ub.n_seq_tokens = 1;
+        ub.n_seqs       = 1;
+        ub.n_seqs_unq   = 1;
+        ub.n_pos        = 1;
+        ub.token        = &token;
+        ub.pos          = &pos;
+        ub.n_seq_id     = &n_seq_id;
+        ub.seq_id       = &seq_ptr;
+        ub.seq_id_unq   = &seq;
+        ub.seq_idx      = seq_idx;
+        ub.output       = &output;
+    }
+};
+
+struct test_prepare_result {
+    bool ok = false;
+    llama_kv_cache::slot_info_vec_t res;
+};
+
+static test_prepare_result run_test_prepare(
+        llama_kv_cache & kv, const std::vector<llama_ubatch> & ubatches, bool pooled) {
+    test_prepare_result out;
+
+    if (pooled) {
+        out.res.resize(ubatches.size());
+        out.ok = llama_kv_cache_prepare_test_access::prepare_into(kv, ubatches, out.res);
+    } else {
+        out.res = llama_kv_cache_prepare_test_access::prepare_reference(kv, ubatches);
+        out.ok  = !out.res.empty();
+    }
+
+    return out;
+}
+
+// SWA counterexample: the last trial overwrites a masked old cell and its
+// seq_rm purge removes positions outside the trial slot. The reference path
+// purges during prepare; a pooled path that skips the last trial would defer
+// the purge until after the earlier ubatches' graphs read the cache.
+static void test_swa_last_trial_purge() {
+    test_kv_fixture f(512, LLAMA_SWA_TYPE_STANDARD);
+
+    test_ubatch a(900);
+    test_ubatch b(1024);
+    const std::vector<llama_ubatch> ubatches = { a.ub, b.ub };
+
+    for (int pooled = 0; pooled < 2; ++pooled) {
+        llama_kv_cache * kv = make_test_cache(f, 512, LLAMA_SWA_TYPE_STANDARD, 1024);
+        seed_test_cache(*kv, 1024, 399, 900, 399);
+
+        const auto r = run_test_prepare(*kv, ubatches, pooled != 0);
+
+        check(r.ok, pooled ? "swa pooled: prepare succeeds" : "swa reference: prepare succeeds");
+        check(r.res.size() == 2, pooled ? "swa pooled: two slots" : "swa reference: two slots");
+
+        if (r.res.size() == 2) {
+            check(r.res[0].idxs[0].size() == 1 && r.res[0].idxs[0][0] == 399,
+                  pooled ? "swa pooled: first slot" : "swa reference: first slot");
+            check(r.res[1].idxs[0].size() == 1 && r.res[1].idxs[0][0] == 400,
+                  pooled ? "swa pooled: last slot" : "swa reference: last slot");
+        }
+
+        auto & cells = llama_kv_cache_prepare_test_access::cells(*kv, 0);
+        check(cells.is_empty(390),
+              pooled ? "swa pooled: earlier-window cell purged" : "swa reference: earlier-window cell purged");
+        check(cells.pos_get(400) == 400,
+              pooled ? "swa pooled: overwritten cell restored" : "swa reference: overwritten cell restored");
+        check(cells.pos_get(401) == 401,
+              pooled ? "swa pooled: later cell retained" : "swa reference: later cell retained");
+        check(llama_kv_cache_prepare_test_access::heads(*kv)[0] == 399,
+              pooled ? "swa pooled: head restored" : "swa reference: head restored");
+
+        delete kv;
+    }
+}
+
+// Non-SWA control: the last trial is still skipped, but apply_ubatch has no
+// purge. Both paths must leave the same restored cache and output slots.
+static void test_non_swa_last_trial_skip() {
+    test_kv_fixture f(0, LLAMA_SWA_TYPE_NONE);
+
+    test_ubatch a(6);
+    test_ubatch b(7);
+    const std::vector<llama_ubatch> ubatches = { a.ub, b.ub };
+
+    for (int pooled = 0; pooled < 2; ++pooled) {
+        llama_kv_cache * kv = make_test_cache(f, 0, LLAMA_SWA_TYPE_NONE, 8);
+        seed_test_cache(*kv, 6, ~0u, ~0u, 6);
+
+        const auto r = run_test_prepare(*kv, ubatches, pooled != 0);
+
+        check(r.ok, pooled ? "non-swa pooled: prepare succeeds" : "non-swa reference: prepare succeeds");
+        check(r.res.size() == 2, pooled ? "non-swa pooled: two slots" : "non-swa reference: two slots");
+
+        if (r.res.size() == 2) {
+            check(r.res[0].idxs[0].size() == 1 && r.res[0].idxs[0][0] == 6,
+                  pooled ? "non-swa pooled: first slot" : "non-swa reference: first slot");
+            check(r.res[1].idxs[0].size() == 1 && r.res[1].idxs[0][0] == 7,
+                  pooled ? "non-swa pooled: last slot" : "non-swa reference: last slot");
+        }
+
+        auto & cells = llama_kv_cache_prepare_test_access::cells(*kv, 0);
+        check(cells.get_used() == 6,
+              pooled ? "non-swa pooled: cache restored" : "non-swa reference: cache restored");
+        check(cells.is_empty(6) && cells.is_empty(7),
+              pooled ? "non-swa pooled: trial cells empty" : "non-swa reference: trial cells empty");
+        check(llama_kv_cache_prepare_test_access::heads(*kv)[0] == 6,
+              pooled ? "non-swa pooled: head restored" : "non-swa reference: head restored");
+
+        delete kv;
+    }
+}
+
 int main() {
     test_reuse_and_lifetime();
     test_pool_outlives_owner();
@@ -624,6 +864,8 @@ int main() {
     test_kv_snapshot_slot_reuse();
     test_kv_cells_cp_into();
     test_restore_cells_multi_stream();
+    test_swa_last_trial_purge();
+    test_non_swa_last_trial_skip();
 
     std::printf("%s failures=%d allocs=%lld frees=%lld\n",
                 g_failures ? "FAILED" : "OK", g_failures,

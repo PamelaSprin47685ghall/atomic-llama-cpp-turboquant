@@ -553,6 +553,10 @@ private:
     const llama_model & model;
     const llama_hparams & hparams;
 
+    // CPU test seam: constructs a real cache and calls the production prepare
+    // paths to cover the SWA purge timing. It adds no runtime behavior.
+    friend struct llama_kv_cache_prepare_test_access;
+
     // the pre-pool implementation of prepare(), kept as the flag-off path
     slot_info_vec_t prepare_reference(const std::vector<llama_ubatch> & ubatches);
 
