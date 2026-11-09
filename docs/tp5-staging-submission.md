@@ -27,9 +27,11 @@ The CUDA backend's host-only staging `api` table is versioned. Version 2 added
 `mark_partial` after the complete v1 prefix; version 3 appends `kind_count`
 after `mark_partial`. A v1 table cannot publish a partial submission; a v2
 table cannot advertise its kind domain. Both are **rejected at registration**
-before any later field is read. Rejection disables staging globally; the
-original copy path is used. This is an explicit mode, not a claim of
-equivalent performance. A v3 table is accepted only when `mark_partial` is
+before any later field is read. A rejected registration does not replace an
+existing table: if a v3 table is already registered it remains in use; if
+none is registered, staging stays unregistered and the original copy path is
+used. This is an explicit mode, not a claim of equivalent performance. A v3
+table is accepted only when `mark_partial` is
 present and `kind_count` covers the host's full kind domain. Mixed v1/v2/v3
 installs are explicitly unsupported; a provider with a smaller kind domain is
 rejected instead of receiving kind values it would treat as invalid. The CPU

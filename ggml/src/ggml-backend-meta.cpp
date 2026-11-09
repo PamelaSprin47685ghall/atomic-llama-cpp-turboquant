@@ -38,28 +38,31 @@ extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
     if (impl == nullptr) {
         return false;
     }
-    // Rejection disables staging globally and the original copy path is used.
-    // This is an explicit mode, not a claim of equivalent performance.
+    // A rejected registration does not replace an existing table. If none is
+    // registered, staging stays unregistered and the original copy path is
+    // used. This is not a claim of equivalent performance.
+    const bool had_registration = g_staging_api.load(std::memory_order_acquire) != nullptr;
+    const char * state = had_registration
+        ? "existing registration unchanged"
+        : "no prior registration (staging unregistered)";
     const auto * api = static_cast<const ggml_cuda_staging::api *>(impl);
     if (api->abi_version != ggml_cuda_staging::kApiVersion) {
         // Do not read any later field: v1 ends before mark_partial and v2 ends
         // before kind_count. Mixed versions are explicitly unsupported.
-        GGML_LOG_WARN("%s: rejecting staging api table abi_version=%u (expected %u); "
-                      "staging is disabled and the original copy path is used\n",
+        GGML_LOG_WARN("%s: rejected provider registration (abi_version=%u, expected %u); %s\n",
                       __func__, unsigned(api->abi_version),
-                      unsigned(ggml_cuda_staging::kApiVersion));
+                      unsigned(ggml_cuda_staging::kApiVersion), state);
         return false;
     }
     if (api->mark_partial == nullptr) {
-        GGML_LOG_WARN("%s: rejecting staging api table without mark_partial; "
-                      "staging is disabled and the original copy path is used\n", __func__);
+        GGML_LOG_WARN("%s: rejected provider registration (missing mark_partial); %s\n",
+                      __func__, state);
         return false;
     }
     if (api->kind_count < ggml_cuda_staging::kKindCount) {
-        GGML_LOG_WARN("%s: rejecting staging api table kind_count=%u (host needs %u); "
-                      "staging is disabled and the original copy path is used\n",
+        GGML_LOG_WARN("%s: rejected provider registration (kind_count=%u, host needs %u); %s\n",
                       __func__, unsigned(api->kind_count),
-                      unsigned(ggml_cuda_staging::kKindCount));
+                      unsigned(ggml_cuda_staging::kKindCount), state);
         return false;
     }
     g_staging_api.store(api, std::memory_order_release);
