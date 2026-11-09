@@ -348,6 +348,22 @@ void test_into_capacity_stability() {
           "into loop finish lost state");
 }
 
+void test_into_geometric_growth() {
+    generation_stream stream;
+    std::string out;
+    std::size_t capacity = out.capacity();
+    std::size_t growths = 0;
+    for (std::size_t i = 0; i < 100000; ++i) {
+        stream.push_into("x", out);
+        if (out.capacity() != capacity) {
+            capacity = out.capacity();
+            ++growths;
+        }
+    }
+    check(out.size() == 100000, "geometric growth lost bytes");
+    check(growths <= 64, "push_into did not grow the destination geometrically");
+}
+
 void test_into_append() {
     generation_stream stream({"END"});
     std::string out = "head:";
@@ -375,6 +391,7 @@ int main() {
         test_ownership_and_move();
         test_into_equivalence();
         test_into_capacity_stability();
+        test_into_geometric_growth();
         test_into_append();
         std::cout << "{\"status\":\"pass\",\"partition_and_adversarial_runs\":" << checked_runs
                   << ",\"generated_inputs\":300,\"long_prefix_input_bytes\":131073"

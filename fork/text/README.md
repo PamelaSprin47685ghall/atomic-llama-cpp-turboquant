@@ -48,6 +48,8 @@ auto last = text.push("d>ignored");
 
 Empty deltas are valid. A token piece may contain only an incomplete UTF-8 sequence or a possible stop prefix. The caller must not emit the original piece while its bytes are held by the stream.
 
+`push_into(std::string_view, std::string & out)` and `finish_into(std::string & out)` append the same bytes directly to a caller-owned string and return a `stream_event` with the same offset, finished flag, and stop index. The destination's existing bytes are included in the capacity checks. A destination that the caller has pre-reserved is not reallocated; otherwise the destination grows geometrically. `push()` and `finish()` are wrappers that own the result string.
+
 Offsets count displayed output bytes. They do not count input bytes, token IDs, Unicode characters, or model positions. A consumer can verify that each delta starts exactly where the previous one ended. Editing a returned string does not change later offsets or results.
 
 The constructor validates and copies the stop strings. Later changes to the caller's vector do not change a stream. Streams cannot be copied. Moving one transfers its configuration, pending text, byte cursor, and terminal state; the moved-from object is finished with an empty result and a zero offset. There is no implicit reset or shared mutable state.

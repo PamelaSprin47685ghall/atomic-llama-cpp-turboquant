@@ -95,13 +95,26 @@ stream_event generation_stream::prepare_event(std::size_t incoming, std::string 
     auto room = out.max_size();
     const auto cursor_room = std::numeric_limits<std::uint64_t>::max() - emitted_;
     if (cursor_room < room) { room = static_cast<std::size_t>(cursor_room); }
-    if (pending_size_ > room || utf8_size_ > (room - pending_size_) / 3) {
+    // The destination may already hold text. Account for it in both limits.
+    const std::size_t used = out.size();
+    if (used > room || pending_size_ > room - used ||
+        utf8_size_ > (room - used - pending_size_) / 3) {
         throw std::length_error("text output exceeds its byte counter");
     }
     const auto held = pending_size_ + 3 * utf8_size_;
-    if (incoming > (room - held) / 3) { throw std::length_error("text message exceeds output capacity"); }
-    // Reserve before changing state. One invalid input byte can produce three output bytes.
-    out.reserve(out.size() + held + 3 * incoming);
+    if (incoming > (room - used - held) / 3) { throw std::length_error("text message exceeds output capacity"); }
+    // Reserve before changing state. One invalid input byte can produce three
+    // output bytes. Grow geometrically: an exact reserve would reallocate on
+    // every call when the caller does not pre-reserve the destination.
+    const std::size_t need = used + held + 3 * incoming;
+    if (need > out.capacity()) {
+        const std::size_t limit = std::numeric_limits<std::size_t>::max();
+        std::size_t target = need;
+        if (out.capacity() <= limit / 2) {
+            target = std::max(target, out.capacity() * 2);
+        }
+        out.reserve(target);
+    }
     return result;
 }
 
