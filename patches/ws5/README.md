@@ -26,7 +26,7 @@ explicitly. This keeps the F2/OFF leg equivalent to stock.
 | `GGML_TP5_POOL_EXACT` | `0` → 384 MiB | `1` | exact per-plan layout, 8 MiB baseline, 68 MiB budget, fail closed |
 | `GGML_TP5_RELAY_SLOT_CHANNELS` | follows `PLAN_UNION` | `1` | 8 plan slots x 256 channel states per window |
 | `GGML_TP5_GRAPH_UID` | `0` | `1` | llama assigns a graph uid after each build |
-| `GGML_TP5_RELAY_VERIFY_UID` | `0` | `1` | uid fast path still computes and asserts the signature |
+| `GGML_TP5_RELAY_VERIFY_UID` | `0` | `1` | uid fast path still computes and asserts the signature; reported as `verify_req/res/exec` |
 | `GGML_TP5_RELAY_PLAN_STATS` | `0` | `1` | print plan/frame/pool counters |
 | `GGML_TP5_RELAY_PLAN_FLUSH` | `0` | `1` | diagnostic: flush every plan on each prepare |
 | `GGML_TP5_LLAMA_PLAN_CACHE` | `0` | `1..8` | llama-side per-shape `llm_graph_result`+scheduler cache; the value is the slot count; relay-only |
@@ -44,6 +44,42 @@ GGML_TP5_GRAPH_UID=1
 
 `GGML_TP5_PLAN_UNION=1` together with `GGML_TP5_RELAY_SLOT_CHANNELS=0` is an
 illegal matrix entry; the runtime patch fails closed on it.
+
+## Verification counters
+
+Verification is invisible in the frame counters: those describe frame
+selection, and a verified fast path selects the same frame as an unverified
+one. `ggml/include/ggml-relay-verify.h` therefore binds three counts to the one
+describe call that verification performs (`relay.hip`, the
+`fast && plan_verify_uid` branch of `submit`). The `verify_submission()` helper
+owns the request -> resolve -> describe -> execute order; `relay.hip` and the
+CPU test call the same helper with a real or fake describe callback.
+
+| Counter | Meaning |
+|---|---|
+| `verify_req` | submissions that reached the relay with verification enabled |
+| `verify_res` | those of them whose uid fast path resolved the frame to reuse |
+| `verify_exec` | verification describes that ran (counted whatever they returned) |
+
+They are nested: `verify_exec <= verify_res <= verify_req`. A run with the
+switch on but no fast path shows `verify_req > 0`, `verify_res = 0`; that is
+the "requested but never resolved" case, not a verification hit. A refused
+submit (busy provider, wrong stage count) never reaches `request()`, so it
+cannot inflate the counts.
+
+Cost is a few predictable branches per submission: no clock, no allocation, no
+atomics (the provider mutex serialises submissions, and the ledger is owned by
+one provider). Counters are cumulative for the provider lifetime; `begin()`,
+plan flushes and frame retirement do not clear them. `verify_ok` on the same
+line reports the nesting check; it is printed only when `GGML_TP5_RELAY_PLAN_STATS=1`
+and is a diagnostic, not a hard assertion.
+
+They print on the existing line, so `GGML_TP5_RELAY_PLAN_STATS=1` is still the
+only switch needed:
+
+```
+TP5_PLAN_STATS destroy … verify_req=523 verify_res=523 verify_exec=523 verify_ok=1
+```
 
 ## llama-side per-shape cache
 

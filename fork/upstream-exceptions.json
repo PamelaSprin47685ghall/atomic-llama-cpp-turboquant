@@ -109,7 +109,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/relay.hip",
-      "sha256": "9ec07069d2fd84b2b67a05c9bdcb573a90da4d5fb24a36edac3b8951892ea8fc",
+      "sha256": "600d494e7c6f8c7360b9eab6ff96406a107c0e351c37abaaa92083cba8e8b259",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution",
@@ -117,7 +117,7 @@
         "fork/tp5-compose native-arithmetic Swift five-HIP single-window execution",
         "fork/tp5-compose native-arithmetic Swift five-HIP two-request execution with independent 262144-capacity contexts"
       ],
-      "reason": "Own complete five-HIP model/relay submission with at most two exact-signature warm/capture/replay definitions and a drain-stable activation word. Prepare all five executables before actual graph launches, retain unknown/unterminated-capture owners, and preserve submission sealing and CPU borrows. Computed ranks retain a separate producer publication kernel. A noncomputed rank publishes its real ready word in the consumer prologue only after the existing fence and block barrier; every rank still performs its actual last-reader acknowledgement. Bounded aligned vector copies remain guarded; hot polling avoids native queries while snapshot/close retains them.  Include ordered channel counts, element counts and each rank terminal pointer, data pointer, dimensions, strides and flags in the replay signature. Rebinding an existing graph from terminal A to B cannot reuse A's executable; content-based A-to-B-to-A reuse remains eligible. The exact-cache change introduces neither generation-only invalidation nor weaker existing ABI-1 layout, drain or borrow contracts. Advertise sealed event availability with a CPU atomic so an event worker with all outputs delivered no longer competes for the next submit snapshot mutex. Abort/failure remains observable even after idle; the real five-rank A/B/A fixture covers an abort after all nine epochs drain. The original sealed-availability and host-instantiation changes add no GPU scheduling edges, extra streams or two-span protocol and do not change arithmetic. Instantiate the five fully ended HIP graphs concurrently using one joined host job per rank. Workers write only their rank's executable and return HIP errors; the owner joins every started job, records allocation/thread/HIP failures and retains partial graph handles. All five executables must exist before any graph launch. Exact replay signatures, initial direct warm, native completion and abort/borrow semantics are unchanged. This is host instantiation parallelism, with no GPU edge removal or extra stream. Cache each frame relay-node total and reset it with that exact frame, so replay accounting does not rescan stage graphs. Maintain per-epoch offered/released contiguous-prefix lower bounds and observed eligibility upper bounds; update eligibility at ready/ack observation and the actual publish/enqueue transitions, preserve holes and original event priority, reset all bounds each epoch, and retain full observation for failure/native-query paths. Add explicitly selected typed F32/F16 wire packing/unpacking with correct physical/logical extents and zero-contributor representation. F16 is an optional transport experiment, not a claimed faster default; all five arrival/release facts and native ownership rules remain unchanged. Restrict the strict relay provider to the one stream-zero lane actually used by graph submission, relay kernels and replay. Before claiming a child, reject existing side streams, concurrent plans or a nonzero current lane; do not clear caller state. Existing per-lane tail record/query, abort, five-rank ready/ack, CPU borrow and drain predicates iterate the admitted actual lane and are unchanged. This avoids constructing and recording tails for unused lanes without claiming hardware queue independence. Add a default-off, exact 0,-1 priority-pair experiment for at most two live or retained providers. Acquire a bounded private lease, query actual physical-device range and existing stream priority/NonBlocking flags before claiming each caller, and create fresh streams with exact checked priority. Never replace a caller stream. Release a lease only on provider deletion after successful unchanged native cleanup; retained unsafe owners keep their lease. All numerical kernels, public tables, submission gate, ready/ack, borrow, abort and native-drain algorithms are unchanged. This source identity is experimental and does not assert a throughput win.",
+      "reason": "Own complete five-HIP model/relay submission with at most two exact-signature warm/capture/replay definitions and a drain-stable activation word. Prepare all five executables before actual graph launches, retain unknown/unterminated-capture owners, and preserve submission sealing and CPU borrows. Computed ranks retain a separate producer publication kernel. A noncomputed rank publishes its real ready word in the consumer prologue only after the existing fence and block barrier; every rank still performs its actual last-reader acknowledgement. Bounded aligned vector copies remain guarded; hot polling avoids native queries while snapshot/close retains them.  Include ordered channel counts, element counts and each rank terminal pointer, data pointer, dimensions, strides and flags in the replay signature. Rebinding an existing graph from terminal A to B cannot reuse A's executable; content-based A-to-B-to-A reuse remains eligible. The exact-cache change introduces neither generation-only invalidation nor weaker existing ABI-1 layout, drain or borrow contracts. Advertise sealed event availability with a CPU atomic so an event worker with all outputs delivered no longer competes for the next submit snapshot mutex. Abort/failure remains observable even after idle; the real five-rank A/B/A fixture covers an abort after all nine epochs drain. The original sealed-availability and host-instantiation changes add no GPU scheduling edges, extra streams or two-span protocol and do not change arithmetic. Instantiate the five fully ended HIP graphs concurrently using one joined host job per rank. Workers write only their rank's executable and return HIP errors; the owner joins every started job, records allocation/thread/HIP failures and retains partial graph handles. All five executables must exist before any graph launch. Exact replay signatures, initial direct warm, native completion and abort/borrow semantics are unchanged. This is host instantiation parallelism, with no GPU edge removal or extra stream. Cache each frame relay-node total and reset it with that exact frame, so replay accounting does not rescan stage graphs. Maintain per-epoch offered/released contiguous-prefix lower bounds and observed eligibility upper bounds; update eligibility at ready/ack observation and the actual publish/enqueue transitions, preserve holes and original event priority, reset all bounds each epoch, and retain full observation for failure/native-query paths. Add explicitly selected typed F32/F16 wire packing/unpacking with correct physical/logical extents and zero-contributor representation. F16 is an optional transport experiment, not a claimed faster default; all five arrival/release facts and native ownership rules remain unchanged. Restrict the strict relay provider to the one stream-zero lane actually used by graph submission, relay kernels and replay. Before claiming a child, reject existing side streams, concurrent plans or a nonzero current lane; do not clear caller state. Existing per-lane tail record/query, abort, five-rank ready/ack, CPU borrow and drain predicates iterate the admitted actual lane and are unchanged. This avoids constructing and recording tails for unused lanes without claiming hardware queue independence. Add a default-off, exact 0,-1 priority-pair experiment for at most two live or retained providers. Acquire a bounded private lease, query actual physical-device range and existing stream priority/NonBlocking flags before claiming each caller, and create fresh streams with exact checked priority. Never replace a caller stream. Release a lease only on provider deletion after successful unchanged native cleanup; retained unsafe owners keep their lease. All numerical kernels, public tables, submission gate, ready/ack, borrow, abort and native-drain algorithms are unchanged. This source identity is experimental and does not assert a throughput win. Bind GGML_TP5_RELAY_VERIFY_UID counters through the shared verify_submission() helper under the provider mutex; print verify_req/res/exec/ok on the plan-stats line.",
       "removal_condition": "Remove when the selected upstream exposes equivalent prepared five-rank HIP execution, CPU publication, actual last-reader and partial-submit completion contracts, and the installed dual-window full-logits, cancellation, bounded-failure and relocation cases pass without these overlays. Remove the TP5 portion when upstream provides equivalent versioned numerical, independent-window, pre-submission, last-reader and native-drain contracts and all installed full-model acceptance cases pass without this change. The decoded-F32 reference consumer retains its historical numerical checks. Native-arithmetic Swift replacements require defect-focused operator evidence, finite natural generation, real five-rank lifecycle evidence and independent paired master performance qualification; archived decoded-F32 logits or token-trajectory equality is not required under the user's current policy. Registering a reviewed hash is not itself runtime qualification. Remove each publication/polling/codec extension when equivalent upstream behavior replaces it or the selected consumer no longer benefits. Preserve exact frame identity, initial direct warm, all-hole/event ordering, native failure/full-snapshot visibility, all five actual ready/ack facts and drain-stable storage. Remove this lane specialization when upstream provides equivalent strict single-stream ownership/admission and native-tail coverage, or the qualified strict profile genuinely requires multiple work lanes with matching drain evidence. Remove the priority-pair experiment if complete paired measurements fail to benefit both requests, or when equivalent qualified upstream stream scheduling replaces it; retain exact native ownership and cleanup evidence."
     },
     {
@@ -168,12 +168,12 @@
     },
     {
       "path": "ggml/CMakeLists.txt",
-      "sha256": "f29244c173f414a2f0ff4b29f539beed13504772333ff001621b1492f8b0d9d3",
+      "sha256": "756472fe6a9aaf418a04bb439df20f1ec3d17abb037cf59126e43a49d4cc6759",
       "mode": "100644",
       "consumers": [
         "fork/tp5-compose real five-HIP Qwen3-8B Q8_0 window execution"
       ],
-      "reason": "Provide an explicit opt-in five-rank native relay capability: prepare complete tensor stages, pre-submit producer/wait/consumer nodes, expose stable CPU payloads and exact-epoch publication, retain unknown native owners. A owns model and device semantics; C composes CPU reduction and independent ownership ledgers. Default execution remains unchanged. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged.",
+      "reason": "Provide an explicit opt-in five-rank native relay capability: prepare complete tensor stages, pre-submit producer/wait/consumer nodes, expose stable CPU payloads and exact-epoch publication, retain unknown native owners. A owns model and device semantics; C composes CPU reduction and independent ownership ledgers. Default execution remains unchanged. TP5 opt-in: complete five-HIP dense model stages, explicit input embedding offload, canonical V layout, synchronized shared metadata, decoded-Q8-weight/F32-activation arithmetic, CPU publication and retained-owner native completion; defaults outside this opted-in profile remain unchanged. Install the new ggml-relay-verify.h public header for the relay verification counters.",
       "removal_condition": "Remove when the selected upstream exposes equivalent prepared five-rank HIP execution, CPU publication, actual last-reader and partial-submit completion contracts, and the installed dual-window full-logits, cancellation, bounded-failure and relocation cases pass without these overlays. Remove the TP5 portion when upstream provides equivalent versioned numerical, independent-window, pre-submission, last-reader and native-drain contracts and all installed full-model acceptance cases pass without this change."
     },
     {
@@ -801,12 +801,12 @@
     },
     {
       "path": "tests/CMakeLists.txt",
-      "sha256": "fc117e099c3b7eef692f24c4ef760c3874c78adbf8082abcc9643368e74154ac",
+      "sha256": "e78ad35683edeba2b34994c693d98d94706c370b95bf58d2bfbbdcfc6faea48f",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
       ],
-      "reason": "Register the TP5 ubatch-pool, staging scheduler/pool/lock, context-retention and prefab sub-envelope CPU tests.",
+      "reason": "Register the TP5 ubatch-pool, staging scheduler/pool/lock, context-retention and prefab sub-envelope CPU tests. Register the relay verification counter CPU test.",
       "removal_condition": "Remove when the pool test moves into the upstream test tree."
     },
     {
@@ -882,6 +882,28 @@
       "removal_condition": "Remove with the WS5 plan-policy implementation."
     },
     {
+      "path": "ggml/include/ggml-relay-verify.h",
+      "sha256": "f5a840f4fc11bd4ce6355f310d91cb2cb073c8a5f0049937bbb8f2fb38d1d2e2",
+      "mode": "100644",
+      "consumers": [
+        "tq-tp5-compose relay verification counters (WS5)",
+        "WS5 relay verification counter CPU test",
+        "relay.hip diagnostic plan stats"
+      ],
+      "reason": "Declare the requested/resolved/executed ledger and the shared verify_submission() helper used by relay.hip and the CPU test. The helper owns the request -> resolve -> describe -> execute order and the fast/switch gate; the provider mutex serialises submissions and all counter reads.",
+      "removal_condition": "Remove with the WS5 relay verification counter instrumentation."
+    },
+    {
+      "path": "tests/test-relay-verify-counters.cpp",
+      "sha256": "b0ee2ca854694ab5f401f23320432053fe93e5d42d129a69bc25d1349adcac0d",
+      "mode": "100644",
+      "consumers": [
+        "WS5 relay verification counter CPU test"
+      ],
+      "reason": "Exercise the shared verify_submission() helper with a fake describe: switch/fast gating, describe-once, failure still counts executed, nested/cumulative counters and the consistency check. The test binds the same orchestration relay.hip calls, not a reimplemented sequence.",
+      "removal_condition": "Remove with the WS5 relay verification counter test target."
+    },
+    {
       "path": "patches/ws5/ggml-backend-meta.cpp.patch",
       "sha256": "d28bfbc9a2eaaa3afba2669aaccdf2db6303bd7db40d6ce61d5f0375883284e4",
       "mode": "100644",
@@ -913,12 +935,12 @@
     },
     {
       "path": "patches/ws5/README.md",
-      "sha256": "9663fbda0f62ece10034292dac037ffb2044bf44207180ba222cbe6a160c5a0b",
+      "sha256": "3d91142be018064d463453f794225e283909eccc75d5dba26bf8d1f3e4a17c4d",
       "mode": "100644",
       "consumers": [
         "integ/tp5-mtp-r28b integration maintainers"
       ],
-      "reason": "Document the WS5 cross-owner patch order, the graph_uid default-off contract, and the OFF/ON switch matrix.",
+      "reason": "Document the WS5 cross-owner patch order, the graph_uid default-off contract, and the OFF/ON switch matrix. Document the relay verification counters and the shared verify_submission() seam.",
       "removal_condition": "Remove after the WS5 patches are upstreamed or folded into the integration commit."
     },
     {

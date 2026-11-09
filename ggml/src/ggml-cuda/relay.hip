@@ -3,6 +3,7 @@
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
 #include "ggml-relay-plan.h"
+#include "ggml-relay-verify.h"
 #include "relay.cuh"
 
 #include <algorithm>
@@ -427,6 +428,10 @@ struct provider {
     uint64_t                               frame_evictions = 0;
     uint64_t                               frame_instantiates = 0;
     uint64_t                               frame_destroys = 0;
+    // Verification evidence for the same gate. Requested counts submissions
+    // that asked for verification, resolved those whose uid fast path found
+    // the frame to verify, executed the describes that actually ran.
+    ggml_relay_verify::ledger              verify;
     std::vector<unsigned char>            signature;
     std::vector<const ggml_tensor *>       tensors;
     std::vector<ggml_tensor *>             tensor_keys;
@@ -1213,7 +1218,8 @@ void log_plan_stats(provider & p, const char * where) {
     const auto & s = p.plan_cache.stats();
     GGML_LOG_INFO("TP5_PLAN_STATS %s hits=%llu misses=%llu inserts=%llu evictions=%llu pinned=%llu "
                   "flushes=%llu stale=%llu live=%zu pool=%zu reallocs=%llu frames_cleared=%llu frames=%zu "
-                  "frame_hits=%llu frame_misses=%llu frame_evict=%llu frame_inst=%llu frame_destroy=%llu\n",
+                  "frame_hits=%llu frame_misses=%llu frame_evict=%llu frame_inst=%llu frame_destroy=%llu "
+                  "verify_req=%llu verify_res=%llu verify_exec=%llu verify_ok=%d\n",
                   where,
                   static_cast<unsigned long long>(s.hits), static_cast<unsigned long long>(s.misses),
                   static_cast<unsigned long long>(s.inserts), static_cast<unsigned long long>(s.evictions),
@@ -1228,7 +1234,11 @@ void log_plan_stats(provider & p, const char * where) {
                   static_cast<unsigned long long>(p.frame_misses),
                   static_cast<unsigned long long>(p.frame_evictions),
                   static_cast<unsigned long long>(p.frame_instantiates),
-                  static_cast<unsigned long long>(p.frame_destroys));
+                  static_cast<unsigned long long>(p.frame_destroys),
+                  static_cast<unsigned long long>(p.verify.total.requested),
+                  static_cast<unsigned long long>(p.verify.total.resolved),
+                  static_cast<unsigned long long>(p.verify.total.executed),
+                  int(p.verify.consistent()));
 }
 
 // Drop every frame captured for one plan generation and queue its retirement
@@ -1876,14 +1886,19 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
         if (fast) {
             hit = true;
         }
-        if (fast && p.plan_verify_uid) {
-            if (!describe_frame(p, graphs, stages, compute_nodes)) {
-                return false;
-            }
-            if (p.current->signature != p.signature) {
-                fail(p, EPROTO, "relay uid fast path signature mismatch");
-                return false;
-            }
+        // The shared helper owns the request -> resolve -> describe -> execute
+        // order and the fast/switch gate. did_describe keeps the signature
+        // check on the same branch as the verification describe.
+        bool did_describe = false;
+        if (!ggml_relay_verify::verify_submission(p.verify, p.plan_verify_uid, fast,
+                [&]() {
+                    return describe_frame(p, graphs, stages, compute_nodes);
+                }, &did_describe)) {
+            return false;
+        }
+        if (did_describe && p.current->signature != p.signature) {
+            fail(p, EPROTO, "relay uid fast path signature mismatch");
+            return false;
         }
         if (!fast && changed) {
             if (!describe_frame(p, graphs, stages, compute_nodes)) {

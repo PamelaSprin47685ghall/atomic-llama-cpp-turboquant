@@ -358,6 +358,8 @@ Non-blocking: manifest debt only; the build and CPU tests do not depend on this 
 | `ggml/src/ggml-cuda/staging.h` | tq-tp5-compose persistent pinned H2D staging pool (WS4), WS4 staging pool CPU test |
 | `tests/test-tp5-staging-pool.cpp` | WS4 staging pool CPU test |
 | `tests/test-relay-plan-policy.cpp` | WS5 relay plan policy CPU test |
+| `ggml/include/ggml-relay-verify.h` | WS5 relay verification counters (`verify_req/res/exec`), header-only |
+| `tests/test-relay-verify-counters.cpp` | WS5 relay verification counter CPU test |
 | `patches/ws5/ggml-backend-meta.cpp.patch` | integ/tp5-mtp-r28b integration maintainers |
 | `patches/ws5/runtime.cpp.patch` | integ/tp5-mtp-r28b integration maintainers |
 | `patches/ws5/ggml-backend.cpp.patch` | integ/tp5-mtp-r28b integration maintainers |
