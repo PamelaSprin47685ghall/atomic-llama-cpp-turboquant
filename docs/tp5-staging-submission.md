@@ -657,6 +657,10 @@ host-visible diagnostics only: GDN tail, replay length, rollback index, PLE
 history positions, and attention/indexer maximum positions. They do not alter
 memory state and do not prove device execution.
 
+The query is not a thread-safe snapshot. The caller must serialize it with
+`llama_decode`, `set_input`, and any other memory mutation, like the other
+memory accessors.
+
 `fork/tp5-compose/src/runtime.cpp` uses this query for the
 `GGML_TP5_MTP_PLE_KV_TRACE=1` trace and no longer includes
 `llama-memory-hybrid-idx.h`. The compose package builds from installed A/B
@@ -668,4 +672,19 @@ The real CPU qwen4exp fixture (`test-llama-archs -a qwen4exp`) exercises the
 query after a 128-token decode: it observes `attention_pos_max=127`,
 `indexer_pos_max=127`, `ple_next_pos=128`, and a nonempty PLE history, and it
 requires rejection of an unknown version, a zero `struct_size`, a negative
-sequence, and a null output.
+sequence, a positive out-of-range sequence, and a null output.
+
+`tests/test-public-tp5-api.cpp` is the permanent build-tree regression for the
+public declarations and link surface (the NextN embedding functions, the trace
+query, and the Meta submit hooks). Installed-package `find_package`/symbol
+checks are staged verification and are not a repository CTest.
+
+The NextN/MTP embedding entry points `llama_set_embeddings_nextn` and
+`llama_get_embeddings_nextn_ith` are declared in `include/llama.h` and exported
+from `libllama`. The compose runtime no longer carries manual declarations for
+them.
+
+`patches/ws5/*` and `overlay/*` are historical evidence from their recorded
+base commits. Their apply instructions and include lists describe the
+pre-isolation tree; they are not current build inputs and must not be applied
+to this tree. The current compose source is authoritative.

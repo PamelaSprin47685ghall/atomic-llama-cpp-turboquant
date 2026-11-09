@@ -33,6 +33,8 @@ The PLE/KV diagnostic trace uses the versioned public
 includes only installed public A/B headers. The Meta submit-hook declarations
 live in `<ggml-backend.h>`; the obsolete `tp5-meta-submit-ready.h` has been
 removed, so new code includes `<ggml-backend.h>` directly.
+The NextN/MTP embedding entry points are public in `<llama.h>`; `runtime.cpp`
+carries no manual declarations for them.
 
 Current numerical/performance evidence is in the
 [single-request repair](#single-request-performance-repair-2026-10-19).

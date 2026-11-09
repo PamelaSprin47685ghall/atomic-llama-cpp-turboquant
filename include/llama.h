@@ -1199,7 +1199,9 @@ extern "C" {
     // also returns false when the memory is not llama_memory_hybrid_idx or
     // seq_id is negative. The fields are host-visible diagnostics only: they
     // do not alter memory state and do not prove device execution. The query
-    // follows the same single-caller contract as the other memory accessors.
+    // is not a thread-safe snapshot: the caller must serialize it with
+    // decode/set_input and any other memory mutation, like the other memory
+    // accessors.
     struct llama_memory_hybrid_idx_trace {
         uint32_t version;
         uint32_t struct_size;
@@ -1601,6 +1603,15 @@ extern "C" {
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
+    // Set whether the context outputs NextN/MTP embeddings.
+    // If masked is true, output embeddings only for tokens with batch.logits != 0.
+    // If masked is false, output embeddings for all tokens in the batch.
+    LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+
+    // Get the NextN/MTP embeddings for the ith output row.
+    // Mirrors llama_get_embeddings_ith(); returns NULL when unavailable.
+    LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
     //
     // backend sampling API [EXPERIMENTAL]

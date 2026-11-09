@@ -3,10 +3,6 @@
 #include <ggml-relay-plan.h>
 #include <gguf.h>
 #include <llama.h>
-// The selected original libllama exports these stable fork MTP staging APIs;
-// only this isolated one-object candidate uses them.
-void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked);
-float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t index);
 #include <tq/relay/ledger.h>
 #include <tq/sampling/shortlist.h>
 #include <tq/scheduling/admission.h>

@@ -412,6 +412,10 @@ static bool check_hybrid_idx_trace(llama_context * ctx, size_t n_tokens) {
         fprintf(stderr, "hybrid_idx trace accepted a negative sequence\n");
         return false;
     }
+    if (llama_memory_hybrid_idx_get_trace(mem, (llama_seq_id) llama_n_seq_max(ctx), &trace)) {
+        fprintf(stderr, "hybrid_idx trace accepted an out-of-range sequence\n");
+        return false;
+    }
     if (llama_memory_hybrid_idx_get_trace(mem, 0, nullptr)) {
         fprintf(stderr, "hybrid_idx trace accepted a null output\n");
         return false;
