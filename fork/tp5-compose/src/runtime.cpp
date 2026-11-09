@@ -3913,9 +3913,11 @@ run_result run(const options & requested) {
         // kept the stock synchronize because no sound output-copy barrier was
         // available; no_sync_logits_calls counts rows resolved through the
         // no-sync path under the output barrier (the no-sync getter or the
-        // pre-captured single-output pointer). A cached greedy commit row does
-        // not read the logits and is not counted; the field can be 0 when all
-        // commit rows are cached.
+        // pre-captured single-output pointer). A cached greedy commit row
+        // without capture_logits does not read the logits and is not counted;
+        // a cached row with capture_logits on still reads through the capture
+        // path and counts. The field can be 0 when all commit rows are cached
+        // and capture_logits is off.
         std::fprintf(stderr,
             "TP5_DW_COMPOSE_EVENT enabled=1 flag=GGML_TP5_DW_COMPOSE_EVENT"
             " windows=%u\n", unsigned(opts.windows));

@@ -50,6 +50,8 @@ void test_partial_mismatch_replay_refresh() {
           "replay mismatch row is usable after the refresh");
     check(cache.get(1).selected.id == 21,
           "replay refresh replaces the mismatch id");
+    check(cache.get(1).selected.logit == 4.0f,
+          "replay mismatch logit bits are the replay result");
     check(verifier_copy.selected.id == 20,
           "verifier copy is not aliased by the refresh");
     check(verifier_copy.selected.logit == 2.0f,

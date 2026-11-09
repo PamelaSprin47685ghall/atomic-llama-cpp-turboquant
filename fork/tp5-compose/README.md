@@ -578,10 +578,12 @@ overwrite the logits buffer, so it is never reused across epochs.
   greedy scan and do not read the logits buffer unless `capture_logits` is
   enabled; the capture path still reads the row through the same getter and
   output-borrow proof. `no_sync_logits_calls` counts rows resolved through the
-  no-sync path under the output barrier; a cached greedy commit row does not
-  read the logits and is not counted, so the field can be 0 when all commit
-  rows are cached. It is not a barrier proof. The `real_h` NextN read, the
-  `verifier_rows` copy and the replay distribution gate are unchanged.
+  no-sync path under the output barrier; a cached greedy commit row without
+  `capture_logits` does not read the logits and is not counted, while a cached
+  row with `capture_logits` on still reads through the capture path and counts.
+  The field can be 0 when all commit rows are cached and `capture_logits` is
+  off. It is not a barrier proof. The `real_h` NextN read, the `verifier_rows`
+  copy and the replay distribution gate are unchanged.
 
 The CPU unit test `tq-tp5-mtp-greedy-cache` (`tests/test-mtp-greedy-cache.cpp`)
 covers the deterministic cache boundary/semantics: partial mismatch with a
