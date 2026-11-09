@@ -559,9 +559,10 @@ The MTP verify epoch caches each target logits row's
 (`src/mtp_greedy_cache.h`). The cache is local: a later target decode can
 overwrite the logits buffer, so it is never reused across epochs.
 
-- Rows below the accepted prefix use the verify result. The rejected-prefix
-  replay requires the replay argmax to equal the original verifier argmax for
-  every accepted-prefix row, so those rows keep the verify id.
+- Rows below the accepted prefix use the verify id. The replay branch refreshes
+  the cached entry with the replay result; the id is required to equal the
+  verify id, and the stored logit bits become the replay bits. The commit uses
+  only the id.
 - The replay mismatch row (row `accepted`) is refreshed with the replay scan.
   Its argmax may change: the replay gate only requires the replay and original
   distributions to be close, not the top-1, so the commit must use the replay
@@ -573,15 +574,24 @@ overwrite the logits buffer, so it is never reused across epochs.
   the commit.
 - The cache stores the exact `greedy_result` (usable, id, logit bits). The
   finite/unique-maximum/signed-zero tie rules of `select_finite_greedy` and
-  every `require(usable)` check are unchanged. Cached rows do not read the
-  logits buffer; scanned rows keep the same syncing/no-sync getter and
-  output-borrow proof. The `real_h` NextN read, the `verifier_rows` copy and
-  the replay distribution gate are unchanged. `no_sync_logits_calls` counts
-  only the rows actually read.
+  every `require(usable)` check are unchanged. Cached rows do not perform the
+  greedy scan and do not read the logits buffer unless `capture_logits` is
+  enabled; the capture path still reads the row through the same getter and
+  output-borrow proof. `no_sync_logits_calls` counts a cached row resolved
+  under the output barrier once; a `capture_logits` row resolved under the
+  output barrier counts once more. The `real_h` NextN read, the
+  `verifier_rows` copy and the replay distribution gate are unchanged.
 
-The CPU test `tq-tp5-mtp-greedy-cache` (`tests/test-mtp-greedy-cache.cpp`)
-covers partial mismatch with a changed replay argmax, the verifier copy not
-aliasing the refreshed row, full accept with the new row scanned, the LateBind
-g0 rules, signed-zero/tie and NaN results, the commit cancellation contract
-(a stopped request does not consume a cached id), and the verify+replay scan
-counts.
+The CPU unit test `tq-tp5-mtp-greedy-cache` (`tests/test-mtp-greedy-cache.cpp`)
+covers the cache predicates and a local commit-gate model: partial mismatch
+with a changed replay argmax, the verifier copy not aliasing the refreshed
+row, full accept with the new row scanned (including the explicit guard when a
+future path caches row n), the LateBind g0 rules, signed-zero/tie and NaN
+results, row bounds, the cache-side commit gate (a stopped request does not
+consume a cached id), and the cache-predicate scan counts. It does not compile
+or execute runtime.cpp and does not prove the runtime wiring, the runtime
+cancellation/exception path, `no_sync_logits_calls`, or `capture_logits`.
+
+The runtime-level `TP5_MTP_GREEDY_VERIFY=1` probe re-scans every cached commit
+row in the real MTP path, prints `TP5_MTP_GREEDY_ROW`, and requires the cached
+id to match the current logits row; it was not run here (no GPU/full).

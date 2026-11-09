@@ -36,18 +36,18 @@ void check(bool ok, const char * name) {
     std::printf("%s %s\n", ok ? "PASS" : "FAIL", name);
 }
 
-tq::sampling::greedy_result make_greedy(std::int32_t id, bool usable = true) {
-    return tq::sampling::greedy_result{usable, tq::sampling::candidate{id, 0.0f}};
+tq::sampling::greedy_result make_greedy(std::int32_t id, float logit = 0.0f) {
+    return tq::sampling::greedy_result{true, tq::sampling::candidate{id, logit}};
 }
 
-// The runtime's commit path: a stopped request does not commit; a cached row
-// that is unusable is rejected by the require(usable) check.
-std::optional<std::int32_t> commit_visible(const tq::tp5::mtp_greedy_cache & cache,
-                                           std::size_t row,
-                                           std::size_t accepted,
-                                           bool native_trim,
-                                           bool full_accept,
-                                           bool stopped) {
+// Local cache-side commit-gate model. It does not execute the runtime; the
+// runtime's stop/exception path is separate.
+std::optional<std::int32_t> commit_gate_model(const tq::tp5::mtp_greedy_cache & cache,
+                                              std::size_t row,
+                                              std::size_t accepted,
+                                              bool native_trim,
+                                              bool full_accept,
+                                              bool stopped) {
     if (stopped) {
         return std::nullopt;
     }
@@ -61,12 +61,12 @@ std::optional<std::int32_t> commit_visible(const tq::tp5::mtp_greedy_cache & cac
     return result.selected.id;
 }
 
-std::int32_t commit_with_scan(const tq::tp5::mtp_greedy_cache & cache,
-                              std::size_t row,
-                              std::size_t accepted,
-                              bool native_trim,
-                              bool full_accept,
-                              const std::function<tq::sampling::greedy_result(std::size_t)> & scan) {
+std::int32_t commit_with_scan_model(const tq::tp5::mtp_greedy_cache & cache,
+                                    std::size_t row,
+                                    std::size_t accepted,
+                                    bool native_trim,
+                                    bool full_accept,
+                                    const std::function<tq::sampling::greedy_result(std::size_t)> & scan) {
     if (cache.can_commit(row, accepted, native_trim, full_accept)) {
         return cache.get(row).selected.id;
     }
@@ -75,8 +75,8 @@ std::int32_t commit_with_scan(const tq::tp5::mtp_greedy_cache & cache,
 
 void test_partial_mismatch_replay_refresh() {
     tq::tp5::mtp_greedy_cache cache;
-    cache.store_verify(0, make_greedy(10));
-    cache.store_verify(1, make_greedy(20)); // mismatch row
+    cache.store_verify(0, make_greedy(10, 1.0f));
+    cache.store_verify(1, make_greedy(20, 2.0f)); // mismatch row
 
     check(cache.can_commit(0, 1, false, false), "accepted row uses the verify result");
     check(!cache.can_commit(1, 1, false, false),
@@ -84,9 +84,10 @@ void test_partial_mismatch_replay_refresh() {
 
     const auto verifier_copy = cache.get(1);
     check(verifier_copy.selected.id == 20, "verifier copy keeps the original id");
+    check(verifier_copy.selected.logit == 2.0f, "verifier copy keeps the verify bits");
 
-    cache.store_replay(0, make_greedy(10));
-    cache.store_replay(1, make_greedy(21)); // replay argmax changed
+    cache.store_replay(0, make_greedy(10, 3.0f));
+    cache.store_replay(1, make_greedy(21, 4.0f)); // replay argmax changed
 
     check(cache.can_commit(1, 1, false, false),
           "replay mismatch row is usable after the refresh");
@@ -94,7 +95,11 @@ void test_partial_mismatch_replay_refresh() {
           "commit uses the replay argmax, not the verify argmax");
     check(verifier_copy.selected.id == 20,
           "verifier copy is not aliased by the refresh");
+    check(verifier_copy.selected.logit == 2.0f,
+          "verifier copy logit bits are not aliased by the refresh");
     check(cache.get(0).selected.id == 10, "accepted row id is unchanged by the replay");
+    check(cache.get(0).selected.logit == 3.0f,
+          "accepted row logit bits are the replay result");
 }
 
 void test_full_accept_new_row() {
@@ -110,14 +115,26 @@ void test_full_accept_new_row() {
           "full-accept new row n is never cached");
 
     int scans = 0;
-    const auto id = commit_with_scan(cache, 3, 3, false, true,
-                                     [&](std::size_t row) {
-                                         ++scans;
-                                         check(row == 3, "full-accept scan uses row n");
-                                         return make_greedy(33);
-                                     });
+    const auto id = commit_with_scan_model(cache, 3, 3, false, true,
+                                           [&](std::size_t row) {
+                                               ++scans;
+                                               check(row == 3, "full-accept scan uses row n");
+                                               return make_greedy(33);
+                                           });
     check(scans == 1, "full-accept new row is scanned exactly once");
     check(id == 33, "full-accept commit uses the scanned row n id");
+
+    // A future path must not bypass the guard by caching row n directly.
+    cache.store_verify(3, make_greedy(99));
+    check(!cache.can_commit(3, 3, true, true),
+          "full-accept row n is rejected even if cached (native-trim)");
+    check(!cache.can_commit(3, 3, false, true),
+          "full-accept row n is rejected even if cached (replay)");
+    cache.store_replay(3, make_greedy(98));
+    check(!cache.can_commit(3, 3, true, true),
+          "full-accept row n is rejected after a replay store (native-trim)");
+    check(!cache.can_commit(3, 3, false, true),
+          "full-accept row n is rejected after a replay store (replay)");
 }
 
 void test_latebind_g0() {
@@ -154,21 +171,30 @@ void test_signed_zero_tie_nan() {
     check(!n.usable, "NaN row is unusable");
     cache.store_verify(1, n);
     check(!cache.get(1).usable, "cache preserves the unusable result");
-    check(!commit_visible(cache, 1, 2, false, false, false).has_value(),
+    check(!commit_gate_model(cache, 1, 2, false, false, false).has_value(),
           "unusable cached row is not committed");
 }
 
-void test_cancellation_gate() {
+void test_commit_gate_model() {
     tq::tp5::mtp_greedy_cache cache;
     cache.store_verify(0, make_greedy(10));
 
-    check(commit_visible(cache, 0, 1, false, false, false).value() == 10,
+    check(commit_gate_model(cache, 0, 1, false, false, false).value() == 10,
           "cached value commits when the request is not stopped");
-    check(!commit_visible(cache, 0, 1, false, false, true).has_value(),
+    check(!commit_gate_model(cache, 0, 1, false, false, true).has_value(),
           "stopped request does not commit a cached value");
 }
 
-void test_scan_counts() {
+void test_row_bounds() {
+    tq::tp5::mtp_greedy_cache cache;
+    cache.store_verify(4, make_greedy(40));
+    check(!cache.has(4), "verify store beyond max_rows is ignored");
+    check(!cache.can_commit(4, 4, false, false), "out-of-range row cannot commit");
+    cache.store_replay(4, make_greedy(41));
+    check(!cache.has(4), "replay store beyond max_rows is ignored");
+}
+
+void test_cache_predicate_scan_counts() {
     {
         int scans = 0;
         const auto scan = [&](std::size_t row) {
@@ -183,7 +209,7 @@ void test_scan_counts() {
         cache.store_replay(1, scan(1));
 
         for (std::size_t row = 0; row < 2; ++row) {
-            const auto id = commit_with_scan(cache, row, 1, false, false, scan);
+            const auto id = commit_with_scan_model(cache, row, 1, false, false, scan);
             check(id == 30 + static_cast<std::int32_t>(row),
                   "partial mismatch commit id");
         }
@@ -203,11 +229,11 @@ void test_scan_counts() {
         }
 
         for (std::size_t row = 0; row < 3; ++row) {
-            check(commit_with_scan(cache, row, 3, false, true, scan) ==
+            check(commit_with_scan_model(cache, row, 3, false, true, scan) ==
                       30 + static_cast<std::int32_t>(row),
                   "full accept cached row id");
         }
-        check(commit_with_scan(cache, 3, 3, false, true, scan) == 33,
+        check(commit_with_scan_model(cache, 3, 3, false, true, scan) == 33,
               "full accept new row id");
         check(scans == 4, "full accept scans verify rows 0..2 and new row 3 (4)");
     }
@@ -220,8 +246,9 @@ int main() {
     test_full_accept_new_row();
     test_latebind_g0();
     test_signed_zero_tie_nan();
-    test_cancellation_gate();
-    test_scan_counts();
+    test_commit_gate_model();
+    test_row_bounds();
+    test_cache_predicate_scan_counts();
 
     std::printf("%s failures=%d\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;

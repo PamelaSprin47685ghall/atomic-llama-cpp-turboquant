@@ -27,14 +27,14 @@ namespace tq::tp5 {
 //   - row 0 may be seeded from the LateBind prefetch g0. It follows the same
 //     rules: accepted row or native-trim mismatch may use it directly, while
 //     an accepted==0 replay must refresh it from the replay scan.
+//
+// Preconditions: the MTP runtime calls this only after its own
+// require(n >= 1 && n <= 3 && local_rows.size() == n + 1), so row and
+// accepted are in [0, n] with n <= 3. full_accept is (accepted == n).
+// store_* silently ignore row >= max_rows; get() requires has(row).
 class mtp_greedy_cache {
 public:
     static constexpr std::size_t max_rows = 4;
-
-    void reset() {
-        rows_ = {};
-        state_ = {};
-    }
 
     // Store the verify result for a target row. The LateBind g0 uses the same
     // entry: it is the original row 0 read before the verify loop.

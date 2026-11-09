@@ -218,7 +218,9 @@ Receipt checks on the ON arm (`TP5_DW_COMPOSE_EVENT …` lines on stderr):
 
 - `output_event_syncs == host_sync_replaced > 0`;
 - `output_event_syncs + fallback_no_output_barrier == epochs`;
-- `no_sync_logits_calls > 0` when the workload has output rows;
+- `no_sync_logits_calls > 0` when the workload has output rows; cached
+  commit rows count, so an epoch whose commit rows are all cached still
+  satisfies this;
 - `epochs` equals the OFF arm's decode count for the same workload;
 - on a forced-fallback arm (e.g. a child without an event interface)
   `output_event_syncs == 0`, `fallback_no_output_barrier == epochs`, and tokens
