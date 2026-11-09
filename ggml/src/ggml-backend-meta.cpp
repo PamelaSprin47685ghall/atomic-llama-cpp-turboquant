@@ -110,32 +110,103 @@ static bool staging_diag_enabled() {
     return on;
 }
 
+// Rejection diagnostics are aggregated per (lane, reason). The hot path only
+// bumps one atomic; the first candidate of each class keeps one example for
+// the exit dump. GGML_TP5_STAGING_DIAG_VERBOSE=1 restores the old per-candidate
+// trace for a short, explicitly requested run.
+enum staging_reject_reason : int {
+    reject_unknown = 0,
+    reject_null,
+    reject_no_input_flag,
+    reject_zero_size,
+    reject_size,
+    reject_generic_size,
+    reject_layout,
+    reject_count,
+};
+
+static const char * staging_reject_reason_name(int reason) {
+    static const char * names[reject_count] = {
+        "unknown", "null", "no_input_flag", "zero_size", "size", "generic_size", "layout",
+    };
+    return reason >= 0 && reason < reject_count ? names[reason] : "?";
+}
+
+struct staging_reject_stat {
+    std::atomic<uint64_t> count{0};
+    const char * name = nullptr;  // first example, written once under first_mutex
+    size_t size = 0;
+    unsigned flags = 0;
+    ggml_type type = GGML_TYPE_COUNT;
+};
+
+struct staging_reject_table {
+    std::mutex first_mutex;
+    staging_reject_stat lanes[2][reject_count];
+};
+static staging_reject_table g_staging_reject;
+
+static bool staging_diag_verbose() {
+    static const bool on = [] {
+        const char * v = std::getenv("GGML_TP5_STAGING_DIAG_VERBOSE");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+static int staging_reject_reason(const ggml_tensor * tensor, size_t size, const char * reason_override) {
+    if (reason_override != nullptr) {
+        return std::strcmp(reason_override, "layout") == 0 ? reject_layout : reject_unknown;
+    }
+    if (tensor == nullptr) {
+        return reject_null;
+    }
+    if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) == 0) {
+        return reject_no_input_flag;
+    }
+    if (size == 0) {
+        return reject_zero_size;
+    }
+    if (size > kMaxStagingBytes) {
+        return reject_size;
+    }
+    if (ggml_cuda_staging::classify_name(tensor->name) == ggml_cuda_staging::kind::generic &&
+            size > ggml_cuda_staging::kGenericMaxBytes) {
+        return reject_generic_size;
+    }
+    return reject_unknown;
+}
+
 static void staging_log_reject(const char * lane, const ggml_tensor * tensor, size_t size,
                                const char * reason_override = nullptr) {
     if (!staging_diag_enabled()) {
+        return;
+    }
+    const int lane_id = std::strcmp(lane, "async") == 0 ? 1 : 0;
+    const int reason = staging_reject_reason(tensor, size, reason_override);
+    staging_reject_stat & stat = g_staging_reject.lanes[lane_id][reason];
+    const uint64_t prev = stat.count.fetch_add(1, std::memory_order_relaxed);
+    if (prev == 0) {
+        // The fetch_add result is unique, so exactly one thread records the
+        // example. The lock is taken once per class, never on later calls.
+        std::lock_guard<std::mutex> lock(g_staging_reject.first_mutex);
+        if (stat.name == nullptr) {
+            stat.name = tensor != nullptr ? tensor->name : "(null)";
+            stat.size = size;
+            stat.flags = tensor != nullptr ? unsigned(tensor->flags) : 0u;
+            stat.type = tensor != nullptr ? tensor->type : GGML_TYPE_COUNT;
+        }
+    }
+    if (!staging_diag_verbose()) {
         return;
     }
     static std::atomic<int> budget{512};
     if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
         return;
     }
-    const char * reason = reason_override != nullptr ? reason_override : "unknown";
-    if (reason_override != nullptr) {
-        // keep the explicit reason
-    } else if (tensor == nullptr) {
-        reason = "null";
-    } else if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) == 0) {
-        reason = "no_input_flag";
-    } else if (size == 0) {
-        reason = "zero_size";
-    } else if (size > kMaxStagingBytes) {
-        reason = "size";
-    } else if (ggml_cuda_staging::classify_name(tensor->name) == ggml_cuda_staging::kind::generic &&
-               size > ggml_cuda_staging::kGenericMaxBytes) {
-        reason = "generic_size";
-    }
     std::fprintf(stderr, "TP5_STAGING_REJECT lane=%s reason=%s name=%s flags=0x%x size=%zu type=%s\n",
-                 lane, reason, tensor != nullptr ? tensor->name : "(null)",
+                 lane, staging_reject_reason_name(reason),
+                 tensor != nullptr ? tensor->name : "(null)",
                  tensor != nullptr ? unsigned(tensor->flags) : 0u, size,
                  tensor != nullptr ? ggml_type_name(tensor->type) : "?");
 }
@@ -174,6 +245,23 @@ extern "C" void ggml_backend_meta_staging_diag_dump() {
         (unsigned long long) g_staging_meta_diag.async_eligible.load(std::memory_order_relaxed),
         (unsigned long long) g_staging_meta_diag.async_lease_ok.load(std::memory_order_relaxed),
         (unsigned long long) g_staging_meta_diag.async_lease_fail.load(std::memory_order_relaxed));
+
+    static const char * lane_names[2] = { "sync", "async" };
+    for (int lane = 0; lane < 2; ++lane) {
+        for (int r = 0; r < reject_count; ++r) {
+            const staging_reject_stat & stat = g_staging_reject.lanes[lane][r];
+            const uint64_t n = stat.count.load(std::memory_order_relaxed);
+            if (n == 0) {
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(g_staging_reject.first_mutex);
+            std::fprintf(stderr,
+                "TP5_STAGING_REJECT lane=%s reason=%s count=%llu example_name=%s flags=0x%x size=%zu type=%s\n",
+                lane_names[lane], staging_reject_reason_name(r), (unsigned long long) n,
+                stat.name != nullptr ? stat.name : "(none)", stat.flags, stat.size,
+                stat.type != GGML_TYPE_COUNT ? ggml_type_name(stat.type) : "?");
+        }
+    }
 }
 
 struct ggml_backend_meta_device;

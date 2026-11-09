@@ -492,3 +492,30 @@ requires `n_sub_envelope == 3`, `n_pad_rows == 7` and no stock fallback in the
 padded arm, and compares the user-visible logits of every step. Under the
 default non-unified cache it repeats the padded/exact comparison inside the
 prefab lane, which is the configuration of the retention fixture.
+
+## Rejection diagnostics
+
+With `GGML_TP5_STAGING_DIAG=1`, a rejected MIRRORED candidate used to print one
+line per candidate. The weight load alone produced 512 `no_input_flag` lines,
+each through unbuffered stderr (FILE lock plus one write syscall), so the
+diagnostic added I/O to the load path and buried the signal.
+
+Rejections are now counted per `(lane, reason)` with one relaxed atomic on the
+hot path. The first candidate of each class keeps one example (name, flags,
+size, type) under a mutex taken once per class. The exit dump prints one
+summary line per class:
+
+```
+TP5_STAGING_REJECT lane=sync reason=no_input_flag count=512 example_name=... flags=0x0 size=... type=...
+```
+
+`GGML_TP5_STAGING_DIAG_VERBOSE=1` restores the per-candidate trace (capped at
+512 lines) for an explicitly requested run. The reason classification
+(`null`, `no_input_flag`, `zero_size`, `size`, `generic_size`, `layout`) is
+unchanged, so the diagnostic still answers why a candidate was rejected.
+
+Cost: the hot path performs one atomic increment per rejected candidate and no
+I/O; the summary costs at most one line per `(lane, reason)` at exit. With the
+flag off, `staging_log_reject` returns after the cached flag check, as before.
+This change touches only `ggml-backend-meta.cpp`; the slot-pressure work owns
+`staging.h`/`acquire` and is not modified.
