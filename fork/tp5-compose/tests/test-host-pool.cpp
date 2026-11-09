@@ -1,5 +1,6 @@
 // TP5 MTP batch pool and piece scratch: lease reuse, fallback batches,
-// inline token storage, and in-memory LeaseEvent accounting.
+// inline token storage, the full-width embedding contract, and in-memory
+// LeaseEvent accounting.
 
 #include "host_pool.h"
 
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <new>
 #include <stdexcept>
 
 #if defined(__GLIBC__)
@@ -33,6 +35,70 @@ static void set_flag(const char * name, const char * value) {
         unsetenv(name);
     }
 #endif
+}
+
+enum class partial_batch { none, embd_only, no_embd, seq_id_only, seq_id_full };
+
+static int          g_batch_init_failures  = 0;
+static int          g_token_alloc_failures = 0;
+static partial_batch g_partial_batch       = partial_batch::none;
+
+static llama_batch partial_batch_init(int wide) {
+    llama_batch batch{};
+    switch (g_partial_batch) {
+        case partial_batch::embd_only:
+            batch.embd = static_cast<float *>(std::malloc(sizeof(float) * static_cast<std::size_t>(wide)));
+            break;
+        case partial_batch::no_embd:
+            batch.pos      = static_cast<llama_pos *>(std::malloc(sizeof(llama_pos)));
+            batch.n_seq_id = static_cast<int32_t *>(std::malloc(sizeof(int32_t)));
+            batch.seq_id   = static_cast<llama_seq_id **>(std::malloc(sizeof(llama_seq_id *) * 2));
+            if (batch.seq_id != nullptr) {
+                batch.seq_id[0] = static_cast<llama_seq_id *>(std::malloc(sizeof(llama_seq_id)));
+                batch.seq_id[1] = nullptr;
+            }
+            batch.logits = static_cast<int8_t *>(std::malloc(sizeof(int8_t)));
+            break;
+        case partial_batch::seq_id_only:
+            batch.seq_id = static_cast<llama_seq_id **>(std::malloc(sizeof(llama_seq_id *) * 2));
+            if (batch.seq_id != nullptr) {
+                batch.seq_id[0] = nullptr;
+                batch.seq_id[1] = nullptr;
+            }
+            break;
+        case partial_batch::seq_id_full:
+            batch.seq_id = static_cast<llama_seq_id **>(std::malloc(sizeof(llama_seq_id *) * 2));
+            if (batch.seq_id != nullptr) {
+                batch.seq_id[0] = static_cast<llama_seq_id *>(std::malloc(sizeof(llama_seq_id)));
+                batch.seq_id[1] = nullptr;
+            }
+            break;
+        case partial_batch::none:
+            break;
+    }
+    return batch;
+}
+
+static llama_batch fail_once_batch_init(int wide) {
+    if (g_batch_init_failures > 0) {
+        --g_batch_init_failures;
+        return partial_batch_init(wide);
+    }
+    return llama_batch_init(1, wide, 1);
+}
+
+static llama_token * fail_once_token_alloc() {
+    if (g_token_alloc_failures > 0) {
+        --g_token_alloc_failures;
+        return nullptr;
+    }
+    return static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
+}
+
+static llama_batch complete_with_token_batch_init(int wide) {
+    llama_batch batch = llama_batch_init(1, wide, 1);
+    batch.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
+    return batch;
 }
 
 static void test_pooled_lease() {
@@ -94,9 +160,12 @@ static void test_fallback_lease() {
 
     // A second lease must own a fresh heap batch, not a freed pointer.
     {
+        float embd2[wide] = { 5.0f, 6.0f, 7.0f, 8.0f };
         auto lease = pool.acquire();
-        lease.set(9, 10, 1, nullptr, wide);
+        lease.set(9, 10, 1, embd2, wide);
         check(lease.batch().token[0] == 9, "fallback: second lease is valid");
+        check(std::memcmp(lease.batch().embd, embd2, sizeof(embd2)) == 0,
+              "fallback: second lease copies its own embedding");
     }
 }
 
@@ -107,12 +176,14 @@ static void test_exhaustion_falls_back() {
 
     tq::tp5::mtp_batch_pool pool(1, wide);
 
+    float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
+
     auto first = pool.acquire();
-    first.set(1, 1, 1, nullptr, wide);
+    first.set(1, 1, 1, embd, wide);
 
     {
         auto second = pool.acquire();
-        second.set(2, 2, 1, nullptr, wide);
+        second.set(2, 2, 1, embd, wide);
         check(second.batch().token[0] == 2, "exhaustion: fallback lease works");
     }
 
@@ -129,8 +200,9 @@ static void test_events() {
         tq::tp5::mtp_batch_pool pool(2, wide);
 
         {
+            float embd[wide] = { 0.5f, 0.25f, 0.125f, 0.0625f };
             auto lease = pool.acquire();
-            lease.set(1, 0, 1, nullptr, wide);
+            lease.set(1, 0, 1, embd, wide);
         }
 
         const auto & events = pool.events();
@@ -156,15 +228,17 @@ static void test_cancel_releases_lease() {
 
     tq::tp5::mtp_batch_pool pool(1, 4);
 
+    float embd[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+
     try {
         auto lease = pool.acquire();
-        lease.set(1, 0, 1, nullptr, 4);
+        lease.set(1, 0, 1, embd, 4);
         throw std::runtime_error("cancelled");
     } catch (const std::runtime_error &) {
     }
 
     auto lease = pool.acquire();
-    lease.set(2, 1, 1, nullptr, 4);
+    lease.set(2, 1, 1, embd, 4);
 
     const auto & events = pool.events();
     check(events.size() == 3, "cancel: acquire, release on unwind, acquire");
@@ -219,9 +293,10 @@ static void test_event_cap() {
 
     // Two events per lease. The log must stop at its fixed cap instead of
     // growing without bound.
+    float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
     for (int i = 0; i < 3000; ++i) {
         auto lease = pool.acquire();
-        lease.set(i, i, 1, nullptr, wide);
+        lease.set(i, i, 1, embd, wide);
     }
 
     const auto & events = pool.events();
@@ -337,6 +412,264 @@ static void test_piece_scratch_buffer() {
 
     llama_model_free(model);
 }
+static void test_set_contract() {
+    set_flag("TP5_MTP_BATCH_POOL", "1");
+
+    constexpr int wide = 4;
+    tq::tp5::mtp_batch_pool pool(1, wide);
+
+    float embd[wide]      = { 1.0f, 2.0f, 3.0f, 4.0f };
+    float wider[wide + 1] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f };
+
+    {
+        auto lease = pool.acquire();
+
+        bool threw = false;
+        try {
+            lease.set(1, 0, 1, nullptr, wide);
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        check(threw, "set: a missing embedding row is refused");
+
+        threw = false;
+        try {
+            lease.set(1, 0, 1, wider, wide + 1);
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        check(threw, "set: a wider row is refused before it overruns the slot");
+
+        threw = false;
+        try {
+            lease.set(1, 0, 1, embd, wide - 1);
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        check(threw, "set: a narrower row is refused instead of leaving stale bytes");
+
+        lease.set(7, 3, 1, embd, wide);
+        check(lease.batch().token[0] == 7, "set: a full-width row is accepted");
+        check(std::memcmp(lease.batch().embd, embd, sizeof(embd)) == 0,
+              "set: the accepted row is copied");
+    }
+
+    // A refused set must not consume the slot.
+    auto again = pool.acquire();
+    again.set(8, 4, 1, embd, wide);
+    check(again.batch().token[0] == 8, "set: the slot survives a refused set");
+
+    set_flag("TP5_MTP_BATCH_POOL", nullptr);
+}
+
+static void test_fallback_set_contract() {
+    set_flag("TP5_MTP_BATCH_POOL", nullptr);
+
+    constexpr int wide = 4;
+    tq::tp5::mtp_batch_pool pool(1, wide);
+
+    float embd[wide]      = { 1.0f, 2.0f, 3.0f, 4.0f };
+    float wider[wide + 1] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f };
+
+    auto lease = pool.acquire();
+    bool threw = false;
+    try {
+        lease.set(1, 0, 1, nullptr, wide);
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    check(threw, "fallback set: a missing embedding row is refused");
+
+    threw = false;
+    try {
+        lease.set(2, 1, 1, wider, wide + 1);
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    check(threw, "fallback set: a wider row is refused");
+
+    threw = false;
+    try {
+        lease.set(2, 1, 1, embd, wide - 1);
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    check(threw, "fallback set: a narrower row is refused");
+
+    lease.set(2, 1, 1, embd, wide);
+    check(lease.batch().token[0] == 2, "fallback set: a full-width row is accepted");
+}
+
+static void test_zero_width_refused() {
+    bool threw = false;
+    try {
+        tq::tp5::mtp_batch_pool pool(1, 0);
+        (void) pool;
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    check(threw, "pool: a zero width is refused");
+}
+
+static void test_pool_lifetime() {
+#if defined(__GLIBC__)
+    set_flag("TP5_MTP_BATCH_POOL", "1");
+    set_flag("TP5_ALLOC_PROBE", nullptr);
+
+    constexpr int wide = 4;
+    float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
+
+    // Warm the allocator bins once so the measured round is steady.
+    {
+        tq::tp5::mtp_batch_pool pool(4, wide);
+        auto lease0 = pool.acquire();
+        auto lease1 = pool.acquire();
+        auto lease2 = pool.acquire();
+        auto lease3 = pool.acquire();
+        lease0.set(0, 0, 1, embd, wide);
+        lease1.set(1, 1, 1, embd, wide);
+        lease2.set(2, 2, 1, embd, wide);
+        lease3.set(3, 3, 1, embd, wide);
+    }
+
+    const std::size_t before = mallinfo2().uordblks;
+    {
+        tq::tp5::mtp_batch_pool pool(4, wide);
+        auto lease0 = pool.acquire();
+        auto lease1 = pool.acquire();
+        auto lease2 = pool.acquire();
+        auto lease3 = pool.acquire();
+        lease0.set(0, 0, 1, embd, wide);
+        lease1.set(1, 1, 1, embd, wide);
+        lease2.set(2, 2, 1, embd, wide);
+        lease3.set(3, 3, 1, embd, wide);
+    }
+    const std::size_t after = mallinfo2().uordblks;
+    check(before == after, "pool lifetime: destruction frees every initialized slot");
+
+    set_flag("TP5_MTP_BATCH_POOL", nullptr);
+#else
+    check(true, "pool lifetime: skipped without mallinfo2");
+#endif
+}
+
+static void test_partial_batch_free_shapes() {
+    set_flag("TP5_MTP_BATCH_POOL", "1");
+
+    constexpr int wide = 4;
+    const partial_batch shapes[] = { partial_batch::none,      partial_batch::embd_only,
+                                     partial_batch::no_embd,   partial_batch::seq_id_only,
+                                     partial_batch::seq_id_full };
+
+    for (const auto shape : shapes) {
+        g_partial_batch = shape;
+        tq::tp5::mtp_batch_pool pool(1, wide, { partial_batch_init, nullptr });
+
+        bool threw = false;
+        try {
+            auto lease = pool.acquire();
+            (void) lease;
+        } catch (const std::bad_alloc &) {
+            threw = true;
+        }
+        check(threw, "alloc: an incomplete first slot throws bad_alloc");
+    }
+
+    g_partial_batch = partial_batch::none;
+    set_flag("TP5_MTP_BATCH_POOL", nullptr);
+}
+
+static void test_first_acquire_failure_retry() {
+    set_flag("TP5_MTP_BATCH_POOL", "1");
+
+    constexpr int wide = 4;
+    float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
+
+    g_batch_init_failures = 1;
+    g_partial_batch       = partial_batch::embd_only;
+    tq::tp5::mtp_batch_pool pool(1, wide, { fail_once_batch_init, nullptr });
+
+    bool threw = false;
+    try {
+        auto lease = pool.acquire();
+        (void) lease;
+    } catch (const std::bad_alloc &) {
+        threw = true;
+    }
+    check(threw, "alloc: the first acquire failure is reported");
+
+    auto lease = pool.acquire();
+    lease.set(3, 0, 1, embd, wide);
+    check(lease.batch().token[0] == 3, "alloc: the slot is retried after a failed first acquire");
+
+    g_partial_batch = partial_batch::none;
+    set_flag("TP5_MTP_BATCH_POOL", nullptr);
+}
+
+static void test_fallback_alloc_failure_retry() {
+    set_flag("TP5_MTP_BATCH_POOL", nullptr);
+
+    constexpr int wide = 4;
+    float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
+
+    g_batch_init_failures = 1;
+    g_partial_batch       = partial_batch::embd_only;
+    tq::tp5::mtp_batch_pool pool(1, wide, { fail_once_batch_init, nullptr });
+
+    bool threw = false;
+    try {
+        auto lease = pool.acquire();
+        (void) lease;
+    } catch (const std::bad_alloc &) {
+        threw = true;
+    }
+    check(threw, "alloc: a partial fallback batch is reported");
+
+    auto lease = pool.acquire();
+    lease.set(4, 1, 1, embd, wide);
+    check(lease.batch().token[0] == 4, "alloc: the fallback path is retried after a failed acquire");
+
+    g_token_alloc_failures = 1;
+    tq::tp5::mtp_batch_pool token_pool(1, wide, { nullptr, fail_once_token_alloc });
+    threw = false;
+    try {
+        auto failed = token_pool.acquire();
+        (void) failed;
+    } catch (const std::bad_alloc &) {
+        threw = true;
+    }
+    check(threw, "alloc: a null fallback token is reported");
+
+    auto retried = token_pool.acquire();
+    retried.set(5, 2, 1, embd, wide);
+    check(retried.batch().token[0] == 5, "alloc: the fallback token path is retried");
+
+    g_partial_batch = partial_batch::none;
+    set_flag("TP5_MTP_BATCH_POOL", nullptr);
+}
+
+static void test_allocator_token_is_replaced() {
+    constexpr int wide = 4;
+    float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
+
+    set_flag("TP5_MTP_BATCH_POOL", "1");
+    {
+        tq::tp5::mtp_batch_pool pool(1, wide, { complete_with_token_batch_init, nullptr });
+        auto lease = pool.acquire();
+        lease.set(6, 0, 1, embd, wide);
+        check(lease.batch().token[0] == 6,
+              "alloc: the pooled slot replaces an allocator-provided token");
+    }
+    set_flag("TP5_MTP_BATCH_POOL", nullptr);
+
+    {
+        tq::tp5::mtp_batch_pool pool(1, wide, { complete_with_token_batch_init, nullptr });
+        auto lease = pool.acquire();
+        lease.set(7, 1, 1, embd, wide);
+        check(lease.batch().token[0] == 7,
+              "alloc: the fallback lease replaces an allocator-provided token");
+    }
+}
 
 int main() {
     test_pooled_lease();
@@ -347,6 +680,14 @@ int main() {
     test_steady_state();
     test_event_cap();
     test_piece_scratch_buffer();
+    test_set_contract();
+    test_fallback_set_contract();
+    test_zero_width_refused();
+    test_pool_lifetime();
+    test_partial_batch_free_shapes();
+    test_first_acquire_failure_retry();
+    test_fallback_alloc_failure_retry();
+    test_allocator_token_is_replaced();
 
     std::printf("%s failures=%d\n", g_failures ? "FAILED" : "OK", g_failures);
 

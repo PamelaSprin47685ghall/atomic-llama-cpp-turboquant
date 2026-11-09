@@ -56,6 +56,12 @@ static bool tp5_exact_one(const char * name) {
     return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
+// NextN residual width of the supported Qwen4Exp pair
+// (dsv4_hc_mult * n_embd = 4 * 2560). The MTP batch pool and every draft call
+// site share this one value; a different model geometry is refused at context
+// creation instead of being truncated or over-read.
+constexpr int mtp_nextn_width = 10240;
+
 // ASYNC-PROTOCOL: host waits on device completion must busy-wait, not sleep
 // on an interrupt/signal (HIP default is ScheduleAuto -> may block). Resolved
 // at runtime from the already-linked HIP runtime; no new link dependency.
@@ -2076,6 +2082,16 @@ run_result run(const options & requested) {
         }
         require(trained_mtp_contexts.size()==opts.windows,
                 "real MTP trained draft and target window count disagree");
+        // The MTP pool and every draft call site carry one mtp_nextn_width
+        // NextN row. Validate both models once, before any decode, so a
+        // geometry mismatch cannot read past a narrower residual row or write
+        // past the pool's embedding buffer. The per-capture LateBind check is
+        // a local restatement of this precondition.
+        for (std::uint32_t wi = 0; wi < opts.windows; ++wi) {
+            require(llama_model_n_embd_out(llama_get_model(contexts[wi].get())) == mtp_nextn_width &&
+                    llama_model_n_embd_out(llama_get_model(trained_mtp_contexts[wi].get())) == mtp_nextn_width,
+                    "MTP NextN residual width must be 10240");
+        }
     }
     failure_state                  failure;
     std::unique_ptr<relay_service> service;
@@ -2159,14 +2175,18 @@ run_result run(const options & requested) {
         try {
             workers.emplace_back([&, wi] {
                 tl_tp5_window = int(wi);
-                // One MTP batch pool and one piece buffer per worker. Both
-                // live across service rounds, so the steady state reuses
-                // them. The pool must outlive every lease.
-                mtp_batch_pool mtp_pool(4, 10240);
+                // One piece buffer per worker. It lives across service rounds,
+                // so the steady state reuses it.
                 piece_scratch piece_buf;
                 const bool text_pool = tp5_exact_one("TP5_TEXT_POOL");
                 bool epoch_active = false;
                 try {
+                // One MTP batch pool per worker. It lives across service
+                // rounds, so the steady state reuses its slots, and it must
+                // outlive every lease. Construct it inside this try: an
+                // allocation failure must reach failure.fail instead of
+                // terminating the worker thread.
+                mtp_batch_pool mtp_pool(4, mtp_nextn_width);
                 for (std::uint32_t svc_round = 0; svc_round < service_rounds && !failure.stopped.load(); ++svc_round) {
                     if (svc_round > 0) {
                         svc_barrier();
@@ -2367,7 +2387,7 @@ run_result run(const options & requested) {
                     std::uint64_t draft_phase_drains = 0;
                     std::uint64_t pair_before_ns=0, pair_after_ns=0, pair_meets=0;
                     std::uint64_t pair_ready_ns = 0, pair_ready_hits = 0, pair_submitted_hits = 0;
-                    std::vector<float> draft_prompt_previous_h(10240, 0.0f);
+                    std::vector<float> draft_prompt_previous_h(mtp_nextn_width, 0.0f);
                     std::size_t draft_prompt_rows=0;
                     std::uint64_t draft_prompt_ns=0;
                     auto timed_seq_rm = [&](llama_memory_t memory, llama_seq_id seq, llama_pos p0, llama_pos p1) {
@@ -2688,7 +2708,7 @@ run_result run(const options & requested) {
                         constexpr std::size_t lb_draft1_assumed_accepted = 0;
                         std::size_t actual_accepted = 0;
                         llama_token lb_draft1_token = 0;
-                        constexpr int wide = 10240;
+                        constexpr int wide = mtp_nextn_width;
                         // skip_gate counts exactly the verify_mtp_this_epoch
                         // term of the prefetch gate (see counter semantics
                         // above for what is and is not distinguishable).
@@ -2751,7 +2771,7 @@ run_result run(const options & requested) {
                                         // it.
                                         // Width self-check (fail-loud, no
                                         // silent fallback): the whole LateBind
-                                        // site hardcodes wide=10240 for the
+                                        // site uses mtp_nextn_width for the
                                         // memcpy/memcmp of the NextN residual.
                                         // If the loaded target/draft model pair
                                         // disagrees with that constant, the
@@ -3118,7 +3138,7 @@ run_result run(const options & requested) {
                                         batch.batch.token[row] == request.prompt_tokens[input_position],
                                         "draft prompt rows must match the private prompt in order");
                                 const auto prompt_start=now_ns();
-                                constexpr int wide=10240;
+                                constexpr int wide = mtp_nextn_width;
                                 const float * target_h=llama_get_embeddings_nextn_ith(ctx, int32_t(row));
                                 require(target_h != nullptr, "prompt target hidden row is missing");
                                 for (int j=0;j<wide;++j)
@@ -3193,7 +3213,7 @@ run_result run(const options & requested) {
                                 // to feed the trained MTP block (shift-by-one).
                                 const float * real_h = llama_get_embeddings_nextn_ith(ctx, int32_t(row));
                                 require(real_h != nullptr, "actual target did not export its wide NextN residual");
-                                constexpr int wide = 10240;
+                                constexpr int wide = mtp_nextn_width;
                                 double hnorm = 0;
                                 for (int j=0;j<wide;++j) {
                                     require(std::isfinite(real_h[j]), "target MTP wide residual is nonfinite");
@@ -3375,7 +3395,8 @@ run_result run(const options & requested) {
                                         //   u32le path (0=serial, 1=reused)
                                         //   -- header ends at offset 48 --
                                         //   n_vocab x f32le: draft logits
-                                        //   wide(10240) x f32le: input wide
+                                        //   mtp_nextn_width(10240) x f32le:
+                                        //     input wide
                                         //     NextN residual (real_h at this
                                         //     site, i.e. the residual the
                                         //     SERIAL decode consumed; for the
@@ -3389,7 +3410,8 @@ run_result run(const options & requested) {
                                         //     recorded bytes on hardware, NOT an
                                         //     independently proven equality)
                                         // Record size =
-                                        //   48 + 4*n_vocab + 4*10240 bytes.
+                                        //   48 + 4*n_vocab +
+                                        //     4*mtp_nextn_width bytes.
                                         // Pairs are matched for comparison by
                                         // (window, request_id, pos, token):
                                         // same-input requires equal residual
