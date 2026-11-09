@@ -240,7 +240,7 @@
     },
     {
       "path": "ggml/include/ggml-backend.h",
-      "sha256": "1afe42eeece5fe2acb6b76e6322073211fbd659c28f601930498db77849dde52",
+      "sha256": "cd2f3f2078ab393721453896dce8bdc4cd60506cd03f23df4922890cc3f7c208",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -385,7 +385,7 @@
     },
     {
       "path": "include/llama.h",
-      "sha256": "db1c349d56e1e7a5d8b7efdb8f50a56fe076f500c5dbefb45311b422080d2585",
+      "sha256": "6698681c473085e6d8ebdabb539626e193dddb235935e3a6f94f8b53164d6897",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -935,7 +935,7 @@
     },
     {
       "path": "patches/ws5/README.md",
-      "sha256": "047d9d48ad5f60ee06b6a79ba01564b58d74a5edbd74668fc6a46c22828cb8f4",
+      "sha256": "ac2f11fe38f155808589ca8f71ec856cbccd979b271e5daa519355d4acc9d03d",
       "mode": "100644",
       "consumers": [
         "integ/tp5-mtp-r28b integration maintainers"

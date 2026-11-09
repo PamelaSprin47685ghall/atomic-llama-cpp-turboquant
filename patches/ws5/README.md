@@ -251,6 +251,12 @@ adapter; no F2 file is modified.
 
 ## Cross-owner patches
 
+The `git apply` commands below target the fixed historical base recorded at
+the top of this file. They are provenance only and are not applicable to the
+current tree: the patches still reference removed files such as
+`tp5-meta-submit-ready.h` and `llama-memory-hybrid-idx.h`. Do not apply them
+to the current tree. The patch bytes are unchanged.
+
 Apply from the worktree root, in any order:
 
 ```

@@ -832,6 +832,33 @@ paths, `no_sync_logits_calls`, `capture_logits`, a real model or end-to-end
 run, GPU/HIP, or performance. None of the merged greedy-cache paths has a
 manifest entry, so no digest was updated; the B5-B7 red items remain.
 
+### E.5 Installed-consumer isolation round 2026-11-09
+
+Cherry-pick `2903d14cd` -> `4bfae1eb7` -> `34cc1672f`, reviewed as t26
+(`agent://kernel6-review`). The obsolete `tp5-meta-submit-ready.h` and the
+wiring-only `tests/test-public-tp5-api.cpp` are absent from the final tree;
+the checkpoint, T3 greedy-cache and relay changes remain. NextN set/ith get
+are public in `include/llama.h`; the Meta submit hooks are `GGML_API` in
+`ggml/include/ggml-backend.h`; the hybrid-index trace is a versioned public
+query. `common/speculative.cpp` keeps `llama-ext.h` only for the remaining
+private APIs (layer_inp, target_layer_ids, mtp_chain,
+get_embeddings_nextn), not for the public NextN pair.
+
+`patches/ws5/README.md` now marks its `git apply` commands as fixed-base
+historical provenance, not applicable to the current tree; the patch bytes
+are unchanged.
+
+Manifest: `include/llama.h`, `ggml/include/ggml-backend.h` and
+`patches/ws5/README.md` matched their baseline digests and were reviewed;
+their digests are updated. `docs/tp5-staging-submission.md` and
+`ggml/src/ggml-backend-meta.cpp` were already stale and keep their old
+digests. No other path has an entry, and none was added.
+
+Evidence scope: the installed `find_package`/symbol checks are temporary
+staged evidence, not a repository CTest. The permanent behavior evidence is
+the real single-sequence CPU qwen4exp trace test. GPU/HIP and Windows export
+paths were not run. The guard was not rerun.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure

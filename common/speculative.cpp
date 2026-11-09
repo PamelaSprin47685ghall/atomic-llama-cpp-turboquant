@@ -10,7 +10,7 @@
 #include "sampling.h"
 #include "speculative-adaptive.h"
 
-#include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#include "../src/llama-ext.h" // private APIs: layer_inp, target_layer_ids, mtp_chain, get_embeddings_nextn; the NextN set/ith get are public in llama.h
 
 #include <algorithm>
 #include <cassert>

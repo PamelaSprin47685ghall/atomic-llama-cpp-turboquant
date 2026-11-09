@@ -665,8 +665,8 @@ memory accessors.
 `GGML_TP5_MTP_PLE_KV_TRACE=1` trace and no longer includes
 `llama-memory-hybrid-idx.h`. The compose package builds from installed A/B
 artifacts; do not add source-tree include paths for `ggml/include` or `src` to
-make it compile. The manifest remains historical and is not re-signed by this
-change.
+make it compile. The manifest is updated only where the baseline digest
+matched and the change was reviewed; stale entries keep their old digests.
 
 The real CPU qwen4exp fixture (`test-llama-archs -a qwen4exp`) exercises the
 query after a 128-token decode: it observes `attention_pos_max=127`,
