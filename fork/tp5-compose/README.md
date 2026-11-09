@@ -57,6 +57,17 @@ independent requests, with at most 512 consumed/generation tokens reserved per
 request. Each request has one local sequence writer. Every model
 call fits one microbatch, with one known input token per active request.
 
+### Host pooling
+
+The worker-local MTP batch pool reuses four one-token batches; the token storage
+is inline and the pool is allocated once per worker. The piece scratch keeps at
+least 256 bytes and never shrinks, so a token piece does not zero-fill the buffer
+again. Each request pre-reserves a conservative emitted-text bound, and
+`push_into` grows the text geometrically past it. The pool flags
+(`TP5_UBATCH_POOL`, `TP5_KV_SNAPSHOT_POOL`, `TP5_DECODE_SCRATCH_POOL`,
+`TP5_MTP_BATCH_POOL`, `TP5_TEXT_POOL`) are exact-`1` and default off; the
+default path keeps the pre-pool allocations.
+
 A prepares every rank/stage and mapped communication allocation before starting
 an epoch. Each partial-sum boundary uses two bounded single-workgroup kernels:
 producer copy plus all-writer publication; exact-epoch wait plus output copy and

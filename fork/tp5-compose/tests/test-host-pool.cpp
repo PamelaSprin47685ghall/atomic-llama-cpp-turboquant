@@ -230,6 +230,43 @@ static void test_event_cap() {
     set_flag("TP5_MTP_BATCH_POOL", nullptr);
 }
 
+static void test_piece_scratch_buffer() {
+    const char * path = std::getenv("TP5_TEST_VOCAB");
+    if (path == nullptr || path[0] == '\0') {
+        check(true, "piece scratch: skipped without TP5_TEST_VOCAB");
+        return;
+    }
+
+    llama_model_params mp = llama_model_default_params();
+    mp.vocab_only = true;
+    llama_model * model = llama_model_load_from_file(path, mp);
+    check(model != nullptr, "piece scratch: vocabulary loads");
+    if (model == nullptr) {
+        return;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    check(n_vocab > 0, "piece scratch: vocabulary is not empty");
+
+    tq::tp5::piece_scratch scratch;
+    std::size_t retained = 0;
+    bool inside = true;
+    for (int i = 0; i < n_vocab; ++i) {
+        const auto view = scratch.view(vocab, i);
+        inside = inside && view.size() <= scratch.buffer_size();
+        if (i == 0) {
+            retained = scratch.buffer_size();
+        }
+    }
+
+    check(inside, "piece scratch: every view stays inside the buffer");
+    check(retained >= 256, "piece scratch: first buffer is at least 256 bytes");
+    check(scratch.buffer_size() == retained, "piece scratch: buffer size is stable across tokens");
+
+    llama_model_free(model);
+}
+
 int main() {
     test_pooled_lease();
     test_fallback_lease();
@@ -238,6 +275,7 @@ int main() {
     test_cancel_releases_lease();
     test_steady_state();
     test_event_cap();
+    test_piece_scratch_buffer();
 
     std::printf("%s failures=%d\n", g_failures ? "FAILED" : "OK", g_failures);
 

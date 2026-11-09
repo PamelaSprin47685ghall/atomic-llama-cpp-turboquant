@@ -1873,6 +1873,9 @@ run_result run(const options & requested) {
         request.prompt_tokens = tokenize(vocab, opts.prompts[i]);
         require(request.prompt_tokens.size() + opts.predict <= opts.context_per_request,
                 "prompt plus generation exceeds per-request context");
+        // Conservative emitted-text bound. push_into() grows geometrically
+        // past it; this only removes the first reallocations.
+        request.text.reserve(static_cast<std::size_t>(opts.predict) * 16 + 64);
         if (!opts.teacher_tokens.empty()) {
             for (auto token : opts.teacher_tokens[i]) {
                 require(token >= 0 && token < n_vocab, "teacher token outside vocabulary");

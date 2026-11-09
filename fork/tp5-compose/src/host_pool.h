@@ -208,9 +208,12 @@ private:
 class piece_scratch {
 public:
     std::string_view view(const llama_vocab * vocab, llama_token token) {
-        // The first call always sees exactly 256 bytes, as the former piece()
-        // did. resize() keeps the capacity when an earlier retry grew it.
-        buffer_.resize(256);
+        // Keep at least 256 bytes, as the former piece() did. A retry may grow
+        // the buffer; it never shrinks, so the next call does not zero-fill
+        // the bytes between the last piece and the 256-byte floor.
+        if (buffer_.size() < 256) {
+            buffer_.resize(256);
+        }
         auto size = llama_token_to_piece(vocab, token, buffer_.data(),
                                          static_cast<std::int32_t>(buffer_.size()), 0, false);
         if (size < 0) {
@@ -224,9 +227,11 @@ public:
         if (!(size >= 0 && static_cast<std::size_t>(size) <= buffer_.size())) {
             throw std::runtime_error("cannot detokenize accepted token");
         }
-        buffer_.resize(static_cast<std::size_t>(size));
         return std::string_view(buffer_.data(), static_cast<std::size_t>(size));
     }
+
+    // Test and diagnostics: the retained buffer size, not the last piece size.
+    std::size_t buffer_size() const { return buffer_.size(); }
 
 private:
     std::string buffer_;
