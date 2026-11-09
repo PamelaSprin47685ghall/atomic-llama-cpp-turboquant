@@ -381,6 +381,28 @@ static bool llama_hc_context_owner_enabled() {
     return enabled;
 }
 
+// Qualified local-compute alternative to the static HC owner layout.
+// The original GGUF and Q8 conversion are unchanged; only physical residency
+// changes. MIRRORED propagation computes the same full HC pair on each rank.
+// Unset or 0 keeps the static-owner layout; every other value is a hard error.
+static bool llama_hc_replicated_compute_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("TP5_HC_REPLICATED_COMPUTE");
+        if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0) {
+            throw std::runtime_error("TP5_HC_REPLICATED_COMPUTE requires 0 or 1 (or unset)");
+        }
+        const bool result = value && std::strcmp(value, "1") == 0;
+        if (result && llama_hc_context_owner_enabled()) {
+            throw std::runtime_error("HC replicated compute requires context-owner OFF");
+        }
+        if (result) {
+            LLAMA_LOG_INFO("llama_hc_replicated_compute_enabled: TP5_HC_REPLICATED_COMPUTE=1 selects five-rank mirrored local-compute HC storage\n");
+        }
+        return result;
+    }();
+    return enabled;
+}
+
 static const std::map<std::string, bool> & llama_hc_context_owner_weights() {
     return llama_model_loader::hc_pair_profile();
 }
@@ -490,15 +512,31 @@ static void llama_shared_expert_shard_validate_layout(const llama_model & model,
     LLAMA_LOG_INFO("%s: qualified 144 shared matrices for five disjoint 128-of-640 hidden slices\n", __func__);
 }
 
+static const char * llama_hc_storage_label(const bool context_owner, const bool replicated) {
+    if (context_owner) {
+        return "mirrored context-owner";
+    }
+    return replicated ? "mirrored local-compute" : "static-owner";
+}
+
 static void llama_hc_context_owner_validate_layout(const llama_model & model, const llama_model_loader & ml) {
     const bool context_owner = llama_hc_context_owner_enabled();
-    if (!context_owner && ml.hc_weight_type == GGML_TYPE_BF16) {
+    // Parse the replicated-compute switch before the default-layout early
+    // return. A value other than 0/1 must fail the load instead of being
+    // silently ignored when the default BF16 layout is selected.
+    const bool replicated = llama_hc_replicated_compute_enabled();
+    if (!context_owner && !replicated && ml.hc_weight_type == GGML_TYPE_BF16) {
         return;
     }
     const auto fail = [&](const std::string & reason) {
-        throw std::runtime_error(std::string(ml.hc_weight_type != GGML_TYPE_BF16 ?
-                ml.hc_weight_option_name() : "GGML_TP5_HC_CONTEXT_OWNER") + ": " + reason);
+        const std::string prefix = replicated ? "TP5_HC_REPLICATED_COMPUTE" :
+                (ml.hc_weight_type != GGML_TYPE_BF16 ?
+                 ml.hc_weight_option_name() : "GGML_TP5_HC_CONTEXT_OWNER");
+        throw std::runtime_error(prefix + ": " + reason);
     };
+    if (replicated && ml.hc_weight_type != GGML_TYPE_Q8_0) {
+        fail("requires Q8_0 HC weights (GGML_TP5_HC_Q8_WEIGHTS=1)");
+    }
     const ggml_type expected_type = ml.hc_weight_type;
     const auto & hp = model.hparams;
     if (model.arch != LLM_ARCH_QWEN4EXP || hp.n_layer_all != 48 || hp.n_layer_nextn != 0 ||
@@ -560,7 +598,7 @@ static void llama_hc_context_owner_validate_layout(const llama_model & model, co
     }
     GGML_ASSERT(expected.size() == 194 && seen.size() == expected.size());
     LLAMA_LOG_INFO("%s: qualified 97 HC pairs (194 %s matrices) for five-rank %s storage\n",
-            __func__, ggml_type_name(expected_type), context_owner ? "mirrored context-owner" : "static-owner");
+            __func__, ggml_type_name(expected_type), llama_hc_storage_label(context_owner, replicated));
 }
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
@@ -678,6 +716,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // derive this index from the same pair prefix; all other tensors ignore it.
     size_t hc_owner = ud->n_devices;
     auto get_tensor_config = [&]() -> tensor_config {
+        if (llama_hc_replicated_compute_enabled()) {
+            const auto & profile = llama_hc_context_owner_weights();
+            const auto pair = profile.find(tensor_name);
+            if (pair != profile.end()) {
+                const bool down = pair->second;
+                if (ud->model->arch != LLM_ARCH_QWEN4EXP || ud->n_devices != 5 ||
+                        hparams.n_layer_all != 48 || hparams.n_layer_nextn != 0 ||
+                        hparams.n_embd != 2560 || hparams.dsv4_hc_mult != 4 ||
+                        hparams.hc_low_rank != 320 || tensor->type != GGML_TYPE_Q8_0 ||
+                        tensor->op != GGML_OP_NONE || tensor->view_src || !ggml_is_contiguous(tensor) ||
+                        tensor->ne[0] != (down ? 10240 : 320) ||
+                        tensor->ne[1] != (down ? 320 : 10240) ||
+                        tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+                    throw std::runtime_error("HC replicated compute requires the exact TP5 Qwen4Exp Q8 HC4 profile: " + tensor_name);
+                }
+                // Complete inputs and complete weights imply complete equal
+                // outputs on every rank; no partial sum or relay boundary.
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
+
         if (llama_hc_context_owner_enabled() && llama_hc_context_owner_weights().count(tensor_name)) {
             // Full model qualification is completed before weight buffers are
             // allocated. Shared physical children remain mirrored for all contexts.
