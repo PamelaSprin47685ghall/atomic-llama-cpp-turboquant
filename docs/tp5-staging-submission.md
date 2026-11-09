@@ -207,10 +207,11 @@ and whose child bytes are unchanged by a second copy.
   and all its members stay allocated for process exit, so the pending copy
   cannot race a member destructor (memory, kv_stream_phase_arena,
   cvec/loras, balloc, sampling, graph results, scheduler, backends).
-  `has_unproven()` covers the main scheduler and every prefab envelope slot
-  scheduler (plus the recorded in-flight slot list); a slot-only fault retains
-  the whole context too. A duplicate `llama_free` on a retained context is
-  ignored and does not increment the count again.
+  `has_unproven()` covers the main scheduler, every prefab envelope slot
+  scheduler (plus the recorded in-flight slot list), and every per-shape
+  scheduler; a slot-only or shape-only fault retains the whole context too. A
+  duplicate `llama_free` on a retained context is ignored and does not
+  increment the count again.
   `llama_context::~llama_context()` refuses a direct delete of a
   scheduler-unproven context (aborts) because a direct delete cannot keep the
   external model and context-owned buffers alive. A relay-only pending context

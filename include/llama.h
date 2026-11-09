@@ -232,6 +232,9 @@ extern "C" {
         LLAMA_CONTEXT_TYPE_MTP     = 1,
     };
 
+    // ON is a request, not a hard requirement: an ineligible model, or a
+    // provider that cannot create a session, resolves to OFF/dormant and the
+    // context continues. The requested and resolved modes are logged.
     enum llama_moe_cache_mode {
         LLAMA_MOE_CACHE_MODE_UNSPECIFIED = -1,
         LLAMA_MOE_CACHE_MODE_OFF = 0,

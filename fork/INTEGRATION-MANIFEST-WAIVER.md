@@ -880,6 +880,65 @@ Manifest: `src/llama-kv-cache.cpp`, `src/llama-kv-cache.h` and
 reviewed; their digests are updated. Other stale entries keep their old
 digests.
 
+### E.7 Legacy relay channel-map reclamation round 2026-11-09
+
+Cherry-pick `3e65d33a1` -> `97fd640ec` -> `c3e8ce6fa` -> `4fc8cfcaf` ->
+`0c3204879`, reviewed as t10 (`agent://mirror-port-review`). `bank_released`
+and `no_reservations` are host-ledger facts only, not native-drain claims;
+`held` and `not_ready` entries are retained, and a stale `INPUT_READY` is
+rejected. The map uses the real TQRelay ledger API; no A dependency was
+invented. The candidate `test-relay-channel-map` uses real ledger/map state
+but was not run in this integration tree; courier and GPU behavior were not
+tested. The seven changed paths have no manifest entry, so no digest was
+updated.
+
+### E.8 MoE session policy and KV phase transition round 2026-11-09
+
+Cherry-pick net effect `09044ca64` -> `8cfc3db76`, reviewed as t7
+(`agent://audit-model-boundary`). The final net keeps the `09044ca` ON
+semantics: an explicit `on` is a request; an ineligible model resolves to
+`off`, a provider with no session is dormant, and the context continues with
+`requested=... resolved=...` logging. The intermediate `7f6144cc6` hard
+rejection is not part of this net. A recreated scheduler re-applies the
+context's resolved mode/budget.
+
+The prefab/phase exclusion restates the existing prefab eligibility
+invariant (prefab rejects a context with KV-stream targets) and is a
+defensive fail-closed guard; it adds no new user-facing restriction. The
+phase switch refuses any unproven owner before reuse/reset, keeps the
+committed physical split when only scheduler/graph reserve fails, and marks
+the arena inconsistent if rollback itself fails.
+
+Manifest evidence is the historical snapshot at `c75c6f8c1`, not the current
+main tree: `common/arg.cpp`
+`e89c65062fb9f16e8116abbcc922e5409328c69a0e3bdfb6d3aaa45bbe12b158`,
+`src/llama-context.cpp`
+`09798de83a217edd3fb233d2d5e8c8e62f3bc2422d4169711e9b21079d07a12c`,
+`src/llama-context.h`
+`90a79a6bd978e5e1ad8daf12c6971b617b381a9d3f573c15c5af5c488984f995`,
+`src/llama-model.cpp`
+`5a0baa4c949f2fae13012d1320b32477d5b87ae73e5e669d5e23873537ccb0d4` and
+`src/llama-model.h`
+`96ed16c351c50596a3e8bff522da82d7a19fb23f799939263dcea3e11d49a345`.
+The manifest records `common/arg.cpp`
+`d395a1d926266275ec5df0c6d7e9e72bed221a5e9e7c4b74d84475470c19377f`,
+`src/llama-context.cpp`
+`0d758756c2aef1947a8d92f372b13346350052f87d352ef48397876fd3ebfa84` and
+`src/llama-context.h`
+`50cf52d1b0bcc367f8626c66fd07e5a7de2d57c740cc1161469674d43fe0880b`; those
+entries remain stale. The new phase header and MoE tests have no entry. No
+digest was re-signed; later main-tree edits do not make this snapshot
+current. `include/llama.h` matched before this round, but the ON comment
+changes it; its manifest entry is now stale and is not re-signed here.
+
+Verification boundary: CPU `test-moe-cache-session` (real scheduler/provider
+session lifecycle), `test-moe-cache-context-policy` (real
+`llama_init_from_model`, model-gated) and the existing staging scheduler test
+are included but were not run here. The context-level ON provider-dormant
+path and the CUDA phase-arena failure side effects remain unverified: the CPU
+backend has no real MoE provider, and no device fault injection was run. No
+GPU, full suite or guard rerun.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure

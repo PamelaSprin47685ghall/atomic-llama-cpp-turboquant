@@ -2,6 +2,8 @@
 
 The MoE expert cache accelerates decode for Mixture-of-Experts (MoE) models when routed expert weights remain in host (CPU) memory. A cache hit runs the selected expert matvec on the GPU while the CPU computes the miss rows through the normal `MUL_MAT_ID` kernel. Exact gate/up/SwiGLU subgraphs can fuse rows resident in both weight tensors while half-resident and missing rows stay on the stock CPU path. The cache belongs to one backend scheduler and persists until that scheduler is destroyed.
 
+A scheduler recreated by a reserve retry, a per-shape plan, or a KV-stream phase switch re-applies the context's resolved mode and budget. `ggml_backend_sched_new` creates an environment-default session; the re-apply replaces it. The context's resolved mode/budget is the single source; every scheduler creation reads it, so a recreated scheduler cannot observe a different policy. If no provider creates a session, the request is dormant and the scheduler is left with no session, not with the environment default. An explicit `on` is a request: an ineligible model with no cacheable expert tensor/provider resolves to `off` and the context continues, and a provider that cannot create a session leaves the cache dormant; the `requested=... resolved=...` log records both. `auto` may resolve to off or stay dormant by design. If an async submission is unproven, the re-apply is refused, the current session is preserved, and the phase switch fails closed. `off` and a fixed budget therefore survive scheduler recreation instead of being silently replaced by the environment default.
+
 This is an opportunistic path. Unsupported nodes, unavailable cache capacity, contention, and cache failures fall back to CPU execution. The same provider interface is implemented by the CUDA, Metal, and Vulkan backends (HIP builds share the CUDA implementation); the detailed controls documented here are read by each backend when it creates its cache session.
 
 ## What is it for
@@ -31,7 +33,7 @@ This matrix is evidence for the tested hardware, not a guarantee that every elig
 
 ## Quick start
 
-`auto` is the default, so a plain `llama-cli`/`llama-server`/`llama-bench` run already probes for cacheable CPU-resident experts. When the model fits in VRAM, nothing happens (see above); when experts spill, the cache engages with the automatic budget.
+The default is the backend/provider default (unspecified), so a plain `llama-cli`/`llama-server`/`llama-bench` run uses the environment-configured session and already probes for cacheable CPU-resident experts. `--moe-cache auto` requests the automatic budget explicitly. When the model fits in VRAM, nothing happens (see above); when experts spill, the cache engages.
 
 To get cache-aware placement (the recommended setup for a model that needs it), combine fit with the cache:
 
@@ -62,12 +64,12 @@ Use `--moe-cache MODE` with programs that use the common argument parser:
 | Mode | Cache budget | Weight repacking | Device requirements |
 | --- | --- | --- | --- |
 | `auto` | Free VRAM minus the reserve | Preserved unless cache-aware fit selects canonical CPU experts | At least one eligible selected CUDA device that clears the 1 GiB automatic slab floor, compute capability 8.0 or newer |
-| `on` | Free VRAM minus the reserve | Disabled | At least one eligible selected CUDA device, compute capability 7.0 or newer |
+| `on` | Free VRAM minus the reserve | Disabled | At least one eligible selected CUDA device, compute capability 7.0 or newer, and a cacheable expert tensor/provider; an ineligible model resolves to `off` |
 | `N` | At most `N` MiB per device, after the reserve | Disabled | Same as `on` |
 | `soft` | Fit first tries spare VRAM with stock placement, evicting experts only as needed | Preserved unless cache-aware fit selects canonical CPU experts | Same as `on` |
 | `off` or `0` | No cache session | Preserved unless changed separately | None |
 
-`auto` is the default. When the complete model fits, or dense weights do not fit without routed experts, normal placement and repacking are preserved. When routed experts must spill and a cache is feasible, cache-aware fit keeps canonical expert weights in host memory, puts all dense layers on the main GPU when possible, and preserves the remaining VRAM for cache pools. Use `on` or a positive budget to force canonical CPU weights when automatic placement is not wanted. `soft` is like `on` with a gentler fit: it first tries to keep stock placement and fit the cache into spare VRAM, evicting experts only as needed. Compute capability floors are evaluated by CUDA and HIP devices; the Metal and Vulkan providers always report Ampere-class capability (800).
+Without `--moe-cache`, the mode stays unspecified and the backend/provider default applies; `auto` is the explicit automatic mode. When the complete model fits, or dense weights do not fit without routed experts, normal placement and repacking are preserved. When routed experts must spill and a cache is feasible, cache-aware fit keeps canonical expert weights in host memory, puts all dense layers on the main GPU when possible, and preserves the remaining VRAM for cache pools. Use `on` or a positive budget to force canonical CPU weights when automatic placement is not wanted; an ineligible model resolves to `off` and the context continues, with the requested/resolved modes logged. `soft` is like `on` with a gentler fit: it first tries to keep stock placement and fit the cache into spare VRAM, evicting experts only as needed. Compute capability floors are evaluated by CUDA and HIP devices; the Metal and Vulkan providers always report Ampere-class capability (800).
 
 A single device is eligible for `auto` when free VRAM minus the reserve clears the 1 GiB automatic slab floor. Below that floor `auto` stays dormant so small pools do not thrash; shrink `GGML_CUDA_MOE_CACHE_RESERVE_MB` (default 3072 MiB) to give the floor room on a constrained card.
 
@@ -263,7 +265,7 @@ The following environment variables are implementation controls, not a stable co
 | `GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS` | automatic | Rows retained on CPU only when every row is resident; an explicit value from `0` through `8` overrides the size-aware policy |
 | `GGML_CUDA_MOE_CACHE_MIN_CC` | mode dependent | Override the minimum compute capability encoded as `major * 100 + minor * 10` |
 
-Directly setting `GGML_CUDA_MOE_CACHE_MODE`, `GGML_CUDA_MOE_CACHE`, or `GGML_CUDA_MOE_CACHE_BUDGET_MB` controls the provider only when a program leaves the mode unspecified. Common applications do this for their implicit `auto` default, so provider settings affect fit and runtime consistently. An explicit `--moe-cache` or `LLAMA_ARG_MOE_CACHE` value takes precedence and also controls the model loader's repacking choice. `llama-bench` applies its selected cache arm before every model instance and overwrites the three raw backend variables; use `--moe-cache` or `LLAMA_ARG_MOE_CACHE` to select its benchmark mode.
+Directly setting `GGML_CUDA_MOE_CACHE_MODE`, `GGML_CUDA_MOE_CACHE`, or `GGML_CUDA_MOE_CACHE_BUDGET_MB` controls the provider only when a program leaves the mode unspecified. Common applications leave the mode unspecified by default, so provider settings affect fit and runtime consistently. An explicit `--moe-cache` or `LLAMA_ARG_MOE_CACHE` value takes precedence and also controls the model loader's repacking choice. `llama-bench` applies its selected cache arm before every model instance and overwrites the three raw backend variables; use `--moe-cache` or `LLAMA_ARG_MOE_CACHE` to select its benchmark mode.
 
 Keep `GGML_OP_OFFLOAD_MIN_BATCH` above the decode batch size. Setting it to `1` can make the scheduler offload the complete `MUL_MAT_ID` operation to the GPU before the CPU path can split cache hits from misses.
 

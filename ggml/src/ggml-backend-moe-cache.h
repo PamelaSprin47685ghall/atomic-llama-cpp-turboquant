@@ -167,9 +167,27 @@ GGML_API struct ggml_moe_cache_api ggml_moe_cache_get(const void * owner);
 // executes a graph with a cache session; falls back to the first registered
 // provider for direct CPU users.
 GGML_API struct ggml_moe_cache_api ggml_moe_cache_active(void);
-// While an async submission is unproven, this keeps the current session: it is
-// neither destroyed nor replaced.
-GGML_API void ggml_backend_sched_set_moe_cache(
+// Outcome of a scheduler MoE-cache configuration request.
+//
+// APPLIED: the requested mode is in effect. OFF has no session; AUTO/ON have
+//          a configured session.
+// DORMANT: the request was recorded (mode/budget), but no provider created a
+//          session. The scheduler has no session, so it cannot silently run
+//          with the environment-default session created at scheduler birth.
+// REFUSED: an unproven submission owns the current session. The session is
+//          neither destroyed nor replaced; the caller must not treat the
+//          scheduler as configured and must not run it with that session.
+enum ggml_moe_cache_set_result {
+    GGML_MOE_CACHE_SET_APPLIED = 0,
+    GGML_MOE_CACHE_SET_DORMANT = 1,
+    GGML_MOE_CACHE_SET_REFUSED = 2,
+};
+
+// Apply one scheduler's MoE cache policy. A scheduler recreated by a reserve
+// retry or a KV-stream phase switch must call this again: ggml_backend_sched_new
+// creates an environment-default session, and leaving it in place would ignore
+// the user's off/budget.
+GGML_API enum ggml_moe_cache_set_result ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib);
 
 #ifdef __cplusplus

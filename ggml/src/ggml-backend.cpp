@@ -2308,17 +2308,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
-void ggml_backend_sched_set_moe_cache(
+enum ggml_moe_cache_set_result ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib) {
     GGML_ASSERT(sched);
     if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED) {
-        return;
+        return GGML_MOE_CACHE_SET_APPLIED;
     }
     if (ggml_backend_sched_any_pending(sched)) {
         // Destroying or replacing the session would free provider resources
         // that an unproven submission may still use. Keep the current session.
         GGML_LOG_ERROR("%s: refusing to change the MoE cache session: an async submission is still unproven\n", __func__);
-        return;
+        return GGML_MOE_CACHE_SET_REFUSED;
     }
 
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
@@ -2327,7 +2327,7 @@ void ggml_backend_sched_set_moe_cache(
     sched->moe_cache_session = nullptr;
     sched->moe_cache_api = ggml_moe_cache_api{};
     if (mode == GGML_MOE_CACHE_MODE_OFF) {
-        return;
+        return GGML_MOE_CACHE_SET_APPLIED;
     }
 
     void * cache_backends[GGML_SCHED_MAX_BACKENDS];
@@ -2357,6 +2357,9 @@ void ggml_backend_sched_set_moe_cache(
     if (provider_tried && !sched->moe_cache_session) {
         GGML_LOG_INFO("[moe-cache] session creation failed: all candidate providers returned null\n");
     }
+    // No session is a dormant request, not a fallback to the environment
+    // default: the default session was destroyed above and is not recreated.
+    return sched->moe_cache_session != nullptr ? GGML_MOE_CACHE_SET_APPLIED : GGML_MOE_CACHE_SET_DORMANT;
 }
 
 static bool ggml_backend_sched_any_pending(ggml_backend_sched_t sched) {

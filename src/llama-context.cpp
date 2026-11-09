@@ -66,6 +66,57 @@ static void tp5_assign_graph_uid(ggml_backend_t relay, ggml_cgraph * gf) {
     }
 }
 
+// Apply the context's MoE cache policy to one scheduler. A scheduler born
+// from ggml_backend_sched_new carries an environment-default session; this
+// call replaces it with the resolved policy. A dormant outcome is not a
+// fallback: the default session was destroyed and no session remains. A
+// refusal keeps the previous session and must fail the caller closed.
+static_assert(int(LLAMA_MOE_CACHE_MODE_UNSPECIFIED) == int(GGML_MOE_CACHE_MODE_UNSPECIFIED),
+              "llama/ggml MoE cache mode values diverged");
+static_assert(int(LLAMA_MOE_CACHE_MODE_OFF) == int(GGML_MOE_CACHE_MODE_OFF),
+              "llama/ggml MoE cache mode values diverged");
+static_assert(int(LLAMA_MOE_CACHE_MODE_AUTO) == int(GGML_MOE_CACHE_MODE_AUTO),
+              "llama/ggml MoE cache mode values diverged");
+static_assert(int(LLAMA_MOE_CACHE_MODE_ON) == int(GGML_MOE_CACHE_MODE_ON),
+              "llama/ggml MoE cache mode values diverged");
+
+static ggml_moe_cache_mode llama_to_ggml_moe_cache_mode(llama_moe_cache_mode mode) {
+    switch (mode) {
+        case LLAMA_MOE_CACHE_MODE_UNSPECIFIED:
+            return GGML_MOE_CACHE_MODE_UNSPECIFIED;
+        case LLAMA_MOE_CACHE_MODE_OFF:
+            return GGML_MOE_CACHE_MODE_OFF;
+        case LLAMA_MOE_CACHE_MODE_AUTO:
+            return GGML_MOE_CACHE_MODE_AUTO;
+        case LLAMA_MOE_CACHE_MODE_ON:
+            return GGML_MOE_CACHE_MODE_ON;
+    }
+    LLAMA_LOG_ERROR("%s: unknown MoE cache mode %d\n", __func__, int(mode));
+    return GGML_MOE_CACHE_MODE_UNSPECIFIED;
+}
+
+static bool llama_apply_moe_cache_config(
+        ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib) {
+    if (sched == nullptr) {
+        return false;
+    }
+    switch (ggml_backend_sched_set_moe_cache(sched, mode, budget_mib)) {
+        case GGML_MOE_CACHE_SET_APPLIED:
+            return true;
+        case GGML_MOE_CACHE_SET_DORMANT:
+            LLAMA_LOG_WARN("%s: MoE cache mode=%d budget=%zu MiB is dormant; "
+                           "the scheduler has no cache session\n",
+                           __func__, int(mode), budget_mib);
+            return true;
+        case GGML_MOE_CACHE_SET_REFUSED:
+            LLAMA_LOG_ERROR("%s: refused to change an unproven MoE cache session; "
+                            "the scheduler must not run with its default session\n",
+                            __func__);
+            return false;
+    }
+    return false;
+}
+
 static bool union_model_shape_supported(const llama_model & model) {
     return model.arch == LLM_ARCH_LLAMA && !model.hparams.use_alibi &&
         model.hparams.n_expert == 0 && model.hparams.n_rel_attn_bkts == 0;
@@ -1195,15 +1246,17 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             kv_stream_phase_arena.page_bytes             = page_bytes;
             kv_stream_phase_arena.conversion_bytes       = conversion_bytes;
             kv_stream_phase_arena.layer_count            = layer_count;
-            kv_stream_phase_arena.current_kv_bytes       = kv_stream_minimum_stage_bytes;
-            kv_stream_phase_arena.current_compute_offset = kv_stream_minimum_stage_bytes;
-            kv_stream_phase_arena.current_compute_bytes  = kv_stream_arena_bytes - kv_stream_minimum_stage_bytes;
-            kv_stream_phase_arena.current_ring_slots     = kv_stream_phase_arena.minimum_ring_slots;
             if (kv_stream_phase_arena.arena == nullptr ||
                 !arena_set_compute_fn(kv_stream_phase_arena.arena, kv_stream_minimum_stage_bytes,
                                       kv_stream_arena_bytes - kv_stream_minimum_stage_bytes)) {
                 throw std::runtime_error("failed to create CUDA block KV streaming phase arena");
             }
+            kv_stream_phase_arena.phase.current = {
+                kv_stream_minimum_stage_bytes,
+                kv_stream_minimum_stage_bytes,
+                kv_stream_arena_bytes - kv_stream_minimum_stage_bytes,
+                kv_stream_phase_arena.minimum_ring_slots,
+            };
             kv_stream_phase_arena.buffer_type = arena_buffer_type_fn(kv_stream_phase_arena.arena);
             if (kv_stream_phase_arena.buffer_type == nullptr) {
                 throw std::runtime_error("failed to obtain phase arena CUDA buffer type");
@@ -1568,7 +1621,28 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
     if (!arena.configured) {
         return true;
     }
-    if (sched && arena.decode == decode) {
+    // The factor-prefab lane rejects a context with KV-stream targets at
+    // init. Keep the invariant explicit: a prefab slot scheduler would own
+    // backends and graph buffers the phase arena is about to repartition.
+    if (prefab) {
+        LLAMA_LOG_ERROR("%s: prefab and the KV-stream phase arena are mutually exclusive\n", __func__);
+        return false;
+    }
+    if (arena.phase.inconsistent) {
+        LLAMA_LOG_ERROR("%s: phase arena is inconsistent after a failed rollback; "
+                        "refusing further switches\n", __func__);
+        return false;
+    }
+    // Any unproven owner is refused before the early reuse. The early return
+    // does not replace owners, but the same rule must hold on both paths:
+    // has_unproven() covers the main scheduler, prefab slots/pending and every
+    // per-shape scheduler.
+    if (has_unproven()) {
+        LLAMA_LOG_ERROR("%s: refusing to switch phases while a scheduler has an unproven submission\n", __func__);
+        arena.phase.phase_ready = false;
+        return false;
+    }
+    if (sched && arena.phase.can_reuse(decode)) {
         return true;
     }
     if (arena.backend_index >= backend_ptrs.size()) {
@@ -1599,6 +1673,14 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
         return false;
     }
     const auto & target = decode ? arena.token_generation : arena.prefill;
+    const llama_kv_stream_phase_layout target_layout = {
+        target.kv_bytes, target.compute_offset, target.compute_bytes, target.ring_slots,
+    };
+    auto & phase = arena.phase;
+
+    // From here the old phase is not reusable: its scheduler is about to be
+    // dropped. Any failure leaves phase_ready false so the next call rebuilds.
+    phase.phase_ready = false;
 
     synchronize();
     if (sched && !arena.graph_reset_fn(backend_ptrs[arena.backend_index])) {
@@ -1614,56 +1696,60 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
     gf_res_prev->reset();
     union_record_invalidate();
 
-    const size_t   old_kv_bytes       = arena.current_kv_bytes;
-    const size_t   old_compute_offset = arena.current_compute_offset;
-    const size_t   old_compute_bytes  = arena.current_compute_bytes;
-    const uint32_t old_ring_slots     = arena.current_ring_slots;
-
-    auto resize_kv = [&](size_t bytes, uint32_t ring_slots) {
-        return kv->kv_stream_resize_pool(bytes, active_tokens, ring_slots);
-    };
-    auto restore_compute = [&] {
-        return arena.set_compute_fn(arena.arena, old_compute_offset, old_compute_bytes);
+    const llama_kv_stream_phase_layout old = phase.current;
+    const auto rollback_compute = [&]() {
+        return arena.set_compute_fn(arena.arena, old.compute_offset, old.compute_bytes);
     };
 
-    if (target.kv_bytes > old_kv_bytes) {
+    if (target_layout.kv_bytes > old.kv_bytes) {
         // Moving compute upward frees the bytes before KV claims them.
-        if (!arena.set_compute_fn(arena.arena, target.compute_offset, target.compute_bytes)) {
+        if (!arena.set_compute_fn(arena.arena, target_layout.compute_offset, target_layout.compute_bytes)) {
             LLAMA_LOG_ERROR("%s: failed to move arena compute slice upward\n", __func__);
             return false;
         }
-        if (!resize_kv(target.kv_bytes, target.ring_slots)) {
-            (void) restore_compute();
+        if (!kv->kv_stream_resize_pool(target_layout.kv_bytes, active_tokens, target_layout.ring_slots)) {
+            if (!rollback_compute()) {
+                phase.inconsistent = true;
+                LLAMA_LOG_ERROR("%s: failed to restore the old arena compute slice after a failed grow; "
+                                "marking the arena inconsistent\n", __func__);
+            }
             LLAMA_LOG_ERROR("%s: failed to grow arena KV slice\n", __func__);
             return false;
         }
-    } else if (target.kv_bytes < old_kv_bytes) {
+    } else if (target_layout.kv_bytes < old.kv_bytes) {
         // KV releases the bytes before compute expands downward.
-        if (!resize_kv(target.kv_bytes, target.ring_slots)) {
+        if (!kv->kv_stream_resize_pool(target_layout.kv_bytes, active_tokens, target_layout.ring_slots)) {
             LLAMA_LOG_ERROR("%s: failed to shrink arena KV slice\n", __func__);
             return false;
         }
-        if (!arena.set_compute_fn(arena.arena, target.compute_offset, target.compute_bytes)) {
-            (void) resize_kv(old_kv_bytes, old_ring_slots);
+        if (!arena.set_compute_fn(arena.arena, target_layout.compute_offset, target_layout.compute_bytes)) {
+            if (!kv->kv_stream_resize_pool(old.kv_bytes, active_tokens, old.ring_slots)) {
+                phase.inconsistent = true;
+                LLAMA_LOG_ERROR("%s: failed to restore the old arena KV slice after a failed shrink; "
+                                "marking the arena inconsistent\n", __func__);
+            }
             LLAMA_LOG_ERROR("%s: failed to move arena compute slice downward\n", __func__);
             return false;
         }
     } else {
-        if (!arena.set_compute_fn(arena.arena, target.compute_offset, target.compute_bytes)) {
+        if (!arena.set_compute_fn(arena.arena, target_layout.compute_offset, target_layout.compute_bytes)) {
             LLAMA_LOG_ERROR("%s: failed to update arena compute slice\n", __func__);
             return false;
         }
-        if (!resize_kv(target.kv_bytes, target.ring_slots)) {
-            (void) restore_compute();
+        if (!kv->kv_stream_resize_pool(target_layout.kv_bytes, active_tokens, target_layout.ring_slots)) {
+            if (!rollback_compute()) {
+                phase.inconsistent = true;
+                LLAMA_LOG_ERROR("%s: failed to restore the old arena compute slice after a failed layout update; "
+                                "marking the arena inconsistent\n", __func__);
+            }
             LLAMA_LOG_ERROR("%s: failed to update arena KV layout\n", __func__);
             return false;
         }
     }
 
-    arena.current_kv_bytes       = target.kv_bytes;
-    arena.current_compute_offset = target.compute_offset;
-    arena.current_compute_bytes  = target.compute_bytes;
-    arena.current_ring_slots     = target.ring_slots;
+    // The physical split is the target. Record that fact, but keep the phase
+    // not-ready until its scheduler and reserved graph exist.
+    phase.current = target_layout;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), arena.max_nodes,
                                        cparams.pipeline_parallel, cparams.op_offload));
@@ -1671,10 +1757,26 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
         LLAMA_LOG_ERROR("%s: failed to recreate scheduler\n", __func__);
         return false;
     }
+    // ggml_backend_sched_new created an environment-default MoE session.
+    // Re-apply the context's resolved policy so a phase switch cannot silently
+    // change the user's off/budget or fall back to that default.
+    if (!moe_cache_configured) {
+        LLAMA_LOG_ERROR("%s: no resolved MoE cache configuration for the phase scheduler; "
+                        "refusing the environment default\n", __func__);
+        sched.reset();
+        return false;
+    }
+    if (!llama_apply_moe_cache_config(sched.get(), llama_to_ggml_moe_cache_mode(moe_cache_mode_resolved),
+                                      moe_cache_budget_mib)) {
+        LLAMA_LOG_ERROR("%s: failed to apply the context's MoE cache configuration to the phase scheduler\n", __func__);
+        sched.reset();
+        return false;
+    }
 
     auto reserve_mctx = memory->init_full();
     if (!reserve_mctx) {
         LLAMA_LOG_ERROR("%s: failed to initialize full memory for phase reserve\n", __func__);
+        sched.reset();
         return false;
     }
 
@@ -1685,11 +1787,13 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
     if (gf == nullptr) {
         LLAMA_LOG_ERROR("%s: failed to reserve %s compute graph in phase arena\n", __func__,
                         decode ? "decode" : "prefill");
+        sched.reset();
         return false;
     }
 
     backend_buf_exp_size = target.backend_sizes;
-    arena.decode         = decode;
+    phase.decode         = decode;
+    phase.phase_ready    = true;
     LLAMA_LOG_INFO("%s: activated %s phase: KV %.2f MiB, compute %.2f MiB, active tokens %u\n", __func__,
                    decode ? "decode" : "prefill", target.kv_bytes / 1024.0 / 1024.0,
                    target.compute_bytes / 1024.0 / 1024.0, active_tokens);
@@ -1723,6 +1827,7 @@ void llama_context::sched_reserve() {
         if (!kv_stream_phase_arena.graph_reset_fn(backend_ptrs[kv_stream_phase_arena.backend_index])) {
             throw std::runtime_error("failed to reset CUDA graphs before measuring phase arena");
         }
+        kv_stream_phase_arena.phase.phase_ready = false;
         sched.reset();
     }
 
@@ -1746,9 +1851,13 @@ void llama_context::sched_reserve() {
     gf_res_reserve->set_owner(this); // same owner invariant for the reserve result
 
     const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
-        model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
-    const ggml_moe_cache_mode moe_cache_mode =
-        moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
+        model, cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
+    // Persist the resolved policy before any scheduler is created. Every
+    // recreated scheduler (reserve retry, per-shape plan, KV-stream phase
+    // switch) re-applies these values instead of keeping the default session.
+    moe_cache_mode_resolved = moe_cache_eligible ? cparams.moe_cache_mode : LLAMA_MOE_CACHE_MODE_OFF;
+    moe_cache_budget_mib    = cparams.moe_cache_budget_mib;
+    moe_cache_configured    = true;
     const char * moe_cache_requested = "provider";
     switch (cparams.moe_cache_mode) {
         case LLAMA_MOE_CACHE_MODE_OFF:
@@ -1768,7 +1877,11 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
                                        cparams.pipeline_parallel, cparams.op_offload));
-    ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+    if (!llama_apply_moe_cache_config(sched.get(), llama_to_ggml_moe_cache_mode(moe_cache_mode_resolved),
+                                      moe_cache_budget_mib)) {
+        sched.reset();
+        throw std::runtime_error("failed to apply the resolved MoE cache configuration");
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1914,6 +2027,7 @@ void llama_context::sched_reserve() {
         kv_stream_phase_arena.max_nodes        = max_nodes;
         kv_stream_phase_arena.configured       = true;
 
+        kv_stream_phase_arena.phase.phase_ready = false;
         sched.reset();
         backend_buft[backend_index] = kv_stream_phase_arena.buffer_type;
         if (!kv_stream_switch_phase(false, 0)) {
@@ -2010,7 +2124,11 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                                    max_nodes, false, cparams.op_offload));
-                ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+                if (!llama_apply_moe_cache_config(sched.get(), llama_to_ggml_moe_cache_mode(moe_cache_mode_resolved),
+                                                  moe_cache_budget_mib)) {
+                    sched.reset();
+                    throw std::runtime_error("failed to apply the resolved MoE cache configuration after scheduler retry");
+                }
                 continue;
             }
             break;
@@ -2030,7 +2148,11 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                                    max_nodes, false, cparams.op_offload));
-                ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+                if (!llama_apply_moe_cache_config(sched.get(), llama_to_ggml_moe_cache_mode(moe_cache_mode_resolved),
+                                                  moe_cache_budget_mib)) {
+                    sched.reset();
+                    throw std::runtime_error("failed to apply the resolved MoE cache configuration after scheduler retry");
+                }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2983,6 +3105,14 @@ bool llama_context::has_unproven() const {
             if (pending && ggml_backend_sched_has_unproven(pending)) {
                 return true;
             }
+        }
+    }
+    // Per-shape schedulers are independent owners too. A shape plan can be the
+    // actual submitter, and the destructor/flush paths must not synchronize an
+    // unproven submission.
+    for (const auto & plan : shape_plans) {
+        if (plan && plan->sched && ggml_backend_sched_has_unproven(plan->sched.get())) {
+            return true;
         }
     }
     return false;
@@ -5765,17 +5895,23 @@ std::unique_ptr<llama_context::llama_shape_plan> llama_context::make_shape_plan(
     auto plan = std::make_unique<llama_shape_plan>();
     plan->res = std::make_unique<llm_graph_result>(max_nodes);
     plan->res->set_owner(this);
-    const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
-        model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
-    const ggml_moe_cache_mode moe_cache_mode =
-        moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
+    if (!moe_cache_configured) {
+        LLAMA_LOG_ERROR("%s: no resolved MoE cache configuration; refusing a per-shape scheduler "
+                        "with the environment default\n", __func__);
+        return nullptr;
+    }
     plan->sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                              max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     if (!plan->sched) {
         LLAMA_LOG_ERROR("%s: failed to create a per-shape scheduler\n", __func__);
         return nullptr;
     }
-    ggml_backend_sched_set_moe_cache(plan->sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+    if (!llama_apply_moe_cache_config(plan->sched.get(), llama_to_ggml_moe_cache_mode(moe_cache_mode_resolved),
+                                      moe_cache_budget_mib)) {
+        LLAMA_LOG_ERROR("%s: failed to apply the MoE cache configuration to the per-shape scheduler\n", __func__);
+        plan->sched.reset();
+        return nullptr;
+    }
     ggml_backend_sched_set_eval_callback(plan->sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
     return plan;
 }
@@ -10443,16 +10579,22 @@ void llama_context::prefab_init() {
         }
         // A owns the backend list, the node-budget policy and the slot result
         // objects; it attaches ready handles to B's slots.
-        const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
-            model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
-        const ggml_moe_cache_mode moe_cache_mode =
-            moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
+        if (!moe_cache_configured) {
+            throw std::runtime_error("factor-prefab: no resolved MoE cache configuration");
+        }
         std::string desc;
         for (size_t i = 0; i < env.size(); ++i) {
             ggml_backend_sched_t slot_sched = ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
                                                     backend_ptrs.size(), graph_max_nodes(env[i]),
                                                     cparams.pipeline_parallel, cparams.op_offload);
-            ggml_backend_sched_set_moe_cache(slot_sched, moe_cache_mode, cparams.moe_cache_budget_mib);
+            if (slot_sched == nullptr) {
+                throw std::runtime_error("factor-prefab: failed to create a slot scheduler");
+            }
+            if (!llama_apply_moe_cache_config(slot_sched, llama_to_ggml_moe_cache_mode(moe_cache_mode_resolved),
+                                              moe_cache_budget_mib)) {
+                ggml_backend_sched_free(slot_sched);
+                throw std::runtime_error("factor-prefab: failed to apply the MoE cache configuration to a slot scheduler");
+            }
             llama_prefab_attach_slot(*prefab, i, slot_sched, new llm_graph_result(graph_max_nodes(env[i])));
             desc += (i ? "," : "") + std::to_string(env[i]);
         }
@@ -10637,13 +10779,20 @@ bool llama_context::prefab_process_ubatch(const llama_ubatch & ubatch, llm_graph
         const uint32_t n_env = slot.n_env;
 
         if (!slot.sched) {
-            const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
-                model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
-            const ggml_moe_cache_mode moe_cache_mode =
-                moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
+            if (!moe_cache_configured) {
+                throw std::runtime_error("factor-prefab: no resolved MoE cache configuration");
+            }
             slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                                     graph_max_nodes(n_env), cparams.pipeline_parallel, cparams.op_offload));
-            ggml_backend_sched_set_moe_cache(slot.sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+            if (!slot.sched) {
+                throw std::runtime_error("factor-prefab: failed to create an MTP slot scheduler");
+            }
+            if (!llama_apply_moe_cache_config(slot.sched.get(),
+                                              llama_to_ggml_moe_cache_mode(moe_cache_mode_resolved),
+                                              moe_cache_budget_mib)) {
+                slot.sched.reset();
+                throw std::runtime_error("factor-prefab: failed to apply the MoE cache configuration to an MTP slot scheduler");
+            }
         }
 
         auto gparams = graph_params(slot.res.get(), ubatch, mctx, gtype);
@@ -10783,13 +10932,20 @@ bool llama_context::prefab_process_ubatch(const llama_ubatch & ubatch, llm_graph
     }
 
     if (!slot.sched) {
-        const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
-            model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
-        const ggml_moe_cache_mode moe_cache_mode =
-            moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
+        if (!moe_cache_configured) {
+            throw std::runtime_error("factor-prefab: no resolved MoE cache configuration");
+        }
         slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                                 graph_max_nodes(n_env), cparams.pipeline_parallel, cparams.op_offload));
-        ggml_backend_sched_set_moe_cache(slot.sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+        if (!slot.sched) {
+            throw std::runtime_error("factor-prefab: failed to create a factor slot scheduler");
+        }
+        if (!llama_apply_moe_cache_config(slot.sched.get(),
+                                          llama_to_ggml_moe_cache_mode(moe_cache_mode_resolved),
+                                          moe_cache_budget_mib)) {
+            slot.sched.reset();
+            throw std::runtime_error("factor-prefab: failed to apply the MoE cache configuration to a factor slot scheduler");
+        }
     }
 
     // canonical ubatch: envelope shape, real data (envelope inputs read the real ubatch and pad)

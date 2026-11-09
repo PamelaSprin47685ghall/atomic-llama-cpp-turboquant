@@ -1107,6 +1107,26 @@ endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp)
 
+# Scheduler MoE-cache session policy on the real CPU scheduler: default
+# session replacement, OFF, dormant, and the unproven refusal. The provider is
+# a real session implementation; every assertion reads the scheduler's own
+# observable mode/budget/session state.
+llama_build_and_test(test-moe-cache-session.cpp LABEL "cpu")
+set_tests_properties(test-moe-cache-session PROPERTIES
+    TIMEOUT 60
+    SKIP_RETURN_CODE 77
+    PASS_REGULAR_EXPRESSION "MOE_SESSION_TEST PASS")
+
+# Explicit ON is a requirement at the real llama_init_from_model entry: a dense
+# model must fail context creation instead of silently resolving to OFF. AUTO
+# and the unspecified default may resolve to OFF. Model-gated; skips without
+# LLAMA_TEST_MODEL.
+llama_build_and_test(test-moe-cache-context-policy.cpp LABEL "cpu")
+set_tests_properties(test-moe-cache-context-policy PROPERTIES
+    TIMEOUT 120
+    SKIP_RETURN_CODE 77
+    PASS_REGULAR_EXPRESSION "MOE_CONTEXT_POLICY_TEST PASS")
+
 if (TARGET ggml-cpu AND NOT LLAMA_USE_SYSTEM_GGML AND NOT GGML_BACKEND_DL AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     add_executable(test-cpu-attn-pad test-cpu-attn-pad.cpp)
     target_link_libraries(test-cpu-attn-pad PRIVATE ggml-cpu ggml-base)

@@ -280,6 +280,36 @@ the draft path is untouched; they do shift across arena sizes, which is the
 non-bit-identical behaviour described under [Numerical
 exactness](#numerical-exactness).
 
+## Phase switch state and failure isolation
+
+A prefill/decode switch first changes the physical KV/compute split, then
+builds the phase scheduler and reserves its graph. The committed split is
+reused only when that scheduler is ready; the stored `current_*` values are
+not by themselves a promise that the phase is usable.
+
+- Before any reuse or physical change, the switch refuses if the main,
+  prefab, or any per-shape scheduler has an unproven submission. The old
+  owner is neither destroyed nor replaced; the caller gets a failure and the
+  process retains the unproven owner.
+- The factor-prefab lane is mutually exclusive with the phase arena: prefab
+  eligibility rejects a context with KV-stream targets, and the switch also
+  refuses a non-null prefab defensively. Per-shape (relay) schedulers can
+  coexist; the switch checks them in `has_unproven()` and flushes them before
+  rebuilding.
+- A failed physical step restores the old split and fails the switch.
+- If the restore itself fails, the arena is marked inconsistent and every
+  later switch fails closed. The process does not pretend the old split is
+  valid.
+- If the physical split succeeds but scheduler creation or graph reservation
+  fails, the new split is kept as a fact, the partial scheduler is dropped,
+  `phase_ready` stays false, and the next call retries from that split.
+
+The CPU state machine is covered by `test-kv-stream-phase-state`. The CUDA
+arena's no-change-on-false contracts for `set_compute` and `resize_pool` are
+read from the implementation (`ggml-cuda.cu`), but this test does not execute
+them on a device. A device run is still required to prove the physical side
+effects under failure.
+
 ## Known inefficiency: MTP verification batches use the prompt-phase layout
 
 `tools/server/server-context.cpp` never calls `llama_set_decode_phase()`, so

@@ -10,6 +10,7 @@
 #include "llama-prefab.h"
 #include "llama-union-binder.h"
 #include "llama-shape-cache.h"
+#include "llama-kv-stream-phase.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -518,11 +519,9 @@ private:
         uint32_t minimum_ring_slots = 8;
         size_t backend_index = SIZE_MAX;
         size_t max_nodes = 0;
-        size_t current_kv_bytes = 0;
-        size_t current_compute_offset = 0;
-        size_t current_compute_bytes = 0;
-        uint32_t current_ring_slots = 0;
-        bool decode = false;
+        // Committed physical split plus the phase whose scheduler is ready.
+        // See src/llama-kv-stream-phase.h for the transition contract.
+        llama_kv_stream_phase_state phase;
         bool configured = false;
         layout prefill;
         layout token_generation;
@@ -608,6 +607,15 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // Resolved MoE cache policy of this context. A scheduler recreated by a
+    // reserve retry, a per-shape plan, or a KV-stream phase switch must
+    // re-apply it; otherwise the new scheduler keeps the environment-default
+    // session created by ggml_backend_sched_new and silently ignores the
+    // user's off/budget.
+    llama_moe_cache_mode moe_cache_mode_resolved = LLAMA_MOE_CACHE_MODE_UNSPECIFIED;
+    size_t               moe_cache_budget_mib    = 0;
+    bool                 moe_cache_configured    = false;
 
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_t backend_tp5_relay = nullptr;

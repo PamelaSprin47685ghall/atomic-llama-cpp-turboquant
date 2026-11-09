@@ -2760,7 +2760,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-cache"}, "MODE",
         "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
-        "(default: auto; auto = preserve weight repacking; on = automatic budget without weight repacking; "
+        "(default: unspecified, the backend environment default; auto = preserve weight repacking; "
+        "on = automatic budget without weight repacking; "
         "soft = try spare VRAM first, evict experts only as needed; "
         "off/0 = disabled; N = VRAM budget in MiB per device without weight repacking)",
         [](common_params & params, const std::string & value) {
