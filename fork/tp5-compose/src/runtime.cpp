@@ -1463,7 +1463,6 @@ class relay_service {
                             event.elements <= UINT64_MAX / width && event.wire_bytes == event.elements * width,
                         "relay wire payload extent is invalid");
             }
-            auto key = std::make_pair(event.plan_generation, event.channel);
             if (event.kind == GGML_RELAY_INPUT_READY) {
                 channel_state * owner = nullptr;
                 if (window.slot_channels) {
