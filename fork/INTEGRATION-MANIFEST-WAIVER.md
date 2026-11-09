@@ -174,30 +174,40 @@ unchanged` versus `no prior registration (staging unregistered)`. The dead
 the dump and the tests.
 
 The automatic merge left the six staging manifest digests at their old
-values, because the source branch's files differ from the target's
-aggregated `ggml-backend-meta.cpp` and the merged test/doc text. Only the
-six files changed and reviewed in this round are re-signed here; no other
-entry is touched, and no historical red item is re-signed.
+values. A whole-file digest cannot sign a partial change: four of the six
+files were already stale against the parent manifest at `e4b838303`, so
+recording their final digest would hide that pre-existing difference. The
+table separates the two proven cases. `staging.cu` and the Meta partial
+test matched their parent manifest digests; their final digests are signed
+for this round. `docs`, `ggml-backend-meta.cpp`, `staging.h` and the pool
+test did not match at `e4b838303`; their parent manifest digests are
+restored and remain red items. No other entry is touched, and no
+historical red item is re-signed.
 
-| path | old recorded at e4b838303 | new hash | source / responsibility |
-|---|---|---|---|
-| `docs/tp5-staging-submission.md` | `9b5a226c66d9e76317dae10b06849d13e35448b55d2d3910c5dc6e2f1b3e8bca` | `e31dca0f0df99096408c8a68b8470b862e2627a35a8113708b773a7e0ac91713` | `97e824de2`, `bfc762daa`, `8b6c28403`: v3 api, kind-domain rejection, short-table read boundary, two reachable `no_slot` classes, and the existing-registration warning semantics. |
-| `ggml/src/ggml-backend-meta.cpp` | `30086f0db3ed3d29be3652eef950fa850e6ccaa9fef561715ca93444aa5134a3` | `02b3de5a50b7f187bbc5f9fb3bd87dd23d9f4b797db7a3861bed6acf53174254` | `97e824de2`, `bfc762daa`, `8b6c28403`: version-first registration, `kind_count` capability check, short-table safety, existing-registration preservation, and the exact WARN state. The shared `candidate_decision` aggregation is retained. |
-| `ggml/src/ggml-cuda/staging.cu` | `06703caf8deb82f13406b3b30d086b63ee0d82da063e388214f7cb0b14eea2d0` | `130f2192a26ceec1bb6103a1ba40d879b13b0c39361242646be5ffe0360581a6` | `97e824de2`, `bfc762daa`, `8b6c28403`: publish `kind_count` in the v3 table and state the rejection/registration semantics at init. |
-| `ggml/src/ggml-cuda/staging.h` | `2726b628aebec43b200298e7c9605509abb2836d1e759122d22969f2c1afb4ec` | `afccd87ef5ab7429663b45ae623cebcf0d54a4d82c179785d3e81c98d428875b` | `97e824de2`, `bfc762daa`, `8b6c28403`: v3 `kind_count`, two reachable `no_slot` classes, no dead counters, and the v3/registration comments. |
-| `tests/test-tp5-staging-meta-partial.cpp` | `96f27f3ce1ebc2f1f8782f6c2c6137f9735ca024b10b0f7d8bf0308ed4618664` | `d46e164fc08c907902df46779e81bd474cdb062db86a5c26ee46c19c2dd909c3` | `bfc762daa`, `8b6c28403`: four-byte v1/v2 tables, accepted-table retention, larger kind domain, and the two warning states. |
-| `tests/test-tp5-staging-pool.cpp` | `aa3b45e969a6163e2434ddb5d147396fe41e8cc2926452ca5e9243660be580b6` | `39c226c9b9517582dd360bb1ae39bab16e5c9c0b5cafd90c68c375f6bacfdd36` | `97e824de2`, `bfc762daa`: v3 append-only assertion and the two-class `no_slot` sum; a faulted pool counts no `no_slot`. |
+| path | parent manifest at e4b838303 | actual at e4b838303 | final hash | disposition |
+|---|---|---|---|---|
+| `docs/tp5-staging-submission.md` | `9b5a226c66d9e76317dae10b06849d13e35448b55d2d3910c5dc6e2f1b3e8bca` | `e73853524455aed75f703a64056f6500e69959cba1e7174b7b274771d08c6905` | `e31dca0f0df99096408c8a68b8470b862e2627a35a8113708b773a7e0ac91713` | parent stale; keep the parent digest as a red item |
+| `ggml/src/ggml-backend-meta.cpp` | `30086f0db3ed3d29be3652eef950fa850e6ccaa9fef561715ca93444aa5134a3` | `59192e302292197dd85921fb852bc4922c66ed173b73ebc2d4504aeba5b51aad` | `02b3de5a50b7f187bbc5f9fb3bd87dd23d9f4b797db7a3861bed6acf53174254` | parent stale; keep the parent digest as a red item |
+| `ggml/src/ggml-cuda/staging.cu` | `06703caf8deb82f13406b3b30d086b63ee0d82da063e388214f7cb0b14eea2d0` | `06703caf8deb82f13406b3b30d086b63ee0d82da063e388214f7cb0b14eea2d0` | `130f2192a26ceec1bb6103a1ba40d879b13b0c39361242646be5ffe0360581a6` | parent matched; sign the final digest |
+| `ggml/src/ggml-cuda/staging.h` | `2726b628aebec43b200298e7c9605509abb2836d1e759122d22969f2c1afb4ec` | `5ee59204e738201b10cd9e51eebbea6b5afcca089d623afff6a7fcb2072b110b` | `afccd87ef5ab7429663b45ae623cebcf0d54a4d82c179785d3e81c98d428875b` | parent stale; keep the parent digest as a red item |
+| `tests/test-tp5-staging-meta-partial.cpp` | `96f27f3ce1ebc2f1f8782f6c2c6137f9735ca024b10b0f7d8bf0308ed4618664` | `96f27f3ce1ebc2f1f8782f6c2c6137f9735ca024b10b0f7d8bf0308ed4618664` | `d46e164fc08c907902df46779e81bd474cdb062db86a5c26ee46c19c2dd909c3` | parent matched; sign the final digest |
+| `tests/test-tp5-staging-pool.cpp` | `aa3b45e969a6163e2434ddb5d147396fe41e8cc2926452ca5e9243660be580b6` | `43accbb88d30a0ede86611b42a585b36d5ffa6cccad86dd427a3b73bc067ea6a` | `39c226c9b9517582dd360bb1ae39bab16e5c9c0b5cafd90c68c375f6bacfdd36` | parent stale; keep the parent digest as a red item |
 
-Verification: the two test files and the registration function are
+The four restored entries are expected to remain mismatches against the
+final files; that records the pre-existing drift instead of blessing it.
+The two signed entries are the only manifest changes in this round. No
+manifest path is new, so there is no new-file registration.
+
+Verification: the parent-match column comes from `git show
+e4b838303:<path>` against the parent manifest, and the final hashes are
+the current files. JSON is valid. The source branch reported the
+short-table ASan check and the staging pool CPU harness passing; neither
+was rerun here. The two test files and the registration function are
 byte-identical to the source branch's final versions; the only
 `ggml-backend-meta.cpp` difference from that branch is the target-side
-rejection aggregation block. The source branch reported the short-table ASan
-check and the staging pool CPU harness passing; neither was rerun here
-because there was no textual code conflict. This round checked JSON
-validity, all six actual file digests, and `python3
-fork/check-upstream.py`, which still fails first at
-`ggml/src/ggml-cuda/mmvf.cu`, the pre-existing Section A red item. No
-historical red item is re-signed.
+rejection aggregation block. The known guard was not rerun after restoring
+the four red items; the earlier B4 run first failed at
+`ggml/src/ggml-cuda/mmvf.cu`, and that entry is unchanged.
 
 Known uncovered boundary: no target-side compile or ASan/CPU rerun, so the
 target's aggregation block and its interaction with the registration are
