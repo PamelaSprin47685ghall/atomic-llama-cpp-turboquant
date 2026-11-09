@@ -139,14 +139,20 @@ struct staging_reject_example {
     ggml_type type = GGML_TYPE_COUNT;
 };
 
+enum staging_example_state : int {
+    example_empty   = 0,
+    example_writing = 1,
+    example_ready   = 2,
+};
+
 struct staging_reject_stat {
-    // The hot path only bumps this counter. The example is published once by
-    // compare_exchange; a dump may observe the count before the example is
-    // published and then reports (none) instead of fabricating a snapshot.
+    // The hot path only bumps this counter. The first example is written in
+    // place by the single thread that wins the EMPTY->WRITING compare_exchange;
+    // that thread publishes READY with release. Readers load the state with
+    // acquire and touch the fields only in READY. No allocation, no blocking.
     std::atomic<uint64_t> count{0};
-    // Heap-owned, self-contained, never freed (process lifetime, diagnostics).
-    // acquire/release pairs the single publication with every reader.
-    std::atomic<const staging_reject_example *> example{nullptr};
+    std::atomic<int> state{example_empty};
+    staging_reject_example example{};
 };
 
 struct staging_reject_table {
@@ -193,23 +199,19 @@ static void staging_log_reject(const char * lane, const ggml_tensor * tensor, si
     const int lane_id = std::strcmp(lane, "async") == 0 ? 1 : 0;
     const int reason = staging_reject_reason(tensor, size, reason_override);
     staging_reject_stat & stat = g_staging_reject.lanes[lane_id][reason];
-    // Hot path: one relaxed increment and no I/O. The first example is captured
-    // once by compare_exchange into a self-owned heap record and published with
-    // release; a dump may see the count before that publication and then
-    // reports (none) instead of fabricating a snapshot.
+    // Hot path: one relaxed increment and no I/O. The single thread that wins
+    // EMPTY->WRITING writes the in-place example and publishes READY with
+    // release; losers do not allocate, block, or retry.
     stat.count.fetch_add(1, std::memory_order_relaxed);
-    if (stat.example.load(std::memory_order_relaxed) == nullptr) {
-        auto * ex = new staging_reject_example{};
-        std::snprintf(ex->name, sizeof(ex->name), "%s",
+    int expected = example_empty;
+    if (stat.state.compare_exchange_strong(expected, example_writing,
+            std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        std::snprintf(stat.example.name, sizeof(stat.example.name), "%s",
                       tensor != nullptr ? tensor->name : "(null)");
-        ex->size = size;
-        ex->flags = tensor != nullptr ? unsigned(tensor->flags) : 0u;
-        ex->type = tensor != nullptr ? tensor->type : GGML_TYPE_COUNT;
-        const staging_reject_example * expected = nullptr;
-        if (!stat.example.compare_exchange_strong(expected, ex,
-                std::memory_order_release, std::memory_order_relaxed)) {
-            delete ex;  // another thread published first
-        }
+        stat.example.size = size;
+        stat.example.flags = tensor != nullptr ? unsigned(tensor->flags) : 0u;
+        stat.example.type = tensor != nullptr ? tensor->type : GGML_TYPE_COUNT;
+        stat.state.store(example_ready, std::memory_order_release);
     }
     if (!staging_diag_verbose()) {
         return;
@@ -268,13 +270,27 @@ extern "C" void ggml_backend_meta_staging_diag_dump() {
             if (n == 0) {
                 continue;
             }
-            const staging_reject_example * ex = stat.example.load(std::memory_order_acquire);
+            // acquire pairs with the writer's release store of READY. The
+            // fields are read only after READY; WRITING is reported as pending
+            // and EMPTY as none. No lock is held across the print.
+            const int state = stat.state.load(std::memory_order_acquire);
+            const char * example_name = "(none)";
+            unsigned example_flags = 0;
+            size_t example_size = 0;
+            const char * example_type = "?";
+            if (state == example_ready) {
+                example_name = stat.example.name;
+                example_flags = stat.example.flags;
+                example_size = stat.example.size;
+                example_type = stat.example.type != GGML_TYPE_COUNT
+                    ? ggml_type_name(stat.example.type) : "?";
+            } else if (state == example_writing) {
+                example_name = "(pending)";
+            }
             std::fprintf(stderr,
                 "TP5_STAGING_REJECT lane=%s reason=%s count=%llu example_name=%s flags=0x%x size=%zu type=%s\n",
                 lane_names[lane], staging_reject_reason_name(r), (unsigned long long) n,
-                ex != nullptr ? ex->name : "(none)", ex != nullptr ? ex->flags : 0u,
-                ex != nullptr ? ex->size : 0,
-                ex != nullptr && ex->type != GGML_TYPE_COUNT ? ggml_type_name(ex->type) : "?");
+                example_name, example_flags, example_size, example_type);
         }
     }
 }

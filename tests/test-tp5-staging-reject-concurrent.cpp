@@ -176,16 +176,17 @@ int main() {
         }
     }
 
-    // Capture the diagnostic output; the dump thread and the rejection threads
-    // share stderr, which the C library serializes.
-    FILE * capture = std::tmpfile();
-    CHECK(capture != nullptr);
-    if (capture == nullptr) {
+    // Capture the concurrent diagnostic output; the dump thread and the
+    // rejection threads share stderr, which the C library serializes. These
+    // intermediate lines may show (none)/(pending) and are not asserted.
+    FILE * concurrent = std::tmpfile();
+    CHECK(concurrent != nullptr);
+    if (concurrent == nullptr) {
         return 1;
     }
     const int saved = dup(fileno(stderr));
     CHECK(saved >= 0);
-    dup2(fileno(capture), fileno(stderr));
+    dup2(fileno(concurrent), fileno(stderr));
 
     std::atomic<bool> start{false};
     std::atomic<bool> stop_dump{false};
@@ -223,18 +224,27 @@ int main() {
     stop_dump.store(true, std::memory_order_release);
     workers[kThreads].join();
 
-    // Final dump after all rejections: the count is exact and the example is
-    // published.
+    // Stop the concurrent capture, then dump once with no writers: the count
+    // is exact and the example must be READY.
+    dup2(saved, fileno(stderr));
+    std::fclose(concurrent);
+
+    FILE * final_capture = std::tmpfile();
+    CHECK(final_capture != nullptr);
+    if (final_capture == nullptr) {
+        return 1;
+    }
+    dup2(fileno(final_capture), fileno(stderr));
     ggml_backend_meta_staging_diag_dump();
     std::fflush(stderr);
     dup2(saved, fileno(stderr));
     close(saved);
 
-    std::rewind(capture);
+    std::rewind(final_capture);
     std::vector<char> out(1u << 20);
-    const size_t n = std::fread(out.data(), 1, out.size() - 1, capture);
+    const size_t n = std::fread(out.data(), 1, out.size() - 1, final_capture);
     out[n] = '\0';
-    std::fclose(capture);
+    std::fclose(final_capture);
 
     char expected_count[128];
     std::snprintf(expected_count, sizeof(expected_count),
@@ -242,6 +252,7 @@ int main() {
     CHECK(std::strstr(out.data(), expected_count) != nullptr);
     CHECK(std::strstr(out.data(), "example_name=reject-concurrent-") != nullptr);
     CHECK(std::strstr(out.data(), "example_name=(none)") == nullptr);
+    CHECK(std::strstr(out.data(), "example_name=(pending)") == nullptr);
 
     for (fixture & f : fixtures) {
         free_fixture(f);

@@ -501,11 +501,13 @@ each through unbuffered stderr (FILE lock plus one write syscall), so the
 diagnostic added I/O to the load path and buried the signal.
 
 Rejections are counted per `(lane, reason)` with one relaxed atomic increment
-on the hot path. The first example (name, flags, size, type) is captured once
-by a compare_exchange into a self-owned heap record and published with
-release. A dump may observe the count before the example is published; it then
-prints `(none)` instead of fabricating a consistent snapshot. The exit dump
-prints one summary line per class:
+on the hot path. Each class embeds a fixed example record (`char[GGML_MAX_NAME]`
+name, size, flags, type) and an atomic state EMPTY/WRITING/READY. The single
+thread that wins the EMPTY->WRITING compare_exchange writes the record in
+place and publishes READY with release. A dump loads the state with acquire
+and reads the fields only in READY; WRITING prints `(pending)` and EMPTY prints
+`(none)`, so a race never fabricates a consistent snapshot. There is no
+allocation and no blocking. The exit dump prints one summary line per class:
 
 ```
 TP5_STAGING_REJECT lane=sync reason=no_input_flag count=512 example_name=... flags=0x0 size=... type=...
@@ -517,7 +519,7 @@ TP5_STAGING_REJECT lane=sync reason=no_input_flag count=512 example_name=... fla
 unchanged, so the diagnostic still answers why a candidate was rejected.
 
 Cost: the hot path performs one relaxed increment and no I/O; the example is
-captured once per class. The summary costs at most one line per
+written once per class with no allocation. The summary costs at most one line per
 `(lane, reason)` at exit and holds no lock while printing. With the flag off,
 `staging_log_reject` returns after the cached flag check, as before. This
 change touches only `ggml-backend-meta.cpp`; the slot-pressure work owns
@@ -525,25 +527,29 @@ change touches only `ggml-backend-meta.cpp`; the slot-pressure work owns
 
 ### Example lifetime and dump ordering
 
-The first example of each class is a self-owned `char[GGML_MAX_NAME]` copy made
-under the table mutex when the class is first seen. The source tensor may be
+The first example of each class is a fixed `char[GGML_MAX_NAME]` copy inside
+the class record, written in place by the CAS winner. The source tensor may be
 renamed, freed, or its arena reused before the exit dump; the summary still
 prints the name captured at rejection time. A test records a rejection,
 renames the tensor, releases the buffer, context and backend, and then dumps:
 it requires the original name and rejects the mutated one.
 
-The dump loads the counter (relaxed) and the example pointer (acquire) without
-holding a lock, so it never blocks the rejection path and never holds a lock
-across `fprintf`. A concurrent first rejection can publish its example after
-the dump has read the count; the dump then prints `(none)` for that class
-while the count stays exact. The table is a namespace-scope static, so it is
-alive when the `atexit` dump runs. The pool dump still takes the pool mutex
-before the Meta summary; that ordering is unchanged.
+The dump loads the counter (relaxed) and the state (acquire) without holding a
+lock, so it never blocks the rejection path and never holds a lock across
+`fprintf`. Memory order: the CAS uses acq_rel on success and relaxed on
+failure; the writer publishes with a release store of READY; the reader's
+acquire load of READY orders the example fields before their use. A concurrent
+first rejection can be in WRITING or not started when the dump reads the
+state; the dump then prints `(pending)` or `(none)` for that class while the
+count stays exact. The table is a namespace-scope static, so it is alive when
+the `atexit` dump runs. The pool dump still takes the pool mutex before the
+Meta summary; that ordering is unchanged.
 
 The summary test is registered as `test-tp5-staging-reject-summary` and the
 concurrent test as `test-tp5-staging-reject-concurrent` in
 `tests/CMakeLists.txt` (labels `cpu;tp5;staging`, CPU only). Both run through
-CTest.
+CTest. The concurrent test allows intermediate `(none)`/`(pending)` lines and
+asserts only the final dump (READY, exact count, no `(none)`/`(pending)`).
 
 ### Integration with the staging union kind
 
