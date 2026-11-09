@@ -677,6 +677,15 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 
     ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    // A Meta destination needs the source tensor identity for staging slot
+    // selection. cpy_tensor is the only buffer hook that receives src; the
+    // blocking set path below sees only the scheduler's decorated copy. A
+    // false return is a pure preflight rejection, so the original path still
+    // applies.
+    if (ggml_backend_buffer_is_host(src_buf) && ggml_backend_buffer_is_meta(dst_buf) &&
+            ggml_backend_buffer_copy_tensor(src, dst)) {
+        return;
+    }
     if (ggml_backend_buffer_is_host(src_buf)) {
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
     } else if (ggml_backend_buffer_is_host(dst_buf)) {

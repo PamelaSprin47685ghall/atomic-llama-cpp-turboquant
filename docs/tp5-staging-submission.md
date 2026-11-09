@@ -132,6 +132,35 @@ pool test mirrors the v1 prefix and static-asserts that v3 appends
   entry, version gate or runtime API-version probe, so an old external binary's
   behavior is not qualified.
 
+## Synchronous source identity
+
+The scheduler's blocking input fallback (`ggml_backend_tensor_copy(input,
+input_cpy)`) reaches the Meta buffer through `set_tensor`, which only receives
+the destination. With `n_copies == 1` that destination has no input flag and
+its name is `"%s#%s#%d"`, so the synchronous lane cannot classify the original
+graph input. The union index names use an exact match and would fall to the
+generic key, or be rejected by the 64 KiB envelope when oversized.
+
+The Meta buffer now implements the existing `ggml_backend_buffer_i::cpy_tensor`
+slot; no interface field is added. `ggml_backend_tensor_copy` tries it first
+only for a host source and a Meta destination. The implementation preflights
+the same conditions as `cpy_tensor_async` (host non-Meta source, non-view Meta
+destination, same layout, both contiguous, mirrored single segment) and then
+calls the synchronous set path with the source tensor as `staging_meta`.
+Eligibility and the kind therefore use the source's input flag and build-time
+name while the upload still targets the destination. A direct
+`ggml_backend_tensor_set` of the decorated destination keeps the old behavior:
+the name is not parsed.
+
+A false return is a pure preflight rejection with no side effect, so the
+caller may fall back to `set_tensor`. After the first possible child write the
+entry returns true even when staging publishes a fatal or partial submission:
+the existing sticky `submission_pending`/`submission_error` state is the only
+error signal, and the blocking fallback never replays a destination that may
+have been partially written. The CPU test `test-tp5-staging-sync-src` covers
+the source kind, mirrored bytes, a non-input source, a direct set without
+source identity, and a partial mirrored submission that must not be replayed.
+
 ## Ownership and lifetime
 
 - **Scheduler input copies**: the scheduler owns the copy tensors and retains

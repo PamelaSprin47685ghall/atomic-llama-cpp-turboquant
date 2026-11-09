@@ -1349,6 +1349,19 @@ add_test(NAME test-tp5-staging-meta-partial COMMAND test-tp5-staging-meta-partia
 set_property(TEST test-tp5-staging-meta-partial PROPERTY LABELS "cpu;tp5;staging")
 set_property(TEST test-tp5-staging-meta-partial PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_META_PARTIAL_TEST PASS")
 
+# TP5 staging synchronous source identity. The scheduler's blocking input
+# fallback reaches the Meta buffer through set_tensor, which only sees the
+# internal copy destination (no input flag with n_copies == 1, decorated
+# name). The buffer cpy_tensor entry carries the original source identity.
+# The test covers the source kind, mirrored bytes, a non-input source, a
+# direct set without source identity, and a partial mirrored submission that
+# must not be replayed. CPU only.
+add_executable(test-tp5-staging-sync-src test-tp5-staging-sync-src.cpp)
+target_link_libraries(test-tp5-staging-sync-src PRIVATE ggml ggml-cpu)
+add_test(NAME test-tp5-staging-sync-src COMMAND test-tp5-staging-sync-src)
+set_property(TEST test-tp5-staging-sync-src PROPERTY LABELS "cpu;tp5;staging")
+set_property(TEST test-tp5-staging-sync-src PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_SYNC_SRC_TEST PASS")
+
 # TP5 staging rejection-summary diagnostics. The first example of each
 # (lane, reason) class is a self-owned copy: the source tensor is renamed and
 # freed before the dump. CPU only.

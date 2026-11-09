@@ -1820,10 +1820,18 @@ static void ggml_backend_meta_buffer_memset_tensor(
     }
 }
 
-static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+// staging_meta is the original source tensor for a blocking tensor copy. The
+// copy destination is an internal tensor without the input flag or build-time
+// name, so staging must classify the source instead. A direct set passes
+// nullptr and keeps the destination-based behavior.
+static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size, const ggml_tensor * staging_meta) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    GGML_ASSERT(staging_meta == nullptr ||
+            (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+             split_state.n_segments == 1 && split_state.nr[0] == 1));
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
@@ -1952,17 +1960,30 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             const ggml_cuda_staging::api * st = staging_api();
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
             const bool staging_on = st != nullptr && st->enabled();
-            // The sync lane sees the scheduler's destination copy, named
+            // The blocking copy path passes the original source as
+            // staging_meta; the direct set path passes nullptr and keeps the
+            // destination-based behavior. Without a source identity the sync
+            // lane sees the scheduler's destination copy, named
             // "%s#%s#%d"; n_copies==1 copies are not INPUT. Do not parse the
             // name and do not relax INPUT: the exact union kinds are async-only.
-            const bool staging_hit = staging_on && staging_eligible(tensor, size, &staging_kind);
+            const ggml_tensor * staging_src = staging_meta != nullptr ? staging_meta : tensor;
+            // A source-based decision must describe the same full copy the
+            // destination expects. A direct set is not constrained here.
+            const bool staging_shape_ok =
+                staging_meta == nullptr ||
+                (staging_meta->data != nullptr &&
+                 ggml_are_same_layout(staging_meta, tensor) &&
+                 size == ggml_nbytes(tensor));
+            const bool staging_hit = staging_on && staging_shape_ok &&
+                staging_eligible(staging_src, size, &staging_kind);
             if (st == nullptr) {
                 g_staging_meta_diag.api_null.fetch_add(1, std::memory_order_relaxed);
             } else if (!staging_on) {
                 g_staging_meta_diag.disabled.fetch_add(1, std::memory_order_relaxed);
             } else if (!staging_hit) {
                 g_staging_meta_diag.not_eligible.fetch_add(1, std::memory_order_relaxed);
-                staging_log_reject("sync", tensor, size);
+                staging_log_reject("sync", staging_src, size,
+                                   staging_shape_ok ? nullptr : "layout");
             } else {
                 g_staging_meta_diag.eligible.fetch_add(1, std::memory_order_relaxed);
                 if (staging_kind == ggml_cuda_staging::kind::generic) {
@@ -2098,6 +2119,48 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     }
 }
 
+static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size) {
+    ggml_backend_meta_buffer_set_tensor_impl(buffer, tensor, data, offset, size, nullptr);
+}
+
+// The scheduler's blocking input fallback reaches the Meta buffer through
+// ggml_backend_tensor_set, which only sees the internal copy destination.
+// cpy_tensor is the one buffer hook that also receives the source tensor, so
+// staging can classify the original graph input while the upload still targets
+// dst. A false return is a pure preflight rejection with no side effect; once
+// a child write or enqueue is possible the function returns true and the
+// existing fail-stop/partial publication owns the error, so the caller never
+// replays a destination that may have been partially written.
+static bool ggml_backend_meta_buffer_cpy_tensor(
+        ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    if (buffer == nullptr || src == nullptr || dst == nullptr ||
+            !ggml_backend_buffer_is_meta(buffer)) {
+        return false;
+    }
+    const ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    const ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (src_buf == nullptr || dst_buf != buffer || dst->buffer != dst_buf ||
+            src->data == nullptr || dst->data == nullptr ||
+            ggml_backend_buffer_is_meta(src_buf) || !ggml_backend_buffer_is_host(src_buf) ||
+            !ggml_are_same_layout(src, dst) ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const size_t nbytes = ggml_nbytes(src);
+    if (nbytes == 0) {
+        return true;
+    }
+    const ggml_backend_meta_split_state split_state =
+        ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+            split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        return false;
+    }
+    ggml_backend_meta_buffer_set_tensor_impl(buffer, dst, src->data, 0, nbytes, src);
+    return true;
+}
+
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
@@ -2222,7 +2285,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .get_tensor      = */ ggml_backend_meta_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,
     /* .get_tensor_2d   = */ nullptr,
-    /* .cpy_tensor      = */ nullptr,
+    /* .cpy_tensor      = */ ggml_backend_meta_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_meta_buffer_clear,
     /* .reset           = */ ggml_backend_meta_buffer_reset,
 };
