@@ -522,14 +522,14 @@
     },
     {
       "path": "src/llama-kv-cache.h",
-      "sha256": "6d2c6cea1b239c7f18e07f1c223a3fe6cd2bbbe10faedbeca7080207b8699f2e",
+      "sha256": "5c8099c830c0f928f2946c77b16b9509f06638dbb879ed75ca27a5bd03cbb775",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
         "fork/tests/a-seams",
         "tq-tp5-compose (WS3 host pool)"
       ],
-      "reason": "Keep explicit reader views and expose internal preparation and resolution to the native graph builder. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL and TP5_DECODE_SCRATCH_POOL. Declare the shared KQ-mask fill with an explicit real-row count for prefab envelopes.",
+      "reason": "Keep explicit reader views and expose internal preparation and resolution to the native graph builder. The WS3 pool also reuses the prepare snapshots and the decode scratch vectors behind TP5_KV_SNAPSHOT_POOL and TP5_DECODE_SCRATCH_POOL. The batch context is non-copyable and non-movable because it owns the exclusive decode scratch; a copy would create a second owner and return the same scratch twice, and a move would leave the source still holding it. Declare the shared KQ-mask fill with an explicit real-row count for prefab envelopes.",
       "removal_condition": "Remove when the selected upstream provides equivalent public reader views and recurrent-state lifetime control, or when the installed RERoT consumer is removed; rerun independent attention and native lifecycle gates."
     },
     {
