@@ -264,7 +264,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "30086f0db3ed3d29be3652eef950fa850e6ccaa9fef561715ca93444aa5134a3",
+      "sha256": "02b3de5a50b7f187bbc5f9fb3bd87dd23d9f4b797db7a3861bed6acf53174254",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",
@@ -842,7 +842,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/staging.cu",
-      "sha256": "06703caf8deb82f13406b3b30d086b63ee0d82da063e388214f7cb0b14eea2d0",
+      "sha256": "130f2192a26ceec1bb6103a1ba40d879b13b0c39361242646be5ffe0360581a6",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)"
@@ -852,7 +852,7 @@
     },
     {
       "path": "ggml/src/ggml-cuda/staging.h",
-      "sha256": "2726b628aebec43b200298e7c9605509abb2836d1e759122d22969f2c1afb4ec",
+      "sha256": "afccd87ef5ab7429663b45ae623cebcf0d54a4d82c179785d3e81c98d428875b",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)",
@@ -863,7 +863,7 @@
     },
     {
       "path": "tests/test-tp5-staging-pool.cpp",
-      "sha256": "aa3b45e969a6163e2434ddb5d147396fe41e8cc2926452ca5e9243660be580b6",
+      "sha256": "39c226c9b9517582dd360bb1ae39bab16e5c9c0b5cafd90c68c375f6bacfdd36",
       "mode": "100644",
       "consumers": [
         "WS4 staging pool CPU test"
@@ -965,7 +965,7 @@
     },
     {
       "path": "docs/tp5-staging-submission.md",
-      "sha256": "9b5a226c66d9e76317dae10b06849d13e35448b55d2d3910c5dc6e2f1b3e8bca",
+      "sha256": "e31dca0f0df99096408c8a68b8470b862e2627a35a8113708b773a7e0ac91713",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose staging/Meta integration maintainers"
@@ -1107,7 +1107,7 @@
       ],
       "reason": "Build a real Meta backend over two CPU child devices and inject a v3 staging table that queues rank 0 and cleanly rejects rank 1. The test proves the partial branch calls mark_partial, releases the lease, publishes submission_pending with first_error zero, and stops the next set at the fatal gate; it also checks v1 prefix acceptance and unknown-version rejection. Drive both the synchronous merge-wait and asynchronous partial lanes, assert mark_partial runs before release, and check the fatal gate afterwards. Expect registration to reject v1, a v2 table, a v3 table without mark_partial, a v3 table with a short kind_count, and a future version; accept the complete v3 table. Also register version-only four-byte v1/v2 tables (ASan read-boundary check), confirm a rejected table does not replace an accepted one, and accept a v3 table with a larger kind_count.",
       "removal_condition": "Remove with the TP5 staging partial-enqueue path or when upstream supplies an equivalent CPU-testable fault-publication contract.",
-      "sha256": "96f27f3ce1ebc2f1f8782f6c2c6137f9735ca024b10b0f7d8bf0308ed4618664",
+      "sha256": "d46e164fc08c907902df46779e81bd474cdb062db86a5c26ee46c19c2dd909c3",
       "mode": "100644"
     }
   ]
