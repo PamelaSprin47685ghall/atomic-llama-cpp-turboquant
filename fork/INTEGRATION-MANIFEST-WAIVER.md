@@ -784,6 +784,32 @@ an asynchronous abort arrives after `observe()` and before the final failed
 check, and recommends a pure CPU predicate test; that test is not added here.
 The guard was not rerun; no GPU or full suite was run.
 
+### E.3 MTP target checkpoint round 2026-11-09
+
+Cherry-pick `62c700ac9`, independently reviewed as t7
+(`agent://mirror-port-review`). The checkpoint replaces the
+`clear()` + `resize()` vector with retained storage, an explicit snapshot
+size and a valid flag. The non-native-trim verify path captures at epoch
+start, restores a rejected prefix, invalidates on full acceptance and at the
+next epoch start; the native-trim path never captures.
+
+The test's only assertion of the vector `resize()` implementation detail
+(`checkpoint: grow zero-initializes only the new tail`) was removed. The
+remaining test exercises the actual `capture`/`restore`/`invalidate`
+semantics: same-size retained bytes, growth prefix, shrink prefix, short
+capture, short restore, exception unwinding, invalidation and zero size. The
+integrated test has 27 checks, not the source commit's 28.
+
+Runtime integration was not executed. No real MTP run, no HIP, no ASan/LSan,
+no full suite and no guard rerun. The first capture in each service round and
+any growth still zero-fill the new storage; same-size or shrink reuse avoids
+that zero fill. The checkpoint is per service round, not retained across
+rounds; its capacity is reused only within a service round.
+
+Manifest: the five changed paths have no manifest entry and none was added.
+No existing entry matched and was reviewed here, so no digest was updated;
+the B5-B7 red items remain. The guard was not rerun.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure

@@ -109,21 +109,15 @@ int main() {
         });
 
         bool prefix_ok = false;
-        bool tail_zero = false;
         const bool grown = checkpoint.capture(24,
             [&](std::uint8_t * dst, std::size_t size) {
                 prefix_ok = size == 24;
                 for (std::size_t i = 0; i < 8; ++i) {
                     prefix_ok = prefix_ok && dst[i] == 0xAB;
                 }
-                tail_zero = true;
-                for (std::size_t i = 8; i < size; ++i) {
-                    tail_zero = tail_zero && dst[i] == 0;
-                }
                 return fill(dst, size, 0xCD);
             });
         check(grown && prefix_ok, "checkpoint: grow retains the prefix");
-        check(tail_zero, "checkpoint: grow zero-initializes only the new tail");
         check(checkpoint.size() == 24 && checkpoint.capacity() == 24,
               "checkpoint: grow updates storage");
     }
