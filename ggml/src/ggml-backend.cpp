@@ -702,7 +702,8 @@ bool ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     // Do not submit more work to an owner that already reported an unknown
     // submission: the blocking fallback below must never overwrite a
     // destination that an in-flight copy may still write. Return false without
-    // touching the destination or either backend's stream.
+    // touching the destination or either backend's stream. This also applies to
+    // a self-copy: true is not a completion proof for an earlier submission.
     if (ggml_backend_submission_unproven(backend_src) ||
             ggml_backend_submission_unproven(backend_dst)) {
         return false;

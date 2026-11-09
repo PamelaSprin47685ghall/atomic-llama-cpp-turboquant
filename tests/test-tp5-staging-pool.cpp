@@ -7,6 +7,8 @@
 #include "../ggml/src/ggml-cuda/staging.h"
 #include "../ggml/src/ggml-impl.h"  // ggml_are_same_layout (static inline)
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -18,10 +20,11 @@ using namespace ggml_cuda_staging;
 
 namespace {
 
-// Frozen v1 host-only api prefix. The meta layer accepts a v1 table from an
-// older backend, so every new field must be appended after zc_enabled and no
-// existing field may move. Keep this mirror in sync with the header's prefix;
-// the assertions below fail the CPU test build if a field is inserted.
+// Frozen v1 host-only api prefix. The meta layer rejects a v1 table because it
+// cannot publish a partial submission, but the prefix is still the ABI
+// baseline: v2 must append its new field after zc_enabled and move nothing.
+// Keep this mirror in sync with the header's prefix; the assertions below fail
+// the CPU test build if a field is inserted.
 struct api_v1 {
     uint32_t abi_version;
     bool (*enabled)();
@@ -1080,6 +1083,76 @@ int test_partial_rejection_marks_pool() {
     return 0;
 }
 
+int test_partial_gate_race() {
+    pool p(fake_ops());
+    uint8_t src[64];
+    uint8_t dst[64] = {};
+    std::memset(src, 0x55, sizeof(src));
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+
+    // Hold the submit gate. mark_partial takes mutex_ and then waits for
+    // submit_mutex_ inside publish_fatal_locked; it must not complete until
+    // the gate is released, and then it must publish exactly once.
+    CHECK(p.enter_submit());
+    std::atomic<bool> started{false};
+    std::atomic<bool> done{false};
+    std::thread t([&] {
+        started.store(true, std::memory_order_release);
+        p.mark_partial(a, dst);
+        done.store(true, std::memory_order_release);
+    });
+    while (!started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK(!done.load(std::memory_order_acquire));
+
+    p.leave_submit();
+    t.join();
+    CHECK(done.load(std::memory_order_acquire));
+    CHECK(!p.usable());
+    CHECK(p.unknown_count() == 1);
+    CHECK(p.snapshot().partial == 1);
+    p.release(a);
+    return 0;
+}
+
+int test_partial_duplicate_marks() {
+    pool p(fake_ops());
+    uint8_t src[64];
+    uint8_t dst[64] = {};
+    std::memset(src, 0x66, sizeof(src));
+
+    lease a;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+
+    std::atomic<int> ready{0};
+    auto publish = [&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (ready.load(std::memory_order_acquire) < 2) {
+            std::this_thread::yield();
+        }
+        p.mark_partial(a, dst);
+    };
+    std::thread t1(publish);
+    std::thread t2(publish);
+    t1.join();
+    t2.join();
+
+    // Both callers observed the same lease. The first records it; the second
+    // must not count the same destination again.
+    CHECK(!p.usable());
+    CHECK(p.unknown_count() == 1);
+    CHECK(p.snapshot().partial == 1);
+    CHECK(p.submission_pending());
+    p.release(a);
+    return 0;
+}
+
 int test_copy_failure_quarantine() {
     pool p(fake_ops());
     uint8_t src[64] = {};
@@ -1364,6 +1437,8 @@ int main() {
         {"source_mutation_isolation",  test_source_mutation_isolation},
         {"partial_enqueue_stops_pool", test_partial_enqueue_stops_pool},
         {"partial_rejection_marks_pool", test_partial_rejection_marks_pool},
+        {"partial_gate_race",          test_partial_gate_race},
+        {"partial_duplicate_marks",    test_partial_duplicate_marks},
         {"layout_predicate",           test_layout_predicate},
         {"wait_device_switch",         test_wait_device_switch},
     };

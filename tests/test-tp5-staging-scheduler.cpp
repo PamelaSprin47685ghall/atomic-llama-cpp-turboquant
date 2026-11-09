@@ -682,6 +682,11 @@ void test_public_copy_async_return() {
         unproven.assign(p, p + sizeof(values));
     }
 
+    // The pre-check runs before the self-copy shortcut: an unproven backend
+    // returns false even when no copy would be queued. True is not a completion
+    // proof for the earlier submission.
+    CHECK(!ggml_backend_tensor_copy_async(&g_fake_backend, &g_fake_backend, dst, dst));
+
     // The state is sticky: a second call must refuse before invoking the
     // callback, so the unproven destination bytes are not overwritten by a
     // blocking fallback and no new copy is queued.

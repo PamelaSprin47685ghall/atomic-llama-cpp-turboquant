@@ -1109,7 +1109,9 @@ extern "C" {
     // When the associated model has a retained pending context, the adapter is
     // erased from the model and kept process-owned instead of deleted; a
     // duplicate call is ignored. This avoids freeing tensors that submitted
-    // native work may still read.
+    // native work may still read. The decision uses the model's retained-
+    // context count, not a per-adapter reference: once any context on the model
+    // is retained, every released adapter is process-owned.
     LLAMA_API void llama_adapter_lora_free(struct llama_adapter_lora * adapter);
 
     // Get the invocation tokens if the current lora is an alora

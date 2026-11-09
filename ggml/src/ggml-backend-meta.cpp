@@ -39,7 +39,7 @@ extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
         return false;
     }
     const auto * api = static_cast<const ggml_cuda_staging::api *>(impl);
-    if (api->abi_version < 1 || api->abi_version > ggml_cuda_staging::kApiVersion) {
+    if (api->abi_version != ggml_cuda_staging::kApiVersion || api->mark_partial == nullptr) {
         return false;
     }
     g_staging_api.store(api, std::memory_order_release);
@@ -4631,8 +4631,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             // The helper returns true for an ordered/synchronous copy and
             // false only when the backend accepted the copy but cannot prove
-            // completion. Never build the reduce node that would replay an
-            // unproven destination.
+            // completion. Its capability pre-check queries these child
+            // registries, which do not expose the Meta staging state; the
+            // explicit ggml_backend_meta_submission_failed() above and the
+            // pool's disabled_ gate are the protection for this path. Never
+            // build the reduce node that would replay an unproven destination.
             if (!ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp)) {
                 return GGML_STATUS_FAILED;
             }
@@ -4713,6 +4716,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+            // The helper's child-registry pre-check is inert here for the same
+            // reason as push_data; the Meta check above is the protection.
             if (!ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst)) {
                 return GGML_STATUS_FAILED;
             }

@@ -211,17 +211,25 @@ bool make_fixture(ggml_backend_dev_t cpu, meta_fixture & fixture) {
 } // namespace
 
 int main() {
-    // The registration gate accepts the frozen v1 prefix and the v2 table, and
-    // rejects an unknown future version before it can be read.
+    // The registration gate accepts only a v2 table with mark_partial. A v1
+    // table cannot publish a partial submission, so it is rejected and the
+    // staging path falls back instead of aborting later. An unknown future
+    // version is rejected before any new field is read.
+    const void * before = ggml_backend_meta_staging_get();
     api v1 = {};
     v1.abi_version = 1;
-    CHECK(ggml_backend_meta_staging_register(&v1));
-    CHECK(ggml_backend_meta_staging_get() == &v1);
+    CHECK(!ggml_backend_meta_staging_register(&v1));
+    CHECK(ggml_backend_meta_staging_get() == before);
 
     api future = {};
     future.abi_version = kApiVersion + 1;
     CHECK(!ggml_backend_meta_staging_register(&future));
-    CHECK(ggml_backend_meta_staging_get() == &v1);
+    CHECK(ggml_backend_meta_staging_get() == before);
+
+    api broken = g_fake_api;
+    broken.mark_partial = nullptr;
+    CHECK(!ggml_backend_meta_staging_register(&broken));
+    CHECK(ggml_backend_meta_staging_get() == before);
 
     CHECK(ggml_backend_meta_staging_register(&g_fake_api));
     CHECK(ggml_backend_meta_staging_get() == &g_fake_api);

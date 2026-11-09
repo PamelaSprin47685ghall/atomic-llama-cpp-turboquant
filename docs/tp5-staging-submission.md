@@ -25,8 +25,11 @@ process exit. Other backends report `0`/`false`.
 
 The CUDA backend's host-only staging `api` table is versioned. Version 2 adds
 `mark_partial` **after** the complete v1 prefix; no v1 field moved. A v1 table
-from an older backend is accepted, and a partial submission that cannot call
-`mark_partial` aborts instead of returning a silent success.
+from an older backend is **rejected at registration** because it cannot publish
+a partial submission; staging then falls back to the original copy path. A
+future version with a different layout is rejected before any new field is
+read. The CPU pool test mirrors the v1 prefix and static-asserts that v2 is an
+append-only extension.
 
 ## Semantics
 
@@ -91,7 +94,8 @@ from an older backend is accepted, and a partial submission that cannot call
   is the signal, so the async helper returns false and no later compute runs.
   The synchronous setter has no return value: its caller cannot observe the
   partial write, but every later staging submit and Meta graph compute sees
-  the fail-stop state.
+  the fail-stop state. A concurrent duplicate `mark_partial` for the same lease
+  keeps the gate closed but does not count the destination twice.
 - Staging faults do not abort: sync paths stop in place and the async path
   returns to the scheduler. The pool quarantines the pinned slot, records the
   unknown destinations (`TP5_STAGING_UNKNOWN` in the diagnostic dump), and
@@ -255,6 +259,12 @@ from an older backend is accepted, and a partial submission that cannot call
   with them; full LoRA arithmetic is outside this test. Freeing an adapter
   before retention, while the context can still compute, is a use-after-free
   by contract.
+- The adapter decision uses the model's retained-context count, not a
+  per-adapter reference. Once any context on the model is retained, every
+  released adapter is process-owned; this is intentionally conservative.
+  The count is atomic and is read without the model lifetime mutex, which is
+  safe only under the documented rule that borrows are released after
+  `llama_free` returns, not concurrently with model teardown.
 - The retained adapter allocation prevents freeing tensors that submitted
   native work may still read; it is not a proof that the in-flight kernel
   finished. CPU tests cannot observe that ordering, and no GPU run is claimed.
@@ -400,7 +410,10 @@ stays pending and the async lane falls back, which is the intended transient
 collision. The test also asserts the frozen v1 `api` prefix at compile time
 and covers a clean rejection after one rank was queued: `mark_partial` stops
 the pool, `submission_pending` is true, `first_error` stays 0, the slot is
-quarantined, and later upload/enqueue/wait/enter_submit/acquire calls fail.
+quarantined, and later upload/enqueue/wait/enter_submit/acquire calls fail. A
+held submit gate blocks `mark_partial` until it is released, and two concurrent
+publications for the same lease count one unknown destination and one partial
+fault.
 
 The Meta partial test builds a real Meta backend over two CPU child devices and
 injects a v2 staging table whose enqueue queues rank 0 and rejects rank 1. It
@@ -409,7 +422,8 @@ and the asynchronous lane (`acquire_nowait` + `enqueue_async`). It asserts the
 partial branch calls `mark_partial` before releasing the lease, that
 `submission_pending` becomes true with `first_error == 0`, and that the next
 set hits the fatal submit gate without another enqueue. It also checks that
-registration accepts the v1 prefix, accepts v2, and rejects a future version.
+registration rejects v1, rejects a v2 table without mark_partial, accepts the
+complete v2 table and rejects a future version.
 
 The context-retain test covers, without a model: the live-context reference
 (free-before-context deferral, last-release delete, new-context refusal after

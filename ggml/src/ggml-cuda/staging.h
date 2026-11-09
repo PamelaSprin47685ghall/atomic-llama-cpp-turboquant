@@ -24,8 +24,9 @@ constexpr uint32_t kRanks        = 16;  // == GGML_CUDA_MAX_DEVICES
 constexpr uint32_t kWindows      = 4;
 constexpr uint32_t kSlotsPerKey  = 2;   // double buffer
 // Bump when the host-only api table grows. New fields are appended after
-// zc_enabled so every older table remains a valid prefix; the meta layer
-// accepts older tables but must not read a field they do not have.
+// zc_enabled so every older table remains a readable prefix, but the meta
+// layer accepts only the current version: a v1 table cannot publish a partial
+// submission, so it is rejected at registration and staging falls back.
 constexpr uint32_t kApiVersion   = 2;
 
 enum class kind : uint32_t {
@@ -438,12 +439,20 @@ public:
     // record, so first_error stays 0 and submission_pending() is the signal.
     void mark_partial(const lease & l, const void * dst) {
         std::lock_guard<std::mutex> lock(mutex_);
+        slot * s = find_locked(l);
+        if (s != nullptr && s->partial_marked) {
+            // A concurrent or duplicate publication for the same slot keeps
+            // the gate closed but must not count the destination twice.
+            disabled_.store(true, std::memory_order_relaxed);
+            publish_fatal_locked();
+            return;
+        }
         stats_.partial++;
         disabled_.store(true, std::memory_order_relaxed);
         record_unknown_locked(dst, -1, 0);
-        slot * s = find_locked(l);
         if (s != nullptr) {
             quarantine_locked(*s, 0);
+            s->partial_marked = true;
         }
         publish_fatal_locked();
     }
@@ -621,6 +630,7 @@ private:
         bool      leased = false;
         bool      pending = false;
         bool      quarantined = false;  // a copy may still read host: never reuse or free
+        bool      partial_marked = false; // mark_partial already recorded this slot
         uint32_t  pending_ranks = 0;
         void *    events[kRanks] = {};
         void *    dev_ptrs[kRanks] = {};
