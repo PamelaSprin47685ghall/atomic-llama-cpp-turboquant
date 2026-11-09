@@ -826,7 +826,7 @@
       "consumers": [
         "llama batch allocator tests"
       ],
-      "reason": "Check slot reuse, generations, concurrency, steady-state allocation, cp_into value equality, exclusive decode-scratch hand-out under contention, and the multi-stream reverse restore with non-identity stream order on the success and find_slot failure paths. Construct a real llama_kv_cache with n_swa=512 and two ubatches: the last trial overwrites a masked cell and purges earlier-window cells; reference and pooled must leave the same cache. A non-SWA control still skips the last trial and leaves the same restored cache; the unconditional-skip negative control fails the SWA check.",
+      "reason": "Check slot reuse, generations, concurrency, steady-state allocation, cp_into value equality, exclusive decode-scratch hand-out under contention, and the multi-stream reverse restore with non-identity stream order on the success and find_slot failure paths. Construct a real llama_kv_cache with n_swa=512 and two ubatches: the last trial overwrites a masked cell and purges earlier-window cells; reference and pooled must leave the same cache. A non-SWA control checks that reference and pooled leave the same restored cache; it does not prove the last trial is skipped. The unconditional-skip negative control fails the SWA check.",
       "removal_condition": "Remove when the pool is unconditional, the equivalent checks and the real-cache SWA purge-timing counterexample live in the upstream test suite."
     },
     {

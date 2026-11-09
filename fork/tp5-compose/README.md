@@ -87,6 +87,12 @@ slot and is not restored, so deferring it would change what earlier ubatches'
 graphs read. The reference path (`prepare_reference`) keeps the full trial
 sequence.
 
+The CPU counterexample compares cache state on a real `llama_kv_cache`; the
+non-SWA control checks cache-state equivalence only and does not prove the
+last trial is skipped. An allocation failure after an earlier apply still
+unwinds past `restore_cells`; that is the existing C++-exception boundary,
+not a no-throw rollback.
+
 A prepares every rank/stage and mapped communication allocation before starting
 an epoch. Each partial-sum boundary uses two bounded single-workgroup kernels:
 producer copy plus all-writer publication; exact-epoch wait plus output copy and

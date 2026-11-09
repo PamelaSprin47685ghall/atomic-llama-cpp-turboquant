@@ -859,6 +859,27 @@ staged evidence, not a repository CTest. The permanent behavior evidence is
 the real single-sequence CPU qwen4exp trace test. GPU/HIP and Windows export
 paths were not run. The guard was not rerun.
 
+### E.6 SWA KV prepare-trial round 2026-11-09
+
+Cherry-pick `e1112f844`, reviewed as t4 (`agent://audit-cpu-boundary`). The
+pooled prepare skips the last trial only when `n_swa == 0` and
+`swa_type == LLAMA_SWA_TYPE_NONE`; with SWA active every ubatch is trialled,
+so `apply_ubatch()`'s `seq_rm` purge happens during prepare and matches
+`prepare_reference()`. The real-cache 512/400/900 counterexample compares
+reference and pooled cache state: cell 390 is purged, cell 400 is restored,
+and the head returns to 399. The non-SWA control checks cache-state
+equivalence only; it does not prove the last trial is skipped. The existing
+exception boundary is unchanged: an allocation failure after an earlier apply
+can unwind past `restore_cells`; it is not a no-throw rollback.
+
+The candidate CPU test is included but was not run in this integration tree.
+No GPU, full suite or guard rerun.
+
+Manifest: `src/llama-kv-cache.cpp`, `src/llama-kv-cache.h` and
+`tests/test-tp5-ubatch-pool.cpp` matched their baseline digests and were
+reviewed; their digests are updated. Other stale entries keep their old
+digests.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure
