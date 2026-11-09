@@ -149,6 +149,11 @@ int main(int argc, char ** argv) {
     }
 
     struct llama_batch batch = llama_batch_init(16, 0, 1);
+    if (!llama_batch_is_complete(&batch, 16, false, true)) {
+        llama_batch_free(batch);
+        batch = (struct llama_batch) { 0 };
+        return 1;
+    }
 
     // fixed token ids, well inside the vocabulary of any test model
     llama_token ptok[64];

@@ -367,6 +367,12 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
         llama_memory_clear(llama_get_memory(ctx), true);
 
         llama_batch batch = llama_batch_init(n_batch, 0, 1);
+        if (!llama_batch_is_complete(&batch, n_batch, false, true)) {
+            LOG_ERR("%s : failed to allocate batch\n", __func__);
+            llama_batch_free(batch);
+            batch = {};
+            return {tokens, -1, logit_history, prob_history};
+        }
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -508,6 +514,12 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     GGML_ASSERT(params.n_ctx == n_seq * n_ctx);
 
     llama_batch batch = llama_batch_init(std::min(n_batch, n_ctx*n_seq), 0, 1);
+    if (!llama_batch_is_complete(&batch, std::min(n_batch, n_ctx*n_seq), false, true)) {
+        LOG_ERR("%s : failed to allocate batch\n", __func__);
+        llama_batch_free(batch);
+        batch = {};
+        return {tokens, -1, logit_history, prob_history};
+    }
 
     std::vector<float> logits;
     if (num_batches > 1) {
@@ -867,6 +879,12 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
     const int max_seq = std::min(4*max_tasks_per_batch, (int) llama_n_seq_max(ctx));
 
     llama_batch batch = llama_batch_init(n_ctx, 0, 4);
+    if (!llama_batch_is_complete(&batch, n_ctx, false, true)) {
+        // void API, no error channel: fail-stop is the documented behavior here.
+        llama_batch_free(batch);
+        batch = {};
+        GGML_ABORT("llama_batch_init failed in hellaswag_score");
+    }
 
     std::vector<float> tok_logits(n_vocab);
     // TODO: this could be made smaller; it's currently the worst-case size
@@ -1165,6 +1183,12 @@ static void winogrande_score(llama_context * ctx, const common_params & params) 
     const int max_seq = std::min(2*max_tasks_per_batch, (int) llama_n_seq_max(ctx));
 
     llama_batch batch = llama_batch_init(n_ctx, 0, 2);
+    if (!llama_batch_is_complete(&batch, n_ctx, false, true)) {
+        // void API, no error channel: fail-stop is the documented behavior here.
+        llama_batch_free(batch);
+        batch = {};
+        GGML_ABORT("llama_batch_init failed in winogrande_score");
+    }
 
     std::vector<float> tok_logits(n_vocab);
     // TODO: this could be made smaller; it's currently the worst-case size
@@ -1519,6 +1543,12 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
     const int max_seq = std::min(4*max_tasks_per_batch, (int) llama_n_seq_max(ctx));
 
     llama_batch batch = llama_batch_init(n_ctx, 0, max_seq);
+    if (!llama_batch_is_complete(&batch, n_ctx, false, true)) {
+        // void API, no error channel: fail-stop is the documented behavior here.
+        llama_batch_free(batch);
+        batch = {};
+        GGML_ABORT("llama_batch_init failed in multiple_choice_score");
+    }
 
     std::vector<float> tok_logits(n_vocab);
     std::vector<float> batch_logits(size_t(n_ctx)*n_vocab);
@@ -1754,6 +1784,12 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
 
     llama_batch batch = llama_batch_init(std::min(n_batch, static_cast<int>(n_ctx)*n_seq), 0, 1);
+    if (!llama_batch_is_complete(&batch, std::min(n_batch, static_cast<int>(n_ctx)*n_seq), false, true)) {
+        // void API, no error channel: fail-stop is the documented behavior here.
+        llama_batch_free(batch);
+        batch = {};
+        GGML_ABORT("llama_batch_init failed in kl_divergence");
+    }
 
     std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - n_ctx/2) * nv);
     std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);

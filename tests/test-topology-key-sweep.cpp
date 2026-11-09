@@ -167,12 +167,9 @@ int main(int argc, char ** argv) {
     for (long step = 0; step < rounds * 4; ++step) {
         const int width = widths[step % 4];
         llama_batch batch = llama_batch_init(width, 0, 1);
-        if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
-            std::fprintf(stderr, "FAIL: batch allocation step=%ld\n", step);
+        if (!llama_batch_is_complete(&batch, width, false, true)) {
             llama_batch_free(batch);
-            ++g_failures;
-            ++g_checks;
-            break;
+            GGML_ABORT("llama_batch_init failed");
         }
         for (int i = 0; i < width; ++i) {
             batch.token[i] = 3 + (int) (((int64_t) (pos + i) * 7 + 1) % (vocab - 3));

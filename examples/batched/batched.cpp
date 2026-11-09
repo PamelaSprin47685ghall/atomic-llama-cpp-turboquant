@@ -118,6 +118,12 @@ int main(int argc, char ** argv) {
     // create a llama_batch
     // we use this object to submit token data for decoding
     llama_batch batch = llama_batch_init(std::max(tokens_list.size(), (size_t) n_parallel), 0, n_parallel);
+    if (!llama_batch_is_complete(&batch, std::max(tokens_list.size(), (size_t) n_parallel), false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(batch);
+        batch = {};
+        return 1;
+    }
 
     std::vector<llama_seq_id> seq_ids(n_parallel, 0);
     for (int32_t i = 0; i < n_parallel; ++i) {

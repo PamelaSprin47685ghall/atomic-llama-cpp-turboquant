@@ -9,6 +9,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -20,7 +21,13 @@ namespace {
 
 class batch_owner {
 public:
-    explicit batch_owner(std::uint32_t capacity) : value(llama_batch_init(std::int32_t(capacity), 0, 1)) {}
+    explicit batch_owner(std::uint32_t capacity) : value(llama_batch_init(std::int32_t(capacity), 0, 1)) {
+        if (!llama_batch_is_complete(&value, std::int32_t(capacity), false, true)) {
+            llama_batch_free(value);
+            value = {};
+            throw std::bad_alloc();
+        }
+    }
     ~batch_owner() { llama_batch_free(value); }
     batch_owner(const batch_owner &) = delete;
     batch_owner & operator=(const batch_owner &) = delete;

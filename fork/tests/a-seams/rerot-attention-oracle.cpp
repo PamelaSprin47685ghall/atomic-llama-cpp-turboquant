@@ -12,6 +12,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -266,7 +267,12 @@ public:
             require(llama_attention_set_views(context_.get(), views.data(), views.size()),
                     "actual A rejected a valid numerical fixture view");
         } else { llama_attention_clear_views(context_.get()); }
-        const auto batch = llama_batch_init(int32_t(rows.size()), 0, 1);
+        llama_batch batch = llama_batch_init(int32_t(rows.size()), 0, 1);
+        if (!llama_batch_is_complete(&batch, int32_t(rows.size()), false, true)) {
+            llama_batch_free(batch);
+            batch = {};
+            throw std::bad_alloc();
+        }
         struct cleanup { llama_batch value; ~cleanup() { llama_batch_free(value); } } owner{batch};
         owner.value.n_tokens = int32_t(rows.size());
         for (std::size_t i = 0; i < rows.size(); ++i) {

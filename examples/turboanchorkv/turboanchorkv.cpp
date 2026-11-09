@@ -1046,6 +1046,12 @@ bool decode_range(llama_context *                  ctx,
                   size_t                           end,
                   int32_t                          n_batch) {
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    if (!llama_batch_is_complete(&batch, n_batch, false, true)) {
+        std::fprintf(stderr, "batch allocation failed\n");
+        llama_batch_free(batch);
+        batch = {};
+        return false;
+    }
     for (size_t offset = begin; offset < end; offset += size_t(n_batch)) {
         common_batch_clear(batch);
         const size_t count = std::min<size_t>(n_batch, end - offset);
@@ -1099,6 +1105,12 @@ suffix_eval evaluate_suffix(llama_context *                  ctx,
     result.logits.reserve(n_eval * size_t(n_vocab));
     result.targets.reserve(n_eval);
     llama_batch batch = llama_batch_init(1, 0, 1);
+    if (!llama_batch_is_complete(&batch, 1, false, true)) {
+        std::fprintf(stderr, "batch allocation failed\n");
+        llama_batch_free(batch);
+        batch = {};
+        return result;
+    }
     for (size_t i = first_input; i + 1 < tokens.size(); ++i) {
         if (!decode_one(ctx, batch, tokens[i], llama_pos(i))) {
             std::fprintf(stderr, "suffix decode failed at token %zu\n", i);
@@ -1167,6 +1179,12 @@ std::vector<llama_token> generate_greedy(llama_context *     ctx,
                                          int                 n_generate) {
     std::vector<llama_token> result;
     llama_batch              batch    = llama_batch_init(1, 0, 1);
+    if (!llama_batch_is_complete(&batch, 1, false, true)) {
+        std::fprintf(stderr, "batch allocation failed\n");
+        llama_batch_free(batch);
+        batch = {};
+        return result;
+    }
     llama_token              input    = final_prompt_token;
     llama_pos                position = final_prompt_position;
     for (int i = 0; i < n_generate; ++i) {

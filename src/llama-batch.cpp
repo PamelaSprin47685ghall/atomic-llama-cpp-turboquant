@@ -1043,24 +1043,6 @@ struct llama_batch llama_batch_get_one(
     };
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-// Test-only allocation fault injection. A test executable may define this
-// weak symbol; production leaves it undefined, so every allocation proceeds.
-// The index is the zero-based allocation point inside llama_batch_init.
-extern "C" bool llama_batch_init_fail_alloc(int32_t index) __attribute__((weak));
-#endif
-
-static void * llama_batch_alloc(size_t size, int32_t index) {
-#if defined(__GNUC__) || defined(__clang__)
-    if (llama_batch_init_fail_alloc != nullptr && llama_batch_init_fail_alloc(index)) {
-        return nullptr;
-    }
-#else
-    (void) index;
-#endif
-    return malloc(size);
-}
-
 // Checked size multiplication for the batch arrays. A wrapped size would turn
 // a too-large request into a small allocation.
 static bool llama_batch_size_mul(size_t a, size_t b, size_t & out) {
@@ -1089,7 +1071,6 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         return batch;
     }
 
-    int32_t alloc_index = 0;
     const size_t n_tokens = (size_t) n_tokens_alloc;
     const size_t n_embd   = (size_t) embd;
     const size_t n_seq    = (size_t) n_seq_max;
@@ -1100,7 +1081,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
             !llama_batch_size_mul(bytes, n_embd, bytes)) {
             return batch;
         }
-        batch.embd = (float *) llama_batch_alloc(bytes, alloc_index++);
+        batch.embd = (float *) malloc(bytes);
         if (batch.embd == nullptr) {
             return batch;
         }
@@ -1108,7 +1089,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         if (!llama_batch_size_mul(sizeof(llama_token), n_tokens, bytes)) {
             return batch;
         }
-        batch.token = (llama_token *) llama_batch_alloc(bytes, alloc_index++);
+        batch.token = (llama_token *) malloc(bytes);
         if (batch.token == nullptr) {
             return batch;
         }
@@ -1117,7 +1098,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
     if (!llama_batch_size_mul(sizeof(llama_pos), n_tokens, bytes)) {
         return batch;
     }
-    batch.pos = (llama_pos *) llama_batch_alloc(bytes, alloc_index++);
+    batch.pos = (llama_pos *) malloc(bytes);
     if (batch.pos == nullptr) {
         return batch;
     }
@@ -1125,7 +1106,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
     if (!llama_batch_size_mul(sizeof(int32_t), n_tokens, bytes)) {
         return batch;
     }
-    batch.n_seq_id = (int32_t *) llama_batch_alloc(bytes, alloc_index++);
+    batch.n_seq_id = (int32_t *) malloc(bytes);
     if (batch.n_seq_id == nullptr) {
         return batch;
     }
@@ -1133,7 +1114,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
     if (!llama_batch_size_mul(sizeof(llama_seq_id *), n_tokens + 1, bytes)) {
         return batch;
     }
-    batch.seq_id = (llama_seq_id **) llama_batch_alloc(bytes, alloc_index++);
+    batch.seq_id = (llama_seq_id **) malloc(bytes);
     if (batch.seq_id == nullptr) {
         return batch;
     }
@@ -1147,7 +1128,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         return batch;
     }
     for (size_t i = 0; i < n_tokens; ++i) {
-        batch.seq_id[i] = (llama_seq_id *) llama_batch_alloc(bytes, alloc_index++);
+        batch.seq_id[i] = (llama_seq_id *) malloc(bytes);
         if (batch.seq_id[i] == nullptr) {
             return batch;
         }
@@ -1156,7 +1137,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
     if (!llama_batch_size_mul(sizeof(int8_t), n_tokens, bytes)) {
         return batch;
     }
-    batch.logits = (int8_t *) llama_batch_alloc(bytes, alloc_index++);
+    batch.logits = (int8_t *) malloc(bytes);
 
     return batch;
 }

@@ -91,11 +91,9 @@ int main(int argc, char ** argv) {
     for (int step = 0; ok && step < rounds * 4; ++step) {
         const int width = widths[step % 4];
         llama_batch batch = llama_batch_init(width, 0, 1);
-        if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
-            std::fprintf(stderr, "FAIL: batch allocation step=%d\n", step);
+        if (!llama_batch_is_complete(&batch, width, false, true)) {
             llama_batch_free(batch);
-            ok = false;
-            break;
+            GGML_ABORT("llama_batch_init failed");
         }
         for (int i = 0; i < width; ++i) {
             batch.token[i] = 3 + (int) (((int64_t) (pos + i) * 7 + 1) % (vocab - 3));
@@ -173,6 +171,10 @@ int main(int argc, char ** argv) {
         } else {
             auto decode_two = [&](llama_pos p, int logits_flag) {
                 llama_batch b = llama_batch_init(2, 0, 1);
+                if (!llama_batch_is_complete(&b, 2, false, true)) {
+                    llama_batch_free(b);
+                    GGML_ABORT("llama_batch_init failed");
+                }
                 for (int i = 0; i < 2; ++i) {
                     b.token[i] = 3 + (int) (((int64_t) (p + i) * 7 + 1) % (vocab - 3));
                     b.pos[i] = p + i;

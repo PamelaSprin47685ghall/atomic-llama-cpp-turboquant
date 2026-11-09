@@ -107,6 +107,10 @@ std::vector<float> copy_step_logits(llama_context * ctx, int n_tokens, int n_voc
 
 bool decode_step(llama_context * ctx, const step & s, int n_vocab, std::vector<float> & out) {
     llama_batch batch = llama_batch_init((int32_t) s.tokens.size(), 0, 1);
+    if (!llama_batch_is_complete(&batch, (int32_t) s.tokens.size(), false, true)) {
+        llama_batch_free(batch);
+        GGML_ABORT("llama_batch_init failed");
+    }
     batch.n_tokens = (int32_t) s.tokens.size();
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         batch.token[i]      = s.tokens[i];

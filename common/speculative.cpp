@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <new>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -216,7 +217,13 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
-        batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
+        const int32_t n_batch = (int32_t) llama_n_batch(ctx_dft);
+        batch = llama_batch_init(n_batch, 0, 1);
+        if (!llama_batch_is_complete(&batch, n_batch, false, true)) {
+            llama_batch_free(batch);
+            batch = {};
+            throw std::bad_alloc();
+        }
 
         // TODO: optimize or pass from outside?
         // {
@@ -497,9 +504,19 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
         batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd_dec, /*n_seq_max=*/ 1);
+        if (!llama_batch_is_complete(&batch, n_b, true, false)) {
+            llama_batch_free(batch);
+            batch = {};
+            throw std::bad_alloc();
+        }
         // llama_batch_init allocates only one of token/embd; eagle3 decoder needs both.
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        if (!llama_batch_is_complete(&batch, n_b, true, true)) {
+            llama_batch_free(batch);
+            batch = {};
+            throw std::bad_alloc();
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1004,14 +1021,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
 
-        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
-        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
+        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+        batch        = llama_batch_init(n_b, 0,          n_seq);
+        batch_inject = llama_batch_init(n_b, n_embd_dec, n_seq);
+        if (!llama_batch_is_complete(&batch, n_b, false, true) ||
+            !llama_batch_is_complete(&batch_inject, n_b, true, false)) {
+            llama_batch_free(batch);
+            batch = {};
+            llama_batch_free(batch_inject);
+            batch_inject = {};
+            throw std::bad_alloc();
+        }
 
         // embd batches on an M-RoPE draft need 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
         if (is_mrope) {
             free(batch_inject.pos);
-            batch_inject.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
+            batch_inject.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * (size_t) n_b);
+            if (batch_inject.pos == nullptr) {
+                llama_batch_free(batch);
+                batch = {};
+                llama_batch_free(batch_inject);
+                batch_inject = {};
+                throw std::bad_alloc();
+            }
         }
 
         smpls.resize(n_seq);
@@ -1486,9 +1519,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         batch_capacity = (int32_t) llama_n_batch(ctx_dft);
         ubatch_capacity = (int32_t) llama_n_ubatch(ctx_dft);
         batch = llama_batch_init(/*n_tokens=*/ batch_capacity, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
+        if (!llama_batch_is_complete(&batch, batch_capacity, true, false)) {
+            llama_batch_free(batch);
+            batch = {};
+            throw std::bad_alloc();
+        }
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * batch_capacity);
+        if (!llama_batch_is_complete(&batch, batch_capacity, true, true)) {
+            llama_batch_free(batch);
+            batch = {};
+            throw std::bad_alloc();
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {

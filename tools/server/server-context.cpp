@@ -282,12 +282,18 @@ struct server_batch {
         }
     }
 
-    void init(int32_t n_tokens_alloc, int32_t n_embd) {
+    bool init(int32_t n_tokens_alloc, int32_t n_embd) {
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
         batch = llama_batch_init(n_tokens_alloc, 0, 1);
+        if (!llama_batch_is_complete(&batch, n_tokens_alloc, false, true)) {
+            llama_batch_free(batch);
+            batch = {};
+            return false;
+        }
         tokens_ptr = batch.token;
         tokens.reserve(n_tokens_alloc);
+        return true;
     }
 
     bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output) {
@@ -1698,7 +1704,10 @@ private:
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
-            batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+            if (!batch.init(std::max(n_batch, params_base.n_parallel), n_embd)) {
+                SRV_ERR("%s", "failed to allocate batch\n");
+                return false;
+            }
         }
 
         if (params_base.cache_ram_mib != 0) {

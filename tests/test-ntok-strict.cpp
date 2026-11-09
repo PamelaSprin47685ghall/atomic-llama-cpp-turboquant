@@ -45,6 +45,10 @@ int main(int argc, char ** argv) {
         const int width = widths[step % 4];
         const int count = counts[step % 4];
         llama_batch batch = llama_batch_init(width, 0, 1);
+        if (!llama_batch_is_complete(&batch, width, false, true)) {
+            llama_batch_free(batch);
+            GGML_ABORT("llama_batch_init failed");
+        }
         batch.n_tokens = width;
         for (int i = 0; i < width; ++i) {
             batch.token[i] = 3 + ((pos + i) * 7 + 1) % (vocab - 3);

@@ -125,6 +125,12 @@ int main(int argc, char ** argv) {
     // seq_id [1, W]         : tokens from the past N - 1 Jacobi iterations
     // seq_id [W + 1, W + G] : verification n-grams
     llama_batch batch = llama_batch_init(llama_n_ctx(ctx), 0, W + G + 1);
+    if (!llama_batch_is_complete(&batch, llama_n_ctx(ctx), false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(batch);
+        batch = {};
+        return 1;
+    }
 
     // target model sampling context
     struct common_sampler * smpl = common_sampler_init(model, params.sampling);

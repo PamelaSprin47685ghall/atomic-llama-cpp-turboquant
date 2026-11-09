@@ -118,6 +118,11 @@ struct test_context {
 
         last_batch_info.clear();
         llama_batch batch = llama_batch_init(512, 0, prompts.size());
+        if (!llama_batch_is_complete(&batch, 512, false, true)) {
+            llama_batch_free(batch);
+            batch = llama_batch{};
+            return false;
+        }
 
         for (const auto & [seq_id, prompt] : prompts) {
             std::vector<llama_token> tokens;
@@ -202,6 +207,11 @@ struct test_context {
         GGML_ASSERT(ctx);
 
         llama_batch batch = llama_batch_init(1, 0, 1);
+        if (!llama_batch_is_complete(&batch, 1, false, true)) {
+            llama_batch_free(batch);
+            batch = llama_batch{};
+            return false;
+        }
         int32_t pos = seq_positions[seq_id];
         common_batch_add(batch, token, pos, { seq_id }, true);
 
@@ -223,6 +233,11 @@ struct test_context {
         GGML_ASSERT(ctx);
 
         llama_batch batch = llama_batch_init(seq_tokens.size(), 0, seq_tokens.size());
+        if (!llama_batch_is_complete(&batch, (int32_t) seq_tokens.size(), false, true)) {
+            llama_batch_free(batch);
+            batch = llama_batch{};
+            return false;
+        }
 
         for (const auto & [seq_id, token] : seq_tokens) {
             int32_t pos = seq_positions[seq_id];
@@ -1539,6 +1554,11 @@ static void test_backend_max_outputs(const test_params & params) {
     test_context test_ctx(params, backend_sampler_configs);
 
     llama_batch batch = llama_batch_init(512, 0, 1);
+    if (!llama_batch_is_complete(&batch, 512, false, true)) {
+        llama_batch_free(batch);
+        batch = llama_batch{};
+        GGML_ABORT("llama_batch_init failed");
+    }
     std::string prompt = "Hello";
 
     std::vector<llama_token> tokens;

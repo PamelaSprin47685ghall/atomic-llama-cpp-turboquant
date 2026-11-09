@@ -9077,6 +9077,12 @@ void llama_context::opt_epoch(ggml_opt_dataset_t      dataset,
     const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
 
     struct llama_batch       batch = llama_batch_init(n_batch, 0, 1);
+    if (!llama_batch_is_complete(&batch, (int32_t) n_batch, false, true)) {
+        llama_batch_free(batch);
+        // void API, no error channel: fail-stop is the documented behavior here.
+        GGML_ABORT("llama_batch_init failed in opt_epoch");
+        return;
+    }
     std::vector<llama_token> tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
 

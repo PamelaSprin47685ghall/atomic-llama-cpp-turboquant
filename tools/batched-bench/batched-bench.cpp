@@ -77,6 +77,15 @@ int llama_batched_bench(int argc, char ** argv) {
     const int32_t n_kv_max = llama_n_ctx(ctx);
 
     llama_batch batch = llama_batch_init(n_kv_max, 0, 1);
+    if (!llama_batch_is_complete(&batch, n_kv_max, false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(batch);
+        batch = {};
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return 1;
+    }
 
     // decode in batches of ctx_params.n_batch tokens
     auto decode_helper = [](llama_context * ctx, llama_batch & batch, int32_t n_batch, bool synchronize) {

@@ -218,6 +218,12 @@ int main(int argc, char ** argv) {
     // initialize batch
     const int n_chunks = chunks.size();
     struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    if (!llama_batch_is_complete(&batch, n_batch, false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(batch);
+        batch = {};
+        return 1;
+    }
 
     // allocate output
     const int n_embd_out = llama_model_n_embd_out(model);
@@ -259,6 +265,14 @@ int main(int argc, char ** argv) {
     }
 
     struct llama_batch query_batch = llama_batch_init(n_batch, 0, 1);
+    if (!llama_batch_is_complete(&query_batch, n_batch, false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(query_batch);
+        query_batch = {};
+        llama_batch_free(batch);
+        batch = {};
+        return 1;
+    }
 
     // start loop, receive query and return top k similar chunks based on cosine similarity
     std::string query;

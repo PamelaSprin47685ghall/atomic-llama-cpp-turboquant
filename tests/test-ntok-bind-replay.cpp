@@ -172,10 +172,10 @@ int tok_token(int pos, int vocab) {
 // parameters. `row` receives the full logits row of that last token.
 int tok_decode(llama_context * ctx, const tok_model & m, int pos, int width, std::vector<float> & row) {
     llama_batch batch = llama_batch_init(width, 0, 1);
-    if (batch.token == nullptr || batch.pos == nullptr || batch.n_seq_id == nullptr ||
-            batch.seq_id == nullptr || batch.logits == nullptr) {
+    if (!llama_batch_is_complete(&batch, width, false, true)) {
         std::fprintf(stderr, "FAIL: batch allocation width=%d\n", width);
         llama_batch_free(batch);
+        batch = llama_batch{};
         return -1;
     }
     batch.n_tokens = width;

@@ -168,6 +168,12 @@ int main(int argc, char ** argv) {
     common_speculative_begin(spec, seq_id, prompt_tgt);
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+    if (!llama_batch_is_complete(&batch_tgt, llama_n_batch(ctx_tgt), false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(batch_tgt);
+        batch_tgt = {};
+        return 1;
+    }
 
     size_t n_draft = 0;
 

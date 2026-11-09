@@ -385,7 +385,7 @@
     },
     {
       "path": "include/llama.h",
-      "sha256": "28667c17f48c4b0abbd3c9ce9872d1bb1d1942050f605d9b5bd7290d82eaafe3",
+      "sha256": "ca92540e26a43d98d48045d3f31d222da1d0958b46fd6c8e9c7c05bc98a32e0d",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -736,13 +736,13 @@
     },
     {
       "path": "src/llama-batch.cpp",
-      "sha256": "043b12aa7c200e008d631a390a61a33fc61a6cf9324a49dfd0cc1d20f0695a81",
+      "sha256": "42468b792b218a0ac33f2cfe7607a8d26d87979a8c107c070a38a32ae0e74bd7",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose",
         "llama batch allocator tests"
       ],
-      "reason": "Acquire ubatch payloads from the fixed-slot pool and restore every caller-filled array on a reused slot. Check every llama_batch_init allocation, including the outer seq_id array, and return a partial batch with null fields on failure instead of dereferencing it. A weak test-only hook injects an allocation failure at each real allocation point.",
+      "reason": "Acquire ubatch payloads from the fixed-slot pool and restore every caller-filled array on a reused slot. Check every llama_batch_init allocation, including the outer seq_id array, and return a partial batch with null fields on failure instead of dereferencing it. The test injects failures with an LD_PRELOAD malloc/calloc interposer; production has no hook.",
       "removal_condition": "Remove when the pool is unconditional and upstream provides a reusable ubatch payload allocator."
     },
     {

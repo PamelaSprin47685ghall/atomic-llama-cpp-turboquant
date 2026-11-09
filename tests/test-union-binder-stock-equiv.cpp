@@ -246,6 +246,10 @@ static int bse_step(llama_context * ctx, int vocab, int pos, std::vector<float> 
     logits_out.assign((size_t) vocab, 0.0f);
 
     llama_batch batch = llama_batch_init(1, 0, 1);
+    if (!llama_batch_is_complete(&batch, 1, false, true)) {
+        llama_batch_free(batch);
+        GGML_ABORT("llama_batch_init failed");
+    }
     batch.n_tokens     = 1;
     batch.token[0]     = (llama_token) (1 + (pos * 7) % (vocab - 1));
     batch.pos[0]       = (llama_pos) pos;
@@ -301,6 +305,10 @@ static int bse_step_multi(llama_context * ctx, int vocab, int step, std::vector<
     logits_out.assign((size_t) n * (size_t) vocab, 0.0f);
 
     llama_batch batch = llama_batch_init(n, 0, 1);
+    if (!llama_batch_is_complete(&batch, n, false, true)) {
+        llama_batch_free(batch);
+        GGML_ABORT("llama_batch_init failed");
+    }
     batch.n_tokens = n;
     for (int i = 0; i < n; ++i) {
         const int pos = step * n + i;
@@ -1173,6 +1181,10 @@ static int bse_step_perturbed(llama_context * ctx, int vocab, int pos, std::vect
     logits_out.assign((size_t) vocab, 0.0f);
 
     llama_batch batch = llama_batch_init(1, 0, 1);
+    if (!llama_batch_is_complete(&batch, 1, false, true)) {
+        llama_batch_free(batch);
+        GGML_ABORT("llama_batch_init failed");
+    }
     batch.n_tokens     = 1;
     // bse_step()'s id is 1 + (pos*7) % (vocab-1), in [1, vocab-1]; +1 wrapped
     // into the same range is a different id for vocab > 2.

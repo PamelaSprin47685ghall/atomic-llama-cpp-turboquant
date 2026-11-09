@@ -687,9 +687,17 @@ bool run_arm(llama_model * model, const std::vector<step_plan> & plan, int total
     for (int step = 0; step < steps; ++step) {
         const step_plan & p = plan[size_t(step)];
         llama_batch batch = llama_batch_init(p.width, 0, 1);
+        if (!llama_batch_is_complete(&batch, p.width, false, true)) {
+            std::fprintf(stderr, "ARM_FAIL arm=%s batch allocation step=%d\n", arm.name, step);
+            llama_batch_free(batch);
+            batch = llama_batch{};
+            arm.failure = "batch allocation failed";
+            break;
+        }
         if (!fill_batch(batch, p, vocab, arm.single_seq)) {
             std::fprintf(stderr, "ARM_FAIL arm=%s batch allocation step=%d\n", arm.name, step);
             llama_batch_free(batch);
+            batch = llama_batch{};
             arm.failure = "batch allocation failed";
             break;
         }

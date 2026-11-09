@@ -438,6 +438,14 @@ bool run_plan(llama_model * model, FILE * out, int vocab, const mode_spec & spec
         cap.reset();
 
         llama_batch batch = llama_batch_init(st.n_tokens, 0, 1);
+        if (!llama_batch_is_complete(&batch, st.n_tokens, false, true)) {
+            std::fprintf(stderr, "BATCH_ALLOC_FAIL MODE=%s STEP=%u\n",
+                         spec.name, (uint32_t) i);
+            llama_batch_free(batch);
+            batch = llama_batch{};
+            ok = false;
+            break;
+        }
         for (int j = 0; j < st.n_tokens; ++j) {
             batch.token[j]     = token_for(start + j, vocab);
             batch.pos[j]       = start + j;

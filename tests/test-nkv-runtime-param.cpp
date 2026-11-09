@@ -1066,6 +1066,12 @@ static bool part2(const live_model & m, int n_steps) {
         tokens[0] = (llama_token) (1 + (step * 7) % (vocab - 1));
 
         llama_batch batch = llama_batch_init(1, 0, 1);
+        if (!llama_batch_is_complete(&batch, 1, false, true)) {
+            llama_batch_free(batch);
+            batch = llama_batch{};
+            ok = false;
+            break;
+        }
         batch.n_tokens = 1;
         batch.token[0]    = tokens[0];
         batch.pos[0]      = (llama_pos) step;
@@ -1340,6 +1346,11 @@ static int tri_decode(llama_context * ctx, const tri_cell & c, int vocab, std::v
     logits_out.assign((size_t) c.n_outputs * (size_t) vocab, 0.0f);
 
     llama_batch batch = llama_batch_init(c.n_tokens, 0, 1);
+    if (!llama_batch_is_complete(&batch, c.n_tokens, false, true)) {
+        llama_batch_free(batch);
+        batch = llama_batch{};
+        return -1;
+    }
     batch.n_tokens = c.n_tokens;
     for (int i = 0; i < c.n_tokens; ++i) {
         batch.token[i]     = (llama_token) (1 + (c.pos0 + i) * 7 % (vocab - 1));

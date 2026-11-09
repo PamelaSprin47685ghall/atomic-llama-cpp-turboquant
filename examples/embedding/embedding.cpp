@@ -243,6 +243,12 @@ int main(int argc, char ** argv) {
     // initialize batch
     const int n_prompts = prompts.size();
     struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    if (!llama_batch_is_complete(&batch, n_batch, false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(batch);
+        batch = {};
+        return 1;
+    }
 
     // count number of embeddings
     int n_embd_count = 0;

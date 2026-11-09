@@ -70,9 +70,9 @@ arm_stats read_stats(llama_context * ctx) {
 bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos, llama_seq_id seq,
                 std::vector<float> & out, int n_vocab) {
     llama_batch batch = llama_batch_init(1, 0, 1);
-    if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+    if (!llama_batch_is_complete(&batch, 1, false, true)) {
         llama_batch_free(batch);
-        return false;
+        GGML_ABORT("llama_batch_init failed");
     }
     batch.n_tokens    = 1;
     batch.token[0]    = tok;
@@ -361,30 +361,32 @@ int main(int argc, char ** argv) {
         // one batch, two sequences, one token each: equal_seqs() holds
         const llama_seq_id pair[2] = { fs.a, fs.b };
         llama_batch batch_on  = llama_batch_init(2, 0, 1);
-        llama_batch batch_off = llama_batch_init(2, 0, 1);
-        const bool batch_ok = batch_on.token  && batch_on.pos  && batch_on.n_seq_id  &&
-                              batch_on.seq_id && batch_on.logits &&
-                              batch_off.token && batch_off.pos && batch_off.n_seq_id &&
-                              batch_off.seq_id && batch_off.logits;
-        if (batch_ok) {
-            batch_on.n_tokens  = 2;
-            batch_off.n_tokens = 2;
-            for (int i = 0; i < 2; ++i) {
-                const llama_token tok = (llama_token) (1 + (int) ((step * 7 + i * 3) % (n_vocab - 1)));
-                batch_on.token[i]      = tok;
-                batch_on.pos[i]        = pos[pair[i]];
-                batch_on.n_seq_id[i]   = 1;
-                batch_on.seq_id[i][0]  = pair[i];
-                batch_on.logits[i]     = 1;
-                batch_off.token[i]     = tok;
-                batch_off.pos[i]       = pos[pair[i]];
-                batch_off.n_seq_id[i]  = 1;
-                batch_off.seq_id[i][0] = pair[i];
-                batch_off.logits[i]    = 1;
-            }
+        if (!llama_batch_is_complete(&batch_on, 2, false, true)) {
+            llama_batch_free(batch_on);
+            GGML_ABORT("llama_batch_init failed");
         }
-        const int rc_on  = batch_ok ? llama_decode(on,  batch_on)  : -1;
-        const int rc_off = batch_ok ? llama_decode(off, batch_off) : -1;
+        llama_batch batch_off = llama_batch_init(2, 0, 1);
+        if (!llama_batch_is_complete(&batch_off, 2, false, true)) {
+            llama_batch_free(batch_off);
+            GGML_ABORT("llama_batch_init failed");
+        }
+        batch_on.n_tokens  = 2;
+        batch_off.n_tokens = 2;
+        for (int i = 0; i < 2; ++i) {
+            const llama_token tok = (llama_token) (1 + (int) ((step * 7 + i * 3) % (n_vocab - 1)));
+            batch_on.token[i]      = tok;
+            batch_on.pos[i]        = pos[pair[i]];
+            batch_on.n_seq_id[i]   = 1;
+            batch_on.seq_id[i][0]  = pair[i];
+            batch_on.logits[i]     = 1;
+            batch_off.token[i]     = tok;
+            batch_off.pos[i]       = pos[pair[i]];
+            batch_off.n_seq_id[i]  = 1;
+            batch_off.seq_id[i][0] = pair[i];
+            batch_off.logits[i]    = 1;
+        }
+        const int rc_on  = llama_decode(on,  batch_on);
+        const int rc_off = llama_decode(off, batch_off);
         llama_batch_free(batch_on);
         llama_batch_free(batch_off);
         if (rc_on != 0 || rc_off != 0) {

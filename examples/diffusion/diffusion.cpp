@@ -145,6 +145,12 @@ void diffusion_generate(llama_context *          ctx,
     struct llama_sampler * dist_sampler = llama_sampler_init_dist(params.seed);
 
     llama_batch batch = llama_batch_init(params.max_length, 0, 1);
+    if (!llama_batch_is_complete(&batch, params.max_length, false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(batch);
+        // diffusion_generate returns void and has no error channel; fail-stop.
+        GGML_ABORT("failed to allocate batch");
+    }
     batch.n_tokens    = params.max_length;
 
     // Pre-allocate buffers for CFG if needed

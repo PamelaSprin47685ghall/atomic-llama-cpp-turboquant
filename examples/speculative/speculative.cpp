@@ -216,7 +216,21 @@ int main(int argc, char ** argv) {
     }
 
     llama_batch batch_dft = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
+    if (!llama_batch_is_complete(&batch_dft, llama_n_batch(ctx_dft), false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(batch_dft);
+        batch_dft = {};
+        return 1;
+    }
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, n_seq_dft);
+    if (!llama_batch_is_complete(&batch_tgt, llama_n_batch(ctx_tgt), false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(batch_tgt);
+        batch_tgt = {};
+        llama_batch_free(batch_dft);
+        batch_dft = {};
+        return 1;
+    }
 
     const auto t_dec_start = ggml_time_us();
 

@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -28,7 +29,13 @@ using tokens = std::vector<llama_token>;
 struct batch_owner {
     llama_batch value;
 
-    explicit batch_owner(int32_t count) : value(llama_batch_init(count, 0, 1)) {}
+    explicit batch_owner(int32_t count) : value(llama_batch_init(count, 0, 1)) {
+        if (!llama_batch_is_complete(&value, count, false, true)) {
+            llama_batch_free(value);
+            value = {};
+            throw std::bad_alloc();
+        }
+    }
     ~batch_owner() { llama_batch_free(value); }
     batch_owner(const batch_owner &) = delete;
     batch_owner & operator=(const batch_owner &) = delete;

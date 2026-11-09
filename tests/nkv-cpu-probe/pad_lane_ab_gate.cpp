@@ -266,8 +266,9 @@ llama_token token_for(int pos, int vocab) {
 // One step: a single token at `pos`, requested as the only output.
 bool decode_step(llama_context * ctx, int pos, int vocab, step_record & rec) {
     llama_batch batch = llama_batch_init(1, 0, 1);
-    if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+    if (!llama_batch_is_complete(&batch, 1, false, true)) {
         llama_batch_free(batch);
+        batch = llama_batch{};
         return false;
     }
     batch.token[0]     = token_for(pos, vocab);

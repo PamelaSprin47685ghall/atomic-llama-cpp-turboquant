@@ -827,6 +827,12 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
     GGML_ASSERT(params.n_ctx == n_seq * n_ctx);
 
     llama_batch batch = llama_batch_init(std::min(n_batch, n_ctx*n_seq), 0, 1);
+    if (!llama_batch_is_complete(&batch, std::min(n_batch, n_ctx*n_seq), false, true)) {
+        LOG_ERR("%s : failed to allocate batch\n", __func__);
+        llama_batch_free(batch);
+        batch = {};
+        return false;
+    }
 
     std::vector<float> logits;
     if (params.compute_ppl && num_batches > 1) {

@@ -330,9 +330,10 @@ int main(int argc, char ** argv) {
         const step_plan p = plan_step(step);
 
         llama_batch batch = llama_batch_init(p.width, 0, 1);
-        if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+        if (!llama_batch_is_complete(&batch, p.width, false, true)) {
             ok = gate_fail("G7_execute", "step=%d batch allocation failed", step);
             llama_batch_free(batch);
+            batch = llama_batch{};
             break;
         }
         for (int j = 0; j < p.width; ++j) {

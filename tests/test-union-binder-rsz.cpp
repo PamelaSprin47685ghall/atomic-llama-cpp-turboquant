@@ -94,6 +94,10 @@ static llama_context * make_ctx(llama_model * model, const char * binder_env) {
 // compare_logits()/dump_step() to loop over them.
 static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos, llama_seq_id seq) {
     llama_batch b = llama_batch_init(1, 0, 1);
+    if (!llama_batch_is_complete(&b, 1, false, true)) {
+        llama_batch_free(b);
+        GGML_ABORT("llama_batch_init failed");
+    }
     b.n_tokens    = 1;
     b.token[0]    = tok;
     b.pos[0]      = pos;
@@ -436,6 +440,10 @@ static bool compare_states(llama_context * a, llama_context * b, int step,
 static bool decode_many(llama_context * ctx, const llama_token * toks,
                         const llama_pos * pos, const llama_seq_id * seqs, int n) {
     llama_batch b = llama_batch_init(n, 0, n);
+    if (!llama_batch_is_complete(&b, n, false, true)) {
+        llama_batch_free(b);
+        GGML_ABORT("llama_batch_init failed");
+    }
     b.n_tokens = n;
     for (int i = 0; i < n; ++i) {
         b.token[i]     = toks[i];

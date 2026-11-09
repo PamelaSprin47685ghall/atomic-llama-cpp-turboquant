@@ -31,17 +31,6 @@ inline std::uint64_t monotonic_ns() noexcept {
             .count());
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-// Test-only token-allocation fault injection. A test executable may define
-// this weak symbol; production leaves it undefined.
-extern "C" bool tq_tp5_mtp_pool_fail_token_alloc() __attribute__((weak));
-inline bool fail_token_alloc() noexcept {
-    return tq_tp5_mtp_pool_fail_token_alloc != nullptr && tq_tp5_mtp_pool_fail_token_alloc();
-}
-#else
-inline bool fail_token_alloc() noexcept { return false; }
-#endif
-
 } // namespace host_pool_detail
 
 // A worker-local pool of one-token MTP decode batches. A slot owns one
@@ -60,14 +49,6 @@ class mtp_batch_pool {
         bool ready = false;
         bool in_use = false;
     };
-
-    // llama_batch_init reports allocation failure with null arrays, not an
-    // exception. A one-token batch must own these arrays; the token is either
-    // inline (pooled slot) or allocated separately (fallback lease).
-    static bool batch_arrays_complete(const llama_batch & batch) noexcept {
-        return batch.embd != nullptr && batch.pos != nullptr && batch.n_seq_id != nullptr &&
-               batch.seq_id != nullptr && batch.seq_id[0] != nullptr && batch.logits != nullptr;
-    }
 
     // llama_batch_free checks every array and stops the seq_id walk at the
     // first null entry, so a partially allocated llama_batch_init result is
@@ -151,7 +132,7 @@ public:
             // An out-of-range slot marks a heap fallback in the probe log.
             slot_ = static_cast<std::uint32_t>(pool->slots_.size());
             llama_batch batch = llama_batch_init(1, pool->wide_, 1);
-            if (!batch_arrays_complete(batch)) {
+            if (!llama_batch_is_complete(&batch, 1, true, false)) {
                 discard_partial(batch);
                 throw std::bad_alloc();
             }
@@ -159,9 +140,7 @@ public:
             // that one token separately; its destructor frees it and clears
             // the pointer before llama_batch_free runs.
             std::free(batch.token);
-            batch.token = host_pool_detail::fail_token_alloc()
-                    ? nullptr
-                    : static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
+            batch.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
             if (batch.token == nullptr) {
                 discard_partial(batch);
                 throw std::bad_alloc();
@@ -221,7 +200,7 @@ public:
                 }
                 if (!s.ready) {
                     llama_batch batch = llama_batch_init(1, wide_, 1);
-                    if (!batch_arrays_complete(batch)) {
+                    if (!llama_batch_is_complete(&batch, 1, true, false)) {
                         // Free whatever llama_batch_init produced. The slot stays
                         // unready, so a later acquire retries instead of
                         // caching a partial batch.

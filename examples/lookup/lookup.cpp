@@ -110,6 +110,12 @@ int main(int argc, char ** argv){
     std::vector<llama_token> draft;
 
     llama_batch batch_tgt = llama_batch_init(llama_n_ctx(ctx), 0, 1);
+    if (!llama_batch_is_complete(&batch_tgt, llama_n_ctx(ctx), false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(batch_tgt);
+        batch_tgt = {};
+        return 1;
+    }
 
     const auto t_dec_start = ggml_time_us();
 

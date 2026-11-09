@@ -14,6 +14,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -217,7 +218,13 @@ private:
 };
 
 struct batch_owner {
-    explicit batch_owner(int count) : value(llama_batch_init(count, 0, 1)) {}
+    explicit batch_owner(int count) : value(llama_batch_init(count, 0, 1)) {
+        if (!llama_batch_is_complete(&value, count, false, true)) {
+            llama_batch_free(value);
+            value = {};
+            throw std::bad_alloc();
+        }
+    }
     ~batch_owner() { llama_batch_free(value); }
     llama_batch value;
 };

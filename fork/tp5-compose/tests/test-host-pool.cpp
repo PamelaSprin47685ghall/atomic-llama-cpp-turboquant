@@ -5,6 +5,10 @@
 #include "host_pool.h"
 
 #include <cstdint>
+#if defined(__unix__) || defined(__APPLE__)
+#include <dlfcn.h>
+#define TP5_HAVE_DLOPEN 1
+#endif
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -38,18 +42,24 @@ static void set_flag(const char * name, const char * value) {
 #endif
 }
 
-// The real llama_batch_init and the pool's fallback token allocation consult
-// these weak hooks. The test target exports them so the shared libllama
-// resolves its weak references to this executable.
-static int  g_fail_batch_alloc = -1;
-static bool g_fail_token_alloc = false;
+// Test-only malloc failure injection: the shared interposer is loaded with
+// LD_PRELOAD and exports arm/disarm. Production code has no hook.
+using fail_malloc_arm_fn    = void (*)(int);
+using fail_malloc_disarm_fn = void (*)(void);
 
-extern "C" bool llama_batch_init_fail_alloc(int32_t index) {
-    return index == g_fail_batch_alloc;
-}
+static fail_malloc_arm_fn    g_fail_malloc_arm    = nullptr;
+static fail_malloc_disarm_fn g_fail_malloc_disarm = nullptr;
 
-extern "C" bool tq_tp5_mtp_pool_fail_token_alloc() {
-    return g_fail_token_alloc;
+static bool load_fail_malloc() {
+#if defined(TP5_HAVE_DLOPEN)
+    g_fail_malloc_arm = reinterpret_cast<fail_malloc_arm_fn>(
+            dlsym(RTLD_DEFAULT, "tp5_fail_malloc_arm"));
+    g_fail_malloc_disarm = reinterpret_cast<fail_malloc_disarm_fn>(
+            dlsym(RTLD_DEFAULT, "tp5_fail_malloc_disarm"));
+    return g_fail_malloc_arm != nullptr && g_fail_malloc_disarm != nullptr;
+#else
+    return false;
+#endif
 }
 
 static void test_pooled_lease() {
@@ -522,32 +532,43 @@ static bool batch_init_complete(const llama_batch & batch) {
 }
 
 static void test_real_batch_init_failure() {
+    if (!load_fail_malloc()) {
+        check(true, "real init: failure injection skipped without LD_PRELOAD");
+        return;
+    }
+
     constexpr int wide = 4;
 
     for (int index = 0; index < 6; ++index) {
-        g_fail_batch_alloc = index;
+        g_fail_malloc_arm(index);
         llama_batch partial = llama_batch_init(1, wide, 1);
+        g_fail_malloc_disarm();
         check(batch_init_failure_matches(partial, index),
               "real init: the injected allocation is null and later fields stay null");
         llama_batch_free(partial);
     }
 
-    g_fail_batch_alloc = -1;
     llama_batch complete = llama_batch_init(1, wide, 1);
     check(batch_init_complete(complete), "real init: the clean batch owns every array");
     llama_batch_free(complete);
 }
 
 static void test_real_pooled_failure_retry() {
+    if (!load_fail_malloc()) {
+        check(true, "real init: pooled failure injection skipped without LD_PRELOAD");
+        return;
+    }
+
     set_flag("TP5_MTP_BATCH_POOL", "1");
+    set_flag("TP5_ALLOC_PROBE", nullptr);
 
     constexpr int wide = 4;
     float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
 
     for (int index = 0; index < 6; ++index) {
-        g_fail_batch_alloc = index;
         tq::tp5::mtp_batch_pool pool(1, wide);
 
+        g_fail_malloc_arm(index);
         bool threw = false;
         try {
             auto lease = pool.acquire();
@@ -555,28 +576,33 @@ static void test_real_pooled_failure_retry() {
         } catch (const std::bad_alloc &) {
             threw = true;
         }
+        g_fail_malloc_disarm();
         check(threw, "real init: the pooled first acquire reports the failure");
 
-        g_fail_batch_alloc = -1;
         auto lease = pool.acquire();
         lease.set(3, 0, 1, embd, wide);
         check(lease.batch().token[0] == 3, "real init: the pooled slot retries after the failure");
     }
 
-    g_fail_batch_alloc = -1;
     set_flag("TP5_MTP_BATCH_POOL", nullptr);
 }
 
 static void test_real_fallback_failure_retry() {
+    if (!load_fail_malloc()) {
+        check(true, "real init: fallback failure injection skipped without LD_PRELOAD");
+        return;
+    }
+
     set_flag("TP5_MTP_BATCH_POOL", nullptr);
+    set_flag("TP5_ALLOC_PROBE", nullptr);
 
     constexpr int wide = 4;
     float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
 
     for (int index = 0; index < 6; ++index) {
-        g_fail_batch_alloc = index;
         tq::tp5::mtp_batch_pool pool(1, wide);
 
+        g_fail_malloc_arm(index);
         bool threw = false;
         try {
             auto lease = pool.acquire();
@@ -584,17 +610,18 @@ static void test_real_fallback_failure_retry() {
         } catch (const std::bad_alloc &) {
             threw = true;
         }
+        g_fail_malloc_disarm();
         check(threw, "real init: the fallback acquire reports the failure");
 
-        g_fail_batch_alloc = -1;
         auto lease = pool.acquire();
         lease.set(4, 1, 1, embd, wide);
         check(lease.batch().token[0] == 4, "real init: the fallback path retries after the failure");
     }
 
-    g_fail_batch_alloc = -1;
-    g_fail_token_alloc = true;
+    // The fallback token is the seventh allocation after a complete six-array
+    // llama_batch_init(1, wide, 1).
     tq::tp5::mtp_batch_pool token_pool(1, wide);
+    g_fail_malloc_arm(6);
     bool threw = false;
     try {
         auto lease = token_pool.acquire();
@@ -602,9 +629,9 @@ static void test_real_fallback_failure_retry() {
     } catch (const std::bad_alloc &) {
         threw = true;
     }
+    g_fail_malloc_disarm();
     check(threw, "real init: a null fallback token is reported");
 
-    g_fail_token_alloc = false;
     auto retried = token_pool.acquire();
     retried.set(5, 2, 1, embd, wide);
     check(retried.batch().token[0] == 5, "real init: the fallback token path retries");

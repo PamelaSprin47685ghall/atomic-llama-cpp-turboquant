@@ -14,6 +14,7 @@
 #include <limits.h>
 #include <cinttypes>
 #include <clocale>
+#include <new>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -110,6 +111,11 @@ struct mtmd_cli_context {
         smpl = common_sampler_init(model, params.sampling);
         n_threads = params.cpuparams.n_threads;
         batch = llama_batch_init(1, 0, 1); // batch for next token generation
+        if (!llama_batch_is_complete(&batch, 1, false, true)) {
+            llama_batch_free(batch);
+            batch = {};
+            throw std::bad_alloc();
+        }
         n_batch = params.n_batch;
 
         if (!model || !lctx) {

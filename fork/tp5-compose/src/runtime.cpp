@@ -1674,13 +1674,7 @@ struct row_batch {
 
     explicit row_batch(std::uint32_t capacity) {
         batch = llama_batch_init(capacity, 0, 1);
-        bool complete = batch.token != nullptr && batch.pos != nullptr &&
-                        batch.n_seq_id != nullptr && batch.seq_id != nullptr &&
-                        batch.logits != nullptr;
-        for (std::uint32_t i = 0; complete && i < capacity; ++i) {
-            complete = batch.seq_id[i] != nullptr;
-        }
-        if (!complete) {
+        if (!llama_batch_is_complete(&batch, static_cast<int32_t>(capacity), false, true)) {
             llama_batch_free(batch);
             batch = {};
             throw std::bad_alloc();

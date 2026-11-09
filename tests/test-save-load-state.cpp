@@ -11,7 +11,12 @@ struct llama_batch_ptr {
     llama_batch batch;
 
     llama_batch_ptr(int32_t n_tokens, int32_t embd, int32_t n_seq_max)
-        : batch{llama_batch_init(n_tokens, embd, n_seq_max)} {}
+        : batch{llama_batch_init(n_tokens, embd, n_seq_max)} {
+        if (!llama_batch_is_complete(&batch, n_tokens, embd != 0, embd == 0)) {
+            llama_batch_free(batch);
+            GGML_ABORT("llama_batch_init failed");
+        }
+    }
 
     ~llama_batch_ptr() { llama_batch_free(batch); }
 

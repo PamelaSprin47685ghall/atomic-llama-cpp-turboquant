@@ -11,6 +11,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -28,7 +29,13 @@ void require(bool value, const std::string & message) {
 }
 
 struct batch_owner {
-    explicit batch_owner(int count) : value(llama_batch_init(count, 0, 1)) {}
+    explicit batch_owner(int count) : value(llama_batch_init(count, 0, 1)) {
+        if (!llama_batch_is_complete(&value, count, false, true)) {
+            llama_batch_free(value);
+            value = {};
+            throw std::bad_alloc();
+        }
+    }
     ~batch_owner() { llama_batch_free(value); }
     batch_owner(const batch_owner &) = delete;
     batch_owner & operator=(const batch_owner &) = delete;

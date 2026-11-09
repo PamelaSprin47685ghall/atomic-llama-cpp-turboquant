@@ -69,19 +69,23 @@ if(BUILD_TESTING)
     target_include_directories(tq_tp5_ordered_fold_tests PRIVATE src)
     target_link_libraries(tq_tp5_ordered_fold_tests PRIVATE llama)
     add_test(NAME tq-tp5-ordered-f32-fold COMMAND tq_tp5_ordered_fold_tests)
+    if(UNIX AND NOT APPLE)
+        add_library(tp5_fail_malloc SHARED tests/fail-malloc.c)
+        target_link_libraries(tp5_fail_malloc PRIVATE ${CMAKE_DL_LIBS})
+    endif()
     add_executable(tq_tp5_host_pool_tests tests/test-host-pool.cpp)
-    # The test defines the weak allocation-failure hooks that libllama and
-    # host_pool.h consult. Export the executable's symbols so the shared
-    # library resolves them; a static llama resolves them at link time.
-    set_target_properties(tq_tp5_host_pool_tests PROPERTIES ENABLE_EXPORTS ON)
     target_compile_features(tq_tp5_host_pool_tests PRIVATE cxx_std_17)
     target_include_directories(tq_tp5_host_pool_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/../alloc-ledger/include)
     target_compile_definitions(tq_tp5_host_pool_tests PRIVATE
         TP5_TEST_VOCAB_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/../../models/ggml-vocab-command-r.gguf")
-    target_link_libraries(tq_tp5_host_pool_tests PRIVATE llama)
+    target_link_libraries(tq_tp5_host_pool_tests PRIVATE llama ${CMAKE_DL_LIBS})
     add_test(NAME tq-tp5-host-pool COMMAND tq_tp5_host_pool_tests)
+    if(UNIX AND NOT APPLE)
+        set_tests_properties(tq-tp5-host-pool PROPERTIES
+            ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:tp5_fail_malloc>")
+    endif()
     if(TQ_TP5_BUILD_HIP_TESTS)
         add_executable(tq_tp5_q8_f32_tests tests/test-q8-f32.cpp)
         target_compile_features(tq_tp5_q8_f32_tests PRIVATE cxx_std_17)

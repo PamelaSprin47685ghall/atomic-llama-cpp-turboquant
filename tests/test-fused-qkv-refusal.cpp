@@ -237,10 +237,10 @@ llama_token token_at(int pos, int vocab) {
 int decode_one(llama_context * ctx, llama_token token, llama_pos pos,
                std::vector<float> & row, int vocab) {
     llama_batch batch = llama_batch_init(1, 0, 1);
-    if (batch.token == nullptr || batch.pos == nullptr || batch.n_seq_id == nullptr ||
-            batch.seq_id == nullptr || batch.logits == nullptr) {
+    if (!llama_batch_is_complete(&batch, 1, false, true)) {
         std::fprintf(stderr, "FAIL: batch allocation\n");
         llama_batch_free(batch);
+        batch = llama_batch{};
         return -1;
     }
     batch.n_tokens     = 1;

@@ -1695,6 +1695,10 @@ static int four_decode(llama_context * ctx, const four_cell & c, int vocab, std:
     logits_out.assign((size_t) c.n_outputs * (size_t) vocab, 0.0f);
 
     llama_batch batch = llama_batch_init(c.n_tokens, 0, 1);
+    if (!llama_batch_is_complete(&batch, c.n_tokens, false, true)) {
+        llama_batch_free(batch);
+        GGML_ABORT("llama_batch_init failed");
+    }
     batch.n_tokens = c.n_tokens;
     for (int i = 0; i < c.n_tokens; ++i) {
         batch.token[i]     = (llama_token) (1 + (c.pos0 + i) * 7 % (vocab - 1));

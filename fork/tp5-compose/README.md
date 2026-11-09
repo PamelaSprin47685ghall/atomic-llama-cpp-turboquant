@@ -503,12 +503,15 @@ leaves scope, including on exception unwinding. When the flag is off or every
 slot is leased, the fallback lease owns the same heap batch that the pre-pool
 path allocated and frees it on release. `llama_batch_init` checks every
 allocation, including the outer `seq_id` array, and reports failure with null
-fields instead of dereferencing a failed allocation. The caller must check
-every field it uses; the MTP pool and the target `row_batch` do so and throw
-`std::bad_alloc` after releasing the partial batch. `llama_batch_free` is safe
-on a partial batch because it checks each pointer and stops the `seq_id` walk
-at the first null entry. A failed pool slot stays unready, so a later acquire
-retries.
+fields instead of dereferencing a failed allocation. `llama_batch_free` is
+safe on a partial batch because it checks each pointer and stops the `seq_id`
+walk at the first null entry. Every caller in this tree checks the result with
+`llama_batch_is_complete` and frees the partial batch; functions with an error
+channel return or propagate it, and the void entry points with no error channel
+(`llama_context::opt_epoch` and perplexity's void scorers) fail-stop with
+`GGML_ABORT`, recorded at the call site. The MTP pool and the target
+`row_batch` throw `std::bad_alloc`; a failed pool slot stays unready, so a
+later acquire retries.
 
 The pool is not thread safe: exactly one worker owns it, and the pool outlives
 every lease. `lease::set` requires a non-null embedding row whose width equals
@@ -523,5 +526,9 @@ perform no heap allocation after the first slot is warm. The CPU test
 `tq-tp5-host-pool` covers reuse, fallback, exhaustion, exception release, the
 probe cap, pool destruction, the `set` contract, and a failure injected at
 each of the six real `llama_batch_init` allocation points (direct, pooled, and
-fallback), plus the fallback token; every case must report `std::bad_alloc`
-and the next acquire must succeed.
+fallback), plus the fallback token. Injection uses the test-only `LD_PRELOAD`
+interposer in `tests/fail-malloc.c`, which arms a countdown immediately before
+the real call and adds no production hook or ABI. Every failure must report
+`std::bad_alloc` and the next acquire must succeed; without the preload the
+normal path skips injection and still passes. The contract is documented in
+`include/llama.h`.

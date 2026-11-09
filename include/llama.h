@@ -1426,6 +1426,37 @@ extern "C" {
     // Safe for a partially allocated batch returned after an allocation failure.
     LLAMA_API void llama_batch_free(struct llama_batch batch);
 
+    // Returns true when every array needed for n_tokens rows is present.
+    // needs_embd selects the embedding input; needs_token selects the token
+    // input. A batch returned by llama_batch_init can be incomplete after an
+    // allocation failure; check it before use and call llama_batch_free() when
+    // this returns false.
+    static inline bool llama_batch_is_complete(
+            const struct llama_batch * batch,
+            int32_t n_tokens,
+            bool needs_embd,
+            bool needs_token) {
+        if (batch == NULL || n_tokens < 0) {
+            return false;
+        }
+        if (needs_embd && batch->embd == NULL) {
+            return false;
+        }
+        if (needs_token && batch->token == NULL) {
+            return false;
+        }
+        if (batch->pos == NULL || batch->n_seq_id == NULL ||
+            batch->seq_id == NULL || batch->logits == NULL) {
+            return false;
+        }
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            if (batch->seq_id[i] == NULL) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // Process a batch of tokens.
     // In contrast to llama_decode() - this call does not use KV cache.
     // For encode-decoder contexts, processes the batch using the encoder.

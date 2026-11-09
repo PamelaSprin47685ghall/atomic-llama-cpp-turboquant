@@ -256,6 +256,13 @@ bool run(llama_model * model, const char * mode, const char * on_path, const cha
         }
         previous_count = count;
         llama_batch batch = llama_batch_init(width, 0, 1);
+        if (!llama_batch_is_complete(&batch, width, false, true)) {
+            std::fprintf(stderr, "BATCH_ALLOC_FAIL mode=%s step=%d\n", mode, step);
+            llama_batch_free(batch);
+            batch = llama_batch{};
+            ok = false;
+            break;
+        }
         std::vector<int> indices;
         for (int j = 0; j < width; ++j) {
             batch.token[j] = 3 + ((pos + j) * 7 + 1) % (vocab - 3);

@@ -700,8 +700,9 @@ int token_at(int pos, int vocab) {
 // One decode of a single token. Returns the llama_decode status.
 int decode_one(llama_context * ctx, int token, int pos, int seq) {
     llama_batch batch = llama_batch_init(1, 0, 1);
-    if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+    if (!llama_batch_is_complete(&batch, 1, false, true)) {
         llama_batch_free(batch);
+        batch = llama_batch{};
         return -100;
     }
     batch.n_tokens     = 1;

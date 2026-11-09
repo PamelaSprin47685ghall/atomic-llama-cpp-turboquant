@@ -126,6 +126,12 @@ int main(int argc, char ** argv) {
     //LOG_INF("prompt: %s\n", params.prompt.c_str());
 
     llama_batch batch = llama_batch_init(params.n_batch, 0, 1);
+    if (!llama_batch_is_complete(&batch, params.n_batch, false, true)) {
+        LOG_ERR("%s: failed to allocate batch\n", __func__);
+        llama_batch_free(batch);
+        batch = {};
+        return 1;
+    }
 
     int n_past = 0;
 
