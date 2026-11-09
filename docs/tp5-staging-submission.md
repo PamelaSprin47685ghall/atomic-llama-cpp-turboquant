@@ -674,10 +674,10 @@ query after a 128-token decode: it observes `attention_pos_max=127`,
 requires rejection of an unknown version, a zero `struct_size`, a negative
 sequence, a positive out-of-range sequence, and a null output.
 
-`tests/test-public-tp5-api.cpp` is the permanent build-tree regression for the
-public declarations and link surface (the NextN embedding functions, the trace
-query, and the Meta submit hooks). Installed-package `find_package`/symbol
-checks are staged verification and are not a repository CTest.
+`test-llama-archs -a qwen4exp` is the permanent real CPU behavior regression
+for the trace query. The installed-package `find_package`/symbol checks were
+run in a temporary `mktemp -d` staging tree; they are evidence, not a
+repository CTest or a permanent behavior test.
 
 The NextN/MTP embedding entry points `llama_set_embeddings_nextn` and
 `llama_get_embeddings_nextn_ith` are declared in `include/llama.h` and exported
