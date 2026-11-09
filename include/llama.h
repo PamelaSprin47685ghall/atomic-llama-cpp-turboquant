@@ -48,6 +48,8 @@
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 #define LLAMA_STATE_SEQ_VERSION 3
 
+#define LLAMA_MEMORY_HYBRID_IDX_TRACE_VERSION 1
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -1190,6 +1192,30 @@ extern "C" {
     // Release only the native recurrent state. Stored attention keys keep their
     // logical sequence owner and remain visible through explicit reader views.
     LLAMA_API bool llama_memory_seq_rm_recurrent(llama_memory_t mem, llama_seq_id seq_id);
+
+    // Versioned, read-only diagnostic view of a Qwen4Exp hybrid-index memory.
+    // The caller sets version = LLAMA_MEMORY_HYBRID_IDX_TRACE_VERSION and
+    // struct_size = sizeof(*out); a mismatch returns false without writing. The query
+    // also returns false when the memory is not llama_memory_hybrid_idx or
+    // seq_id is negative. The fields are host-visible diagnostics only: they
+    // do not alter memory state and do not prove device execution. The query
+    // follows the same single-caller contract as the other memory accessors.
+    struct llama_memory_hybrid_idx_trace {
+        uint32_t version;
+        uint32_t struct_size;
+        int32_t  gdn_tail_pos;
+        uint32_t replay_len;
+        uint32_t rs_idx;
+        int32_t  ple_next_pos;
+        uint64_t ple_count;
+        int32_t  ple_recent[2];
+        int32_t  attention_pos_max;
+        int32_t  indexer_pos_max;
+    };
+    LLAMA_API bool llama_memory_hybrid_idx_get_trace(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+        struct llama_memory_hybrid_idx_trace * out);
 
     // Clear the memory contents
     // If data == true, the data buffers will also be cleared together with the metadata

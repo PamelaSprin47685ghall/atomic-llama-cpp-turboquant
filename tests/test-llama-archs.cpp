@@ -368,6 +368,57 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+static bool check_hybrid_idx_trace(llama_context * ctx, size_t n_tokens) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    llama_memory_hybrid_idx_trace trace{};
+    trace.version = LLAMA_MEMORY_HYBRID_IDX_TRACE_VERSION;
+    trace.struct_size = sizeof(trace);
+
+    if (!llama_memory_hybrid_idx_get_trace(mem, 0, &trace)) {
+        fprintf(stderr, "hybrid_idx trace query returned false\n");
+        return false;
+    }
+
+    printf("hybrid_idx trace: gdn_tail_pos=%d replay_len=%u rs_idx=%u "
+           "ple_next_pos=%d ple_count=%llu ple_recent=[%d,%d] "
+           "attention_pos_max=%d indexer_pos_max=%d\n",
+           int(trace.gdn_tail_pos), trace.replay_len, trace.rs_idx,
+           int(trace.ple_next_pos), (unsigned long long) trace.ple_count,
+           int(trace.ple_recent[1]), int(trace.ple_recent[0]),
+           int(trace.attention_pos_max), int(trace.indexer_pos_max));
+
+    const bool live = trace.ple_count > 0
+        && trace.ple_next_pos == (llama_pos) n_tokens
+        && trace.attention_pos_max == (llama_pos) n_tokens - 1
+        && trace.indexer_pos_max == (llama_pos) n_tokens - 1;
+    if (!live) {
+        fprintf(stderr, "hybrid_idx trace values are not the decoded fixture state\n");
+    }
+
+    llama_memory_hybrid_idx_trace bad = trace;
+    bad.version = LLAMA_MEMORY_HYBRID_IDX_TRACE_VERSION + 1;
+    bad.struct_size = sizeof(bad);
+    if (llama_memory_hybrid_idx_get_trace(mem, 0, &bad)) {
+        fprintf(stderr, "hybrid_idx trace accepted an unknown version\n");
+        return false;
+    }
+    bad = trace;
+    bad.struct_size = 0;
+    if (llama_memory_hybrid_idx_get_trace(mem, 0, &bad)) {
+        fprintf(stderr, "hybrid_idx trace accepted a zero struct_size\n");
+        return false;
+    }
+    if (llama_memory_hybrid_idx_get_trace(mem, -1, &trace)) {
+        fprintf(stderr, "hybrid_idx trace accepted a negative sequence\n");
+        return false;
+    }
+    if (llama_memory_hybrid_idx_get_trace(mem, 0, nullptr)) {
+        fprintf(stderr, "hybrid_idx trace accepted a null output\n");
+        return false;
+    }
+    return live;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -668,6 +719,11 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        if (arch == LLM_ARCH_QWEN4EXP && !encode) {
+                            if (!check_hybrid_idx_trace(model_and_ctx_cpu.second.get(), tokens.size())) {
+                                all_ok = false;
+                            }
+                        }
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);

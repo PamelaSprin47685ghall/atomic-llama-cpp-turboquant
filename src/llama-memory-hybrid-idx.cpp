@@ -1,5 +1,6 @@
 #include "llama-memory-hybrid-idx.h"
 
+#include "llama.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -235,6 +236,11 @@ size_t llama_memory_hybrid_idx::ple_hist_capacity() const {
 
 llama_memory_hybrid_idx::ple_history & llama_memory_hybrid_idx::ple_hist_get(llama_seq_id seq_id) const {
     return ple_hist[seq_id];
+}
+
+const llama_memory_hybrid_idx::ple_history * llama_memory_hybrid_idx::ple_hist_peek(llama_seq_id seq_id) const {
+    const auto it = ple_hist.find(seq_id);
+    return it == ple_hist.end() ? nullptr : &it->second;
 }
 
 // first position still remembered by h
@@ -544,6 +550,54 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
+}
+
+bool llama_memory_hybrid_idx_get_trace(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+    struct llama_memory_hybrid_idx_trace * out) {
+    if (mem == nullptr || out == nullptr) {
+        return false;
+    }
+    if (out->version != LLAMA_MEMORY_HYBRID_IDX_TRACE_VERSION || out->struct_size != sizeof(*out)) {
+        return false;
+    }
+    if (seq_id < 0) {
+        return false;
+    }
+
+    auto * m = dynamic_cast<llama_memory_hybrid_idx *>(mem);
+    if (m == nullptr) {
+        return false;
+    }
+
+    auto * rec  = m->get_mem_recr();
+    auto * attn = m->get_mem_attn();
+    if (rec == nullptr || attn == nullptr) {
+        return false;
+    }
+
+    const size_t s = size_t(seq_id);
+    if (s >= rec->tails.size()) {
+        return false;
+    }
+    const int32_t tail = s < rec->tails.size() ? rec->tails[s] : -1;
+    const auto * hist = m->ple_hist_peek(seq_id);
+
+    out->gdn_tail_pos = tail >= 0 && size_t(tail) < rec->cells.size()
+        ? rec->cells[size_t(tail)].pos : -1;
+    out->replay_len = s < rec->replay_len.size() ? rec->replay_len[s] : 0;
+    out->rs_idx = s < rec->rs_idx.size() ? rec->rs_idx[s] : 0;
+    out->ple_next_pos = hist != nullptr ? hist->next_pos : -1;
+    out->ple_count = hist != nullptr ? uint64_t(hist->toks.size()) : 0;
+    out->ple_recent[0] = hist != nullptr && !hist->toks.empty() ? hist->toks.back() : -1;
+    out->ple_recent[1] = hist != nullptr && hist->toks.size() >= 2
+        ? hist->toks[hist->toks.size() - 2] : -1;
+    out->attention_pos_max = attn->seq_pos_max(seq_id);
+
+    auto * idx = m->get_mem_idx();
+    out->indexer_pos_max = idx != nullptr ? idx->seq_pos_max(seq_id) : -1;
+    return true;
 }
 
 //

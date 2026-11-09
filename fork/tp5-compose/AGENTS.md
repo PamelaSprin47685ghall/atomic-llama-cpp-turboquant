@@ -16,7 +16,7 @@
 
 1. [LEMMA 1, 2] The CLI loads one real Qwen3-8B Q8_0 model across exactly five HIP ranks, runs independent requests through one or two isolated windows, computes CPU sums in rank order, and samples complete finite logits. Proof: `tests/real-tp5.py` exercises installed executable and records actual masks/counters, full logits, row identity and final reservations. Only executed records grant qualification.
 2. [LEMMA 2, 3] CPU input retirement never grants output retirement; output is reusable only after all actual last readers. Failure stops new publication; unproved drain terminates the CLI GPU domain without freeing native owners. Proof: runtime's ledger transitions, explicit abort/delay cases and provider native receipts; see `../VALIDATION.md` for actual scope.
-3. [LEMMA 1] This package builds from installed A/B artifacts and includes no private A header. Proof: standalone installed-consumer acceptance, recorded after execution.
+3. [LEMMA 1] This package builds from installed A/B artifacts and includes no private A header. Proof: standalone installed-consumer acceptance, recorded after execution. The hybrid-index diagnostic trace uses the public versioned `llama_memory_hybrid_idx_get_trace` query; `runtime.cpp` includes only installed public headers and no `llama-memory-hybrid-idx.h` or `tp5-meta-submit-ready.h` path.
 
 ## Exceptions
 

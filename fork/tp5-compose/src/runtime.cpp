@@ -1,10 +1,8 @@
 #include <ggml-backend.h>
-#include "tp5-meta-submit-ready.h"
 #include <ggml-relay.h>
 #include <ggml-relay-plan.h>
 #include <gguf.h>
 #include <llama.h>
-#include "llama-memory-hybrid-idx.h"
 // The selected original libllama exports these stable fork MTP staging APIs;
 // only this isolated one-object candidate uses them.
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked);
@@ -2949,26 +2947,21 @@ run_result run(const options & requested) {
                                         consumed[0]+1+accepted);
                                     auto debug_recurrent = [&](const char * stage) {
                                         if (!mtp_state_trace) return;
-                                        auto * mem = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx));
-                                        require(mem != nullptr,
+                                        llama_memory_hybrid_idx_trace trace{};
+                                        trace.version = LLAMA_MEMORY_HYBRID_IDX_TRACE_VERSION;
+                                        trace.struct_size = sizeof(trace);
+                                        require(llama_memory_hybrid_idx_get_trace(
+                                                    llama_get_memory(ctx), 0, &trace),
                                             "MTP ring-state trace requires Qwen4Exp hybrid_idx");
-                                        const auto & hist=mem->ple_hist_get(0);
-                                        auto * rec=mem->get_mem_recr();
-                                        const int tail=rec->tails[0];
-                                        const auto last_pos=tail>=0 ? rec->cells[tail].pos : -1;
-                                        const int ht1=hist.toks.empty() ? -1 : int(hist.toks.back());
-                                        const int ht2=hist.toks.size()<2 ? -1 : int(hist.toks[hist.toks.size()-2]);
-                                        const auto idxpos=mem->get_mem_idx() ?
-                                            mem->get_mem_idx()->seq_pos_max(0) : -1;
-                                        const auto attpos=mem->get_mem_attn()->seq_pos_max(0);
                                         std::fprintf(stderr,
-                                            "TP5_REAL_MTP_RECURRENT_PLE_KV_TRACE stage=%s window=%u source_pos=%llu accepted_drafts=%zu invalid_pos=%d GDN_tail_pos=%d replay_len=%u rs_idx=%u PLE_next_pos=%d PLE_count=%zu PLE_recent2=[%d,%d] attention_pos_max=%d indexer_pos_max=%d\n",
+                                            "TP5_REAL_MTP_RECURRENT_PLE_KV_TRACE stage=%s window=%u source_pos=%llu accepted_drafts=%zu invalid_pos=%d GDN_tail_pos=%d replay_len=%u rs_idx=%u PLE_next_pos=%d PLE_count=%llu PLE_recent2=[%d,%d] attention_pos_max=%d indexer_pos_max=%d\n",
                                             stage,wi,(unsigned long long)consumed[0],
-                                            accepted,int(invalid_from),int(last_pos),
-                                            rec->replay_len.empty()?0:rec->replay_len[0],
-                                            rec->rs_idx.empty()?0:rec->rs_idx[0],
-                                            int(hist.next_pos),hist.toks.size(),ht2,ht1,
-                                            int(attpos),int(idxpos));
+                                            accepted,int(invalid_from),int(trace.gdn_tail_pos),
+                                            trace.replay_len,trace.rs_idx,
+                                            int(trace.ple_next_pos),
+                                            (unsigned long long)trace.ple_count,
+                                            int(trace.ple_recent[1]),int(trace.ple_recent[0]),
+                                            int(trace.attention_pos_max),int(trace.indexer_pos_max));
                                         std::fflush(stderr);
                                     };
                                     debug_recurrent("before_invalid_suffix_trim");

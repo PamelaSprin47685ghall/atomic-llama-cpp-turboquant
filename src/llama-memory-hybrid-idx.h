@@ -96,6 +96,9 @@ public:
     // const because set_input updates it through a const memory context
     ple_history & ple_hist_get(llama_seq_id seq_id) const;
 
+    // Non-inserting lookup; returns nullptr when seq_id has no history yet.
+    const ple_history * ple_hist_peek(llama_seq_id seq_id) const;
+
     // Retain the hash predecessors plus the maximum supported recurrent rewind.
     size_t ple_hist_capacity() const;
 

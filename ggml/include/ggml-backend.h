@@ -532,6 +532,15 @@ extern "C" {
     GGML_API size_t ggml_backend_meta_output_record(ggml_backend_t meta_backend, const struct ggml_tensor * tensor);
     GGML_API size_t ggml_backend_meta_output_wait  (ggml_backend_t meta_backend);
 
+    // TP5 Meta submit hooks. Both are caller-thread-scoped observation points:
+    // the ready hook runs after private conversion/prepare and before native
+    // submit; the submitted hook runs only after a successful, sealed native
+    // submit and after the provider lock is released. The caller owns userdata
+    // until it clears the hook with (nullptr, nullptr). Returns false for a
+    // partial hook/userdata pair or a nested ready hook.
+    GGML_API bool ggml_backend_meta_set_submit_ready_hook(bool (*hook)(void *), void * userdata);
+    GGML_API bool ggml_backend_meta_set_submitted_hook  (bool (*hook)(void *), void * userdata);
+
     // ggml_backend_meta_first_child_device(meta_backend) returns the device of
     // the Meta backend's FIRST simple child, or nullptr when there is none (not
     // a Meta backend, no initialized child, or child 0 gone). A Meta backend

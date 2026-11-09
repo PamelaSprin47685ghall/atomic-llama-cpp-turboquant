@@ -28,6 +28,12 @@ Read the [final report](../../build-tp5-native-speed-20261021/NATIVE-SPEED-REPOR
 It does not copy model arithmetic, include private A headers, or make a B library
 call another participant. The installed executable is `tq-tp5-compose`.
 
+The PLE/KV diagnostic trace uses the versioned public
+`llama_memory_hybrid_idx_get_trace` query from `<llama.h>`; `runtime.cpp`
+includes only installed public A/B headers. The Meta submit-hook declarations
+live in `<ggml-backend.h>`; the obsolete `tp5-meta-submit-ready.h` has been
+removed, so new code includes `<ggml-backend.h>` directly.
+
 Current numerical/performance evidence is in the
 [single-request repair](#single-request-performance-repair-2026-10-19).
 Historical sections retain their original image identities.
@@ -191,7 +197,7 @@ There is no environment-variable switch that silently enables strict mode for
 ordinary callers: A's public `tp5_relay` context parameter defaults to false.
 
 For a standalone C build, provide an installation containing the matching A,
-`TQRelay`, `TQScheduling`, and `TQText` packages:
+`TQRelay`, `TQSampling`, `TQScheduling`, and `TQText` packages:
 
 ```sh
 cmake -S fork/tp5-compose -B build-tp5-c \
@@ -201,6 +207,10 @@ cmake --build build-tp5-c --parallel 4
 ctest --test-dir build-tp5-c --output-on-failure --no-tests=error
 cmake --install build-tp5-c
 ```
+
+Do not add source-tree include paths (`ggml/include` or `src`) to this build.
+The installed packages provide every public header; a source-tree path hides
+private-header dependencies and breaks the installed-consumer contract.
 
 The installed acceptance helper is exactly
 `<prefix>/share/TQTP5Compose/real-tp5.py` (capitalization is significant), not a

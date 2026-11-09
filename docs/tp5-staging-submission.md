@@ -637,3 +637,35 @@ union-kind change lands, any new rejection condition in `staging_candidate`
 must get a reason here; otherwise those candidates fall into `other`, which is
 reported and counted instead of `unknown`. Keep the generic 64 KiB overflow
 classification aligned with `kGenericMaxBytes` in `staging.h`.
+
+## Installed public contracts for the TP5 Meta hooks and hybrid-index trace
+
+The Meta submit-ready and submitted hook declarations now live in
+`ggml/include/ggml-backend.h` and use `GGML_API`, the core-library export
+macro; the hooks are defined in `libggml-base`, not in a backend DSO. The old
+`ggml/include/tp5-meta-submit-ready.h` has no consumer left and was removed;
+its install entry is gone. Consumers include `<ggml-backend.h>` directly. The
+ggml package installs the public declarations through `GGML_PUBLIC_HEADERS`.
+
+`include/llama.h` exposes a versioned, read-only diagnostic query:
+`struct llama_memory_hybrid_idx_trace` with
+`LLAMA_MEMORY_HYBRID_IDX_TRACE_VERSION` (currently 1) and
+`llama_memory_hybrid_idx_get_trace`. The caller sets `version` and
+`struct_size`; the query returns false without writing when either differs, when the memory
+is not `llama_memory_hybrid_idx`, or when `seq_id` is negative. Its fields are
+host-visible diagnostics only: GDN tail, replay length, rollback index, PLE
+history positions, and attention/indexer maximum positions. They do not alter
+memory state and do not prove device execution.
+
+`fork/tp5-compose/src/runtime.cpp` uses this query for the
+`GGML_TP5_MTP_PLE_KV_TRACE=1` trace and no longer includes
+`llama-memory-hybrid-idx.h`. The compose package builds from installed A/B
+artifacts; do not add source-tree include paths for `ggml/include` or `src` to
+make it compile. The manifest remains historical and is not re-signed by this
+change.
+
+The real CPU qwen4exp fixture (`test-llama-archs -a qwen4exp`) exercises the
+query after a 128-token decode: it observes `attention_pos_max=127`,
+`indexer_pos_max=127`, `ple_next_pos=128`, and a nonempty PLE history, and it
+requires rejection of an unknown version, a zero `struct_size`, a negative
+sequence, and a null output.
