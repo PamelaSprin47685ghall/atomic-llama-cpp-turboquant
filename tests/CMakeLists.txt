@@ -1372,3 +1372,37 @@ add_test(NAME test-tp5-prefab-subenvelope COMMAND test-tp5-prefab-subenvelope)
 set_property(TEST test-tp5-prefab-subenvelope PROPERTY LABELS "cpu;tp5;prefab")
 set_property(TEST test-tp5-prefab-subenvelope PROPERTY PASS_REGULAR_EXPRESSION "PREFAB_SUBENVELOPE_TEST PASS")
 set_property(TEST test-tp5-prefab-subenvelope PROPERTY FAIL_REGULAR_EXPRESSION "^FAIL:")
+
+# TP5 HC replicated-compute switch regression. The default static-owner layout
+# must stay untouched; TP5_HC_REPLICATED_COMPUTE=1 must select the MIRRORED
+# local-compute split and log it; any other value must fail the load, and the
+# context-owner layout must reject the combination. The mock Qwen4Exp model and
+# Q8_0 HC pair need no GGUF and no GPU.
+add_executable(test-tp5-hc-replicated-compute test-tp5-hc-replicated-compute.cpp)
+target_link_libraries(test-tp5-hc-replicated-compute PRIVATE llama)
+target_include_directories(test-tp5-hc-replicated-compute PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME test-tp5-hc-replicated-compute-unset
+    COMMAND ${CMAKE_COMMAND} -E env --unset=TP5_HC_REPLICATED_COMPUTE
+        $<TARGET_FILE:test-tp5-hc-replicated-compute> off)
+add_test(NAME test-tp5-hc-replicated-compute-off
+    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=0
+        $<TARGET_FILE:test-tp5-hc-replicated-compute> off)
+add_test(NAME test-tp5-hc-replicated-compute-on
+    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=1
+        $<TARGET_FILE:test-tp5-hc-replicated-compute> on)
+add_test(NAME test-tp5-hc-replicated-compute-invalid
+    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=2
+        $<TARGET_FILE:test-tp5-hc-replicated-compute> invalid)
+add_test(NAME test-tp5-hc-replicated-compute-conflict
+    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=1 GGML_TP5_HC_CONTEXT_OWNER=1
+        $<TARGET_FILE:test-tp5-hc-replicated-compute> conflict)
+set_tests_properties(
+    test-tp5-hc-replicated-compute-unset
+    test-tp5-hc-replicated-compute-off
+    test-tp5-hc-replicated-compute-on
+    test-tp5-hc-replicated-compute-invalid
+    test-tp5-hc-replicated-compute-conflict
+    PROPERTIES LABELS "cpu;tp5"
+               PASS_REGULAR_EXPRESSION "TP5_HC_REPLICATED_COMPUTE_TEST PASS"
+               FAIL_REGULAR_EXPRESSION "FAIL "
+               TIMEOUT 60)
