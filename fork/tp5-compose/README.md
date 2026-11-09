@@ -687,6 +687,21 @@ is never restored as the new one. The native-trim path
 short capture, short restore, full acceptance, exception unwinding, zero size,
 and the shrink-after-invalidate and shrink-after-exception epoch sequences.
 
+With `GGML_TP5_MTP_ON_DEVICE_CHECKPOINT=1` the state flags are
+`LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`. The checkpoint object then retains only the
+metadata; the tensor snapshot lives in `ctx->mem_storage[seq_id]` and is owned
+by the context. The runtime captures once per verify epoch and consumes or
+invalidates the checkpoint before the next capture; a second ON_DEVICE capture
+for the same seq replaces that device snapshot. The device metadata carries a
+generation, so restoring the older metadata returns 0 instead of silently
+copying the newer tensors; the runtime also refuses to capture while a
+checkpoint is still live. The 512 MiB gate uses the full host state size for
+ON_DEVICE, not the metadata size, so the device copy is bounded by the same
+limit. A restore without a matching device snapshot returns 0 from
+`llama_state_seq_set_data_ext` and the runtime fails with a clear error; it does
+not abort. The class cannot validate the device bytes, so the rejected-prefix
+replay KL check remains the content guard.
+
 ## MTP target greedy cache (2026-11-09)
 
 The MTP verify epoch caches each target logits row's

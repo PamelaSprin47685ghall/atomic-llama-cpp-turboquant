@@ -2481,9 +2481,17 @@ run_result run(const options & requested) {
                             // qualified full host sequence snapshot.
                             std::size_t state_sz=0;
                             if(!mtp_native_trim) {
+                                require(!target_state_checkpoint.is_valid(),
+                                        "MTP target checkpoint still live before capture");
                                 state_sz=llama_state_seq_get_size_ext(ctx,0,checkpoint_flags);
-                                require(state_sz>0 && state_sz<=(512ull<<20),
-                                        "MTP valid full GDN+KV checkpoint unavailable");
+                                // ON_DEVICE returns metadata only; the tensor
+                                // copy lives in ctx->mem_storage[seq]. Bound
+                                // that copy by the full host state size.
+                                const std::size_t gate_sz = mtp_device_snapshot
+                                    ? llama_state_seq_get_size_ext(ctx,0,LLAMA_STATE_SEQ_FLAGS_NONE)
+                                    : state_sz;
+                                require(state_sz>0 && gate_sz>0 && gate_sz<=(512ull<<20),
+                                        "MTP valid full GDN+KV checkpoint unavailable or exceeds 512 MiB");
                                 // capture records state_sz as this epoch's
                                 // valid length; the retained storage may be
                                 // larger after a shrink.

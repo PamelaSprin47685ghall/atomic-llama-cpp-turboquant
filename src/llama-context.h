@@ -675,6 +675,9 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+    // generation of each device snapshot; a later capture for the same seq
+    // replaces mem_storage[seq], so older metadata must not restore it
+    std::map<llama_seq_id, std::uint64_t> mem_storage_gen;
 
     bool has_evaluated_once = false;
     // Observation state for the last memory_update(): failed distinguishes a

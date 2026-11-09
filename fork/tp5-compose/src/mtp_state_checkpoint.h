@@ -1,11 +1,24 @@
 #pragma once
 
-// Host snapshot of one MTP target sequence state (attention KV plus the hybrid
-// GDN recurrent state). The storage survives across verify epochs. The current
-// snapshot size and an explicit valid flag identify the bytes that belong to
-// this epoch, so a buffer that still holds an older, larger snapshot is never
-// restored as the new one. The storage grows only when the new snapshot is
-// larger; a same-size or smaller snapshot reuses it without zero-filling.
+// Checkpoint storage for one MTP target sequence state. With host state flags
+// the retained storage owns the complete snapshot (attention KV plus the hybrid
+// GDN recurrent state). With LLAMA_STATE_SEQ_FLAGS_ON_DEVICE the retained
+// storage owns only the metadata written by llama_state_seq_get_data_ext; the
+// tensor bytes live in ctx->mem_storage[seq_id] and are owned by the context.
+// In device mode this class cannot see or validate that device copy: the caller
+// must keep the context alive and must not overwrite the device snapshot
+// between capture and restore. A second ON_DEVICE capture for the same seq
+// replaces mem_storage[seq]; the device metadata carries a generation, so
+// restoring the older metadata returns 0 from llama_state_seq_set_data_ext
+// instead of silently copying the newer tensors. The current size and valid
+// flag identify the bytes in this object's storage only; they do not identify
+// the device snapshot.
+//
+// The storage survives across verify epochs. The current snapshot size and an
+// explicit valid flag identify the bytes that belong to this epoch, so a buffer
+// that still holds an older, larger snapshot is never restored as the new one.
+// The storage grows only when the new snapshot is larger; a same-size or
+// smaller snapshot reuses it without zero-filling.
 
 #include <cstddef>
 #include <cstdint>

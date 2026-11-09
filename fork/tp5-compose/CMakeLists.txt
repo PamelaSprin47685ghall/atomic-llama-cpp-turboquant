@@ -96,6 +96,10 @@ if(BUILD_TESTING)
     target_include_directories(tq_tp5_mtp_checkpoint_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME tq-tp5-mtp-state-checkpoint COMMAND tq_tp5_mtp_checkpoint_tests)
+    add_executable(tq_tp5_mtp_state_real_tests tests/test-mtp-state-real.cpp)
+    target_compile_features(tq_tp5_mtp_state_real_tests PRIVATE cxx_std_17)
+    target_link_libraries(tq_tp5_mtp_state_real_tests PRIVATE llama)
+    add_test(NAME tq-tp5-mtp-state-real COMMAND tq_tp5_mtp_state_real_tests)
     add_executable(tq_tp5_mtp_greedy_cache_tests tests/test-mtp-greedy-cache.cpp)
     target_compile_features(tq_tp5_mtp_greedy_cache_tests PRIVATE cxx_std_17)
     target_include_directories(tq_tp5_mtp_greedy_cache_tests PRIVATE

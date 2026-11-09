@@ -8830,6 +8830,11 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
     try {
         io.write(&io_magic, sizeof(io_magic));
         io.write(&seq_id, sizeof(seq_id));
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            // fixed-size placeholder; get_data writes the real generation
+            const std::uint64_t generation = 0;
+            io.write(&generation, sizeof(generation));
+        }
 
         return state_seq_write_data(io, seq_id, flags);
     } catch (const std::exception & err) {
@@ -8849,6 +8854,10 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     try {
         io->write(&io_magic, sizeof(io_magic));
         io->write(&seq_id, sizeof(seq_id));
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            const std::uint64_t generation = ++mem_storage_gen[seq_id];
+            io->write(&generation, sizeof(generation));
+        }
 
         return state_seq_write_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
@@ -8862,27 +8871,40 @@ size_t llama_context::state_seq_set_data(llama_seq_id          seq_id,
                                          size_t                size,
                                          llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_read_i> io;
-    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        // create a temporary io to read the magic and the src seq_id
-        io = std::make_unique<llama_io_read_host>(src, size);
-
-        uint32_t magic_read;
-        io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
-            throw std::runtime_error("wrong sequence state magic");
-        }
-
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
-
-        GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
-
-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
-    } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
-    }
-
     try {
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            // Read the metadata header first. The device tensor copy lives in
+            // mem_storage[seq_id]; a restore without a prior capture must fail
+            // with 0 instead of aborting.
+            auto header = std::make_unique<llama_io_read_host>(src, size);
+
+            uint32_t magic_read;
+            header->read(&magic_read, sizeof(magic_read));
+            if (io_magic != magic_read) {
+                throw std::runtime_error("wrong sequence state magic");
+            }
+
+            llama_seq_id seq_id_read;
+            header->read(&seq_id_read, sizeof(seq_id_read));
+
+            std::uint64_t generation_read = 0;
+            header->read(&generation_read, sizeof(generation_read));
+
+            const auto it = mem_storage.find(seq_id_read);
+            if (it == mem_storage.end()) {
+                LLAMA_LOG_ERROR("%s: no device snapshot for seq %d\n", __func__, seq_id_read);
+                return 0;
+            }
+            if (mem_storage_gen[seq_id_read] != generation_read) {
+                LLAMA_LOG_ERROR("%s: device snapshot for seq %d was overwritten\n", __func__, seq_id_read);
+                return 0;
+            }
+
+            io = std::make_unique<llama_io_read_device>(src, size, it->second);
+        } else {
+            io = std::make_unique<llama_io_read_host>(src, size);
+        }
+
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
         if (io_magic != magic_read) {
@@ -8891,6 +8913,10 @@ size_t llama_context::state_seq_set_data(llama_seq_id          seq_id,
 
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            std::uint64_t generation_read = 0;
+            io->read(&generation_read, sizeof(generation_read));
+        }
 
         return state_seq_read_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
