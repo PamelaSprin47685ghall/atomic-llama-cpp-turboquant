@@ -353,6 +353,52 @@ host-pool test and its CMake wiring only. A future caller that passes a
 value larger than the init capacity would still read past `seq_id`,
 because `llama_batch` does not store the capacity.
 
+### B7. Synchronous Meta source identity round 2026-11-09
+
+Base `2dda3c6fa`. Cherry-picks `0969d889a` -> `d384aaae1` from
+`feat/pillar5-refine-sync-src-identity`. One code conflict remained in the
+`GGML_BACKEND_SPLIT_AXIS_MIRRORED` eligibility hunk of
+`ggml/src/ggml-backend-meta.cpp`: the target's v3/rejection-aggregation
+comment and the source's `staging_meta` shape check touched the same lines.
+The resolution keeps the destination-copy warning and adds the source
+identity path. The test file conflicted only on the fake-table comment; the
+v3 comment and `kind_count = kKindCount` are kept. Docs and CMake merged.
+
+The source branch's fake table was v2; the integrated
+`tests/test-tp5-staging-sync-src.cpp` now initializes the v3 `kind_count`
+and describes the table as v3. A destination view
+(`dst->view_src != nullptr`) is rejected by the `cpy_tensor` preflight and
+falls back to `set_tensor` at its offset. A fatal or partial submission is
+sticky: `ggml_backend_tensor_copy` is `void`, the public
+`submission_pending`/`submission_error` state carries the fault, the next
+graph compute returns `GGML_STATUS_FAILED`, and the blocking fallback never
+replays the destination.
+
+Manifest disposition: no digest was updated or added. The five changed
+paths are red items; the existing B5/B6 entries for `docs` and
+`ggml-backend-meta.cpp` were already stale and stay at their recorded
+digests. `ggml-backend.cpp` matched its parent manifest before this round
+but is not signed now; `tests/CMakeLists.txt` was already stale; the new
+test has no entry.
+
+| path | parent manifest at 2dda3c6fa | current actual | disposition |
+|---|---|---|---|
+| `docs/tp5-staging-submission.md` | `9b5a226c66d9e76317dae10b06849d13e35448b55d2d3910c5dc6e2f1b3e8bca` | `d7a8d24f07b932d043ff78e09a483000319834b99a5ff7445a4e61dc96fede20` | already-stale red item; not re-signed |
+| `ggml/src/ggml-backend-meta.cpp` | `30086f0db3ed3d29be3652eef950fa850e6ccaa9fef561715ca93444aa5134a3` | `6e1f907ad24161cb25c1d643318d9952fef085a9af8baa645362256dbdf9a158` | already-stale red item; not re-signed |
+| `ggml/src/ggml-backend.cpp` | `325d55028535ca47823cf7ceaa95f185101857cd11b8549b73c70536d249cfcb` | `20ffa660f6db39485d24b1c22a22117fb03966f5b02d91b6cafb21331151b45e` | parent-matched, now red; not signed |
+| `tests/CMakeLists.txt` | `9a94fd693d250398dd67475384024d4f24d5f721eef206c8a64d1e82dc4f4bca` | `10430b1d117a9d7f62dcfcdb019abfaa97aaee0b94f2992e2fc11afd425752e2` | already-stale red item; not re-signed |
+| `tests/test-tp5-staging-sync-src.cpp` | no entry | `6cea0b6b4533b46b8c19ea14994ac12cb8498b0e0c5e7d8093b88273986301af` | new/unregistered red item |
+
+Verification: built `test-tp5-staging-sync-src` from this tree against the
+integrated `ggml` and ran it once. Result:
+`TP5_STAGING_SYNC_SRC_TEST PASS`, exit 0. No GPU, full suite, other
+staging tests, or guard rerun.
+
+Known uncovered boundary: the test uses the fake staging table and CPU Meta
+children; it does not exercise a real HIP provider, the async lane, or a
+full scheduler/model run. The other staging tests were not rerun. The guard
+was not rerun; the red items above remain, so this integration is not clean.
+
 ## C. Pre-existing undeclared A paths
 
 172 paths remain undeclared after registering the WS2/WS3/WS4/WS5 paths.
