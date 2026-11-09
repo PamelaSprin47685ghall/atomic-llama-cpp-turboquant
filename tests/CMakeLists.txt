@@ -1547,8 +1547,9 @@ endif()
 # TP5 HC replicated-compute switch regression. The default static-owner layout
 # must stay untouched; TP5_HC_REPLICATED_COMPUTE=1 must select the MIRRORED
 # local-compute split and log it; any other value must fail the load, and the
-# context-owner layout must reject the combination. The mock Qwen4Exp model and
-# Q8_0 HC pair need no GGUF and no GPU.
+# context-owner layout must reject the combination. The private MTP-only model
+# keeps its BF16 nextn HC block and must stay on the static-owner path. The mock
+# Qwen4Exp models and HC pairs need no GGUF and no GPU.
 add_executable(test-tp5-hc-replicated-compute test-tp5-hc-replicated-compute.cpp)
 target_link_libraries(test-tp5-hc-replicated-compute PRIVATE llama)
 target_include_directories(test-tp5-hc-replicated-compute PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -1567,12 +1568,25 @@ add_test(NAME test-tp5-hc-replicated-compute-invalid
 add_test(NAME test-tp5-hc-replicated-compute-conflict
     COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=1 GGML_TP5_HC_CONTEXT_OWNER=1
         $<TARGET_FILE:test-tp5-hc-replicated-compute> conflict)
+add_test(NAME test-tp5-hc-replicated-compute-mtp
+    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=1
+        $<TARGET_FILE:test-tp5-hc-replicated-compute> mtp)
+add_test(NAME test-tp5-hc-replicated-compute-policy
+    COMMAND ${CMAKE_COMMAND} -E env TP5_HC_REPLICATED_COMPUTE=1
+        $<TARGET_FILE:test-tp5-hc-replicated-compute> policy)
+add_test(NAME test-tp5-hc-replicated-compute-validate
+    COMMAND ${CMAKE_COMMAND} -E env --unset=GGML_TP5_HC_Q8_WEIGHTS --unset=GGML_TP5_HC_Q4_WEIGHTS
+        TP5_HC_REPLICATED_COMPUTE=1
+        $<TARGET_FILE:test-tp5-hc-replicated-compute> validate)
 set_tests_properties(
     test-tp5-hc-replicated-compute-unset
     test-tp5-hc-replicated-compute-off
     test-tp5-hc-replicated-compute-on
     test-tp5-hc-replicated-compute-invalid
     test-tp5-hc-replicated-compute-conflict
+    test-tp5-hc-replicated-compute-mtp
+    test-tp5-hc-replicated-compute-policy
+    test-tp5-hc-replicated-compute-validate
     PROPERTIES LABELS "cpu;tp5"
                PASS_REGULAR_EXPRESSION "TP5_HC_REPLICATED_COMPUTE_TEST PASS"
                FAIL_REGULAR_EXPRESSION "FAIL "
