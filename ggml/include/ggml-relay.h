@@ -99,8 +99,13 @@ struct ggml_relay_event_v2 {
 // not host launch API calls. Neither counter proves native completion.
 // sealed is true only for an epoch whose finish completed without a failure.
 // finish clears it when its plan-pin release or final observation fails, so a
-// true submit return is the only continuation permit. A later asynchronous
-// failure may set failed after sealed was observed; failed is sticky.
+// true submit return is the only continuation permit. finish/publish success
+// publication and abort()'s sticky abort claim share one lock-free atomic
+// claim word: a success CAS that increments first is ordered before a later
+// abort; an abort fetch_or that sets the sticky bit first makes the success
+// CAS fail. snapshot() reads the claim with a no-op CAS. The claim orders abort
+// against host success publication; general fail() is provider-mutex ordered.
+// failed is sticky.
 struct ggml_relay_status {
     uint32_t abi_version;
     uint32_t ranks;
@@ -169,6 +174,11 @@ GGML_API int  ggml_backend_relay_poll_v2(
 GGML_API bool ggml_backend_relay_publish_v2(
         ggml_backend_t backend, const struct ggml_relay_event_v2 * event, size_t event_size);
 // Sticky failure: stop normal publication and make bounded device waits exit.
+// abort() is wait-free: two RMWs (one pending-error CAS and one fetch_or to
+// set the sticky abort bit), then the device abort word is published. It takes
+// no host lock and never waits for another thread or a HIP
+// launch/JIT/EventRecord holder. The backend must outlive this call, as for
+// any ggml_backend_t operation; the claim does not protect object lifetime.
 GGML_API void ggml_backend_relay_abort(ggml_backend_t backend, int32_t error_code);
 
 // Pillar 5: describe the next relay plan before its graph is submitted.

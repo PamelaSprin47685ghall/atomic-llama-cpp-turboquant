@@ -22,7 +22,9 @@ struct ggml_relay_provider_i {
     // warmup, complete-epoch capture/replay and native acceptance/drain. A
     // failure never permits a caller to continue execution on another path.
     // A true return is the only continuation permit: the provider clears
-    // sealed if its plan-pin release or final observation fails.
+    // sealed if its plan-pin release or final observation fails. finish
+    // claims a success on the lock-free abort claim word; an abort that claims
+    // first makes it fail, an abort after the claim is a later failure.
     bool (*submit)(void * provider, ggml_cgraph * const * graphs, size_t stages);
     int (*poll)(void * provider, ggml_relay_event * event);
     bool (*publish)(void * provider, const ggml_relay_event * event);

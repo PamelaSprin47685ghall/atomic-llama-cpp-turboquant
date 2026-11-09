@@ -26,7 +26,14 @@ constexpr uint32_t ranks = GGML_RELAY_RANKS;
 // Keep native-tail evidence for that actual lane only; HIP hardware queue
 // assignment remains a runtime property, not a promise made by this count.
 constexpr uint32_t lanes_per_rank = 1;
-static_assert(std::atomic<int32_t>::is_always_lock_free, "relay abort must never acquire a hidden host lock");
+static_assert(std::atomic<int32_t>::is_always_lock_free,
+              "relay abort's status atomic must stay lock-free");
+static_assert(std::atomic<uint64_t>::is_always_lock_free,
+              "relay abort's claim atomic must stay lock-free");
+// Bit 63 is the sticky abort claim; bits 0..62 are the host-success counter.
+// Both abort() and the host success paths use compare-exchange on this one
+// atomic, so its modification order is the abort/success linearization order.
+constexpr uint64_t abort_claim_bit = uint64_t(1) << 63;
 constexpr uint32_t all_ranks        = (1u << ranks) - 1;
 // Swift needs 36 recurrent-output, 48 expert-output and 97 HC joins. Reserve a
 // fixed bound before submission; unused slots never become active transfers.
@@ -380,6 +387,12 @@ struct provider {
     }
 
     std::mutex                            mutex;
+    // Single lock-free abort/success claim. abort() sets the sticky bit with a
+    // CAS; finish()/publish() increment the success counter with a CAS only
+    // while the bit is clear. The CAS modification order decides whether an
+    // abort is before or after a host success publication. snapshot() uses a
+    // no-op CAS to linearize its abort read. No thread waits on a lock here.
+    std::atomic<uint64_t>                  abort_claim{ 0 };
     // Ordinary CPU memory, never mapped to a device or used for GPU RMW.
     std::atomic<int32_t>                  pending_abort{ 0 };
     // Idle event workers must not contend with the next submit snapshot.
@@ -488,12 +501,39 @@ void retain(provider * p) {
     retained         = p;
 }
 
+// Read the abort/success claim with a no-op read-modify-write. A plain load
+// could read an older value without a happens-before edge; the RMW reads the
+// modification order and is the linearization point for snapshot().
+uint64_t read_abort_claim(provider & p) noexcept {
+    uint64_t state = p.abort_claim.load(std::memory_order_relaxed);
+    while (!p.abort_claim.compare_exchange_weak(state, state,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+    return state;
+}
+
+// Read the pending abort error with a no-op RMW. Used before prepare/submit
+// mutations and before begin() pins a plan, so an abort request that is
+// ordered before the check fails closed before any provider mutation.
+int32_t read_pending_abort(provider & p) noexcept {
+    int32_t state = p.pending_abort.load(std::memory_order_relaxed);
+    while (!p.pending_abort.compare_exchange_weak(state, state,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+    return state;
+}
+
 void fail(provider & p, int code, const char * message) {
     p.event_status.store(-1, std::memory_order_release);
     if (!p.status.failed) {
-        const int32_t aborted = p.pending_abort.load(std::memory_order_acquire);
+        // Only a claimed abort may attribute this failure to the host abort.
+        // A pending error that has not claimed the sticky bit is still an
+        // in-progress abort; a concurrent non-abort failure keeps its own
+        // code/message.
+        const bool aborted = (read_abort_claim(p) & abort_claim_bit) != 0;
+        const int32_t error = aborted ? p.pending_abort.load(std::memory_order_acquire) : 0;
         p.status.failed       = true;
-        p.status.error_code   = aborted ? aborted : (code ? code : EIO);
+        p.status.error_code   = error ? error : (code ? code : EIO);
         snprintf(p.status.error, sizeof(p.status.error), "%s", aborted ? "relay aborted by host" : message);
     }
     if (p.abort_host) {
@@ -502,10 +542,62 @@ void fail(provider & p, int code, const char * message) {
 }
 
 void consume_abort(provider & p) {
-    const int32_t error = p.pending_abort.load(std::memory_order_acquire);
-    if (error) {
-        fail(p, error, "relay aborted by host");
+    if ((p.abort_claim.load(std::memory_order_acquire) & abort_claim_bit) == 0) {
+        return;
     }
+    const int32_t error = p.pending_abort.load(std::memory_order_acquire);
+    fail(p, error ? error : ECANCELED, "relay aborted by host");
+}
+
+// True when an abort is already claimed or its pending error is published.
+// The two no-op RMW reads give the check a modification-order point. This is
+// called before prepare/submit mutations and before begin() pins a plan.
+bool abort_requested(provider & p) {
+    if (read_abort_claim(p) & abort_claim_bit) {
+        consume_abort(p);
+        return true;
+    }
+    const int32_t pending = read_pending_abort(p);
+    if (pending) {
+        fail(p, pending, "relay aborted by host");
+        return true;
+    }
+    return false;
+}
+
+// Claim one host success (finish or publish). The CAS on abort_claim is the
+// linearization point: if abort set the sticky bit first, the CAS reads it and
+// fails; if this CAS increments first, abort's later CAS sets the bit after
+// this success. The 63-bit counter cannot wrap before 2^63 successes; fail
+// closed if it would.
+bool claim_host_success(provider & p) {
+    uint64_t state = p.abort_claim.load(std::memory_order_relaxed);
+    for (;;) {
+        if (state & abort_claim_bit) {
+            return false;
+        }
+        if ((state & ~abort_claim_bit) == ~abort_claim_bit) {
+            fail(p, EOVERFLOW, "relay abort claim counter exhausted");
+            return false;
+        }
+        if (p.abort_claim.compare_exchange_weak(state, state + 1,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
+    }
+}
+
+// Claim the sticky abort bit with one fetch_or RMW. The pending-error CAS is
+// a read-modify-write: the first abort stores its code, later aborts read it
+// with acquire, and the fetch_or release publishes that first error to any
+// reader that sees the bit. fetch_or is a single RMW with no retry loop, so
+// abort is wait-free with respect to host lock holders and other aborts.
+void claim_host_abort(provider & p, int32_t error) {
+    int32_t expected = 0;
+    p.pending_abort.compare_exchange_strong(expected, error ? error : ECANCELED,
+                                            std::memory_order_release,
+                                            std::memory_order_acquire);
+    p.abort_claim.fetch_or(abort_claim_bit, std::memory_order_acq_rel);
 }
 
 bool checked(provider & p, hipError_t error, const char * operation) {
@@ -1411,6 +1503,9 @@ bool plan_generation_for(provider & p, const ggml_relay_plan_key * key, size_t c
 bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, const ggml_relay_plan_key * key) {
     auto &                      p = *static_cast<provider *>(opaque);
     std::lock_guard<std::mutex> lock(p.mutex);
+    if (abort_requested(p)) {
+        return false;
+    }
     if (!idle(p) || p.status.failed) {
         return false;
     }
@@ -1536,6 +1631,9 @@ bool prepare_ex(void * opaque, ggml_tensor * const * terminals, size_t count, co
 }
 
 bool begin(provider & p) {
+    if (abort_requested(p)) {
+        return false;
+    }
     if (!idle(p) || p.status.failed || p.status.channels == 0) {
         return false;
     }
@@ -1783,13 +1881,6 @@ bool finish(provider & p) {
     }
     p.active = false;
     consume_abort(p);
-    p.status.sealed = !p.status.failed;
-    if (p.status.sealed) {
-        p.event_status.store(1, std::memory_order_release);
-    }
-    if (p.status.sealed && p.mode == submission::direct) {
-        p.current->warmed = true;
-    }
     if (p.plan_pinned) {
         p.plan_pinned = false;
         if (!p.plan_cache.release(p.status.plan_generation)) {
@@ -1797,14 +1888,28 @@ bool finish(provider & p) {
         }
     }
     observe(p);
-    if (p.status.failed) {
-        // The plan-pin release and this final observation run after sealed and
-        // event_status were set. A failure here must not return a sealed
-        // epoch: fail() already set event_status=-1, so clear sealed too. A
-        // true return then always means the epoch is sealed and publishable.
+    // The abort claim CAS is the host success linearization point. If abort
+    // set the sticky bit first, this CAS reads it and fails; if this CAS
+    // increments first, a later abort sets the bit after this success. A true
+    // return is a point-in-time success, not immunity to a later abort.
+    bool sealed = false;
+    if (!p.status.failed) {
+        p.status.sealed = true;
+        p.event_status.store(1, std::memory_order_release);
+        if (claim_host_success(p)) {
+            sealed = true;
+            if (p.mode == submission::direct) {
+                p.current->warmed = true;
+            }
+        } else {
+            p.status.sealed = false;
+            p.event_status.store(-1, std::memory_order_release);
+            consume_abort(p);
+        }
+    } else {
         p.status.sealed = false;
     }
-    return p.status.sealed;
+    return sealed;
 }
 
 template<typename... T> void describe(provider & p, const T &... values) {
@@ -1942,6 +2047,9 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
     const int64_t d0=ggml_time_us();
     std::lock_guard<std::mutex> lock(p.mutex);
     const int64_t dlock=ggml_time_us();
+    if (abort_requested(p)) {
+        return false;
+    }
     if (!idle(p) || p.status.failed || !graphs || stages != p.status.channels + 1) {
         return false;
     }
@@ -2155,7 +2263,8 @@ int poll_event(void * opaque, Event * event) {
             return -1; // Never expose packed bytes as float pointers.
         }
     }
-    if (p.pending_abort.load(std::memory_order_acquire)) {
+    if ((p.abort_claim.load(std::memory_order_acquire) & abort_claim_bit) ||
+        p.pending_abort.load(std::memory_order_acquire)) {
         return -1;
     }
     // The count is a lock-free hint; the queue itself is read under p.mutex.
@@ -2281,8 +2390,12 @@ bool publish_event(void * opaque, const Event * event) {
     if (p.status.failed || !p.status.sealed || !c.offered || c.published) {
         return false;
     }
-    if (load(p.abort_host)) {
-        fail(p, ECANCELED, "relay publication canceled by host abort");
+    // Claim this publication on the abort/success word. The CAS is the
+    // publication linearization: an abort that claimed first makes this fail;
+    // an abort that claims after is a later failure. The generation store is
+    // the publication effect and follows the claim.
+    if (!claim_host_success(p)) {
+        consume_abort(p);
         return false;
     }
     c.published = true;
@@ -2312,23 +2425,31 @@ bool snapshot(void * opaque, ggml_relay_status * status) {
     if (!lock.owns_lock()) {
         return false;
     }
-    // A settled snapshot: the current epoch's native tails finished, every
-    // output of that epoch was released, and no event is pending. Epoch 0 is
-    // settled by definition (channels == outputs_released == 0; observe()
-    // returns after consume_abort). For epoch > 0, prepare may change
-    // status.channels before begin without touching outputs_released, so the
-    // explicit count comparison is required: it proves every channel of the
-    // current epoch was released, not only the previous epoch's channels.
-    // When the condition holds, observe() would skip every channel and only
-    // re-OR the completed mask; consume_abort() still catches a host abort
-    // that appeared before this lock.
-    if (p.status.finished && p.event_status.load(std::memory_order_acquire) == 0 &&
-        p.outputs_released == p.status.channels) {
+    // Linearize the abort read with a no-op CAS on abort_claim. An abort that
+    // claimed before this point is visible through the claim word's
+    // modification order; an abort that claims after is a later failure. A
+    // settled snapshot has finished native tails, every output of the current
+    // epoch released, and event_status==0. Epoch 0 is settled by definition;
+    // after prepare, status.channels may change before begin without touching
+    // outputs_released, so the explicit count comparison is required.
+    if (read_abort_claim(p) & abort_claim_bit) {
         consume_abort(p);
         *status = p.status;
         return true;
     }
+    if (p.status.failed) {
+        *status = p.status;
+        return true;
+    }
+    if (p.status.finished && p.event_status.load(std::memory_order_acquire) == 0 &&
+        p.outputs_released == p.status.channels) {
+        *status = p.status;
+        return true;
+    }
     observe(p);
+    if (read_abort_claim(p) & abort_claim_bit) {
+        consume_abort(p);
+    }
     *status = p.status;
     return true;
 }
@@ -2369,15 +2490,17 @@ void abort(void * opaque, int32_t error) {
         return;
     }
     auto & p = *static_cast<provider *>(opaque);
-    // Owner lifetime is externally serialized against destroy. This pointer
-    // remains immutable while native work can exist; never wait for a HIP
-    // launch/JIT/EventRecord holder before releasing device-side waits.
+    // Owner lifetime is externally serialized against destroy; the claim word
+    // does not protect lifetime. This path is wait-free: the pending-error RMW
+    // stores the first error, then one fetch_or sets the sticky abort bit.
+    // The device abort word is published only after that claim, so a host
+    // success claim that wins the RMW order is before this abort, and a host
+    // claim that loses sees the bit. Abort never takes the provider mutex or
+    // any other host lock and never waits for another thread or a HIP holder.
+    claim_host_abort(p, error);
     if (p.abort_host) {
         store(p.abort_host, 1);
     }
-    int32_t expected = 0;
-    p.pending_abort.compare_exchange_strong(expected, error ? error : ECANCELED, std::memory_order_release,
-                                            std::memory_order_relaxed);
     p.event_status.store(-1, std::memory_order_release);
     std::unique_lock<std::mutex> lock(p.mutex, std::try_to_lock);
     if (lock.owns_lock()) {

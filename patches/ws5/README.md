@@ -196,8 +196,104 @@ false; `fail()` has already set `event_status = -1`. A true submit return is
 therefore the only permission to continue, and a false return must not be
 replayed. The caller aborts the epoch; native owners stay retained until
 completion is proved (`idle()` still requires `finished`, and `destroy()`
-retains an unproved owner). A later asynchronous failure can set `failed`
-after `sealed` was observed; `failed` is sticky and `poll()` then returns -1.
+retains an unproved owner).
+
+`finish()` and `publish()` claim a host success by compare-exchange on one
+64-bit `abort_claim` word: bit 63 is the sticky abort bit, bits 0..62 are a
+host-success counter. `abort()` stores the first pending error with a CAS,
+then sets bit 63 with one `fetch_or` RMW on the same word; only after that
+claim does it publish `abort_host`/`event_status`. The RMW modification order
+is the abort/success linearization order:
+
+* if abort's `fetch_or` sets the bit before a finish/publish success CAS, that
+  CAS reads the bit and fails;
+* if the success CAS increments the counter first, abort's later `fetch_or`
+  reads the success and sets the bit after it, so the success is ordered
+  before the later abort.
+
+This is a linearization order, not a wall-clock guarantee: an operation that
+starts after an abort's `fetch_or` returns can still be ordered before it in
+the RMW modification order without a happens-before edge. The lock-free
+contract is the RMW order; a caller that needs wall-clock ordering must add its
+own synchronization.
+
+`finish()`/`publish()` are serialized by the provider mutex; abort is the only
+concurrent writer of the claim. The counter cannot wrap before 2^63
+successes; the code fails closed if it would.
+
+The first abort error is sticky: `pending_abort` transitions only 0 -> error
+with a CAS; later aborts read the first value. The claim RMW is a release and
+a reader that sees the bit with an acquire load/RMW synchronizes with it and
+sees the pending error. `snapshot()` reads the claim with a no-op CAS (an RMW),
+not a plain load, so its abort read has a modification-order linearization
+point: an abort that claimed first is visible; an abort that claims after is a
+later failure. A snapshot that linearizes before a later abort may return a
+status that was true at that point even if the abort publishes its device word
+before the caller observes the status.
+
+Abort is wait-free: exactly two RMWs (one pending-error CAS plus one
+`fetch_or`), no retry loop, no host mutex, and no wait for another thread or a
+HIP launch/JIT/EventRecord holder. The device abort word is published after the
+claim RMW, not before, so a host success CAS cannot be ordered after an
+already-published device abort. A success CAS that wins is ordered before a
+later abort; a later abort can still set `failed` and publish the device word
+after a true return. The true return is a point-in-time success, not immunity
+to a later abort.
+
+The claim word orders abort against finish/publish success publication.
+General `fail()` (GPU/protocol errors) is not a host success claim; its status
+publication is ordered by the provider mutex. It reads the claim word with a
+no-op RMW only to attribute an already-claimed abort, not an abort whose
+pending error is still in progress. Do not generalize the claim to all
+failures. `poll()` is an event fast path: it checks
+the claim bit with a plain load and may return an event that `publish()`'s
+claim then rejects; it is not a success publication.
+
+The provider is fail-stop. `fail()` sets `status.failed` and no path clears
+it; `prepare()`, `submit()` and `begin()` reject it; `create()` allocates a new
+provider and `destroy()` deletes it. The Meta backend creates the provider in
+its constructor. On free, a submission-failed owner or a failed `destroy`
+retains the whole Meta owner instead of destroying it; only a successful
+destroy deletes the provider. Either way the old provider is not reused, and
+there is no `clear` or re-prepare path. A new backend/provider does not make
+old caller-owned source/destination buffers reusable: those buffers must wait
+for real native completion or remain isolated/retained with the old owner.
+The sticky abort claim matches that existing contract: a new run needs a new
+backend/provider, not a reset. This is not a new reuse prohibition.
+
+`prepare()`/`submit()` check the claim and pending error with no-op RMW reads
+before any plan-cache mutation or plan pin; `begin()` repeats the check before
+pinning. If an abort's pending CAS or claim RMW is ordered before that check,
+the operation fails before any plan-cache mutation or plan pin; `fail()` itself
+still updates `status`/`event_status`/`abort_host`. If the check is ordered
+first, the prepare/submit is linearized before the abort; its later mutations
+or pin are part of that earlier operation. A plan pin taken after the check is
+released by `finish()` on the same submit path even when the abort claim makes
+finish fail. This is the RMW-order definition, not a wall-clock promise: a
+prepare/submit that starts after an abort request without a happens-before
+edge can still be ordered before it.
+
+If a submit is abandoned after `begin()` pinned a plan and before `finish()`
+releases it, `destroy()`/`flush_all_plans()` refuses while the plan is pinned
+and the Meta owner is retained. The old caller-owned buffers stay with that
+retained owner and are not reusable by a new provider. This is a retention
+path, not a GPU completion claim.
+
+`abort()` requires the backend to outlive the call, as for any
+`ggml_backend_t` operation; the claim word protects ordering, not object
+lifetime. The in-tree callers keep it alive: `llama_free()` calls abort before
+deciding to retain the whole context (and retains it on abort), and
+`relay_service::abort_all()` runs from service/worker/watchdog paths while the
+service and its backends are alive, with the service destructor joining its
+threads before the owner frees the backends. No extra abort-specific caller
+synchronization is required beyond that backend lifetime.
+
+The abort/finish/snapshot/publish interleaving is not runtime-tested: finish
+and the claim paths are private to the HIP provider and no host seam exists.
+Device abort-word visibility and the RMW concurrency are also not
+runtime-tested. Verification is the `relay.hip` HIP compile plus the static
+RMW-order, call/owner audit; a real behavior test needs a HIP fault-injection
+seam and is not present.
 
 ## Plan identity: coarse llama key + terminal binding digest
 

@@ -974,6 +974,36 @@ forcing or a draft context, and it does not prove runtime/draft/teacher or
 GPU/end-to-end MTP behavior. No GPU, full suite or guard rerun. The five
 changed paths have no manifest entry, so no digest was updated.
 
+### E.10 Relay abort lock-free claim round 2026-11-09
+
+Cherry-pick the final reviewed net effect `09044ca64` -> `cd319f4ad`
+(the requested `9f310f9f` is the clean ancestor; t12 reviewed the later
+`abort_requested` code at `762b83642`, and `cd319f4ad` changes only README
+wording). The abort path is a lock-free claim: one 64-bit `abort_claim` word
+holds the sticky abort bit and the host-success counter. `finish()`/`publish()`
+claim a success by CAS; `abort()` stores the first pending error and sets the
+sticky bit with one `fetch_or`; `snapshot()` uses a no-op CAS.
+`prepare()`/`submit()`/`begin()` check the claim and pending error before any
+plan-cache mutation or plan pin. First abort error is sticky, the provider is
+fail-stop, and a new provider does not make old caller buffers reusable.
+
+The public relay ABI 1 is unchanged: the header changes are comments only, no
+struct layout or function signature changed. No shim was added. The existing
+finish/sealed fix, graph-UID documentation, install-isolation annotations,
+checkpoint/T3/ledger changes and other merged features are preserved.
+
+Manifest: `ggml/include/ggml-relay.h`, `ggml/src/ggml-cuda/relay.hip`,
+`ggml/src/ggml-relay-impl.h` and `patches/ws5/README.md` matched their
+baseline digests and were reviewed; their hashes are updated. Other stale
+entries keep their old digests.
+
+Verification boundary: the documented evidence is the `relay.hip` HIP gfx1030
+compile plus static RMW-order, call and owner audits. Device abort-word
+visibility and RMW concurrency were not run; no runtime abort/finish behavior
+test exists. Old caller-owned buffers still wait for real native completion or
+remain retained with the old owner; this is retention, not a GPU completion
+claim. No GPU, full suite or guard rerun.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure
