@@ -595,3 +595,6 @@ row bounds. It does not compile or execute runtime.cpp and does not prove the
 runtime wiring, the runtime cancellation/exception path,
 `no_sync_logits_calls`, `capture_logits`, or the real end-to-end. Those remain
 unverified here (no GPU/full).
+
+The unit target has 32 checks; the reviewed unit run is 32 PASS / 0 FAIL. The
+real MTP runtime and GPU path were not run.
