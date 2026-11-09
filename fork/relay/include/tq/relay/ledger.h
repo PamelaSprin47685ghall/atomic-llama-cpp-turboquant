@@ -29,6 +29,17 @@ struct reserve_reply {
     std::optional<lease> granted;
 };
 
+// Host-side proof available for retiring a channel without inventing a native
+// drain claim. `no_native_work` means no bank was ever reserved for this
+// ledger. `bank_released` means every occupied bank has recorded input release,
+// output publication and every consumer completion. `not_ready` means a bank
+// is still incomplete and must not be retired.
+enum class retirement_state {
+    not_ready,
+    no_native_work,
+    bank_released,
+};
+
 // Owns one channel's bank lifecycle (guide 30.4 SlotLedger, 32.4, 50.4).
 //
 // The first version uses the conservative combined-bank model: one bank
@@ -93,6 +104,10 @@ class channel_ledger {
 
     // A timeout does not prove that a device stopped using these pages.
     bool may_release_storage() const noexcept { return drained_; }
+
+    // Retirement proof derived from the actual bank receipts, not a caller
+    // bool. See retirement_state above.
+    retirement_state retirement() const noexcept;
 
     // Next ticket to issue; 0 means the sequence is exhausted.
     std::uint64_t next_ticket() const noexcept { return next_ticket_; }

@@ -49,7 +49,10 @@ struct legacy_input {
     channel_state * state = nullptr;
     bool            stale = false;
     std::size_t     retired = 0;
+    std::size_t     retired_bank = 0;
+    std::size_t     retired_no_work = 0;
     std::size_t     retained_held = 0;
+    std::size_t     retained_not_ready = 0;
 };
 
 class legacy_channel_map {
@@ -77,7 +80,20 @@ class legacy_channel_map {
                     continue;
                 }
                 if (it->second) {
-                    on_retire(*it->second);
+                    const auto proof = it->second->ledger.retirement();
+                    if (proof == relay::retirement_state::not_ready) {
+                        ++result.retained_not_ready;
+                        ++it;
+                        continue;
+                    }
+                    on_retire(*it->second, proof);
+                    if (proof == relay::retirement_state::bank_released) {
+                        ++result.retired_bank;
+                        ++retired_bank_;
+                    } else {
+                        ++result.retired_no_work;
+                        ++retired_no_work_;
+                    }
                 }
                 it = channels_.erase(it);
                 ++result.retired;
@@ -114,12 +130,16 @@ class legacy_channel_map {
 
     std::uint64_t map_generation() const noexcept { return map_generation_; }
     std::uint64_t retired() const noexcept { return retired_; }
+    std::uint64_t retired_bank() const noexcept { return retired_bank_; }
+    std::uint64_t retired_no_work() const noexcept { return retired_no_work_; }
     std::size_t   size() const noexcept { return channels_.size(); }
 
   private:
     channel_map   channels_;
     std::uint64_t map_generation_ = 0;
     std::uint64_t retired_ = 0;
+    std::uint64_t retired_bank_ = 0;
+    std::uint64_t retired_no_work_ = 0;
 };
 
 } // namespace tq::tp5

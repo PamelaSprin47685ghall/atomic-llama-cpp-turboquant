@@ -217,6 +217,20 @@ std::uint32_t channel_ledger::active_bank_count() const noexcept {
     return count;
 }
 
+retirement_state channel_ledger::retirement() const noexcept {
+    bool any_occupied = false;
+    for (const auto & slot : banks_) {
+        if (!slot.occupied) {
+            continue;
+        }
+        any_occupied = true;
+        if (!(slot.input_released && slot.output_published && slot.consumed == member_mask_)) {
+            return retirement_state::not_ready;
+        }
+    }
+    return any_occupied ? retirement_state::bank_released : retirement_state::no_native_work;
+}
+
 bank_state channel_ledger::bank(std::uint32_t slot) const noexcept {
     if (slot >= banks_.size() || !banks_[slot].occupied) {
         return {};
