@@ -997,12 +997,18 @@ Manifest: `ggml/include/ggml-relay.h`, `ggml/src/ggml-cuda/relay.hip`,
 baseline digests and were reviewed; their hashes are updated. Other stale
 entries keep their old digests.
 
-Verification boundary: the documented evidence is the `relay.hip` HIP gfx1030
-compile plus static RMW-order, call and owner audits. Device abort-word
-visibility and RMW concurrency were not run; no runtime abort/finish behavior
-test exists. Old caller-owned buffers still wait for real native completion or
-remain retained with the old owner; this is retention, not a GPU completion
-claim. No GPU, full suite or guard rerun.
+DevOps ran one `hipcc -x hip -std=gnu++17 --offload-arch=gfx1030 -O1 -fPIC -c`
+single-file compile of `ggml/src/ggml-cuda/relay.hip` at `430a4f02c` in the
+exclusive directory `/tmp/tmp.IwJ4WT5WDi`: exit 0, 5 seconds. Commands and
+flags are recorded at `agent://safe-devops` (t4). This proves source
+compilation/codegen for gfx1030 only; it does not link, load a model, run
+kernels, or test abort ordering/visibility/concurrency/performance.
+
+The documented evidence also includes the static RMW-order, call and owner
+audits. Device abort-word visibility and RMW concurrency were not run; no
+runtime abort/finish behavior test exists. Old caller-owned buffers still wait
+for real native completion or remain retained with the old owner; this is
+retention, not a GPU completion claim. No GPU, full suite or guard rerun.
 
 ## F. Why this does not block the integration
 
