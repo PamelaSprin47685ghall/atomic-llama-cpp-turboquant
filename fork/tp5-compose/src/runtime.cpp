@@ -20,6 +20,7 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t index);
 #include "dw_compose_event.h"
 #include "host_pool.h"
 #include "mtp_state_checkpoint.h"
+#include "mtp_greedy_cache.h"
 
 #include <algorithm>
 #include <dlfcn.h>
@@ -2724,6 +2725,8 @@ run_result run(const options & requested) {
                         bool lb_draft1_prefetched = false;
                         constexpr std::size_t lb_draft1_assumed_accepted = 0;
                         std::size_t actual_accepted = 0;
+                        bool mtp_verify_full_accept = false;
+                        mtp_greedy_cache mtp_greedy;
                         llama_token lb_draft1_token = 0;
                         constexpr int wide = mtp_nextn_width;
                         // skip_gate counts exactly the verify_mtp_this_epoch
@@ -2745,6 +2748,10 @@ run_result run(const options & requested) {
                                 const auto g0 = tq::sampling::select_finite_greedy(l0, n_vocab);
                                 require(g0.usable, "LateBind Pref(L0) invariant violation: nonfinite L0");
                                 lb_draft1_token = g0.selected.id;
+                                // Seed row 0 with the original target greedy result.
+                                // The verify loop reuses it; an accepted==0 replay
+                                // refreshes it before the commit.
+                                mtp_greedy.store_verify(0, g0);
 
                                 // Check predict budget and EOG before speculative dispatch
                                 const bool is_eog = !opts.ignore_eos && llama_vocab_is_eog(vocab, lb_draft1_token);
@@ -2844,13 +2851,20 @@ run_result run(const options & requested) {
                                 "MTP multistep must have exactly 1+N true target output rows");
                             std::size_t accepted=0;
                             for (;accepted<n;++accepted) {
-                                const float * logits=llama_get_logits_ith(ctx,int(accepted));
-                                require(logits!=nullptr,"MTP multi target logits missing");
-                                const auto greedy=tq::sampling::select_finite_greedy(logits,n_vocab);
+                                tq::sampling::greedy_result greedy;
+                                if (mtp_greedy.has(accepted)) {
+                                    greedy = mtp_greedy.get(accepted);
+                                } else {
+                                    const float * logits=llama_get_logits_ith(ctx,int(accepted));
+                                    require(logits!=nullptr,"MTP multi target logits missing");
+                                    greedy = tq::sampling::select_finite_greedy(logits,n_vocab);
+                                }
                                 require(greedy.usable,"MTP multi target logits nonfinite");
+                                mtp_greedy.store_verify(accepted, greedy);
                                 if(greedy.selected.id!=pending_mtp_tokens[accepted])break;
                             }
                             const bool full_accept=accepted==n;
+                            mtp_verify_full_accept = full_accept;
                             ++mtp_verify_rounds;
                             mtp_accepted_draft_tokens+=accepted;
                             if(full_accept)++mtp_accept_rounds;
@@ -3064,7 +3078,12 @@ run_result run(const options & requested) {
                                     require(greedy.usable,
                                         "MTP multi replay has nonfinite target logits");
                                     auto & ref=verifier_rows[j];
-                                    const auto v=tq::sampling::select_finite_greedy(ref.data(),n_vocab);
+                                    // The verify loop already scanned this row on the
+                                    // same pre-replay bytes; reuse that exact result.
+                                    // A copy is required: the cache is refreshed below.
+                                    const auto v = mtp_greedy.has(j) ?
+                                        mtp_greedy.get(j) :
+                                        tq::sampling::select_finite_greedy(ref.data(),n_vocab);
                                     require(v.usable,
                                         "MTP multi target original verifier row nonfinite");
                                     if(greedy.selected.id!=v.selected.id) {
@@ -3113,6 +3132,11 @@ run_result run(const options & requested) {
                                     if(j<accepted)
                                         require(greedy.selected.id==v.selected.id,
                                             "MTP multi accepted-prefix token changed during rollback replay");
+                                    // The replay buffer is the current row. Refresh the
+                                    // cache so the commit uses the replay argmax for the
+                                    // mismatch row; accepted-prefix rows are guaranteed
+                                    // equal by the require above.
+                                    mtp_greedy.store_replay(j, greedy);
                                 }
                                 if(replay_n==1)
                                     single_output_logits=llama_get_logits_ith(ctx,0);
@@ -3209,23 +3233,50 @@ run_result run(const options & requested) {
                                 continue;
                             }
                             // DUALWIN-COMPOSE-EVENT: with the event barrier
-                            // above, every row is resolved without a further
-                            // host synchronize; the barrier already proved this
-                            // epoch's output copy completed. OFF and the
-                            // counted fallback keep the stock syncing getter.
+                            // above, every scanned row is resolved without a
+                            // further host synchronize; the barrier already
+                            // proved this epoch's output copy completed. Cached
+                            // rows are not read at all. OFF and the counted
+                            // fallback keep the stock syncing getter.
+                            const bool cached_greedy = mtp_greedy.can_commit(
+                                row, actual_accepted, mtp_native_trim, mtp_verify_full_accept);
                             const bool single_row_hit =
                                 output_rows == 1 && row == static_cast<std::size_t>(single_output_row);
-                            const float * logits =
-                                single_row_hit && single_output_logits != nullptr ?
-                                    single_output_logits :
-                                    (dw_output_barrier ?
-                                         llama_get_logits_ith_no_sync(ctx, row) :
-                                         llama_get_logits_ith(ctx, row));
-                            if (dw_output_barrier) {
-                                ++dw_compose_events[wi].no_sync_logits_calls;
+                            const float * logits = nullptr;
+                            tq::sampling::greedy_result greedy;
+                            if (cached_greedy) {
+                                // The per-epoch cache is valid only under the
+                                // verify/replay guarantees encoded in can_commit();
+                                // cached rows do not read the logits buffer.
+                                greedy = mtp_greedy.get(row);
+                            } else {
+                                logits =
+                                    single_row_hit && single_output_logits != nullptr ?
+                                        single_output_logits :
+                                        (dw_output_barrier ?
+                                             llama_get_logits_ith_no_sync(ctx, row) :
+                                             llama_get_logits_ith(ctx, row));
+                                if (dw_output_barrier) {
+                                    ++dw_compose_events[wi].no_sync_logits_calls;
+                                }
+                                require(logits != nullptr, "full logits row is missing");
+                                greedy = tq::sampling::select_finite_greedy(logits, n_vocab);
                             }
-                            require(logits != nullptr, "full logits row is missing");
-                            const auto greedy = tq::sampling::select_finite_greedy(logits, n_vocab);
+                            // The full-logits capture needs the row bytes even when
+                            // the greedy scan is cached; keep the same getter and
+                            // output-borrow proof as the scan path.
+                            if (cached_greedy && opts.capture_logits) {
+                                logits =
+                                    single_row_hit && single_output_logits != nullptr ?
+                                        single_output_logits :
+                                        (dw_output_barrier ?
+                                             llama_get_logits_ith_no_sync(ctx, row) :
+                                             llama_get_logits_ith(ctx, row));
+                                if (dw_output_barrier) {
+                                    ++dw_compose_events[wi].no_sync_logits_calls;
+                                }
+                                require(logits != nullptr, "full logits row is missing");
+                            }
                             require(greedy.usable, "nonfinite full model logits");
                             const llama_token selected = greedy.selected.id;
                             if (mtp_draft_smoke && request.tokens.size() + 1 < opts.predict) {

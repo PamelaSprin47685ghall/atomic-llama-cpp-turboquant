@@ -551,3 +551,37 @@ is never restored as the new one. The native-trim path
 `tq-tp5-mtp-state-checkpoint` covers same-size retention, growth, shrink,
 short capture, short restore, full acceptance, exception unwinding, zero size,
 and the shrink-after-invalidate and shrink-after-exception epoch sequences.
+
+## MTP target greedy cache (2026-11-09)
+
+The MTP verify epoch caches each target logits row's
+`tq::sampling::select_finite_greedy` result for the duration of that epoch
+(`src/mtp_greedy_cache.h`). The cache is local: a later target decode can
+overwrite the logits buffer, so it is never reused across epochs.
+
+- Rows below the accepted prefix use the verify result. The rejected-prefix
+  replay requires the replay argmax to equal the original verifier argmax for
+  every accepted-prefix row, so those rows keep the verify id.
+- The replay mismatch row (row `accepted`) is refreshed with the replay scan.
+  Its argmax may change: the replay gate only requires the replay and original
+  distributions to be close, not the top-1, so the commit must use the replay
+  result, not the verify id.
+- The native-trim mismatch row has no replay and uses the verify result.
+- The full-accept new row `n` is never verified and is always scanned.
+- The LateBind prefetch `g0` seeds row 0. It is usable for an accepted row or
+  the native-trim mismatch; an `accepted == 0` replay refreshes row 0 before
+  the commit.
+- The cache stores the exact `greedy_result` (usable, id, logit bits). The
+  finite/unique-maximum/signed-zero tie rules of `select_finite_greedy` and
+  every `require(usable)` check are unchanged. Cached rows do not read the
+  logits buffer; scanned rows keep the same syncing/no-sync getter and
+  output-borrow proof. The `real_h` NextN read, the `verifier_rows` copy and
+  the replay distribution gate are unchanged. `no_sync_logits_calls` counts
+  only the rows actually read.
+
+The CPU test `tq-tp5-mtp-greedy-cache` (`tests/test-mtp-greedy-cache.cpp`)
+covers partial mismatch with a changed replay argmax, the verifier copy not
+aliasing the refreshed row, full accept with the new row scanned, the LateBind
+g0 rules, signed-zero/tie and NaN results, the commit cancellation contract
+(a stopped request does not consume a cached id), and the verify+replay scan
+counts.
