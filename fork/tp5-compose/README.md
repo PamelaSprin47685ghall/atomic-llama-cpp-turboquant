@@ -674,3 +674,55 @@ incomplete bank that is retained as `not_ready`, the explicit stale refusal,
 and that `OUTPUT_RELEASED` never reclaims. It is not a pure helper-counter
 test, but it is still a narrow host test: no GPU, full-model, or MTP runtime
 evidence is claimed.
+
+## MTP multi-row stop contract (2026-11-09)
+
+One MTP verification batch commits `1 + N` rows (`N` in 1..3): the source
+token plus the accepted draft prefix and its correction row. A stop can occur
+before the last row: an EOG token, the request's cancel threshold, or the
+`predict` budget. The committed prefix is then shorter than the speculative
+batch.
+
+The runtime does not merely suppress the later text pushes. During
+verification it classifies the emitted token of every row that could be
+committed and records the first stop row. The target rollback path then keeps
+only the committed prefix:
+
+- `mtp_native_trim` (the bounded GDN ring) rewinds the target
+  attention/PLE/indexer/recurrent suffix from `source_position + valid_rows`.
+- The full checkpoint path restores the pre-batch target state and replays only
+  the `valid_rows` committed inputs, so the target state never retains the
+  speculative suffix. The replay preserves the original numerical contract:
+  accepted draft rows must match exactly; the correction row may differ only
+  inside the KL/rel/overlap gate; a stop row must match because its token
+  decides the stop. A full accept does not replay the extra row.
+- The commit loop advances `consumed` by the committed rows only, emits only
+  those tokens, and finishes the UTF-8 stream exactly once. The post-loop
+  `apply_commit_trims` remains a safety net for a commit-time stop that the
+  verification row classification did not predict.
+
+The draft context is speculative. The MTP draft context is single-sequence:
+`mtp_batch_pool::lease::set` always writes `seq_id` 0, and the option
+validation requires two windows with one prompt per window. The stop cleanup
+therefore enforces `ids.size() == 1 && local == 0`; this restates the existing
+T4 smoke contract and adds no new restriction on legal inputs. A future
+multi-request MTP path must add per-request draft sequences before removing
+that guard. The trim start is the stopped request's first row position
+(`stopped_source_position`), not necessarily `batch.pos[0]`. On any MTP stop
+the runtime synchronizes a pending draft decode and trims the predicted
+attention KV from that source token, including a stop-row-0 prefetch that the
+bind site reused. The service-round boundary remains the final clear. It is
+not part of the request's committed target state.
+
+The CPU-only `tq-tp5-commit-stop` test exercises the production-used
+`classify_commit_stop`, `commit_stop_state`, `has_later_row`,
+`stopped_source_position`, `replay_token_must_match`, and
+`apply_commit_trims` helpers, plus the real `generation_stream`. It covers
+cancel/EOG/budget precedence, `ignore_eos`, the target trim position with and
+without a later row, state reset, the replay contract, trim application, the
+stopped-request source position on a multi-request row map, and the
+finished-stream push rejection. It does not execute `run()`, a model,
+checkpoint restore/replay, `llama_memory_seq_rm`, teacher forcing, or a draft
+context; those remain covered only by the real-model acceptance suite when it
+is run. The stop-row-0 draft KV cleanup is code-inspected here; this CPU test
+cannot create a draft context.

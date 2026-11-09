@@ -945,6 +945,25 @@ path and the CUDA phase-arena failure side effects remain unverified: the CPU
 backend has no real MoE provider, and no device fault injection was run. No
 GPU, full suite or guard rerun.
 
+### E.9 MTP multi-row stop contract round 2026-11-09
+
+Cherry-pick net effect `67c71b1da` -> `b3c6cf681`, reviewed as t27
+(`agent://kernel6-review`). A verification stop includes its row in the
+committed prefix and suppresses every later push. The target trim uses the
+stopped request's first row position (`stopped_source_position`) and
+`valid_rows`, not `batch.pos[0]`; the original replay mismatch gate is
+retained, with the stop row required to match. `ids.size() == 1 && local == 0`
+restates the existing T4 smoke option contract and adds no new restriction on
+legal inputs. The draft stop cleanup synchronizes a pending draft decode and
+trims from that request source; it is code-inspected, not exercised here.
+
+The candidate CPU test `tq-tp5-commit-stop` exercises the production helper
+functions and the real `generation_stream`. It does not execute `run()`, a
+model, checkpoint restore/replay, `llama_memory_seq_rm`, teacher forcing or a
+draft context, and it was not run in this integration tree. No GPU, full suite
+or guard rerun. The five changed paths have no manifest entry, so no digest
+was updated.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure

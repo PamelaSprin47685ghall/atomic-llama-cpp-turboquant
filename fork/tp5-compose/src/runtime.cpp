@@ -13,6 +13,7 @@
 #include "dw_event_trace.h"
 #include "dw_compose_event.h"
 #include "host_pool.h"
+#include "commit_stop.h"
 #include "mtp_state_checkpoint.h"
 #include "mtp_greedy_cache.h"
 #include "relay_channel_map.h"
@@ -2418,6 +2419,13 @@ run_result run(const options & requested) {
                     mtp_state_checkpoint                target_state_checkpoint;
                     std::vector<std::size_t>             local_rows;
                     local_rows.reserve(ids.size());
+                    // A multi-row MTP batch can commit only a prefix when an
+                    // EOG, cancel, or budget stop lands before its last row.
+                    // The target state still contains the later speculative
+                    // inputs, so record the first position to remove for each
+                    // sequence. This is per epoch, not per token allocation:
+                    // the state is sized once per service round.
+                    commit_stop_state stop_state(ids.size());
                     for (auto id : ids) {
                         result.requests[id].admitted_ns = now_ns();
                     }
@@ -2428,9 +2436,11 @@ run_result run(const options & requested) {
                         target_state_checkpoint.invalidate();
                         batch.clear();
                         local_rows.clear();
+                        stop_state.reset();
                         std::uint32_t output_rows = 0;
                         std::int32_t single_output_row = -1;
                         bool verify_mtp_this_epoch = false;
+                        bool mtp_stop_expected = false;
                         if (mtp_draft_smoke && !pending_mtp_tokens.empty() &&
                             ids.size()==1 &&
                             result.requests[ids[0]].tokens.size()+1 < opts.predict) {
@@ -2858,7 +2868,11 @@ run_result run(const options & requested) {
                             const std::size_t n=pending_mtp_tokens.size();
                             require(n>=1&&n<=3&&local_rows.size()==n+1&&output_rows==n+1,
                                 "MTP multistep must have exactly 1+N true target output rows");
+                            auto &            verify_request = result.requests[ids[0]];
+                            const std::size_t verify_base    = verify_request.tokens.size();
                             std::size_t accepted=0;
+                            std::size_t valid_rows=n+1;
+                            std::optional<std::size_t> stop_row;
                             for (;accepted<n;++accepted) {
                                 tq::sampling::greedy_result greedy;
                                 if (mtp_greedy.has(accepted)) {
@@ -2870,9 +2884,42 @@ run_result run(const options & requested) {
                                 }
                                 require(greedy.usable,"MTP multi target logits nonfinite");
                                 mtp_greedy.store_verify(accepted, greedy);
+                                // The stop decision uses the token that will be
+                                // committed, not the draft proposal. With
+                                // teacher tokens the emitted token is the
+                                // teacher token; otherwise it is the target
+                                // greedy token.
+                                const llama_token emitted = opts.teacher_tokens.empty() ?
+                                    greedy.selected.id :
+                                    static_cast<llama_token>(
+                                        opts.teacher_tokens[ids[0]][verify_base + accepted]);
+                                const bool is_eog = !opts.ignore_eos &&
+                                    llama_vocab_is_eog(vocab, emitted);
+                                const bool cancel_match =
+                                    opts.cancel_request == static_cast<std::int32_t>(ids[0]) &&
+                                    verify_base + accepted + 1 >= opts.cancel_after;
+                                const auto stop = classify_commit_stop(
+                                    is_eog, opts.ignore_eos, cancel_match,
+                                    verify_base + accepted + 1,
+                                    opts.cancel_after, opts.predict);
+                                if (stop != commit_stop::none) {
+                                    // Commit rows 0..accepted, including this
+                                    // stop row. The later speculative rows are
+                                    // removed by the rollback/replay path
+                                    // below, not merely hidden from the text.
+                                    stop_row   = accepted;
+                                    valid_rows = accepted + 1;
+                                    break;
+                                }
                                 if(greedy.selected.id!=pending_mtp_tokens[accepted])break;
                             }
-                            const bool full_accept=accepted==n;
+                            if (!stop_row.has_value() && accepted < n) {
+                                // The loop broke on a draft mismatch at
+                                // `accepted`; the correction row commits.
+                                valid_rows = accepted + 1;
+                            }
+                            const bool full_accept = valid_rows == n + 1;
+                            mtp_stop_expected = stop_row.has_value();
                             mtp_verify_full_accept = full_accept;
                             ++mtp_verify_rounds;
                             mtp_accepted_draft_tokens+=accepted;
@@ -2955,7 +3002,7 @@ run_result run(const options & requested) {
                                     // for valid prefix. No 118MB state copy and
                                     // no costly second target GPU decode.
                                     const llama_pos invalid_from=static_cast<llama_pos>(
-                                        consumed[0]+1+accepted);
+                                        consumed[0]+valid_rows);
                                     auto debug_recurrent = [&](const char * stage) {
                                         if (!mtp_state_trace) return;
                                         llama_memory_hybrid_idx_trace trace{};
@@ -2980,7 +3027,6 @@ run_result run(const options & requested) {
                                                 llama_get_memory(ctx),0,invalid_from,-1),
                                             "bounded native Qwen recurrent/PLE/attention/indexer speculative suffix trim failed");
                                     debug_recurrent("after_invalid_suffix_trim");
-                                    const auto valid_rows=accepted+1;
                                     local_rows.resize(valid_rows);
                                     batch.batch.n_tokens=int32_t(valid_rows);
                                     output_rows=uint32_t(valid_rows);
@@ -3002,7 +3048,7 @@ run_result run(const options & requested) {
                                 // verified as a legitimate chain. Keep copies
                                 // of those original verifier logits BEFORE the
                                 // full restore; replay overwrites host output.
-                                const std::size_t replay_n=accepted+1;
+                                const std::size_t replay_n=valid_rows;
                                 std::vector<std::vector<float>> verifier_rows(replay_n);
                                 for (std::size_t j=0;j<replay_n;++j) {
                                     const float * t=llama_get_logits_ith(ctx,int(j));
@@ -3133,9 +3179,16 @@ run_result run(const options & requested) {
                                                 rel<=0.05&&overlap>=9,
                                             "MTP multi verifier/replay F32 distribution materially differs");
                                     }
-                                    if(j<accepted)
+                                    // Preserve the original replay contract:
+                                    // accepted draft rows must match exactly;
+                                    // the correction row may differ only inside
+                                    // the KL/rel/overlap gate above. A stop row
+                                    // is the exception: its token decides the
+                                    // stop, so it must match the original
+                                    // verifier row.
+                                    if (replay_token_must_match(j, accepted, stop_row.has_value()))
                                         require(greedy.selected.id==v.selected.id,
-                                            "MTP multi accepted-prefix token changed during rollback replay");
+                                            "MTP multi committed-prefix token changed during rollback replay");
                                     // The replay buffer is the current row. Refresh the
                                     // cache so the commit uses the replay argmax for the
                                     // mismatch row; accepted-prefix rows are guaranteed
@@ -3181,6 +3234,14 @@ run_result run(const options & requested) {
                         for (std::size_t row = 0; row < local_rows.size(); ++row) {
                             const auto local          = local_rows[row];
                             auto &     request        = result.requests[ids[local]];
+                            if (!request.stop_reason.empty()) {
+                                // The request stopped at an earlier row of
+                                // this same speculative batch. Do not consume
+                                // or commit the remaining rows, and do not
+                                // push into the already finished text stream.
+                                // The target suffix is removed after the loop.
+                                continue;
+                            }
                             const auto input_position = consumed[local]++;
                             if (prompt_catchup && input_position < request.prompt_tokens.size()) {
                                 require(ids.size() == 1 && local == 0 &&
@@ -3653,23 +3714,83 @@ run_result run(const options & requested) {
                                 auto delta = streams[local].push(piece(vocab, request.tokens.back().emitted_token));
                                 request.text += delta.text;
                             }
-                            if (opts.cancel_request == static_cast<std::int32_t>(ids[local]) &&
-                                request.tokens.size() >= opts.cancel_after) {
-                                request.stop_reason = "cancelled";
-                            } else if (!opts.ignore_eos &&
-                                       llama_vocab_is_eog(vocab, request.tokens.back().emitted_token)) {
-                                request.stop_reason = "eos";
-                            } else if (request.tokens.size() == opts.predict) {
-                                request.stop_reason = "budget";
-                            }
-                            if (!request.stop_reason.empty()) {
+                            const bool cancel_match =
+                                opts.cancel_request == static_cast<std::int32_t>(ids[local]) &&
+                                request.tokens.size() >= opts.cancel_after;
+                            const bool is_eog =
+                                !opts.ignore_eos &&
+                                llama_vocab_is_eog(vocab, request.tokens.back().emitted_token);
+                            const auto stop = classify_commit_stop(
+                                is_eog, opts.ignore_eos, cancel_match,
+                                request.tokens.size(), opts.cancel_after, opts.predict);
+                            // Only a verification epoch has multiple rows for
+                            // one request. A future multi-row non-verify batch
+                            // must extend this target trim to its path.
+                            const bool later_row = stop != commit_stop::none &&
+                                verify_mtp_this_epoch && has_later_row(local_rows, row, local);
+                            const auto stop_reason = stop_state.note_stop(
+                                local, static_cast<std::int64_t>(input_position), later_row, stop);
+                            if (!stop_reason.empty()) {
+                                request.stop_reason.assign(stop_reason);
                                 if (text_pool) {
                                     streams[local].finish_into(request.text);
                                 } else {
                                     request.text += streams[local].finish().text;
                                 }
                                 request.finished_ns = now_ns();
+                                require(consumed[local] == input_position + 1,
+                                        "stopped request consumed cursor drifted");
+                                if (mtp_draft_smoke) {
+                                    // The MTP draft context is single-sequence:
+                                    // mtp_batch_pool::lease::set always writes
+                                    // seq_id 0, and the option validation
+                                    // requires two windows with one prompt per
+                                    // window. Fail closed if a future
+                                    // multi-request path reaches this cleanup
+                                    // without per-request draft sequences.
+                                    require(ids.size() == 1 && local == 0,
+                                            "MTP draft stop cleanup requires one request in sequence 0");
+                                    const auto draft_source = stopped_source_position(
+                                        local_rows, row, local,
+                                        [&](std::size_t source_row) {
+                                            return static_cast<std::int64_t>(batch.batch.pos[source_row]);
+                                        });
+                                    require(draft_source.has_value(),
+                                            "MTP draft stop cleanup has no source position for the stopped request");
+                                    // The target stop does not imply the draft
+                                    // context stopped. Drop its speculative KV
+                                    // from the stopped request's source token,
+                                    // including a stop-row-0 prefetch that the
+                                    // bind site may have reused. Synchronize a
+                                    // pending draft decode before trimming it.
+                                    auto * dctx = trained_mtp_contexts.at(wi).get();
+                                    if (draft_pending) {
+                                        llama_synchronize(dctx);
+                                        draft_pending = false;
+                                    }
+                                    require(timed_seq_rm(llama_get_memory(dctx), 0,
+                                                         static_cast<llama_pos>(*draft_source + 1), -1),
+                                            "stopped MTP draft speculative suffix trim failed");
+                                    lb_draft1_prefetched = false;
+                                    pending_mtp_tokens.clear();
+                                }
                             }
+                        }
+                        // A stop before the last row of a multi-row MTP batch
+                        // leaves speculative inputs in the target attention /
+                        // recurrent state. The text guard above only stops
+                        // publication; remove the invalid suffix so the state
+                        // ends at the last committed input position.
+                        apply_commit_trims(stop_state.trims(),
+                            [&](std::size_t local, std::int64_t trim_from) {
+                                require(timed_seq_rm(llama_get_memory(ctx),
+                                                     static_cast<llama_seq_id>(local),
+                                                     static_cast<llama_pos>(trim_from), -1),
+                                        "stopped MTP request speculative suffix trim failed");
+                            });
+                        if (mtp_stop_expected) {
+                            require(!result.requests[ids[0]].stop_reason.empty(),
+                                    "MTP stop row was not committed");
                         }
                         metrics.last_finish_ns = now_ns();
                         metrics.result_commit_ns += metrics.last_finish_ns - commit_start;
