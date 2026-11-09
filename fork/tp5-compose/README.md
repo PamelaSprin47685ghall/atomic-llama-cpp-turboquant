@@ -626,3 +626,36 @@ unverified here (no GPU/full).
 
 The unit target has 32 checks; the reviewed unit run is 32 PASS / 0 FAIL. The
 real MTP runtime and GPU path were not run.
+
+## Legacy relay channel map reclamation (2026-11-09)
+
+When neither `GGML_TP5_PLAN_UNION=1` nor
+`GGML_TP5_RELAY_SLOT_CHANNELS=1` selects the slotized lane, a window owns one
+`channel_state` per `(plan generation, channel)` in `src/relay_channel_map.h`.
+A provider plan generation can advance when a graph is rebuilt and its terminal
+binding changes (the MTP 1-token / n+1-token alternation is one trigger). The
+map previously never erased an entry, so every generation added its channels
+for the provider lifetime.
+
+Reclamation runs only in the legacy map branch, before the next generation's
+first `INPUT_READY` is inserted. `prepare()` already required the provider to
+be idle (finished, no borrow, every channel released). The same courier
+services older `OUTPUT_RELEASED` events before the next `INPUT_READY`, and a
+deferred `delayed_event` is handled before the next poll. `OUTPUT_RELEASED`
+still finds its entry and never triggers reclamation; failure or abort leaves
+the map to `finish_ledgers()`.
+
+Reclamation is all-or-nothing. If any entry older than the new generation still
+has a held lease, `reclaim_older_channels()` returns `live_lease`, erases
+nothing and the caller fails closed with `relay map reclaim hit live lease`.
+Only after the held optional is clear does the helper erase older entries and
+advance `service_window::map_generation`. This does not require or enable
+`GGML_TP5_PLAN_UNION`; the default map lane and every existing legal
+configuration keep their behavior.
+
+The CPU-only `tq-tp5-relay-channel-map` test builds real `channel_ledger`
+leases (reserve, producer ready, reduce done, output published, consumer done)
+and observes the map size, generation and real `bank_state` fields. It covers
+generation no-op, 181-channel generations, newer-generation preservation, and
+the held-lease refusal without a mock echo. It is a narrow host test; no GPU,
+full-model, or MTP runtime evidence is claimed.

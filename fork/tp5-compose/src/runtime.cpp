@@ -15,6 +15,7 @@
 #include "host_pool.h"
 #include "mtp_state_checkpoint.h"
 #include "mtp_greedy_cache.h"
+#include "relay_channel_map.h"
 
 #include <algorithm>
 #include <dlfcn.h>
@@ -354,17 +355,6 @@ struct failure_state {
     }
 };
 
-struct channel_state {
-    relay::channel_ledger       ledger;
-    std::optional<relay::lease> held;
-    std::uint64_t               epoch = 0;
-    std::uint64_t               elements = 0;
-    std::uint64_t               wire_bytes = 0;
-    std::uint32_t               computed_mask = 0;
-
-    channel_state(std::uint64_t run, std::uint64_t plan, std::uint64_t channel) : ledger(run, plan, channel, 5, 1) {}
-};
-
 // Pillar 5 channel ownership: one fixed table per window, eight plan slots of
 // 256 channel states. A slot is rebound only after its last reader ended.
 using plan_channel_slots = ggml_relay_plan::channel_slots<channel_state>;
@@ -602,7 +592,11 @@ struct cycle_timing_row {
 
 struct service_window {
     ggml_backend_t                                                                    backend = nullptr;
-    std::map<std::pair<std::uint64_t, std::uint32_t>, std::unique_ptr<channel_state>> channels;
+    channel_map                                                                       channels;
+    // Highest plan generation admitted by the legacy map. Only INPUT_READY
+    // advances it, after prepare observed idle and every older
+    // OUTPUT_RELEASED was serviced by this window's courier.
+    std::uint64_t                                                                     map_generation = 0;
     // Pillar 5: slotized ownership. The map above stays the fallback when
     // GGML_TP5_RELAY_SLOT_CHANNELS=0 (and GGML_TP5_PLAN_UNION is unset).
     plan_channel_slots                                                                plan_slots;
@@ -1482,6 +1476,19 @@ class relay_service {
                     }
                     owner = slot_owner.get();
                 } else {
+                    // Legacy map: reclaim older generations only from this
+                    // INPUT_READY. prepare() required idle, and the courier
+                    // serviced every older OUTPUT_RELEASED before offering this
+                    // event (delayed_event is handled before the next poll).
+                    // A held lease refuses the whole reclamation; never erase a
+                    // live reader.
+                    if (event.plan_generation > window.map_generation) {
+                        const auto reclaimed = reclaim_older_channels(
+                                window.channels, event.plan_generation, window.map_generation,
+                                [](const channel_state & state) { return state.held.has_value(); });
+                        require(reclaimed != channel_map_reclaim::live_lease,
+                                "relay map reclaim hit live lease");
+                    }
                     auto & map_owner = window.channels[key];
                     if (!map_owner) {
                         map_owner = std::make_unique<channel_state>(run_, event.plan_generation, event.channel);
@@ -1587,6 +1594,9 @@ class relay_service {
                         window.plan_slots.retire(event.plan_generation);
                     }
                 }
+                // The legacy map ignores PLAN_RETIRED: it reclaims older
+                // generations from the next INPUT_READY, after this courier
+                // has serviced their OUTPUT_RELEASED events.
             } else {
                 throw std::runtime_error("unknown relay event kind");
             }
