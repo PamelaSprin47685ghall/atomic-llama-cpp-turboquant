@@ -1358,6 +1358,16 @@ add_test(NAME test-tp5-staging-reject-summary COMMAND test-tp5-staging-reject-su
 set_property(TEST test-tp5-staging-reject-summary PROPERTY LABELS "cpu;tp5;staging")
 set_property(TEST test-tp5-staging-reject-summary PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_REJECT_TEST PASS")
 
+# TP5 staging rejection-summary concurrency. Independent Meta backends record
+# rejections from several threads while a dump thread reads the summary. The
+# hot path is one relaxed atomic plus a one-time example publication; the dump
+# holds no lock across its print. CPU only.
+add_executable(test-tp5-staging-reject-concurrent test-tp5-staging-reject-concurrent.cpp)
+target_link_libraries(test-tp5-staging-reject-concurrent PRIVATE ggml ggml-cpu)
+add_test(NAME test-tp5-staging-reject-concurrent COMMAND test-tp5-staging-reject-concurrent)
+set_property(TEST test-tp5-staging-reject-concurrent PROPERTY LABELS "cpu;tp5;staging")
+set_property(TEST test-tp5-staging-reject-concurrent PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_REJECT_CONCURRENT_TEST PASS")
+
 # TP5 WS4 pending-context/model ownership test. llama_free retains the whole
 # context (and defers llama_model_free) while an async submission is unproven;
 # a clean context/model takes the normal destruction path. The context part

@@ -500,11 +500,12 @@ line per candidate. The weight load alone produced 512 `no_input_flag` lines,
 each through unbuffered stderr (FILE lock plus one write syscall), so the
 diagnostic added I/O to the load path and buried the signal.
 
-Rejections are counted per `(lane, reason)`. The counter and the first example
-(name, flags, size, type) share one mutex-protected critical section, so a
-nonzero count always has a complete example. The critical section is a counter
-and, once per class, a short name copy; there is no I/O. The exit dump prints
-one summary line per class:
+Rejections are counted per `(lane, reason)` with one relaxed atomic increment
+on the hot path. The first example (name, flags, size, type) is captured once
+by a compare_exchange into a self-owned heap record and published with
+release. A dump may observe the count before the example is published; it then
+prints `(none)` instead of fabricating a consistent snapshot. The exit dump
+prints one summary line per class:
 
 ```
 TP5_STAGING_REJECT lane=sync reason=no_input_flag count=512 example_name=... flags=0x0 size=... type=...
@@ -515,11 +516,12 @@ TP5_STAGING_REJECT lane=sync reason=no_input_flag count=512 example_name=... fla
 (`null`, `no_input_flag`, `zero_size`, `size`, `generic_size`, `layout`) is
 unchanged, so the diagnostic still answers why a candidate was rejected.
 
-Cost: the hot path takes one uncontended mutex per rejected candidate and
-performs no I/O; the summary costs at most one line per `(lane, reason)` at
-exit. With the flag off, `staging_log_reject` returns after the cached flag
-check, as before. This change touches only `ggml-backend-meta.cpp`; the
-slot-pressure work owns `staging.h`/`acquire` and is not modified.
+Cost: the hot path performs one relaxed increment and no I/O; the example is
+captured once per class. The summary costs at most one line per
+`(lane, reason)` at exit and holds no lock while printing. With the flag off,
+`staging_log_reject` returns after the cached flag check, as before. This
+change touches only `ggml-backend-meta.cpp`; the slot-pressure work owns
+`staging.h`/`acquire` and is not modified.
 
 ### Example lifetime and dump ordering
 
@@ -530,14 +532,24 @@ prints the name captured at rejection time. A test records a rejection,
 renames the tensor, releases the buffer, context and backend, and then dumps:
 it requires the original name and rejects the mutated one.
 
-The dump reads the counter and the example fields under the same mutex that
-guards the single write, so a nonzero count always has a complete example.
-The table is a namespace-scope static, so it is alive when the `atexit` dump
-runs. The pool dump still takes the pool mutex before the Meta summary; that
-ordering is unchanged and a thread holding the pool lock delays the dump, as
-before.
+The dump loads the counter (relaxed) and the example pointer (acquire) without
+holding a lock, so it never blocks the rejection path and never holds a lock
+across `fprintf`. A concurrent first rejection can publish its example after
+the dump has read the count; the dump then prints `(none)` for that class
+while the count stays exact. The table is a namespace-scope static, so it is
+alive when the `atexit` dump runs. The pool dump still takes the pool mutex
+before the Meta summary; that ordering is unchanged.
 
-The summary test is registered as `test-tp5-staging-reject-summary` in
-`tests/CMakeLists.txt` (labels `cpu;tp5;staging`, PASS on
-`TP5_STAGING_REJECT_TEST PASS`). It is CPU only and was run once through
+The summary test is registered as `test-tp5-staging-reject-summary` and the
+concurrent test as `test-tp5-staging-reject-concurrent` in
+`tests/CMakeLists.txt` (labels `cpu;tp5;staging`, CPU only). Both run through
 CTest.
+
+### Integration with the staging union kind
+
+The reason classifier shares the staging constants and name mapping
+(`classify_name`, `kMaxStagingBytes`, `kGenericMaxBytes`). When the staging
+union-kind change lands, any new rejection condition in `staging_candidate`
+must get a reason here; otherwise those candidates fall into `other`, which is
+reported and counted instead of `unknown`. Keep the generic 64 KiB overflow
+classification aligned with `kGenericMaxBytes` in `staging.h`.

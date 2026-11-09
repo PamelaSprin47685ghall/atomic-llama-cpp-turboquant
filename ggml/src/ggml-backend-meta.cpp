@@ -115,7 +115,7 @@ static bool staging_diag_enabled() {
 // the exit dump. GGML_TP5_STAGING_DIAG_VERBOSE=1 restores the old per-candidate
 // trace for a short, explicitly requested run.
 enum staging_reject_reason : int {
-    reject_unknown = 0,
+    reject_other = 0,
     reject_null,
     reject_no_input_flag,
     reject_zero_size,
@@ -127,26 +127,29 @@ enum staging_reject_reason : int {
 
 static const char * staging_reject_reason_name(int reason) {
     static const char * names[reject_count] = {
-        "unknown", "null", "no_input_flag", "zero_size", "size", "generic_size", "layout",
+        "other", "null", "no_input_flag", "zero_size", "size", "generic_size", "layout",
     };
     return reason >= 0 && reason < reject_count ? names[reason] : "?";
 }
 
-struct staging_reject_stat {
-    // Count and example share one critical section: a nonzero count always
-    // means the example below is complete, so the dump cannot print a count
-    // without its example.
-    uint64_t count = 0;
-    // Self-owned first example: the source tensor may be freed before the exit
-    // dump. Written once under first_mutex, NUL-terminated.
+struct staging_reject_example {
     char name[GGML_MAX_NAME] = {};
     size_t size = 0;
     unsigned flags = 0;
     ggml_type type = GGML_TYPE_COUNT;
 };
 
+struct staging_reject_stat {
+    // The hot path only bumps this counter. The example is published once by
+    // compare_exchange; a dump may observe the count before the example is
+    // published and then reports (none) instead of fabricating a snapshot.
+    std::atomic<uint64_t> count{0};
+    // Heap-owned, self-contained, never freed (process lifetime, diagnostics).
+    // acquire/release pairs the single publication with every reader.
+    std::atomic<const staging_reject_example *> example{nullptr};
+};
+
 struct staging_reject_table {
-    std::mutex first_mutex;
     staging_reject_stat lanes[2][reject_count];
 };
 static staging_reject_table g_staging_reject;
@@ -161,7 +164,7 @@ static bool staging_diag_verbose() {
 
 static int staging_reject_reason(const ggml_tensor * tensor, size_t size, const char * reason_override) {
     if (reason_override != nullptr) {
-        return std::strcmp(reason_override, "layout") == 0 ? reject_layout : reject_unknown;
+        return std::strcmp(reason_override, "layout") == 0 ? reject_layout : reject_other;
     }
     if (tensor == nullptr) {
         return reject_null;
@@ -179,7 +182,7 @@ static int staging_reject_reason(const ggml_tensor * tensor, size_t size, const 
             size > ggml_cuda_staging::kGenericMaxBytes) {
         return reject_generic_size;
     }
-    return reject_unknown;
+    return reject_other;
 }
 
 static void staging_log_reject(const char * lane, const ggml_tensor * tensor, size_t size,
@@ -190,18 +193,22 @@ static void staging_log_reject(const char * lane, const ggml_tensor * tensor, si
     const int lane_id = std::strcmp(lane, "async") == 0 ? 1 : 0;
     const int reason = staging_reject_reason(tensor, size, reason_override);
     staging_reject_stat & stat = g_staging_reject.lanes[lane_id][reason];
-    {
-        // One uncontended mutex on the rejection path keeps the count and the
-        // first example consistent. The critical section is a counter and,
-        // once per class, a short name copy; there is no I/O.
-        std::lock_guard<std::mutex> lock(g_staging_reject.first_mutex);
-        ++stat.count;
-        if (stat.name[0] == '\0') {
-            std::snprintf(stat.name, sizeof(stat.name), "%s",
-                          tensor != nullptr ? tensor->name : "(null)");
-            stat.size = size;
-            stat.flags = tensor != nullptr ? unsigned(tensor->flags) : 0u;
-            stat.type = tensor != nullptr ? tensor->type : GGML_TYPE_COUNT;
+    // Hot path: one relaxed increment and no I/O. The first example is captured
+    // once by compare_exchange into a self-owned heap record and published with
+    // release; a dump may see the count before that publication and then
+    // reports (none) instead of fabricating a snapshot.
+    stat.count.fetch_add(1, std::memory_order_relaxed);
+    if (stat.example.load(std::memory_order_relaxed) == nullptr) {
+        auto * ex = new staging_reject_example{};
+        std::snprintf(ex->name, sizeof(ex->name), "%s",
+                      tensor != nullptr ? tensor->name : "(null)");
+        ex->size = size;
+        ex->flags = tensor != nullptr ? unsigned(tensor->flags) : 0u;
+        ex->type = tensor != nullptr ? tensor->type : GGML_TYPE_COUNT;
+        const staging_reject_example * expected = nullptr;
+        if (!stat.example.compare_exchange_strong(expected, ex,
+                std::memory_order_release, std::memory_order_relaxed)) {
+            delete ex;  // another thread published first
         }
     }
     if (!staging_diag_verbose()) {
@@ -256,17 +263,18 @@ extern "C" void ggml_backend_meta_staging_diag_dump() {
     static const char * lane_names[2] = { "sync", "async" };
     for (int lane = 0; lane < 2; ++lane) {
         for (int r = 0; r < reject_count; ++r) {
-            std::lock_guard<std::mutex> lock(g_staging_reject.first_mutex);
             const staging_reject_stat & stat = g_staging_reject.lanes[lane][r];
-            const uint64_t n = stat.count;
+            const uint64_t n = stat.count.load(std::memory_order_relaxed);
             if (n == 0) {
                 continue;
             }
+            const staging_reject_example * ex = stat.example.load(std::memory_order_acquire);
             std::fprintf(stderr,
                 "TP5_STAGING_REJECT lane=%s reason=%s count=%llu example_name=%s flags=0x%x size=%zu type=%s\n",
                 lane_names[lane], staging_reject_reason_name(r), (unsigned long long) n,
-                stat.name[0] != '\0' ? stat.name : "(none)", stat.flags, stat.size,
-                stat.type != GGML_TYPE_COUNT ? ggml_type_name(stat.type) : "?");
+                ex != nullptr ? ex->name : "(none)", ex != nullptr ? ex->flags : 0u,
+                ex != nullptr ? ex->size : 0,
+                ex != nullptr && ex->type != GGML_TYPE_COUNT ? ggml_type_name(ex->type) : "?");
         }
     }
 }
