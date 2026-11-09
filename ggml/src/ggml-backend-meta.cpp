@@ -40,7 +40,8 @@ extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
     }
     const auto * api = static_cast<const ggml_cuda_staging::api *>(impl);
     if (api->abi_version != ggml_cuda_staging::kApiVersion) {
-        // Do not read any later field: an older table ends before mark_partial.
+        // Do not read any later field: v1 ends before mark_partial and v2 ends
+        // before kind_count. Mixed versions are explicitly unsupported.
         GGML_LOG_WARN("%s: rejecting staging api table abi_version=%u (expected %u); "
                       "staging falls back\n", __func__, unsigned(api->abi_version),
                       unsigned(ggml_cuda_staging::kApiVersion));
@@ -49,6 +50,12 @@ extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
     if (api->mark_partial == nullptr) {
         GGML_LOG_WARN("%s: rejecting staging api table without mark_partial; "
                       "staging falls back\n", __func__);
+        return false;
+    }
+    if (api->kind_count < ggml_cuda_staging::kKindCount) {
+        GGML_LOG_WARN("%s: rejecting staging api table kind_count=%u (host needs %u); "
+                      "staging falls back\n", __func__, unsigned(api->kind_count),
+                      unsigned(ggml_cuda_staging::kKindCount));
         return false;
     }
     g_staging_api.store(api, std::memory_order_release);
@@ -1938,6 +1945,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             const ggml_cuda_staging::api * st = staging_api();
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
             const bool staging_on = st != nullptr && st->enabled();
+            // The sync lane sees the scheduler's destination copy, named
+            // "%s#%s#%d"; n_copies==1 copies are not INPUT. Do not parse the
+            // name and do not relax INPUT: the exact union kinds are async-only.
             const bool staging_hit = staging_on && staging_eligible(tensor, size, &staging_kind);
             if (st == nullptr) {
                 g_staging_meta_diag.api_null.fetch_add(1, std::memory_order_relaxed);
@@ -1997,7 +2007,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                                                 // An old table cannot publish the partial
                                                 // fault. Do not return a success that hides
                                                 // a partially written destination. Registration
-                                                // requires v2 + mark_partial, so this is
+                                                // requires v3 + mark_partial + kind_count, so this is
                                                 // defense against a mutated/bypassed table.
                                                 GGML_ABORT("TP5 staging partial enqueue without fault publication");
                                             }
@@ -2575,6 +2585,8 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
             const ggml_cuda_staging::api * st = staging_api();
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
             const bool staging_on = st != nullptr && st->enabled();
+            // staging_meta is the scheduler's real source tensor; its name and
+            // INPUT flag are the identity used for classification.
             const ggml_tensor * staging_src = staging_meta != nullptr ? staging_meta : tensor;
             // A non-scheduler caller must not make the upload size, type or
             // layout diverge from the destination. The scheduler already
@@ -2637,7 +2649,7 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                                     if (st->abi_version >= 2 && st->mark_partial != nullptr) {
                                         st->mark_partial(&staged_lease, tensor->data);
                                     } else {
-                                        // Registration requires v2 + mark_partial; this is
+                                        // Registration requires v3 + mark_partial + kind_count; this is
                                         // defense against a mutated/bypassed table.
                                         GGML_ABORT("TP5 staging partial enqueue without fault publication");
                                     }

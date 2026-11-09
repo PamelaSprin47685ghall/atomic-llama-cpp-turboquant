@@ -23,11 +23,14 @@ constexpr size_t   kMaxPoolBytes = 4u << 20;
 constexpr uint32_t kRanks        = 16;  // == GGML_CUDA_MAX_DEVICES
 constexpr uint32_t kWindows      = 4;
 constexpr uint32_t kSlotsPerKey  = 2;   // double buffer
-// Bump when the host-only api table grows. New fields are appended after
-// zc_enabled so every older table remains a readable prefix, but the meta
-// layer accepts only the current version: a v1 table cannot publish a partial
-// submission, so it is rejected at registration and staging falls back.
-constexpr uint32_t kApiVersion   = 2;
+// Bump when the host-only api table grows. New fields are appended after the
+// previous version's last field, but the meta layer accepts only the current
+// version and checks the version before reading any later field. v1 cannot
+// publish a partial submission; v2 has mark_partial but no kind domain; v3
+// adds kind_count. A mixed v1/v2/v3 install is explicitly unsupported and
+// staging falls back with a warning instead of sending kind values the
+// provider does not understand.
+constexpr uint32_t kApiVersion   = 3;
 
 enum class kind : uint32_t {
     tokens  = 0,
@@ -80,6 +83,11 @@ inline kind classify_name(const char * name) {
     if (std::strcmp(name, "inp_h") == 0 || std::strstr(name, "mtp_h_input") != nullptr) {
         return kind::mtp_h;
     }
+    // These exact names are reachable from the async lane's source tensor.
+    // The sync lane classifies the scheduler's destination copy, named
+    // "%s#%s#%d"; n_copies==1 copies are not INPUT. Do not parse the
+    // decorated name and do not relax the INPUT requirement: the sync
+    // fallback stays generic or unstaged.
     if (std::strcmp(name, "union_inp_k_idxs") == 0) {
         return kind::union_k;
     }
@@ -214,8 +222,6 @@ public:
         uint64_t no_slot                   = 0;
         uint64_t no_slot_leased            = 0;
         uint64_t no_slot_pending           = 0;
-        uint64_t no_slot_quarantined       = 0;
-        uint64_t no_slot_other             = 0;
         uint64_t no_slot_by_kind[kKindCount]  = {};
         uint64_t leases_by_kind[kKindCount]   = {};
         uint64_t reaps_by_kind[kKindCount]    = {};
@@ -318,31 +324,22 @@ public:
         if (chosen == nullptr) {
             stats_.no_slot++;
             stats_.no_slot_by_kind[size_t(k)]++;
+            // A disabled pool returned at the top of acquire; a usable free
+            // slot would have been chosen by pick_free_locked; a too-small
+            // free slot fails in grow_locked as oversize, not here. The only
+            // reachable no_slot states are therefore an unleased pending slot
+            // (retire lag) or all usable slots leased.
             bool any_unleased_pending = false;
-            bool any_leased = false;
-            bool any_usable = false;
             for (const auto & s : key) {
-                if (s.quarantined) {
-                    continue;
-                }
-                any_usable = true;
-                if (s.leased) {
-                    any_leased = true;
-                }
                 if (!s.leased && s.pending) {
                     any_unleased_pending = true;
+                    break;
                 }
             }
-            if (!any_usable) {
-                stats_.no_slot_quarantined++;
-            } else if (any_unleased_pending) {
+            if (any_unleased_pending) {
                 stats_.no_slot_pending++;
-            } else if (any_leased) {
-                stats_.no_slot_leased++;
             } else {
-                // A usable free slot would have been chosen above; this is a
-                // defensive category for an unexpected state.
-                stats_.no_slot_other++;
+                stats_.no_slot_leased++;
             }
             return false;
         }
@@ -713,8 +710,7 @@ public:
             "TP5_STAGING leases=%llu uploads=%llu upload_bytes=%llu waits=%llu wait_ms=%.3f "
             "enqueues=%llu releases=%llu hits=%llu misses=%llu oversize=%llu alloc_fail=%llu "
             "stale_release=%llu wait_fail=%llu query_fail=%llu no_slot=%llu "
-            "no_slot_leased=%llu no_slot_pending=%llu no_slot_quarantined=%llu "
-            "no_slot_other=%llu reaps=%llu "
+            "no_slot_leased=%llu no_slot_pending=%llu reaps=%llu "
             "queries=%llu quarantine=%llu invalid=%llu "
             "partial=%llu first_error=%d\n",
             (unsigned long long) stats_.leases,
@@ -734,8 +730,6 @@ public:
             (unsigned long long) stats_.no_slot,
             (unsigned long long) stats_.no_slot_leased,
             (unsigned long long) stats_.no_slot_pending,
-            (unsigned long long) stats_.no_slot_quarantined,
-            (unsigned long long) stats_.no_slot_other,
             (unsigned long long) stats_.reaps,
             (unsigned long long) stats_.queries,
             (unsigned long long) stats_.quarantine,
@@ -1076,6 +1070,11 @@ struct api {
     // the destination as unknown and makes submission_pending() true.
     // first_error is unchanged because a rejection is not a native error.
     void (*mark_partial)(const lease * l, const void * dst);
+    // v3 only, appended after mark_partial. Number of kind values the
+    // provider's pool understands. The host rejects a provider whose
+    // kind_count is smaller than its own kKindCount instead of sending kind
+    // values the provider would treat as invalid.
+    uint32_t kind_count;
 };
 
 // Defined by the CUDA/HIP backend.

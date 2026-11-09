@@ -237,6 +237,7 @@ const api kApi = {
     /* .usable            = */ usable,
     /* .zc_enabled        = */ api_zc_enabled,
     /* .mark_partial      = */ api_mark_partial,
+    /* .kind_count       = */ kKindCount,
 };
 
 }  // namespace

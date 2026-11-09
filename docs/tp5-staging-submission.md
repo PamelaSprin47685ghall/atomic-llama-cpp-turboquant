@@ -23,13 +23,16 @@ staging pool. The functions ignore the backend argument: one staging fault in
 one Meta context makes every Meta backend report the error/pending state until
 process exit. Other backends report `0`/`false`.
 
-The CUDA backend's host-only staging `api` table is versioned. Version 2 adds
-`mark_partial` **after** the complete v1 prefix; no v1 field moved. A v1 table
-from an older backend is **rejected at registration** because it cannot publish
-a partial submission; staging then falls back to the original copy path. A
-future version with a different layout is rejected before any new field is
-read. The CPU pool test mirrors the v1 prefix and static-asserts that v2 is an
-append-only extension.
+The CUDA backend's host-only staging `api` table is versioned. Version 2 added
+`mark_partial` after the complete v1 prefix; version 3 appends `kind_count`
+after `mark_partial`. A v1 table cannot publish a partial submission; a v2
+table cannot advertise its kind domain. Both are **rejected at registration**
+before any later field is read, and staging falls back with a warning. A v3
+table is accepted only when `mark_partial` is present and `kind_count` covers
+the host's full kind domain. Mixed v1/v2/v3 installs are explicitly
+unsupported; a provider with a smaller kind domain is rejected instead of
+receiving kind values it would treat as invalid. The CPU pool test mirrors the
+v1 prefix and static-asserts that v3 appends `kind_count` after `mark_partial`.
 
 ## Semantics
 
@@ -407,16 +410,17 @@ error); neither is a latency measurement. A query error is fatal, like a
 failed wait. A not-ready query is a state, not a fault, and the adapter does
 not clear the runtime's sticky error. A slot whose events are still in flight
 stays pending and the async lane falls back, which is the intended transient
-collision. The dump also splits `no_slot` into `no_slot_leased` (every usable
-slot for that key was leased), `no_slot_pending` (at least one usable
-unleased slot was still pending and its events were not all complete),
-`no_slot_quarantined` (no usable slot) and `no_slot_other` (defensive,
-expected zero), and reports
-`leases/no_slot/reaps/queries` per kind on `TP5_STAGING_KIND` lines. The
-global `misses` counter remains the note_source pointer check, not a staging
-miss. The test pins that split and the per-kind sums against a deterministic
-lease collision and a deterministic pending miss. It also asserts the frozen
-v1 `api` prefix at compile time
+collision. The dump splits `no_slot` into the two reachable classes:
+`no_slot_leased` (all usable slots for that key were leased) and
+`no_slot_pending` (at least one usable unleased slot was still pending and
+its events were not all complete). A quarantined/faulted pool is disabled at
+acquire entry, so a fault is not counted as `no_slot`; a free slot is chosen
+by `pick_free_locked` and a too-small slot fails as `oversize`, so there is
+no third class. The dump also reports `leases/no_slot/reaps/queries` per kind
+on `TP5_STAGING_KIND` lines. The global `misses` counter remains the
+note_source pointer check, not a staging miss. The test pins the split and
+the per-kind sums against a deterministic lease collision and a deterministic
+pending miss. It also asserts the frozen v1 `api` prefix at compile time
 and covers a clean rejection after one rank was queued: `mark_partial` stops
 the pool, `submission_pending` is true, `first_error` stays 0, the slot is
 quarantined, and later upload/enqueue/wait/enter_submit/acquire calls fail. A
@@ -428,14 +432,14 @@ fault.
 the `no_slot` composition: a successful acquire can query an incomplete slot
 before reclaiming another, the synchronous path issues no queries, and
 `pending_ranks` can hold 1..16 ranks. Use `no_slot_leased`,
-`no_slot_pending`, `no_slot_quarantined`, `no_slot_other` and the per-kind
-counters directly. The earlier five-rank/five-query inverse applied only to
-the five-rank normal run; it is not a code invariant.
+`no_slot_pending` and the per-kind counters directly. The earlier
+five-rank/five-query inverse applied only to the five-rank normal run; it is
+not a code invariant.
 
 The two union index inputs (`union_inp_k_idxs`, `union_inp_v_idxs`) have
 dedicated kinds. Both are graph inputs on the same graph; before this change
-both classified as generic and could occupy both generic slots. Each now has
-its own double buffer and keeps the 64 KiB per-slot envelope it had as a
+both classified as generic and could occupy both generic slots. In the async
+lane each now has its own double buffer and keeps the 64 KiB per-slot envelope it had as a
 generic input, so eligibility is unchanged. Fixed limits: 4 MiB total pinned
 pool (`kMaxPoolBytes`), 2 MiB per request (`kMaxStagingBytes`), 2 slots per
 (window, kind), and 64 KiB per generic/union slot. The split is not free: it
@@ -452,7 +456,22 @@ split adds no synchronization and does not reuse a slot earlier.
 The CPU test also covers 1/5/16 pending-rank reap query counts, a synchronous
 all-leased miss with zero queries, and the four-window union-kind budget
 (16 slots x 64 KiB = 1 MiB under a 1 MiB cap; the next growth is oversize,
-not no_slot).
+not no_slot). It also checks that a scheduler-decorated union name stays
+generic, that a non-INPUT union input does not stage, that `no_slot` sums to
+`no_slot_leased + no_slot_pending`, and that a faulted pool does not count
+`no_slot`.
+
+The exact union kinds are async-only in the current scheduler. The async lane
+classifies the scheduler's real source tensor (`staging_meta`); the sync lane
+classifies the destination copy, named "%s#%s#%d" (ggml-backend.cpp), and for
+n_copies==1 that copy is not INPUT. Do not parse the decorated name and do
+not relax INPUT: the sync fallback stays generic or unstaged. A future sync
+fix needs a scoped source-identity channel from the scheduler; the copy loop
+already holds the real source tensor, but the public sync set interface passes
+only the destination. The dependency is ggml-backend.cpp's input-copy loop
+(batch and non-batch paths) plus a meta set_tensor hook; the benefit is
+correct kind classification and the real INPUT flag in the sync lane without
+name parsing. Not implemented here.
 
 Per-window staging is not wired. The compose worker's `tl_tp5_window`
 (`fork/tp5-compose/src/runtime.cpp`) is a real per-window thread identity,
@@ -462,14 +481,15 @@ keeps the existing window-0 behavior. A per-window split needs that hook and
 a separate measurement.
 
 The Meta partial test builds a real Meta backend over two CPU child devices and
-injects a v2 staging table whose enqueue queues rank 0 and rejects rank 1. It
+injects a v3 staging table whose enqueue queues rank 0 and rejects rank 1. It
 covers both the synchronous buffer-set lane (`merge_wait` + `enqueue_sync`)
 and the asynchronous lane (`acquire_nowait` + `enqueue_async`). It asserts the
 partial branch calls `mark_partial` before releasing the lease, that
 `submission_pending` becomes true with `first_error == 0`, and that the next
 set hits the fatal submit gate without another enqueue. It also checks that
-registration rejects v1, rejects a v2 table without mark_partial, accepts the
-complete v2 table and rejects a future version.
+registration rejects v1, rejects a v2 table, rejects a v3 table without
+mark_partial, rejects a v3 table whose kind_count is smaller than the host's
+kind domain, accepts the complete v3 table and rejects a future version.
 
 The context-retain test covers, without a model: the live-context reference
 (free-before-context deferral, last-release delete, new-context refusal after

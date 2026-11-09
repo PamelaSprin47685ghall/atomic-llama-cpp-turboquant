@@ -62,6 +62,8 @@ static_assert(offsetof(api, mark_partial) >= sizeof(api_v1),
               "the v2 mark_partial field overlaps the v1 prefix");
 static_assert(offsetof(api, mark_partial) > offsetof(api, zc_enabled),
               "new api fields must be appended after zc_enabled");
+static_assert(offsetof(api, kind_count) > offsetof(api, mark_partial),
+              "the v3 kind_count field must be appended after mark_partial");
 
 int g_allocs = 0;
 int g_frees = 0;
@@ -678,7 +680,6 @@ int test_no_slot_attribution() {
     CHECK(s.no_slot == 1);
     CHECK(s.no_slot_leased == 1);
     CHECK(s.no_slot_pending == 0);
-    CHECK(s.no_slot_quarantined == 0);
     CHECK(s.no_slot_by_kind[size_t(kind::tokens)] == 1);
     CHECK(s.no_slot_by_kind[size_t(kind::generic)] == 0);
     CHECK(s.leases_by_kind[size_t(kind::tokens)] == 2);
@@ -753,9 +754,7 @@ int test_no_slot_attribution() {
     CHECK(no_slot_sum == s.no_slot);
     CHECK(reaps_sum == s.reaps);
     CHECK(queries_sum == s.queries);
-    CHECK(s.no_slot_other == 0);
-    CHECK(s.no_slot_leased + s.no_slot_pending + s.no_slot_quarantined +
-          s.no_slot_other == s.no_slot);
+    CHECK(s.no_slot_leased + s.no_slot_pending == s.no_slot);
     return 0;
 }
 
@@ -1017,6 +1016,9 @@ int test_fault_event_record_quarantine() {
     CHECK(p.enqueue(a, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
     g_fail_event_record = false;
     CHECK(!p.usable());
+    // A disabled pool returns before the no_slot classification: a fault is
+    // not a capacity miss.
+    CHECK(p.snapshot().no_slot == 0);
     CHECK(p.snapshot().quarantine == 1);
     CHECK(p.snapshot().first_error == 3);  // fake_event_record error code
     p.release(a);
@@ -1286,6 +1288,8 @@ int test_staging_candidate() {
     CHECK(classify_name("union_inp_k_idxs") == kind::union_k);
     CHECK(classify_name("union_inp_v_idxs") == kind::union_v);
     CHECK(classify_name("union_inp_k_idxs_extra") == kind::generic);
+    CHECK(classify_name("ROCm0#union_inp_k_idxs#0") == kind::generic);
+    CHECK(classify_name("ROCm0#union_inp_v_idxs#0") == kind::generic);
     CHECK(classify_name("") == kind::generic);
     CHECK(classify_name(nullptr) == kind::generic);
     CHECK(classify_name("blk.0.attn_q.weight") == kind::generic);
@@ -1310,6 +1314,12 @@ int test_staging_candidate() {
     CHECK(!staging_candidate(true, "union_inp_v_idxs", kGenericMaxBytes + 1, max_bytes, &k));
     CHECK(!staging_candidate(true, "union_inp_k_idxs", max_bytes + 1, max_bytes, &k));
     CHECK(!staging_candidate(true, "union_inp_v_idxs", 0, max_bytes, &k));
+    // The sync lane sees the decorated copy name and, for n_copies==1, no
+    // INPUT flag. Neither path may be "fixed" by parsing the name or relaxing
+    // the flag.
+    CHECK(!staging_candidate(false, "union_inp_k_idxs", 64, max_bytes, &k));
+    CHECK(staging_candidate(true, "ROCm0#union_inp_k_idxs#0", 64, max_bytes, &k));
+    CHECK(k == kind::generic);
     // A weight without the input flag never stages, even with a matching name.
     CHECK(!staging_candidate(false, "inp_tokens", 128, max_bytes, &k));
     // Size bound covers the 32-row MTP hidden input and rejects larger blocks.

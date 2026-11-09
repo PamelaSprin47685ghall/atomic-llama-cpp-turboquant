@@ -2,7 +2,7 @@
 //
 // A MIRRORED Meta submission can queue rank 0 and then get a clean rejection
 // from rank 1. The destination is partially written; the Meta layer must call
-// the v2 staging mark_partial entry instead of returning a silent success.
+// the v3 staging mark_partial entry instead of returning a silent success.
 //
 // Both lanes are exercised:
 //   * the synchronous buffer set path (merge_wait + enqueue_sync), and
@@ -161,6 +161,7 @@ const api g_fake_api = {
     /* .usable            = */ fake_usable,
     /* .zc_enabled        = */ nullptr,
     /* .mark_partial      = */ fake_mark_partial,
+    /* .kind_count       = */ kKindCount,
 };
 
 ggml_backend_meta_split_state split_mirrored(const ggml_tensor *, void *) {
@@ -211,10 +212,11 @@ bool make_fixture(ggml_backend_dev_t cpu, meta_fixture & fixture) {
 } // namespace
 
 int main() {
-    // The registration gate accepts only a v2 table with mark_partial. A v1
-    // table cannot publish a partial submission, so it is rejected and the
-    // staging path falls back instead of aborting later. An unknown future
-    // version is rejected before any new field is read.
+    // The registration gate accepts only a v3 table with mark_partial and a
+    // kind_count covering the host's kind domain. A v1 table cannot publish a
+    // partial submission; a v2 table cannot advertise its kind domain. Both
+    // are rejected and the staging path falls back instead of aborting later.
+    // An unknown future version is rejected before any new field is read.
     const void * before = ggml_backend_meta_staging_get();
     api v1 = {};
     v1.abi_version = 1;
@@ -226,9 +228,19 @@ int main() {
     CHECK(!ggml_backend_meta_staging_register(&future));
     CHECK(ggml_backend_meta_staging_get() == before);
 
+    api v2 = g_fake_api;
+    v2.abi_version = 2;
+    CHECK(!ggml_backend_meta_staging_register(&v2));
+    CHECK(ggml_backend_meta_staging_get() == before);
+
     api broken = g_fake_api;
     broken.mark_partial = nullptr;
     CHECK(!ggml_backend_meta_staging_register(&broken));
+    CHECK(ggml_backend_meta_staging_get() == before);
+
+    api short_kinds = g_fake_api;
+    short_kinds.kind_count = uint32_t(kKindCount - 1);
+    CHECK(!ggml_backend_meta_staging_register(&short_kinds));
     CHECK(ggml_backend_meta_staging_get() == before);
 
     CHECK(ggml_backend_meta_staging_register(&g_fake_api));
