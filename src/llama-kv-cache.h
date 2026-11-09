@@ -150,6 +150,8 @@ public:
 
     // fixed-slot pool of decode scratches. Two slots cover a nested decode;
     // an exhausted pool falls back to the single scratch or to local vectors.
+    // The pool synchronizes the scratch buffers only: the cache cells and
+    // heads still belong to one decode thread at a time.
     class decode_scratch_pool {
     public:
         decode_scratch_pool() = default;
@@ -662,7 +664,18 @@ private:
         void reserve(size_t n) {
             std::lock_guard<std::mutex> lock(mutex);
 
-            for (size_t i = storage.size(); i < n; ++i) {
+            if (n <= storage.size()) {
+                return;
+            }
+
+            // reserve both vectors before publishing a slot, so neither push
+            // below can fail and leave the slot outside free. this also keeps
+            // every future release() from allocating: free never holds more
+            // entries than storage.
+            storage.reserve(n);
+            free.reserve(n);
+
+            while (storage.size() < n) {
                 storage.push_back(std::make_unique<snapshot_slot>());
                 free.push_back(storage.back().get());
             }
@@ -778,6 +791,15 @@ public:
 
     // returns the decode scratch, when the context holds one
     ~llama_kv_cache_context() override;
+
+    // the context owns the decode scratch, the split ubatches and the cache
+    // pointer. a copy would return the same scratch twice, and a move would
+    // leave the source still holding it. keep ownership in the unique_ptr
+    // that creates the context.
+    llama_kv_cache_context(const llama_kv_cache_context &)             = delete;
+    llama_kv_cache_context & operator=(const llama_kv_cache_context &) = delete;
+    llama_kv_cache_context(llama_kv_cache_context &&)                  = delete;
+    llama_kv_cache_context & operator=(llama_kv_cache_context &&)      = delete;
 
     //
     // llama_memory_context_i

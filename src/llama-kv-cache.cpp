@@ -1273,6 +1273,24 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
         slot_info_vec_t &           sinfos   = scratch != nullptr ? scratch->sinfos   : sinfos_local;
         std::vector<llama_ubatch> & ubatches = scratch != nullptr ? scratch->ubatches : ubatches_local;
 
+        // every exit that does not hand the scratch to the batch context
+        // returns it here. without this, an allocation failure between
+        // scratch_acquire() and set_decode_scratch() would leave the pool
+        // slot out of free forever.
+        struct scratch_guard {
+            llama_kv_cache &            kv;
+            decode_scratch *            scratch;
+            slot_info_vec_t &           sinfos;
+            std::vector<llama_ubatch> & ubatches;
+            bool                        transferred = false;
+
+            ~scratch_guard() {
+                if (!transferred) {
+                    kv.scratch_return(sinfos, ubatches, scratch);
+                }
+            }
+        } guard { *this, scratch, sinfos, ubatches };
+
         ubatches.clear();
 
         while (true) {
@@ -1287,12 +1305,10 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         if (balloc.get_n_used() < balloc.get_n_tokens()) {
             // failed to find a suitable split
-            scratch_return(sinfos, ubatches, scratch);
             break;
         }
 
         if (!prepare_into(ubatches, sinfos, scratch)) {
-            scratch_return(sinfos, ubatches, scratch);
             break;
         }
 
@@ -1300,6 +1316,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
                 this, std::move(sinfos), std::move(ubatches));
 
         ctx->set_decode_scratch(scratch);
+        guard.transferred = true;
 
         return ctx;
     } while (false);
@@ -1407,8 +1424,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_reference(const std::vec
 // pooled prepare: the same search, apply and restore order as
 // prepare_reference(), with the recovery snapshots taken from the pool
 bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, slot_info_vec_t & res, decode_scratch * scratch) {
-    // the reference path returns an empty vector for an empty batch, which
-    // every caller treats as a failed prepare
+    // an empty batch cannot be placed: the reference path asserts on it, so
+    // return the failure that every caller already handles
     if (ubatches.empty()) {
         res.clear();
         return false;
@@ -1429,6 +1446,13 @@ bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, sl
     states.clear();
     pooled.clear();
     fallback.clear();
+
+    // reserve the recovery vectors before acquiring any slot: the push_backs
+    // below then cannot throw after snapshots.acquire() has removed a slot
+    // from free and before that slot reaches pooled/fallback
+    states.reserve(ubatches.size());
+    pooled.reserve(ubatches.size());
+    fallback.reserve(ubatches.size());
 
     // release every acquired slot on all return paths
     struct slot_guard {

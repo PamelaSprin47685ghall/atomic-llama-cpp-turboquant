@@ -31,7 +31,7 @@ Run before any GPU smoke. A stale `install/bin/tq-tp5-compose` with a newer
   - `install/bin/tq-tp5-compose`: `GGML_TP5_PLAN_UNION`, `TP5_MTP_BATCH_POOL`,
     `TP5_TEXT_POOL` (the other WS switches live in the libraries).
   - `install/lib/libllama`: `TP5_UBATCH_POOL`, `TP5_KV_SNAPSHOT_POOL`,
-    `TP5_UBATCH_TRACE`.
+    `TP5_DECODE_SCRATCH_POOL`, `TP5_UBATCH_TRACE`.
   - `install/lib/libggml-hip`: `GGML_TP5_STAGING`, `GGML_TP5_PLAN_UNION`,
     `GGML_TP5_RELAY_FRAMES`, `GGML_TP5_POOL_EXACT`, `GGML_TP5_GRAPH_UID`.
   - A missing string in the artifact that owns it means the install is stale:

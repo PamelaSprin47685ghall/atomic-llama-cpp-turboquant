@@ -14,7 +14,15 @@
 #include <cstdlib>
 #include <new>
 #include <thread>
+#include <type_traits>
 #include <vector>
+
+// the batch context owns its decode scratch, so a copy or move would return
+// the same scratch twice
+static_assert(!std::is_copy_constructible_v<llama_kv_cache_context>, "kv context must own its scratch");
+static_assert(!std::is_copy_assignable_v<llama_kv_cache_context>,    "kv context must own its scratch");
+static_assert(!std::is_move_constructible_v<llama_kv_cache_context>, "kv context must own its scratch");
+static_assert(!std::is_move_assignable_v<llama_kv_cache_context>,    "kv context must own its scratch");
 
 static std::atomic<long long> g_allocs{0};
 static std::atomic<long long> g_frees{0};
@@ -287,6 +295,86 @@ static void test_decode_scratch_pool() {
     check(pool.in_use() == 0, "scratch pool: every slot returned");
 }
 
+// The decode scratch is handed to one batch context at a time. Under
+// contention the free-list must never give the same slot to two threads, and
+// every slot must come back when its owner releases it.
+static void test_decode_scratch_pool_concurrency() {
+    constexpr int threads = 8;
+    constexpr int rounds  = 20000;
+
+    {
+        llama_kv_cache::decode_scratch_pool pool(threads);
+
+        std::atomic<long long> errors{0};
+        std::vector<std::thread> workers;
+        workers.reserve(threads);
+
+        for (int t = 0; t < threads; ++t) {
+            workers.emplace_back([&, t] {
+                for (int i = 0; i < rounds; ++i) {
+                    auto * s = pool.acquire();
+                    if (s == nullptr) {
+                        errors.fetch_add(1);
+                        continue;
+                    }
+
+                    // the slot is exclusive: no other thread may overwrite
+                    // this stamp while the acquire is held
+                    const uint32_t stamp = static_cast<uint32_t>(t*rounds + i) + 1;
+                    s->sinfos.resize(1);
+                    s->sinfos[0].s0 = stamp;
+                    std::this_thread::yield();
+                    if (s->sinfos[0].s0 != stamp) {
+                        errors.fetch_add(1);
+                    }
+
+                    pool.release(s);
+                }
+            });
+        }
+
+        for (auto & worker : workers) {
+            worker.join();
+        }
+
+        check(errors.load() == 0, "scratch pool concurrent: exclusive slot");
+        check(pool.in_use() == 0, "scratch pool concurrent: every slot returned");
+        check(pool.fallbacks() == 0, "scratch pool concurrent: capacity was sufficient");
+    }
+
+    {
+        // an exhausted pool counts every refusal and still returns every
+        // acquired slot
+        llama_kv_cache::decode_scratch_pool pool(2);
+
+        constexpr int workers_n = 8;
+        std::atomic<long long> refusals{0};
+        std::vector<std::thread> workers;
+        workers.reserve(workers_n);
+
+        for (int t = 0; t < workers_n; ++t) {
+            workers.emplace_back([&] {
+                for (int i = 0; i < 2000; ++i) {
+                    auto * s = pool.acquire();
+                    if (s == nullptr) {
+                        refusals.fetch_add(1);
+                        continue;
+                    }
+                    pool.release(s);
+                }
+            });
+        }
+
+        for (auto & worker : workers) {
+            worker.join();
+        }
+
+        check(pool.in_use() == 0, "scratch pool exhausted: every slot returned");
+        check(static_cast<long long>(pool.fallbacks()) == refusals.load(),
+              "scratch pool exhausted: every refusal counted");
+    }
+}
+
 static void test_kv_snapshot_slot_reuse() {
     llama_kv_cells src;
     src.resize(64);
@@ -378,6 +466,7 @@ int main() {
     test_steady_state();
     test_concurrency();
     test_decode_scratch_pool();
+    test_decode_scratch_pool_concurrency();
     test_kv_snapshot_slot_reuse();
     test_kv_cells_cp_into();
 
