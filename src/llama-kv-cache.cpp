@@ -1401,28 +1401,21 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_reference(const std::vec
 
     GGML_ASSERT(!states.empty() || !success);
 
-    // This reverse restore is the normal-path rollback: it runs when
-    // find_slot() rejects a ubatch. An allocation failure after
-    // apply_ubatch() unwinds past it and leaves the simulated placement in
-    // the cells. That failure is a C++ exception escaping llama_decode(),
-    // not a llama_decode() return: llama_decode() has no exception contract,
-    // a C caller cannot catch it, and a C++ caller catches it outside the
-    // documented return-code path. The partial-memory rule for abort (2) and fatal
-    // error (< -1) tells the caller to reconcile with
+    // This reverse restore always runs, on success and on the find_slot
+    // failure path: it undoes every recorded trial placement. The exception
+    // window starts after the first apply_ubatch(). An allocation failure
+    // there unwinds past this loop and leaves the simulated placement in the
+    // cells. That failure is a C++ exception escaping llama_decode(), not a
+    // llama_decode() return: llama_decode() has no exception contract, a C
+    // caller cannot catch it, and a C++ caller catches it outside the
+    // documented return-code path. The partial-memory rule for abort (2) and
+    // fatal error (< -1) tells the caller to reconcile with
     // llama_memory_seq_pos_min/max(); it does not make this exception a
     // supported return. A no-throw rollback is impossible here because
     // set() re-inserts into used/seq_pos (std::set/std::map) and can allocate.
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
-        const auto & sinfo = it->sinfo;
-
-        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            auto & cells = v_cells[sinfo.strm[s]];
-            auto & head  = v_heads[sinfo.strm[s]];
-
-            cells.set(sinfo.idxs[s], it->v_cells[s]);
-            head = it->v_heads_old[s];
-        }
+        restore_cells(v_cells, v_heads, it->sinfo, it->v_heads_old, it->v_cells);
     }
 
     if (!success) {
@@ -1536,19 +1529,10 @@ bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, sl
 
     GGML_ASSERT(!states.empty() || !success);
 
-    // same normal-path rollback as prepare_reference(); the exception note
-    // there applies here too
-    // iterate backwards and restore the cells to their original state
+    // the same always-run reverse restore as prepare_reference(); the
+    // exception note there applies here too
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
-        const auto & sinfo = (*it)->sinfo;
-
-        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            auto & cells = v_cells[sinfo.strm[s]];
-            auto & head  = v_heads[sinfo.strm[s]];
-
-            cells.set(sinfo.idxs[s], (*it)->v_cells[s]);
-            head = (*it)->v_heads_old[s];
-        }
+        restore_cells(v_cells, v_heads, (*it)->sinfo, (*it)->v_heads_old, (*it)->v_cells);
     }
 
     if (!success) {

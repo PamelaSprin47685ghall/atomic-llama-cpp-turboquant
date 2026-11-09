@@ -127,6 +127,39 @@ build reused `/tmp/r28b-pillar5-cpu` (reconfigured with
 `ggml/src/ggml-cuda/mmvf.cu`; that is the pre-existing red item recorded in
 Section A, not a new mismatch from this round.
 
+### B4. Multi-stream restore round 2026-11-09
+
+Base `a93914c36` (`feat/pillar5-refine-20261109`). Cherry-picks
+`e126dbf3f` from `feat/pillar5-refine-kv-polish-20261109`. The cherry-pick
+conflicted in `src/llama-kv-cache.cpp` and `fork/upstream-exceptions.json`;
+`src/llama-kv-cache.h` and the test merged cleanly. The resolution keeps
+`24d086a80`'s context copy/move deletion and `40ea8d93b`'s exact exception
+boundary, and fuses the multi-stream restore description. The resolved hunks
+contain comment and manifest text only; the restore logic and the test are
+the source commit's. These three entries are re-signed for this round only.
+The older B3 hashes are left as history; this section does not rewrite them,
+and no Section A/C drift is re-signed.
+
+| path | old recorded at a93914c36 | new hash | source / responsibility |
+|---|---|---|---|
+| `src/llama-kv-cache.cpp` | `b69703a4140951c6b5526b13419f0c928795d2d8ae3ccd6d5cc8defd2abe335c` | `1b50c714a6ca94a841c3c6cc27954bb942fef9ad188226241bf31321a926f7d0` | `e126dbf3f`: both prepare paths call the inline `restore_cells()`; it restores head `v_heads_old[sinfo.strm[s]]` and cells `v_cells_old[s]`. The fused comment states that the reverse restore runs on success and on the find_slot failure path, and that the exception window starts after the first `apply_ubatch()`; it keeps the exact C++ exception boundary from `40ea8d93b`. |
+| `src/llama-kv-cache.h` | `5c8099c830c0f928f2946c77b16b9509f06638dbb879ed75ca27a5bd03cbb775` | `beaa815a0ea1638c6ef9b94b6e958586557cfb1270f40a8092f8a1b2ae0a5e9e` | `e126dbf3f`: exposes the inline `restore_cells()` helper. The context copy/move deletion from `24d086a80` is retained unchanged. |
+| `tests/test-tp5-ubatch-pool.cpp` | `bac8b583b2794ad9850a1c59195fe6a12a1acfd4252ab46f2eb5c97b88f06b34` | `ffd14c9077c1e690653bbb0a9f15e4a94128b3661e7e41822ac90ad3537d2326` | `e126dbf3f`: adds `test_restore_cells_multi_stream()` with stream orders (3,1) and (1,3), two reverse-ordered trial placements, and a find_slot-failure-shaped restore. |
+
+Verification: the source branch reported the narrow `test-tp5-ubatch-pool`
+check passing; it was not rerun here because the resolution changed only
+comments and manifest/waiver text. The three actual file digests match the
+table, and `python3 fork/check-upstream.py` still fails first at
+`ggml/src/ggml-cuda/mmvf.cu`, the pre-existing Section A red item; no new
+mismatch and no historical red item was re-signed.
+
+Known uncovered boundary: the added test calls `restore_cells()` directly
+with synthetic cells; it does not execute `prepare_reference()` or
+`prepare_into()` through a real multi-stream `llama_decode()`. The reachable
+case is `kv_unified=false` with non-contiguous, out-of-order sequence ids
+(for example {2,3}); the unified path keeps `sinfo.strm[s] == s` and does not
+exercise the index mismatch.
+
 ## C. Pre-existing undeclared A paths
 
 172 paths remain undeclared after registering the WS2/WS3/WS4/WS5 paths.

@@ -431,6 +431,33 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // restore one trial placement: the cells of every stream in sinfo return to
+    // v_cells_old[s], and the head of stream sinfo.strm[s] returns to
+    // v_heads_old[sinfo.strm[s]]. v_cells_old is indexed by the sinfo stream
+    // order, not by stream id.
+    static void restore_cells(
+            llama_kv_cells_vec & v_cells,
+            std::vector<uint32_t> & v_heads,
+            const slot_info & sinfo,
+            const std::vector<uint32_t> & v_heads_old,
+            const std::vector<llama_kv_cells> & v_cells_old) {
+        GGML_ASSERT(v_cells_old.size() >= sinfo.n_stream());
+
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const uint32_t stream = static_cast<uint32_t>(sinfo.strm[s]);
+
+            GGML_ASSERT(stream < v_cells.size());
+            GGML_ASSERT(stream < v_heads.size());
+            GGML_ASSERT(stream < v_heads_old.size());
+
+            auto & cells = v_cells[stream];
+            auto & head  = v_heads[stream];
+
+            cells.set(sinfo.idxs[s], v_cells_old[s]);
+            head = v_heads_old[stream];
+        }
+    }
+
     //
     // input API
     //

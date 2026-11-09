@@ -451,6 +451,168 @@ static void test_kv_cells_cp_into() {
     check(alloc_delta() == base, "kv: 10k cp_into, zero net allocation after warmup");
 }
 
+// A multi-stream ubatch can name its streams out of order. The reverse restore
+// must return each stream's head to that stream's own snapshot, and it must run
+// on the success path as well as on the find_slot failure path.
+static void test_restore_cells_multi_stream() {
+    const auto set_cell = [](llama_kv_cells & cells, uint32_t idx, llama_pos pos, llama_seq_id seq) {
+        cells.pos_set(idx, pos);
+        cells.seq_add(idx, seq);
+    };
+
+    const auto make_cells = [&]() {
+        llama_kv_cells_vec cells(4);
+        for (auto & cells_i : cells) {
+            cells_i.resize(8);
+        }
+        set_cell(cells[1], 2, 10, 1);
+        set_cell(cells[3], 0, 30, 3);
+        set_cell(cells[3], 1, 31, 3);
+        return cells;
+    };
+
+    const auto snapshot = [](const llama_kv_cells_vec & cells, const llama_kv_cache::slot_info & sinfo) {
+        std::vector<llama_kv_cells> out(sinfo.n_stream());
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            cells[sinfo.strm[s]].cp_into(sinfo.idxs[s], out[s]);
+        }
+        return out;
+    };
+
+    const auto place = [](llama_kv_cells_vec & cells, std::vector<uint32_t> & heads,
+                          const llama_kv_cache::slot_info & sinfo,
+                          llama_pos base, llama_seq_id seq) {
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            auto & cells_s = cells[sinfo.strm[s]];
+            for (uint32_t i = 0; i < sinfo.idxs[s].size(); ++i) {
+                const uint32_t idx = sinfo.idxs[s][i];
+                if (!cells_s.is_empty(idx)) {
+                    cells_s.rm(idx);
+                }
+                cells_s.pos_set(idx, base + static_cast<llama_pos>(i));
+                cells_s.seq_add(idx, seq);
+            }
+            heads[sinfo.strm[s]] = sinfo.idxs[s].back() + 1;
+        }
+    };
+
+    {
+        auto cells = make_cells();
+        std::vector<uint32_t> heads = { 0, 3, 0, 2 };
+
+        llama_kv_cache::slot_info sinfo = {};
+        sinfo.s0 = 1;
+        sinfo.s1 = 3;
+        sinfo.strm = { 3, 1 };
+        sinfo.idxs = { { 0, 1 }, { 2 } };
+
+        const auto old_cells = snapshot(cells, sinfo);
+        const auto old_heads = heads;
+
+        place(cells, heads, sinfo, 90, 7);
+        llama_kv_cache::restore_cells(cells, heads, sinfo, old_heads, old_cells);
+
+        check(heads == old_heads, "restore multi-stream: heads (3,1)");
+        check(cells[3].pos_get(0) == 30 && cells[3].seq_get(0) == 3,
+              "restore multi-stream: stream 3 cell 0");
+        check(cells[3].pos_get(1) == 31 && cells[3].seq_get(1) == 3,
+              "restore multi-stream: stream 3 cell 1");
+        check(cells[1].pos_get(2) == 10 && cells[1].seq_get(2) == 1,
+              "restore multi-stream: stream 1 cell 2");
+        check(cells[0].get_used() == 0 && cells[2].get_used() == 0,
+              "restore multi-stream: untouched streams");
+    }
+
+    {
+        auto cells = make_cells();
+        std::vector<uint32_t> heads = { 0, 5, 0, 6 };
+
+        llama_kv_cache::slot_info sinfo = {};
+        sinfo.s0 = 1;
+        sinfo.s1 = 3;
+        sinfo.strm = { 1, 3 };
+        sinfo.idxs = { { 2 }, { 0, 1 } };
+
+        const auto old_cells = snapshot(cells, sinfo);
+        const auto old_heads = heads;
+
+        place(cells, heads, sinfo, 90, 7);
+        llama_kv_cache::restore_cells(cells, heads, sinfo, old_heads, old_cells);
+
+        check(heads == old_heads, "restore multi-stream: heads (1,3)");
+        check(cells[1].pos_get(2) == 10 && cells[1].seq_get(2) == 1,
+              "restore multi-stream: stream 1 cell 2");
+        check(cells[3].pos_get(0) == 30 && cells[3].seq_get(0) == 3,
+              "restore multi-stream: stream 3 cell 0");
+        check(cells[3].pos_get(1) == 31 && cells[3].seq_get(1) == 3,
+              "restore multi-stream: stream 3 cell 1");
+    }
+
+    {
+        // two successful trial placements restore in reverse order
+        auto cells = make_cells();
+        std::vector<uint32_t> heads = { 0, 3, 0, 2 };
+
+        llama_kv_cache::slot_info first = {};
+        first.s0 = 3;
+        first.s1 = 3;
+        first.strm = { 3 };
+        first.idxs = { { 0 } };
+
+        llama_kv_cache::slot_info second = {};
+        second.s0 = 1;
+        second.s1 = 3;
+        second.strm = { 1, 3 };
+        second.idxs = { { 2 }, { 1 } };
+
+        const auto old_heads = heads;
+        const auto first_cells = snapshot(cells, first);
+        place(cells, heads, first, 70, 7);
+
+        const auto second_heads = heads;
+        const auto second_cells = snapshot(cells, second);
+        place(cells, heads, second, 80, 8);
+
+        llama_kv_cache::restore_cells(cells, heads, second, second_heads, second_cells);
+        llama_kv_cache::restore_cells(cells, heads, first, old_heads, first_cells);
+
+        check(heads == old_heads, "restore trial placement: heads");
+        check(cells[3].pos_get(0) == 30 && cells[3].seq_get(0) == 3,
+              "restore trial placement: stream 3 cell 0");
+        check(cells[3].pos_get(1) == 31 && cells[3].seq_get(1) == 3,
+              "restore trial placement: stream 3 cell 1");
+        check(cells[1].pos_get(2) == 10 && cells[1].seq_get(2) == 1,
+              "restore trial placement: stream 1 cell 2");
+    }
+
+    {
+        // find_slot fails for the next ubatch: only the recorded trial
+        // placement is undone
+        auto cells = make_cells();
+        std::vector<uint32_t> heads = { 0, 3, 0, 2 };
+
+        llama_kv_cache::slot_info applied = {};
+        applied.s0 = 3;
+        applied.s1 = 3;
+        applied.strm = { 3 };
+        applied.idxs = { { 0, 1 } };
+
+        const auto old_heads = heads;
+        const auto applied_cells = snapshot(cells, applied);
+        place(cells, heads, applied, 70, 7);
+
+        llama_kv_cache::restore_cells(cells, heads, applied, old_heads, applied_cells);
+
+        check(heads == old_heads, "restore find_slot failure: heads");
+        check(cells[3].pos_get(0) == 30 && cells[3].seq_get(0) == 3,
+              "restore find_slot failure: stream 3 cell 0");
+        check(cells[3].pos_get(1) == 31 && cells[3].seq_get(1) == 3,
+              "restore find_slot failure: stream 3 cell 1");
+        check(cells[1].pos_get(2) == 10 && cells[1].seq_get(2) == 1,
+              "restore find_slot failure: untouched stream 1");
+    }
+}
+
 int main() {
     test_reuse_and_lifetime();
     test_pool_outlives_owner();
@@ -461,6 +623,7 @@ int main() {
     test_decode_scratch_pool_concurrency();
     test_kv_snapshot_slot_reuse();
     test_kv_cells_cp_into();
+    test_restore_cells_multi_stream();
 
     std::printf("%s failures=%d allocs=%lld frees=%lld\n",
                 g_failures ? "FAILED" : "OK", g_failures,
