@@ -215,6 +215,144 @@ verified statically, not by execution. The version check is only exercised
 for the short v1/v2 tables by the source test; no real mixed v2/v3 HIP
 provider was exercised. GPU/HIP staging was not run.
 
+### B6. MTP batch pool and batch-caller migration round 2026-11-09
+
+Base `393d917` (`feat/pillar5-refine-20261109`). Cherry-picks
+`410ffb70c` -> `390556d62` -> `07e19d229` -> `d7d2cf87a` from
+`feat/pillar5-refine-mtp-pool`. Two files conflicted:
+`fork/tp5-compose/tests/test-host-pool.cpp` (both sides inserted tests at
+the same points; keep the piece-scratch test and every MTP/failure test,
+and restore the function brace git moved outside the conflict) and
+`fork/tp5-compose/CMakeLists.txt` (keep `TP5_TEST_VOCAB_DEFAULT` and merge
+the `llama` + `${CMAKE_DL_LIBS}` link). The other 62 files merged
+automatically.
+
+Manifest disposition. `include/llama.h` and `src/llama-batch.cpp` matched
+their parent manifest digests at `393d917`; their final digests are signed
+after review. The three A entries below also matched at `393d917`, but the
+four commits changed their files; they keep the parent digest as red items
+and were not re-signed.
+
+| path | parent manifest at 393d917 | current actual | disposition |
+|---|---|---|---|
+| `src/llama-context.cpp` | `0d758756c2aef1947a8d92f372b13346350052f87d352ef48397876fd3ebfa84` | `cd2c18cb4997c9b5d30e4d10429957977aecee5114ee0e461c7e9dc579771aae` | keep parent digest; red item; not re-signed |
+| `tests/test-tp5-prefab-subenvelope.cpp` | `37a4d9d30f7b171eeca3157f78261e44018f4a886e7b2784a8e8d2ae8f5683c6` | `36d3c3f049c8e594f39bdf0330ecc5db147c2eda82d7d0b5512332eae09db2e3` | keep parent digest; red item; not re-signed |
+| `tools/server/server-context.cpp` | `a5892b7e9101f08a05769387758e736c038bc22fd70afad43d9b07f013041e2d` | `28518ef8ed529962a82d55cf04d9a39c737493b0c40307e33d4e859c7d1affc6` | keep parent digest; red item; not re-signed |
+
+| path | parent manifest at 393d917 | final hash |
+|---|---|---|
+| `include/llama.h` | `58840cdf4f40fb0b3e912a7b2817d4a7ceaf28a180f5b6ddcda46212b588c4ad` | `db1c349d56e1e7a5d8b7efdb8f50a56fe076f500c5dbefb45311b422080d2585` |
+| `src/llama-batch.cpp` | `4519681d562c9702bbb0e69ba61b4917407a5250b994bcb32142696be1fcd815` | `42468b792b218a0ac33f2cfe7607a8d26d87979a8c107c070a38a32ae0e74bd7` |
+
+The remaining 58 changed paths have no manifest entry. They are listed
+below as new/unregistered red items; no entry was added, and no historical
+red item was re-signed. The B4/B5 staging red items (`docs`, `meta.cpp`,
+`staging.h`, `test-pool`) and the Section A `mmvf.cu` drift are unchanged.
+
+`common/` (1):
+
+- `common/speculative.cpp`
+
+`examples/` (12):
+
+- `examples/batched/batched.cpp`
+- `examples/diffusion/diffusion.cpp`
+- `examples/embedding/embedding.cpp`
+- `examples/llama.android/lib/src/main/cpp/ai_chat.cpp`
+- `examples/lookahead/lookahead.cpp`
+- `examples/lookup/lookup.cpp`
+- `examples/parallel/parallel.cpp`
+- `examples/passkey/passkey.cpp`
+- `examples/retrieval/retrieval.cpp`
+- `examples/speculative-simple/speculative-simple.cpp`
+- `examples/speculative/speculative.cpp`
+- `examples/turboanchorkv/turboanchorkv.cpp`
+
+`fork/` (12):
+
+- `fork/batch-compose/src/main.cpp`
+- `fork/rerot-compose/src/native.cpp`
+- `fork/tests/a-seams/recurrent-lifecycle-test.cpp`
+- `fork/tests/a-seams/rerot-attention-oracle.cpp`
+- `fork/tests/a-seams/rerot-native-trace.cpp`
+- `fork/tests/a-seams/rerot-reader-views.cpp`
+- `fork/tp5-compose/CMakeLists.txt`
+- `fork/tp5-compose/README.md`
+- `fork/tp5-compose/src/host_pool.h`
+- `fork/tp5-compose/src/runtime.cpp`
+- `fork/tp5-compose/tests/fail-malloc.c`
+- `fork/tp5-compose/tests/test-host-pool.cpp`
+
+`tests/` (27):
+
+- `tests/nkv-cpu-probe/nout_runtime_probe.cpp`
+- `tests/nkv-cpu-probe/pad_lane_ab_gate.cpp`
+- `tests/nkv-cpu-probe/padmax_cpu_probe.cpp`
+- `tests/nkv-cpu-probe/union_varlen_e2e.cpp`
+- `tests/nkv-cpu-probe/varlen_output_probe.cpp`
+- `tests/rsz/graph_reuse_probe.c`
+- `tests/test-backend-sampler.cpp`
+- `tests/test-fused-qkv-refusal.cpp`
+- `tests/test-llama-archs.cpp`
+- `tests/test-nkv-exact-width.cpp`
+- `tests/test-nkv-runtime-param.cpp`
+- `tests/test-ntok-bind-replay.cpp`
+- `tests/test-ntok-cross-matrix.cpp`
+- `tests/test-ntok-onegraph.cpp`
+- `tests/test-ntok-strict.cpp`
+- `tests/test-recurrent-state-rollback.cpp`
+- `tests/test-rsz-hybrid-compose.cpp`
+- `tests/test-rsz-multiseq-decode.cpp`
+- `tests/test-rsz-nkv-rsz-topology.cpp`
+- `tests/test-rsz-runtime-param.cpp`
+- `tests/test-rsz-union-combo.cpp`
+- `tests/test-save-load-state.cpp`
+- `tests/test-state-restore-fragmented.cpp`
+- `tests/test-topology-key-sweep.cpp`
+- `tests/test-union-binder-rsz.cpp`
+- `tests/test-union-binder-stock-equiv.cpp`
+- `tests/test-union-four-param-matrix.cpp`
+
+`tools/` (6):
+
+- `tools/batched-bench/batched-bench.cpp`
+- `tools/imatrix/imatrix.cpp`
+- `tools/mtmd/mtmd-cli.cpp`
+- `tools/mtmd/mtmd-helper.cpp`
+- `tools/perplexity/perplexity.cpp`
+- `tools/results/results.cpp`
+
+Contract checks: `llama_batch_is_complete()` documents that `n_tokens`
+must be the capacity passed to `llama_batch_init()` (or a smaller number
+of initialized `seq_id` entries); a larger value reads past `seq_id`.
+The inspected call sites pass the same capacity expression used at init;
+the pool passes `1` for `llama_batch_init(1, wide, 1)`, and no inspected
+call passes a larger running count. `llama_batch_init()` initializes the
+outer `seq_id` array with a null sentinel, checks every allocation and
+size multiplication, and returns null fields on failure;
+`llama_batch_free()` stops at the first null `seq_id` entry. The pool
+discards a partial batch, leaves the slot unready, and retries; the
+fallback token is freed once. CMake enables C, builds the test-only
+`fail-malloc` interposer, runs the test through `cmake -E env` with
+`LD_PRELOAD` and `TP5_REQUIRE_FAIL_MALLOC=1`, and keeps the existing
+`TP5_TEST_VOCAB_DEFAULT` define and `TQText::text` link.
+
+Verification: the narrow CPU check built `tq_tp5_host_pool_tests` and
+`tp5_fail_malloc` from this tree against the freshly rebuilt `libllama`
+(build commit `0804b304b`), loaded with `LD_PRELOAD`. Normal run: 73
+`PASS`, 0 `FAIL`, 3 `SKIP`, exit 0. With the fail-malloc interposer and
+`TP5_REQUIRE_FAIL_MALLOC=1`: 112 `PASS`, 0 `FAIL`, 0 `SKIP`, exit 0. The
+source branch's earlier normal 67 `PASS` / 3 `SKIP` and interposer 103
+`PASS` / 0 `FAIL` were not repeated as the same check. The guard was not
+rerun; the red items above remain, so this integration is not clean.
+
+Known uncovered boundary: no full link/build of every migrated caller, no
+GPU/full-suite run, and no execution of the 58 unregistered paths or the
+three red A files beyond static review. The narrow check covers the
+host-pool test and its CMake wiring only. A future caller that passes a
+value larger than the init capacity would still read past `seq_id`,
+because `llama_batch` does not store the capacity.
+
 ## C. Pre-existing undeclared A paths
 
 172 paths remain undeclared after registering the WS2/WS3/WS4/WS5 paths.
