@@ -19,6 +19,7 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t index);
 #include "dw_event_trace.h"
 #include "dw_compose_event.h"
 #include "host_pool.h"
+#include "mtp_state_checkpoint.h"
 
 #include <algorithm>
 #include <dlfcn.h>
@@ -2404,13 +2405,17 @@ run_result run(const options & requested) {
                         diag_state+=now_ns()-start; ++diag_state_count;
                         return result;
                     };
-                    std::vector<std::uint8_t>           target_state_checkpoint;
+                    mtp_state_checkpoint                target_state_checkpoint;
                     std::vector<std::size_t>             local_rows;
                     local_rows.reserve(ids.size());
                     for (auto id : ids) {
                         result.requests[id].admitted_ns = now_ns();
                     }
                     while (!failure.stopped.load()) {
+                        // A host checkpoint belongs to one epoch. Drop any
+                        // previous snapshot before this epoch can create or
+                        // consume one.
+                        target_state_checkpoint.invalidate();
                         batch.clear();
                         local_rows.clear();
                         std::uint32_t output_rows = 0;
@@ -2442,11 +2447,15 @@ run_result run(const options & requested) {
                                 state_sz=llama_state_seq_get_size_ext(ctx,0,checkpoint_flags);
                                 require(state_sz>0 && state_sz<=(512ull<<20),
                                         "MTP valid full GDN+KV checkpoint unavailable");
-                                target_state_checkpoint.resize(state_sz);
-                                const auto written=llama_state_seq_get_data_ext(
-                                    ctx,target_state_checkpoint.data(),state_sz,0,checkpoint_flags);
-                                require(written==state_sz,
-                                        "MTP full target state snapshot failed");
+                                // capture records state_sz as this epoch's
+                                // valid length; the retained storage may be
+                                // larger after a shrink.
+                                const bool captured=target_state_checkpoint.capture(state_sz,
+                                    [&](std::uint8_t * dst,std::size_t size) {
+                                        return llama_state_seq_get_data_ext(
+                                            ctx,dst,size,0,checkpoint_flags);
+                                    });
+                                require(captured, "MTP full target state snapshot failed");
                             }
                             batch.push(rr.tokens.back().emitted_token,consumed[0],0,true);
                             local_rows.push_back(0);
@@ -2982,14 +2991,20 @@ run_result run(const options & requested) {
                                     require(t!=nullptr,"MTP rejected prefix verifier logits missing");
                                     verifier_rows[j].assign(t,t+n_vocab);
                                 }
-                                require(!target_state_checkpoint.empty(),
+                                require(target_state_checkpoint.is_valid(),
                                         "MTP multi full target checkpoint missing");
-                                const std::size_t restored=llama_state_seq_set_data_ext(
-                                    ctx,target_state_checkpoint.data(),
-                                    target_state_checkpoint.size(),0,checkpoint_flags);
-                                require(restored==target_state_checkpoint.size(),
+                                // This epoch's valid length, not the retained
+                                // storage size: the buffer can be larger after
+                                // a shrink. set_data_ext receives only these
+                                // bytes.
+                                const std::size_t checkpoint_size=target_state_checkpoint.size();
+                                const std::size_t restored=target_state_checkpoint.restore(
+                                    [&](const std::uint8_t * src,std::size_t size) {
+                                        return llama_state_seq_set_data_ext(
+                                            ctx,src,size,0,checkpoint_flags);
+                                    });
+                                require(restored==checkpoint_size && restored>0,
                                         "MTP multi full GDN+attention KV restore failed");
-                                target_state_checkpoint.clear();
                                 std::vector<llama_token> verified_inputs(replay_n);
                                 std::vector<llama_pos> verified_positions(replay_n);
                                 for(std::size_t j=0;j<replay_n;++j){
@@ -3125,7 +3140,7 @@ run_result run(const options & requested) {
                                     }
                                 }
                             } else {
-                                target_state_checkpoint.clear();
+                                target_state_checkpoint.invalidate();
                                 if (mtp_state_trace) {
                                     std::fprintf(stderr,
                                         "TP5_REAL_MTP_MULTI_ACCEPT window=%u n_drafts=%zu committed_outputs=%zu\n",

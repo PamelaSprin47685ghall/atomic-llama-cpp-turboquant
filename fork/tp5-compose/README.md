@@ -532,3 +532,22 @@ the real call and adds no production hook or ABI. Every failure must report
 `std::bad_alloc` and the next acquire must succeed; without the preload the
 normal path skips injection and still passes. The contract is documented in
 `include/llama.h`.
+
+## MTP target state checkpoint (2026-11-09)
+
+The non-native-trim MTP verify path (`GGML_TP5_MTP_RS_RING=0`,
+`GGML_TP5_MTP_ON_DEVICE_CHECKPOINT=0`) keeps one host checkpoint per worker
+across verify epochs. The checkpoint is an `mtp_state_checkpoint`
+(`src/mtp_state_checkpoint.h`): it owns the storage, the current snapshot size,
+and an explicit valid flag. A capture grows the storage only when the new
+snapshot is larger; a same-size or smaller capture reuses the existing bytes
+without zero-filling them. `llama_state_seq_get_data_ext` must write exactly
+the requested size, otherwise the checkpoint stays invalid even though older
+bytes remain in the storage. A restore passes the captured size, not the
+storage size, and consumes the checkpoint; full acceptance invalidates it. A
+failed, short or throwing restore also leaves it invalid, so an older snapshot
+is never restored as the new one. The native-trim path
+(`GGML_TP5_MTP_RS_RING=1`) does not create a host checkpoint. The CPU test
+`tq-tp5-mtp-state-checkpoint` covers same-size retention, growth, shrink,
+short capture, short restore, full acceptance, exception unwinding, zero size,
+and the shrink-after-invalidate and shrink-after-exception epoch sequences.
