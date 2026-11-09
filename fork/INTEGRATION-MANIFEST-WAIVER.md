@@ -957,12 +957,22 @@ restates the existing T4 smoke option contract and adds no new restriction on
 legal inputs. The draft stop cleanup synchronizes a pending draft decode and
 trims from that request source; it is code-inspected, not exercised here.
 
-The candidate CPU test `tq-tp5-commit-stop` exercises the production helper
-functions and the real `generation_stream`. It does not execute `run()`, a
-model, checkpoint restore/replay, `llama_memory_seq_rm`, teacher forcing or a
-draft context, and it was not run in this integration tree. No GPU, full suite
-or guard rerun. The five changed paths have no manifest entry, so no digest
-was updated.
+DevOps ran `tq-tp5-commit-stop` on this tree (`addd2ca70`) once in the
+exclusive directory `/tmp/tmp.7jHPfKmkip`: it built and installed the real
+TQText source into `$D/prefix` (the existing install's `stream.h` differed
+from the current source tree, which contains commit `6dee933f9`), configured
+`fork/tp5-compose` with
+`CMAKE_PREFIX_PATH="$D/prefix;<existing install>"`, built
+`tq_tp5_commit_stop_tests`, and ran
+`ctest -R '^tq-tp5-commit-stop$'`: 1/1 Passed, exit 0. Commands and output are
+recorded at `agent://safe-devops` (t3).
+
+This is helper/stream evidence only. It exercises the production
+`commit_stop.h` helpers and the real `generation_stream`; it does not execute
+`run()`, a model, checkpoint restore/replay, `llama_memory_seq_rm`, teacher
+forcing or a draft context, and it does not prove runtime/draft/teacher or
+GPU/end-to-end MTP behavior. No GPU, full suite or guard rerun. The five
+changed paths have no manifest entry, so no digest was updated.
 
 ## F. Why this does not block the integration
 
