@@ -607,6 +607,26 @@ struct llama_meta_device_get_split_state_userdata {
     const struct llama_model * model;
 };
 
+// Pure HC layout policy. The replicated local-compute layout qualifies only
+// the main Qwen4Exp trunk with Q8 HC weights. The private MTP-only model has
+// n_layer_nextn > 0 and deliberately keeps its own BF16 HC block, so the
+// switch must not reject it. Exposed for the CPU regression test.
+enum llama_hc_layout_validation {
+    LLAMA_HC_LAYOUT_SKIP,                 // default static-owner path
+    LLAMA_HC_LAYOUT_REJECT_WEIGHT_TYPE,   // replicated main trunk without Q8
+    LLAMA_HC_LAYOUT_VALIDATE_DEFAULT,     // normal HC layout validation
+    LLAMA_HC_LAYOUT_VALIDATE_REPLICATED,  // mirrored main trunk with Q8
+};
+
+llama_hc_layout_validation llama_hc_layout_validation_for(
+        const struct llama_model & model, ggml_type hc_weight_type,
+        bool context_owner, bool replicated);
+
+// Exposed for the CPU regression test. The early policy decisions read only
+// hc_weight_type and the model hparams; they do not touch the loader maps.
+void llama_hc_context_owner_validate_layout(
+        const struct llama_model & model, const struct llama_model_loader & ml);
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
 struct llama_model {

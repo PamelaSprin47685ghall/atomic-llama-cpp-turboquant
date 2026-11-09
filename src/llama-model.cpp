@@ -519,13 +519,32 @@ static const char * llama_hc_storage_label(const bool context_owner, const bool 
     return replicated ? "mirrored local-compute" : "static-owner";
 }
 
-static void llama_hc_context_owner_validate_layout(const llama_model & model, const llama_model_loader & ml) {
+llama_hc_layout_validation llama_hc_layout_validation_for(
+        const llama_model & model, const ggml_type hc_weight_type,
+        const bool context_owner, const bool replicated) {
+    // The replicated layout qualifies the main Qwen4Exp trunk only. The
+    // private MTP-only model has n_layer_nextn > 0 and deliberately keeps its
+    // own BF16 HC block; it must load through the static-owner path.
+    const bool main_trunk = model.arch == LLM_ARCH_QWEN4EXP && model.hparams.n_layer_nextn == 0;
+    if (replicated && main_trunk) {
+        return hc_weight_type == GGML_TYPE_Q8_0 ?
+                LLAMA_HC_LAYOUT_VALIDATE_REPLICATED : LLAMA_HC_LAYOUT_REJECT_WEIGHT_TYPE;
+    }
+    if (!context_owner && hc_weight_type == GGML_TYPE_BF16) {
+        return LLAMA_HC_LAYOUT_SKIP;
+    }
+    return LLAMA_HC_LAYOUT_VALIDATE_DEFAULT;
+}
+
+void llama_hc_context_owner_validate_layout(const llama_model & model, const llama_model_loader & ml) {
     const bool context_owner = llama_hc_context_owner_enabled();
     // Parse the replicated-compute switch before the default-layout early
     // return. A value other than 0/1 must fail the load instead of being
     // silently ignored when the default BF16 layout is selected.
     const bool replicated = llama_hc_replicated_compute_enabled();
-    if (!context_owner && !replicated && ml.hc_weight_type == GGML_TYPE_BF16) {
+    const llama_hc_layout_validation validation =
+            llama_hc_layout_validation_for(model, ml.hc_weight_type, context_owner, replicated);
+    if (validation == LLAMA_HC_LAYOUT_SKIP) {
         return;
     }
     const auto fail = [&](const std::string & reason) {
@@ -534,9 +553,10 @@ static void llama_hc_context_owner_validate_layout(const llama_model & model, co
                  ml.hc_weight_option_name() : "GGML_TP5_HC_CONTEXT_OWNER");
         throw std::runtime_error(prefix + ": " + reason);
     };
-    if (replicated && ml.hc_weight_type != GGML_TYPE_Q8_0) {
+    if (validation == LLAMA_HC_LAYOUT_REJECT_WEIGHT_TYPE) {
         fail("requires Q8_0 HC weights (GGML_TP5_HC_Q8_WEIGHTS=1)");
     }
+    const bool replicated_main = validation == LLAMA_HC_LAYOUT_VALIDATE_REPLICATED;
     const ggml_type expected_type = ml.hc_weight_type;
     const auto & hp = model.hparams;
     if (model.arch != LLM_ARCH_QWEN4EXP || hp.n_layer_all != 48 || hp.n_layer_nextn != 0 ||
@@ -598,7 +618,7 @@ static void llama_hc_context_owner_validate_layout(const llama_model & model, co
     }
     GGML_ASSERT(expected.size() == 194 && seen.size() == expected.size());
     LLAMA_LOG_INFO("%s: qualified 97 HC pairs (194 %s matrices) for five-rank %s storage\n",
-            __func__, ggml_type_name(expected_type), llama_hc_storage_label(context_owner, replicated));
+            __func__, ggml_type_name(expected_type), llama_hc_storage_label(context_owner, replicated_main));
 }
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
@@ -716,6 +736,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // derive this index from the same pair prefix; all other tensors ignore it.
     size_t hc_owner = ud->n_devices;
     auto get_tensor_config = [&]() -> tensor_config {
+        // The private MTP-only model keeps its BF16 nextn.hc_head pair out of
+        // hc_pair_profile(), so it falls through to the static-owner block.
         if (llama_hc_replicated_compute_enabled()) {
             const auto & profile = llama_hc_context_owner_weights();
             const auto pair = profile.find(tensor_name);
