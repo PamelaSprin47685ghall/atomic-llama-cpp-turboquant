@@ -645,17 +645,26 @@ deferred `delayed_event` is handled before the next poll. `OUTPUT_RELEASED`
 still finds its entry and never triggers reclamation; failure or abort leaves
 the map to `finish_ledgers()`.
 
-Reclamation is all-or-nothing. If any entry older than the new generation still
-has a held lease, `reclaim_older_channels()` returns `live_lease`, erases
-nothing and the caller fails closed with `relay map reclaim hit live lease`.
-Only after the held optional is clear does the helper erase older entries and
-advance `service_window::map_generation`. This does not require or enable
-`GGML_TP5_PLAN_UNION`; the default map lane and every existing legal
-configuration keep their behavior.
+Reclamation is state-driven and preserves availability. When a newer
+`INPUT_READY` arrives, `legacy_channel_map` advances its admitted generation;
+every older entry without a held lease is retired through the caller callback
+(runtime records `ledger.mark_drained(true)` and increments `map_retired`) and
+erased. An older entry that still has a held lease is retained, not erased and
+not turned into a hard failure; its later `OUTPUT_RELEASED` still finds it, and
+a later generation retries the reclamation. This keeps the event and the old
+ledger available for a normal drain instead of dropping it or aborting a run.
+A stale `INPUT_READY` older than the admitted generation is rejected
+explicitly and creates no old ledger.
 
-The CPU-only `tq-tp5-relay-channel-map` test builds real `channel_ledger`
-leases (reserve, producer ready, reduce done, output published, consumer done)
-and observes the map size, generation and real `bank_state` fields. It covers
-generation no-op, 181-channel generations, newer-generation preservation, and
-the held-lease refusal without a mock echo. It is a narrow host test; no GPU,
-full-model, or MTP runtime evidence is claimed.
+The existing `TP5_DW_COURIER_HIT` line also prints `map_retired`, the number
+of unheld older entries retired through this path.
+
+The CPU-only `tq-tp5-relay-channel-map` test drives the same
+`INPUT_READY -> held lease -> OUTPUT_RELEASED -> newer INPUT_READY` chain
+through `legacy_channel_map`, with real `channel_ledger` leases (reserve, five
+producer-ready records, reduce done, output published, five consumer-done
+records). It observes map size/generation, held retention, the retired
+`bank_state` drain facts (`input_released`, `output_published`,
+`consumed_ranks`), the explicit stale refusal, and that `OUTPUT_RELEASED`
+never reclaims. It is not a pure helper-counter test, but it is still a narrow
+host test: no GPU, full-model, or MTP runtime evidence is claimed.

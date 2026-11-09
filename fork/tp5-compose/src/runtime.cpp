@@ -592,11 +592,10 @@ struct cycle_timing_row {
 
 struct service_window {
     ggml_backend_t                                                                    backend = nullptr;
-    channel_map                                                                       channels;
-    // Highest plan generation admitted by the legacy map. Only INPUT_READY
-    // advances it, after prepare observed idle and every older
-    // OUTPUT_RELEASED was serviced by this window's courier.
-    std::uint64_t                                                                     map_generation = 0;
+    // Legacy (plan generation, channel) map. INPUT_READY advances the admitted
+    // generation and retires unheld older entries; held older entries stay
+    // until their OUTPUT_RELEASED. The slotized lane below does not use it.
+    legacy_channel_map                                                                map;
     // Pillar 5: slotized ownership. The map above stays the fallback when
     // GGML_TP5_RELAY_SLOT_CHANNELS=0 (and GGML_TP5_PLAN_UNION is unset).
     plan_channel_slots                                                                plan_slots;
@@ -757,7 +756,8 @@ class relay_service {
                          "hit_rate=%.6f d_published=%llu d_retired_before=%llu event_hit_rate=%.6f "
                          "pending_sum=%llu pending_max=%llu hist=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
                          "drain_ns=%llu drain_passes=%llu drain_max=%llu batch_extra=%llu "
-                         "polls=%llu idle=%llu serviced_in=%llu serviced_out=%llu deferred=%llu errors=%llu\n",
+                         "polls=%llu idle=%llu serviced_in=%llu serviced_out=%llu deferred=%llu errors=%llu "
+                         "map_retired=%llu\n",
                          i, threads_.size(), int(courier_ablate_),
                          (unsigned long long) w.demand_epochs, (unsigned long long) w.demand_hits,
                          (unsigned long long) w.demand_misses, hit_rate,
@@ -772,7 +772,8 @@ class relay_service {
                          (unsigned long long) w.demand_drain_max, (unsigned long long) w.courier_batch_extra,
                          (unsigned long long) w.courier_polls, (unsigned long long) w.courier_idle,
                          (unsigned long long) w.courier_input, (unsigned long long) w.courier_output,
-                         (unsigned long long) w.courier_deferred, (unsigned long long) w.courier_errors);
+                         (unsigned long long) w.courier_deferred, (unsigned long long) w.courier_errors,
+                         (unsigned long long) w.map.retired());
         }
     }
 
@@ -1367,9 +1368,7 @@ class relay_service {
                 window->plan_slots.clear();
                 require(window->plan_slots.live_channels() == 0, "relay plan slots did not return to zero at close");
             } else {
-                for (auto & entry : window->channels) {
-                    finish_owner(*entry.second);
-                }
+                window->map.for_each(finish_owner);
             }
         }
     }
@@ -1476,24 +1475,20 @@ class relay_service {
                     }
                     owner = slot_owner.get();
                 } else {
-                    // Legacy map: reclaim older generations only from this
-                    // INPUT_READY. prepare() required idle, and the courier
-                    // serviced every older OUTPUT_RELEASED before offering this
-                    // event (delayed_event is handled before the next poll).
-                    // A held lease refuses the whole reclamation; never erase a
-                    // live reader.
-                    if (event.plan_generation > window.map_generation) {
-                        const auto reclaimed = reclaim_older_channels(
-                                window.channels, event.plan_generation, window.map_generation,
-                                [](const channel_state & state) { return state.held.has_value(); });
-                        require(reclaimed != channel_map_reclaim::live_lease,
-                                "relay map reclaim hit live lease");
-                    }
-                    auto & map_owner = window.channels[key];
-                    if (!map_owner) {
-                        map_owner = std::make_unique<channel_state>(run_, event.plan_generation, event.channel);
-                    }
-                    owner = map_owner.get();
+                    // Legacy map: the state-driven input chain advances the
+                    // admitted generation, retires unheld older entries and
+                    // retains held ones for their later OUTPUT_RELEASED.
+                    // prepare() required idle and the courier serviced every
+                    // older release before offering this event (delayed_event
+                    // is handled before the next poll). A stale generation is
+                    // a protocol violation and must not rebuild an old ledger.
+                    auto input = window.map.input_ready(run_, event.plan_generation, event.channel,
+                            [](channel_state & old) {
+                                require(old.ledger.mark_drained(true),
+                                        "cannot record reclaimed relay drain");
+                            });
+                    require(!input.stale, "relay map received a stale plan generation");
+                    owner = input.state;
                 }
                 require(!owner->held && event.epoch > owner->epoch, "relay input epoch is stale or has live readers");
                 auto reservation = owner->ledger.reserve(index, event.epoch, event.channel, event.plan_generation);
@@ -1564,10 +1559,9 @@ class relay_service {
                             "output has no matching CPU lease");
                     found_owner = slot->states[event.channel].get();
                 } else {
-                    auto found = window.channels.find(key);
-                    require(found != window.channels.end() && found->second->held.has_value(),
+                    found_owner = window.map.output_released(event.plan_generation, event.channel);
+                    require(found_owner != nullptr && found_owner->held.has_value(),
                             "output has no matching CPU lease");
-                    found_owner = found->second.get();
                 }
                 auto & owner = *found_owner;
                 require(owner.held.has_value(), "output has no matching CPU lease");

@@ -9,12 +9,17 @@
 // generation inserts its channels into this map. Without reclamation the map
 // grows for the provider lifetime.
 //
-// Reclamation is allowed only from the next generation's INPUT_READY, after
+// Reclamation is state-driven from the next generation's INPUT_READY, after
 // the provider reported idle (prepare requires it) and after every older
-// OUTPUT_RELEASED was serviced by the same courier. If any older entry still
-// has a held lease, the whole reclamation is refused: no entry is erased and
-// the caller must fail closed. This is deliberately all-or-nothing so a
-// partially reclaimed generation cannot hide a live reader.
+// OUTPUT_RELEASED was serviced by the same courier. Entries with a held lease
+// are retained, never erased; an unheld older entry is retired through the
+// caller's callback before it is erased. This preserves a held generation for
+// its later OUTPUT_RELEASED instead of aborting a run or dropping an event.
+//
+// A generation older than the admitted one is a protocol violation: input_ready
+// reports stale and creates no entry, so a stale INPUT_READY cannot rebuild an
+// old ledger. OUTPUT_RELEASED still finds a retained old entry and never
+// triggers reclamation.
 
 #include <tq/relay/ledger.h>
 
@@ -40,48 +45,81 @@ struct channel_state {
 
 using channel_map = std::map<std::pair<std::uint64_t, std::uint32_t>, std::unique_ptr<channel_state>>;
 
-enum class channel_map_reclaim {
-    none,       // the generation did not advance; nothing to do
-    reclaimed,  // every entry older than the new generation was erased
-    live_lease, // an older entry still has a held lease; nothing was erased
+struct legacy_input {
+    channel_state * state = nullptr;
+    bool            stale = false;
+    std::size_t     retired = 0;
+    std::size_t     retained_held = 0;
 };
 
-// Reclaim entries older than new_generation. `map_generation` is the highest
-// generation already admitted by this window. On live_lease, neither the map
-// nor map_generation is modified. `removed` (when non-null) receives the
-// number of erased entries, or 0 on refusal.
-template <typename HasHeld>
-channel_map_reclaim reclaim_older_channels(
-        channel_map & channels,
-        std::uint64_t new_generation,
-        std::uint64_t & map_generation,
-        HasHeld && has_held,
-        std::size_t * removed = nullptr) {
-    if (removed != nullptr) {
-        *removed = 0;
+class legacy_channel_map {
+  public:
+    // One INPUT_READY event. `on_retire` is called once for every unheld older
+    // entry immediately before it is erased. A held older entry is retained.
+    // A stale generation returns stale without touching the map.
+    template <typename OnRetire>
+    legacy_input input_ready(std::uint64_t run, std::uint64_t generation, std::uint32_t channel,
+                             OnRetire && on_retire) {
+        legacy_input result;
+        if (generation < map_generation_) {
+            result.stale = true;
+            return result;
+        }
+        if (generation > map_generation_) {
+            for (auto it = channels_.begin(); it != channels_.end();) {
+                if (it->first.first >= generation) {
+                    ++it;
+                    continue;
+                }
+                if (it->second && it->second->held.has_value()) {
+                    ++result.retained_held;
+                    ++it;
+                    continue;
+                }
+                if (it->second) {
+                    on_retire(*it->second);
+                }
+                it = channels_.erase(it);
+                ++result.retired;
+                ++retired_;
+            }
+            map_generation_ = generation;
+        }
+        const auto key = std::make_pair(generation, channel);
+        auto       it  = channels_.find(key);
+        if (it == channels_.end()) {
+            it = channels_.emplace(key, std::make_unique<channel_state>(run, generation, channel)).first;
+        }
+        result.state = it->second.get();
+        return result;
     }
-    if (new_generation <= map_generation) {
-        return channel_map_reclaim::none;
+
+    // One OUTPUT_RELEASED event. A retained old generation is found; an
+    // already reclaimed one returns nullptr (the caller treats that as a
+    // protocol violation). This never reclaims.
+    channel_state * output_released(std::uint64_t generation, std::uint32_t channel) {
+        const auto it = channels_.find({generation, channel});
+        return it == channels_.end() ? nullptr : it->second.get();
     }
-    for (const auto & entry : channels) {
-        if (entry.first.first < new_generation && entry.second && has_held(*entry.second)) {
-            return channel_map_reclaim::live_lease;
+
+    // End-of-run iteration over the remaining entries.
+    template <typename F>
+    void for_each(F && f) {
+        for (auto & entry : channels_) {
+            if (entry.second) {
+                f(*entry.second);
+            }
         }
     }
-    std::size_t erased = 0;
-    for (auto it = channels.begin(); it != channels.end();) {
-        if (it->first.first < new_generation) {
-            it = channels.erase(it);
-            ++erased;
-        } else {
-            ++it;
-        }
-    }
-    map_generation = new_generation;
-    if (removed != nullptr) {
-        *removed = erased;
-    }
-    return channel_map_reclaim::reclaimed;
-}
+
+    std::uint64_t map_generation() const noexcept { return map_generation_; }
+    std::uint64_t retired() const noexcept { return retired_; }
+    std::size_t   size() const noexcept { return channels_.size(); }
+
+  private:
+    channel_map   channels_;
+    std::uint64_t map_generation_ = 0;
+    std::uint64_t retired_ = 0;
+};
 
 } // namespace tq::tp5
