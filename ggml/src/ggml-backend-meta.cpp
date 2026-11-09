@@ -134,7 +134,9 @@ static const char * staging_reject_reason_name(int reason) {
 
 struct staging_reject_stat {
     std::atomic<uint64_t> count{0};
-    const char * name = nullptr;  // first example, written once under first_mutex
+    // Self-owned first example: the source tensor may be freed before the exit
+    // dump. Written once under first_mutex, NUL-terminated.
+    char name[GGML_MAX_NAME] = {};
     size_t size = 0;
     unsigned flags = 0;
     ggml_type type = GGML_TYPE_COUNT;
@@ -190,8 +192,9 @@ static void staging_log_reject(const char * lane, const ggml_tensor * tensor, si
         // The fetch_add result is unique, so exactly one thread records the
         // example. The lock is taken once per class, never on later calls.
         std::lock_guard<std::mutex> lock(g_staging_reject.first_mutex);
-        if (stat.name == nullptr) {
-            stat.name = tensor != nullptr ? tensor->name : "(null)";
+        if (stat.name[0] == '\0') {
+            std::snprintf(stat.name, sizeof(stat.name), "%s",
+                          tensor != nullptr ? tensor->name : "(null)");
             stat.size = size;
             stat.flags = tensor != nullptr ? unsigned(tensor->flags) : 0u;
             stat.type = tensor != nullptr ? tensor->type : GGML_TYPE_COUNT;
@@ -258,7 +261,7 @@ extern "C" void ggml_backend_meta_staging_diag_dump() {
             std::fprintf(stderr,
                 "TP5_STAGING_REJECT lane=%s reason=%s count=%llu example_name=%s flags=0x%x size=%zu type=%s\n",
                 lane_names[lane], staging_reject_reason_name(r), (unsigned long long) n,
-                stat.name != nullptr ? stat.name : "(none)", stat.flags, stat.size,
+                stat.name[0] != '\0' ? stat.name : "(none)", stat.flags, stat.size,
                 stat.type != GGML_TYPE_COUNT ? ggml_type_name(stat.type) : "?");
         }
     }
