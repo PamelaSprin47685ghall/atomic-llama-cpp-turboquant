@@ -1035,6 +1035,14 @@ Manifest: `ggml/include/ggml-relay.h`, `ggml/src/ggml-cuda/relay.hip` and
 their hashes are updated. `src/llama-context.cpp` remains a historical stale
 entry and was not re-signed; `fork/tp5-compose/src/runtime.cpp` has no entry.
 
+DevOps compiled `relay.hip` at `015dec2042` with
+`hipcc -x hip -std=gnu++17 --offload-arch=gfx1030 -O1 -fPIC -c` in the
+exclusive directory `/tmp/tmp.PhrAVeJBTH`: exit 0, 6 seconds, no warnings.
+This was compile-only: no link, model load, kernel run, or GPU use. The full
+command is recorded at `agent://safe-devops`. It does not prove device
+execution, concurrency, memory ordering, snapshot/abort linearization or any
+runtime/provider behavior.
+
 Verification boundary: t4 (`agent://audit-integrated-relay`) is the static
 audit. No GPU, full suite or guard rerun. Capture-phase abort, actual
 instantiate counts and the wait/drain stop path were not executed; device
