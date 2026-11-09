@@ -831,13 +831,13 @@
     },
     {
       "path": "ggml/include/ggml-relay-plan.h",
-      "sha256": "296a0257682c3d7844fd6ccef4a6eb891b82ec3c25c0c492cb71c3afc985142d",
+      "sha256": "fdada34eb8f6b3fa45ac8de02eeb682defffaa4f5fefed0a909ee3739a825ce8",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose pillar-5 plan cache and frame LRU (WS5)",
         "ggml relay plan-key provider ABI"
       ],
-      "reason": "Declare the pillar-5 relay plan key (eight fields including channels), frame LRU, exact pool policy and the environment switch matrix. graph_uid defaults to false so the unset path is stock; ON runs set GGML_TP5_GRAPH_UID=1 explicitly.",
+      "reason": "Declare the pillar-5 relay plan key (eight fields including channels), frame LRU, exact pool policy and the environment switch matrix. graph_uid defaults to false, but it does not gate the relay uid fast path: sched/meta still assign uids when it is unset. ON runs set GGML_TP5_GRAPH_UID=1 explicitly.",
       "removal_condition": "Remove when upstream provides equivalent plan identity, frame LRU and exact pool policy, or when the WS5 consumer is removed."
     },
     {
@@ -873,12 +873,12 @@
     },
     {
       "path": "tests/test-relay-plan-policy.cpp",
-      "sha256": "4d849f8de99a5e0364cea495d6e5428e7d2cf5abdc10ab9b37007a3855f39efc",
+      "sha256": "94b811f67a39011ca876e0a729fdc5ff3c331e2dfe34fef43964c0ffd0836b8b",
       "mode": "100644",
       "consumers": [
         "WS5 relay plan policy CPU test"
       ],
-      "reason": "Cover the eight-field plan key, FRAMES default 2 versus ON 8, POOL_EXACT default 0 versus ON 1, PLAN_UNION default 0 versus ON 1, and graph_uid default false.",
+      "reason": "Cover the eight-field plan key, FRAMES default 2 versus ON 8, POOL_EXACT default 0 versus ON 1, PLAN_UNION default 0 versus ON 1, and graph_uid default false (the relay uid path does not read it).",
       "removal_condition": "Remove with the WS5 plan-policy implementation."
     },
     {
@@ -935,12 +935,12 @@
     },
     {
       "path": "patches/ws5/README.md",
-      "sha256": "04df9c7459d371f22cc140982697fd803bca6dd8149a153ae3a4a4b34afb7f8c",
+      "sha256": "2f79f3cb732711d6b6bddcc5bc089f48d14076bb845e01852a69026e5617d3b7",
       "mode": "100644",
       "consumers": [
         "integ/tp5-mtp-r28b integration maintainers"
       ],
-      "reason": "Document the WS5 cross-owner patch order, the graph_uid default-off contract, and the OFF/ON switch matrix. Document the relay verification counters and the shared verify_submission() seam.",
+      "reason": "Document the WS5 cross-owner patch order, the graph_uid default-off contract and its non-effect on the relay uid path, and the OFF/ON switch matrix. Document the relay verification counters and the shared verify_submission() seam.",
       "removal_condition": "Remove after the WS5 patches are upstreamed or folded into the integration commit."
     },
     {

@@ -556,8 +556,9 @@ inline pool_growth pool_growth_decision(const pool_layout & layout, const std::s
     return need > budget ? pool_growth::fail_budget : pool_growth::grow;
 }
 
-// Environment switch matrix. Every switch defaults to the legacy behavior:
-// no plan cache, two frames, the 384 MiB pool, the map channel table.
+// Environment switch matrix. Every switch defaults to the legacy behavior for
+// plan cache, frames, pool and channel table. graph_uid is parsed and logged;
+// the relay uid selection does not read it.
 struct config {
     bool          plan_union    = false;
     std::size_t   frames        = 2;
@@ -565,7 +566,7 @@ struct config {
     bool          slot_channels = false;
     bool          verify_uid    = false;
     bool          plan_stats    = false;
-    bool          graph_uid     = false; // GGML_TP5_GRAPH_UID=1 enables; OFF is stock
+    bool          graph_uid     = false; // GGML_TP5_GRAPH_UID=1 assigns the llama parent uid; relay uid selection ignores it
     bool          plan_flush    = false;
 };
 
@@ -624,7 +625,7 @@ inline bool parse_config(const char * plan_union, const char * frames, const cha
         return reject("GGML_TP5_RELAY_PLAN_STATS must be 0 or 1");
     }
     if (graph_uid == nullptr || graph_uid[0] == '\0') {
-        out.graph_uid = false; // OFF == stock: llama leaves every graph uid zero
+        out.graph_uid = false; // OFF does not force uid 0: sched/meta still assign uids
     } else if (!parse_switch(graph_uid, out.graph_uid)) {
         return reject("GGML_TP5_GRAPH_UID must be 0 or 1");
     }

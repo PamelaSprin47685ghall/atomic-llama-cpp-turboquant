@@ -45,12 +45,17 @@
 //
 // llama_context
 //
-// Pillar 5: a graph object is built once and reused in place, so the uid is
-// assigned only when the object has none. A rebuild allocates a fresh graph
-// (llm_graph_result::reset) and therefore a fresh uid. The switch is OFF by
-// default: with every pillar-5 flag unset, every uid stays zero and the relay
-// takes the full signature path, which is stock behavior. The ON leg must set
-// GGML_TP5_GRAPH_UID=1 explicitly.
+// Pillar 5: a graph object is built once and reused in place, so this helper
+// assigns a uid only when the object has none. A rebuild allocates a fresh
+// graph (llm_graph_result::reset) and therefore a fresh uid.
+//
+// GGML_TP5_GRAPH_UID is not a relay fast-path switch. With the switch unset,
+// ggml_backend_sched_split_graph() still assigns a uid to every graph whose
+// uid is 0, and the relay provider receives the Meta backend's internal child
+// graphs, whose uids are assigned on every Meta rebuild regardless of this
+// switch. The relay uid fast path therefore still applies when the switch is
+// unset. Use GGML_TP5_RELAY_VERIFY_UID=1 to require the signature describe on
+// a fast hit.
 static void tp5_assign_graph_uid(ggml_backend_t relay, ggml_cgraph * gf) {
     static const bool enabled = [] {
         const char * value = getenv("GGML_TP5_GRAPH_UID");

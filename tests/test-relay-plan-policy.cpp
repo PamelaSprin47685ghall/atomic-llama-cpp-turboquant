@@ -517,7 +517,7 @@ void test_config() {
     CHECK(!cfg.slot_channels);
     CHECK(!cfg.verify_uid);
     CHECK(!cfg.plan_stats);
-    CHECK(!cfg.graph_uid); // OFF == stock: every graph uid stays zero
+    CHECK(!cfg.graph_uid); // default false; the relay uid path does not read it
     CHECK(!cfg.plan_flush);
 
     CHECK(ggml_relay_plan::parse_config("1", "8", "1", "1", "1", "1", "0", "1",
@@ -531,7 +531,8 @@ void test_config() {
     CHECK(!cfg.graph_uid);
     CHECK(cfg.plan_flush);
 
-    // The uid assignment is an explicit ON-leg switch, never a default.
+    // The uid assignment is an explicit ON-leg switch, never a default; the
+    // relay uid selection does not read it.
     CHECK(ggml_relay_plan::parse_config(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "1", nullptr,
                                         cfg, error, sizeof(error)));
     CHECK(cfg.graph_uid);

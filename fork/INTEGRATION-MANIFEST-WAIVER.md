@@ -724,9 +724,14 @@ Non-blocking: manifest debt only; the build and CPU tests do not depend on this 
 
 ## E. Defaults and domain separation
 
-- `ggml_relay_plan::config::graph_uid` defaults to `false`. The OFF leg therefore returns
-  to uid 0, the full signature, 2 frames, the 384 MiB pool, no plan cache and map
-  channels. The ON leg must set `GGML_TP5_GRAPH_UID=1` explicitly.
+- `ggml_relay_plan::config::graph_uid` defaults to `false`, but it does not gate the
+  relay uid fast path. With the switch unset, `ggml_backend_sched_split_graph()` still
+  assigns a uid to every graph whose uid is 0, and the relay provider receives the Meta
+  backend's internal child graphs, whose uids are assigned on every Meta rebuild. The
+  switch only changes when the llama-level parent graph receives its uid. The OFF leg
+  keeps 2 frames, the 384 MiB pool, no plan cache and map channels; the relay uid fast
+  path still applies unless `GGML_TP5_RELAY_VERIFY_UID=1` requests the describe. The ON
+  leg must set `GGML_TP5_GRAPH_UID=1` explicitly.
 - `GGML_TP5_RELAY_FRAMES` defaults to `2`; the ON leg must set `8` explicitly.
 - `GGML_TP5_POOL_EXACT` defaults to `0`; the ON leg must set `1` explicitly.
 - `GGML_TP5_PLAN_UNION` defaults to `0`; the ON leg must set `1` explicitly.
@@ -734,7 +739,23 @@ Non-blocking: manifest debt only; the build and CPU tests do not depend on this 
   terminal-binding digest; B `PlanKey` has seven fields, and the C boundary carries the
   eight caller-visible fields. They are separate domains. The C adapter maps them
   explicitly; the types are not merged.
-  `patches/ws5/README.md` records OFF≡stock and the two-domain mapping.
+  `patches/ws5/README.md` records the legacy defaults, the uid fast-path caveat and the
+  two-domain mapping.
+
+### E.1 Documentation-only round
+
+The comment above `tp5_assign_graph_uid()` in `src/llama-context.cpp` was corrected
+without a behavior change. That path is a pre-existing stale manifest item: the digest
+recorded at the `0aca90f70` baseline does not match the committed file, so this round
+does not re-sign the whole file and does not claim the old overlay is certified.
+
+The three relay-owned documentation/test paths
+(`ggml/include/ggml-relay-plan.h`, `tests/test-relay-plan-policy.cpp`,
+`patches/ws5/README.md`) are re-signed against the audited `d401->67c` baseline. Their
+signed digests record byte identity and the reviewed comment change, not runtime
+qualification. `ggml/include/ggml-relay.h` and `ggml/src/ggml-cuda/relay.hip` were not
+changed and keep the B8 signatures. No other manifest entry was updated, and the guard
+was not rerun; the B5-B7 red items remain.
 
 ## F. Why this does not block the integration
 

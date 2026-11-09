@@ -5,17 +5,21 @@ Base `71544695b`, F2 merge `2a29eba88` (`feat/tp5-mtp-ws2-alloc-ledger` @ `ae9c1
 
 ## OFF is stock
 
-With every switch unset or `0`, the branch is behavior-identical to stock:
+With every switch unset or `0`, the legacy defaults are preserved for frames,
+plan cache, pool and channel ownership:
 
 - two captured frames (the old linear 2-frame cache),
 - no plan cache, monotonic `plan_generation` on every prepare,
 - the fixed 384.25 MiB channel pool (`256 * 1573888 B`),
-- the original `map<(plan,channel), channel_state>` runtime ownership,
-- every graph `uid` stays zero, so the relay takes the full `describe_frame`
-  signature path.
+- the original `map<(plan,channel), channel_state>` runtime ownership.
 
-`GGML_TP5_GRAPH_UID` is **off by default**. The ON leg must set it to `1`
-explicitly. This keeps the F2/OFF leg equivalent to stock.
+`GGML_TP5_GRAPH_UID` is **off by default**, but it does not disable the relay
+uid fast path. With the switch unset, `ggml_backend_sched_split_graph()` still
+assigns a uid to every graph whose uid is 0, and the relay provider receives
+the Meta backend's internal child graphs, whose uids are assigned on every
+Meta rebuild. The switch only changes when the llama-level parent graph
+receives its uid. The relay therefore still uses the uid fast path unless
+`GGML_TP5_RELAY_VERIFY_UID=1` requests the `describe_frame` signature check.
 
 ## Switches
 
@@ -25,7 +29,7 @@ explicitly. This keeps the F2/OFF leg equivalent to stock.
 | `GGML_TP5_RELAY_FRAMES` | unset/`0` → 2 | `8` | frame capacity 2..8; `4` is the structural tier; illegal values fail `create` |
 | `GGML_TP5_POOL_EXACT` | `0` → 384 MiB | `1` | exact per-plan layout, 8 MiB baseline, 68 MiB budget, fail closed |
 | `GGML_TP5_RELAY_SLOT_CHANNELS` | follows `PLAN_UNION` | `1` | 8 plan slots x 256 channel states per window |
-| `GGML_TP5_GRAPH_UID` | `0` | `1` | llama assigns a graph uid after each build |
+| `GGML_TP5_GRAPH_UID` | `0` | `1` | assigns the llama parent graph uid when it is zero; the relay uid path does not read this switch |
 | `GGML_TP5_RELAY_VERIFY_UID` | `0` | `1` | uid fast path still computes and asserts the signature; reported as `verify_req/res/exec` |
 | `GGML_TP5_RELAY_PLAN_STATS` | `0` | `1` | print plan/frame/pool counters |
 | `GGML_TP5_RELAY_PLAN_FLUSH` | `0` | `1` | diagnostic: flush every plan on each prepare |
