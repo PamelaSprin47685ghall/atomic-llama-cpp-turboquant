@@ -133,7 +133,10 @@ static const char * staging_reject_reason_name(int reason) {
 }
 
 struct staging_reject_stat {
-    std::atomic<uint64_t> count{0};
+    // Count and example share one critical section: a nonzero count always
+    // means the example below is complete, so the dump cannot print a count
+    // without its example.
+    uint64_t count = 0;
     // Self-owned first example: the source tensor may be freed before the exit
     // dump. Written once under first_mutex, NUL-terminated.
     char name[GGML_MAX_NAME] = {};
@@ -187,11 +190,12 @@ static void staging_log_reject(const char * lane, const ggml_tensor * tensor, si
     const int lane_id = std::strcmp(lane, "async") == 0 ? 1 : 0;
     const int reason = staging_reject_reason(tensor, size, reason_override);
     staging_reject_stat & stat = g_staging_reject.lanes[lane_id][reason];
-    const uint64_t prev = stat.count.fetch_add(1, std::memory_order_relaxed);
-    if (prev == 0) {
-        // The fetch_add result is unique, so exactly one thread records the
-        // example. The lock is taken once per class, never on later calls.
+    {
+        // One uncontended mutex on the rejection path keeps the count and the
+        // first example consistent. The critical section is a counter and,
+        // once per class, a short name copy; there is no I/O.
         std::lock_guard<std::mutex> lock(g_staging_reject.first_mutex);
+        ++stat.count;
         if (stat.name[0] == '\0') {
             std::snprintf(stat.name, sizeof(stat.name), "%s",
                           tensor != nullptr ? tensor->name : "(null)");
@@ -252,12 +256,12 @@ extern "C" void ggml_backend_meta_staging_diag_dump() {
     static const char * lane_names[2] = { "sync", "async" };
     for (int lane = 0; lane < 2; ++lane) {
         for (int r = 0; r < reject_count; ++r) {
+            std::lock_guard<std::mutex> lock(g_staging_reject.first_mutex);
             const staging_reject_stat & stat = g_staging_reject.lanes[lane][r];
-            const uint64_t n = stat.count.load(std::memory_order_relaxed);
+            const uint64_t n = stat.count;
             if (n == 0) {
                 continue;
             }
-            std::lock_guard<std::mutex> lock(g_staging_reject.first_mutex);
             std::fprintf(stderr,
                 "TP5_STAGING_REJECT lane=%s reason=%s count=%llu example_name=%s flags=0x%x size=%zu type=%s\n",
                 lane_names[lane], staging_reject_reason_name(r), (unsigned long long) n,

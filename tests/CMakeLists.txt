@@ -1349,6 +1349,15 @@ add_test(NAME test-tp5-staging-meta-partial COMMAND test-tp5-staging-meta-partia
 set_property(TEST test-tp5-staging-meta-partial PROPERTY LABELS "cpu;tp5;staging")
 set_property(TEST test-tp5-staging-meta-partial PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_META_PARTIAL_TEST PASS")
 
+# TP5 staging rejection-summary diagnostics. The first example of each
+# (lane, reason) class is a self-owned copy: the source tensor is renamed and
+# freed before the dump. CPU only.
+add_executable(test-tp5-staging-reject-summary test-tp5-staging-reject-summary.cpp)
+target_link_libraries(test-tp5-staging-reject-summary PRIVATE ggml ggml-cpu)
+add_test(NAME test-tp5-staging-reject-summary COMMAND test-tp5-staging-reject-summary)
+set_property(TEST test-tp5-staging-reject-summary PROPERTY LABELS "cpu;tp5;staging")
+set_property(TEST test-tp5-staging-reject-summary PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_REJECT_TEST PASS")
+
 # TP5 WS4 pending-context/model ownership test. llama_free retains the whole
 # context (and defers llama_model_free) while an async submission is unproven;
 # a clean context/model takes the normal destruction path. The context part

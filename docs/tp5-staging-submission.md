@@ -500,10 +500,11 @@ line per candidate. The weight load alone produced 512 `no_input_flag` lines,
 each through unbuffered stderr (FILE lock plus one write syscall), so the
 diagnostic added I/O to the load path and buried the signal.
 
-Rejections are now counted per `(lane, reason)` with one relaxed atomic on the
-hot path. The first candidate of each class keeps one example (name, flags,
-size, type) under a mutex taken once per class. The exit dump prints one
-summary line per class:
+Rejections are counted per `(lane, reason)`. The counter and the first example
+(name, flags, size, type) share one mutex-protected critical section, so a
+nonzero count always has a complete example. The critical section is a counter
+and, once per class, a short name copy; there is no I/O. The exit dump prints
+one summary line per class:
 
 ```
 TP5_STAGING_REJECT lane=sync reason=no_input_flag count=512 example_name=... flags=0x0 size=... type=...
@@ -514,11 +515,11 @@ TP5_STAGING_REJECT lane=sync reason=no_input_flag count=512 example_name=... fla
 (`null`, `no_input_flag`, `zero_size`, `size`, `generic_size`, `layout`) is
 unchanged, so the diagnostic still answers why a candidate was rejected.
 
-Cost: the hot path performs one atomic increment per rejected candidate and no
-I/O; the summary costs at most one line per `(lane, reason)` at exit. With the
-flag off, `staging_log_reject` returns after the cached flag check, as before.
-This change touches only `ggml-backend-meta.cpp`; the slot-pressure work owns
-`staging.h`/`acquire` and is not modified.
+Cost: the hot path takes one uncontended mutex per rejected candidate and
+performs no I/O; the summary costs at most one line per `(lane, reason)` at
+exit. With the flag off, `staging_log_reject` returns after the cached flag
+check, as before. This change touches only `ggml-backend-meta.cpp`; the
+slot-pressure work owns `staging.h`/`acquire` and is not modified.
 
 ### Example lifetime and dump ordering
 
@@ -529,10 +530,14 @@ prints the name captured at rejection time. A test records a rejection,
 renames the tensor, releases the buffer, context and backend, and then dumps:
 it requires the original name and rejects the mutated one.
 
-The dump reads the counter atomically and the example fields under the same
-mutex that guards their single write. A first write that races the dump is
-serialized by the mutex; if the dump wins, the example prints as `(none)` but
-the counter is still exact. The table is a namespace-scope static, so it is
-alive when the `atexit` dump runs. The pool dump still takes the pool mutex
-before the Meta summary; that ordering is unchanged and a thread holding the
-pool lock delays the dump, as before.
+The dump reads the counter and the example fields under the same mutex that
+guards the single write, so a nonzero count always has a complete example.
+The table is a namespace-scope static, so it is alive when the `atexit` dump
+runs. The pool dump still takes the pool mutex before the Meta summary; that
+ordering is unchanged and a thread holding the pool lock delays the dump, as
+before.
+
+The summary test is registered as `test-tp5-staging-reject-summary` in
+`tests/CMakeLists.txt` (labels `cpu;tp5;staging`, PASS on
+`TP5_STAGING_REJECT_TEST PASS`). It is CPU only and was run once through
+CTest.
