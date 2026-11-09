@@ -757,6 +757,33 @@ qualification. `ggml/include/ggml-relay.h` and `ggml/src/ggml-cuda/relay.hip` we
 changed and keep the B8 signatures. No other manifest entry was updated, and the guard
 was not rerun; the B5-B7 red items remain.
 
+### E.2 Relay finish failure round 2026-11-09
+
+Cherry-pick `0a6a0cba3`, independently reviewed as t19
+(`agent://kernel6-review`). `finish()` now clears `sealed` when the plan-pin
+release or the final `observe()` fails, so a true `finish()`/`submit` return
+is the only continuation permit. A false return is the abort path; native
+owners stay retained until `idle()` proves completion. The README
+finish-contract section is merged with the existing graph_uid correction.
+
+Manifest: only `ggml/include/ggml-relay.h`,
+`ggml/src/ggml-cuda/relay.hip`, `ggml/src/ggml-relay-impl.h` and
+`patches/ws5/README.md` were re-signed. Each matched its manifest before the
+merge and the t19 review covers the changed span. The E.1 note that
+`ggml-relay.h` and `relay.hip` kept the B8 signatures described the
+documentation-only round; this finish round changes and re-signs them.
+`src/llama-context.cpp` remains at its stale `0aca90f70` digest; no other
+entry was updated.
+
+Verification boundary: the real `observe()` failure and
+`plan_cache.release` failure branches were not dynamically executed. There
+was no HIP fault injection. The HIP compile and the existing CPU
+policy/verify/shape tests each cover only their own scope; they do not prove
+the runtime failure branches. t19 also records the residual P3 window where
+an asynchronous abort arrives after `observe()` and before the final failed
+check, and recommends a pure CPU predicate test; that test is not added here.
+The guard was not rerun; no GPU or full suite was run.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure
