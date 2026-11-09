@@ -817,6 +817,21 @@ Manifest: the five changed paths have no manifest entry and none was added.
 No existing entry matched and was reviewed here, so no digest was updated;
 the B5-B7 red items remain. The guard was not rerun.
 
+### E.4 MTP greedy-cache unit check round 2026-11-09
+
+The integrated tree at `a34ef6275` was checked once for the
+`tq_tp5_mtp_greedy_cache_tests` target by an equivalent compile/run in an
+exclusive directory: the test and `shortlist.cpp` were compiled separately
+with the target's `cxx_std_17`, `src` include and `TQSampling` static link,
+then linked and run once. Result: 32 PASS, 0 FAIL, exit 0. Commands and
+output are recorded at `agent://kernel-devops-lock` (t10).
+
+This is a cache-class unit test only. It does not compile or execute
+`runtime.cpp` and does not cover the runtime wiring, cancellation/exception
+paths, `no_sync_logits_calls`, `capture_logits`, a real model or end-to-end
+run, GPU/HIP, or performance. None of the merged greedy-cache paths has a
+manifest entry, so no digest was updated; the B5-B7 red items remain.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure
