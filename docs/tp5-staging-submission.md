@@ -407,13 +407,59 @@ error); neither is a latency measurement. A query error is fatal, like a
 failed wait. A not-ready query is a state, not a fault, and the adapter does
 not clear the runtime's sticky error. A slot whose events are still in flight
 stays pending and the async lane falls back, which is the intended transient
-collision. The test also asserts the frozen v1 `api` prefix at compile time
+collision. The dump also splits `no_slot` into `no_slot_leased` (every usable
+slot for that key was leased), `no_slot_pending` (at least one usable
+unleased slot was still pending and its events were not all complete),
+`no_slot_quarantined` (no usable slot) and `no_slot_other` (defensive,
+expected zero), and reports
+`leases/no_slot/reaps/queries` per kind on `TP5_STAGING_KIND` lines. The
+global `misses` counter remains the note_source pointer check, not a staging
+miss. The test pins that split and the per-kind sums against a deterministic
+lease collision and a deterministic pending miss. It also asserts the frozen
+v1 `api` prefix at compile time
 and covers a clean rejection after one rank was queued: `mark_partial` stops
 the pool, `submission_pending` is true, `first_error` stays 0, the slot is
 quarantined, and later upload/enqueue/wait/enter_submit/acquire calls fail. A
 held submit gate blocks `mark_partial` until it is released, and two concurrent
 publications for the same lease count one unknown destination and one partial
 fault.
+
+`queries` is a backend call count, not a code invariant and not invertible to
+the `no_slot` composition: a successful acquire can query an incomplete slot
+before reclaiming another, the synchronous path issues no queries, and
+`pending_ranks` can hold 1..16 ranks. Use `no_slot_leased`,
+`no_slot_pending`, `no_slot_quarantined`, `no_slot_other` and the per-kind
+counters directly. The earlier five-rank/five-query inverse applied only to
+the five-rank normal run; it is not a code invariant.
+
+The two union index inputs (`union_inp_k_idxs`, `union_inp_v_idxs`) have
+dedicated kinds. Both are graph inputs on the same graph; before this change
+both classified as generic and could occupy both generic slots. Each now has
+its own double buffer and keeps the 64 KiB per-slot envelope it had as a
+generic input, so eligibility is unchanged. Fixed limits: 4 MiB total pinned
+pool (`kMaxPoolBytes`), 2 MiB per request (`kMaxStagingBytes`), 2 slots per
+(window, kind), and 64 KiB per generic/union slot. The split is not free: it
+adds two double buffers, i.e. up to 4 x 64 KiB = 256 KiB of additional pinned
+capacity in the active window 0 (up to 16 slot records and 1 MiB across all
+four window arrays), plus up to one lazily created event per rank per new slot
+(5 active ranks -> up to 20 additional events for the four window-0 slots).
+The 4 MiB cap still bounds pinned bytes; the extra event handles and slot
+metadata are outside that byte cap. No GPU run has measured whether this
+reduces `no_slot`; the CPU test only proves the mapping and per-kind
+independence. Reuse still requires every recorded rank event to complete; the
+split adds no synchronization and does not reuse a slot earlier.
+
+The CPU test also covers 1/5/16 pending-rank reap query counts, a synchronous
+all-leased miss with zero queries, and the four-window union-kind budget
+(16 slots x 64 KiB = 1 MiB under a 1 MiB cap; the next growth is oversize,
+not no_slot).
+
+Per-window staging is not wired. The compose worker's `tl_tp5_window`
+(`fork/tp5-compose/src/runtime.cpp`) is a real per-window thread identity,
+but it lives in the compose module and is not visible to ggml-base. Passing
+it in requires a registered hook; this change does not guess a window and
+keeps the existing window-0 behavior. A per-window split needs that hook and
+a separate measurement.
 
 The Meta partial test builds a real Meta backend over two CPU child devices and
 injects a v2 staging table whose enqueue queues rank 0 and rejects rank 1. It

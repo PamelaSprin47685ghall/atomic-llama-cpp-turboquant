@@ -661,6 +661,104 @@ int test_reap_query_failure_disables() {
     return 0;
 }
 
+int test_no_slot_attribution() {
+    pool p(fake_ops());
+    uint8_t src[32] = {};
+    uint8_t dst[32] = {};
+
+    // Both token slots are leased: a real lease collision, not a pending
+    // event. No query is issued because there is no unleased slot.
+    lease a;
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+    lease c;
+    CHECK(!p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    auto s = p.snapshot();
+    CHECK(s.no_slot == 1);
+    CHECK(s.no_slot_leased == 1);
+    CHECK(s.no_slot_pending == 0);
+    CHECK(s.no_slot_quarantined == 0);
+    CHECK(s.no_slot_by_kind[size_t(kind::tokens)] == 1);
+    CHECK(s.no_slot_by_kind[size_t(kind::generic)] == 0);
+    CHECK(s.leases_by_kind[size_t(kind::tokens)] == 2);
+    CHECK(s.queries == 0);
+    p.release(a);
+    p.release(b);
+
+    // Both token slots are now pending with incomplete events: retire lag.
+    lease d;
+    lease e;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &d));
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &e));
+    CHECK(p.upload(d, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.upload(e, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(d, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 0
+    CHECK(p.enqueue(e, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 1
+    p.release(d);
+    p.release(e);
+    CHECK(!p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    s = p.snapshot();
+    CHECK(s.no_slot == 2);
+    CHECK(s.no_slot_leased == 1);
+    CHECK(s.no_slot_pending == 1);
+    CHECK(s.no_slot_by_kind[size_t(kind::tokens)] == 2);
+    CHECK(s.queries == 2);  // one not-ready rank in each pending slot
+    CHECK(s.reaps == 0);
+
+    // Completing one slot turns the next acquire into a reap.
+    fake_complete_record(0);
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &c, false));
+    s = p.snapshot();
+    CHECK(s.no_slot == 2);
+    CHECK(s.reaps == 1);
+    CHECK(s.reaps_by_kind[size_t(kind::tokens)] == 1);
+    CHECK(s.queries == 3);
+    CHECK(s.queries_by_kind[size_t(kind::tokens)] == 3);
+    CHECK(s.leases_by_kind[size_t(kind::tokens)] == 5);
+    p.release(c);
+
+    // A second kind is attributed separately.
+    lease g1;
+    lease g2;
+    CHECK(p.acquire(0, kind::generic, sizeof(src), &g1));
+    CHECK(p.acquire(0, kind::generic, sizeof(src), &g2));
+    CHECK(p.upload(g1, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.upload(g2, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(g1, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 2
+    CHECK(p.enqueue(g2, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 3
+    p.release(g1);
+    p.release(g2);
+    lease g3;
+    CHECK(!p.acquire(0, kind::generic, sizeof(src), &g3, false));
+    s = p.snapshot();
+    CHECK(s.no_slot == 3);
+    CHECK(s.no_slot_pending == 2);
+    CHECK(s.no_slot_by_kind[size_t(kind::generic)] == 1);
+    CHECK(s.no_slot_by_kind[size_t(kind::tokens)] == 2);
+
+    // The global counters equal the per-kind sums, and the no_slot split
+    // covers every miss.
+    uint64_t leases_sum = 0;
+    uint64_t no_slot_sum = 0;
+    uint64_t reaps_sum = 0;
+    uint64_t queries_sum = 0;
+    for (size_t k = 0; k < kKindCount; ++k) {
+        leases_sum += s.leases_by_kind[k];
+        no_slot_sum += s.no_slot_by_kind[k];
+        reaps_sum += s.reaps_by_kind[k];
+        queries_sum += s.queries_by_kind[k];
+    }
+    CHECK(leases_sum == s.leases);
+    CHECK(no_slot_sum == s.no_slot);
+    CHECK(reaps_sum == s.reaps);
+    CHECK(queries_sum == s.queries);
+    CHECK(s.no_slot_other == 0);
+    CHECK(s.no_slot_leased + s.no_slot_pending + s.no_slot_quarantined +
+          s.no_slot_other == s.no_slot);
+    return 0;
+}
+
 int test_reap_device_switch() {
     backend_ops ops = fake_ops();
     ops.current_device = fake_current_device;
@@ -958,6 +1056,223 @@ int test_device_ptr() {
     return 0;
 }
 
+int test_union_kinds_interleaved_and_slow() {
+    pool p(fake_ops());
+    uint8_t src[32] = {};
+    uint8_t dst[32] = {};
+
+    // Interleave both union kinds. Each kind has its own two slots, so a
+    // single graph's k/v copies no longer compete for the generic key.
+    lease k0;
+    lease k1;
+    lease v0;
+    lease v1;
+    CHECK(p.acquire(0, kind::union_k, sizeof(src), &k0));
+    CHECK(p.acquire(0, kind::union_v, sizeof(src), &v0));
+    CHECK(p.acquire(0, kind::union_k, sizeof(src), &k1));
+    CHECK(p.acquire(0, kind::union_v, sizeof(src), &v1));
+    CHECK(k0.slot != k1.slot);
+    CHECK(v0.slot != v1.slot);
+    CHECK(p.upload(k0, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.upload(k1, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.upload(v0, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.upload(v1, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(k0, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 0
+    CHECK(p.enqueue(k1, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 1
+    CHECK(p.enqueue(v0, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 2
+    CHECK(p.enqueue(v1, 0, dst, sizeof(src), nullptr) == submit_result::ok);  // 3
+    p.release(k0);
+    p.release(k1);
+    p.release(v0);
+    p.release(v1);
+
+    // The generic key is independent of both union kinds.
+    lease g;
+    CHECK(p.acquire(0, kind::generic, sizeof(src), &g));
+    p.release(g);
+
+    // A third union_k is a pending miss on its own kind; union_v is untouched.
+    lease k2;
+    CHECK(!p.acquire(0, kind::union_k, sizeof(src), &k2, false));
+    auto s = p.snapshot();
+    CHECK(s.no_slot == 1);
+    CHECK(s.no_slot_pending == 1);
+    CHECK(s.no_slot_by_kind[size_t(kind::union_k)] == 1);
+    CHECK(s.no_slot_by_kind[size_t(kind::union_v)] == 0);
+    CHECK(s.queries_by_kind[size_t(kind::union_k)] == 2);
+    CHECK(s.queries_by_kind[size_t(kind::union_v)] == 0);
+
+    // Slow consumer: only v0's event completed. union_v rotates; union_k
+    // remains blocked on its own incomplete rank event.
+    fake_complete_record(2);
+    lease v2;
+    CHECK(p.acquire(0, kind::union_v, sizeof(src), &v2, false));
+    CHECK(v2.slot == v0.slot || v2.slot == v1.slot);
+    s = p.snapshot();
+    CHECK(s.reaps_by_kind[size_t(kind::union_v)] == 1);
+    CHECK(s.reaps_by_kind[size_t(kind::union_k)] == 0);
+    CHECK(s.no_slot_by_kind[size_t(kind::union_k)] == 1);
+
+    // Completing k0 lets union_k rotate without changing union_v's counts.
+    fake_complete_record(0);
+    CHECK(p.acquire(0, kind::union_k, sizeof(src), &k2, false));
+    CHECK(k2.slot == k0.slot || k2.slot == k1.slot);
+    s = p.snapshot();
+    CHECK(s.reaps_by_kind[size_t(kind::union_k)] == 1);
+    CHECK(s.reaps_by_kind[size_t(kind::union_v)] == 1);
+    CHECK(s.no_slot_by_kind[size_t(kind::union_k)] == 1);
+    CHECK(s.no_slot_by_kind[size_t(kind::union_v)] == 0);
+    CHECK(s.queries_by_kind[size_t(kind::union_k)] == 3);
+    p.release(v2);
+    p.release(k2);
+    return 0;
+}
+
+int test_union_kind_failure_disables() {
+    pool p(fake_ops());
+    uint8_t src[32] = {};
+    uint8_t dst[32] = {};
+
+    lease k;
+    CHECK(p.acquire(0, kind::union_k, sizeof(src), &k));
+    CHECK(p.upload(k, src, sizeof(src)) == submit_result::ok);
+    g_fail_event_record = true;
+    CHECK(p.enqueue(k, 0, dst, sizeof(src), nullptr) == submit_result::fatal);
+    g_fail_event_record = false;
+    CHECK(!p.usable());
+    CHECK(p.snapshot().quarantine == 1);
+    CHECK(p.snapshot().first_error == 3);
+    p.release(k);
+
+    // The fail-stop state is global: a different kind also refuses a lease.
+    lease v;
+    CHECK(!p.acquire(0, kind::union_v, sizeof(src), &v, false));
+    CHECK(!p.usable());
+    return 0;
+}
+
+int test_rank_count_reap_queries() {
+    const uint32_t counts[3] = {1, 5, 16};
+    for (uint32_t n : counts) {
+        g_record_log.clear();
+        pool p(fake_ops());
+        uint8_t src[32] = {};
+        uint8_t dst[32] = {};
+
+        lease a;
+        lease b;
+        CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+        CHECK(p.upload(a, src, sizeof(src)) == submit_result::ok);
+        for (uint32_t r = 0; r < n; ++r) {
+            CHECK(p.enqueue(a, int(r), dst, sizeof(src), nullptr) == submit_result::ok);
+        }
+        CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+        CHECK(p.upload(b, src, sizeof(src)) == submit_result::ok);
+        CHECK(p.enqueue(b, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+        p.release(a);
+        p.release(b);
+
+        // Complete A's n rank events; leave B's single event not ready. The
+        // reap of A must query exactly popcount(A.pending_ranks) = n, not a
+        // fixed five. kRanks is 16, so n=16 is the mask boundary.
+        for (uint32_t r = 0; r < n; ++r) {
+            fake_complete_record(int(r));
+        }
+        const int q0 = g_queries;
+        lease c;
+        CHECK(p.acquire(0, kind::tokens, sizeof(src), &c, false));
+        const auto s = p.snapshot();
+        CHECK(s.reaps == 1);
+        CHECK(s.reaps_by_kind[size_t(kind::tokens)] == 1);
+        CHECK(s.queries_by_kind[size_t(kind::tokens)] == n);
+        CHECK(g_queries - q0 == int(n));
+        p.release(c);
+    }
+    return 0;
+}
+
+int test_sync_all_leased_no_slot() {
+    pool p(fake_ops());
+    uint8_t src[16] = {};
+    uint8_t dst[16] = {};
+
+    lease a;
+    lease b;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &a));
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &b));
+
+    // Synchronous acquire with both slots leased and no pending event: this
+    // is a lease collision, not a retire miss, and it issues no queries.
+    lease c;
+    CHECK(!p.acquire(0, kind::tokens, sizeof(src), &c));
+    auto s = p.snapshot();
+    CHECK(s.no_slot == 1);
+    CHECK(s.no_slot_leased == 1);
+    CHECK(s.no_slot_pending == 0);
+    CHECK(s.queries == 0);
+    p.release(a);
+    p.release(b);
+
+    // The asynchronous pending miss is a distinct state and does query.
+    lease d;
+    lease e;
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &d));
+    CHECK(p.acquire(0, kind::tokens, sizeof(src), &e));
+    CHECK(p.upload(d, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.upload(e, src, sizeof(src)) == submit_result::ok);
+    CHECK(p.enqueue(d, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+    CHECK(p.enqueue(e, 0, dst, sizeof(src), nullptr) == submit_result::ok);
+    p.release(d);
+    p.release(e);
+    lease f;
+    CHECK(!p.acquire(0, kind::tokens, sizeof(src), &f, false));
+    s = p.snapshot();
+    CHECK(s.no_slot == 2);
+    CHECK(s.no_slot_leased == 1);
+    CHECK(s.no_slot_pending == 1);
+    CHECK(s.queries == 2);
+    return 0;
+}
+
+int test_four_window_union_budget() {
+    // Four windows x two union kinds x two slots x 64 KiB = 1 MiB. The
+    // production pool is 4 MiB; this smaller cap makes the boundary exact.
+    const size_t max_bytes = size_t(kWindows) * 2 * 2 * kGenericMaxBytes;
+    pool p(fake_ops(), max_bytes);
+    uint8_t src[kGenericMaxBytes] = {};
+    uint8_t dst[kGenericMaxBytes] = {};
+    const kind kinds[2] = {kind::union_k, kind::union_v};
+
+    for (uint32_t w = 0; w < kWindows; ++w) {
+        for (kind k : kinds) {
+            lease l0;
+            lease l1;
+            CHECK(p.acquire(w, k, kGenericMaxBytes, &l0));
+            CHECK(p.upload(l0, src, kGenericMaxBytes) == submit_result::ok);
+            CHECK(p.enqueue(l0, 0, dst, kGenericMaxBytes, nullptr) == submit_result::ok);
+            p.release(l0);
+            CHECK(p.acquire(w, k, kGenericMaxBytes, &l1));
+            CHECK(p.upload(l1, src, kGenericMaxBytes) == submit_result::ok);
+            CHECK(p.enqueue(l1, 0, dst, kGenericMaxBytes, nullptr) == submit_result::ok);
+            p.release(l1);
+        }
+    }
+
+    auto s = p.snapshot();
+    CHECK(s.leases == uint64_t(kWindows) * 2 * 2);
+    CHECK(p.pool_bytes() == max_bytes);
+    CHECK(s.oversize == 0);
+    CHECK(s.no_slot == 0);
+
+    // The byte cap is hard: a new key cannot grow even by one byte.
+    lease t;
+    CHECK(!p.acquire(0, kind::tokens, 1, &t));
+    s = p.snapshot();
+    CHECK(s.oversize == 1);
+    CHECK(s.no_slot == 0);
+    return 0;
+}
+
 int test_staging_candidate() {
     const size_t max_bytes = 2u << 20;
 
@@ -968,6 +1283,9 @@ int test_staging_candidate() {
     CHECK(classify_name("attn_inp_kq_mask") == kind::kq_mask);
     CHECK(classify_name("mtp_h_input") == kind::mtp_h);
     CHECK(classify_name("inp_h") == kind::mtp_h);
+    CHECK(classify_name("union_inp_k_idxs") == kind::union_k);
+    CHECK(classify_name("union_inp_v_idxs") == kind::union_v);
+    CHECK(classify_name("union_inp_k_idxs_extra") == kind::generic);
     CHECK(classify_name("") == kind::generic);
     CHECK(classify_name(nullptr) == kind::generic);
     CHECK(classify_name("blk.0.attn_q.weight") == kind::generic);
@@ -982,6 +1300,16 @@ int test_staging_candidate() {
     // Large unnamed blocks stay out of the generic rotation.
     CHECK(!staging_candidate(true, "", kGenericMaxBytes + 1, max_bytes, &k));
     CHECK(staging_candidate(true, "", kGenericMaxBytes, max_bytes, &k));
+    // The union index inputs keep the 64 KiB envelope they had as generic
+    // inputs; the split changes only the key, not eligibility.
+    CHECK(staging_candidate(true, "union_inp_k_idxs", kGenericMaxBytes, max_bytes, &k));
+    CHECK(k == kind::union_k);
+    CHECK(!staging_candidate(true, "union_inp_k_idxs", kGenericMaxBytes + 1, max_bytes, &k));
+    CHECK(staging_candidate(true, "union_inp_v_idxs", kGenericMaxBytes, max_bytes, &k));
+    CHECK(k == kind::union_v);
+    CHECK(!staging_candidate(true, "union_inp_v_idxs", kGenericMaxBytes + 1, max_bytes, &k));
+    CHECK(!staging_candidate(true, "union_inp_k_idxs", max_bytes + 1, max_bytes, &k));
+    CHECK(!staging_candidate(true, "union_inp_v_idxs", 0, max_bytes, &k));
     // A weight without the input flag never stages, even with a matching name.
     CHECK(!staging_candidate(false, "inp_tokens", 128, max_bytes, &k));
     // Size bound covers the 32-row MTP hidden input and rejects larger blocks.
@@ -1412,6 +1740,7 @@ int main() {
         {"reap_event_rerecord",        test_reap_event_rerecord},
         {"reap_preserves_other_slot",  test_reap_preserves_other_slot},
         {"reap_query_failure_disables", test_reap_query_failure_disables},
+        {"no_slot_attribution",        test_no_slot_attribution},
         {"reap_device_switch",         test_reap_device_switch},
         {"note_source_fast_path",      test_note_source_fast_path},
         {"window_isolation",           test_window_isolation},
@@ -1433,6 +1762,11 @@ int main() {
         {"quarantine_destructor_retains", test_quarantine_destructor_retains},
         {"owns_and_diagnostics",       test_owns_and_diagnostics},
         {"device_ptr",                 test_device_ptr},
+        {"union_kinds_interleaved_and_slow", test_union_kinds_interleaved_and_slow},
+        {"union_kind_failure_disables", test_union_kind_failure_disables},
+        {"rank_count_reap_queries",    test_rank_count_reap_queries},
+        {"sync_all_leased_no_slot",    test_sync_all_leased_no_slot},
+        {"four_window_union_budget",   test_four_window_union_budget},
         {"staging_candidate",          test_staging_candidate},
         {"source_mutation_isolation",  test_source_mutation_isolation},
         {"partial_enqueue_stops_pool", test_partial_enqueue_stops_pool},

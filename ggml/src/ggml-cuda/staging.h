@@ -36,7 +36,14 @@ enum class kind : uint32_t {
     mtp_h   = 3,
     kq_mask = 4,
     generic = 5,
-    count   = 6,
+    // The two union index inputs are distinct graph inputs on the same graph.
+    // Dedicated kinds give each its own double buffer instead of making both
+    // copies share the generic key. The generic 64 KiB cap stays in force for
+    // every other unnamed input. The split adds two double buffers; the 4 MiB
+    // pool cap still bounds total pinned bytes.
+    union_k = 6,
+    union_v = 7,
+    count   = 8,
 };
 
 constexpr size_t kKindCount = size_t(kind::count);
@@ -73,6 +80,12 @@ inline kind classify_name(const char * name) {
     if (std::strcmp(name, "inp_h") == 0 || std::strstr(name, "mtp_h_input") != nullptr) {
         return kind::mtp_h;
     }
+    if (std::strcmp(name, "union_inp_k_idxs") == 0) {
+        return kind::union_k;
+    }
+    if (std::strcmp(name, "union_inp_v_idxs") == 0) {
+        return kind::union_v;
+    }
     return kind::generic;
 }
 
@@ -81,14 +94,22 @@ constexpr size_t kGenericMaxBytes = 64u << 10;
 // A staging candidate is a graph input (the flag excludes weights and other
 // one-shot uploads) within the per-request size bound. Generic kinds are
 // allowed: unnamed inputs still rotate through their own slots, but only when
-// small, so a large unnamed block cannot crowd out the dedicated kinds.
+// small, so a large unnamed block cannot crowd out the dedicated kinds. The
+// two union index kinds were generic before the split and keep the same
+// 64 KiB per-slot envelope, so eligibility is unchanged. The split is not
+// free: it adds two double buffers. In the active window 0 that is up to
+// 4 x 64 KiB = 256 KiB of additional pinned capacity (up to 16 slot records
+// and 1 MiB across all four window arrays), plus up to one lazily created
+// event per rank per new slot. The 4 MiB pool cap still bounds pinned bytes;
+// the extra event handles and metadata are outside that byte cap.
 inline bool staging_candidate(bool has_input_flag, const char * name, size_t size,
                               size_t max_bytes, kind * out) {
     if (out == nullptr || !has_input_flag || size == 0 || size > max_bytes) {
         return false;
     }
     const kind k = classify_name(name);
-    if (k == kind::generic && size > kGenericMaxBytes) {
+    if ((k == kind::generic || k == kind::union_k || k == kind::union_v) &&
+            size > kGenericMaxBytes) {
         return false;
     }
     *out = k;
@@ -146,6 +167,14 @@ public:
         uint64_t wait_fail                 = 0;
         uint64_t query_fail                = 0;
         uint64_t no_slot                   = 0;
+        uint64_t no_slot_leased            = 0;
+        uint64_t no_slot_pending           = 0;
+        uint64_t no_slot_quarantined       = 0;
+        uint64_t no_slot_other             = 0;
+        uint64_t no_slot_by_kind[kKindCount]  = {};
+        uint64_t leases_by_kind[kKindCount]   = {};
+        uint64_t reaps_by_kind[kKindCount]    = {};
+        uint64_t queries_by_kind[kKindCount]  = {};
         uint64_t reaps                     = 0;
         uint64_t queries                   = 0;
         uint64_t quarantine                = 0;
@@ -230,7 +259,7 @@ public:
                 if (s.leased || s.quarantined || !s.pending) {
                     continue;
                 }
-                if (try_reap_locked(s)) {
+                if (try_reap_locked(s, size_t(k))) {
                     chosen = pick_free_locked(key, bytes);
                     break;
                 }
@@ -243,6 +272,33 @@ public:
         //    the caller asked for it.
         if (chosen == nullptr) {
             stats_.no_slot++;
+            stats_.no_slot_by_kind[size_t(k)]++;
+            bool any_unleased_pending = false;
+            bool any_leased = false;
+            bool any_usable = false;
+            for (const auto & s : key) {
+                if (s.quarantined) {
+                    continue;
+                }
+                any_usable = true;
+                if (s.leased) {
+                    any_leased = true;
+                }
+                if (!s.leased && s.pending) {
+                    any_unleased_pending = true;
+                }
+            }
+            if (!any_usable) {
+                stats_.no_slot_quarantined++;
+            } else if (any_unleased_pending) {
+                stats_.no_slot_pending++;
+            } else if (any_leased) {
+                stats_.no_slot_leased++;
+            } else {
+                // A usable free slot would have been chosen above; this is a
+                // defensive category for an unexpected state.
+                stats_.no_slot_other++;
+            }
             return false;
         }
         if (!wait_slot_locked(*chosen)) {
@@ -260,6 +316,7 @@ public:
         out->slot     = uint32_t(chosen - key.data());
         out->epoch    = chosen->epoch;
         stats_.leases++;
+        stats_.leases_by_kind[size_t(k)]++;
         return true;
     }
 
@@ -581,6 +638,7 @@ public:
                      bytes_used_, max_bytes_, int(disabled_.load(std::memory_order_relaxed)));
         static const char * names[kKindCount] = {
             "tokens", "pos", "out_ids", "mtp_h", "kq_mask", "generic",
+            "union_k", "union_v",
         };
         for (size_t k = 0; k < kKindCount; ++k) {
             if (stats_.upload_bytes_by_kind[k] == 0) {
@@ -589,11 +647,29 @@ public:
             std::fprintf(f, "TP5_STAGING kind=%s upload_bytes=%llu\n", names[k],
                          (unsigned long long) stats_.upload_bytes_by_kind[k]);
         }
+        // Per-kind attribution: a no_slot can be a real lease collision or an
+        // unleased slot whose rank events have not all completed. The global
+        // no_slot line alone cannot tell those apart.
+        for (size_t k = 0; k < kKindCount; ++k) {
+            if (stats_.leases_by_kind[k] == 0 && stats_.no_slot_by_kind[k] == 0 &&
+                    stats_.reaps_by_kind[k] == 0 && stats_.queries_by_kind[k] == 0) {
+                continue;
+            }
+            std::fprintf(f,
+                "TP5_STAGING_KIND kind=%s leases=%llu no_slot=%llu reaps=%llu queries=%llu\n",
+                names[k],
+                (unsigned long long) stats_.leases_by_kind[k],
+                (unsigned long long) stats_.no_slot_by_kind[k],
+                (unsigned long long) stats_.reaps_by_kind[k],
+                (unsigned long long) stats_.queries_by_kind[k]);
+        }
         const uint64_t misses = stats_.misses + misses_fast_.load(std::memory_order_relaxed);
         std::fprintf(f,
             "TP5_STAGING leases=%llu uploads=%llu upload_bytes=%llu waits=%llu wait_ms=%.3f "
             "enqueues=%llu releases=%llu hits=%llu misses=%llu oversize=%llu alloc_fail=%llu "
-            "stale_release=%llu wait_fail=%llu query_fail=%llu no_slot=%llu reaps=%llu "
+            "stale_release=%llu wait_fail=%llu query_fail=%llu no_slot=%llu "
+            "no_slot_leased=%llu no_slot_pending=%llu no_slot_quarantined=%llu "
+            "no_slot_other=%llu reaps=%llu "
             "queries=%llu quarantine=%llu invalid=%llu "
             "partial=%llu first_error=%d\n",
             (unsigned long long) stats_.leases,
@@ -611,6 +687,10 @@ public:
             (unsigned long long) stats_.wait_fail,
             (unsigned long long) stats_.query_fail,
             (unsigned long long) stats_.no_slot,
+            (unsigned long long) stats_.no_slot_leased,
+            (unsigned long long) stats_.no_slot_pending,
+            (unsigned long long) stats_.no_slot_quarantined,
+            (unsigned long long) stats_.no_slot_other,
             (unsigned long long) stats_.reaps,
             (unsigned long long) stats_.queries,
             (unsigned long long) stats_.quarantine,
@@ -721,7 +801,7 @@ private:
 
     // Non-blocking completion reclaim. A query error is fatal, like a failed
     // wait: an unprovable completion keeps the slot out of rotation.
-    bool try_reap_locked(slot & s) {
+    bool try_reap_locked(slot & s, size_t kind_index) {
         if (!s.pending) {
             return true;
         }
@@ -750,6 +830,7 @@ private:
             // examined, stopping at the first not-ready or error. It is a
             // call count, not a latency measurement.
             stats_.queries++;
+            stats_.queries_by_kind[kind_index]++;
             bool rank_complete = false;
             const int query_err = ops_.event_query(s.events[r], &rank_complete);
             if (query_err != 0) {
@@ -779,6 +860,7 @@ private:
         s.pending = false;
         s.pending_ranks = 0;
         stats_.reaps++;
+        stats_.reaps_by_kind[kind_index]++;
         return true;
     }
 
