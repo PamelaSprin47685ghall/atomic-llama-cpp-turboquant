@@ -649,11 +649,11 @@ Reclamation is state-driven and preserves availability. When a newer
 `INPUT_READY` arrives, `legacy_channel_map` advances its admitted generation;
 an older entry is retired only on a ledger receipt: `channel_ledger::retirement()`
 returns `bank_released` when every occupied bank recorded input release, output
-publication and every consumer completion, or `no_native_work` when no bank was
+publication and every consumer completion, or `no_reservations` when no bank was
 ever reserved. `not_ready` is retained, as is any entry with a held lease. The
 reclaim callback does not call `mark_drained` and does not turn a bool or
 `held == false` into a native-drain proof; the callback only records the
-receipt (`map_retired_bank` or `map_retired_no_work`). A held or not-ready old
+receipt (`map_retired_bank` or `map_retired_no_reservations`). A held or not-ready old
 entry stays for its later `OUTPUT_RELEASED`, and a later generation retries.
 The provider idle requirement at prepare remains the ordering proof; the
 native-drain proof for entries that remain at close is still `finish_ledgers`.
@@ -661,7 +661,7 @@ A stale `INPUT_READY` older than the admitted generation is rejected
 explicitly and creates no old ledger.
 
 The existing `TP5_DW_COURIER_HIT` line prints `map_retired_bank` and
-`map_retired_no_work`, the two receipt classes retired through this path.
+`map_retired_no_reservations`, the two receipt classes retired through this path.
 
 The CPU-only `tq-tp5-relay-channel-map` test drives the same
 `INPUT_READY -> held lease -> OUTPUT_RELEASED -> newer INPUT_READY` chain
@@ -669,7 +669,7 @@ through `legacy_channel_map`, with real `channel_ledger` leases (reserve, five
 producer-ready records, reduce done, output published, five consumer-done
 records). It observes map size/generation, held retention, the retired
 `bank_state` drain facts (`input_released`, `output_published`,
-`consumed_ranks`), the `bank_released` / `no_native_work` proofs, an
+`consumed_ranks`), the `bank_released` / `no_reservations` proofs, an
 incomplete bank that is retained as `not_ready`, the explicit stale refusal,
 and that `OUTPUT_RELEASED` never reclaims. It is not a pure helper-counter
 test, but it is still a narrow host test: no GPU, full-model, or MTP runtime

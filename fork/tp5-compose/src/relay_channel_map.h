@@ -50,7 +50,7 @@ struct legacy_input {
     bool            stale = false;
     std::size_t     retired = 0;
     std::size_t     retired_bank = 0;
-    std::size_t     retired_no_work = 0;
+    std::size_t     retired_no_reservations = 0;
     std::size_t     retained_held = 0;
     std::size_t     retained_not_ready = 0;
 };
@@ -91,8 +91,8 @@ class legacy_channel_map {
                         ++result.retired_bank;
                         ++retired_bank_;
                     } else {
-                        ++result.retired_no_work;
-                        ++retired_no_work_;
+                        ++result.retired_no_reservations;
+                        ++retired_no_reservations_;
                     }
                 }
                 it = channels_.erase(it);
@@ -131,7 +131,7 @@ class legacy_channel_map {
     std::uint64_t map_generation() const noexcept { return map_generation_; }
     std::uint64_t retired() const noexcept { return retired_; }
     std::uint64_t retired_bank() const noexcept { return retired_bank_; }
-    std::uint64_t retired_no_work() const noexcept { return retired_no_work_; }
+    std::uint64_t retired_no_reservations() const noexcept { return retired_no_reservations_; }
     std::size_t   size() const noexcept { return channels_.size(); }
 
   private:
@@ -139,7 +139,7 @@ class legacy_channel_map {
     std::uint64_t map_generation_ = 0;
     std::uint64_t retired_ = 0;
     std::uint64_t retired_bank_ = 0;
-    std::uint64_t retired_no_work_ = 0;
+    std::uint64_t retired_no_reservations_ = 0;
 };
 
 } // namespace tq::tp5

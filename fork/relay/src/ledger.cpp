@@ -228,7 +228,7 @@ retirement_state channel_ledger::retirement() const noexcept {
             return retirement_state::not_ready;
         }
     }
-    return any_occupied ? retirement_state::bank_released : retirement_state::no_native_work;
+    return any_occupied ? retirement_state::bank_released : retirement_state::no_reservations;
 }
 
 bank_state channel_ledger::bank(std::uint32_t slot) const noexcept {

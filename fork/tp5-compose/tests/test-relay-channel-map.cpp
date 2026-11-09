@@ -138,15 +138,15 @@ void test_input_output_input_chain() {
     CHECK(in3.retained_not_ready == 0);
     CHECK(in3.retired == 2);
     CHECK(in3.retired_bank == 1);
-    CHECK(in3.retired_no_work == 1);
+    CHECK(in3.retired_no_reservations == 1);
     CHECK(map.map_generation() == 3);
     CHECK(map.size() == 1);
     CHECK(map.retired() == 2);
     CHECK(map.retired_bank() == 1);
-    CHECK(map.retired_no_work() == 1);
+    CHECK(map.retired_no_reservations() == 1);
     CHECK(log.calls == 2);
     bool saw_bank_released = false;
-    bool saw_no_work = false;
+    bool saw_no_reservations = false;
     for (std::size_t i = 0; i < log.proofs.size(); ++i) {
         if (log.proofs[i] == retirement_state::bank_released) {
             saw_bank_released = true;
@@ -155,14 +155,14 @@ void test_input_output_input_chain() {
             CHECK(bank.input_released);
             CHECK(bank.output_published);
             CHECK(bank.consumed_ranks == 0x1fu);
-        } else if (log.proofs[i] == retirement_state::no_native_work) {
-            saw_no_work = true;
+        } else if (log.proofs[i] == retirement_state::no_reservations) {
+            saw_no_reservations = true;
         } else {
             CHECK(false);
         }
     }
     CHECK(saw_bank_released);
-    CHECK(saw_no_work);
+    CHECK(saw_no_reservations);
 
     // Stale INPUT_READY for a reclaimed generation is refused and creates no
     // old ledger.
@@ -233,7 +233,7 @@ void test_incomplete_bank_is_not_retired() {
     CHECK(!in3.stale);
     CHECK(in3.retired == 2);
     CHECK(in3.retired_bank == 1);
-    CHECK(in3.retired_no_work == 1);
+    CHECK(in3.retired_no_reservations == 1);
     CHECK(map.map_generation() == 3);
     CHECK(map.size() == 1);
     CHECK(log.calls == 2);

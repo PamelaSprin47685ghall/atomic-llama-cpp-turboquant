@@ -30,13 +30,13 @@ struct reserve_reply {
 };
 
 // Host-side proof available for retiring a channel without inventing a native
-// drain claim. `no_native_work` means no bank was ever reserved for this
+// drain claim. `no_reservations` means no bank was ever reserved for this
 // ledger. `bank_released` means every occupied bank has recorded input release,
 // output publication and every consumer completion. `not_ready` means a bank
 // is still incomplete and must not be retired.
 enum class retirement_state {
     not_ready,
-    no_native_work,
+    no_reservations,
     bank_released,
 };
 

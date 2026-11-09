@@ -597,10 +597,10 @@ struct service_window {
     // until their OUTPUT_RELEASED. The slotized lane below does not use it.
     legacy_channel_map                                                                map;
     // Retirement receipts from the map. bank_released means every producer and
-    // consumer fact was recorded; no_work means no bank was ever reserved.
+    // consumer fact was recorded; no_reservations means no bank was ever reserved.
     // Neither is a native-drain claim; the reclaim path does not mark drained.
     std::uint64_t                                                                     map_retired_bank = 0;
-    std::uint64_t                                                                     map_retired_no_work = 0;
+    std::uint64_t                                                                     map_retired_no_reservations = 0;
     // Pillar 5: slotized ownership. The map above stays the fallback when
     // GGML_TP5_RELAY_SLOT_CHANNELS=0 (and GGML_TP5_PLAN_UNION is unset).
     plan_channel_slots                                                                plan_slots;
@@ -762,7 +762,7 @@ class relay_service {
                          "pending_sum=%llu pending_max=%llu hist=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
                          "drain_ns=%llu drain_passes=%llu drain_max=%llu batch_extra=%llu "
                          "polls=%llu idle=%llu serviced_in=%llu serviced_out=%llu deferred=%llu errors=%llu "
-                         "map_retired_bank=%llu map_retired_no_work=%llu\n",
+                         "map_retired_bank=%llu map_retired_no_reservations=%llu\n",
                          i, threads_.size(), int(courier_ablate_),
                          (unsigned long long) w.demand_epochs, (unsigned long long) w.demand_hits,
                          (unsigned long long) w.demand_misses, hit_rate,
@@ -779,7 +779,7 @@ class relay_service {
                          (unsigned long long) w.courier_input, (unsigned long long) w.courier_output,
                          (unsigned long long) w.courier_deferred, (unsigned long long) w.courier_errors,
                          (unsigned long long) w.map_retired_bank,
-                         (unsigned long long) w.map_retired_no_work);
+                         (unsigned long long) w.map_retired_no_reservations);
         }
     }
 
@@ -1490,12 +1490,12 @@ class relay_service {
                     auto input = window.map.input_ready(run_, event.plan_generation, event.channel,
                             [&window](channel_state &, relay::retirement_state proof) {
                                 require(proof == relay::retirement_state::bank_released ||
-                                                proof == relay::retirement_state::no_native_work,
+                                                proof == relay::retirement_state::no_reservations,
                                         "relay map retired an unproved ledger");
                                 if (proof == relay::retirement_state::bank_released) {
                                     ++window.map_retired_bank;
                                 } else {
-                                    ++window.map_retired_no_work;
+                                    ++window.map_retired_no_reservations;
                                 }
                             });
                     require(!input.stale, "relay map received a stale plan generation");
