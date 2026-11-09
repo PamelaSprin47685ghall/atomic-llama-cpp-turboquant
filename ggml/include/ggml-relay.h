@@ -23,7 +23,8 @@ enum ggml_relay_event_kind {
 // TP5 pillar-5 plan identity. Seven coarse fields plus the channel count.
 // Two epochs with the same key must be interchangeable for every captured
 // graph. `channels` is part of the identity: a 180- and a 181-channel plan
-// never share a plan slot.
+// never share a plan slot. Zero lets the provider use the prepared stage
+// count; any nonzero value must equal the count being prepared.
 struct ggml_relay_plan_key {
     uint64_t model;       // model identity inside one process
     uint32_t window;      // service window ordinal (provider is per window)
@@ -134,7 +135,9 @@ GGML_API int  ggml_backend_relay_poll(ggml_backend_t backend, struct ggml_relay_
 // publishes a success generation. Abort alone does not end a CPU borrow.
 GGML_API bool ggml_backend_relay_publish(ggml_backend_t backend, const struct ggml_relay_event * event);
 // False also permits temporary contention; retry without holding a provider
-// view or lock. Capability discovery must precede concurrent execution.
+// view or lock. A finished epoch whose outputs are all released has no
+// pending fact; the returned status is what a full observation would produce.
+// Capability discovery must precede concurrent execution.
 GGML_API bool ggml_backend_relay_snapshot(ggml_backend_t backend, struct ggml_relay_status * status);
 // Experimental HC4/K320 context owner offset (0..4), configured exactly once
 // after context creation and before its first real graph_compute/submit.

@@ -117,7 +117,71 @@ while kernels may be launching.
 `frame_hits`, `frame_misses`, `frame_evict`, `frame_inst`, `frame_destroy`.
 A nonzero `frame_inst` proves the capture path ran; a nonzero `frame_hits`
 proves the LRU served a repeat. `frames_cleared` counts frames dropped by an
-exact-pool layout growth, not by the destroy flush.
+exact-pool layout growth, not by the destroy flush; it counts only slots that
+were live in the frame LRU, so a cold growth reports 0. A normal prepare
+retires at most one plan (the single LRU victim); the diagnostic
+`GGML_TP5_RELAY_PLAN_FLUSH=1` path can retire up to eight. The 16-entry
+retirement queue is burst headroom for that diagnostic path plus pending
+retirements. Overflow is a hard failure
+(`relay retirement queue overflow: the runtime did not drain PLAN_RETIRED`),
+not a drop: the provider cannot prove the runtime observed a retirement, and a
+dropped event would lose the runtime's immediate "no live reader" assertion.
+The provider queue-full branch is not covered by a test; normal runtime
+operation cannot reach it because the runtime drains every epoch and prepare
+retires at most one plan. It is a fail-closed guard against a stalled or
+foreign consumer.
+
+## Exact-pool layout and cost model
+
+The exact layout places a 1024-byte control block at each channel offset and
+then the F32 payload for five ranks plus the output. `control` is a 64-byte
+aligned object and its words are 64 bytes apart, so each channel slot is
+padded up to `pool_alignment = 64` bytes. Without that padding a channel with,
+for example, 1001 F32 elements would put the next control block at offset
+25,048, which is not 64-byte aligned; the mapped device pointers would then
+form misaligned `control` objects and the per-word atomics would lose their
+natural alignment. The T4 table (36x40960 + 145x10240) is already aligned and
+still costs 71,209,984 bytes; the padding is at most 63 bytes per channel.
+
+Cost per plan, with `c` channels and `e_i` F32 elements in channel `i`:
+
+```
+slot_bytes_i = round_up(1024 + e_i * 4 * (ranks + 1), 64)
+pool_need    = sum(slot_bytes_i)                       <= 68 MiB
+bindings     = 8 slots * 256 channels * 5 ranks * 80 B  = 819,200 B
+```
+
+Plan lookup scans at most eight 9-field keys twice (`find` + `acquire`); a key
+hit compares the full binding snapshot, `181 * 5 * 80 = 72,400` bytes for a
+181-channel plan, and an insert copies the same. Frame selection compares the
+serialized graph signature against at most `GGML_TP5_RELAY_FRAMES` cached
+signatures; the uid fast path skips that describe only when the caller assigns
+graph uids. A rebuilt definition serializes the full node/leaf closure, so the
+scan is O(signature bytes) per cached frame; vector equality short-circuits on
+a size mismatch. The frame LRU victim scan is at most eight entries.
+
+The exact pool allocates the 8 MiB baseline at create and reallocates only
+when the current layout cannot cover the plan and the new need exceeds the
+live allocation. A layout change clears every captured frame because captured
+graphs hold the old device pointers; the next submit recaptures. The 68 MiB
+budget is a hard bound: a plan that needs more fails closed with the actual
+byte count, it is never truncated.
+
+The provider lock is held across submit/finish (graph instantiate, launch and
+tail record) and across `observe`. A `publish` cannot overlap that long
+section: `poll` sets the borrow before returning `INPUT_READY`, and `begin`
+requires `idle()`, which rejects an outstanding borrow, so submit returns
+before it can instantiate or launch. The remaining contention is with
+`snapshot`: when the current epoch is settled
+(`finished && event_status == 0 && outputs_released == status.channels`),
+`snapshot` returns the cached status without rescanning channels. Epoch 0 is
+settled by definition; after `prepare`, `status.channels` may change before
+`begin` without touching `outputs_released`, so the explicit count comparison
+is required and the fast path does not apply to the new, not-yet-released
+channel set. Before the predicate holds, `snapshot` scans the in-flight
+channels and queries only ranks whose tail is still incomplete
+(`completed_mask` is checked before `hipSetDevice`). Those queries are the
+evidence used to decide completion, so they are not skipped.
 
 ## Plan identity: coarse llama key + terminal binding digest
 
@@ -143,26 +207,30 @@ names a different real binding therefore fails closed with
 `relay plan key collided with a different terminal binding`, not a silent
 reuse. The snapshot is written on insert and overwritten when the slot is
 reused; the explicit key->channels vs prepared-count contradiction remains a
-key-consistency failure. The digest and snapshot are used only when the plan
-cache is enabled and a key is present, so flag 0 keeps the legacy path.
+key-consistency failure. The in-tree llama caller leaves `key.channels` zero
+and lets the provider use the prepared stage count; a caller that fills it
+must fill the count of the plan being prepared. The digest and snapshot are
+used only when the plan cache is enabled and a key is present, so flag 0
+keeps the legacy path.
 
-The provider-create line ends with `key_digest=1` when the build contains this
-fix. That marker is build freshness only, not a correctness proof: the
-correctness evidence is the full-snapshot comparison in the code and the CPU
-tests below. A rerun log without the marker used an older installed
-`libggml-hip.so`.
+The provider-create line records the resolved `slot_channels` value and ends
+with `key_digest=1` when the build contains this fix. That marker is build
+freshness only, not a correctness proof: the correctness evidence is the
+full-snapshot comparison in the code and the CPU tests below. A rerun log
+without the marker used an older installed `libggml-hip.so`.
 
 ## Two plan-key domains (not the same type)
 
 | Type | Fields | Owner | Purpose |
 |---|---|---|---|
 | `tq::alloc::PlanKey` | 7: model, window, n_tokens, n_outputs, rs_class, n_kv_bucket, alloc_gen | `fork/alloc-ledger/include/tq/alloc/plan_cache.h` (F2) | allocation-ledger identity and arena placement |
-| `ggml_relay_plan::plan_key` | the same 7 + `channels` = 8 | `ggml/include/ggml-relay-plan.h` (WS5) | relay graph plan identity and frame/generation reuse |
+| `ggml_relay_plan::plan_key` | the same 7 + `channels` + internal `binding` = 9 | `ggml/include/ggml-relay-plan.h` (WS5) | relay graph plan identity and frame/generation reuse |
 
 They are deliberately separate. The relay adds `channels` because one
 allocation plan can back relay graphs with different channel tables (180 vs
 181). The C boundary type `struct ggml_relay_plan_key` (in `ggml-relay.h`) maps
-the relay domain only. `ggml_relay_plan::plan_key::from_c`/`to_c` are the
+the relay domain only; it carries the eight caller-visible fields, not the
+internal binding digest. `ggml_relay_plan::plan_key::from_c`/`to_c` are the
 adapter; no F2 file is modified.
 
 ## Cross-owner patches
@@ -204,8 +272,9 @@ hipcc -x hip -std=gnu++17 --offload-arch=gfx1030 -O1 -c \
 
 The policy test pins: plan-cache hit/evict/pin/flush and channels-in-key; the
 five-shape frame LRU (cap 8 = five cold misses, cap 4 worst case 9/12); the T4
-pool layout (`71,209,984 B <= 68 MiB`) and the fail-closed 65536 bound; channel
-slot binding/retirement/dual-window isolation and the 1448/2896 bounds; and the
+pool layout (`71,209,984 B <= 68 MiB`), its 64-byte control alignment for odd
+element counts, and the fail-closed 65536 bound; channel slot
+binding/retirement/dual-window isolation and the 1448/2896 bounds; and the
 legacy switch defaults.
 
 `test-shape-cache` pins the llama-side cache policy: same-shape second hit,

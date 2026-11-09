@@ -3,7 +3,8 @@
 // These pin the decisions relay.hip and the compose runtime share:
 //   * K=8 plan cache: hit/evict/pin/flush and channels-in-key,
 //   * frame LRU: the five-shape working set needs capacity 8,
-//   * exact pool layout: the T4 table fits 68 MiB, the 65536 bound does not,
+//   * exact pool layout: the T4 table fits 68 MiB, every control block stays
+//     64-byte aligned, and the 65536 bound does not fit,
 //   * per-window channel slots: binding, retirement, dual-window isolation,
 //   * the switch matrix: every switch defaults to the legacy behavior.
 //
@@ -261,6 +262,36 @@ void test_pool_layout() {
     CHECK(layout.capacity[0] == 40960);
     CHECK(layout.capacity[36] == 10240);
     CHECK(layout.offset[1] == 1024 + 40960 * 4 * 6);
+
+    // Every control block is a 64-byte-aligned object whose words are 64
+    // bytes apart. A channel whose payload is not a multiple of 64 bytes must
+    // not misalign the next control block. T4 is already aligned; odd element
+    // counts exercise the padding.
+    std::vector<size_t> odd = { 1, 3, 5, 7, 9, 17, 65521 };
+    ggml_relay_plan::pool_layout odd_layout;
+    CHECK(ggml_relay_plan::compute_pool_layout(odd.data(), odd.size(), 5,
+                                               ggml_relay_plan::pool_budget_default, odd_layout));
+    std::size_t odd_need = 0;
+    CHECK(ggml_relay_plan::pool_need(odd.data(), odd.size(), 5, odd_need));
+    CHECK(odd_need == odd_layout.bytes);
+    for (std::size_t i = 0; i < odd.size(); ++i) {
+        CHECK(odd_layout.offset[i] % ggml_relay_plan::pool_alignment == 0);
+        CHECK(odd_layout.capacity[i] == odd[i]);
+        if (i + 1 < odd.size()) {
+            const std::size_t payload_end = odd_layout.offset[i] +
+                ggml_relay_plan::control_bytes + odd_layout.capacity[i] * 4 * 6;
+            CHECK(odd_layout.offset[i + 1] >= payload_end);
+            CHECK(odd_layout.offset[i + 1] - payload_end < ggml_relay_plan::pool_alignment);
+        }
+    }
+    // Padding is between slots, not extra capacity: one more element still
+    // needs a new layout. The final slot's padding is part of the allocation.
+    std::vector<size_t> odd_more = odd;
+    ++odd_more.back();
+    CHECK(!ggml_relay_plan::layout_covers(odd_layout, odd_more.data(), odd_more.size()));
+    CHECK(odd_layout.bytes % ggml_relay_plan::pool_alignment == 0);
+    // An impossible rank count is rejected before the stride can overflow.
+    CHECK(!ggml_relay_plan::pool_need(odd.data(), odd.size(), SIZE_MAX, odd_need));
 
     // The old 65536 bound cannot fit the budget; the exact layout must fail
     // closed rather than silently overrun.

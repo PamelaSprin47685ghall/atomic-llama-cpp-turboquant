@@ -29,7 +29,8 @@ namespace ggml_relay_plan {
 // One provider owns at most eight prepared plans and eight captured frames.
 constexpr std::size_t plan_capacity      = 8;
 constexpr std::size_t frame_capacity_max = 8;
-// The relay channel table is fixed at 256 slots; a plan uses at most 181.
+// The relay channel table is fixed at 256 slots; the T4/MTP working set
+// uses at most 181 of them.
 constexpr std::size_t channel_capacity   = 256;
 // control is 16 cache-line words (generation, 5 ready, 5 ack, 5 error).
 constexpr std::size_t control_bytes      = 16 * 64;
@@ -331,7 +332,9 @@ private:
 // Frame metadata LRU. The provider owns the native graph/exec storage and
 // mirrors its per-frame uid, plan generation and last use here. A frame is a
 // uid fast-path candidate only when both uid and plan generation match; the
-// full signature remains the second-level check.
+// full signature remains the second-level check. The provider tests its
+// current frame directly; find() exposes the same predicate for the CPU
+// policy test and for callers that search every slot.
 class frame_lru {
 public:
     explicit frame_lru(std::size_t capacity = 2) noexcept : capacity_(capacity) {
@@ -428,9 +431,18 @@ private:
     std::size_t                           capacity_ = 2;
 };
 
+// The control block starts every channel slot and is a 64-byte aligned object
+// whose words are 64 bytes apart. Every slot is padded to this boundary so the
+// next control block keeps that alignment.
+constexpr std::size_t pool_alignment = 64;
+static_assert((pool_alignment & (pool_alignment - 1)) == 0, "pool alignment must be a power of two");
+static_assert(control_bytes % pool_alignment == 0, "control bytes must preserve pool alignment");
+
 // Exact channel layout. offset[c] is the byte offset of channel c's control
-// word; capacity[c] is the payload capacity in F32 elements per rank. The
-// total is sum(control_bytes + capacity * 4 * (ranks + 1)).
+// word; capacity[c] is the payload capacity in F32 elements per rank. Each
+// slot is padded to `pool_alignment` bytes, so offset[c] is always aligned
+// and the control word can be used as a control object. The total is
+// sum(round_up(control_bytes + capacity * 4 * (ranks + 1), pool_alignment)).
 struct pool_layout {
     std::array<std::size_t, channel_capacity> offset{};
     std::array<std::size_t, channel_capacity> capacity{};
@@ -445,19 +457,37 @@ struct pool_layout {
     }
 };
 
+// Bytes for one channel slot: its control block plus its payload, rounded up
+// so the next control block stays aligned. `elements` is the exact F32 element
+// count; the padding is never exposed as capacity.
+inline bool pool_slot_bytes(std::size_t elements, std::size_t stride,
+                            std::size_t & bytes) noexcept {
+    bytes = 0;
+    if (stride == 0 || elements == 0 || elements > (SIZE_MAX - control_bytes) / stride) {
+        return false;
+    }
+    const std::size_t raw = control_bytes + elements * stride;
+    if (raw > SIZE_MAX - (pool_alignment - 1)) {
+        return false;
+    }
+    bytes = (raw + pool_alignment - 1) & ~(pool_alignment - 1);
+    return true;
+}
+
 // Byte need for a plan. Returns false on overflow or an invalid element count.
 inline bool pool_need(const std::size_t * elements, std::size_t count, std::size_t ranks,
                       std::size_t & need) noexcept {
     need = 0;
-    if (elements == nullptr || count == 0 || count > channel_capacity || ranks == 0) {
+    if (elements == nullptr || count == 0 || count > channel_capacity || ranks == 0 ||
+        ranks > SIZE_MAX / sizeof(float) - 1) {
         return false;
     }
     const std::size_t stride = sizeof(float) * (ranks + 1);
     for (std::size_t i = 0; i < count; ++i) {
-        if (elements[i] == 0 || elements[i] > (SIZE_MAX - control_bytes) / stride) {
+        std::size_t slot = 0;
+        if (!pool_slot_bytes(elements[i], stride, slot)) {
             return false;
         }
-        const std::size_t slot = control_bytes + elements[i] * stride;
         if (slot > SIZE_MAX - need) {
             return false;
         }
@@ -479,9 +509,14 @@ inline bool compute_pool_layout(const std::size_t * elements, std::size_t count,
     const std::size_t stride = sizeof(float) * (ranks + 1);
     std::size_t       offset = 0;
     for (std::size_t i = 0; i < count; ++i) {
+        std::size_t slot = 0;
+        if (!pool_slot_bytes(elements[i], stride, slot)) {
+            out.clear();
+            return false;
+        }
         out.offset[i]   = offset;
         out.capacity[i] = elements[i];
-        offset += control_bytes + elements[i] * stride;
+        offset += slot;
     }
     out.bytes = offset;
     out.count = count;

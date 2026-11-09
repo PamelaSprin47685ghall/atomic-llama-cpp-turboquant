@@ -372,8 +372,10 @@ Non-blocking: manifest debt only; the build and CPU tests do not depend on this 
 - `GGML_TP5_RELAY_FRAMES` defaults to `2`; the ON leg must set `8` explicitly.
 - `GGML_TP5_POOL_EXACT` defaults to `0`; the ON leg must set `1` explicitly.
 - `GGML_TP5_PLAN_UNION` defaults to `0`; the ON leg must set `1` explicitly.
-- WS5 `plan_key` has eight fields including `channels`; B `PlanKey` has seven fields.
-  They are separate domains. The C adapter maps them explicitly; the types are not merged.
+- WS5 `plan_key` has nine fields: the seven B fields, `channels`, and an internal
+  terminal-binding digest; B `PlanKey` has seven fields, and the C boundary carries the
+  eight caller-visible fields. They are separate domains. The C adapter maps them
+  explicitly; the types are not merged.
   `patches/ws5/README.md` records OFF≡stock and the two-domain mapping.
 
 ## F. Why this does not block the integration
