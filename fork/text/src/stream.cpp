@@ -92,28 +92,22 @@ generation_stream & generation_stream::operator=(generation_stream && other) noe
 stream_event generation_stream::prepare_event(std::size_t incoming, std::string & out) const {
     stream_event result;
     result.offset = emitted_;
-    auto room = out.max_size();
-    const auto cursor_room = std::numeric_limits<std::uint64_t>::max() - emitted_;
-    if (cursor_room < room) { room = static_cast<std::size_t>(cursor_room); }
-    // The destination may already hold text. Account for it in both limits.
+    // The destination may already hold text. The room is what remains in both
+    // the string and the output cursor, not a total minus the used size.
     const std::size_t used = out.size();
-    if (used > room || pending_size_ > room - used ||
-        utf8_size_ > (room - used - pending_size_) / 3) {
+    const std::size_t room = detail::output_room(used, out.max_size(), emitted_);
+    if (pending_size_ > room || utf8_size_ > (room - pending_size_) / 3) {
         throw std::length_error("text output exceeds its byte counter");
     }
     const auto held = pending_size_ + 3 * utf8_size_;
-    if (incoming > (room - used - held) / 3) { throw std::length_error("text message exceeds output capacity"); }
+    if (incoming > (room - held) / 3) { throw std::length_error("text message exceeds output capacity"); }
     // Reserve before changing state. One invalid input byte can produce three
     // output bytes. Grow geometrically: an exact reserve would reallocate on
-    // every call when the caller does not pre-reserve the destination.
+    // every call when the caller does not pre-reserve the destination. Clamp
+    // the target to max_size() so the doubling cannot overshoot it.
     const std::size_t need = used + held + 3 * incoming;
     if (need > out.capacity()) {
-        const std::size_t limit = std::numeric_limits<std::size_t>::max();
-        std::size_t target = need;
-        if (out.capacity() <= limit / 2) {
-            target = std::max(target, out.capacity() * 2);
-        }
-        out.reserve(target);
+        out.reserve(detail::growth_target(need, out.capacity(), out.max_size()));
     }
     return result;
 }

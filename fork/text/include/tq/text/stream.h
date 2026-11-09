@@ -1,14 +1,41 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace tq::text {
+
+namespace detail {
+
+// Remaining bytes a destination can accept. The string limit is its
+// max_size() minus what it already holds; the cursor limit is the room left
+// in the 64-bit output counter. The smaller one wins.
+inline std::size_t output_room(std::size_t used, std::size_t max_size, std::uint64_t emitted) {
+    const std::size_t string_room = used <= max_size ? max_size - used : 0;
+    const std::uint64_t cursor = std::numeric_limits<std::uint64_t>::max() - emitted;
+    const std::size_t cursor_room = cursor > std::numeric_limits<std::size_t>::max()
+        ? std::numeric_limits<std::size_t>::max()
+        : static_cast<std::size_t>(cursor);
+    return std::min(string_room, cursor_room);
+}
+
+// Geometric capacity target, clamped to the destination's max_size().
+inline std::size_t growth_target(std::size_t need, std::size_t capacity, std::size_t max_size) {
+    std::size_t target = need;
+    if (capacity <= std::numeric_limits<std::size_t>::max() / 2) {
+        target = std::max(target, capacity * 2);
+    }
+    return std::min(target, max_size);
+}
+
+} // namespace detail
 
 struct stream_delta {
     std::uint64_t offset = 0;

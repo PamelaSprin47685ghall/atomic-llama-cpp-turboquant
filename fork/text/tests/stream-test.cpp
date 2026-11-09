@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -364,6 +365,23 @@ void test_into_geometric_growth() {
     check(growths <= 64, "push_into did not grow the destination geometrically");
 }
 
+void test_room_and_growth_limits() {
+    using tq::text::detail::output_room;
+    using tq::text::detail::growth_target;
+
+    constexpr std::uint64_t umax = std::numeric_limits<std::uint64_t>::max();
+
+    check(output_room(10, 100, 0) == 90, "room: the string limit wins");
+    check(output_room(10, 100, umax - 5) == 5, "room: the cursor limit wins");
+    check(output_room(0, 100, umax - 5) == 5, "room: cursor limit at zero size");
+    check(output_room(100, 100, 0) == 0, "room: full destination has no room");
+
+    check(growth_target(100, 0, 1000) == 100, "growth: first allocation is the need");
+    check(growth_target(100, 60, 1000) == 120, "growth: doubles the capacity");
+    check(growth_target(900, 600, 1000) == 1000, "growth: clamps to max_size");
+    check(growth_target(1000, 1000, 1000) == 1000, "growth: exact max_size is kept");
+}
+
 void test_into_append() {
     generation_stream stream({"END"});
     std::string out = "head:";
@@ -392,6 +410,7 @@ int main() {
         test_into_equivalence();
         test_into_capacity_stability();
         test_into_geometric_growth();
+        test_room_and_growth_limits();
         test_into_append();
         std::cout << "{\"status\":\"pass\",\"partition_and_adversarial_runs\":" << checked_runs
                   << ",\"generated_inputs\":300,\"long_prefix_input_bytes\":131073"
