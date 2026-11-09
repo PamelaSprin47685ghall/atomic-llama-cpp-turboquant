@@ -501,12 +501,14 @@ Each worker owns four lazy slots; a slot allocates its one-token `llama_batch`
 on first acquire and keeps the token inline. A lease returns its slot when it
 leaves scope, including on exception unwinding. When the flag is off or every
 slot is leased, the fallback lease owns the same heap batch that the pre-pool
-path allocated and frees it on release. `llama_batch_init` reports allocation
-failure with null arrays and never throws. Every required array and the
-fallback token are checked; a partial batch is released through
-`llama_batch_free` (safe on partial allocations because it checks each pointer
-and stops the `seq_id` walk at the first null entry) and then reported as
-`std::bad_alloc`. The failed slot stays unready, so a later acquire retries.
+path allocated and frees it on release. `llama_batch_init` checks every
+allocation, including the outer `seq_id` array, and reports failure with null
+fields instead of dereferencing a failed allocation. The caller must check
+every field it uses; the MTP pool and the target `row_batch` do so and throw
+`std::bad_alloc` after releasing the partial batch. `llama_batch_free` is safe
+on a partial batch because it checks each pointer and stops the `seq_id` walk
+at the first null entry. A failed pool slot stays unready, so a later acquire
+retries.
 
 The pool is not thread safe: exactly one worker owns it, and the pool outlives
 every lease. `lease::set` requires a non-null embedding row whose width equals
@@ -519,5 +521,7 @@ draft NextN widths are checked once (`10240`) before the worker pool exists.
 pool; the log stops at the cap. With the pool enabled, 10k sequential leases
 perform no heap allocation after the first slot is warm. The CPU test
 `tq-tp5-host-pool` covers reuse, fallback, exhaustion, exception release, the
-probe cap, pool destruction, the `set` contract, and injected first-use,
-fallback-batch, and fallback-token allocation failures including retry.
+probe cap, pool destruction, the `set` contract, and a failure injected at
+each of the six real `llama_batch_init` allocation points (direct, pooled, and
+fallback), plus the fallback token; every case must report `std::bad_alloc`
+and the next acquire must succeed.

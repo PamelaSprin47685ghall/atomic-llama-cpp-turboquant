@@ -31,6 +31,17 @@ inline std::uint64_t monotonic_ns() noexcept {
             .count());
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+// Test-only token-allocation fault injection. A test executable may define
+// this weak symbol; production leaves it undefined.
+extern "C" bool tq_tp5_mtp_pool_fail_token_alloc() __attribute__((weak));
+inline bool fail_token_alloc() noexcept {
+    return tq_tp5_mtp_pool_fail_token_alloc != nullptr && tq_tp5_mtp_pool_fail_token_alloc();
+}
+#else
+inline bool fail_token_alloc() noexcept { return false; }
+#endif
+
 } // namespace host_pool_detail
 
 // A worker-local pool of one-token MTP decode batches. A slot owns one
@@ -50,20 +61,9 @@ class mtp_batch_pool {
         bool in_use = false;
     };
 
-    llama_batch pool_batch_init() {
-        return alloc_.batch_init != nullptr ? alloc_.batch_init(wide_) : llama_batch_init(1, wide_, 1);
-    }
-
-    llama_token * pool_token_alloc() {
-        return alloc_.token_alloc != nullptr ? alloc_.token_alloc()
-                                             : static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
-    }
-
     // llama_batch_init reports allocation failure with null arrays, not an
-    // exception. (It dereferences seq_id before returning, so a null seq_id
-    // array is an upstream crash, not a state this check can see.) A
-    // one-token batch must own these arrays; the token is either inline
-    // (pooled slot) or allocated separately (fallback lease).
+    // exception. A one-token batch must own these arrays; the token is either
+    // inline (pooled slot) or allocated separately (fallback lease).
     static bool batch_arrays_complete(const llama_batch & batch) noexcept {
         return batch.embd != nullptr && batch.pos != nullptr && batch.n_seq_id != nullptr &&
                batch.seq_id != nullptr && batch.seq_id[0] != nullptr && batch.logits != nullptr;
@@ -84,16 +84,6 @@ public:
     // Bound the optional probe log. Steady state would otherwise append two
     // records per token.
     static constexpr std::size_t max_events = 4096;
-
-    // Test seam for allocation failure. The defaults call llama_batch_init and
-    // std::malloc. A custom allocator must return the same layout as
-    // llama_batch_init(1, wide, 1): arrays may be null on failure, and when
-    // seq_id is non-null its sentinel entry must be null so llama_batch_free
-    // can release the partial batch.
-    struct allocator {
-        llama_batch (*batch_init)(int wide) = nullptr;
-        llama_token * (*token_alloc)() = nullptr;
-    };
 
     // A one-token batch. A pooled lease borrows a pool slot. A fallback lease
     // owns a heap batch. Both release their batch when the lease dies.
@@ -160,7 +150,7 @@ public:
         explicit lease(mtp_batch_pool * pool) : pool_(pool) {
             // An out-of-range slot marks a heap fallback in the probe log.
             slot_ = static_cast<std::uint32_t>(pool->slots_.size());
-            llama_batch batch = pool->pool_batch_init();
+            llama_batch batch = llama_batch_init(1, pool->wide_, 1);
             if (!batch_arrays_complete(batch)) {
                 discard_partial(batch);
                 throw std::bad_alloc();
@@ -169,7 +159,9 @@ public:
             // that one token separately; its destructor frees it and clears
             // the pointer before llama_batch_free runs.
             std::free(batch.token);
-            batch.token = pool->pool_token_alloc();
+            batch.token = host_pool_detail::fail_token_alloc()
+                    ? nullptr
+                    : static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
             if (batch.token == nullptr) {
                 discard_partial(batch);
                 throw std::bad_alloc();
@@ -191,9 +183,8 @@ public:
     // Each slot starts uninitialized. The first acquire of a slot allocates
     // its batch. A pool that is disabled or exhausted returns a fallback
     // lease that owns a heap batch.
-    mtp_batch_pool(std::size_t n_slots, int wide, allocator alloc = allocator{ nullptr, nullptr })
-        : slots_(n_slots), wide_(wide), alloc_(alloc),
-          probe_(host_pool_detail::exact_one("TP5_ALLOC_PROBE")),
+    mtp_batch_pool(std::size_t n_slots, int wide)
+        : slots_(n_slots), wide_(wide), probe_(host_pool_detail::exact_one("TP5_ALLOC_PROBE")),
           enabled_(host_pool_detail::exact_one("TP5_MTP_BATCH_POOL")) {
         if (wide <= 0) {
             // A non-positive width would make llama_batch_init allocate the
@@ -229,17 +220,17 @@ public:
                     continue;
                 }
                 if (!s.ready) {
-                    llama_batch batch = pool_batch_init();
+                    llama_batch batch = llama_batch_init(1, wide_, 1);
                     if (!batch_arrays_complete(batch)) {
-                        // Free whatever the allocator produced. The slot stays
+                        // Free whatever llama_batch_init produced. The slot stays
                         // unready, so a later acquire retries instead of
                         // caching a partial batch.
                         discard_partial(batch);
                         throw std::bad_alloc();
                     }
                     // embd > 0 makes llama_batch_init leave token null. The
-                    // slot supplies that storage inline. Release a token the
-                    // allocator returned anyway so the inline storage is the
+                    // slot supplies that storage inline. Release a token that
+                    // llama_batch_init returned anyway so the inline storage is the
                     // only owner.
                     std::free(batch.token);
                     batch.token = &s.token;
@@ -288,7 +279,6 @@ private:
 
     std::vector<slot> slots_;
     int wide_ = 0;
-    allocator alloc_;
     bool probe_ = false;
     bool enabled_ = false;
     std::uint64_t event_seq_ = 0;

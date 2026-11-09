@@ -4,6 +4,7 @@
 
 #include "host_pool.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -37,68 +38,18 @@ static void set_flag(const char * name, const char * value) {
 #endif
 }
 
-enum class partial_batch { none, embd_only, no_embd, seq_id_only, seq_id_full };
+// The real llama_batch_init and the pool's fallback token allocation consult
+// these weak hooks. The test target exports them so the shared libllama
+// resolves its weak references to this executable.
+static int  g_fail_batch_alloc = -1;
+static bool g_fail_token_alloc = false;
 
-static int          g_batch_init_failures  = 0;
-static int          g_token_alloc_failures = 0;
-static partial_batch g_partial_batch       = partial_batch::none;
-
-static llama_batch partial_batch_init(int wide) {
-    llama_batch batch{};
-    switch (g_partial_batch) {
-        case partial_batch::embd_only:
-            batch.embd = static_cast<float *>(std::malloc(sizeof(float) * static_cast<std::size_t>(wide)));
-            break;
-        case partial_batch::no_embd:
-            batch.pos      = static_cast<llama_pos *>(std::malloc(sizeof(llama_pos)));
-            batch.n_seq_id = static_cast<int32_t *>(std::malloc(sizeof(int32_t)));
-            batch.seq_id   = static_cast<llama_seq_id **>(std::malloc(sizeof(llama_seq_id *) * 2));
-            if (batch.seq_id != nullptr) {
-                batch.seq_id[0] = static_cast<llama_seq_id *>(std::malloc(sizeof(llama_seq_id)));
-                batch.seq_id[1] = nullptr;
-            }
-            batch.logits = static_cast<int8_t *>(std::malloc(sizeof(int8_t)));
-            break;
-        case partial_batch::seq_id_only:
-            batch.seq_id = static_cast<llama_seq_id **>(std::malloc(sizeof(llama_seq_id *) * 2));
-            if (batch.seq_id != nullptr) {
-                batch.seq_id[0] = nullptr;
-                batch.seq_id[1] = nullptr;
-            }
-            break;
-        case partial_batch::seq_id_full:
-            batch.seq_id = static_cast<llama_seq_id **>(std::malloc(sizeof(llama_seq_id *) * 2));
-            if (batch.seq_id != nullptr) {
-                batch.seq_id[0] = static_cast<llama_seq_id *>(std::malloc(sizeof(llama_seq_id)));
-                batch.seq_id[1] = nullptr;
-            }
-            break;
-        case partial_batch::none:
-            break;
-    }
-    return batch;
+extern "C" bool llama_batch_init_fail_alloc(int32_t index) {
+    return index == g_fail_batch_alloc;
 }
 
-static llama_batch fail_once_batch_init(int wide) {
-    if (g_batch_init_failures > 0) {
-        --g_batch_init_failures;
-        return partial_batch_init(wide);
-    }
-    return llama_batch_init(1, wide, 1);
-}
-
-static llama_token * fail_once_token_alloc() {
-    if (g_token_alloc_failures > 0) {
-        --g_token_alloc_failures;
-        return nullptr;
-    }
-    return static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
-}
-
-static llama_batch complete_with_token_batch_init(int wide) {
-    llama_batch batch = llama_batch_init(1, wide, 1);
-    batch.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)));
-    return batch;
+extern "C" bool tq_tp5_mtp_pool_fail_token_alloc() {
+    return g_fail_token_alloc;
 }
 
 static void test_pooled_lease() {
@@ -553,17 +504,49 @@ static void test_pool_lifetime() {
 #endif
 }
 
-static void test_partial_batch_free_shapes() {
+static bool batch_init_failure_matches(const llama_batch & batch, int index) {
+    switch (index) {
+        case 0: return batch.embd == nullptr;
+        case 1: return batch.embd != nullptr && batch.pos == nullptr;
+        case 2: return batch.pos != nullptr && batch.n_seq_id == nullptr;
+        case 3: return batch.n_seq_id != nullptr && batch.seq_id == nullptr;
+        case 4: return batch.seq_id != nullptr && batch.seq_id[0] == nullptr && batch.logits == nullptr;
+        case 5: return batch.seq_id != nullptr && batch.seq_id[0] != nullptr && batch.logits == nullptr;
+        default: return false;
+    }
+}
+
+static bool batch_init_complete(const llama_batch & batch) {
+    return batch.embd != nullptr && batch.pos != nullptr && batch.n_seq_id != nullptr &&
+           batch.seq_id != nullptr && batch.seq_id[0] != nullptr && batch.logits != nullptr;
+}
+
+static void test_real_batch_init_failure() {
+    constexpr int wide = 4;
+
+    for (int index = 0; index < 6; ++index) {
+        g_fail_batch_alloc = index;
+        llama_batch partial = llama_batch_init(1, wide, 1);
+        check(batch_init_failure_matches(partial, index),
+              "real init: the injected allocation is null and later fields stay null");
+        llama_batch_free(partial);
+    }
+
+    g_fail_batch_alloc = -1;
+    llama_batch complete = llama_batch_init(1, wide, 1);
+    check(batch_init_complete(complete), "real init: the clean batch owns every array");
+    llama_batch_free(complete);
+}
+
+static void test_real_pooled_failure_retry() {
     set_flag("TP5_MTP_BATCH_POOL", "1");
 
     constexpr int wide = 4;
-    const partial_batch shapes[] = { partial_batch::none,      partial_batch::embd_only,
-                                     partial_batch::no_embd,   partial_batch::seq_id_only,
-                                     partial_batch::seq_id_full };
+    float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
 
-    for (const auto shape : shapes) {
-        g_partial_batch = shape;
-        tq::tp5::mtp_batch_pool pool(1, wide, { partial_batch_init, nullptr });
+    for (int index = 0; index < 6; ++index) {
+        g_fail_batch_alloc = index;
+        tq::tp5::mtp_batch_pool pool(1, wide);
 
         bool threw = false;
         try {
@@ -572,103 +555,61 @@ static void test_partial_batch_free_shapes() {
         } catch (const std::bad_alloc &) {
             threw = true;
         }
-        check(threw, "alloc: an incomplete first slot throws bad_alloc");
-    }
+        check(threw, "real init: the pooled first acquire reports the failure");
 
-    g_partial_batch = partial_batch::none;
-    set_flag("TP5_MTP_BATCH_POOL", nullptr);
-}
-
-static void test_first_acquire_failure_retry() {
-    set_flag("TP5_MTP_BATCH_POOL", "1");
-
-    constexpr int wide = 4;
-    float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
-
-    g_batch_init_failures = 1;
-    g_partial_batch       = partial_batch::embd_only;
-    tq::tp5::mtp_batch_pool pool(1, wide, { fail_once_batch_init, nullptr });
-
-    bool threw = false;
-    try {
+        g_fail_batch_alloc = -1;
         auto lease = pool.acquire();
-        (void) lease;
-    } catch (const std::bad_alloc &) {
-        threw = true;
+        lease.set(3, 0, 1, embd, wide);
+        check(lease.batch().token[0] == 3, "real init: the pooled slot retries after the failure");
     }
-    check(threw, "alloc: the first acquire failure is reported");
 
-    auto lease = pool.acquire();
-    lease.set(3, 0, 1, embd, wide);
-    check(lease.batch().token[0] == 3, "alloc: the slot is retried after a failed first acquire");
-
-    g_partial_batch = partial_batch::none;
+    g_fail_batch_alloc = -1;
     set_flag("TP5_MTP_BATCH_POOL", nullptr);
 }
 
-static void test_fallback_alloc_failure_retry() {
+static void test_real_fallback_failure_retry() {
     set_flag("TP5_MTP_BATCH_POOL", nullptr);
 
     constexpr int wide = 4;
     float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
 
-    g_batch_init_failures = 1;
-    g_partial_batch       = partial_batch::embd_only;
-    tq::tp5::mtp_batch_pool pool(1, wide, { fail_once_batch_init, nullptr });
+    for (int index = 0; index < 6; ++index) {
+        g_fail_batch_alloc = index;
+        tq::tp5::mtp_batch_pool pool(1, wide);
 
+        bool threw = false;
+        try {
+            auto lease = pool.acquire();
+            (void) lease;
+        } catch (const std::bad_alloc &) {
+            threw = true;
+        }
+        check(threw, "real init: the fallback acquire reports the failure");
+
+        g_fail_batch_alloc = -1;
+        auto lease = pool.acquire();
+        lease.set(4, 1, 1, embd, wide);
+        check(lease.batch().token[0] == 4, "real init: the fallback path retries after the failure");
+    }
+
+    g_fail_batch_alloc = -1;
+    g_fail_token_alloc = true;
+    tq::tp5::mtp_batch_pool token_pool(1, wide);
     bool threw = false;
     try {
-        auto lease = pool.acquire();
+        auto lease = token_pool.acquire();
         (void) lease;
     } catch (const std::bad_alloc &) {
         threw = true;
     }
-    check(threw, "alloc: a partial fallback batch is reported");
+    check(threw, "real init: a null fallback token is reported");
 
-    auto lease = pool.acquire();
-    lease.set(4, 1, 1, embd, wide);
-    check(lease.batch().token[0] == 4, "alloc: the fallback path is retried after a failed acquire");
-
-    g_token_alloc_failures = 1;
-    tq::tp5::mtp_batch_pool token_pool(1, wide, { nullptr, fail_once_token_alloc });
-    threw = false;
-    try {
-        auto failed = token_pool.acquire();
-        (void) failed;
-    } catch (const std::bad_alloc &) {
-        threw = true;
-    }
-    check(threw, "alloc: a null fallback token is reported");
-
+    g_fail_token_alloc = false;
     auto retried = token_pool.acquire();
     retried.set(5, 2, 1, embd, wide);
-    check(retried.batch().token[0] == 5, "alloc: the fallback token path is retried");
+    check(retried.batch().token[0] == 5, "real init: the fallback token path retries");
 
-    g_partial_batch = partial_batch::none;
     set_flag("TP5_MTP_BATCH_POOL", nullptr);
-}
-
-static void test_allocator_token_is_replaced() {
-    constexpr int wide = 4;
-    float embd[wide] = { 1.0f, 2.0f, 3.0f, 4.0f };
-
-    set_flag("TP5_MTP_BATCH_POOL", "1");
-    {
-        tq::tp5::mtp_batch_pool pool(1, wide, { complete_with_token_batch_init, nullptr });
-        auto lease = pool.acquire();
-        lease.set(6, 0, 1, embd, wide);
-        check(lease.batch().token[0] == 6,
-              "alloc: the pooled slot replaces an allocator-provided token");
-    }
-    set_flag("TP5_MTP_BATCH_POOL", nullptr);
-
-    {
-        tq::tp5::mtp_batch_pool pool(1, wide, { complete_with_token_batch_init, nullptr });
-        auto lease = pool.acquire();
-        lease.set(7, 1, 1, embd, wide);
-        check(lease.batch().token[0] == 7,
-              "alloc: the fallback lease replaces an allocator-provided token");
-    }
 }
 
 int main() {
@@ -684,10 +625,9 @@ int main() {
     test_fallback_set_contract();
     test_zero_width_refused();
     test_pool_lifetime();
-    test_partial_batch_free_shapes();
-    test_first_acquire_failure_retry();
-    test_fallback_alloc_failure_retry();
-    test_allocator_token_is_replaced();
+    test_real_batch_init_failure();
+    test_real_pooled_failure_retry();
+    test_real_fallback_failure_retry();
 
     std::printf("%s failures=%d\n", g_failures ? "FAILED" : "OK", g_failures);
 

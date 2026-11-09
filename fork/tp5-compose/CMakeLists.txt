@@ -70,6 +70,10 @@ if(BUILD_TESTING)
     target_link_libraries(tq_tp5_ordered_fold_tests PRIVATE llama)
     add_test(NAME tq-tp5-ordered-f32-fold COMMAND tq_tp5_ordered_fold_tests)
     add_executable(tq_tp5_host_pool_tests tests/test-host-pool.cpp)
+    # The test defines the weak allocation-failure hooks that libllama and
+    # host_pool.h consult. Export the executable's symbols so the shared
+    # library resolves them; a static llama resolves them at link time.
+    set_target_properties(tq_tp5_host_pool_tests PROPERTIES ENABLE_EXPORTS ON)
     target_compile_features(tq_tp5_host_pool_tests PRIVATE cxx_std_17)
     target_include_directories(tq_tp5_host_pool_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src

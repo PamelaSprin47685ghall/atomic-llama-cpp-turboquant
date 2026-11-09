@@ -37,6 +37,7 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t index);
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -1671,7 +1672,20 @@ class relay_service {
 struct row_batch {
     llama_batch batch{};
 
-    explicit row_batch(std::uint32_t capacity) { batch = llama_batch_init(capacity, 0, 1); }
+    explicit row_batch(std::uint32_t capacity) {
+        batch = llama_batch_init(capacity, 0, 1);
+        bool complete = batch.token != nullptr && batch.pos != nullptr &&
+                        batch.n_seq_id != nullptr && batch.seq_id != nullptr &&
+                        batch.logits != nullptr;
+        for (std::uint32_t i = 0; complete && i < capacity; ++i) {
+            complete = batch.seq_id[i] != nullptr;
+        }
+        if (!complete) {
+            llama_batch_free(batch);
+            batch = {};
+            throw std::bad_alloc();
+        }
+    }
 
     ~row_batch() { llama_batch_free(batch); }
 

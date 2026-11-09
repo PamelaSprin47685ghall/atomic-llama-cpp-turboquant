@@ -1412,13 +1412,18 @@ extern "C" {
     // If embd != 0, llama_batch.embd will be allocated with size of n_tokens * embd * sizeof(float)
     // Otherwise, llama_batch.token will be allocated to store n_tokens llama_token
     // The rest of the llama_batch members are allocated with size n_tokens
-    // All members are left uninitialized
+    // On success, all members are allocated but left uninitialized.
+    // On allocation failure or an invalid extent, every field that could not be
+    // allocated is null; the function never dereferences a failed allocation and
+    // never throws. The caller must check every field it uses and call
+    // llama_batch_free() on the partial batch before discarding it.
     LLAMA_API struct llama_batch llama_batch_init(
             int32_t n_tokens,
             int32_t embd,
             int32_t n_seq_max);
 
     // Frees a batch of tokens allocated with llama_batch_init()
+    // Safe for a partially allocated batch returned after an allocation failure.
     LLAMA_API void llama_batch_free(struct llama_batch batch);
 
     // Process a batch of tokens.

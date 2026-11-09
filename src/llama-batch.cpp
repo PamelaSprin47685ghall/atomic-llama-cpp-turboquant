@@ -6,6 +6,7 @@
 #include "llama-tp5-flags.h"
 
 #include <cassert>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -1042,6 +1043,34 @@ struct llama_batch llama_batch_get_one(
     };
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+// Test-only allocation fault injection. A test executable may define this
+// weak symbol; production leaves it undefined, so every allocation proceeds.
+// The index is the zero-based allocation point inside llama_batch_init.
+extern "C" bool llama_batch_init_fail_alloc(int32_t index) __attribute__((weak));
+#endif
+
+static void * llama_batch_alloc(size_t size, int32_t index) {
+#if defined(__GNUC__) || defined(__clang__)
+    if (llama_batch_init_fail_alloc != nullptr && llama_batch_init_fail_alloc(index)) {
+        return nullptr;
+    }
+#else
+    (void) index;
+#endif
+    return malloc(size);
+}
+
+// Checked size multiplication for the batch arrays. A wrapped size would turn
+// a too-large request into a small allocation.
+static bool llama_batch_size_mul(size_t a, size_t b, size_t & out) {
+    if (a != 0 && b > SIZE_MAX / a) {
+        return false;
+    }
+    out = a * b;
+    return true;
+}
+
 struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_t n_seq_max) {
     llama_batch batch = {
         /*n_tokens =*/ 0,
@@ -1053,21 +1082,81 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*logits   =*/ nullptr,
     };
 
+    // Failure contract: a null field means that allocation failed. The caller
+    // must check every field it uses and call llama_batch_free() on the partial
+    // batch. This function never dereferences a failed allocation.
+    if (n_tokens_alloc <= 0 || embd < 0 || n_seq_max <= 0) {
+        return batch;
+    }
+
+    int32_t alloc_index = 0;
+    const size_t n_tokens = (size_t) n_tokens_alloc;
+    const size_t n_embd   = (size_t) embd;
+    const size_t n_seq    = (size_t) n_seq_max;
+    size_t bytes = 0;
+
     if (embd) {
-        batch.embd = (float *) malloc(sizeof(float) * n_tokens_alloc * embd);
+        if (!llama_batch_size_mul(sizeof(float), n_tokens, bytes) ||
+            !llama_batch_size_mul(bytes, n_embd, bytes)) {
+            return batch;
+        }
+        batch.embd = (float *) llama_batch_alloc(bytes, alloc_index++);
+        if (batch.embd == nullptr) {
+            return batch;
+        }
     } else {
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_tokens_alloc);
+        if (!llama_batch_size_mul(sizeof(llama_token), n_tokens, bytes)) {
+            return batch;
+        }
+        batch.token = (llama_token *) llama_batch_alloc(bytes, alloc_index++);
+        if (batch.token == nullptr) {
+            return batch;
+        }
     }
 
-    batch.pos      = (llama_pos *)     malloc(sizeof(llama_pos)      * n_tokens_alloc);
-    batch.n_seq_id = (int32_t *)       malloc(sizeof(int32_t)        * n_tokens_alloc);
-    batch.seq_id   = (llama_seq_id **) malloc(sizeof(llama_seq_id *) * (n_tokens_alloc + 1));
-    for (int i = 0; i < n_tokens_alloc; ++i) {
-        batch.seq_id[i] = (llama_seq_id *) malloc(sizeof(llama_seq_id) * n_seq_max);
+    if (!llama_batch_size_mul(sizeof(llama_pos), n_tokens, bytes)) {
+        return batch;
     }
-    batch.seq_id[n_tokens_alloc] = nullptr;
+    batch.pos = (llama_pos *) llama_batch_alloc(bytes, alloc_index++);
+    if (batch.pos == nullptr) {
+        return batch;
+    }
 
-    batch.logits   = (int8_t *)        malloc(sizeof(int8_t)         * n_tokens_alloc);
+    if (!llama_batch_size_mul(sizeof(int32_t), n_tokens, bytes)) {
+        return batch;
+    }
+    batch.n_seq_id = (int32_t *) llama_batch_alloc(bytes, alloc_index++);
+    if (batch.n_seq_id == nullptr) {
+        return batch;
+    }
+
+    if (!llama_batch_size_mul(sizeof(llama_seq_id *), n_tokens + 1, bytes)) {
+        return batch;
+    }
+    batch.seq_id = (llama_seq_id **) llama_batch_alloc(bytes, alloc_index++);
+    if (batch.seq_id == nullptr) {
+        return batch;
+    }
+    // Initialize the whole pointer array so llama_batch_free() stops at the
+    // first null entry when a per-token allocation fails.
+    for (size_t i = 0; i <= n_tokens; ++i) {
+        batch.seq_id[i] = nullptr;
+    }
+
+    if (!llama_batch_size_mul(sizeof(llama_seq_id), n_seq, bytes)) {
+        return batch;
+    }
+    for (size_t i = 0; i < n_tokens; ++i) {
+        batch.seq_id[i] = (llama_seq_id *) llama_batch_alloc(bytes, alloc_index++);
+        if (batch.seq_id[i] == nullptr) {
+            return batch;
+        }
+    }
+
+    if (!llama_batch_size_mul(sizeof(int8_t), n_tokens, bytes)) {
+        return batch;
+    }
+    batch.logits = (int8_t *) llama_batch_alloc(bytes, alloc_index++);
 
     return batch;
 }
