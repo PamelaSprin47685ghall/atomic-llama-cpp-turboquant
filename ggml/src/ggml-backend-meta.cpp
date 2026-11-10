@@ -3730,24 +3730,22 @@ static void ggml_backend_meta_buffer_memset_tensor(
             ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
-    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
         GGML_ASSERT(tensor->ne[3] == 1);
 
         std::vector<size_t> simple_offsets(n_bufs, 0);
         if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
-            GGML_ASSERT(tensor->ne[2] == 1);
-
             const size_t row_stride = tensor->nb[1];
             GGML_ASSERT(offset % row_stride == 0);
             GGML_ASSERT(size   % row_stride == 0);
             const int64_t row_start = offset / row_stride;
             const int64_t row_count = size   / row_stride;
-            GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
+            GGML_ASSERT(row_start + row_count <= tensor->ne[1] * tensor->ne[2]);
 
             const int64_t blck_size = ggml_blck_size(tensor->type);
-            if (tensor->ne[1] == 1) {
+            if (tensor->ne[1] == 1 && tensor->ne[2] == 1) {
                 for (size_t s = 0; s < split_state.n_segments; s++) {
                     for (size_t r = 0; r < split_state.nr[s]; r++) {
                         for (size_t j = 0; j < n_bufs; j++) {
@@ -4135,7 +4133,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
         st = buffer_ctx->staging_provider.load(std::memory_order_acquire);
     }
 
-    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
         GGML_ASSERT(tensor->ne[3] == 1);
@@ -4143,10 +4141,8 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
         size_t offset_data = 0;
         std::vector<size_t> simple_offsets(n_bufs, 0);
         if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
-            GGML_ASSERT(tensor->ne[2] == 1);
-
             const int64_t blck_size = ggml_blck_size(tensor->type);
-            if (tensor->ne[1] == 1) {
+            if (tensor->ne[1] == 1 && tensor->ne[2] == 1) {
                 // 1D logical range mapping. A view's simple tensor data already
                 // points at the child view start, so only the intersection with
                 // this offset/size range is copied.
@@ -4185,7 +4181,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
             GGML_ASSERT(size   % row_stride == 0);
             const int64_t row_start = offset / row_stride;
             const int64_t row_count = size   / row_stride;
-            GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
+            GGML_ASSERT(row_start + row_count <= tensor->ne[1] * tensor->ne[2]);
 
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 for (size_t r = 0; r < split_state.nr[s]; r++) {
@@ -4642,7 +4638,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         }
     }
 
-    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
         GGML_ASSERT(tensor->ne[3] == 1);
@@ -4650,10 +4646,8 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         size_t offset_data = 0;
         std::vector<size_t> simple_offsets(n_bufs, 0);
         if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
-            GGML_ASSERT(tensor->ne[2] == 1);
-
             const int64_t blck_size = ggml_blck_size(tensor->type);
-            if (tensor->ne[1] == 1) {
+            if (tensor->ne[1] == 1 && tensor->ne[2] == 1) {
                 // 1D logical range mapping. A view's simple tensor data already
                 // points at the child view start, so only the intersection with
                 // this offset/size range is copied.
@@ -4692,7 +4686,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             GGML_ASSERT(size   % row_stride == 0);
             const int64_t row_start = offset / row_stride;
             const int64_t row_count = size   / row_stride;
-            GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
+            GGML_ASSERT(row_start + row_count <= tensor->ne[1] * tensor->ne[2]);
 
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 for (size_t r = 0; r < split_state.nr[s]; r++) {
