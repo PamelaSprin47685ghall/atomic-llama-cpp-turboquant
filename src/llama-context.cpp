@@ -8661,10 +8661,11 @@ class llama_io_write_device : public llama_io_write_i {
             // A transposed v/s state writes a row-interior range. A Meta view
             // of that range cannot map its split offset, so copy those ranges
             // through host staging instead of a view.
+            const bool meta_src = ggml_backend_buffer_is_meta(winfo.tensor->buffer);
             const size_t row = winfo.tensor->nb[1];
             const bool row_aligned = row > 0 &&
                 winfo.offset % row == 0 && winfo.size % row == 0;
-            if (row_aligned) {
+            if (!meta_src || row_aligned) {
                 ggml_tensor * org = ggml_view_1d(mbuf.ctx.get(), winfo.tensor, n, winfo.offset);
                 ggml_set_name(org, winfo.tensor->name);
                 mbuf.org.push_back(org);
@@ -8931,10 +8932,11 @@ class llama_io_read_device : public llama_io_read_i {
 
         // A transposed v/s state range starts inside a row. A Meta view cannot
         // map that split offset, so move it through a host buffer instead.
+        const bool meta_dst = ggml_backend_buffer_is_meta(tensor->buffer);
         const size_t row = tensor->nb[1];
         const bool row_aligned = row > 0 &&
             offset % row == 0 && size % row == 0;
-        if (!row_aligned) {
+        if (meta_dst && !row_aligned) {
             try {
                 std::vector<char> host(size);
                 ggml_backend_tensor_get(cpy, host.data(), 0, size);
