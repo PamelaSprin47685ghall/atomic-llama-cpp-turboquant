@@ -762,6 +762,33 @@ static bool ggml_backend_submission_unproven(ggml_backend_t backend) {
            ggml_backend_sched_submission_pending(backend);
 }
 
+// Synchronize under the backend's own ownership gate. A backend that cannot
+// prove its submission is not synchronized; the caller treats that as a
+// fail-stop instead of a silent completion proof.
+static bool ggml_backend_synchronize_if_proven(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return true;
+    }
+    if (ggml_backend_submission_unproven(backend)) {
+        return false;
+    }
+    if (backend->device != nullptr && backend->device->reg != nullptr) {
+        auto api = (const ggml_backend_synchronize_if_proven_api *)
+            ggml_backend_reg_get_proc_address(backend->device->reg,
+                                              "ggml_backend_synchronize_if_proven_v1");
+        if (api != nullptr &&
+                api->abi_version == GGML_BACKEND_SYNCHRONIZE_IF_PROVEN_API_VERSION &&
+                api->sync != nullptr) {
+            const bool ok = api->sync(backend);
+            // A publication can occur after the backend releases its gate.
+            // The post-check turns that window into a fail-stop.
+            return ok && !ggml_backend_submission_unproven(backend);
+        }
+    }
+    ggml_backend_synchronize(backend);
+    return !ggml_backend_submission_unproven(backend);
+}
+
 static const ggml_backend_completion_api * ggml_backend_sched_completion_api(
         ggml_backend_t backend) {
     if (backend == nullptr || backend->device == nullptr ||
@@ -846,6 +873,64 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
     }
 }
 
+// Blocking copy with the destination owner's versioned capability. The
+// capability separates a preflight rejection from a fail-stop that may
+// already have submitted work; a fail-stop never falls back to a replay.
+static bool ggml_backend_tensor_copy_sync(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (src == nullptr || dst == nullptr) {
+        return false;
+    }
+    const ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    const bool dst_is_meta = ggml_backend_buffer_is_meta(dst_buf);
+
+    if (ggml_backend_submission_unproven(backend_src) ||
+            ggml_backend_submission_unproven(backend_dst)) {
+        return false;
+    }
+
+    const bool meta_owner_ok = dst_is_meta &&
+        (backend_dst == nullptr || backend_dst->device == nullptr ||
+         ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst_buf)) ==
+             backend_dst->device);
+
+    bool handled = false;
+    if (backend_dst != nullptr && backend_dst->device != nullptr &&
+            backend_dst->device->reg != nullptr) {
+        auto api = (const ggml_backend_copy_tensor_sync_api *)
+            ggml_backend_reg_get_proc_address(backend_dst->device->reg,
+                                              "ggml_backend_copy_tensor_sync_v2");
+        if (api != nullptr && api->abi_version == GGML_BACKEND_COPY_TENSOR_SYNC_API_VERSION &&
+                api->copy != nullptr) {
+            const int result = api->copy(backend_src, backend_dst, src, dst);
+            if (result == GGML_BACKEND_COPY_TENSOR_SYNC_OK) {
+                handled = true;
+            } else if (result == GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP) {
+                return false;
+            }
+        }
+    }
+
+    if (!handled) {
+        if (dst_is_meta) {
+            // A Meta destination without a handled owner copy uses the public
+            // no-staging path. A non-contiguous destination is refused because
+            // the ownerless path cannot inspect the split state safely.
+            if (!meta_owner_ok || !ggml_is_contiguous(dst)) {
+                return false;
+            }
+        }
+        if (ggml_backend_submission_unproven(backend_src) ||
+                ggml_backend_submission_unproven(backend_dst)) {
+            return false;
+        }
+        ggml_backend_tensor_copy(src, dst);
+    }
+    return !ggml_backend_submission_unproven(backend_src) &&
+           !ggml_backend_submission_unproven(backend_dst);
+}
+
 bool ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
@@ -880,11 +965,14 @@ bool ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
 
     // an async copy would normally happen after all the queued operations on both backends are completed
     // to simulate the same behavior, we need to synchronize both backends first, and do a blocking copy
-    ggml_backend_synchronize(backend_src);
-    ggml_backend_synchronize(backend_dst);
-    ggml_backend_tensor_copy(src, dst);
+    if (!ggml_backend_synchronize_if_proven(backend_src) ||
+            !ggml_backend_synchronize_if_proven(backend_dst)) {
+        return false;
+    }
+    const bool copied = ggml_backend_tensor_copy_sync(backend_src, backend_dst, src, dst);
     // A fault published while the blocking copy ran is not a completion proof.
-    return !ggml_backend_submission_unproven(backend_src) &&
+    return copied &&
+           !ggml_backend_submission_unproven(backend_src) &&
            !ggml_backend_submission_unproven(backend_dst);
 }
 
@@ -2292,7 +2380,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(
                     input_copies.flush();
                     batch_inputs = false;
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                const bool copied = ggml_backend_tensor_copy_sync(
+                        input_backend, split_backend, input, input_cpy);
+                const bool src_unproven =
+                    ggml_backend_sched_note_submission_state(sched, input_backend);
+                const bool dst_unproven =
+                    ggml_backend_sched_note_submission_state(sched, split_backend);
+                if (!copied || src_unproven || dst_unproven) {
+                    // Either owner may have published a fatal or partial
+                    // submission. Keep the copy slots and stop; never replay
+                    // the destination.
+                    input_copies.retain = true;
+                    return GGML_STATUS_FAILED;
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2413,13 +2513,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(
                         }
                     }
                     if (!copied) {
-                        ggml_backend_synchronize(input_backend);
+                        if (!ggml_backend_synchronize_if_proven(input_backend)) {
+                            input_copies.retain = true;
+                            return GGML_STATUS_FAILED;
+                        }
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                            if (ggml_backend_submission_unproven(split_backend)) {
+                                input_copies.retain = true;
+                                return GGML_STATUS_FAILED;
+                            }
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
-                            ggml_backend_synchronize(split_backend);
+                            if (!ggml_backend_synchronize_if_proven(split_backend)) {
+                                input_copies.retain = true;
+                                return GGML_STATUS_FAILED;
+                            }
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
+                        const bool sync_copied = ggml_backend_tensor_copy_sync(
+                                input_backend, split_backend, input, input_cpy);
+                        const bool src_unproven =
+                            ggml_backend_sched_note_submission_state(sched, input_backend);
+                        const bool dst_unproven =
+                            ggml_backend_sched_note_submission_state(sched, split_backend);
+                        if (!sync_copied || src_unproven || dst_unproven) {
+                            // Same fail-stop boundary as the async lane: the
+                            // source or destination may be partially written.
+                            input_copies.retain = true;
+                            return GGML_STATUS_FAILED;
+                        }
                     }
                 }
             }

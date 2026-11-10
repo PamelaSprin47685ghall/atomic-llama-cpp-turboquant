@@ -1933,6 +1933,13 @@ static const bool ggml_backend_meta_compose_event_gate = [] {
 static int  ggml_backend_meta_submission_error(ggml_backend_t backend);
 static bool ggml_backend_meta_submission_pending(ggml_backend_t backend);
 static bool ggml_backend_meta_submission_failed(ggml_backend_t backend);
+static int ggml_backend_meta_copy_tensor_sync(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, ggml_tensor * dst);
+static bool ggml_backend_meta_copy_tensor_no_staging(
+        const ggml_tensor * src, ggml_tensor * dst);
+static bool ggml_backend_meta_synchronize_if_proven(ggml_backend_t backend);
+static int  ggml_backend_meta_drain(ggml_backend_t backend);
 
 static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .get_name             = */ ggml_backend_meta_device_get_name,
@@ -1964,6 +1971,26 @@ static ggml_backend_dev_t ggml_backend_meta_reg_get_device(ggml_backend_reg_t, s
     return nullptr;
 }
 
+static const ggml_backend_copy_tensor_sync_api ggml_backend_meta_copy_tensor_sync_api = {
+    /* .abi_version = */ GGML_BACKEND_COPY_TENSOR_SYNC_API_VERSION,
+    /* .copy        = */ ggml_backend_meta_copy_tensor_sync,
+};
+
+static const ggml_backend_copy_tensor_no_staging_api ggml_backend_meta_copy_tensor_no_staging_api = {
+    /* .abi_version = */ GGML_BACKEND_COPY_TENSOR_NO_STAGING_API_VERSION,
+    /* .copy        = */ ggml_backend_meta_copy_tensor_no_staging,
+};
+
+static const ggml_backend_synchronize_if_proven_api ggml_backend_meta_synchronize_if_proven_api = {
+    /* .abi_version = */ GGML_BACKEND_SYNCHRONIZE_IF_PROVEN_API_VERSION,
+    /* .sync        = */ ggml_backend_meta_synchronize_if_proven,
+};
+
+static const ggml_backend_drain_api ggml_backend_meta_drain_api = {
+    /* .abi_version = */ GGML_BACKEND_DRAIN_API_VERSION,
+    /* .drain       = */ ggml_backend_meta_drain,
+};
+
 static void * ggml_backend_meta_reg_get_proc_address(ggml_backend_reg_t, const char * name) {
     if (std::strcmp(name, "ggml_backend_submission_error") == 0) {
         return reinterpret_cast<void *>(+[](ggml_backend_t backend) -> int {
@@ -1974,6 +2001,22 @@ static void * ggml_backend_meta_reg_get_proc_address(ggml_backend_reg_t, const c
         return reinterpret_cast<void *>(+[](ggml_backend_t backend) -> bool {
             return ggml_backend_meta_submission_pending(backend);
         });
+    }
+    if (std::strcmp(name, "ggml_backend_copy_tensor_sync_v2") == 0) {
+        return const_cast<void *>(reinterpret_cast<const void *>(
+            &ggml_backend_meta_copy_tensor_sync_api));
+    }
+    if (std::strcmp(name, "ggml_backend_copy_tensor_no_staging_v1") == 0) {
+        return const_cast<void *>(reinterpret_cast<const void *>(
+            &ggml_backend_meta_copy_tensor_no_staging_api));
+    }
+    if (std::strcmp(name, "ggml_backend_synchronize_if_proven_v1") == 0) {
+        return const_cast<void *>(reinterpret_cast<const void *>(
+            &ggml_backend_meta_synchronize_if_proven_api));
+    }
+    if (std::strcmp(name, "ggml_backend_drain_v1") == 0) {
+        return const_cast<void *>(reinterpret_cast<const void *>(
+            &ggml_backend_meta_drain_api));
     }
     return nullptr;
 }

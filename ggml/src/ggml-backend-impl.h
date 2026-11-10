@@ -165,6 +165,33 @@ extern "C" {
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 
+    // Optional blocking copy capability negotiated through the reg
+    // proc-address hook under the name "ggml_backend_copy_tensor_sync_v2".
+    // The returned table is versioned so a future signature cannot be read
+    // through an older layout. The result separates a pure preflight
+    // rejection from a fail-stop that may already have submitted work.
+    enum ggml_backend_copy_tensor_sync_result {
+        GGML_BACKEND_COPY_TENSOR_SYNC_OK        = 0, // handled; check owner state
+        GGML_BACKEND_COPY_TENSOR_SYNC_REJECTED  = 1, // preflight; no side effect
+        GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP = 2, // no replay; may be submitted
+    };
+    #define GGML_BACKEND_COPY_TENSOR_SYNC_API_VERSION 2
+    struct ggml_backend_copy_tensor_sync_api {
+        uint32_t abi_version;
+        int (*copy)(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+                    const struct ggml_tensor * src, struct ggml_tensor * dst);
+    };
+
+    // Optional ownerless no-staging copy for a public blocking copy that has
+    // no backend owner. It must preserve the ordinary copy result without
+    // leasing a staging slot. A Meta destination without this capability is
+    // not copied through the ownerless staging path.
+    #define GGML_BACKEND_COPY_TENSOR_NO_STAGING_API_VERSION 1
+    struct ggml_backend_copy_tensor_no_staging_api {
+        uint32_t abi_version;
+        bool (*copy)(const struct ggml_tensor * src, struct ggml_tensor * dst);
+    };
+
     // Optional drain receipt negotiated under the name
     // "ggml_backend_drain_v1". Only DRAINED is a native completion fact; a
     // missing or failed receipt never clears a sticky submission.

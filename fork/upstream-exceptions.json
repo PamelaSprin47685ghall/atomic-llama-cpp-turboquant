@@ -560,7 +560,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-impl.h",
-      "sha256": "1f4e8566e05b6fdf2dab69bd135626881a4e58341fdab47da7f078d2413ccf3e",
+      "sha256": "643cda7bc69d76c88a99d8e4533cac9f2b9ddbb2ed98ed1d366af4719bc45b71",
       "mode": "100644",
       "consumers": [
         "ggml async submission scheduler",
@@ -571,7 +571,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "6384b90805a6065c5380c7fbdfb426cbca32aed83c3e2c3f6e66e8c6ec3f049f",
+      "sha256": "e9ea19bdf8f47281c14f04db17add245edfb07b54f4e23dae52f7ebb9348c376",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",
@@ -632,7 +632,7 @@
     },
     {
       "path": "ggml/src/ggml-backend.cpp",
-      "sha256": "d5cdd66ba886b44ce3215339ade80b4b445ce78839061fcb08c22c7671ccc810",
+      "sha256": "02e2084930c8b7a79a64dc88c2f6c55baba6e5d499721863a787d86387e2d95b",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
