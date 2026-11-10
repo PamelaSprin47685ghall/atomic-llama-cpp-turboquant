@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <new>
 #include <mutex>
 #include <vector>
 #include <unordered_map>
@@ -668,6 +669,22 @@ static bool ggml_backend_submission_unproven(ggml_backend_t backend) {
            ggml_backend_sched_submission_pending(backend);
 }
 
+static const ggml_backend_completion_api * ggml_backend_sched_completion_api(
+        ggml_backend_t backend) {
+    if (backend == nullptr || backend->device == nullptr ||
+            backend->device->reg == nullptr) {
+        return nullptr;
+    }
+    auto * api = (const ggml_backend_completion_api *)
+        ggml_backend_reg_get_proc_address(backend->device->reg,
+                                          "ggml_backend_completion_v1");
+    if (api == nullptr || api->abi_version != GGML_BACKEND_COMPLETION_API_VERSION ||
+            api->attempt == nullptr || api->wait == nullptr) {
+        return nullptr;
+    }
+    return api;
+}
+
 void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
@@ -1045,6 +1062,9 @@ struct ggml_backend_sched {
     // alive, so ggml_backend_sched_free never has to dereference them (the
     // caller may destroy the backends before the scheduler).
     bool submission_unproven = false;
+    // Monotonic id for explicit completion receipts. Normal graph_compute
+    // calls do not use it.
+    uint64_t receipt_attempt = 0;
 
     int n_backends;
 
@@ -1107,6 +1127,87 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 };
+
+struct ggml_backend_sched_receipt_resource {
+    ggml_backend_t        backend;
+    uint64_t              attempt;
+    ggml_backend_event_t  event;
+    bool                  event_only;
+    bool                  drain_only;
+};
+
+struct ggml_backend_sched_receipt_impl {
+    uint64_t attempt;
+    int      state;
+    int      error;
+    bool     submitted;
+    bool     failed_early;
+    bool     in_flight;
+    std::vector<ggml_backend_sched_receipt_resource> resources;
+};
+
+static void ggml_backend_sched_receipt_cancel(
+        ggml_backend_sched_receipt_resource * res) {
+    if (res->event_only) {
+        ggml_backend_event_free(res->event);
+        return;
+    }
+    const ggml_backend_completion_api * api = ggml_backend_sched_completion_api(res->backend);
+    if (api != nullptr) {
+        if (api->end != nullptr) api->end(res->backend);
+        if (api->release != nullptr) api->release(res->backend, res->attempt);
+    }
+}
+
+static bool ggml_backend_sched_receipt_reserve(
+        ggml_backend_sched_receipt_impl * impl, ggml_backend_t backend,
+        ggml_backend_sched_receipt_resource * out) {
+    *out = {};
+    out->backend = backend;
+    const ggml_backend_completion_api * api = ggml_backend_sched_completion_api(backend);
+    if (api != nullptr && api->begin != nullptr) {
+        const uint64_t token = api->begin(backend);
+        if (token != 0) {
+            out->attempt = token;
+            return true;
+        }
+    }
+    if (backend->device != nullptr && backend->device->iface.event_new != nullptr &&
+            backend->iface.event_record != nullptr) {
+        ggml_backend_event_t event = ggml_backend_event_new(backend->device);
+        if (event != nullptr) {
+            out->event = event;
+            out->event_only = true;
+            return true;
+        }
+    }
+    impl->state = GGML_BACKEND_SCHED_RECEIPT_UNKNOWN;
+    impl->in_flight = true;
+    impl->error = -1;
+    return false;
+}
+
+static void ggml_backend_sched_receipt_finish(
+        ggml_backend_sched_receipt_impl * impl, ggml_backend_sched_receipt_resource * res) {
+    const ggml_backend_completion_api * api = ggml_backend_sched_completion_api(res->backend);
+    if (!res->event_only) {
+        if (api != nullptr && api->end != nullptr) {
+            api->end(res->backend);
+        }
+    } else {
+        ggml_backend_event_record(res->event, res->backend);
+    }
+    try {
+        impl->resources.push_back(*res);
+    } catch (...) {
+        if (res->event_only) {
+            ggml_backend_event_free(res->event);
+        }
+        impl->state = GGML_BACKEND_SCHED_RECEIPT_UNKNOWN;
+        impl->in_flight = true;
+        impl->error = -1;
+    }
+}
 
 static bool ggml_backend_sched_any_pending(ggml_backend_sched_t sched);
 
@@ -1905,7 +2006,9 @@ static bool ggml_backend_sched_note_submission_state(
     return false;
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched, bool retained_inputs) {
+static enum ggml_status ggml_backend_sched_compute_splits(
+        ggml_backend_sched_t sched, bool retained_inputs,
+        ggml_backend_sched_receipt_impl * receipt) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -2126,8 +2229,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    const bool copied = split_backend->iface.cpy_tensor_async != nullptr &&
+                    ggml_backend_sched_receipt_resource copy_res = {};
+                    const bool async_copy_available = split_backend->iface.cpy_tensor_async != nullptr;
+                    if (receipt != nullptr && async_copy_available) {
+                        if (!ggml_backend_sched_receipt_reserve(receipt, split_backend, &copy_res)) {
+                            return GGML_STATUS_FAILED;
+                        }
+                        receipt->submitted = true;
+                    }
+                    const bool copied = async_copy_available &&
                         split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+                    if (receipt != nullptr && async_copy_available) {
+                        if (copied) {
+                            ggml_backend_sched_receipt_finish(receipt, &copy_res);
+                        } else {
+                            ggml_backend_sched_receipt_cancel(&copy_res);
+                        }
+                    }
                     if (copied) {
                         if (ggml_backend_sched_note_submission_state(sched, split_backend)) {
                             input_copies.retain = true;
@@ -2159,7 +2277,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         const int64_t dflushed=ggml_time_us();
         if (!sched->callback_eval) {
+            ggml_backend_sched_receipt_resource compute_res = {};
+            if (receipt != nullptr) {
+                if (!ggml_backend_sched_receipt_reserve(receipt, split_backend, &compute_res)) {
+                    return GGML_STATUS_FAILED;
+                }
+                receipt->submitted = true;
+            }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (receipt != nullptr) {
+                ggml_backend_sched_receipt_finish(receipt, &compute_res);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 // A compute failure may be the first observation of a staging
                 // fault that happened outside the scheduler copy path. Query
@@ -2192,7 +2320,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
+                ggml_backend_sched_receipt_resource compute_res = {};
+                if (receipt != nullptr) {
+                    if (!ggml_backend_sched_receipt_reserve(receipt, split_backend, &compute_res)) {
+                        return GGML_STATUS_FAILED;
+                    }
+                    receipt->submitted = true;
+                }
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                if (receipt != nullptr) {
+                    ggml_backend_sched_receipt_finish(receipt, &compute_res);
+                }
                 if (ec != GGML_STATUS_SUCCESS) {
                     if (ggml_backend_sched_any_pending(sched)) {
                         input_copies.retain = true;
@@ -3124,7 +3262,8 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 }
 
 static enum ggml_status ggml_backend_sched_graph_compute_async_impl(
-        ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool retained_inputs) {
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool retained_inputs,
+        ggml_backend_sched_receipt_impl * receipt) {
     GGML_ASSERT(sched);
     if (ggml_backend_sched_any_pending(sched)) {
         return GGML_STATUS_FAILED;
@@ -3139,15 +3278,236 @@ static enum ggml_status ggml_backend_sched_graph_compute_async_impl(
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched, retained_inputs);
+    return ggml_backend_sched_compute_splits(sched, retained_inputs, receipt);
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
-    return ggml_backend_sched_graph_compute_async_impl(sched, graph, false);
+    return ggml_backend_sched_graph_compute_async_impl(sched, graph, false, nullptr);
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async_retained_inputs(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
-    return ggml_backend_sched_graph_compute_async_impl(sched, graph, true);
+    return ggml_backend_sched_graph_compute_async_impl(sched, graph, true, nullptr);
+}
+
+bool ggml_backend_sched_graph_compute_receipt(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        struct ggml_backend_sched_receipt * receipt) {
+    if (sched == nullptr || graph == nullptr || receipt == nullptr) {
+        return false;
+    }
+    memset(receipt, 0, sizeof(*receipt));
+    receipt->version = GGML_BACKEND_SCHED_RECEIPT_API_VERSION;
+    receipt->state   = GGML_BACKEND_SCHED_RECEIPT_COMPLETED_FAILURE;
+    receipt->error   = -1;
+
+    if (ggml_backend_sched_any_pending(sched)) {
+        receipt->state = GGML_BACKEND_SCHED_RECEIPT_UNKNOWN;
+        receipt->in_flight = true;
+        return false;
+    }
+
+    auto * impl = new (std::nothrow) ggml_backend_sched_receipt_impl();
+    if (impl == nullptr) {
+        receipt->state = GGML_BACKEND_SCHED_RECEIPT_UNKNOWN;
+        return false;
+    }
+    impl->attempt = ++sched->receipt_attempt;
+    impl->state   = GGML_BACKEND_SCHED_RECEIPT_ACCEPTED;
+    impl->error   = 0;
+
+    receipt->attempt = impl->attempt;
+    receipt->state   = impl->state;
+    receipt->priv    = impl;
+
+    const enum ggml_status status =
+        ggml_backend_sched_graph_compute_async_impl(sched, graph, false, impl);
+    if (status != GGML_STATUS_SUCCESS) {
+        impl->failed_early = true;
+        impl->error = status;
+        if (impl->resources.empty()) {
+            impl->state = GGML_BACKEND_SCHED_RECEIPT_COMPLETED_FAILURE;
+        }
+    }
+    receipt->state = impl->state;
+    receipt->error = impl->error;
+    receipt->submitted = impl->submitted;
+    receipt->in_flight = impl->in_flight;
+    return impl->submitted;
+}
+
+int ggml_backend_sched_receipt_wait(
+        ggml_backend_sched_t sched, struct ggml_backend_sched_receipt * receipt) {
+    if (sched == nullptr || receipt == nullptr || receipt->priv == nullptr ||
+            receipt->version != GGML_BACKEND_SCHED_RECEIPT_API_VERSION) {
+        return GGML_BACKEND_SCHED_RECEIPT_UNKNOWN;
+    }
+    auto * impl = static_cast<ggml_backend_sched_receipt_impl *>(receipt->priv);
+    const bool started_unknown = impl->state == GGML_BACKEND_SCHED_RECEIPT_UNKNOWN;
+    if (impl->state != GGML_BACKEND_SCHED_RECEIPT_ACCEPTED &&
+            !(impl->state == GGML_BACKEND_SCHED_RECEIPT_UNKNOWN && impl->in_flight)) {
+        receipt->state = impl->state;
+        receipt->error = impl->error;
+        receipt->in_flight = impl->in_flight;
+        return impl->state;
+    }
+
+    bool failed = impl->failed_early;
+    bool unknown = false;
+    bool event_only_seen = false;
+    bool drained_unknown = false;
+    int  error = impl->error;
+    for (const ggml_backend_sched_receipt_resource & res : impl->resources) {
+        if (res.event_only) {
+            // A recorded backend event is a real completion fence but carries
+            // no success/error status. It proves drained, not success.
+            ggml_backend_event_synchronize(res.event);
+            event_only_seen = true;
+            continue;
+        }
+        const ggml_backend_completion_api * api =
+            ggml_backend_sched_completion_api(res.backend);
+        if (api == nullptr) {
+            unknown = true;
+            continue;
+        }
+        int wait_error = 0;
+        int result;
+        if (res.drain_only) {
+            result = api->drain != nullptr ? api->drain(res.backend, &wait_error)
+                                           : GGML_BACKEND_COMPLETION_UNKNOWN;
+        } else {
+            result = api->wait(res.backend, res.attempt, &wait_error);
+        }
+        if (result == GGML_BACKEND_COMPLETION_FAILED) {
+            failed = true;
+            if (error == 0) {
+                error = wait_error != 0 ? wait_error : -1;
+            }
+        } else if (result != GGML_BACKEND_COMPLETION_SUCCESS) {
+            if (api->drain != nullptr) {
+                int drain_error = 0;
+                if (api->drain(res.backend, &drain_error) == GGML_BACKEND_COMPLETION_SUCCESS) {
+                    drained_unknown = true;
+                } else {
+                    unknown = true;
+                    if (error == 0) error = drain_error != 0 ? drain_error : -1;
+                }
+            } else {
+                unknown = true;
+            }
+        }
+    }
+    if (unknown) {
+        // Keep the attempt quarantined: an accepted split may still be in
+        // flight, so this is not a terminal failure the caller may free.
+        impl->state = GGML_BACKEND_SCHED_RECEIPT_UNKNOWN;
+        impl->error = error != 0 ? error : -1;
+        impl->in_flight = !impl->resources.empty();
+    } else if (failed || drained_unknown) {
+        impl->state = GGML_BACKEND_SCHED_RECEIPT_COMPLETED_FAILURE;
+        impl->error = error != 0 ? error : -1;
+        impl->in_flight = false;
+    } else if (event_only_seen) {
+        // Drained, but not provable as success or failure.
+        impl->state = GGML_BACKEND_SCHED_RECEIPT_UNKNOWN;
+        impl->error = error != 0 ? error : -1;
+        impl->in_flight = false;
+    } else if (started_unknown && !impl->resources.empty()) {
+        // All registered streams/events drained, but the original exact
+        // attempt could not be named. This is a completed failure, not a
+        // success; host undo may now be restored and the receipt released.
+        impl->state = GGML_BACKEND_SCHED_RECEIPT_COMPLETED_FAILURE;
+        impl->error = error != 0 ? error : -1;
+        impl->in_flight = false;
+    } else if (started_unknown) {
+        // No resource was registered for an unknown attempt: keep it
+        // quarantined rather than claiming a drain.
+        impl->state = GGML_BACKEND_SCHED_RECEIPT_UNKNOWN;
+        impl->error = error != 0 ? error : -1;
+        impl->in_flight = true;
+    } else {
+        impl->state = GGML_BACKEND_SCHED_RECEIPT_COMPLETED_SUCCESS;
+        impl->error = 0;
+    }
+    receipt->state = impl->state;
+    receipt->error = impl->error;
+    receipt->in_flight = impl->in_flight;
+    return impl->state;
+}
+
+bool ggml_backend_sched_receipt_release(
+        ggml_backend_sched_t sched, struct ggml_backend_sched_receipt * receipt) {
+    (void) sched;
+    if (receipt == nullptr || receipt->priv == nullptr) {
+        return true;
+    }
+    auto * impl = static_cast<ggml_backend_sched_receipt_impl *>(receipt->priv);
+    if (impl->state == GGML_BACKEND_SCHED_RECEIPT_ACCEPTED ||
+            (impl->state == GGML_BACKEND_SCHED_RECEIPT_UNKNOWN && impl->in_flight)) {
+        // Do not free an unproven in-flight attempt. The caller must drain or
+        // keep it quarantined; deleting here would hide live backend work.
+        return false;
+    }
+    for (const auto & res : impl->resources) {
+        if (res.event_only) {
+            ggml_backend_event_free(res.event);
+            continue;
+        }
+        const ggml_backend_completion_api * api =
+            ggml_backend_sched_completion_api(res.backend);
+        if (api != nullptr && api->release != nullptr) {
+            api->release(res.backend, res.attempt);
+        }
+    }
+    delete impl;
+    receipt->priv = nullptr;
+    return true;
+}
+
+bool ggml_backend_sched_drain_pending(ggml_backend_sched_t sched, int * error) {
+    if (sched == nullptr) {
+        if (error != nullptr) *error = -1;
+        return false;
+    }
+    bool any = false;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        ggml_backend_t backend = sched->backends[i];
+        const int submission_error = ggml_backend_sched_submission_error(backend);
+        const bool pending = ggml_backend_sched_submission_pending(backend);
+        if (submission_error == 0 && !pending) {
+            continue;
+        }
+        any = true;
+        const ggml_backend_completion_api * api = ggml_backend_sched_completion_api(backend);
+        if (api != nullptr && api->drain != nullptr) {
+            int drain_error = 0;
+            if (api->drain(backend, &drain_error) != GGML_BACKEND_COMPLETION_SUCCESS) {
+                if (error != nullptr) *error = drain_error != 0 ? drain_error : -1;
+                return false;
+            }
+            continue;
+        }
+        if (backend->device != nullptr && backend->device->iface.event_new != nullptr &&
+                backend->iface.event_record != nullptr) {
+            ggml_backend_event_t event = ggml_backend_event_new(backend->device);
+            if (event == nullptr) {
+                if (error != nullptr) *error = -1;
+                return false;
+            }
+            ggml_backend_event_record(event, backend);
+            ggml_backend_event_synchronize(event);
+            ggml_backend_event_free(event);
+            continue;
+        }
+        if (error != nullptr) *error = submission_error != 0 ? submission_error : -1;
+        return false;
+    }
+    if (!any) {
+        if (error != nullptr) *error = 0;
+        return true;
+    }
+    if (error != nullptr) *error = 0;
+    return true;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

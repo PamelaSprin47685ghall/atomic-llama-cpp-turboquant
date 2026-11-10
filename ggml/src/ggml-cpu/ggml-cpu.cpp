@@ -9,6 +9,8 @@
 
 #include <atomic>
 #include <cctype>
+#include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -118,6 +120,15 @@ struct ggml_backend_cpu_context {
     std::atomic<uint64_t> attn_live_elems{0};
     std::atomic<uint64_t> attn_pad_elems{0};
     std::atomic<uint64_t> attn_rows{0};
+
+    // CPU is synchronous, but it still publishes the same explicit completion
+    // token contract as asynchronous backends. Device type is never a proof.
+    std::atomic<uint64_t> completion_attempt{0};
+    uint64_t              completion_active = 0;
+    std::mutex            completion_mutex;
+    std::mutex            submission_owner_mutex;
+    std::unordered_map<uint64_t, int> completions; // 0 accepted, 1 success, 2 failed
+    std::unordered_map<uint64_t, int> completion_errors;
 };
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
@@ -181,6 +192,7 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    const uint64_t completion_token = cpu_ctx->completion_active;
 
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
@@ -189,6 +201,11 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
         cpu_ctx->work_data = new uint8_t[cplan.work_size];
         if (cpu_ctx->work_data == NULL) {
             cpu_ctx->work_size = 0;
+            if (completion_token != 0) {
+                std::lock_guard<std::mutex> lock(cpu_ctx->completion_mutex);
+                cpu_ctx->completions[completion_token] = 2;
+                cpu_ctx->completion_errors[completion_token] = (int) GGML_STATUS_ALLOC_FAILED;
+            }
             return GGML_STATUS_ALLOC_FAILED;
         }
         cpu_ctx->work_size = cplan.work_size;
@@ -200,7 +217,13 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.use_ref             = cpu_ctx->use_ref;
     cplan.cpu_ctx             = cpu_ctx;
 
-    return ggml_graph_compute(cgraph, &cplan);
+    const enum ggml_status status = ggml_graph_compute(cgraph, &cplan);
+    if (completion_token != 0) {
+        std::lock_guard<std::mutex> lock(cpu_ctx->completion_mutex);
+        cpu_ctx->completions[completion_token] = status == GGML_STATUS_SUCCESS ? 1 : 2;
+        cpu_ctx->completion_errors[completion_token] = (int) status;
+    }
+    return status;
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {
@@ -714,7 +737,84 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+static uint64_t ggml_backend_cpu_completion_begin(ggml_backend_t backend) {
+    auto * ctx = (struct ggml_backend_cpu_context *)backend->context;
+    ctx->submission_owner_mutex.lock();
+    try {
+        std::lock_guard<std::mutex> lock(ctx->completion_mutex);
+        const uint64_t token = ++ctx->completion_attempt;
+        ctx->completions[token] = 0;
+        ctx->completion_errors[token] = 0;
+        ctx->completion_active = token;
+        return token;
+    } catch (...) {
+        ctx->submission_owner_mutex.unlock();
+        return 0;
+    }
+}
+
+static void ggml_backend_cpu_completion_end(ggml_backend_t backend) {
+    auto * ctx = (struct ggml_backend_cpu_context *)backend->context;
+    {
+        std::lock_guard<std::mutex> lock(ctx->completion_mutex);
+        ctx->completion_active = 0;
+    }
+    ctx->submission_owner_mutex.unlock();
+}
+
+static uint64_t ggml_backend_cpu_completion_attempt(ggml_backend_t backend) {
+    auto * ctx = (struct ggml_backend_cpu_context *)backend->context;
+    return ctx->completion_attempt.load(std::memory_order_acquire);
+}
+
+static int ggml_backend_cpu_completion_wait(
+        ggml_backend_t backend, uint64_t attempt, int * error) {
+    auto * ctx = (struct ggml_backend_cpu_context *)backend->context;
+    std::lock_guard<std::mutex> lock(ctx->completion_mutex);
+    auto it = ctx->completions.find(attempt);
+    if (it == ctx->completions.end()) {
+        if (error != nullptr) *error = -1;
+        return GGML_BACKEND_COMPLETION_UNKNOWN;
+    }
+    if (it->second == 2) {
+        if (error != nullptr) *error = ctx->completion_errors[attempt];
+        return GGML_BACKEND_COMPLETION_FAILED;
+    }
+    if (it->second != 1) {
+        if (error != nullptr) *error = -1;
+        return GGML_BACKEND_COMPLETION_UNKNOWN;
+    }
+    if (error != nullptr) *error = 0;
+    return GGML_BACKEND_COMPLETION_SUCCESS;
+}
+
+static int ggml_backend_cpu_completion_drain(ggml_backend_t backend, int * error) {
+    GGML_UNUSED(backend);
+    if (error != nullptr) *error = 0;
+    return GGML_BACKEND_COMPLETION_SUCCESS;
+}
+
+static void ggml_backend_cpu_completion_release(ggml_backend_t backend, uint64_t attempt) {
+    auto * ctx = (struct ggml_backend_cpu_context *)backend->context;
+    std::lock_guard<std::mutex> lock(ctx->completion_mutex);
+    ctx->completions.erase(attempt);
+    ctx->completion_errors.erase(attempt);
+}
+
+static const ggml_backend_completion_api ggml_backend_cpu_completion_api = {
+    /* .abi_version = */ GGML_BACKEND_COMPLETION_API_VERSION,
+    /* .begin       = */ ggml_backend_cpu_completion_begin,
+    /* .end         = */ ggml_backend_cpu_completion_end,
+    /* .attempt     = */ ggml_backend_cpu_completion_attempt,
+    /* .wait        = */ ggml_backend_cpu_completion_wait,
+    /* .drain       = */ ggml_backend_cpu_completion_drain,
+    /* .release     = */ ggml_backend_cpu_completion_release,
+};
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_completion_v1") == 0) {
+        return (void *) &ggml_backend_cpu_completion_api;
+    }
     if (strcmp(name, "ggml_backend_supports_ordered_attention") == 0) {
         return (void *) ggml_backend_cpu_device_supports_op;
     }

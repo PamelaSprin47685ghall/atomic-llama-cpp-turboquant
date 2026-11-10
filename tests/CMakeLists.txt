@@ -144,6 +144,14 @@ add_executable(test-topology-cache-key test-topology-cache-key.cpp)
 target_link_libraries(test-topology-cache-key PRIVATE ggml)
 add_test(NAME test-topology-cache-key COMMAND test-topology-cache-key)
 
+# Narrow real-CPU receipt contract: a synchronous CPU backend must publish a
+# completed-success receipt with a real attempt id; wait() must report the
+# same completed fact. No model and no GPU.
+add_executable(test-sched-receipt test-sched-receipt.cpp)
+target_link_libraries(test-sched-receipt PRIVATE ggml ggml-cpu)
+target_include_directories(test-sched-receipt PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+add_test(NAME test-sched-receipt COMMAND test-sched-receipt)
+
 # the two decision predicates of the rs_z runtime lane (arming, decode-time
 # row check) as pure functions: no model, no context, no backend, so the
 # n_rs_seq refusal and the _cell/_envelope split are pinned in every CPU build

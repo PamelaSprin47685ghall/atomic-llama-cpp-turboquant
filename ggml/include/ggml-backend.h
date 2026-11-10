@@ -347,6 +347,44 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_backend_sched_debug_copy_dependency(
             ggml_backend_sched_t sched, const struct ggml_tensor * source);
 
+    // Versioned per-attempt completion receipt.  submit records the real
+    // scheduler attempt and the backend attempts/resources it submitted;
+    // ACCEPTED is not completion.  wait() proves the exact attempt:
+    // COMPLETED_SUCCESS/COMPLETED_FAILURE are facts, UNKNOWN is not success.
+    // A void synchronize is never used as a success proof here.
+    enum ggml_backend_sched_receipt_state {
+        GGML_BACKEND_SCHED_RECEIPT_ACCEPTED          = 0,
+        GGML_BACKEND_SCHED_RECEIPT_COMPLETED_SUCCESS = 1,
+        GGML_BACKEND_SCHED_RECEIPT_COMPLETED_FAILURE = 2,
+        GGML_BACKEND_SCHED_RECEIPT_UNKNOWN           = 3,
+    };
+    #define GGML_BACKEND_SCHED_RECEIPT_API_VERSION 1
+    struct ggml_backend_sched_receipt {
+        uint32_t version;
+        uint64_t attempt;
+        int      state;
+        int      error;
+        bool     submitted; // true iff at least one split was handed to a backend
+        bool     in_flight; // UNKNOWN due to a previous/unresolved submission
+        void *   priv; // scheduler-owned attempt/resources; release it
+    };
+    // Returns true only when the graph was submitted and an attempt exists.
+    // A false return with COMPLETED_FAILURE means no work was submitted.
+    GGML_API bool ggml_backend_sched_graph_compute_receipt(
+            ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+            struct ggml_backend_sched_receipt * receipt);
+    // Blocks until the recorded attempt is proven or cannot be proven.
+    // Returns the receipt state.  Callers must not treat ACCEPTED/UNKNOWN as
+    // success.
+    GGML_API int ggml_backend_sched_receipt_wait(
+            ggml_backend_sched_t sched, struct ggml_backend_sched_receipt * receipt);
+    GGML_API bool ggml_backend_sched_receipt_release(
+            ggml_backend_sched_t sched, struct ggml_backend_sched_receipt * receipt);
+    // Drain only backends that currently report a pending/error submission.
+    // Used to retire a quarantined host undo when no per-attempt receipt exists.
+    GGML_API bool ggml_backend_sched_drain_pending(
+            ggml_backend_sched_t sched, int * error);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success

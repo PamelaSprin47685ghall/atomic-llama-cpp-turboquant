@@ -249,6 +249,39 @@ extern "C" {
         void * context;
     };
 
+    // Optional per-attempt completion receipt, negotiated under the name
+    // "ggml_backend_completion_v1".  A backend that accepts asynchronous graph
+    // work publishes an attempt id in graph_compute.  wait() must report the
+    // outcome of that exact attempt without aborting on a native error:
+    // SUCCESS and FAILED are completed facts; UNKNOWN means the backend cannot
+    // prove the attempt.  A missing receipt is never a success.
+    enum ggml_backend_completion_result {
+        GGML_BACKEND_COMPLETION_SUCCESS = 0,
+        GGML_BACKEND_COMPLETION_FAILED  = 1,
+        GGML_BACKEND_COMPLETION_UNKNOWN = 2,
+    };
+    #define GGML_BACKEND_COMPLETION_API_VERSION 3
+    struct ggml_backend_completion_api {
+        uint32_t abi_version;
+        // Latest accepted graph attempt, or 0 when none is recorded.
+        // Atomically create a completion ticket for exactly this submission.
+        // Normal graph/copy calls do not call begin and create no record.
+        uint64_t (*begin)(ggml_backend_t backend);
+        // Seal the ticket after the backend submission call. No record is
+        // created outside begin/end.
+        void (*end)(ggml_backend_t backend);
+        uint64_t (*attempt)(ggml_backend_t backend);
+        // Wait for one attempt.  error receives the native/ggml error for
+        // FAILED; it may be NULL.  The call must not terminate the process.
+        int (*wait)(ggml_backend_t backend, uint64_t attempt, int * error);
+        // Prove that all backend work has reached a completion boundary.
+        // Used only to retire a quarantined host undo after an UNKNOWN
+        // attempt; it is not a per-attempt success claim.
+        int (*drain)(ggml_backend_t backend, int * error);
+        // Release a submission token after wait/drain/terminal state.
+        void (*release)(ggml_backend_t backend, uint64_t attempt);
+    };
+
     // Add backend dynamic loading support to the backend
 
     // Initialize the backend
