@@ -9119,6 +9119,10 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+llama_host_memory_breakdown_data llama_context::host_memory_breakdown() const {
+    return memory ? memory->host_memory_breakdown() : llama_host_memory_breakdown_data {};
+}
+
 //
 // training
 //
@@ -10540,6 +10544,10 @@ void llama_opt_epoch(struct llama_context *  ctx,
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+llama_host_memory_breakdown_data llama_get_host_memory_breakdown(const struct llama_context * ctx) {
+    return ctx->host_memory_breakdown();
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

@@ -729,6 +729,28 @@ public:
         return journal_ != nullptr;
     }
 
+    // Host payload capacity of one cells object. This counts vector capacity
+    // and container payload entries, not allocator bookkeeping; it excludes
+    // the journal (accounted separately by cell_journal::bytes()).
+    size_t host_bytes() const {
+        size_t n = used.size()*sizeof(uint32_t) +
+                   pos.capacity()*sizeof(llama_pos) +
+                   ext.capacity()*sizeof(llama_kv_cell_ext) +
+                   shift.capacity()*sizeof(llama_pos) +
+                   seq.capacity()*sizeof(seq_set_t);
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            n += seq_pos[s].size()*(sizeof(llama_pos) + sizeof(int));
+        }
+        return n;
+    }
+
+    // Swap the cell payload without changing either object's address or
+    // journal borrow. Used by the shift-backup restore to keep get_cells()
+    // references valid across a restore.
+    void swap_contents(llama_kv_cells & other) noexcept {
+        swap_data(other);
+    }
+
     // Restore one cell from the prepare journal. This is the only writer used
     // by the journal replay; it updates used/seq_pos so the cell invariants
     // hold.

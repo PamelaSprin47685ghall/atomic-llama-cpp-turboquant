@@ -196,6 +196,16 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
+llama_host_memory_breakdown_data llama_memory_hybrid::host_memory_breakdown() const {
+    llama_host_memory_breakdown_data res = mem_attn->host_memory_breakdown();
+    const auto recr = mem_recr->host_memory_breakdown();
+    res.journal     += recr.journal;
+    res.trial_index += recr.trial_index;
+    res.snapshots   += recr.snapshots;
+    res.scratch     += recr.scratch;
+    return res;
+}
+
 bool llama_memory_hybrid::has_kv_stream_targets() const {
     return mem_attn->has_kv_stream_targets();
 }

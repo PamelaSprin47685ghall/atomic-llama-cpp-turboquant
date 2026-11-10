@@ -67,6 +67,7 @@ public:
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    llama_host_memory_breakdown_data host_memory_breakdown() const override;
 
     // state write/load
 

@@ -5,6 +5,7 @@
 // try as much as possible to not include this header in the rest of the codebase
 
 #include "llama.h"
+#include "llama-host-memory.h"
 
 #include <cstdint>
 #include <map>
@@ -105,6 +106,11 @@ LLAMA_API size_t llama_model_get_moe_tensor_info(
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+// Host-only KV journal/prepare accounting. This is not part of the
+// buffer-type map above and does not change llama_get_memory_breakdown's
+// device-buffer meaning.
+LLAMA_API llama_host_memory_breakdown_data llama_get_host_memory_breakdown(const struct llama_context * ctx);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to

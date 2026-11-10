@@ -1221,7 +1221,8 @@ unbound prepare snapshots; vector growth/snapshot reuse only assign unbound
 elements. This is the ownership fix, not a change to the journal data model.
 
 Scope: `test-kv-cells-journal-ownership` is header-only synthetic ownership/
-OOM coverage; it was not run here. `test-tp5-ubatch-pool` uses a synthetic
+OOM coverage; it was run once and passed, including the 262145-cell boundary.
+`test-tp5-ubatch-pool` uses a synthetic
 real `llama_kv_cache` with OOM sweeps (SWA/non-SWA, persistent, begin_trial,
 same-cell) and capacity/microbench reporting; it is not a full model run.
 `test-kv-update-status` uses a real CPU dense Llama context. SWA purge tests
@@ -1229,11 +1230,14 @@ use synthetic cache construction; `n_swa=0` covers the journal replay branch,
 not an SWA purge. No full runtime model, GPU, or staging receipt was run.
 
 Narrow verification in this isolated worktree, once each:
-`test-tp5-ubatch-pool` reported `OK failures=0 allocs=24256 frees=23106`,
-exit 0 (synthetic real-cache OOM/SWA/non-SWA sweep, not a full model);
+`test-tp5-ubatch-pool` reported `OK failures=0 allocs=24313 frees=23163`,
+exit 0 (synthetic real-cache OOM/SWA/non-SWA sweep, including the host
+breakdown and cells-address checks; not a full model);
 `test-kv-update-status` with `tests/test-models/llama-dense.gguf` reported
 `KV_UPDATE_STATUS_TEST PASS checks=21`, exit 0 (real CPU dense context).
-`test-kv-cells-journal-ownership` was not run. No GPU/full suite was run.
+`test-kv-cells-journal-ownership` passed once with the 262145-cell boundary
+(the two child GGML_ASSERT messages are the expected bound-destination death
+tests). No GPU/full suite was run.
 
 The K-shift shift backup is now strong on allocation failure:
 `shift_backup_save()` copies `v_cells` and `v_heads` into locals and swaps only
@@ -1266,6 +1270,21 @@ resetting another writer's trial. The journal replay still aborts via
 case (one past the old limit) and passed once; its bound-destination death
 tests intentionally print child abort messages. The 12 B/cell budget is the
 current public number; the old capacity/microbench observations are historical.
+
+Host accounting is exposed separately as
+`llama_get_host_memory_breakdown()` in `llama-ext.h`; it does not change
+`llama_get_memory_breakdown()`, whose map remains device/buffer-type memory
+only. The host struct reports `journal`, `trial_index`, `snapshots` and
+`scratch` payload capacity: `cell_journal::bytes()` is now called, the
+snapshot pools/fallback slots and shift backup are counted once, the flat
+trial index is counted from the scratch blocks, and scratch control vectors
+are separate. Main resident `v_cells` metadata is not included in this
+journal/prepare account. These are payload capacities, not allocator
+bookkeeping.
+
+`shift_backup_restore()` now swaps cell payloads in place instead of swapping
+the `v_cells` vector, so `get_cells()` references and the cell objects keep
+their addresses. The shift-backup test checks the address and restored state.
 
 Manifest: `src/llama-kv-cache.cpp`, `src/llama-kv-cache.h`,
 `src/llama-kv-cells.h` and `tests/test-tp5-ubatch-pool.cpp` were updated to

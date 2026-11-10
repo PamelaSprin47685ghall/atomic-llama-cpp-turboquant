@@ -178,6 +178,16 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
     return mb;
 }
 
+llama_host_memory_breakdown_data llama_kv_cache_iswa::host_memory_breakdown() const {
+    llama_host_memory_breakdown_data res = kv_base->host_memory_breakdown();
+    const auto swa = kv_swa->host_memory_breakdown();
+    res.journal     += swa.journal;
+    res.trial_index += swa.trial_index;
+    res.snapshots   += swa.snapshots;
+    res.scratch     += swa.scratch;
+    return res;
+}
+
 bool llama_kv_cache_iswa::has_kv_stream_targets() const {
     return kv_base->has_kv_stream_targets() || kv_swa->has_kv_stream_targets();
 }

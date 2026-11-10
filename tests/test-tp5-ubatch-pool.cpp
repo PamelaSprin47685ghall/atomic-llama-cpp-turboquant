@@ -1143,10 +1143,13 @@ static void test_shift_backup_strong_oom() {
     llama_kv_cells retry_before = cells;
     const auto heads_before = llama_kv_cache_prepare_test_access::heads(*kv);
     kv->shift_backup_save();
+    const auto host = kv->host_memory_breakdown();
+    check(host.snapshots > 0 && host.total() >= host.snapshots,
+          "host breakdown counts the shift backup");
     cells.pos_set(0, 77);
     kv->shift_backup_restore();
-    // restore swaps v_cells, so the old reference is invalidated.
     auto & restored = llama_kv_cache_prepare_test_access::cells(*kv, 0);
+    check(&restored == &cells, "shift backup: restore preserves the cells object address");
     check(same_cells(restored, retry_before, restored.size()) &&
           llama_kv_cache_prepare_test_access::heads(*kv) == heads_before,
           "shift backup: retry saves and restores complete state");

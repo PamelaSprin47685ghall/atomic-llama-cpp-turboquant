@@ -1231,6 +1231,38 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     return ret;
 }
 
+llama_host_memory_breakdown_data llama_kv_cache::host_memory_breakdown() const {
+    llama_host_memory_breakdown_data res;
+
+    res.journal += cell_journals.capacity()*sizeof(cell_journal);
+    for (const auto & j : cell_journals) {
+        res.journal += j.bytes();
+    }
+
+    const auto scratch = scratch_pool.host_memory_breakdown();
+    res.trial_index += scratch.trial_index;
+    res.snapshots   += scratch.snapshots;
+    res.scratch     += scratch.scratch;
+
+    const auto local_scratch = decode_scratch_.host_memory_breakdown();
+    res.trial_index += local_scratch.trial_index;
+    res.snapshots   += local_scratch.snapshots;
+    res.scratch     += local_scratch.scratch;
+
+    const auto snapshots_bytes = snapshots.host_memory_breakdown();
+    res.snapshots += snapshots_bytes.snapshots;
+
+    res.snapshots += shift_cells_backup.capacity()*sizeof(llama_kv_cells) +
+                     shift_heads_backup.capacity()*sizeof(uint32_t);
+    for (const auto & c : shift_cells_backup) {
+        res.snapshots += c.host_bytes();
+    }
+
+    res.scratch += heads_before.capacity()*sizeof(uint32_t);
+
+    return res;
+}
+
 bool llama_kv_cache::has_kv_stream_targets() const {
     return kv_stream_runtime.runtime != nullptr;
 }
@@ -1986,9 +2018,12 @@ void llama_kv_cache::shift_backup_restore() {
     if (shift_cells_backup.empty()) {
         return;
     }
-    // Swap is noexcept: the restore itself cannot fail halfway and leave a
-    // partially copied cache. The old live vectors are released by clear().
-    v_cells.swap(shift_cells_backup);
+    // Swap payloads in place: the restore cannot fail halfway and the
+    // v_cells objects (and get_cells references) keep their addresses.
+    GGML_ASSERT(v_cells.size() == shift_cells_backup.size());
+    for (size_t s = 0; s < v_cells.size(); ++s) {
+        v_cells[s].swap_contents(shift_cells_backup[s]);
+    }
     v_heads.swap(shift_heads_backup);
     shift_backup_clear();
 }

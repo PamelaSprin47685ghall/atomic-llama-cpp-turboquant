@@ -133,6 +133,16 @@ public:
         std::vector<llama_kv_cells> v_cells; // journal snapshot of the old cells
 
         size_t trial_idx_off = 0; // offset into the flat per-stream trial index block
+
+        size_t host_bytes() const {
+            size_t n = sizeof(*this) +
+                       v_heads_old.capacity()*sizeof(uint32_t) +
+                       v_cells.capacity()*sizeof(llama_kv_cells);
+            for (const auto & c : v_cells) {
+                n += c.host_bytes();
+            }
+            return n;
+        }
     };
 
     // decode-time buffers reused by one batch context. the context returns
@@ -149,6 +159,21 @@ public:
 
         bool in_use    = false;
         bool from_pool = false;
+
+        llama_host_memory_breakdown_data host_memory_breakdown() const {
+            llama_host_memory_breakdown_data res;
+            res.scratch += sizeof(*this) +
+                           sinfos.capacity()*sizeof(slot_info) +
+                           ubatches.capacity()*sizeof(llama_ubatch) +
+                           states.capacity()*sizeof(snapshot_slot *) +
+                           pooled.capacity()*sizeof(snapshot_slot *) +
+                           fallback.capacity()*sizeof(std::unique_ptr<snapshot_slot>);
+            res.trial_index += trial_idx.capacity()*sizeof(size_t);
+            for (const auto & slot : fallback) {
+                res.snapshots += slot->host_bytes();
+            }
+            return res;
+        }
     };
 
     // fixed-slot pool of decode scratches. Two slots cover a nested decode;
@@ -236,6 +261,20 @@ public:
             return fallbacks_;
         }
 
+        llama_host_memory_breakdown_data host_memory_breakdown() const {
+            std::lock_guard<std::mutex> lock(mutex);
+            llama_host_memory_breakdown_data res;
+            res.scratch += storage.capacity()*sizeof(std::unique_ptr<decode_scratch>) +
+                           free.capacity()*sizeof(decode_scratch *);
+            for (const auto & scratch_ptr : storage) {
+                const auto scratch = scratch_ptr->host_memory_breakdown();
+                res.scratch     += scratch.scratch;
+                res.trial_index += scratch.trial_index;
+                res.snapshots   += scratch.snapshots;
+            }
+            return res;
+        }
+
     private:
         mutable std::mutex mutex;
         std::vector<std::unique_ptr<decode_scratch>> storage;
@@ -299,6 +338,7 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    llama_host_memory_breakdown_data host_memory_breakdown() const override;
 
     bool has_kv_stream_targets() const override;
     std::vector<llama_kv_stream_target> get_kv_stream_targets() const override;
@@ -730,8 +770,19 @@ private:
             }
         }
 
+        llama_host_memory_breakdown_data host_memory_breakdown() const {
+            std::lock_guard<std::mutex> lock(mutex);
+            llama_host_memory_breakdown_data res;
+            res.snapshots += storage.capacity()*sizeof(std::unique_ptr<snapshot_slot>) +
+                             free.capacity()*sizeof(snapshot_slot *);
+            for (const auto & slot : storage) {
+                res.snapshots += slot->host_bytes();
+            }
+            return res;
+        }
+
     private:
-        std::mutex mutex;
+        mutable std::mutex mutex;
 
         std::vector<std::unique_ptr<snapshot_slot>> storage;
         std::vector<snapshot_slot *> free;

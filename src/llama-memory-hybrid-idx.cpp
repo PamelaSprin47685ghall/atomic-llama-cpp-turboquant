@@ -221,6 +221,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     return mb;
 }
 
+llama_host_memory_breakdown_data llama_memory_hybrid_idx::host_memory_breakdown() const {
+    llama_host_memory_breakdown_data res = llama_memory_hybrid::host_memory_breakdown();
+    if (mem_idx) {
+        const auto idx = mem_idx->host_memory_breakdown();
+        res.journal     += idx.journal;
+        res.trial_index += idx.trial_index;
+        res.snapshots   += idx.snapshots;
+        res.scratch     += idx.scratch;
+    }
+    return res;
+}
+
 //
 // [TAG_PLE_HISTORY] per-sequence PLE n-gram history
 //
