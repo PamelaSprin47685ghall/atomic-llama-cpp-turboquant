@@ -1135,7 +1135,7 @@
     },
     {
       "path": "include/llama.h",
-      "sha256": "6bbbbfc386e744d7214dbbed0a57572af9773a08758a71a7d09838717a1d6c1a",
+      "sha256": "15bd2c57c870b21290d69d9e9ca68f24091ed2d30f736fa10ff115b7fb7e8e42",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -1816,7 +1816,7 @@
     },
     {
       "path": "src/llama-context.cpp",
-      "sha256": "60e8ce83447e70af07eefb29c78ed3a3c408b008aee67691196591a5b960e946",
+      "sha256": "2b44ac7a01a6fdb16c24122a5de6445eeaa69b8d98b07034cc93cfa1d5d8ae94",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -3535,6 +3535,17 @@
       ],
       "reason": "Cover same-thread note_source under the submit gate, gate retention, and the check-then-lock TOCTOU wait-free try_lock against a fatal publication.",
       "removal_condition": "Remove with the WS4 staging pool test target."
+    },
+    {
+      "path": "tests/test-tp5-staging-owner-runtime.cpp",
+      "sha256": "ed1a892e5833363dc1653548636e009edfd72bd407fce22e39eef58e4019b4a8",
+      "mode": "100644",
+      "consumers": [
+        "TP5 staging owner runtime tests",
+        "provider/staging maintainers"
+      ],
+      "reason": "Real QWEN4EXP target/draft contexts drive the per-run staging owner retainer, owner credit release, and delayed-completion retry.",
+      "removal_condition": "Remove when the staging owner runtime is covered upstream or the retainer moves under fork/tests/."
     },
     {
       "path": "tests/test-tp5-staging-pool.cpp",

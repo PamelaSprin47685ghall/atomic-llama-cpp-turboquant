@@ -18,9 +18,9 @@ is introduced and no undeclared path remains.
 
 The earlier c9715b052 registration (314 entries) is the base. This round
 re-signs every entry whose bytes changed in the unified p5unified tree and adds
-the 25 non-`fork/` paths that became changed after that registration. Every
+the 26 non-`fork/` paths that became changed after that registration. Every
 entry carries the real SHA-256 and mode read from the current worktree, plus
-named consumers, reason, and removal condition. The manifest now has 339
+named consumers, reason, and removal condition. The manifest now has 340
 entries.
 
 Newly registered paths in this round:
@@ -39,15 +39,17 @@ Newly registered paths in this round:
   `src/tp5-cleanup-owner.h`
 - CPU tests: `tests/test-meta-host-view-copy.cpp`,
   `tests/test-sched-receipt.cpp`, `tests/test-tp5-context-cleanup-concurrent.cpp`,
-  `tests/test-tp5-hc-replicated-compute.cpp`, `tests/test-tp5-relay-free-decision.cpp`
+  `tests/test-tp5-hc-replicated-compute.cpp`,
+  `tests/test-tp5-relay-free-decision.cpp`,
+  `tests/test-tp5-staging-owner-runtime.cpp`
 
 `.gitattributes` marks the retained patch/text artifacts as whitespace-exempt:
 `audit/m3-tail-storage.patch.txt`, the WS0 overlay patches,
 `patches/ws5/*.patch`, `fork/logits-compose/README.md`, and the
 `fork/mtp-progress-20261031` archive. Source and test files are not exempted.
 
-Guard result: `changed_upstream_paths=339`, `extension_paths=365`,
-`exception_manifest_sha256=f2eb637f4c65063700cc8a05c17a25270fb7a2ae810e35288e41dbb5fc00de85`.
+Guard result: `changed_upstream_paths=340`, `extension_paths=366`,
+`exception_manifest_sha256=d5fd7ef36943d7d0c253f967845a0e656fafa9e1660ec41c863fddf4e5ff9d7f`.
 No source or test file was modified, added, or removed by the manifest round.
 
 ## A. Pre-existing mismatches (historical)

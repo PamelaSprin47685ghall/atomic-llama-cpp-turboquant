@@ -11001,6 +11001,27 @@ ggml_backend_t llama_tp5_relay_backend(llama_context * ctx) {
     return ctx != nullptr ? ctx->get_tp5_relay_backend() : nullptr;
 }
 
+int llama_tp5_context_staging_drain(struct llama_context * ctx) {
+    if (ctx == nullptr) {
+        return LLAMA_TP5_CONTEXT_DRAIN_FAILED;
+    }
+    if (!ctx->has_staging_scope()) {
+        return LLAMA_TP5_CONTEXT_DRAIN_DRAINED;
+    }
+    // The unified tree has no full per-context staging receipt. A bound
+    // lane/owner is not a completion proof; report UNKNOWN so the caller
+    // keeps the relay/checkpoint receipts.
+    return LLAMA_TP5_CONTEXT_DRAIN_UNKNOWN;
+}
+
+bool llama_tp5_context_staging_owner(
+        const struct llama_context * ctx, uint64_t * owner, uint64_t * generation) {
+    if (ctx == nullptr || owner == nullptr || generation == nullptr) {
+        return false;
+    }
+    return ctx->get_tp5_owner(*owner, *generation);
+}
+
 // DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): output-copy completion as
 // device events. The record must be issued AFTER llama_decode returned, so every
 // event is ordered behind the graph AND behind the asynchronous logits D2H copy

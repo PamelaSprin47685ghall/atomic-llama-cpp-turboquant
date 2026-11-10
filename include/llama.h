@@ -653,6 +653,26 @@ extern "C" {
     // API may run concurrently with llama_decode/llama_synchronize.
     LLAMA_API struct ggml_backend * llama_tp5_relay_backend(struct llama_context * ctx);
 
+    // Staging-only context receipt. DRAINED is the only clean state;
+    // BUSY/FAILED/UNKNOWN must retain the context/owner. A context with no
+    // staging lane/owner returns DRAINED (no staging scope). This is an
+    // additional staging gate, never the sole completion proof for
+    // seq_rm/seq_cp/seq_add or slot retirement.
+    enum llama_tp5_context_drain_result {
+        LLAMA_TP5_CONTEXT_DRAIN_DRAINED           = 0,
+        LLAMA_TP5_CONTEXT_DRAIN_BUSY              = 1,
+        LLAMA_TP5_CONTEXT_DRAIN_FAILED            = 2,
+        LLAMA_TP5_CONTEXT_DRAIN_DRAINED_WITH_ERROR = 3,
+        LLAMA_TP5_CONTEXT_DRAIN_UNKNOWN           = 4,
+    };
+    LLAMA_API int llama_tp5_context_staging_drain(struct llama_context * ctx);
+
+    // Borrow the owner token/generation bound to this context, if any. The
+    // token remains owned by the combiner; the caller must not release it
+    // except through the normal owner drain/release protocol.
+    LLAMA_API bool llama_tp5_context_staging_owner(
+        const struct llama_context * ctx, uint64_t * owner, uint64_t * generation);
+
     // DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): tp5-relay only.
     // Record one device event per child stream that the asynchronous logits D2H
     // copy of the last decoded epoch used (one stream for a mirrored output,
