@@ -23,7 +23,7 @@ struct mock_memory : public llama_memory_i {
 
     bool get_can_shift() const override { GGML_ASSERT(false && "not implemented"); }
 
-    void clear(bool) override { GGML_ASSERT(false && "not implemented"); }
+    bool clear(bool) override { GGML_ASSERT(false && "not implemented"); return true; }
 
     bool seq_rm  (llama_seq_id, llama_pos, llama_pos) override { GGML_ASSERT(false && "not implemented"); }
     void seq_cp  (llama_seq_id, llama_seq_id, llama_pos, llama_pos) override { GGML_ASSERT(false && "not implemented"); }
