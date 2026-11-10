@@ -1179,16 +1179,21 @@ run showed `seq_add` was ignored and the mock failure hit decode, not the
 K-shift update. It is retained as diagnosis evidence, not a pass.
 
 Follow-up correction (test-only): state buffers are now sized by
-`llama_state_seq_get_size`. qwen4exp's attention cache refuses `seq_add`
-("cannot shift its K/V"), so the mock failure would hit the main decode graph,
-not the K-shift update. The test now detects that no position changed and
-SKIPs the K-shift failure/empty-stream subcase. The qwen4exp run is
-`SKIP: cache cannot shift; K-shift failure path not applicable`,
-`KV_UPDATE_STATUS_TEST PASS checks=13`, exit 0. Root cause of the original
-empty-stream failures is therefore that no K-shift update occurred and the
-state guards were not reached; this does not prove a state-guard bug. The
-20-check llama-dense CPU result is from the earlier run and was not rerun
-after this test-only adjustment.
+`llama_state_seq_get_size`. The test checks `llama_memory_can_shift()` before
+any core path: an unsupported model prints `SKIP` and returns 77 without
+running the core checks or printing PASS. The earlier qwen4exp `SKIP ... PASS
+checks=13` output was before this capability/exit-77 change and is superseded;
+it is not a core PASS. The qwen4exp exit-77 path was not rerun after this
+change.
+
+For a shift-capable fixture, the test now requires `seq_add` to actually move
+the sequence position before running the K-shift FAILED checks; a no-op is a
+failure, not a skip. Dense llama run after the change:
+`KV_UPDATE_STATUS_TEST PASS checks=21`, exit 0, with the movement assertion and
+the K-shift/state-guard checks executed. The earlier 20-check dense result is
+historical; the current test has 21 checks. Root cause of the original
+qwen4exp empty-stream failures is that no K-shift update occurred and the
+state guards were not reached; this does not prove a state-guard bug.
 
 Manifest: no digest was re-signed. `src/llama-context.cpp/.h`,
 `src/llama-memory-recurrent.h` and `patches/ws5/README.md` remain red/unsigned.

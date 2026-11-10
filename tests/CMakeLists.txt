@@ -657,6 +657,7 @@ if (UNIX)
         add_test(NAME test-kv-update-status COMMAND $<TARGET_FILE:test-kv-update-status> "${LLAMA_NTOK_TEST_MODEL}")
         set_property(TEST test-kv-update-status PROPERTY LABELS "main;cpu;tp5")
         set_property(TEST test-kv-update-status PROPERTY PASS_REGULAR_EXPRESSION "KV_UPDATE_STATUS_TEST PASS")
+        set_property(TEST test-kv-update-status PROPERTY SKIP_RETURN_CODE 77)
     endif()
     if (LLAMA_NTOK_TEST_MODEL)
         # The n_outputs probe sets both binder arms itself, so it needs no

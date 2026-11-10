@@ -34,6 +34,7 @@
 
 static int g_checks = 0;
 static int g_fail   = 0;
+static bool g_skip  = false;
 
 #define CHECK(cond, ...) do { \
     ++g_checks; \
@@ -246,6 +247,17 @@ static void run_backend_failure(const char * model_path) {
         return;
     }
 
+    if (!llama_memory_can_shift(llama_get_memory(ctx))) {
+        // A model whose cache cannot shift cannot reach the K-shift FAILED
+        // path. Do not run the core checks or print PASS for it; report a
+        // skip so a dense regression cannot hide behind this fixture.
+        std::fprintf(stderr, "SKIP: memory cannot shift; K-shift test not applicable\n");
+        g_skip = true;
+        llama_free(ctx);
+        llama_model_free(model);
+        return;
+    }
+
     CHECK(decode_one(ctx, 1), "mock decode 1");
     CHECK(decode_one(ctx, 2), "mock decode 2");
     const llama_pos pos_before = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
@@ -265,13 +277,9 @@ static void run_backend_failure(const char * model_path) {
     CHECK(empty_size > 0, "baseline empty-stream state get");
 
     llama_memory_seq_add(llama_get_memory(ctx), 0, 0, -1, 1);
-    if (llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == pos_before) {
-        // The hybrid qwen4exp attention cache refuses seq_add ("cannot shift
-        // its K/V"), so no K-shift update is pending. The mock failure would
-        // hit the main decode graph, not the K-shift FAILED path; the state
-        // guards are therefore not applicable to this model. Skip explicitly
-        // instead of asserting a path the model cannot reach.
-        std::printf("SKIP: cache cannot shift; K-shift failure path not applicable\n");
+    const llama_pos pos_after_add = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    CHECK(pos_after_add != pos_before, "shift-capable fixture must move positions");
+    if (pos_after_add == pos_before) {
         llama_free(ctx);
         llama_model_free(model);
         return;
@@ -353,8 +361,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    run_no_update_and_applied(model);
     run_backend_failure(argv[1]);
+    if (g_skip) {
+        llama_model_free(model);
+        llama_backend_free();
+        std::fprintf(stderr, "KV_UPDATE_STATUS_TEST SKIP: K-shift test not applicable\n");
+        return 77;
+    }
+    run_no_update_and_applied(model);
 
     llama_model_free(model);
     llama_backend_free();
