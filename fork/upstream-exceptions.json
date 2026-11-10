@@ -965,7 +965,7 @@
     },
     {
       "path": "docs/tp5-staging-submission.md",
-      "sha256": "12e6e8af45a56641eca9d2ba4041fe9e2d4ef42e3594e6eaabfb817a9399b0de",
+      "sha256": "5178b28ea78801246300a6bacabcfe0d7a53dd02dcab5c49d75b777497f398db",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose staging/Meta integration maintainers"

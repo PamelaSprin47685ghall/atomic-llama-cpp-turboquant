@@ -10,13 +10,9 @@
 // that class slot_size, not other: the diagnostic and the eligibility
 // predicate read one decision.
 //
-// Build (CPU only):
-//   cmake --build build-ws4-polish-cpu -j --target ggml
-//   g++ -std=c++17 -O2 -I ggml/include -I ggml/src \
-//       tests/test-tp5-staging-reject-summary.cpp \
-//       -L build-ws4-polish-cpu/bin -Wl,-rpath,"$PWD/build-ws4-polish-cpu/bin" \
-//       -lggml -lggml-cpu -lggml-base -o /tmp/test-tp5-staging-reject-summary
-//   /tmp/test-tp5-staging-reject-summary
+// Build and run (CPU only, CTest target in tests/CMakeLists.txt):
+//   cmake --build build-ws4-sched-ctest -j --target test-tp5-staging-reject-summary
+//   ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-reject-summary --output-on-failure
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -67,8 +63,11 @@ bool fake_enter_submit() {
 void fake_leave_submit() {
 }
 
-// The rejection path only needs enabled/configured/usable. The remaining
-// entries stay null because no staging candidate reaches them here.
+// Registration needs abi_version, mark_partial and kind_count: a zero
+// kind_count is smaller than the host's domain and is rejected before the
+// rejection path can run. The rejection path itself only needs
+// enabled/configured/usable. No staging candidate reaches acquire, upload,
+// wait, release or the enqueue hooks here, so they stay null.
 const api g_fake_api = {
     /* .abi_version       = */ kApiVersion,
     /* .enabled           = */ fake_enabled,
@@ -95,6 +94,7 @@ const api g_fake_api = {
     /* .usable            = */ fake_usable,
     /* .zc_enabled        = */ nullptr,
     /* .mark_partial      = */ fake_mark_partial,
+    /* .kind_count        = */ kKindCount,
 };
 
 ggml_backend_meta_split_state split_mirrored(const ggml_tensor *, void *) {

@@ -6,9 +6,9 @@
 // a lock across fprintf, and must not crash. The final dump must report the
 // exact total and a published example.
 //
-// Build (CPU only):
-//   cmake --build build-ws4-polish-cpu -j --target test-tp5-staging-reject-concurrent
-//   ctest --test-dir build-ws4-polish-cpu -R test-tp5-staging-reject-concurrent
+// Build and run (CPU only, CTest target in tests/CMakeLists.txt):
+//   cmake --build build-ws4-sched-ctest -j --target test-tp5-staging-reject-concurrent
+//   ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-reject-concurrent --output-on-failure
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -61,6 +61,11 @@ void fake_leave_submit() {
 void fake_mark_partial(const lease *, const void *) {
 }
 
+// Registration needs abi_version, mark_partial and kind_count: a zero
+// kind_count is smaller than the host's domain and is rejected before the
+// rejection path can run. The rejection path itself only needs
+// enabled/configured/usable. No staging candidate reaches acquire, upload,
+// wait, release or the enqueue hooks here, so they stay null.
 const api g_fake_api = {
     /* .abi_version       = */ kApiVersion,
     /* .enabled           = */ fake_enabled,
@@ -87,6 +92,7 @@ const api g_fake_api = {
     /* .usable            = */ fake_usable,
     /* .zc_enabled        = */ nullptr,
     /* .mark_partial      = */ fake_mark_partial,
+    /* .kind_count        = */ kKindCount,
 };
 
 ggml_backend_meta_split_state split_mirrored(const ggml_tensor *, void *) {

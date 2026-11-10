@@ -15,11 +15,14 @@ limits.
   each passed once. DevOps then ran `test-tp5-staging-sync-src` once against
   the current main staging diff in `/tmp/tmp.PFMEB9VxfG`; it passed. This note
   does not rerun the tests.
-- Two observed staging failures remain in their original state and are not
-  fixed: `test-tp5-staging-reject-summary` and
-  `test-tp5-staging-reject-concurrent` fail because their fake API lacks
-  `kind_count`. They are not claimed as passing, and this note does not claim
-  a clean full staging suite.
+- Two observed staging failures had one fixture defect: the fake v3 API of
+  `test-tp5-staging-reject-summary` and
+  `test-tp5-staging-reject-concurrent` omitted `kind_count`, so registration
+  rejected the table before any rejection path ran. Both fixtures now publish
+  `kind_count = kKindCount`; their rejection and concurrency assertions are
+  unchanged. The original failures remain part of this history. DevOps built
+  both tests CPU-only in `/tmp/tmp.lwjlsDRMOL` and ran each once; both passed.
+  This is a host CPU result only: no GPU and no full staging suite is claimed.
 
 ## Capability negotiation
 
@@ -394,6 +397,12 @@ ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-note-source-lock --ou
 cmake --build build-ws4-sched-ctest -j --target test-tp5-staging-meta-partial
 ctest --test-dir build-ws4-sched-ctest -R test-tp5-staging-meta-partial --output-on-failure
 
+# staging rejection summary/concurrency (ctest, CPU)
+cmake --build build-ws4-sched-ctest -j --target \
+      test-tp5-staging-reject-summary test-tp5-staging-reject-concurrent
+ctest --test-dir build-ws4-sched-ctest \
+      -R 'test-tp5-staging-reject-(summary|concurrent)' --output-on-failure
+
 # ASAN variant: catches the backends-before-scheduler UAF and the
 # release_buffers-while-pending free.
 cmake -S . -B build-ws4-sched-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGGML_HIP=OFF \
@@ -652,6 +661,10 @@ concurrent test as `test-tp5-staging-reject-concurrent` in
 `tests/CMakeLists.txt` (labels `cpu;tp5;staging`, CPU only). Both run through
 CTest. The concurrent test allows intermediate `(none)`/`(pending)` lines and
 asserts only the final dump (READY, exact count, no `(none)`/`(pending)`).
+Both fixtures register a complete v3 table with `kind_count = kKindCount`.
+The registration gate rejects a table that omits `kind_count`, so an
+incomplete fake table would test the gate and never reach the rejection
+summary or its concurrency path.
 
 ### Integration with the staging union kind
 
