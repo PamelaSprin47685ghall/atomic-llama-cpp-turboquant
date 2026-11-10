@@ -587,6 +587,11 @@ private:
         return false;
     }
 
+    // Token slots are ordinary READY records and are processed by
+    // process_one_ready(); there is no separate token queue in this owner.
+    bool has_retained_tokens() const { return false; }
+    bool process_retained_token(bool) { return false; }
+
     std::size_t free_slots_locked() const {
         std::size_t n = 0;
         for (const slot & s : slots_) {

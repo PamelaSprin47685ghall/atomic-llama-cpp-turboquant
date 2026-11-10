@@ -56,6 +56,10 @@ struct provider_entry {
     const ggml_cuda_staging::api * api = nullptr;
     uint16_t tag = 0;
     ggml_backend_reg_t reg = nullptr;
+    // The DSO reference is held by the host module table, not by the
+    // provider. Keeping it here lets rollback/quarantine retain the code
+    // until the last owner, token, call, or lookup is gone.
+    std::shared_ptr<void> module;
     uint32_t active_owners = 0;
     uint32_t active_calls = 0;
     uint32_t live_users = 0;
@@ -837,6 +841,16 @@ static bool register_provider(ggml_backend_reg_t reg, const void * impl, const c
         return false;
     }
     std::shared_ptr<void> module = std::move(held.module);
+    if (!ggml_backend_module::begin_registration(reg)) {
+        GGML_LOG_WARN("%s: rejected provider registration (backend is unloading or unloaded)\n", func);
+        return false;
+    }
+    struct registration_guard {
+        ggml_backend_reg_t reg;
+        ~registration_guard() {
+            ggml_backend_module::end_registration(reg);
+        }
+    } registration_hold{reg};
 
     // Keep the new entry outside the lock: if push_back fails, its module
     // reference must be released after g_provider_mutex is unlocked.

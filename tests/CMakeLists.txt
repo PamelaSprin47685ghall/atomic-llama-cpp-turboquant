@@ -1534,3 +1534,13 @@ if (MTP_DRAFTONLY_TARGET AND MTP_DRAFTONLY_DRAFT)
     set_property(TEST test-tp5-staging-owner-runtime PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_OWNER_RUNTIME_TEST PASS")
     set_property(TEST test-tp5-staging-owner-runtime PROPERTY TIMEOUT 300)
 endif()
+if (LLAMA_TP5_TEST_HOOKS)
+    add_executable(test-tp5-context-cleanup-concurrent test-tp5-context-cleanup-concurrent.cpp)
+    target_link_libraries(test-tp5-context-cleanup-concurrent PRIVATE llama)
+    target_include_directories(test-tp5-context-cleanup-concurrent PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda
+        ${PROJECT_SOURCE_DIR}/fork/tp5-compose/src)
+endif()

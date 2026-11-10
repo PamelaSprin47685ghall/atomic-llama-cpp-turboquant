@@ -16,6 +16,7 @@ namespace {
 struct module_record {
     std::shared_ptr<void> module;
     uint32_t users = 0;
+    uint32_t registrations = 0;
     uint64_t epoch = 0;
     bool dynamic = false;
     bool loading = false;
@@ -263,9 +264,9 @@ bool detach(ggml_backend_reg_t reg, std::shared_ptr<void> * module_out,
     if (it == table.records.end()) {
         return false;
     }
-    if (it->second.users != 0) {
-        // A live backend instance still points into this module. The caller
-        // must keep the entry until the last pin is released.
+    if (it->second.users != 0 || it->second.registrations != 0) {
+        // A live backend instance or an in-flight provider registration
+        // still points into this module. Keep the entry.
         return false;
     }
     const bool dynamic = it->second.dynamic || it->second.module != nullptr;
@@ -419,6 +420,41 @@ bool attach_backend(ggml_backend_t backend, ggml_backend_pin * pin) {
         pin->spill = nullptr;
         delete spill;
         return false;
+    }
+}
+
+bool begin_registration(ggml_backend_reg_t reg) {
+    if (reg == nullptr) {
+        return false;
+    }
+    module_table & table = get_table();
+    std::lock_guard<std::mutex> lock(table.mutex);
+    const auto it = table.records.find(reg);
+    if (it == table.records.end()) {
+        // register_provider publishes static/loading records before this
+        // call; an absent record is not a usable provider target.
+        return false;
+    }
+    module_record & record = it->second;
+    if (record.unloading) {
+        return false;
+    }
+    if (record.loading && !record.module && !t_loading) {
+        return false;
+    }
+    ++record.registrations;
+    return true;
+}
+
+void end_registration(ggml_backend_reg_t reg) {
+    if (reg == nullptr) {
+        return;
+    }
+    module_table & table = get_table();
+    std::lock_guard<std::mutex> lock(table.mutex);
+    const auto it = table.records.find(reg);
+    if (it != table.records.end() && it->second.registrations > 0) {
+        --it->second.registrations;
     }
 }
 

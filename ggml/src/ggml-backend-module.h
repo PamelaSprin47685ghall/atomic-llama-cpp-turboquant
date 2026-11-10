@@ -63,6 +63,9 @@ GGML_BASE_API bool take_backend(ggml_backend_t backend, ggml_backend_pin * pin);
 GGML_BASE_API void put_back(ggml_backend_t backend, ggml_backend_pin pin);
 GGML_BASE_API void release_pin(ggml_backend_pin pin);
 GGML_BASE_API bool backend_free_in_progress(ggml_backend_t backend);
+GGML_BASE_API void retry_retained_pins();
+GGML_BASE_API bool begin_registration(ggml_backend_reg_t reg);
+GGML_BASE_API void end_registration(ggml_backend_reg_t reg);
 
 // Provider free callbacks that intentionally retain the backend object call
 // mark_retained before returning. ggml_backend_free consumes the mark on the

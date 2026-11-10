@@ -218,7 +218,7 @@ struct ggml_backend_registry {
         // Serialize the module publication with load/unload. A rejected
         // handle is returned to the caller, which drops it after releasing
         // this lock.
-        std::lock_guard<std::recursive_mutex> load_lock(load_mutex);
+        std::unique_lock<std::recursive_mutex> load_lock(load_mutex);
         bool added = false;
         bool ok = true;
         std::shared_ptr<void> undo_module;
@@ -305,8 +305,12 @@ struct ggml_backend_registry {
                 }
             }
         }
-        undo_module.reset();
         if (!ok) {
+            // The undo module may be the last reference. Drop it only after
+            // releasing the load transaction, so a dlclose cannot run under
+            // load_mutex.
+            load_lock.unlock();
+            undo_module.reset();
             if (rejected != nullptr) {
                 *rejected = std::move(handle);
             }
