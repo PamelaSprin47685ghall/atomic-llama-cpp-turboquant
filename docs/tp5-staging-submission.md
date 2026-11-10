@@ -592,6 +592,10 @@ and the reaper only needs the lock to publish its result. This keeps the
 blocking `event_sync` under `mutex_`, which is the premise of the
 `note_source` deadlock proof, while removing the process-global lock hold from
 the async retire probe. Query counts and the `no_slot` split are unchanged.
+Both the out-of-lock query and `wait_slot_locked` restore the caller's device
+only when `current_device` returned a non-negative id. An RAII guard around
+the out-of-lock query restores that device and clears the matching `reaping`
+claim if a backend hook throws, so a slot cannot stay out of rotation.
 If the reaper leases the slot before the blocking acquire retries, the
 blocking acquire observes a transient lease collision and falls back; the
 async lane owns the slot. That race needs a concurrent blocking and

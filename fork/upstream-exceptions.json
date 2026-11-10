@@ -852,13 +852,13 @@
     },
     {
       "path": "ggml/src/ggml-cuda/staging.h",
-      "sha256": "17c97a0872deabd4f93c35f1d854500580887ee763182ecc9b79fb2bd6459ea0",
+      "sha256": "2df8b045afd94a864e4355d4cef39f09025052c3f34b69c9c95c848475e2b31c",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)",
         "WS4 staging pool CPU test"
       ],
-      "reason": "Declare the staging pool API and host-side lease/slot state used by the meta backend and the CPU test harness. Declare the tri-state submit_result API and make note_source wait-free: it publishes the submit gate, takes the pool lock only by try_lock, and skips with a fast miss when the gate or pool lock is held. Add backend_ops::event_query: acquire(wait_pending=false) polls the recorded events of pending slots outside the pool lock, claims one slot with a reaping flag, skips an active lease, quarantines a query error as fatal, and records query_fail/reaps/queries. Add per-window lease/no_slot counters and a reaping state that keeps the blocking wait under the pool lock. Add the v2 mark_partial entry, the v3 kind_count capability, and partial statistic: a later clean rejection after at least one queued rank stops the pool, quarantines the slot and records the destination as unknown with first_error unchanged. Version 2 appends mark_partial and version 3 appends kind_count after the previous version's last field (no earlier field moves) and the CPU pool test asserts that prefix at compile time. Reject v1 and v2 at registration (v1 cannot publish partial work; v2 cannot advertise its kind domain); mark_partial is idempotent per leased slot so concurrent duplicate publications count one destination. Document that mark_partial idempotence is lease-scoped: a call after release cannot find the slot.",
+      "reason": "Declare the staging pool API and host-side lease/slot state used by the meta backend and the CPU test harness. Declare the tri-state submit_result API and make note_source wait-free: it publishes the submit gate, takes the pool lock only by try_lock, and skips with a fast miss when the gate or pool lock is held. Add backend_ops::event_query: acquire(wait_pending=false) polls the recorded events of pending slots outside the pool lock, claims one slot with a reaping flag, skips an active lease, quarantines a query error as fatal, and records query_fail/reaps/queries. Add per-window lease/no_slot counters and a reaping state that keeps the blocking wait under the pool lock. Restore the caller's device only when current_device returned a non-negative id, and guard the out-of-lock query so an exception restores the device and clears the matching reaping claim. Add the v2 mark_partial entry, the v3 kind_count capability, and partial statistic: a later clean rejection after at least one queued rank stops the pool, quarantines the slot and records the destination as unknown with first_error unchanged. Version 2 appends mark_partial and version 3 appends kind_count after the previous version's last field (no earlier field moves) and the CPU pool test asserts that prefix at compile time. Reject v1 and v2 at registration (v1 cannot publish partial work; v2 cannot advertise its kind domain); mark_partial is idempotent per leased slot so concurrent duplicate publications count one destination. Document that mark_partial idempotence is lease-scoped: a call after release cannot find the slot.",
       "removal_condition": "Remove with the WS4 staging pool implementation."
     },
     {
@@ -965,7 +965,7 @@
     },
     {
       "path": "docs/tp5-staging-submission.md",
-      "sha256": "f88cf6276dae29b403bef688ed9d3d52f3482d1cef1c40b19c4dc04d6b20db9c",
+      "sha256": "47a9c2c1c3181e5ea4bbaf4865dea395262c514adb2bdf831b6a04d1d4d5b669",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose staging/Meta integration maintainers"

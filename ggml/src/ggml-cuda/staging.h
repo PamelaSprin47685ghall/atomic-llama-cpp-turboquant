@@ -391,7 +391,9 @@ public:
                 // turning a missing optional hook into a pool fault.
                 complete = false;
             } else {
-                const int saved = ops_.current_device != nullptr ? ops_.current_device() : -1;
+                int saved = -1;
+                reap_query_guard guard(*this, window, size_t(k), reap_index, reap_epoch, saved);
+                saved = ops_.current_device != nullptr ? ops_.current_device() : -1;
                 for (uint32_t r = 0; r < kRanks; ++r) {
                     if ((reap_ranks & (uint32_t(1) << r)) == 0) {
                         continue;
@@ -418,11 +420,12 @@ public:
                         break;
                     }
                 }
-                if (ops_.restore_device != nullptr && !ops_.restore_device(saved)) {
+                if (!guard.restore()) {
                     if (fail_err == 0) {
                         fail_err = -1;
                     }
                 }
+                guard.commit();
             }
 
             {
@@ -890,6 +893,77 @@ private:
 
     using rotation = std::array<slot, kSlotsPerKey>;
 
+    // Restores the caller's device when a backend hook exits by exception.
+    // saved < 0 means current_device was unavailable or failed; -1 is not a
+    // valid device and must not reach restore_device.
+    struct device_restore_guard {
+        const backend_ops & ops;
+        int &               saved;
+        bool                done = false;
+
+        device_restore_guard(const backend_ops & ops_in, int & saved_in)
+            : ops(ops_in), saved(saved_in) {}
+
+        ~device_restore_guard() {
+            if (!done && saved >= 0 && ops.restore_device != nullptr) {
+                (void) ops.restore_device(saved);
+            }
+        }
+
+        bool restore() {
+            done = true;
+            if (saved < 0 || ops.restore_device == nullptr) {
+                return true;
+            }
+            return ops.restore_device(saved);
+        }
+    };
+
+    // Out-of-lock retire query guard. The normal path calls restore() and
+    // commit(); on an exception the destructor restores the device and clears
+    // the reaping claim for the matching epoch, so the slot cannot stay out of
+    // rotation. Clearing reaping needs the pool lock; the query block itself
+    // does not hold it.
+    struct reap_query_guard {
+        pool &   p;
+        uint32_t window;
+        size_t   kind_index;
+        size_t   slot_index;
+        uint64_t epoch;
+        int &    saved;
+        bool     restore_done = false;
+        bool     restore_ok   = true;
+        bool     committed    = false;
+
+        reap_query_guard(pool & pool_in, uint32_t window_in, size_t kind_in, size_t slot_in,
+                         uint64_t epoch_in, int & saved_in)
+            : p(pool_in), window(window_in), kind_index(kind_in), slot_index(slot_in),
+              epoch(epoch_in), saved(saved_in) {}
+
+        ~reap_query_guard() {
+            if (!restore_done && saved >= 0 && p.ops_.restore_device != nullptr) {
+                (void) p.ops_.restore_device(saved);
+            }
+            if (!committed) {
+                std::lock_guard<std::mutex> lock(p.mutex_);
+                slot & s = p.slots_[window][kind_index][slot_index];
+                if (s.reaping && s.epoch == epoch) {
+                    s.reaping = false;
+                }
+            }
+        }
+
+        bool restore() {
+            restore_done = true;
+            if (saved >= 0 && p.ops_.restore_device != nullptr) {
+                restore_ok = p.ops_.restore_device(saved);
+            }
+            return restore_ok;
+        }
+
+        void commit() { committed = true; }
+    };
+
     struct unknown_work {
         const void * dst = nullptr;
         int rank = -1;
@@ -1023,7 +1097,9 @@ private:
             return true;
         }
         const auto t0 = std::chrono::steady_clock::now();
-        const int saved = ops_.current_device != nullptr ? ops_.current_device() : -1;
+        int saved = -1;
+        device_restore_guard restore_guard(ops_, saved);
+        saved = ops_.current_device != nullptr ? ops_.current_device() : -1;
         bool ok = true;
         int fail_err = 0;
         for (uint32_t r = 0; r < kRanks; ++r) {
@@ -1047,7 +1123,7 @@ private:
                 break;
             }
         }
-        if (ops_.restore_device != nullptr && !ops_.restore_device(saved)) {
+        if (!restore_guard.restore()) {
             ok = false;
             if (fail_err == 0) {
                 fail_err = -1;
