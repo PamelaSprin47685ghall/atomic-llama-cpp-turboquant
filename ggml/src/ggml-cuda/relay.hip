@@ -56,6 +56,12 @@ constexpr uint64_t wait_seconds = 600;
 std::atomic<uint32_t> priority_pair_slots{ 0 };
 static_assert(GGML_RELAY_TOKEN_SUCCESS == 0 && GGML_RELAY_TOKEN_FAILED == 1 && GGML_RELAY_TOKEN_UNKNOWN == 2,
               "relay token results must match the generic completion result values");
+#ifdef GGML_BACKEND_COMPLETION_API_VERSION
+static_assert(GGML_RELAY_TOKEN_SUCCESS == GGML_BACKEND_COMPLETION_SUCCESS &&
+              GGML_RELAY_TOKEN_FAILED == GGML_BACKEND_COMPLETION_FAILED &&
+              GGML_RELAY_TOKEN_UNKNOWN == GGML_BACKEND_COMPLETION_UNKNOWN,
+              "relay token results must match the merged generic completion results");
+#endif
 static_assert(std::atomic<uint32_t>::is_always_lock_free, "relay priority leases require a lock-free host atomic");
 static_assert(std::atomic<size_t>::is_always_lock_free, "relay retirement queue requires a lock-free host atomic");
 
@@ -1623,7 +1629,7 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
     if (!idle(p)) {
         return false; // Busy is transient; the caller may retry after draining.
     }
-    if (!p.token_tails.empty()) {
+    if (!p.token_tails.empty() || !p.token_state.empty()) {
         reject_local("relay prepare requires every completion token released");
         return false;
     }
@@ -1770,8 +1776,8 @@ bool begin(provider & p) {
     }
     // A token record owns the lane tail event handles. Re-recording those
     // events for a new epoch would silently retarget wait_token, so every
-    // token must be released before the next begin.
-    if (!p.token_tails.empty()) {
+    // token must be released before the next prepare/begin.
+    if (!p.token_tails.empty() || !p.token_state.empty()) {
         reject_local("relay begin requires every completion token released");
         return false;
     }
@@ -1791,20 +1797,28 @@ bool begin(provider & p) {
         p.plan_pinned = true;
     }
     // Create the token record before mutating the epoch. A failed allocation
-    // must not leave a half-begun epoch or a pinned plan behind.
+    // must not leave a half-begun epoch or a pinned plan behind. The failure
+    // is fatal: the epoch cannot be sealed without a token record.
     uint64_t token = 0;
     if (want_token) {
-        token = ++p.next_token;
-        try {
-            p.token_state[token] = {0, 0};
-        } catch (const std::bad_alloc &) {
+        auto rollback_token = [&p]() {
             if (p.plan_pinned) {
                 p.plan_pinned = false;
                 if (!p.plan_cache.release(p.status.plan_generation)) {
                     fail_local(p, EPROTO, "relay begin could not release its plan pin after token allocation failed");
                 }
             }
+        };
+        token = ++p.next_token;
+        try {
+            p.token_state[token] = {0, 0};
+        } catch (const std::bad_alloc &) {
+            rollback_token();
             fail(p, ENOMEM, "relay begin could not record its completion token");
+            return false;
+        } catch (...) {
+            rollback_token();
+            fail(p, EIO, "relay begin could not record its completion token");
             return false;
         }
     }

@@ -252,7 +252,7 @@ and whose child bytes are unchanged by a second copy.
   contention. Abort does not revoke a borrow, so only publishing the saved
   `INPUT_READY` view returns it. The provider never releases a borrow that a
   CPU reader may still own. Every completion token must be released before the
-  next prepare/submit: the token record owns the lane tail events. `prepare`
+  next prepare/begin: the token record owns the lane tail events. `prepare`
   sets `outputs_released` to the new channel count while the provider is idle,
   so the prepare window is a settled state, not an old count against new
   channels.
@@ -464,7 +464,10 @@ prepare/submit/destroy guards for an unreleased token. It is not part of the
 default CPU CTest run. `llama_free`'s relay retain decision is not covered by
 this test because it does not create a llama_context; a CPU-only fake provider
 would be needed to exercise that, the ABI 2/3 fallback, and the pending-abort
-window. The CPU-only `test-tp5-relay-free-decision` covers the pure retain
+window. The ABI 5 token path is provider-complete and test-covered here, but
+its Meta completion/receipt consumer lives on the KV receipt branch; this tree
+does not claim that production wiring is complete. The CPU-only
+`test-tp5-relay-free-decision` covers the pure retain
 decision itself: epoch 0 and the prepare window, borrow, tokens, releases, the
 failed-provider exemption, contention, unsupported ABI fallback, and
 epoch/channel mismatches.

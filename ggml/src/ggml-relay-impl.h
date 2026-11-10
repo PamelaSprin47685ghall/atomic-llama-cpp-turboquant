@@ -49,8 +49,10 @@ struct ggml_relay_provider_i {
     // success/failure for exactly that token; it never polls or substitutes a
     // global epoch. release_token retires the token record. The token result
     // uses ggml_relay_token_result. Every token must be released before the
-    // next begin: the record owns the lane tail events, and re-recording them
-    // for a new epoch would retarget a later wait_token.
+    // next prepare/begin: the record owns the lane tail events, and
+    // re-recording them for a new epoch would retarget a later wait_token.
+    // A token-record allocation failure fails the provider; it is not
+    // retryable.
     bool (*submit_token)(void * provider, ggml_cgraph * const * graphs, size_t stages,
                          uint64_t * token);
     int  (*wait_token)(void * provider, uint64_t token, int * error);

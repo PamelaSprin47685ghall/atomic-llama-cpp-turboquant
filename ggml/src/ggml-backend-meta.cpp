@@ -5610,8 +5610,8 @@ bool ggml_backend_relay_plan_snapshot(ggml_backend_t backend, ggml_relay_plan_sn
 
 int ggml_backend_relay_cpu_snapshot(ggml_backend_t backend, ggml_relay_cpu_status * status) {
     auto * ctx = ggml_backend_relay_meta_context(backend);
-    if (ctx == nullptr || status == nullptr || ctx->relay_i->abi_version < 5 ||
-        ctx->relay_i->cpu_snapshot == nullptr) {
+    if (ctx == nullptr || ctx->relay_i == nullptr || status == nullptr ||
+        ctx->relay_i->abi_version < 5 || ctx->relay_i->cpu_snapshot == nullptr) {
         return -1;
     }
     return ctx->relay_i->cpu_snapshot(ctx->relay, status) ? 1 : 0;

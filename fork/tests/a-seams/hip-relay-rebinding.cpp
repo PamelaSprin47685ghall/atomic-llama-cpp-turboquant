@@ -191,6 +191,15 @@ struct fixture {
         require(api->prepare(provider, terminals.data(), 1), "preparing terminal binding failed");
     }
 
+    void prepare_two_channels() {
+        std::array<ggml_tensor *, 2 * ranks> terminals{};
+        for (size_t r = 0; r < ranks; ++r) {
+            terminals[r] = rank[r].a;
+            terminals[ranks + r] = rank[r].b;
+        }
+        require(api->prepare(provider, terminals.data(), 2), "preparing a two-channel binding failed");
+    }
+
     void run_epoch(size_t epoch, bool select_b, clock_type::time_point deadline, bool use_token = false) {
         std::cerr << "phase epoch " << epoch + 1 << " inputs\n";
         std::array<float, width> values{};
@@ -201,6 +210,16 @@ struct fixture {
             }
             // Contents alone change. Graphs and all tensor metadata are fixed.
             ggml_backend_tensor_set(rank[r].input, values.data(), 0, sizeof(values));
+        }
+        if (use_token) {
+            // A prepare that changes the channel count must leave the new
+            // channels released and outputs_released equal to the new count.
+            prepare_two_channels();
+            ggml_relay_cpu_status cpu{};
+            require(api->cpu_snapshot(provider, &cpu) == 1 && cpu.channels == 2 &&
+                    cpu.outputs_released == cpu.channels,
+                    "prepare did not settle the new channel count");
+            prepare(false);
         }
         std::cerr << "phase epoch " << epoch + 1 << " submit\n";
         uint64_t token = 0;
@@ -260,17 +279,36 @@ struct fixture {
                 }
             }
 
-            ggml_relay_status status{};
-            if (api->snapshot(provider, &status)) {
-                require(!status.failed, std::string("provider failure: ") + status.error);
-                if (status.finished && published && released) {
-                    final_status = status;
+            if (use_token) {
+                // Do not call snapshot after submit_token: snapshot's settled
+                // fast path would settle the token and hide wait_token's own
+                // plan_complete path. The release event plus wait_token below
+                // prove the native drain.
+                if (published && released) {
                     break;
+                }
+            } else {
+                ggml_relay_status status{};
+                if (api->snapshot(provider, &status)) {
+                    require(!status.failed, std::string("provider failure: ") + status.error);
+                    if (status.finished && published && released) {
+                        final_status = status;
+                        break;
+                    }
                 }
             }
             if (result == 0) {
                 std::this_thread::yield();
             }
+        }
+        int token_error = -1;
+        if (use_token) {
+            require(api->wait_token(provider, token, &token_error) == GGML_RELAY_TOKEN_SUCCESS &&
+                    token_error == 0, "token epoch did not report success");
+            ggml_relay_status status{};
+            require(api->snapshot(provider, &status) && status.finished,
+                    "token epoch snapshot did not prove completion");
+            final_status = status;
         }
         require(final_status.epoch == epoch + 1 && final_status.channels == 1 &&
                 final_status.sealed && final_status.finished &&
@@ -279,9 +317,6 @@ struct fixture {
                 final_status.cpu_reductions == epoch + 1, "incomplete native/CPU completion proof");
 
         if (use_token) {
-            int token_error = -1;
-            require(api->wait_token(provider, token, &token_error) == GGML_RELAY_TOKEN_SUCCESS &&
-                    token_error == 0, "token epoch did not report success");
             // The token is settled but unreleased: prepare, submit and destroy
             // must all refuse without changing the provider state.
             std::array<ggml_tensor *, ranks> terminals{};
@@ -293,7 +328,13 @@ struct fixture {
             uint64_t again = 0;
             require(!api->submit_token(provider, graphs.data(), 2, &again) && again == 0,
                     "submit accepted an unreleased token");
-            require(!api->destroy(provider), "destroy accepted an unreleased token");
+            const bool token_destroyed = api->destroy(provider);
+            if (token_destroyed) {
+                // destroy() deleted the provider. Never let fail_cleanup touch it.
+                provider = nullptr;
+                pending_token = 0;
+                throw std::runtime_error("destroy accepted an unreleased token");
+            }
             api->release_token(provider, token);
             pending_token = 0;
         }
@@ -370,6 +411,12 @@ struct fixture {
         api->abort(provider, ECANCELED);
         require(api->poll(provider, &event) < 0, "poll hid the claimed abort");
 
+        // Call wait_token before any snapshot so snapshot's settle path does
+        // not hide wait_token's own failed-token handling.
+        int token_error = 0;
+        require(api->wait_token(provider, token, &token_error) == GGML_RELAY_TOKEN_FAILED,
+                "aborted token did not report failure");
+
         ggml_relay_status status{};
         require(api->snapshot(provider, &status), "snapshot after abort failed");
         require(status.failed && status.error_code == ECANCELED,
@@ -411,9 +458,6 @@ struct fixture {
             }
             std::this_thread::yield();
         }
-        int token_error = 0;
-        require(api->wait_token(provider, token, &token_error) == GGML_RELAY_TOKEN_FAILED,
-                "aborted token did not report failure");
         api->release_token(provider, token);
         pending_token = 0;
         require(api->destroy(provider), "provider refused destruction after the borrow returned");

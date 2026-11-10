@@ -73,6 +73,19 @@ void test_prepare_window() {
     CHECK(!decision.retain);
 }
 
+void test_prepare_window_after_epoch() {
+    // prepare changes channels after epoch 2 and resets outputs_released to
+    // the new count. The provider is still settled, not "outputs outstanding".
+    auto facts = settled();
+    facts.status_epoch = 2;
+    facts.status_channels = 5;
+    facts.cpu.epoch = 2;
+    facts.cpu.channels = 5;
+    facts.cpu.outputs_released = 5;
+    const auto decision = llama_relay_free_decide(facts);
+    CHECK(!decision.retain);
+}
+
 void test_borrow() {
     auto facts = settled();
     facts.cpu.borrowed_channel = 1;
@@ -179,6 +192,7 @@ int main() {
     test_settled();
     test_epoch_zero();
     test_prepare_window();
+    test_prepare_window_after_epoch();
     test_borrow();
     test_active_token();
     test_settled_token_not_released();
