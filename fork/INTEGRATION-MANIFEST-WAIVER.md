@@ -1301,6 +1301,20 @@ test still exits 77/SKIP because that cache cannot shift, so it does not print
 the core K-shift PASS. The dense host field check is in the same test but was
 not rerun after this public-check addition.
 
+CPU microbenchmark (agent://safe-devops t8; raw values in
+`/tmp/tmp.7Kd6QbMNvC/results.csv`): it compares the 18-bit index direct
+parent `fa400274f` against the 32-bit `03331f2d6`, not a completely
+unoptimized original. It is a synthetic, predeclared 3-group ABBA run (12
+independent processes, same `g++ -std=c++17 -O2 -DNDEBUG` flags; only the
+header differs). Medians, old/new: 8192-cell small case 50.080/50.904 ms;
+262145-cell boundary record 46.427/46.300 ms; 16385 `begin()` calls
+144.586/101.744 us. The small and record deltas are within run-to-run noise.
+The `begin()` difference is consistent but absolute cost is only about
+0.10-0.17 ms per 16385 begins, and it is the old 16384th-begin full `seen_`
+fill path, not a general throughput result. The old arm cannot record the
+262145th entry, so that record boundary is not a paired same-workload
+comparison. No GPU, model tok/s, or significant-gain claim.
+
 Manifest: `src/llama-kv-cache.cpp`, `src/llama-kv-cache.h`,
 `src/llama-kv-cells.h` and `tests/test-tp5-ubatch-pool.cpp` were updated to
 their actual post-integration hashes. `tests/test-kv-cells-journal-ownership.cpp`
