@@ -3616,11 +3616,18 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             // TODO: the following assert fails for llama-parallel even though the results are correct:
             // GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
             ne[split_dim] = child_ne[j];
-            // The child simple tensor is a sub-range along the split axis; its
-            // non-split strides are the output's strides, not a share-scaled
-            // copy. Scaling here breaks permute/transpose, where the split
-            // axis is not the innermost and the actual coordinate stride is
-            // the permuted tensor's nb.
+            // Every physical outer dimension that wraps the split axis has a
+            // stride proportional to the parent's split extent. Scale those
+            // strides with the child extent; inner/equal strides stay exact.
+            // The stride comparison also handles a permuted/transposed split
+            // axis that is not the innermost physical dimension.
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                if (tensor->nb[i] > tensor->nb[split_dim] && tensor->ne[split_dim] > 0) {
+                    nb[i] = tensor->nb[i] * ne[split_dim] / tensor->ne[split_dim];
+                } else {
+                    nb[i] = tensor->nb[i];
+                }
+            }
         }
 
         ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
