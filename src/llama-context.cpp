@@ -1265,20 +1265,22 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 
         // Pillar 5: per-shape scheduler/graph cache. The flag value is the
         // slot count; 0 keeps the single-scheduler path. Relay contexts get a
-        // two-slot default because the stock target graph alternates between
-        // the 1-row decode shape and the 2-row MTP verify shape (1 accepted +
-        // 1 draft), and a single gf_res_prev slot rebuilds and re-allocates on
-        // every switch. Two slots are enough for that working set; larger
-        // working sets can raise the value explicitly. The cache is no longer
-        // relay-only: an explicit value also enables it on non-relay stock
-        // contexts (make_shape_plan fails closed and falls back if the context
-        // cannot host a per-shape scheduler).
+        // four-slot default: the formal 512x2 and steady-state TTFT runs use
+        // GGML_TP5_MTP_DRAFT_DEPTH=2 and reuse one context across rounds, so a
+        // round sees the prompt-prefill shape and the 1/2/3-row decode/verify
+        // shapes. Four slots keep {prefill, 1, 2, 3} resident; a two-slot
+        // default would evict the prefill and 2-row shapes on the 1/3 rows and
+        // rebuild the graph, re-allocate and re-prepare the relay on the next
+        // measured round. Larger working sets can raise the value explicitly.
+        // The cache is no longer relay-only: an explicit value also enables it
+        // on non-relay stock contexts (make_shape_plan fails closed and falls
+        // back if the context cannot host a per-shape scheduler).
         {
             const char * plan_env = getenv("GGML_TP5_LLAMA_PLAN_CACHE");
             const size_t cap      = llama_shape_cache::parse_capacity(plan_env);
             const bool   plan_default = plan_env == nullptr && backend_tp5_relay != nullptr;
             shape_plan_active = cap != 0 || plan_default;
-            shape_plan_cache  = llama_shape_cache::cache(plan_default ? 2 : cap);
+            shape_plan_cache  = llama_shape_cache::cache(plan_default ? 4 : cap);
             if (plan_env != nullptr && cap == 0) {
                 LLAMA_LOG_WARN("%s: GGML_TP5_LLAMA_PLAN_CACHE value is invalid or 0; "
                                "per-shape plan cache disabled\n", __func__);
@@ -6587,9 +6589,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
     // Pillar 5: per-shape scheduler/graph selection. A hit reuses the entry's
     // llm_graph_result and scheduler; can_reuse() below still decides whether
-    // the graph itself is current. Relay contexts default to two slots so the
-    // 1-row decode and 2-row MTP verify shapes do not rebuild on every switch;
-    // an explicit GGML_TP5_LLAMA_PLAN_CACHE also enables the cache elsewhere.
+    // the graph itself is current. Relay contexts default to four slots so the
+    // prefill and 1/2/3-row decode/verify shapes do not rebuild on every
+    // switch; an explicit GGML_TP5_LLAMA_PLAN_CACHE also enables the cache
+    // elsewhere.
     llm_graph_result *   res       = gf_res_prev.get();
     ggml_backend_sched_t run_sched = sched.get();
     int                  shape_slot = -1;
